@@ -1,0 +1,11 @@
+{
+  "model": "llama3.1:8b",
+  "fixture": "test-log.txt",
+  "originalChars": 7390,
+  "summaryChars": 501,
+  "compressionRatio": "14.8",
+  "elapsedMs": 1183,
+  "totalDurationMs": 1180,
+  "evalTokens": 116,
+  "promptTokens": 2071
+}

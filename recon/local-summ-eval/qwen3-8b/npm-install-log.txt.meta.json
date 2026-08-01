@@ -1,0 +1,11 @@
+{
+  "model": "qwen3:8b",
+  "fixture": "npm-install-log.txt",
+  "originalChars": 1095,
+  "summaryChars": 1061,
+  "compressionRatio": "1.0",
+  "elapsedMs": 2808,
+  "totalDurationMs": 2803,
+  "evalTokens": 358,
+  "promptTokens": 452
+}

@@ -1,0 +1,11 @@
+{
+  "model": "llama3.1:8b",
+  "fixture": "grep-result.txt",
+  "originalChars": 4576,
+  "summaryChars": 465,
+  "compressionRatio": "9.8",
+  "elapsedMs": 913,
+  "totalDurationMs": 909,
+  "evalTokens": 95,
+  "promptTokens": 1264
+}
