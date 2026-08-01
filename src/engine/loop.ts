@@ -610,7 +610,11 @@ export class HeadlessSession {
 					content: resultContent,
 				})
 
-				this.logger.info(`[loop] tool result: ${call.name}`, { isError, toolCalls })
+				this.logger.info(`[loop] tool result: ${call.name}`, {
+					isError,
+					toolCalls,
+					arg: summarizeToolArg(call.name, call.args),
+				})
 
 				// Consecutive-mistake accounting: errors, parse failures, empty
 				// results, and identical repeated calls all count.
@@ -830,6 +834,30 @@ export class HeadlessSession {
 			iterations,
 			toolCalls,
 		}
+	}
+}
+
+/**
+ * Best-effort one-line summary of a tool call's key argument, purely for
+ * harness.log diagnostics (e.g. telling "read the same file 5 times in a
+ * row" apart from "read 5 different files" without re-running a paid
+ * session). Deliberately short and lossy — never logs full file/command
+ * content, only the path/command/query a human would want to scan.
+ */
+function summarizeToolArg(name: string, args: Record<string, unknown>): string | undefined {
+	const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined)
+	switch (name) {
+		case "read_file":
+		case "list_files":
+		case "write_to_file":
+		case "apply_diff":
+		case "search_replace":
+		case "edit_file":
+			return str(args.path)
+		case "execute_command":
+			return str(args.command)?.slice(0, 200)
+		default:
+			return undefined
 	}
 }
 

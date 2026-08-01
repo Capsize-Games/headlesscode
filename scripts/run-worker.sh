@@ -36,6 +36,13 @@
 #                      .harness.decision-answer before falling back to
 #                      autonomous decision; default 30 min). Answer a blocked
 #                      worker with scripts/headlesscode-answer.sh.
+#   HEADLESSCODE_MAX_ITERATIONS  when set, forwarded to the CLI as
+#                      --max-iterations (default 50 — often too low for a
+#                      multi-phase plan doc that needs substantial file
+#                      exploration before its first edit; each iteration is
+#                      now cheap, roughly $0.002 with the fixed pricing/
+#                      caching, so raising this is a cost-cheap way to avoid
+#                      "max iterations reached without task completion").
 #
 # Usage:
 #   scripts/run-worker.sh <worktree-path> <task-file-or-text> \
@@ -168,6 +175,11 @@ fi
 # harness.log), same rationale as the budget args above.
 if [ -n "${HEADLESSCODE_DECISION_TIMEOUT_MS:-}" ]; then
     BUDGET_ARG="$BUDGET_ARG --decision-timeout-ms '$HEADLESSCODE_DECISION_TIMEOUT_MS'"
+fi
+
+# Iteration cap: forward as a CLI flag too, same rationale as above.
+if [ -n "${HEADLESSCODE_MAX_ITERATIONS:-}" ]; then
+    BUDGET_ARG="$BUDGET_ARG --max-iterations '$HEADLESSCODE_MAX_ITERATIONS'"
 fi
 
 WRAPPER="
