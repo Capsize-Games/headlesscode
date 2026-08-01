@@ -24,17 +24,26 @@
  * Proper token-based condensation is Phase 3.
  *
  * The loop is non-interactive by construction: no approval prompts, no
- * webview, and `ask_followup_question` calls are answered by the executor with
- * a "harness is non-interactive" result.
+ * webview. `ask_followup_question` calls escalate instead of failing
+ * immediately: the executor writes a `.harness.needs-decision` marker and
+ * blocks (budget clock paused) for a configurable timeout waiting for
+ * `.harness.decision-answer` — a human or the orchestrator can answer via
+ * `scripts/headlesscode-answer.sh`. Only once that timeout elapses does it
+ * fall back to the original "harness is non-interactive" error (see
+ * src/tools/executor.ts).
  */
 
 import * as path from "node:path"
+
+import { randomUUID } from "node:crypto"
 
 import { BudgetExceededError, BudgetTracker, type SessionBudget } from "../budget/budget.js"
 import { DEFAULT_MODEL } from "../llm/openrouter.js"
 import { createHeadlessExecutor, ToolExecutor } from "../tools/executor.js"
 import { buildRollingSummary, extractSessionSummary } from "../memory/summarizer.js"
 import type { MemoryStore, RecallResult } from "../memory/types.js"
+import { createCheckpointService, type CheckpointService } from "../checkpoints/service.js"
+import { recordSessionUsage, removeLiveUsage, writeLiveUsage } from "./usage.js"
 import { Logger } from "./logger.js"
 import { parseToolCalls } from "./parser.js"
 import { buildSystemPrompt, loadCustomModes, selectToolsForMode } from "./prompt.js"
@@ -90,6 +99,26 @@ export interface HeadlessSessionConfig {
 	 * response (`LlmResponse.usage`), which OpenRouterClient already surfaces.
 	 */
 	budget?: SessionBudget | null
+	/**
+	 * Checkpoints: auto-snapshot the workspace into a shadow git repo (see
+	 * `src/checkpoints/service.ts`) at session start and after every iteration
+	 * that executed at least one tool call, so edits can be reverted. Default
+	 * ON, but only actually runs when the executor is edit-capable (has
+	 * `write_to_file` registered) — read-only executors (reviewer/QA) have
+	 * nothing to checkpoint. Checkpoint failures are always non-fatal (logged
+	 * as a warning, session continues).
+	 */
+	checkpoints?: boolean
+	/** Shadow-git storage dir override (default: `<workspaceRoot>/.headlesscode/checkpoints`). */
+	checkpointDir?: string
+	/**
+	 * Decision escalation (workstream 2): how long ask_followup_question blocks
+	 * waiting for `<workspaceRoot>/.harness.decision-answer` before falling
+	 * back to today's autonomous-decision error (default 30 min — see
+	 * DEFAULT_DECISION_TIMEOUT_MS in src/tools/executor.ts). Ignored when a
+	 * custom `executor` is injected (its own options win).
+	 */
+	decisionTimeoutMs?: number
 }
 
 export interface SessionRunState {
@@ -124,6 +153,11 @@ export interface ResolvedSessionConfig {
 	project: string
 	/** Phase 6: per-session budget (null = off). */
 	budget: SessionBudget | null
+	/** Checkpoints on/off (default true; actual use also requires an edit-capable executor). */
+	checkpoints: boolean
+	checkpointDir?: string
+	/** Decision escalation timeout, ms (see HeadlessSessionConfig.decisionTimeoutMs). */
+	decisionTimeoutMs?: number
 }
 
 /** Phase 3: memory activity recorded for the last `run()` (null when off/failed). */
@@ -144,6 +178,14 @@ export class HeadlessSession {
 	/** Phase 3: memory activity for the last run (null when memory is off or recording failed). */
 	memoryStats: SessionMemoryStats | null = null
 	private recallInfo: { recalledFacts: number; recalledSessions: number } | null = null
+	/** Session id used as the checkpoint service's taskId. */
+	private readonly sessionId: string
+	private checkpointService: CheckpointService | null = null
+	/** Whether checkpoints actually run this session: config on AND the executor is edit-capable. */
+	private readonly checkpointsActive: boolean
+	/** Cost/token monitoring (workstream 3): cumulative usage tokens across all LLM calls this run. */
+	private totalInputTokens = 0
+	private totalOutputTokens = 0
 
 	constructor(config: HeadlessSessionConfig) {
 		if (!config.llmClient) {
@@ -174,11 +216,18 @@ export class HeadlessSession {
 			project: config.project ?? path.basename(path.resolve(config.workspaceRoot)),
 			memory: config.memory ?? null,
 			budget: config.budget ?? null,
+			checkpoints: config.checkpoints ?? true,
+			checkpointDir: config.checkpointDir,
+			decisionTimeoutMs: config.decisionTimeoutMs,
 		}
 
 		this.llmClient = config.llmClient
 		this.logger = config.logger ?? new Logger({ level: "info" })
-		this.executor = config.executor ?? createHeadlessExecutor(config.workspaceRoot)
+		this.executor =
+			config.executor ??
+			createHeadlessExecutor(config.workspaceRoot, { decisionTimeoutMs: this.config.decisionTimeoutMs })
+		this.sessionId = randomUUID()
+		this.checkpointsActive = this.config.checkpoints && this.executor.has("write_to_file")
 		this.state = {
 			systemPrompt: "",
 			messages: [],
@@ -236,27 +285,139 @@ export class HeadlessSession {
 			tools: tools.map((t) => (t.type === "function" ? t.function.name : t.type)),
 		})
 
+		// 2c. Checkpoints: baseline snapshot before iteration 1 (mirrors Zoo
+		// Code's Task.ts:~1447). Non-fatal: any failure just disables
+		// checkpoints for the rest of the session (never fails the run).
+		await this.initCheckpoints()
+
 		// 3. Run the bounded loop, then persist the session + extracted facts.
 		// Memory recording never fails the session (wrapped in try/catch).
-		const budgetTracker = this.config.budget ? new BudgetTracker(this.config.budget) : null
-		const result = await this.runIterations(budgetTracker)
-		await this.recordMemory(result)
-		// Phase 6: surface the budget accounting on every result when a budget
-		// was configured (absent when off → zero behavior change).
-		if (budgetTracker) {
-			const usage = budgetTracker.check()
-			const budgetUsage: SessionBudgetUsage = {
-				costUsd: usage.costUsd,
-				elapsedMs: usage.elapsedMs,
-				iterations: usage.iterations,
-				model: this.config.model,
-			}
-			return { ...result, budgetUsage }
+		//
+		// Cost/token accounting (workstream 3): a BudgetTracker is ALWAYS
+		// created now, even when `config.budget` is unset — in that case it's
+		// constructed with `{}` (no limits), so `tick()`/`record()` never trip;
+		// it's used purely for accounting so usage is always recorded and
+		// logged, regardless of whether enforcement caps are configured.
+		const startedAt = new Date().toISOString()
+		const budgetTracker = new BudgetTracker(this.config.budget ?? {})
+		// Decision escalation: wire the budget clock's pause/resume so
+		// ask_followup_question doesn't burn duration budget while blocked
+		// waiting on a human/orchestrator answer (see executor.ts).
+		this.executor.setBudgetClockHooks(
+			() => budgetTracker.pauseClock(),
+			() => budgetTracker.resumeClock(),
+		)
+		let result: SessionResult
+		try {
+			result = await this.runIterations(budgetTracker, startedAt)
+		} catch (error) {
+			// Defensive: runIterations normally returns SessionResults instead
+			// of throwing, but if it ever does, don't leave a stale live usage
+			// snapshot behind. Non-fatal (see removeLiveSnapshot), then rethrow.
+			await this.removeLiveSnapshot()
+			throw error
 		}
-		return result
+		await this.recordMemory(result)
+		// Surface the budget/usage accounting on every result now (previously
+		// only present when a budget was configured).
+		const usage = budgetTracker.check()
+		const budgetUsage: SessionBudgetUsage = {
+			costUsd: usage.costUsd,
+			elapsedMs: usage.elapsedMs,
+			iterations: usage.iterations,
+			model: this.config.model,
+		}
+		const finalResult: SessionResult = { ...result, budgetUsage }
+
+		// Persist usage for the dashboard (workstream 3). Non-fatal: any
+		// failure is logged as a warning and never fails the session, matching
+		// the memory-recording/checkpoint try/catch idiom above.
+		await this.recordUsage(finalResult, startedAt)
+
+		return finalResult
 	}
 
-	private async runIterations(budgetTracker: BudgetTracker | null): Promise<SessionResult> {
+	/**
+	 * Cost/token monitoring (workstream 3): append one JSON line to
+	 * `<workspaceRoot>/.headlesscode/usage/<sessionId>.jsonl` describing this
+	 * completed session (success, error, or budget-exceeded — every path that
+	 * returns a SessionResult reaches here via `run()`). Non-fatal: any
+	 * failure is logged as a warning and never fails the session.
+	 */
+	private async recordUsage(result: SessionResult, startedAt: string): Promise<void> {
+		try {
+			await recordSessionUsage(this.config.workspaceRoot, {
+				sessionId: this.sessionId,
+				mode: this.config.mode,
+				model: this.config.model,
+				iterations: result.iterations,
+				inputTokens: this.totalInputTokens,
+				outputTokens: this.totalOutputTokens,
+				costUsd: result.budgetUsage?.costUsd ?? 0,
+				startedAt,
+				endedAt: new Date().toISOString(),
+				status: result.status === "success" ? "success" : result.reason === "budget" ? "budget" : "error",
+				workspaceRoot: this.config.workspaceRoot,
+			})
+		} catch (error) {
+			this.logger.warn("[usage] failed to persist session usage (non-fatal; dashboard will miss this session)", {
+				error: error instanceof Error ? error.message : String(error),
+			})
+		}
+		// The final `.jsonl` record is the authoritative source once the
+		// session completes (success, error, or budget-exceeded — every path
+		// that returns a SessionResult reaches here via `run()`), so the
+		// per-iteration live snapshot is now stale. Delete it. Non-fatal.
+		await this.removeLiveSnapshot()
+	}
+
+	/**
+		* Live (in-progress) usage visibility: overwrite the snapshot at
+		* `<workspaceRoot>/.headlesscode/usage/<sessionId>.live.json` after each
+		* iteration so the dashboard can show a still-running session's
+		* accumulating cost/tokens/iteration count. Same running totals as the
+		* `[usage] running total` log line. Non-fatal: any failure is logged as a
+		* warning and never affects the session.
+		*/
+	private async writeLiveSnapshot(startedAt: string, iteration: number, costUsd: number): Promise<void> {
+		try {
+			await writeLiveUsage(this.config.workspaceRoot, {
+				sessionId: this.sessionId,
+				mode: this.config.mode,
+				model: this.config.model,
+				iterations: iteration,
+				inputTokens: this.totalInputTokens,
+				outputTokens: this.totalOutputTokens,
+				costUsd,
+				startedAt,
+				status: "running",
+				workspaceRoot: this.config.workspaceRoot,
+			})
+		} catch (error) {
+			this.logger.warn("[usage] failed to write live snapshot (non-fatal; dashboard only sees this session once it finishes)", {
+				error: error instanceof Error ? error.message : String(error),
+			})
+		}
+	}
+
+	/**
+		* Live (in-progress) usage visibility: delete the session's live snapshot.
+		* Called on every completion path (success via `recordUsage`, error, and
+		* budget-exceeded — all flow back through `run()`/`recordUsage()`, plus a
+		* defensive call if `runIterations` ever throws). Non-fatal: a failure is
+		* logged as a warning and never affects the session.
+		*/
+	private async removeLiveSnapshot(): Promise<void> {
+		try {
+			await removeLiveUsage(this.config.workspaceRoot, this.sessionId)
+		} catch (error) {
+			this.logger.warn("[usage] failed to remove live snapshot (non-fatal)", {
+				error: error instanceof Error ? error.message : String(error),
+			})
+		}
+	}
+
+	private async runIterations(budgetTracker: BudgetTracker, startedAt: string): Promise<SessionResult> {
 		const { maxIterations, consecutiveErrorLimit } = this.config
 		const messages = this.state.messages
 		let consecutiveMistakes = 0
@@ -266,18 +427,17 @@ export class HeadlessSession {
 		for (let iteration = 1; iteration <= maxIterations; iteration++) {
 			this.logger.info(`[loop] iteration ${iteration}/${maxIterations}`, { history: messages.length })
 
-			// Phase 6 budget check BEFORE this LLM call: elapsed time, iteration
-			// count and accumulated cost are all re-checked here so no further
-			// spend happens once a limit has tripped.
-			if (budgetTracker) {
-				try {
-					budgetTracker.tick()
-				} catch (err) {
-					if (err instanceof BudgetExceededError) {
-						return this.budgetFailure(err, iteration, toolCalls)
-					}
-					throw err
+			// Budget check BEFORE this LLM call: elapsed time, iteration count
+			// and accumulated cost are all re-checked here so no further spend
+			// happens once a limit has tripped. When no budget was configured
+			// the tracker has no limits, so this never trips (pure accounting).
+			try {
+				budgetTracker.tick()
+			} catch (err) {
+				if (err instanceof BudgetExceededError) {
+					return this.budgetFailure(err, iteration, toolCalls)
 				}
+				throw err
 			}
 
 			// 3. Sliding-window truncation (Phase 1 placeholder).
@@ -298,9 +458,13 @@ export class HeadlessSession {
 						signal: controller.signal,
 					})
 					assistant = response.message
-					// Phase 6: feed the provider's usage tokens into the budget
-					// (cost accumulation; trips when the cost cap is crossed).
-					if (budgetTracker && response.usage) {
+					// Cost/token accounting (workstream 3): feed the provider's usage
+					// tokens into the budget tracker unconditionally now (it always
+					// exists — see `run()` — with no limits when no budget was
+					// configured, so this only ever accumulates, never trips).
+					if (response.usage) {
+						this.totalInputTokens += response.usage.promptTokens ?? 0
+						this.totalOutputTokens += response.usage.completionTokens ?? 0
 						try {
 							budgetTracker.record({
 								model: this.config.model,
@@ -314,6 +478,19 @@ export class HeadlessSession {
 							throw err
 						}
 					}
+					this.logger.info("[usage] running total", {
+						iteration,
+						costUsd: budgetTracker.totalCostUsd,
+						iterations: budgetTracker.iterationCount,
+						inputTokens: this.totalInputTokens,
+						outputTokens: this.totalOutputTokens,
+					})
+					// Live (in-progress) usage snapshot: overwritten in place each
+					// iteration so the dashboard can show this still-running
+					// session's accumulating cost/tokens/iterations. Non-fatal —
+					// a write failure must never affect the session (same idiom
+					// as the final usage record / checkpoints).
+					await this.writeLiveSnapshot(startedAt, iteration, budgetTracker.totalCostUsd)
 				} finally {
 					clearTimeout(timer)
 				}
@@ -410,6 +587,7 @@ export class HeadlessSession {
 						reason: isError ? "tool error" : call.parseError ? "parse error" : isRepeat ? "identical repeat" : "empty result",
 					})
 					if (consecutiveMistakes >= consecutiveErrorLimit) {
+						await this.saveIterationCheckpoint(iteration)
 						return this.boundedFailure("consecutive mistakes", iteration, toolCalls, consecutiveMistakes)
 					}
 				} else {
@@ -417,6 +595,11 @@ export class HeadlessSession {
 					lastCallSignature = undefined
 				}
 			}
+
+			// Checkpoints: this iteration executed at least one tool call (we only
+			// reach here when `calls.length > 0`), so snapshot the workspace.
+			// Non-fatal — see saveIterationCheckpoint.
+			await this.saveIterationCheckpoint(iteration)
 		}
 
 		// maxIterations exhausted without completion.
@@ -425,6 +608,59 @@ export class HeadlessSession {
 			error: `Max iterations (${maxIterations}) reached without task completion`,
 			iterations: maxIterations,
 			toolCalls,
+		}
+	}
+
+	/**
+	 * Checkpoints: initialize the shadow git service and save the baseline
+	 * checkpoint before iteration 1 (mirrors Zoo Code's `Task.ts:~1447`).
+	 * A no-op when checkpoints are off (config or read-only executor). Never
+	 * throws — any failure is logged as a warning and disables checkpoints
+	 * for the rest of this session, exactly like the memory-recall pattern
+	 * above.
+	 */
+	private async initCheckpoints(): Promise<void> {
+		if (!this.checkpointsActive) {
+			return
+		}
+		try {
+			const service = createCheckpointService({
+				taskId: this.sessionId,
+				workspaceRoot: this.config.workspaceRoot,
+				checkpointDir: this.config.checkpointDir,
+				log: (message) => this.logger.debug(`[checkpoints] ${message}`),
+			})
+			await service.init()
+			await service.save(`Task: ${this.sessionId}, Time: ${Date.now()}`, { allowEmpty: true })
+			this.checkpointService = service
+			this.logger.info("[checkpoints] baseline checkpoint saved", { taskId: this.sessionId })
+		} catch (error) {
+			this.checkpointService = null
+			this.logger.warn("[checkpoints] init/baseline failed (non-fatal; checkpoints disabled for this session)", {
+				error: error instanceof Error ? error.message : String(error),
+			})
+		}
+	}
+
+	/**
+	 * Checkpoints: save a per-iteration snapshot after a turn that executed
+	 * at least one tool call (mirrors Zoo Code's
+	 * `presentAssistantMessage.ts:~988`, `task.checkpointSave(true)`). Non-fatal
+	 * — a failure here is logged and silently drops checkpointing for the rest
+	 * of the session (never fails the run).
+	 */
+	private async saveIterationCheckpoint(iteration: number): Promise<void> {
+		if (!this.checkpointsActive || !this.checkpointService) {
+			return
+		}
+		try {
+			await this.checkpointService.save(`Task: ${this.sessionId}, Time: ${Date.now()}`, { allowEmpty: true })
+			this.logger.debug("[checkpoints] iteration checkpoint saved", { iteration })
+		} catch (error) {
+			this.checkpointService = null
+			this.logger.warn("[checkpoints] save failed (non-fatal; checkpoints disabled for the rest of this session)", {
+				error: error instanceof Error ? error.message : String(error),
+			})
 		}
 	}
 

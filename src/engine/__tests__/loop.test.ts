@@ -16,6 +16,8 @@ import * as path from "node:path"
 import { HeadlessSession } from "../loop.js"
 import { createHeadlessExecutor } from "../../tools/executor.js"
 import { parseToolCall } from "../parser.js"
+import { readUsageFile } from "../usage.js"
+import type { SessionBudget } from "../../budget/budget.js"
 import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } from "../types.js"
 
 // ─── Fake LLM client ─────────────────────────────────────────────────────────
@@ -49,6 +51,58 @@ function textReply(content: string): ChatMessage {
 	return { role: "assistant", content }
 }
 
+/**
+ * Live-snapshot probe client: reports a fixed token usage per call and, from
+ * the second call on, runs `probe()` BEFORE returning — at that point the
+ * previous iteration's `*.live.json` snapshot must already be on disk (it is
+ * written right after each iteration's LLM call). Used to observe the live
+ * snapshot mid-run without exposing the session's private sessionId.
+ */
+class LiveProbeClient implements LlmClient {
+	calls = 0
+
+	constructor(
+		private readonly script: Array<(req: LlmRequest) => ChatMessage>,
+		private readonly probe: () => Promise<void>,
+	) {}
+
+	async createChatCompletion(request: LlmRequest): Promise<LlmResponse> {
+		this.calls++
+		if (this.calls > 1) {
+			await this.probe()
+		}
+		const step = this.script.shift()
+		if (!step) {
+			throw new Error("LiveProbeClient: script exhausted (model kept calling)")
+		}
+		return {
+			message: step(request),
+			usage: { promptTokens: 100, completionTokens: 50 },
+		}
+	}
+}
+
+/** Read the single `*.live.json` snapshot in a usage dir (asserts it exists). */
+async function readLiveSnapshot(usageDir: string): Promise<Record<string, unknown>> {
+	const entries = await fs.readdir(usageDir)
+	const live = entries.find((e) => e.endsWith(".live.json"))
+	assert.ok(live, `expected a *.live.json snapshot in ${usageDir}, found: ${entries.join(", ") || "(empty)"}`)
+	return JSON.parse(await fs.readFile(path.join(usageDir, live), "utf-8")) as Record<string, unknown>
+}
+
+/** Assert a live snapshot is gone and a single final `.jsonl` record remains. */
+async function assertCompletedCleanup(ws: string, expectedStatus: string): Promise<void> {
+	const usageDir = path.join(ws, ".headlesscode", "usage")
+	const entries = await fs.readdir(usageDir)
+	assert.ok(entries.some((e) => e.endsWith(".jsonl")), "final .jsonl record written")
+	assert.ok(!entries.some((e) => e.endsWith(".live.json")), "live snapshot removed on completion")
+	const jsonl = entries.find((e) => e.endsWith(".jsonl"))
+	assert.ok(jsonl, "found the .jsonl file")
+	const records = await readUsageFile(path.join(usageDir, jsonl))
+	assert.equal(records.length, 1)
+	assert.equal(records[0].status, expectedStatus)
+}
+
 async function makeSession(options: {
 	task: string
 	client: LlmClient
@@ -56,6 +110,7 @@ async function makeSession(options: {
 	maxIterations?: number
 	consecutiveErrorLimit?: number
 	windowSize?: number
+	budget?: SessionBudget
 }) {
 	const session = new HeadlessSession({
 		workspaceRoot: options.workspaceRoot,
@@ -66,6 +121,11 @@ async function makeSession(options: {
 		maxIterations: options.maxIterations ?? 10,
 		consecutiveErrorLimit: options.consecutiveErrorLimit ?? 3,
 		windowSize: options.windowSize ?? 40,
+		budget: options.budget ?? null,
+		// Checkpoints are default-on and would otherwise write real shadow-git
+		// commits to ~/.headlesscode/checkpoints on every test run; this suite
+		// isn't testing checkpoints, so keep tests hermetic and fast.
+		checkpoints: false,
 	})
 	return session
 }
@@ -238,6 +298,117 @@ async function testMaxIterationsBound(): Promise<void> {
 	}
 }
 
+// ─── Live (in-progress) usage snapshot lifecycle ─────────────────────────────
+
+async function testLiveSnapshotCreatedAndUpdatedDuringIterations(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-live-"))
+	try {
+		const usageDir = path.join(ws, ".headlesscode", "usage")
+		let probes = 0
+		const client = new LiveProbeClient(
+			[
+				() => toolCall("write_to_file", { path: "a.txt", content: "hello" }),
+				() => toolCall("write_to_file", { path: "b.txt", content: "world" }),
+				() => toolCall("attempt_completion", { result: "done" }),
+			],
+			async () => {
+				probes++
+				const snap = await readLiveSnapshot(usageDir)
+				assert.equal(snap.status, "running")
+				assert.equal(typeof snap.sessionId, "string")
+				assert.ok(String(snap.sessionId).length > 0)
+				assert.equal(snap.workspaceRoot, ws)
+				assert.equal(snap.mode, "code")
+				assert.equal(snap.model, "fake-model")
+				assert.equal(snap.endedAt, undefined, "live snapshot has no endedAt")
+				assert.equal(typeof snap.costUsd, "number")
+				if (probes === 1) {
+					// Probe runs before call 2: the iteration-1 snapshot.
+					assert.equal(snap.iterations, 1)
+					assert.equal(snap.inputTokens, 100)
+					assert.equal(snap.outputTokens, 50)
+				} else {
+					// Probe runs before call 3: overwritten in place for iteration 2.
+					assert.equal(snap.iterations, 2)
+					assert.equal(snap.inputTokens, 200)
+					assert.equal(snap.outputTokens, 100)
+				}
+			},
+		)
+		const session = await makeSession({ task: "write two files", client, workspaceRoot: ws })
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(probes, 2, "probe ran before both the 2nd and 3rd LLM calls")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testLiveSnapshotRemovedOnSuccess(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-live-succ-"))
+	try {
+		const client = new FakeLlmClient([
+			() => toolCall("write_to_file", { path: "a.txt", content: "x" }),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({ task: "write a file", client, workspaceRoot: ws })
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		await assertCompletedCleanup(ws, "success")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testLiveSnapshotRemovedOnError(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-live-err-"))
+	try {
+		// Model keeps calling an unimplemented stub tool (apply_diff) → bounded
+		// failure (status "error") after `consecutiveErrorLimit` mistakes.
+		const client = new FakeLlmClient([
+			() => toolCall("apply_diff", { path: "a.ts", diff: "x" }),
+			() => toolCall("apply_diff", { path: "a.ts", diff: "x" }),
+			() => toolCall("apply_diff", { path: "a.ts", diff: "x" }),
+		])
+		const session = await makeSession({
+			task: "apply a diff",
+			client,
+			workspaceRoot: ws,
+			consecutiveErrorLimit: 3,
+		})
+		const result = await session.run()
+		assert.equal(result.status, "error", `expected bounded failure, got ${JSON.stringify(result)}`)
+		await assertCompletedCleanup(ws, "error")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testLiveSnapshotRemovedOnBudgetExceeded(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-live-budget-"))
+	try {
+		// Budget maxIterations: 1 → iteration 1 runs (live snapshot written),
+		// iteration 2's pre-call tick() trips the budget → status "error",
+		// reason "budget".
+		const client = new FakeLlmClient([
+			() => toolCall("write_to_file", { path: "a.txt", content: "x" }),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({
+			task: "write a file",
+			client,
+			workspaceRoot: ws,
+			budget: { maxIterations: 1 },
+		})
+		const result = await session.run()
+		assert.equal(result.status, "error", `expected budget abort, got ${JSON.stringify(result)}`)
+		assert.equal(result.reason, "budget")
+		await assertCompletedCleanup(ws, "budget")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -247,6 +418,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["scenario 4: malformed JSON args -> parser fallback exercised", testScenario4MalformedJsonArgs],
 	["path-traversal guard rejects escaping paths", testPathTraversalGuard],
 	["max iterations -> bounded failure", testMaxIterationsBound],
+	["live snapshot: created + updated in place during a running session's iterations", testLiveSnapshotCreatedAndUpdatedDuringIterations],
+	["live snapshot: removed on successful completion", testLiveSnapshotRemovedOnSuccess],
+	["live snapshot: removed when the session ends with an error", testLiveSnapshotRemovedOnError],
+	["live snapshot: removed when the session is aborted by budget limits", testLiveSnapshotRemovedOnBudgetExceeded],
 ]
 
 async function main(): Promise<void> {

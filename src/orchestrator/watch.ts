@@ -4,19 +4,28 @@
  * Replaces the airunner GUI wake-up (xdotool phone-home / wmctrl) with
  * process/IPC signals written by scripts/run-worker.sh:
  *
- *   <worktree>/.harness.pid    worker PID (written at launch)
- *   <worktree>/.harness.exit   worker exit code (written on harness exit)
- *   <worktree>/.harness.done/  completion marker DIR (mkdir-based, atomic,
- *                              same lock-mutex convention as phone-home.sh)
- *   <worktree>/harness.log     worker stdout+stderr
+ *   <worktree>/.harness.pid              worker PID (written at launch)
+ *   <worktree>/.harness.exit             worker exit code (written on harness exit)
+ *   <worktree>/.harness.done/            completion marker DIR (mkdir-based, atomic,
+ *                                        same lock-mutex convention as phone-home.sh)
+ *   <worktree>/.harness.needs-decision   decision escalation marker (JSON:
+ *                                        question/suggestions?/askedAt — see
+ *                                        src/tools/executor.ts's
+ *                                        ask_followup_question handler)
+ *   <worktree>/harness.log               worker stdout+stderr
  *
  * `watchGroups` polls those markers (short configurable interval, default 5s —
  * NO fixed 20s sleep), updates `.orchestrator-state.json` (status
- * done|failed, exit code, summary from the harness.log tail, last_activity),
- * and invokes an optional per-group callback (used to trigger the reviewer)
- * when a group transitions to done. A stall guard flags groups whose spawned
- * timestamp exceeds HEADLESSCODE_STALL_TIMEOUT (default 2h, matching
- * airunner's 2h stall detection) with no completion.
+ * done|failed|blocked, exit code, summary from the harness.log tail,
+ * last_activity), and invokes an optional per-group callback (used to trigger
+ * the reviewer) when a group transitions to done. A stall guard flags groups
+ * whose spawned timestamp exceeds HEADLESSCODE_STALL_TIMEOUT (default 2h,
+ * matching airunner's 2h stall detection) with no completion — a group that is
+ * "blocked" (needs-decision marker present) is exempt from the stall guard
+ * while the marker exists: waiting on a real question is not stalling. Once
+ * the marker disappears (answered via scripts/headlesscode-answer.sh, or the
+ * worker's wait timed out and it moved on), the group flows back to "running"
+ * on the next poll.
  */
 
 import { execFileSync } from "node:child_process"
@@ -24,6 +33,7 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 
+import type { UsageRecord } from "../engine/usage.js"
 import { loadStateSync, saveStateSync, updateGroup, type OrchestratorGroup, type OrchestratorState } from "./state.js"
 
 export const DEFAULT_POLL_INTERVAL_MS = 5_000
@@ -43,6 +53,11 @@ export interface WatchOptions {
 	stallTimeoutMs?: number
 	/** Optional callback fired when a group transitions to done/failed. */
 	onGroupUpdate?: (group: OrchestratorGroup, state: OrchestratorState) => void | Promise<void>
+	/**
+	 * Injectable stderr writer for the proactive status-change signal
+	 * (default: process.stderr) — lets tests capture the emitted lines.
+	 */
+	stderrWriter?: (text: string) => void
 	/** Abort the watch loop (e.g. from a parent orchestrator). */
 	signal?: AbortSignal
 }
@@ -80,11 +95,118 @@ function readExitCode(wtPath: string): number | undefined {
 	}
 }
 
+/**
+ * Cost/token monitoring (workstream 3): sum every usage record found under
+ * `<worktree>/.headlesscode/usage/*.jsonl` (the worker's session usage — see
+ * `src/engine/usage.ts`). Defensive: a worktree is expected to hold exactly
+ * one worker session's usage file, but a worktree reused across multiple
+ * sessions would have more than one file (or a file with multiple lines) —
+ * summing all records found is the correct rollup either way. Returns
+ * undefined when no usage data is found (missing dir, no files, or every
+ * file unreadable/empty) so callers don't stamp a spurious all-zero usage.
+ */
+function readWorktreeUsage(wtPath: string): OrchestratorGroup["usage"] | undefined {
+	const dir = path.join(wtPath, ".headlesscode", "usage")
+	let files: string[]
+	try {
+		files = fs.readdirSync(dir).filter((f) => f.endsWith(".jsonl"))
+	} catch {
+		return undefined
+	}
+
+	let costUsd = 0
+	let inputTokens = 0
+	let outputTokens = 0
+	let iterations = 0
+	let found = false
+
+	for (const file of files) {
+		let raw: string
+		try {
+			raw = fs.readFileSync(path.join(dir, file), "utf-8")
+		} catch {
+			continue
+		}
+		for (const line of raw.split("\n")) {
+			const trimmed = line.trim()
+			if (!trimmed) {
+				continue
+			}
+			try {
+				const record = JSON.parse(trimmed) as Partial<UsageRecord>
+				if (typeof record.sessionId !== "string") {
+					continue
+				}
+				costUsd += typeof record.costUsd === "number" ? record.costUsd : 0
+				inputTokens += typeof record.inputTokens === "number" ? record.inputTokens : 0
+				outputTokens += typeof record.outputTokens === "number" ? record.outputTokens : 0
+				iterations += typeof record.iterations === "number" ? record.iterations : 0
+				found = true
+			} catch {
+				// Loose validation: skip malformed / partially-written lines.
+			}
+		}
+	}
+
+	return found ? { costUsd, inputTokens, outputTokens, iterations } : undefined
+}
+
+/** Sum every group's `usage` into a round-level total (see OrchestratorState.totalUsage). */
+export function computeTotalUsage(state: OrchestratorState): OrchestratorState["totalUsage"] {
+	let costUsd = 0
+	let inputTokens = 0
+	let outputTokens = 0
+	let iterations = 0
+	let found = false
+	for (const group of state.groups) {
+		if (!group.usage) {
+			continue
+		}
+		found = true
+		costUsd += group.usage.costUsd
+		inputTokens += group.usage.inputTokens
+		outputTokens += group.usage.outputTokens
+		iterations += group.usage.iterations
+	}
+	return found ? { costUsd, inputTokens, outputTokens, iterations } : undefined
+}
+
 function hasDoneMarker(wtPath: string): boolean {
 	try {
 		return fs.statSync(path.join(wtPath, ".harness.done")).isDirectory()
 	} catch {
 		return false
+	}
+}
+
+/** Decision-escalation marker contents (see src/tools/executor.ts). */
+interface NeedsDecision {
+	question: string
+	suggestions?: string[]
+	askedAt?: string
+}
+
+/** Read + loosely validate `.harness.needs-decision`; undefined when absent/malformed. */
+function readNeedsDecision(wtPath: string): NeedsDecision | undefined {
+	let raw: string
+	try {
+		raw = fs.readFileSync(path.join(wtPath, ".harness.needs-decision"), "utf-8")
+	} catch {
+		return undefined
+	}
+	try {
+		const parsed: unknown = JSON.parse(raw)
+		if (parsed === null || typeof parsed !== "object" || typeof (parsed as Record<string, unknown>).question !== "string") {
+			return undefined
+		}
+		const obj = parsed as Record<string, unknown>
+		return {
+			question: obj.question as string,
+			...(Array.isArray(obj.suggestions) ? { suggestions: obj.suggestions as string[] } : {}),
+			...(typeof obj.askedAt === "string" ? { askedAt: obj.askedAt as string } : {}),
+		}
+	} catch {
+		return undefined
 	}
 }
 
@@ -123,6 +245,7 @@ export function inspectGroup(
 			exitCode === 0
 				? `worker completed cleanly (exit 0)${summary ? " — see harness.log" : ""}`
 				: `worker exited ${exitCode ?? "with unknown code"} (see harness.log)`
+		const usage = readWorktreeUsage(wtPath)
 		return {
 			status,
 			last_activity: {
@@ -132,12 +255,40 @@ export function inspectGroup(
 			commits: group.commits ?? [],
 			...(exitCode !== undefined ? { exit_code: exitCode } : {}),
 			summary: summary.slice(0, 4000),
+			...(usage ? { usage } : {}),
 		}
 	}
 
 	// No done marker yet.
 	if (isTerminal) {
 		return undefined
+	}
+
+	// Decision escalation: the worker's ask_followup_question call is blocked
+	// waiting for a human/orchestrator answer. Not stalling — exempt from the
+	// stall guard below while the marker is present.
+	const decision = readNeedsDecision(wtPath)
+	if (decision) {
+		const alreadyBlocked =
+			group.status === "blocked" &&
+			group.blocked?.question === decision.question &&
+			group.blocked?.askedAt === decision.askedAt
+		if (alreadyBlocked) {
+			return undefined
+		}
+		return {
+			status: "blocked",
+			blocked: decision,
+			last_activity: {
+				note: `blocked: awaiting decision — ${decision.question}`,
+			},
+		}
+	}
+
+	// Marker gone: a previously blocked group resumed (answered or timed out
+	// and fell back to autonomous decision) — flow back to "running".
+	if (group.status === "blocked") {
+		return { status: "running", blocked: undefined }
 	}
 
 	// Stall guard: spawned long ago with no completion and no pid → stalled.
@@ -167,6 +318,42 @@ function lastCommit(wtPath: string): string {
 }
 
 /**
+ * Print a concise, human-facing status-change line to the watch loop's
+ * stderr writer (proactive monitoring — see plans/live-monitoring-gaps.md,
+ * gap 2). Only ever called on a genuine status transition by watchGroups,
+ * so a group that stays blocked/running never spams the same lines. The
+ * review verdict per group is intentionally omitted: the orchestrator CLI
+ * already prints it (`[orchestrate] <group> review verdict: …`) after
+ * running the reviewer.
+ */
+function printStatusTransition(
+	write: (text: string) => void,
+	group: OrchestratorGroup,
+	patch: Partial<Omit<OrchestratorGroup, "name">>,
+	newStatus: string,
+): void {
+	const worktree = group.worktree ?? `.worktrees/${group.name}`
+	switch (newStatus) {
+		case "blocked": {
+			const question = patch.blocked?.question ?? ""
+			write(`[orchestrate] BLOCKED: group "${group.name}" needs a decision — "${question}"\n`)
+			write(`[orchestrate]   answer with: scripts/headlesscode-answer.sh ${worktree} "<answer>"\n`)
+			break
+		}
+		case "done":
+			write(`[orchestrate] DONE: group "${group.name}" finished (exit ${patch.exit_code ?? 0})\n`)
+			break
+		case "failed":
+			write(
+				`[orchestrate] FAILED: group "${group.name}" failed` +
+					(patch.stalled ? " (stalled)" : ` (exit ${patch.exit_code ?? "?"})`) +
+					"\n",
+			)
+			break
+	}
+}
+
+/**
  * Poll all non-terminal groups until every group is terminal (done/failed),
  * the abort signal fires, or the callback aborts. State changes are persisted
  * to the state file; `onGroupUpdate` is called after each persisted change.
@@ -181,6 +368,16 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 		options.stallTimeoutMs ?? Number(process.env.HEADLESSCODE_STALL_TIMEOUT ?? DEFAULT_STALL_TIMEOUT_MS)
 
 	let state = loadStateSync(statePath)
+
+	const writeStderr = options.stderrWriter ?? ((text: string) => process.stderr.write(text))
+
+	// Previously-seen status per group, seeded from the loaded state: the
+	// loop only prints a status-change line on a genuine transition, so a
+	// group that stays blocked/running across polls never re-spams it.
+	const lastSeenStatus = new Map<string, string>()
+	for (const g of state.groups) {
+		lastSeenStatus.set(g.name, g.status)
+	}
 
 	const isTerminal = (g: OrchestratorGroup): boolean => g.status === "done" || g.status === "failed"
 
@@ -199,7 +396,22 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 			if (!patch) {
 				continue
 			}
+			// Proactive status-change signal (gap 2): print a clear stderr line
+			// on the transition into blocked / done / failed — only when the
+			// status genuinely changed, never on every poll while a group stays
+			// in the same state.
+			if (typeof patch.status === "string") {
+				const prevStatus = lastSeenStatus.get(group.name) ?? group.status
+				if (patch.status !== prevStatus) {
+					printStatusTransition(writeStderr, group, patch, patch.status)
+				}
+				lastSeenStatus.set(group.name, patch.status)
+			}
 			state = updateGroup(state, group.name, patch)
+			// Cost/token monitoring: recompute the round-level total whenever a
+			// group's usage may have changed (i.e. every state update — cheap,
+			// and keeps totalUsage never stale).
+			state = { ...state, totalUsage: computeTotalUsage(state) }
 			saveStateSync(statePath, state)
 			changed = true
 			const updated = state.groups.find((g) => g.name === group.name)
