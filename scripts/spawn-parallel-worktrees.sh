@@ -144,6 +144,14 @@ for spec in "$@"; do
         git -C "$REPO_ROOT" worktree add -b "$branch" "$wt_path" master
     fi
 
+    # zoo-code/ (the upstream reference clone used as a vendoring source,
+    # see ATTRIBUTION.md) is gitignored, so `git worktree add` never
+    # copies it in. Symlink it from the main checkout so a worker in this
+    # worktree can still read upstream source at the pinned commit.
+    if [ -d "$REPO_ROOT/zoo-code" ] && [ ! -e "$wt_path/zoo-code" ]; then
+        ln -s ../../zoo-code "$wt_path/zoo-code"
+    fi
+
     # Compute unique ports for this worktree.
     # +1 base so offset=0 never collides with the main repo's own
     # already-running stack, which sits on the plain defaults
