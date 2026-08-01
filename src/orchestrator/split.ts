@@ -1,0 +1,193 @@
+/**
+ * Issue-splitting heuristics — deterministic TS port.
+ *
+ * SOURCE: the airunner repo's `multi-agent-orchestrator` custom mode
+ * (`~Projects/airunner/.roomodes`), Step 2 "Decide the split". The four
+ * heuristics are reused unchanged in spirit:
+ *
+ *   1. Isolate anything touching a hot path alone (request handling,
+ *      database sessions/migrations, auth, encryption, anything the
+ *      codebase's own conventions flag as high blast radius) — never
+ *      bundle a hot-path change with unrelated work, and never put two
+ *      independent hot-path changes in the same worktree if avoidable.
+ *   2. Group same-shape mechanical work together (e.g. multiple "split
+ *      this file" issues, multiple "add test coverage" issues) — they
+ *      share a risk profile and review checklist, and batching them
+ *      means one worker/PR/review cycle instead of several.
+ *   3. Never let a worktree exceed roughly a day of sequential work for
+ *      one agent — if a single issue is enormous, it can be its own
+ *      worktree; don't pad it with more work.
+ *   4. Prefer 2-4 worktrees over 5+ in most cases.
+ *
+ * This module turns those judgment calls into a small deterministic
+ * algorithm so the same decisions can be made headlessly, re-verified in
+ * unit tests, and printed by `orchestrate --dry-run` before anything is
+ * spawned. It is pure (no fs, no network) and fully unit-testable.
+ *
+ * Output naming follows the airunner task-file convention:
+ *   plans/parallel-tasks/<name>-issue<numbers>.md
+ * e.g. `w1-issue27.md`, `w2-issue29-36.md`.
+ */
+
+/** One open GitHub issue (airunner-style `gh issue view --json ...` shape). */
+export interface SplitIssue {
+	number: number
+	title: string
+	body?: string
+}
+
+/** A proposed worktree group, one harness worker will own it. */
+export interface WorktreeSpec {
+	/** Worktree name, e.g. `w1`. */
+	name: string
+	/** Issue numbers assigned to this worktree, ascending. */
+	issues: number[]
+	/** Task file name under plans/parallel-tasks/ (airunner convention). */
+	taskFile: string
+}
+
+/** Hot-path keywords from heuristic 1 (matched against title + body). */
+const HOT_PATH_RE = /(request|handler|migration|database|session|auth|encryption|crypto|password|token)/i
+
+/**
+ * Same-shape mechanical-work patterns from heuristic 2 (matched against the
+ * title). The key is the "shape" used to group issues; all issues whose title
+ * matches the same pattern share a risk profile + review checklist.
+ */
+const SAME_SHAPE_PATTERNS: Array<{ key: string; re: RegExp }> = [
+	// "split" + "decompose" are the same mechanical shape — airunner grouped
+	// #29 "Split the 10 multi-class files" with #36 "Decompose remaining 25
+	// files" in one worktree (w2-issue29-36.md) for exactly this reason.
+	{ key: "split", re: /(split|decompose)/i },
+	{ key: "coverage", re: /coverage/i },
+	{ key: "test", re: /test/i },
+	{ key: "docs", re: /docs/i },
+	{ key: "refactor", re: /refactor/i },
+]
+
+/** Issues with no recognized mechanical shape land here. */
+const GENERIC_KEY = "generic"
+
+/** Max issues in a generic (non-same-shape) group — heuristic 3 (~1 day). */
+export const GENERIC_GROUP_CAP = 2
+
+/** Max issues in a same-shape group — mechanical batches can be larger. */
+export const SAME_SHAPE_GROUP_CAP = 3
+
+/** Prefer at most this many groups (heuristic 4: 2-4, never 5+). */
+export const MAX_GROUPS = 4
+
+function isHotPath(issue: SplitIssue): boolean {
+	const haystack = `${issue.title}\n${issue.body ?? ""}`
+	return HOT_PATH_RE.test(haystack)
+}
+
+function shapeOf(issue: SplitIssue): string {
+	for (const { key, re } of SAME_SHAPE_PATTERNS) {
+		if (re.test(issue.title)) {
+			return key
+		}
+	}
+	return GENERIC_KEY
+}
+
+function capFor(shape: string): number {
+	return shape === GENERIC_KEY ? GENERIC_GROUP_CAP : SAME_SHAPE_GROUP_CAP
+}
+
+/** Internal group shape used while deciding; not part of the public spec. */
+interface InternalGroup {
+	shape: string
+	issues: number[]
+}
+
+/** Sort issue-number lists ascending (stable, deterministic). */
+function sortedIssues(numbers: number[]): number[] {
+	return [...numbers].sort((a, b) => a - b)
+}
+
+function minIssue(group: InternalGroup): number {
+	return group.issues.length > 0 ? Math.min(...group.issues) : Number.MAX_SAFE_INTEGER
+}
+
+/**
+ * Split issues into worktree groups using the airunner heuristics.
+ *
+ * - Every hot-path issue is isolated alone (heuristic 1).
+ * - Non-hot-path issues are batched by mechanical shape, capped at
+ *   `capFor(shape)` issues per group (heuristics 2 + 3).
+ * - If that yields more than `MAX_GROUPS` groups, the smallest groups are
+ *   merged (same-shape pairs first, then the smallest remaining) until the
+ *   round fits in 2-4 worktrees (heuristic 4).
+ *
+ * @param issues issues to split (order-independent; output is sorted)
+ * @returns worktree specs in ascending min-issue order, named w1..wN with
+ *          airunner-convention task files
+ */
+export function splitIssues(issues: SplitIssue[]): WorktreeSpec[] {
+	if (issues.length === 0) {
+		return []
+	}
+
+	const hot: SplitIssue[] = []
+	const rest: SplitIssue[] = []
+	for (const issue of issues) {
+		;(isHotPath(issue) ? hot : rest).push(issue)
+	}
+	hot.sort((a, b) => a.number - b.number)
+	rest.sort((a, b) => a.number - b.number)
+
+	// Heuristic 1: each hot-path issue alone.
+	const groups: InternalGroup[] = hot.map((issue) => ({ shape: "hot", issues: [issue.number] }))
+
+	// Heuristics 2 + 3: batch same-shape work, cap non-same-shape at ~2.
+	const buckets = new Map<string, InternalGroup[]>()
+	for (const issue of rest) {
+		const shape = shapeOf(issue)
+		const list = buckets.get(shape) ?? []
+		let bucket = list[list.length - 1]
+		if (!bucket || bucket.issues.length >= capFor(shape)) {
+			bucket = { shape, issues: [] }
+			list.push(bucket)
+			buckets.set(shape, list)
+		}
+		bucket.issues.push(issue.number)
+	}
+	for (const list of buckets.values()) {
+		groups.push(...list)
+	}
+
+	// Deterministic group ordering by smallest issue number.
+	groups.sort((a, b) => minIssue(a) - minIssue(b))
+
+	// Heuristic 4: never exceed MAX_GROUPS. Merge smallest groups, preferring
+	// same-shape pairs so merged work still shares one review checklist.
+	while (groups.length > MAX_GROUPS) {
+		groups.sort((a, b) => {
+			const bySize = a.issues.length - b.issues.length
+			if (bySize !== 0) {
+				return bySize
+			}
+			return minIssue(a) - minIssue(b)
+		})
+		const smallest = groups[0]
+		const sameShape = groups
+			.slice(1)
+			.find((g) => g.shape === smallest.shape && g.shape !== "hot")
+		const target = sameShape ?? groups[1]
+		target.issues = sortedIssues([...target.issues, ...smallest.issues])
+		groups.splice(0, 1)
+	}
+
+	// Final sort by min issue number, then assign names + task files.
+	groups.sort((a, b) => minIssue(a) - minIssue(b))
+	return groups.map((group, index) => {
+		const issues = sortedIssues(group.issues)
+		const name = `w${index + 1}`
+		return {
+			name,
+			issues,
+			taskFile: `${name}-issue${issues.join("-")}.md`,
+		}
+	})
+}

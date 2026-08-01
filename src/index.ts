@@ -1,0 +1,47 @@
+/**
+ * headlesscode package entry — runs the CLI when executed directly
+ * (`tsx src/index.ts`, `npm run dev`) and re-exports the public API for
+ * programmatic use.
+ */
+
+import { main } from "./cli.js"
+
+// Run the CLI when this file is executed directly (e.g. `tsx src/index.ts`).
+main()
+	.then((code) => {
+		process.exitCode = code
+	})
+	.catch((err) => {
+		process.stderr.write(`headlesscode: unexpected error: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`)
+		process.exitCode = 2
+	})
+
+export * from "./cli.js"
+export * from "./memory/index.js"
+export { OpenRouterClient, OpenRouterError, DEFAULT_MODEL } from "./llm/openrouter.js"
+export { HeadlessSession, truncateHistory } from "./engine/loop.js"
+export { Logger } from "./engine/logger.js"
+export { parseToolCalls, parseToolCall, bestEffortPartialJson } from "./engine/parser.js"
+export {
+	createHeadlessExecutor,
+	ToolExecutor,
+	resolveWithinWorkspace,
+	PathTraversalError,
+} from "./tools/executor.js"
+export {
+	buildSystemPrompt,
+	loadCustomModes,
+	selectToolsForMode,
+	EXECUTABLE_TOOL_NAMES,
+} from "./engine/prompt.js"
+export type {
+	ChatMessage,
+	ChatTool,
+	ChatToolCall,
+	LlmClient,
+	LlmRequest,
+	LlmResponse,
+	ParsedToolCall,
+	SessionResult,
+	ToolResult,
+} from "./engine/types.js"

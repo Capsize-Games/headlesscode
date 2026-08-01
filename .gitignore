@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Logs and temp files
+*.log
+.DS_Store
+*.tmp
+
+# Phase 3 memory subsystem default storage (facts + session summaries JSONL)
+/.headlesscode/
+
+# Parallel orchestration worktrees (spawned per-issue, cleaned up by the harness)
+.worktrees/
+
+# Environment
+.env
+.env.*
+
+# Upstream Zoo Code clone used as a vendoring source (see VENDOR-NOTES.md)
+# This is a build input, not part of the harness. Root-anchored so the vendored
+# portable core under src/vendor/zoo-code/ (Apache-2.0, with attribution) stays tracked.
+/zoo-code/

@@ -1,0 +1,25 @@
+{
+	"compilerOptions": {
+		"target": "ES2022",
+		"lib": ["ES2022"],
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"strict": true,
+		"esModuleInterop": true,
+		"allowSyntheticDefaultImports": true,
+		"skipLibCheck": true,
+		"forceConsistentCasingInFileNames": true,
+		"resolveJsonModule": true,
+		"isolatedModules": true,
+		"noEmit": true,
+		"types": ["node"],
+		"paths": {
+			"@roo-code/types": ["./src/vendor/zoo-code/types/index.ts"],
+			"vscode": ["./src/vendor/zoo-code/shim/vscode.ts"],
+			"os-name": ["./src/vendor/zoo-code/shim/os-name.ts"],
+			"strip-bom": ["./src/vendor/zoo-code/shim/strip-bom.ts"],
+			"@anthropic-ai/sdk": ["./src/vendor/zoo-code/shim/anthropic.ts"]
+		}
+	},
+	"include": ["src"]
+}

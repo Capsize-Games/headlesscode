@@ -1,0 +1,407 @@
+#!/usr/bin/env tsx
+/**
+ * headlesscode — Phase 1 headless CLI entry.
+ *
+ * Exit codes:
+ *   0  success
+ *   1  task failed / max iterations / bounded failure
+ *   2  usage or configuration error (bad args, missing API key)
+ */
+
+import * as fs from "node:fs"
+import * as path from "node:path"
+
+import { LocalMemoryStore } from "./memory/local.js"
+import type { MemoryStore } from "./memory/types.js"
+import { OpenRouterClient } from "./llm/openrouter.js"
+import { HeadlessSession } from "./engine/loop.js"
+import { Logger } from "./engine/logger.js"
+import { buildSystemPrompt, loadCustomModes, selectToolsForMode } from "./engine/prompt.js"
+import { orchestrateMain } from "./orchestrator/cli.js"
+import { watchMain } from "./watcher/cli.js"
+
+const VERSION = "0.1.0"
+
+interface CliOptions {
+	mode: string
+	task?: string
+	taskFile?: string
+	workspace?: string
+	model?: string
+	maxIterations?: number
+	consecutiveErrorLimit?: number
+	/** Phase 6: per-session cost cap, USD (also $HEADLESSCODE_MAX_COST_USD). */
+	maxCostUsd?: number
+	/** Phase 6: per-session duration cap, ms (also $HEADLESSCODE_MAX_DURATION_MS). */
+	maxDurationMs?: number
+	logFile?: string
+	memoryDir?: string
+	noMemory: boolean
+	dryRun: boolean
+	version: boolean
+	help: boolean
+}
+
+const USAGE = `headlesscode — headless coding-agent harness (Phase 1 engine)
+
+Usage:
+  headlesscode --task "<task text>" [options]
+  headlesscode --task-file <path> [options]
+  headlesscode --dry-run [options]          # build system prompt + validate config, no LLM call
+
+Subcommands:
+  headlesscode orchestrate --repo <path> --issue <n>... [--qa] [--deploy] [--dry-run]
+              Run a full parallel orchestration round
+              (split → spawn → review → QA → deploy gate). See
+              \`npx tsx src/cli.ts orchestrate --help\` for full options.
+  headlesscode watch --owner <o> --repo <r> --label <label> [--run-once]
+              Poll GitHub for labeled issues and fan out into orchestration
+              batches (idempotent). See
+              \`npx tsx src/cli.ts watch --help\` for full options.
+
+Options:
+  --mode <slug>              Mode to run in (built-in or from .roomodes). Default: code
+  --task <text>              The task description for the agent
+  --task-file <path>         Read the task from a file (relative to workspace)
+  --workspace <root>         Workspace root (default: $HEADLESSCODE_WORKSPACE_ROOT or cwd)
+  --model <id>               OpenRouter model id (default: $OPENROUTER_MODEL or deepseek/deepseek-chat)
+  --max-iterations <n>       Loop iteration cap (default: 50)
+  --consecutive-error-limit <n>  Consecutive mistakes before giving up (default: 3)
+  --log-file <path>          Also append structured logs to this file
+  --memory-dir <path>        Store project memory (facts + session summaries) under
+                             <path>. Enables Phase 3 memory. Default (when enabled):
+                             $HEADLESSCODE_MEMORY_DIR or <workspace>/.headlesscode/memory
+  --no-memory                Explicitly disable memory even if HEADLESSCODE_MEMORY_DIR is set
+  --max-cost-usd <n>         Phase 6: per-session cost cap in USD (decimal, e.g. 0.05).
+                             Default: $HEADLESSCODE_MAX_COST_USD; off when neither is set
+  --max-duration-ms <n>      Phase 6: per-session wall-clock cap in ms. Default:
+                             $HEADLESSCODE_MAX_DURATION_MS; off when neither is set.
+                             When a cap trips the session aborts with reason "budget"
+  --dry-run                  Build the system prompt, validate .roomodes/rules loading,
+                             then exit without calling the LLM (no API key needed)
+  --version                  Print version and exit
+  --help                     Show this help and exit
+
+Environment:
+  OPENROUTER_API_KEY         Required (except --dry-run)
+  OPENROUTER_MODEL           Default model id
+  OPENROUTER_HTTP_REFERER    Optional HTTP-Referer header
+  OPENROUTER_APP_TITLE       Optional X-Title header
+  HEADLESSCODE_WORKSPACE_ROOT  Default workspace root
+  HEADLESSCODE_MEMORY_DIR    Default memory dir (memory enabled when set)
+  HEADLESSCODE_PROJECT       Project scope for memory (default: workspace basename)
+`
+
+export function parseArgs(argv: string[]): { options: CliOptions; error?: string } {
+	const options: CliOptions = {
+		mode: "code",
+		noMemory: false,
+		dryRun: false,
+		version: false,
+		help: false,
+	}
+
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i]
+		const eq = arg.indexOf("=")
+		const flag = eq === -1 ? arg : arg.slice(0, eq)
+		const inlineValue = eq === -1 ? undefined : arg.slice(eq + 1)
+		const next = (): string | undefined => {
+			if (inlineValue !== undefined) {
+				return inlineValue
+			}
+			const v = argv[i + 1]
+			if (v === undefined || v.startsWith("--")) {
+				return undefined
+			}
+			i++
+			return v
+		}
+
+		switch (flag) {
+			case "--mode":
+			case "--task":
+			case "--task-file":
+			case "--workspace":
+			case "--model":
+			case "--log-file": {
+				const value = next()
+				if (value === undefined) {
+					return { options, error: `Missing value for ${flag}` }
+				}
+				switch (flag) {
+					case "--mode":
+						options.mode = value
+						break
+					case "--task":
+						options.task = value
+						break
+					case "--task-file":
+						options.taskFile = value
+						break
+					case "--workspace":
+						options.workspace = value
+						break
+					case "--model":
+						options.model = value
+						break
+					case "--log-file":
+						options.logFile = value
+						break
+				}
+				break
+			}
+			case "--max-iterations":
+			case "--consecutive-error-limit": {
+				const value = next()
+				const num = value === undefined ? Number.NaN : Number(value)
+				if (!Number.isInteger(num) || num <= 0) {
+					return { options, error: `${flag} requires a positive integer` }
+				}
+				if (flag === "--max-iterations") {
+					options.maxIterations = num
+				} else {
+					options.consecutiveErrorLimit = num
+				}
+				break
+			}
+			case "--max-cost-usd": {
+				const value = next()
+				const num = value === undefined ? Number.NaN : Number(value)
+				if (!Number.isFinite(num) || num <= 0) {
+					return { options, error: "--max-cost-usd requires a positive number (USD, decimal allowed)" }
+				}
+				options.maxCostUsd = num
+				break
+			}
+			case "--max-duration-ms": {
+				const value = next()
+				const num = value === undefined ? Number.NaN : Number(value)
+				if (!Number.isInteger(num) || num <= 0) {
+					return { options, error: "--max-duration-ms requires a positive integer" }
+				}
+				options.maxDurationMs = num
+				break
+			}
+			case "--memory-dir": {
+				const value = next()
+				if (value === undefined) {
+					return { options, error: "Missing value for --memory-dir" }
+				}
+				options.memoryDir = value
+				break
+			}
+			case "--no-memory":
+				options.noMemory = true
+				break
+			case "--dry-run":
+				options.dryRun = true
+				break
+			case "--version":
+				options.version = true
+				break
+			case "--help":
+			case "-h":
+				options.help = true
+				break
+			default:
+				return { options, error: `Unknown argument: ${arg}` }
+		}
+	}
+
+	return { options }
+}
+
+export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
+	// Phase 2 subcommand: `headlesscode orchestrate ...` — delegates to the
+	// orchestrator module (split → spawn → watch → review). Keeps the Phase 1
+	// run path untouched.
+	if (argv[0] === "orchestrate") {
+		return orchestrateMain(argv.slice(1))
+	}
+
+	// Phase 5 subcommand: `headlesscode watch ...` — GitHub issue watcher
+	// (poll label → split → spawn → durable idempotency state).
+	if (argv[0] === "watch") {
+		return watchMain(argv.slice(1))
+	}
+
+	const { options, error } = parseArgs(argv)
+	if (error) {
+		process.stderr.write(`headlesscode: ${error}\n\n${USAGE}`)
+		return 2
+	}
+	if (options.help) {
+		process.stdout.write(USAGE)
+		return 0
+	}
+	if (options.version) {
+		process.stdout.write(`headlesscode ${VERSION}\n`)
+		return 0
+	}
+
+	const workspaceRoot = path.resolve(options.workspace ?? process.env.HEADLESSCODE_WORKSPACE_ROOT ?? process.cwd())
+	const logger = new Logger({ level: "info", filePath: options.logFile })
+
+	// ── dry-run: no API key required ──────────────────────────────────────────
+	if (options.dryRun) {
+		try {
+			const customModes = await loadCustomModes(workspaceRoot)
+			const built = await buildSystemPrompt({
+				workspaceRoot,
+				mode: options.mode,
+				customModes,
+			})
+			const tools = selectToolsForMode(options.mode, customModes)
+
+			process.stdout.write(built.prompt + "\n")
+			process.stdout.write(
+				`\n───── dry-run summary ─────\n` +
+					`mode:             ${options.mode}\n` +
+					`workspace:        ${workspaceRoot}\n` +
+					`custom modes:     ${customModes.length ? customModes.map((m) => m.slug).join(", ") : "(none, using built-ins)"}\n` +
+					`exposed tools:    ${tools.map((t) => (t.type === "function" ? t.function.name : t.type)).join(", ")}\n` +
+					`system prompt:    ${built.prompt.length} chars\n`,
+			)
+			logger.info("dry-run complete", { mode: options.mode, workspaceRoot })
+			return 0
+		} catch (err) {
+			process.stderr.write(`headlesscode: dry-run failed: ${err instanceof Error ? err.message : String(err)}\n`)
+			return 2
+		}
+	}
+
+	// ── real run: API key required ────────────────────────────────────────────
+	const apiKey = process.env.OPENROUTER_API_KEY
+	if (!apiKey) {
+		process.stderr.write(
+			"headlesscode: OPENROUTER_API_KEY is not set.\n" +
+				"  Export it (e.g. export OPENROUTER_API_KEY=sk-or-...) or use --dry-run to\n" +
+				"  validate the prompt/config without calling the LLM.\n",
+		)
+		return 2
+	}
+
+	if (!options.task && !options.taskFile) {
+		process.stderr.write(`headlesscode: provide a task with --task <text> or --task-file <path>\n\n${USAGE}`)
+		return 2
+	}
+	if (options.task && options.taskFile) {
+		process.stderr.write("headlesscode: use either --task or --task-file, not both\n")
+		return 2
+	}
+
+	let taskText = options.task ?? ""
+	if (options.taskFile) {
+		const taskFilePath = path.resolve(workspaceRoot, options.taskFile)
+		try {
+			taskText = fs.readFileSync(taskFilePath, "utf-8")
+		} catch (err) {
+			process.stderr.write(
+				`headlesscode: cannot read task file '${taskFilePath}': ${err instanceof Error ? err.message : String(err)}\n`,
+			)
+			return 2
+		}
+	}
+	if (taskText.trim() === "") {
+		process.stderr.write("headlesscode: task text is empty\n")
+		return 2
+	}
+
+	const model = options.model ?? process.env.OPENROUTER_MODEL ?? undefined
+	const client = new OpenRouterClient({ apiKey, defaultModel: model })
+
+	// Phase 3 memory: OFF by default (preserves pre-Phase-3 behavior). Enabled
+	// only by --memory-dir or $HEADLESSCODE_MEMORY_DIR; --no-memory forces off.
+	const memory = resolveMemory(options, workspaceRoot)
+	const project = process.env.HEADLESSCODE_PROJECT ?? path.basename(workspaceRoot)
+
+	// Phase 6 per-session budget: flags win over the env fallbacks
+	// ($HEADLESSCODE_MAX_COST_USD / $HEADLESSCODE_MAX_DURATION_MS — set by
+	// run-worker.sh / run-qa.sh for workers). Off when neither is set.
+	const maxCostUsd = options.maxCostUsd ?? envNumber("HEADLESSCODE_MAX_COST_USD")
+	const maxDurationMs = options.maxDurationMs ?? envNumber("HEADLESSCODE_MAX_DURATION_MS")
+	const budget =
+		maxCostUsd !== undefined || maxDurationMs !== undefined ? { maxCostUsd, maxDurationMs } : undefined
+
+	const session = new HeadlessSession({
+		workspaceRoot,
+		mode: options.mode,
+		model,
+		taskText,
+		maxIterations: options.maxIterations,
+		consecutiveErrorLimit: options.consecutiveErrorLimit,
+		llmClient: client,
+		logger,
+		memory,
+		project,
+		budget,
+	})
+
+	const result = await session.run()
+
+	if (session.memoryStats) {
+		process.stdout.write(
+			`[memory] project="${project}" recalled ${session.memoryStats.recalledFacts} fact(s) / ${session.memoryStats.recalledSessions} session(s); recorded ${session.memoryStats.recordedFacts} fact(s) / ${session.memoryStats.recordedSessions} session(s)\n`,
+		)
+	}
+
+	if (result.budgetUsage) {
+		process.stdout.write(
+			`[budget] cost $${result.budgetUsage.costUsd.toFixed(6)}, elapsed ${result.budgetUsage.elapsedMs}ms, iterations ${result.budgetUsage.iterations}, model ${result.budgetUsage.model}\n`,
+		)
+	}
+
+	if (result.status === "success") {
+		logger.info("session succeeded", { iterations: result.iterations, toolCalls: result.toolCalls })
+		process.stdout.write(result.result + "\n")
+		return 0
+	}
+
+	logger.error("session failed", { error: result.error, iterations: result.iterations, reason: result.reason })
+	if (result.reason === "budget") {
+		process.stderr.write(`headlesscode: task aborted by budget: ${result.error ?? "budget exceeded"}\n`)
+		return 1
+	}
+	process.stderr.write(`headlesscode: task failed: ${result.error ?? "unknown error"}\n`)
+	return 1
+}
+
+/** Parse a positive finite number from env (undefined when unset/invalid). */
+function envNumber(name: string): number | undefined {
+	const raw = process.env[name]
+	if (raw === undefined || raw === "") {
+		return undefined
+	}
+	const n = Number(raw)
+	return Number.isFinite(n) && n > 0 ? n : undefined
+}
+
+/**
+	* Resolve the Phase 3 memory store. Default OFF (null) to preserve existing
+	* behavior; enabled by --memory-dir or $HEADLESSCODE_MEMORY_DIR. --no-memory
+	* forces OFF even when the env var is set.
+	*/
+function resolveMemory(options: CliOptions, workspaceRoot: string): MemoryStore | null {
+	if (options.noMemory) {
+		return null
+	}
+	const dir = options.memoryDir ?? process.env.HEADLESSCODE_MEMORY_DIR
+	if (!dir) {
+		return null
+	}
+	return new LocalMemoryStore({ dir: path.resolve(dir) })
+}
+
+// Allow `tsx src/cli.ts` / `headlesscode` / `npm run cli` to run directly.
+if (import.meta.url === `file://${process.argv[1]}`) {
+	main().then(
+		(code) => {
+			process.exitCode = code
+		},
+		(err) => {
+			process.stderr.write(`headlesscode: unexpected error: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`)
+			process.exitCode = 2
+		},
+	)
+}
