@@ -11,7 +11,7 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 
-import { buildReworkTaskFileContent, handleReviewVerdict, parseOrchestrateArgs } from "../cli.js"
+import { buildReworkTaskFileContent, buildSpawnEnv, handleReviewVerdict, parseOrchestrateArgs } from "../cli.js"
 import { watchGroups } from "../watch.js"
 import { defaultState, loadStateSync, saveStateSync, updateGroup, type OrchestratorGroup, type OrchestratorState } from "../state.js"
 import type { ReviewResult } from "../reviewer.js"
@@ -246,6 +246,108 @@ async function testWatchGroupsRepollsGroupAfterReworkReset(): Promise<void> {
 	}
 }
 
+// ─── First-spawn env: the resolved worker model reaches spawnSync ────────────
+// The mode-models-first-spawn fix: orchestrateMain resolves the worker's model
+// BEFORE the initial spawnSync and threads it into that call's env as
+// OPENROUTER_MODEL (the spawner + run-worker.sh inherit it). buildSpawnEnv is
+// the extracted, exported builder — inspect its output env, don't just check
+// "no error".
+
+async function testSpawnEnvCarriesResolvedModelWhenModeMapped(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		// A mode-models.json entry for the worker's mode (code).
+		await fs.mkdir(path.join(repo, ".headlesscode"), { recursive: true })
+		await fs.writeFile(
+			path.join(repo, ".headlesscode", "mode-models.json"),
+			JSON.stringify({ code: "deepseek/deepseek-code-model" }, null, 2) + "\n",
+			"utf-8",
+		)
+		const baseEnv = { OPENROUTER_MODEL: "deepseek/deepseek-env-model" }
+		const { env, workerModel } = buildSpawnEnv({ repo, mode: "code", env: baseEnv })
+		assert.equal(workerModel, "deepseek/deepseek-code-model", "the config entry resolves for the worker's mode")
+		assert.equal(
+			env.OPENROUTER_MODEL,
+			"deepseek/deepseek-code-model",
+			"the spawn env carries the RESOLVED model (not the raw env var)",
+		)
+		// The rest of the spawn env contract is untouched.
+		assert.equal(env.TARGET_REPO, repo)
+		assert.equal(env.ORCHESTRATOR_MODE, "code")
+		assert.equal(env.HEADLESSCODE_PROJECT, path.basename(repo))
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testSpawnEnvCarriesResolvedModelFromDefaultKey(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		await fs.mkdir(path.join(repo, ".headlesscode"), { recursive: true })
+		await fs.writeFile(
+			path.join(repo, ".headlesscode", "mode-models.json"),
+			JSON.stringify({ _default: "deepseek/deepseek-default-model" }, null, 2) + "\n",
+			"utf-8",
+		)
+		const { env, workerModel } = buildSpawnEnv({ repo, mode: "code", env: {} })
+		assert.equal(workerModel, "deepseek/deepseek-default-model")
+		assert.equal(env.OPENROUTER_MODEL, "deepseek/deepseek-default-model")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testSpawnEnvExplicitModelFlagBeatsConfig(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		await fs.mkdir(path.join(repo, ".headlesscode"), { recursive: true })
+		await fs.writeFile(
+			path.join(repo, ".headlesscode", "mode-models.json"),
+			JSON.stringify({ code: "deepseek/deepseek-from-file" }, null, 2) + "\n",
+			"utf-8",
+		)
+		const { env, workerModel } = buildSpawnEnv({
+			repo,
+			mode: "code",
+			explicitModel: "deepseek/deepseek-from-flag",
+			env: {},
+		})
+		assert.equal(workerModel, "deepseek/deepseek-from-flag", "an explicit --model always wins (rule 1)")
+		assert.equal(env.OPENROUTER_MODEL, "deepseek/deepseek-from-flag")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testSpawnEnvNoConfigKeepsRawEnvModel(): Promise<void> {
+	// Regression: no mode-models.json — today's blanket override pattern
+	// (OPENROUTER_MODEL=... orchestrate ...) must pass the raw env value
+	// through unchanged.
+	const repo = await tmpRepo()
+	try {
+		const { env, workerModel } = buildSpawnEnv({
+			repo,
+			mode: "code",
+			env: { OPENROUTER_MODEL: "deepseek/deepseek-env-model" },
+		})
+		assert.equal(workerModel, "deepseek/deepseek-env-model")
+		assert.equal(env.OPENROUTER_MODEL, "deepseek/deepseek-env-model")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testSpawnEnvNoConfigNoEnvLeavesModelUnset(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const { env, workerModel } = buildSpawnEnv({ repo, mode: "code", env: {} })
+		assert.equal(workerModel, undefined, "nothing configured -> no model (the CLI's own default applies)")
+		assert.equal(env.OPENROUTER_MODEL, undefined, "no OPENROUTER_MODEL injected when nothing resolves")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -258,6 +360,11 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["multiple groups rework independently", testMultipleGroupsReworkIndependently],
 	["--max-rework-cycles parses (default 3, custom, invalid)", testParseOrchestrateArgsMaxReworkCycles],
 	["watchGroups re-polls a group after a rework reset", testWatchGroupsRepollsGroupAfterReworkReset],
+	["spawn env carries the resolved model when the worker's mode is mapped", testSpawnEnvCarriesResolvedModelWhenModeMapped],
+	["spawn env resolves from the _default key", testSpawnEnvCarriesResolvedModelFromDefaultKey],
+	["spawn env: explicit --model flag beats the config file", testSpawnEnvExplicitModelFlagBeatsConfig],
+	["spawn env: no config -> raw OPENROUTER_MODEL passes through unchanged", testSpawnEnvNoConfigKeepsRawEnvModel],
+	["spawn env: nothing configured -> no model injected", testSpawnEnvNoConfigNoEnvLeavesModelUnset],
 ]
 
 async function main(): Promise<void> {

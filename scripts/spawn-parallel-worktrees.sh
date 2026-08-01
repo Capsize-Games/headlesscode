@@ -37,9 +37,16 @@
 #   HEADLESSCODE_CLI     harness CLI command (default: "npx tsx src/cli.ts",
 #                        resolved from the headlesscode repo root)
 #   HEADLESSCODE_ROOT    headlesscode repo root containing src/cli.ts
+#   SPAWN_MODEL          explicit model override for EVERY worker (like an
+#                        --model flag: beats .headlesscode/mode-models.json
+#                        entries; default: unset, each worker's mode resolves
+#                        its own model from <repo>/.headlesscode/mode-models.json
+#                        via src/config/mode-models.ts, falling back to
+#                        $OPENROUTER_MODEL which then flows to run-worker.sh)
 #
-# Requires: node >= 18 (used only to merge the state JSON — the harness is a
-# node project, so this is not a new dependency), git, bash.
+# Requires: node >= 18 (used only to merge the state JSON + resolve the
+# per-mode model — the harness is a node project, so this is not a new
+# dependency), git, bash.
 
 set -euo pipefail
 
@@ -98,6 +105,42 @@ merge_state() {
         fs.mkdirSync(path.dirname(stateFile), { recursive: true })
         fs.writeFileSync(stateFile, JSON.stringify(state, null, 2) + "\n")
     ' "$state_file" "$patch_file"
+}
+
+# ── Per-mode model resolution ────────────────────────────────────────────────
+# Resolve the OpenRouter model id for a worktree's harness mode via the REAL
+# TypeScript logic (src/config/mode-models.ts, resolveModelForMode) — never a
+# bash reimplementation. Precedence (documented in mode-models.ts): an
+# explicit SPAWN_MODEL override -> <repo>/.headlesscode/mode-models.json[mode]
+# -> ...["_default"] -> $OPENROUTER_MODEL -> empty (the CLI's own default).
+#
+# The config is read from $REPO_ROOT, NOT the worktree: a fresh `git worktree
+# add` does not copy .headlesscode/ into the worktree (it is gitignored in the
+# harness repo), so only the real repo's copy is guaranteed to exist.
+#
+# Prints the resolved model id on stdout (possibly empty); exits non-zero on
+# any error so a broken mode-models.json fails loudly instead of silently
+# spawning workers with the wrong model (mode-models.ts's own fail-loudly rule).
+resolve_mode_model() {
+    local mode="$1"
+    local workspace_root="$2"
+    local model_override="${SPAWN_MODEL:-}"
+    # cd into the harness root so tsx resolves the RELATIVE import
+    # ./src/config/mode-models.ts against the harness repo, not against the
+    # caller's cwd (which may be the target repo or anywhere else).
+    (
+        cd "$HARNESS_ROOT"
+        npx tsx -e '
+            import { resolveModelForMode } from "./src/config/mode-models.ts"
+            const [workspaceRoot, mode, explicitModel] = process.argv.slice(1)
+            const resolved = resolveModelForMode({
+                workspaceRoot,
+                mode,
+                explicitModel: explicitModel === "" ? undefined : explicitModel,
+            })
+            if (resolved !== undefined) process.stdout.write(resolved)
+        ' "$workspace_root" "$mode" "$model_override"
+    )
 }
 
 # Extract issue numbers from a task file basename following the airunner
@@ -219,10 +262,20 @@ EOF
     rm -f "$patch_file"
 
     # ── Launch the headless worker (replaces code + sleep 20 + xdotool) ─────
+    # Resolve the worker's model FIRST so mode-models.json affects the very
+    # first spawn, not just rework re-spawns. Passing the resolved value
+    # explicitly (--model) keeps run-worker.sh's CLI free of any env var the
+    # worktree may or may not inherit, and an empty resolution adds no flag at
+    # all (the worker CLI then applies its own default).
     echo "  Launching headless harness worker for '$name' (mode $ORCH_MODE)..."
+    WORKER_MODEL="$(resolve_mode_model "$ORCH_MODE" "$REPO_ROOT")"
+    MODEL_ARGS=()
+    if [ -n "$WORKER_MODEL" ]; then
+        MODEL_ARGS=(--model "$WORKER_MODEL")
+    fi
     WORKER_PID="$(ORCHESTRATOR_MODE="$ORCH_MODE" bash "$HARNESS_ROOT/scripts/run-worker.sh" \
-        "$wt_path" "ORCHESTRATOR_TASK.md" --mode "$ORCH_MODE")"
-    echo "  Worker pid: $WORKER_PID (log: $wt_path/harness.log)"
+        "$wt_path" "ORCHESTRATOR_TASK.md" --mode "$ORCH_MODE" "${MODEL_ARGS[@]}")"
+    echo "  Worker pid: $WORKER_PID (model: ${WORKER_MODEL:-<unset — CLI default>}, log: $wt_path/harness.log)"
 
     # ── Record "running" now that the worker is up ──────────────────────────
     patch_file="$(mktemp)"
