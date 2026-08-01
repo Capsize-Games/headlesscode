@@ -1,17 +1,24 @@
 /**
- * `headlesscode dashboard` subcommand — a local, read-only, auto-refreshing
- * cost/token dashboard (workstream 3).
+ * `headlesscode dashboard` subcommand — a local, auto-refreshing cost/token
+ * dashboard (workstream 3) + live per-session event feed + pause/resume
+ * control (live worker monitoring).
  *
  *   npx tsx src/cli.ts dashboard [--port 4390] [--repo <path>]
  *
  * Thin dispatch to src/dashboard/server.ts — no logic duplicated here. When
  * `--repo` is omitted the page still starts but shows no sessions/round data
  * (the aggregation gracefully degrades — see src/dashboard/aggregate.ts).
+ *
+ * NOTE (Phase 3 scope change): the dashboard is no longer purely read-only —
+ * the page's pause/resume buttons issue state-changing POSTs to the running
+ * worker (see src/dashboard/server.ts's header note). Still local-only +
+ * no-auth (binds 127.0.0.1), but that assumption needs revisiting if this is
+ * ever exposed beyond localhost.
  */
 
 import { DEFAULT_DASHBOARD_PORT, startDashboardServer } from "./server.js"
 
-const DASHBOARD_USAGE = `headlesscode dashboard — local read-only cost/token dashboard
+const DASHBOARD_USAGE = `headlesscode dashboard — local cost/token dashboard + live worker control
 
 Usage:
   headlesscode dashboard [--port 4390] [--repo <path>]

@@ -1,5 +1,6 @@
 /**
- * Cost/token dashboard — pure aggregation logic (workstream 3).
+ * Cost/token dashboard — pure aggregation logic (workstream 3) + live
+ * per-session event feed (live worker monitoring).
  *
  * Scans `.headlesscode/usage/*.jsonl` files (see `src/engine/usage.ts` for
  * the on-disk shape/writer) under a repo root — both the repo's own usage
@@ -7,6 +8,12 @@
  * worktree (orchestrated runs) — and, when `.worktrees/.orchestrator-state.json`
  * exists, folds in the round-level rollup (per-group usage + any group
  * currently `status: "blocked"`, surfacing the pending question).
+ *
+ * `readSessionEvents` (the Phase 1 live-monitoring feed) reads a session's
+ * `<workspaceRoot>/.headlesscode/events/<sessionId>.jsonl` (see
+ * `src/engine/events.ts` for the on-disk shape/writer) from the repo root's
+ * own events dir OR any `.worktrees/<name>/` events dir — the same dual
+ * search `buildSummary` performs for usage files.
  *
  * Deliberately pure + fs-only: no `node:http` here, so it's unit-testable
  * without spinning up the dashboard server (see `src/dashboard/server.ts`
@@ -20,6 +27,7 @@
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
 
+import { eventsFilePath, readEventsFile, type EventRecord } from "../engine/events.js"
 import { readLiveUsageFile, readUsageFile, type LiveUsageRecord, type UsageRecord } from "../engine/usage.js"
 import { loadState, type OrchestratorGroup, type OrchestratorState } from "../orchestrator/state.js"
 
@@ -167,6 +175,102 @@ export function sumSessions(rows: SessionRow[]): UsageTotals {
 		totals.sessionCount += 1
 	}
 	return totals
+}
+
+/**
+ * Locate the events feed file for one session id, searching the repo root's
+ * own events dir AND every `.worktrees/<name>/` worktree events dir (the same
+ * dual search `buildSummary` performs for usage files). Returns the file path
+ * + a display `source` label, or undefined when no feed exists anywhere.
+ */
+export async function findSessionEventsFile(
+	repo: string,
+	sessionId: string,
+): Promise<{ file: string; source: string } | undefined> {
+	const repoRoot = path.resolve(repo)
+
+	// 1. Direct (non-orchestrated) sessions run against the repo root itself.
+	const rootFile = eventsFilePath(repoRoot, sessionId)
+	try {
+		await fs.access(rootFile)
+		return { file: rootFile, source: "." }
+	} catch {
+		// Not here — check worktrees.
+	}
+
+	// 2. Orchestrated worker sessions, one events dir per worktree.
+	const worktreesDir = path.join(repoRoot, ".worktrees")
+	let worktreeNames: string[] = []
+	try {
+		const entries = await fs.readdir(worktreesDir, { withFileTypes: true })
+		worktreeNames = entries.filter((e) => e.isDirectory()).map((e) => e.name)
+	} catch {
+		worktreeNames = []
+	}
+	for (const name of worktreeNames) {
+		const file = eventsFilePath(path.join(worktreesDir, name), sessionId)
+		try {
+			await fs.access(file)
+			return { file, source: `.worktrees/${name}` }
+		} catch {
+			// Keep looking.
+		}
+	}
+	return undefined
+}
+
+/**
+ * Read a session's structured event feed, optionally starting from a byte
+ * offset (`sinceOffset` — the incremental "give me only what's new since I
+ * last asked" polling idea, like `tail -f`). Returns the new events plus the
+ * next offset to pass on the following poll.
+ *
+ * Pure + fs-only, never throws for a missing feed: a session with no events
+ * file yet (or already cleaned up) yields `{ events: [], nextOffset: 0 }`.
+ * Loose validation is inherited from `readEventsFile` (malformed /
+ * partially-written trailing lines are skipped).
+ */
+export async function readSessionEvents(
+	repo: string,
+	sessionId: string,
+	sinceOffset = 0,
+): Promise<{ events: EventRecord[]; nextOffset: number }> {
+	const found = await findSessionEventsFile(repo, sessionId)
+	if (!found) {
+		return { events: [], nextOffset: 0 }
+	}
+	const events = await readEventsFile(found.file)
+	// Byte-offset semantics (tail -f): a line is considered consumed only
+	// when its END (start + encoded length, newline included) lies at or
+	// before the offset — a partially-appended line (the caller's offset
+	// lands mid-line) is returned whole. Lines after the consumed prefix are
+	// returned; nextOffset is the byte offset just past the last returned
+	// line, so the next poll passes it back as sinceOffset.
+	let fileSize = 0
+	try {
+		fileSize = (await fs.stat(found.file)).size
+	} catch {
+		fileSize = 0
+	}
+	// The offset never exceeds the current file size, so a shrunk/recreated
+	// file degrades to "read from the start".
+	const safeOffset = Math.min(Math.max(0, sinceOffset), fileSize)
+	const encoded = events.map((e) => JSON.stringify(e) + "\n")
+	let startIndex = 0
+	let bytesSeen = 0
+	for (let i = 0; i < encoded.length; i++) {
+		const lineBytes = Buffer.byteLength(encoded[i])
+		if (safeOffset < bytesSeen + lineBytes) {
+			// This line is not fully consumed — it (and everything after) is new.
+			startIndex = i
+			break
+		}
+		bytesSeen += lineBytes
+		startIndex = i + 1
+	}
+	const newEvents = events.slice(startIndex)
+	const newBytes = encoded.slice(startIndex).reduce((acc, line) => acc + Buffer.byteLength(line), 0)
+	return { events: newEvents, nextOffset: safeOffset + newBytes }
 }
 
 /**
