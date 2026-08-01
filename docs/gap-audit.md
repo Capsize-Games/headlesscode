@@ -2,9 +2,12 @@
 
 Snapshot of known behavioral gaps between the headless harness and the interactive VS Code
 extension it's ported from. Documented for prioritization, not all scheduled — checkpoints,
-decision escalation, cost/token monitoring, and diff-based editing (previously the four
-biggest gaps) are now built; see [`docs/checkpoints.md`](checkpoints.md) and this doc's own
-history for context.
+decision escalation, cost/token monitoring, diff-based editing, command/protected-file
+permissions parity, and an automatic rework loop for `orchestrate` (previously the biggest
+gaps) are now built; see [`docs/checkpoints.md`](checkpoints.md) and this doc's own history
+for context. Also fixed along the way: `execute_command`'s timeout used to `SIGKILL` the
+process, contradicting the vendored tool's own documented "keeps running in the background"
+contract — it now actually backgrounds it, matching upstream.
 
 ## Diff-based editing — built
 
@@ -18,30 +21,26 @@ Prior to this, every edit went through `write_to_file`, a full-file overwrite �
 entire large file rewritten for a one-line change) and unsafe (a truncated/malformed model
 response silently clobbered the whole file with no partial-match/hunk validation).
 
-## Settings/permissions parity — none
+## Settings/permissions parity — built
 
-Zoo Code's VS Code settings panel backs a real enforcement layer
-(`zoo-code/src/core/auto-approval/index.ts` + `packages/types/src/global-settings.ts`):
+Ported the load-bearing parts of Zoo Code's settings-backed enforcement layer
+(`zoo-code/src/core/auto-approval/` + `packages/types/src/global-settings.ts`) as
+harness-level CLI flags/env vars/a committed `permissions.json`, since there's no settings
+UI: `src/permissions/commands.ts` (compound-command splitting, dangerous shell-substitution
+detection, longest-prefix-match `allowedCommands`/`deniedCommands` with ties going to deny)
+and `src/permissions/protected-files.ts` (glob-based protected-file writes, default-refused,
+with an explicit `--allow-protected-writes` escape hatch). Enforced in
+`src/tools/executor.ts` before a command runs or a file is written — not just requested via
+the system prompt. Commands default-allow when unconfigured (preserves prior behavior);
+`deniedCommands` and dangerous substitutions always apply regardless. Covered by both unit
+tests and a dedicated e2e suite (`scripts/e2e-permissions/run.sh`) proving a real CLI
+invocation actually refuses a protected write / denied command and that the escape hatch
+really works, not just that the underlying matching functions are correct in isolation.
 
-- Per-category auto-approve toggles (`alwaysAllowReadOnly`, `alwaysAllowWrite`,
-  `alwaysAllowExecute`, `alwaysAllowMcp`, ...)
-- `allowedCommands` / `deniedCommands` — regex allow/deny lists gating `execute_command`
-- `alwaysAllowWriteProtected` — a protected-files concept
-- `alwaysAllowWriteOutsideWorkspace` / `alwaysAllowReadOnlyOutsideWorkspace` — workspace
-  boundary guards
-- `followupAutoApproveTimeoutMs` — the interactive analogue of the decision-escalation
-  timeout just built for headlesscode workers
-
-headlesscode's executor (`src/tools/executor.ts`) has **none of this**: `execute_command`
-runs anything the model asks with no allow/deny list, and `write_to_file` has only a
-path-traversal guard (workspace-boundary enforcement is actually *stricter* than Zoo Code's
-default there, since it's hard-denied rather than a toggle) — but nothing protects specific
-files like `.env` from being overwritten by the model itself. This matters more, not less,
-once VS Code (and its accidental human-approval safety net) is out of the loop entirely.
-
-**Recommendation**: port `allowedCommands`/`deniedCommands` + a protected-file list as
-harness-level config (CLI flags/env, since there's no settings UI), enforced in the executor
-before a command/write runs — not just requested via the system prompt.
+Not ported: `alwaysAllowWriteOutsideWorkspace`/`alwaysAllowReadOnlyOutsideWorkspace` (moot —
+headlesscode's workspace-boundary guard is a hard path-traversal deny, not a toggle, and is
+already stricter than Zoo Code's default) and `alwaysAllowMcp`/`alwaysAllowSubtasks` (no MCP
+client or subtask concept exists to gate — see below).
 
 ## Other known gaps (lower priority, mostly by design)
 
