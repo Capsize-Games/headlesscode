@@ -243,10 +243,40 @@ customModes:
 
       ## Step 3 — Monitor, don't babysit
 
-      Do not poll tightly. Periodically check
-      `.worktrees/.orchestrator-state.json` for each group's status
-      (`spawned`/`running`/`done`/`failed`/`blocked`/`needs-human`) and,
-      for a running view of cost/tokens/cache-hit-rate across the round:
+      Two failure modes to avoid, both wasteful for different reasons:
+      tight polling (a fresh `execute_command` + your own LLM turn every
+      few seconds — burns real tokens on nothing) and a single blind long
+      `sleep N` before checking anything (looks efficient but means a
+      `"blocked"` group can sit unanswered for up to the full N, and you
+      have zero visibility until the sleep ends even if everything
+      finished in the first 10 seconds).
+
+      Instead, use ONE `execute_command` per monitoring pass that loops
+      internally with short sleeps and exits the moment there's something
+      to act on — one tool call/turn covers a whole watch window, but you
+      react in ~20-30s, not minutes:
+      ```bash
+      for i in $(seq 1 20); do
+        STATE=$(node -e 'const s=JSON.parse(require("fs").readFileSync(".worktrees/.orchestrator-state.json","utf-8")); for (const g of s.groups) console.log(g.name, "|", g.status, "|", (g.blocked&&g.blocked.question)||"")')
+        echo "=== check $i ==="
+        echo "$STATE"
+        # Exit the loop early the moment ANY group needs attention or
+        # everything has reached a terminal status -- don't wait out the
+        # rest of the window once there's something to act on.
+        echo "$STATE" | grep -q "blocked" && { echo "BLOCKED — stopping to act"; break; }
+        echo "$STATE" | grep -qE "running|spawned" || { echo "all terminal — stopping"; break; }
+        sleep 20
+      done
+      ```
+      Adjust the loop count/sleep interval to the round's expected size
+      (a handful of small tasks vs. a large multi-hour round), but always
+      keep the interior sleep short (15-30s) and always break out early on
+      `blocked` or all-terminal — never let the loop run to completion
+      silently past something that needed a reaction. If the loop exits
+      because everything's still running with nothing to act on, just
+      call it again for the next watch window.
+
+      For a running view of cost/tokens/cache-hit-rate across the round:
       ```
       npx tsx src/cli.ts dashboard --repo $(pwd)
       ```
