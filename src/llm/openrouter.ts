@@ -115,13 +115,43 @@ export class OpenRouterClient implements LlmClient {
 			)
 		}
 
-		const data = (await response.json().catch(() => undefined)) as
-			| { choices?: Array<{ message?: ChatMessage }>; usage?: RawUsage }
+		// Read the raw body first (not response.json() directly): a 200 status
+		// doesn't guarantee a well-formed choices[] payload — OpenRouter/upstream
+		// providers can return HTTP 200 with an `{error: {...}}` envelope, an
+		// empty/truncated body (e.g. a gateway cutting the connection on a slow
+		// generation), or a `choices[0]` with `finish_reason` set but no
+		// `message`. Surfacing the raw body distinguishes these cases instead of
+		// collapsing them all into one uninformative "no choices[0].message".
+		const rawBody = await response.text()
+		let data:
+			| {
+					choices?: Array<{ message?: ChatMessage; finish_reason?: string }>
+					usage?: RawUsage
+					error?: { message?: string; code?: unknown }
+			  }
 			| undefined
+		try {
+			data = JSON.parse(rawBody)
+		} catch {
+			const excerpt = rawBody.length > 500 ? `${rawBody.slice(0, 500)}…` : rawBody
+			throw new OpenRouterError(`OpenRouter returned HTTP 200 with a non-JSON/unparseable body: ${excerpt || "(empty)"}`)
+		}
+
+		if (data?.error) {
+			throw new OpenRouterError(
+				`OpenRouter returned HTTP 200 with an error envelope: ${data.error.message ?? JSON.stringify(data.error)}`,
+			)
+		}
 
 		const message = data?.choices?.[0]?.message
 		if (!data || !message) {
-			throw new OpenRouterError("OpenRouter response contained no choices[0].message")
+			const finishReason = data?.choices?.[0]?.finish_reason
+			const excerpt = rawBody.length > 500 ? `${rawBody.slice(0, 500)}…` : rawBody
+			throw new OpenRouterError(
+				`OpenRouter response contained no choices[0].message` +
+					(finishReason ? ` (finish_reason: ${finishReason})` : "") +
+					`. Raw body: ${excerpt || "(empty)"}`,
+			)
 		}
 
 		return {

@@ -35,6 +35,8 @@ interface CliOptions {
 	consecutiveErrorLimit?: number
 	/** Sliding-window history cap, in messages (also see DEFAULT_WINDOW_SIZE in engine/loop.ts). */
 	windowSize?: number
+	/** Per-LLM-call abort timeout, ms (default: DEFAULT_LLM_TIMEOUT_MS in engine/loop.ts). */
+	llmTimeoutMs?: number
 	/** Phase 6: per-session cost cap, USD (also $HEADLESSCODE_MAX_COST_USD). */
 	maxCostUsd?: number
 	/** Phase 6: per-session duration cap, ms (also $HEADLESSCODE_MAX_DURATION_MS). */
@@ -94,6 +96,8 @@ Options:
   --window-size <n>          Sliding-window history cap, in messages, before the
                              oldest are evicted (default: 300; see DEFAULT_WINDOW_SIZE
                              in src/engine/loop.ts for why)
+  --llm-timeout-ms <n>       Per-LLM-call abort timeout, ms (default: 300000 / 5 min
+                             — reasoning models can take a while on a heavy turn)
   --log-file <path>          Also append structured logs to this file
   --memory-dir <path>        Store project memory (facts + session summaries) under
                              <path>. Enables Phase 3 memory. Default (when enabled):
@@ -213,7 +217,8 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 			}
 			case "--max-iterations":
 			case "--consecutive-error-limit":
-			case "--window-size": {
+			case "--window-size":
+			case "--llm-timeout-ms": {
 				const value = next()
 				const num = value === undefined ? Number.NaN : Number(value)
 				if (!Number.isInteger(num) || num <= 0) {
@@ -223,8 +228,10 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 					options.maxIterations = num
 				} else if (flag === "--consecutive-error-limit") {
 					options.consecutiveErrorLimit = num
-				} else {
+				} else if (flag === "--window-size") {
 					options.windowSize = num
+				} else {
+					options.llmTimeoutMs = num
 				}
 				break
 			}
@@ -471,6 +478,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		maxIterations: options.maxIterations,
 		consecutiveErrorLimit: options.consecutiveErrorLimit,
 		windowSize: options.windowSize,
+		llmTimeoutMs: options.llmTimeoutMs,
 		llmClient: client,
 		logger,
 		memory,

@@ -67,7 +67,15 @@ export const DEFAULT_CONSECUTIVE_ERROR_LIMIT = 3
  * keeps the cost of carrying more history low (see src/budget/cost.ts).
  */
 export const DEFAULT_WINDOW_SIZE = 300
-export const DEFAULT_LLM_TIMEOUT_MS = 120_000
+/**
+ * 2026-08-01: raised from 120_000. A real session's iteration 16 call alone
+ * took ~59s and generated 8,000+ output tokens (deepseek/deepseek-v4-flash
+ * is a reasoning model — long generations are normal, not a hang); iteration
+ * 19 then hit exactly the old 120s ceiling and failed with an opaque "no
+ * choices[0].message" error. 300s gives a heavy reasoning turn real room
+ * without masking an actually-hung request as something else.
+ */
+export const DEFAULT_LLM_TIMEOUT_MS = 300_000
 
 export interface HeadlessSessionConfig {
 	workspaceRoot: string
