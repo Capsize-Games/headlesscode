@@ -47,6 +47,9 @@ import type { ToolContext, ToolHandler, ToolResult } from "../engine/types.js"
 import { checkCommand, type CommandRefusal } from "../permissions/commands.js"
 import { findMatchingPattern } from "../permissions/protected-files.js"
 import { resolvePermissions, type PermissionsConfig } from "../permissions/config.js"
+import { OpenRouterEmbedder } from "../codesearch/embedder.js"
+import { formatSearchResults, searchIndex } from "../codesearch/search.js"
+import { INDEX_RELATIVE_PATH } from "../codesearch/types.js"
 
 /** Cap on tool-result text fed back to the model (keep context bounded). */
 export const MAX_RESULT_CHARS = 30_000
@@ -1244,8 +1247,54 @@ async function askFollowupQuestionHandler(args: Record<string, unknown>, ctx: To
 function stubHandler(name: string): ToolHandler {
 	return () =>
 		err(
-			`Tool '${name}' is not implemented in the headless harness yet. Implemented tools: read_file, write_to_file, apply_diff, search_replace, edit_file, execute_command, list_files. Adapt and retry with one of those.`,
+			`Tool '${name}' is not implemented in the headless harness yet. Implemented tools: read_file, write_to_file, apply_diff, search_replace, edit_file, execute_command, list_files, codebase_search. Adapt and retry with one of those.`,
 		)
+}
+
+/**
+ * codebase_search — semantic search over the persisted codebase index.
+ *
+ * Embeds the query (one call), loads `<workspaceRoot>/.headlesscode/
+ * codesearch/index.jsonl`, brute-force cosine against every stored chunk, and
+ * returns the top-K as `file:startLine-endLine` + a snippet — matching the
+ * vendored CodebaseSearchTool's output shape (src/vendor/zoo-code/src/core/
+ * tools/CodebaseSearchTool.ts).
+ *
+ * If no index exists yet, returns a clear ACTIONABLE error telling the model
+ * to ask a human to run `headlesscode index` — deliberately NOT a silent
+ * empty result ("no matches" would look like a legitimately empty search).
+ * The index is built by a separate, explicit CLI step and is never
+ * auto-triggered mid-session (it costs real money and takes real time).
+ */
+async function codebaseSearchHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+	const query = requireString(args, "query")
+	const pathPrefix = typeof args.path === "string" && args.path.trim() !== "" ? args.path : undefined
+
+	return (async () => {
+		// No index → actionable error, not a silent empty result.
+		const indexFile = path.join(ctx.workspaceRoot, INDEX_RELATIVE_PATH)
+		try {
+			await fsp.access(indexFile)
+		} catch {
+			return err(
+				`codebase_search: no codebase index found at '${indexFile}'. ` +
+					`The codebase has not been indexed yet. Ask a human to run ` +
+					`'headlesscode index --workspace ${ctx.workspaceRoot}' first (this builds the semantic index ` +
+					`and costs a small amount of embedding API money).`,
+			)
+		}
+
+		// Embed the query (one call). This is a real network call; failures
+		// surface as a tool error so the loop's mistake handling applies.
+		const embedder = new OpenRouterEmbedder()
+		const queryResult = await embedder.embedBatch([query])
+		if (queryResult.embeddings.length !== 1) {
+			return err(`codebase_search: embedder returned ${queryResult.embeddings.length} embeddings for the query`)
+		}
+
+		const results = searchIndex(ctx.workspaceRoot, queryResult.embeddings[0]!, pathPrefix)
+		return ok(formatSearchResults(query, results))
+	})()
 }
 
 function errorMessage(error: unknown): string {
@@ -1287,6 +1336,7 @@ const IMPLEMENTED_TOOLS = new Set([
 	"edit_file",
 	"execute_command",
 	"list_files",
+	"codebase_search",
 ])
 
 /**
@@ -1305,6 +1355,7 @@ export function createHeadlessExecutor(workspaceRoot: string, options: ToolExecu
 	executor.register("edit_file", editFileHandler)
 	executor.register("execute_command", executeCommandHandler)
 	executor.register("list_files", listFilesHandler)
+	executor.register("codebase_search", codebaseSearchHandler)
 
 	executor.register("attempt_completion", attemptCompletionHandler)
 	executor.register("ask_followup_question", askFollowupQuestionHandler)

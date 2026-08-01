@@ -61,6 +61,7 @@ export const EXECUTABLE_TOOL_NAMES = new Set([
 	"edit_file",
 	"execute_command",
 	"list_files",
+	"codebase_search",
 	"attempt_completion",
 	"ask_followup_question",
 ])
