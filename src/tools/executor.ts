@@ -19,7 +19,7 @@
 import * as fs from "node:fs"
 import * as fsp from "node:fs/promises"
 import * as path from "node:path"
-import { spawn } from "node:child_process"
+import { spawn, type ChildProcess } from "node:child_process"
 import { setTimeout as sleep } from "node:timers/promises"
 
 // Side effect: installs String.prototype.toPosix() used by path formatting.
@@ -99,6 +99,18 @@ export class ToolExecutor {
 				isError: true,
 			}
 		}
+	}
+
+	/**
+		* Session teardown: hard-kill any execute_command children that a timeout
+		* left running in the background (see executeCommandHandler). A single tool
+		* call timing out mid-session does NOT trigger this — the backgrounded
+		* process is exactly what the model asked for and must keep running until
+		* the model cleans it up or the session truly ends. Only calling this at
+		* true session end does, so nothing is orphaned past its session.
+		*/
+	dispose(): void {
+		killBackgroundCommands()
 	}
 }
 
@@ -249,7 +261,80 @@ function writeToFileHandler(args: Record<string, unknown>, ctx: ToolContext): Pr
 	})()
 }
 
-/** execute_command — spawn via child_process, capture stdout+stderr, timeout. */
+// ─── execute_command backgrounded-child registry ─────────────────────────────
+
+/**
+ * Children that timed out and were intentionally left running in the
+ * background (see executeCommandHandler). Tracked for exactly two reasons:
+ *   (a) their stdout/stderr pipes keep being drained so a long-running child
+ *       never blocks on a full pipe buffer, and
+ *   (b) `ToolExecutor.dispose()` can hard-kill anything still running when a
+ *       session truly ends, so the harness never orphans a process.
+ * A later `execute_command` mid-session (e.g. `pkill`, `docker compose down`)
+ * works unchanged — the model targets the process by port/name/pattern, same
+ * as a human would.
+ */
+const backgroundCommands = new Set<ChildProcess>()
+
+/** Best-effort unref of a stdio pipe so it can't keep the event loop alive. */
+function unrefStream(stream: NodeJS.ReadableStream | null): void {
+	try {
+		// child.stdout/stderr are net.Socket instances at runtime but typed as
+		// Readable, so feature-detect `unref` rather than casting to Socket.
+		;(stream as { unref?: () => void } | null)?.unref?.()
+	} catch {
+		// Not every stream type supports unref — the child's own unref (see
+		// executeCommandHandler) is the important part for harness exit.
+	}
+}
+
+/**
+ * Session teardown: hard-kill every execute_command child still running after
+ * a timeout. Called by `ToolExecutor.dispose()` when a session ends (success,
+ * bounded failure, budget abort, or thrown error) so no backgrounded process
+ * is orphaned past its session. Deliberately NOT called when a single tool
+ * call times out mid-session — that is the whole point of the background
+ * semantics (see the vendored execute_command tool's timeout contract).
+ */
+function killBackgroundCommands(): void {
+	for (const child of backgroundCommands) {
+		try {
+			if (child.exitCode === null && child.signalCode === null) {
+				if (child.pid != null) {
+					// The child is a detached process-group leader (see
+					// executeCommandHandler), so kill the whole group with a
+					// negative pid — that reaps grandchildren too (e.g. the
+					// `node`/`sh` the shell may have spawned), not just the
+					// shell itself. Falls back to killing the direct child on
+					// platforms where group signals aren't supported.
+					try {
+						process.kill(-child.pid, "SIGKILL")
+					} catch {
+						child.kill("SIGKILL")
+					}
+				} else {
+					child.kill("SIGKILL")
+				}
+			}
+		} catch {
+			// Already gone — nothing to clean up.
+		}
+	}
+	backgroundCommands.clear()
+}
+
+/**
+ * execute_command — spawn via child_process, capture stdout+stderr.
+ *
+ * Timeout semantics follow the vendored tool's own contract (see
+ * src/vendor/zoo-code/src/core/prompts/tools/native-tools/execute_command.ts):
+ * when the `timeout` elapses the command KEEPS RUNNING in the background — it
+ * is NOT killed — and the model receives the output captured so far so it can
+ * start a dev server / long migration and move on. The result is a normal
+ * (non-error) tool result: a timeout here is expected behavior the model asked
+ * for via the `timeout` arg, so it must not count toward the loop's
+ * consecutive-mistake bounded-failure limit.
+ */
 function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
 	const command = requireString(args, "command")
 	const timeoutS = toNonNegativeInt(args.timeout, DEFAULT_COMMAND_TIMEOUT_S) || DEFAULT_COMMAND_TIMEOUT_S
@@ -265,6 +350,7 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 			let stdout = ""
 			let stderr = ""
 			let settled = false
+			let timedOut = false
 
 			const finish = (result: ToolResult) => {
 				if (!settled) {
@@ -275,34 +361,68 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 
 			let child
 			try {
-				child = spawn(command, { cwd, shell: true })
+				// `detached: true` puts the shell in its own process group
+				// (pgid = child.pid). That serves two purposes: (a) a timed-out
+				// command can keep running fully independent of the harness's
+				// own process group, and (b) session teardown can kill the whole
+				// group (`process.kill(-pid)`) so grandchildren are reaped too.
+				// The process-group kill is the only way to clean up the full
+				// tree of a `shell: true` spawn — killing the shell alone would
+				// orphan whatever it had launched.
+				child = spawn(command, { cwd, shell: true, detached: true })
 			} catch (error) {
 				return finish(err(`execute_command: failed to spawn '${command}': ${errorMessage(error)}`))
 			}
 
 			const timer = setTimeout(() => {
-				child.kill("SIGKILL")
+				// Do NOT kill the child — the vendored contract says a timed-out
+				// command keeps running in the background so the model can start
+				// dev servers / long migrations and get control back.
+				timedOut = true
+				backgroundCommands.add(child)
+				// Detach from the harness's event loop: the child and its pipes
+				// must not keep the process alive once a session is done. The
+				// child stays tracked in backgroundCommands so session teardown
+				// (ToolExecutor.dispose) can hard-kill it rather than orphan it.
+				child.unref()
+				unrefStream(child.stdout)
+				unrefStream(child.stderr)
+				const combined = [stdout, stderr].filter(Boolean).join("\n")
+				finish(
+					ok(
+						`[execute_command] timed out after ${timeoutS}s — process is still running in the background, output captured so far:\n${combined}`,
+					),
+				)
 			}, timeoutS * 1000)
 
 			child.stdout?.on("data", (chunk) => {
-				stdout += chunk.toString()
+				// After a timeout the model already got its partial output; keep
+				// draining the pipe (so the child never blocks on a full buffer)
+				// but stop accumulating output we can no longer deliver.
+				if (!timedOut) {
+					stdout += chunk.toString()
+				}
 			})
 			child.stderr?.on("data", (chunk) => {
-				stderr += chunk.toString()
+				if (!timedOut) {
+					stderr += chunk.toString()
+				}
 			})
 			child.on("error", (error) => {
 				clearTimeout(timer)
+				backgroundCommands.delete(child)
 				finish(err(`execute_command: spawn error for '${command}': ${errorMessage(error)}`))
 			})
 			child.on("close", (code, signal) => {
 				clearTimeout(timer)
+				backgroundCommands.delete(child)
 				const combined = [stdout, stderr].filter(Boolean).join("\n")
 				if (signal === "SIGKILL") {
-					finish(
-						err(
-							`execute_command: command '${command}' timed out after ${timeoutS}s and was killed. Output so far:\n${combined}`,
-						),
-					)
+					// Defensive path only: a timeout never sends SIGKILL anymore,
+					// so this is reachable solely when something external killed
+					// the process (the model's own `pkill` cleanup command, or
+					// ToolExecutor.dispose during session teardown).
+					finish(err(`execute_command: command '${command}' was killed by signal ${signal}.\n${combined}`))
 					return
 				}
 				if (code !== 0) {

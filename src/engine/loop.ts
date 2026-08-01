@@ -316,6 +316,16 @@ export class HeadlessSession {
 			// snapshot behind. Non-fatal (see removeLiveSnapshot), then rethrow.
 			await this.removeLiveSnapshot()
 			throw error
+		} finally {
+			// Session teardown: hard-kill any execute_command children that a
+			// timeout left running in the background (see ToolExecutor.dispose
+			// in src/tools/executor.ts). Runs on EVERY completion path —
+			// success, bounded failure, budget abort, or a thrown error — so a
+			// backgrounded process is never orphaned past its session. A single
+			// tool call timing out mid-session does NOT trigger this: the child
+			// keeps running until the session actually ends, exactly as the
+			// vendored execute_command timeout contract promises.
+			this.executor.dispose()
 		}
 		await this.recordMemory(result)
 		// Surface the budget/usage accounting on every result now (previously
