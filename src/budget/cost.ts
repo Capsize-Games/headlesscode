@@ -36,6 +36,17 @@ export interface ModelPrice {
 	input: number
 	/** Price per 1M OUTPUT (completion) tokens, USD. */
 	output: number
+	/**
+	 * Price per 1M CACHED input tokens, USD (a provider-side prompt-cache hit —
+	 * see LlmResponse.usage.cachedTokens). Optional and deliberately NOT
+	 * defaulted to a discounted guess: when absent, cached tokens are priced
+	 * at the full `input` rate, i.e. zero behavior change from before cache
+	 * accounting existed. Only set this once you've confirmed the model's
+	 * real cache-hit rate (e.g. from OpenRouter/provider docs) — this is a
+	 * cost GUARDRAIL, so a wrong optimistic discount could let real spend
+	 * exceed a configured cap.
+	 */
+	cacheRead?: number
 }
 
 /** Model id → price. */
@@ -115,24 +126,38 @@ export interface CostInput {
 	model: string
 	inputTokens?: number
 	outputTokens?: number
+	/**
+	 * Prompt tokens served from the provider's cache (a SUBSET of
+	 * inputTokens, not additional — see LlmResponse.usage.cachedTokens).
+	 * Priced at price.cacheRead when set, else at the full input rate.
+	 */
+	cachedTokens?: number
 	/** Explicit pricing table (default: env-merged defaults). */
 	pricing?: PricingTable
 }
 
 /**
  * Estimate the USD cost of one LLM call from its usage token counts.
- *   cost = inputTokens × price.input / 1e6 + outputTokens × price.output / 1e6
+ *   cost = (inputTokens - cachedTokens) × price.input / 1e6
+ *         + cachedTokens × (price.cacheRead ?? price.input) / 1e6
+ *         + outputTokens × price.output / 1e6
+ * `cachedTokens` is clamped to `inputTokens` (a provider reporting more
+ * cached than total prompt tokens would otherwise produce a negative
+ * "uncached" count).
  */
 export function estimateCost(input: CostInput): number {
 	const { model, inputTokens = 0, outputTokens = 0 } = input
 	const table = input.pricing ?? loadPricingTable()
 	const price = priceFor(model, table)
-	return (inputTokens * price.input + outputTokens * price.output) / 1_000_000
+	const cachedTokens = Math.min(Math.max(input.cachedTokens ?? 0, 0), inputTokens)
+	const uncachedTokens = inputTokens - cachedTokens
+	const cacheRate = price.cacheRead ?? price.input
+	return (uncachedTokens * price.input + cachedTokens * cacheRate + outputTokens * price.output) / 1_000_000
 }
 
 /** Sum the estimated cost across multiple calls (runs) — the session total. */
 export function accumulateCost(
-	runs: Array<{ model: string; inputTokens?: number; outputTokens?: number }>,
+	runs: Array<{ model: string; inputTokens?: number; outputTokens?: number; cachedTokens?: number }>,
 	pricing?: PricingTable,
 ): number {
 	return runs.reduce((sum, run) => sum + estimateCost({ ...run, pricing }), 0)

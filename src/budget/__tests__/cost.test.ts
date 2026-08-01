@@ -79,6 +79,51 @@ async function testPriceOverrideTable(): Promise<void> {
 	assert.deepEqual(priceFor("unlisted", custom), FALLBACK_MODEL_PRICE)
 }
 
+async function testCachedTokenPricing(): Promise<void> {
+	// No cacheRead configured for the model: cached tokens are priced at the
+	// FULL input rate (zero behavior change from before cache accounting
+	// existed) — deliberately NOT a discounted guess by default.
+	const noDiscountConfigured = estimateCost({
+		model: "deepseek/deepseek-chat",
+		inputTokens: 1_000_000,
+		cachedTokens: 800_000,
+		outputTokens: 0,
+	})
+	assert.ok(
+		Math.abs(noDiscountConfigured - 0.27) < 1e-9,
+		`no cacheRead configured -> full input price regardless of cachedTokens, expected $0.27, got ${noDiscountConfigured}`,
+	)
+
+	// With an explicit cacheRead price configured, cached tokens are billed
+	// at that rate and the rest at the full input rate.
+	const withDiscount: PricingTable = { "my/cached-model": { input: 1, output: 2, cacheRead: 0.1 } }
+	const discounted = estimateCost({
+		model: "my/cached-model",
+		inputTokens: 1_000_000,
+		cachedTokens: 800_000,
+		outputTokens: 0,
+		pricing: withDiscount,
+	})
+	// 200k uncached @ $1/1M + 800k cached @ $0.1/1M = 0.2 + 0.08 = 0.28
+	assert.ok(Math.abs(discounted - 0.28) < 1e-9, `expected $0.28, got ${discounted}`)
+
+	// cachedTokens is clamped to inputTokens — a provider reporting more
+	// cached than total prompt tokens must never produce a negative
+	// "uncached" count (and must never make the estimate go DOWN as a
+	// result — this is a cost guardrail, so it must stay conservative).
+	const overReported = estimateCost({
+		model: "my/cached-model",
+		inputTokens: 1_000_000,
+		cachedTokens: 5_000_000,
+		outputTokens: 0,
+		pricing: withDiscount,
+	})
+	// Clamped to 1M cached @ $0.1/1M = $0.10, not negative and not > the
+	// fully-uncached price.
+	assert.ok(Math.abs(overReported - 0.1) < 1e-9, `expected $0.10 (clamped), got ${overReported}`)
+	assert.ok(overReported >= 0, "cost estimate is never negative")
+}
+
 async function testEnvPricingJsonOverride(): Promise<void> {
 	// HEADLESSCODE_PRICING_JSON: a file with per-model overrides is deep-merged
 	// over the defaults (unlisted models keep the built-in price).
@@ -151,6 +196,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["estimateCost math (per-1M input/output, mixed, zero defaults)", testEstimateCostMath],
 	["unknown model falls back to the conservative rate (never $0)", testModelFallback],
 	["in-code pricing override table + per-model fallback", testPriceOverrideTable],
+	["cached-token pricing: no discount by default, configurable, clamped", testCachedTokenPricing],
 	["HEADLESSCODE_PRICING_JSON deep-merges over the defaults", testEnvPricingJsonOverride],
 	["HEADLESSCODE_PRICING_JSON with a missing file throws", testEnvPricingJsonMissingFileThrows],
 	["accumulateCost sums multiple runs", testAccumulateCost],

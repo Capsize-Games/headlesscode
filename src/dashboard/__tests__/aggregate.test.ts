@@ -326,7 +326,14 @@ async function testMalformedOrchestratorStateHandledGracefully(): Promise<void> 
 
 async function testSumSessionsEmpty(): Promise<void> {
 	const totals = sumSessions([])
-	assert.deepEqual(totals, { costUsd: 0, inputTokens: 0, outputTokens: 0, iterations: 0, sessionCount: 0 })
+	assert.deepEqual(totals, {
+		costUsd: 0,
+		inputTokens: 0,
+		outputTokens: 0,
+		cachedTokens: 0,
+		iterations: 0,
+		sessionCount: 0,
+	})
 }
 
 // ─── Runner ──────────────────────────────────────────────────────────────────

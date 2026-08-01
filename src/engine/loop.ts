@@ -196,6 +196,8 @@ export class HeadlessSession {
 	/** Cost/token monitoring (workstream 3): cumulative usage tokens across all LLM calls this run. */
 	private totalInputTokens = 0
 	private totalOutputTokens = 0
+	/** Subset of totalInputTokens served from the provider's prompt cache (see LlmResponse.usage.cachedTokens). */
+	private totalCachedTokens = 0
 
 	constructor(config: HeadlessSessionConfig) {
 		if (!config.llmClient) {
@@ -387,6 +389,7 @@ export class HeadlessSession {
 				iterations: result.iterations,
 				inputTokens: this.totalInputTokens,
 				outputTokens: this.totalOutputTokens,
+				cachedTokens: this.totalCachedTokens,
 				costUsd: result.budgetUsage?.costUsd ?? 0,
 				startedAt,
 				endedAt: new Date().toISOString(),
@@ -422,6 +425,7 @@ export class HeadlessSession {
 				iterations: iteration,
 				inputTokens: this.totalInputTokens,
 				outputTokens: this.totalOutputTokens,
+				cachedTokens: this.totalCachedTokens,
 				costUsd,
 				startedAt,
 				status: "running",
@@ -499,11 +503,13 @@ export class HeadlessSession {
 					if (response.usage) {
 						this.totalInputTokens += response.usage.promptTokens ?? 0
 						this.totalOutputTokens += response.usage.completionTokens ?? 0
+						this.totalCachedTokens += response.usage.cachedTokens ?? 0
 						try {
 							budgetTracker.record({
 								model: this.config.model,
 								inputTokens: response.usage.promptTokens,
 								outputTokens: response.usage.completionTokens,
+								cachedTokens: response.usage.cachedTokens,
 							})
 						} catch (err) {
 							if (err instanceof BudgetExceededError) {
@@ -518,6 +524,7 @@ export class HeadlessSession {
 						iterations: budgetTracker.iterationCount,
 						inputTokens: this.totalInputTokens,
 						outputTokens: this.totalOutputTokens,
+						cachedTokens: this.totalCachedTokens,
 					})
 					// Live (in-progress) usage snapshot: overwritten in place each
 					// iteration so the dashboard can show this still-running

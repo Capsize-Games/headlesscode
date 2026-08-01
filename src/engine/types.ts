@@ -64,6 +64,14 @@ export interface LlmResponse {
 		promptTokens?: number
 		completionTokens?: number
 		totalTokens?: number
+		/**
+		 * Prompt tokens served from the provider's prefix cache (a subset of
+		 * promptTokens, not additional) — OpenRouter surfaces this as
+		 * `usage.prompt_tokens_details.cached_tokens` when the underlying
+		 * provider (e.g. DeepSeek) supports automatic prompt caching. Cached
+		 * tokens are billed at a steep discount; see src/budget/cost.ts.
+		 */
+		cachedTokens?: number
 	}
 }
 

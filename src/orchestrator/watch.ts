@@ -124,6 +124,7 @@ function readWorktreeUsage(wtPath: string): OrchestratorGroup["usage"] | undefin
 	let costUsd = 0
 	let inputTokens = 0
 	let outputTokens = 0
+	let cachedTokens = 0
 	let iterations = 0
 	let found = false
 
@@ -147,6 +148,7 @@ function readWorktreeUsage(wtPath: string): OrchestratorGroup["usage"] | undefin
 				costUsd += typeof record.costUsd === "number" ? record.costUsd : 0
 				inputTokens += typeof record.inputTokens === "number" ? record.inputTokens : 0
 				outputTokens += typeof record.outputTokens === "number" ? record.outputTokens : 0
+				cachedTokens += typeof record.cachedTokens === "number" ? record.cachedTokens : 0
 				iterations += typeof record.iterations === "number" ? record.iterations : 0
 				found = true
 			} catch {
@@ -155,7 +157,7 @@ function readWorktreeUsage(wtPath: string): OrchestratorGroup["usage"] | undefin
 		}
 	}
 
-	return found ? { costUsd, inputTokens, outputTokens, iterations } : undefined
+	return found ? { costUsd, inputTokens, outputTokens, cachedTokens, iterations } : undefined
 }
 
 /** Sum every group's `usage` into a round-level total (see OrchestratorState.totalUsage). */
@@ -163,6 +165,7 @@ export function computeTotalUsage(state: OrchestratorState): OrchestratorState["
 	let costUsd = 0
 	let inputTokens = 0
 	let outputTokens = 0
+	let cachedTokens = 0
 	let iterations = 0
 	let found = false
 	for (const group of state.groups) {
@@ -173,9 +176,10 @@ export function computeTotalUsage(state: OrchestratorState): OrchestratorState["
 		costUsd += group.usage.costUsd
 		inputTokens += group.usage.inputTokens
 		outputTokens += group.usage.outputTokens
+		cachedTokens += group.usage.cachedTokens ?? 0
 		iterations += group.usage.iterations
 	}
-	return found ? { costUsd, inputTokens, outputTokens, iterations } : undefined
+	return found ? { costUsd, inputTokens, outputTokens, cachedTokens, iterations } : undefined
 }
 
 function hasDoneMarker(wtPath: string): boolean {

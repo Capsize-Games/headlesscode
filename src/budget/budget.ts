@@ -144,11 +144,12 @@ export class BudgetTracker {
 	 * Accumulates the estimated cost and re-checks the cost cap. Throws
 	 * `BudgetExceededError` when the cost limit trips.
 	 */
-	record(input: { model: string; inputTokens?: number; outputTokens?: number }): void {
+	record(input: { model: string; inputTokens?: number; outputTokens?: number; cachedTokens?: number }): void {
 		const cost = estimateCost({
 			model: input.model,
 			inputTokens: input.inputTokens ?? 0,
 			outputTokens: input.outputTokens ?? 0,
+			cachedTokens: input.cachedTokens ?? 0,
 			pricing: this.pricing,
 		})
 		this.costUsd += cost

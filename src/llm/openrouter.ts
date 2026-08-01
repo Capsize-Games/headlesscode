@@ -152,6 +152,10 @@ interface RawUsage {
 	prompt_tokens?: number
 	completion_tokens?: number
 	total_tokens?: number
+	/** OpenRouter's pass-through of the underlying provider's cache accounting. */
+	prompt_tokens_details?: {
+		cached_tokens?: number
+	}
 }
 
 function mapUsage(raw: RawUsage | undefined): LlmResponse["usage"] {
@@ -162,5 +166,6 @@ function mapUsage(raw: RawUsage | undefined): LlmResponse["usage"] {
 		promptTokens: raw.prompt_tokens,
 		completionTokens: raw.completion_tokens,
 		totalTokens: raw.total_tokens,
+		cachedTokens: raw.prompt_tokens_details?.cached_tokens,
 	}
 }

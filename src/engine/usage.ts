@@ -29,6 +29,12 @@ export interface UsageRecord {
 	iterations: number
 	inputTokens: number
 	outputTokens: number
+	/**
+	 * Subset of inputTokens served from the provider's prompt cache (see
+	 * LlmResponse.usage.cachedTokens). Optional: absent on records written
+	 * before this field existed, or when the provider never reports it.
+	 */
+	cachedTokens?: number
 	costUsd: number
 	startedAt: string
 	endedAt: string
@@ -50,6 +56,7 @@ export interface LiveUsageRecord {
 	iterations: number
 	inputTokens: number
 	outputTokens: number
+	cachedTokens?: number
 	costUsd: number
 	startedAt: string
 	status: "running"

@@ -107,6 +107,8 @@ export interface OrchestratorGroup {
 		costUsd: number
 		inputTokens: number
 		outputTokens: number
+		/** Subset of inputTokens served from the provider's prompt cache (0 when unreported). */
+		cachedTokens?: number
 		iterations: number
 	}
 }
@@ -126,6 +128,8 @@ export interface OrchestratorState {
 		costUsd: number
 		inputTokens: number
 		outputTokens: number
+		/** Subset of inputTokens served from the provider's prompt cache (0 when unreported). */
+		cachedTokens?: number
 		iterations: number
 	}
 	[key: string]: unknown

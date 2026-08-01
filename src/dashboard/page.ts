@@ -87,12 +87,17 @@ function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+function fmtPct(n) { return (n ?? 0).toFixed(1) + "%"; }
+
 function renderTotals(totals) {
   const el = document.getElementById("totals");
+  const cacheHitRate = totals.inputTokens > 0 ? (100 * (totals.cachedTokens ?? 0)) / totals.inputTokens : 0;
   el.innerHTML = [
     ["Sessions", fmtInt(totals.sessionCount)],
     ["Total cost", fmtCost(totals.costUsd)],
     ["Input tokens", fmtInt(totals.inputTokens)],
+    ["Cached tokens", fmtInt(totals.cachedTokens)],
+    ["Cache hit rate", fmtPct(cacheHitRate)],
     ["Output tokens", fmtInt(totals.outputTokens)],
     ["Iterations", fmtInt(totals.iterations)],
   ].map(([label, value]) => \`<div class="stat"><div class="label">\${esc(label)}</div><div class="value">\${esc(value)}</div></div>\`).join("");
@@ -126,6 +131,7 @@ function renderRound(round) {
       <td class="status-\${esc(g.status)}">\${esc(g.status)}</td>
       <td>\${g.usage ? fmtCost(g.usage.costUsd) : "—"}</td>
       <td>\${g.usage ? fmtInt(g.usage.inputTokens) : "—"}</td>
+      <td>\${g.usage ? fmtInt(g.usage.cachedTokens) : "—"}</td>
       <td>\${g.usage ? fmtInt(g.usage.outputTokens) : "—"}</td>
       <td>\${g.usage ? fmtInt(g.usage.iterations) : "—"}</td>
     </tr>
@@ -134,8 +140,8 @@ function renderRound(round) {
     <div class="sub">batch: \${esc(round.batch ?? "—")} · updated: \${esc(round.updated ?? "—")}
       · round total: \${round.totalUsage ? fmtCost(round.totalUsage.costUsd) : "$0.000000"}</div>
     <table>
-      <thead><tr><th>group</th><th>status</th><th>cost</th><th>in tok</th><th>out tok</th><th>iter</th></tr></thead>
-      <tbody>\${rows || '<tr><td colspan="6" class="empty">no groups</td></tr>'}</tbody>
+      <thead><tr><th>group</th><th>status</th><th>cost</th><th>in tok</th><th>cached tok</th><th>out tok</th><th>iter</th></tr></thead>
+      <tbody>\${rows || '<tr><td colspan="7" class="empty">no groups</td></tr>'}</tbody>
     </table>
   \`;
 }
@@ -154,6 +160,7 @@ function renderSessions(sessions) {
       <td class="status-\${esc(s.status)}">\${esc(s.status)}</td>
       <td>\${fmtCost(s.costUsd)}</td>
       <td>\${fmtInt(s.inputTokens)}</td>
+      <td>\${fmtInt(s.cachedTokens)}</td>
       <td>\${fmtInt(s.outputTokens)}</td>
       <td>\${fmtInt(s.iterations)}</td>
       <td class="mono">\${esc(s.startedAt)}</td>
@@ -163,7 +170,7 @@ function renderSessions(sessions) {
   \`).join("");
   el.innerHTML = \`
     <table>
-      <thead><tr><th>id</th><th>mode</th><th>model</th><th>status</th><th>cost</th><th>in tok</th><th>out tok</th><th>iter</th><th>started</th><th>ended</th><th>source</th></tr></thead>
+      <thead><tr><th>id</th><th>mode</th><th>model</th><th>status</th><th>cost</th><th>in tok</th><th>cached tok</th><th>out tok</th><th>iter</th><th>started</th><th>ended</th><th>source</th></tr></thead>
       <tbody>\${rows}</tbody>
     </table>
   \`;

@@ -31,6 +31,8 @@ export interface SessionRow {
 	iterations: number
 	inputTokens: number
 	outputTokens: number
+	/** Subset of inputTokens served from the provider's prompt cache (0 when unreported). */
+	cachedTokens: number
 	costUsd: number
 	startedAt: string
 	endedAt: string
@@ -44,6 +46,7 @@ export interface UsageTotals {
 	costUsd: number
 	inputTokens: number
 	outputTokens: number
+	cachedTokens: number
 	iterations: number
 	sessionCount: number
 }
@@ -73,7 +76,7 @@ export interface DashboardSummary {
 }
 
 function emptyTotals(): UsageTotals {
-	return { costUsd: 0, inputTokens: 0, outputTokens: 0, iterations: 0, sessionCount: 0 }
+	return { costUsd: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, iterations: 0, sessionCount: 0 }
 }
 
 /** List `*.jsonl` files directly inside `dir` (non-recursive); [] when missing/unreadable. */
@@ -105,6 +108,7 @@ function toSessionRow(r: UsageRecord | LiveUsageRecord, source: string): Session
 		iterations: r.iterations ?? 0,
 		inputTokens: r.inputTokens ?? 0,
 		outputTokens: r.outputTokens ?? 0,
+		cachedTokens: r.cachedTokens ?? 0,
 		costUsd: r.costUsd ?? 0,
 		startedAt: r.startedAt,
 		// Live snapshots have no endedAt (the session is still running).
@@ -158,6 +162,7 @@ export function sumSessions(rows: SessionRow[]): UsageTotals {
 		totals.costUsd += row.costUsd
 		totals.inputTokens += row.inputTokens
 		totals.outputTokens += row.outputTokens
+		totals.cachedTokens += row.cachedTokens
 		totals.iterations += row.iterations
 		totals.sessionCount += 1
 	}
