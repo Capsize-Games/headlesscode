@@ -121,6 +121,15 @@ export interface ToolContext {
 	 */
 	pauseBudgetClock?: () => void
 	resumeBudgetClock?: () => void
+	/**
+	 * Live worker monitoring: fired at the same lifecycle points where the
+	 * `.harness.needs-decision` marker is written/cleared (see the
+	 * ask_followup_question handler in src/tools/executor.ts), so the session
+	 * can mirror those transitions on its structured event feed
+	 * (`decision_blocked` / `decision_answered`). Absent when no hook was
+	 * wired (plain executor use, tests without a session).
+	 */
+	onDecisionEvent?: (eventType: "decision_blocked" | "decision_answered", fields: Record<string, unknown>) => void
 }
 
 /** A tool handler: dispatch any registered tool by name. */

@@ -52,6 +52,8 @@ interface CliOptions {
 	checkpointDir?: string
 	/** Decision escalation timeout, ms (also $HEADLESSCODE_DECISION_TIMEOUT_MS). */
 	decisionTimeoutMs?: number
+	/** Pause/resume max duration, ms (also $HEADLESSCODE_MAX_PAUSE_MS). */
+	maxPauseMs?: number
 	/** Permissions: comma-separated command prefixes allowed to run (also $HEADLESSCODE_ALLOWED_COMMANDS). */
 	allowedCommands?: string
 	/** Permissions: comma-separated command prefixes never allowed (also $HEADLESSCODE_DENIED_COMMANDS). */
@@ -82,7 +84,9 @@ Subcommands:
               List/restore/diff shadow-git checkpoints for a workspace. See
               \`npx tsx src/cli.ts checkpoints --help\` for full options.
   headlesscode dashboard [--port 4390] [--repo <path>]
-              Serve a local read-only cost/token dashboard. See
+              Serve a local cost/token dashboard with a live per-session
+              event feed and pause/resume control (Phase 3: no longer purely
+              read-only — see src/dashboard/server.ts). See
               \`npx tsx src/cli.ts dashboard --help\` for full options.
 
 Options:
@@ -120,6 +124,10 @@ Options:
                                a human/orchestrator answer before falling back
                                to autonomous decision, ms (default 1800000 / 30
                                min). Default: $HEADLESSCODE_DECISION_TIMEOUT_MS
+  --max-pause-ms <n>         Max duration a dashboard-initiated pause may hold
+                               the loop before it auto-resumes, ms (default
+                               7200000 / 2h — matches the orchestrator's stall
+                               guard). Default: $HEADLESSCODE_MAX_PAUSE_MS
   --allowed-commands <list>  Comma-separated command prefixes the agent may run.
                                Default: $HEADLESSCODE_ALLOWED_COMMANDS, else
                                .headlesscode/permissions.json, else empty (=
@@ -262,6 +270,15 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 				options.decisionTimeoutMs = num
 				break
 			}
+			case "--max-pause-ms": {
+				const value = next()
+				const num = value === undefined ? Number.NaN : Number(value)
+				if (!Number.isInteger(num) || num <= 0) {
+					return { options, error: "--max-pause-ms requires a positive integer" }
+				}
+				options.maxPauseMs = num
+				break
+			}
 			case "--memory-dir":
 			case "--allowed-commands":
 			case "--denied-commands":
@@ -342,7 +359,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	}
 
 	// Cost/token dashboard subcommand: `headlesscode dashboard ...` — local
-	// read-only HTML dashboard (see src/dashboard/).
+	// HTML dashboard with live per-session events + pause/resume control
+	// (Phase 3 — see src/dashboard/; no longer purely read-only).
 	if (argv[0] === "dashboard") {
 		return dashboardMain(argv.slice(1))
 	}
@@ -450,6 +468,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// Off (undefined) falls back to executor.ts's own default (30 min).
 	const decisionTimeoutMs = options.decisionTimeoutMs ?? envNumber("HEADLESSCODE_DECISION_TIMEOUT_MS")
 
+	// Pause/resume (live worker monitoring): flag wins over the env fallback
+	// ($HEADLESSCODE_MAX_PAUSE_MS). Off (undefined) falls back to loop.ts's
+	// own default (2h — matching watch.ts's stall guard). Passing it through
+	// explicitly keeps the CLI the single place that resolves config.
+	const maxPauseMs = options.maxPauseMs ?? envNumber("HEADLESSCODE_MAX_PAUSE_MS")
+
 	// Permissions (command allow/deny + protected files): CLI flags > env vars
 	// > <workspaceRoot>/.headlesscode/permissions.json > built-in defaults.
 	// A malformed permissions.json fails loudly (mirrors HEADLESSCODE_PRICING_JSON).
@@ -487,6 +511,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		checkpoints: !options.noCheckpoints,
 		checkpointDir: options.checkpointDir,
 		decisionTimeoutMs,
+		maxPauseMs,
 		permissions,
 	})
 

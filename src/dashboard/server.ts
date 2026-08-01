@@ -1,18 +1,30 @@
 /**
- * Cost/token dashboard — plain `node:http` server (workstream 3).
+ * Cost/token dashboard — plain `node:http` server (workstream 3) + live
+ * per-session events + pause/resume control (live worker monitoring).
  *
  * ZERO new UI/framework dependencies, matching this project's established
  * "plain fs + JSON, no schema library" ethos (see `src/orchestrator/state.ts`'s
  * own file-header comment). Bound to `127.0.0.1` only, no auth — explicitly a
  * local-only tool per the plan doc.
  *
- *   GET /             the static HTML page (src/dashboard/page.ts)
- *   GET /api/summary  JSON from src/dashboard/aggregate.ts's buildSummary()
+ *   GET  /                        the static HTML page (src/dashboard/page.ts)
+ *   GET  /api/summary             JSON from src/dashboard/aggregate.ts's buildSummary()
+ *   GET  /api/session/:id/events  JSON events feed (incremental via ?since=<offset>)
+ *   POST /api/session/:id/pause   write `.harness.pause-requested` (worker pauses between iterations)
+ *   POST /api/session/:id/resume  remove `.harness.pause-requested` (worker resumes)
+ *
+ * NOTE (Phase 3 scope change): the dashboard is no longer purely read-only.
+ * The two POST routes above write/remove a pause marker in the target
+ * worktree — a control action, not just observability. Still local-only /
+ * no-auth (binds 127.0.0.1), but if this endpoint is ever exposed beyond
+ * localhost, that assumption needs revisiting — no auth was added here.
  */
 
+import * as fsp from "node:fs/promises"
 import * as http from "node:http"
+import * as path from "node:path"
 
-import { buildSummary } from "./aggregate.js"
+import { buildSummary, findSessionEventsFile, readSessionEvents } from "./aggregate.js"
 import { renderPage } from "./page.js"
 
 /** Default dashboard port (overridable via --port or $HEADLESSCODE_DASHBOARD_PORT). */
@@ -45,6 +57,84 @@ async function handleRequest(
 	options: DashboardServerOptions,
 ): Promise<void> {
 	const url = new URL(req.url ?? "/", "http://127.0.0.1")
+
+	// Live session detail: GET /api/session/:id/events?since=<offset>&repo=<path>
+	const eventsMatch = /^\/api\/session\/([^/]+)\/events$/.exec(url.pathname)
+	if (eventsMatch && req.method === "GET") {
+		const sessionId = decodeURIComponent(eventsMatch[1])
+		const repo = url.searchParams.get("repo") || options.repo
+		if (!repo) {
+			res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ error: "missing repo — pass ?repo=<path> or start the dashboard with --repo" }),
+			)
+			return
+		}
+		const sinceRaw = url.searchParams.get("since")
+		const since = sinceRaw === null || sinceRaw === "" ? 0 : Number(sinceRaw)
+		if (!Number.isFinite(since) || since < 0) {
+			res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ error: "invalid since offset" }),
+			)
+			return
+		}
+		try {
+			const { events, nextOffset } = await readSessionEvents(repo, sessionId, since)
+			res
+				.writeHead(200, { "content-type": "application/json; charset=utf-8" })
+				.end(JSON.stringify({ sessionId, events, nextOffset }))
+		} catch (error) {
+			res
+				.writeHead(500, { "content-type": "application/json; charset=utf-8" })
+				.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+		}
+		return
+	}
+
+	// Pause/resume control (Phase 3): POST /api/session/:id/pause|resume —
+	// deliberately POST-only (a state-changing action must not be triggerable
+	// by a GET/prefetch). Pause writes `.harness.pause-requested`; resume
+	// removes it (presence/absence IS the signal — see src/engine/loop.ts).
+	const pauseMatch = /^\/api\/session\/([^/]+)\/(pause|resume)$/.exec(url.pathname)
+	if (pauseMatch && req.method !== "POST") {
+		res.writeHead(405, { "content-type": "text/plain" }).end("Method Not Allowed")
+		return
+	}
+	if (pauseMatch && req.method === "POST") {
+		const sessionId = decodeURIComponent(pauseMatch[1])
+		const action = pauseMatch[2]
+		const repo = url.searchParams.get("repo") || options.repo
+		if (!repo) {
+			res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ error: "missing repo — pass ?repo=<path> or start the dashboard with --repo" }),
+			)
+			return
+		}
+		try {
+			const found = await findSessionEventsFile(repo, sessionId)
+			if (!found) {
+				res.writeHead(404, { "content-type": "application/json; charset=utf-8" }).end(
+					JSON.stringify({ error: `no session ${sessionId} found under ${repo}` }),
+				)
+				return
+			}
+			// The marker lives in the worktree that owns the session's events feed.
+			const worktreeRoot = found.source === "." ? path.resolve(repo) : path.resolve(repo, found.source)
+			const markerPath = path.join(worktreeRoot, ".harness.pause-requested")
+			if (action === "pause") {
+				await fsp.writeFile(markerPath, new Date().toISOString() + "\n", "utf-8")
+			} else {
+				await fsp.rm(markerPath, { force: true })
+			}
+			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ sessionId, action, ok: true, worktree: found.source }),
+			)
+		} catch (error) {
+			res
+				.writeHead(500, { "content-type": "application/json; charset=utf-8" })
+				.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+		}
+		return
+	}
 
 	if (req.method !== "GET") {
 		res.writeHead(405, { "content-type": "text/plain" }).end("Method Not Allowed")

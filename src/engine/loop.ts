@@ -33,7 +33,9 @@
  * src/tools/executor.ts).
  */
 
+import * as fsp from "node:fs/promises"
 import * as path from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 
 import { randomUUID } from "node:crypto"
 
@@ -45,11 +47,20 @@ import { buildRollingSummary, extractSessionSummary } from "../memory/summarizer
 import type { MemoryStore, RecallResult } from "../memory/types.js"
 import { createCheckpointService, type CheckpointService } from "../checkpoints/service.js"
 import { recordSessionUsage, removeLiveUsage, writeLiveUsage } from "./usage.js"
+import { EventFeed, EVENT_TRUNCATE_CHARS, truncateField } from "./events.js"
 import { Logger } from "./logger.js"
 import { parseToolCalls } from "./parser.js"
 import { buildSystemPrompt, loadCustomModes, selectToolsForMode } from "./prompt.js"
 import type { ChatMessage, ChatTool, LlmClient, SessionResult, SessionBudgetUsage } from "./types.js"
 import type { ModeConfig } from "@roo-code/types"
+
+/** Default max pause duration for dashboard-initiated pauses, ms (matches watch.ts's stall guard). */
+export const DEFAULT_MAX_PAUSE_MS = 2 * 60 * 60 * 1000
+/** Default pause marker poll interval, ms (same cadence as decision escalation). */
+export const DEFAULT_PAUSE_POLL_INTERVAL_MS = 5_000
+/** Marker basenames, relative to the workspace root (see src/tools/executor.ts's marker idiom). */
+const PAUSE_REQUESTED_FILENAME = ".harness.pause-requested"
+const PAUSED_FILENAME = ".harness.paused"
 
 export const DEFAULT_MAX_ITERATIONS = 50
 export const DEFAULT_CONSECUTIVE_ERROR_LIMIT = 3
@@ -142,12 +153,30 @@ export interface HeadlessSessionConfig {
 	 * custom `executor` is injected (its own options win).
 	 */
 	decisionTimeoutMs?: number
+	/** Decision-escalation poll interval, ms (default 5s — override in tests). */
+	decisionPollIntervalMs?: number
 	/**
 	 * Resolved permissions (command allow/deny + protected files). Optional:
 	 * when absent the executor resolves its own from env vars +
 	 * `<workspaceRoot>/.headlesscode/permissions.json` + built-in defaults.
 	 */
 	permissions?: PermissionsConfig
+	/**
+	 * Pause/resume (dashboard control): max duration a dashboard-initiated
+	 * pause may hold the loop before it auto-resumes, ms (default 2h — see
+	 * DEFAULT_MAX_PAUSE_MS). Also settable via $HEADLESSCODE_MAX_PAUSE_MS /
+	 * --max-pause-ms.
+	 */
+	maxPauseMs?: number
+	/** Pause marker poll interval, ms (default 5s — override in tests). */
+	pausePollIntervalMs?: number
+	/**
+	 * Live event hook: fires for every structured event emitted to the
+	 * session's event feed. Tests inject a fake hook to observe events
+	 * mid-run without exposing the session's private sessionId (same probe
+	 * pattern as the live-usage-snapshot tests).
+	 */
+	eventHook?: (eventType: string, fields: Record<string, unknown>) => void
 }
 
 export interface SessionRunState {
@@ -187,8 +216,16 @@ export interface ResolvedSessionConfig {
 	checkpointDir?: string
 	/** Decision escalation timeout, ms (see HeadlessSessionConfig.decisionTimeoutMs). */
 	decisionTimeoutMs?: number
+	/** Decision escalation poll interval, ms (see HeadlessSessionConfig.decisionPollIntervalMs). */
+	decisionPollIntervalMs?: number
 	/** Permissions, when explicitly resolved by the caller (else executor resolves). */
 	permissions?: PermissionsConfig
+	/** Pause/resume max duration, ms (see HeadlessSessionConfig.maxPauseMs). */
+	maxPauseMs: number
+	/** Pause marker poll interval, ms (see HeadlessSessionConfig.pausePollIntervalMs). */
+	pausePollIntervalMs: number
+	/** Live event hook (see HeadlessSessionConfig.eventHook). */
+	eventHook?: (eventType: string, fields: Record<string, unknown>) => void
 }
 
 /** Phase 3: memory activity recorded for the last `run()` (null when off/failed). */
@@ -219,6 +256,12 @@ export class HeadlessSession {
 	private totalOutputTokens = 0
 	/** Subset of totalInputTokens served from the provider's prompt cache (see LlmResponse.usage.cachedTokens). */
 	private totalCachedTokens = 0
+	/** Live worker monitoring: the session's structured event feed (non-fatal — see src/engine/events.ts). */
+	private readonly eventFeed: EventFeed
+	/** The hook fired for every event (tests inject it; undefined in prod). */
+	private readonly eventHook?: (eventType: string, fields: Record<string, unknown>) => void
+	/** The most recent LLM call's token usage (for the llm_response event). */
+	private lastLlmUsage: { inputTokens: number; outputTokens: number; cachedTokens: number } | null = null
 
 	constructor(config: HeadlessSessionConfig) {
 		if (!config.llmClient) {
@@ -252,7 +295,11 @@ export class HeadlessSession {
 			checkpoints: config.checkpoints ?? true,
 			checkpointDir: config.checkpointDir,
 			decisionTimeoutMs: config.decisionTimeoutMs,
+			decisionPollIntervalMs: config.decisionPollIntervalMs,
 			permissions: config.permissions,
+			maxPauseMs: config.maxPauseMs ?? envMaxPauseMs() ?? DEFAULT_MAX_PAUSE_MS,
+			pausePollIntervalMs: config.pausePollIntervalMs ?? DEFAULT_PAUSE_POLL_INTERVAL_MS,
+			eventHook: config.eventHook,
 		}
 
 		this.llmClient = config.llmClient
@@ -261,9 +308,35 @@ export class HeadlessSession {
 			config.executor ??
 			createHeadlessExecutor(config.workspaceRoot, {
 				decisionTimeoutMs: this.config.decisionTimeoutMs,
+				decisionPollIntervalMs: this.config.decisionPollIntervalMs,
 				permissions: this.config.permissions,
+				// Live worker monitoring: mirror ask_followup_question's
+				// .harness.needs-decision marker lifecycle on the session's
+				// event feed (decision_blocked / decision_answered). Non-fatal.
+				onDecisionEvent: (eventType, fields) => {
+					void this.emitEvent(
+						eventType,
+						() =>
+							eventType === "decision_blocked"
+								? this.eventFeed.decisionBlocked(
+										typeof fields.question === "string" ? fields.question : "(no question)",
+										Array.isArray(fields.suggestions) ? (fields.suggestions as string[]) : undefined,
+									)
+								: this.eventFeed.decisionAnswered(
+										typeof fields.answer === "string" ? fields.answer : undefined,
+										fields.timedOut === true,
+									),
+						fields,
+					)
+				},
 			})
 		this.sessionId = randomUUID()
+		this.eventHook = config.eventHook
+		this.eventFeed = new EventFeed(config.workspaceRoot, this.sessionId, (eventType, error) => {
+			this.logger.warn(`[events] failed to record '${eventType}' (non-fatal; dashboard misses this event)`, {
+				error: error instanceof Error ? error.message : String(error),
+			})
+		})
 		// Checkpoints are active when the executor is edit-capable: write_to_file
 		// OR any of the surgical edit tools (apply_diff / search_replace /
 		// edit_file). An iteration that used ONLY a diff tool must still snapshot
@@ -331,6 +404,11 @@ export class HeadlessSession {
 			workspaceRoot,
 			tools: tools.map((t) => (t.type === "function" ? t.function.name : t.type)),
 		})
+		// Live worker monitoring: emit the session_start event alongside the
+		// human-readable log line above (see src/engine/events.ts). Non-fatal.
+		await this.emitEvent("session_start", () =>
+			this.eventFeed.sessionStart({ mode, model, workspaceRoot, taskText: this.config.taskText }),
+		)
 
 		// 2c. Checkpoints: baseline snapshot before iteration 1 (mirrors Zoo
 		// Code's Task.ts:~1447). Non-fatal: any failure just disables
@@ -385,6 +463,20 @@ export class HeadlessSession {
 			model: this.config.model,
 		}
 		const finalResult: SessionResult = { ...result, budgetUsage }
+
+		// Live worker monitoring: emit the terminal session_end event (the
+		// feed is KEPT after the session ends — it's a history/replay log,
+		// unlike the live usage snapshot which recordUsage deletes). Non-fatal.
+		await this.emitEvent("session_end", () =>
+			this.eventFeed.sessionEnd({
+				status: result.status,
+				iterations: result.iterations,
+				costUsd: usage.costUsd,
+				inputTokens: this.totalInputTokens,
+				outputTokens: this.totalOutputTokens,
+				cachedTokens: this.totalCachedTokens,
+			}),
+		)
 
 		// Persist usage for the dashboard (workstream 3). Non-fatal: any
 		// failure is logged as a warning and never fails the session, matching
@@ -476,6 +568,99 @@ export class HeadlessSession {
 		}
 	}
 
+	/**
+	 * Live worker monitoring: append one structured event to the session's
+	 * feed, fire the injected eventHook, and never let a feed failure affect
+	 * the session (non-fatal — matches the memory/usage/checkpoint idiom).
+	 */
+	private async emitEvent(
+		eventType: string,
+		write: () => Promise<void>,
+		fields: Record<string, unknown> = {},
+	): Promise<void> {
+		try {
+			await write()
+			this.eventHook?.(eventType, fields)
+		} catch (error) {
+			this.logger.warn(`[events] failed to record '${eventType}' (non-fatal; dashboard misses this event)`, {
+				error: error instanceof Error ? error.message : String(error),
+			})
+		}
+	}
+
+	/**
+	 * Pause/resume (dashboard control): called before each iteration's LLM
+	 * call (the same safe boundary where budgetTracker.tick() runs — never
+	 * mid-tool-call). When `<workspaceRoot>/.harness.pause-requested` is
+	 * present, writes the `.harness.paused` status marker, emits a `paused`
+	 * event, pauses the budget clock, and blocks polling for the marker's
+	 * REMOVAL (resume = delete the marker) — up to `maxPauseMs`, after which
+	 * the loop auto-resumes (a forgotten pause must never hang a worker
+	 * forever). On resume the marker is deleted, a `resumed` event is emitted
+	 * and the budget clock resumes, so a paused session is never penalized
+	 * for wall-clock duration. Marker-file failures are non-fatal.
+	 */
+	private async checkPauseRequested(budgetTracker: BudgetTracker): Promise<void> {
+		const root = this.config.workspaceRoot
+		const requestedPath = path.join(root, PAUSE_REQUESTED_FILENAME)
+		const pausedPath = path.join(root, PAUSED_FILENAME)
+		try {
+			await fsp.access(requestedPath)
+		} catch {
+			return // No pause requested — normal running.
+		}
+
+		this.logger.info("[pause] pause requested — blocking", { maxPauseMs: this.config.maxPauseMs })
+		try {
+			await fsp.writeFile(pausedPath, new Date().toISOString() + "\n", "utf-8")
+		} catch (error) {
+			this.logger.warn("[pause] failed to write .harness.paused (non-fatal; continuing unpaused)", {
+				error: error instanceof Error ? error.message : String(error),
+			})
+			return
+		}
+		await this.emitEvent("paused", () => this.eventFeed.paused(), {})
+		budgetTracker.pauseClock()
+
+		const started = Date.now()
+		let autoResumed = false
+		try {
+			while (Date.now() - started < this.config.maxPauseMs) {
+				let exists = false
+				try {
+					await fsp.access(requestedPath)
+					exists = true
+				} catch {
+					exists = false
+				}
+				if (!exists) {
+					break // Marker removed — resume.
+				}
+				await sleep(Math.min(this.config.pausePollIntervalMs, this.config.maxPauseMs - (Date.now() - started)))
+			}
+			autoResumed = Date.now() - started >= this.config.maxPauseMs
+		} finally {
+			budgetTracker.resumeClock()
+			await this.emitEvent(
+				"resumed",
+				() => this.eventFeed.resumed(autoResumed ? "auto-resume: max pause duration reached" : undefined),
+				{},
+			)
+			try {
+				await fsp.unlink(pausedPath)
+			} catch {
+				// Already gone / never existed — fine either way.
+			}
+		}
+		if (autoResumed) {
+			this.logger.warn("[pause] max pause duration reached — auto-resuming", {
+				maxPauseMs: this.config.maxPauseMs,
+			})
+		} else {
+			this.logger.info("[pause] resume requested — continuing")
+		}
+	}
+
 	private async runIterations(budgetTracker: BudgetTracker, startedAt: string): Promise<SessionResult> {
 		const { maxIterations, consecutiveErrorLimit } = this.config
 		const messages = this.state.messages
@@ -485,6 +670,14 @@ export class HeadlessSession {
 
 		for (let iteration = 1; iteration <= maxIterations; iteration++) {
 			this.logger.info(`[loop] iteration ${iteration}/${maxIterations}`, { history: messages.length })
+			// Live worker monitoring: emit the iteration_start event alongside
+			// the human-readable log line above. Non-fatal.
+			await this.emitEvent("iteration_start", () => this.eventFeed.iterationStart(iteration, messages.length))
+
+			// Pause/resume (dashboard control): block between iterations (never
+			// mid-tool-call — same safe boundary as the budget check below)
+			// while a .harness.pause-requested marker is present.
+			await this.checkPauseRequested(budgetTracker)
 
 			// Budget check BEFORE this LLM call: elapsed time, iteration count
 			// and accumulated cost are all re-checked here so no further spend
@@ -525,6 +718,11 @@ export class HeadlessSession {
 						this.totalInputTokens += response.usage.promptTokens ?? 0
 						this.totalOutputTokens += response.usage.completionTokens ?? 0
 						this.totalCachedTokens += response.usage.cachedTokens ?? 0
+						this.lastLlmUsage = {
+							inputTokens: response.usage.promptTokens ?? 0,
+							outputTokens: response.usage.completionTokens ?? 0,
+							cachedTokens: response.usage.cachedTokens ?? 0,
+						}
 						try {
 							budgetTracker.record({
 								model: this.config.model,
@@ -557,6 +755,18 @@ export class HeadlessSession {
 					clearTimeout(timer)
 				}
 			} catch (error) {
+				// Live worker monitoring: surface the LLM call failure on the
+				// event feed too (the session is ending with an error). The
+				// assistant variable is unset here, so emit via raw fields.
+				await this.emitEvent(
+					"llm_error",
+					() =>
+						this.eventFeed.emit("llm_error", {
+							iteration,
+							error: truncateField(error instanceof Error ? error.message : String(error)).text,
+						}),
+					{ iteration },
+				)
 				const message = error instanceof Error ? error.message : String(error)
 				this.logger.error("[loop] LLM request failed", { iteration, error: message })
 				return {
@@ -565,6 +775,27 @@ export class HeadlessSession {
 					iterations: iteration,
 					toolCalls,
 				}
+			}
+
+			// Live worker monitoring: emit the llm_response event (a short
+			// text preview, whether the response carried tool_calls, and this
+			// call's token usage incl. cachedTokens — see src/engine/events.ts).
+			// Non-fatal.
+			{
+				const text = typeof assistant.content === "string" ? assistant.content.trim() : ""
+				await this.emitEvent(
+					"llm_response",
+					() =>
+						this.eventFeed.llmResponse({
+							iteration,
+							hadToolCalls: Array.isArray(assistant.tool_calls) && assistant.tool_calls.length > 0,
+							textPreview: text || undefined,
+							inputTokens: this.lastLlmUsage?.inputTokens,
+							outputTokens: this.lastLlmUsage?.outputTokens,
+							cachedTokens: this.lastLlmUsage?.cachedTokens,
+						}),
+					{ iteration },
+				)
 			}
 
 			// 5. Append the assistant message.
@@ -615,6 +846,26 @@ export class HeadlessSession {
 				let resultContent: string
 				let isError: boolean
 
+				// Live worker monitoring: emit the tool_call event BEFORE
+				// executing (a truncated argument summary — the path for file
+				// tools, the command for execute_command — never full content).
+				// Non-fatal.
+				{
+					const argSummary = summarizeToolArg(call.name, call.args) ?? ""
+					const truncated = argSummary.length > EVENT_TRUNCATE_CHARS
+					await this.emitEvent(
+						"tool_call",
+						() =>
+							this.eventFeed.toolCall({
+								iteration,
+								tool: call.name,
+								args: truncated ? argSummary.slice(0, EVENT_TRUNCATE_CHARS) : argSummary,
+								argsTruncated: truncated,
+							}),
+						{ iteration },
+					)
+				}
+
 				if (call.parseError) {
 					resultContent = `[Error] Failed to parse arguments for tool '${call.name}': ${call.parseError}. Raw arguments: ${call.rawArguments}`
 					isError = true
@@ -631,11 +882,35 @@ export class HeadlessSession {
 					content: resultContent,
 				})
 
+				// Pause/resume (dashboard control): after each tool execution is
+				// still a safe boundary (never mid-tool-call, never mid-LLM-call)
+				// and makes a pause request responsive even when the LLM is fast
+				// enough to run many iterations between the pre-iteration checks.
+				// A request that lands during a tool call is honored as soon as
+				// that call returns.
+				await this.checkPauseRequested(budgetTracker)
+
 				this.logger.info(`[loop] tool result: ${call.name}`, {
 					isError,
 					toolCalls,
 					arg: summarizeToolArg(call.name, call.args),
 				})
+				// Live worker monitoring: emit the tool_result event (a
+				// truncated preview — never the full result). Non-fatal.
+				await this.emitEvent(
+					"tool_result",
+					() => {
+						const preview = truncateField(resultContent)
+						return this.eventFeed.toolResult({
+							iteration,
+							tool: call.name,
+							isError,
+							result: preview.text,
+							resultTruncated: preview.truncated,
+						})
+					},
+					{ iteration },
+				)
 
 				// Consecutive-mistake accounting: errors, parse failures, empty
 				// results, and identical repeated calls all count.
@@ -700,6 +975,9 @@ export class HeadlessSession {
 			await service.save(`Task: ${this.sessionId}, Time: ${Date.now()}`, { allowEmpty: true })
 			this.checkpointService = service
 			this.logger.info("[checkpoints] baseline checkpoint saved", { taskId: this.sessionId })
+			// Live worker monitoring: the baseline checkpoint is iteration 0.
+			// Non-fatal.
+			await this.emitEvent("checkpoint_saved", () => this.eventFeed.checkpointSaved(0))
 		} catch (error) {
 			this.checkpointService = null
 			this.logger.warn("[checkpoints] init/baseline failed (non-fatal; checkpoints disabled for this session)", {
@@ -722,6 +1000,9 @@ export class HeadlessSession {
 		try {
 			await this.checkpointService.save(`Task: ${this.sessionId}, Time: ${Date.now()}`, { allowEmpty: true })
 			this.logger.debug("[checkpoints] iteration checkpoint saved", { iteration })
+			// Live worker monitoring: mirror the existing checkpoint hook point.
+			// Non-fatal.
+			await this.emitEvent("checkpoint_saved", () => this.eventFeed.checkpointSaved(iteration))
 		} catch (error) {
 			this.checkpointService = null
 			this.logger.warn("[checkpoints] save failed (non-fatal; checkpoints disabled for the rest of this session)", {
@@ -937,4 +1218,19 @@ export function truncateHistory(messages: ChatMessage[], windowSize: number): Ch
 	}
 	const keptTail = rest.slice(evictCount)
 	return [system, firstUser, ...keptTail]
+}
+
+/**
+	* Pause/resume (dashboard control): resolve the max-pause override from
+	* `$HEADLESSCODE_MAX_PAUSE_MS` when set and valid (undefined otherwise, so
+	* the caller's flag/default wins). Mirrors the other env fallbacks in
+	* src/cli.ts (envNumber) — invalid values are ignored, not fatal.
+	*/
+function envMaxPauseMs(): number | undefined {
+	const raw = process.env.HEADLESSCODE_MAX_PAUSE_MS
+	if (raw === undefined || raw === "") {
+		return undefined
+	}
+	const n = Number(raw)
+	return Number.isFinite(n) && n > 0 ? n : undefined
 }

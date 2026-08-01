@@ -65,6 +65,12 @@ export interface ToolExecutorOptions {
 	 * enforce the repo's committed policy.
 	 */
 	permissions?: PermissionsConfig
+	/**
+	 * Live worker monitoring: fired at the same lifecycle points where the
+	 * `.harness.needs-decision` marker is written/cleared, so the session can
+	 * mirror them on its event feed (see ToolContext.onDecisionEvent).
+	 */
+	onDecisionEvent?: (eventType: "decision_blocked" | "decision_answered", fields: Record<string, unknown>) => void
 }
 
 export class ToolExecutor {
@@ -121,6 +127,7 @@ export class ToolExecutor {
 				decisionPollIntervalMs: this.options.decisionPollIntervalMs,
 				pauseBudgetClock: this.pauseBudgetClock,
 				resumeBudgetClock: this.resumeBudgetClock,
+				onDecisionEvent: this.options.onDecisionEvent,
 			})
 		} catch (err) {
 			return {
@@ -1051,8 +1058,13 @@ async function askFollowupQuestionHandler(args: Record<string, unknown>, ctx: To
 		)
 		return autonomousDecisionError(question)
 	}
+	// Live worker monitoring: mirror the marker write on the session's event
+	// feed (see src/engine/events.ts). Non-fatal — a feed failure must never
+	// affect the tool result.
+	ctx.onDecisionEvent?.("decision_blocked", { question, ...(suggestions ? { suggestions } : {}) })
 
 	ctx.pauseBudgetClock?.()
+	let answered = false
 	try {
 		const deadline = Date.now() + timeoutMs
 		while (Date.now() < deadline) {
@@ -1065,6 +1077,8 @@ async function askFollowupQuestionHandler(args: Record<string, unknown>, ctx: To
 			if (answer !== undefined) {
 				await safeUnlink(needsDecisionPath)
 				await safeUnlink(answerPath)
+				ctx.onDecisionEvent?.("decision_answered", { answer: answer.trim() })
+				answered = true
 				return ok(`[Human/orchestrator answer received] ${answer.trim()}`)
 			}
 			const remaining = deadline - Date.now()
@@ -1075,6 +1089,9 @@ async function askFollowupQuestionHandler(args: Record<string, unknown>, ctx: To
 		}
 	} finally {
 		ctx.resumeBudgetClock?.()
+	}
+	if (!answered) {
+		ctx.onDecisionEvent?.("decision_answered", { timedOut: true })
 	}
 
 	// Timed out: fall back to exactly today's behavior.
