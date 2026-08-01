@@ -860,6 +860,19 @@ export const TRUNCATION_BATCH_SIZE = 10
  * condensation (summarize + merge) using the model's real token counts —
  * this batching is a small, targeted fix for the caching regression above,
  * not a substitute for that.
+ *
+ * 2026-08-01 fix: the batch boundary above is purely positional and doesn't
+ * know about the OpenAI tool-call protocol, where an assistant message with
+ * `tool_calls` must be immediately followed by one `role: "tool"` message per
+ * call. With irregular per-turn tool-call counts (1-3 per iteration in real
+ * sessions), a raw batch slice can land mid-group: it evicts the assistant's
+ * `tool_calls` message but keeps the `tool` result message(s) that respond to
+ * it, producing a kept tail that starts with an orphaned `tool` message.
+ * Lenient hosts tolerated this; DeepSeek's official endpoint rejects it with
+ * HTTP 400 ("Messages with role 'tool' must be a response to a preceding
+ * message with 'tool_calls'") — confirmed live against a real session at
+ * iteration 17. Fix: after the batch cut, skip forward over any leading
+ * orphaned `tool` messages so the kept tail never starts mid-group.
  */
 export function truncateHistory(messages: ChatMessage[], windowSize: number): ChatMessage[] {
 	if (messages.length <= windowSize) {
@@ -869,7 +882,10 @@ export function truncateHistory(messages: ChatMessage[], windowSize: number): Ch
 	const firstUser = messages[1]
 	const rest = messages.slice(2)
 	const overflow = rest.length - (windowSize - 2)
-	const evictCount = Math.ceil(overflow / TRUNCATION_BATCH_SIZE) * TRUNCATION_BATCH_SIZE
+	let evictCount = Math.ceil(overflow / TRUNCATION_BATCH_SIZE) * TRUNCATION_BATCH_SIZE
+	while (evictCount < rest.length && rest[evictCount].role === "tool") {
+		evictCount++
+	}
 	const keptTail = rest.slice(evictCount)
 	return [system, firstUser, ...keptTail]
 }

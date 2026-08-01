@@ -597,6 +597,44 @@ async function testTruncateHistoryEvictsInBatches(): Promise<void> {
 }
 
 /**
+ * 2026-08-01 regression: real sessions have an irregular number of tool
+ * calls per turn (1-3), so a raw positional batch cut can land in the middle
+ * of an assistant `tool_calls` + its `tool` response group -- evicting the
+ * assistant message but keeping its orphaned `tool` response(s). DeepSeek's
+ * official endpoint rejects that with HTTP 400. Builds a history shaped like
+ * the real failing session (varying call counts per turn) and asserts the
+ * kept tail never starts with a `role: "tool"` message.
+ */
+async function testTruncateHistoryNeverSplitsToolCallGroup(): Promise<void> {
+	const system = fakeMsg(0)
+	const firstUser = fakeMsg(1)
+	const rest: ChatMessage[] = []
+	const callCounts = [1, 3, 2, 1, 2, 3, 1, 1, 2, 3, 1, 2]
+	for (const n of callCounts) {
+		const calls: ChatToolCall[] = Array.from({ length: n }, (_, i) => ({
+			id: `call_${rest.length}_${i}`,
+			type: "function",
+			function: { name: "read_file", arguments: "{}" },
+		}))
+		rest.push({ role: "assistant", content: null, tool_calls: calls })
+		for (const c of calls) {
+			rest.push({ role: "tool", content: "ok", tool_call_id: c.id, name: "read_file" })
+		}
+	}
+	const messages = [system, firstUser, ...rest]
+	for (let windowSize = 4; windowSize < messages.length; windowSize++) {
+		const result = truncateHistory(messages, windowSize)
+		if (result.length > 2) {
+			assert.notEqual(
+				result[2].role,
+				"tool",
+				`windowSize=${windowSize}: kept tail starts with an orphaned tool message`,
+			)
+		}
+	}
+}
+
+/**
  * The actual regression this batching fixes: once truncation is active, the
  * prefix sent to the model must stay IDENTICAL across multiple consecutive
  * calls (not re-slice a different window every single time), so provider-
@@ -661,6 +699,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["checkpoints: apply_diff-only iteration still triggers a checkpoint", testCheckpointTriggeredByApplyDiffOnly],
 	["truncateHistory: no-op below the window", testTruncateHistoryNoOpBelowWindow],
 	["truncateHistory: evicts in TRUNCATION_BATCH_SIZE-sized batches", testTruncateHistoryEvictsInBatches],
+	["truncateHistory: never splits an assistant tool_calls / tool response group", testTruncateHistoryNeverSplitsToolCallGroup],
 	["truncateHistory: prefix stays stable across a batch (cache-eligible)", testTruncateHistoryStablePrefixBetweenBatches],
 ]
 
