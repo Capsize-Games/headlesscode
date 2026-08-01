@@ -50,11 +50,19 @@ client or subtask concept exists to gate — see below).
   (`src/engine/loop.ts`, search "Phase 1 sliding-window truncation"), not token-based
   summarize+merge condensation.
 - **No browser tool** — not present in the vendored native-tool set this harness exposes.
-- **No `codebase_search`** (semantic code search) — stubbed. Distinct from the Phase 3 memory
-  embedder (`src/memory/embed.ts`), which only powers session/fact recall, not code search.
-- **No subtasks** (`new_task` stubbed) — deliberate: multi-agent work is handled at the
-  process level (separate worktrees/workers via the orchestrator) rather than in-session
-  subtasking.
+## codebase_search — built
+
+Implemented against a real OpenRouter embedding model (`qwen/qwen3-embedding-4b`, verified
+live), distinct from the Phase 3 memory embedder (`src/memory/embed.ts`, which only powers
+session/fact recall, not code search). See `src/codesearch/`. Requires an explicit
+`headlesscode index` run per workspace before it returns real results — not yet actually
+exercised in a real session as of 2026-08-01 (the index step and mode-prompt guidance to
+prefer it over blind `read_file` scanning are still open follow-ups).
+
+- **No subtasks** (`new_task` stubbed) — previously deliberate ("multi-agent work is handled
+  at the process level"), but the project owner has since confirmed wanting a real port of
+  Zoo/Roo's recursive `new_task`-based Orchestrator mode for individual workers. Not yet
+  scoped into a plan doc — this line is now a real open item, not a closed design decision.
 - **Hetzner cloud provider** — documented sketch, not implemented
   (`docs/phase6-cloud.md`), a deliberate scope decision.
 - **Playwright-MCP QA gap** — documented (`docs/phase4-qa.md`), a deliberate scope decision;
