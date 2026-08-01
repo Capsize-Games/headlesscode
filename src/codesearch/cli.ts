@@ -1,12 +1,22 @@
 /**
  * `headlesscode index` subcommand — build/refresh the codebase-search index.
  *
- *   npx tsx src/cli.ts index --workspace <path> [--model <id>]
+ *   npx tsx src/cli.ts index --workspace <path> [--model <id>] [--embedding-backend <openrouter|ollama>]
  *
  * Walks the workspace's real source files (git-aware, .gitignore-respecting),
  * chunks them, embeds ONLY the chunks whose content hash changed since the
  * last index (incremental — the cost-control mechanism), and writes
  * <workspace>/.headlesscode/codesearch/index.jsonl.
+ *
+ * Two embedding backends are supported:
+ *   - openrouter (default) — cloud, `qwen/qwen3-embedding-4b`, costs real
+ *     money (priced in src/budget/cost.ts);
+ *   - ollama (opt-in) — local `qwen3-embedding:8b` via
+ *     HEADLESSCODE_OLLAMA_URL (default http://localhost:11434). Free, no
+ *     cost tracking; produces 4096-dim vectors, NOT interchangeable with the
+ *     cloud model's 2560-dim vectors (a backend switch requires a full
+ *     reindex — the build handles it automatically by treating every stored
+ *     vector from the other backend as stale).
  *
  * Indexing is a SEPARATE, EXPLICIT step (it costs real money and takes real
  * time) — it is never auto-triggered mid-session. Sessions consume whatever
@@ -15,20 +25,38 @@
 
 import * as path from "node:path"
 
-import { OpenRouterEmbedder, resolveEmbeddingModel } from "./embedder.js"
+import {
+	createEmbedder,
+	EMBEDDING_BACKEND_ENV,
+	OPENROUTER_EMBEDDING_MODEL_ENV,
+	resolveEmbeddingBackend,
+	resolveEmbeddingModel,
+} from "./embedder.js"
 import { buildIndex, indexFilePath } from "./index.js"
 import { estimateCost, priceFor } from "../budget/cost.js"
+import { DEFAULT_OLLAMA_EMBEDDING_MODEL, OLLAMA_EMBEDDING_MODEL_ENV } from "./ollama-embedder.js"
 
 const INDEX_USAGE = `headlesscode index — build/refresh the codebase semantic-search index
 
 Usage:
-  headlesscode index --workspace <path> [--model <id>]
+  headlesscode index --workspace <path> [--model <id>] [--embedding-backend <openrouter|ollama>]
 
 Options:
-  --workspace <path>   Workspace root to index (required)
-  --model <id>         Embedding model id (default: $HEADLESSCODE_EMBEDDING_MODEL
-                       or ${resolveEmbeddingModel()})
-  --help               Show this help and exit
+  --workspace <path>      Workspace root to index (required)
+  --model <id>            OpenRouter embedding model id (default:
+                          $OPENROUTER_EMBEDDING_MODEL or ${resolveEmbeddingModel()})
+  --embedding-backend <b> Embedding backend: openrouter (default) or ollama
+                          (local, opt-in). Default: $HEADLESSCODE_EMBEDDING_BACKEND
+                          or openrouter
+  --help                  Show this help and exit
+
+Environment:
+  HEADLESSCODE_EMBEDDING_BACKEND          openrouter | ollama (default openrouter)
+  HEADLESSCODE_EMBEDDING_MODEL            OpenRouter embedding model override
+  HEADLESSCODE_OPENROUTER_EMBEDDING_MODEL OpenRouter embedding model override
+                                          (preferred for clarity)
+  HEADLESSCODE_OLLAMA_URL                 Ollama server URL (default http://localhost:11434)
+  HEADLESSCODE_OLLAMA_EMBEDDING_MODEL     Ollama embedding model (default ${DEFAULT_OLLAMA_EMBEDDING_MODEL})
 
 This builds (or incrementally refreshes) the codebase-search index at
 <workspace>/.headlesscode/codesearch/index.jsonl used by the codebase_search
@@ -40,6 +68,7 @@ changed chunks.
 interface IndexCliOptions {
 	workspace?: string
 	model?: string
+	embeddingBackend?: string
 	help: boolean
 }
 
@@ -63,15 +92,18 @@ export function parseIndexArgs(argv: string[]): { options: IndexCliOptions; erro
 		}
 		switch (flag) {
 			case "--workspace":
-			case "--model": {
+			case "--model":
+			case "--embedding-backend": {
 				const value = next()
 				if (value === undefined) {
 					return { options, error: `Missing value for ${flag}` }
 				}
 				if (flag === "--workspace") {
 					options.workspace = value
-				} else {
+				} else if (flag === "--model") {
 					options.model = value
+				} else {
+					options.embeddingBackend = value
 				}
 				break
 			}
@@ -102,34 +134,47 @@ export async function indexMain(argv: string[]): Promise<number> {
 	}
 
 	const workspaceRoot = path.resolve(options.workspace)
-	const model = resolveEmbeddingModel(process.env, options.model)
+	const backend = resolveEmbeddingBackend(process.env, options.embeddingBackend)
 
-	if (!process.env.OPENROUTER_API_KEY) {
+	const embedder = createEmbedder(backend, { model: options.model }, process.env)
+	const modelForEnv = options.model?.trim() || process.env[OPENROUTER_EMBEDDING_MODEL_ENV]?.trim()
+
+	if (backend === "openrouter" && !process.env.OPENROUTER_API_KEY) {
 		process.stderr.write("headlesscode index: OPENROUTER_API_KEY is not set (required for cloud embedding).\n")
 		return 2
 	}
 
-	const embedder = new OpenRouterEmbedder(model)
 	process.stdout.write(`Indexing workspace: ${workspaceRoot}\n`)
+	process.stdout.write(`Embedding backend:  ${backend}\n`)
 	process.stdout.write(`Embedding model:    ${embedder.model}\n`)
+	if (backend === "ollama") {
+		const ollamaModel = process.env[OLLAMA_EMBEDDING_MODEL_ENV]?.trim() || DEFAULT_OLLAMA_EMBEDDING_MODEL
+		process.stdout.write(`  (local, no embedding cost — model: ${ollamaModel})\n`)
+	}
 
 	try {
 		const result = await buildIndex(embedder, workspaceRoot, (scanned, total) => {
 			process.stdout.write(`\r  scanned ${scanned}/${total} files`)
-		})
+		}, backend)
 		if (result.filesScanned > 0) {
 			process.stdout.write(`\r  scanned ${result.filesScanned}/${result.filesScanned} files\n`)
 		} else {
 			process.stdout.write("\n")
 		}
 
-		const price = priceFor(result.model)
-		const estCostUsd = estimateCost({
-			model: result.model,
-			inputTokens: result.promptTokens,
-			outputTokens: 0,
-		})
 		const indexFile = indexFilePath(workspaceRoot)
+		const costLine =
+			backend === "openrouter"
+				? (() => {
+						const price = priceFor(result.model)
+						const estCostUsd = estimateCost({
+							model: result.model,
+							inputTokens: result.promptTokens,
+							outputTokens: 0,
+						})
+						return `  estimated cost:       $${estCostUsd.toFixed(6)} (${result.model} @ $${price.input}/1M input)\n`
+					})()
+				: `  estimated cost:       $0.00 (local backend — no cloud spend)\n`
 		process.stdout.write(
 			`Index written: ${indexFile}\n` +
 				`  files scanned:        ${result.filesScanned}\n` +
@@ -138,7 +183,7 @@ export async function indexMain(argv: string[]): Promise<number> {
 				`  chunks removed:       ${result.chunksRemoved}\n` +
 				`  total chunks:         ${result.totalChunks}\n` +
 				`  embedding tokens:     ${result.promptTokens}\n` +
-				`  estimated cost:       $${estCostUsd.toFixed(6)} (${result.model} @ $${price.input}/1M input)\n`,
+				costLine,
 		)
 		return 0
 	} catch (err) {

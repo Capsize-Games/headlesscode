@@ -93,10 +93,11 @@ Subcommands:
               event feed and pause/resume control (Phase 3: no longer purely
               read-only — see src/dashboard/server.ts). See
               \`npx tsx src/cli.ts dashboard --help\` for full options.
-  headlesscode index --workspace <path> [--model <id>]
+  headlesscode index --workspace <path> [--model <id>] [--embedding-backend <b>]
               Build/refresh the codebase semantic-search index for a workspace
               (used by the codebase_search tool). A separate, explicit step —
-              never auto-triggered mid-session. See
+              never auto-triggered mid-session. --embedding-backend picks
+              openrouter (default) or ollama (local). See
               \`npx tsx src/cli.ts index --help\` for full options.
   headlesscode provision --installation-id <id> --owner <o> --repo <r> --target <dir>
               Clone a GitHub repo the App installation can access into a local

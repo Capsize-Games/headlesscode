@@ -61,12 +61,51 @@
  */
 
 import { OpenRouterClient } from "../llm/openrouter.js"
+import {
+	DEFAULT_OLLAMA_EMBEDDING_MODEL,
+	DEFAULT_OLLAMA_URL,
+	OLLAMA_EMBEDDING_MODEL_ENV,
+	OLLAMA_URL_ENV,
+	OllamaEmbedder,
+	resolveOllamaEmbeddingModel,
+	resolveOllamaUrl,
+} from "./ollama-embedder.js"
 
 /** Default embedding model (see header comment for verification notes). */
 export const DEFAULT_EMBEDDING_MODEL = "qwen/qwen3-embedding-4b"
 
 /** Env var that overrides the embedding model. */
 export const EMBEDDING_MODEL_ENV = "HEADLESSCODE_EMBEDDING_MODEL"
+
+/** Embedding backends (the codebase index build + query can pick between). */
+export const EMBEDDING_BACKENDS = ["openrouter", "ollama"] as const
+
+/** Default backend — OpenRouter, matching the pre-existing behavior. */
+export const DEFAULT_EMBEDDING_BACKEND = "openrouter"
+
+/** Env var that selects the backend (`openrouter` | `ollama`). */
+export const EMBEDDING_BACKEND_ENV = "HEADLESSCODE_EMBEDDING_BACKEND"
+
+/** Env var that overrides the OpenRouter embedding model. */
+export const OPENROUTER_EMBEDDING_MODEL_ENV = "HEADLESSCODE_OPENROUTER_EMBEDDING_MODEL"
+
+/** The backend an index was built with (recorded per entry + in metadata). */
+export type EmbeddingBackend = (typeof EMBEDDING_BACKENDS)[number]
+
+/**
+ * Resolve the embedding backend: explicit override → env → default. The
+ * default is deliberately `openrouter` (opt-in for Ollama), because hosted/
+ * headless workers have no local GPU — see plans/local-embeddings-ollama.md.
+ */
+export function resolveEmbeddingBackend(env: NodeJS.ProcessEnv = process.env, override?: string): EmbeddingBackend {
+	const raw = (override?.trim() || env[EMBEDDING_BACKEND_ENV]?.trim() || DEFAULT_EMBEDDING_BACKEND).toLowerCase()
+	if (raw === "ollama" || raw === "openrouter") {
+		return raw
+	}
+	throw new Error(
+		`Invalid embedding backend "${raw}" (from ${EMBEDDING_BACKEND_ENV} or --embedding-backend): expected "openrouter" or "ollama"`,
+	)
+}
 
 /** Embedding batch size (chunks per request). Kept modest for retry granularity. */
 export const EMBED_BATCH_SIZE = 128
@@ -100,6 +139,36 @@ export interface EmbedResult {
 	model: string
 	promptTokens: number
 	totalTokens: number
+}
+
+/** Name of the backend field on the index metadata block (shared with index.ts/types.ts). */
+export const METADATA_BACKEND_KEY = "backend" as const
+
+/** Name of the model field on the index metadata block (shared with index.ts/types.ts). */
+export const METADATA_MODEL_KEY = "model" as const
+
+/**
+ * Create the embedder for a backend, defaulting to `openrouter`. The
+ * OpenRouter model resolves from the constructor option → env → default; the
+ * Ollama model/URL from their own env vars (or constructor options).
+ */
+export function createEmbedder(
+	backend?: EmbeddingBackend,
+	options: {
+		/** OpenRouter embedding model override (--model / HEADLESSCODE_OPENROUTER_EMBEDDING_MODEL). */
+		model?: string
+		/** Ollama embedding model override (HEADLESSCODE_OLLAMA_EMBEDDING_MODEL). */
+		ollamaModel?: string
+		/** Ollama server URL override (HEADLESSCODE_OLLAMA_URL). */
+		ollamaUrl?: string
+	} = {},
+	env: NodeJS.ProcessEnv = process.env,
+): Embedder {
+	const resolved = resolveEmbeddingBackend(env, backend)
+	if (resolved === "ollama") {
+		return new OllamaEmbedder(options.ollamaModel ?? resolveOllamaEmbeddingModel(env), options.ollamaUrl ?? resolveOllamaUrl(env))
+	}
+	return new OpenRouterEmbedder(options.model ?? env[OPENROUTER_EMBEDDING_MODEL_ENV] ?? resolveEmbeddingModel(env))
 }
 
 /**
