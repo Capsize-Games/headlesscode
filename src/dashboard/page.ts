@@ -129,6 +129,12 @@ export function renderPage(): string {
 
   <div class="stats" id="totals"></div>
 
+  <h2>Mode → model settings</h2>
+  <div class="sub">Per-mode model assignment (<code>.headlesscode/mode-models.json</code>).
+    Each role resolves its own model; <code>_default</code> is the fallback when a mode isn't listed.
+    An explicit <code>--model</code> flag always overrides this table.</div>
+  <div id="modeModels"></div>
+
   <h2>Blocked (awaiting a decision)</h2>
   <div id="blocked"><div class="empty">none</div></div>
 
@@ -428,6 +434,164 @@ function renderSessions(sessions) {
   });
 }
 
+// ── Mode → model settings (mode-model-assignment) ───────────────────────────
+// A small editable table (mode slug + model id, add/remove rows) with a save
+// button that POSTs the current table state to /api/settings/mode-models and
+// shows success/error inline. Plain vanilla JS — no framework, matching this
+// page's style.
+const modeModelsEl = document.getElementById("modeModels");
+
+// Rows carry their slug in a data attribute so the table state can be
+// serialized back to the { mode: model, _default: model } file shape.
+function settingsTableRow(slug, model, isDefault) {
+  const tr = document.createElement("tr");
+  tr.dataset.slug = slug;
+  tr.innerHTML =
+    '<td class="mono">' + esc(slug) + "</td>" +
+    '<td><input type="text" value="' + esc(model) + '" placeholder="provider/model" class="model-input" style="width:100%"></td>' +
+    '<td><button class="row-remove" title="remove row">✕</button></td>';
+  if (isDefault) {
+    const label = document.createElement("span");
+    label.className = "sub";
+    label.textContent = "  (fallback)";
+    tr.querySelector("td").appendChild(label);
+  }
+  tr.querySelector(".row-remove").addEventListener("click", () => {
+    tr.remove();
+  });
+  return tr;
+}
+
+async function loadModeModels() {
+  try {
+    const res = await fetch("/api/settings/mode-models");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    renderModeModels(data || {});
+  } catch (err) {
+    modeModelsEl.innerHTML = '<div class="empty">failed to load mode-models settings: ' + esc(err) + "</div>";
+  }
+}
+
+function renderModeModels(file) {
+  const entries = Object.entries(file || {});
+  const table = document.createElement("table");
+  const thead = document.createElement("thead");
+  thead.innerHTML = "<tr><th>mode</th><th>model id</th><th></th></tr>";
+  const tbody = document.createElement("tbody");
+  let hasDefault = false;
+  for (const [slug, model] of entries) {
+    const isDefault = slug === "_default";
+    if (isDefault) hasDefault = true;
+    tbody.appendChild(settingsTableRow(slug, model, isDefault));
+  }
+  if (!hasDefault) {
+    // Seed an empty _default row so the fallback is always editable.
+    tbody.appendChild(settingsTableRow("_default", "", true));
+  }
+  table.appendChild(thead);
+  table.appendChild(tbody);
+
+  const slugInput = document.createElement("input");
+  slugInput.type = "text";
+  slugInput.placeholder = "mode slug (e.g. code, deepseek-reviewer, qa-agent)";
+  slugInput.style.width = "100%";
+
+  const modelInput = document.createElement("input");
+  modelInput.type = "text";
+  modelInput.placeholder = "provider/model";
+  modelInput.style.width = "100%";
+
+  const addBtn = document.createElement("button");
+  addBtn.textContent = "+ Add row";
+  addBtn.addEventListener("click", () => {
+    const slug = slugInput.value.trim();
+    if (!slug || slug === "_default") {
+      addMsg("mode slug must be a non-empty string (use the _default row for the fallback)", true);
+      return;
+    }
+    if (table.querySelector('tbody tr[data-slug="' + slug + '"]')) {
+      addMsg("row for mode '" + slug + "' already exists", true);
+      return;
+    }
+    const tr = settingsTableRow(slug, modelInput.value.trim(), false);
+    tbody.appendChild(tr);
+    slugInput.value = "";
+    modelInput.value = "";
+    clearMsg();
+  });
+
+  const saveBtn = document.createElement("button");
+  saveBtn.textContent = "💾 Save";
+  saveBtn.addEventListener("click", () => saveModeModels(table));
+
+  const addRow = document.createElement("div");
+  addRow.className = "settings-add";
+  addRow.style.cssText = "display:flex; gap:8px; margin-top:8px; align-items:center; flex-wrap:wrap;";
+  addRow.appendChild(slugInput);
+  addRow.appendChild(modelInput);
+  addRow.appendChild(addBtn);
+
+  const actions = document.createElement("div");
+  actions.style.cssText = "display:flex; gap:8px; margin-top:8px; align-items:center; flex-wrap:wrap;";
+  actions.appendChild(saveBtn);
+  const msg = document.createElement("span");
+  msg.id = "settingsMsg";
+  actions.appendChild(msg);
+
+  modeModelsEl.innerHTML = "";
+  modeModelsEl.appendChild(table);
+  modeModelsEl.appendChild(addRow);
+  modeModelsEl.appendChild(actions);
+}
+
+function currentSettingsTable(table) {
+  const out = {};
+  for (const tr of table.querySelectorAll("tbody tr")) {
+    const slug = tr.dataset.slug;
+    const model = tr.querySelector("input").value.trim();
+    if (!slug) continue;
+    if (model) out[slug] = model;
+  }
+  return out;
+}
+
+function settingsMsg() {
+  return document.getElementById("settingsMsg");
+}
+
+function addMsg(text, isError) {
+  const el = settingsMsg();
+  if (!el) return;
+  el.textContent = text;
+  el.className = isError ? "status-error" : "status-success";
+}
+
+function clearMsg() {
+  const el = settingsMsg();
+  if (el) el.textContent = "";
+}
+
+async function saveModeModels(table) {
+  const payload = currentSettingsTable(table);
+  clearMsg();
+  try {
+    const res = await fetch("/api/settings/mode-models", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      addMsg("save failed: " + (data.error || ("HTTP " + res.status)), true);
+      return;
+    }
+    addMsg("saved ✓ — " + Object.keys(payload).length + " entry(ies)", false);
+  } catch (err) {
+    addMsg("save failed: " + err, true);
+  }
+}
+
 async function poll() {
   try {
     const res = await fetch("/api/summary");
@@ -455,6 +619,7 @@ document.getElementById("feed").addEventListener("scroll", () => {
 });
 
 poll();
+loadModeModels();
 setInterval(poll, 4000);
 // Live event feed poll: faster than the summary poll (1.5s) so the detail
 // view feels live, and only runs while a detail view is open.

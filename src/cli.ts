@@ -23,6 +23,7 @@ import { checkpointsMain } from "./checkpoints/cli.js"
 import { dashboardMain } from "./dashboard/cli.js"
 import { indexMain } from "./codesearch/cli.js"
 import { resolvePermissions, type PermissionsConfig } from "./permissions/config.js"
+import { resolveModelForMode } from "./config/mode-models.js"
 
 const VERSION = "0.1.0"
 
@@ -406,11 +407,22 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 				customModes,
 			})
 			const tools = selectToolsForMode(options.mode, customModes)
+			// Per-mode model assignment: dry-run resolves the model exactly
+			// like a real run (mode-models.json / _default / OPENROUTER_MODEL,
+			// with an explicit --model always winning) so the effective model
+			// is visible without an LLM call. undefined -> the client default.
+			const dryRunModel = resolveModelForMode({
+				workspaceRoot,
+				mode: options.mode,
+				explicitModel: options.model,
+				env: process.env,
+			})
 
 			process.stdout.write(built.prompt + "\n")
 			process.stdout.write(
 				`\n───── dry-run summary ─────\n` +
 					`mode:             ${options.mode}\n` +
+					`model:            ${dryRunModel ?? "deepseek/deepseek-chat (client default)"}\n` +
 					`workspace:        ${workspaceRoot}\n` +
 					`custom modes:     ${customModes.length ? customModes.map((m) => m.slug).join(", ") : "(none, using built-ins)"}\n` +
 					`exposed tools:    ${tools.map((t) => (t.type === "function" ? t.function.name : t.type)).join(", ")}\n` +
@@ -461,7 +473,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		return 2
 	}
 
-	const model = options.model ?? process.env.OPENROUTER_MODEL ?? undefined
+	// Per-mode model assignment (plans/mode-model-assignment.md): the
+	// resolved mode's config entry / _default / OPENROUTER_MODEL apply only
+	// when no explicit --model flag was given (an explicit flag always wins).
+	// `undefined` is passed through so the OpenRouter client's own built-in
+	// default stays the single source of truth for the ultimate fallback.
+	const model = resolveModelForMode({
+		workspaceRoot,
+		mode: options.mode,
+		explicitModel: options.model,
+		env: process.env,
+	})
 	const client = new OpenRouterClient({ apiKey, defaultModel: model })
 
 	// Phase 3 memory: OFF by default (preserves pre-Phase-3 behavior). Enabled

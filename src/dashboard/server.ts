@@ -1,6 +1,7 @@
 /**
  * Cost/token dashboard — plain `node:http` server (workstream 3) + live
- * per-session events + pause/resume control (live worker monitoring).
+ * per-session events + pause/resume control (live worker monitoring) +
+ * per-mode model settings (mode-model-assignment).
  *
  * ZERO new UI/framework dependencies, matching this project's established
  * "plain fs + JSON, no schema library" ethos (see `src/orchestrator/state.ts`'s
@@ -12,12 +13,14 @@
  *   GET  /api/session/:id/events  JSON events feed (incremental via ?since=<offset>)
  *   POST /api/session/:id/pause   write `.harness.pause-requested` (worker pauses between iterations)
  *   POST /api/session/:id/resume  remove `.harness.pause-requested` (worker resumes)
+ *   GET  /api/settings/mode-models?repo=<path>   current mode-models.json content ({} if absent)
+ *   POST /api/settings/mode-models?repo=<path>   validate + write mode-models.json (creates .headlesscode/)
  *
  * NOTE (Phase 3 scope change): the dashboard is no longer purely read-only.
- * The two POST routes above write/remove a pause marker in the target
- * worktree — a control action, not just observability. Still local-only /
- * no-auth (binds 127.0.0.1), but if this endpoint is ever exposed beyond
- * localhost, that assumption needs revisiting — no auth was added here.
+ * The POST routes above write/remove files in the target worktree/repo — a
+ * control action, not just observability. Still local-only / no-auth (binds
+ * 127.0.0.1), but if this endpoint is ever exposed beyond localhost, that
+ * assumption needs revisiting — no auth was added here.
  */
 
 import * as fsp from "node:fs/promises"
@@ -26,6 +29,13 @@ import * as path from "node:path"
 
 import { buildSummary, findSessionEventsFile, readSessionEvents } from "./aggregate.js"
 import { renderPage } from "./page.js"
+import {
+	MODE_MODELS_CONFIG_FILE,
+	loadModeModelsFile,
+	stringifyModeModelsFile,
+	validateModeModelsBody,
+	type ModeModelsFile,
+} from "../config/mode-models.js"
 
 /** Default dashboard port (overridable via --port or $HEADLESSCODE_DASHBOARD_PORT). */
 export const DEFAULT_DASHBOARD_PORT = 4390
@@ -136,6 +146,72 @@ async function handleRequest(
 		return
 	}
 
+	// Per-mode model settings (mode-model-assignment): GET returns the current
+	// `.headlesscode/mode-models.json` content ({} when absent); POST validates
+	// the JSON body with the same rules the config loader uses and writes it
+	// (creating `.headlesscode/` if needed). A malformed save is rejected with
+	// a clear error — never writes garbage that later throws on a worker read.
+	if (url.pathname === "/api/settings/mode-models") {
+		const repo = url.searchParams.get("repo") || options.repo
+		if (!repo) {
+			res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ error: "missing repo — pass ?repo=<path> or start the dashboard with --repo" }),
+			)
+			return
+		}
+		if (req.method === "GET") {
+			try {
+				// Reuse the strict loader: a malformed on-disk file surfaces as
+				// an error here instead of a silently-empty settings page.
+				const file = loadModeModelsFile(repo)
+				res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(
+					JSON.stringify(file ?? {}),
+				)
+			} catch (error) {
+				res
+					.writeHead(500, { "content-type": "application/json; charset=utf-8" })
+					.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+			}
+			return
+		}
+		if (req.method === "POST") {
+			try {
+				const raw = await readJsonBody(req)
+				let body: unknown
+				try {
+					body = JSON.parse(raw)
+				} catch (err) {
+					res
+						.writeHead(400, { "content-type": "application/json; charset=utf-8" })
+						.end(JSON.stringify({ error: `invalid JSON body: ${err instanceof Error ? err.message : String(err)}` }))
+					return
+				}
+				// Same strict validation the config loader applies on read.
+				try {
+					validateModeModelsBody(body)
+				} catch (err) {
+					res
+						.writeHead(400, { "content-type": "application/json; charset=utf-8" })
+						.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }))
+					return
+				}
+				const file = path.join(repo, MODE_MODELS_CONFIG_FILE)
+				await fsp.mkdir(path.dirname(file), { recursive: true })
+				await fsp.writeFile(file, stringifyModeModelsFile(body as ModeModelsFile), "utf-8")
+				res
+					.writeHead(200, { "content-type": "application/json; charset=utf-8" })
+					.end(JSON.stringify({ ok: true, path: file }))
+			} catch (error) {
+				res
+					.writeHead(500, { "content-type": "application/json; charset=utf-8" })
+					.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+			}
+			return
+		}
+		res.writeHead(405, { "content-type": "text/plain" }).end("Method Not Allowed")
+		return
+	}
+
 	if (req.method !== "GET") {
 		res.writeHead(405, { "content-type": "text/plain" }).end("Method Not Allowed")
 		return
@@ -160,4 +236,16 @@ async function handleRequest(
 	}
 
 	res.writeHead(404, { "content-type": "text/plain" }).end("Not Found")
+}
+
+/** Read a request body as text (bounded — settings payloads are tiny). */
+async function readJsonBody(req: http.IncomingMessage): Promise<string> {
+	const chunks: Buffer[] = []
+	for await (const chunk of req) {
+		chunks.push(chunk as Buffer)
+		if (chunks.reduce((n, c) => n + c.length, 0) > 1_000_000) {
+			throw new Error("request body too large (limit 1MB)")
+		}
+	}
+	return Buffer.concat(chunks).toString("utf-8")
 }

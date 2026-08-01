@@ -30,6 +30,7 @@ import { loadState, saveState, updateGroup, type OrchestratorGroup, type Orchest
 import { runReview, type ReviewResult } from "./reviewer.js"
 import { runQa } from "../qa/qa.js"
 import { groupWorktreePath, watchGroups } from "./watch.js"
+import { resolveModelForMode } from "../config/mode-models.js"
 
 const ORCHESTRATE_USAGE = `headlesscode orchestrate — Phase 2 parallel round
 
@@ -42,7 +43,11 @@ Options:
   --issue <n>            Issue number to include (repeatable)
   --issues-json <file>   Read issues from a JSON array of {number,title,body}
   --mode <slug>          Harness mode for workers (default: code)
-  --model <id>           Model id for workers + reviewer + QA (default: $OPENROUTER_MODEL)
+  --model <id>           Explicit model override for workers + reviewer + QA
+                         (beats .headlesscode/mode-models.json entries). Without
+                         it, each role resolves its OWN model from the file:
+                         worker mode / --review-mode / --qa-mode
+                         (default: $OPENROUTER_MODEL or the client default)
   --batch <name>         Batch id recorded in the state file (default: round-<date>)
   --review-mode <slug>   Mode slug used for review sessions (default: deepseek-reviewer)
   --no-review            Spawn + watch only; do not run the reviewer
@@ -624,7 +629,13 @@ function spawnCommandFor(harnessRoot: string, specs: WorktreeSpec[]): string {
 	return `bash ${path.join(harnessRoot, "scripts", "spawn-parallel-worktrees.sh")} ${triples.join(" ")}`
 }
 
-function printPlan(repo: string, mode: string, specs: WorktreeSpec[], issues: SplitIssue[]): void {
+function printPlan(
+	repo: string,
+	mode: string,
+	specs: WorktreeSpec[],
+	issues: SplitIssue[],
+	models?: { worker: string; reviewer: string; qa: string },
+): void {
 	const shapeNotes = new Map<number, string>()
 	for (const issue of issues) {
 		const hot = /(request|handler|migration|database|session|auth|encryption|crypto|password|token)/i.test(
@@ -649,6 +660,11 @@ function printPlan(repo: string, mode: string, specs: WorktreeSpec[], issues: Sp
 	process.stdout.write("── Orchestrate plan (dry run) ─────────────────────────────\n")
 	process.stdout.write(`  repo:     ${repo}\n`)
 	process.stdout.write(`  mode:     ${mode}\n`)
+	if (models) {
+		process.stdout.write(`  models:   worker: ${models.worker}\n`)
+		process.stdout.write(`            reviewer: ${models.reviewer}\n`)
+		process.stdout.write(`            QA: ${models.qa}\n`)
+	}
 	process.stdout.write(`  issues:   ${issues.map((i) => i.number).join(", ")}\n\n`)
 	process.stdout.write("Split plan (heuristics from the airunner multi-agent-orchestrator mode):\n")
 	for (const spec of specs) {
@@ -699,7 +715,18 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 
 	const specs = splitIssues(issues)
 	if (options.dryRun) {
-		printPlan(repo, options.mode, specs, issues)
+		// Per-mode model assignment: resolve each role's model exactly like a
+		// real round so the dry-run preview shows the effective model per role
+		// (mode-models.json / _default / OPENROUTER_MODEL; explicit --model
+		// always wins). undefined -> the OpenRouter client's built-in default.
+		const previewModel = (mode: string): string =>
+			resolveModelForMode({ workspaceRoot: repo, mode, explicitModel: options.model, env: process.env }) ??
+			"deepseek/deepseek-chat (client default)"
+		printPlan(repo, options.mode, specs, issues, {
+			worker: previewModel(options.mode),
+			reviewer: previewModel(options.reviewMode),
+			qa: previewModel(options.qaMode),
+		})
 		return 0
 	}
 
@@ -774,7 +801,30 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	state.batch = batch
 	await saveState(statePath, state)
 
-	// 4. Watch + review.
+	// 4. Watch + review. Per-mode model assignment: each role resolves its OWN
+	// model — workers use the group's mode, the reviewer uses reviewMode, QA
+	// uses qaMode. An explicit --model flag beats every mode's config entry
+	// (resolveModelForMode precedence rule 1), so a blanket override still
+	// works exactly as before.
+	const workerModel = resolveModelForMode({
+		workspaceRoot: repo,
+		mode: options.mode,
+		explicitModel: options.model,
+		env: process.env,
+	})
+	const reviewerModel = resolveModelForMode({
+		workspaceRoot: repo,
+		mode: options.reviewMode,
+		explicitModel: options.model,
+		env: process.env,
+	})
+	const qaModel = resolveModelForMode({
+		workspaceRoot: repo,
+		mode: options.qaMode,
+		explicitModel: options.model,
+		env: process.env,
+	})
+
 	process.stdout.write("Watching for worker completion (.harness.done markers)...\n")
 	await watchGroups({
 		repoRoot: repo,
@@ -792,7 +842,7 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 				const result = await runReview({
 					workspaceRoot: groupWorktreePath(repo, group),
 					mode: options.reviewMode,
-					model: options.model,
+					model: reviewerModel,
 				})
 				const patch = {
 					review_verdict: result.verdict,
@@ -824,7 +874,7 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 						repo,
 						options.maxReworkCycles,
 						options.mode,
-						options.model,
+						workerModel,
 					)
 					if (decision.shouldSpawn && decision.taskFilePath && decision.taskContent && decision.spawnCommand) {
 						fs.mkdirSync(path.dirname(decision.taskFilePath), { recursive: true })
@@ -904,7 +954,7 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 				const qaResult = await runQa({
 					workspaceRoot: groupWorktreePath(repo, group),
 					mode: options.qaMode,
-					model: options.model,
+					model: qaModel,
 				})
 				const qaStatus = qaResult.verdict === "pass" ? "done" : "failed"
 				// Merge onto `state` (which already carries the review patch) —
