@@ -40,10 +40,12 @@ export interface CloudSessionRequest {
 export interface SessionHandle {
 	/** Unique id within the provider (e.g. the worktree/container name). */
 	id: string
-	/** Provider name (e.g. "local", "hetzner-docker"). */
+	/** Provider name (e.g. "local", "docker", "hetzner-docker"). */
 	provider: string
 	/** Where the session lives (worktree path / container address). */
 	address?: string
+	/** Provider-specific opaque identifier (e.g. container id) — optional. */
+	containerId?: string
 }
 
 export interface CommandResult {
@@ -255,13 +257,20 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-// ─── Hetzner evaluation hook ─────────────────────────────────────────────────
+// ─── Hetzner evaluation hook (superseded by the Docker provider) ─────────────
 //
-// `HetznerDockerProvider` is deliberately a SKETCH ONLY — it documents the
-// shape a real 6.1 cloud provider would take (per docs/phase6-cloud.md) but is
-// NOT implemented against live Hetzner: no API credentials, no Docker SDK, no
-// network. See docs/phase6-cloud.md §"Hetzner evaluation" for the 6.2
-// findings and the recommendation.
+// `HetznerDockerProvider` was deliberately a SKETCH ONLY — it documented the
+// shape a real 6.1 cloud provider would take (per docs/phase6-cloud.md) but
+// was NOT implemented against live Hetzner: no API credentials, no Docker
+// SDK, no network.
+//
+// It is now SUPERSEDED by the real `DockerSessionProvider` in
+// src/cloud/docker-provider.ts (docs/multi-tenant-hosting-design.md §5): a
+// working container-per-session implementation of the same `CloudProvider`
+// interface, proven against a real local Docker daemon. This sketch is kept
+// as a backward-compatible marker for the Phase 6.2 evaluation history and
+// for the existing provider contract test; the "reason" now points at the
+// replacement instead of describing an unimplemented future.
 export interface HetznerDockerProviderSketch {
 	readonly name: string
 	readonly implemented: false
@@ -272,5 +281,5 @@ export const hetznerDockerProviderSketch: HetznerDockerProviderSketch = {
 	name: "hetzner-docker",
 	implemented: false,
 	reason:
-		"Evaluation only (Phase 6, spec 6.2). A real implementation would spawn a container per issue on the existing self-hosted GitHub Actions runners (or dedicated Hetzner hosts), run the harness via the same lifecycle methods, and tear down afterwards — see docs/phase6-cloud.md.",
+		"Evaluation artifact (Phase 6, spec 6.2) superseded by DockerSessionProvider (src/cloud/docker-provider.ts) — see docs/multi-tenant-hosting-design.md.",
 }
