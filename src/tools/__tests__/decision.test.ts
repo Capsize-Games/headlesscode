@@ -15,8 +15,11 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 
-import { createHeadlessExecutor } from "../executor.js"
+import { createHeadlessExecutor, createReadOnlyHeadlessExecutor } from "../executor.js"
 import { BudgetTracker } from "../../budget/budget.js"
+import { HeadlessSession } from "../../engine/loop.js"
+import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } from "../../engine/types.js"
+import type { PermissionsConfig } from "../../permissions/config.js"
 
 async function mkTmpWorkspace(prefix: string): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -152,6 +155,167 @@ async function testExecutorWiresBudgetClockHooksAroundTheWait(): Promise<void> {
 	}
 }
 
+// ─── Permissions enforcement (session-level) ────────────────────────────────
+
+/** Minimal fake LLM client — mirrors src/engine/__tests__/loop.test.ts. */
+class FakeLlmClient implements LlmClient {
+	requests: LlmRequest[] = []
+
+	constructor(private readonly script: Array<(req: LlmRequest) => ChatMessage>) {}
+
+	async createChatCompletion(request: LlmRequest): Promise<LlmResponse> {
+		this.requests.push(request)
+		const step = this.script.shift()
+		if (!step) {
+			throw new Error("FakeLlmClient: script exhausted (model kept calling)")
+		}
+		return { message: step(request) }
+	}
+}
+
+function toolCall(name: string, args: unknown, id = `call_${Math.random().toString(36).slice(2)}`): ChatMessage {
+	const call: ChatToolCall = { id, type: "function", function: { name, arguments: JSON.stringify(args) } }
+	return { role: "assistant", content: null, tool_calls: [call] }
+}
+
+/** Zero-policy permissions: nothing configured, nothing protected, hatch off. */
+const EMPTY_PERMISSIONS: PermissionsConfig = {
+	allowedCommands: [],
+	deniedCommands: [],
+	protectedFiles: [],
+	allowProtectedWrites: false,
+}
+
+/** The most recent `tool` message for a tool name, or null (scan backwards). */
+function lastToolMessage(session: HeadlessSession, name: string): string | null {
+	const messages = session.state.messages
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const m = messages[i]
+		if (m.role === "tool" && m.name === name) {
+			return m.content
+		}
+	}
+	return null
+}
+
+// ─── (d1) a denied command is isError:true AND counts as a mistake ──────────
+
+async function testDeniedCommandIsErrorAndCountsAsMistake(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-perm-denied-cmd-")
+	try {
+		const client = new FakeLlmClient([() => toolCall("execute_command", { command: "rm -rf /" })])
+		const session = new HeadlessSession({
+			workspaceRoot: ws,
+			mode: "code",
+			model: "fake-model",
+			taskText: "run a command",
+			llmClient: client,
+			maxIterations: 5,
+			// One refusal must trip the bounded-failure bound: the refusal IS a mistake.
+			consecutiveErrorLimit: 1,
+			checkpoints: false,
+			permissions: { ...EMPTY_PERMISSIONS, deniedCommands: ["rm"] },
+		})
+
+		const result = await session.run()
+		assert.equal(result.status, "error", `expected bounded failure, got ${JSON.stringify(result)}`)
+		// NOTE: the loop's boundedFailure template reads "1 consecutive
+		// consecutive mistakes" (a pre-existing wording quirk in src/engine/loop.ts)
+		// — match the stable prefix.
+		assert.match(
+			result.error ?? "",
+			/Bounded failure: 1 consecutive/,
+			"a permissions refusal must count toward the consecutive-mistake counter",
+		)
+
+		const toolMsg = lastToolMessage(session, "execute_command")
+		assert.ok(toolMsg !== null, "the refusal result must be fed back to the model")
+		assert.match(toolMsg ?? "", /refusing to run/, "refusal message should be explicit")
+		assert.match(toolMsg ?? "", /denied by the permissions policy/, "refusal must explain why")
+		assert.match(toolMsg ?? "", /rm -rf \//, "refusal must name the offending sub-command")
+		assert.match(toolMsg ?? "", /denied pattern 'rm'/, "refusal must name the matched pattern")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// ─── (d2) a protected-file write is isError:true AND counts as a mistake ────
+
+async function testProtectedWriteIsErrorAndCountsAsMistake(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-perm-prot-write-")
+	try {
+		const client = new FakeLlmClient([() => toolCall("write_to_file", { path: ".env", content: "API_KEY=leaked" })])
+		const session = new HeadlessSession({
+			workspaceRoot: ws,
+			mode: "code",
+			model: "fake-model",
+			taskText: "write a config",
+			llmClient: client,
+			maxIterations: 5,
+			consecutiveErrorLimit: 1,
+			checkpoints: false,
+			permissions: { ...EMPTY_PERMISSIONS, protectedFiles: [".env"] },
+		})
+
+		const result = await session.run()
+		assert.equal(result.status, "error", `expected bounded failure, got ${JSON.stringify(result)}`)
+		// See the note in testDeniedCommandIsErrorAndCountsAsMistake: the loop's
+		// message reads "1 consecutive consecutive mistakes".
+		assert.match(
+			result.error ?? "",
+			/Bounded failure: 1 consecutive/,
+			"a protected-file refusal must count toward the consecutive-mistake counter",
+		)
+
+		const toolMsg = lastToolMessage(session, "write_to_file")
+		assert.ok(toolMsg !== null, "the refusal result must be fed back to the model")
+		assert.match(toolMsg ?? "", /refusing to write protected file '\.env'/, "refusal must name the file")
+		assert.match(toolMsg ?? "", /protected pattern '\.env'/, "refusal must name the matched pattern")
+		assert.match(toolMsg ?? "", /allow-protected-writes/, "refusal must mention the escape hatch")
+
+		// The protected file must never be written.
+		await assert.rejects(fs.access(path.join(ws, ".env")), "protected file must not exist after the refusal")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// ─── (d3) the escape hatch actually bypasses protected-file enforcement ─────
+
+async function testAllowProtectedWritesEscapeHatchWorks(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-perm-escape-")
+	try {
+		const executor = createHeadlessExecutor(ws, {
+			permissions: { ...EMPTY_PERMISSIONS, protectedFiles: [".env"], allowProtectedWrites: true },
+		})
+		const result = await executor.execute("write_to_file", { path: ".env", content: "OK" })
+		assert.equal(result.isError, false, "the escape hatch must permit the protected write")
+		assert.match(result.content, /File written: \.env/)
+		assert.equal(await fs.readFile(path.join(ws, ".env"), "utf-8"), "OK")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// ─── (d4) reviewer/QA read-only executors gate execute_command too ──────────
+
+async function testReadOnlyExecutorAlsoGatesCommands(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-perm-reviewer-")
+	try {
+		const executor = createReadOnlyHeadlessExecutor(ws, {
+			permissions: { ...EMPTY_PERMISSIONS, deniedCommands: ["gh"] },
+		})
+		const denied = await executor.execute("execute_command", { command: "gh repo delete foo" })
+		assert.equal(denied.isError, true, "reviewer/QA execute_command must be gated by the same allow/deny logic")
+		assert.match(denied.content, /denied by the permissions policy/)
+
+		const allowed = await executor.execute("execute_command", { command: "echo ok" })
+		assert.equal(allowed.isError, false, "a non-denied command must still run for reviewer/QA")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -159,6 +323,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["ask_followup_question: timeout -> falls back to today's error, marker cleaned up", testTimeoutFallsBackToAutonomousDecision],
 	["BudgetTracker: pauseClock/resumeClock excludes blocked time from elapsedMs", testBudgetPauseResumeExcludesBlockedTime],
 	["ToolExecutor: wires pause/resume hooks around the ask_followup_question wait", testExecutorWiresBudgetClockHooksAroundTheWait],
+	["permissions: denied execute_command is isError:true and counts as a mistake (session-level)", testDeniedCommandIsErrorAndCountsAsMistake],
+	["permissions: protected-file write_to_file is isError:true and counts as a mistake (session-level)", testProtectedWriteIsErrorAndCountsAsMistake],
+	["permissions: --allow-protected-writes escape hatch permits the protected write", testAllowProtectedWritesEscapeHatchWorks],
+	["permissions: reviewer/QA read-only executor gates execute_command identically", testReadOnlyExecutorAlsoGatesCommands],
 ]
 
 async function main(): Promise<void> {
@@ -177,7 +345,7 @@ async function main(): Promise<void> {
 		console.error(`\n${failed} test(s) failed`)
 		process.exit(1)
 	}
-	console.log(`\nAll ${tests.length} decision-escalation tests passed`)
+	console.log(`\nAll ${tests.length} executor tests passed`)
 }
 
 main().catch((err) => {

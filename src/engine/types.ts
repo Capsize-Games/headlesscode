@@ -9,6 +9,8 @@
  * endpoint.
  */
 
+import type { PermissionsConfig } from "../permissions/config.js"
+
 export type ChatRole = "system" | "user" | "assistant" | "tool"
 
 /** A single OpenAI-style function call emitted by the model. */
@@ -85,6 +87,14 @@ export interface ToolResult {
 /** Per-call context handed to tool handlers. */
 export interface ToolContext {
 	workspaceRoot: string
+	/**
+	 * Resolved command allow/deny + protected-file permissions for this
+	 * executor/session (see src/permissions/). Always present — the executor
+	 * resolves built-in defaults when nothing is configured — so handlers can
+	 * enforce command gating (execute_command) and protected-file refusals
+	 * (write_to_file) without guessing.
+	 */
+	permissions: PermissionsConfig
 	/**
 	 * Decision escalation (ask_followup_question, see src/tools/executor.ts):
 	 * how long to block waiting for `.harness.decision-answer` before falling
