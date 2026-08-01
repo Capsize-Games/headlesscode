@@ -26,8 +26,8 @@ import { fileURLToPath } from "node:url"
 
 import { activeSessionCountForRepo, maxConcurrentSessionsFromEnv } from "../budget/concurrency.js"
 import { splitIssues, type SplitIssue, type WorktreeSpec } from "./split.js"
-import { loadState, saveState, updateGroup, type OrchestratorState } from "./state.js"
-import { runReview } from "./reviewer.js"
+import { loadState, saveState, updateGroup, type OrchestratorGroup, type OrchestratorState } from "./state.js"
+import { runReview, type ReviewResult } from "./reviewer.js"
 import { runQa } from "../qa/qa.js"
 import { groupWorktreePath, watchGroups } from "./watch.js"
 
@@ -64,6 +64,10 @@ Options:
                          processes (default: $HEADLESSCODE_MAX_CONCURRENT_SESSIONS or 3).
                          When the cap is already reached this run ABORTS with a clear
                          message and exit 1 (never queues silently)
+  --max-rework-cycles <n>  Max automatic rework attempts per group when the review
+                         finds issues (default: 3). Each rework re-runs a worker on the
+                         SAME worktree to fix the findings. After the cap, the group is
+                         marked "needs-human" and left for manual resolution
   --dry-run              Print the split plan + spawn commands, spawn nothing
   --help                 Show this help and exit
 
@@ -104,6 +108,8 @@ interface OrchestrateOptions {
 	memoryDir?: string
 	/** Phase 6: global concurrent-session cap (default env or 3). */
 	maxConcurrentSessions: number
+	/** Rework loop: max review-rework attempts per group before giving up (default 3). */
+	maxReworkCycles: number
 	dryRun: boolean
 	help: boolean
 }
@@ -120,6 +126,7 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 		deploy: false,
 		pollIntervalMs: 5000,
 		maxConcurrentSessions: maxConcurrentSessionsFromEnv(),
+		maxReworkCycles: 3,
 		dryRun: false,
 		help: false,
 	}
@@ -223,6 +230,15 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 					return { options, error: "--max-concurrent-sessions requires a positive integer" }
 				}
 				options.maxConcurrentSessions = n
+				break
+			}
+			case "--max-rework-cycles": {
+				const v = next()
+				const n = v === undefined ? Number.NaN : Number(v)
+				if (!Number.isInteger(n) || n <= 0) {
+					return { options, error: "--max-rework-cycles requires a positive integer" }
+				}
+				options.maxReworkCycles = n
 				break
 			}
 			case "--no-review":
@@ -409,6 +425,196 @@ export function writeTaskFiles(repo: string, specs: WorktreeSpec[], issues: Spli
 		written.push(target)
 	}
 	return written
+}
+
+/**
+ * Rework-loop task content (see plans/rework-loop.md): a NEW task file for a
+ * group whose review came back with a "finding" verdict. Reuses the original
+ * task file's structure/conventions (rules preamble, closing-report template,
+ * scope) but the assignment is the reviewer's `pending_review_findings` list
+ * rather than the raw issues. The worker is expected to address EVERY finding,
+ * re-verify for real, and re-close/re-comment with fresh evidence per the
+ * closing-report template — same contract as the first attempt.
+ */
+export function buildReworkTaskFileContent(
+	group: { name: string; issues?: number[] },
+	findings: string[],
+	reworkCount: number,
+): string {
+	const assigned = (group.issues ?? []).map((n) => `#${n}`).join(", ") || "this worktree"
+	const ghLines = (group.issues ?? []).map((n) => `gh issue view ${n}`).join("\n")
+	const findingsList = findings.length > 0 ? findings.map((f, i) => `${i + 1}. ${f}`).join("\n") : ""
+	return [
+		"Before anything else: read `.roo/rules-code/rules.md` in full (or `.roo/rules/rules.md` if",
+		"rules-code is absent) and treat it as binding for this entire session, regardless of whether",
+		"it auto-loaded for whatever mode you're running in — don't assume it applied, read it yourself.",
+		"",
+		"You are working autonomously in the SAME isolated git worktree as the previous attempt, on",
+		"the same branch. The automated adversarial reviewer found problems with that attempt. Read",
+		"this entire file before doing anything.",
+		"",
+		`## Rework cycle ${reworkCount} — address the review findings`,
+		"",
+		`Assigned issues: ${assigned}. Fetch each issue's real body yourself (do not rely on a stale`,
+		"copy of any issue body):",
+		"```",
+		ghLines || "# (no issue numbers recorded — inspect the worktree for context)",
+		"```",
+		"",
+		"## Review findings to fix (from the automated review)",
+		"",
+		...findingsList.split("\n"),
+		...(findingsList === "" ? ["(no specific findings were recorded — re-read the previous attempt's", "diff and re-verify everything the reviewer might have flagged.)"] : []),
+		"",
+		"Your job: address EVERY finding above. Do not skip any. Do not claim a finding is fixed",
+		"without reproducing the fix for real.",
+		"",
+		"## Workflow",
+		"",
+		"1. Read each finding above and the relevant source files.",
+		"2. Fix every finding, following the project's own conventions and the rules files.",
+		"3. Re-verify for real (run the project's tests / boot check) and capture the output —",
+		"   output in a report is a claim, not evidence, until reproduced.",
+		"4. Commit with the issue number referenced, one logical change per commit.",
+		"5. Push the branch and update the PR (or open a new one if needed).",
+		"6. Post an UPDATED closing comment below on each issue using the required template, then",
+		"   re-close it (or leave it open with the updated report if it must stay open).",
+		"",
+		"## Required comment template",
+		"",
+		"Your issue-closing comment must use this exact structure (every section present; a section can",
+		"be 'N/A' with a reason, but a missing section is itself a review finding):",
+		"```",
+		`## Issue <n> — Closing Report (rework cycle ${reworkCount})`,
+		"",
+		"### Files changed",
+		"<one line per file>",
+		"",
+		"### Baseline (before)",
+		"<real output>",
+		"",
+		"### Baseline (after)",
+		"<real output>",
+		"",
+		"### Boot check",
+		"<real output or exact reason it didn't apply>",
+		"",
+		"### Residual risk / notes",
+		"<anything not 100% certain>",
+		"",
+		"PR: <link>",
+		"```",
+		"",
+		"## Closing out",
+		"",
+		"Once every finding is addressed and every assigned issue is re-closed with fresh evidence:",
+		"1. Finish with attempt_completion and a full summary of what you changed, the real baseline",
+		"   numbers, the boot check, and the PR link(s).",
+		"2. The harness records your completion automatically (exit code + .harness.done marker) —",
+		"   no separate phone-home step is needed.",
+		"3. Do not start on any issue not assigned to this worktree.",
+		"",
+		`Scope: ${assigned} only — rework cycle ${reworkCount}.`,
+	].join("\n")
+}
+
+// ─── Rework-loop decision ────────────────────────────────────────────────────
+
+/**
+ * The outcome of deciding what to do with a group whose review came back with
+ * a "finding" verdict (see plans/rework-loop.md). Either the group gets a NEW
+ * rework attempt on the SAME worktree (shouldSpawn), or it has exhausted its
+ * `--max-rework-cycles` budget and is marked for human attention.
+ */
+export interface ReworkDecision {
+	/** State patch to apply to the group (rework reset, or needs-human). */
+	patch: Partial<Omit<OrchestratorGroup, "name">>
+	/** Whether a rework worker should be spawned on the same worktree. */
+	shouldSpawn: boolean
+	/** The group's reworkCount after this decision. */
+	newReworkCount: number
+	/** Absolute path of the rework task file (only when shouldSpawn). */
+	taskFilePath?: string
+	/** Content of the rework task file (only when shouldSpawn). */
+	taskContent?: string
+	/** Exact `bash -c` command that launches the rework worker (only when shouldSpawn). */
+	spawnCommand?: string
+}
+
+/**
+ * Decide what to do after a review "finding" verdict, and build the pieces the
+ * caller needs (state patch, task file, spawn command). Extracted from the
+ * watchGroups callback so every branch is unit-testable without a live round.
+ *
+ * - Below the cap: the group is reset to "running" on the SAME worktree with a
+ *   fresh `spawned` timestamp (so the watcher's stall guard measures the rework
+ *   worker, not the original one), review/QA records are cleared, reworkCount is
+ *   incremented, and a rework task file + worker launch command are produced.
+ * - At the cap: no spawn; the group is marked `needs-human` (a TERMINAL state,
+ *   deliberately distinct from `failed`) with the findings left recorded so a
+ *   human can see exactly what the reviewer flagged.
+ */
+export function handleReviewVerdict(
+	group: OrchestratorGroup,
+	result: ReviewResult,
+	repo: string,
+	maxReworkCycles: number,
+	mode: string,
+	model?: string,
+): ReworkDecision {
+	const currentRework = typeof group.reworkCount === "number" ? group.reworkCount : 0
+	const newReworkCount = currentRework + 1
+	const now = new Date().toISOString()
+
+	if (currentRework < maxReworkCycles) {
+		const taskFilePath = path.join(repo, "plans", "parallel-tasks", `${group.name}-rework${newReworkCount}.md`)
+		const taskContent = buildReworkTaskFileContent(group, result.findings, newReworkCount)
+		const worktreePath = groupWorktreePath(repo, group)
+		const spawnCommand =
+			`bash ${path.join(HARNESS_ROOT_TS, "scripts", "run-worker.sh")} ` +
+			`"${worktreePath}" "${taskFilePath}" --mode "${mode}"` +
+			(model ? ` --model "${model}"` : "")
+		return {
+			shouldSpawn: true,
+			newReworkCount,
+			taskFilePath,
+			taskContent,
+			spawnCommand,
+			patch: {
+				status: "running",
+				reworkCount: newReworkCount,
+				// Fresh spawned timestamp: the stall guard must measure the
+				// rework worker, not the (possibly hours-old) original attempt.
+				spawned: now,
+				// A fresh cycle needs a fresh review — clear the old verdict,
+				// findings, QA, and the previous attempt's completion artifacts.
+				review_verdict: undefined,
+				pending_review_findings: undefined,
+				reviewed_at: undefined,
+				qa: undefined,
+				stalled: undefined,
+				exit_code: undefined,
+				summary: undefined,
+				last_activity: {
+					note: `rework cycle ${newReworkCount}: re-spawned worker on the same worktree to fix review findings`,
+				},
+			},
+		}
+	}
+
+	// Cap reached: no new attempt. Terminal "needs-human" outcome — the
+	// findings stay recorded so a human can see exactly what failed.
+	return {
+		shouldSpawn: false,
+		newReworkCount: currentRework,
+		patch: {
+			status: "needs-human",
+			reworkCount: currentRework,
+			last_activity: {
+				note: `exhausted ${currentRework} rework attempt(s); review still has ${result.findings.length} finding(s) — needs human`,
+			},
+		},
+	}
 }
 
 // ─── Spawn command assembly ──────────────────────────────────────────────────
@@ -604,6 +810,72 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 				process.stdout.write(
 					`[orchestrate] ${group.name} review verdict: ${result.verdict} (${result.findings.length} finding(s))\n`,
 				)
+
+				// Rework loop (plans/rework-loop.md): a "finding" verdict is
+				// treated as NEW WORK — re-spawn a worker on the SAME worktree to
+				// fix the findings, up to --max-rework-cycles attempts. Returning
+				// true tells watchGroups to reload state from disk so it re-polls
+				// the group as "running" → "done" → re-reviewed (the watcher's
+				// in-memory state is otherwise stale — see watchGroups).
+				if (result.verdict === "finding") {
+					const decision = handleReviewVerdict(
+						group,
+						result,
+						repo,
+						options.maxReworkCycles,
+						options.mode,
+						options.model,
+					)
+					if (decision.shouldSpawn && decision.taskFilePath && decision.taskContent && decision.spawnCommand) {
+						fs.mkdirSync(path.dirname(decision.taskFilePath), { recursive: true })
+						fs.writeFileSync(decision.taskFilePath, decision.taskContent, "utf-8")
+						process.stdout.write(
+							`[orchestrate] ${group.name} rework cycle ${decision.newReworkCount}: ` +
+								`wrote ${path.relative(repo, decision.taskFilePath)}; re-spawning worker on the same worktree...\n`,
+						)
+						const spawnResult = spawnSync("bash", ["-c", decision.spawnCommand], {
+							cwd: repo,
+							env: {
+								...process.env,
+								HEADLESSCODE_ROOT: HARNESS_ROOT_TS,
+								...(options.memoryDir ? { HEADLESSCODE_MEMORY_DIR: path.resolve(options.memoryDir) } : {}),
+							},
+							stdio: "inherit",
+						})
+						if (spawnResult.status !== 0) {
+							// The rework worker could not be launched — the group
+							// cannot fix itself, so surface it as needing a human
+							// instead of leaving a dangling "running" group.
+							process.stderr.write(
+								`[orchestrate] rework worker spawn for ${group.name} failed (exit ${spawnResult.status}); ` +
+									`marking group needs-human\n`,
+							)
+							state = updateGroup(state, group.name, {
+								status: "needs-human",
+								reworkCount: decision.newReworkCount,
+								last_activity: {
+									note: `rework spawn failed after ${decision.newReworkCount} attempt(s); needs human`,
+								},
+							})
+							await saveState(statePath, state)
+						} else {
+							// Spawn succeeded: reset the group so the watcher
+							// re-polls it as "running" → "done" → re-reviewed.
+							state = updateGroup(state, group.name, decision.patch)
+							await saveState(statePath, state)
+						}
+						return true
+					}
+					// Cap reached: terminal "needs-human" outcome. Findings stay
+					// recorded so a human can see exactly what the reviewer flagged.
+					state = updateGroup(state, group.name, decision.patch)
+					await saveState(statePath, state)
+					process.stderr.write(
+						`[orchestrate] NEEDS-HUMAN: ${group.name} exhausted ${decision.newReworkCount} rework ` +
+							`attempt(s) and the review still has findings — a human must look at this worktree.\n`,
+					)
+					return true
+				}
 			} catch (err) {
 				process.stderr.write(
 					`[orchestrate] review of ${group.name} failed: ${err instanceof Error ? err.message : String(err)}\n`,
@@ -665,7 +937,9 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	// worker completion), so the authoritative post-round state is on disk.
 	const finalState = await loadState(statePath)
 
-	const terminal = finalState.groups.filter((g) => g.status === "done" || g.status === "failed")
+	const terminal = finalState.groups.filter(
+		(g) => g.status === "done" || g.status === "failed" || g.status === "needs-human",
+	)
 	process.stdout.write(
 		`\nRound complete: ${terminal.length}/${finalState.groups.length} groups terminal. State: ${statePath}\n`,
 	)
@@ -673,6 +947,18 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	if (failed.length > 0) {
 		process.stderr.write(
 			`headlesscode orchestrate: ${failed.length} group(s) failed: ${failed.map((g) => g.name).join(", ")}\n`,
+		)
+		return 1
+	}
+	// Rework-exhausted groups are a DISTINCT, final "needs a human" outcome —
+	// not a mid-review group and not a generic failure. Exit 1 like a failure
+	// (the round did not fully succeed) but the message names the cause.
+	const needsHuman = finalState.groups.filter((g) => g.status === "needs-human")
+	if (needsHuman.length > 0) {
+		process.stderr.write(
+			`headlesscode orchestrate: ${needsHuman.length} group(s) exhausted their rework attempts and ` +
+				`need a human: ${needsHuman.map((g) => g.name).join(", ")}. ` +
+				`See their review_verdict/pending_review_findings in ${statePath}.\n`,
 		)
 		return 1
 	}
@@ -740,6 +1026,13 @@ function deployGateReady(
 	const anyFailed = state.groups.some((g) => g.status === "failed")
 	if (anyFailed) {
 		return { ready: false, reason: "one or more groups failed" }
+	}
+	// Rework-exhausted groups: a distinct, final "needs a human" outcome —
+	// the deploy must never proceed while one exists, and the reason must
+	// say why (not a generic failure, not an in-flight review).
+	const anyNeedsHuman = state.groups.some((g) => g.status === "needs-human")
+	if (anyNeedsHuman) {
+		return { ready: false, reason: "one or more groups need human attention (rework attempts exhausted)" }
 	}
 	const anyNotDone = state.groups.some((g) => g.status !== "done")
 	if (anyNotDone) {

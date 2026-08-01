@@ -66,10 +66,22 @@ cleanup() {
 			git -C "$FIXTURE" worktree remove --force "$FIXTURE/.worktrees/$n" 2>/dev/null || true
 		done
 	fi
-	rm -rf "${FIXTURE:-}" "${BARE:-}" "${DEPLOY_TARGET:-}" \
+	# Rework-loop fixture (second fixture from section 10).
+	if [ -n "${FIXTURE2:-}" ]; then
+		for n in $WORKTREE_NAMES; do
+			pidfile="$FIXTURE2/.worktrees/$n/.harness.pid"
+			if [ -f "$pidfile" ]; then
+				pid="$(cat "$pidfile" 2>/dev/null || true)"
+				[ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+			fi
+			git -C "$FIXTURE2" worktree remove --force "$FIXTURE2/.worktrees/$n" 2>/dev/null || true
+		done
+	fi
+	rm -rf "${FIXTURE:-}" "${BARE:-}" "${FIXTURE2:-}" "${BARE2:-}" "${DEPLOY_TARGET:-}" \
 		"${ISSUES_JSON:-}" "${ORCH1_OUT:-}" "${ORCH2_OUT:-}" "${ORCH3_OUT:-}" \
 		"${QA_INVOKE_PASS_OUT:-}" "${QA_INVOKE_FAIL_OUT:-}" "${RUNQA_OUT:-}" \
 		"${AUTO_MOCK_LOG:-}" "${QA_PASS_MOCK_LOG:-}" "${QA_FAIL_MOCK_LOG:-}" \
+		"${REWORK_ISSUES:-}" "${REWORK_MOCK_LOG:-}" "${REWORK_OUT:-}" \
 		"${GATE_DENIED_OUT:-}" "${GATE_APPROVED_OUT:-}" "${GATE_FILE_OUT:-}" "${GATE_ESCAPE_OUT:-}" "${GATE_MISSING_OUT:-}"
 	echo "  cleaned up temp fixture/bare/worktrees/logs (set KEEP=1 to retain)"
 }
@@ -78,9 +90,12 @@ start_mock() {
 	local scenario="$1"
 	local logfile="$2"
 	local portvar="$3"
+	# Optional 4th arg: extra env assignments passed to the mock (word-split,
+	# e.g. "REWORK_REVIEWS=1"). Empty when unused.
+	local extra_env="${4:-}"
 	(
 		cd "$ROOT" &&
-			env PORT=0 MOCK_SCENARIO="$scenario" MOCK_FIXTURE_ROOT="${FIXTURE:-}" \
+			env PORT=0 MOCK_SCENARIO="$scenario" MOCK_FIXTURE_ROOT="${FIXTURE:-}" $extra_env \
 				node scripts/e2e/mock-openrouter.mjs
 	) >"$logfile" 2>&1 &
 	local pid=$!
@@ -487,11 +502,76 @@ else
 	tail -n 25 "$ORCH3_OUT" >&2
 fi
 
-# ── 10. Summary + cleanup ────────────────────────────────────────────────────
+# ── 10. Rework loop end-to-end ────────────────────────────────────────────────
+# plans/rework-loop.md: a review FINDING must trigger a REAL rework spawn on the
+# SAME worktree, the watcher must re-poll the group to done, and the re-review
+# must come back clean — all inside ONE `orchestrate` run. A fresh fixture +
+# fresh mock (REWORK_REVIEWS=1: first review returns a finding, second is clean)
+# keeps this independent of the earlier sections.
+echo "== [10/11] rework loop end-to-end (review finding -> rework -> clean) =="
+FIXTURE2="$(bash "$ROOT/scripts/e2e-fixture/setup.sh")"
+if [ -z "$FIXTURE2" ] || [ ! -d "$FIXTURE2/.git" ]; then
+	echo "  rework fixture setup failed; aborting" >&2
+	exit 1
+fi
+BARE2="$(mktemp -d /tmp/headlesscode-e2e4-rework-bare-XXXXXX)"
+git -C "$FIXTURE2" branch -M master
+git init --bare -q "$BARE2"
+git -C "$FIXTURE2" remote add origin "$BARE2"
+git -C "$FIXTURE2" -c user.name="E2E" -c user.email="e2e@headlesscode.invalid" -c commit.gpgsign=false \
+	push -q -u origin master
+echo "  rework fixture: $FIXTURE2 (origin -> $BARE2)"
+
+REWORK_ISSUES="$(mktemp /tmp/headlesscode-e2e4-rework-issues-XXXXXX.json)"
+cat > "$REWORK_ISSUES" <<'EOF'
+[
+  { "number": 1, "title": "Fix the greet bug", "body": "greet() must return 'Hello, ' + name" }
+]
+EOF
+REWORK_MOCK_LOG="$(mktemp /tmp/headlesscode-e2e4-rework-mock-XXXXXX.log)"
+start_mock qa-orchestrate "$REWORK_MOCK_LOG" REWORK_PORT "REWORK_REVIEWS=1"
+sleep 0.2
+
+REWORK_OUT="$(mktemp /tmp/headlesscode-e2e4-rework-XXXXXX.out)"
+(
+	cd "$ROOT" &&
+		OPENROUTER_API_KEY="test-key" \
+		OPENROUTER_BASE_URL="http://127.0.0.1:$REWORK_PORT" \
+		HEADLESSCODE_ROOT="$ROOT" \
+		npx tsx src/cli.ts orchestrate --repo "$FIXTURE2" --issues-json "$REWORK_ISSUES" \
+			--poll-interval-ms 200
+) >"$REWORK_OUT" 2>&1
+REWORK_EXIT=$?
+echo "  orchestrate (rework round) exit: $REWORK_EXIT"
+if [ "$REWORK_EXIT" -eq 0 ] &&
+	grep -q "rework cycle 1" "$REWORK_OUT" &&
+	grep -q "review verdict: clean" "$REWORK_OUT"; then
+	pass "review finding triggered a real rework spawn; the round re-reviewed clean (exit $REWORK_EXIT)"
+else
+	fail "rework round should exit 0 with a 'rework cycle 1' line and a final clean verdict (exit $REWORK_EXIT)"
+	tail -n 30 "$REWORK_OUT" >&2
+fi
+REWORK_STATE="$FIXTURE2/.worktrees/.orchestrator-state.json"
+if [ -f "$REWORK_STATE" ] && grep -q '"reworkCount": 1' "$REWORK_STATE" &&
+	grep -q '"review_verdict": "clean"' "$REWORK_STATE"; then
+	pass "state file records reworkCount 1 and a final clean review verdict"
+else
+	fail "state file should record reworkCount 1 + clean review verdict"
+	[ -f "$REWORK_STATE" ] && cat "$REWORK_STATE" >&2 || true
+fi
+if [ -f "$FIXTURE2/plans/parallel-tasks/w1-rework1.md" ]; then
+	pass "rework task file plans/parallel-tasks/w1-rework1.md written (original task file preserved)"
+else
+	fail "rework task file w1-rework1.md missing"
+fi
+WORKTREE_NAMES="$WORKTREE_NAMES w1"
+
+# ── 11. Summary + cleanup ────────────────────────────────────────────────────
 TOTAL=$((PASS + FAIL))
 echo ""
 echo "──────────────────────────────────────────────────────────────"
 echo "  fixture:         $FIXTURE"
+echo "  rework fixture:  $FIXTURE2"
 echo "  results:         PASS $PASS / $TOTAL   FAIL $FAIL / $TOTAL"
 if [ "$FAIL" -eq 0 ]; then
 	echo "  RESULT: PASS"

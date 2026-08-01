@@ -75,6 +75,11 @@ const PORT = Number(process.env.PORT || 0)
 const SCENARIO = process.env.MOCK_SCENARIO || "success"
 const FIXTURE_ROOT = process.env.MOCK_FIXTURE_ROOT
 const BUGGY_FILE = process.env.MOCK_BUGGY_FILE || "src/greet.js"
+// Rework-loop e2e (plans/rework-loop.md): in the qa-orchestrate scenario, make
+// the first N review sessions return a FINDING verdict instead of clean, so a
+// real `orchestrate` run exercises a rework spawn end-to-end (worker success →
+// review finding → rework worker → review clean).
+const REWORK_REVIEWS = Number(process.env.REWORK_REVIEWS || 0)
 
 const DEFAULT_VERIFY_CMD =
 	"node -e \"const { greet } = require('./src/greet.js'); const assert = require('node:assert'); assert.strictEqual(greet('World'), 'Hello, World'); console.log('greet verified OK')\""
@@ -324,21 +329,26 @@ function buildScenarioResponse({ model, historyToolCalls, systemPrompt, toolName
 			})
 		}
 		if (/independent reviewer/i.test(systemPrompt)) {
-			// Review session -> clean (the qa-orchestrate round must end with
-			// every group reviewed clean so QA runs and the deploy gate opens).
+			// Review session. Normally clean (so QA runs and the deploy gate
+			// opens), but with REWORK_REVIEWS=N the first N review sessions
+			// return a FINDING — proving a real rework spawn end-to-end: the
+			// orchestrator re-runs a worker on the SAME worktree, the watcher
+			// re-polls it to done, and the re-review comes back clean.
 			if (historyToolCalls === 0) {
+				reviewSessionCount++
 				return chatResponse(model, {
 					role: "assistant",
 					content: null,
 					tool_calls: [toolCall(`call_mock_review_read`, "read_file", { path: BUGGY_FILE })],
 				})
 			}
+			const reworkThisReview = reviewSessionCount <= REWORK_REVIEWS
 			return chatResponse(model, {
 				role: "assistant",
 				content: null,
 				tool_calls: [
 					toolCall(`call_mock_review_done`, "attempt_completion", {
-						result: reviewCleanCompletionText(),
+						result: reworkThisReview ? reviewCompletionText() : reviewCleanCompletionText(),
 					}),
 				],
 			})
@@ -382,6 +392,10 @@ function buildScenarioResponse({ model, historyToolCalls, systemPrompt, toolName
 // ─── Server ─────────────────────────────────────────────────────────────────
 
 let REQUEST_COUNT = 0
+// Counts REVIEW sessions seen by the qa-orchestrate scenario (incremented on
+// each review session's first request). Used with REWORK_REVIEWS to decide
+// which reviews return a finding vs. clean.
+let reviewSessionCount = 0
 
 const server = http.createServer((req, res) => {
 	if (req.method !== "POST") {
