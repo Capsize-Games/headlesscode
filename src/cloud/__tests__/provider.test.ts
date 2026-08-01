@@ -174,7 +174,8 @@ async function testLocalProcessProviderRealCommandsWithFakes(): Promise<void> {
 
 async function testHetznerSketchIsDocumentedNotImplemented(): Promise<void> {
 	assert.equal(hetznerDockerProviderSketch.implemented, false, "no live Hetzner implementation")
-	assert.match(hetznerDockerProviderSketch.reason, /Evaluation only/)
+	// Superseded by the real DockerSessionProvider (src/cloud/docker-provider.ts).
+	assert.match(hetznerDockerProviderSketch.reason, /superseded by DockerSessionProvider/)
 	assert.equal(hetznerDockerProviderSketch.name, "hetzner-docker")
 }
 
