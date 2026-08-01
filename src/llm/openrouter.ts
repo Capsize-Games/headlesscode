@@ -131,7 +131,7 @@ export class OpenRouterClient implements LlmClient {
 	}
 }
 
-function buildRequestBody(request: LlmRequest, model: string): Record<string, unknown> {
+export function buildRequestBody(request: LlmRequest, model: string): Record<string, unknown> {
 	const body: Record<string, unknown> = {
 		model,
 		messages: request.messages,
@@ -144,6 +144,20 @@ function buildRequestBody(request: LlmRequest, model: string): Record<string, un
 	}
 	if (request.maxTokens !== undefined) {
 		body.max_tokens = request.maxTokens
+	}
+	// Pin routing to DeepSeek's own official endpoint for deepseek/* models,
+	// not whichever third-party host (DeepInfra, Baidu, Mancer, ...) OpenRouter's
+	// automatic price-based routing might otherwise pick behind the same model
+	// id. This matters beyond preference: those endpoints have meaningfully
+	// different prices — especially cache-read pricing, where the official
+	// endpoint's rate is roughly 10x cheaper than third-party hosts serving the
+	// same model — so DEFAULT_PRICING_TABLE's deepseek/* entries
+	// (src/budget/cost.ts) are only actually correct WITH this pin in place.
+	// `allow_fallbacks: false` means a request fails clearly if the official
+	// endpoint is down, rather than silently routing elsewhere at a different
+	// (unpriced-by-us) rate.
+	if (model.startsWith("deepseek/")) {
+		body.provider = { order: ["deepseek"], allow_fallbacks: false }
 	}
 	return body
 }
