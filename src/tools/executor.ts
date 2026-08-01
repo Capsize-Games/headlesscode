@@ -24,11 +24,17 @@
  * `search_replace` is a strict one-occurrence literal match, and `edit_file`
  * falls back exact → whitespace-tolerant → token-based matching (plus
  * file-creation when old_string is "").
+ *
+ * read_file carries a session-scoped cache (see the readFileCache comment
+ * below): the exact same effective args served against byte-identical content
+ * earlier in THIS session get a short cache-hit message instead of the full
+ * content, because re-sending identical content is pure output-token waste.
  */
 
 import * as fs from "node:fs"
 import * as fsp from "node:fs/promises"
 import * as path from "node:path"
+import { createHash } from "node:crypto"
 import { spawn, type ChildProcess } from "node:child_process"
 import { setTimeout as sleep } from "node:timers/promises"
 
@@ -77,6 +83,13 @@ export class ToolExecutor {
 	private readonly handlers = new Map<string, ToolHandler>()
 	private pauseBudgetClock: (() => void) | undefined
 	private resumeBudgetClock: (() => void) | undefined
+	/**
+	 * Session-scoped read_file cache (see readFileCache below). One executor
+	 * serves one session, so per-instance state is exactly per-session state.
+	 * Keyed by a serialized string (see makeReadFileCacheKey) — the map must
+	 * never be keyed by object identity, or no two calls would ever collide.
+	 */
+	private readonly readCache = new Map<string, ReadFileCacheEntry>()
 	/** Resolved permissions handed to every handler call (see ToolExecutorOptions.permissions). */
 	readonly permissions: PermissionsConfig
 
@@ -109,6 +122,17 @@ export class ToolExecutor {
 	setBudgetClockHooks(pause: () => void, resume: () => void): void {
 		this.pauseBudgetClock = pause
 		this.resumeBudgetClock = resume
+	}
+
+	/**
+	 * Register read_file wired to THIS executor's session-scoped cache. Must be
+	 * called by every construction path that wants the cache (headless,
+	 * reviewer, QA) — each executor instance gets its own independent cache.
+	 */
+	registerReadFile(): void {
+		this.register("read_file", (args, ctx) =>
+			readFileHandler(args, ctx, this.readCache.get(readFileKey(args, ctx)), this.readCache),
+		)
 	}
 
 	async execute(name: string, args: Record<string, unknown>): Promise<ToolResult> {
@@ -251,10 +275,96 @@ function toNonNegativeInt(v: unknown, fallback: number): number {
 	return fallback
 }
 
-// ─── Tool handlers ───────────────────────────────────────────────────────────
+// ─── read_file session cache ─────────────────────────────────────────────────
+
+/**
+ * Session-scoped read_file cache.
+ *
+ * read_file is the one tool with measured, real waste: a real session re-read
+ * the same path with identical args 14-16 times, re-sending byte-identical
+ * content at full output-token cost every time (see the DEFAULT_WINDOW_SIZE
+ * story in src/engine/loop.ts). Even with that history bug fixed, a model will
+ * legitimately re-read a file it saw earlier in a long session — there is no
+ * reason to pay full output tokens for content the conversation already has.
+ *
+ * Correctness: a cache hit requires BOTH (a) the exact effective args that
+ * produce byte-identical output, AND (b) the current on-disk content hashing
+ * identically to the prior read. (b) is checked by hashing the file at
+ * cache-check time — never by tracking "did a write-shaped tool get called",
+ * because a file can change for reasons the executor doesn't directly control
+ * (execute_command running a formatter/build/codegen, an external editor,
+ * anything else). The hash is cheap (node:crypto sha256, no new dependency).
+ *
+ * The hit short-circuit applies once per "unchanged streak": the first
+ * identical call after real content was served returns the short cache-hit
+ * message, the SECOND consecutive identical call serves real content again, so
+ * a model that is confused or insistent is never stuck being told "it's
+ * cached" with no way to actually get the content back.
+ *
+ * Scope: per ToolExecutor instance, i.e. per session (executors are
+ * constructed per-session — see createHeadlessExecutor and its read-only
+ * siblings). Deliberately NOT persisted to disk and NOT shared across
+ * instances: a reviewer/QA executor gets its own independent cache.
+ */
+
+/**
+ * Everything about a read_file call that affects its output, serialized into a
+ * stable string so two calls that produce byte-identical output always collide
+ * (see makeReadFileCacheKey).
+ */
+type ReadFileCacheKey = {
+	/** Resolved absolute path (path.resolve'd, so ./a.ts and a.ts collide). */
+	target: string
+	/** 'slice' or 'indentation'. */
+	mode: string
+	/** Effective 1-based offset (default 1). */
+	offset: number
+	/** Effective limit (default 2000). */
+	limit: number
+	/** Effective indentation-mode max_lines (default 60); undefined in slice mode. */
+	windowLines?: number
+}
+
+/** One cache entry: the content hash from the last real read + streak state. */
+type ReadFileCacheEntry = {
+	/** sha256 of the file content as of the last real read of this key. */
+	hash: string
+	/**
+	 * Whether the last read of this key was already served as a cache-hit
+	 * message. When true, the next identical call serves real content again
+	 * (resetting this flag), so the hit message never loops forever.
+	 */
+	toldUnchanged: boolean
+}
+
+/**
+ * Serialize a read_file cache key to a stable string. Map keys must be
+ * primitives (object keys compare by identity, so two structurally-identical
+ * fresh objects would never collide); a JSON string of the fully-resolved
+ * effective args is both stable and collision-free.
+ */
+function makeReadFileCacheKey(key: ReadFileCacheKey): string {
+	return JSON.stringify(key)
+}
+
+/** Cache-hit message shown instead of the full file content. */
+const READ_FILE_CACHE_HIT_MESSAGE =
+	"[cache] this file is unchanged since your last read of it earlier in this session (identical content, same range). Re-read the earlier tool result for the content, or call read_file again if you specifically need it re-sent."
+
+function hashFileContent(content: string): string {
+	return createHash("sha256").update(content).digest("hex")
+}
+
+/** The indentation-mode window size this harness actually uses (Phase 1 minimal). */
+const DEFAULT_INDENTATION_WINDOW_LINES = 60
 
 /** read_file — slice mode with offset/limit pagination (offset is 1-based). */
-function readFileHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+function readFileHandler(
+	args: Record<string, unknown>,
+	ctx: ToolContext,
+	cache: ReadFileCacheEntry | undefined,
+	entry: Map<string, ReadFileCacheEntry>,
+): Promise<ToolResult> {
 	const filePath = requireString(args, "path")
 	return (async () => {
 		const target = safeTarget(ctx, filePath)
@@ -273,6 +383,8 @@ function readFileHandler(args: Record<string, unknown>, ctx: ToolContext): Promi
 		const mode = typeof args.mode === "string" ? args.mode : "slice"
 		const offset = toNonNegativeInt(args.offset, 1) // 1-based
 		const limit = toNonNegativeInt(args.limit, 2000)
+		const indentation = args.indentation as Record<string, unknown> | undefined
+		const windowLines = mode === "indentation" ? toNonNegativeInt(indentation?.["max_lines"], DEFAULT_INDENTATION_WINDOW_LINES) : undefined
 
 		let content: string
 		try {
@@ -281,24 +393,50 @@ function readFileHandler(args: Record<string, unknown>, ctx: ToolContext): Promi
 			return err(`read_file: cannot read '${rel}': ${errorMessage(error)}`)
 		}
 
+		// Cache-check the CURRENT on-disk content (never "no write tool was
+		// called"): identical args + identical hash => byte-identical output.
+		const key = makeReadFileCacheKey({ target, mode, offset, limit, windowLines })
+		const currentHash = hashFileContent(content)
+		if (cache !== undefined && cache.hash === currentHash && !cache.toldUnchanged) {
+			cache.toldUnchanged = true
+			return ok(READ_FILE_CACHE_HIT_MESSAGE)
+		}
+
 		const allLines = content.split(/\r?\n/)
+		let result: ToolResult
 		if (mode === "indentation") {
 			// Phase 1 minimal: indentation mode falls back to a window around the
 			// anchor line (anchor_line 1-based), which is good enough for the loop.
-			const anchor = toNonNegativeInt(
-				(args.indentation as Record<string, unknown> | undefined)?.["anchor_line"],
-				offset,
-			)
-			const windowLines = toNonNegativeInt(
-				(args.indentation as Record<string, unknown> | undefined)?.["max_lines"],
-				60,
-			)
-			const start = Math.max(1, anchor)
-			return ok(formatFileSlice(rel, allLines, start, windowLines))
+			const anchor = toNonNegativeInt(indentation?.["anchor_line"], offset)
+			result = ok(formatFileSlice(rel, allLines, Math.max(1, anchor), windowLines ?? DEFAULT_INDENTATION_WINDOW_LINES))
+		} else {
+			result = ok(formatFileSlice(rel, allLines, Math.max(1, offset), limit))
 		}
 
-		return ok(formatFileSlice(rel, allLines, Math.max(1, offset), limit))
+		// Serve (or re-serve) real content; record hash + reset the hit flag so
+		// the next identical call may short-circuit once more.
+		entry.set(key, { hash: currentHash, toldUnchanged: false })
+		return result
 	})()
+}
+
+/**
+ * Compute the stable string cache key for a read_file call, mirroring exactly
+ * how readFileHandler resolves its args (defaults and all) so two calls that
+ * produce byte-identical output always collide on the same key. Path safety is
+ * enforced identically to the handler itself, so an escaping path errors here
+ * exactly as it would in the handler (and caches nothing).
+ */
+function readFileKey(args: Record<string, unknown>, ctx: ToolContext): string {
+	const filePath = requireString(args, "path")
+	const target = safeTarget(ctx, filePath)
+	const mode = typeof args.mode === "string" ? args.mode : "slice"
+	const offset = toNonNegativeInt(args.offset, 1) // 1-based
+	const limit = toNonNegativeInt(args.limit, 2000)
+	const indentation = args.indentation as Record<string, unknown> | undefined
+	const windowLines =
+		mode === "indentation" ? toNonNegativeInt(indentation?.["max_lines"], DEFAULT_INDENTATION_WINDOW_LINES) : undefined
+	return makeReadFileCacheKey({ target, mode, offset, limit, windowLines })
 }
 
 function formatFileSlice(rel: string, allLines: string[], offset: number, limit: number): string {
@@ -1160,7 +1298,7 @@ const IMPLEMENTED_TOOLS = new Set([
 export function createHeadlessExecutor(workspaceRoot: string, options: ToolExecutorOptions = {}): ToolExecutor {
 	const executor = new ToolExecutor(workspaceRoot, options)
 
-	executor.register("read_file", readFileHandler)
+	executor.registerReadFile()
 	executor.register("write_to_file", writeToFileHandler)
 	executor.register("apply_diff", applyDiffHandler)
 	executor.register("search_replace", searchReplaceHandler)
@@ -1200,7 +1338,7 @@ export function createHeadlessExecutor(workspaceRoot: string, options: ToolExecu
 function createReadCommandExecutor(workspaceRoot: string, options: ToolExecutorOptions = {}): ToolExecutor {
 	const executor = new ToolExecutor(workspaceRoot, options)
 
-	executor.register("read_file", readFileHandler)
+	executor.registerReadFile()
 	executor.register("list_files", listFilesHandler)
 	executor.register("execute_command", executeCommandHandler)
 
