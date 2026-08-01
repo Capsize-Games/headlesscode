@@ -33,6 +33,8 @@ interface CliOptions {
 	model?: string
 	maxIterations?: number
 	consecutiveErrorLimit?: number
+	/** Sliding-window history cap, in messages (also see DEFAULT_WINDOW_SIZE in engine/loop.ts). */
+	windowSize?: number
 	/** Phase 6: per-session cost cap, USD (also $HEADLESSCODE_MAX_COST_USD). */
 	maxCostUsd?: number
 	/** Phase 6: per-session duration cap, ms (also $HEADLESSCODE_MAX_DURATION_MS). */
@@ -89,6 +91,9 @@ Options:
   --model <id>               OpenRouter model id (default: $OPENROUTER_MODEL or deepseek/deepseek-chat)
   --max-iterations <n>       Loop iteration cap (default: 50)
   --consecutive-error-limit <n>  Consecutive mistakes before giving up (default: 3)
+  --window-size <n>          Sliding-window history cap, in messages, before the
+                             oldest are evicted (default: 300; see DEFAULT_WINDOW_SIZE
+                             in src/engine/loop.ts for why)
   --log-file <path>          Also append structured logs to this file
   --memory-dir <path>        Store project memory (facts + session summaries) under
                              <path>. Enables Phase 3 memory. Default (when enabled):
@@ -207,7 +212,8 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 				break
 			}
 			case "--max-iterations":
-			case "--consecutive-error-limit": {
+			case "--consecutive-error-limit":
+			case "--window-size": {
 				const value = next()
 				const num = value === undefined ? Number.NaN : Number(value)
 				if (!Number.isInteger(num) || num <= 0) {
@@ -215,8 +221,10 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 				}
 				if (flag === "--max-iterations") {
 					options.maxIterations = num
-				} else {
+				} else if (flag === "--consecutive-error-limit") {
 					options.consecutiveErrorLimit = num
+				} else {
+					options.windowSize = num
 				}
 				break
 			}
@@ -462,6 +470,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		taskText,
 		maxIterations: options.maxIterations,
 		consecutiveErrorLimit: options.consecutiveErrorLimit,
+		windowSize: options.windowSize,
 		llmClient: client,
 		logger,
 		memory,

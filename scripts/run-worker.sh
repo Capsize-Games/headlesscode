@@ -43,6 +43,12 @@
 #                      now cheap, roughly $0.002 with the fixed pricing/
 #                      caching, so raising this is a cost-cheap way to avoid
 #                      "max iterations reached without task completion").
+#   HEADLESSCODE_WINDOW_SIZE  when set, forwarded to the CLI as
+#                      --window-size (default 300 messages). Rarely needs
+#                      overriding now that the default accounts for
+#                      deepseek/deepseek-v4-flash's 1M-token context — only
+#                      raise it further for a task that reads an unusually
+#                      large number of files before it starts writing.
 #
 # Usage:
 #   scripts/run-worker.sh <worktree-path> <task-file-or-text> \
@@ -180,6 +186,11 @@ fi
 # Iteration cap: forward as a CLI flag too, same rationale as above.
 if [ -n "${HEADLESSCODE_MAX_ITERATIONS:-}" ]; then
     BUDGET_ARG="$BUDGET_ARG --max-iterations '$HEADLESSCODE_MAX_ITERATIONS'"
+fi
+
+# Sliding-window history cap (messages, not tokens): forward as a CLI flag too.
+if [ -n "${HEADLESSCODE_WINDOW_SIZE:-}" ]; then
+    BUDGET_ARG="$BUDGET_ARG --window-size '$HEADLESSCODE_WINDOW_SIZE'"
 fi
 
 WRAPPER="

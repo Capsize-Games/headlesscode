@@ -53,7 +53,20 @@ import type { ModeConfig } from "@roo-code/types"
 
 export const DEFAULT_MAX_ITERATIONS = 50
 export const DEFAULT_CONSECUTIVE_ERROR_LIMIT = 3
-export const DEFAULT_WINDOW_SIZE = 40
+/**
+ * 2026-08-01: raised from 40. `windowSize` is a MESSAGE count, not a token
+ * count, but the models this harness targets (e.g. deepseek/deepseek-v4-flash
+ * on its official endpoint, pinned in src/llm/openrouter.ts) have context
+ * windows over 1M tokens — a 40-message cap was evicting messages hundreds
+ * of thousands of tokens before the model's real context limit. Confirmed
+ * live: a real session re-read the same handful of files 14-16 times each
+ * because truncation kept dropping their earlier `read_file` results out of
+ * view, burning iterations and cost on redundant reads instead of ever
+ * reaching a write. 300 messages covers a task's full exploration phase for
+ * realistic tasks without approaching the real context ceiling; caching
+ * keeps the cost of carrying more history low (see src/budget/cost.ts).
+ */
+export const DEFAULT_WINDOW_SIZE = 300
 export const DEFAULT_LLM_TIMEOUT_MS = 120_000
 
 export interface HeadlessSessionConfig {
