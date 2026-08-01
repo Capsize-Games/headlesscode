@@ -47,7 +47,8 @@ import type { ToolContext, ToolHandler, ToolResult } from "../engine/types.js"
 import { checkCommand, type CommandRefusal } from "../permissions/commands.js"
 import { findMatchingPattern } from "../permissions/protected-files.js"
 import { resolvePermissions, type PermissionsConfig } from "../permissions/config.js"
-import { OpenRouterEmbedder } from "../codesearch/embedder.js"
+import { createEmbedder, EMBEDDING_BACKEND_ENV, resolveEmbeddingBackend } from "../codesearch/embedder.js"
+import { loadIndexMetadata } from "../codesearch/index.js"
 import { formatSearchResults, searchIndex } from "../codesearch/search.js"
 import { INDEX_RELATIVE_PATH } from "../codesearch/types.js"
 
@@ -1284,9 +1285,31 @@ async function codebaseSearchHandler(args: Record<string, unknown>, ctx: ToolCon
 			)
 		}
 
+		// The query embedder must match the backend the index was built with.
+		// Local and cloud embedding models produce different-dimension vectors
+		// (ollama qwen3-embedding:8b = 4096, openrouter qwen/qwen3-embedding-4b
+		// = 2560), so a mismatch would silently compare apples to oranges.
+		// The env var/flag selection happens at index-build time; the index
+		// metadata records which backend built it, and we use that backend
+		// here — refusing explicitly when it can't be honored.
+		const metadata = loadIndexMetadata(ctx.workspaceRoot)
+		let queryBackend = resolveEmbeddingBackend(process.env)
+		if (metadata && metadata.backend !== queryBackend) {
+			return err(
+				`codebase_search: index was built with backend "${metadata.backend}" (model "${metadata.model}"), ` +
+					`but ${EMBEDDING_BACKEND_ENV} selects "${queryBackend}". Embedding backends produce ` +
+					`different-dimension vectors and are NOT interchangeable — rebuild the index with ` +
+					`'headlesscode index --embedding-backend ${queryBackend}' or unset ` +
+					`${EMBEDDING_BACKEND_ENV} to search with the backend that built the index.`,
+			)
+		}
+		if (metadata) {
+			queryBackend = metadata.backend
+		}
+
 		// Embed the query (one call). This is a real network call; failures
 		// surface as a tool error so the loop's mistake handling applies.
-		const embedder = new OpenRouterEmbedder()
+		const embedder = createEmbedder(queryBackend)
 		const queryResult = await embedder.embedBatch([query])
 		if (queryResult.embeddings.length !== 1) {
 			return err(`codebase_search: embedder returned ${queryResult.embeddings.length} embeddings for the query`)
