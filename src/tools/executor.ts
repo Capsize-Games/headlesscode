@@ -829,7 +829,21 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 				// The process-group kill is the only way to clean up the full
 				// tree of a `shell: true` spawn — killing the shell alone would
 				// orphan whatever it had launched.
-				child = spawn(command, { cwd, shell: true, detached: true })
+				child = spawn(command, {
+					cwd,
+					shell: true,
+					detached: true,
+					// Matches the vendored Execa-based terminal's own spawn options
+					// (zoo-code/src/integrations/terminal/ExecaTerminalProcess.ts):
+					// ignore stdin so a command that reads from it gets an immediate
+					// EOF instead of hanging on an open, never-written pipe (there is
+					// no interactive user here to type anything), and force a UTF-8
+					// locale so tools sensitive to it (Ruby, CocoaPods, etc. per the
+					// vendored comment) behave consistently regardless of the host's
+					// own locale configuration.
+					stdio: ["ignore", "pipe", "pipe"],
+					env: { ...process.env, LANG: "en_US.UTF-8", LC_ALL: "en_US.UTF-8" },
+				})
 			} catch (error) {
 				return finish(err(`execute_command: failed to spawn '${command}': ${errorMessage(error)}`))
 			}
