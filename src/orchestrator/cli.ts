@@ -629,6 +629,50 @@ function spawnCommandFor(harnessRoot: string, specs: WorktreeSpec[]): string {
 	return `bash ${path.join(harnessRoot, "scripts", "spawn-parallel-worktrees.sh")} ${triples.join(" ")}`
 }
 
+export interface BuildSpawnEnvOptions {
+	repo: string
+	/** Harness mode for the workers (e.g. "code"). */
+	mode: string
+	/** An explicit --model flag value, if the caller passed one — always wins (resolveModelForMode rule 1). */
+	explicitModel?: string
+	memoryDir?: string
+	/** Env to read OPENROUTER_MODEL from (default: process.env). */
+	env?: NodeJS.ProcessEnv
+}
+
+/**
+ * Resolve the worker's model and build the env for the initial spawnSync
+ * (step 2 of orchestrateMain). Exported for tests: this is the fix for
+ * "mode-models.json ignored on a worker's FIRST spawn" — the resolved model
+ * is threaded into the spawn env as OPENROUTER_MODEL (which the spawner
+ * script and run-worker.sh inherit), instead of only applying on rework
+ * re-spawns. The returned workerModel is the SAME const the rework loop
+ * reuses later.
+ */
+export function buildSpawnEnv(options: BuildSpawnEnvOptions): { env: NodeJS.ProcessEnv; workerModel: string | undefined } {
+	const workerModel = resolveModelForMode({
+		workspaceRoot: options.repo,
+		mode: options.mode,
+		explicitModel: options.explicitModel,
+		env: options.env ?? process.env,
+	})
+	const env: NodeJS.ProcessEnv = {
+		...(options.env ?? process.env),
+		TARGET_REPO: options.repo,
+		ORCHESTRATOR_MODE: options.mode,
+		// The resolved worker model must reach the spawner (and the workers it
+		// launches) — same pattern as HEADLESSCODE_PROJECT below.
+		...(workerModel ? { OPENROUTER_MODEL: workerModel } : {}),
+		// Phase 3: workers scope memory to the REPO (not the worktree) and
+		// share one memory dir. HEADLESSCODE_PROJECT flows to the worker CLI
+		// which passes it as the session `project`; the env var is inherited
+		// when --memory-dir is not given.
+		HEADLESSCODE_PROJECT: path.basename(options.repo),
+		...(options.memoryDir ? { HEADLESSCODE_MEMORY_DIR: path.resolve(options.memoryDir) } : {}),
+	}
+	return { env, workerModel }
+}
+
 function printPlan(
 	repo: string,
 	mode: string,
@@ -760,6 +804,21 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	const written = writeTaskFiles(repo, specs, issues)
 	process.stdout.write(`Wrote ${written.length} task file(s) under ${path.join(repo, "plans", "parallel-tasks")}\n`)
 
+	// 1c. Per-mode model assignment for the WORKER'S FIRST SPAWN. This must
+	// resolve BEFORE step 2's spawnSync: the spawner script (and through it
+	// run-worker.sh) inherits OPENROUTER_MODEL from the environment, so a
+	// mode-models.json entry for the worker's mode would otherwise be silently
+	// ignored on the first attempt (it only kicked in on rework re-spawns).
+	// resolveModelForMode's own precedence holds here: an explicit --model
+	// flag beats the config file, which beats OPENROUTER_MODEL.
+	const { env: spawnEnv, workerModel } = buildSpawnEnv({
+		repo,
+		mode: options.mode,
+		explicitModel: options.model,
+		memoryDir: options.memoryDir,
+		env: process.env,
+	})
+
 	// 2. Spawn (the bash script is the actual spawner; cwd = target repo so
 	//    `git rev-parse --show-toplevel` resolves there).
 	const spawnCmd = `bash ${path.join(HARNESS_ROOT_TS, "scripts", "spawn-parallel-worktrees.sh")} ${specs
@@ -771,17 +830,7 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	// binary file").
 	const spawnResult = spawnSync("bash", ["-c", spawnCmd], {
 		cwd: repo,
-		env: {
-			...process.env,
-			TARGET_REPO: repo,
-			ORCHESTRATOR_MODE: options.mode,
-			// Phase 3: workers scope memory to the REPO (not the worktree) and
-			// share one memory dir. HEADLESSCODE_PROJECT flows to the worker CLI
-			// which passes it as the session `project`; the env var is inherited
-			// when --memory-dir is not given.
-			HEADLESSCODE_PROJECT: path.basename(repo),
-			...(options.memoryDir ? { HEADLESSCODE_MEMORY_DIR: path.resolve(options.memoryDir) } : {}),
-		},
+		env: spawnEnv,
 		stdio: "inherit",
 	})
 	if (spawnResult.status !== 0) {
@@ -802,16 +851,11 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	await saveState(statePath, state)
 
 	// 4. Watch + review. Per-mode model assignment: each role resolves its OWN
-	// model — workers use the group's mode, the reviewer uses reviewMode, QA
+	// model — workers use the group's mode (resolved in 1c, above — the SAME
+	// const reused here for the rework loop), the reviewer uses reviewMode, QA
 	// uses qaMode. An explicit --model flag beats every mode's config entry
 	// (resolveModelForMode precedence rule 1), so a blanket override still
 	// works exactly as before.
-	const workerModel = resolveModelForMode({
-		workspaceRoot: repo,
-		mode: options.mode,
-		explicitModel: options.model,
-		env: process.env,
-	})
 	const reviewerModel = resolveModelForMode({
 		workspaceRoot: repo,
 		mode: options.reviewMode,

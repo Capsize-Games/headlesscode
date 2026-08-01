@@ -1,0 +1,229 @@
+/**
+ * Shell-level tests for the mode-models-first-spawn fix in
+ * scripts/spawn-parallel-worktrees.sh: a worker's FIRST spawn must resolve
+ * its model via resolveModelForMode (src/config/mode-models.ts) and pass the
+ * result to run-worker.sh as `--model` — not only on rework re-spawns.
+ *
+ * These run the REAL spawn script end-to-end against a throwaway fixture git
+ * repo (the scripts/e2e-phase2 [5/9] pattern), with HEADLESSCODE_ROOT pointed
+ * at the REAL headlesscode repo (this worktree has src/config/mode-models.ts)
+ * and HEADLESSCODE_CLI stubbed to `echo` so no LLM/API key is needed —
+ * run-worker.sh's harness.log then captures the exact CLI args and we assert
+ * on the `--model` flag.
+ *
+ * Plain assert-based (no framework, no network), matching the repo test
+ * style. Run via `npm test` ->
+ * `tsx src/orchestrator/__tests__/spawn-model.test.ts`.
+ */
+
+import assert from "node:assert/strict"
+import { execFileSync } from "node:child_process"
+import * as fs from "node:fs"
+import * as fsPromises from "node:fs/promises"
+import * as os from "node:os"
+import * as path from "node:path"
+import { fileURLToPath } from "node:url"
+
+/** This repo root (parent of src/orchestrator/__tests__/). */
+const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url))
+const SPAWN_SCRIPT = path.join(REPO_ROOT, "scripts", "spawn-parallel-worktrees.sh")
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+async function makeFixture(modeModels: Record<string, string> | null): Promise<string> {
+	const dir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "headlesscode-spawn-model-"))
+	try {
+		execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" })
+	} catch {
+		execFileSync("git", ["init", "-q", dir], { stdio: "ignore" })
+	}
+	await fsPromises.mkdir(path.join(dir, "src"), { recursive: true })
+	await fsPromises.mkdir(path.join(dir, "plans", "parallel-tasks"), { recursive: true })
+	await fsPromises.writeFile(path.join(dir, "src", "a.js"), "module.exports = 1\n", "utf-8")
+	await fsPromises.writeFile(
+		path.join(dir, "plans", "parallel-tasks", "task.md"),
+		"## assignment\nno-op fixture task\n",
+		"utf-8",
+	)
+	if (modeModels !== null) {
+		await fsPromises.mkdir(path.join(dir, ".headlesscode"), { recursive: true })
+		await fsPromises.writeFile(
+			path.join(dir, ".headlesscode", "mode-models.json"),
+			JSON.stringify(modeModels, null, 2) + "\n",
+			"utf-8",
+		)
+	}
+	execFileSync("git", ["-C", dir, "add", "-A"], { stdio: "ignore" })
+	execFileSync(
+		"git",
+		["-C", dir, "-c", "user.name=Headlesscode SpawnModel", "-c", "user.email=spawn-model@headlesscode.invalid",
+			"-c", "commit.gpgsign=false", "commit", "-q", "-m", "fixture"],
+		{ stdio: "ignore" },
+	)
+	// The spawner branches off origin/master (falling back to local master).
+	execFileSync("git", ["-C", dir, "branch", "-M", "master"], { stdio: "ignore" })
+	return dir
+}
+
+/** Run the REAL spawn script against a fixture; returns its stdout + the worktree path. */
+function runSpawn(fixture: string, spec: string, extraEnv: Record<string, string>): { out: string; wtPath: string } {
+	const env: NodeJS.ProcessEnv = {
+		...process.env,
+		PATH: process.env.PATH ?? "",
+		HOME: process.env.HOME ?? "",
+		TARGET_REPO: fixture,
+		// CRITICAL: the REAL repo — the script's HARNESS_ROOT must resolve
+		// src/config/mode-models.ts (npx tsx -e imports it by relative path).
+		HEADLESSCODE_ROOT: REPO_ROOT,
+		// Stub the CLI so no real worker/LLM runs; run-worker.sh's harness.log
+		// then shows the exact args (incl. --model) we assert on.
+		HEADLESSCODE_CLI: "echo",
+		// Never let an outer SPAWN_MODEL leak into a test it does not belong to.
+		SPAWN_MODEL: "",
+		// The calling shell may have OPENROUTER_MODEL set (the harness runs
+		// with one); each test decides explicitly whether it is set.
+		OPENROUTER_MODEL: "",
+		...extraEnv,
+	}
+	const out = execFileSync("bash", [SPAWN_SCRIPT, spec], { env, encoding: "utf-8" })
+	return { out, wtPath: path.join(fixture, ".worktrees", spec.split(":")[0]) }
+}
+
+async function waitForDone(wtPath: string, timeoutMs = 15000): Promise<void> {
+	const deadline = Date.now() + timeoutMs
+	while (Date.now() < deadline) {
+		if (fs.existsSync(path.join(wtPath, ".harness.done"))) {
+			return
+		}
+		await sleep(100)
+	}
+	throw new Error(`worker did not complete within ${timeoutMs}ms (no .harness.done at ${wtPath})`)
+}
+
+async function cleanupFixture(fixture: string, wtName: string): Promise<void> {
+	const pidFile = path.join(fixture, ".worktrees", wtName, ".harness.pid")
+	if (fs.existsSync(pidFile)) {
+		try {
+			process.kill(Number(fs.readFileSync(pidFile, "utf-8")), "SIGKILL")
+		} catch {
+			/* worker already gone */
+		}
+	}
+	try {
+		execFileSync("git", ["-C", fixture, "worktree", "remove", "--force", path.join(fixture, ".worktrees", wtName)], {
+			stdio: "ignore",
+		})
+	} catch {
+		/* worktree not registered (spawn failed early) — rm -rf below cleans up */
+	}
+	await fsPromises.rm(fixture, { recursive: true, force: true })
+}
+
+// ─── A mode-models.json entry reaches run-worker.sh on the FIRST spawn ───────
+
+async function testFirstSpawnUsesModeModelsEntry(): Promise<void> {
+	const fixture = await makeFixture({ code: "deepseek/deepseek-fake-code-model" })
+	try {
+		const { out, wtPath } = runSpawn(fixture, "mm-a:0:plans/parallel-tasks/task.md", {})
+		assert.ok(
+			out.includes("model: deepseek/deepseek-fake-code-model"),
+			`spawn output reports the resolved model, got:\n${out}`,
+		)
+		await waitForDone(wtPath)
+		const log = await fsPromises.readFile(path.join(wtPath, "harness.log"), "utf-8")
+		assert.ok(
+			log.includes("--model deepseek/deepseek-fake-code-model"),
+			`run-worker.sh received the resolved model on the first spawn, harness.log:\n${log}`,
+		)
+	} finally {
+		await cleanupFixture(fixture, "mm-a")
+	}
+}
+
+// ─── Regression: no config -> the blanket OPENROUTER_MODEL override is unchanged ──
+
+async function testNoConfigKeepsBlanketEnvOverride(): Promise<void> {
+	const fixture = await makeFixture(null)
+	try {
+		const { wtPath } = runSpawn(fixture, "mm-b:0:plans/parallel-tasks/task.md", {
+			OPENROUTER_MODEL: "deepseek/deepseek-env-model",
+		})
+		await waitForDone(wtPath)
+		const log = await fsPromises.readFile(path.join(wtPath, "harness.log"), "utf-8")
+		assert.ok(
+			log.includes("--model deepseek/deepseek-env-model"),
+			`the blanket OPENROUTER_MODEL override still reaches run-worker.sh with no mode-models.json, harness.log:\n${log}`,
+		)
+	} finally {
+		await cleanupFixture(fixture, "mm-b")
+	}
+}
+
+// ─── SPAWN_MODEL (the shell-level --model equivalent) still beats the file ───
+
+async function testSpawnModelOverrideBeatsConfig(): Promise<void> {
+	const fixture = await makeFixture({ code: "deepseek/deepseek-from-file" })
+	try {
+		const { wtPath } = runSpawn(fixture, "mm-c:0:plans/parallel-tasks/task.md", {
+			SPAWN_MODEL: "deepseek/deepseek-override-model",
+		})
+		await waitForDone(wtPath)
+		const log = await fsPromises.readFile(path.join(wtPath, "harness.log"), "utf-8")
+		assert.ok(
+			log.includes("--model deepseek/deepseek-override-model"),
+			`SPAWN_MODEL wins over the config file, harness.log:\n${log}`,
+		)
+	} finally {
+		await cleanupFixture(fixture, "mm-c")
+	}
+}
+
+// ─── Nothing configured + nothing in env -> no --model flag at all ──────────
+
+async function testNoModelAddsNoFlag(): Promise<void> {
+	const fixture = await makeFixture(null)
+	try {
+		const { wtPath } = runSpawn(fixture, "mm-d:0:plans/parallel-tasks/task.md", {})
+		await waitForDone(wtPath)
+		const log = await fsPromises.readFile(path.join(wtPath, "harness.log"), "utf-8")
+		assert.ok(
+			!log.includes("--model"),
+			`no model anywhere -> no --model flag (the worker CLI applies its own default), harness.log:\n${log}`,
+		)
+	} finally {
+		await cleanupFixture(fixture, "mm-d")
+	}
+}
+
+// ─── Runner ──────────────────────────────────────────────────────────────────
+
+const tests: Array<[string, () => Promise<void>]> = [
+	["mode-models.json entry reaches run-worker.sh on the FIRST spawn", testFirstSpawnUsesModeModelsEntry],
+	["no config: blanket OPENROUTER_MODEL override is unchanged (regression)", testNoConfigKeepsBlanketEnvOverride],
+	["SPAWN_MODEL override still beats the config file", testSpawnModelOverrideBeatsConfig],
+	["nothing configured -> no --model flag at all", testNoModelAddsNoFlag],
+]
+
+async function main(): Promise<void> {
+	let failed = 0
+	for (const [name, fn] of tests) {
+		try {
+			await fn()
+			console.log(`  ok   ${name}`)
+		} catch (err) {
+			failed++
+			console.error(`  FAIL ${name}`)
+			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
+		}
+	}
+	if (failed > 0) {
+		console.error(`\n${failed} test(s) failed`)
+		process.exit(1)
+	}
+	console.log(`\nAll ${tests.length} spawn-model tests passed`)
+}
+
+main().catch((err) => {
+	console.error("Test runner crashed:", err)
+	process.exit(1)
+})
