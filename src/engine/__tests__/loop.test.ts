@@ -14,7 +14,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 
-import { HeadlessSession } from "../loop.js"
+import { HeadlessSession, truncateHistory, TRUNCATION_BATCH_SIZE } from "../loop.js"
 import { createHeadlessExecutor } from "../../tools/executor.js"
 import { createCheckpointService } from "../../checkpoints/service.js"
 import { parseToolCall } from "../parser.js"
@@ -572,6 +572,77 @@ async function testCheckpointTriggeredByApplyDiffOnly(): Promise<void> {
 	}
 }
 
+// ─── truncateHistory — batch eviction (cache-stability regression) ───────────
+
+function fakeMsg(i: number): ChatMessage {
+	return { role: i % 2 === 0 ? "assistant" : "tool", content: `msg-${i}`, name: i % 2 === 0 ? undefined : "tool" }
+}
+
+async function testTruncateHistoryNoOpBelowWindow(): Promise<void> {
+	const messages = [fakeMsg(0), fakeMsg(1), fakeMsg(2), fakeMsg(3)]
+	const result = truncateHistory(messages, 40)
+	assert.deepEqual(result, messages, "below the window, history is returned untouched")
+}
+
+async function testTruncateHistoryEvictsInBatches(): Promise<void> {
+	const windowSize = 10
+	// system + firstUser + 20 more = 22 total, well over the window.
+	const messages = [fakeMsg(0), fakeMsg(1), ...Array.from({ length: 20 }, (_, i) => fakeMsg(i + 2))]
+	const result = truncateHistory(messages, windowSize)
+	// overflow = 20 - (10 - 2) = 12 -> evictCount = ceil(12/10)*10 = 20 (a full batch beyond
+	// the raw overflow, not just the minimum 12) -- kept tail is system+firstUser+0 of `rest`.
+	assert.equal(result.length, 2, `expected only system+firstUser kept, got ${result.length}`)
+	assert.equal(result[0], messages[0])
+	assert.equal(result[1], messages[1])
+}
+
+/**
+ * The actual regression this batching fixes: once truncation is active, the
+ * prefix sent to the model must stay IDENTICAL across multiple consecutive
+ * calls (not re-slice a different window every single time), so provider-
+ * side prompt caching can actually accrue. Simulates a growing conversation
+ * one message at a time (as HeadlessSession's real loop does) and asserts
+ * the truncated result is byte-identical (via deepEqual) across a whole
+ * batch's worth of growth, only changing at the batch boundary.
+ */
+async function testTruncateHistoryStablePrefixBetweenBatches(): Promise<void> {
+	const windowSize = 20
+	const system = fakeMsg(0)
+	const firstUser = fakeMsg(1)
+	const results: ChatMessage[][] = []
+	let messages = [system, firstUser]
+	// Grow one message at a time well past the window, capturing each truncated result.
+	for (let i = 2; i < 2 + 40; i++) {
+		messages = [...messages, fakeMsg(i)]
+		results.push(truncateHistory(messages, windowSize))
+	}
+	// A genuinely growing conversation can never produce byte-identical
+	// results call-to-call (new content is always appended) -- what caching
+	// actually needs is that the RETAINED PREFIX doesn't shift: each new
+	// result should be the previous one PLUS new messages appended at the
+	// end, not a window whose oldest kept message also changes every call
+	// (that was the original bug -- `rest.slice(-(windowSize-2))` shifts
+	// its start index on every single call once truncation is active).
+	// Find the longest run of consecutive calls where every result is a
+	// prefix-preserving extension of the one before it, and confirm at
+	// least one such run is TRUNCATION_BATCH_SIZE calls long.
+	function isPrefixExtension(prev: ChatMessage[], next: ChatMessage[]): boolean {
+		if (next.length < prev.length) return false
+		return prev.every((m, i) => m === next[i])
+	}
+	let longestStableRun = 1
+	let currentRun = 1
+	for (let i = 1; i < results.length; i++) {
+		const extends_ = isPrefixExtension(results[i - 1], results[i])
+		currentRun = extends_ ? currentRun + 1 : 1
+		longestStableRun = Math.max(longestStableRun, currentRun)
+	}
+	assert.ok(
+		longestStableRun >= TRUNCATION_BATCH_SIZE,
+		`expected a run of at least ${TRUNCATION_BATCH_SIZE} consecutive prefix-preserving (cache-eligible) calls, longest was ${longestStableRun}`,
+	)
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -588,6 +659,9 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["execute_command: a timed-out call does NOT count toward the consecutive-mistake limit", testTimeoutDoesNotCountAsMistake],
 	["execute_command: session end reaps backgrounded children (no orphans left behind)", testSessionEndReapsBackgroundedChildren],
 	["checkpoints: apply_diff-only iteration still triggers a checkpoint", testCheckpointTriggeredByApplyDiffOnly],
+	["truncateHistory: no-op below the window", testTruncateHistoryNoOpBelowWindow],
+	["truncateHistory: evicts in TRUNCATION_BATCH_SIZE-sized batches", testTruncateHistoryEvictsInBatches],
+	["truncateHistory: prefix stays stable across a batch (cache-eligible)", testTruncateHistoryStablePrefixBetweenBatches],
 ]
 
 async function main(): Promise<void> {

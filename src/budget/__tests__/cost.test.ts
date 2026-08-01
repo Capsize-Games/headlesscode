@@ -19,6 +19,34 @@ import {
 	type PricingTable,
 } from "../cost.js"
 
+/**
+ * Regression test for a real incident (2026-08-01): `deepseek/deepseek-v4-flash`
+ * was missing from DEFAULT_PRICING_TABLE, so every session running it fell
+ * through to FALLBACK_MODEL_PRICE (7x+ its real input rate), producing
+ * wildly inflated internal cost estimates (one 147-iteration session
+ * reported ~$11 estimated vs. the real OpenRouter account showing well
+ * under $1 total spend for the whole month) and at least one false-positive
+ * budget-cap abort. This must never silently regress back to the fallback.
+ */
+async function testDeepseekV4FlashPriced(): Promise<void> {
+	const price = DEFAULT_PRICING_TABLE["deepseek/deepseek-v4-flash"]
+	assert.ok(price, "deepseek/deepseek-v4-flash must be a real entry, not fall through to the fallback")
+	assert.notDeepEqual(price, FALLBACK_MODEL_PRICE, "must not accidentally equal the unknown-model fallback price")
+	assert.ok(price.input < 1, `input price should be well under $1/1M (real rate is ~$0.14), got $${price.input}`)
+	assert.ok(price.cacheRead !== undefined && price.cacheRead < price.input, "cacheRead must be a real discount, not left unset")
+
+	// The actual incident, reproduced: a session that racked up 5.3M input /
+	// 37.8K output / 1.4M cached tokens must cost single-digit dollars, not
+	// the ~$11 the fallback rate produced.
+	const cost = estimateCost({
+		model: "deepseek/deepseek-v4-flash",
+		inputTokens: 5_338_407,
+		outputTokens: 37_804,
+		cachedTokens: 1_411_584,
+	})
+	assert.ok(cost < 2, `expected well under $2 for the real incident's token counts, got $${cost.toFixed(4)}`)
+}
+
 async function testDefaultTableShape(): Promise<void> {
 	// The default table covers the models the harness uses: deepseek-chat,
 	// deepseek-reasoner and at least one general model.
@@ -193,6 +221,7 @@ async function testAccumulateCost(): Promise<void> {
 
 const tests: Array<[string, () => Promise<void>]> = [
 	["default pricing table covers deepseek-chat + reasoner + a general model", testDefaultTableShape],
+	["deepseek/deepseek-v4-flash is priced correctly (2026-08-01 incident regression)", testDeepseekV4FlashPriced],
 	["estimateCost math (per-1M input/output, mixed, zero defaults)", testEstimateCostMath],
 	["unknown model falls back to the conservative rate (never $0)", testModelFallback],
 	["in-code pricing override table + per-model fallback", testPriceOverrideTable],
