@@ -13,7 +13,7 @@
  *         "branch": string,                  // "issues/w1-2026-07-31"
  *         "issues": number[],
  *         "task_file": string,
- *         "status": "spawned"|"running"|"done"|"failed"|"blocked"|string,
+ *         "status": "spawned"|"running"|"done"|"failed"|"blocked"|"needs-human"|string,
  *         "spawned": ISO timestamp,
  *         "last_activity": string | object,  // "last_commit"/"note" seen live
  *         "commits": string[],
@@ -40,7 +40,14 @@ export interface OrchestratorGroup {
 	branch?: string
 	issues?: number[]
 	task_file?: string
-	/** spawned | running | done | failed (loose: any string is tolerated). */
+	/**
+	 * spawned | running | done | failed | blocked | needs-human (loose: any
+	 * string is tolerated). `needs-human` is a TERMINAL state set by the
+	 * rework loop when a group exhausted its review-rework attempts — the
+	 * underlying problem was never fixed and a human must look at it. It is
+	 * deliberately distinct from `failed` (worker crash/stall) and from
+	 * `blocked` (waiting on a decision answer, not a rework cycle).
+	 */
 	status: string
 	spawned?: string
 	last_status_change?: string
@@ -57,6 +64,13 @@ export interface OrchestratorGroup {
 	/** Review bookkeeping (written by the orchestrator after runReview). */
 	review_verdict?: string
 	reviewed_at?: string
+	/**
+	 * Rework loop counter — how many rework cycles this group has already gone
+	 * through after a review "finding" verdict. Absent (== 0) when the group
+	 * has never been reworked. Incremented by the orchestrator each time it
+	 * re-spawns a worker on the SAME worktree to fix review findings.
+	 */
+	reworkCount?: number
 	/**
 	 * QA bookkeeping (Phase 4, written by the orchestrator after runQa when
 	 * `--qa` is passed): verdict is pass|fail|error; status is "done" for a

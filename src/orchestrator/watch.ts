@@ -51,8 +51,15 @@ export interface WatchOptions {
 	pollIntervalMs?: number
 	/** Stall guard (default: $HEADLESSCODE_STALL_TIMEOUT or 2h). */
 	stallTimeoutMs?: number
-	/** Optional callback fired when a group transitions to done/failed. */
-	onGroupUpdate?: (group: OrchestratorGroup, state: OrchestratorState) => void | Promise<void>
+	/**
+	 * Optional callback fired when a group transitions to done/failed.
+	 * Returning `true` tells watchGroups that the callback REWROTE the state
+	 * file (e.g. the rework loop reset a group back to "running" and spawned a
+	 * new worker on the same worktree): the loop reloads the state from disk
+	 * and re-polls, so the group is picked up as "running" → "done" →
+	 * re-reviewed exactly like a first attempt.
+	 */
+	onGroupUpdate?: (group: OrchestratorGroup, state: OrchestratorState) => void | Promise<void | boolean>
 	/**
 	 * Injectable stderr writer for the proactive status-change signal
 	 * (default: process.stderr) — lets tests capture the emitted lines.
@@ -64,7 +71,7 @@ export interface WatchOptions {
 
 export interface WatchSummary {
 	state: OrchestratorState
-	/** True when every group reached a terminal state (done/failed/stalled). */
+	/** True when every group reached a terminal state (done/failed/needs-human/stalled). */
 	allTerminal: boolean
 }
 
@@ -232,7 +239,9 @@ export function inspectGroup(
 ): Partial<OrchestratorGroup> | undefined {
 	const wtPath = groupWorktreePath(repoRoot, group)
 	const startedAt = group.spawned !== undefined ? Date.parse(group.spawned) : NaN
-	const isTerminal = group.status === "done" || group.status === "failed"
+	// `needs-human` is terminal: a group that exhausted its rework attempts is
+	// never re-polled for completion markers (no worker is running on it).
+	const isTerminal = group.status === "done" || group.status === "failed" || group.status === "needs-human"
 
 	if (hasDoneMarker(wtPath)) {
 		if (isTerminal) {
@@ -350,6 +359,12 @@ function printStatusTransition(
 					"\n",
 			)
 			break
+		case "needs-human":
+			write(
+				`[orchestrate] NEEDS-HUMAN: group "${group.name}" exhausted ` +
+					`${group.reworkCount ?? 0} rework attempt(s) and still has review findings — a human must look at this\n`,
+			)
+			break
 	}
 }
 
@@ -379,7 +394,8 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 		lastSeenStatus.set(g.name, g.status)
 	}
 
-	const isTerminal = (g: OrchestratorGroup): boolean => g.status === "done" || g.status === "failed"
+	const isTerminal = (g: OrchestratorGroup): boolean =>
+		g.status === "done" || g.status === "failed" || g.status === "needs-human"
 
 	while (true) {
 		if (options.signal?.aborted) {
@@ -397,9 +413,9 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 				continue
 			}
 			// Proactive status-change signal (gap 2): print a clear stderr line
-			// on the transition into blocked / done / failed — only when the
-			// status genuinely changed, never on every poll while a group stays
-			// in the same state.
+			// on the transition into blocked / done / failed / needs-human —
+			// only when the status genuinely changed, never on every poll while
+			// a group stays in the same state.
 			if (typeof patch.status === "string") {
 				const prevStatus = lastSeenStatus.get(group.name) ?? group.status
 				if (patch.status !== prevStatus) {
@@ -416,7 +432,20 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 			changed = true
 			const updated = state.groups.find((g) => g.name === group.name)
 			if (updated) {
-				await options.onGroupUpdate?.(updated, state)
+				const reload = await options.onGroupUpdate?.(updated, state)
+				if (reload === true) {
+					// The callback rewrote the state file (rework loop: group
+					// reset to "running", or marked "needs-human"). The loop's
+					// in-memory state is stale — reload from disk (the
+					// authoritative source) and restart this poll pass so the
+					// group is re-inspected under its new status. lastSeenStatus
+					// is resynced so transition lines stay accurate.
+					state = loadStateSync(statePath)
+					for (const g of state.groups) {
+						lastSeenStatus.set(g.name, g.status)
+					}
+					break
+				}
 			}
 		}
 
