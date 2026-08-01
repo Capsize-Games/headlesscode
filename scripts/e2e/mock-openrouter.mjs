@@ -49,18 +49,40 @@
  *     system prompt has "independent reviewer" -> review-clean; otherwise ->
  *     QA pass script.
  *
+ *   permissions — command allow/deny + protected-file enforcement e2e
+ *     (plans/permissions-parity.md): a fixed 3-step script regardless of
+ *     what the harness actually does with each step, so the SAME scenario
+ *     can prove both the default-refuse and --allow-protected-writes paths:
+ *       history_tool_calls == 0 -> write_to_file targeting a protected path
+ *                                  (.env) with distinctive content
+ *       history_tool_calls == 1 -> execute_command with a command the e2e
+ *                                  runner passes via --denied-commands
+ *       history_tool_calls >= 2 -> attempt_completion (summary)
+ *     The mock does not know or care whether either step was actually
+ *     refused by the executor — the e2e runner asserts refusal/success by
+ *     inspecting the real tool-result content fed back into the request
+ *     history and the real file content on disk afterward.
+ *
  * Environment:
  *   PORT               listen port (default 0 = OS-assigned random port).
  *                      The actual port is printed to stdout in the
  *                      "[mock] listening on http://127.0.0.1:<port>" line.
  *   MOCK_SCENARIO      success | error-loop | review-clean | review-finding |
- *                      qa-pass | qa-fail | qa-orchestrate (default success)
+ *                      qa-pass | qa-fail | qa-orchestrate | permissions
+ *                      (default success)
  *   MOCK_FIXTURE_ROOT  path to the fixture repo; the write_to_file content is
  *                      derived by patching this repo's buggy source so the
  *                      e2e runner can assert the fix landed byte-for-byte.
  *   MOCK_BUGGY_FILE    relative path of the buggy source (default src/greet.js)
  *   MOCK_VERIFY_CMD    command the agent should run to verify the fix
  *                      (default: run the fixture's greet test inline)
+ *   MOCK_PROTECTED_WRITE_CONTENT  content the `permissions` scenario's
+ *                      write_to_file step tries to write to `.env` (default
+ *                      below) — the e2e runner checks for this exact string
+ *                      to tell "the write actually landed" from "refused".
+ *   MOCK_DENIED_COMMAND  command the `permissions` scenario's execute_command
+ *                      step tries to run (default below) — the e2e runner
+ *                      passes this same string via --denied-commands.
  *
  * Logging: every request prints one line to stdout (captured by the e2e
  * runner for assertions), e.g.
@@ -83,6 +105,10 @@ const REWORK_REVIEWS = Number(process.env.REWORK_REVIEWS || 0)
 
 const DEFAULT_VERIFY_CMD =
 	"node -e \"const { greet } = require('./src/greet.js'); const assert = require('node:assert'); assert.strictEqual(greet('World'), 'Hello, World'); console.log('greet verified OK')\""
+
+// permissions scenario (plans/permissions-parity.md e2e gap).
+const PROTECTED_WRITE_CONTENT = process.env.MOCK_PROTECTED_WRITE_CONTENT || "MOCK_SECRET=should-never-land\n"
+const DENIED_COMMAND = process.env.MOCK_DENIED_COMMAND || "curl http://169.254.169.254/latest/meta-data/"
 const VERIFY_CMD = process.env.MOCK_VERIFY_CMD || DEFAULT_VERIFY_CMD
 
 /** Matches the buggy line in the fixture source (see scripts/e2e-fixture/setup.sh). */
@@ -273,6 +299,37 @@ function buildScenarioResponse({ model, historyToolCalls, systemPrompt, toolName
 			],
 		}
 		return chatResponse(model, msg)
+	}
+
+	if (SCENARIO === "permissions") {
+		if (historyToolCalls === 0) {
+			return chatResponse(model, {
+				role: "assistant",
+				content: null,
+				tool_calls: [
+					toolCall(`call_mock_perm_write`, "write_to_file", {
+						path: ".env",
+						content: PROTECTED_WRITE_CONTENT,
+					}),
+				],
+			})
+		}
+		if (historyToolCalls === 1) {
+			return chatResponse(model, {
+				role: "assistant",
+				content: null,
+				tool_calls: [toolCall(`call_mock_perm_exec`, "execute_command", { command: DENIED_COMMAND })],
+			})
+		}
+		return chatResponse(model, {
+			role: "assistant",
+			content: null,
+			tool_calls: [
+				toolCall(`call_mock_perm_done`, "attempt_completion", {
+					result: "Attempted the protected write and the denied command; reporting whatever the tool results said.",
+				}),
+			],
+		})
 	}
 
 	if (SCENARIO === "review-clean" || SCENARIO === "review-finding") {
