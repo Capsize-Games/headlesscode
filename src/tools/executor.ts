@@ -29,6 +29,16 @@
  * below): the exact same effective args served against byte-identical content
  * earlier in THIS session get a short cache-hit message instead of the full
  * content, because re-sending identical content is pure output-token waste.
+ *
+ * OPT-IN local summarization (see src/tools/output-summarizer.ts): when
+ * HEADLESSCODE_LOCAL_SUMMARIZATION=1, oversized execute_command output that
+ * would exceed MAX_RESULT_CHARS is compressed by a small local Ollama model
+ * before reaching the cloud model (with a "[Output summarized by local
+ * model…]" transparency header). OFF by default; on ANY failure the result
+ * falls back to today's exact blunt truncation. Deliberately limited to
+ * execute_command output — read_file / write_to_file / diff content always
+ * stays verbatim (summarizing code a model is about to edit would be a
+ * correctness hazard).
  */
 
 import * as fs from "node:fs"
@@ -38,6 +48,8 @@ import { createHash } from "node:crypto"
 import { spawn, type ChildProcess } from "node:child_process"
 import { setTimeout as sleep } from "node:timers/promises"
 
+import type { Logger } from "../engine/logger.js"
+
 // Side effect: installs String.prototype.toPosix() used by path formatting.
 import "../vendor/zoo-code/src/utils/path.js"
 
@@ -45,6 +57,12 @@ import { MultiSearchReplaceDiffStrategy } from "../vendor/zoo-code/src/core/diff
 
 import type { ToolContext, ToolHandler, ToolResult } from "../engine/types.js"
 import { checkCommand, type CommandRefusal } from "../permissions/commands.js"
+import {
+	OllamaOutputSummarizer,
+	isLocalSummarizationEnabled,
+	summarizeToolResult,
+	MAX_SUMMARIZER_INPUT_CHARS as SUMMARIZER_INPUT_CAP,
+} from "./output-summarizer.js"
 import { findMatchingPattern } from "../permissions/protected-files.js"
 import { resolvePermissions, type PermissionsConfig } from "../permissions/config.js"
 import { createEmbedder, EMBEDDING_BACKEND_ENV, resolveEmbeddingBackend } from "../codesearch/embedder.js"
@@ -259,6 +277,59 @@ function truncate(content: string): string {
 		content.slice(0, MAX_RESULT_CHARS) +
 		`\n…[output truncated at ${MAX_RESULT_CHARS} chars to keep context bounded]`
 	)
+}
+
+/**
+ * Apply the tool-result size discipline to raw handler output.
+ *
+ * With local summarization OFF (default) this is EXACTLY today's behavior:
+ * blunt-truncate over `MAX_RESULT_CHARS`. With it ON, a result that would
+ * exceed the cap is instead sent to the local model for compression; on ANY
+ * summarizer failure we fall back to the same blunt truncation, so an
+ * opted-in session with a broken Ollama behaves identically to a non-opted-in
+ * one. Small results never reach the summarizer (that would be pure latency
+ * and risk for zero benefit).
+ *
+ * NOTE: deliberately used ONLY for execute_command output (the large,
+ * mostly-noisy command-output case). read_file / write_to_file / diff
+ * content must stay verbatim — a summarized diff or file body would be a
+ * correctness hazard for the cloud model.
+ */
+async function summarizeCommandOutput(content: string): Promise<string> {
+	if (content.length <= MAX_RESULT_CHARS) {
+		return content
+	}
+	if (!isLocalSummarizationEnabled()) {
+		return truncate(content)
+	}
+	const summarizer = makeSummarizer()
+	if (summarizer === undefined) {
+		return truncate(content)
+	}
+	const input = content.length > SUMMARIZER_INPUT_CAP ? content.slice(0, SUMMARIZER_INPUT_CAP) : content
+	return summarizeToolResult(input, summarizer, summarizerLogger)
+}
+
+/**
+ * The one place summarization is actually performed, and the ONLY reason the
+ * executor module imports OllamaOutputSummarizer. Wired in the constructor.
+ */
+let summarizerLogger: Pick<Logger, "debug" | "warn"> = {
+	debug: () => {},
+	warn: (message) => process.stderr.write(`[local-summ] ${message}\n`),
+}
+
+/**
+ * Module-level session summarizer (one per process). Constructed lazily on the
+ * first oversized result of an opted-in session; never constructed for a
+ * non-opted-in session. Process-level rather than executor-level because the
+ * Ollama client is stateless; one process = one summarizer.
+ */
+let toolSummarizer: OllamaOutputSummarizer | undefined
+
+/** Bind the session logger (used by the summarizer for non-fatal warnings). */
+export function bindSummarizerLogger(logger: Pick<Logger, "debug" | "warn">): void {
+	summarizerLogger = logger
 }
 
 function requireString(args: Record<string, unknown>, key: string): string {
@@ -1049,10 +1120,17 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 					return
 				}
 				if (code !== 0) {
-					finish(err(`execute_command: command '${command}' exited with code ${code}.\n${combined}`))
+					// Command failed: the stderr/stdout tail is exactly what the
+					// model needs. Summarize it (opt-in) exactly like the success
+					// path — a failed verbose test run is THE canonical case.
+					void summarizeCommandOutput(combined).then((content) =>
+						finish(err(`execute_command: command '${command}' exited with code ${code}.\n${content}`)),
+					)
 					return
 				}
-				finish(ok(combined === "" ? `(command completed with no output)` : combined))
+				void summarizeCommandOutput(combined === "" ? `(command completed with no output)` : combined).then(
+					(content) => finish(ok(content)),
+				)
 			})
 		})
 	})()
@@ -1322,6 +1400,22 @@ async function codebaseSearchHandler(args: Record<string, unknown>, ctx: ToolCon
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * Lazily construct the session's local summarizer. Returns undefined when the
+ * feature is off (never construct an Ollama client for a non-opted-in
+ * session). One executor = one summarizer, so a session that keeps producing
+ * oversized results reuses the same client across calls.
+ */
+function makeSummarizer(): OllamaOutputSummarizer | undefined {
+	if (!isLocalSummarizationEnabled()) {
+		return undefined
+	}
+	if (toolSummarizer === undefined) {
+		toolSummarizer = new OllamaOutputSummarizer()
+	}
+	return toolSummarizer
 }
 
 // ─── Registry ────────────────────────────────────────────────────────────────

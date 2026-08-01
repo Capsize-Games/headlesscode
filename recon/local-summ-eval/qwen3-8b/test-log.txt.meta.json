@@ -1,0 +1,11 @@
+{
+  "model": "qwen3:8b",
+  "fixture": "test-log.txt",
+  "originalChars": 7390,
+  "summaryChars": 462,
+  "compressionRatio": "16.0",
+  "elapsedMs": 1232,
+  "totalDurationMs": 1200,
+  "evalTokens": 107,
+  "promptTokens": 2077
+}

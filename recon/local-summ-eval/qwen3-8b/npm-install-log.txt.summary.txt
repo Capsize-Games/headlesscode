@@ -1,0 +1,28 @@
+- **npm warnings:**
+  - `@npmcli/move-file@2.0.1`: This functionality is no longer supported
+  - `uuid@3.4.0`: Please upgrade to uuid@7 or later
+
+- **npm notice:**
+  - New minor version of npm available! 9.8.1 -> 10.8.2
+  - Changelog: https://github.com/npm/cli/releases/tag/v10.8.2
+  - Run `npm install -g npm@10.8.2` to update
+
+- **npm error:**
+  - `code EBADENGINE`
+  - `notsup Unsupported engine for typescript@5.6.3: wanted: {"node":">=14.17"}`
+  - `notsup Actual: {"node":"20.10.0"}`
+  - `Your Node version is incompatible with the required engine of typescript@5.6.3`
+
+- **Dependency resolution:**
+  - While resolving: `headlesscode@0.1.0`
+  - Found: `node@20.10.0`
+  - `node_modules/typescript`
+  - `node_modules/typescript@5.6.3`
+  - Could not resolve dependency:
+    - `peer typescript@">=5.0.0"` from `tsx@4.19.0`
+
+- **Suggestion:**
+  - Fix the upstream dependency conflict, or retry with `--force` or `--legacy-peer-deps` to accept an incorrect (and potentially broken) dependency resolution.
+
+- **Installation result:**
+  - added 154 packages in 6s

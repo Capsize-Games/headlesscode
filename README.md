@@ -194,6 +194,16 @@ watch subcommand (Phase 5 — GitHub issue watcher, poll-based intake):
   All file operations are resolved relative to the workspace root and rejected
   if they escape it (path-traversal guard via `path.resolve` + containment
   check). Command results are truncated (~30k chars) to keep context bounded.
+- [`src/tools/output-summarizer.ts`](./src/tools/output-summarizer.ts) —
+  OPT-IN local summarization of oversized `execute_command` output: when
+  `HEADLESSCODE_LOCAL_SUMMARIZATION=1`, a result that would exceed the 30k
+  char cap is compressed by a local Ollama chat model before reaching the
+  cloud model, with a `[Output summarized by local model…]` transparency
+  header. OFF by default; on any failure it falls back to today's exact blunt
+  truncation (never an error, never a hang). Endpoint/model configurable via
+  `HEADLESSCODE_OLLAMA_URL` (default `http://localhost:11434`) and
+  `HEADLESSCODE_SUMMARIZATION_MODEL` (default `qwen3:8b`). Deliberately
+  limited to command output — file/diff content always stays verbatim.
 - [`src/engine/parser.ts`](./src/engine/parser.ts) — OpenAI function-calling
   parser: JSON.parses `tool_calls[].function.arguments` with a best-effort
   partial-JSON fallback; parse failures are marked and fed back as errors.
