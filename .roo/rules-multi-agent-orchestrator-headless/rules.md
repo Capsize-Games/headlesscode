@@ -94,6 +94,18 @@ up and guessing. During that window, the group's status in
 Don't let a blocked group sit past its timeout unanswered if you're
 actively monitoring the round.
 
+## When YOU are the headless one
+
+If you are yourself running headlessly — no interactive session, started
+from the browser via the dashboard's "Start a session" — then you are in
+exactly the position Step 2 above describes for workers: your own
+`ask_followup_question` calls write the same `.harness.needs-decision`
+marker and wait for `.harness.decision-answer`; you do NOT have a special
+interactive question tool in that case, don't assume you do. The person
+watching the dashboard's event feed answers you there, and the browser's
+inline answer box (or `scripts/headlesscode-answer.sh`) unblocks you the
+same way it unblocks a worker.
+
 ## Checkpoints and cost
 
 Every worker checkpoints its own worktree automatically (shadow git, not

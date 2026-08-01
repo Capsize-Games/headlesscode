@@ -63,6 +63,16 @@
  *     inspecting the real tool-result content fed back into the request
  *     history and the real file content on disk afterward.
  *
+ *   decision — browser-control-plane e2e (plans/browser-control-plane.md):
+ *     the model calls ask_followup_question ONCE, then (only once a real
+ *     answer has been fed back into the request history as a tool result)
+ *     terminates with attempt_completion. This is what the manual smoke
+ *     test uses to prove the dashboard's start → decision_blocked → answer
+ *     → decision_answered → continue loop end to end.
+ *       history_tool_calls == 0 -> ask_followup_question
+ *       any later request -> attempt_completion (the harness only reaches
+ *                            it if the question was actually answered)
+ *
  * Environment:
  *   PORT               listen port (default 0 = OS-assigned random port).
  *                      The actual port is printed to stdout in the
@@ -327,6 +337,41 @@ function buildScenarioResponse({ model, historyToolCalls, systemPrompt, toolName
 			tool_calls: [
 				toolCall(`call_mock_perm_done`, "attempt_completion", {
 					result: "Attempted the protected write and the denied command; reporting whatever the tool results said.",
+				}),
+			],
+		})
+	}
+
+	if (SCENARIO === "decision") {
+		if (historyToolCalls === 0) {
+			// Ask the human a question — the harness blocks on
+			// .harness.needs-decision until someone writes
+			// .harness.decision-answer (a terminal human, or the dashboard's
+			// answer endpoint — which is what the browser-control-plane smoke
+			// test exercises).
+			return chatResponse(model, {
+				role: "assistant",
+				content: null,
+				tool_calls: [
+					toolCall(`call_mock_ask`, "ask_followup_question", {
+						question: "Which config file should I edit?",
+						follow_up: [
+							{ text: "./src/frontend-config.json", mode: null },
+							{ text: "./config/frontend-config.json", mode: null },
+						],
+					}),
+				],
+			})
+		}
+		// Only reached once the question was actually answered — the harness
+		// only sends a follow-up request after the answer came back as a
+		// normal tool result. Terminate cleanly.
+		return chatResponse(model, {
+			role: "assistant",
+			content: null,
+			tool_calls: [
+				toolCall(`call_mock_done`, "attempt_completion", {
+					result: "The human answered my question via the dashboard; proceeding and done.",
 				}),
 			],
 		})

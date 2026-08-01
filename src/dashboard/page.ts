@@ -121,11 +121,47 @@ export function renderPage(): string {
   .ev-iter { color: GrayText; }
   .ev .trunc-note { color: GrayText; font-style: italic; }
   .feed-empty { color: GrayText; font-style: italic; padding: 12px 0; }
+
+  /* Inline decision-answer box (browser control plane): rendered in the feed
+     right after a decision_blocked event with no matching decision_answered
+     yet, so the human answers right where they see the question. */
+  .answer-box {
+    border: 1px solid color-mix(in srgb, #b8860b 50%, transparent);
+    border-radius: 8px; padding: 8px 12px; margin: 6px 0;
+    background: color-mix(in srgb, #b8860b 8%, transparent);
+  }
+  .answer-box .answer-suggestions { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+  .answer-box .answer-suggestions button {
+    font-size: 0.75rem; padding: 2px 10px; border-radius: 12px; cursor: pointer;
+    border: 1px solid color-mix(in srgb, #b8860b 60%, transparent);
+    background: color-mix(in srgb, #b8860b 12%, transparent); color: inherit;
+  }
+  .answer-box .answer-input-row { display: flex; gap: 6px; align-items: center; }
+  .answer-box input[type="text"] { flex: 1; font-size: 0.8rem; padding: 3px 8px; }
+  .answer-box button { font-size: 0.75rem; padding: 3px 12px; border-radius: 6px; cursor: pointer; }
+  .answer-box .answer-status { font-size: 0.75rem; color: GrayText; margin-left: 6px; }
 </style>
 </head>
 <body>
   <h1>headlesscode dashboard</h1>
   <div class="sub">Local monitor + control. Summary auto-refreshes every 4s. <span id="generatedAt"></span></div>
+
+  <div id="launch">
+    <h2>Start a session</h2>
+    <div class="sub">Launch a top-level session as a detached background process (same CLI
+      <code>scripts/run-worker.sh</code> uses). The event feed below opens immediately so you can
+      watch it start thinking. Requires <code>OPENROUTER_API_KEY</code> to be exported in the
+      dashboard process's environment (<code>set -a; source .env; set +a</code> before starting the
+      dashboard) — launched sessions inherit it, they don't re-source <code>.env</code>.</div>
+    <textarea id="launchTask" rows="3" placeholder="Describe the work, e.g. 'Split plans/realtime-monitoring.md into issues and orchestrate a round against them…'" style="width:100%"></textarea>
+    <div style="display:flex; gap:8px; margin-top:8px; align-items:center; flex-wrap:wrap;">
+      <label for="launchMode" class="mono" style="color:GrayText">mode</label>
+      <input type="text" id="launchMode" list="modeList" value="multi-agent-orchestrator-headless" style="min-width:260px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:0.8rem">
+      <datalist id="modeList"></datalist>
+      <button id="btnStart">▶ Start</button>
+      <span id="launchMsg"></span>
+    </div>
+  </div>
 
   <div class="stats" id="totals"></div>
 
@@ -277,6 +313,7 @@ function renderEvent(e) {
   }
   const div = document.createElement("div");
   div.className = "ev " + esc(e.type) + (e.isError ? " is-error" : "");
+  div.dataset.ts = e.ts || "";
   div.innerHTML = '<span class="ev-ts">' + esc(e.ts) + "</span><span class=\"ev-body\">" + iter + '<span class="ev-label">' + esc(label) + "</span> " + body + "</span>";
   return div;
 }
@@ -304,6 +341,12 @@ async function pollEvents() {
       if (feed.querySelector(".feed-empty")) feed.innerHTML = "";
       for (const e of data.events || []) {
         feed.appendChild(renderEvent(e));
+        // Browser control plane: if this is a decision_blocked and no
+        // matching decision_answered has arrived yet, render the inline
+        // answer box right here in the feed.
+        if (e.type === "decision_blocked" && !answeredAlready(feed, e)) {
+          renderAnswerBox(feed, e);
+        }
       }
       detail.lastEventCount = (detail.lastEventCount || 0) + (data.events || []).length;
       if (shouldScroll) feed.scrollTop = feed.scrollHeight;
@@ -314,6 +357,9 @@ async function pollEvents() {
     if (types.includes("paused")) detail.paused = true;
     if (types.includes("resumed")) detail.paused = false;
     if (types.includes("session_end")) { detail.status = "done"; detail.paused = false; }
+    // Prune answer boxes for decision_blocked events that now HAVE a matching
+    // decision_answered (the answer arrived — the box is moot).
+    pruneAnsweredBoxes();
     updateDetailControls();
   } catch (err) {
     const feed = document.getElementById("feed");
@@ -462,6 +508,33 @@ function settingsTableRow(slug, model, isDefault) {
   return tr;
 }
 
+// Populate the "start a session" mode selector from the real merged modes
+// (.roomodes + global ~/.roo/custom_modes.yaml). Falls back to just the
+// default when the endpoint is unavailable (e.g. no --repo) — the input stays
+// a plain text field, so typing any slug always works.
+async function loadModes() {
+  const list = document.getElementById("modeList");
+  if (!list) return;
+  try {
+    const res = await fetch("/api/modes");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    list.innerHTML = "";
+    const seen = new Set();
+    for (const m of (data.modes || [])) {
+      if (seen.has(m.slug)) continue;
+      seen.add(m.slug);
+      const opt = document.createElement("option");
+      opt.value = m.slug;
+      if (m.name && m.name !== m.slug) opt.label = m.name;
+      list.appendChild(opt);
+    }
+  } catch (err) {
+    // Non-fatal: the text input with the default value still works.
+    list.innerHTML = "";
+  }
+}
+
 async function loadModeModels() {
   try {
     const res = await fetch("/api/settings/mode-models");
@@ -592,6 +665,161 @@ async function saveModeModels(table) {
   }
 }
 
+// ── Start a session (browser control plane) ─────────────────────────────────
+// POSTs the typed prompt to /api/session/start, then navigates straight to
+// that session's live event view — the whole point is the user watches it
+// start thinking within a second or two of hitting submit, not that they
+// hunt for it in a list.
+async function startSession() {
+  const task = document.getElementById("launchTask").value.trim();
+  const mode = document.getElementById("launchMode").value.trim() || "multi-agent-orchestrator-headless";
+  const msg = document.getElementById("launchMsg");
+  const btn = document.getElementById("btnStart");
+  if (!task) {
+    msg.textContent = "type a prompt first";
+    msg.className = "status-error";
+    return;
+  }
+  msg.textContent = "launching…";
+  msg.className = "";
+  btn.disabled = true;
+  try {
+    const res = await fetch("/api/session/start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ task, mode }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      msg.textContent = "start failed: " + (data.error || ("HTTP " + res.status));
+      msg.className = "status-error";
+      return;
+    }
+    // Navigate immediately to the new session's live event view.
+    openDetail(data.sessionId, ".", "running");
+    msg.textContent = "launched ✓ session " + data.sessionId.slice(0, 8) + " — watching its event feed";
+    msg.className = "status-success";
+  } catch (err) {
+    msg.textContent = "start failed: " + err;
+    msg.className = "status-error";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ── Answer a blocked session (browser control plane) ────────────────────────
+// Rendered inline in the event feed at the decision_blocked event when no
+// matching decision_answered has arrived yet. Suggestion buttons are
+// quick-replies; the free-text input is the general case.
+
+// An event feed has exactly one blocked question at a time (a session blocks
+// on one ask_followup_question, gets answered, then possibly blocks again).
+// Track per-session state so we only render one answer box per outstanding
+// question, and prune it once the answer arrives.
+let pendingDecisionTs = null;
+
+// Returns true when this decision_blocked should NOT get an answer box —
+// i.e. a decision_answered for it already exists in the feed. Scans the DOM
+// (a session can block multiple times; only match an answer that came after
+// this particular question).
+function answeredAlready(feed, blockedEvent) {
+  // If the detail view was reopened, pendingDecisionTs may still point at
+  // this exact blocked event from a previous render — treat that as "box
+  // still owed" unless a box already exists in the freshly re-rendered feed.
+  if (pendingDecisionTs === blockedEvent.ts && feed.querySelector(".answer-box")) {
+    return true;
+  }
+  // Otherwise, check whether the feed already shows a decision_answered that
+  // came after this blocked event in DOM order.
+  const evs = feed.querySelectorAll(".ev.decision_answered");
+  for (const el of evs) {
+    if (el.dataset.ts >= blockedEvent.ts) return true;
+  }
+  return false;
+}
+
+function pruneAnsweredBoxes() {
+  const feed = document.getElementById("feed");
+  const evs = feed.querySelectorAll(".ev.decision_answered");
+  if (evs.length === 0) {
+    // No answer events at all — keep boxes as-is.
+    return;
+  }
+  const lastAnswered = evs[evs.length - 1].dataset.ts;
+  feed.querySelectorAll(".answer-box").forEach((box) => {
+    const ts = box.dataset.blockedTs;
+    if (ts && ts <= lastAnswered) {
+      box.remove();
+    }
+  });
+  // If the newest answer postdates our pending question, it's resolved.
+  if (pendingDecisionTs !== null && pendingDecisionTs <= lastAnswered) {
+    pendingDecisionTs = null;
+  }
+}
+
+function renderAnswerBox(feed, e) {
+  pendingDecisionTs = e.ts;
+  const box = document.createElement("div");
+  box.className = "answer-box";
+  box.dataset.blockedTs = e.ts;
+  const suggestions = Array.isArray(e.suggestions) ? e.suggestions : [];
+  const sRow = document.createElement("div");
+  sRow.className = "answer-suggestions";
+  for (const s of suggestions) {
+    const b = document.createElement("button");
+    b.textContent = s;
+    b.addEventListener("click", () => submitAnswer(e, s, box));
+    sRow.appendChild(b);
+  }
+  box.appendChild(sRow);
+
+  const row = document.createElement("div");
+  row.className = "answer-input-row";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.placeholder = "type an answer…";
+  row.appendChild(input);
+  const btn = document.createElement("button");
+  btn.textContent = "Answer";
+  btn.addEventListener("click", () => {
+    const text = input.value.trim();
+    if (!text) return;
+    submitAnswer(e, text, box);
+  });
+  row.appendChild(btn);
+  const status = document.createElement("span");
+  status.className = "answer-status";
+  status.id = "answerStatus" + (e.ts || "");
+  row.appendChild(status);
+  box.appendChild(row);
+  feed.appendChild(box);
+}
+
+async function submitAnswer(e, text, box) {
+  const status = box.querySelector(".answer-status");
+  if (!status) return;
+  status.textContent = "answering…";
+  try {
+    const res = await fetch("/api/session/" + encodeURIComponent(detail.sessionId) + "/answer", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ answer: text }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      status.textContent = "failed: " + (data.error || ("HTTP " + res.status));
+      return;
+    }
+    status.textContent = "answered ✓ — worker resumes on its next poll";
+    status.className = "status-success";
+    // Keep the box but disable it; the decision_answered event will confirm.
+    box.querySelectorAll("button, input").forEach((el) => { el.disabled = true; });
+  } catch (err) {
+    status.textContent = "failed: " + err;
+  }
+}
+
 async function poll() {
   try {
     const res = await fetch("/api/summary");
@@ -613,6 +841,14 @@ async function poll() {
 document.getElementById("detailClose").addEventListener("click", closeDetail);
 document.getElementById("btnPause").addEventListener("click", () => controlSession("pause"));
 document.getElementById("btnResume").addEventListener("click", () => controlSession("resume"));
+document.getElementById("btnStart").addEventListener("click", startSession);
+// Enter in the task box submits too (shift+enter for a newline).
+document.getElementById("launchTask").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter" && !ev.shiftKey) {
+    ev.preventDefault();
+    startSession();
+  }
+});
 // Stop yanking the view down while the user reads history above.
 document.getElementById("feed").addEventListener("scroll", () => {
   if (detail) detail.userScrolledUp = !feedAutoScrolls();
@@ -620,6 +856,7 @@ document.getElementById("feed").addEventListener("scroll", () => {
 
 poll();
 loadModeModels();
+loadModes();
 setInterval(poll, 4000);
 // Live event feed poll: faster than the summary poll (1.5s) so the detail
 // view feels live, and only runs while a detail view is open.

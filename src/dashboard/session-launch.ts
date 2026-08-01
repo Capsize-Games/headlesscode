@@ -1,0 +1,164 @@
+/**
+ * Browser control plane — launching a top-level session from the dashboard and
+ * answering its escalated questions.
+ *
+ * Two capabilities, both deliberately thin wrappers around what already exists:
+ *
+ *  1. `launchSession` spawns the SAME CLI invocation `scripts/run-worker.sh`
+ *     uses (`npx tsx src/cli.ts --task ... --mode ... --workspace ...`) as a
+ *     DETACHED background process — `detached: true` + `unref()` — so the
+ *     dashboard HTTP handler returns immediately and the session keeps running
+ *     after the server's own process group is long gone. The child inherits
+ *     the dashboard process's environment, which is exactly why
+ *     `OPENROUTER_API_KEY` must be exported (e.g. `set -a; source .env`) when
+ *     the dashboard itself is started — this endpoint does NOT re-source
+ *     `.env` the way the CLI's other entry points do.
+ *
+ *  2. `answerSessionDecision` writes `.harness.decision-answer` in the
+ *     session's workspace root — functionally identical to
+ *     `scripts/headlesscode-answer.sh`, but without a subprocess for a
+ *     one-line file write. The worker's `ask_followup_question` poll picks it
+ *     up, deletes both markers, and resumes (see src/tools/executor.ts).
+ *
+ * Session id determinism: the launch endpoint generates the session id HERE
+ * (a UUID, same generator HeadlessSession uses internally) and passes it to
+ * the CLI via `--session-id` (added in src/cli.ts → HeadlessSessionConfig),
+ * so the browser can open the session's live event view immediately instead
+ * of polling for "whatever session showed up after we launched".
+ *
+ * The CLI string is split into argv and spawned WITHOUT a shell (spawn's
+ * default), so the user's task text never passes through shell quoting —
+ * no injection surface for a form-POST endpoint. `detached: true` still puts
+ * the child in its own process group, matching the executor.ts idiom.
+ *
+ * This module is pure fs + child_process — no HTTP, so it's unit-testable
+ * without spinning up the dashboard server (see the server.ts wrapper).
+ */
+
+import * as fsp from "node:fs/promises"
+import * as path from "node:path"
+import { spawn } from "node:child_process"
+import { randomUUID } from "node:crypto"
+
+/** Marker basenames, relative to the session's workspace root (src/tools/executor.ts idiom). */
+const NEEDS_DECISION_FILENAME = ".harness.needs-decision"
+const DECISION_ANSWER_FILENAME = ".harness.decision-answer"
+
+/** The default mode for a browser-launched top-level session. */
+export const DEFAULT_LAUNCH_MODE = "multi-agent-orchestrator-headless"
+
+/** Request body for POST /api/session/start. */
+export interface SessionStartRequest {
+	/** Workspace/repo root the session runs against. */
+	repo?: string
+	/** The user's typed prompt. */
+	task?: string
+	/** Mode slug (default: multi-agent-orchestrator-headless). */
+	mode?: string
+}
+
+/** Request body for POST /api/session/:id/answer. */
+export interface SessionAnswerRequest {
+	answer?: string
+}
+
+export interface LaunchSessionResult {
+	sessionId: string
+	pid: number
+	workspace: string
+	mode: string
+}
+
+/**
+ * Validate a session-start body. Returns a human-readable error string when
+ * the body is unusable, undefined when it's acceptable.
+ */
+export function validateSessionStartBody(body: unknown): string | undefined {
+	if (body === null || typeof body !== "object" || Array.isArray(body)) {
+		return "body must be a JSON object"
+	}
+	const { task, repo, mode } = body as Record<string, unknown>
+	if (typeof task !== "string" || task.trim() === "") {
+		return "missing or empty 'task' — provide the prompt text to run"
+	}
+	if (repo !== undefined && (typeof repo !== "string" || repo.trim() === "")) {
+		return "'repo' must be a non-empty string path"
+	}
+	if (mode !== undefined && (typeof mode !== "string" || mode.trim() === "")) {
+		return "'mode' must be a non-empty string slug"
+	}
+	return undefined
+}
+
+/** Split a CLI command string into argv (whitespace-separated, no shell). */
+function splitCli(cli: string): string[] {
+	return cli.split(/\s+/).filter((part) => part.length > 0)
+}
+
+/**
+ * Launch a top-level HeadlessSession as a detached background process,
+ * mirroring scripts/run-worker.sh's launch semantics (nohup-style, no
+ * blocking on the child). Resolves once the child has been spawned — NOT
+ * when it finishes, which is the whole point of detached/unref.
+ */
+export async function launchSession(
+	options: {
+		/** Repo root the session runs against (the dashboard's --repo, or a body override). */
+		workspace: string
+		task: string
+		mode?: string
+		/**
+		 * CLI invocation template, e.g. "npx tsx src/cli.ts". Tests point it
+		 * at a tiny fake script for fast, deterministic assertions.
+		 */
+		cli?: string
+		/** Directory the CLI runs in (default: process.cwd() — the dashboard's cwd). */
+		repoRoot?: string
+	},
+): Promise<LaunchSessionResult> {
+	const sessionId = randomUUID()
+	const mode = options.mode?.trim() ? options.mode.trim() : DEFAULT_LAUNCH_MODE
+	const workspace = path.resolve(options.workspace)
+	const cli = options.cli ?? "npx tsx src/cli.ts"
+	// The dashboard may have been started from a different cwd than this repo;
+	// the CLI runs with repoRoot as cwd so `npx tsx` finds src/cli.ts no
+	// matter where the dashboard process was launched from.
+	const repoRoot = path.resolve(options.repoRoot ?? process.cwd())
+
+	const argv = [...splitCli(cli), "--task", options.task, "--mode", mode, "--workspace", workspace, "--session-id", sessionId]
+
+	// NOTE (control-plane): the child inherits this process's environment —
+	// OPENROUTER_API_KEY and OPENROUTER_BASE_URL (the e2e mock) included. The
+	// dashboard is expected to have sourced .env at startup (see cli.ts's
+	// dashboard help); this endpoint deliberately does not re-source it.
+	const child = spawn(argv[0], argv.slice(1), {
+		cwd: repoRoot,
+		detached: true,
+		stdio: "ignore",
+		env: process.env,
+	})
+
+	// Detach fully: the child must neither keep the dashboard's event loop
+	// alive nor die when the dashboard exits. It becomes its own process
+	// group leader (detached: true) and keeps running independently.
+	child.unref()
+
+	return { sessionId, pid: child.pid ?? 0, workspace, mode }
+}
+
+/**
+ * Answer a blocked session's pending `ask_followup_question` by writing
+ * `<workspaceRoot>/.harness.decision-answer` (the marker
+ * `ask_followup_question` polls for — see src/tools/executor.ts). Mirrors
+ * scripts/headlesscode-answer.sh, in-process (no subprocess for a one-line
+ * write; the two implementations must stay in sync).
+ */
+export async function answerSessionDecision(workspaceRoot: string, answer: string): Promise<void> {
+	await fsp.writeFile(path.join(workspaceRoot, DECISION_ANSWER_FILENAME), answer, "utf-8")
+}
+
+/** Marker filenames, exported for tests. */
+export const DECISION_MARKERS = {
+	needsDecision: NEEDS_DECISION_FILENAME,
+	decisionAnswer: DECISION_ANSWER_FILENAME,
+} as const

@@ -90,6 +90,13 @@ export const DEFAULT_LLM_TIMEOUT_MS = 300_000
 
 export interface HeadlessSessionConfig {
 	workspaceRoot: string
+	/**
+	 * Explicit session id override (default: a fresh randomUUID). The
+	 * dashboard's session-launch endpoint generates the id first and passes
+	 * it through (via --session-id) so the browser can open the session's
+	 * live event view immediately, before the first event exists.
+	 */
+	sessionId?: string
 	/** Mode slug, default 'code' (built-in or from .roomodes). */
 	mode?: string
 	/** Model id; default env OPENROUTER_MODEL or 'deepseek/deepseek-chat'. */
@@ -191,6 +198,8 @@ export interface SessionRunState {
 /** The session config with every optional field resolved to a concrete value. */
 export interface ResolvedSessionConfig {
 	workspaceRoot: string
+	/** Explicit session id override (see HeadlessSessionConfig.sessionId). */
+	sessionId?: string
 	mode: string
 	model: string
 	taskText: string
@@ -272,6 +281,7 @@ export class HeadlessSession {
 		}
 
 		this.config = {
+			sessionId: config.sessionId?.trim() ? config.sessionId.trim() : undefined,
 			mode: config.mode ?? "code",
 			model: config.model ?? process.env.OPENROUTER_MODEL ?? DEFAULT_MODEL,
 			taskText: config.taskText,
@@ -330,7 +340,7 @@ export class HeadlessSession {
 					)
 				},
 			})
-		this.sessionId = randomUUID()
+		this.sessionId = config.sessionId?.trim() ? config.sessionId.trim() : randomUUID()
 		this.eventHook = config.eventHook
 		this.eventFeed = new EventFeed(config.workspaceRoot, this.sessionId, (eventType, error) => {
 			this.logger.warn(`[events] failed to record '${eventType}' (non-fatal; dashboard misses this event)`, {
