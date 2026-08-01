@@ -93,6 +93,16 @@ All 21 tool schema files + the index + converters + MCP-server schema builder
 | `src/services/checkpoints/excludes.ts` | `zoo-code/src/services/checkpoints/excludes.ts` (shadow-repo `.git/info/exclude` patterns) |
 | `src/services/checkpoints/index.ts` | `zoo-code/src/services/checkpoints/index.ts` (barrel) |
 
+### Diff-based editing — `zoo-code/src/core/diff/`
+| Vendored file | Original path |
+|---|---|
+| `src/core/diff/strategies/multi-search-replace.ts` | `zoo-code/src/core/diff/strategies/multi-search-replace.ts` (fuzzy Levenshtein diff engine with `:start_line:` disambiguation + truncated-diff repair; backs the harness's `apply_diff` tool) |
+| `src/utils/text-normalization.ts` | `zoo-code/src/utils/text-normalization.ts` (pure: `normalizeString`, `unescapeHtmlEntities`) |
+| `src/integrations/misc/extract-text.ts` | `zoo-code/src/integrations/misc/extract-text.ts` (subset: only the `addLineNumbers` / `everyLineHasLineNumbers` / `stripLineNumbers` helpers the diff strategy imports; PDF/DOCX/XLSX extractors and binary detection excluded — they drag `pdf-parse`, `mammoth`, `isbinaryfile`) |
+| `types/global-settings.ts` | `zoo-code/packages/types/src/global-settings.ts` (subset: only `DEFAULT_DIFF_FUZZY_THRESHOLD = 1.0`, re-exported from the `@roo-code/types` barrel) |
+
+New real npm dep added for this: `fastest-levenshtein` (the diff strategy's Levenshtein distance function).
+
 Real npm deps added for this (not shimmed — genuine portable packages):
 `simple-git`, `p-wait-for` (see root `package.json`). Harness wiring is
 `src/checkpoints/service.ts` + `src/checkpoints/cli.ts`; see

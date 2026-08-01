@@ -15,6 +15,7 @@ import * as path from "node:path"
 
 import { HeadlessSession } from "../loop.js"
 import { createHeadlessExecutor } from "../../tools/executor.js"
+import { createCheckpointService } from "../../checkpoints/service.js"
 import { parseToolCall } from "../parser.js"
 import { readUsageFile } from "../usage.js"
 import type { SessionBudget } from "../../budget/budget.js"
@@ -111,6 +112,9 @@ async function makeSession(options: {
 	consecutiveErrorLimit?: number
 	windowSize?: number
 	budget?: SessionBudget
+	/** Checkpoints on/off + shadow-git storage dir (default off — see below). */
+	checkpoints?: boolean
+	checkpointDir?: string
 }) {
 	const session = new HeadlessSession({
 		workspaceRoot: options.workspaceRoot,
@@ -124,8 +128,10 @@ async function makeSession(options: {
 		budget: options.budget ?? null,
 		// Checkpoints are default-on and would otherwise write real shadow-git
 		// commits to ~/.headlesscode/checkpoints on every test run; this suite
-		// isn't testing checkpoints, so keep tests hermetic and fast.
-		checkpoints: false,
+		// isn't testing checkpoints (except the one that is), so keep tests
+		// hermetic and fast. The checkpoint test passes a tmp checkpointDir.
+		checkpoints: options.checkpoints ?? false,
+		checkpointDir: options.checkpointDir,
 	})
 	return session
 }
@@ -150,11 +156,15 @@ async function testScenario1WriteThenCompletion(): Promise<void> {
 		// The system prompt was built from the vendored builder.
 		assert.ok(session.state.systemPrompt.length > 100, "system prompt should be built")
 		assert.ok(session.state.systemPrompt.includes("TOOL USE"), "system prompt should contain TOOL USE section")
-		// Tools sent to the LLM are exactly the implemented subset.
+		// Tools sent to the LLM are exactly the implemented subset (the three
+		// surgical edit tools are implemented and therefore advertised too).
 		const toolNames = client.requests[0].tools?.map((t) => (t.type === "function" ? t.function.name : t.type))
 		assert.ok(toolNames?.includes("read_file"), "read_file should be exposed")
 		assert.ok(toolNames?.includes("attempt_completion"), "attempt_completion should be exposed")
-		assert.ok(!toolNames?.includes("apply_diff"), "apply_diff stub should NOT be exposed to the model")
+		assert.ok(toolNames?.includes("apply_diff"), "apply_diff should be exposed (implemented)")
+		assert.ok(toolNames?.includes("search_replace"), "search_replace should be exposed (implemented)")
+		assert.ok(toolNames?.includes("edit_file"), "edit_file should be exposed (implemented)")
+		assert.ok(!toolNames?.includes("codebase_search"), "codebase_search stub should NOT be exposed to the model")
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -184,15 +194,15 @@ async function testScenario2CommandThenTextAnswer(): Promise<void> {
 async function testScenario3ErroringToolBoundedFailure(): Promise<void> {
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-s3-"))
 	try {
-		// Model keeps calling an unimplemented stub tool (apply_diff).
+		// Model keeps calling an unimplemented stub tool (codebase_search).
 		const client = new FakeLlmClient([
-			() => toolCall("apply_diff", { path: "a.ts", diff: "ignored" }),
-			() => toolCall("apply_diff", { path: "a.ts", diff: "ignored" }),
-			() => toolCall("apply_diff", { path: "a.ts", diff: "ignored" }),
-			() => toolCall("apply_diff", { path: "a.ts", diff: "ignored" }),
+			() => toolCall("codebase_search", { query: "x" }),
+			() => toolCall("codebase_search", { query: "x" }),
+			() => toolCall("codebase_search", { query: "x" }),
+			() => toolCall("codebase_search", { query: "x" }),
 		])
 		const session = await makeSession({
-			task: "apply a diff",
+			task: "search the codebase",
 			client,
 			workspaceRoot: ws,
 			consecutiveErrorLimit: 3,
@@ -363,15 +373,15 @@ async function testLiveSnapshotRemovedOnSuccess(): Promise<void> {
 async function testLiveSnapshotRemovedOnError(): Promise<void> {
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-live-err-"))
 	try {
-		// Model keeps calling an unimplemented stub tool (apply_diff) → bounded
-		// failure (status "error") after `consecutiveErrorLimit` mistakes.
+		// Model keeps calling an unimplemented stub tool (codebase_search) →
+		// bounded failure (status "error") after `consecutiveErrorLimit` mistakes.
 		const client = new FakeLlmClient([
-			() => toolCall("apply_diff", { path: "a.ts", diff: "x" }),
-			() => toolCall("apply_diff", { path: "a.ts", diff: "x" }),
-			() => toolCall("apply_diff", { path: "a.ts", diff: "x" }),
+			() => toolCall("codebase_search", { query: "x" }),
+			() => toolCall("codebase_search", { query: "x" }),
+			() => toolCall("codebase_search", { query: "x" }),
 		])
 		const session = await makeSession({
-			task: "apply a diff",
+			task: "search the codebase",
 			client,
 			workspaceRoot: ws,
 			consecutiveErrorLimit: 3,
@@ -409,6 +419,62 @@ async function testLiveSnapshotRemovedOnBudgetExceeded(): Promise<void> {
 	}
 }
 
+/**
+	* The loop's checkpoint trigger used to key off the executor having
+	* `write_to_file` registered — an iteration that used ONLY `apply_diff` (no
+	* write_to_file call at all) would slip through uncheckpointed. Regression:
+	* a session whose model edits via apply_diff alone must still snapshot.
+	*
+	* The diff markers are assembled at runtime (`<".repeat(7)` etc.) so the
+	* literal SEARCH/REPLACE sequences don't appear in this file's source.
+	*/
+async function testCheckpointTriggeredByApplyDiffOnly(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-ckpt-applydiff-"))
+	const checkpointDir = await fs.mkdtemp(path.join(os.tmpdir(), "hc-ckpt-loop-"))
+	try {
+		// Seed a file the model will edit via apply_diff only.
+		await fs.writeFile(path.join(ws, "greeting.txt"), "hello world\n", "utf-8")
+
+		const diff = [
+			"<".repeat(7) + " SEARCH",
+			":start_line:1",
+			"-------",
+			"hello world",
+			"=======",
+			"hello brave new world",
+			">".repeat(7) + " REPLACE",
+		].join("\n")
+		const client = new FakeLlmClient([
+			() => toolCall("apply_diff", { path: "greeting.txt", diff }),
+			() => toolCall("attempt_completion", { result: "Done: edited greeting.txt" }),
+		])
+		const session = await makeSession({
+			task: "edit greeting.txt",
+			client,
+			workspaceRoot: ws,
+			checkpoints: true,
+			checkpointDir,
+		})
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		// The diff was actually applied to disk.
+		assert.equal(await fs.readFile(path.join(ws, "greeting.txt"), "utf-8"), "hello brave new world\n")
+
+		// The shadow-git checkpoint repo for this session must exist and hold
+		// more than the baseline snapshot (baseline + post-iteration snapshot).
+		const tasksDir = path.join(checkpointDir, "tasks")
+		const taskIds = await fs.readdir(tasksDir)
+		assert.equal(taskIds.length, 1, `expected exactly one checkpoint task, got: ${taskIds.join(", ")}`)
+		const svc = createCheckpointService({ taskId: taskIds[0], workspaceRoot: ws, checkpointDir })
+		await svc.init()
+		const entries = await svc.list()
+		assert.ok(entries.length >= 2, `expected baseline + iteration checkpoints, got ${entries.length}`)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+		await fs.rm(checkpointDir, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -422,6 +488,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["live snapshot: removed on successful completion", testLiveSnapshotRemovedOnSuccess],
 	["live snapshot: removed when the session ends with an error", testLiveSnapshotRemovedOnError],
 	["live snapshot: removed when the session is aborted by budget limits", testLiveSnapshotRemovedOnBudgetExceeded],
+	["checkpoints: apply_diff-only iteration still triggers a checkpoint", testCheckpointTriggeredByApplyDiffOnly],
 ]
 
 async function main(): Promise<void> {

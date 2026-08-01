@@ -2,23 +2,21 @@
 
 Snapshot of known behavioral gaps between the headless harness and the interactive VS Code
 extension it's ported from. Documented for prioritization, not all scheduled — checkpoints,
-decision escalation, and cost/token monitoring (previously the three biggest gaps) are now
-built; see [`docs/checkpoints.md`](checkpoints.md) and this doc's own history for context.
+decision escalation, cost/token monitoring, and diff-based editing (previously the four
+biggest gaps) are now built; see [`docs/checkpoints.md`](checkpoints.md) and this doc's own
+history for context.
 
-## Recommended next: diff-based editing
+## Diff-based editing — built
 
-`apply_diff` / `search_replace` / `edit_file` are not implemented — every edit goes through
-`write_to_file`, a full-file overwrite (`src/tools/executor.ts`). Two consequences:
-
-- **Cost**: rewriting an entire large file for a one-line change burns far more output tokens
-  than a targeted diff, on every single edit.
-- **Safety**: no diff review step exists even at the model level — a truncated or malformed
-  model response silently clobbers the whole file with no partial-match/hunk validation the
-  way `apply_diff`'s fuzzy matching provides upstream.
-
-This is a self-contained port of Zoo Code's diff-matching logic (`zoo-code/src/core/diff/`)
-and is the single highest-value remaining gap. Not built in this round — recommend scheduling
-it next.
+`apply_diff` / `search_replace` / `edit_file` are implemented, backed by a verbatim vendored
+port of Zoo Code's diff-matching logic (`src/vendor/zoo-code/src/core/diff/strategies/
+multi-search-replace.ts` for `apply_diff`'s fuzzy engine; `search_replace`'s strict
+one-occurrence literal match and `edit_file`'s exact → whitespace-tolerant → token-based
+fallback chain live in `src/tools/executor.ts`). The harness's executor also snapshots
+checkpoints after any iteration that used any edit tool (including diff-only iterations).
+Prior to this, every edit went through `write_to_file`, a full-file overwrite — costly (an
+entire large file rewritten for a one-line change) and unsafe (a truncated/malformed model
+response silently clobbered the whole file with no partial-match/hunk validation).
 
 ## Settings/permissions parity — none
 

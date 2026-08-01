@@ -32,7 +32,8 @@ import "../vendor/zoo-code/src/utils/path.js"
 import type { ExtensionContext } from "vscode"
 import { SYSTEM_PROMPT } from "../vendor/zoo-code/src/core/prompts/system.js"
 import { getNativeTools } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/index.js"
-import { getModeBySlug, modes, getToolsForMode } from "../vendor/zoo-code/src/shared/modes.js"
+import { getGroupName, getModeBySlug, modes, getToolsForMode } from "../vendor/zoo-code/src/shared/modes.js"
+import { TOOL_GROUPS } from "../vendor/zoo-code/src/shared/tools.js"
 import { customModesSettingsSchema } from "../vendor/zoo-code/types/index.js"
 import type { ModeConfig } from "@roo-code/types"
 
@@ -55,6 +56,9 @@ export interface BuiltPrompt {
 export const EXECUTABLE_TOOL_NAMES = new Set([
 	"read_file",
 	"write_to_file",
+	"apply_diff",
+	"search_replace",
+	"edit_file",
 	"execute_command",
 	"list_files",
 	"attempt_completion",
@@ -221,6 +225,21 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions): Prom
 export function selectToolsForMode(mode: string, customModes: ModeConfig[] = []): ChatTool[] {
 	const modeConfig = getModeBySlug(mode, customModes) ?? modes.find((m) => m.slug === mode) ?? modes[0]
 	const allowedNames = new Set(getToolsForMode(modeConfig.groups))
+
+	// The vendored `getToolsForMode` only includes a group's standard `tools`,
+	// not its opt-in `customTools` (e.g. `search_replace` / `edit_file` in the
+	// `edit` group — in VS Code they're enabled via a settings checkbox).
+	// Headless has no UI to opt in, so we surface a group's customTools too —
+	// BUT only those the executor actually implements (the EXECUTABLE_TOOL_NAMES
+	// intersection below is still the final gate), so a stub like `edit` or
+	// `apply_patch` never leaks to the model.
+	for (const group of modeConfig.groups) {
+		const groupName = getGroupName(group)
+		const customTools = TOOL_GROUPS[groupName]?.customTools ?? []
+		for (const customName of customTools) {
+			allowedNames.add(customName)
+		}
+	}
 
 	const nativeTools = getNativeTools()
 	const selected: ChatTool[] = []
