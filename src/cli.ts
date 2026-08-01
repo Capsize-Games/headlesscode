@@ -22,6 +22,7 @@ import { watchMain } from "./watcher/cli.js"
 import { checkpointsMain } from "./checkpoints/cli.js"
 import { dashboardMain } from "./dashboard/cli.js"
 import { indexMain } from "./codesearch/cli.js"
+import { provisionMain } from "./github/cli.js"
 import { resolvePermissions, type PermissionsConfig } from "./permissions/config.js"
 import { resolveModelForMode } from "./config/mode-models.js"
 
@@ -95,6 +96,11 @@ Subcommands:
               (used by the codebase_search tool). A separate, explicit step —
               never auto-triggered mid-session. See
               \`npx tsx src/cli.ts index --help\` for full options.
+  headlesscode provision --installation-id <id> --owner <o> --repo <r> --target <dir>
+              Clone a GitHub repo the App installation can access into a local
+              dir (token stripped from the remote URL), ready as a
+              --workspace value. Also --list-repos <id>. See
+              \`npx tsx src/cli.ts provision --help\` for full options.
 
 Options:
   --mode <slug>              Mode to run in (built-in or from .roomodes). Default: code
@@ -378,6 +384,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// never auto-triggered mid-session (it costs real money and takes time).
 	if (argv[0] === "index") {
 		return indexMain(argv.slice(1))
+	}
+
+	// GitHub App repo provisioning subcommand: `headlesscode provision ...` —
+	// clone a repo the App installation can access into a local dir (token
+	// stripped from the remote), ready as a --workspace value. Also
+	// `--list-repos <id>` (see src/github/cli.ts + docs/github-app-setup.md).
+	if (argv[0] === "provision") {
+		return provisionMain(argv.slice(1))
 	}
 
 	const { options, error } = parseArgs(argv)
