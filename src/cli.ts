@@ -21,6 +21,7 @@ import { orchestrateMain } from "./orchestrator/cli.js"
 import { watchMain } from "./watcher/cli.js"
 import { checkpointsMain } from "./checkpoints/cli.js"
 import { dashboardMain } from "./dashboard/cli.js"
+import { indexMain } from "./codesearch/cli.js"
 import { resolvePermissions, type PermissionsConfig } from "./permissions/config.js"
 
 const VERSION = "0.1.0"
@@ -88,6 +89,11 @@ Subcommands:
               event feed and pause/resume control (Phase 3: no longer purely
               read-only — see src/dashboard/server.ts). See
               \`npx tsx src/cli.ts dashboard --help\` for full options.
+  headlesscode index --workspace <path> [--model <id>]
+              Build/refresh the codebase semantic-search index for a workspace
+              (used by the codebase_search tool). A separate, explicit step —
+              never auto-triggered mid-session. See
+              \`npx tsx src/cli.ts index --help\` for full options.
 
 Options:
   --mode <slug>              Mode to run in (built-in or from .roomodes). Default: code
@@ -363,6 +369,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// (Phase 3 — see src/dashboard/; no longer purely read-only).
 	if (argv[0] === "dashboard") {
 		return dashboardMain(argv.slice(1))
+	}
+
+	// Codebase semantic-search index subcommand: `headlesscode index ...` —
+	// build/refresh <workspace>/.headlesscode/codesearch/index.jsonl for the
+	// codebase_search tool (see src/codesearch/). A separate, EXPLICIT step —
+	// never auto-triggered mid-session (it costs real money and takes time).
+	if (argv[0] === "index") {
+		return indexMain(argv.slice(1))
 	}
 
 	const { options, error } = parseArgs(argv)

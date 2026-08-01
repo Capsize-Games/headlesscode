@@ -188,7 +188,7 @@ async function testScenario1WriteThenCompletion(): Promise<void> {
 		assert.ok(toolNames?.includes("apply_diff"), "apply_diff should be exposed (implemented)")
 		assert.ok(toolNames?.includes("search_replace"), "search_replace should be exposed (implemented)")
 		assert.ok(toolNames?.includes("edit_file"), "edit_file should be exposed (implemented)")
-		assert.ok(!toolNames?.includes("codebase_search"), "codebase_search stub should NOT be exposed to the model")
+		assert.ok(toolNames?.includes("codebase_search"), "codebase_search should be exposed (implemented)")
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -218,7 +218,10 @@ async function testScenario2CommandThenTextAnswer(): Promise<void> {
 async function testScenario3ErroringToolBoundedFailure(): Promise<void> {
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-s3-"))
 	try {
-		// Model keeps calling an unimplemented stub tool (codebase_search).
+		// Model keeps calling codebase_search with no index built yet — the
+		// handler returns a clear "not indexed" error, so the loop still hits
+		// its consecutive-mistake bound (the tool is real, the workspace just
+		// has no index).
 		const client = new FakeLlmClient([
 			() => toolCall("codebase_search", { query: "x" }),
 			() => toolCall("codebase_search", { query: "x" }),
@@ -239,7 +242,7 @@ async function testScenario3ErroringToolBoundedFailure(): Promise<void> {
 		// Tool results were fed back as error tool messages.
 		const toolMsgs = session.state.messages.filter((m) => m.role === "tool")
 		assert.equal(toolMsgs.length, 3)
-		assert.match(toolMsgs[0]?.content ?? "", /not implemented/)
+		assert.match(toolMsgs[0]?.content ?? "", /no codebase index|not indexed/i)
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}

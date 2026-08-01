@@ -75,12 +75,23 @@ export type PricingTable = Record<string, ModelPrice>
  *   smaller error (`cacheRead` off by 10x — $0.028 instead of the real
  *   $0.0028/1M) was caught and fixed the same day.
  * - `anthropic/claude-3.5-sonnet` — a general-purpose reference model.
+ * - `qwen/qwen3-embedding-4b` — the codebase-index embedding model
+ *   (src/codesearch/embedder.ts). Embedding responses carry no completion
+ *   tokens (output is always 0). The rate is the CONSERVATIVE input-only
+ *   $0.15/1M observed live on OpenRouter's Google embedding endpoint
+ *   (2026-08-01): qwen3-embedding-4b itself is served on a BYOK-routed
+ *   endpoint that reported $0 through OpenRouter at probe time, and its list
+ *   price was NOT readable from OpenRouter's API (embedding models are absent
+ *   from /api/v1/models — see src/codesearch/embedder.ts's header). Pricing a
+ *   guardrail means fail-closed: estimate at a real observed rate rather than
+ *   $0, so an index build on a large repo still counts against a cost cap.
  */
 export const DEFAULT_PRICING_TABLE: PricingTable = {
-	"deepseek/deepseek-chat": { input: 0.27, output: 1.1 },
-	"deepseek/deepseek-reasoner": { input: 0.55, output: 2.19 },
-	"deepseek/deepseek-v4-flash": { input: 0.14, output: 0.28, cacheRead: 0.0028 },
-	"anthropic/claude-3.5-sonnet": { input: 3.0, output: 15.0 },
+ "deepseek/deepseek-chat": { input: 0.27, output: 1.1 },
+ "deepseek/deepseek-reasoner": { input: 0.55, output: 2.19 },
+ "deepseek/deepseek-v4-flash": { input: 0.14, output: 0.28, cacheRead: 0.0028 },
+ "anthropic/claude-3.5-sonnet": { input: 3.0, output: 15.0 },
+ "qwen/qwen3-embedding-4b": { input: 0.15, output: 0.15 },
 }
 
 /**
