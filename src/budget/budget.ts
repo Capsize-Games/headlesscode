@@ -80,6 +80,10 @@ export class BudgetTracker {
 	private readonly startedAt: number
 	private iterations = 0
 	private costUsd = 0
+	/** Cumulative ms spent paused (see pauseClock/resumeClock), excluded from elapsedMs. */
+	private blockedMs = 0
+	/** Set while paused (the `now()` value pauseClock() was called at); null when running. */
+	private blockStartedAt: number | null = null
 
 	constructor(budget: SessionBudget, options: BudgetTrackerOptions = {}) {
 		this.budget = budget
@@ -88,8 +92,33 @@ export class BudgetTracker {
 		this.startedAt = this.now()
 	}
 
+	/**
+	 * Decision escalation (workstream 2): call before blocking on an external
+	 * answer (e.g. ask_followup_question waiting on `.harness.decision-answer`)
+	 * so the wait doesn't count against `maxDurationMs`. Idempotent — a second
+	 * call while already paused is a no-op.
+	 */
+	pauseClock(): void {
+		if (this.blockStartedAt === null) {
+			this.blockStartedAt = this.now()
+		}
+	}
+
+	/**
+	 * Resume the clock after a pause, folding the paused interval into
+	 * `blockedMs`. Idempotent — a call while not paused is a no-op.
+	 */
+	resumeClock(): void {
+		if (this.blockStartedAt !== null) {
+			this.blockedMs += Math.max(0, this.now() - this.blockStartedAt)
+			this.blockStartedAt = null
+		}
+	}
+
 	get elapsedMs(): number {
-		return Math.max(0, this.now() - this.startedAt)
+		const raw = Math.max(0, this.now() - this.startedAt)
+		const inProgressBlock = this.blockStartedAt !== null ? Math.max(0, this.now() - this.blockStartedAt) : 0
+		return Math.max(0, raw - this.blockedMs - inProgressBlock)
 	}
 
 	get iterationCount(): number {

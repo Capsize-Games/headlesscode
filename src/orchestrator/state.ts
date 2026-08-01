@@ -13,7 +13,7 @@
  *         "branch": string,                  // "issues/w1-2026-07-31"
  *         "issues": number[],
  *         "task_file": string,
- *         "status": "spawned"|"running"|"done"|"failed"|string,
+ *         "status": "spawned"|"running"|"done"|"failed"|"blocked"|string,
  *         "spawned": ISO timestamp,
  *         "last_activity": string | object,  // "last_commit"/"note" seen live
  *         "commits": string[],
@@ -70,6 +70,31 @@ export interface OrchestratorGroup {
 	}
 	/** PR metadata seen in the live airunner state file. */
 	pr?: { number?: number; url?: string; state?: string }
+	/**
+	 * Decision escalation (workstream 2): set by the watcher (watch.ts) while
+	 * `<worktree>/.harness.needs-decision` is present — the worker's
+	 * ask_followup_question call is blocked waiting for
+	 * `<worktree>/.harness.decision-answer`. Mirrors the marker file's JSON
+	 * shape. Cleared (and status flows back to "running") once the marker
+	 * disappears, whether because a human/orchestrator answered it via
+	 * `scripts/headlesscode-answer.sh` or because the worker's wait timed out
+	 * and it fell back to autonomous decision.
+	 */
+	blocked?: { question: string; suggestions?: string[]; askedAt?: string }
+	/**
+	 * Cost/token monitoring (workstream 3): rolled up by the watcher
+	 * (watch.ts) from the worker's `<worktree>/.headlesscode/usage/*.jsonl`
+	 * once the group reaches a terminal state (done/failed). Summed across
+	 * all usage records found for the worktree (defensive against a worktree
+	 * running more than one session) — see `src/dashboard/aggregate.ts` for
+	 * the same shape used dashboard-side.
+	 */
+	usage?: {
+		costUsd: number
+		inputTokens: number
+		outputTokens: number
+		iterations: number
+	}
 }
 
 /** The orchestrator state file document. */
@@ -77,6 +102,18 @@ export interface OrchestratorState {
 	batch?: string
 	updated?: string
 	groups: OrchestratorGroup[]
+	/**
+	 * Cost/token monitoring (workstream 3): round-level total, the sum of
+	 * every group's `usage` field. Recomputed by the watcher each time a
+	 * group's usage is rolled in, so "this round cost $X" is answerable
+	 * without summing client-side.
+	 */
+	totalUsage?: {
+		costUsd: number
+		inputTokens: number
+		outputTokens: number
+		iterations: number
+	}
 	[key: string]: unknown
 }
 

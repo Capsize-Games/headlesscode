@@ -63,6 +63,10 @@ async function runSession(options: {
 		windowSize: 40,
 		memory: options.memory ?? null,
 		project: PROJECT,
+		// Checkpoints are default-on and would otherwise write real shadow-git
+		// commits to ~/.headlesscode/checkpoints on every test run; this suite
+		// isn't testing checkpoints, so keep tests hermetic and fast.
+		checkpoints: false,
 	})
 	const result = await session.run()
 	return { session, result }

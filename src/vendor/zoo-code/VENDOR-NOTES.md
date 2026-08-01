@@ -84,6 +84,34 @@ All 21 tool schema files + the index + converters + MCP-server schema builder
 | `types/message.ts` | `zoo-code/packages/types/src/message.ts` (`ClineAsk`, `ToolProgressStatus`) |
 | `types/tool-params.ts` | `zoo-code/packages/types/src/tool-params.ts` (`GenerateImageParams`, `ReadFileToolParams`) |
 
+### Checkpoints — `zoo-code/src/services/checkpoints/`
+| Vendored file | Original path |
+|---|---|
+| `src/services/checkpoints/ShadowCheckpointService.ts` | `zoo-code/src/services/checkpoints/ShadowCheckpointService.ts` (shadow-git mechanism via `simple-git`; 1 `vscode.*` ref — an error toast — satisfied by the shim) |
+| `src/services/checkpoints/RepoPerTaskCheckpointService.ts` | `zoo-code/src/services/checkpoints/RepoPerTaskCheckpointService.ts` (thin subclass: `shadowDir/tasks/<taskId>/checkpoints` layout) |
+| `src/services/checkpoints/types.ts` | `zoo-code/src/services/checkpoints/types.ts` |
+| `src/services/checkpoints/excludes.ts` | `zoo-code/src/services/checkpoints/excludes.ts` (shadow-repo `.git/info/exclude` patterns) |
+| `src/services/checkpoints/index.ts` | `zoo-code/src/services/checkpoints/index.ts` (barrel) |
+
+Real npm deps added for this (not shimmed — genuine portable packages):
+`simple-git`, `p-wait-for` (see root `package.json`). Harness wiring is
+`src/checkpoints/service.ts` + `src/checkpoints/cli.ts`; see
+`docs/checkpoints.md`.
+
+One adaptation note specific to checkpoints: `ShadowCheckpointService`'s
+private `stageAll()` (`git add . --ignore-errors`) only stages correctly
+when the shadow dir's `cwd` is unrelated to the workspace it tracks (true for
+Zoo Code's real `globalStorageUri`-based shadow dir, which is always outside
+any workspace). `src/checkpoints/service.ts` runtime-patches that one method
+on its own subclass's prototype to `git add -A` as defense in depth, and
+separately refuses (throws) to create a checkpoint service whose
+`checkpointDir` resolves inside `workspaceRoot` at all — nesting also breaks
+`restoreCheckpoint()`'s `git clean -f -d -f`, which would delete a nested
+shadow repo's own `.git`. See the file header of `src/checkpoints/service.ts`
+for the full writeup (verified empirically, not just from reading the code).
+No vendored file was edited for this — the fix is a subclass-prototype patch
+in the harness's own wrapper module.
+
 ---
 
 ## 2. Shims created (all under `src/vendor/zoo-code/`)
@@ -105,7 +133,7 @@ Wired through `tsconfig.json` → `compilerOptions.paths` unless noted:
 | `src/services/mcp/McpHub.ts` | `zoo-code/src/services/mcp/McpHub.ts` | Stub `McpHub` with an injectable server list; `getServers()`. No transports (Phase 1 has no MCP). |
 | `src/services/code-index/manager.ts` | `zoo-code/src/services/code-index/manager.ts` | Stub `CodeIndexManager.getInstance()` (prompt builder only calls the factory; result unused). |
 | `src/services/skills/SkillsManager.ts` | `zoo-code/src/services/skills/SkillsManager.ts` | Stub returning no skills from `getSkillsForMode()`. |
-| `src/services/search/file-search.ts` | `zoo-code/src/services/search/file-search.ts` | `executeRipgrep` implemented with pure Node fs for the `.roo` subdirectory discovery used by `roo-config`. |
+| `src/services/search/file-search.ts` | `zoo-code/src/services/search/file-search.ts` | `executeRipgrep` implemented with pure Node fs + a small glob matcher (`**`, `*`, `!`-excludes). Originally only served `.roo` subdirectory discovery (`roo-config`); extended for the checkpoints vendoring to also serve `ShadowCheckpointService#getNestedGitRepository()`'s `**/.git/HEAD` nested-repo scan (returns `{ path, type }`, not just `path`, to match what that caller destructures). |
 | `src/i18n/index.ts` | `zoo-code/src/i18n/index.ts` | `t()` returns the key with `{param}` interpolation; original is the webview UI catalog. |
 | `types/index.ts` | the `@roo-code/types` package | Re-export barrel over the vendored `types/*` modules. Mapped via `paths: "@roo-code/types"`. |
 

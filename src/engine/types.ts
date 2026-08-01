@@ -85,6 +85,24 @@ export interface ToolResult {
 /** Per-call context handed to tool handlers. */
 export interface ToolContext {
 	workspaceRoot: string
+	/**
+	 * Decision escalation (ask_followup_question, see src/tools/executor.ts):
+	 * how long to block waiting for `.harness.decision-answer` before falling
+	 * back to today's autonomous-decision error, and how often to poll for it.
+	 * Both optional — handlers fall back to their own defaults when absent.
+	 */
+	decisionTimeoutMs?: number
+	decisionPollIntervalMs?: number
+	/**
+	 * Budget-clock pause/resume hooks, wired by HeadlessSession right after it
+	 * constructs a BudgetTracker (see src/budget/budget.ts's pauseClock /
+	 * resumeClock). ask_followup_question calls these around its blocking wait
+	 * so time spent waiting on a human/orchestrator answer isn't charged
+	 * against the session's duration budget. Absent when no budget is
+	 * configured, or when the injected executor never wired them.
+	 */
+	pauseBudgetClock?: () => void
+	resumeBudgetClock?: () => void
 }
 
 /** A tool handler: dispatch any registered tool by name. */

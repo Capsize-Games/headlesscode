@@ -20,6 +20,7 @@ import * as fs from "node:fs"
 import * as fsp from "node:fs/promises"
 import * as path from "node:path"
 import { spawn } from "node:child_process"
+import { setTimeout as sleep } from "node:timers/promises"
 
 // Side effect: installs String.prototype.toPosix() used by path formatting.
 import "../vendor/zoo-code/src/utils/path.js"
@@ -35,10 +36,23 @@ export const DEFAULT_COMMAND_TIMEOUT_S = 120
 /** Max entries returned by list_files before truncation. */
 export const MAX_LIST_FILES = 500
 
+/** Options that configure a ToolExecutor's decision-escalation behavior. */
+export interface ToolExecutorOptions {
+	/** ask_followup_question escalation timeout, ms (default 30 min — see DEFAULT_DECISION_TIMEOUT_MS). */
+	decisionTimeoutMs?: number
+	/** ask_followup_question poll interval, ms (default 5s — override in tests). */
+	decisionPollIntervalMs?: number
+}
+
 export class ToolExecutor {
 	private readonly handlers = new Map<string, ToolHandler>()
+	private pauseBudgetClock: (() => void) | undefined
+	private resumeBudgetClock: (() => void) | undefined
 
-	constructor(readonly workspaceRoot: string) {}
+	constructor(
+		readonly workspaceRoot: string,
+		private readonly options: ToolExecutorOptions = {},
+	) {}
 
 	register(name: string, handler: ToolHandler): void {
 		this.handlers.set(name, handler)
@@ -52,6 +66,17 @@ export class ToolExecutor {
 		return [...this.handlers.keys()]
 	}
 
+	/**
+	 * Wired by HeadlessSession right after it constructs a BudgetTracker, so
+	 * ask_followup_question (and any future blocking tool) can pause the
+	 * session's budget-duration clock while waiting on an external answer.
+	 * Never called when no budget is configured.
+	 */
+	setBudgetClockHooks(pause: () => void, resume: () => void): void {
+		this.pauseBudgetClock = pause
+		this.resumeBudgetClock = resume
+	}
+
 	async execute(name: string, args: Record<string, unknown>): Promise<ToolResult> {
 		const handler = this.handlers.get(name)
 		if (!handler) {
@@ -61,7 +86,13 @@ export class ToolExecutor {
 			}
 		}
 		try {
-			return await handler(args, { workspaceRoot: this.workspaceRoot })
+			return await handler(args, {
+				workspaceRoot: this.workspaceRoot,
+				decisionTimeoutMs: this.options.decisionTimeoutMs,
+				decisionPollIntervalMs: this.options.decisionPollIntervalMs,
+				pauseBudgetClock: this.pauseBudgetClock,
+				resumeBudgetClock: this.resumeBudgetClock,
+			})
 		} catch (err) {
 			return {
 				content: `[Error] Tool '${name}' failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -347,13 +378,117 @@ function attemptCompletionHandler(args: Record<string, unknown>): ToolResult {
 	return ok(result)
 }
 
-/** ask_followup_question — non-interactive by design. */
-function askFollowupQuestionHandler(args: Record<string, unknown>): ToolResult {
-	const question = typeof args.question === "string" ? args.question : "(no question)"
+/** Marker basenames, relative to the workspace root (mirrors the .harness.* idiom). */
+const NEEDS_DECISION_FILENAME = ".harness.needs-decision"
+const DECISION_ANSWER_FILENAME = ".harness.decision-answer"
+
+/** Default ask_followup_question escalation timeout: 30 minutes. */
+export const DEFAULT_DECISION_TIMEOUT_MS = 1_800_000
+/** Default poll interval while waiting for an answer, matching watch.ts's DEFAULT_POLL_INTERVAL_MS. */
+export const DEFAULT_DECISION_POLL_INTERVAL_MS = 5_000
+
+/** Today's non-interactive fallback text — reused verbatim on timeout (see file header). */
+function autonomousDecisionError(question: string): ToolResult {
 	return {
 		content: `[Non-interactive] This headless harness cannot display questions or collect answers. The model must decide autonomously. (Question asked: ${question})`,
 		isError: true,
 	}
+}
+
+/** Extract suggestion text from the `follow_up` arg (see the vendored native-tool schema). */
+function extractSuggestions(followUp: unknown): string[] | undefined {
+	if (!Array.isArray(followUp)) {
+		return undefined
+	}
+	const texts = followUp
+		.map((item) => (item !== null && typeof item === "object" ? (item as Record<string, unknown>).text : undefined))
+		.filter((t): t is string => typeof t === "string" && t.length > 0)
+	return texts.length > 0 ? texts : undefined
+}
+
+async function safeUnlink(p: string): Promise<void> {
+	try {
+		await fsp.unlink(p)
+	} catch {
+		// Already gone / never existed — fine either way.
+	}
+}
+
+/**
+ * ask_followup_question — decision escalation (workstream 2).
+ *
+ * Writes `<workspaceRoot>/.harness.needs-decision` (JSON: question,
+ * suggestions?, askedAt), then polls for `<workspaceRoot>/.harness.decision-
+ * answer` every `decisionPollIntervalMs` (default 5s) up to
+ * `decisionTimeoutMs` (default 30min). The session's budget-duration clock is
+ * paused for the duration of the wait (see pauseBudgetClock/resumeBudgetClock
+ * on ToolContext).
+ *
+ * - Answer arrives in time: both marker files are deleted and the answer text
+ *   is returned as a NORMAL (non-error) tool result — the model continues
+ *   with real input, and this does NOT count toward the loop's consecutive-
+ *   mistake bounded-failure limit.
+ * - Timeout elapses: the needs-decision marker is deleted (a log line notes
+ *   the timeout) and the handler falls back to EXACTLY today's behavior — the
+ *   "must decide autonomously" tool error, which DOES count as a mistake.
+ */
+async function askFollowupQuestionHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+	const question = typeof args.question === "string" ? args.question : "(no question)"
+	const suggestions = extractSuggestions(args.follow_up)
+	const askedAt = new Date().toISOString()
+
+	const needsDecisionPath = path.join(ctx.workspaceRoot, NEEDS_DECISION_FILENAME)
+	const answerPath = path.join(ctx.workspaceRoot, DECISION_ANSWER_FILENAME)
+	const timeoutMs = ctx.decisionTimeoutMs ?? DEFAULT_DECISION_TIMEOUT_MS
+	const pollIntervalMs = ctx.decisionPollIntervalMs ?? DEFAULT_DECISION_POLL_INTERVAL_MS
+
+	try {
+		await fsp.writeFile(
+			needsDecisionPath,
+			JSON.stringify({ question, ...(suggestions ? { suggestions } : {}), askedAt }, null, 2) + "\n",
+			"utf-8",
+		)
+	} catch (error) {
+		// Can't even signal escalation (e.g. read-only workspace) — fall back
+		// immediately to today's behavior rather than blocking on a wait no one
+		// can ever answer.
+		process.stderr.write(
+			`[headlesscode] ask_followup_question: failed to write ${NEEDS_DECISION_FILENAME}, falling back to autonomous decision: ${errorMessage(error)}\n`,
+		)
+		return autonomousDecisionError(question)
+	}
+
+	ctx.pauseBudgetClock?.()
+	try {
+		const deadline = Date.now() + timeoutMs
+		while (Date.now() < deadline) {
+			let answer: string | undefined
+			try {
+				answer = await fsp.readFile(answerPath, "utf-8")
+			} catch {
+				answer = undefined
+			}
+			if (answer !== undefined) {
+				await safeUnlink(needsDecisionPath)
+				await safeUnlink(answerPath)
+				return ok(`[Human/orchestrator answer received] ${answer.trim()}`)
+			}
+			const remaining = deadline - Date.now()
+			if (remaining <= 0) {
+				break
+			}
+			await sleep(Math.min(pollIntervalMs, remaining))
+		}
+	} finally {
+		ctx.resumeBudgetClock?.()
+	}
+
+	// Timed out: fall back to exactly today's behavior.
+	process.stderr.write(
+		`[headlesscode] ask_followup_question: timed out after ${timeoutMs}ms waiting for ${DECISION_ANSWER_FILENAME}, falling back to autonomous decision.\n`,
+	)
+	await safeUnlink(needsDecisionPath)
+	return autonomousDecisionError(question)
 }
 
 /** Stub for vendored tools that Phase 1 does not implement headlessly. */
@@ -402,8 +537,8 @@ const IMPLEMENTED_TOOLS = new Set(["read_file", "write_to_file", "execute_comman
  * attempt_completion + ask_followup_question handlers, and stubs for every
  * other vendored tool schema.
  */
-export function createHeadlessExecutor(workspaceRoot: string): ToolExecutor {
-	const executor = new ToolExecutor(workspaceRoot)
+export function createHeadlessExecutor(workspaceRoot: string, options: ToolExecutorOptions = {}): ToolExecutor {
+	const executor = new ToolExecutor(workspaceRoot, options)
 
 	executor.register("read_file", readFileHandler)
 	executor.register("write_to_file", writeToFileHandler)
@@ -439,8 +574,8 @@ export function createHeadlessExecutor(workspaceRoot: string): ToolExecutor {
  * tools are absent from BOTH the executor and the tool list advertised to
  * the model (see src/qa/qa.ts `qaTools()`).
  */
-function createReadCommandExecutor(workspaceRoot: string): ToolExecutor {
-	const executor = new ToolExecutor(workspaceRoot)
+function createReadCommandExecutor(workspaceRoot: string, options: ToolExecutorOptions = {}): ToolExecutor {
+	const executor = new ToolExecutor(workspaceRoot, options)
 
 	executor.register("read_file", readFileHandler)
 	executor.register("list_files", listFilesHandler)
@@ -460,8 +595,8 @@ function createReadCommandExecutor(workspaceRoot: string): ToolExecutor {
 }
 
 /** Reviewer executor (Phase 2): read + command, no write. See above. */
-export function createReadOnlyHeadlessExecutor(workspaceRoot: string): ToolExecutor {
-	return createReadCommandExecutor(workspaceRoot)
+export function createReadOnlyHeadlessExecutor(workspaceRoot: string, options: ToolExecutorOptions = {}): ToolExecutor {
+	return createReadCommandExecutor(workspaceRoot, options)
 }
 
 /**
@@ -470,6 +605,6 @@ export function createReadOnlyHeadlessExecutor(workspaceRoot: string): ToolExecu
  * at every call site: the QA agent can boot the app and run tests via
  * execute_command, but cannot modify source files (no write_to_file).
  */
-export function createQaHeadlessExecutor(workspaceRoot: string): ToolExecutor {
-	return createReadCommandExecutor(workspaceRoot)
+export function createQaHeadlessExecutor(workspaceRoot: string, options: ToolExecutorOptions = {}): ToolExecutor {
+	return createReadCommandExecutor(workspaceRoot, options)
 }

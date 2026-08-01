@@ -22,6 +22,12 @@ The following material in this repository is derived from
   (`src/vendor/zoo-code/src/services/roo-config/`).
 - **Types and constants** — `ModeConfig`/`DEFAULT_MODES` and the tool/group
   type definitions under `src/vendor/zoo-code/types/`.
+- **Checkpoints** — the shadow-git auto-commit mechanism
+  (`src/vendor/zoo-code/src/services/checkpoints/ShadowCheckpointService.ts`,
+  `RepoPerTaskCheckpointService.ts`, `types.ts`, `excludes.ts`, `index.ts`),
+  which snapshots the workspace into a hidden git repo (via `simple-git`)
+  after every tool-executing turn so edits can be reverted; see
+  `docs/checkpoints.md`.
 
 Source: **https://github.com/Zoo-Code-Org/Zoo-Code**
 License: **Apache-2.0** · Copyright **2026 Zoo Code**.

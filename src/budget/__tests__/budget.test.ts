@@ -230,6 +230,7 @@ async function testSessionBudgetTripsMidRun(): Promise<void> {
 			maxIterations: 5,
 			llmClient: client,
 			budget: { maxCostUsd: 0.005 },
+			checkpoints: false,
 		})
 		const result = await session.run()
 
@@ -252,8 +253,10 @@ async function testSessionBudgetTripsMidRun(): Promise<void> {
 async function testSessionBudgetDefaultOff(): Promise<void> {
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-budget-off-"))
 	try {
-		// No budget config -> identical existing behavior: succeeds, and no
-		// budgetUsage field is added (loop.test.ts covers the full loop).
+		// No budget config -> no enforcement (still succeeds), but usage
+		// accounting (workstream 3) is now UNCONDITIONAL: budgetUsage is always
+		// present, with no limits tripped, reflecting the real accumulated
+		// cost/tokens rather than being absent.
 		const client = new FakeLlmClient(
 			[
 				() => toolCall("read_file", { path: "a.txt" }),
@@ -268,10 +271,14 @@ async function testSessionBudgetDefaultOff(): Promise<void> {
 			taskText: "do the thing",
 			maxIterations: 5,
 			llmClient: client,
+			checkpoints: false,
 		})
 		const result = await session.run()
 		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
-		assert.equal(result.budgetUsage, undefined, "no budget -> no budgetUsage on the result")
+		assert.ok(result.budgetUsage, "usage accounting is unconditional now -> budgetUsage always present")
+		assert.equal(result.budgetUsage?.iterations, 2, "two LLM calls happened")
+		assert.ok((result.budgetUsage?.costUsd ?? 0) > 0, "cost accumulated even with no budget configured")
+		assert.equal(result.budgetUsage?.model, "fake-budget-model")
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -296,6 +303,7 @@ async function testSessionBudgetIterationsCap(): Promise<void> {
 			maxIterations: 5,
 			llmClient: client,
 			budget: { maxIterations: 1 },
+			checkpoints: false,
 		})
 		const result = await session.run()
 		assert.equal(result.status, "error")
@@ -319,7 +327,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["tracker: check() reports the correct reason", testCheckReasons],
 	["sessionBudgetFromEnv: env -> budget, unset/invalid handled", testSessionBudgetFromEnv],
 	["session: budget trips mid-run -> status error, reason budget, budgetUsage populated", testSessionBudgetTripsMidRun],
-	["session: budget default off -> success, no budgetUsage (zero behavior change)", testSessionBudgetDefaultOff],
+	["session: budget default off -> success, budgetUsage still present (accounting is unconditional)", testSessionBudgetDefaultOff],
 	["session: iterations cap trips before the next LLM call", testSessionBudgetIterationsCap],
 ]
 

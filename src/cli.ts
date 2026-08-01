@@ -19,6 +19,8 @@ import { Logger } from "./engine/logger.js"
 import { buildSystemPrompt, loadCustomModes, selectToolsForMode } from "./engine/prompt.js"
 import { orchestrateMain } from "./orchestrator/cli.js"
 import { watchMain } from "./watcher/cli.js"
+import { checkpointsMain } from "./checkpoints/cli.js"
+import { dashboardMain } from "./dashboard/cli.js"
 
 const VERSION = "0.1.0"
 
@@ -40,6 +42,11 @@ interface CliOptions {
 	dryRun: boolean
 	version: boolean
 	help: boolean
+	/** Checkpoints on by default; --no-checkpoints opts out. */
+	noCheckpoints: boolean
+	checkpointDir?: string
+	/** Decision escalation timeout, ms (also $HEADLESSCODE_DECISION_TIMEOUT_MS). */
+	decisionTimeoutMs?: number
 }
 
 const USAGE = `headlesscode — headless coding-agent harness (Phase 1 engine)
@@ -58,6 +65,12 @@ Subcommands:
               Poll GitHub for labeled issues and fan out into orchestration
               batches (idempotent). See
               \`npx tsx src/cli.ts watch --help\` for full options.
+  headlesscode checkpoints --workspace <path> [list | restore <hash> | diff <hash>]
+              List/restore/diff shadow-git checkpoints for a workspace. See
+              \`npx tsx src/cli.ts checkpoints --help\` for full options.
+  headlesscode dashboard [--port 4390] [--repo <path>]
+              Serve a local read-only cost/token dashboard. See
+              \`npx tsx src/cli.ts dashboard --help\` for full options.
 
 Options:
   --mode <slug>              Mode to run in (built-in or from .roomodes). Default: code
@@ -79,6 +92,16 @@ Options:
                              When a cap trips the session aborts with reason "budget"
   --dry-run                  Build the system prompt, validate .roomodes/rules loading,
                              then exit without calling the LLM (no API key needed)
+  --no-checkpoints           Disable shadow-git checkpoints (on by default; see
+                             \`headlesscode checkpoints --help\`). No effect for
+                             read-only sessions (reviewer/QA), which never checkpoint
+  --checkpoint-dir <path>    Shadow-git storage root override (default:
+                             ~/.headlesscode/checkpoints — MUST be outside the
+                             workspace; see docs/checkpoints.md)
+  --decision-timeout-ms <n>  How long ask_followup_question blocks waiting for
+                             a human/orchestrator answer before falling back
+                             to autonomous decision, ms (default 1800000 / 30
+                             min). Default: $HEADLESSCODE_DECISION_TIMEOUT_MS
   --version                  Print version and exit
   --help                     Show this help and exit
 
@@ -99,6 +122,7 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 		dryRun: false,
 		version: false,
 		help: false,
+		noCheckpoints: false,
 	}
 
 	for (let i = 0; i < argv.length; i++) {
@@ -183,6 +207,15 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 				options.maxDurationMs = num
 				break
 			}
+			case "--decision-timeout-ms": {
+				const value = next()
+				const num = value === undefined ? Number.NaN : Number(value)
+				if (!Number.isInteger(num) || num <= 0) {
+					return { options, error: "--decision-timeout-ms requires a positive integer" }
+				}
+				options.decisionTimeoutMs = num
+				break
+			}
 			case "--memory-dir": {
 				const value = next()
 				if (value === undefined) {
@@ -191,8 +224,19 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 				options.memoryDir = value
 				break
 			}
+			case "--checkpoint-dir": {
+				const value = next()
+				if (value === undefined) {
+					return { options, error: "Missing value for --checkpoint-dir" }
+				}
+				options.checkpointDir = value
+				break
+			}
 			case "--no-memory":
 				options.noMemory = true
+				break
+			case "--no-checkpoints":
+				options.noCheckpoints = true
 				break
 			case "--dry-run":
 				options.dryRun = true
@@ -224,6 +268,18 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// (poll label → split → spawn → durable idempotency state).
 	if (argv[0] === "watch") {
 		return watchMain(argv.slice(1))
+	}
+
+	// Checkpoints subcommand: `headlesscode checkpoints ...` — list/restore/diff
+	// shadow-git checkpoints for a workspace (see src/checkpoints/).
+	if (argv[0] === "checkpoints") {
+		return checkpointsMain(argv.slice(1))
+	}
+
+	// Cost/token dashboard subcommand: `headlesscode dashboard ...` — local
+	// read-only HTML dashboard (see src/dashboard/).
+	if (argv[0] === "dashboard") {
+		return dashboardMain(argv.slice(1))
 	}
 
 	const { options, error } = parseArgs(argv)
@@ -324,6 +380,11 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	const budget =
 		maxCostUsd !== undefined || maxDurationMs !== undefined ? { maxCostUsd, maxDurationMs } : undefined
 
+	// Decision escalation: flag wins over the env fallback
+	// ($HEADLESSCODE_DECISION_TIMEOUT_MS — set by run-worker.sh for workers).
+	// Off (undefined) falls back to executor.ts's own default (30 min).
+	const decisionTimeoutMs = options.decisionTimeoutMs ?? envNumber("HEADLESSCODE_DECISION_TIMEOUT_MS")
+
 	const session = new HeadlessSession({
 		workspaceRoot,
 		mode: options.mode,
@@ -336,6 +397,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		memory,
 		project,
 		budget,
+		checkpoints: !options.noCheckpoints,
+		checkpointDir: options.checkpointDir,
+		decisionTimeoutMs,
 	})
 
 	const result = await session.run()

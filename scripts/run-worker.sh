@@ -30,6 +30,12 @@
 #                      away on cost/time)
 #   HEADLESSCODE_PRICING_JSON  forwarded to the CLI (pricing table override;
 #                      inherited through the environment automatically)
+#   HEADLESSCODE_DECISION_TIMEOUT_MS  decision-escalation timeout, ms; when
+#                      set, forwarded to the CLI as --decision-timeout-ms
+#                      (ask_followup_question blocks this long waiting for
+#                      .harness.decision-answer before falling back to
+#                      autonomous decision; default 30 min). Answer a blocked
+#                      worker with scripts/headlesscode-answer.sh.
 #
 # Usage:
 #   scripts/run-worker.sh <worktree-path> <task-file-or-text> \
@@ -156,6 +162,12 @@ if [ -n "${HEADLESSCODE_MAX_COST_USD:-}" ]; then
 fi
 if [ -n "${HEADLESSCODE_MAX_DURATION_MS:-}" ]; then
     BUDGET_ARG="$BUDGET_ARG --max-duration-ms '$HEADLESSCODE_MAX_DURATION_MS'"
+fi
+
+# Decision escalation: forward the env var as a CLI flag too (visible in
+# harness.log), same rationale as the budget args above.
+if [ -n "${HEADLESSCODE_DECISION_TIMEOUT_MS:-}" ]; then
+    BUDGET_ARG="$BUDGET_ARG --decision-timeout-ms '$HEADLESSCODE_DECISION_TIMEOUT_MS'"
 fi
 
 WRAPPER="
