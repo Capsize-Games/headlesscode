@@ -12,6 +12,7 @@ import assert from "node:assert/strict"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 
 import { HeadlessSession } from "../loop.js"
 import { createHeadlessExecutor } from "../../tools/executor.js"
@@ -101,6 +102,29 @@ async function assertCompletedCleanup(ws: string, expectedStatus: string): Promi
 	const records = await readUsageFile(path.join(usageDir, jsonl))
 	assert.equal(records.length, 1)
 	assert.equal(records[0].status, expectedStatus)
+}
+
+async function exists(p: string): Promise<boolean> {
+	try {
+		await fs.access(p)
+		return true
+	} catch {
+		return false
+	}
+}
+
+/** Poll `process.kill(pid, 0)` until the process is gone (throws) or timeout. */
+async function waitForProcessExit(pid: number, timeoutMs = 5_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs
+	while (Date.now() < deadline) {
+		try {
+			process.kill(pid, 0)
+		} catch {
+			return // gone
+		}
+		await sleep(50)
+	}
+	throw new Error(`process ${pid} still alive after ${timeoutMs}ms`)
 }
 
 async function makeSession(options: {
@@ -409,6 +433,79 @@ async function testLiveSnapshotRemovedOnBudgetExceeded(): Promise<void> {
 	}
 }
 
+// ─── execute_command timeout semantics ───────────────────────────────────────
+
+async function testTimeoutDoesNotCountAsMistake(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-timeout-"))
+	try {
+		// consecutiveErrorLimit: 1 means a SINGLE mistaken tool call ends the
+		// session in bounded failure. The execute_command times out (its child
+		// is left running in the background) and must NOT count as a mistake —
+		// so the session still reaches attempt_completion and succeeds.
+		const client = new FakeLlmClient([
+			() => toolCall("execute_command", { command: "node -e 'setTimeout(()=>{},5000)'", timeout: 1 }),
+			() => toolCall("attempt_completion", { result: "backgrounded it and moved on" }),
+		])
+		const session = await makeSession({
+			task: "start a long process and continue",
+			client,
+			workspaceRoot: ws,
+			consecutiveErrorLimit: 1,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `timeout must not be a mistake, got ${JSON.stringify(result)}`)
+		assert.match(result.result ?? "", /backgrounded/)
+		// The tool message fed back to the model is the timeout marker, and it
+		// must NOT be an error message (no "[Error]" prefix).
+		const toolMsg = session.state.messages.find((m) => m.role === "tool")
+		assert.ok(toolMsg, "expected a tool message in history")
+		assert.match(toolMsg?.content ?? "", /timed out after 1s/, "timeout marker must be fed back to the model")
+		assert.doesNotMatch(toolMsg?.content ?? "", /^\[Error\]/, "a timeout must not look like an error to the model")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testSessionEndReapsBackgroundedChildren(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-reap-"))
+	try {
+		// The execute_command times out and its child is left running in the
+		// background (it would write a marker after 60s). The session then
+		// completes normally. At session end the teardown hook (dispose in
+		// run()'s finally) must hard-kill the backgrounded child — NOT leave
+		// it orphaned past its session.
+		const marker = path.join(ws, "leftover-marker.txt")
+		const client = new FakeLlmClient([
+			() =>
+				toolCall("execute_command", {
+					command:
+						`node -e 'console.log("pid=" + process.pid); ` +
+						`setTimeout(() => require("fs").writeFileSync(${JSON.stringify(marker)}, "done"), 60000)'`,
+					timeout: 1,
+				}),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({ task: "start then finish", client, workspaceRoot: ws })
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+
+		// Recover the backgrounded pid from the tool result fed back to the model.
+		const toolMsg = session.state.messages.find((m) => m.role === "tool")
+		const pidMatch = toolMsg?.content?.match(/pid=(\d+)/)
+		assert.ok(pidMatch, "tool result should contain the backgrounded pid")
+		const pid = Number(pidMatch[1])
+		assert.ok(Number.isInteger(pid) && pid > 0, "could not extract the backgrounded pid")
+
+		// The session has ended: the child must have been killed by the
+		// teardown hook, so it is no longer alive and can never write its marker.
+		await waitForProcessExit(pid)
+		assert.equal(await exists(marker), false, "killed backgrounded child must never write its marker")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -422,6 +519,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["live snapshot: removed on successful completion", testLiveSnapshotRemovedOnSuccess],
 	["live snapshot: removed when the session ends with an error", testLiveSnapshotRemovedOnError],
 	["live snapshot: removed when the session is aborted by budget limits", testLiveSnapshotRemovedOnBudgetExceeded],
+	["execute_command: a timed-out call does NOT count toward the consecutive-mistake limit", testTimeoutDoesNotCountAsMistake],
+	["execute_command: session end reaps backgrounded children (no orphans left behind)", testSessionEndReapsBackgroundedChildren],
 ]
 
 async function main(): Promise<void> {
