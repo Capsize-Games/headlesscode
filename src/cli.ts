@@ -33,6 +33,8 @@ interface CliOptions {
 	task?: string
 	taskFile?: string
 	workspace?: string
+	/** Explicit session id override (set by the dashboard's session-launch endpoint). */
+	sessionId?: string
 	model?: string
 	maxIterations?: number
 	consecutiveErrorLimit?: number
@@ -107,6 +109,10 @@ Options:
   --task <text>              The task description for the agent
   --task-file <path>         Read the task from a file (relative to workspace)
   --workspace <root>         Workspace root (default: $HEADLESSCODE_WORKSPACE_ROOT or cwd)
+  --session-id <id>          Explicit session id override (default: a fresh UUID).
+                             Used by the dashboard's session-launch endpoint so
+                             the browser can open the session's event view
+                             immediately; rarely needed from a terminal.
   --model <id>               OpenRouter model id (default: $OPENROUTER_MODEL or deepseek/deepseek-chat)
   --max-iterations <n>       Loop iteration cap (default: 50)
   --consecutive-error-limit <n>  Consecutive mistakes before giving up (default: 3)
@@ -209,7 +215,8 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 			case "--task-file":
 			case "--workspace":
 			case "--model":
-			case "--log-file": {
+			case "--log-file":
+			case "--session-id": {
 				const value = next()
 				if (value === undefined) {
 					return { options, error: `Missing value for ${flag}` }
@@ -232,6 +239,9 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 						break
 					case "--log-file":
 						options.logFile = value
+						break
+					case "--session-id":
+						options.sessionId = value
 						break
 				}
 				break
@@ -546,6 +556,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 
 	const session = new HeadlessSession({
 		workspaceRoot,
+		sessionId: options.sessionId,
 		mode: options.mode,
 		model,
 		taskText,

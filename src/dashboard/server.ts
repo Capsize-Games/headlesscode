@@ -1,7 +1,8 @@
 /**
  * Cost/token dashboard — plain `node:http` server (workstream 3) + live
  * per-session events + pause/resume control (live worker monitoring) +
- * per-mode model settings (mode-model-assignment).
+ * per-mode model settings (mode-model-assignment) + browser control-plane
+ * (session launch + answer).
  *
  * ZERO new UI/framework dependencies, matching this project's established
  * "plain fs + JSON, no schema library" ethos (see `src/orchestrator/state.ts`'s
@@ -15,12 +16,16 @@
  *   POST /api/session/:id/resume  remove `.harness.pause-requested` (worker resumes)
  *   GET  /api/settings/mode-models?repo=<path>   current mode-models.json content ({} if absent)
  *   POST /api/settings/mode-models?repo=<path>   validate + write mode-models.json (creates .headlesscode/)
+ *   POST /api/session/start       launch a detached top-level session (see src/dashboard/session-launch.ts)
+ *   POST /api/session/:id/answer  write `.harness.decision-answer` to unblock an escalated question
+ *   GET  /api/modes?repo=<path>   merged available modes (.roomodes + global) for the mode selector
  *
- * NOTE (Phase 3 scope change): the dashboard is no longer purely read-only.
- * The POST routes above write/remove files in the target worktree/repo — a
- * control action, not just observability. Still local-only / no-auth (binds
- * 127.0.0.1), but if this endpoint is ever exposed beyond localhost, that
- * assumption needs revisiting — no auth was added here.
+ * NOTE (control plane): the POST /api/session/start route can launch real,
+ * billed work and run arbitrary shell via `gh`/`orchestrate` from a form
+ * POST — a bigger step across the read-only-to-control line than the
+ * pause/resume or settings POSTs were individually. Still local-only /
+ * no-auth (binds 127.0.0.1), but if this endpoint is ever exposed beyond
+ * localhost, that assumption needs revisiting — no auth was added here.
  */
 
 import * as fsp from "node:fs/promises"
@@ -29,6 +34,8 @@ import * as path from "node:path"
 
 import { buildSummary, findSessionEventsFile, readSessionEvents } from "./aggregate.js"
 import { renderPage } from "./page.js"
+import { answerSessionDecision, launchSession, validateSessionStartBody } from "./session-launch.js"
+import { loadCustomModes } from "../engine/prompt.js"
 import {
 	MODE_MODELS_CONFIG_FILE,
 	loadModeModelsFile,
@@ -44,6 +51,22 @@ export interface DashboardServerOptions {
 	port: number
 	/** Repo root to scan for usage files + .orchestrator-state.json (optional). */
 	repo?: string
+	/**
+	 * Optional control-plane bearer token. When set, POST routes under
+	 * /api/session/* require `Authorization: Bearer <token>`. Unset (default)
+	 * = today's behavior: no auth at all. Deliberately optional — a real auth
+	 * system is a separate, deliberate project-owner decision (see the header
+	 * note); this is a cheap hook, not a substitute.
+	 */
+	token?: string
+	/**
+	 * CLI invocation for POST /api/session/start (default "npx tsx src/cli.ts").
+	 * Test-only injection point so the HTTP layer can be exercised against a
+	 * tiny fake script instead of the real CLI; not a public config surface.
+	 */
+	cli?: string
+	/** Directory the launched CLI runs in (default: process.cwd()). Test-only. */
+	repoRoot?: string
 }
 
 /** Start the dashboard HTTP server. Resolves once it's listening. */
@@ -67,6 +90,21 @@ async function handleRequest(
 	options: DashboardServerOptions,
 ): Promise<void> {
 	const url = new URL(req.url ?? "/", "http://127.0.0.1")
+
+	// Optional control-plane token (HEADLESSCODE_DASHBOARD_TOKEN — see
+	// DashboardServerOptions.token). When configured, every POST under
+	// /api/session/* (start/pause/resume/answer) requires the bearer header.
+	// Unset = no auth, exactly today's behavior.
+	if (options.token && req.method === "POST" && url.pathname.startsWith("/api/session/")) {
+		const auth = req.headers.authorization ?? ""
+		const expected = `Bearer ${options.token}`
+		if (auth !== expected) {
+			res.writeHead(401, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ error: "unauthorized — set Authorization: Bearer <token>" }),
+			)
+			return
+		}
+	}
 
 	// Live session detail: GET /api/session/:id/events?since=<offset>&repo=<path>
 	const eventsMatch = /^\/api\/session\/([^/]+)\/events$/.exec(url.pathname)
@@ -137,6 +175,122 @@ async function handleRequest(
 			}
 			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(
 				JSON.stringify({ sessionId, action, ok: true, worktree: found.source }),
+			)
+		} catch (error) {
+			res
+				.writeHead(500, { "content-type": "application/json; charset=utf-8" })
+				.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+		}
+		return
+	}
+
+	// Launch a top-level session (browser control plane): POST /api/session/start
+	// spawns a detached `npx tsx src/cli.ts --task ... --mode ... --workspace ...`
+	// background process (see src/dashboard/session-launch.ts) and returns the
+	// new session's id immediately, so the browser can open its live event view
+	// before the first event exists. repo defaults to the dashboard's --repo;
+	// mode defaults to multi-agent-orchestrator-headless.
+	if (url.pathname === "/api/session/start" && req.method !== "POST") {
+		res.writeHead(405, { "content-type": "text/plain" }).end("Method Not Allowed")
+		return
+	}
+	if (url.pathname === "/api/session/start" && req.method === "POST") {
+		try {
+			const raw = await readJsonBody(req)
+			let body: unknown
+			try {
+				body = JSON.parse(raw || "{}")
+			} catch (err) {
+				res
+					.writeHead(400, { "content-type": "application/json; charset=utf-8" })
+					.end(JSON.stringify({ error: `invalid JSON body: ${err instanceof Error ? err.message : String(err)}` }))
+				return
+			}
+			const validationError = validateSessionStartBody(body)
+			if (validationError) {
+				res
+					.writeHead(400, { "content-type": "application/json; charset=utf-8" })
+					.end(JSON.stringify({ error: validationError }))
+				return
+			}
+			const start = body as { task: string; repo?: string; mode?: string }
+			const repo = start.repo?.trim() || options.repo
+			if (!repo) {
+				res
+					.writeHead(400, { "content-type": "application/json; charset=utf-8" })
+					.end(
+						JSON.stringify({
+							error: "missing repo — pass 'repo' in the body or start the dashboard with --repo",
+						}),
+					)
+				return
+			}
+			const launched = await launchSession({
+				workspace: repo,
+				task: start.task,
+				mode: start.mode,
+				cli: options.cli,
+				repoRoot: options.repoRoot,
+			})
+			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(JSON.stringify(launched))
+		} catch (error) {
+			res
+				.writeHead(500, { "content-type": "application/json; charset=utf-8" })
+				.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+		}
+		return
+	}
+
+	// Answer a blocked session's escalated question (browser control plane):
+	// POST /api/session/:id/answer writes `.harness.decision-answer` in the
+	// session's workspace root, which ask_followup_question polls for (see
+	// src/tools/executor.ts). Works for ANY session — worker or top-level —
+	// because the marker mechanism doesn't know who answers it.
+	const answerMatch = /^\/api\/session\/([^/]+)\/answer$/.exec(url.pathname)
+	if (answerMatch && req.method !== "POST") {
+		res.writeHead(405, { "content-type": "text/plain" }).end("Method Not Allowed")
+		return
+	}
+	if (answerMatch && req.method === "POST") {
+		const sessionId = decodeURIComponent(answerMatch[1])
+		const repo = url.searchParams.get("repo") || options.repo
+		if (!repo) {
+			res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ error: "missing repo — pass ?repo=<path> or start the dashboard with --repo" }),
+			)
+			return
+		}
+		try {
+			const found = await findSessionEventsFile(repo, sessionId)
+			if (!found) {
+				res.writeHead(404, { "content-type": "application/json; charset=utf-8" }).end(
+					JSON.stringify({ error: `no session ${sessionId} found under ${repo}` }),
+				)
+				return
+			}
+			const raw = await readJsonBody(req)
+			let body: unknown
+			try {
+				body = JSON.parse(raw || "{}")
+			} catch (err) {
+				res
+					.writeHead(400, { "content-type": "application/json; charset=utf-8" })
+					.end(JSON.stringify({ error: `invalid JSON body: ${err instanceof Error ? err.message : String(err)}` }))
+				return
+			}
+			const answer = (body as { answer?: unknown })?.answer
+			if (typeof answer !== "string" || answer.trim() === "") {
+				res
+					.writeHead(400, { "content-type": "application/json; charset=utf-8" })
+					.end(JSON.stringify({ error: "missing or empty 'answer' — provide the answer text to unblock the session" }))
+				return
+			}
+			// The marker lives in the worktree that owns the session's events
+			// feed (same resolution pause/resume uses above).
+			const worktreeRoot = found.source === "." ? path.resolve(repo) : path.resolve(repo, found.source)
+			await answerSessionDecision(worktreeRoot, answer.trim())
+			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ sessionId, ok: true, worktree: found.source }),
 			)
 		} catch (error) {
 			res
@@ -227,6 +381,31 @@ async function handleRequest(
 		try {
 			const summary = await buildSummary(options.repo)
 			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(JSON.stringify(summary))
+		} catch (error) {
+			res
+				.writeHead(500, { "content-type": "application/json; charset=utf-8" })
+				.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+		}
+		return
+	}
+
+	// Available modes for the "start a session" mode selector: the project's
+	// own .roomodes merged with global ~/.roo/custom_modes.yaml (same loader
+	// the CLI uses — see src/engine/prompt.ts). The selector falls back to a
+	// plain text input when this is unavailable, so a failure here is a
+	// non-fatal degradation, not an error page.
+	if (url.pathname === "/api/modes") {
+		const repo = url.searchParams.get("repo") || options.repo
+		if (!repo) {
+			res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ error: "missing repo — pass ?repo=<path> or start the dashboard with --repo" }),
+			)
+			return
+		}
+		try {
+			const customModes = await loadCustomModes(repo)
+			const modes = customModes.map((m) => ({ slug: m.slug, name: m.name ?? m.slug, source: m.source ?? "unknown" }))
+			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(JSON.stringify({ modes }))
 		} catch (error) {
 			res
 				.writeHead(500, { "content-type": "application/json; charset=utf-8" })

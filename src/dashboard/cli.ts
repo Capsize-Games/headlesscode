@@ -31,9 +31,19 @@ Options:
                  the server runs).
   --help         Show this help and exit
 
+Environment:
+  HEADLESSCODE_DASHBOARD_TOKEN  Optional bearer token for the control-plane
+                 POST routes (/api/session/start|pause|resume|answer). Unset
+                 (default) = no auth. Local-only tool; see the notes below.
+
 Notes:
-  Binds to 127.0.0.1 only — no auth, local-only tool. Never expose this
-  port beyond localhost.
+  Binds to 127.0.0.1 only — no auth unless HEADLESSCODE_DASHBOARD_TOKEN is
+  set. Never expose this port beyond localhost.
+  IMPORTANT (browser control plane): the "start a session" endpoint spawns
+  the CLI as a detached child that INHERITS this process's environment — it
+  does NOT re-source .env. Export OPENROUTER_API_KEY (e.g. 'set -a; source
+  .env; set +a') before starting the dashboard, or launched sessions will
+  fail immediately with an OpenRouter auth error.
 `
 
 interface DashboardCliOptions {
@@ -107,7 +117,11 @@ export async function dashboardMain(argv: string[]): Promise<number> {
 	}
 
 	try {
-		await startDashboardServer({ port: options.port, repo: options.repo })
+		await startDashboardServer({
+			port: options.port,
+			repo: options.repo,
+			token: process.env.HEADLESSCODE_DASHBOARD_TOKEN || undefined,
+		})
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err)
 		if ((err as NodeJS.ErrnoException)?.code === "EADDRINUSE") {

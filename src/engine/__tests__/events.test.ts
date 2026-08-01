@@ -73,6 +73,43 @@ async function makeSession(options: {
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 /**
+ * The dashboard's session-launch endpoint generates the session id FIRST and
+ * passes it to the CLI via --session-id (HeadlessSessionConfig.sessionId).
+ * Prove the override is honored: the events feed must land at exactly that
+ * id, not a fresh UUID — otherwise the browser's immediate open of
+ * /api/session/:id/events would point at a file that never gets written.
+ */
+async function testExplicitSessionIdOverrideIsHonored(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-events-sid-"))
+	try {
+		const client = new FakeLlmClient([() => toolCall("attempt_completion", { result: "done" })])
+		const session = new HeadlessSession({
+			workspaceRoot: ws,
+			mode: "code",
+			model: "fake-model",
+			taskText: "do a thing",
+			sessionId: "dashboard-chosen-id-123",
+			llmClient: client,
+			maxIterations: 5,
+			checkpoints: false,
+		})
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+
+		// The events file must be exactly the overridden id, not a UUID.
+		const evDir = eventsDir(ws)
+		const files = await fs.readdir(evDir)
+		assert.deepEqual(files, ["dashboard-chosen-id-123.jsonl"], `expected the overridden id, got: ${files.join(", ")}`)
+
+		const events = await readEventsFile(eventsFilePath(ws, "dashboard-chosen-id-123"))
+		assert.equal(events[0].sessionId, "dashboard-chosen-id-123")
+		assert.equal(events[events.length - 1].type, "session_end")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+/**
  * A real session (tool call once, then complete) must write an events file
  * with the full lifecycle sequence in order:
  *   session_start, iteration_start, llm_response, tool_call, tool_result,
@@ -323,6 +360,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 		"events: full lifecycle sequence (session_start … session_end) with token usage incl. cachedTokens",
 		testEventSequenceWithToolThenCompletion,
 	],
+	["events: explicit sessionId override is honored (feed lands at the dashboard-chosen id)", testExplicitSessionIdOverrideIsHonored],
 	["events: long tool results are truncated with a marker, never dumped in full", testLongContentIsTruncated],
 	["events: feed file is KEPT after the session ends (unlike the live usage snapshot)", testEventFeedKeptAfterSessionEnds],
 	["events: ask_followup_question mirrors decision_blocked/decision_answered on the feed", testDecisionEventsMirrorMarkerLifecycle],
