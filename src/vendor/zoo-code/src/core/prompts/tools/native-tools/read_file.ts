@@ -142,7 +142,17 @@ export function createReadFileTool(options: ReadFileToolOptions = {}): OpenAI.Ch
 		function: {
 			name: "read_file",
 			description,
-			strict: true,
+			// PATCHED (headlesscode, not upstream): `strict: true` was set here
+			// while `required` only lists `path` — `mode`, `offset`, `limit`,
+			// and `indentation` are all genuinely optional and NOT required,
+			// which violates OpenAI's own strict-mode contract (when
+			// strict:true, every property must be in `required`). Lenient
+			// hosts silently tolerate this; DeepSeek's official API endpoint
+			// validates it correctly and rejects the whole request with
+			// HTTP 400 the moment this tool is included — confirmed live,
+			// 2026-08-01. `read_command_output.ts` right next to this file
+			// already disables strict mode for exactly this reason (see its
+			// own comment) — this is the same fix, just missed here upstream.
 			parameters: {
 				type: "object",
 				properties,
