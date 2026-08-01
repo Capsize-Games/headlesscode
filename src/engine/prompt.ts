@@ -23,6 +23,7 @@
  */
 
 import * as path from "node:path"
+import * as os from "node:os"
 import * as fsp from "node:fs/promises"
 import * as yaml from "yaml"
 
@@ -66,7 +67,7 @@ export const EXECUTABLE_TOOL_NAMES = new Set([
 	"ask_followup_question",
 ])
 
-// ─── .roomodes loading ───────────────────────────────────────────────────────
+// ─── custom modes loading (project .roomodes + global ~/.roo/custom_modes.yaml) ──
 
 const PROBLEMATIC_CHARS_REGEX =
 	// eslint-disable-next-line no-misleading-character-class
@@ -94,15 +95,19 @@ function cleanInvisibleCharacters(content: string): string {
 }
 
 /**
- * Load and validate `<workspaceRoot>/.roomodes` (YAML, JSON fallback), mirroring
- * the vendored `CustomModesManager.loadModesFromFile` behaviour but reading from
- * the headless workspace root directly. Returns [] when no file exists.
+ * Parse + validate a custom-modes settings file (YAML, JSON fallback), mirroring
+ * the vendored `CustomModesManager.loadModesFromFile` behaviour. Non-fatal:
+ * a missing file returns [], a malformed/unparseable file logs an error and
+ * returns [] (never throws). Used for both the project `.roomodes` and the
+ * global `~/.roo/custom_modes.yaml`.
+ *
+ * @param filePath absolute path of the modes file to read
+ * @param source   "project" for `.roomodes`, "global" for `custom_modes.yaml`
  */
-export async function loadCustomModes(workspaceRoot: string): Promise<ModeConfig[]> {
-	const roomodesPath = path.join(workspaceRoot, ".roomodes")
+async function loadModesFromFile(filePath: string, source: "project" | "global"): Promise<ModeConfig[]> {
 	let raw: string
 	try {
-		raw = await fsp.readFile(roomodesPath, "utf-8")
+		raw = await fsp.readFile(filePath, "utf-8")
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
 			return []
@@ -122,7 +127,7 @@ export async function loadCustomModes(workspaceRoot: string): Promise<ModeConfig
 		try {
 			parsed = JSON.parse(raw) ?? {}
 		} catch {
-			console.error(`[headlesscode] Failed to parse .roomodes at ${roomodesPath}: ${String(yamlError)}`)
+			console.error(`[headlesscode] Failed to parse ${path.basename(filePath)} at ${filePath}: ${String(yamlError)}`)
 			return []
 		}
 	}
@@ -136,11 +141,46 @@ export async function loadCustomModes(workspaceRoot: string): Promise<ModeConfig
 		const issues = result.error.issues
 			.map((issue) => `• ${issue.path.join(".")}: ${issue.message}`)
 			.join("\n")
-		console.error(`[headlesscode] .roomodes schema validation failed at ${roomodesPath}:\n${issues}`)
+		console.error(`[headlesscode] ${path.basename(filePath)} schema validation failed at ${filePath}:\n${issues}`)
 		return []
 	}
 
-	return result.data.customModes.map((mode) => ({ ...mode, source: "project" as const }))
+	return result.data.customModes.map((mode) => ({ ...mode, source }))
+}
+
+/**
+ * Load the merged set of custom modes for a workspace: the project's own
+ * `.roomodes` first (project wins on slug collision), then the global
+ * `~/.roo/custom_modes.yaml` for any slug the project does NOT define —
+ * the same precedence model as the vendored
+ * `CustomModesManager.mergeCustomModes`. A missing or malformed global file
+ * degrades exactly like a missing/malformed `.roomodes` (returns [] for that
+ * source, logs, never throws).
+ */
+export async function loadCustomModes(workspaceRoot: string): Promise<ModeConfig[]> {
+	const projectModes = await loadModesFromFile(path.join(workspaceRoot, ".roomodes"), "project")
+	const globalModes = await loadModesFromFile(path.join(os.homedir(), ".roo", "custom_modes.yaml"), "global")
+
+	const slugs = new Set<string>()
+	const merged: ModeConfig[] = []
+
+	// Project modes first — they take precedence over same-slug global modes.
+	for (const mode of projectModes) {
+		if (!slugs.has(mode.slug)) {
+			slugs.add(mode.slug)
+			merged.push(mode)
+		}
+	}
+
+	// Global modes fill in everything the project does not define.
+	for (const mode of globalModes) {
+		if (!slugs.has(mode.slug)) {
+			slugs.add(mode.slug)
+			merged.push(mode)
+		}
+	}
+
+	return merged
 }
 
 // ─── Context stand-in ────────────────────────────────────────────────────────
