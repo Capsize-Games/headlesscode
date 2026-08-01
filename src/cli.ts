@@ -21,6 +21,7 @@ import { orchestrateMain } from "./orchestrator/cli.js"
 import { watchMain } from "./watcher/cli.js"
 import { checkpointsMain } from "./checkpoints/cli.js"
 import { dashboardMain } from "./dashboard/cli.js"
+import { resolvePermissions, type PermissionsConfig } from "./permissions/config.js"
 
 const VERSION = "0.1.0"
 
@@ -47,6 +48,14 @@ interface CliOptions {
 	checkpointDir?: string
 	/** Decision escalation timeout, ms (also $HEADLESSCODE_DECISION_TIMEOUT_MS). */
 	decisionTimeoutMs?: number
+	/** Permissions: comma-separated command prefixes allowed to run (also $HEADLESSCODE_ALLOWED_COMMANDS). */
+	allowedCommands?: string
+	/** Permissions: comma-separated command prefixes never allowed (also $HEADLESSCODE_DENIED_COMMANDS). */
+	deniedCommands?: string
+	/** Permissions: comma-separated protected-file globs (also $HEADLESSCODE_PROTECTED_FILES). */
+	protectedFiles?: string
+	/** Permissions escape hatch: allow writes to protected files (default: false). */
+	allowProtectedWrites: boolean
 }
 
 const USAGE = `headlesscode — headless coding-agent harness (Phase 1 engine)
@@ -99,9 +108,26 @@ Options:
                              ~/.headlesscode/checkpoints — MUST be outside the
                              workspace; see docs/checkpoints.md)
   --decision-timeout-ms <n>  How long ask_followup_question blocks waiting for
-                             a human/orchestrator answer before falling back
-                             to autonomous decision, ms (default 1800000 / 30
-                             min). Default: $HEADLESSCODE_DECISION_TIMEOUT_MS
+                               a human/orchestrator answer before falling back
+                               to autonomous decision, ms (default 1800000 / 30
+                               min). Default: $HEADLESSCODE_DECISION_TIMEOUT_MS
+  --allowed-commands <list>  Comma-separated command prefixes the agent may run.
+                               Default: $HEADLESSCODE_ALLOWED_COMMANDS, else
+                               .headlesscode/permissions.json, else empty (=
+                               allow everything except --denied-commands)
+  --denied-commands <list>   Comma-separated command prefixes that are ALWAYS
+                               refused (deny wins over allow; dangerous shell
+                               substitutions are always blocked regardless).
+                               Default: $HEADLESSCODE_DENIED_COMMANDS, else
+                               .headlesscode/permissions.json, else empty
+  --protected-files <list>   Comma-separated glob patterns of files the agent may
+                               not write. Default: $HEADLESSCODE_PROTECTED_FILES,
+                               else .headlesscode/permissions.json, else
+                               ".env,.env.*,*.pem,*.key,id_rsa*"
+  --allow-protected-writes   Escape hatch: permit writes to protected files
+                               (default: OFF). Also settable via
+                               "allowProtectedWrites": true in
+                               .headlesscode/permissions.json
   --version                  Print version and exit
   --help                     Show this help and exit
 
@@ -113,6 +139,10 @@ Environment:
   HEADLESSCODE_WORKSPACE_ROOT  Default workspace root
   HEADLESSCODE_MEMORY_DIR    Default memory dir (memory enabled when set)
   HEADLESSCODE_PROJECT       Project scope for memory (default: workspace basename)
+  HEADLESSCODE_ALLOWED_COMMANDS   Default --allowed-commands (comma-separated)
+  HEADLESSCODE_DENIED_COMMANDS    Default --denied-commands (comma-separated)
+  HEADLESSCODE_PROTECTED_FILES    Default --protected-files (comma-separated globs)
+  HEADLESSCODE_ALLOW_PROTECTED_WRITES  Allow protected-file writes ("1"/"true")
 `
 
 export function parseArgs(argv: string[]): { options: CliOptions; error?: string } {
@@ -123,6 +153,7 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 		version: false,
 		help: false,
 		noCheckpoints: false,
+		allowProtectedWrites: false,
 	}
 
 	for (let i = 0; i < argv.length; i++) {
@@ -216,14 +247,33 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 				options.decisionTimeoutMs = num
 				break
 			}
-			case "--memory-dir": {
+			case "--memory-dir":
+			case "--allowed-commands":
+			case "--denied-commands":
+			case "--protected-files": {
 				const value = next()
 				if (value === undefined) {
-					return { options, error: "Missing value for --memory-dir" }
+					return { options, error: `Missing value for ${flag}` }
 				}
-				options.memoryDir = value
+				switch (flag) {
+					case "--memory-dir":
+						options.memoryDir = value
+						break
+					case "--allowed-commands":
+						options.allowedCommands = value
+						break
+					case "--denied-commands":
+						options.deniedCommands = value
+						break
+					case "--protected-files":
+						options.protectedFiles = value
+						break
+				}
 				break
 			}
+			case "--allow-protected-writes":
+				options.allowProtectedWrites = true
+				break
 			case "--checkpoint-dir": {
 				const value = next()
 				if (value === undefined) {
@@ -385,6 +435,26 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// Off (undefined) falls back to executor.ts's own default (30 min).
 	const decisionTimeoutMs = options.decisionTimeoutMs ?? envNumber("HEADLESSCODE_DECISION_TIMEOUT_MS")
 
+	// Permissions (command allow/deny + protected files): CLI flags > env vars
+	// > <workspaceRoot>/.headlesscode/permissions.json > built-in defaults.
+	// A malformed permissions.json fails loudly (mirrors HEADLESSCODE_PRICING_JSON).
+	let permissions: PermissionsConfig
+	try {
+		permissions = resolvePermissions({
+			workspaceRoot,
+			overrides: {
+				allowedCommands: options.allowedCommands,
+				deniedCommands: options.deniedCommands,
+				protectedFiles: options.protectedFiles,
+				allowProtectedWrites: options.allowProtectedWrites ? true : null,
+			},
+			env: process.env,
+		})
+	} catch (err) {
+		process.stderr.write(`headlesscode: ${err instanceof Error ? err.message : String(err)}\n`)
+		return 2
+	}
+
 	const session = new HeadlessSession({
 		workspaceRoot,
 		mode: options.mode,
@@ -400,6 +470,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		checkpoints: !options.noCheckpoints,
 		checkpointDir: options.checkpointDir,
 		decisionTimeoutMs,
+		permissions,
 	})
 
 	const result = await session.run()

@@ -26,6 +26,9 @@ import { setTimeout as sleep } from "node:timers/promises"
 import "../vendor/zoo-code/src/utils/path.js"
 
 import type { ToolContext, ToolHandler, ToolResult } from "../engine/types.js"
+import { checkCommand, type CommandRefusal } from "../permissions/commands.js"
+import { findMatchingPattern } from "../permissions/protected-files.js"
+import { resolvePermissions, type PermissionsConfig } from "../permissions/config.js"
 
 /** Cap on tool-result text fed back to the model (keep context bounded). */
 export const MAX_RESULT_CHARS = 30_000
@@ -42,17 +45,30 @@ export interface ToolExecutorOptions {
 	decisionTimeoutMs?: number
 	/** ask_followup_question poll interval, ms (default 5s — override in tests). */
 	decisionPollIntervalMs?: number
+	/**
+	 * Resolved permissions (command allow/deny + protected files). When absent
+	 * the executor resolves them itself from env vars +
+	 * `<workspaceRoot>/.headlesscode/permissions.json` + built-in defaults, so
+	 * executors constructed without CLI flags (reviewer/QA, tests) still
+	 * enforce the repo's committed policy.
+	 */
+	permissions?: PermissionsConfig
 }
 
 export class ToolExecutor {
 	private readonly handlers = new Map<string, ToolHandler>()
 	private pauseBudgetClock: (() => void) | undefined
 	private resumeBudgetClock: (() => void) | undefined
+	/** Resolved permissions handed to every handler call (see ToolExecutorOptions.permissions). */
+	readonly permissions: PermissionsConfig
 
 	constructor(
 		readonly workspaceRoot: string,
 		private readonly options: ToolExecutorOptions = {},
-	) {}
+	) {
+		this.permissions =
+			options.permissions ?? resolvePermissions({ workspaceRoot: this.workspaceRoot, env: process.env })
+	}
 
 	register(name: string, handler: ToolHandler): void {
 		this.handlers.set(name, handler)
@@ -88,6 +104,7 @@ export class ToolExecutor {
 		try {
 			return await handler(args, {
 				workspaceRoot: this.workspaceRoot,
+				permissions: this.permissions,
 				decisionTimeoutMs: this.options.decisionTimeoutMs,
 				decisionPollIntervalMs: this.options.decisionPollIntervalMs,
 				pauseBudgetClock: this.pauseBudgetClock,
@@ -138,6 +155,41 @@ function ok(content: string): ToolResult {
 
 function err(content: string): ToolResult {
 	return { content: truncate(`[Error] ${content}`), isError: true }
+}
+
+/**
+ * Build the model-facing refusal message for a blocked execute_command. The
+ * tone matches the other err(...) messages in this file: name what was
+ * refused and why, and give a well-behaved model a concrete way to adjust.
+ */
+function refusalMessage(command: string, refusal: CommandRefusal): ToolResult {
+	switch (refusal.kind) {
+		case "dangerous":
+			return err(
+				`execute_command: refusing to run '${command}': it contains a dangerous shell substitution pattern ` +
+					`(e.g. \${var@P}, \${!var}, <<<\$(...), =(...), or *(e:...:)) which is ALWAYS blocked and cannot be ` +
+					`allow-listed or configured away. Rewrite the command without shell parameter-expansion tricks.`,
+			)
+		case "malformed":
+			return err(
+				`execute_command: refusing to run '${command}': malformed command (` +
+					`${refusal.parseError?.message ?? "shell syntax error"}) — a shell syntax error is never auto-approved. ` +
+					`Fix the quoting and retry.`,
+			)
+		case "denied":
+			return err(
+				`execute_command: refusing to run '${command}': sub-command '${refusal.subCommand}' is denied by the ` +
+					`permissions policy (matches denied pattern '${refusal.pattern}'). Adjust your approach; this command ` +
+					`is not permitted even if other parts of the chain are allowed.`,
+			)
+		case "not_allowed":
+			return err(
+				`execute_command: refusing to run '${command}': sub-command '${refusal.subCommand}' is not in the ` +
+					`allowed-commands list and cannot be auto-approved in this headless session. Add it via ` +
+					`--allowed-commands, HEADLESSCODE_ALLOWED_COMMANDS, or <workspaceRoot>/.headlesscode/permissions.json, ` +
+					`or adjust your approach.`,
+			)
+	}
 }
 
 function truncate(content: string): string {
@@ -239,6 +291,25 @@ function writeToFileHandler(args: Record<string, unknown>, ctx: ToolContext): Pr
 		const target = safeTarget(ctx, filePath)
 		const rel = path.relative(ctx.workspaceRoot, target).toPosix() || path.basename(target)
 
+		// Permissions: refuse writes to protected files (secret/credential
+		// patterns) unless the escape hatch — --allow-protected-writes or
+		// "allowProtectedWrites": true in .headlesscode/permissions.json — is
+		// explicitly on (OFF by default). Naming the matched pattern gives a
+		// well-behaved model a concrete reason to stop. A refusal is a real
+		// tool error (isError: true) and counts toward the consecutive-mistake
+		// bound, exactly like any other tool failure.
+		if (!ctx.permissions.allowProtectedWrites) {
+			const matchedPattern = findMatchingPattern(rel, ctx.permissions.protectedFiles)
+			if (matchedPattern !== null) {
+				return err(
+					`write_to_file: refusing to write protected file '${rel}' (matches protected pattern '${matchedPattern}'). ` +
+						`This file is protected by the harness permissions policy and cannot be overwritten. If this write is ` +
+						`genuinely required, re-run with --allow-protected-writes (or set "allowProtectedWrites": true in ` +
+						`<workspaceRoot>/.headlesscode/permissions.json); it is OFF by default.`,
+				)
+			}
+		}
+
 		try {
 			await fsp.mkdir(path.dirname(target), { recursive: true })
 			await fsp.writeFile(target, content, "utf-8")
@@ -259,6 +330,20 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 		if (args.cwd != null && args.cwd !== "") {
 			const cwdArg = requireString(args, "cwd")
 			cwd = safeTarget(ctx, cwdArg)
+		}
+
+		// Permissions gate (command allow/deny + dangerous substitution):
+		// refuse BEFORE spawning so nothing is ever executed. Compound
+		// commands are checked per sub-command (parseCommand splits on
+		// &&/||/;/|/&) — a denied or unallow-listed sub-command blocks the
+		// whole chain. This applies to every executor built on this handler,
+		// including the read-only reviewer/QA executors (they share it), which
+		// also run unattended and could otherwise run arbitrary commands. A
+		// refusal is a real tool error (isError: true) and therefore counts
+		// toward the loop's consecutive-mistake bound, same as any tool error.
+		const refusal = checkCommand(command, ctx.permissions.allowedCommands, ctx.permissions.deniedCommands)
+		if (refusal !== null) {
+			return refusalMessage(command, refusal)
 		}
 
 		return new Promise<ToolResult>((resolve) => {

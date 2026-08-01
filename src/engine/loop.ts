@@ -40,6 +40,7 @@ import { randomUUID } from "node:crypto"
 import { BudgetExceededError, BudgetTracker, type SessionBudget } from "../budget/budget.js"
 import { DEFAULT_MODEL } from "../llm/openrouter.js"
 import { createHeadlessExecutor, ToolExecutor } from "../tools/executor.js"
+import type { PermissionsConfig } from "../permissions/config.js"
 import { buildRollingSummary, extractSessionSummary } from "../memory/summarizer.js"
 import type { MemoryStore, RecallResult } from "../memory/types.js"
 import { createCheckpointService, type CheckpointService } from "../checkpoints/service.js"
@@ -119,6 +120,12 @@ export interface HeadlessSessionConfig {
 	 * custom `executor` is injected (its own options win).
 	 */
 	decisionTimeoutMs?: number
+	/**
+	 * Resolved permissions (command allow/deny + protected files). Optional:
+	 * when absent the executor resolves its own from env vars +
+	 * `<workspaceRoot>/.headlesscode/permissions.json` + built-in defaults.
+	 */
+	permissions?: PermissionsConfig
 }
 
 export interface SessionRunState {
@@ -158,6 +165,8 @@ export interface ResolvedSessionConfig {
 	checkpointDir?: string
 	/** Decision escalation timeout, ms (see HeadlessSessionConfig.decisionTimeoutMs). */
 	decisionTimeoutMs?: number
+	/** Permissions, when explicitly resolved by the caller (else executor resolves). */
+	permissions?: PermissionsConfig
 }
 
 /** Phase 3: memory activity recorded for the last `run()` (null when off/failed). */
@@ -219,13 +228,17 @@ export class HeadlessSession {
 			checkpoints: config.checkpoints ?? true,
 			checkpointDir: config.checkpointDir,
 			decisionTimeoutMs: config.decisionTimeoutMs,
+			permissions: config.permissions,
 		}
 
 		this.llmClient = config.llmClient
 		this.logger = config.logger ?? new Logger({ level: "info" })
 		this.executor =
 			config.executor ??
-			createHeadlessExecutor(config.workspaceRoot, { decisionTimeoutMs: this.config.decisionTimeoutMs })
+			createHeadlessExecutor(config.workspaceRoot, {
+				decisionTimeoutMs: this.config.decisionTimeoutMs,
+				permissions: this.config.permissions,
+			})
 		this.sessionId = randomUUID()
 		this.checkpointsActive = this.config.checkpoints && this.executor.has("write_to_file")
 		this.state = {
