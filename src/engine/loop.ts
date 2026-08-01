@@ -576,7 +576,7 @@ export class HeadlessSession {
 				})
 				this.logger.warn("[loop] empty reply counted as mistake", { consecutiveMistakes })
 				if (consecutiveMistakes >= consecutiveErrorLimit) {
-					return this.boundedFailure("empty replies", iteration, toolCalls, consecutiveMistakes)
+					return this.boundedFailure("consecutive empty replies", iteration, toolCalls, consecutiveMistakes)
 				}
 				continue
 			}
@@ -799,7 +799,7 @@ export class HeadlessSession {
 		this.logger.error("[loop] bounded failure", { reason, consecutiveMistakes })
 		return {
 			status: "error",
-			error: `Bounded failure: ${consecutiveMistakes} consecutive ${reason} (limit ${this.config.consecutiveErrorLimit})`,
+			error: `Bounded failure: ${consecutiveMistakes} ${reason} (limit ${this.config.consecutiveErrorLimit})`,
 			iterations,
 			toolCalls,
 		}
