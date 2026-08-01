@@ -15,16 +15,48 @@ parallel-worktrees.sh` and `scripts/run-worker.sh` are called directly,
 and `git rev-parse --show-toplevel` from inside this repo already resolves
 correctly.
 
-## No automatic review or rework loop
+## Two different pipelines live in one mode — know which one you're in
 
-Unlike an issue-driven round, this mode does not invoke the
-`deepseek-reviewer` mode automatically, and there is no automatic
-rework-on-finding loop (`headlesscode orchestrate`'s rework behavior, if it
-exists, is orchestrator-CLI-level and only applies to `orchestrate`'s own
-GitHub-issue-driven flow — direct `spawn-parallel-worktrees.sh` calls don't
-go through it). Review of each worker's result is a separate, deliberate
-step — either the user reviews the diff directly, or the `deepseek-reviewer`
-mode is invoked explicitly afterward. Don't assume "done" means "correct."
+This mode has two entry points (see the mode's own "Step 0" instructions):
+the **issue-driven path** (Step 0a splits/files issues, then Step 1 runs
+`headlesscode orchestrate --issue ...`) and the **direct task-file path**
+(Step 2 calls `scripts/spawn-parallel-worktrees.sh` directly against
+existing `plans/*.md` files). They behave differently in one important way:
+
+- **Issue-driven path**: `orchestrate` runs an automated review after each
+  group finishes, and — per the rework-loop work already built — will
+  automatically respawn a worker on the same worktree to address a
+  `"finding"` verdict, up to `--max-rework-cycles` (default 3), before
+  giving up and marking the group `"needs-human"`.
+- **Direct task-file path**: no automated review, no rework loop.
+  `spawn-parallel-worktrees.sh` calls don't go through `orchestrate`'s
+  review/rework machinery at all. Review of each worker's result is a
+  separate, deliberate step — the user reviews the diff directly, or the
+  `deepseek-reviewer` mode is invoked explicitly afterward.
+
+Either way, "done" is never the same as "correct" from this mode's own
+perspective — even the issue-driven path's automated review is a separate
+adversarial pass, not something you assert on the round's behalf.
+
+## Drafting and filing issues (Step 0a)
+
+- `gh` must be authenticated (`gh auth status`) — check before filing
+  anything, don't discover an auth problem partway through a batch.
+- `plans/issues/<NN>-<slug>.md` drafts + `plans/issues/INDEX.md` +
+  `plans/issues/.filed.json` (the idempotency ledger) are working files
+  for this pipeline, not permanent project docs — unlike `plans/*.md`
+  work-order files, which are meant to be read by an external agent as a
+  standalone spec, these are an internal handoff between your own Step 0a
+  and Step 1. The ledger is NOT the source of truth for what's been filed
+  — GitHub is. If the ledger looks stale (an issue number it records has
+  since been closed/deleted), trust `gh issue view <n>` over the ledger,
+  and tell the user what looked inconsistent rather than silently
+  "fixing" it.
+- Splitting issues into parallel groups is inherited from
+  `src/orchestrator/split.ts`, not something to hand-tune by filing issues
+  in a contrived order or trying to influence grouping some other way. If
+  a `--dry-run` preview looks wrong, the fix is retitling/redrafting the
+  issue (back in Step 0a), not working around the split logic.
 
 ## Requirements
 
