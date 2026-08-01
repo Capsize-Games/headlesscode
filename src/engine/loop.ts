@@ -104,9 +104,10 @@ export interface HeadlessSessionConfig {
 	 * `src/checkpoints/service.ts`) at session start and after every iteration
 	 * that executed at least one tool call, so edits can be reverted. Default
 	 * ON, but only actually runs when the executor is edit-capable (has
-	 * `write_to_file` registered) — read-only executors (reviewer/QA) have
-	 * nothing to checkpoint. Checkpoint failures are always non-fatal (logged
-	 * as a warning, session continues).
+	 * `write_to_file`, `apply_diff`, `search_replace` or `edit_file`
+	 * registered) — read-only executors (reviewer/QA) have nothing to
+	 * checkpoint. Checkpoint failures are always non-fatal (logged as a
+	 * warning, session continues).
 	 */
 	checkpoints?: boolean
 	/** Shadow-git storage dir override (default: `<workspaceRoot>/.headlesscode/checkpoints`). */
@@ -227,7 +228,17 @@ export class HeadlessSession {
 			config.executor ??
 			createHeadlessExecutor(config.workspaceRoot, { decisionTimeoutMs: this.config.decisionTimeoutMs })
 		this.sessionId = randomUUID()
-		this.checkpointsActive = this.config.checkpoints && this.executor.has("write_to_file")
+		// Checkpoints are active when the executor is edit-capable: write_to_file
+		// OR any of the surgical edit tools (apply_diff / search_replace /
+		// edit_file). An iteration that used ONLY a diff tool must still snapshot
+		// the workspace — those are edits too. Read-only executors (reviewer/QA)
+		// have none of these and nothing to checkpoint.
+		this.checkpointsActive =
+			this.config.checkpoints &&
+			(this.executor.has("write_to_file") ||
+				this.executor.has("apply_diff") ||
+				this.executor.has("search_replace") ||
+				this.executor.has("edit_file"))
 		this.state = {
 			systemPrompt: "",
 			messages: [],

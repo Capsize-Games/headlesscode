@@ -15,6 +15,7 @@ export * from "./tool.js"
 export * from "./mode.js"
 export * from "./todo.js"
 export * from "./vscode.js"
+export * from "./global-settings.js"
 
 export type { ClineAsk, ToolProgressStatus } from "./message.js"
 export type { GenerateImageParams, ReadFileToolParams } from "./tool-params.js"

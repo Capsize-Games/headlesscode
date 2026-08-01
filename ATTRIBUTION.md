@@ -28,6 +28,17 @@ The following material in this repository is derived from
   which snapshots the workspace into a hidden git repo (via `simple-git`)
   after every tool-executing turn so edits can be reverted; see
   `docs/checkpoints.md`.
+- **Diff-based editing** — the multi-search-replace fuzzy diff engine
+  (`src/vendor/zoo-code/src/core/diff/strategies/multi-search-replace.ts`,
+  a verbatim copy of `zoo-code/src/core/diff/strategies/multi-search-replace.ts`),
+  plus its pure helpers `zoo-code/src/utils/text-normalization.ts` and the
+  line-number helpers extracted from
+  `zoo-code/src/integrations/misc/extract-text.ts`, and the
+  `DEFAULT_DIFF_FUZZY_THRESHOLD` constant from
+  `zoo-code/packages/types/src/global-settings.ts`. These back the headless
+  harness's `apply_diff` tool (the tool schemas for `apply_diff` /
+  `search_replace` / `edit_file` were already vendored under
+  `src/vendor/zoo-code/src/core/prompts/tools/native-tools/`).
 
 Source: **https://github.com/Zoo-Code-Org/Zoo-Code**
 License: **Apache-2.0** · Copyright **2026 Zoo Code**.
