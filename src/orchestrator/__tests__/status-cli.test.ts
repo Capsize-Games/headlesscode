@@ -208,7 +208,10 @@ async function testWaitReturnsWhenAllGroupsDone(): Promise<void> {
 	assert.equal(result.allDone, true)
 	assert.equal(result.timedOut, false)
 	assert.equal(result.state.groups[0].status, "done")
-	assert.ok(result.elapsedMs >= 10, `waited for the transition, got ${result.elapsedMs}ms`)
+	// Floor of one poll interval (5ms): with a ms-resolution clock the expected
+	// ~10ms of real time (2 polls x 5ms) can truncate to 9ms and flake; the
+	// `calls >= 3` assertion below already proves it polled past the first read.
+	assert.ok(result.elapsedMs >= 5, `waited for the transition, got ${result.elapsedMs}ms`)
 	assert.ok(calls >= 3, `polled until terminal, got ${calls} reads`)
 }
 
