@@ -114,6 +114,12 @@ export interface ToolExecutorOptions {
 	 * mirror them on its event feed (see ToolContext.onDecisionEvent).
 	 */
 	onDecisionEvent?: (eventType: "decision_blocked" | "decision_answered", fields: Record<string, unknown>) => void
+	/**
+	 * Live todo-list monitoring: fired each time update_todo_list replaces the
+	 * session's checklist (see ToolContext.onTodoEvent). The session mirrors
+	 * it on its event feed as `todo_updated`.
+	 */
+	onTodoEvent?: (fields: { todos: string; done: number; inProgress: number; pending: number }) => void
 }
 
 export class ToolExecutor {
@@ -127,6 +133,12 @@ export class ToolExecutor {
 	 * never be keyed by object identity, or no two calls would ever collide.
 	 */
 	private readonly readCache = new Map<string, ReadFileCacheEntry>()
+	/**
+	 * Session-scoped todo list state (see TodoListState below). update_todo_list
+	 * always REPLACES the whole checklist, so this holds only the latest one.
+	 * Conversational/session state — NEVER written to a workspace file.
+	 */
+	private readonly todoList = new TodoListState()
 	/** Resolved permissions handed to every handler call (see ToolExecutorOptions.permissions). */
 	readonly permissions: PermissionsConfig
 
@@ -172,6 +184,27 @@ export class ToolExecutor {
 		)
 	}
 
+	/**
+	 * Register update_todo_list wired to THIS executor's session-scoped todo
+	 * state, surfacing each state change via the onTodoEvent option (the
+	 * session mirrors it as a `todo_updated` feed event). Must be called by
+	 * the headless construction path; read-only executors (reviewer/QA/local
+	 * explore) deliberately leave it unregistered — their tool lists never
+	 * advertise it either, so it stays an inert stub there.
+	 */
+	registerTodoList(): void {
+		this.register("update_todo_list", (args, ctx) => updateTodoListHandler(args, ctx, this.todoList))
+	}
+
+	/**
+	 * Snapshot of the session's current todo list, or undefined before the
+	 * first update_todo_list call. Read-only accessor — the dashboard /
+	 * observability side can query live planning state without touching it.
+	 */
+	getTodoList(): TodoListSnapshot | undefined {
+		return this.todoList.snapshot()
+	}
+
 	async execute(name: string, args: Record<string, unknown>): Promise<ToolResult> {
 		const handler = this.handlers.get(name)
 		if (!handler) {
@@ -189,6 +222,7 @@ export class ToolExecutor {
 				pauseBudgetClock: this.pauseBudgetClock,
 				resumeBudgetClock: this.resumeBudgetClock,
 				onDecisionEvent: this.options.onDecisionEvent,
+				onTodoEvent: this.options.onTodoEvent,
 			})
 		} catch (err) {
 			return {
@@ -711,11 +745,11 @@ async function applyDiffHandler(args: Record<string, unknown>, ctx: ToolContext)
 // ─── search_replace — strict literal one-occurrence replacement ──────────────
 
 /**
-	* search_replace — a literal string replacement requiring old_string to match
-	* EXACTLY once (the core safety property: never guess which occurrence the
-	* model meant). Normalizes line endings to LF for matching, mirroring the
-	* upstream SearchReplaceTool.
-	*/
+	 * search_replace — a literal string replacement requiring old_string to match
+	 * EXACTLY once (the core safety property: never guess which occurrence the
+	 * model meant). Normalizes line endings to LF for matching, mirroring the
+	 * upstream SearchReplaceTool.
+	 */
 async function searchReplaceHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
 	const filePath = requireString(args, "file_path")
 	const oldString = requireString(args, "old_string")
@@ -781,9 +815,9 @@ async function searchReplaceHandler(args: Record<string, unknown>, ctx: ToolCont
 type LineEnding = "\r\n" | "\n"
 
 /**
-	* Count occurrences of a substring in a string (non-overlapping).
-	* Ported verbatim from upstream EditFileTool.ts.
-	*/
+	 * Count occurrences of a substring in a string (non-overlapping).
+	 * Ported verbatim from upstream EditFileTool.ts.
+	 */
 function countOccurrences(str: string, substr: string): number {
 	if (substr === "") return 0
 	let count = 0
@@ -796,9 +830,9 @@ function countOccurrences(str: string, substr: string): number {
 }
 
 /**
-	* Safely replace all occurrences of a literal string, handling $ escape
-	* sequences. Ported verbatim from upstream EditFileTool.ts.
-	*/
+	 * Safely replace all occurrences of a literal string, handling $ escape
+	 * sequences. Ported verbatim from upstream EditFileTool.ts.
+	 */
 function safeLiteralReplace(str: string, oldString: string, newString: string): string {
 	if (oldString === "" || !str.includes(oldString)) {
 		return str
@@ -828,10 +862,10 @@ function escapeRegExp(input: string): string {
 }
 
 /**
-	* Whitespace-tolerant regex: treats runs of horizontal whitespace and
-	* cross-line whitespace as flexible, so minor formatting drift still matches.
-	* Ported verbatim from upstream EditFileTool.ts.
-	*/
+	 * Whitespace-tolerant regex: treats runs of horizontal whitespace and
+	 * cross-line whitespace as flexible, so minor formatting drift still matches.
+	 * Ported verbatim from upstream EditFileTool.ts.
+	 */
 function buildWhitespaceTolerantRegex(oldLF: string): RegExp {
 	if (oldLF === "") {
 		return new RegExp("(?!)", "g")
@@ -858,9 +892,9 @@ function buildWhitespaceTolerantRegex(oldLF: string): RegExp {
 }
 
 /**
-	* Token-based regex: matches the non-whitespace tokens in order, separated by
-	* any whitespace. Ported verbatim from upstream EditFileTool.ts.
-	*/
+	 * Token-based regex: matches the non-whitespace tokens in order, separated by
+	 * any whitespace. Ported verbatim from upstream EditFileTool.ts.
+	 */
 function buildTokenRegex(oldLF: string): RegExp {
 	const tokens = oldLF.split(/\s+/).filter(Boolean)
 	if (tokens.length === 0) {
@@ -877,12 +911,12 @@ function countRegexMatches(content: string, regex: RegExp): number {
 }
 
 /**
-	* edit_file — literal string replacement resilient to formatting drift via the
-	* fallback chain exact → whitespace-tolerant → token-based, with an optional
-	* `expected_replacements` count (default 1). Also creates new files when
-	* old_string is "" (failing clearly if the file already exists). Mirrors the
-	* upstream EditFileTool; the file's original line endings are preserved.
-	*/
+	 * edit_file — literal string replacement resilient to formatting drift via the
+	 * fallback chain exact → whitespace-tolerant → token-based, with an optional
+	 * `expected_replacements` count (default 1). Also creates new files when
+	 * old_string is "" (failing clearly if the file already exists). Mirrors the
+	 * upstream EditFileTool; the file's original line endings are preserved.
+	 */
 async function editFileHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
 	// Coerce old_string/new_string to handle malformed native calls that pass
 	// non-strings (upstream normalizes those to "" to avoid later crashes).
@@ -1341,6 +1375,109 @@ async function askFollowupQuestionHandler(args: Record<string, unknown>, ctx: To
 	return autonomousDecisionError(question)
 }
 
+// ─── update_todo_list (structured planning aid) ─────────────────────────────
+
+/** Status of one checklist line — matches the vendored tool's vocabulary. */
+export type TodoStatus = "pending" | "in_progress" | "completed"
+
+/** One parsed checklist item. */
+export interface TodoItem {
+	content: string
+	status: TodoStatus
+}
+
+/**
+	 * Full session todo state, as surfaced by `onTodoEvent` / `getTodoList()`.
+	 * `todos` is the normalized full checklist (every line, exactly as stored).
+	 */
+export interface TodoListSnapshot {
+	todos: string
+	done: number
+	inProgress: number
+	pending: number
+}
+
+/**
+	 * Session-scoped todo list state. update_todo_list always REPLACES the whole
+	 * list (per the vendored tool contract: "Always provide the full list; the
+	 * system will overwrite the previous one"), so state is just the latest
+	 * parsed checklist + derived counts. In-memory conversational state only —
+	 * never written to a workspace file.
+	 */
+class TodoListState {
+	todos = ""
+	done = 0
+	inProgress = 0
+	pending = 0
+
+	snapshot(): TodoListSnapshot | undefined {
+		if (this.todos === "") {
+			return undefined
+		}
+		return { todos: this.todos, done: this.done, inProgress: this.inProgress, pending: this.pending }
+	}
+
+	replace(todos: string, done: number, inProgress: number, pending: number): void {
+		this.todos = todos
+		this.done = done
+		this.inProgress = inProgress
+		this.pending = pending
+	}
+}
+
+/**
+	 * Parse a markdown checklist into items + the normalized list. Tolerant of
+	 * `-`/`*`/`+` or no list marker, and of `[ ]` / `[x]` / `[X]` / `[-]`.
+	 * Lines that don't look like checklist items are preserved in the normalized
+	 * output (so an update never silently drops content) but excluded from the
+	 * counts, mirroring the vendored tool's single-level checklist format.
+	 */
+export function parseTodoList(todos: string): { items: TodoItem[]; normalized: string } {
+	const items: TodoItem[] = []
+	const lines: string[] = []
+	for (const raw of todos.split(/\r?\n/)) {
+		const line = raw.trimEnd()
+		lines.push(line)
+		const m = /^\s*(?:[-*+]\s+)?\[(.)\]\s*(.*)$/.exec(line)
+		if (!m) {
+			continue
+		}
+		const marker = m[1]
+		let status: TodoStatus = "pending"
+		if (marker === "x" || marker === "X") {
+			status = "completed"
+		} else if (marker === "-") {
+			status = "in_progress"
+		}
+		const content = m[2].trim()
+		if (content !== "") {
+			items.push({ content, status })
+		}
+	}
+	return { items, normalized: lines.join("\n") }
+}
+
+/**
+	 * The update_todo_list handler (vendored schema: `{todos: string}`, strict,
+	 * required). Stores the full checklist as session state and echoes the
+	 * normalized list + counts back, so the model sees exactly what was stored.
+	 * Fires `onTodoEvent` on every call so the session can surface a
+	 * `todo_updated` feed event for observability.
+	 */
+function updateTodoListHandler(args: Record<string, unknown>, ctx: ToolContext, state: TodoListState): ToolResult {
+	const todos = requireString(args, "todos")
+	const { items, normalized } = parseTodoList(todos)
+	const done = items.filter((i) => i.status === "completed").length
+	const inProgress = items.filter((i) => i.status === "in_progress").length
+	const pending = items.filter((i) => i.status === "pending").length
+
+	state.replace(normalized, done, inProgress, pending)
+
+	ctx.onTodoEvent?.({ todos: normalized, done, inProgress, pending })
+
+	return ok(`TODO list updated (${done} completed, ${inProgress} in progress, ${pending} pending):\n${normalized}`)
+}
+
 /** Stub for vendored tools that the headless harness does not implement. */
 function stubHandler(name: string, implemented: readonly string[] = ["read_file", "write_to_file", "apply_diff", "search_replace", "edit_file", "execute_command", "list_files", "codebase_search"]): ToolHandler {
 	const available = [...implemented].sort().join(", ")
@@ -1479,6 +1616,7 @@ const IMPLEMENTED_TOOLS = new Set([
 	"go_to_definition",
 	"find_references",
 	"import_graph",
+	"update_todo_list",
 ])
 
 /**
@@ -1503,6 +1641,7 @@ export function createHeadlessExecutor(workspaceRoot: string, options: ToolExecu
 	executor.register("go_to_definition", goToDefinitionHandler)
 	executor.register("find_references", findReferencesHandler)
 	executor.register("import_graph", importGraphHandler)
+	executor.registerTodoList()
 
 	executor.register("attempt_completion", attemptCompletionHandler)
 	executor.register("ask_followup_question", askFollowupQuestionHandler)

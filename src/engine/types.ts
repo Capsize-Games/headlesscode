@@ -153,6 +153,15 @@ export interface ToolContext {
 	 * wired (plain executor use, tests without a session).
 	 */
 	onDecisionEvent?: (eventType: "decision_blocked" | "decision_answered", fields: Record<string, unknown>) => void
+	/**
+	 * Live todo-list monitoring: fired each time update_todo_list replaces the
+	 * session's checklist (see the handler in src/tools/executor.ts), carrying
+	 * the full normalized checklist plus done/in-progress/pending counts, so
+	 * the session can mirror it on its structured event feed (`todo_updated`).
+	 * Absent when no hook was wired (plain executor use, tests without a
+	 * session).
+	 */
+	onTodoEvent?: (fields: { todos: string; done: number; inProgress: number; pending: number }) => void
 }
 
 /** A tool handler: dispatch any registered tool by name. */

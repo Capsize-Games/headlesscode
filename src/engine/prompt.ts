@@ -74,6 +74,10 @@ export const EXECUTABLE_TOOL_NAMES = new Set([
 	"codebase_search",
 	"attempt_completion",
 	"ask_followup_question",
+	// The structured-planning aid (see src/vendor/zoo-code/.../update_todo_list.ts).
+	// Vendored ALWAYS_AVAILABLE_TOOLS already includes it for every mode's
+	// allowedNames; this is the final gate that makes it executable/advertised.
+	"update_todo_list",
 ])
 
 // ─── custom modes loading (project .roomodes + global ~/.roo/custom_modes.yaml) ──

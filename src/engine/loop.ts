@@ -463,6 +463,21 @@ export class HeadlessSession {
 						fields,
 					)
 				},
+				// Live worker monitoring: mirror each update_todo_list state
+				// change on the session's event feed (todo_updated). Non-fatal.
+				onTodoEvent: (fields) => {
+					void this.emitEvent(
+						"todo_updated",
+						() =>
+							this.eventFeed.todoUpdated({
+								todos: fields.todos,
+								done: fields.done,
+								inProgress: fields.inProgress,
+								pending: fields.pending,
+							}),
+						fields,
+					)
+				},
 			})
 		this.sessionId = config.sessionId?.trim() ? config.sessionId.trim() : randomUUID()
 		this.eventHook = config.eventHook
@@ -1553,6 +1568,10 @@ export function summarizeToolArg(name: string, args: Record<string, unknown>): s
 			return str(args.path)
 		case "execute_command":
 			return str(args.command)?.slice(0, 200)
+		case "update_todo_list":
+			// The checklist body, clipped so a long planning list doesn't spam
+			// the event/feed view (the todo_updated event carries full counts).
+			return str(args.todos)?.slice(0, 200)
 		default:
 			return undefined
 	}

@@ -13,13 +13,17 @@
  * Event types emitted by HeadlessSession (see src/engine/loop.ts):
  *   session_start / iteration_start / llm_response / tool_call / tool_result
  *   checkpoint_saved / decision_blocked / decision_answered
- *   condensed / paused / resumed / session_end
+ *   condensed / todo_updated / paused / resumed / session_end
  *
  * `condensed` is the one structural event that was originally only a log line
  * (`[condense] oldest turns condensed…` in src/engine/condense.ts) — the
  * dashboard's timeline view needs it as a real event to mark where the
  * session compressed its history, so it is emitted by HeadlessSession when a
  * condensation pass actually replaces the oldest turns.
+ *
+ * `todo_updated` (update_todo_list: full normalized checklist + counts —
+ * done / inProgress / pending; the dashboard reads this to render live
+ * planning state)
  *
  * Unlike the live usage snapshot (deleted at session end because the final
  * .jsonl record supersedes it), the event feed is a history/replay log and is
@@ -267,6 +271,23 @@ export class EventFeed {
 			...(fields.inputTokens !== undefined ? { inputTokens: fields.inputTokens } : {}),
 			...(fields.outputTokens !== undefined ? { outputTokens: fields.outputTokens } : {}),
 			...(fields.cachedTokens !== undefined ? { cachedTokens: fields.cachedTokens } : {}),
+		})
+	}
+
+	/**
+	 * Todo-list state change (update_todo_list): the full normalized checklist
+	 * (truncated like every other large field) plus done / in-progress /
+	 * pending counts, so the dashboard can show live planning state and the
+	 * history can show how the checklist evolved across the session.
+	 */
+	todoUpdated(fields: { todos: string; done: number; inProgress: number; pending: number }): Promise<void> {
+		const t = truncateField(fields.todos)
+		return this.emit("todo_updated", {
+			todos: t.text,
+			...(t.truncated ? { todosTruncated: true } : {}),
+			done: fields.done,
+			inProgress: fields.inProgress,
+			pending: fields.pending,
 		})
 	}
 
