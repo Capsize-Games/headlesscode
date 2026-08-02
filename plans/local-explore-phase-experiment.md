@@ -36,25 +36,44 @@ one model's judgment ends and the other's begins.
 
 **Real VRAM/context measurements taken live on the project owner's actual
 hardware, 2026-08-02** (`ollama ps` after loading `qwen3.5:9b` at increasing
-`num_ctx`):
+`num_ctx`). Flash attention + KV cache quantization
+(`OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_KV_CACHE_TYPE=q8_0`) are now the
+PERMANENT Ollama config on this machine (persisted in `/etc/init.d/ollama`,
+survives reboot — re-verify this is still true in your environment, don't
+assume it wasn't reverted):
 
-| context tokens | VRAM (100% GPU) |
-|---|---|
-| 4,096 | 8.6 GB |
-| 8,192 | 8.8 GB |
-| 32,768 | 9.9 GB |
-| 65,536 | 11 GB |
-| 131,072 | 14 GB |
+| context tokens | qwen3.5:9b alone | + qwen3-embedding:8b also resident |
+|---|---|---|
+| 4,096 | 8.6 GB | — |
+| 8,192 | 8.7 GB | 14.9 GB (coexist OK) |
+| 12,288–24,576 | 8.8–9.2 GB | ~15.0–15.4 GB (coexist OK) |
+| 28,672 | 9.3 GB | ~15.5 GB (coexist OK, the observed edge) |
+| 32,768 | 9.5 GB | **evicts one model** (confirmed live — Ollama swaps rather than exceed VRAM) |
+| 131,072 | 12 GB | n/a — exploration model alone at this size |
 
-The model's nominal max context (262,144 per `ollama show`) would almost
-certainly exceed the 16GB card entirely — extrapolate the growth rate
-yourself before assuming otherwise. **The real, safe operating ceiling on
-this hardware is roughly 32K-64K tokens, not the model's headline number.**
-This is a hard constraint on the design, not a tuning nicety: whatever you
-build must default to a context budget inside this range and must not
-silently let a local session's history grow past what the hardware can
-actually hold. Re-verify these numbers yourself live before relying on
-them — Ollama/driver versions can change this.
+**The coexistence boundary (~28K tokens), not the solo-model boundary
+(~131K), is the real constraint for this task** — the exploration phase's
+tool set includes `codebase_search` (see "What to build" below), which
+needs `qwen3-embedding:8b` loaded. If the exploration phase's context grows
+past ~28K while `codebase_search` might still be called, Ollama will evict
+one model to load the other, costing a real ~5-second reload on every
+switch between generation and embedding calls (confirmed live). Default the
+exploration phase's context budget to something safely under this edge
+(e.g. 24,576) — re-verify the real boundary live in your environment before
+picking a final default, these numbers can shift with driver/Ollama
+versions.
+
+The model's nominal max context (262,144 per `ollama show`) would still
+exceed the 16GB card even with quantization (confirmed live: 17GB, 86% CPU
+fallback) — nowhere close to usable. **The real, safe operating ceiling on
+this hardware, accounting for the embedding model needing to coexist, is
+~24-28K tokens, not the model's headline number and not even the
+solo-model ceiling.** This is a hard constraint on the design, not a tuning
+nicety: whatever you build must default to a context budget inside this
+range and must not silently let a local session's history grow past what
+the hardware can actually hold while keeping both models resident.
+Re-verify these numbers yourself live before relying on them — Ollama/
+driver versions can change this.
 
 **The design this leads to**: a bounded **local exploration phase** that
 runs BEFORE the cloud model's turn, using a read-only, side-effect-free tool
