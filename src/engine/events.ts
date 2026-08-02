@@ -13,7 +13,13 @@
  * Event types emitted by HeadlessSession (see src/engine/loop.ts):
  *   session_start / iteration_start / llm_response / tool_call / tool_result
  *   checkpoint_saved / decision_blocked / decision_answered
- *   paused / resumed / session_end
+ *   condensed / paused / resumed / session_end
+ *
+ * `condensed` is the one structural event that was originally only a log line
+ * (`[condense] oldest turns condensed…` in src/engine/condense.ts) — the
+ * dashboard's timeline view needs it as a real event to mark where the
+ * session compressed its history, so it is emitted by HeadlessSession when a
+ * condensation pass actually replaces the oldest turns.
  *
  * Unlike the live usage snapshot (deleted at session end because the final
  * .jsonl record supersedes it), the event feed is a history/replay log and is
@@ -236,6 +242,32 @@ export class EventFeed {
 	/** iteration 0 = the session's baseline checkpoint (before iteration 1). */
 	checkpointSaved(iteration: number): Promise<void> {
 		return this.emit("checkpoint_saved", { iteration })
+	}
+
+	/**
+	 * A context-condensation pass replaced the oldest turns with one synthetic
+	 * summary message (see src/engine/condense.ts). Carries the iteration whose
+	 * call triggered it, the message counts before/after, and the condensation
+	 * call's own token usage when known (the dashboard timeline marks the
+	 * point; the tokens make the spend visible — condensation was previously
+	 * only a log line, invisible to the feed).
+	 */
+	condensed(fields: {
+		iteration: number
+		messagesBefore: number
+		messagesAfter: number
+		inputTokens?: number
+		outputTokens?: number
+		cachedTokens?: number
+	}): Promise<void> {
+		return this.emit("condensed", {
+			iteration: fields.iteration,
+			messagesBefore: fields.messagesBefore,
+			messagesAfter: fields.messagesAfter,
+			...(fields.inputTokens !== undefined ? { inputTokens: fields.inputTokens } : {}),
+			...(fields.outputTokens !== undefined ? { outputTokens: fields.outputTokens } : {}),
+			...(fields.cachedTokens !== undefined ? { cachedTokens: fields.cachedTokens } : {}),
+		})
 	}
 
 	decisionBlocked(question: string, suggestions?: string[]): Promise<void> {

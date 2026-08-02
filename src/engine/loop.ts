@@ -361,6 +361,8 @@ export class HeadlessSession {
 	private readonly eventHook?: (eventType: string, fields: Record<string, unknown>) => void
 	/** The most recent LLM call's token usage (for the llm_response event). */
 	private lastLlmUsage: { inputTokens: number; outputTokens: number; cachedTokens: number } | null = null
+	/** The condensation call's token usage, stashed by recordCondensationUsage for the `condensed` event. */
+	private lastCondenseUsage: { inputTokens: number; outputTokens: number; cachedTokens: number } | null = null
 	/**
 	 * Phase 3 context condensation: how far the oldest turns have ALREADY
 	 * been condensed. Mutable OBJECT passed by reference into `maybeCondense`
@@ -826,6 +828,7 @@ export class HeadlessSession {
 	 * (constraint 2 — never invisible spend).
 	 */
 	private async maybeCondenseHistory(
+		iteration: number,
 		messages: ChatMessage[],
 		budgetTracker: BudgetTracker,
 	): Promise<ChatMessage[]> {
@@ -885,7 +888,24 @@ export class HeadlessSession {
 				// this.state.messages both see the condensed array — the
 				// sent prefix then stays stable across subsequent calls
 				// (never re-condense the same chunk).
+				const messagesBefore = messages.length
 				messages.splice(0, messages.length, ...condensed)
+				// Emit the feed event the timeline needs: condensation used to
+				// be only a log line, invisible to the dashboard. Non-fatal.
+				await this.emitEvent("condensed", () =>
+					this.eventFeed.condensed({
+						iteration,
+						messagesBefore,
+						messagesAfter: condensed.length,
+						...(this.lastCondenseUsage
+							? {
+									inputTokens: this.lastCondenseUsage.inputTokens,
+									outputTokens: this.lastCondenseUsage.outputTokens,
+									cachedTokens: this.lastCondenseUsage.cachedTokens,
+								}
+							: {}),
+					}),
+				)
 				return messages
 			}
 			return messages
@@ -921,6 +941,7 @@ export class HeadlessSession {
 		this.totalInputTokens += inputTokens
 		this.totalOutputTokens += outputTokens
 		this.totalCachedTokens += cachedTokens
+		this.lastCondenseUsage = { inputTokens, outputTokens, cachedTokens }
 		try {
 			budgetTracker.record({
 				model: this.config.condenseModel,
@@ -986,7 +1007,7 @@ export class HeadlessSession {
 			// call (constraint 2 — condensation spend is never invisible).
 			let requestMessages: ChatMessage[]
 			try {
-				requestMessages = await this.maybeCondenseHistory(messages, budgetTracker)
+				requestMessages = await this.maybeCondenseHistory(iteration, messages, budgetTracker)
 			} catch (err) {
 				if (err instanceof BudgetExceededError) {
 					return this.budgetFailure(err, iteration, toolCalls)
