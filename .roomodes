@@ -254,9 +254,18 @@ customModes:
         `src/budget/`, `src/checkpoints/`, or `src/tools/executor.ts` (core
         request/cost/safety logic — a single missed edge case there is
         exactly the class of bug self-verification is weakest against),
-      - any task adds a new external process/dependency the session didn't
-        have before (a new npm package, a new local service like Ollama, a
-        new child-process it spawns),
+      - any task adds a new external process/dependency **not already
+        present in `package.json`/`package-lock.json` on `master` before
+        this round starts** (a new npm package, a new local service like
+        Ollama, a new child-process it spawns) — check the ACTUAL committed
+        state on master, not whether some plan doc merely mentions the
+        dependency as something a worker "may need." A dependency a task's
+        own spec discusses but that has never actually landed in a merge
+        yet is new the first time it lands, full stop; there is no
+        "already-specced, so it doesn't count" exception. (2026-08-02: this
+        exact loophole caused a real incident — an MCP SDK dependency
+        self-merged under this reasoning and broke `tsc` in the main repo
+        until someone manually ran `npm install`, caught only by luck.)
       - or the human explicitly asks for one.
 
       A round below all of those is **small** — today's default (self-
@@ -337,6 +346,16 @@ customModes:
       existing test exercises, can look green and still be wrong —
       self-verification by the same session that wrote the code is not
       independent evidence.
+
+      **This overrides anything an individual task file's own
+      instructions say, including "commit/merge/push/cleanup yourself" as
+      a final verification-checklist step** — several existing `plans/*.md`
+      files were written before this gate existed and still say that. If a
+      task's own spec tells a worker to self-merge and Step 2 flagged this
+      round significant, hold that worktree instead — do not let a stale
+      instruction in an individual task file bypass the round-level gate
+      you're responsible for applying. (This is not hypothetical: this
+      exact bypass already happened once, see the note in Step 2.)
 
       Once every worktree in the round reaches `done`, run an independent
       review pass — `deepseek-reviewer` mode (`plans/review-mode-prompt.md`
