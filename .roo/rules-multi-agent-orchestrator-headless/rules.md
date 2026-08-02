@@ -15,6 +15,16 @@ parallel-worktrees.sh` and `scripts/run-worker.sh` are called directly,
 and `git rev-parse --show-toplevel` from inside this repo already resolves
 correctly.
 
+## Arriving here via a `switch_mode` handoff from 📐 Planning
+
+📐 Planning mode (`.roomodes`) gathers context, writes a fully
+self-contained `plans/<slug>.md` work order, confirms it with the user,
+then calls `switch_mode` into this mode — the user approves the switch
+(a real Zoo Code UI step, not silent), and this mode picks up mid-
+conversation with the plan doc already written above. Per this mode's own
+"Step 0": that's the already-scoped task-file case, go straight to Step 2
+— don't wait for a fresh instruction, the plan doc IS the instruction.
+
 ## Two different pipelines live in one mode — know which one you're in
 
 This mode has two entry points (see the mode's own "Step 0" instructions):
