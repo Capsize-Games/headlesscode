@@ -21,6 +21,7 @@ export type { WatchOptions, WatchSummary } from "./watch.js"
 export {
 	buildStatusSummary,
 	formatStatusText,
+	reconcileGroups,
 	verdictLine,
 	waitForTerminalState,
 	isTerminalStatus,
@@ -28,4 +29,12 @@ export {
 	DEFAULT_STATUS_POLL_INTERVAL_MS,
 	DEFAULT_STATUS_TIMEOUT_MS,
 } from "./status.js"
-export type { StatusSummary, StatusCounts, StatusGroupRow, WaitForTerminalOptions, WaitForTerminalResult } from "./status.js"
+export type {
+	StatusSummary,
+	StatusCounts,
+	StatusGroupRow,
+	WaitForTerminalOptions,
+	WaitForTerminalResult,
+	ReconcileHooks,
+	ReconcileResult,
+} from "./status.js"

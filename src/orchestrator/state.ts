@@ -13,7 +13,7 @@
  *         "branch": string,                  // "issues/w1-2026-07-31"
  *         "issues": number[],
  *         "task_file": string,
- *         "status": "spawned"|"running"|"done"|"failed"|"blocked"|"needs-human"|string,
+ *         "status": "spawned"|"running"|"done"|"failed"|"blocked"|"needs-human"|"orphaned"|string,
  *         "spawned": ISO timestamp,
  *         "last_activity": string | object,  // "last_commit"/"note" seen live
  *         "commits": string[],
@@ -41,12 +41,18 @@ export interface OrchestratorGroup {
 	issues?: number[]
 	task_file?: string
 	/**
-	 * spawned | running | done | failed | blocked | needs-human (loose: any
-	 * string is tolerated). `needs-human` is a TERMINAL state set by the
-	 * rework loop when a group exhausted its review-rework attempts — the
-	 * underlying problem was never fixed and a human must look at it. It is
-	 * deliberately distinct from `failed` (worker crash/stall) and from
-	 * `blocked` (waiting on a decision answer, not a rework cycle).
+	 * spawned | running | done | failed | blocked | needs-human | orphaned
+	 * (loose: any string is tolerated). `needs-human` is a TERMINAL state
+	 * set by the rework loop when a group exhausted its review-rework
+	 * attempts — the underlying problem was never fixed and a human must
+	 * look at it. It is deliberately distinct from `failed` (worker
+	 * crash/stall) and from `blocked` (waiting on a decision answer, not a
+	 * rework cycle). `orphaned` is a TERMINAL state written by
+	 * `orchestrate status`'s read-side reconciliation (status.ts): the
+	 * group's worktree is gone from disk and it never reached a terminal
+	 * status, so the real outcome cannot be determined from markers alone —
+	 * a human must investigate via git history. It is never guessed as
+	 * `done`/`failed`; surfacing the ambiguity honestly is the point.
 	 */
 	status: string
 	spawned?: string
