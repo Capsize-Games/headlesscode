@@ -395,7 +395,7 @@ export function renderPage(repo?: string): string {
     <h2>Start a session</h2>
     <div class="sub">Launch a top-level session as a detached background process (same CLI
       <code>scripts/run-worker.sh</code> uses). The event feed below opens immediately so you can
-      watch it start thinking. Requires <code>OPENROUTER_API_KEY</code> to be exported in the
+      watch it start thinking. Requires <code>HEADLESSCODE_OPENROUTER_API_KEY</code> to be exported in the
       dashboard process's environment (<code>set -a; source .env; set +a</code> before starting the
       dashboard) — launched sessions inherit it, they don't re-source <code>.env</code>.</div>
     <textarea id="launchTask" rows="3" placeholder="Describe the work, e.g. 'Split plans/realtime-monitoring.md into issues and orchestrate a round against them…'" style="width:100%"></textarea>

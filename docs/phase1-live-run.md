@@ -21,7 +21,7 @@ result against the Zoo Code baseline.
 | Node.js ≥ 18 | The harness uses the native `fetch` API and `tsx` to run TS directly. |
 | `npm install` (tsx, typescript) | Installs `tsx` (CLI runner) and `typescript` (type-checking). |
 | Git ≥ 2.28 | Needed for `git worktree add -b` and the per-session branch pattern. |
-| `OPENROUTER_API_KEY` | A valid OpenRouter API key (e.g. `sk-or-v1-...`). Required for every non-`--dry-run` invocation. |
+| `HEADLESSCODE_OPENROUTER_API_KEY` | A valid OpenRouter API key (e.g. `sk-or-v1-...`). Required for every non-`--dry-run` invocation. |
 | A target repo with issues | The repo you want the agent to work on — must already be cloned locally. |
 
 Optional but recommended:
@@ -58,7 +58,7 @@ git -C /path/to/repo worktree add -b fix/issue-29 /path/to/.worktrees/issue-29
 
 # 2. Run the harness against the worktree (see §3 for the full invocation)
 cd /path/to/headlesscode
-OPENROUTER_API_KEY=sk-or-... npx tsx src/cli.ts \
+HEADLESSCODE_OPENROUTER_API_KEY=sk-or-... npx tsx src/cli.ts \
   --task "<issue text, copied verbatim from GitHub>" \
   --mode code \
   --workspace /path/to/.worktrees/issue-29 \
@@ -106,7 +106,7 @@ git -C ~/Projects/<target-repo> worktree add -b fix/issue-N ~/Projects/<target-r
 ```bash
 cd /path/to/headlesscode
 
-export OPENROUTER_API_KEY=sk-or-v1-...        # required
+export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-v1-...        # required
 export OPENROUTER_MODEL=deepseek/deepseek-chat # optional (cheap default)
 
 npx tsx src/cli.ts \
@@ -152,7 +152,7 @@ This is how the offline integration test points the real client at
 
 ```bash
 OPENROUTER_BASE_URL=http://127.0.0.1:44193 \
-OPENROUTER_API_KEY=test-key \
+HEADLESSCODE_OPENROUTER_API_KEY=test-key \
 npx tsx src/cli.ts --task "fix the greet function" --workspace <worktree>
 ```
 
@@ -184,7 +184,7 @@ iteration/tool progress.
 | --- | --- |
 | `0` | Success — `attempt_completion` (or a text-only final answer) was received; the result is on stdout. |
 | `1` | Task failed — max iterations reached, consecutive-mistake bound tripped, or an LLM call failed/timed out. Details in stderr and the log. |
-| `2` | Usage / configuration error — bad arguments, missing `OPENROUTER_API_KEY` (unless `--dry-run`), empty task, unreadable `--task-file`, etc. |
+| `2` | Usage / configuration error — bad arguments, missing `HEADLESSCODE_OPENROUTER_API_KEY` (unless `--dry-run`), empty task, unreadable `--task-file`, etc. |
 
 ### `--dry-run` (validation without an API key)
 

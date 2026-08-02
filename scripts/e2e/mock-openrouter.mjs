@@ -10,7 +10,7 @@
  * `OPENROUTER_BASE_URL=http://127.0.0.1:<this port>`).
  *
  * Validates the `Authorization: Bearer <key>` header is present (any value is
- * accepted — the CLI only requires OPENROUTER_API_KEY to be set).
+ * accepted — the CLI only requires HEADLESSCODE_OPENROUTER_API_KEY to be set).
  *
  * Behavior is driven by a state machine, keyed off MOCK_SCENARIO:
  *

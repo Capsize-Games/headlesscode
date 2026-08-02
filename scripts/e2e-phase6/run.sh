@@ -116,7 +116,7 @@ sleep 0.2
 CONTROL_OUT="$(mktemp /tmp/headlesscode-e2e6-control-XXXXXX.out)"
 (
 	cd "$ROOT" &&
-		OPENROUTER_API_KEY="test" \
+		HEADLESSCODE_OPENROUTER_API_KEY="test" \
 		OPENROUTER_BASE_URL="http://127.0.0.1:$LLM_PORT" \
 		npx tsx src/cli.ts --task "Fix the greet bug" --workspace "$FIXTURE"
 ) >"$CONTROL_OUT" 2>&1
@@ -134,7 +134,7 @@ fi
 BUDGET_OUT="$(mktemp /tmp/headlesscode-e2e6-budget-XXXXXX.out)"
 (
 	cd "$ROOT" &&
-		OPENROUTER_API_KEY="test" \
+		HEADLESSCODE_OPENROUTER_API_KEY="test" \
 		OPENROUTER_BASE_URL="http://127.0.0.1:$LLM_PORT" \
 		HEADLESSCODE_MAX_COST_USD="0.00001" \
 		npx tsx src/cli.ts --task "Fix the greet bug" --workspace "$FIXTURE"

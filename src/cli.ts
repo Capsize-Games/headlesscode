@@ -267,7 +267,7 @@ Options:
   --help                     Show this help and exit
 
 Environment:
-  OPENROUTER_API_KEY         Required (except --dry-run)
+  HEADLESSCODE_OPENROUTER_API_KEY         Required (except --dry-run)
   OPENROUTER_MODEL           Default model id
   OPENROUTER_HTTP_REFERER    Optional HTTP-Referer header
   OPENROUTER_APP_TITLE       Optional X-Title header
@@ -623,11 +623,11 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	}
 
 	// ── real run: API key required ────────────────────────────────────────────
-	const apiKey = process.env.OPENROUTER_API_KEY
+	const apiKey = process.env.HEADLESSCODE_OPENROUTER_API_KEY
 	if (!apiKey) {
 		process.stderr.write(
-			"headlesscode: OPENROUTER_API_KEY is not set.\n" +
-				"  Export it (e.g. export OPENROUTER_API_KEY=sk-or-...) or use --dry-run to\n" +
+			"headlesscode: HEADLESSCODE_OPENROUTER_API_KEY is not set.\n" +
+				"  Export it (e.g. export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-...) or use --dry-run to\n" +
 				"  validate the prompt/config without calling the LLM.\n",
 		)
 		return 2

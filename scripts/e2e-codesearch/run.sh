@@ -111,7 +111,7 @@ TASK_TEXT='Where is the greet function and how does it handle the name argument?
 (
 	cd "$ROOT" &&
 		OPENROUTER_BASE_URL="http://127.0.0.1:$MOCK_PORT" \
-		OPENROUTER_API_KEY="test-key" \
+		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 		HEADLESSCODE_WORKSPACE_ROOT="$WORKTREE" \
 		npx tsx src/cli.ts --task "$TASK_TEXT" --mode code \
 			--workspace "$WORKTREE" --max-iterations 10

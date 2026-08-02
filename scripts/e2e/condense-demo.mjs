@@ -188,7 +188,7 @@ server.listen(0, "127.0.0.1", async () => {
 		env: {
 			...process.env,
 			OPENROUTER_BASE_URL: `http://127.0.0.1:${port}`,
-			OPENROUTER_API_KEY: "demo-key",
+			HEADLESSCODE_OPENROUTER_API_KEY: "demo-key",
 		},
 		stdio: ["ignore", "pipe", "pipe"],
 	})

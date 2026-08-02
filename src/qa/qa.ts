@@ -190,7 +190,7 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
 
 	const client =
 		llmClient ??
-		new OpenRouterClient({ apiKey: process.env.OPENROUTER_API_KEY, defaultModel: model, baseUrl })
+		new OpenRouterClient({ apiKey: process.env.HEADLESSCODE_OPENROUTER_API_KEY, defaultModel: model, baseUrl })
 
 	const session = new HeadlessSession({
 		workspaceRoot,

@@ -95,7 +95,7 @@ Options:
   --help                 Show this help and exit
 
 Environment:
-  OPENROUTER_API_KEY     Required for a real run (workers + reviewer + QA)
+  HEADLESSCODE_OPENROUTER_API_KEY     Required for a real run (workers + reviewer + QA)
   ORCHESTRATOR_MODE      Overrides --mode when set
   HEADLESSCODE_CLI       Overrides the spawner's CLI command
   HEADLESSCODE_MEMORY_DIR  Memory dir inherited by workers (unless --memory-dir overrides)
@@ -1036,9 +1036,9 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		return 0
 	}
 
-	if (!process.env.OPENROUTER_API_KEY) {
+	if (!process.env.HEADLESSCODE_OPENROUTER_API_KEY) {
 		process.stderr.write(
-			"headlesscode orchestrate: OPENROUTER_API_KEY is not set (workers + reviewer need it).\n" +
+			"headlesscode orchestrate: HEADLESSCODE_OPENROUTER_API_KEY is not set (workers + reviewer need it).\n" +
 				"  Use --dry-run to preview the plan without an API key.\n",
 		)
 		return 2

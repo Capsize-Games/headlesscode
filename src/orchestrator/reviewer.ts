@@ -118,7 +118,7 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 	} = options
 
 	const systemPromptOverride = await fs.readFile(reviewPromptPath, "utf-8")
-	const client = llmClient ?? new OpenRouterClient({ apiKey: process.env.OPENROUTER_API_KEY, defaultModel: model })
+	const client = llmClient ?? new OpenRouterClient({ apiKey: process.env.HEADLESSCODE_OPENROUTER_API_KEY, defaultModel: model })
 
 	const session = new HeadlessSession({
 		workspaceRoot,

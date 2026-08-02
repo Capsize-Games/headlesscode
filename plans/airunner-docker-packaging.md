@@ -62,8 +62,8 @@ test files, hand-rolled `assert`, `All N tests passed` trailer); `npx tsc
   separate from the application code volume so it survives image rebuilds.
 - **Secrets convention**: plain environment variables via `env_file`
   (`.env`/`.env.prod`), read via `os.getenv(...)` in the Python backend.
-  `OPENROUTER_API_KEY` already flows this way for other purposes. A
-  headlesscode install should read `OPENROUTER_API_KEY` (and any other env
+  `HEADLESSCODE_OPENROUTER_API_KEY` already flows this way for other purposes. A
+  headlesscode install should read `HEADLESSCODE_OPENROUTER_API_KEY` (and any other env
   vars it needs) the same way — do not invent a separate secrets mechanism.
 - **No build/dist step exists in headlesscode itself** — `package.json`'s
   `bin`/`scripts` all invoke `tsx` directly against TypeScript source
@@ -144,7 +144,7 @@ your call, but say which you chose and why.
 
 Document (a short section in this task's own report, plus a
 `docs/airunner-docker-packaging.md` if you judge it warranted) exactly what
-env vars the container needs (`OPENROUTER_API_KEY` at minimum; note whether
+env vars the container needs (`HEADLESSCODE_OPENROUTER_API_KEY` at minimum; note whether
 `HEADLESSCODE_EMBEDDING_BACKEND=ollama` even makes sense in this context —
 almost certainly NOT, since there's no local GPU inside this deployment;
 the default `openrouter` embedding backend is correct here, explicitly

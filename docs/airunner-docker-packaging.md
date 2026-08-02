@@ -157,7 +157,7 @@ convention — nothing new is invented:
 
 | Variable | Required? | Notes |
 |---|---|---|
-| `OPENROUTER_API_KEY` | **Yes** (real runs) | Same system-owned key the rest of uwuchat uses. Needed only for non-`--dry-run` sessions. |
+| `HEADLESSCODE_OPENROUTER_API_KEY` | **Yes** (real runs) | Same system-owned key the rest of uwuchat uses. Needed only for non-`--dry-run` sessions. |
 | `HEADLESSCODE_EMBEDDING_BACKEND` | **No — leave unset** | **Confirmed: `ollama` does NOT make sense here.** This deployment has no local GPU and no ollama service; the code default `openrouter` (see `DEFAULT_EMBEDDING_BACKEND` in `src/codesearch/embedder.ts`) is the correct backend. The dev-machine `.env` in this repo sets `ollama` as a local-only opt-in — do not copy that setting into the container. |
 | `HEADLESSCODE_WORKSPACE_ROOT` | no (default set) | `/data/headlesscode-workspaces` (baked into the image + compose). |
 | `HEADLESSCODE_MAX_COST_USD`, `HEADLESSCODE_MAX_DURATION_MS` | no | Per-session budget guardrails (Phase 6). |

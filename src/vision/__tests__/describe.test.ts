@@ -248,19 +248,19 @@ async function testMissingContentError(): Promise<void> {
 }
 
 async function testMissingApiKeyError(): Promise<void> {
-	const prev = process.env.OPENROUTER_API_KEY
-	delete process.env.OPENROUTER_API_KEY
+	const prev = process.env.HEADLESSCODE_OPENROUTER_API_KEY
+	delete process.env.HEADLESSCODE_OPENROUTER_API_KEY
 	try {
 		await assert.rejects(
 			() => describeImage("x.png", { baseUrl: "http://127.0.0.1:1" }),
-			(err) => err instanceof VisionError && /OPENROUTER_API_KEY is not set/.test(err.message),
+			(err) => err instanceof VisionError && /HEADLESSCODE_OPENROUTER_API_KEY is not set/.test(err.message),
 			"no API key must be a clear VisionError, not a confusing network error",
 		)
 	} finally {
 		if (prev === undefined) {
-			delete process.env.OPENROUTER_API_KEY
+			delete process.env.HEADLESSCODE_OPENROUTER_API_KEY
 		} else {
-			process.env.OPENROUTER_API_KEY = prev
+			process.env.HEADLESSCODE_OPENROUTER_API_KEY = prev
 		}
 	}
 }

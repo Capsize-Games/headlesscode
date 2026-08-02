@@ -116,7 +116,7 @@ OUT1="$(mktemp /tmp/headlesscode-e2e-perm-cli1-XXXXXX.out)"
 (
 	cd "$ROOT" &&
 		OPENROUTER_BASE_URL="http://127.0.0.1:$MOCK1_PORT" \
-		OPENROUTER_API_KEY="test-key" \
+		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 		npx tsx src/cli.ts --task "attempt a protected write and a denied command" --mode code \
 			--workspace "$WT1" --max-iterations 10 --log-file "$HARNESS1_LOG" \
 			--denied-commands "$DENIED_COMMAND"
@@ -162,7 +162,7 @@ OUT2="$(mktemp /tmp/headlesscode-e2e-perm-cli2-XXXXXX.out)"
 (
 	cd "$ROOT" &&
 		OPENROUTER_BASE_URL="http://127.0.0.1:$MOCK2_PORT" \
-		OPENROUTER_API_KEY="test-key" \
+		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 		npx tsx src/cli.ts --task "attempt a protected write and a denied command" --mode code \
 			--workspace "$WT2" --max-iterations 10 --log-file "$HARNESS2_LOG" \
 			--denied-commands "$DENIED_COMMAND" --allow-protected-writes

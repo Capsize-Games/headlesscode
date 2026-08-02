@@ -48,7 +48,7 @@ until completion. Non-interactive by design.
 npm install
 
 # Required (except for --dry-run):
-export OPENROUTER_API_KEY=sk-or-...
+export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-...
 
 # Optional:
 export OPENROUTER_MODEL=deepseek/deepseek-chat          # default model
@@ -77,7 +77,7 @@ rules loading succeeded; non-zero means a config error.
 ## Real-usage example against a target repo
 
 ```bash
-export OPENROUTER_API_KEY=sk-or-...
+export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-...
 export HEADLESSCODE_WORKSPACE_ROOT=~/Projects/some-target-repo
 
 # Point the agent at an already-scoped issue, in an isolated worktree:
@@ -93,7 +93,7 @@ The agent reads files, runs commands, writes code, and finishes by calling
 `attempt_completion` (or by giving a final text answer). The final result is
 printed to stdout. Exit code 0 = success; 1 = task failed (max iterations or
 consecutive-mistake limit); 2 = usage/config error (e.g. missing
-`OPENROUTER_API_KEY`).
+`HEADLESSCODE_OPENROUTER_API_KEY`).
 
 ## CLI reference
 
@@ -183,7 +183,7 @@ watch subcommand (Phase 5 — GitHub issue watcher, poll-based intake):
 
 - [`src/llm/openrouter.ts`](./src/llm/openrouter.ts) — OpenRouter
   chat-completions client using native `fetch` (no axios/node-fetch/openai
-  SDK). Reads `OPENROUTER_API_KEY`, optional `OPENROUTER_HTTP_REFERER` /
+  SDK). Reads `HEADLESSCODE_OPENROUTER_API_KEY`, optional `OPENROUTER_HTTP_REFERER` /
   `OPENROUTER_APP_TITLE`; model default `deepseek/deepseek-chat` (env
   `OPENROUTER_MODEL` overrides). Non-2xx → typed `OpenRouterError` with status +
   body excerpt; supports `AbortSignal` timeouts.

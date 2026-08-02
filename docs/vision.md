@@ -89,7 +89,7 @@ looked better (consistency) turned out to be consistency *in hallucinating*.
 The live smoke test confirmed the 12b description is enough for
 `deepseek/deepseek-v4-flash` to correctly diagnose the page's JavaScript
 error and layout bug from the text alone. Override via
-`HEADLESSCODE_VISION_MODEL` (reuses `OPENROUTER_API_KEY`); the 27b is priced
+`HEADLESSCODE_VISION_MODEL` (reuses `HEADLESSCODE_OPENROUTER_API_KEY`); the 27b is priced
 in [`src/budget/cost.ts`](../src/budget/cost.ts) too, so an override to the
 quality anchor still estimates accurately.
 

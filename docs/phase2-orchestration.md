@@ -235,7 +235,7 @@ of hand-rolling poll loops over the state file / `harness.log`:
 
 ```bash
 # 1. Configure
-export OPENROUTER_API_KEY=sk-or-...
+export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-...
 export OPENROUTER_MODEL=deepseek/deepseek-chat
 
 # 2. Preview the split + spawn command (no API key needed)

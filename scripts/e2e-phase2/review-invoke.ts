@@ -5,7 +5,7 @@
  * pointed at the mock OpenRouter server via env.
  *
  * Usage:
- *   OPENROUTER_BASE_URL=http://127.0.0.1:<port> OPENROUTER_API_KEY=test-key \
+ *   OPENROUTER_BASE_URL=http://127.0.0.1:<port> HEADLESSCODE_OPENROUTER_API_KEY=test-key \
  *     npx tsx scripts/e2e-phase2/review-invoke.ts --workspace <path> [--mode <slug>]
  *
  * Prints:
@@ -29,7 +29,7 @@ async function main(): Promise<void> {
 	const mode = modeIdx !== -1 && args[modeIdx + 1] ? args[modeIdx + 1] : "deepseek-reviewer"
 
 	const client = new OpenRouterClient({
-		apiKey: process.env.OPENROUTER_API_KEY,
+		apiKey: process.env.HEADLESSCODE_OPENROUTER_API_KEY,
 		defaultModel: process.env.OPENROUTER_MODEL,
 	})
 	const result = await runReview({ workspaceRoot, mode, llmClient: client })

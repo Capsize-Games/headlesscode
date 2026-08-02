@@ -8,7 +8,7 @@
  *
  * The handler is exercised against a REAL local `node:http` fake OpenRouter
  * server reached through the standard env vars (OPENROUTER_BASE_URL +
- * OPENROUTER_API_KEY) — the same config a real session uses — so the whole
+ * HEADLESSCODE_OPENROUTER_API_KEY) — the same config a real session uses — so the whole
  * describeImage -> HTTP -> description/usage path is tested for real, not
  * stubbed.
  */
@@ -71,9 +71,9 @@ async function writeFixtureImage(ws: string): Promise<void> {
 
 async function withVisionEnv(port: number, fn: () => Promise<void>): Promise<void> {
 	const prevBase = process.env.OPENROUTER_BASE_URL
-	const prevKey = process.env.OPENROUTER_API_KEY
+	const prevKey = process.env.HEADLESSCODE_OPENROUTER_API_KEY
 	process.env.OPENROUTER_BASE_URL = `http://127.0.0.1:${port}`
-	process.env.OPENROUTER_API_KEY = "test-key"
+	process.env.HEADLESSCODE_OPENROUTER_API_KEY = "test-key"
 	try {
 		await fn()
 	} finally {
@@ -83,9 +83,9 @@ async function withVisionEnv(port: number, fn: () => Promise<void>): Promise<voi
 			process.env.OPENROUTER_BASE_URL = prevBase
 		}
 		if (prevKey === undefined) {
-			delete process.env.OPENROUTER_API_KEY
+			delete process.env.HEADLESSCODE_OPENROUTER_API_KEY
 		} else {
-			process.env.OPENROUTER_API_KEY = prevKey
+			process.env.HEADLESSCODE_OPENROUTER_API_KEY = prevKey
 		}
 	}
 }

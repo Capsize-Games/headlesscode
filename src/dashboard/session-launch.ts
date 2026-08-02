@@ -10,7 +10,7 @@
  *     dashboard HTTP handler returns immediately and the session keeps running
  *     after the server's own process group is long gone. The child inherits
  *     the dashboard process's environment, which is exactly why
- *     `OPENROUTER_API_KEY` must be exported (e.g. `set -a; source .env`) when
+ *     `HEADLESSCODE_OPENROUTER_API_KEY` must be exported (e.g. `set -a; source .env`) when
  *     the dashboard itself is started — this endpoint does NOT re-source
  *     `.env` the way the CLI's other entry points do.
  *
@@ -128,7 +128,7 @@ export async function launchSession(
 	const argv = [...splitCli(cli), "--task", options.task, "--mode", mode, "--workspace", workspace, "--session-id", sessionId]
 
 	// NOTE (control-plane): the child inherits this process's environment —
-	// OPENROUTER_API_KEY and OPENROUTER_BASE_URL (the e2e mock) included. The
+	// HEADLESSCODE_OPENROUTER_API_KEY and OPENROUTER_BASE_URL (the e2e mock) included. The
 	// dashboard is expected to have sourced .env at startup (see cli.ts's
 	// dashboard help); this endpoint deliberately does not re-source it.
 	const child = spawn(argv[0], argv.slice(1), {

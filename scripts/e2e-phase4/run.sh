@@ -217,7 +217,7 @@ echo "== [4/10] orchestrate --qa (full round) =="
 ORCH1_OUT="$(mktemp /tmp/headlesscode-e2e4-orch1-XXXXXX.out)"
 (
 	cd "$ROOT" &&
-		OPENROUTER_API_KEY="test-key" \
+		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 		OPENROUTER_BASE_URL="http://127.0.0.1:$AUTO_PORT" \
 		HEADLESSCODE_ROOT="$ROOT" \
 		npx tsx src/cli.ts orchestrate --repo "$FIXTURE" --issues-json "$ISSUES_JSON" \
@@ -258,7 +258,7 @@ QA_INVOKE_PASS_OUT="$(mktemp /tmp/headlesscode-e2e4-qapass-XXXXXX.out)"
 (
 	cd "$ROOT" &&
 		OPENROUTER_BASE_URL="http://127.0.0.1:$QA_PASS_PORT" \
-		OPENROUTER_API_KEY="test-key" \
+		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 		npx tsx scripts/e2e-phase4/qa-invoke.ts --workspace "$FIXTURE/.worktrees/w1"
 ) >"$QA_INVOKE_PASS_OUT" 2>&1
 QA_PASS_EXIT=$?
@@ -287,7 +287,7 @@ QA_INVOKE_FAIL_OUT="$(mktemp /tmp/headlesscode-e2e4-qafail-XXXXXX.out)"
 (
 	cd "$ROOT" &&
 		OPENROUTER_BASE_URL="http://127.0.0.1:$QA_FAIL_PORT" \
-		OPENROUTER_API_KEY="test-key" \
+		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 		npx tsx scripts/e2e-phase4/qa-invoke.ts --workspace "$FIXTURE/.worktrees/w1"
 ) >"$QA_INVOKE_FAIL_OUT" 2>&1
 QA_FAIL_EXIT=$?
@@ -302,7 +302,7 @@ fi
 # ── 7. run-qa.sh wrapper ─────────────────────────────────────────────────────
 echo "== [7/10] scripts/run-qa.sh wrapper =="
 RUNQA_OUT="$(mktemp /tmp/headlesscode-e2e4-runqa-XXXXXX.out)"
-QA_PID="$(OPENROUTER_BASE_URL="http://127.0.0.1:$QA_PASS_PORT" OPENROUTER_API_KEY="test-key" \
+QA_PID="$(OPENROUTER_BASE_URL="http://127.0.0.1:$QA_PASS_PORT" HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 	HEADLESSCODE_ROOT="$ROOT" \
 	bash "$ROOT/scripts/run-qa.sh" "$FIXTURE/.worktrees/w1" --mode qa-agent)"
 QA_PID="$(printf '%s' "$QA_PID" | tail -n 1)"
@@ -459,7 +459,7 @@ rm -f "$FIXTURE/.e2e-deploy-ran"
 ORCH2_OUT="$(mktemp /tmp/headlesscode-e2e4-orch2-XXXXXX.out)"
 (
 	cd "$ROOT" &&
-		OPENROUTER_API_KEY="test-key" \
+		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 		OPENROUTER_BASE_URL="http://127.0.0.1:$AUTO_PORT" \
 		HEADLESSCODE_ROOT="$ROOT" \
 		DEPLOY_APPROVAL_TOKEN="correct-token" \
@@ -483,7 +483,7 @@ ORCH2_MARKER_LINES="$(wc -l < "$FIXTURE/.e2e-deploy-ran" 2>/dev/null || echo 0)"
 ORCH3_OUT="$(mktemp /tmp/headlesscode-e2e4-orch3-XXXXXX.out)"
 (
 	cd "$ROOT" &&
-		OPENROUTER_API_KEY="test-key" \
+		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 		OPENROUTER_BASE_URL="http://127.0.0.1:$AUTO_PORT" \
 		HEADLESSCODE_ROOT="$ROOT" \
 		DEPLOY_APPROVAL_TOKEN="wrong-token" \
@@ -535,7 +535,7 @@ sleep 0.2
 REWORK_OUT="$(mktemp /tmp/headlesscode-e2e4-rework-XXXXXX.out)"
 (
 	cd "$ROOT" &&
-		OPENROUTER_API_KEY="test-key" \
+		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 		OPENROUTER_BASE_URL="http://127.0.0.1:$REWORK_PORT" \
 		HEADLESSCODE_ROOT="$ROOT" \
 		npx tsx src/cli.ts orchestrate --repo "$FIXTURE2" --issues-json "$REWORK_ISSUES" \

@@ -42,7 +42,7 @@ Notes:
   set. Never expose this port beyond localhost.
   IMPORTANT (browser control plane): the "start a session" endpoint spawns
   the CLI as a detached child that INHERITS this process's environment — it
-  does NOT re-source .env. Export OPENROUTER_API_KEY (e.g. 'set -a; source
+  does NOT re-source .env. Export HEADLESSCODE_OPENROUTER_API_KEY (e.g. 'set -a; source
   .env; set +a') before starting the dashboard, or launched sessions will
   fail immediately with an OpenRouter auth error.
 `

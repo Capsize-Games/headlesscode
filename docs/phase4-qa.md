@@ -128,10 +128,10 @@ under a QA-specific name so the intent is explicit at every call site.
 Standalone against one worktree:
 
 ```bash
-OPENROUTER_API_KEY=... npx tsx src/cli.ts \
+HEADLESSCODE_OPENROUTER_API_KEY=... npx tsx src/cli.ts \
   --task-file <wt>/.qa-task.md --workspace <wt> --mode qa-agent
 # or the wrapper:
-OPENROUTER_API_KEY=... bash scripts/run-qa.sh <wt> --mode qa-agent
+HEADLESSCODE_OPENROUTER_API_KEY=... bash scripts/run-qa.sh <wt> --mode qa-agent
 ```
 
 Inside a full orchestration round (QA runs after each group's review passes):

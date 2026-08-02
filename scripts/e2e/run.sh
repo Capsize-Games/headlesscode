@@ -149,7 +149,7 @@ TASK_TEXT='fix the greet function in src/greet.js so it returns "Hello, " + name
 (
 	cd "$ROOT" &&
 		OPENROUTER_BASE_URL="http://127.0.0.1:$MOCK_PORT" \
-		OPENROUTER_API_KEY="test-key" \
+		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 		HEADLESSCODE_WORKSPACE_ROOT="$WORKTREE" \
 		npx tsx src/cli.ts --task "$TASK_TEXT" --mode code \
 			--workspace "$WORKTREE" --max-iterations 10 --log-file "$HARNESS_LOG"

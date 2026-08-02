@@ -25,7 +25,7 @@ evidence already sitting in this exact worktree:**
   cost, 77 iterations, model `deepseek/deepseek-v4-flash`** — that is real
   API usage that already happened in this worktree during your previous
   attempt.
-- A working `OPENROUTER_API_KEY` is present in `.env` in this worktree right
+- A working `HEADLESSCODE_OPENROUTER_API_KEY` is present in `.env` in this worktree right
   now.
 - `src/cli.ts` supports `--task-file`, which is exactly what's needed to run
   the two comparison sessions the evaluation calls for.

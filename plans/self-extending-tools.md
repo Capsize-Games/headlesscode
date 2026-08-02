@@ -49,7 +49,7 @@ With no human reviewing what a tool does before it runs, the sandbox's
 default permissions ARE the security boundary. Concretely:
 - **No ambient secrets.** A hot-written tool gets none of the main
   service's credentials (DB connection strings, other integrations' API
-  keys, `OPENROUTER_API_KEY`, etc.) by default. If a tool genuinely needs
+  keys, `HEADLESSCODE_OPENROUTER_API_KEY`, etc.) by default. If a tool genuinely needs
   an external credential, that has to be an explicit, narrow grant — and
   since there's no human reviewing the grant request either, this needs
   its own design (a fixed allowlist of pre-approved narrow-scope

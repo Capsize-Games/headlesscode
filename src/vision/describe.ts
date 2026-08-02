@@ -71,7 +71,7 @@ export interface DescribeImageResult {
 export interface DescribeImageOptions {
 	/** Model id. Default: HEADLESSCODE_VISION_MODEL, then DEFAULT_VISION_MODEL. */
 	model?: string
-	/** Reuses OPENROUTER_API_KEY when omitted. */
+	/** Reuses HEADLESSCODE_OPENROUTER_API_KEY when omitted. */
 	apiKey?: string
 	/** Reuses OPENROUTER_BASE_URL when omitted. */
 	baseUrl?: string
@@ -108,10 +108,10 @@ export async function describeImage(
 	imagePath: string,
 	options: DescribeImageOptions = {},
 ): Promise<DescribeImageResult> {
-	const apiKey = options.apiKey ?? process.env.OPENROUTER_API_KEY
+	const apiKey = options.apiKey ?? process.env.HEADLESSCODE_OPENROUTER_API_KEY
 	if (!apiKey) {
 		throw new VisionError(
-			"OPENROUTER_API_KEY is not set. Set the environment variable OPENROUTER_API_KEY to use describeImage (vision captioning).",
+			"HEADLESSCODE_OPENROUTER_API_KEY is not set. Set the environment variable HEADLESSCODE_OPENROUTER_API_KEY to use describeImage (vision captioning).",
 		)
 	}
 	const model = options.model ?? process.env.HEADLESSCODE_VISION_MODEL ?? DEFAULT_VISION_MODEL

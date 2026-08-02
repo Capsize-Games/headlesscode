@@ -71,7 +71,7 @@ added — do not build a second one). Request body:
   `src/tools/executor.ts`'s backgrounded `execute_command` already
   established for not blocking on a long-running child), running
   `npx tsx src/cli.ts --task '<task>' --mode '<mode>' --workspace '<repo>'`
-  with `OPENROUTER_API_KEY` inherited from the dashboard process's own
+  with `HEADLESSCODE_OPENROUTER_API_KEY` inherited from the dashboard process's own
   environment (so `.env` only needs to be sourced once, when the dashboard
   itself starts — document this clearly, since it's a change from every
   other entry point in this project, which each source `.env` themselves).

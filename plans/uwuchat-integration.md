@@ -143,7 +143,7 @@ the architect/orchestrator prompt engineering, and anything else sent
 upstream. That's a real prompt-leak vector, not a hypothetical one, and it's
 unacceptable for the same reason the existing chat pipeline already keeps its
 system prompts off any user-visible surface. Coding mode uses the **same
-system-owned `OPENROUTER_API_KEY`** the rest of uwuchat already uses — the
+system-owned `HEADLESSCODE_OPENROUTER_API_KEY`** the rest of uwuchat already uses — the
 new piece is accounting for it separately from chat's flat-tier model, not a
 different key.
 

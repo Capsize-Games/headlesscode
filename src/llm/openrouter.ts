@@ -8,7 +8,7 @@
  *   - Base URL override: OPENROUTER_BASE_URL env var (default
  *     https://openrouter.ai) — lets tests/proxies point the client at a mock
  *     server (e.g. http://127.0.0.1:<port>).
- *   - Authorization: Bearer <OPENROUTER_API_KEY>
+ *   - Authorization: Bearer <HEADLESSCODE_OPENROUTER_API_KEY>
  *   - Optional headers from env: HTTP-Referer (OPENROUTER_HTTP_REFERER),
  *     X-Title (OPENROUTER_APP_TITLE) — recommended by OpenRouter for
  *     identifying the app and enabling higher rate limits.
@@ -78,7 +78,7 @@ export class OpenRouterClient implements LlmClient {
 	private readonly appTitle?: string
 
 	constructor(options: OpenRouterClientOptions = {}) {
-		this.apiKey = options.apiKey ?? process.env.OPENROUTER_API_KEY
+		this.apiKey = options.apiKey ?? process.env.HEADLESSCODE_OPENROUTER_API_KEY
 		this.baseUrl = (options.baseUrl ?? process.env.OPENROUTER_BASE_URL ?? OPENROUTER_BASE_URL).replace(/\/+$/, "")
 		this.defaultModel = options.defaultModel ?? process.env.OPENROUTER_MODEL ?? DEFAULT_MODEL
 		this.httpReferer = options.httpReferer ?? process.env.OPENROUTER_HTTP_REFERER
@@ -121,7 +121,7 @@ export class OpenRouterClient implements LlmClient {
 	async embed(inputs: string[], model: string, signal?: AbortSignal): Promise<OpenRouterEmbedding> {
 		if (!this.apiKey) {
 			throw new OpenRouterError(
-				"OPENROUTER_API_KEY is not set. Set the environment variable OPENROUTER_API_KEY (or pass apiKey to OpenRouterClient).",
+				"HEADLESSCODE_OPENROUTER_API_KEY is not set. Set the environment variable HEADLESSCODE_OPENROUTER_API_KEY (or pass apiKey to OpenRouterClient).",
 			)
 		}
 		if (inputs.length === 0) {
@@ -273,7 +273,7 @@ export class OpenRouterClient implements LlmClient {
 	async createChatCompletion(request: LlmRequest): Promise<LlmResponse> {
 		if (!this.apiKey) {
 			throw new OpenRouterError(
-				"OPENROUTER_API_KEY is not set. Set the environment variable OPENROUTER_API_KEY (or pass apiKey to OpenRouterClient).",
+				"HEADLESSCODE_OPENROUTER_API_KEY is not set. Set the environment variable HEADLESSCODE_OPENROUTER_API_KEY (or pass apiKey to OpenRouterClient).",
 			)
 		}
 

@@ -186,7 +186,7 @@ SPAWN_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-spawn-XXXXXX.out)"
 (
 	cd "$ROOT" &&
 		TARGET_REPO="$FIXTURE" \
-		OPENROUTER_API_KEY="test-key" \
+		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 		OPENROUTER_BASE_URL="http://127.0.0.1:$WORKER_PORT" \
 		HEADLESSCODE_ROOT="$ROOT" \
 		bash scripts/spawn-parallel-worktrees.sh \
@@ -312,7 +312,7 @@ REVIEW_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-review-XXXXXX.out)"
 (
 	cd "$ROOT" &&
 		OPENROUTER_BASE_URL="http://127.0.0.1:$REVIEW_PORT" \
-		OPENROUTER_API_KEY="test-key" \
+		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 		npx tsx scripts/e2e-phase2/review-invoke.ts --workspace "$FIXTURE/.worktrees/w1"
 ) >"$REVIEW_OUT" 2>&1
 REVIEW_EXIT=$?

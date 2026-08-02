@@ -72,7 +72,7 @@ adversarial pass, not something you assert on the round's behalf.
 
 ## Requirements
 
-- `OPENROUTER_API_KEY` must be live — this repo's own `.env` (gitignored)
+- `HEADLESSCODE_OPENROUTER_API_KEY` must be live — this repo's own `.env` (gitignored)
   has it. Since workers are launched as detached background processes that
   inherit whatever shell environment spawned them, make sure it's actually
   exported in *your* shell before calling the spawn script:

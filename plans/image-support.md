@@ -114,7 +114,7 @@ how `local-explore.ts`'s `OllamaLocalChatClient` is similarly a standalone,
 narrow client outside the main abstraction, not shoehorned into it.
 
 Config: `HEADLESSCODE_VISION_MODEL` env var (default: whatever your
-evaluation above picks), reusing the same `OPENROUTER_API_KEY`. Real $ cost
+evaluation above picks), reusing the same `HEADLESSCODE_OPENROUTER_API_KEY`. Real $ cost
 per call — wire this into the existing budget/usage tracking
 (`src/budget/`, `.headlesscode/usage/*.jsonl`) the same way regular LLM
 calls are recorded, not as an untracked side channel — a coding session

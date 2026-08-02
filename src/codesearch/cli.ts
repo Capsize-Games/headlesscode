@@ -139,8 +139,8 @@ export async function indexMain(argv: string[]): Promise<number> {
 	const embedder = createEmbedder(backend, { model: options.model }, process.env)
 	const modelForEnv = options.model?.trim() || process.env[OPENROUTER_EMBEDDING_MODEL_ENV]?.trim()
 
-	if (backend === "openrouter" && !process.env.OPENROUTER_API_KEY) {
-		process.stderr.write("headlesscode index: OPENROUTER_API_KEY is not set (required for cloud embedding).\n")
+	if (backend === "openrouter" && !process.env.HEADLESSCODE_OPENROUTER_API_KEY) {
+		process.stderr.write("headlesscode index: HEADLESSCODE_OPENROUTER_API_KEY is not set (required for cloud embedding).\n")
 		return 2
 	}
 
