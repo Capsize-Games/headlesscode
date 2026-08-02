@@ -221,10 +221,27 @@ function readNeedsDecision(wtPath: string): NeedsDecision | undefined {
 	}
 }
 
-function hasPid(wtPath: string): boolean {
+/**
+ * Whether the worker process recorded in `.harness.pid` is ACTUALLY still
+ * running — not just whether the pid file exists. A worker that crashes or
+ * is killed without cleaning up its own pid file leaves a stale file behind
+ * forever; checking existence alone made a dead worker indistinguishable
+ * from a live one, which is what caused the 2026-08-02 incident below (see
+ * `inspectGroup`'s stall-guard branch).
+ */
+function isPidAlive(wtPath: string): boolean {
+	let raw: string
 	try {
-		const raw = fs.readFileSync(path.join(wtPath, ".harness.pid"), "utf-8").trim()
-		return /^\d+$/.test(raw)
+		raw = fs.readFileSync(path.join(wtPath, ".harness.pid"), "utf-8").trim()
+	} catch {
+		return false
+	}
+	if (!/^\d+$/.test(raw)) {
+		return false
+	}
+	try {
+		process.kill(Number(raw), 0)
+		return true
 	} catch {
 		return false
 	}
@@ -304,11 +321,45 @@ export function inspectGroup(
 		return { status: "running", blocked: undefined }
 	}
 
-	// Stall guard: spawned long ago with no completion and no pid → stalled.
+	// Stall guard: spawned long ago with no completion marker.
+	//
+	// 2026-08-02 incident: this branch used to return a freshly-constructed
+	// patch on EVERY poll once a group passed stallTimeoutMs, even when
+	// nothing had actually changed since the previous poll (same "still
+	// stalled" note, forever). watchGroups' loop only sleeps when nothing
+	// changed, and treated "inspectGroup returned a patch" as "something
+	// changed" -- so once any group entered this state, the outer loop
+	// never slept again: a zero-delay busy loop that ran for 11+ hours at
+	// ~76% CPU, continuously rewriting .orchestrator-state.json, on a
+	// worktree whose worker had actually already died (a stale
+	// `.harness.pid` file made `hasPid` return true forever, so the branch
+	// never resolved to a terminal state either -- see `isPidAlive` above,
+	// which replaces a file-existence check with an actual liveness check).
+	//
+	// Fixed by two changes: (1) resolve to "failed" the moment the process
+	// is confirmed dead, instead of reporting "still stalled" forever with
+	// no live process behind it; (2) for a genuinely still-alive-but-slow
+	// worker, report the stall ONCE (the first time `group.stalled` flips
+	// true) rather than on every subsequent poll -- an unresolved stall
+	// that hasn't changed state is not new information.
 	if (!Number.isNaN(startedAt) && now - startedAt > stallTimeoutMs) {
-		const isStalled = !hasPid(wtPath)
+		if (!isPidAlive(wtPath)) {
+			return {
+				status: "failed",
+				stalled: true,
+				last_activity: {
+					note:
+						`STALLED: no completion marker after ${Math.round(stallTimeoutMs / 60000)}m ` +
+						`and the worker process is no longer running (spawned ${group.spawned})`,
+				},
+			}
+		}
+		if (group.stalled === true) {
+			// Already reported; still alive, still no completion -- not new.
+			return undefined
+		}
 		return {
-			...(isStalled ? { status: "failed", stalled: true } : { stalled: true }),
+			stalled: true,
 			last_activity: {
 				note: `STALLED: no completion marker after ${Math.round(stallTimeoutMs / 60000)}m (spawned ${group.spawned})`,
 			},

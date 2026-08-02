@@ -11,6 +11,7 @@ import assert from "node:assert/strict"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
+import { spawnSync } from "node:child_process"
 
 import { inspectGroup, watchGroups, DEFAULT_STALL_TIMEOUT_MS } from "../watch.js"
 import { defaultState, loadStateSync, saveStateSync, type OrchestratorGroup, type OrchestratorState } from "../state.js"
@@ -313,6 +314,78 @@ async function testWatchGroupsPrintsFailedTransitionToStderr(): Promise<void> {
 	}
 }
 
+/**
+ * 2026-08-02 incident regression: a group past the stall timeout whose
+ * worker process has ACTUALLY died (not just a missing pid file — a real
+ * dead pid recorded in a stale `.harness.pid`) must resolve to "failed"
+ * immediately, not sit reporting "still stalled" forever. Before the fix,
+ * `hasPid` only checked file existence, so a stale pid file made a dead
+ * worker indistinguishable from a live one — the group could never resolve.
+ */
+async function testStallGuardResolvesToFailedWhenPidIsDead(): Promise<void> {
+	const repoRoot = await tmpRepo()
+	try {
+		const wtPath = path.join(repoRoot, ".worktrees", "w1")
+		await fs.mkdir(wtPath, { recursive: true })
+		// A pid that is guaranteed dead by the time we read it: spawn a
+		// trivial child, let it exit, and use its (now-released) pid.
+		const dead = spawnSync(process.execPath, ["-e", "process.exit(0)"])
+		const deadPid = dead.pid
+		assert.ok(deadPid, "expected the trivial child to report a pid")
+		await fs.writeFile(path.join(wtPath, ".harness.pid"), String(deadPid), "utf-8")
+
+		const longAgo = new Date(Date.now() - DEFAULT_STALL_TIMEOUT_MS * 10).toISOString()
+		const group = baseGroup({ spawned: longAgo })
+		const patch = inspectGroup(repoRoot, group, Date.now(), DEFAULT_STALL_TIMEOUT_MS)
+
+		assert.ok(patch, "a dead-pid stalled group must resolve, not silently do nothing")
+		assert.equal(patch?.status, "failed", "a confirmed-dead worker must resolve to failed, not sit stalled forever")
+		assert.equal(patch?.stalled, true)
+	} finally {
+		await fs.rm(repoRoot, { recursive: true, force: true })
+	}
+}
+
+/**
+ * 2026-08-02 incident regression, the actual busy-loop cause: a group past
+ * the stall timeout whose worker IS still genuinely alive must report the
+ * stall ONCE (the transition into `stalled: true`), then return `undefined`
+ * on every subsequent poll as long as nothing has changed — not a fresh
+ * patch every single time. Before the fix, this branch returned a new
+ * patch object unconditionally on every call, which `watchGroups`' "only
+ * sleep if nothing changed" loop treated as "something changed" forever,
+ * producing a zero-delay busy loop (observed: 11+ hours at ~76% CPU on a
+ * real orchestrator round).
+ */
+async function testStallGuardReportsOnceThenStopsWhileStillAlive(): Promise<void> {
+	const repoRoot = await tmpRepo()
+	try {
+		const wtPath = path.join(repoRoot, ".worktrees", "w1")
+		await fs.mkdir(wtPath, { recursive: true })
+		// This test process's own pid is guaranteed alive for the duration.
+		await fs.writeFile(path.join(wtPath, ".harness.pid"), String(process.pid), "utf-8")
+
+		const longAgo = new Date(Date.now() - DEFAULT_STALL_TIMEOUT_MS * 10).toISOString()
+		const now = Date.now()
+
+		// First poll: not yet marked stalled -> must report it (once).
+		const freshGroup = baseGroup({ spawned: longAgo })
+		const firstPatch = inspectGroup(repoRoot, freshGroup, now, DEFAULT_STALL_TIMEOUT_MS)
+		assert.ok(firstPatch, "the first stall detection must produce a patch")
+		assert.equal(firstPatch?.status, undefined, "still alive -> status must NOT flip to failed")
+		assert.equal(firstPatch?.stalled, true)
+
+		// Second poll: simulate the patch having been persisted (stalled:
+		// true already recorded) and nothing else changed -- this is the
+		// exact repeated-call shape that caused the busy loop.
+		const alreadyStalledGroup = baseGroup({ spawned: longAgo, stalled: true })
+		const secondPatch = inspectGroup(repoRoot, alreadyStalledGroup, now + 1000, DEFAULT_STALL_TIMEOUT_MS)
+		assert.equal(secondPatch, undefined, "an unresolved stall that hasn't changed must not produce a fresh patch every poll")
+	} finally {
+		await fs.rm(repoRoot, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -320,6 +393,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["inspectGroup: already blocked on the same question -> no patch (no churn)", testInspectGroupNoChangeWhenAlreadyBlockedOnSameQuestion],
 	["inspectGroup: marker removed while blocked -> status running, blocked cleared", testInspectGroupFlowsBackToRunningWhenMarkerRemoved],
 	["inspectGroup: blocked group is exempt from the stall guard", testBlockedGroupIsExemptFromStallGuard],
+	["inspectGroup: stalled + confirmed-dead pid resolves to failed", testStallGuardResolvesToFailedWhenPidIsDead],
+	["inspectGroup: stalled + still-alive pid reports once, then stops (busy-loop regression)", testStallGuardReportsOnceThenStopsWhileStillAlive],
 	["watchGroups: blocked -> running -> done end-to-end transition", testWatchGroupsBlockedThenUnblockedFlow],
 	["watchGroups: BLOCKED line printed once on the transition into blocked", testWatchGroupsPrintsBlockedTransitionToStderr],
 	["watchGroups: BLOCKED line not repeated while the group stays blocked", testWatchGroupsDoesNotRepeatBlockedLineWhileStillBlocked],
