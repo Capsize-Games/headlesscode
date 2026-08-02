@@ -51,29 +51,43 @@ assume it wasn't reverted):
 | 32,768 | 9.5 GB | **evicts one model** (confirmed live — Ollama swaps rather than exceed VRAM) |
 | 131,072 | 12 GB | n/a — exploration model alone at this size |
 
-**The coexistence boundary (~28K tokens), not the solo-model boundary
-(~131K), is the real constraint for this task** — the exploration phase's
-tool set includes `codebase_search` (see "What to build" below), which
-needs `qwen3-embedding:8b` loaded. If the exploration phase's context grows
-past ~28K while `codebase_search` might still be called, Ollama will evict
-one model to load the other, costing a real ~5-second reload on every
-switch between generation and embedding calls (confirmed live). Default the
-exploration phase's context budget to something safely under this edge
-(e.g. 24,576) — re-verify the real boundary live in your environment before
-picking a final default, these numbers can shift with driver/Ollama
-versions.
+**Resolved via temporal separation, not a context cap.** The obvious
+approach — let the exploration phase call `codebase_search` too — would
+require `qwen3-embedding:8b` resident in VRAM AT THE SAME TIME as
+`qwen3.5:9b` is generating, and that coexistence only holds through ~28K
+context (9.3GB + 6.2GB = 15.5GB; confirmed live that 32K already evicts one
+model to load the other, costing a real ~5-second reload per switch). The
+project owner explicitly did not want to cap context that low. Two other
+options were checked live and ruled out: no 2-bit quantization exists for
+this model (checked Ollama's library directly — only full-size tags are
+published), and forcing the embedding model onto CPU is not viable at all
+for real indexing workloads (measured live: the identical embedding call
+took 3.85s on GPU vs. **116 seconds on CPU** — a ~30x slowdown that would
+turn a ~1-minute real index build for this repo's 3,756 chunks into multiple
+days).
 
-The model's nominal max context (262,144 per `ollama show`) would still
-exceed the 16GB card even with quantization (confirmed live: 17GB, 86% CPU
-fallback) — nowhere close to usable. **The real, safe operating ceiling on
-this hardware, accounting for the embedding model needing to coexist, is
-~24-28K tokens, not the model's headline number and not even the
-solo-model ceiling.** This is a hard constraint on the design, not a tuning
-nicety: whatever you build must default to a context budget inside this
-range and must not silently let a local session's history grow past what
-the hardware can actually hold while keeping both models resident.
-Re-verify these numbers yourself live before relying on them — Ollama/
-driver versions can change this.
+**The actual fix: `codebase_search` is NOT in the local exploration
+phase's own tool set** (see "What to build" below — `read_file` and
+`list_files` only). The two-phase design is already strictly sequential —
+the exploration phase completes and hands off BEFORE the cloud model's turn
+(and anything it triggers, including `codebase_search`) ever runs. The two
+models are never actually needed in VRAM at the same instant, so there is
+no real coexistence constraint to design around. This means the
+exploration phase can use its full SOLO-model context ceiling instead of
+the coexistence-limited one:
+
+| context tokens | qwen3.5:9b alone (flash attn + q8_0 KV, confirmed live) |
+|---|---|
+| 4,096 | 8.6 GB |
+| 32,768 | 9.5 GB |
+| 65,536 | 10 GB |
+| 131,072 | 12 GB |
+| 262,144 (nominal max) | 17 GB — still doesn't fit even quantized, 86% CPU fallback, not usable |
+
+Default the exploration phase's context budget somewhere in the
+131,072-and-under range (real ~4GB headroom at that size) — re-verify these
+numbers live in your environment before picking a final default, they can
+shift with driver/Ollama versions.
 
 **The design this leads to**: a bounded **local exploration phase** that
 runs BEFORE the cloud model's turn, using a read-only, side-effect-free tool
@@ -94,10 +108,15 @@ gathering, nothing else.
 `src/tools/executor.ts` already has `createReadOnlyHeadlessExecutor` (used
 by reviewer/QA), but it includes `execute_command` — that's too permissive
 for this use case (arbitrary command execution has real side-effect
-potential even without file writes). Build a NEW, stricter executor
-variant (or a config option on the existing one) exposing only `read_file`,
-`list_files`, and `codebase_search` — nothing else, not even
-`execute_command`. Every other tool stubbed, matching the existing pattern.
+potential even without file writes). Build a NEW, stricter executor variant
+(or a config option on the existing one) exposing only `read_file` and
+`list_files` — nothing else, not even `execute_command`, and **deliberately
+NOT `codebase_search`** (see the VRAM-coexistence section above for exactly
+why: `codebase_search` needs the embedding model resident at the same time
+as the exploration model is generating, which is the one combination this
+design avoids entirely by keeping the two phases strictly sequential — the
+cloud model gets full `codebase_search` access in its own turn, unaffected).
+Every other tool stubbed, matching the existing pattern.
 
 ### 2. A local exploration session
 
