@@ -54,7 +54,13 @@ import { recordSessionUsage, removeLiveUsage, writeLiveUsage } from "./usage.js"
 import { EventFeed, EVENT_TRUNCATE_CHARS, truncateField } from "./events.js"
 import { Logger } from "./logger.js"
 import { parseToolCalls } from "./parser.js"
-import { appendBrowserActionTool, buildSystemPrompt, loadCustomModes, selectToolsForMode } from "./prompt.js"
+import {
+	appendBrowserActionTool,
+	appendCodeIntelTools,
+	buildSystemPrompt,
+	loadCustomModes,
+	selectToolsForMode,
+} from "./prompt.js"
 import type { ChatMessage, ChatTool, LlmClient, LlmResponse, SessionResult, SessionBudgetUsage } from "./types.js"
 import type { ModeConfig } from "@roo-code/types"
 import {
@@ -500,10 +506,12 @@ export class HeadlessSession {
 				customModes,
 				globalCustomInstructions: this.config.globalCustomInstructions,
 			})).prompt
-		// browser_action is not part of the vendored tool set, so
-		// selectToolsForMode can't include it — append it explicitly so the
-		// model can launch a browser mid-session (see src/tools/browser/).
-		const tools = appendBrowserActionTool(this.config.tools ?? selectToolsForMode(mode, customModes))
+		// browser_action and the four code-intelligence tools are not part of
+		// the vendored tool set, so selectToolsForMode can't include them —
+		// append them explicitly (see src/tools/browser/ and src/codeintel/).
+		const tools = appendCodeIntelTools(
+			appendBrowserActionTool(this.config.tools ?? selectToolsForMode(mode, customModes)),
+		)
 
 		this.state.systemPrompt = systemPrompt
 		this.state.tools = tools

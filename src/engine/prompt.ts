@@ -37,6 +37,7 @@ import { getGroupName, getModeBySlug, modes, getToolsForMode } from "../vendor/z
 import { TOOL_GROUPS } from "../vendor/zoo-code/src/shared/tools.js"
 import { customModesSettingsSchema } from "../vendor/zoo-code/types/index.js"
 import { browserActionTool } from "../tools/browser/tool.js"
+import { CODE_INTEL_TOOLS } from "../codeintel/tools.js"
 import type { ModeConfig } from "@roo-code/types"
 
 import type { ChatTool } from "./types.js"
@@ -54,7 +55,14 @@ export interface BuiltPrompt {
 	customModes: ModeConfig[]
 }
 
-/** The tools the Phase 1 executor actually implements/registers. */
+/**
+ * The vendored tools the executor actually implements/registers. Used as the
+ * final gate when filtering `getNativeTools()` in selectToolsForMode. Two
+ * non-vendored tool sets are NOT in here because they never appear in
+ * getNativeTools(): browser_action and the four code-intelligence tools
+ * (outline / go_to_definition / find_references / import_graph) — callers
+ * append those explicitly via appendBrowserActionTool / appendCodeIntelTools.
+ */
 export const EXECUTABLE_TOOL_NAMES = new Set([
 	"read_file",
 	"write_to_file",
@@ -316,4 +324,24 @@ export function appendBrowserActionTool(tools: ChatTool[]): ChatTool[] {
 		return tools
 	}
 	return [...tools, browserActionTool as unknown as ChatTool]
+}
+
+/**
+ * Append the four code-intelligence tool schemas (outline, go_to_definition,
+ * find_references, import_graph) to a tool list if they aren't already
+ * present. Like browser_action, these are NEW tools with no vendored Zoo Code
+ * upstream (see src/codeintel/tools.ts), so selectToolsForMode can't pick
+ * them up from getNativeTools(); callers that want the model to navigate
+ * source code append them explicitly. Read-only, so they are appended for
+ * every mode including the reviewer/QA executors.
+ */
+export function appendCodeIntelTools(tools: ChatTool[]): ChatTool[] {
+	const present = new Set(
+		tools.filter((t) => t.type === "function").map((t) => (t.function as { name: string }).name),
+	)
+	const missing = CODE_INTEL_TOOLS.filter((t) => t.type === "function" && !present.has(t.function.name))
+	if (missing.length === 0) {
+		return tools
+	}
+	return [...tools, ...(missing as unknown as ChatTool[])]
 }
