@@ -10,11 +10,21 @@
  * summary poll — this is meant to feel live), appending new events to the
  * DOM rather than re-rendering the whole feed, and auto-scrolling to the
  * latest event unless the user has manually scrolled up. The panel also
- * carries pause/resume buttons (POST /api/session/:id/pause|resume).
+ * carries pause/resume buttons (POST /api/session/:id/pause|resume) and a
+ * checkpoints panel (GET /api/checkpoints list + GET /api/checkpoints/diff,
+ * POST /api/checkpoints/restore).
+ *
+ * Checkpoints panel: lists the session's shadow-git checkpoints; clicking one
+ * shows its unified-diff-style text block vs the working tree; Restore
+ * reverts REAL workspace files and therefore requires a two-step confirm
+ * (the button arms first — a second click fires the POST). After a restore
+ * the list + diff refresh so the view never shows stale data.
  *
  * NOTE (Phase 3 scope change): this page is no longer purely read-only — the
- * pause/resume buttons issue state-changing POSTs. Local-only + no-auth,
- * matching the server; see src/dashboard/server.ts's header note.
+ * pause/resume buttons issue state-changing POSTs, and restore is fully
+ * destructive. Local-only + no-auth by default; the restore POST goes
+ * through the same optional bearer-token gate as the other control POSTs
+ * when HEADLESSCODE_DASHBOARD_TOKEN is set (see src/dashboard/server.ts).
  */
 
 export function renderPage(): string {
@@ -140,6 +150,46 @@ export function renderPage(): string {
   .answer-box input[type="text"] { flex: 1; font-size: 0.8rem; padding: 3px 8px; }
   .answer-box button { font-size: 0.75rem; padding: 3px 12px; border-radius: 6px; cursor: pointer; }
   .answer-box .answer-status { font-size: 0.75rem; color: GrayText; margin-left: 6px; }
+
+  /* Checkpoints panel (browser checkpoint list/diff/restore): sits between
+     the detail head and the event feed. Plain rows + a unified-diff <pre> —
+     no framework, matching this page's ethos. */
+  #checkpointsPanel {
+    border-top: 1px solid color-mix(in srgb, CanvasText 12%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, CanvasText 12%, transparent);
+    padding: 8px 16px;
+  }
+  .checkpoints-head { display: flex; align-items: baseline; gap: 8px; font-weight: 600; font-size: 0.85rem; }
+  .checkpoints-head .ckpt-status { font-weight: 400; color: GrayText; font-size: 0.75rem; }
+  .ckpt-list { margin-top: 4px; }
+  .ckpt-row {
+    display: flex; gap: 10px; align-items: baseline; padding: 3px 0;
+    border-bottom: 1px solid color-mix(in srgb, CanvasText 6%, transparent);
+    font-size: 0.8rem; cursor: pointer;
+  }
+  .ckpt-row:hover { background: color-mix(in srgb, CanvasText 5%, transparent); }
+  .ckpt-row.selected { background: color-mix(in srgb, #8250df 12%, transparent); }
+  .ckpt-row .ckpt-msg { flex: 1; word-break: break-word; }
+  .ckpt-row .ckpt-date { color: GrayText; flex-shrink: 0; }
+  .ckpt-row .ckpt-hash { color: GrayText; flex-shrink: 0; }
+  .ckpt-diff { margin-top: 8px; }
+  .ckpt-diff-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .ckpt-diff-head button {
+    font-size: 0.75rem; padding: 3px 12px; border-radius: 6px; cursor: pointer;
+    border: 1px solid color-mix(in srgb, CanvasText 30%, transparent); background: color-mix(in srgb, CanvasText 8%, transparent);
+  }
+  .ckpt-diff-head button:disabled { opacity: 0.45; cursor: not-allowed; }
+  .ckpt-diff-head button.restore-armed {
+    background: #c0392b; color: #fff; border-color: #c0392b; font-weight: 600;
+  }
+  .ckpt-diff-head .ckpt-restore-msg { font-size: 0.75rem; }
+  #ckptDiffBody {
+    max-height: 300px; overflow-y: auto; margin-top: 6px; padding: 8px 12px;
+    background: color-mix(in srgb, CanvasText 4%, transparent);
+    border: 1px solid color-mix(in srgb, CanvasText 12%, transparent);
+    border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.75rem; white-space: pre-wrap; word-break: break-word;
+  }
 </style>
 </head>
 <body>
@@ -191,6 +241,18 @@ export function renderPage(): string {
       </span>
       <button class="close" id="detailClose" title="close">✕</button>
     </div>
+    <div id="checkpointsPanel">
+      <div class="checkpoints-head">📸 Checkpoints <span class="ckpt-status" id="ckptStatus"></span></div>
+      <div class="ckpt-list" id="ckptList"></div>
+      <div class="ckpt-diff" id="ckptDiff" style="display:none">
+        <div class="ckpt-diff-head">
+          <span class="mono" id="ckptDiffTitle"></span>
+          <button id="btnRestore" title="reverts real workspace files to this checkpoint">Restore</button>
+          <span class="ckpt-restore-msg" id="ckptRestoreMsg"></span>
+        </div>
+        <pre id="ckptDiffBody"></pre>
+      </div>
+    </div>
     <div id="feed"><div class="feed-empty">select a session to watch its live event feed</div></div>
   </div>
 
@@ -226,9 +288,9 @@ const EVENT_LABELS = {
 // Current detail view state: null when closed.
 let detail = null; // { sessionId, source, nextOffset, lastEventCount, userScrolledUp }
 
-function openDetail(sessionId, source, status) {
+function openDetail(sessionId, source, status, workspace) {
   closeDetail();
-  detail = { sessionId, source, nextOffset: 0, lastEventCount: 0, userScrolledUp: false, status };
+  detail = { sessionId, source, nextOffset: 0, lastEventCount: 0, userScrolledUp: false, status, workspace };
   document.getElementById("detail").style.display = "block";
   document.getElementById("detailSessionId").textContent = sessionId;
   document.getElementById("detailSource").textContent = "· " + (source || "");
@@ -239,12 +301,18 @@ function openDetail(sessionId, source, status) {
   detail.userScrolledUp = false;
   feed.scrollTop = 0;
   pollEvents();
+  // The checkpoints panel loads alongside the event feed.
+  loadCheckpoints();
 }
 
 function closeDetail() {
   if (detail) {
     detail = null;
   }
+  // Reset checkpoint state so the panel shows nothing stale next open.
+  ckptEntries = [];
+  ckptSelectedHash = null;
+  ckptRestoreArmed = false;
   document.getElementById("detail").style.display = "none";
 }
 
@@ -384,6 +452,146 @@ async function controlSession(action) {
   updateDetailControls();
 }
 
+// ── Checkpoints (browser checkpoint list/diff/restore) ──────────────────────
+// The panel in the session detail view lists the session's shadow-git
+// checkpoints (message, date, hash) via GET /api/checkpoints. Clicking a row
+// loads its diff (GET /api/checkpoints/diff) and renders it as a plain
+// unified-diff-style text block. Restore reverts REAL files, so it needs a
+// two-step confirm: the button first arms ("really restore?"), and only a
+// second click on the armed button fires the POST. After a successful restore
+// the list + diff refresh so the view never shows stale data.
+let ckptEntries = []; // { hash, message, date } for the current detail session
+let ckptSelectedHash = null;
+let ckptRestoreArmed = false;
+
+async function loadCheckpoints() {
+  const listEl = document.getElementById("ckptList");
+  const statusEl = document.getElementById("ckptStatus");
+  const diffEl = document.getElementById("ckptDiff");
+  if (!detail) return;
+  // The detail view is keyed by session id; the checkpoints routes are keyed
+  // by the same session id (HeadlessSession uses sessionId as the checkpoint
+  // taskId). The workspace the shadow repo tracks is the session's recorded
+  // workspaceRoot (a worker session may live in a worktree, not --repo).
+  const params = new URLSearchParams({ session: detail.sessionId });
+  if (detail.workspace) params.set("repo", detail.workspace);
+  try {
+    const res = await fetch("/api/checkpoints?" + params.toString());
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    ckptEntries = data.entries || [];
+    ckptSelectedHash = null;
+    ckptRestoreArmed = false;
+    diffEl.style.display = "none";
+    document.getElementById("ckptDiffBody").textContent = "";
+    document.getElementById("ckptRestoreMsg").textContent = "";
+    if (ckptEntries.length === 0) {
+      statusEl.textContent = "none for this session";
+      listEl.innerHTML = '<div class="feed-empty">no checkpoints</div>';
+      return;
+    }
+    statusEl.textContent = ckptEntries.length + " checkpoint" + (ckptEntries.length > 1 ? "s" : "");
+    listEl.innerHTML = "";
+    for (const entry of ckptEntries) {
+      const row = document.createElement("div");
+      row.className = "ckpt-row";
+      row.dataset.hash = entry.hash;
+      row.innerHTML =
+        '<span class="ckpt-msg">' + esc(entry.message) + "</span>" +
+        '<span class="ckpt-date">' + esc(entry.date) + "</span>" +
+        '<span class="ckpt-hash mono">' + esc(entry.hash.slice(0, 12)) + "</span>";
+      row.addEventListener("click", () => selectCheckpoint(entry.hash, row));
+      listEl.appendChild(row);
+    }
+  } catch (err) {
+    statusEl.textContent = "";
+    listEl.innerHTML = '<div class="feed-empty">failed to load checkpoints: ' + esc(String(err)) + "</div>";
+  }
+}
+
+function selectCheckpoint(hash, row) {
+  ckptSelectedHash = hash;
+  ckptRestoreArmed = false;
+  const restoreBtn = document.getElementById("btnRestore");
+  restoreBtn.classList.remove("restore-armed");
+  restoreBtn.textContent = "Restore";
+  restoreBtn.disabled = false;
+  document.getElementById("ckptRestoreMsg").textContent = "";
+  document.getElementById("ckptRestoreMsg").className = "ckpt-restore-msg";
+  document.querySelectorAll(".ckpt-row").forEach((r) => r.classList.toggle("selected", r === row));
+  loadDiff(hash);
+}
+
+async function loadDiff(hash) {
+  const diffEl = document.getElementById("ckptDiff");
+  const titleEl = document.getElementById("ckptDiffTitle");
+  const bodyEl = document.getElementById("ckptDiffBody");
+  const entry = ckptEntries.find((e) => e.hash === hash);
+  titleEl.textContent = (entry ? entry.message : hash.slice(0, 12)) + " vs working tree";
+  bodyEl.textContent = "loading diff…";
+  diffEl.style.display = "block";
+  const params = new URLSearchParams({ session: detail.sessionId, from: hash });
+  if (detail.workspace) params.set("repo", detail.workspace);
+  try {
+    const res = await fetch("/api/checkpoints/diff?" + params.toString());
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    bodyEl.textContent = data.diff || "(no changes)";
+  } catch (err) {
+    bodyEl.textContent = "failed to load diff: " + err;
+  }
+}
+
+// Restore is DESTRUCTIVE (reverts real workspace files) — never a single
+// accidental click. First click arms the button (turns red + changes label);
+// second click actually POSTs.
+async function restoreSelected() {
+  const restoreBtn = document.getElementById("btnRestore");
+  const msgEl = document.getElementById("ckptRestoreMsg");
+  if (!ckptSelectedHash) return;
+  if (!ckptRestoreArmed) {
+    ckptRestoreArmed = true;
+    restoreBtn.classList.add("restore-armed");
+    restoreBtn.textContent = "⚠ Really restore?";
+    msgEl.textContent = "this reverts real files in the workspace to the selected checkpoint — uncommitted changes since then are lost";
+    msgEl.className = "ckpt-restore-msg";
+    return;
+  }
+  restoreBtn.disabled = true;
+  msgEl.textContent = "restoring…";
+  msgEl.className = "ckpt-restore-msg";
+  try {
+    const params = new URLSearchParams({ session: detail.sessionId });
+    if (detail.workspace) params.set("repo", detail.workspace);
+    const res = await fetch("/api/checkpoints/restore?" + params.toString(), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ hash: ckptSelectedHash }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      msgEl.textContent = "restore failed: " + (data.error || ("HTTP " + res.status));
+      msgEl.className = "ckpt-restore-msg status-error";
+      restoreBtn.disabled = false;
+      return;
+    }
+    msgEl.textContent = "restored ✓ to " + ckptSelectedHash.slice(0, 12) + " — files reverted";
+    msgEl.className = "ckpt-restore-msg status-success";
+    // Reflect the new state: re-list (restore rewrites the workspace; the
+    // checkpoint set itself is unchanged but the working tree is now at the
+    // restored commit) and refresh the selected diff (now vs the restored
+    // tree, so "no changes" is expected).
+    await loadCheckpoints();
+    if (ckptEntries.some((e) => e.hash === ckptSelectedHash)) {
+      loadDiff(ckptSelectedHash);
+    }
+  } catch (err) {
+    msgEl.textContent = "restore failed: " + err;
+    msgEl.className = "ckpt-restore-msg status-error";
+    restoreBtn.disabled = false;
+  }
+}
+
 function renderTotals(totals) {
   const el = document.getElementById("totals");
   const cacheHitRate = totals.inputTokens > 0 ? (100 * (totals.cachedTokens ?? 0)) / totals.inputTokens : 0;
@@ -450,7 +658,7 @@ function renderSessions(sessions) {
   // Every row is clickable: opens the live event detail panel for that
   // session (the detail panel polls /api/session/:id/events while open).
   const rows = sessions.map((s) => \`
-    <tr class="session-row" data-session-id="\${esc(s.sessionId)}" data-source="\${esc(s.source)}" data-status="\${esc(s.status)}" style="cursor:pointer">
+    <tr class="session-row" data-session-id="\${esc(s.sessionId)}" data-source="\${esc(s.source)}" data-status="\${esc(s.status)}" data-workspace="\${esc(s.workspaceRoot)}" style="cursor:pointer">
       <td class="mono">\${esc(s.sessionId.slice(0, 8))}</td>
       <td>\${esc(s.mode)}</td>
       <td>\${esc(s.model)}</td>
@@ -475,7 +683,7 @@ function renderSessions(sessions) {
   // container and read the clicked row's data attributes.
   el.querySelectorAll(".session-row").forEach((row) => {
     row.addEventListener("click", () => {
-      openDetail(row.dataset.sessionId, row.dataset.source, row.dataset.status);
+      openDetail(row.dataset.sessionId, row.dataset.source, row.dataset.status, row.dataset.workspace);
     });
   });
 }
@@ -696,7 +904,7 @@ async function startSession() {
       return;
     }
     // Navigate immediately to the new session's live event view.
-    openDetail(data.sessionId, ".", "running");
+    openDetail(data.sessionId, ".", "running", data.workspace);
     msg.textContent = "launched ✓ session " + data.sessionId.slice(0, 8) + " — watching its event feed";
     msg.className = "status-success";
   } catch (err) {
@@ -842,6 +1050,7 @@ document.getElementById("detailClose").addEventListener("click", closeDetail);
 document.getElementById("btnPause").addEventListener("click", () => controlSession("pause"));
 document.getElementById("btnResume").addEventListener("click", () => controlSession("resume"));
 document.getElementById("btnStart").addEventListener("click", startSession);
+document.getElementById("btnRestore").addEventListener("click", restoreSelected);
 // Enter in the task box submits too (shift+enter for a newline).
 document.getElementById("launchTask").addEventListener("keydown", (ev) => {
   if (ev.key === "Enter" && !ev.shiftKey) {
