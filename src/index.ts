@@ -27,6 +27,19 @@ export {
 	DEFAULT_CONDENSE_THRESHOLD_FRACTION,
 	DEFAULT_CONTEXT_WINDOW_TOKENS,
 } from "./engine/condense.js"
+export {
+	runLocalExplorePhase,
+	buildLocalExploreHandoffMessage,
+	buildLocalExploreTools,
+	OllamaLocalChatClient,
+	LocalExploreError,
+	isLocalExploreEnabled,
+	LOCAL_EXPLORE_ENV,
+	DEFAULT_LOCAL_EXPLORE_MODEL,
+	DEFAULT_LOCAL_EXPLORE_MAX_ITERATIONS,
+	DEFAULT_LOCAL_EXPLORE_CONTEXT_TOKENS,
+	EXPLORE_SYSTEM_PROMPT,
+} from "./engine/local-explore.js"
 export { Logger } from "./engine/logger.js"
 export { parseToolCalls, parseToolCall, bestEffortPartialJson } from "./engine/parser.js"
 export {
