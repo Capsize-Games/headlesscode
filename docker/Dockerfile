@@ -1,0 +1,94 @@
+# syntax=docker/dockerfile:1
+# ---------------------------------------------------------------------------
+# headlesscode — standalone headless coding-agent CLI, packaged as a Docker
+# image.
+#
+# This is the image airunner's compose stack runs as a sidecar service next
+# to the Python `server` container (see docs/airunner-docker-packaging.md).
+# Node 22 (matching the LTS this stack's client build already uses in
+# Dockerfile.caddy) + git; tsx executes the TypeScript source directly —
+# there is no compiled output in this repo, so devDependencies are needed at
+# runtime and installed via `npm ci`.
+#
+# Build context = headlesscode repo root:
+#   docker build -f docker/Dockerfile -t headlesscode:0.1.0 .
+#
+# Deliberately NOT installed here:
+#   - Playwright browser binaries. The `playwright` npm package installs as
+#     JS-only (no browser download on npm ci — no install script), and
+#     browser binaries are a ~400MB addition, so browser_action is disabled
+#     until an explicit `npx playwright install chromium` (+ install-deps)
+#     step is run. See docs/airunner-docker-packaging.md §Playwright.
+#   - Docker CLI / docker.sock. Per-session container isolation
+#     (DockerSessionProvider) is a separate, undecided security expansion —
+#     v1 runs sessions as plain git worktrees + sibling processes, which
+#     needs no Docker. See docs/airunner-docker-packaging.md §Isolation.
+# ---------------------------------------------------------------------------
+
+FROM node:22-bookworm-slim
+
+# git: the orchestration path (worktree spawn / checkpoints / reviewers)
+# shells out to git constantly. ca-certificates: HTTPS for OpenRouter + npm.
+# curl: handy for debugging the sidecar (no healthcheck dependency on it —
+# the compose healthcheck calls `headlesscode --version`).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/headlesscode
+
+# Dependencies first, for layer caching: package manifest + lockfile only.
+COPY package.json package-lock.json tsconfig.json ./
+# Full install (devDependencies included): tsx + typescript run the
+# TypeScript source at runtime. Playwright is a devDependency but installs
+# JS-only — no browser binaries are downloaded.
+RUN npm ci --no-audit --no-fund
+
+# Application source (the vendored portable core lives under src/vendor/).
+COPY src ./src
+
+# Runtime orchestration scripts: the non-dry-run orchestrate path shells out
+# to scripts/spawn-parallel-worktrees.sh, which in turn launches each worker
+# via scripts/run-worker.sh; headlesscode-answer.sh answers decision-escalation
+# prompts a blocked worker (scripts' HARNESS_ROOT resolves to /opt/headlesscode
+# from BASH_SOURCE, so they find src/cli.ts + node_modules here). The rest of
+# scripts/ is dev/deploy tooling (GUI injection, phone-home, QA runs) that has
+# no business in the image.
+COPY scripts/spawn-parallel-worktrees.sh scripts/run-worker.sh scripts/headlesscode-answer.sh ./scripts/
+RUN chmod +x scripts/spawn-parallel-worktrees.sh scripts/run-worker.sh scripts/headlesscode-answer.sh
+
+# The package.json `bin` entry (src/cli.ts, shebang `#!/usr/bin/env tsx`)
+# only becomes executable when headlesscode is installed as a dependency of
+# another package, so wire a fixed wrapper that mirrors the repo's own
+# `tsx src/cli.ts` invocation.
+#
+# TSX_TSCONFIG_PATH: tsx discovers tsconfig.json from the *cwd*, but the CLI
+# is invoked from arbitrary working directories (orchestrated project
+# checkouts, scratch repos, /data/...), so without this the `vscode` ->
+# src/vendor/zoo-code/shim path alias wouldn't resolve and every command
+# fails with ERR_MODULE_NOT_FOUND. Pinning the tsconfig makes resolution
+# cwd-independent.
+RUN printf '#!/bin/sh\nexport TSX_TSCONFIG_PATH=/opt/headlesscode/tsconfig.json\nexec /opt/headlesscode/node_modules/.bin/tsx /opt/headlesscode/src/cli.ts "$@"\n' \
+        > /usr/local/bin/headlesscode \
+    && chmod +x /usr/local/bin/headlesscode
+
+# Persistent state lives on the /data volume (named `server_data` in
+# airunner's compose) so it survives image rebuilds — never inside the
+# container filesystem. HEADLESSCODE_WORKSPACE_ROOT is where orchestrated
+# project checkouts + their .headlesscode/ dirs go; HOME (default
+# ~/.headlesscode/checkpoints, playwright cache) also lands under /data.
+ENV HEADLESSCODE_WORKSPACE_ROOT=/data/headlesscode-workspaces \
+    HOME=/data/headlesscode-home
+
+# docker/entrypoint.sh re-creates these dirs at every container start — the
+# volume mount shadows whatever the image build created.
+COPY docker/entrypoint.sh /usr/local/bin/headlesscode-entrypoint.sh
+RUN chmod +x /usr/local/bin/headlesscode-entrypoint.sh
+
+EXPOSE 4390
+ENTRYPOINT ["/usr/local/bin/headlesscode-entrypoint.sh"]
+# v1: the sidecar is an install target, not yet wired into uwu's tool
+# calling (that's plans/uwuchat-integration.md's Tier 1). Keep it alive so
+# the server container can reach it over the Docker network; Tier 1 replaces
+# this with the real invocation surface.
+CMD ["sleep", "infinity"]
