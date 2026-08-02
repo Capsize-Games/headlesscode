@@ -142,6 +142,27 @@ re-derive it). Register it in `code` mode's tool set
 (`createHeadlessExecutor` — follow the precedent of how `codebase_search`/
 codeintel tools were added recently). Returns the description the same way.
 
+### 3a. `describe_image` needs a real usage nudge — this is not optional
+
+Real evidence from this project's own live sessions: tools shipped with only
+a good schema description and no rules-file mention get essentially zero
+adoption (`outline`/`go_to_definition`/`find_references`/`import_graph`
+landed with solid descriptions and were used 0 times across three separate
+live sessions, except `outline` at 7 calls total). `codebase_search`, by
+contrast, got real repeated adoption specifically because its own task
+required adding explicit "try this before X" guidance to
+`.roo/rules-code/rules.md` AND verifying live that the guidance actually
+changed behavior. This project's `.roo/rules/rules.md` now codifies this as
+a standing requirement ("A new tool is not done until something tells a
+model to reach for it") — read that section before finishing this task.
+Concretely: add a short, scannable entry to `.roo/rules-code/rules.md`
+(match the existing compact bullet-list format used for the code-intel
+tools' section — do not write a long prose paragraph) telling the model
+when to reach for `describe_image` (e.g., after a `browser_action`
+screenshot if it wasn't already auto-described per item 2 above, or when a
+task references an image already in the workspace), and confirm in a real
+session that the model actually uses it when relevant.
+
 ### 4. Update the now-stale comment/description
 
 `src/tools/browser/tool.ts`'s header comment and the screenshot tool's own
