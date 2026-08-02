@@ -57,11 +57,13 @@ import { parseToolCalls } from "./parser.js"
 import {
 	appendBrowserActionTool,
 	appendCodeIntelTools,
+	appendDescribeImageTool,
 	buildSystemPrompt,
 	loadCustomModes,
 	selectToolsForMode,
 } from "./prompt.js"
 import type {
+	AuxLlmUsage,
 	ChatMessage,
 	ChatTool,
 	LlmClient,
@@ -650,6 +652,13 @@ export class HeadlessSession {
 						fields,
 					)
 				},
+				// Cloud vision captioning: every auxiliary LLM call's usage
+				// (browser screenshots, describe_image) flows into the SAME
+				// BudgetTracker + running totals as a main call, so image cost
+				// is never an untracked side channel (recordAuxLlmUsage below).
+				// The budgetTracker field is assigned later in run() — handler
+				// calls only happen after that, so the closure sees it set.
+				onAuxLlmUsage: (usage) => this.recordAuxLlmUsage(usage),
 			})
 		this.sessionId = config.sessionId?.trim() ? config.sessionId.trim() : randomUUID()
 		this.parentSessionId = this.config.parentSessionId
@@ -718,11 +727,14 @@ export class HeadlessSession {
 				customModes,
 				globalCustomInstructions: this.config.globalCustomInstructions,
 			})).prompt
-		// browser_action and the four code-intelligence tools are not part of
-		// the vendored tool set, so selectToolsForMode can't include them —
-		// append them explicitly (see src/tools/browser/ and src/codeintel/).
+		// browser_action, describe_image and the four code-intelligence tools
+		// are not part of the vendored tool set, so selectToolsForMode can't
+		// include them — append them explicitly (see src/tools/browser/,
+		// src/vision/ and src/codeintel/).
 		const tools = appendCodeIntelTools(
-			appendBrowserActionTool(this.config.tools ?? selectToolsForMode(mode, customModes)),
+			appendDescribeImageTool(
+				appendBrowserActionTool(this.config.tools ?? selectToolsForMode(mode, customModes)),
+			),
 		)
 
 		this.state.systemPrompt = systemPrompt
@@ -1173,6 +1185,48 @@ export class HeadlessSession {
 			throw err
 		}
 		this.logger.info("[usage] condensation call recorded", {
+			inputTokens,
+			outputTokens,
+			cachedTokens,
+			costUsd: budgetTracker.totalCostUsd,
+		})
+	}
+
+	/**
+		* Feed an auxiliary LLM call's usage — cloud vision captioning
+		* (src/vision/describe.ts): browser screenshots and the describe_image
+		* tool — into the same BudgetTracker + running session totals as a main
+		* call, so image cost shows up in the session's real total instead of an
+		* untracked side channel. A budget trip from this spend propagates to the
+		* tool handler that made the call; the next tick() then aborts the session
+		* exactly like a main call's record() trip.
+		*/
+	private recordAuxLlmUsage(usage: AuxLlmUsage): void {
+		const inputTokens = usage.inputTokens
+		const outputTokens = usage.outputTokens
+		const cachedTokens = usage.cachedTokens ?? 0
+		this.totalInputTokens += inputTokens
+		this.totalOutputTokens += outputTokens
+		this.totalCachedTokens += cachedTokens
+		const budgetTracker = this.budgetTracker
+		if (budgetTracker === null) {
+			return // no tracker — pure accounting is impossible; nothing else to do
+		}
+		try {
+			budgetTracker.record({
+				model: usage.model,
+				inputTokens,
+				outputTokens,
+				cachedTokens,
+			})
+		} catch (err) {
+			// Rethrow — the tool handler that made the call surfaces it (see
+			// the browser screenshot / describe_image handlers) and the next
+			// tick() converts it into a budgetFailure session result.
+			throw err
+		}
+		this.logger.info("[usage] auxiliary LLM call recorded", {
+			model: usage.model,
 			inputTokens,
 			outputTokens,
 			cachedTokens,

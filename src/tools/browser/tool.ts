@@ -15,15 +15,16 @@
  * click / type / getConsoleLogs / getNetworkErrors / close. No arbitrary
  * Playwright API passthrough.
  *
- * Tool-result image caveat: ToolResult (src/engine/types.ts) carries only a
- * string `content` — there is NO image-content part anywhere in this
- * harness's ChatMessage/tool-result plumbing (the vendored upstream has
- * image support in its message types, but this harness's local types do
- * not). Screenshots are therefore written to a PNG file inside the
- * workspace and the tool returns the path + page URL/title, so the model can
- * read/inspect it via read_file if its provider supports images — never a
- * silent text-only placeholder. This is a documented, real prerequisite gap,
- * not a workaround.
+ * Image handling: ToolResult (src/engine/types.ts) carries only a string
+ * `content` — there is NO image-content part in this harness's
+ * ChatMessage/tool-result plumbing, and the pinned primary model
+ * (deepseek/deepseek-v4-flash) cannot process images at all. Screenshots are
+ * therefore described by the cloud vision captioner (src/vision/describe.ts):
+ * the PNG is saved inside the workspace, sent to an OpenRouter vision model,
+ * and the resulting TEXT description is embedded directly in the tool result
+ * (cost flows through the session's BudgetTracker via onAuxLlmUsage). The raw
+ * image never reaches the main model — but the file path is kept in the
+ * result too, for callers that want the PNG itself.
  *
  * The schema's `action` union is shared with the handler in
  * src/tools/browser/handler.ts, which owns the actual session lifecycle and
@@ -41,7 +42,7 @@ This tool is for VERIFICATION — a browser is stateful: check the page with scr
 Parameters:
 - action: (required) One of:
   - "launch": Start the headless browser and navigate to url. Re-launching later closes the previous browser and starts fresh.
-  - "screenshot": Capture the current page as a PNG. The PNG is written to a file under the workspace (path: <workspaceRoot>/.headlesscode/browser-screenshots/<timestamp>.png) and the result reports the file path + the current page title/URL, because this harness's tool results are text-only. Read the PNG back with read_file to view it (if your model supports images).
+  - "screenshot": Capture the current page as a PNG. The PNG is written to a file under the workspace (path: <workspaceRoot>/.headlesscode/browser-screenshots/<timestamp>.png) and then described by a cloud vision model — the result includes a real TEXT description of the page (visible text, layout, error messages, UI state) plus the file path + current page title/URL. No raw image reaches the model; act on the description directly.
   - "click": Click the first element matching selector (a CSS selector).
   - "type": Type text into the first element matching selector (a CSS selector; the element must be focusable — a text input or textarea).
   - "getConsoleLogs": Return console messages (including errors) captured from the page since the last getConsoleLogs call (each call returns only NEW entries).

@@ -40,6 +40,22 @@ If a tool returns "not supported" (non-TS/JS file) or "could not resolve,"
 that's a real, final answer for that file/symbol — fall back to
 `read_file`/grep, don't retry.
 
+## Reach for `describe_image` when a task references an image
+
+- **Need to know what an image in the workspace actually shows** (a
+  screenshot checked into the repo, a diagram, a design mockup, a broken-page
+  capture)? `describe_image` with `{path}` returns a detailed text
+  description from a cloud vision model — visible text verbatim, layout, UI
+  states, what looks wrong — so you can act on images without ever seeing
+  them. It costs a small real amount (an LLM API call); use it deliberately,
+  not speculatively.
+- **Do NOT call it for screenshots you took yourself with `browser_action`**
+  — those are already auto-described in the screenshot result (and in that
+  flow the description is what reaches you, never the raw PNG).
+- Each call makes a real paid LLM request — when in doubt whether an image is
+  even relevant, prefer reading the task/commit message first, then describe
+  the image only if it matters.
+
 ## Once you have a line number, prefer `read_file`'s `indentation` mode
 
 - When a `codebase_search` result, grep match, error stack trace, or

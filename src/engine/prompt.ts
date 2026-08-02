@@ -37,6 +37,7 @@ import { getGroupName, getModeBySlug, modes, getToolsForMode } from "../vendor/z
 import { TOOL_GROUPS } from "../vendor/zoo-code/src/shared/tools.js"
 import { customModesSettingsSchema } from "../vendor/zoo-code/types/index.js"
 import { browserActionTool } from "../tools/browser/tool.js"
+import { describeImageTool } from "../vision/tool.js"
 import { CODE_INTEL_TOOLS } from "../codeintel/tools.js"
 import type { ModeConfig } from "@roo-code/types"
 
@@ -333,6 +334,23 @@ export function appendBrowserActionTool(tools: ChatTool[]): ChatTool[] {
 		return tools
 	}
 	return [...tools, browserActionTool as unknown as ChatTool]
+}
+
+/**
+ * Append the describe_image tool schema (cloud vision captioning — see
+ * src/vision/) to a tool list if it isn't already present. Like
+ * browser_action, it is a NEW tool with no vendored Zoo Code upstream, so
+ * selectToolsForMode can't pick it up from getNativeTools(); callers that
+ * want the model to inspect images append it explicitly. Only wired where a
+ * real accounting session exists (onAuxLlmUsage) — read-only reviewer/QA
+ * executors deliberately don't advertise it (their executors don't register
+ * the handler, and calls there would be untracked spend).
+ */
+export function appendDescribeImageTool(tools: ChatTool[]): ChatTool[] {
+	if (tools.some((t) => t.type === "function" && t.function.name === describeImageTool.function.name)) {
+		return tools
+	}
+	return [...tools, describeImageTool as unknown as ChatTool]
 }
 
 /**

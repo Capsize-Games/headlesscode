@@ -92,6 +92,15 @@ export const DEFAULT_PRICING_TABLE: PricingTable = {
  "deepseek/deepseek-v4-flash": { input: 0.14, output: 0.28, cacheRead: 0.0028 },
  "anthropic/claude-3.5-sonnet": { input: 3.0, output: 15.0 },
  "qwen/qwen3-embedding-4b": { input: 0.15, output: 0.15 },
+ // Cloud vision captioning (src/vision/describe.ts). Live OpenRouter list
+ // rates pulled 2026-08-02 for image-input models; the 12b is the default
+ // (cheapest candidate that wasn't materially worse than the quality anchor
+ // in the image-support evaluation — see plans/image-support.md), and the
+ // 27b is priced too so an override to the quality anchor still estimates
+ // accurately instead of falling through to FALLBACK_MODEL_PRICE. Both were
+ // verified live against the API during the evaluation.
+ "google/gemma-3-12b-it": { input: 0.05, output: 0.15 },
+ "google/gemma-3-27b-it": { input: 0.08, output: 0.45 },
 }
 
 /**
