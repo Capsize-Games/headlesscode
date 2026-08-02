@@ -13,6 +13,9 @@
  * Event types emitted by HeadlessSession (see src/engine/loop.ts):
  *   session_start / iteration_start / llm_response / tool_call / tool_result
  *   checkpoint_saved / decision_blocked / decision_answered
+ *   todo_updated (update_todo_list: full normalized checklist + counts —
+ *   done / inProgress / pending; the dashboard reads this to render live
+ *   planning state)
  *   paused / resumed / session_end
  *
  * Unlike the live usage snapshot (deleted at session end because the final
@@ -236,6 +239,23 @@ export class EventFeed {
 	/** iteration 0 = the session's baseline checkpoint (before iteration 1). */
 	checkpointSaved(iteration: number): Promise<void> {
 		return this.emit("checkpoint_saved", { iteration })
+	}
+
+	/**
+	 * Todo-list state change (update_todo_list): the full normalized checklist
+	 * (truncated like every other large field) plus done / in-progress /
+	 * pending counts, so the dashboard can show live planning state and the
+	 * history can show how the checklist evolved across the session.
+	 */
+	todoUpdated(fields: { todos: string; done: number; inProgress: number; pending: number }): Promise<void> {
+		const t = truncateField(fields.todos)
+		return this.emit("todo_updated", {
+			todos: t.text,
+			...(t.truncated ? { todosTruncated: true } : {}),
+			done: fields.done,
+			inProgress: fields.inProgress,
+			pending: fields.pending,
+		})
 	}
 
 	decisionBlocked(question: string, suggestions?: string[]): Promise<void> {
