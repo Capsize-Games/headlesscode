@@ -1,16 +1,19 @@
 /**
- * `headlesscode provision` subcommand — GitHub App repo provisioning.
+ * GitHub App CLI subcommands — `headlesscode provision` and
+ * `headlesscode push-pr`.
  *
  *   npx tsx src/cli.ts provision --installation-id <id> --owner <o> --repo <r> --target <dir>
+ *   npx tsx src/cli.ts push-pr --installation-id <id> --owner <o> --repo <r> \
+ *     --local-dir <path> --branch <name> --title <title> --body <text> [--base <branch>]
  *
- * The manual/scriptable entry point for "give me this repo, right now": gets
- * a fresh installation access token (from GITHUB_APP_ID + the App private
- * key), clones the repo into --target, strips the token from the remote URL,
- * and prints the resulting local path — ready to be used as a `--workspace`
- * value for an orchestrate round, a single session, etc.
+ * `provision` is the read half: gets a fresh installation access token (from
+ * GITHUB_APP_ID + the App private key), clones the repo into --target, strips
+ * the token from the remote URL, and prints the resulting local path — ready
+ * to be used as a `--workspace` value. Also `--list-repos <installation-id>`.
  *
- * Also `--list-repos <installation-id>`: list the repositories the
- * installation can access (what a future "choose a project" UI would call).
+ * `push-pr` is the write half: pushes a local branch to the repo with the
+ * same installation token (token scrubbed from .git/config immediately), then
+ * opens a PR from it — never to the repo's default branch, never auto-merged.
  *
  * Thin dispatch to src/github/ — no logic duplicated here. Exit codes match
  * the project convention: 0 success, 1 runtime failure, 2 usage/config error.
@@ -21,7 +24,9 @@ import * as path from "node:path"
 
 import { createAppAuthClient } from "./app-auth.js"
 import { listInstallationRepos } from "./installations.js"
+import { getRepoDefaultBranch, openPullRequest } from "./pr.js"
 import { provisionRepo } from "./provision.js"
+import { pushBranch } from "./push.js"
 
 const PROVISION_USAGE = `headlesscode provision — GitHub App repo provisioning
 
@@ -210,4 +215,234 @@ export async function provisionMain(argv: string[]): Promise<number> {
 		process.stderr.write(`headlesscode provision: ${err instanceof Error ? err.message : String(err)}\n`)
 		return 1
 	}
+}
+
+const PUSH_PR_USAGE = `headlesscode push-pr — push a branch + open a pull request
+
+Usage:
+	 headlesscode push-pr --installation-id <id> --owner <o> --repo <r> \\
+	   --local-dir <path> --branch <name> --title <title> --body <text> [--base <branch>]
+	     Push the local <branch> (the current HEAD of <local-dir>, which must
+	     already have the work committed) to <owner>/<repo> using a GitHub App
+	     installation access token, then open a pull request from <branch> into
+	     --base (default: the repo's ACTUAL default branch, resolved from the
+	     repo API — never hardcoded). Prints "#<n>: <url>".
+	     The token is scrubbed from the origin URL immediately after the push
+	     (it never persists in .git/config) and push-pr NEVER pushes to the
+	     repo's default branch — opening the PR is the whole deliverable,
+	     merging is a human's job.
+
+Options:
+	 --installation-id <id>  GitHub App installation ID (required)
+	 --owner <o>             Repo owner (required)
+	 --repo <r>              Repo name (required)
+	 --local-dir <path>      Local repo to push from (required; work committed)
+	 --branch <name>         Branch to push + open the PR from. Must NOT be the
+	                         repo's default branch (required)
+	 --title <text>          PR title (required)
+	 --body <text>           PR body (required)
+	 --base <branch>         PR target branch (default: the repo's default branch)
+	 --help                  Show this help and exit
+
+Environment:
+	 GITHUB_APP_ID                   GitHub App numeric ID (required; see docs/github-app-setup.md)
+	 GITHUB_APP_PRIVATE_KEY          The App's private key PEM text (required; never logged)
+	 GITHUB_APP_PRIVATE_KEY_PATH     Alternative: path to a .pem private key file
+	 GITHUB_API_BASE_URL             API base URL override (tests/mocks)
+`
+
+interface PushPrCliOptions {
+	installationId?: string
+	owner?: string
+	repo?: string
+	localDir?: string
+	branch?: string
+	title?: string
+	body?: string
+	base?: string
+	help: boolean
+}
+
+export function parsePushPrArgs(argv: string[]): { options: PushPrCliOptions; error?: string } {
+	const options: PushPrCliOptions = { help: false }
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i]
+		const eq = arg.indexOf("=")
+		const flag = eq === -1 ? arg : arg.slice(0, eq)
+		const inlineValue = eq === -1 ? undefined : arg.slice(eq + 1)
+		const next = (): string | undefined => {
+			if (inlineValue !== undefined) {
+				return inlineValue
+			}
+			const v = argv[i + 1]
+			if (v === undefined || v.startsWith("--")) {
+				return undefined
+			}
+			i++
+			return v
+		}
+
+		switch (flag) {
+			case "--installation-id":
+			case "--owner":
+			case "--repo":
+			case "--local-dir":
+			case "--branch":
+			case "--title":
+			case "--body":
+			case "--base": {
+				const value = next()
+				if (value === undefined) {
+					return { options, error: `Missing value for ${flag}` }
+				}
+				switch (flag) {
+					case "--installation-id":
+						options.installationId = value
+						break
+					case "--owner":
+						options.owner = value
+						break
+					case "--repo":
+						options.repo = value
+						break
+					case "--local-dir":
+						options.localDir = value
+						break
+					case "--branch":
+						options.branch = value
+						break
+					case "--title":
+						options.title = value
+						break
+					case "--body":
+						options.body = value
+						break
+					case "--base":
+						options.base = value
+						break
+				}
+				break
+			}
+			case "--help":
+			case "-h":
+				options.help = true
+				break
+			default:
+				return { options, error: `Unknown push-pr argument: ${arg}` }
+		}
+	}
+	return { options }
+}
+
+/** Injectable seams for pushPrMain (tests); defaults are the real modules. */
+export interface PushPrDeps {
+	buildClient?: () => ReturnType<typeof createAppAuthClient>
+	pushBranch?: typeof pushBranch
+	openPullRequest?: typeof openPullRequest
+	getRepoDefaultBranch?: typeof getRepoDefaultBranch
+	stdout?: (text: string) => void
+	stderr?: (text: string) => void
+}
+
+export async function pushPrMain(argv: string[], deps: PushPrDeps = {}): Promise<number> {
+	const buildClient = deps.buildClient ?? buildProvisionClient
+	const push = deps.pushBranch ?? pushBranch
+	const openPr = deps.openPullRequest ?? openPullRequest
+	const repoDefaultBranch = deps.getRepoDefaultBranch ?? getRepoDefaultBranch
+	const out = deps.stdout ?? ((text: string) => process.stdout.write(text))
+	const errOut = deps.stderr ?? ((text: string) => process.stderr.write(text))
+
+	const { options, error } = parsePushPrArgs(argv)
+	if (error) {
+		errOut(`headlesscode push-pr: ${error}\n\n${PUSH_PR_USAGE}`)
+		return 2
+	}
+	if (options.help) {
+		out(PUSH_PR_USAGE)
+		return 0
+	}
+	if (
+		!options.installationId ||
+		!options.owner ||
+		!options.repo ||
+		!options.localDir ||
+		!options.branch ||
+		options.title === undefined ||
+		options.body === undefined
+	) {
+		errOut(
+			`headlesscode push-pr: --installation-id, --owner, --repo, --local-dir, --branch, ` +
+				`--title and --body are required\n\n${PUSH_PR_USAGE}`,
+		)
+		return 2
+	}
+
+	let client
+	try {
+		client = buildClient()
+	} catch (err) {
+		errOut(`headlesscode push-pr: ${err instanceof Error ? err.message : String(err)}\n`)
+		return 2
+	}
+	const getToken = () => client.getInstallationToken(options.installationId!)
+
+	// Resolve the PR target branch UP FRONT (the repo's real default branch
+	// unless --base is given) so the hard rule can be enforced BEFORE pushing:
+	// push-pr never pushes to the repo's default branch.
+	let base: string
+	try {
+		base =
+			options.base ??
+			(await repoDefaultBranch({
+				owner: options.owner!,
+				repo: options.repo!,
+				getToken,
+				...(process.env.GITHUB_API_BASE_URL ? { baseUrl: process.env.GITHUB_API_BASE_URL } : {}),
+			}))
+	} catch (err) {
+		errOut(`headlesscode push-pr: ${err instanceof Error ? err.message : String(err)}\n`)
+		return 1
+	}
+	if (base === options.branch) {
+		errOut(
+			`headlesscode push-pr: refusing to push '${options.branch}' — it IS the repo's default branch. ` +
+				`push-pr never pushes to the default branch; use a feature branch name.\n`,
+		)
+		return 2
+	}
+
+	try {
+		await push({
+			installationId: options.installationId,
+			owner: options.owner!,
+			repo: options.repo!,
+			localDir: options.localDir!,
+			branchName: options.branch!,
+			getToken,
+		})
+	} catch (err) {
+		errOut(`headlesscode push-pr: ${err instanceof Error ? err.message : String(err)}\n`)
+		return 1
+	}
+
+	let pr
+	try {
+		pr = await openPr({
+			installationId: options.installationId,
+			owner: options.owner!,
+			repo: options.repo!,
+			head: options.branch!,
+			base,
+			title: options.title!,
+			body: options.body!,
+			getToken,
+			...(process.env.GITHUB_API_BASE_URL ? { baseUrl: process.env.GITHUB_API_BASE_URL } : {}),
+		})
+	} catch (err) {
+		errOut(`headlesscode push-pr: ${err instanceof Error ? err.message : String(err)}\n`)
+		return 1
+	}
+
+	out(`PR #${pr.number}: ${pr.url}\n`)
+	return 0
 }
