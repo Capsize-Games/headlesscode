@@ -19,6 +19,10 @@
  *   POST /api/session/start       launch a detached top-level session (see src/dashboard/session-launch.ts)
  *   POST /api/session/:id/answer  write `.harness.decision-answer` to unblock an escalated question
  *   GET  /api/modes?repo=<path>   merged available modes (.roomodes + global) for the mode selector
+ *   GET  /api/files?repo=<path>&dir=<rel>        list a workspace directory (file browser)
+ *   GET  /api/files/content?repo=<path>&file=<rel>  single file's text content (capped/binary-safe)
+ *   GET  /api/settings/permissions?repo=<path>  current permissions.json + resolved defaults
+ *   POST /api/settings/permissions?repo=<path>  validate + write permissions.json (creates .headlesscode/)
  *
  * NOTE (control plane): the POST /api/session/start route can launch real,
  * billed work and run arbitrary shell via `gh`/`orchestrate` from a form
@@ -26,6 +30,20 @@
  * pause/resume or settings POSTs were individually. Still local-only /
  * no-auth (binds 127.0.0.1), but if this endpoint is ever exposed beyond
  * localhost, that assumption needs revisiting — no auth was added here.
+ *
+ * NOTE (permissions settings): POST /api/settings/permissions is covered by
+ * the same optional bearer-token gate as /api/session/* when a token IS
+ * configured. When it isn't, this route is (deliberately) no-auth like
+ * everything else — the whole dashboard binds 127.0.0.1 only and is
+ * documented as a local-only tool. A separate default-on auth for just this
+ * route was considered and rejected: it would be the ONLY endpoint with a
+ * different default, surprising anyone running the established local
+ * workflow, and the binding/localhost contract is the actual security
+ * boundary (a real auth system is a separate, deliberate project-owner
+ * decision — see DashboardServerOptions.token). The one thing that is NOT
+ * negotiable is that when the gate IS configured, this route is inside it —
+ * a weakened permissions file is more consequential than starting a session,
+ * so it must never be gated *less* strictly than the session routes.
  */
 
 import * as fsp from "node:fs/promises"
@@ -43,6 +61,16 @@ import {
 	validateModeModelsBody,
 	type ModeModelsFile,
 } from "../config/mode-models.js"
+import { listWorkspaceDir, readWorkspaceFile } from "./files.js"
+import {
+	PERMISSIONS_CONFIG_FILE,
+	loadPermissionsFile,
+	parsePermissionsFileBody,
+	resolvePermissions,
+	stringifyPermissionsFile,
+	type PermissionsFile,
+} from "../permissions/config.js"
+import { PathTraversalError } from "../tools/executor.js"
 
 /** Default dashboard port (overridable via --port or $HEADLESSCODE_DASHBOARD_PORT). */
 export const DEFAULT_DASHBOARD_PORT = 4390
@@ -92,10 +120,16 @@ async function handleRequest(
 	const url = new URL(req.url ?? "/", "http://127.0.0.1")
 
 	// Optional control-plane token (HEADLESSCODE_DASHBOARD_TOKEN — see
-	// DashboardServerOptions.token). When configured, every POST under
-	// /api/session/* (start/pause/resume/answer) requires the bearer header.
-	// Unset = no auth, exactly today's behavior.
-	if (options.token && req.method === "POST" && url.pathname.startsWith("/api/session/")) {
+	// DashboardServerOptions.token). When configured, every state-changing
+	// POST requires the bearer header: /api/session/* (start/pause/resume/
+	// answer) AND /api/settings/permissions (a weakened permissions file is
+	// more consequential than starting a session, so it shares the SAME gate —
+	// never gated less strictly). Unset = no auth, exactly today's behavior.
+	if (
+		options.token &&
+		req.method === "POST" &&
+		(url.pathname.startsWith("/api/session/") || url.pathname === "/api/settings/permissions")
+	) {
 		const auth = req.headers.authorization ?? ""
 		const expected = `Bearer ${options.token}`
 		if (auth !== expected) {
@@ -366,13 +400,152 @@ async function handleRequest(
 		return
 	}
 
+	// File browser (dashboard-file-browser-and-permissions-ui): GET
+	// /api/files?repo=<path>&dir=<rel> lists a workspace directory's entries.
+	// The path-safety guard (resolveWithinWorkspace + PathTraversalError) is
+	// applied inside src/dashboard/files.ts — a traversal attempt surfaces as
+	// a 400, never a file-system read outside the workspace.
+	if (url.pathname === "/api/files" && req.method === "GET") {
+		const repo = url.searchParams.get("repo") || options.repo
+		if (!repo) {
+			res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ error: "missing repo — pass ?repo=<path> or start the dashboard with --repo" }),
+			)
+			return
+		}
+		const dir = url.searchParams.get("dir") || "."
+		try {
+			const entries = await listWorkspaceDir(repo, dir)
+			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(JSON.stringify({ dir, entries }))
+		} catch (error) {
+			if (error instanceof PathTraversalError) {
+				res
+					.writeHead(400, { "content-type": "application/json; charset=utf-8" })
+					.end(JSON.stringify({ error: error.message }))
+				return
+			}
+			res
+				.writeHead(500, { "content-type": "application/json; charset=utf-8" })
+				.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+		}
+		return
+	}
+
+	// GET /api/files/content?repo=<path>&file=<rel> — one file's text content,
+	// capped/binary-safe (see src/dashboard/files.ts). Same traversal guard.
+	if (url.pathname === "/api/files/content" && req.method === "GET") {
+		const repo = url.searchParams.get("repo") || options.repo
+		if (!repo) {
+			res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ error: "missing repo — pass ?repo=<path> or start the dashboard with --repo" }),
+			)
+			return
+		}
+		const file = url.searchParams.get("file")
+		if (!file) {
+			res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ error: "missing file — pass ?file=<relative-path>" }),
+			)
+			return
+		}
+		try {
+			const result = await readWorkspaceFile(repo, file)
+			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(JSON.stringify({ file, ...result }))
+		} catch (error) {
+			if (error instanceof PathTraversalError) {
+				res
+					.writeHead(400, { "content-type": "application/json; charset=utf-8" })
+					.end(JSON.stringify({ error: error.message }))
+				return
+			}
+			res
+				.writeHead(500, { "content-type": "application/json; charset=utf-8" })
+				.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+		}
+		return
+	}
+
+	// Permissions settings (dashboard-file-browser-and-permissions-ui): GET
+	// /api/settings/permissions?repo=<path> returns the current
+	// .headlesscode/permissions.json content OR the resolved built-in defaults
+	// clearly labeled as defaults-not-yet-customized (mirroring the
+	// mode-models page's "no file yet" UX, plus the resolved view so the page
+	// always shows what a session would actually enforce). POST validates with
+	// the SAME parser the config loader uses (parsePermissionsFileBody — no
+	// second validator that could drift) and writes the file. POST is covered
+	// by the optional bearer-token gate above.
+	if (url.pathname === "/api/settings/permissions") {
+		const repo = url.searchParams.get("repo") || options.repo
+		if (!repo) {
+			res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ error: "missing repo — pass ?repo=<path> or start the dashboard with --repo" }),
+			)
+			return
+		}
+		if (req.method === "GET") {
+			try {
+				// Reuse the strict loader: a malformed on-disk file surfaces as
+				// an error here instead of a silently-empty settings page.
+				const file = loadPermissionsFile(repo)
+				const resolved = resolvePermissions({ workspaceRoot: repo })
+				res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(
+					JSON.stringify({ file, resolved, isDefault: file === null }),
+				)
+			} catch (error) {
+				res
+					.writeHead(500, { "content-type": "application/json; charset=utf-8" })
+					.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+			}
+			return
+		}
+		if (req.method === "POST") {
+			try {
+				const raw = await readJsonBody(req)
+				let body: unknown
+				try {
+					body = JSON.parse(raw)
+				} catch (err) {
+					res
+						.writeHead(400, { "content-type": "application/json; charset=utf-8" })
+						.end(JSON.stringify({ error: `invalid JSON body: ${err instanceof Error ? err.message : String(err)}` }))
+					return
+				}
+				// Same strict validation the config loader applies on read —
+				// parsePermissionsFileBody IS the loader's validator, so the
+				// save path can never drift from what the CLI/env path enforces.
+				let parsed: PermissionsFile
+				try {
+					parsed = parsePermissionsFileBody(body, "body")
+				} catch (err) {
+					res
+						.writeHead(400, { "content-type": "application/json; charset=utf-8" })
+						.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }))
+					return
+				}
+				const file = path.join(repo, PERMISSIONS_CONFIG_FILE)
+				await fsp.mkdir(path.dirname(file), { recursive: true })
+				await fsp.writeFile(file, stringifyPermissionsFile(parsed), "utf-8")
+				res
+					.writeHead(200, { "content-type": "application/json; charset=utf-8" })
+					.end(JSON.stringify({ ok: true, path: file }))
+			} catch (error) {
+				res
+					.writeHead(500, { "content-type": "application/json; charset=utf-8" })
+					.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+			}
+			return
+		}
+		res.writeHead(405, { "content-type": "text/plain" }).end("Method Not Allowed")
+		return
+	}
+
 	if (req.method !== "GET") {
 		res.writeHead(405, { "content-type": "text/plain" }).end("Method Not Allowed")
 		return
 	}
 
 	if (url.pathname === "/") {
-		const html = renderPage()
+		const html = renderPage(options.repo)
 		res.writeHead(200, { "content-type": "text/html; charset=utf-8" }).end(html)
 		return
 	}
