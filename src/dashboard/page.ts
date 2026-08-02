@@ -310,6 +310,81 @@ export function renderPage(repo?: string): string {
   #permissionsSettings .perm-row button { font-size: 0.8rem; padding: 3px 12px; border-radius: 6px; cursor: pointer; }
   #permissionsSettings .perm-actions { display: flex; gap: 8px; margin-top: 10px; align-items: center; flex-wrap: wrap; }
   #permissionsSettings .perm-status { font-size: 0.8rem; }
+
+  /* Timeline view (work-progress-visualization). Third detail-view mode next to
+     the flat event log and the chat thread. Pure HTML/CSS positioning — no
+     charting library: iteration cells and marker dots are absolutely placed on
+     a % time axis, matching this page's no-dependency ethos. */
+  #timeline { display: none; padding: 12px 16px; font-size: 0.8rem; }
+  #detail.view-timeline #feed { display: none; }
+  #detail.view-timeline #chat { display: none; }
+  #detail.view-timeline #timeline { display: block; }
+  .tl-empty { color: GrayText; font-style: italic; padding: 12px 0; }
+  .tl-summary { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+  .tl-chip {
+    border: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
+    border-radius: 8px; padding: 4px 10px; display: flex; gap: 6px; align-items: baseline;
+    background: color-mix(in srgb, CanvasText 4%, transparent);
+  }
+  .tl-chip .tl-chip-label { color: GrayText; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.03em; }
+  .tl-chip .tl-chip-value { font-weight: 600; }
+  .tl-chip.tl-cat-read .tl-chip-value { color: #4f9cf9; }
+  .tl-chip.tl-cat-search .tl-chip-value { color: #38bdf8; }
+  .tl-chip.tl-cat-write .tl-chip-value { color: #f59e0b; }
+  .tl-chip.tl-cat-exec .tl-chip-value { color: #10b981; }
+  .tl-legend { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; color: GrayText; font-size: 0.72rem; }
+  .tl-legend-item { display: inline-flex; align-items: center; gap: 4px; }
+  .tl-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+  .tl-cat-read { background: #4f9cf9; }
+  .tl-cat-search { background: #38bdf8; }
+  .tl-cat-write { background: #f59e0b; }
+  .tl-cat-exec { background: #10b981; }
+  .tl-cat-other { background: #9ca3af; }
+  .tl-cat-none { background: transparent; border: 1px dashed color-mix(in srgb, CanvasText 30%, transparent); }
+  .tl-strip {
+    position: relative; height: 30px; margin: 4px 0 2px;
+    border: 1px solid color-mix(in srgb, CanvasText 12%, transparent); border-radius: 4px;
+    background: color-mix(in srgb, CanvasText 3%, transparent);
+  }
+  .tl-grid { position: relative; height: 100%; }
+  .tl-cell { position: absolute; top: 2px; bottom: 2px; border-radius: 2px; cursor: pointer; }
+  .tl-cell:hover { outline: 1px solid CanvasText; }
+  .tl-marker-row { position: relative; height: 16px; margin: 2px 0 6px; }
+  .tl-marker { position: absolute; top: 0; transform: translateX(-50%); font-size: 0.8rem; cursor: default; }
+  .tl-mk-checkpoint { color: #b8860b; }
+  .tl-mk-condensed { color: #8250df; }
+  .tl-mk-paused { color: #b8860b; }
+  .tl-mk-resumed { color: #1a7f37; }
+  .tl-mk-decision { color: #c0392b; }
+  .tl-mk-start { color: #1a7f37; }
+  .tl-mk-end { color: GrayText; }
+  .tl-mk-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; background: currentColor; }
+  .tl-marker-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+  .tl-marker-chip {
+    font-size: 0.72rem; padding: 1px 8px; border-radius: 10px;
+    border: 1px solid color-mix(in srgb, CanvasText 25%, transparent);
+    color: GrayText;
+  }
+  .tl-marker-chip.tl-mk-condensed { border-color: color-mix(in srgb, #8250df 50%, transparent); color: #8250df; }
+  .tl-marker-chip.tl-mk-decision { border-color: color-mix(in srgb, #c0392b 50%, transparent); color: #c0392b; }
+  .tl-marker-chip.tl-mk-paused { border-color: color-mix(in srgb, #b8860b 50%, transparent); color: #b8860b; }
+  .tl-marker-chip.tl-mk-resumed { border-color: color-mix(in srgb, #1a7f37 50%, transparent); color: #1a7f37; }
+  .tl-iter-list { margin-top: 4px; }
+  .tl-iter-row { border-bottom: 1px solid color-mix(in srgb, CanvasText 6%, transparent); }
+  .tl-iter-head { display: flex; align-items: baseline; gap: 10px; padding: 4px 2px; cursor: pointer; flex-wrap: wrap; }
+  .tl-iter-head:hover { background: color-mix(in srgb, CanvasText 4%, transparent); }
+  .tl-iter-num { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 600; }
+  .tl-cat-badge { font-size: 0.7rem; padding: 0 6px; border-radius: 8px; color: #fff; }
+  .tl-cat-badge.tl-cat-read { background: #4f9cf9; }
+  .tl-cat-badge.tl-cat-search { background: #38bdf8; }
+  .tl-cat-badge.tl-cat-write { background: #f59e0b; }
+  .tl-cat-badge.tl-cat-exec { background: #10b981; }
+  .tl-cat-badge.tl-cat-other { background: #9ca3af; }
+  .tl-cat-badge.tl-cat-none { background: transparent; color: GrayText; border: 1px dashed color-mix(in srgb, CanvasText 40%, transparent); }
+  .tl-iter-tools { color: GrayText; word-break: break-all; }
+  .tl-iter-err { color: #c0392b; font-weight: 600; }
+  .tl-iter-tokens { color: GrayText; margin-left: auto; }
+  .tl-iter-body { padding: 2px 2px 6px 14px; color: GrayText; }
 </style>
 </head>
 <body>
@@ -384,6 +459,7 @@ export function renderPage(repo?: string): string {
     <div class="detail-tabs">
       <button id="tabLog" class="active">Event log</button>
       <button id="tabChat">Chat thread</button>
+      <button id="tabTimeline">Timeline</button>
     </div>
     <div id="checkpointsPanel">
       <div class="checkpoints-head">📸 Checkpoints <span class="ckpt-status" id="ckptStatus"></span></div>
@@ -400,6 +476,7 @@ export function renderPage(repo?: string): string {
     </div>
     <div id="feed"><div class="feed-empty">select a session to watch its live event feed</div></div>
     <div id="chat"><div class="chat-empty">select a session to watch its live event feed</div></div>
+    <div id="timeline"><div class="tl-empty">select a session to watch its live event feed</div></div>
   </div>
 
   <div id="error"></div>
@@ -425,6 +502,7 @@ const EVENT_LABELS = {
   tool_call: "🔧 tool call",
   tool_result: "✅ tool result",
   checkpoint_saved: "📸 checkpoint",
+  condensed: "🧠 condensed",
   decision_blocked: "⛔ blocked (question)",
   decision_answered: "💬 question answered",
   paused: "⏸ paused",
@@ -446,6 +524,7 @@ function openDetail(sessionId, source, status, workspace) {
   const feed = document.getElementById("feed");
   feed.innerHTML = '<div class="feed-empty">loading events…</div>';
   document.getElementById("chat").innerHTML = '<div class="chat-empty">loading events…</div>';
+  document.getElementById("timeline").innerHTML = '<div class="tl-empty">loading events…</div>';
   // Reset scroll-tracking state for the new session.
   detail.userScrolledUp = false;
   feed.scrollTop = 0;
@@ -511,6 +590,10 @@ function renderEvent(e) {
       break;
     case "checkpoint_saved":
       body = e.iteration === 0 ? "baseline" : "after iteration " + esc(e.iteration);
+      break;
+    case "condensed":
+      body = "messages " + esc(e.messagesBefore) + "→" + esc(e.messagesAfter) +
+        (typeof e.inputTokens === "number" ? " · in=" + esc(e.inputTokens) + " out=" + esc(e.outputTokens ?? 0) + " cached=" + esc(e.cachedTokens ?? 0) : "");
       break;
     case "decision_blocked":
       body = esc(e.question || "") + (e.suggestions && e.suggestions.length ? " · suggestions: " + esc(e.suggestions.join(" | ")) : "");
@@ -593,6 +676,8 @@ async function pollEvents() {
     // Prune answer boxes for decision_blocked events that now HAVE a matching
     // decision_answered (the answer arrived — the box is moot).
     pruneAnsweredBoxes();
+    // The timeline re-renders from allEvents on every poll, like the chat view.
+    renderTimeline();
     updateDetailControls();
   } catch (err) {
     const feed = document.getElementById("feed");
@@ -641,8 +726,10 @@ function setView(view) {
   detail.view = view;
   const detailEl = document.getElementById("detail");
   detailEl.classList.toggle("view-chat", view === "chat");
+  detailEl.classList.toggle("view-timeline", view === "timeline");
   document.getElementById("tabLog").classList.toggle("active", view === "log");
   document.getElementById("tabChat").classList.toggle("active", view === "chat");
+  document.getElementById("tabTimeline").classList.toggle("active", view === "timeline");
 }
 
 // Render one chat "turn" block: the model's text bubble (plus a reasoning
@@ -736,6 +823,7 @@ function renderChatSystem(e) {
   const labels = {
     session_start: "🚀 session start",
     checkpoint_saved: "📸 checkpoint",
+    condensed: "🧠 condensed",
     paused: "⏸ paused",
     resumed: "▶ resumed",
     llm_error: "💥 llm error",
@@ -747,6 +835,10 @@ function renderChatSystem(e) {
   switch (e.type) {
     case "checkpoint_saved":
       body = e.iteration === 0 ? "baseline" : "after iteration " + esc(e.iteration);
+      break;
+    case "condensed":
+      body = "messages " + esc(e.messagesBefore) + "→" + esc(e.messagesAfter) +
+        (typeof e.inputTokens === "number" ? " · in=" + esc(e.inputTokens) + " out=" + esc(e.outputTokens ?? 0) + " cached=" + esc(e.cachedTokens ?? 0) : "");
       break;
     case "paused":
     case "resumed":
@@ -873,6 +965,377 @@ function groupEvents(events) {
   }
   closeTurn();
   return blocks;
+}
+
+// ── Timeline view (work-progress-visualization) ─────────────────────────────
+// Reduces the SAME event feed into a per-iteration "shape" model: one cell per
+// iteration colored by its dominant tool type, a running read/write/exec/
+// search tool-mix summary, and structural markers (checkpoints, condensation,
+// pause/resume, decisions) positioned on a real time axis. Inline vanilla-JS
+// twin of src/dashboard/timeline.ts (no build step — duplicated, not imported;
+// keep the two in sync). Pure HTML/CSS positioning — no charting library.
+const TL_READ = new Set(["read_file", "list_files", "outline", "go_to_definition", "find_references", "import_graph"]);
+const TL_WRITE = new Set(["write_to_file", "apply_diff", "search_replace", "edit_file"]);
+const TL_EXEC = new Set(["execute_command"]);
+const TL_SEARCH = new Set(["codebase_search"]);
+
+function tlCategory(tool) {
+  if (TL_READ.has(tool)) return "read";
+  if (TL_WRITE.has(tool)) return "write";
+  if (TL_EXEC.has(tool)) return "exec";
+  if (TL_SEARCH.has(tool)) return "search";
+  return "other";
+}
+
+// Tie-break priority for equal call counts: the write that appears once
+// alongside a read that appears once is still the iteration's point.
+const TL_TIE = ["write", "exec", "search", "read", "other"];
+
+function tlToTs(t) {
+  if (typeof t === "number") return t;
+  const ms = Date.parse(String(t));
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+// Inline twin of timeline.ts's buildTimeline: { iterations, markers, totals }.
+function buildTimeline(events) {
+  const m = {
+    iterations: [],
+    markers: [],
+    totals: { read: 0, write: 0, exec: 0, search: 0, other: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
+    task: "", model: "", mode: "",
+  };
+  const categoryCounts = new Map();
+  const toolCounts = new Map();
+  const iterMeta = new Map();
+  const ensure = (iteration) => {
+    if (!iterMeta.has(iteration)) {
+      iterMeta.set(iteration, { firstTs: Infinity, lastTs: -Infinity, inputTokens: 0, outputTokens: 0, cachedTokens: 0, hasError: false });
+    }
+  };
+  for (const e of events) {
+    const ts = tlToTs(e.ts);
+    switch (e.type) {
+      case "session_start":
+        m.task = typeof e.task === "string" ? e.task : "";
+        m.model = typeof e.model === "string" ? e.model : "";
+        m.mode = typeof e.mode === "string" ? e.mode : "";
+        m.markers.push({ kind: "start", ts: ts });
+        break;
+      case "session_end":
+        m.markers.push({ kind: "end", ts: ts, status: e.status });
+        break;
+      case "iteration_start":
+        if (typeof e.iteration !== "number") break;
+        ensure(e.iteration);
+        iterMeta.get(e.iteration).firstTs = Math.min(iterMeta.get(e.iteration).firstTs, ts);
+        iterMeta.get(e.iteration).lastTs = Math.max(iterMeta.get(e.iteration).lastTs, ts);
+        break;
+      case "llm_response":
+        if (typeof e.iteration !== "number") break;
+        ensure(e.iteration);
+        {
+          const meta = iterMeta.get(e.iteration);
+          meta.firstTs = Math.min(meta.firstTs, ts);
+          meta.lastTs = Math.max(meta.lastTs, ts);
+          const input = typeof e.inputTokens === "number" ? e.inputTokens : 0;
+          const output = typeof e.outputTokens === "number" ? e.outputTokens : 0;
+          const cached = typeof e.cachedTokens === "number" ? e.cachedTokens : 0;
+          meta.inputTokens += input;
+          meta.outputTokens += output;
+          meta.cachedTokens += cached;
+          m.totals.inputTokens += input;
+          m.totals.outputTokens += output;
+          m.totals.cachedTokens += cached;
+        }
+        break;
+      case "tool_call":
+        if (typeof e.iteration !== "number") break;
+        ensure(e.iteration);
+        {
+          const meta = iterMeta.get(e.iteration);
+          meta.firstTs = Math.min(meta.firstTs, ts);
+          meta.lastTs = Math.max(meta.lastTs, ts);
+          const tool = typeof e.tool === "string" ? e.tool : "unknown";
+          const cat = tlCategory(tool);
+          if (!categoryCounts.has(e.iteration)) categoryCounts.set(e.iteration, {});
+          categoryCounts.get(e.iteration)[cat] = (categoryCounts.get(e.iteration)[cat] || 0) + 1;
+          if (!toolCounts.has(e.iteration)) toolCounts.set(e.iteration, {});
+          toolCounts.get(e.iteration)[tool] = (toolCounts.get(e.iteration)[tool] || 0) + 1;
+          m.totals[cat] += 1;
+          m.totals.toolCalls += 1;
+        }
+        break;
+      case "tool_result":
+        if (typeof e.iteration === "number" && iterMeta.has(e.iteration) && e.isError === true) {
+          iterMeta.get(e.iteration).hasError = true;
+        }
+        break;
+      case "checkpoint_saved":
+        m.markers.push({ kind: "checkpoint", ts: ts, iteration: e.iteration });
+        break;
+      case "condensed":
+        m.markers.push({ kind: "condensed", ts: ts, iteration: e.iteration, messagesBefore: e.messagesBefore, messagesAfter: e.messagesAfter, inputTokens: e.inputTokens, outputTokens: e.outputTokens, cachedTokens: e.cachedTokens });
+        break;
+      case "paused":
+        m.markers.push({ kind: "paused", ts: ts, iteration: e.iteration, reason: e.reason });
+        break;
+      case "resumed":
+        m.markers.push({ kind: "resumed", ts: ts, iteration: e.iteration, reason: e.reason });
+        break;
+      case "decision_blocked":
+        m.markers.push({ kind: "decision", ts: ts, question: e.question });
+        break;
+      case "decision_answered":
+        m.markers.push({ kind: "decision", ts: ts, answer: e.answer, timedOut: e.timedOut });
+        break;
+    }
+  }
+  for (const [iteration, meta] of iterMeta) {
+    const cc = categoryCounts.get(iteration) || {};
+    const tc = toolCounts.get(iteration) || {};
+    let dominant = "none";
+    if (Object.keys(cc).length > 0) {
+      dominant = Object.keys(cc).sort((a, b) => (cc[b] - cc[a]) || (TL_TIE.indexOf(a) - TL_TIE.indexOf(b)))[0];
+    }
+    const calls = Object.keys(tc)
+      .map((name) => ({ name: name, count: tc[name] }))
+      .sort((a, b) => (b.count - a.count) || a.name.localeCompare(b.name));
+    m.iterations.push({
+      iteration: iteration,
+      category: dominant,
+      toolCalls: calls,
+      toolCount: calls.reduce((s, c) => s + c.count, 0),
+      firstTs: meta.firstTs === Infinity ? 0 : meta.firstTs,
+      lastTs: meta.lastTs === -Infinity ? 0 : meta.lastTs,
+      inputTokens: meta.inputTokens,
+      outputTokens: meta.outputTokens,
+      cachedTokens: meta.cachedTokens,
+      hasError: meta.hasError,
+    });
+  }
+  return m;
+}
+
+const TL_LABEL = { read: "read", write: "write", exec: "exec", search: "search", other: "other", none: "idle" };
+
+function tlBounds(m) {
+  let min = Infinity, max = -Infinity;
+  for (const it of m.iterations) {
+    min = Math.min(min, it.firstTs);
+    max = Math.max(max, it.lastTs);
+  }
+  for (const mk of m.markers) {
+    min = Math.min(min, mk.ts);
+    max = Math.max(max, mk.ts);
+  }
+  if (!Number.isFinite(min) || !Number.isFinite(max) || min === max) {
+    min = 0;
+    max = 1;
+  }
+  return { min: min, max: max, span: max - min };
+}
+
+function tlMarkerGlyph(mk) {
+  switch (mk.kind) {
+    case "start": return "🚀";
+    case "checkpoint": return "📸";
+    case "condensed": return "⟲";
+    case "paused": return "⏸";
+    case "resumed": return "▶";
+    case "decision": return "⛔";
+    case "end": return "🏁";
+    default: return "•";
+  }
+}
+
+function tlMarkerTitle(mk) {
+  switch (mk.kind) {
+    case "start": return "session start";
+    case "checkpoint":
+      return "checkpoint" + (typeof mk.iteration === "number" ? (mk.iteration === 0 ? " (baseline)" : " (iter " + mk.iteration + ")") : "");
+    case "condensed":
+      return "condensed " + esc(mk.messagesBefore) + "→" + esc(mk.messagesAfter) + " messages" + (mk.inputTokens ? " · in=" + fmtInt(mk.inputTokens) + " out=" + fmtInt(mk.outputTokens) : "");
+    case "paused": return "paused" + (mk.reason ? ": " + esc(mk.reason) : "");
+    case "resumed": return "resumed" + (mk.reason ? ": " + esc(mk.reason) : "");
+    case "decision":
+      return mk.question
+        ? "blocked: " + esc(String(mk.question).slice(0, 60))
+        : (mk.timedOut ? "question timed out" : "answered: " + esc(String(mk.answer || "").slice(0, 60)));
+    case "end": return "session end" + (mk.status ? " (" + esc(mk.status) + ")" : "");
+    default: return mk.kind;
+  }
+}
+
+// Tool-mix summary chips: the read/write ratio as real numbers, not eyeballed.
+function tlSummary(m) {
+  const t = m.totals;
+  const wrap = document.createElement("div");
+  wrap.className = "tl-summary";
+  const chips = [
+    ["iterations", String(m.iterations.length), ""],
+    ["tool calls", fmtInt(t.toolCalls), ""],
+    ["reads", fmtInt(t.read), "read"],
+    ["searches", fmtInt(t.search), "search"],
+    ["writes", fmtInt(t.write), "write"],
+    ["commands", fmtInt(t.exec), "exec"],
+    ["tokens in", fmtInt(t.inputTokens), ""],
+    ["tokens out", fmtInt(t.outputTokens), ""],
+    ["cached", fmtInt(t.cachedTokens), ""],
+  ];
+  for (const c of chips) {
+    const chip = document.createElement("div");
+    chip.className = "tl-chip" + (c[2] ? " tl-cat-" + c[2] : "");
+    chip.innerHTML = '<span class="tl-chip-label">' + esc(c[0]) + '</span><span class="tl-chip-value">' + esc(c[1]) + "</span>";
+    wrap.appendChild(chip);
+  }
+  return wrap;
+}
+
+function tlLegend() {
+  const wrap = document.createElement("div");
+  wrap.className = "tl-legend";
+  for (const [cat, label] of [["read", "read"], ["search", "search"], ["write", "write"], ["exec", "commands"], ["other", "other"], ["none", "idle"]]) {
+    const s = document.createElement("span");
+    s.className = "tl-legend-item";
+    s.innerHTML = '<span class="tl-swatch tl-cat-' + esc(cat) + '"></span>' + esc(label);
+    wrap.appendChild(s);
+  }
+  for (const [kind, label] of [["checkpoint", "📸 checkpoint"], ["condensed", "⟲ condensed"], ["paused", "⏸ pause"], ["resumed", "▶ resume"], ["decision", "⛔ decision"]]) {
+    const s = document.createElement("span");
+    s.className = "tl-legend-item";
+    s.innerHTML = '<span class="tl-swatch tl-mk-swatch tl-mk-' + esc(kind) + '"></span>' + esc(label);
+    wrap.appendChild(s);
+  }
+  return wrap;
+}
+
+// The horizontal timeline: one cell per iteration, positioned by REAL time
+// (session-relative % of the whole span), colored by dominant tool type.
+function tlStrip(m) {
+  const b = tlBounds(m);
+  const strip = document.createElement("div");
+  strip.className = "tl-strip";
+  const grid = document.createElement("div");
+  grid.className = "tl-grid";
+  strip.appendChild(grid);
+  for (const it of m.iterations) {
+    const left = ((it.firstTs - b.min) / b.span) * 100;
+    const width = Math.min(Math.max(1.2, ((it.lastTs - it.firstTs) / b.span) * 100), 100 - left);
+    const cell = document.createElement("div");
+    cell.className = "tl-cell tl-cat-" + esc(it.category);
+    cell.style.left = left.toFixed(3) + "%";
+    cell.style.width = width.toFixed(3) + "%";
+    cell.title = "iteration " + it.iteration + " — " + TL_LABEL[it.category] +
+      (it.toolCount ? " · " + it.toolCount + " tool call" + (it.toolCount === 1 ? "" : "s") + " (" + it.toolCalls.map((c) => c.name + "×" + c.count).join(", ") + ")" : "") +
+      (it.inputTokens ? " · in=" + fmtInt(it.inputTokens) + " out=" + fmtInt(it.outputTokens) + " cached=" + fmtInt(it.cachedTokens) : "");
+    cell.dataset.iter = String(it.iteration);
+    cell.addEventListener("click", () => toggleIterationRow(it.iteration, true));
+    grid.appendChild(cell);
+  }
+  return strip;
+}
+
+// Structural markers on the same time axis (dots) + readable chips for the
+// interesting ones (checkpoints stay as dots — their density IS the signal).
+function tlMarkers(m) {
+  const wrap = document.createElement("div");
+  const b = tlBounds(m);
+  const dots = document.createElement("div");
+  dots.className = "tl-marker-row";
+  for (const mk of m.markers) {
+    const left = ((mk.ts - b.min) / b.span) * 100;
+    const dot = document.createElement("div");
+    dot.className = "tl-marker tl-mk-" + esc(mk.kind);
+    dot.style.left = left.toFixed(3) + "%";
+    dot.textContent = tlMarkerGlyph(mk);
+    dot.title = tlMarkerTitle(mk);
+    dots.appendChild(dot);
+  }
+  wrap.appendChild(dots);
+
+  const chips = document.createElement("div");
+  chips.className = "tl-marker-chips";
+  for (const mk of m.markers) {
+    if (mk.kind === "checkpoint") continue;
+    const chip = document.createElement("span");
+    chip.className = "tl-marker-chip tl-mk-" + esc(mk.kind);
+    chip.textContent = tlMarkerGlyph(mk) + " " + tlMarkerTitle(mk);
+    chips.appendChild(chip);
+  }
+  wrap.appendChild(chips);
+  return wrap;
+}
+
+// Per-iteration detail rows below the strip: click a row (or a strip cell) to
+// expand the exact tool calls + token usage of that iteration.
+function toggleIterationRow(iteration, scrollTo) {
+  const list = document.querySelector("#timeline .tl-iter-list");
+  if (!list) return;
+  const row = list.querySelector('.tl-iter-row[data-iter="' + iteration + '"]');
+  if (!row) return;
+  const body = row.querySelector(".tl-iter-body");
+  const head = row.querySelector(".tl-iter-head");
+  if (body) {
+    const open = body.style.display === "block";
+    body.style.display = open ? "none" : "block";
+    if (head) head.classList.toggle("open", !open);
+    if (!open && scrollTo) row.scrollIntoView({ block: "nearest" });
+  }
+}
+
+function tlIterations(m) {
+  const list = document.createElement("div");
+  list.className = "tl-iter-list";
+  for (const it of m.iterations) {
+    const row = document.createElement("div");
+    row.className = "tl-iter-row";
+    row.dataset.iter = String(it.iteration);
+    const head = document.createElement("div");
+    head.className = "tl-iter-head";
+    const toolSummary = it.toolCalls.map((c) => c.name + "×" + c.count).join(", ") || "no tool calls";
+    const tokens = it.inputTokens
+      ? "in=" + fmtInt(it.inputTokens) + " · out=" + fmtInt(it.outputTokens) + " · cached=" + fmtInt(it.cachedTokens)
+      : "";
+    head.innerHTML =
+      '<span class="tl-iter-num">iter ' + esc(it.iteration) + "</span>" +
+      '<span class="tl-cat-badge tl-cat-' + esc(it.category) + '">' + esc(TL_LABEL[it.category]) + "</span>" +
+      '<span class="tl-iter-tools">' + esc(toolSummary) + "</span>" +
+      (it.hasError ? '<span class="tl-iter-err">⚠ error</span>' : "") +
+      (tokens ? '<span class="tl-iter-tokens mono">' + esc(tokens) + "</span>" : "");
+    head.addEventListener("click", () => toggleIterationRow(it.iteration, false));
+    row.appendChild(head);
+    const body = document.createElement("div");
+    body.className = "tl-iter-body";
+    body.style.display = "none";
+    body.innerHTML =
+      '<div class="mono">tools: ' + esc(it.toolCalls.map((c) => c.name + " × " + c.count).join(" · ") || "none") + "</div>" +
+      (tokens ? '<div class="mono">tokens: ' + esc(tokens) + "</div>" : "");
+    row.appendChild(body);
+    list.appendChild(row);
+  }
+  return list;
+}
+
+// Re-render the whole timeline from the accumulated feed on every poll (same
+// approach as renderChat — incremental append doesn't fit a % time axis).
+function renderTimeline() {
+  if (!detail) return;
+  const el = document.getElementById("timeline");
+  const events = detail.allEvents || [];
+  if (events.length === 0) {
+    el.innerHTML = '<div class="tl-empty">no events yet — waiting for the worker…</div>';
+    return;
+  }
+  const m = buildTimeline(events);
+  el.innerHTML = "";
+  el.appendChild(tlSummary(m));
+  el.appendChild(tlLegend());
+  el.appendChild(tlStrip(m));
+  el.appendChild(tlMarkers(m));
+  el.appendChild(tlIterations(m));
+}
+
 // ── Checkpoints (browser checkpoint list/diff/restore) ──────────────────────
 // The panel in the session detail view lists the session's shadow-git
 // checkpoints (message, date, hash) via GET /api/checkpoints. Clicking a row
@@ -1474,11 +1937,11 @@ const PERM_LIST_FIELDS = [
 ];
 
 function permListToText(list) {
-  return (list || []).join("\n");
+  return (list || []).join("\\n");
 }
 
 function permTextToList(text) {
-  return text.split("\n").map((s) => s.trim()).filter((s) => s.length > 0);
+  return text.split("\\n").map((s) => s.trim()).filter((s) => s.length > 0);
 }
 
 function renderPermissions(data) {
@@ -1774,9 +2237,11 @@ document.getElementById("detailClose").addEventListener("click", closeDetail);
 document.getElementById("btnPause").addEventListener("click", () => controlSession("pause"));
 document.getElementById("btnResume").addEventListener("click", () => controlSession("resume"));
 document.getElementById("btnStart").addEventListener("click", startSession);
-// Chat-thread vs. flat event-log toggle: both render the same feed data.
+// Chat-thread vs. flat event-log vs. timeline toggle: all three render the
+// same feed data, just shaped differently.
 document.getElementById("tabLog").addEventListener("click", () => setView("log"));
 document.getElementById("tabChat").addEventListener("click", () => setView("chat"));
+document.getElementById("tabTimeline").addEventListener("click", () => setView("timeline"));
 document.getElementById("btnRestore").addEventListener("click", restoreSelected);
 
 document.getElementById("fbLoad").addEventListener("click", fbLoad);

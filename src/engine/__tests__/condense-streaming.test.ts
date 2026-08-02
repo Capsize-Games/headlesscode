@@ -213,24 +213,34 @@ function estimateChars(messages: ChatMessage[]): number {
 /**
  * The exact event-feed type sequence a session with `callCounts` tool-call
  * turns, `perTurnChunks` chunks per growth turn and `finalChunks` chunks on
- * the completion turn must produce. The condensation iteration emits NO events
- * of its own (silent summary call), so the feed reads as a clean
- * session_start → checkpoint_saved → per-iteration streamed-turn blocks →
- * final streamed completion → session_end.
+ * the completion turn must produce. When condensation fires (iteration
+ * `condenseIteration`, 0 = never), the `condensed` event lands immediately
+ * after that iteration's `iteration_start` — the loop emits it from
+ * maybeCondenseHistory before the main LLM call — so the feed reads as a
+ * clean session_start → checkpoint_saved → per-iteration streamed-turn blocks
+ * → (condensed) → final streamed completion → session_end.
  */
-function expectedEventTypes(callCounts: number[], perTurnChunks: number[], finalChunks: number): string[] {
+function expectedEventTypes(
+	callCounts: number[],
+	perTurnChunks: number[],
+	finalChunks: number,
+	condenseIteration = 0,
+): string[] {
 	const types: string[] = ["session_start", "checkpoint_saved"]
-	for (let k = 0; k < callCounts.length; k++) {
+	const pushIteration = (k: number, chunks: number, withCheckpoint: boolean) => {
 		types.push("iteration_start")
-		for (let c = 0; c < perTurnChunks[k]; c++) types.push("llm_stream_chunk")
+		if (k + 1 === condenseIteration) types.push("condensed")
+		for (let c = 0; c < chunks; c++) types.push("llm_stream_chunk")
 		types.push("llm_response")
 		for (let t = 0; t < callCounts[k]; t++) {
 			types.push("tool_call")
 			types.push("tool_result")
 		}
-		types.push("checkpoint_saved")
+		if (withCheckpoint) types.push("checkpoint_saved")
 	}
+	for (let k = 0; k < callCounts.length; k++) pushIteration(k, perTurnChunks[k], true)
 	types.push("iteration_start")
+	if (callCounts.length + 1 === condenseIteration) types.push("condensed")
 	for (let c = 0; c < finalChunks; c++) types.push("llm_stream_chunk")
 	types.push("llm_response")
 	types.push("session_end")
@@ -335,8 +345,8 @@ async function testCondensationAndStreamingInOneSession(): Promise<void> {
 		const { events } = await readSessionEvents(ws)
 		assert.deepEqual(
 			events.map((e) => e.type),
-			expectedEventTypes(callCounts, callCounts.map(() => 1), 3),
-			"full event sequence must be exactly ordered (incl. checkpoint_saved placement and the silent condensation iteration)",
+			expectedEventTypes(callCounts, callCounts.map(() => 1), 3, 12),
+			"full event sequence must be exactly ordered (incl. checkpoint_saved placement and the condensed event at iteration 12)",
 		)
 
 		const iterStarts = events.filter((e) => e.type === "iteration_start")
@@ -347,16 +357,29 @@ async function testCondensationAndStreamingInOneSession(): Promise<void> {
 			"iteration_start reports the PRE-condensation history (34 at iteration 12)",
 		)
 
-		// The condensation moment itself: iteration 12's chunks are contiguous
-		// right after its iteration_start, with no condensation events and no
-		// other iteration's chunks mixed in.
+		// The condensation moment itself: the condensed event lands immediately
+		// after iteration 12's iteration_start, and the iteration's stream
+		// chunks stay contiguous right after it — no other iteration's chunks
+		// mixed in.
 		const i12 = events.findIndex((e) => e.type === "iteration_start" && e.iteration === 12)
+		assert.equal(events[i12 + 1].type, "condensed", "condensation is emitted at the start of iteration 12, before its stream")
 		assert.deepEqual(
-			events.slice(i12 + 1, i12 + 4).map((e) => e.type),
+			events.slice(i12 + 2, i12 + 5).map((e) => e.type),
 			["llm_stream_chunk", "llm_stream_chunk", "llm_stream_chunk"],
 			"iteration 12's stream chunks are contiguous — nothing interleaves with the condensation",
 		)
-		assert.equal(events[i12 + 4].type, "llm_response")
+		assert.equal(events[i12 + 5].type, "llm_response")
+
+		// The condensed event's payload: the message counts the timeline shows
+		// (31 → 12) and the condensation call's own usage, so condensation
+		// spend is visible in the feed, not just the session totals.
+		const condensedEvents = events.filter((e) => e.type === "condensed")
+		assert.equal(condensedEvents.length, 1, "exactly one condensed event across the session")
+		assert.equal(condensedEvents[0].iteration, 12)
+		assert.equal(condensedEvents[0].messagesBefore, 34, "history length at condensation time (matches the iteration_start count)")
+		assert.equal(condensedEvents[0].messagesAfter, 12, "history length after condensation")
+		assert.equal(condensedEvents[0].inputTokens, 40_000, "condensed event carries the condensation call's input tokens")
+		assert.equal(condensedEvents[0].outputTokens, 2_000, "condensed event carries the condensation call's output tokens")
 
 		// Streamed chunks match the assembled message exactly (the same
 		// assertion streaming-and-reasoning makes in isolation).
