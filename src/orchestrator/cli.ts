@@ -26,13 +26,22 @@ import { fileURLToPath } from "node:url"
 
 import { activeSessionCountForRepo, maxConcurrentSessionsFromEnv } from "../budget/concurrency.js"
 import { splitIssues, type SplitIssue, type WorktreeSpec } from "./split.js"
-import { loadState, loadStateSync, saveState, updateGroup, type OrchestratorGroup, type OrchestratorState } from "./state.js"
+import {
+	loadState,
+	loadStateSync,
+	saveState,
+	saveStateSync,
+	updateGroup,
+	type OrchestratorGroup,
+	type OrchestratorState,
+} from "./state.js"
 import { runReview, type ReviewResult } from "./reviewer.js"
 import { runQa } from "../qa/qa.js"
 import { groupWorktreePath, watchGroups } from "./watch.js"
 import {
 	buildStatusSummary,
 	formatStatusText,
+	reconcileGroups,
 	verdictLine,
 	waitForTerminalState,
 	DEFAULT_STATUS_POLL_INTERVAL_MS,
@@ -743,26 +752,33 @@ Usage:
 
 Options:
   --repo <path>          Target repo root whose .worktrees/.orchestrator-state.json
-                         is read (required). Pure read — never writes the file.
+                         is read (required). Before reporting, stale non-terminal
+                         entries are reconciled against real worktree markers
+                         (.harness.done/.harness.exit) and the state file is
+                         patched back when ground truth proves a different status
+                         ("done"/"failed", or "orphaned" when the worktree is gone).
   --wait                 Block inside this ONE call until every group reaches a
-                         terminal status (done|failed|needs-human; "blocked" is
-                         NOT terminal — it keeps waiting) or --timeout-ms elapses,
-                         then print the same summary plus a one-line verdict.
+                         terminal status (done|failed|needs-human|orphaned;
+                         "blocked" is NOT terminal — it keeps waiting) or
+                         --timeout-ms elapses, then print the same summary plus a
+                         one-line verdict. Reconciliation runs on every poll.
   --timeout-ms <n>       Max --wait duration, ms (default: 7200000 = 2h, matching
                          the watcher's stall guard — a round left non-terminal
                          longer than that is flagged stalled anyway).
   --poll-interval-ms <n> State-file poll interval for --wait, ms (default: 5000,
                          matching the watcher's own write cadence).
-  --json                 Machine-readable output. One-shot: the raw
-                         OrchestratorState. With --wait: the final state plus
-                         top-level allDone/timedOut/verdict fields.
+  --json                 Machine-readable output. One-shot: the reconciled
+                         OrchestratorState plus a top-level "reconciled" array of
+                         group names patched (only when something was patched).
+                         With --wait: the final state plus top-level
+                         allDone/timedOut/verdict/reconciled fields.
   --help, -h             Show this help and exit.
 
 Exit codes:
-  0  one-shot: no group is failed/needs-human right now;
+  0  one-shot: no group is failed/needs-human/orphaned right now;
      --wait: every group is done (clean finish)
-  1  one-shot: at least one group is failed or needs-human;
-     --wait: any group failed/needs-human, or the wait timed out
+  1  one-shot: at least one group is failed, needs-human, or orphaned;
+     --wait: any group failed/needs-human/orphaned, or the wait timed out
   2  usage error (bad or missing arguments)
 `
 
@@ -867,7 +883,10 @@ function waitExitCode(allDone: boolean, summary: StatusSummary): number {
 /**
  * `headlesscode orchestrate status` entry point. One call, one result: the
  * calling agent never re-invokes a tool per poll, unlike the bash loop this
- * replaces.
+ * replaces. Both forms reconcile stale state against real worktree markers
+ * before reporting (see status.ts's reconcileGroups) — the state file is
+ * patched back when ground truth proves a different status, so a stale
+ * "running" entry is never reported as-is.
  */
 export async function statusMain(argv: string[], io: StatusIo = {}): Promise<number> {
 	const writeOut = io.stdout ?? ((text: string) => process.stdout.write(text))
@@ -894,11 +913,30 @@ export async function statusMain(argv: string[], io: StatusIo = {}): Promise<num
 		const result = await waitForTerminalState(statePath, {
 			timeoutMs: options.timeoutMs,
 			pollIntervalMs: options.pollIntervalMs,
+			// Reconcile on EVERY poll (a group can finish mid-wait), persisting
+			// any patch straight back to the state file so the next poll reads
+			// the reconciled truth.
+			reconcile: (state) => {
+				const r = reconcileGroups(state, repo)
+				if (r.reconciled.length > 0) {
+					saveStateSync(statePath, r.state)
+				}
+				return r
+			},
 		})
 		const summary = buildStatusSummary(result.state)
 		const verdict = verdictLine(summary, result.timedOut, result.allDone)
 		if (options.json) {
-			writeOut(JSON.stringify({ ...result.state, allDone: result.allDone, timedOut: result.timedOut, verdict }, null, 2) + "\n")
+			const out: Record<string, unknown> = {
+				...result.state,
+				allDone: result.allDone,
+				timedOut: result.timedOut,
+				verdict,
+			}
+			if (result.reconciled.length > 0) {
+				out.reconciled = result.reconciled
+			}
+			writeOut(JSON.stringify(out, null, 2) + "\n")
 		} else {
 			writeOut(
 				formatStatusText(summary, {
@@ -907,13 +945,15 @@ export async function statusMain(argv: string[], io: StatusIo = {}): Promise<num
 					timedOut: result.timedOut,
 					allDone: result.allDone,
 					elapsedMs: result.elapsedMs,
+					reconciled: result.reconciled,
 				}),
 			)
 		}
 		return waitExitCode(result.allDone, summary)
 	}
 
-	// One-shot: read the current state, print it, exit on current health.
+	// One-shot: read the current state, reconcile it against real markers
+	// (persisting any patch), print, exit on current health.
 	let state: OrchestratorState
 	try {
 		state = loadStateSync(statePath)
@@ -923,13 +963,22 @@ export async function statusMain(argv: string[], io: StatusIo = {}): Promise<num
 		)
 		return 1
 	}
+	const reconciliation = reconcileGroups(state, repo)
+	if (reconciliation.reconciled.length > 0) {
+		saveStateSync(statePath, reconciliation.state)
+		state = reconciliation.state
+	}
 	const summary = buildStatusSummary(state)
 	if (options.json) {
-		writeOut(JSON.stringify(state, null, 2) + "\n")
+		const out: Record<string, unknown> = { ...state }
+		if (reconciliation.reconciled.length > 0) {
+			out.reconciled = reconciliation.reconciled
+		}
+		writeOut(JSON.stringify(out, null, 2) + "\n")
 	} else {
-		writeOut(formatStatusText(summary, { repo, statePath }))
+		writeOut(formatStatusText(summary, { repo, statePath, reconciled: reconciliation.reconciled }))
 	}
-	return summary.counts.failed > 0 || summary.counts.needsHuman > 0 ? 1 : 0
+	return summary.counts.failed > 0 || summary.counts.needsHuman > 0 || summary.counts.orphaned > 0 ? 1 : 0
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────

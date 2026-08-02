@@ -2,17 +2,29 @@
  * `headlesscode orchestrate status` — read-side status command for EXTERNAL
  * callers (an interactive orchestrator agent checking on a round from outside
  * the watching process). Reads `.worktrees/.orchestrator-state.json` via
- * loadStateSync (state.ts) — it never writes the file, never re-implements
- * parsing, and does NOT touch watch.ts's own live-monitoring loop.
+ * loadStateSync (state.ts) — it never re-implements parsing and does NOT
+ * touch watch.ts's own live-monitoring loop.
+ *
+ * Reconciliation: before reporting (and on EVERY poll while waiting), every
+ * group whose `status` is non-terminal is checked against real worktree
+ * markers (`.harness.done` + `.harness.exit`), and when the ground truth
+ * proves a different status the state file is patched back via
+ * updateGroup/saveStateSync (state.ts):
+ *   - `.harness.done` present  -> "done" (exit 0) / "failed" (non-zero)
+ *   - worktree entirely gone   -> "orphaned" (terminal — evidence is gone,
+ *                                 a human must investigate via git history)
+ *   - worktree present, no marker -> left alone (genuinely still running)
+ * This closes the gap where a direct-path round (spawn-parallel-worktrees.sh,
+ * no watcher) left group entries stuck on "running" forever.
  *
  * Two forms:
- *   - one-shot: print a compact per-group summary (or the raw state with
- *     --json) and exit.
+ *   - one-shot: print a compact per-group summary (or the reconciled state
+ *     with --json) and exit.
  *   - --wait: block inside this ONE process until every group reaches a
- *     terminal status ("done" | "failed" | "needs-human" — "blocked" is
- *     deliberately NOT terminal: it is a decision-escalation wait state that
- *     keeps this command waiting) or --timeout-ms elapses, then print the
- *     same summary plus a one-line verdict.
+ *     terminal status ("done" | "failed" | "needs-human" | "orphaned" —
+ *     "blocked" is deliberately NOT terminal: it is a decision-escalation
+ *     wait state that keeps this command waiting) or --timeout-ms elapses,
+ *     then print the same summary plus a one-line verdict.
  *
  * Polling the state file (not fs.watch) is a deliberate choice: the file is
  * written by watch.ts, which itself polls at DEFAULT_POLL_INTERVAL_MS, so a
@@ -23,18 +35,23 @@
  * matches the existing watch.ts idiom and is trivially testable.
  */
 
+import * as fs from "node:fs"
+import * as path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 
-import { defaultState, loadStateSync, type OrchestratorGroup, type OrchestratorState } from "./state.js"
-import { DEFAULT_POLL_INTERVAL_MS, DEFAULT_STALL_TIMEOUT_MS } from "./watch.js"
+import { defaultState, loadStateSync, updateGroup, type OrchestratorGroup, type OrchestratorState } from "./state.js"
+import { DEFAULT_POLL_INTERVAL_MS, DEFAULT_STALL_TIMEOUT_MS, groupWorktreePath } from "./watch.js"
 
 /**
  * The statuses that end a round for a group. `blocked` is NOT here on
  * purpose: a group waiting on a decision answer is not finished, and
  * `--wait` must keep waiting rather than exit early (see state.ts's
- * OrchestratorGroup.status doc comment).
+ * OrchestratorGroup.status doc comment). `orphaned` IS here: the group's
+ * worktree is gone, so there is nothing left to wait FOR — the evidence is
+ * gone, and reconciliation (reconcileGroups) has already surfaced the case
+ * for a human to investigate rather than silently guessing an outcome.
  */
-export const TERMINAL_STATUSES = ["done", "failed", "needs-human"] as const
+export const TERMINAL_STATUSES = ["done", "failed", "needs-human", "orphaned"] as const
 
 export function isTerminalStatus(status: string): boolean {
 	return TERMINAL_STATUSES.includes(status as (typeof TERMINAL_STATUSES)[number])
@@ -77,6 +94,8 @@ export interface StatusCounts {
 	needsHuman: number
 	blocked: number
 	running: number
+	/** Worktree gone before a terminal status — surfaced for a human (terminal). */
+	orphaned: number
 	other: number
 }
 
@@ -108,6 +127,7 @@ export function buildStatusSummary(state: OrchestratorState): StatusSummary {
 		needsHuman: 0,
 		blocked: 0,
 		running: 0,
+		orphaned: 0,
 		other: 0,
 	}
 	const groups = state.groups.map((g) => {
@@ -127,6 +147,9 @@ export function buildStatusSummary(state: OrchestratorState): StatusSummary {
 			case "running":
 			case "spawned":
 				counts.running++
+				break
+			case "orphaned":
+				counts.orphaned++
 				break
 			default:
 				counts.other++
@@ -150,7 +173,8 @@ export function buildStatusSummary(state: OrchestratorState): StatusSummary {
 
 /**
  * One-line verdict for the `--wait` form, e.g. "3/3 groups done, 0 failed"
- * or "timed out after 2 of 3 groups done".
+ * or "timed out after 2 of 3 groups done". Orphaned groups are called out
+ * explicitly (they are terminal but NOT done — a human must investigate).
  */
 export function verdictLine(summary: StatusSummary, timedOut: boolean, allDone: boolean): string {
 	const c = summary.counts
@@ -158,20 +182,44 @@ export function verdictLine(summary: StatusSummary, timedOut: boolean, allDone: 
 		return "nothing to wait for — no groups in state"
 	}
 	if (timedOut) {
-		const tail = c.failed > 0 || c.needsHuman > 0 ? ` (${c.failed} failed, ${c.needsHuman} needs-human)` : ""
-		return `timed out after ${c.done} of ${c.total} group${c.total === 1 ? "" : "s"} done${tail}`
+		const tail: string[] = []
+		if (c.failed > 0 || c.needsHuman > 0) {
+			tail.push(`${c.failed} failed, ${c.needsHuman} needs-human`)
+		}
+		if (c.orphaned > 0) {
+			tail.push(`${c.orphaned} orphaned`)
+		}
+		return `timed out after ${c.done} of ${c.total} group${c.total === 1 ? "" : "s"} done${tail.length > 0 ? ` (${tail.join("; ")})` : ""}`
 	}
 	if (allDone) {
 		return `${c.total}/${c.total} groups done, 0 failed`
 	}
-	// All terminal, but not all done → failed and/or needs-human present.
-	return `all ${c.total} group${c.total === 1 ? "" : "s"} terminal, but ${c.failed} failed / ${c.needsHuman} needs-human`
+	// All terminal, but not all done → failed and/or needs-human and/or orphaned present.
+	const tail: string[] = []
+	if (c.failed > 0) {
+		tail.push(`${c.failed} failed`)
+	}
+	if (c.needsHuman > 0) {
+		tail.push(`${c.needsHuman} needs-human`)
+	}
+	if (c.orphaned > 0) {
+		tail.push(`${c.orphaned} orphaned`)
+	}
+	return `all ${c.total} group${c.total === 1 ? "" : "s"} terminal, but ${tail.length > 0 ? tail.join(" / ") : "something unresolved"}`
 }
 
 /** Human-readable status block (one-shot form when timedOut/allDone are omitted). */
 export function formatStatusText(
 	summary: StatusSummary,
-	opts: { repo: string; statePath: string; timedOut?: boolean; allDone?: boolean; elapsedMs?: number },
+	opts: {
+		repo: string
+		statePath: string
+		timedOut?: boolean
+		allDone?: boolean
+		elapsedMs?: number
+		/** Group names this call reconciled from stale markers (shown when non-empty). */
+		reconciled?: string[]
+	},
 ): string {
 	const c = summary.counts
 	const lines: string[] = []
@@ -222,8 +270,14 @@ export function formatStatusText(
 		lines.push(
 			`${c.total} group${c.total === 1 ? "" : "s"}: ${c.done} done · ${c.failed} failed · ` +
 				`${c.needsHuman} needs-human · ${c.blocked} blocked · ${c.running} running/spawned` +
+				(c.orphaned > 0 ? ` · ${c.orphaned} orphaned` : "") +
 				(c.other > 0 ? ` · ${c.other} other` : ""),
 		)
+	}
+
+	if (opts.reconciled !== undefined && opts.reconciled.length > 0) {
+		lines.push("")
+		lines.push(`reconciled: ${opts.reconciled.join(", ")} (stale status patched from worktree markers)`)
 	}
 
 	if (opts.timedOut !== undefined || opts.allDone !== undefined) {
@@ -231,6 +285,96 @@ export function formatStatusText(
 		lines.push(`verdict: ${verdictLine(summary, opts.timedOut ?? false, opts.allDone ?? false)}`)
 	}
 	return lines.join("\n") + "\n"
+}
+
+// ─── Read-side reconciliation ────────────────────────────────────────────────
+
+export interface ReconcileHooks {
+	/** Worktree existence check (default: fs.existsSync). */
+	worktreeExists?: (worktreePath: string) => boolean
+	/** `.harness.done` marker check (default: directory at <wt>/.harness.done). */
+	hasDoneMarker?: (worktreePath: string) => boolean
+	/** `.harness.exit` reader (default: parse <wt>/.harness.exit, undefined when absent/invalid). */
+	readExitCode?: (worktreePath: string) => number | undefined
+}
+
+export interface ReconcileResult {
+	/** The reconciled state (unchanged when nothing was patched). */
+	state: OrchestratorState
+	/** Group names whose status/exit_code were patched by this pass. */
+	reconciled: string[]
+}
+
+/**
+ * Reconcile a state's non-terminal groups against REAL worktree markers.
+ * This is the fix for the 2026-08-02 `--wait` hang: a worker that genuinely
+ * finished (`.harness.done` present, process dead) but whose state entry
+ * still said "running", and groups from long-merged rounds whose worktrees
+ * were removed while the state still said "running". Only positive evidence
+ * triggers a patch — a worktree that still exists without a `.harness.done`
+ * marker is left alone (genuinely still running, not ours to second-guess).
+ *
+ * Pure: returns a new state + the names patched; does NOT persist. Callers
+ * persist via saveStateSync when `reconciled` is non-empty.
+ */
+export function reconcileGroups(state: OrchestratorState, repo: string, hooks: ReconcileHooks = {}): ReconcileResult {
+	const worktreeExists = hooks.worktreeExists ?? ((p: string): boolean => fs.existsSync(p))
+	const hasDoneMarker = hooks.hasDoneMarker ?? ((p: string): boolean => {
+		try {
+			return fs.statSync(path.join(p, ".harness.done")).isDirectory()
+		} catch {
+			return false
+		}
+	})
+	const readExitCode = hooks.readExitCode ?? ((p: string): number | undefined => {
+		try {
+			const raw = fs.readFileSync(path.join(p, ".harness.exit"), "utf-8").trim()
+			const code = Number(raw)
+			return Number.isFinite(code) ? code : undefined
+		} catch {
+			return undefined
+		}
+	})
+
+	let current = state
+	const reconciled: string[] = []
+	for (const group of state.groups) {
+		if (isTerminalStatus(group.status)) {
+			continue
+		}
+		const wtPath = groupWorktreePath(repo, group)
+		if (hasDoneMarker(wtPath)) {
+			// Ground truth exists: the worker finished. Mirror watch.ts's
+			// mapping (exit 0 → done, anything else/unknown → failed).
+			const exitCode = readExitCode(wtPath)
+			const status = exitCode === 0 ? "done" : "failed"
+			current = updateGroup(current, group.name, {
+				status,
+				...(exitCode !== undefined ? { exit_code: exitCode } : {}),
+				last_activity: {
+					note:
+						exitCode === 0
+							? "reconciled from .harness markers: worker completed cleanly (exit 0)"
+							: `reconciled from .harness markers: worker exited ${exitCode ?? "with unknown code"}`,
+				},
+			})
+			reconciled.push(group.name)
+		} else if (!worktreeExists(wtPath)) {
+			// Worktree entirely gone, never reached a terminal status: the
+			// outcome is genuinely unknowable from markers — surface it as
+			// "orphaned" for a human instead of silently guessing done.
+			current = updateGroup(current, group.name, {
+				status: "orphaned",
+				last_activity: {
+					note: "orphaned: worktree removed before a terminal status — investigate via git history",
+				},
+			})
+			reconciled.push(group.name)
+		}
+		// else: worktree still present, no .harness.done → still in progress;
+		// absence of evidence is not evidence of absence — leave as-is.
+	}
+	return { state: current, reconciled }
 }
 
 // ─── Blocking wait ───────────────────────────────────────────────────────────
@@ -244,6 +388,14 @@ export interface WaitForTerminalOptions {
 	signal?: AbortSignal
 	/** Injectable state reader (default: loadStateSync on statePath). */
 	readState?: () => OrchestratorState
+	/**
+	 * Read-side reconciliation applied to EVERY polled state (not just the
+	 * first — a group can finish mid-wait) BEFORE the terminality check.
+	 * Return the (possibly patched) state plus the names reconciled; the
+	 * loop accumulates the union across polls into the result's
+	 * `reconciled` list.
+	 */
+	reconcile?: (state: OrchestratorState) => ReconcileResult
 }
 
 export interface WaitForTerminalResult {
@@ -252,6 +404,8 @@ export interface WaitForTerminalResult {
 	allDone: boolean
 	timedOut: boolean
 	elapsedMs: number
+	/** Group names reconciled (patched to done/failed/orphaned) across all polls. */
+	reconciled: string[]
 }
 
 /**
@@ -282,15 +436,43 @@ export async function waitForTerminalState(
 		}
 	}
 
+	const reconciled: string[] = []
+	const reconciledSeen = new Set<string>()
+
+	// Apply read-side reconciliation to a freshly-read state and record any
+	// patched group names (deduped across polls).
+	const applyReconcile = (s: OrchestratorState): OrchestratorState => {
+		if (!opts.reconcile) {
+			return s
+		}
+		const result = opts.reconcile(s)
+		for (const name of result.reconciled) {
+			if (!reconciledSeen.has(name)) {
+				reconciledSeen.add(name)
+				reconciled.push(name)
+			}
+		}
+		return result.state
+	}
+
 	let state = readTolerant()
+	if (state !== null) {
+		state = applyReconcile(state)
+	}
 
 	while (true) {
 		if (opts.signal?.aborted) {
-			return { state: state ?? defaultState(), allDone: false, timedOut: false, elapsedMs: Date.now() - start }
+			return {
+				state: state ?? defaultState(),
+				allDone: false,
+				timedOut: false,
+				elapsedMs: Date.now() - start,
+				reconciled,
+			}
 		}
 		if (state !== null) {
 			if (state.groups.length === 0) {
-				return { state, allDone: false, timedOut: false, elapsedMs: Date.now() - start }
+				return { state, allDone: false, timedOut: false, elapsedMs: Date.now() - start, reconciled }
 			}
 			if (state.groups.every((g) => isTerminalStatus(g.status))) {
 				return {
@@ -298,14 +480,19 @@ export async function waitForTerminalState(
 					allDone: state.groups.every((g) => g.status === "done"),
 					timedOut: false,
 					elapsedMs: Date.now() - start,
+					reconciled,
 				}
 			}
 		}
 		if (Date.now() >= deadline) {
-			const finalState = readTolerant() ?? state ?? defaultState()
-			return { state: finalState, allDone: false, timedOut: true, elapsedMs: Date.now() - start }
+			let finalState = readTolerant() ?? state ?? defaultState()
+			finalState = applyReconcile(finalState)
+			return { state: finalState, allDone: false, timedOut: true, elapsedMs: Date.now() - start, reconciled }
 		}
 		await sleep(pollIntervalMs)
 		state = readTolerant()
+		if (state !== null) {
+			state = applyReconcile(state)
+		}
 	}
 }

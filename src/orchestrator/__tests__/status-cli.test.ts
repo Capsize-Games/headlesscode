@@ -13,7 +13,14 @@ import * as path from "node:path"
 
 import { parseStatusArgs, statusMain } from "../cli.js"
 import { waitForTerminalState } from "../status.js"
-import { defaultState, saveStateSync, updateGroup, type OrchestratorGroup, type OrchestratorState } from "../state.js"
+import {
+	defaultState,
+	loadStateSync,
+	saveStateSync,
+	updateGroup,
+	type OrchestratorGroup,
+	type OrchestratorState,
+} from "../state.js"
 
 async function tmpRepo(): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-status-"))
@@ -109,8 +116,12 @@ async function testOneShotPrintsHumanSummary(): Promise<void> {
 		assert.ok(text.includes("total usage: $0.0420"), "round totals line")
 		assert.ok(text.includes("w-done"), "done group row")
 		assert.ok(text.includes("w-fail"), "failed group row")
-		assert.ok(text.includes("w-run"), "running group row")
-		assert.ok(text.includes("3 groups: 1 done · 1 failed · 0 needs-human · 0 blocked · 1 running/spawned"), "counts line")
+		assert.ok(text.includes("w-run"), "group row present")
+		// The fixture's w-run has no worktree on disk, so reconciliation must
+		// surface it as "orphaned" — distinctly, not as a silent "done".
+		assert.ok(text.includes("orphaned"), "orphaned status rendered for the worktree-less running group")
+		assert.ok(text.includes("3 groups: 1 done · 1 failed · 0 needs-human · 0 blocked · 0 running/spawned · 1 orphaned"), "counts line")
+		assert.ok(text.includes("reconciled: w-run (stale status patched from worktree markers)"), "reconciliation is surfaced in text")
 		assert.equal(cap.err.join(""), "", "no stderr on a healthy read")
 	} finally {
 		await fs.rm(repo, { recursive: true, force: true })
@@ -140,14 +151,15 @@ async function testOneShotJsonShape(): Promise<void> {
 		const code = await statusMain(["--repo", repo, "--json"], cap.io)
 
 		assert.equal(code, 1, "failed group present -> exit 1 even in --json mode")
-		const parsed = JSON.parse(cap.out.join("")) as OrchestratorState
+		const parsed = JSON.parse(cap.out.join("")) as OrchestratorState & { reconciled?: string[] }
 		assert.equal(parsed.batch, "r1")
 		assert.equal(parsed.groups.length, 3)
 		assert.deepEqual(
 			parsed.groups.map((g) => g.status).sort(),
-			["done", "failed", "running"],
-			"--json passes the raw groups through",
+			["done", "failed", "orphaned"],
+			"--json passes the reconciled groups through (the worktree-less running group is orphaned)",
 		)
+		assert.deepEqual(parsed.reconciled, ["w-run"], "--json notes the group this call reconciled")
 		assert.ok(parsed.totalUsage && parsed.totalUsage.costUsd === 0.042, "round totals preserved")
 	} finally {
 		await fs.rm(repo, { recursive: true, force: true })
@@ -239,6 +251,10 @@ async function testWaitAgainstRealFileTransitionsToDone(): Promise<void> {
 	const repo = await tmpRepo()
 	try {
 		const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
+		// The worktree must EXIST so reconciliation keeps the group genuinely
+		// running (a missing worktree would reconcile it to "orphaned"
+		// instantly and the wait would not be waiting at all).
+		await fs.mkdir(path.join(repo, ".worktrees", "w1"), { recursive: true })
 		saveStateSync(statePath, updateGroup(defaultState("r1"), "w1", baseGroup({ status: "running" })))
 
 		const cap = capture()
@@ -263,11 +279,19 @@ async function testWaitAgainstRealFileTransitionsToDone(): Promise<void> {
 async function testWaitTimesOutWithClearVerdict(): Promise<void> {
 	const repo = await tmpRepo()
 	try {
-		// Two groups: one done, one running forever.
+		// Two groups: one done, one running forever. The running group's
+		// worktree must EXIST (no .harness.done) so reconciliation leaves it
+		// running and the wait actually times out. baseGroup's default
+		// worktree is ".worktrees/w1", so pin it explicitly.
 		const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
 		let state = updateGroup(defaultState("r1"), "w-done", baseGroup({ name: "w-done", status: "done" }))
-		state = updateGroup(state, "w-run", baseGroup({ name: "w-run", status: "running" }))
+		state = updateGroup(
+			state,
+			"w-run",
+			baseGroup({ name: "w-run", status: "running", worktree: ".worktrees/w-run" }),
+		)
 		saveStateSync(statePath, state)
+		await fs.mkdir(path.join(repo, ".worktrees", "w-run"), { recursive: true })
 
 		const cap = capture()
 		const code = await statusMain(["--repo", repo, "--wait", "--timeout-ms", "100", "--poll-interval-ms", "15"], cap.io)
@@ -299,6 +323,177 @@ async function testWaitJsonCarriesVerdictFields(): Promise<void> {
 	}
 }
 
+// ─── Read-side reconciliation (one-shot + --wait) ────────────────────────────
+
+/**
+	* Create `<repo>/.worktrees/<name>`; when `exitCode` is given also drop the
+	* `.harness.done` marker dir + `.harness.exit` file the watcher/run-worker.sh
+	* would have left behind. No exitCode → worktree exists with NO marker (a
+	* genuinely still-running worker).
+	*/
+async function makeWorktree(repo: string, name: string, exitCode?: number): Promise<void> {
+	const wt = path.join(repo, ".worktrees", name)
+	await fs.mkdir(wt, { recursive: true })
+	if (exitCode === undefined) {
+		return
+	}
+	await fs.mkdir(path.join(wt, ".harness.done"), { recursive: true })
+	await fs.writeFile(path.join(wt, ".harness.exit"), String(exitCode), "utf8")
+}
+
+async function testOneShotReconcilesDoneFromMarkersAndPersists(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
+		saveStateSync(statePath, updateGroup(defaultState("r1"), "w1", baseGroup({ status: "running" })))
+		await makeWorktree(repo, "w1", 0)
+
+		const cap = capture()
+		const code = await statusMain(["--repo", repo], cap.io)
+
+		assert.equal(code, 0, "reconciled to done -> exit 0")
+		assert.ok(cap.out.join("").includes("w1"), "group row present")
+		// The patch must be persisted back to the state file, not just
+		// applied to the in-memory copy.
+		const onDisk = loadStateSync(statePath)
+		assert.equal(onDisk.groups[0].status, "done", "state file updated to done")
+		assert.equal(onDisk.groups[0].exit_code, 0, "exit_code recorded in the state file")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testOneShotReconcilesFailedFromNonZeroExit(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
+		saveStateSync(statePath, updateGroup(defaultState("r1"), "w1", baseGroup({ status: "running" })))
+		await makeWorktree(repo, "w1", 3)
+
+		const cap = capture()
+		const code = await statusMain(["--repo", repo], cap.io)
+
+		assert.equal(code, 1, "reconciled to failed -> exit 1")
+		const onDisk = loadStateSync(statePath)
+		assert.equal(onDisk.groups[0].status, "failed", "state file updated to failed")
+		assert.equal(onDisk.groups[0].exit_code, 3, "non-zero exit_code recorded")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testOneShotReconcilesOrphanedDistinctly(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
+		saveStateSync(statePath, updateGroup(defaultState("r1"), "w1", baseGroup({ status: "running" })))
+		// No worktree dir at all → nothing to wait for, outcome unknowable.
+
+		const cap = capture()
+		const code = await statusMain(["--repo", repo], cap.io)
+
+		assert.equal(code, 1, "orphaned is a needs-attention outcome -> exit 1")
+		const text = cap.out.join("")
+		assert.ok(text.includes("orphaned"), "text renders the orphaned status")
+		assert.ok(text.includes("1 group: 0 done · 0 failed · 0 needs-human · 0 blocked · 0 running/spawned · 1 orphaned"), "counts line keeps orphaned distinct from done")
+		assert.ok(!/1 group: 1 done/.test(text), "orphaned is never reported as done")
+
+		const onDisk = loadStateSync(statePath)
+		assert.equal(onDisk.groups[0].status, "orphaned", "state file updated to orphaned")
+
+		// --json on a FRESH stale state: distinct status + reconciled list.
+		saveStateSync(statePath, updateGroup(defaultState("r1"), "w1", baseGroup({ status: "running" })))
+		const capJson = capture()
+		await statusMain(["--repo", repo, "--json"], capJson.io)
+		const parsed = JSON.parse(capJson.out.join("")) as OrchestratorState & { reconciled?: string[] }
+		assert.equal(parsed.groups[0].status, "orphaned", "json status is orphaned, not done")
+		assert.deepEqual(parsed.reconciled, ["w1"], "json notes the group this call reconciled")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testOneShotLeavesRunningGroupWithLiveWorktreeAlone(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
+		saveStateSync(statePath, updateGroup(defaultState("r1"), "w1", baseGroup({ status: "running" })))
+		// Worktree exists but has NO .harness.done marker → genuinely running.
+		await makeWorktree(repo, "w1")
+
+		const cap = capture()
+		const code = await statusMain(["--repo", repo], cap.io)
+
+		assert.equal(code, 0, "running-only state -> exit 0")
+		assert.ok(cap.out.join("").includes("1 running/spawned"), "group still reported running")
+		const onDisk = loadStateSync(statePath)
+		assert.equal(onDisk.groups[0].status, "running", "reconciliation must not touch a live worktree")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testWaitReconcilesStaleGroupPromptly(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
+		let state = updateGroup(defaultState("r1"), "w1", baseGroup({ status: "running" }))
+		state = updateGroup(state, "w2", baseGroup({ name: "w2", status: "done" }))
+		saveStateSync(statePath, state)
+		// w1 is stale-but-reconcilable: its worktree still exists with a real
+		// .harness.done marker, it's just that nobody updated the state file.
+		await makeWorktree(repo, "w1", 0)
+
+		const t0 = Date.now()
+		const cap = capture()
+		const code = await statusMain(
+			["--repo", repo, "--wait", "--json", "--timeout-ms", "5000", "--poll-interval-ms", "50"],
+			cap.io,
+		)
+		const elapsed = Date.now() - t0
+
+		assert.equal(code, 0, "reconciled to done + all done -> exit 0")
+		const parsed = JSON.parse(cap.out.join("")) as OrchestratorState & {
+			allDone: boolean
+			timedOut: boolean
+			verdict: string
+			reconciled?: string[]
+		}
+		assert.equal(parsed.allDone, true)
+		assert.equal(parsed.timedOut, false)
+		assert.equal(parsed.verdict, "2/2 groups done, 0 failed")
+		assert.deepEqual(parsed.reconciled, ["w1"], "wait reports the reconciled group")
+		assert.ok(elapsed < 2000, `returned promptly instead of waiting the timeout (${elapsed}ms)`)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testWaitTreatsOrphanedAsTerminal(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
+		saveStateSync(statePath, updateGroup(defaultState("r1"), "w1", baseGroup({ status: "running" })))
+		// No worktree → reconciled to orphaned on the first poll → terminal.
+
+		const t0 = Date.now()
+		const cap = capture()
+		const code = await statusMain(
+			["--repo", repo, "--wait", "--timeout-ms", "5000", "--poll-interval-ms", "50"],
+			cap.io,
+		)
+		const elapsed = Date.now() - t0
+
+		assert.equal(code, 1, "orphaned is terminal but NOT done -> exit 1")
+		const text = cap.out.join("")
+		assert.ok(text.includes("verdict: all 1 group terminal, but 1 orphaned"), "verdict names the orphaned group")
+		assert.ok(!text.includes("timed out"), "did not wait out the full timeout")
+		assert.ok(elapsed < 2000, `returned promptly instead of waiting the timeout (${elapsed}ms)`)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -316,6 +511,12 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["wait against the real state file transitions to done", testWaitAgainstRealFileTransitionsToDone],
 	["wait times out with a clear verdict and exit 1", testWaitTimesOutWithClearVerdict],
 	["wait --json carries allDone/timedOut/verdict fields", testWaitJsonCarriesVerdictFields],
+	["one-shot reconciles done from .harness markers and persists", testOneShotReconcilesDoneFromMarkersAndPersists],
+	["one-shot reconciles failed from a non-zero .harness.exit", testOneShotReconcilesFailedFromNonZeroExit],
+	["one-shot reconciles orphaned and renders it distinctly (text + json)", testOneShotReconcilesOrphanedDistinctly],
+	["one-shot leaves a running group with a live worktree alone", testOneShotLeavesRunningGroupWithLiveWorktreeAlone],
+	["wait reconciles a stale-but-reconcilable group promptly", testWaitReconcilesStaleGroupPromptly],
+	["wait treats orphaned as terminal and returns promptly", testWaitTreatsOrphanedAsTerminal],
 ]
 
 async function main(): Promise<void> {
