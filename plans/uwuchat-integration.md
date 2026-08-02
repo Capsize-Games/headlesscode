@@ -224,51 +224,55 @@ bundle it into this integration. Coding sessions can run without shared
 memory initially; `uwu`'s own rolling-summary memory of "we've been building
 X" is a reasonable enough starting context even without deep integration.
 
-### 5. Where headlesscode actually executes — DECIDED (2026-08-02)
+### 5. Where headlesscode actually executes — DECIDED, then CORRECTED (2026-08-02)
 
-**Decision: the same server uwuchat's backend already runs on, in a Docker
-container, using the existing `DockerSessionProvider`.** No new server for
-this — explicitly rejected by the project owner ("i don't want to spin up an
-entire new server just for the admin to build code"). `DockerSessionProvider`
-already provisions a resource-limited, read-only-rootfs container with a
-workspace bind mount via the local `docker` CLI, which is exactly "same host,
-isolated container" — no new infrastructure required, only the wiring
-described below. Revisit only if/when Tier 1 or Tier 2 usage volume actually
-threatens to compete with uwuchat's own production resource needs on that
-host — not a concern to design around preemptively for a single admin user.
+**Decision: the same server uwuchat's backend already runs on.** No new
+server for this — explicitly rejected by the project owner ("i don't want to
+spin up an entire new server just for the admin to build code"). This part
+stands.
 
-Verified state of `src/cloud/` (not the "Docker/Hetzner abstraction" this
-doc previously assumed — corrected):
+**Correction**: this section originally assumed `DockerSessionProvider`
+would provide per-session container isolation *inside* that server. Verified
+against airunner's real Docker setup while scoping
+`plans/airunner-docker-packaging.md` (the task that actually installs
+headlesscode into that environment): **airunner's `server` container has
+zero Docker access today** — no `/var/run/docker.sock` mount, no `docker`
+CLI installed, anywhere in the stack. `DockerSessionProvider`
+(`src/cloud/docker-provider.ts`) shells out to a local `docker` CLI to spin
+up per-session containers — it CANNOT run from inside a container that has
+no Docker access itself, without first adding Docker socket access to that
+container. That's a real, separate security expansion (giving uwuchat's
+production backend container the ability to control the host's Docker
+daemon) that the project owner has not decided on and that
+`airunner-docker-packaging.md` deliberately does NOT add.
 
-Verified state of `src/cloud/` (not the "Docker/Hetzner abstraction" this
-doc previously assumed — corrected):
+**Revised v1 reality**: headlesscode's actual orchestration path
+(`headlesscode orchestrate`, `LocalProcessProvider`,
+`scripts/spawn-parallel-worktrees.sh`) already runs as plain git worktrees +
+sibling OS child processes — it needs no Docker at all to function. So Tier
+1 sessions in v1 run as regular processes inside the one `server` container,
+isolated from each other only by separate working directories/PIDs, **not**
+separate containers. This is a real, known tradeoff (weaker per-session
+isolation than originally assumed) accepted for v1 given the admin-only
+scope and speed priority — revisit before ever considering Tier 1 beyond a
+single trusted admin, and revisit for Tier 2 regardless (its "disposable
+per-artifact workspace" framing in this doc's Tier 2 section may want real
+container isolation from the start, since it's public-facing).
+
+Verified state of `src/cloud/` for reference:
 
 - **`src/cloud/provider.ts`**: `CloudProvider` interface (5-method session
   lifecycle) + `LocalProcessProvider`, which just wraps the existing
   `scripts/spawn-parallel-worktrees.sh`/`run-worker.sh` — local worktrees,
-  not remote compute. Also exports `hetznerDockerProviderSketch`, explicitly
-  `implemented: false` — **no live Hetzner code exists anywhere.**
+  not remote compute, not Docker. This is what v1 actually uses. Also
+  exports `hetznerDockerProviderSketch`, explicitly `implemented: false` —
+  no live Hetzner code exists anywhere.
 - **`src/cloud/docker-provider.ts`**: `DockerSessionProvider` is real and
-  working — shells out to the local `docker` CLI to run a session in a
-  resource-limited, read-only-rootfs container with a workspace bind mount.
-  This provisions a container **on whatever host runs the CLI**, not a
-  remote/cloud machine.
+  working as a primitive, but not usable from inside a container with no
+  Docker access — parked until/unless the socket-access decision is made
+  explicitly (see correction above).
 - **Nothing is wired into `src/cli.ts`** — no `orchestrate`/`dashboard`
-  subcommand uses either provider today. It's a tested interface + a real
-  local-Docker primitive, not yet connected to anything.
-
-Per the decision above: `DockerSessionProvider` runs in the same process/host
-as uwuchat's backend (not a separate container/process boundary at the host
-level, just container isolation per coding session) — session isolation
-comes from the Docker container itself (resource limits, read-only rootfs),
-not from network/host separation. This avoids building real multi-tenant/
-remote provisioning (Hetzner, dynamic machine spin-up) before it's needed,
-while still being a genuine stepping stone toward real multi-tenant hosting
-later if Tier 1 or Tier 2 ever need it — not a dead end that has to be
-thrown away. Wiring `CloudProvider`/`DockerSessionProvider` into an actual
-`headlesscode orchestrate` entry point uwuchat's backend can call is real,
-scoped work, but small relative to building genuine remote compute
-provisioning from scratch.
+  subcommand uses either provider today.
 
 ### 6. Pushing work back to GitHub — currently ZERO push/PR code exists
 
