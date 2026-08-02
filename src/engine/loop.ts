@@ -130,6 +130,14 @@ export interface HeadlessSessionConfig {
 	maxTokens?: number
 	/** Abort timeout per LLM call, ms (default 120s). */
 	llmTimeoutMs?: number
+	/**
+	 * Opt-in SSE streaming (streaming-and-reasoning, default OFF). When true,
+	 * LLM calls stream token/reasoning deltas and the loop emits incremental
+	 * `llm_stream_chunk` events so the dashboard can show live-typing text.
+	 * Default OFF — the blocking request path (which the e2e fixtures and
+	 * most tests assume) is unchanged.
+	 */
+	stream?: boolean
 	/** Sliding-window cap on messages sent per request (default 40). */
 	windowSize?: number
 	/**
@@ -246,6 +254,8 @@ export interface ResolvedSessionConfig {
 	consecutiveErrorLimit: number
 	systemPromptOverride?: string
 	llmTimeoutMs: number
+	/** Opt-in SSE streaming (streaming-and-reasoning; default false). */
+	stream: boolean
 	windowSize: number
 	/**
 	 * Phase 3 context condensation: the model's real context window in
@@ -362,6 +372,7 @@ export class HeadlessSession {
 			consecutiveErrorLimit: config.consecutiveErrorLimit ?? DEFAULT_CONSECUTIVE_ERROR_LIMIT,
 			systemPromptOverride: config.systemPromptOverride,
 			llmTimeoutMs: config.llmTimeoutMs ?? DEFAULT_LLM_TIMEOUT_MS,
+			stream: config.stream ?? envStreaming(),
 			windowSize: config.windowSize ?? DEFAULT_WINDOW_SIZE,
 			// Deliberately left undefined when the caller didn't configure it:
 			// the live OpenRouter models-endpoint lookup in maybeCondenseHistory
@@ -948,6 +959,17 @@ export class HeadlessSession {
 						temperature: this.config.temperature,
 						maxTokens: this.config.maxTokens,
 						signal: controller.signal,
+						stream: this.config.stream,
+						onStreamChunk: (kind, chunk) => {
+							// Dashboard live-typing: forward each chunk to the event
+							// feed (truncated like other large fields). Non-fatal —
+							// a feed write failure must never abort the LLM call.
+							void this.emitEvent(
+								"llm_stream_chunk",
+								() => this.eventFeed.llmStreamChunk({ iteration, kind, chunk }),
+								{ iteration },
+							)
+						},
 					})
 					assistant = response.message
 					// Cost/token accounting (workstream 3): feed the provider's usage
@@ -1018,9 +1040,9 @@ export class HeadlessSession {
 			}
 
 			// Live worker monitoring: emit the llm_response event (a short
-			// text preview, whether the response carried tool_calls, and this
-			// call's token usage incl. cachedTokens — see src/engine/events.ts).
-			// Non-fatal.
+			// text preview, whether the response carried tool_calls, this
+			// call's token usage incl. cachedTokens, and any reasoning
+			// content — see src/engine/events.ts). Non-fatal.
 			{
 				const text = typeof assistant.content === "string" ? assistant.content.trim() : ""
 				await this.emitEvent(
@@ -1030,6 +1052,14 @@ export class HeadlessSession {
 							iteration,
 							hadToolCalls: Array.isArray(assistant.tool_calls) && assistant.tool_calls.length > 0,
 							textPreview: text || undefined,
+							// The full reasoning string: EventFeed.llmResponse
+							// truncates it (EVENT_TRUNCATE_CHARS) and flags the cut,
+							// exactly once — pre-truncating here would double-truncate
+							// and lose the truncated flag for boundary-length content.
+							reasoningPreview:
+								typeof assistant.reasoning === "string" && assistant.reasoning.trim()
+									? assistant.reasoning
+									: undefined,
 							inputTokens: this.lastLlmUsage?.inputTokens,
 							outputTokens: this.lastLlmUsage?.outputTokens,
 							cachedTokens: this.lastLlmUsage?.cachedTokens,
@@ -1038,11 +1068,16 @@ export class HeadlessSession {
 				)
 			}
 
-			// 5. Append the assistant message.
+			// 5. Append the assistant message. Reasoning is echoed back on the
+			// assistant history message (OpenRouter accepts it and providers
+			// like native DeepSeek drop prior reasoning if it is not echoed on
+			// assistant messages within tool-call turns — see api-docs.deepseek.com
+			// /guides/thinking_mode). Harmless for providers that ignore it.
 			const assistantMessage: ChatMessage = {
 				role: "assistant",
 				content: assistant.content ?? null,
 				tool_calls: assistant.tool_calls,
+				reasoning: assistant.reasoning,
 			}
 			messages.push(assistantMessage)
 
@@ -1479,4 +1514,18 @@ function envMaxPauseMs(): number | undefined {
 	}
 	const n = Number(raw)
 	return Number.isFinite(n) && n > 0 ? n : undefined
+}
+
+/**
+ * Streaming-and-reasoning: resolve the SSE-streaming opt-in from
+ * `$HEADLESSCODE_STREAM` (accepted: "1", "true", "yes", "on"; anything else
+ * — including unset — means OFF). Default OFF deliberately: the blocking
+ * request path (which the e2e fixtures and most tests assume) is unchanged.
+ */
+function envStreaming(): boolean {
+	const raw = process.env.HEADLESSCODE_STREAM
+	if (raw === undefined || raw === "") {
+		return false
+	}
+	return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase())
 }

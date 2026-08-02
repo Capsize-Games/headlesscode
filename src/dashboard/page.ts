@@ -173,6 +173,7 @@ export function renderPage(repo?: string): string {
   #chat .bubble .bubble-kicker { font-size: 0.72rem; color: #8250df; font-weight: 600; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.04em; }
   #chat .bubble .bubble-kicker.error { color: #c0392b; }
   #chat .bubble .bubble-kicker.ok { color: #1a7f37; }
+  #chat .bubble.stream-chunk { border-style: dashed; border-color: color-mix(in srgb, #8250df 25%, transparent); background: color-mix(in srgb, #8250df 3%, transparent); }
   #chat .tool-call {
     display: flex; align-items: baseline; gap: 8px; margin: 8px 0 0;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.78rem;
@@ -419,6 +420,7 @@ const EVENT_LABELS = {
   session_start: "🚀 session start",
   iteration_start: "🔄 iteration",
   llm_response: "🤖 llm response",
+  llm_stream_chunk: "⋯ stream chunk",
   llm_error: "💥 llm error",
   tool_call: "🔧 tool call",
   tool_result: "✅ tool result",
@@ -503,6 +505,9 @@ function renderEvent(e) {
       body = (e.hadToolCalls ? "tool_calls " : "text ") +
         (e.textPreview ? "· " + esc(String(e.textPreview).slice(0, 300)) + (e.textTruncated ? ' <span class="trunc-note">(truncated)</span>' : "") : "") +
         (typeof e.inputTokens === "number" ? " · in=" + esc(e.inputTokens) + " out=" + esc(e.outputTokens ?? 0) + " cached=" + esc(e.cachedTokens ?? 0) : "");
+      break;
+    case "llm_stream_chunk":
+      body = (e.kind || "") + (e.chunk ? " · " + esc(String(e.chunk).slice(0, 200)) + (e.chunkTruncated ? ' <span class="trunc-note">(truncated)</span>' : "") : "");
       break;
     case "checkpoint_saved":
       body = e.iteration === 0 ? "baseline" : "after iteration " + esc(e.iteration);
@@ -678,6 +683,18 @@ function renderChatTurn(turn) {
         bubble.appendChild(elTruncNote());
       }
       wrap.appendChild(bubble);
+    } else if (e.type === "llm_stream_chunk") {
+      // Streaming chunk: render as a live-typing bubble. The turn's final
+      // llm_response carries the assembled text, so these are purely the
+      // "live" effect between iteration_start and llm_response.
+      const stream = document.createElement("div");
+      stream.className = "bubble stream-chunk";
+      const label = e.kind === "reasoning" ? "thinking…" : e.kind === "tool" ? "tool…" : "typing…";
+      stream.innerHTML =
+        '<div class="bubble-kicker">' + esc(label) + "</div>" +
+        "<div>" + esc(String(e.chunk || "")) + "</div>" +
+        (e.chunkTruncated ? '<div class="trunc-note">(truncated)</div>' : "");
+      wrap.appendChild(stream);
     } else if (e.type === "decision_answered") {
       // The answer to a blocked question: inline in the turn that asked it.
       const marker = document.createElement("div");
@@ -841,6 +858,7 @@ function groupEvents(events) {
       case "llm_response":
       case "tool_call":
       case "decision_answered":
+      case "llm_stream_chunk":
         if (current) {
           current.events.push(e);
         } else {

@@ -21,6 +21,9 @@
  *   - `decision_blocked` starts a turn (a new question the model asked the
  *     human); the matching `decision_answered` is rendered as an inline
  *     system marker within that same turn.
+ *   - `llm_stream_chunk` events belong to the current turn (streamed chunks
+ *     arrive BETWEEN iteration_start and llm_response). They must NOT close
+ *     the turn — the turn would fragment into one system marker per chunk.
  *   - Everything else (`checkpoint_saved`, `paused`, `resumed`, `llm_error`,
  *     `session_end`, …) is a system-level marker rendered as a small inline
  *     chip between turns, not a chat bubble.
@@ -116,6 +119,7 @@ export function groupEventsIntoChat(events: EventRecord[]): ChatGrouping {
 			case "llm_response":
 			case "tool_call":
 			case "decision_answered":
+			case "llm_stream_chunk":
 				// Belongs to the current turn when there is one; otherwise a
 				// lone marker (a feed that starts mid-session).
 				if (current) {
