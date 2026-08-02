@@ -113,6 +113,11 @@ Subcommands:
               Run a full parallel orchestration round
               (split → spawn → review → QA → deploy gate). See
               \`npx tsx src/cli.ts orchestrate --help\` for full options.
+  headlesscode orchestrate status --repo <path> [--wait] [--timeout-ms <n>] [--json]
+              Print a compact per-group status of a round, or block inside one
+              call until every group is terminal (--wait) — replaces
+              hand-rolled poll loops over the state file / harness.log. See
+              \`npx tsx src/cli.ts orchestrate status --help\` for full options.
   headlesscode watch --owner <o> --repo <r> --label <label> [--run-once]
               Poll GitHub for labeled issues and fan out into orchestration
               batches (idempotent). See

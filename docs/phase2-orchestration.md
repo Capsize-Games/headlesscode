@@ -182,6 +182,43 @@ npx tsx src/cli.ts orchestrate --repo <path> --issue 27 --issue 29 --issue 38 \
 - `--dry-run` prints the split plan + exact spawn command without spawning
   (no API key needed).
 
+### `orchestrate status` — read-side status / wait for external callers
+
+```bash
+npx tsx src/cli.ts orchestrate status --repo <path> [--json]                       # one-shot
+npx tsx src/cli.ts orchestrate status --repo <path> --wait [--timeout-ms <n>] [--json]  # block until terminal
+```
+
+The interactive orchestrator agent (or any external caller) uses this instead
+of hand-rolling poll loops over the state file / `harness.log`:
+
+- **One-shot** reads `.worktrees/.orchestrator-state.json` (via `loadStateSync`
+  from `state.ts` — never writes, never re-implements parsing) and prints a
+  compact per-group table: name, status, last activity, review verdict +
+  finding count, QA verdict, per-group cost, STALLED flag, blocked question,
+  plus round-level totals. `--json` prints the raw `OrchestratorState` for
+  programmatic consumption.
+- **`--wait`** blocks inside this ONE process — the caller makes one tool call
+  and gets one result — until every group reaches a terminal status
+  (`done` | `failed` | `needs-human`; `blocked` is deliberately NOT terminal:
+  it is a decision-escalation wait state that keeps the wait going) or
+  `--timeout-ms` elapses. It then prints the same summary plus a one-line
+  verdict (`3/3 groups done, 0 failed` / `timed out after 2 of 3 groups
+  done`), and with `--json` adds top-level `allDone`/`timedOut`/`verdict`
+  fields.
+- **Exit codes** are the whole point for scripts: `0` = every group done
+  (clean), `1` = any group failed/needs-human OR the wait timed out, `2` =
+  usage error. A caller that just wants yes/no can branch on exit code alone.
+- **Implementation notes** (`src/orchestrator/status.ts`): `--wait` polls the
+  state file at `--poll-interval-ms` (default 5s), not `fs.watch` — the
+  watcher itself writes the file at that cadence, `fs.watch` on a regular
+  file is unreliable when the writer replaces it via rename, and the file may
+  not exist at wait-start. Default `--timeout-ms` is 2h, matching the
+  watcher's stall guard (`HEADLESSCODE_STALL_TIMEOUT`): a round left
+  non-terminal longer than that is flagged stalled anyway. Transient JSON
+  parse errors during the wait (writer mid-save) are retried, not fatal. An
+  empty state file returns immediately — nothing to wait for.
+
 ## 8. Before/after — how this replaces the airunner GUI flow
 
 | Airunner (GUI) | headlesscode (Phase 2) |
@@ -209,9 +246,11 @@ npx tsx src/cli.ts orchestrate --repo ~/Projects/airunner \
 npx tsx src/cli.ts orchestrate --repo ~/Projects/airunner \
   --issue 27 --issue 29 --issue 36 --issue 38
 
-# 4. Inspect state while it runs
-cat ~/Projects/airunner/.worktrees/.orchestrator-state.json
-tail -f ~/Projects/airunner/.worktrees/w1/harness.log
+# 4. Inspect state while it runs (one-shot), or block until the round finishes
+npx tsx src/cli.ts orchestrate status --repo ~/Projects/airunner
+# Or wait for the whole round from one call (exit 0 = all done):
+npx tsx src/cli.ts orchestrate status --repo ~/Projects/airunner --wait --timeout-ms 7200000
+tail -f ~/Projects/airunner/.worktrees/w1/harness.log   # per-worker detail, if needed
 ```
 
 Notes:
