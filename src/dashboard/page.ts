@@ -27,7 +27,7 @@
  * when HEADLESSCODE_DASHBOARD_TOKEN is set (see src/dashboard/server.ts).
  */
 
-export function renderPage(): string {
+export function renderPage(repo?: string): string {
 	return `<!doctype html>
 <html lang="en">
 <head>
@@ -263,6 +263,52 @@ export function renderPage(): string {
     border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 0.75rem; white-space: pre-wrap; word-break: break-word;
   }
+  /* File browser (dashboard-file-browser-and-permissions-ui). */
+  #fileBrowser { margin-top: 8px; }
+  #fileBrowser .fb-toolbar { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; flex-wrap: wrap; }
+  #fileBrowser .fb-toolbar input[type="text"] { flex: 1; min-width: 200px; padding: 4px 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; }
+  #fileBrowser .fb-tree {
+    border: 1px solid color-mix(in srgb, CanvasText 15%, transparent);
+    border-radius: 8px; max-height: 380px; overflow: auto; padding: 6px 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem;
+  }
+  #fileBrowser .fb-entry { display: flex; align-items: center; gap: 6px; padding: 2px 10px; cursor: pointer; white-space: nowrap; }
+  #fileBrowser .fb-entry:hover { background: color-mix(in srgb, CanvasText 6%, transparent); }
+  #fileBrowser .fb-entry .fb-name { overflow: hidden; text-overflow: ellipsis; }
+  #fileBrowser .fb-entry .fb-size { margin-left: auto; color: GrayText; font-size: 0.7rem; padding-left: 12px; }
+  #fileBrowser .fb-entry.dir > .fb-name { font-weight: 600; }
+  #fileBrowser .fb-children { padding-left: 16px; }
+  #fileBrowser .fb-children.collapsed { display: none; }
+  #fileBrowser .fb-viewer {
+    margin-top: 8px; border: 1px solid color-mix(in srgb, CanvasText 15%, transparent);
+    border-radius: 8px; overflow: hidden;
+  }
+  #fileBrowser .fb-viewer-head {
+    display: flex; align-items: center; gap: 8px; padding: 6px 12px;
+    border-bottom: 1px solid color-mix(in srgb, CanvasText 12%, transparent);
+    font-size: 0.75rem; color: GrayText;
+  }
+  #fileBrowser .fb-viewer-head .fb-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 600; color: CanvasText; overflow: hidden; text-overflow: ellipsis; }
+  #fileBrowser .fb-viewer-head .fb-close { margin-left: auto; cursor: pointer; border: none; background: none; font-size: 1rem; color: GrayText; }
+  #fileBrowser pre.fb-content {
+    margin: 0; padding: 12px; max-height: 420px; overflow: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem; line-height: 1.45;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  #fileBrowser .fb-note { color: GrayText; font-style: italic; padding: 8px 12px; }
+
+  /* Permissions settings (dashboard-file-browser-and-permissions-ui). */
+  #permissionsSettings .perm-list { display: flex; flex-direction: column; gap: 8px; }
+  #permissionsSettings .perm-field label { font-size: 0.75rem; color: GrayText; text-transform: uppercase; letter-spacing: 0.03em; }
+  #permissionsSettings .perm-field textarea {
+    width: 100%; min-height: 56px; padding: 6px 8px; margin-top: 3px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.78rem;
+    resize: vertical;
+  }
+  #permissionsSettings .perm-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+  #permissionsSettings .perm-row button { font-size: 0.8rem; padding: 3px 12px; border-radius: 6px; cursor: pointer; }
+  #permissionsSettings .perm-actions { display: flex; gap: 8px; margin-top: 10px; align-items: center; flex-wrap: wrap; }
+  #permissionsSettings .perm-status { font-size: 0.8rem; }
 </style>
 </head>
 <body>
@@ -293,6 +339,26 @@ export function renderPage(): string {
     Each role resolves its own model; <code>_default</code> is the fallback when a mode isn't listed.
     An explicit <code>--model</code> flag always overrides this table.</div>
   <div id="modeModels"></div>
+
+  <h2>Workspace files</h2>
+  <div class="sub">Read-only file browser. Click a directory to expand/collapse; click a file to
+    preview its text content (files over 30k chars or binary files are not previewable).
+    No file editing from the browser — deliberately read-only.</div>
+  <div id="fileBrowser">
+    <div class="fb-toolbar">
+      <input type="text" id="fbRepo" placeholder="workspace path (repo)" value="${repo ? String(repo).replace(/"/g, "&quot;") : ""}" />
+      <button id="fbLoad">Load</button>
+      <span id="fbMsg"></span>
+    </div>
+    <div class="empty">enter a workspace path and press Load</div>
+  </div>
+
+  <h2>Permissions settings</h2>
+  <div class="sub">Command allow/deny + protected-file permissions
+    (<code>.headlesscode/permissions.json</code>). When no file exists yet the page shows the
+    resolved built-in defaults, clearly labeled. Save writes the file; the change takes effect
+    on the next session (fresh <code>resolvePermissions</code> call).</div>
+  <div id="permissionsSettings"><div class="empty">loading…</div></div>
 
   <h2>Blocked (awaiting a decision)</h2>
   <div id="blocked"><div class="empty">none</div></div>
@@ -1211,6 +1277,308 @@ async function saveModeModels(table) {
   }
 }
 
+// ── Workspace file browser (dashboard-file-browser-and-permissions-ui) ──────
+// A simple collapsible directory tree — plain vanilla JS, no library. Clicking
+// a directory toggles its children; clicking a file fetches its (capped,
+// binary-safe) content and shows it in a read-only text view. Read-only by
+// design: no file editing from the browser in this pass.
+const fbEl = document.getElementById("fileBrowser");
+const fbMsgEl = document.getElementById("fbMsg");
+const fbRepoInput = document.getElementById("fbRepo");
+
+// Paths currently expanded, relative to the workspace root ("." = root).
+// The tree re-fetches each level on demand — no full recursive walk, so a
+// huge repo stays cheap.
+const fbExpanded = new Set();
+
+function fbMsg(text, isError) {
+  if (!fbMsgEl) return;
+  fbMsgEl.textContent = text;
+  fbMsgEl.className = isError ? "status-error" : "status-success";
+}
+
+function fbRepo() {
+  return (fbRepoInput.value || "").trim();
+}
+
+async function fbFetchDir(relDir) {
+  const params = new URLSearchParams();
+  params.set("repo", fbRepo());
+  if (relDir && relDir !== ".") params.set("dir", relDir);
+  const res = await fetch("/api/files?" + params.toString());
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || ("HTTP " + res.status));
+  }
+  return data.entries || [];
+}
+
+function fmtSize(n) {
+  if (typeof n !== "number") return "";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+// Render one directory level as a <div class="fb-children"> under parentRel.
+// container is the element the level's children get appended to.
+async function renderFbLevel(container, parentRel) {
+  container.innerHTML = '<div class="empty">loading…</div>';
+  let entries;
+  try {
+    entries = await fbFetchDir(parentRel);
+  } catch (err) {
+    container.innerHTML = '<div class="empty">failed: ' + esc(err) + "</div>";
+    return;
+  }
+  container.innerHTML = "";
+  for (const entry of entries) {
+    const rel = parentRel === "." || parentRel === "" ? entry.name : parentRel + "/" + entry.name;
+    const row = document.createElement("div");
+    row.className = "fb-entry " + (entry.type === "dir" ? "dir" : "file");
+    const icon = entry.type === "dir" ? "📁" : "📄";
+    row.innerHTML =
+      '<span class="fb-icon">' + icon + "</span>" +
+      '<span class="fb-name">' + esc(entry.name) + "</span>" +
+      (entry.type === "file" ? '<span class="fb-size">' + esc(fmtSize(entry.size)) + "</span>" : "");
+    if (entry.type === "dir") {
+      const children = document.createElement("div");
+      children.className = "fb-children collapsed";
+      row.appendChild(children);
+      row.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        if (fbExpanded.has(rel)) {
+          fbExpanded.delete(rel);
+          children.classList.add("collapsed");
+          children.innerHTML = "";
+        } else {
+          fbExpanded.add(rel);
+          children.classList.remove("collapsed");
+          renderFbLevel(children, rel);
+        }
+      });
+    } else {
+      row.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        fbPreviewFile(rel);
+      });
+    }
+    container.appendChild(row);
+  }
+  if (entries.length === 0) {
+    container.innerHTML = '<div class="empty">(empty directory)</div>';
+  }
+}
+
+async function fbPreviewFile(rel) {
+  const params = new URLSearchParams();
+  params.set("repo", fbRepo());
+  params.set("file", rel);
+  try {
+    const res = await fetch("/api/files/content?" + params.toString());
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+    fbShowViewer(rel, data);
+  } catch (err) {
+    fbMsg("failed to load file: " + err, true);
+  }
+}
+
+function fbShowViewer(rel, data) {
+  const existing = fbEl.querySelector(".fb-viewer");
+  if (existing) existing.remove();
+  const viewer = document.createElement("div");
+  viewer.className = "fb-viewer";
+  const head = document.createElement("div");
+  head.className = "fb-viewer-head";
+  head.innerHTML = '<span class="fb-path">' + esc(rel) + "</span>" +
+    '<button class="fb-close" title="close">✕</button>';
+  head.querySelector(".fb-close").addEventListener("click", () => viewer.remove());
+  viewer.appendChild(head);
+  const body = document.createElement("div");
+  if (data.previewable) {
+    const pre = document.createElement("pre");
+    pre.className = "fb-content";
+    pre.textContent = data.content;
+    body.appendChild(pre);
+  } else {
+    const note = document.createElement("div");
+    note.className = "fb-note";
+    note.textContent = "not previewable — " + (data.reason || "unknown reason");
+    body.appendChild(note);
+  }
+  viewer.appendChild(body);
+  fbEl.appendChild(viewer);
+  viewer.scrollIntoView({ block: "nearest" });
+}
+
+async function fbLoad() {
+  if (!fbRepo()) {
+    fbMsg("enter a workspace path first", true);
+    return;
+  }
+  fbExpanded.clear();
+  fbMsg("");
+  const tree = fbEl.querySelector(".fb-tree");
+  if (tree) tree.remove();
+  const holder = document.createElement("div");
+  holder.className = "fb-tree";
+  fbEl.appendChild(holder);
+  await renderFbLevel(holder, ".");
+}
+
+// ── Permissions settings (dashboard-file-browser-and-permissions-ui) ────────
+// View + edit allowed/denied command lists, protected-file globs, and the
+// allowProtectedWrites escape hatch. Mirrors the mode-models settings page's
+// UX: load current state, edit in place, Save POSTs and shows the same inline
+// success/error status. When no permissions.json exists yet the page shows
+// the resolved built-in defaults, clearly labeled as defaults.
+const permEl = document.getElementById("permissionsSettings");
+
+function permStatus() {
+  return permEl.querySelector(".perm-status");
+}
+
+function permMsg(text, isError) {
+  const el = permStatus();
+  if (!el) return;
+  el.textContent = text;
+  el.className = "perm-status " + (isError ? "status-error" : "status-success");
+}
+
+// The three list fields are edited as newline-separated text (one entry per
+// line — the natural way to edit a list of command prefixes / globs in a
+// plain textarea, no framework).
+const PERM_LIST_FIELDS = [
+  { key: "allowedCommands", label: "allowed commands", hint: "one command prefix per line — empty = default-ALLOW (deny list still applies)" },
+  { key: "deniedCommands", label: "denied commands", hint: "one command prefix per line — deny always wins" },
+  { key: "protectedFiles", label: "protected files", hint: "one glob per line, e.g. .env, *.pem, secrets/" },
+];
+
+function permListToText(list) {
+  return (list || []).join("\n");
+}
+
+function permTextToList(text) {
+  return text.split("\n").map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
+function renderPermissions(data) {
+  const file = data.file || null;
+  const resolved = data.resolved || {};
+
+  permEl.innerHTML = "";
+
+  const banner = document.createElement("div");
+  banner.className = "sub";
+  if (data.isDefault) {
+    banner.textContent = "No .headlesscode/permissions.json yet — showing the resolved built-in defaults. " +
+      "Saving writes a real config file; until then these defaults apply to every session.";
+  } else {
+    banner.textContent = "Loaded from .headlesscode/permissions.json — this is the file every session reads.";
+  }
+  permEl.appendChild(banner);
+
+  const list = document.createElement("div");
+  list.className = "perm-list";
+
+  // Seed the textareas from the FILE content when present, else from the
+  // resolved defaults (so an empty workspace shows what would actually be
+  // enforced — and saving those defaults is a no-op policy-wise).
+  const seed = file || {
+    allowedCommands: resolved.allowedCommands || [],
+    deniedCommands: resolved.deniedCommands || [],
+    protectedFiles: resolved.protectedFiles || [],
+  };
+
+  for (const field of PERM_LIST_FIELDS) {
+    const div = document.createElement("div");
+    div.className = "perm-field";
+    const label = document.createElement("label");
+    label.textContent = field.label;
+    div.appendChild(label);
+    const ta = document.createElement("textarea");
+    ta.dataset.key = field.key;
+    ta.value = permListToText(seed[field.key]);
+    ta.placeholder = field.hint;
+    div.appendChild(ta);
+    list.appendChild(div);
+  }
+  permEl.appendChild(list);
+
+  // allowProtectedWrites — the escape hatch, labeled as such.
+  const row = document.createElement("div");
+  row.className = "perm-row";
+  const cb = document.createElement("input");
+  cb.type = "checkbox";
+  cb.id = "permAllowWrites";
+  cb.checked = !!seed.allowProtectedWrites;
+  const cbLabel = document.createElement("label");
+  cbLabel.htmlFor = "permAllowWrites";
+  cbLabel.innerHTML = '<span class="mono">allowProtectedWrites</span> — escape hatch: allow writes to protected files (.env, keys, PEMs). <b>Off by default; turning this on weakens protection for every future session.</b>';
+  row.appendChild(cb);
+  row.appendChild(cbLabel);
+  permEl.appendChild(row);
+
+  const actions = document.createElement("div");
+  actions.className = "perm-actions";
+  const saveBtn = document.createElement("button");
+  saveBtn.textContent = "💾 Save permissions";
+  saveBtn.addEventListener("click", () => savePermissions());
+  actions.appendChild(saveBtn);
+  const msg = document.createElement("span");
+  msg.className = "perm-status";
+  actions.appendChild(msg);
+  permEl.appendChild(actions);
+}
+
+function currentPermissionsPayload() {
+  const payload = {};
+  for (const field of PERM_LIST_FIELDS) {
+    const ta = permEl.querySelector('textarea[data-key="' + field.key + '"]');
+    const list = ta ? permTextToList(ta.value) : [];
+    if (list.length > 0) payload[field.key] = list;
+  }
+  const cb = document.getElementById("permAllowWrites");
+  if (cb) payload.allowProtectedWrites = cb.checked;
+  return payload;
+}
+
+async function savePermissions() {
+  permMsg("saving…", false);
+  const payload = currentPermissionsPayload();
+  try {
+    const res = await fetch("/api/settings/permissions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      permMsg("save failed: " + (data.error || ("HTTP " + res.status)), true);
+      return;
+    }
+    permMsg("saved ✓ — permissions.json written. Takes effect on the next session.", false);
+    // Refresh the GET so the page reflects the now-customized state.
+    loadPermissions();
+  } catch (err) {
+    permMsg("save failed: " + err, true);
+  }
+}
+
+async function loadPermissions() {
+  const params = new URLSearchParams();
+  if (fbRepo()) params.set("repo", fbRepo());
+  try {
+    const res = await fetch("/api/settings/permissions?" + params.toString());
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+    renderPermissions(data);
+  } catch (err) {
+    permEl.innerHTML = '<div class="empty">failed to load permissions settings: ' + esc(err) + "</div>";
+  }
+}
+
 // ── Start a session (browser control plane) ─────────────────────────────────
 // POSTs the typed prompt to /api/session/start, then navigates straight to
 // that session's live event view — the whole point is the user watches it
@@ -1393,6 +1761,14 @@ document.getElementById("tabLog").addEventListener("click", () => setView("log")
 document.getElementById("tabChat").addEventListener("click", () => setView("chat"));
 document.getElementById("btnRestore").addEventListener("click", restoreSelected);
 
+document.getElementById("fbLoad").addEventListener("click", fbLoad);
+// Enter in the file-browser repo box loads too.
+document.getElementById("fbRepo").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") {
+    ev.preventDefault();
+    fbLoad();
+  }
+});
 // Enter in the task box submits too (shift+enter for a newline).
 document.getElementById("launchTask").addEventListener("keydown", (ev) => {
   if (ev.key === "Enter" && !ev.shiftKey) {
@@ -1407,6 +1783,7 @@ document.getElementById("feed").addEventListener("scroll", () => {
 
 poll();
 loadModeModels();
+loadPermissions();
 loadModes();
 setInterval(poll, 4000);
 // Live event feed poll: faster than the summary poll (1.5s) so the detail

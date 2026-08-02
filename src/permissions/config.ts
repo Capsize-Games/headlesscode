@@ -88,6 +88,48 @@ export function parseCommaSeparated(raw: string | undefined): string[] | undefin
 }
 
 /**
+ * Validate an already-parsed permissions-file body (an object of
+ * {allowedCommands?, deniedCommands?, protectedFiles?, allowProtectedWrites?})
+ * and return the normalized `PermissionsFile`. Throws on malformed input —
+ * a broken policy must fail loudly, never silently fall back to weaker
+ * defaults. The file path is only used in error messages.
+ *
+ * Shared by BOTH the file loader below and the dashboard settings POST, so
+ * the HTTP save path can never drift from what the CLI/env path enforces.
+ */
+export function parsePermissionsFileBody(parsed: unknown, source: string): PermissionsFile {
+	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error(
+			`permissions: '${source}' must be a JSON object of {allowedCommands, deniedCommands, protectedFiles, allowProtectedWrites}`,
+		)
+	}
+
+	const out: PermissionsFile = {}
+	const obj = parsed as Record<string, unknown>
+
+	for (const key of ["allowedCommands", "deniedCommands", "protectedFiles"] as const) {
+		const value = obj[key]
+		if (value === undefined) {
+			continue
+		}
+		if (!Array.isArray(value) || !value.every((v) => typeof v === "string")) {
+			throw new Error(`permissions: '${source}' field '${key}' must be an array of strings`)
+		}
+		out[key] = value as string[]
+	}
+
+	const allowProtectedWrites = obj.allowProtectedWrites
+	if (allowProtectedWrites !== undefined) {
+		if (typeof allowProtectedWrites !== "boolean") {
+			throw new Error(`permissions: '${source}' field 'allowProtectedWrites' must be a boolean`)
+		}
+		out.allowProtectedWrites = allowProtectedWrites
+	}
+
+	return out
+}
+
+/**
  * Load `<workspaceRoot>/.headlesscode/permissions.json` when present.
  * Returns `null` when the file does not exist (the common case). A
  * present-but-malformed file throws — a broken policy must fail loudly, never
@@ -116,37 +158,7 @@ export function loadPermissionsFile(workspaceRoot: string): PermissionsFile | nu
 		)
 	}
 
-	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-		throw new Error(`permissions: '${filePath}' must be a JSON object of {allowedCommands, deniedCommands, protectedFiles, allowProtectedWrites}`)
-	}
-
-	const out: PermissionsFile = {}
-	const obj = parsed as Record<string, unknown>
-
-	for (const key of ["allowedCommands", "deniedCommands", "protectedFiles"] as const) {
-		const value = obj[key]
-		if (value === undefined) {
-			continue
-		}
-		if (!Array.isArray(value) || !value.every((v) => typeof v === "string")) {
-			throw new Error(
-				`permissions: '${filePath}' field '${key}' must be an array of strings`,
-			)
-		}
-		out[key] = value as string[]
-	}
-
-	const allowProtectedWrites = obj.allowProtectedWrites
-	if (allowProtectedWrites !== undefined) {
-		if (typeof allowProtectedWrites !== "boolean") {
-			throw new Error(
-				`permissions: '${filePath}' field 'allowProtectedWrites' must be a boolean`,
-			)
-		}
-		out.allowProtectedWrites = allowProtectedWrites
-	}
-
-	return out
+	return parsePermissionsFileBody(parsed, filePath)
 }
 
 /** Parse a truthy env flag ("1"/"true"/"yes"); undefined when unset. */
@@ -203,4 +215,9 @@ export function resolvePermissions(options: {
 		false
 
 	return { allowedCommands, deniedCommands, protectedFiles, allowProtectedWrites }
+}
+
+/** Pretty-printed canonical serialization for the settings file. */
+export function stringifyPermissionsFile(file: PermissionsFile): string {
+	return JSON.stringify(file, null, 2) + "\n"
 }
