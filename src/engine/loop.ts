@@ -65,6 +65,7 @@ import {
 	skipOrphanedToolMessages,
 } from "./condense.js"
 import { runLocalExplorePhase, type LocalExploreOptions, type LocalExploreResult } from "./local-explore.js"
+import { DEFAULT_LINE_LIMIT } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/read_file.js"
 
 /** Default max pause duration for dashboard-initiated pauses, ms (matches watch.ts's stall guard). */
 export const DEFAULT_MAX_PAUSE_MS = 2 * 60 * 60 * 1000
@@ -1484,11 +1485,37 @@ export class HeadlessSession {
  * row" apart from "read 5 different files" without re-running a paid
  * session). Deliberately short and lossy — never logs full file/command
  * content, only the path/command/query a human would want to scan.
+ *
+ * read_file gets extra detail — the reading mode (default "slice") and the
+ * effective range (offset/limit, or the indentation anchor_line) — so
+ * harness.log/event feeds reveal whether real sessions actually use the
+ * targeted indentation mode or default to broad slice reads. Exported only
+ * for tests.
  */
-function summarizeToolArg(name: string, args: Record<string, unknown>): string | undefined {
+export function summarizeToolArg(name: string, args: Record<string, unknown>): string | undefined {
 	const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined)
 	switch (name) {
-		case "read_file":
+		case "read_file": {
+			const filePath = str(args.path)
+			if (filePath === undefined) return undefined
+			const mode = str(args.mode) === "indentation" ? "indentation" : "slice"
+			if (mode === "indentation") {
+				const indentation = args.indentation as Record<string, unknown> | undefined
+				const anchor = indentation?.["anchor_line"]
+				return typeof anchor === "number"
+					? `${filePath} [indentation anchor=${anchor}]`
+					: `${filePath} [indentation]`
+			}
+			const offset = typeof args.offset === "number" ? args.offset : undefined
+			const limit = typeof args.limit === "number" ? args.limit : undefined
+			if (offset !== undefined || limit !== undefined) {
+				return `${filePath} [slice${offset !== undefined ? ` offset=${offset}` : ""}${limit !== undefined ? ` limit=${limit}` : ""}]`
+			}
+			// No slice args: show the tool's real defaults (mirrors the
+			// executor's toNonNegativeInt fallbacks) so a default broad read is
+			// distinguishable from a targeted one at a glance.
+			return `${filePath} [slice offset=1 limit=${DEFAULT_LINE_LIMIT}]`
+		}
 		case "list_files":
 		case "write_to_file":
 		case "apply_diff":

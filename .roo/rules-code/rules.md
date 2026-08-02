@@ -17,3 +17,19 @@
   tells you WHERE something is, `read_file` (slice, or indentation mode at
   the cited anchor line) is still how you actually see the full code to
   understand and edit it.
+
+## Once you have a line number, prefer `read_file`'s `indentation` mode
+
+- When a `codebase_search` result, grep match, error stack trace, or
+  definition lookup gives you a specific line number, prefer `read_file` in
+  `indentation` mode anchored on that line (`{ path, mode: "indentation",
+  indentation: { anchor_line: N } }`) over a broad `slice` read. It extracts
+  the containing function/class/logical block — complete and syntactically
+  valid, no mid-function truncation — instead of pulling up to 2,000 lines
+  of surrounding file you then have to scroll through.
+- This is guidance, not a hard rule. A `slice` read is still the right tool
+  for initial file orientation (seeing the overall structure before you know
+  which line matters), for reading a small config/data file in full, and for
+  a specific contiguous line range. Indentation mode is the better choice
+  when you already know the anchor: a targeted extraction beats a whole-file
+  dump, and it keeps the session's context (and cost) down.
