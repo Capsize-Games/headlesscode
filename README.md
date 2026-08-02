@@ -60,6 +60,28 @@ export HEADLESSCODE_WORKSPACE_ROOT=/path/to/target/repo  # default workspace roo
 npx headlesscode --task "Fix the bug in src/index.ts" --workspace /path/to/target/repo
 ```
 
+### Systemwide `headlesscode` command
+
+Other projects on this machine currently invoke headlesscode via
+`(cd ~/Projects/headlesscode && npx tsx src/cli.ts ...)`. To skip that, install
+a `headlesscode` command onto your `PATH` once:
+
+```bash
+scripts/install-cli.sh
+```
+
+This writes a wrapper to `~/.local/bin/headlesscode` (override with
+`HEADLESSCODE_BIN_DIR`) that runs this checkout's `src/cli.ts` via its local
+`tsx`, without `cd`-ing — so `--repo`/`--workspace` still default to whatever
+directory you're standing in when you invoke it. Re-run the script any time
+after `git pull` to point it at a moved checkout; the wrapper itself doesn't
+need updating for ordinary code changes.
+
+```bash
+# from any repo, no HEADLESSCODE_ROOT plumbing needed:
+headlesscode orchestrate --repo . --issue 42
+```
+
 ## The `--dry-run` flow (no API key needed)
 
 `--dry-run` builds the full system prompt and validates configuration loading
