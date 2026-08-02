@@ -78,6 +78,11 @@ export const EXECUTABLE_TOOL_NAMES = new Set([
 	// Vendored ALWAYS_AVAILABLE_TOOLS already includes it for every mode's
 	// allowedNames; this is the final gate that makes it executable/advertised.
 	"update_todo_list",
+	// Recursive task decomposition: vendored modes' ALWAYS_AVAILABLE_TOOLS
+	// already includes new_task for every mode (shared/tools.ts); this is the
+	// final gate that makes it executable/advertised now that HeadlessSession
+	// implements the handler (see src/engine/loop.ts).
+	"new_task",
 ])
 
 // ─── custom modes loading (project .roomodes + global ~/.roo/custom_modes.yaml) ──
