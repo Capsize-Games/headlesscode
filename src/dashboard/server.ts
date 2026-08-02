@@ -2,7 +2,7 @@
  * Cost/token dashboard — plain `node:http` server (workstream 3) + live
  * per-session events + pause/resume control (live worker monitoring) +
  * per-mode model settings (mode-model-assignment) + browser control-plane
- * (session launch + answer).
+ * (session launch + answer) + checkpoint list/diff/restore.
  *
  * ZERO new UI/framework dependencies, matching this project's established
  * "plain fs + JSON, no schema library" ethos (see `src/orchestrator/state.ts`'s
@@ -19,13 +19,26 @@
  *   POST /api/session/start       launch a detached top-level session (see src/dashboard/session-launch.ts)
  *   POST /api/session/:id/answer  write `.harness.decision-answer` to unblock an escalated question
  *   GET  /api/modes?repo=<path>   merged available modes (.roomodes + global) for the mode selector
+ *   GET  /api/checkpoints?repo=<path>&session=<taskId>
+ *                                 list checkpoints for a session (CheckpointService.list())
+ *   GET  /api/checkpoints/diff?repo=<path>&session=<taskId>&from=<hash>&to=<hash?>
+ *                                 diff between two checkpoints, or a checkpoint vs. the
+ *                                 current working tree when `to` is omitted
+ *   POST /api/checkpoints/restore?repo=<path>&session=<taskId>   body {hash} — restores
+ *                                 a checkpoint onto the REAL workspace (destructive;
+ *                                 gated by the same optional bearer token as
+ *                                 /api/session/* POSTs — see below)
  *
  * NOTE (control plane): the POST /api/session/start route can launch real,
  * billed work and run arbitrary shell via `gh`/`orchestrate` from a form
  * POST — a bigger step across the read-only-to-control line than the
- * pause/resume or settings POSTs were individually. Still local-only /
- * no-auth (binds 127.0.0.1), but if this endpoint is ever exposed beyond
- * localhost, that assumption needs revisiting — no auth was added here.
+ * pause/resume or settings POSTs were individually. POST
+ * /api/checkpoints/restore is MORE dangerous still: it reverts REAL
+ * workspace files (the shadow repo's core.worktree). Both are local-only /
+ * no-auth by default (binds 127.0.0.1), but if these endpoints are ever
+ * exposed beyond localhost, that assumption needs revisiting — the restore
+ * endpoint in particular MUST stay behind the optional bearer-token gate
+ * when one is configured.
  */
 
 import * as fsp from "node:fs/promises"
@@ -33,6 +46,7 @@ import * as http from "node:http"
 import * as path from "node:path"
 
 import { buildSummary, findSessionEventsFile, readSessionEvents } from "./aggregate.js"
+import { diffCheckpoints, listCheckpoints, renderUnifiedDiff, restoreCheckpoint } from "./checkpoints.js"
 import { renderPage } from "./page.js"
 import { answerSessionDecision, launchSession, validateSessionStartBody } from "./session-launch.js"
 import { loadCustomModes } from "../engine/prompt.js"
@@ -67,6 +81,13 @@ export interface DashboardServerOptions {
 	cli?: string
 	/** Directory the launched CLI runs in (default: process.cwd()). Test-only. */
 	repoRoot?: string
+	/**
+	 * Shadow-git storage root for the /api/checkpoints/* routes (default:
+	 * `~/.headlesscode/checkpoints` — the same default the CLI/engine use).
+	 * Test-only injection so the routes can be exercised against a temp dir
+	 * instead of the developer's home directory; not a public config surface.
+	 */
+	checkpointDir?: string
 }
 
 /** Start the dashboard HTTP server. Resolves once it's listening. */
@@ -93,9 +114,16 @@ async function handleRequest(
 
 	// Optional control-plane token (HEADLESSCODE_DASHBOARD_TOKEN — see
 	// DashboardServerOptions.token). When configured, every POST under
-	// /api/session/* (start/pause/resume/answer) requires the bearer header.
-	// Unset = no auth, exactly today's behavior.
-	if (options.token && req.method === "POST" && url.pathname.startsWith("/api/session/")) {
+	// /api/session/* (start/pause/resume/answer) AND the destructive
+	// POST /api/checkpoints/restore require the bearer header. Unset = no
+	// auth, exactly today's behavior. Restore is MORE dangerous than the
+	// session routes (it reverts real workspace files), so it must never be
+	// gated any looser than they are.
+	if (
+		options.token &&
+		req.method === "POST" &&
+		(url.pathname.startsWith("/api/session/") || url.pathname === "/api/checkpoints/restore")
+	) {
 		const auth = req.headers.authorization ?? ""
 		const expected = `Bearer ${options.token}`
 		if (auth !== expected) {
@@ -363,6 +391,99 @@ async function handleRequest(
 			return
 		}
 		res.writeHead(405, { "content-type": "text/plain" }).end("Method Not Allowed")
+		return
+	}
+
+	// Checkpoints — browser control plane. `repo` is the workspace whose
+	// files the shadow git repo tracks (the dashboard's --repo); `session` is
+	// the session/task id (HeadlessSession uses its sessionId as the
+	// checkpoint taskId — see src/engine/loop.ts). list/diff wrap the
+	// existing CheckpointService (src/checkpoints/service.ts) read-only;
+	// restore is the one DESTRUCTIVE action this dashboard can perform and is
+	// gated by the optional bearer token above (same gate as /api/session/*
+	// POSTs — never looser).
+	if (url.pathname === "/api/checkpoints" || url.pathname === "/api/checkpoints/diff") {
+		const repo = url.searchParams.get("repo") || options.repo
+		const session = url.searchParams.get("session")
+		if (!repo || !session) {
+			res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ error: "missing repo or session — pass ?repo=<path>&session=<taskId>" }),
+			)
+			return
+		}
+		const routeOptions = { workspaceRoot: repo, sessionId: session, checkpointDir: options.checkpointDir }
+		try {
+			if (url.pathname === "/api/checkpoints") {
+				const entries = await listCheckpoints(routeOptions)
+				res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(JSON.stringify({ entries }))
+			} else {
+				const from = url.searchParams.get("from")
+				if (!from) {
+					res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+						JSON.stringify({ error: "missing from — pass ?from=<hash> (optional &to=<hash>)" }),
+					)
+					return
+				}
+				const to = url.searchParams.get("to") ?? undefined
+				const changes = await diffCheckpoints(routeOptions, from, to)
+				res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(
+					JSON.stringify({ diff: renderUnifiedDiff(changes), changes }),
+				)
+			}
+		} catch (error) {
+			res
+				.writeHead(500, { "content-type": "application/json; charset=utf-8" })
+				.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+		}
+		return
+	}
+
+	// Restore a checkpoint — DESTRUCTIVE (reverts REAL workspace files).
+	// POST-only (a state-changing action must not be triggerable by a GET),
+	// body {hash}, gated by the optional bearer token above.
+	if (url.pathname === "/api/checkpoints/restore" && req.method !== "POST") {
+		res.writeHead(405, { "content-type": "text/plain" }).end("Method Not Allowed")
+		return
+	}
+	if (url.pathname === "/api/checkpoints/restore" && req.method === "POST") {
+		const repo = url.searchParams.get("repo") || options.repo
+		const session = url.searchParams.get("session")
+		if (!repo || !session) {
+			res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ error: "missing repo or session — pass ?repo=<path>&session=<taskId>" }),
+			)
+			return
+		}
+		try {
+			const raw = await readJsonBody(req)
+			let body: unknown
+			try {
+				body = JSON.parse(raw || "{}")
+			} catch (err) {
+				res
+					.writeHead(400, { "content-type": "application/json; charset=utf-8" })
+					.end(JSON.stringify({ error: `invalid JSON body: ${err instanceof Error ? err.message : String(err)}` }))
+				return
+			}
+			const hash = (body as { hash?: unknown })?.hash
+			if (typeof hash !== "string" || hash.trim() === "") {
+				res
+					.writeHead(400, { "content-type": "application/json; charset=utf-8" })
+					.end(JSON.stringify({ error: "missing or empty 'hash' — provide the checkpoint hash to restore" }))
+				return
+			}
+			await restoreCheckpoint(
+				{ workspaceRoot: repo, sessionId: session, checkpointDir: options.checkpointDir },
+				hash.trim(),
+			)
+			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ ok: true, restored: hash.trim() }),
+			)
+		} catch (error) {
+			res
+				.writeHead(500, { "content-type": "application/json; charset=utf-8" })
+				.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+		}
 		return
 	}
 
