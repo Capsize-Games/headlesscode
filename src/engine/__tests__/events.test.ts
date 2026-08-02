@@ -290,6 +290,14 @@ async function testLongContentIsTruncated(): Promise<void> {
 			const files2 = await fs.readdir(eventsDir(ws2))
 			const sessionId2 = files2[0].replace(/\.jsonl$/, "")
 			const events2 = await readEventsFile(eventsFilePath(ws2, sessionId2))
+			// read_file's tool_call args carry mode+range detail (observability
+			// for whether sessions use targeted indentation reads vs. broad
+			// slices) — the same summarizeToolArg helper as harness.log.
+			const readCallEvent = events2.find((e) => e.type === "tool_call" && e.tool === "read_file")
+			assert.ok(readCallEvent, "expected a read_file tool_call event")
+			assert.equal(readCallEvent?.args, "big.txt [slice offset=1 limit=2000]")
+			assert.equal(readCallEvent?.argsTruncated, undefined)
+
 			const toolResultEvent2 = events2.find((e) => e.type === "tool_result")
 			assert.ok(toolResultEvent2, "expected a tool_result event")
 			assert.equal(toolResultEvent2?.resultTruncated, true)
