@@ -73,6 +73,24 @@
  *       any later request -> attempt_completion (the harness only reaches
  *                            it if the question was actually answered)
  *
+ *   search-before-read — codebase_search-activation e2e
+ *     (plans/codebase-search-activation.md): proves the code-mode guidance
+ *     actually changes behavior. A realistically-scripted mock model: it
+ *     reads the SYSTEM PROMPT and follows it (NOT the request's message
+ *     history — a session can call tools in any order before terminating):
+ *       prompt contains the codebase_search guidance
+ *         -> the mock's first reply is codebase_search
+ *       otherwise -> the mock's first reply is read_file
+ *       after either -> attempt_completion (the response is crafted to be
+ *       valid either way, so the run ALWAYS terminates cleanly at exit 0
+ *       regardless of which tool the prompt steered the model to; the
+ *       runner then inspects the mock's response log to see which tool
+ *       the model actually reached for first)
+ *     The prompt (not the tool list) is the discriminator because
+ *     codebase_search is always advertised in code mode — the tool list
+ *     alone cannot distinguish "guidance followed" from "tool merely
+ *     available".
+ *
  * Environment:
  *   PORT               listen port (default 0 = OS-assigned random port).
  *                      The actual port is printed to stdout in the
@@ -377,6 +395,54 @@ function buildScenarioResponse({ model, historyToolCalls, systemPrompt, toolName
 		})
 	}
 
+	if (SCENARIO === "search-before-read") {
+		// codebase_search-activation e2e: prove the code-mode guidance
+		// actually changes behavior. A realistically-scripted mock model:
+		// it reads the system prompt and follows it. The mock derives the
+		// model's behavior from the PROMPT CONTENT (not the tool list —
+		// codebase_search is always advertised in code mode, so the tool
+		// list alone can't distinguish "guidance followed" from "tool
+		// merely available").
+		//   - The prompt tells the model to try codebase_search before
+		//     whole-file reads -> the mock calls codebase_search first.
+		//   - The prompt does NOT -> the mock falls back to read_file.
+		// The mock NEVER errors — whichever path, the run terminates
+		// cleanly at exit 0 and the runner inspects the request log to
+		// see which tool the model actually reached for first.
+		const promptHasGuidance =
+			typeof systemPrompt === "string" && /codebase_search complements/i.test(systemPrompt)
+		if (historyToolCalls === 0) {
+			if (promptHasGuidance) {
+				return chatResponse(model, {
+					role: "assistant",
+					content: null,
+					tool_calls: [
+						toolCall(`call_mock_search_${REQUEST_COUNT}`, "codebase_search", {
+							query: "where is the greet function",
+							path: null,
+						}),
+					],
+				})
+			}
+			return chatResponse(model, {
+				role: "assistant",
+				content: null,
+				tool_calls: [toolCall(`call_mock_read_${REQUEST_COUNT}`, "read_file", { path: BUGGY_FILE })],
+			})
+		}
+		return chatResponse(model, {
+			role: "assistant",
+			content: null,
+			tool_calls: [
+				toolCall(`call_mock_done_${REQUEST_COUNT}`, "attempt_completion", {
+					result: `Located the target code (tool call #1: ${
+						promptHasGuidance ? "codebase_search" : "read_file"
+					}) and inspected it.`,
+				}),
+			],
+		})
+	}
+
 	if (SCENARIO === "review-clean" || SCENARIO === "review-finding") {
 		if (historyToolCalls === 0) {
 			// a. Inspect the changed file (read-only tool, no write tools).
@@ -567,6 +633,18 @@ const server = http.createServer((req, res) => {
 			})
 			return
 		}
+
+		// Log the tool calls the mock emits as the model's reply — the e2e
+		// runner asserts on THESE to prove what the (scripted) model actually
+		// reached for, which the request's advertised tool list cannot show.
+		const responseToolCalls = response.choices?.[0]?.message?.tool_calls ?? []
+		const responseToolNames = responseToolCalls
+			.map((tc) => (tc && tc.function && typeof tc.function.name === "string" ? tc.function.name : "?"))
+			.join(",")
+		console.log(
+			`[mock] response #${REQUEST_COUNT} tool_calls=${responseToolNames || "-"}`,
+		)
+
 		sendJson(res, 200, response)
 	})
 })

@@ -34,6 +34,9 @@
 #     overrides, there's nothing here that needs them)
 #   - ORCHESTRATOR_TASK.md at the worktree root, containing the real
 #     content of <task-fileN>
+#   - the main repo's codebase-search index (if any) copied in, so
+#     codebase_search works in the fresh worktree (the index is gitignored
+#     and `git worktree add` never brings it)
 #   - a VS Code window opened at that path, with its task injected and
 #     submitted automatically via scripts/inject-task-into-window.sh
 #     (xdotool-driven UI automation — clipboard-paste + keystroke, the
@@ -92,6 +95,19 @@ for spec in "$@"; do
     # worktree can still read upstream source at the pinned commit.
     if [ -d "$REPO_ROOT/zoo-code" ] && [ ! -e "$wt_path/zoo-code" ]; then
         ln -s ../../zoo-code "$wt_path/zoo-code"
+    fi
+
+    # Codebase-search index: same gitignore story as zoo-code/ — never
+    # committed, so copy the main checkout's index (if any) so this fresh
+    # worktree starts with a usable index. A symlink would break when the
+    # main repo rebuilds its index (the file gets replaced, not edited).
+    if [ -f "$REPO_ROOT/.headlesscode/codesearch/index.jsonl" ] &&
+        [ -s "$REPO_ROOT/.headlesscode/codesearch/index.jsonl" ] &&
+        [ ! -e "$wt_path/.headlesscode/codesearch/index.jsonl" ]; then
+        mkdir -p "$wt_path/.headlesscode/codesearch"
+        cp "$REPO_ROOT/.headlesscode/codesearch/index.jsonl" \
+            "$wt_path/.headlesscode/codesearch/index.jsonl"
+        echo "  Seeded codebase-search index from main repo ($(du -h "$wt_path/.headlesscode/codesearch/index.jsonl" | cut -f1))"
     fi
 
     if [ -n "$task_file" ]; then

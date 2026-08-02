@@ -17,6 +17,10 @@
 #     COMPOSE_PROJECT_NAME=airunner-<name>, POSTGRES_PORT=$((5433+offset)),
 #     AIRUNNER_HTTP_PORT=$((8090+offset*10)), VITE_PORT=$((5174+offset)).
 #   - Task file copied verbatim to <worktree>/ORCHESTRATOR_TASK.md.
+#   - The main repo's codebase-search index (if any) is copied into the
+#     worktree (the index is gitignored, so `git worktree add` never brings
+#     it; without this a fresh worktree would report "not indexed" and
+#     every worker would fall back to blind read_file/grep exploration).
 #   - Stdout is the progress log.
 #
 # What replaced the GUI block (airunner lines ~144-162: `code "$wt_path"`,
@@ -193,6 +197,25 @@ for spec in "$@"; do
     # worktree can still read upstream source at the pinned commit.
     if [ -d "$REPO_ROOT/zoo-code" ] && [ ! -e "$wt_path/zoo-code" ]; then
         ln -s ../../zoo-code "$wt_path/zoo-code"
+    fi
+
+    # Codebase-search index: same gitignore story as zoo-code/ — the index
+    # (typically ~100MB+ for this repo) is never committed, so a fresh
+    # worktree has none and codebase_search would report "not indexed".
+    # Copy the main checkout's index (if any) so this worktree's workers
+    # start with a usable index instead of silently falling back to blind
+    # read_file/grep exploration. A symlink would break as soon as the
+    # main repo rebuilds its index (replacing the file, not editing it).
+    # A fresh copy is a few seconds of disk I/O per worktree — acceptable.
+    if [ -f "$REPO_ROOT/.headlesscode/codesearch/index.jsonl" ] &&
+        [ -s "$REPO_ROOT/.headlesscode/codesearch/index.jsonl" ] &&
+        [ ! -e "$wt_path/.headlesscode/codesearch/index.jsonl" ]; then
+        mkdir -p "$wt_path/.headlesscode/codesearch"
+        cp "$REPO_ROOT/.headlesscode/codesearch/index.jsonl" \
+            "$wt_path/.headlesscode/codesearch/index.jsonl"
+        echo "  Seeded codebase-search index from main repo ($(du -h "$wt_path/.headlesscode/codesearch/index.jsonl" | cut -f1))"
+    else
+        echo "  No codebase-search index in main repo — worktree starts unindexed (run 'headlesscode index --workspace .' in the main repo to enable codebase_search)."
     fi
 
     # Compute unique ports for this worktree.
