@@ -97,6 +97,57 @@ async function testNothingConfiguredReturnsUndefined(): Promise<void> {
 	}
 }
 
+// ─── extraKeys (Phase 3 condensation model assignment) ───────────────────────
+
+async function testExtraKeyBeatsDefault(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		await writeConfig(repo, JSON.stringify({ _default: "default-model", _condensation: "cheap-model" }))
+		const resolved = resolveModelForMode({
+			workspaceRoot: repo,
+			mode: "code",
+			extraKeys: ["_condensation"],
+			env: { OPENROUTER_MODEL: "from-env" },
+		})
+		assert.equal(resolved, "cheap-model", "the extra key (_condensation) must beat _default + env")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testExtraKeyFallsThroughToDefaultWhenAbsent(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		await writeConfig(repo, JSON.stringify({ _default: "default-model" }))
+		const resolved = resolveModelForMode({
+			workspaceRoot: repo,
+			mode: "code",
+			extraKeys: ["_condensation"],
+			env: {},
+		})
+		assert.equal(resolved, "default-model", "no _condensation key -> _default applies (unchanged behavior)")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testExtraKeyWithoutExtraKeysRequestedIgnored(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		await writeConfig(repo, JSON.stringify({ _default: "default-model", _condensation: "cheap-model" }))
+		// Callers that don't pass extraKeys must never accidentally pick up
+		// _condensation — it's only consulted when explicitly requested.
+		const resolved = resolveModelForMode({
+			workspaceRoot: repo,
+			mode: "code",
+			env: {},
+		})
+		assert.equal(resolved, "default-model", "_condensation must be ignored unless extraKeys requests it")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 // ─── Missing file = zero-config ──────────────────────────────────────────────
 
 async function testMissingFileFallsThroughToEnv(): Promise<void> {
@@ -191,6 +242,9 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["_default beats OPENROUTER_MODEL", testDefaultBeatsEnv],
 	["OPENROUTER_MODEL used when no config entry applies", testEnvBeatsUndefined],
 	["nothing configured -> undefined (caller default applies)", testNothingConfiguredReturnsUndefined],
+	["extraKeys: _condensation beats _default + env", testExtraKeyBeatsDefault],
+	["extraKeys: falls through to _default when absent", testExtraKeyFallsThroughToDefaultWhenAbsent],
+	["extraKeys: ignored unless explicitly requested", testExtraKeyWithoutExtraKeysRequestedIgnored],
 	["missing file falls through to env (zero-config)", testMissingFileFallsThroughToEnv],
 	["missing file with no env -> undefined", testMissingFileWithNoEnvReturnsUndefined],
 	["malformed JSON throws clearly", testMalformedJsonThrowsClearly],
