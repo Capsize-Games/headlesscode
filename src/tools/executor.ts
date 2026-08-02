@@ -15,6 +15,10 @@
  *   - browser_action    { action, url?, selector?, text? } — Playwright-backed
  *     headless browser inspection (launch/screenshot/click/type/getConsoleLogs/
  *     getNetworkErrors/close); NEW work, no upstream port (see src/tools/browser/).
+ *   - outline / go_to_definition / find_references / import_graph — the four
+ *     code-intelligence tools (TS Compiler API backed, src/codeintel/): one
+ *     cached ts.Program per workspace serves all four. NEW work, no upstream
+ *     port (see src/codeintel/).
  *
  * Every file operation resolves relative to the configured workspace root and
  * is rejected if it escapes the workspace (path-traversal guard). Results are
@@ -59,6 +63,12 @@ import "../vendor/zoo-code/src/utils/path.js"
 import { MultiSearchReplaceDiffStrategy } from "../vendor/zoo-code/src/core/diff/strategies/multi-search-replace.js"
 
 import { browserActionHandler, disposeBrowserSessions } from "./browser/handler.js"
+import {
+	goToDefinitionHandler,
+	findReferencesHandler,
+	importGraphHandler,
+	outlineHandler,
+} from "../codeintel/handlers.js"
 
 import type { ToolContext, ToolHandler, ToolResult } from "../engine/types.js"
 import { checkCommand, type CommandRefusal } from "../permissions/commands.js"
@@ -1465,6 +1475,10 @@ const IMPLEMENTED_TOOLS = new Set([
 	"list_files",
 	"codebase_search",
 	"browser_action",
+	"outline",
+	"go_to_definition",
+	"find_references",
+	"import_graph",
 ])
 
 /**
@@ -1485,6 +1499,10 @@ export function createHeadlessExecutor(workspaceRoot: string, options: ToolExecu
 	executor.register("list_files", listFilesHandler)
 	executor.register("codebase_search", codebaseSearchHandler)
 	executor.register("browser_action", browserActionHandler)
+	executor.register("outline", outlineHandler)
+	executor.register("go_to_definition", goToDefinitionHandler)
+	executor.register("find_references", findReferencesHandler)
+	executor.register("import_graph", importGraphHandler)
 
 	executor.register("attempt_completion", attemptCompletionHandler)
 	executor.register("ask_followup_question", askFollowupQuestionHandler)
@@ -1522,6 +1540,10 @@ function createReadCommandExecutor(workspaceRoot: string, options: ToolExecutorO
 	executor.register("list_files", listFilesHandler)
 	executor.register("execute_command", executeCommandHandler)
 	executor.register("browser_action", browserActionHandler)
+	executor.register("outline", outlineHandler)
+	executor.register("go_to_definition", goToDefinitionHandler)
+	executor.register("find_references", findReferencesHandler)
+	executor.register("import_graph", importGraphHandler)
 
 	executor.register("attempt_completion", attemptCompletionHandler)
 	executor.register("ask_followup_question", askFollowupQuestionHandler)

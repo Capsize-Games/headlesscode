@@ -17,7 +17,7 @@ import { OpenRouterClient } from "./llm/openrouter.js"
 import { HeadlessSession } from "./engine/loop.js"
 import { isLocalExploreEnabled } from "./engine/local-explore.js"
 import { Logger } from "./engine/logger.js"
-import { buildSystemPrompt, loadCustomModes, selectToolsForMode } from "./engine/prompt.js"
+import { appendCodeIntelTools, buildSystemPrompt, loadCustomModes, selectToolsForMode } from "./engine/prompt.js"
 import { orchestrateMain } from "./orchestrator/cli.js"
 import { watchMain } from "./watcher/cli.js"
 import { checkpointsMain } from "./checkpoints/cli.js"
@@ -521,7 +521,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 				mode: options.mode,
 				customModes,
 			})
-			const tools = selectToolsForMode(options.mode, customModes)
+			// Dry-run advertises the same non-vendored tools a real session
+			// appends (code-intelligence tools; browser_action too, matching
+			// the loop).
+			const tools = appendCodeIntelTools(selectToolsForMode(options.mode, customModes))
 			// Per-mode model assignment: dry-run resolves the model exactly
 			// like a real run (mode-models.json / _default / OPENROUTER_MODEL,
 			// with an explicit --model always winning) so the effective model
