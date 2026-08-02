@@ -224,7 +224,21 @@ bundle it into this integration. Coding sessions can run without shared
 memory initially; `uwu`'s own rolling-summary memory of "we've been building
 X" is a reasonable enough starting context even without deep integration.
 
-### 5. Where headlesscode actually executes (revised 2026-08-02 — real findings)
+### 5. Where headlesscode actually executes — DECIDED (2026-08-02)
+
+**Decision: the same server uwuchat's backend already runs on, in a Docker
+container, using the existing `DockerSessionProvider`.** No new server for
+this — explicitly rejected by the project owner ("i don't want to spin up an
+entire new server just for the admin to build code"). `DockerSessionProvider`
+already provisions a resource-limited, read-only-rootfs container with a
+workspace bind mount via the local `docker` CLI, which is exactly "same host,
+isolated container" — no new infrastructure required, only the wiring
+described below. Revisit only if/when Tier 1 or Tier 2 usage volume actually
+threatens to compete with uwuchat's own production resource needs on that
+host — not a concern to design around preemptively for a single admin user.
+
+Verified state of `src/cloud/` (not the "Docker/Hetzner abstraction" this
+doc previously assumed — corrected):
 
 Verified state of `src/cloud/` (not the "Docker/Hetzner abstraction" this
 doc previously assumed — corrected):
@@ -243,23 +257,18 @@ doc previously assumed — corrected):
   subcommand uses either provider today. It's a tested interface + a real
   local-Docker primitive, not yet connected to anything.
 
-**Given the stated priority (speed, single admin, don't over-engineer for
-scale not yet needed, but don't paint into a corner either):** the
-pragmatic near-term path is running headlesscode on a single
-admin-controlled host — reachable by uwuchat's backend, but NOT the same
-container/process as uwuchat's own production backend — using
-`DockerSessionProvider` for per-session isolation on that host (already
-built, already tested, no new provisioning code required for v1). This
-avoids building real multi-tenant/remote provisioning (Hetzner, dynamic
-machine spin-up) before it's needed, while `DockerSessionProvider`'s
-per-session container isolation is a genuine stepping stone toward real
-multi-tenant hosting later — not a dead end that has to be thrown away when
-Tier 1 eventually opens up (if it ever does; recall Tier 1 is scoped
-admin-only *indefinitely*, so this may never need to scale past one
-concurrent admin session in practice). Wiring `CloudProvider`/
-`DockerSessionProvider` into an actual `headlesscode orchestrate --remote`
-path (or equivalent) is real, scoped work, but small relative to building
-genuine remote compute provisioning from scratch.
+Per the decision above: `DockerSessionProvider` runs in the same process/host
+as uwuchat's backend (not a separate container/process boundary at the host
+level, just container isolation per coding session) — session isolation
+comes from the Docker container itself (resource limits, read-only rootfs),
+not from network/host separation. This avoids building real multi-tenant/
+remote provisioning (Hetzner, dynamic machine spin-up) before it's needed,
+while still being a genuine stepping stone toward real multi-tenant hosting
+later if Tier 1 or Tier 2 ever need it — not a dead end that has to be
+thrown away. Wiring `CloudProvider`/`DockerSessionProvider` into an actual
+`headlesscode orchestrate` entry point uwuchat's backend can call is real,
+scoped work, but small relative to building genuine remote compute
+provisioning from scratch.
 
 ### 6. Pushing work back to GitHub — currently ZERO push/PR code exists
 
@@ -294,11 +303,11 @@ code-mode toggle, and the GitHub push step are all small/bounded now that
 they're not design questions anymore — get an end-to-end path working fast,
 harden later.
 
-1. Single admin-controlled host (existing box is fine) with Docker
-   available; wire `DockerSessionProvider` into an actual
-   `headlesscode orchestrate` entry point uwuchat's backend can call
-   remotely (item 5). No Hetzner/multi-tenant work — deliberately deferred,
-   possibly indefinitely given Tier 1's admin-only scope.
+1. Wire `DockerSessionProvider` into an actual `headlesscode orchestrate`
+   entry point uwuchat's backend can call, running on uwuchat's existing
+   server (item 5, decided — no new server). No Hetzner/multi-tenant work —
+   deliberately deferred, possibly indefinitely given Tier 1's admin-only
+   scope.
 2. Code-mode toggle in the admin's `uwu` session (item 2) — no
    classification logic, just an explicit on/off the admin controls.
 3. `ToolCategory.CODE` tools: an `architect` tool (produces a plan doc,
@@ -320,9 +329,6 @@ harden later.
 
 ## Open questions for the project owner (resolve before dispatch)
 
-- Which admin-controlled host actually runs step 1 — an existing box
-  already available, or does one need to be stood up? (Not a design
-  question anymore, just needs a concrete answer.)
 - Per-round spend cap default, and how code-credit top-up actually happens
   for the admin-only phase (manual DB/admin-panel adjustment is probably
   enough to start).
