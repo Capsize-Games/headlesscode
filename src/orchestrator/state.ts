@@ -78,6 +78,17 @@ export interface OrchestratorGroup {
 	 */
 	reworkCount?: number
 	/**
+	 * Iteration-exhaustion continuation counter — how many times this group
+	 * has already been re-spawned on the SAME worktree after a worker hit
+	 * `--max-iterations` ("the task is bigger than one session", see
+	 * plans/issues/02-orchestrate-iteration-plumbing.md). Absent (== 0) when
+	 * the group's first attempt never hit the cap. Incremented by the
+	 * orchestrator each time it continues a group past the cap; once it
+	 * reaches the group's `--max-continuations` budget the group is marked
+	 * `needs-human` (same terminal shape as reworkCount's cap).
+	 */
+	continuationCount?: number
+	/**
 	 * QA bookkeeping (Phase 4, written by the orchestrator after runQa when
 	 * `--qa` is passed): verdict is pass|fail|error; status is "done" for a
 	 * pass, "failed" otherwise; evidence is the QA report's evidence section.

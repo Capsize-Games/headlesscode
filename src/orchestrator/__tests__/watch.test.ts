@@ -13,7 +13,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { spawnSync } from "node:child_process"
 
-import { inspectGroup, watchGroups, DEFAULT_STALL_TIMEOUT_MS } from "../watch.js"
+import { inspectGroup, isIterationExhaustion, watchGroups, DEFAULT_STALL_TIMEOUT_MS } from "../watch.js"
 import { defaultState, loadStateSync, saveStateSync, type OrchestratorGroup, type OrchestratorState } from "../state.js"
 
 async function tmpRepo(): Promise<string> {
@@ -386,6 +386,39 @@ async function testStallGuardReportsOnceThenStopsWhileStillAlive(): Promise<void
 	}
 }
 
+// ─── isIterationExhaustion: the continuable-failure predicate ────────────────
+// Only the harness's exact "Max iterations (N) reached without task
+// completion" error marks a failure as iteration-exhaustion (the auto-continue
+// signal); budget stops and real errors must never match.
+
+async function testIsIterationExhaustionMatchesExactError(): Promise<void> {
+	assert.equal(
+		isIterationExhaustion("headlesscode: task failed: Max iterations (50) reached without task completion"),
+		true,
+		"the harness CLI's stderr line (redirected into harness.log) must match",
+	)
+	assert.equal(
+		isIterationExhaustion("... some log ... Max iterations (3) reached without task completion"),
+		true,
+		"the exact error substring anywhere in the summary matches",
+	)
+}
+
+async function testIsIterationExhaustionRejectsOtherFailures(): Promise<void> {
+	assert.equal(
+		isIterationExhaustion("headlesscode: task aborted by budget: max cost exceeded"),
+		false,
+		"a budget stop is NOT iteration exhaustion (must never auto-continue)",
+	)
+	assert.equal(
+		isIterationExhaustion("headlesscode: task failed: consecutive mistakes"),
+		false,
+		"a real error is NOT iteration exhaustion",
+	)
+	assert.equal(isIterationExhaustion(undefined), false, "no summary is never exhaustion")
+	assert.equal(isIterationExhaustion(""), false, "empty summary is never exhaustion")
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -400,6 +433,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["watchGroups: BLOCKED line not repeated while the group stays blocked", testWatchGroupsDoesNotRepeatBlockedLineWhileStillBlocked],
 	["watchGroups: DONE line printed on the transition to done", testWatchGroupsPrintsDoneTransitionToStderr],
 	["watchGroups: FAILED line printed on the transition to failed", testWatchGroupsPrintsFailedTransitionToStderr],
+	["isIterationExhaustion matches the exact max-iterations error", testIsIterationExhaustionMatchesExactError],
+	["isIterationExhaustion rejects budget/real failures and empty summaries", testIsIterationExhaustionRejectsOtherFailures],
 ]
 
 async function main(): Promise<void> {

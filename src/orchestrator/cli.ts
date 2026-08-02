@@ -37,7 +37,7 @@ import {
 } from "./state.js"
 import { runReview, type ReviewResult } from "./reviewer.js"
 import { runQa } from "../qa/qa.js"
-import { groupWorktreePath, watchGroups } from "./watch.js"
+import { groupWorktreePath, isIterationExhaustion, watchGroups } from "./watch.js"
 import {
 	buildStatusSummary,
 	formatStatusText,
@@ -88,9 +88,19 @@ Options:
                          When the cap is already reached this run ABORTS with a clear
                          message and exit 1 (never queues silently)
   --max-rework-cycles <n>  Max automatic rework attempts per group when the review
-                         finds issues (default: 3). Each rework re-runs a worker on the
-                         SAME worktree to fix the findings. After the cap, the group is
-                         marked "needs-human" and left for manual resolution
+                 finds issues (default: 3). Each rework re-runs a worker on the
+                 SAME worktree to fix the findings. After the cap, the group is
+                 marked "needs-human" and left for manual resolution
+  --max-iterations <n>   Per-session loop iteration cap for EVERY worker in this
+                 round (default: $HEADLESSCODE_MAX_ITERATIONS or the harness's
+                 own default, 50). A worker that hits the cap is auto-continued
+                 on the SAME worktree (see --max-continuations) instead of
+                 hard-failing the group
+  --max-continuations <n>  Max automatic continuations per group after a worker
+                 hits the iteration cap (default: 3). Each continuation
+                 re-spawns a worker on the SAME worktree with a fresh session.
+                 After the cap, the group is marked "needs-human" and left for
+                 manual resolution
   --dry-run              Print the split plan + spawn commands, spawn nothing
   --help                 Show this help and exit
 
@@ -108,6 +118,9 @@ Environment:
   HEADLESSCODE_MAX_COST_USD / HEADLESSCODE_MAX_DURATION_MS
                          Per-session budget env fallbacks forwarded to workers
                          (run-worker.sh / run-qa.sh pass them as CLI flags)
+  HEADLESSCODE_MAX_ITERATIONS
+                         Per-session iteration cap env fallback forwarded to
+                         workers as --max-iterations (run-worker.sh)
 `
 
 interface OrchestrateOptions {
@@ -133,8 +146,31 @@ interface OrchestrateOptions {
 	maxConcurrentSessions: number
 	/** Rework loop: max review-rework attempts per group before giving up (default 3). */
 	maxReworkCycles: number
+	/**
+	 * Per-session iteration cap forwarded to every worker (default:
+	 * $HEADLESSCODE_MAX_ITERATIONS; undefined = leave the harness's own
+	 * default, 50, untouched).
+	 */
+	maxIterations?: number
+	/** Auto-continue: max re-spawns per group after a worker hits the iteration cap (default 3). */
+	maxContinuations: number
 	dryRun: boolean
 	help: boolean
+}
+
+/**
+	* Resolve the default per-session iteration cap from $HEADLESSCODE_MAX_ITERATIONS.
+	* undefined (unset or invalid) means "leave the harness's own default (50)
+	* untouched" — the harness default itself is never changed, this only makes the
+	* round-level cap overridable.
+	*/
+function maxIterationsFromEnv(): number | undefined {
+	const raw = process.env.HEADLESSCODE_MAX_ITERATIONS
+	if (raw === undefined || raw === "") {
+		return undefined
+	}
+	const n = Number(raw)
+	return Number.isInteger(n) && n > 0 ? n : undefined
 }
 
 export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOptions; error?: string } {
@@ -150,6 +186,8 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 		pollIntervalMs: 5000,
 		maxConcurrentSessions: maxConcurrentSessionsFromEnv(),
 		maxReworkCycles: 3,
+		maxContinuations: 3,
+		maxIterations: maxIterationsFromEnv(),
 		dryRun: false,
 		help: false,
 	}
@@ -262,6 +300,24 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 					return { options, error: "--max-rework-cycles requires a positive integer" }
 				}
 				options.maxReworkCycles = n
+				break
+			}
+			case "--max-iterations": {
+				const v = next()
+				const n = v === undefined ? Number.NaN : Number(v)
+				if (!Number.isInteger(n) || n <= 0) {
+					return { options, error: "--max-iterations requires a positive integer" }
+				}
+				options.maxIterations = n
+				break
+			}
+			case "--max-continuations": {
+				const v = next()
+				const n = v === undefined ? Number.NaN : Number(v)
+				if (!Number.isInteger(n) || n <= 0) {
+					return { options, error: "--max-continuations requires a positive integer" }
+				}
+				options.maxContinuations = n
 				break
 			}
 			case "--no-review":
@@ -541,6 +597,95 @@ export function buildReworkTaskFileContent(
 	].join("\n")
 }
 
+/**
+	* Continuation task content (plans/issues/02-orchestrate-iteration-plumbing.md,
+	* Part 2): a NEW task file for a group whose worker exited because it hit the
+	* iteration cap. The worktree is untouched and resumable — the partial edits
+	* are on disk — so the next session picks up where the last left off. Reuses
+	* the original task file's conventions (rules preamble, closing-report
+	* template, scope) but the assignment is "keep going" rather than the raw
+	* issues.
+	*/
+export function buildContinuationTaskFileContent(
+	group: { name: string; issues?: number[] },
+	continuationCount: number,
+): string {
+	const assigned = (group.issues ?? []).map((n) => `#${n}`).join(", ") || "this worktree"
+	const ghLines = (group.issues ?? []).map((n) => `gh issue view ${n}`).join("\n")
+	return [
+		"Before anything else: read `.roo/rules-code/rules.md` in full (or `.roo/rules/rules.md` if",
+		"rules-code is absent) and treat it as binding for this entire session, regardless of whether",
+		"it auto-loaded for whatever mode you're running in — don't assume it applied, read it yourself.",
+		"",
+		"You are working autonomously in the SAME isolated git worktree as the previous session(s), on",
+		"the same branch. The previous session was cut short because it hit the harness's iteration cap",
+		"(a bounded-failure guard, not a review verdict) — its partial work is still on disk: uncommitted",
+		"edits, commits, notes — pick up exactly where it left off. Read this entire file",
+		"before doing anything.",
+		"",
+		`## Continuation cycle ${continuationCount} — complete the task`,
+		"",
+		`Assigned issues: ${assigned}. Fetch each issue's real body yourself (do not rely on a stale`,
+		"copy of any issue body):",
+		"```",
+		ghLines || "# (no issue numbers recorded — inspect the worktree for context)",
+		"```",
+		"",
+		"## What the previous session did",
+		"",
+		"- Inspect the worktree's git status, recent commits, and uncommitted changes to see exactly",
+		"  how far the previous session got.",
+		"- Do NOT restart from scratch: continue the existing work toward the issues above.",
+		"- If the previous session left a partial fix, finish it and verify it for real.",
+		"",
+		"## Workflow",
+		"",
+		"1. Read each assigned issue body via `gh issue view <n>` and the relevant source files.",
+		"2. Continue the implementation following the project's own conventions and the rules files.",
+		"3. Verify for real (run the project's tests / boot check) and capture the output —",
+		"   output in a report is a claim, not evidence, until reproduced.",
+		"4. Commit with the issue number referenced, one logical change per commit.",
+		"5. Push the branch and open a PR (ready, not draft).",
+		"6. Post the closing comment below on each issue using the required template, then close it.",
+		"",
+		"## Required comment template",
+		"",
+		"Your issue-closing comment must use this exact structure (every section present; a section can",
+		"be 'N/A' with a reason, but a missing section is itself a review finding):",
+		"```",
+		`## Issue <n> — Closing Report (continuation cycle ${continuationCount})`,
+		"",
+		"### Files changed",
+		"<one line per file>",
+		"",
+		"### Baseline (before)",
+		"<real output>",
+		"",
+		"### Baseline (after)",
+		"<real output>",
+		"",
+		"### Boot check",
+		"<real output or exact reason it didn't apply>",
+		"",
+		"### Residual risk / notes",
+		"<anything not 100% certain>",
+		"",
+		"PR: <link>",
+		"```",
+		"",
+		"## Closing out",
+		"",
+		"Once every assigned issue is closed with the template above:",
+		"1. Finish with attempt_completion and a full summary of what you changed, the real baseline",
+		"   numbers, the boot check, and the PR link(s).",
+		"2. The harness records your completion automatically (exit code + .harness.done marker) —",
+		"   no separate phone-home step is needed.",
+		"3. Do not start on any issue not assigned to this worktree.",
+		"",
+		`Scope: ${assigned} only — continuation cycle ${continuationCount}.`,
+	].join("\n")
+}
+
 // ─── Rework-loop decision ────────────────────────────────────────────────────
 
 /**
@@ -584,6 +729,8 @@ export function handleReviewVerdict(
 	maxReworkCycles: number,
 	mode: string,
 	model?: string,
+	/** Per-session iteration cap forwarded to the rework worker (default: harness's own). */
+	maxIterations?: number,
 ): ReworkDecision {
 	const currentRework = typeof group.reworkCount === "number" ? group.reworkCount : 0
 	const newReworkCount = currentRework + 1
@@ -596,7 +743,8 @@ export function handleReviewVerdict(
 		const spawnCommand =
 			`bash ${path.join(HARNESS_ROOT_TS, "scripts", "run-worker.sh")} ` +
 			`"${worktreePath}" "${taskFilePath}" --mode "${mode}"` +
-			(model ? ` --model "${model}"` : "")
+			(model ? ` --model "${model}"` : "") +
+			(maxIterations !== undefined ? ` --max-iterations "${maxIterations}"` : "")
 		return {
 			shouldSpawn: true,
 			newReworkCount,
@@ -640,6 +788,116 @@ export function handleReviewVerdict(
 	}
 }
 
+// ─── Iteration-exhaustion continuation decision ──────────────────────────────
+
+/**
+	* The outcome of deciding what to do with a group whose worker failed with
+	* exit != 0 (plans/issues/02-orchestrate-iteration-plumbing.md, Part 2).
+	* Either the group gets a NEW continuation session on the SAME worktree
+	* (shouldSpawn), or it has exhausted its `--max-continuations` budget and is
+	* marked for human attention, or the failure is not the iteration-cap reason
+	* at all and the group stays `failed`.
+	*/
+export interface ContinuationDecision {
+	/** State patch to apply to the group (running reset, needs-human, or empty for a real failure). */
+	patch: Partial<Omit<OrchestratorGroup, "name">>
+	/** Whether a continuation worker should be spawned on the same worktree. */
+	shouldSpawn: boolean
+	/** The group's continuationCount after this decision. */
+	newContinuationCount: number
+	/** Absolute path of the continuation task file (only when shouldSpawn). */
+	taskFilePath?: string
+	/** Content of the continuation task file (only when shouldSpawn). */
+	taskContent?: string
+	/** Exact `bash -c` command that launches the continuation worker (only when shouldSpawn). */
+	spawnCommand?: string
+}
+
+/**
+	* Decide what to do after a worker failed with exit != 0, and build the pieces
+	* the caller needs (state patch, task file, spawn command). Extracted from the
+	* watchGroups callback so every branch is unit-testable without a live round.
+	*
+	* - The failure is NOT the iteration-cap reason (budget stop, tool-error
+	*   storm, crash — or a clean exit with the string merely in the log tail):
+	*   no continuation; the patch is empty and the watcher's "failed" stands.
+	* - Below the cap: the group is reset to "running" on the SAME worktree with a
+	*   fresh `spawned` timestamp (so the stall guard measures the continuation
+	*   worker, not the attempt that hit the cap), continuationCount is
+	*   incremented, completion artifacts are cleared, and a continuation task
+	*   file + worker launch command are produced.
+	* - At the cap: no spawn; the group is marked `needs-human` (a TERMINAL state,
+	*   deliberately distinct from `failed`).
+	*/
+export function handleIterationExhaustion(
+	group: OrchestratorGroup,
+	repo: string,
+	maxContinuations: number,
+	mode: string,
+	model?: string,
+	maxIterations?: number,
+): ContinuationDecision {
+	const current = typeof group.continuationCount === "number" ? group.continuationCount : 0
+	if (group.exit_code === 0 || !isIterationExhaustion(group.summary)) {
+		// Real failure — budget stops and every other exit reason stay
+		// terminal. No patch: the watcher's "failed" stands.
+		return { shouldSpawn: false, newContinuationCount: current, patch: {} }
+	}
+	const newContinuationCount = current + 1
+	const now = new Date().toISOString()
+
+	if (current < maxContinuations) {
+		const taskFilePath = path.join(repo, "plans", "parallel-tasks", `${group.name}-continue${newContinuationCount}.md`)
+		const taskContent = buildContinuationTaskFileContent(group, newContinuationCount)
+		const worktreePath = groupWorktreePath(repo, group)
+		const spawnCommand =
+			`bash ${path.join(HARNESS_ROOT_TS, "scripts", "run-worker.sh")} ` +
+			`"${worktreePath}" "${taskFilePath}" --mode "${mode}"` +
+			(model ? ` --model "${model}"` : "") +
+			(maxIterations !== undefined ? ` --max-iterations "${maxIterations}"` : "")
+		return {
+			shouldSpawn: true,
+			newContinuationCount,
+			taskFilePath,
+			taskContent,
+			spawnCommand,
+			patch: {
+				status: "running",
+				continuationCount: newContinuationCount,
+				// Fresh spawned timestamp: the stall guard must measure the
+				// continuation worker, not the (possibly hours-old) attempt
+				// that hit the cap.
+				spawned: now,
+				// A fresh session starts clean: drop the previous attempt's
+				// completion artifacts, review/QA records and stall flag.
+				review_verdict: undefined,
+				pending_review_findings: undefined,
+				reviewed_at: undefined,
+				qa: undefined,
+				stalled: undefined,
+				exit_code: undefined,
+				summary: undefined,
+				last_activity: {
+					note: `continuation ${newContinuationCount}: previous session hit the iteration cap; re-spawned worker on the same worktree`,
+				},
+			},
+		}
+	}
+
+	// Cap reached: no new attempt. Terminal "needs-human" outcome.
+	return {
+		shouldSpawn: false,
+		newContinuationCount: current,
+		patch: {
+			status: "needs-human",
+			continuationCount: current,
+			last_activity: {
+				note: `exhausted ${current} continuation attempt(s) — still hitting the iteration cap; needs human`,
+			},
+		},
+	}
+}
+
 // ─── Spawn command assembly ──────────────────────────────────────────────────
 
 function spawnCommandFor(harnessRoot: string, specs: WorktreeSpec[]): string {
@@ -654,6 +912,8 @@ export interface BuildSpawnEnvOptions {
 	/** An explicit --model flag value, if the caller passed one — always wins (resolveModelForMode rule 1). */
 	explicitModel?: string
 	memoryDir?: string
+	/** Per-session iteration cap forwarded as HEADLESSCODE_MAX_ITERATIONS (run-worker.sh → --max-iterations). */
+	maxIterations?: number
 	/** Env to read OPENROUTER_MODEL from (default: process.env). */
 	env?: NodeJS.ProcessEnv
 }
@@ -687,6 +947,10 @@ export function buildSpawnEnv(options: BuildSpawnEnvOptions): { env: NodeJS.Proc
 		// when --memory-dir is not given.
 		HEADLESSCODE_PROJECT: path.basename(options.repo),
 		...(options.memoryDir ? { HEADLESSCODE_MEMORY_DIR: path.resolve(options.memoryDir) } : {}),
+		// Iteration cap: an explicit --max-iterations beats the inherited env
+		// var; undefined leaves whatever the caller's env already had in place
+		// (or the harness's own default, 50, if neither is set).
+		...(options.maxIterations !== undefined ? { HEADLESSCODE_MAX_ITERATIONS: String(options.maxIterations) } : {}),
 	}
 	return { env, workerModel }
 }
@@ -697,6 +961,7 @@ function printPlan(
 	specs: WorktreeSpec[],
 	issues: SplitIssue[],
 	models?: { worker: string; reviewer: string; qa: string },
+	maxIterations?: number,
 ): void {
 	const shapeNotes = new Map<number, string>()
 	for (const issue of issues) {
@@ -722,6 +987,11 @@ function printPlan(
 	process.stdout.write("── Orchestrate plan (dry run) ─────────────────────────────\n")
 	process.stdout.write(`  repo:     ${repo}\n`)
 	process.stdout.write(`  mode:     ${mode}\n`)
+	process.stdout.write(
+		maxIterations !== undefined
+			? `  max iterations: ${maxIterations} (workers get --max-iterations ${maxIterations})\n`
+			: "  max iterations: <harness default 50>\n",
+	)
 	if (models) {
 		process.stdout.write(`  models:   worker: ${models.worker}\n`)
 		process.stdout.write(`            reviewer: ${models.reviewer}\n`)
@@ -1032,7 +1302,7 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 			worker: previewModel(options.mode),
 			reviewer: previewModel(options.reviewMode),
 			qa: previewModel(options.qaMode),
-		})
+		}, options.maxIterations)
 		return 0
 	}
 
@@ -1078,6 +1348,7 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		mode: options.mode,
 		explicitModel: options.model,
 		memoryDir: options.memoryDir,
+		maxIterations: options.maxIterations,
 		env: process.env,
 	})
 
@@ -1137,6 +1408,77 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		statePath,
 		pollIntervalMs: options.pollIntervalMs,
 		onGroupUpdate: async (group, currentState) => {
+			// Auto-continue on iteration-exhaustion (issue #2 Part 2): a worker
+			// that failed ONLY because it hit --max-iterations gets a fresh
+			// session on the SAME worktree (the partial state is on disk), up
+			// to --max-continuations, then the group is marked needs-human.
+			// Runs regardless of --no-review (this is about worker failure, not
+			// review routing) and never triggers for budget stops or real
+			// errors — handleIterationExhaustion's empty patch keeps "failed".
+			if (group.status === "failed") {
+				const decision = handleIterationExhaustion(
+					group,
+					repo,
+					options.maxContinuations,
+					options.mode,
+					workerModel,
+					options.maxIterations,
+				)
+				if (decision.shouldSpawn && decision.taskFilePath && decision.taskContent && decision.spawnCommand) {
+					fs.mkdirSync(path.dirname(decision.taskFilePath), { recursive: true })
+					fs.writeFileSync(decision.taskFilePath, decision.taskContent, "utf-8")
+					process.stdout.write(
+						`[orchestrate] ${group.name} continuation ${decision.newContinuationCount}: ` +
+							`previous worker hit the iteration cap; wrote ${path.relative(repo, decision.taskFilePath)}; ` +
+							`re-spawning worker on the same worktree...\n`,
+					)
+					const spawnResult = spawnSync("bash", ["-c", decision.spawnCommand], {
+						cwd: repo,
+						env: {
+							...process.env,
+							HEADLESSCODE_ROOT: HARNESS_ROOT_TS,
+							...(options.memoryDir ? { HEADLESSCODE_MEMORY_DIR: path.resolve(options.memoryDir) } : {}),
+						},
+						stdio: "inherit",
+					})
+					if (spawnResult.status !== 0) {
+						// The continuation worker could not be launched — the
+						// group cannot continue itself, so surface it as needing
+						// a human instead of leaving a dangling "running" group.
+						process.stderr.write(
+							`[orchestrate] continuation spawn for ${group.name} failed (exit ${spawnResult.status}); ` +
+								`marking group needs-human\n`,
+						)
+						state = updateGroup(state, group.name, {
+							status: "needs-human",
+							continuationCount: decision.newContinuationCount,
+							last_activity: {
+								note: `continuation spawn failed after ${decision.newContinuationCount} attempt(s); needs human`,
+							},
+						})
+						await saveState(statePath, state)
+					} else {
+						// Spawn succeeded: reset the group so the watcher re-polls
+						// it as "running" → "done/failed" → re-continued exactly
+						// like a first attempt.
+						state = updateGroup(state, group.name, decision.patch)
+						await saveState(statePath, state)
+					}
+					return true
+				}
+				if (decision.patch.status === "needs-human") {
+					// Continuation cap reached: terminal "needs-human" outcome.
+					state = updateGroup(state, group.name, decision.patch)
+					await saveState(statePath, state)
+					process.stderr.write(
+						`[orchestrate] NEEDS-HUMAN: ${group.name} exhausted ${decision.newContinuationCount} continuation ` +
+							`attempt(s) and still hits the iteration cap — a human must look at this worktree.\n`,
+					)
+					return true
+				}
+				// Real failure (not iteration exhaustion): stays failed.
+				return
+			}
 			if (!options.review) {
 				return
 			}
@@ -1181,6 +1523,7 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 						options.maxReworkCycles,
 						options.mode,
 						workerModel,
+						options.maxIterations,
 					)
 					if (decision.shouldSpawn && decision.taskFilePath && decision.taskContent && decision.spawnCommand) {
 						fs.mkdirSync(path.dirname(decision.taskFilePath), { recursive: true })
@@ -1312,9 +1655,9 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	const needsHuman = finalState.groups.filter((g) => g.status === "needs-human")
 	if (needsHuman.length > 0) {
 		process.stderr.write(
-			`headlesscode orchestrate: ${needsHuman.length} group(s) exhausted their rework attempts and ` +
-				`need a human: ${needsHuman.map((g) => g.name).join(", ")}. ` +
-				`See their review_verdict/pending_review_findings in ${statePath}.\n`,
+			`headlesscode orchestrate: ${needsHuman.length} group(s) need a human (rework/continuation ` +
+				`attempts exhausted): ${needsHuman.map((g) => g.name).join(", ")}. ` +
+				`See ${statePath} for their review_verdict/pending_review_findings and continuationCount.\n`,
 		)
 		return 1
 	}
@@ -1383,12 +1726,12 @@ function deployGateReady(
 	if (anyFailed) {
 		return { ready: false, reason: "one or more groups failed" }
 	}
-	// Rework-exhausted groups: a distinct, final "needs a human" outcome —
-	// the deploy must never proceed while one exists, and the reason must
-	// say why (not a generic failure, not an in-flight review).
+	// Rework/continuation-exhausted groups: a distinct, final "needs a human"
+	// outcome — the deploy must never proceed while one exists, and the reason
+	// must say why (not a generic failure, not an in-flight review).
 	const anyNeedsHuman = state.groups.some((g) => g.status === "needs-human")
 	if (anyNeedsHuman) {
-		return { ready: false, reason: "one or more groups need human attention (rework attempts exhausted)" }
+		return { ready: false, reason: "one or more groups need human attention (rework/continuation attempts exhausted)" }
 	}
 	const anyNotDone = state.groups.some((g) => g.status !== "done")
 	if (anyNotDone) {

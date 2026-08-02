@@ -62,7 +62,8 @@ cleanup() {
 	fi
 	rm -rf "${FIXTURE:-}" "${BARE:-}" \
 		"${ISSUES_JSON:-}" "${DRYRUN_OUT:-}" "${SPAWN_OUT:-}" \
-		"${WATCH_OUT:-}" "${REVIEW_OUT:-}" "${WORKER_MOCK_LOG:-}" "${REVIEW_MOCK_LOG:-}"
+		"${WATCH_OUT:-}" "${REVIEW_OUT:-}" "${WORKER_MOCK_LOG:-}" "${REVIEW_MOCK_LOG:-}" \
+		"${EXHAUST_MOCK_LOG:-}" "${CONT_SPAWN_OUT:-}" "${CONT_OUT:-}"
 	echo "  cleaned up temp fixture/bare/worktrees/logs (set KEEP=1 to retain)"
 }
 
@@ -103,7 +104,7 @@ start_mock() {
 }
 
 # ── 1. Fixture repo + bare origin (the spawner branches off origin/master) ──
-echo "== [1/9] fixture repo + origin =="
+echo "== [1/10] fixture repo + origin =="
 FIXTURE="$(bash "$ROOT/scripts/e2e-fixture/setup.sh")"
 if [ -z "$FIXTURE" ] || [ ! -d "$FIXTURE/.git" ]; then
 	echo "  fixture setup failed; aborting" >&2
@@ -118,7 +119,7 @@ git -C "$FIXTURE" -c user.name="E2E" -c user.email="e2e@headlesscode.invalid" -c
 echo "  fixture: $FIXTURE (origin -> $BARE, master pushed)"
 
 # ── 2. Task files (the spawner copies these into each worktree) ─────────────
-echo "== [2/9] task files =="
+echo "== [2/10] task files =="
 mkdir -p "$FIXTURE/plans/parallel-tasks"
 cat > "$FIXTURE/plans/parallel-tasks/w1-issue1.md" <<'EOF'
 ## Your assignment
@@ -147,7 +148,7 @@ EOF
 echo "  wrote 2 task files under $FIXTURE/plans/parallel-tasks"
 
 # ── 3. Mock OpenRouter servers (worker + reviewer, separate ports) ──────────
-echo "== [3/9] mock OpenRouter servers =="
+echo "== [3/10] mock OpenRouter servers =="
 WORKER_MOCK_LOG="$(mktemp /tmp/headlesscode-e2e-phase2-worker-mock-XXXXXX.log)"
 REVIEW_MOCK_LOG="$(mktemp /tmp/headlesscode-e2e-phase2-review-mock-XXXXXX.log)"
 start_mock success "$WORKER_MOCK_LOG" WORKER_PORT
@@ -155,7 +156,7 @@ start_mock review-clean "$REVIEW_MOCK_LOG" REVIEW_PORT
 sleep 0.2
 
 # ── 4. orchestrate --dry-run: split plan + spawn commands ───────────────────
-echo "== [4/9] orchestrate --dry-run =="
+echo "== [4/10] orchestrate --dry-run =="
 ISSUES_JSON="$(mktemp /tmp/headlesscode-e2e-phase2-issues-XXXXXX.json)"
 cat > "$ISSUES_JSON" <<'EOF'
 [
@@ -181,7 +182,7 @@ else
 fi
 
 # ── 5. Real spawn (2 specs, real workers against the mock) ──────────────────
-echo "== [5/9] spawn-parallel-worktrees.sh (2 specs) =="
+echo "== [5/10] spawn-parallel-worktrees.sh (2 specs) =="
 SPAWN_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-spawn-XXXXXX.out)"
 (
 	cd "$ROOT" &&
@@ -231,7 +232,7 @@ else
 fi
 
 # ── 6. Wait for completion markers (.harness.done) ──────────────────────────
-echo "== [6/9] waiting for workers (.harness.done markers) =="
+echo "== [6/10] waiting for workers (.harness.done markers) =="
 ALL_DONE=0
 for _ in $(seq 1 180); do
 	if [ -d "$FIXTURE/.worktrees/w1/.harness.done" ] && [ -d "$FIXTURE/.worktrees/w2/.harness.done" ]; then
@@ -297,7 +298,7 @@ else
 fi
 
 # ── 7. Mock request-log assertions (workers) ─────────────────────────────────
-echo "== [7/9] worker mock request log =="
+echo "== [7/10] worker mock request log =="
 WORKER_REQ_COUNT="$(grep -c '\[mock\] request #' "$WORKER_MOCK_LOG" || true)"
 echo "  worker mock requests: $WORKER_REQ_COUNT"
 if [ "$WORKER_REQ_COUNT" -ge 6 ]; then
@@ -307,7 +308,7 @@ else
 fi
 
 # ── 8. Review invocation (second harness run, read-only) ────────────────────
-echo "== [8/9] review invocation (mock scenario, read-only) =="
+echo "== [8/10] review invocation (mock scenario, read-only) =="
 REVIEW_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-review-XXXXXX.out)"
 (
 	cd "$ROOT" &&
@@ -338,7 +339,93 @@ else
 	fail "clean review should parse to 0 findings"
 fi
 
-# ── 9. Summary + cleanup ─────────────────────────────────────────────────────
+# ── 9. Iteration-exhaustion auto-continue (issue #2 Part 2) ─────────────────
+# The mock "exhaustion" scenario makes a worker NEVER terminate, so with a tiny
+# --max-iterations each session aborts with the exact "Max iterations" error.
+# The continuation watcher (continuation-invoke.ts, wiring the same
+# handleIterationExhaustion logic orchestrateMain uses) must re-spawn the
+# worker on the SAME worktree twice (max-continuations 2) and then mark the
+# group needs-human.
+echo "== [9/10] iteration-exhaustion auto-continue (mock exhaustion scenario) =="
+EXHAUST_MOCK_LOG="$(mktemp /tmp/headlesscode-e2e-phase2-exhaust-mock-XXXXXX.log)"
+start_mock exhaustion "$EXHAUST_MOCK_LOG" EXHAUST_PORT
+cat > "$FIXTURE/plans/parallel-tasks/w3-issue29.md" <<'EOF'
+## Your assignment
+
+Fix the bug in src/greet.js: greet() must return "Hello, " + name (issue #29).
+
+## Workflow
+
+1. Read src/greet.js.
+2. Patch it with write_to_file.
+3. Verify with `node src/greet.test.js`.
+4. Report via attempt_completion.
+EOF
+CONT_SPAWN_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-cont-spawn-XXXXXX.out)"
+(
+	cd "$ROOT" &&
+		TARGET_REPO="$FIXTURE" \
+		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
+		OPENROUTER_BASE_URL="http://127.0.0.1:$EXHAUST_PORT" \
+		HEADLESSCODE_ROOT="$ROOT" \
+		HEADLESSCODE_MAX_ITERATIONS=3 \
+		bash scripts/spawn-parallel-worktrees.sh w3:2:plans/parallel-tasks/w3-issue29.md
+) >"$CONT_SPAWN_OUT" 2>&1
+CONT_SPAWN_EXIT=$?
+if [ "$CONT_SPAWN_EXIT" -eq 0 ] && [ -d "$FIXTURE/.worktrees/w3" ]; then
+	pass "continuation fixture: worktree w3 created (HEADLESSCODE_MAX_ITERATIONS=3)"
+else
+	fail "continuation fixture: w3 spawn failed (exit $CONT_SPAWN_EXIT)"
+	tail -n 15 "$CONT_SPAWN_OUT" >&2
+fi
+WORKTREE_NAMES="$WORKTREE_NAMES w3"
+
+# Wait for the FIRST exhaustion (exit 1 + the exact Max-iterations error).
+W3_EXHAUSTED=0
+for _ in $(seq 1 120); do
+	if [ -f "$FIXTURE/.worktrees/w3/.harness.exit" ]; then
+		W3_EXHAUSTED=1
+		break
+	fi
+	sleep 1
+done
+W3_EXIT="$(cat "$FIXTURE/.worktrees/w3/.harness.exit" 2>/dev/null || echo '')"
+if [ "$W3_EXHAUSTED" -eq 1 ] && [ "$W3_EXIT" = "1" ] &&
+	grep -q "Max iterations (3) reached without task completion" "$FIXTURE/.worktrees/w3/harness.log"; then
+	pass "exhaustion worker exited 1 with the exact Max-iterations error in harness.log"
+else
+	fail "expected w3 worker to hit --max-iterations 3 (exit 1 + error in harness.log); got exit $W3_EXIT"
+	tail -n 8 "$FIXTURE/.worktrees/w3/harness.log" 2>/dev/null >&2 || true
+fi
+
+# Run the continuation watcher (max-continuations 2 -> initial + 2 re-spawns -> needs-human).
+CONT_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-cont-XXXXXX.out)"
+(
+	cd "$ROOT" &&
+		OPENROUTER_BASE_URL="http://127.0.0.1:$EXHAUST_PORT" \
+		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
+		HEADLESSCODE_ROOT="$ROOT" \
+		npx tsx scripts/e2e-phase2/continuation-invoke.ts "$FIXTURE" 3 2
+) >"$CONT_OUT" 2>&1
+CONT_EXIT=$?
+if grep -q "GROUP w3 status=needs-human" "$CONT_OUT" && grep -q "continuation_count=2" "$CONT_OUT"; then
+	pass "group w3 reached needs-human after 2 continuations (count=2, terminal)"
+else
+	fail "expected w3 needs-human with continuation_count=2 (exit $CONT_EXIT)"
+	tail -n 25 "$CONT_OUT" >&2
+fi
+if [ -f "$FIXTURE/plans/parallel-tasks/w3-continue1.md" ] && [ -f "$FIXTURE/plans/parallel-tasks/w3-continue2.md" ]; then
+	pass "continuation task files written (w3-continue1.md + w3-continue2.md)"
+else
+	fail "expected w3-continue1.md and w3-continue2.md under $FIXTURE/plans/parallel-tasks"
+fi
+if [ -d "$FIXTURE/.worktrees/w3" ]; then
+	pass "the SAME worktree was re-used across continuations (still one w3)"
+else
+	fail "w3 worktree missing after continuations"
+fi
+
+# ── 10. Summary + cleanup ────────────────────────────────────────────────────
 TOTAL=$((PASS + FAIL))
 echo ""
 echo "──────────────────────────────────────────────────────────────"

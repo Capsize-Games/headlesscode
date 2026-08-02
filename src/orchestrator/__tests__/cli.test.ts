@@ -11,7 +11,14 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 
-import { buildReworkTaskFileContent, buildSpawnEnv, handleReviewVerdict, parseOrchestrateArgs } from "../cli.js"
+import {
+	buildContinuationTaskFileContent,
+	buildReworkTaskFileContent,
+	buildSpawnEnv,
+	handleIterationExhaustion,
+	handleReviewVerdict,
+	parseOrchestrateArgs,
+} from "../cli.js"
 import { watchGroups } from "../watch.js"
 import { defaultState, loadStateSync, saveStateSync, updateGroup, type OrchestratorGroup, type OrchestratorState } from "../state.js"
 import type { ReviewResult } from "../reviewer.js"
@@ -348,6 +355,284 @@ async function testSpawnEnvNoConfigNoEnvLeavesModelUnset(): Promise<void> {
 	}
 }
 
+// ─── --max-iterations / --max-continuations parsing ─────────────────────────
+
+async function testParseOrchestrateArgsMaxIterations(): Promise<void> {
+	// Default with neither a flag nor the env var: undefined -> the harness's
+	// own default (50) applies untouched (the issue only makes it overridable).
+	const def = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1"])
+	assert.equal(def.error, undefined)
+	assert.equal(def.options.maxIterations, undefined, "no flag/env -> leave the harness default untouched")
+
+	// Env fallback when no flag is given.
+	process.env.HEADLESSCODE_MAX_ITERATIONS = "75"
+	try {
+		const fromEnv = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1"])
+		assert.equal(fromEnv.error, undefined)
+		assert.equal(fromEnv.options.maxIterations, 75, "env fallback applies when no flag")
+	} finally {
+		delete process.env.HEADLESSCODE_MAX_ITERATIONS
+	}
+
+	// An explicit flag beats the env fallback.
+	process.env.HEADLESSCODE_MAX_ITERATIONS = "75"
+	try {
+		const flag = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1", "--max-iterations", "120"])
+		assert.equal(flag.error, undefined)
+		assert.equal(flag.options.maxIterations, 120, "explicit flag beats the env fallback")
+	} finally {
+		delete process.env.HEADLESSCODE_MAX_ITERATIONS
+	}
+
+	const bad = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1", "--max-iterations", "abc"])
+	assert.ok(bad.error && bad.error.includes("positive integer"), "non-numeric is rejected")
+
+	const zero = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1", "--max-iterations", "0"])
+	assert.ok(zero.error && zero.error.includes("positive integer"), "0 is rejected")
+}
+
+async function testParseOrchestrateArgsMaxContinuations(): Promise<void> {
+	const def = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1"])
+	assert.equal(def.error, undefined)
+	assert.equal(def.options.maxContinuations, 3, "default continuation cap is 3")
+
+	const custom = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1", "--max-continuations", "5"])
+	assert.equal(custom.error, undefined)
+	assert.equal(custom.options.maxContinuations, 5)
+
+	const zero = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1", "--max-continuations", "0"])
+	assert.ok(zero.error && zero.error.includes("positive integer"), "0 is rejected")
+
+	const bad = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1", "--max-continuations", "x"])
+	assert.ok(bad.error && bad.error.includes("positive integer"), "non-numeric is rejected")
+}
+
+async function testSpawnEnvCarriesMaxIterations(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		// Explicit cap -> the spawn env carries it as HEADLESSCODE_MAX_ITERATIONS
+		// (run-worker.sh forwards it as --max-iterations to the worker CLI).
+		const { env } = buildSpawnEnv({ repo, mode: "code", maxIterations: 123, env: {} })
+		assert.equal(env.HEADLESSCODE_MAX_ITERATIONS, "123", "explicit cap forwarded to the spawn env")
+
+		// undefined cap -> the inherited env var (if any) passes through untouched.
+		const withEnv = buildSpawnEnv({ repo, mode: "code", env: { HEADLESSCODE_MAX_ITERATIONS: "99" } })
+		assert.equal(withEnv.env.HEADLESSCODE_MAX_ITERATIONS, "99", "undefined cap leaves the inherited env var alone")
+
+		// Explicit cap beats the inherited env var.
+		const flagBeatsEnv = buildSpawnEnv({ repo, mode: "code", maxIterations: 200, env: { HEADLESSCODE_MAX_ITERATIONS: "99" } })
+		assert.equal(flagBeatsEnv.env.HEADLESSCODE_MAX_ITERATIONS, "200", "explicit cap beats the inherited env var")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+// ─── buildContinuationTaskFileContent ────────────────────────────────────────
+
+async function testContinuationTaskFileContentIncludesIssuesAndCycle(): Promise<void> {
+	const content = buildContinuationTaskFileContent({ name: "w1", issues: [27, 29] }, 2)
+	assert.ok(content.includes("Continuation cycle 2"), "content names the continuation cycle")
+	assert.ok(content.includes("#27, #29"), "original issue numbers included")
+	assert.ok(content.includes("gh issue view 27") && content.includes("gh issue view 29"), "gh fetch lines included")
+	assert.ok(content.includes("iteration cap"), "explains WHY the previous session stopped")
+	assert.ok(content.includes("Closing Report (continuation cycle 2)"), "closing template reuses the continuation variant")
+	assert.ok(content.includes("Scope: #27, #29 only — continuation cycle 2."), "scope line names the cycle")
+
+	// A group with no recorded issues must still produce a valid task.
+	const noIssues = buildContinuationTaskFileContent({ name: "w1" }, 1)
+	assert.ok(noIssues.includes("inspect the worktree"), "no-issues fallback text present")
+}
+
+// ─── handleIterationExhaustion ───────────────────────────────────────────────
+
+/** A group whose worker failed specifically because it hit the iteration cap. */
+function exhaustedGroup(overrides: Partial<OrchestratorGroup> = {}): OrchestratorGroup {
+	return baseGroup({
+		status: "failed",
+		exit_code: 1,
+		summary: "headlesscode: task failed: Max iterations (50) reached without task completion",
+		...overrides,
+	})
+}
+
+async function testExhaustionBelowCapSpawnsAndResetsState(): Promise<void> {
+	const group = exhaustedGroup({ issues: [27], continuationCount: 0 })
+	const decision = handleIterationExhaustion(group, "/tmp/example-repo", 3, "code")
+
+	assert.equal(decision.shouldSpawn, true, "below the cap the group gets a continuation spawn")
+	assert.equal(decision.newContinuationCount, 1)
+	assert.ok(
+		decision.taskFilePath?.endsWith(path.join("plans", "parallel-tasks", "w1-continue1.md")),
+		`continuation task file named <name>-continue<n>.md, got ${decision.taskFilePath}`,
+	)
+	assert.ok(decision.taskContent && decision.taskContent.includes("Continuation cycle 1"), "cycle number embedded in the task")
+	assert.ok(decision.spawnCommand && decision.spawnCommand.includes("run-worker.sh"), "spawn command calls run-worker.sh directly")
+	assert.ok(decision.spawnCommand?.includes(`--mode "code"`), "spawn command forwards the worker mode")
+	assert.ok(decision.spawnCommand?.includes(".worktrees/w1"), "spawn command targets the SAME worktree (no new worktree)")
+
+	// State reset: status back to running, completion artifacts cleared, count incremented.
+	assert.equal(decision.patch.status, "running")
+	assert.equal(decision.patch.continuationCount, 1)
+	assert.equal(decision.patch.exit_code, undefined, "previous attempt's exit code cleared")
+	assert.equal(decision.patch.summary, undefined, "previous attempt's summary cleared")
+	assert.equal(decision.patch.review_verdict, undefined, "review verdict cleared for a fresh session")
+	assert.equal(decision.patch.qa, undefined, "stale QA cleared for a fresh session")
+	assert.ok(typeof decision.patch.spawned === "string", "spawned reset so the stall guard measures the continuation worker")
+	assert.ok(decision.patch.last_activity && typeof decision.patch.last_activity === "object", "last_activity notes the continuation")
+}
+
+async function testExhaustionIncrementsFromExistingCount(): Promise<void> {
+	// A group already on its 2nd continuation moves to its 3rd.
+	const group = exhaustedGroup({ continuationCount: 2 })
+	const decision = handleIterationExhaustion(group, "/tmp/repo", 3, "code")
+	assert.equal(decision.shouldSpawn, true)
+	assert.equal(decision.newContinuationCount, 3)
+	assert.ok(
+		decision.taskFilePath?.endsWith(path.join("plans", "parallel-tasks", "w1-continue3.md")),
+		"each cycle writes a NEW task file (prior files not overwritten)",
+	)
+	assert.equal(decision.patch.continuationCount, 3)
+}
+
+async function testExhaustionAtCapMarksNeedsHumanAndDoesNotSpawn(): Promise<void> {
+	const group = exhaustedGroup({ continuationCount: 3 })
+	const decision = handleIterationExhaustion(group, "/tmp/repo", 3, "code")
+
+	assert.equal(decision.shouldSpawn, false, "at the cap nothing is spawned again")
+	assert.equal(decision.newContinuationCount, 3, "count not incremented — no new attempt happens")
+	assert.equal(decision.taskFilePath, undefined)
+	assert.equal(decision.spawnCommand, undefined)
+	assert.equal(decision.patch.status, "needs-human", "distinct terminal state, not failed/done")
+	assert.equal(decision.patch.continuationCount, 3)
+	const activity = decision.patch.last_activity
+	assert.ok(activity && typeof activity === "object" && "note" in activity, "last_activity explains the gave-up reason")
+}
+
+async function testBudgetFailureDoesNotContinue(): Promise<void> {
+	// A budget stop is a deliberate guardrail, NOT "task too big" — it must
+	// never trigger a continuation (the group stays failed).
+	const group = baseGroup({
+		status: "failed",
+		exit_code: 1,
+		summary: "headlesscode: task aborted by budget: max cost exceeded",
+	})
+	const decision = handleIterationExhaustion(group, "/tmp/repo", 3, "code")
+	assert.equal(decision.shouldSpawn, false, "a budget stop must never auto-continue")
+	assert.equal(decision.newContinuationCount, 0)
+	assert.deepEqual(decision.patch, {}, "no state patch — the watcher's failed status stands")
+}
+
+async function testGenericFailureDoesNotContinue(): Promise<void> {
+	const group = baseGroup({ status: "failed", exit_code: 1, summary: "headlesscode: task failed: consecutive mistakes" })
+	const decision = handleIterationExhaustion(group, "/tmp/repo", 3, "code")
+	assert.equal(decision.shouldSpawn, false, "a real error must never auto-continue")
+	assert.deepEqual(decision.patch, {})
+}
+
+async function testCleanExitWithMaxIterationsTextDoesNotContinue(): Promise<void> {
+	// The string in the log tail alone is not enough — only a NON-ZERO exit
+	// combined with the exhaustion message is a continuable failure.
+	const group = baseGroup({
+		status: "done",
+		exit_code: 0,
+		summary: "informational: Max iterations (50) reached without task completion",
+	})
+	const decision = handleIterationExhaustion(group, "/tmp/repo", 3, "code")
+	assert.equal(decision.shouldSpawn, false, "a clean exit is never continuable")
+	assert.deepEqual(decision.patch, {})
+}
+
+async function testExhaustionSpawnForwardsMaxIterations(): Promise<void> {
+	const group = exhaustedGroup()
+	const withCap = handleIterationExhaustion(group, "/tmp/repo", 3, "code", undefined, 7)
+	assert.ok(
+		withCap.spawnCommand?.includes('--max-iterations "7"'),
+		"continuation spawn forwards the round-level iteration cap, got " + withCap.spawnCommand,
+	)
+	const withoutCap = handleIterationExhaustion(group, "/tmp/repo", 3, "code")
+	assert.ok(!withoutCap.spawnCommand?.includes("--max-iterations"), "no cap -> no flag (harness default applies)")
+}
+
+// ─── watchGroups re-polls a group after a continuation reset ─────────────────
+// Mirrors the rework-loop test above: after onGroupUpdate resets a failed
+// group to "running" (and the watcher reloads on the callback's `true`), the
+// polling loop picks the group back up as running → done.
+
+async function testWatchGroupsRepollsGroupAfterContinuationReset(): Promise<void> {
+	const repoRoot = await tmpRepo()
+	try {
+		const wtPath = path.join(repoRoot, ".worktrees", "w1")
+		await fs.mkdir(wtPath, { recursive: true })
+		const statePath = path.join(repoRoot, ".worktrees", ".orchestrator-state.json")
+		const initial: OrchestratorState = {
+			...defaultState("round-1"),
+			groups: [
+				{ name: "w1", worktree: ".worktrees/w1", issues: [27], status: "running", spawned: new Date().toISOString() },
+			],
+		}
+		saveStateSync(statePath, initial)
+		// First worker hit the iteration cap: exit 1 + the exact failure
+		// message in harness.log (run-worker.sh redirects stderr there, and the
+		// watcher captures the tail as the group summary).
+		await fs.mkdir(path.join(wtPath, ".harness.done"))
+		await fs.writeFile(path.join(wtPath, ".harness.exit"), "1", "utf-8")
+		await fs.writeFile(
+			path.join(wtPath, "harness.log"),
+			"headlesscode: task failed: Max iterations (3) reached without task completion\n",
+			"utf-8",
+		)
+
+		let callbackCalls = 0
+		const controller = new AbortController()
+		const summary = await watchGroups({
+			repoRoot,
+			statePath,
+			pollIntervalMs: 20,
+			stderrWriter: () => {},
+			onGroupUpdate: async (group) => {
+				callbackCalls++
+				if (callbackCalls === 1) {
+					// First failure: iteration exhaustion → continuation.
+					const decision = handleIterationExhaustion(group, repoRoot, 3, "code")
+					assert.equal(decision.shouldSpawn, true, "iteration exhaustion below the cap must continue")
+					assert.equal(decision.patch.status, "running")
+					// Apply the reset the real callback applies, then simulate a
+					// continuation worker that starts AND finishes: clear the old
+					// completion markers (run-worker.sh does this) and re-create
+					// them to represent the continuation worker's completion.
+					saveStateSync(statePath, updateGroup(loadStateSync(statePath), "w1", decision.patch))
+					await fs.rm(path.join(wtPath, ".harness.done"), { recursive: true, force: true })
+					await fs.rm(path.join(wtPath, ".harness.exit"), { force: true })
+					await fs.mkdir(path.join(wtPath, ".harness.done"))
+					await fs.writeFile(path.join(wtPath, ".harness.exit"), "0", "utf-8")
+					return true
+				}
+				// Second completion: the continuation finished cleanly.
+				const cleanPatch = {
+					review_verdict: "clean",
+					pending_review_findings: [] as string[],
+					reviewed_at: new Date().toISOString(),
+					last_activity: { note: "reviewed: verdict=clean" },
+				}
+				saveStateSync(statePath, updateGroup(loadStateSync(statePath), "w1", cleanPatch))
+				return undefined
+			},
+			signal: controller.signal,
+		})
+
+		assert.equal(callbackCalls, 2, "the loop must re-poll the group after the continuation reset and re-review it")
+		assert.equal(summary.allTerminal, true)
+
+		// The disk state is authoritative (orchestrateMain reloads it after the round).
+		const persisted = loadStateSync(statePath)
+		assert.equal(persisted.groups[0].status, "done")
+		assert.equal(persisted.groups[0].review_verdict, "clean")
+		assert.equal(persisted.groups[0].continuationCount, 1, "continuationCount incremented exactly once")
+	} finally {
+		await fs.rm(repoRoot, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -365,6 +650,18 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["spawn env: explicit --model flag beats the config file", testSpawnEnvExplicitModelFlagBeatsConfig],
 	["spawn env: no config -> raw OPENROUTER_MODEL passes through unchanged", testSpawnEnvNoConfigKeepsRawEnvModel],
 	["spawn env: nothing configured -> no model injected", testSpawnEnvNoConfigNoEnvLeavesModelUnset],
+	["--max-iterations parses (env fallback, flag beats env, invalid)", testParseOrchestrateArgsMaxIterations],
+	["--max-continuations parses (default 3, custom, invalid)", testParseOrchestrateArgsMaxContinuations],
+	["spawn env carries HEADLESSCODE_MAX_ITERATIONS (flag > env, untouched when unset)", testSpawnEnvCarriesMaxIterations],
+	["continuation task file includes issues, cycle, and scope", testContinuationTaskFileContentIncludesIssuesAndCycle],
+	["iteration exhaustion below cap triggers continuation spawn + state reset", testExhaustionBelowCapSpawnsAndResetsState],
+	["iteration exhaustion increments from an existing continuation count", testExhaustionIncrementsFromExistingCount],
+	["iteration exhaustion at cap marks needs-human and does NOT spawn", testExhaustionAtCapMarksNeedsHumanAndDoesNotSpawn],
+	["budget stop never auto-continues (stays failed)", testBudgetFailureDoesNotContinue],
+	["generic failure never auto-continues (stays failed)", testGenericFailureDoesNotContinue],
+	["clean exit with the max-iterations text never auto-continues", testCleanExitWithMaxIterationsTextDoesNotContinue],
+	["continuation spawn forwards the round-level --max-iterations when set", testExhaustionSpawnForwardsMaxIterations],
+	["watchGroups re-polls a group after a continuation reset", testWatchGroupsRepollsGroupAfterContinuationReset],
 ]
 
 async function main(): Promise<void> {

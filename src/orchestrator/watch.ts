@@ -42,6 +42,25 @@ export const DEFAULT_STALL_TIMEOUT_MS = 2 * 60 * 60 * 1000 // 2h, matching airun
 /** Number of harness.log lines kept as the group summary. */
 const SUMMARY_TAIL_LINES = 40
 
+/**
+ * The harness loop's exact iteration-cap failure message (the `result.error`
+ * from src/engine/loop.ts, printed by src/cli.ts to stderr, which
+ * run-worker.sh redirects into harness.log and the watcher captures in the
+ * group summary). The ONLY failure reason that may auto-continue a group —
+ * a budget stop or a real error must stay terminal.
+ */
+export const MAX_ITERATIONS_ERROR_RE = /Max iterations \(\d+\) reached without task completion/
+
+/**
+ * Whether a worker's log summary indicates it failed specifically because it
+ * hit the iteration cap ("the task is bigger than one session") vs. some
+ * other reason. Pure + unit-testable so the watcher's continuation decision
+ * stays thin (see handleIterationExhaustion in cli.ts).
+ */
+export function isIterationExhaustion(summary: string | undefined): boolean {
+	return typeof summary === "string" && MAX_ITERATIONS_ERROR_RE.test(summary)
+}
+
 export interface WatchOptions {
 	/** Target repo root containing `.worktrees/` (also used to resolve). */
 	repoRoot: string

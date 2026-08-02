@@ -41,6 +41,11 @@
 #   HEADLESSCODE_CLI     harness CLI command (default: "npx tsx src/cli.ts",
 #                        resolved from the headlesscode repo root)
 #   HEADLESSCODE_ROOT    headlesscode repo root containing src/cli.ts
+#   HEADLESSCODE_MAX_ITERATIONS  per-session iteration cap for EVERY worker;
+#                        forwarded explicitly to run-worker.sh as
+#                        --max-iterations (mirrors how ORCHESTRATOR_MODE is
+#                        passed explicitly). The orchestrator's --max-iterations
+#                        sets this in the spawn env.
 #   SPAWN_MODEL          explicit model override for EVERY worker (like an
 #                        --model flag: beats .headlesscode/mode-models.json
 #                        entries; default: unset, each worker's mode resolves
@@ -296,8 +301,12 @@ EOF
     if [ -n "$WORKER_MODEL" ]; then
         MODEL_ARGS=(--model "$WORKER_MODEL")
     fi
+    MAX_ITER_ARGS=()
+    if [ -n "${HEADLESSCODE_MAX_ITERATIONS:-}" ]; then
+        MAX_ITER_ARGS=(--max-iterations "$HEADLESSCODE_MAX_ITERATIONS")
+    fi
     WORKER_PID="$(ORCHESTRATOR_MODE="$ORCH_MODE" bash "$HARNESS_ROOT/scripts/run-worker.sh" \
-        "$wt_path" "ORCHESTRATOR_TASK.md" --mode "$ORCH_MODE" "${MODEL_ARGS[@]}")"
+        "$wt_path" "ORCHESTRATOR_TASK.md" --mode "$ORCH_MODE" "${MODEL_ARGS[@]}" "${MAX_ITER_ARGS[@]}")"
     echo "  Worker pid: $WORKER_PID (model: ${WORKER_MODEL:-<unset — CLI default>}, log: $wt_path/harness.log)"
 
     # ── Record "running" now that the worker is up ──────────────────────────

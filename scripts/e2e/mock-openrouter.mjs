@@ -37,6 +37,14 @@
  *     consecutive-mistake bound and the CLI exits 1 (bounded failure,
  *     verified end-to-end).
  *
+ *   exhaustion — issue #2 Part 2 (iteration-exhaustion auto-continue):
+ *     the model NEVER terminates; every reply is a benign read_file on a
+ *     DIFFERENT fixture file (a different path each iteration so the loop's
+ *     identical-repeat mistake counter never trips). The harness therefore
+ *     runs until its --max-iterations cap aborts the session with the exact
+ *     "Max iterations (N) reached without task completion" error — the
+ *     signal the orchestrator's continuation callback auto-continues on.
+ *
  *   qa-pass / qa-fail — Phase 4 QA scenario: the model only gets read +
  *     command tools (execute_command runs the fixture test) and terminates
  *     with an attempt_completion that either passes with evidence or fails
@@ -95,9 +103,9 @@
  *   PORT               listen port (default 0 = OS-assigned random port).
  *                      The actual port is printed to stdout in the
  *                      "[mock] listening on http://127.0.0.1:<port>" line.
- *   MOCK_SCENARIO      success | error-loop | review-clean | review-finding |
- *                      qa-pass | qa-fail | qa-orchestrate | permissions
- *                      (default success)
+ *   MOCK_SCENARIO      success | error-loop | exhaustion | review-clean |
+ *                      review-finding | qa-pass | qa-fail | qa-orchestrate |
+ *                      permissions (default success)
  *   MOCK_FIXTURE_ROOT  path to the fixture repo; the write_to_file content is
  *                      derived by patching this repo's buggy source so the
  *                      e2e runner can assert the fix landed byte-for-byte.
@@ -313,6 +321,21 @@ function qaSessionResponse(model, historyToolCalls, pass) {
  * concurrently within one orchestrate process.
  */
 function buildScenarioResponse({ model, historyToolCalls, systemPrompt, toolNames }) {
+	if (SCENARIO === "exhaustion") {
+		// Never terminate. Cycle through DIFFERENT benign read_file targets so
+		// the loop's identical-repeat mistake counter never trips — it runs
+		// until the harness's --max-iterations cap aborts the session with the
+		// exact "Max iterations" error (the orchestrator's auto-continue signal,
+		// issue #2 Part 2).
+		const files = [BUGGY_FILE, "README.md", "package.json"]
+		const file = files[historyToolCalls % files.length]
+		return chatResponse(model, {
+			role: "assistant",
+			content: null,
+			tool_calls: [toolCall(`call_mock_exhaust_${REQUEST_COUNT}`, "read_file", { path: file })],
+		})
+	}
+
 	if (SCENARIO === "error-loop") {
 		// Identical erroring tool call every time: the loop's consecutive-mistake
 		// bound (default 3) must trip and the CLI must exit 1.

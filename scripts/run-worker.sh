@@ -43,6 +43,7 @@
 #                      now cheap, roughly $0.002 with the fixed pricing/
 #                      caching, so raising this is a cost-cheap way to avoid
 #                      "max iterations reached without task completion").
+#                      An explicit --max-iterations flag below overrides it.
 #   HEADLESSCODE_WINDOW_SIZE  when set, forwarded to the CLI as
 #                      --window-size (default 300 messages). Rarely needs
 #                      overriding now that the default accounts for
@@ -52,14 +53,14 @@
 #
 # Usage:
 #   scripts/run-worker.sh <worktree-path> <task-file-or-text> \
-#       [--mode <slug>] [--model <id>] [--log-file <path>]
+#       [--mode <slug>] [--model <id>] [--log-file <path>] [--max-iterations <n>]
 #
 # Prints the worker PID on stdout (the only stdout output).
 
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 <worktree-path> <task-file-or-text> [--mode <slug>] [--model <id>] [--log-file <path>]" >&2
+    echo "Usage: $0 <worktree-path> <task-file-or-text> [--mode <slug>] [--model <id>] [--log-file <path>] [--max-iterations <n>]" >&2
     exit 2
 }
 
@@ -75,6 +76,7 @@ shift
 MODE="code"
 MODEL=""
 LOG_FILE=""
+MAX_ITERATIONS=""
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -100,6 +102,14 @@ while [ "$#" -gt 0 ]; do
             ;;
         --log-file=*)
             LOG_FILE="${1#--log-file=}"
+            shift
+            ;;
+        --max-iterations)
+            MAX_ITERATIONS="${2:-}"
+            shift 2
+            ;;
+        --max-iterations=*)
+            MAX_ITERATIONS="${1#--max-iterations=}"
             shift
             ;;
         *)
@@ -183,9 +193,11 @@ if [ -n "${HEADLESSCODE_DECISION_TIMEOUT_MS:-}" ]; then
     BUDGET_ARG="$BUDGET_ARG --decision-timeout-ms '$HEADLESSCODE_DECISION_TIMEOUT_MS'"
 fi
 
-# Iteration cap: forward as a CLI flag too, same rationale as above.
-if [ -n "${HEADLESSCODE_MAX_ITERATIONS:-}" ]; then
-    BUDGET_ARG="$BUDGET_ARG --max-iterations '$HEADLESSCODE_MAX_ITERATIONS'"
+# Iteration cap: forward as a CLI flag too, same rationale as above. An
+# explicit --max-iterations flag on this script beats the env var.
+MAX_ITERATIONS_VALUE="${MAX_ITERATIONS:-${HEADLESSCODE_MAX_ITERATIONS:-}}"
+if [ -n "$MAX_ITERATIONS_VALUE" ]; then
+    BUDGET_ARG="$BUDGET_ARG --max-iterations '$MAX_ITERATIONS_VALUE'"
 fi
 
 # Sliding-window history cap (messages, not tokens): forward as a CLI flag too.
