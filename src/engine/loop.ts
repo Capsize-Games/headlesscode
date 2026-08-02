@@ -64,6 +64,7 @@ import {
 	maybeCondense,
 	skipOrphanedToolMessages,
 } from "./condense.js"
+import { runLocalExplorePhase, type LocalExploreOptions, type LocalExploreResult } from "./local-explore.js"
 
 /** Default max pause duration for dashboard-initiated pauses, ms (matches watch.ts's stall guard). */
 export const DEFAULT_MAX_PAUSE_MS = 2 * 60 * 60 * 1000
@@ -231,6 +232,20 @@ export interface HeadlessSessionConfig {
 	 * pattern as the live-usage-snapshot tests).
 	 */
 	eventHook?: (eventType: string, fields: Record<string, unknown>) => void
+	/**
+	 * OPT-IN local exploration phase (default OFF — see
+	 * plans/local-exploration.md): when truthy, HeadlessSession runs a
+	 * bounded, strictly read-only local Ollama exploration pass (read_file +
+	 * list_files only) BEFORE its first cloud iteration and folds the
+	 * transcript into the cloud context as a clearly-labeled synthetic
+	 * message. `true` = enabled with env defaults (HEADLESSCODE_LOCAL_EXPLORE_*);
+	 * an options object = enabled with explicit overrides (tests). Non-fatal
+	 * by construction: any local failure (Ollama down, bad response, model
+	 * not pulled) skips the phase and the session proceeds exactly as today —
+	 * a broken experimental feature must never break a real session. When
+	 * unset (the default), the phase never runs at all.
+	 */
+	localExplore?: boolean | LocalExploreOptions
 }
 
 export interface SessionRunState {
@@ -297,6 +312,12 @@ export interface ResolvedSessionConfig {
 	pausePollIntervalMs: number
 	/** Live event hook (see HeadlessSessionConfig.eventHook). */
 	eventHook?: (eventType: string, fields: Record<string, unknown>) => void
+	/**
+	 * Opt-in local exploration phase (see HeadlessSessionConfig.localExplore).
+	 * undefined/false = OFF (zero behavior change); options object = enabled
+	 * with overrides; true = enabled with env defaults.
+	 */
+	localExplore?: boolean | LocalExploreOptions
 }
 
 /** Phase 3: memory activity recorded for the last `run()` (null when off/failed). */
@@ -403,6 +424,7 @@ export class HeadlessSession {
 			maxPauseMs: config.maxPauseMs ?? envMaxPauseMs() ?? DEFAULT_MAX_PAUSE_MS,
 			pausePollIntervalMs: config.pausePollIntervalMs ?? DEFAULT_PAUSE_POLL_INTERVAL_MS,
 			eventHook: config.eventHook,
+			localExplore: config.localExplore,
 		}
 
 		this.llmClient = config.llmClient
@@ -503,6 +525,24 @@ export class HeadlessSession {
 			messages[1] = { role: "user", content: `${messages[1].content ?? ""}\n\n${recall.section}` }
 		}
 		this.recallInfo = { recalledFacts: recall.recalledFacts, recalledSessions: recall.recalledSessions }
+
+		// 2bb. OPT-IN local exploration phase (default OFF, see
+		// plans/local-exploration.md): a bounded, read-only local Ollama pass
+		// runs BEFORE the cloud model's first turn. Its transcript is folded
+		// in as a clearly-labeled synthetic message at index 2 (after system +
+		// task) so the cloud model can tell it came from a preliminary local
+		// pass, not its own prior work. Non-fatal: any local failure skips the
+		// phase entirely and the session proceeds exactly as today.
+		if (this.config.localExplore) {
+			const localResult = await this.runLocalExplore()
+			if (localResult?.handoffMessage) {
+				messages.splice(2, 0, localResult.handoffMessage)
+				this.logger.info("[loop] folded local exploration phase into cloud context", {
+					iterations: localResult.iterations,
+					terminatedBy: localResult.terminatedBy,
+				})
+			}
+		}
 
 		this.logger.info("[loop] session start", {
 			mode,
@@ -1291,6 +1331,30 @@ export class HeadlessSession {
 		* "## PROJECT MEMORY" section (recalled facts + rolling recap) plus counts.
 		* Non-fatal: any failure returns an empty section.
 		*/
+	/**
+	 * OPT-IN local exploration phase (default OFF). Wraps runLocalExplorePhase
+	 * in a try/catch so even a thrown error (a programming bug, not just a
+	 * local-model failure) can never abort a real session — fail open to
+	 * today's cloud-only behavior. Returns null when the phase is off or
+	 * produced nothing usable.
+	 */
+	private async runLocalExplore(): Promise<LocalExploreResult | null> {
+		const override = typeof this.config.localExplore === "object" ? this.config.localExplore : {}
+		try {
+			return await runLocalExplorePhase({
+				workspaceRoot: this.config.workspaceRoot,
+				taskText: this.config.taskText,
+				logger: this.logger,
+				...override,
+			})
+		} catch (error) {
+			this.logger.warn("[local-explore] local exploration phase failed (non-fatal; proceeding cloud-only)", {
+				error: error instanceof Error ? error.message : String(error),
+			})
+			return null
+		}
+	}
+
 	private async recallMemory(): Promise<{ section: string; recalledFacts: number; recalledSessions: number }> {
 		const memory = this.config.memory
 		if (!memory) {

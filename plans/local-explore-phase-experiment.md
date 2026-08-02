@@ -242,3 +242,114 @@ This is the actual point of the task, same rigor as
   pursuing further — with the reasoning, not just the verdict.
 - Confirmation of tsc/test/e2e results.
 - Any deviation from this spec, and why.
+
+---
+
+# Results — honest evaluation, run live 2026-08-02 (this segment)
+
+## Environment re-verification (VRAM/context table)
+
+Re-verified live on the project owner's machine. Flash attention + q8_0 KV
+cache remain the permanent Ollama config (still persisted in
+`/etc/init.d/ollama`). Solo-model VRAM at each `num_ctx`, 100% GPU:
+
+| context tokens | qwen3.5:9b alone (measured this run) |
+|---|---|
+| 4,096 | 8.6 GB |
+| 32,768 | 9.5 GB |
+| 65,536 | 10 GB |
+| 131,072 | 12 GB |
+| 262,144 | 17 GB — 86% CPU fallback, unusable |
+
+The spec's table holds exactly. Default `contextTokens` stays 131,072
+(~4 GB headroom on the 16 GB card). All three local phases in the eval ran
+at this setting (peak model VRAM ~12 GB, no evictions, no OOM).
+
+## Setup for the comparison
+
+- Local phase: real Ollama `qwen3.5:9b`, defaults as shipped
+  (`--local-explore`, `HEADLESSCODE_LOCAL_EXPLORE_CONTEXT_TOKENS` unset →
+  131,072; `maxIterations` 15; `timeoutMs` 120 s).
+- Cloud phase: real OpenRouter. The default `deepseek/deepseek-chat` and
+  the `~`-alias `deepseek/deepseek-v4-flash-latest` both return
+  400/404 ("not a valid model ID"), so both modes used
+  `deepseek/deepseek-v4-flash-0731` (the dated, non-alias id).
+- Honest cost basis: the harness's own `costUsd` falls back to the
+  conservative $2/$8-per-M `FALLBACK_MODEL_PRICE` for this unlisted model
+  id (≈22× inflated), so real spend is recomputed here at the model's
+  OpenRouter list rates measured from `/api/v1/models` on 2026-08-02:
+  $0.09/M uncached input, $0.0028/M cached input, $0.18/M output.
+- 3 exploration tasks × 2 modes, identical task text. Tasks: (A) read-only
+  headless executor — where created + exact tool list; (B) consecutive-error
+  limit — constant, counter sites, trip/reset, `boundedFailure`; (C)
+  `codebase_search` wiring + exact `IMPLEMENTED_TOOLS`/`EXECUTABLE_TOOL_NAMES`
+  contents (deliberate stress case: the local model cannot call
+  `codebase_search` itself, and previously drifted on this exact task).
+
+## Numbers (real run, not impressions)
+
+| Task | Mode | Cloud input tok | Cloud output tok | Real cost | Wall clock | Local phase |
+|---|---|---|---|---|---|---|
+| A | cloud-only | 82,821 | 4,032 | $0.00287 | 40 s | — |
+| A | local-explore | 63,305 | 2,527 | $0.00150 | 52 s | 3 iters, ~20.3K tok, 21.7 s |
+| B | cloud-only | 197,753 | 3,256 | $0.00342 | 38 s | — |
+| B | local-explore | 122,017 | 3,575 | $0.00253 | 61 s | 6 iters, ~15.6K tok, 23.8 s |
+| C | cloud-only | 107,201 | 3,647 | $0.00189 | 34 s | — |
+| C | local-explore | 81,310 | 3,737 | $0.00146 | 54 s | 3 iters, ~20.1K tok, 19.7 s |
+
+- **Cost: −23% to −48%** (input tokens −24% to −38%; local tokens are free).
+  Total across the three tasks: $0.00818 → $0.00549 (−33%).
+- **Wall clock: +12 to +23 s (+30% to +61%)** — entirely the local phase's
+  own time (cold model load + inference). The cloud *portion* was equal or
+  faster in local-explore mode (A 30 s vs 40 s, B 37 s vs 38 s, C 34 s vs
+  34 s) — the handoff's pointer to the right files means the cloud does less
+  wandering before its first useful tool call.
+- **Quality: 6/6 correct**, both modes, all three tasks (verified against
+  source, not just the model's word). No quality regression observed.
+
+## Misleading-exploration audit (the important part)
+
+The local model alone drifts on task C: 2 of 3 standalone local-phase runs
+claimed `IMPLEMENTED_TOOLS` at executor.ts:1466 (actual 1458),
+`EXECUTABLE_TOOL_NAMES` at prompt.ts:66 (actual 58), and claimed the
+reviewer/QA executor exposes *real* `codebase_search` (it is a stub there).
+Tasks A and B were essentially exact in all runs.
+
+**However, in every CLI local-explore run the cloud's final answer was
+correct** — the drift, when present in the handoff, was caught and
+corrected by the cloud, never propagated to a wrong final answer (task C
+local-explore gave 1458/58, matching cloud-only). The mitigations that made
+this hold: the handoff header's explicit "starting point to verify, not
+ground truth" framing, and the 400-char tool-result truncation marker
+("re-read the file yourself to verify") which pushes the cloud to re-read
+rather than trust line numbers.
+
+Caveat: n=3 tasks × 2 modes is a small sample, all "find the code" shaped.
+It does NOT establish that the mitigation always holds — especially for
+tasks where the cloud might trust rather than re-read, or where the local
+phase's 15-iteration bound runs out mid-exploration.
+
+## Verdict
+
+**Built, evaluated, not enabling by default.** Ship as opt-in (as shipped:
+`--local-explore` / `HEADLESSCODE_LOCAL_EXPLORE=1`, default off, zero
+behavior change when off — covered by unit test). The numbers show a real
+cost win with no quality regression in sample, but the +30–60% wall-clock
+increase is material on small sessions, the misleading-drift risk on line
+numbers is real (measured, mitigated, not eliminated), and the sample is
+too small to justify flipping a default. Re-evaluate if/when: (a) a larger
+run (real task corpus, both modes) shows the cloud-corrects-drift property
+holds reliably; or (b) the time cost matters less (long sessions where a
+22 s pre-pass amortizes) and the user opts in per-session.
+
+## Deviations from the spec
+
+1. Default `deepseek/deepseek-chat` is not routable on this key (404);
+   eval used `deepseek/deepseek-v4-flash-0731` instead — a same-family,
+   cheaper model. Does not affect the local phase; the harness default is
+   unchanged.
+2. The eval harness header references `plans/local-exploration.md`; the
+   actual file is `plans/local-explore-phase-experiment.md` — reference
+   fixed in `scripts/local-explore-eval.mjs`.
+3. No plan-doc changes to the shipped behavior: default stays off, per the
+   verdict above.

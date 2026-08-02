@@ -1332,10 +1332,11 @@ async function askFollowupQuestionHandler(args: Record<string, unknown>, ctx: To
 }
 
 /** Stub for vendored tools that the headless harness does not implement. */
-function stubHandler(name: string): ToolHandler {
+function stubHandler(name: string, implemented: readonly string[] = ["read_file", "write_to_file", "apply_diff", "search_replace", "edit_file", "execute_command", "list_files", "codebase_search"]): ToolHandler {
+	const available = [...implemented].sort().join(", ")
 	return () =>
 		err(
-			`Tool '${name}' is not implemented in the headless harness yet. Implemented tools: read_file, write_to_file, apply_diff, search_replace, edit_file, execute_command, list_files, codebase_search. Adapt and retry with one of those.`,
+			`Tool '${name}' is not implemented in the headless harness yet. Implemented tools: ${available}. Adapt and retry with one of those.`,
 		)
 }
 
@@ -1548,4 +1549,39 @@ export function createReadOnlyHeadlessExecutor(workspaceRoot: string, options: T
  */
 export function createQaHeadlessExecutor(workspaceRoot: string, options: ToolExecutorOptions = {}): ToolExecutor {
 	return createReadCommandExecutor(workspaceRoot, options)
+}
+
+/**
+ * Create the STRICTLY read-only executor for the opt-in local exploration
+ * phase (see src/engine/local-explore.ts): only read_file and list_files are
+ * real tools. attempt_completion is registered but its result is intercepted
+ * by the local loop as the explicit "I have enough, hand off" signal — it is
+ * NOT a real task completion. Every other tool — execute_command,
+ * codebase_search, every write tool, ask_followup_question, browser_action —
+ * is a stub.
+ *
+ * Deliberately narrower than createReadOnlyHeadlessExecutor (reviewer/QA),
+ * which includes execute_command: arbitrary command execution has real
+ * side-effect potential even without file writes, and this phase must be
+ * pure information-gathering. codebase_search is also absent ON PURPOSE: it
+ * needs the embedding model resident in VRAM at the same time the local
+ * exploration model is generating, the one coexistence the two-phase design
+ * avoids entirely (the cloud model gets full codebase_search access in its
+ * own turn, after the local phase is done).
+ */
+export function createLocalExploreExecutor(workspaceRoot: string, options: ToolExecutorOptions = {}): ToolExecutor {
+	const executor = new ToolExecutor(workspaceRoot, options)
+
+	executor.registerReadFile()
+	executor.register("list_files", listFilesHandler)
+	executor.register("attempt_completion", attemptCompletionHandler)
+
+	for (const name of VENDORED_TOOL_NAMES) {
+		if (executor.has(name)) {
+			continue
+		}
+		executor.register(name, stubHandler(name, ["read_file", "list_files", "attempt_completion"]))
+	}
+
+	return executor
 }

@@ -15,6 +15,7 @@ import { LocalMemoryStore } from "./memory/local.js"
 import type { MemoryStore } from "./memory/types.js"
 import { OpenRouterClient } from "./llm/openrouter.js"
 import { HeadlessSession } from "./engine/loop.js"
+import { isLocalExploreEnabled } from "./engine/local-explore.js"
 import { Logger } from "./engine/logger.js"
 import { buildSystemPrompt, loadCustomModes, selectToolsForMode } from "./engine/prompt.js"
 import { orchestrateMain } from "./orchestrator/cli.js"
@@ -91,6 +92,13 @@ interface CliOptions {
 	protectedFiles?: string
 	/** Permissions escape hatch: allow writes to protected files (default: false). */
 	allowProtectedWrites: boolean
+	/**
+	 * OPT-IN local exploration phase (default OFF): a bounded, read-only local
+	 * Ollama pass runs before the cloud model's first turn and folds its
+	 * findings into a labeled synthetic message. Also settable via
+	 * $HEADLESSCODE_LOCAL_EXPLORE. Experimental — see plans/local-exploration.md.
+	 */
+	localExplore: boolean
 }
 
 const USAGE = `headlesscode — headless coding-agent harness (Phase 1 engine)
@@ -200,10 +208,18 @@ Options:
                                "allowProtectedWrites": true in
                                .headlesscode/permissions.json
   --stream                   Opt-in SSE streaming (streaming-and-reasoning):
-                               stream token/reasoning deltas and emit
-                               llm_stream_chunk events for live-typing view.
-                               Default: OFF (blocking requests unchanged).
-                               Also settable via $HEADLESSCODE_STREAM
+                              stream token/reasoning deltas and emit
+                              llm_stream_chunk events for live-typing view.
+                              Default: OFF (blocking requests unchanged).
+                              Also settable via $HEADLESSCODE_STREAM
+  --local-explore            OPT-IN local exploration phase (experimental,
+                              default OFF): run a bounded, strictly read-only
+                              local Ollama pass (qwen3.5:9b — read_file +
+                              list_files only) before the cloud model's first
+                              turn and fold its findings into the cloud
+                              context as a labeled synthetic message. Fails
+                              open to cloud-only on any local error. Also
+                              settable via $HEADLESSCODE_LOCAL_EXPLORE
   --version                  Print version and exit
   --help                     Show this help and exit
 
@@ -220,6 +236,12 @@ Environment:
   HEADLESSCODE_PROTECTED_FILES    Default --protected-files (comma-separated globs)
   HEADLESSCODE_ALLOW_PROTECTED_WRITES  Allow protected-file writes ("1"/"true")
   HEADLESSCODE_STREAM          Opt-in SSE streaming ("1"/"true"/"yes"/"on")
+  HEADLESSCODE_LOCAL_EXPLORE   Opt-in local exploration phase ("1"/"true")
+  HEADLESSCODE_LOCAL_EXPLORE_MODEL    Local model (default qwen3.5:9b)
+  HEADLESSCODE_LOCAL_EXPLORE_MAX_ITERATIONS  Iteration cap (default 15)
+  HEADLESSCODE_LOCAL_EXPLORE_CONTEXT_TOKENS   Context-token budget (default 131072)
+  HEADLESSCODE_LOCAL_EXPLORE_TIMEOUT_MS       Per-call timeout ms (default 120000)
+  HEADLESSCODE_OLLAMA_URL      Ollama base URL (default http://localhost:11434)
 `
 
 export function parseArgs(argv: string[]): { options: CliOptions; error?: string } {
@@ -232,6 +254,7 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 		noCheckpoints: false,
 		allowProtectedWrites: false,
 		stream: false,
+		localExplore: false,
 	}
 
 	for (let i = 0; i < argv.length; i++) {
@@ -393,6 +416,9 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 				break
 			case "--stream":
 				options.stream = true
+				break
+			case "--local-explore":
+				options.localExplore = true
 				break
 			case "--checkpoint-dir": {
 				const value = next()
@@ -658,6 +684,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		decisionTimeoutMs,
 		maxPauseMs,
 		permissions,
+		// Opt-in local exploration phase (default OFF). Flag OR env var — the
+		// phase itself resolves the remaining HEADLESSCODE_LOCAL_EXPLORE_*
+		// defaults at call time. Any local failure fails open to cloud-only.
+		localExplore: options.localExplore || isLocalExploreEnabled(process.env),
 	})
 
 	const result = await session.run()
