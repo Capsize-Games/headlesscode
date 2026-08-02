@@ -23,7 +23,7 @@ import { watchMain } from "./watcher/cli.js"
 import { checkpointsMain } from "./checkpoints/cli.js"
 import { dashboardMain } from "./dashboard/cli.js"
 import { indexMain } from "./codesearch/cli.js"
-import { provisionMain } from "./github/cli.js"
+import { provisionMain, pushPrMain } from "./github/cli.js"
 import { resolvePermissions, type PermissionsConfig } from "./permissions/config.js"
 import { resolveModelForMode } from "./config/mode-models.js"
 
@@ -154,6 +154,13 @@ Subcommands:
               dir (token stripped from the remote URL), ready as a
               --workspace value. Also --list-repos <id>. See
               \`npx tsx src/cli.ts provision --help\` for full options.
+  headlesscode push-pr --installation-id <id> --owner <o> --repo <r> \\
+              --local-dir <path> --branch <name> --title <title> --body <text> [--base <branch>]
+              Push a local branch to a GitHub repo with the App installation
+              token (token scrubbed from .git/config immediately), then open
+              a pull request from it — never to the repo's default branch,
+              never auto-merged. See
+              \`npx tsx src/cli.ts push-pr --help\` for full options.
 
 Options:
   --mode <slug>              Mode to run in (built-in or from .roomodes). Default: code
@@ -537,6 +544,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// `--list-repos <id>` (see src/github/cli.ts + docs/github-app-setup.md).
 	if (argv[0] === "provision") {
 		return provisionMain(argv.slice(1))
+	}
+
+	// GitHub push-back subcommand: `headlesscode push-pr ...` — push a local
+	// branch to a repo the App installation can access (token scrubbed from
+	// .git/config immediately), then open a PR from it. The "write" half of
+	// provisioning (see src/github/cli.ts + docs/github-app-setup.md).
+	if (argv[0] === "push-pr") {
+		return pushPrMain(argv.slice(1))
 	}
 
 	const { options, error } = parseArgs(argv)
