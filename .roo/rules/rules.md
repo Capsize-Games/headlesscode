@@ -53,6 +53,25 @@ Before considering any change to `src/` done:
   self-contained (the agent reading it has no access to this
   conversation or any other planning context), and must not reference
   internal-only planning artifacts.
+- **A new tool is not done until something tells a model to reach for it.**
+  A tool's own schema description is not enough on its own — real usage
+  data has shown tools with good descriptions but no rules-file mention
+  going completely unused (the four code-intelligence tools, `outline`/
+  `go_to_definition`/`find_references`/`import_graph`, landed with solid
+  descriptions and got zero real adoption across multiple live sessions
+  until a short "prefer X over Y" section was added to
+  `.roo/rules-code/rules.md` — `codebase_search` got adopted specifically
+  because its own task required this and `outline`'s sibling tools didn't).
+  Any task that adds a tool intended for regular use must: (1) add a short,
+  scannable "prefer this over Y for Z" entry to the relevant `.roo/rules-*/
+  rules.md` file (follow the existing compact bullet-list format — do not
+  write a long prose section per tool, that doesn't scale as more tools are
+  added), and (2) verify in a real session that the guidance actually
+  changes behavior, not just that the tool works when called directly. A
+  tool that's genuinely meant to be optional/rare (used only when the model
+  specifically decides it's needed, not as a general preference) can skip
+  this — say so explicitly in the task file so it's a deliberate choice, not
+  an oversight.
 
 ## Never write to `/tmp`
 

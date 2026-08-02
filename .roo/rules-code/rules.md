@@ -18,6 +18,28 @@
   the cited anchor line) is still how you actually see the full code to
   understand and edit it.
 
+## Prefer code-intelligence tools over grep/read-and-scan
+
+TypeScript/JavaScript files only. Each of these beats the generic fallback
+next to it — reach for the specific tool, not the general one:
+
+- **Need a file's structure without reading it whole?** `outline` over a
+  full `read_file`.
+- **Need where a symbol is actually defined?** `go_to_definition` over
+  grep/`execute_command` text search — it's real compiler symbol
+  resolution, not a text match, so it's correct on overloads, re-exports,
+  and aliased imports where grep gives false hits or misses.
+- **Need every real usage site of a symbol (a rename/change impact
+  check)?** `find_references` over grep — same reasoning: grep finds text
+  matches, this finds actual references.
+- **Need a file's import/export relationships before editing it?**
+  `import_graph` over manually reading imports and cross-referencing by
+  hand.
+
+If a tool returns "not supported" (non-TS/JS file) or "could not resolve,"
+that's a real, final answer for that file/symbol — fall back to
+`read_file`/grep, don't retry.
+
 ## Once you have a line number, prefer `read_file`'s `indentation` mode
 
 - When a `codebase_search` result, grep match, error stack trace, or
