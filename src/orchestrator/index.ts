@@ -17,3 +17,15 @@ export type { ReviewOptions, ReviewResult } from "./reviewer.js"
 
 export { watchGroups, inspectGroup, tailLog, groupWorktreePath, DEFAULT_POLL_INTERVAL_MS, DEFAULT_STALL_TIMEOUT_MS } from "./watch.js"
 export type { WatchOptions, WatchSummary } from "./watch.js"
+
+export {
+	buildStatusSummary,
+	formatStatusText,
+	verdictLine,
+	waitForTerminalState,
+	isTerminalStatus,
+	TERMINAL_STATUSES,
+	DEFAULT_STATUS_POLL_INTERVAL_MS,
+	DEFAULT_STATUS_TIMEOUT_MS,
+} from "./status.js"
+export type { StatusSummary, StatusCounts, StatusGroupRow, WaitForTerminalOptions, WaitForTerminalResult } from "./status.js"

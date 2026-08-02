@@ -26,10 +26,19 @@ import { fileURLToPath } from "node:url"
 
 import { activeSessionCountForRepo, maxConcurrentSessionsFromEnv } from "../budget/concurrency.js"
 import { splitIssues, type SplitIssue, type WorktreeSpec } from "./split.js"
-import { loadState, saveState, updateGroup, type OrchestratorGroup, type OrchestratorState } from "./state.js"
+import { loadState, loadStateSync, saveState, updateGroup, type OrchestratorGroup, type OrchestratorState } from "./state.js"
 import { runReview, type ReviewResult } from "./reviewer.js"
 import { runQa } from "../qa/qa.js"
 import { groupWorktreePath, watchGroups } from "./watch.js"
+import {
+	buildStatusSummary,
+	formatStatusText,
+	verdictLine,
+	waitForTerminalState,
+	DEFAULT_STATUS_POLL_INTERVAL_MS,
+	DEFAULT_STATUS_TIMEOUT_MS,
+	type StatusSummary,
+} from "./status.js"
 import { resolveModelForMode } from "../config/mode-models.js"
 
 const ORCHESTRATE_USAGE = `headlesscode orchestrate — Phase 2 parallel round
@@ -724,9 +733,213 @@ function printPlan(
 /** Resolve this harness repo's root (parent of src/orchestrator). */
 const HARNESS_ROOT_TS = fileURLToPath(new URL("../..", import.meta.url))
 
+// ─── `orchestrate status` — read-side status / wait for EXTERNAL callers ────
+
+const STATUS_USAGE = `headlesscode orchestrate status — per-group status of a round, optionally waiting for it
+
+Usage:
+  headlesscode orchestrate status --repo <path> [--json]
+  headlesscode orchestrate status --repo <path> --wait [--timeout-ms <n>] [--json]
+
+Options:
+  --repo <path>          Target repo root whose .worktrees/.orchestrator-state.json
+                         is read (required). Pure read — never writes the file.
+  --wait                 Block inside this ONE call until every group reaches a
+                         terminal status (done|failed|needs-human; "blocked" is
+                         NOT terminal — it keeps waiting) or --timeout-ms elapses,
+                         then print the same summary plus a one-line verdict.
+  --timeout-ms <n>       Max --wait duration, ms (default: 7200000 = 2h, matching
+                         the watcher's stall guard — a round left non-terminal
+                         longer than that is flagged stalled anyway).
+  --poll-interval-ms <n> State-file poll interval for --wait, ms (default: 5000,
+                         matching the watcher's own write cadence).
+  --json                 Machine-readable output. One-shot: the raw
+                         OrchestratorState. With --wait: the final state plus
+                         top-level allDone/timedOut/verdict fields.
+  --help, -h             Show this help and exit.
+
+Exit codes:
+  0  one-shot: no group is failed/needs-human right now;
+     --wait: every group is done (clean finish)
+  1  one-shot: at least one group is failed or needs-human;
+     --wait: any group failed/needs-human, or the wait timed out
+  2  usage error (bad or missing arguments)
+`
+
+export interface StatusOptions {
+	repo: string
+	json: boolean
+	wait: boolean
+	timeoutMs: number
+	pollIntervalMs: number
+	help: boolean
+}
+
+export function parseStatusArgs(argv: string[]): { options: StatusOptions; error?: string } {
+	const options: StatusOptions = {
+		repo: "",
+		json: false,
+		wait: false,
+		timeoutMs: DEFAULT_STATUS_TIMEOUT_MS,
+		pollIntervalMs: DEFAULT_STATUS_POLL_INTERVAL_MS,
+		help: false,
+	}
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i]
+		const eq = arg.indexOf("=")
+		const flag = eq === -1 ? arg : arg.slice(0, eq)
+		const inlineValue = eq === -1 ? undefined : arg.slice(eq + 1)
+		const next = (): string | undefined => {
+			if (inlineValue !== undefined) {
+				return inlineValue
+			}
+			const v = argv[i + 1]
+			if (v === undefined || v.startsWith("--")) {
+				return undefined
+			}
+			i++
+			return v
+		}
+		switch (flag) {
+			case "--repo": {
+				const v = next()
+				if (v === undefined) {
+					return { options, error: "Missing value for --repo" }
+				}
+				options.repo = v
+				break
+			}
+			case "--json":
+				options.json = true
+				break
+			case "--wait":
+				options.wait = true
+				break
+			case "--timeout-ms": {
+				const v = next()
+				const n = v === undefined ? Number.NaN : Number(v)
+				if (!Number.isInteger(n) || n <= 0) {
+					return { options, error: "--timeout-ms requires a positive integer" }
+				}
+				options.timeoutMs = n
+				break
+			}
+			case "--poll-interval-ms": {
+				const v = next()
+				const n = v === undefined ? Number.NaN : Number(v)
+				if (!Number.isInteger(n) || n <= 0) {
+					return { options, error: "--poll-interval-ms requires a positive integer" }
+				}
+				options.pollIntervalMs = n
+				break
+			}
+			case "--help":
+			case "-h":
+				options.help = true
+				break
+			default:
+				return { options, error: `Unknown orchestrate status argument: ${arg}` }
+		}
+	}
+	return { options }
+}
+
+export interface StatusIo {
+	stdout?: (text: string) => void
+	stderr?: (text: string) => void
+}
+
+function waitExitCode(allDone: boolean, summary: StatusSummary): number {
+	// Nothing in the state file is not a failure — exit 0 so a caller that
+	// ran --wait against a wrong/empty path sees a clear, non-alarming result.
+	if (summary.counts.total === 0) {
+		return 0
+	}
+	if (allDone) {
+		return 0
+	}
+	// Reached here only when allDone is false: either the wait timed out with
+	// groups still non-terminal, or every group is terminal but at least one
+	// failed/needs-human. Both are non-clean outcomes → 1.
+	return 1
+}
+
+/**
+ * `headlesscode orchestrate status` entry point. One call, one result: the
+ * calling agent never re-invokes a tool per poll, unlike the bash loop this
+ * replaces.
+ */
+export async function statusMain(argv: string[], io: StatusIo = {}): Promise<number> {
+	const writeOut = io.stdout ?? ((text: string) => process.stdout.write(text))
+	const writeErr = io.stderr ?? ((text: string) => process.stderr.write(text))
+
+	const { options, error } = parseStatusArgs(argv)
+	if (error) {
+		writeErr(`headlesscode orchestrate status: ${error}\n\n${STATUS_USAGE}`)
+		return 2
+	}
+	if (options.help) {
+		writeOut(STATUS_USAGE)
+		return 0
+	}
+	if (!options.repo) {
+		writeErr(`headlesscode orchestrate status: --repo <path> is required\n\n${STATUS_USAGE}`)
+		return 2
+	}
+
+	const repo = path.resolve(options.repo)
+	const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
+
+	if (options.wait) {
+		const result = await waitForTerminalState(statePath, {
+			timeoutMs: options.timeoutMs,
+			pollIntervalMs: options.pollIntervalMs,
+		})
+		const summary = buildStatusSummary(result.state)
+		const verdict = verdictLine(summary, result.timedOut, result.allDone)
+		if (options.json) {
+			writeOut(JSON.stringify({ ...result.state, allDone: result.allDone, timedOut: result.timedOut, verdict }, null, 2) + "\n")
+		} else {
+			writeOut(
+				formatStatusText(summary, {
+					repo,
+					statePath,
+					timedOut: result.timedOut,
+					allDone: result.allDone,
+					elapsedMs: result.elapsedMs,
+				}),
+			)
+		}
+		return waitExitCode(result.allDone, summary)
+	}
+
+	// One-shot: read the current state, print it, exit on current health.
+	let state: OrchestratorState
+	try {
+		state = loadStateSync(statePath)
+	} catch (err) {
+		writeErr(
+			`headlesscode orchestrate status: cannot read state file ${statePath}: ${err instanceof Error ? err.message : String(err)}\n`,
+		)
+		return 1
+	}
+	const summary = buildStatusSummary(state)
+	if (options.json) {
+		writeOut(JSON.stringify(state, null, 2) + "\n")
+	} else {
+		writeOut(formatStatusText(summary, { repo, statePath }))
+	}
+	return summary.counts.failed > 0 || summary.counts.needsHuman > 0 ? 1 : 0
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 export async function orchestrateMain(argv: string[]): Promise<number> {
+	// Subcommand dispatch: `headlesscode orchestrate status ...` is the
+	// read-side status/wait command; everything else is the spawn+watch round.
+	if (argv[0] === "status") {
+		return statusMain(argv.slice(1))
+	}
 	const { options, error } = parseOrchestrateArgs(argv)
 	if (error) {
 		process.stderr.write(`headlesscode orchestrate: ${error}\n\n${ORCHESTRATE_USAGE}`)
