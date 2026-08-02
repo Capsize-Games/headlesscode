@@ -1,11 +1,11 @@
 /**
  * Tests for the opt-in local exploration phase (src/engine/local-explore.ts +
- * its HeadlessSession wiring in src/engine/loop.ts) — plans/local-exploration.md.
+ * its HeadlessSession wiring in src/engine/loop.ts) — plans/local-explore-phase-experiment.md.
  *
  * Plain assert-based script (no test framework, no network, no API key) run
  * via `npm test` → `tsx src/engine/__tests__/local-explore.test.ts`.
  *
- * Coverage per plans/local-exploration.md:
+ * Coverage per plans/local-explore-phase-experiment.md:
  *   - iteration cap enforcement (the phase stops at maxIterations);
  *   - context-budget cap enforcement, BOTH gates: stop before a request that
  *     would exceed the budget (pre-call) and stop when a huge tool result

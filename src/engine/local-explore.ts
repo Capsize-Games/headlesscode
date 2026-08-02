@@ -1,5 +1,5 @@
 /**
- * Opt-in LOCAL EXPLORATION PHASE (default OFF) — plans/local-exploration.md.
+ * Opt-in LOCAL EXPLORATION PHASE (default OFF) — plans/local-explore-phase-experiment.md.
  *
  * A bounded, strictly read-only local-model pass that runs BEFORE the cloud
  * model's first turn: a local Ollama model (default qwen3.5:9b) gets a

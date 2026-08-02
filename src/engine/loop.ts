@@ -234,7 +234,7 @@ export interface HeadlessSessionConfig {
 	eventHook?: (eventType: string, fields: Record<string, unknown>) => void
 	/**
 	 * OPT-IN local exploration phase (default OFF — see
-	 * plans/local-exploration.md): when truthy, HeadlessSession runs a
+	 * plans/local-explore-phase-experiment.md): when truthy, HeadlessSession runs a
 	 * bounded, strictly read-only local Ollama exploration pass (read_file +
 	 * list_files only) BEFORE its first cloud iteration and folds the
 	 * transcript into the cloud context as a clearly-labeled synthetic
@@ -527,7 +527,7 @@ export class HeadlessSession {
 		this.recallInfo = { recalledFacts: recall.recalledFacts, recalledSessions: recall.recalledSessions }
 
 		// 2bb. OPT-IN local exploration phase (default OFF, see
-		// plans/local-exploration.md): a bounded, read-only local Ollama pass
+		// plans/local-explore-phase-experiment.md): a bounded, read-only local Ollama pass
 		// runs BEFORE the cloud model's first turn. Its transcript is folded
 		// in as a clearly-labeled synthetic message at index 2 (after system +
 		// task) so the cloud model can tell it came from a preliminary local

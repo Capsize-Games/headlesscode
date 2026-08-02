@@ -96,7 +96,7 @@ interface CliOptions {
 	 * OPT-IN local exploration phase (default OFF): a bounded, read-only local
 	 * Ollama pass runs before the cloud model's first turn and folds its
 	 * findings into a labeled synthetic message. Also settable via
-	 * $HEADLESSCODE_LOCAL_EXPLORE. Experimental — see plans/local-exploration.md.
+	 * $HEADLESSCODE_LOCAL_EXPLORE. Experimental — see plans/local-explore-phase-experiment.md.
 	 */
 	localExplore: boolean
 }
