@@ -216,9 +216,9 @@ customModes:
       rework loop) reworked on a review finding up to the configured
       cycle cap. It can run a long time — if your shell tool has a
       timeout shorter than the round will take, launch it detached
-      instead (`nohup ... &`) and poll
-      `.worktrees/.orchestrator-state.json`, same as the direct path
-      below. Then go to **Step 3** (Monitor).
+      instead (`nohup ... &`) and check on it via `orchestrate status
+      --wait`, same as the direct path below. Then go to **Step 3**
+      (Monitor).
 
       ## Step 2 — Spawn (direct task-file path)
 
@@ -275,38 +275,30 @@ customModes:
 
       ## Step 3 — Monitor, don't babysit
 
-      Two failure modes to avoid, both wasteful for different reasons:
-      tight polling (a fresh `execute_command` + your own LLM turn every
-      few seconds — burns real tokens on nothing) and a single blind long
-      `sleep N` before checking anything (looks efficient but means a
-      `"blocked"` group can sit unanswered for up to the full N, and you
-      have zero visibility until the sleep ends even if everything
-      finished in the first 10 seconds).
-
-      Instead, use ONE `execute_command` per monitoring pass that loops
-      internally with short sleeps and exits the moment there's something
-      to act on — one tool call/turn covers a whole watch window, but you
-      react in ~20-30s, not minutes:
-      ```bash
-      for i in $(seq 1 20); do
-        STATE=$(node -e 'const s=JSON.parse(require("fs").readFileSync(".worktrees/.orchestrator-state.json","utf-8")); for (const g of s.groups) console.log(g.name, "|", g.status, "|", (g.blocked&&g.blocked.question)||"")')
-        echo "=== check $i ==="
-        echo "$STATE"
-        # Exit the loop early the moment ANY group needs attention or
-        # everything has reached a terminal status -- don't wait out the
-        # rest of the window once there's something to act on.
-        echo "$STATE" | grep -q "blocked" && { echo "BLOCKED — stopping to act"; break; }
-        echo "$STATE" | grep -qE "running|spawned" || { echo "all terminal — stopping"; break; }
-        sleep 20
-      done
+      Do NOT hand-roll a sleep-and-poll bash loop over
+      `.orchestrator-state.json` — that used to be the standard pattern
+      here and it was real, measured waste: one `execute_command` + your
+      own LLM turn per check, ~20 near-identical outputs dumped into your
+      context for a single wait. Use ONE call instead:
       ```
-      Adjust the loop count/sleep interval to the round's expected size
-      (a handful of small tasks vs. a large multi-hour round), but always
-      keep the interior sleep short (15-30s) and always break out early on
-      `blocked` or all-terminal — never let the loop run to completion
-      silently past something that needed a reaction. If the loop exits
-      because everything's still running with nothing to act on, just
-      call it again for the next watch window.
+      npx tsx src/cli.ts orchestrate status --repo $(pwd)          # one-shot
+      npx tsx src/cli.ts orchestrate status --repo $(pwd) --wait   # blocks until every group is terminal
+      ```
+      `--wait` blocks inside that single call (internal polling, no cost to
+      you per check) until every group reaches a terminal status (`done` /
+      `failed` / `needs-human` — `"blocked"` is deliberately NOT terminal,
+      so it keeps waiting) or `--timeout-ms` elapses (default 2h, matching
+      the watcher's own stall-guard timeout). Exit code 0 = every group
+      done cleanly; non-zero = any group failed/needs-human or the wait
+      timed out. Add `--json` for machine-readable output (`allDone` /
+      `timedOut` / `verdict` fields) if you need to branch on the result
+      without parsing text.
+
+      If you're actively monitoring a round for `"blocked"` groups you need
+      to answer promptly, bound `--timeout-ms` to something shorter than
+      the full 2h default (e.g. `--timeout-ms 300000` for a 5-minute
+      window) and re-run the wait after handling anything it surfaces —
+      still one call per window, not a per-second loop.
 
       For a running view of cost/tokens/cache-hit-rate across the round:
       ```

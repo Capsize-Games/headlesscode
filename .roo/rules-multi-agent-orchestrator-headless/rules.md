@@ -94,6 +94,26 @@ up and guessing. During that window, the group's status in
 Don't let a blocked group sit past its timeout unanswered if you're
 actively monitoring the round.
 
+## Checking round status — one call, not a poll loop
+
+Wait on a round with ONE command instead of hand-rolling a sleep-and-grep
+loop over `.orchestrator-state.json`/`harness.log`:
+
+```
+npx tsx src/cli.ts orchestrate status --repo $(pwd)          # one-shot
+npx tsx src/cli.ts orchestrate status --repo $(pwd) --wait   # blocks until every group is terminal
+```
+
+`--wait` blocks inside the single call until every group is terminal
+(`done` / `failed` / `needs-human` — `blocked` is deliberately NOT
+terminal, so a blocked group keeps the wait running), prints the per-group
+summary plus a one-line verdict, and exits 0 only when every group is done
+(non-zero = failed / needs-human / timed out). `--json` gives the same with
+top-level `allDone` / `timedOut` / `verdict` fields. While actively
+monitoring, bound the wait with a modest `--timeout-ms` (e.g. 30–60
+minutes) so you wake periodically to answer blocked questions instead of
+letting them sit; the default (2h) is right for a truly unattended wait.
+
 ## When YOU are the headless one
 
 If you are yourself running headlessly — no interactive session, started
