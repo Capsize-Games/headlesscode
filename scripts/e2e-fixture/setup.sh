@@ -123,6 +123,9 @@ cat > .roo/rules-code/rules.md <<'EOF'
 - MODE RULE (code): when fixing a bug, read the target file first, then patch
   it with write_to_file, then verify it with execute_command.
 - MODE RULE (code): never modify files outside the workspace.
+- MODE RULE (code): for orientation ("where is X" / "how does Y work"), try
+  codebase_search before whole-file reads; codebase_search complements
+  read_file — use search to locate, then read_file to inspect.
 EOF
 
 cat > .roo/rules/rules.md <<'EOF'

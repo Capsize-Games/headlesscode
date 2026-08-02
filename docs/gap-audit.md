@@ -50,14 +50,32 @@ client or subtask concept exists to gate — see below).
   (`src/engine/loop.ts`, search "Phase 1 sliding-window truncation"), not token-based
   summarize+merge condensation.
 - **No browser tool** — not present in the vendored native-tool set this harness exposes.
-## codebase_search — built
+## codebase_search — built and activated
 
 Implemented against a real OpenRouter embedding model (`qwen/qwen3-embedding-4b`, verified
 live), distinct from the Phase 3 memory embedder (`src/memory/embed.ts`, which only powers
 session/fact recall, not code search). See `src/codesearch/`. Requires an explicit
-`headlesscode index` run per workspace before it returns real results — not yet actually
-exercised in a real session as of 2026-08-01 (the index step and mode-prompt guidance to
-prefer it over blind `read_file` scanning are still open follow-ups).
+`headlesscode index` run per workspace before it returns real results.
+
+Activation (2026-08-01):
+- `headlesscode index --workspace .` was run against this repo and its worktrees; the
+  index is **generated on first use, never committed** — it is ~168MB for this repo
+  (3066 chunks × 2560-dim vectors), so it stays gitignored under
+  `/.headlesscode/`. Re-running the index is incremental: unchanged chunks are skipped
+  by content hash (a no-op re-index costs ~$0), so keeping it current is cheap.
+- `scripts/spawn-parallel-worktrees.sh` and `-gui.sh` now **copy the main repo's index
+  into each fresh worktree** (same gitignore rationale as the `zoo-code/` symlink), so a
+  worker never starts with a guaranteed "not indexed".
+- `.roo/rules-code/rules.md` tells `code`-mode workers to try `codebase_search` before
+  whole-file reads for orientation, to treat a "not indexed" result as a fallback signal
+  (not a retryable error), and that `codebase_search` complements (not replaces)
+  `read_file`.
+- Verified live (2026-08-01): a real `code`-mode session on "where is truncateHistory
+  and how does it handle tool_calls?" reached for `codebase_search` 6 times before any
+  whole-file read, then used a targeted `grep` + `read_file` to pin the exact lines.
+  `scripts/e2e-codesearch/run.sh` pins the behavior with a mock-LLM session (the mock
+  reads the system prompt and follows the guidance), so the activation is regression-
+  guarded offline too.
 
 - **No subtasks** (`new_task` stubbed) — previously deliberate ("multi-agent work is handled
   at the process level"), but the project owner has since confirmed wanting a real port of
