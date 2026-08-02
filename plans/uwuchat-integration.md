@@ -179,13 +179,28 @@ count varies a lot task to task) rather than a flat per-turn cost. Needed:
   plumbing should be built for real from the start, since that's the part
   that actually protects against runaway spend.
 
-### 2. Mode-routing dispatcher
+### 2. Code-mode toggle, NOT intent classification (revised 2026-08-02)
 
-`ToolCategory.CODE` is declared but nothing switches into it at runtime.
-Needed: real logic in (or alongside) `TOOL_CLASSIFICATION` that recognizes
-coding intent and enters architect mode, plus the actual state machine for
-architect → orchestrator handoff within one conversation (today `uwu` has no
-concept of "mode" that persists turn-to-turn beyond tool routing per-turn).
+Originally scoped as auto-detection via `TOOL_CLASSIFICATION` recognizing
+coding intent mid-conversation. **Simplified per project owner's direction**:
+for Tier 1, the admin explicitly toggles "Code Mode" on/off (a literal
+switch in the admin's session — could be as simple as a slash-command or a
+settings toggle in the client) rather than the bot inferring intent
+automatically. While the toggle is on, the admin's messages in that
+conversation drive the architect → orchestrator flow directly; nothing needs
+to guess whether a given message is "coding intent" or not. This is
+substantially less work than building classification logic and is the
+right choice given the stated priority (get Tier 1 running fast, single
+admin user, correctness of intent-detection isn't a real risk when the
+human explicitly opts in per-conversation).
+
+**This does not apply to Tier 2 at all.** The public-facing scoped code
+tools (quick site/script/bootstrapped-app templates) are just ordinary
+tools available to `uwu` like the existing `RESEARCH`-category tools —
+no mode concept, no toggle, no state machine. The bot reaches for a Tier 2
+tool the same way it reaches for a web-search tool: because the
+conversation calls for it, decided per-turn by ordinary tool-calling, not
+by switching into a persistent mode.
 
 ### 3. Decision-escalation → chat bridge
 
@@ -209,51 +224,111 @@ bundle it into this integration. Coding sessions can run without shared
 memory initially; `uwu`'s own rolling-summary memory of "we've been building
 X" is a reasonable enough starting context even without deep integration.
 
-### 5. Where headlesscode actually executes
+### 5. Where headlesscode actually executes (revised 2026-08-02 — real findings)
 
-Not yet decided: does `headlesscode orchestrate` run on the same
-infrastructure as uwuchat's backend (would need real compute provisioning —
-`src/cloud/` already has a Docker/Hetzner provider abstraction built for
-exactly this), or does it need to run somewhere the user has already
-authorized (their own machine, a project-specific sandbox)? This has real
-security implications (arbitrary code execution + `execute_command` on
-whatever host runs it) that need a decision before any of this ships, not
-just a technical wiring question.
+Verified state of `src/cloud/` (not the "Docker/Hetzner abstraction" this
+doc previously assumed — corrected):
 
-## Suggested build order (when Phase 2 actually starts)
+- **`src/cloud/provider.ts`**: `CloudProvider` interface (5-method session
+  lifecycle) + `LocalProcessProvider`, which just wraps the existing
+  `scripts/spawn-parallel-worktrees.sh`/`run-worker.sh` — local worktrees,
+  not remote compute. Also exports `hetznerDockerProviderSketch`, explicitly
+  `implemented: false` — **no live Hetzner code exists anywhere.**
+- **`src/cloud/docker-provider.ts`**: `DockerSessionProvider` is real and
+  working — shells out to the local `docker` CLI to run a session in a
+  resource-limited, read-only-rootfs container with a workspace bind mount.
+  This provisions a container **on whatever host runs the CLI**, not a
+  remote/cloud machine.
+- **Nothing is wired into `src/cli.ts`** — no `orchestrate`/`dashboard`
+  subcommand uses either provider today. It's a tested interface + a real
+  local-Docker primitive, not yet connected to anything.
 
-1. Code-credits accounting: balance tracking, real-time debit from
-   `.headlesscode/usage/*.jsonl`, hard stop at zero (foundational, blocks
-   everything else, no dependency on headlesscode internals besides the
-   usage-file format already shipping today). Admin-only manual top-up is
-   enough for launch; skip building a real purchase flow until this goes
-   beyond admin accounts.
-2. `ToolCategory.CODE` tools: an `architect` tool (produces a plan doc, calls
-   headlesscode's own LLM client with the system-owned key) and an
-   `orchestrator` tool (shells to `headlesscode orchestrate`).
-3. Mode-routing/handoff logic (`TOOL_CLASSIFICATION` → architect → auto-hand
-   to orchestrator within one conversation).
-4. Decision-escalation → chat bridge.
-5. Cost display UI (adapt `InlineCostBreakdown` pattern).
-6. Progress visualization UI (adapt `TurnFlowView`/`InlineFlowNodes`,
+**Given the stated priority (speed, single admin, don't over-engineer for
+scale not yet needed, but don't paint into a corner either):** the
+pragmatic near-term path is running headlesscode on a single
+admin-controlled host — reachable by uwuchat's backend, but NOT the same
+container/process as uwuchat's own production backend — using
+`DockerSessionProvider` for per-session isolation on that host (already
+built, already tested, no new provisioning code required for v1). This
+avoids building real multi-tenant/remote provisioning (Hetzner, dynamic
+machine spin-up) before it's needed, while `DockerSessionProvider`'s
+per-session container isolation is a genuine stepping stone toward real
+multi-tenant hosting later — not a dead end that has to be thrown away when
+Tier 1 eventually opens up (if it ever does; recall Tier 1 is scoped
+admin-only *indefinitely*, so this may never need to scale past one
+concurrent admin session in practice). Wiring `CloudProvider`/
+`DockerSessionProvider` into an actual `headlesscode orchestrate --remote`
+path (or equivalent) is real, scoped work, but small relative to building
+genuine remote compute provisioning from scratch.
+
+### 6. Pushing work back to GitHub — currently ZERO push/PR code exists
+
+Verified: `src/github/provision.ts`'s `provisionRepo()` only clones IN
+(`git clone` with an installation token, then immediately strips the token
+via `git remote set-url`) — there is no push, no branch creation on the
+remote, no PR creation anywhere in this codebase. `app-auth.ts`'s GitHub
+App auth (via `@octokit/auth-app`) is real, tested, and reusable for this —
+the missing piece is purely the "write back" half.
+
+Simplest real path for v1 (reuses the same installation-token pattern
+`provisionRepo` already uses, no new auth mechanism needed):
+
+- After a Tier 1 round completes, push the resulting branch back using the
+  installation token the same way `provisionRepo` used it for clone (a
+  `git push` with the token embedded transiently, stripped from
+  `.git/config` afterward exactly like the clone path already does).
+- **Push to a branch, not directly to the repo's default branch**, and open
+  a PR via GitHub's REST API (`POST /repos/{owner}/{repo}/pulls,`
+  straightforward with the same Octokit client already in use) rather than
+  auto-merging. This mirrors this project's own established Step 3.5
+  review-gate philosophy (nothing self-merges without a human/independent
+  check) and gives the admin a normal GitHub review surface for free,
+  without building any custom review UI into uwuchat itself.
+- This is real, bounded, near-term-buildable work — not a design question
+  like items 1/2/5 above, just not built yet.
+
+## Suggested build order (when Phase 2 actually starts, revised 2026-08-02)
+
+Reordered for speed: a single admin-controlled host running Docker, the
+code-mode toggle, and the GitHub push step are all small/bounded now that
+they're not design questions anymore — get an end-to-end path working fast,
+harden later.
+
+1. Single admin-controlled host (existing box is fine) with Docker
+   available; wire `DockerSessionProvider` into an actual
+   `headlesscode orchestrate` entry point uwuchat's backend can call
+   remotely (item 5). No Hetzner/multi-tenant work — deliberately deferred,
+   possibly indefinitely given Tier 1's admin-only scope.
+2. Code-mode toggle in the admin's `uwu` session (item 2) — no
+   classification logic, just an explicit on/off the admin controls.
+3. `ToolCategory.CODE` tools: an `architect` tool (produces a plan doc,
+   calls headlesscode's own LLM client with the system-owned key) and an
+   `orchestrator` tool (shells to `headlesscode orchestrate` on the host
+   from step 1).
+4. GitHub push-back (item 6): push branch + open PR via the installation
+   token, reusing `app-auth.ts`'s existing tested auth. Small, bounded,
+   no design questions left once written down here.
+5. Code-credits accounting: balance tracking, real-time debit from
+   `.headlesscode/usage/*.jsonl`, hard stop at zero. Admin-only manual
+   top-up is enough for launch — skip building a real purchase flow.
+6. Decision-escalation → chat bridge.
+7. Cost display UI (adapt `InlineCostBreakdown` pattern).
+8. Progress visualization UI (adapt `TurnFlowView`/`InlineFlowNodes`,
    possibly informed by whatever `plans/work-progress-visualization.md`
    ships in headlesscode's own dashboard first — reuse the classification
    logic, not just the visual pattern).
-7. Compute/execution-environment decision (where orchestrator rounds
-   actually run) — should be settled before step 2 ships to real users, but
-   can be prototyped locally first.
 
 ## Open questions for the project owner (resolve before dispatch)
 
-- Compute location for orchestrator rounds (item 5 above) — this is sharper
-  now that coding is admin-only: does it just run on the admin's own
-  machine/dev box for this phase (simplest, no hosted-execution security
-  design needed yet), or does it need to run on shared infra even for the
-  admin-only launch?
-- Per-round spend cap default and whether it's account-configurable or fixed
-  globally, and how code-credit top-up actually happens for the admin-only
-  phase (manual DB/admin-panel adjustment is probably enough to start).
-- Whether architect-mode output should always require explicit user
-  approval before auto-handing to orchestrator, or whether that handoff can
-  be automatic for small/low-risk plans (mirrors this project's own Step
-  2/3.5 significance-threshold judgment calls in `.roomodes`).
+- Which admin-controlled host actually runs step 1 — an existing box
+  already available, or does one need to be stood up? (Not a design
+  question anymore, just needs a concrete answer.)
+- Per-round spend cap default, and how code-credit top-up actually happens
+  for the admin-only phase (manual DB/admin-panel adjustment is probably
+  enough to start).
+- Whether Tier 1's architect-mode output should always require explicit
+  admin approval before auto-handing to orchestrator, or whether that
+  handoff can be automatic (mirrors this project's own Step 2/3.5
+  significance-threshold judgment calls in `.roomodes`) — lower-stakes now
+  than when this was scoped for a general user base, since the admin is
+  both the requester and the reviewer.
