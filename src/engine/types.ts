@@ -115,6 +115,24 @@ export interface ToolResult {
 	isError: boolean
 }
 
+/**
+ * Usage of one LLM call made OUTSIDE the main loop's request path — e.g. the
+ * cloud vision captioning in src/vision/describe.ts (browser screenshots and
+ * the `describe_image` tool). Auxiliary calls are recorded into the SAME
+ * BudgetTracker + running session totals as a main call (see
+ * recordAuxLlmUsage in src/engine/loop.ts), so their real token/cost shows up
+ * in the session's budget/usage accounting instead of being an untracked side
+ * channel. Shape mirrors the token counts of LlmResponse.usage.
+ */
+export interface AuxLlmUsage {
+	/** The model id the auxiliary call actually ran (echoed by the provider). */
+	model: string
+	inputTokens: number
+	outputTokens: number
+	/** Subset of inputTokens served from the provider's prompt cache. */
+	cachedTokens?: number
+}
+
 /** Per-call context handed to tool handlers. */
 export interface ToolContext {
 	workspaceRoot: string
@@ -162,6 +180,18 @@ export interface ToolContext {
 	 * session).
 	 */
 	onTodoEvent?: (fields: { todos: string; done: number; inProgress: number; pending: number }) => void
+	/**
+	 * Auxiliary LLM usage reporting (cloud vision captioning — see
+	 * src/vision/describe.ts): fired after every LLM call made outside the
+	 * main loop's request path, so the session can record its tokens/cost into
+	 * the same BudgetTracker + totals as a main call (see recordAuxLlmUsage in
+	 * src/engine/loop.ts). Absent when no hook was wired — plain executor use,
+	 * tests without a session. Its presence also gates the screenshot action's
+	 * auto-describe behavior (browser_action only captions screenshots when
+	 * attached to a real accounting session; bare executors skip the call and
+	 * the model can still use `describe_image` explicitly).
+	 */
+	onAuxLlmUsage?: (usage: AuxLlmUsage) => void
 }
 
 /** A tool handler: dispatch any registered tool by name. */

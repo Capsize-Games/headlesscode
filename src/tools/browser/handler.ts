@@ -21,17 +21,20 @@
  *     for teardown paths that skip dispose().
  *
  * Screenshot results are written to `<workspaceRoot>/.headlesscode/
- * browser-screenshots/<timestamp>.png` — the tool result is text-only, so the
- * model gets the file path + page title/URL and can read the PNG back via
- * read_file (see the caveat in tool.ts).
+ * browser-screenshots/<timestamp>.png` and the PNG is immediately described by
+ * the cloud vision captioner (src/vision/describe.ts), so the tool result
+ * carries a real TEXT description the main model can act on — no raw image
+ * ever reaches it. The file path stays in the result too, for callers that
+ * want the raw PNG.
  */
 
 import * as fsp from "node:fs/promises"
 import * as path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 
-import type { ToolContext, ToolResult } from "../../engine/types.js"
+import type { AuxLlmUsage, ToolContext, ToolResult } from "../../engine/types.js"
 import { resolveWithinWorkspace } from "../executor.js"
+import { describeImage, type DescribeImageResult } from "../../vision/describe.js"
 import {
 	BrowserSession,
 	MAX_BROWSER_EVENT_ENTRIES,
@@ -190,6 +193,20 @@ async function resolveScreenshotPath(workspaceRoot: string): Promise<string> {
 
 // ─── Handler ─────────────────────────────────────────────────────────────────
 
+/**
+ * The screenshot action's captioner, injectable for tests. Real sessions
+ * always use describeImage (src/vision/describe.ts); browser-action.test.ts
+ * swaps in a fake so the suite needs no network/API key.
+ */
+let visionCaptioner: (imagePath: string) => Promise<DescribeImageResult> = (imagePath) => describeImage(imagePath)
+
+/** Test seam: replace the screenshot captioner (see browser-action.test.ts). */
+export function setVisionCaptionerForTest(
+	captioner: (imagePath: string) => Promise<DescribeImageResult>,
+): void {
+	visionCaptioner = captioner
+}
+
 export async function browserActionHandler(
 	args: Record<string, unknown>,
 	ctx: ToolContext,
@@ -232,8 +249,29 @@ export async function browserActionHandler(
 					const target = await resolveScreenshotPath(ctx.workspaceRoot)
 					await fsp.writeFile(target, Buffer.from(base64, "base64"))
 					const desc = await session.describe()
-					return ok(`${desc}\nscreenshot saved to ${path.relative(ctx.workspaceRoot, target).toPosix()} (${target}) — ` +
-						`this harness's tool results are text-only, so the PNG was written to disk; read it back with read_file to view it`)
+					// Cloud vision captioning: the PNG never reaches the main
+					// model (deepseek-v4-flash is text-only), so describe it
+					// here and put a real text description in the result. Only
+					// when a real accounting session wired onAuxLlmUsage (cost
+					// flows through BudgetTracker); bare/read-only executors
+					// skip the call and keep the path so the model can still
+					// invoke describe_image explicitly.
+					let captionNote = ""
+					if (ctx.onAuxLlmUsage !== undefined) {
+						try {
+							const { description, usage } = await visionCaptioner(target)
+							ctx.onAuxLlmUsage(usage)
+							captionNote = `\nimage description: ${description}`
+						} catch (err) {
+							// Captioning is a bonus on top of the screenshot —
+							// a vision failure must never fail the screenshot
+							// itself, just say so and keep the file path.
+							captionNote = `\n[image description failed: ${err instanceof Error ? err.message : String(err)}]`
+						}
+					}
+					return ok(
+						`${desc}\nscreenshot saved to ${path.relative(ctx.workspaceRoot, target).toPosix()} (${target})${captionNote}`,
+					)
 				}
 
 				case "click": {

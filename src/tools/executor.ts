@@ -63,6 +63,7 @@ import "../vendor/zoo-code/src/utils/path.js"
 import { MultiSearchReplaceDiffStrategy } from "../vendor/zoo-code/src/core/diff/strategies/multi-search-replace.js"
 
 import { browserActionHandler, disposeBrowserSessions } from "./browser/handler.js"
+import { describeImageHandler } from "../vision/tool.js"
 import {
 	goToDefinitionHandler,
 	findReferencesHandler,
@@ -70,7 +71,7 @@ import {
 	outlineHandler,
 } from "../codeintel/handlers.js"
 
-import type { ToolContext, ToolHandler, ToolResult } from "../engine/types.js"
+import type { AuxLlmUsage, ToolContext, ToolHandler, ToolResult } from "../engine/types.js"
 import { checkCommand, type CommandRefusal } from "../permissions/commands.js"
 import {
 	OllamaOutputSummarizer,
@@ -120,12 +121,25 @@ export interface ToolExecutorOptions {
 	 * it on its event feed as `todo_updated`.
 	 */
 	onTodoEvent?: (fields: { todos: string; done: number; inProgress: number; pending: number }) => void
+	/**
+	 * Auxiliary LLM usage reporting (cloud vision captioning — see
+	 * src/vision/describe.ts). Wired by HeadlessSession right after it
+	 * constructs a BudgetTracker (same place as setBudgetClockHooks), so every
+	 * captioning call's tokens/cost lands in the SAME BudgetTracker + running
+	 * session totals as a main call — never an untracked side channel. Absent
+	 * for bare executors (tests, reviewer/QA) — which also disables the
+	 * screenshot action's automatic captioning, so an un-accounted executor
+	 * never spends money behind the session's back (the model can still call
+	 * `describe_image` explicitly).
+	 */
+	onAuxLlmUsage?: (usage: AuxLlmUsage) => void
 }
 
 export class ToolExecutor {
 	private readonly handlers = new Map<string, ToolHandler>()
 	private pauseBudgetClock: (() => void) | undefined
 	private resumeBudgetClock: (() => void) | undefined
+	private onAuxLlmUsage: ((usage: AuxLlmUsage) => void) | undefined
 	/**
 	 * Session-scoped read_file cache (see readFileCache below). One executor
 	 * serves one session, so per-instance state is exactly per-session state.
@@ -148,6 +162,7 @@ export class ToolExecutor {
 	) {
 		this.permissions =
 			options.permissions ?? resolvePermissions({ workspaceRoot: this.workspaceRoot, env: process.env })
+		this.onAuxLlmUsage = options.onAuxLlmUsage
 	}
 
 	register(name: string, handler: ToolHandler): void {
@@ -223,6 +238,9 @@ export class ToolExecutor {
 				resumeBudgetClock: this.resumeBudgetClock,
 				onDecisionEvent: this.options.onDecisionEvent,
 				onTodoEvent: this.options.onTodoEvent,
+				// Auxiliary LLM usage (cloud vision captioning): forwarded so
+				// handlers can report spend into the session's BudgetTracker.
+				onAuxLlmUsage: this.onAuxLlmUsage,
 			})
 		} catch (err) {
 			return {
@@ -1612,6 +1630,7 @@ const IMPLEMENTED_TOOLS = new Set([
 	"list_files",
 	"codebase_search",
 	"browser_action",
+	"describe_image",
 	"outline",
 	"go_to_definition",
 	"find_references",
@@ -1644,6 +1663,7 @@ export function createHeadlessExecutor(workspaceRoot: string, options: ToolExecu
 	executor.register("list_files", listFilesHandler)
 	executor.register("codebase_search", codebaseSearchHandler)
 	executor.register("browser_action", browserActionHandler)
+	executor.register("describe_image", describeImageHandler)
 	executor.register("outline", outlineHandler)
 	executor.register("go_to_definition", goToDefinitionHandler)
 	executor.register("find_references", findReferencesHandler)

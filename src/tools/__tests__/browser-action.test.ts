@@ -26,6 +26,9 @@ import { setTimeout as sleep } from "node:timers/promises"
 import { AddressInfo } from "node:net"
 
 import { createHeadlessExecutor } from "../executor.js"
+import { describeImage } from "../../vision/describe.js"
+import { setVisionCaptionerForTest } from "../browser/handler.js"
+import type { AuxLlmUsage } from "../../engine/types.js"
 
 /** The static page HTML served by the local test server. */
 const PAGE_HTML = `<!doctype html>
@@ -119,6 +122,11 @@ async function testLaunchScreenshotAndDescribe(): Promise<void> {
 		assert.equal(shot.isError, false, `screenshot must succeed, got: ${shot.content}`)
 		assert.match(shot.content, /screenshot saved to/, "must report the saved path")
 		assert.match(shot.content, /\.headlesscode\/browser-screenshots\//, "screenshot must live under .headlesscode/browser-screenshots/")
+		// Bare executor (no onAuxLlmUsage): automatic captioning must be
+		// skipped — an un-accounted executor never spends money behind the
+		// session's back, and no stale read-it-back text remains either.
+		assert.doesNotMatch(shot.content, /image description:/, "no onAuxLlmUsage -> no auto-caption")
+		assert.doesNotMatch(shot.content, /read it back with read_file/, "the stale read-it-back dead end must be gone")
 		const match = shot.content.match(/saved to ([^\s]+)/)
 		assert.ok(match, "could not extract the screenshot path from the result")
 		const pngPath = path.join(ws, match[1])
@@ -342,6 +350,67 @@ async function findChromiumPids(): Promise<number[]> {
 	return pids
 }
 
+// ─── (f) screenshot auto-captioning (cloud vision) ───────────────────────────
+
+async function testScreenshotAutoCaptionsForModel(): Promise<void> {
+	const server = await startTestServer()
+	const ws = await mkTmpWorkspace("hc-browser-caption-")
+	const used: string[] = []
+	const captions: AuxLlmUsage[] = []
+	try {
+		// Swap in a fake captioner — the real one (describeImage) would hit
+		// OpenRouter; the fake still exercises the full handler path: PNG path
+		// in, description + usage out, usage forwarded to the session.
+		setVisionCaptionerForTest(async (imagePath) => {
+			used.push(imagePath)
+			return {
+				description:
+					"A red error banner reads: Failed to load data: Cannot read properties of undefined (reading 'map') (fake caption).",
+				usage: { model: "google/gemma-3-12b-it", inputTokens: 321, outputTokens: 17 },
+			}
+		})
+
+		// A REAL accounting session wires onAuxLlmUsage (HeadlessSession does);
+		// the executor forwards it so the caption cost lands in the BudgetTracker.
+		const executor = createHeadlessExecutor(ws, { onAuxLlmUsage: (usage) => captions.push(usage) })
+		const url = `http://127.0.0.1:${server.port}/`
+		const launched = await executor.execute("browser_action", { action: "launch", url })
+		assert.equal(launched.isError, false, `launch must succeed, got: ${launched.content}`)
+
+		const shot = await executor.execute("browser_action", { action: "screenshot" })
+		assert.equal(shot.isError, false, `screenshot must succeed, got: ${shot.content}`)
+		assert.match(
+			shot.content,
+			/image description: A red error banner reads: Failed to load data/,
+			"the screenshot result must embed the real vision description",
+		)
+		assert.doesNotMatch(shot.content, /read it back with read_file/, "the stale read-it-back dead end must be gone")
+		assert.match(shot.content, /screenshot saved to/, "must keep the file path in the result")
+
+		// The captioner must be handed the actual saved PNG (absolute path under
+		// .headlesscode/browser-screenshots/).
+		assert.equal(used.length, 1, "screenshot must caption exactly once")
+		assert.ok(
+			used[0].includes("browser-screenshots") && used[0].endsWith(".png"),
+			`captioner must get the saved PNG path, got: ${used[0]}`,
+		)
+
+		// The caption's usage must reach the session's accounting hook exactly
+		// once, with the real numbers from the caption call.
+		assert.equal(captions.length, 1, "caption usage must be reported to the session")
+		assert.equal(captions[0].model, "google/gemma-3-12b-it")
+		assert.equal(captions[0].inputTokens, 321)
+		assert.equal(captions[0].outputTokens, 17)
+
+		await executor.dispose()
+	} finally {
+		// Restore the real captioner so this test never leaks into others.
+		setVisionCaptionerForTest((imagePath) => describeImage(imagePath))
+		await fs.rm(ws, { recursive: true, force: true })
+		await server.close()
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -350,6 +419,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["browser_action: bad selector + navigation failure are clear errors", testBadSelectorAndNavigationFailure],
 	["browser_action: hung action times out without hanging the session", testHungActionTimesOut],
 	["browser_action: session end (dispose) kills a still-open browser", testDisposeKillsOpenBrowser],
+	["browser_action: screenshot auto-captions via vision (description + usage)", testScreenshotAutoCaptionsForModel],
 ]
 
 async function main(): Promise<void> {
