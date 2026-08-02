@@ -2,6 +2,12 @@
 
 ## Status: architecture plan only — NOT scoped for dispatch yet
 
+**Scope note (2026-08-02, revised):** coding mode will be **admin-only for
+now**, not rolled out to the general user base. This removes the near-term
+urgency of a public billing/credits UI, but the underlying design below
+still assumes it'll eventually go wider, so the credit-system shape is worth
+getting right even though only an admin account will exercise it at first.
+
 This is Phase 2 of the "ditch VS Code" goal. Phase 1 (perfecting headlesscode's
 own dashboard/CLI interface, the browser-first workflow) comes first and is
 still in progress as of this writing. **Do not dispatch this plan to a worker
@@ -22,8 +28,8 @@ instead with `uwu` — uwuchat's system bot — in the uwuchat web UI. Concretel
    mode.
 3. `uwu` automatically hands that document to itself in **orchestrator
    mode**, which drives `headlesscode orchestrate` (the existing multi-agent
-   worktree orchestrator) against it, using the project's real BYOK
-   OpenRouter key.
+   worktree orchestrator) against it, using the system-owned OpenRouter key,
+   metered against the user's code-credit balance.
 4. Workers do the work headlessly, exactly as they do today.
 5. If a worker escalates a decision (`ask_followup_question`), the
    orchestrator tries to answer it autonomously first; if it genuinely can't,
@@ -60,35 +66,50 @@ Verified live in the uwuchat/airunner codebase (`~/Projects/airunner`,
 
 ## What's genuinely NOT built and would be new work
 
-### 1. BYOK infrastructure (the biggest real gap)
+### 1. A code-credits system (system-owned key, NOT BYOK)
 
-Verified: **zero BYOK mechanism exists anywhere in airunner/uwuchat.**
-Billing today is flat Stripe subscription tiers (`extensions/auth/server/
-stripe_routes.py`, `TIER_CAPS`/`TIER_DAILY_CAPS`/`TIER_DAILY_TOKEN_CAPS`)
-metered by counting `PipelineTokenUsage.call_chain_id` rows per tenant per
-period — turns/tokens against a single system-owned `OPENROUTER_API_KEY`.
-Coding mode needs a parallel, separate accounting model: real dollars against
-a user-supplied key, not turns against a shared quota. Needed:
+**BYOK was considered and rejected** (2026-08-02): routing coding calls
+through a user-supplied OpenRouter key means the raw requests are visible in
+THAT user's own OpenRouter dashboard/logs — including `uwu`'s system prompts,
+the architect/orchestrator prompt engineering, and anything else sent
+upstream. That's a real prompt-leak vector, not a hypothetical one, and it's
+unacceptable for the same reason the existing chat pipeline already keeps its
+system prompts off any user-visible surface. Coding mode uses the **same
+system-owned `OPENROUTER_API_KEY`** the rest of uwuchat already uses — the
+new piece is accounting for it separately from chat's flat-tier model, not a
+different key.
 
-- Secure BYOK key storage (encrypted at rest — `UserEncryptedText` pattern
-  already used for `AgentMemory.summary` is the established precedent to
-  follow, not invent a new encryption approach).
-- A settings UI toggle ("enable coding — bring your own OpenRouter key") with
-  key entry/validation (a real, cheap OpenRouter API call to confirm the key
-  works before saving, matching this project's "verify don't assume" ethos).
-- Coding-mode LLM calls must route through headlesscode's own client
-  construction (`src/llm/openrouter.ts` already exists) using the user's key,
-  NOT through `airunner_services`'s system-key pipeline — these are
-  structurally different call paths, not a config flag on the existing one.
-- A cost display reading headlesscode's own `.headlesscode/usage/*.jsonl`
-  (real $ per session/round) — parallel to `InlineCostBreakdown`, not sharing
-  its data source, since `pipeline_token_usage` rows don't apply to BYOK
-  calls at all.
-- Guardrails: a spending cap the user sets for coding specifically (distinct
-  from subscription tier caps), enforced by headlesscode's existing
-  `BudgetTracker`/`--max-cost-usd` (already built, currently opt-in via CLI
-  flag — this integration is a natural forcing function to make it always-on
-  for uwuchat-launched sessions).
+Verified: **zero credits/metered-spend mechanism exists anywhere in
+airunner/uwuchat today** — billing is flat Stripe subscription tiers
+(`extensions/auth/server/stripe_routes.py`, `TIER_CAPS`/`TIER_DAILY_CAPS`/
+`TIER_DAILY_TOKEN_CAPS`) metered by counting `PipelineTokenUsage.call_chain_id`
+rows per tenant per period — turns/tokens, not dollars, and no concept of a
+purchasable/decrementing balance. Coding mode needs a parallel accounting
+model: real dollar cost per session/round, debited against a credit balance,
+because unlike chat turns, a coding round's cost is open-ended (iteration
+count varies a lot task to task) rather than a flat per-turn cost. Needed:
+
+- A `code_credits` balance per account (or per-admin-account, given the
+  admin-only launch scope) — a purchasable/toppable-up balance, structurally
+  closer to a prepaid wallet than the existing tier-cap counters.
+- Real-time debiting from headlesscode's own `.headlesscode/usage/*.jsonl`
+  (already tracks real $ per session/round via `BudgetTracker`) — this is the
+  authoritative cost source; credits are debited from real measured spend,
+  not estimated up front.
+- A **hard stop**, not just a warning, when the balance hits zero — wire into
+  headlesscode's existing `BudgetTracker`/`--max-cost-usd` (already built,
+  currently opt-in via CLI flag — this integration is a natural forcing
+  function to make a cap always-on for uwuchat-launched sessions, sourced
+  from the remaining credit balance rather than a fixed CLI number).
+- A cost display reading `.headlesscode/usage/*.jsonl` — parallel to
+  `InlineCostBreakdown`, not sharing its data source, since
+  `pipeline_token_usage` rows are turn-counts against the flat-tier model and
+  don't represent real coding spend.
+- Because coding mode is admin-only for now, the purchase/top-up flow itself
+  can be minimal (a manual admin-only balance adjustment, not a real Stripe
+  product) until this goes wider — but the debiting/hard-stop/display
+  plumbing should be built for real from the start, since that's the part
+  that actually protects against runaway spend.
 
 ### 2. Mode-routing dispatcher
 
@@ -133,11 +154,15 @@ just a technical wiring question.
 
 ## Suggested build order (when Phase 2 actually starts)
 
-1. BYOK key storage + validation + settings toggle (foundational, blocks
-   everything else, no dependency on headlesscode internals).
+1. Code-credits accounting: balance tracking, real-time debit from
+   `.headlesscode/usage/*.jsonl`, hard stop at zero (foundational, blocks
+   everything else, no dependency on headlesscode internals besides the
+   usage-file format already shipping today). Admin-only manual top-up is
+   enough for launch; skip building a real purchase flow until this goes
+   beyond admin accounts.
 2. `ToolCategory.CODE` tools: an `architect` tool (produces a plan doc, calls
-   headlesscode's own LLM client with the BYOK key) and an `orchestrator`
-   tool (shells to `headlesscode orchestrate`).
+   headlesscode's own LLM client with the system-owned key) and an
+   `orchestrator` tool (shells to `headlesscode orchestrate`).
 3. Mode-routing/handoff logic (`TOOL_CLASSIFICATION` → architect → auto-hand
    to orchestrator within one conversation).
 4. Decision-escalation → chat bridge.
@@ -152,10 +177,14 @@ just a technical wiring question.
 
 ## Open questions for the project owner (resolve before dispatch)
 
-- Compute location for orchestrator rounds (item 5 above) — user's own
-  machine only, or hosted?
-- Per-round spend cap default and whether it's user-configurable per session
-  or only globally per account.
+- Compute location for orchestrator rounds (item 5 above) — this is sharper
+  now that coding is admin-only: does it just run on the admin's own
+  machine/dev box for this phase (simplest, no hosted-execution security
+  design needed yet), or does it need to run on shared infra even for the
+  admin-only launch?
+- Per-round spend cap default and whether it's account-configurable or fixed
+  globally, and how code-credit top-up actually happens for the admin-only
+  phase (manual DB/admin-panel adjustment is probably enough to start).
 - Whether architect-mode output should always require explicit user
   approval before auto-handing to orchestrator, or whether that handoff can
   be automatic for small/low-risk plans (mirrors this project's own Step
