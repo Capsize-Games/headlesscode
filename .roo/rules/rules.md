@@ -54,6 +54,36 @@ Before considering any change to `src/` done:
   conversation or any other planning context), and must not reference
   internal-only planning artifacts.
 
+## Never write to `/tmp`
+
+- Scratch/temporary files (throwaway test scripts, one-off data dumps,
+  intermediate output you don't need to keep) must go under
+  `<workspace_root>/.headlesscode/scratch/` (create it if it doesn't exist —
+  `/.headlesscode/` is already gitignored, so nothing there needs its own
+  ignore rule), never `/tmp` or any other path outside the workspace.
+- This is not a style preference: `/tmp` is outside the workspace root, so
+  any write there is an "outside-workspace" operation. In the interactive
+  VS Code GUI (Zoo Code's chat panel, including the real windows the
+  `multi-agent-orchestrator` mode spawns), outside-workspace writes cannot
+  be auto-approved — there is no toggle for it — so every `/tmp` write
+  blocks the session waiting for a human to click approve. A worker sitting
+  idle on an unattended approval prompt is functionally the same as a
+  crash. In headless workers, `write_to_file`/`apply_diff`/`search_replace`/
+  `edit_file` all hard-reject any path outside the workspace root
+  (`resolveWithinWorkspace` in `src/tools/executor.ts` throws
+  `PathTraversalError` — `/tmp/...` is never workspace-relative, so this
+  always fails). `execute_command` has no equivalent guard (it's a
+  command-string allow/deny list, not path-aware — see
+  `src/permissions/commands.ts`), so a shell redirect to `/tmp` currently
+  succeeds there even though every other write path rejects it — that
+  inconsistency is exactly how workers have been getting away with it.
+  There is no context in this project where writing to `/tmp` is correct;
+  don't rely on `execute_command` being the one path that happens to allow
+  it.
+- If you need a location that survives across your own multiple tool calls
+  within one task, `.headlesscode/scratch/` still works the same way —
+  it's just inside the workspace instead of outside it.
+
 ## Git worktrees
 
 Parallel work happens in git worktrees under `.worktrees/<name>/`
