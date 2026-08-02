@@ -122,6 +122,79 @@ export function renderPage(): string {
   .ev .trunc-note { color: GrayText; font-style: italic; }
   .feed-empty { color: GrayText; font-style: italic; padding: 12px 0; }
 
+  /* Detail view tabs: flat event log (original) vs. chat thread (this view).
+     Both render from the SAME /api/session/:id/events feed — the toggle only
+     switches how the already-arriving events are displayed. */
+  #detail .detail-tabs { display: flex; gap: 4px; padding: 0 16px; border-bottom: 1px solid color-mix(in srgb, CanvasText 12%, transparent); }
+  #detail .detail-tabs button {
+    font-size: 0.8rem; padding: 6px 14px; cursor: pointer;
+    border: none; background: none; color: GrayText; border-bottom: 2px solid transparent;
+  }
+  #detail .detail-tabs button.active { color: CanvasText; border-bottom-color: #8250df; font-weight: 600; }
+
+  /* Chat-thread view (phase: dashboard-chat-ui). Rendered client-side from the
+     same event feed — the model's text + its tool calls/results per turn, as
+     chat bubbles instead of flat rows. */
+  #chat {
+    display: none; max-height: 420px; overflow-y: auto; padding: 16px 16px 8px;
+    font-size: 0.85rem; line-height: 1.45;
+  }
+  #detail.view-chat #feed { display: none; }
+  #detail.view-chat #chat { display: block; }
+  #chat .chat-task {
+    border: 1px solid color-mix(in srgb, CanvasText 25%, transparent);
+    border-radius: 10px; padding: 8px 12px; margin-bottom: 14px;
+    background: color-mix(in srgb, CanvasText 5%, transparent);
+    white-space: pre-wrap; word-break: break-word;
+  }
+  #chat .chat-task .chat-task-label { font-size: 0.72rem; color: GrayText; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px; }
+  #chat .turn { margin-bottom: 16px; }
+  #chat .turn-head {
+    display: flex; align-items: center; gap: 8px; margin: 0 0 6px;
+    font-size: 0.72rem; color: GrayText; text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  #chat .turn-head .turn-iter { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #chat .bubble {
+    border: 1px solid color-mix(in srgb, #8250df 35%, transparent);
+    border-radius: 10px; padding: 10px 14px; margin-bottom: 8px;
+    background: color-mix(in srgb, #8250df 6%, transparent);
+    word-break: break-word; white-space: pre-wrap;
+  }
+  #chat .bubble .bubble-kicker { font-size: 0.72rem; color: #8250df; font-weight: 600; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.04em; }
+  #chat .bubble .bubble-kicker.error { color: #c0392b; }
+  #chat .bubble .bubble-kicker.ok { color: #1a7f37; }
+  #chat .tool-call {
+    display: flex; align-items: baseline; gap: 8px; margin: 8px 0 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.78rem;
+  }
+  #chat .tool-call .tool-name { color: #8250df; font-weight: 600; }
+  #chat .tool-call .tool-arg { color: GrayText; word-break: break-all; }
+  #chat .tool-result {
+    margin: 2px 0 6px 22px; padding: 6px 10px; border-left: 3px solid #1a7f37;
+    background: color-mix(in srgb, #1a7f37 6%, transparent);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem;
+    white-space: pre-wrap; word-break: break-word; color: color-mix(in srgb, CanvasText 85%, transparent);
+  }
+  #chat .tool-result.error { border-left-color: #c0392b; background: color-mix(in srgb, #c0392b 7%, transparent); }
+  #chat .tool-result .result-label { font-weight: 600; margin-bottom: 2px; }
+  #chat .tool-result.error .result-label { color: #c0392b; }
+  #chat .tool-result.ok .result-label { color: #1a7f37; }
+  #chat .trunc-note { color: GrayText; font-style: italic; font-size: 0.72rem; }
+  #chat .sys-marker {
+    display: flex; align-items: center; gap: 6px; margin: 10px 0;
+    font-size: 0.72rem; color: GrayText;
+  }
+  #chat .sys-marker .marker-label { font-weight: 600; }
+  #chat .sys-marker.checkpoint_saved .marker-label { color: #b8860b; }
+  #chat .sys-marker.paused .marker-label { color: #b8860b; }
+  #chat .sys-marker.resumed .marker-label { color: #1a7f37; }
+  #chat .sys-marker.decision_answered .marker-label { color: #1a7f37; }
+  #chat .sys-marker.decision_blocked .marker-label { color: #c0392b; }
+  #chat .sys-marker.llm_error .marker-label { color: #c0392b; }
+  #chat .sys-marker.session_end .marker-label { color: GrayText; }
+  #chat .chat-empty { color: GrayText; font-style: italic; padding: 12px 0; }
+  #chat .chat-err { color: #c0392b; padding: 12px 0; }
+
   /* Inline decision-answer box (browser control plane): rendered in the feed
      right after a decision_blocked event with no matching decision_answered
      yet, so the human answers right where they see the question. */
@@ -191,7 +264,12 @@ export function renderPage(): string {
       </span>
       <button class="close" id="detailClose" title="close">✕</button>
     </div>
+    <div class="detail-tabs">
+      <button id="tabLog" class="active">Event log</button>
+      <button id="tabChat">Chat thread</button>
+    </div>
     <div id="feed"><div class="feed-empty">select a session to watch its live event feed</div></div>
+    <div id="chat"><div class="chat-empty">select a session to watch its live event feed</div></div>
   </div>
 
   <div id="error"></div>
@@ -228,16 +306,18 @@ let detail = null; // { sessionId, source, nextOffset, lastEventCount, userScrol
 
 function openDetail(sessionId, source, status) {
   closeDetail();
-  detail = { sessionId, source, nextOffset: 0, lastEventCount: 0, userScrolledUp: false, status };
+  detail = { sessionId, source, nextOffset: 0, lastEventCount: 0, userScrolledUp: false, status, allEvents: [], view: "chat" };
   document.getElementById("detail").style.display = "block";
   document.getElementById("detailSessionId").textContent = sessionId;
   document.getElementById("detailSource").textContent = "· " + (source || "");
   updateDetailControls();
   const feed = document.getElementById("feed");
   feed.innerHTML = '<div class="feed-empty">loading events…</div>';
+  document.getElementById("chat").innerHTML = '<div class="chat-empty">loading events…</div>';
   // Reset scroll-tracking state for the new session.
   detail.userScrolledUp = false;
   feed.scrollTop = 0;
+  setView(detail.view);
   pollEvents();
 }
 
@@ -314,7 +394,12 @@ function renderEvent(e) {
   const div = document.createElement("div");
   div.className = "ev " + esc(e.type) + (e.isError ? " is-error" : "");
   div.dataset.ts = e.ts || "";
-  div.innerHTML = '<span class="ev-ts">' + esc(e.ts) + "</span><span class=\"ev-body\">" + iter + '<span class="ev-label">' + esc(label) + "</span> " + body + "</span>";
+  // NOTE: the ev-body class is built with a variable to avoid a backslash-quote
+  // escape INSIDE this page's outer template literal — \" in a template literal
+  // is unescaped at runtime to a bare quote, which would break the served JS
+  // (pre-existing bug fixed here; the flat log must keep working).
+  const evBodyClass = "ev-body";
+  div.innerHTML = '<span class="ev-ts">' + esc(e.ts) + "</span><span class=" + evBodyClass + ">" + iter + '<span class="ev-label">' + esc(label) + "</span> " + body + "</span>";
   return div;
 }
 
@@ -334,12 +419,18 @@ async function pollEvents() {
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
     const feed = document.getElementById("feed");
-    if (detail.lastEventCount === 0 && (!data.events || data.events.length === 0)) {
+    const newEvents = data.events || [];
+    // Accumulate the full feed: the chat view groups events into turns, so it
+    // needs everything seen so far, not just the incremental slice. The flat
+    // event-log view still appends incrementally as before.
+    detail.allEvents = (detail.allEvents || []).concat(newEvents);
+    if (detail.lastEventCount === 0 && newEvents.length === 0) {
       feed.innerHTML = '<div class="feed-empty">no events yet — waiting for the worker…</div>';
+      renderChat();
     } else {
       const shouldScroll = feedAutoScrolls();
       if (feed.querySelector(".feed-empty")) feed.innerHTML = "";
-      for (const e of data.events || []) {
+      for (const e of newEvents) {
         feed.appendChild(renderEvent(e));
         // Browser control plane: if this is a decision_blocked and no
         // matching decision_answered has arrived yet, render the inline
@@ -348,12 +439,13 @@ async function pollEvents() {
           renderAnswerBox(feed, e);
         }
       }
-      detail.lastEventCount = (detail.lastEventCount || 0) + (data.events || []).length;
+      detail.lastEventCount = (detail.lastEventCount || 0) + newEvents.length;
       if (shouldScroll) feed.scrollTop = feed.scrollHeight;
+      renderChat();
     }
     detail.nextOffset = data.nextOffset;
     // Derive running/paused state from the feed (the summary row may lag).
-    const types = (data.events || []).map((e) => e.type);
+    const types = newEvents.map((e) => e.type);
     if (types.includes("paused")) detail.paused = true;
     if (types.includes("resumed")) detail.paused = false;
     if (types.includes("session_end")) { detail.status = "done"; detail.paused = false; }
@@ -382,6 +474,251 @@ async function controlSession(action) {
   if (action === "pause") detail.paused = true;
   if (action === "resume") detail.paused = false;
   updateDetailControls();
+}
+
+// ── Chat-thread view (dashboard-chat-ui) ────────────────────────────────────
+// Groups the SAME event feed data into conversation turns (see the grouping
+// rules in src/dashboard/chat-thread.ts) and renders them as chat bubbles:
+// the user's task, then per turn the assistant's text + its tool calls and
+// their results inline, with system-level events as small markers. The flat
+// event-log view (renderEvent above) remains available via the tab toggle.
+// This is client-side-only rendering of data that's already arriving via the
+// existing poll — no new backend source.
+
+// Short arg summary for a tool call, matching the server-side summarizeToolArg
+// style (the feed already carries this as "args"; cap here for safety).
+function chatSummaryArg(e) {
+  if (!e || e.type !== "tool_call") return "";
+  const raw = String(e.args || "");
+  const trimmed = raw.trim();
+  if (trimmed.length <= 80) return trimmed;
+  return trimmed.slice(0, 80) + "…";
+}
+
+function setView(view) {
+  if (!detail) return;
+  detail.view = view;
+  const detailEl = document.getElementById("detail");
+  detailEl.classList.toggle("view-chat", view === "chat");
+  document.getElementById("tabLog").classList.toggle("active", view === "log");
+  document.getElementById("tabChat").classList.toggle("active", view === "chat");
+}
+
+// Render one chat "turn" block: the model's text bubble (plus a reasoning
+// bubble if streaming-and-reasoning has landed and the feed carries one),
+// then its tool calls and results inline.
+function renderChatTurn(turn) {
+  const wrap = document.createElement("div");
+  wrap.className = "turn";
+
+  const head = document.createElement("div");
+  head.className = "turn-head";
+  const ts = turn.turnStart.ts || "";
+  const headText = (turn.turnStart.type === "decision_blocked")
+    ? "⛔ question"
+    : "iteration " + (typeof turn.iteration === "number" ? turn.iteration : "?");
+  head.innerHTML = '<span class="turn-iter">' + esc(headText) + "</span><span>" + esc(ts) + "</span>";
+  wrap.appendChild(head);
+
+  for (const e of turn.events) {
+    if (e.type === "llm_response") {
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      const reasoning = typeof e.reasoning === "string" && e.reasoning ? e.reasoning : "";
+      const text = typeof e.textPreview === "string" ? e.textPreview : "";
+      const toks = typeof e.inputTokens === "number"
+        ? '<div class="trunc-note">in=' + esc(e.inputTokens) + " · out=" + esc(e.outputTokens ?? 0) + " · cached=" + esc(e.cachedTokens ?? 0) + "</div>"
+        : "";
+      if (reasoning) {
+        bubble.innerHTML =
+          '<div class="bubble-kicker">thinking</div><div>' + esc(reasoning) + "</div>" +
+          (text ? '<div style="margin-top:8px">' + esc(text) + "</div>" : "") + toks;
+      } else if (text) {
+        bubble.innerHTML = '<div>' + esc(text) + "</div>" + toks;
+      } else {
+        bubble.innerHTML = '<div class="trunc-note">(tool-call turn — no text)</div>' + toks;
+      }
+      if (e.textTruncated) {
+        bubble.appendChild(elTruncNote());
+      }
+      wrap.appendChild(bubble);
+    } else if (e.type === "decision_answered") {
+      // The answer to a blocked question: inline in the turn that asked it.
+      const marker = document.createElement("div");
+      marker.className = "sys-marker decision_answered";
+      marker.innerHTML = '<span class="marker-label">💬 answer</span><span>' + esc(e.timedOut ? "timed out — worker moved on autonomously" : (e.answer || "")) + "</span>";
+      wrap.appendChild(marker);
+    } else if (e.type === "tool_call") {
+      const call = document.createElement("div");
+      call.className = "tool-call";
+      const arg = chatSummaryArg(e);
+      call.innerHTML = '<span class="tool-name">' + esc(e.tool) + "</span>" + (arg ? '<span class="tool-arg">' + esc(arg) + "</span>" : "") + (e.argsTruncated ? ' <span class="trunc-note">(truncated)</span>' : "");
+      wrap.appendChild(call);
+    } else if (e.type === "tool_result") {
+      const res = document.createElement("div");
+      res.className = "tool-result" + (e.isError ? " error" : " ok");
+      const label = (e.isError ? "⚠ error" : "✓ result") + (e.tool ? " · " + esc(e.tool) : "");
+      const content = String(e.result || "");
+      res.innerHTML = '<div class="result-label">' + label + "</div>" + (content ? "<div>" + esc(content) + "</div>" : "") + (e.resultTruncated ? '<div class="trunc-note">(truncated)</div>' : "");
+      wrap.appendChild(res);
+    } else {
+      // Unknown event inside a turn: fall back to a system marker.
+      wrap.appendChild(renderChatSystem(e));
+    }
+  }
+  return wrap;
+}
+
+function elTruncNote() {
+  const d = document.createElement("div");
+  d.className = "trunc-note";
+  d.textContent = "(truncated)";
+  return d;
+}
+
+// Render a system-level event as a small inline marker, not a chat bubble.
+function renderChatSystem(e) {
+  const marker = document.createElement("div");
+  marker.className = "sys-marker " + esc(e.type);
+  const labels = {
+    session_start: "🚀 session start",
+    checkpoint_saved: "📸 checkpoint",
+    paused: "⏸ paused",
+    resumed: "▶ resumed",
+    llm_error: "💥 llm error",
+    decision_blocked: "⛔ blocked (question)",
+    session_end: "🏁 session end",
+  };
+  const label = labels[e.type] || e.type;
+  let body = "";
+  switch (e.type) {
+    case "checkpoint_saved":
+      body = e.iteration === 0 ? "baseline" : "after iteration " + esc(e.iteration);
+      break;
+    case "paused":
+    case "resumed":
+      body = e.reason ? esc(e.reason) : "";
+      break;
+    case "llm_error":
+      body = esc(String(e.message || e.error || ""));
+      break;
+    case "session_start":
+      body = esc(e.mode || "") + " · " + esc(e.model || "");
+      break;
+    case "session_end":
+      body = "status=" + esc(e.status) + " · iterations=" + esc(e.iterations) + " · cost=" + fmtCost(e.costUsd);
+      break;
+    case "decision_blocked":
+      body = esc(e.question || "") + (e.suggestions && e.suggestions.length ? " · suggestions: " + esc(e.suggestions.join(" | ")) : "");
+      break;
+    default:
+      body = esc(JSON.stringify(e).slice(0, 200));
+  }
+  marker.innerHTML = '<span class="marker-label">' + esc(label) + "</span>" + (body ? "<span>" + body + "</span>" : "");
+  return marker;
+}
+
+// Re-render the whole chat thread from the accumulated event feed. Called on
+// every poll (the feed arrives incrementally, but grouping is order-dependent
+// — a turn only becomes complete once its final tool_result lands, so
+// re-grouping from scratch is the simplest correct approach).
+function renderChat() {
+  if (!detail) return;
+  const chat = document.getElementById("chat");
+  const events = detail.allEvents || [];
+  if (events.length === 0) {
+    chat.innerHTML = '<div class="chat-empty">no events yet — waiting for the worker…</div>';
+    return;
+  }
+  const shouldScroll = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 40;
+  chat.innerHTML = "";
+
+  // Task bubble (the user's message) when the feed has a session_start.
+  const start = events.find((e) => e.type === "session_start");
+  if (start && typeof start.task === "string" && start.task) {
+    const task = document.createElement("div");
+    task.className = "chat-task";
+    task.innerHTML = '<div class="chat-task-label">task</div><div>' + esc(start.task) + "</div>" + (start.taskTruncated ? '<div class="trunc-note">(truncated)</div>' : "");
+    chat.appendChild(task);
+  }
+
+  // Group + render. Mirrors src/dashboard/chat-thread.ts's grouping rules
+  // (kept as pure TS there + unit-tested; this inline copy is the page's
+  // no-build-step vanilla-JS rendition of the same rules).
+  const blocks = groupEvents(events);
+  for (const block of blocks) {
+    if (block.kind === "turn") {
+      chat.appendChild(renderChatTurn(block));
+    } else {
+      chat.appendChild(renderChatSystem(block.event));
+    }
+  }
+  if (shouldScroll) chat.scrollTop = chat.scrollHeight;
+}
+
+// Group a flat event array into chat blocks — inline JS twin of the tested
+// pure function in src/dashboard/chat-thread.ts (this page has no build step,
+// so the grouping is duplicated rather than imported).
+function groupEvents(events) {
+  const blocks = [];
+  let task = "";
+  let current = null;
+  const closeTurn = () => {
+    if (current) {
+      blocks.push({ kind: "turn", iteration: current.iteration, turnStart: current.turnStart, events: current.events });
+      current = null;
+    }
+  };
+  for (const e of events) {
+    switch (e.type) {
+      case "session_start":
+        task = typeof e.task === "string" ? e.task : "";
+        blocks.push({ kind: "system", event: e });
+        break;
+      case "iteration_start":
+        closeTurn();
+        current = { iteration: e.iteration, turnStart: e, events: [] };
+        break;
+      case "decision_blocked":
+        closeTurn();
+        current = { iteration: e.iteration, turnStart: e, events: [] };
+        break;
+      case "tool_result": {
+        if (current && current.events.length > 0) {
+          const last = current.events[current.events.length - 1];
+          if (last.type === "tool_call") {
+            current.events.push(e);
+            break;
+          }
+        }
+        blocks.push({ kind: "system", event: e });
+        break;
+      }
+      case "session_end":
+      case "llm_error":
+      case "checkpoint_saved":
+      case "paused":
+      case "resumed":
+        closeTurn();
+        blocks.push({ kind: "system", event: e });
+        break;
+      case "llm_response":
+      case "tool_call":
+      case "decision_answered":
+        if (current) {
+          current.events.push(e);
+        } else {
+          blocks.push({ kind: "system", event: e });
+        }
+        break;
+      default:
+        closeTurn();
+        blocks.push({ kind: "system", event: e });
+        break;
+    }
+  }
+  closeTurn();
+  return blocks;
 }
 
 function renderTotals(totals) {
@@ -842,6 +1179,9 @@ document.getElementById("detailClose").addEventListener("click", closeDetail);
 document.getElementById("btnPause").addEventListener("click", () => controlSession("pause"));
 document.getElementById("btnResume").addEventListener("click", () => controlSession("resume"));
 document.getElementById("btnStart").addEventListener("click", startSession);
+// Chat-thread vs. flat event-log toggle: both render the same feed data.
+document.getElementById("tabLog").addEventListener("click", () => setView("log"));
+document.getElementById("tabChat").addEventListener("click", () => setView("chat"));
 // Enter in the task box submits too (shift+enter for a newline).
 document.getElementById("launchTask").addEventListener("keydown", (ev) => {
   if (ev.key === "Enter" && !ev.shiftKey) {
