@@ -36,6 +36,7 @@ import { getNativeTools } from "../vendor/zoo-code/src/core/prompts/tools/native
 import { getGroupName, getModeBySlug, modes, getToolsForMode } from "../vendor/zoo-code/src/shared/modes.js"
 import { TOOL_GROUPS } from "../vendor/zoo-code/src/shared/tools.js"
 import { customModesSettingsSchema } from "../vendor/zoo-code/types/index.js"
+import { browserActionTool } from "../tools/browser/tool.js"
 import type { ModeConfig } from "@roo-code/types"
 
 import type { ChatTool } from "./types.js"
@@ -262,6 +263,10 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions): Prom
  * (`EXECUTABLE_TOOL_NAMES`). Stub-only tools (apply_diff, search_files, …) are
  * NOT advertised to the model, so it doesn't waste turns calling unimplemented
  * tools; they remain registered in the executor purely as a safety net.
+ *
+ * NOTE (browser_action): this tool is NOT part of the vendored tool set, so
+ * it can't be selected here — callers append it explicitly via
+ * appendBrowserActionTool (see below).
  */
 export function selectToolsForMode(mode: string, customModes: ModeConfig[] = []): ChatTool[] {
 	const modeConfig = getModeBySlug(mode, customModes) ?? modes.find((m) => m.slug === mode) ?? modes[0]
@@ -296,4 +301,19 @@ export function selectToolsForMode(mode: string, customModes: ModeConfig[] = [])
 	}
 
 	return selected
+}
+
+/**
+	* Append the `browser_action` tool schema to a tool list if it isn't already
+	* present. `browser_action` is NOT a vendored Zoo Code tool (it's new work —
+	* see src/tools/browser/tool.ts), so it never appears in getNativeTools() and
+	* selectToolsForMode() can't pick it up; callers that want the model to be
+	* able to launch a browser (headless + QA sessions) append it explicitly.
+	* Appending rather than replacing keeps the mode's own tool filtering intact.
+	*/
+export function appendBrowserActionTool(tools: ChatTool[]): ChatTool[] {
+	if (tools.some((t) => t.type === "function" && t.function.name === browserActionTool.function.name)) {
+		return tools
+	}
+	return [...tools, browserActionTool as unknown as ChatTool]
 }

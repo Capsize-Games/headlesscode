@@ -50,7 +50,7 @@ import { recordSessionUsage, removeLiveUsage, writeLiveUsage } from "./usage.js"
 import { EventFeed, EVENT_TRUNCATE_CHARS, truncateField } from "./events.js"
 import { Logger } from "./logger.js"
 import { parseToolCalls } from "./parser.js"
-import { buildSystemPrompt, loadCustomModes, selectToolsForMode } from "./prompt.js"
+import { appendBrowserActionTool, buildSystemPrompt, loadCustomModes, selectToolsForMode } from "./prompt.js"
 import type { ChatMessage, ChatTool, LlmClient, SessionResult, SessionBudgetUsage } from "./types.js"
 import type { ModeConfig } from "@roo-code/types"
 
@@ -385,7 +385,10 @@ export class HeadlessSession {
 				customModes,
 				globalCustomInstructions: this.config.globalCustomInstructions,
 			})).prompt
-		const tools = this.config.tools ?? selectToolsForMode(mode, customModes)
+		// browser_action is not part of the vendored tool set, so
+		// selectToolsForMode can't include it — append it explicitly so the
+		// model can launch a browser mid-session (see src/tools/browser/).
+		const tools = appendBrowserActionTool(this.config.tools ?? selectToolsForMode(mode, customModes))
 
 		this.state.systemPrompt = systemPrompt
 		this.state.tools = tools

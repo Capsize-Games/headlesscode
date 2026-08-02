@@ -12,6 +12,9 @@
  *   - edit_file         { file_path, old_string, new_string, expected_replacements? }
  *   - execute_command   { command, cwd?, timeout? }
  *   - list_files        { path?, recursive? }
+ *   - browser_action    { action, url?, selector?, text? } — Playwright-backed
+ *     headless browser inspection (launch/screenshot/click/type/getConsoleLogs/
+ *     getNetworkErrors/close); NEW work, no upstream port (see src/tools/browser/).
  *
  * Every file operation resolves relative to the configured workspace root and
  * is rejected if it escapes the workspace (path-traversal guard). Results are
@@ -42,6 +45,8 @@ import { setTimeout as sleep } from "node:timers/promises"
 import "../vendor/zoo-code/src/utils/path.js"
 
 import { MultiSearchReplaceDiffStrategy } from "../vendor/zoo-code/src/core/diff/strategies/multi-search-replace.js"
+
+import { browserActionHandler, disposeBrowserSessions } from "./browser/handler.js"
 
 import type { ToolContext, ToolHandler, ToolResult } from "../engine/types.js"
 import { checkCommand, type CommandRefusal } from "../permissions/commands.js"
@@ -166,7 +171,10 @@ export class ToolExecutor {
 
 	/**
 		* Session teardown: hard-kill any execute_command children that a timeout
-		* left running in the background (see executeCommandHandler). A single tool
+		* left running in the background (see executeCommandHandler), AND close
+		* any launched browser (see disposeBrowserSessions — a model may never
+		* call browser_action's close(), so the browser is torn down here at true
+		* session end, exactly like the backgrounded children). A single tool
 		* call timing out mid-session does NOT trigger this — the backgrounded
 		* process is exactly what the model asked for and must keep running until
 		* the model cleans it up or the session truly ends. Only calling this at
@@ -174,6 +182,7 @@ export class ToolExecutor {
 		*/
 	dispose(): void {
 		killBackgroundCommands()
+		disposeBrowserSessions()
 	}
 }
 
@@ -1337,6 +1346,7 @@ const IMPLEMENTED_TOOLS = new Set([
 	"execute_command",
 	"list_files",
 	"codebase_search",
+	"browser_action",
 ])
 
 /**
@@ -1356,6 +1366,7 @@ export function createHeadlessExecutor(workspaceRoot: string, options: ToolExecu
 	executor.register("execute_command", executeCommandHandler)
 	executor.register("list_files", listFilesHandler)
 	executor.register("codebase_search", codebaseSearchHandler)
+	executor.register("browser_action", browserActionHandler)
 
 	executor.register("attempt_completion", attemptCompletionHandler)
 	executor.register("ask_followup_question", askFollowupQuestionHandler)
@@ -1392,6 +1403,7 @@ function createReadCommandExecutor(workspaceRoot: string, options: ToolExecutorO
 	executor.registerReadFile()
 	executor.register("list_files", listFilesHandler)
 	executor.register("execute_command", executeCommandHandler)
+	executor.register("browser_action", browserActionHandler)
 
 	executor.register("attempt_completion", attemptCompletionHandler)
 	executor.register("ask_followup_question", askFollowupQuestionHandler)
