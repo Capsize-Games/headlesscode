@@ -239,7 +239,30 @@ customModes:
       the task files already exist as the full unit of work each). Each
       worker runs `--mode code` with the harness's default model
       (`deepseek/deepseek-chat`) unless told otherwise. Note the worktree
-      names you used. Then go to **Step 3**.
+      names you used.
+
+      **Before spawning, decide whether this round needs a mandatory
+      review gate (Step 3.5) before merging.** This path has no automated
+      rework loop the way the issue-driven path does — workers only
+      self-verify (tsc/test/e2e in their own worktree) before merging
+      themselves. That was fine for small, isolated, mechanical fixes; it
+      is NOT fine on its own for a round where something could plausibly
+      be wrong in a way self-verification wouldn't catch. Treat a round as
+      **significant** (mandatory review gate applies) if ANY of:
+      - more than 3 task files in the round,
+      - any task's own plan doc says it touches `src/engine/loop.ts`,
+        `src/budget/`, `src/checkpoints/`, or `src/tools/executor.ts` (core
+        request/cost/safety logic — a single missed edge case there is
+        exactly the class of bug self-verification is weakest against),
+      - any task adds a new external process/dependency the session didn't
+        have before (a new npm package, a new local service like Ollama, a
+        new child-process it spawns),
+      - or the human explicitly asks for one.
+
+      A round below all of those is **small** — today's default (self-
+      verify, merge, report) applies unchanged, go straight to **Step 3**.
+
+      Then go to **Step 3**.
 
       ## Step 3 — Monitor, don't babysit
 
@@ -304,17 +327,57 @@ customModes:
       npx tsx src/cli.ts checkpoints --workspace .worktrees/<name> restore <hash>
       ```
 
+      ## Step 3.5 — Review before merging (significant rounds only, see Step 2)
+
+      For a round flagged **significant** in Step 2: do NOT merge any
+      worktree on self-verification alone, even if tsc/test/e2e are all
+      green in it. A worker that died on repeated tool errors mid-
+      verification and only happened to pass on a later attempt, or a
+      change that alters cost accounting/cache behavior in a way no
+      existing test exercises, can look green and still be wrong —
+      self-verification by the same session that wrote the code is not
+      independent evidence.
+
+      Once every worktree in the round reaches `done`, run an independent
+      review pass — `deepseek-reviewer` mode (`plans/review-mode-prompt.md`
+      is its full operating procedure) — against each worktree BEFORE
+      merging it, or write one review task doc covering the whole round if
+      the worktrees are still live, or covering the merged diffs on
+      `master` if you already merged before realizing the round qualified
+      as significant (adapt the procedure: diff the specific commits
+      instead of a worktree — `plans/review-todays-batch.md` is a worked
+      example of doing exactly this). Prioritize: anything the worker's own
+      report flagged as rocky (errors during its own verification,
+      anything it left open/unresolved), and anything touching cost
+      accounting or prompt-cache stability specifically, since those are
+      the hardest classes of bug for this project's existing tests to
+      catch by accident.
+
+      A **pass** verdict: proceed to merge (or, if already merged, no
+      further action beyond noting the review in your report). A **fail**
+      verdict: do NOT attempt to fix it yourself in this mode — report the
+      reviewer's findings to the human exactly as `review-mode-prompt.md`
+      requires (file:line evidence, reproduced command output, specific
+      actionable asks), the same way a `"needs-human"` group already works
+      elsewhere in this mode.
+
+      For a **small** round (per Step 2's threshold), this step is
+      skipped — today's default stands.
+
       ## Step 4 — Report, do not review
 
       Report everything relevant to how this round started: issue
       numbers and URLs filed (if Step 0a ran), the split plan used,
-      per-group final status, cost/tokens. But do **not** judge whether
-      any worker's output is actually correct — this mode has no
-      automated review step wired up; the user reviews each worker's diff
-      and summary themselves (or hands it to a separate review pass)
-      before anything is merged or a worktree is cleaned up. Never claim
-      a group "looks good" — you have observed that a process exited, not
-      that its output is right.
+      per-group final status, cost/tokens, and whether Step 3.5's review
+      gate applied (and its verdict, if so). But do **not** judge whether
+      any worker's output is actually correct yourself — for a small
+      round, the user reviews each worker's diff and summary themselves
+      (or hands it to a separate review pass) before trusting it further;
+      for a significant round, Step 3.5's independent reviewer already did
+      that job, but you still don't get to second-guess or override its
+      verdict in this mode. Never claim a group "looks good" on your own
+      authority — you have observed that a process exited, not that its
+      output is right.
     groups:
       - read
       - edit

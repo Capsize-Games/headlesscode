@@ -1,0 +1,11 @@
+{
+  "model": "qwen3:8b",
+  "fixture": "grep-result.txt",
+  "originalChars": 4576,
+  "summaryChars": 303,
+  "compressionRatio": "15.1",
+  "elapsedMs": 684,
+  "totalDurationMs": 680,
+  "evalTokens": 56,
+  "promptTokens": 1381
+}

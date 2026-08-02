@@ -10,14 +10,24 @@
  * summary poll — this is meant to feel live), appending new events to the
  * DOM rather than re-rendering the whole feed, and auto-scrolling to the
  * latest event unless the user has manually scrolled up. The panel also
- * carries pause/resume buttons (POST /api/session/:id/pause|resume).
+ * carries pause/resume buttons (POST /api/session/:id/pause|resume) and a
+ * checkpoints panel (GET /api/checkpoints list + GET /api/checkpoints/diff,
+ * POST /api/checkpoints/restore).
+ *
+ * Checkpoints panel: lists the session's shadow-git checkpoints; clicking one
+ * shows its unified-diff-style text block vs the working tree; Restore
+ * reverts REAL workspace files and therefore requires a two-step confirm
+ * (the button arms first — a second click fires the POST). After a restore
+ * the list + diff refresh so the view never shows stale data.
  *
  * NOTE (Phase 3 scope change): this page is no longer purely read-only — the
- * pause/resume buttons issue state-changing POSTs. Local-only + no-auth,
- * matching the server; see src/dashboard/server.ts's header note.
+ * pause/resume buttons issue state-changing POSTs, and restore is fully
+ * destructive. Local-only + no-auth by default; the restore POST goes
+ * through the same optional bearer-token gate as the other control POSTs
+ * when HEADLESSCODE_DASHBOARD_TOKEN is set (see src/dashboard/server.ts).
  */
 
-export function renderPage(): string {
+export function renderPage(repo?: string): string {
 	return `<!doctype html>
 <html lang="en">
 <head>
@@ -122,6 +132,80 @@ export function renderPage(): string {
   .ev .trunc-note { color: GrayText; font-style: italic; }
   .feed-empty { color: GrayText; font-style: italic; padding: 12px 0; }
 
+  /* Detail view tabs: flat event log (original) vs. chat thread (this view).
+     Both render from the SAME /api/session/:id/events feed — the toggle only
+     switches how the already-arriving events are displayed. */
+  #detail .detail-tabs { display: flex; gap: 4px; padding: 0 16px; border-bottom: 1px solid color-mix(in srgb, CanvasText 12%, transparent); }
+  #detail .detail-tabs button {
+    font-size: 0.8rem; padding: 6px 14px; cursor: pointer;
+    border: none; background: none; color: GrayText; border-bottom: 2px solid transparent;
+  }
+  #detail .detail-tabs button.active { color: CanvasText; border-bottom-color: #8250df; font-weight: 600; }
+
+  /* Chat-thread view (phase: dashboard-chat-ui). Rendered client-side from the
+     same event feed — the model's text + its tool calls/results per turn, as
+     chat bubbles instead of flat rows. */
+  #chat {
+    display: none; max-height: 420px; overflow-y: auto; padding: 16px 16px 8px;
+    font-size: 0.85rem; line-height: 1.45;
+  }
+  #detail.view-chat #feed { display: none; }
+  #detail.view-chat #chat { display: block; }
+  #chat .chat-task {
+    border: 1px solid color-mix(in srgb, CanvasText 25%, transparent);
+    border-radius: 10px; padding: 8px 12px; margin-bottom: 14px;
+    background: color-mix(in srgb, CanvasText 5%, transparent);
+    white-space: pre-wrap; word-break: break-word;
+  }
+  #chat .chat-task .chat-task-label { font-size: 0.72rem; color: GrayText; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px; }
+  #chat .turn { margin-bottom: 16px; }
+  #chat .turn-head {
+    display: flex; align-items: center; gap: 8px; margin: 0 0 6px;
+    font-size: 0.72rem; color: GrayText; text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  #chat .turn-head .turn-iter { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #chat .bubble {
+    border: 1px solid color-mix(in srgb, #8250df 35%, transparent);
+    border-radius: 10px; padding: 10px 14px; margin-bottom: 8px;
+    background: color-mix(in srgb, #8250df 6%, transparent);
+    word-break: break-word; white-space: pre-wrap;
+  }
+  #chat .bubble .bubble-kicker { font-size: 0.72rem; color: #8250df; font-weight: 600; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.04em; }
+  #chat .bubble .bubble-kicker.error { color: #c0392b; }
+  #chat .bubble .bubble-kicker.ok { color: #1a7f37; }
+  #chat .bubble.stream-chunk { border-style: dashed; border-color: color-mix(in srgb, #8250df 25%, transparent); background: color-mix(in srgb, #8250df 3%, transparent); }
+  #chat .tool-call {
+    display: flex; align-items: baseline; gap: 8px; margin: 8px 0 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.78rem;
+  }
+  #chat .tool-call .tool-name { color: #8250df; font-weight: 600; }
+  #chat .tool-call .tool-arg { color: GrayText; word-break: break-all; }
+  #chat .tool-result {
+    margin: 2px 0 6px 22px; padding: 6px 10px; border-left: 3px solid #1a7f37;
+    background: color-mix(in srgb, #1a7f37 6%, transparent);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem;
+    white-space: pre-wrap; word-break: break-word; color: color-mix(in srgb, CanvasText 85%, transparent);
+  }
+  #chat .tool-result.error { border-left-color: #c0392b; background: color-mix(in srgb, #c0392b 7%, transparent); }
+  #chat .tool-result .result-label { font-weight: 600; margin-bottom: 2px; }
+  #chat .tool-result.error .result-label { color: #c0392b; }
+  #chat .tool-result.ok .result-label { color: #1a7f37; }
+  #chat .trunc-note { color: GrayText; font-style: italic; font-size: 0.72rem; }
+  #chat .sys-marker {
+    display: flex; align-items: center; gap: 6px; margin: 10px 0;
+    font-size: 0.72rem; color: GrayText;
+  }
+  #chat .sys-marker .marker-label { font-weight: 600; }
+  #chat .sys-marker.checkpoint_saved .marker-label { color: #b8860b; }
+  #chat .sys-marker.paused .marker-label { color: #b8860b; }
+  #chat .sys-marker.resumed .marker-label { color: #1a7f37; }
+  #chat .sys-marker.decision_answered .marker-label { color: #1a7f37; }
+  #chat .sys-marker.decision_blocked .marker-label { color: #c0392b; }
+  #chat .sys-marker.llm_error .marker-label { color: #c0392b; }
+  #chat .sys-marker.session_end .marker-label { color: GrayText; }
+  #chat .chat-empty { color: GrayText; font-style: italic; padding: 12px 0; }
+  #chat .chat-err { color: #c0392b; padding: 12px 0; }
+
   /* Inline decision-answer box (browser control plane): rendered in the feed
      right after a decision_blocked event with no matching decision_answered
      yet, so the human answers right where they see the question. */
@@ -140,6 +224,92 @@ export function renderPage(): string {
   .answer-box input[type="text"] { flex: 1; font-size: 0.8rem; padding: 3px 8px; }
   .answer-box button { font-size: 0.75rem; padding: 3px 12px; border-radius: 6px; cursor: pointer; }
   .answer-box .answer-status { font-size: 0.75rem; color: GrayText; margin-left: 6px; }
+
+  /* Checkpoints panel (browser checkpoint list/diff/restore): sits between
+     the detail head and the event feed. Plain rows + a unified-diff <pre> —
+     no framework, matching this page's ethos. */
+  #checkpointsPanel {
+    border-top: 1px solid color-mix(in srgb, CanvasText 12%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, CanvasText 12%, transparent);
+    padding: 8px 16px;
+  }
+  .checkpoints-head { display: flex; align-items: baseline; gap: 8px; font-weight: 600; font-size: 0.85rem; }
+  .checkpoints-head .ckpt-status { font-weight: 400; color: GrayText; font-size: 0.75rem; }
+  .ckpt-list { margin-top: 4px; }
+  .ckpt-row {
+    display: flex; gap: 10px; align-items: baseline; padding: 3px 0;
+    border-bottom: 1px solid color-mix(in srgb, CanvasText 6%, transparent);
+    font-size: 0.8rem; cursor: pointer;
+  }
+  .ckpt-row:hover { background: color-mix(in srgb, CanvasText 5%, transparent); }
+  .ckpt-row.selected { background: color-mix(in srgb, #8250df 12%, transparent); }
+  .ckpt-row .ckpt-msg { flex: 1; word-break: break-word; }
+  .ckpt-row .ckpt-date { color: GrayText; flex-shrink: 0; }
+  .ckpt-row .ckpt-hash { color: GrayText; flex-shrink: 0; }
+  .ckpt-diff { margin-top: 8px; }
+  .ckpt-diff-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .ckpt-diff-head button {
+    font-size: 0.75rem; padding: 3px 12px; border-radius: 6px; cursor: pointer;
+    border: 1px solid color-mix(in srgb, CanvasText 30%, transparent); background: color-mix(in srgb, CanvasText 8%, transparent);
+  }
+  .ckpt-diff-head button:disabled { opacity: 0.45; cursor: not-allowed; }
+  .ckpt-diff-head button.restore-armed {
+    background: #c0392b; color: #fff; border-color: #c0392b; font-weight: 600;
+  }
+  .ckpt-diff-head .ckpt-restore-msg { font-size: 0.75rem; }
+  #ckptDiffBody {
+    max-height: 300px; overflow-y: auto; margin-top: 6px; padding: 8px 12px;
+    background: color-mix(in srgb, CanvasText 4%, transparent);
+    border: 1px solid color-mix(in srgb, CanvasText 12%, transparent);
+    border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.75rem; white-space: pre-wrap; word-break: break-word;
+  }
+  /* File browser (dashboard-file-browser-and-permissions-ui). */
+  #fileBrowser { margin-top: 8px; }
+  #fileBrowser .fb-toolbar { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; flex-wrap: wrap; }
+  #fileBrowser .fb-toolbar input[type="text"] { flex: 1; min-width: 200px; padding: 4px 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; }
+  #fileBrowser .fb-tree {
+    border: 1px solid color-mix(in srgb, CanvasText 15%, transparent);
+    border-radius: 8px; max-height: 380px; overflow: auto; padding: 6px 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem;
+  }
+  #fileBrowser .fb-entry { display: flex; align-items: center; gap: 6px; padding: 2px 10px; cursor: pointer; white-space: nowrap; }
+  #fileBrowser .fb-entry:hover { background: color-mix(in srgb, CanvasText 6%, transparent); }
+  #fileBrowser .fb-entry .fb-name { overflow: hidden; text-overflow: ellipsis; }
+  #fileBrowser .fb-entry .fb-size { margin-left: auto; color: GrayText; font-size: 0.7rem; padding-left: 12px; }
+  #fileBrowser .fb-entry.dir > .fb-name { font-weight: 600; }
+  #fileBrowser .fb-children { padding-left: 16px; }
+  #fileBrowser .fb-children.collapsed { display: none; }
+  #fileBrowser .fb-viewer {
+    margin-top: 8px; border: 1px solid color-mix(in srgb, CanvasText 15%, transparent);
+    border-radius: 8px; overflow: hidden;
+  }
+  #fileBrowser .fb-viewer-head {
+    display: flex; align-items: center; gap: 8px; padding: 6px 12px;
+    border-bottom: 1px solid color-mix(in srgb, CanvasText 12%, transparent);
+    font-size: 0.75rem; color: GrayText;
+  }
+  #fileBrowser .fb-viewer-head .fb-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 600; color: CanvasText; overflow: hidden; text-overflow: ellipsis; }
+  #fileBrowser .fb-viewer-head .fb-close { margin-left: auto; cursor: pointer; border: none; background: none; font-size: 1rem; color: GrayText; }
+  #fileBrowser pre.fb-content {
+    margin: 0; padding: 12px; max-height: 420px; overflow: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem; line-height: 1.45;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  #fileBrowser .fb-note { color: GrayText; font-style: italic; padding: 8px 12px; }
+
+  /* Permissions settings (dashboard-file-browser-and-permissions-ui). */
+  #permissionsSettings .perm-list { display: flex; flex-direction: column; gap: 8px; }
+  #permissionsSettings .perm-field label { font-size: 0.75rem; color: GrayText; text-transform: uppercase; letter-spacing: 0.03em; }
+  #permissionsSettings .perm-field textarea {
+    width: 100%; min-height: 56px; padding: 6px 8px; margin-top: 3px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.78rem;
+    resize: vertical;
+  }
+  #permissionsSettings .perm-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+  #permissionsSettings .perm-row button { font-size: 0.8rem; padding: 3px 12px; border-radius: 6px; cursor: pointer; }
+  #permissionsSettings .perm-actions { display: flex; gap: 8px; margin-top: 10px; align-items: center; flex-wrap: wrap; }
+  #permissionsSettings .perm-status { font-size: 0.8rem; }
 </style>
 </head>
 <body>
@@ -171,6 +341,26 @@ export function renderPage(): string {
     An explicit <code>--model</code> flag always overrides this table.</div>
   <div id="modeModels"></div>
 
+  <h2>Workspace files</h2>
+  <div class="sub">Read-only file browser. Click a directory to expand/collapse; click a file to
+    preview its text content (files over 30k chars or binary files are not previewable).
+    No file editing from the browser — deliberately read-only.</div>
+  <div id="fileBrowser">
+    <div class="fb-toolbar">
+      <input type="text" id="fbRepo" placeholder="workspace path (repo)" value="${repo ? String(repo).replace(/"/g, "&quot;") : ""}" />
+      <button id="fbLoad">Load</button>
+      <span id="fbMsg"></span>
+    </div>
+    <div class="empty">enter a workspace path and press Load</div>
+  </div>
+
+  <h2>Permissions settings</h2>
+  <div class="sub">Command allow/deny + protected-file permissions
+    (<code>.headlesscode/permissions.json</code>). When no file exists yet the page shows the
+    resolved built-in defaults, clearly labeled. Save writes the file; the change takes effect
+    on the next session (fresh <code>resolvePermissions</code> call).</div>
+  <div id="permissionsSettings"><div class="empty">loading…</div></div>
+
   <h2>Blocked (awaiting a decision)</h2>
   <div id="blocked"><div class="empty">none</div></div>
 
@@ -191,7 +381,25 @@ export function renderPage(): string {
       </span>
       <button class="close" id="detailClose" title="close">✕</button>
     </div>
+    <div class="detail-tabs">
+      <button id="tabLog" class="active">Event log</button>
+      <button id="tabChat">Chat thread</button>
+    </div>
+    <div id="checkpointsPanel">
+      <div class="checkpoints-head">📸 Checkpoints <span class="ckpt-status" id="ckptStatus"></span></div>
+      <div class="ckpt-list" id="ckptList"></div>
+      <div class="ckpt-diff" id="ckptDiff" style="display:none">
+        <div class="ckpt-diff-head">
+          <span class="mono" id="ckptDiffTitle"></span>
+          <button id="btnRestore" title="reverts real workspace files to this checkpoint">Restore</button>
+          <span class="ckpt-restore-msg" id="ckptRestoreMsg"></span>
+        </div>
+        <pre id="ckptDiffBody"></pre>
+      </div>
+
+    </div>
     <div id="feed"><div class="feed-empty">select a session to watch its live event feed</div></div>
+    <div id="chat"><div class="chat-empty">select a session to watch its live event feed</div></div>
   </div>
 
   <div id="error"></div>
@@ -212,6 +420,7 @@ const EVENT_LABELS = {
   session_start: "🚀 session start",
   iteration_start: "🔄 iteration",
   llm_response: "🤖 llm response",
+  llm_stream_chunk: "⋯ stream chunk",
   llm_error: "💥 llm error",
   tool_call: "🔧 tool call",
   tool_result: "✅ tool result",
@@ -226,25 +435,34 @@ const EVENT_LABELS = {
 // Current detail view state: null when closed.
 let detail = null; // { sessionId, source, nextOffset, lastEventCount, userScrolledUp }
 
-function openDetail(sessionId, source, status) {
+function openDetail(sessionId, source, status, workspace) {
   closeDetail();
-  detail = { sessionId, source, nextOffset: 0, lastEventCount: 0, userScrolledUp: false, status };
+  detail = { sessionId, source, nextOffset: 0, lastEventCount: 0, userScrolledUp: false, status, workspace, allEvents: [], view: "chat" };
+
   document.getElementById("detail").style.display = "block";
   document.getElementById("detailSessionId").textContent = sessionId;
   document.getElementById("detailSource").textContent = "· " + (source || "");
   updateDetailControls();
   const feed = document.getElementById("feed");
   feed.innerHTML = '<div class="feed-empty">loading events…</div>';
+  document.getElementById("chat").innerHTML = '<div class="chat-empty">loading events…</div>';
   // Reset scroll-tracking state for the new session.
   detail.userScrolledUp = false;
   feed.scrollTop = 0;
+  setView(detail.view);
   pollEvents();
+  // The checkpoints panel loads alongside the event feed.
+  loadCheckpoints();
 }
 
 function closeDetail() {
   if (detail) {
     detail = null;
   }
+  // Reset checkpoint state so the panel shows nothing stale next open.
+  ckptEntries = [];
+  ckptSelectedHash = null;
+  ckptRestoreArmed = false;
   document.getElementById("detail").style.display = "none";
 }
 
@@ -288,6 +506,9 @@ function renderEvent(e) {
         (e.textPreview ? "· " + esc(String(e.textPreview).slice(0, 300)) + (e.textTruncated ? ' <span class="trunc-note">(truncated)</span>' : "") : "") +
         (typeof e.inputTokens === "number" ? " · in=" + esc(e.inputTokens) + " out=" + esc(e.outputTokens ?? 0) + " cached=" + esc(e.cachedTokens ?? 0) : "");
       break;
+    case "llm_stream_chunk":
+      body = (e.kind || "") + (e.chunk ? " · " + esc(String(e.chunk).slice(0, 200)) + (e.chunkTruncated ? ' <span class="trunc-note">(truncated)</span>' : "") : "");
+      break;
     case "checkpoint_saved":
       body = e.iteration === 0 ? "baseline" : "after iteration " + esc(e.iteration);
       break;
@@ -314,7 +535,12 @@ function renderEvent(e) {
   const div = document.createElement("div");
   div.className = "ev " + esc(e.type) + (e.isError ? " is-error" : "");
   div.dataset.ts = e.ts || "";
-  div.innerHTML = '<span class="ev-ts">' + esc(e.ts) + "</span><span class=\"ev-body\">" + iter + '<span class="ev-label">' + esc(label) + "</span> " + body + "</span>";
+  // NOTE: the ev-body class is built with a variable to avoid a backslash-quote
+  // escape INSIDE this page's outer template literal — \" in a template literal
+  // is unescaped at runtime to a bare quote, which would break the served JS
+  // (pre-existing bug fixed here; the flat log must keep working).
+  const evBodyClass = "ev-body";
+  div.innerHTML = '<span class="ev-ts">' + esc(e.ts) + "</span><span class=" + evBodyClass + ">" + iter + '<span class="ev-label">' + esc(label) + "</span> " + body + "</span>";
   return div;
 }
 
@@ -334,12 +560,18 @@ async function pollEvents() {
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
     const feed = document.getElementById("feed");
-    if (detail.lastEventCount === 0 && (!data.events || data.events.length === 0)) {
+    const newEvents = data.events || [];
+    // Accumulate the full feed: the chat view groups events into turns, so it
+    // needs everything seen so far, not just the incremental slice. The flat
+    // event-log view still appends incrementally as before.
+    detail.allEvents = (detail.allEvents || []).concat(newEvents);
+    if (detail.lastEventCount === 0 && newEvents.length === 0) {
       feed.innerHTML = '<div class="feed-empty">no events yet — waiting for the worker…</div>';
+      renderChat();
     } else {
       const shouldScroll = feedAutoScrolls();
       if (feed.querySelector(".feed-empty")) feed.innerHTML = "";
-      for (const e of data.events || []) {
+      for (const e of newEvents) {
         feed.appendChild(renderEvent(e));
         // Browser control plane: if this is a decision_blocked and no
         // matching decision_answered has arrived yet, render the inline
@@ -348,12 +580,13 @@ async function pollEvents() {
           renderAnswerBox(feed, e);
         }
       }
-      detail.lastEventCount = (detail.lastEventCount || 0) + (data.events || []).length;
+      detail.lastEventCount = (detail.lastEventCount || 0) + newEvents.length;
       if (shouldScroll) feed.scrollTop = feed.scrollHeight;
+      renderChat();
     }
     detail.nextOffset = data.nextOffset;
     // Derive running/paused state from the feed (the summary row may lag).
-    const types = (data.events || []).map((e) => e.type);
+    const types = newEvents.map((e) => e.type);
     if (types.includes("paused")) detail.paused = true;
     if (types.includes("resumed")) detail.paused = false;
     if (types.includes("session_end")) { detail.status = "done"; detail.paused = false; }
@@ -382,6 +615,403 @@ async function controlSession(action) {
   if (action === "pause") detail.paused = true;
   if (action === "resume") detail.paused = false;
   updateDetailControls();
+}
+
+// ── Chat-thread view (dashboard-chat-ui) ────────────────────────────────────
+// Groups the SAME event feed data into conversation turns (see the grouping
+// rules in src/dashboard/chat-thread.ts) and renders them as chat bubbles:
+// the user's task, then per turn the assistant's text + its tool calls and
+// their results inline, with system-level events as small markers. The flat
+// event-log view (renderEvent above) remains available via the tab toggle.
+// This is client-side-only rendering of data that's already arriving via the
+// existing poll — no new backend source.
+
+// Short arg summary for a tool call, matching the server-side summarizeToolArg
+// style (the feed already carries this as "args"; cap here for safety).
+function chatSummaryArg(e) {
+  if (!e || e.type !== "tool_call") return "";
+  const raw = String(e.args || "");
+  const trimmed = raw.trim();
+  if (trimmed.length <= 80) return trimmed;
+  return trimmed.slice(0, 80) + "…";
+}
+
+function setView(view) {
+  if (!detail) return;
+  detail.view = view;
+  const detailEl = document.getElementById("detail");
+  detailEl.classList.toggle("view-chat", view === "chat");
+  document.getElementById("tabLog").classList.toggle("active", view === "log");
+  document.getElementById("tabChat").classList.toggle("active", view === "chat");
+}
+
+// Render one chat "turn" block: the model's text bubble (plus a reasoning
+// bubble if streaming-and-reasoning has landed and the feed carries one),
+// then its tool calls and results inline.
+function renderChatTurn(turn) {
+  const wrap = document.createElement("div");
+  wrap.className = "turn";
+
+  const head = document.createElement("div");
+  head.className = "turn-head";
+  const ts = turn.turnStart.ts || "";
+  const headText = (turn.turnStart.type === "decision_blocked")
+    ? "⛔ question"
+    : "iteration " + (typeof turn.iteration === "number" ? turn.iteration : "?");
+  head.innerHTML = '<span class="turn-iter">' + esc(headText) + "</span><span>" + esc(ts) + "</span>";
+  wrap.appendChild(head);
+
+  for (const e of turn.events) {
+    if (e.type === "llm_response") {
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      const reasoning = typeof e.reasoning === "string" && e.reasoning ? e.reasoning : "";
+      const text = typeof e.textPreview === "string" ? e.textPreview : "";
+      const toks = typeof e.inputTokens === "number"
+        ? '<div class="trunc-note">in=' + esc(e.inputTokens) + " · out=" + esc(e.outputTokens ?? 0) + " · cached=" + esc(e.cachedTokens ?? 0) + "</div>"
+        : "";
+      if (reasoning) {
+        bubble.innerHTML =
+          '<div class="bubble-kicker">thinking</div><div>' + esc(reasoning) + "</div>" +
+          (text ? '<div style="margin-top:8px">' + esc(text) + "</div>" : "") + toks;
+      } else if (text) {
+        bubble.innerHTML = '<div>' + esc(text) + "</div>" + toks;
+      } else {
+        bubble.innerHTML = '<div class="trunc-note">(tool-call turn — no text)</div>' + toks;
+      }
+      if (e.textTruncated) {
+        bubble.appendChild(elTruncNote());
+      }
+      wrap.appendChild(bubble);
+    } else if (e.type === "llm_stream_chunk") {
+      // Streaming chunk: render as a live-typing bubble. The turn's final
+      // llm_response carries the assembled text, so these are purely the
+      // "live" effect between iteration_start and llm_response.
+      const stream = document.createElement("div");
+      stream.className = "bubble stream-chunk";
+      const label = e.kind === "reasoning" ? "thinking…" : e.kind === "tool" ? "tool…" : "typing…";
+      stream.innerHTML =
+        '<div class="bubble-kicker">' + esc(label) + "</div>" +
+        "<div>" + esc(String(e.chunk || "")) + "</div>" +
+        (e.chunkTruncated ? '<div class="trunc-note">(truncated)</div>' : "");
+      wrap.appendChild(stream);
+    } else if (e.type === "decision_answered") {
+      // The answer to a blocked question: inline in the turn that asked it.
+      const marker = document.createElement("div");
+      marker.className = "sys-marker decision_answered";
+      marker.innerHTML = '<span class="marker-label">💬 answer</span><span>' + esc(e.timedOut ? "timed out — worker moved on autonomously" : (e.answer || "")) + "</span>";
+      wrap.appendChild(marker);
+    } else if (e.type === "tool_call") {
+      const call = document.createElement("div");
+      call.className = "tool-call";
+      const arg = chatSummaryArg(e);
+      call.innerHTML = '<span class="tool-name">' + esc(e.tool) + "</span>" + (arg ? '<span class="tool-arg">' + esc(arg) + "</span>" : "") + (e.argsTruncated ? ' <span class="trunc-note">(truncated)</span>' : "");
+      wrap.appendChild(call);
+    } else if (e.type === "tool_result") {
+      const res = document.createElement("div");
+      res.className = "tool-result" + (e.isError ? " error" : " ok");
+      const label = (e.isError ? "⚠ error" : "✓ result") + (e.tool ? " · " + esc(e.tool) : "");
+      const content = String(e.result || "");
+      res.innerHTML = '<div class="result-label">' + label + "</div>" + (content ? "<div>" + esc(content) + "</div>" : "") + (e.resultTruncated ? '<div class="trunc-note">(truncated)</div>' : "");
+      wrap.appendChild(res);
+    } else {
+      // Unknown event inside a turn: fall back to a system marker.
+      wrap.appendChild(renderChatSystem(e));
+    }
+  }
+  return wrap;
+}
+
+function elTruncNote() {
+  const d = document.createElement("div");
+  d.className = "trunc-note";
+  d.textContent = "(truncated)";
+  return d;
+}
+
+// Render a system-level event as a small inline marker, not a chat bubble.
+function renderChatSystem(e) {
+  const marker = document.createElement("div");
+  marker.className = "sys-marker " + esc(e.type);
+  const labels = {
+    session_start: "🚀 session start",
+    checkpoint_saved: "📸 checkpoint",
+    paused: "⏸ paused",
+    resumed: "▶ resumed",
+    llm_error: "💥 llm error",
+    decision_blocked: "⛔ blocked (question)",
+    session_end: "🏁 session end",
+  };
+  const label = labels[e.type] || e.type;
+  let body = "";
+  switch (e.type) {
+    case "checkpoint_saved":
+      body = e.iteration === 0 ? "baseline" : "after iteration " + esc(e.iteration);
+      break;
+    case "paused":
+    case "resumed":
+      body = e.reason ? esc(e.reason) : "";
+      break;
+    case "llm_error":
+      body = esc(String(e.message || e.error || ""));
+      break;
+    case "session_start":
+      body = esc(e.mode || "") + " · " + esc(e.model || "");
+      break;
+    case "session_end":
+      body = "status=" + esc(e.status) + " · iterations=" + esc(e.iterations) + " · cost=" + fmtCost(e.costUsd);
+      break;
+    case "decision_blocked":
+      body = esc(e.question || "") + (e.suggestions && e.suggestions.length ? " · suggestions: " + esc(e.suggestions.join(" | ")) : "");
+      break;
+    default:
+      body = esc(JSON.stringify(e).slice(0, 200));
+  }
+  marker.innerHTML = '<span class="marker-label">' + esc(label) + "</span>" + (body ? "<span>" + body + "</span>" : "");
+  return marker;
+}
+
+// Re-render the whole chat thread from the accumulated event feed. Called on
+// every poll (the feed arrives incrementally, but grouping is order-dependent
+// — a turn only becomes complete once its final tool_result lands, so
+// re-grouping from scratch is the simplest correct approach).
+function renderChat() {
+  if (!detail) return;
+  const chat = document.getElementById("chat");
+  const events = detail.allEvents || [];
+  if (events.length === 0) {
+    chat.innerHTML = '<div class="chat-empty">no events yet — waiting for the worker…</div>';
+    return;
+  }
+  const shouldScroll = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 40;
+  chat.innerHTML = "";
+
+  // Task bubble (the user's message) when the feed has a session_start.
+  const start = events.find((e) => e.type === "session_start");
+  if (start && typeof start.task === "string" && start.task) {
+    const task = document.createElement("div");
+    task.className = "chat-task";
+    task.innerHTML = '<div class="chat-task-label">task</div><div>' + esc(start.task) + "</div>" + (start.taskTruncated ? '<div class="trunc-note">(truncated)</div>' : "");
+    chat.appendChild(task);
+  }
+
+  // Group + render. Mirrors src/dashboard/chat-thread.ts's grouping rules
+  // (kept as pure TS there + unit-tested; this inline copy is the page's
+  // no-build-step vanilla-JS rendition of the same rules).
+  const blocks = groupEvents(events);
+  for (const block of blocks) {
+    if (block.kind === "turn") {
+      chat.appendChild(renderChatTurn(block));
+    } else {
+      chat.appendChild(renderChatSystem(block.event));
+    }
+  }
+  if (shouldScroll) chat.scrollTop = chat.scrollHeight;
+}
+
+// Group a flat event array into chat blocks — inline JS twin of the tested
+// pure function in src/dashboard/chat-thread.ts (this page has no build step,
+// so the grouping is duplicated rather than imported).
+function groupEvents(events) {
+  const blocks = [];
+  let task = "";
+  let current = null;
+  const closeTurn = () => {
+    if (current) {
+      blocks.push({ kind: "turn", iteration: current.iteration, turnStart: current.turnStart, events: current.events });
+      current = null;
+    }
+  };
+  for (const e of events) {
+    switch (e.type) {
+      case "session_start":
+        task = typeof e.task === "string" ? e.task : "";
+        blocks.push({ kind: "system", event: e });
+        break;
+      case "iteration_start":
+        closeTurn();
+        current = { iteration: e.iteration, turnStart: e, events: [] };
+        break;
+      case "decision_blocked":
+        closeTurn();
+        current = { iteration: e.iteration, turnStart: e, events: [] };
+        break;
+      case "tool_result": {
+        if (current && current.events.length > 0) {
+          const last = current.events[current.events.length - 1];
+          if (last.type === "tool_call") {
+            current.events.push(e);
+            break;
+          }
+        }
+        blocks.push({ kind: "system", event: e });
+        break;
+      }
+      case "session_end":
+      case "llm_error":
+      case "checkpoint_saved":
+      case "paused":
+      case "resumed":
+        closeTurn();
+        blocks.push({ kind: "system", event: e });
+        break;
+      case "llm_response":
+      case "tool_call":
+      case "decision_answered":
+      case "llm_stream_chunk":
+        if (current) {
+          current.events.push(e);
+        } else {
+          blocks.push({ kind: "system", event: e });
+        }
+        break;
+      default:
+        closeTurn();
+        blocks.push({ kind: "system", event: e });
+        break;
+    }
+  }
+  closeTurn();
+  return blocks;
+// ── Checkpoints (browser checkpoint list/diff/restore) ──────────────────────
+// The panel in the session detail view lists the session's shadow-git
+// checkpoints (message, date, hash) via GET /api/checkpoints. Clicking a row
+// loads its diff (GET /api/checkpoints/diff) and renders it as a plain
+// unified-diff-style text block. Restore reverts REAL files, so it needs a
+// two-step confirm: the button first arms ("really restore?"), and only a
+// second click on the armed button fires the POST. After a successful restore
+// the list + diff refresh so the view never shows stale data.
+let ckptEntries = []; // { hash, message, date } for the current detail session
+let ckptSelectedHash = null;
+let ckptRestoreArmed = false;
+
+async function loadCheckpoints() {
+  const listEl = document.getElementById("ckptList");
+  const statusEl = document.getElementById("ckptStatus");
+  const diffEl = document.getElementById("ckptDiff");
+  if (!detail) return;
+  // The detail view is keyed by session id; the checkpoints routes are keyed
+  // by the same session id (HeadlessSession uses sessionId as the checkpoint
+  // taskId). The workspace the shadow repo tracks is the session's recorded
+  // workspaceRoot (a worker session may live in a worktree, not --repo).
+  const params = new URLSearchParams({ session: detail.sessionId });
+  if (detail.workspace) params.set("repo", detail.workspace);
+  try {
+    const res = await fetch("/api/checkpoints?" + params.toString());
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    ckptEntries = data.entries || [];
+    ckptSelectedHash = null;
+    ckptRestoreArmed = false;
+    diffEl.style.display = "none";
+    document.getElementById("ckptDiffBody").textContent = "";
+    document.getElementById("ckptRestoreMsg").textContent = "";
+    if (ckptEntries.length === 0) {
+      statusEl.textContent = "none for this session";
+      listEl.innerHTML = '<div class="feed-empty">no checkpoints</div>';
+      return;
+    }
+    statusEl.textContent = ckptEntries.length + " checkpoint" + (ckptEntries.length > 1 ? "s" : "");
+    listEl.innerHTML = "";
+    for (const entry of ckptEntries) {
+      const row = document.createElement("div");
+      row.className = "ckpt-row";
+      row.dataset.hash = entry.hash;
+      row.innerHTML =
+        '<span class="ckpt-msg">' + esc(entry.message) + "</span>" +
+        '<span class="ckpt-date">' + esc(entry.date) + "</span>" +
+        '<span class="ckpt-hash mono">' + esc(entry.hash.slice(0, 12)) + "</span>";
+      row.addEventListener("click", () => selectCheckpoint(entry.hash, row));
+      listEl.appendChild(row);
+    }
+  } catch (err) {
+    statusEl.textContent = "";
+    listEl.innerHTML = '<div class="feed-empty">failed to load checkpoints: ' + esc(String(err)) + "</div>";
+  }
+}
+
+function selectCheckpoint(hash, row) {
+  ckptSelectedHash = hash;
+  ckptRestoreArmed = false;
+  const restoreBtn = document.getElementById("btnRestore");
+  restoreBtn.classList.remove("restore-armed");
+  restoreBtn.textContent = "Restore";
+  restoreBtn.disabled = false;
+  document.getElementById("ckptRestoreMsg").textContent = "";
+  document.getElementById("ckptRestoreMsg").className = "ckpt-restore-msg";
+  document.querySelectorAll(".ckpt-row").forEach((r) => r.classList.toggle("selected", r === row));
+  loadDiff(hash);
+}
+
+async function loadDiff(hash) {
+  const diffEl = document.getElementById("ckptDiff");
+  const titleEl = document.getElementById("ckptDiffTitle");
+  const bodyEl = document.getElementById("ckptDiffBody");
+  const entry = ckptEntries.find((e) => e.hash === hash);
+  titleEl.textContent = (entry ? entry.message : hash.slice(0, 12)) + " vs working tree";
+  bodyEl.textContent = "loading diff…";
+  diffEl.style.display = "block";
+  const params = new URLSearchParams({ session: detail.sessionId, from: hash });
+  if (detail.workspace) params.set("repo", detail.workspace);
+  try {
+    const res = await fetch("/api/checkpoints/diff?" + params.toString());
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    bodyEl.textContent = data.diff || "(no changes)";
+  } catch (err) {
+    bodyEl.textContent = "failed to load diff: " + err;
+  }
+}
+
+// Restore is DESTRUCTIVE (reverts real workspace files) — never a single
+// accidental click. First click arms the button (turns red + changes label);
+// second click actually POSTs.
+async function restoreSelected() {
+  const restoreBtn = document.getElementById("btnRestore");
+  const msgEl = document.getElementById("ckptRestoreMsg");
+  if (!ckptSelectedHash) return;
+  if (!ckptRestoreArmed) {
+    ckptRestoreArmed = true;
+    restoreBtn.classList.add("restore-armed");
+    restoreBtn.textContent = "⚠ Really restore?";
+    msgEl.textContent = "this reverts real files in the workspace to the selected checkpoint — uncommitted changes since then are lost";
+    msgEl.className = "ckpt-restore-msg";
+    return;
+  }
+  restoreBtn.disabled = true;
+  msgEl.textContent = "restoring…";
+  msgEl.className = "ckpt-restore-msg";
+  try {
+    const params = new URLSearchParams({ session: detail.sessionId });
+    if (detail.workspace) params.set("repo", detail.workspace);
+    const res = await fetch("/api/checkpoints/restore?" + params.toString(), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ hash: ckptSelectedHash }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      msgEl.textContent = "restore failed: " + (data.error || ("HTTP " + res.status));
+      msgEl.className = "ckpt-restore-msg status-error";
+      restoreBtn.disabled = false;
+      return;
+    }
+    msgEl.textContent = "restored ✓ to " + ckptSelectedHash.slice(0, 12) + " — files reverted";
+    msgEl.className = "ckpt-restore-msg status-success";
+    // Reflect the new state: re-list (restore rewrites the workspace; the
+    // checkpoint set itself is unchanged but the working tree is now at the
+    // restored commit) and refresh the selected diff (now vs the restored
+    // tree, so "no changes" is expected).
+    await loadCheckpoints();
+    if (ckptEntries.some((e) => e.hash === ckptSelectedHash)) {
+      loadDiff(ckptSelectedHash);
+    }
+  } catch (err) {
+    msgEl.textContent = "restore failed: " + err;
+    msgEl.className = "ckpt-restore-msg status-error";
+    restoreBtn.disabled = false;
+  }
+
 }
 
 function renderTotals(totals) {
@@ -450,7 +1080,7 @@ function renderSessions(sessions) {
   // Every row is clickable: opens the live event detail panel for that
   // session (the detail panel polls /api/session/:id/events while open).
   const rows = sessions.map((s) => \`
-    <tr class="session-row" data-session-id="\${esc(s.sessionId)}" data-source="\${esc(s.source)}" data-status="\${esc(s.status)}" style="cursor:pointer">
+    <tr class="session-row" data-session-id="\${esc(s.sessionId)}" data-source="\${esc(s.source)}" data-status="\${esc(s.status)}" data-workspace="\${esc(s.workspaceRoot)}" style="cursor:pointer">
       <td class="mono">\${esc(s.sessionId.slice(0, 8))}</td>
       <td>\${esc(s.mode)}</td>
       <td>\${esc(s.model)}</td>
@@ -475,7 +1105,7 @@ function renderSessions(sessions) {
   // container and read the clicked row's data attributes.
   el.querySelectorAll(".session-row").forEach((row) => {
     row.addEventListener("click", () => {
-      openDetail(row.dataset.sessionId, row.dataset.source, row.dataset.status);
+      openDetail(row.dataset.sessionId, row.dataset.source, row.dataset.status, row.dataset.workspace);
     });
   });
 }
@@ -665,6 +1295,308 @@ async function saveModeModels(table) {
   }
 }
 
+// ── Workspace file browser (dashboard-file-browser-and-permissions-ui) ──────
+// A simple collapsible directory tree — plain vanilla JS, no library. Clicking
+// a directory toggles its children; clicking a file fetches its (capped,
+// binary-safe) content and shows it in a read-only text view. Read-only by
+// design: no file editing from the browser in this pass.
+const fbEl = document.getElementById("fileBrowser");
+const fbMsgEl = document.getElementById("fbMsg");
+const fbRepoInput = document.getElementById("fbRepo");
+
+// Paths currently expanded, relative to the workspace root ("." = root).
+// The tree re-fetches each level on demand — no full recursive walk, so a
+// huge repo stays cheap.
+const fbExpanded = new Set();
+
+function fbMsg(text, isError) {
+  if (!fbMsgEl) return;
+  fbMsgEl.textContent = text;
+  fbMsgEl.className = isError ? "status-error" : "status-success";
+}
+
+function fbRepo() {
+  return (fbRepoInput.value || "").trim();
+}
+
+async function fbFetchDir(relDir) {
+  const params = new URLSearchParams();
+  params.set("repo", fbRepo());
+  if (relDir && relDir !== ".") params.set("dir", relDir);
+  const res = await fetch("/api/files?" + params.toString());
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || ("HTTP " + res.status));
+  }
+  return data.entries || [];
+}
+
+function fmtSize(n) {
+  if (typeof n !== "number") return "";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+// Render one directory level as a <div class="fb-children"> under parentRel.
+// container is the element the level's children get appended to.
+async function renderFbLevel(container, parentRel) {
+  container.innerHTML = '<div class="empty">loading…</div>';
+  let entries;
+  try {
+    entries = await fbFetchDir(parentRel);
+  } catch (err) {
+    container.innerHTML = '<div class="empty">failed: ' + esc(err) + "</div>";
+    return;
+  }
+  container.innerHTML = "";
+  for (const entry of entries) {
+    const rel = parentRel === "." || parentRel === "" ? entry.name : parentRel + "/" + entry.name;
+    const row = document.createElement("div");
+    row.className = "fb-entry " + (entry.type === "dir" ? "dir" : "file");
+    const icon = entry.type === "dir" ? "📁" : "📄";
+    row.innerHTML =
+      '<span class="fb-icon">' + icon + "</span>" +
+      '<span class="fb-name">' + esc(entry.name) + "</span>" +
+      (entry.type === "file" ? '<span class="fb-size">' + esc(fmtSize(entry.size)) + "</span>" : "");
+    if (entry.type === "dir") {
+      const children = document.createElement("div");
+      children.className = "fb-children collapsed";
+      row.appendChild(children);
+      row.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        if (fbExpanded.has(rel)) {
+          fbExpanded.delete(rel);
+          children.classList.add("collapsed");
+          children.innerHTML = "";
+        } else {
+          fbExpanded.add(rel);
+          children.classList.remove("collapsed");
+          renderFbLevel(children, rel);
+        }
+      });
+    } else {
+      row.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        fbPreviewFile(rel);
+      });
+    }
+    container.appendChild(row);
+  }
+  if (entries.length === 0) {
+    container.innerHTML = '<div class="empty">(empty directory)</div>';
+  }
+}
+
+async function fbPreviewFile(rel) {
+  const params = new URLSearchParams();
+  params.set("repo", fbRepo());
+  params.set("file", rel);
+  try {
+    const res = await fetch("/api/files/content?" + params.toString());
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+    fbShowViewer(rel, data);
+  } catch (err) {
+    fbMsg("failed to load file: " + err, true);
+  }
+}
+
+function fbShowViewer(rel, data) {
+  const existing = fbEl.querySelector(".fb-viewer");
+  if (existing) existing.remove();
+  const viewer = document.createElement("div");
+  viewer.className = "fb-viewer";
+  const head = document.createElement("div");
+  head.className = "fb-viewer-head";
+  head.innerHTML = '<span class="fb-path">' + esc(rel) + "</span>" +
+    '<button class="fb-close" title="close">✕</button>';
+  head.querySelector(".fb-close").addEventListener("click", () => viewer.remove());
+  viewer.appendChild(head);
+  const body = document.createElement("div");
+  if (data.previewable) {
+    const pre = document.createElement("pre");
+    pre.className = "fb-content";
+    pre.textContent = data.content;
+    body.appendChild(pre);
+  } else {
+    const note = document.createElement("div");
+    note.className = "fb-note";
+    note.textContent = "not previewable — " + (data.reason || "unknown reason");
+    body.appendChild(note);
+  }
+  viewer.appendChild(body);
+  fbEl.appendChild(viewer);
+  viewer.scrollIntoView({ block: "nearest" });
+}
+
+async function fbLoad() {
+  if (!fbRepo()) {
+    fbMsg("enter a workspace path first", true);
+    return;
+  }
+  fbExpanded.clear();
+  fbMsg("");
+  const tree = fbEl.querySelector(".fb-tree");
+  if (tree) tree.remove();
+  const holder = document.createElement("div");
+  holder.className = "fb-tree";
+  fbEl.appendChild(holder);
+  await renderFbLevel(holder, ".");
+}
+
+// ── Permissions settings (dashboard-file-browser-and-permissions-ui) ────────
+// View + edit allowed/denied command lists, protected-file globs, and the
+// allowProtectedWrites escape hatch. Mirrors the mode-models settings page's
+// UX: load current state, edit in place, Save POSTs and shows the same inline
+// success/error status. When no permissions.json exists yet the page shows
+// the resolved built-in defaults, clearly labeled as defaults.
+const permEl = document.getElementById("permissionsSettings");
+
+function permStatus() {
+  return permEl.querySelector(".perm-status");
+}
+
+function permMsg(text, isError) {
+  const el = permStatus();
+  if (!el) return;
+  el.textContent = text;
+  el.className = "perm-status " + (isError ? "status-error" : "status-success");
+}
+
+// The three list fields are edited as newline-separated text (one entry per
+// line — the natural way to edit a list of command prefixes / globs in a
+// plain textarea, no framework).
+const PERM_LIST_FIELDS = [
+  { key: "allowedCommands", label: "allowed commands", hint: "one command prefix per line — empty = default-ALLOW (deny list still applies)" },
+  { key: "deniedCommands", label: "denied commands", hint: "one command prefix per line — deny always wins" },
+  { key: "protectedFiles", label: "protected files", hint: "one glob per line, e.g. .env, *.pem, secrets/" },
+];
+
+function permListToText(list) {
+  return (list || []).join("\n");
+}
+
+function permTextToList(text) {
+  return text.split("\n").map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
+function renderPermissions(data) {
+  const file = data.file || null;
+  const resolved = data.resolved || {};
+
+  permEl.innerHTML = "";
+
+  const banner = document.createElement("div");
+  banner.className = "sub";
+  if (data.isDefault) {
+    banner.textContent = "No .headlesscode/permissions.json yet — showing the resolved built-in defaults. " +
+      "Saving writes a real config file; until then these defaults apply to every session.";
+  } else {
+    banner.textContent = "Loaded from .headlesscode/permissions.json — this is the file every session reads.";
+  }
+  permEl.appendChild(banner);
+
+  const list = document.createElement("div");
+  list.className = "perm-list";
+
+  // Seed the textareas from the FILE content when present, else from the
+  // resolved defaults (so an empty workspace shows what would actually be
+  // enforced — and saving those defaults is a no-op policy-wise).
+  const seed = file || {
+    allowedCommands: resolved.allowedCommands || [],
+    deniedCommands: resolved.deniedCommands || [],
+    protectedFiles: resolved.protectedFiles || [],
+  };
+
+  for (const field of PERM_LIST_FIELDS) {
+    const div = document.createElement("div");
+    div.className = "perm-field";
+    const label = document.createElement("label");
+    label.textContent = field.label;
+    div.appendChild(label);
+    const ta = document.createElement("textarea");
+    ta.dataset.key = field.key;
+    ta.value = permListToText(seed[field.key]);
+    ta.placeholder = field.hint;
+    div.appendChild(ta);
+    list.appendChild(div);
+  }
+  permEl.appendChild(list);
+
+  // allowProtectedWrites — the escape hatch, labeled as such.
+  const row = document.createElement("div");
+  row.className = "perm-row";
+  const cb = document.createElement("input");
+  cb.type = "checkbox";
+  cb.id = "permAllowWrites";
+  cb.checked = !!seed.allowProtectedWrites;
+  const cbLabel = document.createElement("label");
+  cbLabel.htmlFor = "permAllowWrites";
+  cbLabel.innerHTML = '<span class="mono">allowProtectedWrites</span> — escape hatch: allow writes to protected files (.env, keys, PEMs). <b>Off by default; turning this on weakens protection for every future session.</b>';
+  row.appendChild(cb);
+  row.appendChild(cbLabel);
+  permEl.appendChild(row);
+
+  const actions = document.createElement("div");
+  actions.className = "perm-actions";
+  const saveBtn = document.createElement("button");
+  saveBtn.textContent = "💾 Save permissions";
+  saveBtn.addEventListener("click", () => savePermissions());
+  actions.appendChild(saveBtn);
+  const msg = document.createElement("span");
+  msg.className = "perm-status";
+  actions.appendChild(msg);
+  permEl.appendChild(actions);
+}
+
+function currentPermissionsPayload() {
+  const payload = {};
+  for (const field of PERM_LIST_FIELDS) {
+    const ta = permEl.querySelector('textarea[data-key="' + field.key + '"]');
+    const list = ta ? permTextToList(ta.value) : [];
+    if (list.length > 0) payload[field.key] = list;
+  }
+  const cb = document.getElementById("permAllowWrites");
+  if (cb) payload.allowProtectedWrites = cb.checked;
+  return payload;
+}
+
+async function savePermissions() {
+  permMsg("saving…", false);
+  const payload = currentPermissionsPayload();
+  try {
+    const res = await fetch("/api/settings/permissions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      permMsg("save failed: " + (data.error || ("HTTP " + res.status)), true);
+      return;
+    }
+    permMsg("saved ✓ — permissions.json written. Takes effect on the next session.", false);
+    // Refresh the GET so the page reflects the now-customized state.
+    loadPermissions();
+  } catch (err) {
+    permMsg("save failed: " + err, true);
+  }
+}
+
+async function loadPermissions() {
+  const params = new URLSearchParams();
+  if (fbRepo()) params.set("repo", fbRepo());
+  try {
+    const res = await fetch("/api/settings/permissions?" + params.toString());
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+    renderPermissions(data);
+  } catch (err) {
+    permEl.innerHTML = '<div class="empty">failed to load permissions settings: ' + esc(err) + "</div>";
+  }
+}
+
 // ── Start a session (browser control plane) ─────────────────────────────────
 // POSTs the typed prompt to /api/session/start, then navigates straight to
 // that session's live event view — the whole point is the user watches it
@@ -696,7 +1628,7 @@ async function startSession() {
       return;
     }
     // Navigate immediately to the new session's live event view.
-    openDetail(data.sessionId, ".", "running");
+    openDetail(data.sessionId, ".", "running", data.workspace);
     msg.textContent = "launched ✓ session " + data.sessionId.slice(0, 8) + " — watching its event feed";
     msg.className = "status-success";
   } catch (err) {
@@ -842,6 +1774,19 @@ document.getElementById("detailClose").addEventListener("click", closeDetail);
 document.getElementById("btnPause").addEventListener("click", () => controlSession("pause"));
 document.getElementById("btnResume").addEventListener("click", () => controlSession("resume"));
 document.getElementById("btnStart").addEventListener("click", startSession);
+// Chat-thread vs. flat event-log toggle: both render the same feed data.
+document.getElementById("tabLog").addEventListener("click", () => setView("log"));
+document.getElementById("tabChat").addEventListener("click", () => setView("chat"));
+document.getElementById("btnRestore").addEventListener("click", restoreSelected);
+
+document.getElementById("fbLoad").addEventListener("click", fbLoad);
+// Enter in the file-browser repo box loads too.
+document.getElementById("fbRepo").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") {
+    ev.preventDefault();
+    fbLoad();
+  }
+});
 // Enter in the task box submits too (shift+enter for a newline).
 document.getElementById("launchTask").addEventListener("keydown", (ev) => {
   if (ev.key === "Enter" && !ev.shiftKey) {
@@ -856,6 +1801,7 @@ document.getElementById("feed").addEventListener("scroll", () => {
 
 poll();
 loadModeModels();
+loadPermissions();
 loadModes();
 setInterval(poll, 4000);
 // Live event feed poll: faster than the summary poll (1.5s) so the detail

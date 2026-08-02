@@ -40,8 +40,32 @@ interface CliOptions {
 	consecutiveErrorLimit?: number
 	/** Sliding-window history cap, in messages (also see DEFAULT_WINDOW_SIZE in engine/loop.ts). */
 	windowSize?: number
+	/**
+	 * Phase 3 context condensation: the model's real context window in
+	 * tokens (default: live OpenRouter lookup, else
+	 * DEFAULT_CONTEXT_WINDOW_TOKENS in src/engine/condense.ts).
+	 */
+	contextWindowTokens?: number
+	/**
+	 * Phase 3 context condensation: fraction of the context window at which
+	 * the oldest turns are condensed (default
+	 * DEFAULT_CONDENSE_THRESHOLD_FRACTION in src/engine/condense.ts).
+	 */
+	condenseThreshold?: number
+	/**
+	 * Phase 3 context condensation: model id for the condensation call
+	 * (default: the session model, or the `_condensation` key in
+	 * .headlesscode/mode-models.json).
+	 */
+	condenseModel?: string
 	/** Per-LLM-call abort timeout, ms (default: DEFAULT_LLM_TIMEOUT_MS in engine/loop.ts). */
 	llmTimeoutMs?: number
+	/**
+	 * Streaming-and-reasoning: opt-in SSE streaming (default OFF — the
+	 * blocking request path is unchanged). Also settable via
+	 * $HEADLESSCODE_STREAM ("1"/"true"/"yes"/"on").
+	 */
+	stream: boolean
 	/** Phase 6: per-session cost cap, USD (also $HEADLESSCODE_MAX_COST_USD). */
 	maxCostUsd?: number
 	/** Phase 6: per-session duration cap, ms (also $HEADLESSCODE_MAX_DURATION_MS). */
@@ -93,10 +117,11 @@ Subcommands:
               event feed and pause/resume control (Phase 3: no longer purely
               read-only — see src/dashboard/server.ts). See
               \`npx tsx src/cli.ts dashboard --help\` for full options.
-  headlesscode index --workspace <path> [--model <id>]
+  headlesscode index --workspace <path> [--model <id>] [--embedding-backend <b>]
               Build/refresh the codebase semantic-search index for a workspace
               (used by the codebase_search tool). A separate, explicit step —
-              never auto-triggered mid-session. See
+              never auto-triggered mid-session. --embedding-backend picks
+              openrouter (default) or ollama (local). See
               \`npx tsx src/cli.ts index --help\` for full options.
   headlesscode provision --installation-id <id> --owner <o> --repo <r> --target <dir>
               Clone a GitHub repo the App installation can access into a local
@@ -119,6 +144,16 @@ Options:
   --window-size <n>          Sliding-window history cap, in messages, before the
                              oldest are evicted (default: 300; see DEFAULT_WINDOW_SIZE
                              in src/engine/loop.ts for why)
+  --context-window <n>       Phase 3 context condensation: the model's real context
+                             window in tokens (default: live OpenRouter lookup, else
+                             128000; see DEFAULT_CONTEXT_WINDOW_TOKENS in
+                             src/engine/condense.ts)
+  --condense-threshold <f>   Phase 3 context condensation: fraction of the context
+                             window at which the oldest turns are condensed into one
+                             summary (default: 0.75; must be between 0 and 1)
+  --condense-model <id>      Phase 3 context condensation: model id for the
+                             condensation call (default: the session model, or the
+                             _condensation key in .headlesscode/mode-models.json)
   --llm-timeout-ms <n>       Per-LLM-call abort timeout, ms (default: 300000 / 5 min
                              — reasoning models can take a while on a heavy turn)
   --log-file <path>          Also append structured logs to this file
@@ -164,6 +199,11 @@ Options:
                                (default: OFF). Also settable via
                                "allowProtectedWrites": true in
                                .headlesscode/permissions.json
+  --stream                   Opt-in SSE streaming (streaming-and-reasoning):
+                               stream token/reasoning deltas and emit
+                               llm_stream_chunk events for live-typing view.
+                               Default: OFF (blocking requests unchanged).
+                               Also settable via $HEADLESSCODE_STREAM
   --version                  Print version and exit
   --help                     Show this help and exit
 
@@ -179,6 +219,7 @@ Environment:
   HEADLESSCODE_DENIED_COMMANDS    Default --denied-commands (comma-separated)
   HEADLESSCODE_PROTECTED_FILES    Default --protected-files (comma-separated globs)
   HEADLESSCODE_ALLOW_PROTECTED_WRITES  Allow protected-file writes ("1"/"true")
+  HEADLESSCODE_STREAM          Opt-in SSE streaming ("1"/"true"/"yes"/"on")
 `
 
 export function parseArgs(argv: string[]): { options: CliOptions; error?: string } {
@@ -190,6 +231,7 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 		help: false,
 		noCheckpoints: false,
 		allowProtectedWrites: false,
+		stream: false,
 	}
 
 	for (let i = 0; i < argv.length; i++) {
@@ -249,6 +291,7 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 			case "--max-iterations":
 			case "--consecutive-error-limit":
 			case "--window-size":
+			case "--context-window":
 			case "--llm-timeout-ms": {
 				const value = next()
 				const num = value === undefined ? Number.NaN : Number(value)
@@ -261,9 +304,28 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 					options.consecutiveErrorLimit = num
 				} else if (flag === "--window-size") {
 					options.windowSize = num
+				} else if (flag === "--context-window") {
+					options.contextWindowTokens = num
 				} else {
 					options.llmTimeoutMs = num
 				}
+				break
+			}
+			case "--condense-threshold": {
+				const value = next()
+				const num = value === undefined ? Number.NaN : Number(value)
+				if (!Number.isFinite(num) || num <= 0 || num >= 1) {
+					return { options, error: "--condense-threshold requires a fraction between 0 and 1 (e.g. 0.75)" }
+				}
+				options.condenseThreshold = num
+				break
+			}
+			case "--condense-model": {
+				const value = next()
+				if (value === undefined) {
+					return { options, error: "Missing value for --condense-model" }
+				}
+				options.condenseModel = value
 				break
 			}
 			case "--max-cost-usd": {
@@ -328,6 +390,9 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 			}
 			case "--allow-protected-writes":
 				options.allowProtectedWrites = true
+				break
+			case "--stream":
+				options.stream = true
 				break
 			case "--checkpoint-dir": {
 				const value = next()
@@ -510,6 +575,21 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	})
 	const client = new OpenRouterClient({ apiKey, defaultModel: model })
 
+	// Phase 3 context condensation: a cheaper model for the condensation
+	// call can be assigned via the `_condensation` key in
+	// .headlesscode/mode-models.json (consulted after `mode`, before
+	// `_default`). An explicit --condense-model flag always wins; otherwise
+	// the session model is used (same model = simplest, consistent quality).
+	const condenseModel =
+		options.condenseModel ??
+		resolveModelForMode({
+			workspaceRoot,
+			mode: options.mode,
+			explicitModel: undefined,
+			extraKeys: ["_condensation"],
+			env: process.env,
+		})
+
 	// Phase 3 memory: OFF by default (preserves pre-Phase-3 behavior). Enabled
 	// only by --memory-dir or $HEADLESSCODE_MEMORY_DIR; --no-memory forces off.
 	const memory = resolveMemory(options, workspaceRoot)
@@ -563,7 +643,11 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		maxIterations: options.maxIterations,
 		consecutiveErrorLimit: options.consecutiveErrorLimit,
 		windowSize: options.windowSize,
+		contextWindowTokens: options.contextWindowTokens,
+		condenseThresholdFraction: options.condenseThreshold,
+		condenseModel,
 		llmTimeoutMs: options.llmTimeoutMs,
+		stream: options.stream,
 		llmClient: client,
 		logger,
 		memory,

@@ -18,10 +18,14 @@
  *     repeated calls / empty replies) exceeded. Also any LLM call error or
  *     timeout aborts the session with an error.
  *
- * History truncation (Phase 1 placeholder): the system message and the first
- * user message are always kept; when the history exceeds `windowSize`, the
- * oldest non-system, non-first-user messages are dropped before each request.
- * Proper token-based condensation is Phase 3.
+ * History management: Phase 1 sliding-window truncation PLUS Phase 3 token-
+ * budget-aware condensation (see src/engine/condense.ts). The system message
+ * and the first user message are always kept; when the history exceeds
+ * `windowSize` messages, the oldest non-system, non-first-user messages are
+ * dropped before each request — UNLESS the last request's real prompt-token
+ * count crossed the condensation threshold, in which case the oldest turns
+ * are first summarized into one compact synthetic message instead of being
+ * dropped outright (see `maybeCondenseHistory`).
  *
  * The loop is non-interactive by construction: no approval prompts, no
  * webview. `ask_followup_question` calls escalate instead of failing
@@ -50,9 +54,16 @@ import { recordSessionUsage, removeLiveUsage, writeLiveUsage } from "./usage.js"
 import { EventFeed, EVENT_TRUNCATE_CHARS, truncateField } from "./events.js"
 import { Logger } from "./logger.js"
 import { parseToolCalls } from "./parser.js"
-import { buildSystemPrompt, loadCustomModes, selectToolsForMode } from "./prompt.js"
-import type { ChatMessage, ChatTool, LlmClient, SessionResult, SessionBudgetUsage } from "./types.js"
+import { appendBrowserActionTool, buildSystemPrompt, loadCustomModes, selectToolsForMode } from "./prompt.js"
+import type { ChatMessage, ChatTool, LlmClient, LlmResponse, SessionResult, SessionBudgetUsage } from "./types.js"
 import type { ModeConfig } from "@roo-code/types"
+import {
+	computeEvictCount,
+	DEFAULT_CONDENSE_THRESHOLD_FRACTION,
+	DEFAULT_CONTEXT_WINDOW_TOKENS,
+	maybeCondense,
+	skipOrphanedToolMessages,
+} from "./condense.js"
 
 /** Default max pause duration for dashboard-initiated pauses, ms (matches watch.ts's stall guard). */
 export const DEFAULT_MAX_PAUSE_MS = 2 * 60 * 60 * 1000
@@ -119,8 +130,44 @@ export interface HeadlessSessionConfig {
 	maxTokens?: number
 	/** Abort timeout per LLM call, ms (default 120s). */
 	llmTimeoutMs?: number
+	/**
+	 * Opt-in SSE streaming (streaming-and-reasoning, default OFF). When true,
+	 * LLM calls stream token/reasoning deltas and the loop emits incremental
+	 * `llm_stream_chunk` events so the dashboard can show live-typing text.
+	 * Default OFF — the blocking request path (which the e2e fixtures and
+	 * most tests assume) is unchanged.
+	 */
+	stream?: boolean
 	/** Sliding-window cap on messages sent per request (default 40). */
 	windowSize?: number
+	/**
+	 * Phase 3 context condensation: the model's real context window in
+	 * tokens, used to decide WHEN to condense (the last request's real
+	 * prompt-token count vs. `condenseThresholdFraction` of this). When
+	 * unset, the session tries OpenRouter's `/api/v1/models/<id>/endpoints`
+	 * once (via `fetchModelContextWindow`), then falls back to
+	 * `DEFAULT_CONTEXT_WINDOW_TOKENS` (see src/engine/condense.ts).
+	 */
+	contextWindowTokens?: number
+	/**
+	 * Phase 3 context condensation: fraction of the context window at which
+	 * the oldest turns get summarized into one synthetic message (default
+	 * DEFAULT_CONDENSE_THRESHOLD_FRACTION = 0.75 — see condense.ts's header
+	 * for the reasoning).
+	 */
+	condenseThresholdFraction?: number
+	/**
+	 * Phase 3 context condensation: model id used for the condensation LLM
+	 * call (default: the session model). A cheaper model can be assigned via
+	 * the `_condensation` key in `<workspaceRoot>/.headlesscode/mode-models.json`
+	 * (see src/config/mode-models.ts's extraKeys).
+	 */
+	condenseModel?: string
+	/**
+	 * Phase 3 context condensation: max output tokens for the condensation
+	 * call (default: the session's `maxTokens`, if set).
+	 */
+	condenseMaxTokens?: number
 	globalCustomInstructions?: string
 	/**
 	 * Phase 3 memory store (default null = memory OFF, zero behavior change).
@@ -207,7 +254,22 @@ export interface ResolvedSessionConfig {
 	consecutiveErrorLimit: number
 	systemPromptOverride?: string
 	llmTimeoutMs: number
+	/** Opt-in SSE streaming (streaming-and-reasoning; default false). */
+	stream: boolean
 	windowSize: number
+	/**
+	 * Phase 3 context condensation: the model's real context window in
+	 * tokens, when explicitly configured (undefined = resolve live from
+	 * OpenRouter's models endpoint once, then fall back to
+	 * DEFAULT_CONTEXT_WINDOW_TOKENS — see maybeCondenseHistory).
+	 */
+	contextWindowTokens?: number
+	/** Phase 3 context condensation: resolved trigger fraction. */
+	condenseThresholdFraction: number
+	/** Phase 3 context condensation: model used for the condensation call. */
+	condenseModel: string
+	/** Phase 3 context condensation: max output tokens for the condensation call. */
+	condenseMaxTokens?: number
 	temperature?: number
 	maxTokens?: number
 	globalCustomInstructions?: string
@@ -271,6 +333,27 @@ export class HeadlessSession {
 	private readonly eventHook?: (eventType: string, fields: Record<string, unknown>) => void
 	/** The most recent LLM call's token usage (for the llm_response event). */
 	private lastLlmUsage: { inputTokens: number; outputTokens: number; cachedTokens: number } | null = null
+	/**
+	 * Phase 3 context condensation: how far the oldest turns have ALREADY
+	 * been condensed. Mutable OBJECT passed by reference into `maybeCondense`
+	 * (a private field cannot be passed by reference directly, and a fresh
+	 * wrapper per call would discard the mutation). Values: 0 = nothing
+	 * condensed yet; 2 = condensation ran and the summary now sits at index
+	 * 2. Re-condensation is gated on the uncompressed tail having grown past
+	 * MIN_CONDENSE_TAIL_GROWTH — this is what keeps the condensed prefix
+	 * STABLE across many subsequent calls (the condensation equivalent of
+	 * `truncateHistory`'s fixed-batch eviction — see constraint 5 in
+	 * plans/context-condensation.md).
+	 */
+	private readonly condensedUpToMsgIndex: { value: number } = { value: 0 }
+	/** True while a condensation LLM call is in flight (see maybeCondense). */
+	private readonly condenseInFlight: { value: boolean } = { value: false }
+	/**
+	 * True once the real context window has been resolved (from config, the
+	 * OpenRouter models endpoint, or the conservative default) — the lookup
+	 * is done at most once per session, on the first iteration that needs it.
+	 */
+	private contextWindowResolved = false
 
 	constructor(config: HeadlessSessionConfig) {
 		if (!config.llmClient) {
@@ -289,7 +372,17 @@ export class HeadlessSession {
 			consecutiveErrorLimit: config.consecutiveErrorLimit ?? DEFAULT_CONSECUTIVE_ERROR_LIMIT,
 			systemPromptOverride: config.systemPromptOverride,
 			llmTimeoutMs: config.llmTimeoutMs ?? DEFAULT_LLM_TIMEOUT_MS,
+			stream: config.stream ?? envStreaming(),
 			windowSize: config.windowSize ?? DEFAULT_WINDOW_SIZE,
+			// Deliberately left undefined when the caller didn't configure it:
+			// the live OpenRouter models-endpoint lookup in maybeCondenseHistory
+			// resolves the real context window (never hardcode a stale number —
+			// constraint 1 of plans/context-condensation.md), with
+			// DEFAULT_CONTEXT_WINDOW_TOKENS as the conservative fallback.
+			contextWindowTokens: config.contextWindowTokens,
+			condenseThresholdFraction: config.condenseThresholdFraction ?? DEFAULT_CONDENSE_THRESHOLD_FRACTION,
+			condenseModel: config.condenseModel ?? config.model ?? process.env.OPENROUTER_MODEL ?? DEFAULT_MODEL,
+			condenseMaxTokens: config.condenseMaxTokens,
 			logger: config.logger,
 			temperature: config.temperature,
 			maxTokens: config.maxTokens,
@@ -385,7 +478,10 @@ export class HeadlessSession {
 				customModes,
 				globalCustomInstructions: this.config.globalCustomInstructions,
 			})).prompt
-		const tools = this.config.tools ?? selectToolsForMode(mode, customModes)
+		// browser_action is not part of the vendored tool set, so
+		// selectToolsForMode can't include it — append it explicitly so the
+		// model can launch a browser mid-session (see src/tools/browser/).
+		const tools = appendBrowserActionTool(this.config.tools ?? selectToolsForMode(mode, customModes))
 
 		this.state.systemPrompt = systemPrompt
 		this.state.tools = tools
@@ -671,6 +767,131 @@ export class HeadlessSession {
 		}
 	}
 
+	/**
+	 * Phase 3 context condensation: resolve the model's real context window
+	 * (once per session) and, when the LAST request's real prompt tokens
+	 * crossed the threshold, replace the oldest turns with one synthetic
+	 * summary message. Non-fatal: any failure falls back to
+	 * `truncateHistory` for that call. The condensation call's own usage is
+	 * fed into the SAME BudgetTracker + running totals as the main session
+	 * (constraint 2 — never invisible spend).
+	 */
+	private async maybeCondenseHistory(
+		messages: ChatMessage[],
+		budgetTracker: BudgetTracker,
+	): Promise<ChatMessage[]> {
+		if (!(this.lastLlmUsage && this.lastLlmUsage.inputTokens > 0)) {
+			return messages
+		}
+		const config = this.config
+
+		// Resolve the real context window at most once per session: explicit
+		// config wins, then a live OpenRouter lookup (the same
+		// /api/v1/models/<id>/endpoints source the pricing table was verified
+		// against), then the conservative default.
+		let contextWindowTokens = config.contextWindowTokens
+		if (contextWindowTokens === undefined) {
+			contextWindowTokens = DEFAULT_CONTEXT_WINDOW_TOKENS
+			if (!this.contextWindowResolved) {
+				this.contextWindowResolved = true
+				const client = this.llmClient as {
+					fetchModelContextWindow?: (model: string) => Promise<number | undefined>
+				}
+				try {
+					const live = await client.fetchModelContextWindow?.(config.model)
+					if (live !== undefined && live > 0) {
+						contextWindowTokens = live
+						this.logger.info("[condense] resolved live context window from OpenRouter models endpoint", {
+							model: config.model,
+							contextWindowTokens: live,
+						})
+					}
+				} catch (error) {
+					this.logger.warn("[condense] live context-window lookup failed (non-fatal; using conservative default)", {
+						error: error instanceof Error ? error.message : String(error),
+					})
+				}
+			}
+		}
+
+		try {
+			const condensed = await maybeCondense({
+				llmClient: this.llmClient,
+				logger: this.logger,
+				messages,
+				model: config.model,
+				lastPromptTokens: this.lastLlmUsage.inputTokens,
+				contextWindowTokens,
+				thresholdFraction: config.condenseThresholdFraction,
+				condensedUpTo: this.condensedUpToMsgIndex,
+				condenseInFlight: this.condenseInFlight,
+				condenseModel: config.condenseModel,
+				condenseMaxTokens: config.condenseMaxTokens ?? config.maxTokens,
+				condenseAbortSignal: undefined,
+				onUsage: (usage) => this.recordCondensationUsage(usage, budgetTracker),
+			})
+			if (condensed !== null) {
+				// Replace the working state IN PLACE so the loop's local
+				// `messages` reference (aliased to this.state.messages) and
+				// this.state.messages both see the condensed array — the
+				// sent prefix then stays stable across subsequent calls
+				// (never re-condense the same chunk).
+				messages.splice(0, messages.length, ...condensed)
+				return messages
+			}
+			return messages
+		} catch (error) {
+			// A budget trip from the condensation call's usage accounting is
+			// NOT non-fatal — it must abort the session exactly like a main
+			// call's record() trip (never silently under-report spend).
+			if (error instanceof BudgetExceededError) {
+				throw error
+			}
+			// Non-fatal: fall back to truncateHistory for this call.
+			this.logger.warn("[condense] condensation failed (non-fatal; falling back to message-count truncation)", {
+				error: error instanceof Error ? error.message : String(error),
+			})
+			return messages
+		}
+	}
+
+	/**
+	 * Feed a condensation call's usage into the same BudgetTracker + running
+	 * totals as the main session (constraint 2). Mirrors the main call's
+	 * accounting block in runIterations — including the budget-limit trip
+	 * path (a condensation call that pushes spend over a configured cap must
+	 * abort the session exactly like a main call would).
+	 */
+	private recordCondensationUsage(
+		usage: NonNullable<LlmResponse["usage"]>,
+		budgetTracker: BudgetTracker,
+	): void {
+		const inputTokens = usage.promptTokens ?? 0
+		const outputTokens = usage.completionTokens ?? 0
+		const cachedTokens = usage.cachedTokens ?? 0
+		this.totalInputTokens += inputTokens
+		this.totalOutputTokens += outputTokens
+		this.totalCachedTokens += cachedTokens
+		try {
+			budgetTracker.record({
+				model: this.config.condenseModel,
+				inputTokens,
+				outputTokens,
+				cachedTokens,
+			})
+		} catch (err) {
+			// Rethrow — the caller (runIterations) turns a BudgetExceededError
+			// into a budgetFailure result, same as a main call's record() trip.
+			throw err
+		}
+		this.logger.info("[usage] condensation call recorded", {
+			inputTokens,
+			outputTokens,
+			cachedTokens,
+			costUsd: budgetTracker.totalCostUsd,
+		})
+	}
+
 	private async runIterations(budgetTracker: BudgetTracker, startedAt: string): Promise<SessionResult> {
 		const { maxIterations, consecutiveErrorLimit } = this.config
 		const messages = this.state.messages
@@ -702,8 +923,28 @@ export class HeadlessSession {
 				throw err
 			}
 
-			// 3. Sliding-window truncation (Phase 1 placeholder).
-			const requestMessages = truncateHistory(messages, this.config.windowSize)
+			// 3. Phase 3 context condensation + sliding-window truncation.
+			// Condensation runs FIRST: when the last request's real prompt
+			// tokens crossed the token threshold, the oldest turns are
+			// summarized into one synthetic message (non-fatal — on any
+			// failure this just returns the messages unchanged, and
+			// truncateHistory below still bounds the request). It runs
+			// infrequently by design (batch-once-stable prefix — see
+			// maybeCondenseHistory), so the sliding-window fallback remains
+			// the cheap default for the vast majority of calls. The ONE
+			// exception to non-fatal: a budget trip from the condensation
+			// call's own usage accounting aborts the session like a main
+			// call (constraint 2 — condensation spend is never invisible).
+			let requestMessages: ChatMessage[]
+			try {
+				requestMessages = await this.maybeCondenseHistory(messages, budgetTracker)
+			} catch (err) {
+				if (err instanceof BudgetExceededError) {
+					return this.budgetFailure(err, iteration, toolCalls)
+				}
+				throw err
+			}
+			requestMessages = truncateHistory(requestMessages, this.config.windowSize)
 
 			// 4. Call the LLM with an abort timeout.
 			let assistant: ChatMessage
@@ -718,6 +959,17 @@ export class HeadlessSession {
 						temperature: this.config.temperature,
 						maxTokens: this.config.maxTokens,
 						signal: controller.signal,
+						stream: this.config.stream,
+						onStreamChunk: (kind, chunk) => {
+							// Dashboard live-typing: forward each chunk to the event
+							// feed (truncated like other large fields). Non-fatal —
+							// a feed write failure must never abort the LLM call.
+							void this.emitEvent(
+								"llm_stream_chunk",
+								() => this.eventFeed.llmStreamChunk({ iteration, kind, chunk }),
+								{ iteration },
+							)
+						},
 					})
 					assistant = response.message
 					// Cost/token accounting (workstream 3): feed the provider's usage
@@ -788,9 +1040,9 @@ export class HeadlessSession {
 			}
 
 			// Live worker monitoring: emit the llm_response event (a short
-			// text preview, whether the response carried tool_calls, and this
-			// call's token usage incl. cachedTokens — see src/engine/events.ts).
-			// Non-fatal.
+			// text preview, whether the response carried tool_calls, this
+			// call's token usage incl. cachedTokens, and any reasoning
+			// content — see src/engine/events.ts). Non-fatal.
 			{
 				const text = typeof assistant.content === "string" ? assistant.content.trim() : ""
 				await this.emitEvent(
@@ -800,6 +1052,14 @@ export class HeadlessSession {
 							iteration,
 							hadToolCalls: Array.isArray(assistant.tool_calls) && assistant.tool_calls.length > 0,
 							textPreview: text || undefined,
+							// The full reasoning string: EventFeed.llmResponse
+							// truncates it (EVENT_TRUNCATE_CHARS) and flags the cut,
+							// exactly once — pre-truncating here would double-truncate
+							// and lose the truncated flag for boundary-length content.
+							reasoningPreview:
+								typeof assistant.reasoning === "string" && assistant.reasoning.trim()
+									? assistant.reasoning
+									: undefined,
 							inputTokens: this.lastLlmUsage?.inputTokens,
 							outputTokens: this.lastLlmUsage?.outputTokens,
 							cachedTokens: this.lastLlmUsage?.cachedTokens,
@@ -808,11 +1068,16 @@ export class HeadlessSession {
 				)
 			}
 
-			// 5. Append the assistant message.
+			// 5. Append the assistant message. Reasoning is echoed back on the
+			// assistant history message (OpenRouter accepts it and providers
+			// like native DeepSeek drop prior reasoning if it is not echoed on
+			// assistant messages within tool-call turns — see api-docs.deepseek.com
+			// /guides/thinking_mode). Harmless for providers that ignore it.
 			const assistantMessage: ChatMessage = {
 				role: "assistant",
 				content: assistant.content ?? null,
 				tool_calls: assistant.tool_calls,
+				reasoning: assistant.reasoning,
 			}
 			messages.push(assistantMessage)
 
@@ -1199,7 +1464,12 @@ export const TRUNCATION_BATCH_SIZE = 10
  * Documented placeholder: Phase 3 replaces this with token-count-based
  * condensation (summarize + merge) using the model's real token counts —
  * this batching is a small, targeted fix for the caching regression above,
- * not a substitute for that.
+ * not a substitute for that. Phase 3 is now implemented (see
+ * src/engine/condense.ts + `maybeCondenseHistory`): when the last request's
+ * real prompt tokens cross the condensation threshold, the oldest turns are
+ * summarized into one synthetic message BEFORE this drop-oldest fallback
+ * runs. This function remains the cheap default for sessions that never
+ * cross the token threshold (constraint 4 of plans/context-condensation.md).
  *
  * 2026-08-01 fix: the batch boundary above is purely positional and doesn't
  * know about the OpenAI tool-call protocol, where an assistant message with
@@ -1212,7 +1482,11 @@ export const TRUNCATION_BATCH_SIZE = 10
  * HTTP 400 ("Messages with role 'tool' must be a response to a preceding
  * message with 'tool_calls'") — confirmed live against a real session at
  * iteration 17. Fix: after the batch cut, skip forward over any leading
- * orphaned `tool` messages so the kept tail never starts mid-group.
+ * orphaned `tool` messages so the kept tail never starts mid-group. The
+ * count computation + orphaned-tool skip now live in the SHARED helpers
+ * `computeEvictCount` / `skipOrphanedToolMessages` (src/engine/condense.ts),
+ * so the token-aware condensation path (`computeCondenseCount`) enforces the
+ * same group-boundary invariant from one implementation.
  */
 export function truncateHistory(messages: ChatMessage[], windowSize: number): ChatMessage[] {
 	if (messages.length <= windowSize) {
@@ -1221,12 +1495,9 @@ export function truncateHistory(messages: ChatMessage[], windowSize: number): Ch
 	const system = messages[0]
 	const firstUser = messages[1]
 	const rest = messages.slice(2)
-	const overflow = rest.length - (windowSize - 2)
-	let evictCount = Math.ceil(overflow / TRUNCATION_BATCH_SIZE) * TRUNCATION_BATCH_SIZE
-	while (evictCount < rest.length && rest[evictCount].role === "tool") {
-		evictCount++
-	}
-	const keptTail = rest.slice(evictCount)
+	const evictCount = computeEvictCount(rest.length, windowSize, TRUNCATION_BATCH_SIZE)
+	const keptTailStart = skipOrphanedToolMessages(rest, evictCount)
+	const keptTail = rest.slice(keptTailStart)
 	return [system, firstUser, ...keptTail]
 }
 
@@ -1243,4 +1514,18 @@ function envMaxPauseMs(): number | undefined {
 	}
 	const n = Number(raw)
 	return Number.isFinite(n) && n > 0 ? n : undefined
+}
+
+/**
+ * Streaming-and-reasoning: resolve the SSE-streaming opt-in from
+ * `$HEADLESSCODE_STREAM` (accepted: "1", "true", "yes", "on"; anything else
+ * — including unset — means OFF). Default OFF deliberately: the blocking
+ * request path (which the e2e fixtures and most tests assume) is unchanged.
+ */
+function envStreaming(): boolean {
+	const raw = process.env.HEADLESSCODE_STREAM
+	if (raw === undefined || raw === "") {
+		return false
+	}
+	return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase())
 }

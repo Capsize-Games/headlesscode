@@ -1,0 +1,7 @@
+Here is the summarized output, keeping only errors/warnings/failures and their exact messages:
+
+**No errors or warnings found in this output.**
+
+The provided command output appears to be a large code file with many lines of TypeScript code, but it does not contain any error or warning messages. The code seems to be well-formatted and free of syntax errors.
+
+If you would like me to review the code for potential issues or suggest improvements, please let me know!

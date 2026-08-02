@@ -1,0 +1,297 @@
+> headlesscode@0.1.0 test
+> tsx src/engine/__tests__/loop.test.ts
+
+  ok   loop: session completes with tool call
+  ok   loop: session completes without tool call
+  ok   loop: bounded failure after consecutive mistakes
+  ok   loop: budget abort
+  ok   loop: pause/resume
+  ok   loop: memory recall + record wiring
+  ok   loop: checkpoint wiring
+  ok   loop: global modes
+  ok   loop: event feed
+
+All 9 loop tests passed
+> tsx src/orchestrator/__tests__/split.test.ts
+
+  ok   split: two workers
+  ok   split: three workers
+  ok   split: zero workers rejected
+  ok   split: worker with no issues
+  ok   split: worker with explicit issues
+
+All 5 split tests passed
+> tsx src/orchestrator/__tests__/state.test.ts
+
+  ok   state: round lifecycle
+  ok   state: worker status transitions
+  ok   state: crash recovery
+  ok   state: stale worker pruning
+
+All 4 state tests passed
+> tsx src/orchestrator/__tests__/reviewer.test.ts
+
+  ok   reviewer: invokes reviewer on completion
+  ok   reviewer: reviewer failure is non-fatal
+
+All 2 reviewer tests passed
+> tsx src/orchestrator/__tests__/cli.test.ts
+
+  ok   cli: parses --issues
+  ok   cli: parses --workers
+  ok   cli: rejects unknown flag
+
+All 3 cli tests passed
+> tsx src/orchestrator/__tests__/spawn-model.test.ts
+
+  ok   spawn-model: resolves model per mode
+  ok   spawn-model: falls back to default
+
+All 2 spawn-model tests passed
+> tsx src/qa/__tests__/qa.test.ts
+
+  ok   qa: runs and reports
+  ok   qa: failure reported
+
+All 2 qa tests passed
+> tsx src/deploy/__tests__/gate.test.ts
+
+  ok   gate: blocks on failing check
+  ok   gate: passes on green check
+  ok   gate: requires checks
+
+All 3 gate tests passed
+> tsx src/memory/__tests__/embed.test.ts
+
+  ok   embed: deterministic hash embedder
+  ok   embed: chunked embedding
+
+All 2 embed tests passed
+> tsx src/memory/__tests__/local.test.ts
+
+  ok   local: create + query
+
+All 1 local tests passed
+> tsx src/memory/__tests__/summarizer.test.ts
+
+  ok   summarizer: extracts facts
+  ok   summarizer: rolling summary
+
+All 2 summarizer tests passed
+> tsx src/memory/__tests__/memory-wiring.test.ts
+
+  ok   memory-wiring: session records memory
+
+All 1 memory-wiring tests passed
+> tsx src/memory/__tests__/uwuchat.test.ts
+
+  ok   uwuchat: chat client contract
+
+All 1 uwuchat tests passed
+> tsx src/watcher/__tests__/github.test.ts
+
+  ok   github: app auth flow
+  ok   github: issue webhook parse
+
+All 2 github tests passed
+> tsx src/watcher/__tests__/state.test.ts
+
+  ok   watcher-state: round lifecycle
+
+All 1 watcher-state tests passed
+> tsx src/watcher/__tests__/watch.test.ts
+
+  ok   watch: polls and detects issues
+
+All 1 watch tests passed
+> tsx src/budget/__tests__/cost.test.ts
+
+  ok   cost: pricing table lookup
+  ok   cost: cost accumulation
+
+All 2 cost tests passed
+> tsx src/budget/__tests__/budget.test.ts
+
+  ok   budget: duration budget
+  ok   budget: token budget
+
+All 2 budget tests passed
+> tsx src/budget/__tests__/concurrency.test.ts
+
+  ok   concurrency: serializes
+
+All 1 concurrency tests passed
+> tsx src/cloud/__tests__/provider.test.ts
+
+  ok   cloud: provider lifecycle
+
+All 1 provider tests passed
+> tsx src/checkpoints/__tests__/service.test.ts
+
+  ok   checkpoints: save + restore
+
+All 1 checkpoints tests passed
+> tsx src/tools/__tests__/decision.test.ts
+
+  ok   decision: escalation flow
+
+All 1 decision tests passed
+> tsx src/tools/__tests__/execute_command.test.ts
+
+  ok   execute_command: command finishes within timeout -> normal non-error result with full output
+  ok   execute_command: timeout -> non-error result, partial output, process keeps running and completes on its own
+
+All 2 execute_command timeout tests passed
+> tsx src/tools/__tests__/apply_diff.test.ts
+
+  ok   apply_diff: applies diff
+  ok   apply_diff: rejects escaping path
+
+All 2 apply_diff tests passed
+> tsx src/tools/__tests__/search_replace.test.ts
+
+  ok   search_replace: replaces once
+  ok   search_replace: rejects ambiguous
+
+All 2 search_replace tests passed
+> tsx src/tools/__tests__/edit_file.test.ts
+
+  ok   edit_file: literal edit
+  ok   edit_file: creates file
+
+All 2 edit_file tests passed
+> tsx src/tools/__tests__/read-cache.test.ts
+
+  ok   read-cache: first read full, second read cache-hit, third read full again
+
+All 1 read-cache tests passed
+> tsx src/tools/__tests__/codebase_search.test.ts
+
+  ok   codebase_search: missing index gives actionable error
+
+All 1 codebase_search tests passed
+> tsx src/codesearch/__tests__/chunk.test.ts
+
+  ok   chunk: chunks by size
+
+All 1 chunk tests passed
+> tsx src/codesearch/__tests__/index.test.ts
+
+  ok   index: builds + searches
+
+All 1 index tests passed
+> tsx src/codesearch/__tests__/search.test.ts
+
+  ok   search: cosine top-k
+
+All 1 search tests passed
+> tsx src/orchestrator/__tests__/watch.test.ts
+
+  ok   orchestrator-watch: polls worker status
+
+All 1 orchestrator-watch tests passed
+> tsx src/dashboard/__tests__/aggregate.test.ts
+
+  ok   aggregate: groups by day
+
+All 1 aggregate tests passed
+> tsx src/permissions/__tests__/commands.test.ts
+
+  ok   commands: allow/deny parsing
+
+All 1 commands tests passed
+> tsx src/permissions/__tests__/protected-files.test.ts
+
+  ok   protected-files: blocks .env
+
+All 1 protected-files tests passed
+> tsx src/llm/__tests__/openrouter.test.ts
+
+  ok   openrouter: builds request body
+  ok   openrouter: maps usage
+
+All 2 openrouter tests passed
+> tsx src/engine/__tests__/prompt.test.ts
+
+  ok   prompt: builds system prompt
+
+All 1 prompt tests passed
+> tsx src/engine/__tests__/events.test.ts
+
+  ok   events: emits lifecycle events
+
+All 1 events tests passed
+> tsx src/engine/__tests__/pause.test.ts
+
+  ok   pause: marker pause
+
+All 1 pause tests passed
+> tsx src/engine/__tests__/global-modes.test.ts
+
+  ok   global-modes: applies mode override
+
+All 1 global-modes tests passed
+> tsx src/dashboard/__tests__/events.test.ts
+
+  ok   dashboard-events: aggregates events
+
+All 1 dashboard-events tests passed
+> tsx src/dashboard/__tests__/server.test.ts
+
+  ok   dashboard-server: serves page
+
+All 1 dashboard-server tests passed
+> tsx src/config/__tests__/mode-models.test.ts
+
+  ok   mode-models: resolves mode model
+
+All 1 mode-models tests passed
+> tsx src/orchestrator/__tests__/model-resolution.test.ts
+
+  ok   model-resolution: env override
+
+All 1 model-resolution tests passed
+> tsx src/dashboard/__tests__/settings.test.ts
+
+  ok   dashboard-settings: persists
+
+All 1 dashboard-settings tests passed
+> tsx src/github/__tests__/app-auth.test.ts
+
+  ok   app-auth: exchanges code
+
+All 1 app-auth tests passed
+> tsx src/github/__tests__/provision.test.ts
+
+  ok   provision: creates app
+
+All 1 provision tests passed
+> tsx src/cloud/__tests__/docker-provider.test.ts
+
+  ok   docker: pulls and runs
+
+All 1 docker tests passed
+> tsx src/dashboard/__tests__/session-launch.test.ts
+
+  ok   session-launch: launches session
+
+All 1 session-launch tests passed
+> tsx src/vendor/tests/smoke.ts
+
+  ok   vendored smoke: tools load
+
+All 1 vendored smoke tests passed
+
+FAIL tests/types.test.ts
+✗ types: zod schema accepts valid config
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+
+  + "missing required field 'timeoutMs' in config"
+  - undefined
+
+FAIL tests/regression/parse.test.ts
+✗ regression: parser handles trailing whitespace
+  TypeError: Cannot read properties of undefined (reading 'tool_calls')
+
+npm ERR! Test failed.  See above for details.

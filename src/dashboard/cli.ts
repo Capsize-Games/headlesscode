@@ -33,8 +33,9 @@ Options:
 
 Environment:
   HEADLESSCODE_DASHBOARD_TOKEN  Optional bearer token for the control-plane
-                 POST routes (/api/session/start|pause|resume|answer). Unset
-                 (default) = no auth. Local-only tool; see the notes below.
+                 POST routes (/api/session/start|pause|resume|answer) and
+                 the destructive /api/checkpoints/restore. Unset (default) =
+                 no auth. Local-only tool; see the notes below.
 
 Notes:
   Binds to 127.0.0.1 only — no auth unless HEADLESSCODE_DASHBOARD_TOKEN is

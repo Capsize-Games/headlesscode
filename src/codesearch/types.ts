@@ -25,6 +25,16 @@ export interface IndexEntry {
 	 * re-index of an untouched repo from spending money.
 	 */
 	hash: string
+	/**
+	 * Backend that produced this entry's embedding (`openrouter` | `ollama`).
+	 * Added by the build for every entry; absent on pre-existing entries from
+	 * before the Ollama backend existed, which the build treats as
+	 * `openrouter` (the only backend that existed then). The query handler
+	 * refuses to search with a mismatched backend — local and cloud
+	 * embedding models produce different vector dimensions, so mixing them
+	 * would silently yield garbage similarity scores.
+	 */
+	backend?: "openrouter" | "ollama"
 }
 
 /** The on-disk index: `<workspaceRoot>/.headlesscode/codesearch/index.jsonl`. */

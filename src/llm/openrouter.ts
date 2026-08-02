@@ -17,7 +17,14 @@
  * `defaultModel` → `OPENROUTER_MODEL` env var → `deepseek/deepseek-chat`.
  */
 
-import type { LlmClient, LlmRequest, LlmResponse, ChatMessage, ChatTool } from "../engine/types.js"
+import type {
+	LlmClient,
+	LlmRequest,
+	LlmResponse,
+	ChatMessage,
+	ChatTool,
+	ChatToolCall,
+} from "../engine/types.js"
 
 export const OPENROUTER_BASE_URL = "https://openrouter.ai"
 export const DEFAULT_MODEL = "deepseek/deepseek-chat"
@@ -207,6 +214,62 @@ export class OpenRouterClient implements LlmClient {
 		}
 	}
 
+	/**
+	 * Fetch a model's advertised context window (tokens) from OpenRouter's
+	 * `/api/v1/models/<id>/endpoints` endpoint, the same way the pricing
+	 * table in src/budget/cost.ts was verified live (2026-08-01): a model's
+	 * true context length is a property of the ENDPOINT that serves it, not
+	 * the model id — deepseek/deepseek-v4-flash's official DeepSeek endpoint
+	 * is 1,048,576 while third-party hosts behind the same id may differ.
+	 * The harness deliberately never hardcodes a stale number; callers
+	 * should cache the result for the session's lifetime.
+	 *
+	 * OpenRouter returns an array of endpoint objects, each with a
+	 * `context_length` (tokens). The largest non-zero value across endpoints
+	 * is used (a model may be served by multiple hosts with different
+	 * windows; the largest is the upper bound the provider will accept).
+	 * Returns `undefined` when the endpoint is unreachable/unauthorized or
+	 * carries no usable number — the caller falls back to its conservative
+	 * default (`DEFAULT_CONTEXT_WINDOW_TOKENS` in src/engine/condense.ts).
+	 */
+	async fetchModelContextWindow(model: string, signal?: AbortSignal): Promise<number | undefined> {
+		if (!this.apiKey) {
+			return undefined
+		}
+		const id = encodeURIComponent(model)
+		const url = `${this.baseUrl}/api/v1/models/${id}/endpoints`
+
+		let response: Response
+		try {
+			response = await fetch(url, {
+				method: "GET",
+				headers: this.authHeaders(),
+				signal,
+			})
+		} catch {
+			return undefined
+		}
+		if (!response.ok) {
+			return undefined
+		}
+
+		let data: { data?: Array<{ context_length?: unknown }> } | undefined
+		try {
+			data = JSON.parse(await response.text()) as { data?: Array<{ context_length?: unknown }> }
+		} catch {
+			return undefined
+		}
+
+		let best: number | undefined
+		for (const ep of data?.data ?? []) {
+			const n = typeof ep?.context_length === "number" ? ep.context_length : undefined
+			if (typeof n === "number" && Number.isFinite(n) && n > 0) {
+				best = best === undefined ? n : Math.max(best, n)
+			}
+		}
+		return best
+	}
+
 	async createChatCompletion(request: LlmRequest): Promise<LlmResponse> {
 		if (!this.apiKey) {
 			throw new OpenRouterError(
@@ -220,6 +283,14 @@ export class OpenRouterClient implements LlmClient {
 		const headers = this.authHeaders()
 
 		const body = buildRequestBody(request, model)
+
+		// Opt-in SSE streaming (streaming-and-reasoning). When `request.stream`
+		// is true the response is parsed incrementally from the `data:` lines and
+		// the final message is assembled from the deltas; otherwise the legacy
+		// single blocking fetch path below runs unchanged (the default).
+		if (request.stream) {
+			return this.streamChatCompletion(request, url, headers, body)
+		}
 
 		let response: Response
 		try {
@@ -292,6 +363,226 @@ export class OpenRouterClient implements LlmClient {
 			usage: mapUsage(data.usage),
 		}
 	}
+
+	/**
+	 * Opt-in SSE streaming path (streaming-and-reasoning). `body` is the same
+	 * request body the blocking path would send, plus `stream: true` and
+	 * `stream_options: { include_usage: true }` (the usage chunk at the end of
+	 * the stream is what makes cost accounting work — verified live 2026-08-01:
+	 * the final `data:` chunk carries `usage` with the same fields as a
+	 * non-streamed response).
+	 *
+	 * Assembles the final `LlmResponse` message from the streamed deltas so the
+	 * caller sees exactly what a non-streamed equivalent response would have
+	 * produced. Text, reasoning and tool calls are all reassembled (tool-call
+	 * arguments arrive as partial JSON across many chunks — see the probe
+	 * findings in the task notes; each chunk's `delta.tool_calls[i]` carries
+	 * `index`, and the id/name arrive once on the first chunk for that index,
+	 * with subsequent chunks carrying only partial `function.arguments`).
+	 *
+	 * The caller's AbortSignal (the loop's llmTimeoutMs timer) is passed to the
+	 * fetch AND honored while reading the stream body: a mid-stream stall still
+	 * aborts (the reader throws AbortError), so a stalled stream cannot hang the
+	 * session past the timeout.
+	 */
+	private async streamChatCompletion(
+		request: LlmRequest,
+		url: string,
+		headers: Record<string, string>,
+		body: Record<string, unknown>,
+	): Promise<LlmResponse> {
+		const streamBody: Record<string, unknown> = {
+			...body,
+		}
+
+		let response: Response
+		try {
+			response = await fetch(url, {
+				method: "POST",
+				headers,
+				body: JSON.stringify(streamBody),
+				signal: request.signal,
+			})
+		} catch (err) {
+			if (err instanceof Error && err.name === "AbortError") {
+				throw err
+			}
+			throw new OpenRouterError(
+				`Network error calling OpenRouter (stream): ${err instanceof Error ? err.message : String(err)}`,
+			)
+		}
+
+		if (!response.ok) {
+			const rawBody = await response.text().catch(() => "")
+			const excerpt = rawBody.length > 500 ? `${rawBody.slice(0, 500)}…` : rawBody
+			throw new OpenRouterError(
+				`OpenRouter returned HTTP ${response.status}: ${excerpt}`,
+				response.status,
+				excerpt,
+			)
+		}
+
+		if (!response.body) {
+			throw new OpenRouterError("OpenRouter returned a stream response with no body")
+		}
+
+		const reader = response.body.getReader()
+		const decoder = new TextDecoder()
+		let buffer = ""
+		let done = false
+
+		// Final assembled message. `reasoning` concatenates `delta.reasoning`
+		// strings; `content` concatenates `delta.content`; tool calls are keyed
+		// by their stream index and merged after the stream ends.
+		const contentParts: string[] = []
+		const reasoningParts: string[] = []
+		const toolCallsByIdx = new Map<number, { id: string; name: string; args: string[] }>()
+		let sawFinish = false
+		let sawUsage = false
+		let lastUsage: RawUsage | undefined
+
+		const fail = (message: string): never => {
+			throw new OpenRouterError(message)
+		}
+
+		// Fire a live-typing chunk to the caller's callback. Non-fatal by
+		// contract (types.ts): a throw from onStreamChunk must never fail the
+		// LLM call — the event feed is best-effort.
+		const emitChunk = (kind: "text" | "reasoning" | "tool", chunk: string): void => {
+			if (!request.onStreamChunk || chunk.length === 0) {
+				return
+			}
+			try {
+				request.onStreamChunk(kind, chunk)
+			} catch {
+				// Swallow: the dashboard's live-typing feed is best-effort.
+			}
+		}
+
+		while (!done) {
+			// Structural type: the lib is ES2022 (no DOM), so the undici
+			// ReadableStream read-result shape is spelled out rather than
+			// referenced by name.
+			let chunk: { done: boolean; value?: Uint8Array }
+			try {
+				chunk = await reader.read()
+			} catch (err) {
+				if (err instanceof Error && err.name === "AbortError") {
+					throw err
+				}
+				throw new OpenRouterError(
+					`Error reading OpenRouter stream: ${err instanceof Error ? err.message : String(err)}`,
+				)
+			}
+			if (chunk.done) {
+				done = true
+				break
+			}
+			buffer += decoder.decode(chunk.value, { stream: true })
+			const lines = buffer.split("\n")
+			buffer = lines.pop() ?? ""
+
+			for (const line of lines) {
+				const trimmed = line.trim()
+				if (!trimmed || !trimmed.startsWith("data:")) {
+					continue
+				}
+				const payload = trimmed.slice(5).trim()
+				if (payload === "[DONE]") {
+					done = true
+					break
+				}
+				if (payload === "") {
+					continue
+				}
+				let data:
+					| {
+							choices?: Array<{ delta?: { content?: string; reasoning?: string; tool_calls?: StreamToolCallDelta[] }; finish_reason?: string }>
+							usage?: RawUsage
+							error?: { message?: string }
+					  }
+					| undefined
+				try {
+					data = JSON.parse(payload) as typeof data
+				} catch {
+					fail(`OpenRouter stream contained a non-JSON data line: ${payload.slice(0, 200)}`)
+				}
+				if (data?.error) {
+					fail(`OpenRouter stream error envelope: ${data.error.message ?? JSON.stringify(data.error)}`)
+				}
+				const choice = data?.choices?.[0]
+				if (choice?.finish_reason) {
+					sawFinish = true
+				}
+				const delta = choice?.delta
+				if (delta) {
+					if (typeof delta.content === "string") {
+						contentParts.push(delta.content)
+						emitChunk("text", delta.content)
+					}
+					if (typeof delta.reasoning === "string") {
+						reasoningParts.push(delta.reasoning)
+						emitChunk("reasoning", delta.reasoning)
+					}
+					if (Array.isArray(delta.tool_calls)) {
+						for (const tc of delta.tool_calls) {
+							const entry = toolCallsByIdx.get(tc.index) ?? { id: "", name: "", args: [] }
+							if (typeof tc.id === "string" && tc.id) {
+								entry.id = tc.id
+							}
+							if (typeof tc.function?.name === "string" && tc.function.name) {
+								entry.name = tc.function.name
+							}
+							if (typeof tc.function?.arguments === "string" && tc.function.arguments) {
+								entry.args.push(tc.function.arguments)
+								emitChunk("tool", tc.function.arguments)
+							}
+							toolCallsByIdx.set(tc.index, entry)
+						}
+					}
+				}
+				if (data?.usage) {
+					sawUsage = true
+					lastUsage = data.usage
+				}
+			}
+		}
+
+		const content = contentParts.join("")
+		const reasoning = reasoningParts.join("")
+		const toolCalls: ChatToolCall[] = [...toolCallsByIdx.entries()]
+			.sort(([a], [b]) => a - b)
+			.map(([, tc]) => ({
+				id: tc.id || `call_stream_${tc.name || "unknown"}`,
+				type: "function" as const,
+				function: { name: tc.name || "unknown_tool", arguments: tc.args.join("") },
+			}))
+
+		const message: ChatMessage = {
+			role: "assistant",
+			content: content === "" ? null : content,
+			...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+			...(reasoning !== "" ? { reasoning } : {}),
+		}
+
+		if (!sawFinish && !toolCalls.length && content === "" && reasoning === "" && !sawUsage) {
+			// A stream that produced nothing at all (e.g. gateway cut) should
+			// surface as an error, not a silent empty assistant turn.
+			fail("OpenRouter stream ended with no content, reasoning, tool calls or usage")
+		}
+
+		return {
+			message,
+			usage: mapUsage(lastUsage),
+		}
+	}
+}
+
+/** A single `delta.tool_calls[]` entry as OpenRouter streams it. */
+interface StreamToolCallDelta {
+	index: number
+	id?: string
+	function?: { name?: string; arguments?: string }
 }
 
 export function buildRequestBody(request: LlmRequest, model: string): Record<string, unknown> {
@@ -308,6 +599,17 @@ export function buildRequestBody(request: LlmRequest, model: string): Record<str
 	if (request.maxTokens !== undefined) {
 		body.max_tokens = request.maxTokens
 	}
+	// Opt-in SSE streaming (streaming-and-reasoning): `stream: true` makes
+	// OpenRouter return a text/event-stream instead of one JSON body, and
+	// `stream_options.include_usage: true` puts the final usage chunk (with
+	// prompt/completion/reasoning token counts) at the end of the stream —
+	// without it a streamed response carries NO usage data and cost
+	// accounting would silently under-report. Both are OpenRouter's own
+	// OpenAI-compatible conventions, verified live 2026-08-01.
+	if (request.stream) {
+		body.stream = true
+		body.stream_options = { include_usage: true }
+	}
 	// Pin routing to DeepSeek's own official endpoint for deepseek/* models,
 	// not whichever third-party host (DeepInfra, Baidu, Mancer, ...) OpenRouter's
 	// automatic price-based routing might otherwise pick behind the same model
@@ -321,6 +623,19 @@ export function buildRequestBody(request: LlmRequest, model: string): Record<str
 	// (unpriced-by-us) rate.
 	if (model.startsWith("deepseek/")) {
 		body.provider = { order: ["deepseek"], allow_fallbacks: false }
+		// Reasoning content (streaming-and-reasoning): request it explicitly for
+		// the only model family this harness pins. Verified live 2026-08-01 on
+		// deepseek/deepseek-v4-flash: `include_reasoning: true` is in every
+		// endpoint's `supported_parameters`; WITHOUT it the pinned official
+		// endpoint still reasons (the model thinks anyway) but `include_reasoning:
+		// false` suppresses the returned `reasoning` field — so this flag is
+		// load-bearing for actually getting the thinking text back. OpenRouter
+		// cleanly ignores the param for models that don't support it (probed with
+		// 200s on gpt-4o-mini/claude-3.7-sonnet when the model id resolves; the
+		// 404s seen were account/data-policy endpoint availability, not the
+		// param). Kept to the deepseek/ prefix rather than unconditional to match
+		// the existing pin boundary.
+		body.include_reasoning = true
 	}
 	return body
 }

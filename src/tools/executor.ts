@@ -12,6 +12,9 @@
  *   - edit_file         { file_path, old_string, new_string, expected_replacements? }
  *   - execute_command   { command, cwd?, timeout? }
  *   - list_files        { path?, recursive? }
+ *   - browser_action    { action, url?, selector?, text? } — Playwright-backed
+ *     headless browser inspection (launch/screenshot/click/type/getConsoleLogs/
+ *     getNetworkErrors/close); NEW work, no upstream port (see src/tools/browser/).
  *
  * Every file operation resolves relative to the configured workspace root and
  * is rejected if it escapes the workspace (path-traversal guard). Results are
@@ -29,6 +32,16 @@
  * below): the exact same effective args served against byte-identical content
  * earlier in THIS session get a short cache-hit message instead of the full
  * content, because re-sending identical content is pure output-token waste.
+ *
+ * OPT-IN local summarization (see src/tools/output-summarizer.ts): when
+ * HEADLESSCODE_LOCAL_SUMMARIZATION=1, oversized execute_command output that
+ * would exceed MAX_RESULT_CHARS is compressed by a small local Ollama model
+ * before reaching the cloud model (with a "[Output summarized by local
+ * model…]" transparency header). OFF by default; on ANY failure the result
+ * falls back to today's exact blunt truncation. Deliberately limited to
+ * execute_command output — read_file / write_to_file / diff content always
+ * stays verbatim (summarizing code a model is about to edit would be a
+ * correctness hazard).
  */
 
 import * as fs from "node:fs"
@@ -38,16 +51,27 @@ import { createHash } from "node:crypto"
 import { spawn, type ChildProcess } from "node:child_process"
 import { setTimeout as sleep } from "node:timers/promises"
 
+import type { Logger } from "../engine/logger.js"
+
 // Side effect: installs String.prototype.toPosix() used by path formatting.
 import "../vendor/zoo-code/src/utils/path.js"
 
 import { MultiSearchReplaceDiffStrategy } from "../vendor/zoo-code/src/core/diff/strategies/multi-search-replace.js"
 
+import { browserActionHandler, disposeBrowserSessions } from "./browser/handler.js"
+
 import type { ToolContext, ToolHandler, ToolResult } from "../engine/types.js"
 import { checkCommand, type CommandRefusal } from "../permissions/commands.js"
+import {
+	OllamaOutputSummarizer,
+	isLocalSummarizationEnabled,
+	summarizeToolResult,
+	MAX_SUMMARIZER_INPUT_CHARS as SUMMARIZER_INPUT_CAP,
+} from "./output-summarizer.js"
 import { findMatchingPattern } from "../permissions/protected-files.js"
 import { resolvePermissions, type PermissionsConfig } from "../permissions/config.js"
-import { OpenRouterEmbedder } from "../codesearch/embedder.js"
+import { createEmbedder, EMBEDDING_BACKEND_ENV, resolveEmbeddingBackend } from "../codesearch/embedder.js"
+import { loadIndexMetadata } from "../codesearch/index.js"
 import { formatSearchResults, searchIndex } from "../codesearch/search.js"
 import { INDEX_RELATIVE_PATH } from "../codesearch/types.js"
 
@@ -166,7 +190,10 @@ export class ToolExecutor {
 
 	/**
 		* Session teardown: hard-kill any execute_command children that a timeout
-		* left running in the background (see executeCommandHandler). A single tool
+		* left running in the background (see executeCommandHandler), AND close
+		* any launched browser (see disposeBrowserSessions — a model may never
+		* call browser_action's close(), so the browser is torn down here at true
+		* session end, exactly like the backgrounded children). A single tool
 		* call timing out mid-session does NOT trigger this — the backgrounded
 		* process is exactly what the model asked for and must keep running until
 		* the model cleans it up or the session truly ends. Only calling this at
@@ -174,6 +201,7 @@ export class ToolExecutor {
 		*/
 	dispose(): void {
 		killBackgroundCommands()
+		disposeBrowserSessions()
 	}
 }
 
@@ -258,6 +286,59 @@ function truncate(content: string): string {
 		content.slice(0, MAX_RESULT_CHARS) +
 		`\n…[output truncated at ${MAX_RESULT_CHARS} chars to keep context bounded]`
 	)
+}
+
+/**
+ * Apply the tool-result size discipline to raw handler output.
+ *
+ * With local summarization OFF (default) this is EXACTLY today's behavior:
+ * blunt-truncate over `MAX_RESULT_CHARS`. With it ON, a result that would
+ * exceed the cap is instead sent to the local model for compression; on ANY
+ * summarizer failure we fall back to the same blunt truncation, so an
+ * opted-in session with a broken Ollama behaves identically to a non-opted-in
+ * one. Small results never reach the summarizer (that would be pure latency
+ * and risk for zero benefit).
+ *
+ * NOTE: deliberately used ONLY for execute_command output (the large,
+ * mostly-noisy command-output case). read_file / write_to_file / diff
+ * content must stay verbatim — a summarized diff or file body would be a
+ * correctness hazard for the cloud model.
+ */
+async function summarizeCommandOutput(content: string): Promise<string> {
+	if (content.length <= MAX_RESULT_CHARS) {
+		return content
+	}
+	if (!isLocalSummarizationEnabled()) {
+		return truncate(content)
+	}
+	const summarizer = makeSummarizer()
+	if (summarizer === undefined) {
+		return truncate(content)
+	}
+	const input = content.length > SUMMARIZER_INPUT_CAP ? content.slice(0, SUMMARIZER_INPUT_CAP) : content
+	return summarizeToolResult(input, summarizer, summarizerLogger)
+}
+
+/**
+ * The one place summarization is actually performed, and the ONLY reason the
+ * executor module imports OllamaOutputSummarizer. Wired in the constructor.
+ */
+let summarizerLogger: Pick<Logger, "debug" | "warn"> = {
+	debug: () => {},
+	warn: (message) => process.stderr.write(`[local-summ] ${message}\n`),
+}
+
+/**
+ * Module-level session summarizer (one per process). Constructed lazily on the
+ * first oversized result of an opted-in session; never constructed for a
+ * non-opted-in session. Process-level rather than executor-level because the
+ * Ollama client is stateless; one process = one summarizer.
+ */
+let toolSummarizer: OllamaOutputSummarizer | undefined
+
+/** Bind the session logger (used by the summarizer for non-fatal warnings). */
+export function bindSummarizerLogger(logger: Pick<Logger, "debug" | "warn">): void {
+	summarizerLogger = logger
 }
 
 function requireString(args: Record<string, unknown>, key: string): string {
@@ -1048,10 +1129,17 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 					return
 				}
 				if (code !== 0) {
-					finish(err(`execute_command: command '${command}' exited with code ${code}.\n${combined}`))
+					// Command failed: the stderr/stdout tail is exactly what the
+					// model needs. Summarize it (opt-in) exactly like the success
+					// path — a failed verbose test run is THE canonical case.
+					void summarizeCommandOutput(combined).then((content) =>
+						finish(err(`execute_command: command '${command}' exited with code ${code}.\n${content}`)),
+					)
 					return
 				}
-				finish(ok(combined === "" ? `(command completed with no output)` : combined))
+				void summarizeCommandOutput(combined === "" ? `(command completed with no output)` : combined).then(
+					(content) => finish(ok(content)),
+				)
 			})
 		})
 	})()
@@ -1284,9 +1372,31 @@ async function codebaseSearchHandler(args: Record<string, unknown>, ctx: ToolCon
 			)
 		}
 
+		// The query embedder must match the backend the index was built with.
+		// Local and cloud embedding models produce different-dimension vectors
+		// (ollama qwen3-embedding:8b = 4096, openrouter qwen/qwen3-embedding-4b
+		// = 2560), so a mismatch would silently compare apples to oranges.
+		// The env var/flag selection happens at index-build time; the index
+		// metadata records which backend built it, and we use that backend
+		// here — refusing explicitly when it can't be honored.
+		const metadata = loadIndexMetadata(ctx.workspaceRoot)
+		let queryBackend = resolveEmbeddingBackend(process.env)
+		if (metadata && metadata.backend !== queryBackend) {
+			return err(
+				`codebase_search: index was built with backend "${metadata.backend}" (model "${metadata.model}"), ` +
+					`but ${EMBEDDING_BACKEND_ENV} selects "${queryBackend}". Embedding backends produce ` +
+					`different-dimension vectors and are NOT interchangeable — rebuild the index with ` +
+					`'headlesscode index --embedding-backend ${queryBackend}' or unset ` +
+					`${EMBEDDING_BACKEND_ENV} to search with the backend that built the index.`,
+			)
+		}
+		if (metadata) {
+			queryBackend = metadata.backend
+		}
+
 		// Embed the query (one call). This is a real network call; failures
 		// surface as a tool error so the loop's mistake handling applies.
-		const embedder = new OpenRouterEmbedder()
+		const embedder = createEmbedder(queryBackend)
 		const queryResult = await embedder.embedBatch([query])
 		if (queryResult.embeddings.length !== 1) {
 			return err(`codebase_search: embedder returned ${queryResult.embeddings.length} embeddings for the query`)
@@ -1299,6 +1409,22 @@ async function codebaseSearchHandler(args: Record<string, unknown>, ctx: ToolCon
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * Lazily construct the session's local summarizer. Returns undefined when the
+ * feature is off (never construct an Ollama client for a non-opted-in
+ * session). One executor = one summarizer, so a session that keeps producing
+ * oversized results reuses the same client across calls.
+ */
+function makeSummarizer(): OllamaOutputSummarizer | undefined {
+	if (!isLocalSummarizationEnabled()) {
+		return undefined
+	}
+	if (toolSummarizer === undefined) {
+		toolSummarizer = new OllamaOutputSummarizer()
+	}
+	return toolSummarizer
 }
 
 // ─── Registry ────────────────────────────────────────────────────────────────
@@ -1337,6 +1463,7 @@ const IMPLEMENTED_TOOLS = new Set([
 	"execute_command",
 	"list_files",
 	"codebase_search",
+	"browser_action",
 ])
 
 /**
@@ -1356,6 +1483,7 @@ export function createHeadlessExecutor(workspaceRoot: string, options: ToolExecu
 	executor.register("execute_command", executeCommandHandler)
 	executor.register("list_files", listFilesHandler)
 	executor.register("codebase_search", codebaseSearchHandler)
+	executor.register("browser_action", browserActionHandler)
 
 	executor.register("attempt_completion", attemptCompletionHandler)
 	executor.register("ask_followup_question", askFollowupQuestionHandler)
@@ -1392,6 +1520,7 @@ function createReadCommandExecutor(workspaceRoot: string, options: ToolExecutorO
 	executor.registerReadFile()
 	executor.register("list_files", listFilesHandler)
 	executor.register("execute_command", executeCommandHandler)
+	executor.register("browser_action", browserActionHandler)
 
 	executor.register("attempt_completion", attemptCompletionHandler)
 	executor.register("ask_followup_question", askFollowupQuestionHandler)

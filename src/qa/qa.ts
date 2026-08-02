@@ -37,7 +37,7 @@ import { execFileSync } from "node:child_process"
 
 import { HeadlessSession } from "../engine/loop.js"
 import { OpenRouterClient } from "../llm/openrouter.js"
-import { loadCustomModes } from "../engine/prompt.js"
+import { appendBrowserActionTool, loadCustomModes } from "../engine/prompt.js"
 import { createQaHeadlessExecutor } from "../tools/executor.js"
 import { getNativeTools } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/index.js"
 import type { ChatTool, LlmClient, SessionResult } from "../engine/types.js"
@@ -55,11 +55,18 @@ const QA_TOOL_NAMES = new Set([
 	"ask_followup_question",
 ])
 
-/** The QA-mode tool schemas (read-only + command, no write tools). */
+/**
+ * The QA-mode tool schemas (read-only + command, no write tools), plus
+ * browser_action — QA can boot the app AND now visually verify it in a
+ * headless browser (the phase4 gap "live Playwright-MCP interactivity is not
+ * available headlessly" is partially closed for agent-driven checks; see
+ * src/tools/browser/tool.ts).
+ */
 export function qaTools(): ChatTool[] {
-	return getNativeTools().filter(
+	const tools = getNativeTools().filter(
 		(t) => t.type === "function" && QA_TOOL_NAMES.has(t.function.name),
 	) as unknown as ChatTool[]
+	return appendBrowserActionTool(tools)
 }
 
 /**

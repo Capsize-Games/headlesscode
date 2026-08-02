@@ -44,6 +44,17 @@ export interface ResolveModelOptions {
 	explicitModel?: string
 	/** Env to read OPENROUTER_MODEL from (default: process.env). */
 	env?: NodeJS.ProcessEnv
+	/**
+	 * Optional EXTRA config keys to consult between `mode` and `_default`
+	 * (e.g. `_condensation` — a cheaper model id used for the context-
+	 * condensation LLM call; see src/engine/condense.ts). Each key is read
+	 * directly from the config file, so an entry like
+	 * `"_condensation": "deepseek/deepseek-v4-flash"` works without being a
+	 * real mode slug. When none of the keys resolve, precedence falls
+	 * through to `_default` → `OPENROUTER_MODEL` → undefined exactly as
+	 * before.
+	 */
+	extraKeys?: string[]
 }
 
 /**
@@ -100,7 +111,7 @@ export function loadModeModelsFile(workspaceRoot: string): ModeModelsFile | null
  * source of truth for the ultimate fallback.
  */
 export function resolveModelForMode(options: ResolveModelOptions): string | undefined {
-	const { workspaceRoot, mode, explicitModel, env = process.env } = options
+	const { workspaceRoot, mode, explicitModel, extraKeys, env = process.env } = options
 
 	if (explicitModel !== undefined && explicitModel !== "") {
 		return explicitModel
@@ -110,6 +121,11 @@ export function resolveModelForMode(options: ResolveModelOptions): string | unde
 	if (file !== null) {
 		if (typeof file[mode] === "string") {
 			return file[mode]
+		}
+		for (const key of extraKeys ?? []) {
+			if (typeof file[key] === "string") {
+				return file[key]
+			}
 		}
 		if (typeof file[DEFAULT_KEY] === "string") {
 			return file[DEFAULT_KEY]
