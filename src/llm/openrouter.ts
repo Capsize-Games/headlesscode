@@ -207,6 +207,62 @@ export class OpenRouterClient implements LlmClient {
 		}
 	}
 
+	/**
+	 * Fetch a model's advertised context window (tokens) from OpenRouter's
+	 * `/api/v1/models/<id>/endpoints` endpoint, the same way the pricing
+	 * table in src/budget/cost.ts was verified live (2026-08-01): a model's
+	 * true context length is a property of the ENDPOINT that serves it, not
+	 * the model id — deepseek/deepseek-v4-flash's official DeepSeek endpoint
+	 * is 1,048,576 while third-party hosts behind the same id may differ.
+	 * The harness deliberately never hardcodes a stale number; callers
+	 * should cache the result for the session's lifetime.
+	 *
+	 * OpenRouter returns an array of endpoint objects, each with a
+	 * `context_length` (tokens). The largest non-zero value across endpoints
+	 * is used (a model may be served by multiple hosts with different
+	 * windows; the largest is the upper bound the provider will accept).
+	 * Returns `undefined` when the endpoint is unreachable/unauthorized or
+	 * carries no usable number — the caller falls back to its conservative
+	 * default (`DEFAULT_CONTEXT_WINDOW_TOKENS` in src/engine/condense.ts).
+	 */
+	async fetchModelContextWindow(model: string, signal?: AbortSignal): Promise<number | undefined> {
+		if (!this.apiKey) {
+			return undefined
+		}
+		const id = encodeURIComponent(model)
+		const url = `${this.baseUrl}/api/v1/models/${id}/endpoints`
+
+		let response: Response
+		try {
+			response = await fetch(url, {
+				method: "GET",
+				headers: this.authHeaders(),
+				signal,
+			})
+		} catch {
+			return undefined
+		}
+		if (!response.ok) {
+			return undefined
+		}
+
+		let data: { data?: Array<{ context_length?: unknown }> } | undefined
+		try {
+			data = JSON.parse(await response.text()) as { data?: Array<{ context_length?: unknown }> }
+		} catch {
+			return undefined
+		}
+
+		let best: number | undefined
+		for (const ep of data?.data ?? []) {
+			const n = typeof ep?.context_length === "number" ? ep.context_length : undefined
+			if (typeof n === "number" && Number.isFinite(n) && n > 0) {
+				best = best === undefined ? n : Math.max(best, n)
+			}
+		}
+		return best
+	}
+
 	async createChatCompletion(request: LlmRequest): Promise<LlmResponse> {
 		if (!this.apiKey) {
 			throw new OpenRouterError(

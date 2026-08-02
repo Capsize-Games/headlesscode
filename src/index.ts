@@ -20,6 +20,13 @@ export * from "./cli.js"
 export * from "./memory/index.js"
 export { OpenRouterClient, OpenRouterError, DEFAULT_MODEL } from "./llm/openrouter.js"
 export { HeadlessSession, truncateHistory } from "./engine/loop.js"
+export {
+	maybeCondense,
+	condenseOldestTurns,
+	computeCondenseCount,
+	DEFAULT_CONDENSE_THRESHOLD_FRACTION,
+	DEFAULT_CONTEXT_WINDOW_TOKENS,
+} from "./engine/condense.js"
 export { Logger } from "./engine/logger.js"
 export { parseToolCalls, parseToolCall, bestEffortPartialJson } from "./engine/parser.js"
 export {
