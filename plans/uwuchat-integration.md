@@ -2,12 +2,6 @@
 
 ## Status: architecture plan only — NOT scoped for dispatch yet
 
-**Scope note (2026-08-02, revised):** coding mode will be **admin-only for
-now**, not rolled out to the general user base. This removes the near-term
-urgency of a public billing/credits UI, but the underlying design below
-still assumes it'll eventually go wider, so the credit-system shape is worth
-getting right even though only an admin account will exercise it at first.
-
 This is Phase 2 of the "ditch VS Code" goal. Phase 1 (perfecting headlesscode's
 own dashboard/CLI interface, the browser-first workflow) comes first and is
 still in progress as of this writing. **Do not dispatch this plan to a worker
@@ -16,25 +10,99 @@ This document exists so the target shape is written down and doesn't have to
 be re-derived later, and so Phase 1 decisions (event shapes, dashboard APIs,
 decision-escalation marker files) can be made with this destination in mind.
 
-## The vision (project owner's own framing, 2026-08-02)
+## Two tiers, deliberately separate (2026-08-02, revised)
+
+The full open-ended "have a conversation, get a plan doc, get a whole
+orchestrated build" flow and the public-facing chatbot are **two different
+products with two different risk profiles**, and this plan now treats them
+as such:
+
+- **Tier 1 — Admin general harness.** An admin, using `uwu`, can point
+  headlesscode at *any* project and drive the full architect → orchestrator →
+  worker flow, open-ended, same as this very session does today. This is the
+  "manage any project via uwuchat" capability. **Admin-only, indefinitely** —
+  not a beta stage on the way to public, but a deliberately permanent
+  operator-only tier, since it implies arbitrary `execute_command` execution
+  and unbounded scope. This lets admins dogfood/validate the whole pipeline
+  before any of it reaches a public user in any form.
+- **Tier 2 — User-facing scoped code tools.** The public-facing `uwu` gets
+  narrow, bounded tools that happen to use headlesscode under the hood, NOT
+  general-purpose "build whatever you want" access. Framing: give the
+  chatbot *freedom to create what it needs* for a specific, recognized use
+  case, not an open-ended coding harness. E.g. "bang together a quick
+  website," "write a small script to solve this problem," "spin up a
+  preset/bootstrapped app from a known template." Each of these is a
+  constrained tool with its own narrow task template, tight iteration cap,
+  and probably no exposed plan-doc/orchestrator UI at all — the user never
+  sees "architect mode," they just get the artifact. This is a genuinely
+  different, much smaller integration than Tier 1, not a cut-down version of
+  it — see the dedicated section below.
+
+Both tiers reuse the same underlying headlesscode engine; they differ in
+*how much of it is exposed* and *how bounded each invocation is*.
+
+## Tier 1 vision (the original framing, now admin-scoped)
 
 Today, coding work happens as a conversation with an assistant (Claude Code,
-this very session) in a terminal/IDE. The target: that conversation happens
-instead with `uwu` — uwuchat's system bot — in the uwuchat web UI. Concretely:
+this very session) in a terminal/IDE. The Tier 1 target: that conversation
+happens instead with `uwu` — uwuchat's system bot — in the uwuchat web UI,
+**for an admin account**:
 
-1. User has a normal conversation with `uwu` about what they want to build.
+1. Admin has a normal conversation with `uwu` about what they want to build.
 2. `uwu` recognizes coding intent and produces an **architect-mode** output —
    a plan document, the same shape this session already produces via plan
    mode.
 3. `uwu` automatically hands that document to itself in **orchestrator
    mode**, which drives `headlesscode orchestrate` (the existing multi-agent
    worktree orchestrator) against it, using the system-owned OpenRouter key,
-   metered against the user's code-credit balance.
+   metered against the admin's code-credit balance.
 4. Workers do the work headlessly, exactly as they do today.
 5. If a worker escalates a decision (`ask_followup_question`), the
    orchestrator tries to answer it autonomously first; if it genuinely can't,
    the question surfaces as a normal `uwu` chat message in the SAME
-   conversation, and the user's reply unblocks the worker.
+   conversation, and the admin's reply unblocks the worker.
+
+## Tier 2: user-facing scoped code tools (new section)
+
+This is deliberately NOT "expose Tier 1 to users with a lower spend cap." The
+shape is different:
+
+- **A small, curated set of task templates**, not open-ended architect-mode
+  plan generation. Each template is a pre-written, scoped task spec (in the
+  same style as this project's own `plans/*.md` task files, but authored by
+  the project owner ahead of time, not generated fresh from an arbitrary
+  user conversation) — e.g. `templates/quick-website.md`,
+  `templates/utility-script.md`, `templates/bootstrapped-app-<kind>.md`.
+  `uwu` fills in the specifics from the conversation (what the site is
+  about, what the script needs to do) but the *shape and guardrails* of the
+  task are fixed by the template, not improvised.
+- **No exposed orchestrator/multi-worker complexity.** These are small
+  enough to run as a single headlesscode session (`code` mode, one
+  worktree, one bounded iteration cap), not a multi-agent round — much
+  cheaper, much faster to reason about for a first launch, and avoids
+  exposing decision-escalation/blocked-state chat plumbing (Tier 1's item 3
+  below) to public users at all initially.
+- **Bounded blast radius by construction**: each invocation operates in a
+  fresh, disposable workspace scoped to that one artifact (a new git repo /
+  worktree per generated site or script), not "any project" — there's no
+  equivalent of Tier 1's "point it at any project" danger because there's no
+  arbitrary target to point at.
+- **Cost is naturally small and predictable per template** (a single bounded
+  session, not an open-ended round), which likely means this can be metered
+  through something closer to uwuchat's existing tier-cap/turn-counting
+  model rather than needing the full code-credits wallet Tier 1 requires —
+  worth revisiting once real per-template cost data exists from Tier 1 usage.
+- **Output delivery** is a new, real open question: does the user get a
+  downloadable zip, a live-previewed static deploy, a link to a hosted
+  sandbox? This determines real new infrastructure (`src/cloud/`'s
+  Docker/Hetzner provider abstraction is a plausible fit for "deploy this
+  generated thing somewhere the user can see it") that Tier 1 doesn't need
+  at all (an admin managing "any project" presumably already has their own
+  deploy path).
+- Tier 2 should be scoped as its own follow-up plan doc once Tier 1 is real
+  and validated — it's mentioned here to record the framing and keep Tier 1's
+  design (item 1, code-credits; item 5, compute location) honest about NOT
+  assuming Tier 2 reuses it wholesale.
 
 ## Why this maps onto existing uwuchat scaffolding, not a rebuild
 
@@ -64,7 +132,7 @@ Verified live in the uwuchat/airunner codebase (`~/Projects/airunner`,
   mode just needs to poll for it and emit a chat message instead of (or in
   addition to) what the dashboard/CLI helper script does today.
 
-## What's genuinely NOT built and would be new work
+## What's genuinely NOT built and would be new work (Tier 1)
 
 ### 1. A code-credits system (system-owned key, NOT BYOK)
 
