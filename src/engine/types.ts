@@ -32,6 +32,14 @@ export interface ChatMessage {
 	tool_call_id?: string
 	/** Present on `role: "tool"` messages. */
 	name?: string
+	/**
+	 * The model's reasoning/"thinking" text for this assistant message
+	 * (streaming-and-reasoning). OpenRouter normalizes DeepSeek's
+	 * `reasoning_content` to `reasoning` on the response message; we echo it
+	 * back onto outgoing assistant history the same way. Optional — absent
+	 * for models/calls that don't produce reasoning content.
+	 */
+	reasoning?: string
 }
 
 /** An OpenAI-format ChatCompletionTool (function schema). */
@@ -55,6 +63,21 @@ export interface LlmRequest {
 	temperature?: number
 	maxTokens?: number
 	signal?: AbortSignal
+	/**
+	 * Opt-in SSE streaming (streaming-and-reasoning). When true the client
+	 * streams deltas and assembles the final message from the stream instead
+	 * of one blocking fetch. Default OFF — existing callers/tests are
+	 * unaffected.
+	 */
+	stream?: boolean
+	/**
+	 * Streaming-and-reasoning: invoked for each incremental chunk as a streamed
+	 * response arrives (kind "text" | "reasoning" | "tool"). Only called when
+	 * `stream` is true and the client actually streams; the loop uses it to emit
+	 * `llm_stream_chunk` events for the dashboard's live-typing view. Non-fatal
+	 * by contract: a throw from this callback must not fail the LLM call.
+	 */
+	onStreamChunk?: (kind: "text" | "reasoning" | "tool", chunk: string) => void
 }
 
 /** Response shape returned by an LlmClient. */

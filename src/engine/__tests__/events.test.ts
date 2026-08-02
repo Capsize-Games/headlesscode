@@ -42,6 +42,46 @@ class FakeLlmClient implements LlmClient {
 	}
 }
 
+/**
+ * Streaming fake: when `request.stream` is true, invokes `request.onStreamChunk`
+ * incrementally (the way OpenRouterClient.streamChatCompletion does) BEFORE
+ * returning the fully-assembled message — the loop's `llm_stream_chunk` events
+ * must fire as the chunks arrive, ahead of the single `llm_response` summary.
+ */
+class StreamingFakeLlmClient implements LlmClient {
+	requests: LlmRequest[] = []
+	/** How many chunks each call actually emitted (per request index). */
+	chunkCounts: number[] = []
+
+	constructor(
+		private readonly script: Array<
+			(req: LlmRequest) => { message: ChatMessage; chunks: Array<{ kind: "text" | "reasoning" | "tool"; chunk: string }> }
+		>,
+		private readonly usagePerCall?: { promptTokens: number; completionTokens: number },
+	) {}
+
+	async createChatCompletion(request: LlmRequest): Promise<LlmResponse> {
+		this.requests.push(request)
+		const step = this.script.shift()
+		if (!step) {
+			throw new Error("StreamingFakeLlmClient: script exhausted (model kept calling)")
+		}
+		const { message, chunks } = step(request)
+		let count = 0
+		if (request.stream && request.onStreamChunk) {
+			for (const c of chunks) {
+				count++
+				request.onStreamChunk(c.kind, c.chunk)
+			}
+		}
+		this.chunkCounts.push(count)
+		return {
+			message,
+			...(!this.usagePerCall ? {} : { usage: { ...this.usagePerCall } }),
+		}
+	}
+}
+
 function toolCall(name: string, args: unknown, id = `call_${Math.random().toString(36).slice(2)}`): ChatMessage {
 	const argumentsStr = typeof args === "string" ? args : JSON.stringify(args)
 	const call: ChatToolCall = { id, type: "function", function: { name, arguments: argumentsStr } }
@@ -57,6 +97,7 @@ async function makeSession(options: {
 	client: LlmClient
 	workspaceRoot: string
 	maxIterations?: number
+	stream?: boolean
 }) {
 	const session = new HeadlessSession({
 		workspaceRoot: options.workspaceRoot,
@@ -66,6 +107,7 @@ async function makeSession(options: {
 		llmClient: options.client,
 		maxIterations: options.maxIterations ?? 10,
 		checkpoints: false,
+		stream: options.stream,
 	})
 	return session
 }
@@ -353,6 +395,220 @@ async function testDecisionEventsMirrorMarkerLifecycle(): Promise<void> {
 	}
 }
 
+// ─── Reasoning capture + streaming (streaming-and-reasoning) ────────────────
+
+/**
+ * Reasoning content must flow from the raw response (message.reasoning, as
+ * OpenRouter normalizes DeepSeek's reasoning_content) into the event feed:
+ * an `llm_response` event carrying `reasoningPreview` (truncated like every
+ * other large field), and NOT emitted at all when there's no reasoning.
+ */
+async function testReasoningFlowsToEventFeedTruncated(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-events-reason-"))
+	try {
+		const longReasoning = "x".repeat(EVENT_TRUNCATE_CHARS + 200)
+		const client = new FakeLlmClient([
+			// A tool-call-bearing first turn: a text-only reply would end the
+			// session immediately, so there'd be no SECOND call to observe the
+			// echoed reasoning on. carryReasoning() attaches the reasoning to the
+			// assistant message.
+			() => ({ ...toolCall("read_file", { path: "a.txt" }), reasoning: longReasoning }),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({ task: "reason about it", client, workspaceRoot: ws })
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+
+		const evDir = eventsDir(ws)
+		const files = await fs.readdir(evDir)
+		const sessionId = files[0].replace(/\.jsonl$/, "")
+		const events = await readEventsFile(eventsFilePath(ws, sessionId))
+
+		// The response event carries the reasoning preview, truncated + flagged.
+		const llmResponse = events.find((e) => e.type === "llm_response")
+		assert.ok(llmResponse, "expected an llm_response event")
+		assert.equal(llmResponse?.reasoningPreview, "x".repeat(EVENT_TRUNCATE_CHARS))
+		assert.equal(llmResponse?.reasoningTruncated, true)
+		assert.equal(llmResponse?.hadToolCalls, true)
+		// Tool-call turn: no text preview (undefined, not "" — the loop uses
+		// `text || undefined`).
+		assert.equal(llmResponse?.textPreview, undefined)
+		// The FULL reasoning must never be dumped into the feed.
+		assert.ok(!JSON.stringify(events).includes(longReasoning), "full reasoning must never be dumped into the feed")
+
+		// The reasoning is echoed back onto the NEXT call's assistant history
+		// (matches zoo-code: reasoning is prepended to apiConversationHistory,
+		// and native DeepSeek drops prior reasoning if it isn't echoed).
+		const second = client.requests[1]
+		const echoed = second.messages.find(
+			(m) => m.role === "assistant" && m.reasoning === longReasoning,
+		)
+		assert.ok(echoed, "reasoning must be echoed back on assistant history for the next call")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+/**
+ * A streamed session must emit `llm_stream_chunk` events incrementally (in
+ * order, reasoning before text), and the final `llm_response` summary still
+ * fires once with the assembled text + usage.
+ */
+async function testStreamedChunksEmitIncrementally(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-events-stream-"))
+	try {
+		const client = new StreamingFakeLlmClient([
+			() => ({
+				chunks: [
+					{ kind: "reasoning" as const, chunk: "Let me think" },
+					{ kind: "reasoning" as const, chunk: " harder" },
+					{ kind: "text" as const, chunk: "Hello" },
+					{ kind: "text" as const, chunk: " world" },
+				],
+				message: { role: "assistant" as const, content: "Hello world", reasoning: "Let me think harder" },
+			}),
+			() => ({ chunks: [], message: toolCall("attempt_completion", { result: "done" }) }),
+		])
+		const session = await makeSession({ task: "stream a reply", client, workspaceRoot: ws, stream: true })
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+
+		const evDir = eventsDir(ws)
+		const files = await fs.readdir(evDir)
+		const sessionId = files[0].replace(/\.jsonl$/, "")
+		const events = await readEventsFile(eventsFilePath(ws, sessionId))
+
+		const streamChunks = events.filter((e) => e.type === "llm_stream_chunk")
+		assert.equal(streamChunks.length, 4, "each chunk is its own event")
+		assert.deepEqual(
+			streamChunks.map((e) => [e.kind, e.chunk]),
+			[
+				["reasoning", "Let me think"],
+				["reasoning", " harder"],
+				["text", "Hello"],
+				["text", " world"],
+			],
+			"chunks arrive incrementally, in order, reasoning before text",
+		)
+		assert.equal(streamChunks.every((e) => e.iteration === 1), true)
+
+		// The llm_response summary still fires ONCE with the assembled text.
+		const llmResponses = events.filter((e) => e.type === "llm_response")
+		assert.equal(llmResponses.length, 1)
+		assert.equal(llmResponses[0].textPreview, "Hello world")
+		assert.equal(llmResponses[0].reasoningPreview, "Let me think harder")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+/**
+ * A streamed TOOL-CALL turn: the streamed tool chunks emit as `llm_stream_chunk`
+ * (kind "tool") events, and the turn still terminates via the tool call.
+ */
+async function testStreamedToolCallTurnEmitsToolChunks(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-events-stream-tool-"))
+	try {
+		const client = new StreamingFakeLlmClient([
+			() => ({
+				chunks: [
+					{ kind: "tool" as const, chunk: '{"path"' },
+					{ kind: "tool" as const, chunk: ':"a.txt","content":"x"}' },
+				],
+				message: toolCall("write_to_file", { path: "a.txt", content: "x" }),
+			}),
+			() => ({ chunks: [], message: toolCall("attempt_completion", { result: "done" }) }),
+		])
+		const session = await makeSession({ task: "write via stream", client, workspaceRoot: ws, stream: true })
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+
+		const evDir = eventsDir(ws)
+		const files = await fs.readdir(evDir)
+		const sessionId = files[0].replace(/\.jsonl$/, "")
+		const events = await readEventsFile(eventsFilePath(ws, sessionId))
+
+		const toolChunks = events.filter((e) => e.type === "llm_stream_chunk" && e.kind === "tool")
+		assert.equal(toolChunks.length, 2)
+		assert.deepEqual(
+			toolChunks.map((e) => e.chunk),
+			['{"path"', ':"a.txt","content":"x"}' ],
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+/**
+	* Cost accounting for a STREAMED response: the usage carried by the final
+	* stream chunk (`completion_tokens` incl. reasoning tokens) must feed the
+	* budget tracker exactly ONCE — the incremental llm_stream_chunk events are
+	* purely visual and must never be counted, and the usage must not be missed
+	* just because the response arrived as a stream.
+	*/
+async function testStreamedResponseUsageFeedsBudgetOnce(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-events-stream-cost-"))
+	try {
+		const client = new StreamingFakeLlmClient(
+			[
+				// First turn must be a TOOL call (a text-only reply would end the
+				// session after call 1 — the loop's pragmatic-success path) so
+				// that the second call's usage is also recorded and both
+				// streamed responses feed the budget tracker exactly once each.
+				() => ({
+					chunks: [
+						{ kind: "reasoning" as const, chunk: "think" },
+						{ kind: "text" as const, chunk: "Hello" },
+					],
+					message: {
+						role: "assistant" as const,
+						content: "Hello",
+						reasoning: "think",
+						tool_calls: [
+							{
+								id: "call_1",
+								type: "function" as const,
+								function: { name: "write_to_file", arguments: JSON.stringify({ path: "a.txt", content: "x" }) },
+							},
+						],
+					},
+				}),
+				() => ({ chunks: [], message: toolCall("attempt_completion", { result: "done" }) }),
+			],
+			// Reasoning tokens are billed as output (completion) tokens — this
+			// is what a real OpenRouter streamed usage chunk reports.
+			{ promptTokens: 100, completionTokens: 30 },
+		)
+		const session = await makeSession({ task: "stream with usage", client, workspaceRoot: ws, stream: true })
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+
+		const evDir = eventsDir(ws)
+		const files = await fs.readdir(evDir)
+		const sessionId = files[0].replace(/\.jsonl$/, "")
+		const events = await readEventsFile(eventsFilePath(ws, sessionId))
+
+		// The session_end totals reflect EXACTLY one record of the streamed
+		// usage per call (2 calls → 200 in / 60 out) — no double-count from
+		// the chunk events, no miss from the streaming path.
+		const end = events[events.length - 1]
+		assert.equal(end.type, "session_end")
+		assert.equal(end.inputTokens, 200)
+		assert.equal(end.outputTokens, 60)
+		assert.equal(end.cachedTokens, 0)
+		assert.equal(typeof end.costUsd, "number")
+
+		// Each llm_response carries the same single usage record (not summed
+		// across chunks).
+		const responses = events.filter((e) => e.type === "llm_response")
+		assert.equal(responses.length, 2)
+		assert.equal(responses[0].outputTokens, 30)
+		assert.equal(responses[1].outputTokens, 30)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -364,6 +620,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["events: long tool results are truncated with a marker, never dumped in full", testLongContentIsTruncated],
 	["events: feed file is KEPT after the session ends (unlike the live usage snapshot)", testEventFeedKeptAfterSessionEnds],
 	["events: ask_followup_question mirrors decision_blocked/decision_answered on the feed", testDecisionEventsMirrorMarkerLifecycle],
+	["events: reasoning flows to the feed truncated + echoed on next call history", testReasoningFlowsToEventFeedTruncated],
+	["events: streamed chunks emit incrementally, llm_response summary fires once", testStreamedChunksEmitIncrementally],
+	["events: a streamed tool-call turn emits tool chunks + a single tool_call", testStreamedToolCallTurnEmitsToolChunks],
+	["events: streamed response usage feeds the budget tracker exactly once (no double-count)", testStreamedResponseUsageFeedsBudgetOnce],
 ]
 
 async function main(): Promise<void> {

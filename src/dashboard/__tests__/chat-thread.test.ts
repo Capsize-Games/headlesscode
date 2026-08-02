@@ -168,6 +168,45 @@ async function testPauseResumePairAreSystemMarkers(): Promise<void> {
 	assert.equal(turnsOf(group).length, 1)
 }
 
+// ─── llm_stream_chunk events belong to the CURRENT turn ─────────────────────
+
+async function testStreamChunksStayInCurrentTurn(): Promise<void> {
+	const events = [
+		event("iteration_start", { iteration: 2 }),
+		event("llm_stream_chunk", { iteration: 2, kind: "reasoning", chunk: "think" }),
+		event("llm_stream_chunk", { iteration: 2, kind: "reasoning", chunk: "ing" }),
+		event("llm_stream_chunk", { iteration: 2, kind: "text", chunk: "Hello" }),
+		event("llm_response", { iteration: 2, hadToolCalls: false, textPreview: "Hello", outputTokens: 5 }),
+		event("tool_call", { iteration: 2, tool: "attempt_completion", args: "done" }),
+		event("tool_result", { iteration: 2, tool: "attempt_completion", isError: false, result: "ok" }),
+		event("session_end", { status: "success", iterations: 2 }),
+	]
+
+	const group = groupEventsIntoChat(events)
+	const turns = turnsOf(group)
+	// The stream chunks must NOT close the turn (they are not system markers):
+	// everything from iteration_start through the tool_result is ONE turn.
+	assert.equal(turns.length, 1, "stream chunks must stay in the current turn, not fragment it")
+	assert.deepEqual(
+		turns[0].map((e) => e.type),
+		["llm_stream_chunk", "llm_stream_chunk", "llm_stream_chunk", "llm_response", "tool_call", "tool_result"],
+	)
+	assert.equal(turns[0][0].kind, "reasoning")
+	assert.equal(turns[0][2].kind, "text")
+	// No stream chunk leaks out as a system marker.
+	assert.deepEqual(systemsOf(group).map((e) => e.type), ["session_end"])
+}
+
+// ─── A lone stream chunk (feed starts mid-stream) is a system marker ────────
+
+async function testLoneStreamChunkIsSystemMarker(): Promise<void> {
+	const group = groupEventsIntoChat([event("llm_stream_chunk", { iteration: 1, kind: "text", chunk: "orphan" })])
+	const systems = systemsOf(group)
+	assert.equal(systems.length, 1)
+	assert.equal(systems[0].type, "llm_stream_chunk")
+	assert.equal(turnsOf(group).length, 0)
+}
+
 // ─── session_end closes the last turn ───────────────────────────────────────
 
 async function testSessionEndClosesTurnAndIsSystemMarker(): Promise<void> {
@@ -231,6 +270,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["chat-thread: an error tool result stays attached to its call", testErrorToolResultStaysWithItsCall],
 	["chat-thread: decision_blocked/answered pair forms its own turn", testDecisionBlockedAnsweredPair],
 	["chat-thread: pause/resume pair renders as system markers", testPauseResumePairAreSystemMarkers],
+	["chat-thread: stream chunks stay in the current turn (no fragmentation)", testStreamChunksStayInCurrentTurn],
+	["chat-thread: a lone stream chunk degrades to a system marker", testLoneStreamChunkIsSystemMarker],
 	["chat-thread: session_end closes the turn and is a system marker", testSessionEndClosesTurnAndIsSystemMarker],
 	["chat-thread: empty feed / no task degrade gracefully", testEmptyFeedAndNoTask],
 	["chat-thread: an orphaned tool_result is a system marker", testOrphanedToolResultIsSystemMarker],

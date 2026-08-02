@@ -165,18 +165,46 @@ export class EventFeed {
 		iteration: number
 		hadToolCalls: boolean
 		textPreview?: string
+		/** Reasoning/"thinking" text (streaming-and-reasoning), truncated like other large fields. */
+		reasoningPreview?: string
 		inputTokens?: number
 		outputTokens?: number
 		cachedTokens?: number
 	}): Promise<void> {
 		const text = fields.textPreview ? truncateField(fields.textPreview) : undefined
+		const reasoning = fields.reasoningPreview ? truncateField(fields.reasoningPreview) : undefined
 		return this.emit("llm_response", {
 			iteration: fields.iteration,
 			hadToolCalls: fields.hadToolCalls,
 			...(text ? { textPreview: text.text, ...(text.truncated ? { textTruncated: true } : {}) } : {}),
+			...(reasoning
+				? { reasoningPreview: reasoning.text, ...(reasoning.truncated ? { reasoningTruncated: true } : {}) }
+				: {}),
 			...(fields.inputTokens !== undefined ? { inputTokens: fields.inputTokens } : {}),
 			...(fields.outputTokens !== undefined ? { outputTokens: fields.outputTokens } : {}),
 			...(fields.cachedTokens !== undefined ? { cachedTokens: fields.cachedTokens } : {}),
+		})
+	}
+
+	/**
+	 * One incremental chunk of a streamed LLM response (streaming-and-reasoning,
+	 * opt-in). Distinct from the single `llm_response` summary event which still
+	 * fires once at the end of the call with final totals — this is the
+	 * live-typing feed. `kind` is "text" | "reasoning" | "tool" so the dashboard
+	 * can render reasoning text differently from the answer text. Truncated like
+	 * every other large field.
+	 */
+	llmStreamChunk(fields: {
+		iteration: number
+		kind: "text" | "reasoning" | "tool"
+		chunk: string
+	}): Promise<void> {
+		const c = truncateField(fields.chunk)
+		return this.emit("llm_stream_chunk", {
+			iteration: fields.iteration,
+			kind: fields.kind,
+			chunk: c.text,
+			...(c.truncated ? { chunkTruncated: true } : {}),
 		})
 	}
 

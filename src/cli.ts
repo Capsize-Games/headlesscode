@@ -60,6 +60,12 @@ interface CliOptions {
 	condenseModel?: string
 	/** Per-LLM-call abort timeout, ms (default: DEFAULT_LLM_TIMEOUT_MS in engine/loop.ts). */
 	llmTimeoutMs?: number
+	/**
+	 * Streaming-and-reasoning: opt-in SSE streaming (default OFF — the
+	 * blocking request path is unchanged). Also settable via
+	 * $HEADLESSCODE_STREAM ("1"/"true"/"yes"/"on").
+	 */
+	stream: boolean
 	/** Phase 6: per-session cost cap, USD (also $HEADLESSCODE_MAX_COST_USD). */
 	maxCostUsd?: number
 	/** Phase 6: per-session duration cap, ms (also $HEADLESSCODE_MAX_DURATION_MS). */
@@ -193,6 +199,11 @@ Options:
                                (default: OFF). Also settable via
                                "allowProtectedWrites": true in
                                .headlesscode/permissions.json
+  --stream                   Opt-in SSE streaming (streaming-and-reasoning):
+                               stream token/reasoning deltas and emit
+                               llm_stream_chunk events for live-typing view.
+                               Default: OFF (blocking requests unchanged).
+                               Also settable via $HEADLESSCODE_STREAM
   --version                  Print version and exit
   --help                     Show this help and exit
 
@@ -208,6 +219,7 @@ Environment:
   HEADLESSCODE_DENIED_COMMANDS    Default --denied-commands (comma-separated)
   HEADLESSCODE_PROTECTED_FILES    Default --protected-files (comma-separated globs)
   HEADLESSCODE_ALLOW_PROTECTED_WRITES  Allow protected-file writes ("1"/"true")
+  HEADLESSCODE_STREAM          Opt-in SSE streaming ("1"/"true"/"yes"/"on")
 `
 
 export function parseArgs(argv: string[]): { options: CliOptions; error?: string } {
@@ -219,6 +231,7 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 		help: false,
 		noCheckpoints: false,
 		allowProtectedWrites: false,
+		stream: false,
 	}
 
 	for (let i = 0; i < argv.length; i++) {
@@ -377,6 +390,9 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 			}
 			case "--allow-protected-writes":
 				options.allowProtectedWrites = true
+				break
+			case "--stream":
+				options.stream = true
 				break
 			case "--checkpoint-dir": {
 				const value = next()
@@ -631,6 +647,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		condenseThresholdFraction: options.condenseThreshold,
 		condenseModel,
 		llmTimeoutMs: options.llmTimeoutMs,
+		stream: options.stream,
 		llmClient: client,
 		logger,
 		memory,
