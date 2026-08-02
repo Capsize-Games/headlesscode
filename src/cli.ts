@@ -39,6 +39,19 @@ interface CliOptions {
 	model?: string
 	maxIterations?: number
 	consecutiveErrorLimit?: number
+	/**
+	 * Recursive task decomposition (`new_task`): hard cap on how deep a single
+	 * root session may delegate (default DEFAULT_MAX_RECURSION_DEPTH = 2;
+	 * also $HEADLESSCODE_MAX_RECURSION_DEPTH). See src/engine/loop.ts.
+	 */
+	maxRecursionDepth?: number
+	/**
+	 * Recursive task decomposition (`new_task`): a child's default
+	 * maxIterations as a fraction of the parent's REMAINING iterations
+	 * (default DEFAULT_CHILD_ITERATION_FRACTION = 0.5; also
+	 * $HEADLESSCODE_CHILD_ITERATION_FRACTION). See src/engine/loop.ts.
+	 */
+	childIterationFraction?: number
 	/** Sliding-window history cap, in messages (also see DEFAULT_WINDOW_SIZE in engine/loop.ts). */
 	windowSize?: number
 	/**
@@ -148,6 +161,18 @@ Options:
                              immediately; rarely needed from a terminal.
   --model <id>               OpenRouter model id (default: $OPENROUTER_MODEL or deepseek/deepseek-chat)
   --max-iterations <n>       Loop iteration cap (default: 50)
+  --max-recursion-depth <n>  Recursive task decomposition (new_task): hard cap
+                               on how deep one root session may delegate
+                               (default: 2 = root → child → grandchild; a
+                               deeper new_task call is refused as a normal
+                               tool error). Default:
+                               $HEADLESSCODE_MAX_RECURSION_DEPTH
+  --child-iteration-fraction <f>  Recursive task decomposition: a child's
+                               default maxIterations as a fraction of the
+                               parent's REMAINING iterations (default: 0.5,
+                               floor 3 — a child never exceeds what its parent
+                               has left). Default:
+                               $HEADLESSCODE_CHILD_ITERATION_FRACTION
   --consecutive-error-limit <n>  Consecutive mistakes before giving up (default: 3)
   --window-size <n>          Sliding-window history cap, in messages, before the
                              oldest are evicted (default: 300; see DEFAULT_WINDOW_SIZE
@@ -235,6 +260,8 @@ Environment:
   HEADLESSCODE_DENIED_COMMANDS    Default --denied-commands (comma-separated)
   HEADLESSCODE_PROTECTED_FILES    Default --protected-files (comma-separated globs)
   HEADLESSCODE_ALLOW_PROTECTED_WRITES  Allow protected-file writes ("1"/"true")
+  HEADLESSCODE_MAX_RECURSION_DEPTH    Default --max-recursion-depth (positive int)
+  HEADLESSCODE_CHILD_ITERATION_FRACTION  Default --child-iteration-fraction (0 < f <= 1)
   HEADLESSCODE_STREAM          Opt-in SSE streaming ("1"/"true"/"yes"/"on")
   HEADLESSCODE_LOCAL_EXPLORE   Opt-in local exploration phase ("1"/"true")
   HEADLESSCODE_LOCAL_EXPLORE_MODEL    Local model (default qwen3.5:9b)
@@ -315,7 +342,8 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 			case "--consecutive-error-limit":
 			case "--window-size":
 			case "--context-window":
-			case "--llm-timeout-ms": {
+			case "--llm-timeout-ms":
+			case "--max-recursion-depth": {
 				const value = next()
 				const num = value === undefined ? Number.NaN : Number(value)
 				if (!Number.isInteger(num) || num <= 0) {
@@ -329,9 +357,20 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 					options.windowSize = num
 				} else if (flag === "--context-window") {
 					options.contextWindowTokens = num
+				} else if (flag === "--max-recursion-depth") {
+					options.maxRecursionDepth = num
 				} else {
 					options.llmTimeoutMs = num
 				}
+				break
+			}
+			case "--child-iteration-fraction": {
+				const value = next()
+				const num = value === undefined ? Number.NaN : Number(value)
+				if (!Number.isFinite(num) || num <= 0 || num > 1) {
+					return { options, error: "--child-iteration-fraction requires a fraction between 0 and 1 (e.g. 0.5)" }
+				}
+				options.childIterationFraction = num
 				break
 			}
 			case "--condense-threshold": {
@@ -643,6 +682,13 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// explicitly keeps the CLI the single place that resolves config.
 	const maxPauseMs = options.maxPauseMs ?? envNumber("HEADLESSCODE_MAX_PAUSE_MS")
 
+	// Recursive task decomposition (`new_task`): CLI flag wins over the env
+	// fallback; undefined falls back to loop.ts's own defaults (depth 2 /
+	// fraction 0.5). Passed through so children inherit the root's caps.
+	const maxRecursionDepth = options.maxRecursionDepth ?? envNumber("HEADLESSCODE_MAX_RECURSION_DEPTH")
+	const childIterationFraction =
+		options.childIterationFraction ?? envNumber("HEADLESSCODE_CHILD_ITERATION_FRACTION")
+
 	// Permissions (command allow/deny + protected files): CLI flags > env vars
 	// > <workspaceRoot>/.headlesscode/permissions.json > built-in defaults.
 	// A malformed permissions.json fails loudly (mirrors HEADLESSCODE_PRICING_JSON).
@@ -670,6 +716,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		model,
 		taskText,
 		maxIterations: options.maxIterations,
+		maxRecursionDepth,
+		childIterationFraction,
 		consecutiveErrorLimit: options.consecutiveErrorLimit,
 		windowSize: options.windowSize,
 		contextWindowTokens: options.contextWindowTokens,

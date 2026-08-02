@@ -46,6 +46,19 @@ export interface EventRecord {
 	sessionId: string
 	type: string
 	iteration?: number
+	/**
+	 * Recursive task decomposition (`new_task`): the id of the session that
+	 * spawned this one, present on every event of a child session (absent on
+	 * root sessions). Lets the dashboard render parent/child nesting without
+	 * cross-referencing anything else — the lineage is stamped onto each
+	 * record, so a child feed never needs its parent's feed to be readable.
+	 */
+	parentSessionId?: string
+	/**
+	 * Recursive task decomposition (`new_task`): this session's recursion
+	 * depth (0 = root). Stamped onto every event alongside parentSessionId.
+	 */
+	recursionDepth?: number
 	[field: string]: unknown
 }
 
@@ -139,6 +152,12 @@ export class EventFeed {
 		private readonly workspaceRoot: string,
 		private readonly sessionId: string,
 		private readonly onError: (eventType: string, error: unknown) => void,
+		/**
+		 * Recursive task decomposition (`new_task`): the parent session's id
+		 * and this session's recursion depth, stamped onto EVERY record so a
+		 * child feed is self-describing. Absent on root sessions (no-op).
+		 */
+		private readonly lineage?: { parentSessionId?: string; recursionDepth?: number },
 	) {}
 
 	/** Append a raw event record (non-fatal). */
@@ -147,6 +166,8 @@ export class EventFeed {
 			ts: new Date().toISOString(),
 			sessionId: this.sessionId,
 			type,
+			...(this.lineage?.parentSessionId ? { parentSessionId: this.lineage.parentSessionId } : {}),
+			...(this.lineage?.recursionDepth !== undefined ? { recursionDepth: this.lineage.recursionDepth } : {}),
 			...fields,
 		}
 		const task = this.queue.then(() => appendEvent(this.workspaceRoot, this.sessionId, record))

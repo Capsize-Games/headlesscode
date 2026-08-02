@@ -1617,6 +1617,13 @@ const IMPLEMENTED_TOOLS = new Set([
 	"find_references",
 	"import_graph",
 	"update_todo_list",
+	// Recursive task decomposition: implemented by HeadlessSession itself
+	// (HeadlessSession.register registers handleNewTask on the executor —
+	// see src/engine/loop.ts). The handler needs the SESSION (lineage,
+	// budget, checkpoint service), so it lives there, not in this file's
+	// stateless handler factory; read-only executors (reviewer/QA/local
+	// explore) still stub it as "not implemented" via the vendored schema.
+	"new_task",
 ])
 
 /**

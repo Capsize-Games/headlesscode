@@ -61,7 +61,15 @@ import {
 	loadCustomModes,
 	selectToolsForMode,
 } from "./prompt.js"
-import type { ChatMessage, ChatTool, LlmClient, LlmResponse, SessionResult, SessionBudgetUsage } from "./types.js"
+import type {
+	ChatMessage,
+	ChatTool,
+	LlmClient,
+	LlmResponse,
+	SessionResult,
+	SessionBudgetUsage,
+	ToolResult,
+} from "./types.js"
 import type { ModeConfig } from "@roo-code/types"
 import {
 	computeEvictCount,
@@ -72,6 +80,10 @@ import {
 } from "./condense.js"
 import { runLocalExplorePhase, type LocalExploreOptions, type LocalExploreResult } from "./local-explore.js"
 import { DEFAULT_LINE_LIMIT } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/read_file.js"
+// Recursive task decomposition (`new_task`): child mode resolution uses the
+// SAME lookup the top-level session does (custom modes from .roomodes first,
+// then the vendored built-ins — see src/engine/prompt.ts).
+import { getModeBySlug, modes } from "../vendor/zoo-code/src/shared/modes.js"
 
 /** Default max pause duration for dashboard-initiated pauses, ms (matches watch.ts's stall guard). */
 export const DEFAULT_MAX_PAUSE_MS = 2 * 60 * 60 * 1000
@@ -83,6 +95,37 @@ const PAUSED_FILENAME = ".harness.paused"
 
 export const DEFAULT_MAX_ITERATIONS = 50
 export const DEFAULT_CONSECUTIVE_ERROR_LIMIT = 3
+/**
+ * Recursive task decomposition (`new_task`): hard cap on recursion depth.
+ * Depth 0 is the root session; a session at depth `max` may NOT delegate
+ * further (its new_task call is refused as a normal tool error). Default 2 =
+ * root (0) → child (1) → grandchild (2); the grandchild is the deepest level
+ * that can run. Chosen over 3 because every level also halves the child's
+ * iteration budget (see DEFAULT_CHILD_ITERATION_FRACTION), so a 2-deep tree
+ * is already bounded to ~1.75× the parent's own iteration cap while still
+ * giving a genuinely two-level decomposition — and the shared budget is the
+ * real cost governor regardless of depth. See plans/recursive-orchestrator-mode.md.
+ */
+export const DEFAULT_MAX_RECURSION_DEPTH = 2
+/**
+ * Recursive task decomposition (`new_task`): a child session's default
+ * maxIterations is this fraction of the parent's REMAINING iterations (the
+ * parent still needs iterations after the child returns to process the
+ * result and finish). 0.5 gives the child half and keeps half for the parent;
+ * each further level halves again, so a depth-2 grandchild gets 0.25 of the
+ * root's remaining budget. Overridable via --child-iteration-fraction /
+ * $HEADLESSCODE_CHILD_ITERATION_FRACTION; the model cannot request more
+ * through the strict vendored schema (mode/message/todos only).
+ */
+export const DEFAULT_CHILD_ITERATION_FRACTION = 0.5
+/**
+ * Recursive task decomposition (`new_task`): floor on a child's maxIterations
+ * so a parent with only a couple of iterations left doesn't spawn a crippled
+ * 1-iteration child (real sub-steps need a few tool calls minimum). Never
+ * exceeds the parent's remaining iterations — the child is always capped at
+ * what the parent itself has left.
+ */
+export const DEFAULT_MIN_CHILD_ITERATIONS = 3
 /**
  * 2026-08-01: raised from 40. `windowSize` is a MESSAGE count, not a token
  * count, but the models this harness targets (e.g. deepseek/deepseek-v4-flash
@@ -116,6 +159,42 @@ export interface HeadlessSessionConfig {
 	 * live event view immediately, before the first event exists.
 	 */
 	sessionId?: string
+	/**
+	 * Recursive task decomposition (`new_task`): the id of the session that
+	 * spawned this one (absent on root sessions). Stamped onto every event
+	 * this session emits and used in checkpoint lineage tags, so a child
+	 * feed/checkpoint trail is self-describing.
+	 */
+	parentSessionId?: string
+	/**
+	 * Recursive task decomposition (`new_task`): this session's recursion
+	 * depth, 0 = root (default). Bumped by the parent's new_task handler;
+	 * a session at `recursionDepth >= maxRecursionDepth` refuses further
+	 * delegation as a normal tool error.
+	 */
+	recursionDepth?: number
+	/**
+	 * Recursive task decomposition (`new_task`): hard cap on how deep a
+	 * single root session may delegate (default DEFAULT_MAX_RECURSION_DEPTH
+	 * = 2; also settable via --max-recursion-depth). A normal tool error,
+	 * never a crash, when a child would exceed it.
+	 */
+	maxRecursionDepth?: number
+	/**
+	 * Recursive task decomposition (`new_task`): default maxIterations for a
+	 * child session as a fraction of the parent's remaining iterations
+	 * (default DEFAULT_CHILD_ITERATION_FRACTION = 0.5; also settable via
+	 * --child-iteration-fraction). See the constant's comment for the
+	 * reasoning.
+	 */
+	childIterationFraction?: number
+	/**
+	 * Recursive task decomposition (`new_task`): floor on a child's default
+	 * maxIterations (default DEFAULT_MIN_CHILD_ITERATIONS = 3) so a parent
+	 * with only a couple of iterations left doesn't spawn a crippled child.
+	 * Never exceeds the parent's remaining iterations.
+	 */
+	minChildIterations?: number
 	/** Mode slug, default 'code' (built-in or from .roomodes). */
 	mode?: string
 	/** Model id; default env OPENROUTER_MODEL or 'deepseek/deepseek-chat'. */
@@ -195,6 +274,16 @@ export interface HeadlessSessionConfig {
 	 */
 	budget?: SessionBudget | null
 	/**
+	 * INTERNAL plumbing for recursive task decomposition (`new_task`) — NOT a
+	 * public configuration field. When set, the session reuses THIS budget
+	 * tracker instead of constructing its own from `budget`, so a child's LLM
+	 * usage counts against the SAME cost/duration/iteration caps as its
+	 * parent (one shared cap, never a separate untracked budget per level).
+	 * The parent's new_task handler passes its own tracker down; root
+	 * sessions leave this unset.
+	 */
+	budgetTracker?: BudgetTracker
+	/**
 	 * Checkpoints: auto-snapshot the workspace into a shadow git repo (see
 	 * `src/checkpoints/service.ts`) at session start and after every iteration
 	 * that executed at least one tool call, so edits can be reverted. Default
@@ -207,6 +296,25 @@ export interface HeadlessSessionConfig {
 	checkpoints?: boolean
 	/** Shadow-git storage dir override (default: `<workspaceRoot>/.headlesscode/checkpoints`). */
 	checkpointDir?: string
+	/**
+	 * INTERNAL plumbing for recursive task decomposition (`new_task`) — NOT a
+	 * public configuration field. When set, the session uses THIS checkpoint
+	 * service instance (the parent's) instead of creating its own, so a
+	 * child's edits land in the SAME shadow-git history as the parent's
+	 * (checkpoints are keyed by workspaceRoot; the parent passes its service
+	 * down). `null` = the parent's checkpoints failed to init → the child
+	 * inherits "disabled" rather than starting a disconnected history.
+	 * Root sessions leave this unset and create their own service.
+	 */
+	checkpointService?: CheckpointService | null
+	/**
+	 * INTERNAL plumbing for recursive task decomposition (`new_task`) — NOT a
+	 * public configuration field. The parent session's full checkpoint
+	 * lineage string (e.g. `<rootId>` or `<rootId>/<childId>`), used to tag a
+	 * child's checkpoint commit messages as `Task: <lineage>/<childId>, …`
+	 * so `headlesscode checkpoints list` shows the whole parent/child chain.
+	 */
+	checkpointLineagePrefix?: string
 	/**
 	 * Decision escalation (workstream 2): how long ask_followup_question blocks
 	 * waiting for `<workspaceRoot>/.harness.decision-answer` before falling
@@ -304,6 +412,22 @@ export interface ResolvedSessionConfig {
 	project: string
 	/** Phase 6: per-session budget (null = off). */
 	budget: SessionBudget | null
+	/**
+	 * Recursive task decomposition (`new_task`): lineage + delegation caps —
+	 * resolved from HeadlessSessionConfig (see its doc comments for the
+	 * semantics of each field).
+	 */
+	parentSessionId?: string
+	recursionDepth: number
+	maxRecursionDepth: number
+	childIterationFraction: number
+	minChildIterations: number
+	/** Internal plumbing for `new_task` (NOT public config) — see HeadlessSessionConfig.budgetTracker. */
+	budgetTracker?: BudgetTracker
+	/** Internal plumbing for `new_task` (NOT public config) — see HeadlessSessionConfig.checkpointService. */
+	checkpointService?: CheckpointService | null
+	/** Internal plumbing for `new_task` (NOT public config) — see HeadlessSessionConfig.checkpointLineagePrefix. */
+	checkpointLineagePrefix?: string
 	/** Checkpoints on/off (default true; actual use also requires an edit-capable executor). */
 	checkpoints: boolean
 	checkpointDir?: string
@@ -384,6 +508,41 @@ export class HeadlessSession {
 	 * is done at most once per session, on the first iteration that needs it.
 	 */
 	private contextWindowResolved = false
+	/**
+	 * Recursive task decomposition (`new_task`): the session that spawned this
+	 * one, or undefined for root sessions. Stamped onto every event and used
+	 * in checkpoint lineage tags.
+	 */
+	private readonly parentSessionId?: string
+	/** Recursive task decomposition (`new_task`): 0 = root; see HeadlessSessionConfig.recursionDepth. */
+	private readonly recursionDepth: number
+	/** Recursive task decomposition (`new_task`): hard cap on delegation depth. */
+	private readonly maxRecursionDepth: number
+	/**
+	 * Recursive task decomposition (`new_task`): full checkpoint lineage
+	 * string. Root: just this session's id; child: `<parentLineage>/<childId>`.
+	 * Used in checkpoint commit message tags (`Task: <lineage>, Time: …`) so
+	 * `headlesscode checkpoints list` shows the whole parent/child chain.
+	 */
+	private checkpointLineage: string
+	/**
+	 * Recursive task decomposition (`new_task`): the parent's iteration number
+	 * as of the last completed LLM turn, updated at the top of every loop in
+	 * runIterations. The new_task handler reads it to compute the child's
+	 * default maxIterations from the parent's REMAINING iterations.
+	 */
+	private currentIteration = 0
+	/** The parent's loaded custom modes, stashed so the new_task handler can
+	 * reuse them for child mode resolution instead of re-loading .roomodes. */
+	private customModes: ModeConfig[] = []
+	/**
+	 * Recursive task decomposition (`new_task`): the shared BudgetTracker the
+	 * parent runs on, set in run() and passed down to children so the whole
+	 * delegation tree spends against ONE cost/duration/iteration budget (see
+	 * the config field's comment). Null only before run() starts — new_task
+	 * cannot be called before that (the handler only runs inside the loop).
+	 */
+	private budgetTracker: BudgetTracker | null = null
 
 	constructor(config: HeadlessSessionConfig) {
 		if (!config.llmClient) {
@@ -395,6 +554,13 @@ export class HeadlessSession {
 
 		this.config = {
 			sessionId: config.sessionId?.trim() ? config.sessionId.trim() : undefined,
+			// Recursive task decomposition (`new_task`): lineage fields default
+			// to root-session values (undefined parent / depth 0 / cap 2).
+			parentSessionId: config.parentSessionId?.trim() ? config.parentSessionId.trim() : undefined,
+			recursionDepth: config.recursionDepth ?? 0,
+			maxRecursionDepth: config.maxRecursionDepth ?? DEFAULT_MAX_RECURSION_DEPTH,
+			childIterationFraction: config.childIterationFraction ?? DEFAULT_CHILD_ITERATION_FRACTION,
+			minChildIterations: config.minChildIterations ?? DEFAULT_MIN_CHILD_ITERATIONS,
 			mode: config.mode ?? "code",
 			model: config.model ?? process.env.OPENROUTER_MODEL ?? DEFAULT_MODEL,
 			taskText: config.taskText,
@@ -425,6 +591,12 @@ export class HeadlessSession {
 			project: config.project ?? path.basename(path.resolve(config.workspaceRoot)),
 			memory: config.memory ?? null,
 			budget: config.budget ?? null,
+			// Internal plumbing for `new_task` (see the config interface):
+			// the shared budget tracker / checkpoint service lineage from the
+			// parent session, threaded straight through.
+			budgetTracker: config.budgetTracker,
+			checkpointService: config.checkpointService,
+			checkpointLineagePrefix: config.checkpointLineagePrefix,
 			checkpoints: config.checkpoints ?? true,
 			checkpointDir: config.checkpointDir,
 			decisionTimeoutMs: config.decisionTimeoutMs,
@@ -480,12 +652,31 @@ export class HeadlessSession {
 				},
 			})
 		this.sessionId = config.sessionId?.trim() ? config.sessionId.trim() : randomUUID()
+		this.parentSessionId = this.config.parentSessionId
+		this.recursionDepth = this.config.recursionDepth
+		this.maxRecursionDepth = this.config.maxRecursionDepth
+		// Checkpoint lineage: root sessions tag commits with just their own id;
+		// children append their id to the parent's full lineage chain.
+		this.checkpointLineage = this.parentSessionId
+			? `${this.config.checkpointLineagePrefix ?? this.parentSessionId}/${this.sessionId}`
+			: this.sessionId
 		this.eventHook = config.eventHook
 		this.eventFeed = new EventFeed(config.workspaceRoot, this.sessionId, (eventType, error) => {
 			this.logger.warn(`[events] failed to record '${eventType}' (non-fatal; dashboard misses this event)`, {
 				error: error instanceof Error ? error.message : String(error),
 			})
-		})
+		},
+		// Recursive task decomposition: stamp the parent/child lineage onto
+		// EVERY event of this session's feed so a child's .jsonl is
+		// self-describing (the dashboard can render nesting without joining).
+		this.parentSessionId ? { parentSessionId: this.parentSessionId, recursionDepth: this.recursionDepth } : undefined)
+		// Recursive task decomposition (`new_task`): register the real handler
+		// on the headless executor. Read-only executors (reviewer/QA/local
+		// explore) already stubbed new_task during construction, so they keep
+		// the "not implemented" stub — `has()` is true and this is skipped.
+		if (!this.executor.has("new_task")) {
+			this.executor.register("new_task", (args) => this.handleNewTask(args))
+		}
 		// Checkpoints are active when the executor is edit-capable: write_to_file
 		// OR any of the surgical edit tools (apply_diff / search_replace /
 		// edit_file). An iteration that used ONLY a diff tool must still snapshot
@@ -514,8 +705,11 @@ export class HeadlessSession {
 	async run(): Promise<SessionResult> {
 		const { workspaceRoot, mode, model } = this.config
 
-		// 1. System prompt + tool selection.
+		// 1. System prompt + tool selection. customModes is stashed on the
+		// session so the new_task handler can reuse it for child mode
+		// resolution (avoid re-reading .roomodes per delegation).
 		const customModes = this.config.customModes ?? (await loadCustomModes(workspaceRoot))
+		this.customModes = customModes
 		const systemPrompt =
 			this.config.systemPromptOverride ??
 			(await buildSystemPrompt({
@@ -596,7 +790,16 @@ export class HeadlessSession {
 		// it's used purely for accounting so usage is always recorded and
 		// logged, regardless of whether enforcement caps are configured.
 		const startedAt = new Date().toISOString()
-		const budgetTracker = new BudgetTracker(this.config.budget ?? {})
+		// Recursive task decomposition (`new_task`): a child session is given
+		// the PARENT's BudgetTracker instance (internal plumbing, not public
+		// config), so its LLM usage lands in the same running total and trips
+		// the SAME cost cap — a $0.50-capped parent can't spawn children that
+		// each independently spend up to $0.50. Root sessions (no tracker
+		// passed) still build one from config as before.
+		const budgetTracker = this.config.budgetTracker ?? new BudgetTracker(this.config.budget ?? {})
+		// Stash it on the session so the new_task handler can hand the SAME
+		// instance to children (see handleNewTask).
+		this.budgetTracker = budgetTracker
 		// Decision escalation: wire the budget clock's pause/resume so
 		// ask_followup_question doesn't burn duration budget while blocked
 		// waiting on a human/orchestrator answer (see executor.ts).
@@ -985,6 +1188,10 @@ export class HeadlessSession {
 		let toolCalls = 0
 
 		for (let iteration = 1; iteration <= maxIterations; iteration++) {
+			// Recursive task decomposition (`new_task`): remember the iteration
+			// number so the handler can compute a child's default maxIterations
+			// from the parent's REMAINING iterations (see handleNewTask).
+			this.currentIteration = iteration
 			this.logger.info(`[loop] iteration ${iteration}/${maxIterations}`, { history: messages.length })
 			// Live worker monitoring: emit the iteration_start event alongside
 			// the human-readable log line above. Non-fatal.
@@ -1168,6 +1375,23 @@ export class HeadlessSession {
 
 			const calls = parseToolCalls(assistant)
 
+			// 6a.5 Recursive task decomposition (`new_task`): the vendored tool
+			// description mandates "This tool MUST be called alone. Do NOT call
+			// this tool alongside other tools in the same message turn." The
+			// tool handler only ever sees its own args (ToolExecutor.execute is
+			// per-call), so only this loop — which sees the whole `calls`
+			// batch — can enforce it. new_task calls are refused with a normal
+			// tool error while every sibling call in the turn still executes
+			// (the refusal counts toward consecutiveMistakes like any other).
+			const refusedNewTaskIds = new Set<string>()
+			if (calls.length > 1 && calls.some((call) => call.name === "new_task")) {
+				for (const call of calls) {
+					if (call.name === "new_task") {
+						refusedNewTaskIds.add(call.id)
+					}
+				}
+			}
+
 			// 6a. SUCCESS via attempt_completion.
 			const completionCall = calls.find((call) => call.name === "attempt_completion")
 			if (completionCall) {
@@ -1228,6 +1452,13 @@ export class HeadlessSession {
 
 				if (call.parseError) {
 					resultContent = `[Error] Failed to parse arguments for tool '${call.name}': ${call.parseError}. Raw arguments: ${call.rawArguments}`
+					isError = true
+				} else if (refusedNewTaskIds.has(call.id)) {
+					// new_task was called alongside other tools this turn — refuse
+					// it (per the vendored tool description) WITHOUT executing it,
+					// while siblings below execute normally.
+					resultContent =
+						"[Error] new_task MUST be called alone — do not call it alongside other tools in the same message turn. Re-issue new_task as the ONLY tool call in its own turn."
 					isError = true
 				} else {
 					const result = await this.executor.execute(call.name, call.args)
@@ -1325,6 +1556,22 @@ export class HeadlessSession {
 			return
 		}
 		try {
+			// Recursive task decomposition (`new_task`): a child session reuses
+			// the PARENT's CheckpointService instance — checkpoints are keyed by
+			// workspaceRoot, not by session, so both sessions' edits land in the
+			// same shadow-git history. The lineage tag on each save
+			// (`Task: <parentId>/<childId>, …`) keeps them distinguishable in
+			// `headlesscode checkpoints list`. Root sessions (no service
+			// passed) create their own as before.
+			if (this.config.checkpointService) {
+				this.checkpointService = this.config.checkpointService
+				await this.checkpointService.save(`Task: ${this.checkpointLineage}, Time: ${Date.now()}`, {
+					allowEmpty: true,
+				})
+				this.logger.info("[checkpoints] child baseline checkpoint saved", { lineage: this.checkpointLineage })
+				await this.emitEvent("checkpoint_saved", () => this.eventFeed.checkpointSaved(0))
+				return
+			}
 			const service = createCheckpointService({
 				taskId: this.sessionId,
 				workspaceRoot: this.config.workspaceRoot,
@@ -1332,7 +1579,7 @@ export class HeadlessSession {
 				log: (message) => this.logger.debug(`[checkpoints] ${message}`),
 			})
 			await service.init()
-			await service.save(`Task: ${this.sessionId}, Time: ${Date.now()}`, { allowEmpty: true })
+			await service.save(`Task: ${this.checkpointLineage}, Time: ${Date.now()}`, { allowEmpty: true })
 			this.checkpointService = service
 			this.logger.info("[checkpoints] baseline checkpoint saved", { taskId: this.sessionId })
 			// Live worker monitoring: the baseline checkpoint is iteration 0.
@@ -1358,7 +1605,7 @@ export class HeadlessSession {
 			return
 		}
 		try {
-			await this.checkpointService.save(`Task: ${this.sessionId}, Time: ${Date.now()}`, { allowEmpty: true })
+			await this.checkpointService.save(`Task: ${this.checkpointLineage}, Time: ${Date.now()}`, { allowEmpty: true })
 			this.logger.debug("[checkpoints] iteration checkpoint saved", { iteration })
 			// Live worker monitoring: mirror the existing checkpoint hook point.
 			// Non-fatal.
@@ -1368,6 +1615,164 @@ export class HeadlessSession {
 			this.logger.warn("[checkpoints] save failed (non-fatal; checkpoints disabled for the rest of this session)", {
 				error: error instanceof Error ? error.message : String(error),
 			})
+		}
+	}
+
+	/**
+		* Recursive task decomposition (`new_task`) — the headless-native
+		* equivalent of Zoo Code's GUI `NewTaskTool` /
+		* `ClineProvider.delegateParentAndOpenChild` (see plans/recursive-orchestrator-mode.md).
+		* This is a deliberate deviation from this project's usual verbatim-port
+		* convention: the GUI version pauses and fully disposes the parent task,
+		* persists an `awaitingChildId` marker to disk, makes the child the
+		* webview's "sole active task", and resumes the parent later via a task
+		* scheduler + rollback — a whole persisted-task-history subsystem this
+		* single-process loop has no use for (the parent's call stack IS the
+		* resume state). Instead the handler constructs a new HeadlessSession
+		* SYNCHRONOUSLY and BLOCKS on it like a function call: no new process, no
+		* worktree, no parallelism. The child's outcome comes back as this tool
+		* call's result and the parent's loop simply continues on its next turn.
+		*
+		* Containment (the actual point of the feature, not hardening): the child
+		* shares the parent's BudgetTracker (one cost cap across the whole tree —
+		* see run()) and its maxIterations defaults to a fraction of the parent's
+		* REMAINING iterations, so recursive delegation can never silently blow
+		* past the parent's own budget/iteration caps.
+		*/
+	private async handleNewTask(args: Record<string, unknown>): Promise<ToolResult> {
+		const mode = typeof args.mode === "string" ? args.mode.trim() : ""
+		const message = typeof args.message === "string" ? args.message.trim() : ""
+		if (!mode || !message) {
+			return {
+				content: `[Error] new_task requires both 'mode' and 'message' (mode=${JSON.stringify(args.mode)}, message=${JSON.stringify(args.message)}).`,
+				isError: true,
+			}
+		}
+
+		// Hard depth cap: refuse as a NORMAL tool error (counts toward
+		// consecutiveMistakes like any other), never a crash. The refusal is
+		// recoverable — the parent model just completes the step itself.
+		if (this.recursionDepth >= this.maxRecursionDepth) {
+			return {
+				content: `[Error] new_task: max recursion depth reached (depth ${this.recursionDepth} >= max ${this.maxRecursionDepth}), cannot delegate further — complete this step yourself.`,
+				isError: true,
+			}
+		}
+
+		// Mode resolution mirrors top-level session mode resolution
+		// (loadCustomModes/selectToolsForMode in prompt.ts): custom modes from
+		// .roomodes first, then the vendored built-ins. An invalid slug is a
+		// normal tool error, not a crash.
+		const modeConfig = getModeBySlug(mode, this.customModes) ?? modes.find((m) => m.slug === mode)
+		if (!modeConfig) {
+			const known = [...modes.map((m) => m.slug), ...this.customModes.map((m) => m.slug)].join(", ")
+			return {
+				content: `[Error] new_task: unknown mode '${mode}'. Known modes: ${known}.`,
+				isError: true,
+			}
+		}
+
+		// Iteration containment: the child defaults to `childIterationFraction`
+		// of the parent's REMAINING iterations (the parent still needs budget
+		// after the child returns to consume the result and finish), floored
+		// at minChildIterations and NEVER exceeding what the parent has left —
+		// a recursive tree can't hand a child an iteration budget independent
+		// of the parent's own cap. The strict vendored schema
+		// (mode/message/todos only, additionalProperties: false) means the
+		// model can't request more room through the tool itself.
+		const remaining = Math.max(0, this.config.maxIterations - this.currentIteration)
+		const fraction = Math.min(1, Math.max(0, this.config.childIterationFraction))
+		const childMaxIterations = Math.max(
+			1,
+			Math.min(remaining, Math.max(this.config.minChildIterations, Math.floor(remaining * fraction))),
+		)
+
+		this.logger.info("[new_task] delegating to child session", {
+			childMode: mode,
+			parentSessionId: this.sessionId,
+			depth: this.recursionDepth + 1,
+			maxIterations: childMaxIterations,
+			parentRemaining: remaining,
+		})
+
+		const child = new HeadlessSession({
+			workspaceRoot: this.config.workspaceRoot,
+			// Lineage: the child is one level deeper and knows its parent.
+			parentSessionId: this.sessionId,
+			recursionDepth: this.recursionDepth + 1,
+			maxRecursionDepth: this.maxRecursionDepth,
+			childIterationFraction: this.config.childIterationFraction,
+			minChildIterations: this.config.minChildIterations,
+			mode,
+			model: this.config.model,
+			taskText: message,
+			maxIterations: childMaxIterations,
+			consecutiveErrorLimit: this.config.consecutiveErrorLimit,
+			windowSize: this.config.windowSize,
+			contextWindowTokens: this.config.contextWindowTokens,
+			condenseThresholdFraction: this.config.condenseThresholdFraction,
+			condenseModel: this.config.condenseModel,
+			condenseMaxTokens: this.config.condenseMaxTokens,
+			temperature: this.config.temperature,
+			maxTokens: this.config.maxTokens,
+			globalCustomInstructions: this.config.globalCustomInstructions,
+			llmTimeoutMs: this.config.llmTimeoutMs,
+			stream: this.config.stream,
+			llmClient: this.llmClient,
+			logger: this.logger,
+			memory: this.config.memory,
+			project: this.config.project,
+			// Checkpoints: reuse the PARENT's composite shadow-git service so
+			// child edits land in the SAME restorable history (checkpoints are
+			// keyed by workspaceRoot, not by a session "owning" them). null
+			// (the parent's checkpoints failed to init) inherits "disabled" —
+			// never start a disconnected history.
+			checkpoints: this.config.checkpoints,
+			checkpointDir: this.config.checkpointDir,
+			checkpointService: this.checkpointService,
+			checkpointLineagePrefix: this.checkpointLineage,
+			decisionTimeoutMs: this.config.decisionTimeoutMs,
+			decisionPollIntervalMs: this.config.decisionPollIntervalMs,
+			// The child gets the parent's RESOLVED permissions (not the
+			// possibly-undefined input), so delegating can't silently bypass
+			// a command/deny or protected-file policy by re-resolving from env.
+			permissions: this.executor.permissions,
+			maxPauseMs: this.config.maxPauseMs,
+			pausePollIntervalMs: this.config.pausePollIntervalMs,
+			eventHook: this.config.eventHook,
+			customModes: this.customModes,
+			localExplore: this.config.localExplore,
+			// Internal plumbing: the shared budget tracker IS the containment
+			// guarantee — the child's spend trips the same cost cap as the
+			// parent's (see #2 in plans/recursive-orchestrator-mode.md).
+			budgetTracker: this.budgetTracker ?? undefined,
+		})
+
+		const childResult = await child.run()
+
+		if (childResult.status === "success") {
+			const text = typeof childResult.result === "string" ? childResult.result : "(no result text)"
+			this.logger.info("[new_task] child succeeded", {
+				childMode: mode,
+				iterations: childResult.iterations,
+				toolCalls: childResult.toolCalls,
+			})
+			// Success: the child's final answer IS this tool call's result.
+			return { content: text, isError: false }
+		}
+
+		// Failure: return an HONEST error — never fabricate a success. The
+		// parent model needs the real outcome (why, how much it cost, what
+		// the child did) to decide whether to retry differently or finish.
+		const usage = childResult.budgetUsage
+			? ` (total parent+child spend $${childResult.budgetUsage.costUsd.toFixed(6)})`
+			: ""
+		const reason = childResult.reason ? `, reason: ${childResult.reason}` : ""
+		return {
+			content:
+				`[Error] new_task child session (mode '${mode}') failed: ${childResult.error ?? "unknown error"}${reason}${usage}. ` +
+				`The child made ${childResult.toolCalls} tool call(s) over ${childResult.iterations} iteration(s). Do not blindly retry this exact delegation — reassess and complete the step yourself.`,
+			isError: true,
 		}
 	}
 
