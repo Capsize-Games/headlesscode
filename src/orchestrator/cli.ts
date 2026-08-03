@@ -1449,7 +1449,11 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 							`[orchestrate] continuation spawn for ${group.name} failed (exit ${spawnResult.status}); ` +
 								`marking group needs-human\n`,
 						)
-						state = updateGroup(state, group.name, {
+						// Merge onto the watcher's CURRENT state (not the outer
+						// snapshot, which predates this group's failed patch and
+						// other groups' transitions) — same reasoning as the
+						// review patch below.
+						state = updateGroup(currentState, group.name, {
 							status: "needs-human",
 							continuationCount: decision.newContinuationCount,
 							last_activity: {
@@ -1461,14 +1465,14 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 						// Spawn succeeded: reset the group so the watcher re-polls
 						// it as "running" → "done/failed" → re-continued exactly
 						// like a first attempt.
-						state = updateGroup(state, group.name, decision.patch)
+						state = updateGroup(currentState, group.name, decision.patch)
 						await saveState(statePath, state)
 					}
 					return true
 				}
 				if (decision.patch.status === "needs-human") {
 					// Continuation cap reached: terminal "needs-human" outcome.
-					state = updateGroup(state, group.name, decision.patch)
+					state = updateGroup(currentState, group.name, decision.patch)
 					await saveState(statePath, state)
 					process.stderr.write(
 						`[orchestrate] NEEDS-HUMAN: ${group.name} exhausted ${decision.newContinuationCount} continuation ` +
