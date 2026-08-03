@@ -236,7 +236,7 @@ of hand-rolling poll loops over the state file / `harness.log`:
 ```bash
 # 1. Configure
 export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-...
-export OPENROUTER_MODEL=deepseek/deepseek-chat
+export OPENROUTER_MODEL=deepseek/deepseek-v4-flash
 
 # 2. Preview the split + spawn command (no API key needed)
 npx tsx src/cli.ts orchestrate --repo ~/Projects/airunner \

@@ -55,11 +55,10 @@ export type PricingTable = Record<string, ModelPrice>
 /**
  * Default pricing table (OpenRouter list rates, USD per 1M tokens).
  *
- * - `deepseek/deepseek-chat` — the harness default (Phase 1/2/5 workers).
- * - `deepseek/deepseek-reasoner` — the reasoning variant used for review/QA.
- * - `deepseek/deepseek-v4-flash` — the OFFICIAL DeepSeek provider's own rate
- *   specifically (verified against OpenRouter's own
- *   `/api/v1/models/deepseek/deepseek-v4-flash/endpoints` on 2026-08-01,
+ * - `deepseek/deepseek-v4-flash` — the harness default (Phase 1/2/5 workers;
+ *   see `DEFAULT_MODEL` in src/llm/openrouter.ts). The rate is the OFFICIAL
+ *   DeepSeek provider's own rate specifically (verified against OpenRouter's
+ *   own `/api/v1/models/deepseek/deepseek-v4-flash/endpoints` on 2026-08-01,
  *   cross-checked against OpenRouter's own pricing UI). This price is only
  *   actually correct because `src/llm/openrouter.ts` pins routing to this
  *   exact provider (`provider: { order: ["deepseek"], allow_fallbacks:
@@ -74,6 +73,10 @@ export type PricingTable = Record<string, ModelPrice>
  *   cost estimates and at least one false-positive budget abort. A second,
  *   smaller error (`cacheRead` off by 10x — $0.028 instead of the real
  *   $0.0028/1M) was caught and fixed the same day.
+ * - `deepseek/deepseek-chat` — the legacy default, still priced so an
+ *   explicit `OPENROUTER_MODEL=deepseek/deepseek-chat` override accounts
+ *   correctly.
+ * - `deepseek/deepseek-reasoner` — the reasoning variant used for review/QA.
  * - `anthropic/claude-3.5-sonnet` — a general-purpose reference model.
  * - `qwen/qwen3-embedding-4b` — the codebase-index embedding model
  *   (src/codesearch/embedder.ts). Embedding responses carry no completion

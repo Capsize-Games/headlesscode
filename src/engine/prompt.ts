@@ -84,6 +84,14 @@ export const EXECUTABLE_TOOL_NAMES = new Set([
 	// final gate that makes it executable/advertised now that HeadlessSession
 	// implements the handler (see src/engine/loop.ts).
 	"new_task",
+	// switch_mode (plans/switch-mode-headless.md): vendored modes'
+	// ALWAYS_AVAILABLE_TOOLS already includes switch_mode for every mode
+	// (shared/tools.ts, same as new_task); this is the final gate that makes
+	// it executable/advertised now that HeadlessSession implements the
+	// handler. NOTE: read-only executors (reviewer/QA/local explore) still
+	// stub it — their tool lists never advertise it either (see the scope
+	// boundary in plans/switch-mode-headless.md).
+	"switch_mode",
 ])
 
 // ─── custom modes loading (project .roomodes + global ~/.roo/custom_modes.yaml) ──

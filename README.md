@@ -51,7 +51,7 @@ npm install
 export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-...
 
 # Optional:
-export OPENROUTER_MODEL=deepseek/deepseek-chat          # default model
+export OPENROUTER_MODEL=deepseek/deepseek-v4-flash       # default model
 export OPENROUTER_HTTP_REFERER=https://example.com       # OpenRouter app header
 export OPENROUTER_APP_TITLE="headlesscode"               # OpenRouter X-Title header
 export HEADLESSCODE_WORKSPACE_ROOT=/path/to/target/repo  # default workspace root
@@ -130,7 +130,7 @@ headlesscode watch --owner <o> --repo <path> --label <name> [options]
   --task <text>                 The task description for the agent
   --task-file <path>            Read the task from a file (relative to workspace)
   --workspace <root>            Workspace root (default: $HEADLESSCODE_WORKSPACE_ROOT or cwd)
-  --model <id>                  OpenRouter model id (default: $OPENROUTER_MODEL or deepseek/deepseek-chat)
+  --model <id>                  OpenRouter model id (default: $OPENROUTER_MODEL or deepseek/deepseek-v4-flash)
   --max-iterations <n>          Loop iteration cap (default: 50)
   --consecutive-error-limit <n> Consecutive mistakes before giving up (default: 3)
   --max-cost-usd <n>            Phase 6: per-session cost cap in USD (decimal). Default
@@ -206,7 +206,7 @@ watch subcommand (Phase 5 — GitHub issue watcher, poll-based intake):
 - [`src/llm/openrouter.ts`](./src/llm/openrouter.ts) — OpenRouter
   chat-completions client using native `fetch` (no axios/node-fetch/openai
   SDK). Reads `HEADLESSCODE_OPENROUTER_API_KEY`, optional `OPENROUTER_HTTP_REFERER` /
-  `OPENROUTER_APP_TITLE`; model default `deepseek/deepseek-chat` (env
+  `OPENROUTER_APP_TITLE`; model default `deepseek/deepseek-v4-flash` (env
   `OPENROUTER_MODEL` overrides). Non-2xx → typed `OpenRouterError` with status +
   body excerpt; supports `AbortSignal` timeouts.
 - [`src/tools/executor.ts`](./src/tools/executor.ts) — headless executor for

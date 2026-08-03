@@ -45,7 +45,12 @@ import { randomUUID } from "node:crypto"
 
 import { BudgetExceededError, BudgetTracker, type SessionBudget } from "../budget/budget.js"
 import { DEFAULT_MODEL } from "../llm/openrouter.js"
-import { createHeadlessExecutor, ToolExecutor } from "../tools/executor.js"
+import {
+	createHeadlessExecutor,
+	escalateDecision,
+	NEEDS_DECISION_FILENAME,
+	ToolExecutor,
+} from "../tools/executor.js"
 import type { PermissionsConfig } from "../permissions/config.js"
 import { buildRollingSummary, extractSessionSummary } from "../memory/summarizer.js"
 import type { MemoryStore, RecallResult } from "../memory/types.js"
@@ -70,6 +75,7 @@ import type {
 	LlmResponse,
 	SessionResult,
 	SessionBudgetUsage,
+	ToolContext,
 	ToolResult,
 } from "./types.js"
 import type { ModeConfig } from "@roo-code/types"
@@ -128,6 +134,19 @@ export const DEFAULT_CHILD_ITERATION_FRACTION = 0.5
  * what the parent itself has left.
  */
 export const DEFAULT_MIN_CHILD_ITERATIONS = 3
+/**
+ * switch_mode (plans/switch-mode-headless.md): hard cap on how many times a
+ * single session may change its OWN active mode in place. Mirrors new_task's
+ * recursion-depth cap (same rationale: bound worst-case cost/thrash, not just
+ * infinite loops). Default 5: a realistic Architect→Code→Architect→Code
+ * handoff pipeline fits comfortably, while anything beyond ~5 pivots in one
+ * session is almost certainly a model thrashing between modes instead of
+ * working — and every switch costs either a human approval round-trip or
+ * (with auto-approve on) an unvetted permission expansion, so the cap stays
+ * far below anything a legitimate workflow needs. Overridable via
+ * --max-mode-switches / $HEADLESSCODE_MAX_MODE_SWITCHES.
+ */
+export const DEFAULT_MAX_MODE_SWITCHES = 5
 /**
  * 2026-08-01: raised from 40. `windowSize` is a MESSAGE count, not a token
  * count, but the models this harness targets (e.g. deepseek/deepseek-v4-flash
@@ -197,9 +216,29 @@ export interface HeadlessSessionConfig {
 	 * Never exceeds the parent's remaining iterations.
 	 */
 	minChildIterations?: number
+	/**
+	 * switch_mode (plans/switch-mode-headless.md): OPT-IN auto-approval of
+	 * mode switches (default false — OFF). When set, a switch_mode call
+	 * performs the mode change immediately with no human/orchestrator
+	 * approval escalation (still logged + evented, just not gated). OFF by
+	 * default because the approval gate is the actual security boundary:
+	 * a deliberately restricted mode (e.g. architect, read+md-only) must not
+	 * be able to silently grant itself a broader mode's edit permissions.
+	 * Also settable via --auto-approve-mode-switch /
+	 * $HEADLESSCODE_AUTO_APPROVE_MODE_SWITCH.
+	 */
+	autoApproveModeSwitch?: boolean
+	/**
+	 * switch_mode: hard cap on total in-place mode switches per session
+	 * (default DEFAULT_MAX_MODE_SWITCHES = 5; also settable via
+	 * --max-mode-switches / $HEADLESSCODE_MAX_MODE_SWITCHES). Exceeding it is
+	 * a normal tool error (never a crash), mirroring new_task's recursion
+	 * depth cap.
+	 */
+	maxModeSwitches?: number
 	/** Mode slug, default 'code' (built-in or from .roomodes). */
 	mode?: string
-	/** Model id; default env OPENROUTER_MODEL or 'deepseek/deepseek-chat'. */
+	/** Model id; default env OPENROUTER_MODEL or 'deepseek/deepseek-v4-flash'. */
 	model?: string
 	taskText: string
 	maxIterations?: number
@@ -424,6 +463,10 @@ export interface ResolvedSessionConfig {
 	maxRecursionDepth: number
 	childIterationFraction: number
 	minChildIterations: number
+	/** switch_mode: opt-in auto-approval (see HeadlessSessionConfig.autoApproveModeSwitch). */
+	autoApproveModeSwitch: boolean
+	/** switch_mode: hard cap on total in-place switches per session (see HeadlessSessionConfig.maxModeSwitches). */
+	maxModeSwitches: number
 	/** Internal plumbing for `new_task` (NOT public config) — see HeadlessSessionConfig.budgetTracker. */
 	budgetTracker?: BudgetTracker
 	/** Internal plumbing for `new_task` (NOT public config) — see HeadlessSessionConfig.checkpointService. */
@@ -545,6 +588,25 @@ export class HeadlessSession {
 	 * cannot be called before that (the handler only runs inside the loop).
 	 */
 	private budgetTracker: BudgetTracker | null = null
+	/**
+	 * switch_mode (plans/switch-mode-headless.md): how many in-place mode
+	 * switches this session has already performed (see config.maxModeSwitches
+	 * for the cap). Bumped only on an actually-performed switch — refusals
+	 * (unknown mode, already there, cap reached, denied/timed-out approval)
+	 * never count.
+	 */
+	private modeSwitchCount = 0
+	/**
+	 * switch_mode: the visible "[mode switched: …]" transcript marker for a
+	 * switch that was JUST approved, consumed by the loop right after the
+	 * switch_mode tool result is appended. It lives here (not pushed straight
+	 * into this.state.messages by the handler) because the marker MUST come
+	 * AFTER the tool result — an assistant message with tool_calls has to be
+	 * followed by its tool messages with nothing between (strict providers
+	 * like DeepSeek 400 on it), and the handler runs before the loop appends
+	 * that result. null when no switch is awaiting its marker.
+	 */
+	private pendingModeSwitchMarker: string | null = null
 
 	constructor(config: HeadlessSessionConfig) {
 		if (!config.llmClient) {
@@ -563,6 +625,10 @@ export class HeadlessSession {
 			maxRecursionDepth: config.maxRecursionDepth ?? DEFAULT_MAX_RECURSION_DEPTH,
 			childIterationFraction: config.childIterationFraction ?? DEFAULT_CHILD_ITERATION_FRACTION,
 			minChildIterations: config.minChildIterations ?? DEFAULT_MIN_CHILD_ITERATIONS,
+			// switch_mode: the approval gate is OFF by default — auto-approve
+			// is an explicit opt-in (config/CLI/env), never a silent default.
+			autoApproveModeSwitch: config.autoApproveModeSwitch ?? false,
+			maxModeSwitches: config.maxModeSwitches ?? DEFAULT_MAX_MODE_SWITCHES,
 			mode: config.mode ?? "code",
 			model: config.model ?? process.env.OPENROUTER_MODEL ?? DEFAULT_MODEL,
 			taskText: config.taskText,
@@ -685,6 +751,15 @@ export class HeadlessSession {
 		// the "not implemented" stub — `has()` is true and this is skipped.
 		if (!this.executor.has("new_task")) {
 			this.executor.register("new_task", (args) => this.handleNewTask(args))
+		}
+		// switch_mode (plans/switch-mode-headless.md): same session-bound
+		// registration pattern as new_task — the handler needs SESSION state
+		// (current mode, transcript, mode-switch counter) plus the shared
+		// decision-escalation helper (which needs the per-call ToolContext).
+		// Read-only executors (reviewer/QA/local explore) already stubbed it
+		// during construction, so they keep the "not implemented" stub.
+		if (!this.executor.has("switch_mode")) {
+			this.executor.register("switch_mode", (args, ctx) => this.handleSwitchMode(args, ctx))
 		}
 		// Checkpoints are active when the executor is edit-capable: write_to_file
 		// OR any of the surgical edit tools (apply_diff / search_replace /
@@ -1445,6 +1520,25 @@ export class HeadlessSession {
 					}
 				}
 			}
+			// switch_mode (plans/switch-mode-headless.md): the vendored schema
+			// does NOT mandate "called alone", but the approval gate makes it
+			// necessary anyway — its escalation shares the SINGLE
+			// .harness.needs-decision / .harness.decision-answer marker pair
+			// with ask_followup_question, so two escalated tools in one turn
+			// would stomp each other's marker and both poll the same answer
+			// file. Calls are executed sequentially (no true concurrency), but
+			// the collision is still real: the second writer overwrites the
+			// first's question and whichever reader sees an answer first
+			// consumes it. Refusing switch_mode alongside siblings (which
+			// still execute) keeps the marker protocol single-writer.
+			const refusedSwitchModeIds = new Set<string>()
+			if (calls.length > 1 && calls.some((call) => call.name === "switch_mode")) {
+				for (const call of calls) {
+					if (call.name === "switch_mode") {
+						refusedSwitchModeIds.add(call.id)
+					}
+				}
+			}
 
 			// 6a. SUCCESS via attempt_completion.
 			const completionCall = calls.find((call) => call.name === "attempt_completion")
@@ -1514,6 +1608,15 @@ export class HeadlessSession {
 					resultContent =
 						"[Error] new_task MUST be called alone — do not call it alongside other tools in the same message turn. Re-issue new_task as the ONLY tool call in its own turn."
 					isError = true
+				} else if (refusedSwitchModeIds.has(call.id)) {
+					// switch_mode was called alongside other tools this turn —
+					// refuse it WITHOUT executing it (its approval waits on the
+					// single .harness.decision-answer marker, which must not
+					// collide with a sibling's escalation), while siblings below
+					// execute normally. See the refusal-set construction above.
+					resultContent =
+						"[Error] switch_mode cannot run alongside other tools in the same message turn: its approval waits on a single .harness.decision-answer marker that must not collide with a sibling tool's escalation. Re-issue switch_mode as the ONLY tool call in its own turn."
+					isError = true
 				} else {
 					const result = await this.executor.execute(call.name, call.args)
 					resultContent = result.content
@@ -1526,7 +1629,17 @@ export class HeadlessSession {
 					name: call.name,
 					content: resultContent,
 				})
-
+	
+				// switch_mode (plans/switch-mode-headless.md): append the approved
+				// switch's visible transcript marker AFTER the tool result — the
+				// assistant-with-tool_calls → tool-result adjacency must stay
+				// unbroken (strict providers 400 otherwise; see
+				// pendingModeSwitchMarker). Only consumed on success.
+				if (call.name === "switch_mode" && !isError && this.pendingModeSwitchMarker !== null) {
+					messages.push({ role: "user", content: this.pendingModeSwitchMarker })
+					this.pendingModeSwitchMarker = null
+				}
+	
 				// Pause/resume (dashboard control): after each tool execution is
 				// still a safe boundary (never mid-tool-call, never mid-LLM-call)
 				// and makes a pause request responsive even when the LLM is fast
@@ -1787,6 +1900,11 @@ export class HeadlessSession {
 			checkpointLineagePrefix: this.checkpointLineage,
 			decisionTimeoutMs: this.config.decisionTimeoutMs,
 			decisionPollIntervalMs: this.config.decisionPollIntervalMs,
+			// switch_mode: children inherit the parent's approval policy and
+			// switch cap, so an auto-approving root's children don't silently
+			// fall back to per-switch human approval (and vice versa).
+			autoApproveModeSwitch: this.config.autoApproveModeSwitch,
+			maxModeSwitches: this.config.maxModeSwitches,
 			// The child gets the parent's RESOLVED permissions (not the
 			// possibly-undefined input), so delegating can't silently bypass
 			// a command/deny or protected-file policy by re-resolving from env.
@@ -1827,6 +1945,156 @@ export class HeadlessSession {
 				`[Error] new_task child session (mode '${mode}') failed: ${childResult.error ?? "unknown error"}${reason}${usage}. ` +
 				`The child made ${childResult.toolCalls} tool call(s) over ${childResult.iterations} iteration(s). Do not blindly retry this exact delegation — reassess and complete the step yourself.`,
 			isError: true,
+		}
+	}
+
+	/**
+		* switch_mode — the headless-native equivalent of Zoo Code's GUI mode
+		* switch (see plans/switch-mode-headless.md). Deliberately NOT the same
+		* thing as new_task: this does NOT spawn a child session — the CURRENT
+		* session's own active mode changes IN PLACE (same message history, same
+		* iteration count, same budget), just with a new system prompt / tool set
+		* / role from this point forward.
+		*
+		* Approval gate: unless config.autoApproveModeSwitch is set, the switch is
+		* escalated through the SAME .harness.needs-decision /
+		* .harness.decision-answer marker pair as ask_followup_question and fails
+		* CLOSED on denial/timeout (the session stays in its current mode) —
+		* silently granting a never-approved switch would defeat the mode
+		* restriction boundary entirely (a read-only mode like architect must not
+		* be able to grant itself code mode's edit permissions unvetted).
+		*/
+	private async handleSwitchMode(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+		const modeSlug = typeof args.mode_slug === "string" ? args.mode_slug.trim() : ""
+		const reason = typeof args.reason === "string" ? args.reason.trim() : ""
+		if (!modeSlug || !reason) {
+			return {
+				content: `[Error] switch_mode requires both 'mode_slug' and 'reason' (mode_slug=${JSON.stringify(args.mode_slug)}, reason=${JSON.stringify(args.reason)}).`,
+				isError: true,
+			}
+		}
+
+		// Mode resolution mirrors new_task: custom modes from .roomodes first,
+		// then the vendored built-ins. An invalid slug is a normal tool error
+		// (no escalation, no state change).
+		const modeConfig = getModeBySlug(modeSlug, this.customModes) ?? modes.find((m) => m.slug === modeSlug)
+		if (!modeConfig) {
+			const known = [...modes.map((m) => m.slug), ...this.customModes.map((m) => m.slug)].join(", ")
+			return {
+				content: `[Error] switch_mode: unknown mode '${modeSlug}'. Known modes: ${known}.`,
+				isError: true,
+			}
+		}
+
+		// Switching to the mode the session is ALREADY in: harmless no-op tool
+		// error rather than a pointless approval round-trip.
+		if (this.state.mode === modeSlug) {
+			return {
+				content: `[Error] switch_mode: already in mode '${modeSlug}' — no switch performed.`,
+				isError: true,
+			}
+		}
+
+		// Hard cap on total switches per session (mirrors new_task's recursion
+		// depth cap — bound worst-case cost/thrash). A normal tool error, and
+		// checked BEFORE the approval gate so a capped-out session never even
+		// escalates.
+		if (this.modeSwitchCount >= this.config.maxModeSwitches) {
+			return {
+				content: `[Error] switch_mode: max mode switches reached (${this.modeSwitchCount} >= max ${this.config.maxModeSwitches}), cannot switch to '${modeSlug}' — continue in mode '${this.state.mode}'.`,
+				isError: true,
+			}
+		}
+
+		// Approval gate — fail CLOSED. autoApproveModeSwitch skips escalation
+		// entirely; otherwise a human/orchestrator must approve via
+		// .harness.decision-answer ("approve"/"yes", case-insensitive), and any
+		// other answer (or a timeout) DENIES the switch with no state change.
+		const from = this.state.mode
+		let autoApproved = false
+		if (this.config.autoApproveModeSwitch) {
+			autoApproved = true
+			this.logger.info("[switch_mode] auto-approved (autoApproveModeSwitch)", { from, to: modeSlug })
+		} else {
+			const outcome = await escalateDecision(
+				ctx,
+				`Switch from mode '${from}' to mode '${modeSlug}'? Reason: ${reason}`,
+				["approve", "deny"],
+			)
+			if (outcome.status === "writeFailed") {
+				this.logger.warn("[switch_mode] could not write approval marker; denying switch (fail closed)", {
+					from,
+					to: modeSlug,
+					error: outcome.error,
+				})
+				return {
+					content: `[Error] switch_mode: mode switch to '${modeSlug}' could not be escalated for approval (failed to write ${NEEDS_DECISION_FILENAME}: ${outcome.error}). Continue in your current mode '${from}'.`,
+					isError: true,
+				}
+			}
+			if (outcome.status === "timedOut") {
+				this.logger.warn("[switch_mode] approval timed out; denying switch (fail closed)", { from, to: modeSlug })
+				return {
+					content: `[Error] switch_mode: mode switch to '${modeSlug}' was not approved within the timeout; continue in your current mode '${from}', or ask a human directly via ask_followup_question if this is blocking your progress.`,
+					isError: true,
+				}
+			}
+			const answer = outcome.answer.trim().toLowerCase()
+			if (!(answer.startsWith("approve") || answer.startsWith("yes"))) {
+				this.logger.warn("[switch_mode] approval denied by human/orchestrator; no switch", {
+					from,
+					to: modeSlug,
+					answer: outcome.answer,
+				})
+				return {
+					content: `[Error] switch_mode: mode switch to '${modeSlug}' was denied (answer: ${outcome.answer}). Continue in your current mode '${from}'.`,
+					isError: true,
+				}
+			}
+			this.logger.info("[switch_mode] approved by human/orchestrator", { from, to: modeSlug })
+		}
+
+		// Perform the switch: recompute the system prompt + tool list the SAME
+		// way run() does at session start (including the config.tools override
+		// precedence), mutate session state in place (the iteration loop reads
+		// this.state.tools fresh on every LLM call — see run()), and leave a
+		// visible marker in the transcript so the model's own history honestly
+		// shows when/why the switch happened rather than having it silently
+		// rewritten underneath.
+		const built = await buildSystemPrompt({
+			workspaceRoot: this.config.workspaceRoot,
+			mode: modeSlug,
+			customModes: this.customModes,
+			globalCustomInstructions: this.config.globalCustomInstructions,
+		})
+		const newTools = appendCodeIntelTools(
+			appendDescribeImageTool(
+				appendBrowserActionTool(this.config.tools ?? selectToolsForMode(modeSlug, this.customModes)),
+			),
+		)
+		this.state.mode = modeSlug
+		this.state.tools = newTools
+		this.state.systemPrompt = built.prompt
+		// The "living" system prompt each LLM call reads (messages[0] is
+		// otherwise just a regular history entry — update it in place). The
+		// visible "[mode switched: …]" marker is NOT pushed here: the loop
+		// appends it right after this call's tool result, so the strict
+		// assistant-with-tool_calls → tool-result adjacency contract is kept
+		// (see pendingModeSwitchMarker).
+		if (this.state.messages[0]?.role === "system") {
+			this.state.messages[0].content = built.prompt
+		}
+		this.pendingModeSwitchMarker = `[mode switched: ${from} -> ${modeSlug}. Reason: ${reason}]`
+		this.modeSwitchCount++
+		// Live worker monitoring: structured event for the dashboard (non-fatal
+		// like every other event emission).
+		await this.emitEvent("mode_switched", () =>
+			this.eventFeed.modeSwitched({ from, to: modeSlug, reason, autoApproved }),
+		)
+		this.logger.info("[switch_mode] switched", { from, to: modeSlug, count: this.modeSwitchCount, autoApproved })
+		return {
+			content: `Switched to mode '${modeSlug}'. Reason acknowledged: ${reason}`,
+			isError: false,
 		}
 	}
 

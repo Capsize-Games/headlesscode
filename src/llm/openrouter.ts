@@ -14,7 +14,7 @@
  *     identifying the app and enabling higher rate limits.
  *
  * Chat model resolution order (per request): `request.model` → constructor
- * `defaultModel` → `OPENROUTER_MODEL` env var → `deepseek/deepseek-chat`.
+ * `defaultModel` → `OPENROUTER_MODEL` env var → `deepseek/deepseek-v4-flash`.
  */
 
 import type {
@@ -27,7 +27,7 @@ import type {
 } from "../engine/types.js"
 
 export const OPENROUTER_BASE_URL = "https://openrouter.ai"
-export const DEFAULT_MODEL = "deepseek/deepseek-chat"
+export const DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
 
 export interface OpenRouterClientOptions {
 	apiKey?: string

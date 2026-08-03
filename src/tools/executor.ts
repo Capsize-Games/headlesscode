@@ -1271,8 +1271,8 @@ function attemptCompletionHandler(args: Record<string, unknown>): ToolResult {
 }
 
 /** Marker basenames, relative to the workspace root (mirrors the .harness.* idiom). */
-const NEEDS_DECISION_FILENAME = ".harness.needs-decision"
-const DECISION_ANSWER_FILENAME = ".harness.decision-answer"
+export const NEEDS_DECISION_FILENAME = ".harness.needs-decision"
+export const DECISION_ANSWER_FILENAME = ".harness.decision-answer"
 
 /** Default ask_followup_question escalation timeout: 30 minutes. */
 export const DEFAULT_DECISION_TIMEOUT_MS = 1_800_000
@@ -1306,33 +1306,45 @@ async function safeUnlink(p: string): Promise<void> {
 	}
 }
 
+/** The terminal outcome of one decision-escalation wait (see escalateDecision). */
+export type DecisionEscalationResult =
+	| { status: "answered"; answer: string }
+	| { status: "timedOut" }
+	| { status: "writeFailed"; error: string }
+
 /**
- * ask_followup_question — decision escalation (workstream 2).
+ * Shared decision-escalation primitive (ask_followup_question AND switch_mode
+ * — see plans/switch-mode-headless.md; do NOT duplicate this for future
+ * blocking tools).
  *
  * Writes `<workspaceRoot>/.harness.needs-decision` (JSON: question,
  * suggestions?, askedAt), then polls for `<workspaceRoot>/.harness.decision-
  * answer` every `decisionPollIntervalMs` (default 5s) up to
  * `decisionTimeoutMs` (default 30min). The session's budget-duration clock is
  * paused for the duration of the wait (see pauseBudgetClock/resumeBudgetClock
- * on ToolContext).
+ * on ToolContext). Both marker files are ALWAYS cleaned up on every terminal
+ * outcome, and the decision_blocked / decision_answered event hooks fire at
+ * the same lifecycle points as before.
  *
- * - Answer arrives in time: both marker files are deleted and the answer text
- *   is returned as a NORMAL (non-error) tool result — the model continues
- *   with real input, and this does NOT count toward the loop's consecutive-
- *   mistake bounded-failure limit.
- * - Timeout elapses: the needs-decision marker is deleted (a log line notes
- *   the timeout) and the handler falls back to EXACTLY today's behavior — the
- *   "must decide autonomously" tool error, which DOES count as a mistake.
+ * The CALLER decides what each outcome means for the model:
+ *  - answered: a human/orchestrator wrote the answer file; the raw answer
+ *    text (trimmed) is returned for the caller to interpret.
+ *  - timedOut: no answer arrived within the timeout; the marker is already
+ *    cleaned up, so a caller that refuses on timeout leaves no debris.
+ *  - writeFailed: the needs-decision marker itself couldn't be written (e.g.
+ *    a read-only workspace) — the caller should fail immediately rather than
+ *    block on an answer no one can ever provide.
  */
-async function askFollowupQuestionHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
-	const question = typeof args.question === "string" ? args.question : "(no question)"
-	const suggestions = extractSuggestions(args.follow_up)
-	const askedAt = new Date().toISOString()
-
+export async function escalateDecision(
+	ctx: ToolContext,
+	question: string,
+	suggestions?: string[],
+): Promise<DecisionEscalationResult> {
 	const needsDecisionPath = path.join(ctx.workspaceRoot, NEEDS_DECISION_FILENAME)
 	const answerPath = path.join(ctx.workspaceRoot, DECISION_ANSWER_FILENAME)
 	const timeoutMs = ctx.decisionTimeoutMs ?? DEFAULT_DECISION_TIMEOUT_MS
 	const pollIntervalMs = ctx.decisionPollIntervalMs ?? DEFAULT_DECISION_POLL_INTERVAL_MS
+	const askedAt = new Date().toISOString()
 
 	try {
 		await fsp.writeFile(
@@ -1341,13 +1353,10 @@ async function askFollowupQuestionHandler(args: Record<string, unknown>, ctx: To
 			"utf-8",
 		)
 	} catch (error) {
-		// Can't even signal escalation (e.g. read-only workspace) — fall back
-		// immediately to today's behavior rather than blocking on a wait no one
-		// can ever answer.
-		process.stderr.write(
-			`[headlesscode] ask_followup_question: failed to write ${NEEDS_DECISION_FILENAME}, falling back to autonomous decision: ${errorMessage(error)}\n`,
-		)
-		return autonomousDecisionError(question)
+		// Can't even signal escalation (e.g. read-only workspace) — report the
+		// failure and let the caller decide, rather than blocking on a wait no
+		// one can ever answer.
+		return { status: "writeFailed", error: errorMessage(error) }
 	}
 	// Live worker monitoring: mirror the marker write on the session's event
 	// feed (see src/engine/events.ts). Non-fatal — a feed failure must never
@@ -1370,7 +1379,7 @@ async function askFollowupQuestionHandler(args: Record<string, unknown>, ctx: To
 				await safeUnlink(answerPath)
 				ctx.onDecisionEvent?.("decision_answered", { answer: answer.trim() })
 				answered = true
-				return ok(`[Human/orchestrator answer received] ${answer.trim()}`)
+				return { status: "answered", answer: answer.trim() }
 			}
 			const remaining = deadline - Date.now()
 			if (remaining <= 0) {
@@ -1384,12 +1393,45 @@ async function askFollowupQuestionHandler(args: Record<string, unknown>, ctx: To
 	if (!answered) {
 		ctx.onDecisionEvent?.("decision_answered", { timedOut: true })
 	}
+	// Timed out: clean up the needs-decision marker (the answer file was never
+	// written). The caller decides the model-facing outcome.
+	await safeUnlink(needsDecisionPath)
+	return { status: "timedOut" }
+}
+
+/**
+ * ask_followup_question — decision escalation (workstream 2). Thin wrapper
+ * over the shared escalateDecision primitive: the semantics are UNCHANGED
+ * from before the refactor.
+ *
+ * - Answer arrives in time: the answer text is returned as a NORMAL
+ *   (non-error) tool result — the model continues with real input, and this
+ *   does NOT count toward the loop's consecutive-mistake bounded-failure
+ *   limit.
+ * - Timeout elapses (or the marker couldn't even be written): the handler
+ *   falls back to EXACTLY today's behavior — the "must decide autonomously"
+ *   tool error, which DOES count as a mistake.
+ */
+async function askFollowupQuestionHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+	const question = typeof args.question === "string" ? args.question : "(no question)"
+	const suggestions = extractSuggestions(args.follow_up)
+	const timeoutMs = ctx.decisionTimeoutMs ?? DEFAULT_DECISION_TIMEOUT_MS
+
+	const outcome = await escalateDecision(ctx, question, suggestions)
+	if (outcome.status === "writeFailed") {
+		process.stderr.write(
+			`[headlesscode] ask_followup_question: failed to write ${NEEDS_DECISION_FILENAME}, falling back to autonomous decision: ${outcome.error}\n`,
+		)
+		return autonomousDecisionError(question)
+	}
+	if (outcome.status === "answered") {
+		return ok(`[Human/orchestrator answer received] ${outcome.answer}`)
+	}
 
 	// Timed out: fall back to exactly today's behavior.
 	process.stderr.write(
 		`[headlesscode] ask_followup_question: timed out after ${timeoutMs}ms waiting for ${DECISION_ANSWER_FILENAME}, falling back to autonomous decision.\n`,
 	)
-	await safeUnlink(needsDecisionPath)
 	return autonomousDecisionError(question)
 }
 
@@ -1643,6 +1685,13 @@ const IMPLEMENTED_TOOLS = new Set([
 	// stateless handler factory; read-only executors (reviewer/QA/local
 	// explore) still stub it as "not implemented" via the vendored schema.
 	"new_task",
+	// switch_mode (plans/switch-mode-headless.md): implemented by
+	// HeadlessSession itself for the same reason as new_task — the handler
+	// needs SESSION state (current mode, transcript, mode-switch counter) and
+	// shares ask_followup_question's decision-escalation marker protocol.
+	// Read-only executors (reviewer/QA/local explore) still stub it via the
+	// vendored schema.
+	"switch_mode",
 ])
 
 /**

@@ -28,3 +28,6 @@ build/
 # This is a build input, not part of the harness. Root-anchored so the vendored
 # portable core under src/vendor/zoo-code/ (Apache-2.0, with attribution) stays tracked.
 /zoo-code/
+
+# Local tool runtime artifacts (Claude Code scheduled-task lock, etc.)
+/.claude/

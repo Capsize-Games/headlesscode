@@ -5,7 +5,7 @@
  * fallback key. Kept deliberately simple (a plain local config file — no
  * complexity-based routing, which is an explicit future idea, not this):
  *
- *   { "code": "deepseek/deepseek-chat", "deepseek-reviewer": "deepseek/deepseek-reasoner", "_default": "deepseek/deepseek-chat" }
+ *   { "code": "deepseek/deepseek-v4-flash", "deepseek-reviewer": "deepseek/deepseek-reasoner", "_default": "deepseek/deepseek-v4-flash" }
  *
  * Resolution precedence for `resolveModelForMode`:
  *   1. `explicitModel` (an actual `--model` flag value) — always wins, a

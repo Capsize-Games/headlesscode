@@ -14,6 +14,9 @@
  *   session_start / iteration_start / llm_response / tool_call / tool_result
  *   checkpoint_saved / decision_blocked / decision_answered
  *   condensed / todo_updated / paused / resumed / session_end
+ *   mode_switched (switch_mode: the session's own active mode changed in
+ *   place — same session, new system prompt/tool set; see
+ *   plans/switch-mode-headless.md)
  *
  * `condensed` is the one structural event that was originally only a log line
  * (`[condense] oldest turns condensed…` in src/engine/condense.ts) — the
@@ -327,6 +330,24 @@ export class EventFeed {
 		return this.emit("decision_answered", {
 			...(timedOut ? { timedOut: true } : {}),
 			...(a ? { answer: a.text, ...(a.truncated ? { answerTruncated: true } : {}) } : {}),
+		})
+	}
+
+	/**
+	 * switch_mode changed the session's OWN active mode in place (same
+	 * session/history/budget, new system prompt + tool set from this point
+	 * forward — see plans/switch-mode-headless.md). autoApproved tells the
+	 * dashboard whether the switch went through the human/orchestrator
+	 * approval gate (false) or the off-by-default auto-approve opt-in (true).
+	 */
+	modeSwitched(fields: { from: string; to: string; reason: string; autoApproved: boolean }): Promise<void> {
+		const reason = truncateField(fields.reason)
+		return this.emit("mode_switched", {
+			from: fields.from,
+			to: fields.to,
+			reason: reason.text,
+			...(reason.truncated ? { reasonTruncated: true } : {}),
+			autoApproved: fields.autoApproved,
 		})
 	}
 

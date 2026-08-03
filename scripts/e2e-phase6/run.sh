@@ -129,14 +129,16 @@ else
 fi
 
 # Budgeted run: tiny per-session cost cap (via env, as run-worker.sh would).
-# deepseek-chat = $0.27/1M in + $1.10/1M out; one mock call is 16 in + 24 out
-# ≈ $0.00003072 > $0.00001, so the FIRST recorded call trips the budget.
+# The session uses the harness DEFAULT model (deepseek/deepseek-v4-flash =
+# $0.14/1M in + $0.28/1M out — see DEFAULT_MODEL in src/llm/openrouter.ts);
+# one mock call is 16 in + 24 out ≈ $0.00000896, so a $0.000005 cap means the
+# FIRST recorded call trips the budget.
 BUDGET_OUT="$(mktemp /tmp/headlesscode-e2e6-budget-XXXXXX.out)"
 (
 	cd "$ROOT" &&
 		HEADLESSCODE_OPENROUTER_API_KEY="test" \
 		OPENROUTER_BASE_URL="http://127.0.0.1:$LLM_PORT" \
-		HEADLESSCODE_MAX_COST_USD="0.00001" \
+		HEADLESSCODE_MAX_COST_USD="0.000005" \
 		npx tsx src/cli.ts --task "Fix the greet bug" --workspace "$FIXTURE"
 ) >"$BUDGET_OUT" 2>&1
 BUDGET_EXIT=$?

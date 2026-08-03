@@ -1297,7 +1297,7 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		// always wins). undefined -> the OpenRouter client's built-in default.
 		const previewModel = (mode: string): string =>
 			resolveModelForMode({ workspaceRoot: repo, mode, explicitModel: options.model, env: process.env }) ??
-			"deepseek/deepseek-chat (client default)"
+			"deepseek/deepseek-v4-flash (client default)"
 		printPlan(repo, options.mode, specs, issues, {
 			worker: previewModel(options.mode),
 			reviewer: previewModel(options.reviewMode),

@@ -118,6 +118,16 @@ interface CliOptions {
 	 * $HEADLESSCODE_LOCAL_EXPLORE. Experimental — see plans/local-explore-phase-experiment.md.
 	 */
 	localExplore: boolean
+	/**
+	 * switch_mode (plans/switch-mode-headless.md): opt-in auto-approval of
+	 * in-place mode switches — OFF by default because the approval gate is the
+	 * security boundary that keeps a restricted mode from silently granting
+	 * itself a broader mode's permissions. Also settable via
+	 * $HEADLESSCODE_AUTO_APPROVE_MODE_SWITCH.
+	 */
+	autoApproveModeSwitch: boolean
+	/** switch_mode: hard cap on total in-place mode switches per session (default 5). */
+	maxModeSwitches?: number
 }
 
 const USAGE = `headlesscode — headless coding-agent harness (Phase 1 engine)
@@ -177,7 +187,7 @@ Options:
                              Used by the dashboard's session-launch endpoint so
                              the browser can open the session's event view
                              immediately; rarely needed from a terminal.
-  --model <id>               OpenRouter model id (default: $OPENROUTER_MODEL or deepseek/deepseek-chat)
+  --model <id>               OpenRouter model id (default: $OPENROUTER_MODEL or deepseek/deepseek-v4-flash)
   --max-iterations <n>       Loop iteration cap (default: 50)
   --max-recursion-depth <n>  Recursive task decomposition (new_task): hard cap
                                on how deep one root session may delegate
@@ -256,13 +266,26 @@ Options:
                               Default: OFF (blocking requests unchanged).
                               Also settable via $HEADLESSCODE_STREAM
   --local-explore            OPT-IN local exploration phase (experimental,
-                              default OFF): run a bounded, strictly read-only
-                              local Ollama pass (qwen3.5:9b — read_file +
-                              list_files only) before the cloud model's first
-                              turn and fold its findings into the cloud
-                              context as a labeled synthetic message. Fails
-                              open to cloud-only on any local error. Also
-                              settable via $HEADLESSCODE_LOCAL_EXPLORE
+                               default OFF): run a bounded, strictly read-only
+                               local Ollama pass (qwen3.5:9b — read_file +
+                               list_files only) before the cloud model's first
+                               turn and fold its findings into the cloud
+                               context as a labeled synthetic message. Fails
+                               open to cloud-only on any local error. Also
+                               settable via $HEADLESSCODE_LOCAL_EXPLORE
+  --auto-approve-mode-switch switch_mode: auto-approve in-place mode switches
+                               WITHOUT escalating to a human/orchestrator.
+                               OFF by default — the approval gate is the
+                               security boundary that keeps a restricted mode
+                               (e.g. architect, read+md-only) from silently
+                               granting itself a broader mode's edit
+                               permissions. Also settable via
+                               $HEADLESSCODE_AUTO_APPROVE_MODE_SWITCH
+  --max-mode-switches <n>    switch_mode: hard cap on total in-place mode
+                               switches per session (default: 5 — see
+                               DEFAULT_MAX_MODE_SWITCHES in src/engine/loop.ts).
+                               Also settable via
+                               $HEADLESSCODE_MAX_MODE_SWITCHES
   --version                  Print version and exit
   --help                     Show this help and exit
 
@@ -282,6 +305,9 @@ Environment:
   HEADLESSCODE_CHILD_ITERATION_FRACTION  Default --child-iteration-fraction (0 < f <= 1)
   HEADLESSCODE_STREAM          Opt-in SSE streaming ("1"/"true"/"yes"/"on")
   HEADLESSCODE_LOCAL_EXPLORE   Opt-in local exploration phase ("1"/"true")
+  HEADLESSCODE_AUTO_APPROVE_MODE_SWITCH  Auto-approve switch_mode calls ("1"/"true"/"yes"/"on")
+  HEADLESSCODE_MAX_MODE_SWITCHES      switch_mode: hard cap on total in-place
+                               mode switches per session (positive int)
   HEADLESSCODE_LOCAL_EXPLORE_MODEL    Local model (default qwen3.5:9b)
   HEADLESSCODE_LOCAL_EXPLORE_MAX_ITERATIONS  Iteration cap (default 15)
   HEADLESSCODE_LOCAL_EXPLORE_CONTEXT_TOKENS   Context-token budget (default 131072)
@@ -300,6 +326,7 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 		allowProtectedWrites: false,
 		stream: false,
 		localExplore: false,
+		autoApproveModeSwitch: false,
 	}
 
 	for (let i = 0; i < argv.length; i++) {
@@ -361,7 +388,8 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 			case "--window-size":
 			case "--context-window":
 			case "--llm-timeout-ms":
-			case "--max-recursion-depth": {
+			case "--max-recursion-depth":
+			case "--max-mode-switches": {
 				const value = next()
 				const num = value === undefined ? Number.NaN : Number(value)
 				if (!Number.isInteger(num) || num <= 0) {
@@ -377,6 +405,8 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 					options.contextWindowTokens = num
 				} else if (flag === "--max-recursion-depth") {
 					options.maxRecursionDepth = num
+				} else if (flag === "--max-mode-switches") {
+					options.maxModeSwitches = num
 				} else {
 					options.llmTimeoutMs = num
 				}
@@ -476,6 +506,9 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 				break
 			case "--local-explore":
 				options.localExplore = true
+				break
+			case "--auto-approve-mode-switch":
+				options.autoApproveModeSwitch = true
 				break
 			case "--checkpoint-dir": {
 				const value = next()
@@ -608,7 +641,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 			process.stdout.write(
 				`\n───── dry-run summary ─────\n` +
 					`mode:             ${options.mode}\n` +
-					`model:            ${dryRunModel ?? "deepseek/deepseek-chat (client default)"}\n` +
+					`model:            ${dryRunModel ?? "deepseek/deepseek-v4-flash (client default)"}\n` +
 					`workspace:        ${workspaceRoot}\n` +
 					`custom modes:     ${customModes.length ? customModes.map((m) => m.slug).join(", ") : "(none, using built-ins)"}\n` +
 					`exposed tools:    ${tools.map((t) => (t.type === "function" ? t.function.name : t.type)).join(", ")}\n` +
@@ -718,6 +751,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	const childIterationFraction =
 		options.childIterationFraction ?? envNumber("HEADLESSCODE_CHILD_ITERATION_FRACTION")
 
+	// switch_mode (plans/switch-mode-headless.md): the approval gate is OFF by
+	// default. Flag wins over the env fallback
+	// ($HEADLESSCODE_AUTO_APPROVE_MODE_SWITCH); undefined falls back to
+	// loop.ts's own cap default (DEFAULT_MAX_MODE_SWITCHES = 5).
+	const autoApproveModeSwitch =
+		options.autoApproveModeSwitch || envBoolean("HEADLESSCODE_AUTO_APPROVE_MODE_SWITCH")
+	const maxModeSwitches = options.maxModeSwitches ?? envNumber("HEADLESSCODE_MAX_MODE_SWITCHES")
+
 	// Permissions (command allow/deny + protected files): CLI flags > env vars
 	// > <workspaceRoot>/.headlesscode/permissions.json > built-in defaults.
 	// A malformed permissions.json fails loudly (mirrors HEADLESSCODE_PRICING_JSON).
@@ -762,6 +803,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		checkpoints: !options.noCheckpoints,
 		checkpointDir: options.checkpointDir,
 		decisionTimeoutMs,
+		autoApproveModeSwitch,
+		maxModeSwitches,
 		maxPauseMs,
 		permissions,
 		// Opt-in local exploration phase (default OFF). Flag OR env var — the
@@ -807,6 +850,15 @@ function envNumber(name: string): number | undefined {
 	}
 	const n = Number(raw)
 	return Number.isFinite(n) && n > 0 ? n : undefined
+}
+
+/** Parse an env boolean opt-in: "1"/"true"/"yes"/"on" → true; anything else (incl. unset) → false. */
+function envBoolean(name: string): boolean {
+	const raw = process.env[name]
+	if (raw === undefined || raw === "") {
+		return false
+	}
+	return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase())
 }
 
 /**

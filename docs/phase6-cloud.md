@@ -301,22 +301,22 @@ burst capacity is actually required — at which point
 
 ## 6. Cost model example for one session
 
-Baseline: one harness session, `deepseek/deepseek-chat`
-($0.27/1M input, $1.10/1M output).
+Baseline: one harness session, `deepseek/deepseek-v4-flash`
+($0.14/1M input, $0.28/1M output).
 
 | Call | Input | Output | Cost |
 | --- | --- | --- | --- |
-| system+task read | 2 000 | 0 | $0.00054 |
-| tool-call round 1 | 1 500 | 300 | $0.00074 |
-| tool-call round 2 | 1 800 | 350 | $0.00087 |
-| attempt_completion | 900 | 120 | $0.00038 |
-| **Total** | **6 200** | **770** | **≈ $0.0025** |
+| system+task read | 2 000 | 0 | $0.00028 |
+| tool-call round 1 | 1 500 | 300 | $0.00029 |
+| tool-call round 2 | 1 800 | 350 | $0.00035 |
+| attempt_completion | 900 | 120 | $0.00016 |
+| **Total** | **6 200** | **770** | **≈ $0.0011** |
 
 At the default `maxIterations = 50`, the absolute worst case is ~50 tool-call
-rounds ≈ $0.05–$0.15 depending on context growth — hence the default
+rounds ≈ $0.03–$0.08 depending on context growth — hence the default
 recommendation of a per-session cap like `--max-cost-usd 0.05` for
-`deepseek-chat` work. A fleet of 3 concurrent sessions (default cap) with that
-per-session budget bounds a full pipeline round at roughly **$0.45 worst
+`deepseek/deepseek-v4-flash` work. A fleet of 3 concurrent sessions (default cap) with that
+per-session budget bounds a full pipeline round at roughly **$0.15 worst
 case**, before the review/QA rounds (which reuse the same budget mechanism via
 the same env vars). Raise the cap only when a session legitimately needs more
 turns; the guardrail is meant to catch runaways, not to be a tight fit for
