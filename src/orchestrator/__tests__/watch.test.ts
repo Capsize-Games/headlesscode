@@ -13,7 +13,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { spawnSync } from "node:child_process"
 
-import { inspectGroup, isIterationExhaustion, watchGroups, DEFAULT_STALL_TIMEOUT_MS } from "../watch.js"
+import { inspectGroup, isIterationExhaustion, tailLog, watchGroups, DEFAULT_STALL_TIMEOUT_MS } from "../watch.js"
 import { defaultState, loadStateSync, saveStateSync, type OrchestratorGroup, type OrchestratorState } from "../state.js"
 
 async function tmpRepo(): Promise<string> {
@@ -419,6 +419,58 @@ async function testIsIterationExhaustionRejectsOtherFailures(): Promise<void> {
 	assert.equal(isIterationExhaustion(""), false, "empty summary is never exhaustion")
 }
 
+// ─── tailLog: run-separator scoping (restart must not lose prior log/stats) ──
+// scripts/run-worker.sh now appends to harness.log across continuation/rework
+// respawns on the same worktree (never truncates it), writing a run-start
+// separator before each session. tailLog() must scope its summary to content
+// after the LAST separator so a short current-run log never inherits a stale
+// "Max iterations reached" line from an earlier session in the same file.
+
+async function testTailLogScopesToLatestRunAfterAppend(): Promise<void> {
+	const repoRoot = await tmpRepo()
+	try {
+		const logPath = path.join(repoRoot, "harness.log")
+		await fs.writeFile(
+			logPath,
+			[
+				"===== headlesscode run start: 2026-08-01T00:00:00Z =====",
+				"first session doing work",
+				"headlesscode: task failed: Max iterations (50) reached without task completion",
+				"===== headlesscode run start: 2026-08-01T01:00:00Z =====",
+				"second session picked up where the first left off",
+				"headlesscode: task completed successfully",
+			].join("\n"),
+			"utf-8",
+		)
+
+		const summary = tailLog(logPath)
+		assert.ok(!summary.includes("Max iterations"), "must not see the previous session's exhaustion line")
+		assert.ok(summary.includes("second session picked up"), "must see the current session's own output")
+		assert.equal(isIterationExhaustion(summary), false, "a short current run must not misfire as exhaustion")
+	} finally {
+		await fs.rm(repoRoot, { recursive: true, force: true })
+	}
+}
+
+async function testTailLogPreservesFullHistoryOnDisk(): Promise<void> {
+	const repoRoot = await tmpRepo()
+	try {
+		const logPath = path.join(repoRoot, "harness.log")
+		await fs.writeFile(logPath, "first session output\n", "utf-8")
+		await fs.appendFile(
+			logPath,
+			"\n===== headlesscode run start: 2026-08-01T01:00:00Z =====\nsecond session output\n",
+			"utf-8",
+		)
+
+		const raw = await fs.readFile(logPath, "utf-8")
+		assert.ok(raw.includes("first session output"), "appending must never destroy a prior session's log")
+		assert.ok(raw.includes("second session output"), "and must include the new session's log too")
+	} finally {
+		await fs.rm(repoRoot, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -435,6 +487,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["watchGroups: FAILED line printed on the transition to failed", testWatchGroupsPrintsFailedTransitionToStderr],
 	["isIterationExhaustion matches the exact max-iterations error", testIsIterationExhaustionMatchesExactError],
 	["isIterationExhaustion rejects budget/real failures and empty summaries", testIsIterationExhaustionRejectsOtherFailures],
+	["tailLog: scopes the summary to content after the latest run-start separator", testTailLogScopesToLatestRunAfterAppend],
+	["tailLog: appended harness.log preserves every prior session's output on disk", testTailLogPreservesFullHistoryOnDisk],
 ]
 
 async function main(): Promise<void> {

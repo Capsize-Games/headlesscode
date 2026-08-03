@@ -52,6 +52,18 @@ const SUMMARY_TAIL_LINES = 40
 export const MAX_ITERATIONS_ERROR_RE = /Max iterations \(\d+\) reached without task completion/
 
 /**
+ * Run-boundary separator that scripts/run-worker.sh appends to harness.log
+ * before launching each session. Since a worktree is reused across
+ * continuation/rework respawns and harness.log is now append-only (never
+ * truncated, so full log history + accumulated spend/token context survive a
+ * restart), tailLog() must scope to content AFTER the last separator —
+ * otherwise a short current-run log could still have a stale "Max iterations
+ * reached" line from a previous session inside its last-N-lines window and
+ * misfire another continuation.
+ */
+const RUN_SEPARATOR_RE = /^===== headlesscode run start: .* =====$/
+
+/**
  * Whether a worker's log summary indicates it failed specifically because it
  * hit the iteration cap ("the task is bigger than one session") vs. some
  * other reason. Pure + unit-testable so the watcher's continuation decision
@@ -94,12 +106,25 @@ export interface WatchSummary {
 	allTerminal: boolean
 }
 
-/** Tail a file's last `maxLines` lines (used for the group summary). */
+/**
+ * Tail a file's last `maxLines` lines (used for the group summary), scoped to
+ * content after the LAST run-start separator so a respawned worker's summary
+ * (and the exhaustion check derived from it) never sees a previous session's
+ * output — see RUN_SEPARATOR_RE.
+ */
 export function tailLog(logPath: string, maxLines = SUMMARY_TAIL_LINES): string {
 	try {
 		const raw = fs.readFileSync(logPath, "utf-8")
 		const lines = raw.split(/\r?\n/).filter((l) => l.trim() !== "")
-		return lines.slice(-maxLines).join("\n")
+		let lastSeparator = -1
+		for (let i = lines.length - 1; i >= 0; i--) {
+			if (RUN_SEPARATOR_RE.test(lines[i])) {
+				lastSeparator = i
+				break
+			}
+		}
+		const currentRun = lastSeparator >= 0 ? lines.slice(lastSeparator + 1) : lines
+		return currentRun.slice(-maxLines).join("\n")
 	} catch {
 		return ""
 	}

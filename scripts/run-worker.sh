@@ -217,7 +217,16 @@ exit \$CODE
 # ── Launch detached + record pid ────────────────────────────────────────────
 rm -f "$WT_PATH/.harness.exit"
 rm -rf "$WT_PATH/.harness.done"
-nohup bash -c "$WRAPPER" >"$WT_PATH/harness.log" 2>&1 &
+# A worktree is reused across continuation/rework respawns, so harness.log
+# must be APPENDED to, never truncated — a worker that hits the iteration cap
+# or gets a review rework cycle keeps its full log history (and the orchestrator
+# keeps its accumulated spend/token stats, which live in separate per-session
+# .headlesscode/usage/<sessionId>.jsonl files and were never actually cleared).
+# The run-start separator lets watch.ts's tailLog() scope the "current run"
+# summary/exhaustion check to only this run's output, not a stale tail from a
+# previous session still sitting in the same file.
+printf '\n===== headlesscode run start: %s =====\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$WT_PATH/harness.log"
+nohup bash -c "$WRAPPER" >>"$WT_PATH/harness.log" 2>&1 &
 PID=$!
 printf '%s' "$PID" > "$WT_PATH/.harness.pid"
 
