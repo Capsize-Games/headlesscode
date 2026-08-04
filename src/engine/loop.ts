@@ -202,7 +202,7 @@ export const DEFAULT_READ_ONLY_NUDGE_THRESHOLD = 8
 const READ_ONLY_TOOL_NAMES = new Set(["list_files", "read_file", "search_files"])
 /** The injected nudge (user-role, seen by the model on its next turn). */
 const READ_ONLY_NUDGE_MESSAGE =
-	"You've made several read/exploration calls without using `codebase_search`. If the workspace has an index (check: is there a `.headlesscode/codesearch/index.jsonl`?), try `codebase_search` for targeted semantic search instead of blind tree-walking. If the workspace is not indexed, ignore this nudge."
+	"You've made several read/exploration calls without using `codebase_search`. If the workspace has an index (it lives in the central project store — see `~/.local/share/headlesscode/projects/`), try `codebase_search` for targeted semantic search instead of blind tree-walking. If the workspace is not indexed, ignore this nudge."
 
 /**
  * Same-file multi-edit diagnosis (see the tool-execution loop): when the
@@ -417,7 +417,7 @@ export interface HeadlessSessionConfig {
 	/**
 	 * Phase 3 context condensation: model id used for the condensation LLM
 	 * call (default: the session model). A cheaper model can be assigned via
-	 * the `_condensation` key in `<workspaceRoot>/.headlesscode/mode-models.json`
+	 * the `_condensation` key in the central store's `mode-models.json`
 	 * (see src/config/mode-models.ts's extraKeys).
 	 */
 	condenseModel?: string
@@ -465,7 +465,7 @@ export interface HeadlessSessionConfig {
 	 * warning, session continues).
 	 */
 	checkpoints?: boolean
-	/** Shadow-git storage dir override (default: `<workspaceRoot>/.headlesscode/checkpoints`). */
+	/** Shadow-git storage dir override (default: the central store's `checkpoints/`). */
 	checkpointDir?: string
 	/**
 	 * INTERNAL plumbing for recursive task decomposition (`new_task`) — NOT a
@@ -498,8 +498,8 @@ export interface HeadlessSessionConfig {
 	decisionPollIntervalMs?: number
 	/**
 	 * Resolved permissions (command allow/deny + protected files). Optional:
-	 * when absent the executor resolves its own from env vars +
-	 * `<workspaceRoot>/.headlesscode/permissions.json` + built-in defaults.
+	 * when absent the executor resolves its own from env vars + the central
+	 * store's `permissions.json` + built-in defaults.
 	 */
 	permissions?: PermissionsConfig
 	/**

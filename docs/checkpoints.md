@@ -28,10 +28,12 @@ non-interactive process (no toast notifications, no webview).
 
 The shadow repo for a session lives at
 `<checkpointDir>/tasks/<taskId>/checkpoints`, where `checkpointDir` defaults
-to **`~/.headlesscode/checkpoints`** (the current user's home directory) —
-**not** inside the workspace being tracked, and this is enforced:
-`createCheckpointService` throws if `checkpointDir` resolves inside
-`workspaceRoot`.
+to the central data store's **`~/.local/share/headlesscode/checkpoints`**
+(see `src/project-store.ts`; the old `~/.headlesscode/checkpoints` is
+migrated there once on first use, and `headlesscode migrate` runs the same
+migration explicitly) — **not** inside the workspace being tracked, and this
+is enforced: `createCheckpointService` throws if `checkpointDir` resolves
+inside `workspaceRoot`.
 
 This is a deliberate deviation from a workspace-local
 `<workspaceRoot>/.headlesscode/checkpoints` default. Two of the vendored
@@ -115,7 +117,7 @@ restore" beyond restoring to a later checkpoint if one exists.
 | Flag | Effect |
 | --- | --- |
 | `--no-checkpoints` | Disable checkpoints for this session (edit-capable sessions only; read-only sessions never checkpoint regardless) |
-| `--checkpoint-dir <path>` | Override the shadow-git storage root (default `~/.headlesscode/checkpoints`; must be outside the workspace) |
+| `--checkpoint-dir <path>` | Override the shadow-git storage root (default `~/.local/share/headlesscode/checkpoints`; must be outside the workspace) |
 
 ## Programmatic use
 

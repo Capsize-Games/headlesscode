@@ -31,6 +31,7 @@ import { dashboardMain } from "./dashboard/cli.js"
 import { indexMain } from "./codesearch/cli.js"
 import { provisionMain, pushPrMain } from "./github/cli.js"
 import { decisionProxyMain } from "./decision-proxy/cli.js"
+import { migrateMain } from "./migrate/cli.js"
 import { resolvePermissions, type PermissionsConfig } from "./permissions/config.js"
 import { resolveModelForMode } from "./config/mode-models.js"
 
@@ -194,6 +195,14 @@ Subcommands:
               when uncertain/errored — the existing timeout fallback fires
               as today. See \`npx tsx src/cli.ts decision-proxy --help\` for
               full options.
+  headlesscode migrate [--workspace <path>]
+              One-time central-store migrations: moves global shared
+              instructions (~/.roo/) and the checkpoint store
+              (~/.headlesscode/checkpoints) into ~/.local/share/headlesscode/,
+              plus a workspace's legacy .headlesscode/ content (index,
+              mode-models.json, permissions.json) into the central project
+              store. Idempotent; each move is verified before the source is
+              removed. See \`npx tsx src/cli.ts migrate --help\`.
 
 Options:
   --mode <slug>              Mode to run in (built-in or from .roomodes). Default: code
@@ -636,6 +645,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// task text (see src/decision-proxy/ + plans/decision-proxy-agent.md).
 	if (argv[0] === "decision-proxy") {
 		return decisionProxyMain(argv.slice(1))
+	}
+
+	// Migration subcommand: `headlesscode migrate ...` — the explicit,
+	// human-triggered version of the one-time central-store migrations
+	// (shared instructions, checkpoint store, legacy workspace
+	// `.headlesscode/`). See src/migrate/ + src/project-store.ts.
+	if (argv[0] === "migrate") {
+		return migrateMain(argv.slice(1))
 	}
 
 	const { options, error } = parseArgs(argv)

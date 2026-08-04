@@ -78,16 +78,18 @@ export type PricingTable = Record<string, ModelPrice>
  *   correctly.
  * - `deepseek/deepseek-reasoner` — the reasoning variant used for review/QA.
  * - `anthropic/claude-3.5-sonnet` — a general-purpose reference model.
- * - `qwen/qwen3-embedding-4b` — the codebase-index embedding model
- *   (src/codesearch/embedder.ts). Embedding responses carry no completion
- *   tokens (output is always 0). The rate is the CONSERVATIVE input-only
- *   $0.15/1M observed live on OpenRouter's Google embedding endpoint
- *   (2026-08-01): qwen3-embedding-4b itself is served on a BYOK-routed
- *   endpoint that reported $0 through OpenRouter at probe time, and its list
- *   price was NOT readable from OpenRouter's API (embedding models are absent
- *   from /api/v1/models — see src/codesearch/embedder.ts's header). Pricing a
- *   guardrail means fail-closed: estimate at a real observed rate rather than
- *   $0, so an index build on a large repo still counts against a cost cap.
+ * - `qwen/qwen3-embedding-4b` / `qwen/qwen3-embedding-8b` — the codebase-index
+ *   embedding models (src/codesearch/embedder.ts; 8b is the default since
+ *   the central-store round, 4b kept priced so a legacy index/override still
+ *   estimates correctly). Embedding responses carry no completion tokens
+ *   (output is always 0). The rates are CONSERVATIVE input-only estimates:
+ *   $0.15/1M for 4b was observed live on OpenRouter's Google embedding
+ *   endpoint (2026-08-01), and 8b is estimated at $0.30/1M (2x the 4b rate,
+ *   parameter-scaled) because embedding models are absent from OpenRouter's
+ *   /api/v1/models listing so neither list price is API-verifiable (see
+ *   src/codesearch/embedder.ts's header). Pricing a guardrail means
+ *   fail-closed: estimate rather than $0, so an index build on a large repo
+ *   still counts against a cost cap.
  */
 export const DEFAULT_PRICING_TABLE: PricingTable = {
  "deepseek/deepseek-chat": { input: 0.27, output: 1.1 },
@@ -95,6 +97,7 @@ export const DEFAULT_PRICING_TABLE: PricingTable = {
  "deepseek/deepseek-v4-flash": { input: 0.14, output: 0.28, cacheRead: 0.0028 },
  "anthropic/claude-3.5-sonnet": { input: 3.0, output: 15.0 },
  "qwen/qwen3-embedding-4b": { input: 0.15, output: 0.15 },
+ "qwen/qwen3-embedding-8b": { input: 0.3, output: 0.3 },
  // Cloud vision captioning (src/vision/describe.ts). Live OpenRouter list
  // rates pulled 2026-08-02 for image-input models; the 12b is the default
  // (cheapest candidate that wasn't materially worse than the quality anchor

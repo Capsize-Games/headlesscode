@@ -117,8 +117,17 @@ export class OpenRouterClient implements LlmClient {
 	 * HTTP request instead of one call per chunk. Embedding models are NOT in
 	 * OpenRouter's public `/api/v1/models` listing, but the endpoint is live —
 	 * see src/codesearch/embedder.ts's header comment for the full findings.
+	 *
+	 * `options.provider` (when given) pins routing via `extra_body.provider`
+	 * (OpenRouter's `{"order": [...], "allow_fallbacks": bool}` convention,
+	 * same shape buildRequestBody uses for the deepseek/* chat pin).
 	 */
-	async embed(inputs: string[], model: string, signal?: AbortSignal): Promise<OpenRouterEmbedding> {
+	async embed(
+		inputs: string[],
+		model: string,
+		options: { signal?: AbortSignal; provider?: { order?: string[]; allowFallbacks?: boolean } } = {},
+	): Promise<OpenRouterEmbedding> {
+		const { signal, provider } = options
 		if (!this.apiKey) {
 			throw new OpenRouterError(
 				"HEADLESSCODE_OPENROUTER_API_KEY is not set. Set the environment variable HEADLESSCODE_OPENROUTER_API_KEY (or pass apiKey to OpenRouterClient).",
@@ -129,7 +138,10 @@ export class OpenRouterClient implements LlmClient {
 		}
 
 		const url = `${this.baseUrl}/api/v1/embeddings`
-		const body = { model, input: inputs }
+		const body: Record<string, unknown> = { model, input: inputs }
+		if (provider) {
+			body.provider = provider
+		}
 
 		let response: Response
 		try {

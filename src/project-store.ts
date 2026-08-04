@@ -279,8 +279,12 @@ function copyVerified(src: string, dest: string): void {
  * `headlesscode migrate` subcommand remains the human-triggered path for real
  * machines.
  */
-function storeOverridden(): boolean {
+export function isStoreOverridden(): boolean {
 	return (process.env.HEADLESSCODE_DATA_DIR ?? "").trim() !== ""
+}
+
+function storeOverridden(): boolean {
+	return isStoreOverridden()
 }
 
 let checkpointMigrationAttempted = false

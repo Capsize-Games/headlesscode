@@ -54,13 +54,16 @@
  *    is computed over whatever length comes back, so no fixed-dimension
  *    constraint needs to be hard-coded.
  *
- * The chosen default model is `qwen/qwen3-embedding-4b` (open weights, no
- * data-policy guardrail restriction on this account, 2560 dims — a solid
- * quality/size/cost balance for code search). It is overridable via
+ * The chosen default model is `qwen/qwen3-embedding-8b` (the 4b→8b switch is
+ * documented below; 2560+ dims — a solid quality/size/cost balance for code
+ * search), pinned to the DeepInfra provider (see DEFAULT_EMBEDDING_PROVIDER).
+ * Both the model and the pin are overridable per machine via the central
+ * store's settings.json (src/project-store.ts) and per build via
  * `HEADLESSCODE_EMBEDDING_MODEL` (or the constructor option).
  */
 
 import { OpenRouterClient } from "../llm/openrouter.js"
+import { loadCentralSettings, type CentralSettings } from "../project-store.js"
 import {
 	DEFAULT_OLLAMA_EMBEDDING_MODEL,
 	DEFAULT_OLLAMA_URL,
@@ -71,8 +74,15 @@ import {
 	resolveOllamaUrl,
 } from "./ollama-embedder.js"
 
-/** Default embedding model (see header comment for verification notes). */
-export const DEFAULT_EMBEDDING_MODEL = "qwen/qwen3-embedding-4b"
+/**
+ * Default embedding model (see header comment for verification notes).
+ * The 8b variant (not 4b) — matching airunner's own working setup
+ * (projects/uwuchat/server/embedding_provider.py): chosen there for zero data
+ * retention + lower cost. The default is overridable per machine via the
+ * central store's settings.json (`embedding.model` — see src/project-store.ts)
+ * and per build via $HEADLESSCODE_EMBEDDING_MODEL / --model.
+ */
+export const DEFAULT_EMBEDDING_MODEL = "qwen/qwen3-embedding-8b"
 
 /** Env var that overrides the embedding model. */
 export const EMBEDDING_MODEL_ENV = "HEADLESSCODE_EMBEDDING_MODEL"
@@ -88,6 +98,18 @@ export const EMBEDDING_BACKEND_ENV = "HEADLESSCODE_EMBEDDING_BACKEND"
 
 /** Env var that overrides the OpenRouter embedding model. */
 export const OPENROUTER_EMBEDDING_MODEL_ENV = "HEADLESSCODE_OPENROUTER_EMBEDDING_MODEL"
+
+/**
+ * Default OpenRouter provider pin for embedding requests, matching airunner's
+ * working setup (projects/uwuchat/server/embedding_provider.py): DeepInfra,
+ * zero data retention, no fallbacks. Verified live 2026-08-04 against
+ * OpenRouter's `/api/v1/models/<id>/endpoints` that the provider slug casing
+ * is exactly `"DeepInfra"` (capital D/I). Overridable per machine via the
+ * central store's settings.json (`embedding.provider` /
+ * `embedding.allowFallbacks` — see src/project-store.ts).
+ */
+export const DEFAULT_EMBEDDING_PROVIDER = "DeepInfra"
+export const DEFAULT_EMBEDDING_ALLOW_FALLBACKS = false
 
 /** The backend an index was built with (recorded per entry + in metadata). */
 export type EmbeddingBackend = (typeof EMBEDDING_BACKENDS)[number]
@@ -117,9 +139,41 @@ export const MAX_CHUNK_CHARS = 8_000
 const MAX_RETRIES = 3
 const INITIAL_RETRY_DELAY_MS = 500
 
-/** Resolve the embedding model: constructor option → env → default. */
+/**
+ * Resolve the embedding model: constructor option → env → central settings →
+ * built-in default. The central settings default (src/project-store.ts's
+ * settings.json `embedding.model`) is the per-machine override knob so the
+ * 8b default is not hardcoded in application code with no way to change it.
+ */
 export function resolveEmbeddingModel(env: NodeJS.ProcessEnv = process.env, override?: string): string {
-	return override?.trim() || env[EMBEDDING_MODEL_ENV]?.trim() || DEFAULT_EMBEDDING_MODEL
+	const settings = loadCentralSettings()
+	return (
+		override?.trim() ||
+		env[EMBEDDING_MODEL_ENV]?.trim() ||
+		settings.embedding?.model?.trim() ||
+		DEFAULT_EMBEDDING_MODEL
+	)
+}
+
+/**
+ * Resolve the OpenRouter provider pin for embedding requests: central settings
+ * → built-in default. Returns undefined only when settings explicitly disable
+ * pinning (allowFallbacks without a provider is treated as no pin).
+ */
+export function resolveEmbeddingProvider(settings: CentralSettings = loadCentralSettings()): {
+	order?: string[]
+	allowFallbacks?: boolean
+} | undefined {
+	const provider = settings.embedding?.provider?.trim()
+	if (!provider) {
+		return { order: [DEFAULT_EMBEDDING_PROVIDER], allowFallbacks: DEFAULT_EMBEDDING_ALLOW_FALLBACKS }
+	}
+	return {
+		order: [provider],
+		...(typeof settings.embedding?.allowFallbacks === "boolean"
+			? { allowFallbacks: settings.embedding.allowFallbacks }
+			: { allowFallbacks: DEFAULT_EMBEDDING_ALLOW_FALLBACKS }),
+	}
 }
 
 /** The embedder interface the index build + tool handler depend on. */
@@ -168,7 +222,11 @@ export function createEmbedder(
 	if (resolved === "ollama") {
 		return new OllamaEmbedder(options.ollamaModel ?? resolveOllamaEmbeddingModel(env), options.ollamaUrl ?? resolveOllamaUrl(env))
 	}
-	return new OpenRouterEmbedder(options.model ?? env[OPENROUTER_EMBEDDING_MODEL_ENV] ?? resolveEmbeddingModel(env))
+	return new OpenRouterEmbedder(
+		options.model ?? env[OPENROUTER_EMBEDDING_MODEL_ENV] ?? resolveEmbeddingModel(env),
+		undefined,
+		resolveEmbeddingProvider(),
+	)
 }
 
 /**
@@ -177,12 +235,15 @@ export function createEmbedder(
  */
 export class OpenRouterEmbedder implements Embedder {
 	private readonly client: OpenRouterClient
+	private readonly provider: { order?: string[]; allowFallbacks?: boolean } | undefined
 
 	constructor(
 		readonly model: string = resolveEmbeddingModel(),
 		client?: OpenRouterClient,
+		provider: { order?: string[]; allowFallbacks?: boolean } | undefined = resolveEmbeddingProvider(),
 	) {
 		this.client = client ?? new OpenRouterClient()
+		this.provider = provider
 	}
 
 	async embedBatch(texts: string[]): Promise<EmbedResult> {
@@ -200,7 +261,7 @@ export class OpenRouterEmbedder implements Embedder {
 			let lastError: unknown
 			while (attempt < MAX_RETRIES) {
 				try {
-					const result = await this.client.embed(batch, this.model)
+					const result = await this.client.embed(batch, this.model, { provider: this.provider })
 					embeddings.push(...result.embeddings)
 					promptTokens += result.promptTokens
 					totalTokens += result.totalTokens
