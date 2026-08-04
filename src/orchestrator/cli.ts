@@ -38,7 +38,6 @@ import {
 import { runReview, type ReviewResult } from "./reviewer.js"
 import { runQa } from "../qa/qa.js"
 import { groupWorktreePath, isIterationExhaustion, watchGroups } from "./watch.js"
-import { checkAndNoteHeadlesscodeDir } from "../index-util.js"
 import {
 	buildStatusSummary,
 	formatStatusText,
@@ -1401,10 +1400,6 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		process.stderr.write(`headlesscode orchestrate: not a git repo: ${repo}\n`)
 		return 2
 	}
-
-	// P1.7: clarify that per-workspace state (index, mode-models.json) lives
-	// in the workspace's own `.headlesscode/`, not the global `~/.headlesscode/`.
-	checkAndNoteHeadlesscodeDir(repo)
 
 	let issues: SplitIssue[]
 	try {

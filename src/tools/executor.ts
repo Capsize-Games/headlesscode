@@ -84,9 +84,8 @@ import {
 import { findMatchingPattern } from "../permissions/protected-files.js"
 import { resolvePermissions, type PermissionsConfig } from "../permissions/config.js"
 import { createEmbedder, EMBEDDING_BACKEND_ENV, resolveEmbeddingBackend } from "../codesearch/embedder.js"
-import { loadIndexMetadata } from "../codesearch/index.js"
+import { indexFilePath, loadIndexMetadata } from "../codesearch/index.js"
 import { formatSearchResults, searchIndex } from "../codesearch/search.js"
-import { INDEX_RELATIVE_PATH } from "../codesearch/types.js"
 
 /** Cap on tool-result text fed back to the model (keep context bounded). */
 export const MAX_RESULT_CHARS = 30_000
@@ -1563,9 +1562,10 @@ function stubHandler(name: string, implemented: readonly string[] = ["read_file"
 /**
  * codebase_search — semantic search over the persisted codebase index.
  *
- * Embeds the query (one call), loads `<workspaceRoot>/.headlesscode/
- * codesearch/index.jsonl`, brute-force cosine against every stored chunk, and
- * returns the top-K as `file:startLine-endLine` + a snippet — matching the
+ * Embeds the query (one call), loads the central project store's
+ * `codesearch/index.jsonl` (see src/project-store.ts — every worktree of a
+ * repo shares the same index), brute-force cosine against every stored chunk,
+ * and returns the top-K as `file:startLine-endLine` + a snippet — matching the
  * vendored CodebaseSearchTool's output shape (src/vendor/zoo-code/src/core/
  * tools/CodebaseSearchTool.ts).
  *
@@ -1581,7 +1581,7 @@ async function codebaseSearchHandler(args: Record<string, unknown>, ctx: ToolCon
 
 	return (async () => {
 		// No index → actionable error, not a silent empty result.
-		const indexFile = path.join(ctx.workspaceRoot, INDEX_RELATIVE_PATH)
+		const indexFile = indexFilePath(ctx.workspaceRoot)
 		try {
 			await fsp.access(indexFile)
 		} catch {

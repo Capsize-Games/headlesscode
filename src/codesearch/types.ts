@@ -37,8 +37,13 @@ export interface IndexEntry {
 	backend?: "openrouter" | "ollama"
 }
 
-/** The on-disk index: `<workspaceRoot>/.headlesscode/codesearch/index.jsonl`. */
-export const INDEX_RELATIVE_PATH = ".headlesscode/codesearch/index.jsonl"
+/**
+ * The on-disk index, relative to the CENTRAL project data dir
+ * (`<dataRoot>/projects/<project-key>/codesearch/index.jsonl` — see
+ * src/project-store.ts). No longer workspace-relative: the index lives in the
+ * central store so every worktree of a repo shares it.
+ */
+export const INDEX_RELATIVE_PATH = "codesearch/index.jsonl"
 
 /** Default top-K results returned by codebase_search. */
 export const DEFAULT_TOP_K = 10

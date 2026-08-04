@@ -72,17 +72,17 @@ import { renderPage } from "./page.js"
 import { answerSessionDecision, launchSession, validateSessionStartBody } from "./session-launch.js"
 import { loadCustomModes } from "../engine/prompt.js"
 import {
-	MODE_MODELS_CONFIG_FILE,
 	loadModeModelsFile,
+	modeModelsFilePath,
 	stringifyModeModelsFile,
 	validateModeModelsBody,
 	type ModeModelsFile,
 } from "../config/mode-models.js"
 import { listWorkspaceDir, readWorkspaceFile } from "./files.js"
 import {
-	PERMISSIONS_CONFIG_FILE,
 	loadPermissionsFile,
 	parsePermissionsFileBody,
+	permissionsFilePath,
 	resolvePermissions,
 	stringifyPermissionsFile,
 	type PermissionsFile,
@@ -411,7 +411,7 @@ async function handleRequest(
 						.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }))
 					return
 				}
-				const file = path.join(repo, MODE_MODELS_CONFIG_FILE)
+				const file = modeModelsFilePath(repo)
 				await fsp.mkdir(path.dirname(file), { recursive: true })
 				await fsp.writeFile(file, stringifyModeModelsFile(body as ModeModelsFile), "utf-8")
 				res
@@ -642,7 +642,7 @@ async function handleRequest(
 						.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }))
 					return
 				}
-				const file = path.join(repo, PERMISSIONS_CONFIG_FILE)
+				const file = permissionsFilePath(repo)
 				await fsp.mkdir(path.dirname(file), { recursive: true })
 				await fsp.writeFile(file, stringifyPermissionsFile(parsed), "utf-8")
 				res

@@ -1,8 +1,9 @@
 /**
  * Persisted codebase-search index: storage + incremental build.
  *
- * Storage: `<workspaceRoot>/.headlesscode/codesearch/index.jsonl`, one JSON
- * line per chunk — { file, startLine, endLine, embedding, hash } (see
+ * Storage: the CENTRAL per-project data store's
+ * `codesearch/index.jsonl` (see src/project-store.ts) — one JSON line per
+ * chunk — { file, startLine, endLine, embedding, hash } (see
  * src/codesearch/types.ts). Plain JSONL, no vector DB: brute-force cosine
  * over every stored vector at query time is the deliberate scope for this
  * project's scale. SCALING LIMIT (documented, accepted): cosine search is
@@ -44,6 +45,7 @@ import {
 	type EmbeddingBackend,
 } from "./embedder.js"
 import { walkSourceFiles } from "./files.js"
+import { resolveProjectDataDir } from "../project-store.js"
 import { INDEX_RELATIVE_PATH, type IndexEntry } from "./types.js"
 
 export interface IndexBuildResult {
@@ -65,9 +67,9 @@ export interface IndexBuildResult {
 	backend: EmbeddingBackend
 }
 
-/** Absolute path of the index file for a workspace. */
+/** Absolute path of the index file for a workspace (central project store). */
 export function indexFilePath(workspaceRoot: string): string {
-	return path.join(path.resolve(workspaceRoot), INDEX_RELATIVE_PATH)
+	return path.join(resolveProjectDataDir(workspaceRoot), INDEX_RELATIVE_PATH)
 }
 
 /**
