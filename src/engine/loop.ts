@@ -1604,6 +1604,15 @@ export class HeadlessSession {
 							throw err
 						}
 					}
+					// The cumulative fields above are dominated by repeatedly-billed
+					// cache reads of the same growing prefix, once per turn — they
+					// do NOT represent the current conversation size (see
+					// plans/smart-condensation-async.md part 1). The per-iteration
+					// fields below are the REAL last single request's numbers, the
+					// same values the condensation trigger uses: the right unit for
+					// choosing condensation timing, and for correlating cache-hit
+					// rate (lastCachedTokens / lastPromptTokens) with conversation
+					// growth. Both are already in memory — logged, not computed.
 					this.logger.info("[usage] running total", {
 						iteration,
 						costUsd: budgetTracker.totalCostUsd,
@@ -1611,6 +1620,8 @@ export class HeadlessSession {
 						inputTokens: this.totalInputTokens,
 						outputTokens: this.totalOutputTokens,
 						cachedTokens: this.totalCachedTokens,
+						lastPromptTokens: this.lastLlmUsage?.inputTokens,
+						lastCachedTokens: this.lastLlmUsage?.cachedTokens,
 					})
 					// Live (in-progress) usage snapshot: overwritten in place each
 					// iteration so the dashboard can show this still-running
