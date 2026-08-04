@@ -707,8 +707,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 
 	// Phase 3 context condensation: a cheaper model for the condensation
 	// call can be assigned via the `_condensation` key in
-	// .headlesscode/mode-models.json (consulted after `mode`, before
-	// `_default`). An explicit --condense-model flag always wins; otherwise
+	// .headlesscode/mode-models.json (consulted BEFORE the mode entry —
+	// its whole purpose is to override the session model for condensation,
+	// so a file that sets both `code` and `_condensation` must use the
+	// cheap model). An explicit --condense-model flag always wins; otherwise
 	// the session model is used (same model = simplest, consistent quality).
 	const condenseModel =
 		options.condenseModel ??

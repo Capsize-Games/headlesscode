@@ -4,13 +4,16 @@
  * A bounded, strictly read-only local-model pass that runs BEFORE the cloud
  * model's first turn: a local Ollama model (default qwen3.5:9b) gets a
  * chance to explore the repository with a deliberately narrowed tool set
- * (read_file + list_files only — no execute_command, no write tools, and
- * deliberately NOT codebase_search; see the plans doc for why: codebase_search
- * needs the embedding model resident in VRAM at the same time the exploration
- * model is generating, the one coexistence the two-phase design avoids
- * entirely). When the phase concludes, its transcript is folded into the
- * cloud session's initial context as a clearly-labeled synthetic message and
- * the cloud model takes over completely.
+ * (read_file + list_files + codebase_search — no execute_command, no write
+ * tools). codebase_search was originally excluded because the two-phase
+ * design avoids co-resident VRAM: the exploration model AND a local
+ * embedding model can't share limited VRAM. But the actually-deployed
+ * embedder is cloud-side (OpenRouter, qwen/qwen3-embedding-4b — see
+ * src/codesearch/cli.ts), NOT local Ollama, so codebase_search touches no
+ * local VRAM at all and is safe in the local phase (2026-08-04). When the
+ * phase concludes, its transcript is folded into the cloud session's initial
+ * context as a clearly-labeled synthetic message and the cloud model takes
+ * over completely.
  *
  * The phase is bounded by BOTH an iteration cap and a context-token budget
  * (the measured safe solo-model VRAM ceiling at the configured num_ctx — see
@@ -357,7 +360,7 @@ export function buildLocalExploreHandoffMessage(
 		return null
 	}
 	const reason = terminationReason(result)
-	const header = `[Local exploration phase — a separate LOCAL model (read-only, could only call read_file and list_files: no commands, no writes, no codebase_search) ran a pre-pass on this repository BEFORE your first turn. This is NOT your own prior work. Treat its file claims as a starting point to verify, not ground truth. The phase stopped because: ${reason}.]`
+	const header = `[Local exploration phase — a separate LOCAL model (read-only, could call read_file, list_files and codebase_search: no commands, no writes) ran a pre-pass on this repository BEFORE your first turn. This is NOT your own prior work. Treat its file claims as a starting point to verify, not ground truth. The phase stopped because: ${reason}.]`
 	const footer = "=== END LOCAL EXPLORATION TRANSCRIPT ==="
 	return {
 		role: "user",
@@ -575,13 +578,16 @@ function normalizeToolCallArguments(args: unknown): string {
 // ─── Tools + prompt ─────────────────────────────────────────────────────────
 
 /**
- * The local phase's tool schemas: read_file, list_files, attempt_completion —
- * taken from the vendored native-tool definitions so the schema matches what
- * the cloud model sees. Everything else is deliberately absent (the executor
+ * The local phase's tool schemas: read_file, list_files, codebase_search,
+ * attempt_completion — taken from the vendored native-tool definitions so the
+ * schema matches what the cloud model sees. codebase_search is included even
+ * though the phase is local because its embedding call is cloud-side
+ * (OpenRouter), not local Ollama — it consumes no local VRAM (see the
+ * file-top comment). Everything else is deliberately absent (the executor
  * stubs it if called anyway).
  */
 export function buildLocalExploreTools(): ChatTool[] {
-	const names = new Set(["read_file", "list_files", "attempt_completion"])
+	const names = new Set(["read_file", "list_files", "codebase_search", "attempt_completion"])
 	return getNativeTools()
 		.filter((t) => t.type === "function" && names.has(t.function.name))
 		.map((t) => t as unknown as ChatTool)
@@ -592,10 +598,12 @@ export const EXPLORE_SYSTEM_PROMPT = `You are a LOCAL, read-only repository expl
 Available tools:
 - read_file — read a file (path is relative to the workspace root).
 - list_files — list files/directories (path is relative to the workspace root; recursive: true for a full tree).
+- codebase_search — semantic search over the indexed codebase (a query describing what you need; returns matching file excerpts). Use it for targeted search instead of blind tree-walking.
 - attempt_completion — call this when you have gathered ENOUGH context. Its result argument is your exploration report: what you found, which files are relevant and why. This does NOT complete the task — it hands off to the main model.
 
 Rules:
-- Read-only: you cannot write files, run commands, or search semantically. Only read_file and list_files exist.
+- Read-only: you cannot write files or run commands. You may use read_file, list_files and codebase_search only.
+- Prefer codebase_search for targeted lookups ("where is X?" / "how does Y work?") over recursively listing and reading whole trees.
 - Do not fabricate file contents or paths. Report exactly what the tools return. If a read fails, say so.
 - Explore purposefully: list the top level first, then drill into the directories and files that matter for the task. Prefer reading the actual entry points (package.json, src/index.ts, README) before guessing.
 - When you have enough context to hand the main model a focused map of the relevant code, call attempt_completion with your findings. If you cannot make progress, call attempt_completion anyway with what you have — never loop forever.`

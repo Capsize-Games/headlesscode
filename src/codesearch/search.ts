@@ -17,13 +17,20 @@
  * over all chunks in the index. Fine for this project's scale; a vector DB or
  * ANN index is the known future path for very large repos (see
  * src/codesearch/index.ts).
+ *
+ * LOAD CACHING: parsing the index JSONL is the dominant per-query cost — a
+ * 37k-chunk index is ~860MB of JSONL that takes ~5s to stream-parse into
+ * ~1.4GB of JS objects. A codebase_search query therefore pays that once per
+ * SESSION (not per call): the parsed entries are cached keyed by
+ * (path, mtimeMs, size), so a rebuild elsewhere invalidates the cache
+ * automatically and repeated queries are ~instant.
  */
 
 import * as fs from "node:fs"
 import * as path from "node:path"
 
 import { cosineSimilarity } from "./embedder.js"
-import { loadIndex } from "./index.js"
+import { indexFilePath, loadIndex } from "./index.js"
 import { DEFAULT_TOP_K, type IndexEntry } from "./types.js"
 
 /** One search result, matching the vendored CodebaseSearchTool's payload shape. */
@@ -48,6 +55,36 @@ function readSnippet(workspaceRoot: string, rel: string, startLine: number, endL
 	}
 }
 
+// Module-level parsed-index cache (one entry per process — a session runs one
+// workspace; keying by path+mtime+size also makes it correct for several).
+let cachedIndexPath: string | undefined
+let cachedIndexMtimeMs = -1
+let cachedIndexSize = -1
+let cachedEntries: IndexEntry[] = []
+
+/** loadIndex with a session-scoped parse cache; invalidated by file change. */
+function loadIndexCached(workspaceRoot: string): IndexEntry[] {
+	const file = indexFilePath(workspaceRoot)
+	let st: fs.Stats
+	try {
+		st = fs.statSync(file)
+	} catch {
+		// Index disappeared (or never existed) — drop the cache entry so a
+		// later build of the same path is picked up fresh.
+		cachedIndexPath = undefined
+		return loadIndex(workspaceRoot)
+	}
+	if (cachedIndexPath === file && cachedIndexMtimeMs === st.mtimeMs && cachedIndexSize === st.size) {
+		return cachedEntries
+	}
+	const entries = loadIndex(workspaceRoot)
+	cachedIndexPath = file
+	cachedIndexMtimeMs = st.mtimeMs
+	cachedIndexSize = st.size
+	cachedEntries = entries
+	return entries
+}
+
 /** Search the persisted index for the chunks most similar to `query`. */
 export function searchIndex(
 	workspaceRoot: string,
@@ -55,7 +92,7 @@ export function searchIndex(
 	pathPrefix?: string,
 	topK: number = DEFAULT_TOP_K,
 ): SearchResult[] {
-	const entries = loadIndex(workspaceRoot)
+	const entries = loadIndexCached(workspaceRoot)
 	const scored: Array<{ entry: IndexEntry; score: number }> = []
 
 	for (const entry of entries) {

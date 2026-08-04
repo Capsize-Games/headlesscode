@@ -33,7 +33,11 @@ class FakeLlmClient implements LlmClient {
 	) {}
 
 	async createChatCompletion(request: LlmRequest): Promise<LlmResponse> {
-		this.requests.push(request)
+		// Snapshot messages: the loop mutates the SAME array across iterations
+		// (assistant/tool pushes, condensation, nudge injection). Without a copy,
+		// every recorded request aliases to the array's final state — making the
+		// read-only nudge appear in requests that predate its injection.
+		this.requests.push({ ...request, messages: request.messages.map((m) => ({ ...m })) })
 		this.onRequest?.(request)
 		const step = this.script.shift()
 		if (!step) {
@@ -330,6 +334,98 @@ async function testMaxIterationsBound(): Promise<void> {
 		assert.equal(result.status, "error", `expected max-iterations failure, got ${JSON.stringify(result)}`)
 		assert.match(result.error ?? "", /Max iterations/)
 		assert.equal(result.iterations, 4)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// ─── Blind tree-walking guardrail (P1.6) ─────────────────────────────────────
+
+const NUDGE_FRAGMENT = "You've made several read/exploration calls"
+
+/** Indexed fixture: files f1..fn plus a non-empty `.headlesscode/codesearch/index.jsonl`. */
+async function makeIndexedWorkspace(prefix: string, n: number): Promise<string> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), prefix))
+	await fs.mkdir(path.join(ws, ".headlesscode", "codesearch"), { recursive: true })
+	for (let i = 1; i <= n; i++) {
+		await fs.writeFile(path.join(ws, `f${i}.txt`), `content ${i}\n`)
+	}
+	// Non-empty is all hasCodebaseIndex() requires — the guardrail only
+	// checks existence, it never queries the index.
+	await fs.writeFile(path.join(ws, ".headlesscode", "codesearch", "index.jsonl"), '{"dummy":true}\n')
+	return ws
+}
+
+function requestsContainingNudge(requests: LlmRequest[]): number[] {
+	return requests
+		.map((r, i) => (r.messages.some((m) => m.role === "user" && typeof m.content === "string" && m.content.includes(NUDGE_FRAGMENT)) ? i : -1))
+		.filter((i) => i >= 0)
+}
+
+async function testReadOnlyNudgeTriggered(): Promise<void> {
+	const ws = await makeIndexedWorkspace("headlesscode-nudge-", 9)
+	try {
+		// 8 consecutive read_file iterations (distinct paths, so no
+		// identical-repeat mistakes) then completion. The nudge must be
+		// injected at the end of iteration 8 and visible in the 9th request.
+		const client = new FakeLlmClient([
+			...Array.from({ length: 8 }, (_, i) => () => toolCall("read_file", { path: `f${i + 1}.txt` })),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({ task: "explore", client, workspaceRoot: ws })
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.ok(client.requests.length >= 9, `expected >=9 requests, got ${client.requests.length}`)
+		const nudged = requestsContainingNudge(client.requests)
+		assert.deepEqual(nudged, [8], "nudge should appear exactly once, in the request after the 8th read-only iteration")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testReadOnlyNudgeResetsOnProductiveCall(): Promise<void> {
+	const ws = await makeIndexedWorkspace("headlesscode-nudge-reset-", 12)
+	try {
+		// 4 read-only (below threshold), a write_to_file resets the streak,
+		// then 8 more read-only re-trigger the nudge. The write at iteration
+		// 5 means the second streak ends at iteration 13, so the nudge shows
+		// up in request 14 (index 13).
+		const client = new FakeLlmClient([
+			() => toolCall("read_file", { path: "f1.txt" }),
+			() => toolCall("read_file", { path: "f2.txt" }),
+			() => toolCall("read_file", { path: "f3.txt" }),
+			() => toolCall("read_file", { path: "f4.txt" }),
+			() => toolCall("write_to_file", { path: "out.txt", content: "reset" }),
+			...Array.from({ length: 8 }, (_, i) => () => toolCall("read_file", { path: `f${i + 5}.txt` })),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({ task: "explore", client, workspaceRoot: ws, maxIterations: 20 })
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		const nudged = requestsContainingNudge(client.requests)
+		assert.deepEqual(nudged, [13], "nudge should fire only AFTER the write_to_file reset, on the second 8-call streak")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testReadOnlyNudgeNotInjectedWhenUnindexed(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-nudge-noindex-"))
+	try {
+		for (let i = 1; i <= 9; i++) {
+			await fs.writeFile(path.join(ws, `f${i}.txt`), `content ${i}\n`)
+		}
+		const client = new FakeLlmClient([
+			...Array.from({ length: 9 }, (_, i) => () => toolCall("read_file", { path: `f${i + 1}.txt` })),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({ task: "explore", client, workspaceRoot: ws })
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.deepEqual(requestsContainingNudge(client.requests), [], "no nudge when the workspace has no codebase-search index")
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -693,6 +789,9 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["scenario 4: malformed JSON args -> parser fallback exercised", testScenario4MalformedJsonArgs],
 	["path-traversal guard rejects escaping paths", testPathTraversalGuard],
 	["max iterations -> bounded failure", testMaxIterationsBound],
+	["blind tree-walking: nudge after N consecutive read-only iterations (indexed ws)", testReadOnlyNudgeTriggered],
+	["blind tree-walking: a productive tool call resets the streak", testReadOnlyNudgeResetsOnProductiveCall],
+	["blind tree-walking: no nudge when the workspace is unindexed", testReadOnlyNudgeNotInjectedWhenUnindexed],
 	["live snapshot: created + updated in place during a running session's iterations", testLiveSnapshotCreatedAndUpdatedDuringIterations],
 	["live snapshot: removed on successful completion", testLiveSnapshotRemovedOnSuccess],
 	["live snapshot: removed when the session ends with an error", testLiveSnapshotRemovedOnError],

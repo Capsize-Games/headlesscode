@@ -52,6 +52,18 @@
 #                        its own model from <repo>/.headlesscode/mode-models.json
 #                        via src/config/mode-models.ts, falling back to
 #                        $OPENROUTER_MODEL which then flows to run-worker.sh)
+#   ALLOW_UNINDEXED      when set (e.g. ALLOW_UNINDEXED=1), a missing
+#                        main-repo codebase-search index is only a warning and
+#                        worktrees spawn unindexed. When UNSET (default) a
+#                        missing index is a HARD failure: the whole spawn
+#                        aborts before creating any worktree.
+#   HEADLESSCODE_AUTO_INDEX  when set (e.g. HEADLESSCODE_AUTO_INDEX=1), a
+#                        missing main-repo index is built FIRST via
+#                        `headlesscode index --workspace <repo>` before the
+#                        first spawn (the built index then seeds every
+#                        worktree). Costs real cloud-embedding money, so it is
+#                        strictly opt-in — never automatic, never silent.
+#                        Takes precedence over the ALLOW_UNINDEXED failure.
 #
 # Requires: node >= 18 (used only to merge the state JSON + resolve the
 # per-mode model — the harness is a node project, so this is not a new
@@ -74,6 +86,28 @@ if [ -z "$REPO_ROOT" ]; then
     exit 1
 fi
 REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
+
+# ── No-index guardrail ────────────────────────────────────────────────────────
+# A fresh worktree never has a codebase-search index (it's gitignored, so
+# `git worktree add` never brings it), so without this check every worker
+# starts at "not indexed" and falls back to blind read_file/grep walks — the
+# exact slowness this round fixes. Default: hard-fail the whole spawn BEFORE
+# creating any worktree. Escapes (see header):
+#   ALLOW_UNINDEXED=1          keep the historical warning-and-continue
+#   HEADLESSCODE_AUTO_INDEX=1  build the index first (opt-in; costs real
+#                              cloud-embedding money via `headlesscode index`)
+INDEX_FILE="$REPO_ROOT/.headlesscode/codesearch/index.jsonl"
+if [ ! -f "$INDEX_FILE" ] || [ ! -s "$INDEX_FILE" ]; then
+    if [ -n "${HEADLESSCODE_AUTO_INDEX:-}" ]; then
+        echo "No codebase-search index in main repo — building it now (HEADLESSCODE_AUTO_INDEX=1):"
+        echo "  headlesscode index --workspace $REPO_ROOT"
+        CLI="${HEADLESSCODE_CLI:-npx tsx src/cli.ts}"
+        (cd "$HARNESS_ROOT" && $CLI index --workspace "$REPO_ROOT")
+    elif [ -z "${ALLOW_UNINDEXED:-}" ]; then
+        echo "No codebase-search index found. Run 'headlesscode index --workspace $REPO_ROOT' first, or set ALLOW_UNINDEXED=1 to proceed without it." >&2
+        exit 1
+    fi
+fi
 
 WORKTREE_PARENT="$REPO_ROOT/.worktrees"
 DATE_TAG="$(date +%Y-%m-%d)"
@@ -222,6 +256,19 @@ for spec in "$@"; do
     else
         echo "  No codebase-search index in main repo — worktree starts unindexed (run 'headlesscode index --workspace .' in the main repo to enable codebase_search)."
     fi
+
+    # Per-workspace config files (mode-models.json, permissions.json): same
+    # gitignore story as the index — a fresh worktree never has them, and a
+    # worker resolves its models (incl. the `_condensation` cheap model) and
+    # permissions from <worktree>/.headlesscode/. A worker without
+    # mode-models.json silently runs condensation on the full session model.
+    for cfg in "$REPO_ROOT"/.headlesscode/mode-models.json "$REPO_ROOT"/.headlesscode/permissions.json; do
+        if [ -f "$cfg" ] && [ ! -e "$wt_path/.headlesscode/$(basename "$cfg")" ]; then
+            mkdir -p "$wt_path/.headlesscode"
+            cp "$cfg" "$wt_path/.headlesscode/$(basename "$cfg")"
+            echo "  Seeded $(basename "$cfg") from main repo"
+        fi
+    done
 
     # Compute unique ports for this worktree.
     # +1 base so offset=0 never collides with the main repo's own

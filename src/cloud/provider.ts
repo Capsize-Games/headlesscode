@@ -163,6 +163,21 @@ export class LocalProcessProvider implements CloudProvider {
 		const result = this.run(command, path.resolve(repo), {
 			TARGET_REPO: path.resolve(repo),
 			ORCHESTRATOR_MODE: request.env?.ORCHESTRATOR_MODE ?? "code",
+			// Operator knobs (spawner no-index guardrail + local-explore phase)
+			// flow from the ambient process env; an injected `run` only sees
+			// this explicit env, so forward them alongside TARGET_REPO.
+			...(process.env.ALLOW_UNINDEXED ? { ALLOW_UNINDEXED: process.env.ALLOW_UNINDEXED } : {}),
+			...(process.env.HEADLESSCODE_AUTO_INDEX ? { HEADLESSCODE_AUTO_INDEX: process.env.HEADLESSCODE_AUTO_INDEX } : {}),
+			...(process.env.HEADLESSCODE_LOCAL_EXPLORE ? { HEADLESSCODE_LOCAL_EXPLORE: process.env.HEADLESSCODE_LOCAL_EXPLORE } : {}),
+			...(process.env.HEADLESSCODE_LOCAL_EXPLORE_MODEL
+				? { HEADLESSCODE_LOCAL_EXPLORE_MODEL: process.env.HEADLESSCODE_LOCAL_EXPLORE_MODEL }
+				: {}),
+			...(process.env.HEADLESSCODE_LOCAL_EXPLORE_MAX_ITERATIONS
+				? { HEADLESSCODE_LOCAL_EXPLORE_MAX_ITERATIONS: process.env.HEADLESSCODE_LOCAL_EXPLORE_MAX_ITERATIONS }
+				: {}),
+			...(process.env.HEADLESSCODE_LOCAL_EXPLORE_CONTEXT_TOKENS
+				? { HEADLESSCODE_LOCAL_EXPLORE_CONTEXT_TOKENS: process.env.HEADLESSCODE_LOCAL_EXPLORE_CONTEXT_TOKENS }
+				: {}),
 		})
 		if (result.exitCode !== 0) {
 			throw new Error(`LocalProcessProvider: spawn failed (exit ${result.exitCode}): ${result.output}`)

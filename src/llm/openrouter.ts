@@ -224,50 +224,92 @@ export class OpenRouterClient implements LlmClient {
 	 * The harness deliberately never hardcodes a stale number; callers
 	 * should cache the result for the session's lifetime.
 	 *
-	 * OpenRouter returns an array of endpoint objects, each with a
-	 * `context_length` (tokens). The largest non-zero value across endpoints
-	 * is used (a model may be served by multiple hosts with different
-	 * windows; the largest is the upper bound the provider will accept).
-	 * Returns `undefined` when the endpoint is unreachable/unauthorized or
-	 * carries no usable number — the caller falls back to its conservative
-	 * default (`DEFAULT_CONTEXT_WINDOW_TOKENS` in src/engine/condense.ts).
+	 * Two live-verified quirks are handled here:
+	 * - The `<id>` path segment is the model's `provider/model` slug with a
+	 *   LITERAL slash — percent-encoding the whole string
+	 *   (`encodeURIComponent("deepseek/deepseek-v4-flash")`) yields
+	 *   `deepseek%2Fdeepseek-v4-flash` which OpenRouter 404s on. Encode each
+	 *   segment separately and rejoin with the literal `/`.
+	 * - The response body is `{"data":{"endpoints":[{...context_length}]}}`
+	 *   (per-endpoint windows nested under `data.endpoints`), NOT the
+	 *   `{"data":[...]}` array some proxies return. Accept both shapes.
+	 *
+	 * The largest non-zero context_length across endpoints is used (a model
+	 * may be served by multiple hosts with different windows; the largest is
+	 * the upper bound the provider will accept). Returns `undefined` when
+	 * the endpoint is unreachable/unauthorized or carries no usable number —
+	 * the caller falls back to its conservative default
+	 * (`DEFAULT_CONTEXT_WINDOW_TOKENS` in src/engine/condense.ts).
 	 */
 	async fetchModelContextWindow(model: string, signal?: AbortSignal): Promise<number | undefined> {
-		if (!this.apiKey) {
-			return undefined
-		}
-		const id = encodeURIComponent(model)
-		const url = `${this.baseUrl}/api/v1/models/${id}/endpoints`
+	if (!this.apiKey) {
+		return undefined
+	}
+	// Encode each slug segment separately so the `provider/model` literal
+	// slash survives (see comment above — encodeURIComponent on the whole
+	// id makes OpenRouter return 404).
+	const id = model
+		.split("/")
+		.map((segment) => encodeURIComponent(segment))
+		.join("/")
+	const url = `${this.baseUrl}/api/v1/models/${id}/endpoints`
 
-		let response: Response
+	// This call happens at most ONCE per session (loop.ts's
+	// contextWindowResolved flag never re-attempts), so a single transient
+	// hiccup would silently poison the whole session with the conservative
+	// 128k default — condensation then fires ~8x too often. Retry transport
+	// failures and 5xx/429 once with a short backoff; a deterministic 4xx
+	// (e.g. 404 from a wrong slug) is not retried.
+	let response: Response | undefined
+	for (let attempt = 0; attempt < 2; attempt++) {
 		try {
-			response = await fetch(url, {
+			const res = await fetch(url, {
 				method: "GET",
 				headers: this.authHeaders(),
 				signal,
 			})
-		} catch {
-			return undefined
-		}
-		if (!response.ok) {
-			return undefined
-		}
-
-		let data: { data?: Array<{ context_length?: unknown }> } | undefined
-		try {
-			data = JSON.parse(await response.text()) as { data?: Array<{ context_length?: unknown }> }
-		} catch {
-			return undefined
-		}
-
-		let best: number | undefined
-		for (const ep of data?.data ?? []) {
-			const n = typeof ep?.context_length === "number" ? ep.context_length : undefined
-			if (typeof n === "number" && Number.isFinite(n) && n > 0) {
-				best = best === undefined ? n : Math.max(best, n)
+			if (res.ok) {
+				response = res
+				break
 			}
+			if (!(res.status === 429 || res.status >= 500)) {
+				return undefined
+			}
+		} catch {
+			// transport failure — retried below
 		}
-		return best
+		if (attempt === 0) {
+			await new Promise((r) => setTimeout(r, 250))
+		}
+	}
+	if (!response) {
+		return undefined
+	}
+
+	// Live shape: { data: { id, endpoints: [{ context_length, ... }] } }.
+	// Legacy/proxy shape: { data: [{ context_length }] }.
+	let data:
+		| { data?: Array<{ context_length?: unknown }> | { endpoints?: Array<{ context_length?: unknown }> } }
+		| undefined
+	try {
+		data = JSON.parse(await response.text()) as typeof data
+	} catch {
+		return undefined
+	}
+
+	const endpoints = Array.isArray(data?.data)
+		? data.data
+		: Array.isArray(data?.data?.endpoints)
+			? data.data.endpoints
+			: []
+	let best: number | undefined
+	for (const ep of endpoints) {
+		const n = typeof ep?.context_length === "number" ? ep.context_length : undefined
+		if (typeof n === "number" && Number.isFinite(n) && n > 0) {
+			best = best === undefined ? n : Math.max(best, n)
+		}
+	}
+	return best
 	}
 
 	async createChatCompletion(request: LlmRequest): Promise<LlmResponse> {
@@ -666,3 +708,4 @@ function mapUsage(raw: RawUsage | undefined): LlmResponse["usage"] {
 function excerpt(body: string): string {
 	return body.length > 500 ? `${body.slice(0, 500)}…` : body
 }
+

@@ -51,9 +51,9 @@ assume it wasn't reverted):
 | 32,768 | 9.5 GB | **evicts one model** (confirmed live — Ollama swaps rather than exceed VRAM) |
 | 131,072 | 12 GB | n/a — exploration model alone at this size |
 
-**Resolved via temporal separation, not a context cap.** The obvious
+**Resolved via temporal separation, not a context cap.** The original
 approach — let the exploration phase call `codebase_search` too — would
-require `qwen3-embedding:8b` resident in VRAM AT THE SAME TIME as
+have required `qwen3-embedding:8b` resident in VRAM AT THE SAME TIME as
 `qwen3.5:9b` is generating, and that coexistence only holds through ~28K
 context (9.3GB + 6.2GB = 15.5GB; confirmed live that 32K already evicts one
 model to load the other, costing a real ~5-second reload per switch). The
@@ -66,15 +66,17 @@ took 3.85s on GPU vs. **116 seconds on CPU** — a ~30x slowdown that would
 turn a ~1-minute real index build for this repo's 3,756 chunks into multiple
 days).
 
-**The actual fix: `codebase_search` is NOT in the local exploration
-phase's own tool set** (see "What to build" below — `read_file` and
-`list_files` only). The two-phase design is already strictly sequential —
-the exploration phase completes and hands off BEFORE the cloud model's turn
-(and anything it triggers, including `codebase_search`) ever runs. The two
-models are never actually needed in VRAM at the same instant, so there is
-no real coexistence constraint to design around. This means the
-exploration phase can use its full SOLO-model context ceiling instead of
-the coexistence-limited one:
+**Superseded 2026-08-04: the deployed embedder is CLOUD-side, so the VRAM
+coexistence concern is moot.** The measurements above assumed a LOCAL
+Ollama embedding model (`qwen3-embedding:8b`) co-resident with the
+exploration model. The actually-shipped codebase-search embedder is
+OpenRouter-hosted (`qwen/qwen3-embedding-4b` via the `openrouter` backend —
+see `src/codesearch/cli.ts`); its embedding calls never touch local VRAM,
+so `codebase_search` is now SAFE in the local exploration phase and was
+added to its tool set. The strict sequential two-phase design is retained
+for its original reason (a cheap local recon before the expensive cloud
+model), and the exploration phase still uses its full SOLO-model context
+ceiling (no embedding model competing for VRAM under ANY design):
 
 | context tokens | qwen3.5:9b alone (flash attn + q8_0 KV, confirmed live) |
 |---|---|
@@ -109,14 +111,13 @@ gathering, nothing else.
 by reviewer/QA), but it includes `execute_command` — that's too permissive
 for this use case (arbitrary command execution has real side-effect
 potential even without file writes). Build a NEW, stricter executor variant
-(or a config option on the existing one) exposing only `read_file` and
-`list_files` — nothing else, not even `execute_command`, and **deliberately
-NOT `codebase_search`** (see the VRAM-coexistence section above for exactly
-why: `codebase_search` needs the embedding model resident at the same time
-as the exploration model is generating, which is the one combination this
-design avoids entirely by keeping the two phases strictly sequential — the
-cloud model gets full `codebase_search` access in its own turn, unaffected).
-Every other tool stubbed, matching the existing pattern.
+(or a config option on the existing one) exposing `read_file`, `list_files`
+and `codebase_search` — nothing else, not even `execute_command`. The
+original plan deliberately excluded `codebase_search` (local-embedding VRAM
+coexistence), but that constraint was lifted 2026-08-04 because the shipped
+embedder is cloud-side (see the analysis section above); the cloud model
+still gets the full tool set in its own turn, unaffected. Every other tool
+stubbed, matching the existing pattern.
 
 ### 2. A local exploration session
 

@@ -34,6 +34,7 @@ import {
 } from "./embedder.js"
 import { buildIndex, indexFilePath } from "./index.js"
 import { estimateCost, priceFor } from "../budget/cost.js"
+import { checkAndNoteHeadlesscodeDir } from "../index-util.js"
 import { DEFAULT_OLLAMA_EMBEDDING_MODEL, OLLAMA_EMBEDDING_MODEL_ENV } from "./ollama-embedder.js"
 
 const INDEX_USAGE = `headlesscode index — build/refresh the codebase semantic-search index
@@ -135,6 +136,10 @@ export async function indexMain(argv: string[]): Promise<number> {
 
 	const workspaceRoot = path.resolve(options.workspace)
 	const backend = resolveEmbeddingBackend(process.env, options.embeddingBackend)
+
+	// P1.7: clarify that per-workspace state (this index) lives in the
+	// workspace's own `.headlesscode/`, not the global `~/.headlesscode/`.
+	checkAndNoteHeadlesscodeDir(workspaceRoot)
 
 	const embedder = createEmbedder(backend, { model: options.model }, process.env)
 	const modelForEnv = options.model?.trim() || process.env[OPENROUTER_EMBEDDING_MODEL_ENV]?.trim()

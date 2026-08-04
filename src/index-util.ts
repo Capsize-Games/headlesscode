@@ -15,6 +15,7 @@
  * crashed/partial build — treat it as absent so the spawner rebuilds it).
  */
 
+import { existsSync } from "node:fs"
 import * as fsp from "node:fs/promises"
 import * as path from "node:path"
 
@@ -34,4 +35,25 @@ export async function hasCodebaseIndex(workspaceRoot: string): Promise<boolean> 
 	} catch {
 		return false
 	}
+}
+
+/**
+ * Global-vs-workspace `.headlesscode/` clarity (speed workstream, P1.7): when
+ * a workspace has no `.headlesscode/` directory yet, print a one-line note
+ * that per-workspace state (codebase-search index, mode-models.json) will be
+ * created THERE — distinct from `~/.headlesscode/`, which only holds
+ * checkpoints. No-op once the directory exists. Called from `headlesscode
+ * index` and `headlesscode orchestrate` at the earliest point the workspace
+ * root is known.
+ */
+export function checkAndNoteHeadlesscodeDir(
+	workspaceRoot: string,
+	write: (line: string) => void = (line) => process.stdout.write(line),
+): void {
+	if (existsSync(path.join(path.resolve(workspaceRoot), ".headlesscode"))) {
+		return
+	}
+	write(
+		"This workspace has no `.headlesscode/` directory — per-workspace state (index, mode-models.json) will be created here. This is distinct from `~/.headlesscode/` which only holds checkpoints.\n",
+	)
 }

@@ -1800,25 +1800,27 @@ export function createQaHeadlessExecutor(workspaceRoot: string, options: ToolExe
  * Deliberately narrower than createReadOnlyHeadlessExecutor (reviewer/QA),
  * which includes execute_command: arbitrary command execution has real
  * side-effect potential even without file writes, and this phase must be
- * pure information-gathering. codebase_search is also absent ON PURPOSE: it
- * needs the embedding model resident in VRAM at the same time the local
- * exploration model is generating, the one coexistence the two-phase design
- * avoids entirely (the cloud model gets full codebase_search access in its
- * own turn, after the local phase is done).
+ * pure information-gathering. codebase_search IS included: its embedding
+ * call is cloud-side (OpenRouter), so it touches no local VRAM — the
+ * original exclusion assumed a local embedding model co-resident with the
+ * exploration model, which the deployed cloud embedder makes moot (the
+ * cloud model still gets full codebase_search access in its own turn).
  */
 export function createLocalExploreExecutor(workspaceRoot: string, options: ToolExecutorOptions = {}): ToolExecutor {
 	const executor = new ToolExecutor(workspaceRoot, options)
 
 	executor.registerReadFile()
 	executor.register("list_files", listFilesHandler)
+	executor.register("codebase_search", codebaseSearchHandler)
 	executor.register("attempt_completion", attemptCompletionHandler)
 
 	for (const name of VENDORED_TOOL_NAMES) {
 		if (executor.has(name)) {
 			continue
 		}
-		executor.register(name, stubHandler(name, ["read_file", "list_files", "attempt_completion"]))
+		executor.register(name, stubHandler(name, ["read_file", "list_files", "codebase_search", "attempt_completion"]))
 	}
 
 	return executor
 }
+

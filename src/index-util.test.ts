@@ -19,7 +19,7 @@ import * as fsp from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 
-import { hasCodebaseIndex, indexFilePathFor } from "./index-util.js"
+import { checkAndNoteHeadlesscodeDir, hasCodebaseIndex, indexFilePathFor } from "./index-util.js"
 import { INDEX_RELATIVE_PATH } from "./codesearch/types.js"
 
 async function mkTmp(prefix: string): Promise<string> {
@@ -67,10 +67,39 @@ async function testRealIndexIsDetected(): Promise<void> {
 	}
 }
 
+const NOTE = "This workspace has no `.headlesscode/` directory"
+
+async function testHeadlesscodeDirNotePrintedWhenAbsent(): Promise<void> {
+	const ws = await mkTmp("hc-idxutil-note-")
+	try {
+		const lines: string[] = []
+		checkAndNoteHeadlesscodeDir(ws, (line) => lines.push(line))
+		assert.equal(lines.length, 1, "exactly one note line when `.headlesscode/` is absent")
+		assert.ok(lines[0].includes(NOTE), "note explains per-workspace state vs ~/.headlesscode/")
+		assert.ok(lines[0].includes("~/.headlesscode/"), "note distinguishes the global checkpoints dir")
+	} finally {
+		await fsp.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testHeadlesscodeDirNoteSilentWhenPresent(): Promise<void> {
+	const ws = await mkTmp("hc-idxutil-note2-")
+	try {
+		await fsp.mkdir(path.join(ws, ".headlesscode"), { recursive: true })
+		const lines: string[] = []
+		checkAndNoteHeadlesscodeDir(ws, (line) => lines.push(line))
+		assert.equal(lines.length, 0, "no note once `.headlesscode/` exists")
+	} finally {
+		await fsp.rm(ws, { recursive: true, force: true })
+	}
+}
+
 const tests: Array<[string, () => Promise<void>]> = [
 	["absent index → not indexed", testAbsentIndexIsDetected],
 	["empty index file → treated as absent (partial build)", testEmptyIndexIsTreatedAsAbsent],
 	["real index → usable, at the documented path", testRealIndexIsDetected],
+	["P1.7: `.headlesscode/` note printed when the dir is absent", testHeadlesscodeDirNotePrintedWhenAbsent],
+	["P1.7: `.headlesscode/` note silent when the dir exists", testHeadlesscodeDirNoteSilentWhenPresent],
 ]
 
 async function main(): Promise<void> {

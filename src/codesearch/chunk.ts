@@ -39,6 +39,8 @@
 import * as fs from "node:fs"
 import * as path from "node:path"
 
+import { MAX_CHUNK_CHARS } from "./embedder.js"
+
 /** A chunk of a file with its line citation. */
 export interface Chunk {
 	/** Workspace-relative POSIX path. */
@@ -232,12 +234,61 @@ function chunkFallback(lines: string[], file: string): Chunk[] {
 }
 
 /**
+ * Split one oversized chunk into pieces of at most MAX_CHUNK_CHARS (the cap
+ * lives in embedder.ts — the OpenRouter embeddings endpoint rejects any single
+ * input over the model's limit, seen live as an HTTP 422 on an 8.8M-char
+ * minified/data chunk and an HTTP 400 at ~100k chars on qwen/qwen3-embedding-4b
+ * whose context is 40960 tokens). Line-based windowing alone cannot guarantee
+ * the cap (a file can be a single giant line), so every chunk is split down to
+ * at most MAX_CHUNK_CHARS, preferring line boundaries and hard-slicing
+ * mid-line only for unbroken giant lines.
+ */
+function splitOversizedChunk(chunk: Chunk): Chunk[] {
+	if (chunk.content.length <= MAX_CHUNK_CHARS) {
+		return [chunk]
+	}
+	const out: Chunk[] = []
+	let cursor = 0
+	let startLine = chunk.startLine
+	while (cursor < chunk.content.length) {
+		let end = Math.min(cursor + MAX_CHUNK_CHARS, chunk.content.length)
+		// Back off to the previous newline (consuming it) unless this is the
+		// final slice or the window is one unbroken line.
+		if (end < chunk.content.length) {
+			const nl = chunk.content.lastIndexOf("\n", end - 1)
+			if (nl > cursor) {
+				end = nl + 1
+			}
+		}
+		const piece = chunk.content.slice(cursor, end)
+		const newlineCount = (piece.match(/\n/g) ?? []).length
+		// Line bookkeeping: a trailing \n terminates the final line of the
+		// piece, so it covers newlineCount lines; otherwise it covers
+		// newlineCount + 1. A piece with no \n at all is a mid-line hard slice
+		// of one giant line, so it cites the same line and the next slice
+		// starts on the same line number.
+		const coversLines = newlineCount + (piece.endsWith("\n") ? 0 : 1)
+		out.push({
+			file: chunk.file,
+			startLine,
+			endLine: startLine + coversLines - 1,
+			content: piece,
+		})
+		if (newlineCount > 0) {
+			startLine += coversLines
+		}
+		cursor = end
+	}
+	return out
+}
+
+/**
  * Split a source file into line-cited chunks.
  *
  * @param absPath  absolute path of the file to chunk
  * @param relPath  workspace-relative POSIX path (used for citations)
  */
-export function chunkFile(absPath: string, relPath: string): Chunk[] {
+function chunkFileUncapped(absPath: string, relPath: string): Chunk[] {
 	let content: string
 	try {
 		content = fs.readFileSync(absPath, "utf-8")
@@ -274,4 +325,15 @@ export function chunkFile(absPath: string, relPath: string): Chunk[] {
 	}
 
 	return chunkFallback(lines, relPath)
+}
+
+/**
+	* Split a source file into line-cited chunks, each capped at MAX_CHUNK_CHARS
+	* characters so no chunk can exceed the embedding endpoint's input limit.
+	*
+	* @param absPath  absolute path of the file to chunk
+	* @param relPath  workspace-relative POSIX path (used for citations)
+	*/
+export function chunkFile(absPath: string, relPath: string): Chunk[] {
+	return chunkFileUncapped(absPath, relPath).flatMap(splitOversizedChunk)
 }

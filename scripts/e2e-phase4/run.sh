@@ -220,6 +220,7 @@ ORCH1_OUT="$(mktemp /tmp/headlesscode-e2e4-orch1-XXXXXX.out)"
 		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 		OPENROUTER_BASE_URL="http://127.0.0.1:$AUTO_PORT" \
 		HEADLESSCODE_ROOT="$ROOT" \
+		ALLOW_UNINDEXED=1 \
 		npx tsx src/cli.ts orchestrate --repo "$FIXTURE" --issues-json "$ISSUES_JSON" \
 			--qa --qa-mode qa-agent --poll-interval-ms 200
 ) >"$ORCH1_OUT" 2>&1
@@ -462,6 +463,7 @@ ORCH2_OUT="$(mktemp /tmp/headlesscode-e2e4-orch2-XXXXXX.out)"
 		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 		OPENROUTER_BASE_URL="http://127.0.0.1:$AUTO_PORT" \
 		HEADLESSCODE_ROOT="$ROOT" \
+		ALLOW_UNINDEXED=1 \
 		DEPLOY_APPROVAL_TOKEN="correct-token" \
 		npx tsx src/cli.ts orchestrate --repo "$FIXTURE" --issues-json "$ISSUES_JSON" \
 			--qa --qa-mode qa-agent --deploy --deploy-args "--local --fastsearch-only" --poll-interval-ms 200
@@ -486,6 +488,7 @@ ORCH3_OUT="$(mktemp /tmp/headlesscode-e2e4-orch3-XXXXXX.out)"
 		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 		OPENROUTER_BASE_URL="http://127.0.0.1:$AUTO_PORT" \
 		HEADLESSCODE_ROOT="$ROOT" \
+		ALLOW_UNINDEXED=1 \
 		DEPLOY_APPROVAL_TOKEN="wrong-token" \
 		npx tsx src/cli.ts orchestrate --repo "$FIXTURE" --issues-json "$ISSUES_JSON" \
 			--qa --qa-mode qa-agent --deploy --poll-interval-ms 200
@@ -538,6 +541,7 @@ REWORK_OUT="$(mktemp /tmp/headlesscode-e2e4-rework-XXXXXX.out)"
 		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 		OPENROUTER_BASE_URL="http://127.0.0.1:$REWORK_PORT" \
 		HEADLESSCODE_ROOT="$ROOT" \
+		ALLOW_UNINDEXED=1 \
 		npx tsx src/cli.ts orchestrate --repo "$FIXTURE2" --issues-json "$REWORK_ISSUES" \
 			--poll-interval-ms 200
 ) >"$REWORK_OUT" 2>&1

@@ -38,6 +38,7 @@ import {
 import { runReview, type ReviewResult } from "./reviewer.js"
 import { runQa } from "../qa/qa.js"
 import { groupWorktreePath, isIterationExhaustion, watchGroups } from "./watch.js"
+import { checkAndNoteHeadlesscodeDir } from "../index-util.js"
 import {
 	buildStatusSummary,
 	formatStatusText,
@@ -951,6 +952,24 @@ export function buildSpawnEnv(options: BuildSpawnEnvOptions): { env: NodeJS.Proc
 		// var; undefined leaves whatever the caller's env already had in place
 		// (or the harness's own default, 50, if neither is set).
 		...(options.maxIterations !== undefined ? { HEADLESSCODE_MAX_ITERATIONS: String(options.maxIterations) } : {}),
+		// Operator knobs (spawner guardrail + local exploration) forwarded from
+		// the AMBIENT env, not options.env — the caller's env is usually
+		// process.env so the spread above already carries them, but a filtered
+		// env must not silently drop an operator decision. ALLOW_UNINDEXED /
+		// HEADLESSCODE_AUTO_INDEX gate the spawner's no-index guardrail;
+		// HEADLESSCODE_LOCAL_EXPLORE* enable the pre-cloud local-explore phase.
+		...(process.env.ALLOW_UNINDEXED ? { ALLOW_UNINDEXED: process.env.ALLOW_UNINDEXED } : {}),
+		...(process.env.HEADLESSCODE_AUTO_INDEX ? { HEADLESSCODE_AUTO_INDEX: process.env.HEADLESSCODE_AUTO_INDEX } : {}),
+		...(process.env.HEADLESSCODE_LOCAL_EXPLORE ? { HEADLESSCODE_LOCAL_EXPLORE: process.env.HEADLESSCODE_LOCAL_EXPLORE } : {}),
+		...(process.env.HEADLESSCODE_LOCAL_EXPLORE_MODEL
+			? { HEADLESSCODE_LOCAL_EXPLORE_MODEL: process.env.HEADLESSCODE_LOCAL_EXPLORE_MODEL }
+			: {}),
+		...(process.env.HEADLESSCODE_LOCAL_EXPLORE_MAX_ITERATIONS
+			? { HEADLESSCODE_LOCAL_EXPLORE_MAX_ITERATIONS: process.env.HEADLESSCODE_LOCAL_EXPLORE_MAX_ITERATIONS }
+			: {}),
+		...(process.env.HEADLESSCODE_LOCAL_EXPLORE_CONTEXT_TOKENS
+			? { HEADLESSCODE_LOCAL_EXPLORE_CONTEXT_TOKENS: process.env.HEADLESSCODE_LOCAL_EXPLORE_CONTEXT_TOKENS }
+			: {}),
 	}
 	return { env, workerModel }
 }
@@ -1334,6 +1353,10 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		process.stderr.write(`headlesscode orchestrate: not a git repo: ${repo}\n`)
 		return 2
 	}
+
+	// P1.7: clarify that per-workspace state (index, mode-models.json) lives
+	// in the workspace's own `.headlesscode/`, not the global `~/.headlesscode/`.
+	checkAndNoteHeadlesscodeDir(repo)
 
 	let issues: SplitIssue[]
 	try {

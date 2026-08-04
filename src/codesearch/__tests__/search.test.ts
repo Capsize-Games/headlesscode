@@ -109,6 +109,33 @@ async function testPathPrefixFiltersResults(): Promise<void> {
 	}
 }
 
+async function testSearchPicksUpRebuiltIndex(): Promise<void> {
+	const ws = await mkTmpWorkspace({
+		"src/a.ts": "function alpha() { return 1 }\n",
+	})
+	try {
+		const embedder = new FakeEmbedder()
+		await buildIndex(embedder, ws)
+
+		// First search populates the session-scoped parse cache.
+		const first = searchIndex(ws, fakeVector("alpha"), undefined, 10)
+		assert.ok(first.some((r) => r.codeChunk.includes("alpha")), "first search sees the alpha chunk")
+
+		// Rebuild the SAME workspace with completely different content.
+		await fs.writeFile(path.join(ws, "src", "a.ts"), "function beta() { return 2 }\n")
+		await buildIndex(embedder, ws)
+
+		// The cache must be invalidated by the rebuild (mtime+size change):
+		// a "beta" query must hit and the old "alpha" chunk must be gone.
+		const second = searchIndex(ws, fakeVector("beta"), undefined, 10)
+		assert.ok(second.some((r) => r.codeChunk.includes("beta")), "rebuilt index is visible to later searches")
+		const alpha = searchIndex(ws, fakeVector("alpha"), undefined, 10)
+		assert.ok(!alpha.some((r) => r.codeChunk.includes("alpha")), "stale cached entries must not survive a rebuild")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 async function testFormatMatchesToolContract(): Promise<void> {
 	const results = [
 		{
@@ -134,6 +161,7 @@ async function testFormatMatchesToolContract(): Promise<void> {
 const tests: Array<[string, () => Promise<void>]> = [
 	["top-K ordering follows cosine similarity on a fixture index", testTopKOrderingMatchesCosineSimilarity],
 	["path prefix filters results to a subdirectory", testPathPrefixFiltersResults],
+	["a rebuilt index invalidates the session-scoped parse cache", testSearchPicksUpRebuiltIndex],
 	["formatted output matches the vendored tool contract", testFormatMatchesToolContract],
 ]
 

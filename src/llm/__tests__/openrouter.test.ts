@@ -48,14 +48,20 @@ async function testFetchModelContextWindowParsesEndpoints(): Promise<void> {
 	const client = new OpenRouterClient({ apiKey: "k", baseUrl: "http://mock" })
 	const originalFetch = globalThis.fetch
 	globalThis.fetch = (async (url: string | URL | Request) => {
-		assert.match(String(url), /\/api\/v1\/models\/deepseek%2Fdeepseek-v4-flash\/endpoints$/)
+		// The model id slug must keep its LITERAL `provider/model` slash —
+		// percent-encoding the whole id (deepseek%2Fdeepseek-v4-flash) makes
+		// OpenRouter 404 (regression fixed 2026-08-04).
+		assert.match(String(url), /\/api\/v1\/models\/deepseek\/deepseek-v4-flash\/endpoints$/)
 		return new Response(
 			JSON.stringify({
-				data: [
-					{ context_length: 131072, id: "host-a" },
-					{ context_length: 1048576, id: "official-deepseek" },
-					{ context_length: 0, id: "broken" },
-				],
+				data: {
+					id: "deepseek/deepseek-v4-flash",
+					endpoints: [
+						{ context_length: 131072, id: "host-a" },
+						{ context_length: 1048576, id: "official-deepseek" },
+						{ context_length: 0, id: "broken" },
+					],
+				},
 			}),
 			{ status: 200, headers: { "Content-Type": "application/json" } },
 		)
@@ -63,6 +69,29 @@ async function testFetchModelContextWindowParsesEndpoints(): Promise<void> {
 	try {
 		const windowTokens = await client.fetchModelContextWindow("deepseek/deepseek-v4-flash")
 		assert.equal(windowTokens, 1048576, "the largest non-zero context_length across endpoints wins")
+	} finally {
+		globalThis.fetch = originalFetch
+	}
+}
+
+async function testFetchModelContextWindowAcceptsLegacyArrayShape(): Promise<void> {
+	// Defensive: some proxies return the older `{"data":[...]}` array shape.
+	const { OpenRouterClient } = await import("../openrouter.js")
+	const client = new OpenRouterClient({ apiKey: "k", baseUrl: "http://mock" })
+	const originalFetch = globalThis.fetch
+	globalThis.fetch = (async () =>
+		new Response(
+			JSON.stringify({
+				data: [
+					{ context_length: 131072, id: "host-a" },
+					{ context_length: 1048576, id: "official-deepseek" },
+				],
+			}),
+			{ status: 200, headers: { "Content-Type": "application/json" } },
+		)) as typeof fetch
+	try {
+		const windowTokens = await client.fetchModelContextWindow("deepseek/deepseek-v4-flash")
+		assert.equal(windowTokens, 1048576, "legacy array shape still resolves the largest non-zero window")
 	} finally {
 		globalThis.fetch = originalFetch
 	}
@@ -82,6 +111,67 @@ async function testFetchModelContextWindowReturnsUndefinedOnFailure(): Promise<v
 	// No API key -> undefined without even fetching.
 	const noKey = new OpenRouterClient({ baseUrl: "http://mock" })
 	assert.equal(await noKey.fetchModelContextWindow("deepseek/deepseek-chat"), undefined)
+}
+
+async function testFetchModelContextWindowRetriesTransientFailure(): Promise<void> {
+	// This lookup happens at most once per session and the loop never
+	// re-attempts, so a transient hiccup must not silently poison the session
+	// with the 128k default. A transport failure followed by a 200 must resolve
+	// the live window (and a 503 similarly).
+	const { OpenRouterClient } = await import("../openrouter.js")
+	const originalFetch = globalThis.fetch
+	let calls = 0
+	try {
+		const client = new OpenRouterClient({ apiKey: "k", baseUrl: "http://mock" })
+		globalThis.fetch = (async () => {
+			calls++
+			if (calls === 1) {
+				throw new TypeError("fetch failed (transient)")
+			}
+			return new Response(
+				JSON.stringify({
+					data: {
+						id: "deepseek/deepseek-v4-flash",
+						endpoints: [{ context_length: 1048576, id: "official-deepseek" }],
+					},
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			)
+		}) as typeof fetch
+		assert.equal(await client.fetchModelContextWindow("deepseek/deepseek-v4-flash"), 1048576)
+		assert.equal(calls, 2, "transport failure retried exactly once")
+
+		// 503 -> retry once -> 200.
+		calls = 0
+		globalThis.fetch = (async () => {
+			calls++
+			if (calls === 1) {
+				return new Response("overloaded", { status: 503 })
+			}
+			return new Response(
+				JSON.stringify({
+					data: {
+						id: "deepseek/deepseek-v4-flash",
+						endpoints: [{ context_length: 131072, id: "host-a" }],
+					},
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			)
+		}) as typeof fetch
+		assert.equal(await client.fetchModelContextWindow("deepseek/deepseek-v4-flash"), 131072)
+		assert.equal(calls, 2, "5xx retried exactly once")
+
+		// Deterministic 404 is NOT retried — exactly one call.
+		calls = 0
+		globalThis.fetch = (async () => {
+			calls++
+			return new Response("not found", { status: 404 })
+		}) as typeof fetch
+		assert.equal(await client.fetchModelContextWindow("nope/model"), undefined)
+		assert.equal(calls, 1, "404 is deterministic and must not be retried")
+	} finally {
+		globalThis.fetch = originalFetch
+	}
 }
 
 // ─── Reasoning capture (streaming-and-reasoning, part 1) ────────────────────
@@ -339,6 +429,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["an empty streamed response fails loudly, not silently", testStreamedEmptyResponseFails],
 	["a mid-stream stall aborts via the caller's AbortSignal", testStreamedStallAbortsOnSignal],
 	["fetchModelContextWindow: parses endpoints, largest non-zero wins", testFetchModelContextWindowParsesEndpoints],
+	["fetchModelContextWindow: accepts the legacy array shape", testFetchModelContextWindowAcceptsLegacyArrayShape],
+	["fetchModelContextWindow: retries transient failures, not 404s", testFetchModelContextWindowRetriesTransientFailure],
 	["fetchModelContextWindow: undefined on failure / missing key", testFetchModelContextWindowReturnsUndefinedOnFailure],
 ]
 

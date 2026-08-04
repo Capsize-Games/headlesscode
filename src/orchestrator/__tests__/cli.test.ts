@@ -384,11 +384,18 @@ async function testSpawnEnvNoConfigNoEnvLeavesModelUnset(): Promise<void> {
 // ─── --max-iterations / --max-continuations parsing ─────────────────────────
 
 async function testParseOrchestrateArgsMaxIterations(): Promise<void> {
-	// Default with neither a flag nor the env var: undefined -> the harness's
-	// own default (50) applies untouched (the issue only makes it overridable).
-	const def = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1"])
-	assert.equal(def.error, undefined)
-	assert.equal(def.options.maxIterations, undefined, "no flag/env -> leave the harness default untouched")
+	// Ambient-proof: HEADLESSCODE_MAX_ITERATIONS is a real orchestration knob
+	// an operator may legitimately have exported — the "neither flag nor env"
+	// case must not depend on the ambient env being clean.
+	const savedMaxIterations = process.env.HEADLESSCODE_MAX_ITERATIONS
+	delete process.env.HEADLESSCODE_MAX_ITERATIONS
+	try {
+		// Default with neither a flag nor the env var: undefined -> the
+		// harness's own default (50) applies untouched (the issue only makes
+		// it overridable).
+		const def = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1"])
+		assert.equal(def.error, undefined)
+		assert.equal(def.options.maxIterations, undefined, "no flag/env -> leave the harness default untouched")
 
 	// Env fallback when no flag is given.
 	process.env.HEADLESSCODE_MAX_ITERATIONS = "75"
@@ -415,6 +422,13 @@ async function testParseOrchestrateArgsMaxIterations(): Promise<void> {
 
 	const zero = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1", "--max-iterations", "0"])
 	assert.ok(zero.error && zero.error.includes("positive integer"), "0 is rejected")
+	} finally {
+		if (savedMaxIterations === undefined) {
+			delete process.env.HEADLESSCODE_MAX_ITERATIONS
+		} else {
+			process.env.HEADLESSCODE_MAX_ITERATIONS = savedMaxIterations
+		}
+	}
 }
 
 async function testParseOrchestrateArgsMaxContinuations(): Promise<void> {

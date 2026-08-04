@@ -15,8 +15,9 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 
-import { buildIndex, chunkHash, indexFilePath, loadIndex } from "../index.js"
+import { buildIndex, chunkHash, indexFilePath, loadIndex, readJsonlEntries, writeIndexEntries } from "../index.js"
 import type { Embedder } from "../embedder.js"
+import type { IndexEntry } from "../types.js"
 import { walkSourceFiles } from "../files.js"
 
 /** Deterministic fake embedder with an embed-call counter. */
@@ -184,12 +185,107 @@ async function testWalkAndIndexRoundTrip(): Promise<void> {
 	}
 }
 
+/** Full-precision floats (17 sig digits — what JSON.stringify emits by default). */
+const FULL_PRECISION_FLOAT = 0.012345678901234567
+
+/**
+ * The streaming write must never materialize the whole index as one string,
+ * and the streaming read must reconstruct lines that straddle block
+ * boundaries. A 64-byte read block forces hundreds of boundaries across a
+ * ~600KB index whose lines are ~2.5KB each — every line straddles one.
+ */
+async function testStreamingWriteReadRoundTripAcrossBlockBoundaries(): Promise<void> {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hc-idxw-"))
+	try {
+		const file = path.join(dir, "index.jsonl")
+		// 600 entries × 256-dim → multiple WRITE_BATCH_SIZE (512) batches too.
+		const entries: IndexEntry[] = []
+		for (let i = 0; i < 600; i++) {
+			entries.push({
+				file: `src/mod${i % 10}.ts`,
+				startLine: i + 1,
+				endLine: i + 2,
+				embedding: Array.from({ length: 256 }, (_, j) =>
+					j % 2 === 0 ? -FULL_PRECISION_FLOAT : FULL_PRECISION_FLOAT + j * 1e-9,
+				),
+				hash: "a".repeat(64),
+				backend: "openrouter",
+			})
+		}
+		await writeIndexEntries(file, entries)
+
+		const loaded = readJsonlEntries(file, 64)
+		assert.equal(loaded.length, entries.length, "every written entry must reload across block boundaries")
+		// Rounding is applied at write time: no stored float has > 6 decimals.
+		for (const e of loaded) {
+			for (const v of e.embedding) {
+				const s = String(v)
+				const decimals = s.includes(".") ? s.length - s.indexOf(".") - 1 : 0
+				assert.ok(decimals <= 6, `float not rounded on disk: ${s}`)
+			}
+		}
+		// Field fidelity across the write/read round trip.
+		const first = loaded[0]
+		assert.equal(first.file, "src/mod0.ts")
+		assert.equal(first.startLine, 1)
+		assert.equal(first.endLine, 2)
+		assert.equal(first.hash, "a".repeat(64))
+		assert.equal(first.backend, "openrouter")
+	} finally {
+		await fs.rm(dir, { recursive: true, force: true })
+	}
+}
+
+/**
+ * A real build (fake embedder returning full-precision floats) must persist
+ * rounded embeddings — the mechanism that keeps a 2560-dim index ~60%
+ * smaller than full precision — while loadIndex returns the rounded values.
+ */
+async function testBuildPersistsRoundedEmbeddings(): Promise<void> {
+	const ws = await mkTmpWorkspace({
+		"src/a.ts": "export function alpha() {\n  return 1\n}\n",
+	})
+	try {
+		const embedder: Embedder = {
+			model: "fake/float",
+			async embedBatch(texts: string[]) {
+				return {
+					embeddings: texts.map((_, i) =>
+						Array.from({ length: 8 }, (_, j) => FULL_PRECISION_FLOAT + i + j * 1e-9),
+					),
+					promptTokens: texts.length,
+					totalTokens: texts.length,
+				}
+			},
+		}
+		await buildIndex(embedder, ws)
+
+		const entries = loadIndex(ws)
+		assert.ok(entries.length >= 1)
+		for (const e of entries) {
+			for (const v of e.embedding) {
+				const s = String(v)
+				const decimals = s.includes(".") ? s.length - s.indexOf(".") - 1 : 0
+				assert.ok(decimals <= 6, `stored float not rounded: ${s}`)
+			}
+		}
+
+		const raw = await fs.readFile(path.join(ws, ".headlesscode", "codesearch", "index.jsonl"), "utf-8")
+		assert.ok(raw.includes("0.012346"), "rounded value (0.0123456789… → 0.012346) on disk")
+		assert.ok(!raw.includes("0.012345678901234567"), "full-precision float must NOT be stored")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 const tests: Array<[string, () => Promise<void>]> = [
 	["build writes a valid index.jsonl with sane entries", testBuildWritesIndex],
 	["rebuild with no changes re-embeds NOTHING (call-counter proof)", testRebuildWithNoChangesEmbedsNothing],
 	["a changed chunk is re-embedded, an unchanged one is not", testChangedChunkGetsReembeddedUnchangedDoesNot],
 	["chunks for deleted files are dropped on rebuild", testDeletedFileChunksRemoved],
 	["file walker + index build round-trip", testWalkAndIndexRoundTrip],
+	["streaming write/read round-trips lines straddling block boundaries", testStreamingWriteReadRoundTripAcrossBlockBoundaries],
+	["build persists rounded embeddings (not full precision)", testBuildPersistsRoundedEmbeddings],
 ]
 
 async function main(): Promise<void> {

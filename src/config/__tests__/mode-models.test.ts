@@ -115,6 +115,31 @@ async function testExtraKeyBeatsDefault(): Promise<void> {
 	}
 }
 
+async function testExtraKeyBeatsModeEntry(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		// The canonical P0.2 file sets BOTH the session model for `code` AND
+		// a cheaper `_condensation` model. The whole point of `_condensation`
+		// is to override the session model on the condensation call, so it
+		// must win even when the mode entry is present — otherwise the key
+		// is silently dead (condensation keeps running on the full-price
+		// session model).
+		await writeConfig(
+			repo,
+			JSON.stringify({ code: "mode-specific", _default: "default-model", _condensation: "cheap-model" }),
+		)
+		const resolved = resolveModelForMode({
+			workspaceRoot: repo,
+			mode: "code",
+			extraKeys: ["_condensation"],
+			env: { OPENROUTER_MODEL: "from-env" },
+		})
+		assert.equal(resolved, "cheap-model", "the extra key (_condensation) must beat the mode's own entry")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 async function testExtraKeyFallsThroughToDefaultWhenAbsent(): Promise<void> {
 	const repo = await tmpRepo()
 	try {
