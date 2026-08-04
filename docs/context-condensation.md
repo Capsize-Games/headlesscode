@@ -62,9 +62,11 @@ A cheaper model can be assigned two ways:
 
 1. `--condense-model <id>` flag.
 2. The `_condensation` key in
-   `<workspaceRoot>/.headlesscode/mode-models.json` (consulted after `mode`,
-   before `_default` — see [`src/config/mode-models.ts`](../src/config/mode-models.ts)'s
-   `extraKeys`).
+   `<workspaceRoot>/.headlesscode/mode-models.json` (consulted BEFORE the
+   mode entry — its whole purpose is to override the session model for
+   condensation, so a file setting both `"code"` and `"_condensation"`
+   uses the cheap model; falls through to `mode` → `_default` — see
+   [`src/config/mode-models.ts`](../src/config/mode-models.ts)'s `extraKeys`).
 
 The local-Ollama path from `plans/local-output-summarization.md` is NOT a
 dependency — this works standalone with a cloud model. It could be wired in

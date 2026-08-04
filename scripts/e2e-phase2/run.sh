@@ -182,7 +182,37 @@ else
 fi
 
 # ── 5. Real spawn (2 specs, real workers against the mock) ──────────────────
+echo "== [4.5/10] no-index guardrail: ALLOW_UNINDEXED unset => hard fail =="
+GUARD_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-guard-XXXXXX.out)"
+(
+	cd "$ROOT" &&
+		TARGET_REPO="$FIXTURE" \
+		HEADLESSCODE_ROOT="$ROOT" \
+		bash scripts/spawn-parallel-worktrees.sh probe:9:plans/parallel-tasks/never-created.md
+) >"$GUARD_OUT" 2>&1
+GUARD_EXIT=$?
+if [ "$GUARD_EXIT" -ne 0 ] &&
+	grep -q "No codebase-search index found" "$GUARD_OUT" &&
+	[ ! -d "$FIXTURE/.worktrees/probe" ]; then
+	pass "spawner hard-fails on a missing index (exit $GUARD_EXIT, no worktree created)"
+else
+	fail "expected non-zero exit + 'No codebase-search index found' + no worktree; got exit $GUARD_EXIT"
+	tail -n 10 "$GUARD_OUT" >&2
+fi
+
 echo "== [5/10] spawn-parallel-worktrees.sh (2 specs) =="
+# Give the fixture a per-workspace mode-models.json (the P0.2 config file):
+# the spawner must seed it into each worktree so workers resolve the cheap
+# `_condensation` model instead of silently running condensation on the full
+# session model.
+mkdir -p "$FIXTURE/.headlesscode"
+cat > "$FIXTURE/.headlesscode/mode-models.json" <<'EOF'
+{
+  "_default": "deepseek/deepseek-v4-flash",
+  "code": "deepseek/deepseek-v4-flash",
+  "_condensation": "qwen/qwen3-8b"
+}
+EOF
 SPAWN_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-spawn-XXXXXX.out)"
 (
 	cd "$ROOT" &&
@@ -190,6 +220,7 @@ SPAWN_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-spawn-XXXXXX.out)"
 		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 		OPENROUTER_BASE_URL="http://127.0.0.1:$WORKER_PORT" \
 		HEADLESSCODE_ROOT="$ROOT" \
+		ALLOW_UNINDEXED=1 \
 		bash scripts/spawn-parallel-worktrees.sh \
 			w1:0:plans/parallel-tasks/w1-issue1.md \
 			w2:1:plans/parallel-tasks/w2-issue2-3.md
@@ -229,6 +260,13 @@ if [ -f "$FIXTURE/.worktrees/w1/ORCHESTRATOR_TASK.md" ] &&
 	pass "ORCHESTRATOR_TASK.md copied into each worktree"
 else
 	fail "ORCHESTRATOR_TASK.md copy missing"
+fi
+if [ -f "$FIXTURE/.worktrees/w1/.headlesscode/mode-models.json" ] &&
+	[ -f "$FIXTURE/.worktrees/w2/.headlesscode/mode-models.json" ] &&
+	grep -q '"_condensation": "qwen/qwen3-8b"' "$FIXTURE/.worktrees/w1/.headlesscode/mode-models.json"; then
+	pass "per-workspace mode-models.json seeded into each worktree"
+else
+	fail "mode-models.json seeding into worktrees missing/wrong"
 fi
 
 # ── 6. Wait for completion markers (.harness.done) ──────────────────────────
@@ -369,6 +407,7 @@ CONT_SPAWN_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-cont-spawn-XXXXXX.out)"
 		OPENROUTER_BASE_URL="http://127.0.0.1:$EXHAUST_PORT" \
 		HEADLESSCODE_ROOT="$ROOT" \
 		HEADLESSCODE_MAX_ITERATIONS=3 \
+		ALLOW_UNINDEXED=1 \
 		bash scripts/spawn-parallel-worktrees.sh w3:2:plans/parallel-tasks/w3-issue29.md
 ) >"$CONT_SPAWN_OUT" 2>&1
 CONT_SPAWN_EXIT=$?

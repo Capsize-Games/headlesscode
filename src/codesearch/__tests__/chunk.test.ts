@@ -10,6 +10,7 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 
+import { MAX_CHUNK_CHARS } from "../embedder.js"
 import { chunkFile } from "../chunk.js"
 
 async function mkTmpWorkspace(files: Record<string, string>): Promise<string> {
@@ -240,6 +241,55 @@ async function testNoBoundariesFallsBackToWindows(): Promise<void> {
 	}
 }
 
+async function testOversizedChunksAreCapped(): Promise<void> {
+	// A single giant line (minified bundle / huge data blob) and a window that
+	// exceeds the char cap must both be split down below MAX_CHUNK_CHARS — the
+	// embedding endpoint rejects any input >= 131072 chars (HTTP 422).
+	const giantLine = "x".repeat(300_000)
+	const longLines = Array.from({ length: 150 }, (_, i) => `line ${i} ` + "y".repeat(1900)).join("\n")
+	const ws = await mkTmpWorkspace({
+		"bundle.js": giantLine + "\n",
+		"data.txt": longLines + "\n",
+	})
+	try {
+		// (a) A file that is ONE giant line must split into capped pieces that
+		// all cite the same line and reconstruct the original content.
+		const jsChunks = chunkFile(path.join(ws, "bundle.js"), "bundle.js")
+		assert.ok(jsChunks.length >= 3, `300k single line should split into >=3 capped chunks, got ${jsChunks.length}`)
+		for (const c of jsChunks) {
+			assert.ok(c.content.length <= MAX_CHUNK_CHARS, `chunk ${c.startLine}-${c.endLine} exceeds MAX_CHUNK_CHARS`)
+			assert.equal(c.startLine, 1, "all pieces of one giant line cite line 1")
+			assert.equal(c.endLine, 1)
+		}
+		assert.equal(
+			jsChunks.map((c) => c.content).join(""),
+			giantLine + "\n",
+			"capped pieces must reconstruct the original file content",
+		)
+
+		// (b) A fallback window of 60 lines × ~2k chars = ~120k chars exceeds
+		// the cap and must be split further. Windows overlap by 10 lines, so
+		// pieces from different source windows interleave — the invariants
+		// that hold are: every chunk is capped, and every line 1..150 is
+		// covered by at least one chunk.
+		const txtChunks = chunkFile(path.join(ws, "data.txt"), "data.txt")
+		assert.ok(txtChunks.length >= 4, `oversized windows should split further, got ${txtChunks.length}`)
+		const cited = new Set<number>()
+		for (const c of txtChunks) {
+			assert.ok(c.content.length <= MAX_CHUNK_CHARS, `chunk ${c.startLine}-${c.endLine} exceeds MAX_CHUNK_CHARS`)
+			assert.ok(c.startLine >= 1 && c.endLine >= c.startLine, "sane line range")
+			for (let l = c.startLine; l <= c.endLine; l++) {
+				cited.add(l)
+			}
+		}
+		for (let l = 1; l <= 150; l++) {
+			assert.ok(cited.has(l), `line ${l} is not covered by any chunk`)
+		}
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 async function testSkipsBinaryAndGitignoredFiles(): Promise<void> {
 	const ws = await mkTmpWorkspace({
 		"a.ts": "export const a = 1\n",
@@ -268,6 +318,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["TypeScript file chunks by top-level function/class boundaries", testTsChunksByFunctionBoundaries],
 	["Python file chunks by top-level def/class boundaries", testPyChunksByTopLevelDefs],
 	["boundary-less file falls back to fixed-size windows with overlap", testNoBoundariesFallsBackToWindows],
+	["oversized chunks are capped below the embedder input limit", testOversizedChunksAreCapped],
 	["gitignored + binary files are skipped (walker integration)", testSkipsBinaryAndGitignoredFiles],
 ]
 

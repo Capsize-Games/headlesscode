@@ -45,14 +45,17 @@ export interface ResolveModelOptions {
 	/** Env to read OPENROUTER_MODEL from (default: process.env). */
 	env?: NodeJS.ProcessEnv
 	/**
-	 * Optional EXTRA config keys to consult between `mode` and `_default`
-	 * (e.g. `_condensation` — a cheaper model id used for the context-
-	 * condensation LLM call; see src/engine/condense.ts). Each key is read
-	 * directly from the config file, so an entry like
-	 * `"_condensation": "deepseek/deepseek-v4-flash"` works without being a
-	 * real mode slug. When none of the keys resolve, precedence falls
-	 * through to `_default` → `OPENROUTER_MODEL` → undefined exactly as
-	 * before.
+	 * Optional EXTRA config keys consulted BEFORE the mode entry (e.g.
+	 * `_condensation` — a cheaper model id used for the context-condensation
+	 * LLM call; see src/engine/condense.ts). Each key is read directly from
+	 * the config file, so an entry like `"_condensation": "qwen/qwen3-8b"`
+	 * works without being a real mode slug. Consulted first because the
+	 * whole point of such a key is to override whatever the session model
+	 * resolves to — if the mode entry shadowed it, a file that sets both
+	 * `"code"` and `"_condensation"` (the canonical example) would silently
+	 * keep running condensation on the full-price session model. When none
+	 * of the keys resolve, precedence falls through to `mode` → `_default`
+	 * → `OPENROUTER_MODEL` → undefined exactly as before.
 	 */
 	extraKeys?: string[]
 }
@@ -119,13 +122,13 @@ export function resolveModelForMode(options: ResolveModelOptions): string | unde
 
 	const file = loadModeModelsFile(workspaceRoot)
 	if (file !== null) {
-		if (typeof file[mode] === "string") {
-			return file[mode]
-		}
 		for (const key of extraKeys ?? []) {
 			if (typeof file[key] === "string") {
 				return file[key]
 			}
+		}
+		if (typeof file[mode] === "string") {
+			return file[mode]
 		}
 		if (typeof file[DEFAULT_KEY] === "string") {
 			return file[DEFAULT_KEY]

@@ -88,6 +88,7 @@ import {
 } from "./condense.js"
 import { runLocalExplorePhase, type LocalExploreOptions, type LocalExploreResult } from "./local-explore.js"
 import { DEFAULT_LINE_LIMIT } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/read_file.js"
+import { hasCodebaseIndex } from "../index-util.js"
 // Recursive task decomposition (`new_task`): child mode resolution uses the
 // SAME lookup the top-level session does (custom modes from .roomodes first,
 // then the vendored built-ins — see src/engine/prompt.ts).
@@ -170,6 +171,27 @@ export const DEFAULT_WINDOW_SIZE = 300
  * without masking an actually-hung request as something else.
  */
 export const DEFAULT_LLM_TIMEOUT_MS = 300_000
+/**
+ * Blind tree-walking guardrail (speed workstream, P1.6): after this many
+ * CONSECUTIVE iterations whose every tool call is a plain read/exploration
+ * tool (list_files / read_file / search_files) with no codebase_search,
+ * code-intel, or edit mixed in, the loop injects a one-line user-role nudge
+ * pointing at codebase_search. Chosen at 8: the whole point is to catch a
+ * model settling into a blind tree-walk BEFORE it has burned a dozen+ calls
+ * (which is where the airunner sessions' exploration ballooning started),
+ * while staying comfortably above a legitimate 2-5 call local recon burst —
+ * the nudge must never fire for normal short reads. It is a SOFT nudge
+ * (reversible, matches the empty-reply pattern): a single productive call
+ * resets the streak, and it never fires when the workspace has no
+ * codebase-search index (blind walking is then the only option). Overridable
+ * via $HEADLESSCODE_READ_ONLY_NUDGE_THRESHOLD.
+ */
+export const DEFAULT_READ_ONLY_NUDGE_THRESHOLD = 8
+/** Tool names that count as "blind tree-walking" for the guardrail above. */
+const READ_ONLY_TOOL_NAMES = new Set(["list_files", "read_file", "search_files"])
+/** The injected nudge (user-role, seen by the model on its next turn). */
+const READ_ONLY_NUDGE_MESSAGE =
+	"You've made several read/exploration calls without using `codebase_search`. If the workspace has an index (check: is there a `.headlesscode/codesearch/index.jsonl`?), try `codebase_search` for targeted semantic search instead of blind tree-walking. If the workspace is not indexed, ignore this nudge."
 
 export interface HeadlessSessionConfig {
 	workspaceRoot: string
@@ -1162,6 +1184,14 @@ export class HeadlessSession {
 							model: config.model,
 							contextWindowTokens: live,
 						})
+					} else {
+						// Silent-undefined is the common failure mode (lookup
+						// returned nothing, not an exception) — log it so a
+						// fallback to 128k is always visible in harness.log.
+						this.logger.warn("[condense] live context-window lookup returned no value (non-fatal; using conservative default)", {
+							model: config.model,
+							contextWindowTokens,
+						})
 					}
 				} catch (error) {
 					this.logger.warn("[condense] live context-window lookup failed (non-fatal; using conservative default)", {
@@ -1315,6 +1345,12 @@ export class HeadlessSession {
 		let consecutiveMistakes = 0
 		let lastCallSignature: string | undefined
 		let toolCalls = 0
+		// Blind tree-walking guardrail (P1.6): count consecutive read-only
+		// iterations; when the streak crosses the threshold AND the workspace
+		// is indexed, inject one soft nudge per streak (see READ_ONLY_NUDGE_MESSAGE).
+		const readOnlyNudgeThreshold = envReadOnlyNudgeThreshold()
+		let readOnlyStreak = 0
+		let readOnlyNudgeInjected = false
 
 		for (let iteration = 1; iteration <= maxIterations; iteration++) {
 			// Recursive task decomposition (`new_task`): remember the iteration
@@ -1692,6 +1728,38 @@ export class HeadlessSession {
 				} else {
 					consecutiveMistakes = 0
 					lastCallSignature = undefined
+				}
+			}
+
+			// Blind tree-walking guardrail (P1.6): after N consecutive
+			// iterations whose every tool call is a plain read/exploration
+			// tool (list_files / read_file / search_files) with no
+			// codebase_search, code-intel, or edit, inject a soft user-role
+			// nudge pointing at codebase_search. One nudge per streak; any
+			// non-read-only tool resets the streak. Never fires on an
+			// unindexed workspace (blind walking is then the only option).
+			// Soft + reversible — a later productive call resets everything.
+			if (calls.length > 0) {
+				const allReadOnly = calls.every((call) => READ_ONLY_TOOL_NAMES.has(call.name))
+				if (allReadOnly) {
+					readOnlyStreak++
+					if (readOnlyStreak >= readOnlyNudgeThreshold && !readOnlyNudgeInjected) {
+						if (await hasCodebaseIndex(this.config.workspaceRoot)) {
+							readOnlyNudgeInjected = true
+							messages.push({ role: "user", content: READ_ONLY_NUDGE_MESSAGE })
+							this.logger.warn("[loop] blind tree-walking nudge injected", { readOnlyStreak })
+						} else {
+							// Unindexed workspace: the nudge would be noise (the
+							// model has no better option than walking the tree).
+							// Reset so we stop re-checking every iteration.
+							readOnlyStreak = 0
+						}
+					}
+				} else {
+					// Any non-read-only call (edit, codebase_search, code-intel,
+					// execute_command, …) breaks the blind-walk pattern.
+					readOnlyStreak = 0
+					readOnlyNudgeInjected = false
 				}
 			}
 
@@ -2380,6 +2448,22 @@ function envMaxPauseMs(): number | undefined {
 	}
 	const n = Number(raw)
 	return Number.isFinite(n) && n > 0 ? n : undefined
+}
+
+/**
+ * Blind tree-walking guardrail (P1.6): the streak threshold at which a
+ * read-only nudge is injected, from $HEADLESSCODE_READ_ONLY_NUDGE_THRESHOLD
+ * (default DEFAULT_READ_ONLY_NUDGE_THRESHOLD = 8). Non-positive/invalid
+ * values fall back to the default — a 0 or negative threshold would inject
+ * the nudge on the very first read, which is noise, not guidance.
+ */
+function envReadOnlyNudgeThreshold(): number {
+	const raw = process.env.HEADLESSCODE_READ_ONLY_NUDGE_THRESHOLD
+	if (raw === undefined || raw === "") {
+		return DEFAULT_READ_ONLY_NUDGE_THRESHOLD
+	}
+	const n = Number(raw)
+	return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_READ_ONLY_NUDGE_THRESHOLD
 }
 
 /**

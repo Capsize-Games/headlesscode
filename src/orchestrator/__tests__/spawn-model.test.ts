@@ -78,6 +78,10 @@ function runSpawn(fixture: string, spec: string, extraEnv: Record<string, string
 		// Stub the CLI so no real worker/LLM runs; run-worker.sh's harness.log
 		// then shows the exact args (incl. --model) we assert on.
 		HEADLESSCODE_CLI: "echo",
+		// These tests exercise MODEL RESOLUTION, not the index — the fixtures
+		// have no codebase-search index, so bypass the spawner's no-index
+		// guardrail (P1.4) exactly like scripts/e2e-phase2/run.sh does.
+		ALLOW_UNINDEXED: "1",
 		// Never let an outer SPAWN_MODEL leak into a test it does not belong to.
 		SPAWN_MODEL: "",
 		// The calling shell may have OPENROUTER_MODEL set (the harness runs

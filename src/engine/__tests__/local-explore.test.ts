@@ -22,8 +22,10 @@
  *     cloud-model history;
  *   - HEADLESSCODE_LOCAL_EXPLORE unset/false is a complete no-op (env gate +
  *     CLI flag + byte-identical cloud sessions);
- *   - the narrower tool set: execute_command, every write tool and
- *     codebase_search are genuinely unavailable in the local-phase executor;
+ *   - the narrowed tool set: read_file, list_files, codebase_search and
+ *     attempt_completion are available; execute_command and every write tool
+ *     are genuinely unavailable in the local-phase executor (codebase_search
+ *     is available because its embedding call is cloud-side, not local VRAM);
  *   - the real Ollama client's wire format (arguments as OBJECTS outbound,
  *     object→string normalization inbound, think:false, stream:false,
  *     num_ctx).
@@ -455,14 +457,16 @@ test("local explore disabled (unset/false) is a complete no-op", async () => {
 	assert.ok(!serialize(disabledClient.requests).includes("Local exploration"), "no local content")
 })
 
-// 16. Narrower tool set: the local-phase executor exposes ONLY read_file,
-// list_files, attempt_completion — every write tool, execute_command and
-// codebase_search is genuinely unavailable, not just unused.
-test("local-phase executor exposes only read_file / list_files / attempt_completion", async () => {
+// 16. Narrowed tool set: the local-phase executor exposes read_file,
+// list_files, codebase_search, attempt_completion — every write tool and
+// execute_command is genuinely unavailable, not just unused. codebase_search
+// is available because its embedding call is cloud-side (OpenRouter), not a
+// local model that would have to share VRAM with the exploration model.
+test("local-phase executor exposes read_file / list_files / codebase_search / attempt_completion", async () => {
 	const ws = await makeTmpWorkspace({ "a.txt": "hello" })
 	const executor = createLocalExploreExecutor(ws)
 
-	// The three available tools work.
+	// The four available tools work.
 	const read = await executor.execute("read_file", { path: "a.txt" })
 	assert.equal(read.isError, false)
 	assert.ok(read.content.includes("hello"))
@@ -471,20 +475,25 @@ test("local-phase executor exposes only read_file / list_files / attempt_complet
 	const complete = await executor.execute("attempt_completion", { result: "done" })
 	assert.equal(complete.isError, false)
 	assert.ok(complete.content.includes("done"))
+	// codebase_search is registered (no index in the fixture → the actionable
+	// no-index error, NOT the "not implemented" stub).
+	const search = await executor.execute("codebase_search", { query: "hello" })
+	assert.equal(search.isError, true)
+	assert.ok(search.content.includes("no codebase index found"), search.content)
 
 	// Everything else is a stub — genuinely unavailable.
-	const unavailable = ["execute_command", "write_to_file", "apply_diff", "search_replace", "edit_file", "codebase_search", "ask_followup_question"]
+	const unavailable = ["execute_command", "write_to_file", "apply_diff", "search_replace", "edit_file", "ask_followup_question"]
 	for (const name of unavailable) {
 		const res = await executor.execute(name, name === "execute_command" ? { command: "true" } : {})
 		assert.equal(res.isError, true, `${name} must be an error`)
 		assert.ok(res.content.includes("not implemented"), `${name}: ${res.content}`)
 	}
-	// The advertised tool list contains exactly the three allowed tools
+	// The advertised tool list contains exactly the four allowed tools
 	// (order follows the native tool registry — compare sorted).
 	const names = buildLocalExploreTools()
 		.map((t) => (t.type === "function" ? t.function.name : t.type))
 		.sort()
-	assert.deepEqual(names, ["attempt_completion", "list_files", "read_file"].sort())
+	assert.deepEqual(names, ["attempt_completion", "codebase_search", "list_files", "read_file"].sort())
 })
 
 // 17. Real Ollama client wire format (fake fetch): arguments are OBJECTS

@@ -7,9 +7,18 @@
  * over every stored vector at query time is the deliberate scope for this
  * project's scale. SCALING LIMIT (documented, accepted): cosine search is
  * O(N) over all chunks in the index, so on very large repos (hundreds of
- * thousands of chunks) queries get slow and the flat file grows. A real
- * vector DB (pgvector/Qdrant) or an HNSW index is the known future path if
- * that ever becomes a problem — it is deliberately NOT solved here.
+ * thousands of chunks) queries get slow. A real vector DB (pgvector/Qdrant)
+ * or an HNSW index is the known future path if that ever becomes a problem
+ * — it is deliberately NOT solved here.
+ *
+ * The JSONL itself is read and written STREAMING (bounded blocks / batches),
+ * never as one monolithic string: a 2560-dim embedding is ~21KB serialized,
+ * so a repo like airunner (37k chunks) produces a ~780MB index that far
+ * exceeds V8's ~1GB max string length if materialized whole (see the
+ * `Invalid string length` crash this guards against). Stored embedding
+ * floats are rounded to 6 decimal places (float32-grade precision — cosine
+ * similarity is unaffected, and it cuts each vector's serialized size by
+ * ~60%).
  *
  * Build semantics: the content hash lets a re-index skip unchanged chunks
  * instead of re-embedding the whole repo every time (the cost-control
@@ -61,44 +70,99 @@ export function indexFilePath(workspaceRoot: string): string {
 	return path.join(path.resolve(workspaceRoot), INDEX_RELATIVE_PATH)
 }
 
-/** Load all entries from the index file ([] when missing/unreadable). */
-export function loadIndex(workspaceRoot: string): IndexEntry[] {
-	const file = indexFilePath(workspaceRoot)
-	let raw: string
+/**
+ * Size of each read block when loading the index. A bounded block keeps peak
+ * memory flat regardless of index size; reading the whole file as one string
+ * is impossible above V8's ~1GB string cap anyway.
+ */
+const LOAD_BLOCK_SIZE = 64 * 1024 * 1024
+
+/** Parse one JSONL line into an IndexEntry; undefined for blank/malformed lines. */
+function parseIndexLine(line: string): IndexEntry | undefined {
+	const trimmed = line.trim()
+	if (trimmed === "") {
+		return undefined
+	}
 	try {
-		raw = fs.readFileSync(file, "utf-8")
+		const parsed = JSON.parse(trimmed) as Partial<IndexEntry>
+		if (
+			typeof parsed.file === "string" &&
+			typeof parsed.startLine === "number" &&
+			typeof parsed.endLine === "number" &&
+			Array.isArray(parsed.embedding) &&
+			parsed.embedding.every((v) => typeof v === "number") &&
+			typeof parsed.hash === "string"
+		) {
+			// Entries written before the Ollama backend existed carry no
+			// `backend` field — they were necessarily built with the only
+			// backend that existed then (openrouter).
+			const backend = parsed.backend === "ollama" ? "ollama" : "openrouter"
+			return { ...parsed, backend } as IndexEntry
+		}
+		// Malformed lines are skipped (loose validation, matching the
+		// project's read-side idiom — see src/memory/local.ts's readJsonl).
+	} catch {
+		// skip unparseable line
+	}
+	return undefined
+}
+
+/**
+ * Read a JSONL file's entries in bounded blocks ([] when missing/unreadable).
+ *
+ * `blockSize` is a test seam — production uses LOAD_BLOCK_SIZE. A line is
+ * never split across blocks (partial content is carried in a pending buffer),
+ * so lines arbitrarily larger than the block size still load correctly. One
+ * accepted imperfection: a multi-byte UTF-8 char straddling a block boundary
+ * decodes as a replacement char and the line is dropped by the loose
+ * validation above — irrelevant in practice because index lines are almost
+ * entirely ASCII (only file paths are strings).
+ */
+export function readJsonlEntries(file: string, blockSize: number = LOAD_BLOCK_SIZE): IndexEntry[] {
+	let fd: number
+	try {
+		fd = fs.openSync(file, "r")
 	} catch {
 		return []
 	}
 	const entries: IndexEntry[] = []
-	for (const line of raw.split("\n")) {
-		const trimmed = line.trim()
-		if (trimmed === "") {
-			continue
-		}
-		try {
-			const parsed = JSON.parse(trimmed) as Partial<IndexEntry>
-			if (
-				typeof parsed.file === "string" &&
-				typeof parsed.startLine === "number" &&
-				typeof parsed.endLine === "number" &&
-				Array.isArray(parsed.embedding) &&
-				parsed.embedding.every((v) => typeof v === "number") &&
-				typeof parsed.hash === "string"
-			) {
-				// Entries written before the Ollama backend existed carry no
-				// `backend` field — they were necessarily built with the only
-				// backend that existed then (openrouter).
-				const backend = parsed.backend === "ollama" ? "ollama" : "openrouter"
-				entries.push({ ...parsed, backend } as IndexEntry)
+	const buffer = Buffer.alloc(blockSize)
+	let pending = ""
+	let offset = 0
+	try {
+		for (;;) {
+			const bytesRead = fs.readSync(fd, buffer, 0, blockSize, offset)
+			if (bytesRead === 0) {
+				break
 			}
-			// Malformed lines are skipped (loose validation, matching the
-			// project's read-side idiom — see src/memory/local.ts's readJsonl).
-		} catch {
-			// skip unparseable line
+			offset += bytesRead
+			pending += buffer.subarray(0, bytesRead).toString("utf-8")
+			let nl = pending.indexOf("\n")
+			while (nl !== -1) {
+				const entry = parseIndexLine(pending.slice(0, nl))
+				if (entry) {
+					entries.push(entry)
+				}
+				pending = pending.slice(nl + 1)
+				nl = pending.indexOf("\n")
+			}
 		}
+		// Final line when the file doesn't end in a newline.
+		if (pending.trim() !== "") {
+			const entry = parseIndexLine(pending)
+			if (entry) {
+				entries.push(entry)
+			}
+		}
+	} finally {
+		fs.closeSync(fd)
 	}
 	return entries
+}
+
+/** Load all entries from the index file ([] when missing/unreadable). */
+export function loadIndex(workspaceRoot: string): IndexEntry[] {
+	return readJsonlEntries(indexFilePath(workspaceRoot))
 }
 
 /** Absolute path of the index METADATA file (sibling of index.jsonl). */
@@ -174,6 +238,68 @@ function indexLookup(entries: IndexEntry[]): Map<string, IndexEntry> {
 		map.set(`${entry.file}:${entry.startLine}`, entry)
 	}
 	return map
+}
+
+/**
+ * Significant decimal places stored per embedding float. Full double
+ * precision is wasted here: embeddings are compared by cosine similarity,
+ * which tolerates float32-grade precision (~7 sig figs) with no measurable
+ * quality change, and each stored float costs ~1 char per significant digit
+ * in the JSONL. Rounding to 6 places shrinks a 2560-dim vector's serialized
+ * form by ~60% (53KB → 21KB), which is the difference between a ~780MB and
+ * a ~1.9GB index on a repo the size of airunner.
+ */
+export const EMBEDDING_FLOAT_DECIMALS = 6
+
+/** Round an entry's embedding for serialization (does not mutate the entry). */
+function serializeEntry(entry: IndexEntry): IndexEntry {
+	if (entry.embedding.every((v) => Math.abs(v * 10 ** EMBEDDING_FLOAT_DECIMALS - Math.round(v * 10 ** EMBEDDING_FLOAT_DECIMALS)) < 1e-9)) {
+		// Already rounded to the storage precision (reused unchanged entries
+		// from an earlier build) — skip the copy.
+		return entry
+	}
+	const scale = 10 ** EMBEDDING_FLOAT_DECIMALS
+	const embedding = entry.embedding.map((v) => Math.round(v * scale) / scale)
+	return { ...entry, embedding }
+}
+
+/** How many lines to buffer before flushing to the index file's write stream. */
+const WRITE_BATCH_SIZE = 512
+
+/**
+ * Write index entries to `file` as JSONL, streaming in bounded batches.
+ *
+ * Building one giant `entries.map(JSON.stringify).join("\n")` string crashes
+ * with `Invalid string length` once the serialized index exceeds V8's ~1GB
+ * string cap (reached at ~37k chunks × 2560-dim embeddings — see the header
+ * comment). Each flushed batch is at most ~11MB (512 × ~21KB), so any repo
+ * size works.
+ */
+export async function writeIndexEntries(file: string, entries: IndexEntry[]): Promise<void> {
+	const stream = fs.createWriteStream(file, { encoding: "utf-8" })
+	const writeError = new Promise<never>((_, reject) => {
+		stream.once("error", reject)
+	})
+	try {
+		for (let i = 0; i < entries.length; i += WRITE_BATCH_SIZE) {
+			const batch = entries.slice(i, i + WRITE_BATCH_SIZE)
+			const lines = batch.map((e) => JSON.stringify(serializeEntry(e))).join("\n") + "\n"
+			if (!stream.write(lines)) {
+				// Backpressure: wait for the stream to drain before writing more.
+				await Promise.race([
+					new Promise<void>((resolve) => stream.once("drain", resolve)),
+					writeError,
+				])
+			}
+		}
+	} finally {
+		await new Promise<void>((resolve) => stream.end(resolve))
+		// Surface a write error (e.g. ENOSPC) instead of silently truncating.
+		await Promise.race([
+			new Promise<void>((resolve) => stream.once("close", resolve)),
+			writeError,
+		])
+	}
 }
 
 /**
@@ -269,8 +395,7 @@ export async function buildIndex(
 
 	const file = indexFilePath(root)
 	await fsp.mkdir(path.dirname(file), { recursive: true })
-	const lines = newEntries.map((e) => JSON.stringify(e)).join("\n") + "\n"
-	await fsp.writeFile(file, lines, "utf-8")
+	await writeIndexEntries(file, newEntries)
 	// Sibling metadata records which backend/model built this index, so a
 	// query can refuse a backend mismatch with a clear error instead of
 	// comparing different-dimension vectors (see loadIndexMetadata).
