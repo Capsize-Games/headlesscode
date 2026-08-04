@@ -26,13 +26,25 @@ export function indexFilePathFor(workspaceRoot: string): string {
 	return path.join(resolveProjectDataDir(workspaceRoot), "codesearch", "index.jsonl")
 }
 
-/** True when the workspace already has a non-empty codebase-search index. */
+/**
+ * True when the workspace already has a non-empty codebase-search index.
+ * Also counts a legacy workspace-relative `.headlesscode/codesearch/index.jsonl`
+ * (pre-migration grace — the same rule the spawn scripts rely on so a fresh
+ * worktree of an already-indexed repo never rebuilds unnecessarily).
+ */
 export async function hasCodebaseIndex(workspaceRoot: string): Promise<boolean> {
-	const file = indexFilePathFor(workspaceRoot)
-	try {
-		const st = await fsp.stat(file)
-		return st.isFile() && st.size > 0
-	} catch {
-		return false
+	for (const file of [
+		indexFilePathFor(workspaceRoot),
+		path.join(workspaceRoot, ".headlesscode", "codesearch", "index.jsonl"),
+	]) {
+		try {
+			const st = await fsp.stat(file)
+			if (st.isFile() && st.size > 0) {
+				return true
+			}
+		} catch {
+			// missing — try the next candidate
+		}
 	}
+	return false
 }

@@ -55,6 +55,7 @@ import { createHash } from "node:crypto"
 import { spawn, type ChildProcess } from "node:child_process"
 import { setTimeout as sleep } from "node:timers/promises"
 
+import { isTypeScriptWorkspace } from "./language-detect.js"
 import type { Logger } from "../engine/logger.js"
 
 // Side effect: installs String.prototype.toPosix() used by path formatting.
@@ -1708,6 +1709,41 @@ const IMPLEMENTED_TOOLS = new Set([
 ])
 
 /**
+ * Register the TS-ONLY code-intelligence tools + run_tests — CONDITIONALLY,
+ * gated on the workspace actually being TS/JS (src/tools/language-detect.ts).
+ * All of these are built on ts.Program/tsx: on a Python/C++/Rust workspace
+ * they are dead weight (advertised on every request, costing prompt tokens,
+ * silently useless if tried) — the same "match the tool list to what actually
+ * works" discipline `codebase_search` already models with its broad extension
+ * list. On non-TS workspaces they are NOT registered here, so both the
+ * executor and the advertised tool list (loop.ts gates advertisement on
+ * executor.has) omit them.
+ */
+function registerTypeScriptGatedTools(
+	executor: ToolExecutor,
+	workspaceRoot: string,
+	options: ToolExecutorOptions = {},
+): void {
+	if (!isTypeScriptWorkspace(workspaceRoot)) {
+		return
+	}
+	executor.register("outline", outlineHandler)
+	executor.register("go_to_definition", goToDefinitionHandler)
+	executor.register("find_references", findReferencesHandler)
+	executor.register("import_graph", importGraphHandler)
+	// rename_symbol EDITS files, so it is deliberately NOT registered on the
+	// read-only executors (reviewer/QA/local explore) — they must never be
+	// able to modify source, and their tool lists don't advertise it either
+	// (see the RENAME_SYMBOL_TOOL note in src/codeintel/tools.ts).
+	executor.register("rename_symbol", renameSymbolHandler)
+	// run_tests RUNS the project's test suite — an edit-loop tool, not a
+	// read-only inspection, so like rename_symbol it is only registered on
+	// the headless (edit-capable) executor. Reviewer/QA use execute_command
+	// to run tests themselves; their tool lists don't advertise run_tests.
+	executor.register("run_tests", (args, ctx) => runTestsHandler(args, ctx, options.getSessionChangedFiles))
+}
+
+/**
  * Create the default headless executor for a workspace root: the 7 core tools
  * (read_file, write_to_file, apply_diff, search_replace, edit_file,
  * execute_command, list_files), attempt_completion + ask_followup_question
@@ -1726,20 +1762,7 @@ export function createHeadlessExecutor(workspaceRoot: string, options: ToolExecu
 	executor.register("codebase_search", codebaseSearchHandler)
 	executor.register("browser_action", browserActionHandler)
 	executor.register("describe_image", describeImageHandler)
-	executor.register("outline", outlineHandler)
-	executor.register("go_to_definition", goToDefinitionHandler)
-	executor.register("find_references", findReferencesHandler)
-	executor.register("import_graph", importGraphHandler)
-	// rename_symbol EDITS files, so it is deliberately NOT registered on the
-	// read-only executors (reviewer/QA/local explore) — they must never be
-	// able to modify source, and their tool lists don't advertise it either
-	// (see the RENAME_SYMBOL_TOOL note in src/codeintel/tools.ts).
-	executor.register("rename_symbol", renameSymbolHandler)
-	// run_tests RUNS the project's test suite — an edit-loop tool, not a
-	// read-only inspection, so like rename_symbol it is only registered on
-	// the headless (edit-capable) executor. Reviewer/QA use execute_command
-	// to run tests themselves; their tool lists don't advertise run_tests.
-	executor.register("run_tests", (args, ctx) => runTestsHandler(args, ctx, options.getSessionChangedFiles))
+	registerTypeScriptGatedTools(executor, workspaceRoot, options)
 	executor.registerTodoList()
 
 	executor.register("attempt_completion", attemptCompletionHandler)
@@ -1778,10 +1801,15 @@ function createReadCommandExecutor(workspaceRoot: string, options: ToolExecutorO
 	executor.register("list_files", listFilesHandler)
 	executor.register("execute_command", executeCommandHandler)
 	executor.register("browser_action", browserActionHandler)
-	executor.register("outline", outlineHandler)
-	executor.register("go_to_definition", goToDefinitionHandler)
-	executor.register("find_references", findReferencesHandler)
-	executor.register("import_graph", importGraphHandler)
+	// The four read-only code-intelligence tools (TS-only) follow the same
+	// language gate as the headless executor — a reviewer of a C++/Python
+	// workspace must not be handed ts.Program tools.
+	if (isTypeScriptWorkspace(workspaceRoot)) {
+		executor.register("outline", outlineHandler)
+		executor.register("go_to_definition", goToDefinitionHandler)
+		executor.register("find_references", findReferencesHandler)
+		executor.register("import_graph", importGraphHandler)
+	}
 
 	executor.register("attempt_completion", attemptCompletionHandler)
 	executor.register("ask_followup_question", askFollowupQuestionHandler)

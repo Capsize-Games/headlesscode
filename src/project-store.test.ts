@@ -125,7 +125,16 @@ async function testLegacyWorkspaceDataMigrates(): Promise<void> {
 		await fsp.writeFile(path.join(legacyRoot, "codesearch", "index.jsonl.meta.json"), '{"backend":"openrouter"}\n')
 		await fsp.writeFile(path.join(legacyRoot, "mode-models.json"), '{"code":"deepseek/deepseek-v4-flash"}\n')
 
-		const central = resolveProjectDataDir(ws)
+		// NOTE: resolveProjectDataDir's AUTO-migration is skipped under the
+		// $HEADLESSCODE_DATA_DIR override (tests must never move real data),
+		// so this test exercises the EXPLICIT migrateLegacyProjectData path —
+		// the same function the `headlesscode migrate` subcommand and the
+		// real-machine auto path both call.
+		const identity = resolveProjectIdentity(ws)
+		const central = path.join(projectStoreRoot(), "projects", projectKeyFor(identity.keySource))
+		const log: string[] = []
+		migrateLegacyProjectData(ws, identity.keySource, central, { log: (m) => log.push(m) })
+		assert.ok(log.length > 0, "migration logs what happened")
 		// Content lands in the central store, NOT the workspace.
 		assert.equal(
 			await fsp.readFile(path.join(central, "codesearch", "index.jsonl"), "utf-8"),

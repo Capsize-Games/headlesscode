@@ -132,7 +132,13 @@ export interface MigrateOptions {
  * Resolve the central data dir for a workspace: `<root>/projects/<project-key>`.
  * Cached per process per (resolved) workspace root, so the git exec + project.json
  * write happen at most once per session. Also performs the one-time legacy
- * `.headlesscode/` migration on first resolution (see migrateLegacyProjectData).
+ * `.headlesscode/` migration on first resolution (see migrateLegacyProjectData) —
+ * SKIPPED under a $HEADLESSCODE_DATA_DIR override, exactly like the
+ * checkpoint/shared-instructions auto-migrations: the override means "never move
+ * real data", and the test suites run with an override against real workspace
+ * roots (e.g. the run_tests end-to-end test runs with cwd = this repo). Under an
+ * override the legacy files are still READ via the pre-migration-grace fallback
+ * paths in mode-models/permissions/codesearch-index instead.
  */
 export function resolveProjectDataDir(workspaceRoot: string): string {
 	const root = path.resolve(workspaceRoot)
@@ -145,7 +151,9 @@ export function resolveProjectDataDir(workspaceRoot: string): string {
 	const dir = path.join(projectStoreRoot(), "projects", key)
 	projectDirCache.set(root, dir)
 	writeProjectMetadata(dir, keySource, kind)
-	migrateLegacyProjectData(root, keySource, dir)
+	if (!storeOverridden()) {
+		migrateLegacyProjectData(root, keySource, dir)
+	}
 	return dir
 }
 
