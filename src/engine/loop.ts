@@ -47,6 +47,7 @@ import { randomUUID } from "node:crypto"
 
 import { BudgetExceededError, BudgetTracker, type SessionBudget } from "../budget/budget.js"
 import { DEFAULT_MODEL } from "../llm/openrouter.js"
+import { DECISION_PROXY_ANSWER_PREFIX } from "../decision-proxy/proxy.js"
 import {
 	createHeadlessExecutor,
 	escalateDecision,
@@ -2322,7 +2323,15 @@ export class HeadlessSession {
 					isError: true,
 				}
 			}
-			const answer = outcome.answer.trim().toLowerCase()
+			// The decision-proxy (src/decision-proxy/) writes its answers with a
+			// distinguishing `[decision-proxy] ` prefix so the audit trail can tell
+			// a human never looked at the answer — strip it before the exact-text
+			// approve/deny match (otherwise a proxy "approve" is misread as a deny).
+			let answer = outcome.answer.trim()
+			if (answer.toLowerCase().startsWith(DECISION_PROXY_ANSWER_PREFIX.toLowerCase())) {
+				answer = answer.slice(DECISION_PROXY_ANSWER_PREFIX.length).trimStart()
+			}
+			answer = answer.toLowerCase()
 			if (!(answer.startsWith("approve") || answer.startsWith("yes"))) {
 				this.logger.warn("[switch_mode] approval denied by human/orchestrator; no switch", {
 					from,

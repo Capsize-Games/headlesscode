@@ -340,6 +340,9 @@ async function testProcessQuestionLlmErrorWritesNothing(): Promise<void> {
 			() => {
 				throw new Error("upstream 500")
 			},
+			() => {
+				throw new Error("upstream 500")
+			},
 		])
 		await writeMarker(ws, "Which file?")
 		const marker = (await readNeedsDecisionMarker(ws))!
@@ -348,7 +351,47 @@ async function testProcessQuestionLlmErrorWritesNothing(): Promise<void> {
 
 		assert.equal(result.outcome, "errored")
 		assert.match(result.detail ?? "", /upstream 500/)
+		assert.equal(client.callCount, 2, "a thrown error is retried once before failing open")
 		assert.equal(await exists(path.join(ws, DECISION_ANSWER)), false, "an LLM error must fail open (write nothing)")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testProcessQuestionRetriesEmptyFirstResponse(): Promise<void> {
+	// A reasoning model can return HTTP 200 with EMPTY content on the first
+	// completion (observed live in the decision-proxy pilot). The proxy must
+	// retry the SAME one-shot prompt once and use the second response.
+	const ws = await mkTmpWorkspace("hc-proxy-retry-")
+	try {
+		const client = new FakeLlmClient([() => textReply(""), () => textReply('{"answer": "src/codesearch/chunk.ts"}')])
+		await writeMarker(ws, "Which file is in scope?")
+		const marker = (await readNeedsDecisionMarker(ws))!
+
+		const result = await processQuestion(proxyBaseOptions(ws, client), marker)
+
+		assert.equal(result.outcome, "answered")
+		assert.equal(client.callCount, 2, "empty first response must be retried once")
+		const answer = await fs.readFile(path.join(ws, DECISION_ANSWER), "utf-8")
+		assert.equal(answer, "[decision-proxy] src/codesearch/chunk.ts")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testProcessQuestionGivesUpAfterAllRetriesEmpty(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-proxy-retryfail-")
+	try {
+		const client = new FakeLlmClient([() => textReply(""), () => textReply("")])
+		await writeMarker(ws, "Which file?")
+		const marker = (await readNeedsDecisionMarker(ws))!
+
+		const result = await processQuestion(proxyBaseOptions(ws, client), marker)
+
+		assert.equal(result.outcome, "errored")
+		assert.match(result.detail ?? "", /empty LLM response \(attempt 2\/2\)/)
+		assert.equal(client.callCount, 2)
+		assert.equal(await exists(path.join(ws, DECISION_ANSWER)), false, "all-empty responses must fail open (write nothing)")
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -551,7 +594,9 @@ async function run(): Promise<void> {
 		["model: fallback chain without key", testResolveModelFallsBackWithoutKey],
 		["processQuestion: answered writes prefixed answer", testProcessQuestionAnsweredWritesPrefixedAnswer],
 		["processQuestion: uncertain writes nothing", testProcessQuestionUncertainWritesNothing],
-		["processQuestion: LLM error writes nothing", testProcessQuestionLlmErrorWritesNothing],
+		["processQuestion: LLM error retried once then writes nothing", testProcessQuestionLlmErrorWritesNothing],
+		["processQuestion: empty first response retried, second answer used", testProcessQuestionRetriesEmptyFirstResponse],
+		["processQuestion: all-retries-empty fails open", testProcessQuestionGivesUpAfterAllRetriesEmpty],
 		["processQuestion: malformed writes nothing", testProcessQuestionMalformedWritesNothing],
 		["processQuestion: no task skips LLM", testProcessQuestionNoTaskSkipsLlm],
 		["processQuestion: stale marker never answered", testProcessQuestionStaleMarkerNeverAnswered],

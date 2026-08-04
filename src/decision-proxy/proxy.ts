@@ -67,8 +67,16 @@ export const DEFAULT_DECISION_PROXY_POLL_INTERVAL_MS = 5_000
  */
 export const DECISION_PROXY_LLM_TIMEOUT_ENV = "HEADLESSCODE_DECISION_PROXY_LLM_TIMEOUT_MS"
 export const DEFAULT_DECISION_PROXY_LLM_TIMEOUT_MS = 60_000
-/** Max output tokens for the answer call — the reply is one short JSON object. */
-export const DEFAULT_DECISION_PROXY_MAX_TOKENS = 400
+/**
+ * Max output tokens for the answer call. Raised twice after the live pilot:
+ * deepseek-v4-flash (a reasoning model) intermittently returned HTTP 200 with
+ * EMPTY final content — its reasoning trace can consume the whole output
+ * budget (DeepSeek counts reasoning toward max_tokens), leaving no room for
+ * the final `{"answer": ...}` / `{"uncertain": true}` payload. 4096 is still
+ * a single short completion (~$0.0006 worst case) and keeps the answer call
+ * comfortably inside the worker's decision window.
+ */
+export const DEFAULT_DECISION_PROXY_MAX_TOKENS = 4096
 /**
  * Distinguishing prefix on a proxy-authored answer file — anyone reading
  * harness.log / the dashboard's decision_answered event can tell a human
@@ -303,6 +311,16 @@ function resolveTaskTextFromOrchestratorState(workspaceRoot: string): TaskTextRe
 
 // ─── LLM call ───────────────────────────────────────────────────────────────
 
+/**
+ * Max attempts for ONE question's LLM call. A reasoning model (e.g. the
+ * default deepseek/deepseek-v4-flash) sometimes returns HTTP 200 with EMPTY
+ * content on the first completion (observed live in the decision-proxy pilot);
+ * the retry re-issues the SAME one-shot prompt — still a single question, no
+ * tools, no loop. The caller still fails open (writes nothing) if every
+ * attempt is unusable.
+ */
+export const MAX_PROXY_LLM_ATTEMPTS = 2
+
 export const DECISION_PROXY_SYSTEM_PROMPT = `You are the DECISION PROXY for a headless coding agent. The agent was given a task and, during the session, asked a question that would normally go to a human. You answer on the human's behalf — but ONLY when the agent's ORIGINAL TASK TEXT genuinely grounds a specific answer.
 
 You will be given:
@@ -312,6 +330,7 @@ You will be given:
 
 Rules:
 - If the original task text gives you enough information to answer the question DIRECTLY and SPECIFICALLY, answer it. When one of the suggested answers clearly matches what the task requires, choose it. Be concise and concrete — your answer is fed back to the agent verbatim.
+- If the question is a MODE-SWITCH approval (its suggested answers are exactly "approve"/"deny"), your answer must be exactly "approve" or "deny": approve only when the original task text supports the switch (e.g. the task says the work should be handed to another mode), otherwise deny.
 - If the original task text does NOT answer the question (it is silent on the matter, or the question is a genuine choice the task left open), you MUST respond with the uncertain sentinel.
 - NEVER guess, invent, or extrapolate beyond what the task text supports. A fabricated answer actively misdirects the agent; an abstention merely falls back to the existing no-answer behavior.
 
@@ -334,28 +353,41 @@ async function callProxyLlm(options: DecisionProxyOptions, taskText: string, mar
 	// → the client's own DEFAULT_MODEL (same final fallback as the main loop).
 	const model = options.model ?? resolveDecisionProxyModel(options.workspaceRoot, process.env) ?? DEFAULT_MODEL
 	const timeoutMs = options.llmTimeoutMs ?? resolveDecisionProxyLlmTimeout(process.env)
-	const controller = new AbortController()
-	const timer = setTimeout(() => controller.abort(), timeoutMs)
-	try {
-		const messages: ChatMessage[] = [
-			{ role: "system", content: DECISION_PROXY_SYSTEM_PROMPT },
-			{ role: "user", content: buildProxyUserPrompt(taskText, marker.question, marker.suggestions) },
-		]
-		const response: LlmResponse = await options.llmClient.createChatCompletion({
-			model,
-			messages,
-			temperature: 0,
-			maxTokens: options.maxTokens ?? DEFAULT_DECISION_PROXY_MAX_TOKENS,
-			signal: controller.signal,
-		})
-		const content = response.message.content
-		if (typeof content !== "string" || content.trim() === "") {
-			throw new DecisionProxyError("empty LLM response")
+	const messages: ChatMessage[] = [
+		{ role: "system", content: DECISION_PROXY_SYSTEM_PROMPT },
+		{ role: "user", content: buildProxyUserPrompt(taskText, marker.question, marker.suggestions) },
+	]
+	let lastError: unknown
+	for (let attempt = 1; attempt <= MAX_PROXY_LLM_ATTEMPTS; attempt++) {
+		const controller = new AbortController()
+		const timer = setTimeout(() => controller.abort(), timeoutMs)
+		try {
+			const response: LlmResponse = await options.llmClient.createChatCompletion({
+				model,
+				messages,
+				temperature: 0,
+				maxTokens: options.maxTokens ?? DEFAULT_DECISION_PROXY_MAX_TOKENS,
+				signal: controller.signal,
+			})
+			const content = response.message.content
+			if (typeof content === "string" && content.trim() !== "") {
+				return content
+			}
+			// Diagnose the empty response for the audit trail: was the completion
+			// cut mid-reasoning (DeepSeek counts reasoning toward max_tokens), or
+			// did the model emit a reasoning block with no final content at all?
+			const reasoning = typeof response.message.reasoning === "string" && response.message.reasoning.length > 0
+			lastError = new DecisionProxyError(
+				`empty LLM response (attempt ${attempt}/${MAX_PROXY_LLM_ATTEMPTS})` +
+					(reasoning ? ` — model emitted ${response.message.reasoning!.length} chars of reasoning but no final content` : " — no content and no reasoning"),
+			)
+		} catch (err) {
+			lastError = err
+		} finally {
+			clearTimeout(timer)
 		}
-		return content
-	} finally {
-		clearTimeout(timer)
 	}
+	throw lastError instanceof Error ? lastError : new DecisionProxyError(String(lastError))
 }
 
 // ─── Sentinel parsing ───────────────────────────────────────────────────────
