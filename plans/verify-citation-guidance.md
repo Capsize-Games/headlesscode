@@ -46,21 +46,30 @@ the `headlesscode checkpoints list` command.
 
 Every specific instruction or finding in your plan doc that references
 existing code MUST cite a real file path and line number/range, verified by
-ACTUALLY READING the file at writing time (`read_file`/`search_files`/
-`codebase_search`/`outline`/`go_to_definition` — check the real current line
+ACTUALLY READING the file at writing time (check the real current line
 numbers, don't trust memory). Do not write "the checkpoints CLI" where you
-could write `src/checkpoints/cli.ts:NN-NN`. If a line range you are about to
-cite doesn't match what you actually find, correct it to the real number
-before writing it down. Narrative context is fine, but every concrete code
-reference carries a verified location.
+could write `src/checkpoints/cli.ts:NN-NN`. Narrative context is fine, but
+every concrete code reference carries a verified location.
 
-**Tool use is mandatory.** You MUST call `read_file` (or `search_files`/
-`codebase_search`) on the actual files — `src/checkpoints/cli.ts`,
-`src/checkpoints/service.ts`, the tests under `src/checkpoints/__tests__/`
-(real filename: `service.test.ts`) — BEFORE writing any citation. A citation
-whose line numbers you did not personally verify by reading the file is a
-hallucination; never write one. A plan doc written without a single tool
-call is an automatic FAILURE of this session.
+**Tool use is mandatory.** A plan doc written without a single tool call is
+an automatic FAILURE of this session. Note: `codebase_search` may be
+unavailable in this worktree — use `read_file`/`search_files` instead.
+
+## Exact steps — follow them in order
+
+1. `read_file` `src/checkpoints/cli.ts` (in full).
+2. `read_file` `src/checkpoints/service.ts` (in full).
+3. `read_file` `src/checkpoints/__tests__/service.test.ts` (in full).
+4. Identify where the `list` subcommand parses its args and where the
+   checkpoint entries are rendered. Note the REAL line numbers.
+5. Write `plans/checkpoints-list-limit.md` with `write_to_file`, planning
+   the `--limit <n>` flag. Every finding that references existing code must
+   carry the real `path:line` from your reads (e.g.
+   `src/checkpoints/cli.ts:12-30`) — a citation whose line numbers you did
+   not personally verify is a hallucination; never write one.
+6. SELF-CHECK: `read_file` the plan doc you just wrote and confirm it
+   contains at least one `path:line` citation per code reference. If any
+   code reference lacks one, fix the doc before finishing.
 
 ## Constraints — headless session, no user to ask
 
