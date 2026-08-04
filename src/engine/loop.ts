@@ -61,10 +61,13 @@ import { Logger } from "./logger.js"
 import { parseToolCalls } from "./parser.js"
 import {
 	appendBrowserActionTool,
+	appendCodeIntelEditTools,
 	appendCodeIntelTools,
 	appendDescribeImageTool,
+	appendRunTestsTool,
 	buildSystemPrompt,
 	loadCustomModes,
+	modeHasEditGroup,
 	selectToolsForMode,
 } from "./prompt.js"
 import type {
@@ -758,6 +761,26 @@ export class HeadlessSession {
 				// The budgetTracker field is assigned later in run() — handler
 				// calls only happen after that, so the closure sees it set.
 				onAuxLlmUsage: (usage) => this.recordAuxLlmUsage(usage),
+				// Test selection (run_tests): infer files changed since the
+				// session's baseline checkpoint, so a worker can verify "did I
+				// break anything" against exactly what IT changed — even when
+				// the workspace itself is not a git repo. The checkpoint
+				// service initializes later in run() (after this executor is
+				// constructed), so read it lazily here; undefined → the
+				// run_tests handler falls back to the workspace git status.
+				getSessionChangedFiles: async () => {
+					const svc = this.checkpointService
+					if (!svc) {
+						return undefined
+					}
+					const entries = await svc.list()
+					const baseline = entries[0]?.hash
+					if (!baseline) {
+						return undefined
+					}
+					const diffs = await svc.diff({ from: baseline })
+					return diffs.map((d) => d.paths.relative)
+				},
 			})
 		this.sessionId = config.sessionId?.trim() ? config.sessionId.trim() : randomUUID()
 		this.parentSessionId = this.config.parentSessionId
@@ -835,15 +858,25 @@ export class HeadlessSession {
 				customModes,
 				globalCustomInstructions: this.config.globalCustomInstructions,
 			})).prompt
-		// browser_action, describe_image and the four code-intelligence tools
-		// are not part of the vendored tool set, so selectToolsForMode can't
+		// browser_action, describe_image and the code-intelligence tools are
+		// not part of the vendored tool set, so selectToolsForMode can't
 		// include them — append them explicitly (see src/tools/browser/,
-		// src/vision/ and src/codeintel/).
-		const tools = appendCodeIntelTools(
+		// src/vision/ and src/codeintel/). rename_symbol (edits files) and
+		// run_tests (runs the test suite) are only advertised when THIS
+		// session's executor actually registers the handlers (read-only
+		// reviewer/QA executors don't, and must not be advertised tools they
+		// can't run).
+		let tools = appendCodeIntelTools(
 			appendDescribeImageTool(
 				appendBrowserActionTool(this.config.tools ?? selectToolsForMode(mode, customModes)),
 			),
 		)
+		if (this.executor.has("rename_symbol")) {
+			tools = appendCodeIntelEditTools(tools)
+		}
+		if (this.executor.has("run_tests")) {
+			tools = appendRunTestsTool(tools)
+		}
 
 		this.state.systemPrompt = systemPrompt
 		this.state.tools = tools
@@ -2156,11 +2189,17 @@ export class HeadlessSession {
 			customModes: this.customModes,
 			globalCustomInstructions: this.config.globalCustomInstructions,
 		})
-		const newTools = appendCodeIntelTools(
+		let newTools = appendCodeIntelTools(
 			appendDescribeImageTool(
 				appendBrowserActionTool(this.config.tools ?? selectToolsForMode(modeSlug, this.customModes)),
 			),
 		)
+		if (this.executor.has("rename_symbol")) {
+			newTools = appendCodeIntelEditTools(newTools)
+		}
+		if (this.executor.has("run_tests")) {
+			newTools = appendRunTestsTool(newTools)
+		}
 		this.state.mode = modeSlug
 		this.state.tools = newTools
 		this.state.systemPrompt = built.prompt

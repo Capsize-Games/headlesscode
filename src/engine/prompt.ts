@@ -38,7 +38,8 @@ import { TOOL_GROUPS } from "../vendor/zoo-code/src/shared/tools.js"
 import { customModesSettingsSchema } from "../vendor/zoo-code/types/index.js"
 import { browserActionTool } from "../tools/browser/tool.js"
 import { describeImageTool } from "../vision/tool.js"
-import { CODE_INTEL_TOOLS } from "../codeintel/tools.js"
+import { runTestsTool } from "../tools/run-tests.js"
+import { CODE_INTEL_TOOLS, RENAME_SYMBOL_TOOL } from "../codeintel/tools.js"
 import type { ModeConfig } from "@roo-code/types"
 
 import type { ChatTool } from "./types.js"
@@ -379,4 +380,34 @@ export function appendCodeIntelTools(tools: ChatTool[]): ChatTool[] {
 		return tools
 	}
 	return [...tools, ...(missing as unknown as ChatTool[])]
+}
+
+/**
+ * Append the EDIT-capable code-intelligence tool schema (`rename_symbol`) to
+ * a tool list if it isn't already present. Unlike appendCodeIntelTools (the
+ * four read-only tools, safe for every mode), rename_symbol WRITES files, so
+ * callers must gate this on the executor actually registering it (the
+ * headless executor does; the read-only reviewer/QA executors do not — see
+ * src/tools/executor.ts) — otherwise a read-only session would advertise a
+ * tool whose handler is missing.
+ */
+export function appendCodeIntelEditTools(tools: ChatTool[]): ChatTool[] {
+	if (tools.some((t) => t.type === "function" && t.function.name === RENAME_SYMBOL_TOOL.function.name)) {
+		return tools
+	}
+	return [...tools, RENAME_SYMBOL_TOOL as unknown as ChatTool]
+}
+
+/**
+ * Append the `run_tests` tool schema if it isn't already present. Like
+ * rename_symbol, run_tests RUNS the test suite (side-effectful) and is only
+ * meaningful to edit-capable sessions, so callers gate this on the executor
+ * actually registering it (the headless executor does; read-only reviewer/QA
+ * executors do not — see src/tools/executor.ts).
+ */
+export function appendRunTestsTool(tools: ChatTool[]): ChatTool[] {
+	if (tools.some((t) => t.type === "function" && t.function.name === runTestsTool.function.name)) {
+		return tools
+	}
+	return [...tools, runTestsTool as unknown as ChatTool]
 }
