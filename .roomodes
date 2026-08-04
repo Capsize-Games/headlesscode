@@ -105,7 +105,10 @@ customModes:
          Every instruction or finding that references existing code must
          carry the verified file:line location from step 1's exploration
          (see `.roo/rules/rules.md`'s citation requirement) — the written
-         plan doc is where those citations land.
+         plan doc is where those citations land. Self-check before
+         finishing: re-read the written doc and confirm every code
+         reference includes a `path:line` you verified; fix any that
+         don't before handing off.
       3. Ask the user if the plan looks right before handing off — this
          is the checkpoint, not something to skip because a mode switch
          requires approval anyway.
