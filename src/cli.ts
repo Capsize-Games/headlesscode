@@ -30,6 +30,7 @@ import { checkpointsMain } from "./checkpoints/cli.js"
 import { dashboardMain } from "./dashboard/cli.js"
 import { indexMain } from "./codesearch/cli.js"
 import { provisionMain, pushPrMain } from "./github/cli.js"
+import { decisionProxyMain } from "./decision-proxy/cli.js"
 import { resolvePermissions, type PermissionsConfig } from "./permissions/config.js"
 import { resolveModelForMode } from "./config/mode-models.js"
 
@@ -185,6 +186,14 @@ Subcommands:
               a pull request from it — never to the repo's default branch,
               never auto-merged. See
               \`npx tsx src/cli.ts push-pr --help\` for full options.
+  headlesscode decision-proxy --workspace <path> [--task <text>] [--task-file <path>]
+              OPT-IN (HEADLESSCODE_DECISION_PROXY=1) LLM stand-in for the
+              human on ask_followup_question: watches <path> for
+              .harness.needs-decision and answers via .harness.decision-answer,
+              grounded in the session's ORIGINAL task text. Writes nothing
+              when uncertain/errored — the existing timeout fallback fires
+              as today. See \`npx tsx src/cli.ts decision-proxy --help\` for
+              full options.
 
 Options:
   --mode <slug>              Mode to run in (built-in or from .roomodes). Default: code
@@ -326,6 +335,11 @@ Environment:
   HEADLESSCODE_LOCAL_EXPLORE_CONTEXT_TOKENS   Context-token budget (default 131072)
   HEADLESSCODE_LOCAL_EXPLORE_TIMEOUT_MS       Per-call timeout ms (default 120000)
   HEADLESSCODE_OLLAMA_URL      Ollama base URL (default http://localhost:11434)
+  HEADLESSCODE_DECISION_PROXY   Opt-in decision-proxy agent ("1"/"true") — an
+                                LLM stand-in for the human on
+                                ask_followup_question (headlesscode
+                                decision-proxy subcommand; see
+                                plans/decision-proxy-agent.md)
 `
 
 export function parseArgs(argv: string[]): { options: CliOptions; error?: string } {
@@ -613,6 +627,15 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// provisioning (see src/github/cli.ts + docs/github-app-setup.md).
 	if (argv[0] === "push-pr") {
 		return pushPrMain(argv.slice(1))
+	}
+
+	// Decision-proxy subcommand: `headlesscode decision-proxy ...` — an
+	// OPT-IN (HEADLESSCODE_DECISION_PROXY=1) LLM stand-in for the human on
+	// ask_followup_question. Watches a workspace for .harness.needs-decision
+	// and writes .harness.decision-answer grounded in the session's original
+	// task text (see src/decision-proxy/ + plans/decision-proxy-agent.md).
+	if (argv[0] === "decision-proxy") {
+		return decisionProxyMain(argv.slice(1))
 	}
 
 	const { options, error } = parseArgs(argv)
