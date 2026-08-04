@@ -75,6 +75,25 @@ import type { Logger } from "./logger.js"
 export const DEFAULT_CONDENSE_THRESHOLD_FRACTION = 0.75
 
 /**
+ * Default fraction of the context window at which the ASYNC early-fire
+ * background condensation kicks off (plans/smart-condensation-async.md part
+ * 2). Must be BELOW the hard threshold fraction; at 0.6 vs a 0.75 hard
+ * threshold it leaves a 15-percentage-point runway for the 55-80s (measured)
+ * condensation call to resolve in the background while the main loop keeps
+ * making forward progress.
+ *
+ * PROVISIONAL: part 1's real per-iteration conversation-size data (the
+ * lastPromptTokens field added to the `[usage] running total` line) is what
+ * this number is supposed to be derived from — the conversation-size point
+ * where prompt-cache degradation becomes significant. That data requires a
+ * real long session, which is a later round's natural by-product; until it
+ * lands, 0.6 is a documented, TUNABLE interim value (--condense-early-fire),
+ * not a magic constant imported from anywhere. Re-derive it from fresh data
+ * before trusting it.
+ */
+export const DEFAULT_CONDENSE_EARLY_FIRE_FRACTION = 0.6
+
+/**
  * Conservative default context window (tokens) when the real value cannot be
  * resolved from OpenRouter's models endpoint AND no override is configured.
  * Deliberately conservative (deepseek/deepseek-v4-flash's official endpoint
@@ -239,6 +258,28 @@ export function computeCondenseCount(
 }
 
 /**
+ * Shared token-budget math for BOTH condensation paths: how many tokens the
+ * next request should target after condensation (half the hard threshold —
+ * enough that we don't re-cross it every single call) and how many oldest
+ * messages that corresponds to condensing (tool-call-group-safe, via
+ * `computeCondenseCount`). The synchronous path (`maybeCondense`) and the
+ * async early-fire path (HeadlessSession.fireBackgroundCondense) derive the
+ * SAME boundary from the SAME helper — never two independent implementations
+ * of the boundary rule.
+ */
+export function computeCondensePlan(
+	messages: ChatMessage[],
+	lastPromptTokens: number,
+	contextWindowTokens: number,
+	thresholdFraction: number,
+): { targetTokens: number; wantTokens: number; count: number } {
+	const targetTokens = Math.max(1, Math.floor(contextWindowTokens * thresholdFraction * 0.5))
+	const wantTokens = Math.max(1, lastPromptTokens - targetTokens)
+	const count = computeCondenseCount(messages, wantTokens)
+	return { targetTokens, wantTokens, count }
+}
+
+/**
  * Shared tool-call-group-safe count computation for `truncateHistory`'s
  * message-count eviction: how many messages to drop from index 2 onward
  * (returned as a COUNT to drop, so the caller keeps system+firstUser).
@@ -358,7 +399,6 @@ export async function maybeCondense(options: {
 		llmClient,
 		logger,
 		messages,
-		model,
 		lastPromptTokens,
 		contextWindowTokens,
 		thresholdFraction,
@@ -396,10 +436,9 @@ export async function maybeCondense(options: {
 		// Condense enough that the next request lands comfortably below the
 		// threshold (target = half the threshold), so we don't re-cross it
 		// every single call. MIN_KEPT_TAIL_MESSAGES in computeCondenseCount
-		// keeps the recent tail verbatim regardless.
-		const targetTokens = Math.max(1, Math.floor(contextWindowTokens * thresholdFraction * 0.5))
-		const wantTokens = Math.max(1, lastPromptTokens - targetTokens)
-		const count = computeCondenseCount(messages, wantTokens)
+		// keeps the recent tail verbatim regardless. Same shared math as the
+		// async early-fire path (computeCondensePlan).
+		const { count } = computeCondensePlan(messages, lastPromptTokens, contextWindowTokens, thresholdFraction)
 		if (count < 2) {
 			return null
 		}
@@ -415,7 +454,12 @@ export async function maybeCondense(options: {
 			summary = await condenseOldestTurns(llmClient, {
 				messages,
 				count,
-				model,
+				// condenseModel (NOT model): the whole point of the `_condensation`
+				// mode-models key / --condense-model flag is that this call may use
+				// a cheaper model than the session's — and recordCondensationUsage
+				// already accounts its cost under condenseModel. Routing the call
+				// to `model` silently ignored the flag (call + accounting disagreed).
+				model: condenseModel,
 				maxTokens: condenseMaxTokens,
 				signal: condenseAbortSignal,
 				onUsage,

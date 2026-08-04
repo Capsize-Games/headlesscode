@@ -85,10 +85,15 @@ import type {
 } from "./types.js"
 import type { ModeConfig } from "@roo-code/types"
 import {
+	buildCondensedMessage,
+	computeCondensePlan,
 	computeEvictCount,
+	condenseOldestTurns,
+	DEFAULT_CONDENSE_EARLY_FIRE_FRACTION,
 	DEFAULT_CONDENSE_THRESHOLD_FRACTION,
 	DEFAULT_CONTEXT_WINDOW_TOKENS,
 	maybeCondense,
+	MIN_CONDENSE_TAIL_GROWTH,
 	skipOrphanedToolMessages,
 } from "./condense.js"
 import { runLocalExplorePhase, type LocalExploreOptions, type LocalExploreResult } from "./local-explore.js"
@@ -399,6 +404,16 @@ export interface HeadlessSessionConfig {
 	 */
 	condenseThresholdFraction?: number
 	/**
+	 * Async/background condensation (plans/smart-condensation-async.md): the
+	 * fraction of the context window at which the condensation LLM call fires
+	 * EARLY, in the background against a snapshot, while the main loop keeps
+	 * running (default DEFAULT_CONDENSE_EARLY_FIRE_FRACTION = 0.6 — below the
+	 * hard threshold; PROVISIONAL, tune from part-1 real data). Must be below
+	 * `condenseThresholdFraction`; when it isn't, the async path is safely off
+	 * and only the synchronous hard-threshold path runs.
+	 */
+	condenseEarlyFireFraction?: number
+	/**
 	 * Phase 3 context condensation: model id used for the condensation LLM
 	 * call (default: the session model). A cheaper model can be assigned via
 	 * the `_condensation` key in `<workspaceRoot>/.headlesscode/mode-models.json`
@@ -551,6 +566,8 @@ export interface ResolvedSessionConfig {
 	contextWindowTokens?: number
 	/** Phase 3 context condensation: resolved trigger fraction. */
 	condenseThresholdFraction: number
+	/** Async/background condensation: resolved early-fire fraction (below the hard threshold). */
+	condenseEarlyFireFraction: number
 	/** Phase 3 context condensation: model used for the condensation call. */
 	condenseModel: string
 	/** Phase 3 context condensation: max output tokens for the condensation call. */
@@ -662,6 +679,36 @@ export class HeadlessSession {
 	/** True while a condensation LLM call is in flight (see maybeCondense). */
 	private readonly condenseInFlight: { value: boolean } = { value: false }
 	/**
+	 * Async/background condensation (plans/smart-condensation-async.md part
+	 * 2): the single in-flight background condensation job, or null. Fired
+	 * BEFORE the hard threshold is crossed (see fireBackgroundCondense), the
+	 * call runs against an immutable SNAPSHOT while the main loop keeps
+	 * appending; when it resolves, applyBackgroundCondense splices the summary
+	 * into the LIVE history at the re-resolved boundary, or discards it (slow
+	 * background superseded by the synchronous path / session ended). One job
+	 * at a time by design — "needs another one soon after" is a signal the
+	 * early-fire fraction needs tuning, not a case for overlapping calls. The
+	 * job itself is fire-and-forget (no general background-task framework); a
+	 * Promise kicked off without awaiting, tracked here, is enough.
+	 */
+	private backgroundCondense: {
+		/** Immutable prefix [0, 2+count) the call summarized (reference slice — messages are never mutated once pushed). */
+		snapshot: ChatMessage[]
+		/** How many messages from index 2 the summary replaces. */
+		count: number
+		/** The iteration at which the background job was fired (for logs/events). */
+		firedAtIteration: number
+	} | null = null
+	/**
+	 * Set once the session's iteration loop has finished (attempt_completion,
+	 * error, budget abort, max iterations — every exit). A background
+	 * condensation resolving after this must DISCARD its result, not splice a
+	 * message array that's already been consumed by completion (see
+	 * applyBackgroundCondense); its usage has already landed in the
+	 * BudgetTracker either way.
+	 */
+	private sessionEnded = false
+	/**
 	 * True once the real context window has been resolved (from config, the
 	 * OpenRouter models endpoint, or the conservative default) — the lookup
 	 * is done at most once per session, on the first iteration that needs it.
@@ -770,6 +817,7 @@ export class HeadlessSession {
 			// DEFAULT_CONTEXT_WINDOW_TOKENS as the conservative fallback.
 			contextWindowTokens: config.contextWindowTokens,
 			condenseThresholdFraction: config.condenseThresholdFraction ?? DEFAULT_CONDENSE_THRESHOLD_FRACTION,
+			condenseEarlyFireFraction: config.condenseEarlyFireFraction ?? DEFAULT_CONDENSE_EARLY_FIRE_FRACTION,
 			condenseModel: config.condenseModel ?? config.model ?? process.env.OPENROUTER_MODEL ?? DEFAULT_MODEL,
 			condenseMaxTokens: config.condenseMaxTokens,
 			logger: config.logger,
@@ -1067,6 +1115,11 @@ export class HeadlessSession {
 			// tool call timing out mid-session does NOT trigger this: the child
 			// keeps running until the session actually ends, exactly as the
 			// vendored execute_command timeout contract promises.
+			// The iteration loop is over on every path — a background
+			// condensation resolving from here on must discard, not splice a
+			// message array already consumed by completion (see
+			// applyBackgroundCondense).
+			this.sessionEnded = true
 			this.executor.dispose()
 		}
 		await this.recordMemory(result)
@@ -1297,52 +1350,21 @@ export class HeadlessSession {
 		}
 		const config = this.config
 
-		// Resolve the real context window at most once per session: explicit
-		// config wins, then a live OpenRouter lookup (the same
-		// /api/v1/models/<id>/endpoints source the pricing table was verified
-		// against), then the conservative default.
-		let contextWindowTokens = config.contextWindowTokens
-		if (contextWindowTokens === undefined) {
-			if (this.resolvedContextWindowTokens !== undefined) {
-				// Already resolved live earlier THIS session — reuse it. Without
-				// this branch, every check after the first silently fell back to
-				// DEFAULT_CONTEXT_WINDOW_TOKENS forever (see the field's doc
-				// comment): contextWindowResolved recorded that a lookup was
-				// ATTEMPTED, but the value it resolved to was never cached.
-				contextWindowTokens = this.resolvedContextWindowTokens
-			} else {
-				contextWindowTokens = DEFAULT_CONTEXT_WINDOW_TOKENS
-				if (!this.contextWindowResolved) {
-					this.contextWindowResolved = true
-					const client = this.llmClient as {
-						fetchModelContextWindow?: (model: string) => Promise<number | undefined>
-					}
-					try {
-						const live = await client.fetchModelContextWindow?.(config.model)
-						if (live !== undefined && live > 0) {
-							contextWindowTokens = live
-							this.resolvedContextWindowTokens = live
-							this.logger.info("[condense] resolved live context window from OpenRouter models endpoint", {
-								model: config.model,
-								contextWindowTokens: live,
-							})
-						} else {
-							// Silent-undefined is the common failure mode (lookup
-							// returned nothing, not an exception) — log it so a
-							// fallback to 128k is always visible in harness.log.
-							this.logger.warn("[condense] live context-window lookup returned no value (non-fatal; using conservative default)", {
-								model: config.model,
-								contextWindowTokens,
-							})
-						}
-					} catch (error) {
-						this.logger.warn("[condense] live context-window lookup failed (non-fatal; using conservative default)", {
-							error: error instanceof Error ? error.message : String(error),
-						})
-					}
-				}
-			}
-		}
+		// Resolve the real context window at most once per session (explicit
+		// config, then a live OpenRouter lookup, then the conservative default
+		// — see resolveContextWindowTokens).
+		const contextWindowTokens = await this.resolveContextWindowTokens()
+
+		// Async early-fire (plans/smart-condensation-async.md part 2): when
+		// the last request's real size is inside the EARLY window (above the
+		// early-fire fraction, below the hard threshold), kick off the
+		// condensation LLM call in the background against an immutable snapshot
+		// and keep going — the splice lands when it resolves (see
+		// applyBackgroundCondense). This is latency-hiding, NOT a replacement
+		// for the synchronous hard-threshold path below: a slow or failed
+		// background job must never delay or suppress it (the hard fallback is
+		// the load-bearing safety property of the design).
+		this.fireBackgroundCondense(iteration, messages, budgetTracker, contextWindowTokens)
 
 		try {
 			const condensed = await maybeCondense({
@@ -1400,6 +1422,276 @@ export class HeadlessSession {
 			})
 			return messages
 		}
+	}
+
+	/**
+	 * Resolve the model's real context window at most once per session:
+	 * explicit config wins, then a live OpenRouter lookup (the same
+	 * /api/v1/models/<id>/endpoints source the pricing table was verified
+	 * against — see src/llm/openrouter.ts's fetchModelContextWindow), then the
+	 * conservative default. The resolved value is cached on the session
+	 * (`resolvedContextWindowTokens`) so every later check reuses it instead
+	 * of re-defaulting to 128k — the 2026-08-04 bug fix (the boolean alone
+	 * recorded that a lookup was ATTEMPTED, never what it resolved TO). Shared
+	 * by the synchronous condensation check and the async early-fire check.
+	 */
+	private async resolveContextWindowTokens(): Promise<number> {
+		const config = this.config
+		if (config.contextWindowTokens !== undefined) {
+			return config.contextWindowTokens
+		}
+		if (this.resolvedContextWindowTokens !== undefined) {
+			// Already resolved live earlier THIS session — reuse it.
+			return this.resolvedContextWindowTokens
+		}
+		let contextWindowTokens = DEFAULT_CONTEXT_WINDOW_TOKENS
+		if (!this.contextWindowResolved) {
+			this.contextWindowResolved = true
+			const client = this.llmClient as {
+				fetchModelContextWindow?: (model: string) => Promise<number | undefined>
+			}
+			try {
+				const live = await client.fetchModelContextWindow?.(config.model)
+				if (live !== undefined && live > 0) {
+					contextWindowTokens = live
+					this.resolvedContextWindowTokens = live
+					this.logger.info("[condense] resolved live context window from OpenRouter models endpoint", {
+						model: config.model,
+						contextWindowTokens: live,
+					})
+				} else {
+					// Silent-undefined is the common failure mode (lookup
+					// returned nothing, not an exception) — log it so a
+					// fallback to 128k is always visible in harness.log.
+					this.logger.warn("[condense] live context-window lookup returned no value (non-fatal; using conservative default)", {
+						model: config.model,
+						contextWindowTokens,
+					})
+				}
+			} catch (error) {
+				this.logger.warn("[condense] live context-window lookup failed (non-fatal; using conservative default)", {
+					error: error instanceof Error ? error.message : String(error),
+				})
+			}
+		}
+		return contextWindowTokens
+	}
+
+	/**
+	 * Async/background condensation (plans/smart-condensation-async.md part
+	 * 2): when the last request's real prompt-token count is inside the EARLY
+	 * window (above `condenseEarlyFireFraction`, below the hard threshold),
+	 * fire the condensation LLM call against an immutable SNAPSHOT of the
+	 * messages and DON'T await it — the main loop keeps appending. On resolve,
+	 * `applyBackgroundCondense` splices the summary into the live history at
+	 * the re-resolved boundary; on failure it's a logged, non-fatal wasted
+	 * call. The synchronous hard-threshold path is the load-bearing safety net
+	 * and is NEVER suppressed by a pending background job (this method never
+	 * touches `condenseInFlight`).
+	 *
+	 * One in-flight background job at a time (`backgroundCondense`); firing a
+	 * second while the first is pending is deliberately NOT handled — a
+	 * conversation that still needs another condensation right after one
+	 * resolved is a signal the early-fire fraction needs tuning, not a case to
+	 * solve by overlapping calls.
+	 */
+	private fireBackgroundCondense(
+		iteration: number,
+		messages: ChatMessage[],
+		budgetTracker: BudgetTracker,
+		contextWindowTokens: number,
+	): void {
+		const config = this.config
+		const lastPromptTokens = this.lastLlmUsage?.inputTokens ?? 0
+		const hardThreshold = Math.max(1, contextWindowTokens * config.condenseThresholdFraction)
+		const earlyThreshold = Math.max(1, contextWindowTokens * config.condenseEarlyFireFraction)
+		// Misconfigured early-fire fraction (>= the hard threshold): the early
+		// window is empty — the async path is safely OFF (sync-only) rather
+		// than erroring.
+		if (earlyThreshold >= hardThreshold) {
+			return
+		}
+		// Only the early window is ours: below it there's nothing to hide yet;
+		// at/above the hard threshold the SYNCHRONOUS path owns the decision
+		// (and must never find a background job standing in its way).
+		if (!(earlyThreshold <= lastPromptTokens && lastPromptTokens < hardThreshold)) {
+			return
+		}
+		if (this.backgroundCondense !== null) {
+			return // one in-flight background condensation at a time
+		}
+		if (this.condenseInFlight.value) {
+			return // a synchronous condensation is running — don't overlap it
+		}
+		// Same batch-once-stable guard as the synchronous path: after a
+		// condensation the uncompressed tail must re-grow meaningfully before
+		// condensing again, or the sent prefix would be rewritten every call
+		// and defeat provider-side prompt caching.
+		const alreadyCondensed = this.condensedUpToMsgIndex.value > 2
+		if (alreadyCondensed && messages.length - this.condensedUpToMsgIndex.value < MIN_CONDENSE_TAIL_GROWTH) {
+			return
+		}
+		// Same shared boundary math as the sync path (computeCondensePlan →
+		// computeCondenseCount): the snapshot boundary is tool-call-group-safe
+		// BY CONSTRUCTION at fire time (re-verified against the live state at
+		// apply time).
+		const plan = computeCondensePlan(messages, lastPromptTokens, contextWindowTokens, config.condenseThresholdFraction)
+		if (plan.count < 2) {
+			return
+		}
+		// Snapshot, don't share state: the call works against ONLY this array.
+		// Message objects are never mutated once pushed (the loop only appends;
+		// the one in-place mutation is the condensation splice itself), so a
+		// reference slice is a stable, immutable-in-practice snapshot while the
+		// live array keeps growing under the main loop.
+		const snapshot = messages.slice(0, 2 + plan.count)
+		this.logger.info("[condense] early-fire background condensation — hiding latency", {
+			iteration,
+			lastPromptTokens,
+			earlyThreshold: Math.round(earlyThreshold),
+			hardThreshold: Math.round(hardThreshold),
+			count: plan.count,
+			condenseModel: config.condenseModel,
+		})
+		const job = { snapshot, count: plan.count, firedAtIteration: iteration }
+		this.backgroundCondense = job
+		condenseOldestTurns(this.llmClient, {
+			messages: snapshot,
+			count: plan.count,
+			model: config.condenseModel,
+			maxTokens: config.condenseMaxTokens ?? config.maxTokens,
+			onUsage: (usage) => this.recordCondensationUsage(usage, budgetTracker),
+		})
+			.then(async (summary) => {
+				// The job is done (applied or discarded) — a NEW background job
+				// may fire on a later iteration.
+				this.backgroundCondense = null
+				await this.applyBackgroundCondense(job, summary)
+			})
+			.catch((error) => {
+				this.backgroundCondense = null
+				if (error instanceof BudgetExceededError) {
+					// Budget trip from the background call's OWN accounting: the
+					// usage was already recorded into the tracker, so the NEXT
+					// budgetTracker.tick() in the loop aborts the session exactly
+					// like a main call's record() trip — the same
+					// non-fatal-here / fatal-next-tick pattern as
+					// recordAuxLlmUsage.
+					this.logger.warn("[condense] background condensation tripped the budget (next tick aborts the session)", {
+						iteration,
+						error: error.message,
+						costUsd: budgetTracker.totalCostUsd,
+					})
+					return
+				}
+				this.logger.warn("[condense] background condensation call failed (non-fatal; synchronous hard-threshold path still applies)", {
+					iteration,
+					error: error instanceof Error ? error.message : String(error),
+				})
+			})
+	}
+
+	/**
+	 * Apply a resolved background condensation to the LIVE history, or discard
+	 * it. The splice point is re-resolved against the CURRENT state, never the
+	 * stale snapshot:
+	 *   - session already ended → discard (a wasted-but-harmless call; its
+	 *     usage already landed in the BudgetTracker via recordCondensationUsage);
+	 *   - a synchronous condensation is in flight → discard (it will splice the
+	 *     same region itself on completion; applying on top would double-
+	 *     condense and corrupt the history — the sync path is authoritative);
+	 *   - the live prefix no longer matches the snapshot → discard (something
+	 *     upstream of the snapshot point was mutated — the stable-prefix
+	 *     assumption is verified explicitly, never silently);
+	 *   - the boundary lands mid tool-call-group → discard (the same DeepSeek
+	 *     HTTP 400 class of bug the sync path's computeCondenseCount prevents).
+	 * Otherwise the summary replaces [2, 2+count) of the live array, exactly
+	 * as the synchronous path would have, and `condensedUpToMsgIndex` advances
+	 * so the batch-once-stable guard applies to later re-fires.
+	 */
+	private async applyBackgroundCondense(
+		job: { snapshot: ChatMessage[]; count: number; firedAtIteration: number },
+		summary: string,
+	): Promise<void> {
+		const config = this.config
+		if (this.sessionEnded) {
+			this.logger.info("[condense] background condensation resolved after session end — discarded (wasted-but-harmless call)", {
+				firedAtIteration: job.firedAtIteration,
+				count: job.count,
+				condenseModel: config.condenseModel,
+			})
+			return
+		}
+		const messages = this.state.messages
+		const boundary = 2 + job.count
+		if (this.condenseInFlight.value) {
+			// The synchronous path is mid-call right now (the hard threshold
+			// was hit while this background job was still pending). It will
+			// replace the array itself on completion — applying this result on
+			// top would double-condense. The sync path is authoritative.
+			this.logger.info("[condense] background condensation superseded by the synchronous path — discarded", {
+				firedAtIteration: job.firedAtIteration,
+			})
+			return
+		}
+		// Verify the stable-prefix assumption explicitly (reference equality
+		// per index is authoritative: message objects are never mutated in
+		// place once pushed). If the prefix drifted — e.g. a synchronous
+		// condensation already ran while this job was pending — the snapshot
+		// boundary no longer exists in the live array and the splice must not
+		// apply blindly.
+		if (!messagesPrefixEquals(messages, job.snapshot)) {
+			this.logger.warn("[condense] background condensation discarded — live prefix no longer matches the snapshot", {
+				firedAtIteration: job.firedAtIteration,
+				count: job.count,
+			})
+			return
+		}
+		// Tool-call-group boundary safety against the CURRENT state, reusing
+		// the sync path's shared helper: the kept tail must never start with
+		// an orphaned `tool` message. The snapshot boundary was group-safe at
+		// fire time, so a skip here means the live prefix drifted — discard
+		// rather than produce a request strict providers would HTTP 400.
+		if (skipOrphanedToolMessages(messages, boundary) !== boundary) {
+			this.logger.warn("[condense] background condensation discarded — boundary landed mid tool-call group", {
+				firedAtIteration: job.firedAtIteration,
+			})
+			return
+		}
+		const messagesBefore = messages.length
+		const condensed: ChatMessage[] = [
+			messages[0],
+			messages[1],
+			buildCondensedMessage(summary),
+			...messages.slice(boundary),
+		]
+		messages.splice(0, messages.length, ...condensed)
+		// Advance the marker BEFORE any await so a re-fire on a later iteration
+		// hits the batch-once-stable guard (the sent prefix with the summary at
+		// index 2 stays byte-identical across calls — what prompt caching needs).
+		this.condensedUpToMsgIndex.value = 3
+		this.logger.info("[condense] background condensation applied", {
+			firedAtIteration: job.firedAtIteration,
+			count: job.count,
+			historyBefore: messagesBefore,
+			historyAfter: condensed.length,
+		})
+		// Same feed event the synchronous path emits (see maybeCondenseHistory)
+		// so the dashboard timeline shows background condensation too. Non-fatal.
+		await this.emitEvent("condensed", () =>
+			this.eventFeed.condensed({
+				iteration: job.firedAtIteration,
+				messagesBefore,
+				messagesAfter: condensed.length,
+				...(this.lastCondenseUsage
+					? {
+							inputTokens: this.lastCondenseUsage.inputTokens,
+							outputTokens: this.lastCondenseUsage.outputTokens,
+							cachedTokens: this.lastCondenseUsage.cachedTokens,
+						}
+					: {}),
+			}),
+		)
 	}
 
 	/**
@@ -1604,6 +1896,15 @@ export class HeadlessSession {
 							throw err
 						}
 					}
+					// The cumulative fields above are dominated by repeatedly-billed
+					// cache reads of the same growing prefix, once per turn — they
+					// do NOT represent the current conversation size (see
+					// plans/smart-condensation-async.md part 1). The per-iteration
+					// fields below are the REAL last single request's numbers, the
+					// same values the condensation trigger uses: the right unit for
+					// choosing condensation timing, and for correlating cache-hit
+					// rate (lastCachedTokens / lastPromptTokens) with conversation
+					// growth. Both are already in memory — logged, not computed.
 					this.logger.info("[usage] running total", {
 						iteration,
 						costUsd: budgetTracker.totalCostUsd,
@@ -1611,6 +1912,8 @@ export class HeadlessSession {
 						inputTokens: this.totalInputTokens,
 						outputTokens: this.totalOutputTokens,
 						cachedTokens: this.totalCachedTokens,
+						lastPromptTokens: this.lastLlmUsage?.inputTokens,
+						lastCachedTokens: this.lastLlmUsage?.cachedTokens,
 					})
 					// Live (in-progress) usage snapshot: overwritten in place each
 					// iteration so the dashboard can show this still-running
@@ -2595,6 +2898,27 @@ export function summarizeToolArg(name: string, args: Record<string, unknown>): s
 
 /** Batch size for truncateHistory's eviction — see its own doc comment for why. */
 export const TRUNCATION_BATCH_SIZE = 10
+
+/**
+ * Verify the stable-prefix assumption for a background condensation
+ * (applyBackgroundCondense): the live history must still hold the SAME
+ * message objects at [0, snapshot.length) as the snapshot the background call
+ * summarized. Messages are never mutated in place once pushed (the loop only
+ * appends; the one in-place mutation is the condensation splice, which
+ * REPLACES whole prefix entries), so reference equality per index is
+ * authoritative and cheap — no deep compare needed.
+ */
+function messagesPrefixEquals(live: ChatMessage[], snapshot: ChatMessage[]): boolean {
+	if (live.length < snapshot.length) {
+		return false
+	}
+	for (let i = 0; i < snapshot.length; i++) {
+		if (live[i] !== snapshot[i]) {
+			return false
+		}
+	}
+	return true
+}
 
 /**
  * Phase 1 sliding-window truncation: keep the system message and the first
