@@ -49,21 +49,30 @@ export const runTestsTool = {
 	function: {
 		name: RUN_TESTS_NAME,
 		description: RUN_TESTS_DESCRIPTION,
-		strict: true,
+		// Note: strict mode is intentionally disabled for this tool (mirrors
+		// read_command_output.ts's precedent). With strict: true, every
+		// property must be in `required`, which forces nullable-union types
+		// (`type: ["array", "null"]`) for genuinely optional params so the
+		// model can omit them — DeepSeek's OpenRouter endpoint rejects that
+		// union-type syntax outright ("unknown variant `array`, expected one
+		// of `string`, `number`, `integer`, `boolean`, `null`"), breaking
+		// EVERY session's very first request since the tool list itself is
+		// sent up front. Plain, non-strict optional properties avoid this
+		// entirely and match how ask_followup_question's `follow_up`
+		// (required) array param is already declared elsewhere.
 		parameters: {
 			type: "object",
 			properties: {
 				paths: {
-					type: ["array", "null"],
+					type: "array",
 					items: { type: "string" },
 					description: RT_PATHS_PARAMETER_DESCRIPTION,
 				},
 				timeout: {
-					type: ["integer", "null"],
+					type: "integer",
 					description: RT_TIMEOUT_PARAMETER_DESCRIPTION,
 				},
 			},
-			required: ["paths", "timeout"],
 			additionalProperties: false,
 		},
 	},
