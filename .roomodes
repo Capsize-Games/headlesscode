@@ -93,12 +93,19 @@ customModes:
          gather context through conversation the same way that mode
          would — ask clarifying questions, use `codebase_search`/
          `outline`/`go_to_definition`/`read_file` to ground the plan in
-         the real current state of the code, not assumption.
+         the real current state of the code, not assumption. Grounding
+         means capturing the ACTUAL file:line locations those tools
+         return and citing them in the written plan doc — not just
+         using the tools to inform a narrative description.
       2. Write the plan directly to `plans/<short-slug>.md` — full
          sections (who it's for, what to build, what NOT to do, tests,
          verification checklist, what to report back), matching this
          project's existing plan docs' structure and level of detail
          (read a couple of recently-merged ones), not a brief todo list.
+         Every instruction or finding that references existing code must
+         carry the verified file:line location from step 1's exploration
+         (see `.roo/rules/rules.md`'s citation requirement) — the written
+         plan doc is where those citations land.
       3. Ask the user if the plan looks right before handing off — this
          is the checkpoint, not something to skip because a mode switch
          requires approval anyway.
