@@ -20,11 +20,13 @@ Read both files before starting so you write under the new requirement.
 ## Your deliverable
 
 Write ONE complete, self-contained plan doc: `plans/checkpoints-list-limit.md`
-in this worktree, in this repo's existing plan-doc format (who it's for /
-what to build / what NOT to do / tests / verification checklist / what to
-report back — read a couple of recently-merged ones under `plans/` for the
-shape). The doc plans a small, real feature: a `--limit <n>` option on the
-`headlesscode checkpoints list` command.
+in this worktree, using the `write_to_file` tool — the file must PHYSICALLY
+EXIST in the worktree when you finish (a plan doc that exists only in your
+reply text is a failure). Use this repo's existing plan-doc format (who it's
+for / what to build / what NOT to do / tests / verification checklist / what
+to report back — read a couple of recently-merged ones under `plans/` for
+the shape). The doc plans a small, real feature: a `--limit <n>` option on
+the `headlesscode checkpoints list` command.
 
 ## The task to plan (modest scope — do not expand it)
 
@@ -44,13 +46,21 @@ shape). The doc plans a small, real feature: a `--limit <n>` option on the
 
 Every specific instruction or finding in your plan doc that references
 existing code MUST cite a real file path and line number/range, verified by
-actually reading or grepping the file at writing time (`codebase_search`/
-`outline`/`go_to_definition`/`read_file`/`search_files` — and check the
-actual current line numbers, don't trust memory). Do not write "the
-checkpoints CLI" where you could write `src/checkpoints/cli.ts:NN-NN`. If a
-line range you are about to cite doesn't match what you actually find,
-correct it to the real number before writing it down. Narrative context is
-fine, but every concrete code reference carries a verified location.
+ACTUALLY READING the file at writing time (`read_file`/`search_files`/
+`codebase_search`/`outline`/`go_to_definition` — check the real current line
+numbers, don't trust memory). Do not write "the checkpoints CLI" where you
+could write `src/checkpoints/cli.ts:NN-NN`. If a line range you are about to
+cite doesn't match what you actually find, correct it to the real number
+before writing it down. Narrative context is fine, but every concrete code
+reference carries a verified location.
+
+**Tool use is mandatory.** You MUST call `read_file` (or `search_files`/
+`codebase_search`) on the actual files — `src/checkpoints/cli.ts`,
+`src/checkpoints/service.ts`, the tests under `src/checkpoints/__tests__/`
+(real filename: `service.test.ts`) — BEFORE writing any citation. A citation
+whose line numbers you did not personally verify by reading the file is a
+hallucination; never write one. A plan doc written without a single tool
+call is an automatic FAILURE of this session.
 
 ## Constraints — headless session, no user to ask
 
