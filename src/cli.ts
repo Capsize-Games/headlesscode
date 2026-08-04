@@ -73,6 +73,14 @@ interface CliOptions {
 	 */
 	condenseThreshold?: number
 	/**
+	 * Async/background condensation: fraction of the context window at which
+	 * the condensation LLM call fires EARLY in the background (default
+	 * DEFAULT_CONDENSE_EARLY_FIRE_FRACTION in src/engine/condense.ts). Must be
+	 * below the hard `condenseThreshold`; when it isn't, the async path is off
+	 * and only the synchronous hard-threshold path runs.
+	 */
+	condenseEarlyFire?: number
+	/**
 	 * Phase 3 context condensation: model id for the condensation call
 	 * (default: the session model, or the `_condensation` key in
 	 * .headlesscode/mode-models.json).
@@ -212,6 +220,11 @@ Options:
   --condense-threshold <f>   Phase 3 context condensation: fraction of the context
                              window at which the oldest turns are condensed into one
                              summary (default: 0.75; must be between 0 and 1)
+  --condense-early-fire <f>  Async condensation: fraction of the context window at
+                             which the condensation LLM call fires EARLY, in the
+                             background against a snapshot, while the loop keeps
+                             running (default: 0.6, provisional — must be below
+                             --condense-threshold or the async path is off)
   --condense-model <id>      Phase 3 context condensation: model id for the
                              condensation call (default: the session model, or the
                              _condensation key in .headlesscode/mode-models.json)
@@ -428,6 +441,15 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 					return { options, error: "--condense-threshold requires a fraction between 0 and 1 (e.g. 0.75)" }
 				}
 				options.condenseThreshold = num
+				break
+			}
+			case "--condense-early-fire": {
+				const value = next()
+				const num = value === undefined ? Number.NaN : Number(value)
+				if (!Number.isFinite(num) || num <= 0 || num >= 1) {
+					return { options, error: "--condense-early-fire requires a fraction between 0 and 1 (e.g. 0.6)" }
+				}
+				options.condenseEarlyFire = num
 				break
 			}
 			case "--condense-model": {
@@ -794,6 +816,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		windowSize: options.windowSize,
 		contextWindowTokens: options.contextWindowTokens,
 		condenseThresholdFraction: options.condenseThreshold,
+		condenseEarlyFireFraction: options.condenseEarlyFire,
 		condenseModel,
 		llmTimeoutMs: options.llmTimeoutMs,
 		stream: options.stream,

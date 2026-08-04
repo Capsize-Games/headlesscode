@@ -24,7 +24,9 @@ export {
 	maybeCondense,
 	condenseOldestTurns,
 	computeCondenseCount,
+	computeCondensePlan,
 	DEFAULT_CONDENSE_THRESHOLD_FRACTION,
+	DEFAULT_CONDENSE_EARLY_FIRE_FRACTION,
 	DEFAULT_CONTEXT_WINDOW_TOKENS,
 } from "./engine/condense.js"
 export {
