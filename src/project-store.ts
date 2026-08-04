@@ -150,8 +150,14 @@ export function resolveProjectDataDir(workspaceRoot: string): string {
 	const key = projectKeyFor(keySource)
 	const dir = path.join(projectStoreRoot(), "projects", key)
 	projectDirCache.set(root, dir)
-	writeProjectMetadata(dir, keySource, kind)
+	// Under a $HEADLESSCODE_DATA_DIR override neither the metadata write nor
+	// the migration touches the store: the override means "test/scratch —
+	// don't leave real store entries behind" (direct test runs construct
+	// executors against throwaway /tmp workspaces; without this guard every
+	// one of them would litter the real ~/.local/share/headlesscode with a
+	// projects/<hash>/project.json stub).
 	if (!storeOverridden()) {
+		writeProjectMetadata(dir, keySource, kind)
 		migrateLegacyProjectData(root, keySource, dir)
 	}
 	return dir
@@ -161,7 +167,7 @@ export function resolveProjectDataDir(workspaceRoot: string): string {
 export const PROJECT_METADATA_FILE = "project.json"
 
 /** Write `<project-key>/project.json` once (path the key was derived from + first-seen). */
-function writeProjectMetadata(dir: string, keySource: string, kind: ProjectIdentity["kind"]): void {
+export function writeProjectMetadata(dir: string, keySource: string, kind: ProjectIdentity["kind"]): void {
 	try {
 		const metaPath = path.join(dir, PROJECT_METADATA_FILE)
 		if (fs.existsSync(metaPath)) {

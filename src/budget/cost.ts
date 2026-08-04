@@ -117,6 +117,101 @@ export const DEFAULT_PRICING_TABLE: PricingTable = {
  */
 export const FALLBACK_MODEL_PRICE: ModelPrice = { input: 2.0, output: 8.0 }
 
+/** One endpoint entry of OpenRouter's `/api/v1/models/<id>/endpoints` response. */
+export interface EndpointPricingEntry {
+	/** Provider slug as OpenRouter reports it (e.g. "DeepSeek", "DeepInfra"). */
+	provider_name?: unknown
+	/** Per-token prices as STRINGS, USD per token (verified live 2026-08-04). */
+	pricing?: {
+		prompt?: unknown
+		completion?: unknown
+		input_cache_read?: unknown
+	}
+}
+
+/** Parse a per-token USD string like "0.00000014" into per-1M-token USD. */
+function perTokenToPerMillion(value: unknown): number | undefined {
+	if (typeof value !== "string" && typeof value !== "number") {
+		return undefined
+	}
+	const n = typeof value === "string" ? Number(value) : value
+	if (!Number.isFinite(n) || n < 0) {
+		return undefined
+	}
+	return n * 1_000_000
+}
+
+/**
+ * Parse live endpoint pricing into a `ModelPrice` (USD per 1M tokens).
+ *
+ * Selection rules, mirroring how the request actually routes:
+ * - When `providerPreference` is given (e.g. "DeepSeek" for the deepseek/*
+ *   chat pin), the FIRST endpoint whose provider_name matches (case-
+ *   insensitive) is used verbatim — that is the price actually charged.
+ * - Otherwise the MAX of each field across all endpoints that expose it is
+ *   used. This is a deliberate fail-closed choice: for auto-routed models the
+ *   harness cannot know which endpoint served a call, and this table is a
+ *   GUARDRAIL (the codebase's FALLBACK_MODEL_PRICE rationale) — over-
+ *   estimating is safe, under-estimating lets a cap be bypassed.
+ *
+ * Returns undefined when no endpoint exposes usable pricing.
+ */
+export function parseEndpointPricing(
+	endpoints: EndpointPricingEntry[],
+	providerPreference?: string,
+): ModelPrice | undefined {
+	let price: ModelPrice | undefined
+	for (const ep of endpoints) {
+		const pricing = ep?.pricing
+		if (!pricing || typeof pricing !== "object") {
+			continue
+		}
+		const parsed: ModelPrice = {
+			input: perTokenToPerMillion(pricing.prompt) ?? 0,
+			output: perTokenToPerMillion(pricing.completion) ?? 0,
+		}
+		if (parsed.input === 0 && parsed.output === 0) {
+			continue
+		}
+		const cacheRead = perTokenToPerMillion(pricing.input_cache_read)
+		if (cacheRead !== undefined) {
+			parsed.cacheRead = cacheRead
+		}
+		// Provider-preference match wins outright (first match — a match
+		// returns immediately, so reaching the end without returning means no
+		// usable match existed).
+		if (providerPreference) {
+			const name = typeof ep?.provider_name === "string" ? ep.provider_name : ""
+			if (name.toLowerCase() === providerPreference.toLowerCase()) {
+				return parsed
+			}
+		}
+		// Otherwise keep the conservative per-field max.
+		price = {
+			input: Math.max(price?.input ?? 0, parsed.input),
+			output: Math.max(price?.output ?? 0, parsed.output),
+			...(cacheRead !== undefined
+				? { cacheRead: Math.max(price?.cacheRead ?? 0, cacheRead) }
+				: price?.cacheRead !== undefined
+					? { cacheRead: price.cacheRead }
+					: {}),
+		}
+	}
+	// A preference was requested but no endpoint matched it — return nothing
+	// so the caller falls back to the hardcoded table (for deepseek/* that
+	// table IS the official endpoint's rate; using some other host's numbers
+	// for a pinned model would be wrong).
+	if (providerPreference) {
+		return undefined
+	}
+	return price
+}
+
+/** Merge a live-resolved price into a pricing table under a model id. */
+export function mergeLivePrice(table: PricingTable, model: string, price: ModelPrice): PricingTable {
+	return { ...table, [model]: price }
+}
+
 /**
  * Load the effective pricing table: defaults deep-merged with overrides from
  * `HEADLESSCODE_PRICING_JSON` (when set). A missing/unreadable/malformed file

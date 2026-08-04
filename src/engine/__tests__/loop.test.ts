@@ -101,6 +101,31 @@ class LiveProbeClient implements LlmClient {
 	}
 }
 
+/**
+	* Fake client for the Part E live-pricing tests: returns real token usage on
+	* every call and (optionally) a fake `fetchModelInfo` so the session's
+	* eager live lookup resolves a price. `info === undefined` models a client
+	* with NO live-pricing support — the fallback path.
+	*/
+class UsageClient implements LlmClient {
+	constructor(
+		private readonly script: Array<(req: LlmRequest) => ChatMessage>,
+		private readonly info: { price?: { input: number; output: number; cacheRead?: number } } | undefined,
+	) {}
+
+	async createChatCompletion(request: LlmRequest): Promise<LlmResponse> {
+		const step = this.script.shift()
+		if (!step) {
+			throw new Error("UsageClient: script exhausted (model kept calling)")
+		}
+		return { message: step(request), usage: { promptTokens: 100, completionTokens: 50 } }
+	}
+
+	async fetchModelInfo(): Promise<{ price?: { input: number; output: number; cacheRead?: number } } | undefined> {
+		return this.info
+	}
+}
+
 /** Read the single `*.live.json` snapshot in a usage dir (asserts it exists). */
 async function readLiveSnapshot(usageDir: string): Promise<Record<string, unknown>> {
 	const entries = await fs.readdir(usageDir)
@@ -1013,6 +1038,51 @@ async function testDifferentFileBatchFailureGetsNoDiagnosis(): Promise<void> {
 	}
 }
 
+// ─── Part E: live pricing feeds the session's BudgetTracker ──────────────────
+
+async function testBudgetUsesLivePricingWhenAvailable(): Promise<void> {
+	// A live price that DIFFERS from the hardcoded table must win: the
+	// session's cost accounting reflects the live value, not the default.
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-liveprice-"))
+	try {
+		const client = new UsageClient([() => toolCall("attempt_completion", { result: "done" })], {
+			price: { input: 9, output: 9 },
+		})
+		const session = await makeSession({ task: "finish", client, workspaceRoot: ws })
+		const result = await session.run()
+		assert.equal(result.status, "success")
+		// 100 prompt + 50 completion tokens at $9/1M = (900 + 450)/1e6.
+		const expected = (100 * 9 + 50 * 9) / 1_000_000
+		assert.ok(
+			Math.abs((result.budgetUsage?.costUsd ?? 0) - expected) < 1e-9,
+			`expected live-priced cost $${expected}, got $${result.budgetUsage?.costUsd}`,
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testBudgetFallsBackToHardcodedTableWithoutLivePricing(): Promise<void> {
+	// A client with NO live-pricing support (fetchModelInfo absent/undefined)
+	// must behave EXACTLY as before live pricing existed: "fake-model" isn't
+	// in DEFAULT_PRICING_TABLE, so the conservative FALLBACK_MODEL_PRICE
+	// ($2/$8 per 1M) applies — no crash, no $0, no live value.
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-fallbackprice-"))
+	try {
+		const client = new UsageClient([() => toolCall("attempt_completion", { result: "done" })], undefined)
+		const session = await makeSession({ task: "finish", client, workspaceRoot: ws })
+		const result = await session.run()
+		assert.equal(result.status, "success")
+		const expected = (100 * 2 + 50 * 8) / 1_000_000
+		assert.ok(
+			Math.abs((result.budgetUsage?.costUsd ?? 0) - expected) < 1e-9,
+			`expected fallback-priced cost $${expected}, got $${result.budgetUsage?.costUsd}`,
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -1042,6 +1112,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["truncateHistory: evicts in TRUNCATION_BATCH_SIZE-sized batches", testTruncateHistoryEvictsInBatches],
 	["truncateHistory: never splits an assistant tool_calls / tool response group", testTruncateHistoryNeverSplitsToolCallGroup],
 	["truncateHistory: prefix stays stable across a batch (cache-eligible)", testTruncateHistoryStablePrefixBetweenBatches],
+	["Part E: live pricing feeds the session's BudgetTracker", testBudgetUsesLivePricingWhenAvailable],
+	["Part E: no live pricing → hardcoded table fallback, unchanged behavior", testBudgetFallsBackToHardcodedTableWithoutLivePricing],
 ]
 
 async function main(): Promise<void> {

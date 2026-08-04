@@ -32,6 +32,7 @@ import {
 	projectStoreRoot,
 	resolveProjectDataDir,
 	resolveProjectIdentity,
+	writeProjectMetadata,
 } from "./project-store.js"
 
 async function mkTmp(prefix: string): Promise<string> {
@@ -53,7 +54,13 @@ async function testPlainDirGetsDistinctKey(): Promise<void> {
 		const dirB = resolveProjectDataDir(wsB)
 		assert.notEqual(dirA, dirB, "two distinct plain dirs get distinct central dirs")
 		assert.ok(dirA.startsWith(projectStoreRoot() + path.sep), "central dir lives under the store root")
-		// project.json metadata is written so a human can identify the project.
+		// NOTE: resolveProjectDataDir skips the metadata write under the
+		// $HEADLESSCODE_DATA_DIR override (test runs must not leave real-store
+		// entries behind), so the metadata contract is asserted against the
+		// explicit writeProjectMetadata — the same function resolution calls
+		// in production.
+		const { keySource, kind } = resolveProjectIdentity(wsA)
+		writeProjectMetadata(dirA, keySource, kind)
 		const meta = JSON.parse(await fsp.readFile(path.join(dirA, "project.json"), "utf-8")) as {
 			path: string
 			kind: string
@@ -86,6 +93,8 @@ async function testGitRepoAndWorktreeShareKey(): Promise<void> {
 		run("git", ["commit", "-m", "init"], repo)
 
 		const repoDir = resolveProjectDataDir(repo)
+		const repoIdentity = resolveProjectIdentity(repo)
+		writeProjectMetadata(repoDir, repoIdentity.keySource, repoIdentity.kind)
 		const meta = JSON.parse(await fsp.readFile(path.join(repoDir, "project.json"), "utf-8")) as {
 			path: string
 			kind: string
