@@ -53,6 +53,19 @@ function toolCall(name: string, args: unknown, id = `call_${Math.random().toStri
 	return { role: "assistant", content: null, tool_calls: [call] }
 }
 
+/** ONE assistant message carrying SEVERAL tool calls (a single-turn batch). */
+function toolCallBatch(calls: Array<{ name: string; args: unknown }>): ChatMessage {
+	return {
+		role: "assistant",
+		content: null,
+		tool_calls: calls.map(({ name, args }) => ({
+			id: `call_${Math.random().toString(36).slice(2)}`,
+			type: "function",
+			function: { name, arguments: typeof args === "string" ? args : JSON.stringify(args) },
+		})),
+	}
+}
+
 function textReply(content: string): ChatMessage {
 	return { role: "assistant", content }
 }
@@ -136,6 +149,8 @@ async function makeSession(options: {
 	task: string
 	client: LlmClient
 	workspaceRoot: string
+	/** Mode slug (default "code"). Read-only modes disable the commit guard. */
+	mode?: string
 	maxIterations?: number
 	consecutiveErrorLimit?: number
 	windowSize?: number
@@ -146,7 +161,7 @@ async function makeSession(options: {
 }) {
 	const session = new HeadlessSession({
 		workspaceRoot: options.workspaceRoot,
-		mode: "code",
+		mode: options.mode ?? "code",
 		model: "fake-model",
 		taskText: options.task,
 		llmClient: options.client,
@@ -780,6 +795,224 @@ async function testTruncateHistoryStablePrefixBetweenBatches(): Promise<void> {
 	)
 }
 
+// Diff markers built via concatenation (not literal template text) so the
+// harness's own diff parser never mistakes them for real SEARCH/REPLACE
+// markers in this test file.
+function diffBlock(search: string, replace: string): string {
+	const searchMarker = "<<<<<<<" + " SEARCH"
+	const replaceMarker = "======="
+	const endMarker = ">>>>>>>" + " REPLACE"
+	return `${searchMarker}\n-------\n${search}${replaceMarker}\n${replace}${endMarker}`
+}
+
+// ─── Same-file multi-edit batch diagnosis ────────────────────────────────────
+
+async function testSameFileBatchFailureGetsDiagnosis(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-samefile-"))
+	try {
+		await fs.writeFile(path.join(ws, "notes.txt"), "alpha\nbeta\ngamma\n", "utf-8")
+		// ONE turn with TWO apply_diff calls to the SAME file. The second's
+		// SEARCH text matches the PRE-first-edit content, so it fails after
+		// the first edit has already landed on disk.
+		const client = new FakeLlmClient([
+			() =>
+				toolCallBatch([
+					{ name: "apply_diff", args: { path: "notes.txt", diff: diffBlock("alpha\n", "ALPHA\n") } },
+					{ name: "apply_diff", args: { path: "notes.txt", diff: diffBlock("alpha\nbeta\n", "alpha\nbeta\ninserted\n") } },
+				]),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({ task: "edit notes.txt twice", client, workspaceRoot: ws })
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		const applyDiffResults = session.state.messages.filter((m) => m.role === "tool" && m.name === "apply_diff")
+		assert.equal(applyDiffResults.length, 2, "both apply_diff calls executed")
+		const failed = applyDiffResults.find((m) => (m.content ?? "").includes("unable to apply diff"))
+		assert.ok(failed, "the second call must fail (stale SEARCH text)")
+		assert.match(
+			failed?.content ?? "",
+			/already edited by an earlier tool call in this same turn/,
+			"the failure carries the same-file-in-batch diagnosis, not just the generic mismatch",
+		)
+		assert.match(
+			failed?.content ?? "",
+			/SEARCH\/REPLACE blocks in ONE apply_diff call/,
+			"the diagnosis points at the fix (single-call batching)",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+/**
+ * Create a temp workspace that is a real git repo with one committed tracked
+ * file (`notes.txt`), so the commit-before-finishing guardrail has something
+ * real to check. Returns the workspace path, or null when git is unavailable.
+ */
+async function mkGitWorkspace(): Promise<string | null> {
+	const { execFileSync } = await import("node:child_process")
+	try {
+		execFileSync("git", ["--version"], { stdio: "ignore" })
+	} catch {
+		return null
+	}
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-git-"))
+	execFileSync("git", ["init", "-q"], { cwd: ws })
+	execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: ws })
+	execFileSync("git", ["config", "user.name", "Test"], { cwd: ws })
+	await fs.writeFile(path.join(ws, "notes.txt"), "hello\n", "utf-8")
+	execFileSync("git", ["add", "notes.txt"], { cwd: ws })
+	execFileSync("git", ["commit", "-q", "-m", "initial"], { cwd: ws })
+	return ws
+}
+
+// ─── Commit-before-finishing guardrail ───────────────────────────────────────
+
+async function testCompletionNudgedOnUncommittedChanges(): Promise<void> {
+	const ws = await mkGitWorkspace()
+	if (ws === null) {
+		console.log("  skip commit-guard test (git not installed)")
+		return
+	}
+	try {
+		// Edit the tracked file, then try to finish WITHOUT committing.
+		const client = new FakeLlmClient([
+			() => toolCall("apply_diff", { path: "notes.txt", diff: diffBlock("hello\n", "hello world\n") }),
+			() => toolCall("attempt_completion", { result: "done editing" }),
+			() => toolCall("attempt_completion", { result: "done editing (retried)" }),
+		])
+		const session = await makeSession({ task: "edit notes.txt", client, workspaceRoot: ws })
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "done editing (retried)", "the retried completion is the one accepted")
+		assert.equal(result.iterations, 3, "the deferred completion consumed one extra iteration")
+		const completionMsgs = session.state.messages.filter((m) => m.role === "tool" && m.name === "attempt_completion")
+		assert.equal(completionMsgs.length, 1, "only the deferred completion produced a tool message")
+		assert.match(
+			completionMsgs[0]?.content ?? "",
+			/uncommitted tracked-file changes/,
+			"the corrective nudge names the situation",
+		)
+		assert.match(completionMsgs[0]?.content ?? "", /git commit/, "it points at git commit")
+		assert.match(completionMsgs[0]?.content ?? "", /attempt_completion again/, "it is a retry nudge, not a hard block")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testCompletionAcceptedWhenClean(): Promise<void> {
+	const ws = await mkGitWorkspace()
+	if (ws === null) {
+		console.log("  skip commit-guard test (git not installed)")
+		return
+	}
+	try {
+		// Nothing edited: the guard must not fire for a clean tree.
+		const client = new FakeLlmClient([
+			() => toolCall("attempt_completion", { result: "nothing to do" }),
+		])
+		const session = await makeSession({ task: "do nothing", client, workspaceRoot: ws })
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "nothing to do")
+		assert.equal(result.iterations, 1, "no nudge, no extra iteration")
+		const nudges = session.state.messages.filter((m) => (m.content ?? "").includes("uncommitted tracked-file changes"))
+		assert.equal(nudges.length, 0, "a clean tree must not be nudged")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testCompletionAcceptedAfterCommit(): Promise<void> {
+	const ws = await mkGitWorkspace()
+	if (ws === null) {
+		console.log("  skip commit-guard test (git not installed)")
+		return
+	}
+	try {
+		// Edit, commit via execute_command, then finish: no nudge.
+		const client = new FakeLlmClient([
+			() => toolCall("apply_diff", { path: "notes.txt", diff: diffBlock("hello\n", "hello world\n") }),
+			() => toolCall("execute_command", { command: "git add notes.txt && git commit -q -m \"edit notes\"" }),
+			() => toolCall("attempt_completion", { result: "committed and done" }),
+		])
+		const session = await makeSession({ task: "edit and commit", client, workspaceRoot: ws })
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "committed and done")
+		const nudges = session.state.messages.filter((m) => (m.content ?? "").includes("uncommitted tracked-file changes"))
+		assert.equal(nudges.length, 0, "committing before finishing means no nudge")
+		// The commit actually landed.
+		const { execFileSync } = await import("node:child_process")
+		const log = execFileSync("git", ["log", "--oneline"], { cwd: ws, encoding: "utf-8" })
+		assert.match(log, /edit notes/, "the model's commit landed in the repo")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testNoNudgeInReadOnlyMode(): Promise<void> {
+	const ws = await mkGitWorkspace()
+	if (ws === null) {
+		console.log("  skip commit-guard test (git not installed)")
+		return
+	}
+	try {
+		// Uncommitted tracked change present, but the mode is READ-ONLY (ask
+		// has no edit group) — the guard must be scoped out entirely.
+		await fs.writeFile(path.join(ws, "notes.txt"), "changed without a commit\n", "utf-8")
+		const client = new FakeLlmClient([
+			() => toolCall("attempt_completion", { result: "investigation only" }),
+		])
+		const session = await makeSession({ task: "investigate", client, workspaceRoot: ws, mode: "ask" })
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(result.iterations, 1, "read-only mode accepts completion immediately")
+		const nudges = session.state.messages.filter((m) => (m.content ?? "").includes("uncommitted tracked-file changes"))
+		assert.equal(nudges.length, 0, "read-only modes never get the commit nudge")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testDifferentFileBatchFailureGetsNoDiagnosis(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-diffile-"))
+	try {
+		await fs.writeFile(path.join(ws, "a.txt"), "hello\n", "utf-8")
+		await fs.writeFile(path.join(ws, "b.txt"), "hello\n", "utf-8")
+		// ONE turn with TWO apply_diff calls to DIFFERENT files. The second
+		// fails for an unrelated reason (no match) — it must NOT get the
+		// same-file-in-batch diagnosis.
+		const client = new FakeLlmClient([
+			() =>
+				toolCallBatch([
+					{ name: "apply_diff", args: { path: "a.txt", diff: diffBlock("hello\n", "hi\n") } },
+					{ name: "apply_diff", args: { path: "b.txt", diff: diffBlock("goodbye\n", "bye\n") } },
+				]),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({ task: "edit two files", client, workspaceRoot: ws })
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		const applyDiffResults = session.state.messages.filter((m) => m.role === "tool" && m.name === "apply_diff")
+		const failed = applyDiffResults.find((m) => (m.content ?? "").includes("unable to apply diff"))
+		assert.ok(failed, "the second call fails (no match in b.txt)")
+		assert.doesNotMatch(
+			failed?.content ?? "",
+			/already edited by an earlier tool call/,
+			"different-file failures must NOT get the same-file diagnosis",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -799,6 +1032,12 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["execute_command: a timed-out call does NOT count toward the consecutive-mistake limit", testTimeoutDoesNotCountAsMistake],
 	["execute_command: session end reaps backgrounded children (no orphans left behind)", testSessionEndReapsBackgroundedChildren],
 	["checkpoints: apply_diff-only iteration still triggers a checkpoint", testCheckpointTriggeredByApplyDiffOnly],
+	["same-file batch: a second same-file edit failure gets the stale-SEARCH diagnosis", testSameFileBatchFailureGetsDiagnosis],
+	["same-file batch: a failure on a DIFFERENT file gets no diagnosis", testDifferentFileBatchFailureGetsNoDiagnosis],
+	["commit guard: attempt_completion with uncommitted tracked changes gets one nudge, then is accepted", testCompletionNudgedOnUncommittedChanges],
+	["commit guard: a clean tree is never nudged", testCompletionAcceptedWhenClean],
+	["commit guard: committing before finishing means no nudge", testCompletionAcceptedAfterCommit],
+	["commit guard: read-only modes never get the nudge", testNoNudgeInReadOnlyMode],
 	["truncateHistory: no-op below the window", testTruncateHistoryNoOpBelowWindow],
 	["truncateHistory: evicts in TRUNCATION_BATCH_SIZE-sized batches", testTruncateHistoryEvictsInBatches],
 	["truncateHistory: never splits an assistant tool_calls / tool response group", testTruncateHistoryNeverSplitsToolCallGroup],

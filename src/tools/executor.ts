@@ -69,7 +69,9 @@ import {
 	findReferencesHandler,
 	importGraphHandler,
 	outlineHandler,
+	renameSymbolHandler,
 } from "../codeintel/handlers.js"
+import { runTestsHandler } from "./run-tests.js"
 
 import type { AuxLlmUsage, ToolContext, ToolHandler, ToolResult } from "../engine/types.js"
 import { checkCommand, type CommandRefusal } from "../permissions/commands.js"
@@ -121,6 +123,17 @@ export interface ToolExecutorOptions {
 	 * it on its event feed as `todo_updated`.
 	 */
 	onTodoEvent?: (fields: { todos: string; done: number; inProgress: number; pending: number }) => void
+	/**
+	 * Test-selection (run_tests): optional session-provided inference of the
+	 * files changed since the session's baseline. Wired by HeadlessSession to
+	 * diff the shadow-checkpoint repo's baseline commit against the current
+	 * working tree (see src/checkpoints/service.ts) — the checkpoint service
+	 * tracks a baseline per task, so this works even when the workspace
+	 * itself has no git repo. Returning `undefined` makes the run_tests
+	 * handler fall back to the workspace's own `git status`. Absent for bare
+	 * executors (tests, reviewer/QA — which don't register run_tests anyway).
+	 */
+	getSessionChangedFiles?: () => Promise<string[] | undefined>
 	/**
 	 * Auxiliary LLM usage reporting (cloud vision captioning — see
 	 * src/vision/describe.ts). Wired by HeadlessSession right after it
@@ -1717,6 +1730,16 @@ export function createHeadlessExecutor(workspaceRoot: string, options: ToolExecu
 	executor.register("go_to_definition", goToDefinitionHandler)
 	executor.register("find_references", findReferencesHandler)
 	executor.register("import_graph", importGraphHandler)
+	// rename_symbol EDITS files, so it is deliberately NOT registered on the
+	// read-only executors (reviewer/QA/local explore) — they must never be
+	// able to modify source, and their tool lists don't advertise it either
+	// (see the RENAME_SYMBOL_TOOL note in src/codeintel/tools.ts).
+	executor.register("rename_symbol", renameSymbolHandler)
+	// run_tests RUNS the project's test suite — an edit-loop tool, not a
+	// read-only inspection, so like rename_symbol it is only registered on
+	// the headless (edit-capable) executor. Reviewer/QA use execute_command
+	// to run tests themselves; their tool lists don't advertise run_tests.
+	executor.register("run_tests", (args, ctx) => runTestsHandler(args, ctx, options.getSessionChangedFiles))
 	executor.registerTodoList()
 
 	executor.register("attempt_completion", attemptCompletionHandler)
