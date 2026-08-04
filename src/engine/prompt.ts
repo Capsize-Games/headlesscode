@@ -95,6 +95,24 @@ export const EXECUTABLE_TOOL_NAMES = new Set([
 	"switch_mode",
 ])
 
+/**
+ * True when a mode's tool groups include the `edit` group — i.e. the mode is
+ * expected to modify files (code, architect, …) as opposed to read-only
+ * investigation/review roles. Uses the SAME group classification the vendored
+ * prompt builder uses for MCP (`getGroupName(group) === "mcp"` in
+ * src/vendor/zoo-code/src/core/prompts/system.ts), so custom modes from
+ * .roomodes are classified exactly like the built-ins instead of by a
+ * hand-maintained slug list. Used to scope edit-workflow guidance (commit
+ * before finishing, targeted test runs) to modes that can actually edit.
+ */
+export function modeHasEditGroup(mode: string, customModes: ModeConfig[] = []): boolean {
+	const modeConfig = getModeBySlug(mode, customModes) ?? modes.find((m) => m.slug === mode)
+	if (modeConfig === undefined) {
+		return false
+	}
+	return modeConfig.groups.some((group) => getGroupName(group) === "edit")
+}
+
 // ─── custom modes loading (project .roomodes + global ~/.roo/custom_modes.yaml) ──
 
 const PROBLEMATIC_CHARS_REGEX =
@@ -276,7 +294,35 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions): Prom
 		settings,
 	)
 
-	return { prompt, modeConfig, customModes }
+	// Headless harness workflow conventions, appended AFTER the vendored
+	// builder's output (which is vendored code and must not be edited in
+	// place). These are harness-level expectations that live outside any
+	// single rules file: committing real work before finishing, running the
+	// targeted test file(s) during the iterative edit-check loop, and
+	// batching same-file diffs into one apply_diff. Edit-workflow guidance
+	// only applies to modes that can actually edit files (modeHasEditGroup);
+	// read-only reviewer/QA roles never see it.
+	const conventions = buildHeadlessConventions(modeConfig.slug, customModes)
+	const fullPrompt = conventions === undefined ? prompt : `${prompt}\n${conventions}`
+
+	return { prompt: fullPrompt, modeConfig, customModes }
+}
+
+/**
+ * The headless-specific workflow section spliced onto the end of the system
+ * prompt for edit-capable modes (see buildSystemPrompt). Keep it SHORT and
+ * scannable — it is one block of prose among the vendored sections, not a
+ * replacement for the tools' own descriptions or the rules files.
+ */
+export function buildHeadlessConventions(mode: string, customModes: ModeConfig[] = []): string | undefined {
+	if (!modeHasEditGroup(mode, customModes)) {
+		return undefined
+	}
+	return `# Headless harness workflow conventions
+
+- Commit before finishing: real, working changes must be committed via \`git add\` + \`git commit\` BEFORE calling attempt_completion. Use one commit per logical change with a descriptive message, matching this repo's normal style (run \`git log --oneline\` for examples). If you genuinely have no changes to commit (e.g. a read-only investigation), finish without committing.
+- Test selection during iterative work: after editing a file, run the SPECIFIC test file(s) for what you changed (the \`run_tests\` tool, or \`npx tsx <test-file>\` directly) instead of the full suite on every edit. The full \`npm test\` is still required once, right before attempt_completion, for real confidence.
+- Batch same-file diffs: when several changes target the SAME file, include them as separate SEARCH/REPLACE blocks in ONE apply_diff call — and after any successful edit, re-read the file before composing further diffs, because its content has changed.`
 }
 
 // ─── Tool selection ──────────────────────────────────────────────────────────

@@ -32,9 +32,24 @@ next to it — reach for the specific tool, not the general one:
 - **Need every real usage site of a symbol (a rename/change impact
   check)?** `find_references` over grep — same reasoning: grep finds text
   matches, this finds actual references.
+- **Need to rename a symbol across multiple files?** `rename_symbol` over
+  composing N separate `apply_diff`/`search_replace` edits — it reuses the
+  same real reference resolution as `find_references` and applies every
+  site atomically (all-or-nothing with rollback), replacing the
+  read-every-file + edit-every-file round trip. Scope: TS/JS files inside
+  the workspace only.
 - **Need a file's import/export relationships before editing it?**
   `import_graph` over manually reading imports and cross-referencing by
   hand.
+
+## Verify targeted tests, not the full suite, while iterating
+
+- After editing a file, run the SPECIFIC test file(s) for what you changed
+  via `run_tests` (it picks the direct `__tests__/` sibling and any test
+  that imports the changed file through the real import graph) — or
+  `npx tsx <test-file>` directly. Reserve the full `npm test` for the final
+  confidence run right before `attempt_completion`; a passing selective run
+  is NOT full-suite green.
 
 If a tool returns "not supported" (non-TS/JS file) or "could not resolve,"
 that's a real, final answer for that file/symbol — fall back to

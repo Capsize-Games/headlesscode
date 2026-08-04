@@ -39,7 +39,9 @@
 
 import * as fsp from "node:fs/promises"
 import * as path from "node:path"
+import { execFile } from "node:child_process"
 import { setTimeout as sleep } from "node:timers/promises"
+import { promisify } from "node:util"
 
 import { randomUUID } from "node:crypto"
 
@@ -195,6 +197,93 @@ const READ_ONLY_TOOL_NAMES = new Set(["list_files", "read_file", "search_files"]
 /** The injected nudge (user-role, seen by the model on its next turn). */
 const READ_ONLY_NUDGE_MESSAGE =
 	"You've made several read/exploration calls without using `codebase_search`. If the workspace has an index (check: is there a `.headlesscode/codesearch/index.jsonl`?), try `codebase_search` for targeted semantic search instead of blind tree-walking. If the workspace is not indexed, ignore this nudge."
+
+/**
+ * Same-file multi-edit diagnosis (see the tool-execution loop): when the
+ * model submits several edit calls to the SAME file in ONE turn, the later
+ * calls' SEARCH text was typically composed against the file's PRE-first-edit
+ * content — so they fail with a "diff didn't match" error the model has to
+ * reason its way out of. The loop tracks which paths earlier calls in the
+ * batch already modified and appends this diagnosis to any later failure on
+ * the same path, turning the generic mismatch into a pointer at the fix.
+ */
+const SAME_FILE_BATCH_DIAGNOSIS =
+	"\n\n<diagnosis>this file was already edited by an earlier tool call in this same turn — your SEARCH text may have been composed against the file's content BEFORE that edit. Re-read the file to get its current state, or next time include both changes as separate SEARCH/REPLACE blocks in ONE apply_diff call.</diagnosis>"
+
+/** Edit tools whose args name a target file (for the same-file batch diagnosis). */
+const BATCH_EDIT_TOOL_NAMES = new Set(["apply_diff", "search_replace", "edit_file", "write_to_file"])
+
+/**
+ * Best-effort extraction of the file path an edit tool call targets, for the
+ * same-file batch diagnosis. `apply_diff`/`write_to_file` use `path`;
+ * `search_replace`/`edit_file` use `file_path`. Resolved against the
+ * workspace root so two spellings of the same path collide. Not authoritative
+ * (the executor's own safeTarget is) — a mis-extraction only skips a
+ * diagnosis, never blocks anything.
+ */
+function editToolTargetPath(workspaceRoot: string, call: { name: string; args: Record<string, unknown> }): string | undefined {
+	if (!BATCH_EDIT_TOOL_NAMES.has(call.name)) {
+		return undefined
+	}
+	const raw =
+		typeof call.args.path === "string" && call.args.path.trim() !== ""
+			? call.args.path
+			: typeof call.args.file_path === "string" && call.args.file_path.trim() !== ""
+				? call.args.file_path
+				: undefined
+	if (raw === undefined) {
+		return undefined
+	}
+	try {
+		return path.resolve(workspaceRoot, raw)
+	} catch {
+		return undefined
+	}
+}
+
+/**
+ * Commit-before-finishing guardrail: the corrective note pushed as the
+ * attempt_completion tool RESULT (keeping the assistant-with-tool_calls →
+ * tool-result adjacency contract) when a worker tries to finish with
+ * uncommitted tracked changes. One nudge per session — a retried
+ * attempt_completion is always accepted, since a model may legitimately
+ * finish with nothing to commit or a deliberate decision to leave work
+ * uncommitted.
+ */
+const COMMIT_NUDGE_CONTENT =
+	"[System: attempt_completion not accepted — the workspace has uncommitted tracked-file changes. Real, working changes must be committed via `git add` + `git commit` BEFORE finishing: one commit per logical change, with a descriptive message matching this repo's normal style (run `git log --oneline` for examples). Commit your changes, then call attempt_completion again. If you genuinely have a reason to leave changes uncommitted (e.g. a read-only investigation), call attempt_completion again as-is and it will be accepted.]"
+
+const execFileP = promisify(execFile)
+
+/**
+ * True when the workspace's git repo has uncommitted TRACKED-file changes
+ * (modified/staged/deleted/renamed — NOT `??` untracked files, which may be
+ * deliberate scratch work the model shouldn't be forced to commit). False
+ * when git fails (no repo) or the status is clean. The commit-before-
+ * finishing guardrail's structural backstop — independent of whether the
+ * prompt instruction alone is followed.
+ */
+async function hasUncommittedTrackedChanges(workspaceRoot: string): Promise<boolean> {
+	try {
+		const { stdout } = await execFileP("git", ["status", "--short"], {
+			cwd: workspaceRoot,
+			timeout: 15_000,
+		})
+		for (const line of stdout.split("\n")) {
+			if (line.trim() === "") {
+				continue
+			}
+			// `?? path` = untracked only; every other status ( M, M , A, D,
+			// R, AM, …) is a tracked-file change.
+			if (!line.startsWith("??")) {
+				return true
+			}
+		}
+		return false
+	} catch {
+		return false // not a git repo or git missing — nothing to enforce
+	}
+}
 
 export interface HeadlessSessionConfig {
 	workspaceRoot: string
@@ -1399,6 +1488,11 @@ export class HeadlessSession {
 		let consecutiveMistakes = 0
 		let lastCallSignature: string | undefined
 		let toolCalls = 0
+		// Commit-before-finishing guardrail: whether the one-per-session
+		// "uncommitted changes" nudge has already been given. A retried
+		// attempt_completion is always accepted afterwards (see
+		// COMMIT_NUDGE_CONTENT).
+		let completionNudged = false
 		// Blind tree-walking guardrail (P1.6): count consecutive read-only
 		// iterations; when the streak crosses the threshold AND the workspace
 		// is indexed, inject one soft nudge per streak (see READ_ONLY_NUDGE_MESSAGE).
@@ -1637,6 +1731,50 @@ export class HeadlessSession {
 					typeof completionCall.args?.result === "string"
 						? completionCall.args.result
 						: JSON.stringify(completionCall.args)
+
+				// Commit-before-finishing guardrail (structural backstop — see
+				// plans/harness-tooling-efficiency.md item 4): in an EDIT-CAPABLE
+				// mode, before accepting completion, check for uncommitted
+				// TRACKED changes. When present (and the one-per-session nudge
+				// hasn't been spent yet), DON'T accept — the nudge becomes this
+				// call's tool result (keeping the assistant→tool adjacency
+				// contract) and the loop continues so the model can commit and
+				// retry. A retried completion is always accepted (the model may
+				// legitimately finish uncommitted). Read-only modes never get the
+				// check — there's nothing to commit.
+				if (
+					!completionNudged &&
+					modeHasEditGroup(this.config.mode, this.customModes) &&
+					(await hasUncommittedTrackedChanges(this.config.workspaceRoot))
+				) {
+					completionNudged = true
+					// Siblings of a deferred attempt_completion never ran — push a
+					// tool message for each so the assistant-with-tool_calls →
+					// tool-result adjacency contract stays unbroken for strict
+					// providers (the completion's own tool message is the nudge).
+					for (const sibling of calls) {
+						if (sibling.id === completionCall.id) {
+							continue
+						}
+						messages.push({
+							role: "tool",
+							tool_call_id: sibling.id,
+							name: sibling.name,
+							content: "[System: not executed — attempt_completion was deferred because the workspace has uncommitted changes; re-issue this call if still needed.]",
+						})
+					}
+					messages.push({
+						role: "tool",
+						tool_call_id: completionCall.id,
+						name: "attempt_completion",
+						content: COMMIT_NUDGE_CONTENT,
+					})
+					this.logger.warn("[loop] attempt_completion deferred — uncommitted tracked changes present", {
+						iteration,
+					})
+					continue
+				}
+
 				this.logger.info("[loop] attempt_completion received — success", { iteration })
 				return { status: "success", result, iterations: iteration, toolCalls: toolCalls + 1 }
 			}
@@ -1663,10 +1801,17 @@ export class HeadlessSession {
 			}
 
 			// 7. Execute each tool call, feeding results back as `tool` messages.
+			// Same-file multi-edit diagnosis: paths already successfully
+			// modified by an EARLIER call in THIS batch (scoped per assistant
+			// turn — the executor re-reads the file per call, so the failure
+			// mechanism is stale SEARCH text, not a stale executor).
+			const batchEditedPaths = new Map<string, string>()
 			for (const call of calls) {
 				toolCalls++
 				let resultContent: string
 				let isError: boolean
+				const targetPath = editToolTargetPath(this.config.workspaceRoot, call)
+				const previouslyEditedBy = targetPath === undefined ? undefined : batchEditedPaths.get(targetPath)
 
 				// Live worker monitoring: emit the tool_call event BEFORE
 				// executing (a truncated argument summary — the path for file
@@ -1713,12 +1858,28 @@ export class HeadlessSession {
 					isError = result.isError
 				}
 
+				// Same-file multi-edit diagnosis: a LATER edit call failing on a
+				// path an EARLIER call in this batch already modified gets the
+				// actionable note appended (the generic mismatch error alone
+				// leaves the model to guess why its SEARCH text vanished).
+				// Only fires on same-file collisions — two calls to DIFFERENT
+				// files in one batch never trigger it.
+				if (isError && previouslyEditedBy !== undefined) {
+					resultContent = `${resultContent}${SAME_FILE_BATCH_DIAGNOSIS}`
+				}
+
 				messages.push({
 					role: "tool",
 					tool_call_id: call.id,
 					name: call.name,
 					content: resultContent,
 				})
+
+				// Record successful edits so a later sibling call on the same
+				// path can be diagnosed (see above).
+				if (!isError && targetPath !== undefined) {
+					batchEditedPaths.set(targetPath, call.name)
+				}
 	
 				// switch_mode (plans/switch-mode-headless.md): append the approved
 				// switch's visible transcript marker AFTER the tool result — the
