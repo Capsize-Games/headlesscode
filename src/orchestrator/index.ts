@@ -15,8 +15,26 @@ export type { OrchestratorGroup, OrchestratorState } from "./state.js"
 export { runReview, parseReviewResult, reviewTools, HARNESS_ROOT, DEFAULT_REVIEW_PROMPT_PATH } from "./reviewer.js"
 export type { ReviewOptions, ReviewResult } from "./reviewer.js"
 
-export { watchGroups, inspectGroup, tailLog, groupWorktreePath, DEFAULT_POLL_INTERVAL_MS, DEFAULT_STALL_TIMEOUT_MS } from "./watch.js"
+export { watchGroups, inspectGroup, tailLog, groupWorktreePath, isPidAlive, DEFAULT_POLL_INTERVAL_MS, DEFAULT_STALL_TIMEOUT_MS } from "./watch.js"
 export type { WatchOptions, WatchSummary } from "./watch.js"
+
+export { checkMergedByAncestor, checkMergedByGitHubPr } from "./merge-check.js"
+export type { MergeCheckResult } from "./merge-check.js"
+
+export {
+	applyCleanup,
+	assessGroupCleanup,
+	assessGroupCleanupSync,
+	checkGroupMerged,
+	cleanupMain,
+	parseCleanupArgs,
+	planCleanup,
+	removeHarnessArtifacts,
+	resolveBaseBranch,
+	resolveGroupBranch,
+	worktreeUncommitted,
+} from "./cleanup.js"
+export type { CleanupDeps, CleanupPlan, CleanupPlanEntry, CleanupRunResult, CleanupStatus, GhWiring } from "./cleanup.js"
 
 export {
 	buildStatusSummary,

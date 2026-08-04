@@ -39,6 +39,7 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 
+import type { CleanupStatus } from "./cleanup.js"
 import { defaultState, loadStateSync, updateGroup, type OrchestratorGroup, type OrchestratorState } from "./state.js"
 import { DEFAULT_POLL_INTERVAL_MS, DEFAULT_STALL_TIMEOUT_MS, groupWorktreePath } from "./watch.js"
 
@@ -85,6 +86,13 @@ export interface StatusGroupRow {
 	stalled: boolean
 	blockedQuestion?: string
 	qaVerdict?: string
+	/**
+	 * Cleanup eligibility for TERMINAL groups (computed by the status CLI via
+	 * cleanup.ts's assessGroupCleanupSync — the same gates the cleanup command
+	 * uses, minus the network). eligible | blocked (<reason>) | done. Undefined
+	 * for non-terminal groups (never touched by cleanup).
+	 */
+	cleanup?: CleanupStatus
 }
 
 export interface StatusCounts {
@@ -243,7 +251,7 @@ export function formatStatusText(
 		lines.push("No orchestrator groups found in this state file (nothing to report / wait for).")
 	} else {
 		lines.push("")
-		lines.push(`${"GROUP".padEnd(14)}${"STATUS".padEnd(12)}LAST ACTIVITY · REVIEW · QA · USAGE`)
+		lines.push(`${"GROUP".padEnd(14)}${"STATUS".padEnd(12)}${"CLEANUP".padEnd(12)}LAST ACTIVITY · REVIEW · QA · USAGE`)
 		for (const g of summary.groups) {
 			const bits: string[] = []
 			if (g.lastActivity) {
@@ -264,7 +272,12 @@ export function formatStatusText(
 			if (g.blockedQuestion) {
 				bits.push(`blocked: ${g.blockedQuestion}`)
 			}
-			lines.push(`${g.name.padEnd(14)}${g.status.padEnd(12)}${bits.join(" · ")}`)
+			if (g.cleanup?.status === "blocked") {
+				bits.push(`cleanup: ${g.cleanup.reason}`)
+			}
+			const cleanupCell =
+				g.cleanup === undefined ? "-" : g.cleanup.status === "eligible" ? "eligible" : g.cleanup.status === "done" ? "done" : "blocked"
+			lines.push(`${g.name.padEnd(14)}${g.status.padEnd(12)}${cleanupCell.padEnd(12)}${bits.join(" · ")}`)
 		}
 		lines.push("")
 		lines.push(
