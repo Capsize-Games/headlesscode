@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict"
 
-import { NoDiffError, OpenPrError, getRepoDefaultBranch, openPullRequest } from "../pr.js"
+import { NoDiffError, OpenPrError, getPullRequestStatus, getRepoDefaultBranch, openPullRequest } from "../pr.js"
 
 /** The token used for API calls in these tests (fake — never a real one). */
 const FAKE_TOKEN = "ghs_TESTTOKEN1234567890"
@@ -242,6 +242,128 @@ async function testGetRepoDefaultBranchRejectsMissingBranch(): Promise<void> {
 	)
 }
 
+// ─── getPullRequestStatus ────────────────────────────────────────────────────
+
+function prStatusOptions(overrides: Partial<Parameters<typeof getPullRequestStatus>[0]> = {}): Parameters<typeof getPullRequestStatus>[0] {
+	return {
+		owner: "octo",
+		repo: "hello",
+		prNumber: 42,
+		getToken: async () => FAKE_TOKEN,
+		baseUrl: API_BASE,
+		...overrides,
+	}
+}
+
+async function testGetPullRequestStatusMerged(): Promise<void> {
+	const { fetchImpl, requests } = makeFakeFetch((method, path) => {
+		if (method === "GET" && path === "/repos/octo/hello/pulls/42") {
+			return {
+				status: 200,
+				body: {
+					number: 42,
+					state: "closed",
+					merged: true,
+					merged_at: "2026-08-02T12:00:00Z",
+					html_url: "https://github.com/octo/hello/pull/42",
+					title: "Add feature",
+				},
+			}
+		}
+		throw new Error(`unexpected request: ${method} ${path}`)
+	})
+
+	const status = await getPullRequestStatus(prStatusOptions({ fetchImpl }))
+	assert.equal(status.merged, true)
+	assert.equal(status.state, "closed")
+	assert.equal(status.number, 42)
+	assert.equal(status.mergedAt, "2026-08-02T12:00:00Z")
+	assert.equal(status.htmlUrl, "https://github.com/octo/hello/pull/42")
+	assert.equal(requests.length, 1)
+	const req = requests[0]
+	assert.equal(req.method, "GET")
+	assert.equal(req.url, `${API_BASE}/repos/octo/hello/pulls/42`)
+	assert.equal(req.headers.authorization, `Bearer ${FAKE_TOKEN}`, "the installation token rides as a Bearer header")
+	assert.equal(req.headers.accept, "application/vnd.github+json")
+	assert.equal(req.headers["x-github-api-version"], "2022-11-28")
+}
+
+async function testGetPullRequestStatusUnmergedOpen(): Promise<void> {
+	const { fetchImpl } = makeFakeFetch((method, path) => {
+		if (method === "GET" && path === "/repos/octo/hello/pulls/42") {
+			return { status: 200, body: { number: 42, state: "open", merged: false } }
+		}
+		throw new Error(`unexpected request: ${method} ${path}`)
+	})
+
+	const status = await getPullRequestStatus(prStatusOptions({ fetchImpl }))
+	assert.equal(status.merged, false, "an open PR is not merged")
+	assert.equal(status.state, "open")
+}
+
+async function testGetPullRequestStatusClosedNotMerged(): Promise<void> {
+	const { fetchImpl } = makeFakeFetch((method, path) => {
+		if (method === "GET" && path === "/repos/octo/hello/pulls/42") {
+			return { status: 200, body: { number: 42, state: "closed", merged: false } }
+		}
+		throw new Error(`unexpected request: ${method} ${path}`)
+	})
+
+	const status = await getPullRequestStatus(prStatusOptions({ fetchImpl }))
+	assert.equal(status.merged, false, "a closed-without-merge PR is NOT merged")
+	assert.equal(status.state, "closed")
+}
+
+async function testGetPullRequestStatusApiError(): Promise<void> {
+	const { fetchImpl } = makeFakeFetch((method, path) => {
+		if (method === "GET" && path === "/repos/octo/hello/pulls/42") {
+			return { status: 404, body: { message: "Not Found" } }
+		}
+		throw new Error(`unexpected request: ${method} ${path}`)
+	})
+
+	await assert.rejects(
+		() => getPullRequestStatus(prStatusOptions({ fetchImpl })),
+		(err) => {
+			assert.ok(err instanceof OpenPrError)
+			assert.equal((err as OpenPrError).status, 404)
+			return true
+		},
+	)
+}
+
+async function testGetPullRequestStatusNetworkError(): Promise<void> {
+	const { fetchImpl } = makeFakeFetch(() => ({ networkError: new Error("fetch failed: ECONNREFUSED") }))
+
+	await assert.rejects(
+		() => getPullRequestStatus(prStatusOptions({ fetchImpl })),
+		(err) => {
+			assert.ok(err instanceof OpenPrError)
+			assert.equal((err as OpenPrError).status, 0, "network failures carry status 0")
+			assert.match((err as Error).message, /network error \(GET/)
+			return true
+		},
+	)
+}
+
+async function testGetPullRequestStatusMalformedBodyThrows(): Promise<void> {
+	const { fetchImpl } = makeFakeFetch((method, path) => {
+		if (method === "GET" && path === "/repos/octo/hello/pulls/42") {
+			return { status: 200, body: { number: 42 } } // no state/merged
+		}
+		throw new Error(`unexpected request: ${method} ${path}`)
+	})
+
+	await assert.rejects(
+		() => getPullRequestStatus(prStatusOptions({ fetchImpl })),
+		(err) => {
+			assert.ok(err instanceof OpenPrError)
+			assert.match((err as Error).message, /unexpected PR status shape/)
+			return true
+		},
+	)
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -254,6 +376,12 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["validates required options", testValidatesRequiredOptions],
 	["getRepoDefaultBranch returns the repo's default_branch", testGetRepoDefaultBranch],
 	["getRepoDefaultBranch rejects a repo with no default_branch", testGetRepoDefaultBranchRejectsMissingBranch],
+	["getPullRequestStatus reads a merged PR's status (GET + Bearer token)", testGetPullRequestStatusMerged],
+	["getPullRequestStatus reports an open PR as not merged", testGetPullRequestStatusUnmergedOpen],
+	["getPullRequestStatus reports a closed-not-merged PR as not merged", testGetPullRequestStatusClosedNotMerged],
+	["getPullRequestStatus surfaces API errors as OpenPrError", testGetPullRequestStatusApiError],
+	["getPullRequestStatus surfaces network failures as OpenPrError (status 0)", testGetPullRequestStatusNetworkError],
+	["getPullRequestStatus rejects a malformed 2xx body", testGetPullRequestStatusMalformedBodyThrows],
 ]
 
 async function main(): Promise<void> {

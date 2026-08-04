@@ -60,6 +60,14 @@ export interface OrchestratorGroup {
 	last_activity?: string | { last_commit?: string; note?: string; [key: string]: unknown }
 	commits?: string[]
 	actions_taken?: string[]
+	/**
+	 * Set by `orchestrate cleanup --apply` once the group's worktree was
+	 * removed after its branch was verified merged (local-ancestor or
+	 * GitHub PR). The group entry itself is NEVER deleted — the round's
+	 * history stays queryable after cleanup (same philosophy as the
+	 * `orphaned` status).
+	 */
+	cleaned_at?: string
 	pending_review_findings?: string[]
 	/** Worker exit code (written by run-worker.sh; recorded by the watcher). */
 	exit_code?: number

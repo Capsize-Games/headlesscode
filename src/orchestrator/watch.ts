@@ -266,17 +266,21 @@ function readNeedsDecision(wtPath: string): NeedsDecision | undefined {
 }
 
 /**
- * Whether the worker process recorded in `.harness.pid` is ACTUALLY still
- * running — not just whether the pid file exists. A worker that crashes or
- * is killed without cleaning up its own pid file leaves a stale file behind
- * forever; checking existence alone made a dead worker indistinguishable
- * from a live one, which is what caused the 2026-08-02 incident below (see
- * `inspectGroup`'s stall-guard branch).
+ * Whether the worker process recorded in a pid file (default `.harness.pid`)
+ * is ACTUALLY still running — not just whether the file exists. A worker that
+ * crashes or is killed without cleaning up its own pid file leaves a stale
+ * file behind forever; checking existence alone made a dead worker
+ * indistinguishable from a live one, which is what caused the 2026-08-02
+ * incident below (see `inspectGroup`'s stall-guard branch).
+ *
+ * The pid-file name is a parameter so the same liveness check can be reused
+ * for the QA session marker (`.qa.pid`) by orchestrate cleanup — one
+ * mechanism, never reinvented.
  */
-function isPidAlive(wtPath: string): boolean {
+export function isPidAlive(wtPath: string, pidFile = ".harness.pid"): boolean {
 	let raw: string
 	try {
-		raw = fs.readFileSync(path.join(wtPath, ".harness.pid"), "utf-8").trim()
+		raw = fs.readFileSync(path.join(wtPath, pidFile), "utf-8").trim()
 	} catch {
 		return false
 	}

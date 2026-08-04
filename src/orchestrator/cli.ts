@@ -42,6 +42,7 @@ import { checkAndNoteHeadlesscodeDir } from "../index-util.js"
 import {
 	buildStatusSummary,
 	formatStatusText,
+	isTerminalStatus,
 	reconcileGroups,
 	verdictLine,
 	waitForTerminalState,
@@ -49,6 +50,7 @@ import {
 	DEFAULT_STATUS_TIMEOUT_MS,
 	type StatusSummary,
 } from "./status.js"
+import { assessGroupCleanupSync, cleanupMain, resolveBaseBranch, type CleanupStatus } from "./cleanup.js"
 import { resolveModelForMode } from "../config/mode-models.js"
 
 const ORCHESTRATE_USAGE = `headlesscode orchestrate — Phase 2 parallel round
@@ -1219,6 +1221,39 @@ async function runGroupTerminalHook(cmd: string, group: OrchestratorGroup, write
 }
 
 /**
+	* Attach the cleanup-eligibility column to every TERMINAL group's status row
+	* (read-only, no side effects — the same gates the cleanup command uses,
+	* minus the GitHub PR network check). Returns the per-group map for --json.
+	* Never throws: on any failure the group is reported blocked with a reason,
+	* matching cleanup's fail-closed model.
+	*/
+function attachCleanupStatus(repo: string, state: OrchestratorState, summary: StatusSummary): Record<string, CleanupStatus> {
+	let baseBranch: string | undefined
+	try {
+		baseBranch = resolveBaseBranch(repo)
+	} catch {
+		baseBranch = undefined
+	}
+	const byGroup: Record<string, CleanupStatus> = {}
+	for (const row of summary.groups) {
+		if (!isTerminalStatus(row.status)) {
+			continue // non-terminal groups are never touched by cleanup
+		}
+		const group = state.groups.find((g) => g.name === row.name)
+		if (!group) {
+			continue
+		}
+		const cleanup: CleanupStatus =
+			baseBranch === undefined
+				? { status: "blocked", reason: "cannot resolve base branch (detached HEAD?) — pass --base to cleanup" }
+				: assessGroupCleanupSync(repo, group, baseBranch)
+		row.cleanup = cleanup
+		byGroup[row.name] = cleanup
+	}
+	return byGroup
+}
+
+/**
 	* `headlesscode orchestrate status` entry point. One call, one result: the
 	* calling agent never re-invokes a tool per poll, unlike the bash loop this
 	* replaces. Both forms reconcile stale state against real worktree markers
@@ -1269,6 +1304,7 @@ export async function statusMain(argv: string[], io: StatusIo = {}): Promise<num
 		})
 		const summary = buildStatusSummary(result.state)
 		const verdict = verdictLine(summary, result.timedOut, result.allDone)
+		const cleanupByGroup = attachCleanupStatus(repo, result.state, summary)
 		if (options.json) {
 			const out: Record<string, unknown> = {
 				...result.state,
@@ -1278,6 +1314,9 @@ export async function statusMain(argv: string[], io: StatusIo = {}): Promise<num
 			}
 			if (result.reconciled.length > 0) {
 				out.reconciled = result.reconciled
+			}
+			if (Object.keys(cleanupByGroup).length > 0) {
+				out.cleanup = cleanupByGroup
 			}
 			writeOut(JSON.stringify(out, null, 2) + "\n")
 		} else {
@@ -1312,10 +1351,14 @@ export async function statusMain(argv: string[], io: StatusIo = {}): Promise<num
 		state = reconciliation.state
 	}
 	const summary = buildStatusSummary(state)
+	const cleanupByGroup = attachCleanupStatus(repo, state, summary)
 	if (options.json) {
 		const out: Record<string, unknown> = { ...state }
 		if (reconciliation.reconciled.length > 0) {
 			out.reconciled = reconciliation.reconciled
+		}
+		if (Object.keys(cleanupByGroup).length > 0) {
+			out.cleanup = cleanupByGroup
 		}
 		writeOut(JSON.stringify(out, null, 2) + "\n")
 	} else {
@@ -1328,9 +1371,14 @@ export async function statusMain(argv: string[], io: StatusIo = {}): Promise<num
 
 export async function orchestrateMain(argv: string[]): Promise<number> {
 	// Subcommand dispatch: `headlesscode orchestrate status ...` is the
-	// read-side status/wait command; everything else is the spawn+watch round.
+	// read-side status/wait command; `orchestrate cleanup ...` is the
+	// human-triggered post-merge worktree cleanup; everything else is the
+	// spawn+watch round.
 	if (argv[0] === "status") {
 		return statusMain(argv.slice(1))
+	}
+	if (argv[0] === "cleanup") {
+		return cleanupMain(argv.slice(1))
 	}
 	const { options, error } = parseOrchestrateArgs(argv)
 	if (error) {
@@ -1383,7 +1431,8 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 			`headlesscode orchestrate: stale worktree(s) found: ${staleWorktrees
 				.map((p) => path.relative(repo, p))
 				.join(", ")}. ` +
-				`Remove them first (git worktree remove <path>) then retry.\n`,
+				`Remove them first — either "git worktree remove <path>", or "headlesscode orchestrate cleanup --repo ${repo} ` +
+				`--apply" (which only removes worktrees whose branch is verified merged) — then retry.\n`,
 		)
 		return 1
 	}
