@@ -19,7 +19,7 @@
  * spawning anything (no API key needed).
  */
 
-import { execFileSync, spawnSync } from "node:child_process"
+import { execFileSync, spawn, spawnSync } from "node:child_process"
 import * as fs from "node:fs"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
@@ -1018,7 +1018,7 @@ const STATUS_USAGE = `headlesscode orchestrate status — per-group status of a 
 
 Usage:
   headlesscode orchestrate status --repo <path> [--json]
-  headlesscode orchestrate status --repo <path> --wait [--timeout-ms <n>] [--json]
+  headlesscode orchestrate status --repo <path> --wait [--timeout-ms <n>] [--on-group-terminal <cmd>] [--json]
 
 Options:
   --repo <path>          Target repo root whose .worktrees/.orchestrator-state.json
@@ -1037,6 +1037,14 @@ Options:
                          longer than that is flagged stalled anyway).
   --poll-interval-ms <n> State-file poll interval for --wait, ms (default: 5000,
                          matching the watcher's own write cadence).
+  --on-group-terminal <cmd>
+                         With --wait: run <cmd> (spawned directly — no shell
+                         parsing — with the group name and its terminal status as
+                         two positional args) each time a group transitions to
+                         done|failed|needs-human|orphaned mid-wait. Fires once per
+                         group per transition; never fires for groups already
+                         terminal when the wait started. A failing hook logs a
+                         warning to stderr but never aborts the wait.
   --json                 Machine-readable output. One-shot: the reconciled
                          OrchestratorState plus a top-level "reconciled" array of
                          group names patched (only when something was patched).
@@ -1058,6 +1066,8 @@ export interface StatusOptions {
 	wait: boolean
 	timeoutMs: number
 	pollIntervalMs: number
+	/** Command spawned (with the group name + terminal status as args) per terminal transition while --wait is active. */
+	onGroupTerminal?: string
 	help: boolean
 }
 
@@ -1068,6 +1078,7 @@ export function parseStatusArgs(argv: string[]): { options: StatusOptions; error
 		wait: false,
 		timeoutMs: DEFAULT_STATUS_TIMEOUT_MS,
 		pollIntervalMs: DEFAULT_STATUS_POLL_INTERVAL_MS,
+		onGroupTerminal: undefined,
 		help: false,
 	}
 	for (let i = 0; i < argv.length; i++) {
@@ -1119,6 +1130,14 @@ export function parseStatusArgs(argv: string[]): { options: StatusOptions; error
 				options.pollIntervalMs = n
 				break
 			}
+			case "--on-group-terminal": {
+				const v = next()
+				if (v === undefined) {
+					return { options, error: "Missing value for --on-group-terminal" }
+				}
+				options.onGroupTerminal = v
+				break
+			}
 			case "--help":
 			case "-h":
 				options.help = true
@@ -1151,13 +1170,43 @@ function waitExitCode(allDone: boolean, summary: StatusSummary): number {
 }
 
 /**
- * `headlesscode orchestrate status` entry point. One call, one result: the
- * calling agent never re-invokes a tool per poll, unlike the bash loop this
- * replaces. Both forms reconcile stale state against real worktree markers
- * before reporting (see status.ts's reconcileGroups) — the state file is
- * patched back when ground truth proves a different status, so a stale
- * "running" entry is never reported as-is.
- */
+	* Run the `--on-group-terminal <cmd>` hook for a group that just reached a
+	* terminal status: spawn <cmd> directly (NO shell parsing of <cmd> — it is
+	* the executable path/name) with the group name and status as the two
+	* positional args, and await completion so transitions fire sequentially.
+	* A broken hook (spawn failure or non-zero exit) logs a warning to stderr
+	* but never aborts the wait — a failed notification must not take down a
+	* status watch that is otherwise healthy.
+	*/
+async function runGroupTerminalHook(cmd: string, group: OrchestratorGroup, writeErr: (text: string) => void): Promise<void> {
+	try {
+		const child = spawn(cmd, [group.name, group.status], { stdio: "inherit" })
+		await new Promise<void>((resolve, reject) => {
+			child.once("error", reject)
+			child.once("exit", (code, signal) => {
+				if (code !== 0) {
+					reject(new Error(signal ? `killed by ${signal}` : `exit ${code}`))
+				} else {
+					resolve()
+				}
+			})
+		})
+	} catch (err) {
+		writeErr(
+			`headlesscode orchestrate status: --on-group-terminal hook failed for group "${group.name}" ` +
+				`(${group.status}): ${err instanceof Error ? err.message : String(err)}\n`,
+		)
+	}
+}
+
+/**
+	* `headlesscode orchestrate status` entry point. One call, one result: the
+	* calling agent never re-invokes a tool per poll, unlike the bash loop this
+	* replaces. Both forms reconcile stale state against real worktree markers
+	* before reporting (see status.ts's reconcileGroups) — the state file is
+	* patched back when ground truth proves a different status, so a stale
+	* "running" entry is never reported as-is.
+	*/
 export async function statusMain(argv: string[], io: StatusIo = {}): Promise<number> {
 	const writeOut = io.stdout ?? ((text: string) => process.stdout.write(text))
 	const writeErr = io.stderr ?? ((text: string) => process.stderr.write(text))
@@ -1180,6 +1229,10 @@ export async function statusMain(argv: string[], io: StatusIo = {}): Promise<num
 	const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
 
 	if (options.wait) {
+		// --on-group-terminal: spawn the hook command per genuine terminal
+		// transition (sequentially — terminal transitions are rare and
+		// blocking the poll loop for the hook is fine).
+		const hookCmd = options.onGroupTerminal
 		const result = await waitForTerminalState(statePath, {
 			timeoutMs: options.timeoutMs,
 			pollIntervalMs: options.pollIntervalMs,
@@ -1193,6 +1246,7 @@ export async function statusMain(argv: string[], io: StatusIo = {}): Promise<num
 				}
 				return r
 			},
+			onGroupTerminal: hookCmd ? (group) => runGroupTerminalHook(hookCmd, group, writeErr) : undefined,
 		})
 		const summary = buildStatusSummary(result.state)
 		const verdict = verdictLine(summary, result.timedOut, result.allDone)
@@ -1290,6 +1344,27 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	}
 
 	const specs = splitIssues(issues)
+
+	// Pre-spawn collision check: a leftover worktree dir from a previous
+	// round means the caller must clean it up FIRST — fail loudly before
+	// spawning anything (and before the --dry-run early-exit, so dry runs
+	// catch stale worktrees too). scripts/spawn-parallel-worktrees.sh exits
+	// 1 on the same collision as defense in depth, but this check runs
+	// before any task files are written or groups are recorded, so a
+	// skipped-at-spawn group can never be silently dropped again.
+	const staleWorktrees = specs
+		.map((spec) => path.join(repo, ".worktrees", spec.name))
+		.filter((wtPath) => fs.existsSync(wtPath))
+	if (staleWorktrees.length > 0) {
+		process.stderr.write(
+			`headlesscode orchestrate: stale worktree(s) found: ${staleWorktrees
+				.map((p) => path.relative(repo, p))
+				.join(", ")}. ` +
+				`Remove them first (git worktree remove <path>) then retry.\n`,
+		)
+		return 1
+	}
+
 	if (options.dryRun) {
 		// Per-mode model assignment: resolve each role's model exactly like a
 		// real round so the dry-run preview shows the effective model per role

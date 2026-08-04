@@ -396,6 +396,18 @@ export interface WaitForTerminalOptions {
 	 * `reconciled` list.
 	 */
 	reconcile?: (state: OrchestratorState) => ReconcileResult
+	/**
+	 * Called immediately when a group transitions to a terminal status
+	 * (done/failed/needs-human/orphaned) during the wait — fires once per
+	 * group per transition. Does NOT fire for non-terminal transitions
+	 * (blocked, running, spawned). Never called for groups that were already
+	 * terminal before the wait started (including groups whose initial
+	 * "running" entry was stale state the FIRST reconciliation fixed to
+	 * terminal — those were always terminal, just stale in the file).
+	 * May return a promise; the wait loop awaits it so transitions are
+	 * processed sequentially (e.g. a --on-group-terminal hook command).
+	 */
+	onGroupTerminal?: (group: OrchestratorGroup) => void | Promise<void>
 }
 
 export interface WaitForTerminalResult {
@@ -460,6 +472,34 @@ export async function waitForTerminalState(
 		state = applyReconcile(state)
 	}
 
+	// Previously-seen status per group, seeded from the FIRST reconciled
+	// state (same pattern as watchGroups). The onGroupTerminal callback only
+	// fires on a genuine transition INTO a terminal status — never for a
+	// group that was already terminal when the wait started, including
+	// groups whose initial "running" entry was stale state the first
+	// reconciliation fixed to terminal (they were always terminal, just
+	// stale in the file). Comparison happens AFTER reconciliation on every
+	// poll, so a reconciliation-driven status change is only seen as a
+	// transition when the PREVIOUS poll had already observed the
+	// (reconciled) non-terminal truth — i.e. a real, live finish detected
+	// via worktree markers appearing mid-wait.
+	const lastSeenStatus = new Map<string, string>()
+	if (state !== null) {
+		for (const g of state.groups) {
+			lastSeenStatus.set(g.name, g.status)
+		}
+	}
+
+	const notifyTerminal = async (groups: OrchestratorGroup[]): Promise<void> => {
+		for (const g of groups) {
+			const prev = lastSeenStatus.get(g.name) ?? g.status
+			if (opts.onGroupTerminal && isTerminalStatus(g.status) && !isTerminalStatus(prev)) {
+				await opts.onGroupTerminal(g)
+			}
+			lastSeenStatus.set(g.name, g.status)
+		}
+	}
+
 	while (true) {
 		if (opts.signal?.aborted) {
 			return {
@@ -487,12 +527,16 @@ export async function waitForTerminalState(
 		if (Date.now() >= deadline) {
 			let finalState = readTolerant() ?? state ?? defaultState()
 			finalState = applyReconcile(finalState)
+			// The final read can observe a transition that landed right at the
+			// deadline — report it before returning the timed-out result.
+			await notifyTerminal(finalState.groups)
 			return { state: finalState, allDone: false, timedOut: true, elapsedMs: Date.now() - start, reconciled }
 		}
 		await sleep(pollIntervalMs)
 		state = readTolerant()
 		if (state !== null) {
 			state = applyReconcile(state)
+			await notifyTerminal(state.groups)
 		}
 	}
 }

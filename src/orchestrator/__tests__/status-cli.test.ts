@@ -12,7 +12,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 
 import { parseStatusArgs, statusMain } from "../cli.js"
-import { waitForTerminalState } from "../status.js"
+import { reconcileGroups, waitForTerminalState } from "../status.js"
 import {
 	defaultState,
 	loadStateSync,
@@ -96,6 +96,28 @@ async function testParseStatusArgsCustomAndErrors(): Promise<void> {
 	assert.ok(parseStatusArgs(["--timeout-ms", "0"]).error?.includes("positive integer"), "zero timeout errors")
 	assert.ok(parseStatusArgs(["--nope"]).error?.includes("Unknown"), "unknown flag errors")
 	assert.equal(parseStatusArgs(["--help"]).options.help, true)
+}
+
+async function testParseStatusArgsOnGroupTerminal(): Promise<void> {
+	const ok = parseStatusArgs(["--repo", "/tmp/repo", "--wait", "--on-group-terminal", "echo"])
+	assert.equal(ok.error, undefined)
+	assert.equal(ok.options.onGroupTerminal, "echo")
+
+	// The whole next arg is the command (no shell parsing later, so a
+	// multi-word command like "echo GOT:" is kept intact).
+	const multiWord = parseStatusArgs(["--repo", "/tmp/repo", "--on-group-terminal", "echo GOT:"])
+	assert.equal(multiWord.error, undefined)
+	assert.equal(multiWord.options.onGroupTerminal, "echo GOT:")
+
+	const eq = parseStatusArgs(["--repo=/tmp/repo", "--on-group-terminal=echo"])
+	assert.equal(eq.error, undefined)
+	assert.equal(eq.options.onGroupTerminal, "echo", "--flag=value form works")
+
+	const missing = parseStatusArgs(["--repo", "/tmp/repo", "--on-group-terminal"])
+	assert.ok(
+		missing.error?.includes("Missing value for --on-group-terminal"),
+		"missing value errors (got: " + String(missing.error) + ")",
+	)
 }
 
 // ─── One-shot status ─────────────────────────────────────────────────────────
@@ -248,6 +270,83 @@ async function testWaitEmptyStateReturnsImmediately(): Promise<void> {
 	assert.ok(result.elapsedMs < 1000, `returned promptly, got ${result.elapsedMs}ms`)
 }
 
+// ─── onGroupTerminal (Bug 2: per-group terminal notifications) ────────────────
+
+async function testWaitOnGroupTerminalFiresOnGenuineTransition(): Promise<void> {
+	let calls = 0
+	const fired: Array<{ name: string; status: string }> = []
+	const readState = (): OrchestratorState => {
+		calls++
+		if (calls < 3) {
+			return updateGroup(defaultState("r1"), "w1", baseGroup({ status: "running" }))
+		}
+		return updateGroup(defaultState("r1"), "w1", baseGroup({ status: "failed" }))
+	}
+	const result = await waitForTerminalState("", {
+		pollIntervalMs: 5,
+		timeoutMs: 5000,
+		readState,
+		onGroupTerminal: (group) => {
+			fired.push({ name: group.name, status: group.status })
+		},
+	})
+
+	assert.deepEqual(fired, [{ name: "w1", status: "failed" }], "fires exactly once, with name + terminal status")
+	assert.equal(result.allDone, false, "failed is terminal but not done")
+}
+
+async function testWaitOnGroupTerminalSkipsAlreadyTerminalGroups(): Promise<void> {
+	const fired: string[] = []
+	const readState = (): OrchestratorState =>
+		updateGroup(defaultState("r1"), "w1", baseGroup({ name: "w1", status: "done" }))
+	const result = await waitForTerminalState("", {
+		pollIntervalMs: 5,
+		timeoutMs: 5000,
+		readState,
+		onGroupTerminal: (group) => {
+			fired.push(`${group.name}:${group.status}`)
+		},
+	})
+
+	assert.equal(result.allDone, true)
+	assert.deepEqual(fired, [], "groups already terminal when the wait started never fire")
+}
+
+async function testWaitOnGroupTerminalSkipsReconciliationOnlyChanges(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
+		// The worker ALREADY finished before the wait started: the state file
+		// still says "running", but ground truth (the worktree's .harness.done
+		// marker + non-zero .harness.exit) says failed. The FIRST reconciliation
+		// patches it to terminal BEFORE lastSeenStatus is seeded — the group
+		// was always terminal, just stale in the file, so no genuine
+		// transition exists and the callback must NOT fire.
+		await fs.mkdir(path.join(repo, ".worktrees", "w1", ".harness.done"), { recursive: true })
+		await fs.writeFile(path.join(repo, ".worktrees", "w1", ".harness.exit"), "3", "utf8")
+		saveStateSync(statePath, updateGroup(defaultState("r1"), "w1", baseGroup({ status: "running" })))
+
+		const fired: string[] = []
+		await waitForTerminalState(statePath, {
+			pollIntervalMs: 5,
+			timeoutMs: 5000,
+			reconcile: (state) => {
+				const r = reconcileGroups(state, repo)
+				if (r.reconciled.length > 0) {
+					saveStateSync(statePath, r.state)
+				}
+				return r
+			},
+			onGroupTerminal: (group) => {
+				fired.push(`${group.name}:${group.status}`)
+			},
+		})
+		assert.deepEqual(fired, [], "reconciliation-only changes (stale running -> failed) never fire")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 // ─── statusMain --wait (end-to-end via the real state file) ─────────────────
 
 async function testWaitAgainstRealFileTransitionsToDone(): Promise<void> {
@@ -321,6 +420,43 @@ async function testWaitJsonCarriesVerdictFields(): Promise<void> {
 		assert.equal(parsed.timedOut, false, "top-level timedOut flag")
 		assert.equal(parsed.verdict, "1/1 groups done, 0 failed", "top-level verdict line")
 		assert.ok(Array.isArray(parsed.groups), "state shape preserved alongside the verdict fields")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testWaitOnGroupTerminalHookSpawnsCommand(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
+		// Worktree must EXIST so reconciliation keeps the group genuinely
+		// running while the wait polls (a missing worktree would reconcile it
+		// to orphaned instantly and no live transition would ever be observed).
+		await fs.mkdir(path.join(repo, ".worktrees", "w1"), { recursive: true })
+		saveStateSync(statePath, updateGroup(defaultState("r1"), "w1", baseGroup({ status: "running" })))
+
+		// The hook: a tiny script that records its two positional args (group
+		// name + terminal status) to a log file.
+		const hookLog = path.join(repo, "hook-args.log")
+		const hook = path.join(repo, "hook.sh")
+		await fs.writeFile(hook, `#!/bin/sh\nprintf '%s %s\\n' "$1" "$2" >> "${hookLog}"\n`, "utf-8")
+		await fs.chmod(hook, 0o755)
+
+		const cap = capture()
+		const waitPromise = statusMain(
+			["--repo", repo, "--wait", "--timeout-ms", "5000", "--poll-interval-ms", "25", "--on-group-terminal", hook],
+			cap.io,
+		)
+
+		// Transition the state file partway through the wait (the watcher
+		// would do this; here the test plays the writer).
+		await new Promise((resolve) => setTimeout(resolve, 150))
+		saveStateSync(statePath, updateGroup(defaultState("r1"), "w1", baseGroup({ status: "done" })))
+
+		const code = await waitPromise
+		assert.equal(code, 0, "clean finish -> exit 0")
+		const log = await fs.readFile(hookLog, "utf-8")
+		assert.ok(log.trim() === "w1 done", `hook received <group-name> <status>, got: ${JSON.stringify(log)}`)
 	} finally {
 		await fs.rm(repo, { recursive: true, force: true })
 	}

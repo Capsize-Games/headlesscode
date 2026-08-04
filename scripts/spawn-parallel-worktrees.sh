@@ -184,8 +184,8 @@ for spec in "$@"; do
     fi
 
     if [ -d "$wt_path" ]; then
-        echo "Skipping $name — $wt_path already exists."
-        continue
+        echo "ERROR: $name — $wt_path already exists. Remove it first (git worktree remove ...) then retry." >&2
+        exit 1
     fi
 
     echo "=== Creating worktree '$name' at $wt_path (branch $branch, port offset $offset) ==="

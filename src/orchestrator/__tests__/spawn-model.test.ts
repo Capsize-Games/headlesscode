@@ -195,6 +195,38 @@ async function testNoModelAddsNoFlag(): Promise<void> {
 	}
 }
 
+// ─── Pre-spawn collision: an existing worktree dir fails loudly (Bug 1) ───────
+
+async function testExistingWorktreeDirFailsLoudly(): Promise<void> {
+	const fixture = await makeFixture(null)
+	try {
+		// A leftover dir from a previous round — the script must abort with a
+		// clear error, NOT silently skip the group (that was the bug: w1 got
+		// skipped, never recorded, and the round still exited 0).
+		const staleName = "stale-a"
+		const staleDir = path.join(fixture, ".worktrees", staleName)
+		await fsPromises.mkdir(staleDir, { recursive: true })
+		await fsPromises.writeFile(path.join(staleDir, "leftover.txt"), "stale\n", "utf-8")
+
+		let caught: (Error & { status?: number; stderr?: string }) | null = null
+		try {
+			runSpawn(fixture, `${staleName}:0:plans/parallel-tasks/task.md`, {})
+		} catch (err) {
+			caught = err as Error & { status?: number; stderr?: string }
+		}
+
+		assert.ok(caught, "spawn must fail when the worktree dir already exists")
+		assert.notEqual(caught.status, 0, "non-zero exit required (no silent skip)")
+		assert.ok(
+			(caught.stderr ?? "").includes("already exists"),
+			`stderr names the collision, got: ${caught.stderr}`,
+		)
+		assert.ok((caught.stderr ?? "").includes("Remove it first"), "stderr tells the caller to clean up")
+	} finally {
+		await cleanupFixture(fixture, "stale-a")
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -202,6 +234,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["no config: blanket OPENROUTER_MODEL override is unchanged (regression)", testNoConfigKeepsBlanketEnvOverride],
 	["SPAWN_MODEL override still beats the config file", testSpawnModelOverrideBeatsConfig],
 	["nothing configured -> no --model flag at all", testNoModelAddsNoFlag],
+	["existing worktree dir causes a non-zero exit (no silent skip)", testExistingWorktreeDirFailsLoudly],
 ]
 
 async function main(): Promise<void> {

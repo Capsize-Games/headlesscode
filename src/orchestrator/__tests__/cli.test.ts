@@ -7,6 +7,7 @@
  */
 
 import assert from "node:assert/strict"
+import { execFileSync } from "node:child_process"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
@@ -17,6 +18,7 @@ import {
 	buildSpawnEnv,
 	handleIterationExhaustion,
 	handleReviewVerdict,
+	orchestrateMain,
 	parseOrchestrateArgs,
 } from "../cli.js"
 import { watchGroups } from "../watch.js"
@@ -25,6 +27,30 @@ import type { ReviewResult } from "../reviewer.js"
 
 async function tmpRepo(): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-cli-rework-"))
+}
+
+/** Initialize a real git repo (orchestrateMain git-checks the target with `git rev-parse --git-dir`). */
+function initGitRepo(dir: string): void {
+	try {
+		execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" })
+	} catch {
+		execFileSync("git", ["init", "-q", dir], { stdio: "ignore" })
+	}
+}
+
+/** Run a function while capturing everything written to process.stderr. */
+function withCapturedStderr(fn: () => Promise<number>): Promise<{ exit: number; stderr: string }> {
+	const original = process.stderr.write.bind(process.stderr)
+	let stderr = ""
+	process.stderr.write = ((chunk: unknown): boolean => {
+		stderr += String(chunk)
+		return true
+	}) as typeof process.stderr.write
+	return fn()
+		.finally(() => {
+			process.stderr.write = original
+		})
+		.then((exit) => ({ exit, stderr }))
 }
 
 function baseGroup(overrides: Partial<OrchestratorGroup> = {}): OrchestratorGroup {
@@ -633,6 +659,58 @@ async function testWatchGroupsRepollsGroupAfterContinuationReset(): Promise<void
 	}
 }
 
+// ─── Pre-spawn worktree collision check (Bug 1) ───────────────────────────────
+
+async function testOrchestrateMainFailsOnStaleWorktree(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		initGitRepo(repo)
+		const issuesPath = path.join(repo, "issues.json")
+		await fs.writeFile(
+			issuesPath,
+			JSON.stringify([{ number: 1, title: "Fix the thing", body: "Do it" }]),
+			"utf-8",
+		)
+		// Leftover worktree dir from a previous round — the round must abort
+		// BEFORE spawning anything (and even before the --dry-run early-exit,
+		// so a dry run catches stale worktrees too).
+		await fs.mkdir(path.join(repo, ".worktrees", "w1"), { recursive: true })
+		await fs.writeFile(path.join(repo, ".worktrees", "w1", "leftover.txt"), "stale\n", "utf-8")
+
+		const { exit, stderr } = await withCapturedStderr(() =>
+			orchestrateMain(["--repo", repo, "--issues-json", issuesPath, "--dry-run"]),
+		)
+
+		assert.notEqual(exit, 0, "a stale worktree dir must fail the round, got exit 0")
+		assert.ok(stderr.includes(".worktrees/w1"), `error names the colliding path, got: ${stderr}`)
+		assert.ok(stderr.includes("Remove them first"), "error tells the caller how to clean up")
+		assert.ok(stderr.includes("git worktree remove"), "cleanup hint names git worktree remove")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testOrchestrateMainDryRunProceedsWhenNoCollision(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		initGitRepo(repo)
+		const issuesPath = path.join(repo, "issues.json")
+		await fs.writeFile(
+			issuesPath,
+			JSON.stringify([{ number: 1, title: "Fix the thing", body: "Do it" }]),
+			"utf-8",
+		)
+
+		// No pre-existing .worktrees/w1 -> the collision check passes and the
+		// dry-run reaches printPlan (the step that would be followed by the
+		// spawn command on a real round), exiting 0.
+		const exit = await orchestrateMain(["--repo", repo, "--issues-json", issuesPath, "--dry-run"])
+		assert.equal(exit, 0, "clear worktrees -> dry-run proceeds to the plan and exits 0")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -662,6 +740,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["clean exit with the max-iterations text never auto-continues", testCleanExitWithMaxIterationsTextDoesNotContinue],
 	["continuation spawn forwards the round-level --max-iterations when set", testExhaustionSpawnForwardsMaxIterations],
 	["watchGroups re-polls a group after a continuation reset", testWatchGroupsRepollsGroupAfterContinuationReset],
+	["orchestrateMain fails on a stale worktree dir even in --dry-run", testOrchestrateMainFailsOnStaleWorktree],
+	["orchestrateMain dry-run proceeds when all worktree dirs are clear", testOrchestrateMainDryRunProceedsWhenNoCollision],
 ]
 
 async function main(): Promise<void> {
