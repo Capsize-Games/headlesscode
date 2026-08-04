@@ -576,6 +576,17 @@ export class HeadlessSession {
 	 */
 	private contextWindowResolved = false
 	/**
+	 * The live-resolved context window, cached across the WHOLE session once
+	 * found (see maybeCondenseHistory). Distinct from contextWindowResolved:
+	 * that flag alone previously caused every condensation check AFTER the
+	 * first to silently re-fall-back to DEFAULT_CONTEXT_WINDOW_TOKENS, since
+	 * the boolean recorded that resolution was ATTEMPTED but never cached
+	 * what it resolved TO — condensation kept firing at 75% of 128k even
+	 * after a successful live lookup reported the model's real (larger)
+	 * window. Fixed 2026-08-04.
+	 */
+	private resolvedContextWindowTokens: number | undefined = undefined
+	/**
 	 * Recursive task decomposition (`new_task`): the session that spawned this
 	 * one, or undefined for root sessions. Stamped onto every event and used
 	 * in checkpoint lineage tags.
@@ -1170,33 +1181,43 @@ export class HeadlessSession {
 		// against), then the conservative default.
 		let contextWindowTokens = config.contextWindowTokens
 		if (contextWindowTokens === undefined) {
-			contextWindowTokens = DEFAULT_CONTEXT_WINDOW_TOKENS
-			if (!this.contextWindowResolved) {
-				this.contextWindowResolved = true
-				const client = this.llmClient as {
-					fetchModelContextWindow?: (model: string) => Promise<number | undefined>
-				}
-				try {
-					const live = await client.fetchModelContextWindow?.(config.model)
-					if (live !== undefined && live > 0) {
-						contextWindowTokens = live
-						this.logger.info("[condense] resolved live context window from OpenRouter models endpoint", {
-							model: config.model,
-							contextWindowTokens: live,
-						})
-					} else {
-						// Silent-undefined is the common failure mode (lookup
-						// returned nothing, not an exception) — log it so a
-						// fallback to 128k is always visible in harness.log.
-						this.logger.warn("[condense] live context-window lookup returned no value (non-fatal; using conservative default)", {
-							model: config.model,
-							contextWindowTokens,
+			if (this.resolvedContextWindowTokens !== undefined) {
+				// Already resolved live earlier THIS session — reuse it. Without
+				// this branch, every check after the first silently fell back to
+				// DEFAULT_CONTEXT_WINDOW_TOKENS forever (see the field's doc
+				// comment): contextWindowResolved recorded that a lookup was
+				// ATTEMPTED, but the value it resolved to was never cached.
+				contextWindowTokens = this.resolvedContextWindowTokens
+			} else {
+				contextWindowTokens = DEFAULT_CONTEXT_WINDOW_TOKENS
+				if (!this.contextWindowResolved) {
+					this.contextWindowResolved = true
+					const client = this.llmClient as {
+						fetchModelContextWindow?: (model: string) => Promise<number | undefined>
+					}
+					try {
+						const live = await client.fetchModelContextWindow?.(config.model)
+						if (live !== undefined && live > 0) {
+							contextWindowTokens = live
+							this.resolvedContextWindowTokens = live
+							this.logger.info("[condense] resolved live context window from OpenRouter models endpoint", {
+								model: config.model,
+								contextWindowTokens: live,
+							})
+						} else {
+							// Silent-undefined is the common failure mode (lookup
+							// returned nothing, not an exception) — log it so a
+							// fallback to 128k is always visible in harness.log.
+							this.logger.warn("[condense] live context-window lookup returned no value (non-fatal; using conservative default)", {
+								model: config.model,
+								contextWindowTokens,
+							})
+						}
+					} catch (error) {
+						this.logger.warn("[condense] live context-window lookup failed (non-fatal; using conservative default)", {
+							error: error instanceof Error ? error.message : String(error),
 						})
 					}
-				} catch (error) {
-					this.logger.warn("[condense] live context-window lookup failed (non-fatal; using conservative default)", {
-						error: error instanceof Error ? error.message : String(error),
-					})
 				}
 			}
 		}
