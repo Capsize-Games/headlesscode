@@ -232,6 +232,31 @@ of hand-rolling poll loops over the state file / `harness.log`:
   parse errors during the wait (writer mid-save) are retried, not fatal. An
   empty state file returns immediately — nothing to wait for.
 
+### Keeping local master in sync with origin (issue #25)
+
+Worktree branches spawn off `origin/master` (with a local-`master` fallback in
+`spawn-parallel-worktrees.sh`), but GitHub PR merges only ever move
+`origin/master` — nothing used to push local `master`, so it silently drifted
+ahead by dozens of commits and every PR-merge cycle paid for it with re-merge
+conflict cascades. Two natural checkpoints now reconcile the two (see
+`src/orchestrator/git-sync.ts`):
+
+- `headlesscode orchestrate` (a real round, not `--dry-run`): before spawning,
+  fetches `origin`, pushes any local-only commits, and fast-forwards local
+  master onto `origin/master`, so this round's branches start from what's
+  actually on GitHub.
+- `headlesscode orchestrate cleanup --apply`: after the round settles, the
+  same reconciliation (a local merge of a round's branch gets pushed too).
+
+Both are best-effort auxiliary steps: a failure (auth, divergence, offline)
+prints a loud warning and never aborts the round or fails cleanup. Residual
+drift after a sync attempt (e.g. a true divergence — local ahead AND behind
+`origin/master`) is surfaced as an actionable `WARNING` naming the manual
+`git fetch` / `merge --ff-only` / `push` commands. Setting
+`HEADLESSCODE_ORCHESTRATE_NO_SYNC=1` disables the mutation entirely and only
+warns when local master is ahead of origin by more than `TRIVIAL_DRIFT_AHEAD`
+(5) commits.
+
 ## 8. Before/after — how this replaces the airunner GUI flow
 
 | Airunner (GUI) | headlesscode (Phase 2) |

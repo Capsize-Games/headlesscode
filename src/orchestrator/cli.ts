@@ -52,6 +52,14 @@ import {
 	type StatusSummary,
 } from "./status.js"
 import { assessGroupCleanupSync, cleanupMain, resolveBaseBranch, type CleanupStatus } from "./cleanup.js"
+import {
+	branchSyncStatus,
+	ORCHESTRATE_SYNC_DISABLED_ENV,
+	syncBranchWithOrigin,
+	syncSummaryLines,
+	syncWarningLines,
+	TRIVIAL_DRIFT_AHEAD,
+} from "./git-sync.js"
 import { resolveModelForMode } from "../config/mode-models.js"
 import { runPreflight, type PreflightResult } from "../llm/preflight.js"
 
@@ -1774,6 +1782,33 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 				`Wait for running sessions to finish or raise the cap.\n`,
 		)
 		return 1
+	}
+
+	// 1a-sync. Issue #25: local master silently drifts unpushed from origin,
+	// and every PR-merge cycle pays for it with re-merge conflict cascades.
+	// At this "a new round is about to start" checkpoint, reconcile the two
+	// (fetch origin, push local-only commits, fast-forward local onto origin)
+	// so this round's branches start from what's actually on GitHub. Best-
+	// effort auxiliary step: a failure is a loud warning, never an abort.
+	// HEADLESSCODE_ORCHESTRATE_NO_SYNC=1 disables the mutation and only warns
+	// on non-trivial drift (see git-sync.ts).
+	if (process.env[ORCHESTRATE_SYNC_DISABLED_ENV]) {
+		const drift = branchSyncStatus(repo)
+		if (drift && drift.ahead > TRIVIAL_DRIFT_AHEAD) {
+			process.stderr.write(
+				`headlesscode orchestrate: WARNING: local ${drift.branch} is ${drift.ahead} commit(s) ahead of ${drift.remoteRef} ` +
+					`(${ORCHESTRATE_SYNC_DISABLED_ENV} set — not pushing). Push it now to avoid merge-conflict cascades at ` +
+					`PR-merge time (issue #25): git -C ${repo} push origin ${drift.branch}\n`,
+			)
+		}
+	} else {
+		const sync = syncBranchWithOrigin(repo)
+		for (const line of syncSummaryLines(sync)) {
+			process.stdout.write(`[sync] ${line}\n`)
+		}
+		for (const line of syncWarningLines(sync, repo)) {
+			process.stderr.write(`headlesscode orchestrate: ${line}\n`)
+		}
 	}
 
 	// 1a-pre. Issue #13 pre-spawn preflight probe: a cheap 1-token completion

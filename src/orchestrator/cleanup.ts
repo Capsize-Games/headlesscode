@@ -60,6 +60,14 @@ import { checkMergedByAncestor, checkMergedByGitHubPr, type MergeCheckResult } f
 import { loadStateSync, saveStateSync, updateGroup, type OrchestratorGroup, type OrchestratorState } from "./state.js"
 import { isTerminalStatus } from "./status.js"
 import { groupWorktreePath, isPidAlive } from "./watch.js"
+import {
+	branchSyncStatus,
+	ORCHESTRATE_SYNC_DISABLED_ENV,
+	syncBranchWithOrigin,
+	syncSummaryLines,
+	syncWarningLines,
+	TRIVIAL_DRIFT_AHEAD,
+} from "./git-sync.js"
 
 // ─── Harness-owned worktree artifacts ─────────────────────────────────────────
 // Paths the harness itself creates inside a worktree (run-worker.sh, run-qa.sh,
@@ -883,6 +891,28 @@ export async function cleanupMain(argv: string[], io: CleanupIo = {}): Promise<n
 			writeOut(cleanupJson(result.plan, { mode, result }))
 		} else {
 			writeOut(formatCleanupText(result.plan, { mode, result }))
+		}
+		// Issue #25: cleanup --apply is the "a round just settled" checkpoint —
+		// reconcile local master with origin (fetch, push, fast-forward) so
+		// unpushed merge commits stop accumulating. Best-effort: failures are
+		// loud warnings, never a cleanup failure. Sync lines go to stderr so
+		// --json stdout stays machine-readable (see git-sync.ts).
+		if (process.env[ORCHESTRATE_SYNC_DISABLED_ENV]) {
+			const drift = branchSyncStatus(repo, baseBranch)
+			if (drift && drift.ahead > TRIVIAL_DRIFT_AHEAD) {
+				writeErr(
+					`headlesscode orchestrate cleanup: WARNING: local ${drift.branch} is ${drift.ahead} commit(s) ahead of ${drift.remoteRef} ` +
+						`(${ORCHESTRATE_SYNC_DISABLED_ENV} set — not pushing). Push it now: git -C ${repo} push origin ${drift.branch}\n`,
+				)
+			}
+		} else {
+			const sync = syncBranchWithOrigin(repo, baseBranch)
+			for (const line of syncSummaryLines(sync)) {
+				writeErr(`[sync] ${line}\n`)
+			}
+			for (const line of syncWarningLines(sync, repo)) {
+				writeErr(`headlesscode orchestrate cleanup: ${line}\n`)
+			}
 		}
 		return result.failed.length > 0 ? 1 : 0
 	}

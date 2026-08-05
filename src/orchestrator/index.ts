@@ -56,6 +56,16 @@ export {
 export type { CleanupDeps, CleanupPlan, CleanupPlanEntry, CleanupRunResult, CleanupStatus, GhWiring } from "./cleanup.js"
 
 export {
+	branchSyncStatus,
+	ORCHESTRATE_SYNC_DISABLED_ENV,
+	syncBranchWithOrigin,
+	syncSummaryLines,
+	syncWarningLines,
+	TRIVIAL_DRIFT_AHEAD,
+} from "./git-sync.js"
+export type { BranchSyncResult, BranchSyncStatus } from "./git-sync.js"
+
+export {
 	buildStatusSummary,
 	formatStatusText,
 	reconcileGroups,
