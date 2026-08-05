@@ -1,0 +1,11 @@
+Guidance for working in a React codebase.
+
+- Before adding a component, check how existing components are written (function vs class, hooks usage, styling approach — CSS modules / Tailwind / CSS-in-JS, file organization) and match it; a working component that follows a different pattern than the surrounding code is a review finding.
+- Match the project's existing component-testing setup (React Testing Library vs others; colocated `*.test.tsx` vs a `__tests__/` dir) when writing component tests. If the project has no component tests, don't introduce a new framework — verify with the project's existing test runner instead.
+- Prefer the project's existing state/data-fetching pattern (context, Redux, Zustand, react-query, …) over introducing a new library for a single component.
+- Effect correctness — the "background timer fires unexpectedly" class of bug: every value read inside `useEffect`/`useMemo`/`useCallback` must be in the dependency array (or deliberately omitted with a comment), and timers/subscriptions must be cleaned up in the effect's returned cleanup function. Under `<StrictMode>` effects run mount→unmount→mount in dev, so an effect that leaks a timer looks fine once and double-fires later.
+- If the project's lint config enables `eslint-plugin-react-hooks`, run the project's lint on new/changed components and treat its hooks-rule findings as blocking — don't locally disable those rules.
+- Framework boundary (Next.js/Remix, when `next.config` or framework deps are present): respect the server/client component split — keep server-only code (secrets, DB access) out of client components and follow the project's directive convention (`"use client"` etc.).
+- Interactive elements (custom buttons, dialogs, form controls): if the project has `eslint-plugin-jsx-a11y` configured, new elements must satisfy it (keyboard access, accessible labels, ARIA) — a mouse-only control fails a11y review.
+- Use a stable id, not the array index, as a `key` for lists that can be reordered or filtered — index keys cause state/scroll bugs on reorder.
+- Changing a component's props or a context's shape: update every usage site in the same change. React (especially in a plain-JS codebase) has no compiler to catch a missed prop at build time — a component left with an outdated call site fails only at render/runtime.
