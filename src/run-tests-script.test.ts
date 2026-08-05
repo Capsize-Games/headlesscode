@@ -10,6 +10,7 @@
 
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
+import * as fs from "node:fs"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -18,6 +19,34 @@ const SCRIPT = path.join(REPO_ROOT, "scripts", "run-tests.mjs")
 
 function run(args: string[]): string {
 	return execFileSync("node", [SCRIPT, ...args], { cwd: REPO_ROOT, encoding: "utf-8" })
+}
+
+/**
+ * Issue #32 regression: run-tests.mjs used to hardcode
+ * `repoRoot/node_modules/.bin/tsx` — repoRoot being the WORKTREE's own root,
+ * which has no node_modules of its own (not git-tracked, never installed
+ * there). Every OTHER `npx tsx ...` call in this codebase works fine inside
+ * a worktree because npx/Node's own module resolution walks UP through
+ * ancestor directories to find the main checkout's node_modules (a worktree
+ * is a filesystem CHILD of the main checkout) — the hardcoded absolute path
+ * bypassed that walk-up entirely. Verifies against a REAL, freshly created
+ * `git worktree` nested under `.worktrees/` (matching this repo's own
+ * convention) with zero node_modules of its own.
+ */
+async function testResolvesTsxViaWalkUpInABareWorktree(): Promise<void> {
+	const wtName = `run-tests-nm-check-${Date.now()}`
+	const wtPath = path.join(REPO_ROOT, ".worktrees", wtName)
+	execFileSync("git", ["worktree", "add", "-q", wtPath, "HEAD", "--detach"], { cwd: REPO_ROOT })
+	try {
+		assert.ok(!fs.existsSync(path.join(wtPath, "node_modules")), "fixture worktree must have no node_modules of its own")
+		const out = execFileSync("node", [path.join(wtPath, "scripts", "run-tests.mjs"), "spawn-state-reset"], {
+			cwd: wtPath,
+			encoding: "utf-8",
+		})
+		assert.match(out, /all 1 file\(s\) passed/, `expected the test to run via walk-up resolution, got:\n${out}`)
+	} finally {
+		execFileSync("git", ["worktree", "remove", "--force", wtPath], { cwd: REPO_ROOT })
+	}
 }
 
 async function testBarePositionalArgFilters(): Promise<void> {
@@ -48,6 +77,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["bare positional arg filters like `npm test -- <pattern>` (issue #4)", testBarePositionalArgFilters],
 	["explicit --filter flag still works", testExplicitFilterFlagStillWorks],
 	["filter matching nothing exits non-zero with a clear message", testNoMatchExitsNonZeroWithClearMessage],
+	["resolves tsx via ancestor walk-up in a bare worktree with no node_modules (issue #32)", testResolvesTsxViaWalkUpInABareWorktree],
 ]
 
 async function main(): Promise<void> {

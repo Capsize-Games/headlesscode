@@ -41,6 +41,33 @@ function findTestFiles(dir) {
 	return found
 }
 
+/**
+ * Resolve the `tsx` binary by walking up from `dir` through ancestor
+ * `node_modules/.bin/` directories — the same directory walk-up Node's own
+ * module resolution (and `npx`) does, which is why every OTHER `npx tsx ...`
+ * invocation in this codebase already works inside a bare `git worktree`
+ * (worktrees are created as filesystem children of the main checkout, which
+ * has the real node_modules, even though the worktree itself has none of its
+ * own). A single hardcoded `repoRoot/node_modules/.bin/tsx` path — repoRoot
+ * being the WORKTREE's own root — has no such fallback and breaks `npm test`
+ * in every freshly spawned worktree (caught live 2026-08-05, issue #17's own
+ * worker hit this and had to work around it with an uncommitted symlink).
+ */
+function resolveTsxBin(dir) {
+	let current = dir
+	while (true) {
+		const candidate = path.join(current, "node_modules", ".bin", "tsx")
+		if (fs.existsSync(candidate)) {
+			return candidate
+		}
+		const parent = path.dirname(current)
+		if (parent === current) {
+			throw new Error(`run-tests: could not find node_modules/.bin/tsx walking up from ${dir}`)
+		}
+		current = parent
+	}
+}
+
 function main() {
 	const filterArgIndex = process.argv.indexOf("--filter")
 	// `npm test -- orchestrator` passes "orchestrator" through as a bare
@@ -69,7 +96,7 @@ function main() {
 
 	process.stdout.write(`run-tests: running ${files.length} file(s)${filter ? ` (filter: "${filter}")` : ""}\n\n`)
 
-	const tsxBin = path.join(repoRoot, "node_modules", ".bin", "tsx")
+	const tsxBin = resolveTsxBin(repoRoot)
 
 	for (const file of files) {
 		try {
