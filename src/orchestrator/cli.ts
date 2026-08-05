@@ -36,7 +36,7 @@ import {
 	type OrchestratorGroup,
 	type OrchestratorState,
 } from "./state.js"
-import { runReview, type ReviewResult } from "./reviewer.js"
+import { runReviewWithRetries, type ReviewResult } from "./reviewer.js"
 import { analyzeWorktreeSessions } from "./log-analysis.js"
 import { runQa } from "../qa/qa.js"
 import { groupWorktreePath, isIterationExhaustion, isPidAlive, watchGroups } from "./watch.js"
@@ -474,6 +474,11 @@ export function buildTaskFileContent(spec: WorktreeSpec, issues: SplitIssue[]): 
 		"- Re-run real checks (tests, boot) after every change and paste the real output in your report —",
 		"  output in a report is a claim, not evidence, until reproduced.",
 		"- If you find yourself repeating the same check across issues, script it under scripts/.",
+		"- A `git worktree add <path> <ref>` ALWAYS checks out the committed state of <ref> — it never sees",
+		"  uncommitted changes sitting in another checkout's working tree, even though worktrees share the",
+		"  same .git. If you spin up a throwaway worktree to verify a fix you just made, either commit the",
+		"  fix first or manually copy the modified file(s) into the fresh worktree — otherwise you'll be",
+		"  testing the OLD code and get a confusing failure that looks like the fix didn't work.",
 		"",
 		"## Environment",
 		"",
@@ -824,6 +829,27 @@ export function handleReviewVerdict(
 				note: `exhausted ${currentRework} rework attempt(s); review still has ${result.findings.length} finding(s) — needs human`,
 			},
 		},
+	}
+}
+
+/**
+ * A review-SESSION failure (crash/budget/mistake-limit — see
+ * runReviewWithRetries) survived every retry: verdict "error", distinct from
+ * a real code "finding". This must NEVER feed into handleReviewVerdict's
+ * rework-a-worker path — there is nothing actionable in a placeholder error
+ * message, and spawning a worker to "fix" it wastes a full session for
+ * nothing (caught live 2026-08-05 on issue #17's own round: a review
+ * session's own bounded-failure triggered a pointless worker rework cycle).
+ * Always terminal needs-human — a human should look at why review sessions
+ * keep failing against this worktree, not have a worker respawned blindly.
+ */
+export function handleReviewSessionError(result: ReviewResult): Partial<OrchestratorGroup> {
+	return {
+		status: "needs-human",
+		review_verdict: result.verdict,
+		pending_review_findings: result.findings,
+		reviewed_at: new Date().toISOString(),
+		last_activity: { note: `review session kept failing: ${result.summary}` },
 	}
 }
 
@@ -2060,11 +2086,21 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 			}
 			process.stdout.write(`[orchestrate] reviewing ${group.name} (branch ${group.branch ?? "?"})...\n`)
 			try {
-				const result = await runReview({
+				const result = await runReviewWithRetries({
 					workspaceRoot: groupWorktreePath(repo, group),
 					mode: options.reviewMode,
 					model: reviewerModel,
 				})
+				// A review-SESSION failure must not feed into the rework-a-worker
+				// path below — see handleReviewSessionError's doc comment.
+				if (result.verdict === "error") {
+					await patchGroup(statePath, group.name, handleReviewSessionError(result))
+					process.stderr.write(
+						`[orchestrate] NEEDS-HUMAN: ${group.name}'s review session failed repeatedly — ` +
+							`${result.summary}\n`,
+					)
+					return true
+				}
 				const patch = {
 					review_verdict: result.verdict,
 					pending_review_findings: result.findings,

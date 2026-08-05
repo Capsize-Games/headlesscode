@@ -17,6 +17,7 @@ import {
 	buildReworkTaskFileContent,
 	buildSpawnEnv,
 	handleIterationExhaustion,
+	handleReviewSessionError,
 	handleReviewVerdict,
 	orchestrateMain,
 	parseOrchestrateArgs,
@@ -104,6 +105,14 @@ function findingResult(findings: string[] = ["finding one", "finding two"]): Rev
 	return { verdict: "finding", findings, summary: "REOPENED" }
 }
 
+function reviewSessionErrorResult(): ReviewResult {
+	return {
+		verdict: "error",
+		findings: ["[review session error] Bounded failure: 3 consecutive mistakes (limit 3)"],
+		summary: "Review session failed: Bounded failure: 3 consecutive mistakes (limit 3)",
+	}
+}
+
 // ─── buildReworkTaskFileContent ──────────────────────────────────────────────
 
 async function testReworkTaskFileContentIncludesFindingsAndIssues(): Promise<void> {
@@ -153,6 +162,28 @@ async function testFindingBelowCapSpawnsAndResetsState(): Promise<void> {
 	assert.equal(decision.patch.exit_code, undefined, "previous attempt's exit code cleared")
 	assert.ok(typeof decision.patch.spawned === "string", "spawned reset so the stall guard measures the rework worker")
 	assert.ok(decision.patch.last_activity && typeof decision.patch.last_activity === "object", "last_activity notes the rework")
+}
+
+/**
+ * 2026-08-05 real bug caught live on issue #17's own round: a review-SESSION
+ * failure (crash/budget/mistake-limit) was being treated exactly like a real
+ * code finding and fed into handleReviewVerdict, spawning a worker to "fix"
+ * a placeholder error message with nothing actionable in it. Verifies the
+ * fix: a session-error verdict goes straight to needs-human, WITHOUT ever
+ * calling handleReviewVerdict (no rework spawn, no reworkCount increment).
+ */
+async function testReviewSessionErrorGoesStraightToNeedsHumanNoRework(): Promise<void> {
+	const patch = handleReviewSessionError(reviewSessionErrorResult())
+	assert.equal(patch.status, "needs-human", "a review session failure must be terminal, not silently retried forever")
+	assert.equal(patch.review_verdict, "error")
+	assert.deepEqual(patch.pending_review_findings, [
+		"[review session error] Bounded failure: 3 consecutive mistakes (limit 3)",
+	])
+	assert.equal(patch.reworkCount, undefined, "must NOT touch reworkCount — this never went through the rework path")
+	assert.ok(
+		typeof patch.last_activity === "object" && patch.last_activity !== null && "note" in patch.last_activity,
+		"last_activity must explain the review session failure",
+	)
 }
 
 /**
@@ -966,6 +997,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["rework task file includes findings, issues, rework count", testReworkTaskFileContentIncludesFindingsAndIssues],
 	["rework task file handles empty findings gracefully", testReworkTaskFileContentHandlesEmptyFindings],
 	["finding below cap triggers rework spawn + state reset", testFindingBelowCapSpawnsAndResetsState],
+	["review session error goes straight to needs-human, never a rework spawn", testReviewSessionErrorGoesStraightToNeedsHumanNoRework],
 	["rework patch actually clears a stale cost_recorded on merge", testReworkPatchActuallyClearsCostRecordedOnMerge],
 	["continuation patch actually clears a stale cost_recorded on merge", testContinuationPatchActuallyClearsCostRecordedOnMerge],
 	["finding increments from an existing rework count", testFindingIncrementsFromExistingCount],

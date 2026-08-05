@@ -4,8 +4,39 @@
  */
 
 import assert from "node:assert/strict"
+import * as fs from "node:fs/promises"
+import * as os from "node:os"
+import * as path from "node:path"
 
-import { parseReviewResult } from "../reviewer.js"
+import { parseReviewResult, runReviewWithRetries } from "../reviewer.js"
+import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } from "../../engine/types.js"
+
+// ─── Fake LLM client (same pattern as engine/__tests__/loop.test.ts) ─────────
+
+class FakeLlmClient implements LlmClient {
+	constructor(private readonly script: Array<() => ChatMessage>) {}
+
+	async createChatCompletion(_request: LlmRequest): Promise<LlmResponse> {
+		const step = this.script.shift()
+		if (!step) {
+			throw new Error("FakeLlmClient: script exhausted (model kept calling)")
+		}
+		return { message: step() }
+	}
+}
+
+function toolCall(name: string, args: unknown): ChatMessage {
+	const call: ChatToolCall = {
+		id: `call_${Math.random().toString(36).slice(2)}`,
+		type: "function",
+		function: { name, arguments: typeof args === "string" ? args : JSON.stringify(args) },
+	}
+	return { role: "assistant", content: null, tool_calls: [call] }
+}
+
+function attemptCompletion(verdictLine: string): ChatMessage {
+	return toolCall("attempt_completion", { result: `Reviewed everything.\n\n${verdictLine}` })
+}
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
@@ -239,6 +270,72 @@ async function testMissingStructuredVerdictFallsBackToHeuristic(): Promise<void>
 	assert.equal(result.verdict, "finding")
 }
 
+// ─── runReviewWithRetries: end-to-end against a real HeadlessSession ─────────
+//
+// 2026-08-05 incident: a review SESSION failure (crash/budget/mistake-limit)
+// was reported as `verdict: "finding"` — indistinguishable from a real code
+// problem — so the orchestrator spawned a pointless worker rework cycle to
+// "fix" a placeholder error message. Fixed by introducing a distinct "error"
+// verdict and a retry wrapper that only retries on session failures, never
+// on a real clean/finding verdict. These tests exercise the REAL
+// HeadlessSession (via an injected FakeLlmClient, no network) rather than
+// just the string-parsing heuristic, since the bug was in how a failed
+// SESSION gets classified, not in text parsing.
+
+async function makeWorkspace(): Promise<string> {
+	return fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-review-retry-"))
+}
+
+async function testRunReviewWithRetriesReturnsCleanImmediately(): Promise<void> {
+	const ws = await makeWorkspace()
+	try {
+		const client = new FakeLlmClient([() => attemptCompletion("VERDICT: CLEAN")])
+		const result = await runReviewWithRetries({ workspaceRoot: ws, llmClient: client, maxIterations: 5 }, 2)
+		assert.equal(result.verdict, "clean")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testRunReviewWithRetriesRetriesAfterSessionError(): Promise<void> {
+	const ws = await makeWorkspace()
+	try {
+		// First "session" (3 calls): read_file on a nonexistent path 3x in a
+		// row -> a real tool error each time -> bounded-failure after
+		// consecutiveErrorLimit's default (3), reported as verdict "error".
+		// Second "session" (the retry): a clean attempt_completion.
+		const client = new FakeLlmClient([
+			() => toolCall("read_file", { path: "does/not/exist.txt" }),
+			() => toolCall("read_file", { path: "does/not/exist.txt" }),
+			() => toolCall("read_file", { path: "does/not/exist.txt" }),
+			() => attemptCompletion("VERDICT: CLEAN"),
+		])
+		const result = await runReviewWithRetries({ workspaceRoot: ws, llmClient: client, maxIterations: 5 }, 2)
+		assert.equal(result.verdict, "clean", "the retry's real clean verdict must win, not the first attempt's error")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testRunReviewWithRetriesExhaustsRetries(): Promise<void> {
+	const ws = await makeWorkspace()
+	try {
+		// Every attempt (1 initial + 2 retries = 3 total) hits the same
+		// bounded-failure via a nonexistent read_file, 3 calls each.
+		const failingAttempt = (): Array<() => ChatMessage> => [
+			() => toolCall("read_file", { path: "does/not/exist.txt" }),
+			() => toolCall("read_file", { path: "does/not/exist.txt" }),
+			() => toolCall("read_file", { path: "does/not/exist.txt" }),
+		]
+		const client = new FakeLlmClient([...failingAttempt(), ...failingAttempt(), ...failingAttempt()])
+		const result = await runReviewWithRetries({ workspaceRoot: ws, llmClient: client, maxIterations: 5 }, 2)
+		assert.equal(result.verdict, "error", "after exhausting retries, the caller must get the final error back")
+		assert.ok(result.findings[0]?.includes("review session error"), "error findings should be labeled as such")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -257,6 +354,9 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["structured verdict line is case-insensitive and trims whitespace", testStructuredVerdictIsCaseInsensitiveAndTrimsWhitespace],
 	["missing structured verdict falls back to the heuristic", testMissingStructuredVerdictFallsBackToHeuristic],
 	["bare 'wrong'/'regression'/'does not' in clean prose does not mark a finding", testBareWrongRegressionDoesNotMarkFinding],
+	["runReviewWithRetries: a normal clean verdict returns immediately, no retry", testRunReviewWithRetriesReturnsCleanImmediately],
+	["runReviewWithRetries: retries after a review-session error and succeeds on the 2nd attempt", testRunReviewWithRetriesRetriesAfterSessionError],
+	["runReviewWithRetries: exhausts retries and returns the final error verdict", testRunReviewWithRetriesExhaustsRetries],
 ]
 
 async function main(): Promise<void> {

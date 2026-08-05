@@ -12,7 +12,14 @@ export type { SplitIssue, WorktreeSpec } from "./split.js"
 export { loadState, loadStateSync, saveState, saveStateSync, updateGroup, defaultState } from "./state.js"
 export type { OrchestratorGroup, OrchestratorState } from "./state.js"
 
-export { runReview, parseReviewResult, reviewTools, HARNESS_ROOT, DEFAULT_REVIEW_PROMPT_PATH } from "./reviewer.js"
+export {
+	runReview,
+	runReviewWithRetries,
+	parseReviewResult,
+	reviewTools,
+	HARNESS_ROOT,
+	DEFAULT_REVIEW_PROMPT_PATH,
+} from "./reviewer.js"
 export type { ReviewOptions, ReviewResult } from "./reviewer.js"
 
 export { analyzeWorktreeSessions, formatAnalysisReport, listSessionIds } from "./log-analysis.js"

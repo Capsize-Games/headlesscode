@@ -87,8 +87,17 @@ export interface ReviewOptions {
 export interface ReviewResult {
 	/** Individual findings extracted from the reviewer's final report. */
 	findings: string[]
-	/** clean = nothing wrong found; finding = reviewer reported a problem. */
-	verdict: "clean" | "finding"
+	/**
+	 * clean = nothing wrong found; finding = reviewer reported a real problem
+	 * with the WORKER's code; error = the review SESSION ITSELF failed
+	 * (crashed, hit its own mistake/budget limit) before ever producing a
+	 * real verdict — deliberately distinct from "finding" so the caller
+	 * retries the REVIEW, not the worker's already-fine code (see
+	 * runReviewWithRetries; issue caught live 2026-08-05 — a review session's
+	 * own bounded-failure was being treated exactly like a code finding and
+	 * triggered a pointless worker rework cycle).
+	 */
+	verdict: "clean" | "finding" | "error"
 	/** The reviewer's full final summary. */
 	summary: string
 }
@@ -134,8 +143,11 @@ function defaultTaskText(workspaceRoot: string): string {
  * Run one headless review session against `workspaceRoot` using the reviewer
  * checklist as the system prompt override and a read-only executor. Returns
  * the parsed verdict/findings/summary. A failed session (LLM error, max
- * iterations) is reported as `verdict: "finding"` with a synthetic finding,
- * so the orchestrator never mistakes an inconclusive review for a clean one.
+ * iterations, bounded-failure mistake limit) is reported as `verdict:
+ * "error"` with a synthetic finding, so the orchestrator never mistakes an
+ * inconclusive review for a clean one — but also never mistakes it for a
+ * real code finding either (see runReviewWithRetries, which callers should
+ * generally use instead of calling this directly).
  */
 export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 	const {
@@ -170,11 +182,41 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 		const error = result.error ?? "unknown review session error"
 		return {
 			findings: [`[review session error] ${error}`],
-			verdict: "finding",
+			verdict: "error",
 			summary: `Review session failed: ${error}`,
 		}
 	}
 	return parseReviewResult(result.result)
+}
+
+/**
+ * Run a review, retrying ONLY when the review SESSION itself failed
+ * (verdict "error" — a crash, budget stop, or bounded-failure mistake limit
+ * inside the review session), up to `maxRetries` additional attempts. A real
+ * "clean" or "finding" verdict is returned immediately, first try — this
+ * only guards against the review session's own infrastructure hiccups, not
+ * against re-litigating a real finding.
+ *
+ * Why this exists: `runReview` reports a failed session as `verdict:
+ * "error"` rather than silently treating an inconclusive review as clean —
+ * correct fail-closed behavior. But the ORIGINAL caller-side handling
+ * treated ANY non-clean verdict (including "error") as a real code finding
+ * and triggered a full worker rework cycle to "fix" it — pointlessly
+ * respawning a worker against a placeholder error message with nothing
+ * actionable in it. Caught live 2026-08-05 running issue #17's own round.
+ * After `maxRetries` failed attempts, the caller gets the final "error"
+ * result back and should escalate to needs-human (a human should look at
+ * why review sessions keep failing) rather than reworking the worker.
+ */
+export async function runReviewWithRetries(options: ReviewOptions, maxRetries = 2): Promise<ReviewResult> {
+	let last: ReviewResult = { findings: [], verdict: "error", summary: "no attempt made" }
+	for (let attempt = 0; attempt <= maxRetries; attempt++) {
+		last = await runReview(options)
+		if (last.verdict !== "error") {
+			return last
+		}
+	}
+	return last
 }
 
 /**
