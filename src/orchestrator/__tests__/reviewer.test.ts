@@ -89,6 +89,50 @@ async function testFindingWinsOverCoincidentalCleanLanguage(): Promise<void> {
 	)
 }
 
+/**
+ * 2026-08-05 production incident (a second, distinct bug from the same
+ * over-broad word list, caught minutes after fixing the first): a
+ * genuinely CLEAN review — "No findings", "Issue left closed" — reported
+ * real baseline test counts ("12 failed, 1187 passed, ... 8 errors",
+ * pre-existing failures on master, unrelated to the change). The bare word
+ * "failed" alone tripped the OLD finding-marker list, misclassifying a
+ * clean review as a finding and spawning a completely unnecessary rework
+ * cycle — real API spend fixing a problem that did not exist. "Failed" /
+ * "wrong" / "regression" / "does not" are ordinary words that appear
+ * constantly in normal baseline-reporting prose and must NEVER be finding
+ * markers on their own; only `reopen(ed)` (the actual ground-truth action
+ * the reviewer takes on GitHub) and an explicit "verdict: ... finding"
+ * phrase are reliable.
+ */
+async function testBaselineFailedCountsDoNotFalselyTripAFinding(): Promise<void> {
+	const result = parseReviewResult(
+		[
+			"## Independent review — CLEAN, issue stays closed",
+			"",
+			"Reviewed per review-mode procedure. No findings; the previous scope item is fully addressed.",
+			"",
+			"### Full-suite baselines I personally confirmed",
+			"- `server/tests`: **12 failed, 1187 passed, 8 skipped, 39 deselected, 10 errors** — all pre-existing on master.",
+			"- `server/src/airunner_services/tests`: **3 failed, 928 passed, 9 deselected, 8 errors**.",
+			"",
+			"Issue left closed.",
+		].join("\n"),
+	)
+	assert.equal(
+		result.verdict,
+		"clean",
+		"baseline 'N failed' test counts must never be mistaken for a real finding — this is normal, expected pre-existing-failure reporting",
+	)
+}
+
+async function testBareWrongRegressionDoesNotMarkFinding(): Promise<void> {
+	// "wrong"/"regression"/"does not" as ordinary prose, no reopen anywhere.
+	const result = parseReviewResult(
+		"Nothing was wrong with the approach; there is no regression, and the fix does not touch server code. Verified clean.",
+	)
+	assert.equal(result.verdict, "clean")
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -98,6 +142,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["unmarked report defaults to clean", testCleanVerdictDefaultWhenUnmarked],
 	["verdict: clean with no findings -> clean", testCleanVerdictDoesNotTripOnCleanupWord],
 	["a finding always wins over coincidental 'verified clean' text elsewhere", testFindingWinsOverCoincidentalCleanLanguage],
+	["baseline 'N failed' test counts do not falsely trip a finding", testBaselineFailedCountsDoNotFalselyTripAFinding],
+	["bare 'wrong'/'regression'/'does not' in clean prose does not mark a finding", testBareWrongRegressionDoesNotMarkFinding],
 ]
 
 async function main(): Promise<void> {

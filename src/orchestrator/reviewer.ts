@@ -194,6 +194,23 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
  * trigger. Never weaken this back to "finding && !clean" — a report is
  * either clean (nothing wrong) or it has findings; it cannot be both, and
  * when in doubt (both markers present), a real finding must win.
+ *
+ * The finding-marker word list is deliberately narrow — only `reopen(ed)`
+ * and an explicit `verdict: ... finding` phrase — NOT bare words like
+ * "failed", "wrong", "regression", or "does not". A second real production
+ * bug from the SAME over-broad list: a genuinely clean review's baseline
+ * test counts ("12 failed, 1187 passed" — pre-existing failures on master,
+ * unrelated to the change) contain the word "failed", which alone tripped
+ * the OLD list and misclassified a clean review as a finding — spawning a
+ * completely unnecessary rework cycle, spending real API cost on a fix
+ * for a problem that did not exist. "Failed"/"wrong"/"regression" are
+ * ordinary words that show up constantly in normal baseline-reporting
+ * prose; they are NOT a reliable signal on their own. `reopen(ed)` is
+ * reliable because it names the actual ground-truth action the reviewer
+ * takes on GitHub when — and only when — there's a real problem. Do not
+ * add generic words back to this list without a specific report shape
+ * that needs them AND a test proving it doesn't false-positive on normal
+ * baseline/prose language.
  */
 export function parseReviewResult(text: string): ReviewResult {
 	const summary = text.trim()
@@ -222,8 +239,7 @@ export function parseReviewResult(text: string): ReviewResult {
 		}
 	}
 
-	const hasFindingMarker =
-		/\b(reopen(ed)?|finding|verdict[^.\n]*finding|regression|failed|does\s+not\b|wrong)\b/i.test(lower)
+	const hasFindingMarker = /\b(reopen(ed)?|verdict[^.\n]*finding)\b/i.test(lower)
 
 	const verdict: "clean" | "finding" = hasFindingMarker ? "finding" : "clean"
 	return { findings: [...new Set(findings)], verdict, summary }
