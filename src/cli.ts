@@ -29,6 +29,7 @@ import { watchMain } from "./watcher/cli.js"
 import { checkpointsMain } from "./checkpoints/cli.js"
 import { dashboardMain } from "./dashboard/cli.js"
 import { indexMain } from "./codesearch/cli.js"
+import { codemapMain } from "./codemap/cli.js"
 import { provisionMain, pushPrMain } from "./github/cli.js"
 import { decisionProxyMain } from "./decision-proxy/cli.js"
 import { migrateMain } from "./migrate/cli.js"
@@ -181,6 +182,13 @@ Subcommands:
               never auto-triggered mid-session. --embedding-backend picks
               openrouter (default) or ollama (local). See
               \`npx tsx src/cli.ts index --help\` for full options.
+  headlesscode codemap --workspace <path> [--force] [--watch] [--interval-ms <n>]
+              Build/refresh a project's deterministic module/import map
+              (codemap.json/codemap.lock/codemap.html in the central project
+              store). No LLM anywhere in the pipeline; regeneration is
+              fingerprint-aware (an unchanged repo writes nothing). --watch
+              turns it into a long-running poll loop. See
+              \`npx tsx src/cli.ts codemap --help\` for full options.
   headlesscode provision --installation-id <id> --owner <o> --repo <r> --target <dir>
               Clone a GitHub repo the App installation can access into a local
               dir (token stripped from the remote URL), ready as a
@@ -626,6 +634,15 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// never auto-triggered mid-session (it costs real money and takes time).
 	if (argv[0] === "index") {
 		return indexMain(argv.slice(1))
+	}
+
+	// Deterministic per-project codemap subcommand: `headlesscode codemap ...` —
+	// generate the module/import map (codemap.json/codemap.lock/codemap.html)
+	// into the central project store; `--watch` becomes a long-running poll
+	// loop (see src/codemap/ + docs/codemap.md). No LLM anywhere in the
+	// pipeline — mechanical, deterministic, cheap to regenerate.
+	if (argv[0] === "codemap") {
+		return codemapMain(argv.slice(1))
 	}
 
 	// GitHub App repo provisioning subcommand: `headlesscode provision ...` —
