@@ -19,6 +19,9 @@
 #   6. The runtime orchestration scripts (spawn-parallel-worktrees.sh,
 #      run-worker.sh, headlesscode-answer.sh) exist and are executable in
 #      the image — a real non-dry-run orchestrate run shells out to them.
+#   7. The bundled stack rules (shared/stacks/) are seeded into the
+#      container's central store and spliced into a dry-run prompt for a
+#      TypeScript project.
 #
 # Requires: docker (classic or buildx), network access for npm ci.
 # Exit code: 0 = PASS, 1 = FAIL.
@@ -41,7 +44,7 @@ trap cleanup EXIT
 
 cd "$ROOT"
 
-echo "==> [1/6] building image: docker build -t $TAG -f docker/Dockerfile ."
+echo "==> [1/7] building image: docker build -t $TAG -f docker/Dockerfile ."
 if ! docker build -t "$TAG" -f docker/Dockerfile .; then
 	echo "FATAL: image build failed — see output above"
 	exit 1
@@ -49,7 +52,7 @@ fi
 pass "image built: $TAG"
 
 echo
-echo "==> [2/6] headlesscode --version"
+echo "==> [2/7] headlesscode --version"
 VERSION_OUT="$(docker run --rm "$TAG" headlesscode --version 2>&1)"
 VERSION_STATUS=$?
 if [ "$VERSION_STATUS" -ne 0 ]; then
@@ -63,7 +66,7 @@ case "$VERSION_OUT" in
 esac
 
 echo
-echo "==> [3/6] headlesscode --dry-run (no API key / no LLM)"
+echo "==> [3/7] headlesscode --dry-run (no API key / no LLM)"
 DRYRUN_OUT="$(docker run --rm -w /workspace "$TAG" headlesscode --dry-run --workspace /workspace 2>&1)"
 DRYRUN_STATUS=$?
 if [ "$DRYRUN_STATUS" -ne 0 ]; then
@@ -78,7 +81,7 @@ else
 fi
 
 echo
-echo "==> [4/6] headlesscode orchestrate --dry-run (scratch git repo + --issues-json)"
+echo "==> [4/7] headlesscode orchestrate --dry-run (scratch git repo + --issues-json)"
 # The inner script runs INSIDE the container; the /data volume is shared, so
 # the scratch repo + issues file written here are visible there.
 INNER_SCRIPT=$(cat <<'EOS'
@@ -106,7 +109,7 @@ else
 fi
 
 echo
-echo "==> [5/6] /data volume convention (state dirs created on the volume)"
+echo "==> [5/7] /data volume convention (state dirs created on the volume)"
 DATA_OUT="$(docker run --rm -v "$VOLUME:/data" "$TAG" bash -c 'ls -d /data/headlesscode-workspaces /data/headlesscode-home && cd /data/headlesscode-workspaces && headlesscode --version' 2>&1)"
 DATA_STATUS=$?
 if [ "$DATA_STATUS" -ne 0 ]; then
@@ -121,7 +124,7 @@ else
 fi
 
 echo
-echo "==> [6/6] runtime orchestration scripts present + executable"
+echo "==> [6/7] runtime orchestration scripts present + executable"
 SCRIPTS_OUT="$(docker run --rm "$TAG" bash -c 'ls -l /opt/headlesscode/scripts/ && for f in spawn-parallel-worktrees.sh run-worker.sh headlesscode-answer.sh; do test -x /opt/headlesscode/scripts/$f || exit 1; done' 2>&1)"
 SCRIPTS_STATUS=$?
 if [ "$SCRIPTS_STATUS" -ne 0 ]; then
@@ -133,6 +136,32 @@ if [ "$SCRIPTS_STATUS" -eq 0 ]; then
 	pass "orchestration scripts present + executable in the image"
 else
 	fail "runtime orchestration scripts missing or not executable"
+fi
+
+echo
+echo "==> [7/7] shipped stack rules seeded into the central store + spliced into prompts"
+# The entrypoint seeds /opt/headlesscode/shared into $HOME at container start;
+# a dry-run prompt for a TypeScript project must then contain the
+# STACK-SPECIFIC INSTRUCTIONS section (the seeded typescript/rules.md).
+STACK_OUT="$(docker run --rm -v "$VOLUME:/data" -w /data "$TAG" bash -c '
+set -e
+test -s "$HOME/.local/share/headlesscode/shared/stacks/typescript/rules.md"
+test -s "$HOME/.local/share/headlesscode/shared/stacks/react/rules.md"
+mkdir -p /data/ts-repo
+echo "{}" > /data/ts-repo/tsconfig.json
+COUNT=$(headlesscode --dry-run --workspace /data/ts-repo 2>&1 | grep -c "STACK-SPECIFIC INSTRUCTIONS")
+echo "stack-section-count=$COUNT"
+' 2>&1)"
+STACK_STATUS=$?
+if [ "$STACK_STATUS" -ne 0 ]; then
+	fail "stack-rules seeding check exited $STACK_STATUS"
+	echo "$STACK_OUT"
+fi
+echo "$STACK_OUT" | sed 's/^/  /'
+if [ "$STACK_STATUS" -eq 0 ] && grep -q "stack-section-count=[1-9]" <<<"$STACK_OUT"; then
+	pass "stack rules seeded in container + spliced into the dry-run prompt"
+else
+	fail "stack rules not seeded/spliced in the container"
 fi
 
 echo

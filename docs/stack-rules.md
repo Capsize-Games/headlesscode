@@ -43,6 +43,24 @@ A missing file is never an error — same idiom as the existing missing-file
 handling for `mode-models.json` / `.roomodes` (zero config = zero behavior
 change).
 
+## Where the shipped content lives
+
+The canonical per-stack content is committed to this repo under
+`shared/stacks/<stack>/rules.md` — a mirror of the central runtime layout —
+and reaches the central store two ways:
+
+- **Local install** (`scripts/install-cli.sh`): syncs the repo's `shared/`
+  tree into `~/.local/share/headlesscode/shared/` (idempotent — only ever
+  adds/overwrites files under that tree, never deletes). Re-run the script
+  after `git pull` to pick up content changes, same as the CLI wrapper.
+- **Docker image** (`docker/Dockerfile` + `docker/entrypoint.sh`): the image
+  COPYs `shared/`, and the entrypoint seeds it into the container's `$HOME`
+  at every start (the central store lives on the `/data` volume, which
+  shadows image content).
+
+A project-local `.roo/rules-stack-<stack>/rules.md` in a target repo is never
+touched by either path — that tier stays purely user-owned.
+
 ## Detection heuristics
 
 Starting point; per-stack content (not these signals) is refined in the
