@@ -14,7 +14,14 @@ import * as path from "node:path"
 import { spawnSync } from "node:child_process"
 
 import { inspectGroup, isIterationExhaustion, tailLog, watchGroups, DEFAULT_STALL_TIMEOUT_MS } from "../watch.js"
-import { defaultState, loadStateSync, saveStateSync, type OrchestratorGroup, type OrchestratorState } from "../state.js"
+import {
+	defaultState,
+	loadStateSync,
+	saveStateSync,
+	updateGroup,
+	type OrchestratorGroup,
+	type OrchestratorState,
+} from "../state.js"
 
 async function tmpRepo(): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-watch-blocked-"))
@@ -310,7 +317,13 @@ async function testWatchGroupsRecordsCostOnDoneTransition(): Promise<void> {
 			"utf-8",
 		)
 
-		const summary = await watchGroups({ repoRoot, statePath, pollIntervalMs: 20, stderrWriter: () => {} })
+		const summary = await watchGroups({
+			repoRoot,
+			statePath,
+			pollIntervalMs: 20,
+			stderrWriter: () => {},
+			reviewEnabled: false,
+		})
 		assert.equal(summary.allTerminal, true)
 
 		const persisted = loadStateSync(statePath)
@@ -323,6 +336,83 @@ async function testWatchGroupsRecordsCostOnDoneTransition(): Promise<void> {
 		assert.deepEqual(records[0]?.issues, [42])
 		assert.equal(records[0]?.costUsd, 0.05)
 		assert.equal(records[0]?.status, "done")
+	} finally {
+		await fs.rm(repoRoot, { recursive: true, force: true })
+	}
+}
+
+/**
+ * 2026-08-05 incident: recordCostIfSettled originally fired the FIRST time
+ * a group was observed terminal — before review (or QA) even ran. Since
+ * review/QA are separate HeadlessSession runs against the SAME worktree,
+ * each writing their own `.headlesscode/usage/*.jsonl`, and nothing
+ * re-triggers a usage rollup for a "done" group unless a rework respawn
+ * happens, their real cost was silently never captured. This reproduces
+ * the fix: with review enabled, a "done" group must NOT be recorded until
+ * `review_verdict` is set, and the recorded total must include the review
+ * session's own usage file, not just the original worker's.
+ */
+async function testWatchGroupsWaitsForReviewBeforeRecordingCost(): Promise<void> {
+	const repoRoot = await tmpRepo()
+	try {
+		const wtPath = path.join(repoRoot, ".worktrees", "w1")
+		const usageDir = path.join(wtPath, ".headlesscode", "usage")
+		await fs.mkdir(usageDir, { recursive: true })
+		const statePath = path.join(repoRoot, ".worktrees", ".orchestrator-state.json")
+		saveStateSync(statePath, { ...defaultState("round-1"), groups: [baseGroup({ issues: [42] })] })
+		await fs.mkdir(path.join(wtPath, ".harness.done"))
+		await fs.writeFile(path.join(wtPath, ".harness.exit"), "0", "utf-8")
+		await fs.writeFile(
+			path.join(usageDir, "worker.jsonl"),
+			`${JSON.stringify({ sessionId: "worker", costUsd: 0.05, inputTokens: 1000, outputTokens: 100, cachedTokens: 400, iterations: 12 })}\n`,
+			"utf-8",
+		)
+
+		let callbackCalls = 0
+		const summary = await watchGroups({
+			repoRoot,
+			statePath,
+			pollIntervalMs: 20,
+			stderrWriter: () => {},
+			reviewEnabled: true,
+			onGroupUpdate: async (group) => {
+				callbackCalls++
+				// Simulate the real review step: it's a SEPARATE HeadlessSession
+				// against the same worktree, so it writes its OWN usage file,
+				// then reports a clean verdict — same shape as cli.ts's real
+				// runReview + state patch.
+				await fs.writeFile(
+					path.join(usageDir, "review.jsonl"),
+					`${JSON.stringify({ sessionId: "review", costUsd: 0.02, inputTokens: 500, outputTokens: 50, cachedTokens: 100, iterations: 8 })}\n`,
+					"utf-8",
+				)
+				saveStateSync(
+					statePath,
+					updateGroup(loadStateSync(statePath), group.name, {
+						review_verdict: "clean",
+						pending_review_findings: [],
+						reviewed_at: new Date().toISOString(),
+					}),
+				)
+				return undefined
+			},
+		})
+		assert.equal(summary.allTerminal, true)
+		assert.equal(callbackCalls, 1, "review must run exactly once")
+
+		const persisted = loadStateSync(statePath)
+		const group = persisted.groups.find((g) => g.name === "w1")
+		assert.ok(group?.cost_recorded, "cost must be recorded once review is settled")
+		assert.equal(group?.review_verdict, "clean")
+
+		const { readCostHistory } = await import("../cost-history.js")
+		const records = await readCostHistory(repoRoot)
+		assert.equal(records.length, 1, "exactly one cost-history record, recorded after review")
+		assert.equal(
+			records[0]?.costUsd,
+			0.07,
+			"recorded cost must include BOTH the worker's and the review session's usage, not just the worker's",
+		)
 	} finally {
 		await fs.rm(repoRoot, { recursive: true, force: true })
 	}
@@ -575,6 +665,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["watchGroups: BLOCKED line not repeated while the group stays blocked", testWatchGroupsDoesNotRepeatBlockedLineWhileStillBlocked],
 	["watchGroups: DONE line printed on the transition to done", testWatchGroupsPrintsDoneTransitionToStderr],
 	["watchGroups: records cost history exactly once on the done transition", testWatchGroupsRecordsCostOnDoneTransition],
+	["watchGroups: waits for review before recording cost, then includes the review session's own usage", testWatchGroupsWaitsForReviewBeforeRecordingCost],
 	["watchGroups: FAILED line printed on the transition to failed", testWatchGroupsPrintsFailedTransitionToStderr],
 	["isIterationExhaustion matches the exact max-iterations error", testIsIterationExhaustionMatchesExactError],
 	["isIterationExhaustion rejects budget/real failures and empty summaries", testIsIterationExhaustionRejectsOtherFailures],

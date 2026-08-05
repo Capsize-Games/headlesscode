@@ -99,6 +99,22 @@ export interface WatchOptions {
 	stderrWriter?: (text: string) => void
 	/** Abort the watch loop (e.g. from a parent orchestrator). */
 	signal?: AbortSignal
+	/**
+	 * Whether this round runs the automated review step (default true,
+	 * matching orchestrate's own `--no-review` default). Cost-history
+	 * recording (recordCostIfTerminal) needs this: a "done" group's review
+	 * (and, if review is clean, QA) hasn't necessarily run yet the FIRST
+	 * moment the worker's own `.harness.done` marker appears — recording
+	 * right then would miss those sessions' cost. When review is enabled,
+	 * recording waits for `group.review_verdict` to be set.
+	 */
+	reviewEnabled?: boolean
+	/**
+	 * Whether this round runs QA (default false, matching orchestrate's own
+	 * `--qa` opt-in default). When enabled, cost-history recording for a
+	 * "done" group additionally waits for `group.qa` to be set.
+	 */
+	qaEnabled?: boolean
 }
 
 export interface WatchSummary {
@@ -157,7 +173,7 @@ function readExitCode(wtPath: string): number | undefined {
  * undefined when no usage data is found (missing dir, no files, or every
  * file unreadable/empty) so callers don't stamp a spurious all-zero usage.
  */
-function readWorktreeUsage(wtPath: string): OrchestratorGroup["usage"] | undefined {
+export function readWorktreeUsage(wtPath: string): OrchestratorGroup["usage"] | undefined {
 	const dir = path.join(wtPath, ".headlesscode", "usage")
 	let files: string[]
 	try {
@@ -513,25 +529,56 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 	const isTerminal = (g: OrchestratorGroup): boolean =>
 		g.status === "done" || g.status === "failed" || g.status === "needs-human"
 
+	const reviewEnabled = options.reviewEnabled ?? true
+	const qaEnabled = options.qaEnabled ?? false
+
+	/**
+	 * Whether a group has NO more automated work pending, i.e. it's safe to
+	 * record its cost as final. For "failed"/"needs-human" this is just
+	 * `isTerminal` — cli.ts's review/QA sections both gate on
+	 * `group.status === "done"`, so a failed or needs-human group never gets
+	 * reviewed/QA'd at all. For "done" specifically, review (if enabled) and
+	 * QA (if enabled) may still be IN PROGRESS the first moment the worker's
+	 * own `.harness.done` marker appears — recording right then would miss
+	 * those sessions' real cost entirely (they're separate HeadlessSession
+	 * runs against the same worktree, each writing their own
+	 * `.headlesscode/usage/*.jsonl`, but nothing re-triggers a usage rollup
+	 * for a "done" group unless a rework respawn happens). So for "done",
+	 * wait for `review_verdict`/`qa` to actually be populated first.
+	 */
+	const isSettled = (g: OrchestratorGroup): boolean => {
+		if (g.status !== "done") {
+			return isTerminal(g)
+		}
+		const reviewSettled = !reviewEnabled || g.review_verdict !== undefined
+		const qaSettled = !qaEnabled || g.qa !== undefined
+		return reviewSettled && qaSettled
+	}
+
 	// Mandatory cost/token history recording (cost-history.ts): fires exactly
-	// once per group, the FIRST time it's observed in any terminal status,
+	// once per group, the FIRST time it's observed SETTLED (see isSettled),
 	// regardless of which of orchestrate's many branches got it there (a
-	// clean "done", a real failure, a rework-cap exhaustion, a
+	// clean "done" + review + QA, a real failure, a rework-cap exhaustion, a
 	// continuation-cap exhaustion all reach this the same way). A single
 	// insertion point here — rather than one call per terminal-outcome
 	// branch in cli.ts's onGroupUpdate — means no future branch can
 	// silently skip recording by forgetting to call it. Called from two
-	// spots below: for a group ALREADY terminal at the top of a poll pass
+	// spots below: for a group ALREADY settled at the top of a poll pass
 	// (e.g. reloaded from disk after onGroupUpdate marked it needs-human),
-	// and immediately after a group transitions to terminal WITHIN the
-	// current pass (needed because `allTerminal` can return before the
+	// and immediately after a group's settledness may have changed WITHIN
+	// the current pass (needed because `allTerminal` can return before the
 	// loop ever revisits that group at the top of a fresh pass).
-	const recordCostIfTerminal = async (g: OrchestratorGroup): Promise<void> => {
-		if (!isTerminal(g) || g.cost_recorded !== undefined) {
+	const recordCostIfSettled = async (g: OrchestratorGroup): Promise<void> => {
+		if (!isSettled(g) || g.cost_recorded !== undefined) {
 			return
 		}
+		// Recompute usage FRESH from the worktree rather than trusting
+		// `g.usage` (which may predate the review/QA sessions that just ran
+		// against the same worktree, each writing their own usage file) —
+		// this is what actually makes review/QA cost visible in the record.
+		const freshUsage = readWorktreeUsage(groupWorktreePath(repoRoot, g))
 		try {
-			await recordGroupCost(repoRoot, g)
+			await recordGroupCost(repoRoot, { ...g, usage: freshUsage })
 		} catch (err) {
 			writeStderr(
 				`[orchestrate] cost recording for ${g.name} failed: ${err instanceof Error ? err.message : String(err)}\n`,
@@ -563,7 +610,7 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 
 		for (const group of state.groups) {
 			if (isTerminal(group)) {
-				await recordCostIfTerminal(group)
+				await recordCostIfSettled(group)
 				continue
 			}
 			const patch = inspectGroup(repoRoot, group, now, stallTimeoutMs)
@@ -604,12 +651,19 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 					}
 					break
 				}
-				// No reload: the group's status (from inspectGroup's patch above,
-				// already including `usage` for a done/failed transition) is
-				// final for this pass. Record cost now — `allTerminal` below can
-				// return before the loop ever revisits this group at the top of
-				// a fresh pass, so this can't wait for that check to catch it.
-				await recordCostIfTerminal(updated)
+				// No reload: `updated` was captured BEFORE onGroupUpdate ran, so
+				// it can't see review_verdict/qa the callback just wrote
+				// directly to disk without signaling reload (e.g. the clean,
+				// no-rework path) — re-fetch fresh before checking settledness,
+				// or a "done" group whose review/QA JUST finished this same
+				// tick would look unsettled and never get recorded. Record now
+				// (rather than waiting for a future pass) because `allTerminal`
+				// below can return before the loop ever revisits this group at
+				// the top of a fresh pass.
+				const freshAfterCallback = loadStateSync(statePath).groups.find((g) => g.name === group.name)
+				if (freshAfterCallback) {
+					await recordCostIfSettled(freshAfterCallback)
+				}
 			}
 		}
 

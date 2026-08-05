@@ -1594,6 +1594,8 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		repoRoot: repo,
 		statePath,
 		pollIntervalMs: options.pollIntervalMs,
+		reviewEnabled: options.review,
+		qaEnabled: options.qa,
 		onGroupUpdate: async (group, currentState) => {
 			// Auto-continue on iteration-exhaustion (issue #2 Part 2): a worker
 			// that failed ONLY because it hit --max-iterations gets a fresh
