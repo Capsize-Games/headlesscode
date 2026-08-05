@@ -26,6 +26,11 @@ import { promisify } from "node:util"
 const execFileP = promisify(execFile)
 
 const REAL_HOME = os.homedir()
+// The test runner sets $HEADLESSCODE_DATA_DIR globally (scripts/run-tests.mjs
+// -> .headlesscode/test-store), and getCentralStackRulesDir() now honors it
+// via projectStoreRoot() — remember the original so the per-test sandbox can
+// be unwound in the cleanup below.
+const REAL_DATA_DIR = process.env.HEADLESSCODE_DATA_DIR
 const ROOT_SANDBOX = path.join(os.tmpdir(), `hc-stacks-root-${process.pid}-${Date.now()}`)
 
 import { buildSystemPrompt } from "../prompt.js"
@@ -49,6 +54,11 @@ async function sandboxHome(): Promise<string> {
 	activeHomes.push(home)
 	process.env.HOME = home
 	process.env.USERPROFILE = home
+	// getCentralStackRulesDir() resolves through projectStoreRoot(), which
+	// honors $HEADLESSCODE_DATA_DIR — and the test runner sets it globally.
+	// Point it at a per-test scratch dir so the central stack-rules store is
+	// isolated per test just like $HOME is.
+	process.env.HEADLESSCODE_DATA_DIR = path.join(ROOT_SANDBOX, `data-${activeHomes.length - 1}`)
 	return home
 }
 
@@ -255,16 +265,20 @@ async function testNoRulesSourceIsZeroConfig(): Promise<void> {
 
 /** Central rules.md for a detected stack is loaded with its source label. */
 async function testCentralStackRulesLoaded(): Promise<void> {
-	const home = await sandboxHome()
+	await sandboxHome()
 	await writeCentralStackRules("python", "PY-CENTRAL-MARKER: global python conventions")
 	const ws = await makeProject({ "pyproject.toml": "[project]\nname = \"x\"\n" })
 
 	const loaded = await loadStackRules(ws)
 	assert.equal(sorted(loaded.stacks), "python", "expected python detected")
 	assert.ok(loaded.content.includes("PY-CENTRAL-MARKER"), "expected central python rules in content")
+	// The label must be the engine's OWN central path — under the per-test
+	// $HEADLESSCODE_DATA_DIR sandbox, never the real ~/.local/share/headlesscode.
+	const centralFile = getCentralStackRulesFile("python")
+	assert.ok(loaded.content.includes(centralFile), "expected the central file path labelled in content")
 	assert.ok(
-		loaded.content.includes(path.join(home, ".local", "share", "headlesscode", "shared", "stacks", "python", "rules.md")),
-		"expected the central file path labelled in content",
+		!loaded.content.includes(path.join(REAL_HOME, ".local", "share", "headlesscode")),
+		"central rules must never be read from the real home store",
 	)
 }
 
@@ -339,6 +353,56 @@ async function testShippedStackRulesContent(): Promise<void> {
 	// and #11) must be present.
 	assert.ok(shippedStacks.includes("fastapi"), "expected shipped FastAPI stack rules (issue #10)")
 	assert.ok(shippedStacks.includes("postgresql"), "expected shipped PostgreSQL stack rules (issue #11)")
+}
+
+/** The install→read round trip must ACTUALLY work: run the repo's
+ * scripts/sync-stack-rules.sh under a scratch $HEADLESSCODE_DATA_DIR (the way
+ * scripts/install-cli.sh invokes it), then load the shipped rules through the
+ * ENGINE with the same env and confirm they splice. Guards the #10/#11
+ * shipping path against the script and the engine silently diverging on the
+ * store root — the $HEADLESSCODE_DATA_DIR divergence this round fixed (the
+ * script used to install to the override while the engine read
+ * ~/.local/share/headlesscode, so shipped content never spliced). */
+async function testInstallToReadRoundTrip(): Promise<void> {
+	await sandboxHome() // sandboxes $HOME AND $HEADLESSCODE_DATA_DIR per test
+	const repoRoot = path.resolve(fileURLToPath(new URL("../../../", import.meta.url)))
+	const syncScript = path.join(repoRoot, "scripts", "sync-stack-rules.sh")
+	assert.ok((await fs.stat(syncScript)).isFile(), "expected scripts/sync-stack-rules.sh in the repo")
+
+	// 1. Install the shipped content exactly the way install-cli.sh does
+	//    (inherits the sandboxed env: HOME + HEADLESSCODE_DATA_DIR).
+	await execFileP("bash", [syncScript], { cwd: repoRoot })
+
+	// 2. The engine must read EXACTLY where the script wrote.
+	const dataDir = path.join(ROOT_SANDBOX, `data-${activeHomes.length - 1}`)
+	assert.equal(
+		getCentralStackRulesDir(),
+		path.join(dataDir, "shared", "stacks"),
+		"engine central dir must equal the sync script's install target under $HEADLESSCODE_DATA_DIR",
+	)
+	for (const stack of ["fastapi", "postgresql"]) {
+		const installed = await fs.readFile(path.join(getCentralStackRulesDir(), stack, "rules.md"), "utf-8")
+		assert.ok(installed.trim().length > 0, `sync must install a non-empty ${stack}/rules.md`)
+	}
+
+	// 3. A real engine load with the same env must splice the shipped content.
+	const fastapiWs = await makeProject({ "requirements.txt": "fastapi[all]==0.100.0\n" })
+	const fastapiLoaded = await loadStackRules(fastapiWs)
+	assert.ok(
+		fastapiLoaded.content.includes("Stack rules: FastAPI"),
+		"shipped FastAPI rules must splice through the engine after sync",
+	)
+	assert.ok(
+		fastapiLoaded.content.includes(getCentralStackRulesFile("fastapi")),
+		"spliced FastAPI rules must be labelled with the engine's central path",
+	)
+
+	const pgWs = await makeProject({ "requirements.txt": "asyncpg==0.28.0\n" })
+	const pgLoaded = await loadStackRules(pgWs)
+	assert.ok(
+		pgLoaded.content.includes("Stack rules: PostgreSQL"),
+		"shipped PostgreSQL rules must splice through the engine after sync",
+	)
 }
 
 // ─── buildSystemPrompt splice tests ──────────────────────────────────────────
@@ -420,6 +484,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["central rules splice before project rules for the same stack", testCentralThenProjectOrder],
 	["detected stacks with no rules.md contribute nothing", testDetectedButNoRulesIsEmpty],
 	["shipped shared/stacks content is present and non-empty", testShippedStackRulesContent],
+	["install-to-read round trip under HEADLESSCODE_DATA_DIR", testInstallToReadRoundTrip],
 	["zero-config prompt unchanged (byte-identical, no section)", testZeroConfigPromptUnchanged],
 	["stack rules spliced alphabetically with header", testStackRulesSplicedAlphabetically],
 	["appendStackRulesSection format", testAppendSectionFormat],
@@ -436,6 +501,19 @@ async function main(): Promise<void> {
 		`os.homedir() did not pick up the sandboxed HOME (${os.homedir()}); refusing to run against the real home`,
 	)
 	assert.equal(process.env.HOME, path.join(ROOT_SANDBOX, "home-0"))
+	// Same guard for the data-dir override: getCentralStackRulesDir() reads it
+	// via projectStoreRoot(), so a missed override would write to the REAL
+	// (or the runner's shared test) store.
+	assert.equal(
+		process.env.HEADLESSCODE_DATA_DIR,
+		path.join(ROOT_SANDBOX, "data-0"),
+		"HEADLESSCODE_DATA_DIR must be sandboxed per test",
+	)
+	assert.equal(
+		getCentralStackRulesDir(),
+		path.join(ROOT_SANDBOX, "data-0", "shared", "stacks"),
+		"getCentralStackRulesDir() must resolve under the per-test data dir",
+	)
 
 	let failed = 0
 	for (const [name, fn] of tests) {
@@ -458,5 +536,10 @@ async function main(): Promise<void> {
 main().finally(async () => {
 	process.env.HOME = REAL_HOME
 	delete process.env.USERPROFILE
+	if (REAL_DATA_DIR === undefined) {
+		delete process.env.HEADLESSCODE_DATA_DIR
+	} else {
+		process.env.HEADLESSCODE_DATA_DIR = REAL_DATA_DIR
+	}
 	await fs.rm(ROOT_SANDBOX, { recursive: true, force: true }).catch(() => {})
 })

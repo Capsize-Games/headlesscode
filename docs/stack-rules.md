@@ -36,16 +36,20 @@ their source path in the prompt):
 
 | Tier | Path |
 | ---- | ---- |
-| Central (global, ships with headlesscode) | `~/.local/share/headlesscode/shared/stacks/<stack>/rules.md` |
+| Central (global, ships with headlesscode) | `<store>/shared/stacks/<stack>/rules.md` — `<store>` is `projectStoreRoot()` (`~/.local/share/headlesscode` by default; `$HEADLESSCODE_DATA_DIR` overrides it, exactly like every other central-store consumer) |
 | Project-local (optional override/addition) | `<workspaceRoot>/.roo/rules-stack-<stack>/rules.md` |
 
 **Repo source for the central tier.** The central tier's content is authored in
 this repo at `shared/stacks/<stack>/rules.md` (this is what "ships with
 headlesscode" means — the repo is the canonical source), and installed into the
 per-machine central store by `scripts/sync-stack-rules.sh`, which
-`scripts/install-cli.sh` also invokes. A missing file is never an error — same
-idiom as the existing missing-file handling for `mode-models.json` /
-`.roomodes` (zero config = zero behavior change).
+`scripts/install-cli.sh` also invokes. The script installs to the SAME root the
+engine reads (`getCentralStackRulesDir()` in `src/engine/stacks.ts` resolves
+through `projectStoreRoot()`, so a `$HEADLESSCODE_DATA_DIR` override is honored
+on both sides — an install is only real if the engine can read it back). A
+missing file is never an error — same idiom as the existing missing-file
+handling for `mode-models.json` / `.roomodes` (zero config = zero behavior
+change).
 
 ## Detection heuristics
 

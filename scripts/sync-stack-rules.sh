@@ -4,14 +4,19 @@
 #
 # The headlesscode repo is the canonical source of the per-stack rules.md files
 # ("ships with headlesscode" — src/engine/stacks.ts documents the central tier
-# at ~/.local/share/headlesscode/shared/stacks/<stack>/rules.md). The central
-# store is the per-machine INSTALL TARGET: it is what every session on that
-# machine reads via getCentralStackRulesFile(). This script copies the repo's
-# shared/stacks/ tree there so a checkout + install is all a machine needs.
+# at <store>/shared/stacks/<stack>/rules.md). The central store is the
+# per-machine INSTALL TARGET: it is what every session on that machine reads
+# via getCentralStackRulesFile(). This script copies the repo's shared/stacks/
+# tree there so a checkout + install is all a machine needs.
 #
-# Respects $HEADLESSCODE_DATA_DIR (the project's standard central-store
-# override, see src/project-store.ts) when set; defaults to the XDG convention
-# $HOME/.local/share/headlesscode. Idempotent: re-running simply re-copies.
+# The destination MUST be the same root the engine reads, or an install
+# silently never splices: getCentralStackRulesDir() in src/engine/stacks.ts
+# resolves through projectStoreRoot() (src/project-store.ts), which honors
+# $HEADLESSCODE_DATA_DIR (the project's standard central-store override, "a
+# legit per-machine escape hatch") and defaults to the XDG convention
+# $HOME/.local/share/headlesscode. This script mirrors that exactly —
+# including absolute-izing the override the same way projectStoreRoot()'s
+# path.resolve() does. Idempotent: re-running simply re-copies.
 #
 # Usage: scripts/sync-stack-rules.sh
 set -euo pipefail
@@ -19,10 +24,17 @@ set -euo pipefail
 HARNESS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SOURCE="$HARNESS_ROOT/shared/stacks"
 if [ -n "${HEADLESSCODE_DATA_DIR:-}" ]; then
-	DEST="$HEADLESSCODE_DATA_DIR/shared/stacks"
+	# Mirror projectStoreRoot()'s path.resolve() semantics: an absolute
+	# override is used as-is, a relative one resolves against the script's
+	# cwd — so script and engine agree on the store root.
+	case "$HEADLESSCODE_DATA_DIR" in
+		/*) DATA_DIR="$HEADLESSCODE_DATA_DIR" ;;
+		*) DATA_DIR="$(pwd)/$HEADLESSCODE_DATA_DIR" ;;
+	esac
 else
-	DEST="$HOME/.local/share/headlesscode/shared/stacks"
+	DATA_DIR="$HOME/.local/share/headlesscode"
 fi
+DEST="$DATA_DIR/shared/stacks"
 
 if [ ! -d "$SOURCE" ]; then
 	echo "sync-stack-rules: no $SOURCE (nothing to install)" >&2
