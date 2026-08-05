@@ -53,6 +53,21 @@ function withCapturedStderr(fn: () => Promise<number>): Promise<{ exit: number; 
 		.then((exit) => ({ exit, stderr }))
 }
 
+/** Run a function while capturing everything written to process.stdout. */
+function withCapturedStdout(fn: () => Promise<number>): Promise<{ exit: number; stdout: string }> {
+	const original = process.stdout.write.bind(process.stdout)
+	let stdout = ""
+	process.stdout.write = ((chunk: unknown): boolean => {
+		stdout += String(chunk)
+		return true
+	}) as typeof process.stdout.write
+	return fn()
+		.finally(() => {
+			process.stdout.write = original
+		})
+		.then((exit) => ({ exit, stdout }))
+}
+
 function baseGroup(overrides: Partial<OrchestratorGroup> = {}): OrchestratorGroup {
 	return {
 		name: "w1",
@@ -675,7 +690,7 @@ async function testWatchGroupsRepollsGroupAfterContinuationReset(): Promise<void
 
 // ─── Pre-spawn worktree collision check (Bug 1) ───────────────────────────────
 
-async function testOrchestrateMainFailsOnStaleWorktree(): Promise<void> {
+async function testOrchestrateMainSkipsOccupiedWorktreeSlot(): Promise<void> {
 	const repo = await tmpRepo()
 	try {
 		initGitRepo(repo)
@@ -685,20 +700,46 @@ async function testOrchestrateMainFailsOnStaleWorktree(): Promise<void> {
 			JSON.stringify([{ number: 1, title: "Fix the thing", body: "Do it" }]),
 			"utf-8",
 		)
-		// Leftover worktree dir from a previous round — the round must abort
-		// BEFORE spawning anything (and even before the --dry-run early-exit,
-		// so a dry run catches stale worktrees too).
+		// w1 is occupied by a still-running round (or genuinely stale leftover)
+		// — the new round must name around it (w2) instead of hard-failing, so
+		// a second `orchestrate` invocation against the same repo can proceed
+		// alongside an in-flight one. See split.ts's occupiedNames param.
 		await fs.mkdir(path.join(repo, ".worktrees", "w1"), { recursive: true })
-		await fs.writeFile(path.join(repo, ".worktrees", "w1", "leftover.txt"), "stale\n", "utf-8")
+		await fs.writeFile(path.join(repo, ".worktrees", "w1", "leftover.txt"), "in-flight\n", "utf-8")
 
-		const { exit, stderr } = await withCapturedStderr(() =>
+		const { exit, stdout } = await withCapturedStdout(() =>
 			orchestrateMain(["--repo", repo, "--issues-json", issuesPath, "--dry-run"]),
 		)
 
-		assert.notEqual(exit, 0, "a stale worktree dir must fail the round, got exit 0")
-		assert.ok(stderr.includes(".worktrees/w1"), `error names the colliding path, got: ${stderr}`)
-		assert.ok(stderr.includes("Remove them first"), "error tells the caller how to clean up")
-		assert.ok(stderr.includes("git worktree remove"), "cleanup hint names git worktree remove")
+		assert.equal(exit, 0, "occupied w1 must not fail the round when w2 is free")
+		assert.ok(stdout.includes("w2"), `plan should name the group w2, got: ${stdout}`)
+		assert.ok(!stdout.includes("w1   issue"), `plan should not reuse the occupied w1 slot, got: ${stdout}`)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testOrchestrateMainSkipsMultipleOccupiedSlots(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		initGitRepo(repo)
+		const issuesPath = path.join(repo, "issues.json")
+		await fs.writeFile(
+			issuesPath,
+			JSON.stringify([{ number: 1, title: "Fix the thing", body: "Do it" }]),
+			"utf-8",
+		)
+		// w1 AND w2 both occupied (e.g. two still-running rounds) — naming
+		// must skip both and land on w3, still succeeding.
+		await fs.mkdir(path.join(repo, ".worktrees", "w1"), { recursive: true })
+		await fs.mkdir(path.join(repo, ".worktrees", "w2"), { recursive: true })
+
+		const { exit, stdout } = await withCapturedStdout(() =>
+			orchestrateMain(["--repo", repo, "--issues-json", issuesPath, "--dry-run"]),
+		)
+
+		assert.equal(exit, 0, "occupied w1+w2 must not fail the round when w3 is free")
+		assert.ok(stdout.includes("w3"), `plan should name the group w3, got: ${stdout}`)
 	} finally {
 		await fs.rm(repo, { recursive: true, force: true })
 	}
@@ -754,7 +795,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["clean exit with the max-iterations text never auto-continues", testCleanExitWithMaxIterationsTextDoesNotContinue],
 	["continuation spawn forwards the round-level --max-iterations when set", testExhaustionSpawnForwardsMaxIterations],
 	["watchGroups re-polls a group after a continuation reset", testWatchGroupsRepollsGroupAfterContinuationReset],
-	["orchestrateMain fails on a stale worktree dir even in --dry-run", testOrchestrateMainFailsOnStaleWorktree],
+	["orchestrateMain skips an occupied w1 slot and names the group w2", testOrchestrateMainSkipsOccupiedWorktreeSlot],
+	["orchestrateMain skips multiple occupied slots (w1+w2 -> w3)", testOrchestrateMainSkipsMultipleOccupiedSlots],
 	["orchestrateMain dry-run proceeds when all worktree dirs are clear", testOrchestrateMainDryRunProceedsWhenNoCollision],
 ]
 

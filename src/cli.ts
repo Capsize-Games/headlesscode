@@ -32,6 +32,7 @@ import { indexMain } from "./codesearch/cli.js"
 import { provisionMain, pushPrMain } from "./github/cli.js"
 import { decisionProxyMain } from "./decision-proxy/cli.js"
 import { migrateMain } from "./migrate/cli.js"
+import { analyzeCliMain } from "./orchestrator/analyze-cli.js"
 import { resolvePermissions, type PermissionsConfig } from "./permissions/config.js"
 import { resolveModelForMode } from "./config/mode-models.js"
 
@@ -653,6 +654,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// `.headlesscode/`). See src/migrate/ + src/project-store.ts.
 	if (argv[0] === "migrate") {
 		return migrateMain(argv.slice(1))
+	}
+
+	// Ad-hoc session log analysis: `headlesscode analyze-worktree ...` — the
+	// orchestrator already runs this automatically per group (see
+	// src/orchestrator/log-analysis.ts + cli.ts's onGroupUpdate); this
+	// subcommand lets a human point it at any worktree by hand.
+	if (argv[0] === "analyze-worktree") {
+		return analyzeCliMain(argv.slice(1))
 	}
 
 	const { options, error } = parseArgs(argv)

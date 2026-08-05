@@ -136,6 +136,22 @@ export interface OrchestratorGroup {
 		cachedTokens?: number
 		iterations: number
 	}
+	/**
+	 * Deterministic post-hoc session log analysis (log-analysis.ts), run once
+	 * a group reaches "done", independent of --review/--qa. Captures the same
+	 * findings a human would get reading harness.log + events.jsonl by hand:
+	 * tool-call/error stats, stall gaps, and repeated-command detection.
+	 * `undefined` until analyzed; `false` means analysis ran but found no
+	 * events dir (nothing to report — e.g. the group was cleaned up).
+	 */
+	log_analysis?:
+		| {
+				findings: string[]
+				toolCallCounts: Record<string, number>
+				toolErrorCounts: Record<string, number>
+				analyzedAt: string
+		  }
+		| false
 }
 
 /** The orchestrator state file document. */

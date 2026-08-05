@@ -36,6 +36,7 @@ import {
 	type OrchestratorState,
 } from "./state.js"
 import { runReview, type ReviewResult } from "./reviewer.js"
+import { analyzeWorktreeSessions } from "./log-analysis.js"
 import { runQa } from "../qa/qa.js"
 import { groupWorktreePath, isIterationExhaustion, watchGroups } from "./watch.js"
 import {
@@ -440,6 +441,11 @@ export function buildTaskFileContent(spec: WorktreeSpec, issues: SplitIssue[]): 
 		"- Never delete a public name without grepping the ENTIRE codebase for every importer — including",
 		"  string-literal references (dispatch tables, getattr-by-name) and test files that import for",
 		"  side effects (pytest fixtures, registration).",
+		"- If you split a module into submodules, verify EVERY public name the original module exposed is",
+		"  still re-exported from the package's __init__.py (or equivalent) before closing — a missed",
+		"  re-export is a common, easy-to-miss defect a reviewer WILL catch, costing a full rework cycle.",
+		"  If the project has a re-export-checking script (e.g. scripts/check_re_exports.py), run it now,",
+		"  not just after a reviewer flags the miss.",
 		"- Re-run real checks (tests, boot) after every change and paste the real output in your report —",
 		"  output in a report is a claim, not evidence, until reproduced.",
 		"- If you find yourself repeating the same check across issues, script it under scripts/.",
@@ -1409,25 +1415,42 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		return 2
 	}
 
-	const specs = splitIssues(issues)
+	// Naming collision avoidance: a still-running round in the same repo
+	// already occupies some `.worktrees/wN` dirs. Scan them and let
+	// splitIssues name this round's groups around the gap instead of always
+	// starting at w1 and colliding — see split.ts's occupiedNames param. Two
+	// concurrent `orchestrate` invocations against the same repo can now
+	// share it instead of the second one hard-failing on a "stale" worktree
+	// that was actually just in-flight, not stale.
+	let occupiedNames: Set<string> = new Set()
+	try {
+		occupiedNames = new Set(
+			fs
+				.readdirSync(path.join(repo, ".worktrees"), { withFileTypes: true })
+				.filter((d) => d.isDirectory())
+				.map((d) => d.name),
+		)
+	} catch {
+		// No .worktrees dir yet — nothing occupied.
+	}
+	const specs = splitIssues(issues, { occupiedNames })
 
-	// Pre-spawn collision check: a leftover worktree dir from a previous
-	// round means the caller must clean it up FIRST — fail loudly before
-	// spawning anything (and before the --dry-run early-exit, so dry runs
-	// catch stale worktrees too). scripts/spawn-parallel-worktrees.sh exits
-	// 1 on the same collision as defense in depth, but this check runs
-	// before any task files are written or groups are recorded, so a
-	// skipped-at-spawn group can never be silently dropped again.
+	// Pre-spawn collision check: defense in depth only now that naming skips
+	// occupied slots above — this should not fire in the normal case. It
+	// still catches races (a worktree appearing between the scan above and
+	// spawn) and fails loudly before spawning anything or writing task
+	// files/state, so a skipped-at-spawn group can never be silently dropped.
 	const staleWorktrees = specs
 		.map((spec) => path.join(repo, ".worktrees", spec.name))
 		.filter((wtPath) => fs.existsSync(wtPath))
 	if (staleWorktrees.length > 0) {
 		process.stderr.write(
-			`headlesscode orchestrate: stale worktree(s) found: ${staleWorktrees
+			`headlesscode orchestrate: worktree collision found: ${staleWorktrees
 				.map((p) => path.relative(repo, p))
 				.join(", ")}. ` +
-				`Remove them first — either "git worktree remove <path>", or "headlesscode orchestrate cleanup --repo ${repo} ` +
-				`--apply" (which only removes worktrees whose branch is verified merged) — then retry.\n`,
+				`Another round may have just spawned into this slot — retry, or if it's genuinely stale, remove it first: ` +
+				`"git worktree remove <path>", or "headlesscode orchestrate cleanup --repo ${repo} --apply" ` +
+				`(which only removes worktrees whose branch is verified merged).\n`,
 		)
 		return 1
 	}
@@ -1625,6 +1648,41 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 				// Real failure (not iteration exhaustion): stays failed.
 				return
 			}
+
+			// Deterministic post-hoc log analysis: runs once per group as soon
+			// as it reaches "done", unconditionally (no --review/--qa gate, no
+			// LLM cost) — the same tool-call/error/stall/repeated-command
+			// findings a human would otherwise get by hand-reading harness.log
+			// + events.jsonl. Never blocks review/QA below; a failure here is
+			// logged and swallowed.
+			if (group.status === "done" && group.log_analysis === undefined) {
+				try {
+					const analysis = await analyzeWorktreeSessions(groupWorktreePath(repo, group))
+					const patch = {
+						log_analysis: analysis
+							? {
+									findings: analysis.findings,
+									toolCallCounts: analysis.toolCallCounts,
+									toolErrorCounts: analysis.toolErrorCounts,
+									analyzedAt: new Date().toISOString(),
+								}
+							: (false as const),
+					}
+					state = updateGroup(currentState, group.name, patch)
+					await saveState(statePath, state)
+					if (analysis && analysis.findings.length > 0) {
+						process.stdout.write(
+							`[orchestrate] ${group.name} log analysis: ${analysis.findings.length} finding(s):\n` +
+								analysis.findings.map((f) => `    - ${f}\n`).join(""),
+						)
+					}
+				} catch (err) {
+					process.stderr.write(
+						`[orchestrate] log analysis of ${group.name} failed: ${err instanceof Error ? err.message : String(err)}\n`,
+					)
+				}
+			}
+
 			if (!options.review) {
 				return
 			}
