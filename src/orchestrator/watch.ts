@@ -332,7 +332,19 @@ export function inspectGroup(
 			},
 			commits: group.commits ?? [],
 			...(exitCode !== undefined ? { exit_code: exitCode } : {}),
-			summary: summary.slice(0, 4000),
+			// `.slice(-4000)`, NOT `.slice(0, 4000)`: this is a TAIL (already the
+			// last SUMMARY_TAIL_LINES lines of the run) being capped to a char
+			// budget. Keeping the FIRST 4000 chars of a tail throws away the most
+			// recent content — exactly the lines that report the actual terminal
+			// outcome (a worker's final error, e.g. "Max iterations (N) reached
+			// without task completion"). This was a real, confirmed production
+			// bug: it silently broke isIterationExhaustion's detection (the
+			// summary never contained the error string it matches against), so
+			// auto-continuation never fired for genuinely iteration-exhausted
+			// groups, AND it broke human/agent-facing status reporting (the
+			// "summary" shown was always a stale mid-run snapshot, never the
+			// real ending) — both from the same one-line bug.
+			summary: summary.slice(-4000),
 			...(usage ? { usage } : {}),
 		}
 	}

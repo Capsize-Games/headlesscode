@@ -419,6 +419,55 @@ async function testIsIterationExhaustionRejectsOtherFailures(): Promise<void> {
 	assert.equal(isIterationExhaustion(""), false, "empty summary is never exhaustion")
 }
 
+/**
+ * 2026-08-05 incident regression: `inspectGroup`'s captured `summary` field
+ * silently dropped the ACTUAL final lines of a long-running worker's
+ * harness.log. tailLog() correctly returns the last SUMMARY_TAIL_LINES
+ * lines of the current run, but that tail was then capped with
+ * `.slice(0, 4000)` — the FIRST 4000 chars of an already-end-anchored tail
+ * — which discards the tail's own most recent content when the 40-line
+ * window exceeds 4000 chars (easy: harness.log's JSON usage lines commonly
+ * run 200-300+ chars each). In a real dispatch round this made
+ * `isIterationExhaustion(group.summary)` return false for a worker that
+ * GENUINELY hit --max-iterations, because the "Max iterations (N) reached"
+ * line — always the true last line — never survived into `summary`. Two
+ * real, separate consequences from the one bug: auto-continuation never
+ * fired, and status output shown to a human/agent never reflected the
+ * worker's real final outcome.
+ */
+async function testInspectGroupSummaryPreservesTrueTailNotHead(): Promise<void> {
+	const repoRoot = await tmpRepo()
+	try {
+		const wtPath = path.join(repoRoot, ".worktrees", "w1")
+		await fs.mkdir(wtPath, { recursive: true })
+		// Pad with enough long lines that the 40-line tail window exceeds 4000
+		// chars well before reaching the final line — reproduces the real
+		// harness.log shape (verbose JSON usage-total lines every iteration).
+		const padLine =
+			'[2026-08-05T14:00:00.000Z] INFO  [usage] running total {"iteration":1,"costUsd":0.01,"inputTokens":100000,"outputTokens":1000,"cachedTokens":90000,"lastPromptTokens":10000,"lastCachedTokens":9000}'
+		const padding = Array.from({ length: 39 }, () => padLine).join("\n")
+		const finalLine = "headlesscode: task failed: Max iterations (50) reached without task completion"
+		await fs.writeFile(path.join(wtPath, "harness.log"), `${padding}\n${finalLine}\n`, "utf-8")
+		await fs.mkdir(path.join(wtPath, ".harness.done"))
+		await fs.writeFile(path.join(wtPath, ".harness.exit"), "1", "utf-8")
+
+		const patch = inspectGroup(repoRoot, baseGroup(), Date.now(), DEFAULT_STALL_TIMEOUT_MS)
+		assert.ok(patch, "a done marker with a failing exit code must produce a patch")
+		assert.equal(patch?.status, "failed")
+		assert.ok(
+			patch?.summary?.includes("Max iterations (50) reached"),
+			`captured summary must include the real final error line, got tail: ${patch?.summary?.slice(-200)}`,
+		)
+		assert.equal(
+			isIterationExhaustion(patch?.summary),
+			true,
+			"the captured summary must actually be detected as iteration exhaustion (this is what gates auto-continuation)",
+		)
+	} finally {
+		await fs.rm(repoRoot, { recursive: true, force: true })
+	}
+}
+
 // ─── tailLog: run-separator scoping (restart must not lose prior log/stats) ──
 // scripts/run-worker.sh now appends to harness.log across continuation/rework
 // respawns on the same worktree (never truncates it), writing a run-start
@@ -487,6 +536,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["watchGroups: FAILED line printed on the transition to failed", testWatchGroupsPrintsFailedTransitionToStderr],
 	["isIterationExhaustion matches the exact max-iterations error", testIsIterationExhaustionMatchesExactError],
 	["isIterationExhaustion rejects budget/real failures and empty summaries", testIsIterationExhaustionRejectsOtherFailures],
+	["inspectGroup: captured summary preserves the true tail, not the head, of a long harness.log", testInspectGroupSummaryPreservesTrueTailNotHead],
 	["tailLog: scopes the summary to content after the latest run-start separator", testTailLogScopesToLatestRunAfterAppend],
 	["tailLog: appended harness.log preserves every prior session's output on disk", testTailLogPreservesFullHistoryOnDisk],
 ]
