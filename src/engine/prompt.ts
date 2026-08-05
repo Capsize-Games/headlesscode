@@ -23,9 +23,10 @@
  */
 
 import * as path from "node:path"
-import * as os from "node:os"
 import * as fsp from "node:fs/promises"
 import * as yaml from "yaml"
+
+import { ensureSharedInstructionsMigration, sharedInstructionsRoot } from "../project-store.js"
 
 // Side effect: installs String.prototype.toPosix() used by the prompt sections.
 import "../vendor/zoo-code/src/utils/path.js"
@@ -113,7 +114,11 @@ export function modeHasEditGroup(mode: string, customModes: ModeConfig[] = []): 
 	return modeConfig.groups.some((group) => getGroupName(group) === "edit")
 }
 
-// ─── custom modes loading (project .roomodes + global ~/.roo/custom_modes.yaml) ──
+// ─── custom modes loading (project .roomodes + global shared modes.yaml) ─────
+// The GLOBAL modes file lives at ~/.local/share/headlesscode/shared/modes.yaml
+// (headlesscode-native location — src/project-store.ts) instead of the
+// Zoo-Code-branded ~/.roo/custom_modes.yaml. The file FORMAT (YAML, schema)
+// and the merge semantics are unchanged; only the lookup path moved.
 
 const PROBLEMATIC_CHARS_REGEX =
 	// eslint-disable-next-line no-misleading-character-class
@@ -148,7 +153,7 @@ function cleanInvisibleCharacters(content: string): string {
  * global `~/.roo/custom_modes.yaml`.
  *
  * @param filePath absolute path of the modes file to read
- * @param source   "project" for `.roomodes`, "global" for `custom_modes.yaml`
+ * @param source   "project" for `.roomodes`, "global" for `modes.yaml`
  */
 async function loadModesFromFile(filePath: string, source: "project" | "global"): Promise<ModeConfig[]> {
 	let raw: string
@@ -196,16 +201,18 @@ async function loadModesFromFile(filePath: string, source: "project" | "global")
 
 /**
  * Load the merged set of custom modes for a workspace: the project's own
- * `.roomodes` first (project wins on slug collision), then the global
- * `~/.roo/custom_modes.yaml` for any slug the project does NOT define —
- * the same precedence model as the vendored
- * `CustomModesManager.mergeCustomModes`. A missing or malformed global file
- * degrades exactly like a missing/malformed `.roomodes` (returns [] for that
- * source, logs, never throws).
+ * `.roomodes` first (project wins on slug collision), then the GLOBAL shared
+ * modes file — `~/.local/share/headlesscode/shared/modes.yaml` (see
+ * src/project-store.ts; the one-time ~/.roo/ migration is triggered here on
+ * first use) — for any slug the project does NOT define. Same precedence
+ * model as the vendored `CustomModesManager.mergeCustomModes`. A missing or
+ * malformed global file degrades exactly like a missing/malformed `.roomodes`
+ * (returns [] for that source, logs, never throws).
  */
 export async function loadCustomModes(workspaceRoot: string): Promise<ModeConfig[]> {
+	ensureSharedInstructionsMigration()
 	const projectModes = await loadModesFromFile(path.join(workspaceRoot, ".roomodes"), "project")
-	const globalModes = await loadModesFromFile(path.join(os.homedir(), ".roo", "custom_modes.yaml"), "global")
+	const globalModes = await loadModesFromFile(path.join(sharedInstructionsRoot(), "modes.yaml"), "global")
 
 	const slugs = new Set<string>()
 	const merged: ModeConfig[] = []

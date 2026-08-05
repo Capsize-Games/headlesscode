@@ -1,9 +1,10 @@
 /**
- * Tests for global custom modes (~/.roo/custom_modes.yaml) merged with the
- * project's own `.roomodes` (src/engine/prompt.ts's loadCustomModes), plus a
- * proof that the ALREADY-WORKING global+project rules merge actually splices
- * BOTH `~/.roo/rules/rules.md` and `<project>/.roo/rules/rules.md` into the
- * built system prompt.
+ * Tests for global custom modes — the headlesscode-native shared modes file
+ * (`~/.local/share/headlesscode/shared/modes.yaml`, see src/project-store.ts)
+ * merged with the project's own `.roomodes` (src/engine/prompt.ts's
+ * loadCustomModes), plus a proof that the ALREADY-WORKING global+project rules
+ * merge actually splices BOTH `shared/rules/rules.md` and
+ * `<project>/.roo/rules/rules.md` into the built system prompt.
  *
  * Plain assert-based script (no test framework), run via `npm test` ->
  * `tsx src/engine/__tests__/global-modes.test.ts`.
@@ -11,11 +12,11 @@
  * All filesystem access is sandboxed: each test switches HOME to its own
  * fresh temp dir, and the sandbox is asserted before any test runs. Both
  * `loadCustomModes` (src/engine/prompt.ts) and the vendored rules loader
- * (`custom-instructions.ts`) resolve the global `.roo` directory by calling
+ * (`custom-instructions.ts`) resolve the global shared directory by calling
  * `os.homedir()` at CALL time (not at module-evaluation time), so switching
  * `process.env.HOME` per test is sufficient; `os.homedir()` respects $HOME on
- * Linux, which is verified before the tests run. The real `~/.roo/` is never
- * touched (the real `~/.roo/custom_modes.yaml` exists on this machine).
+ * Linux, which is verified before the tests run. The real
+ * `~/.local/share/headlesscode/` is never touched.
  */
 
 import * as fs from "node:fs/promises"
@@ -35,10 +36,18 @@ let activeHomes: string[] = []
 
 async function sandboxHome(): Promise<string> {
 	const home = path.join(ROOT_SANDBOX, `home-${activeHomes.length}`)
-	await fs.mkdir(path.join(home, ".roo"), { recursive: true })
+	// The headlesscode-native global shared dir (src/project-store.ts) —
+	// `~/.roo/` is no longer read. The store root is ALSO pointed at the
+	// sandboxed home: sharedInstructionsRoot() is store-root-derived, and
+	// under `npm test` the suite-wide HEADLESSCODE_DATA_DIR override would
+	// otherwise redirect the shared dir away from this sandboxed HOME.
+	// (Each test file is its own process, so per-file env mutation is safe.)
+	const storeRoot = path.join(home, ".local", "share", "headlesscode")
+	await fs.mkdir(path.join(storeRoot, "shared"), { recursive: true })
 	activeHomes.push(home)
 	process.env.HOME = home
 	process.env.USERPROFILE = home
+	process.env.HEADLESSCODE_DATA_DIR = storeRoot
 	return home
 }
 
@@ -71,7 +80,7 @@ function serializeMode(m: Record<string, unknown>): string {
 async function writeGlobalModes(modes: unknown[]): Promise<void> {
 	const home = process.env.HOME!
 	await fs.writeFile(
-		path.join(home, ".roo", "custom_modes.yaml"),
+		path.join(home, ".local", "share", "headlesscode", "shared", "modes.yaml"),
 		`customModes:\n${modes.map((m) => serializeMode(m as Record<string, unknown>)).join("\n")}\n`,
 		"utf-8",
 	)
@@ -144,7 +153,11 @@ async function testMissingGlobalFileIsZeroConfig(): Promise<void> {
  */
 async function testMalformedGlobalFileDoesNotThrow(): Promise<void> {
 	const home = await sandboxHome()
-	await fs.writeFile(path.join(home, ".roo", "custom_modes.yaml"), "this is: [not: valid yaml\n  - broken", "utf-8")
+	await fs.writeFile(
+		path.join(home, ".local", "share", "headlesscode", "shared", "modes.yaml"),
+		"this is: [not: valid yaml\n  - broken",
+		"utf-8",
+	)
 	const ws = await makeWorkspace([mode("project-still-loads", "Project Still Loads")])
 
 	const merged = await loadCustomModes(ws)
@@ -176,9 +189,13 @@ async function testSchemaInvalidGlobalFileDoesNotThrow(): Promise<void> {
  */
 async function testGlobalAndProjectRulesBothSpliceIntoSystemPrompt(): Promise<void> {
 	const home = await sandboxHome()
-	// Global rules file (sandboxed HOME).
-	await fs.mkdir(path.join(home, ".roo", "rules"), { recursive: true })
-	await fs.writeFile(path.join(home, ".roo", "rules", "rules.md"), "GLOBAL-RULE-MARKER: shared global conventions", "utf-8")
+	// Global rules file (sandboxed HOME, headlesscode-native shared location).
+	await fs.mkdir(path.join(home, ".local", "share", "headlesscode", "shared", "rules"), { recursive: true })
+	await fs.writeFile(
+		path.join(home, ".local", "share", "headlesscode", "shared", "rules", "rules.md"),
+		"GLOBAL-RULE-MARKER: shared global conventions",
+		"utf-8",
+	)
 
 	// Project workspace with its own rules + a project mode (so we have a
 	// custom mode to run the prompt under, and both rules paths apply).
@@ -200,7 +217,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["missing global file behaves as zero-config", testMissingGlobalFileIsZeroConfig],
 	["malformed global file degrades like malformed .roomodes (no throw)", testMalformedGlobalFileDoesNotThrow],
 	["schema-invalid global file degrades gracefully (no throw)", testSchemaInvalidGlobalFileDoesNotThrow],
-	["global + project .roo/rules/rules.md BOTH splice into the system prompt", testGlobalAndProjectRulesBothSpliceIntoSystemPrompt],
+	["global shared + project .roo/rules/rules.md BOTH splice into the system prompt", testGlobalAndProjectRulesBothSpliceIntoSystemPrompt],
 ]
 
 async function main(): Promise<void> {

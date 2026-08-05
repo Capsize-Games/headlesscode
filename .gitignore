@@ -27,7 +27,13 @@ build/
 # Upstream Zoo Code clone used as a vendoring source (see VENDOR-NOTES.md)
 # This is a build input, not part of the harness. Root-anchored so the vendored
 # portable core under src/vendor/zoo-code/ (Apache-2.0, with attribution) stays tracked.
-/zoo-code/
+# NOTE: no trailing slash on purpose — in spawned worktrees `zoo-code` is a
+# SYMLINK to the main checkout (a symlink does not match a dir-only pattern).
+/zoo-code
+
+# Harness bookkeeping artifacts that must never be committed from a worktree.
+/.harness.pid
+/ORCHESTRATOR_TASK.md
 
 # Local tool runtime artifacts (Claude Code scheduled-task lock, etc.)
 /.claude/

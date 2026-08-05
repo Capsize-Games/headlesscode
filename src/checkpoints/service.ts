@@ -33,10 +33,12 @@
  *
  * For both reasons, `createCheckpointService` refuses to create a service
  * whose `checkpointDir` resolves inside `workspaceRoot`, and defaults to a
- * per-user location outside any workspace: `~/.headlesscode/checkpoints`
- * (mirroring Zoo Code's `globalStorageUri` design). Each session's shadow
- * repo is further namespaced by a random `taskId`, so unrelated
- * workspaces/sessions never collide there.
+ * per-user location outside any workspace: the central store's
+ * `~/.local/share/headlesscode/checkpoints` (mirroring Zoo Code's
+ * `globalStorageUri` design; consolidated here from the old
+ * `~/.headlesscode/checkpoints` — see src/project-store.ts's
+ * migrateCheckpointStore). Each session's shadow repo is further namespaced by
+ * a random `taskId`, so unrelated workspaces/sessions never collide there.
  *
  * Failure handling: every method here can throw (init can fail if git isn't
  * installed, a nested git repo is detected, etc.). This wrapper does NOT
@@ -47,15 +49,21 @@
  * driving it there.
  */
 
-import * as os from "node:os"
 import * as path from "node:path"
 
+import { ensureCheckpointMigration, projectStoreRoot } from "../project-store.js"
 import { ShadowCheckpointService } from "../vendor/zoo-code/src/services/checkpoints/ShadowCheckpointService.js"
 import type { CheckpointDiff, CheckpointResult } from "../vendor/zoo-code/src/services/checkpoints/types.js"
 
-/** Default shadow-git storage root, outside any workspace (see file header). */
+/**
+ * Default shadow-git storage root, outside any workspace (see file header).
+ * Lives under the central data store (`~/.local/share/headlesscode/checkpoints`)
+ * — consolidated from the old `~/.headlesscode/checkpoints`, which is migrated
+ * once automatically on first use (see ensureCheckpointMigration).
+ */
 export function defaultCheckpointDir(): string {
-	return path.join(os.homedir(), ".headlesscode", "checkpoints")
+	ensureCheckpointMigration()
+	return path.join(projectStoreRoot(), "checkpoints")
 }
 
 export interface CreateCheckpointServiceOptions {

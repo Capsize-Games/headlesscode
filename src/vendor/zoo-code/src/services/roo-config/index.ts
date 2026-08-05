@@ -3,29 +3,26 @@ import * as os from "os"
 import fs from "fs/promises"
 
 /**
- * Gets the global .roo directory path based on the current platform
+ * Gets the GLOBAL shared-config directory used for the mode-agnostic rules
+ * (`<dir>/rules/`) and per-mode rules (`<dir>/rules-<mode>/`) that
+ * `addCustomInstructions()` scans (see src/core/prompts/sections/
+ * custom-instructions.ts).
  *
- * @returns The absolute path to the global .roo directory
+ * DELIBERATE DEVIATION FROM THE VENDORED UPSTREAM: upstream returns
+ * `~/.roo` (the Zoo-Code-branded location). headlesscode relocated the global
+ * shared instructions to its own native data location,
+ * `~/.local/share/headlesscode/shared/` (see src/project-store.ts), to
+ * complete the decoupling from Zoo Code as a tool — the file FORMAT and the
+ * rules-directory-scanning convention are unchanged, only the lookup path
+ * moved. Project-local `.roo/rules(-<mode>)/` is untouched (the project dir
+ * still wins on any overlap).
  *
- * @example Platform-specific paths:
- * ```
- * // macOS/Linux: ~/.roo/
- * // Example: /Users/john/.roo
- *
- * // Windows: %USERPROFILE%\.roo\
- * // Example: C:\Users\john\.roo
- * ```
- *
- * @example Usage:
- * ```typescript
- * const globalDir = getGlobalRooDirectory()
- * // Returns: "/Users/john/.roo" (on macOS/Linux)
- * // Returns: "C:\\Users\\john\\.roo" (on Windows)
- * ```
+ * @returns The absolute path to the global shared-instructions directory:
+ *          `~/.local/share/headlesscode/shared` on macOS/Linux
  */
 export function getGlobalRooDirectory(): string {
 	const homeDir = os.homedir()
-	return path.join(homeDir, ".roo")
+	return path.join(homeDir, ".local", "share", "headlesscode", "shared")
 }
 
 /**

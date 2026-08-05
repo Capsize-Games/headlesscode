@@ -25,6 +25,7 @@ import type {
 	ChatTool,
 	ChatToolCall,
 } from "../engine/types.js"
+import { parseEndpointPricing, type EndpointPricingEntry, type ModelPrice } from "../budget/cost.js"
 
 export const OPENROUTER_BASE_URL = "https://openrouter.ai"
 export const DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
@@ -117,8 +118,17 @@ export class OpenRouterClient implements LlmClient {
 	 * HTTP request instead of one call per chunk. Embedding models are NOT in
 	 * OpenRouter's public `/api/v1/models` listing, but the endpoint is live —
 	 * see src/codesearch/embedder.ts's header comment for the full findings.
+	 *
+	 * `options.provider` (when given) pins routing via `extra_body.provider`
+	 * (OpenRouter's `{"order": [...], "allow_fallbacks": bool}` convention,
+	 * same shape buildRequestBody uses for the deepseek/* chat pin).
 	 */
-	async embed(inputs: string[], model: string, signal?: AbortSignal): Promise<OpenRouterEmbedding> {
+	async embed(
+		inputs: string[],
+		model: string,
+		options: { signal?: AbortSignal; provider?: { order?: string[]; allowFallbacks?: boolean } } = {},
+	): Promise<OpenRouterEmbedding> {
+		const { signal, provider } = options
 		if (!this.apiKey) {
 			throw new OpenRouterError(
 				"HEADLESSCODE_OPENROUTER_API_KEY is not set. Set the environment variable HEADLESSCODE_OPENROUTER_API_KEY (or pass apiKey to OpenRouterClient).",
@@ -129,7 +139,10 @@ export class OpenRouterClient implements LlmClient {
 		}
 
 		const url = `${this.baseUrl}/api/v1/embeddings`
-		const body = { model, input: inputs }
+		const body: Record<string, unknown> = { model, input: inputs }
+		if (provider) {
+			body.provider = provider
+		}
 
 		let response: Response
 		try {
@@ -215,14 +228,12 @@ export class OpenRouterClient implements LlmClient {
 	}
 
 	/**
-	 * Fetch a model's advertised context window (tokens) from OpenRouter's
-	 * `/api/v1/models/<id>/endpoints` endpoint, the same way the pricing
-	 * table in src/budget/cost.ts was verified live (2026-08-01): a model's
-	 * true context length is a property of the ENDPOINT that serves it, not
-	 * the model id — deepseek/deepseek-v4-flash's official DeepSeek endpoint
-	 * is 1,048,576 while third-party hosts behind the same id may differ.
-	 * The harness deliberately never hardcodes a stale number; callers
-	 * should cache the result for the session's lifetime.
+	 * Fetch BOTH the advertised context window and per-token pricing for a
+	 * model from OpenRouter's `/api/v1/models/<id>/endpoints` endpoint — ONE
+	 * fetch resolves both, so a session never pays for two round-trips to the
+	 * same URL (the pricing capture is Part E of the central-store round; the
+	 * context-window side is the pre-existing mechanism from
+	 * plans/speed-and-context-efficiency.md).
 	 *
 	 * Two live-verified quirks are handled here:
 	 * - The `<id>` path segment is the model's `provider/model` slug with a
@@ -230,86 +241,122 @@ export class OpenRouterClient implements LlmClient {
 	 *   (`encodeURIComponent("deepseek/deepseek-v4-flash")`) yields
 	 *   `deepseek%2Fdeepseek-v4-flash` which OpenRouter 404s on. Encode each
 	 *   segment separately and rejoin with the literal `/`.
-	 * - The response body is `{"data":{"endpoints":[{...context_length}]}}`
-	 *   (per-endpoint windows nested under `data.endpoints`), NOT the
+	 * - The response body is `{"data":{"endpoints":[{...}]}}`
+	 *   (per-endpoint data nested under `data.endpoints`), NOT the
 	 *   `{"data":[...]}` array some proxies return. Accept both shapes.
 	 *
-	 * The largest non-zero context_length across endpoints is used (a model
-	 * may be served by multiple hosts with different windows; the largest is
-	 * the upper bound the provider will accept). Returns `undefined` when
-	 * the endpoint is unreachable/unauthorized or carries no usable number —
-	 * the caller falls back to its conservative default
-	 * (`DEFAULT_CONTEXT_WINDOW_TOKENS` in src/engine/condense.ts).
+	 * The largest non-zero context_length across endpoints is the window. The
+	 * pricing selection is delegated to parseEndpointPricing (src/budget/
+	 * cost.ts): for the deepseek/* family the OFFICIAL DeepSeek endpoint's
+	 * numbers are used (that is the price actually charged — this harness
+	 * pins routing to it); for everything else the per-field max across
+	 * endpoints is used (fail-closed for a cost guardrail). Returns
+	 * `undefined` when the endpoint is unreachable/unauthorized or carries no
+	 * usable data — callers fall back to their conservative defaults.
+	 */
+	async fetchModelInfo(
+		model: string,
+		signal?: AbortSignal,
+	): Promise<{ contextWindow?: number; price?: ModelPrice } | undefined> {
+		if (!this.apiKey) {
+			return undefined
+		}
+		// Encode each slug segment separately so the `provider/model` literal
+		// slash survives (see comment above — encodeURIComponent on the whole
+		// id makes OpenRouter return 404).
+		const id = model
+			.split("/")
+			.map((segment) => encodeURIComponent(segment))
+			.join("/")
+		const url = `${this.baseUrl}/api/v1/models/${id}/endpoints`
+
+		// This call happens at most ONCE per session (loop.ts caches the
+		// result), so a single transient hiccup would silently poison the
+		// whole session with the conservative defaults. Retry transport
+		// failures and 5xx/429 once with a short backoff; a deterministic 4xx
+		// (e.g. 404 from a wrong slug) is not retried.
+		let response: Response | undefined
+		for (let attempt = 0; attempt < 2; attempt++) {
+			try {
+				const res = await fetch(url, {
+					method: "GET",
+					headers: this.authHeaders(),
+					signal,
+				})
+				if (res.ok) {
+					response = res
+					break
+				}
+				if (!(res.status === 429 || res.status >= 500)) {
+					return undefined
+				}
+			} catch {
+				// transport failure — retried below
+			}
+			if (attempt === 0) {
+				await new Promise((r) => setTimeout(r, 250))
+			}
+		}
+		if (!response) {
+			return undefined
+		}
+
+		// Live shape: { data: { id, endpoints: [{ context_length, pricing, ... }] } }.
+		// Legacy/proxy shape: { data: [{ context_length }] }.
+		let data:
+			| {
+					data?:
+						| Array<{ context_length?: unknown; provider_name?: unknown; pricing?: unknown }>
+						| { endpoints?: Array<{ context_length?: unknown; provider_name?: unknown; pricing?: unknown }> }
+			  }
+			| undefined
+		try {
+			data = JSON.parse(await response.text()) as typeof data
+		} catch {
+			return undefined
+		}
+
+		const endpoints = Array.isArray(data?.data)
+			? data.data
+			: Array.isArray(data?.data?.endpoints)
+				? data.data.endpoints
+				: []
+		let contextWindow: number | undefined
+		for (const ep of endpoints) {
+			const n = typeof ep?.context_length === "number" ? ep.context_length : undefined
+			if (typeof n === "number" && Number.isFinite(n) && n > 0) {
+				contextWindow = contextWindow === undefined ? n : Math.max(contextWindow, n)
+			}
+		}
+		const providerPreference = model.startsWith("deepseek/") ? "DeepSeek" : undefined
+		const price = parseEndpointPricing(endpoints as EndpointPricingEntry[], providerPreference)
+		return {
+			...(contextWindow !== undefined ? { contextWindow } : {}),
+			...(price !== undefined ? { price } : {}),
+		}
+	}
+
+	/**
+	 * Fetch a model's advertised context window (tokens) from OpenRouter's
+	 * `/api/v1/models/<id>/endpoints` endpoint (thin wrapper over
+	 * fetchModelInfo — see that method's doc for the full contract). Returns
+	 * `undefined` when the lookup fails or carries no usable number; the
+	 * caller falls back to `DEFAULT_CONTEXT_WINDOW_TOKENS`.
 	 */
 	async fetchModelContextWindow(model: string, signal?: AbortSignal): Promise<number | undefined> {
-	if (!this.apiKey) {
-		return undefined
-	}
-	// Encode each slug segment separately so the `provider/model` literal
-	// slash survives (see comment above — encodeURIComponent on the whole
-	// id makes OpenRouter return 404).
-	const id = model
-		.split("/")
-		.map((segment) => encodeURIComponent(segment))
-		.join("/")
-	const url = `${this.baseUrl}/api/v1/models/${id}/endpoints`
-
-	// This call happens at most ONCE per session (loop.ts's
-	// contextWindowResolved flag never re-attempts), so a single transient
-	// hiccup would silently poison the whole session with the conservative
-	// 128k default — condensation then fires ~8x too often. Retry transport
-	// failures and 5xx/429 once with a short backoff; a deterministic 4xx
-	// (e.g. 404 from a wrong slug) is not retried.
-	let response: Response | undefined
-	for (let attempt = 0; attempt < 2; attempt++) {
-		try {
-			const res = await fetch(url, {
-				method: "GET",
-				headers: this.authHeaders(),
-				signal,
-			})
-			if (res.ok) {
-				response = res
-				break
-			}
-			if (!(res.status === 429 || res.status >= 500)) {
-				return undefined
-			}
-		} catch {
-			// transport failure — retried below
-		}
-		if (attempt === 0) {
-			await new Promise((r) => setTimeout(r, 250))
-		}
-	}
-	if (!response) {
-		return undefined
+		return (await this.fetchModelInfo(model, signal))?.contextWindow
 	}
 
-	// Live shape: { data: { id, endpoints: [{ context_length, ... }] } }.
-	// Legacy/proxy shape: { data: [{ context_length }] }.
-	let data:
-		| { data?: Array<{ context_length?: unknown }> | { endpoints?: Array<{ context_length?: unknown }> } }
-		| undefined
-	try {
-		data = JSON.parse(await response.text()) as typeof data
-	} catch {
-		return undefined
-	}
-
-	const endpoints = Array.isArray(data?.data)
-		? data.data
-		: Array.isArray(data?.data?.endpoints)
-			? data.data.endpoints
-			: []
-	let best: number | undefined
-	for (const ep of endpoints) {
-		const n = typeof ep?.context_length === "number" ? ep.context_length : undefined
-		if (typeof n === "number" && Number.isFinite(n) && n > 0) {
-			best = best === undefined ? n : Math.max(best, n)
-		}
-	}
-	return best
+	/**
+	 * Fetch live per-token pricing for a model from the same
+	 * `/api/v1/models/<id>/endpoints` response (thin wrapper over
+	 * fetchModelInfo). Returns `undefined` on any failure/missing data — the
+	 * caller falls back to DEFAULT_PRICING_TABLE exactly as before live
+	 * pricing existed. Resolved once per session and cached by the caller
+	 * (loop.ts), mirroring the context-window caching fix.
+	 */
+	async fetchModelPricing(model: string, signal?: AbortSignal): Promise<ModelPrice | undefined> {
+		return (await this.fetchModelInfo(model, signal))?.price
 	}
 
 	async createChatCompletion(request: LlmRequest): Promise<LlmResponse> {

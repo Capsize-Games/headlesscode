@@ -46,6 +46,7 @@ import { promisify } from "node:util"
 import { randomUUID } from "node:crypto"
 
 import { BudgetExceededError, BudgetTracker, type SessionBudget } from "../budget/budget.js"
+import { loadPricingTable, mergeLivePrice, type ModelPrice, type PricingTable } from "../budget/cost.js"
 import { DEFAULT_MODEL } from "../llm/openrouter.js"
 import { DECISION_PROXY_ANSWER_PREFIX } from "../decision-proxy/proxy.js"
 import {
@@ -202,7 +203,7 @@ export const DEFAULT_READ_ONLY_NUDGE_THRESHOLD = 8
 const READ_ONLY_TOOL_NAMES = new Set(["list_files", "read_file", "search_files"])
 /** The injected nudge (user-role, seen by the model on its next turn). */
 const READ_ONLY_NUDGE_MESSAGE =
-	"You've made several read/exploration calls without using `codebase_search`. If the workspace has an index (check: is there a `.headlesscode/codesearch/index.jsonl`?), try `codebase_search` for targeted semantic search instead of blind tree-walking. If the workspace is not indexed, ignore this nudge."
+	"You've made several read/exploration calls without using `codebase_search`. If the workspace has an index (it lives in the central project store — see `~/.local/share/headlesscode/projects/`), try `codebase_search` for targeted semantic search instead of blind tree-walking. If the workspace is not indexed, ignore this nudge."
 
 /**
  * Same-file multi-edit diagnosis (see the tool-execution loop): when the
@@ -417,7 +418,7 @@ export interface HeadlessSessionConfig {
 	/**
 	 * Phase 3 context condensation: model id used for the condensation LLM
 	 * call (default: the session model). A cheaper model can be assigned via
-	 * the `_condensation` key in `<workspaceRoot>/.headlesscode/mode-models.json`
+	 * the `_condensation` key in the central store's `mode-models.json`
 	 * (see src/config/mode-models.ts's extraKeys).
 	 */
 	condenseModel?: string
@@ -465,7 +466,7 @@ export interface HeadlessSessionConfig {
 	 * warning, session continues).
 	 */
 	checkpoints?: boolean
-	/** Shadow-git storage dir override (default: `<workspaceRoot>/.headlesscode/checkpoints`). */
+	/** Shadow-git storage dir override (default: the central store's `checkpoints/`). */
 	checkpointDir?: string
 	/**
 	 * INTERNAL plumbing for recursive task decomposition (`new_task`) — NOT a
@@ -498,8 +499,8 @@ export interface HeadlessSessionConfig {
 	decisionPollIntervalMs?: number
 	/**
 	 * Resolved permissions (command allow/deny + protected files). Optional:
-	 * when absent the executor resolves its own from env vars +
-	 * `<workspaceRoot>/.headlesscode/permissions.json` + built-in defaults.
+	 * when absent the executor resolves its own from env vars + the central
+	 * store's `permissions.json` + built-in defaults.
 	 */
 	permissions?: PermissionsConfig
 	/**
@@ -726,6 +727,17 @@ export class HeadlessSession {
 	 * window. Fixed 2026-08-04.
 	 */
 	private resolvedContextWindowTokens: number | undefined = undefined
+	/**
+	 * The live-resolved model price (Part E), cached across the WHOLE session
+	 * once found — same VALUE-caching discipline as resolvedContextWindowTokens
+	 * (a boolean alone recorded the attempt, not what it resolved TO). Set by
+	 * resolveLiveModelInfo() during run(); undefined when the live lookup
+	 * failed or returned nothing, in which case DEFAULT_PRICING_TABLE (or the
+	 * env-merged table) is used exactly as before live pricing existed.
+	 */
+	private resolvedLivePrice: ModelPrice | undefined = undefined
+	/** True once the model-info (context window + pricing) lookup has been attempted. */
+	private modelInfoResolved = false
 	/**
 	 * Recursive task decomposition (`new_task`): the session that spawned this
 	 * one, or undefined for root sessions. Stamped onto every event and used
@@ -999,16 +1011,18 @@ export class HeadlessSession {
 		// browser_action, describe_image and the code-intelligence tools are
 		// not part of the vendored tool set, so selectToolsForMode can't
 		// include them — append them explicitly (see src/tools/browser/,
-		// src/vision/ and src/codeintel/). rename_symbol (edits files) and
-		// run_tests (runs the test suite) are only advertised when THIS
-		// session's executor actually registers the handlers (read-only
-		// reviewer/QA executors don't, and must not be advertised tools they
-		// can't run).
-		let tools = appendCodeIntelTools(
-			appendDescribeImageTool(
-				appendBrowserActionTool(this.config.tools ?? selectToolsForMode(mode, customModes)),
-			),
-		)
+		// src/vision/ and src/codeintel/). The TS-only code-intelligence tools
+		// (outline/go_to_definition/find_references/import_graph), rename_symbol
+		// (edits files) and run_tests (runs the test suite) are only advertised
+		// when THIS session's executor actually registers the handlers: the
+		// read-only reviewer/QA executors must not be advertised tools they
+		// can't run, and on a non-TS/JS workspace (Python/C++/…) the executor
+		// deliberately does not register the ts.Program-based tools at all —
+		// so the tool list matches what actually works for the project.
+		let tools = appendDescribeImageTool(appendBrowserActionTool(this.config.tools ?? selectToolsForMode(mode, customModes)))
+		if (this.executor.has("outline")) {
+			tools = appendCodeIntelTools(tools)
+		}
 		if (this.executor.has("rename_symbol")) {
 			tools = appendCodeIntelEditTools(tools)
 		}
@@ -1087,7 +1101,23 @@ export class HeadlessSession {
 		// the SAME cost cap — a $0.50-capped parent can't spawn children that
 		// each independently spend up to $0.50. Root sessions (no tracker
 		// passed) still build one from config as before.
-		const budgetTracker = this.config.budgetTracker ?? new BudgetTracker(this.config.budget ?? {})
+		// Live pricing (Part E): resolve the model's real price ONCE at session
+		// start (same /api/v1/models/<id>/endpoints source as the context
+		// window) and hand the BudgetTracker a table with the live value merged
+		// over the defaults — live wins, the hardcoded table remains the
+		// fallback, and which source was used is logged for harness.log.
+		// Children reuse the PARENT's tracker (resolved on the parent's run),
+		// so the eager fetch is a root-session-only cost.
+		let pricingTable: PricingTable | undefined
+		if (this.config.budgetTracker === undefined) {
+			const livePrice = await this.resolveLiveModelInfo()
+			if (livePrice !== undefined) {
+				pricingTable = mergeLivePrice(loadPricingTable(), this.config.model, livePrice)
+			}
+		}
+		const budgetTracker =
+			this.config.budgetTracker ??
+			new BudgetTracker(this.config.budget ?? {}, pricingTable ? { pricing: pricingTable } : {})
 		// Stash it on the session so the new_task handler can hand the SAME
 		// instance to children (see handleNewTask).
 		this.budgetTracker = budgetTracker
@@ -1423,6 +1453,56 @@ export class HeadlessSession {
 			})
 			return messages
 		}
+	}
+
+	/**
+	 * Resolve the model's real context window + pricing AT MOST ONCE per
+	 * session via a single /api/v1/models/<id>/endpoints lookup
+	 * (src/llm/openrouter.ts's fetchModelInfo), caching BOTH values — the
+	 * pricing for the BudgetTracker's live table (Part E), the context window
+	 * for the condensation checks (which then short-circuit on the cached
+	 * value instead of re-fetching). Deliberately fail-open and non-fatal: a
+	 * missing/failed lookup leaves `resolvedLivePrice` undefined and the
+	 * session uses DEFAULT_PRICING_TABLE (or the env-merged table) exactly as
+	 * before live pricing existed, with a harness.log line recording which
+	 * source was used. Bounded by a 5s timeout so a hung OpenRouter never
+	 * blocks session start.
+	 */
+	private async resolveLiveModelInfo(): Promise<ModelPrice | undefined> {
+		if (this.modelInfoResolved) {
+			return this.resolvedLivePrice
+		}
+		this.modelInfoResolved = true
+		const client = this.llmClient as {
+			fetchModelInfo?: (model: string, signal?: AbortSignal) => Promise<{ contextWindow?: number; price?: ModelPrice } | undefined>
+		}
+		let info: { contextWindow?: number; price?: ModelPrice } | undefined
+		try {
+			const signal = typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(5_000) : undefined
+			info = await client.fetchModelInfo?.(this.config.model, signal)
+		} catch (error) {
+			this.logger.warn("[budget] live pricing/context-window lookup failed (non-fatal; using hardcoded pricing table)", {
+				error: error instanceof Error ? error.message : String(error),
+			})
+			return undefined
+		}
+		if (info?.contextWindow !== undefined && info.contextWindow > 0) {
+			this.resolvedContextWindowTokens = info.contextWindow
+		}
+		if (info?.price !== undefined) {
+			this.resolvedLivePrice = info.price
+			this.logger.info("[budget] resolved live pricing from OpenRouter models endpoint", {
+				model: this.config.model,
+				input: info.price.input,
+				output: info.price.output,
+				...(info.price.cacheRead !== undefined ? { cacheRead: info.price.cacheRead } : {}),
+			})
+		} else {
+			this.logger.warn("[budget] live pricing unavailable; using hardcoded DEFAULT_PRICING_TABLE (non-fatal)", {
+				model: this.config.model,
+			})
+		}
+		return this.resolvedLivePrice
 	}
 
 	/**
