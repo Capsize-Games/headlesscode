@@ -43,18 +43,11 @@ cleanup() {
 		echo "  KEEP=1: leaving fixture/bare/worktrees/logs in place"
 		return
 	fi
+	# Stop any still-running workers' WHOLE process trees (issue #20) —
+	# stop-worker.sh handles both .harness.* and .qa.* marker families.
 	if [ -n "${FIXTURE:-}" ]; then
 		for n in $WORKTREE_NAMES; do
-			pidfile="$FIXTURE/.worktrees/$n/.harness.pid"
-			if [ -f "$pidfile" ]; then
-				pid="$(cat "$pidfile" 2>/dev/null || true)"
-				[ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-			fi
-			qapidfile="$FIXTURE/.worktrees/$n/.qa.pid"
-			if [ -f "$qapidfile" ]; then
-				pid="$(cat "$qapidfile" 2>/dev/null || true)"
-				[ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-			fi
+			bash "$ROOT/scripts/stop-worker.sh" "$FIXTURE/.worktrees/$n" >/dev/null 2>&1 || true
 		done
 	fi
 	for p in $MOCK_PIDS; do
@@ -69,11 +62,7 @@ cleanup() {
 	# Rework-loop fixture (second fixture from section 10).
 	if [ -n "${FIXTURE2:-}" ]; then
 		for n in $WORKTREE_NAMES; do
-			pidfile="$FIXTURE2/.worktrees/$n/.harness.pid"
-			if [ -f "$pidfile" ]; then
-				pid="$(cat "$pidfile" 2>/dev/null || true)"
-				[ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-			fi
+			bash "$ROOT/scripts/stop-worker.sh" "$FIXTURE2/.worktrees/$n" >/dev/null 2>&1 || true
 			git -C "$FIXTURE2" worktree remove --force "$FIXTURE2/.worktrees/$n" 2>/dev/null || true
 		done
 	fi

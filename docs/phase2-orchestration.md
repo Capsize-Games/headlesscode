@@ -50,14 +50,27 @@ Replaces "open a window, paste the task, press Enter". For one worktree it:
 
 1. Runs `$HEADLESSCODE_CLI --task-file <task> --workspace <worktree> --mode <mode>`
    (or `--task <text>` for inline text) as a **detached background process**
-   (`nohup bash -c … &` — no X server, no display needed).
-2. Writes the worker PID to `<worktree>/.harness.pid`.
+   (`nohup setsid bash -c … &` — no X server, no display needed). `setsid`
+   puts the wrapper in its OWN session/process group so a stop command can
+   kill the whole tree with one negative-PID signal (issue #20: killing only
+   the wrapper PID used to leave the real child running undetected,
+   reparented to init).
+2. Writes the worker PID to `<worktree>/.harness.pid` and — when setsid is
+   available — the process-group id to `<worktree>/.harness.pgid` (written
+   from inside the wrapper, so it is always the real group leader).
 3. Redirects stdout+stderr to `<worktree>/harness.log`.
 4. On harness exit, writes the exit code to `<worktree>/.harness.exit` and
    creates the completion marker directory `<worktree>/.harness.done/`
    (`mkdir` is atomic — the same lock-mutex convention airunner's
    `phone-home.sh` uses, repurposed as a completion signal instead of an
    xdotool wake-up).
+
+Stopping a worker: `scripts/stop-worker.sh <worktree-path>` kills the worker's
+WHOLE process tree — SIGTERM to the recorded process group, SIGKILL after
+`--grace-ms` (default 5s) if it survives, then verifies the group is gone.
+`headlesscode orchestrate stop --repo <path> --group <name>` is the
+orchestrated form: it stops the group's worker and marks the group
+`needs-human` (terminal) so a stopped group is never left looking "running".
 
 ```bash
 scripts/run-worker.sh <worktree-path> <task-file-or-text> \
