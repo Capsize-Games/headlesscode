@@ -53,6 +53,12 @@ Before considering any change to `src/` done:
   self-contained (the agent reading it has no access to this
   conversation or any other planning context), and must not reference
   internal-only planning artifacts.
+- **Stack-specific rules.** Per-stack guidance for a target project (Python
+  vs. C++ conventions, verification tooling, …) lives at
+  `<workspaceRoot>/.roo/rules-stack-<stack>/rules.md`, with a machine-global
+  set at `~/.local/share/headlesscode/shared/stacks/<stack>/rules.md`
+  (additive, global first). Detection + splicing is automatic — see
+  `src/engine/stacks.ts` and `docs/stack-rules.md`.
 - **A new tool is not done until something tells a model to reach for it.**
   A tool's own schema description is not enough on its own — real usage
   data has shown tools with good descriptions but no rules-file mention

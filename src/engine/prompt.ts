@@ -19,7 +19,9 @@
  *
  * Note: `.roo/rules-<mode>/`, `.roo/rules/`, and AGENTS.md splicing happens
  * inside the vendored `SYSTEM_PROMPT` → `addCustomInstructions()`; we only
- * need to pass the workspace root as `cwd` plus the mode slug.
+ * need to pass the workspace root as `cwd` plus the mode slug. Stack-specific
+ * rules (src/engine/stacks.ts) are spliced HERE, after the vendored build —
+ * the vendored prompt sections have no hook for them.
  */
 
 import * as path from "node:path"
@@ -41,6 +43,7 @@ import { describeImageTool } from "../vision/tool.js"
 import { CODE_INTEL_TOOLS } from "../codeintel/tools.js"
 import type { ModeConfig } from "@roo-code/types"
 
+import { appendStackRulesSection, loadStackRules } from "./stacks.js"
 import type { ChatTool } from "./types.js"
 
 export interface BuildSystemPromptOptions {
@@ -275,7 +278,15 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions): Prom
 		settings,
 	)
 
-	return { prompt, modeConfig, customModes }
+	// Stack-specific rules (src/engine/stacks.ts): appended as a clearly
+	// delimited section only when a detected stack actually has rules content
+	// — zero stacks / no rules.md keeps the prompt byte-identical.
+	const stackRules = await loadStackRules(workspaceRoot)
+	const finalPrompt = stackRules.content
+		? appendStackRulesSection(prompt, stackRules.content, stackRules.stacks)
+		: prompt
+
+	return { prompt: finalPrompt, modeConfig, customModes }
 }
 
 // ─── Tool selection ──────────────────────────────────────────────────────────
