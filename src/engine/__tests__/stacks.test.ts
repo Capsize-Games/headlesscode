@@ -20,6 +20,7 @@ import { execFile } from "node:child_process"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
+import { fileURLToPath } from "node:url"
 import { promisify } from "node:util"
 
 const execFileP = promisify(execFile)
@@ -308,6 +309,36 @@ async function testDetectedButNoRulesIsEmpty(): Promise<void> {
 	assert.equal(loaded.content, "", "expected empty content when detected stacks have no rules.md")
 }
 
+/** The repo's SHIPPED stack-rules content (shared/stacks/<stack>/rules.md) must
+ * stay present and non-empty — this is the "ships with headlesscode" central
+ * tier that scripts/sync-stack-rules.sh installs into the machine-global
+ * store. Guards against a future refactor silently dropping the content these
+ * stack-rules content issues shipped. Reads repo-relative files only (the
+ * per-test HOME sandbox above is about the machine store, not the repo). */
+async function testShippedStackRulesContent(): Promise<void> {
+	await sandboxHome()
+	const repoRoot = path.resolve(fileURLToPath(new URL("../../../", import.meta.url)))
+	const shippedDir = path.join(repoRoot, "shared", "stacks")
+	const entries = await fs.readdir(shippedDir, { withFileTypes: true })
+	const shippedStacks = entries
+		.filter((e) => e.isDirectory())
+		.map((e) => e.name)
+		.sort()
+	assert.ok(shippedStacks.length > 0, "expected at least one shipped stack under shared/stacks/")
+
+	for (const stack of shippedStacks) {
+		assert.ok(
+			(STACK_NAMES as readonly string[]).includes(stack),
+			`shared/stacks/${stack} is not a known stack name`,
+		)
+		const content = await fs.readFile(path.join(shippedDir, stack, "rules.md"), "utf-8")
+		assert.ok(content.trim().length > 0, `shared/stacks/${stack}/rules.md must be non-empty`)
+	}
+
+	// The FastAPI stack rules shipped by this round (issue #10) must be present.
+	assert.ok(shippedStacks.includes("fastapi"), "expected shipped FastAPI stack rules (issue #10)")
+}
+
 // ─── buildSystemPrompt splice tests ──────────────────────────────────────────
 
 /** Zero-config: no stacks / no rules -> prompt is byte-identical across builds and has no stack section. */
@@ -386,6 +417,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["project-local rules-stack-<stack> loaded with source label", testProjectStackRulesLoaded],
 	["central rules splice before project rules for the same stack", testCentralThenProjectOrder],
 	["detected stacks with no rules.md contribute nothing", testDetectedButNoRulesIsEmpty],
+	["shipped shared/stacks content is present and non-empty", testShippedStackRulesContent],
 	["zero-config prompt unchanged (byte-identical, no section)", testZeroConfigPromptUnchanged],
 	["stack rules spliced alphabetically with header", testStackRulesSplicedAlphabetically],
 	["appendStackRulesSection format", testAppendSectionFormat],

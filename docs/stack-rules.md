@@ -39,9 +39,13 @@ their source path in the prompt):
 | Central (global, ships with headlesscode) | `~/.local/share/headlesscode/shared/stacks/<stack>/rules.md` |
 | Project-local (optional override/addition) | `<workspaceRoot>/.roo/rules-stack-<stack>/rules.md` |
 
-A missing file is never an error — same idiom as the existing missing-file
-handling for `mode-models.json` / `.roomodes` (zero config = zero behavior
-change).
+**Repo source for the central tier.** The central tier's content is authored in
+this repo at `shared/stacks/<stack>/rules.md` (this is what "ships with
+headlesscode" means — the repo is the canonical source), and installed into the
+per-machine central store by `scripts/sync-stack-rules.sh`, which
+`scripts/install-cli.sh` also invokes. A missing file is never an error — same
+idiom as the existing missing-file handling for `mode-models.json` /
+`.roomodes` (zero config = zero behavior change).
 
 ## Detection heuristics
 

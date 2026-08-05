@@ -24,6 +24,11 @@ EOF
 chmod +x "$TARGET"
 
 echo "Installed headlesscode -> $TARGET (harness: $HARNESS_ROOT)"
+
+# Install the shipped stack-rules content (shared/stacks/<stack>/rules.md)
+# into the machine-global central store — this is what "ships with
+# headlesscode" means for the central tier (see docs/stack-rules.md).
+bash "$HARNESS_ROOT/scripts/sync-stack-rules.sh"
 if ! command -v headlesscode >/dev/null 2>&1; then
     echo "warning: $INSTALL_DIR is not on your PATH" >&2
 fi
