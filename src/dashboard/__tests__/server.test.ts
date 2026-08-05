@@ -188,6 +188,124 @@ async function testPauseUnknownSessionIs404(): Promise<void> {
 	}
 }
 
+// ─── POST /api/session/:id/message (mid-session message injection) ──────────
+
+async function testMessageEndpointWritesMarker(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		// Session lives in a worktree (the orchestrator case) — the marker
+		// must land in the worktree root, same as pause/resume/answer.
+		const wtRoot = path.join(repo, ".worktrees", "w1")
+		await writeEventFile(wtRoot, "worker-session", [event("session_start", "2026-08-01T00:00:00.000Z")])
+		const { server, port } = await startServer(repo)
+		const base = `http://127.0.0.1:${port}`
+		try {
+			const res = await fetch(base + "/api/session/worker-session/message", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ text: "  Wait — switch approach now.  " }),
+			})
+			assert.equal(res.status, 200)
+			const body = (await res.json()) as { ok: boolean; worktree: string }
+			assert.equal(body.ok, true)
+			assert.equal(body.worktree, ".worktrees/w1")
+
+			const marker = path.join(wtRoot, ".harness.inject-message")
+			const parsed = JSON.parse(await fs.readFile(marker, "utf-8")) as { text?: unknown; injectedAt?: unknown }
+			assert.equal(parsed.text, "Wait — switch approach now.", "the text is written trimmed")
+			assert.equal(typeof parsed.injectedAt, "string", "marker carries an ISO injectedAt timestamp")
+			assert.ok(!Number.isNaN(Date.parse(parsed.injectedAt as string)), "injectedAt must be a parseable ISO timestamp")
+		} finally {
+			server.close()
+		}
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testMessageEndpointValidatesAndRejectsUnknown(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const { server, port } = await startServer(repo)
+		const base = `http://127.0.0.1:${port}`
+		try {
+			// Unknown session -> 404.
+			const unknown = await fetch(base + "/api/session/ghost/message", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ text: "hello" }),
+			})
+			assert.equal(unknown.status, 404)
+
+			// Known session but missing/empty text -> 400.
+			await writeEventFile(repo, "s1", [event("session_start", "2026-08-01T00:00:00.000Z")])
+			const noText = await fetch(base + "/api/session/s1/message", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({}),
+			})
+			assert.equal(noText.status, 400)
+			assert.match(String((await noText.json() as { error?: string }).error ?? ""), /missing or empty 'text'/i)
+
+			// GET (not POST) -> 405 — a GET must never trigger an injection.
+			const getRes = await fetch(base + "/api/session/s1/message")
+			assert.equal(getRes.status, 405)
+
+			// Invalid JSON -> 400.
+			const badJsonRes = await fetch(base + "/api/session/s1/message", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: "{ not json",
+			})
+			assert.equal(badJsonRes.status, 400)
+
+			// Nothing was written on any of the rejected paths.
+			await assert.rejects(fs.access(path.join(repo, ".harness.inject-message")), "no marker may be written by rejected requests")
+		} finally {
+			server.close()
+		}
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+/**
+ * The message route sits under /api/session/*, so it inherits the SAME
+ * optional bearer-token gate as pause/resume/answer/start.
+ */
+async function testMessageEndpointRespectsAuthGate(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		await writeEventFile(repo, "s1", [event("session_start", "2026-08-01T00:00:00.000Z")])
+		const server = await startDashboardServer({ port: 0, repo, token: "sekret" })
+		const addr = server.address()
+		const port = typeof addr === "object" && addr ? addr.port : 0
+		const base = `http://127.0.0.1:${port}`
+		try {
+			// Without the header -> 401, no marker written.
+			const noAuth = await fetch(base + "/api/session/s1/message", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ text: "hello" }),
+			})
+			assert.equal(noAuth.status, 401)
+
+			// With the right token -> 200 and the marker is written.
+			const goodAuth = await fetch(base + "/api/session/s1/message", {
+				method: "POST",
+				headers: { "content-type": "application/json", authorization: "Bearer sekret" },
+				body: JSON.stringify({ text: "hello" }),
+			})
+			assert.equal(goodAuth.status, 200)
+			await fs.access(path.join(repo, ".harness.inject-message"))
+		} finally {
+			server.close()
+		}
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 /**
  * Non-GET / non-POST methods to unrelated routes are still rejected: the
  * pause/resume POST routes are the ONLY non-GET routes the server accepts.
@@ -235,6 +353,9 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["server: events endpoint for an unknown session -> empty feed, 200", testEventsEndpointMissingSessionIsEmpty],
 	["server: POST pause/resume write/remove .harness.pause-requested in the worktree", testPauseResumeWriteRemoveMarker],
 	["server: POST pause for an unknown session -> 404", testPauseUnknownSessionIs404],
+	["server: POST /message writes the .harness.inject-message marker (text + injectedAt)", testMessageEndpointWritesMarker],
+	["server: POST /message validates + rejects unknown sessions (404/400/405)", testMessageEndpointValidatesAndRejectsUnknown],
+	["server: POST /message respects the same optional bearer-token gate as pause/answer", testMessageEndpointRespectsAuthGate],
 	["server: non-GET/non-POST methods to unrelated routes are still rejected (405)", testNonGetPostMethodsStillRejected],
 ]
 

@@ -113,6 +113,12 @@ export const DEFAULT_PAUSE_POLL_INTERVAL_MS = 5_000
 /** Marker basenames, relative to the workspace root (see src/tools/executor.ts's marker idiom). */
 const PAUSE_REQUESTED_FILENAME = ".harness.pause-requested"
 const PAUSED_FILENAME = ".harness.paused"
+/**
+ * Mid-session message injection (live chat-UI control): written by the
+ * dashboard's POST /api/session/:id/message as JSON `{ text, injectedAt }`,
+ * consumed + deleted by checkInjectedMessage (see plans/live-message-injection-for-chat-uis.md).
+ */
+export const INJECT_MESSAGE_FILENAME = ".harness.inject-message"
 
 export const DEFAULT_MAX_ITERATIONS = 50
 export const DEFAULT_CONSECUTIVE_ERROR_LIMIT = 3
@@ -1363,7 +1369,79 @@ export class HeadlessSession {
 	}
 
 	/**
-	 * Phase 3 context condensation: resolve the model's real context window
+		* Mid-session message injection (live chat-UI control): called at the SAME
+		* safe boundary as checkPauseRequested (before each iteration's LLM call —
+		* never mid-tool-call). When `<workspaceRoot>/.harness.inject-message` is
+		* present (JSON `{ text, injectedAt }` — written by the dashboard's
+		* POST /api/session/:id/message), appends `text` to the session's live
+		* message array as a plain user-role message, emits a `message_injected`
+		* event, and deletes the marker. The next LLM call then sees the message
+		* exactly as if the user had typed it in a normal back-and-forth — NOT as
+		* a tool result or a system interruption notice.
+		*
+		* This boundary is safe for the SAME reason it's safe for pause: every
+		* prior assistant `tool_calls` message has ALL its matching `tool` results
+		* already appended (never an orphaned tool_calls group — inserting a user
+		* message mid-group would break the assistant→tool adjacency strict
+		* providers 400 on). Once appended, the injected message is just a normal
+		* user-role history entry: it participates in truncateHistory/condensation
+		* like any other message, and the mechanism is mode-agnostic (session-level,
+		* not gated by mode). Marker failures are non-fatal. Policy: ONE pending
+		* message — a later POST overwrites an earlier one (overwrite-with-latest,
+		* no queue); a malformed marker is logged and deleted so the loop doesn't
+		* trip over it every iteration.
+		*/
+	private async checkInjectedMessage(): Promise<void> {
+		const root = this.config.workspaceRoot
+		const markerPath = path.join(root, INJECT_MESSAGE_FILENAME)
+		let raw: string
+		try {
+			raw = await fsp.readFile(markerPath, "utf-8")
+		} catch {
+			return // No injection pending — normal running.
+		}
+
+		let text: string | undefined
+		try {
+			const parsed = JSON.parse(raw) as { text?: unknown }
+			if (typeof parsed.text === "string" && parsed.text.trim() !== "") {
+				text = parsed.text.trim()
+			}
+		} catch {
+			// Malformed JSON — handled below.
+		}
+		if (text === undefined) {
+			this.logger.warn("[inject] malformed .harness.inject-message — ignoring and removing it", {})
+			try {
+				await fsp.rm(markerPath, { force: true })
+			} catch (error) {
+				this.logger.warn("[inject] failed to remove malformed .harness.inject-message (non-fatal)", {
+					error: error instanceof Error ? error.message : String(error),
+				})
+			}
+			return
+		}
+
+		// Consume the marker BEFORE appending: if the removal fails, no message
+		// is injected this iteration and the marker is simply retried next
+		// iteration — a failure between push and delete would otherwise
+		// re-inject the same message on the next iteration.
+		try {
+			await fsp.rm(markerPath, { force: true })
+		} catch (error) {
+			this.logger.warn("[inject] failed to remove .harness.inject-message (non-fatal; will retry next iteration)", {
+				error: error instanceof Error ? error.message : String(error),
+			})
+			return
+		}
+
+		this.state.messages.push({ role: "user", content: text })
+		this.logger.info("[inject] message injected into live history", { history: this.state.messages.length })
+		await this.emitEvent("message_injected", () => this.eventFeed.messageInjected({ text }), {})
+	}
+
+	/**
+		* Phase 3 context condensation: resolve the model's real context window
 	 * (once per session) and, when the LAST request's real prompt tokens
 	 * crossed the threshold, replace the oldest turns with one synthetic
 	 * summary message. Non-fatal: any failure falls back to
@@ -1887,6 +1965,14 @@ export class HeadlessSession {
 			// mid-tool-call — same safe boundary as the budget check below)
 			// while a .harness.pause-requested marker is present.
 			await this.checkPauseRequested(budgetTracker)
+
+			// Mid-session message injection (live chat-UI control): AFTER the
+			// pause check (so a message written during a pause is picked up the
+			// moment the session resumes), before the LLM call. Every prior
+			// assistant tool_calls message has all its tool results appended by
+			// now, so a user-role message inserted here can never split an
+			// assistant→tool adjacency (see checkInjectedMessage).
+			await this.checkInjectedMessage()
 
 			// Budget check BEFORE this LLM call: elapsed time, iteration count
 			// and accumulated cost are all re-checked here so no further spend
