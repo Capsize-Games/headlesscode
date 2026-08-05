@@ -20,6 +20,11 @@ export type { SessionLogAnalysis, AnalyzeOptions, ToolErrorSample, StallGap, Rep
 
 export { analyzeCliMain, parseAnalyzeArgs } from "./analyze-cli.js"
 
+export { costHistoryFilePath, appendCostHistoryRecord, readCostHistory, recordGroupCost } from "./cost-history.js"
+export type { CostHistoryRecord } from "./cost-history.js"
+
+export { costHistoryCliMain, parseCostHistoryArgs } from "./cost-history-cli.js"
+
 export { watchGroups, inspectGroup, tailLog, groupWorktreePath, isPidAlive, DEFAULT_POLL_INTERVAL_MS, DEFAULT_STALL_TIMEOUT_MS } from "./watch.js"
 export type { WatchOptions, WatchSummary } from "./watch.js"
 

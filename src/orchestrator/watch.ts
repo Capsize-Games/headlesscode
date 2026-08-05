@@ -35,6 +35,7 @@ import { setTimeout as sleep } from "node:timers/promises"
 
 import type { UsageRecord } from "../engine/usage.js"
 import { loadStateSync, saveStateSync, updateGroup, type OrchestratorGroup, type OrchestratorState } from "./state.js"
+import { recordGroupCost } from "./cost-history.js"
 
 export const DEFAULT_POLL_INTERVAL_MS = 5_000
 export const DEFAULT_STALL_TIMEOUT_MS = 2 * 60 * 60 * 1000 // 2h, matching airunner
@@ -512,6 +513,47 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 	const isTerminal = (g: OrchestratorGroup): boolean =>
 		g.status === "done" || g.status === "failed" || g.status === "needs-human"
 
+	// Mandatory cost/token history recording (cost-history.ts): fires exactly
+	// once per group, the FIRST time it's observed in any terminal status,
+	// regardless of which of orchestrate's many branches got it there (a
+	// clean "done", a real failure, a rework-cap exhaustion, a
+	// continuation-cap exhaustion all reach this the same way). A single
+	// insertion point here — rather than one call per terminal-outcome
+	// branch in cli.ts's onGroupUpdate — means no future branch can
+	// silently skip recording by forgetting to call it. Called from two
+	// spots below: for a group ALREADY terminal at the top of a poll pass
+	// (e.g. reloaded from disk after onGroupUpdate marked it needs-human),
+	// and immediately after a group transitions to terminal WITHIN the
+	// current pass (needed because `allTerminal` can return before the
+	// loop ever revisits that group at the top of a fresh pass).
+	const recordCostIfTerminal = async (g: OrchestratorGroup): Promise<void> => {
+		if (!isTerminal(g) || g.cost_recorded !== undefined) {
+			return
+		}
+		try {
+			await recordGroupCost(repoRoot, g)
+		} catch (err) {
+			writeStderr(
+				`[orchestrate] cost recording for ${g.name} failed: ${err instanceof Error ? err.message : String(err)}\n`,
+			)
+		}
+		// Mark recorded regardless of whether recordGroupCost found usage to
+		// write (undefined return = nothing to record, e.g. failed before any
+		// session wrote a usage file) — either way, don't retry forever.
+		//
+		// Reload fresh from disk before merging in cost_recorded, rather than
+		// persisting the caller's in-memory `state` closure variable: a
+		// onGroupUpdate callback can write directly to the state file without
+		// returning `reload: true` (e.g. cli.ts's clean-verdict path after a
+		// rework reset), which leaves this function's in-memory `state` stale
+		// relative to disk. Blindly saving that stale copy back would clobber
+		// the callback's own write — a real regression this exact fix caught
+		// (cli.test.ts's rework/continuation-reset re-poll tests).
+		const fresh = loadStateSync(statePath)
+		state = updateGroup(fresh, g.name, { cost_recorded: new Date().toISOString() })
+		saveStateSync(statePath, state)
+	}
+
 	while (true) {
 		if (options.signal?.aborted) {
 			break
@@ -521,6 +563,7 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 
 		for (const group of state.groups) {
 			if (isTerminal(group)) {
+				await recordCostIfTerminal(group)
 				continue
 			}
 			const patch = inspectGroup(repoRoot, group, now, stallTimeoutMs)
@@ -561,6 +604,12 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 					}
 					break
 				}
+				// No reload: the group's status (from inspectGroup's patch above,
+				// already including `usage` for a done/failed transition) is
+				// final for this pass. Record cost now — `allTerminal` below can
+				// return before the loop ever revisits this group at the top of
+				// a fresh pass, so this can't wait for that check to catch it.
+				await recordCostIfTerminal(updated)
 			}
 		}
 

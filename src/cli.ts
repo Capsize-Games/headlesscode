@@ -33,6 +33,7 @@ import { provisionMain, pushPrMain } from "./github/cli.js"
 import { decisionProxyMain } from "./decision-proxy/cli.js"
 import { migrateMain } from "./migrate/cli.js"
 import { analyzeCliMain } from "./orchestrator/analyze-cli.js"
+import { costHistoryCliMain } from "./orchestrator/cost-history-cli.js"
 import { resolvePermissions, type PermissionsConfig } from "./permissions/config.js"
 import { resolveModelForMode } from "./config/mode-models.js"
 
@@ -662,6 +663,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// subcommand lets a human point it at any worktree by hand.
 	if (argv[0] === "analyze-worktree") {
 		return analyzeCliMain(argv.slice(1))
+	}
+
+	// Cost/token history: `headlesscode cost-history ...` — read-side for
+	// the mandatory, automatic recording in watch.ts (recordCostIfTerminal).
+	if (argv[0] === "cost-history") {
+		return costHistoryCliMain(argv.slice(1))
 	}
 
 	const { options, error } = parseArgs(argv)

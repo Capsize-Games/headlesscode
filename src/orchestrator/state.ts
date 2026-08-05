@@ -152,6 +152,19 @@ export interface OrchestratorGroup {
 				analyzedAt: string
 		  }
 		| false
+	/**
+	 * Mandatory cost/token history recording (cost-history.ts) — timestamp
+	 * of when this group's combined usage was appended to the repo's
+	 * central `cost-history.jsonl`. Written exactly once, the first time
+	 * the group reaches ANY terminal status (done/failed/needs-human,
+	 * regardless of which code path got it there), by watchGroups' own
+	 * polling loop rather than orchestrate's review/rework branches — a
+	 * single, unconditional insertion point so no terminal outcome (a real
+	 * failure, a rework-cap exhaustion, a continuation-cap exhaustion) can
+	 * skip being recorded by falling through a branch that doesn't call it.
+	 * `undefined` until recorded.
+	 */
+	cost_recorded?: string
 }
 
 /** The orchestrator state file document. */

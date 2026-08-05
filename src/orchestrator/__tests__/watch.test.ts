@@ -287,6 +287,47 @@ async function testWatchGroupsPrintsDoneTransitionToStderr(): Promise<void> {
 	}
 }
 
+/**
+ * Mandatory cost/token history recording: a group reaching "done" must get
+ * its combined usage recorded to the central cost-history.jsonl exactly
+ * once, with `cost_recorded` set on the persisted group so it's never
+ * re-recorded on a later poll. This is the end-to-end counterpart to
+ * cost-history.test.ts's unit coverage of recordGroupCost itself.
+ */
+async function testWatchGroupsRecordsCostOnDoneTransition(): Promise<void> {
+	const repoRoot = await tmpRepo()
+	try {
+		const wtPath = path.join(repoRoot, ".worktrees", "w1")
+		const usageDir = path.join(wtPath, ".headlesscode", "usage")
+		await fs.mkdir(usageDir, { recursive: true })
+		const statePath = path.join(repoRoot, ".worktrees", ".orchestrator-state.json")
+		saveStateSync(statePath, { ...defaultState("round-1"), groups: [baseGroup({ issues: [42] })] })
+		await fs.mkdir(path.join(wtPath, ".harness.done"))
+		await fs.writeFile(path.join(wtPath, ".harness.exit"), "0", "utf-8")
+		await fs.writeFile(
+			path.join(usageDir, "session-1.jsonl"),
+			`${JSON.stringify({ sessionId: "session-1", costUsd: 0.05, inputTokens: 1000, outputTokens: 100, cachedTokens: 400, iterations: 12 })}\n`,
+			"utf-8",
+		)
+
+		const summary = await watchGroups({ repoRoot, statePath, pollIntervalMs: 20, stderrWriter: () => {} })
+		assert.equal(summary.allTerminal, true)
+
+		const persisted = loadStateSync(statePath)
+		const group = persisted.groups.find((g) => g.name === "w1")
+		assert.ok(group?.cost_recorded, "cost_recorded must be set once the group is terminal")
+
+		const { readCostHistory } = await import("../cost-history.js")
+		const records = await readCostHistory(repoRoot)
+		assert.equal(records.length, 1, "exactly one cost-history record must be written")
+		assert.deepEqual(records[0]?.issues, [42])
+		assert.equal(records[0]?.costUsd, 0.05)
+		assert.equal(records[0]?.status, "done")
+	} finally {
+		await fs.rm(repoRoot, { recursive: true, force: true })
+	}
+}
+
 async function testWatchGroupsPrintsFailedTransitionToStderr(): Promise<void> {
 	const repoRoot = await tmpRepo()
 	try {
@@ -533,6 +574,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["watchGroups: BLOCKED line printed once on the transition into blocked", testWatchGroupsPrintsBlockedTransitionToStderr],
 	["watchGroups: BLOCKED line not repeated while the group stays blocked", testWatchGroupsDoesNotRepeatBlockedLineWhileStillBlocked],
 	["watchGroups: DONE line printed on the transition to done", testWatchGroupsPrintsDoneTransitionToStderr],
+	["watchGroups: records cost history exactly once on the done transition", testWatchGroupsRecordsCostOnDoneTransition],
 	["watchGroups: FAILED line printed on the transition to failed", testWatchGroupsPrintsFailedTransitionToStderr],
 	["isIterationExhaustion matches the exact max-iterations error", testIsIterationExhaustionMatchesExactError],
 	["isIterationExhaustion rejects budget/real failures and empty summaries", testIsIterationExhaustionRejectsOtherFailures],
@@ -542,16 +584,28 @@ const tests: Array<[string, () => Promise<void>]> = [
 ]
 
 async function main(): Promise<void> {
+	// watchGroups now records cost history (cost-history.ts) as a mandatory
+	// side effect of a group reaching a terminal status, which touches the
+	// central project store — redirect it to a temp dir so no test run ever
+	// writes into the real ~/.local/share/headlesscode (same defensive
+	// pattern as config/__tests__/mode-models.test.ts).
+	const storeTmp = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-watch-store-"))
+	process.env.HEADLESSCODE_DATA_DIR = storeTmp
 	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
+	try {
+		for (const [name, fn] of tests) {
+			try {
+				await fn()
+				console.log(`  ok   ${name}`)
+			} catch (err) {
+				failed++
+				console.error(`  FAIL ${name}`)
+				console.error(err instanceof Error ? err.stack ?? err.message : String(err))
+			}
 		}
+	} finally {
+		delete process.env.HEADLESSCODE_DATA_DIR
+		await fs.rm(storeTmp, { recursive: true, force: true })
 	}
 	if (failed > 0) {
 		console.error(`\n${failed} test(s) failed`)
