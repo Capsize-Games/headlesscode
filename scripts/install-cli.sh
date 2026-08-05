@@ -29,19 +29,14 @@ chmod +x "$TARGET"
 
 echo "Installed headlesscode -> $TARGET (harness: $HARNESS_ROOT)"
 
-# Ship the bundled shared content into the central store. Idempotent: only
-# ever adds/overwrites files under the repo's shared/ tree — never deletes
-# anything a user placed in the central store themselves.
-SHARED_SRC="$HARNESS_ROOT/shared"
-SHARED_DST="${HEADLESSCODE_SHARED_DIR:-$HOME/.local/share/headlesscode/shared}"
-if [ -d "$SHARED_SRC" ]; then
-    mkdir -p "$SHARED_DST"
-    cp -R "$SHARED_SRC"/. "$SHARED_DST"/
-    echo "Installed shared content -> $SHARED_DST"
-else
-    echo "No shared/ content to install (nothing copied)"
-fi
-
+# Install the shipped stack-rules content (shared/stacks/<stack>/rules.md)
+# into the machine-global central store — this is what "ships with
+# headlesscode" means for the central tier (see docs/stack-rules.md).
+# Routes through the SAME resolution getCentralStackRulesDir() uses
+# (projectStoreRoot()/$HEADLESSCODE_DATA_DIR) — a separate ad hoc
+# $HEADLESSCODE_SHARED_DIR copy path here previously diverged from that and
+# silently installed to the wrong place (issue #10's review finding).
+bash "$HARNESS_ROOT/scripts/sync-stack-rules.sh"
 if ! command -v headlesscode >/dev/null 2>&1; then
     echo "warning: $INSTALL_DIR is not on your PATH" >&2
 fi

@@ -12,8 +12,8 @@
  * - `loadStackRules(workspaceRoot)` — for every detected stack (in canonical
  *   alphabetical order, so prompt content is reproducible across runs) reads
  *   that stack's rules.md from the central global set
- *   (`~/.local/share/headlesscode/shared/stacks/<stack>/rules.md`) and the
- *   optional project-local override
+ *   (`<store>/shared/stacks/<stack>/rules.md`, where `<store>` is
+ *   `projectStoreRoot()`) and the optional project-local override
  *   (`<workspaceRoot>/.roo/rules-stack-<stack>/rules.md`). Both are additive,
  *   global first — the same precedence shape as the existing global+project
  *   rules splice in the vendored `addCustomInstructions` — and a missing file
@@ -27,10 +27,10 @@
 
 import { execFile } from "node:child_process"
 import * as fsp from "node:fs/promises"
-import * as os from "node:os"
 import * as path from "node:path"
 import { promisify } from "node:util"
 
+import { projectStoreRoot } from "../project-store.js"
 import * as yaml from "yaml"
 
 const execFileP = promisify(execFile)
@@ -50,12 +50,15 @@ export const STACK_RULES_HEADER = "STACK-SPECIFIC INSTRUCTIONS"
 
 /**
  * Central (machine-global) stack rules directory:
- * `~/.local/share/headlesscode/shared/stacks/<stack>/rules.md`. Resolved at
- * call time (not module load) so `os.homedir()` picks up a sandboxed $HOME —
- * same requirement as the global modes loader in prompt.ts.
+ * `<store>/shared/stacks/<stack>/rules.md`, where `<store>` is
+ * `projectStoreRoot()` — so the `$HEADLESSCODE_DATA_DIR` override is honored
+ * exactly like every other central-store consumer (checkpoints, settings,
+ * shared instructions, project data), and `scripts/sync-stack-rules.sh`
+ * installs to the same root the engine reads. Resolved at call time (not
+ * module load) so the override / sandboxed $HOME are picked up per call.
  */
 export function getCentralStackRulesDir(): string {
-	return path.join(os.homedir(), ".local", "share", "headlesscode", "shared", "stacks")
+	return path.join(projectStoreRoot(), "shared", "stacks")
 }
 
 /** Absolute path of a stack's central rules.md. */
