@@ -418,6 +418,92 @@ async function testWatchGroupsWaitsForReviewBeforeRecordingCost(): Promise<void>
 	}
 }
 
+/**
+ * Issue #24 (2026-08-05): watchGroups used to await each group's
+ * onGroupUpdate INLINE in the per-group for-loop, so one group's long
+ * review/QA fully monopolized the watcher — no other group's completion was
+ * even detected until the in-flight one resolved. Live impact: a settled
+ * group sat fully idle for 30+ minutes behind another group's review+QA in
+ * the same round. This reproduces the fix: group "w1"'s callback blocks on
+ * a gate that only opens once group "w2" has ALREADY completed its own
+ * callback, proving w2's review runs and finishes while w1's is still stuck
+ * — i.e. groups are no longer serialized through the watcher.
+ */
+async function testWatchGroupsRunsReviewForMultipleGroupsConcurrently(): Promise<void> {
+	const repoRoot = await tmpRepo()
+	try {
+		const w1Path = path.join(repoRoot, ".worktrees", "w1")
+		const w2Path = path.join(repoRoot, ".worktrees", "w2")
+		await fs.mkdir(w1Path, { recursive: true })
+		await fs.mkdir(w2Path, { recursive: true })
+		const statePath = path.join(repoRoot, ".worktrees", ".orchestrator-state.json")
+		saveStateSync(statePath, {
+			...defaultState("round-1"),
+			groups: [baseGroup({ name: "w1", worktree: ".worktrees/w1" }), baseGroup({ name: "w2", worktree: ".worktrees/w2" })],
+		})
+		await fs.mkdir(path.join(w1Path, ".harness.done"))
+		await fs.writeFile(path.join(w1Path, ".harness.exit"), "0", "utf-8")
+		await fs.mkdir(path.join(w2Path, ".harness.done"))
+		await fs.writeFile(path.join(w2Path, ".harness.exit"), "0", "utf-8")
+
+		let w2Finished = false
+		let resolveW1Started: (() => void) | undefined
+		const w1Started = new Promise<void>((resolve) => {
+			resolveW1Started = resolve
+		})
+
+		const summary = await watchGroups({
+			repoRoot,
+			statePath,
+			pollIntervalMs: 20,
+			stderrWriter: () => {},
+			reviewEnabled: true,
+			onGroupUpdate: async (group) => {
+				if (group.name === "w1") {
+					resolveW1Started?.()
+					// Block until w2's callback has fully finished — if the
+					// watcher still serialized groups, this would deadlock
+					// (w2's callback would never even start), so the test
+					// itself is the proof: it only completes if w2 ran
+					// concurrently with w1 still stuck here.
+					const deadline = Date.now() + 5000
+					while (!w2Finished && Date.now() < deadline) {
+						await new Promise((r) => setTimeout(r, 5))
+					}
+					assert.equal(w2Finished, true, "w2 must finish while w1's callback is still blocked")
+					saveStateSync(
+						statePath,
+						updateGroup(loadStateSync(statePath), "w1", {
+							review_verdict: "clean",
+							pending_review_findings: [],
+							reviewed_at: new Date().toISOString(),
+						}),
+					)
+					return undefined
+				}
+				await w1Started
+				saveStateSync(
+					statePath,
+					updateGroup(loadStateSync(statePath), "w2", {
+						review_verdict: "clean",
+						pending_review_findings: [],
+						reviewed_at: new Date().toISOString(),
+					}),
+				)
+				w2Finished = true
+				return undefined
+			},
+		})
+
+		assert.equal(summary.allTerminal, true)
+		const persisted = loadStateSync(statePath)
+		assert.equal(persisted.groups.find((g) => g.name === "w1")?.review_verdict, "clean")
+		assert.equal(persisted.groups.find((g) => g.name === "w2")?.review_verdict, "clean")
+	} finally {
+		await fs.rm(repoRoot, { recursive: true, force: true })
+	}
+}
+
 async function testWatchGroupsPrintsFailedTransitionToStderr(): Promise<void> {
 	const repoRoot = await tmpRepo()
 	try {
@@ -666,6 +752,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["watchGroups: DONE line printed on the transition to done", testWatchGroupsPrintsDoneTransitionToStderr],
 	["watchGroups: records cost history exactly once on the done transition", testWatchGroupsRecordsCostOnDoneTransition],
 	["watchGroups: waits for review before recording cost, then includes the review session's own usage", testWatchGroupsWaitsForReviewBeforeRecordingCost],
+	["watchGroups: runs review for multiple groups concurrently, not serialized (issue #24)", testWatchGroupsRunsReviewForMultipleGroupsConcurrently],
 	["watchGroups: FAILED line printed on the transition to failed", testWatchGroupsPrintsFailedTransitionToStderr],
 	["isIterationExhaustion matches the exact max-iterations error", testIsIterationExhaustionMatchesExactError],
 	["isIterationExhaustion rejects budget/real failures and empty summaries", testIsIterationExhaustionRejectsOtherFailures],

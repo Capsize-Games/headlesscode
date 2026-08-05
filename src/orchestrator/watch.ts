@@ -613,14 +613,54 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 		saveStateSync(statePath, state)
 	}
 
+	// onGroupUpdate calls in flight (keyed by group name), fired without
+	// blocking this loop's iteration over the OTHER groups — see issue #24:
+	// awaiting each group's review/QA inline in this loop meant one group's
+	// multi-minute review fully monopolized the watcher, leaving every other
+	// group's completion undetected (and its own review/QA unstarted) for as
+	// long as the in-flight one took. `allTerminal` below must not fire until
+	// this set drains, or the round would report done while review/QA for a
+	// group is still silently running in the background.
+	const inFlightCallbacks = new Map<string, Promise<void>>()
+
 	while (true) {
 		if (options.signal?.aborted) {
 			break
+		}
+		// Reload fresh from disk every pass rather than trusting the loop's
+		// in-memory `state`: a concurrently in-flight onGroupUpdate call (see
+		// inFlightCallbacks above) writes review/QA patches and rework/
+		// continuation resets directly to the state file via patchGroup, with
+		// no synchronous signal back to this loop. Anything this pass reads
+		// must come from disk to see those writes.
+		state = loadStateSync(statePath)
+		// Resync transition tracking against whatever the fresh state shows:
+		// a background callback may have reset a group's status (e.g.
+		// "done" -> "running" for a rework/continuation respawn) since the
+		// last pass, and that must still print a transition line even though
+		// no `inspectGroup` patch drove it this pass.
+		for (const group of state.groups) {
+			const prevStatus = lastSeenStatus.get(group.name) ?? group.status
+			if (group.status !== prevStatus) {
+				printStatusTransition(writeStderr, group, { status: group.status }, group.status)
+				lastSeenStatus.set(group.name, group.status)
+			}
 		}
 		const now = Date.now()
 		let changed = false
 
 		for (const group of state.groups) {
+			// A group whose onGroupUpdate is still in flight must not be
+			// re-inspected: a rework/continuation reset writes the "running"
+			// status BEFORE it finishes clearing and re-creating the
+			// .harness.done/.harness.exit markers (each fs op is a separate
+			// await), so a poll landing in that window would see "running" +
+			// stale leftover markers and spuriously re-fire the callback for
+			// the SAME group a second time before the first invocation ever
+			// finished resetting them.
+			if (inFlightCallbacks.has(group.name)) {
+				continue
+			}
 			if (isTerminal(group)) {
 				await recordCostIfSettled(group)
 				continue
@@ -648,40 +688,50 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 			saveStateSync(statePath, state)
 			changed = true
 			const updated = state.groups.find((g) => g.name === group.name)
-			if (updated) {
-				const reload = await options.onGroupUpdate?.(updated, state)
-				if (reload === true) {
-					// The callback rewrote the state file (rework loop: group
-					// reset to "running", or marked "needs-human"). The loop's
-					// in-memory state is stale — reload from disk (the
-					// authoritative source) and restart this poll pass so the
-					// group is re-inspected under its new status. lastSeenStatus
-					// is resynced so transition lines stay accurate.
-					state = loadStateSync(statePath)
-					for (const g of state.groups) {
-						lastSeenStatus.set(g.name, g.status)
+			// Fire the callback WITHOUT blocking this loop's iteration over the
+			// other groups (issue #24) — `updated` just transitioned into a
+			// terminal status this pass, so the top-of-loop `isTerminal` check
+			// above guards against re-firing it for the same group while this
+			// call is still in flight (its status stays "done"/"failed"/
+			// "needs-human" in the state file the whole time this callback
+			// runs, even mid-review, since review/QA outcomes are separate
+			// fields). Guard with inFlightCallbacks too, defensively, in case
+			// a future status shape changes that invariant.
+			if (updated && !inFlightCallbacks.has(group.name)) {
+				const callback = (async () => {
+					try {
+						await options.onGroupUpdate?.(updated, state)
+					} catch (err) {
+						writeStderr(
+							`[orchestrate] onGroupUpdate for ${group.name} failed: ${err instanceof Error ? err.message : String(err)}\n`,
+						)
 					}
-					break
-				}
-				// No reload: `updated` was captured BEFORE onGroupUpdate ran, so
-				// it can't see review_verdict/qa the callback just wrote
-				// directly to disk without signaling reload (e.g. the clean,
-				// no-rework path) — re-fetch fresh before checking settledness,
-				// or a "done" group whose review/QA JUST finished this same
-				// tick would look unsettled and never get recorded. Record now
-				// (rather than waiting for a future pass) because `allTerminal`
-				// below can return before the loop ever revisits this group at
-				// the top of a fresh pass.
-				const freshAfterCallback = loadStateSync(statePath).groups.find((g) => g.name === group.name)
-				if (freshAfterCallback) {
-					await recordCostIfSettled(freshAfterCallback)
-				}
+					// The callback (if any) persisted its patches directly to the
+					// state file via patchGroup — re-fetch fresh rather than
+					// trusting this closure's `state`, which may now be stale
+					// relative to disk (this group's own writes, or another
+					// group's concurrent writes). Record cost now rather than
+					// waiting for a future pass, since `allTerminal` only drains
+					// via inFlightCallbacks.size, not by revisiting this group.
+					const freshAfterCallback = loadStateSync(statePath).groups.find((g) => g.name === group.name)
+					if (freshAfterCallback) {
+						await recordCostIfSettled(freshAfterCallback)
+					}
+				})()
+				inFlightCallbacks.set(group.name, callback)
+				void callback.finally(() => {
+					inFlightCallbacks.delete(group.name)
+				})
 			}
 		}
 
-		const allTerminal = state.groups.length > 0 && state.groups.every(isTerminal)
+		const allTerminal =
+			state.groups.length > 0 && state.groups.every(isTerminal) && inFlightCallbacks.size === 0
 		if (allTerminal) {
-			return { state, allTerminal: true }
+			// Reload once more: an in-flight callback observed as drained just
+			// above may have written its final patch to disk after this pass's
+			// `state` was last touched.
+			return { state: loadStateSync(statePath), allTerminal: true }
 		}
 		if (!changed) {
 			await sleep(pollIntervalMs)

@@ -29,9 +29,9 @@ import { splitIssues, type SplitIssue, type WorktreeSpec } from "./split.js"
 import {
 	loadState,
 	loadStateSync,
+	patchGroup,
 	saveState,
 	saveStateSync,
-	updateGroup,
 	type OrchestratorGroup,
 	type OrchestratorState,
 } from "./state.js"
@@ -1605,7 +1605,7 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		pollIntervalMs: options.pollIntervalMs,
 		reviewEnabled: options.review,
 		qaEnabled: options.qa,
-		onGroupUpdate: async (group, currentState) => {
+		onGroupUpdate: async (group) => {
 			// Auto-continue on iteration-exhaustion (issue #2 Part 2): a worker
 			// that failed ONLY because it hit --max-iterations gets a fresh
 			// session on the SAME worktree (the partial state is on disk), up
@@ -1647,31 +1647,30 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 							`[orchestrate] continuation spawn for ${group.name} failed (exit ${spawnResult.status}); ` +
 								`marking group needs-human\n`,
 						)
-						// Merge onto the watcher's CURRENT state (not the outer
-						// snapshot, which predates this group's failed patch and
-						// other groups' transitions) — same reasoning as the
-						// review patch below.
-						state = updateGroup(currentState, group.name, {
+						// patchGroup reloads the state file fresh immediately
+						// before merging (under a write lock) rather than basing
+						// the merge on `currentState` — a stale snapshot that may
+						// predate other groups' concurrent writes now that
+						// review/QA for multiple groups can run in parallel
+						// (issue #24).
+						await patchGroup(statePath, group.name, {
 							status: "needs-human",
 							continuationCount: decision.newContinuationCount,
 							last_activity: {
 								note: `continuation spawn failed after ${decision.newContinuationCount} attempt(s); needs human`,
 							},
 						})
-						await saveState(statePath, state)
 					} else {
 						// Spawn succeeded: reset the group so the watcher re-polls
 						// it as "running" → "done/failed" → re-continued exactly
 						// like a first attempt.
-						state = updateGroup(currentState, group.name, decision.patch)
-						await saveState(statePath, state)
+						await patchGroup(statePath, group.name, decision.patch)
 					}
 					return true
 				}
 				if (decision.patch.status === "needs-human") {
 					// Continuation cap reached: terminal "needs-human" outcome.
-					state = updateGroup(currentState, group.name, decision.patch)
-					await saveState(statePath, state)
+					await patchGroup(statePath, group.name, decision.patch)
 					process.stderr.write(
 						`[orchestrate] NEEDS-HUMAN: ${group.name} exhausted ${decision.newContinuationCount} continuation ` +
 							`attempt(s) and still hits the iteration cap — a human must look at this worktree.\n`,
@@ -1701,8 +1700,7 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 								}
 							: (false as const),
 					}
-					state = updateGroup(currentState, group.name, patch)
-					await saveState(statePath, state)
+					await patchGroup(statePath, group.name, patch)
 					if (analysis && analysis.findings.length > 0) {
 						process.stdout.write(
 							`[orchestrate] ${group.name} log analysis: ${analysis.findings.length} finding(s):\n` +
@@ -1737,11 +1735,7 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 						note: `reviewed: verdict=${result.verdict} (${result.findings.length} finding(s))`,
 					},
 				}
-				// Merge into the watcher's current state (not the outer snapshot,
-				// which may predate the group's transition to done) so the status
-				// written by watchGroups is never clobbered back to an older value.
-				state = updateGroup(currentState, group.name, patch)
-				await saveState(statePath, state)
+				await patchGroup(statePath, group.name, patch)
 				process.stdout.write(
 					`[orchestrate] ${group.name} review verdict: ${result.verdict} (${result.findings.length} finding(s))\n`,
 				)
@@ -1786,26 +1780,23 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 								`[orchestrate] rework worker spawn for ${group.name} failed (exit ${spawnResult.status}); ` +
 									`marking group needs-human\n`,
 							)
-							state = updateGroup(state, group.name, {
+							await patchGroup(statePath, group.name, {
 								status: "needs-human",
 								reworkCount: decision.newReworkCount,
 								last_activity: {
 									note: `rework spawn failed after ${decision.newReworkCount} attempt(s); needs human`,
 								},
 							})
-							await saveState(statePath, state)
 						} else {
 							// Spawn succeeded: reset the group so the watcher
 							// re-polls it as "running" → "done" → re-reviewed.
-							state = updateGroup(state, group.name, decision.patch)
-							await saveState(statePath, state)
+							await patchGroup(statePath, group.name, decision.patch)
 						}
 						return true
 					}
 					// Cap reached: terminal "needs-human" outcome. Findings stay
 					// recorded so a human can see exactly what the reviewer flagged.
-					state = updateGroup(state, group.name, decision.patch)
-					await saveState(statePath, state)
+					await patchGroup(statePath, group.name, decision.patch)
 					process.stderr.write(
 						`[orchestrate] NEEDS-HUMAN: ${group.name} exhausted ${decision.newReworkCount} rework ` +
 							`attempt(s) and the review still has findings — a human must look at this worktree.\n`,
@@ -1829,8 +1820,11 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 				return
 			}
 			// The callback's `group` is the pre-review snapshot; the review
-			// verdict lives in the state we just persisted, so read it fresh.
-			const updatedGroup = state.groups.find((g) => g.name === group.name)
+			// verdict lives in the state file we just persisted via patchGroup,
+			// so read it fresh from disk rather than any in-memory copy —
+			// review/QA for other groups can be writing concurrently now
+			// (issue #24), so a captured snapshot here could be stale.
+			const updatedGroup = loadStateSync(statePath).groups.find((g) => g.name === group.name)
 			const reviewPassed = !options.review || updatedGroup?.review_verdict === "clean"
 			if (!reviewPassed) {
 				return
@@ -1843,9 +1837,7 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 					model: qaModel,
 				})
 				const qaStatus = qaResult.verdict === "pass" ? "done" : "failed"
-				// Merge onto `state` (which already carries the review patch) —
-				// NOT `currentState`, which would clobber review_verdict on save.
-				state = updateGroup(state, group.name, {
+				await patchGroup(statePath, group.name, {
 					qa: {
 						status: qaStatus,
 						verdict: qaResult.verdict,
@@ -1856,7 +1848,6 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 						note: `QA: verdict=${qaResult.verdict}`,
 					},
 				})
-				await saveState(statePath, state)
 				process.stdout.write(
 					`[orchestrate] ${group.name} QA verdict: ${qaResult.verdict} (status ${qaStatus})\n`,
 				)

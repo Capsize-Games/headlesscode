@@ -273,3 +273,45 @@ export function updateGroup(
 	}
 	return { ...state, groups, updated: new Date().toISOString() }
 }
+
+/**
+ * Serializes read-merge-write critical sections against the state file.
+ * Needed now that review/QA for multiple groups can run concurrently
+ * (watchGroups no longer awaits one group's onGroupUpdate before starting
+ * the next) — without this, two concurrent callers doing
+ * loadState -> updateGroup -> saveState for DIFFERENT groups can interleave
+ * across their `await` points and race: both read the same on-disk
+ * snapshot, then whichever saves last clobbers the other's patch for its
+ * own group. Every merge point in cli.ts's onGroupUpdate must go through
+ * patchGroup below rather than reusing a stale in-memory state snapshot.
+ */
+let stateWriteQueue: Promise<unknown> = Promise.resolve()
+
+function withStateLock<T>(fn: () => Promise<T>): Promise<T> {
+	const run = stateWriteQueue.then(fn, fn)
+	stateWriteQueue = run.then(
+		() => undefined,
+		() => undefined,
+	)
+	return run
+}
+
+/**
+ * Atomically patch one group in the on-disk state file: reloads fresh,
+ * merges the patch, writes, all inside the write lock so a concurrent patch
+ * for a different group (or the same group) can't be lost. Returns the full
+ * merged state. Prefer this over a manual loadState/updateGroup/saveState
+ * sequence anywhere concurrent writers are possible.
+ */
+export async function patchGroup(
+	statePath: string,
+	name: string,
+	patch: Partial<Omit<OrchestratorGroup, "name">>,
+): Promise<OrchestratorState> {
+	return withStateLock(async () => {
+		const fresh = await loadState(statePath)
+		const next = updateGroup(fresh, name, patch)
+		await saveState(statePath, next)
+		return next
+	})
+}
