@@ -42,6 +42,7 @@ import { checkAndNoteHeadlesscodeDir } from "../index-util.js"
 import {
 	buildStatusSummary,
 	formatStatusText,
+	isTerminalStatus,
 	reconcileGroups,
 	verdictLine,
 	waitForTerminalState,
@@ -1324,13 +1325,245 @@ export async function statusMain(argv: string[], io: StatusIo = {}): Promise<num
 	return summary.counts.failed > 0 || summary.counts.needsHuman > 0 || summary.counts.orphaned > 0 ? 1 : 0
 }
 
+// ─── `orchestrate stop` — stop a group's WHOLE worker tree (issue #20) ──────
+
+const STOP_USAGE = `headlesscode orchestrate stop — stop one or more groups' worker process trees
+
+Usage:
+  headlesscode orchestrate stop --repo <path> --group <name> [--group <name> ...] [options]
+
+Stops a worker COMPLETELY: scripts/stop-worker.sh targets the worker's process
+GROUP — run-worker.sh launches each worker under setsid and the wrapper
+records its process-group id in <worktree>/.harness.pgid — so the wrapper
+bash, npx, node/tsx and every non-detached grandchild are all killed.
+Killing the wrapper PID alone used to leave the real work running undetected,
+reparented to init, until the session finished on its own (issue #20).
+
+Each stopped group is patched to "needs-human" (a TERMINAL state — a human
+must decide what to do with the stopped worktree next, e.g. resume it under
+new logic). Groups that are already terminal are left untouched.
+
+Options:
+  --repo <path>          Target repo root whose .worktrees/.orchestrator-state.json
+                         is read (required).
+  --group <name>         Worktree group name to stop (repeatable; at least one).
+  --grace-ms <n>         SIGTERM grace period before SIGKILL escalation, ms
+                         (default: 5000; forwarded to scripts/stop-worker.sh).
+  --json                 Machine-readable output: per-group results + final state.
+  --help, -h             Show this help and exit.
+
+Exit codes:
+  0  every requested group was stopped (or was already terminal)
+  1  a requested group could not be stopped / is not in the state file
+  2  usage error (bad or missing arguments)
+`
+
+export interface StopOptions {
+	repo: string
+	groups: string[]
+	graceMs: number
+	json: boolean
+	help: boolean
+}
+
+export function parseStopArgs(argv: string[]): { options: StopOptions; error?: string } {
+	const options: StopOptions = { repo: "", groups: [], graceMs: 5000, json: false, help: false }
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i]
+		const eq = arg.indexOf("=")
+		const flag = eq === -1 ? arg : arg.slice(0, eq)
+		const inlineValue = eq === -1 ? undefined : arg.slice(eq + 1)
+		const next = (): string | undefined => {
+			if (inlineValue !== undefined) {
+				return inlineValue
+			}
+			const v = argv[i + 1]
+			if (v === undefined || v.startsWith("--")) {
+				return undefined
+			}
+			i++
+			return v
+		}
+		switch (flag) {
+			case "--repo": {
+				const v = next()
+				if (v === undefined) {
+					return { options, error: "Missing value for --repo" }
+				}
+				options.repo = v
+				break
+			}
+			case "--group": {
+				const v = next()
+				if (v === undefined) {
+					return { options, error: "Missing value for --group" }
+				}
+				options.groups.push(v)
+				break
+			}
+			case "--grace-ms": {
+				const v = next()
+				const n = v === undefined ? Number.NaN : Number(v)
+				if (!Number.isInteger(n) || n < 0) {
+					return { options, error: "--grace-ms requires a non-negative integer" }
+				}
+				options.graceMs = n
+				break
+			}
+			case "--json":
+				options.json = true
+				break
+			case "--help":
+			case "-h":
+				options.help = true
+				break
+			default:
+				return { options, error: `Unknown orchestrate stop argument: ${arg}` }
+		}
+	}
+	return { options }
+}
+
+export interface StopIo {
+	stdout?: (text: string) => void
+	stderr?: (text: string) => void
+	/** Injectable stop-script runner (tests); default: spawnSync scripts/stop-worker.sh. */
+	runStopWorker?: (wtPath: string, graceMs: number) => { exitCode: number; output: string }
+}
+
+/**
+ * `headlesscode orchestrate stop` entry point. Stops each requested group's
+ * worker process tree via scripts/stop-worker.sh (issue #20) and patches the
+ * stopped groups to `needs-human` so they never sit "running" forever with no
+ * process behind them.
+ */
+export async function stopMain(argv: string[], io: StopIo = {}): Promise<number> {
+	const writeOut = io.stdout ?? ((text: string) => process.stdout.write(text))
+	const writeErr = io.stderr ?? ((text: string) => process.stderr.write(text))
+
+	const { options, error } = parseStopArgs(argv)
+	if (error) {
+		writeErr(`headlesscode orchestrate stop: ${error}\n\n${STOP_USAGE}`)
+		return 2
+	}
+	if (options.help) {
+		writeOut(STOP_USAGE)
+		return 0
+	}
+	if (!options.repo) {
+		writeErr(`headlesscode orchestrate stop: --repo <path> is required\n\n${STOP_USAGE}`)
+		return 2
+	}
+	if (options.groups.length === 0) {
+		writeErr(`headlesscode orchestrate stop: at least one --group <name> is required\n\n${STOP_USAGE}`)
+		return 2
+	}
+
+	const repo = path.resolve(options.repo)
+	const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
+	const runStopWorker =
+		io.runStopWorker ??
+		((wtPath: string, graceMs: number): { exitCode: number; output: string } => {
+			const res = spawnSync(
+				"bash",
+				[path.join(HARNESS_ROOT_TS, "scripts", "stop-worker.sh"), wtPath, "--grace-ms", String(graceMs)],
+				{ encoding: "utf-8" },
+			)
+			const output = `${res.stdout ?? ""}${res.stderr ?? ""}`.trim()
+			return { exitCode: res.status ?? 1, output }
+		})
+
+	if (!fs.existsSync(statePath)) {
+		writeErr(`headlesscode orchestrate stop: no orchestrator state file at ${statePath} — nothing to stop (wrong --repo?)\n`)
+		return 1
+	}
+
+	let state: OrchestratorState
+	try {
+		state = loadStateSync(statePath)
+	} catch (err) {
+		writeErr(
+			`headlesscode orchestrate stop: cannot read state file ${statePath}: ${err instanceof Error ? err.message : String(err)}\n`,
+		)
+		return 1
+	}
+
+	// Validate EVERY requested group exists BEFORE stopping anything — an
+	// operator typo must not stop half the requested set.
+	const unknown = options.groups.filter((name) => !state.groups.some((g) => g.name === name))
+	if (unknown.length > 0) {
+		writeErr(
+			`headlesscode orchestrate stop: group(s) not in state file ${statePath}: ${unknown.join(", ")}\n`,
+		)
+		return 1
+	}
+
+	const results: Array<{ name: string; status: string; stopped: boolean; output?: string }> = []
+	let failed = 0
+	let current = state
+	for (const name of options.groups) {
+		const group = current.groups.find((g) => g.name === name)
+		if (!group) {
+			continue
+		}
+		// With --json, stdout stays pure JSON — human progress + the stop
+		// script's own output go to stderr (conventional diagnostics channel).
+		const writeDiag = options.json ? writeErr : writeOut
+		if (isTerminalStatus(group.status)) {
+			// Already done/failed/needs-human/orphaned: no live worker to stop,
+			// and patching it would clobber the real outcome.
+			writeDiag(`[stop] ${name}: already ${group.status} — nothing to stop\n`)
+			results.push({ name, status: group.status, stopped: false })
+			continue
+		}
+		const wtPath = groupWorktreePath(repo, group)
+		const res = runStopWorker(wtPath, options.graceMs)
+		if (res.exitCode !== 0) {
+			writeDiag(res.output ? `${res.output}\n` : "")
+			writeErr(
+				`[stop] ${name}: scripts/stop-worker.sh failed (exit ${res.exitCode}) — group left as-is (${group.status})\n`,
+			)
+			failed++
+			results.push({ name, status: group.status, stopped: false, ...(res.output ? { output: res.output } : {}) })
+			continue
+		}
+		current = updateGroup(current, name, {
+			status: "needs-human",
+			stopped_at: new Date().toISOString(),
+			stalled: undefined,
+			blocked: undefined,
+			last_activity: {
+				note: "stopped by operator: worker process tree killed (scripts/stop-worker.sh); a human must decide next steps",
+			},
+		})
+		results.push({ name, status: "needs-human", stopped: true })
+		writeDiag(res.output ? `${res.output}\n` : "")
+		writeDiag(`[stop] ${name}: worker tree stopped; group marked needs-human\n`)
+	}
+	saveStateSync(statePath, current)
+
+	if (options.json) {
+		const out: Record<string, unknown> = {
+			results,
+			stopped: results.filter((r) => r.stopped).map((r) => r.name),
+			groups: current.groups,
+		}
+		writeOut(JSON.stringify(out, null, 2) + "\n")
+	}
+	return failed > 0 ? 1 : 0
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 export async function orchestrateMain(argv: string[]): Promise<number> {
 	// Subcommand dispatch: `headlesscode orchestrate status ...` is the
-	// read-side status/wait command; everything else is the spawn+watch round.
+	// read-side status/wait command, `... stop ...` stops a group's whole
+	// worker tree (issue #20); everything else is the spawn+watch round.
 	if (argv[0] === "status") {
 		return statusMain(argv.slice(1))
+	}
+	if (argv[0] === "stop") {
+		return stopMain(argv.slice(1))
 	}
 	const { options, error } = parseOrchestrateArgs(argv)
 	if (error) {
