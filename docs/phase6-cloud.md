@@ -215,7 +215,9 @@ behind it without touching the orchestration layer.
 `LocalProcessProvider` IS today's local flow: task files via the shared
 builder, `scripts/spawn-parallel-worktrees.sh` for the worktree, readiness via
 `.harness.pid`, `scripts/run-worker.sh` for the harness, results from
-`.harness.exit` / `.harness.done` / `harness.log`, teardown via
+`.harness.exit` / `.harness.done` / `harness.log`, stopping via
+`scripts/stop-worker.sh` (issue #20 — kills the worker's whole process group
+via the `.harness.pgid` recorded at launch), teardown via
 `git worktree remove --force`. Injectable `run` / `waitForReady` seams + a
 `dryRun` mode keep it unit-testable with no real worktrees or processes (see
 `src/cloud/__tests__/provider.test.ts` — documented as the lighter contract

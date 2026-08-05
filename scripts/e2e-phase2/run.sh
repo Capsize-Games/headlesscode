@@ -41,14 +41,11 @@ cleanup() {
 		echo "  KEEP=1: leaving fixture ($FIXTURE), bare ($BARE), worktrees, and logs in place"
 		return
 	fi
-	# Kill any still-running workers (by their .harness.pid files).
+	# Stop any still-running workers' WHOLE process trees (issue #20) — killing
+	# the wrapper PID alone would leave the real child running undetected.
 	if [ -n "${FIXTURE:-}" ]; then
 		for n in $WORKTREE_NAMES; do
-			pidfile="$FIXTURE/.worktrees/$n/.harness.pid"
-			if [ -f "$pidfile" ]; then
-				pid="$(cat "$pidfile" 2>/dev/null || true)"
-				[ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-			fi
+			bash "$ROOT/scripts/stop-worker.sh" "$FIXTURE/.worktrees/$n" >/dev/null 2>&1 || true
 		done
 	fi
 	for p in $MOCK_PIDS; do
@@ -63,7 +60,8 @@ cleanup() {
 	rm -rf "${FIXTURE:-}" "${BARE:-}" \
 		"${ISSUES_JSON:-}" "${DRYRUN_OUT:-}" "${SPAWN_OUT:-}" \
 		"${WATCH_OUT:-}" "${REVIEW_OUT:-}" "${WORKER_MOCK_LOG:-}" "${REVIEW_MOCK_LOG:-}" \
-		"${EXHAUST_MOCK_LOG:-}" "${CONT_SPAWN_OUT:-}" "${CONT_OUT:-}"
+		"${EXHAUST_MOCK_LOG:-}" "${CONT_SPAWN_OUT:-}" "${CONT_OUT:-}" \
+		"${STOP_SPAWN_OUT:-}" "${STOP_OUT:-}"
 	echo "  cleaned up temp fixture/bare/worktrees/logs (set KEEP=1 to retain)"
 }
 
@@ -489,6 +487,91 @@ if [ -d "$FIXTURE/.worktrees/w3" ]; then
 	pass "the SAME worktree was re-used across continuations (still one w3)"
 else
 	fail "w3 worktree missing after continuations"
+fi
+
+# ── 9.5. Stop capability (issue #20): killing the wrapper PID must not leave ─
+#        the actual work running — stop-worker.sh kills the WHOLE tree. ──────
+# Requires setsid (Linux util-linux), which run-worker.sh uses to put each
+# worker in its own process group.
+echo "== [9.5/10] stop-worker.sh kills the whole process tree (issue #20) =="
+cat > "$FIXTURE/plans/parallel-tasks/w4-issue20.md" <<'EOF'
+## Your assignment
+
+Fix the bug in src/greet.js: greet() must return "Hello, " + name (issue #20).
+
+## Workflow
+
+1. Read src/greet.js.
+2. Patch it with write_to_file.
+3. Verify with `node src/greet.test.js`.
+4. Report via attempt_completion.
+EOF
+STOP_SPAWN_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-stop-spawn-XXXXXX.out)"
+(
+	cd "$ROOT" &&
+		TARGET_REPO="$FIXTURE" \
+		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
+		OPENROUTER_BASE_URL="http://127.0.0.1:$EXHAUST_PORT" \
+		HEADLESSCODE_ROOT="$ROOT" \
+		HEADLESSCODE_MAX_ITERATIONS=200 \
+		ALLOW_UNINDEXED=1 \
+		bash scripts/spawn-parallel-worktrees.sh w4:3:plans/parallel-tasks/w4-issue20.md
+) >"$STOP_SPAWN_OUT" 2>&1
+STOP_SPAWN_EXIT=$?
+if [ "$STOP_SPAWN_EXIT" -eq 0 ] && [ -d "$FIXTURE/.worktrees/w4" ]; then
+	pass "stop fixture: worktree w4 spawned against the exhaustion mock"
+else
+	fail "stop fixture: w4 spawn failed (exit $STOP_SPAWN_EXIT)"
+	tail -n 15 "$STOP_SPAWN_OUT" >&2
+fi
+WORKTREE_NAMES="$WORKTREE_NAMES w4"
+
+# Wait for the worker to be up with its process-group id recorded.
+W4_UP=0
+for _ in $(seq 1 30); do
+	if [ -f "$FIXTURE/.worktrees/w4/.harness.pgid" ]; then
+		W4_UP=1
+		break
+	fi
+	sleep 1
+done
+W4_PGID="$(cat "$FIXTURE/.worktrees/w4/.harness.pgid" 2>/dev/null || true)"
+if [ "$W4_UP" -eq 1 ] && [ -n "$W4_PGID" ]; then
+	pass "stop fixture: worker up with .harness.pgid=$W4_PGID"
+else
+	fail "stop fixture: w4 never became ready (no .harness.pgid)"
+	tail -n 10 "$FIXTURE/.worktrees/w4/harness.log" 2>/dev/null >&2 || true
+fi
+
+# The worker is a setsid group leader: its whole tree is one live group.
+if [ -n "$W4_PGID" ] && kill -0 -- "-$W4_PGID" 2>/dev/null; then
+	pass "stop fixture: process group -$W4_PGID is alive (whole tree in one group)"
+else
+	fail "stop fixture: expected a live process group -$W4_PGID"
+fi
+
+# Stop it: the WHOLE tree must die, and no completion marker may appear.
+STOP_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-stop-XXXXXX.out)"
+(
+	cd "$ROOT" && bash scripts/stop-worker.sh "$FIXTURE/.worktrees/w4"
+) >"$STOP_OUT" 2>&1
+STOP_EXIT=$?
+if [ "$STOP_EXIT" -eq 0 ] && [ -n "$W4_PGID" ] && ! kill -0 -- "-$W4_PGID" 2>/dev/null; then
+	pass "stop-worker.sh killed the whole process tree (exit 0, group -$W4_PGID gone)"
+else
+	fail "stop-worker.sh did not kill the tree (exit $STOP_EXIT)"
+	cat "$STOP_OUT" >&2
+fi
+sleep 3
+if [ ! -d "$FIXTURE/.worktrees/w4/.harness.done" ]; then
+	pass "stop fixture: no .harness.done after stop (worker was really stopped)"
+else
+	fail "stop fixture: .harness.done appeared after stop — the worker finished anyway"
+fi
+if [ ! -f "$FIXTURE/.worktrees/w4/.harness.exit" ]; then
+	pass "stop fixture: no .harness.exit after stop (wrapper was killed with the tree)"
+else
+	fail "stop fixture: .harness.exit present after stop — wrapper survived"
 fi
 
 # ── 10. Summary + cleanup ────────────────────────────────────────────────────

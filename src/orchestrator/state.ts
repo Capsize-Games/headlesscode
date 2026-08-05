@@ -75,6 +75,14 @@ export interface OrchestratorGroup {
 	summary?: string
 	/** Set by the watcher's stall guard. */
 	stalled?: boolean
+	/**
+	 * Set by `headlesscode orchestrate stop` when an operator stops a group's
+	 * worker process tree mid-run (scripts/stop-worker.sh, issue #20): the
+	 * group is patched to `needs-human` and this records WHEN the stop
+	 * happened, so a human can tell a deliberately-stopped group apart from a
+	 * crash or a rework-exhausted one.
+	 */
+	stopped_at?: string
 	/** Review bookkeeping (written by the orchestrator after runReview). */
 	review_verdict?: string
 	reviewed_at?: string

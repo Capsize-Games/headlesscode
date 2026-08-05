@@ -159,6 +159,10 @@ Subcommands:
               call until every group is terminal (--wait) — replaces
               hand-rolled poll loops over the state file / harness.log. See
               \`npx tsx src/cli.ts orchestrate status --help\` for full options.
+  headlesscode orchestrate stop --repo <path> --group <name> [--group <name> ...]
+              Stop a group's worker COMPLETELY (whole process tree via
+              scripts/stop-worker.sh — issue #20) and mark it needs-human. See
+              \`npx tsx src/cli.ts orchestrate stop --help\` for full options.
   headlesscode watch --owner <o> --repo <r> --label <label> [--run-once]
               Poll GitHub for labeled issues and fan out into orchestration
               batches (idempotent). See

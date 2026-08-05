@@ -11,8 +11,12 @@
 #      prompt automatically by the harness (same mechanism as the reviewer),
 #      so the task file is a thin pointer to it.
 #   2. Runs `$HEADLESSCODE_CLI --task-file .qa-task.md --workspace <worktree>
-#      --mode <mode>` as a detached background process (nohup + &).
-#   3. Writes the QA session PID to <worktree>/.qa.pid.
+#      --mode <mode>` as a detached background process (nohup + setsid + & —
+#      setsid puts the QA wrapper in its OWN process group so a stop command
+#      can kill the whole tree, issue #20).
+#   3. Writes the QA session PID to <worktree>/.qa.pid and, when setsid is
+#      available, the process-group id to <worktree>/.qa.pgid (written from
+#      INSIDE the wrapper, so it is always the real group leader).
 #   4. Redirects stdout+stderr to <worktree>/qa.log.
 #   5. On harness exit, writes the exit code to <worktree>/.qa.exit and creates
 #      the completion marker directory <worktree>/.qa.done/ (same atomic mkdir
@@ -152,10 +156,27 @@ mkdir '$WT_PATH/.qa.done' 2>/dev/null
 exit \$CODE
 "
 
-# ── Launch detached + record pid ────────────────────────────────────────────
+# ── Launch detached + record pid + pgid ─────────────────────────────────────
 rm -f "$WT_PATH/.qa.exit"
 rm -rf "$WT_PATH/.qa.done"
-nohup bash -c "$WRAPPER" >"$WT_PATH/qa.log" 2>&1 &
+
+# Issue #20 (same fix as run-worker.sh): run the QA wrapper in its OWN process
+# group via setsid so a stop command can kill the whole tree, and record the
+# group id from INSIDE the wrapper (exact even when setsid has to fork).
+SETSID_OK=0
+if command -v setsid >/dev/null 2>&1; then
+    SETSID_OK=1
+    WRAPPER="printf '%s' \"\$\$\" > '$WT_PATH/.qa.pgid'
+$WRAPPER"
+else
+    echo "run-qa: warning: setsid not found — QA session will share the caller's process group; stopping it can only kill the wrapper PID (issue #20)" >&2
+fi
+
+if [ "$SETSID_OK" -eq 1 ]; then
+    nohup setsid bash -c "$WRAPPER" >"$WT_PATH/qa.log" 2>&1 &
+else
+    nohup bash -c "$WRAPPER" >"$WT_PATH/qa.log" 2>&1 &
+fi
 PID=$!
 printf '%s' "$PID" > "$WT_PATH/.qa.pid"
 

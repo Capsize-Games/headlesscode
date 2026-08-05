@@ -105,12 +105,20 @@ async function waitForDone(wtPath: string, timeoutMs = 15000): Promise<void> {
 }
 
 async function cleanupFixture(fixture: string, wtName: string): Promise<void> {
+	// Issue #20: kill the worker's WHOLE process group, not just the wrapper
+	// PID — the wrapper is now a setsid group leader and its children would
+	// otherwise survive the cleanup (run-worker.sh writes .harness.pgid).
+	const pgidFile = path.join(fixture, ".worktrees", wtName, ".harness.pgid")
 	const pidFile = path.join(fixture, ".worktrees", wtName, ".harness.pid")
-	if (fs.existsSync(pidFile)) {
-		try {
-			process.kill(Number(fs.readFileSync(pidFile, "utf-8")), "SIGKILL")
-		} catch {
-			/* worker already gone */
+	for (const file of [pgidFile, pidFile]) {
+		if (fs.existsSync(file)) {
+			try {
+				const pid = Number(fs.readFileSync(file, "utf-8"))
+				// Negative pid = the whole process group; a plain pid otherwise.
+				process.kill(file === pgidFile ? -pid : pid, "SIGKILL")
+			} catch {
+				/* worker already gone */
+			}
 		}
 	}
 	try {

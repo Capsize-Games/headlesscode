@@ -5,6 +5,9 @@
  * process/IPC signals written by scripts/run-worker.sh:
  *
  *   <worktree>/.harness.pid              worker PID (written at launch)
+ *   <worktree>/.harness.pgid             worker process-group id (written by the
+ *                                        wrapper under setsid; issue #20 — lets a
+ *                                        stop command kill the WHOLE tree)
  *   <worktree>/.harness.exit             worker exit code (written on harness exit)
  *   <worktree>/.harness.done/            completion marker DIR (mkdir-based, atomic,
  *                                        same lock-mutex convention as phone-home.sh)
@@ -282,9 +285,33 @@ function readNeedsDecision(wtPath: string): NeedsDecision | undefined {
 	}
 }
 
+/** Read + validate a numeric pid/pgid marker file; undefined when absent/invalid. */
+function readPidFile(wtPath: string, name: string): number | undefined {
+	let raw: string
+	try {
+		raw = fs.readFileSync(path.join(wtPath, name), "utf-8").trim()
+	} catch {
+		return undefined
+	}
+	if (!/^\d+$/.test(raw)) {
+		return undefined
+	}
+	return Number(raw)
+}
+
+/** `process.kill(pid, 0)` liveness probe (a negative pid targets a process group). */
+function processAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0)
+		return true
+	} catch {
+		return false
+	}
+}
+
 /**
- * Whether the worker process recorded in a pid file (default `.harness.pid`)
- * is ACTUALLY still running — not just whether the file exists. A worker that
+ * Whether the process recorded in a pid file (default `.harness.pid`) is
+ * ACTUALLY still running — not just whether the file exists. A worker that
  * crashes or is killed without cleaning up its own pid file leaves a stale
  * file behind forever; checking existence alone made a dead worker
  * indistinguishable from a live one, which is what caused the 2026-08-02
@@ -293,23 +320,25 @@ function readNeedsDecision(wtPath: string): NeedsDecision | undefined {
  * The pid-file name is a parameter so the same liveness check can be reused
  * for the QA session marker (`.qa.pid`) by orchestrate cleanup — one
  * mechanism, never reinvented.
+ *
+ * Issue #20: for the worker's OWN pid file specifically, liveness is checked
+ * at the process GROUP level when available (`.harness.pgid`, written by
+ * run-worker.sh's setsid launch): killing only the wrapper bash — the
+ * `.harness.pid` process — leaves the real child running reparented to
+ * init, and a wrapper-only check would report the worker dead while it
+ * keeps burning the session. Workers launched before the setsid change (and
+ * any non-default pidFile, e.g. the QA session's `.qa.pid`, which has no
+ * group concept) fall back to the single-pid check.
  */
 export function isPidAlive(wtPath: string, pidFile = ".harness.pid"): boolean {
-	let raw: string
-	try {
-		raw = fs.readFileSync(path.join(wtPath, pidFile), "utf-8").trim()
-	} catch {
-		return false
+	if (pidFile === ".harness.pid") {
+		const pgid = readPidFile(wtPath, ".harness.pgid")
+		if (pgid !== undefined) {
+			return processAlive(-pgid)
+		}
 	}
-	if (!/^\d+$/.test(raw)) {
-		return false
-	}
-	try {
-		process.kill(Number(raw), 0)
-		return true
-	} catch {
-		return false
-	}
+	const pid = readPidFile(wtPath, pidFile)
+	return pid !== undefined && processAlive(pid)
 }
 
 /**
