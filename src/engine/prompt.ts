@@ -19,7 +19,9 @@
  *
  * Note: `.roo/rules-<mode>/`, `.roo/rules/`, and AGENTS.md splicing happens
  * inside the vendored `SYSTEM_PROMPT` → `addCustomInstructions()`; we only
- * need to pass the workspace root as `cwd` plus the mode slug.
+ * need to pass the workspace root as `cwd` plus the mode slug. Stack-specific
+ * rules (src/engine/stacks.ts) are spliced HERE, after the vendored build —
+ * the vendored prompt sections have no hook for them.
  */
 
 import * as path from "node:path"
@@ -43,6 +45,7 @@ import { runTestsTool } from "../tools/run-tests.js"
 import { CODE_INTEL_TOOLS, RENAME_SYMBOL_TOOL } from "../codeintel/tools.js"
 import type { ModeConfig } from "@roo-code/types"
 
+import { appendStackRulesSection, loadStackRules } from "./stacks.js"
 import type { ChatTool } from "./types.js"
 
 export interface BuildSystemPromptOptions {
@@ -301,6 +304,14 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions): Prom
 		settings,
 	)
 
+	// Stack-specific rules (src/engine/stacks.ts): appended as a clearly
+	// delimited section only when a detected stack actually has rules content
+	// — zero stacks / no rules.md keeps the prompt byte-identical.
+	const stackRules = await loadStackRules(workspaceRoot)
+	const withStackRules = stackRules.content
+		? appendStackRulesSection(prompt, stackRules.content, stackRules.stacks)
+		: prompt
+
 	// Headless harness workflow conventions, appended AFTER the vendored
 	// builder's output (which is vendored code and must not be edited in
 	// place). These are harness-level expectations that live outside any
@@ -310,7 +321,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions): Prom
 	// only applies to modes that can actually edit files (modeHasEditGroup);
 	// read-only reviewer/QA roles never see it.
 	const conventions = buildHeadlessConventions(modeConfig.slug, customModes)
-	const fullPrompt = conventions === undefined ? prompt : `${prompt}\n${conventions}`
+	const fullPrompt = conventions === undefined ? withStackRules : `${withStackRules}\n${conventions}`
 
 	return { prompt: fullPrompt, modeConfig, customModes }
 }

@@ -56,6 +56,17 @@ export {
 	selectToolsForMode,
 	EXECUTABLE_TOOL_NAMES,
 } from "./engine/prompt.js"
+export {
+	detectStacks,
+	loadStackRules,
+	appendStackRulesSection,
+	STACK_NAMES,
+	STACK_RULES_HEADER,
+	getCentralStackRulesDir,
+	getCentralStackRulesFile,
+	getProjectStackRulesFile,
+} from "./engine/stacks.js"
+export type { StackName, LoadedStackRules } from "./engine/stacks.js"
 export type {
 	ChatMessage,
 	ChatTool,
