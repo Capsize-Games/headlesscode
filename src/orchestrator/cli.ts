@@ -51,6 +51,7 @@ import {
 	type StatusSummary,
 } from "./status.js"
 import { resolveModelForMode } from "../config/mode-models.js"
+import { runPreflight, type PreflightResult } from "../llm/preflight.js"
 
 const ORCHESTRATE_USAGE = `headlesscode orchestrate — Phase 2 parallel round
 
@@ -103,6 +104,12 @@ Options:
                  re-spawns a worker on the SAME worktree with a fresh session.
                  After the cap, the group is marked "needs-human" and left for
                  manual resolution
+  --no-preflight        Skip the pre-spawn preflight probe (issue #13): a cheap
+                 1-token completion using the EXACT model + provider pin a real
+                 worker uses, run BEFORE anything is spawned, that distinguishes
+                 key-invalid / account-balance-exhausted / pinned-provider-down
+                 / all-clear. ON by default; skip for CI/non-interactive
+                 contexts that don't want the extra round-trip
   --dry-run              Print the split plan + spawn commands, spawn nothing
   --help                 Show this help and exit
 
@@ -156,6 +163,11 @@ interface OrchestrateOptions {
 	maxIterations?: number
 	/** Auto-continue: max re-spawns per group after a worker hits the iteration cap (default 3). */
 	maxContinuations: number
+	/**
+	 * Issue #13 pre-spawn preflight probe (1-token, exact model + provider
+	 * pin). ON by default; --no-preflight skips it for CI/non-interactive.
+	 */
+	preflight: boolean
 	dryRun: boolean
 	help: boolean
 }
@@ -190,6 +202,7 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 		maxReworkCycles: 3,
 		maxContinuations: 3,
 		maxIterations: maxIterationsFromEnv(),
+		preflight: true,
 		dryRun: false,
 		help: false,
 	}
@@ -350,6 +363,9 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 				options.deployArgs = v
 				break
 			}
+			case "--no-preflight":
+				options.preflight = false
+				break
 			case "--dry-run":
 				options.dryRun = true
 				break
@@ -1663,6 +1679,48 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		return 1
 	}
 
+	// 1a-pre. Issue #13 pre-spawn preflight probe: a cheap 1-token completion
+	// using the EXACT model + provider pin a real worker will use, so a dead
+	// key / exhausted account balance / down pinned provider fails NOW instead
+	// of 30-80 iterations (10-15 min + real spend) into the round. Runs before
+	// task files or spawn; --no-preflight skips it for CI/non-interactive
+	// contexts that don't want the extra round-trip. The probe's model is
+	// resolved exactly like the worker's first spawn (same resolveModelForMode
+	// precedence as 1c below), so what we probe is what the worker will call.
+	let preflightProbe: PreflightResult | undefined
+	if (options.preflight) {
+		const workerModelForProbe = resolveModelForMode({
+			workspaceRoot: repo,
+			mode: options.mode,
+			explicitModel: options.model,
+			env: process.env,
+		})
+		const maxCostRaw = process.env.HEADLESSCODE_MAX_COST_USD
+		const maxCostUsd = maxCostRaw !== undefined && maxCostRaw !== "" ? Number(maxCostRaw) : undefined
+		try {
+			preflightProbe = await runPreflight({
+				model: workerModelForProbe,
+				workerSessions: specs.length,
+				maxCostUsd: maxCostUsd !== undefined && Number.isFinite(maxCostUsd) && maxCostUsd > 0 ? maxCostUsd : undefined,
+			})
+		} catch (err) {
+			// runPreflight never throws by contract, but if it ever does the
+			// round must not proceed on an unchecked gate.
+			process.stderr.write(
+				`headlesscode orchestrate: preflight probe crashed unexpectedly: ${err instanceof Error ? err.message : String(err)}\n`,
+			)
+			return 1
+		}
+		process.stdout.write(`[preflight] ${preflightProbe.line}\n`)
+		if (preflightProbe.status !== "ok") {
+			process.stderr.write(
+				`headlesscode orchestrate: preflight FAILED (${preflightProbe.status}) — aborting before any workers spawn. ` +
+					`Fix the problem above, or use --no-preflight to skip this check.\n`,
+			)
+			return 1
+		}
+	}
+
 	// 1b. Task files.
 	const written = writeTaskFiles(repo, specs, issues)
 	process.stdout.write(`Wrote ${written.length} task file(s) under ${path.join(repo, "plans", "parallel-tasks")}\n`)
@@ -1712,6 +1770,19 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		state = { batch, groups: [] }
 	}
 	state.batch = batch
+	// Issue #13: persist the preflight probe so the dashboard can surface the
+	// preflight line on the round view (see aggregate.ts RoundSummary.preflight).
+	if (preflightProbe) {
+		state.preflight = {
+			status: preflightProbe.status,
+			model: preflightProbe.model,
+			baseUrl: preflightProbe.baseUrl,
+			line: preflightProbe.line,
+			latencyMs: preflightProbe.latencyMs,
+			probeCostUsd: preflightProbe.probeCostUsd,
+			roundCostEstimateUsd: preflightProbe.roundCostEstimateUsd,
+		}
+	}
 	await saveState(statePath, state)
 
 	// 4. Watch + review. Per-mode model assignment: each role resolves its OWN

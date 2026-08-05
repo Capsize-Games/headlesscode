@@ -175,6 +175,36 @@ async function testBlockedGroupSurfacesQuestion(): Promise<void> {
 	}
 }
 
+async function testRoundSurfacesPreflightProbe(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
+		const state: OrchestratorState = {
+			batch: "round-1",
+			groups: [],
+			preflight: {
+				status: "ok",
+				model: "deepseek/deepseek-v4-flash",
+				line: 'deepseek/deepseek-v4-flash (pinned to provider "deepseek"): all clear — 1-token probe OK in 812ms',
+				latencyMs: 812,
+				probeCostUsd: 0.000004,
+				roundCostEstimateUsd: 0.14,
+			},
+		}
+		await saveState(statePath, state)
+
+		const summary = await buildSummary(repo)
+		assert.ok(summary.round, "round data present when .orchestrator-state.json exists")
+		assert.equal(summary.round?.preflight?.status, "ok")
+		assert.equal(summary.round?.preflight?.model, "deepseek/deepseek-v4-flash")
+		assert.ok(summary.round?.preflight?.line.includes("all clear"), "preflight line reaches the round summary")
+		assert.equal(summary.round?.preflight?.roundCostEstimateUsd, 0.14)
+		assert.equal(summary.round?.preflight?.latencyMs, 812)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 async function testNoOrchestratorStateYieldsNoRound(): Promise<void> {
 	const repo = await tmpRepo()
 	try {
@@ -344,6 +374,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["buildSummary: multiple sessions sum correctly", testMultipleSessionsSumCorrectly],
 	["buildSummary: worktree usage dirs are included alongside the repo root's own", testWorktreeSessionsAreIncluded],
 	["buildSummary: a blocked group surfaces its question in round.blocked", testBlockedGroupSurfacesQuestion],
+	["buildSummary: the round surfaces the preflight probe line", testRoundSurfacesPreflightProbe],
 	["buildSummary: no .orchestrator-state.json -> round is undefined", testNoOrchestratorStateYieldsNoRound],
 	["buildSummary: a live snapshot with no .jsonl shows the session as running", testLiveSnapshotShowsRunningSession],
 	["buildSummary: completed .jsonl wins over a live snapshot (no dup, no double count)", testCompletedJsonlWinsOverLiveSnapshot],
