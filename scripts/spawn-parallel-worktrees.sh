@@ -137,13 +137,32 @@ mkdir -p "$WORKTREE_PARENT"
 # ── State-file merge (node one-liner; the harness is a node project) ────────
 # Merges a JSON patch ({ groups: [...] }) into the state file, upserting by
 # group name. Keeps the file valid JSON even when it doesn't exist yet.
+#
+# mode (3rd arg, default "merge"):
+#   - "merge":   shallow-merge the patch onto any existing same-named entry
+#                (used for in-round follow-up patches, e.g. spawned -> running,
+#                where preserving other fields written moments ago is correct).
+#   - "replace": REPLACE any existing same-named entry wholesale instead of
+#                merging. Required for the FIRST patch of a new round: a
+#                worktree slot (e.g. "w1") is commonly reused after
+#                `orchestrate cleanup` removes the old worktree dir but
+#                leaves the group's state entry in place for history. A
+#                shallow merge there would let the PREVIOUS round's
+#                review_verdict/qa/cost_recorded/reviewed_at survive into the
+#                new round untouched — cli.ts's review/QA gates check those
+#                fields for `!== undefined`, so stale non-undefined values
+#                make a brand-new round look already-reviewed/QA'd/costed,
+#                silently skipping real verification. (Caught live 2026-08-05:
+#                issue #25's own round inherited issue #5's stale QA evidence
+#                this exact way.)
 merge_state() {
     local state_file="$1"
     local patch_file="$2"
+    local mode="${3:-merge}"
     node -e '
         const fs = require("fs")
         const path = require("path")
-        const [stateFile, patchFile] = process.argv.slice(1)
+        const [stateFile, patchFile, mode] = process.argv.slice(1)
         let patch
         try {
             patch = JSON.parse(fs.readFileSync(patchFile, "utf-8"))
@@ -159,13 +178,13 @@ merge_state() {
         if (!Array.isArray(state.groups)) state.groups = []
         for (const g of patch.groups || []) {
             const i = state.groups.findIndex((x) => x && x.name === g.name)
-            if (i >= 0) state.groups[i] = { ...state.groups[i], ...g }
+            if (i >= 0) state.groups[i] = mode === "replace" ? g : { ...state.groups[i], ...g }
             else state.groups.push(g)
         }
         state.updated = new Date().toISOString()
         fs.mkdirSync(path.dirname(stateFile), { recursive: true })
         fs.writeFileSync(stateFile, JSON.stringify(state, null, 2) + "\n")
-    ' "$state_file" "$patch_file"
+    ' "$state_file" "$patch_file" "$mode"
 }
 
 # ── Per-mode model resolution ────────────────────────────────────────────────
@@ -328,7 +347,11 @@ for spec in "$@"; do
   ]
 }
 EOF
-    merge_state "$STATE_FILE" "$patch_file"
+    # "replace": this is the FIRST patch for this group name in this round —
+    # wholesale-replace rather than merge, so a reused worktree slot never
+    # inherits a previous round's review_verdict/qa/cost_recorded/etc. (see
+    # merge_state's doc comment).
+    merge_state "$STATE_FILE" "$patch_file" replace
     rm -f "$patch_file"
 
     # ── Launch the headless worker (replaces code + sleep 20 + xdotool) ─────
