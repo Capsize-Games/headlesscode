@@ -16,13 +16,17 @@ set -e
 
 mkdir -p "$HEADLESSCODE_WORKSPACE_ROOT" "$HOME"
 
-# Seed the shipped stack rules into the central store
-# ($HOME/.local/share/headlesscode/shared/stacks). $HOME lives on the /data
-# volume, which shadows image layers, so this must run at every start.
+# Seed the shipped stack rules into the central store the runtime reads
+# (src/engine/stacks.ts:getCentralStackRulesDir resolves via projectStoreRoot,
+# honoring $HEADLESSCODE_DATA_DIR — the same resolution install-cli.sh uses):
+# $HEADLESSCODE_DATA_DIR/shared/stacks, else $HOME/.local/share/headlesscode/
+# shared/stacks. $HOME lives on the /data volume, which shadows image layers,
+# so this must run at every start.
 STACKS_SRC=/opt/headlesscode/shared/stacks
 if [ -d "$STACKS_SRC" ]; then
-	mkdir -p "$HOME/.local/share/headlesscode/shared/stacks"
-	cp -R "$STACKS_SRC"/. "$HOME/.local/share/headlesscode/shared/stacks"/
+	STACKS_DEST="${HEADLESSCODE_DATA_DIR:-$HOME/.local/share/headlesscode}/shared/stacks"
+	mkdir -p "$STACKS_DEST"
+	cp -R "$STACKS_SRC"/. "$STACKS_DEST"/
 fi
 
 if ! git config --global user.name >/dev/null 2>&1; then

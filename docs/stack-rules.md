@@ -36,7 +36,7 @@ their source path in the prompt):
 
 | Tier | Path |
 | ---- | ---- |
-| Central (global, ships with headlesscode) | `~/.local/share/headlesscode/shared/stacks/<stack>/rules.md` |
+| Central (global, ships with headlesscode) | `$HEADLESSCODE_DATA_DIR`/`shared/stacks/<stack>/rules.md` when that override is set, else `~/.local/share/headlesscode/shared/stacks/<stack>/rules.md` |
 | Project-local (optional override/addition) | `<workspaceRoot>/.roo/rules-stack-<stack>/rules.md` |
 
 A missing file is never an error — same idiom as the existing missing-file
@@ -48,11 +48,16 @@ change).
 The central tier is a shipped set, not a user-created one: the canonical
 copy lives in the repo at `shared/stacks/<stack>/rules.md` (mirroring the
 runtime layout), and is installed into the machine-global path by
-`scripts/install-cli.sh` (honoring the `$HEADLESSCODE_DATA_DIR` override the
-runtime uses) and, for the Docker image, seeded into `$HOME/.local/share/
-headlesscode/shared/stacks/` by `docker/entrypoint.sh` at every container
-start (the `/data` volume shadows image layers). Keep the in-repo file as
-the single source of truth for central stack rules.
+`scripts/install-cli.sh`. The runtime resolves that path the same way the
+installer writes it: `getCentralStackRulesDir()` (`src/engine/stacks.ts`) is
+store-root-derived via `projectStoreRoot()` (`src/project-store.ts`), which
+honors the `$HEADLESSCODE_DATA_DIR` override exactly like
+`sharedInstructionsRoot()` does — so the shipped content is
+`$HEADLESSCODE_DATA_DIR/shared/stacks/` when the override is set, else
+`~/.local/share/headlesscode/shared/stacks/`. For the Docker image,
+`docker/entrypoint.sh` seeds the same override-aware central-store path at
+every container start (the `/data` volume shadows image layers). Keep the
+in-repo file as the single source of truth for central stack rules.
 
 ## Detection heuristics
 

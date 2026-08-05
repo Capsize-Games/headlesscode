@@ -56,7 +56,9 @@ Before considering any change to `src/` done:
 - **Stack-specific rules.** Per-stack guidance for a target project (Python
   vs. C++ conventions, verification tooling, …) lives at
   `<workspaceRoot>/.roo/rules-stack-<stack>/rules.md`, with a machine-global
-  set at `~/.local/share/headlesscode/shared/stacks/<stack>/rules.md`
+  set at `~/.local/share/headlesscode/shared/stacks/<stack>/rules.md` (or
+  `$HEADLESSCODE_DATA_DIR/shared/stacks/<stack>/rules.md` under an override —
+  the runtime and `scripts/install-cli.sh` resolve the same store root)
   (additive, global first) — shipped from the repo's `shared/stacks/` by
   `scripts/install-cli.sh` (and seeded in the Docker image at entrypoint).
   Detection + splicing is automatic — see `src/engine/stacks.ts` and
