@@ -16,9 +16,20 @@
 #   scripts/codemap-watch.sh [--once] [--interval-ms <n>] <workspace-path>
 #
 # Env overrides:
-#   HEADLESSCODE_ROOT    repo containing src/cli.ts (default: this repo)
-#   HEADLESSCODE_CLI     command that runs the harness CLI
-#                        (default "npx tsx src/cli.ts")
+#   HEADLESSCODE_ROOT    repo containing src/cli.ts (default: this repo).
+#                        Honored only when that checkout actually has the
+#                        codemap subcommand — otherwise this script falls back
+#                        to its own checkout (the harness exports
+#                        HEADLESSCODE_ROOT to every worker pointing at the
+#                        main checkout, which can be on a branch that
+#                        predates the codemap subcommand).
+#   HEADLESSCODE_CLI     command that runs the harness CLI. Default is the
+#                        direct tsx binary (node_modules/.bin/tsx src/cli.ts)
+#                        — NOT "npx tsx src/cli.ts", because npx is an extra
+#                        shim that swallows SIGINT/SIGTERM instead of
+#                        forwarding them, which breaks the clean-stop promise
+#                        of --watch mode (systemd sends SIGTERM to the
+#                        wrapper). Same choice install-cli.sh makes.
 #
 # Exit codes: 0 on a successful one-shot / clean stop; 2 on usage errors.
 
@@ -77,11 +88,34 @@ if [ ! -d "$WS_PATH" ]; then
     exit 2
 fi
 
-HARNESS_ROOT="${HEADLESSCODE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-CLI="${HEADLESSCODE_CLI:-npx tsx src/cli.ts}"
+CLI="${HEADLESSCODE_CLI:-node_modules/.bin/tsx src/cli.ts}"
+
+# Resolve this script's own checkout first (robustly — `cd` to the script's
+# dir before pwd -P, so a relative invocation path or a symlinked scripts/
+# dir can't point us at the wrong root), then decide the harness root.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIPT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+
+# True when the repo's cli.ts dispatches the codemap subcommand (the stable
+# `if (argv[0] === "codemap")` idiom every subcommand follows in src/cli.ts).
+has_codemap_subcommand() {
+    grep -qE 'argv\[0\] === "codemap"' "$1/src/cli.ts"
+}
+
+HARNESS_ROOT="$SCRIPT_ROOT"
+if [ -n "${HEADLESSCODE_ROOT:-}" ]; then
+    if [ -f "$HEADLESSCODE_ROOT/src/cli.ts" ] && has_codemap_subcommand "$HEADLESSCODE_ROOT"; then
+        HARNESS_ROOT="$(cd "$HEADLESSCODE_ROOT" && pwd -P)"
+    elif has_codemap_subcommand "$SCRIPT_ROOT"; then
+        echo "codemap-watch: HEADLESSCODE_ROOT ($HEADLESSCODE_ROOT) lacks the codemap subcommand; using this checkout ($SCRIPT_ROOT)" >&2
+    else
+        echo "codemap-watch: HEADLESSCODE_ROOT ($HEADLESSCODE_ROOT) has no src/cli.ts with a codemap subcommand" >&2
+        exit 2
+    fi
+fi
 
 if [ ! -f "$HARNESS_ROOT/src/cli.ts" ]; then
-    echo "codemap-watch: HEADLESSCODE_ROOT ($HARNESS_ROOT) has no src/cli.ts — point it at the headlesscode repo" >&2
+    echo "codemap-watch: $HARNESS_ROOT has no src/cli.ts — point HEADLESSCODE_ROOT at the headlesscode repo" >&2
     exit 2
 fi
 
