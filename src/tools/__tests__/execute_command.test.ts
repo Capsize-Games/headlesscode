@@ -110,11 +110,140 @@ async function testTimeoutKeepsProcessAliveAndWritesMarker(): Promise<void> {
 	}
 }
 
+// ─── (c) central-store protection (see src/permissions/store-protection.ts) ──
+
+async function testRecursiveDeleteOfCentralStoreRefusedBeforeSpawn(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-ec-store-ws-")
+	const storeBase = await mkTmpWorkspace("hc-ec-store-data-")
+	const storeRoot = path.join(storeBase, "central-store")
+	await fs.mkdir(storeRoot, { recursive: true })
+	const marker = path.join(storeRoot, "marker.txt")
+	await fs.writeFile(marker, "keep-me")
+	const savedDataDir = process.env.HEADLESSCODE_DATA_DIR
+	process.env.HEADLESSCODE_DATA_DIR = storeRoot
+	try {
+		const executor = createHeadlessExecutor(ws) // ZERO permissions config
+		const result = await executor.execute("execute_command", {
+			command: `rm -rf ${storeRoot}`,
+			timeout: 10,
+		})
+		assert.equal(result.isError, true, "a store-targeting recursive delete must be refused (isError)")
+		assert.match(result.content, /central store/, "refusal message names the central store")
+		// The refusal happens BEFORE spawn — nothing was executed or deleted.
+		assert.equal(await exists(marker), true, "the store's content must survive (refused before spawn)")
+		assert.equal(await exists(storeRoot), true, "the store dir must survive")
+	} finally {
+		if (savedDataDir === undefined) {
+			delete process.env.HEADLESSCODE_DATA_DIR
+		} else {
+			process.env.HEADLESSCODE_DATA_DIR = savedDataDir
+		}
+		await fs.rm(ws, { recursive: true, force: true })
+		await fs.rm(storeBase, { recursive: true, force: true })
+	}
+}
+
+async function testStoreProtectionNotOverridableByPermissions(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-ec-store-nover-")
+	const storeBase = await mkTmpWorkspace("hc-ec-store-nover-data-")
+	const storeRoot = path.join(storeBase, "central-store")
+	await fs.mkdir(storeRoot, { recursive: true })
+	const marker = path.join(storeRoot, "marker.txt")
+	await fs.writeFile(marker, "keep-me")
+	const savedDataDir = process.env.HEADLESSCODE_DATA_DIR
+	process.env.HEADLESSCODE_DATA_DIR = storeRoot
+	try {
+		// An allow-everything permissions config: the store protection is not
+		// configurable, so the command must STILL be refused.
+		const executor = createHeadlessExecutor(ws, {
+			permissions: {
+				allowedCommands: ["rm", "rm -rf", "*"],
+				deniedCommands: [],
+				protectedFiles: [],
+				allowProtectedWrites: true,
+			},
+		})
+		const result = await executor.execute("execute_command", {
+			command: `rm -rf ${storeRoot}`,
+			timeout: 10,
+		})
+		assert.equal(result.isError, true, "store protection is NOT overridable by an allow-everything config")
+		assert.match(result.content, /central store/, "refusal message names the central store")
+		assert.equal(await exists(marker), true, "nothing was executed or deleted")
+	} finally {
+		if (savedDataDir === undefined) {
+			delete process.env.HEADLESSCODE_DATA_DIR
+		} else {
+			process.env.HEADLESSCODE_DATA_DIR = savedDataDir
+		}
+		await fs.rm(ws, { recursive: true, force: true })
+		await fs.rm(storeBase, { recursive: true, force: true })
+	}
+}
+
+async function testWorkspaceScratchCleanupStillAllowed(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-ec-store-cleanup-")
+	const storeBase = await mkTmpWorkspace("hc-ec-store-cleanup-data-")
+	const storeRoot = path.join(storeBase, "central-store")
+	const savedDataDir = process.env.HEADLESSCODE_DATA_DIR
+	process.env.HEADLESSCODE_DATA_DIR = storeRoot
+	try {
+		// Ordinary workspace cleanup is NOT the store — it must actually RUN.
+		const scratch = path.join(ws, "tmp-scratch")
+		await fs.mkdir(scratch, { recursive: true })
+		await fs.writeFile(path.join(scratch, "file.txt"), "scratch")
+		const executor = createHeadlessExecutor(ws)
+		const result = await executor.execute("execute_command", {
+			command: "rm -rf ./tmp-scratch",
+			timeout: 10,
+		})
+		assert.equal(result.isError, false, "workspace cleanup is allowed (not the store)")
+		assert.equal(await exists(scratch), false, "the scratch dir was actually removed")
+	} finally {
+		if (savedDataDir === undefined) {
+			delete process.env.HEADLESSCODE_DATA_DIR
+		} else {
+			process.env.HEADLESSCODE_DATA_DIR = savedDataDir
+		}
+		await fs.rm(ws, { recursive: true, force: true })
+		await fs.rm(storeBase, { recursive: true, force: true })
+	}
+}
+
+async function testNonDestructiveStoreAccessAllowed(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-ec-store-read-")
+	const storeBase = await mkTmpWorkspace("hc-ec-store-read-data-")
+	const storeRoot = path.join(storeBase, "central-store")
+	const savedDataDir = process.env.HEADLESSCODE_DATA_DIR
+	process.env.HEADLESSCODE_DATA_DIR = storeRoot
+	try {
+		const executor = createHeadlessExecutor(ws)
+		const result = await executor.execute("execute_command", {
+			command: `echo store-root-is ${storeRoot}`,
+			timeout: 10,
+		})
+		assert.equal(result.isError, false, "reading/referencing the store via echo is allowed")
+		assert.match(result.content, /store-root-is/, "command ran normally")
+	} finally {
+		if (savedDataDir === undefined) {
+			delete process.env.HEADLESSCODE_DATA_DIR
+		} else {
+			process.env.HEADLESSCODE_DATA_DIR = savedDataDir
+		}
+		await fs.rm(ws, { recursive: true, force: true })
+		await fs.rm(storeBase, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
 	["execute_command: command finishes within timeout -> normal non-error result with full output", testNormalCompletionWithinTimeout],
 	["execute_command: timeout -> non-error result, partial output, process keeps running and completes on its own", testTimeoutKeepsProcessAliveAndWritesMarker],
+	["execute_command: rm -rf of the central store is refused BEFORE spawn (zero config)", testRecursiveDeleteOfCentralStoreRefusedBeforeSpawn],
+	["execute_command: store protection is NOT overridable by an allow-everything permissions config", testStoreProtectionNotOverridableByPermissions],
+	["execute_command: rm -rf of workspace scratch still runs (not the store)", testWorkspaceScratchCleanupStillAllowed],
+	["execute_command: non-destructive store access (echo) is allowed", testNonDestructiveStoreAccessAllowed],
 ]
 
 async function main(): Promise<void> {
