@@ -38,7 +38,7 @@ import {
 import { runReview, type ReviewResult } from "./reviewer.js"
 import { analyzeWorktreeSessions } from "./log-analysis.js"
 import { runQa } from "../qa/qa.js"
-import { groupWorktreePath, isIterationExhaustion, watchGroups } from "./watch.js"
+import { groupWorktreePath, isIterationExhaustion, isPidAlive, watchGroups } from "./watch.js"
 import {
 	buildStatusSummary,
 	formatStatusText,
@@ -1440,17 +1440,39 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	// still catches races (a worktree appearing between the scan above and
 	// spawn) and fails loudly before spawning anything or writing task
 	// files/state, so a skipped-at-spawn group can never be silently dropped.
+	//
+	// Liveness-aware (a real production incident, not hypothetical): a
+	// generic "stale worktree" message previously read as an invitation to
+	// manually `rm -rf`/`git worktree remove` the path — which, when the
+	// worktree actually belonged to a still-running worker, destroyed live
+	// session state mid-run and wasted real API spend, repeatedly, across
+	// one dispatch session. Distinguish "still running" from "leftover" via
+	// the SAME `.harness.pid` liveness check the watcher's own stall guard
+	// uses (isPidAlive), and steer toward `orchestrate cleanup --apply`
+	// specifically — NOT raw `git worktree remove`, which refuses on any
+	// untracked file and can leave a stray `.headlesscode/` behind that
+	// re-trips this exact check on the next attempt; `cleanup --apply`
+	// removes harness artifacts (including `.headlesscode/`) BEFORE calling
+	// `git worktree remove`, precisely to avoid that residue (see
+	// cleanup.ts's removeHarnessArtifacts).
 	const staleWorktrees = specs
 		.map((spec) => path.join(repo, ".worktrees", spec.name))
 		.filter((wtPath) => fs.existsSync(wtPath))
 	if (staleWorktrees.length > 0) {
+		const details = staleWorktrees
+			.map((wtPath) => {
+				const rel = path.relative(repo, wtPath)
+				return isPidAlive(wtPath) ? `${rel} (round IN PROGRESS — live pid)` : `${rel} (no live pid — likely leftover)`
+			})
+			.join(", ")
 		process.stderr.write(
-			`headlesscode orchestrate: worktree collision found: ${staleWorktrees
-				.map((p) => path.relative(repo, p))
-				.join(", ")}. ` +
-				`Another round may have just spawned into this slot — retry, or if it's genuinely stale, remove it first: ` +
-				`"git worktree remove <path>", or "headlesscode orchestrate cleanup --repo ${repo} --apply" ` +
-				`(which only removes worktrees whose branch is verified merged).\n`,
+			`headlesscode orchestrate: worktree collision found: ${details}. ` +
+				`If any are marked "round IN PROGRESS", do NOT delete them — that destroys a live session's state and spend. ` +
+				`Retry once it finishes, or investigate with "headlesscode orchestrate status --repo ${repo}". ` +
+				`For genuinely leftover worktrees, use "headlesscode orchestrate cleanup --repo ${repo} --apply" ` +
+				`(only removes worktrees whose branch is verified merged, and clears .headlesscode/ before ` +
+				`"git worktree remove" so it can't leave residue behind) — avoid raw "git worktree remove"/"rm -rf", ` +
+				`which can leave a stray .headlesscode/ dir that re-trips this same check next time.\n`,
 		)
 		return 1
 	}
