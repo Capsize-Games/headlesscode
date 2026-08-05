@@ -17,7 +17,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 
 import { hasCodebaseIndex, indexFilePathFor } from "./index-util.js"
-import { projectStoreRoot } from "./project-store.js"
+import { migrateLegacyProjectData, projectStoreRoot, resolveProjectDataDir, resolveProjectIdentity } from "./project-store.js"
 
 async function mkTmp(prefix: string): Promise<string> {
 	return fsp.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -80,12 +80,20 @@ async function testLegacyWorkspaceIndexIsMigratedOnFirstResolution(): Promise<vo
 	const ws = await mkTmp("hc-idxutil-legacy-")
 	process.env.HEADLESSCODE_DATA_DIR = data
 	try {
-		// Old-style workspace-relative index: the FIRST resolution must migrate
-		// it into the central store (so a fresh worktree/session never starts
-		// "not indexed" and never forces a costly re-embed).
+		// Old-style workspace-relative index: resolution + migration must land
+		// it in the central store (so a fresh worktree/session never starts
+		// "not indexed" and never forces a costly re-embed). NOTE: the AUTO
+		// migration is skipped under a HEADLESSCODE_DATA_DIR override (tests
+		// must never move real data), so the explicit migrateLegacyProjectData
+		// — the function both the real-machine auto path and the `headlesscode
+		// migrate` subcommand call — is exercised directly; hasCodebaseIndex's
+		// pre-migration-grace legacy read is what makes detection correct
+		// before that happens.
 		await fsp.mkdir(path.join(ws, ".headlesscode", "codesearch"), { recursive: true })
 		await fsp.writeFile(path.join(ws, ".headlesscode", "codesearch", "index.jsonl"), "legacy-line\n")
-		assert.equal(await hasCodebaseIndex(ws), true, "legacy index is detected as usable")
+		assert.equal(await hasCodebaseIndex(ws), true, "legacy index is detected as usable (pre-migration grace)")
+		const identity = resolveProjectIdentity(ws)
+		migrateLegacyProjectData(ws, identity.keySource, resolveProjectDataDir(ws), { log: () => {} })
 		assert.equal(
 			await fsp
 				.stat(path.join(ws, ".headlesscode", "codesearch", "index.jsonl"))
@@ -99,6 +107,7 @@ async function testLegacyWorkspaceIndexIsMigratedOnFirstResolution(): Promise<vo
 			"legacy-line\n",
 			"legacy index content lands in the central store",
 		)
+		assert.equal(await hasCodebaseIndex(ws), true, "detection still true once the central copy exists")
 	} finally {
 		delete process.env.HEADLESSCODE_DATA_DIR
 		await fsp.rm(data, { recursive: true, force: true })

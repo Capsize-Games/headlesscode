@@ -150,6 +150,13 @@ export function resolveProjectDataDir(workspaceRoot: string): string {
 	const key = projectKeyFor(keySource)
 	const dir = path.join(projectStoreRoot(), "projects", key)
 	projectDirCache.set(root, dir)
+	// The project dir is always ensured (callers write index/mode-models/
+	// permissions directly into it).
+	try {
+		fs.mkdirSync(dir, { recursive: true })
+	} catch {
+		// Non-fatal: a read-only store root falls back to legacy reads.
+	}
 	// Under a $HEADLESSCODE_DATA_DIR override neither the metadata write nor
 	// the migration touches the store: the override means "test/scratch —
 	// don't leave real store entries behind" (direct test runs construct

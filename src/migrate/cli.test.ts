@@ -53,9 +53,20 @@ async function testMigrateMovesWorkspaceLegacyData(): Promise<void> {
 }
 
 async function testMigrateHelp(): Promise<void> {
-	assert.equal(await migrateMain(["--help"]), 0, "--help exits 0")
-	assert.equal(await migrateMain([]), 0, "no args exits 0 (workspace = cwd, no-op when nothing to migrate)")
-	assert.equal(await migrateMain(["--bogus"]), 2, "unknown arg exits 2")
+	const data = await mkTmp("hc-migrate-help-")
+	// The no-args call resolves workspace = process.cwd() and writes the
+	// project-dir metadata — must land in the tmp store, never the real
+	// ~/.local/share/headlesscode (the earlier test's finally deletes the
+	// suite-wide override, so this test sets its own).
+	process.env.HEADLESSCODE_DATA_DIR = data
+	try {
+		assert.equal(await migrateMain(["--help"]), 0, "--help exits 0")
+		assert.equal(await migrateMain([]), 0, "no args exits 0 (workspace = cwd, no-op when nothing to migrate)")
+		assert.equal(await migrateMain(["--bogus"]), 2, "unknown arg exits 2")
+	} finally {
+		delete process.env.HEADLESSCODE_DATA_DIR
+		await fs.rm(data, { recursive: true, force: true })
+	}
 }
 
 async function testMigrateUsesStoreRoot(): Promise<void> {

@@ -37,11 +37,17 @@ let activeHomes: string[] = []
 async function sandboxHome(): Promise<string> {
 	const home = path.join(ROOT_SANDBOX, `home-${activeHomes.length}`)
 	// The headlesscode-native global shared dir (src/project-store.ts) —
-	// `~/.roo/` is no longer read.
-	await fs.mkdir(path.join(home, ".local", "share", "headlesscode", "shared"), { recursive: true })
+	// `~/.roo/` is no longer read. The store root is ALSO pointed at the
+	// sandboxed home: sharedInstructionsRoot() is store-root-derived, and
+	// under `npm test` the suite-wide HEADLESSCODE_DATA_DIR override would
+	// otherwise redirect the shared dir away from this sandboxed HOME.
+	// (Each test file is its own process, so per-file env mutation is safe.)
+	const storeRoot = path.join(home, ".local", "share", "headlesscode")
+	await fs.mkdir(path.join(storeRoot, "shared"), { recursive: true })
 	activeHomes.push(home)
 	process.env.HOME = home
 	process.env.USERPROFILE = home
+	process.env.HEADLESSCODE_DATA_DIR = storeRoot
 	return home
 }
 
