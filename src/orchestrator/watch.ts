@@ -5,6 +5,9 @@
  * process/IPC signals written by scripts/run-worker.sh:
  *
  *   <worktree>/.harness.pid              worker PID (written at launch)
+ *   <worktree>/.harness.pgid             worker process-group id (written by the
+ *                                        wrapper under setsid; issue #20 — lets a
+ *                                        stop command kill the WHOLE tree)
  *   <worktree>/.harness.exit             worker exit code (written on harness exit)
  *   <worktree>/.harness.done/            completion marker DIR (mkdir-based, atomic,
  *                                        same lock-mutex convention as phone-home.sh)
@@ -265,6 +268,30 @@ function readNeedsDecision(wtPath: string): NeedsDecision | undefined {
 	}
 }
 
+/** Read + validate a numeric pid/pgid marker file; undefined when absent/invalid. */
+function readPidFile(wtPath: string, name: string): number | undefined {
+	let raw: string
+	try {
+		raw = fs.readFileSync(path.join(wtPath, name), "utf-8").trim()
+	} catch {
+		return undefined
+	}
+	if (!/^\d+$/.test(raw)) {
+		return undefined
+	}
+	return Number(raw)
+}
+
+/** `process.kill(pid, 0)` liveness probe (a negative pid targets a process group). */
+function processAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0)
+		return true
+	} catch {
+		return false
+	}
+}
+
 /**
  * Whether the worker process recorded in `.harness.pid` is ACTUALLY still
  * running — not just whether the pid file exists. A worker that crashes or
@@ -272,23 +299,22 @@ function readNeedsDecision(wtPath: string): NeedsDecision | undefined {
  * forever; checking existence alone made a dead worker indistinguishable
  * from a live one, which is what caused the 2026-08-02 incident below (see
  * `inspectGroup`'s stall-guard branch).
+ *
+ * Issue #20: when the worker was launched under setsid (run-worker.sh now
+ * writes the process-group id to `.harness.pgid`), liveness is checked at the
+ * GROUP level (`process.kill(-pgid, 0)`): killing only the wrapper bash — the
+ * pid file's process — leaves the real child running reparented to init, and
+ * a wrapper-only check would report the worker dead while it keeps burning
+ * the session. Workers launched before the setsid change have no `.harness.pgid`
+ * and fall back to the pid-only check.
  */
 function isPidAlive(wtPath: string): boolean {
-	let raw: string
-	try {
-		raw = fs.readFileSync(path.join(wtPath, ".harness.pid"), "utf-8").trim()
-	} catch {
-		return false
+	const pgid = readPidFile(wtPath, ".harness.pgid")
+	if (pgid !== undefined) {
+		return processAlive(-pgid)
 	}
-	if (!/^\d+$/.test(raw)) {
-		return false
-	}
-	try {
-		process.kill(Number(raw), 0)
-		return true
-	} catch {
-		return false
-	}
+	const pid = readPidFile(wtPath, ".harness.pid")
+	return pid !== undefined && processAlive(pid)
 }
 
 /**

@@ -7,8 +7,15 @@
 # Worker lifecycle:
 #   1. Runs `$HEADLESSCODE_CLI --task-file <task> --workspace <worktree>
 #      --mode <mode>` (or `--task <text>` when given text) as a detached
-#      background process (nohup + & — no GUI, no X server needed).
-#   2. Writes the worker PID to <worktree>/.harness.pid.
+#      background process (nohup + setsid + & — no GUI, no X server needed).
+#      setsid puts the wrapper in its OWN session/process group so a stop
+#      command can kill the whole tree with one negative-PID signal (issue
+#      #20: killing only the wrapper PID used to leave the real child running
+#      undetected, reparented to init).
+#   2. Writes the worker PID to <worktree>/.harness.pid and, when setsid is
+#      available, the process-group id to <worktree>/.harness.pgid (written
+#      from INSIDE the wrapper, so it is always the real group leader even if
+#      setsid had to fork).
 #   3. Redirects stdout+stderr to <worktree>/harness.log.
 #   4. On harness exit, writes the exit code to <worktree>/.harness.exit and
 #      creates the completion marker directory <worktree>/.harness.done/
@@ -214,7 +221,7 @@ mkdir '$WT_PATH/.harness.done' 2>/dev/null
 exit \$CODE
 "
 
-# ── Launch detached + record pid ────────────────────────────────────────────
+# ── Launch detached + record pid + pgid ─────────────────────────────────────
 rm -f "$WT_PATH/.harness.exit"
 rm -rf "$WT_PATH/.harness.done"
 # A worktree is reused across continuation/rework respawns, so harness.log
@@ -226,7 +233,33 @@ rm -rf "$WT_PATH/.harness.done"
 # summary/exhaustion check to only this run's output, not a stale tail from a
 # previous session still sitting in the same file.
 printf '\n===== headlesscode run start: %s =====\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$WT_PATH/harness.log"
-nohup bash -c "$WRAPPER" >>"$WT_PATH/harness.log" 2>&1 &
+
+# Issue #20: run the wrapper in its OWN process group so a stop command can
+# kill the WHOLE tree (wrapper bash + npx + node/tsx + non-detached
+# grandchildren) with a single negative-PID signal (`kill -TERM -<pgid>`).
+# `kill <wrapper-pid>` alone reaps only the bash wrapper — the real child,
+# reparented to init once the spawner shell exits, keeps running undetected to
+# completion. `setsid` makes the wrapper a session+process-group leader; every
+# descendant inherits that group unless it deliberately detaches.
+# The wrapper writes its OWN PID (== PGID) to .harness.pgid from INSIDE, so
+# the recorded group id is exact even in the rare case setsid has to fork
+# because the caller was already a process-group leader. Without setsid
+# (non-Linux), no .harness.pgid is written and a stop command falls back to
+# the old wrapper-only kill with an explicit warning.
+SETSID_OK=0
+if command -v setsid >/dev/null 2>&1; then
+    SETSID_OK=1
+    WRAPPER="printf '%s' \"\$\$\" > '$WT_PATH/.harness.pgid'
+$WRAPPER"
+else
+    echo "run-worker: warning: setsid not found — worker will share the caller's process group; stopping it can only kill the wrapper PID (issue #20)" >&2
+fi
+
+if [ "$SETSID_OK" -eq 1 ]; then
+    nohup setsid bash -c "$WRAPPER" >>"$WT_PATH/harness.log" 2>&1 &
+else
+    nohup bash -c "$WRAPPER" >>"$WT_PATH/harness.log" 2>&1 &
+fi
 PID=$!
 printf '%s' "$PID" > "$WT_PATH/.harness.pid"
 
