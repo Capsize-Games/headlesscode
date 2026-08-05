@@ -167,6 +167,78 @@ async function testBareWrongRegressionDoesNotMarkFinding(): Promise<void> {
 	assert.equal(result.verdict, "clean")
 }
 
+// ─── Structured VERDICT line: the primary path, no heuristics involved ───────
+
+async function testStructuredVerdictCleanWinsOverContradictoryProse(): Promise<void> {
+	// The exact shape of incident #1 (eb1407c): a "verified clean" section
+	// alongside language that used to look like a finding — but now with the
+	// required structured line, which is authoritative regardless.
+	const result = parseReviewResult(
+		[
+			"### Verified clean",
+			"- Everything reproduced. Some baselines show 12 failed, 1187 passed (pre-existing).",
+			"",
+			"VERDICT: CLEAN",
+		].join("\n"),
+	)
+	assert.equal(result.verdict, "clean")
+}
+
+async function testStructuredVerdictFindingWinsEvenWithCleanLanguageEverywhere(): Promise<void> {
+	const result = parseReviewResult(
+		[
+			"### Verified clean (all reproduced personally)",
+			"- Several claims checked out fine.",
+			"",
+			"### Reopened",
+			"- **#83** reopened for a real problem.",
+			"",
+			"VERDICT: FINDING",
+		].join("\n"),
+	)
+	assert.equal(result.verdict, "finding")
+}
+
+async function testStructuredVerdictIgnoresBaselineFailedCounts(): Promise<void> {
+	// Incident #2 (7535f1f) shape, plus the required line.
+	const result = parseReviewResult(
+		[
+			"No findings. Baselines: 12 failed, 1187 passed, 10 errors (pre-existing on master).",
+			"",
+			"VERDICT: CLEAN",
+		].join("\n"),
+	)
+	assert.equal(result.verdict, "clean")
+}
+
+async function testStructuredVerdictIgnoresNoReopenAside(): Promise<void> {
+	// Incident #3 (f816ca9) shape, plus the required line.
+	const result = parseReviewResult(
+		[
+			"### Non-blocking observations (pre-existing / out of scope, no reopen)",
+			"1. A benign nit.",
+			"",
+			"Staying closed. No reopening warranted.",
+			"",
+			"VERDICT: CLEAN",
+		].join("\n"),
+	)
+	assert.equal(result.verdict, "clean")
+}
+
+async function testStructuredVerdictIsCaseInsensitiveAndTrimsWhitespace(): Promise<void> {
+	const result = parseReviewResult(["Some report text.", "", "verdict: finding  "].join("\n"))
+	assert.equal(result.verdict, "finding")
+}
+
+async function testMissingStructuredVerdictFallsBackToHeuristic(): Promise<void> {
+	// No "VERDICT: ..." line at all -> falls back to the existing heuristic
+	// path (already covered by the other tests in this file, but confirm
+	// the fallback actually engages rather than defaulting blindly).
+	const result = parseReviewResult("Reopened issue #27: a real bug, file:line evidence here.")
+	assert.equal(result.verdict, "finding")
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -178,6 +250,12 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["a finding always wins over coincidental 'verified clean' text elsewhere", testFindingWinsOverCoincidentalCleanLanguage],
 	["baseline 'N failed' test counts do not falsely trip a finding", testBaselineFailedCountsDoNotFalselyTripAFinding],
 	["a 'no reopen' aside explaining nothing needs action stays clean", testNoReopenAsideDoesNotMarkFinding],
+	["structured VERDICT: CLEAN wins over contradictory prose", testStructuredVerdictCleanWinsOverContradictoryProse],
+	["structured VERDICT: FINDING wins even with clean language everywhere", testStructuredVerdictFindingWinsEvenWithCleanLanguageEverywhere],
+	["structured VERDICT: CLEAN ignores baseline 'N failed' counts", testStructuredVerdictIgnoresBaselineFailedCounts],
+	["structured VERDICT: CLEAN ignores a 'no reopen' aside", testStructuredVerdictIgnoresNoReopenAside],
+	["structured verdict line is case-insensitive and trims whitespace", testStructuredVerdictIsCaseInsensitiveAndTrimsWhitespace],
+	["missing structured verdict falls back to the heuristic", testMissingStructuredVerdictFallsBackToHeuristic],
 	["bare 'wrong'/'regression'/'does not' in clean prose does not mark a finding", testBareWrongRegressionDoesNotMarkFinding],
 ]
 

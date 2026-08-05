@@ -116,9 +116,17 @@ function defaultTaskText(workspaceRoot: string): string {
 		`Review the work done in this workspace (branch: ${currentBranch(workspaceRoot)}) ` +
 		"exactly as your operating procedure instructs. For each issue the worker closed, read the " +
 		"closing report, read the real diff, and re-run every checkable claim yourself. When you are " +
-		"done, call attempt_completion with a structured summary: verdict (CLEAN or FINDING), a " +
-		"Findings section listing anything wrong with file:line evidence, and the final baseline " +
-		"numbers you personally confirmed."
+		"done, call attempt_completion with a structured summary: a Findings section listing anything " +
+		"wrong with file:line evidence (omit or write 'none' if clean), and the final baseline numbers " +
+		"you personally confirmed.\n\n" +
+		"The VERY LAST LINE of your attempt_completion result must be exactly one of:\n" +
+		"VERDICT: CLEAN\n" +
+		"VERDICT: FINDING\n" +
+		"Nothing else on that line — no prose, no punctuation, no markdown formatting. This is the ONLY " +
+		"line the orchestrator parses to decide whether to trigger a rework cycle; everything else in " +
+		"your report is for a human reader. Get this exactly right even when the rest of your report " +
+		"discusses both clean and problematic findings — the verdict reflects the OVERALL outcome " +
+		"(FINDING if you reopened ANY issue, CLEAN only if none needed reopening)."
 	)
 }
 
@@ -268,6 +276,24 @@ export function parseReviewResult(text: string): ReviewResult {
 		}
 	}
 
+	// Primary path: an explicit, structured "VERDICT: CLEAN"/"VERDICT: FINDING"
+	// line (required by defaultTaskText) is authoritative — exact match, no
+	// heuristics, so no future report phrasing can ever false-positive it.
+	// This exists because free-form regex heuristics on prose proved to have
+	// no ceiling on false positives: three separate real incidents (see the
+	// function docstring) each needed a NEW fix for a NEW phrasing the
+	// previous fix didn't anticipate. A rigid required line has no such
+	// ceiling — it's either present and exact, or it's absent.
+	const structuredVerdict = summary.match(/^VERDICT:\s*(CLEAN|FINDING)\s*$/im)
+	if (structuredVerdict) {
+		const verdict: "clean" | "finding" = structuredVerdict[1]!.toUpperCase() === "FINDING" ? "finding" : "clean"
+		return { findings: [...new Set(findings)], verdict, summary }
+	}
+
+	// Fallback for a session that didn't emit the required line (an older
+	// prompt, a model that ignored the instruction, or a hand-written test
+	// fixture) — the heuristic below, kept exactly as hardened by the three
+	// past incidents, but no longer the primary path.
 	const hasFindingMarker =
 		REOPENED_HEADING_RE.test(summary) || REOPENED_WITH_ISSUE_RE.test(summary) || VERDICT_FINDING_RE.test(summary)
 

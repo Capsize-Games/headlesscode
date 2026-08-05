@@ -109,6 +109,39 @@ async function testBaselineFailedCountsDoNotFalselyFailAPassingQaReport(): Promi
 	)
 }
 
+// ─── Structured QA_VERDICT line: the primary path, no heuristics involved ────
+
+async function testStructuredVerdictPassIgnoresBaselineFailedCounts(): Promise<void> {
+	const result = parseQaResult(
+		[
+			"App booted, exercised the changed behavior for real, all targeted checks pass.",
+			"Baselines (pre-existing, unrelated): 12 failed, 1187 passed, 10 errors.",
+			"",
+			"QA_VERDICT: PASS",
+		].join("\n"),
+	)
+	assert.equal(result.verdict, "pass")
+}
+
+async function testStructuredVerdictFailWinsEvenWithPassLanguage(): Promise<void> {
+	const result = parseQaResult(
+		["All existing tests still pass, but the new feature itself does not work.", "", "QA_VERDICT: FAIL"].join(
+			"\n",
+		),
+	)
+	assert.equal(result.verdict, "fail")
+}
+
+async function testStructuredVerdictIsCaseInsensitiveAndTrimsWhitespace(): Promise<void> {
+	const result = parseQaResult(["Report body.", "", "qa_verdict: pass  "].join("\n"))
+	assert.equal(result.verdict, "pass")
+}
+
+async function testMissingStructuredQaVerdictFallsBackToHeuristic(): Promise<void> {
+	const result = parseQaResult("QA PASS — no failures found across the suite, verified OK.")
+	assert.equal(result.verdict, "pass")
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -120,6 +153,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["no Evidence section -> full summary is evidence", testEvidenceFallsBackToFullSummary],
 	["pass marker survives 'no failures found' phrasing", testPassMarkerDoesNotTripOnFailureWord],
 	["baseline 'N failed' test counts do not falsely fail a passing QA report", testBaselineFailedCountsDoNotFalselyFailAPassingQaReport],
+	["structured QA_VERDICT: PASS ignores baseline 'N failed' counts", testStructuredVerdictPassIgnoresBaselineFailedCounts],
+	["structured QA_VERDICT: FAIL wins even with pass language elsewhere", testStructuredVerdictFailWinsEvenWithPassLanguage],
+	["structured qa verdict line is case-insensitive and trims whitespace", testStructuredVerdictIsCaseInsensitiveAndTrimsWhitespace],
+	["missing structured QA_VERDICT falls back to the heuristic", testMissingStructuredQaVerdictFallsBackToHeuristic],
 ]
 
 async function main(): Promise<void> {

@@ -183,9 +183,15 @@ function defaultTaskText(workspaceRoot: string, mode: string): string {
 		`all (e.g. only scripts/docs/backend), the boot-and-smoke-test step still applies but do not go ` +
 		`looking for unrelated things to click through — there's nothing in scope for deeper UI ` +
 		`interaction. Report EVIDENCE with real command output. ` +
-		`When you are done, call attempt_completion with a structured summary: a verdict line ` +
-		`(QA PASS or QA FAIL), an Evidence section with the real commands you ran and their ` +
-		`output, and the final baseline numbers you personally confirmed.`
+		`When you are done, call attempt_completion with a structured summary: an Evidence section ` +
+		`with the real commands you ran and their output, and the final baseline numbers you ` +
+		`personally confirmed.\n\n` +
+		`The VERY LAST LINE of your attempt_completion result must be exactly one of:\n` +
+		`QA_VERDICT: PASS\n` +
+		`QA_VERDICT: FAIL\n` +
+		`Nothing else on that line — no prose, no punctuation, no markdown formatting. This is the ONLY ` +
+		`line the orchestrator parses to decide pass/fail; everything else in your report is for a ` +
+		`human reader.`
 	)
 }
 
@@ -291,6 +297,19 @@ export function parseQaResult(text: string): QaResult {
 		evidence = section[1].trim()
 	}
 
+	// Primary path: an explicit, structured "QA_VERDICT: PASS"/"QA_VERDICT: FAIL"
+	// line (required by defaultTaskText) is authoritative — exact match, no
+	// heuristics. Same rationale as reviewer.ts's parseReviewResult: free-form
+	// regex heuristics on prose have no ceiling on false positives (a real
+	// incident here — baseline "N failed" test counts forced a fail verdict on
+	// a QA session that explicitly said "QA PASS").
+	const structuredVerdict = summary.match(/^QA_VERDICT:\s*(PASS|FAIL)\s*$/im)
+	if (structuredVerdict) {
+		const verdict: QaVerdict = structuredVerdict[1]!.toUpperCase() === "PASS" ? "pass" : "fail"
+		return { verdict, evidence: evidence || summary, summary }
+	}
+
+	// Fallback for a session that didn't emit the required line.
 	const hasPassMarker =
 		/\b(qa\s*pass|all\s*tests?\s*pass|no\s+errors?\s+found|no\s+failures|definition\s+of\s+done\s+(is\s+|was\s+)?(met|satisfied)|errors?\s*:\s*\[\s*\]|passed\s+(\d+)\/\d+|verified\s+ok)\b/i.test(
 			lower,
