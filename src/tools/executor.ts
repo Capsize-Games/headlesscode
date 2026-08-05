@@ -350,6 +350,14 @@ function refusalMessage(command: string, refusal: CommandRefusal): ToolResult {
 					`--allowed-commands, HEADLESSCODE_ALLOWED_COMMANDS, or <workspaceRoot>/.headlesscode/permissions.json, ` +
 					`or adjust your approach.`,
 			)
+		case "protected_store":
+			return err(
+				`execute_command: refusing to run '${command}': sub-command '${refusal.subCommand}' is a recursive delete ` +
+					`targeting the shared central store at '${refusal.storeRoot}' (resolved target '${refusal.target}'). ` +
+					`The central store is protected BY DEFAULT and this cannot be overridden via --allowed-commands or ` +
+					`permissions.json — it is shared across every project on this machine, and no single workspace may ` +
+					`delete it. Do not attempt to reset it from inside the harness.`,
+			)
 	}
 }
 
@@ -1096,16 +1104,20 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 			cwd = safeTarget(ctx, cwdArg)
 		}
 
-		// Permissions gate (command allow/deny + dangerous substitution):
-		// refuse BEFORE spawning so nothing is ever executed. Compound
-		// commands are checked per sub-command (parseCommand splits on
-		// &&/||/;/|/&) — a denied or unallow-listed sub-command blocks the
-		// whole chain. This applies to every executor built on this handler,
-		// including the read-only reviewer/QA executors (they share it), which
-		// also run unattended and could otherwise run arbitrary commands. A
-		// refusal is a real tool error (isError: true) and therefore counts
-		// toward the loop's consecutive-mistake bound, same as any tool error.
-		const refusal = checkCommand(command, ctx.permissions.allowedCommands, ctx.permissions.deniedCommands)
+		// Permissions gate (command allow/deny + dangerous substitution +
+		// central-store protection): refuse BEFORE spawning so nothing is ever
+		// executed. Compound commands are checked per sub-command (parseCommand
+		// splits on &&/||/;/|/&) — a denied or unallow-listed sub-command
+		// blocks the whole chain. This applies to every executor built on this
+		// handler, including the read-only reviewer/QA executors (they share
+		// it), which also run unattended and could otherwise run arbitrary
+		// commands. A refusal is a real tool error (isError: true) and
+		// therefore counts toward the loop's consecutive-mistake bound, same as
+		// any tool error. The command's resolved `cwd` anchors relative targets
+		// for the central-store check (see src/permissions/store-protection.ts).
+		const refusal = checkCommand(command, ctx.permissions.allowedCommands, ctx.permissions.deniedCommands, {
+			workspaceRoot: cwd,
+		})
 		if (refusal !== null) {
 			return refusalMessage(command, refusal)
 		}

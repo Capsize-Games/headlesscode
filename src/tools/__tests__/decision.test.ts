@@ -203,7 +203,10 @@ function lastToolMessage(session: HeadlessSession, name: string): string | null 
 async function testDeniedCommandIsErrorAndCountsAsMistake(): Promise<void> {
 	const ws = await mkTmpWorkspace("hc-perm-denied-cmd-")
 	try {
-		const client = new FakeLlmClient([() => toolCall("execute_command", { command: "rm -rf /" })])
+		// A NON-store target: `rm -rf /` would now be refused by the always-on
+		// central-store protection (a parent of the store), not by the deny-list
+		// — this test must exercise the deny-list refusal path specifically.
+		const client = new FakeLlmClient([() => toolCall("execute_command", { command: "rm -rf /opt/scratch-x" })])
 		const session = new HeadlessSession({
 			workspaceRoot: ws,
 			mode: "code",
