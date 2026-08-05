@@ -95,6 +95,23 @@ async function makeMergedFixture(): Promise<Fixture> {
 	return f
 }
 
+/** Repo with a bare `origin` (origin/main pushed) — for the sync-on-apply test. */
+async function makeOriginRepo(): Promise<{ repo: string; remote: string }> {
+	const remote = await fsp.mkdtemp(path.join(os.tmpdir(), "headlesscode-cleanup-remote-"))
+	execFileSync("git", ["init", "-q", "--bare", remote], { stdio: "ignore" })
+	const repo = await fsp.mkdtemp(path.join(os.tmpdir(), "headlesscode-cleanup-remote-local-"))
+	execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" })
+	git(repo, ["config", "user.email", "test@headlesscode.invalid"])
+	git(repo, ["config", "user.name", "Cleanup Test"])
+	git(repo, ["config", "commit.gpgsign", "false"])
+	git(repo, ["remote", "add", "origin", remote])
+	await fsp.writeFile(path.join(repo, "a.txt"), "a\n")
+	git(repo, ["add", "a.txt"])
+	git(repo, ["commit", "-qm", "init"])
+	git(repo, ["push", "-q", "-u", "origin", "main"])
+	return { repo, remote }
+}
+
 /** Repo with worktree w1 (branch feat) whose work is NOT merged into main. */
 async function makeUnmergedFixture(): Promise<Fixture> {
 	const repo = await makeRepoBase()
@@ -264,6 +281,32 @@ async function testApplyTwiceIsIdempotentNoop(): Promise<void> {
 		assert.equal(cap.err.join(""), "")
 	} finally {
 		await fsp.rm(f.repo, { recursive: true, force: true })
+	}
+}
+
+async function testApplySyncsMainToOrigin(): Promise<void> {
+	// Issue #25: cleanup --apply is the "a round just settled" checkpoint —
+	// after the worktree/branch removal it must also reconcile local master
+	// with origin (push the local merge), so unpushed drift stops accumulating.
+	const { repo, remote } = await makeOriginRepo()
+	try {
+		const { wtPath, branch } = await makeWorktree(repo)
+		await commitInWorktree(wtPath)
+		git(repo, ["merge", "-q", "--no-edit", branch])
+		const f: Fixture = { repo, branch, wtPath, statePath: path.join(repo, ".worktrees", ".orchestrator-state.json") }
+		saveStateSync(f.statePath, stateWithGroup(f, { status: "done" }))
+		assert.notEqual(git(remote, ["rev-parse", "main"]), git(repo, ["rev-parse", "main"]), "origin is behind local before cleanup")
+
+		const cap = capture()
+		const code = await cleanupMain(["--repo", repo, "--apply"], cap.io)
+		assert.equal(code, 0)
+		assert.ok(!fs.existsSync(wtPath), "worktree removed")
+		assert.equal(git(repo, ["branch", "--list", branch]), "", "branch deleted")
+		assert.equal(git(remote, ["rev-parse", "main"]), git(repo, ["rev-parse", "main"]), "cleanup --apply pushed local main to origin")
+		assert.ok(cap.err.join("").includes("[sync]"), "the sync outcome is reported on stderr, got: " + cap.err.join(""))
+	} finally {
+		await fsp.rm(repo, { recursive: true, force: true })
+		await fsp.rm(remote, { recursive: true, force: true })
 	}
 }
 
@@ -558,6 +601,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["no flag at all defaults to a dry run", testDefaultIsDryRun],
 	["apply removes the worktree, deletes the branch, patches state (never the entry)", testApplyRemovesWorktreeBranchAndPatchesState],
 	["apply twice is an idempotent no-op on the second run", testApplyTwiceIsIdempotentNoop],
+	["apply reconciles local main with origin (pushes the merged round)", testApplySyncsMainToOrigin],
 	["dirty worktree (human file) blocks cleanup", testDirtyGateBlocksCleanup],
 	["harness's own untracked artifacts do NOT block and are removed", testHarnessArtifactsDoNotBlockAndAreRemoved],
 	["live worker process (.harness.pid) blocks cleanup", testLiveProcessGateBlocksCleanup],

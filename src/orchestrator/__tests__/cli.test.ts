@@ -890,6 +890,76 @@ async function testOrchestrateMainPreflightFailureAbortsBeforeSpawn(): Promise<v
 	}
 }
 
+// ─── master ↔ origin sync before spawn (issue #25) ───────────────────────────
+
+async function testOrchestrateMainWarnsOnDriftWhenSyncDisabled(): Promise<void> {
+	// Issue #25: with the auto-sync disabled, `orchestrate` must still surface
+	// non-trivial unpushed drift loudly instead of letting it compound across
+	// rounds — and the warning path must be read-only (never push).
+	const repo = await tmpRepo()
+	const savedKey = process.env.HEADLESSCODE_OPENROUTER_API_KEY
+	const savedBaseUrl = process.env.OPENROUTER_BASE_URL
+	const savedNoSync = process.env.HEADLESSCODE_ORCHESTRATE_NO_SYNC
+	process.env.HEADLESSCODE_OPENROUTER_API_KEY = "k"
+	process.env.HEADLESSCODE_ORCHESTRATE_NO_SYNC = "1"
+	try {
+		initGitRepo(repo)
+		const remote = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-cli-sync-remote-"))
+		try {
+			execFileSync("git", ["init", "-q", "--bare", remote], { stdio: "ignore" })
+			execFileSync("git", ["-C", repo, "remote", "add", "origin", remote], { stdio: "ignore" })
+			execFileSync("git", ["-C", repo, "config", "user.email", "test@headlesscode.invalid"], { stdio: "ignore" })
+			execFileSync("git", ["-C", repo, "config", "user.name", "Sync Test"], { stdio: "ignore" })
+			execFileSync("git", ["-C", repo, "config", "commit.gpgsign", "false"], { stdio: "ignore" })
+			await fs.writeFile(path.join(repo, "a.txt"), "a\n", "utf-8")
+			execFileSync("git", ["-C", repo, "add", "a.txt"], { stdio: "ignore" })
+			execFileSync("git", ["-C", repo, "commit", "-qm", "init"], { stdio: "ignore" })
+			execFileSync("git", ["-C", repo, "push", "-q", "-u", "origin", "main"], { stdio: "ignore" })
+			// 6 unpushed commits — past TRIVIAL_DRIFT_AHEAD (5).
+			for (let i = 1; i <= 6; i++) {
+				await fs.appendFile(path.join(repo, "a.txt"), `line ${i}\n`, "utf-8")
+				execFileSync("git", ["-C", repo, "add", "a.txt"], { stdio: "ignore" })
+				execFileSync("git", ["-C", repo, "commit", "-qm", `local ${i}`], { stdio: "ignore" })
+			}
+			const issuesPath = path.join(repo, "issues.json")
+			await fs.writeFile(issuesPath, JSON.stringify([{ number: 1, title: "Fix the thing", body: "Do it" }]), "utf-8")
+			// The round still aborts on the preflight probe (unreachable mock),
+			// which runs AFTER the sync block — so both messages must appear.
+			process.env.OPENROUTER_BASE_URL = "http://127.0.0.1:1"
+
+			const { exit, stderr } = await withCapturedStderr(() =>
+				orchestrateMain(["--repo", repo, "--issues-json", issuesPath]),
+			)
+
+			assert.notEqual(exit, 0, "preflight failure still aborts the round")
+			assert.ok(stderr.includes("6 commit(s) ahead of origin/main"), `loud drift warning names the drift, got: ${stderr}`)
+			assert.ok(stderr.includes("HEADLESSCODE_ORCHESTRATE_NO_SYNC"), "the warning explains why the sync is off")
+			const originMain = execFileSync("git", ["-C", repo, "rev-parse", "origin/main"], { encoding: "utf-8" }).trim()
+			const localMain = execFileSync("git", ["-C", repo, "rev-parse", "main"], { encoding: "utf-8" }).trim()
+			assert.notEqual(originMain, localMain, "the disabled path is read-only — origin must not be pushed")
+		} finally {
+			await fs.rm(remote, { recursive: true, force: true })
+		}
+	} finally {
+		if (savedKey === undefined) {
+			delete process.env.HEADLESSCODE_OPENROUTER_API_KEY
+		} else {
+			process.env.HEADLESSCODE_OPENROUTER_API_KEY = savedKey
+		}
+		if (savedBaseUrl === undefined) {
+			delete process.env.OPENROUTER_BASE_URL
+		} else {
+			process.env.OPENROUTER_BASE_URL = savedBaseUrl
+		}
+		if (savedNoSync === undefined) {
+			delete process.env.HEADLESSCODE_ORCHESTRATE_NO_SYNC
+		} else {
+			process.env.HEADLESSCODE_ORCHESTRATE_NO_SYNC = savedNoSync
+		}
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -926,6 +996,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["--no-preflight parses (default on, flag off)", testParseOrchestrateArgsNoPreflight],
 	["orchestrateMain dry-run proceeds when all worktree dirs are clear", testOrchestrateMainDryRunProceedsWhenNoCollision],
 	["orchestrateMain aborts before spawn when the preflight probe fails", testOrchestrateMainPreflightFailureAbortsBeforeSpawn],
+	["orchestrateMain warns loudly on drift when the auto-sync is disabled", testOrchestrateMainWarnsOnDriftWhenSyncDisabled],
 ]
 
 async function main(): Promise<void> {
