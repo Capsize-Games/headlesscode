@@ -54,6 +54,23 @@ export interface CostHistoryRecord {
 	/** How many auto-continuation/rework respawns happened on this group's worktree before it finished. */
 	continuationCount: number
 	reworkCount: number
+	/**
+	 * When the group's FIRST worker session was spawned (OrchestratorGroup.spawned,
+	 * i.e. round-dispatch time — the earliest point headlesscode itself has
+	 * visibility into, not the GitHub issue's own createdAt). Undefined only
+	 * for pre-existing groups recorded before this field was added.
+	 */
+	spawnedAt?: string
+	/**
+	 * Wall-clock time from spawnedAt to recordedAt (dispatch-to-completion),
+	 * covering every continuation/rework/review/QA cycle in between — the
+	 * metric that directly measures headlesscode's OWN pipeline efficiency,
+	 * separate from cost. A bug that forces an extra rework cycle costs both
+	 * money (costUsd) AND wall-clock time (this field); tracking both is what
+	 * makes "did fixing bug X actually speed up the next run" answerable.
+	 * Undefined when spawnedAt is unavailable.
+	 */
+	wallClockMs?: number
 }
 
 /** Config file basename inside the central project data dir. */
@@ -119,8 +136,21 @@ export async function recordGroupCost(repoRoot: string, group: OrchestratorGroup
 	if (!group.usage) {
 		return undefined
 	}
+	const recordedAt = new Date().toISOString()
+	// group.spawned is NOT the original dispatch time — handleReviewVerdict/
+	// handleIterationExhaustion's reset patches explicitly overwrite it with
+	// "now" on every rework/continuation respawn (so the stall guard measures
+	// the CURRENT attempt, not a possibly-hours-old original one). Using it
+	// here would under-report wallClockMs to just the final cycle, hiding
+	// exactly the wasted time a bug-triggered extra cycle adds — the thing
+	// this metric exists to make visible. The true start is the EARLIEST
+	// startedAt across every session that ever ran on this worktree (usage
+	// files are never deleted across respawns), so derive it from there,
+	// falling back to group.spawned only if no usage data exists at all.
+	const worktreePath = path.resolve(repoRoot, group.worktree ?? `.worktrees/${group.name}`)
+	const spawnedAt = (await earliestSessionStart(worktreePath)) ?? group.spawned
 	const record: CostHistoryRecord = {
-		recordedAt: new Date().toISOString(),
+		recordedAt,
 		repo: path.resolve(repoRoot),
 		groupName: group.name,
 		issues: group.issues ?? [],
@@ -133,9 +163,45 @@ export async function recordGroupCost(repoRoot: string, group: OrchestratorGroup
 		iterations: group.usage.iterations,
 		continuationCount: group.continuationCount ?? 0,
 		reworkCount: group.reworkCount ?? 0,
+		spawnedAt,
+		wallClockMs: spawnedAt ? Date.parse(recordedAt) - Date.parse(spawnedAt) : undefined,
 	}
 	await appendCostHistoryRecord(repoRoot, record)
 	return record
+}
+
+/**
+ * The earliest `startedAt` across every session (completed `.jsonl` or
+ * orphaned `.live.json`) ever recorded in a worktree's usage dir — the
+ * true "work on this group began at" timestamp, immune to group.spawned
+ * being reset on every rework/continuation respawn. Returns undefined
+ * when the usage dir doesn't exist or contains no valid records.
+ */
+async function earliestSessionStart(worktreePath: string): Promise<string | undefined> {
+	const dir = usageDir(worktreePath)
+	let entries: string[]
+	try {
+		entries = await fsp.readdir(dir)
+	} catch {
+		return undefined
+	}
+	let earliest: string | undefined
+	for (const file of entries) {
+		if (!file.endsWith(".jsonl") && !file.endsWith(".live.json")) {
+			continue
+		}
+		try {
+			const raw = await fsp.readFile(path.join(dir, file), "utf-8")
+			const firstLine = raw.trim().split("\n")[0]
+			const parsed = JSON.parse(firstLine) as { startedAt?: string }
+			if (typeof parsed.startedAt === "string" && (!earliest || parsed.startedAt < earliest)) {
+				earliest = parsed.startedAt
+			}
+		} catch {
+			continue
+		}
+	}
+	return earliest
 }
 
 /**

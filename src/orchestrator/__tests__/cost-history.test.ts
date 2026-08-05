@@ -154,6 +154,70 @@ async function testRecordGroupCostDefaultsMissingIssuesAndCachedTokens(): Promis
 	}
 }
 
+/**
+ * wallClockMs must reflect the TRUE first-session start, not group.spawned
+ * — handleReviewVerdict/handleIterationExhaustion's reset patches
+ * explicitly overwrite group.spawned with "now" on every rework/
+ * continuation respawn (so the stall guard measures the current attempt),
+ * which would otherwise under-report total dispatch-to-completion time to
+ * just the FINAL cycle, hiding exactly the wasted time an extra
+ * bug-triggered cycle adds.
+ */
+async function testRecordGroupCostComputesWallClockFromEarliestSession(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		await writeUsageFile(repo, "w1", "session-original", {
+			sessionId: "session-original",
+			mode: "code",
+			model: "deepseek/deepseek-v4-flash",
+			iterations: 40,
+			inputTokens: 1000,
+			outputTokens: 100,
+			costUsd: 0.02,
+			startedAt: "2026-08-05T10:00:00.000Z",
+			endedAt: "2026-08-05T10:30:00.000Z",
+			status: "error",
+		})
+		await writeUsageFile(repo, "w1", "session-rework", {
+			sessionId: "session-rework",
+			mode: "code",
+			model: "deepseek/deepseek-v4-flash",
+			iterations: 20,
+			inputTokens: 500,
+			outputTokens: 50,
+			costUsd: 0.01,
+			startedAt: "2026-08-05T11:00:00.000Z",
+			endedAt: "2026-08-05T11:15:00.000Z",
+			status: "success",
+		})
+		// group.spawned reflects only the LATEST respawn (reset by the rework
+		// patch) — must NOT be what wallClockMs is computed from.
+		const group = baseGroup({
+			worktree: ".worktrees/w1",
+			spawned: "2026-08-05T11:00:00.000Z",
+			usage: { costUsd: 0.03, inputTokens: 1500, outputTokens: 150, cachedTokens: 0, iterations: 60 },
+		})
+		const record = await recordGroupCost(repo, group)
+		assert.ok(record)
+		assert.equal(record?.spawnedAt, "2026-08-05T10:00:00.000Z", "must use the EARLIEST session's start, not group.spawned")
+		assert.ok(record?.wallClockMs && record.wallClockMs > 60 * 60 * 1000, "wall-clock must span from the original session, over an hour, not just the final 15-minute rework")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testRecordGroupCostFallsBackToGroupSpawnedWithNoUsageFiles(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const group = baseGroup({ worktree: ".worktrees/w1", spawned: "2026-08-05T10:00:00.000Z" })
+		const record = await recordGroupCost(repo, group)
+		assert.equal(record?.spawnedAt, "2026-08-05T10:00:00.000Z")
+		assert.ok(typeof record?.wallClockMs === "number")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 // ─── recordAllSessionCosts: per-session outcome tracking ────────────────────
 
 async function writeUsageFile(repo: string, groupName: string, sessionId: string, record: object): Promise<void> {
@@ -311,6 +375,8 @@ const tests: [string, () => Promise<void>][] = [
 	["recordGroupCost builds a correct record from a terminal group", testRecordGroupCostBuildsCorrectRecord],
 	["recordGroupCost returns undefined + writes nothing when group has no usage", testRecordGroupCostSkipsWhenNoUsage],
 	["recordGroupCost defaults missing issues/cachedTokens", testRecordGroupCostDefaultsMissingIssuesAndCachedTokens],
+	["recordGroupCost computes wallClockMs from the earliest session, not group.spawned", testRecordGroupCostComputesWallClockFromEarliestSession],
+	["recordGroupCost falls back to group.spawned with no usage files", testRecordGroupCostFallsBackToGroupSpawnedWithNoUsageFiles],
 	["recordAllSessionCosts classifies success/error/killed", testRecordAllSessionCostsClassifiesSuccessErrorAndKilled],
 	["recordAllSessionCosts is idempotent", testRecordAllSessionCostsIsIdempotent],
 	["stale live snapshot ignored when a completed record exists for the same session", testLiveSnapshotIgnoredWhenCompletedRecordExists],

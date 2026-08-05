@@ -70,25 +70,47 @@ export function parseCostHistoryArgs(argv: string[]): CostHistoryCliOptions | { 
 	return { repo, issues, sessions, json }
 }
 
+/** Human-readable duration, e.g. "37m", "1h 12m", "2d 3h". Undefined input renders as "?". */
+function formatDuration(ms: number | undefined): string {
+	if (ms === undefined || !Number.isFinite(ms) || ms < 0) {
+		return "?"
+	}
+	const totalMinutes = Math.round(ms / 60000)
+	const days = Math.floor(totalMinutes / 1440)
+	const hours = Math.floor((totalMinutes % 1440) / 60)
+	const minutes = totalMinutes % 60
+	if (days > 0) {
+		return `${days}d ${hours}h`
+	}
+	if (hours > 0) {
+		return `${hours}h ${minutes}m`
+	}
+	return `${minutes}m`
+}
+
 function formatTable(records: CostHistoryRecord[], sessionRecords: SessionCostRecord[]): string {
 	if (records.length === 0) {
 		return "No cost history recorded for this repo yet."
 	}
 	const lines: string[] = []
 	lines.push(
-		`${"GROUP".padEnd(10)}${"ISSUES".padEnd(16)}${"STATUS".padEnd(14)}${"COST".padEnd(10)}${"ITER".padEnd(6)}CONT/REWORK · RECORDED`,
+		`${"GROUP".padEnd(10)}${"ISSUES".padEnd(16)}${"STATUS".padEnd(14)}${"COST".padEnd(10)}${"ITER".padEnd(6)}${"TIME".padEnd(8)}CONT/REWORK · RECORDED`,
 	)
 	let totalCost = 0
+	let totalWallClockMs = 0
 	for (const r of records) {
 		totalCost += r.costUsd
+		totalWallClockMs += r.wallClockMs ?? 0
 		lines.push(
 			`${r.groupName.padEnd(10)}${r.issues.map((n) => `#${n}`).join(",").padEnd(16)}${r.status.padEnd(14)}` +
 				`$${r.costUsd.toFixed(4)}`.padEnd(10) +
-				`${String(r.iterations).padEnd(6)}${r.continuationCount}/${r.reworkCount} · ${r.recordedAt}`,
+				`${String(r.iterations).padEnd(6)}${formatDuration(r.wallClockMs).padEnd(8)}${r.continuationCount}/${r.reworkCount} · ${r.recordedAt}`,
 		)
 	}
 	lines.push("")
-	lines.push(`${records.length} record(s), total: $${totalCost.toFixed(4)}`)
+	lines.push(
+		`${records.length} record(s), total: $${totalCost.toFixed(4)}, total wall-clock (planning-to-completion): ${formatDuration(totalWallClockMs)}`,
+	)
 
 	// Wasted-spend summary, from the per-session breakdown: any session
 	// whose outcome was NOT "success" (errored, hit budget, or was killed

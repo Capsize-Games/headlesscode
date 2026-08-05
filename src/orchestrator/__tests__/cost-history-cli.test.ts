@@ -216,6 +216,33 @@ async function testMainSessionsFlagShowsPerSessionBreakdown(): Promise<void> {
 	}
 }
 
+async function testMainShowsWallClockDuration(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		await appendCostHistoryRecord(
+			repo,
+			baseRecord({
+				groupName: "w1",
+				costUsd: 0.05,
+				spawnedAt: "2026-08-05T10:00:00.000Z",
+				wallClockMs: 75 * 60 * 1000, // 1h 15m
+			}),
+		)
+		const out = captureStdout()
+		let code: number
+		try {
+			code = await costHistoryCliMain(["--repo", repo])
+		} finally {
+			out.restore()
+		}
+		assert.equal(code, 0)
+		assert.match(out.get(), /1h 15m/)
+		assert.match(out.get(), /total wall-clock \(planning-to-completion\): 1h 15m/)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: [string, () => Promise<void>][] = [
@@ -224,6 +251,7 @@ const tests: [string, () => Promise<void>][] = [
 	["parseCostHistoryArgs --sessions flag", testParseArgsSessionsFlag],
 	["parseCostHistoryArgs rejects non-integer --issue", testParseArgsRejectsNonIntegerIssue],
 	["main prints a table with a total", testMainPrintsTableWithTotal],
+	["main shows wall-clock duration formatted human-readably", testMainShowsWallClockDuration],
 	["main filters by --issue", testMainFiltersByIssue],
 	["main --json prints raw records", testMainJsonOutput],
 	["main prints a clear message on empty history", testMainEmptyHistoryMessage],
