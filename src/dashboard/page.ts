@@ -1524,9 +1524,13 @@ function renderRound(round) {
       <td>\${g.usage ? fmtInt(g.usage.iterations) : "—"}</td>
     </tr>
   \`).join("");
+  const preflight = round.preflight && round.preflight.line
+    ? '<div class="sub mono" title="preflight probe before this round spawned">preflight: ' + esc(round.preflight.line) + '</div>'
+    : "";
   el.innerHTML = \`
     <div class="sub">batch: \${esc(round.batch ?? "—")} · updated: \${esc(round.updated ?? "—")}
       · round total: \${round.totalUsage ? fmtCost(round.totalUsage.costUsd) : "$0.000000"}</div>
+    \${preflight}
     <table>
       <thead><tr><th>group</th><th>status</th><th>cost</th><th>in tok</th><th>cached tok</th><th>out tok</th><th>iter</th></tr></thead>
       <tbody>\${rows || '<tr><td colspan="7" class="empty">no groups</td></tr>'}</tbody>
