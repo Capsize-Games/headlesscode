@@ -1,5 +1,5 @@
 /**
- * Tests for the deterministic codemap build (src/codemap/ — issue #17).
+ * Tests for the deterministic codemap build (src/codemap/ — issues #17/#18).
  *
  * Plain assert-based script (no test framework), run via `npm test` →
  * `tsx src/codemap/__tests__/build.test.ts`. Asserts against real temp
@@ -7,6 +7,8 @@
  *
  *   - TS/JS modules get import edges from the shared codeintel import graph
  *     (real tsconfig resolution, real paths);
+ *   - TS/JS modules get Phase 2 call edges from the shared call graph (real
+ *     checker symbol resolution) and entrypoint-rooted flows;
  *   - Python modules get edges from the AST subprocess extractor
  *     (scripts/codemap-python-extract.py);
  *   - C/C++ modules get regex `#include` edges;
@@ -53,10 +55,12 @@ async function mkTsFixture(): Promise<string> {
 	await fsp.mkdir(path.join(ws, "src", "vendor"), { recursive: true })
 	await fsp.writeFile(path.join(ws, "tsconfig.json"), TSCONFIG)
 	await fsp.writeFile(path.join(ws, "package.json"), JSON.stringify({ name: "fixture", main: "src/index.ts" }, null, 2))
-	await fsp.writeFile(path.join(ws, "src", "a.ts"), `import { b } from "./b.js"\nexport const a = 1\n`)
-	await fsp.writeFile(path.join(ws, "src", "b.ts"), `export const b = 2\n`)
-	await fsp.writeFile(path.join(ws, "src", "index.ts"), `import { a } from "./a.js"\nconsole.log(a)\n`)
-	await fsp.writeFile(path.join(ws, "src", "a.test.ts"), `import { a } from "./a.js"\nexport const t = a\n`)
+	// a.ts imports AND calls into b.ts — the fixture exercises both Phase 1
+	// import edges and Phase 2 call edges (issue #18).
+	await fsp.writeFile(path.join(ws, "src", "a.ts"), `import { double } from "./b.js"\nexport function compute(): number { return double(21) }\n`)
+	await fsp.writeFile(path.join(ws, "src", "b.ts"), `export function double(n: number): number { return n * 2 }\n`)
+	await fsp.writeFile(path.join(ws, "src", "index.ts"), `import { compute } from "./a.js"\nconsole.log(compute())\n`)
+	await fsp.writeFile(path.join(ws, "src", "a.test.ts"), `import { compute } from "./a.js"\nexport const t = compute()\n`)
 	await fsp.writeFile(path.join(ws, "src", "vendor", "v.ts"), `export const v = 1\n`)
 	gitInit(ws)
 	return ws
@@ -191,7 +195,7 @@ async function testFingerprintAwareRegeneration(): Promise<void> {
 
 		// An edited file changes the fingerprint and triggers a regen.
 		await new Promise((r) => setTimeout(r, 5))
-		await fsp.writeFile(path.join(ws, "src", "a.ts"), `import { b } from "./b.js"\nexport const a = 42\n`)
+		await fsp.writeFile(path.join(ws, "src", "a.ts"), `import { double } from "./b.js"\nexport const a = double(21)\n`)
 		const third = await buildCodemap({ workspaceRoot: ws })
 		assert.equal(third.changed, true, "an edited module must trigger regeneration")
 		assert.notEqual(third.fingerprint, first.fingerprint, "fingerprint must change when content changes")
@@ -201,6 +205,38 @@ async function testFingerprintAwareRegeneration(): Promise<void> {
 		assert.equal((await buildCodemap({ workspaceRoot: ws })).changed, true, "new file triggers regeneration")
 		await fsp.rm(path.join(ws, "src", "c.ts"))
 		assert.equal((await buildCodemap({ workspaceRoot: ws })).changed, true, "deleted file triggers regeneration")
+	} finally {
+		await fsp.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testCallEdgesAndEntrypointFlows(): Promise<void> {
+	const ws = await mkTsFixture()
+	try {
+		resetCodeIntelCaches()
+		const result = await buildCodemap({ workspaceRoot: ws })
+
+		const callEdges = result.edges.filter((e) => e.kind === "call")
+		assert.ok(
+			callEdges.some((e) => e.from === "src/a.ts" && e.to === "src/b.ts" && e.specifier.includes("double")),
+			`a.ts must have a call edge to double() in b.ts:\n${JSON.stringify(callEdges)}`,
+		)
+		assert.ok(
+			callEdges.some((e) => e.from === "src/index.ts" && e.to === "src/a.ts" && e.specifier.includes("compute")),
+			`index.ts must have a call edge to compute() in a.ts:\n${JSON.stringify(callEdges)}`,
+		)
+		for (const e of callEdges) {
+			assert.notEqual(e.from, e.to, "call edges must never be self-loops")
+		}
+
+		// Entrypoint-rooted flows: index.ts (entrypoint) reaches a.ts + b.ts
+		// along import and call edges — surfaced, not ranked (issue #18).
+		const flow = result.flows["src/index.ts"]
+		assert.ok(flow !== undefined, "the entrypoint module must have a flow")
+		assert.deepEqual(flow, ["src/a.ts", "src/b.ts"], `entrypoint flow reaches its import/call graph:\n${JSON.stringify(flow)}`)
+
+		const entrypointPaths = result.modules.filter((m) => m.role === "entrypoint").map((m) => m.path)
+		assert.deepEqual(Object.keys(result.flows).sort(), entrypointPaths.sort(), "flows are keyed by entrypoint modules only")
 	} finally {
 		await fsp.rm(ws, { recursive: true, force: true })
 	}
@@ -217,6 +253,8 @@ async function testHtmlIsSelfContained(): Promise<void> {
 		assert.ok(html.includes("<svg"), "contains an svg graph")
 		assert.ok(html.includes("CODEMAP = "), "embeds the codemap JSON")
 		assert.ok(html.includes('id="search"'), "has a search box")
+		assert.ok(html.includes("edge.call"), "call edges have a distinct style in the visualizer")
+		assert.ok(html.includes("flow from this entrypoint"), "entrypoint detail panel renders its flow")
 		// No external RESOURCE references (the SVG namespace URI is a string
 		// constant, not a fetch): no script src, no stylesheet link, no CSS
 		// url()/import.
@@ -240,6 +278,7 @@ async function main(): Promise<void> {
 		["TS/JS modules get resolved import edges + correct roles", testTypeScriptEdgesAndRoles],
 		["Python modules get AST-subprocess import edges", testPythonEdges],
 		["C/C++ modules get regex include edges", testCppIncludeEdges],
+		["TS/JS call edges resolve cross-module calls + entrypoint flows", testCallEdgesAndEntrypointFlows],
 		["regeneration is fingerprint-aware (no writes when unchanged)", testFingerprintAwareRegeneration],
 		["html visualizer is self-contained and embeds the map", testHtmlIsSelfContained],
 	]

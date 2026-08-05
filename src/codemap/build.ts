@@ -18,6 +18,7 @@ import * as path from "node:path"
 
 import { inventoryModules } from "./files.js"
 import { codemapFingerprint, contentHash, fingerprintMap, lockMatches } from "./fingerprint.js"
+import { computeEntrypointFlows } from "./flows.js"
 import { renderCodemapHtml } from "./html.js"
 import { codemapDir, codemapHtmlPath, codemapJsonPath, codemapLockPath, loadCodemap, loadLock } from "./lock.js"
 import { extractEdges } from "./extract.js"
@@ -38,6 +39,8 @@ export interface CodemapBuildResult {
 	edges: CodemapEdge[]
 	/** Per-module external (unresolved/out-of-workspace) specifiers. */
 	externalDeps: Record<string, string[]>
+	/** Entrypoint-rooted reachability (Phase 2, issue #18). */
+	flows: Record<string, string[]>
 	fingerprint: string
 	jsonPath: string
 	htmlPath: string
@@ -70,6 +73,9 @@ export async function buildCodemap(options: CodemapBuildOptions): Promise<Codema
 				modules: existing.modules,
 				edges: existing.edges,
 				externalDeps: existing.externalDeps,
+				// Derived from modules+edges; a map written before flows existed
+				// simply has none until the next real regeneration.
+				flows: existing.flows ?? {},
 				fingerprint: existing.fingerprint,
 				jsonPath: codemapJsonPath(root),
 				htmlPath: codemapHtmlPath(root),
@@ -79,6 +85,7 @@ export async function buildCodemap(options: CodemapBuildOptions): Promise<Codema
 	}
 
 	const { edges, externalDeps } = await extractEdges(root, modules)
+	const flows = computeEntrypointFlows(modules, edges)
 	const fingerprint = codemapFingerprint({ project, modules, edges, externalDeps })
 
 	const codemap: Codemap = {
@@ -89,6 +96,7 @@ export async function buildCodemap(options: CodemapBuildOptions): Promise<Codema
 		modules,
 		edges,
 		externalDeps,
+		flows,
 	}
 	const lock: CodemapLock = {
 		project,
@@ -109,6 +117,7 @@ export async function buildCodemap(options: CodemapBuildOptions): Promise<Codema
 		modules,
 		edges,
 		externalDeps,
+		flows,
 		fingerprint,
 		jsonPath: codemapJsonPath(root),
 		htmlPath: codemapHtmlPath(root),

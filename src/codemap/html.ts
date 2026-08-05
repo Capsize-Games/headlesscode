@@ -71,9 +71,11 @@ main { flex: 1; display: flex; min-height: 0; }
 .node.highlight circle { stroke: #fff; stroke-width: 2; }
 .edge { stroke: #3b4352; stroke-width: 1; }
 .edge.include { stroke: #6b4f2a; }
+.edge.call { stroke: #4fd08e; stroke-dasharray: 5 4; }
 .edge.dim { opacity: 0.08; }
 .edge.highlight { stroke: #5b8def; stroke-width: 1.6; }
 .edge.highlight.include { stroke: #e2a14f; }
+.edge.highlight.call { stroke: #4fd08e; }
 #detail {
   width: 300px; border-left: 1px solid #232936; background: #141821;
   display: none; flex-direction: column; overflow-y: auto; flex-shrink: 0;
@@ -111,12 +113,13 @@ main { flex: 1; display: flex; min-height: 0; }
     <span><span class="swatch" style="background:#6b7280"></span>generated</span>
     <span><span class="swatch" style="background:#5b8def; width:0; height:0"></span><span style="color:#6b7280">— import</span></span>
     <span><span class="swatch" style="background:#e2a14f; width:0; height:0"></span><span style="color:#8b6b3a">— include</span></span>
+    <span><span class="swatch" style="background:#4fd08e; width:0; height:0"></span><span style="color:#7fbf9a">-- call</span></span>
   </span>
 </header>
 <main>
   <div id="graph">
     <svg id="svg"></svg>
-    <div id="hint">scroll to zoom · drag to pan · click a node to highlight its imports/importers</div>
+    <div id="hint">scroll to zoom · drag to pan · click a node to highlight its imports, calls and importers</div>
   </div>
   <aside id="detail">
     <h2><span id="detailTitle">Module</span><span class="close" id="detailClose">✕</span></h2>
@@ -131,7 +134,9 @@ const ROLE_COLORS = {
   source: "#5b8def", test: "#46c17b", entrypoint: "#22d3ee",
   config: "#f5a524", vendor: "#a78bfa", generated: "#6b7280"
 };
-const EDGE_KIND = { import: "edge", include: "edge include" };
+function edgeClass(kind) {
+  return kind === "include" ? "edge include" : kind === "call" ? "edge call" : "edge";
+}
 
 // ── deterministic layout: BFS layers from root modules ─────────────────────
 function layout(codemap) {
@@ -202,6 +207,10 @@ const labelEls = [];
 const edgeEls = [];
 const incoming = CODEMAP.modules.map(() => []);
 const outgoing = CODEMAP.modules.map(() => []);
+const importIn = CODEMAP.modules.map(() => []);
+const importOut = CODEMAP.modules.map(() => []);
+const callIn = CODEMAP.modules.map(() => []);
+const callOut = CODEMAP.modules.map(() => []);
 
 for (const e of CODEMAP.edges) {
   const fi = byPath.get(e.from);
@@ -209,6 +218,13 @@ for (const e of CODEMAP.edges) {
   if (fi === undefined || ti === undefined) continue;
   outgoing[fi].push(ti);
   incoming[ti].push(fi);
+  if (e.kind === "call") {
+    callOut[fi].push(ti);
+    callIn[ti].push(fi);
+  } else {
+    importOut[fi].push(ti);
+    importIn[ti].push(fi);
+  }
 }
 
 // edges first (under nodes)
@@ -221,7 +237,7 @@ for (const e of CODEMAP.edges) {
   const line = document.createElementNS(NS, "line");
   line.setAttribute("x1", a.x); line.setAttribute("y1", a.y);
   line.setAttribute("x2", b.x); line.setAttribute("y2", b.y);
-  line.setAttribute("class", EDGE_KIND[e.kind] || "edge");
+  line.setAttribute("class", edgeClass(e.kind));
   line.setAttribute("data-kind", e.kind);
   line.setAttribute("data-from", e.from);
   line.setAttribute("data-to", e.to);
@@ -307,7 +323,7 @@ fit();
 // ── selection / highlight ──────────────────────────────────────────────────
 const detail = document.getElementById("detail");
 function clearHighlight() {
-  edgeEls.forEach((el) => el.setAttribute("class", (el.getAttribute("data-kind") === "include" ? "edge include" : "edge")));
+  edgeEls.forEach((el) => el.setAttribute("class", edgeClass(el.getAttribute("data-kind"))));
   nodeEls.forEach((el) => el.classList.remove("dim", "highlight"));
 }
 function selectNode(i) {
@@ -322,7 +338,6 @@ function selectNode(i) {
     const active = (f === i && connected.has(t)) || (t === i && connected.has(f));
     if (active) {
       el.classList.add("highlight");
-      if (el.getAttribute("data-kind") === "include") el.classList.add("include");
     } else {
       el.classList.add("dim");
     }
@@ -339,8 +354,6 @@ function showDetail(i) {
   const m = CODEMAP.modules[i];
   document.getElementById("detailTitle").textContent = m.path.split("/").pop();
   const color = ROLE_COLORS[m.role] || "#5b8def";
-  const inList = incoming[i].map((j) => CODEMAP.modules[j].path);
-  const outList = outgoing[i].map((j) => CODEMAP.modules[j].path);
   const ext = (CODEMAP.externalDeps && CODEMAP.externalDeps[m.path]) || [];
   let html = "";
   html += '<div class="kv"><span class="k">path</span><span class="v">' + escapeHtml(m.path) + "</span></div>";
@@ -354,16 +367,33 @@ function showDetail(i) {
     if (ext.length > 40) html += "<li>…</li>";
     html += "</ul>";
   }
-  html += "<h3>imports (" + outList.length + ")</h3><ul>";
-  html += outList.length
-    ? outList.map((p) => '<li><a data-jump="' + p + '">' + escapeHtml(p) + "</a></li>").join("")
+  html += "<h3>imports (" + importOut[i].length + ")</h3><ul>";
+  html += importOut[i].length
+    ? importOut[i].map((p) => '<li><a data-jump="' + CODEMAP.modules[p].path + '">' + escapeHtml(CODEMAP.modules[p].path) + "</a></li>").join("")
     : '<li class="empty">none</li>';
   html += "</ul>";
-  html += "<h3>imported by (" + inList.length + ")</h3><ul>";
-  html += inList.length
-    ? inList.map((p) => '<li><a data-jump="' + p + '">' + escapeHtml(p) + "</a></li>").join("")
+  html += "<h3>imported by (" + importIn[i].length + ")</h3><ul>";
+  html += importIn[i].length
+    ? importIn[i].map((p) => '<li><a data-jump="' + CODEMAP.modules[p].path + '">' + escapeHtml(CODEMAP.modules[p].path) + "</a></li>").join("")
     : '<li class="empty">none</li>';
   html += "</ul>";
+  html += "<h3>calls (" + callOut[i].length + ")</h3><ul>";
+  html += callOut[i].length
+    ? callOut[i].map((p) => '<li><a data-jump="' + CODEMAP.modules[p].path + '">' + escapeHtml(CODEMAP.modules[p].path) + "</a></li>").join("")
+    : '<li class="empty">none</li>';
+  html += "</ul>";
+  html += "<h3>called by (" + callIn[i].length + ")</h3><ul>";
+  html += callIn[i].length
+    ? callIn[i].map((p) => '<li><a data-jump="' + CODEMAP.modules[p].path + '">' + escapeHtml(CODEMAP.modules[p].path) + "</a></li>").join("")
+    : '<li class="empty">none</li>';
+  html += "</ul>";
+  const flows = (CODEMAP.flows && CODEMAP.flows[m.path]) || [];
+  if (m.role === "entrypoint" && flows.length) {
+    html += "<h3>flow from this entrypoint (" + flows.length + ")</h3><ul>";
+    html += flows.slice(0, 40).map((p) => '<li><a data-jump="' + p + '">' + escapeHtml(p) + "</a></li>").join("");
+    if (flows.length > 40) html += "<li>…</li>";
+    html += "</ul>";
+  }
   document.getElementById("detailBody").innerHTML = html;
   detail.classList.add("open");
   detail.querySelectorAll("a[data-jump]").forEach((a) => {

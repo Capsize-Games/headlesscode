@@ -1,12 +1,14 @@
 # Deterministic per-project codemap
 
 The codemap is a script-generated, machine-readable map of a project's
-modules and their import/include relationships — plus a self-contained
-interactive HTML visualizer. It exists so a headlesscode worker that needs to
-know "what is this repo, what imports what" can read `codemap.json` instead of
-re-deriving structure via grep every session. **No LLM is involved anywhere in
-the pipeline** (issue #17's hard requirement): the map is fully deterministic,
-fast to regenerate, and cheap to keep fresh with a watcher.
+modules and their import/include relationships, the cross-module function
+calls (TypeScript/JS), and entrypoint-rooted end-to-end flows — plus a
+self-contained interactive HTML visualizer. It exists so a headlesscode worker
+that needs to know "what is this repo, what imports what, what calls what,
+where do the entrypoints lead" can read `codemap.json` instead of re-deriving
+structure via grep every session. **No LLM is involved anywhere in the
+pipeline** (issues #17/#18's hard requirement): the map is fully
+deterministic, fast to regenerate, and cheap to keep fresh with a watcher.
 
 ## What gets generated
 
@@ -23,9 +25,11 @@ codebase-search index — worktrees of a repo share one codemap):
 
 - `codemap.json` — every module (path, language, size/line counts, a
   naming-convention **role**: source/test/entrypoint/config/vendor/generated),
-  every import/include **edge** between workspace modules, per-module
-  **external deps** (specifiers that resolve outside the workspace — e.g.
-  `node:fs`, third-party libs), and a deterministic content **fingerprint**.
+  every **edge** between workspace modules (`import`/`include` for all
+  languages, plus `call` edges for TS/JS — see below), per-module **external
+  deps** (specifiers that resolve outside the workspace — e.g. `node:fs`,
+  third-party libs), entrypoint-rooted **flows**, and a deterministic content
+  **fingerprint**.
 - `codemap.lock` — a sha256 per module path. The next build compares the
   current inventory against it: identical key set + hashes ⇒ **no writes at
   all**. Any edit/new/deleted file ⇒ a full regeneration (fast — full regen is
@@ -82,13 +86,45 @@ Everything is mechanical and deterministic:
 
 | Language | Extractor |
 | --- | --- |
-| TypeScript / JS | `getImportGraph()` from `src/codeintel/import-graph.ts` — the existing TS-Language-Service-based import graph (tsconfig `paths` aliases resolved exactly as the compiler would). Modules the TS program doesn't cover (e.g. standalone `.mjs` scripts outside `tsconfig` include) simply carry no import edges. |
-| Python | `scripts/codemap-python-extract.py` — a stdlib-`ast` subprocess (the project's established pattern for Python tooling) resolving `import` / `from ... import` / relative imports to module files, best-effort. |
-| C / C++ | regex `#include` graph (good enough for structure; symbol-level resolution is explicitly Phase 2). |
+| TypeScript / JS | `getImportGraph()` from `src/codeintel/import-graph.ts` (import edges) and `getCallGraph()` from `src/codeintel/call-graph.ts` (Phase 2 call edges) — both built on the real TS Language Service/checker, so tsconfig `paths` aliases and call targets resolve exactly as the compiler would (overloads, re-exports, method calls all land on the real declaration). Modules the TS program doesn't cover (e.g. standalone `.mjs` scripts outside `tsconfig` include) simply carry no import/call edges. |
+| Python | `scripts/codemap-python-extract.py` — a stdlib-`ast` subprocess (the project's established pattern for Python tooling) resolving `import` / `from ... import` / relative imports to module files, best-effort. Call edges stay Phase 2+ for Python (see below). |
+| C / C++ | regex `#include` graph (good enough for structure; symbol-level resolution needs a compiler frontend and stays out of scope unless a concrete need appears). |
 
 Edges that resolve **outside** the workspace (node_modules, builtins, failures)
 never become graph nodes — they're summarized per module in
 `externalDeps`, keeping the map a map of *this* project.
+
+## Phase 2: call edges + entrypoint flows (issue #18)
+
+Phase 1 was import/include-only. Phase 2 adds the tractable core of the
+original "calls/reads/writes/publishes/subscribes + ranked flows" prompt,
+with the same **no LLM** requirement:
+
+- **`call` edges (TS/JS only).** For every call/constructor site, the TS
+  checker's resolved signature gives the callee's real declaration, whose
+  file is the edge target. One edge per module pair (callee names are joined
+  into `specifier`), so the module graph stays clean. Self-calls and calls
+  into node_modules/lib are dropped — external call targets are already
+  visible through the module's import edges.
+- **Entrypoint flows.** `codemap.json` gains a `flows` map: for each
+  `entrypoint` module, the sorted list of every module reachable from it
+  along directed import+call edges (`src/codemap/flows.ts`). Deterministic
+  and derived (not fingerprinted — a pure function of modules + edges).
+
+**Deliberate non-goals, per the issue's own analysis:**
+- **Ranking flows by "importance"** was considered and punted: every
+  heuristic either needs per-framework semantics (FastAPI routes, Celery
+  tasks, pub/sub topics) that require project-specific pattern lists, or
+  reduces to sorting by reachable-set size. Wrong ranking is worse than no
+  ranking ("Mark any relationship without source evidence as unknown"), so
+  the map surfaces the flows and lets a human/worker filter.
+- **Python call edges** need the framework pattern lists (FastAPI `@app.get`
+  → HTTP entrypoint, Celery `@app.task` → queue consumer, …). Those are
+  inherently project-specific and will be scoped to a concrete project (e.g.
+  airunner) when someone needs them — not built speculatively generic.
+- **C++ call edges** need a real compiler frontend (clang libtooling /
+  `-ast-dump`), a much bigger investment than this project currently
+  justifies. Includes-only stays.
 
 ## Keeping it fresh (watcher install)
 
@@ -132,11 +168,11 @@ ExecStart=/home/user/headlesscode/scripts/codemap-watch.sh --once /home/user/Pro
 A one-shot against an unchanged repo does nothing but re-hash the inventory —
 milliseconds — so an aggressive schedule is fine.
 
-## Scope / limits (Phase 1)
+## Scope / limits
 
-- The graph is **import/include only**. `calls`/`reads`/`writes`/
-  `publishes`/`subscribes` edges and ranked end-to-end flows are Phase 2
-  (they need real per-language call-graph tooling).
+- The graph has `import`/`include` edges for every language and `call` edges
+  for TS/JS. `reads`/`writes`/`publishes`/`subscribes` edges and *ranked*
+  flows are not built (see "Phase 2" above for the per-language reasoning).
 - C++ includes are regex-resolved, not symbol-resolved.
 - Roles are naming-convention heuristics (deterministic, but a file named
   `main.py` deep in a package is tagged "entrypoint" by convention, not
