@@ -254,6 +254,33 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
 }
 
 /**
+ * Run QA, retrying ONLY when the session itself failed (verdict "error" —
+ * a crash, budget stop, bounded-failure mistake limit, or an
+ * attempt_completion whose result never actually populated), up to
+ * `maxRetries` additional attempts. A real "pass" or "fail" is returned
+ * immediately, first try.
+ *
+ * Mirrors reviewer.ts's runReviewWithRetries — same class of bug, same fix.
+ * Caught live 2026-08-05 running issue #18's own round: a QA session ended
+ * with no real result (`result.result === undefined` despite the
+ * HeadlessSession itself reporting "success"), correctly classified as
+ * verdict "error" by runQa — but `cli.ts` had nowhere to route that
+ * distinctly from a real "fail": the group's top-level status stayed "done",
+ * cost got recorded, and the round was silently considered fully settled
+ * with an empty-evidence "failed" QA that nobody would ever look at again.
+ */
+export async function runQaWithRetries(options: RunQaOptions, maxRetries = 2): Promise<QaResult> {
+	let last: QaResult = { verdict: "error", evidence: "", summary: "no attempt made" }
+	for (let attempt = 0; attempt <= maxRetries; attempt++) {
+		last = await runQa(options)
+		if (last.verdict !== "error") {
+			return last
+		}
+	}
+	return last
+}
+
+/**
  * Parse a QA session's final report into { verdict, evidence, summary }.
  *
  * Deterministic + tested:

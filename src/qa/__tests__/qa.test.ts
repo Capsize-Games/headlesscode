@@ -4,8 +4,43 @@
  */
 
 import assert from "node:assert/strict"
+import * as fs from "node:fs/promises"
+import * as os from "node:os"
+import * as path from "node:path"
 
-import { parseQaResult } from "../qa.js"
+import { parseQaResult, runQaWithRetries } from "../qa.js"
+import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } from "../../engine/types.js"
+
+// ─── Fake LLM client (same pattern as engine/__tests__/loop.test.ts) ─────────
+
+class FakeLlmClient implements LlmClient {
+	constructor(private readonly script: Array<() => ChatMessage>) {}
+
+	async createChatCompletion(_request: LlmRequest): Promise<LlmResponse> {
+		const step = this.script.shift()
+		if (!step) {
+			throw new Error("FakeLlmClient: script exhausted (model kept calling)")
+		}
+		return { message: step() }
+	}
+}
+
+function toolCall(name: string, args: unknown): ChatMessage {
+	const call: ChatToolCall = {
+		id: `call_${Math.random().toString(36).slice(2)}`,
+		type: "function",
+		function: { name, arguments: typeof args === "string" ? args : JSON.stringify(args) },
+	}
+	return { role: "assistant", content: null, tool_calls: [call] }
+}
+
+function attemptCompletion(verdictLine: string): ChatMessage {
+	return toolCall("attempt_completion", { result: `QA complete.\n\n${verdictLine}` })
+}
+
+async function makeWorkspace(): Promise<string> {
+	return fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-qa-retry-"))
+}
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
@@ -142,6 +177,62 @@ async function testMissingStructuredQaVerdictFallsBackToHeuristic(): Promise<voi
 	assert.equal(result.verdict, "pass")
 }
 
+// ─── runQaWithRetries: end-to-end against a real HeadlessSession ────────────
+//
+// 2026-08-05 incident (QA-side twin of the reviewer.ts incident): a QA
+// SESSION failure (crash/budget/mistake-limit) is correctly reported as
+// verdict "error" by runQa — but nothing retried it, so cli.ts recorded an
+// empty-evidence "failed" QA and settled the round with no human ever
+// notified. Fixed with a retry wrapper that only retries on session
+// failures, never on a real pass/fail. These exercise the REAL
+// HeadlessSession (via an injected FakeLlmClient, no network).
+
+async function testRunQaWithRetriesReturnsPassImmediately(): Promise<void> {
+	const ws = await makeWorkspace()
+	try {
+		const client = new FakeLlmClient([() => attemptCompletion("QA_VERDICT: PASS")])
+		const result = await runQaWithRetries({ workspaceRoot: ws, llmClient: client, maxIterations: 5 }, 2)
+		assert.equal(result.verdict, "pass")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testRunQaWithRetriesRetriesAfterSessionError(): Promise<void> {
+	const ws = await makeWorkspace()
+	try {
+		// First "session" (3 calls): read_file on a nonexistent path 3x ->
+		// bounded-failure -> verdict "error". Second "session" (the retry): a
+		// real pass.
+		const client = new FakeLlmClient([
+			() => toolCall("read_file", { path: "does/not/exist.txt" }),
+			() => toolCall("read_file", { path: "does/not/exist.txt" }),
+			() => toolCall("read_file", { path: "does/not/exist.txt" }),
+			() => attemptCompletion("QA_VERDICT: PASS"),
+		])
+		const result = await runQaWithRetries({ workspaceRoot: ws, llmClient: client, maxIterations: 5 }, 2)
+		assert.equal(result.verdict, "pass", "the retry's real pass must win, not the first attempt's error")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testRunQaWithRetriesExhaustsRetries(): Promise<void> {
+	const ws = await makeWorkspace()
+	try {
+		const failingAttempt = (): Array<() => ChatMessage> => [
+			() => toolCall("read_file", { path: "does/not/exist.txt" }),
+			() => toolCall("read_file", { path: "does/not/exist.txt" }),
+			() => toolCall("read_file", { path: "does/not/exist.txt" }),
+		]
+		const client = new FakeLlmClient([...failingAttempt(), ...failingAttempt(), ...failingAttempt()])
+		const result = await runQaWithRetries({ workspaceRoot: ws, llmClient: client, maxIterations: 5 }, 2)
+		assert.equal(result.verdict, "error", "after exhausting retries, the caller must get the final error back")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -157,6 +248,9 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["structured QA_VERDICT: FAIL wins even with pass language elsewhere", testStructuredVerdictFailWinsEvenWithPassLanguage],
 	["structured qa verdict line is case-insensitive and trims whitespace", testStructuredVerdictIsCaseInsensitiveAndTrimsWhitespace],
 	["missing structured QA_VERDICT falls back to the heuristic", testMissingStructuredQaVerdictFallsBackToHeuristic],
+	["runQaWithRetries: a normal pass verdict returns immediately, no retry", testRunQaWithRetriesReturnsPassImmediately],
+	["runQaWithRetries: retries after a QA-session error and succeeds on the 2nd attempt", testRunQaWithRetriesRetriesAfterSessionError],
+	["runQaWithRetries: exhausts retries and returns the final error verdict", testRunQaWithRetriesExhaustsRetries],
 ]
 
 async function main(): Promise<void> {

@@ -38,7 +38,7 @@ import {
 } from "./state.js"
 import { runReviewWithRetries, type ReviewResult } from "./reviewer.js"
 import { analyzeWorktreeSessions } from "./log-analysis.js"
-import { runQa } from "../qa/qa.js"
+import { runQaWithRetries, type QaResult } from "../qa/qa.js"
 import { groupWorktreePath, isIterationExhaustion, isPidAlive, watchGroups } from "./watch.js"
 import {
 	buildStatusSummary,
@@ -850,6 +850,27 @@ export function handleReviewSessionError(result: ReviewResult): Partial<Orchestr
 		pending_review_findings: result.findings,
 		reviewed_at: new Date().toISOString(),
 		last_activity: { note: `review session kept failing: ${result.summary}` },
+	}
+}
+
+/**
+ * QA-side twin of handleReviewSessionError: a QA-SESSION failure (verdict
+ * "error" — see runQaWithRetries) survived every retry. Must escalate to
+ * needs-human directly, never recorded as an ordinary "failed" QA (which
+ * would settle the round with cost recorded and nothing left to retry,
+ * while QA never actually validated anything). Caught live 2026-08-05 on
+ * issue #18's own round.
+ */
+export function handleQaSessionError(result: QaResult): Partial<OrchestratorGroup> {
+	return {
+		status: "needs-human",
+		qa: {
+			status: "failed",
+			verdict: result.verdict,
+			evidence: result.evidence.slice(0, 4000),
+			updated: new Date().toISOString(),
+		},
+		last_activity: { note: `QA session kept failing: ${result.summary}` },
 	}
 }
 
@@ -2205,11 +2226,27 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 			}
 			process.stdout.write(`[orchestrate] QA ${group.name} (branch ${group.branch ?? "?"})...\n`)
 			try {
-				const qaResult = await runQa({
+				const qaResult = await runQaWithRetries({
 					workspaceRoot: groupWorktreePath(repo, group),
 					mode: options.qaMode,
 					model: qaModel,
 				})
+				// A QA-SESSION failure (crash/budget/mistake-limit/no result —
+				// see runQaWithRetries) survived every retry: verdict "error",
+				// distinct from a real "fail". Must escalate to needs-human, NOT
+				// silently record a "failed"-looking QA with empty evidence and
+				// leave the group's top-level status "done" — that would settle
+				// the round (cost recorded, nothing left to retry) while QA never
+				// actually validated anything. Caught live 2026-08-05 on issue
+				// #18's own round: the QA-side twin of #33's review bug.
+				if (qaResult.verdict === "error") {
+					await patchGroup(statePath, group.name, handleQaSessionError(qaResult))
+					process.stderr.write(
+						`[orchestrate] NEEDS-HUMAN: ${group.name}'s QA session failed repeatedly — ` +
+							`${qaResult.summary}\n`,
+					)
+					return
+				}
 				const qaStatus = qaResult.verdict === "pass" ? "done" : "failed"
 				await patchGroup(statePath, group.name, {
 					qa: {

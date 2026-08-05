@@ -17,6 +17,7 @@ import {
 	buildReworkTaskFileContent,
 	buildSpawnEnv,
 	handleIterationExhaustion,
+	handleQaSessionError,
 	handleReviewSessionError,
 	handleReviewVerdict,
 	orchestrateMain,
@@ -25,6 +26,7 @@ import {
 import { watchGroups } from "../watch.js"
 import { defaultState, loadStateSync, saveStateSync, updateGroup, type OrchestratorGroup, type OrchestratorState } from "../state.js"
 import type { ReviewResult } from "../reviewer.js"
+import type { QaResult } from "../../qa/qa.js"
 
 async function tmpRepo(): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-cli-rework-"))
@@ -113,6 +115,14 @@ function reviewSessionErrorResult(): ReviewResult {
 	}
 }
 
+function qaSessionErrorResult(): QaResult {
+	return {
+		verdict: "error",
+		evidence: "",
+		summary: "QA session failed: unknown QA session error",
+	}
+}
+
 // ─── buildReworkTaskFileContent ──────────────────────────────────────────────
 
 async function testReworkTaskFileContentIncludesFindingsAndIssues(): Promise<void> {
@@ -183,6 +193,26 @@ async function testReviewSessionErrorGoesStraightToNeedsHumanNoRework(): Promise
 	assert.ok(
 		typeof patch.last_activity === "object" && patch.last_activity !== null && "note" in patch.last_activity,
 		"last_activity must explain the review session failure",
+	)
+}
+
+/**
+ * 2026-08-05 real bug caught live on issue #18's own round: the QA-side
+ * twin of the review-session-error bug. A QA-SESSION failure (verdict
+ * "error") was recorded as an ordinary "failed" QA with empty evidence,
+ * leaving the group's top-level status "done" — the round settled (cost
+ * recorded) with QA having never actually validated anything and no human
+ * ever notified. Verifies the fix: a QA session-error goes straight to
+ * needs-human.
+ */
+async function testQaSessionErrorGoesStraightToNeedsHuman(): Promise<void> {
+	const patch = handleQaSessionError(qaSessionErrorResult())
+	assert.equal(patch.status, "needs-human", "a QA session failure must be terminal, not silently settled as done")
+	assert.equal(patch.qa?.verdict, "error")
+	assert.equal(patch.qa?.status, "failed")
+	assert.ok(
+		typeof patch.last_activity === "object" && patch.last_activity !== null && "note" in patch.last_activity,
+		"last_activity must explain the QA session failure",
 	)
 }
 
@@ -998,6 +1028,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["rework task file handles empty findings gracefully", testReworkTaskFileContentHandlesEmptyFindings],
 	["finding below cap triggers rework spawn + state reset", testFindingBelowCapSpawnsAndResetsState],
 	["review session error goes straight to needs-human, never a rework spawn", testReviewSessionErrorGoesStraightToNeedsHumanNoRework],
+	["QA session error goes straight to needs-human, not settled as an ordinary failed QA", testQaSessionErrorGoesStraightToNeedsHuman],
 	["rework patch actually clears a stale cost_recorded on merge", testReworkPatchActuallyClearsCostRecordedOnMerge],
 	["continuation patch actually clears a stale cost_recorded on merge", testContinuationPatchActuallyClearsCostRecordedOnMerge],
 	["finding increments from an existing rework count", testFindingIncrementsFromExistingCount],
