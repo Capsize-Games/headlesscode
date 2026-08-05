@@ -235,6 +235,32 @@ async function testNonDestructiveStoreAccessAllowed(): Promise<void> {
 	}
 }
 
+/**
+ * Issue caught live 2026-08-05: `spawn(cmd, { shell: true })` defaults to
+ * `/bin/sh` (dash on Debian/Ubuntu), which has no bash-only features. A
+ * model reaching for `${PIPESTATUS[0]}` (common, and nothing in any mode's
+ * rules files warns against it) got a shell PARSE error on the WHOLE
+ * command line — including a real, passing command that preceded it —
+ * misreporting a genuine pass as a failure. This produced a false
+ * "QA_VERDICT: FAIL" on an otherwise-clean round. Fixed by pointing the
+ * spawn's shell at bash explicitly when present.
+ */
+async function testBashOnlySyntaxDoesNotFalselyFailTheCommand(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-ec-bashism-")
+	try {
+		const executor = createHeadlessExecutor(ws)
+		const result = await executor.execute("execute_command", {
+			command: `echo real-output; echo "EXIT=\${PIPESTATUS[0]}"`,
+			timeout: 10,
+		})
+		assert.equal(result.isError, false, "a bash-only construct must not falsely fail the whole command")
+		assert.match(result.content, /real-output/, "the real command's output must still be captured")
+		assert.match(result.content, /EXIT=0/, "PIPESTATUS must actually resolve (proves bash, not sh, ran it)")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -244,6 +270,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["execute_command: store protection is NOT overridable by an allow-everything permissions config", testStoreProtectionNotOverridableByPermissions],
 	["execute_command: rm -rf of workspace scratch still runs (not the store)", testWorkspaceScratchCleanupStillAllowed],
 	["execute_command: non-destructive store access (echo) is allowed", testNonDestructiveStoreAccessAllowed],
+	["execute_command: bash-only syntax (${PIPESTATUS[0]}) does not falsely fail the command", testBashOnlySyntaxDoesNotFalselyFailTheCommand],
 ]
 
 async function main(): Promise<void> {

@@ -88,6 +88,17 @@ import { createEmbedder, EMBEDDING_BACKEND_ENV, resolveEmbeddingBackend } from "
 import { indexFilePath, loadIndexMetadata } from "../codesearch/index.js"
 import { formatSearchResults, searchIndex } from "../codesearch/search.js"
 
+/**
+ * Absolute path to bash, if present, for execute_command's shell (see the
+ * spawn() call below) — `undefined` falls back to `spawn`'s own default
+ * (`/bin/sh`) on a host without bash, rather than failing to spawn at all.
+ */
+export const BASH_PATH: string | undefined = fs.existsSync("/bin/bash")
+	? "/bin/bash"
+	: fs.existsSync("/usr/bin/bash")
+		? "/usr/bin/bash"
+		: undefined
+
 /** Cap on tool-result text fed back to the model (keep context bounded). */
 export const MAX_RESULT_CHARS = 30_000
 
@@ -1147,7 +1158,23 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 				// orphan whatever it had launched.
 				child = spawn(command, {
 					cwd,
-					shell: true,
+					// `shell: true` alone defaults to `/bin/sh` (dash on Debian/
+					// Ubuntu, the common host here), which has no bash-only
+					// features — `${PIPESTATUS[0]}`, `[[ ]]`, arrays. A model that
+					// reaches for one of these (common; every mode's rules files
+					// are silent on which shell dialect execute_command actually
+					// runs) gets a shell PARSE error on the whole command line —
+					// including whatever real command preceded it (e.g.
+					// `npm test 2>&1 | tail -60; echo "EXIT=${PIPESTATUS[0]}"`)
+					// fails with exit 2 even though `npm test` itself may have
+					// passed cleanly. Confirmed live 2026-08-05: this produced a
+					// genuine FALSE "QA_VERDICT: FAIL" on issue #17's round — a
+					// manual re-run of the identical code passed cleanly. Every
+					// `scripts/*.sh` in this repo already assumes bash; making
+					// execute_command match removes an entire class of spurious
+					// tool/verification failures instead of just working around
+					// each occurrence as it's spotted.
+					shell: BASH_PATH ?? true,
 					detached: true,
 					// Matches the vendored Execa-based terminal's own spawn options
 					// (zoo-code/src/integrations/terminal/ExecaTerminalProcess.ts):
