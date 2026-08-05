@@ -16,6 +16,15 @@ set -e
 
 mkdir -p "$HEADLESSCODE_WORKSPACE_ROOT" "$HOME"
 
+# Seed the shipped stack rules into the central store
+# ($HOME/.local/share/headlesscode/shared/stacks). $HOME lives on the /data
+# volume, which shadows image layers, so this must run at every start.
+STACKS_SRC=/opt/headlesscode/shared/stacks
+if [ -d "$STACKS_SRC" ]; then
+	mkdir -p "$HOME/.local/share/headlesscode/shared/stacks"
+	cp -R "$STACKS_SRC"/. "$HOME/.local/share/headlesscode/shared/stacks"/
+fi
+
 if ! git config --global user.name >/dev/null 2>&1; then
 	git config --global user.name "${GIT_AUTHOR_NAME:-headlesscode}"
 fi

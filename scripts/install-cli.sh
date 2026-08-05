@@ -23,6 +23,19 @@ EOF
 
 chmod +x "$TARGET"
 
+# Ship the central stack-rules content (`shared/stacks/<stack>/rules.md`)
+# into the runtime's central store, so stack-specific instructions actually
+# reach worker system prompts. Same location + override the runtime resolves:
+# $HEADLESSCODE_DATA_DIR, else $HOME/.local/share/headlesscode/shared/stacks
+# (see src/project-store.ts:projectStoreRoot + src/engine/stacks.ts).
+STACKS_SRC="$HARNESS_ROOT/shared/stacks"
+if [ -d "$STACKS_SRC" ]; then
+    STACKS_DEST="${HEADLESSCODE_DATA_DIR:-$HOME/.local/share/headlesscode}/shared/stacks"
+    mkdir -p "$STACKS_DEST"
+    cp -R "$STACKS_SRC"/. "$STACKS_DEST"/
+    echo "Installed stack rules -> $STACKS_DEST"
+fi
+
 echo "Installed headlesscode -> $TARGET (harness: $HARNESS_ROOT)"
 if ! command -v headlesscode >/dev/null 2>&1; then
     echo "warning: $INSTALL_DIR is not on your PATH" >&2

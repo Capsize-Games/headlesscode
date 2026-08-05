@@ -47,6 +47,11 @@ RUN npm ci --no-audit --no-fund
 # Application source (the vendored portable core lives under src/vendor/).
 COPY src ./src
 
+# Shipped central stack-rules content (`shared/stacks/<stack>/rules.md`) —
+# seeded into the runtime's central store at container start (entrypoint.sh),
+# because $HOME lives on the /data volume which shadows image layers.
+COPY shared ./shared
+
 # Runtime orchestration scripts: the non-dry-run orchestrate path shells out
 # to scripts/spawn-parallel-worktrees.sh, which in turn launches each worker
 # via scripts/run-worker.sh; headlesscode-answer.sh answers decision-escalation

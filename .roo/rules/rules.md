@@ -57,8 +57,10 @@ Before considering any change to `src/` done:
   vs. C++ conventions, verification tooling, …) lives at
   `<workspaceRoot>/.roo/rules-stack-<stack>/rules.md`, with a machine-global
   set at `~/.local/share/headlesscode/shared/stacks/<stack>/rules.md`
-  (additive, global first). Detection + splicing is automatic — see
-  `src/engine/stacks.ts` and `docs/stack-rules.md`.
+  (additive, global first) — shipped from the repo's `shared/stacks/` by
+  `scripts/install-cli.sh` (and seeded in the Docker image at entrypoint).
+  Detection + splicing is automatic — see `src/engine/stacks.ts` and
+  `docs/stack-rules.md`.
 - **Plan docs must cite verified file:line locations.** Every code
   reference in a `plans/*.md` doc — every instruction or finding that
   points at existing code — MUST include the real file path AND line

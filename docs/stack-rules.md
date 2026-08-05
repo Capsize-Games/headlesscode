@@ -43,6 +43,17 @@ A missing file is never an error — same idiom as the existing missing-file
 handling for `mode-models.json` / `.roomodes` (zero config = zero behavior
 change).
 
+### Shipping the central content
+
+The central tier is a shipped set, not a user-created one: the canonical
+copy lives in the repo at `shared/stacks/<stack>/rules.md` (mirroring the
+runtime layout), and is installed into the machine-global path by
+`scripts/install-cli.sh` (honoring the `$HEADLESSCODE_DATA_DIR` override the
+runtime uses) and, for the Docker image, seeded into `$HOME/.local/share/
+headlesscode/shared/stacks/` by `docker/entrypoint.sh` at every container
+start (the `/data` volume shadows image layers). Keep the in-repo file as
+the single source of truth for central stack rules.
+
 ## Detection heuristics
 
 Starting point; per-stack content (not these signals) is refined in the
