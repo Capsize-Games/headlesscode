@@ -105,20 +105,15 @@ export function parseCodemapArgs(argv: string[]): { options: CodemapCliOptions; 
 	return { options }
 }
 
-function report(result: Awaited<ReturnType<typeof buildCodemap>>, force: boolean): void {
+// `--force` always regenerates (buildCodemap skips the lock check), so only
+// two outcomes exist: a real (re)generation, or an unchanged short-circuit.
+function report(result: Awaited<ReturnType<typeof buildCodemap>>): void {
 	if (result.changed) {
 		process.stdout.write(
 			`codemap: regenerated ${result.modules.length} modules, ${result.edges.length} edges` +
 				` (fp ${result.fingerprint.slice(0, 12)})\n` +
 				`  ${result.jsonPath}\n` +
 				`  ${result.htmlPath}\n`,
-		)
-		return
-	}
-	if (force) {
-		process.stdout.write(
-			`codemap: forced regeneration produced identical fingerprints — no writes\n` +
-				`  ${result.modules.length} modules, ${result.edges.length} edges (fp ${result.fingerprint.slice(0, 12)})\n`,
 		)
 		return
 	}
@@ -147,7 +142,7 @@ export async function codemapMain(argv: string[]): Promise<number> {
 
 	const runOnce = async (): Promise<void> => {
 		const result = await buildCodemap({ workspaceRoot, force: options.force })
-		report(result, options.force)
+		report(result)
 	}
 
 	if (!options.watch) {
