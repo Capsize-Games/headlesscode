@@ -61,6 +61,34 @@ async function testCleanVerdictDoesNotTripOnCleanupWord(): Promise<void> {
 	assert.equal(result.verdict, "clean")
 }
 
+/**
+ * 2026-08-05 production incident regression: a real reviewer report against
+ * airunner issue #83/PR #88 had BOTH a "### Verified clean" section (listing
+ * several claims that checked out) and a SEPARATE "### Reopened" section
+ * naming one real problem (a dropped `--user` scope item). The old
+ * `hasFindingMarker && !hasCleanMarker` logic let the ambient "verified
+ * clean" text suppress the explicit reopen, misclassifying a genuinely
+ * reopened review as "clean" — which would have skipped the entire rework
+ * mechanism. A finding marker must always win.
+ */
+async function testFindingWinsOverCoincidentalCleanLanguage(): Promise<void> {
+	const result = parseReviewResult(
+		[
+			"### Verified clean (all reproduced personally)",
+			"- `./scripts/w1-pytest.sh server/tests/test_prompt_parts.py` -> `1 passed`.",
+			"- Cold-stack first invocation -> `2/2 containers healthy`.",
+			"",
+			"### Reopened",
+			"- **#83** reopened for the `--user \"$(id -u):$(id -g)\"` scope item: not implemented.",
+		].join("\n"),
+	)
+	assert.equal(result.verdict, "finding", "an explicit reopen must win even alongside 'verified clean' text elsewhere")
+	assert.ok(
+		result.findings.some((f) => f.includes("reopened")),
+		"the reopened item must be captured as a finding",
+	)
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -69,6 +97,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["reopen marker in prose -> finding", testFindingVerdictFromReopenMarker],
 	["unmarked report defaults to clean", testCleanVerdictDefaultWhenUnmarked],
 	["verdict: clean with no findings -> clean", testCleanVerdictDoesNotTripOnCleanupWord],
+	["a finding always wins over coincidental 'verified clean' text elsewhere", testFindingWinsOverCoincidentalCleanLanguage],
 ]
 
 async function main(): Promise<void> {

@@ -149,11 +149,26 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
  *
  * Verdict heuristics (deterministic, tested):
  *   - "finding" if the report contains reopen/finding/problem markers, OR
- *     explicit "verdict: finding";
+ *     explicit "verdict: finding" — ALWAYS wins, even if the same report
+ *     also contains clean-sounding language elsewhere (see below);
  *   - "clean" if it contains explicit clean markers ("review clean",
- *     "verified clean", "no findings", "everything checks out");
+ *     "verified clean", "no findings", "everything checks out") AND no
+ *     finding marker;
  *   - default "clean" when the report states neither (the reviewer only
  *     reopens for real problems, so an unmarked report is treated as clean).
+ *
+ * A finding marker ALWAYS overrides a clean marker, never the reverse. A
+ * real reviewer report reopening one issue while confirming several OTHER
+ * claims checked out cleanly is a completely normal report shape (e.g. a
+ * "### Verified clean" section listing what's fine, alongside a separate
+ * "### Reopened" section naming the real problem) — treating the ambient
+ * presence of "verified clean" text as grounds to override an explicit
+ * "reopened" elsewhere in the SAME report was a real production bug: it
+ * silently classified a genuinely reopened review as "clean", which would
+ * have skipped the entire rework mechanism this classification exists to
+ * trigger. Never weaken this back to "finding && !clean" — a report is
+ * either clean (nothing wrong) or it has findings; it cannot be both, and
+ * when in doubt (both markers present), a real finding must win.
  */
 export function parseReviewResult(text: string): ReviewResult {
 	const summary = text.trim()
@@ -184,11 +199,7 @@ export function parseReviewResult(text: string): ReviewResult {
 
 	const hasFindingMarker =
 		/\b(reopen(ed)?|finding|verdict[^.\n]*finding|regression|failed|does\s+not\b|wrong)\b/i.test(lower)
-	const hasCleanMarker =
-		/\b(review\s*clean|verdict[^.\n]*clean|verified\s*clean|no\s+findings|everything\s+checks?\s+out|all\s+claims?\s+verified|nothing\s+wrong)\b/i.test(
-			lower,
-		)
 
-	const verdict: "clean" | "finding" = hasFindingMarker && !hasCleanMarker ? "finding" : "clean"
+	const verdict: "clean" | "finding" = hasFindingMarker ? "finding" : "clean"
 	return { findings: [...new Set(findings)], verdict, summary }
 }
