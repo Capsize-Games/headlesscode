@@ -133,6 +133,46 @@ async function testFindingBelowCapSpawnsAndResetsState(): Promise<void> {
 	assert.ok(decision.patch.last_activity && typeof decision.patch.last_activity === "object", "last_activity notes the rework")
 }
 
+/**
+ * 2026-08-05 real bug caught while manually recovering a stuck round: a
+ * rework/continuation respawn adds MORE real cost on the same worktree,
+ * but the reset patch never cleared `cost_recorded` — so once the fresh
+ * cycle re-settled, cost-history.ts's one-shot recording gate silently
+ * skipped re-recording the combined total forever. Verifies the actual
+ * MERGE behavior via updateGroup (not just that the patch literal contains
+ * `undefined`, which can't distinguish "explicitly cleared" from "key
+ * simply absent" — only the merged result proves the old value is gone).
+ */
+async function testReworkPatchActuallyClearsCostRecordedOnMerge(): Promise<void> {
+	const group = baseGroup({ reworkCount: 0, status: "done", cost_recorded: "2026-08-01T00:00:00.000Z" })
+	const decision = handleReviewVerdict(group, findingResult(), "/tmp/example-repo", 3, "code")
+	const state: OrchestratorState = { ...defaultState("round-1"), groups: [group] }
+	const merged = updateGroup(state, "w1", decision.patch)
+	assert.equal(
+		merged.groups[0]?.cost_recorded,
+		undefined,
+		"a stale cost_recorded from the PREVIOUS attempt must not survive a rework reset",
+	)
+}
+
+async function testContinuationPatchActuallyClearsCostRecordedOnMerge(): Promise<void> {
+	const group = baseGroup({
+		continuationCount: 0,
+		status: "failed",
+		summary: "headlesscode: task failed: Max iterations (50) reached without task completion",
+		cost_recorded: "2026-08-01T00:00:00.000Z",
+	})
+	const decision = handleIterationExhaustion(group, "/tmp/example-repo", 3, "code")
+	assert.equal(decision.shouldSpawn, true)
+	const state: OrchestratorState = { ...defaultState("round-1"), groups: [group] }
+	const merged = updateGroup(state, "w1", decision.patch)
+	assert.equal(
+		merged.groups[0]?.cost_recorded,
+		undefined,
+		"a stale cost_recorded from the PREVIOUS attempt must not survive a continuation reset",
+	)
+}
+
 async function testFindingIncrementsFromExistingCount(): Promise<void> {
 	// A group already in its 2nd rework cycle moves to its 3rd.
 	const group = baseGroup({ reworkCount: 2, status: "done" })
@@ -772,6 +812,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["rework task file includes findings, issues, rework count", testReworkTaskFileContentIncludesFindingsAndIssues],
 	["rework task file handles empty findings gracefully", testReworkTaskFileContentHandlesEmptyFindings],
 	["finding below cap triggers rework spawn + state reset", testFindingBelowCapSpawnsAndResetsState],
+	["rework patch actually clears a stale cost_recorded on merge", testReworkPatchActuallyClearsCostRecordedOnMerge],
+	["continuation patch actually clears a stale cost_recorded on merge", testContinuationPatchActuallyClearsCostRecordedOnMerge],
 	["finding increments from an existing rework count", testFindingIncrementsFromExistingCount],
 	["finding at cap marks needs-human and does NOT spawn", testFindingAtCapMarksNeedsHumanAndDoesNotSpawn],
 	["clean verdict never touches reworkCount", testCleanVerdictNeverTouchesReworkCount],

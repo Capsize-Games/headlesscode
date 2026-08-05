@@ -774,6 +774,12 @@ export function handleReviewVerdict(
 				stalled: undefined,
 				exit_code: undefined,
 				summary: undefined,
+				// Must also clear cost_recorded: the rework worker adds MORE real
+				// cost on this worktree, and recordCostIfSettled's one-shot gate
+				// would otherwise silently skip re-recording the combined total
+				// once this cycle re-settles — a real bug caught while manually
+				// recovering a stuck round (see cost-history.ts).
+				cost_recorded: undefined,
 				last_activity: {
 					note: `rework cycle ${newReworkCount}: re-spawned worker on the same worktree to fix review findings`,
 				},
@@ -885,6 +891,9 @@ export function handleIterationExhaustion(
 				stalled: undefined,
 				exit_code: undefined,
 				summary: undefined,
+				// Must also clear cost_recorded — see the identical note in
+				// handleReviewVerdict's patch above.
+				cost_recorded: undefined,
 				last_activity: {
 					note: `continuation ${newContinuationCount}: previous session hit the iteration cap; re-spawned worker on the same worktree`,
 				},
