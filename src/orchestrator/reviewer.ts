@@ -29,6 +29,7 @@ import { OpenRouterClient } from "../llm/openrouter.js"
 import { createReadOnlyHeadlessExecutor } from "../tools/executor.js"
 import { getNativeTools } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/index.js"
 import type { ChatTool, LlmClient, SessionResult } from "../engine/types.js"
+import type { SessionBudget } from "../budget/budget.js"
 
 /** Default location of the reviewer checklist, relative to the harness repo. */
 export const DEFAULT_REVIEW_PROMPT_PATH = "plans/zoo-code-review-mode-prompt.md"
@@ -58,7 +59,29 @@ export interface ReviewOptions {
 	llmClient?: LlmClient
 	/** Review task text (default: built from the workspace/branch). */
 	taskText?: string
+	/**
+	 * Iteration ceiling — a backstop, not the primary guard (see `budget`
+	 * below). Default is deliberately generous (200): a review that
+	 * genuinely needs to re-run tests, re-derive baselines, and check
+	 * several claims can legitimately need many tool calls, and a tight cap
+	 * cutting it off mid-work is worse than a real runaway — it silently
+	 * loses the review's actual findings (see `runReview`'s session-failure
+	 * fallback below) rather than ending the session cleanly. A real
+	 * incident: a review that had ALREADY reopened the issue and posted its
+	 * findings comment (real GitHub side effects, correct) hit the OLD
+	 * default of 40 right before calling `attempt_completion`, so the
+	 * orchestrator only saw a synthetic "session error" instead of the
+	 * real finding text.
+	 */
 	maxIterations?: number
+	/**
+	 * Cost/duration backstop (SessionBudget's maxCostUsd/maxDurationMs) —
+	 * the preferred way to bound a review session: a true runaway gets
+	 * caught by spend or wall-clock time, not by an arbitrary tool-call
+	 * count that penalizes legitimate thorough work. Omit for no budget
+	 * (the harness's own defaults apply, if any).
+	 */
+	budget?: Pick<SessionBudget, "maxCostUsd" | "maxDurationMs">
 }
 
 export interface ReviewResult {
@@ -114,7 +137,8 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 		reviewPromptPath = `${HARNESS_ROOT}${DEFAULT_REVIEW_PROMPT_PATH}`,
 		llmClient,
 		taskText,
-		maxIterations = 40,
+		maxIterations = 200,
+		budget,
 	} = options
 
 	const systemPromptOverride = await fs.readFile(reviewPromptPath, "utf-8")
@@ -126,6 +150,7 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 		model,
 		taskText: taskText ?? defaultTaskText(workspaceRoot),
 		maxIterations,
+		budget,
 		systemPromptOverride,
 		tools: reviewTools(),
 		executor: createReadOnlyHeadlessExecutor(workspaceRoot),

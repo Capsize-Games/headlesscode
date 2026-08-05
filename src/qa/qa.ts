@@ -42,6 +42,7 @@ import { createQaHeadlessExecutor } from "../tools/executor.js"
 import { getNativeTools } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/index.js"
 import type { ChatTool, LlmClient, SessionResult } from "../engine/types.js"
 import type { MemoryStore } from "../memory/types.js"
+import type { SessionBudget } from "../budget/budget.js"
 
 /** Default mode slug used for QA sessions (the airunner qa-agent mode). */
 export const DEFAULT_QA_MODE = "qa-agent"
@@ -121,8 +122,23 @@ export interface RunQaOptions {
 	llmClient?: LlmClient
 	/** OpenRouter base URL override (e2e points this at the mock server). */
 	baseUrl?: string
-	/** Loop iteration cap (default: 50). */
+	/**
+	 * Loop iteration cap — a backstop, not the primary guard (see `budget`
+	 * below). Default is deliberately generous (200): QA that boots the
+	 * app, runs a real test suite, and exercises changed behavior can
+	 * legitimately need many tool calls, and cutting it off mid-work
+	 * silently loses the real evidence rather than ending cleanly (see
+	 * `runQa`'s session-failure fallback below) — a review session hitting
+	 * this exact problem at the old default of 40 was a real incident.
+	 */
 	maxIterations?: number
+	/**
+	 * Cost/duration backstop (SessionBudget's maxCostUsd/maxDurationMs) —
+	 * the preferred way to bound a QA session: a true runaway gets caught
+	 * by spend or wall-clock time, not by an arbitrary tool-call count that
+	 * penalizes legitimate thorough work.
+	 */
+	budget?: Pick<SessionBudget, "maxCostUsd" | "maxDurationMs">
 	/** Phase 3 memory store (optional; QA can reuse the project's memory). */
 	memory?: MemoryStore | null
 	/** Project scope for memory (default: basename of workspaceRoot). */
@@ -177,7 +193,8 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
 		model,
 		llmClient,
 		baseUrl,
-		maxIterations = 50,
+		maxIterations = 200,
+		budget,
 		memory = null,
 		project,
 	} = options
@@ -198,6 +215,7 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
 		model,
 		taskText: options.taskText ?? defaultTaskText(workspaceRoot, mode),
 		maxIterations,
+		budget,
 		systemPromptOverride,
 		tools: qaTools(),
 		executor: createQaHeadlessExecutor(workspaceRoot),
