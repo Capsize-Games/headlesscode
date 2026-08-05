@@ -282,6 +282,46 @@ async function testCentralStackRulesLoaded(): Promise<void> {
 	)
 }
 
+/**
+ * The $HEADLESSCODE_DATA_DIR override redirects the central stacks dir, and
+ * content installed there (the path scripts/install-cli.sh ships to) is
+ * actually spliced — regression guard for the shipped-content guarantee.
+ */
+async function testCentralStackRulesHonorDataDirOverride(): Promise<void> {
+	const home = await sandboxHome()
+	// The install script writes to $HEADLESSCODE_DATA_DIR/shared/stacks when
+	// the override is set; the runtime must read from THAT dir, not the
+	// $HOME-derived default (the review finding on install-cli.sh).
+	const overrideRoot = path.join(ROOT_SANDBOX, `data-override-${activeHomes.length}`, "store")
+	const centralFile = path.join(overrideRoot, "shared", "stacks", "python", "rules.md")
+	await fs.mkdir(path.dirname(centralFile), { recursive: true })
+	await fs.writeFile(centralFile, "PY-OVERRIDE-MARKER: shipped under the data-dir override", "utf-8")
+	process.env.HEADLESSCODE_DATA_DIR = overrideRoot
+
+	assert.equal(
+		getCentralStackRulesDir(),
+		path.join(overrideRoot, "shared", "stacks"),
+		"getCentralStackRulesDir() must resolve through the $HEADLESSCODE_DATA_DIR override",
+	)
+	assert.notEqual(
+		getCentralStackRulesDir(),
+		path.join(home, ".local", "share", "headlesscode", "shared", "stacks"),
+		"the override must NOT fall back to the $HOME-derived default",
+	)
+
+	const ws = await makeProject({ "pyproject.toml": "[project]\nname = \"x\"\n" })
+	const loaded = await loadStackRules(ws)
+	assert.equal(sorted(loaded.stacks), "python", "expected python detected")
+	assert.ok(
+		loaded.content.includes("PY-OVERRIDE-MARKER"),
+		"rules installed under the $HEADLESSCODE_DATA_DIR override must be spliced into the prompt",
+	)
+	assert.ok(
+		loaded.content.includes(centralFile),
+		"expected the override-path central file labelled in content",
+	)
+}
+
 /** Project-local .roo/rules-stack-<stack>/rules.md is loaded with its label. */
 async function testProjectStackRulesLoaded(): Promise<void> {
 	await sandboxHome()
@@ -480,6 +520,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["non-git walk skips node_modules", testWalkSkipsNodeModules],
 	["no rules source is zero-config (empty content, no detection)", testNoRulesSourceIsZeroConfig],
 	["central stack rules loaded with source label", testCentralStackRulesLoaded],
+	["central stack rules honor the $HEADLESSCODE_DATA_DIR override", testCentralStackRulesHonorDataDirOverride],
 	["project-local rules-stack-<stack> loaded with source label", testProjectStackRulesLoaded],
 	["central rules splice before project rules for the same stack", testCentralThenProjectOrder],
 	["detected stacks with no rules.md contribute nothing", testDetectedButNoRulesIsEmpty],
@@ -492,7 +533,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 
 async function main(): Promise<void> {
 	// Sanity check the sandbox is actually in effect — if os.homedir() ignored
-	// $HOME the tests would be writing to the REAL ~/.local/share/headlesscode.
+	// $HOME, or the store-root override didn't land under the sandbox, the
+	// tests would be writing to the REAL ~/.local/share/headlesscode.
 	const probe = path.join(ROOT_SANDBOX, "probe")
 	await sandboxHome()
 	assert.equal(
