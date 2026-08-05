@@ -125,6 +125,40 @@ async function testBaselineFailedCountsDoNotFalselyTripAFinding(): Promise<void>
 	)
 }
 
+/**
+ * 2026-08-05 production incident (a THIRD variant of the same bug class,
+ * caught immediately after fixing the second, live, on a real review of
+ * airunner PR #89): a genuinely clean review explained that two minor,
+ * out-of-scope observations did NOT need action using the word "reopen"
+ * itself — "(pre-existing / out of scope, no reopen)" and "Staying
+ * closed. No reopening warranted." — with the bare `\breopen(ed)?\b`
+ * marker (the fix from the PREVIOUS incident) still tripping on this,
+ * because it has no negation-awareness at all. A negation lookbehind
+ * would only protect this exact phrasing (the same mistake made for
+ * "failed" last time); the real fix is structural: `reopen(ed)` only
+ * counts as a finding when it's an actual "### Reopened" heading or is
+ * tied to a specific issue number, both of which the reviewer's own
+ * required report format always uses for a REAL reopen, and an
+ * incidental aside never does.
+ */
+async function testNoReopenAsideDoesNotMarkFinding(): Promise<void> {
+	const result = parseReviewResult(
+		[
+			"## Independent review — VERIFIED CLEAN",
+			"",
+			"Independently reproduced every checkable claim.",
+			"",
+			"### Non-blocking observations (pre-existing / out of scope, no reopen)",
+			'1. `poll-worktree.sh` compares against uppercase "CLOSED" but gh returns lowercase — pre-existing on master.',
+			"2. A benign gitignored log gets one extra line on stall — doc nit only.",
+			"",
+			"Staying closed. No reopening warranted.",
+		].join("\n"),
+	)
+	assert.equal(result.verdict, "clean", "an aside merely mentioning 'reopen' while explicitly NOT reopening must stay clean")
+	assert.deepEqual(result.findings, [])
+}
+
 async function testBareWrongRegressionDoesNotMarkFinding(): Promise<void> {
 	// "wrong"/"regression"/"does not" as ordinary prose, no reopen anywhere.
 	const result = parseReviewResult(
@@ -143,6 +177,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["verdict: clean with no findings -> clean", testCleanVerdictDoesNotTripOnCleanupWord],
 	["a finding always wins over coincidental 'verified clean' text elsewhere", testFindingWinsOverCoincidentalCleanLanguage],
 	["baseline 'N failed' test counts do not falsely trip a finding", testBaselineFailedCountsDoNotFalselyTripAFinding],
+	["a 'no reopen' aside explaining nothing needs action stays clean", testNoReopenAsideDoesNotMarkFinding],
 	["bare 'wrong'/'regression'/'does not' in clean prose does not mark a finding", testBareWrongRegressionDoesNotMarkFinding],
 ]
 

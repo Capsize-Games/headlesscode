@@ -195,26 +195,54 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
  * either clean (nothing wrong) or it has findings; it cannot be both, and
  * when in doubt (both markers present), a real finding must win.
  *
- * The finding-marker word list is deliberately narrow — only `reopen(ed)`
- * and an explicit `verdict: ... finding` phrase — NOT bare words like
- * "failed", "wrong", "regression", or "does not". A second real production
- * bug from the SAME over-broad list: a genuinely clean review's baseline
- * test counts ("12 failed, 1187 passed" — pre-existing failures on master,
- * unrelated to the change) contain the word "failed", which alone tripped
- * the OLD list and misclassified a clean review as a finding — spawning a
- * completely unnecessary rework cycle, spending real API cost on a fix
- * for a problem that did not exist. "Failed"/"wrong"/"regression" are
- * ordinary words that show up constantly in normal baseline-reporting
- * prose; they are NOT a reliable signal on their own. `reopen(ed)` is
- * reliable because it names the actual ground-truth action the reviewer
- * takes on GitHub when — and only when — there's a real problem. Do not
- * add generic words back to this list without a specific report shape
- * that needs them AND a test proving it doesn't false-positive on normal
- * baseline/prose language.
+ * The finding-marker word list is deliberately narrow — NOT bare words
+ * like "failed", "wrong", "regression", "does not", or even bare
+ * "reopen(ed)" on its own. Three real production bugs came from
+ * progressively narrowing an over-broad list, each caught live in the same
+ * session:
+ *   1. A clean marker ("verified clean") anywhere overrode an explicit
+ *      finding elsewhere in the same report (fixed: finding always wins).
+ *   2. Bare "failed"/"wrong"/"regression" matched ordinary baseline-
+ *      reporting prose ("12 failed, 1187 passed" — pre-existing, unrelated
+ *      to the change) with zero real problem present (fixed: dropped those
+ *      words entirely, kept only `reopen(ed)`).
+ *   3. Bare "reopen(ed)" STILL wasn't safe: a genuinely clean report can
+ *      explain that something does NOT need action using the word
+ *      "reopen" itself — "(pre-existing / out of scope, no reopen)",
+ *      "Staying closed. No reopening warranted." — with zero negation-
+ *      detection, "reopen" appearing ANYWHERE, including inside a
+ *      sentence explicitly saying it's NOT happening, still tripped the
+ *      finding branch.
+ *
+ * The fix for #3 is not another negation lookbehind (that class of patch
+ * — `(?<!no\s)` — already failed once for "failed"; it only protects the
+ * EXACT phrase it names, never generalizes to different phrasing). The
+ * reliable signal instead is a STRUCTURAL one: `reopen(ed)` only counts
+ * when it is
+ *   (a) a section heading on its own ("### Reopened"), or
+ *   (b) explicitly tied to a specific issue number within the same
+ *       sentence ("reopened #83" / "#83 ... reopened" / "issue #83
+ *       REOPENED"),
+ * because the reviewer's own required report format always associates a
+ * real reopen with the specific issue number it applies to — an
+ * incidental "no reopen" aside never does. Do not go back to a bare
+ * `\breopen(ed)?\b` match, and do not add generic words back to this list
+ * without a specific report shape that needs them AND a test proving no
+ * false-positive on normal baseline/prose/aside language.
  */
 export function parseReviewResult(text: string): ReviewResult {
 	const summary = text.trim()
-	const lower = summary.toLowerCase()
+
+	// A real reopen: either an explicit "### Reopened" heading, or
+	// "reopen(ed)" tied to a specific issue number within ~30 chars on
+	// either side, never crossing a sentence boundary (period/newline) —
+	// see the function docstring for why bare "reopen(ed)" isn't enough.
+	const REOPENED_HEADING_RE = /(?:^|\n)#{1,6}\s*reopened?\b/i
+	const REOPENED_WITH_ISSUE_RE = /#\d+\b[^.\n]{0,30}\breopen(?:ed)?\b|\breopen(?:ed)?\b[^.\n]{0,30}#\d+\b/i
+	const VERDICT_FINDING_RE = /\bverdict\b[^.\n]*\bfinding\b/i
+
+	const isRealFindingLine = (line: string): boolean =>
+		REOPENED_HEADING_RE.test(`\n${line}`) || REOPENED_WITH_ISSUE_RE.test(line) || VERDICT_FINDING_RE.test(line)
 
 	// Extract a "## Findings" / "Findings:" section if present.
 	const findings: string[] = []
@@ -229,17 +257,19 @@ export function parseReviewResult(text: string): ReviewResult {
 			}
 		}
 	}
-	// Fallback: any line that explicitly names a finding / a reopen.
+	// Fallback: any line that names a REAL reopen (tied to an issue number
+	// or its own heading) — not just the bare word "finding"/"reopen".
 	if (findings.length === 0) {
 		for (const line of summary.split("\n")) {
 			const item = line.replace(/^[-*\d.\s)\]]+\s*/, "").trim()
-			if (/\b(reopen(ed)?|finding)\b/i.test(item) && item.length > 8) {
+			if (isRealFindingLine(item) && item.length > 8) {
 				findings.push(item)
 			}
 		}
 	}
 
-	const hasFindingMarker = /\b(reopen(ed)?|verdict[^.\n]*finding)\b/i.test(lower)
+	const hasFindingMarker =
+		REOPENED_HEADING_RE.test(summary) || REOPENED_WITH_ISSUE_RE.test(summary) || VERDICT_FINDING_RE.test(summary)
 
 	const verdict: "clean" | "finding" = hasFindingMarker ? "finding" : "clean"
 	return { findings: [...new Set(findings)], verdict, summary }
