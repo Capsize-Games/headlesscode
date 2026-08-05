@@ -335,8 +335,10 @@ async function testShippedStackRulesContent(): Promise<void> {
 		assert.ok(content.trim().length > 0, `shared/stacks/${stack}/rules.md must be non-empty`)
 	}
 
-	// The FastAPI stack rules shipped by this round (issue #10) must be present.
+	// The FastAPI + PostgreSQL stack rules shipped by this round (issues #10
+	// and #11) must be present.
 	assert.ok(shippedStacks.includes("fastapi"), "expected shipped FastAPI stack rules (issue #10)")
+	assert.ok(shippedStacks.includes("postgresql"), "expected shipped PostgreSQL stack rules (issue #11)")
 }
 
 // ─── buildSystemPrompt splice tests ──────────────────────────────────────────
