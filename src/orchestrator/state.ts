@@ -167,11 +167,37 @@ export interface OrchestratorGroup {
 	cost_recorded?: string
 }
 
+/**
+ * Preflight probe record persisted on the state file so the dashboard can
+ * surface it (issue #13): the result of the 1-token probe `orchestrate` runs
+ * BEFORE spawning any workers, using the exact model + provider pin a real
+ * worker uses. Written by orchestrateMain alongside `batch`; see
+ * src/llm/preflight.ts for the statuses.
+ */
+export interface PreflightRecord {
+	/** One of PreflightStatus ("ok" | "no-api-key" | "invalid-key" | "balance" | "provider" | "network" | "other"). */
+	status: string
+	/** The model id the probe ran with. */
+	model: string
+	/** The OpenRouter base URL probed. */
+	baseUrl?: string
+	/** The single human-readable preflight line. */
+	line: string
+	/** Probe wall time, ms. */
+	latencyMs: number
+	/** Estimated USD cost of the 1-token probe itself. */
+	probeCostUsd: number
+	/** Order-of-magnitude round cost estimate (nominal profile × sessions × price). */
+	roundCostEstimateUsd?: number
+}
+
 /** The orchestrator state file document. */
 export interface OrchestratorState {
 	batch?: string
 	updated?: string
 	groups: OrchestratorGroup[]
+	/** Issue #13 preflight probe result (present once orchestrate ran it). */
+	preflight?: PreflightRecord
 	/**
 	 * Cost/token monitoring (workstream 3): round-level total, the sum of
 	 * every group's `usage` field. Recomputed by the watcher each time a
