@@ -170,8 +170,19 @@ function currentBranch(workspaceRoot: string): string {
 function defaultTaskText(workspaceRoot: string, mode: string): string {
 	return (
 		`Run the QA checklist defined in your operating instructions against this workspace ` +
-		`(branch: ${currentBranch(workspaceRoot)}, mode: ${mode}). Boot the app, run the relevant ` +
-		`test suite, exercise the changed behavior, and report EVIDENCE with real command output. ` +
+		`(branch: ${currentBranch(workspaceRoot)}, mode: ${mode}).\n\n` +
+		`FIRST: run \`git diff origin/master...HEAD --stat\` (or the equivalent against this repo's ` +
+		`actual base branch) to see EXACTLY which files changed. That diff is your scope — it tells ` +
+		`you which behavior to exercise. A real incident: without this instruction, a QA session spent ` +
+		`over a dozen iterations exploring an unrelated chat-UI input component and an unrelated ` +
+		`dependency-pinning question before ever looking at the actual diff, on a change that only ` +
+		`touched two shell scripts and a docs file.\n\n` +
+		`Boot the app and confirm it starts cleanly (a QUICK smoke test — no new JS/console errors on ` +
+		`load — not a deep exploration of unrelated areas), run the relevant test suite, then exercise ` +
+		`SPECIFICALLY the behavior the diff touched. If the diff doesn't touch the browser-facing app at ` +
+		`all (e.g. only scripts/docs/backend), the boot-and-smoke-test step still applies but do not go ` +
+		`looking for unrelated things to click through — there's nothing in scope for deeper UI ` +
+		`interaction. Report EVIDENCE with real command output. ` +
 		`When you are done, call attempt_completion with a structured summary: a verdict line ` +
 		`(QA PASS or QA FAIL), an Evidence section with the real commands you ran and their ` +
 		`output, and the final baseline numbers you personally confirmed.`
