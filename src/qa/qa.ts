@@ -242,10 +242,27 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
  * Deterministic + tested:
  *   - "pass"  — explicit pass markers (QA PASS, all tests pass, no errors
  *               found, definition of done satisfied, `errors: []`, …).
- *   - "fail"  — explicit fail markers (QA FAIL, failed, errors found, bug,
- *               regression, does not work, definition of done NOT met, …).
+ *   - "fail"  — explicit fail markers (QA FAIL, does not work, definition of
+ *               done NOT met) — deliberately narrow, see below;
  *   - default "fail" when neither is stated (FAIL-CLOSED: an inconclusive QA
  *     report never gates a deploy through).
+ *
+ * The fail-marker list is deliberately narrow — the SAME class of bug as
+ * `reviewer.ts`'s parseReviewResult, found in the same incident: it used to
+ * include bare "failed"/"failure"/"failures found"/"errors found"/"bug"/
+ * "regression"/"broken"/"failing" ANYWHERE in the report. A QA report citing
+ * real baseline test counts ("12 failed, 1187 passed" — pre-existing on
+ * master, unrelated to the change) contains the bare word "failed", which
+ * alone tripped the fail branch — and fail always wins over pass in this
+ * function's logic, so ANY QA report mentioning ordinary baseline numbers
+ * would be force-classified as "fail" even when QA genuinely passed. The
+ * negative lookbehind `(?<!no\s)failed` only protects the exact phrase "no
+ * failed" — it does nothing for "12 failed", which is the actual shape
+ * baseline reporting takes. Narrowed to `qa fail` / `definition of done
+ * not` / `does not work` — explicit, structured verdict language, not
+ * incidental words that show up constantly in normal test-output prose.
+ * Do not add generic words back without a specific report shape that needs
+ * them AND a test proving no false-positive on baseline/prose language.
  *
  * Evidence: an `## Evidence` / `Evidence:` section when present, else the full
  * summary text (which still contains the real command output).
@@ -267,13 +284,7 @@ export function parseQaResult(text: string): QaResult {
 		/\b(qa\s*pass|all\s*tests?\s*pass|no\s+errors?\s+found|no\s+failures|definition\s+of\s+done\s+(is\s+|was\s+)?(met|satisfied)|errors?\s*:\s*\[\s*\]|passed\s+(\d+)\/\d+|verified\s+ok)\b/i.test(
 			lower,
 		)
-	// Fail markers use negative lookbehind so "no errors found" / "no failures
-	// found" (pass statements) never trip the fail branch. Lookbehinds honor
-	// the /i flag, so "No errors found" is also protected.
-	const hasFailMarker =
-		/\b(qa\s*fail|(?<!no\s)failed|(?<!no\s)failure|(?<!no\s)failures?\s+found|(?<!no\s)errors?\s+found|bug|regression|does\s+not\s+work|broken|definition\s+of\s+done\s+not|failing)\b/i.test(
-			lower,
-		)
+	const hasFailMarker = /\b(qa\s*fail|definition\s+of\s+done\s+not|does\s+not\s+work)\b/i.test(lower)
 
 	let verdict: QaVerdict
 	if (hasPassMarker && !hasFailMarker) {

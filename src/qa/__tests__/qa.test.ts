@@ -78,6 +78,37 @@ async function testPassMarkerDoesNotTripOnFailureWord(): Promise<void> {
 	assert.equal(result.verdict, "pass")
 }
 
+/**
+ * 2026-08-05 production incident (same class of bug as reviewer.ts's
+ * parseReviewResult, found in the same session): a genuinely passing QA
+ * report citing real baseline test counts ("12 failed, 1187 passed" —
+ * pre-existing failures on master, unrelated to the change under QA)
+ * contains the bare word "failed". The old fail-marker regex's negative
+ * lookbehind `(?<!no\s)failed` only protects the exact phrase "no failed"
+ * — it does nothing for "12 failed", the actual shape baseline reporting
+ * takes — and fail always wins over pass in this function, so the whole
+ * report was force-classified "fail" despite QA PASS being stated
+ * explicitly. Caught live while this exact QA session was running.
+ */
+async function testBaselineFailedCountsDoNotFalselyFailAPassingQaReport(): Promise<void> {
+	const result = parseQaResult(
+		[
+			"QA PASS",
+			"",
+			"## Evidence",
+			"- App booted, exercised the changed behavior for real, all targeted checks pass.",
+			"- Full-suite baselines (pre-existing on master, unrelated to this change):",
+			"  `server/tests`: 12 failed, 1187 passed, 8 skipped, 10 errors.",
+			"  `server/src/airunner_services/tests`: 3 failed, 928 passed, 8 errors.",
+		].join("\n"),
+	)
+	assert.equal(
+		result.verdict,
+		"pass",
+		"baseline 'N failed' test counts must never be mistaken for a QA failure of the actual change",
+	)
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -88,6 +119,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["errors array content -> fail", testFailOnErrorsArrayContent],
 	["no Evidence section -> full summary is evidence", testEvidenceFallsBackToFullSummary],
 	["pass marker survives 'no failures found' phrasing", testPassMarkerDoesNotTripOnFailureWord],
+	["baseline 'N failed' test counts do not falsely fail a passing QA report", testBaselineFailedCountsDoNotFalselyFailAPassingQaReport],
 ]
 
 async function main(): Promise<void> {
