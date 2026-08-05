@@ -1,8 +1,10 @@
 /**
- * Unit tests for src/config/mode-models.ts — per-mode model assignment via
- * `<workspaceRoot>/.headlesscode/mode-models.json`. Plain assert-based (no
- * test framework, no network) matching the repo test style. Run via `npm test`
- * -> `tsx src/config/__tests__/mode-models.test.ts`.
+ * Unit tests for src/config/mode-models.ts — per-mode model assignment via the
+ * CENTRAL project store's `mode-models.json` (src/project-store.ts). The store
+ * is redirected to a temp dir via $HEADLESSCODE_DATA_DIR so no test ever
+ * touches the real home directory. Plain assert-based (no test framework, no
+ * network) matching the repo test style. Run via `npm test` ->
+ * `tsx src/config/__tests__/mode-models.test.ts`.
  */
 
 import assert from "node:assert/strict"
@@ -10,15 +12,20 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 
-import { loadModeModelsFile, resolveModelForMode, validateModeModelsBody, DEFAULT_KEY } from "../mode-models.js"
+import { loadModeModelsFile, modeModelsFilePath, resolveModelForMode, validateModeModelsBody, DEFAULT_KEY } from "../mode-models.js"
+
+let storeTmp: string
 
 async function tmpRepo(): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-mode-models-"))
 }
 
 async function writeConfig(repo: string, content: string): Promise<void> {
-	await fs.mkdir(path.join(repo, ".headlesscode"), { recursive: true })
-	await fs.writeFile(path.join(repo, ".headlesscode", "mode-models.json"), content, "utf-8")
+	// Write at the CENTRAL config location (modeModelsFilePath) — the legacy
+	// `.headlesscode/` migration path is covered by src/project-store.test.ts.
+	const file = modeModelsFilePath(repo)
+	await fs.mkdir(path.dirname(file), { recursive: true })
+	await fs.writeFile(file, content, "utf-8")
 }
 
 // ─── Precedence ──────────────────────────────────────────────────────────────
@@ -281,16 +288,24 @@ const tests: Array<[string, () => Promise<void>]> = [
 ]
 
 async function main(): Promise<void> {
+	// Redirect the central store to a temp dir for the whole run.
+	storeTmp = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-mode-models-store-"))
+	process.env.HEADLESSCODE_DATA_DIR = storeTmp
 	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
+	try {
+		for (const [name, fn] of tests) {
+			try {
+				await fn()
+				console.log(`  ok   ${name}`)
+			} catch (err) {
+				failed++
+				console.error(`  FAIL ${name}`)
+				console.error(err instanceof Error ? err.stack ?? err.message : String(err))
+			}
 		}
+	} finally {
+		delete process.env.HEADLESSCODE_DATA_DIR
+		await fs.rm(storeTmp, { recursive: true, force: true })
 	}
 	if (failed > 0) {
 		console.error(`\n${failed} test(s) failed`)

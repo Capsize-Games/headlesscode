@@ -1,0 +1,187 @@
+# Decision-proxy agent: an LLM stand-in for the human on `ask_followup_question`
+
+## Who you are working on this for
+
+You (deepseek) are implementing this against the `headlesscode` repository —
+a standalone Node/TypeScript CLI running a headless coding-agent loop. Match
+the project's established conventions: no test framework beyond hand-rolled
+`assert` + `tsx`-run test files, minimal new dependencies, `npx tsc --noEmit`
+and `npm test` must stay green, re-run `scripts/e2e*/run.sh` afterward.
+
+**Scope for this round: headlesscode only.** No changes to `~/Projects/
+airunner` or the uwuchat product are needed or wanted here — this plan builds
+and pilots the mechanism entirely within headlesscode's own repo, using
+headlesscode to develop headlesscode (the same loop that produced
+`plans/speed-and-context-efficiency.md`'s fixes). The airunner/uwuchat
+integration (a system chatbot that toggles between chat-mode and code-mode,
+each with its own context) is a separate, already-reasoned-through problem
+the project owner considers solved on the airunner side — do not design for
+it here.
+
+## The problem this solves
+
+`ask_followup_question` (and `switch_mode`, sharing the same primitive) blocks
+a headless session on a real answer: `escalateDecision` in
+`src/tools/executor.ts` writes `<workspaceRoot>/.harness.needs-decision`
+(the question + suggestions), then polls for `<workspaceRoot>/
+.harness.decision-answer` every 5s for up to `DEFAULT_DECISION_TIMEOUT_MS`
+(30 minutes) before falling back to "must decide autonomously" — a generic,
+context-free default that isn't grounded in what the human actually wanted.
+Today the only way to answer faster than the timeout is a human running
+`scripts/headlesscode-answer.sh <worktree> "<answer>"` by hand.
+
+This matters most for **Planning mode** specifically
+(`~/Projects/airunner/.roomodes`'s `planning` mode, and any equivalent used
+directly in headlesscode) — its entire job is conversational discovery via
+exactly this tool, so a headless planning session either stalls for 30
+minutes per question or free-runs on ungrounded defaults. That's the
+practical blocker to running "start a planning session and let it drive all
+the way to a dispatched, reviewed round" unattended.
+
+## The design (as discussed and agreed)
+
+A **decision-proxy agent**: a small process that watches for
+`.harness.needs-decision` markers and answers them automatically — grounded
+in the session's *original, verbatim* task request, not a paraphrase of it —
+by writing `.harness.decision-answer` itself, exactly the same file a human
+would write via `headlesscode-answer.sh`. No changes to `escalateDecision`
+or `ask_followup_question` themselves: the proxy is a new writer of the same
+answer file, so the existing timeout/fallback path is untouched and remains
+the safety net.
+
+**Explicitly decided, not up for re-litigation in this round:**
+- **No stakes-based gating** (no "low-stakes questions only" allow-list).
+  The project owner's call: instead of hand-classifying question types, the
+  proxy should recognize its own uncertainty and say so.
+- **No eval-test suite for calibration in v1.** If genuine miscalibration
+  problems show up in practice, that's the trigger to build evals — not
+  something to build speculatively now.
+- **Every proxy answer is logged distinguishably** from a human-written one
+  (see "Logging" below). This is not the eval-based safety net that was
+  explicitly deferred — it's a free, structural audit trail, cheap enough
+  that there's no reason to skip it even in a minimal v1.
+
+### The escalation path when the proxy is uncertain
+
+The proxy has three possible outcomes per question:
+1. **Confident answer** → write `.harness.decision-answer` with the answer
+   text, prefixed so it's identifiable as proxy-authored (see Logging).
+2. **Uncertain ("I don't know")** → write NOTHING. Do not fabricate a
+   low-confidence answer. This is the intentional design: with nothing
+   written, `escalateDecision`'s existing poll loop just keeps waiting,
+   and the EXISTING timeout → "must decide autonomously" fallback fires
+   exactly as it does today with no proxy running at all. In this
+   headlesscode-only scope there is no uwuchat bot to bubble up to yet —
+   the correct behavior here is "fall back to today's behavior," not a new
+   escalation channel. (When this gets integrated into the airunner/uwuchat
+   pipeline later, "uncertain" is the signal that would route to the real
+   human instead of the timeout — that's future work, not this round's.)
+3. **Proxy call itself fails** (LLM error, timeout, malformed response) →
+   same as (2): write nothing, fail open to today's behavior. Mirror the
+   fail-open contract already established in `src/engine/local-explore.ts`
+   (never let an experimental/auxiliary subsystem break a real session).
+
+### What the proxy needs to answer well
+
+- **The original task text, verbatim** — not a summary generated by an
+  intermediate stage. For a direct `headlesscode --task/--task-file` session
+  this is the literal task string/file content passed at session start. For
+  an orchestrator-spawned worker, it's the group's `task_file` content
+  (already sitting on disk, referenced in `.orchestrator-state.json`). This
+  directly addresses the "telephone game drift" concern from the design
+  discussion — the proxy answers against ground truth, not a paraphrase of a
+  paraphrase.
+- **The question + suggestions** from `.harness.needs-decision` (already
+  structured JSON: `question`, `suggestions?`, `askedAt`).
+- Optionally, recent session context (e.g. the last few tool
+  calls/results) if cheaply available — nice-to-have, not required for v1;
+  don't over-build this before knowing whether the minimal version already
+  works well enough.
+
+### Implementation shape
+
+New script/subcommand, e.g. `scripts/decision-proxy.sh` (bash, matching the
+`headlesscode-answer.sh` sibling it replaces the manual half of) or a
+`headlesscode decision-proxy --workspace <path>` CLI subcommand if the
+bash-vs-TS split in this repo makes more sense that way (existing precedent:
+`headlesscode-answer.sh` is a thin bash wrapper; the actual LLM call belongs
+in TypeScript since it needs the same `LlmClient`/model-resolution machinery
+as everything else — look at how `src/engine/local-explore.ts` structures a
+small bounded LLM-driven loop as the closest existing analog, though this is
+simpler: single question in, single answer out, no tool-calling loop needed).
+
+- Poll (or `fs.watch`) the target worktree(s) for `.harness.needs-decision`.
+  For the pilot, a single worktree is enough — don't build multi-worktree
+  fan-out before the single-worktree case is proven.
+- On a new marker: read it, read the session's original task text, make ONE
+  LLM call (no tools, a plain completion) with a system prompt that
+  instructs the model to answer directly and specifically when confident, or
+  respond with a distinct sentinel (e.g. a JSON `{"uncertain": true}` shape,
+  not free text guessing) when it isn't. Parse the sentinel; on anything
+  else treat as "uncertain" (fail closed on parse ambiguity — never treat a
+  malformed response as license to write a fabricated answer).
+- Config: reuse the existing `mode-models.json` `extraKeys` indirection
+  pattern (`src/config/mode-models.ts`) — add a `_decision-proxy` key,
+  consistent with `_condensation`'s precedent, rather than inventing a new
+  config mechanism.
+- Env-gated, default OFF: `HEADLESSCODE_DECISION_PROXY=1` to enable,
+  mirroring `local-explore.ts`'s `HEADLESSCODE_LOCAL_EXPLORE` pattern exactly
+  (same project convention for opt-in experimental subsystems).
+
+### Logging (the audit trail, kept even without eval tests)
+
+- A proxy-authored answer file should carry a distinguishing prefix, e.g.
+  `[decision-proxy] <answer text>` — so anyone reading `harness.log` or the
+  dashboard's decision_answered event can immediately tell a human never
+  looked at this, without needing separate bookkeeping.
+- The proxy process itself should log every question it saw and what it did
+  with it (answered / uncertain / errored) to its own log file, so a full
+  session's decision history is reconstructable after the fact even though
+  nothing blocked on it live.
+
+## What NOT to build in this round
+
+- No stakes/complexity-based gating (explicitly rejected above).
+- No eval-test harness for calibration (explicitly deferred).
+- No airunner/uwuchat wiring (out of scope — session-management there is
+  already considered solved via the existing chat/code mode toggle).
+- No multi-worktree fan-out beyond what a simple loop gives you for free —
+  prove the single-worktree case first.
+- No new marker-file protocol — reuse `.harness.needs-decision` /
+  `.harness.decision-answer` exactly as they exist today; this is an
+  additive answerer, not a protocol change.
+
+## The pilot: does this actually make things faster?
+
+This is the "test a small portion before committing to the rest" the project
+owner asked for — run entirely on headlesscode's own repo, no airunner
+involvement:
+
+1. Implement the minimal decision-proxy (single worktree, env-gated, the
+   three-outcome logic above).
+2. Run a real headlesscode session against headlesscode's own repo using
+   Planning-mode-equivalent behavior (a task deliberately underspecified
+   enough to provoke at least one real `ask_followup_question` call — e.g.
+   an ambiguous "improve X" task rather than a fully-specified one) — first
+   WITHOUT the proxy running, to get a baseline: how long does the session
+   actually sit blocked (up to the full 30-minute timeout, or however long
+   until someone manually answers) before it can proceed.
+3. Run the same shape of task WITH `HEADLESSCODE_DECISION_PROXY=1`, and
+   measure: time from `.harness.needs-decision` appearing to
+   `.harness.decision-answer` being written (should be single-digit seconds
+   — one LLM call), and whether the session proceeds sensibly afterward
+   (spot-check manually — this is exactly the judgment eval tests would
+   otherwise automate, deferred per the decision above).
+4. Success criterion for "proceed with the rest of the work": decision
+   points resolve in seconds instead of minutes, the proxy's answers are
+   reasonable on manual inspection, and it correctly says "uncertain" rather
+   than confidently answering when a question is genuinely outside what the
+   original task text could grounds an answer in (test this deliberately —
+   include at least one question in the pilot that the original task
+   genuinely doesn't answer, and confirm the proxy abstains rather than
+   guessing).
+5. If the pilot looks good: come back to this plan (or a follow-up) to
+   discuss what "the rest of the work" is — likely candidates raised in
+   conversation are multi-worktree support and, later, the airunner/uwuchat
+   "uncertain bubbles up to the real human" integration — but don't
+   pre-commit to that scope here; decide after seeing the pilot's numbers.

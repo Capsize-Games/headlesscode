@@ -161,6 +161,65 @@ export const findReferencesTool = {
 	},
 } satisfies OpenAI.Chat.ChatCompletionTool
 
+// ─── rename_symbol ───────────────────────────────────────────────────────────
+
+const RENAME_SYMBOL_DESCRIPTION = `Rename a symbol at a given line of a source file to a new name EVERYWHERE it's used across the workspace, as ONE atomic operation — either every call site updates or none do (on any failure, already-applied edits are rolled back and the error names the failing site). Uses the TypeScript compiler's real reference resolution (the same engine as find_references) to enumerate sites, so it is correct on overloads, re-exports, and aliased imports where a text find/replace would miss or wrongly hit.
+
+Use this instead of composing N separate apply_diff/search_replace edits when you need to rename a symbol used across multiple files — one call replaces the whole read-every-file + edit-every-file round trip.
+
+Only works on TypeScript/JavaScript source files, and refuses (with nothing changed) when any reference site lies outside the workspace root.
+
+Parameters:
+- path: (required) Path to the source file containing the symbol, relative to the workspace root.
+- line: (required) 1-based line number of the symbol.
+- character: (optional) 1-based column of the symbol within the line; omit to use the symbol name or the first identifier on the line.
+- symbol: (optional) The symbol's name, used to disambiguate when the line has several identifiers (e.g. { "path": "src/foo.ts", "line": 12, "symbol": "bar" }). Ignored when character is given.
+- new_name: (required) The new identifier to rename the symbol to (must be a valid TypeScript identifier).
+
+Example: rename the function on line 1 of src/util.ts to "compute": { "path": "src/util.ts", "line": 1, "symbol": "util", "new_name": "compute" }`
+
+const RS_PATH_PARAMETER_DESCRIPTION = `Path to the source file containing the symbol, relative to the workspace root`
+const RS_LINE_PARAMETER_DESCRIPTION = `1-based line number of the symbol`
+const RS_CHARACTER_PARAMETER_DESCRIPTION = `1-based column of the symbol within the line (disambiguates on multi-symbol lines); omit to use the symbol name or the first identifier on the line`
+const RS_SYMBOL_PARAMETER_DESCRIPTION = `Symbol name to disambiguate when the line has several identifiers; ignored when character is given`
+const RS_NEW_NAME_PARAMETER_DESCRIPTION = `The new identifier to rename the symbol to (must be a valid TypeScript identifier)`
+
+export const renameSymbolTool = {
+	type: "function",
+	function: {
+		name: "rename_symbol",
+		description: RENAME_SYMBOL_DESCRIPTION,
+		strict: true,
+		parameters: {
+			type: "object",
+			properties: {
+				path: {
+					type: "string",
+					description: RS_PATH_PARAMETER_DESCRIPTION,
+				},
+				line: {
+					type: "integer",
+					description: RS_LINE_PARAMETER_DESCRIPTION,
+				},
+				character: {
+					type: ["integer", "null"],
+					description: RS_CHARACTER_PARAMETER_DESCRIPTION,
+				},
+				symbol: {
+					type: ["string", "null"],
+					description: RS_SYMBOL_PARAMETER_DESCRIPTION,
+				},
+				new_name: {
+					type: "string",
+					description: RS_NEW_NAME_PARAMETER_DESCRIPTION,
+				},
+			},
+			required: ["path", "line", "character", "symbol", "new_name"],
+			additionalProperties: false,
+		},
+	},
+} satisfies OpenAI.Chat.ChatCompletionTool
+
 // ─── import_graph ────────────────────────────────────────────────────────────
 
 const IMPORT_GRAPH_DESCRIPTION = `Show a file's import relationships: (a) everything it imports, resolved to the REAL file paths the TypeScript compiler resolves them to (tsconfig paths aliases like "vscode" -> src/vendor/zoo-code/shim/vscode.ts included), and (b) everything that imports it (reverse lookup across the whole program). Static analysis of import/export declarations — deterministic and fast (the program-wide import map is cached).
@@ -209,3 +268,13 @@ export const CODE_INTEL_TOOL_NAMES: readonly string[] = [
 	findReferencesTool.function.name,
 	importGraphTool.function.name,
 ]
+
+/**
+ * The EDIT-capable code-intelligence tool (`rename_symbol`). Deliberately NOT
+ * part of CODE_INTEL_TOOLS: that set is appended for every mode including the
+ * read-only reviewer/QA executors (which never register write tools), whereas
+ * rename_symbol edits files and must only be advertised to executors that
+ * actually register it (the headless executor — see src/tools/executor.ts).
+ * Callers append it explicitly, gated on executor capability.
+ */
+export const RENAME_SYMBOL_TOOL: OpenAI.Chat.ChatCompletionTool = renameSymbolTool

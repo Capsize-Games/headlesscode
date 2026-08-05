@@ -17,10 +17,12 @@
 #     COMPOSE_PROJECT_NAME=airunner-<name>, POSTGRES_PORT=$((5433+offset)),
 #     AIRUNNER_HTTP_PORT=$((8090+offset*10)), VITE_PORT=$((5174+offset)).
 #   - Task file copied verbatim to <worktree>/ORCHESTRATOR_TASK.md.
-#   - The main repo's codebase-search index (if any) is copied into the
-#     worktree (the index is gitignored, so `git worktree add` never brings
-#     it; without this a fresh worktree would report "not indexed" and
-#     every worker would fall back to blind read_file/grep exploration).
+#   - The codebase-search index + mode-models.json/permissions.json are NOT
+#     seeded anymore: they live in the CENTRAL per-project data store
+#     (~/.local/share/headlesscode/projects/<key>/ — see src/project-store.ts),
+#     keyed by the repo's git-common-dir, so every worktree resolves the SAME
+#     store with zero per-directory setup. The no-index guardrail below checks
+#     that central location (not <repo>/.headlesscode/).
 #   - Stdout is the progress log.
 #
 # What replaced the GUI block (airunner lines ~144-162: `code "$wt_path"`,
@@ -47,23 +49,26 @@
 #                        passed explicitly). The orchestrator's --max-iterations
 #                        sets this in the spawn env.
 #   SPAWN_MODEL          explicit model override for EVERY worker (like an
-#                        --model flag: beats .headlesscode/mode-models.json
-#                        entries; default: unset, each worker's mode resolves
-#                        its own model from <repo>/.headlesscode/mode-models.json
-#                        via src/config/mode-models.ts, falling back to
-#                        $OPENROUTER_MODEL which then flows to run-worker.sh)
+#                        --model flag: beats the central store's
+#                        mode-models.json entries; default: unset, each
+#                        worker's mode resolves its own model from the CENTRAL
+#                        project store's mode-models.json
+#                        (~/.local/share/headlesscode/projects/<key>/ — see
+#                        src/project-store.ts) via src/config/mode-models.ts,
+#                        falling back to $OPENROUTER_MODEL which then flows
+#                        to run-worker.sh)
 #   ALLOW_UNINDEXED      when set (e.g. ALLOW_UNINDEXED=1), a missing
-#                        main-repo codebase-search index is only a warning and
-#                        worktrees spawn unindexed. When UNSET (default) a
-#                        missing index is a HARD failure: the whole spawn
-#                        aborts before creating any worktree.
+#                        codebase-search index in the central store is only a
+#                        warning and worktrees spawn unindexed. When UNSET
+#                        (default) a missing index is a HARD failure: the
+#                        whole spawn aborts before creating any worktree.
 #   HEADLESSCODE_AUTO_INDEX  when set (e.g. HEADLESSCODE_AUTO_INDEX=1), a
-#                        missing main-repo index is built FIRST via
-#                        `headlesscode index --workspace <repo>` before the
-#                        first spawn (the built index then seeds every
-#                        worktree). Costs real cloud-embedding money, so it is
-#                        strictly opt-in — never automatic, never silent.
-#                        Takes precedence over the ALLOW_UNINDEXED failure.
+#                        missing index is built FIRST via
+#                        `headlesscode index --workspace <repo>` (it lands in
+#                        the central store, shared by every worktree). Costs
+#                        real cloud-embedding money, so it is strictly opt-in
+#                        — never automatic, never silent. Takes precedence
+#                        over the ALLOW_UNINDEXED failure.
 #
 # Requires: node >= 18 (used only to merge the state JSON + resolve the
 # per-mode model — the harness is a node project, so this is not a new
@@ -88,18 +93,31 @@ fi
 REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
 
 # ── No-index guardrail ────────────────────────────────────────────────────────
-# A fresh worktree never has a codebase-search index (it's gitignored, so
-# `git worktree add` never brings it), so without this check every worker
-# starts at "not indexed" and falls back to blind read_file/grep walks — the
-# exact slowness this round fixes. Default: hard-fail the whole spawn BEFORE
-# creating any worktree. Escapes (see header):
+# The codebase-search index lives in the CENTRAL per-project data store
+# (~/.local/share/headlesscode/projects/<key>/codesearch/index.jsonl — see
+# src/project-store.ts), keyed by the repo's git-common-dir so every worktree
+# shares it with zero seeding. Without this check a spawn would start every
+# worker at "not indexed" with no way to know — blind read_file/grep walks,
+# the exact slowness this round fixes. Default: hard-fail the whole spawn
+# BEFORE creating any worktree. Escapes (see header):
 #   ALLOW_UNINDEXED=1          keep the historical warning-and-continue
 #   HEADLESSCODE_AUTO_INDEX=1  build the index first (opt-in; costs real
 #                              cloud-embedding money via `headlesscode index`)
-INDEX_FILE="$REPO_ROOT/.headlesscode/codesearch/index.jsonl"
+# Resolve the central index path via the REAL TypeScript logic
+# (src/index-util.ts, indexFilePathFor) — never a bash reimplementation.
+central_index_file() {
+    (
+        cd "$HARNESS_ROOT"
+        npx tsx -e '
+            import { indexFilePathFor } from "./src/index-util.ts"
+            process.stdout.write(indexFilePathFor(process.argv[1]))
+        ' "$REPO_ROOT"
+    )
+}
+INDEX_FILE="$(central_index_file)"
 if [ ! -f "$INDEX_FILE" ] || [ ! -s "$INDEX_FILE" ]; then
     if [ -n "${HEADLESSCODE_AUTO_INDEX:-}" ]; then
-        echo "No codebase-search index in main repo — building it now (HEADLESSCODE_AUTO_INDEX=1):"
+        echo "No codebase-search index in the central store — building it now (HEADLESSCODE_AUTO_INDEX=1):"
         echo "  headlesscode index --workspace $REPO_ROOT"
         CLI="${HEADLESSCODE_CLI:-npx tsx src/cli.ts}"
         (cd "$HARNESS_ROOT" && $CLI index --workspace "$REPO_ROOT")
@@ -154,12 +172,14 @@ merge_state() {
 # Resolve the OpenRouter model id for a worktree's harness mode via the REAL
 # TypeScript logic (src/config/mode-models.ts, resolveModelForMode) — never a
 # bash reimplementation. Precedence (documented in mode-models.ts): an
-# explicit SPAWN_MODEL override -> <repo>/.headlesscode/mode-models.json[mode]
-# -> ...["_default"] -> $OPENROUTER_MODEL -> empty (the CLI's own default).
+# explicit SPAWN_MODEL override -> the CENTRAL project store's
+# mode-models.json[mode] -> ...["_default"] -> $OPENROUTER_MODEL -> empty (the
+# CLI's own default).
 #
-# The config is read from $REPO_ROOT, NOT the worktree: a fresh `git worktree
-# add` does not copy .headlesscode/ into the worktree (it is gitignored in the
-# harness repo), so only the real repo's copy is guaranteed to exist.
+# The config lives in the central store keyed by $REPO_ROOT's git-common-dir
+# (src/project-store.ts) — resolved from $REPO_ROOT, and every worktree of the
+# repo resolves the same store automatically, so there is NO per-worktree
+# seeding to do here anymore.
 #
 # Prints the resolved model id on stdout (possibly empty); exits non-zero on
 # any error so a broken mode-models.json fails loudly instead of silently
@@ -238,37 +258,12 @@ for spec in "$@"; do
         ln -s ../../zoo-code "$wt_path/zoo-code"
     fi
 
-    # Codebase-search index: same gitignore story as zoo-code/ — the index
-    # (typically ~100MB+ for this repo) is never committed, so a fresh
-    # worktree has none and codebase_search would report "not indexed".
-    # Copy the main checkout's index (if any) so this worktree's workers
-    # start with a usable index instead of silently falling back to blind
-    # read_file/grep exploration. A symlink would break as soon as the
-    # main repo rebuilds its index (replacing the file, not editing it).
-    # A fresh copy is a few seconds of disk I/O per worktree — acceptable.
-    if [ -f "$REPO_ROOT/.headlesscode/codesearch/index.jsonl" ] &&
-        [ -s "$REPO_ROOT/.headlesscode/codesearch/index.jsonl" ] &&
-        [ ! -e "$wt_path/.headlesscode/codesearch/index.jsonl" ]; then
-        mkdir -p "$wt_path/.headlesscode/codesearch"
-        cp "$REPO_ROOT/.headlesscode/codesearch/index.jsonl" \
-            "$wt_path/.headlesscode/codesearch/index.jsonl"
-        echo "  Seeded codebase-search index from main repo ($(du -h "$wt_path/.headlesscode/codesearch/index.jsonl" | cut -f1))"
-    else
-        echo "  No codebase-search index in main repo — worktree starts unindexed (run 'headlesscode index --workspace .' in the main repo to enable codebase_search)."
-    fi
-
-    # Per-workspace config files (mode-models.json, permissions.json): same
-    # gitignore story as the index — a fresh worktree never has them, and a
-    # worker resolves its models (incl. the `_condensation` cheap model) and
-    # permissions from <worktree>/.headlesscode/. A worker without
-    # mode-models.json silently runs condensation on the full session model.
-    for cfg in "$REPO_ROOT"/.headlesscode/mode-models.json "$REPO_ROOT"/.headlesscode/permissions.json; do
-        if [ -f "$cfg" ] && [ ! -e "$wt_path/.headlesscode/$(basename "$cfg")" ]; then
-            mkdir -p "$wt_path/.headlesscode"
-            cp "$cfg" "$wt_path/.headlesscode/$(basename "$cfg")"
-            echo "  Seeded $(basename "$cfg") from main repo"
-        fi
-    done
+    # No index / mode-models / permissions seeding here anymore: all of that
+    # state lives in the CENTRAL per-project data store
+    # (~/.local/share/headlesscode/projects/<key>/ — see src/project-store.ts),
+    # keyed by the repo's git-common-dir. This worktree (and every other one)
+    # resolves that same store automatically — copying would be redundant and
+    # the manual per-worktree seeding this block existed for is gone.
 
     # Compute unique ports for this worktree.
     # +1 base so offset=0 never collides with the main repo's own

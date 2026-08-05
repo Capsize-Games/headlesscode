@@ -270,7 +270,7 @@ async function testBuildPersistsRoundedEmbeddings(): Promise<void> {
 			}
 		}
 
-		const raw = await fs.readFile(path.join(ws, ".headlesscode", "codesearch", "index.jsonl"), "utf-8")
+		const raw = await fs.readFile(indexFilePath(ws), "utf-8")
 		assert.ok(raw.includes("0.012346"), "rounded value (0.0123456789… → 0.012346) on disk")
 		assert.ok(!raw.includes("0.012345678901234567"), "full-precision float must NOT be stored")
 	} finally {
@@ -289,16 +289,25 @@ const tests: Array<[string, () => Promise<void>]> = [
 ]
 
 async function main(): Promise<void> {
+	// Redirect the central store to a temp dir so build/read never touch the
+	// real home directory's store.
+	const storeTmp = await fs.mkdtemp(path.join(os.tmpdir(), "hc-idx-store-"))
+	process.env.HEADLESSCODE_DATA_DIR = storeTmp
 	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
+	try {
+		for (const [name, fn] of tests) {
+			try {
+				await fn()
+				console.log(`  ok   ${name}`)
+			} catch (err) {
+				failed++
+				console.error(`  FAIL ${name}`)
+				console.error(err instanceof Error ? err.stack ?? err.message : String(err))
+			}
 		}
+	} finally {
+		delete process.env.HEADLESSCODE_DATA_DIR
+		await fs.rm(storeTmp, { recursive: true, force: true })
 	}
 	if (failed > 0) {
 		console.error(`\n${failed} test(s) failed`)

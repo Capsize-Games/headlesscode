@@ -26,6 +26,7 @@
  */
 
 import { spawnSync } from "node:child_process"
+import * as fs from "node:fs"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -328,6 +329,23 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 	let spawned = 0
 	let failures = 0
 
+	// Naming collision avoidance (mirrors orchestrator/cli.ts's orchestrate
+	// path): seed from whatever `.worktrees/wN` dirs already exist — a
+	// still-running `orchestrate` round, or an earlier sweep this same
+	// process — then reserve each issue's assigned names as we go, so two
+	// issues spawned in the SAME sweep never both land on w1 either.
+	let occupiedNames: Set<string>
+	try {
+		occupiedNames = new Set(
+			fs
+				.readdirSync(path.join(repoRoot, ".worktrees"), { withFileTypes: true })
+				.filter((d) => d.isDirectory())
+				.map((d) => d.name),
+		)
+	} catch {
+		occupiedNames = new Set()
+	}
+
 	// Record deferred issues as "pending" so the next sweep picks them up
 	// (persisted by the per-issue saves below, or the final save). Dry-run
 	// writes nothing.
@@ -338,7 +356,10 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 	}
 
 	for (const issue of toSpawn) {
-		const specs = splitIssues([issue])
+		const specs = splitIssues([issue], { occupiedNames })
+		for (const spec of specs) {
+			occupiedNames.add(spec.name)
+		}
 		if (dryRun) {
 			dryRunPlan!.push({ issue, specs })
 			continue

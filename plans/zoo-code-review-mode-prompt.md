@@ -129,3 +129,23 @@ Post a short summary comment on the PR itself (not just per-issue)
 listing: which issues you verified clean, which you reopened and why,
 and the final baseline test numbers you personally confirmed. Do not
 merge anything yourself.
+
+## Required final line of your attempt_completion result
+
+The orchestrator does not read your prose to decide whether to trigger
+a rework cycle — free-form parsing of report language proved unreliable
+in practice (ordinary phrases like baseline "N failed" counts, or an
+aside explaining something does NOT need reopening, were repeatedly
+misread as a finding). Instead, the VERY LAST LINE of your
+attempt_completion result must be exactly one of:
+
+```
+VERDICT: CLEAN
+VERDICT: FINDING
+```
+
+Nothing else on that line — no prose, no punctuation, no markdown. Use
+FINDING if you reopened ANY issue in this round, CLEAN only if none
+needed reopening. Everything above that line (the per-issue comments,
+the PR summary, your reasoning) is for a human reader and can be as
+detailed as you judge useful — only this last line is machine-parsed.

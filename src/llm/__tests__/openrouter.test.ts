@@ -174,6 +174,104 @@ async function testFetchModelContextWindowRetriesTransientFailure(): Promise<voi
 	}
 }
 
+// ─── fetchModelPricing (Part E: live pricing from the same endpoints response) ─
+
+async function testFetchModelPricingPrefersPinnedProvider(): Promise<void> {
+	// deepseek/* pins routing to the official endpoint — the live price must
+	// be THAT endpoint's numbers, not a cheaper third-party host's.
+	const { OpenRouterClient } = await import("../openrouter.js")
+	const client = new OpenRouterClient({ apiKey: "k", baseUrl: "http://mock" })
+	const originalFetch = globalThis.fetch
+	globalThis.fetch = (async () =>
+		new Response(
+			JSON.stringify({
+				data: {
+					id: "deepseek/deepseek-v4-flash",
+					endpoints: [
+						{
+							provider_name: "DeepInfra",
+							context_length: 131072,
+							pricing: { prompt: "0.00000009", completion: "0.00000018", input_cache_read: "0.000000018" },
+						},
+						{
+							provider_name: "DeepSeek",
+							context_length: 1048576,
+							pricing: { prompt: "0.00000014", completion: "0.00000028", input_cache_read: "0.0000000028" },
+						},
+					],
+				},
+			}),
+			{ status: 200, headers: { "Content-Type": "application/json" } },
+		)) as typeof fetch
+	try {
+		const price = await client.fetchModelPricing("deepseek/deepseek-v4-flash")
+		assert.ok(price, "a live price is resolved")
+		assert.ok(Math.abs(price.input - 0.14) < 1e-9, `official DeepSeek prompt price wins, got $${price.input}`)
+		assert.ok(Math.abs(price.output - 0.28) < 1e-9, `official DeepSeek completion price wins, got $${price.output}`)
+		assert.ok(Math.abs(price.cacheRead! - 0.0028) < 1e-9, `official DeepSeek cacheRead wins, got $${price.cacheRead}`)
+	} finally {
+		globalThis.fetch = originalFetch
+	}
+}
+
+async function testFetchModelPricingFailOpen(): Promise<void> {
+	// 404/unknown model → undefined, so the caller falls back to the
+	// hardcoded table exactly as before live pricing existed.
+	const { OpenRouterClient } = await import("../openrouter.js")
+	const client = new OpenRouterClient({ apiKey: "k", baseUrl: "http://mock" })
+	const originalFetch = globalThis.fetch
+	globalThis.fetch = (async () => new Response("not found", { status: 404 })) as typeof fetch
+	try {
+		assert.equal(await client.fetchModelPricing("nope/model"), undefined)
+	} finally {
+		globalThis.fetch = originalFetch
+	}
+	// No pricing fields on the endpoints → undefined.
+	globalThis.fetch = (async () =>
+		new Response(
+			JSON.stringify({ data: { id: "m/m", endpoints: [{ provider_name: "HostA", context_length: 131072 }] } }),
+			{ status: 200, headers: { "Content-Type": "application/json" } },
+		)) as typeof fetch
+	try {
+		assert.equal(await client.fetchModelPricing("m/m"), undefined)
+	} finally {
+		globalThis.fetch = originalFetch
+	}
+	const noKey = new OpenRouterClient({ baseUrl: "http://mock" })
+	assert.equal(await noKey.fetchModelPricing("deepseek/deepseek-v4-flash"), undefined)
+}
+
+async function testFetchModelInfoSharesOneFetch(): Promise<void> {
+	// fetchModelInfo returns context window AND price from the same response —
+	// a session pays for exactly ONE lookup, not two.
+	const { OpenRouterClient } = await import("../openrouter.js")
+	const client = new OpenRouterClient({ apiKey: "k", baseUrl: "http://mock" })
+	const originalFetch = globalThis.fetch
+	let calls = 0
+	globalThis.fetch = (async () => {
+		calls++
+		return new Response(
+			JSON.stringify({
+				data: {
+					id: "some/model",
+					endpoints: [
+						{ provider_name: "HostA", context_length: 262144, pricing: { prompt: "0.0000002", completion: "0.0000006" } },
+					],
+				},
+			}),
+			{ status: 200, headers: { "Content-Type": "application/json" } },
+		)
+	}) as typeof fetch
+	try {
+		const info = await client.fetchModelInfo("some/model")
+		assert.equal(calls, 1, "exactly one HTTP call")
+		assert.equal(info?.contextWindow, 262144, "context window from the same response")
+		assert.ok(Math.abs(info?.price?.input! - 0.2) < 1e-9, "price from the same response")
+	} finally {
+		globalThis.fetch = originalFetch
+	}
+}
+
 // ─── Reasoning capture (streaming-and-reasoning, part 1) ────────────────────
 
 async function testDeepseekRequestIncludesReasoning(): Promise<void> {
@@ -432,6 +530,9 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["fetchModelContextWindow: accepts the legacy array shape", testFetchModelContextWindowAcceptsLegacyArrayShape],
 	["fetchModelContextWindow: retries transient failures, not 404s", testFetchModelContextWindowRetriesTransientFailure],
 	["fetchModelContextWindow: undefined on failure / missing key", testFetchModelContextWindowReturnsUndefinedOnFailure],
+	["fetchModelPricing: pinned provider's endpoint price wins", testFetchModelPricingPrefersPinnedProvider],
+	["fetchModelPricing: fail-open (404/no-pricing/no-key) → undefined", testFetchModelPricingFailOpen],
+	["fetchModelInfo: one fetch resolves window AND price together", testFetchModelInfoSharesOneFetch],
 ]
 
 async function main(): Promise<void> {

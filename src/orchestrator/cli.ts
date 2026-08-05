@@ -29,19 +29,20 @@ import { splitIssues, type SplitIssue, type WorktreeSpec } from "./split.js"
 import {
 	loadState,
 	loadStateSync,
+	patchGroup,
 	saveState,
 	saveStateSync,
-	updateGroup,
 	type OrchestratorGroup,
 	type OrchestratorState,
 } from "./state.js"
 import { runReview, type ReviewResult } from "./reviewer.js"
+import { analyzeWorktreeSessions } from "./log-analysis.js"
 import { runQa } from "../qa/qa.js"
-import { groupWorktreePath, isIterationExhaustion, watchGroups } from "./watch.js"
-import { checkAndNoteHeadlesscodeDir } from "../index-util.js"
+import { groupWorktreePath, isIterationExhaustion, isPidAlive, watchGroups } from "./watch.js"
 import {
 	buildStatusSummary,
 	formatStatusText,
+	isTerminalStatus,
 	reconcileGroups,
 	verdictLine,
 	waitForTerminalState,
@@ -49,6 +50,7 @@ import {
 	DEFAULT_STATUS_TIMEOUT_MS,
 	type StatusSummary,
 } from "./status.js"
+import { assessGroupCleanupSync, cleanupMain, resolveBaseBranch, type CleanupStatus } from "./cleanup.js"
 import { resolveModelForMode } from "../config/mode-models.js"
 import { runPreflight, type PreflightResult } from "../llm/preflight.js"
 
@@ -455,6 +457,11 @@ export function buildTaskFileContent(spec: WorktreeSpec, issues: SplitIssue[]): 
 		"- Never delete a public name without grepping the ENTIRE codebase for every importer — including",
 		"  string-literal references (dispatch tables, getattr-by-name) and test files that import for",
 		"  side effects (pytest fixtures, registration).",
+		"- If you split a module into submodules, verify EVERY public name the original module exposed is",
+		"  still re-exported from the package's __init__.py (or equivalent) before closing — a missed",
+		"  re-export is a common, easy-to-miss defect a reviewer WILL catch, costing a full rework cycle.",
+		"  If the project has a re-export-checking script (e.g. scripts/check_re_exports.py), run it now,",
+		"  not just after a reviewer flags the miss.",
 		"- Re-run real checks (tests, boot) after every change and paste the real output in your report —",
 		"  output in a report is a claim, not evidence, until reproduced.",
 		"- If you find yourself repeating the same check across issues, script it under scripts/.",
@@ -783,6 +790,12 @@ export function handleReviewVerdict(
 				stalled: undefined,
 				exit_code: undefined,
 				summary: undefined,
+				// Must also clear cost_recorded: the rework worker adds MORE real
+				// cost on this worktree, and recordCostIfSettled's one-shot gate
+				// would otherwise silently skip re-recording the combined total
+				// once this cycle re-settles — a real bug caught while manually
+				// recovering a stuck round (see cost-history.ts).
+				cost_recorded: undefined,
 				last_activity: {
 					note: `rework cycle ${newReworkCount}: re-spawned worker on the same worktree to fix review findings`,
 				},
@@ -894,6 +907,9 @@ export function handleIterationExhaustion(
 				stalled: undefined,
 				exit_code: undefined,
 				summary: undefined,
+				// Must also clear cost_recorded — see the identical note in
+				// handleReviewVerdict's patch above.
+				cost_recorded: undefined,
 				last_activity: {
 					note: `continuation ${newContinuationCount}: previous session hit the iteration cap; re-spawned worker on the same worktree`,
 				},
@@ -1235,6 +1251,39 @@ async function runGroupTerminalHook(cmd: string, group: OrchestratorGroup, write
 }
 
 /**
+	* Attach the cleanup-eligibility column to every TERMINAL group's status row
+	* (read-only, no side effects — the same gates the cleanup command uses,
+	* minus the GitHub PR network check). Returns the per-group map for --json.
+	* Never throws: on any failure the group is reported blocked with a reason,
+	* matching cleanup's fail-closed model.
+	*/
+function attachCleanupStatus(repo: string, state: OrchestratorState, summary: StatusSummary): Record<string, CleanupStatus> {
+	let baseBranch: string | undefined
+	try {
+		baseBranch = resolveBaseBranch(repo)
+	} catch {
+		baseBranch = undefined
+	}
+	const byGroup: Record<string, CleanupStatus> = {}
+	for (const row of summary.groups) {
+		if (!isTerminalStatus(row.status)) {
+			continue // non-terminal groups are never touched by cleanup
+		}
+		const group = state.groups.find((g) => g.name === row.name)
+		if (!group) {
+			continue
+		}
+		const cleanup: CleanupStatus =
+			baseBranch === undefined
+				? { status: "blocked", reason: "cannot resolve base branch (detached HEAD?) — pass --base to cleanup" }
+				: assessGroupCleanupSync(repo, group, baseBranch)
+		row.cleanup = cleanup
+		byGroup[row.name] = cleanup
+	}
+	return byGroup
+}
+
+/**
 	* `headlesscode orchestrate status` entry point. One call, one result: the
 	* calling agent never re-invokes a tool per poll, unlike the bash loop this
 	* replaces. Both forms reconcile stale state against real worktree markers
@@ -1285,6 +1334,7 @@ export async function statusMain(argv: string[], io: StatusIo = {}): Promise<num
 		})
 		const summary = buildStatusSummary(result.state)
 		const verdict = verdictLine(summary, result.timedOut, result.allDone)
+		const cleanupByGroup = attachCleanupStatus(repo, result.state, summary)
 		if (options.json) {
 			const out: Record<string, unknown> = {
 				...result.state,
@@ -1294,6 +1344,9 @@ export async function statusMain(argv: string[], io: StatusIo = {}): Promise<num
 			}
 			if (result.reconciled.length > 0) {
 				out.reconciled = result.reconciled
+			}
+			if (Object.keys(cleanupByGroup).length > 0) {
+				out.cleanup = cleanupByGroup
 			}
 			writeOut(JSON.stringify(out, null, 2) + "\n")
 		} else {
@@ -1328,10 +1381,14 @@ export async function statusMain(argv: string[], io: StatusIo = {}): Promise<num
 		state = reconciliation.state
 	}
 	const summary = buildStatusSummary(state)
+	const cleanupByGroup = attachCleanupStatus(repo, state, summary)
 	if (options.json) {
 		const out: Record<string, unknown> = { ...state }
 		if (reconciliation.reconciled.length > 0) {
 			out.reconciled = reconciliation.reconciled
+		}
+		if (Object.keys(cleanupByGroup).length > 0) {
+			out.cleanup = cleanupByGroup
 		}
 		writeOut(JSON.stringify(out, null, 2) + "\n")
 	} else {
@@ -1344,9 +1401,14 @@ export async function statusMain(argv: string[], io: StatusIo = {}): Promise<num
 
 export async function orchestrateMain(argv: string[]): Promise<number> {
 	// Subcommand dispatch: `headlesscode orchestrate status ...` is the
-	// read-side status/wait command; everything else is the spawn+watch round.
+	// read-side status/wait command; `orchestrate cleanup ...` is the
+	// human-triggered post-merge worktree cleanup; everything else is the
+	// spawn+watch round.
 	if (argv[0] === "status") {
 		return statusMain(argv.slice(1))
+	}
+	if (argv[0] === "cleanup") {
+		return cleanupMain(argv.slice(1))
 	}
 	const { options, error } = parseOrchestrateArgs(argv)
 	if (error) {
@@ -1370,10 +1432,6 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		return 2
 	}
 
-	// P1.7: clarify that per-workspace state (index, mode-models.json) lives
-	// in the workspace's own `.headlesscode/`, not the global `~/.headlesscode/`.
-	checkAndNoteHeadlesscodeDir(repo)
-
 	let issues: SplitIssue[]
 	try {
 		issues = loadIssues(options)
@@ -1382,24 +1440,64 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		return 2
 	}
 
-	const specs = splitIssues(issues)
+	// Naming collision avoidance: a still-running round in the same repo
+	// already occupies some `.worktrees/wN` dirs. Scan them and let
+	// splitIssues name this round's groups around the gap instead of always
+	// starting at w1 and colliding — see split.ts's occupiedNames param. Two
+	// concurrent `orchestrate` invocations against the same repo can now
+	// share it instead of the second one hard-failing on a "stale" worktree
+	// that was actually just in-flight, not stale.
+	let occupiedNames: Set<string> = new Set()
+	try {
+		occupiedNames = new Set(
+			fs
+				.readdirSync(path.join(repo, ".worktrees"), { withFileTypes: true })
+				.filter((d) => d.isDirectory())
+				.map((d) => d.name),
+		)
+	} catch {
+		// No .worktrees dir yet — nothing occupied.
+	}
+	const specs = splitIssues(issues, { occupiedNames })
 
-	// Pre-spawn collision check: a leftover worktree dir from a previous
-	// round means the caller must clean it up FIRST — fail loudly before
-	// spawning anything (and before the --dry-run early-exit, so dry runs
-	// catch stale worktrees too). scripts/spawn-parallel-worktrees.sh exits
-	// 1 on the same collision as defense in depth, but this check runs
-	// before any task files are written or groups are recorded, so a
-	// skipped-at-spawn group can never be silently dropped again.
+	// Pre-spawn collision check: defense in depth only now that naming skips
+	// occupied slots above — this should not fire in the normal case. It
+	// still catches races (a worktree appearing between the scan above and
+	// spawn) and fails loudly before spawning anything or writing task
+	// files/state, so a skipped-at-spawn group can never be silently dropped.
+	//
+	// Liveness-aware (a real production incident, not hypothetical): a
+	// generic "stale worktree" message previously read as an invitation to
+	// manually `rm -rf`/`git worktree remove` the path — which, when the
+	// worktree actually belonged to a still-running worker, destroyed live
+	// session state mid-run and wasted real API spend, repeatedly, across
+	// one dispatch session. Distinguish "still running" from "leftover" via
+	// the SAME `.harness.pid` liveness check the watcher's own stall guard
+	// uses (isPidAlive), and steer toward `orchestrate cleanup --apply`
+	// specifically — NOT raw `git worktree remove`, which refuses on any
+	// untracked file and can leave a stray `.headlesscode/` behind that
+	// re-trips this exact check on the next attempt; `cleanup --apply`
+	// removes harness artifacts (including `.headlesscode/`) BEFORE calling
+	// `git worktree remove`, precisely to avoid that residue (see
+	// cleanup.ts's removeHarnessArtifacts).
 	const staleWorktrees = specs
 		.map((spec) => path.join(repo, ".worktrees", spec.name))
 		.filter((wtPath) => fs.existsSync(wtPath))
 	if (staleWorktrees.length > 0) {
+		const details = staleWorktrees
+			.map((wtPath) => {
+				const rel = path.relative(repo, wtPath)
+				return isPidAlive(wtPath) ? `${rel} (round IN PROGRESS — live pid)` : `${rel} (no live pid — likely leftover)`
+			})
+			.join(", ")
 		process.stderr.write(
-			`headlesscode orchestrate: stale worktree(s) found: ${staleWorktrees
-				.map((p) => path.relative(repo, p))
-				.join(", ")}. ` +
-				`Remove them first (git worktree remove <path>) then retry.\n`,
+			`headlesscode orchestrate: worktree collision found: ${details}. ` +
+				`If any are marked "round IN PROGRESS", do NOT delete them — that destroys a live session's state and spend. ` +
+				`Retry once it finishes, or investigate with "headlesscode orchestrate status --repo ${repo}". ` +
+				`For genuinely leftover worktrees, use "headlesscode orchestrate cleanup --repo ${repo} --apply" ` +
+				`(only removes worktrees whose branch is verified merged, and clears .headlesscode/ before ` +
+				`"git worktree remove" so it can't leave residue behind) — avoid raw "git worktree remove"/"rm -rf", ` +
+				`which can leave a stray .headlesscode/ dir that re-trips this same check next time.\n`,
 		)
 		return 1
 	}
@@ -1576,7 +1674,9 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		repoRoot: repo,
 		statePath,
 		pollIntervalMs: options.pollIntervalMs,
-		onGroupUpdate: async (group, currentState) => {
+		reviewEnabled: options.review,
+		qaEnabled: options.qa,
+		onGroupUpdate: async (group) => {
 			// Auto-continue on iteration-exhaustion (issue #2 Part 2): a worker
 			// that failed ONLY because it hit --max-iterations gets a fresh
 			// session on the SAME worktree (the partial state is on disk), up
@@ -1618,31 +1718,30 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 							`[orchestrate] continuation spawn for ${group.name} failed (exit ${spawnResult.status}); ` +
 								`marking group needs-human\n`,
 						)
-						// Merge onto the watcher's CURRENT state (not the outer
-						// snapshot, which predates this group's failed patch and
-						// other groups' transitions) — same reasoning as the
-						// review patch below.
-						state = updateGroup(currentState, group.name, {
+						// patchGroup reloads the state file fresh immediately
+						// before merging (under a write lock) rather than basing
+						// the merge on `currentState` — a stale snapshot that may
+						// predate other groups' concurrent writes now that
+						// review/QA for multiple groups can run in parallel
+						// (issue #24).
+						await patchGroup(statePath, group.name, {
 							status: "needs-human",
 							continuationCount: decision.newContinuationCount,
 							last_activity: {
 								note: `continuation spawn failed after ${decision.newContinuationCount} attempt(s); needs human`,
 							},
 						})
-						await saveState(statePath, state)
 					} else {
 						// Spawn succeeded: reset the group so the watcher re-polls
 						// it as "running" → "done/failed" → re-continued exactly
 						// like a first attempt.
-						state = updateGroup(currentState, group.name, decision.patch)
-						await saveState(statePath, state)
+						await patchGroup(statePath, group.name, decision.patch)
 					}
 					return true
 				}
 				if (decision.patch.status === "needs-human") {
 					// Continuation cap reached: terminal "needs-human" outcome.
-					state = updateGroup(currentState, group.name, decision.patch)
-					await saveState(statePath, state)
+					await patchGroup(statePath, group.name, decision.patch)
 					process.stderr.write(
 						`[orchestrate] NEEDS-HUMAN: ${group.name} exhausted ${decision.newContinuationCount} continuation ` +
 							`attempt(s) and still hits the iteration cap — a human must look at this worktree.\n`,
@@ -1652,6 +1751,40 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 				// Real failure (not iteration exhaustion): stays failed.
 				return
 			}
+
+			// Deterministic post-hoc log analysis: runs once per group as soon
+			// as it reaches "done", unconditionally (no --review/--qa gate, no
+			// LLM cost) — the same tool-call/error/stall/repeated-command
+			// findings a human would otherwise get by hand-reading harness.log
+			// + events.jsonl. Never blocks review/QA below; a failure here is
+			// logged and swallowed.
+			if (group.status === "done" && group.log_analysis === undefined) {
+				try {
+					const analysis = await analyzeWorktreeSessions(groupWorktreePath(repo, group))
+					const patch = {
+						log_analysis: analysis
+							? {
+									findings: analysis.findings,
+									toolCallCounts: analysis.toolCallCounts,
+									toolErrorCounts: analysis.toolErrorCounts,
+									analyzedAt: new Date().toISOString(),
+								}
+							: (false as const),
+					}
+					await patchGroup(statePath, group.name, patch)
+					if (analysis && analysis.findings.length > 0) {
+						process.stdout.write(
+							`[orchestrate] ${group.name} log analysis: ${analysis.findings.length} finding(s):\n` +
+								analysis.findings.map((f) => `    - ${f}\n`).join(""),
+						)
+					}
+				} catch (err) {
+					process.stderr.write(
+						`[orchestrate] log analysis of ${group.name} failed: ${err instanceof Error ? err.message : String(err)}\n`,
+					)
+				}
+			}
+
 			if (!options.review) {
 				return
 			}
@@ -1673,11 +1806,7 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 						note: `reviewed: verdict=${result.verdict} (${result.findings.length} finding(s))`,
 					},
 				}
-				// Merge into the watcher's current state (not the outer snapshot,
-				// which may predate the group's transition to done) so the status
-				// written by watchGroups is never clobbered back to an older value.
-				state = updateGroup(currentState, group.name, patch)
-				await saveState(statePath, state)
+				await patchGroup(statePath, group.name, patch)
 				process.stdout.write(
 					`[orchestrate] ${group.name} review verdict: ${result.verdict} (${result.findings.length} finding(s))\n`,
 				)
@@ -1722,26 +1851,23 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 								`[orchestrate] rework worker spawn for ${group.name} failed (exit ${spawnResult.status}); ` +
 									`marking group needs-human\n`,
 							)
-							state = updateGroup(state, group.name, {
+							await patchGroup(statePath, group.name, {
 								status: "needs-human",
 								reworkCount: decision.newReworkCount,
 								last_activity: {
 									note: `rework spawn failed after ${decision.newReworkCount} attempt(s); needs human`,
 								},
 							})
-							await saveState(statePath, state)
 						} else {
 							// Spawn succeeded: reset the group so the watcher
 							// re-polls it as "running" → "done" → re-reviewed.
-							state = updateGroup(state, group.name, decision.patch)
-							await saveState(statePath, state)
+							await patchGroup(statePath, group.name, decision.patch)
 						}
 						return true
 					}
 					// Cap reached: terminal "needs-human" outcome. Findings stay
 					// recorded so a human can see exactly what the reviewer flagged.
-					state = updateGroup(state, group.name, decision.patch)
-					await saveState(statePath, state)
+					await patchGroup(statePath, group.name, decision.patch)
 					process.stderr.write(
 						`[orchestrate] NEEDS-HUMAN: ${group.name} exhausted ${decision.newReworkCount} rework ` +
 							`attempt(s) and the review still has findings — a human must look at this worktree.\n`,
@@ -1765,8 +1891,11 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 				return
 			}
 			// The callback's `group` is the pre-review snapshot; the review
-			// verdict lives in the state we just persisted, so read it fresh.
-			const updatedGroup = state.groups.find((g) => g.name === group.name)
+			// verdict lives in the state file we just persisted via patchGroup,
+			// so read it fresh from disk rather than any in-memory copy —
+			// review/QA for other groups can be writing concurrently now
+			// (issue #24), so a captured snapshot here could be stale.
+			const updatedGroup = loadStateSync(statePath).groups.find((g) => g.name === group.name)
 			const reviewPassed = !options.review || updatedGroup?.review_verdict === "clean"
 			if (!reviewPassed) {
 				return
@@ -1779,9 +1908,7 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 					model: qaModel,
 				})
 				const qaStatus = qaResult.verdict === "pass" ? "done" : "failed"
-				// Merge onto `state` (which already carries the review patch) —
-				// NOT `currentState`, which would clobber review_verdict on save.
-				state = updateGroup(state, group.name, {
+				await patchGroup(statePath, group.name, {
 					qa: {
 						status: qaStatus,
 						verdict: qaResult.verdict,
@@ -1792,7 +1919,6 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 						note: `QA: verdict=${qaResult.verdict}`,
 					},
 				})
-				await saveState(statePath, state)
 				process.stdout.write(
 					`[orchestrate] ${group.name} QA verdict: ${qaResult.verdict} (status ${qaStatus})\n`,
 				)

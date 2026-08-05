@@ -5,8 +5,10 @@
  *
  * Walks the workspace's real source files (git-aware, .gitignore-respecting),
  * chunks them, embeds ONLY the chunks whose content hash changed since the
- * last index (incremental — the cost-control mechanism), and writes
- * <workspace>/.headlesscode/codesearch/index.jsonl.
+ * last index (incremental — the cost-control mechanism), and writes the index
+ * into the CENTRAL per-project data store
+ * (~/.local/share/headlesscode/projects/<key>/codesearch/index.jsonl — see
+ * src/project-store.ts). Worktrees of a repo share that store automatically.
  *
  * Two embedding backends are supported:
  *   - openrouter (default) — cloud, `qwen/qwen3-embedding-4b`, costs real
@@ -34,7 +36,6 @@ import {
 } from "./embedder.js"
 import { buildIndex, indexFilePath } from "./index.js"
 import { estimateCost, priceFor } from "../budget/cost.js"
-import { checkAndNoteHeadlesscodeDir } from "../index-util.js"
 import { DEFAULT_OLLAMA_EMBEDDING_MODEL, OLLAMA_EMBEDDING_MODEL_ENV } from "./ollama-embedder.js"
 
 const INDEX_USAGE = `headlesscode index — build/refresh the codebase semantic-search index
@@ -59,11 +60,13 @@ Environment:
   HEADLESSCODE_OLLAMA_URL                 Ollama server URL (default http://localhost:11434)
   HEADLESSCODE_OLLAMA_EMBEDDING_MODEL     Ollama embedding model (default ${DEFAULT_OLLAMA_EMBEDDING_MODEL})
 
-This builds (or incrementally refreshes) the codebase-search index at
-<workspace>/.headlesscode/codesearch/index.jsonl used by the codebase_search
-tool. Chunks whose content hash is unchanged since the last index are skipped
-without re-embedding, so re-running after a small change only pays for the
-changed chunks.
+This builds (or incrementally refreshes) the codebase-search index used by the
+codebase_search tool. The index is stored in the CENTRAL per-project data store
+(~/.local/share/headlesscode/projects/<key>/codesearch/index.jsonl) — keyed by
+the repo's git-common-dir, so every worktree of a repo shares one index with
+zero per-directory setup. Chunks whose content hash is unchanged since the last
+index are skipped without re-embedding, so re-running after a small change only
+pays for the changed chunks.
 `
 
 interface IndexCliOptions {
@@ -136,10 +139,6 @@ export async function indexMain(argv: string[]): Promise<number> {
 
 	const workspaceRoot = path.resolve(options.workspace)
 	const backend = resolveEmbeddingBackend(process.env, options.embeddingBackend)
-
-	// P1.7: clarify that per-workspace state (this index) lives in the
-	// workspace's own `.headlesscode/`, not the global `~/.headlesscode/`.
-	checkAndNoteHeadlesscodeDir(workspaceRoot)
 
 	const embedder = createEmbedder(backend, { model: options.model }, process.env)
 	const modelForEnv = options.model?.trim() || process.env[OPENROUTER_EMBEDDING_MODEL_ENV]?.trim()

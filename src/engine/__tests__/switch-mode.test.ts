@@ -282,6 +282,39 @@ async function testHumanApprovalApprovesSwitch(): Promise<void> {
 	}
 }
 
+async function testProxyPrefixedApprovalApprovesSwitch(): Promise<void> {
+	// The decision-proxy writes answers as "[decision-proxy] <answer>" so the
+	// audit trail can distinguish them from human answers. The switch_mode
+	// gate must strip that prefix before its exact approve/deny match —
+	// otherwise a proxy-approved switch is misread as a denial.
+	const ws = await mkTmpWorkspace("hc-switchmode-proxy-")
+	try {
+		const client = new ScriptedLlmClient([
+			{ message: toolCall("switch_mode", { mode_slug: "ask", reason: "handoff" }) },
+			{ message: toolCall("attempt_completion", { result: "done" }) },
+		])
+		const session = await makeSession({
+			task: "switch modes",
+			client,
+			workspaceRoot: ws,
+			decisionTimeoutMs: 5_000,
+			decisionPollIntervalMs: 20,
+		})
+
+		const timer = setTimeout(() => {
+			void fs.writeFile(path.join(ws, DECISION_ANSWER), "[decision-proxy] approve\n", "utf-8").catch(() => {})
+		}, 60)
+
+		const result = await session.run()
+		clearTimeout(timer)
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(session.state.mode, "ask", "a [decision-proxy]-prefixed approve must take effect")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 async function testDenialRefusesSwitch(): Promise<void> {
 	const ws = await mkTmpWorkspace("hc-switchmode-deny-")
 	try {
@@ -494,6 +527,7 @@ async function testReadOnlyExecutorStillStubsSwitchMode(): Promise<void> {
 const tests: Array<[string, () => Promise<void>]> = [
 	["switch_mode: auto-approve switches mode in place (state, transcript marker, event, next LLM tool list)", testAutoApproveSwitchesModeInPlace],
 	["switch_mode: human 'approve' answer approves the switch (autoApproved: false, markers cleaned)", testHumanApprovalApprovesSwitch],
+	["switch_mode: '[decision-proxy] approve' (prefixed) still approves the switch", testProxyPrefixedApprovalApprovesSwitch],
 	["switch_mode: 'deny' answer refuses with a tool error, no state change, no marker", testDenialRefusesSwitch],
 	["switch_mode: timeout denies (fail closed) and cleans markers", testTimeoutDeniesSwitchAndCleansMarkers],
 	["switch_mode: unknown mode_slug fails immediately with no escalation", testUnknownModeSlugFailsImmediately],

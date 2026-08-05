@@ -21,7 +21,14 @@
 
 import assert from "node:assert/strict"
 
-import { selectToolsForMode } from "../prompt.js"
+import {
+	appendBrowserActionTool,
+	appendCodeIntelEditTools,
+	appendCodeIntelTools,
+	appendDescribeImageTool,
+	appendRunTestsTool,
+	selectToolsForMode,
+} from "../prompt.js"
 import type { ChatTool } from "../types.js"
 
 function findStrictModeViolations(tools: ChatTool[]): string[] {
@@ -52,6 +59,36 @@ async function testNoStrictModeViolationsInCodeMode(): Promise<void> {
 	)
 }
 
+/**
+ * The append* helpers add NON-vendored tools (browser_action, describe_image,
+ * code-intelligence incl. rename_symbol, run_tests) to a mode's tool list —
+ * the same strict-mode contract applies to them, so include them in the
+ * violation sweep alongside selectToolsForMode's output.
+ */
+function codeModeToolsWithAppendedTools(): ChatTool[] {
+	const base = selectToolsForMode("code", [])
+	return appendRunTestsTool(
+		appendCodeIntelEditTools(
+			appendCodeIntelTools(appendDescribeImageTool(appendBrowserActionTool(base))),
+		),
+	)
+}
+
+async function testNoStrictModeViolationsInAppendedTools(): Promise<void> {
+	const tools = codeModeToolsWithAppendedTools()
+	const violations = findStrictModeViolations(tools)
+	assert.deepEqual(
+		violations,
+		[],
+		`strict-mode schema violations in appended tools (will HTTP 400 against DeepSeek's official endpoint): ${violations.join("; ")}`,
+	)
+	// The new tools must actually be present (guards against a future wiring
+	// regression silently dropping them from the advertised set).
+	const names = tools.filter((t) => t.type === "function").map((t) => t.function.name)
+	assert.ok(names.includes("rename_symbol"), "rename_symbol must be advertised for code mode")
+	assert.ok(names.includes("run_tests"), "run_tests must be advertised for code mode")
+}
+
 async function testReadFileSpecificallyIsNotStrictModeBroken(): Promise<void> {
 	// The exact regression: read_file must either not be strict, or have
 	// every property required — either is fine, silently reintroducing the
@@ -72,6 +109,7 @@ async function testReadFileSpecificallyIsNotStrictModeBroken(): Promise<void> {
 
 const tests: Array<[string, () => Promise<void>]> = [
 	["no strict-mode schema violations across the code mode's full tool set", testNoStrictModeViolationsInCodeMode],
+	["no strict-mode schema violations in the appended (non-vendored) tools", testNoStrictModeViolationsInAppendedTools],
 	["read_file specifically: strict/required are consistent", testReadFileSpecificallyIsNotStrictModeBroken],
 ]
 

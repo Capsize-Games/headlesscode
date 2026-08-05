@@ -1,8 +1,9 @@
 /**
  * Persisted codebase-search index: storage + incremental build.
  *
- * Storage: `<workspaceRoot>/.headlesscode/codesearch/index.jsonl`, one JSON
- * line per chunk — { file, startLine, endLine, embedding, hash } (see
+ * Storage: the CENTRAL per-project data store's
+ * `codesearch/index.jsonl` (see src/project-store.ts) — one JSON line per
+ * chunk — { file, startLine, endLine, embedding, hash } (see
  * src/codesearch/types.ts). Plain JSONL, no vector DB: brute-force cosine
  * over every stored vector at query time is the deliberate scope for this
  * project's scale. SCALING LIMIT (documented, accepted): cosine search is
@@ -44,6 +45,7 @@ import {
 	type EmbeddingBackend,
 } from "./embedder.js"
 import { walkSourceFiles } from "./files.js"
+import { resolveProjectDataDir } from "../project-store.js"
 import { INDEX_RELATIVE_PATH, type IndexEntry } from "./types.js"
 
 export interface IndexBuildResult {
@@ -65,9 +67,14 @@ export interface IndexBuildResult {
 	backend: EmbeddingBackend
 }
 
-/** Absolute path of the index file for a workspace. */
+/** Absolute path of the index file for a workspace (central project store). */
 export function indexFilePath(workspaceRoot: string): string {
-	return path.join(path.resolve(workspaceRoot), INDEX_RELATIVE_PATH)
+	return path.join(resolveProjectDataDir(workspaceRoot), INDEX_RELATIVE_PATH)
+}
+
+/** Legacy workspace-relative index path (pre-central-store), for grace reads. */
+export function legacyIndexFilePath(workspaceRoot: string): string {
+	return path.join(workspaceRoot, ".headlesscode", INDEX_RELATIVE_PATH)
 }
 
 /**
@@ -162,12 +169,27 @@ export function readJsonlEntries(file: string, blockSize: number = LOAD_BLOCK_SI
 
 /** Load all entries from the index file ([] when missing/unreadable). */
 export function loadIndex(workspaceRoot: string): IndexEntry[] {
-	return readJsonlEntries(indexFilePath(workspaceRoot))
+	const central = indexFilePath(workspaceRoot)
+	if (!fs.existsSync(central)) {
+		// Pre-migration grace: a legacy workspace-relative index is still
+		// READABLE (though not writable) until the real-machine migration
+		// moves it into the central store.
+		const legacy = legacyIndexFilePath(workspaceRoot)
+		if (fs.existsSync(legacy)) {
+			return readJsonlEntries(legacy)
+		}
+	}
+	return readJsonlEntries(central)
 }
 
 /** Absolute path of the index METADATA file (sibling of index.jsonl). */
 export function indexMetadataFilePath(workspaceRoot: string): string {
 	return indexFilePath(workspaceRoot) + ".meta.json"
+}
+
+/** Legacy workspace-relative index metadata path (pre-central-store grace). */
+export function legacyIndexMetadataFilePath(workspaceRoot: string): string {
+	return legacyIndexFilePath(workspaceRoot) + ".meta.json"
 }
 
 /** The backend + model an on-disk index was built with. */
@@ -184,7 +206,13 @@ export function loadIndexMetadata(workspaceRoot: string): IndexMetadata | undefi
 	try {
 		raw = fs.readFileSync(indexMetadataFilePath(workspaceRoot), "utf-8")
 	} catch {
-		return undefined
+		// Pre-migration grace: read the legacy sibling when the central one is
+		// absent (see loadIndex).
+		try {
+			raw = fs.readFileSync(legacyIndexMetadataFilePath(workspaceRoot), "utf-8")
+		} catch {
+			return undefined
+		}
 	}
 	try {
 		const parsed = JSON.parse(raw) as Record<string, unknown>

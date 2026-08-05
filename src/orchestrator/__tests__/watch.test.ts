@@ -14,7 +14,14 @@ import * as path from "node:path"
 import { spawnSync } from "node:child_process"
 
 import { inspectGroup, isIterationExhaustion, tailLog, watchGroups, DEFAULT_STALL_TIMEOUT_MS } from "../watch.js"
-import { defaultState, loadStateSync, saveStateSync, type OrchestratorGroup, type OrchestratorState } from "../state.js"
+import {
+	defaultState,
+	loadStateSync,
+	saveStateSync,
+	updateGroup,
+	type OrchestratorGroup,
+	type OrchestratorState,
+} from "../state.js"
 
 async function tmpRepo(): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-watch-blocked-"))
@@ -287,6 +294,216 @@ async function testWatchGroupsPrintsDoneTransitionToStderr(): Promise<void> {
 	}
 }
 
+/**
+ * Mandatory cost/token history recording: a group reaching "done" must get
+ * its combined usage recorded to the central cost-history.jsonl exactly
+ * once, with `cost_recorded` set on the persisted group so it's never
+ * re-recorded on a later poll. This is the end-to-end counterpart to
+ * cost-history.test.ts's unit coverage of recordGroupCost itself.
+ */
+async function testWatchGroupsRecordsCostOnDoneTransition(): Promise<void> {
+	const repoRoot = await tmpRepo()
+	try {
+		const wtPath = path.join(repoRoot, ".worktrees", "w1")
+		const usageDir = path.join(wtPath, ".headlesscode", "usage")
+		await fs.mkdir(usageDir, { recursive: true })
+		const statePath = path.join(repoRoot, ".worktrees", ".orchestrator-state.json")
+		saveStateSync(statePath, { ...defaultState("round-1"), groups: [baseGroup({ issues: [42] })] })
+		await fs.mkdir(path.join(wtPath, ".harness.done"))
+		await fs.writeFile(path.join(wtPath, ".harness.exit"), "0", "utf-8")
+		await fs.writeFile(
+			path.join(usageDir, "session-1.jsonl"),
+			`${JSON.stringify({ sessionId: "session-1", costUsd: 0.05, inputTokens: 1000, outputTokens: 100, cachedTokens: 400, iterations: 12 })}\n`,
+			"utf-8",
+		)
+
+		const summary = await watchGroups({
+			repoRoot,
+			statePath,
+			pollIntervalMs: 20,
+			stderrWriter: () => {},
+			reviewEnabled: false,
+		})
+		assert.equal(summary.allTerminal, true)
+
+		const persisted = loadStateSync(statePath)
+		const group = persisted.groups.find((g) => g.name === "w1")
+		assert.ok(group?.cost_recorded, "cost_recorded must be set once the group is terminal")
+
+		const { readCostHistory } = await import("../cost-history.js")
+		const records = await readCostHistory(repoRoot)
+		assert.equal(records.length, 1, "exactly one cost-history record must be written")
+		assert.deepEqual(records[0]?.issues, [42])
+		assert.equal(records[0]?.costUsd, 0.05)
+		assert.equal(records[0]?.status, "done")
+	} finally {
+		await fs.rm(repoRoot, { recursive: true, force: true })
+	}
+}
+
+/**
+ * 2026-08-05 incident: recordCostIfSettled originally fired the FIRST time
+ * a group was observed terminal — before review (or QA) even ran. Since
+ * review/QA are separate HeadlessSession runs against the SAME worktree,
+ * each writing their own `.headlesscode/usage/*.jsonl`, and nothing
+ * re-triggers a usage rollup for a "done" group unless a rework respawn
+ * happens, their real cost was silently never captured. This reproduces
+ * the fix: with review enabled, a "done" group must NOT be recorded until
+ * `review_verdict` is set, and the recorded total must include the review
+ * session's own usage file, not just the original worker's.
+ */
+async function testWatchGroupsWaitsForReviewBeforeRecordingCost(): Promise<void> {
+	const repoRoot = await tmpRepo()
+	try {
+		const wtPath = path.join(repoRoot, ".worktrees", "w1")
+		const usageDir = path.join(wtPath, ".headlesscode", "usage")
+		await fs.mkdir(usageDir, { recursive: true })
+		const statePath = path.join(repoRoot, ".worktrees", ".orchestrator-state.json")
+		saveStateSync(statePath, { ...defaultState("round-1"), groups: [baseGroup({ issues: [42] })] })
+		await fs.mkdir(path.join(wtPath, ".harness.done"))
+		await fs.writeFile(path.join(wtPath, ".harness.exit"), "0", "utf-8")
+		await fs.writeFile(
+			path.join(usageDir, "worker.jsonl"),
+			`${JSON.stringify({ sessionId: "worker", costUsd: 0.05, inputTokens: 1000, outputTokens: 100, cachedTokens: 400, iterations: 12 })}\n`,
+			"utf-8",
+		)
+
+		let callbackCalls = 0
+		const summary = await watchGroups({
+			repoRoot,
+			statePath,
+			pollIntervalMs: 20,
+			stderrWriter: () => {},
+			reviewEnabled: true,
+			onGroupUpdate: async (group) => {
+				callbackCalls++
+				// Simulate the real review step: it's a SEPARATE HeadlessSession
+				// against the same worktree, so it writes its OWN usage file,
+				// then reports a clean verdict — same shape as cli.ts's real
+				// runReview + state patch.
+				await fs.writeFile(
+					path.join(usageDir, "review.jsonl"),
+					`${JSON.stringify({ sessionId: "review", costUsd: 0.02, inputTokens: 500, outputTokens: 50, cachedTokens: 100, iterations: 8 })}\n`,
+					"utf-8",
+				)
+				saveStateSync(
+					statePath,
+					updateGroup(loadStateSync(statePath), group.name, {
+						review_verdict: "clean",
+						pending_review_findings: [],
+						reviewed_at: new Date().toISOString(),
+					}),
+				)
+				return undefined
+			},
+		})
+		assert.equal(summary.allTerminal, true)
+		assert.equal(callbackCalls, 1, "review must run exactly once")
+
+		const persisted = loadStateSync(statePath)
+		const group = persisted.groups.find((g) => g.name === "w1")
+		assert.ok(group?.cost_recorded, "cost must be recorded once review is settled")
+		assert.equal(group?.review_verdict, "clean")
+
+		const { readCostHistory } = await import("../cost-history.js")
+		const records = await readCostHistory(repoRoot)
+		assert.equal(records.length, 1, "exactly one cost-history record, recorded after review")
+		assert.equal(
+			records[0]?.costUsd,
+			0.07,
+			"recorded cost must include BOTH the worker's and the review session's usage, not just the worker's",
+		)
+	} finally {
+		await fs.rm(repoRoot, { recursive: true, force: true })
+	}
+}
+
+/**
+ * Issue #24 (2026-08-05): watchGroups used to await each group's
+ * onGroupUpdate INLINE in the per-group for-loop, so one group's long
+ * review/QA fully monopolized the watcher — no other group's completion was
+ * even detected until the in-flight one resolved. Live impact: a settled
+ * group sat fully idle for 30+ minutes behind another group's review+QA in
+ * the same round. This reproduces the fix: group "w1"'s callback blocks on
+ * a gate that only opens once group "w2" has ALREADY completed its own
+ * callback, proving w2's review runs and finishes while w1's is still stuck
+ * — i.e. groups are no longer serialized through the watcher.
+ */
+async function testWatchGroupsRunsReviewForMultipleGroupsConcurrently(): Promise<void> {
+	const repoRoot = await tmpRepo()
+	try {
+		const w1Path = path.join(repoRoot, ".worktrees", "w1")
+		const w2Path = path.join(repoRoot, ".worktrees", "w2")
+		await fs.mkdir(w1Path, { recursive: true })
+		await fs.mkdir(w2Path, { recursive: true })
+		const statePath = path.join(repoRoot, ".worktrees", ".orchestrator-state.json")
+		saveStateSync(statePath, {
+			...defaultState("round-1"),
+			groups: [baseGroup({ name: "w1", worktree: ".worktrees/w1" }), baseGroup({ name: "w2", worktree: ".worktrees/w2" })],
+		})
+		await fs.mkdir(path.join(w1Path, ".harness.done"))
+		await fs.writeFile(path.join(w1Path, ".harness.exit"), "0", "utf-8")
+		await fs.mkdir(path.join(w2Path, ".harness.done"))
+		await fs.writeFile(path.join(w2Path, ".harness.exit"), "0", "utf-8")
+
+		let w2Finished = false
+		let resolveW1Started: (() => void) | undefined
+		const w1Started = new Promise<void>((resolve) => {
+			resolveW1Started = resolve
+		})
+
+		const summary = await watchGroups({
+			repoRoot,
+			statePath,
+			pollIntervalMs: 20,
+			stderrWriter: () => {},
+			reviewEnabled: true,
+			onGroupUpdate: async (group) => {
+				if (group.name === "w1") {
+					resolveW1Started?.()
+					// Block until w2's callback has fully finished — if the
+					// watcher still serialized groups, this would deadlock
+					// (w2's callback would never even start), so the test
+					// itself is the proof: it only completes if w2 ran
+					// concurrently with w1 still stuck here.
+					const deadline = Date.now() + 5000
+					while (!w2Finished && Date.now() < deadline) {
+						await new Promise((r) => setTimeout(r, 5))
+					}
+					assert.equal(w2Finished, true, "w2 must finish while w1's callback is still blocked")
+					saveStateSync(
+						statePath,
+						updateGroup(loadStateSync(statePath), "w1", {
+							review_verdict: "clean",
+							pending_review_findings: [],
+							reviewed_at: new Date().toISOString(),
+						}),
+					)
+					return undefined
+				}
+				await w1Started
+				saveStateSync(
+					statePath,
+					updateGroup(loadStateSync(statePath), "w2", {
+						review_verdict: "clean",
+						pending_review_findings: [],
+						reviewed_at: new Date().toISOString(),
+					}),
+				)
+				w2Finished = true
+				return undefined
+			},
+		})
+
+		assert.equal(summary.allTerminal, true)
+		const persisted = loadStateSync(statePath)
+		assert.equal(persisted.groups.find((g) => g.name === "w1")?.review_verdict, "clean")
+		assert.equal(persisted.groups.find((g) => g.name === "w2")?.review_verdict, "clean")
+	} finally {
+		await fs.rm(repoRoot, { recursive: true, force: true })
+	}
+}
+
 async function testWatchGroupsPrintsFailedTransitionToStderr(): Promise<void> {
 	const repoRoot = await tmpRepo()
 	try {
@@ -419,6 +636,55 @@ async function testIsIterationExhaustionRejectsOtherFailures(): Promise<void> {
 	assert.equal(isIterationExhaustion(""), false, "empty summary is never exhaustion")
 }
 
+/**
+ * 2026-08-05 incident regression: `inspectGroup`'s captured `summary` field
+ * silently dropped the ACTUAL final lines of a long-running worker's
+ * harness.log. tailLog() correctly returns the last SUMMARY_TAIL_LINES
+ * lines of the current run, but that tail was then capped with
+ * `.slice(0, 4000)` — the FIRST 4000 chars of an already-end-anchored tail
+ * — which discards the tail's own most recent content when the 40-line
+ * window exceeds 4000 chars (easy: harness.log's JSON usage lines commonly
+ * run 200-300+ chars each). In a real dispatch round this made
+ * `isIterationExhaustion(group.summary)` return false for a worker that
+ * GENUINELY hit --max-iterations, because the "Max iterations (N) reached"
+ * line — always the true last line — never survived into `summary`. Two
+ * real, separate consequences from the one bug: auto-continuation never
+ * fired, and status output shown to a human/agent never reflected the
+ * worker's real final outcome.
+ */
+async function testInspectGroupSummaryPreservesTrueTailNotHead(): Promise<void> {
+	const repoRoot = await tmpRepo()
+	try {
+		const wtPath = path.join(repoRoot, ".worktrees", "w1")
+		await fs.mkdir(wtPath, { recursive: true })
+		// Pad with enough long lines that the 40-line tail window exceeds 4000
+		// chars well before reaching the final line — reproduces the real
+		// harness.log shape (verbose JSON usage-total lines every iteration).
+		const padLine =
+			'[2026-08-05T14:00:00.000Z] INFO  [usage] running total {"iteration":1,"costUsd":0.01,"inputTokens":100000,"outputTokens":1000,"cachedTokens":90000,"lastPromptTokens":10000,"lastCachedTokens":9000}'
+		const padding = Array.from({ length: 39 }, () => padLine).join("\n")
+		const finalLine = "headlesscode: task failed: Max iterations (50) reached without task completion"
+		await fs.writeFile(path.join(wtPath, "harness.log"), `${padding}\n${finalLine}\n`, "utf-8")
+		await fs.mkdir(path.join(wtPath, ".harness.done"))
+		await fs.writeFile(path.join(wtPath, ".harness.exit"), "1", "utf-8")
+
+		const patch = inspectGroup(repoRoot, baseGroup(), Date.now(), DEFAULT_STALL_TIMEOUT_MS)
+		assert.ok(patch, "a done marker with a failing exit code must produce a patch")
+		assert.equal(patch?.status, "failed")
+		assert.ok(
+			patch?.summary?.includes("Max iterations (50) reached"),
+			`captured summary must include the real final error line, got tail: ${patch?.summary?.slice(-200)}`,
+		)
+		assert.equal(
+			isIterationExhaustion(patch?.summary),
+			true,
+			"the captured summary must actually be detected as iteration exhaustion (this is what gates auto-continuation)",
+		)
+	} finally {
+		await fs.rm(repoRoot, { recursive: true, force: true })
+	}
+}
+
 // ─── tailLog: run-separator scoping (restart must not lose prior log/stats) ──
 // scripts/run-worker.sh now appends to harness.log across continuation/rework
 // respawns on the same worktree (never truncates it), writing a run-start
@@ -484,24 +750,40 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["watchGroups: BLOCKED line printed once on the transition into blocked", testWatchGroupsPrintsBlockedTransitionToStderr],
 	["watchGroups: BLOCKED line not repeated while the group stays blocked", testWatchGroupsDoesNotRepeatBlockedLineWhileStillBlocked],
 	["watchGroups: DONE line printed on the transition to done", testWatchGroupsPrintsDoneTransitionToStderr],
+	["watchGroups: records cost history exactly once on the done transition", testWatchGroupsRecordsCostOnDoneTransition],
+	["watchGroups: waits for review before recording cost, then includes the review session's own usage", testWatchGroupsWaitsForReviewBeforeRecordingCost],
+	["watchGroups: runs review for multiple groups concurrently, not serialized (issue #24)", testWatchGroupsRunsReviewForMultipleGroupsConcurrently],
 	["watchGroups: FAILED line printed on the transition to failed", testWatchGroupsPrintsFailedTransitionToStderr],
 	["isIterationExhaustion matches the exact max-iterations error", testIsIterationExhaustionMatchesExactError],
 	["isIterationExhaustion rejects budget/real failures and empty summaries", testIsIterationExhaustionRejectsOtherFailures],
+	["inspectGroup: captured summary preserves the true tail, not the head, of a long harness.log", testInspectGroupSummaryPreservesTrueTailNotHead],
 	["tailLog: scopes the summary to content after the latest run-start separator", testTailLogScopesToLatestRunAfterAppend],
 	["tailLog: appended harness.log preserves every prior session's output on disk", testTailLogPreservesFullHistoryOnDisk],
 ]
 
 async function main(): Promise<void> {
+	// watchGroups now records cost history (cost-history.ts) as a mandatory
+	// side effect of a group reaching a terminal status, which touches the
+	// central project store — redirect it to a temp dir so no test run ever
+	// writes into the real ~/.local/share/headlesscode (same defensive
+	// pattern as config/__tests__/mode-models.test.ts).
+	const storeTmp = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-watch-store-"))
+	process.env.HEADLESSCODE_DATA_DIR = storeTmp
 	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
+	try {
+		for (const [name, fn] of tests) {
+			try {
+				await fn()
+				console.log(`  ok   ${name}`)
+			} catch (err) {
+				failed++
+				console.error(`  FAIL ${name}`)
+				console.error(err instanceof Error ? err.stack ?? err.message : String(err))
+			}
 		}
+	} finally {
+		delete process.env.HEADLESSCODE_DATA_DIR
+		await fs.rm(storeTmp, { recursive: true, force: true })
 	}
 	if (failed > 0) {
 		console.error(`\n${failed} test(s) failed`)

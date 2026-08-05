@@ -456,6 +456,15 @@ echo "== [9/10] orchestrate --deploy wiring =="
 printf '%s\n' "correct-token" > "$FIXTURE/.deploy-approval"
 rm -f "$FIXTURE/.e2e-deploy-ran"
 
+# The pre-spawn collision check (added in 0955d5d) refuses to re-run
+# orchestrate on a fixture whose PREVIOUS round's worktree is still present;
+# section 4 left .worktrees/w1 (and its date-tagged branch) behind, so clear
+# both before re-spawning — `git worktree add -b <same-branch>` would
+# otherwise fail on the leftover branch.
+WT1_BRANCH="issues/w1-$(date +%Y-%m-%d)"
+git -C "$FIXTURE" worktree remove --force "$FIXTURE/.worktrees/w1" 2>/dev/null || true
+git -C "$FIXTURE" branch -D "$WT1_BRANCH" 2>/dev/null || true
+
 # 9a. Round already passing + matching token -> gate approves, deploy invoked.
 ORCH2_OUT="$(mktemp /tmp/headlesscode-e2e4-orch2-XXXXXX.out)"
 (
@@ -482,6 +491,10 @@ fi
 
 # 9b. Wrong token -> gate DENIES, orchestrate returns 1, deploy NOT invoked.
 ORCH2_MARKER_LINES="$(wc -l < "$FIXTURE/.e2e-deploy-ran" 2>/dev/null || echo 0)"
+# 9a's round left a fresh .worktrees/w1 + branch — clear them for the denied
+# re-run too.
+git -C "$FIXTURE" worktree remove --force "$FIXTURE/.worktrees/w1" 2>/dev/null || true
+git -C "$FIXTURE" branch -D "$WT1_BRANCH" 2>/dev/null || true
 ORCH3_OUT="$(mktemp /tmp/headlesscode-e2e4-orch3-XXXXXX.out)"
 (
 	cd "$ROOT" &&

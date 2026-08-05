@@ -19,8 +19,9 @@ Tier 1, gated on that plan's own Phase 2 status).
   changes.
 - Workspaces + state live on the same `/data` named volume the backend uses
   (`server_data`), under `/data/headlesscode-workspaces` (+
-  `/data/headlesscode-home` for `~/.headlesscode/checkpoints`), so they
-  survive image rebuilds.
+  `/data/headlesscode-home` for the central data store — checkpoints at
+  `~/.local/share/headlesscode/checkpoints` and the per-project store under
+  `~/.local/share/headlesscode/projects/`), so they survive image rebuilds.
 - Playwright browsers are **not** in the image (v1 decision — see below);
   `browser_action` needs an explicit one-time `npx playwright install
   chromium` step before it works.
@@ -123,12 +124,14 @@ volume, network alias, env, and healthcheck).
 
 - Git workspaces: `/data/headlesscode-workspaces/<project>` (=
   `HEADLESSCODE_WORKSPACE_ROOT`).
-- Per-workspace `.headlesscode/` state: `<workspace>/.headlesscode/` (the
-  harness's own default), plus repo-local `.worktrees/` for orchestrated
-  sessions.
-- Global state: `$HOME=/data/headlesscode-home` — covers the default
-  checkpoint root (`~/.headlesscode/checkpoints`, which must stay outside any
-  workspace) and anything else that keys off `$HOME`.
+- Per-workspace session state: `<workspace>/.headlesscode/` (usage/events/
+  memory feeds), plus repo-local `.worktrees/` for orchestrated sessions.
+- Global + per-project central state: `$HOME=/data/headlesscode-home` — covers
+  the central data store (`~/.local/share/headlesscode/`): the checkpoint
+  root (`~/.local/share/headlesscode/checkpoints`, which must stay outside any
+  workspace), the per-project store (`projects/<key>/` — codebase index,
+  mode-models.json, permissions.json), the shared instructions
+  (`shared/`), and anything else that keys off `$HOME`.
 - All of it is on `server_data:/data`, so image rebuilds/deploys never
   destroy it.
 

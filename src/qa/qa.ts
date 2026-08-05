@@ -42,6 +42,7 @@ import { createQaHeadlessExecutor } from "../tools/executor.js"
 import { getNativeTools } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/index.js"
 import type { ChatTool, LlmClient, SessionResult } from "../engine/types.js"
 import type { MemoryStore } from "../memory/types.js"
+import type { SessionBudget } from "../budget/budget.js"
 
 /** Default mode slug used for QA sessions (the airunner qa-agent mode). */
 export const DEFAULT_QA_MODE = "qa-agent"
@@ -121,8 +122,23 @@ export interface RunQaOptions {
 	llmClient?: LlmClient
 	/** OpenRouter base URL override (e2e points this at the mock server). */
 	baseUrl?: string
-	/** Loop iteration cap (default: 50). */
+	/**
+	 * Loop iteration cap — a backstop, not the primary guard (see `budget`
+	 * below). Default is deliberately generous (200): QA that boots the
+	 * app, runs a real test suite, and exercises changed behavior can
+	 * legitimately need many tool calls, and cutting it off mid-work
+	 * silently loses the real evidence rather than ending cleanly (see
+	 * `runQa`'s session-failure fallback below) — a review session hitting
+	 * this exact problem at the old default of 40 was a real incident.
+	 */
 	maxIterations?: number
+	/**
+	 * Cost/duration backstop (SessionBudget's maxCostUsd/maxDurationMs) —
+	 * the preferred way to bound a QA session: a true runaway gets caught
+	 * by spend or wall-clock time, not by an arbitrary tool-call count that
+	 * penalizes legitimate thorough work.
+	 */
+	budget?: Pick<SessionBudget, "maxCostUsd" | "maxDurationMs">
 	/** Phase 3 memory store (optional; QA can reuse the project's memory). */
 	memory?: MemoryStore | null
 	/** Project scope for memory (default: basename of workspaceRoot). */
@@ -154,11 +170,28 @@ function currentBranch(workspaceRoot: string): string {
 function defaultTaskText(workspaceRoot: string, mode: string): string {
 	return (
 		`Run the QA checklist defined in your operating instructions against this workspace ` +
-		`(branch: ${currentBranch(workspaceRoot)}, mode: ${mode}). Boot the app, run the relevant ` +
-		`test suite, exercise the changed behavior, and report EVIDENCE with real command output. ` +
-		`When you are done, call attempt_completion with a structured summary: a verdict line ` +
-		`(QA PASS or QA FAIL), an Evidence section with the real commands you ran and their ` +
-		`output, and the final baseline numbers you personally confirmed.`
+		`(branch: ${currentBranch(workspaceRoot)}, mode: ${mode}).\n\n` +
+		`FIRST: run \`git diff origin/master...HEAD --stat\` (or the equivalent against this repo's ` +
+		`actual base branch) to see EXACTLY which files changed. That diff is your scope — it tells ` +
+		`you which behavior to exercise. A real incident: without this instruction, a QA session spent ` +
+		`over a dozen iterations exploring an unrelated chat-UI input component and an unrelated ` +
+		`dependency-pinning question before ever looking at the actual diff, on a change that only ` +
+		`touched two shell scripts and a docs file.\n\n` +
+		`Boot the app and confirm it starts cleanly (a QUICK smoke test — no new JS/console errors on ` +
+		`load — not a deep exploration of unrelated areas), run the relevant test suite, then exercise ` +
+		`SPECIFICALLY the behavior the diff touched. If the diff doesn't touch the browser-facing app at ` +
+		`all (e.g. only scripts/docs/backend), the boot-and-smoke-test step still applies but do not go ` +
+		`looking for unrelated things to click through — there's nothing in scope for deeper UI ` +
+		`interaction. Report EVIDENCE with real command output. ` +
+		`When you are done, call attempt_completion with a structured summary: an Evidence section ` +
+		`with the real commands you ran and their output, and the final baseline numbers you ` +
+		`personally confirmed.\n\n` +
+		`The VERY LAST LINE of your attempt_completion result must be exactly one of:\n` +
+		`QA_VERDICT: PASS\n` +
+		`QA_VERDICT: FAIL\n` +
+		`Nothing else on that line — no prose, no punctuation, no markdown formatting. This is the ONLY ` +
+		`line the orchestrator parses to decide pass/fail; everything else in your report is for a ` +
+		`human reader.`
 	)
 }
 
@@ -177,7 +210,8 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
 		model,
 		llmClient,
 		baseUrl,
-		maxIterations = 50,
+		maxIterations = 200,
+		budget,
 		memory = null,
 		project,
 	} = options
@@ -198,6 +232,7 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
 		model,
 		taskText: options.taskText ?? defaultTaskText(workspaceRoot, mode),
 		maxIterations,
+		budget,
 		systemPromptOverride,
 		tools: qaTools(),
 		executor: createQaHeadlessExecutor(workspaceRoot),
@@ -224,10 +259,27 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
  * Deterministic + tested:
  *   - "pass"  — explicit pass markers (QA PASS, all tests pass, no errors
  *               found, definition of done satisfied, `errors: []`, …).
- *   - "fail"  — explicit fail markers (QA FAIL, failed, errors found, bug,
- *               regression, does not work, definition of done NOT met, …).
+ *   - "fail"  — explicit fail markers (QA FAIL, does not work, definition of
+ *               done NOT met) — deliberately narrow, see below;
  *   - default "fail" when neither is stated (FAIL-CLOSED: an inconclusive QA
  *     report never gates a deploy through).
+ *
+ * The fail-marker list is deliberately narrow — the SAME class of bug as
+ * `reviewer.ts`'s parseReviewResult, found in the same incident: it used to
+ * include bare "failed"/"failure"/"failures found"/"errors found"/"bug"/
+ * "regression"/"broken"/"failing" ANYWHERE in the report. A QA report citing
+ * real baseline test counts ("12 failed, 1187 passed" — pre-existing on
+ * master, unrelated to the change) contains the bare word "failed", which
+ * alone tripped the fail branch — and fail always wins over pass in this
+ * function's logic, so ANY QA report mentioning ordinary baseline numbers
+ * would be force-classified as "fail" even when QA genuinely passed. The
+ * negative lookbehind `(?<!no\s)failed` only protects the exact phrase "no
+ * failed" — it does nothing for "12 failed", which is the actual shape
+ * baseline reporting takes. Narrowed to `qa fail` / `definition of done
+ * not` / `does not work` — explicit, structured verdict language, not
+ * incidental words that show up constantly in normal test-output prose.
+ * Do not add generic words back without a specific report shape that needs
+ * them AND a test proving no false-positive on baseline/prose language.
  *
  * Evidence: an `## Evidence` / `Evidence:` section when present, else the full
  * summary text (which still contains the real command output).
@@ -245,17 +297,24 @@ export function parseQaResult(text: string): QaResult {
 		evidence = section[1].trim()
 	}
 
+	// Primary path: an explicit, structured "QA_VERDICT: PASS"/"QA_VERDICT: FAIL"
+	// line (required by defaultTaskText) is authoritative — exact match, no
+	// heuristics. Same rationale as reviewer.ts's parseReviewResult: free-form
+	// regex heuristics on prose have no ceiling on false positives (a real
+	// incident here — baseline "N failed" test counts forced a fail verdict on
+	// a QA session that explicitly said "QA PASS").
+	const structuredVerdict = summary.match(/^QA_VERDICT:\s*(PASS|FAIL)\s*$/im)
+	if (structuredVerdict) {
+		const verdict: QaVerdict = structuredVerdict[1]!.toUpperCase() === "PASS" ? "pass" : "fail"
+		return { verdict, evidence: evidence || summary, summary }
+	}
+
+	// Fallback for a session that didn't emit the required line.
 	const hasPassMarker =
 		/\b(qa\s*pass|all\s*tests?\s*pass|no\s+errors?\s+found|no\s+failures|definition\s+of\s+done\s+(is\s+|was\s+)?(met|satisfied)|errors?\s*:\s*\[\s*\]|passed\s+(\d+)\/\d+|verified\s+ok)\b/i.test(
 			lower,
 		)
-	// Fail markers use negative lookbehind so "no errors found" / "no failures
-	// found" (pass statements) never trip the fail branch. Lookbehinds honor
-	// the /i flag, so "No errors found" is also protected.
-	const hasFailMarker =
-		/\b(qa\s*fail|(?<!no\s)failed|(?<!no\s)failure|(?<!no\s)failures?\s+found|(?<!no\s)errors?\s+found|bug|regression|does\s+not\s+work|broken|definition\s+of\s+done\s+not|failing)\b/i.test(
-			lower,
-		)
+	const hasFailMarker = /\b(qa\s*fail|definition\s+of\s+done\s+not|does\s+not\s+work)\b/i.test(lower)
 
 	let verdict: QaVerdict
 	if (hasPassMarker && !hasFailMarker) {

@@ -27,7 +27,7 @@ import * as path from "node:path"
 
 import { startDashboardServer } from "../server.js"
 import type { Server } from "node:http"
-import { PERMISSIONS_CONFIG_FILE, resolvePermissions } from "../../permissions/config.js"
+import { permissionsFilePath, resolvePermissions } from "../../permissions/config.js"
 import { DEFAULT_PROTECTED_FILES } from "../../permissions/protected-files.js"
 
 async function tmpRepo(prefix = "hc-fileperm-"): Promise<string> {
@@ -288,14 +288,13 @@ async function testPermissionsGetReturnsDefaultsWhenMissing(): Promise<void> {
 async function testPermissionsGetReturnsFileWhenPresent(): Promise<void> {
 	const repo = await tmpRepo()
 	try {
-		await fs.mkdir(path.join(repo, ".headlesscode"), { recursive: true })
 		const custom = {
 			allowedCommands: ["npm test"],
 			deniedCommands: ["rm -rf"],
 			protectedFiles: [".env", "secrets/"],
 			allowProtectedWrites: false,
 		}
-		await fs.writeFile(path.join(repo, PERMISSIONS_CONFIG_FILE), JSON.stringify(custom, null, 2) + "\n", "utf-8")
+		await fs.writeFile(permissionsFilePath(repo), JSON.stringify(custom, null, 2) + "\n", "utf-8")
 
 		const { server, port } = await startServer(repo)
 		try {
@@ -332,7 +331,7 @@ async function testPermissionsPostRoundTripAffectsResolution(): Promise<void> {
 			assert.equal((post.body as { ok: boolean }).ok, true)
 
 			// The file was written (pretty-printed, parseable back).
-			const onDisk = await fs.readFile(path.join(repo, PERMISSIONS_CONFIG_FILE), "utf-8")
+			const onDisk = await fs.readFile(permissionsFilePath(repo), "utf-8")
 			assert.deepEqual(JSON.parse(onDisk), payload)
 
 			// THE round-trip proof: resolvePermissions on a FRESH call (no
@@ -362,9 +361,8 @@ async function testPermissionsPostRoundTripAffectsResolution(): Promise<void> {
 async function testPermissionsPostMalformedRejectedAndNoCorruption(): Promise<void> {
 	const repo = await tmpRepo()
 	try {
-		await fs.mkdir(path.join(repo, ".headlesscode"), { recursive: true })
 		const original = { deniedCommands: ["rm -rf"], allowProtectedWrites: false }
-		await fs.writeFile(path.join(repo, PERMISSIONS_CONFIG_FILE), JSON.stringify(original, null, 2) + "\n", "utf-8")
+		await fs.writeFile(permissionsFilePath(repo), JSON.stringify(original, null, 2) + "\n", "utf-8")
 
 		const { server, port } = await startServer(repo)
 		try {
@@ -401,7 +399,7 @@ async function testPermissionsPostMalformedRejectedAndNoCorruption(): Promise<vo
 			assert.match(String(((await badJsonRes.json()) as { error?: string }).error ?? ""), /invalid JSON body/i)
 
 			// NONE of the malformed saves may have touched the existing file.
-			const after = await fs.readFile(path.join(repo, PERMISSIONS_CONFIG_FILE), "utf-8")
+			const after = await fs.readFile(permissionsFilePath(repo), "utf-8")
 			assert.equal(after, JSON.stringify(original, null, 2) + "\n")
 		} finally {
 			server.close()
@@ -411,7 +409,7 @@ async function testPermissionsPostMalformedRejectedAndNoCorruption(): Promise<vo
 	}
 }
 
-async function testPermissionsPostCreatesHeadlesscodeDir(): Promise<void> {
+async function testPermissionsPostCreatesCentralConfigFile(): Promise<void> {
 	const repo = await tmpRepo()
 	try {
 		const { server, port } = await startServer(repo)
@@ -419,8 +417,9 @@ async function testPermissionsPostCreatesHeadlesscodeDir(): Promise<void> {
 			const base = `http://127.0.0.1:${port}`
 			const post = await postJson(base, permsUrl(repo), { deniedCommands: ["pkill -9"] })
 			assert.equal(post.status, 200)
-			// .headlesscode/ did not exist before — the POST must create it.
-			await fs.access(path.join(repo, PERMISSIONS_CONFIG_FILE))
+			// No workspace-relative file existed before — the central store's
+			// permissions.json must now exist (created on demand).
+			await fs.access(permissionsFilePath(repo))
 		} finally {
 			server.close()
 		}
@@ -498,22 +497,31 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["permissions: GET returns the current file content when present", testPermissionsGetReturnsFileWhenPresent],
 	["permissions: POST writes the file and resolvePermissions round-trips it", testPermissionsPostRoundTripAffectsResolution],
 	["permissions: malformed POST is rejected and does NOT corrupt the existing file", testPermissionsPostMalformedRejectedAndNoCorruption],
-	["permissions: POST creates .headlesscode/ when missing", testPermissionsPostCreatesHeadlesscodeDir],
+	["permissions: POST creates the central config file when missing", testPermissionsPostCreatesCentralConfigFile],
 	["permissions: GET/POST require repo (param or --repo)", testPermissionsPostRequiresRepo],
 	["permissions: optional bearer token gates the permissions POST", testPermissionsTokenGate],
 ]
 
 async function main(): Promise<void> {
+	// Redirect the central store to a temp dir so the HTTP routes never touch
+	// the real home directory's store.
+	const storeTmp = await fs.mkdtemp(path.join(os.tmpdir(), "hc-fileperm-store-"))
+	process.env.HEADLESSCODE_DATA_DIR = storeTmp
 	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
+	try {
+		for (const [name, fn] of tests) {
+			try {
+				await fn()
+				console.log(`  ok   ${name}`)
+			} catch (err) {
+				failed++
+				console.error(`  FAIL ${name}`)
+				console.error(err instanceof Error ? err.stack ?? err.message : String(err))
+			}
 		}
+	} finally {
+		delete process.env.HEADLESSCODE_DATA_DIR
+		await fs.rm(storeTmp, { recursive: true, force: true })
 	}
 	if (failed > 0) {
 		console.error(`\n${failed} test(s) failed`)

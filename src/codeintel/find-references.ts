@@ -19,6 +19,13 @@ export interface ReferenceSite {
 	fileName: string
 	line: number
 	character: number
+	/**
+	 * Absolute character offset of the identifier's start within `fileName`
+	 * (the language service's raw `textSpan.start`). The tools only need
+	 * line/column for display, but `rename_symbol` needs the exact offset to
+	 * edit the file — computed here once instead of re-derived per consumer.
+	 */
+	start: number
 	/** Write access (assignment / declaration) vs read access. */
 	isWriteAccess: boolean
 	snippet: string
@@ -92,6 +99,7 @@ export function findReferences(
 			fileName: ref.fileName,
 			line: lineAndChar.line + 1,
 			character: lineAndChar.character + 1,
+			start: ref.textSpan.start,
 			isWriteAccess: ref.isWriteAccess,
 			snippet: snippetFor(intel, ref.fileName, lineAndChar.line + 1),
 		})

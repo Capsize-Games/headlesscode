@@ -30,6 +30,10 @@ import { checkpointsMain } from "./checkpoints/cli.js"
 import { dashboardMain } from "./dashboard/cli.js"
 import { indexMain } from "./codesearch/cli.js"
 import { provisionMain, pushPrMain } from "./github/cli.js"
+import { decisionProxyMain } from "./decision-proxy/cli.js"
+import { migrateMain } from "./migrate/cli.js"
+import { analyzeCliMain } from "./orchestrator/analyze-cli.js"
+import { costHistoryCliMain } from "./orchestrator/cost-history-cli.js"
 import { resolvePermissions, type PermissionsConfig } from "./permissions/config.js"
 import { resolveModelForMode } from "./config/mode-models.js"
 
@@ -72,6 +76,14 @@ interface CliOptions {
 	 * DEFAULT_CONDENSE_THRESHOLD_FRACTION in src/engine/condense.ts).
 	 */
 	condenseThreshold?: number
+	/**
+	 * Async/background condensation: fraction of the context window at which
+	 * the condensation LLM call fires EARLY in the background (default
+	 * DEFAULT_CONDENSE_EARLY_FIRE_FRACTION in src/engine/condense.ts). Must be
+	 * below the hard `condenseThreshold`; when it isn't, the async path is off
+	 * and only the synchronous hard-threshold path runs.
+	 */
+	condenseEarlyFire?: number
 	/**
 	 * Phase 3 context condensation: model id for the condensation call
 	 * (default: the session model, or the `_condensation` key in
@@ -177,6 +189,22 @@ Subcommands:
               a pull request from it — never to the repo's default branch,
               never auto-merged. See
               \`npx tsx src/cli.ts push-pr --help\` for full options.
+  headlesscode decision-proxy --workspace <path> [--task <text>] [--task-file <path>]
+              OPT-IN (HEADLESSCODE_DECISION_PROXY=1) LLM stand-in for the
+              human on ask_followup_question: watches <path> for
+              .harness.needs-decision and answers via .harness.decision-answer,
+              grounded in the session's ORIGINAL task text. Writes nothing
+              when uncertain/errored — the existing timeout fallback fires
+              as today. See \`npx tsx src/cli.ts decision-proxy --help\` for
+              full options.
+  headlesscode migrate [--workspace <path>]
+              One-time central-store migrations: moves global shared
+              instructions (~/.roo/) and the checkpoint store
+              (~/.headlesscode/checkpoints) into ~/.local/share/headlesscode/,
+              plus a workspace's legacy .headlesscode/ content (index,
+              mode-models.json, permissions.json) into the central project
+              store. Idempotent; each move is verified before the source is
+              removed. See \`npx tsx src/cli.ts migrate --help\`.
 
 Options:
   --mode <slug>              Mode to run in (built-in or from .roomodes). Default: code
@@ -212,6 +240,11 @@ Options:
   --condense-threshold <f>   Phase 3 context condensation: fraction of the context
                              window at which the oldest turns are condensed into one
                              summary (default: 0.75; must be between 0 and 1)
+  --condense-early-fire <f>  Async condensation: fraction of the context window at
+                             which the condensation LLM call fires EARLY, in the
+                             background against a snapshot, while the loop keeps
+                             running (default: 0.6, provisional — must be below
+                             --condense-threshold or the async path is off)
   --condense-model <id>      Phase 3 context condensation: model id for the
                              condensation call (default: the session model, or the
                              _condensation key in .headlesscode/mode-models.json)
@@ -313,6 +346,11 @@ Environment:
   HEADLESSCODE_LOCAL_EXPLORE_CONTEXT_TOKENS   Context-token budget (default 131072)
   HEADLESSCODE_LOCAL_EXPLORE_TIMEOUT_MS       Per-call timeout ms (default 120000)
   HEADLESSCODE_OLLAMA_URL      Ollama base URL (default http://localhost:11434)
+  HEADLESSCODE_DECISION_PROXY   Opt-in decision-proxy agent ("1"/"true") — an
+                                LLM stand-in for the human on
+                                ask_followup_question (headlesscode
+                                decision-proxy subcommand; see
+                                plans/decision-proxy-agent.md)
 `
 
 export function parseArgs(argv: string[]): { options: CliOptions; error?: string } {
@@ -428,6 +466,15 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 					return { options, error: "--condense-threshold requires a fraction between 0 and 1 (e.g. 0.75)" }
 				}
 				options.condenseThreshold = num
+				break
+			}
+			case "--condense-early-fire": {
+				const value = next()
+				const num = value === undefined ? Number.NaN : Number(value)
+				if (!Number.isFinite(num) || num <= 0 || num >= 1) {
+					return { options, error: "--condense-early-fire requires a fraction between 0 and 1 (e.g. 0.6)" }
+				}
+				options.condenseEarlyFire = num
 				break
 			}
 			case "--condense-model": {
@@ -591,6 +638,37 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// provisioning (see src/github/cli.ts + docs/github-app-setup.md).
 	if (argv[0] === "push-pr") {
 		return pushPrMain(argv.slice(1))
+	}
+
+	// Decision-proxy subcommand: `headlesscode decision-proxy ...` — an
+	// OPT-IN (HEADLESSCODE_DECISION_PROXY=1) LLM stand-in for the human on
+	// ask_followup_question. Watches a workspace for .harness.needs-decision
+	// and writes .harness.decision-answer grounded in the session's original
+	// task text (see src/decision-proxy/ + plans/decision-proxy-agent.md).
+	if (argv[0] === "decision-proxy") {
+		return decisionProxyMain(argv.slice(1))
+	}
+
+	// Migration subcommand: `headlesscode migrate ...` — the explicit,
+	// human-triggered version of the one-time central-store migrations
+	// (shared instructions, checkpoint store, legacy workspace
+	// `.headlesscode/`). See src/migrate/ + src/project-store.ts.
+	if (argv[0] === "migrate") {
+		return migrateMain(argv.slice(1))
+	}
+
+	// Ad-hoc session log analysis: `headlesscode analyze-worktree ...` — the
+	// orchestrator already runs this automatically per group (see
+	// src/orchestrator/log-analysis.ts + cli.ts's onGroupUpdate); this
+	// subcommand lets a human point it at any worktree by hand.
+	if (argv[0] === "analyze-worktree") {
+		return analyzeCliMain(argv.slice(1))
+	}
+
+	// Cost/token history: `headlesscode cost-history ...` — read-side for
+	// the mandatory, automatic recording in watch.ts (recordCostIfTerminal).
+	if (argv[0] === "cost-history") {
+		return costHistoryCliMain(argv.slice(1))
 	}
 
 	const { options, error } = parseArgs(argv)
@@ -794,6 +872,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		windowSize: options.windowSize,
 		contextWindowTokens: options.contextWindowTokens,
 		condenseThresholdFraction: options.condenseThreshold,
+		condenseEarlyFireFraction: options.condenseEarlyFire,
 		condenseModel,
 		llmTimeoutMs: options.llmTimeoutMs,
 		stream: options.stream,

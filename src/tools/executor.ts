@@ -55,6 +55,7 @@ import { createHash } from "node:crypto"
 import { spawn, type ChildProcess } from "node:child_process"
 import { setTimeout as sleep } from "node:timers/promises"
 
+import { isTypeScriptWorkspace } from "./language-detect.js"
 import type { Logger } from "../engine/logger.js"
 
 // Side effect: installs String.prototype.toPosix() used by path formatting.
@@ -69,7 +70,9 @@ import {
 	findReferencesHandler,
 	importGraphHandler,
 	outlineHandler,
+	renameSymbolHandler,
 } from "../codeintel/handlers.js"
+import { runTestsHandler } from "./run-tests.js"
 
 import type { AuxLlmUsage, ToolContext, ToolHandler, ToolResult } from "../engine/types.js"
 import { checkCommand, type CommandRefusal } from "../permissions/commands.js"
@@ -82,9 +85,8 @@ import {
 import { findMatchingPattern } from "../permissions/protected-files.js"
 import { resolvePermissions, type PermissionsConfig } from "../permissions/config.js"
 import { createEmbedder, EMBEDDING_BACKEND_ENV, resolveEmbeddingBackend } from "../codesearch/embedder.js"
-import { loadIndexMetadata } from "../codesearch/index.js"
+import { indexFilePath, loadIndexMetadata } from "../codesearch/index.js"
 import { formatSearchResults, searchIndex } from "../codesearch/search.js"
-import { INDEX_RELATIVE_PATH } from "../codesearch/types.js"
 
 /** Cap on tool-result text fed back to the model (keep context bounded). */
 export const MAX_RESULT_CHARS = 30_000
@@ -121,6 +123,17 @@ export interface ToolExecutorOptions {
 	 * it on its event feed as `todo_updated`.
 	 */
 	onTodoEvent?: (fields: { todos: string; done: number; inProgress: number; pending: number }) => void
+	/**
+	 * Test-selection (run_tests): optional session-provided inference of the
+	 * files changed since the session's baseline. Wired by HeadlessSession to
+	 * diff the shadow-checkpoint repo's baseline commit against the current
+	 * working tree (see src/checkpoints/service.ts) — the checkpoint service
+	 * tracks a baseline per task, so this works even when the workspace
+	 * itself has no git repo. Returning `undefined` makes the run_tests
+	 * handler fall back to the workspace's own `git status`. Absent for bare
+	 * executors (tests, reviewer/QA — which don't register run_tests anyway).
+	 */
+	getSessionChangedFiles?: () => Promise<string[] | undefined>
 	/**
 	 * Auxiliary LLM usage reporting (cloud vision captioning — see
 	 * src/vision/describe.ts). Wired by HeadlessSession right after it
@@ -336,6 +349,14 @@ function refusalMessage(command: string, refusal: CommandRefusal): ToolResult {
 					`allowed-commands list and cannot be auto-approved in this headless session. Add it via ` +
 					`--allowed-commands, HEADLESSCODE_ALLOWED_COMMANDS, or <workspaceRoot>/.headlesscode/permissions.json, ` +
 					`or adjust your approach.`,
+			)
+		case "protected_store":
+			return err(
+				`execute_command: refusing to run '${command}': sub-command '${refusal.subCommand}' is a recursive delete ` +
+					`targeting the shared central store at '${refusal.storeRoot}' (resolved target '${refusal.target}'). ` +
+					`The central store is protected BY DEFAULT and this cannot be overridden via --allowed-commands or ` +
+					`permissions.json — it is shared across every project on this machine, and no single workspace may ` +
+					`delete it. Do not attempt to reset it from inside the harness.`,
 			)
 	}
 }
@@ -1083,16 +1104,20 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 			cwd = safeTarget(ctx, cwdArg)
 		}
 
-		// Permissions gate (command allow/deny + dangerous substitution):
-		// refuse BEFORE spawning so nothing is ever executed. Compound
-		// commands are checked per sub-command (parseCommand splits on
-		// &&/||/;/|/&) — a denied or unallow-listed sub-command blocks the
-		// whole chain. This applies to every executor built on this handler,
-		// including the read-only reviewer/QA executors (they share it), which
-		// also run unattended and could otherwise run arbitrary commands. A
-		// refusal is a real tool error (isError: true) and therefore counts
-		// toward the loop's consecutive-mistake bound, same as any tool error.
-		const refusal = checkCommand(command, ctx.permissions.allowedCommands, ctx.permissions.deniedCommands)
+		// Permissions gate (command allow/deny + dangerous substitution +
+		// central-store protection): refuse BEFORE spawning so nothing is ever
+		// executed. Compound commands are checked per sub-command (parseCommand
+		// splits on &&/||/;/|/&) — a denied or unallow-listed sub-command
+		// blocks the whole chain. This applies to every executor built on this
+		// handler, including the read-only reviewer/QA executors (they share
+		// it), which also run unattended and could otherwise run arbitrary
+		// commands. A refusal is a real tool error (isError: true) and
+		// therefore counts toward the loop's consecutive-mistake bound, same as
+		// any tool error. The command's resolved `cwd` anchors relative targets
+		// for the central-store check (see src/permissions/store-protection.ts).
+		const refusal = checkCommand(command, ctx.permissions.allowedCommands, ctx.permissions.deniedCommands, {
+			workspaceRoot: cwd,
+		})
 		if (refusal !== null) {
 			return refusalMessage(command, refusal)
 		}
@@ -1550,9 +1575,10 @@ function stubHandler(name: string, implemented: readonly string[] = ["read_file"
 /**
  * codebase_search — semantic search over the persisted codebase index.
  *
- * Embeds the query (one call), loads `<workspaceRoot>/.headlesscode/
- * codesearch/index.jsonl`, brute-force cosine against every stored chunk, and
- * returns the top-K as `file:startLine-endLine` + a snippet — matching the
+ * Embeds the query (one call), loads the central project store's
+ * `codesearch/index.jsonl` (see src/project-store.ts — every worktree of a
+ * repo shares the same index), brute-force cosine against every stored chunk,
+ * and returns the top-K as `file:startLine-endLine` + a snippet — matching the
  * vendored CodebaseSearchTool's output shape (src/vendor/zoo-code/src/core/
  * tools/CodebaseSearchTool.ts).
  *
@@ -1568,7 +1594,7 @@ async function codebaseSearchHandler(args: Record<string, unknown>, ctx: ToolCon
 
 	return (async () => {
 		// No index → actionable error, not a silent empty result.
-		const indexFile = path.join(ctx.workspaceRoot, INDEX_RELATIVE_PATH)
+		const indexFile = indexFilePath(ctx.workspaceRoot)
 		try {
 			await fsp.access(indexFile)
 		} catch {
@@ -1695,6 +1721,41 @@ const IMPLEMENTED_TOOLS = new Set([
 ])
 
 /**
+ * Register the TS-ONLY code-intelligence tools + run_tests — CONDITIONALLY,
+ * gated on the workspace actually being TS/JS (src/tools/language-detect.ts).
+ * All of these are built on ts.Program/tsx: on a Python/C++/Rust workspace
+ * they are dead weight (advertised on every request, costing prompt tokens,
+ * silently useless if tried) — the same "match the tool list to what actually
+ * works" discipline `codebase_search` already models with its broad extension
+ * list. On non-TS workspaces they are NOT registered here, so both the
+ * executor and the advertised tool list (loop.ts gates advertisement on
+ * executor.has) omit them.
+ */
+function registerTypeScriptGatedTools(
+	executor: ToolExecutor,
+	workspaceRoot: string,
+	options: ToolExecutorOptions = {},
+): void {
+	if (!isTypeScriptWorkspace(workspaceRoot)) {
+		return
+	}
+	executor.register("outline", outlineHandler)
+	executor.register("go_to_definition", goToDefinitionHandler)
+	executor.register("find_references", findReferencesHandler)
+	executor.register("import_graph", importGraphHandler)
+	// rename_symbol EDITS files, so it is deliberately NOT registered on the
+	// read-only executors (reviewer/QA/local explore) — they must never be
+	// able to modify source, and their tool lists don't advertise it either
+	// (see the RENAME_SYMBOL_TOOL note in src/codeintel/tools.ts).
+	executor.register("rename_symbol", renameSymbolHandler)
+	// run_tests RUNS the project's test suite — an edit-loop tool, not a
+	// read-only inspection, so like rename_symbol it is only registered on
+	// the headless (edit-capable) executor. Reviewer/QA use execute_command
+	// to run tests themselves; their tool lists don't advertise run_tests.
+	executor.register("run_tests", (args, ctx) => runTestsHandler(args, ctx, options.getSessionChangedFiles))
+}
+
+/**
  * Create the default headless executor for a workspace root: the 7 core tools
  * (read_file, write_to_file, apply_diff, search_replace, edit_file,
  * execute_command, list_files), attempt_completion + ask_followup_question
@@ -1713,10 +1774,7 @@ export function createHeadlessExecutor(workspaceRoot: string, options: ToolExecu
 	executor.register("codebase_search", codebaseSearchHandler)
 	executor.register("browser_action", browserActionHandler)
 	executor.register("describe_image", describeImageHandler)
-	executor.register("outline", outlineHandler)
-	executor.register("go_to_definition", goToDefinitionHandler)
-	executor.register("find_references", findReferencesHandler)
-	executor.register("import_graph", importGraphHandler)
+	registerTypeScriptGatedTools(executor, workspaceRoot, options)
 	executor.registerTodoList()
 
 	executor.register("attempt_completion", attemptCompletionHandler)
@@ -1755,10 +1813,15 @@ function createReadCommandExecutor(workspaceRoot: string, options: ToolExecutorO
 	executor.register("list_files", listFilesHandler)
 	executor.register("execute_command", executeCommandHandler)
 	executor.register("browser_action", browserActionHandler)
-	executor.register("outline", outlineHandler)
-	executor.register("go_to_definition", goToDefinitionHandler)
-	executor.register("find_references", findReferencesHandler)
-	executor.register("import_graph", importGraphHandler)
+	// The four read-only code-intelligence tools (TS-only) follow the same
+	// language gate as the headless executor — a reviewer of a C++/Python
+	// workspace must not be handed ts.Program tools.
+	if (isTypeScriptWorkspace(workspaceRoot)) {
+		executor.register("outline", outlineHandler)
+		executor.register("go_to_definition", goToDefinitionHandler)
+		executor.register("find_references", findReferencesHandler)
+		executor.register("import_graph", importGraphHandler)
+	}
 
 	executor.register("attempt_completion", attemptCompletionHandler)
 	executor.register("ask_followup_question", askFollowupQuestionHandler)

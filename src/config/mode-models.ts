@@ -1,5 +1,8 @@
 /**
- * Per-mode model assignment — `<workspaceRoot>/.headlesscode/mode-models.json`.
+ * Per-mode model assignment — the CENTRAL project store's `mode-models.json`
+ * (`~/.local/share/headlesscode/projects/<key>/mode-models.json`, see
+ * src/project-store.ts). Keyed by the repo's git-common-dir, so every worktree
+ * of a repo resolves the same per-mode models with zero per-directory setup.
  *
  * Maps a mode slug to an OpenRouter model id, with an optional `_default`
  * fallback key. Kept deliberately simple (a plain local config file — no
@@ -18,8 +21,8 @@
  *      which stays the single source of truth for the ultimate default.
  *
  * Fail-loudly on a malformed file (invalid JSON, non-object, or a non-string
- * value) — the same idiom as `<workspaceRoot>/.headlesscode/permissions.json`
- * (see src/permissions/config.ts): a broken config file throws with a clear
+ * value) — the same idiom as the central permissions.json (see
+ * src/permissions/config.ts): a broken config file throws with a clear
  * message, it never silently falls back. A missing file is NOT an error —
  * zero config means zero behavior change.
  */
@@ -27,8 +30,15 @@
 import * as fs from "node:fs"
 import * as path from "node:path"
 
-/** Config file location, relative to the workspace root. */
-export const MODE_MODELS_CONFIG_FILE = ".headlesscode/mode-models.json"
+import { resolveProjectDataDir } from "../project-store.js"
+
+/** Config file basename inside the central project data dir. */
+export const MODE_MODELS_CONFIG_FILE = "mode-models.json"
+
+/** Absolute path of the central mode-models.json for a workspace root. */
+export function modeModelsFilePath(workspaceRoot: string): string {
+	return path.join(resolveProjectDataDir(workspaceRoot), MODE_MODELS_CONFIG_FILE)
+}
 
 /** The fallback key inside the config file (not a mode slug itself). */
 export const DEFAULT_KEY = "_default"
@@ -61,23 +71,33 @@ export interface ResolveModelOptions {
 }
 
 /**
- * Load `<workspaceRoot>/.headlesscode/mode-models.json` when present.
+ * Load the central `mode-models.json` for a workspace when present.
  * Returns `null` when the file does not exist (the common case). A
  * present-but-malformed file throws — a broken mapping must fail loudly,
  * never silently fall back to a different model than the one configured.
+ * Falls back to the legacy `<workspaceRoot>/.headlesscode/mode-models.json`
+ * only when the central file is absent AND the legacy one still exists
+ * (pre-migration grace — the migration in resolveProjectDataDir normally
+ * moves it before this is reached).
  */
 export function loadModeModelsFile(workspaceRoot: string): ModeModelsFile | null {
-	const filePath = path.resolve(workspaceRoot, MODE_MODELS_CONFIG_FILE)
+	const filePath = modeModelsFilePath(workspaceRoot)
 	let raw: string
 	try {
 		raw = fs.readFileSync(filePath, "utf-8")
 	} catch (err) {
 		if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-			return null
+			const legacy = path.resolve(workspaceRoot, ".headlesscode", MODE_MODELS_CONFIG_FILE)
+			try {
+				raw = fs.readFileSync(legacy, "utf-8")
+			} catch {
+				return null
+			}
+		} else {
+			throw new Error(
+				`mode-models: cannot read mode-models file '${filePath}': ${err instanceof Error ? err.message : String(err)}`,
+			)
 		}
-		throw new Error(
-			`mode-models: cannot read mode-models file '${filePath}': ${err instanceof Error ? err.message : String(err)}`,
-		)
 	}
 
 	let parsed: unknown

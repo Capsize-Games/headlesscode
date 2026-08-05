@@ -83,6 +83,30 @@ class FakeLlmClient implements LlmClient {
 	}
 }
 
+/**
+ * FakeLlmClient + a live fetchModelContextWindow (loop.ts probes for this via
+ * duck typing, not the LlmClient interface — see maybeCondenseHistory).
+ * Counts calls so tests can assert the live lookup happens AT MOST ONCE per
+ * session and its resolved value is reused (not silently re-defaulted) on
+ * every subsequent condensation check.
+ */
+class FakeLlmClientWithContextWindow extends FakeLlmClient {
+	fetchModelContextWindowCalls = 0
+
+	constructor(
+		script: Array<(req: LlmRequest) => ChatMessage>,
+		usage: { promptTokens?: number; completionTokens?: number; cachedTokens?: number },
+		private readonly liveContextWindow: number,
+	) {
+		super(script, usage)
+	}
+
+	async fetchModelContextWindow(_model: string): Promise<number | undefined> {
+		this.fetchModelContextWindowCalls++
+		return this.liveContextWindow
+	}
+}
+
 function toolCall(name: string, args: unknown, id = `call_${Math.random().toString(36).slice(2)}`): ChatMessage {
 	const argumentsStr = typeof args === "string" ? args : JSON.stringify(args)
 	const call: ChatToolCall = { id, type: "function", function: { name, arguments: argumentsStr } }
@@ -578,6 +602,63 @@ async function testSessionAboveThresholdCondensesAndAccounts(): Promise<void> {
 }
 
 /**
+ * Regression test for a 2026-08-04 bug: the live-resolved context window was
+ * cached via a boolean (`contextWindowResolved`) recording only that a
+ * lookup was ATTEMPTED, never the value it resolved TO. Every condensation
+ * check after the session's first silently fell back to
+ * DEFAULT_CONTEXT_WINDOW_TOKENS (128k) even after a successful live lookup
+ * reported the model's real, much larger window — so condensation kept
+ * firing at 75% of 128k for the rest of the session regardless of the
+ * model's actual capacity. Caught live: a real deepseek-v4-flash session
+ * resolved 1,048,576 once, then condensed repeatedly at ~96-99k tokens
+ * anyway. Fixed by caching the resolved number itself
+ * (`resolvedContextWindowTokens`), not just that resolution happened.
+ *
+ * This test drives a session past TWO points that would cross 128k*0.75
+ * (96,000) but NEITHER of which crosses a realistic large window's 0.75
+ * threshold, and asserts: the live lookup fires exactly once, and NO
+ * condensation call ever happens — proving the second (and any later) check
+ * reused the cached large value instead of re-defaulting to 128k.
+ */
+async function testSessionReusesLiveResolvedContextWindowAcrossChecks(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-condense-livewin-"))
+	try {
+		const client = new FakeLlmClientWithContextWindow(
+			[
+				() => toolCall("write_to_file", { path: "a.txt", content: "hello" }),
+				() => toolCall("write_to_file", { path: "b.txt", content: "world" }),
+				() => toolCall("attempt_completion", { result: "done" }),
+			],
+			// Each main call reports 100,000 prompt tokens — comfortably over
+			// 128,000*0.75 (96,000, the OLD buggy threshold) on every check
+			// after the first, but nowhere near 1,000,000*0.75 (750,000, the
+			// real model's threshold this test proves gets reused).
+			{ promptTokens: 100_000, completionTokens: 100 },
+			1_000_000,
+		)
+		// No explicit contextWindowTokens override — force the session down
+		// the live-resolution code path this bug lives in, exactly like a
+		// real (non-test) session with no --context-window flag.
+		const session = await makeSession({ task: "write two files", client, workspaceRoot: ws })
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(
+			client.fetchModelContextWindowCalls,
+			1,
+			"the live lookup must happen at most once per session (resolved value reused after)",
+		)
+		assert.equal(
+			client.condenseCalls,
+			0,
+			"no condensation call may happen: every check must reuse the cached 1,000,000 window, " +
+				"never silently re-fall-back to the 128k default on the second+ check",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+/**
  * Tool-call-group safety at the SESSION level: a history with irregular
  * tool-call group sizes that triggers condensation must never produce a
  * request whose messages start mid-group (orphaned `tool` message).
@@ -775,6 +856,7 @@ const tests: Array<[string, () => Promise<void> | void]> = [
 	["condenseOldestTurns: usage callback fires with the real usage", testCondenseOldestTurnsDirectUsageCallback],
 	["session: below threshold -> byte-identical behavior, zero condensation calls", testSessionBelowThresholdNoCondensationCall],
 	["session: above threshold -> condensation + budget accounting includes it", testSessionAboveThresholdCondensesAndAccounts],
+	["session: live-resolved context window is cached and reused across checks (regression)", testSessionReusesLiveResolvedContextWindowAcrossChecks],
 	["session: condensation never splits a tool-call group", testSessionCondensationNeverSplitsToolGroup],
 	["session: post-condensation prefix stays stable across calls", testSessionPostCondensePrefixStable],
 	["session: condensation usage can trip the budget like a main call", testCondensationUsageTripsBudget],

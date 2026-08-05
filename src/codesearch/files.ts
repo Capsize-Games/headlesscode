@@ -33,6 +33,41 @@ const execFileP = promisify(execFile)
 /** Hard cap on files scanned per index build (mirrors upstream's MAX_LIST_FILES_LIMIT). */
 export const MAX_INDEXED_FILES = 50_000
 
+/**
+ * Generated-artifact directory names skipped EVEN when git-tracked — i.e. even
+ * when `.gitignore` doesn't cover them. Real-world repos routinely commit
+ * these by accident (a coverage report or build output checked in once and
+ * never gitignored); trusting `.gitignore` as the sole source of truth means
+ * that mistake silently costs real embedding-API money and index noise
+ * forever after. This list is deliberately narrow — only directory names
+ * that are near-universally machine-generated and never hand-written source,
+ * so it can't plausibly skip something a project actually wants indexed.
+ */
+const ALWAYS_EXCLUDE_DIR_NAMES = new Set(["coverage", "dist", "build", "node_modules", ".next", ".nuxt"])
+
+/**
+ * Generated lockfile basenames skipped even when git-tracked, for the same
+ * reason as ALWAYS_EXCLUDE_DIR_NAMES: exact machine-generated dependency
+ * manifests with no code-search value, occasionally matched by the
+ * extension allow-list (e.g. `package-lock.json`).
+ */
+const ALWAYS_EXCLUDE_FILE_BASENAMES = new Set([
+	"package-lock.json",
+	"yarn.lock",
+	"pnpm-lock.yaml",
+	"composer.lock",
+	"Gemfile.lock",
+	"poetry.lock",
+])
+
+/** True when `rel` (a workspace-relative POSIX path) should never be indexed, regardless of .gitignore. */
+function isAlwaysExcluded(rel: string): boolean {
+	if (ALWAYS_EXCLUDE_FILE_BASENAMES.has(path.basename(rel))) {
+		return true
+	}
+	return rel.split("/").some((segment) => ALWAYS_EXCLUDE_DIR_NAMES.has(segment))
+}
+
 /** Minimal fallback excludes used when the workspace is NOT a git repo. */
 const FALLBACK_EXCLUDES = new Set([
 	".git",
@@ -172,6 +207,9 @@ export async function walkSourceFiles(workspaceRoot: string): Promise<IndexableF
 			if (!CODE_EXTENSIONS.has(path.extname(rel).toLowerCase())) {
 				continue
 			}
+			if (isAlwaysExcluded(rel)) {
+				continue
+			}
 			// `git ls-files` reports directories as paths with trailing slashes
 			// only in odd edge cases; the extension check above already excludes
 			// them. Guard cheaply anyway.
@@ -225,7 +263,7 @@ export async function walkSourceFiles(workspaceRoot: string): Promise<IndexableF
 				if (!CODE_EXTENSIONS.has(path.extname(ent.name).toLowerCase())) {
 					continue
 				}
-				if (matchesIgnorePatterns(rel, patterns)) {
+				if (matchesIgnorePatterns(rel, patterns) || ALWAYS_EXCLUDE_FILE_BASENAMES.has(ent.name)) {
 					continue
 				}
 				out.push({ rel, abs })

@@ -15,8 +15,45 @@ export type { OrchestratorGroup, OrchestratorState } from "./state.js"
 export { runReview, parseReviewResult, reviewTools, HARNESS_ROOT, DEFAULT_REVIEW_PROMPT_PATH } from "./reviewer.js"
 export type { ReviewOptions, ReviewResult } from "./reviewer.js"
 
-export { watchGroups, inspectGroup, tailLog, groupWorktreePath, DEFAULT_POLL_INTERVAL_MS, DEFAULT_STALL_TIMEOUT_MS } from "./watch.js"
+export { analyzeWorktreeSessions, formatAnalysisReport, listSessionIds } from "./log-analysis.js"
+export type { SessionLogAnalysis, AnalyzeOptions, ToolErrorSample, StallGap, RepeatedCommand } from "./log-analysis.js"
+
+export { analyzeCliMain, parseAnalyzeArgs } from "./analyze-cli.js"
+
+export {
+	costHistoryFilePath,
+	appendCostHistoryRecord,
+	readCostHistory,
+	recordGroupCost,
+	sessionCostHistoryFilePath,
+	appendSessionCostRecord,
+	readSessionCostHistory,
+	recordAllSessionCosts,
+} from "./cost-history.js"
+export type { CostHistoryRecord, SessionCostRecord } from "./cost-history.js"
+
+export { costHistoryCliMain, parseCostHistoryArgs } from "./cost-history-cli.js"
+
+export { watchGroups, inspectGroup, tailLog, groupWorktreePath, isPidAlive, DEFAULT_POLL_INTERVAL_MS, DEFAULT_STALL_TIMEOUT_MS } from "./watch.js"
 export type { WatchOptions, WatchSummary } from "./watch.js"
+
+export { checkMergedByAncestor, checkMergedByGitHubPr } from "./merge-check.js"
+export type { MergeCheckResult } from "./merge-check.js"
+
+export {
+	applyCleanup,
+	assessGroupCleanup,
+	assessGroupCleanupSync,
+	checkGroupMerged,
+	cleanupMain,
+	parseCleanupArgs,
+	planCleanup,
+	removeHarnessArtifacts,
+	resolveBaseBranch,
+	resolveGroupBranch,
+	worktreeUncommitted,
+} from "./cleanup.js"
+export type { CleanupDeps, CleanupPlan, CleanupPlanEntry, CleanupRunResult, CleanupStatus, GhWiring } from "./cleanup.js"
 
 export {
 	buildStatusSummary,

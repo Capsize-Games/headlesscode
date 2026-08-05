@@ -121,10 +121,19 @@ function minIssue(group: InternalGroup): number {
  *   round fits in 2-4 worktrees (heuristic 4).
  *
  * @param issues issues to split (order-independent; output is sorted)
- * @returns worktree specs in ascending min-issue order, named w1..wN with
- *          airunner-convention task files
+ * @param opts.occupiedNames worktree names already in use in the TARGET repo
+ *        (e.g. a still-running round's `.worktrees/w1`) — naming skips over
+ *        these instead of colliding, so a second `orchestrate` invocation
+ *        against the same repo can run alongside an in-flight round instead
+ *        of failing the pre-spawn stale-worktree check. See cli.ts, which
+ *        populates this from the repo's actual `.worktrees/` listing.
+ * @returns worktree specs in ascending min-issue order, named around the
+ *          first free wN slots with airunner-convention task files
  */
-export function splitIssues(issues: SplitIssue[]): WorktreeSpec[] {
+export function splitIssues(
+	issues: SplitIssue[],
+	opts: { occupiedNames?: ReadonlySet<string> } = {},
+): WorktreeSpec[] {
 	if (issues.length === 0) {
 		return []
 	}
@@ -179,11 +188,21 @@ export function splitIssues(issues: SplitIssue[]): WorktreeSpec[] {
 		groups.splice(0, 1)
 	}
 
-	// Final sort by min issue number, then assign names + task files.
+	// Final sort by min issue number, then assign names + task files. Skips
+	// over any name already reserved via opts.occupiedNames (a still-running
+	// round in the same repo) — reserves each assigned name as it goes so two
+	// groups from THIS call never double-book the same slot either.
 	groups.sort((a, b) => minIssue(a) - minIssue(b))
-	return groups.map((group, index) => {
+	const reserved = new Set(opts.occupiedNames ?? [])
+	let nextSlot = 1
+	return groups.map((group) => {
+		while (reserved.has(`w${nextSlot}`)) {
+			nextSlot++
+		}
+		const name = `w${nextSlot}`
+		reserved.add(name)
+		nextSlot++
 		const issues = sortedIssues(group.issues)
-		const name = `w${index + 1}`
 		return {
 			name,
 			issues,
