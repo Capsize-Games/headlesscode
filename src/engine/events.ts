@@ -17,6 +17,11 @@
  *   mode_switched (switch_mode: the session's own active mode changed in
  *   place — same session, new system prompt/tool set; see
  *   plans/switch-mode-headless.md)
+ *   message_injected (live chat-UI control: a human wrote a new user message
+ *   into the RUNNING session via the dashboard — POST /api/session/:id/message
+ *   → `.harness.inject-message` marker; see loop.ts's checkInjectedMessage.
+ *   The text has been appended to the session's live history as a plain
+ *   user-role message and the next LLM call sees it)
  *
  * `condensed` is the one structural event that was originally only a log line
  * (`[condense] oldest turns condensed…` in src/engine/condense.ts) — the
@@ -348,6 +353,22 @@ export class EventFeed {
 			reason: reason.text,
 			...(reason.truncated ? { reasonTruncated: true } : {}),
 			autoApproved: fields.autoApproved,
+		})
+	}
+
+	/**
+	 * Mid-session message injection (live chat-UI control): a human wrote a
+	 * new message into a RUNNING session (POST /api/session/:id/message →
+	 * `.harness.inject-message` marker; see loop.ts's checkInjectedMessage).
+	 * The text is a plain user-role message the session appended to its live
+	 * history; the dashboard renders it inline as if the user had just typed
+	 * it. Truncated like every other large field.
+	 */
+	messageInjected(fields: { text: string }): Promise<void> {
+		const t = truncateField(fields.text)
+		return this.emit("message_injected", {
+			text: t.text,
+			...(t.truncated ? { textTruncated: true } : {}),
 		})
 	}
 

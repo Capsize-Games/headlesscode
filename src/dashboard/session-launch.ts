@@ -43,6 +43,8 @@ import { randomUUID } from "node:crypto"
 /** Marker basenames, relative to the session's workspace root (src/tools/executor.ts idiom). */
 const NEEDS_DECISION_FILENAME = ".harness.needs-decision"
 const DECISION_ANSWER_FILENAME = ".harness.decision-answer"
+/** Mid-session message injection marker (see src/engine/loop.ts's checkInjectedMessage). */
+const INJECT_MESSAGE_FILENAME = ".harness.inject-message"
 
 /** The default mode for a browser-launched top-level session. */
 export const DEFAULT_LAUNCH_MODE = "multi-agent-orchestrator-headless"
@@ -155,6 +157,23 @@ export async function launchSession(
  */
 export async function answerSessionDecision(workspaceRoot: string, answer: string): Promise<void> {
 	await fsp.writeFile(path.join(workspaceRoot, DECISION_ANSWER_FILENAME), answer, "utf-8")
+}
+
+/**
+ * Inject a new user message into a RUNNING session by writing
+ * `<workspaceRoot>/.harness.inject-message` (JSON: `{ text, injectedAt }`).
+ * The loop's checkInjectedMessage (src/engine/loop.ts) picks it up before its
+ * next LLM call, appends `text` as a plain user-role message, and deletes the
+ * marker — the model sees it as if the user had just typed it, NOT as a tool
+ * result or interruption. Mirrors answerSessionDecision's marker protocol;
+ * deliberately a SEPARATE code path from answering an escalated question.
+ *
+ * Policy: ONE pending message per session — a second injection while the
+ * first is still pending OVERWRITES it (overwrite-with-latest, no queue).
+ */
+export async function injectSessionMessage(workspaceRoot: string, text: string): Promise<void> {
+	const marker = JSON.stringify({ text, injectedAt: new Date().toISOString() }) + "\n"
+	await fsp.writeFile(path.join(workspaceRoot, INJECT_MESSAGE_FILENAME), marker, "utf-8")
 }
 
 /** Marker filenames, exported for tests. */

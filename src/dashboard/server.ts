@@ -18,6 +18,9 @@
  *   POST /api/settings/mode-models?repo=<path>   validate + write mode-models.json (creates .headlesscode/)
  *   POST /api/session/start       launch a detached top-level session (see src/dashboard/session-launch.ts)
  *   POST /api/session/:id/answer  write `.harness.decision-answer` to unblock an escalated question
+ *   POST /api/session/:id/message write `.harness.inject-message` ({ text, injectedAt }) — a new
+ *                                 user message the RUNNING session picks up before its next LLM call
+ *                                 (mid-session message injection; see src/engine/loop.ts)
  *   GET  /api/modes?repo=<path>   merged available modes (.roomodes + global) for the mode selector
  *   GET  /api/checkpoints?repo=<path>&session=<taskId>
  *                                 list checkpoints for a session (CheckpointService.list())
@@ -69,7 +72,7 @@ import * as path from "node:path"
 import { buildSummary, findSessionEventsFile, readSessionEvents } from "./aggregate.js"
 import { diffCheckpoints, listCheckpoints, renderUnifiedDiff, restoreCheckpoint } from "./checkpoints.js"
 import { renderPage } from "./page.js"
-import { answerSessionDecision, launchSession, validateSessionStartBody } from "./session-launch.js"
+import { answerSessionDecision, injectSessionMessage, launchSession, validateSessionStartBody } from "./session-launch.js"
 import { loadCustomModes } from "../engine/prompt.js"
 import {
 	loadModeModelsFile,
@@ -351,6 +354,72 @@ async function handleRequest(
 			// feed (same resolution pause/resume uses above).
 			const worktreeRoot = found.source === "." ? path.resolve(repo) : path.resolve(repo, found.source)
 			await answerSessionDecision(worktreeRoot, answer.trim())
+			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ sessionId, ok: true, worktree: found.source }),
+			)
+		} catch (error) {
+			res
+				.writeHead(500, { "content-type": "application/json; charset=utf-8" })
+				.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+		}
+		return
+	}
+
+	// Inject a new user message into a RUNNING session (live chat-UI control):
+	// POST /api/session/:id/message writes `.harness.inject-message` (JSON:
+	// { text, injectedAt }) in the session's workspace root — the SAME marker
+	// protocol pause/resume/answer use. The loop's checkInjectedMessage (see
+	// src/engine/loop.ts) picks it up before its next LLM call, appends the
+	// text as a plain user-role message, and deletes the marker — the model
+	// sees it as if the user had just typed it, NOT as a tool result or an
+	// interruption. Deliberately distinct from /answer (answering a pending
+	// ask_followup_question vs. an unprompted new message). Policy: one
+	// pending message — a second POST before the first is picked up
+	// OVERWRITES it (overwrite-with-latest, no queue). Same auth gate as the
+	// other /api/session/* POSTs (the generic check at the top).
+	const messageMatch = /^\/api\/session\/([^/]+)\/message$/.exec(url.pathname)
+	if (messageMatch && req.method !== "POST") {
+		res.writeHead(405, { "content-type": "text/plain" }).end("Method Not Allowed")
+		return
+	}
+	if (messageMatch && req.method === "POST") {
+		const sessionId = decodeURIComponent(messageMatch[1])
+		const repo = url.searchParams.get("repo") || options.repo
+		if (!repo) {
+			res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ error: "missing repo — pass ?repo=<path> or start the dashboard with --repo" }),
+			)
+			return
+		}
+		try {
+			const found = await findSessionEventsFile(repo, sessionId)
+			if (!found) {
+				res.writeHead(404, { "content-type": "application/json; charset=utf-8" }).end(
+					JSON.stringify({ error: `no session ${sessionId} found under ${repo}` }),
+				)
+				return
+			}
+			const raw = await readJsonBody(req)
+			let body: unknown
+			try {
+				body = JSON.parse(raw || "{}")
+			} catch (err) {
+				res
+					.writeHead(400, { "content-type": "application/json; charset=utf-8" })
+					.end(JSON.stringify({ error: `invalid JSON body: ${err instanceof Error ? err.message : String(err)}` }))
+				return
+			}
+			const text = (body as { text?: unknown })?.text
+			if (typeof text !== "string" || text.trim() === "") {
+				res
+					.writeHead(400, { "content-type": "application/json; charset=utf-8" })
+					.end(JSON.stringify({ error: "missing or empty 'text' — provide the message text to inject into the running session" }))
+				return
+			}
+			// The marker lives in the worktree that owns the session's events
+			// feed (same resolution pause/resume/answer use above).
+			const worktreeRoot = found.source === "." ? path.resolve(repo) : path.resolve(repo, found.source)
+			await injectSessionMessage(worktreeRoot, text.trim())
 			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(
 				JSON.stringify({ sessionId, ok: true, worktree: found.source }),
 			)
