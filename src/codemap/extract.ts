@@ -4,14 +4,19 @@
  *   - TypeScript/JS: reuse `getImportGraph()` from src/codeintel/import-graph.ts
  *     DIRECTLY (built on the TS Language Service, resolves tsconfig `paths`
  *     aliases exactly as the compiler would) — issue #17 explicitly says to
- *     wire it in, not reimplement it. Modules the TS program doesn't cover
- *     (e.g. standalone .mjs scripts outside tsconfig's include) simply carry
- *     no import edges.
+ *     wire it in, not reimplement it — plus `getCallGraph()` from
+ *     src/codeintel/call-graph.ts for Phase 2's cross-module call edges
+ *     (issue #18: real checker symbol resolution, never text matching).
+ *     Modules the TS program doesn't cover (e.g. standalone .mjs scripts
+ *     outside tsconfig's include) simply carry no import/call edges.
  *   - Python: shell out to scripts/codemap-python-extract.py (stdlib `ast`
  *     via a small Python subprocess — the project's established pattern for
- *     Python tooling; the script is deterministic, no LLM).
+ *     Python tooling; the script is deterministic, no LLM). Call edges stay
+ *     Phase 2 for Python (per-framework pattern lists — FastAPI routes,
+ *     Celery tasks — are project-specific by design, see docs/codemap.md).
  *   - C/C++: regex over `#include` directives (mechanical, good enough for
- *     structure; symbol-level resolution is explicitly Phase 2).
+ *     structure; symbol-level resolution is explicitly Phase 2 and likely
+ *     stays includes-only — a real call graph needs a compiler frontend).
  *
  * Edges whose target resolves OUTSIDE the workspace (node_modules, builtins,
  * absolute paths) are NOT emitted as graph edges — they are summarized per
@@ -22,6 +27,7 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 import { spawn } from "node:child_process"
 
+import { getCallGraph } from "../codeintel/call-graph.js"
 import { getImportGraph } from "../codeintel/import-graph.js"
 import { getCodeIntelCache } from "../codeintel/program.js"
 import type { CodemapEdge, ModuleEntry } from "./types.js"
@@ -70,6 +76,7 @@ function extractTypeScriptEdges(root: string, modules: ModuleEntry[]): { edges: 
 		return { edges, externalDeps }
 	}
 	const graph = getImportGraph(intel)
+	const callGraph = getCallGraph(intel)
 
 	for (const module of modules) {
 		if (module.language !== "typescript" && module.language !== "javascript") {
@@ -101,6 +108,42 @@ function extractTypeScriptEdges(root: string, modules: ModuleEntry[]): { edges: 
 		}
 		if (externals.size > 0) {
 			externalDeps[module.path] = [...externals].sort()
+		}
+	}
+
+	// Phase 2 call edges (issue #18): cross-module function/method/constructor
+	// calls, resolved by the TS checker to the callee's defining file. One
+	// edge per from/to pair — callee names are joined into `specifier` so the
+	// module graph stays clean (no parallel lines in the visualizer).
+	const CALL_NAMES_CAP = 8
+	for (const module of modules) {
+		if (module.language !== "typescript" && module.language !== "javascript") {
+			continue
+		}
+		const abs = path.join(root, module.path)
+		const calls = callGraph.get(abs)
+		if (calls === undefined || calls.length === 0) {
+			continue
+		}
+		const byTarget = new Map<string, string[]>()
+		for (const call of calls) {
+			if (call.resolvedFile === undefined) {
+				continue
+			}
+			const rel = toWorkspaceRel(root, call.resolvedFile)
+			if (rel === undefined || rel === module.path || !moduleSet.has(rel)) {
+				continue
+			}
+			const names = byTarget.get(rel) ?? []
+			if (!names.includes(call.callee)) {
+				names.push(call.callee)
+			}
+			byTarget.set(rel, names)
+		}
+		for (const [target, names] of byTarget) {
+			names.sort()
+			const shown = names.length > CALL_NAMES_CAP ? [...names.slice(0, CALL_NAMES_CAP), `… (${names.length} callees)`] : names
+			edges.push({ from: module.path, to: target, kind: "call", specifier: shown.join(", ") })
 		}
 	}
 	return { edges, externalDeps }

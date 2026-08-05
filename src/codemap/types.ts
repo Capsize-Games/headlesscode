@@ -1,12 +1,14 @@
 /**
  * Shared types for the deterministic per-project codemap subsystem
- * (src/codemap/ — module inventory, import/include graph, self-contained
- * HTML visualizer, fingerprint-aware watcher, dashboard endpoints).
+ * (src/codemap/ — module inventory, import/include/call graph,
+ * entrypoint-rooted flows, self-contained HTML visualizer,
+ * fingerprint-aware watcher, dashboard endpoints).
  *
  * Everything here is produced by a SCRIPT, never an LLM: the whole point
- * (issue #17) is a worker that needs to know "what is this repo, what imports
- * what" can read codemap.json instead of re-deriving structure via grep every
- * session — and trust it because it was generated mechanically.
+ * (issue #17/#18) is a worker that needs to know "what is this repo, what
+ * imports what, what calls what, where do the entrypoints lead" can read
+ * codemap.json instead of re-deriving structure via grep every session —
+ * and trust it because it was generated mechanically.
  */
 
 /** Naming-convention heuristic for a module's role (no semantics needed). */
@@ -30,19 +32,28 @@ export interface ModuleEntry {
 }
 
 /**
- * One import/include edge between two modules. Only edges whose target
- * resolves INSIDE the workspace appear here; imports that resolve outside
- * (node_modules, absolute paths, failures) are summarized per module in
- * ModuleEntry.externalDeps so the map never explodes with dependency nodes.
+ * One directed edge between two workspace modules. Only edges whose target
+ * resolves INSIDE the workspace appear here; edges that resolve outside
+ * (node_modules, builtins, absolute paths, failures) are summarized per
+ * module in ModuleEntry.externalDeps so the map never explodes with
+ * dependency nodes.
  */
 export interface CodemapEdge {
-	/** Workspace-relative POSIX path of the importing module. */
+	/** Workspace-relative POSIX path of the source module. */
 	from: string
-	/** Workspace-relative POSIX path of the imported module. */
+	/** Workspace-relative POSIX path of the target module. */
 	to: string
-	/** "import" for TS/JS/Python import statements, "include" for C/C++. */
-	kind: "import" | "include"
-	/** Raw specifier as written in source (e.g. "./b.js", "a.b.c", "foo.h"). */
+	/**
+	 * "import" for TS/JS/Python import statements, "include" for C/C++,
+	 * "call" for TS/JS cross-module function/method/constructor calls
+	 * (Phase 2 — resolved via the TS checker, not text matching).
+	 */
+	kind: "import" | "include" | "call"
+	/**
+	 * Raw specifier as written in source (e.g. "./b.js", "a.b.c", "foo.h").
+	 * For call edges: the sorted, comma-joined callee names that make up the
+	 * edge (one edge per from/to pair, so the module graph stays clean).
+	 */
 	specifier: string
 	/** True for TS `import type` / `export type` edges (thinner in the view). */
 	isTypeOnly?: boolean
@@ -70,6 +81,14 @@ export interface Codemap {
 	 * (not empty) on a module with no such imports.
 	 */
 	externalDeps: Record<string, string[]>
+	/**
+	 * Entrypoint-rooted end-to-end flows (Phase 2, issue #18): for each
+	 * module whose role is "entrypoint", the sorted list of every module
+	 * reachable from it along directed import+call edges. Derived, not
+	 * fingerprinted — a pure function of modules + edges. Deliberately NOT
+	 * ranked by "importance" (see src/codemap/flows.ts for why).
+	 */
+	flows: Record<string, string[]>
 }
 
 /** Per-module content fingerprints — the change-detection lock. */
