@@ -62,6 +62,11 @@ COPY shared ./shared
 COPY scripts/spawn-parallel-worktrees.sh scripts/run-worker.sh scripts/headlesscode-answer.sh ./scripts/
 RUN chmod +x scripts/spawn-parallel-worktrees.sh scripts/run-worker.sh scripts/headlesscode-answer.sh
 
+# Bundled shared content (per-stack rules.md, …). Copied into the image and
+# seeded into the container's $HOME at every start by entrypoint.sh — the
+# central store lives on the /data volume, which shadows image content.
+COPY shared ./shared
+
 # The package.json `bin` entry (src/cli.ts, shebang `#!/usr/bin/env tsx`)
 # only becomes executable when headlesscode is installed as a dependency of
 # another package, so wire a fixed wrapper that mirrors the repo's own

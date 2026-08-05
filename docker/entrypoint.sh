@@ -6,7 +6,10 @@
 #    named `server_data` volume at /data; that mount shadows whatever the
 #    image build created, so the workspace/state dirs must be (re)created
 #    at every container start.
-# 2. Set a usable git identity. The harness shells out to git (worktree
+# 2. Seed the central shared store (per-stack rules.md, …) from the image
+#    copy into $HOME — same reason: the volume shadows image content, so
+#    the seed must run at every start.
+# 3. Set a usable git identity. The harness shells out to git (worktree
 #    spawn, shadow-git checkpoints, reviewers); without user.name/email any
 #    commit fails. Override via GIT_AUTHOR_NAME/EMAIL (and the standard
 #    GIT_COMMITTER_* pair) — the env-file convention, like every other
@@ -21,7 +24,9 @@ mkdir -p "$HEADLESSCODE_WORKSPACE_ROOT" "$HOME"
 # honoring $HEADLESSCODE_DATA_DIR — the same resolution install-cli.sh uses):
 # $HEADLESSCODE_DATA_DIR/shared/stacks, else $HOME/.local/share/headlesscode/
 # shared/stacks. $HOME lives on the /data volume, which shadows image layers,
-# so this must run at every start.
+# so this must run at every start. Idempotent: only ever adds/overwrites
+# files under the image's shared/ tree — never deletes anything a user
+# placed in the central store.
 STACKS_SRC=/opt/headlesscode/shared/stacks
 if [ -d "$STACKS_SRC" ]; then
 	STACKS_DEST="${HEADLESSCODE_DATA_DIR:-$HOME/.local/share/headlesscode}/shared/stacks"

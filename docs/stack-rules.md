@@ -39,6 +39,11 @@ their source path in the prompt):
 | Central (global, ships with headlesscode) | `$HEADLESSCODE_DATA_DIR`/`shared/stacks/<stack>/rules.md` when that override is set, else `~/.local/share/headlesscode/shared/stacks/<stack>/rules.md` |
 | Project-local (optional override/addition) | `<workspaceRoot>/.roo/rules-stack-<stack>/rules.md` |
 
+Per-stack content is authored in-repo under `shared/stacks/<stack>/rules.md`
+(the source of truth, mirroring the central path minus the
+`~/.local/share/headlesscode` prefix) and installed to the central path on
+each machine.
+
 A missing file is never an error — same idiom as the existing missing-file
 handling for `mode-models.json` / `.roomodes` (zero config = zero behavior
 change).
@@ -47,17 +52,28 @@ change).
 
 The central tier is a shipped set, not a user-created one: the canonical
 copy lives in the repo at `shared/stacks/<stack>/rules.md` (mirroring the
-runtime layout), and is installed into the machine-global path by
-`scripts/install-cli.sh`. The runtime resolves that path the same way the
-installer writes it: `getCentralStackRulesDir()` (`src/engine/stacks.ts`) is
-store-root-derived via `projectStoreRoot()` (`src/project-store.ts`), which
-honors the `$HEADLESSCODE_DATA_DIR` override exactly like
-`sharedInstructionsRoot()` does — so the shipped content is
+runtime layout), and reaches the central store two ways:
+
+- **Local install** (`scripts/install-cli.sh`, via `scripts/sync-stack-rules.sh`):
+  syncs the repo's `shared/stacks/` tree into the central store (idempotent —
+  only ever adds/overwrites files under that tree, never deletes). Re-run
+  after `git pull` to pick up content changes.
+- **Docker image** (`docker/Dockerfile` + `docker/entrypoint.sh`): the image
+  COPYs `shared/`, and the entrypoint seeds it into the container's `$HOME`
+  at every start (the central store lives on the `/data` volume, which
+  shadows image content).
+
+Both paths resolve the destination the SAME way the runtime reads it:
+`getCentralStackRulesDir()` (`src/engine/stacks.ts`) is store-root-derived
+via `projectStoreRoot()` (`src/project-store.ts`), which honors the
+`$HEADLESSCODE_DATA_DIR` override — so the shipped content lands at
 `$HEADLESSCODE_DATA_DIR/shared/stacks/` when the override is set, else
-`~/.local/share/headlesscode/shared/stacks/`. For the Docker image,
-`docker/entrypoint.sh` seeds the same override-aware central-store path at
-every container start (the `/data` volume shadows image layers). Keep the
-in-repo file as the single source of truth for central stack rules.
+`~/.local/share/headlesscode/shared/stacks/`. An install/seed step that used
+a DIFFERENT resolution (as `install-cli.sh` briefly did) silently ships to
+the wrong place — verify both sides agree before trusting an install.
+
+A project-local `.roo/rules-stack-<stack>/rules.md` in a target repo is never
+touched by either path — that tier stays purely user-owned.
 
 ## Detection heuristics
 

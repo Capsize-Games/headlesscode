@@ -34,8 +34,11 @@
  */
 
 import { execFileSync } from "node:child_process"
+import * as fs from "node:fs"
+import * as path from "node:path"
 
 import { HeadlessSession } from "../engine/loop.js"
+import { Logger } from "../engine/logger.js"
 import { OpenRouterClient } from "../llm/openrouter.js"
 import { appendBrowserActionTool, appendCodeIntelTools, loadCustomModes } from "../engine/prompt.js"
 import { createQaHeadlessExecutor } from "../tools/executor.js"
@@ -226,6 +229,14 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
 		llmClient ??
 		new OpenRouterClient({ apiKey: process.env.HEADLESSCODE_OPENROUTER_API_KEY, defaultModel: model, baseUrl })
 
+	// Mirror every log line to <worktree>/qa.log — see reviewer.ts's runReview
+	// for the full rationale (same fix, same incident: review/QA run
+	// in-process rather than as a spawned subprocess with redirected stdout
+	// like a worker gets via harness.log, so there was no `tail -f`able file).
+	const logFilePath = path.join(workspaceRoot, "qa.log")
+	fs.appendFileSync(logFilePath, `\n===== headlesscode qa start: ${new Date().toISOString()} =====\n`, "utf-8")
+	const logger = new Logger({ level: "info", filePath: logFilePath })
+
 	const session = new HeadlessSession({
 		workspaceRoot,
 		mode,
@@ -239,6 +250,7 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
 		llmClient: client,
 		memory,
 		project,
+		logger,
 	})
 
 	const result: SessionResult = await session.run()
