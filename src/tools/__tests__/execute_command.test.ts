@@ -18,7 +18,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 
-import { createHeadlessExecutor } from "../executor.js"
+import { createHeadlessExecutor, BASH_PATH } from "../executor.js"
 
 async function mkTmpWorkspace(prefix: string): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -236,6 +236,25 @@ async function testNonDestructiveStoreAccessAllowed(): Promise<void> {
 }
 
 /**
+ * CI safety net for issue #35's fix: `BASH_PATH` must resolve to a REAL
+ * bash binary on whatever machine runs this test, not silently fall back to
+ * `undefined`. If a future environment (CI image, Docker base image swap)
+ * drops bash, this test fails LOUDLY here instead of the failure mode
+ * quietly reappearing as a mysterious false test/QA failure somewhere else
+ * (which is exactly how #35 itself was discovered — indirectly, via a false
+ * QA_VERDICT: FAIL, not a direct signal).
+ */
+async function testBashPathResolvesToARealBinary(): Promise<void> {
+	assert.notEqual(
+		BASH_PATH,
+		undefined,
+		"bash must be installed in this environment — execute_command's shell-compatibility fix (issue #35) " +
+			"depends on it; see the loud module-load warning in executor.ts if this ever legitimately changes",
+	)
+	assert.ok(await exists(BASH_PATH as string), `BASH_PATH (${BASH_PATH}) must point to a file that actually exists`)
+}
+
+/**
  * Issue caught live 2026-08-05: `spawn(cmd, { shell: true })` defaults to
  * `/bin/sh` (dash on Debian/Ubuntu), which has no bash-only features. A
  * model reaching for `${PIPESTATUS[0]}` (common, and nothing in any mode's
@@ -271,6 +290,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["execute_command: rm -rf of workspace scratch still runs (not the store)", testWorkspaceScratchCleanupStillAllowed],
 	["execute_command: non-destructive store access (echo) is allowed", testNonDestructiveStoreAccessAllowed],
 	["execute_command: bash-only syntax (${PIPESTATUS[0]}) does not falsely fail the command", testBashOnlySyntaxDoesNotFalselyFailTheCommand],
+	["execute_command: BASH_PATH resolves to a real binary (CI safety net for issue #35)", testBashPathResolvesToARealBinary],
 ]
 
 async function main(): Promise<void> {

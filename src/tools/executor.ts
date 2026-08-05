@@ -92,12 +92,28 @@ import { formatSearchResults, searchIndex } from "../codesearch/search.js"
  * Absolute path to bash, if present, for execute_command's shell (see the
  * spawn() call below) — `undefined` falls back to `spawn`'s own default
  * (`/bin/sh`) on a host without bash, rather than failing to spawn at all.
+ *
+ * That fallback must never be SILENT: it reintroduces the exact class of bug
+ * fixed in issue #35 (bash-only syntax like `${PIPESTATUS[0]}` silently
+ * failing the whole command line under `/bin/sh`, which produced a real
+ * false QA_VERDICT: FAIL). A future environment (e.g. a minimal Alpine-based
+ * Docker image shipping only `ash`) that lacks bash would quietly bring this
+ * back with no signal — so warn loudly, once, at module load, instead of
+ * letting it fail silently again.
  */
 export const BASH_PATH: string | undefined = fs.existsSync("/bin/bash")
 	? "/bin/bash"
 	: fs.existsSync("/usr/bin/bash")
 		? "/usr/bin/bash"
 		: undefined
+
+if (BASH_PATH === undefined) {
+	process.stderr.write(
+		"[executor] WARNING: bash not found (checked /bin/bash, /usr/bin/bash) — execute_command falls back to " +
+			"/bin/sh, which does NOT support bash-only syntax (${PIPESTATUS[0]}, [[ ]], arrays). This previously " +
+			"caused a real false QA_VERDICT: FAIL (issue #35). Install bash in this environment to avoid it.\n",
+	)
+}
 
 /** Cap on tool-result text fed back to the model (keep context bounded). */
 export const MAX_RESULT_CHARS = 30_000
