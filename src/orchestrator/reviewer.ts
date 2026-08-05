@@ -21,10 +21,13 @@
  */
 
 import * as fs from "node:fs/promises"
+import * as fsSync from "node:fs"
+import * as path from "node:path"
 import { execFileSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 
 import { HeadlessSession } from "../engine/loop.js"
+import { Logger } from "../engine/logger.js"
 import { OpenRouterClient } from "../llm/openrouter.js"
 import { createReadOnlyHeadlessExecutor } from "../tools/executor.js"
 import { getNativeTools } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/index.js"
@@ -164,6 +167,20 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 	const systemPromptOverride = await fs.readFile(reviewPromptPath, "utf-8")
 	const client = llmClient ?? new OpenRouterClient({ apiKey: process.env.HEADLESSCODE_OPENROUTER_API_KEY, defaultModel: model })
 
+	// Mirror every log line to <worktree>/review.log — the same visibility
+	// `run-worker.sh` gives a worker via harness.log (a plain `tail -f`
+	// target), which review/QA sessions never had: they run IN-PROCESS
+	// inside orchestrate rather than as a spawned subprocess with redirected
+	// stdout, so their activity was only ever visible by hand-parsing the
+	// structured `.headlesscode/events/*.jsonl` feed. Raised directly
+	// 2026-08-05: "frustrating that i can't see the review logs the same way
+	// i can the harness logs... i don't like having to hunt them down."
+	// Append-only (matches harness.log's own convention across
+	// retries/rework re-reviews) with a run-separator line per session.
+	const logFilePath = path.join(workspaceRoot, "review.log")
+	fsSync.appendFileSync(logFilePath, `\n===== headlesscode review start: ${new Date().toISOString()} =====\n`, "utf-8")
+	const logger = new Logger({ level: "info", filePath: logFilePath })
+
 	const session = new HeadlessSession({
 		workspaceRoot,
 		mode,
@@ -175,6 +192,7 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 		tools: reviewTools(),
 		executor: createReadOnlyHeadlessExecutor(workspaceRoot),
 		llmClient: client,
+		logger,
 	})
 
 	const result: SessionResult = await session.run()

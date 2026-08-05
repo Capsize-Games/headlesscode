@@ -8,7 +8,7 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 
-import { parseQaResult, runQaWithRetries } from "../qa.js"
+import { parseQaResult, runQa, runQaWithRetries } from "../qa.js"
 import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } from "../../engine/types.js"
 
 // ─── Fake LLM client (same pattern as engine/__tests__/loop.test.ts) ─────────
@@ -187,6 +187,24 @@ async function testMissingStructuredQaVerdictFallsBackToHeuristic(): Promise<voi
 // failures, never on a real pass/fail. These exercise the REAL
 // HeadlessSession (via an injected FakeLlmClient, no network).
 
+/**
+ * QA-side twin of the reviewer.ts fix, same incident: mirror every log
+ * line to <worktree>/qa.log — a real, tailable file (matching harness.log's
+ * convention), rather than only the structured events feed.
+ */
+async function testRunQaWritesATailableLogFile(): Promise<void> {
+	const ws = await makeWorkspace()
+	try {
+		const client = new FakeLlmClient([() => attemptCompletion("QA_VERDICT: PASS")])
+		await runQa({ workspaceRoot: ws, llmClient: client, maxIterations: 5 })
+		const logContent = await fs.readFile(path.join(ws, "qa.log"), "utf-8")
+		assert.match(logContent, /===== headlesscode qa start:/, "run-separator line present")
+		assert.match(logContent, /INFO\s+\[loop\] session start/, "real loop log lines mirrored to the file")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 async function testRunQaWithRetriesReturnsPassImmediately(): Promise<void> {
 	const ws = await makeWorkspace()
 	try {
@@ -248,6 +266,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["structured QA_VERDICT: FAIL wins even with pass language elsewhere", testStructuredVerdictFailWinsEvenWithPassLanguage],
 	["structured qa verdict line is case-insensitive and trims whitespace", testStructuredVerdictIsCaseInsensitiveAndTrimsWhitespace],
 	["missing structured QA_VERDICT falls back to the heuristic", testMissingStructuredQaVerdictFallsBackToHeuristic],
+	["runQa writes a tailable qa.log", testRunQaWritesATailableLogFile],
 	["runQaWithRetries: a normal pass verdict returns immediately, no retry", testRunQaWithRetriesReturnsPassImmediately],
 	["runQaWithRetries: retries after a QA-session error and succeeds on the 2nd attempt", testRunQaWithRetriesRetriesAfterSessionError],
 	["runQaWithRetries: exhausts retries and returns the final error verdict", testRunQaWithRetriesExhaustsRetries],

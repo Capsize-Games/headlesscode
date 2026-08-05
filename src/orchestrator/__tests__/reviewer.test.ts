@@ -8,7 +8,7 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 
-import { parseReviewResult, runReviewWithRetries } from "../reviewer.js"
+import { parseReviewResult, runReview, runReviewWithRetries } from "../reviewer.js"
 import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } from "../../engine/types.js"
 
 // ─── Fake LLM client (same pattern as engine/__tests__/loop.test.ts) ─────────
@@ -286,6 +286,41 @@ async function makeWorkspace(): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-review-retry-"))
 }
 
+/**
+ * Raised directly 2026-08-05: "frustrating that i can't see the review logs
+ * the same way i can the harness logs... i don't like having to hunt them
+ * down." Review/QA run IN-PROCESS inside orchestrate (unlike a worker,
+ * spawned as a subprocess with stdout redirected to harness.log by
+ * run-worker.sh), so there was no plain, tailable log file — only the
+ * structured `.headlesscode/events/*.jsonl` feed. Fixed by mirroring every
+ * log line to <worktree>/review.log, same convention as harness.log
+ * (append-only across retries/rework re-reviews, run-separator per session).
+ */
+async function testRunReviewWritesATailableLogFile(): Promise<void> {
+	const ws = await makeWorkspace()
+	try {
+		const client = new FakeLlmClient([() => attemptCompletion("VERDICT: CLEAN")])
+		await runReview({ workspaceRoot: ws, llmClient: client, maxIterations: 5 })
+		const logContent = await fs.readFile(path.join(ws, "review.log"), "utf-8")
+		assert.match(logContent, /===== headlesscode review start:/, "run-separator line present")
+		assert.match(logContent, /INFO\s+\[loop\] session start/, "real loop log lines mirrored to the file")
+
+		// A second call (e.g. a retry, or re-review after rework) must APPEND,
+		// not truncate — matching harness.log's own convention.
+		const client2 = new FakeLlmClient([() => attemptCompletion("VERDICT: CLEAN")])
+		await runReview({ workspaceRoot: ws, llmClient: client2, maxIterations: 5 })
+		const logContent2 = await fs.readFile(path.join(ws, "review.log"), "utf-8")
+		assert.ok(logContent2.length > logContent.length, "second session must append, not overwrite")
+		assert.equal(
+			(logContent2.match(/===== headlesscode review start:/g) ?? []).length,
+			2,
+			"two sessions -> two run-separator lines",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 async function testRunReviewWithRetriesReturnsCleanImmediately(): Promise<void> {
 	const ws = await makeWorkspace()
 	try {
@@ -354,6 +389,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["structured verdict line is case-insensitive and trims whitespace", testStructuredVerdictIsCaseInsensitiveAndTrimsWhitespace],
 	["missing structured verdict falls back to the heuristic", testMissingStructuredVerdictFallsBackToHeuristic],
 	["bare 'wrong'/'regression'/'does not' in clean prose does not mark a finding", testBareWrongRegressionDoesNotMarkFinding],
+	["runReview writes a tailable review.log, appended across sessions (not truncated)", testRunReviewWritesATailableLogFile],
 	["runReviewWithRetries: a normal clean verdict returns immediately, no retry", testRunReviewWithRetriesReturnsCleanImmediately],
 	["runReviewWithRetries: retries after a review-session error and succeeds on the 2nd attempt", testRunReviewWithRetriesRetriesAfterSessionError],
 	["runReviewWithRetries: exhausts retries and returns the final error verdict", testRunReviewWithRetriesExhaustsRetries],
