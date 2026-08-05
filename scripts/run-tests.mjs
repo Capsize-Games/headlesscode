@@ -43,7 +43,11 @@ function findTestFiles(dir) {
 
 function main() {
 	const filterArgIndex = process.argv.indexOf("--filter")
-	const filter = filterArgIndex >= 0 ? process.argv[filterArgIndex + 1] : undefined
+	// `npm test -- orchestrator` passes "orchestrator" through as a bare
+	// positional arg (no `--filter` flag) — support both forms so the exact
+	// invocation issue #4 asked for works, not just the explicit-flag form.
+	const bareArg = process.argv.slice(2).find((a) => !a.startsWith("--"))
+	const filter = filterArgIndex >= 0 ? process.argv[filterArgIndex + 1] : bareArg
 
 	const srcDir = path.join(repoRoot, "src")
 	const discovered = findTestFiles(srcDir)
