@@ -12,7 +12,14 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { execFileSync } from "node:child_process"
 
-import { appendCostHistoryRecord, readCostHistory, recordGroupCost, type CostHistoryRecord } from "../cost-history.js"
+import {
+	appendCostHistoryRecord,
+	readCostHistory,
+	recordGroupCost,
+	recordAllSessionCosts,
+	readSessionCostHistory,
+	type CostHistoryRecord,
+} from "../cost-history.js"
 import type { OrchestratorGroup } from "../state.js"
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -147,6 +154,154 @@ async function testRecordGroupCostDefaultsMissingIssuesAndCachedTokens(): Promis
 	}
 }
 
+// ─── recordAllSessionCosts: per-session outcome tracking ────────────────────
+
+async function writeUsageFile(repo: string, groupName: string, sessionId: string, record: object): Promise<void> {
+	const dir = path.join(repo, ".worktrees", groupName, ".headlesscode", "usage")
+	await fs.mkdir(dir, { recursive: true })
+	await fs.writeFile(path.join(dir, `${sessionId}.jsonl`), `${JSON.stringify(record)}\n`, "utf-8")
+}
+
+async function writeLiveFile(repo: string, groupName: string, sessionId: string, record: object): Promise<void> {
+	const dir = path.join(repo, ".worktrees", groupName, ".headlesscode", "usage")
+	await fs.mkdir(dir, { recursive: true })
+	await fs.writeFile(path.join(dir, `${sessionId}.live.json`), JSON.stringify(record), "utf-8")
+}
+
+async function testRecordAllSessionCostsClassifiesSuccessErrorAndKilled(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		await writeUsageFile(repo, "w1", "session-ok", {
+			sessionId: "session-ok",
+			mode: "code",
+			model: "deepseek/deepseek-v4-flash",
+			iterations: 10,
+			inputTokens: 1000,
+			outputTokens: 100,
+			cachedTokens: 500,
+			costUsd: 0.01,
+			startedAt: "2026-08-05T00:00:00.000Z",
+			endedAt: "2026-08-05T00:05:00.000Z",
+			status: "success",
+		})
+		await writeUsageFile(repo, "w1", "session-errored", {
+			sessionId: "session-errored",
+			mode: "deepseek-reviewer",
+			model: "deepseek/deepseek-v4-flash",
+			iterations: 40,
+			inputTokens: 500,
+			outputTokens: 50,
+			costUsd: 0.005,
+			startedAt: "2026-08-05T00:10:00.000Z",
+			endedAt: "2026-08-05T00:15:00.000Z",
+			status: "error",
+		})
+		// A live snapshot with NO corresponding completed .jsonl — the process
+		// was killed/crashed before recordUsage()/removeLiveSnapshot() ran.
+		await writeLiveFile(repo, "w1", "session-killed", {
+			sessionId: "session-killed",
+			mode: "code",
+			model: "deepseek/deepseek-v4-flash",
+			iterations: 3,
+			inputTokens: 200,
+			outputTokens: 20,
+			costUsd: 0.002,
+			startedAt: "2026-08-05T00:20:00.000Z",
+			status: "running",
+		})
+
+		const group = baseGroup({ worktree: ".worktrees/w1" })
+		const recorded = await recordAllSessionCosts(repo, group)
+		assert.equal(recorded.length, 3)
+
+		const bySession = new Map(recorded.map((r) => [r.sessionId, r]))
+		assert.equal(bySession.get("session-ok")?.status, "success")
+		assert.equal(bySession.get("session-errored")?.status, "error")
+		assert.equal(bySession.get("session-killed")?.status, "killed")
+		assert.equal(bySession.get("session-killed")?.costUsd, 0.002, "a killed session's LAST-known cost is still captured, not lost")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testRecordAllSessionCostsIsIdempotent(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		await writeUsageFile(repo, "w1", "session-a", {
+			sessionId: "session-a",
+			mode: "code",
+			model: "deepseek/deepseek-v4-flash",
+			iterations: 5,
+			inputTokens: 100,
+			outputTokens: 10,
+			costUsd: 0.001,
+			startedAt: "2026-08-05T00:00:00.000Z",
+			endedAt: "2026-08-05T00:01:00.000Z",
+			status: "success",
+		})
+		const group = baseGroup({ worktree: ".worktrees/w1" })
+		const first = await recordAllSessionCosts(repo, group)
+		assert.equal(first.length, 1)
+		const second = await recordAllSessionCosts(repo, group)
+		assert.equal(second.length, 0, "an already-recorded session must never be re-recorded")
+
+		const all = await readSessionCostHistory(repo)
+		assert.equal(all.length, 1, "exactly one record on disk despite calling recordAllSessionCosts twice")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testLiveSnapshotIgnoredWhenCompletedRecordExists(): Promise<void> {
+	// A stale .live.json left over from before the FINAL write (a normal
+	// artifact of the writeLiveSnapshot -> recordUsage -> removeLiveSnapshot
+	// sequence racing with a crash-recovery read) must not be misclassified
+	// as "killed" when a real completed .jsonl for the SAME session exists.
+	const repo = await tmpRepo()
+	try {
+		await writeUsageFile(repo, "w1", "session-both", {
+			sessionId: "session-both",
+			mode: "code",
+			model: "deepseek/deepseek-v4-flash",
+			iterations: 10,
+			inputTokens: 1000,
+			outputTokens: 100,
+			costUsd: 0.01,
+			startedAt: "2026-08-05T00:00:00.000Z",
+			endedAt: "2026-08-05T00:05:00.000Z",
+			status: "success",
+		})
+		await writeLiveFile(repo, "w1", "session-both", {
+			sessionId: "session-both",
+			mode: "code",
+			model: "deepseek/deepseek-v4-flash",
+			iterations: 9,
+			inputTokens: 900,
+			outputTokens: 90,
+			costUsd: 0.009,
+			startedAt: "2026-08-05T00:00:00.000Z",
+			status: "running",
+		})
+		const group = baseGroup({ worktree: ".worktrees/w1" })
+		const recorded = await recordAllSessionCosts(repo, group)
+		assert.equal(recorded.length, 1, "only the completed record counts, not a stale live snapshot for the same session")
+		assert.equal(recorded[0]?.status, "success")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testRecordAllSessionCostsNoUsageDirReturnsEmpty(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const group = baseGroup({ worktree: ".worktrees/w1" })
+		const recorded = await recordAllSessionCosts(repo, group)
+		assert.deepEqual(recorded, [])
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: [string, () => Promise<void>][] = [
@@ -156,6 +311,10 @@ const tests: [string, () => Promise<void>][] = [
 	["recordGroupCost builds a correct record from a terminal group", testRecordGroupCostBuildsCorrectRecord],
 	["recordGroupCost returns undefined + writes nothing when group has no usage", testRecordGroupCostSkipsWhenNoUsage],
 	["recordGroupCost defaults missing issues/cachedTokens", testRecordGroupCostDefaultsMissingIssuesAndCachedTokens],
+	["recordAllSessionCosts classifies success/error/killed", testRecordAllSessionCostsClassifiesSuccessErrorAndKilled],
+	["recordAllSessionCosts is idempotent", testRecordAllSessionCostsIsIdempotent],
+	["stale live snapshot ignored when a completed record exists for the same session", testLiveSnapshotIgnoredWhenCompletedRecordExists],
+	["recordAllSessionCosts with no usage dir returns empty", testRecordAllSessionCostsNoUsageDirReturnsEmpty],
 ]
 
 async function main(): Promise<void> {

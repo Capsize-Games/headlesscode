@@ -20,8 +20,17 @@ export type { SessionLogAnalysis, AnalyzeOptions, ToolErrorSample, StallGap, Rep
 
 export { analyzeCliMain, parseAnalyzeArgs } from "./analyze-cli.js"
 
-export { costHistoryFilePath, appendCostHistoryRecord, readCostHistory, recordGroupCost } from "./cost-history.js"
-export type { CostHistoryRecord } from "./cost-history.js"
+export {
+	costHistoryFilePath,
+	appendCostHistoryRecord,
+	readCostHistory,
+	recordGroupCost,
+	sessionCostHistoryFilePath,
+	appendSessionCostRecord,
+	readSessionCostHistory,
+	recordAllSessionCosts,
+} from "./cost-history.js"
+export type { CostHistoryRecord, SessionCostRecord } from "./cost-history.js"
 
 export { costHistoryCliMain, parseCostHistoryArgs } from "./cost-history-cli.js"
 

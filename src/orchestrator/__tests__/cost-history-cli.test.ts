@@ -10,7 +10,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { execFileSync } from "node:child_process"
 
-import { appendCostHistoryRecord, type CostHistoryRecord } from "../cost-history.js"
+import { appendCostHistoryRecord, appendSessionCostRecord, type CostHistoryRecord, type SessionCostRecord } from "../cost-history.js"
 import { costHistoryCliMain, parseCostHistoryArgs } from "../cost-history-cli.js"
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -43,6 +43,26 @@ function baseRecord(overrides: Partial<CostHistoryRecord> = {}): CostHistoryReco
 	}
 }
 
+function baseSessionRecord(overrides: Partial<SessionCostRecord> = {}): SessionCostRecord {
+	return {
+		recordedAt: "2026-08-05T00:00:00.000Z",
+		repo: "/tmp/repo",
+		groupName: "w1",
+		issues: [27],
+		sessionId: "session-1",
+		mode: "code",
+		status: "success",
+		costUsd: 0.01,
+		inputTokens: 100,
+		outputTokens: 10,
+		cachedTokens: 50,
+		iterations: 5,
+		startedAt: "2026-08-05T00:00:00.000Z",
+		endedAt: "2026-08-05T00:05:00.000Z",
+		...overrides,
+	}
+}
+
 function captureStdout(): { get: () => string; restore: () => void } {
 	let buf = ""
 	const orig = process.stdout.write.bind(process.stdout)
@@ -63,7 +83,12 @@ async function testParseArgsRequiresRepo(): Promise<void> {
 
 async function testParseArgsCollectsMultipleIssues(): Promise<void> {
 	const result = parseCostHistoryArgs(["--repo", "/tmp/x", "--issue", "27", "--issue", "29", "--json"])
-	assert.deepEqual(result, { repo: "/tmp/x", issues: [27, 29], json: true })
+	assert.deepEqual(result, { repo: "/tmp/x", issues: [27, 29], sessions: false, json: true })
+}
+
+async function testParseArgsSessionsFlag(): Promise<void> {
+	const result = parseCostHistoryArgs(["--repo", "/tmp/x", "--sessions"])
+	assert.deepEqual(result, { repo: "/tmp/x", issues: [], sessions: true, json: false })
 }
 
 async function testParseArgsRejectsNonIntegerIssue(): Promise<void> {
@@ -150,16 +175,60 @@ async function testMainEmptyHistoryMessage(): Promise<void> {
 	}
 }
 
+async function testMainShowsWastedSpendSummary(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		await appendCostHistoryRecord(repo, baseRecord({ costUsd: 0.05 }))
+		await appendSessionCostRecord(repo, baseSessionRecord({ sessionId: "s-ok", status: "success", costUsd: 0.03 }))
+		await appendSessionCostRecord(repo, baseSessionRecord({ sessionId: "s-killed", status: "killed", costUsd: 0.02 }))
+		const out = captureStdout()
+		let code: number
+		try {
+			code = await costHistoryCliMain(["--repo", repo])
+		} finally {
+			out.restore()
+		}
+		assert.equal(code, 0)
+		assert.match(out.get(), /1 wasted session\(s\).*\$0\.0200/)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testMainSessionsFlagShowsPerSessionBreakdown(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		await appendSessionCostRecord(repo, baseSessionRecord({ sessionId: "s-ok", status: "success", costUsd: 0.03 }))
+		await appendSessionCostRecord(repo, baseSessionRecord({ sessionId: "s-errored", status: "error", costUsd: 0.01 }))
+		const out = captureStdout()
+		let code: number
+		try {
+			code = await costHistoryCliMain(["--repo", repo, "--sessions"])
+		} finally {
+			out.restore()
+		}
+		assert.equal(code, 0)
+		assert.match(out.get(), /s-ok/)
+		assert.match(out.get(), /s-errored/)
+		assert.match(out.get(), /wasted \(non-success\): \$0\.0100/)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: [string, () => Promise<void>][] = [
 	["parseCostHistoryArgs requires --repo", testParseArgsRequiresRepo],
 	["parseCostHistoryArgs collects multiple --issue flags", testParseArgsCollectsMultipleIssues],
+	["parseCostHistoryArgs --sessions flag", testParseArgsSessionsFlag],
 	["parseCostHistoryArgs rejects non-integer --issue", testParseArgsRejectsNonIntegerIssue],
 	["main prints a table with a total", testMainPrintsTableWithTotal],
 	["main filters by --issue", testMainFiltersByIssue],
 	["main --json prints raw records", testMainJsonOutput],
 	["main prints a clear message on empty history", testMainEmptyHistoryMessage],
+	["main shows a wasted-spend summary line when non-success sessions exist", testMainShowsWastedSpendSummary],
+	["main --sessions shows the per-session breakdown", testMainSessionsFlagShowsPerSessionBreakdown],
 ]
 
 async function main(): Promise<void> {

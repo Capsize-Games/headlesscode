@@ -1,15 +1,17 @@
 /**
  * `headlesscode cost-history` subcommand — read-side for cost-history.ts's
- * central `cost-history.jsonl`. Recording is automatic and mandatory (see
- * watch.ts's `recordCostIfTerminal`); this is just for looking at what's
- * been recorded — filterable by issue number, printed as a human-readable
- * table or raw JSON. Building actual cost ESTIMATES from this history is
- * explicit future work, not this command.
+ * central `cost-history.jsonl` (per-group combined totals) and
+ * `session-cost-history.jsonl` (per-session, with outcome — the wasted-
+ * spend breakdown). Recording is automatic and mandatory (see watch.ts's
+ * `recordCostIfSettled`/`recordAllSessionCosts`); this is just for looking
+ * at what's been recorded — filterable by issue number, printed as a
+ * human-readable table or raw JSON. Building actual cost ESTIMATES from
+ * this history is explicit future work, not this command.
  *
- *   headlesscode cost-history --repo <path> [--issue <n>] [--json]
+ *   headlesscode cost-history --repo <path> [--issue <n>] [--sessions] [--json]
  */
 
-import { readCostHistory, type CostHistoryRecord } from "./cost-history.js"
+import { readCostHistory, readSessionCostHistory, type CostHistoryRecord, type SessionCostRecord } from "./cost-history.js"
 
 const COST_HISTORY_USAGE = `headlesscode cost-history — read recorded cost/token history for a repo
 
@@ -19,6 +21,10 @@ Usage:
 Options:
   --repo <path>     Target repo root (required)
   --issue <n>       Only show records covering this issue number (repeatable)
+  --sessions        Show the per-session breakdown (with outcome: success/
+                     error/budget/killed) instead of per-group totals —
+                     this is where wasted spend (non-success outcomes)
+                     is visible
   --json            Print the raw records as JSON instead of a table
   --help            Show this help and exit
 `
@@ -26,12 +32,14 @@ Options:
 interface CostHistoryCliOptions {
 	repo: string
 	issues: number[]
+	sessions: boolean
 	json: boolean
 }
 
 export function parseCostHistoryArgs(argv: string[]): CostHistoryCliOptions | { help: true } | { error: string } {
 	let repo: string | undefined
 	const issues: number[] = []
+	let sessions = false
 	let json = false
 
 	for (let i = 0; i < argv.length; i++) {
@@ -47,6 +55,8 @@ export function parseCostHistoryArgs(argv: string[]): CostHistoryCliOptions | { 
 				return { error: `--issue must be an integer, got: ${raw}` }
 			}
 			issues.push(n)
+		} else if (arg === "--sessions") {
+			sessions = true
 		} else if (arg === "--json") {
 			json = true
 		} else {
@@ -57,10 +67,10 @@ export function parseCostHistoryArgs(argv: string[]): CostHistoryCliOptions | { 
 	if (!repo) {
 		return { error: "--repo is required" }
 	}
-	return { repo, issues, json }
+	return { repo, issues, sessions, json }
 }
 
-function formatTable(records: CostHistoryRecord[]): string {
+function formatTable(records: CostHistoryRecord[], sessionRecords: SessionCostRecord[]): string {
 	if (records.length === 0) {
 		return "No cost history recorded for this repo yet."
 	}
@@ -79,6 +89,45 @@ function formatTable(records: CostHistoryRecord[]): string {
 	}
 	lines.push("")
 	lines.push(`${records.length} record(s), total: $${totalCost.toFixed(4)}`)
+
+	// Wasted-spend summary, from the per-session breakdown: any session
+	// whose outcome was NOT "success" (errored, hit budget, or was killed
+	// before finishing) is spend that produced no useful outcome on its
+	// own — surfaced here so it's never silently invisible inside a
+	// group's combined total. Use --sessions to see which sessions.
+	const wasted = sessionRecords.filter((r) => r.status !== "success")
+	if (wasted.length > 0) {
+		const wastedCost = wasted.reduce((sum, r) => sum + r.costUsd, 0)
+		lines.push(
+			`${wasted.length} wasted session(s) (error/budget/killed): $${wastedCost.toFixed(4)} — see --sessions for detail`,
+		)
+	}
+	return lines.join("\n")
+}
+
+function formatSessionTable(records: SessionCostRecord[]): string {
+	if (records.length === 0) {
+		return "No session cost history recorded for this repo yet."
+	}
+	const lines: string[] = []
+	lines.push(
+		`${"GROUP".padEnd(10)}${"MODE".padEnd(18)}${"STATUS".padEnd(10)}${"COST".padEnd(10)}${"ITER".padEnd(6)}SESSION · RECORDED`,
+	)
+	let totalCost = 0
+	let wastedCost = 0
+	for (const r of records) {
+		totalCost += r.costUsd
+		if (r.status !== "success") {
+			wastedCost += r.costUsd
+		}
+		lines.push(
+			`${r.groupName.padEnd(10)}${r.mode.padEnd(18)}${r.status.padEnd(10)}` +
+				`$${r.costUsd.toFixed(4)}`.padEnd(10) +
+				`${String(r.iterations).padEnd(6)}${r.sessionId} · ${r.recordedAt}`,
+		)
+	}
+	lines.push("")
+	lines.push(`${records.length} session(s), total: $${totalCost.toFixed(4)}, wasted (non-success): $${wastedCost.toFixed(4)}`)
 	return lines.join("\n")
 }
 
@@ -94,15 +143,26 @@ export async function costHistoryCliMain(argv: string[]): Promise<number> {
 	}
 
 	let records = await readCostHistory(parsed.repo)
+	let sessionRecords = await readSessionCostHistory(parsed.repo)
 	if (parsed.issues.length > 0) {
 		const wanted = new Set(parsed.issues)
 		records = records.filter((r) => r.issues.some((n) => wanted.has(n)))
+		sessionRecords = sessionRecords.filter((r) => r.issues.some((n) => wanted.has(n)))
+	}
+
+	if (parsed.sessions) {
+		if (parsed.json) {
+			process.stdout.write(JSON.stringify(sessionRecords, null, 2) + "\n")
+		} else {
+			process.stdout.write(formatSessionTable(sessionRecords) + "\n")
+		}
+		return 0
 	}
 
 	if (parsed.json) {
 		process.stdout.write(JSON.stringify(records, null, 2) + "\n")
 	} else {
-		process.stdout.write(formatTable(records) + "\n")
+		process.stdout.write(formatTable(records, sessionRecords) + "\n")
 	}
 	return 0
 }

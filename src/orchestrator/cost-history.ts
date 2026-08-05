@@ -33,6 +33,7 @@ import * as fsp from "node:fs/promises"
 import * as path from "node:path"
 
 import { resolveProjectDataDir } from "../project-store.js"
+import { usageDir, type UsageRecord } from "../engine/usage.js"
 import type { OrchestratorGroup } from "./state.js"
 
 /** One recorded group's combined cost/token/iteration totals. */
@@ -135,4 +136,184 @@ export async function recordGroupCost(repoRoot: string, group: OrchestratorGroup
 	}
 	await appendCostHistoryRecord(repoRoot, record)
 	return record
+}
+
+/**
+ * One individual session's cost, with its own outcome — the per-session
+ * companion to CostHistoryRecord's per-GROUP combined total. Exists
+ * specifically so wasted spend (a session that errored, hit budget, or was
+ * killed before finishing) is visible and queryable on its own, not just
+ * silently folded into a group's final combined total. A real incident
+ * that motivated this: a worker respawned by a false-positive review bug
+ * ran to completion finding nothing to fix (real cost, zero useful
+ * outcome) — before this, that cost was invisible; the group-level total
+ * doesn't distinguish it from productive work.
+ */
+export interface SessionCostRecord {
+	recordedAt: string
+	repo: string
+	groupName: string
+	issues: number[]
+	sessionId: string
+	/** The session's mode (code | deepseek-reviewer | qa-agent | ...) — the closest thing to a "role" label available. */
+	mode: string
+	/**
+	 * success | error | budget — from the session's own final usage record
+	 * (engine/usage.ts's UsageRecord.status) when it completed normally, or
+	 * "killed" when only an orphaned `.live.json` snapshot was found (the
+	 * session's own recordUsage()/removeLiveSnapshot() cleanup never ran —
+	 * see usage.ts: that pair runs on EVERY normal completion path, success,
+	 * error, or budget, so a leftover live snapshot means the process was
+	 * killed or crashed before reaching it).
+	 */
+	status: "success" | "error" | "budget" | "killed"
+	costUsd: number
+	inputTokens: number
+	outputTokens: number
+	cachedTokens: number
+	iterations: number
+	startedAt: string
+	endedAt?: string
+}
+
+/** Config file basename inside the central project data dir. */
+export const SESSION_COST_HISTORY_FILE = "session-cost-history.jsonl"
+
+/** Absolute path of the central session-cost-history.jsonl for a workspace root. */
+export function sessionCostHistoryFilePath(workspaceRoot: string): string {
+	return path.join(resolveProjectDataDir(workspaceRoot), SESSION_COST_HISTORY_FILE)
+}
+
+/** Append one per-session record (non-fatal on write failure is the CALLER's responsibility — this throws). */
+export async function appendSessionCostRecord(workspaceRoot: string, record: SessionCostRecord): Promise<void> {
+	const file = sessionCostHistoryFilePath(workspaceRoot)
+	await fsp.mkdir(path.dirname(file), { recursive: true })
+	await fsp.appendFile(file, JSON.stringify(record) + "\n", "utf-8")
+}
+
+/**
+ * Read + loosely validate the session-cost-history file. Malformed lines
+ * are skipped; a missing file yields an empty array (never throws for
+ * ENOENT) — same idiom as the group-level history.
+ */
+export async function readSessionCostHistory(workspaceRoot: string): Promise<SessionCostRecord[]> {
+	let raw: string
+	try {
+		raw = await fsp.readFile(sessionCostHistoryFilePath(workspaceRoot), "utf-8")
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			return []
+		}
+		throw error
+	}
+	const records: SessionCostRecord[] = []
+	for (const line of raw.split("\n")) {
+		const trimmed = line.trim()
+		if (!trimmed) {
+			continue
+		}
+		try {
+			const parsed = JSON.parse(trimmed) as Partial<SessionCostRecord>
+			if (typeof parsed.recordedAt === "string" && typeof parsed.sessionId === "string" && typeof parsed.costUsd === "number") {
+				records.push(parsed as SessionCostRecord)
+			}
+		} catch {
+			// Loose validation: skip malformed / partially-written lines.
+		}
+	}
+	return records
+}
+
+/**
+ * Scan a worktree's `.headlesscode/usage/` dir for every session that has
+ * EVER run there (completed `.jsonl` records AND orphaned `.live.json`
+ * snapshots left behind by a killed/crashed session), and append a
+ * SessionCostRecord for each one not already recorded — idempotent via
+ * checking sessionIds already present in the history file, same pattern
+ * as `cost_recorded` gates re-recording at the group level. Returns every
+ * record appended THIS call (empty array if everything was already
+ * recorded, or the usage dir doesn't exist).
+ */
+export async function recordAllSessionCosts(repoRoot: string, group: OrchestratorGroup): Promise<SessionCostRecord[]> {
+	const worktreePath = path.resolve(repoRoot, group.worktree ?? `.worktrees/${group.name}`)
+	const dir = usageDir(worktreePath)
+	let entries: string[]
+	try {
+		entries = await fsp.readdir(dir)
+	} catch {
+		return []
+	}
+
+	const existing = await readSessionCostHistory(repoRoot)
+	const alreadyRecorded = new Set(existing.map((r) => r.sessionId))
+
+	const completedIds = new Set(entries.filter((f) => f.endsWith(".jsonl")).map((f) => f.slice(0, -".jsonl".length)))
+	const newRecords: SessionCostRecord[] = []
+
+	for (const file of entries) {
+		if (file.endsWith(".jsonl")) {
+			const sessionId = file.slice(0, -".jsonl".length)
+			if (alreadyRecorded.has(sessionId)) {
+				continue
+			}
+			let usage: UsageRecord
+			try {
+				const raw = await fsp.readFile(path.join(dir, file), "utf-8")
+				usage = JSON.parse(raw.trim().split("\n")[0]) as UsageRecord
+			} catch {
+				continue
+			}
+			const record: SessionCostRecord = {
+				recordedAt: new Date().toISOString(),
+				repo: path.resolve(repoRoot),
+				groupName: group.name,
+				issues: group.issues ?? [],
+				sessionId,
+				mode: usage.mode,
+				status: usage.status,
+				costUsd: usage.costUsd,
+				inputTokens: usage.inputTokens,
+				outputTokens: usage.outputTokens,
+				cachedTokens: usage.cachedTokens ?? 0,
+				iterations: usage.iterations,
+				startedAt: usage.startedAt,
+				endedAt: usage.endedAt,
+			}
+			await appendSessionCostRecord(repoRoot, record)
+			newRecords.push(record)
+		} else if (file.endsWith(".live.json")) {
+			const sessionId = file.slice(0, -".live.json".length)
+			// A completed .jsonl for the same session means recordUsage() DID
+			// run (success/error/budget) — the live snapshot is just stale
+			// leftover from before that, not a sign of a killed session.
+			if (alreadyRecorded.has(sessionId) || completedIds.has(sessionId)) {
+				continue
+			}
+			let live: { mode: string; costUsd: number; inputTokens: number; outputTokens: number; cachedTokens?: number; iterations: number; startedAt: string }
+			try {
+				const raw = await fsp.readFile(path.join(dir, file), "utf-8")
+				live = JSON.parse(raw)
+			} catch {
+				continue
+			}
+			const record: SessionCostRecord = {
+				recordedAt: new Date().toISOString(),
+				repo: path.resolve(repoRoot),
+				groupName: group.name,
+				issues: group.issues ?? [],
+				sessionId,
+				mode: live.mode,
+				status: "killed",
+				costUsd: live.costUsd,
+				inputTokens: live.inputTokens,
+				outputTokens: live.outputTokens,
+				cachedTokens: live.cachedTokens ?? 0,
+				iterations: live.iterations,
+				startedAt: live.startedAt,
+			}
+			await appendSessionCostRecord(repoRoot, record)
+			newRecords.push(record)
+		}
+	}
+	return newRecords
 }

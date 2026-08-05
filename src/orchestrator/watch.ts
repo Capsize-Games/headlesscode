@@ -35,7 +35,7 @@ import { setTimeout as sleep } from "node:timers/promises"
 
 import type { UsageRecord } from "../engine/usage.js"
 import { loadStateSync, saveStateSync, updateGroup, type OrchestratorGroup, type OrchestratorState } from "./state.js"
-import { recordGroupCost } from "./cost-history.js"
+import { recordGroupCost, recordAllSessionCosts } from "./cost-history.js"
 
 export const DEFAULT_POLL_INTERVAL_MS = 5_000
 export const DEFAULT_STALL_TIMEOUT_MS = 2 * 60 * 60 * 1000 // 2h, matching airunner
@@ -582,6 +582,18 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 		} catch (err) {
 			writeStderr(
 				`[orchestrate] cost recording for ${g.name} failed: ${err instanceof Error ? err.message : String(err)}\n`,
+			)
+		}
+		// Per-session breakdown (with outcome: success/error/budget/killed) —
+		// makes wasted spend (a session that errored, hit budget, or was
+		// killed before finishing, e.g. a rework respawned by a bug) visible
+		// on its own, not just silently folded into the group's combined
+		// total above.
+		try {
+			await recordAllSessionCosts(repoRoot, g)
+		} catch (err) {
+			writeStderr(
+				`[orchestrate] per-session cost recording for ${g.name} failed: ${err instanceof Error ? err.message : String(err)}\n`,
 			)
 		}
 		// Mark recorded regardless of whether recordGroupCost found usage to
