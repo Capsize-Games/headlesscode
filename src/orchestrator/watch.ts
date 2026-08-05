@@ -38,6 +38,7 @@ import { setTimeout as sleep } from "node:timers/promises"
 
 import type { UsageRecord } from "../engine/usage.js"
 import { loadStateSync, saveStateSync, updateGroup, type OrchestratorGroup, type OrchestratorState } from "./state.js"
+import { recordGroupCost, recordAllSessionCosts } from "./cost-history.js"
 
 export const DEFAULT_POLL_INTERVAL_MS = 5_000
 export const DEFAULT_STALL_TIMEOUT_MS = 2 * 60 * 60 * 1000 // 2h, matching airunner
@@ -101,6 +102,22 @@ export interface WatchOptions {
 	stderrWriter?: (text: string) => void
 	/** Abort the watch loop (e.g. from a parent orchestrator). */
 	signal?: AbortSignal
+	/**
+	 * Whether this round runs the automated review step (default true,
+	 * matching orchestrate's own `--no-review` default). Cost-history
+	 * recording (recordCostIfTerminal) needs this: a "done" group's review
+	 * (and, if review is clean, QA) hasn't necessarily run yet the FIRST
+	 * moment the worker's own `.harness.done` marker appears — recording
+	 * right then would miss those sessions' cost. When review is enabled,
+	 * recording waits for `group.review_verdict` to be set.
+	 */
+	reviewEnabled?: boolean
+	/**
+	 * Whether this round runs QA (default false, matching orchestrate's own
+	 * `--qa` opt-in default). When enabled, cost-history recording for a
+	 * "done" group additionally waits for `group.qa` to be set.
+	 */
+	qaEnabled?: boolean
 }
 
 export interface WatchSummary {
@@ -159,7 +176,7 @@ function readExitCode(wtPath: string): number | undefined {
  * undefined when no usage data is found (missing dir, no files, or every
  * file unreadable/empty) so callers don't stamp a spurious all-zero usage.
  */
-function readWorktreeUsage(wtPath: string): OrchestratorGroup["usage"] | undefined {
+export function readWorktreeUsage(wtPath: string): OrchestratorGroup["usage"] | undefined {
 	const dir = path.join(wtPath, ".headlesscode", "usage")
 	let files: string[]
 	try {
@@ -293,27 +310,34 @@ function processAlive(pid: number): boolean {
 }
 
 /**
- * Whether the worker process recorded in `.harness.pid` is ACTUALLY still
- * running — not just whether the pid file exists. A worker that crashes or
- * is killed without cleaning up its own pid file leaves a stale file behind
- * forever; checking existence alone made a dead worker indistinguishable
- * from a live one, which is what caused the 2026-08-02 incident below (see
- * `inspectGroup`'s stall-guard branch).
+ * Whether the process recorded in a pid file (default `.harness.pid`) is
+ * ACTUALLY still running — not just whether the file exists. A worker that
+ * crashes or is killed without cleaning up its own pid file leaves a stale
+ * file behind forever; checking existence alone made a dead worker
+ * indistinguishable from a live one, which is what caused the 2026-08-02
+ * incident below (see `inspectGroup`'s stall-guard branch).
  *
- * Issue #20: when the worker was launched under setsid (run-worker.sh now
- * writes the process-group id to `.harness.pgid`), liveness is checked at the
- * GROUP level (`process.kill(-pgid, 0)`): killing only the wrapper bash — the
- * pid file's process — leaves the real child running reparented to init, and
- * a wrapper-only check would report the worker dead while it keeps burning
- * the session. Workers launched before the setsid change have no `.harness.pgid`
- * and fall back to the pid-only check.
+ * The pid-file name is a parameter so the same liveness check can be reused
+ * for the QA session marker (`.qa.pid`) by orchestrate cleanup — one
+ * mechanism, never reinvented.
+ *
+ * Issue #20: for the worker's OWN pid file specifically, liveness is checked
+ * at the process GROUP level when available (`.harness.pgid`, written by
+ * run-worker.sh's setsid launch): killing only the wrapper bash — the
+ * `.harness.pid` process — leaves the real child running reparented to
+ * init, and a wrapper-only check would report the worker dead while it
+ * keeps burning the session. Workers launched before the setsid change (and
+ * any non-default pidFile, e.g. the QA session's `.qa.pid`, which has no
+ * group concept) fall back to the single-pid check.
  */
-function isPidAlive(wtPath: string): boolean {
-	const pgid = readPidFile(wtPath, ".harness.pgid")
-	if (pgid !== undefined) {
-		return processAlive(-pgid)
+export function isPidAlive(wtPath: string, pidFile = ".harness.pid"): boolean {
+	if (pidFile === ".harness.pid") {
+		const pgid = readPidFile(wtPath, ".harness.pgid")
+		if (pgid !== undefined) {
+			return processAlive(-pgid)
+		}
 	}
-	const pid = readPidFile(wtPath, ".harness.pid")
+	const pid = readPidFile(wtPath, pidFile)
 	return pid !== undefined && processAlive(pid)
 }
 
@@ -354,7 +378,19 @@ export function inspectGroup(
 			},
 			commits: group.commits ?? [],
 			...(exitCode !== undefined ? { exit_code: exitCode } : {}),
-			summary: summary.slice(0, 4000),
+			// `.slice(-4000)`, NOT `.slice(0, 4000)`: this is a TAIL (already the
+			// last SUMMARY_TAIL_LINES lines of the run) being capped to a char
+			// budget. Keeping the FIRST 4000 chars of a tail throws away the most
+			// recent content — exactly the lines that report the actual terminal
+			// outcome (a worker's final error, e.g. "Max iterations (N) reached
+			// without task completion"). This was a real, confirmed production
+			// bug: it silently broke isIterationExhaustion's detection (the
+			// summary never contained the error string it matches against), so
+			// auto-continuation never fired for genuinely iteration-exhausted
+			// groups, AND it broke human/agent-facing status reporting (the
+			// "summary" shown was always a stale mid-run snapshot, never the
+			// real ending) — both from the same one-line bug.
+			summary: summary.slice(-4000),
 			...(usage ? { usage } : {}),
 		}
 	}
@@ -522,15 +558,140 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 	const isTerminal = (g: OrchestratorGroup): boolean =>
 		g.status === "done" || g.status === "failed" || g.status === "needs-human"
 
+	const reviewEnabled = options.reviewEnabled ?? true
+	const qaEnabled = options.qaEnabled ?? false
+
+	/**
+	 * Whether a group has NO more automated work pending, i.e. it's safe to
+	 * record its cost as final. For "failed"/"needs-human" this is just
+	 * `isTerminal` — cli.ts's review/QA sections both gate on
+	 * `group.status === "done"`, so a failed or needs-human group never gets
+	 * reviewed/QA'd at all. For "done" specifically, review (if enabled) and
+	 * QA (if enabled) may still be IN PROGRESS the first moment the worker's
+	 * own `.harness.done` marker appears — recording right then would miss
+	 * those sessions' real cost entirely (they're separate HeadlessSession
+	 * runs against the same worktree, each writing their own
+	 * `.headlesscode/usage/*.jsonl`, but nothing re-triggers a usage rollup
+	 * for a "done" group unless a rework respawn happens). So for "done",
+	 * wait for `review_verdict`/`qa` to actually be populated first.
+	 */
+	const isSettled = (g: OrchestratorGroup): boolean => {
+		if (g.status !== "done") {
+			return isTerminal(g)
+		}
+		const reviewSettled = !reviewEnabled || g.review_verdict !== undefined
+		const qaSettled = !qaEnabled || g.qa !== undefined
+		return reviewSettled && qaSettled
+	}
+
+	// Mandatory cost/token history recording (cost-history.ts): fires exactly
+	// once per group, the FIRST time it's observed SETTLED (see isSettled),
+	// regardless of which of orchestrate's many branches got it there (a
+	// clean "done" + review + QA, a real failure, a rework-cap exhaustion, a
+	// continuation-cap exhaustion all reach this the same way). A single
+	// insertion point here — rather than one call per terminal-outcome
+	// branch in cli.ts's onGroupUpdate — means no future branch can
+	// silently skip recording by forgetting to call it. Called from two
+	// spots below: for a group ALREADY settled at the top of a poll pass
+	// (e.g. reloaded from disk after onGroupUpdate marked it needs-human),
+	// and immediately after a group's settledness may have changed WITHIN
+	// the current pass (needed because `allTerminal` can return before the
+	// loop ever revisits that group at the top of a fresh pass).
+	const recordCostIfSettled = async (g: OrchestratorGroup): Promise<void> => {
+		if (!isSettled(g) || g.cost_recorded !== undefined) {
+			return
+		}
+		// Recompute usage FRESH from the worktree rather than trusting
+		// `g.usage` (which may predate the review/QA sessions that just ran
+		// against the same worktree, each writing their own usage file) —
+		// this is what actually makes review/QA cost visible in the record.
+		const freshUsage = readWorktreeUsage(groupWorktreePath(repoRoot, g))
+		try {
+			await recordGroupCost(repoRoot, { ...g, usage: freshUsage })
+		} catch (err) {
+			writeStderr(
+				`[orchestrate] cost recording for ${g.name} failed: ${err instanceof Error ? err.message : String(err)}\n`,
+			)
+		}
+		// Per-session breakdown (with outcome: success/error/budget/killed) —
+		// makes wasted spend (a session that errored, hit budget, or was
+		// killed before finishing, e.g. a rework respawned by a bug) visible
+		// on its own, not just silently folded into the group's combined
+		// total above.
+		try {
+			await recordAllSessionCosts(repoRoot, g)
+		} catch (err) {
+			writeStderr(
+				`[orchestrate] per-session cost recording for ${g.name} failed: ${err instanceof Error ? err.message : String(err)}\n`,
+			)
+		}
+		// Mark recorded regardless of whether recordGroupCost found usage to
+		// write (undefined return = nothing to record, e.g. failed before any
+		// session wrote a usage file) — either way, don't retry forever.
+		//
+		// Reload fresh from disk before merging in cost_recorded, rather than
+		// persisting the caller's in-memory `state` closure variable: a
+		// onGroupUpdate callback can write directly to the state file without
+		// returning `reload: true` (e.g. cli.ts's clean-verdict path after a
+		// rework reset), which leaves this function's in-memory `state` stale
+		// relative to disk. Blindly saving that stale copy back would clobber
+		// the callback's own write — a real regression this exact fix caught
+		// (cli.test.ts's rework/continuation-reset re-poll tests).
+		const fresh = loadStateSync(statePath)
+		state = updateGroup(fresh, g.name, { cost_recorded: new Date().toISOString() })
+		saveStateSync(statePath, state)
+	}
+
+	// onGroupUpdate calls in flight (keyed by group name), fired without
+	// blocking this loop's iteration over the OTHER groups — see issue #24:
+	// awaiting each group's review/QA inline in this loop meant one group's
+	// multi-minute review fully monopolized the watcher, leaving every other
+	// group's completion undetected (and its own review/QA unstarted) for as
+	// long as the in-flight one took. `allTerminal` below must not fire until
+	// this set drains, or the round would report done while review/QA for a
+	// group is still silently running in the background.
+	const inFlightCallbacks = new Map<string, Promise<void>>()
+
 	while (true) {
 		if (options.signal?.aborted) {
 			break
+		}
+		// Reload fresh from disk every pass rather than trusting the loop's
+		// in-memory `state`: a concurrently in-flight onGroupUpdate call (see
+		// inFlightCallbacks above) writes review/QA patches and rework/
+		// continuation resets directly to the state file via patchGroup, with
+		// no synchronous signal back to this loop. Anything this pass reads
+		// must come from disk to see those writes.
+		state = loadStateSync(statePath)
+		// Resync transition tracking against whatever the fresh state shows:
+		// a background callback may have reset a group's status (e.g.
+		// "done" -> "running" for a rework/continuation respawn) since the
+		// last pass, and that must still print a transition line even though
+		// no `inspectGroup` patch drove it this pass.
+		for (const group of state.groups) {
+			const prevStatus = lastSeenStatus.get(group.name) ?? group.status
+			if (group.status !== prevStatus) {
+				printStatusTransition(writeStderr, group, { status: group.status }, group.status)
+				lastSeenStatus.set(group.name, group.status)
+			}
 		}
 		const now = Date.now()
 		let changed = false
 
 		for (const group of state.groups) {
+			// A group whose onGroupUpdate is still in flight must not be
+			// re-inspected: a rework/continuation reset writes the "running"
+			// status BEFORE it finishes clearing and re-creating the
+			// .harness.done/.harness.exit markers (each fs op is a separate
+			// await), so a poll landing in that window would see "running" +
+			// stale leftover markers and spuriously re-fire the callback for
+			// the SAME group a second time before the first invocation ever
+			// finished resetting them.
+			if (inFlightCallbacks.has(group.name)) {
+				continue
+			}
 			if (isTerminal(group)) {
+				await recordCostIfSettled(group)
 				continue
 			}
 			const patch = inspectGroup(repoRoot, group, now, stallTimeoutMs)
@@ -556,27 +717,50 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 			saveStateSync(statePath, state)
 			changed = true
 			const updated = state.groups.find((g) => g.name === group.name)
-			if (updated) {
-				const reload = await options.onGroupUpdate?.(updated, state)
-				if (reload === true) {
-					// The callback rewrote the state file (rework loop: group
-					// reset to "running", or marked "needs-human"). The loop's
-					// in-memory state is stale — reload from disk (the
-					// authoritative source) and restart this poll pass so the
-					// group is re-inspected under its new status. lastSeenStatus
-					// is resynced so transition lines stay accurate.
-					state = loadStateSync(statePath)
-					for (const g of state.groups) {
-						lastSeenStatus.set(g.name, g.status)
+			// Fire the callback WITHOUT blocking this loop's iteration over the
+			// other groups (issue #24) — `updated` just transitioned into a
+			// terminal status this pass, so the top-of-loop `isTerminal` check
+			// above guards against re-firing it for the same group while this
+			// call is still in flight (its status stays "done"/"failed"/
+			// "needs-human" in the state file the whole time this callback
+			// runs, even mid-review, since review/QA outcomes are separate
+			// fields). Guard with inFlightCallbacks too, defensively, in case
+			// a future status shape changes that invariant.
+			if (updated && !inFlightCallbacks.has(group.name)) {
+				const callback = (async () => {
+					try {
+						await options.onGroupUpdate?.(updated, state)
+					} catch (err) {
+						writeStderr(
+							`[orchestrate] onGroupUpdate for ${group.name} failed: ${err instanceof Error ? err.message : String(err)}\n`,
+						)
 					}
-					break
-				}
+					// The callback (if any) persisted its patches directly to the
+					// state file via patchGroup — re-fetch fresh rather than
+					// trusting this closure's `state`, which may now be stale
+					// relative to disk (this group's own writes, or another
+					// group's concurrent writes). Record cost now rather than
+					// waiting for a future pass, since `allTerminal` only drains
+					// via inFlightCallbacks.size, not by revisiting this group.
+					const freshAfterCallback = loadStateSync(statePath).groups.find((g) => g.name === group.name)
+					if (freshAfterCallback) {
+						await recordCostIfSettled(freshAfterCallback)
+					}
+				})()
+				inFlightCallbacks.set(group.name, callback)
+				void callback.finally(() => {
+					inFlightCallbacks.delete(group.name)
+				})
 			}
 		}
 
-		const allTerminal = state.groups.length > 0 && state.groups.every(isTerminal)
+		const allTerminal =
+			state.groups.length > 0 && state.groups.every(isTerminal) && inFlightCallbacks.size === 0
 		if (allTerminal) {
-			return { state, allTerminal: true }
+			// Reload once more: an in-flight callback observed as drained just
+			// above may have written its final patch to disk after this pass's
+			// `state` was last touched.
+			return { state: loadStateSync(statePath), allTerminal: true }
 		}
 		if (!changed) {
 			await sleep(pollIntervalMs)

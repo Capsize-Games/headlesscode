@@ -53,6 +53,21 @@ function withCapturedStderr(fn: () => Promise<number>): Promise<{ exit: number; 
 		.then((exit) => ({ exit, stderr }))
 }
 
+/** Run a function while capturing everything written to process.stdout. */
+function withCapturedStdout(fn: () => Promise<number>): Promise<{ exit: number; stdout: string }> {
+	const original = process.stdout.write.bind(process.stdout)
+	let stdout = ""
+	process.stdout.write = ((chunk: unknown): boolean => {
+		stdout += String(chunk)
+		return true
+	}) as typeof process.stdout.write
+	return fn()
+		.finally(() => {
+			process.stdout.write = original
+		})
+		.then((exit) => ({ exit, stdout }))
+}
+
 /** Run a function while capturing everything written to process.stdout + stderr. */
 function withCapturedIo(fn: () => Promise<number>): Promise<{ exit: number; stdout: string; stderr: string }> {
 	const originalOut = process.stdout.write.bind(process.stdout)
@@ -138,6 +153,46 @@ async function testFindingBelowCapSpawnsAndResetsState(): Promise<void> {
 	assert.equal(decision.patch.exit_code, undefined, "previous attempt's exit code cleared")
 	assert.ok(typeof decision.patch.spawned === "string", "spawned reset so the stall guard measures the rework worker")
 	assert.ok(decision.patch.last_activity && typeof decision.patch.last_activity === "object", "last_activity notes the rework")
+}
+
+/**
+ * 2026-08-05 real bug caught while manually recovering a stuck round: a
+ * rework/continuation respawn adds MORE real cost on the same worktree,
+ * but the reset patch never cleared `cost_recorded` — so once the fresh
+ * cycle re-settled, cost-history.ts's one-shot recording gate silently
+ * skipped re-recording the combined total forever. Verifies the actual
+ * MERGE behavior via updateGroup (not just that the patch literal contains
+ * `undefined`, which can't distinguish "explicitly cleared" from "key
+ * simply absent" — only the merged result proves the old value is gone).
+ */
+async function testReworkPatchActuallyClearsCostRecordedOnMerge(): Promise<void> {
+	const group = baseGroup({ reworkCount: 0, status: "done", cost_recorded: "2026-08-01T00:00:00.000Z" })
+	const decision = handleReviewVerdict(group, findingResult(), "/tmp/example-repo", 3, "code")
+	const state: OrchestratorState = { ...defaultState("round-1"), groups: [group] }
+	const merged = updateGroup(state, "w1", decision.patch)
+	assert.equal(
+		merged.groups[0]?.cost_recorded,
+		undefined,
+		"a stale cost_recorded from the PREVIOUS attempt must not survive a rework reset",
+	)
+}
+
+async function testContinuationPatchActuallyClearsCostRecordedOnMerge(): Promise<void> {
+	const group = baseGroup({
+		continuationCount: 0,
+		status: "failed",
+		summary: "headlesscode: task failed: Max iterations (50) reached without task completion",
+		cost_recorded: "2026-08-01T00:00:00.000Z",
+	})
+	const decision = handleIterationExhaustion(group, "/tmp/example-repo", 3, "code")
+	assert.equal(decision.shouldSpawn, true)
+	const state: OrchestratorState = { ...defaultState("round-1"), groups: [group] }
+	const merged = updateGroup(state, "w1", decision.patch)
+	assert.equal(
+		merged.groups[0]?.cost_recorded,
+		undefined,
+		"a stale cost_recorded from the PREVIOUS attempt must not survive a continuation reset",
+	)
 }
 
 async function testFindingIncrementsFromExistingCount(): Promise<void> {
@@ -711,7 +766,7 @@ async function testWatchGroupsRepollsGroupAfterContinuationReset(): Promise<void
 
 // ─── Pre-spawn worktree collision check (Bug 1) ───────────────────────────────
 
-async function testOrchestrateMainFailsOnStaleWorktree(): Promise<void> {
+async function testOrchestrateMainSkipsOccupiedWorktreeSlot(): Promise<void> {
 	const repo = await tmpRepo()
 	try {
 		initGitRepo(repo)
@@ -721,20 +776,46 @@ async function testOrchestrateMainFailsOnStaleWorktree(): Promise<void> {
 			JSON.stringify([{ number: 1, title: "Fix the thing", body: "Do it" }]),
 			"utf-8",
 		)
-		// Leftover worktree dir from a previous round — the round must abort
-		// BEFORE spawning anything (and even before the --dry-run early-exit,
-		// so a dry run catches stale worktrees too).
+		// w1 is occupied by a still-running round (or genuinely stale leftover)
+		// — the new round must name around it (w2) instead of hard-failing, so
+		// a second `orchestrate` invocation against the same repo can proceed
+		// alongside an in-flight one. See split.ts's occupiedNames param.
 		await fs.mkdir(path.join(repo, ".worktrees", "w1"), { recursive: true })
-		await fs.writeFile(path.join(repo, ".worktrees", "w1", "leftover.txt"), "stale\n", "utf-8")
+		await fs.writeFile(path.join(repo, ".worktrees", "w1", "leftover.txt"), "in-flight\n", "utf-8")
 
-		const { exit, stderr } = await withCapturedStderr(() =>
+		const { exit, stdout } = await withCapturedStdout(() =>
 			orchestrateMain(["--repo", repo, "--issues-json", issuesPath, "--dry-run"]),
 		)
 
-		assert.notEqual(exit, 0, "a stale worktree dir must fail the round, got exit 0")
-		assert.ok(stderr.includes(".worktrees/w1"), `error names the colliding path, got: ${stderr}`)
-		assert.ok(stderr.includes("Remove them first"), "error tells the caller how to clean up")
-		assert.ok(stderr.includes("git worktree remove"), "cleanup hint names git worktree remove")
+		assert.equal(exit, 0, "occupied w1 must not fail the round when w2 is free")
+		assert.ok(stdout.includes("w2"), `plan should name the group w2, got: ${stdout}`)
+		assert.ok(!stdout.includes("w1   issue"), `plan should not reuse the occupied w1 slot, got: ${stdout}`)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testOrchestrateMainSkipsMultipleOccupiedSlots(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		initGitRepo(repo)
+		const issuesPath = path.join(repo, "issues.json")
+		await fs.writeFile(
+			issuesPath,
+			JSON.stringify([{ number: 1, title: "Fix the thing", body: "Do it" }]),
+			"utf-8",
+		)
+		// w1 AND w2 both occupied (e.g. two still-running rounds) — naming
+		// must skip both and land on w3, still succeeding.
+		await fs.mkdir(path.join(repo, ".worktrees", "w1"), { recursive: true })
+		await fs.mkdir(path.join(repo, ".worktrees", "w2"), { recursive: true })
+
+		const { exit, stdout } = await withCapturedStdout(() =>
+			orchestrateMain(["--repo", repo, "--issues-json", issuesPath, "--dry-run"]),
+		)
+
+		assert.equal(exit, 0, "occupied w1+w2 must not fail the round when w3 is free")
+		assert.ok(stdout.includes("w3"), `plan should name the group w3, got: ${stdout}`)
 	} finally {
 		await fs.rm(repo, { recursive: true, force: true })
 	}
@@ -815,6 +896,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["rework task file includes findings, issues, rework count", testReworkTaskFileContentIncludesFindingsAndIssues],
 	["rework task file handles empty findings gracefully", testReworkTaskFileContentHandlesEmptyFindings],
 	["finding below cap triggers rework spawn + state reset", testFindingBelowCapSpawnsAndResetsState],
+	["rework patch actually clears a stale cost_recorded on merge", testReworkPatchActuallyClearsCostRecordedOnMerge],
+	["continuation patch actually clears a stale cost_recorded on merge", testContinuationPatchActuallyClearsCostRecordedOnMerge],
 	["finding increments from an existing rework count", testFindingIncrementsFromExistingCount],
 	["finding at cap marks needs-human and does NOT spawn", testFindingAtCapMarksNeedsHumanAndDoesNotSpawn],
 	["clean verdict never touches reworkCount", testCleanVerdictNeverTouchesReworkCount],
@@ -838,23 +921,33 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["clean exit with the max-iterations text never auto-continues", testCleanExitWithMaxIterationsTextDoesNotContinue],
 	["continuation spawn forwards the round-level --max-iterations when set", testExhaustionSpawnForwardsMaxIterations],
 	["watchGroups re-polls a group after a continuation reset", testWatchGroupsRepollsGroupAfterContinuationReset],
+	["orchestrateMain skips an occupied w1 slot and names the group w2", testOrchestrateMainSkipsOccupiedWorktreeSlot],
+	["orchestrateMain skips multiple occupied slots (w1+w2 -> w3)", testOrchestrateMainSkipsMultipleOccupiedSlots],
 	["--no-preflight parses (default on, flag off)", testParseOrchestrateArgsNoPreflight],
-	["orchestrateMain fails on a stale worktree dir even in --dry-run", testOrchestrateMainFailsOnStaleWorktree],
 	["orchestrateMain dry-run proceeds when all worktree dirs are clear", testOrchestrateMainDryRunProceedsWhenNoCollision],
 	["orchestrateMain aborts before spawn when the preflight probe fails", testOrchestrateMainPreflightFailureAbortsBeforeSpawn],
 ]
 
 async function main(): Promise<void> {
+	// Redirect the central store so mode-model/permissions resolution and any
+	// legacy-file migration stay inside the sandbox, never the real home store.
+	const storeTmp = await fs.mkdtemp(path.join(os.tmpdir(), "hc-orch-cli-store-"))
+	process.env.HEADLESSCODE_DATA_DIR = storeTmp
 	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
+	try {
+		for (const [name, fn] of tests) {
+			try {
+				await fn()
+				console.log(`  ok   ${name}`)
+			} catch (err) {
+				failed++
+				console.error(`  FAIL ${name}`)
+				console.error(err instanceof Error ? err.stack ?? err.message : String(err))
+			}
 		}
+	} finally {
+		delete process.env.HEADLESSCODE_DATA_DIR
+		await fs.rm(storeTmp, { recursive: true, force: true })
 	}
 	if (failed > 0) {
 		console.error(`\n${failed} test(s) failed`)

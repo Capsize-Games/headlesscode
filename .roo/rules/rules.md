@@ -53,6 +53,25 @@ Before considering any change to `src/` done:
   self-contained (the agent reading it has no access to this
   conversation or any other planning context), and must not reference
   internal-only planning artifacts.
+- **Plan docs must cite verified file:line locations.** Every code
+  reference in a `plans/*.md` doc — every instruction or finding that
+  points at existing code — MUST include the real file path AND line
+  number/range, written as `src/checkpoints/cli.ts:12-30`, never as "the
+  checkpoints CLI". The location must be VERIFIED by actually reading or
+  grepping the file at plan-writing time — never recalled from memory or
+  guessed. Measured justification: two comparable headlesscode sessions,
+  same model and machine, ran back-to-back — round 1
+  (`plans/orchestrator-worktree-cleanup.md`, narrative file mentions
+  only) took 4:03 / $0.0216 to reach iteration 20; round 2
+  (`plans/harness-tooling-efficiency-round2.md`, every finding pinned to
+  an exact location) took 2:00 / $0.0169 — over 2x faster, with no other
+  variable differing (cache-hit rates 92-94% in both). A citation can go
+  stale between plan-writing and dispatch: a worker finding that its
+  cited lines no longer match current file content should treat them as
+  "approximately here, verify before trusting the line numbers" — the
+  value of a citation is narrowing the search, not guaranteeing an exact
+  match forever. That's guidance for the READER's trust level, not a
+  downgrade of the WRITER's obligation to cite real locations.
 - **A new tool is not done until something tells a model to reach for it.**
   A tool's own schema description is not enough on its own — real usage
   data has shown tools with good descriptions but no rules-file mention

@@ -25,6 +25,7 @@ import { formatOutline, outlineSourceFile } from "./outline.js"
 import { findDefinition, formatDefinitions, makeRelativizer } from "./go-to-definition.js"
 import { findReferences, formatReferences } from "./find-references.js"
 import { formatImportGraph, getImportGraph } from "./import-graph.js"
+import { formatRenameResult, renameSymbol } from "./rename-symbol.js"
 
 function ok(content: string): ToolResult {
 	return { content, isError: false }
@@ -146,6 +147,25 @@ export function findReferencesHandler(args: Record<string, unknown>, ctx: ToolCo
 	const sites = findReferences(intel, target, line, character, symbol)
 	const rel = makeRelativizer(ctx.workspaceRoot)
 	return ok(formatReferences(rel, sites))
+}
+
+// ─── rename_symbol ───────────────────────────────────────────────────────────
+
+export function renameSymbolHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+	const tool = "rename_symbol"
+	const filePath = requireStringArg(args, "path", tool)
+	const target = resolveTarget(ctx, tool, filePath)
+	const line = lineArg(args, tool)
+	const character = optionalCharacterArg(args)
+	const symbol = optionalStringArg(args, "symbol")
+	const newName = requireStringArg(args, "new_name", tool)
+
+	const intel = intelFor(ctx)
+	// Throws (wrapped by ToolExecutor.execute as `Tool 'rename_symbol' failed:
+	// …`) on any validation failure or a mid-write failure after rollback.
+	return renameSymbol(intel, ctx.workspaceRoot, target, line, character, symbol, newName).then((result) =>
+		ok(formatRenameResult(ctx.workspaceRoot, result)),
+	)
 }
 
 // ─── import_graph ────────────────────────────────────────────────────────────

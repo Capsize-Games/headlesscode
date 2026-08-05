@@ -60,6 +60,14 @@ export interface OrchestratorGroup {
 	last_activity?: string | { last_commit?: string; note?: string; [key: string]: unknown }
 	commits?: string[]
 	actions_taken?: string[]
+	/**
+	 * Set by `orchestrate cleanup --apply` once the group's worktree was
+	 * removed after its branch was verified merged (local-ancestor or
+	 * GitHub PR). The group entry itself is NEVER deleted — the round's
+	 * history stays queryable after cleanup (same philosophy as the
+	 * `orphaned` status).
+	 */
+	cleaned_at?: string
 	pending_review_findings?: string[]
 	/** Worker exit code (written by run-worker.sh; recorded by the watcher). */
 	exit_code?: number
@@ -136,6 +144,35 @@ export interface OrchestratorGroup {
 		cachedTokens?: number
 		iterations: number
 	}
+	/**
+	 * Deterministic post-hoc session log analysis (log-analysis.ts), run once
+	 * a group reaches "done", independent of --review/--qa. Captures the same
+	 * findings a human would get reading harness.log + events.jsonl by hand:
+	 * tool-call/error stats, stall gaps, and repeated-command detection.
+	 * `undefined` until analyzed; `false` means analysis ran but found no
+	 * events dir (nothing to report — e.g. the group was cleaned up).
+	 */
+	log_analysis?:
+		| {
+				findings: string[]
+				toolCallCounts: Record<string, number>
+				toolErrorCounts: Record<string, number>
+				analyzedAt: string
+		  }
+		| false
+	/**
+	 * Mandatory cost/token history recording (cost-history.ts) — timestamp
+	 * of when this group's combined usage was appended to the repo's
+	 * central `cost-history.jsonl`. Written exactly once, the first time
+	 * the group reaches ANY terminal status (done/failed/needs-human,
+	 * regardless of which code path got it there), by watchGroups' own
+	 * polling loop rather than orchestrate's review/rework branches — a
+	 * single, unconditional insertion point so no terminal outcome (a real
+	 * failure, a rework-cap exhaustion, a continuation-cap exhaustion) can
+	 * skip being recorded by falling through a branch that doesn't call it.
+	 * `undefined` until recorded.
+	 */
+	cost_recorded?: string
 }
 
 /**
@@ -269,4 +306,46 @@ export function updateGroup(
 		groups.push({ ...patch, name, status: patch.status ?? "spawned" })
 	}
 	return { ...state, groups, updated: new Date().toISOString() }
+}
+
+/**
+ * Serializes read-merge-write critical sections against the state file.
+ * Needed now that review/QA for multiple groups can run concurrently
+ * (watchGroups no longer awaits one group's onGroupUpdate before starting
+ * the next) — without this, two concurrent callers doing
+ * loadState -> updateGroup -> saveState for DIFFERENT groups can interleave
+ * across their `await` points and race: both read the same on-disk
+ * snapshot, then whichever saves last clobbers the other's patch for its
+ * own group. Every merge point in cli.ts's onGroupUpdate must go through
+ * patchGroup below rather than reusing a stale in-memory state snapshot.
+ */
+let stateWriteQueue: Promise<unknown> = Promise.resolve()
+
+function withStateLock<T>(fn: () => Promise<T>): Promise<T> {
+	const run = stateWriteQueue.then(fn, fn)
+	stateWriteQueue = run.then(
+		() => undefined,
+		() => undefined,
+	)
+	return run
+}
+
+/**
+ * Atomically patch one group in the on-disk state file: reloads fresh,
+ * merges the patch, writes, all inside the write lock so a concurrent patch
+ * for a different group (or the same group) can't be lost. Returns the full
+ * merged state. Prefer this over a manual loadState/updateGroup/saveState
+ * sequence anywhere concurrent writers are possible.
+ */
+export async function patchGroup(
+	statePath: string,
+	name: string,
+	patch: Partial<Omit<OrchestratorGroup, "name">>,
+): Promise<OrchestratorState> {
+	return withStateLock(async () => {
+		const fresh = await loadState(statePath)
+		const next = updateGroup(fresh, name, patch)
+		await saveState(statePath, next)
+		return next
+	})
 }

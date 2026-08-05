@@ -83,11 +83,17 @@ async function testAllowListSemantics(): Promise<void> {
 	// DEFAULT-ALLOW (deliberate, documented decision): empty allow-list means
 	// "allow everything except the deny-list" — preserves pre-permissions
 	// behavior for sessions that configure nothing.
-	assert.equal(decideCommand("rm -rf /", [], []), "allow", "empty allow + empty deny = default-allow")
+	assert.equal(decideCommand("git status", [], []), "allow", "empty allow + empty deny = default-allow")
 	assert.equal(decideCommand("echo hi", [], []), "allow")
+	// ...but the always-on central-store protection still refuses recursive
+	// deletes targeting the store or a PARENT of it, even with zero config —
+	// `rm -rf /` (a parent of everything) and `rm -rf ~` are caught by it, not
+	// by the (empty) deny-list. Full matrix in store-protection.test.ts.
+	assert.equal(decideCommand("rm -rf /", [], []), "deny", "store protection refuses rm -rf / even with zero config")
+	assert.equal(decideCommand("rm -rf /opt/scratch-x", [], []), "allow", "non-store targets still default-allow")
 	// deniedCommands ALWAYS applies, even when the empty allow-list would
 	// otherwise allow everything else.
-	assert.equal(decideCommand("rm -rf /", [], ["rm"]), "deny")
+	assert.equal(decideCommand("rm -rf /opt/scratch-x", [], ["rm"]), "deny")
 	assert.equal(decideCommand("echo hi", [], ["rm"]), "allow")
 }
 
@@ -100,8 +106,9 @@ async function testCompoundCommandsCheckedPerSubCommand(): Promise<void> {
 	assert.equal(decideCommand("echo hi || rm -rf /", ["echo"], []), "deny")
 	assert.equal(decideCommand("ls | rm -rf /", ["ls"], []), "deny")
 	assert.equal(decideCommand("echo hi & rm -rf /", ["echo"], []), "deny")
-	// When every sub-command is allowed, the chain passes.
-	assert.equal(decideCommand("echo hi && rm -rf /", ["echo", "rm"], []), "allow")
+	// When every sub-command is allowed, the chain passes (target is a
+	// non-store path — the store protection only refuses store targets).
+	assert.equal(decideCommand("echo hi && rm -rf /opt/scratch-x", ["echo", "rm"], []), "allow")
 	// Quoted operators are NOT separators — single sub-command.
 	assert.equal(decideCommand('echo "a && b"', ["echo"], []), "allow")
 

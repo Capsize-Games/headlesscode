@@ -23,9 +23,10 @@
  */
 
 import * as path from "node:path"
-import * as os from "node:os"
 import * as fsp from "node:fs/promises"
 import * as yaml from "yaml"
+
+import { ensureSharedInstructionsMigration, sharedInstructionsRoot } from "../project-store.js"
 
 // Side effect: installs String.prototype.toPosix() used by the prompt sections.
 import "../vendor/zoo-code/src/utils/path.js"
@@ -38,7 +39,8 @@ import { TOOL_GROUPS } from "../vendor/zoo-code/src/shared/tools.js"
 import { customModesSettingsSchema } from "../vendor/zoo-code/types/index.js"
 import { browserActionTool } from "../tools/browser/tool.js"
 import { describeImageTool } from "../vision/tool.js"
-import { CODE_INTEL_TOOLS } from "../codeintel/tools.js"
+import { runTestsTool } from "../tools/run-tests.js"
+import { CODE_INTEL_TOOLS, RENAME_SYMBOL_TOOL } from "../codeintel/tools.js"
 import type { ModeConfig } from "@roo-code/types"
 
 import type { ChatTool } from "./types.js"
@@ -94,7 +96,29 @@ export const EXECUTABLE_TOOL_NAMES = new Set([
 	"switch_mode",
 ])
 
-// ─── custom modes loading (project .roomodes + global ~/.roo/custom_modes.yaml) ──
+/**
+ * True when a mode's tool groups include the `edit` group — i.e. the mode is
+ * expected to modify files (code, architect, …) as opposed to read-only
+ * investigation/review roles. Uses the SAME group classification the vendored
+ * prompt builder uses for MCP (`getGroupName(group) === "mcp"` in
+ * src/vendor/zoo-code/src/core/prompts/system.ts), so custom modes from
+ * .roomodes are classified exactly like the built-ins instead of by a
+ * hand-maintained slug list. Used to scope edit-workflow guidance (commit
+ * before finishing, targeted test runs) to modes that can actually edit.
+ */
+export function modeHasEditGroup(mode: string, customModes: ModeConfig[] = []): boolean {
+	const modeConfig = getModeBySlug(mode, customModes) ?? modes.find((m) => m.slug === mode)
+	if (modeConfig === undefined) {
+		return false
+	}
+	return modeConfig.groups.some((group) => getGroupName(group) === "edit")
+}
+
+// ─── custom modes loading (project .roomodes + global shared modes.yaml) ─────
+// The GLOBAL modes file lives at ~/.local/share/headlesscode/shared/modes.yaml
+// (headlesscode-native location — src/project-store.ts) instead of the
+// Zoo-Code-branded ~/.roo/custom_modes.yaml. The file FORMAT (YAML, schema)
+// and the merge semantics are unchanged; only the lookup path moved.
 
 const PROBLEMATIC_CHARS_REGEX =
 	// eslint-disable-next-line no-misleading-character-class
@@ -129,7 +153,7 @@ function cleanInvisibleCharacters(content: string): string {
  * global `~/.roo/custom_modes.yaml`.
  *
  * @param filePath absolute path of the modes file to read
- * @param source   "project" for `.roomodes`, "global" for `custom_modes.yaml`
+ * @param source   "project" for `.roomodes`, "global" for `modes.yaml`
  */
 async function loadModesFromFile(filePath: string, source: "project" | "global"): Promise<ModeConfig[]> {
 	let raw: string
@@ -177,16 +201,18 @@ async function loadModesFromFile(filePath: string, source: "project" | "global")
 
 /**
  * Load the merged set of custom modes for a workspace: the project's own
- * `.roomodes` first (project wins on slug collision), then the global
- * `~/.roo/custom_modes.yaml` for any slug the project does NOT define —
- * the same precedence model as the vendored
- * `CustomModesManager.mergeCustomModes`. A missing or malformed global file
- * degrades exactly like a missing/malformed `.roomodes` (returns [] for that
- * source, logs, never throws).
+ * `.roomodes` first (project wins on slug collision), then the GLOBAL shared
+ * modes file — `~/.local/share/headlesscode/shared/modes.yaml` (see
+ * src/project-store.ts; the one-time ~/.roo/ migration is triggered here on
+ * first use) — for any slug the project does NOT define. Same precedence
+ * model as the vendored `CustomModesManager.mergeCustomModes`. A missing or
+ * malformed global file degrades exactly like a missing/malformed `.roomodes`
+ * (returns [] for that source, logs, never throws).
  */
 export async function loadCustomModes(workspaceRoot: string): Promise<ModeConfig[]> {
+	ensureSharedInstructionsMigration()
 	const projectModes = await loadModesFromFile(path.join(workspaceRoot, ".roomodes"), "project")
-	const globalModes = await loadModesFromFile(path.join(os.homedir(), ".roo", "custom_modes.yaml"), "global")
+	const globalModes = await loadModesFromFile(path.join(sharedInstructionsRoot(), "modes.yaml"), "global")
 
 	const slugs = new Set<string>()
 	const merged: ModeConfig[] = []
@@ -275,7 +301,35 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions): Prom
 		settings,
 	)
 
-	return { prompt, modeConfig, customModes }
+	// Headless harness workflow conventions, appended AFTER the vendored
+	// builder's output (which is vendored code and must not be edited in
+	// place). These are harness-level expectations that live outside any
+	// single rules file: committing real work before finishing, running the
+	// targeted test file(s) during the iterative edit-check loop, and
+	// batching same-file diffs into one apply_diff. Edit-workflow guidance
+	// only applies to modes that can actually edit files (modeHasEditGroup);
+	// read-only reviewer/QA roles never see it.
+	const conventions = buildHeadlessConventions(modeConfig.slug, customModes)
+	const fullPrompt = conventions === undefined ? prompt : `${prompt}\n${conventions}`
+
+	return { prompt: fullPrompt, modeConfig, customModes }
+}
+
+/**
+ * The headless-specific workflow section spliced onto the end of the system
+ * prompt for edit-capable modes (see buildSystemPrompt). Keep it SHORT and
+ * scannable — it is one block of prose among the vendored sections, not a
+ * replacement for the tools' own descriptions or the rules files.
+ */
+export function buildHeadlessConventions(mode: string, customModes: ModeConfig[] = []): string | undefined {
+	if (!modeHasEditGroup(mode, customModes)) {
+		return undefined
+	}
+	return `# Headless harness workflow conventions
+
+- Commit before finishing: real, working changes must be committed via \`git add\` + \`git commit\` BEFORE calling attempt_completion. Use one commit per logical change with a descriptive message, matching this repo's normal style (run \`git log --oneline\` for examples). If you genuinely have no changes to commit (e.g. a read-only investigation), finish without committing.
+- Test selection during iterative work: after editing a file, run the SPECIFIC test file(s) for what you changed (the \`run_tests\` tool, or \`npx tsx <test-file>\` directly) instead of the full suite on every edit. The full \`npm test\` is still required once, right before attempt_completion, for real confidence.
+- Batch same-file diffs: when several changes target the SAME file, include them as separate SEARCH/REPLACE blocks in ONE apply_diff call — and after any successful edit, re-read the file before composing further diffs, because its content has changed.`
 }
 
 // ─── Tool selection ──────────────────────────────────────────────────────────
@@ -379,4 +433,34 @@ export function appendCodeIntelTools(tools: ChatTool[]): ChatTool[] {
 		return tools
 	}
 	return [...tools, ...(missing as unknown as ChatTool[])]
+}
+
+/**
+ * Append the EDIT-capable code-intelligence tool schema (`rename_symbol`) to
+ * a tool list if it isn't already present. Unlike appendCodeIntelTools (the
+ * four read-only tools, safe for every mode), rename_symbol WRITES files, so
+ * callers must gate this on the executor actually registering it (the
+ * headless executor does; the read-only reviewer/QA executors do not — see
+ * src/tools/executor.ts) — otherwise a read-only session would advertise a
+ * tool whose handler is missing.
+ */
+export function appendCodeIntelEditTools(tools: ChatTool[]): ChatTool[] {
+	if (tools.some((t) => t.type === "function" && t.function.name === RENAME_SYMBOL_TOOL.function.name)) {
+		return tools
+	}
+	return [...tools, RENAME_SYMBOL_TOOL as unknown as ChatTool]
+}
+
+/**
+ * Append the `run_tests` tool schema if it isn't already present. Like
+ * rename_symbol, run_tests RUNS the test suite (side-effectful) and is only
+ * meaningful to edit-capable sessions, so callers gate this on the executor
+ * actually registering it (the headless executor does; read-only reviewer/QA
+ * executors do not — see src/tools/executor.ts).
+ */
+export function appendRunTestsTool(tools: ChatTool[]): ChatTool[] {
+	if (tools.some((t) => t.type === "function" && t.function.name === runTestsTool.function.name)) {
+		return tools
+	}
+	return [...tools, runTestsTool as unknown as ChatTool]
 }

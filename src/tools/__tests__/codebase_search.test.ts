@@ -102,8 +102,9 @@ async function testHandlerReadsExistingIndex(): Promise<void> {
 		assert.equal(results[0].filePath, "src/auth.ts", "the password-related chunk ranks first")
 		assert.match(formatSearchResults("hash password", results), /File path: src\/auth\.ts/)
 
-		// index.jsonl exists at the documented location.
-		assert.ok(await exists(path.join(ws, ".headlesscode", "codesearch", "index.jsonl")))
+		// index.jsonl exists at the documented central-store location.
+		const { indexFilePath } = await import("../../codesearch/index.js")
+		assert.ok(await exists(indexFilePath(ws)))
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -122,16 +123,25 @@ const tests: Array<[string, () => Promise<void>]> = [
 ]
 
 async function main(): Promise<void> {
+	// Redirect the central store to a temp dir so buildIndex never touches the
+	// real home directory's store.
+	const storeTmp = await fs.mkdtemp(path.join(os.tmpdir(), "hc-cs-store-"))
+	process.env.HEADLESSCODE_DATA_DIR = storeTmp
 	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
+	try {
+		for (const [name, fn] of tests) {
+			try {
+				await fn()
+				console.log(`  ok   ${name}`)
+			} catch (err) {
+				failed++
+				console.error(`  FAIL ${name}`)
+				console.error(err instanceof Error ? err.stack ?? err.message : String(err))
+			}
 		}
+	} finally {
+		delete process.env.HEADLESSCODE_DATA_DIR
+		await fs.rm(storeTmp, { recursive: true, force: true })
 	}
 	if (failed > 0) {
 		console.error(`\n${failed} test(s) failed`)

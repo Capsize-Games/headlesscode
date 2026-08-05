@@ -5,15 +5,18 @@
  * Resolution precedence (mirrors the flag/env/file convention established for
  * the per-session budget in src/budget/cost.ts and src/cli.ts):
  *
- *   CLI flags > env vars > <workspaceRoot>/.headlesscode/permissions.json > built-in defaults
+ *   CLI flags > env vars > central permissions.json > built-in defaults
  *
  * - CLI flags:  `--allowed-commands` / `--denied-commands` / `--protected-files`
  *               / `--allow-protected-writes` (see src/cli.ts parseArgs)
  * - env vars:   `HEADLESSCODE_ALLOWED_COMMANDS` / `HEADLESSCODE_DENIED_COMMANDS`
  *               / `HEADLESSCODE_PROTECTED_FILES` /
  *               `HEADLESSCODE_ALLOW_PROTECTED_WRITES`
- * - config file: `<workspaceRoot>/.headlesscode/permissions.json`, auto-loaded
- *               when present (no flag needed). Schema:
+ * - config file: the CENTRAL project store's `permissions.json`
+ *               (`~/.local/share/headlesscode/projects/<key>/permissions.json` —
+ *               see src/project-store.ts; keyed by the repo's git-common-dir, so
+ *               worktrees share one policy with zero per-directory setup),
+ *               auto-loaded when present (no flag needed). Schema:
  *               `{ "allowedCommands": string[], "deniedCommands": string[],
  *               "protectedFiles": string[], "allowProtectedWrites": boolean }`.
  *               A malformed file fails loudly — mirroring how
@@ -35,6 +38,7 @@
 import * as fs from "node:fs"
 import * as path from "node:path"
 
+import { resolveProjectDataDir } from "../project-store.js"
 import { DEFAULT_PROTECTED_FILES } from "./protected-files.js"
 
 /**
@@ -72,8 +76,13 @@ export interface PermissionsFile {
 	allowProtectedWrites?: boolean
 }
 
-/** Config file location, relative to the workspace root. */
-export const PERMISSIONS_CONFIG_FILE = ".headlesscode/permissions.json"
+/** Config file basename inside the central project data dir. */
+export const PERMISSIONS_CONFIG_FILE = "permissions.json"
+
+/** Absolute path of the central permissions.json for a workspace root. */
+export function permissionsFilePath(workspaceRoot: string): string {
+	return path.join(resolveProjectDataDir(workspaceRoot), PERMISSIONS_CONFIG_FILE)
+}
 
 /** Split a comma-separated list (CLI flag / env var) into trimmed entries. */
 export function parseCommaSeparated(raw: string | undefined): string[] | undefined {
@@ -130,23 +139,32 @@ export function parsePermissionsFileBody(parsed: unknown, source: string): Permi
 }
 
 /**
- * Load `<workspaceRoot>/.headlesscode/permissions.json` when present.
+ * Load the central `permissions.json` for a workspace when present.
  * Returns `null` when the file does not exist (the common case). A
  * present-but-malformed file throws — a broken policy must fail loudly, never
- * silently fall back to weaker defaults.
+ * silently fall back to weaker defaults. Falls back to the legacy
+ * `<workspaceRoot>/.headlesscode/permissions.json` only when the central file
+ * is absent AND the legacy one still exists (pre-migration grace — the
+ * migration in resolveProjectDataDir normally moves it before this is reached).
  */
 export function loadPermissionsFile(workspaceRoot: string): PermissionsFile | null {
-	const filePath = path.resolve(workspaceRoot, PERMISSIONS_CONFIG_FILE)
+	const filePath = permissionsFilePath(workspaceRoot)
 	let raw: string
 	try {
 		raw = fs.readFileSync(filePath, "utf-8")
 	} catch (err) {
 		if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-			return null
+			const legacy = path.resolve(workspaceRoot, ".headlesscode", PERMISSIONS_CONFIG_FILE)
+			try {
+				raw = fs.readFileSync(legacy, "utf-8")
+			} catch {
+				return null
+			}
+		} else {
+			throw new Error(
+				`permissions: cannot read permissions file '${filePath}': ${err instanceof Error ? err.message : String(err)}`,
+			)
 		}
-		throw new Error(
-			`permissions: cannot read permissions file '${filePath}': ${err instanceof Error ? err.message : String(err)}`,
-		)
 	}
 
 	let parsed: unknown

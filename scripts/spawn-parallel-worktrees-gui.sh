@@ -97,18 +97,11 @@ for spec in "$@"; do
         ln -s ../../zoo-code "$wt_path/zoo-code"
     fi
 
-    # Codebase-search index: same gitignore story as zoo-code/ — never
-    # committed, so copy the main checkout's index (if any) so this fresh
-    # worktree starts with a usable index. A symlink would break when the
-    # main repo rebuilds its index (the file gets replaced, not edited).
-    if [ -f "$REPO_ROOT/.headlesscode/codesearch/index.jsonl" ] &&
-        [ -s "$REPO_ROOT/.headlesscode/codesearch/index.jsonl" ] &&
-        [ ! -e "$wt_path/.headlesscode/codesearch/index.jsonl" ]; then
-        mkdir -p "$wt_path/.headlesscode/codesearch"
-        cp "$REPO_ROOT/.headlesscode/codesearch/index.jsonl" \
-            "$wt_path/.headlesscode/codesearch/index.jsonl"
-        echo "  Seeded codebase-search index from main repo ($(du -h "$wt_path/.headlesscode/codesearch/index.jsonl" | cut -f1))"
-    fi
+    # No codebase-search index seeding here anymore: the index lives in the
+    # CENTRAL per-project data store
+    # (~/.local/share/headlesscode/projects/<key>/ — see src/project-store.ts),
+    # keyed by the repo's git-common-dir. This worktree (and every other one)
+    # resolves that same store automatically, so there is nothing to copy.
 
     if [ -n "$task_file" ]; then
         cp "$REPO_ROOT/$task_file" "$wt_path/ORCHESTRATOR_TASK.md"

@@ -34,6 +34,15 @@
  *   everything except the deny-list" — backward compatible with the
  *   pre-permissions harness. `deniedCommands` always applies. Only when an
  *   allow-list is explicitly configured does "not on the allow-list" mean deny.
+ * - CENTRAL-STORE PROTECTION (always-applied, NOT configurable): a recursive
+ *   `rm` whose resolved target is the shared central store root
+ *   (~/.local/share/headlesscode) or a parent of it is refused EVEN with an
+ *   empty allow/deny config — the default-allow branch must never bypass it.
+ *   This is a pattern-based speed bump against the exact incident documented
+ *   in plans/protect-shared-store-from-destructive-commands.md, not a
+ *   sandbox; see src/permissions/store-protection.ts for the honest scope.
+ *   Per-workspace permissions.json cannot override it (the whole point is
+ *   protecting the SHARED resource from any single workspace).
  *
  * `parseCommand` is ported WITHOUT the `shell-quote` dependency (not present in
  * this repo's node_modules): quoted strings, arithmetic, parameter expansions,
@@ -46,6 +55,8 @@
  * state machine (single/double/ANSI-C/locale/heredoc + comments) is ported
  * verbatim.
  */
+
+import { checkCentralStoreDestruction } from "./store-protection.js"
 
 // ─── parseCommand port (zoo-code/src/shared/parse-command.ts) ───────────────
 
@@ -734,14 +745,21 @@ export interface CommandRefusal {
 	 * - "denied": matched the deny-list (deny wins over allow).
 	 * - "not_allowed": allow-list configured but this sub-command matches
 	 *   neither list; a headless harness has no human to ask, so it is denied.
+	 * - "protected_store": recursive delete targeting the shared central store
+	 *   or a parent of it — always blocked, NOT configurable (see
+	 *   src/permissions/store-protection.ts).
 	 */
-	kind: "dangerous" | "malformed" | "denied" | "not_allowed"
-	/** The sub-command that triggered the refusal (denied/not_allowed). */
+	kind: "dangerous" | "malformed" | "denied" | "not_allowed" | "protected_store"
+	/** The sub-command that triggered the refusal (denied/not_allowed/protected_store). */
 	subCommand?: string
 	/** The deny-list pattern that matched (denied). */
 	pattern?: string
 	/** The parse error (malformed). */
 	parseError?: UnterminatedQuote
+	/** The resolved target that matched the store (protected_store). */
+	target?: string
+	/** The protected central store root (protected_store). */
+	storeRoot?: string
 }
 
 /**
@@ -752,13 +770,21 @@ export interface CommandRefusal {
  * 1. Dangerous substitution → unconditional refuse (not configurable).
  * 2. Malformed command (unterminated quote/heredoc) → refuse.
  * 3. Each sub-command from `parseCommand` (so `echo hi && rm -rf /` is checked
- *    per sub-command, not as one opaque string): deny-list first, then the
- *    allow-list, with upstream's longest-prefix-match precedence.
+ *    per sub-command, not as one opaque string): FIRST the central-store
+ *    protection (recursive delete targeting the shared store or a parent of it
+ *    — always refused, even with empty allow/deny config, and NOT overridable
+ *    by any permissions config), THEN the deny-list, then the allow-list, with
+ *    upstream's longest-prefix-match precedence.
+ *
+ * `options.workspaceRoot` anchors relative command targets for the
+ * central-store check (the executor passes the command's resolved `cwd`;
+ * default: process.cwd()). It has no effect on the allow/deny lists.
  */
 export function checkCommand(
 	command: string,
 	allowedCommands: string[],
 	deniedCommands: string[],
+	options?: { workspaceRoot?: string },
 ): CommandRefusal | null {
 	if (!command?.trim()) {
 		return null
@@ -777,6 +803,19 @@ export function checkCommand(
 		const cmd = sub.replace(/\d*>&\d*/, "").trim()
 		if (!cmd) {
 			continue
+		}
+		// Always-applied central-store protection: runs before (and
+		// independently of) the allow/deny lists, so the empty-allow-list
+		// default-ALLOW branch can never bypass it and no permissions.json
+		// entry can override it.
+		const storeRefusal = checkCentralStoreDestruction(cmd, options?.workspaceRoot)
+		if (storeRefusal !== null) {
+			return {
+				kind: "protected_store",
+				subCommand: cmd,
+				target: storeRefusal.target,
+				storeRoot: storeRefusal.storeRoot,
+			}
 		}
 		const refusal = checkSingleCommand(cmd, allowedCommands, deniedCommands)
 		if (refusal !== null) {
@@ -823,6 +862,7 @@ export function decideCommand(
 	command: string,
 	allowedCommands: string[],
 	deniedCommands: string[],
+	options?: { workspaceRoot?: string },
 ): PermissionDecision {
-	return checkCommand(command, allowedCommands, deniedCommands) === null ? "allow" : "deny"
+	return checkCommand(command, allowedCommands, deniedCommands, options) === null ? "allow" : "deny"
 }

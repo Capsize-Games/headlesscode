@@ -5,6 +5,14 @@
  * pushed a named branch (see src/github/push.ts), this opens a PR from that
  * `head` branch into a `base` branch.
  *
+ * `getPullRequestStatus()` is the read-back half used by orchestrator
+ * worktree cleanup (`src/orchestrator/merge-check.ts`): a squash/rebase PR
+ * merge creates a NEW commit whose hash is nothing on the source branch, so
+ * the local `merge-base --is-ancestor` check alone would wrongly report
+ * "not merged". GitHub's server-computed `.merged` boolean on
+ * `GET /repos/{owner}/{repo}/pulls/{number}` is the only authoritative
+ * "is this PR merged" answer for that workflow.
+ *
  * The base branch is never hardcoded: when `base` is omitted it is resolved
  * fresh from the repo API (`GET /repos/{owner}/{repo}` → `default_branch`),
  * so the PR always targets the repo's REAL default branch unless the caller
@@ -229,4 +237,85 @@ export async function openPullRequest(options: OpenPrOptions): Promise<OpenPrRes
 		throw new OpenPrError(response.status, `unexpected PR response shape from POST ${url}`, url)
 	}
 	return { number: pr.number, url: pr.html_url }
+}
+
+export interface PullRequestStatus {
+	number: number
+	/** "open" | "closed" — the PR's lifecycle state, NOT its merge status. */
+	state: string
+	/** GitHub's server-computed merge boolean — the authoritative answer. */
+	merged: boolean
+	mergedAt?: string
+	htmlUrl?: string
+	title?: string
+}
+
+/**
+	* Read a PR's status back from `GET /repos/{owner}/{repo}/pulls/{number}`.
+	* The `.merged` field is computed server-side by GitHub and is the ONLY
+	* correct "is this PR merged" answer for squash/rebase merges (which create
+	* a new commit hash unrelated to anything on the source branch). Non-2xx
+	* API responses throw OpenPrError exactly like openPullRequest; a malformed
+	* 2xx body (missing `merged`/`state`) also throws rather than guessing.
+	*/
+export async function getPullRequestStatus(options: {
+	owner: string
+	repo: string
+	prNumber: number
+	getToken: TokenSupplier
+	baseUrl?: string
+	fetchImpl?: typeof fetch
+}): Promise<PullRequestStatus> {
+	const { owner, repo, prNumber, getToken, baseUrl, fetchImpl = fetch } = options
+	if (!owner || !repo || !Number.isInteger(prNumber) || prNumber <= 0) {
+		throw new OpenPrError(0, "getPullRequestStatus: owner, repo and a positive prNumber are required", "")
+	}
+
+	const token = await getToken()
+	if (!token) {
+		throw new OpenPrError(0, "getPullRequestStatus: no installation token provided", "")
+	}
+
+	const apiBase = (baseUrl ?? DEFAULT_GH_BASE_URL).replace(/\/+$/, "")
+	const url = `${apiBase}/repos/${owner}/${repo}/pulls/${prNumber}`
+
+	let response: Response
+	try {
+		response = await fetchImpl(url, {
+			method: "GET",
+			headers: ghHeaders(token),
+		})
+	} catch (err) {
+		throw new OpenPrError(
+			0,
+			`GitHub API network error (GET ${url}): ${err instanceof Error ? err.message : String(err)}`,
+			url,
+			{ cause: err },
+		)
+	}
+
+	if (!response.ok) {
+		const payload = await parseErrorPayload(response)
+		throw new OpenPrError(response.status, formatErrorMessage(payload, `GitHub API HTTP ${response.status} for GET ${url}`), url)
+	}
+
+	const body = (await response.json()) as {
+		number?: unknown
+		state?: unknown
+		merged?: unknown
+		merged_at?: unknown
+		html_url?: unknown
+		title?: unknown
+	}
+	if (typeof body.number !== "number" || typeof body.state !== "string" || typeof body.merged !== "boolean") {
+		throw new OpenPrError(response.status, `unexpected PR status shape from GET ${url}`, url)
+	}
+	return {
+		number: body.number,
+		state: body.state,
+		merged: body.merged,
+		...(typeof body.merged_at === "string" ? { mergedAt: body.merged_at } : {}),
+		...(typeof body.html_url === "string" ? { htmlUrl: body.html_url } : {}),
+		...(typeof body.title === "string" ? { title: body.title } : {}),
+	}
 }

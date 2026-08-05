@@ -15,7 +15,10 @@ import {
 	estimateCost,
 	FALLBACK_MODEL_PRICE,
 	loadPricingTable,
+	mergeLivePrice,
+	parseEndpointPricing,
 	priceFor,
+	type EndpointPricingEntry,
 	type PricingTable,
 } from "../cost.js"
 
@@ -217,6 +220,72 @@ async function testAccumulateCost(): Promise<void> {
 	assert.equal(withCustom, 1)
 }
 
+// ─── parseEndpointPricing (Part E live pricing) ───────────────────────────────
+
+async function testParseEndpointPricingProviderPreference(): Promise<void> {
+	// deepseek/* pins routing to the official DeepSeek endpoint, so the
+	// live price must be that endpoint's, even when another host is cheaper.
+	const endpoints: EndpointPricingEntry[] = [
+		{
+			provider_name: "DeepInfra",
+			pricing: { prompt: "0.00000009", completion: "0.00000018", input_cache_read: "0.000000018" },
+		},
+		{
+			provider_name: "DeepSeek",
+			pricing: { prompt: "0.00000014", completion: "0.00000028", input_cache_read: "0.0000000028" },
+		},
+	]
+	const price = parseEndpointPricing(endpoints, "DeepSeek")
+	assert.ok(price, "a usable price is parsed")
+	assert.ok(Math.abs(price.input - 0.14) < 1e-9, `DeepSeek endpoint's prompt price wins (got $${price.input})`)
+	assert.ok(Math.abs(price.output - 0.28) < 1e-9, `DeepSeek endpoint's completion price wins (got $${price.output})`)
+	assert.ok(Math.abs(price.cacheRead! - 0.0028) < 1e-9, `cacheRead parsed from the preferred endpoint (got $${price.cacheRead})`)
+	// Provider match is case-insensitive.
+	const lower = parseEndpointPricing(endpoints, "deepseek")
+	assert.ok(Math.abs(lower!.input - 0.14) < 1e-9, "provider preference matches case-insensitively")
+}
+
+async function testParseEndpointPricingTakesMaxForAutoRouted(): Promise<void> {
+	// For auto-routed (non-pinned) models the harness can't know which
+	// endpoint served a call — a cost GUARDRAIL takes the per-field max so a
+	// cap is never bypassed by under-estimation.
+	const endpoints: EndpointPricingEntry[] = [
+		{ provider_name: "HostA", pricing: { prompt: "0.0000001", completion: "0.0000005" } },
+		{ provider_name: "HostB", pricing: { prompt: "0.0000003", completion: "0.0000002", input_cache_read: "0.00000005" } },
+	]
+	const price = parseEndpointPricing(endpoints)
+	assert.ok(price, "parses a price")
+	assert.ok(Math.abs(price.input - 0.3) < 1e-9, `max prompt wins (got $${price.input})`)
+	assert.ok(Math.abs(price.output - 0.5) < 1e-9, `max completion wins (got $${price.output})`)
+	assert.ok(Math.abs(price.cacheRead! - 0.05) < 1e-9, `max cacheRead wins (got $${price.cacheRead})`)
+}
+
+async function testParseEndpointPricingFailOpen(): Promise<void> {
+	assert.equal(parseEndpointPricing([]), undefined, "no endpoints → undefined")
+	assert.equal(
+		parseEndpointPricing([{ provider_name: "HostA", pricing: {} }]),
+		undefined,
+		"endpoints without pricing → undefined",
+	)
+	assert.equal(
+		parseEndpointPricing([{ provider_name: "HostA", pricing: { prompt: "0.5", completion: "0.5" } }], "DeepSeek"),
+		undefined,
+		"provider preference with no matching endpoint → undefined (caller falls back to the hardcoded table)",
+	)
+	// String-per-token is converted to per-1M; numbers are accepted too.
+	const mixed = parseEndpointPricing([{ provider_name: "HostA", pricing: { prompt: "0.00000014", completion: 0.00000028 } }])
+	assert.ok(Math.abs(mixed!.input - 0.14) < 1e-9 && Math.abs(mixed!.output - 0.28) < 1e-9, "string + numeric per-token prices convert")
+}
+
+async function testMergeLivePriceOverridesDefaults(): Promise<void> {
+	const table = mergeLivePrice(DEFAULT_PRICING_TABLE, "deepseek/deepseek-v4-flash", { input: 0.99, output: 1.99 })
+	assert.equal(table["deepseek/deepseek-v4-flash"].input, 0.99, "the live price replaces the hardcoded entry for that model")
+	assert.equal(table["deepseek/deepseek-chat"].input, DEFAULT_PRICING_TABLE["deepseek/deepseek-chat"].input, "other models untouched")
+	// estimateCost consumes the merged table directly.
+	const cost = estimateCost({ model: "deepseek/deepseek-v4-flash", inputTokens: 1_000_000, outputTokens: 0, pricing: table })
+	assert.ok(Math.abs(cost - 0.99) < 1e-9, `live price flows into estimateCost (got $${cost})`)
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -229,6 +298,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["HEADLESSCODE_PRICING_JSON deep-merges over the defaults", testEnvPricingJsonOverride],
 	["HEADLESSCODE_PRICING_JSON with a missing file throws", testEnvPricingJsonMissingFileThrows],
 	["accumulateCost sums multiple runs", testAccumulateCost],
+	["parseEndpointPricing: pinned provider's endpoint wins", testParseEndpointPricingProviderPreference],
+	["parseEndpointPricing: auto-routed models take the conservative max", testParseEndpointPricingTakesMaxForAutoRouted],
+	["parseEndpointPricing: fail-open when nothing usable", testParseEndpointPricingFailOpen],
+	["mergeLivePrice overrides the hardcoded entry, feeds estimateCost", testMergeLivePriceOverridesDefaults],
 ]
 
 async function main(): Promise<void> {

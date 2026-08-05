@@ -199,10 +199,13 @@ else
 fi
 
 echo "== [5/10] spawn-parallel-worktrees.sh (2 specs) =="
-# Give the fixture a per-workspace mode-models.json (the P0.2 config file):
-# the spawner must seed it into each worktree so workers resolve the cheap
-# `_condensation` model instead of silently running condensation on the full
-# session model.
+# Give the fixture a legacy workspace-relative mode-models.json (the P0.2
+# config file): the spawner no longer seeds it into worktrees — workers
+# resolve it from the CENTRAL project store (src/project-store.ts), keyed by
+# the repo's git-common-dir so every worktree shares it. The assertion below
+# verifies the real resolution path (migrateLegacyProjectData +
+# resolveModelForMode) still lands the cheap `_condensation` model instead of
+# silently running condensation on the full session model.
 mkdir -p "$FIXTURE/.headlesscode"
 cat > "$FIXTURE/.headlesscode/mode-models.json" <<'EOF'
 {
@@ -259,12 +262,36 @@ if [ -f "$FIXTURE/.worktrees/w1/ORCHESTRATOR_TASK.md" ] &&
 else
 	fail "ORCHESTRATOR_TASK.md copy missing"
 fi
-if [ -f "$FIXTURE/.worktrees/w1/.headlesscode/mode-models.json" ] &&
-	[ -f "$FIXTURE/.worktrees/w2/.headlesscode/mode-models.json" ] &&
-	grep -q '"_condensation": "qwen/qwen3-8b"' "$FIXTURE/.worktrees/w1/.headlesscode/mode-models.json"; then
-	pass "per-workspace mode-models.json seeded into each worktree"
+# mode-models.json now lives in the CENTRAL store (src/project-store.ts),
+# keyed by the repo's git-common-dir — the spawner's per-worktree seeding is
+# deliberately gone (see spawn-parallel-worktrees.sh). Assert the NEW
+# contract: no seed file in the worktrees, and the worker's real resolution
+# path still lands the cheap `_condensation` model. The migration is explicit
+# here (migrateLegacyProjectData — the same function the auto path and
+# `headlesscode migrate` call) because under a $HEADLESSCODE_DATA_DIR
+# override the auto migration is skipped.
+if [ -f "$FIXTURE/.worktrees/w1/.headlesscode/mode-models.json" ] ||
+	[ -f "$FIXTURE/.worktrees/w2/.headlesscode/mode-models.json" ]; then
+	fail "per-worktree mode-models.json seed file found — per-worktree seeding should be gone (central store)"
 else
-	fail "mode-models.json seeding into worktrees missing/wrong"
+	pass "no per-worktree mode-models.json seeding (worktrees share the central store)"
+fi
+MM_RESOLVED="$(
+	cd "$ROOT" &&
+		npx tsx -e '
+			import { migrateLegacyProjectData, resolveProjectDataDir, resolveProjectIdentity } from "./src/project-store.ts"
+			import { resolveModelForMode } from "./src/config/mode-models.ts"
+			const [ws] = process.argv.slice(1)
+			const identity = resolveProjectIdentity(ws)
+			migrateLegacyProjectData(ws, identity.keySource, resolveProjectDataDir(ws), { log: () => {} })
+			const resolved = resolveModelForMode({ workspaceRoot: ws, mode: "code", extraKeys: ["_condensation"] })
+			process.stdout.write(resolved ?? "<unset>")
+		' "$FIXTURE/.worktrees/w1"
+)"
+if [ "$MM_RESOLVED" = "qwen/qwen3-8b" ]; then
+	pass "worker resolves _condensation=qwen/qwen3-8b via the central store"
+else
+	fail "expected _condensation=qwen/qwen3-8b from the central store, got '$MM_RESOLVED'"
 fi
 
 # ── 6. Wait for completion markers (.harness.done) ──────────────────────────

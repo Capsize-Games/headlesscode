@@ -61,6 +61,184 @@ async function testCleanVerdictDoesNotTripOnCleanupWord(): Promise<void> {
 	assert.equal(result.verdict, "clean")
 }
 
+/**
+ * 2026-08-05 production incident regression: a real reviewer report against
+ * airunner issue #83/PR #88 had BOTH a "### Verified clean" section (listing
+ * several claims that checked out) and a SEPARATE "### Reopened" section
+ * naming one real problem (a dropped `--user` scope item). The old
+ * `hasFindingMarker && !hasCleanMarker` logic let the ambient "verified
+ * clean" text suppress the explicit reopen, misclassifying a genuinely
+ * reopened review as "clean" — which would have skipped the entire rework
+ * mechanism. A finding marker must always win.
+ */
+async function testFindingWinsOverCoincidentalCleanLanguage(): Promise<void> {
+	const result = parseReviewResult(
+		[
+			"### Verified clean (all reproduced personally)",
+			"- `./scripts/w1-pytest.sh server/tests/test_prompt_parts.py` -> `1 passed`.",
+			"- Cold-stack first invocation -> `2/2 containers healthy`.",
+			"",
+			"### Reopened",
+			"- **#83** reopened for the `--user \"$(id -u):$(id -g)\"` scope item: not implemented.",
+		].join("\n"),
+	)
+	assert.equal(result.verdict, "finding", "an explicit reopen must win even alongside 'verified clean' text elsewhere")
+	assert.ok(
+		result.findings.some((f) => f.includes("reopened")),
+		"the reopened item must be captured as a finding",
+	)
+}
+
+/**
+ * 2026-08-05 production incident (a second, distinct bug from the same
+ * over-broad word list, caught minutes after fixing the first): a
+ * genuinely CLEAN review — "No findings", "Issue left closed" — reported
+ * real baseline test counts ("12 failed, 1187 passed, ... 8 errors",
+ * pre-existing failures on master, unrelated to the change). The bare word
+ * "failed" alone tripped the OLD finding-marker list, misclassifying a
+ * clean review as a finding and spawning a completely unnecessary rework
+ * cycle — real API spend fixing a problem that did not exist. "Failed" /
+ * "wrong" / "regression" / "does not" are ordinary words that appear
+ * constantly in normal baseline-reporting prose and must NEVER be finding
+ * markers on their own; only `reopen(ed)` (the actual ground-truth action
+ * the reviewer takes on GitHub) and an explicit "verdict: ... finding"
+ * phrase are reliable.
+ */
+async function testBaselineFailedCountsDoNotFalselyTripAFinding(): Promise<void> {
+	const result = parseReviewResult(
+		[
+			"## Independent review — CLEAN, issue stays closed",
+			"",
+			"Reviewed per review-mode procedure. No findings; the previous scope item is fully addressed.",
+			"",
+			"### Full-suite baselines I personally confirmed",
+			"- `server/tests`: **12 failed, 1187 passed, 8 skipped, 39 deselected, 10 errors** — all pre-existing on master.",
+			"- `server/src/airunner_services/tests`: **3 failed, 928 passed, 9 deselected, 8 errors**.",
+			"",
+			"Issue left closed.",
+		].join("\n"),
+	)
+	assert.equal(
+		result.verdict,
+		"clean",
+		"baseline 'N failed' test counts must never be mistaken for a real finding — this is normal, expected pre-existing-failure reporting",
+	)
+}
+
+/**
+ * 2026-08-05 production incident (a THIRD variant of the same bug class,
+ * caught immediately after fixing the second, live, on a real review of
+ * airunner PR #89): a genuinely clean review explained that two minor,
+ * out-of-scope observations did NOT need action using the word "reopen"
+ * itself — "(pre-existing / out of scope, no reopen)" and "Staying
+ * closed. No reopening warranted." — with the bare `\breopen(ed)?\b`
+ * marker (the fix from the PREVIOUS incident) still tripping on this,
+ * because it has no negation-awareness at all. A negation lookbehind
+ * would only protect this exact phrasing (the same mistake made for
+ * "failed" last time); the real fix is structural: `reopen(ed)` only
+ * counts as a finding when it's an actual "### Reopened" heading or is
+ * tied to a specific issue number, both of which the reviewer's own
+ * required report format always uses for a REAL reopen, and an
+ * incidental aside never does.
+ */
+async function testNoReopenAsideDoesNotMarkFinding(): Promise<void> {
+	const result = parseReviewResult(
+		[
+			"## Independent review — VERIFIED CLEAN",
+			"",
+			"Independently reproduced every checkable claim.",
+			"",
+			"### Non-blocking observations (pre-existing / out of scope, no reopen)",
+			'1. `poll-worktree.sh` compares against uppercase "CLOSED" but gh returns lowercase — pre-existing on master.',
+			"2. A benign gitignored log gets one extra line on stall — doc nit only.",
+			"",
+			"Staying closed. No reopening warranted.",
+		].join("\n"),
+	)
+	assert.equal(result.verdict, "clean", "an aside merely mentioning 'reopen' while explicitly NOT reopening must stay clean")
+	assert.deepEqual(result.findings, [])
+}
+
+async function testBareWrongRegressionDoesNotMarkFinding(): Promise<void> {
+	// "wrong"/"regression"/"does not" as ordinary prose, no reopen anywhere.
+	const result = parseReviewResult(
+		"Nothing was wrong with the approach; there is no regression, and the fix does not touch server code. Verified clean.",
+	)
+	assert.equal(result.verdict, "clean")
+}
+
+// ─── Structured VERDICT line: the primary path, no heuristics involved ───────
+
+async function testStructuredVerdictCleanWinsOverContradictoryProse(): Promise<void> {
+	// The exact shape of incident #1 (eb1407c): a "verified clean" section
+	// alongside language that used to look like a finding — but now with the
+	// required structured line, which is authoritative regardless.
+	const result = parseReviewResult(
+		[
+			"### Verified clean",
+			"- Everything reproduced. Some baselines show 12 failed, 1187 passed (pre-existing).",
+			"",
+			"VERDICT: CLEAN",
+		].join("\n"),
+	)
+	assert.equal(result.verdict, "clean")
+}
+
+async function testStructuredVerdictFindingWinsEvenWithCleanLanguageEverywhere(): Promise<void> {
+	const result = parseReviewResult(
+		[
+			"### Verified clean (all reproduced personally)",
+			"- Several claims checked out fine.",
+			"",
+			"### Reopened",
+			"- **#83** reopened for a real problem.",
+			"",
+			"VERDICT: FINDING",
+		].join("\n"),
+	)
+	assert.equal(result.verdict, "finding")
+}
+
+async function testStructuredVerdictIgnoresBaselineFailedCounts(): Promise<void> {
+	// Incident #2 (7535f1f) shape, plus the required line.
+	const result = parseReviewResult(
+		[
+			"No findings. Baselines: 12 failed, 1187 passed, 10 errors (pre-existing on master).",
+			"",
+			"VERDICT: CLEAN",
+		].join("\n"),
+	)
+	assert.equal(result.verdict, "clean")
+}
+
+async function testStructuredVerdictIgnoresNoReopenAside(): Promise<void> {
+	// Incident #3 (f816ca9) shape, plus the required line.
+	const result = parseReviewResult(
+		[
+			"### Non-blocking observations (pre-existing / out of scope, no reopen)",
+			"1. A benign nit.",
+			"",
+			"Staying closed. No reopening warranted.",
+			"",
+			"VERDICT: CLEAN",
+		].join("\n"),
+	)
+	assert.equal(result.verdict, "clean")
+}
+
+async function testStructuredVerdictIsCaseInsensitiveAndTrimsWhitespace(): Promise<void> {
+	const result = parseReviewResult(["Some report text.", "", "verdict: finding  "].join("\n"))
+	assert.equal(result.verdict, "finding")
+}
+
+async function testMissingStructuredVerdictFallsBackToHeuristic(): Promise<void> {
+	// No "VERDICT: ..." line at all -> falls back to the existing heuristic
+	// path (already covered by the other tests in this file, but confirm
+	// the fallback actually engages rather than defaulting blindly).
+	const result = parseReviewResult("Reopened issue #27: a real bug, file:line evidence here.")
+	assert.equal(result.verdict, "finding")
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -69,6 +247,16 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["reopen marker in prose -> finding", testFindingVerdictFromReopenMarker],
 	["unmarked report defaults to clean", testCleanVerdictDefaultWhenUnmarked],
 	["verdict: clean with no findings -> clean", testCleanVerdictDoesNotTripOnCleanupWord],
+	["a finding always wins over coincidental 'verified clean' text elsewhere", testFindingWinsOverCoincidentalCleanLanguage],
+	["baseline 'N failed' test counts do not falsely trip a finding", testBaselineFailedCountsDoNotFalselyTripAFinding],
+	["a 'no reopen' aside explaining nothing needs action stays clean", testNoReopenAsideDoesNotMarkFinding],
+	["structured VERDICT: CLEAN wins over contradictory prose", testStructuredVerdictCleanWinsOverContradictoryProse],
+	["structured VERDICT: FINDING wins even with clean language everywhere", testStructuredVerdictFindingWinsEvenWithCleanLanguageEverywhere],
+	["structured VERDICT: CLEAN ignores baseline 'N failed' counts", testStructuredVerdictIgnoresBaselineFailedCounts],
+	["structured VERDICT: CLEAN ignores a 'no reopen' aside", testStructuredVerdictIgnoresNoReopenAside],
+	["structured verdict line is case-insensitive and trims whitespace", testStructuredVerdictIsCaseInsensitiveAndTrimsWhitespace],
+	["missing structured verdict falls back to the heuristic", testMissingStructuredVerdictFallsBackToHeuristic],
+	["bare 'wrong'/'regression'/'does not' in clean prose does not mark a finding", testBareWrongRegressionDoesNotMarkFinding],
 ]
 
 async function main(): Promise<void> {
