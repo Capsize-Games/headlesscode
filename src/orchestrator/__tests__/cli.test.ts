@@ -53,6 +53,28 @@ function withCapturedStderr(fn: () => Promise<number>): Promise<{ exit: number; 
 		.then((exit) => ({ exit, stderr }))
 }
 
+/** Run a function while capturing everything written to process.stdout + stderr. */
+function withCapturedIo(fn: () => Promise<number>): Promise<{ exit: number; stdout: string; stderr: string }> {
+	const originalOut = process.stdout.write.bind(process.stdout)
+	const originalErr = process.stderr.write.bind(process.stderr)
+	let stdout = ""
+	let stderr = ""
+	process.stdout.write = ((chunk: unknown): boolean => {
+		stdout += String(chunk)
+		return true
+	}) as typeof process.stdout.write
+	process.stderr.write = ((chunk: unknown): boolean => {
+		stderr += String(chunk)
+		return true
+	}) as typeof process.stderr.write
+	return fn()
+		.finally(() => {
+			process.stdout.write = originalOut
+			process.stderr.write = originalErr
+		})
+		.then((exit) => ({ exit, stdout, stderr }))
+}
+
 function baseGroup(overrides: Partial<OrchestratorGroup> = {}): OrchestratorGroup {
 	return {
 		name: "w1",
@@ -447,6 +469,20 @@ async function testParseOrchestrateArgsMaxContinuations(): Promise<void> {
 	assert.ok(bad.error && bad.error.includes("positive integer"), "non-numeric is rejected")
 }
 
+// ─── --no-preflight (issue #13) ──────────────────────────────────────────────
+
+async function testParseOrchestrateArgsNoPreflight(): Promise<void> {
+	// The preflight probe is ON by default — the failure it catches costs
+	// 10-15 min + real spend before it surfaces otherwise.
+	const def = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1"])
+	assert.equal(def.error, undefined)
+	assert.equal(def.options.preflight, true, "preflight is on by default")
+
+	const skipped = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1", "--no-preflight"])
+	assert.equal(skipped.error, undefined)
+	assert.equal(skipped.options.preflight, false, "--no-preflight turns the probe off for CI/non-interactive")
+}
+
 async function testSpawnEnvCarriesMaxIterations(): Promise<void> {
 	const repo = await tmpRepo()
 	try {
@@ -725,6 +761,54 @@ async function testOrchestrateMainDryRunProceedsWhenNoCollision(): Promise<void>
 	}
 }
 
+// ─── Pre-spawn preflight probe (issue #13) ───────────────────────────────────
+
+async function testOrchestrateMainPreflightFailureAbortsBeforeSpawn(): Promise<void> {
+	const repo = await tmpRepo()
+	const savedKey = process.env.HEADLESSCODE_OPENROUTER_API_KEY
+	const savedBaseUrl = process.env.OPENROUTER_BASE_URL
+	process.env.HEADLESSCODE_OPENROUTER_API_KEY = "k"
+	try {
+		initGitRepo(repo)
+		const issuesPath = path.join(repo, "issues.json")
+		await fs.writeFile(
+			issuesPath,
+			JSON.stringify([{ number: 1, title: "Fix the thing", body: "Do it" }]),
+			"utf-8",
+		)
+		// Point the probe at an unreachable endpoint: the 1-token probe fails
+		// with a network error, which must ABORT the round BEFORE task files
+		// are written or anything is spawned (the issue's whole point — the
+		// failure surfaces now, not 30-80 iterations in).
+		process.env.OPENROUTER_BASE_URL = "http://127.0.0.1:1"
+
+		const { exit, stdout, stderr } = await withCapturedIo(() =>
+			orchestrateMain(["--repo", repo, "--issues-json", issuesPath]),
+		)
+
+		assert.notEqual(exit, 0, "a failed preflight must abort the round, got exit 0")
+		assert.ok(stdout.includes("[preflight]"), "the preflight line is printed, got: " + stdout)
+		assert.ok(stderr.includes("preflight FAILED (network)"), `names the failure mode, got: ${stderr}`)
+		assert.ok(stderr.includes("aborting before any workers spawn"), "aborts before spawning, got: " + stderr)
+		const taskDirExists = await fs
+			.stat(path.join(repo, "plans", "parallel-tasks"))
+			.then(() => true, () => false)
+		assert.equal(taskDirExists, false, "no task files are written when the preflight fails")
+	} finally {
+		if (savedKey === undefined) {
+			delete process.env.HEADLESSCODE_OPENROUTER_API_KEY
+		} else {
+			process.env.HEADLESSCODE_OPENROUTER_API_KEY = savedKey
+		}
+		if (savedBaseUrl === undefined) {
+			delete process.env.OPENROUTER_BASE_URL
+		} else {
+			process.env.OPENROUTER_BASE_URL = savedBaseUrl
+		}
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -754,8 +838,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["clean exit with the max-iterations text never auto-continues", testCleanExitWithMaxIterationsTextDoesNotContinue],
 	["continuation spawn forwards the round-level --max-iterations when set", testExhaustionSpawnForwardsMaxIterations],
 	["watchGroups re-polls a group after a continuation reset", testWatchGroupsRepollsGroupAfterContinuationReset],
+	["--no-preflight parses (default on, flag off)", testParseOrchestrateArgsNoPreflight],
 	["orchestrateMain fails on a stale worktree dir even in --dry-run", testOrchestrateMainFailsOnStaleWorktree],
 	["orchestrateMain dry-run proceeds when all worktree dirs are clear", testOrchestrateMainDryRunProceedsWhenNoCollision],
+	["orchestrateMain aborts before spawn when the preflight probe fails", testOrchestrateMainPreflightFailureAbortsBeforeSpawn],
 ]
 
 async function main(): Promise<void> {

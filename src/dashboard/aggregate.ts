@@ -73,6 +73,8 @@ export interface RoundSummary {
 	totalUsage?: OrchestratorState["totalUsage"]
 	groups: OrchestratorGroup[]
 	blocked: BlockedGroup[]
+	/** Issue #13 preflight probe result (present once orchestrate ran it). */
+	preflight?: OrchestratorState["preflight"]
 }
 
 export interface DashboardSummary {
@@ -322,6 +324,7 @@ export async function buildSummary(repo?: string): Promise<DashboardSummary> {
 			totalUsage: state.totalUsage,
 			groups: state.groups,
 			blocked,
+			preflight: state.preflight,
 		}
 	} catch {
 		round = undefined
