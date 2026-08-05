@@ -35,6 +35,12 @@
  *   GET  /api/files/content?repo=<path>&file=<rel>  single file's text content (capped/binary-safe)
  *   GET  /api/settings/permissions?repo=<path>  current permissions.json + resolved defaults
  *   POST /api/settings/permissions?repo=<path>  validate + write permissions.json (creates .headlesscode/)
+ *   GET  /api/codemap?repo=<path>     the project's codemap.json (deterministic
+ *                                     module/import map; see src/codemap/) — from the
+ *                                     central per-project store; 404 until
+ *                                     `headlesscode codemap --workspace <path>` has run
+ *   GET  /api/codemap/html?repo=<path>  the self-contained interactive visualizer
+ *                                     (same store; opens standalone in a browser)
  *
  * NOTE (control plane): the POST /api/session/start route can launch real,
  * billed work and run arbitrary shell via `gh`/`orchestrate` from a form
@@ -71,6 +77,7 @@ import * as path from "node:path"
 
 import { buildSummary, findSessionEventsFile, readSessionEvents } from "./aggregate.js"
 import { diffCheckpoints, listCheckpoints, renderUnifiedDiff, restoreCheckpoint } from "./checkpoints.js"
+import { codemapMissingError, readCodemapHtml, readCodemapJson } from "./codemap.js"
 import { renderPage } from "./page.js"
 import { answerSessionDecision, injectSessionMessage, launchSession, validateSessionStartBody } from "./session-launch.js"
 import { loadCustomModes } from "../engine/prompt.js"
@@ -773,6 +780,33 @@ async function handleRequest(
 				.writeHead(500, { "content-type": "application/json; charset=utf-8" })
 				.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
 		}
+		return
+	}
+
+	// Deterministic per-project codemap (issue #17): GET /api/codemap?repo=<path>
+	// serves the stored codemap.json and GET /api/codemap/html?repo=<path>
+	// serves the self-contained visualizer — both read from the CENTRAL
+	// per-project store, exactly what `headlesscode codemap --workspace`
+	// writes. The dashboard never generates the map on request (it's a
+	// deterministic script job); a missing map is a 404 with a clear pointer
+	// to the generating command.
+	if (url.pathname === "/api/codemap" || url.pathname === "/api/codemap/html") {
+		const repo = url.searchParams.get("repo") || options.repo
+		if (!repo) {
+			res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ error: "missing repo — pass ?repo=<path> or start the dashboard with --repo" }),
+			)
+			return
+		}
+		const wantHtml = url.pathname === "/api/codemap/html"
+		const found = wantHtml ? readCodemapHtml(repo) : readCodemapJson(repo)
+		if (found === undefined) {
+			res.writeHead(404, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ error: codemapMissingError(repo) }),
+			)
+			return
+		}
+		res.writeHead(200, { "content-type": found.contentType }).end(found.content)
 		return
 	}
 
