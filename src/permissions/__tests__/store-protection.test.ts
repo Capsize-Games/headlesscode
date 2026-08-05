@@ -287,7 +287,12 @@ async function testWordSplittingAndPathResolution(): Promise<void> {
 	assert.equal(resolveCommandTarget("./scratch", "/ws"), path.resolve("/ws", "./scratch"))
 	assert.equal(resolveCommandTarget("~/x", "/ws"), path.join(os.homedir(), "x"))
 	assert.equal(resolveCommandTarget("/abs/x", "/ws"), "/abs/x", "absolute targets ignore the workspace root")
-	assert.equal(resolveCommandTarget("$HEADLESSCODE_DATA_DIR", "/ws"), path.resolve("/ws", "$HEADLESSCODE_DATA_DIR"))
+	// With the store override UNSET, $HEADLESSCODE_DATA_DIR stays literal (an
+	// unset var is not expanded). `npm test` sets the var at the suite level,
+	// so clear it explicitly for this deterministic assertion.
+	await withEnv("HEADLESSCODE_DATA_DIR", undefined, () => {
+		assert.equal(resolveCommandTarget("$HEADLESSCODE_DATA_DIR", "/ws"), path.resolve("/ws", "$HEADLESSCODE_DATA_DIR"))
+	})
 
 	// Containment edges (no filesystem access — pure path comparison).
 	await withEnv("HEADLESSCODE_DATA_DIR", "/srv/central-store", () => {
