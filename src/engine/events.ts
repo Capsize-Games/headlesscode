@@ -14,6 +14,16 @@
  *   session_start / iteration_start / llm_response / tool_call / tool_result
  *   checkpoint_saved / decision_blocked / decision_answered
  *   condensed / todo_updated / paused / resumed / session_end
+ *   attempt_completion (issue #34): the session's FINAL report, emitted when
+ *   the loop accepts completion (attempt_completion tool call OR the
+ *   text-only success fallback) and carries the FULL report text — this is
+ *   the deliberate exception to EVENT_TRUNCATE_CHARS: the report is exactly
+ *   the content the model produced, so truncating it would reintroduce the
+ *   observability gap it exists to close (a surprising review/QA verdict was
+ *   previously unrecoverable without re-running the whole session). The
+ *   full report is ALSO persisted to `<workspaceRoot>/.headlesscode/reports/
+ *   <sessionId>.md` (see src/engine/reports.ts) so it survives even a feed
+ *   that never gets polled.
  *   mode_switched (switch_mode: the session's own active mode changed in
  *   place — same session, new system prompt/tool set; see
  *   plans/switch-mode-headless.md)
@@ -269,6 +279,24 @@ export class EventFeed {
 			isError: fields.isError,
 			result: fields.result,
 			...(fields.resultTruncated ? { resultTruncated: true } : {}),
+		})
+	}
+
+	/**
+	 * The session's final report (issue #34). Emitted when the loop accepts
+	 * completion — the one tool call that matters most for understanding a
+	 * review/QA/worker verdict was previously invisible to the feed because
+	 * attempt_completion short-circuits before the tool-execution loop (no
+	 * tool_call/tool_result pair is ever recorded for it). `result` is the
+	 * FULL report text, deliberately NOT truncated (the only event field that
+	 * ignores EVENT_TRUNCATE_CHARS — see the module doc comment for why); the
+	 * full report is also persisted to `.headlesscode/reports/<sessionId>.md`
+	 * by the loop, so the feed and the file are two views of the same text.
+	 */
+	attemptCompletion(fields: { iteration: number; result: string }): Promise<void> {
+		return this.emit("attempt_completion", {
+			iteration: fields.iteration,
+			result: fields.result,
 		})
 	}
 

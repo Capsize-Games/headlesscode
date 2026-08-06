@@ -103,6 +103,15 @@ export interface ReviewResult {
 	verdict: "clean" | "finding" | "error"
 	/** The reviewer's full final summary. */
 	summary: string
+	/**
+	 * Issue #34: absolute path to the review session's complete final report
+	 * (`<workspaceRoot>/.headlesscode/reports/<sessionId>.md`), when the
+	 * session succeeded and the report write succeeded. The orchestrator
+	 * persists this so the full reasoning behind a review verdict is one
+	 * file-read away, not a re-run away. Absent for a session error (no
+	 * report was ever produced).
+	 */
+	reportPath?: string
 }
 
 /** The reviewer-mode tool schemas (read-only + command, no write tools). */
@@ -204,7 +213,7 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 			summary: `Review session failed: ${error}`,
 		}
 	}
-	return parseReviewResult(result.result)
+	return { ...parseReviewResult(result.result), reportPath: result.reportPath }
 }
 
 /**

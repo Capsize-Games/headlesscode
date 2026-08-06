@@ -125,7 +125,9 @@ volume, network alias, env, and healthcheck).
 - Git workspaces: `/data/headlesscode-workspaces/<project>` (=
   `HEADLESSCODE_WORKSPACE_ROOT`).
 - Per-workspace session state: `<workspace>/.headlesscode/` (usage/events/
-  memory feeds), plus repo-local `.worktrees/` for orchestrated sessions.
+  memory feeds, plus `reports/` — the complete per-session final
+  `attempt_completion` reports, issue #34), plus repo-local `.worktrees/`
+  for orchestrated sessions.
 - Global + per-project central state: `$HOME=/data/headlesscode-home` — covers
   the central data store (`~/.local/share/headlesscode/`): the checkpoint
   root (`~/.local/share/headlesscode/checkpoints`, which must stay outside any

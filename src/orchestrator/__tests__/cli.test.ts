@@ -167,6 +167,7 @@ async function testFindingBelowCapSpawnsAndResetsState(): Promise<void> {
 	assert.equal(decision.patch.reworkCount, 1)
 	assert.equal(decision.patch.review_verdict, undefined, "review_verdict cleared for a fresh cycle")
 	assert.equal(decision.patch.pending_review_findings, undefined, "findings cleared for a fresh cycle")
+	assert.equal(decision.patch.review_report, undefined, "stale review report path cleared for a fresh cycle")
 	assert.equal(decision.patch.qa, undefined, "stale QA cleared for a fresh cycle")
 	assert.equal(decision.patch.reviewed_at, undefined)
 	assert.equal(decision.patch.exit_code, undefined, "previous attempt's exit code cleared")
@@ -267,6 +268,41 @@ async function testFindingIncrementsFromExistingCount(): Promise<void> {
 		"each cycle writes a NEW task file (prior files not overwritten)",
 	)
 	assert.equal(decision.patch.reworkCount, 3)
+}
+
+/**
+ * Issue #34: the new report-pointer fields (`qa.report`, `review_report`)
+ * are part of the state schema — they must survive an updateGroup merge and
+ * a saveStateSync/loadStateSync round-trip, so a human reading the state
+ * file can follow the pointer to the COMPLETE final report.
+ */
+async function testReportPointerFieldsSurviveStateRoundTrip(): Promise<void> {
+	const repo = await tmpRepo()
+	const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
+	try {
+		const group = baseGroup({
+			review_report: path.join(repo, ".worktrees", "w1", ".headlesscode", "reports", "review-session-1.md"),
+			qa: {
+				status: "failed",
+				verdict: "fail",
+				evidence: "short slice",
+				report: path.join(repo, ".worktrees", "w1", ".headlesscode", "reports", "qa-session-1.md"),
+				updated: new Date().toISOString(),
+			},
+		})
+		const state = updateGroup({ ...defaultState("round-1"), groups: [] }, "w1", group)
+		await saveStateSync(statePath, state)
+		const reloaded = loadStateSync(statePath)
+		assert.equal(
+			reloaded.groups[0]?.review_report,
+			group.review_report,
+			"review_report survives the state round-trip",
+		)
+		assert.equal(reloaded.groups[0]?.qa?.report, group.qa?.report, "qa.report survives the state round-trip")
+		assert.equal(reloaded.groups[0]?.qa?.evidence, "short slice", "the lightweight evidence slice is still there")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
 }
 
 // ─── handleReviewVerdict: at the cap → needs-human, no spawn ────────────────
@@ -1031,6 +1067,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["QA session error goes straight to needs-human, not settled as an ordinary failed QA", testQaSessionErrorGoesStraightToNeedsHuman],
 	["rework patch actually clears a stale cost_recorded on merge", testReworkPatchActuallyClearsCostRecordedOnMerge],
 	["continuation patch actually clears a stale cost_recorded on merge", testContinuationPatchActuallyClearsCostRecordedOnMerge],
+	["report pointer fields (qa.report / review_report) survive the state round-trip (issue #34)", testReportPointerFieldsSurviveStateRoundTrip],
 	["finding increments from an existing rework count", testFindingIncrementsFromExistingCount],
 	["finding at cap marks needs-human and does NOT spawn", testFindingAtCapMarksNeedsHumanAndDoesNotSpawn],
 	["clean verdict never touches reworkCount", testCleanVerdictNeverTouchesReworkCount],

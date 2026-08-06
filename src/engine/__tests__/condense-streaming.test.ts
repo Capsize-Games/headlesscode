@@ -218,7 +218,9 @@ function estimateChars(messages: ChatMessage[]): number {
  * after that iteration's `iteration_start` — the loop emits it from
  * maybeCondenseHistory before the main LLM call — so the feed reads as a
  * clean session_start → checkpoint_saved → per-iteration streamed-turn blocks
- * → (condensed) → final streamed completion → session_end.
+ * → (condensed) → final streamed completion → attempt_completion → session_end
+ * (the attempt_completion event is issue #34's final-report event, emitted
+ * before session_end when the loop accepts completion).
  */
 function expectedEventTypes(
 	callCounts: number[],
@@ -243,6 +245,7 @@ function expectedEventTypes(
 	if (callCounts.length + 1 === condenseIteration) types.push("condensed")
 	for (let c = 0; c < finalChunks; c++) types.push("llm_stream_chunk")
 	types.push("llm_response")
+	types.push("attempt_completion")
 	types.push("session_end")
 	return types
 }

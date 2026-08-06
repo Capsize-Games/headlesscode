@@ -321,6 +321,28 @@ async function testRunReviewWritesATailableLogFile(): Promise<void> {
 	}
 }
 
+/**
+	* Issue #34: the reviewer's COMPLETE final report is persisted per session
+	* (`<workspaceRoot>/.headlesscode/reports/<sessionId>.md`) and surfaced on
+	* the ReviewResult so the orchestrator can point the state file at it — the
+	* full reasoning behind a verdict is one file-read away, not a re-run away.
+	*/
+async function testRunReviewSurfacesFullReportPath(): Promise<void> {
+	const ws = await makeWorkspace()
+	try {
+		const client = new FakeLlmClient([() => attemptCompletion("VERDICT: CLEAN")])
+		const result = await runReview({ workspaceRoot: ws, llmClient: client, maxIterations: 5 })
+		assert.equal(result.verdict, "clean")
+		assert.ok(result.reportPath, "ReviewResult must carry the full-report path")
+		const reportFile = await fs.readFile(result.reportPath!, "utf-8")
+		assert.match(reportFile, /Reviewed everything\./)
+		assert.match(reportFile, /VERDICT: CLEAN/)
+		assert.ok(result.reportPath!.includes(`.headlesscode${path.sep}reports${path.sep}`))
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 async function testRunReviewWithRetriesReturnsCleanImmediately(): Promise<void> {
 	const ws = await makeWorkspace()
 	try {
@@ -390,6 +412,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["missing structured verdict falls back to the heuristic", testMissingStructuredVerdictFallsBackToHeuristic],
 	["bare 'wrong'/'regression'/'does not' in clean prose does not mark a finding", testBareWrongRegressionDoesNotMarkFinding],
 	["runReview writes a tailable review.log, appended across sessions (not truncated)", testRunReviewWritesATailableLogFile],
+	["runReview surfaces the complete final report path (issue #34)", testRunReviewSurfacesFullReportPath],
 	["runReviewWithRetries: a normal clean verdict returns immediately, no retry", testRunReviewWithRetriesReturnsCleanImmediately],
 	["runReviewWithRetries: retries after a review-session error and succeeds on the 2nd attempt", testRunReviewWithRetriesRetriesAfterSessionError],
 	["runReviewWithRetries: exhausts retries and returns the final error verdict", testRunReviewWithRetriesExhaustsRetries],

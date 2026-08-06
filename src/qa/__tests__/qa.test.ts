@@ -205,6 +205,29 @@ async function testRunQaWritesATailableLogFile(): Promise<void> {
 	}
 }
 
+/**
+ * Issue #34: the QA session's COMPLETE final report is persisted per session
+ * (`<workspaceRoot>/.headlesscode/reports/<sessionId>.md`) and surfaced on
+ * the QaResult so the orchestrator can point the state file at it — the full
+ * reasoning behind a QA verdict (e.g. why the `## Evidence` slice alone was
+ * insufficient) is one file-read away, not a re-run away.
+ */
+async function testRunQaSurfacesFullReportPath(): Promise<void> {
+	const ws = await makeWorkspace()
+	try {
+		const client = new FakeLlmClient([() => attemptCompletion("QA_VERDICT: PASS")])
+		const result = await runQa({ workspaceRoot: ws, llmClient: client, maxIterations: 5 })
+		assert.equal(result.verdict, "pass")
+		assert.ok(result.reportPath, "QaResult must carry the full-report path")
+		const reportFile = await fs.readFile(result.reportPath!, "utf-8")
+		assert.match(reportFile, /QA complete\./)
+		assert.match(reportFile, /QA_VERDICT: PASS/)
+		assert.ok(result.reportPath!.includes(`.headlesscode${path.sep}reports${path.sep}`))
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 async function testRunQaWithRetriesReturnsPassImmediately(): Promise<void> {
 	const ws = await makeWorkspace()
 	try {
@@ -267,6 +290,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["structured qa verdict line is case-insensitive and trims whitespace", testStructuredVerdictIsCaseInsensitiveAndTrimsWhitespace],
 	["missing structured QA_VERDICT falls back to the heuristic", testMissingStructuredQaVerdictFallsBackToHeuristic],
 	["runQa writes a tailable qa.log", testRunQaWritesATailableLogFile],
+	["runQa surfaces the complete final report path (issue #34)", testRunQaSurfacesFullReportPath],
 	["runQaWithRetries: a normal pass verdict returns immediately, no retry", testRunQaWithRetriesReturnsPassImmediately],
 	["runQaWithRetries: retries after a QA-session error and succeeds on the 2nd attempt", testRunQaWithRetriesRetriesAfterSessionError],
 	["runQaWithRetries: exhausts retries and returns the final error verdict", testRunQaWithRetriesExhaustsRetries],
