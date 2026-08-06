@@ -117,6 +117,23 @@ printed to stdout. Exit code 0 = success; 1 = task failed (max iterations or
 consecutive-mistake limit); 2 = usage/config error (e.g. missing
 `HEADLESSCODE_OPENROUTER_API_KEY`).
 
+## Registering a new project
+
+To use headlesscode against a project that isn't set up as a headlesscode
+project yet, register it in one step:
+
+```bash
+npx headlesscode init --workspace ~/Projects/rts_cpp
+```
+
+This detects the project's stack(s) (which drives per-session instruction
+selection), makes sure the project's `.gitignore` excludes `.headlesscode/`
+session artifacts, and builds the codebase-search index and the codemap — no
+manual `index`/`codemap`/`.gitignore` steps needed. The index step calls the
+embedding API and costs real money unless you pass `--skip-index` or
+`--embedding-backend ollama`. See `npx headlesscode init --help` for the full
+options.
+
 ## CLI reference
 
 ```
