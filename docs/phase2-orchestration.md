@@ -194,6 +194,26 @@ npx tsx src/cli.ts orchestrate --repo <path> --issue 27 --issue 29 --issue 38 \
   records `review_verdict` / `pending_review_findings` in the state file.
 - `--dry-run` prints the split plan + exact spawn command without spawning
   (no API key needed).
+- `--plan-first` (issue #49, OPT-IN experiment): each worktree gets a SHORT
+  architect-mode planning session run by the spawner BEFORE its code worker.
+  The planner reads `ORCHESTRATOR_TASK.md` + the assigned issues, explores,
+  and writes `PLAN.md` at the worktree root; the spawner then appends the plan
+  into `ORCHESTRATOR_TASK.md` under an `## Implementation plan (from the
+  plan-first phase)` section, so the code worker executes against it instead
+  of re-discovering context from iteration 1. Never the default. Tune with
+  `--plan-first-mode <slug>` (default `architect`) and
+  `--plan-first-max-iterations <n>` (default 15 —
+  `$HEADLESSCODE_PLAN_FIRST_MODE` / `$HEADLESSCODE_PLAN_FIRST_MAX_ITERATIONS`
+  env fallbacks). The plan session runs SYNCHRONOUSLY inside the spawner, so N
+  plan-first worktrees extend the spawn call by ~N × plan-session time. The
+  group's outcome is recorded as `plan_first {mode,status,report?}` in the
+  orchestrator state (`ok` = plan produced + appended; `failed` = plan session
+  errored and the code worker ran without a plan — a warning + fallback, never
+  a spawn abort). Intended use: compare cost / iterations / wall-clock on the
+  SAME oversized multi-part issues against a plain `--mode code` round before
+  considering it for the default path. The plan session's usage is recorded
+  into the group's normal per-session usage files, so a round's
+  cost-history/cost estimate naturally includes the planning phase.
 
 ### `orchestrate status` — read-side status / wait for external callers
 

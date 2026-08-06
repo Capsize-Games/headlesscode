@@ -57,6 +57,27 @@
 #                        src/project-store.ts) via src/config/mode-models.ts,
 #                        falling back to $OPENROUTER_MODEL which then flows
 #                        to run-worker.sh)
+#   PLAN_FIRST           when set (e.g. PLAN_FIRST=1), run a SHORT
+#                        architect-mode planning session in each worktree
+#                        BEFORE launching its code worker (issue #49). The
+#                        planner reads ORCHESTRATOR_TASK.md + the assigned
+#                        issues, explores, and writes PLAN.md at the worktree
+#                        root; the plan is then APPENDED into
+#                        ORCHESTRATOR_TASK.md under an "Implementation plan"
+#                        section so the code worker executes against it. The
+#                        planner task file comes from
+#                        plans/parallel-tasks/<name>-plan.md when present
+#                        (the orchestrator writes it for --plan-first rounds),
+#                        else a generic fallback prompt is used. OPT-IN — never
+#                        the default. NOTE: the plan session runs SYNCHRONOUSLY
+#                        (foreground), so N plan-first worktrees extend the
+#                        spawn call by ~N × plan-session time.
+#   PLAN_FIRST_MODE      mode slug for the plan-first session (default:
+#                        architect; anything the worker CLI accepts — built-in
+#                        or .roomodes)
+#   PLAN_FIRST_MAX_ITERATIONS  iteration cap for the plan-first session
+#                        (default: 15 — deliberately short: the plan session
+#                        must produce a plan, not implement it)
 #   ALLOW_UNINDEXED      when set (e.g. ALLOW_UNINDEXED=1), a missing
 #                        codebase-search index in the central store is only a
 #                        warning and worktrees spawn unindexed. When UNSET
@@ -77,6 +98,12 @@
 set -euo pipefail
 
 HARNESS_ROOT="${HEADLESSCODE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+
+# The CLI command the plan-first session (run_plan_first) runs in the
+# foreground — same default as run-worker.sh's own (npx tsx src/cli.ts,
+# resolved from the harness root). Defined at TOP level: run-worker.sh defines
+# its own copy for the worker, but this one must exist for the spawner itself.
+CLI="${HEADLESSCODE_CLI:-npx tsx src/cli.ts}"
 
 if [ "$#" -eq 0 ]; then
     echo "Usage: $0 <name1>:<offset1>:<task-file1> [<name2>:<offset2>:<task-file2> ...]" >&2
@@ -131,6 +158,13 @@ WORKTREE_PARENT="$REPO_ROOT/.worktrees"
 DATE_TAG="$(date +%Y-%m-%d)"
 STATE_FILE="$WORKTREE_PARENT/.orchestrator-state.json"
 ORCH_MODE="${ORCHESTRATOR_MODE:-code}"
+
+# Issue #49 plan-first experiment: OPT-IN, off unless PLAN_FIRST is set. The
+# orchestrator sets these via buildSpawnEnv when --plan-first is passed; a
+# standalone spawner invocation can set them directly.
+PLAN_FIRST="${PLAN_FIRST:-}"
+PLAN_FIRST_MODE="${PLAN_FIRST_MODE:-architect}"
+PLAN_FIRST_MAX_ITERATIONS="${PLAN_FIRST_MAX_ITERATIONS:-15}"
 
 mkdir -p "$WORKTREE_PARENT"
 
@@ -266,6 +300,86 @@ resolve_worktree_branch() {
     printf '%s' "$candidate"
 }
 
+# ── Plan-first phase (issue #49) ─────────────────────────────────────────────
+# Run a SHORT architect-mode planning session inside a freshly-created worktree
+# BEFORE its code worker launches. The planner reads ORCHESTRATOR_TASK.md + the
+# assigned issues, explores, and writes PLAN.md at the worktree root; on
+# success the plan is APPENDED into ORCHESTRATOR_TASK.md under an
+# "Implementation plan" section so the code worker executes against it.
+#
+# This is deliberately NOT run-worker.sh (which launches a DETACHED background
+# worker and writes .harness.pid/.harness.done markers): the plan phase must
+# complete BEFORE the worker starts, and its markers must never be mistaken
+# for the worker's by the orchestrator watcher. It runs the CLI FOREGROUND
+# with no markers; output appends to the worktree's harness.log under its own
+# separator so the run history stays in one place.
+#
+# Sets the GLOBAL $PLAN_PHASE_STATUS to "ok" (plan produced + appended) or
+# "failed" (session errored / wrote no PLAN.md) — the caller reads it AFTER
+# the call (NOT via command substitution: the function's stdout is the spawner's
+# progress log, and capturing it would inject newlines into the caller's JSON
+# state patch). A failed plan phase is a WARNING + fallback, never a spawn
+# abort: the code worker runs without a plan (the historical behavior) and the
+# state records plan_first.status=failed so the experiment's data still shows
+# the plan phase happened.
+run_plan_first() {
+    local wt_path="$1"
+    local name="$2"
+    PLAN_PHASE_STATUS="failed"
+
+    local planner_task="$REPO_ROOT/plans/parallel-tasks/${name}-plan.md"
+    if [ -f "$planner_task" ]; then
+        cp "$planner_task" "$wt_path/ORCHESTRATOR_PLAN.md"
+    else
+        # Standalone spawner invocation without the orchestrator: fall back to
+        # a generic planner prompt (the planner derives context from the
+        # ORCHESTRATOR_TASK.md always copied into the worktree above).
+        cat > "$wt_path/ORCHESTRATOR_PLAN.md" <<'EOF'
+Before anything else: read `.roo/rules-code/rules.md` in full (or `.roo/rules/rules.md` if rules-code is absent) and treat it as binding for this entire session.
+
+You are the PLANNING phase of an autonomous two-phase workflow. Your ONLY job is to produce a compact, actionable implementation plan for the code session that follows.
+
+1. Read `ORCHESTRATOR_TASK.md` at the workspace root — it is the FULL task the code session must execute.
+2. Explore the codebase just enough to ground the plan (grep/read the files the task touches).
+3. Write the plan to `PLAN.md` at the workspace root (OVERWRITE any existing PLAN.md): goal, concrete steps (files + functions), verification steps, and risks. Make every step something another session can act on without re-doing your exploration.
+4. Finish with attempt_completion summarizing where the plan was written.
+
+Constraints: DO NOT implement anything (no source edits, no commits, no pushes). DO NOT ask the human questions — you are headless. DO NOT use switch_mode. Keep the plan SHORT.
+EOF
+    fi
+
+    local planner_model
+    planner_model="$(resolve_mode_model "$PLAN_FIRST_MODE" "$REPO_ROOT")"
+    echo "  Plan-first phase for '$name' (mode $PLAN_FIRST_MODE, max $PLAN_FIRST_MAX_ITERATIONS iterations, model: ${planner_model:-<unset — CLI default>})..."
+    local planner_args=(--task-file "$wt_path/ORCHESTRATOR_PLAN.md" --workspace "$wt_path" --mode "$PLAN_FIRST_MODE")
+    if [ -n "$planner_model" ]; then
+        planner_args+=(--model "$planner_model")
+    fi
+    planner_args+=(--max-iterations "$PLAN_FIRST_MAX_ITERATIONS")
+
+    printf '\n===== plan-first run start: %s (mode %s, max-iterations %s) =====\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PLAN_FIRST_MODE" "$PLAN_FIRST_MAX_ITERATIONS" >>"$wt_path/harness.log"
+    local plan_ok=1
+    (cd "$HARNESS_ROOT" && $CLI "${planner_args[@]}") >>"$wt_path/harness.log" 2>&1 || plan_ok=0
+
+    if [ "$plan_ok" -eq 1 ] && [ -s "$wt_path/PLAN.md" ]; then
+        {
+            echo ""
+            echo "## Implementation plan (from the plan-first phase)"
+            echo ""
+            cat "$wt_path/PLAN.md"
+        } >> "$wt_path/ORCHESTRATOR_TASK.md"
+        echo "  Plan-first: PLAN.md produced; appended to ORCHESTRATOR_TASK.md for the code worker"
+        PLAN_PHASE_STATUS="ok"
+    elif [ "$plan_ok" -eq 1 ]; then
+        echo "  WARNING: plan-first session for '$name' exited 0 but wrote no PLAN.md — code worker runs without a plan" >&2
+        PLAN_PHASE_STATUS="failed"
+    else
+        echo "  WARNING: plan-first session for '$name' FAILED — code worker runs without a plan (fallback, issue #49)" >&2
+        PLAN_PHASE_STATUS="failed"
+    fi
+}
+
 # ── Spawn loop ───────────────────────────────────────────────────────────────
 for spec in "$@"; do
     name="$(printf '%s' "$spec" | cut -d: -f1)"
@@ -390,6 +504,21 @@ EOF
     merge_state "$STATE_FILE" "$patch_file" replace
     rm -f "$patch_file"
 
+    # ── Plan-first phase (issue #49): a SHORT architect-mode session BEFORE ──
+    # the code worker. OPT-IN via PLAN_FIRST; the plan is appended into
+    # ORCHESTRATOR_TASK.md so the worker executes against it. Synchronous
+    # (foreground) — see run_plan_first's doc comment. plan_status flows into
+    # the "running" state patch below.
+    plan_status="skipped"
+    if [ -n "$PLAN_FIRST" ]; then
+        # NOT a command substitution: run_plan_first's stdout is the spawner's
+        # progress log and the status comes back via the $PLAN_PHASE_STATUS
+        # global (capturing stdout would inject the echo lines' newlines into
+        # the JSON state patch below).
+        run_plan_first "$wt_path" "$name"
+        plan_status="$PLAN_PHASE_STATUS"
+    fi
+
     # ── Launch the headless worker (replaces code + sleep 20 + xdotool) ─────
     # Resolve the worker's model FIRST so mode-models.json affects the very
     # first spawn, not just rework re-spawns. Passing the resolved value
@@ -411,6 +540,16 @@ EOF
     echo "  Worker pid: $WORKER_PID (model: ${WORKER_MODEL:-<unset — CLI default>}, log: $wt_path/harness.log)"
 
     # ── Record "running" now that the worker is up ──────────────────────────
+    # plan_first is only recorded when the plan-first phase was actually
+    # requested (PLAN_FIRST set); a plain round never gets the field.
+    PLAN_FIRST_PATCH=""
+    if [ -n "$PLAN_FIRST" ]; then
+        if [ "$plan_status" = "ok" ]; then
+            PLAN_FIRST_PATCH="      \"plan_first\": { \"mode\": \"$PLAN_FIRST_MODE\", \"status\": \"ok\", \"report\": \"PLAN.md\" },"
+        else
+            PLAN_FIRST_PATCH="      \"plan_first\": { \"mode\": \"$PLAN_FIRST_MODE\", \"status\": \"$plan_status\" },"
+        fi
+    fi
     patch_file="$(mktemp)"
     cat > "$patch_file" <<EOF
 {
@@ -418,6 +557,7 @@ EOF
     {
       "name": "$name",
       "status": "running",
+$PLAN_FIRST_PATCH
       "last_activity": { "note": "harness worker launched (pid $WORKER_PID, mode $ORCH_MODE)" }
     }
   ]

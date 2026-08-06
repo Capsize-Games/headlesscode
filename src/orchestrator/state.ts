@@ -18,7 +18,9 @@
  *         "last_activity": string | object,  // "last_commit"/"note" seen live
  *         "commits": string[],
  *         "actions_taken": string[],
- *         "pending_review_findings": string[]
+ *         "pending_review_findings": string[],
+ *         "plan_first": { "mode": string, "status": "ok"|"failed"|"skipped",
+ *                         "report"?: string }  // issue #49 plan-first outcome
  *       }
  *     ]
  *   }
@@ -124,6 +126,15 @@ export interface OrchestratorGroup {
 	 * `needs-human` (same terminal shape as reworkCount's cap).
 	 */
 	continuationCount?: number
+	/**
+	 * Issue #49 plan-first experiment: outcome of the short architect-mode
+	 * planning session the spawner ran in this worktree BEFORE the code worker
+	 * ("ok" = a plan was produced and appended to the worker's task file;
+	 * "failed" = the plan session errored and the code worker ran without a
+	 * plan — a fallback, never a round failure; "skipped" = reserved, not
+	 * currently written). Absent when the round was not run with --plan-first.
+	 */
+	plan_first?: { mode: string; status: "ok" | "failed" | "skipped"; report?: string }
 	/**
 	 * QA bookkeeping (Phase 4, written by the orchestrator after runQa when
 	 * `--qa` is passed): verdict is pass|fail|error; status is "done" for a
