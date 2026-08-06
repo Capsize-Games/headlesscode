@@ -23,10 +23,11 @@
  *
  * This is deliberately a plain append-only JSONL store, no query engine —
  * matching the project's established idiom (mode-models.json, usage.ts,
- * events.ts). Estimating future task cost FROM this history is explicit
- * future work, not implemented here — this module only records and reads
- * raw records; `headlesscode cost-history` (cost-history-cli.ts) is the
- * read-side for now.
+ * events.ts). Estimating future task cost FROM this history is implemented
+ * in cost-estimate.ts (issue #16): it aggregates these records by issue
+ * shape and `orchestrate --dry-run` reports the expected cost/iteration
+ * range for a new task; `headlesscode cost-history --by-shape` prints the
+ * per-shape aggregates. This module only records and reads raw records.
  */
 
 import * as fsp from "node:fs/promises"
@@ -43,6 +44,16 @@ export interface CostHistoryRecord {
 	groupName: string
 	/** Every GitHub issue number this group's work covered (see OrchestratorGroup.issues). */
 	issues: number[]
+	/**
+	 * The per-issue shape (split.ts's issueShape: hot / split / coverage /
+	 * test / docs / refactor / generic), one entry per issue in the same
+	 * order as `issues` — captured at dispatch time (OrchestratorGroup.shapes)
+	 * and copied here so cost-estimate.ts can match a NEW issue to similar
+	 * past ones (issue #16). Undefined for records written before this field
+	 * existed (or from groups spawned without shapes) — those records can
+	 * only be matched by exact issue number, never by shape.
+	 */
+	shapes?: string[]
 	/** Final status at recording time: done | failed | needs-human. */
 	status: string
 	branch?: string
@@ -154,6 +165,7 @@ export async function recordGroupCost(repoRoot: string, group: OrchestratorGroup
 		repo: path.resolve(repoRoot),
 		groupName: group.name,
 		issues: group.issues ?? [],
+		shapes: group.shapes,
 		status: group.status,
 		branch: group.branch,
 		costUsd: group.usage.costUsd,

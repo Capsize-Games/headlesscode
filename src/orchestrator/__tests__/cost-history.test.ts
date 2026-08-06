@@ -57,6 +57,7 @@ function baseGroup(overrides: Partial<OrchestratorGroup> = {}): OrchestratorGrou
 		name: "w1",
 		status: "done",
 		issues: [27, 29],
+		shapes: ["split", "docs"],
 		branch: "issues/w1-2026-08-05",
 		usage: { costUsd: 0.12, inputTokens: 5000, outputTokens: 400, cachedTokens: 2000, iterations: 45 },
 		continuationCount: 1,
@@ -112,6 +113,7 @@ async function testRecordGroupCostBuildsCorrectRecord(): Promise<void> {
 		const record = await recordGroupCost(repo, group)
 		assert.ok(record)
 		assert.deepEqual(record?.issues, [27, 29], "must carry EVERY issue the group covered, not just one")
+		assert.deepEqual(record?.shapes, ["split", "docs"], "must carry the per-issue shapes (issue #16) — the cost estimator's match key")
 		assert.equal(record?.costUsd, 0.12)
 		assert.equal(record?.inputTokens, 5000)
 		assert.equal(record?.continuationCount, 1)
@@ -121,6 +123,7 @@ async function testRecordGroupCostBuildsCorrectRecord(): Promise<void> {
 		const stored = await readCostHistory(repo)
 		assert.equal(stored.length, 1)
 		assert.equal(stored[0]?.groupName, "w1")
+		assert.deepEqual(stored[0]?.shapes, ["split", "docs"], "shapes survive the write/read round trip")
 	} finally {
 		await fs.rm(repo, { recursive: true, force: true })
 	}
@@ -144,11 +147,13 @@ async function testRecordGroupCostDefaultsMissingIssuesAndCachedTokens(): Promis
 	try {
 		const group = baseGroup({
 			issues: undefined,
+			shapes: undefined,
 			usage: { costUsd: 0.01, inputTokens: 100, outputTokens: 10, iterations: 5 },
 		})
 		const record = await recordGroupCost(repo, group)
 		assert.deepEqual(record?.issues, [], "missing issues defaults to an empty array, never undefined/throw")
 		assert.equal(record?.cachedTokens, 0, "missing cachedTokens defaults to 0")
+		assert.equal(record?.shapes, undefined, "a group without shapes records none (pre-#16 groups stay shapeless)")
 	} finally {
 		await fs.rm(repo, { recursive: true, force: true })
 	}

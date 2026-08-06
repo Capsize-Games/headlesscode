@@ -3,15 +3,18 @@
  * central `cost-history.jsonl` (per-group combined totals) and
  * `session-cost-history.jsonl` (per-session, with outcome — the wasted-
  * spend breakdown). Recording is automatic and mandatory (see watch.ts's
- * `recordCostIfSettled`/`recordAllSessionCosts`); this is just for looking
- * at what's been recorded — filterable by issue number, printed as a
- * human-readable table or raw JSON. Building actual cost ESTIMATES from
- * this history is explicit future work, not this command.
+ * `recordCostIfSettled`/`recordAllSessionCosts`); this is for looking at
+ * what's been recorded — filterable by issue number, printed as a
+ * human-readable table or raw JSON. `--by-shape` (issue #16) prints
+ * per-shape cost/iteration aggregates, including continuation/rework rates.
+ * Estimating a NEW task's cost from this history is cost-estimate.ts's job,
+ * surfaced by `orchestrate --dry-run`.
  *
- *   headlesscode cost-history --repo <path> [--issue <n>] [--sessions] [--json]
+ *   headlesscode cost-history --repo <path> [--issue <n>] [--sessions] [--by-shape] [--json]
  */
 
 import { readCostHistory, readSessionCostHistory, type CostHistoryRecord, type SessionCostRecord } from "./cost-history.js"
+import { aggregateByShape } from "./cost-estimate.js"
 
 const COST_HISTORY_USAGE = `headlesscode cost-history — read recorded cost/token history for a repo
 
@@ -25,6 +28,12 @@ Options:
                      error/budget/killed) instead of per-group totals —
                      this is where wasted spend (non-success outcomes)
                      is visible
+  --by-shape        Show per-shape aggregates (samples, median cost, median
+                     cost per issue, median iterations, continuation/rework
+                     rates) instead of per-group rows — surfaces how much a
+                     given issue SHAPE tends to cost and how often it needs
+                     rework cycles (issue #16). Shapes are only recorded for
+                     groups dispatched after issue #16
   --json            Print the raw records as JSON instead of a table
   --help            Show this help and exit
 `
@@ -33,6 +42,7 @@ interface CostHistoryCliOptions {
 	repo: string
 	issues: number[]
 	sessions: boolean
+	byShape: boolean
 	json: boolean
 }
 
@@ -40,6 +50,7 @@ export function parseCostHistoryArgs(argv: string[]): CostHistoryCliOptions | { 
 	let repo: string | undefined
 	const issues: number[] = []
 	let sessions = false
+	let byShape = false
 	let json = false
 
 	for (let i = 0; i < argv.length; i++) {
@@ -57,6 +68,8 @@ export function parseCostHistoryArgs(argv: string[]): CostHistoryCliOptions | { 
 			issues.push(n)
 		} else if (arg === "--sessions") {
 			sessions = true
+		} else if (arg === "--by-shape") {
+			byShape = true
 		} else if (arg === "--json") {
 			json = true
 		} else {
@@ -67,7 +80,7 @@ export function parseCostHistoryArgs(argv: string[]): CostHistoryCliOptions | { 
 	if (!repo) {
 		return { error: "--repo is required" }
 	}
-	return { repo, issues, sessions, json }
+	return { repo, issues, sessions, byShape, json }
 }
 
 /** Human-readable duration, e.g. "37m", "1h 12m", "2d 3h". Undefined input renders as "?". */
@@ -153,6 +166,35 @@ function formatSessionTable(records: SessionCostRecord[]): string {
 	return lines.join("\n")
 }
 
+function formatShapeTable(stats: ReturnType<typeof aggregateByShape>, recordCount: number): string {
+	if (recordCount === 0) {
+		return "No cost history recorded for this repo yet."
+	}
+	if (stats.length === 0) {
+		return (
+			`${recordCount} record(s) on file, but none carry shapes — shapes are recorded for groups dispatched from now on (issue #16); ` +
+			`use --json to see the raw records.`
+		)
+	}
+	const lines: string[] = []
+	lines.push(
+		`${"SHAPE".padEnd(10)}${"N".padEnd(4)}${"COST MED".padEnd(12)}${"COST/ISSUE MED".padEnd(16)}${"ITER MED".padEnd(10)}CONT/REWORK`,
+	)
+	for (const s of stats) {
+		lines.push(
+			`${s.shape.padEnd(10)}${String(s.samples).padEnd(4)}` +
+				`${`$${s.costMedianUsd.toFixed(4)}`.padEnd(12)}` +
+				`${`$${s.costPerIssueMedianUsd.toFixed(4)}`.padEnd(16)}` +
+				`${String(s.iterationsMedian).padEnd(10)}${s.continuationRate.toFixed(1)} / ${s.reworkRate.toFixed(1)}`,
+		)
+	}
+	lines.push("")
+	lines.push(
+		`Median group cost by shape (per-issue normalized where a group spans multiple issues); continuation/rework = mean cycles per group.`,
+	)
+	return lines.join("\n")
+}
+
 export async function costHistoryCliMain(argv: string[]): Promise<number> {
 	const parsed = parseCostHistoryArgs(argv)
 	if ("help" in parsed) {
@@ -170,6 +212,16 @@ export async function costHistoryCliMain(argv: string[]): Promise<number> {
 		const wanted = new Set(parsed.issues)
 		records = records.filter((r) => r.issues.some((n) => wanted.has(n)))
 		sessionRecords = sessionRecords.filter((r) => r.issues.some((n) => wanted.has(n)))
+	}
+
+	if (parsed.byShape) {
+		const stats = aggregateByShape(records)
+		if (parsed.json) {
+			process.stdout.write(JSON.stringify(stats, null, 2) + "\n")
+		} else {
+			process.stdout.write(formatShapeTable(stats, records.length) + "\n")
+		}
+		return 0
 	}
 
 	if (parsed.sessions) {

@@ -83,12 +83,17 @@ async function testParseArgsRequiresRepo(): Promise<void> {
 
 async function testParseArgsCollectsMultipleIssues(): Promise<void> {
 	const result = parseCostHistoryArgs(["--repo", "/tmp/x", "--issue", "27", "--issue", "29", "--json"])
-	assert.deepEqual(result, { repo: "/tmp/x", issues: [27, 29], sessions: false, json: true })
+	assert.deepEqual(result, { repo: "/tmp/x", issues: [27, 29], sessions: false, byShape: false, json: true })
 }
 
 async function testParseArgsSessionsFlag(): Promise<void> {
 	const result = parseCostHistoryArgs(["--repo", "/tmp/x", "--sessions"])
-	assert.deepEqual(result, { repo: "/tmp/x", issues: [], sessions: true, json: false })
+	assert.deepEqual(result, { repo: "/tmp/x", issues: [], sessions: true, byShape: false, json: false })
+}
+
+async function testParseArgsByShapeFlag(): Promise<void> {
+	const result = parseCostHistoryArgs(["--repo", "/tmp/x", "--by-shape"])
+	assert.deepEqual(result, { repo: "/tmp/x", issues: [], sessions: false, byShape: true, json: false })
 }
 
 async function testParseArgsRejectsNonIntegerIssue(): Promise<void> {
@@ -243,12 +248,68 @@ async function testMainShowsWallClockDuration(): Promise<void> {
 	}
 }
 
+async function testMainByShapeShowsPerShapeAggregates(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		await appendCostHistoryRecord(
+			repo,
+			baseRecord({ groupName: "g1", issues: [27], shapes: ["split"], costUsd: 0.2, iterations: 40 }),
+		)
+		await appendCostHistoryRecord(
+			repo,
+			baseRecord({ groupName: "g2", issues: [28], shapes: ["split"], costUsd: 0.4, iterations: 60 }),
+		)
+		await appendCostHistoryRecord(
+			repo,
+			baseRecord({ groupName: "g3", issues: [30], shapes: ["docs"], costUsd: 0.1, iterations: 20 }),
+		)
+		const out = captureStdout()
+		let code: number
+		try {
+			code = await costHistoryCliMain(["--repo", repo, "--by-shape"])
+		} finally {
+			out.restore()
+		}
+		assert.equal(code, 0)
+		assert.match(out.get(), /split\s+2\s+\$0\.3000\s+\$0\.3000\s+50\s+0\.0 \/ 0\.0/)
+		assert.match(out.get(), /docs\s+1\s+\$0\.1000/)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testMainByShapeJsonOutput(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		await appendCostHistoryRecord(
+			repo,
+			baseRecord({ groupName: "g1", issues: [27], shapes: ["split"], costUsd: 0.2, iterations: 40 }),
+		)
+		const out = captureStdout()
+		let code: number
+		try {
+			code = await costHistoryCliMain(["--repo", repo, "--by-shape", "--json"])
+		} finally {
+			out.restore()
+		}
+		assert.equal(code, 0)
+		const parsed = JSON.parse(out.get()) as Array<{ shape: string; samples: number; costMedianUsd: number }>
+		assert.equal(parsed.length, 1)
+		assert.equal(parsed[0]?.shape, "split")
+		assert.equal(parsed[0]?.samples, 1)
+		assert.equal(parsed[0]?.costMedianUsd, 0.2)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: [string, () => Promise<void>][] = [
 	["parseCostHistoryArgs requires --repo", testParseArgsRequiresRepo],
 	["parseCostHistoryArgs collects multiple --issue flags", testParseArgsCollectsMultipleIssues],
 	["parseCostHistoryArgs --sessions flag", testParseArgsSessionsFlag],
+	["parseCostHistoryArgs --by-shape flag", testParseArgsByShapeFlag],
 	["parseCostHistoryArgs rejects non-integer --issue", testParseArgsRejectsNonIntegerIssue],
 	["main prints a table with a total", testMainPrintsTableWithTotal],
 	["main shows wall-clock duration formatted human-readably", testMainShowsWallClockDuration],
@@ -257,6 +318,8 @@ const tests: [string, () => Promise<void>][] = [
 	["main prints a clear message on empty history", testMainEmptyHistoryMessage],
 	["main shows a wasted-spend summary line when non-success sessions exist", testMainShowsWastedSpendSummary],
 	["main --sessions shows the per-session breakdown", testMainSessionsFlagShowsPerSessionBreakdown],
+	["main --by-shape prints per-shape aggregates (cost medians + cont/rework rates)", testMainByShapeShowsPerShapeAggregates],
+	["main --by-shape --json prints raw shape aggregates", testMainByShapeJsonOutput],
 ]
 
 async function main(): Promise<void> {

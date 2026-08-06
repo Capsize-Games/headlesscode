@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict"
 
-import { splitIssues, GENERIC_GROUP_CAP, SAME_SHAPE_GROUP_CAP, MAX_GROUPS } from "../split.js"
+import { splitIssues, shapeOf, issueShape, GENERIC_GROUP_CAP, SAME_SHAPE_GROUP_CAP, MAX_GROUPS } from "../split.js"
 import type { SplitIssue } from "../split.js"
 
 function issue(number: number, title: string, body?: string): SplitIssue {
@@ -160,6 +160,32 @@ async function testDeterministicRegardlessOfInputOrder(): Promise<void> {
 	assert.deepEqual(specsA, specsB, "split output must be order-independent")
 }
 
+// ─── shapeOf / issueShape (the cost-estimation taxonomy, issue #16) ─────────
+
+async function testShapeOfMatchesMechanicalShapesFromTitle(): Promise<void> {
+	assert.equal(shapeOf(issue(1, "Split routes.py into focused modules")), "split")
+	assert.equal(shapeOf(issue(2, "Decompose the big file")), "split", "decompose is the same split shape")
+	assert.equal(shapeOf(issue(3, "Add coverage for token utils")), "coverage")
+	assert.equal(shapeOf(issue(4, "Write tests for the merge check")), "test")
+	assert.equal(shapeOf(issue(5, "Add docs for the new API")), "docs")
+	assert.equal(shapeOf(issue(6, "Refactor the model layer")), "refactor")
+	assert.equal(shapeOf(issue(7, "Fix the flaky button")), "generic", "no mechanical pattern -> generic")
+	// shapeOf is title-only: a hot keyword in the BODY must not change the
+	// mechanical shape (issueShape handles hotness separately).
+	assert.equal(shapeOf(issue(8, "Rewrite the frontend page", "Touches the encryption layer")), "generic")
+}
+
+async function testIssueShapeHotWinsOverMechanicalShape(): Promise<void> {
+	// A hot-path issue stays "hot" even when its title matches a mechanical
+	// shape — split.ts isolates it alone and its cost profile is its own.
+	assert.equal(issueShape(issue(1, "Refactor auth request handling")), "hot")
+	assert.equal(issueShape(issue(2, "Split the database migration file")), "hot")
+	assert.equal(issueShape(issue(3, "Split routes.py into modules")), "split")
+	assert.equal(issueShape(issue(4, "Fix a typo in the README")), "generic")
+	// Hotness is detected from the body too, like the isolation heuristic.
+	assert.equal(issueShape(issue(5, "Rewrite the settings panel", "Touches the encryption layer directly")), "hot")
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -173,6 +199,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["never more than 4 groups, all issues preserved", testNeverMoreThanMaxGroups],
 	["airunner task-file naming convention", testNamesAndTaskFilesAirunnerConvention],
 	["deterministic regardless of input order", testDeterministicRegardlessOfInputOrder],
+	["shapeOf matches mechanical shapes from the title", testShapeOfMatchesMechanicalShapesFromTitle],
+	["issueShape marks hot-path issues hot (title or body, beats mechanical shape)", testIssueShapeHotWinsOverMechanicalShape],
 ]
 
 async function main(): Promise<void> {

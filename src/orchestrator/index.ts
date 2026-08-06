@@ -41,6 +41,18 @@ export type { CostHistoryRecord, SessionCostRecord } from "./cost-history.js"
 
 export { costHistoryCliMain, parseCostHistoryArgs } from "./cost-history-cli.js"
 
+export {
+	aggregateByShape,
+	buildEstimateSection,
+	estimateGroup,
+	estimateGroups,
+	estimateIssue,
+	MIN_SHAPE_SAMPLES,
+} from "./cost-estimate.js"
+export type { GroupEstimate, IssueEstimate, ShapeStats } from "./cost-estimate.js"
+
+export { issueShape, shapeOf } from "./split.js"
+
 export { watchGroups, inspectGroup, tailLog, groupWorktreePath, isPidAlive, DEFAULT_POLL_INTERVAL_MS, DEFAULT_STALL_TIMEOUT_MS } from "./watch.js"
 export type { WatchOptions, WatchSummary } from "./watch.js"
 
