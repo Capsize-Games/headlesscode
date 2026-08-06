@@ -21,23 +21,26 @@
  *   4. Worktree has no uncommitted changes: `git status --porcelain` shows
  *      only the harness's OWN untracked artifacts (run-worker.sh / run-qa.sh /
  *      the spawner / the executor write .harness.*, .qa.*, harness.log,
- *      qa.log, .headlesscode/, ORCHESTRATOR_TASK.md, .env, zoo-code). A human's
- *      untracked file or ANY tracked modification blocks cleanup — `git
- *      worktree remove` without --force is the final arbiter, and we never
- *      force.
+ *      qa.log, .headlesscode/, ORCHESTRATOR_TASK.md, .env, zoo-code) plus a
+ *      small allowlist of known-safe regenerable residue workers routinely
+ *      leave behind (a node_modules symlink/dir, __pycache__ dirs,
+ *      *.pyc/*.pyo — issue #38). A human's untracked file or ANY tracked
+ *      modification blocks cleanup — `git worktree remove` without --force is
+ *      the final arbiter, and we never force.
  *   5. No live worker process: <worktree>/.harness.pid and .qa.pid absent or
  *      the PID is not running (reuses watch.ts's isPidAlive liveness check —
  *      a stale pid FILE is not a running worker).
  *
  * Apply, per eligible group in state order (never reordered, so partial runs
  * are resumable and idempotent):
- *   1. Remove the harness's own untracked artifacts from the worktree. This
- *      step exists because `git worktree remove` (no --force) refuses on ANY
- *      untracked file — after a real round the harness leaves exactly those
- *      files, so without this the no-force removal the safety model requires
- *      would be impossible. Only the allowlisted paths are ever removed; if a
- *      human file raced in between the gate and this step, the no-force
- *      `git worktree remove` below refuses and the human file survives.
+ *   1. Remove the harness's own untracked artifacts and the known-safe
+ *      regenerable residue from the worktree. This step exists because `git
+ *      worktree remove` (no --force) refuses on ANY untracked file — after a
+ *      real round the harness leaves exactly those files, so without this the
+ *      no-force removal the safety model requires would be impossible. Only
+ *      the allowlisted paths are ever removed; if a human file raced in
+ *      between the gate and this step, the no-force `git worktree remove`
+ *      below refuses and the human file survives.
  *   2. `git worktree remove <path>` (NO --force). A failure here means gate #4
  *      raced with something: that group's cleanup is aborted and reported,
  *      never forced.
@@ -76,6 +79,7 @@ import {
 // removes before `git worktree remove` (which refuses on ANY untracked file).
 const HARNESS_ARTIFACTS = [
 	".harness.pid",
+	".harness.pgid", // process-group id written by run-worker.sh's setsid wrapper (issue #38)
 	".harness.exit",
 	".harness.done",
 	".harness.needs-decision",
@@ -107,6 +111,27 @@ export function removeHarnessArtifacts(wtPath: string): void {
 	}
 }
 
+// ─── Known-safe regenerable worktree artifacts ───────────────────────────────
+// Untracked residue workers/reviewer/QA sessions routinely leave behind that is
+// ALWAYS safe to delete — regenerable by the package manager or interpreter —
+// and that target repos' own .gitignore conventions already treat as disposable
+// (issue #38). A worker-created `node_modules` SYMLINK in particular does not
+// match the dir-only `node_modules/` gitignore pattern, so it shows as
+// untracked and previously blocked cleanup every round. Anything NOT matching
+// here or in HARNESS_ARTIFACTS still blocks cleanup: genuine uncommitted work
+// is never silently discarded.
+const KNOWN_SAFE_ARTIFACT_PATTERNS = [
+	// node tooling dependencies — symlink or real dir, at any depth
+	(p: string): boolean => path.posix.basename(p) === "node_modules",
+	// Python bytecode caches — __pycache__ dirs (any depth) and stray .pyc/.pyo
+	(p: string): boolean => path.posix.basename(p) === "__pycache__",
+	(p: string): boolean => /\.(?:pyc|pyo)$/.test(path.posix.basename(p)),
+] as const
+
+function isKnownSafeArtifact(relPath: string): boolean {
+	return KNOWN_SAFE_ARTIFACT_PATTERNS.some((match) => match(relPath))
+}
+
 // ─── Public result types ──────────────────────────────────────────────────────
 
 /** Per-group cleanup eligibility (also the `cleanup` column in status). */
@@ -134,6 +159,8 @@ export interface CleanupDeps {
 	/** Blocking (non-harness) `git status --porcelain` entries; throws on git failure. */
 	worktreeStatus?: (wtPath: string) => string[]
 	removeHarnessArtifacts?: (wtPath: string) => void
+	/** Remove a worktree's untracked known-safe residue (node_modules, __pycache__, *.pyc/*.pyo). */
+	removeKnownSafeArtifacts?: (wtPath: string) => void
 	/** `git worktree remove <wtPath>` (no --force); throws on failure. */
 	removeWorktree?: (repo: string, wtPath: string) => void
 	/** `git branch -d <branch>`; throws on failure. */
@@ -180,23 +207,15 @@ export function resolveGroupBranch(repo: string, group: OrchestratorGroup): stri
 	}
 }
 
-/**
- * `git status --porcelain` entries that are NOT the harness's own untracked
- * artifacts (i.e. real uncommitted changes — tracked modifications or a
- * human's untracked files). Empty = the worktree is safe to remove.
- */
-export function worktreeUncommitted(wtPath: string): string[] {
-	let out: string
-	try {
-		out = execFileSync("git", ["-C", wtPath, "status", "--porcelain"], {
-			encoding: "utf-8",
-			stdio: ["ignore", "pipe", "ignore"],
-			timeout: 10_000,
-		})
-	} catch (err) {
-		throw new Error(`cannot read worktree git status: ${err instanceof Error ? err.message : String(err)}`)
-	}
-	const blocking: string[] = []
+interface PorcelainEntry {
+	code: string
+	path: string
+	raw: string
+}
+
+/** Parse `git status --porcelain` output into {code, path, raw} entries. */
+function parsePorcelain(out: string): PorcelainEntry[] {
+	const entries: PorcelainEntry[] = []
 	for (const line of out.split("\n")) {
 		if (line === "") {
 			continue
@@ -206,13 +225,63 @@ export function worktreeUncommitted(wtPath: string): string[] {
 		if (file.includes(" -> ")) {
 			file = file.split(" -> ").pop()!.trim()
 		}
-		file = file.replace(/\/+$/, "") // porcelain shows untracked dirs with a trailing /
-		if (code === "??" && isHarnessArtifact(file)) {
+		entries.push({ code, path: file.replace(/\/+$/, ""), raw: line.trim() })
+	}
+	return entries
+}
+
+/** `git status --porcelain` for a worktree; throws on git failure. */
+function gitStatusPorcelain(wtPath: string): string {
+	try {
+		return execFileSync("git", ["-C", wtPath, "status", "--porcelain"], {
+			encoding: "utf-8",
+			stdio: ["ignore", "pipe", "ignore"],
+			timeout: 10_000,
+		})
+	} catch (err) {
+		throw new Error(`cannot read worktree git status: ${err instanceof Error ? err.message : String(err)}`)
+	}
+}
+
+/**
+ * `git status --porcelain` entries that are NOT the harness's own untracked
+ * artifacts or known-safe regenerable residue (i.e. real uncommitted changes —
+ * tracked modifications or a human's untracked files). Empty = the worktree is
+ * safe to remove.
+ */
+export function worktreeUncommitted(wtPath: string): string[] {
+	const blocking: string[] = []
+	for (const entry of parsePorcelain(gitStatusPorcelain(wtPath))) {
+		if (entry.code === "??" && (isHarnessArtifact(entry.path) || isKnownSafeArtifact(entry.path))) {
 			continue
 		}
-		blocking.push(line.trim())
+		blocking.push(entry.raw)
 	}
 	return blocking
+}
+
+/**
+ * Remove a worktree's UNTRACKED known-safe residue (node_modules symlink/dir,
+ * __pycache__ dirs, stray .pyc/.pyo) before `git worktree remove`, which
+ * refuses on ANY untracked file. Git-status-driven: only paths git reports as
+ * untracked are ever removed, so a repo that TRACKS one of these names is
+ * never touched; removing a node_modules symlink unlinks the symlink itself,
+ * never its target. Anything not matching the allowlist is left alone (and
+ * would have blocked cleanup at the dirty gate anyway).
+ */
+export function removeKnownSafeArtifacts(wtPath: string): void {
+	let out: string
+	try {
+		out = gitStatusPorcelain(wtPath)
+	} catch {
+		return // the dirty gate already surfaced a status error — removal must not mask it
+	}
+	for (const entry of parsePorcelain(out)) {
+		if (entry.code !== "??" || !isKnownSafeArtifact(entry.path)) {
+			continue
+		}
+		fs.rmSync(path.join(wtPath, entry.path), { recursive: true, force: true })
+	}
 }
 
 // ─── Merge-check dispatch ─────────────────────────────────────────────────────
@@ -461,9 +530,10 @@ function worktreePathInRepo(repo: string, wtPath: string): boolean {
 
 /**
  * Execute cleanup for every eligible group (in state order): remove harness
- * artifacts → `git worktree remove` (no --force) → `git branch -d` →
- * patch the state entry. A worktree-removal failure aborts ONLY that group
- * (no branch delete, no state patch) and continues with the next.
+ * artifacts and known-safe residue → `git worktree remove` (no --force) →
+ * `git branch -d` → patch the state entry. A worktree-removal failure aborts
+ * ONLY that group (no branch delete, no state patch) and continues with the
+ * next.
  */
 export async function applyCleanup(
 	repo: string,
@@ -472,6 +542,7 @@ export async function applyCleanup(
 ): Promise<CleanupRunResult> {
 	const deps = {
 		removeHarnessArtifacts,
+		removeKnownSafeArtifacts,
 		removeWorktree: (r: string, wtPath: string): void => {
 			execFileSync("git", ["-C", r, "worktree", "remove", wtPath], { stdio: "ignore", timeout: 30_000 })
 		},
@@ -481,7 +552,9 @@ export async function applyCleanup(
 		writeState: saveStateSync,
 		now: () => new Date().toISOString(),
 		...opts.deps,
-	} as Required<Pick<CleanupDeps, "removeHarnessArtifacts" | "removeWorktree" | "deleteBranch" | "writeState" | "now">>
+	} as Required<
+		Pick<CleanupDeps, "removeHarnessArtifacts" | "removeKnownSafeArtifacts" | "removeWorktree" | "deleteBranch" | "writeState" | "now">
+	>
 	const state = loadStateSync(statePath)
 	const plan = await planCleanup(repo, state, { ...opts, statePath })
 
@@ -503,15 +576,17 @@ export async function applyCleanup(
 			continue
 		}
 
-		// Step 1: drop the harness's own untracked artifacts so the no-force
-		// `git worktree remove` below can succeed (it refuses on ANY untracked
-		// file; the dirty gate already proved everything untracked is ours).
+		// Step 1: drop the harness's own untracked artifacts and the known-safe
+		// regenerable residue so the no-force `git worktree remove` below can
+		// succeed (it refuses on ANY untracked file; the dirty gate already
+		// proved everything untracked is allowlisted).
 		try {
 			deps.removeHarnessArtifacts(wtPath)
+			deps.removeKnownSafeArtifacts(wtPath)
 		} catch (err) {
 			failed.push({
 				name: entry.name,
-				error: `removing harness artifacts failed: ${err instanceof Error ? err.message : String(err)}`,
+				error: `removing worktree artifacts failed: ${err instanceof Error ? err.message : String(err)}`,
 			})
 			continue
 		}
@@ -607,7 +682,8 @@ Safety model (all gates recomputed fresh, never cached):
     GitHub PR .merged when pr.number is recorded; disagreement fails closed
   - worktree clean: git status --porcelain shows only the harness's own
     untracked artifacts (.harness.*, .qa.*, harness.log, qa.log,
-    .headlesscode/, ORCHESTRATOR_TASK.md, .env, zoo-code)
+    .headlesscode/, ORCHESTRATOR_TASK.md, .env, zoo-code) plus known-safe
+    regenerable residue (node_modules symlink/dir, __pycache__, *.pyc/*.pyo)
   - no live worker: .harness.pid and .qa.pid absent or the PID is not running
   - terminal status: done | failed | needs-human | orphaned
 
