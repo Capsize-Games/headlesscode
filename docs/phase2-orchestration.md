@@ -214,6 +214,16 @@ npx tsx src/cli.ts orchestrate --repo <path> --issue 27 --issue 29 --issue 38 \
   considering it for the default path. The plan session's usage is recorded
   into the group's normal per-session usage files, so a round's
   cost-history/cost estimate naturally includes the planning phase.
+- **Pre-flight issue-size check** (issue #53): before ANY task file is written
+ or worker spawned, each issue body is scanned with a free deterministic
+ heuristic (`topLevelSectionCount` in `split.ts`) that counts top-level
+ numbered/bulleted sections. An issue reading like 3+ independent pieces of
+ work gets a loud `WARNING` on stderr naming the issue + section count and
+ suggesting splitting it into N sub-issues first — the exact shape that burned
+ iteration caps and budget on real rounds (headlesscode #17, airunnerweb
+ #80/#85). Warning-only by design: a crude heuristic can false-positive, so it
+ never aborts the round; `--no-issue-size-check` silences it for operators who
+ know what they're doing.
 
 ### `orchestrate status` — read-side status / wait for external callers
 

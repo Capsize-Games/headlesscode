@@ -776,6 +776,102 @@ async function testParseOrchestrateArgsNoPreflight(): Promise<void> {
 	assert.equal(skipped.options.preflight, false, "--no-preflight turns the probe off for CI/non-interactive")
 }
 
+// ─── --no-issue-size-check (issue #53) ──────────────────────────────────────
+
+async function testParseOrchestrateArgsNoIssueSizeCheck(): Promise<void> {
+	// The pre-flight size warning is ON by default (it's free — a pure
+	// deterministic scan, unlike the preflight probe's network round-trip).
+	const def = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1"])
+	assert.equal(def.error, undefined)
+	assert.equal(def.options.issueSizeCheck, true, "issue-size check is on by default")
+
+	const skipped = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1", "--no-issue-size-check"])
+	assert.equal(skipped.error, undefined)
+	assert.equal(skipped.options.issueSizeCheck, false, "--no-issue-size-check silences the warning")
+}
+
+async function testOrchestrateMainDryRunWarnsOnOversizedIssue(): Promise<void> {
+	// Issue #53: an issue whose body enumerates 3+ independent pieces must
+	// produce a loud pre-dispatch warning — but the warning never aborts the
+	// round (a crude heuristic can false-positive; the operator decides).
+	const repo = await tmpRepo()
+	try {
+		initGitRepo(repo)
+		const issuesPath = path.join(repo, "issues.json")
+		await fs.writeFile(
+			issuesPath,
+			JSON.stringify([
+				{
+					number: 17,
+					title: "Codemap Phase 1",
+					body: "Three pieces:\n1. Build the index\n2. Wire the search\n3. Ship the dashboard",
+				},
+			]),
+			"utf-8",
+		)
+		const { exit, stdout, stderr } = await withCapturedIo(() =>
+			orchestrateMain(["--repo", repo, "--issues-json", issuesPath, "--dry-run"]),
+		)
+		assert.equal(exit, 0, "the warning must never abort the round")
+		assert.ok(stdout.includes("Split plan"), "dry-run still prints the full plan")
+		assert.ok(stderr.includes("issue #17"), `names the oversized issue, got: ${stderr}`)
+		assert.ok(stderr.includes("3 independent pieces of work"), `states the detected section count, got: ${stderr}`)
+		assert.ok(stderr.includes("splitting it into 3 sub-issues"), `suggests splitting before dispatch, got: ${stderr}`)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testOrchestrateMainDryRunNoIssueSizeWarningWithFlag(): Promise<void> {
+	// --no-issue-size-check silences the warning for operators who know what
+	// they're doing; everything else about the dry-run is unchanged.
+	const repo = await tmpRepo()
+	try {
+		initGitRepo(repo)
+		const issuesPath = path.join(repo, "issues.json")
+		await fs.writeFile(
+			issuesPath,
+			JSON.stringify([
+				{
+					number: 17,
+					title: "Codemap Phase 1",
+					body: "Three pieces:\n1. Build the index\n2. Wire the search\n3. Ship the dashboard",
+				},
+			]),
+			"utf-8",
+		)
+		const { exit, stdout, stderr } = await withCapturedIo(() =>
+			orchestrateMain(["--repo", repo, "--issues-json", issuesPath, "--dry-run", "--no-issue-size-check"]),
+		)
+		assert.equal(exit, 0)
+		assert.ok(stdout.includes("Split plan"), "dry-run plan still printed")
+		assert.ok(!stderr.includes("independent pieces of work"), "--no-issue-size-check suppresses the warning")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testOrchestrateMainDryRunNoWarningForSmallIssue(): Promise<void> {
+	// No false positive on a genuinely small issue: no warning, no abort.
+	const repo = await tmpRepo()
+	try {
+		initGitRepo(repo)
+		const issuesPath = path.join(repo, "issues.json")
+		await fs.writeFile(
+			issuesPath,
+			JSON.stringify([{ number: 1, title: "Fix the thing", body: "Just one focused change." }]),
+			"utf-8",
+		)
+		const { exit, stderr } = await withCapturedStderr(() =>
+			orchestrateMain(["--repo", repo, "--issues-json", issuesPath, "--dry-run"]),
+		)
+		assert.equal(exit, 0)
+		assert.ok(!stderr.includes("independent pieces of work"), "small issue produces no size warning")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 async function testSpawnEnvCarriesMaxIterations(): Promise<void> {
 	const repo = await tmpRepo()
 	try {
@@ -1444,6 +1540,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["orchestrateMain skips an occupied w1 slot and names the group w2", testOrchestrateMainSkipsOccupiedWorktreeSlot],
 	["orchestrateMain skips multiple occupied slots (w1+w2 -> w3)", testOrchestrateMainSkipsMultipleOccupiedSlots],
 	["--no-preflight parses (default on, flag off)", testParseOrchestrateArgsNoPreflight],
+	["--no-issue-size-check parses (default on, flag off)", testParseOrchestrateArgsNoIssueSizeCheck],
+	["orchestrateMain dry-run warns loudly on a 3+-section issue but never aborts (issue #53)", testOrchestrateMainDryRunWarnsOnOversizedIssue],
+	["orchestrateMain dry-run: --no-issue-size-check silences the warning (issue #53)", testOrchestrateMainDryRunNoIssueSizeWarningWithFlag],
+	["orchestrateMain dry-run: small issues produce no size warning (issue #53)", testOrchestrateMainDryRunNoWarningForSmallIssue],
 	["orchestrateMain dry-run proceeds when all worktree dirs are clear", testOrchestrateMainDryRunProceedsWhenNoCollision],
 	["orchestrateMain dry-run shows the no-history estimate note on a fresh repo", testOrchestrateMainDryRunShowsEmptyCostEstimateNote],
 	["orchestrateMain dry-run shows a cost estimate derived from recorded history", testOrchestrateMainDryRunShowsCostEstimateFromHistory],

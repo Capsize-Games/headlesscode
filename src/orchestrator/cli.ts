@@ -25,7 +25,7 @@ import * as path from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { activeSessionCountForRepo, maxConcurrentSessionsFromEnv } from "../budget/concurrency.js"
-import { issueShape, splitIssues, type SplitIssue, type WorktreeSpec } from "./split.js"
+import { issueShape, issueSizeWarnings, splitIssues, type IssueSizeWarning, type SplitIssue, type WorktreeSpec } from "./split.js"
 import { readCostHistory } from "./cost-history.js"
 import { buildEstimateSection, estimateGroups } from "./cost-estimate.js"
 import {
@@ -137,6 +137,13 @@ Options:
                  key-invalid / account-balance-exhausted / pinned-provider-down
                  / all-clear. ON by default; skip for CI/non-interactive
                  contexts that don't want the extra round-trip
+  --no-issue-size-check Skip the pre-flight issue-size warning (issue #53): a
+                 FREE deterministic scan of each issue body that warns loudly
+                 when it reads like 3+ independent pieces of work (top-level
+                 numbered/bulleted sections), before anything is spawned — the
+                 shape that burned iteration caps + budget on real rounds
+                 (headlesscode #17, airunnerweb #80/#85). ON by default; the
+                 warning never aborts the round, so this only silences it
   --dry-run              Print the split plan, a cost estimate (from recorded
                          cost-history, keyed by issue shape — issue #16), and
                          the spawn commands; spawn nothing
@@ -208,6 +215,13 @@ interface OrchestrateOptions {
 	 * pin). ON by default; --no-preflight skips it for CI/non-interactive.
 	 */
 	preflight: boolean
+	/**
+	 * Issue #53 pre-flight issue-size check: a FREE deterministic scan that
+	 * warns loudly (never aborts) when an issue body reads like 3+ independent
+	 * pieces of work, before anything is spawned. ON by default;
+	 * --no-issue-size-check silences it.
+	 */
+	issueSizeCheck: boolean
 	dryRun: boolean
 	help: boolean
 }
@@ -261,6 +275,7 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 		planFirstMode: process.env.HEADLESSCODE_PLAN_FIRST_MODE ?? "architect",
 		planFirstMaxIterations: planFirstMaxIterationsFromEnv(),
 		preflight: true,
+		issueSizeCheck: true,
 		dryRun: false,
 		help: false,
 	}
@@ -443,6 +458,9 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 			}
 			case "--no-preflight":
 				options.preflight = false
+				break
+			case "--no-issue-size-check":
+				options.issueSizeCheck = false
 				break
 			case "--dry-run":
 				options.dryRun = true
@@ -1406,6 +1424,23 @@ export function buildSpawnEnv(options: BuildSpawnEnvOptions): { env: NodeJS.Proc
 	return { env, workerModel }
 }
 
+/**
+ * Issue #53 pre-flight issue-size check: one loud stderr line per issue whose
+ * body reads like 3+ independent pieces of work. Warning-only by design — a
+ * crude heuristic can false-positive, so it never aborts the round; the
+ * operator is told BEFORE anything spawns so they can split the issue first.
+ */
+function printIssueSizeWarnings(warnings: IssueSizeWarning[]): void {
+	for (const w of warnings) {
+		process.stderr.write(
+			`headlesscode orchestrate: WARNING: issue #${w.number} ("${w.title}") reads like ${w.sections} independent pieces of work ` +
+				`(${w.sections} top-level numbered/bulleted sections in its body). Dispatching it to ONE worker risks iteration-cap / budget ` +
+				`burn + rework cycles (issue #53). Consider splitting it into ${w.sections} sub-issues and re-running before spawning. ` +
+				`--no-issue-size-check silences this warning.\n`,
+		)
+	}
+}
+
 function printPlan(
 	repo: string,
 	mode: string,
@@ -2155,6 +2190,15 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 				`which can leave a stray .headlesscode/ dir that re-trips this same check next time.\n`,
 		)
 		return 1
+	}
+
+	// Issue #53 pre-flight issue-size check: warn loudly (never abort) when an
+	// issue's body reads like 3+ independent pieces of work, BEFORE task files
+	// are written or anything is spawned. Pure deterministic heuristic
+	// (split.ts topLevelSectionCount) — no LLM cost. Prints for BOTH --dry-run
+	// (so the preview shows it before any commit to spawn) and real runs.
+	if (options.issueSizeCheck) {
+		printIssueSizeWarnings(issueSizeWarnings(issues))
 	}
 
 	if (options.dryRun) {
