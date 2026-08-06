@@ -804,6 +804,7 @@ export function handleReviewVerdict(
 				review_verdict: undefined,
 				pending_review_findings: undefined,
 				reviewed_at: undefined,
+				review_report: undefined,
 				qa: undefined,
 				stalled: undefined,
 				exit_code: undefined,
@@ -963,6 +964,7 @@ export function handleIterationExhaustion(
 				review_verdict: undefined,
 				pending_review_findings: undefined,
 				reviewed_at: undefined,
+				review_report: undefined,
 				qa: undefined,
 				stalled: undefined,
 				exit_code: undefined,
@@ -2176,6 +2178,10 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 					review_verdict: result.verdict,
 					pending_review_findings: result.findings,
 					reviewed_at: new Date().toISOString(),
+					// Issue #34: point at the review session's complete final
+					// report so the full reasoning behind the verdict is one
+					// file-read away, not a re-run away.
+					review_report: result.reportPath,
 					last_activity: {
 						note: `reviewed: verdict=${result.verdict} (${result.findings.length} finding(s))`,
 					},
@@ -2303,6 +2309,11 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 						status: qaStatus,
 						verdict: qaResult.verdict,
 						evidence: qaResult.evidence.slice(0, 4000),
+						// Issue #34: the state file keeps the lightweight parsed
+						// fields for quick scanning; point at the QA session's
+						// COMPLETE final report so the full reasoning behind the
+						// verdict is one file-read away, not a re-run away.
+						report: qaResult.reportPath,
 						updated: new Date().toISOString(),
 					},
 					last_activity: {

@@ -99,6 +99,14 @@ export interface OrchestratorGroup {
 	review_verdict?: string
 	reviewed_at?: string
 	/**
+	 * Issue #34: absolute path to the review session's COMPLETE final report
+	 * (`<worktree>/.headlesscode/reports/<sessionId>.md`), persisted alongside
+	 * the verdict so the full reasoning behind it is one file-read away, not a
+	 * re-run away. `review_verdict`/`pending_review_findings` stay as the
+	 * lightweight parsed fields for quick scanning.
+	 */
+	review_report?: string
+	/**
 	 * Rework loop counter — how many rework cycles this group has already gone
 	 * through after a review "finding" verdict. Absent (== 0) when the group
 	 * has never been reworked. Incremented by the orchestrator each time it
@@ -126,6 +134,14 @@ export interface OrchestratorGroup {
 		verdict: string
 		evidence: string
 		updated: string
+		/**
+		 * Issue #34: absolute path to the QA session's COMPLETE final report
+		 * (`<worktree>/.headlesscode/reports/<sessionId>.md`), persisted
+		 * alongside the verdict so the full reasoning behind it is one
+		 * file-read away, not a re-run away. `evidence` stays as the
+		 * lightweight pre-extracted slice for quick scanning.
+		 */
+		report?: string
 	}
 	/** PR metadata seen in the live airunner state file. */
 	pr?: { number?: number; url?: string; state?: string }

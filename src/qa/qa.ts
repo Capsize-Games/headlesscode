@@ -157,6 +157,15 @@ export interface QaResult {
 	evidence: string
 	/** The full final summary from the QA session. */
 	summary: string
+	/**
+	 * Issue #34: absolute path to the QA session's complete final report
+	 * (`<workspaceRoot>/.headlesscode/reports/<sessionId>.md`), when the
+	 * session succeeded and the report write succeeded. The orchestrator
+	 * persists this so the full reasoning behind a QA verdict is one
+	 * file-read away, not a re-run away. Absent for a session error (no
+	 * report was ever produced).
+	 */
+	reportPath?: string
 }
 
 function currentBranch(workspaceRoot: string): string {
@@ -262,7 +271,7 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
 			summary: `QA session failed: ${error}`,
 		}
 	}
-	return parseQaResult(result.result)
+	return { ...parseQaResult(result.result), reportPath: result.reportPath }
 }
 
 /**

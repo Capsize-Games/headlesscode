@@ -232,6 +232,15 @@ export interface SessionResult {
 	reason?: string
 	iterations: number
 	toolCalls: number
+	/**
+	 * Issue #34: absolute path to the session's complete final report
+	 * (`<workspaceRoot>/.headlesscode/reports/<sessionId>.md`), present when
+	 * the session ended successfully (attempt_completion or the text-only
+	 * fallback) and the report write succeeded. Callers (runQa/runReview →
+	 * orchestrator state) persist this so the full reasoning behind a
+	 * review/QA verdict is one file-read away, not a re-run away.
+	 */
+	reportPath?: string
 	/** Phase 6: present when the session had a budget (see SessionBudgetUsage). */
 	budgetUsage?: SessionBudgetUsage
 }

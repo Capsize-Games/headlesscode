@@ -7,7 +7,9 @@
  * Runs a real HeadlessSession with a scripted fake LlmClient (the loop.test.ts
  * pattern) and asserts the events .jsonl file contains the expected event
  * sequence in order, and that long content is actually truncated, not dumped
- * in full.
+ * in full — with ONE deliberate exception (issue #34): the final
+ * `attempt_completion` report is the one field that is NOT truncated, since
+ * it IS the report (see src/engine/events.ts).
  */
 
 import assert from "node:assert/strict"
@@ -155,7 +157,11 @@ async function testExplicitSessionIdOverrideIsHonored(): Promise<void> {
  * A real session (tool call once, then complete) must write an events file
  * with the full lifecycle sequence in order:
  *   session_start, iteration_start, llm_response, tool_call, tool_result,
- *   session_end — plus the token usage incl. cachedTokens on llm_response.
+ *   iteration_start, llm_response, attempt_completion, session_end — plus
+ *   the token usage incl. cachedTokens on llm_response. attempt_completion
+ *   short-circuits at step 6a before the tool-execution loop, so it emits
+ *   its own full-text `attempt_completion` event rather than a
+ *   tool_call/tool_result pair (issue #34).
  */
 async function testEventSequenceWithToolThenCompletion(): Promise<void> {
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-events-seq-"))
@@ -180,7 +186,8 @@ async function testEventSequenceWithToolThenCompletion(): Promise<void> {
 
 		const types = events.map((e) => e.type)
 		// attempt_completion short-circuits at step 6a before the tool-
-		// execution loop, so iteration 2 emits no tool_call/tool_result.
+		// execution loop, so iteration 2 emits no tool_call/tool_result —
+		// instead it emits its own full-text `attempt_completion` event.
 		assert.deepEqual(types, [
 			"session_start",
 			"iteration_start",
@@ -189,6 +196,7 @@ async function testEventSequenceWithToolThenCompletion(): Promise<void> {
 			"tool_result",
 			"iteration_start",
 			"llm_response",
+			"attempt_completion",
 			"session_end",
 		])
 
@@ -218,6 +226,21 @@ async function testEventSequenceWithToolThenCompletion(): Promise<void> {
 		assert.equal(toolResultEvent.tool, "write_to_file")
 		assert.equal(toolResultEvent.isError, false)
 		assert.match(String(toolResultEvent.result), /File written: hello\.txt/)
+
+		// The `attempt_completion` event (issue #34) carries the FULL report
+		// text — the completion call was previously invisible to the feed.
+		const completionEvent = events[events.length - 2]
+		assert.equal(completionEvent.type, "attempt_completion")
+		assert.equal(completionEvent.iteration, 2)
+		assert.equal(completionEvent.result, "Done: wrote hello.txt")
+		assert.equal(completionEvent.resultTruncated, undefined, "the final report is never truncated")
+
+		// And the complete report is persisted per session (issue #34), with
+		// the path surfaced on the SessionResult for the orchestrator state.
+		assert.ok(result.reportPath, "SessionResult must carry the report path")
+		const reportFile = await fs.readFile(result.reportPath!, "utf-8")
+		assert.equal(reportFile, "Done: wrote hello.txt", "report file contains the full final report")
+		assert.ok(result.reportPath!.endsWith(`.headlesscode${path.sep}reports${path.sep}${sessionId}.md`))
 
 		// session_end carries the final status/cost/tokens.
 		const end = events[events.length - 1]
@@ -316,10 +339,66 @@ async function testLongContentIsTruncated(): Promise<void> {
 }
 
 /**
- * The event feed survives the session's teardown: unlike the live usage
- * snapshot (deleted at completion), the events .jsonl file is KEPT after the
- * session ends.
- */
+	* Issue #34 — the one deliberate exception to EVENT_TRUNCATE_CHARS: a LONG
+	* final report must land in the feed in FULL (it IS the report), and the
+	* complete text must be persisted to `.headlesscode/reports/<sessionId>.md`.
+	* Regular tool_result previews stay truncated — the full-text behavior is
+	* specific to the final report.
+	*/
+async function testAttemptCompletionEventCarriesFullReportText(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-events-report-"))
+	try {
+		// A genuinely large file so the read_file tool_result MUST be truncated
+		// (proving the full-text exception is specific to the final report).
+		const hugeContent = "z".repeat(EVENT_TRUNCATE_CHARS + 500)
+		await fs.writeFile(path.join(ws, "big.txt"), hugeContent, "utf-8")
+		const longReport =
+			"## Findings\n\n" +
+			"- Ran `npm test`: 3 files, all passed (evidence line " + "y".repeat(EVENT_TRUNCATE_CHARS + 300) + ")\n" +
+			"- Baseline after: green.\n\n" +
+			"VERDICT: CLEAN\n"
+		const client = new FakeLlmClient([
+			() => toolCall("read_file", { path: "big.txt" }),
+			() => toolCall("attempt_completion", { result: longReport }),
+		])
+		const session = await makeSession({ task: "verify and report", client, workspaceRoot: ws })
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+
+		const files = await fs.readdir(eventsDir(ws))
+		const sessionId = files[0].replace(/\.jsonl$/, "")
+		const events = await readEventsFile(eventsFilePath(ws, sessionId))
+
+		// The attempt_completion event carries the report verbatim, untruncated.
+		const completionEvent = events.find((e) => e.type === "attempt_completion")
+		assert.ok(completionEvent, "expected an attempt_completion event")
+		assert.equal(completionEvent?.result, longReport, "the final report is in the feed in FULL")
+		assert.equal(completionEvent?.resultTruncated, undefined, "no truncation flag on the final report")
+
+		// A regular tool_result preview from the same session is still capped —
+		// the full-text exception is specific to the final report.
+		const toolResultEvent = events.find((e) => e.type === "tool_result")
+		assert.ok(toolResultEvent, "expected a tool_result event")
+		assert.equal(toolResultEvent?.resultTruncated, true)
+		assert.ok(
+			String(toolResultEvent?.result).length <= EVENT_TRUNCATE_CHARS,
+			"tool_result preview must stay capped at EVENT_TRUNCATE_CHARS",
+		)
+
+		// The complete report is persisted per session and surfaced on the result.
+		assert.ok(result.reportPath, "SessionResult must carry the report path")
+		const reportFile = await fs.readFile(result.reportPath!, "utf-8")
+		assert.equal(reportFile, longReport, "report file contains the complete final report, not a 4000-char slice")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+/**
+	* The event feed survives the session's teardown: unlike the live usage
+	* snapshot (deleted at completion), the events .jsonl file is KEPT after the
+	* session ends.
+	*/
 async function testEventFeedKeptAfterSessionEnds(): Promise<void> {
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-events-kept-"))
 	try {
@@ -626,6 +705,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	],
 	["events: explicit sessionId override is honored (feed lands at the dashboard-chosen id)", testExplicitSessionIdOverrideIsHonored],
 	["events: long tool results are truncated with a marker, never dumped in full", testLongContentIsTruncated],
+	["events: final attempt_completion report lands in the feed in FULL + persisted to .headlesscode/reports (issue #34)", testAttemptCompletionEventCarriesFullReportText],
 	["events: feed file is KEPT after the session ends (unlike the live usage snapshot)", testEventFeedKeptAfterSessionEnds],
 	["events: ask_followup_question mirrors decision_blocked/decision_answered on the feed", testDecisionEventsMirrorMarkerLifecycle],
 	["events: reasoning flows to the feed truncated + echoed on next call history", testReasoningFlowsToEventFeedTruncated],

@@ -61,6 +61,7 @@ import type { MemoryStore, RecallResult } from "../memory/types.js"
 import { createCheckpointService, type CheckpointService } from "../checkpoints/service.js"
 import { recordSessionUsage, removeLiveUsage, writeLiveUsage } from "./usage.js"
 import { EventFeed, EVENT_TRUNCATE_CHARS, truncateField } from "./events.js"
+import { writeSessionReport } from "./reports.js"
 import { Logger } from "./logger.js"
 import { parseToolCalls } from "./parser.js"
 import {
@@ -1296,6 +1297,45 @@ export class HeadlessSession {
 	}
 
 	/**
+	 * Issue #34 — the final report was the single most information-dense
+	 * moment of any session and the least observable: `attempt_completion`
+	 * short-circuits at step 6a BEFORE the tool-execution loop, so no
+	 * tool_call/tool_result pair was ever recorded for it, and only a narrow
+	 * parsed slice (`qa.evidence`, review findings) survived into the
+	 * orchestrator state. Both gaps are closed here, at the one place every
+	 * success path funnels through:
+	 *
+	 *   1. emit an `attempt_completion` event carrying the FULL report text
+	 *      (deliberately not truncated — see EventFeed.attemptCompletion);
+	 *   2. persist the complete report to
+	 *      `<workspaceRoot>/.headlesscode/reports/<sessionId>.md` and return
+	 *      its path, so runQa/runReview → the orchestrator state can point at
+	 *      it and the reasoning behind a surprising verdict is one file-read
+	 *      away, never a re-run away.
+	 *
+	 * Non-fatal on both paths (matches the memory/usage/events idiom): a feed
+	 * or report-write failure is logged as a warning and the session still
+	 * completes with `reportPath` absent.
+	 */
+	private async persistFinalReport(iteration: number, result: string): Promise<string | undefined> {
+		await this.emitEvent(
+			"attempt_completion",
+			() => this.eventFeed.attemptCompletion({ iteration, result }),
+			{ iteration },
+		)
+		try {
+			const reportPath = await writeSessionReport(this.config.workspaceRoot, this.sessionId, result)
+			this.logger.info("[loop] final report persisted", { reportPath })
+			return reportPath
+		} catch (error) {
+			this.logger.warn("[loop] failed to persist final report (non-fatal; full report is one re-run away)", {
+				error: error instanceof Error ? error.message : String(error),
+			})
+			return undefined
+		}
+	}
+
+	/**
 	 * Pause/resume (dashboard control): called before each iteration's LLM
 	 * call (the same safe boundary where budgetTracker.tick() runs — never
 	 * mid-tool-call). When `<workspaceRoot>/.harness.pause-requested` is
@@ -2246,7 +2286,8 @@ export class HeadlessSession {
 				}
 
 				this.logger.info("[loop] attempt_completion received — success", { iteration })
-				return { status: "success", result, iterations: iteration, toolCalls: toolCalls + 1 }
+				const reportPath = await this.persistFinalReport(iteration, result)
+				return { status: "success", result, iterations: iteration, toolCalls: toolCalls + 1, reportPath }
 			}
 
 			// 6b. Text-only reply (no tool_calls) → pragmatic success fallback.
@@ -2254,7 +2295,8 @@ export class HeadlessSession {
 				const text = (assistant.content ?? "").trim()
 				if (text) {
 					this.logger.info("[loop] text-only reply (no tool calls) — success", { iteration })
-					return { status: "success", result: text, iterations: iteration, toolCalls }
+					const reportPath = await this.persistFinalReport(iteration, text)
+					return { status: "success", result: text, iterations: iteration, toolCalls, reportPath }
 				}
 				// Empty reply: nudge and count as a mistake.
 				consecutiveMistakes++
