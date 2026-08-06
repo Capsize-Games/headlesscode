@@ -394,6 +394,16 @@ export interface HeadlessSessionConfig {
 	 * most tests assume) is unchanged.
 	 */
 	stream?: boolean
+	/**
+	 * Graded reasoning effort for deepseek/* models (issue #30 experiment):
+	 * low/medium/high/max (native DeepSeek levels; max is normalized to
+	 * OpenRouter's "xhigh" on the wire) or "xhigh" directly. Optional — when
+	 * unset, no `reasoning.effort` is sent and the endpoint's default applies
+	 * (pre-existing behavior). Resolved by the CLI from the `_reasoning_effort`
+	 * key in mode-models.json then $HEADLESSCODE_REASONING_EFFORT; falls back
+	 * to the env var here for direct construction.
+	 */
+	reasoningEffort?: string
 	/** Sliding-window cap on messages sent per request (default 40). */
 	windowSize?: number
 	/**
@@ -565,6 +575,8 @@ export interface ResolvedSessionConfig {
 	llmTimeoutMs: number
 	/** Opt-in SSE streaming (streaming-and-reasoning; default false). */
 	stream: boolean
+	/** Graded reasoning effort for deepseek/* models (issue #30); undefined = endpoint default. */
+	reasoningEffort?: string
 	windowSize: number
 	/**
 	 * Phase 3 context condensation: the model's real context window in
@@ -829,6 +841,7 @@ export class HeadlessSession {
 			systemPromptOverride: config.systemPromptOverride,
 			llmTimeoutMs: config.llmTimeoutMs ?? DEFAULT_LLM_TIMEOUT_MS,
 			stream: config.stream ?? envStreaming(),
+			reasoningEffort: config.reasoningEffort ?? process.env.HEADLESSCODE_REASONING_EFFORT,
 			windowSize: config.windowSize ?? DEFAULT_WINDOW_SIZE,
 			// Deliberately left undefined when the caller didn't configure it:
 			// the live OpenRouter models-endpoint lookup in maybeCondenseHistory
@@ -2064,6 +2077,7 @@ export class HeadlessSession {
 						maxTokens: this.config.maxTokens,
 						signal: controller.signal,
 						stream: this.config.stream,
+						reasoningEffort: this.config.reasoningEffort,
 						onStreamChunk: (kind, chunk) => {
 							// Dashboard live-typing: forward each chunk to the event
 							// feed (truncated like other large fields). Non-fatal —
@@ -2680,6 +2694,7 @@ export class HeadlessSession {
 			globalCustomInstructions: this.config.globalCustomInstructions,
 			llmTimeoutMs: this.config.llmTimeoutMs,
 			stream: this.config.stream,
+			reasoningEffort: this.config.reasoningEffort,
 			llmClient: this.llmClient,
 			logger: this.logger,
 			memory: this.config.memory,

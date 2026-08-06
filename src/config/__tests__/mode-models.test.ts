@@ -12,7 +12,14 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 
-import { loadModeModelsFile, modeModelsFilePath, resolveModelForMode, validateModeModelsBody, DEFAULT_KEY } from "../mode-models.js"
+import {
+	loadModeModelsFile,
+	modeModelsFilePath,
+	resolveModelForMode,
+	resolveReasoningEffortForMode,
+	validateModeModelsBody,
+	DEFAULT_KEY,
+} from "../mode-models.js"
 
 let storeTmp: string
 
@@ -180,6 +187,60 @@ async function testExtraKeyWithoutExtraKeysRequestedIgnored(): Promise<void> {
 	}
 }
 
+// ─── _reasoning_effort (issue #30 graded reasoning dial) ─────────────────────
+
+async function testReasoningEffortKeyBeatsEnv(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		await writeConfig(repo, JSON.stringify({ _reasoning_effort: "high" }))
+		const resolved = resolveReasoningEffortForMode({
+			workspaceRoot: repo,
+			env: { HEADLESSCODE_REASONING_EFFORT: "medium" },
+		})
+		assert.equal(resolved, "high", "the _reasoning_effort config key must beat the env var")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testReasoningEffortEnvUsedWhenKeyAbsent(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		await writeConfig(repo, JSON.stringify({ code: "deepseek/deepseek-v4-flash" }))
+		const resolved = resolveReasoningEffortForMode({
+			workspaceRoot: repo,
+			env: { HEADLESSCODE_REASONING_EFFORT: "xhigh" },
+		})
+		assert.equal(resolved, "xhigh", "env is used when the file has no _reasoning_effort key")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testReasoningEffortNothingConfiguredReturnsUndefined(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const resolved = resolveReasoningEffortForMode({ workspaceRoot: repo, env: {} })
+		assert.equal(resolved, undefined, "no key, no env -> undefined (endpoint default applies)")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testReasoningEffortModeEntriesNotConsulted(): Promise<void> {
+	// A mode slug entry (e.g. "code") must NEVER leak into the effort — only
+	// the `_reasoning_effort` key is read. Mirrors how `_condensation` is only
+	// consulted when explicitly requested.
+	const repo = await tmpRepo()
+	try {
+		await writeConfig(repo, JSON.stringify({ code: "deepseek/deepseek-v4-flash", _default: "other" }))
+		const resolved = resolveReasoningEffortForMode({ workspaceRoot: repo, env: {} })
+		assert.equal(resolved, undefined, "mode entries are model ids, not reasoning efforts")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 // ─── Missing file = zero-config ──────────────────────────────────────────────
 
 async function testMissingFileFallsThroughToEnv(): Promise<void> {
@@ -277,6 +338,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["extraKeys: _condensation beats _default + env", testExtraKeyBeatsDefault],
 	["extraKeys: falls through to _default when absent", testExtraKeyFallsThroughToDefaultWhenAbsent],
 	["extraKeys: ignored unless explicitly requested", testExtraKeyWithoutExtraKeysRequestedIgnored],
+	["_reasoning_effort key beats env", testReasoningEffortKeyBeatsEnv],
+	["_reasoning_effort: env used when key absent", testReasoningEffortEnvUsedWhenKeyAbsent],
+	["_reasoning_effort: nothing configured -> undefined", testReasoningEffortNothingConfiguredReturnsUndefined],
+	["_reasoning_effort: mode entries are never consulted", testReasoningEffortModeEntriesNotConsulted],
 	["missing file falls through to env (zero-config)", testMissingFileFallsThroughToEnv],
 	["missing file with no env -> undefined", testMissingFileWithNoEnvReturnsUndefined],
 	["malformed JSON throws clearly", testMalformedJsonThrowsClearly],

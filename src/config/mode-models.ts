@@ -20,6 +20,11 @@
  *      own built-in default (`DEFAULT_MODEL` in src/llm/openrouter.ts),
  *      which stays the single source of truth for the ultimate default.
  *
+ * Non-model `_`-prefixed keys extend the same file: `_condensation` assigns
+ * a cheaper model for the context-condensation call (consulted via extraKeys
+ * before the mode entry), and `_reasoning_effort` sets the graded reasoning
+ * effort for deepseek/* models (see resolveReasoningEffortForMode).
+ *
  * Fail-loudly on a malformed file (invalid JSON, non-object, or a non-string
  * value) — the same idiom as the central permissions.json (see
  * src/permissions/config.ts): a broken config file throws with a clear
@@ -157,6 +162,35 @@ export function resolveModelForMode(options: ResolveModelOptions): string | unde
 
 	const envModel = env.OPENROUTER_MODEL
 	return envModel === undefined || envModel === "" ? undefined : envModel
+}
+
+/** The optional `_reasoning_effort` key inside mode-models.json (not a mode slug). */
+export const REASONING_EFFORT_KEY = "_reasoning_effort"
+
+export interface ResolveReasoningEffortOptions {
+	workspaceRoot: string
+	/** Env to read HEADLESSCODE_REASONING_EFFORT from (default: process.env). */
+	env?: NodeJS.ProcessEnv
+}
+
+/**
+ * Resolve the session's graded reasoning effort (issue #30 experiment) from
+ * the central `mode-models.json` `_reasoning_effort` key (beats env), then
+ * `$HEADLESSCODE_REASONING_EFFORT`, then `undefined` — no effort sent, the
+ * endpoint's undeclared default applies (pre-existing behavior). The value is
+ * a plain string in the same `Record<string, string>` format as model ids, so
+ * no format change is needed. The caller validates/normalizes the value
+ * (parseReasoningEffort in src/llm/openrouter.ts); a missing file/key/env is
+ * NOT an error — zero config means zero behavior change.
+ */
+export function resolveReasoningEffortForMode(options: ResolveReasoningEffortOptions): string | undefined {
+	const { workspaceRoot, env = process.env } = options
+	const file = loadModeModelsFile(workspaceRoot)
+	if (file !== null && typeof file[REASONING_EFFORT_KEY] === "string") {
+		return file[REASONING_EFFORT_KEY]
+	}
+	const envValue = env.HEADLESSCODE_REASONING_EFFORT
+	return envValue === undefined || envValue === "" ? undefined : envValue
 }
 
 /**

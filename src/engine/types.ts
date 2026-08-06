@@ -78,6 +78,16 @@ export interface LlmRequest {
 	 * by contract: a throw from this callback must not fail the LLM call.
 	 */
 	onStreamChunk?: (kind: "text" | "reasoning" | "tool", chunk: string) => void
+	/**
+	 * Graded reasoning effort for models that support it (the pinned DeepSeek
+	 * family — issue #30 experiment). User-facing vocabulary is DeepSeek's
+	 * native set low/medium/high/max, plus OpenRouter's normalized "xhigh"
+	 * (an alias for the native max); the client normalizes to OpenRouter's
+	 * `reasoning: { effort }` field on the wire. Optional — when unset, no
+	 * effort field is sent and the endpoint's own undeclared default applies
+	 * (pre-existing behavior, unchanged).
+	 */
+	reasoningEffort?: string
 }
 
 /** Response shape returned by an LlmClient. */

@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict"
 
-import { buildRequestBody, OpenRouterClient } from "../openrouter.js"
+import { buildRequestBody, OpenRouterClient, parseReasoningEffort } from "../openrouter.js"
 import type { LlmRequest } from "../../engine/types.js"
 
 const baseRequest: LlmRequest = {
@@ -289,6 +289,50 @@ async function testNonDeepseekRequestsDoNotIncludeReasoning(): Promise<void> {
 	assert.equal(body.include_reasoning, undefined)
 }
 
+// ─── Graded reasoning effort (issue #30 experiment) ─────────────────────────
+
+async function testDeepseekRequestSendsReasoningEffort(): Promise<void> {
+	// A configured effort must reach OpenRouter as `reasoning: { effort }`
+	// (normalized), alongside the existing include_reasoning flag.
+	const body = buildRequestBody({ ...baseRequest, reasoningEffort: "high" }, "deepseek/deepseek-v4-flash")
+	assert.deepEqual(body.reasoning, { effort: "high" })
+}
+
+async function testMaxEffortNormalizesToXhigh(): Promise<void> {
+	// OpenRouter's normalized reasoning.effort has no "max" — the native
+	// DeepSeek max maps to "xhigh" on the wire; "xhigh" passes through.
+	const body = buildRequestBody({ ...baseRequest, reasoningEffort: "max" }, "deepseek/deepseek-v4-flash")
+	assert.deepEqual(body.reasoning, { effort: "xhigh" })
+	const body2 = buildRequestBody({ ...baseRequest, reasoningEffort: "xhigh" }, "deepseek/deepseek-v4-flash")
+	assert.deepEqual(body2.reasoning, { effort: "xhigh" })
+}
+
+async function testNoEffortSendsNothing(): Promise<void> {
+	// Regression: an unset effort must NOT add a reasoning field — the
+	// endpoint's undeclared default applies, exactly as before issue #30.
+	const body = buildRequestBody(baseRequest, "deepseek/deepseek-v4-flash")
+	assert.equal(body.reasoning, undefined)
+}
+
+async function testEffortKeptToDeepseekBoundary(): Promise<void> {
+	// Same deepseek/ prefix boundary as include_reasoning — no reasoning
+	// effort is invented for models the harness never pins reasoning on.
+	const body = buildRequestBody({ ...baseRequest, reasoningEffort: "high" }, "anthropic/claude-3.5-sonnet")
+	assert.equal(body.reasoning, undefined)
+}
+
+async function testParseReasoningEffortValidatesAndNormalizes(): Promise<void> {
+	assert.equal(parseReasoningEffort(undefined), undefined)
+	assert.equal(parseReasoningEffort(""), undefined)
+	assert.equal(parseReasoningEffort("  "), undefined)
+	assert.equal(parseReasoningEffort("low"), "low")
+	assert.equal(parseReasoningEffort("MEDIUM"), "medium") // case-insensitive
+	assert.equal(parseReasoningEffort("max"), "xhigh")
+	assert.equal(parseReasoningEffort("xhigh"), "xhigh")
+	assert.throws(() => parseReasoningEffort("higH-effort"), /must be one of low\/medium\/high\/max\/xhigh/i)
+	assert.throws(() => parseReasoningEffort("turbo"), /must be one of low\/medium\/high\/max\/xhigh/i)
+}
+
 async function testStreamingRequestAddsStreamFlags(): Promise<void> {
 	const body = buildRequestBody({ ...baseRequest, stream: true }, "anthropic/claude-3.5-sonnet")
 	assert.equal(body.stream, true)
@@ -520,6 +564,11 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["non-deepseek models are never pinned to the deepseek provider", testNonDeepseekModelsAreNotPinned],
 	["deepseek/* requests include include_reasoning (load-bearing)", testDeepseekRequestIncludesReasoning],
 	["non-deepseek requests do not include include_reasoning", testNonDeepseekRequestsDoNotIncludeReasoning],
+	["deepseek/* requests send reasoning: { effort } when configured", testDeepseekRequestSendsReasoningEffort],
+	["native max normalizes to OpenRouter's xhigh on the wire", testMaxEffortNormalizesToXhigh],
+	["unset effort sends no reasoning field (default unchanged)", testNoEffortSendsNothing],
+	["reasoning effort is kept to the deepseek/ boundary", testEffortKeptToDeepseekBoundary],
+	["parseReasoningEffort validates + normalizes, fails loudly on typos", testParseReasoningEffortValidatesAndNormalizes],
 	["streaming requests add stream + stream_options.include_usage only when opted in", testStreamingRequestAddsStreamFlags],
 	["non-streaming response captures message.reasoning", testNonStreamingResponseCapturesReasoning],
 	["streamed text+reasoning assemble correctly and emit incremental chunks", testStreamedTextAndReasoningAssembleCorrectly],

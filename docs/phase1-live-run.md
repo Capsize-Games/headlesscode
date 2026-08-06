@@ -31,6 +31,31 @@ Optional but recommended:
 | `OPENROUTER_MODEL` | Model id (e.g. `deepseek/deepseek-v4-flash`). Defaults to `deepseek/deepseek-v4-flash` if unset; overridable per-run with `--model`. |
 | `OPENROUTER_HTTP_REFERER` / `OPENROUTER_APP_TITLE` | Passed as `HTTP-Referer` / `X-Title` headers (OpenRouter rate-limit friendliness). |
 | `OPENROUTER_BASE_URL` | Base URL override for testing/proxies — see §4. |
+| `HEADLESSCODE_REASONING_EFFORT` | Graded reasoning effort for `deepseek/*` models (issue #30 experiment): `low` / `medium` / `high` / `max` (native DeepSeek levels) or `xhigh` (OpenRouter's normalized alias for `max`). Unset = the endpoint's undeclared default (pre-existing behavior, unchanged). Also settable per-project via the `_reasoning_effort` key in `mode-models.json` (that key beats this env var) — see below. |
+
+### Graded reasoning effort (`deepseek/*`, issue #30 experiment)
+
+DeepSeek V4 Flash supports graded reasoning (native levels `low`/`medium`/
+`high`/`max`). By default headlesscode never sends an effort level, so every
+session runs at whatever the endpoint's undeclared default is. To dial it for
+an experiment (same model, same cache-discount tier — only the effort changes):
+
+```bash
+export HEADLESSCODE_REASONING_EFFORT=high        # or: medium / low / max / xhigh
+```
+
+Per-project instead of globally, add the `_reasoning_effort` key to the
+central `mode-models.json` (it beats the env var):
+
+```json
+{ "code": "deepseek/deepseek-v4-flash", "_reasoning_effort": "high" }
+```
+
+The value is validated at startup (a typo exits with code 2 rather than
+silently keeping the endpoint default and skewing the comparison), and
+`max` is normalized to OpenRouter's `reasoning: { effort: "xhigh" }` on the
+wire. Only `deepseek/*` models receive the field (same boundary as
+`include_reasoning`); unset means no field is sent — zero behavior change.
 
 ---
 

@@ -13,7 +13,7 @@ import * as path from "node:path"
 
 import { LocalMemoryStore } from "./memory/local.js"
 import type { MemoryStore } from "./memory/types.js"
-import { OpenRouterClient } from "./llm/openrouter.js"
+import { OpenRouterClient, parseReasoningEffort } from "./llm/openrouter.js"
 import { HeadlessSession } from "./engine/loop.js"
 import { isLocalExploreEnabled } from "./engine/local-explore.js"
 import { Logger } from "./engine/logger.js"
@@ -36,7 +36,7 @@ import { migrateMain } from "./migrate/cli.js"
 import { analyzeCliMain } from "./orchestrator/analyze-cli.js"
 import { costHistoryCliMain } from "./orchestrator/cost-history-cli.js"
 import { resolvePermissions, type PermissionsConfig } from "./permissions/config.js"
-import { resolveModelForMode } from "./config/mode-models.js"
+import { resolveModelForMode, resolveReasoningEffortForMode } from "./config/mode-models.js"
 
 const VERSION = "0.1.0"
 
@@ -735,12 +735,19 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 				explicitModel: options.model,
 				env: process.env,
 			})
+			// Reasoning effort (issue #30): resolved + validated here too so
+			// --dry-run catches a bad value (e.g. a typo in the env var or
+			// mode-models.json `_reasoning_effort` key) BEFORE the experiment
+			// burns any real LLM calls. A throw lands in the catch below.
+			const dryRunEffort = resolveReasoningEffortForMode({ workspaceRoot, env: process.env })
+			parseReasoningEffort(dryRunEffort)
 
 			process.stdout.write(built.prompt + "\n")
 			process.stdout.write(
 				`\n───── dry-run summary ─────\n` +
 					`mode:             ${options.mode}\n` +
 					`model:            ${dryRunModel ?? "deepseek/deepseek-v4-flash (client default)"}\n` +
+					`reasoning effort: ${dryRunEffort ?? "(unset — endpoint default)"}\n` +
 					`workspace:        ${workspaceRoot}\n` +
 					`custom modes:     ${customModes.length ? customModes.map((m) => m.slug).join(", ") : "(none, using built-ins)"}\n` +
 					`exposed tools:    ${tools.map((t) => (t.type === "function" ? t.function.name : t.type)).join(", ")}\n` +
@@ -821,6 +828,21 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 			env: process.env,
 		})
 
+	// Graded reasoning effort for deepseek/* models (issue #30 experiment):
+	// the `_reasoning_effort` key in mode-models.json beats
+	// $HEADLESSCODE_REASONING_EFFORT. Deliberately NOT a CLI flag — the
+	// experiment compares env/config values and a flag would be one more
+	// surface to keep in sync. Validated here so a typo fails at startup
+	// (exit 2) with a clear message instead of mid-session on the first LLM
+	// call (fail-loudly, same idiom as mode-models.ts).
+	const reasoningEffort = resolveReasoningEffortForMode({ workspaceRoot, env: process.env })
+	try {
+		parseReasoningEffort(reasoningEffort)
+	} catch (err) {
+		process.stderr.write(`headlesscode: ${err instanceof Error ? err.message : String(err)}\n`)
+		return 2
+	}
+
 	// Phase 3 memory: OFF by default (preserves pre-Phase-3 behavior). Enabled
 	// only by --memory-dir or $HEADLESSCODE_MEMORY_DIR; --no-memory forces off.
 	const memory = resolveMemory(options, workspaceRoot)
@@ -897,6 +919,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		condenseModel,
 		llmTimeoutMs: options.llmTimeoutMs,
 		stream: options.stream,
+		reasoningEffort,
 		llmClient: client,
 		logger,
 		memory,
