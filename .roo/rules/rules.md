@@ -141,3 +141,14 @@ comment for the full contract). `.worktrees/.orchestrator-state.json` is
 the durable source of truth for a round's status — treat it as
 authoritative over your own memory of what happened, especially across
 separate tasks/sessions.
+
+- **Branch naming (issue #15):** push whatever `git branch --show-current`
+  prints in your worktree — the spawner already disambiguates a colliding
+  `issues/<name>-<date>` at creation time and records the REAL final name
+  in `group.branch` in the orchestrator state. If a push still fails
+  because origin owns the name (a race between spawn and push), rename the
+  LOCAL branch first (`git branch -m <new-name>`), then push the renamed
+  branch, and put the final branch name — not just the PR link — in the
+  closing report. Never push a renamed branch while the local worktree
+  branch keeps the old name: that mismatch is exactly what issue #15
+  removed.

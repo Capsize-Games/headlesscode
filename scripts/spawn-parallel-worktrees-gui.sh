@@ -60,12 +60,28 @@ if [ "$#" -eq 0 ]; then
     exit 1
 fi
 
+# Resolve a worktree branch name that is free BOTH locally and on origin
+# (issue #15) — see the headless spawner's resolve_worktree_branch for the
+# full rationale. The intended issues/<name>-<date> name can collide with a
+# leftover branch from an earlier round; the worker must never end up on a
+# local branch whose name differs from what it can push.
+resolve_worktree_branch() {
+    local base="$1"
+    local candidate="$base"
+    local n=2
+    while git -C "$REPO_ROOT" rev-parse --verify --quiet "refs/heads/$candidate" >/dev/null 2>&1 ||
+          git -C "$REPO_ROOT" ls-remote --exit-code origin "refs/heads/$candidate" >/dev/null 2>&1; do
+        candidate="${base}-${n}"
+        n=$((n + 1))
+    done
+    printf '%s' "$candidate"
+}
+
 for spec in "$@"; do
     name="$(echo "$spec" | cut -d: -f1)"
     offset="$(echo "$spec" | cut -d: -f2)"
     task_file="$(echo "$spec" | cut -d: -f3-)"
     wt_path="$WORKTREE_PARENT/$name"
-    branch="issues/${name}-${DATE_TAG}"
 
     if [ -n "$task_file" ] && [ ! -f "$REPO_ROOT/$task_file" ]; then
         echo "ERROR: task file '$task_file' not found relative to $REPO_ROOT" >&2
@@ -77,12 +93,21 @@ for spec in "$@"; do
         continue
     fi
 
+    intended_branch="issues/${name}-${DATE_TAG}"
+    branch="$(resolve_worktree_branch "$intended_branch")"
+    if [ "$branch" != "$intended_branch" ]; then
+        echo "  NOTE (issue #15): branch '$intended_branch' already exists (local or on origin) — using disambiguated branch '$branch' instead."
+    fi
+
     echo "=== Creating worktree '$name' at $wt_path (branch $branch) ==="
 
     git -C "$REPO_ROOT" fetch origin master --quiet 2>/dev/null || echo "  (note: git fetch origin master failed — using local master)"
-    if ! git -C "$REPO_ROOT" worktree add -b "$branch" "$wt_path" origin/master 2>/dev/null; then
+    if ! git -C "$REPO_ROOT" worktree add -b "$branch" "$wt_path" origin/master; then
         echo "  (origin/master unavailable — falling back to local master)"
-        git -C "$REPO_ROOT" worktree add -b "$branch" "$wt_path" master
+        if ! git -C "$REPO_ROOT" worktree add -b "$branch" "$wt_path" master; then
+            echo "ERROR: $name — could not create worktree on branch '$branch' (it may already exist; see the collision note above). Remove the leftover and retry." >&2
+            exit 1
+        fi
     fi
 
     if [ -f "$REPO_ROOT/.env" ]; then

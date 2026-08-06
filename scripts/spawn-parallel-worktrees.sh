@@ -238,13 +238,40 @@ issue_numbers_from_task_file() {
     printf '%s' "$nums" | tr '-' ' '
 }
 
+# Resolve a worktree branch name that is free BOTH locally and on origin
+# (issue #15). The intended issues/<name>-<date> name can collide with a
+# leftover branch from an earlier round: locally (a previous worktree branch
+# that was never deleted) or on origin (a previous push/PR that was never
+# cleaned up). Without disambiguation the spawn either dies (`git worktree add
+# -b` refuses an existing branch) or — worse — succeeds locally while origin
+# already owns the name, so the worker's push fails and it improvises a silent
+# rename that nobody can see. Resolving the name HERE keeps the worktree's
+# local branch equal to the branch that will be pushed, and lets the spawner
+# record the REAL final name in group.branch in the orchestrator state.
+#
+# Local check: `git rev-parse --verify refs/heads/<candidate>`. Remote check:
+# `git ls-remote --exit-code` against origin (the live remote — authoritative;
+# a network failure is treated as "no collision", matching the script's
+# best-effort `git fetch` below). Appends -2, -3, ... until a name is free on
+# both.
+resolve_worktree_branch() {
+    local base="$1"
+    local candidate="$base"
+    local n=2
+    while git -C "$REPO_ROOT" rev-parse --verify --quiet "refs/heads/$candidate" >/dev/null 2>&1 ||
+          git -C "$REPO_ROOT" ls-remote --exit-code origin "refs/heads/$candidate" >/dev/null 2>&1; do
+        candidate="${base}-${n}"
+        n=$((n + 1))
+    done
+    printf '%s' "$candidate"
+}
+
 # ── Spawn loop ───────────────────────────────────────────────────────────────
 for spec in "$@"; do
     name="$(printf '%s' "$spec" | cut -d: -f1)"
     offset="$(printf '%s' "$spec" | cut -d: -f2)"
     task_file="$(printf '%s' "$spec" | cut -d: -f3-)"
     wt_path="$WORKTREE_PARENT/$name"
-    branch="issues/${name}-${DATE_TAG}"
 
     if [ -z "$name" ] || [ -z "$offset" ]; then
         echo "spawn-parallel-worktrees: malformed spec '$spec' (expected <name>:<offset>:<task-file>)" >&2
@@ -261,12 +288,21 @@ for spec in "$@"; do
         exit 1
     fi
 
+    intended_branch="issues/${name}-${DATE_TAG}"
+    branch="$(resolve_worktree_branch "$intended_branch")"
+    if [ "$branch" != "$intended_branch" ]; then
+        echo "  NOTE (issue #15): branch '$intended_branch' already exists (local or on origin) — using disambiguated branch '$branch' instead. group.branch in the orchestrator state records the REAL name."
+    fi
+
     echo "=== Creating worktree '$name' at $wt_path (branch $branch, port offset $offset) ==="
 
     git -C "$REPO_ROOT" fetch origin master --quiet 2>/dev/null || echo "  (note: git fetch origin master failed — using local master)"
-    if ! git -C "$REPO_ROOT" worktree add -b "$branch" "$wt_path" origin/master 2>/dev/null; then
+    if ! git -C "$REPO_ROOT" worktree add -b "$branch" "$wt_path" origin/master; then
         echo "  (origin/master unavailable — falling back to local master)"
-        git -C "$REPO_ROOT" worktree add -b "$branch" "$wt_path" master
+        if ! git -C "$REPO_ROOT" worktree add -b "$branch" "$wt_path" master; then
+            echo "ERROR: $name — could not create worktree on branch '$branch' (it may already exist; see the collision note above). Remove the leftover and retry." >&2
+            exit 1
+        fi
     fi
 
     # zoo-code/ (the upstream reference clone used as a vendoring source,

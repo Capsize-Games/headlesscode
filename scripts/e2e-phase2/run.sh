@@ -574,6 +574,77 @@ else
 	fail "stop fixture: .harness.exit present after stop — wrapper survived"
 fi
 
+# ── 9.6. Branch-name collision disambiguation (issue #15) ────────────────────
+# A leftover branch with the intended name (local, or already on origin) used
+# to make the worker's push fail mid-round; the worker then improvised a
+# renamed push that left the local worktree branch under the old name, and
+# nobody could find the real branch. The spawner must instead disambiguate at
+# CREATION TIME (one name, local == pushed), name it loudly on stdout, and
+# record the REAL name in group.branch in the orchestrator state.
+echo "== [9.6/10] branch-name collision disambiguation (issue #15) =="
+COLLIDE_DATE="$(date +%Y-%m-%d)"
+# Local leftover: a branch named exactly as w5's intended branch.
+git -C "$FIXTURE" branch "issues/w5-${COLLIDE_DATE}" master >/dev/null 2>&1 || true
+# Remote leftover: push a branch named exactly as w6's intended branch.
+git -C "$FIXTURE" push -q origin "master:refs/heads/issues/w6-${COLLIDE_DATE}" >/dev/null 2>&1 || true
+COLLIDE_SPAWN_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-collide-XXXXXX.out)"
+(
+	cd "$ROOT" &&
+		TARGET_REPO="$FIXTURE" \
+		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
+		OPENROUTER_BASE_URL="http://127.0.0.1:$EXHAUST_PORT" \
+		HEADLESSCODE_ROOT="$ROOT" \
+		HEADLESSCODE_MAX_ITERATIONS=1 \
+		ALLOW_UNINDEXED=1 \
+		bash scripts/spawn-parallel-worktrees.sh w5:4: w6:5:
+) >"$COLLIDE_SPAWN_OUT" 2>&1
+COLLIDE_SPAWN_EXIT=$?
+if [ "$COLLIDE_SPAWN_EXIT" -eq 0 ] && [ -d "$FIXTURE/.worktrees/w5" ] && [ -d "$FIXTURE/.worktrees/w6" ]; then
+	pass "collision fixture: w5 + w6 spawned despite both intended branch names being taken"
+else
+	fail "collision fixture: spawn failed (exit $COLLIDE_SPAWN_EXIT)"
+	tail -n 15 "$COLLIDE_SPAWN_OUT" >&2
+fi
+WORKTREE_NAMES="$WORKTREE_NAMES w5 w6"
+
+# The worktree's checked-out branch must BE the disambiguated name (so the
+# local branch == the branch that will be pushed — no mismatch to discover).
+W5_BRANCH="$(git -C "$FIXTURE/.worktrees/w5" symbolic-ref --short HEAD 2>/dev/null || true)"
+W6_BRANCH="$(git -C "$FIXTURE/.worktrees/w6" symbolic-ref --short HEAD 2>/dev/null || true)"
+if [ "$W5_BRANCH" = "issues/w5-${COLLIDE_DATE}-2" ] && [ "$W6_BRANCH" = "issues/w6-${COLLIDE_DATE}-2" ]; then
+	pass "collision fixture: worktrees on disambiguated branches ($W5_BRANCH, $W6_BRANCH)"
+else
+	fail "collision fixture: expected issues/w5-$COLLIDE_DATE-2 + issues/w6-$COLLIDE_DATE-2, got '$W5_BRANCH' + '$W6_BRANCH'"
+fi
+
+# The rename must be loud and structured in the spawn log, not prose buried
+# in a worker's closing report.
+if grep -q "using disambiguated branch 'issues/w5-${COLLIDE_DATE}-2'" "$COLLIDE_SPAWN_OUT" &&
+	grep -q "using disambiguated branch 'issues/w6-${COLLIDE_DATE}-2'" "$COLLIDE_SPAWN_OUT"; then
+	pass "collision fixture: spawn log names the disambiguated branches loudly"
+else
+	fail "collision fixture: expected loud disambiguation lines in spawn output"
+	tail -n 15 "$COLLIDE_SPAWN_OUT" >&2
+fi
+
+# group.branch in the orchestrator state must be the REAL final name, not the
+# originally-intended (colliding) one.
+if grep -q "\"branch\": \"issues/w5-${COLLIDE_DATE}-2\"" "$FIXTURE/.worktrees/.orchestrator-state.json" &&
+	grep -q "\"branch\": \"issues/w6-${COLLIDE_DATE}-2\"" "$FIXTURE/.worktrees/.orchestrator-state.json"; then
+	pass "collision fixture: group.branch records the real disambiguated name for both groups"
+else
+	fail "collision fixture: state group.branch is not the disambiguated name"
+	grep -o '"name": "w[56]".*' "$FIXTURE/.worktrees/.orchestrator-state.json" >&2 || true
+fi
+
+# The leftover branches must be untouched — nothing was force-deleted.
+if [ -n "$(git -C "$FIXTURE" branch --list "issues/w5-${COLLIDE_DATE}")" ] &&
+	git -C "$FIXTURE" ls-remote --exit-code origin "refs/heads/issues/w6-${COLLIDE_DATE}" >/dev/null 2>&1; then
+	pass "collision fixture: leftover local + origin branches preserved"
+else
+	fail "collision fixture: a leftover branch was deleted/modified"
+fi
+
 # ── 10. Summary + cleanup ────────────────────────────────────────────────────
 TOTAL=$((PASS + FAIL))
 echo ""
