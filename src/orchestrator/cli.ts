@@ -640,6 +640,111 @@ export function buildReworkTaskFileContent(
 }
 
 /**
+	* QA-fail rework task content (issue #52): a NEW task file for a group whose
+	* QA session came back with a real "fail" verdict (review had passed). Same
+	* structure/conventions as buildReworkTaskFileContent, but the assignment is
+	* the QA evidence — what the QA session actually found and verified — rather
+	* than the reviewer's findings list. The worker is expected to address every
+	* piece of evidence, re-verify for real, and re-close with fresh evidence per
+	* the closing-report template — same contract as the first attempt.
+	*/
+export function buildQaReworkTaskFileContent(
+	group: { name: string; issues?: number[] },
+	evidence: string,
+	reworkCount: number,
+	reportPath?: string,
+): string {
+	const assigned = (group.issues ?? []).map((n) => `#${n}`).join(", ") || "this worktree"
+	const ghLines = (group.issues ?? []).map((n) => `gh issue view ${n}`).join("\n")
+	// Issue #34-style: point at the QA session's COMPLETE final report so the
+	// full reasoning is one file-read away (evidence is only a 4000-char slice).
+	const reportLines = reportPath
+		? [
+				"",
+				`The full QA session report is at: \`${reportPath}\` — read it for the complete`,
+				"reasoning behind every finding before you start.",
+		  ]
+		: []
+	return [
+		"Before anything else: read `.roo/rules-code/rules.md` in full (or `.roo/rules/rules.md` if",
+		"rules-code is absent) and treat it as binding for this entire session, regardless of whether",
+		"it auto-loaded for whatever mode you're running in — don't assume it applied, read it yourself.",
+		"",
+		"You are working autonomously in the SAME isolated git worktree as the previous attempt, on",
+		"the same branch. Review passed, but the automated QA session found real problems with the",
+		"attempt — treat them as NEW WORK. Read this entire file before doing anything.",
+		"",
+		`## Rework cycle ${reworkCount} — address the QA findings`,
+		"",
+		`Assigned issues: ${assigned}. Fetch each issue's real body yourself (do not rely on a stale`,
+		"copy of any issue body):",
+		"```",
+		ghLines || "# (no issue numbers recorded — inspect the worktree for context)",
+		"```",
+		"",
+		"## QA findings to fix (from the automated QA)",
+		"",
+		...(evidence === ""
+			? [
+					"(the QA report recorded no extractable evidence — re-run the QA checklist against the",
+					"worktree yourself and fix whatever fails.)",
+			  ]
+			: [evidence]),
+		...reportLines,
+		"",
+		"Your job: address EVERY finding above. Do not skip any. Do not claim a finding is fixed",
+		"without reproducing the fix for real.",
+		"",
+		"## Workflow",
+		"",
+		"1. Read each finding above and the relevant source files.",
+		"2. Fix every finding, following the project's own conventions and the rules files.",
+		"3. Re-verify for real (run the project's tests / boot check) and capture the output —",
+		"   output in a report is a claim, not evidence, until reproduced.",
+		"4. Commit with the issue number referenced, one logical change per commit.",
+		"5. Push the branch and update the PR (or open a new one if needed).",
+		"6. Post an UPDATED closing comment below on each issue using the required template, then",
+		"   re-close it (or leave it open with the updated report if it must stay open).",
+		"",
+		"## Required comment template",
+		"",
+		"Your issue-closing comment must use this exact structure (every section present; a section can",
+		"be 'N/A' with a reason, but a missing section is itself a review finding):",
+		"```",
+		`## Issue <n> — Closing Report (rework cycle ${reworkCount})`,
+		"",
+		"### Files changed",
+		"<one line per file>",
+		"",
+		"### Baseline (before)",
+		"<real output>",
+		"",
+		"### Baseline (after)",
+		"<real output>",
+		"",
+		"### Boot check",
+		"<real output or exact reason it didn't apply>",
+		"",
+		"### Residual risk / notes",
+		"<anything not 100% certain>",
+		"",
+		"PR: <link>",
+		"```",
+		"",
+		"## Closing out",
+		"",
+		"Once every finding is addressed and every assigned issue is re-closed with fresh evidence:",
+		"1. Finish with attempt_completion and a full summary of what you changed, the real baseline",
+		"   numbers, the boot check, and the PR link(s).",
+		"2. The harness records your completion automatically (exit code + .harness.done marker) —",
+		"   no separate phone-home step is needed.",
+		"3. Do not start on any issue not assigned to this worktree.",
+		"",
+		`Scope: ${assigned} only — rework cycle ${reworkCount}.`,
+	].join("\n")
+}
+
+/**
 	* Continuation task content (plans/issues/02-orchestrate-iteration-plumbing.md,
 	* Part 2): a NEW task file for a group whose worker exited because it hit the
 	* iteration cap. The worktree is untouched and resumable — the partial edits
@@ -838,7 +943,96 @@ export function handleReviewVerdict(
 }
 
 /**
- * A review-SESSION failure (crash/budget/mistake-limit — see
+	* QA-side twin of handleReviewVerdict (issue #52): a REAL QA "fail" verdict
+	* (as opposed to a QA-SESSION "error" — see handleQaSessionError) is
+	* actionable new work, exactly like a review "finding". Below the
+	* `--max-rework-cycles` cap the group is reset to "running" on the SAME
+	* worktree with a fresh `spawned` timestamp, review/QA/cost artifacts are
+	* cleared, reworkCount is incremented, and a QA rework task file (fed from
+	* `qa.evidence` rather than review findings) + worker launch command are
+	* produced. At the cap: no spawn; the group is marked `needs-human` with the
+	* QA verdict/evidence left recorded so a human can see exactly what failed.
+	*/
+export function handleQaVerdict(
+	group: OrchestratorGroup,
+	result: QaResult,
+	repo: string,
+	maxReworkCycles: number,
+	mode: string,
+	model?: string,
+	/** Per-session iteration cap forwarded to the rework worker (default: harness's own). */
+	maxIterations?: number,
+): ReworkDecision {
+	const currentRework = typeof group.reworkCount === "number" ? group.reworkCount : 0
+	const newReworkCount = currentRework + 1
+	const now = new Date().toISOString()
+
+	if (currentRework < maxReworkCycles) {
+		const taskFilePath = path.join(repo, "plans", "parallel-tasks", `${group.name}-qa-rework${newReworkCount}.md`)
+		const taskContent = buildQaReworkTaskFileContent(group, result.evidence, newReworkCount, result.reportPath)
+		const worktreePath = groupWorktreePath(repo, group)
+		const spawnCommand =
+			`bash ${path.join(HARNESS_ROOT_TS, "scripts", "run-worker.sh")} ` +
+			`"${worktreePath}" "${taskFilePath}" --mode "${mode}"` +
+			(model ? ` --model "${model}"` : "") +
+			(maxIterations !== undefined ? ` --max-iterations "${maxIterations}"` : "")
+		return {
+			shouldSpawn: true,
+			newReworkCount,
+			taskFilePath,
+			taskContent,
+			spawnCommand,
+			patch: {
+				status: "running",
+				reworkCount: newReworkCount,
+				// Fresh spawned timestamp: the stall guard must measure the
+				// rework worker, not the (possibly hours-old) original attempt.
+				spawned: now,
+				// The rework worker changes code, so review AND QA must both
+				// re-run — same fresh-cycle reset as handleReviewVerdict.
+				review_verdict: undefined,
+				pending_review_findings: undefined,
+				reviewed_at: undefined,
+				review_report: undefined,
+				qa: undefined,
+				stalled: undefined,
+				exit_code: undefined,
+				summary: undefined,
+				// The rework worker adds MORE real cost on this worktree; the
+				// one-shot recordCostIfSettled gate must re-record once this
+				// cycle re-settles (same reasoning as handleReviewVerdict).
+				cost_recorded: undefined,
+				last_activity: {
+					note: `rework cycle ${newReworkCount}: re-spawned worker on the same worktree to fix QA findings`,
+				},
+			},
+		}
+	}
+
+	// Cap reached: no new attempt. Terminal "needs-human" outcome — the QA
+	// verdict/evidence stay recorded so a human can see exactly what failed.
+	return {
+		shouldSpawn: false,
+		newReworkCount: currentRework,
+		patch: {
+			status: "needs-human",
+			reworkCount: currentRework,
+			qa: {
+				status: "failed",
+				verdict: result.verdict,
+				evidence: result.evidence.slice(0, 4000),
+				report: result.reportPath,
+				updated: now,
+			},
+			last_activity: {
+				note: `exhausted ${currentRework} rework attempt(s); QA still failing — needs human`,
+			},
+		},
+	}
+}
+
+/**
+	* A review-SESSION failure (crash/budget/mistake-limit — see
  * runReviewWithRetries) survived every retry: verdict "error", distinct from
  * a real code "finding". This must NEVER feed into handleReviewVerdict's
  * rework-a-worker path — there is nothing actionable in a placeholder error
@@ -2303,11 +2497,85 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 					)
 					return
 				}
-				const qaStatus = qaResult.verdict === "pass" ? "done" : "failed"
+				// A real QA FAIL verdict is NEW WORK, not a settled "done"
+				// (issue #52, caught live 2026-08-05): the group passed review
+				// but QA caught real problems. Auto-spawn a rework cycle on the
+				// SAME worktree exactly like a review finding, feeding the QA
+				// evidence into the task file instead of review findings, up to
+				// --max-rework-cycles. At the cap the group goes terminal
+				// needs-human — it must never silently settle as "done" with
+				// only the nested qa.status showing "failed".
+				if (qaResult.verdict === "fail") {
+					const decision = handleQaVerdict(
+						group,
+						qaResult,
+						repo,
+						options.maxReworkCycles,
+						options.mode,
+						workerModel,
+						options.maxIterations,
+					)
+					if (decision.shouldSpawn && decision.taskFilePath && decision.taskContent && decision.spawnCommand) {
+						fs.mkdirSync(path.dirname(decision.taskFilePath), { recursive: true })
+						fs.writeFileSync(decision.taskFilePath, decision.taskContent, "utf-8")
+						process.stdout.write(
+							`[orchestrate] ${group.name} QA-fail rework cycle ${decision.newReworkCount}: ` +
+								`wrote ${path.relative(repo, decision.taskFilePath)}; re-spawning worker on the same worktree...\n`,
+						)
+						const spawnResult = spawnSync("bash", ["-c", decision.spawnCommand], {
+							cwd: repo,
+							env: {
+								...process.env,
+								HEADLESSCODE_ROOT: HARNESS_ROOT_TS,
+								...(options.memoryDir ? { HEADLESSCODE_MEMORY_DIR: path.resolve(options.memoryDir) } : {}),
+							},
+							stdio: "inherit",
+						})
+						if (spawnResult.status !== 0) {
+							// The QA-fail rework worker could not be launched —
+							// the group cannot fix itself, so surface it as
+							// needing a human instead of leaving a dangling
+							// "running" group (same as the review-finding path).
+							process.stderr.write(
+								`[orchestrate] QA-fail rework worker spawn for ${group.name} failed (exit ${spawnResult.status}); ` +
+									`marking group needs-human\n`,
+							)
+							await patchGroup(statePath, group.name, {
+								status: "needs-human",
+								reworkCount: decision.newReworkCount,
+								qa: {
+									status: "failed",
+									verdict: qaResult.verdict,
+									evidence: qaResult.evidence.slice(0, 4000),
+									report: qaResult.reportPath,
+									updated: new Date().toISOString(),
+								},
+								last_activity: {
+									note: `QA-fail rework spawn failed after ${decision.newReworkCount} attempt(s); needs human`,
+								},
+							})
+						} else {
+							// Spawn succeeded: reset the group so the watcher
+							// re-polls it as "running" → "done" → re-reviewed
+							// → re-QA'd.
+							await patchGroup(statePath, group.name, decision.patch)
+						}
+						return true
+					}
+					// Cap reached: terminal "needs-human" outcome. The QA
+					// verdict/evidence stay recorded so a human can see
+					// exactly what failed.
+					await patchGroup(statePath, group.name, decision.patch)
+					process.stderr.write(
+						`[orchestrate] NEEDS-HUMAN: ${group.name} exhausted ${decision.newReworkCount} rework ` +
+							`attempt(s) and QA still fails — a human must look at this worktree.\n`,
+					)
+					return true
+				}
 				await patchGroup(statePath, group.name, {
 					qa: {
-						status: qaStatus,
-						verdict: qaResult.verdict,
+						status: "done",
+						verdict: "pass",
 						evidence: qaResult.evidence.slice(0, 4000),
 						// Issue #34: the state file keeps the lightweight parsed
 						// fields for quick scanning; point at the QA session's
@@ -2317,11 +2585,11 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 						updated: new Date().toISOString(),
 					},
 					last_activity: {
-						note: `QA: verdict=${qaResult.verdict}`,
+						note: "QA: verdict=pass",
 					},
 				})
 				process.stdout.write(
-					`[orchestrate] ${group.name} QA verdict: ${qaResult.verdict} (status ${qaStatus})\n`,
+					`[orchestrate] ${group.name} QA verdict: pass (status done)\n`,
 				)
 			} catch (err) {
 				process.stderr.write(
