@@ -28,6 +28,7 @@ import { orchestrateMain } from "./orchestrator/cli.js"
 import { watchMain } from "./watcher/cli.js"
 import { checkpointsMain } from "./checkpoints/cli.js"
 import { dashboardMain } from "./dashboard/cli.js"
+import { trendMain } from "./dashboard/trend-cli.js"
 import { indexMain } from "./codesearch/cli.js"
 import { codemapMain } from "./codemap/cli.js"
 import { provisionMain, pushPrMain } from "./github/cli.js"
@@ -176,6 +177,11 @@ Subcommands:
               event feed and pause/resume control (Phase 3: no longer purely
               read-only — see src/dashboard/server.ts). See
               \`npx tsx src/cli.ts dashboard --help\` for full options.
+  headlesscode trend --repo <path> [--repo <path> ...] [--port 4460]
+              Serve a local, auto-refreshing page comparing multiple repos'
+              cost-efficiency trends side by side (wasted-session tracking,
+              cost/iteration vs. round-size correlation, rework rate). See
+              \`npx tsx src/cli.ts trend --help\` for full options.
   headlesscode index --workspace <path> [--model <id>] [--embedding-backend <b>]
               Build/refresh the codebase semantic-search index for a workspace
               (used by the codebase_search tool). A separate, explicit step —
@@ -626,6 +632,15 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// (Phase 3 — see src/dashboard/; no longer purely read-only).
 	if (argv[0] === "dashboard") {
 		return dashboardMain(argv.slice(1))
+	}
+
+	// Cross-repo cost-efficiency trend subcommand: `headlesscode trend ...` —
+	// a local, auto-refreshing page comparing multiple repos' cost-history
+	// side by side (see src/dashboard/trend.ts). Distinct from `dashboard`'s
+	// single-repo "Cost history" section: reads live on every request, no
+	// cached snapshot.
+	if (argv[0] === "trend") {
+		return trendMain(argv.slice(1))
 	}
 
 	// Codebase semantic-search index subcommand: `headlesscode index ...` —
