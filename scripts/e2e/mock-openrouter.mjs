@@ -71,6 +71,20 @@
  *     inspecting the real tool-result content fed back into the request
  *     history and the real file content on disk afterward.
  *
+ *   plan-first — issue #49 (plan-first experiment) e2e. ONE server serves
+ *     both the plan session and the code worker, dispatching per-request on
+ *     the MODEL field: requests whose model == MOCK_PLAN_MODEL get the plan
+ *     script (explore -> write PLAN.md -> attempt_completion), everything
+ *     else gets the standard worker success script. The dispatch is robust
+ *     because the fixture's mode-models.json maps the plan-first mode
+ *     ("architect") to MOCK_PLAN_MODEL and "code" to the worker model, so
+ *     the plan session and the code worker always carry different models.
+ *       model == MOCK_PLAN_MODEL:
+ *         history_tool_calls == 0 -> read_file (explore)
+ *         history_tool_calls == 1 -> write_to_file PLAN.md (deterministic plan)
+ *         history_tool_calls >= 2 -> attempt_completion
+ *       otherwise -> the success script (worker)
+ *
  *   decision — browser-control-plane e2e (plans/browser-control-plane.md):
  *     the model calls ask_followup_question ONCE, then (only once a real
  *     answer has been fed back into the request history as a tool result)
@@ -105,7 +119,10 @@
  *                      "[mock] listening on http://127.0.0.1:<port>" line.
  *   MOCK_SCENARIO      success | error-loop | exhaustion | review-clean |
  *                      review-finding | qa-pass | qa-fail | qa-orchestrate |
- *                      permissions (default success)
+ *                      permissions | plan-first (default success)
+ *   MOCK_PLAN_MODEL    model id the plan-first scenario dispatches on (default:
+ *                      deepseek/architect-plan — the fixture maps the
+ *                      architect mode to it in mode-models.json)
  *   MOCK_FIXTURE_ROOT  path to the fixture repo; the write_to_file content is
  *                      derived by patching this repo's buggy source so the
  *                      e2e runner can assert the fix landed byte-for-byte.
@@ -146,6 +163,25 @@ const REWORK_QA = Number(process.env.REWORK_QA || 0)
 
 const DEFAULT_VERIFY_CMD =
 	"node -e \"const { greet } = require('./src/greet.js'); const assert = require('node:assert'); assert.strictEqual(greet('World'), 'Hello, World'); console.log('greet verified OK')\""
+
+// plan-first scenario (issue #49): the model id the plan session's requests
+// carry (see the fixture's mode-models.json "architect" key). The dispatch
+// keys on this — see buildScenarioResponse.
+const PLAN_MODEL = process.env.MOCK_PLAN_MODEL || "deepseek/architect-plan"
+
+// Deterministic plan the plan-first scenario's write_to_file writes to
+// PLAN.md — the e2e runner asserts this exact text lands in the worktree's
+// ORCHESTRATOR_TASK.md (appended by the spawner) to prove the plan phase ran
+// and reached the code worker.
+const PLAN_FIRST_PLAN_CONTENT = [
+	"# Implementation plan (mock plan-first)",
+	"",
+	"1. Read src/greet.js and ORCHESTRATOR_TASK.md.",
+	'2. Fix greet() to return "Hello, " + name (write_to_file on src/greet.js).',
+	"3. Verify with `node src/greet.test.js` (execute_command).",
+	"4. Commit and report via attempt_completion.",
+	"",
+].join("\n")
 
 // permissions scenario (plans/permissions-parity.md e2e gap).
 const PROTECTED_WRITE_CONTENT = process.env.MOCK_PROTECTED_WRITE_CONTENT || "MOCK_SECRET=should-never-land\n"
@@ -569,6 +605,43 @@ function buildScenarioResponse({ model, historyToolCalls, systemPrompt, toolName
 			qaSessionCount++
 		}
 		return qaSessionResponse(model, historyToolCalls, qaSessionCount > REWORK_QA)
+	}
+
+	if (SCENARIO === "plan-first") {
+		// Issue #49: ONE server serves both the plan session and the code
+		// worker, dispatching on the MODEL field (see the scenario doc
+		// comment). The plan session gets explore -> write PLAN.md -> complete;
+		// the worker falls through to the standard success script below.
+		if (model === PLAN_MODEL) {
+			if (historyToolCalls === 0) {
+				return chatResponse(model, {
+					role: "assistant",
+					content: null,
+					tool_calls: [toolCall("call_mock_plan_read", "read_file", { path: BUGGY_FILE })],
+				})
+			}
+			if (historyToolCalls === 1) {
+				return chatResponse(model, {
+					role: "assistant",
+					content: null,
+					tool_calls: [
+						toolCall("call_mock_plan_write", "write_to_file", {
+							path: "PLAN.md",
+							content: PLAN_FIRST_PLAN_CONTENT,
+						}),
+					],
+				})
+			}
+			return chatResponse(model, {
+				role: "assistant",
+				content: null,
+				tool_calls: [
+					toolCall("call_mock_plan_done", "attempt_completion", {
+						result: "Planning complete: wrote the implementation plan to PLAN.md at the workspace root.",
+					}),
+				],
+			})
+		}
 	}
 
 	// success scenario — keyed on this session's own history.

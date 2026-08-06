@@ -116,6 +116,21 @@ Options:
                  re-spawns a worker on the SAME worktree with a fresh session.
                  After the cap, the group is marked "needs-human" and left for
                  manual resolution
+  --plan-first          Issue #49 experiment: run a SHORT architect-mode
+                 planning session per worktree BEFORE the code worker, and
+                 append its plan (PLAN.md) into the worker's task file so the
+                 code worker executes against it instead of re-discovering
+                 context (grep/read cycles) from iteration 1. OPT-IN — never
+                 the default without evidence it helps. The plan session runs
+                 synchronously inside the spawner, so N plan-first worktrees
+                 extend the spawn call by ~N × plan-session time
+  --plan-first-mode <slug>  Mode slug for the plan-first session (default:
+                 architect; any mode the worker CLI accepts — built-in or
+                 .roomodes)
+  --plan-first-max-iterations <n>  Iteration cap for the plan-first session
+                 (default: 15, or $HEADLESSCODE_PLAN_FIRST_MAX_ITERATIONS) —
+                 deliberately short: the plan session must produce a plan,
+                 not implement it
   --no-preflight        Skip the pre-spawn preflight probe (issue #13): a cheap
                  1-token completion using the EXACT model + provider pin a real
                  worker uses, run BEFORE anything is spawned, that distinguishes
@@ -178,6 +193,17 @@ interface OrchestrateOptions {
 	/** Auto-continue: max re-spawns per group after a worker hits the iteration cap (default 3). */
 	maxContinuations: number
 	/**
+	 * Issue #49 experiment: run a short architect-mode planning session per
+	 * worktree BEFORE the code worker, and append its plan (PLAN.md) into the
+	 * worker's task file so the code worker executes against it instead of
+	 * re-discovering context from iteration 1. OPT-IN — never the default.
+	 */
+	planFirst: boolean
+	/** Mode slug for the plan-first session (default: architect). */
+	planFirstMode: string
+	/** Iteration cap for the plan-first session (default: 15 — deliberately short). */
+	planFirstMaxIterations: number
+	/**
 	 * Issue #13 pre-spawn preflight probe (1-token, exact model + provider
 	 * pin). ON by default; --no-preflight skips it for CI/non-interactive.
 	 */
@@ -201,6 +227,21 @@ function maxIterationsFromEnv(): number | undefined {
 	return Number.isInteger(n) && n > 0 ? n : undefined
 }
 
+/**
+ * Resolve the plan-first session's iteration cap from
+ * $HEADLESSCODE_PLAN_FIRST_MAX_ITERATIONS (default: 15 — the plan session is
+ * deliberately SHORT: it must produce a plan, not implement it). Invalid
+ * values fall back to the default.
+ */
+function planFirstMaxIterationsFromEnv(): number {
+	const raw = process.env.HEADLESSCODE_PLAN_FIRST_MAX_ITERATIONS
+	if (raw === undefined || raw === "") {
+		return 15
+	}
+	const n = Number(raw)
+	return Number.isInteger(n) && n > 0 ? n : 15
+}
+
 export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOptions; error?: string } {
 	const options: OrchestrateOptions = {
 		repo: "",
@@ -216,6 +257,9 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 		maxReworkCycles: 3,
 		maxContinuations: 3,
 		maxIterations: maxIterationsFromEnv(),
+		planFirst: false,
+		planFirstMode: process.env.HEADLESSCODE_PLAN_FIRST_MODE ?? "architect",
+		planFirstMaxIterations: planFirstMaxIterationsFromEnv(),
 		preflight: true,
 		dryRun: false,
 		help: false,
@@ -347,6 +391,26 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 					return { options, error: "--max-continuations requires a positive integer" }
 				}
 				options.maxContinuations = n
+				break
+			}
+			case "--plan-first":
+				options.planFirst = true
+				break
+			case "--plan-first-mode": {
+				const v = next()
+				if (v === undefined) {
+					return { options, error: "Missing value for --plan-first-mode" }
+				}
+				options.planFirstMode = v
+				break
+			}
+			case "--plan-first-max-iterations": {
+				const v = next()
+				const n = v === undefined ? Number.NaN : Number(v)
+				if (!Number.isInteger(n) || n <= 0) {
+					return { options, error: "--plan-first-max-iterations requires a positive integer" }
+				}
+				options.planFirstMaxIterations = n
 				break
 			}
 			case "--no-review":
@@ -536,7 +600,62 @@ export function buildTaskFileContent(spec: WorktreeSpec, issues: SplitIssue[]): 
 	].join("\n")
 }
 
-export function writeTaskFiles(repo: string, specs: WorktreeSpec[], issues: SplitIssue[]): string[] {
+/**
+ * Issue #49 plan-first task content: the task file for the SHORT architect-mode
+ * planning session that runs INSIDE the fresh worktree before the code worker.
+ * The planner must produce a compact implementation plan (written to PLAN.md at
+ * the workspace root, overwriting any previous plan) and stop — never
+ * implement, never edit source, never ask the human, never switch modes. The
+ * spawner appends PLAN.md into ORCHESTRATOR_TASK.md so the code worker that
+ * follows executes against it. Reuses the other task files' conventions (rules
+ * preamble, scope line).
+ */
+export function buildPlanFirstTaskFileContent(group: { name: string; issues?: number[] }): string {
+	const assigned = (group.issues ?? []).map((n) => `#${n}`).join(", ") || "this worktree"
+	const ghLines = (group.issues ?? []).map((n) => `gh issue view ${n}`).join("\n")
+	return [
+		"Before anything else: read `.roo/rules-code/rules.md` in full (or `.roo/rules/rules.md` if",
+		"rules-code is absent) and treat it as binding for this entire session, regardless of whether",
+		"it auto-loaded for whatever mode you're running in — don't assume it applied, read it yourself.",
+		"",
+		"You are the PLANNING phase of an autonomous two-phase workflow, running in an isolated git",
+		"worktree on your own branch. Your ONLY job is to produce a compact, actionable implementation",
+		"plan for the code session that follows. Read this entire file before doing anything.",
+		"",
+		"## Your assignment (planning only — DO NOT implement)",
+		"",
+		`Assigned issues: ${assigned}. Fetch each issue's real body yourself:`,
+		"```",
+		ghLines || "# (no issue numbers recorded — read ORCHESTRATOR_TASK.md for the full task)",
+		"```",
+		"",
+		"1. Read `ORCHESTRATOR_TASK.md` at the workspace root — it is the FULL task the code session",
+		"   must execute. Read the assigned issues' real bodies (via gh issue view above).",
+		"2. Explore the codebase just enough to ground the plan (grep/read the files the issues touch).",
+		"3. Write the plan to `PLAN.md` at the workspace root (OVERWRITE any existing PLAN.md) as a",
+		"   compact markdown document: goal, concrete steps (files + functions), verification steps",
+		"   (tests/boot), and any risks. A code session will execute it — make every step something",
+		"   another session can act on without re-doing your exploration.",
+		"4. Finish with attempt_completion summarizing where the plan was written.",
+		"",
+		"## Constraints",
+		"",
+		"- DO NOT implement anything: no source edits, no commits, no pushes, no PRs.",
+		"- DO NOT ask the human questions — you are headless; decide autonomously and write the plan.",
+		"- DO NOT use switch_mode — this session ends with attempt_completion, period.",
+		"- Keep the plan SHORT (a compact plan beats a tome; the code session re-verifies anything it",
+		"  doubts before trusting it).",
+		"",
+		`Scope: ${assigned} only — planning phase.`,
+	].join("\n")
+}
+
+export function writeTaskFiles(
+	repo: string,
+	specs: WorktreeSpec[],
+	issues: SplitIssue[],
+	opts: { planFirst?: boolean } = {},
+): string[] {
 	const dir = path.join(repo, "plans", "parallel-tasks")
 	fs.mkdirSync(dir, { recursive: true })
 	const written: string[] = []
@@ -544,6 +663,16 @@ export function writeTaskFiles(repo: string, specs: WorktreeSpec[], issues: Spli
 		const target = path.join(dir, spec.taskFile)
 		fs.writeFileSync(target, buildTaskFileContent(spec, issues), "utf-8")
 		written.push(target)
+		if (opts.planFirst) {
+			// Issue #49: the plan-first session's task file (the spawner copies
+			// it into the worktree as ORCHESTRATOR_PLAN.md and runs it BEFORE
+			// the code worker). Named `<name>-plan.md` — the spawner derives it
+			// from the worktree name alone, so a standalone spawner invocation
+			// can fall back to a generic planner prompt when it is absent.
+			const planTarget = path.join(dir, `${spec.name}-plan.md`)
+			fs.writeFileSync(planTarget, buildPlanFirstTaskFileContent(spec), "utf-8")
+			written.push(planTarget)
+		}
 	}
 	return written
 }
@@ -1203,6 +1332,12 @@ export interface BuildSpawnEnvOptions {
 	memoryDir?: string
 	/** Per-session iteration cap forwarded as HEADLESSCODE_MAX_ITERATIONS (run-worker.sh → --max-iterations). */
 	maxIterations?: number
+	/** Issue #49: run a plan-first session per worktree before the code worker (forwarded as PLAN_FIRST=1). */
+	planFirst?: boolean
+	/** Mode slug for the plan-first session (default: architect). */
+	planFirstMode?: string
+	/** Iteration cap for the plan-first session (default: 15). */
+	planFirstMaxIterations?: number
 	/** Env to read OPENROUTER_MODEL from (default: process.env). */
 	env?: NodeJS.ProcessEnv
 }
@@ -1258,6 +1393,15 @@ export function buildSpawnEnv(options: BuildSpawnEnvOptions): { env: NodeJS.Proc
 		...(process.env.HEADLESSCODE_LOCAL_EXPLORE_CONTEXT_TOKENS
 			? { HEADLESSCODE_LOCAL_EXPLORE_CONTEXT_TOKENS: process.env.HEADLESSCODE_LOCAL_EXPLORE_CONTEXT_TOKENS }
 			: {}),
+		// Issue #49 plan-first experiment: forwarded to the spawner, which runs
+		// a short architect-mode planning session in each worktree BEFORE
+		// launching the code worker and appends the plan (PLAN.md) to the
+		// worker's task file. Only set when --plan-first is on — never the
+		// default. PLAN_FIRST_MODE/MAX_ITERATIONS are only meaningful when
+		// PLAN_FIRST is set, so they travel together.
+		...(options.planFirst ? { PLAN_FIRST: "1" } : {}),
+		...(options.planFirst ? { PLAN_FIRST_MODE: options.planFirstMode ?? "architect" } : {}),
+		...(options.planFirst ? { PLAN_FIRST_MAX_ITERATIONS: String(options.planFirstMaxIterations ?? 15) } : {}),
 	}
 	return { env, workerModel }
 }
@@ -1270,6 +1414,8 @@ function printPlan(
 	models?: { worker: string; reviewer: string; qa: string },
 	maxIterations?: number,
 	estimateSection?: string[],
+	/** Issue #49: plan-first session info to surface on the dry-run plan. */
+	planFirst?: { mode: string; maxIterations: number },
 ): void {
 	// Shape labels come from split.ts's issueShape (the SAME taxonomy the
 	// split and the cost estimate use) — a single source of truth instead of
@@ -1285,6 +1431,12 @@ function printPlan(
 	process.stdout.write("── Orchestrate plan (dry run) ─────────────────────────────\n")
 	process.stdout.write(`  repo:     ${repo}\n`)
 	process.stdout.write(`  mode:     ${mode}\n`)
+	if (planFirst) {
+		process.stdout.write(
+			`  plan-first: mode ${planFirst.mode}, max ${planFirst.maxIterations} iterations per worktree ` +
+				`(issue #49 — plan session runs BEFORE each code worker)\n`,
+		)
+	}
 	process.stdout.write(
 		maxIterations !== undefined
 			? `  max iterations: ${maxIterations} (workers get --max-iterations ${maxIterations})\n`
@@ -2028,7 +2180,11 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 			worker: previewModel(options.mode),
 			reviewer: previewModel(options.reviewMode),
 			qa: previewModel(options.qaMode),
-		}, options.maxIterations, estimateSection)
+		}, options.maxIterations, estimateSection,
+			options.planFirst
+				? { mode: options.planFirstMode, maxIterations: options.planFirstMaxIterations }
+				: undefined,
+		)
 		return 0
 	}
 
@@ -2128,7 +2284,7 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	}
 
 	// 1b. Task files.
-	const written = writeTaskFiles(repo, specs, issues)
+	const written = writeTaskFiles(repo, specs, issues, { planFirst: options.planFirst })
 	process.stdout.write(`Wrote ${written.length} task file(s) under ${path.join(repo, "plans", "parallel-tasks")}\n`)
 
 	// 1c. Per-mode model assignment for the WORKER'S FIRST SPAWN. This must
@@ -2144,6 +2300,9 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		explicitModel: options.model,
 		memoryDir: options.memoryDir,
 		maxIterations: options.maxIterations,
+		planFirst: options.planFirst,
+		planFirstMode: options.planFirstMode,
+		planFirstMaxIterations: options.planFirstMaxIterations,
 		env: process.env,
 	})
 

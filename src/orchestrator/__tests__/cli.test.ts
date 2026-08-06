@@ -14,6 +14,7 @@ import * as path from "node:path"
 
 import {
 	buildContinuationTaskFileContent,
+	buildPlanFirstTaskFileContent,
 	buildQaReworkTaskFileContent,
 	buildReworkTaskFileContent,
 	buildSpawnEnv,
@@ -24,6 +25,7 @@ import {
 	handleReviewVerdict,
 	orchestrateMain,
 	parseOrchestrateArgs,
+	writeTaskFiles,
 } from "../cli.js"
 import { appendCostHistoryRecord } from "../cost-history.js"
 import { watchGroups } from "../watch.js"
@@ -794,6 +796,140 @@ async function testSpawnEnvCarriesMaxIterations(): Promise<void> {
 	}
 }
 
+// ─── --plan-first (issue #49) ────────────────────────────────────────────────
+
+async function testParseOrchestrateArgsPlanFirst(): Promise<void> {
+	// Ambient-proof: HEADLESSCODE_PLAN_FIRST_MODE / _MAX_ITERATIONS are real
+	// knobs an operator may legitimately have exported — the default case must
+	// not depend on the ambient env being clean.
+	const savedMode = process.env.HEADLESSCODE_PLAN_FIRST_MODE
+	const savedMax = process.env.HEADLESSCODE_PLAN_FIRST_MAX_ITERATIONS
+	delete process.env.HEADLESSCODE_PLAN_FIRST_MODE
+	delete process.env.HEADLESSCODE_PLAN_FIRST_MAX_ITERATIONS
+	try {
+		// Opt-in: OFF by default (the issue is explicit that plan-first must
+		// never be the default without evidence).
+		const def = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1"])
+		assert.equal(def.error, undefined)
+		assert.equal(def.options.planFirst, false, "plan-first is OFF by default")
+		assert.equal(def.options.planFirstMode, "architect", "default plan-first mode is architect")
+		assert.equal(def.options.planFirstMaxIterations, 15, "default plan-first cap is 15 (deliberately short)")
+
+		// --plan-first alone turns it on with the defaults.
+		const on = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1", "--plan-first"])
+		assert.equal(on.error, undefined)
+		assert.equal(on.options.planFirst, true, "--plan-first turns the phase on")
+		assert.equal(on.options.planFirstMode, "architect", "mode defaults to architect when not overridden")
+		assert.equal(on.options.planFirstMaxIterations, 15, "cap defaults to 15 when not overridden")
+
+		// Custom mode + cap.
+		const custom = parseOrchestrateArgs([
+			"--repo", "/tmp/x", "--issue", "1",
+			"--plan-first", "--plan-first-mode", "planner", "--plan-first-max-iterations", "8",
+		])
+		assert.equal(custom.error, undefined)
+		assert.equal(custom.options.planFirst, true)
+		assert.equal(custom.options.planFirstMode, "planner", "custom plan-first mode honored")
+		assert.equal(custom.options.planFirstMaxIterations, 8, "custom plan-first cap honored")
+
+		// Invalid values are rejected like every other numeric knob.
+		const bad = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1", "--plan-first-max-iterations", "x"])
+		assert.ok(bad.error && bad.error.includes("positive integer"), "non-numeric plan-first cap is rejected")
+		const zero = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1", "--plan-first-max-iterations", "0"])
+		assert.ok(zero.error && zero.error.includes("positive integer"), "0 plan-first cap is rejected")
+	} finally {
+		if (savedMode === undefined) {
+			delete process.env.HEADLESSCODE_PLAN_FIRST_MODE
+		} else {
+			process.env.HEADLESSCODE_PLAN_FIRST_MODE = savedMode
+		}
+		if (savedMax === undefined) {
+			delete process.env.HEADLESSCODE_PLAN_FIRST_MAX_ITERATIONS
+		} else {
+			process.env.HEADLESSCODE_PLAN_FIRST_MAX_ITERATIONS = savedMax
+		}
+	}
+}
+
+async function testBuildPlanFirstTaskFileContent(): Promise<void> {
+	const content = buildPlanFirstTaskFileContent({ name: "w1", issues: [27, 29] })
+	assert.ok(content.includes("PLANNING phase"), "names the planning role")
+	assert.ok(content.includes("ORCHESTRATOR_TASK.md"), "points the planner at the worker's full task file")
+	assert.ok(content.includes("PLAN.md"), "tells the planner where to write the plan")
+	assert.ok(content.includes("#27, #29"), "original issue numbers included")
+	assert.ok(content.includes("gh issue view 27") && content.includes("gh issue view 29"), "gh fetch lines included")
+	assert.ok(content.includes("DO NOT implement"), "planning only — no implementation")
+	assert.ok(content.includes("DO NOT ask the human"), "headless — no clarifying questions")
+	assert.ok(content.includes("DO NOT use switch_mode"), "the planner must end with attempt_completion")
+	assert.ok(content.includes("Scope: #27, #29 only — planning phase."), "scope line present")
+
+	// A group with no recorded issues must still produce a valid planner task.
+	const noIssues = buildPlanFirstTaskFileContent({ name: "w1" })
+	assert.ok(noIssues.includes("read ORCHESTRATOR_TASK.md"), "no-issues fallback directs the planner to the task file")
+}
+
+async function testWriteTaskFilesWritesPlanFilesWhenPlanFirst(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const specs = [
+			{ name: "w1", issues: [1], taskFile: "w1-issue1.md" },
+			{ name: "w2", issues: [2], taskFile: "w2-issue2.md" },
+		]
+		const issues = [
+			{ number: 1, title: "t1", body: "b1" },
+			{ number: 2, title: "t2", body: "b2" },
+		]
+
+		// Plain round: only the worker task files.
+		const plain = writeTaskFiles(repo, specs, issues)
+		assert.equal(plain.length, 2, "plain round writes only the worker task files")
+		assert.ok(plain.some((p) => p.endsWith("w1-issue1.md")))
+		assert.ok(!plain.some((p) => p.includes("-plan.md")), "no plan files without planFirst")
+
+		// Plan-first round: worker task files PLUS <name>-plan.md per spec.
+		const planned = writeTaskFiles(repo, specs, issues, { planFirst: true })
+		assert.equal(planned.length, 4, "plan-first round writes worker + plan task files")
+		const planW1 = await fs.readFile(path.join(repo, "plans", "parallel-tasks", "w1-plan.md"), "utf-8")
+		assert.ok(planW1.includes("PLANNING phase"), "w1-plan.md is the planner task")
+		assert.ok(
+			await fs
+				.readFile(path.join(repo, "plans", "parallel-tasks", "w1-issue1.md"), "utf-8")
+				.then((c) => c.includes("## Your assignment")),
+			"the worker task file is unchanged",
+		)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testSpawnEnvCarriesPlanFirst(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		// Off (the default): none of the PLAN_FIRST* vars leak into the env.
+		const off = buildSpawnEnv({ repo, mode: "code", env: {} })
+		assert.equal(off.env.PLAN_FIRST, undefined, "no PLAN_FIRST when plan-first is off")
+		assert.equal(off.env.PLAN_FIRST_MODE, undefined, "no PLAN_FIRST_MODE when plan-first is off")
+		assert.equal(off.env.PLAN_FIRST_MAX_ITERATIONS, undefined, "no PLAN_FIRST_MAX_ITERATIONS when plan-first is off")
+
+		// On: the spawner needs mode + cap to run the plan session.
+		const on = buildSpawnEnv({ repo, mode: "code", planFirst: true, planFirstMode: "architect", planFirstMaxIterations: 8, env: {} })
+		assert.equal(on.env.PLAN_FIRST, "1", "PLAN_FIRST=1 reaches the spawner")
+		assert.equal(on.env.PLAN_FIRST_MODE, "architect", "PLAN_FIRST_MODE reaches the spawner")
+		assert.equal(on.env.PLAN_FIRST_MAX_ITERATIONS, "8", "PLAN_FIRST_MAX_ITERATIONS reaches the spawner")
+
+		// Defaults when only planFirst is given.
+		const defaults = buildSpawnEnv({ repo, mode: "code", planFirst: true, env: {} })
+		assert.equal(defaults.env.PLAN_FIRST_MODE, "architect", "mode defaults to architect")
+		assert.equal(defaults.env.PLAN_FIRST_MAX_ITERATIONS, "15", "cap defaults to 15")
+
+		// The rest of the spawn env contract is untouched.
+		assert.equal(on.env.ORCHESTRATOR_MODE, "code")
+		assert.equal(on.env.TARGET_REPO, repo)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 // ─── buildContinuationTaskFileContent ────────────────────────────────────────
 
 async function testContinuationTaskFileContentIncludesIssuesAndCycle(): Promise<void> {
@@ -1292,6 +1428,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["--max-iterations parses (env fallback, flag beats env, invalid)", testParseOrchestrateArgsMaxIterations],
 	["--max-continuations parses (default 3, custom, invalid)", testParseOrchestrateArgsMaxContinuations],
 	["spawn env carries HEADLESSCODE_MAX_ITERATIONS (flag > env, untouched when unset)", testSpawnEnvCarriesMaxIterations],
+	["--plan-first parses (default off, mode architect, cap 15, invalid rejected)", testParseOrchestrateArgsPlanFirst],
+	["plan-first task file instructs a planning-only session writing PLAN.md", testBuildPlanFirstTaskFileContent],
+	["writeTaskFiles writes <name>-plan.md per spec only when planFirst", testWriteTaskFilesWritesPlanFilesWhenPlanFirst],
+	["spawn env carries PLAN_FIRST/MODE/MAX_ITERATIONS only when plan-first is on", testSpawnEnvCarriesPlanFirst],
 	["continuation task file includes issues, cycle, and scope", testContinuationTaskFileContentIncludesIssuesAndCycle],
 	["iteration exhaustion below cap triggers continuation spawn + state reset", testExhaustionBelowCapSpawnsAndResetsState],
 	["iteration exhaustion increments from an existing continuation count", testExhaustionIncrementsFromExistingCount],

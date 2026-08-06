@@ -105,6 +105,13 @@ export interface StatusGroupRow {
 	 */
 	continuationCount?: number
 	reworkCount?: number
+	/**
+	 * Issue #49 plan-first outcome (undefined = round was not run with
+	 * --plan-first): the architect-mode planning session that ran before this
+	 * group's code worker, and whether a plan actually landed in the worker's
+	 * task file.
+	 */
+	planFirst?: OrchestratorGroup["plan_first"]
 }
 
 export interface StatusCounts {
@@ -188,6 +195,7 @@ export function buildStatusSummary(state: OrchestratorState): StatusSummary {
 			qaVerdict: g.qa?.verdict,
 			continuationCount: g.continuationCount,
 			reworkCount: g.reworkCount,
+			planFirst: g.plan_first,
 		}
 	})
 	return { batch: state.batch, updated: state.updated, groups, counts, totalUsage: state.totalUsage }
@@ -282,6 +290,9 @@ export function formatStatusText(
 			}
 			if (g.reworkCount !== undefined && g.reworkCount > 0) {
 				bits.push(`rework:${g.reworkCount}`)
+			}
+			if (g.planFirst !== undefined) {
+				bits.push(`plan-first:${g.planFirst.status}${g.planFirst.status === "ok" ? " (plan in task file)" : ""}`)
 			}
 			if (g.usageCostUsd !== undefined) {
 				bits.push(`$${g.usageCostUsd.toFixed(4)}`)

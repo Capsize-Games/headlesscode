@@ -61,7 +61,8 @@ cleanup() {
 		"${ISSUES_JSON:-}" "${DRYRUN_OUT:-}" "${SPAWN_OUT:-}" \
 		"${WATCH_OUT:-}" "${REVIEW_OUT:-}" "${WORKER_MOCK_LOG:-}" "${REVIEW_MOCK_LOG:-}" \
 		"${EXHAUST_MOCK_LOG:-}" "${CONT_SPAWN_OUT:-}" "${CONT_OUT:-}" \
-		"${STOP_SPAWN_OUT:-}" "${STOP_OUT:-}"
+		"${STOP_SPAWN_OUT:-}" "${STOP_OUT:-}" \
+		"${PLAN_MOCK_LOG:-}" "${PLAN_SPAWN_OUT:-}"
 	echo "  cleaned up temp fixture/bare/worktrees/logs (set KEEP=1 to retain)"
 }
 
@@ -70,7 +71,9 @@ start_mock() {
 	local logfile="$2"
 	local portvar="$3"
 	local env_extra=()
-	if [ "$scenario" = "success" ]; then
+	if [ "$scenario" = "success" ] || [ "$scenario" = "plan-first" ]; then
+		# plan-first: the code worker half of the scenario derives its fix
+		# content from the fixture exactly like the success scenario.
 		env_extra=(MOCK_FIXTURE_ROOT="$FIXTURE")
 	fi
 	(
@@ -211,6 +214,7 @@ cat > "$FIXTURE/.headlesscode/mode-models.json" <<'EOF'
 {
   "_default": "deepseek/deepseek-v4-flash",
   "code": "deepseek/deepseek-v4-flash",
+  "architect": "deepseek/architect-plan",
   "_condensation": "qwen/qwen3-8b"
 }
 EOF
@@ -645,6 +649,126 @@ else
 	fail "collision fixture: a leftover branch was deleted/modified"
 fi
 
+# ── 9.7. Plan-first phase (issue #49) ────────────────────────────────────────
+# An architect-mode planning session runs in the worktree BEFORE the code
+# worker; its plan (PLAN.md) is appended into ORCHESTRATOR_TASK.md so the
+# worker executes against it. The mock scenario "plan-first" serves BOTH
+# sessions on one port, dispatching on the MODEL field: the fixture maps the
+# "architect" mode to deepseek/architect-plan (plan script: explore -> write
+# PLAN.md -> complete), while the code worker's model falls through to the
+# standard success script. Assertions: the plan phase ran first, the plan
+# landed in ORCHESTRATOR_TASK.md, the worker still completed + fixed the bug,
+# and the state records plan_first.status=ok.
+echo "== [9.7/10] plan-first (issue #49): architect plan session before the code worker =="
+PLAN_MOCK_LOG="$(mktemp /tmp/headlesscode-e2e-phase2-plan-mock-XXXXXX.log)"
+start_mock plan-first "$PLAN_MOCK_LOG" PLAN_PORT
+cat > "$FIXTURE/plans/parallel-tasks/w7-issue7.md" <<'EOF'
+## Your assignment
+
+Fix the bug in src/greet.js: greet() must return "Hello, " + name (issue #7).
+
+## Workflow
+
+1. Read src/greet.js.
+2. Patch it with write_to_file.
+3. Verify with `node src/greet.test.js`.
+4. Report via attempt_completion.
+EOF
+# The plan-first session's task file — what the orchestrator writes for a
+# --plan-first round (buildPlanFirstTaskFileContent); the spawner copies it
+# into the worktree as ORCHESTRATOR_PLAN.md and runs it BEFORE the worker.
+cat > "$FIXTURE/plans/parallel-tasks/w7-plan.md" <<'EOF'
+## Planning phase
+
+Produce a compact implementation plan for ORCHESTRATOR_TASK.md (issue #7) and
+write it to PLAN.md at the workspace root. DO NOT implement anything.
+EOF
+PLAN_SPAWN_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-plan-spawn-XXXXXX.out)"
+(
+	cd "$ROOT" &&
+		TARGET_REPO="$FIXTURE" \
+		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
+		OPENROUTER_BASE_URL="http://127.0.0.1:$PLAN_PORT" \
+		HEADLESSCODE_ROOT="$ROOT" \
+		ALLOW_UNINDEXED=1 \
+		PLAN_FIRST=1 \
+		bash scripts/spawn-parallel-worktrees.sh w7:6:plans/parallel-tasks/w7-issue7.md
+) >"$PLAN_SPAWN_OUT" 2>&1
+PLAN_SPAWN_EXIT=$?
+if [ "$PLAN_SPAWN_EXIT" -eq 0 ] && [ -d "$FIXTURE/.worktrees/w7" ]; then
+	pass "plan-first: worktree w7 spawned with PLAN_FIRST=1"
+else
+	fail "plan-first: w7 spawn failed (exit $PLAN_SPAWN_EXIT)"
+	tail -n 25 "$PLAN_SPAWN_OUT" >&2
+fi
+WORKTREE_NAMES="$WORKTREE_NAMES w7"
+
+# The plan session ran BEFORE the worker: PLAN.md exists, and the plan was
+# appended into ORCHESTRATOR_TASK.md under the Implementation-plan section.
+if grep -q "Plan-first phase for 'w7' (mode architect" "$PLAN_SPAWN_OUT" &&
+	grep -q "appended to ORCHESTRATOR_TASK.md" "$PLAN_SPAWN_OUT"; then
+	pass "plan-first: spawner ran the architect planning session and appended the plan"
+else
+	fail "plan-first: spawn output missing the plan-first phase lines"
+	tail -n 25 "$PLAN_SPAWN_OUT" >&2
+fi
+if [ -s "$FIXTURE/.worktrees/w7/PLAN.md" ] &&
+	grep -q "mock plan-first" "$FIXTURE/.worktrees/w7/PLAN.md"; then
+	pass "plan-first: PLAN.md written by the plan session"
+else
+	fail "plan-first: PLAN.md missing or wrong content"
+fi
+if grep -q "## Implementation plan (from the plan-first phase)" "$FIXTURE/.worktrees/w7/ORCHESTRATOR_TASK.md" &&
+	grep -q "mock plan-first" "$FIXTURE/.worktrees/w7/ORCHESTRATOR_TASK.md"; then
+	pass "plan-first: plan appended into ORCHESTRATOR_TASK.md for the code worker"
+else
+	fail "plan-first: ORCHESTRATOR_TASK.md lacks the appended plan section"
+fi
+
+# The code worker still ran normally after the plan phase and completed.
+W7_DONE=0
+for _ in $(seq 1 120); do
+	if [ -d "$FIXTURE/.worktrees/w7/.harness.done" ]; then
+		W7_DONE=1
+		break
+	fi
+	sleep 1
+done
+W7_EXIT="$(cat "$FIXTURE/.worktrees/w7/.harness.exit" 2>/dev/null || echo '')"
+if [ "$W7_DONE" -eq 1 ] && [ "$W7_EXIT" = "0" ]; then
+	pass "plan-first: code worker completed after the plan phase (exit 0)"
+else
+	fail "plan-first: worker did not complete after the plan (exit $W7_EXIT)"
+	tail -n 20 "$FIXTURE/.worktrees/w7/harness.log" 2>/dev/null >&2 || true
+fi
+if grep -q 'return "Hello, " + name' "$FIXTURE/.worktrees/w7/src/greet.js"; then
+	pass "plan-first: worker really fixed the fixture bug"
+else
+	fail "plan-first: expected the mock-derived fix in w7"
+fi
+
+# The plan session used the architect mode's model; the worker used the code
+# model. Both must appear in the plan-first mock's request log.
+if grep -q "model=deepseek/architect-plan" "$PLAN_MOCK_LOG" &&
+	grep -q "model=deepseek/deepseek-v4-flash" "$PLAN_MOCK_LOG"; then
+	pass "plan-first: mock saw the plan session (architect model) + the worker (code model)"
+else
+	fail "plan-first: mock log missing the plan and/or worker model requests"
+	tail -n 15 "$PLAN_MOCK_LOG" >&2
+fi
+
+# The state file records the plan-first outcome for the group (multi-line JSON
+# from merge_state's pretty-printer, so match with -A4).
+if grep -q '"name": "w7"' "$FIXTURE/.worktrees/.orchestrator-state.json" &&
+	grep -A4 '"plan_first"' "$FIXTURE/.worktrees/.orchestrator-state.json" | grep -q '"mode": "architect"' &&
+	grep -A4 '"plan_first"' "$FIXTURE/.worktrees/.orchestrator-state.json" | grep -q '"status": "ok"' &&
+	grep -A4 '"plan_first"' "$FIXTURE/.worktrees/.orchestrator-state.json" | grep -q '"report": "PLAN.md"'; then
+	pass "plan-first: state records plan_first ok for w7"
+else
+	fail "plan-first: state file missing the plan_first ok record for w7"
+	grep -o '"name": "w7".*' "$FIXTURE/.worktrees/.orchestrator-state.json" >&2 || true
+fi
+
 # ── 10. Summary + cleanup ────────────────────────────────────────────────────
 TOTAL=$((PASS + FAIL))
 echo ""
@@ -652,6 +776,7 @@ echo "────────────────────────�
 echo "  fixture:        $FIXTURE"
 echo "  worker mock:    $WORKER_PORT ($WORKER_REQ_COUNT requests)"
 echo "  review mock:    $REVIEW_PORT"
+echo "  plan-first mock: $PLAN_PORT (issue #49)"
 echo "  results:        PASS $PASS / $TOTAL   FAIL $FAIL / $TOTAL"
 if [ "$FAIL" -eq 0 ]; then
 	echo "  RESULT: PASS"

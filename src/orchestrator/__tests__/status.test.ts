@@ -58,6 +58,42 @@ async function testFormattedTextOmitsZeroCounts(): Promise<void> {
 	assert.ok(!text.includes("rework:"), `zero rework count should not render, got: ${text}`)
 }
 
+// ─── plan-first visibility (issue #49) ───────────────────────────────────────
+
+async function testSummaryCarriesPlanFirst(): Promise<void> {
+	const state = stateOf([baseGroup({ plan_first: { mode: "architect", status: "ok", report: "PLAN.md" } })])
+	const summary = buildStatusSummary(state)
+	assert.deepEqual(summary.groups[0]?.planFirst, { mode: "architect", status: "ok", report: "PLAN.md" })
+}
+
+async function testSummaryLeavesPlanFirstUndefinedWhenNotRun(): Promise<void> {
+	const state = stateOf([baseGroup()])
+	const summary = buildStatusSummary(state)
+	assert.equal(summary.groups[0]?.planFirst, undefined)
+}
+
+async function testFormattedTextShowsPlanFirstOk(): Promise<void> {
+	const state = stateOf([baseGroup({ plan_first: { mode: "architect", status: "ok", report: "PLAN.md" } })])
+	const summary = buildStatusSummary(state)
+	const text = formatStatusText(summary, { repo: "/tmp/repo", statePath: "/tmp/state.json" })
+	assert.match(text, /plan-first:ok \(plan in task file\)/)
+}
+
+async function testFormattedTextShowsPlanFirstFailed(): Promise<void> {
+	const state = stateOf([baseGroup({ plan_first: { mode: "architect", status: "failed" } })])
+	const summary = buildStatusSummary(state)
+	const text = formatStatusText(summary, { repo: "/tmp/repo", statePath: "/tmp/state.json" })
+	assert.match(text, /plan-first:failed/)
+	assert.ok(!text.includes("(plan in task file)"), "failed plan must not claim a plan is in the task file")
+}
+
+async function testFormattedTextOmitsPlanFirstWhenNotRun(): Promise<void> {
+	const state = stateOf([baseGroup()])
+	const summary = buildStatusSummary(state)
+	const text = formatStatusText(summary, { repo: "/tmp/repo", statePath: "/tmp/state.json" })
+	assert.ok(!text.includes("plan-first:"), `plan-first should not render for a plain round, got: ${text}`)
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: [string, () => Promise<void>][] = [
@@ -65,6 +101,11 @@ const tests: [string, () => Promise<void>][] = [
 	["buildStatusSummary leaves counts undefined when never triggered", testSummaryLeavesCountsUndefinedWhenNeverTriggered],
 	["formatStatusText shows continued:/rework: when > 0", testFormattedTextShowsContinuationAndRework],
 	["formatStatusText omits continued:/rework: when 0", testFormattedTextOmitsZeroCounts],
+	["buildStatusSummary carries plan_first when the round used --plan-first", testSummaryCarriesPlanFirst],
+	["buildStatusSummary leaves plan_first undefined for a plain round", testSummaryLeavesPlanFirstUndefinedWhenNotRun],
+	["formatStatusText shows plan-first:ok (plan in task file)", testFormattedTextShowsPlanFirstOk],
+	["formatStatusText shows plan-first:failed without claiming a plan", testFormattedTextShowsPlanFirstFailed],
+	["formatStatusText omits plan-first for a plain round", testFormattedTextOmitsPlanFirstWhenNotRun],
 ]
 
 async function main(): Promise<void> {
