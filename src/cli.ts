@@ -31,6 +31,7 @@ import { dashboardMain } from "./dashboard/cli.js"
 import { trendMain } from "./dashboard/trend-cli.js"
 import { indexMain } from "./codesearch/cli.js"
 import { codemapMain } from "./codemap/cli.js"
+import { initMain } from "./init/cli.js"
 import { provisionMain, pushPrMain } from "./github/cli.js"
 import { decisionProxyMain } from "./decision-proxy/cli.js"
 import { migrateMain } from "./migrate/cli.js"
@@ -195,6 +196,12 @@ Subcommands:
               fingerprint-aware (an unchanged repo writes nothing). --watch
               turns it into a long-running poll loop. See
               \`npx tsx src/cli.ts codemap --help\` for full options.
+  headlesscode init --workspace <path> [--skip-index] [--skip-codemap]
+              Register a new project in one step: resolves the central data
+              dir, detects the stack(s) (drives per-session instruction
+              selection), ensures .gitignore excludes .headlesscode/, then
+              builds the codesearch index + codemap. See
+              \`npx tsx src/cli.ts init --help\` for full options.
   headlesscode provision --installation-id <id> --owner <o> --repo <r> --target <dir>
               Clone a GitHub repo the App installation can access into a local
               dir (token stripped from the remote URL), ready as a
@@ -658,6 +665,13 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// pipeline — mechanical, deterministic, cheap to regenerate.
 	if (argv[0] === "codemap") {
 		return codemapMain(argv.slice(1))
+	}
+
+	// One-command project registration subcommand: `headlesscode init ...` —
+	// resolve central data dir + detect stacks + ensure .gitignore excludes
+	// .headlesscode/ + build index + codemap in one step (see src/init/).
+	if (argv[0] === "init") {
+		return initMain(argv.slice(1))
 	}
 
 	// GitHub App repo provisioning subcommand: `headlesscode provision ...` —
