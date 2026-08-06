@@ -56,6 +56,7 @@ export {
 	parseCleanupArgs,
 	planCleanup,
 	removeHarnessArtifacts,
+	removeKnownSafeArtifacts,
 	resolveBaseBranch,
 	resolveGroupBranch,
 	worktreeUncommitted,

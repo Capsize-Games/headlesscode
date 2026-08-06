@@ -22,6 +22,7 @@ import {
 	cleanupMain,
 	parseCleanupArgs,
 	planCleanup,
+	removeKnownSafeArtifacts,
 	type CleanupDeps,
 	type CleanupStatus,
 	type GhWiring,
@@ -341,6 +342,7 @@ async function testHarnessArtifactsDoNotBlockAndAreRemoved(): Promise<void> {
 		// The harness's own untracked residue must NOT count as dirt — a real
 		// round always leaves these.
 		await fsp.mkdir(path.join(f.wtPath, ".harness.done"), { recursive: true })
+		await fsp.writeFile(path.join(f.wtPath, ".harness.pgid"), "12345\n", "utf-8")
 		await fsp.writeFile(path.join(f.wtPath, "harness.log"), "worker log\n")
 		await fsp.mkdir(path.join(f.wtPath, ".headlesscode", "codesearch"), { recursive: true })
 		await fsp.writeFile(path.join(f.wtPath, ".headlesscode", "mode-models.json"), "{}\n")
@@ -355,6 +357,89 @@ async function testHarnessArtifactsDoNotBlockAndAreRemoved(): Promise<void> {
 		assert.equal(code, 0)
 		assert.ok(!fs.existsSync(f.wtPath), "worktree removed even with harness artifacts present")
 		assert.equal(git(f.repo, ["branch", "--list", f.branch]), "", "branch deleted")
+	} finally {
+		await fsp.rm(f.repo, { recursive: true, force: true })
+	}
+}
+
+async function testKnownSafeResidueDoesNotBlockAndIsRemoved(): Promise<void> {
+	// Build a fixture with a TRACKED python source tree (src/pkg/__init__.py)
+	// committed on main BEFORE the worktree is created, so the worktree's
+	// checkout contains it and the nested __pycache__ shows up at its real path
+	// — the exact shape of the reported friction (a fully-untracked src/ would
+	// collapse to `?? src/` and must still block, since it could contain
+	// anything human).
+	const repo = await makeRepoBase()
+	await fsp.mkdir(path.join(repo, "src", "pkg"), { recursive: true })
+	await fsp.writeFile(path.join(repo, "src", "pkg", "__init__.py"), "pkg\n")
+	git(repo, ["add", "src/pkg/__init__.py"])
+	git(repo, ["commit", "-qm", "track a python package"])
+	const { wtPath, branch } = await makeWorktree(repo)
+	await commitInWorktree(wtPath)
+	git(repo, ["merge", "-q", "--no-edit", branch])
+	const f: Fixture = { repo, branch, wtPath, statePath: path.join(repo, ".worktrees", ".orchestrator-state.json") }
+	saveStateSync(f.statePath, stateWithGroup(f, { status: "done" }))
+	try {
+		// Worker/QA residue that must NOT count as dirt (issue #38): a
+		// node_modules symlink (a symlink does not match the dir-only
+		// `node_modules/` gitignore pattern, so git reports it untracked), a
+		// nested __pycache__ dir next to tracked sources, and a stray .pyc.
+		const symlinkTarget = await fsp.mkdtemp(path.join(os.tmpdir(), "headlesscode-nm-target-"))
+		await fsp.writeFile(path.join(symlinkTarget, "dep.js"), "module.exports = 1\n")
+		await fsp.symlink(symlinkTarget, path.join(f.wtPath, "node_modules"), "dir")
+		await fsp.mkdir(path.join(f.wtPath, "src", "pkg", "__pycache__"), { recursive: true })
+		await fsp.writeFile(path.join(f.wtPath, "src", "pkg", "__pycache__", "mod.cpython-312.pyc"), "b0")
+		await fsp.writeFile(path.join(f.wtPath, "stray.pyc"), "b0")
+		const porcelain = git(f.wtPath, ["status", "--porcelain"]).split("\n")
+		assert.ok(porcelain.some((l) => l.startsWith("?? node_modules")), "the node_modules symlink is genuinely untracked (the reported blocker)")
+		assert.ok(porcelain.some((l) => l.startsWith("?? src/pkg/__pycache__")), "the nested __pycache__ shows at its real path")
+
+		const dry = capture()
+		const dryCode = await cleanupMain(["--repo", f.repo, "--dry-run"], dry.io)
+		assert.equal(dryCode, 0)
+		assert.match(dry.out.join(""), /w1\s+eligible/, "known-safe residue alone does not block cleanup")
+		assert.ok(!dry.out.join("").includes("node_modules"), "node_modules is not listed as a blocker")
+
+		const cap = capture()
+		const code = await cleanupMain(["--repo", f.repo, "--apply"], cap.io)
+		assert.equal(code, 0)
+		assert.ok(!fs.existsSync(f.wtPath), "worktree removed even with known-safe residue present")
+		assert.equal(git(f.repo, ["branch", "--list", f.branch]), "", "branch deleted")
+		assert.ok(fs.existsSync(symlinkTarget), "the node_modules symlink TARGET survives (only the link is removed)")
+	} finally {
+		await fsp.rm(f.repo, { recursive: true, force: true })
+	}
+}
+
+async function testRemoveKnownSafeArtifactsNeverTouchesTrackedFiles(): Promise<void> {
+	const repo = await makeRepoBase()
+	// A repo that TRACKS a path under a known-safe name (committed on main
+	// before the worktree, so the worktree's checkout contains it).
+	await fsp.mkdir(path.join(repo, "__pycache__"), { recursive: true })
+	await fsp.writeFile(path.join(repo, "__pycache__", "tracked.txt"), "tracked\n")
+	git(repo, ["add", "__pycache__/tracked.txt"])
+	git(repo, ["commit", "-qm", "track a pycache file"])
+	const { wtPath, branch } = await makeWorktree(repo)
+	await commitInWorktree(wtPath)
+	git(repo, ["merge", "-q", "--no-edit", branch])
+	const f: Fixture = { repo, branch, wtPath, statePath: path.join(repo, ".worktrees", ".orchestrator-state.json") }
+	saveStateSync(f.statePath, stateWithGroup(f, { status: "done" }))
+	try {
+		// The removal step must delete ONLY untracked residue, never tracked
+		// files — deleting a tracked file would itself dirty the worktree and
+		// defeat the no-force `git worktree remove`.
+		await fsp.writeFile(path.join(f.wtPath, "__pycache__", "stray.pyc"), "b0")
+
+		removeKnownSafeArtifacts(f.wtPath)
+		assert.ok(fs.existsSync(path.join(f.wtPath, "__pycache__", "tracked.txt")), "tracked files under a known-safe name survive")
+		assert.ok(!fs.existsSync(path.join(f.wtPath, "__pycache__", "stray.pyc")), "untracked residue is removed")
+
+		// Only the untracked residue was removed, so cleanup --apply proceeds
+		// and removes the worktree for real.
+		const cap = capture()
+		const code = await cleanupMain(["--repo", f.repo, "--apply"], cap.io)
+		assert.equal(code, 0)
+		assert.ok(!fs.existsSync(f.wtPath), "worktree removed after known-safe residue cleanup")
 	} finally {
 		await fsp.rm(f.repo, { recursive: true, force: true })
 	}
@@ -604,6 +689,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["apply reconciles local main with origin (pushes the merged round)", testApplySyncsMainToOrigin],
 	["dirty worktree (human file) blocks cleanup", testDirtyGateBlocksCleanup],
 	["harness's own untracked artifacts do NOT block and are removed", testHarnessArtifactsDoNotBlockAndAreRemoved],
+	["known-safe residue (node_modules symlink, __pycache__, *.pyc) does NOT block and is removed", testKnownSafeResidueDoesNotBlockAndIsRemoved],
+	["removeKnownSafeArtifacts never touches tracked files under a known-safe name", testRemoveKnownSafeArtifactsNeverTouchesTrackedFiles],
 	["live worker process (.harness.pid) blocks cleanup", testLiveProcessGateBlocksCleanup],
 	["non-terminal group status blocks cleanup", testNonTerminalStatusBlocksCleanup],
 	["unmerged branch blocks cleanup", testNotMergedBlocksCleanup],

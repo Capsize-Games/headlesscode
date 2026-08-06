@@ -1764,9 +1764,9 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	// specifically — NOT raw `git worktree remove`, which refuses on any
 	// untracked file and can leave a stray `.headlesscode/` behind that
 	// re-trips this exact check on the next attempt; `cleanup --apply`
-	// removes harness artifacts (including `.headlesscode/`) BEFORE calling
-	// `git worktree remove`, precisely to avoid that residue (see
-	// cleanup.ts's removeHarnessArtifacts).
+	// removes harness artifacts (including `.headlesscode/`) and known-safe
+	// residue BEFORE calling `git worktree remove`, precisely to avoid that
+	// residue (see cleanup.ts's removeHarnessArtifacts/removeKnownSafeArtifacts).
 	const staleWorktrees = specs
 		.map((spec) => path.join(repo, ".worktrees", spec.name))
 		.filter((wtPath) => fs.existsSync(wtPath))
