@@ -232,7 +232,47 @@ of hand-rolling poll loops over the state file / `harness.log`:
   parse errors during the wait (writer mid-save) are retried, not fatal. An
   empty state file returns immediately — nothing to wait for.
 
-### Keeping local master in sync with origin (issue #25)
+### `orchestrate review` / `orchestrate rework` / `orchestrate resume` — standalone recovery (issue #14)
+
+The review and rework steps normally only fire as steps inside a full
+`orchestrate` spawn+watch round. These subcommands expose the same steps as
+independent entry points that pick up EXISTING state (see
+`src/orchestrator/resume.ts`), reusing `runReview` / `handleReviewVerdict` /
+`handleIterationExhaustion` / `runQaWithRetries` rather than duplicating them:
+
+```bash
+# Run the review step against an already-finished group (exit 0 = clean):
+npx tsx src/cli.ts orchestrate review --repo <path> --issue 14
+npx tsx src/cli.ts orchestrate review --repo <path> --pr 42            # by PR
+npx tsx src/cli.ts orchestrate review --repo <path> --group w1         # by group name
+# Re-spawn a worker on the SAME worktree to fix recorded findings:
+npx tsx src/cli.ts orchestrate rework --repo <path> --issue 14
+# Full recovery pipeline for a stuck/interrupted round (no target = all groups):
+npx tsx src/cli.ts orchestrate resume --repo <path> --issue 14 [--qa] [--dry-run]
+```
+
+All three resolve the target group from `.orchestrator-state.json` (by issue
+number, PR — state `pr` field then branch match — or group name) and, if the
+original worktree was cleaned up, re-checkout the recorded branch into a fresh
+worktree (`git worktree add -B`, preferring `origin/<branch>`).
+
+The **rebuild step** is the first thing `resume` (and `review`) does: a
+stuck/interrupted round always means the state file and disk reality have
+diverged, so the group's status is re-derived from the REAL on-disk markers
+(`.harness.done` / `.harness.exit` / their absence) via
+`inspectGroup(repo, {...group, status: "running"}, Date.now(), stallTimeout)`
+— `rebuildPatchFromMarkers` in `resume.ts`, a first-class, tested code path
+(never rebuilt ad hoc). A missing worktree has no markers to rebuild from, so
+the branch re-checkout is the ground truth and the group is marked `done`.
+
+`resume` then chains the full pipeline per group: rebuild → review (skipped
+when already reviewed, unless `--force-review`) → rework-if-needed (a finding
+verdict left over from an interrupted round is reworked from its recorded
+findings without burning a fresh review session; iteration-exhaustion failures
+get a continuation) → QA (`--qa`) → cost recording. After spawning a
+rework/continuation worker the group is left in-flight and `resume` reports;
+re-run it once the worker finishes. `--dry-run` prints the whole plan and
+changes nothing.
 
 Worktree branches spawn off `origin/master` (with a local-`master` fallback in
 `spawn-parallel-worktrees.sh`), but GitHub PR merges only ever move

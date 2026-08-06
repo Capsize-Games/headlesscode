@@ -92,3 +92,43 @@ export type {
 	ReconcileHooks,
 	ReconcileResult,
 } from "./status.js"
+
+// Issue #14: standalone review/rework/resume subcommands (resume.ts).
+export {
+	findingsFromCommentBodies,
+	fetchFindingsFromIssueComments,
+	parseResumeArgs,
+	parseReviewArgs,
+	parseReworkArgs,
+	prHeadBranch,
+	rebuildPatchFromMarkers,
+	recheckoutWorktree,
+	recordSettledCost,
+	resumeGroup,
+	resumeMain,
+	reviewMain,
+	reworkMain,
+	runQaStep,
+	runReviewStep,
+	runReworkStep,
+	resolveTargetGroups,
+} from "./resume.js"
+export type {
+	QaStepOptions,
+	QaStepResult,
+	RecordCostOptions,
+	ResumeCliOptions,
+	ResumeGroupOptions,
+	ResumeGroupResult,
+	ResumeIo,
+	ResumeOutcome,
+	ResumeTarget,
+	ResolveTargetHooks,
+	ReviewCliOptions,
+	ReviewStepOptions,
+	ReviewStepResult,
+	ReworkCliOptions,
+	ReworkOutcome,
+	ReworkStepOptions,
+	ReworkStepResult,
+} from "./resume.js"

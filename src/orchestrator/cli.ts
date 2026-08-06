@@ -1687,7 +1687,9 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	// Subcommand dispatch: `headlesscode orchestrate status ...` is the
 	// read-side status/wait command, `... stop ...` stops a group's whole
 	// worker tree (issue #20), `... cleanup ...` is the human-triggered
-	// post-merge worktree cleanup; everything else is the spawn+watch round.
+	// post-merge worktree cleanup, `... review/rework/resume ...` (issue #14)
+	// are the standalone recovery subcommands; everything else is the
+	// spawn+watch round.
 	if (argv[0] === "status") {
 		return statusMain(argv.slice(1))
 	}
@@ -1696,6 +1698,20 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	}
 	if (argv[0] === "cleanup") {
 		return cleanupMain(argv.slice(1))
+	}
+	// Issue #14 standalone recovery subcommands. Imported lazily (not
+	// statically) because resume.ts imports this module's rework-decision
+	// helpers — a static import here would create a module cycle.
+	if (argv[0] === "review" || argv[0] === "rework" || argv[0] === "resume") {
+		const { reviewMain, reworkMain, resumeMain } = await import("./resume.js")
+		switch (argv[0]) {
+			case "review":
+				return reviewMain(argv.slice(1))
+			case "rework":
+				return reworkMain(argv.slice(1))
+			default:
+				return resumeMain(argv.slice(1))
+		}
 	}
 	const { options, error } = parseOrchestrateArgs(argv)
 	if (error) {
