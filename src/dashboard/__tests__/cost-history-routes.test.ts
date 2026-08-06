@@ -134,6 +134,39 @@ async function testSinceWindowsByRecordedAt(): Promise<void> {
 	}
 }
 
+/**
+ * Regression: recordedAt is always millisecond-precision ("...000Z") while a
+ * hand-typed ?since= (as in the route's own error-message example) is often
+ * second-precision ("...Z") for the SAME instant. A raw string comparison
+ * treats these as unequal — worse, the millisecond form sorts BEFORE the
+ * second form ("." 0x2E < "Z" 0x5A) — so a record at exactly the ?since=
+ * boundary was wrongly excluded. Compare parsed instants instead.
+ */
+async function testSinceBoundaryMillisecondPrecisionIncludesEqualInstant(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		await appendCostHistoryRecord(
+			repo,
+			baseGroup({ groupName: "at-boundary", recordedAt: "2026-08-02T00:00:00.000Z" }),
+		)
+
+		const { server, port } = await startServer()
+		try {
+			const base = `http://127.0.0.1:${port}`
+			// Same instant as the record's recordedAt, but second-precision.
+			const res = await get(base, `/api/cost-history?repo=${encodeURIComponent(repo)}&since=2026-08-02T00:00:00Z`)
+			assert.equal(res.status, 200)
+			const data = JSON.parse(res.body) as { groups: Array<{ groupName: string }> }
+			assert.equal(data.groups.length, 1, "a record exactly at the ?since= instant must be included (>=)")
+			assert.equal(data.groups[0].groupName, "at-boundary")
+		} finally {
+			server.close()
+		}
+	} finally {
+		await fsp.rm(repo, { recursive: true, force: true })
+	}
+}
+
 async function testLimitKeepsMostRecent(): Promise<void> {
 	const repo = await tmpRepo()
 	try {
@@ -208,6 +241,10 @@ async function main(): Promise<void> {
 	const tests: Array<[string, () => Promise<void>]> = [
 		["GET /api/cost-history?repo= serves group + session records (newest first)", testServesGroupAndSessionRecords],
 		["?since=<iso> windows by recordedAt", testSinceWindowsByRecordedAt],
+		[
+			"?since= boundary: millisecond-precision recordedAt vs second-precision since includes the equal instant",
+			testSinceBoundaryMillisecondPrecisionIncludesEqualInstant,
+		],
 		["?limit=N keeps the most recent N", testLimitKeepsMostRecent],
 		["missing ?repo= is a 400", testMissingRepoIs400],
 		["invalid ?since= / ?limit= are 400s", testInvalidSinceAndLimitAre400],

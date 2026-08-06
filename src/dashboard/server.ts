@@ -809,12 +809,18 @@ async function handleRequest(
 			let groups = await readCostHistory(repo)
 			let sessions = await readSessionCostHistory(repo)
 			if (since) {
-				groups = groups.filter((r) => r.recordedAt >= since)
-				sessions = sessions.filter((r) => r.recordedAt >= since)
+				// Compare parsed instants, not raw strings: recordedAt is always
+				// millisecond-precision ("...000Z") while a hand-typed ?since=
+				// (e.g. the error message's own example) is often second-precision
+				// ("...Z") — the same instant in both forms compares unequal (and
+				// sorts wrong) as strings because "." (0x2E) < "Z" (0x5A).
+				const sinceMs = Date.parse(since)
+				groups = groups.filter((r) => Date.parse(r.recordedAt) >= sinceMs)
+				sessions = sessions.filter((r) => Date.parse(r.recordedAt) >= sinceMs)
 			}
 			// Newest first (the ordering the CLI prints), then window to N.
-			groups.sort((a, b) => (a.recordedAt < b.recordedAt ? 1 : a.recordedAt > b.recordedAt ? -1 : 0))
-			sessions.sort((a, b) => (a.recordedAt < b.recordedAt ? 1 : a.recordedAt > b.recordedAt ? -1 : 0))
+			groups.sort((a, b) => Date.parse(b.recordedAt) - Date.parse(a.recordedAt))
+			sessions.sort((a, b) => Date.parse(b.recordedAt) - Date.parse(a.recordedAt))
 			if (limit !== undefined) {
 				groups = groups.slice(0, limit)
 				sessions = sessions.slice(0, limit)
