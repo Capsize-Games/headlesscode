@@ -155,6 +155,11 @@ const BUGGY_FILE = process.env.MOCK_BUGGY_FILE || "src/greet.js"
 // real `orchestrate` run exercises a rework spawn end-to-end (worker success →
 // review finding → rework worker → review clean).
 const REWORK_REVIEWS = Number(process.env.REWORK_REVIEWS || 0)
+// Issue #52 twin: make the first N QA sessions return a FAIL verdict instead
+// of pass, so a real `orchestrate --qa` run exercises the QA-fail rework
+// end-to-end (worker success → review clean → QA fail → rework worker →
+// review clean → QA pass).
+const REWORK_QA = Number(process.env.REWORK_QA || 0)
 
 const DEFAULT_VERIFY_CMD =
 	"node -e \"const { greet } = require('./src/greet.js'); const assert = require('node:assert'); assert.strictEqual(greet('World'), 'Hello, World'); console.log('greet verified OK')\""
@@ -580,8 +585,26 @@ function buildScenarioResponse({ model, historyToolCalls, systemPrompt, toolName
 				],
 			})
 		}
-		// Otherwise -> QA session (pass script).
-		return qaSessionResponse(model, historyToolCalls, true)
+		// Otherwise -> QA session. With REWORK_QA=N the first N QA sessions
+		// FAIL (issue #52's end-to-end path: the orchestrator auto-spawns a
+		// QA-fail rework worker on the same worktree, and the re-run QA
+		// passes); without it, QA always passes. Counted on the session's
+		// FIRST request only (the review counter's pattern) — a QA session
+		// makes two requests, and counting both would flip the verdict
+		// mid-session. A tool-less request is the round's preflight probe,
+		// NOT a QA session — it must not consume a QA slot (a real incident
+		// in this e2e: the probe grabbed REWORK_QA's only fail slot, so the
+		// first real QA session passed and the rework never spawned).
+		if (toolNames === "") {
+			return chatResponse(model, {
+				role: "assistant",
+				content: "mock: preflight probe acknowledged",
+			})
+		}
+		if (historyToolCalls === 0) {
+			qaSessionCount++
+		}
+		return qaSessionResponse(model, historyToolCalls, qaSessionCount > REWORK_QA)
 	}
 
 	if (SCENARIO === "plan-first") {
@@ -660,6 +683,10 @@ let REQUEST_COUNT = 0
 // each review session's first request). Used with REWORK_REVIEWS to decide
 // which reviews return a finding vs. clean.
 let reviewSessionCount = 0
+// Counts QA sessions seen by the qa-orchestrate scenario (incremented on each
+// QA session's first request). Used with REWORK_QA to decide which QA
+// sessions return a fail vs. pass (issue #52).
+let qaSessionCount = 0
 
 const server = http.createServer((req, res) => {
 	if (req.method !== "POST") {

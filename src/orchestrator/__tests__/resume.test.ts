@@ -26,6 +26,7 @@ import {
 	resumeMain,
 	reviewMain,
 	reworkMain,
+	runReworkStep,
 	resolveTargetGroups,
 	type ResumeTarget,
 } from "../resume.js"
@@ -542,6 +543,173 @@ async function testReworkMainDryRunAtCapMarksNeedsHuman(): Promise<void> {
 	}
 }
 
+// ─── reworkMain / runReworkStep on a QA-failed group (issue #52) ─────────────
+
+/**
+	* Issue #52's practical complaint verbatim: `orchestrate rework` against a
+	* QA-failed group used to be a no-op (it only reworks REVIEW findings, so it
+	* just re-verified the clean review and did nothing about the QA evidence).
+	* Verifies the fix end-to-end through the subcommand: a group whose QA came
+	* back "fail" (clean review) now produces a QA rework task + spawn command.
+	*/
+async function testReworkMainDryRunQaFailReworksFromQaEvidence(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		initGitRepo(repo)
+		await fs.mkdir(path.join(repo, ".worktrees", "w1"), { recursive: true })
+		writeState(repo, [
+			baseGroup({
+				status: "done",
+				review_verdict: "clean",
+				qa: {
+					status: "failed",
+					verdict: "fail",
+					evidence: "integration test is red: expect 42 got 41",
+					updated: new Date().toISOString(),
+				},
+			}),
+		])
+		const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
+		const before = loadStateSync(statePath)
+
+		const { exit, stdout } = await withCapturedStdout(() =>
+			reworkMain(["--repo", repo, "--group", "w1", "--dry-run"]),
+		)
+		assert.equal(exit, 0, "a QA-failed group is reworkable — the previous no-op is gone")
+		assert.ok(stdout.includes("rework cycle 1"), `names the cycle, got: ${stdout}`)
+		assert.ok(stdout.includes("run-worker.sh"), `plans the spawn command, got: ${stdout}`)
+		assert.ok(stdout.includes("w1-qa-rework1.md"), `QA rework task file named, got: ${stdout}`)
+		assert.deepEqual(loadStateSync(statePath), before, "dry-run must not touch state")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testRunReworkStepDryRunQaFailProducesQaReworkTask(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		initGitRepo(repo)
+		const group = baseGroup({
+			status: "done",
+			qa: {
+				status: "failed",
+				verdict: "fail",
+				evidence: "boot smoke test fails",
+				updated: new Date().toISOString(),
+			},
+		})
+		writeState(repo, [group])
+		const lines: string[] = []
+		const result = await runReworkStep({
+			repo,
+			statePath: path.join(repo, ".worktrees", ".orchestrator-state.json"),
+			group,
+			mode: "code",
+			maxReworkCycles: 3,
+			dryRun: true,
+			write: (t) => lines.push(t),
+		})
+		assert.equal(result.outcome, "dry-run")
+		assert.ok(
+			lines.some((l) => l.includes("w1-qa-rework1.md")),
+			`QA-failed group reworks from QA evidence (qa-rework task file), got: ${lines.join("|")}`,
+		)
+		assert.ok(lines.some((l) => l.includes("run-worker.sh")), `spawn command planned, got: ${lines.join("|")}`)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testRunReworkStepDryRunReviewFindingsWinOverQaFail(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		initGitRepo(repo)
+		const group = baseGroup({
+			status: "done",
+			pending_review_findings: ["review finding A"],
+			qa: {
+				status: "failed",
+				verdict: "fail",
+				evidence: "qa evidence B",
+				updated: new Date().toISOString(),
+			},
+		})
+		writeState(repo, [group])
+		const lines: string[] = []
+		const result = await runReworkStep({
+			repo,
+			statePath: path.join(repo, ".worktrees", ".orchestrator-state.json"),
+			group,
+			mode: "code",
+			maxReworkCycles: 3,
+			dryRun: true,
+			write: (t) => lines.push(t),
+		})
+		assert.equal(result.outcome, "dry-run")
+		assert.ok(
+			lines.some((l) => l.includes("w1-rework1.md")),
+			`review findings win over QA fail (review task file), got: ${lines.join("|")}`,
+		)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+/**
+	* Issue #52 in the resume path: a group that ALREADY has a recorded QA fail
+	* (status done — the pre-fix code silently settled it, or the rework spawn
+	* was interrupted) must be reworked from its QA evidence, NOT reported as
+	* settled with cost recorded. Dry-run: the rework is planned, state is
+	* untouched.
+	*/
+async function testResumeGroupDryRunReworksRecordedQaFail(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		initGitRepo(repo)
+		await fs.mkdir(path.join(repo, ".worktrees", "w1"), { recursive: true })
+		const group = baseGroup({
+			status: "done",
+			review_verdict: "clean",
+			qa: {
+				status: "failed",
+				verdict: "fail",
+				evidence: "boot smoke test fails",
+				updated: new Date().toISOString(),
+			},
+		})
+		const statePath = writeState(repo, [group])
+		const lines: string[] = []
+		const result = await resumeGroup({
+			repo,
+			statePath,
+			group,
+			reviewMode: "deepseek-reviewer",
+			qaMode: "qa-agent",
+			reviewEnabled: true,
+			qaEnabled: true,
+			mode: "code",
+			maxReworkCycles: 3,
+			maxContinuations: 3,
+			forceReview: false,
+			dryRun: true,
+			write: (t) => lines.push(t),
+		})
+		assert.equal(
+			result.outcome,
+			"in-flight",
+			`recorded QA fail is reworked, not settled, got ${result.outcome}: ${result.message}`,
+		)
+		assert.ok(
+			lines.some((l) => l.includes("w1-qa-rework1.md")),
+			`QA rework task planned, got: ${lines.join("|")}`,
+		)
+		const state = loadStateSync(statePath)
+		assert.equal(state.groups[0]?.status, "done", "dry-run leaves the recorded QA fail untouched")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 // ─── resumeMain (dry-run pipeline wiring) ────────────────────────────────────
 
 async function testResumeMainDryRunRebuildThenReviewPlan(): Promise<void> {
@@ -768,6 +936,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["reworkMain --dry-run prints task + spawn command, spawns nothing", testReworkMainDryRunPrintsTaskAndSpawnCommand],
 	["reworkMain falls back to the no-findings template text", testReworkMainFallsBackToNoFindingsText],
 	["reworkMain at the rework cap reports needs-human (dry-run)", testReworkMainDryRunAtCapMarksNeedsHuman],
+	["reworkMain --dry-run reworks a QA-failed group from its QA evidence (issue #52)", testReworkMainDryRunQaFailReworksFromQaEvidence],
+	["runReworkStep dry-run on a QA-failed group produces the QA rework task (issue #52)", testRunReworkStepDryRunQaFailProducesQaReworkTask],
+	["runReworkStep: review findings win over a QA fail (issue #52)", testRunReworkStepDryRunReviewFindingsWinOverQaFail],
+	["resumeGroup dry-run reworks a recorded QA fail instead of settling (issue #52)", testResumeGroupDryRunReworksRecordedQaFail],
 	["resumeMain --dry-run: rebuild then review plan", testResumeMainDryRunRebuildThenReviewPlan],
 	["resumeMain --dry-run: reworks a recorded finding without re-review", testResumeMainDryRunReworksRecordedFinding],
 	["resumeMain --dry-run: plans a continuation on iteration exhaustion", testResumeMainDryRunPlansContinuation],

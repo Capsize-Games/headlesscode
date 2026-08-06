@@ -110,9 +110,12 @@ export interface OrchestratorGroup {
 	review_report?: string
 	/**
 	 * Rework loop counter — how many rework cycles this group has already gone
-	 * through after a review "finding" verdict. Absent (== 0) when the group
-	 * has never been reworked. Incremented by the orchestrator each time it
-	 * re-spawns a worker on the SAME worktree to fix review findings.
+	 * through after a review "finding" OR a QA "fail" verdict (issue #52: a
+	 * real QA fail is reworked from its qa.evidence exactly like review
+	 * findings, sharing the same --max-rework-cycles budget). Absent (== 0)
+	 * when the group has never been reworked. Incremented by the orchestrator
+	 * each time it re-spawns a worker on the SAME worktree to fix review/QA
+	 * findings.
 	 */
 	reworkCount?: number
 	/**

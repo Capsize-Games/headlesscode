@@ -674,6 +674,47 @@ interface StreamToolCallDelta {
 	function?: { name?: string; arguments?: string }
 }
 
+/**
+ * User-facing reasoning-effort levels for deepseek/* models (issue #30
+ * experiment). DeepSeek's native graded set is low/medium/high/max; OpenRouter's
+ * normalized `reasoning.effort` accepts "high" and "xhigh" (xhigh maps to the
+ * native max). "xhigh" is accepted as an alias for "max" so both vocabularies
+ * work. Anything else fails loudly — a typo must never silently keep the
+ * endpoint's undeclared default, which would poison the experiment's comparison.
+ */
+export const REASONING_EFFORT_LEVELS = ["low", "medium", "high", "max", "xhigh"] as const
+
+/** The OpenRouter-normalized `reasoning.effort` values actually sent on the wire. */
+export type WireReasoningEffort = "low" | "medium" | "high" | "xhigh"
+
+/**
+ * Validate + normalize a configured reasoning-effort value to the
+ * OpenRouter-normalized wire value. `undefined`/empty means "no effort sent"
+ * (the endpoint's default applies). Throws on anything outside the known set.
+ */
+export function parseReasoningEffort(value: string | undefined): WireReasoningEffort | undefined {
+	if (value === undefined || value.trim() === "") {
+		return undefined
+	}
+	switch (value.trim().toLowerCase()) {
+		case "low":
+			return "low"
+		case "medium":
+			return "medium"
+		case "high":
+			return "high"
+		case "max":
+		case "xhigh":
+			// OpenRouter's normalized reasoning.effort has no "max" — xhigh is
+			// its alias for the native max level.
+			return "xhigh"
+		default:
+			throw new Error(
+				`reasoning effort must be one of ${REASONING_EFFORT_LEVELS.join("/")} (native DeepSeek levels, plus OpenRouter's normalized "xhigh" alias for "max"), got '${value}'`,
+			)
+	}
+}
+
 export function buildRequestBody(request: LlmRequest, model: string): Record<string, unknown> {
 	const body: Record<string, unknown> = {
 		model,
@@ -725,6 +766,17 @@ export function buildRequestBody(request: LlmRequest, model: string): Record<str
 		// param). Kept to the deepseek/ prefix rather than unconditional to match
 		// the existing pin boundary.
 		body.include_reasoning = true
+		// Graded reasoning effort (issue #30): DeepSeek's native low/medium/
+		// high/max is normalized by OpenRouter to `reasoning: { effort: "high" |
+		// "xhigh" }` ("xhigh" = max). Unset = send nothing = the endpoint's
+		// undeclared default, exactly as before. Same deepseek/ boundary as
+		// include_reasoning.
+		if (request.reasoningEffort !== undefined) {
+			const effort = parseReasoningEffort(request.reasoningEffort)
+			if (effort !== undefined) {
+				body.reasoning = { effort }
+			}
+		}
 	}
 	return body
 }

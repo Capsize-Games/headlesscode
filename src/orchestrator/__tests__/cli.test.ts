@@ -15,10 +15,12 @@ import * as path from "node:path"
 import {
 	buildContinuationTaskFileContent,
 	buildPlanFirstTaskFileContent,
+	buildQaReworkTaskFileContent,
 	buildReworkTaskFileContent,
 	buildSpawnEnv,
 	handleIterationExhaustion,
 	handleQaSessionError,
+	handleQaVerdict,
 	handleReviewSessionError,
 	handleReviewVerdict,
 	orchestrateMain,
@@ -126,6 +128,15 @@ function qaSessionErrorResult(): QaResult {
 	}
 }
 
+function qaFailResult(evidence = "test suite fails: 2 of 14 tests error out"): QaResult {
+	return {
+		verdict: "fail",
+		evidence,
+		summary: "QA verdict: fail — the test suite does not pass",
+		reportPath: "/tmp/example-repo/.worktrees/w1/.headlesscode/reports/qa-session-1.md",
+	}
+}
+
 // ─── buildReworkTaskFileContent ──────────────────────────────────────────────
 
 async function testReworkTaskFileContentIncludesFindingsAndIssues(): Promise<void> {
@@ -146,6 +157,31 @@ async function testReworkTaskFileContentHandlesEmptyFindings(): Promise<void> {
 	// A group with no recorded issues must still produce a valid task.
 	const noIssues = buildReworkTaskFileContent({ name: "w1" }, ["x"], 1)
 	assert.ok(noIssues.includes("inspect the worktree"), "no-issues fallback text present")
+}
+
+// ─── buildQaReworkTaskFileContent (issue #52) ────────────────────────────────
+
+async function testQaReworkTaskFileContentIncludesEvidenceAndIssues(): Promise<void> {
+	const content = buildQaReworkTaskFileContent(
+		{ name: "w1", issues: [52] },
+		"test suite fails: 2 of 14 tests error out",
+		1,
+		"/tmp/example-repo/.worktrees/w1/.headlesscode/reports/qa-session-1.md",
+	)
+	assert.ok(content.includes("Rework cycle 1"), "content names the rework cycle")
+	assert.ok(content.includes("QA findings to fix"), "section names the QA source of the cycle")
+	assert.ok(content.includes("test suite fails: 2 of 14 tests error out"), "QA evidence embedded in the task")
+	assert.ok(content.includes("qa-session-1.md"), "full QA report path referenced (issue #34-style)")
+	assert.ok(content.includes("#52"), "original issue numbers included")
+	assert.ok(content.includes("Closing Report (rework cycle 1)"), "closing template reuses the rework variant")
+	assert.ok(content.includes("Scope: #52 only — rework cycle 1."), "scope line names the cycle")
+}
+
+async function testQaReworkTaskFileContentHandlesEmptyEvidence(): Promise<void> {
+	const content = buildQaReworkTaskFileContent({ name: "w1", issues: [52] }, "", 2)
+	assert.ok(content.includes("Rework cycle 2"))
+	assert.ok(content.includes("no extractable evidence"), "empty evidence gets an explicit fallback")
+	assert.ok(content.includes("#52"), "issues still present")
 }
 
 // ─── handleReviewVerdict: below the cap → rework spawn ──────────────────────
@@ -218,6 +254,108 @@ async function testQaSessionErrorGoesStraightToNeedsHuman(): Promise<void> {
 		typeof patch.last_activity === "object" && patch.last_activity !== null && "note" in patch.last_activity,
 		"last_activity must explain the QA session failure",
 	)
+}
+
+/**
+ * Issue #52 (2026-08-05): a REAL QA "fail" verdict used to only patch the
+ * nested `qa` field — the group's top-level status stayed "done" from the
+ * worker's own completion, so a QA-caught bug silently settled the round
+ * (cost recorded, nothing left pending). Verifies the fix: below the cap a
+ * QA fail gets the SAME rework treatment as a review finding — reset to
+ * running on the SAME worktree, review/QA/cost cleared, reworkCount
+ * incremented, and a QA-evidence-fed task file + spawn command produced.
+ */
+async function testQaFailBelowCapSpawnsAndResetsState(): Promise<void> {
+	const group = baseGroup({ reworkCount: 0, status: "done", issues: [52] })
+	const decision = handleQaVerdict(group, qaFailResult(), "/tmp/example-repo", 3, "code")
+
+	assert.equal(decision.shouldSpawn, true, "below the cap the QA fail gets a rework spawn")
+	assert.equal(decision.newReworkCount, 1)
+	assert.ok(
+		decision.taskFilePath?.endsWith(path.join("plans", "parallel-tasks", "w1-qa-rework1.md")),
+		`QA rework task file named <name>-qa-rework<n>.md, got ${decision.taskFilePath}`,
+	)
+	assert.ok(decision.taskContent && decision.taskContent.includes("test suite fails"), "QA evidence embedded in the task")
+	assert.ok(decision.spawnCommand && decision.spawnCommand.includes("run-worker.sh"), "spawn command calls run-worker.sh directly")
+	assert.ok(decision.spawnCommand?.includes(`--mode "code"`), "spawn command forwards the worker mode")
+	assert.ok(decision.spawnCommand?.includes(".worktrees/w1"), "spawn command targets the SAME worktree (no new worktree)")
+
+	// State reset: status back to running, review/QA/cost cleared, count incremented.
+	assert.equal(decision.patch.status, "running")
+	assert.equal(decision.patch.reworkCount, 1)
+	assert.equal(decision.patch.review_verdict, undefined, "review_verdict cleared for a fresh cycle")
+	assert.equal(decision.patch.pending_review_findings, undefined, "findings cleared for a fresh cycle")
+	assert.equal(decision.patch.review_report, undefined, "stale review report path cleared for a fresh cycle")
+	assert.equal(decision.patch.qa, undefined, "stale QA cleared for a fresh cycle")
+	assert.equal(decision.patch.reviewed_at, undefined)
+	assert.equal(decision.patch.exit_code, undefined, "previous attempt's exit code cleared")
+	assert.ok(typeof decision.patch.spawned === "string", "spawned reset so the stall guard measures the rework worker")
+	assert.ok(decision.patch.last_activity && typeof decision.patch.last_activity === "object", "last_activity notes the QA rework")
+}
+
+/**
+ * Issue #52: the QA-fail rework reset must clear a stale cost_recorded just
+ * like the review-finding reset (the rework worker adds more real cost; the
+ * one-shot recording gate must re-record the combined total once the cycle
+ * re-settles). Verified via the real updateGroup MERGE, not the patch literal.
+ */
+async function testQaFailReworkPatchActuallyClearsCostRecordedOnMerge(): Promise<void> {
+	const group = baseGroup({ reworkCount: 0, status: "done", cost_recorded: "2026-08-01T00:00:00.000Z" })
+	const decision = handleQaVerdict(group, qaFailResult(), "/tmp/example-repo", 3, "code")
+	const state: OrchestratorState = { ...defaultState("round-1"), groups: [group] }
+	const merged = updateGroup(state, "w1", decision.patch)
+	assert.equal(
+		merged.groups[0]?.cost_recorded,
+		undefined,
+		"a stale cost_recorded from the PREVIOUS attempt must not survive a QA-fail rework reset",
+	)
+}
+
+/**
+ * Issue #52: at the --max-rework-cycles cap a QA fail must NOT silently
+ * settle as "done" — it goes terminal needs-human with the QA verdict and
+ * evidence left recorded so a human can see exactly what failed.
+ */
+async function testQaFailAtCapMarksNeedsHumanAndDoesNotSpawn(): Promise<void> {
+	const group = baseGroup({ reworkCount: 3, status: "done", issues: [52] })
+	const result = qaFailResult("integration test still red")
+	const decision = handleQaVerdict(group, result, "/tmp/example-repo", 3, "code")
+
+	assert.equal(decision.shouldSpawn, false, "at the cap nothing is spawned again")
+	assert.equal(decision.newReworkCount, 3, "count not incremented — no new attempt happens")
+	assert.equal(decision.taskFilePath, undefined)
+	assert.equal(decision.spawnCommand, undefined)
+	assert.equal(decision.patch.status, "needs-human", "distinct terminal state, not failed/done")
+	assert.equal(decision.patch.reworkCount, 3)
+	assert.equal(decision.patch.qa?.verdict, "fail", "QA verdict stays recorded for the human")
+	assert.equal(decision.patch.qa?.status, "failed")
+	assert.equal(decision.patch.qa?.evidence, "integration test still red", "QA evidence stays recorded for the human")
+	assert.ok(
+		typeof decision.patch.last_activity === "object" && "note" in (decision.patch.last_activity ?? {}),
+		"last_activity explains the gave-up reason",
+	)
+}
+
+/**
+ * Issue #52 regression guard: a QA "pass" verdict is NOT new work — it must
+ * never route through handleQaVerdict (no reworkCount bump, no status change).
+ * The watch loop only calls handleQaVerdict on verdict "fail".
+ */
+async function testQaPassNeverTouchesReworkCount(): Promise<void> {
+	const group = baseGroup({ reworkCount: 2, status: "done" })
+	const state = updateGroup({ groups: [group] }, "w1", {
+		qa: {
+			status: "done",
+			verdict: "pass",
+			evidence: "all green",
+			report: "/tmp/example-repo/.worktrees/w1/.headlesscode/reports/qa-pass-1.md",
+			updated: "2026-08-01T00:00:00.000Z",
+		},
+		last_activity: { note: "QA: verdict=pass" },
+	})
+	assert.equal(state.groups[0].reworkCount, 2, "a QA pass must not increment reworkCount")
+	assert.equal(state.groups[0].qa?.verdict, "pass")
+	assert.equal(state.groups[0].status, "done", "a QA pass keeps the group settled as done")
 }
 
 /**
@@ -1264,9 +1402,15 @@ async function testOrchestrateMainWarnsOnDriftWhenSyncDisabled(): Promise<void> 
 const tests: Array<[string, () => Promise<void>]> = [
 	["rework task file includes findings, issues, rework count", testReworkTaskFileContentIncludesFindingsAndIssues],
 	["rework task file handles empty findings gracefully", testReworkTaskFileContentHandlesEmptyFindings],
+	["QA rework task file includes evidence, issues, report pointer (issue #52)", testQaReworkTaskFileContentIncludesEvidenceAndIssues],
+	["QA rework task file handles empty evidence gracefully (issue #52)", testQaReworkTaskFileContentHandlesEmptyEvidence],
 	["finding below cap triggers rework spawn + state reset", testFindingBelowCapSpawnsAndResetsState],
 	["review session error goes straight to needs-human, never a rework spawn", testReviewSessionErrorGoesStraightToNeedsHumanNoRework],
 	["QA session error goes straight to needs-human, not settled as an ordinary failed QA", testQaSessionErrorGoesStraightToNeedsHuman],
+	["QA fail below cap triggers rework spawn + state reset (issue #52)", testQaFailBelowCapSpawnsAndResetsState],
+	["QA fail rework patch actually clears a stale cost_recorded on merge (issue #52)", testQaFailReworkPatchActuallyClearsCostRecordedOnMerge],
+	["QA fail at cap marks needs-human, evidence stays recorded (issue #52)", testQaFailAtCapMarksNeedsHumanAndDoesNotSpawn],
+	["QA pass never touches reworkCount (issue #52)", testQaPassNeverTouchesReworkCount],
 	["rework patch actually clears a stale cost_recorded on merge", testReworkPatchActuallyClearsCostRecordedOnMerge],
 	["continuation patch actually clears a stale cost_recorded on merge", testContinuationPatchActuallyClearsCostRecordedOnMerge],
 	["report pointer fields (qa.report / review_report) survive the state round-trip (issue #34)", testReportPointerFieldsSurviveStateRoundTrip],

@@ -180,6 +180,8 @@ async function makeSession(options: {
 	consecutiveErrorLimit?: number
 	windowSize?: number
 	budget?: SessionBudget
+	/** Graded reasoning effort for deepseek/* models (issue #30). */
+	reasoningEffort?: string
 	/** Checkpoints on/off + shadow-git storage dir (default off — see below). */
 	checkpoints?: boolean
 	checkpointDir?: string
@@ -194,6 +196,7 @@ async function makeSession(options: {
 		consecutiveErrorLimit: options.consecutiveErrorLimit ?? 3,
 		windowSize: options.windowSize ?? 40,
 		budget: options.budget ?? null,
+		reasoningEffort: options.reasoningEffort,
 		// Checkpoints are default-on and would otherwise write real shadow-git
 		// commits to ~/.headlesscode/checkpoints on every test run; this suite
 		// isn't testing checkpoints (except the one that is), so keep tests
@@ -205,6 +208,59 @@ async function makeSession(options: {
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
+
+async function testReasoningEffortFlowsIntoRequests(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-re-"))
+	try {
+		const client = new FakeLlmClient([() => textReply("Done.")])
+		const session = await makeSession({ task: "say done", client, workspaceRoot: ws, reasoningEffort: "high" })
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(
+			client.requests[0]?.reasoningEffort,
+			"high",
+			"the session's configured reasoningEffort must be on every LLM request",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testReasoningEffortEnvFallbackWhenNotConfigured(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-re2-"))
+	const prev = process.env.HEADLESSCODE_REASONING_EFFORT
+	process.env.HEADLESSCODE_REASONING_EFFORT = "xhigh"
+	try {
+		const client = new FakeLlmClient([() => textReply("Done.")])
+		const session = await makeSession({ task: "say done", client, workspaceRoot: ws })
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(client.requests[0]?.reasoningEffort, "xhigh", "unset config falls back to the env var")
+	} finally {
+		if (prev === undefined) {
+			delete process.env.HEADLESSCODE_REASONING_EFFORT
+		} else {
+			process.env.HEADLESSCODE_REASONING_EFFORT = prev
+		}
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testReasoningEffortAbsentByDefault(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-re3-"))
+	try {
+		const client = new FakeLlmClient([() => textReply("Done.")])
+		const session = await makeSession({ task: "say done", client, workspaceRoot: ws })
+		await session.run()
+		assert.equal(
+			client.requests[0]?.reasoningEffort,
+			undefined,
+			"zero config -> no reasoningEffort on requests (endpoint default applies)",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
 
 async function testScenario1WriteThenCompletion(): Promise<void> {
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-s1-"))
@@ -1086,6 +1142,9 @@ async function testBudgetFallsBackToHardcodedTableWithoutLivePricing(): Promise<
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
+	["reasoning effort: configured value flows onto every request", testReasoningEffortFlowsIntoRequests],
+	["reasoning effort: unset config falls back to the env var", testReasoningEffortEnvFallbackWhenNotConfigured],
+	["reasoning effort: absent by default (endpoint default applies)", testReasoningEffortAbsentByDefault],
 	["scenario 1: write_to_file + attempt_completion -> success, file written", testScenario1WriteThenCompletion],
 	["scenario 2: execute_command + text answer -> success with text result", testScenario2CommandThenTextAnswer],
 	["scenario 3: erroring tool x3 -> bounded failure", testScenario3ErroringToolBoundedFailure],
