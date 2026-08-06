@@ -40,6 +40,17 @@ export interface OrchestratorGroup {
 	worktree?: string
 	branch?: string
 	issues?: number[]
+	/**
+	 * The per-issue shape of this group's work (split.ts's issueShape: hot /
+	 * split / coverage / test / docs / refactor / generic), one entry per
+	 * issue, same order as `issues`. Written by orchestrate at dispatch time
+	 * (issue #16) — the only moment the issue titles/bodies are in hand — so
+	 * the cost-history recording that happens LATER (when the group reaches a
+	 * terminal status, possibly in a separate orchestrate invocation) can
+	 * stamp the group's record with its shape without needing issue content.
+	 * Absent for groups spawned directly via spawn-parallel-worktrees.sh.
+	 */
+	shapes?: string[]
 	task_file?: string
 	/**
 	 * spawned | running | done | failed | blocked | needs-human | orphaned

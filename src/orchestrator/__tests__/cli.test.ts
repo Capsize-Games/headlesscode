@@ -23,6 +23,7 @@ import {
 	orchestrateMain,
 	parseOrchestrateArgs,
 } from "../cli.js"
+import { appendCostHistoryRecord } from "../cost-history.js"
 import { watchGroups } from "../watch.js"
 import { defaultState, loadStateSync, saveStateSync, updateGroup, type OrchestratorGroup, type OrchestratorState } from "../state.js"
 import type { ReviewResult } from "../reviewer.js"
@@ -903,6 +904,71 @@ async function testOrchestrateMainDryRunProceedsWhenNoCollision(): Promise<void>
 	}
 }
 
+async function testOrchestrateMainDryRunShowsEmptyCostEstimateNote(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		initGitRepo(repo)
+		const issuesPath = path.join(repo, "issues.json")
+		await fs.writeFile(
+			issuesPath,
+			JSON.stringify([{ number: 1, title: "Split the big file into modules", body: "Mechanical" }]),
+			"utf-8",
+		)
+		const { exit, stdout } = await withCapturedStdout(() =>
+			orchestrateMain(["--repo", repo, "--issues-json", issuesPath, "--dry-run"]),
+		)
+		assert.equal(exit, 0)
+		assert.match(stdout, /Cost estimate \(from recorded cost-history/)
+		assert.match(stdout, /no cost history recorded yet — estimates appear once groups reach a terminal status/)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testOrchestrateMainDryRunShowsCostEstimateFromHistory(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		initGitRepo(repo)
+		const issuesPath = path.join(repo, "issues.json")
+		await fs.writeFile(
+			issuesPath,
+			JSON.stringify([{ number: 1, title: "Split the big file into modules", body: "Mechanical" }]),
+			"utf-8",
+		)
+		// Seed recorded history for the same repo (issue #16): three past
+		// split-shaped groups — the estimator needs >= 3 same-shape samples.
+		for (const [cost, iters] of [
+			[0.2, 40],
+			[0.3, 50],
+			[0.4, 60],
+		] as const) {
+			await appendCostHistoryRecord(repo, {
+				recordedAt: "2026-08-05T00:00:00.000Z",
+				repo: path.resolve(repo),
+				groupName: `past${cost}`,
+				issues: [100],
+				shapes: ["split"],
+				status: "done",
+				costUsd: cost,
+				inputTokens: 2000,
+				outputTokens: 200,
+				cachedTokens: 0,
+				iterations: iters,
+				continuationCount: 0,
+				reworkCount: 0,
+			})
+		}
+		const { exit, stdout } = await withCapturedStdout(() =>
+			orchestrateMain(["--repo", repo, "--issues-json", issuesPath, "--dry-run"]),
+		)
+		assert.equal(exit, 0)
+		assert.match(stdout, /Cost estimate \(from recorded cost-history/)
+		assert.match(stdout, /w1 \(issues 1 — split\): expected ~\$0\.2000–\$0\.4000 · ~40–60 iterations · 3 sample\(s\)/)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 // ─── Pre-spawn preflight probe (issue #13) ───────────────────────────────────
 
 async function testOrchestrateMainPreflightFailureAbortsBeforeSpawn(): Promise<void> {
@@ -1058,6 +1124,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["orchestrateMain skips multiple occupied slots (w1+w2 -> w3)", testOrchestrateMainSkipsMultipleOccupiedSlots],
 	["--no-preflight parses (default on, flag off)", testParseOrchestrateArgsNoPreflight],
 	["orchestrateMain dry-run proceeds when all worktree dirs are clear", testOrchestrateMainDryRunProceedsWhenNoCollision],
+	["orchestrateMain dry-run shows the no-history estimate note on a fresh repo", testOrchestrateMainDryRunShowsEmptyCostEstimateNote],
+	["orchestrateMain dry-run shows a cost estimate derived from recorded history", testOrchestrateMainDryRunShowsCostEstimateFromHistory],
 	["orchestrateMain aborts before spawn when the preflight probe fails", testOrchestrateMainPreflightFailureAbortsBeforeSpawn],
 	["orchestrateMain warns loudly on drift when the auto-sync is disabled", testOrchestrateMainWarnsOnDriftWhenSyncDisabled],
 ]

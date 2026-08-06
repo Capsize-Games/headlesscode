@@ -25,7 +25,9 @@ import * as path from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { activeSessionCountForRepo, maxConcurrentSessionsFromEnv } from "../budget/concurrency.js"
-import { splitIssues, type SplitIssue, type WorktreeSpec } from "./split.js"
+import { issueShape, splitIssues, type SplitIssue, type WorktreeSpec } from "./split.js"
+import { readCostHistory } from "./cost-history.js"
+import { buildEstimateSection, estimateGroups } from "./cost-estimate.js"
 import {
 	loadState,
 	loadStateSync,
@@ -120,7 +122,9 @@ Options:
                  key-invalid / account-balance-exhausted / pinned-provider-down
                  / all-clear. ON by default; skip for CI/non-interactive
                  contexts that don't want the extra round-trip
-  --dry-run              Print the split plan + spawn commands, spawn nothing
+  --dry-run              Print the split plan, a cost estimate (from recorded
+                         cost-history, keyed by issue shape — issue #16), and
+                         the spawn commands; spawn nothing
   --help                 Show this help and exit
 
 Environment:
@@ -1069,26 +1073,17 @@ function printPlan(
 	issues: SplitIssue[],
 	models?: { worker: string; reviewer: string; qa: string },
 	maxIterations?: number,
+	estimateSection?: string[],
 ): void {
+	// Shape labels come from split.ts's issueShape (the SAME taxonomy the
+	// split and the cost estimate use) — a single source of truth instead of
+	// a third inline copy of the keyword scans.
 	const shapeNotes = new Map<number, string>()
 	for (const issue of issues) {
-		const hot = /(request|handler|migration|database|session|auth|encryption|crypto|password|token)/i.test(
-			`${issue.title}\n${issue.body ?? ""}`,
-		)
-		const shape = hot
-			? "hot-path isolated"
-			: /split/i.test(issue.title)
-				? "same-shape: split"
-				: /coverage/i.test(issue.title)
-					? "same-shape: coverage"
-					: /test/i.test(issue.title)
-						? "same-shape: tests"
-						: /docs/i.test(issue.title)
-							? "same-shape: docs"
-							: /refactor/i.test(issue.title)
-								? "same-shape: refactor"
-								: "generic"
-		shapeNotes.set(issue.number, shape)
+		const shape = issueShape(issue)
+		const label =
+			shape === "hot" ? "hot-path isolated" : shape === "generic" ? "generic" : `same-shape: ${shape}`
+		shapeNotes.set(issue.number, label)
 	}
 
 	process.stdout.write("── Orchestrate plan (dry run) ─────────────────────────────\n")
@@ -1111,6 +1106,15 @@ function printPlan(
 		process.stdout.write(
 			`  ${spec.name.padEnd(4)} issue ${spec.issues.join(", ").padEnd(10)} -> plans/parallel-tasks/${spec.taskFile}  (${reasons})\n`,
 		)
+	}
+	// Issue #16: expected cost/iteration range for this round, estimated
+	// from recorded cost history (best-effort — a read failure yields no
+	// section, never a failed dry-run).
+	if (estimateSection && estimateSection.length > 0) {
+		process.stdout.write("\nCost estimate (from recorded cost-history — issue #16):\n")
+		for (const line of estimateSection) {
+			process.stdout.write(`  ${line}\n`)
+		}
 	}
 	process.stdout.write("\nSpawn commands:\n")
 	process.stdout.write(`  ${spawnCommandFor(HARNESS_ROOT_TS, specs)}\n`)
@@ -1813,11 +1817,22 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		const previewModel = (mode: string): string =>
 			resolveModelForMode({ workspaceRoot: repo, mode, explicitModel: options.model, env: process.env }) ??
 			"deepseek/deepseek-v4-flash (client default)"
+		// Issue #16: estimate the round's expected cost/iterations from
+		// recorded cost history, keyed by issue shape. Advisory only — a
+		// history read failure must never fail the dry-run, just omit the
+		// section.
+		let historyRecords: Awaited<ReturnType<typeof readCostHistory>> = []
+		try {
+			historyRecords = await readCostHistory(repo)
+		} catch {
+			historyRecords = []
+		}
+		const estimateSection = buildEstimateSection(estimateGroups(historyRecords, specs, issues), historyRecords.length)
 		printPlan(repo, options.mode, specs, issues, {
 			worker: previewModel(options.mode),
 			reviewer: previewModel(options.reviewMode),
 			qa: previewModel(options.qaMode),
-		}, options.maxIterations)
+		}, options.maxIterations, estimateSection)
 		return 0
 	}
 
@@ -1965,6 +1980,25 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		state = { batch, groups: [] }
 	}
 	state.batch = batch
+	// Issue #16: stamp every group with its per-issue shape (split.ts's
+	// issueShape) at dispatch time — the only moment the issue titles/bodies
+	// are in hand. cost-history recording happens LATER (when the group
+	// reaches a terminal status, possibly in a separate orchestrate
+	// invocation) and only has issue numbers; the shape is what lets
+	// cost-estimate.ts match a NEW task to similar past ones, so it must be
+	// captured here and persisted in the state file (OrchestratorGroup.shapes).
+	const shapeByNumber = new Map<number, string>()
+	for (const issue of issues) {
+		shapeByNumber.set(issue.number, issueShape(issue))
+	}
+	const groupNamesOnDisk = new Set(state.groups.map((g) => g.name))
+	for (const spec of specs) {
+		if (!groupNamesOnDisk.has(spec.name)) {
+			continue
+		}
+		const shapes = spec.issues.map((n) => shapeByNumber.get(n) ?? "generic")
+		state = updateGroup(state, spec.name, { shapes })
+	}
 	// Issue #13: persist the preflight probe so the dashboard can surface the
 	// preflight line on the round view (see aggregate.ts RoundSummary.preflight).
 	if (preflightProbe) {

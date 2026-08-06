@@ -82,13 +82,33 @@ function isHotPath(issue: SplitIssue): boolean {
 	return HOT_PATH_RE.test(haystack)
 }
 
-function shapeOf(issue: SplitIssue): string {
+/**
+ * The mechanical "shape" of an issue (heuristic 2's grouping key): the first
+ * same-shape pattern matched against the TITLE (split/coverage/test/docs/
+ * refactor), or "generic" when none matches. Pure title-based — the same key
+ * used to batch issues into worktrees. Exported because it doubles as the
+ * similarity signal for cost estimation (cost-estimate.ts, issue #16): a NEW
+ * issue whose shape matches past ones inherits their recorded cost profile.
+ */
+export function shapeOf(issue: SplitIssue): string {
 	for (const { key, re } of SAME_SHAPE_PATTERNS) {
 		if (re.test(issue.title)) {
 			return key
 		}
 	}
 	return GENERIC_KEY
+}
+
+/**
+ * The full shape taxonomy used for cost estimation: "hot" when the issue
+ * touches a hot path (title OR body — the same scan that isolates hot-path
+ * issues into their own worktree), else shapeOf's mechanical shape. A hot
+ * issue keeps its hot label even when its title also matches a mechanical
+ * pattern: hot-path work has its own risk/cost profile, and split.ts treats
+ * it as its own category for isolation purposes.
+ */
+export function issueShape(issue: SplitIssue): string {
+	return isHotPath(issue) ? "hot" : shapeOf(issue)
 }
 
 function capFor(shape: string): number {
