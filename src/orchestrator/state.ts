@@ -32,6 +32,7 @@
 import * as fs from "node:fs"
 import * as fsp from "node:fs/promises"
 import * as path from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 
 /** One worktree group in the orchestrator state file. */
 export interface OrchestratorGroup {
@@ -309,15 +310,19 @@ export function updateGroup(
 }
 
 /**
- * Serializes read-merge-write critical sections against the state file.
- * Needed now that review/QA for multiple groups can run concurrently
- * (watchGroups no longer awaits one group's onGroupUpdate before starting
- * the next) — without this, two concurrent callers doing
+ * Serializes read-merge-write critical sections against the state file
+ * WITHIN this process. Needed now that review/QA for multiple groups can
+ * run concurrently (watchGroups no longer awaits one group's onGroupUpdate
+ * before starting the next) — without this, two concurrent callers doing
  * loadState -> updateGroup -> saveState for DIFFERENT groups can interleave
  * across their `await` points and race: both read the same on-disk
  * snapshot, then whichever saves last clobbers the other's patch for its
  * own group. Every merge point in cli.ts's onGroupUpdate must go through
  * patchGroup below rather than reusing a stale in-memory state snapshot.
+ *
+ * This is an in-process JS Promise chain — it does NOT protect against a
+ * SECOND, separate `orchestrate` OS process racing the same state file (see
+ * acquireCrossProcessLock below for that half of the story; issue #43).
  */
 let stateWriteQueue: Promise<unknown> = Promise.resolve()
 
@@ -330,12 +335,77 @@ function withStateLock<T>(fn: () => Promise<T>): Promise<T> {
 	return run
 }
 
+/** How long a lock dir may sit unrefreshed before another process may steal it (a crashed holder never got to release it). */
+const LOCK_STALE_MS = 30_000
+/** Poll interval while waiting for a held lock. */
+const LOCK_RETRY_MS = 20
+/** How long to wait for a lock before giving up loudly rather than hanging forever. */
+const LOCK_ACQUIRE_TIMEOUT_MS = 15_000
+
+/**
+ * Cross-process mutex for the state file, using the SAME atomic-mkdir
+ * convention already established in this codebase for other lock-like
+ * markers (`.harness.done` — "mkdir-based, atomic", see watch.ts's own
+ * doc comment). `fs.mkdirSync` without `recursive` is an atomic exclusive
+ * create at the OS level: exactly one concurrent caller (in this process OR
+ * a different one) can succeed; every other caller gets EEXIST and must
+ * wait or steal a stale lock.
+ *
+ * Fixes issue #43: `withStateLock` above only serializes callers within ONE
+ * Node process. Two separate `orchestrate` invocations against the same
+ * repo — a scenario the team deliberately held off on running before this
+ * lock existed — would otherwise have zero protection against the exact
+ * lost-update race #24's patchGroup was built to prevent at the in-process
+ * level, just one level up (process A reads, process B reads the same
+ * stale snapshot, A writes, B's write silently discards A's).
+ */
+async function acquireCrossProcessLock(lockDir: string, timeoutMs = LOCK_ACQUIRE_TIMEOUT_MS): Promise<() => void> {
+	const deadline = Date.now() + timeoutMs
+	while (true) {
+		try {
+			fs.mkdirSync(lockDir)
+			return () => {
+				try {
+					fs.rmdirSync(lockDir)
+				} catch {
+					/* already gone (e.g. reclaimed as stale by another process) — fine */
+				}
+			}
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+				throw err
+			}
+			// Reclaim a stale lock: its holder crashed (or was killed) before
+			// releasing it. Without this, one dead process permanently
+			// deadlocks every future orchestrate invocation against this repo.
+			try {
+				const heldFor = Date.now() - fs.statSync(lockDir).mtimeMs
+				if (heldFor > LOCK_STALE_MS) {
+					fs.rmdirSync(lockDir)
+					continue
+				}
+			} catch {
+				continue // lock vanished between our mkdir attempt and stat — retry now
+			}
+			if (Date.now() > deadline) {
+				throw new Error(
+					`patchGroup: could not acquire cross-process lock ${lockDir} within ${timeoutMs}ms ` +
+						`(another orchestrate process may be stuck — check for a stale ${lockDir} dir)`,
+				)
+			}
+			await sleep(LOCK_RETRY_MS)
+		}
+	}
+}
+
 /**
  * Atomically patch one group in the on-disk state file: reloads fresh,
- * merges the patch, writes, all inside the write lock so a concurrent patch
- * for a different group (or the same group) can't be lost. Returns the full
- * merged state. Prefer this over a manual loadState/updateGroup/saveState
- * sequence anywhere concurrent writers are possible.
+ * merges the patch, writes, all inside BOTH the in-process write lock and
+ * the cross-process file lock, so a concurrent patch for a different group
+ * (or the same group) — from this process OR a second orchestrate process
+ * against the same repo — can't be lost. Returns the full merged state.
+ * Prefer this over a manual loadState/updateGroup/saveState sequence
+ * anywhere concurrent writers are possible.
  */
 export async function patchGroup(
 	statePath: string,
@@ -343,9 +413,14 @@ export async function patchGroup(
 	patch: Partial<Omit<OrchestratorGroup, "name">>,
 ): Promise<OrchestratorState> {
 	return withStateLock(async () => {
-		const fresh = await loadState(statePath)
-		const next = updateGroup(fresh, name, patch)
-		await saveState(statePath, next)
-		return next
+		const release = await acquireCrossProcessLock(`${statePath}.lock`)
+		try {
+			const fresh = await loadState(statePath)
+			const next = updateGroup(fresh, name, patch)
+			await saveState(statePath, next)
+			return next
+		} finally {
+			release()
+		}
 	})
 }

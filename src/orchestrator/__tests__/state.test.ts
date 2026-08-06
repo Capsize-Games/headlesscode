@@ -6,8 +6,11 @@
 
 import assert from "node:assert/strict"
 import * as fs from "node:fs/promises"
+import * as fsSync from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
+import { fileURLToPath } from "node:url"
+import { spawn } from "node:child_process"
 
 import {
 	defaultState,
@@ -105,6 +108,77 @@ async function testSyncVariants(): Promise<void> {
 	assert.deepEqual(state.groups, [])
 }
 
+/** Resolve tsx by walking up ancestor node_modules/.bin/ (same as scripts/run-tests.mjs). */
+function resolveTsxBin(dir: string): string {
+	let current = dir
+	while (true) {
+		const candidate = path.join(current, "node_modules", ".bin", "tsx")
+		if (fsSync.existsSync(candidate)) {
+			return candidate
+		}
+		const parent = path.dirname(current)
+		if (parent === current) {
+			throw new Error(`could not find node_modules/.bin/tsx walking up from ${dir}`)
+		}
+		current = parent
+	}
+}
+
+function runFixtureProcess(statePath: string, namePrefix: string, count: number): Promise<void> {
+	const repoRoot = fileURLToPath(new URL("../../..", import.meta.url))
+	const fixture = fileURLToPath(new URL("./fixtures/patch-group-worker.mjs", import.meta.url))
+	const tsxBin = resolveTsxBin(repoRoot)
+	return new Promise((resolve, reject) => {
+		const child = spawn(tsxBin, [fixture, statePath, namePrefix, String(count)], { stdio: "inherit" })
+		child.on("error", reject)
+		child.on("exit", (code) => {
+			if (code === 0) {
+				resolve()
+			} else {
+				reject(new Error(`fixture process (${namePrefix}) exited with code ${code}`))
+			}
+		})
+	})
+}
+
+/**
+ * Issue #43: patchGroup's in-process lock (withStateLock) only serializes
+ * callers within ONE Node process — it does nothing for a SECOND, separate
+ * `orchestrate` OS process racing the same state file. Proves the fix (a
+ * real cross-process lock, acquireCrossProcessLock, via atomic mkdir) by
+ * spawning TWO REAL child processes that each create many new, distinctly
+ * named groups in the SAME shared state file concurrently. Without the
+ * cross-process lock, one process's group-creation write can be silently
+ * discarded by the other's stale-read-based save (the classic lost-update
+ * race) — this reliably reproduces with real OS-level interleaving across
+ * enough concurrent writes, no artificial delay needed.
+ */
+async function testPatchGroupSurvivesTwoConcurrentProcesses(): Promise<void> {
+	const p = await tmpStatePath()
+	saveStateSync(p, defaultState("race-test"))
+
+	const COUNT = 150
+	await Promise.all([runFixtureProcess(p, "procA", COUNT), runFixtureProcess(p, "procB", COUNT)])
+
+	const finalState = loadStateSync(p)
+	const names = new Set(finalState.groups.map((g) => g.name))
+	const missing: string[] = []
+	for (const prefix of ["procA", "procB"]) {
+		for (let i = 0; i < COUNT; i++) {
+			const name = `${prefix}-${i}`
+			if (!names.has(name)) {
+				missing.push(name)
+			}
+		}
+	}
+	assert.deepEqual(
+		missing,
+		[],
+		`${missing.length}/${COUNT * 2} group(s) LOST to a cross-process race (no lock protection): ${missing.slice(0, 10).join(", ")}${missing.length > 10 ? "..." : ""}`,
+	)
+	assert.equal(finalState.groups.length, COUNT * 2, "no duplicate or extra entries either")
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -114,6 +188,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["invalid JSON throws", testLoadInvalidJsonThrows],
 	["updateGroup upserts by name, merges, immutable", testUpdateGroupUpsertsAndMerges],
 	["sync load/save variants", testSyncVariants],
+	["patchGroup survives two concurrent OS processes racing the same state file (issue #43)", testPatchGroupSurvivesTwoConcurrentProcesses],
 ]
 
 async function main(): Promise<void> {
