@@ -6,8 +6,15 @@
  * and the reviewer checklist from the airunner repo.
  */
 
-export { splitIssues } from "./split.js"
-export type { SplitIssue, WorktreeSpec } from "./split.js"
+export {
+	ISSUE_SIZE_WARN_THRESHOLD,
+	issueShape,
+	issueSizeWarnings,
+	shapeOf,
+	splitIssues,
+	topLevelSectionCount,
+} from "./split.js"
+export type { IssueSizeWarning, SplitIssue, WorktreeSpec } from "./split.js"
 
 export { loadState, loadStateSync, saveState, saveStateSync, updateGroup, defaultState } from "./state.js"
 export type { OrchestratorGroup, OrchestratorState } from "./state.js"
@@ -51,7 +58,6 @@ export {
 } from "./cost-estimate.js"
 export type { GroupEstimate, IssueEstimate, ShapeStats } from "./cost-estimate.js"
 
-export { issueShape, shapeOf } from "./split.js"
 
 export { watchGroups, inspectGroup, tailLog, groupWorktreePath, isPidAlive, DEFAULT_POLL_INTERVAL_MS, DEFAULT_STALL_TIMEOUT_MS } from "./watch.js"
 export type { WatchOptions, WatchSummary } from "./watch.js"

@@ -111,6 +111,70 @@ export function issueShape(issue: SplitIssue): string {
 	return isHotPath(issue) ? "hot" : shapeOf(issue)
 }
 
+/**
+ * Pre-flight issue-size check (issue #53). The two worst cost/iteration
+ * outliers this repo has seen (headlesscode #17, airunnerweb #80/#85) all
+ * share one trait: the issue body asks for several substantial, largely
+ * independent pieces of work in a single shot. This is the crude, free,
+ * deterministic signal for that — the issue text itself explicitly asks for
+ * "does the issue body have 3+ top-level numbered/bulleted sections" as an
+ * acceptable first cut. Warning-only by design: a crude heuristic can false-
+ * positive, so it never aborts a round, only warns loudly before dispatch.
+ */
+
+/** Flag an issue whose body reads like at least this many independent pieces. */
+export const ISSUE_SIZE_WARN_THRESHOLD = 3
+
+/** An issue flagged by the pre-flight size check, with the detected count. */
+export interface IssueSizeWarning {
+	number: number
+	title: string
+	/** Number of top-level numbered/bulleted sections detected in the body. */
+	sections: number
+}
+
+/**
+ * Count top-level numbered/bulleted list items in a markdown body — the crude
+ * "N independent pieces" signal. Top-level = at most 3 leading spaces (the
+ * CommonMark container rule); nested list items are indented deeper and are
+ * deliberately excluded. Also counts headings carrying an explicit ordinal
+ * ("## 1. Client session cards"). Pure line scan: prose without list markers
+ * scores 0, so inline numbers ("Python 3.10", "$1.50", "#17") never
+ * false-positive.
+ */
+export function topLevelSectionCount(body: string | undefined): number {
+	if (!body) {
+		return 0
+	}
+	let count = 0
+	for (const line of body.split("\n")) {
+		if (
+			/^ {0,3}\d{1,3}[.)]\s+\S/.test(line) ||
+			/^ {0,3}[-*+]\s+\S/.test(line) ||
+			/^#{1,6} {0,3}\d{1,3}[.)]?\s+\S/.test(line)
+		) {
+			count++
+		}
+	}
+	return count
+}
+
+/**
+ * Issues whose body reads like `ISSUE_SIZE_WARN_THRESHOLD`+ independent pieces
+ * of work — the exact shape that burned iteration caps and budget on real
+ * rounds before dispatch-time detection existed.
+ */
+export function issueSizeWarnings(issues: SplitIssue[]): IssueSizeWarning[] {
+	const warnings: IssueSizeWarning[] = []
+	for (const issue of issues) {
+		const sections = topLevelSectionCount(issue.body)
+		if (sections >= ISSUE_SIZE_WARN_THRESHOLD) {
+			warnings.push({ number: issue.number, title: issue.title, sections })
+		}
+	}
+	return warnings
+}
+
 function capFor(shape: string): number {
 	return shape === GENERIC_KEY ? GENERIC_GROUP_CAP : SAME_SHAPE_GROUP_CAP
 }

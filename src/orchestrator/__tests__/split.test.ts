@@ -8,7 +8,17 @@
 
 import assert from "node:assert/strict"
 
-import { splitIssues, shapeOf, issueShape, GENERIC_GROUP_CAP, SAME_SHAPE_GROUP_CAP, MAX_GROUPS } from "../split.js"
+import {
+	splitIssues,
+	shapeOf,
+	issueShape,
+	issueSizeWarnings,
+	topLevelSectionCount,
+	GENERIC_GROUP_CAP,
+	SAME_SHAPE_GROUP_CAP,
+	MAX_GROUPS,
+	ISSUE_SIZE_WARN_THRESHOLD,
+} from "../split.js"
 import type { SplitIssue } from "../split.js"
 
 function issue(number: number, title: string, body?: string): SplitIssue {
@@ -186,6 +196,41 @@ async function testIssueShapeHotWinsOverMechanicalShape(): Promise<void> {
 	assert.equal(issueShape(issue(5, "Rewrite the settings panel", "Touches the encryption layer directly")), "hot")
 }
 
+// ─── Pre-flight issue-size check (issue #53) ─────────────────────────────────
+
+async function testTopLevelSectionCount(): Promise<void> {
+	// A numbered list of 3+ items is the classic "N independent pieces" shape.
+	assert.equal(topLevelSectionCount("Three pieces:\n1. Build the index\n2. Wire the search\n3. Ship the dashboard"), 3)
+	// Bulleted lists count too.
+	assert.equal(topLevelSectionCount("- split the CLI\n- split the watcher\n- split the state file"), 3)
+	// Headings carrying an explicit ordinal count as sections.
+	assert.equal(topLevelSectionCount("## 1. Codemap phase one\n## 2. Cost tracking\n## 3. Rework loop"), 3)
+	// Below the threshold: 1-2 items are not a warning.
+	assert.equal(topLevelSectionCount("1. Do the thing\n2. Also this"), 2)
+	// Empty / missing bodies are never flagged.
+	assert.equal(topLevelSectionCount(undefined), 0)
+	assert.equal(topLevelSectionCount(""), 0)
+	assert.equal(topLevelSectionCount("Just prose."), 0)
+	// Inline numbers in prose must never false-positive.
+	assert.equal(topLevelSectionCount("Bump the runtime to 3.10 and fix the 1.50 bug (see #17)."), 0)
+	// Nested list items (indented 4+) are NOT top-level sections.
+	assert.equal(topLevelSectionCount("1. Client\n    - sub A\n    - sub B\n2. Server\n    - sub C\n3. Docs"), 3)
+}
+
+async function testIssueSizeWarningsOnlyFlagsThreePlusSections(): Promise<void> {
+	const issues = [
+		issue(17, "Codemap Phase 1", "Three pieces:\n1. Build the index\n2. Wire the search\n3. Ship the dashboard"),
+		issue(80, "Client UI", "One screen, one registry entry"),
+		issue(85, "Tiny fix", undefined),
+	]
+	const warnings = issueSizeWarnings(issues)
+	assert.equal(warnings.length, 1, "only the 3+-section issue is flagged")
+	assert.equal(warnings[0].number, 17, "flagged issue keeps its number")
+	assert.equal(warnings[0].sections, 3)
+	assert.equal(warnings[0].title, "Codemap Phase 1")
+	assert.equal(ISSUE_SIZE_WARN_THRESHOLD, 3, "threshold is 3 per the issue's own ask")
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -201,6 +246,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["deterministic regardless of input order", testDeterministicRegardlessOfInputOrder],
 	["shapeOf matches mechanical shapes from the title", testShapeOfMatchesMechanicalShapesFromTitle],
 	["issueShape marks hot-path issues hot (title or body, beats mechanical shape)", testIssueShapeHotWinsOverMechanicalShape],
+	["topLevelSectionCount counts numbered/bulleted/ordinal-heading sections only (issue #53)", testTopLevelSectionCount],
+	["issueSizeWarnings flags only 3+-section issues (issue #53)", testIssueSizeWarningsOnlyFlagsThreePlusSections],
 ]
 
 async function main(): Promise<void> {
