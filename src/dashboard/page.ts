@@ -385,6 +385,22 @@ export function renderPage(repo?: string): string {
   .tl-iter-err { color: #c0392b; font-weight: 600; }
   .tl-iter-tokens { color: GrayText; margin-left: auto; }
   .tl-iter-body { padding: 2px 2px 6px 14px; color: GrayText; }
+
+  /* Cost history (issue #29): historical per-round cost/token/duration charts,
+     rendered as inline SVG (no charting library). */
+  #costHistory .ch-chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  #costHistory .ch-chip {
+    border: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
+    border-radius: 8px; padding: 4px 10px; display: flex; gap: 6px; align-items: baseline;
+    background: color-mix(in srgb, CanvasText 4%, transparent);
+  }
+  #costHistory .ch-chip .ch-chip-label { color: GrayText; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.03em; }
+  #costHistory .ch-chip .ch-chip-value { font-weight: 600; }
+  #costHistory .ch-chip.ch-wasted .ch-chip-value { color: #c0392b; }
+  #costHistory .ch-block { margin-bottom: 16px; }
+  #costHistory .ch-block-title { font-size: 0.82rem; font-weight: 600; margin-bottom: 4px; }
+  #costHistory .ch-block-sub { font-size: 0.72rem; color: GrayText; margin-bottom: 6px; }
+  #costHistory .ch-table-wrap { overflow-x: auto; }
 </style>
 </head>
 <body>
@@ -444,6 +460,13 @@ export function renderPage(repo?: string): string {
 
   <h2>Sessions</h2>
   <div id="sessions"><div class="empty">no sessions found</div></div>
+
+  <h2>Cost history</h2>
+  <div class="sub">Historical per-round cost/token/duration from the central store's
+    <code>cost-history.jsonl</code> / <code>session-cost-history.jsonl</code>, served by
+    <code>/api/cost-history</code>. Uses the workspace path from the file browser above
+    (or <code>--repo</code>); reload with the file browser's Load button.</div>
+  <div id="costHistory"><div class="empty">loading…</div></div>
 
   <div id="detail">
     <div class="detail-head">
@@ -1910,6 +1933,10 @@ async function fbLoad() {
   holder.className = "fb-tree";
   fbEl.appendChild(holder);
   await renderFbLevel(holder, ".");
+  // The repo path also drives the cost-history + permissions views — reload
+  // them together so a repo switch updates the whole page, not just the tree.
+  loadCostHistory();
+  loadPermissions();
 }
 
 // ── Permissions settings (dashboard-file-browser-and-permissions-ui) ────────
@@ -2219,6 +2246,319 @@ async function submitAnswer(e, text, box) {
   }
 }
 
+// ── Cost history (issue #29) ─────────────────────────────────────────────────
+// Historical per-round + per-session cost/token/duration from the central
+// store's cost-history.jsonl / session-cost-history.jsonl, served by
+// GET /api/cost-history?repo=<path> (see src/dashboard/server.ts). All charts
+// are hand-rolled inline SVG — no charting library, matching this page's
+// no-dependency ethos. The server returns newest-first; the charts read
+// oldest-first.
+const costHistoryEl = document.getElementById("costHistory");
+
+function chRepo() {
+  return fbRepo() || "";
+}
+
+function chCost(n) {
+  return "$" + (n ?? 0).toFixed(4);
+}
+
+function chDuration(ms) {
+  if (!(typeof ms === "number") || !Number.isFinite(ms) || ms < 0) return "?";
+  const totalMinutes = Math.round(ms / 60000);
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return days + "d " + hours + "h";
+  if (hours > 0) return hours + "h " + minutes + "m";
+  return minutes + "m";
+}
+
+// Group label: the issues a round covered (#27,#29), falling back to the
+// group name for groups with no issue numbers.
+function chGroupLabel(g) {
+  const nums = (g.issues && g.issues.length) ? g.issues.map(function (x) { return "#" + x; }).join(",") : "";
+  return nums || g.groupName || "?";
+}
+
+// Generic inline-SVG single-series bar chart. items: [{label, value, color,
+// title}]. opts.format(v) renders y-axis labels; opts.height overrides the
+// chart height. Returns an SVG string (the caller innerHTMLs it).
+function chBars(items, opts) {
+  opts = opts || {};
+  const width = 640;
+  const height = opts.height || 170;
+  const padL = 48, padR = 8, padT = 10, padB = 20;
+  const plotW = width - padL - padR;
+  const plotH = height - padT - padB;
+  let max = 0;
+  for (const it of items) {
+    if (typeof it.value === "number" && it.value > max) max = it.value;
+  }
+  if (max <= 0) max = 1;
+  const n = items.length;
+  const slot = n > 0 ? plotW / n : plotW;
+  const barW = Math.max(2, slot * 0.55);
+  const steps = 4;
+  let out = '<svg viewBox="0 0 ' + width + " " + height + '" width="100%" style="max-width:640px;height:auto" role="img">';
+  for (let i = 0; i <= steps; i++) {
+    const v = (max * i) / steps;
+    const y = padT + plotH - (plotH * i) / steps;
+    out += '<line x1="' + padL + '" y1="' + y + '" x2="' + (width - padR) + '" y2="' + y + '" stroke="currentColor" stroke-opacity="0.12"/>';
+    out += '<text x="' + (padL - 6) + '" y="' + (y + 3) + '" text-anchor="end" font-size="9" fill="currentColor" fill-opacity="0.7">' +
+      esc(opts.format ? opts.format(v) : Math.round(v)) + "</text>";
+  }
+  items.forEach(function (it, i) {
+    const x = padL + i * slot + (slot - barW) / 2;
+    const h = Math.max(1, (plotH * it.value) / max);
+    const y = padT + plotH - h;
+    out += '<rect x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '" width="' + barW.toFixed(1) + '" height="' + h.toFixed(1) + '" rx="2" fill="' + (it.color || "#8250df") + '"><title>' + esc(it.title || it.label) + "</title></rect>";
+    if (n <= 24) {
+      out += '<text x="' + (x + barW / 2).toFixed(1) + '" y="' + (height - 6) + '" text-anchor="middle" font-size="8.5" fill="currentColor" fill-opacity="0.7">' + esc(it.label) + "</text>";
+    }
+  });
+  out += "</svg>";
+  return out;
+}
+
+// Spend per round (bars) + cumulative spend (line on a 0..total scale).
+function chCostChart(asc) {
+  const width = 640, height = 170;
+  const padL = 48, padR = 8, padT = 10, padB = 20;
+  const plotW = width - padL - padR;
+  const plotH = height - padT - padB;
+  let max = 0;
+  let total = 0;
+  for (const g of asc) {
+    if (g.costUsd > max) max = g.costUsd;
+    total += g.costUsd;
+  }
+  if (max <= 0) max = 1;
+  const n = asc.length;
+  const slot = n > 0 ? plotW / n : plotW;
+  const barW = Math.max(2, slot * 0.5);
+  const steps = 4;
+  let out = '<svg viewBox="0 0 ' + width + " " + height + '" width="100%" style="max-width:640px;height:auto" role="img">';
+  for (let i = 0; i <= steps; i++) {
+    const v = (max * i) / steps;
+    const y = padT + plotH - (plotH * i) / steps;
+    out += '<line x1="' + padL + '" y1="' + y + '" x2="' + (width - padR) + '" y2="' + y + '" stroke="currentColor" stroke-opacity="0.12"/>';
+    out += '<text x="' + (padL - 6) + '" y="' + (y + 3) + '" text-anchor="end" font-size="9" fill="currentColor" fill-opacity="0.7">$' + v.toFixed(2) + "</text>";
+  }
+  const pts = [];
+  let cum = 0;
+  asc.forEach(function (g, i) {
+    cum += g.costUsd;
+    const cx = padL + i * slot + slot / 2;
+    const cy = padT + plotH - (plotH * cum) / (total > 0 ? total : 1);
+    pts.push(cx.toFixed(1) + "," + cy.toFixed(1));
+    const x = padL + i * slot + (slot - barW) / 2;
+    const h = Math.max(1, (plotH * g.costUsd) / max);
+    const y = padT + plotH - h;
+    out += '<rect x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '" width="' + barW.toFixed(1) + '" height="' + h.toFixed(1) + '" rx="2" fill="#8250df"><title>' + esc(chGroupLabel(g)) + ": " + chCost(g.costUsd) + "</title></rect>";
+    if (n <= 24) {
+      out += '<text x="' + (x + barW / 2).toFixed(1) + '" y="' + (height - 6) + '" text-anchor="middle" font-size="8.5" fill="currentColor" fill-opacity="0.7">' + esc(chGroupLabel(g)) + "</text>";
+    }
+  });
+  if (pts.length > 1) {
+    out += '<polyline points="' + pts.join(" ") + '" fill="none" stroke="#1a7f37" stroke-width="1.5"><title>cumulative spend</title></polyline>';
+  }
+  out += "</svg>";
+  return out;
+}
+
+// Token usage per round: grouped bars for input / output / cached + gold dots
+// for the cache-hit rate (cached ÷ input) on the same 0..max scale.
+function chTokensChart(asc) {
+  const width = 640, height = 170;
+  const padL = 48, padR = 8, padT = 10, padB = 20;
+  const plotW = width - padL - padR;
+  const plotH = height - padT - padB;
+  let max = 0;
+  for (const g of asc) {
+    const t = Math.max(g.inputTokens || 0, g.outputTokens || 0, g.cachedTokens || 0);
+    if (t > max) max = t;
+  }
+  if (max <= 0) max = 1;
+  const n = asc.length;
+  const slot = n > 0 ? plotW / n : plotW;
+  const groupW = Math.max(3, slot * 0.7);
+  const barW = Math.max(1, groupW / 3 - 1);
+  const steps = 4;
+  let out = '<svg viewBox="0 0 ' + width + " " + height + '" width="100%" style="max-width:640px;height:auto" role="img">';
+  for (let i = 0; i <= steps; i++) {
+    const v = (max * i) / steps;
+    const y = padT + plotH - (plotH * i) / steps;
+    out += '<line x1="' + padL + '" y1="' + y + '" x2="' + (width - padR) + '" y2="' + y + '" stroke="currentColor" stroke-opacity="0.12"/>';
+    out += '<text x="' + (padL - 6) + '" y="' + (y + 3) + '" text-anchor="end" font-size="9" fill="currentColor" fill-opacity="0.7">' + esc(fmtInt(Math.round(v))) + "</text>";
+  }
+  const series = [
+    { key: "inputTokens", color: "#8250df", name: "input" },
+    { key: "outputTokens", color: "#1a7f37", name: "output" },
+    { key: "cachedTokens", color: "#38bdf8", name: "cached" },
+  ];
+  asc.forEach(function (g, i) {
+    const gx = padL + i * slot + (slot - groupW) / 2;
+    series.forEach(function (s, j) {
+      const v = g[s.key] || 0;
+      const h = Math.max(1, (plotH * v) / max);
+      const y = padT + plotH - h;
+      const x = gx + j * (barW + 1);
+      out += '<rect x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '" width="' + barW.toFixed(1) + '" height="' + h.toFixed(1) + '" fill="' + s.color + '"><title>' + esc(s.name) + " · " + esc(chGroupLabel(g)) + ": " + fmtInt(v) + "</title></rect>";
+    });
+    const rate = g.inputTokens > 0 ? (g.cachedTokens || 0) / g.inputTokens : 0;
+    const cx = padL + i * slot + slot / 2;
+    const cy = padT + plotH - plotH * rate;
+    out += '<circle cx="' + cx.toFixed(1) + '" cy="' + cy.toFixed(1) + '" r="2.5" fill="#b8860b"><title>cache hit rate ' + fmtPct(rate * 100) + "</title></circle>";
+    if (n <= 24) {
+      out += '<text x="' + (padL + i * slot + slot / 2).toFixed(1) + '" y="' + (height - 6) + '" text-anchor="middle" font-size="8.5" fill="currentColor" fill-opacity="0.7">' + esc(chGroupLabel(g)) + "</text>";
+    }
+  });
+  out += "</svg>";
+  return out;
+}
+
+function chChip(label, value, cls) {
+  return '<span class="ch-chip' + (cls ? " " + cls : "") + '"><span class="ch-chip-label">' + esc(label) + '</span><span class="ch-chip-value">' + esc(value) + "</span></span>";
+}
+
+async function loadCostHistory() {
+  const el = costHistoryEl;
+  if (!el) return;
+  const repo = chRepo();
+  if (!repo) {
+    el.innerHTML = '<div class="empty">enter a workspace path in the file browser above (or start the dashboard with --repo) to load cost history</div>';
+    return;
+  }
+  try {
+    const res = await fetch("/api/cost-history?repo=" + encodeURIComponent(repo));
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    renderCostHistory(data);
+  } catch (err) {
+    el.innerHTML = '<div class="empty">failed to load cost history: ' + esc(err) + "</div>";
+  }
+}
+
+function renderCostHistory(data) {
+  const el = costHistoryEl;
+  if (!el) return;
+  const groups = data.groups || [];
+  const sessions = data.sessions || [];
+  el.innerHTML = "";
+  if (groups.length === 0 && sessions.length === 0) {
+    el.innerHTML = '<div class="empty">no cost history recorded for this repo yet — per-round records appear once an orchestrated round reaches a terminal status</div>';
+    return;
+  }
+  // Charts read oldest → newest; the server returns newest-first.
+  const asc = groups.slice().sort(function (a, b) {
+    return a.recordedAt < b.recordedAt ? -1 : a.recordedAt > b.recordedAt ? 1 : 0;
+  });
+  const totalCost = groups.reduce(function (s, g) { return s + g.costUsd; }, 0);
+  const totalMs = groups.reduce(function (s, g) { return s + (g.wallClockMs || 0); }, 0);
+  const totalIter = groups.reduce(function (s, g) { return s + (g.iterations || 0); }, 0);
+  const wasted = sessions.filter(function (r) { return r.status !== "success"; });
+  const wastedCost = wasted.reduce(function (s, r) { return s + r.costUsd; }, 0);
+
+  const chips = document.createElement("div");
+  chips.className = "ch-chips";
+  chips.innerHTML =
+    chChip("rounds", fmtInt(groups.length)) +
+    chChip("total spend", chCost(totalCost)) +
+    chChip("wall-clock", chDuration(totalMs)) +
+    chChip("iterations", fmtInt(totalIter)) +
+    chChip("wasted sessions", fmtInt(wasted.length) + " · " + chCost(wastedCost), wasted.length ? "ch-wasted" : "");
+  el.appendChild(chips);
+
+  const costBlock = document.createElement("div");
+  costBlock.className = "ch-block";
+  costBlock.innerHTML = '<div class="ch-block-title">Spend over time</div>' +
+    '<div class="ch-block-sub">cost per round (bars) + cumulative spend (line); rounds labeled by issue number(s).</div>' +
+    chCostChart(asc);
+  el.appendChild(costBlock);
+
+  const tokBlock = document.createElement("div");
+  tokBlock.className = "ch-block";
+  tokBlock.innerHTML = '<div class="ch-block-title">Token usage per round</div>' +
+    '<div class="ch-block-sub">input / output / cached bars; gold dot per round = cache-hit rate (cached ÷ input) — a useful efficiency signal.</div>' +
+    chTokensChart(asc);
+  el.appendChild(tokBlock);
+
+  const wallItems = asc.map(function (g) {
+    return {
+      label: chGroupLabel(g),
+      value: g.wallClockMs || 0,
+      color: "#4f9cf9",
+      title: chGroupLabel(g) + ": " + chDuration(g.wallClockMs),
+    };
+  });
+  const wallBlock = document.createElement("div");
+  wallBlock.className = "ch-block";
+  wallBlock.innerHTML = '<div class="ch-block-title">Wall-clock time to completion per round</div>' +
+    '<div class="ch-block-sub">dispatch (first session start) → recorded (terminal status). "?" = no start timestamp (records from before that field existed).</div>' +
+    chBars(wallItems, { format: chDuration });
+  el.appendChild(wallBlock);
+
+  const iterItems = asc.map(function (g) {
+    return {
+      label: chGroupLabel(g),
+      value: g.iterations || 0,
+      color: "#f59e0b",
+      title: chGroupLabel(g) + ": " + fmtInt(g.iterations) + " iterations · " + fmtInt(g.continuationCount || 0) + " continuations · " + fmtInt(g.reworkCount || 0) + " reworks",
+    };
+  });
+  const iterBlock = document.createElement("div");
+  iterBlock.className = "ch-block";
+  iterBlock.innerHTML = '<div class="ch-block-title">Iterations per round</div>' +
+    '<div class="ch-block-sub">hover a bar for continuation/rework counts — a proxy for how much friction the round hit.</div>' +
+    chBars(iterItems, {});
+  el.appendChild(iterBlock);
+
+  // Wasted-spend breakdown, from the per-session records (same definition the
+  // cost-history CLI's summary line uses: any non-success outcome).
+  if (wasted.length > 0) {
+    const byStatus = {};
+    for (const r of wasted) {
+      byStatus[r.status] = byStatus[r.status] || { count: 0, cost: 0 };
+      byStatus[r.status].count += 1;
+      byStatus[r.status].cost += r.costUsd;
+    }
+    let wasteRows = "";
+    for (const st of ["error", "budget", "killed"]) {
+      const info = byStatus[st];
+      if (!info) continue;
+      wasteRows += '<tr><td class="status-' + esc(st) + '">' + esc(st) + "</td><td>" + fmtInt(info.count) + "</td><td>" + chCost(info.cost) + "</td></tr>";
+    }
+    const wasteBlock = document.createElement("div");
+    wasteBlock.className = "ch-block";
+    wasteBlock.innerHTML = '<div class="ch-block-title">Wasted-spend breakdown</div>' +
+      '<div class="ch-block-sub">sessions that ended error / budget / killed — spend that produced no completed-round outcome on its own.</div>' +
+      '<div class="ch-table-wrap"><table><thead><tr><th>status</th><th>sessions</th><th>cost</th></tr></thead><tbody>' + wasteRows + "</tbody></table></div>";
+    el.appendChild(wasteBlock);
+  }
+
+  // Full per-round table (the CLI table's data, browsable).
+  const rows = asc.map(function (g) {
+    return "<tr>" +
+      "<td>" + esc(g.groupName) + "</td>" +
+      '<td class="mono">' + esc(chGroupLabel(g)) + "</td>" +
+      '<td class="status-' + esc(g.status) + '">' + esc(g.status) + "</td>" +
+      "<td>" + chCost(g.costUsd) + "</td>" +
+      "<td>" + fmtInt(g.iterations || 0) + "</td>" +
+      "<td>" + chDuration(g.wallClockMs) + "</td>" +
+      "<td>" + fmtInt(g.continuationCount || 0) + "</td>" +
+      "<td>" + fmtInt(g.reworkCount || 0) + "</td>" +
+      '<td class="mono">' + esc(g.recordedAt) + "</td>" +
+      "</tr>";
+  }).join("");
+  const tableBlock = document.createElement("div");
+  tableBlock.className = "ch-block";
+  tableBlock.innerHTML = '<div class="ch-block-title">Rounds</div>' +
+    '<div class="ch-table-wrap"><table><thead><tr><th>group</th><th>issues</th><th>status</th><th>cost</th><th>iter</th><th>time</th><th>cont</th><th>rework</th><th>recorded</th></tr></thead>' +
+    "<tbody>" + rows + "</tbody></table></div>";
+  el.appendChild(tableBlock);
+}
+
 async function poll() {
   try {
     const res = await fetch("/api/summary");
@@ -2272,6 +2612,7 @@ poll();
 loadModeModels();
 loadPermissions();
 loadModes();
+loadCostHistory();
 setInterval(poll, 4000);
 // Live event feed poll: faster than the summary poll (1.5s) so the detail
 // view feels live, and only runs while a detail view is open.

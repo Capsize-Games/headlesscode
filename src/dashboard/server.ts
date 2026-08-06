@@ -41,6 +41,13 @@
  *                                     `headlesscode codemap --workspace <path>` has run
  *   GET  /api/codemap/html?repo=<path>  the self-contained interactive visualizer
  *                                     (same store; opens standalone in a browser)
+ *   GET  /api/cost-history?repo=<path>[&since=<iso>][&limit=N]
+ *                                     recorded per-group + per-session cost/token/
+ *                                     duration history from the central store's
+ *                                     cost-history.jsonl / session-cost-history.jsonl
+ *                                     (see src/orchestrator/cost-history.ts) as JSON,
+ *                                     optionally windowed by recordedAt (since) or
+ *                                     most-recent-N (limit)
  *
  * NOTE (control plane): the POST /api/session/start route can launch real,
  * billed work and run arbitrary shell via `gh`/`orchestrate` from a form
@@ -88,6 +95,7 @@ import {
 	validateModeModelsBody,
 	type ModeModelsFile,
 } from "../config/mode-models.js"
+import { readCostHistory, readSessionCostHistory } from "../orchestrator/cost-history.js"
 import { listWorkspaceDir, readWorkspaceFile } from "./files.js"
 import {
 	loadPermissionsFile,
@@ -750,6 +758,76 @@ async function handleRequest(
 		try {
 			const summary = await buildSummary(options.repo)
 			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(JSON.stringify(summary))
+		} catch (error) {
+			res
+				.writeHead(500, { "content-type": "application/json; charset=utf-8" })
+				.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+		}
+		return
+	}
+
+	// Historical cost/token/duration (issue #29): GET /api/cost-history?repo=<path>
+	// serves the central store's recorded per-group cost history AND per-session
+	// breakdown (cost-history.jsonl / session-cost-history.jsonl — see
+	// src/orchestrator/cost-history.ts) as JSON. Read-only; a repo with no
+	// history yet yields empty arrays, never an error (missing files are handled
+	// by the readers). Optional windowing: ?since=<iso> keeps only records
+	// recorded at/after the timestamp (ISO-8601 strings compare correctly), and
+	// ?limit=N keeps the N most recently recorded — both applied after sorting
+	// newest-first, matching the CLI's most-recent-first presentation.
+	if (url.pathname === "/api/cost-history" && req.method === "GET") {
+		const repo = url.searchParams.get("repo") || options.repo
+		if (!repo) {
+			res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ error: "missing repo — pass ?repo=<path> or start the dashboard with --repo" }),
+			)
+			return
+		}
+		const sinceRaw = url.searchParams.get("since")
+		let since: string | undefined
+		if (sinceRaw !== null && sinceRaw !== "") {
+			if (Number.isNaN(Date.parse(sinceRaw))) {
+				res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+					JSON.stringify({ error: "invalid since — pass an ISO-8601 timestamp, e.g. ?since=2026-08-05T00:00:00Z" }),
+				)
+				return
+			}
+			since = sinceRaw
+		}
+		const limitRaw = url.searchParams.get("limit")
+		let limit: number | undefined
+		if (limitRaw !== null && limitRaw !== "") {
+			limit = Number(limitRaw)
+			if (!Number.isInteger(limit) || limit <= 0) {
+				res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+					JSON.stringify({ error: "invalid limit — pass a positive integer" }),
+				)
+				return
+			}
+		}
+		try {
+			let groups = await readCostHistory(repo)
+			let sessions = await readSessionCostHistory(repo)
+			if (since) {
+				// Compare parsed instants, not raw strings: recordedAt is always
+				// millisecond-precision ("...000Z") while a hand-typed ?since=
+				// (e.g. the error message's own example) is often second-precision
+				// ("...Z") — the same instant in both forms compares unequal (and
+				// sorts wrong) as strings because "." (0x2E) < "Z" (0x5A).
+				const sinceMs = Date.parse(since)
+				groups = groups.filter((r) => Date.parse(r.recordedAt) >= sinceMs)
+				sessions = sessions.filter((r) => Date.parse(r.recordedAt) >= sinceMs)
+			}
+			// Newest first (the ordering the CLI prints), then window to N.
+			groups.sort((a, b) => Date.parse(b.recordedAt) - Date.parse(a.recordedAt))
+			sessions.sort((a, b) => Date.parse(b.recordedAt) - Date.parse(a.recordedAt))
+			if (limit !== undefined) {
+				groups = groups.slice(0, limit)
+				sessions = sessions.slice(0, limit)
+			}
+			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ generatedAt: new Date().toISOString(), repo: path.resolve(repo), groups, sessions }),
+			)
 		} catch (error) {
 			res
 				.writeHead(500, { "content-type": "application/json; charset=utf-8" })
