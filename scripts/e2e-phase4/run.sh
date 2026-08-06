@@ -18,6 +18,10 @@
 #   5. `orchestrate --deploy` wiring: after a passing round the gate runs and
 #      the fake deploy script is invoked; with a wrong token the round ends
 #      DENIED (exit 1) and the deploy script is NOT invoked.
+#   6. QA-fail rework loop (issue #52): a real QA FAIL verdict auto-triggers a
+#      rework cycle on the SAME worktree (REWORK_QA=1 mock: first QA fails,
+#      second passes) — the round re-reviews clean and re-QA's pass inside ONE
+#      `orchestrate --qa` run.
 #
 # Usage: scripts/e2e-phase4/run.sh
 #   KEEP=1   keep temp fixture/bare/worktrees/logs (default: remove)
@@ -66,11 +70,19 @@ cleanup() {
 			git -C "$FIXTURE2" worktree remove --force "$FIXTURE2/.worktrees/$n" 2>/dev/null || true
 		done
 	fi
-	rm -rf "${FIXTURE:-}" "${BARE:-}" "${FIXTURE2:-}" "${BARE2:-}" "${DEPLOY_TARGET:-}" \
+	# QA-fail rework fixture (third fixture from section 11).
+	if [ -n "${FIXTURE3:-}" ]; then
+		for n in $WORKTREE_NAMES; do
+			bash "$ROOT/scripts/stop-worker.sh" "$FIXTURE3/.worktrees/$n" >/dev/null 2>&1 || true
+			git -C "$FIXTURE3" worktree remove --force "$FIXTURE3/.worktrees/$n" 2>/dev/null || true
+		done
+	fi
+	rm -rf "${FIXTURE:-}" "${BARE:-}" "${FIXTURE2:-}" "${BARE2:-}" "${FIXTURE3:-}" "${BARE3:-}" "${DEPLOY_TARGET:-}" \
 		"${ISSUES_JSON:-}" "${ORCH1_OUT:-}" "${ORCH2_OUT:-}" "${ORCH3_OUT:-}" \
 		"${QA_INVOKE_PASS_OUT:-}" "${QA_INVOKE_FAIL_OUT:-}" "${RUNQA_OUT:-}" \
 		"${AUTO_MOCK_LOG:-}" "${QA_PASS_MOCK_LOG:-}" "${QA_FAIL_MOCK_LOG:-}" \
 		"${REWORK_ISSUES:-}" "${REWORK_MOCK_LOG:-}" "${REWORK_OUT:-}" \
+		"${REWORK_QA_ISSUES:-}" "${REWORK_QA_MOCK_LOG:-}" "${REWORK_QA_OUT:-}" \
 		"${GATE_DENIED_OUT:-}" "${GATE_APPROVED_OUT:-}" "${GATE_FILE_OUT:-}" "${GATE_ESCAPE_OUT:-}" "${GATE_MISSING_OUT:-}"
 	echo "  cleaned up temp fixture/bare/worktrees/logs (set KEEP=1 to retain)"
 }
@@ -572,12 +584,124 @@ else
 fi
 WORKTREE_NAMES="$WORKTREE_NAMES w1"
 
-# ── 11. Summary + cleanup ────────────────────────────────────────────────────
+# ── 11. QA-fail rework loop end-to-end (issue #52) ───────────────────────────
+# plans/rework-loop.md + issue #52: a real QA FAIL verdict (review had passed)
+# must auto-trigger a rework cycle on the SAME worktree, exactly like a review
+# finding — the watcher re-polls the group to done, re-review comes back clean,
+# and the re-run QA passes — all inside ONE `orchestrate --qa` run. A fresh
+# fixture + fresh mock (REWORK_QA=1: first QA returns fail, second passes)
+# keeps this independent of the earlier sections.
+echo "== [11/12] QA-fail rework loop end-to-end (QA fail -> rework -> QA pass) =="
+FIXTURE3="$(bash "$ROOT/scripts/e2e-fixture/setup.sh")"
+if [ -z "$FIXTURE3" ] || [ ! -d "$FIXTURE3/.git" ]; then
+	echo "  QA-fail fixture setup failed; aborting" >&2
+	exit 1
+fi
+
+# The qa-orchestrate mock classifies QA sessions by the "QA agent" role text —
+# the fixture needs the qa-agent mode spliced in for --qa --qa-mode qa-agent.
+cat > "$FIXTURE3/.roomodes" <<'EOF'
+customModes:
+  - slug: issue-fixer
+    name: 🔧 Issue Fixer (fixture)
+    roleDefinition: |-
+      You are a headless issue-fixing specialist. You analyze the task, read the
+      relevant source, implement the fix with write_to_file, verify it with
+      execute_command, and report via attempt_completion.
+    whenToUse: Use when a fixture issue must be resolved end-to-end.
+    description: Resolve fixture issue #29.
+    groups:
+      - read
+      - edit
+      - command
+    source: project
+  - slug: qa-agent
+    name: QA Agent
+    roleDefinition: |-
+      You are a QA agent for this project. Your job is to verify the changed
+      behavior and report evidence with real command output. You do not write
+      or edit source files.
+    customInstructions: |-
+      **You are a QA agent for this project.**
+
+      ## How to perform QA
+      - Run the project's test suite (`node src/greet.test.js`) and capture the REAL output.
+      - Exercise the changed behavior: greet() must return "Hello, " + name.
+      - Report evidence with real command output.
+
+      ## How to finish
+      Call attempt_completion with a structured summary: a verdict line
+      (QA PASS or QA FAIL), an Evidence section with the real commands you
+      ran and their output, and the final baseline numbers you confirmed.
+    groups:
+      - read
+      - command
+    source: project
+EOF
+git -C "$FIXTURE3" add -A
+git -C "$FIXTURE3" -c user.name="E2E" -c user.email="e2e@headlesscode.invalid" -c commit.gpgsign=false \
+	commit -q -m "fixture: add qa-agent mode (phase 4 QA-fail rework)"
+BARE3="$(mktemp -d /tmp/headlesscode-e2e4-qarework-bare-XXXXXX)"
+git -C "$FIXTURE3" branch -M master
+git init --bare -q "$BARE3"
+git -C "$FIXTURE3" remote add origin "$BARE3"
+git -C "$FIXTURE3" -c user.name="E2E" -c user.email="e2e@headlesscode.invalid" -c commit.gpgsign=false \
+	push -q -u origin master
+echo "  QA-fail rework fixture: $FIXTURE3 (origin -> $BARE3)"
+
+REWORK_QA_ISSUES="$(mktemp /tmp/headlesscode-e2e4-qarework-issues-XXXXXX.json)"
+cat > "$REWORK_QA_ISSUES" <<'EOF'
+[
+  { "number": 1, "title": "Fix the greet bug", "body": "greet() must return 'Hello, ' + name" }
+]
+EOF
+REWORK_QA_MOCK_LOG="$(mktemp /tmp/headlesscode-e2e4-qarework-mock-XXXXXX.log)"
+start_mock qa-orchestrate "$REWORK_QA_MOCK_LOG" REWORK_QA_PORT "REWORK_QA=1"
+sleep 0.2
+
+REWORK_QA_OUT="$(mktemp /tmp/headlesscode-e2e4-qarework-XXXXXX.out)"
+(
+	cd "$ROOT" &&
+		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
+		OPENROUTER_BASE_URL="http://127.0.0.1:$REWORK_QA_PORT" \
+		HEADLESSCODE_ROOT="$ROOT" \
+		ALLOW_UNINDEXED=1 \
+		npx tsx src/cli.ts orchestrate --repo "$FIXTURE3" --issues-json "$REWORK_QA_ISSUES" \
+			--qa --qa-mode qa-agent --poll-interval-ms 200
+) >"$REWORK_QA_OUT" 2>&1
+REWORK_QA_EXIT=$?
+echo "  orchestrate --qa (QA-fail rework round) exit: $REWORK_QA_EXIT"
+if [ "$REWORK_QA_EXIT" -eq 0 ] &&
+	grep -q "QA-fail rework cycle 1" "$REWORK_QA_OUT" &&
+	grep -q "review verdict: clean" "$REWORK_QA_OUT" &&
+	grep -q "QA verdict: pass" "$REWORK_QA_OUT"; then
+	pass "QA fail auto-triggered a real rework spawn; the round re-reviewed clean and re-QA'd pass (exit $REWORK_QA_EXIT)"
+else
+	fail "QA-fail rework round should exit 0 with 'QA-fail rework cycle 1', a clean re-review, and a final QA pass (exit $REWORK_QA_EXIT)"
+	tail -n 40 "$REWORK_QA_OUT" >&2
+fi
+REWORK_QA_STATE="$FIXTURE3/.worktrees/.orchestrator-state.json"
+if [ -f "$REWORK_QA_STATE" ] && grep -q '"reworkCount": 1' "$REWORK_QA_STATE" &&
+	grep -q '"verdict": "pass"' "$REWORK_QA_STATE"; then
+	pass "state file records reworkCount 1 and a final QA verdict pass"
+else
+	fail "state file should record reworkCount 1 + QA verdict pass"
+	[ -f "$REWORK_QA_STATE" ] && cat "$REWORK_QA_STATE" >&2 || true
+fi
+if [ -f "$FIXTURE3/plans/parallel-tasks/w1-qa-rework1.md" ]; then
+	pass "QA rework task file plans/parallel-tasks/w1-qa-rework1.md written (fed from QA evidence)"
+else
+	fail "QA rework task file w1-qa-rework1.md missing"
+fi
+WORKTREE_NAMES="$WORKTREE_NAMES w1"
+
+# ── 12. Summary + cleanup ────────────────────────────────────────────────────
 TOTAL=$((PASS + FAIL))
 echo ""
 echo "──────────────────────────────────────────────────────────────"
 echo "  fixture:         $FIXTURE"
 echo "  rework fixture:  $FIXTURE2"
+echo "  qa-rework fixture: $FIXTURE3"
 echo "  results:         PASS $PASS / $TOTAL   FAIL $FAIL / $TOTAL"
 if [ "$FAIL" -eq 0 ]; then
 	echo "  RESULT: PASS"

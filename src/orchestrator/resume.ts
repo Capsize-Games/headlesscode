@@ -34,6 +34,7 @@ import * as path from "node:path"
 import {
 	handleIterationExhaustion,
 	handleQaSessionError,
+	handleQaVerdict,
 	handleReviewSessionError,
 	handleReviewVerdict,
 } from "./cli.js"
@@ -247,17 +248,20 @@ export function parseReviewArgs(argv: string[]): { options: ReviewCliOptions; er
 
 // ─── `orchestrate rework` ────────────────────────────────────────────────────
 
-const REWORK_USAGE = `headlesscode orchestrate rework — re-spawn a worker to fix review findings
+const REWORK_USAGE = `headlesscode orchestrate rework — re-spawn a worker to fix review/QA findings
 
 Usage:
   headlesscode orchestrate rework --repo <path> (--issue <n>|--pr <n>|--group <name>) [options]
 
-Given an issue/PR/group that already has review findings, re-spawns a worker on
-the SAME worktree (re-checking out the branch if the original was cleaned up)
-to fix them, using the SAME buildReworkTaskFileContent template the automatic
-path uses. Findings come from state's pending_review_findings when present,
-else from the issue's GitHub comments. Exit 0 when a worker was spawned; 1
-when the rework budget is exhausted (needs human) or there is nothing to rework.
+Given an issue/PR/group that already has review findings (or a real QA fail —
+issue #52), re-spawns a worker on the SAME worktree (re-checking out the
+branch if the original was cleaned up) to fix them, using the SAME
+buildReworkTaskFileContent / buildQaReworkTaskFileContent template the
+automatic path uses. Review findings come from state's pending_review_findings
+when present, else from the issue's GitHub comments; a QA-failed group with no
+review findings is reworked from its recorded qa.evidence. Exit 0 when a worker
+was spawned; 1 when the rework budget is exhausted (needs human) or there is
+nothing to rework.
 
 Options:
   --repo <path>            Target repo root (required)
@@ -872,6 +876,13 @@ export interface ReworkStepResult {
  * via the same handleReviewVerdict decision (which also resets the group to
  * "running" and clears review/QA/cost artifacts for a fresh cycle). At the
  * rework cap the group is marked needs-human — identical to the watch loop.
+ *
+ * Issue #52: a group that FAILED QA (real verdict, not session error) has
+ * actionable evidence even with no review findings — the same rework goes
+ * through handleQaVerdict (feeding `qa.evidence` into the task file instead
+ * of review findings), so `orchestrate rework` against a QA-failed group is
+ * no longer a no-op. Review findings win if both are present (the reviewer
+ * is the more specific source).
  */
 export async function runReworkStep(opts: ReworkStepOptions): Promise<ReworkStepResult> {
 	const { repo, statePath, group, mode, model, maxReworkCycles, maxIterations, memoryDir, dryRun, write } = opts
@@ -883,12 +894,27 @@ export async function runReworkStep(opts: ReworkStepOptions): Promise<ReworkStep
 		}
 	}
 	const findings = opts.findings ?? group.pending_review_findings ?? []
+	const qaFail = group.qa?.verdict === "fail" && findings.length === 0
 	const result: ReviewResult = {
 		verdict: "finding",
 		findings,
 		summary: "standalone rework trigger (orchestrate rework/resume)",
 	}
-	const decision = handleReviewVerdict(group, result, repo, maxReworkCycles, mode, model, maxIterations)
+	const decision = qaFail
+		? handleQaVerdict(
+				group,
+				{
+					verdict: "fail",
+					evidence: group.qa?.evidence ?? "",
+					summary: "standalone QA-fail rework trigger (orchestrate rework/resume)",
+				},
+				repo,
+				maxReworkCycles,
+				mode,
+				model,
+				maxIterations,
+			)
+		: handleReviewVerdict(group, result, repo, maxReworkCycles, mode, model, maxIterations)
 	if (!decision.shouldSpawn) {
 		// Cap reached: terminal needs-human (findings stay recorded).
 		if (dryRun) {
@@ -1283,6 +1309,39 @@ export async function resumeGroup(opts: ResumeGroupOptions): Promise<ResumeGroup
 	// 5. Done: review → rework-if-needed → QA → cost.
 	if (group.status === "done") {
 		let current = group
+		// Issue #52: a real QA "fail" (verdict "fail", distinct from a
+		// session "error") is actionable NEW WORK, exactly like a review
+		// finding — re-spawn a worker on the same worktree to fix the QA
+		// evidence, up to the rework cap. Cost is NOT recorded here: the
+		// rework reset clears the one-shot gate and the cycle's real total
+		// is recorded when it settles.
+		const reworkQaFail = async (g: OrchestratorGroup): Promise<ResumeGroupResult> => {
+			const rework = await runReworkStep({
+				repo,
+				statePath,
+				group: g,
+				mode: opts.mode,
+				model: opts.workerModel,
+				maxReworkCycles: opts.maxReworkCycles,
+				maxIterations: opts.maxIterations,
+				memoryDir: opts.memoryDir,
+				dryRun,
+				write,
+			})
+			if (rework.outcome === "spawned" || rework.outcome === "dry-run") {
+				return { outcome: "in-flight", group: rework.group, message: rework.message }
+			}
+			return needsHumanOutcome(opts, rework.group, rework.message)
+		}
+		// An ALREADY-recorded QA fail (status done + qa.verdict fail): the
+		// rework never spawned — interrupted round, or state written by the
+		// pre-#52 code that silently settled as done. Recover from the
+		// recorded qa.evidence without burning a fresh QA session (same
+		// shape as the review-finding recovery below). forceReview opts the
+		// operator into a fresh review instead.
+		if (qaEnabled && current.qa?.verdict === "fail" && !opts.forceReview) {
+			return reworkQaFail(current)
+		}
 		if (reviewEnabled) {
 			// A leftover review-session-error verdict (status done is an
 			// inconsistent-state edge case — handleReviewSessionError normally
@@ -1365,8 +1424,10 @@ export async function resumeGroup(opts: ResumeGroupOptions): Promise<ResumeGroup
 				return needsHumanOutcome(opts, current, qaStep.message)
 			}
 			if (current.qa?.verdict === "fail") {
-				await recordCost(current)
-				return { outcome: "failed", group: current, message: qaStep.message }
+				// A just-returned QA fail is reworked, not settled as a
+				// "failed" group with the top-level status still "done"
+				// (issue #52's silent-settle bug in the resume path).
+				return reworkQaFail(current)
 			}
 		}
 		await recordCost(current)
