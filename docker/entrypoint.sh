@@ -19,20 +19,23 @@ set -e
 
 mkdir -p "$HEADLESSCODE_WORKSPACE_ROOT" "$HOME"
 
-# Seed the shipped stack rules into the central store the runtime reads
-# (src/engine/stacks.ts:getCentralStackRulesDir resolves via projectStoreRoot,
-# honoring $HEADLESSCODE_DATA_DIR — the same resolution install-cli.sh uses):
-# $HEADLESSCODE_DATA_DIR/shared/stacks, else $HOME/.local/share/headlesscode/
-# shared/stacks. $HOME lives on the /data volume, which shadows image layers,
-# so this must run at every start. Idempotent: only ever adds/overwrites
-# files under the image's shared/ tree — never deletes anything a user
-# placed in the central store.
-STACKS_SRC=/opt/headlesscode/shared/stacks
-if [ -d "$STACKS_SRC" ]; then
-	STACKS_DEST="${HEADLESSCODE_DATA_DIR:-$HOME/.local/share/headlesscode}/shared/stacks"
-	mkdir -p "$STACKS_DEST"
-	cp -R "$STACKS_SRC"/. "$STACKS_DEST"/
-fi
+# Seed the shipped central shared content (per-stack rules.md +
+# shared/rules-code/rules.md) into the central store the runtime reads
+# (stacks via src/engine/stacks.ts:getCentralStackRulesDir, rules-code via
+# the vendored roo-config getGlobalRooDirectory, both under
+# $HEADLESSCODE_DATA_DIR/shared, else $HOME/.local/share/headlesscode/shared —
+# the same resolution install-cli.sh uses). $HOME lives on the /data volume,
+# which shadows image layers, so this must run at every start. Idempotent:
+# only ever adds/overwrites files under the image's shared/ tree — never
+# deletes anything a user placed in the central store.
+for sub in stacks rules-code; do
+	SRC="/opt/headlesscode/shared/$sub"
+	if [ -d "$SRC" ]; then
+		DEST="${HEADLESSCODE_DATA_DIR:-$HOME/.local/share/headlesscode}/shared/$sub"
+		mkdir -p "$DEST"
+		cp -R "$SRC"/. "$DEST"/
+	fi
+done
 
 if ! git config --global user.name >/dev/null 2>&1; then
 	git config --global user.name "${GIT_AUTHOR_NAME:-headlesscode}"

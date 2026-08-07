@@ -527,13 +527,27 @@ function loadIssues(options: OrchestrateOptions): SplitIssue[] {
 
 // ─── Task-file generation ────────────────────────────────────────────────────
 
+/**
+ * Rules splicing happens automatically: addCustomInstructions() (vendored,
+ * src/vendor/zoo-code/src/core/prompts/sections/custom-instructions.ts) reads
+ * the central store's `rules/` + `rules-<mode>/` tiers (and the project's
+ * `.roo/` equivalents) into the system prompt before the first turn. Task
+ * files must NOT tell the model to go read a rules file itself — on a project
+ * with no project-local `.roo/rules-code/` (e.g. a fresh `headlesscode init`
+ * setup) that read fails outright and burns a consecutive-mistake budget
+ * before real work starts. Shared by all five task-file builders below.
+ */
+const RULES_SPLICED_NOTE = [
+	"Project and mode-specific rules (from the central shared store and this project's own",
+	".roo/rules*) are already spliced into your system prompt automatically — you do not",
+	"need to read any rules file yourself.",
+]
+
 export function buildTaskFileContent(spec: WorktreeSpec, issues: SplitIssue[]): string {
 	const assigned = spec.issues.map((n) => `#${n}`).join(", ")
 	const ghLines = spec.issues.map((n) => `gh issue view ${n}`).join("\n")
 	return [
-		"Before anything else: read `.roo/rules-code/rules.md` in full (or `.roo/rules/rules.md` if",
-		"rules-code is absent) and treat it as binding for this entire session, regardless of whether",
-		"it auto-loaded for whatever mode you're running in — don't assume it applied, read it yourself.",
+		...RULES_SPLICED_NOTE,
 		"",
 		"You are working autonomously in an isolated git worktree, on your own branch, with your own",
 		"isolated environment. No human is in the loop until you open a PR. Read this entire file before",
@@ -546,25 +560,6 @@ export function buildTaskFileContent(spec: WorktreeSpec, issues: SplitIssue[]): 
 		ghLines,
 		"```",
 		"Do not rely on a stale copy of any issue body.",
-		"",
-		"## Hard-won lessons",
-		"",
-		"- Never delete a public name without grepping the ENTIRE codebase for every importer — including",
-		"  string-literal references (dispatch tables, getattr-by-name) and test files that import for",
-		"  side effects (pytest fixtures, registration).",
-		"- If you split a module into submodules, verify EVERY public name the original module exposed is",
-		"  still re-exported from the package's __init__.py (or equivalent) before closing — a missed",
-		"  re-export is a common, easy-to-miss defect a reviewer WILL catch, costing a full rework cycle.",
-		"  If the project has a re-export-checking script (e.g. scripts/check_re_exports.py), run it now,",
-		"  not just after a reviewer flags the miss.",
-		"- Re-run real checks (tests, boot) after every change and paste the real output in your report —",
-		"  output in a report is a claim, not evidence, until reproduced.",
-		"- If you find yourself repeating the same check across issues, script it under scripts/.",
-		"- A `git worktree add <path> <ref>` ALWAYS checks out the committed state of <ref> — it never sees",
-		"  uncommitted changes sitting in another checkout's working tree, even though worktrees share the",
-		"  same .git. If you spin up a throwaway worktree to verify a fix you just made, either commit the",
-		"  fix first or manually copy the modified file(s) into the fresh worktree — otherwise you'll be",
-		"  testing the OLD code and get a confusing failure that looks like the fix didn't work.",
 		"",
 		"## Environment",
 		"",
@@ -632,9 +627,7 @@ export function buildPlanFirstTaskFileContent(group: { name: string; issues?: nu
 	const assigned = (group.issues ?? []).map((n) => `#${n}`).join(", ") || "this worktree"
 	const ghLines = (group.issues ?? []).map((n) => `gh issue view ${n}`).join("\n")
 	return [
-		"Before anything else: read `.roo/rules-code/rules.md` in full (or `.roo/rules/rules.md` if",
-		"rules-code is absent) and treat it as binding for this entire session, regardless of whether",
-		"it auto-loaded for whatever mode you're running in — don't assume it applied, read it yourself.",
+		...RULES_SPLICED_NOTE,
 		"",
 		"You are the PLANNING phase of an autonomous two-phase workflow, running in an isolated git",
 		"worktree on your own branch. Your ONLY job is to produce a compact, actionable implementation",
@@ -713,9 +706,7 @@ export function buildReworkTaskFileContent(
 	const ghLines = (group.issues ?? []).map((n) => `gh issue view ${n}`).join("\n")
 	const findingsList = findings.length > 0 ? findings.map((f, i) => `${i + 1}. ${f}`).join("\n") : ""
 	return [
-		"Before anything else: read `.roo/rules-code/rules.md` in full (or `.roo/rules/rules.md` if",
-		"rules-code is absent) and treat it as binding for this entire session, regardless of whether",
-		"it auto-loaded for whatever mode you're running in — don't assume it applied, read it yourself.",
+		...RULES_SPLICED_NOTE,
 		"",
 		"You are working autonomously in the SAME isolated git worktree as the previous attempt, on",
 		"the same branch. The automated adversarial reviewer found problems with that attempt. Read",
@@ -813,9 +804,7 @@ export function buildQaReworkTaskFileContent(
 		  ]
 		: []
 	return [
-		"Before anything else: read `.roo/rules-code/rules.md` in full (or `.roo/rules/rules.md` if",
-		"rules-code is absent) and treat it as binding for this entire session, regardless of whether",
-		"it auto-loaded for whatever mode you're running in — don't assume it applied, read it yourself.",
+		...RULES_SPLICED_NOTE,
 		"",
 		"You are working autonomously in the SAME isolated git worktree as the previous attempt, on",
 		"the same branch. Review passed, but the automated QA session found real problems with the",
@@ -907,9 +896,7 @@ export function buildContinuationTaskFileContent(
 	const assigned = (group.issues ?? []).map((n) => `#${n}`).join(", ") || "this worktree"
 	const ghLines = (group.issues ?? []).map((n) => `gh issue view ${n}`).join("\n")
 	return [
-		"Before anything else: read `.roo/rules-code/rules.md` in full (or `.roo/rules/rules.md` if",
-		"rules-code is absent) and treat it as binding for this entire session, regardless of whether",
-		"it auto-loaded for whatever mode you're running in — don't assume it applied, read it yourself.",
+		...RULES_SPLICED_NOTE,
 		"",
 		"You are working autonomously in the SAME isolated git worktree as the previous session(s), on",
 		"the same branch. The previous session was cut short because it hit the harness's iteration cap",

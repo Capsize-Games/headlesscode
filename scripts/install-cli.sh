@@ -27,37 +27,39 @@ EOF
 
 chmod +x "$TARGET"
 
-# Ship the central stack-rules content (`shared/stacks/<stack>/rules.md`)
-# into the runtime's central store, so stack-specific instructions actually
-# reach worker system prompts. This resolves the SAME path the runtime reads:
-# getCentralStackRulesDir() (src/engine/stacks.ts) is store-root-derived via
-# projectStoreRoot() (src/project-store.ts), which honors $HEADLESSCODE_DATA_DIR
-# exactly like sharedInstructionsRoot() does — so the destination below is
-# $HEADLESSCODE_DATA_DIR/shared/stacks when the override is set, else
-# $HOME/.local/share/headlesscode/shared/stacks.
-STACKS_SRC="$HARNESS_ROOT/shared/stacks"
-if [ -d "$STACKS_SRC" ]; then
-    STACKS_DEST="${HEADLESSCODE_DATA_DIR:-$HOME/.local/share/headlesscode}/shared/stacks"
-    mkdir -p "$STACKS_DEST"
-    cp -R "$STACKS_SRC"/. "$STACKS_DEST"/
+# Ship the repo's bundled shared/ content (`shared/stacks/<stack>/rules.md` +
+# `shared/rules-code/rules.md`) into the runtime's central store, so shipped
+# instructions actually reach worker system prompts. This resolves the SAME
+# path the runtime reads: both the stacks tier (getCentralStackRulesDir() in
+# src/engine/stacks.ts) and the rules-code tier (the vendored roo-config
+# getGlobalRooDirectory()) are store-root-derived via projectStoreRoot()
+# (src/project-store.ts), which honors $HEADLESSCODE_DATA_DIR — so the
+# destination below is $HEADLESSCODE_DATA_DIR/shared/<sub> when the override
+# is set, else $HOME/.local/share/headlesscode/shared/<sub>.
+for sub in stacks rules-code; do
+    SRC="$HARNESS_ROOT/shared/$sub"
+    [ -d "$SRC" ] || continue
+    DEST="${HEADLESSCODE_DATA_DIR:-$HOME/.local/share/headlesscode}/shared/$sub"
+    mkdir -p "$DEST"
+    cp -R "$SRC"/. "$DEST"/
     # Verify the shipped content actually landed non-empty (a silently
     # unreachable/empty install would break the "ships with headlesscode"
     # guarantee without any error).
     missing=0
-    for rules in "$STACKS_SRC"/*/rules.md; do
+    for rules in "$SRC"/*/rules.md "$SRC"/rules.md; do
         [ -f "$rules" ] || continue
-        rel="${rules#"$STACKS_SRC"/}"
-        if [ ! -f "$STACKS_DEST/$rel" ] || [ ! -s "$STACKS_DEST/$rel" ]; then
-            echo "error: stack rules missing/empty at $STACKS_DEST/$rel" >&2
+        rel="${rules#"$SRC"/}"
+        if [ ! -f "$DEST/$rel" ] || [ ! -s "$DEST/$rel" ]; then
+            echo "error: shared content missing/empty at $DEST/$rel" >&2
             missing=1
         fi
     done
     if [ "$missing" -ne 0 ]; then
-        echo "error: stack-rules install verification failed" >&2
+        echo "error: shared-content install verification failed (shared/$sub)" >&2
         exit 1
     fi
-    echo "Installed stack rules -> $STACKS_DEST"
-fi
+    echo "Installed shared/$sub -> $DEST"
+done
 
 echo "Installed headlesscode -> $TARGET (harness: $HARNESS_ROOT)"
 
