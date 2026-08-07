@@ -396,7 +396,7 @@ async function testShippedStackRulesContent(): Promise<void> {
 }
 
 /** The install→read round trip must ACTUALLY work: run the repo's
- * scripts/sync-stack-rules.sh under a scratch $HEADLESSCODE_DATA_DIR (the way
+ * scripts/sync-shared-rules.sh under a scratch $HEADLESSCODE_DATA_DIR (the way
  * scripts/install-cli.sh invokes it), then load the shipped rules through the
  * ENGINE with the same env and confirm they splice. Guards the #10/#11
  * shipping path against the script and the engine silently diverging on the
@@ -406,8 +406,8 @@ async function testShippedStackRulesContent(): Promise<void> {
 async function testInstallToReadRoundTrip(): Promise<void> {
 	await sandboxHome() // sandboxes $HOME AND $HEADLESSCODE_DATA_DIR per test
 	const repoRoot = path.resolve(fileURLToPath(new URL("../../../", import.meta.url)))
-	const syncScript = path.join(repoRoot, "scripts", "sync-stack-rules.sh")
-	assert.ok((await fs.stat(syncScript)).isFile(), "expected scripts/sync-stack-rules.sh in the repo")
+	const syncScript = path.join(repoRoot, "scripts", "sync-shared-rules.sh")
+	assert.ok((await fs.stat(syncScript)).isFile(), "expected scripts/sync-shared-rules.sh in the repo")
 
 	// 1. Install the shipped content exactly the way install-cli.sh does
 	//    (inherits the sandboxed env: HOME + HEADLESSCODE_DATA_DIR).
