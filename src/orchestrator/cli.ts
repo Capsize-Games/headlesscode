@@ -75,6 +75,12 @@ Options:
   --repo <path>          Target repo root (required)
   --issue <n>            Issue number to include (repeatable)
   --issues-json <file>   Read issues from a JSON array of {number,title,body}
+  --file-issues          With --issues-json: file a REAL GitHub issue for each
+                         synthetic entry (gh issue create --repo <origin-owner>/<origin-repo>),
+                         swap in the real number returned, and print one
+                         confirmation line per created issue. A real, visible
+                         write to GitHub — opt-in, never automatic.
+                         Requires --issues-json (nothing to file otherwise)
   --mode <slug>          Harness mode for workers (default: code)
   --model <id>           Explicit model override for workers + reviewer + QA
                          (beats .headlesscode/mode-models.json entries). Without
@@ -172,6 +178,12 @@ interface OrchestrateOptions {
 	repo: string
 	issues: number[]
 	issuesJson?: string
+	/**
+	 * Fix 3: file a REAL GitHub issue for every synthetic --issues-json entry
+	 * and substitute the real number before anything else touches `issues`.
+	 * Opt-in — a real write to a real GitHub repo. Requires --issues-json.
+	 */
+	fileIssues: boolean
 	mode: string
 	model?: string
 	batch?: string
@@ -266,6 +278,7 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 		qa: false,
 		qaMode: "qa-agent",
 		deploy: false,
+		fileIssues: false,
 		pollIntervalMs: 5000,
 		maxConcurrentSessions: maxConcurrentSessionsFromEnv(),
 		maxReworkCycles: 3,
@@ -323,6 +336,9 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 				options.issuesJson = v
 				break
 			}
+			case "--file-issues":
+				options.fileIssues = true
+				break
 			case "--mode": {
 				const v = next()
 				if (v === undefined) {
@@ -474,6 +490,13 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 		}
 	}
 
+	// Fix 3: --file-issues without --issues-json is a usage error — a real
+	// --issue <n>/gh-sourced entry already carries a real number, so there is
+	// nothing to file. (Match the existing usage-error exit-2 convention.)
+	if (options.fileIssues && !options.issuesJson) {
+		return { options, error: "--file-issues requires --issues-json (a real --issue <n> round has nothing to file)" }
+	}
+
 	return { options }
 }
 
@@ -496,6 +519,73 @@ function fetchIssueWithGh(repo: string, number: number): SplitIssue {
 	})
 	const parsed = JSON.parse(out) as { number?: number; title?: string; body?: string | null }
 	return { number: parsed.number ?? number, title: parsed.title ?? `issue ${number}`, body: parsed.body ?? undefined }
+}
+
+/**
+ * Resolve `<owner>/<repo>` from the target repo's `origin` remote (used by
+ * --file-issues' `gh issue create --repo <owner>/<repo>`). Accepts both ssh
+ * (`git@host:owner/repo.git`) and https (`https://host/owner/repo.git`) URL
+ * forms. Returns undefined when there is no origin or it is unparseable.
+ */
+function originOwnerRepo(repo: string): string | undefined {
+	try {
+		const url = execFileSync("git", ["-C", repo, "remote", "get-url", "origin"], {
+			encoding: "utf-8",
+			timeout: 10_000,
+		}).trim()
+		const match = url.match(/^(?:git@[^:]+:|https?:\/\/[^/]+\/)([^/]+)\/([^/]+?)(?:\.git)?$/)
+		return match ? `${match[1]}/${match[2]}` : undefined
+	} catch {
+		return undefined
+	}
+}
+
+/**
+ * File one real GitHub issue via `gh issue create` — mirrors fetchIssueWithGh's
+ * execFileSync idiom (same cwd/timeout). Returns the real issue number (the
+ * trailing number of the issue URL gh prints — parsed rather than depending on
+ * a --json flag that only exists in newer gh versions) and its URL.
+ */
+function createGhIssue(repo: string, ownerRepo: string, issue: SplitIssue): { number: number; url: string } {
+	const out = execFileSync(
+		"gh",
+		["issue", "create", "--repo", ownerRepo, "--title", issue.title, "--body", issue.body ?? ""],
+		{ cwd: repo, encoding: "utf-8", timeout: 30_000 },
+	)
+	const url = out.trim().split(/\s+/).pop() ?? out.trim()
+	const numberMatch = url.match(/\/issues\/(\d+)\/?$/)
+	if (!numberMatch) {
+		throw new Error(`gh issue create returned an unrecognized response: ${out.trim()}`)
+	}
+	return { number: Number(numberMatch[1]), url }
+}
+
+/**
+ * Fix 3: file a real GitHub issue for each synthetic issue and substitute the
+ * real number, so every downstream step (worktree/branch naming, task files,
+ * state persistence, PR-closing comments) uses a number that actually exists
+ * on GitHub — no other code needs to know issues were just filed. `shouldFile`
+ * gates which entries get filed: orchestrate uses the default (file all —
+ * --file-issues requires --issues-json, and every --issues-json entry is
+ * synthetic by definition); the predicate exists so tests can cover "entries
+ * that already carry a real number pass through untouched" without a real gh
+ * call. `createIssue` is injected for the same reason (real: createGhIssue).
+ */
+export function fileSyntheticIssues(
+	issues: SplitIssue[],
+	createIssue: (issue: SplitIssue) => { number: number; url: string },
+	shouldFile: (issue: SplitIssue) => boolean = () => true,
+): { issues: SplitIssue[]; created: Array<{ number: number; title: string; url: string }> } {
+	const created: Array<{ number: number; title: string; url: string }> = []
+	const next = issues.map((issue) => {
+		if (!shouldFile(issue)) {
+			return issue
+		}
+		const real = createIssue(issue)
+		created.push({ number: real.number, title: issue.title, url: real.url })
+		return { ...issue, number: real.number }
+	})
+	return { issues: next, created }
 }
 
 function loadIssues(options: OrchestrateOptions): SplitIssue[] {
@@ -2182,6 +2272,35 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	} catch (err) {
 		process.stderr.write(`headlesscode orchestrate: ${err instanceof Error ? err.message : String(err)}\n`)
 		return 2
+	}
+
+	// Fix 3: --file-issues (only valid with --issues-json) files a REAL GitHub
+	// issue for every synthetic --issues-json entry and substitutes the real
+	// number, so worktree/branch naming, task files, and PR-closing comments
+	// all use a number that actually exists on GitHub. Runs before anything
+	// else touches `issues`. A real, visible-to-GitHub side effect — never
+	// silent: one confirmation line per created issue.
+	if (options.fileIssues) {
+		const ownerRepo = originOwnerRepo(repo)
+		if (!ownerRepo) {
+			process.stderr.write(
+				`headlesscode orchestrate: --file-issues needs a parseable GitHub 'origin' remote on ${repo} ` +
+					`(got none) to know where to file the issues\n`,
+			)
+			return 2
+		}
+		try {
+			const { issues: filed, created } = fileSyntheticIssues(issues, (issue) => createGhIssue(repo, ownerRepo, issue))
+			for (const c of created) {
+				process.stdout.write(`[orchestrate] filed issue #${c.number}: ${c.title} -> ${c.url}\n`)
+			}
+			issues = filed
+		} catch (err) {
+			process.stderr.write(
+				`headlesscode orchestrate: --file-issues failed: ${err instanceof Error ? err.message : String(err)}\n`,
+			)
+			return 2
+		}
 	}
 
 	// Naming collision avoidance: a still-running round in the same repo

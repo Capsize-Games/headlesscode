@@ -168,6 +168,13 @@ orchestrate subcommand (Phase 2 — parallel worktrees, headless workers):
   --issue <n>                   Issue number to include (repeatable)
   --issues-json <file>          Read issues from a JSON array of {number,title,body}
                                 (used when gh is unavailable, or for tests)
+  --file-issues                 With --issues-json: file a REAL GitHub issue for
+                                each synthetic entry (gh issue create --repo
+                                <origin-owner>/<origin-repo>), swap in the real
+                                number returned, and print one confirmation line
+                                per created issue. A real, visible write to
+                                GitHub — opt-in, never automatic. Requires
+                                --issues-json
   --batch <name>                Batch id in the state file (default round-<date>)
   --review-mode <slug>          Mode slug for review sessions (default deepseek-reviewer)
   --no-review                   Spawn + watch only; skip the reviewer

@@ -19,6 +19,7 @@ import {
 	buildReworkTaskFileContent,
 	buildTaskFileContent,
 	buildSpawnEnv,
+	fileSyntheticIssues,
 	handleIterationExhaustion,
 	handleQaSessionError,
 	handleQaVerdict,
@@ -579,6 +580,66 @@ async function testMultipleGroupsReworkIndependently(): Promise<void> {
 	assert.equal(state.groups[1].reworkCount, 3)
 	assert.equal(state.groups[0].status, "running")
 	assert.equal(state.groups[1].status, "running")
+}
+
+// ─── parseOrchestrateArgs: --file-issues (Fix 3) ─────────────────────────────
+
+async function testParseOrchestrateArgsFileIssues(): Promise<void> {
+	const withJson = parseOrchestrateArgs(["--repo", "/tmp/x", "--issues-json", "issues.json", "--file-issues"])
+	assert.equal(withJson.error, undefined, "--file-issues with --issues-json parses")
+	assert.equal(withJson.options.fileIssues, true)
+	assert.equal(withJson.options.issuesJson, "issues.json")
+
+	const withoutJson = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1", "--file-issues"])
+	assert.ok(
+		withoutJson.error && withoutJson.error.includes("requires --issues-json"),
+		"--file-issues without --issues-json is a usage error (exit-2 convention)",
+	)
+
+	const off = parseOrchestrateArgs(["--repo", "/tmp/x", "--issues-json", "issues.json"])
+	assert.equal(off.error, undefined)
+	assert.equal(off.options.fileIssues, false, "default off — filing is opt-in, never automatic")
+}
+
+// ─── fileSyntheticIssues (Fix 3, pure number-substitution logic) ─────────────
+
+async function testFileSyntheticIssuesSubstitutesRealNumbers(): Promise<void> {
+	const issues = [
+		{ number: 101, title: "synthetic one", body: "body 1" },
+		{ number: 102, title: "synthetic two", body: undefined },
+	]
+	let nextNumber = 500
+	const result = fileSyntheticIssues(issues, (issue) => {
+		const number = ++nextNumber
+		return { number, url: `https://github.com/acme/proj/issues/${number}` }
+	})
+	assert.equal(result.created.length, 2, "one created record per filed issue")
+	assert.deepEqual(
+		result.issues.map((i) => i.number),
+		[501, 502],
+		"synthetic numbers replaced with the real returned numbers",
+	)
+	assert.equal(result.issues[0]?.title, "synthetic one", "title preserved through substitution")
+	assert.equal(result.issues[0]?.body, "body 1", "body preserved through substitution")
+	assert.equal(result.created[0]?.url, "https://github.com/acme/proj/issues/501", "created record carries the real URL")
+	assert.equal(result.created[1]?.number, 502, "created records carry the real numbers")
+}
+
+async function testFileSyntheticIssuesLeavesRealSourcedEntriesUntouched(): Promise<void> {
+	const issues = [
+		{ number: 7, title: "real issue (gh-sourced)", body: "real body" },
+		{ number: 101, title: "synthetic one", body: "body 1" },
+	]
+	// Gated on "loaded via --issues-json": only the entries the caller marks
+	// for filing (the synthetic ones) get filed; anything already carrying a
+	// real number passes through byte-identical.
+	const result = fileSyntheticIssues(issues, (issue) => ({ number: 900, url: "https://github.com/acme/proj/issues/900" }), (i) =>
+		i.number === 101,
+	)
+	assert.equal(result.created.length, 1, "only the flagged synthetic entry is filed")
+	assert.equal(result.issues[0]?.number, 7, "real-sourced entry untouched")
+	assert.equal(result.issues[0]?.title, "real issue (gh-sourced)", "real-sourced entry title untouched")
+	assert.equal(result.issues[1]?.number, 900, "synthetic entry replaced with the real number")
 }
 
 // ─── parseOrchestrateArgs: --max-rework-cycles ───────────────────────────────
@@ -1610,6 +1671,9 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["finding at cap marks needs-human and does NOT spawn", testFindingAtCapMarksNeedsHumanAndDoesNotSpawn],
 	["clean verdict never touches reworkCount", testCleanVerdictNeverTouchesReworkCount],
 	["multiple groups rework independently", testMultipleGroupsReworkIndependently],
+	["--file-issues parses with --issues-json, usage error without (Fix 3)", testParseOrchestrateArgsFileIssues],
+	["fileSyntheticIssues substitutes real returned numbers (Fix 3)", testFileSyntheticIssuesSubstitutesRealNumbers],
+	["fileSyntheticIssues leaves real-sourced entries untouched (Fix 3)", testFileSyntheticIssuesLeavesRealSourcedEntriesUntouched],
 	["--max-rework-cycles parses (default 3, custom, invalid)", testParseOrchestrateArgsMaxReworkCycles],
 	["watchGroups re-polls a group after a rework reset", testWatchGroupsRepollsGroupAfterReworkReset],
 	["spawn env carries the resolved model when the worker's mode is mapped", testSpawnEnvCarriesResolvedModelWhenModeMapped],
