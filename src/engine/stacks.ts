@@ -53,7 +53,7 @@ export const STACK_RULES_HEADER = "STACK-SPECIFIC INSTRUCTIONS"
  * `<store>/shared/stacks/<stack>/rules.md`, where `<store>` is
  * `projectStoreRoot()` — so the `$HEADLESSCODE_DATA_DIR` override is honored
  * exactly like every other central-store consumer (checkpoints, settings,
- * shared instructions, project data), and `scripts/sync-stack-rules.sh`
+ * shared instructions, project data), and `scripts/sync-shared-rules.sh`
  * installs to the same root the engine reads. Resolved at call time (not
  * module load) so the override / sandboxed $HOME are picked up per call.
  */

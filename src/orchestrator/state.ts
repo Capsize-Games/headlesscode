@@ -53,6 +53,18 @@ export interface OrchestratorGroup {
 	 * Absent for groups spawned directly via spawn-parallel-worktrees.sh.
 	 */
 	shapes?: string[]
+	/**
+	 * Per-issue {title, body}, keyed by issue number as a string (JSON object
+	 * keys are always strings), captured at dispatch time and persisted in the
+	 * state file so the rework/QA/continuation task files — generated LATER
+	 * from state alone, when the original issue objects are no longer in hand
+	 * — can embed each issue's real title/body inline instead of telling the
+	 * worker to run `gh issue view <n>` (which fails outright for synthetic
+	 * --issues-json numbers). Written by orchestrate at dispatch time
+	 * alongside `shapes`; absent for groups spawned directly via
+	 * spawn-parallel-worktrees.sh.
+	 */
+	issueBodies?: Record<string, { title: string; body?: string }>
 	task_file?: string
 	/**
 	 * spawned | running | done | failed | blocked | needs-human | orphaned

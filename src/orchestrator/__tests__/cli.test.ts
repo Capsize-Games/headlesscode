@@ -17,7 +17,9 @@ import {
 	buildPlanFirstTaskFileContent,
 	buildQaReworkTaskFileContent,
 	buildReworkTaskFileContent,
+	buildTaskFileContent,
 	buildSpawnEnv,
+	fileSyntheticIssues,
 	handleIterationExhaustion,
 	handleQaSessionError,
 	handleQaVerdict,
@@ -159,6 +161,41 @@ async function testReworkTaskFileContentHandlesEmptyFindings(): Promise<void> {
 	assert.ok(noIssues.includes("inspect the worktree"), "no-issues fallback text present")
 }
 
+// ─── buildTaskFileContent: inline issue bodies + rules splice (fixes 1+2) ────
+
+async function testTaskFileContentEmbedsIssueTitleAndBody(): Promise<void> {
+	const content = buildTaskFileContent(
+		{ name: "w1", issues: [27, 29], taskFile: "w1-issue27-29.md" },
+		[
+			{ number: 27, title: "Auth token validation", body: "hot path: validate the token in the request handler" },
+			{ number: 29, title: "Split utils", body: "" },
+		],
+	)
+	assert.ok(content.includes("### Issue #27: Auth token validation"), "issue title embedded in the task")
+	assert.ok(content.includes("hot path: validate the token in the request handler"), "issue body embedded in the task")
+	assert.ok(content.includes("### Issue #29: Split utils"), "second issue embedded too")
+	assert.ok(!content.includes("gh issue view"), "no runtime gh fetch when bodies are in hand")
+	assert.ok(!content.includes("rules-code/rules.md"), "no hardcoded read-the-rules-file instruction (Fix 1)")
+	assert.ok(!content.includes("Hard-won lessons"), "hard-won lessons moved to the central rules-code tier (Fix 1)")
+	assert.ok(content.includes("inline body above"), "workflow step 1 points at the inline bodies, not a fetch")
+}
+
+/** Fix 1 regression guard: NONE of the five task builders may tell the model
+ * to go read a rules file itself — that content is spliced automatically. */
+async function testAllTaskBuildersNoHardcodedRulesReadInstruction(): Promise<void> {
+	const outputs = [
+		buildTaskFileContent({ name: "w1", issues: [1], taskFile: "w1.md" }, []),
+		buildPlanFirstTaskFileContent({ name: "w1", issues: [1] }),
+		buildReworkTaskFileContent({ name: "w1", issues: [1] }, [], 1),
+		buildQaReworkTaskFileContent({ name: "w1", issues: [1] }, "", 1),
+		buildContinuationTaskFileContent({ name: "w1", issues: [1] }, 1),
+	]
+	for (const content of outputs) {
+		assert.ok(!content.includes("rules-code/rules.md"), "no hardcoded rules read instruction in a task builder")
+		assert.ok(content.includes("already spliced into your system prompt"), "builders note rules are spliced automatically")
+	}
+}
+
 // ─── buildQaReworkTaskFileContent (issue #52) ────────────────────────────────
 
 async function testQaReworkTaskFileContentIncludesEvidenceAndIssues(): Promise<void> {
@@ -182,6 +219,47 @@ async function testQaReworkTaskFileContentHandlesEmptyEvidence(): Promise<void> 
 	assert.ok(content.includes("Rework cycle 2"))
 	assert.ok(content.includes("no extractable evidence"), "empty evidence gets an explicit fallback")
 	assert.ok(content.includes("#52"), "issues still present")
+}
+
+// ─── persisted issueBodies embedding (Fix 2, rework/QA/continuation) ─────────
+
+async function testReworkTaskFileContentEmbedsPersistedIssueBodies(): Promise<void> {
+	const content = buildReworkTaskFileContent(
+		{ name: "w1", issues: [27], issueBodies: { "27": { title: "Auth token validation", body: "hot path body text" } } },
+		["finding A"],
+		1,
+	)
+	assert.ok(content.includes("### Issue #27: Auth token validation"), "persisted title embedded (Fix 2)")
+	assert.ok(content.includes("hot path body text"), "persisted body embedded (Fix 2)")
+	assert.ok(!content.includes("gh issue view"), "no gh fetch when issueBodies are persisted")
+
+	// Regression guard for the fallback path: a group whose state predates the
+	// issueBodies feature falls back to the OLD gh-issue-view wording per issue
+	// (never silently produce an empty assignment section).
+	const fallback = buildReworkTaskFileContent({ name: "w1", issues: [27] }, ["finding A"], 1)
+	assert.ok(fallback.includes("gh issue view 27"), "fallback keeps the gh issue view instruction per issue")
+}
+
+async function testQaReworkTaskFileContentEmbedsPersistedIssueBodies(): Promise<void> {
+	const content = buildQaReworkTaskFileContent(
+		{ name: "w1", issues: [52], issueBodies: { "52": { title: "QA issue", body: "qa body text" } } },
+		"evidence here",
+		1,
+	)
+	assert.ok(content.includes("### Issue #52: QA issue"), "persisted title embedded (Fix 2)")
+	assert.ok(content.includes("qa body text"), "persisted body embedded (Fix 2)")
+	assert.ok(!content.includes("gh issue view"), "no gh fetch when issueBodies are persisted")
+}
+
+async function testContinuationTaskFileContentEmbedsPersistedIssueBodies(): Promise<void> {
+	const content = buildContinuationTaskFileContent(
+		{ name: "w1", issues: [29], issueBodies: { "29": { title: "Continuation issue", body: "cont body text" } } },
+		1,
+	)
+	assert.ok(content.includes("### Issue #29: Continuation issue"), "persisted title embedded (Fix 2)")
+	assert.ok(content.includes("cont body text"), "persisted body embedded (Fix 2)")
+	assert.ok(!content.includes("gh issue view"), "no gh fetch when issueBodies are persisted")
+	assert.ok(content.includes("inline body above"), "continuation workflow step 1 points at the inline bodies")
 }
 
 // ─── handleReviewVerdict: below the cap → rework spawn ──────────────────────
@@ -502,6 +580,66 @@ async function testMultipleGroupsReworkIndependently(): Promise<void> {
 	assert.equal(state.groups[1].reworkCount, 3)
 	assert.equal(state.groups[0].status, "running")
 	assert.equal(state.groups[1].status, "running")
+}
+
+// ─── parseOrchestrateArgs: --file-issues (Fix 3) ─────────────────────────────
+
+async function testParseOrchestrateArgsFileIssues(): Promise<void> {
+	const withJson = parseOrchestrateArgs(["--repo", "/tmp/x", "--issues-json", "issues.json", "--file-issues"])
+	assert.equal(withJson.error, undefined, "--file-issues with --issues-json parses")
+	assert.equal(withJson.options.fileIssues, true)
+	assert.equal(withJson.options.issuesJson, "issues.json")
+
+	const withoutJson = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1", "--file-issues"])
+	assert.ok(
+		withoutJson.error && withoutJson.error.includes("requires --issues-json"),
+		"--file-issues without --issues-json is a usage error (exit-2 convention)",
+	)
+
+	const off = parseOrchestrateArgs(["--repo", "/tmp/x", "--issues-json", "issues.json"])
+	assert.equal(off.error, undefined)
+	assert.equal(off.options.fileIssues, false, "default off — filing is opt-in, never automatic")
+}
+
+// ─── fileSyntheticIssues (Fix 3, pure number-substitution logic) ─────────────
+
+async function testFileSyntheticIssuesSubstitutesRealNumbers(): Promise<void> {
+	const issues = [
+		{ number: 101, title: "synthetic one", body: "body 1" },
+		{ number: 102, title: "synthetic two", body: undefined },
+	]
+	let nextNumber = 500
+	const result = fileSyntheticIssues(issues, (issue) => {
+		const number = ++nextNumber
+		return { number, url: `https://github.com/acme/proj/issues/${number}` }
+	})
+	assert.equal(result.created.length, 2, "one created record per filed issue")
+	assert.deepEqual(
+		result.issues.map((i) => i.number),
+		[501, 502],
+		"synthetic numbers replaced with the real returned numbers",
+	)
+	assert.equal(result.issues[0]?.title, "synthetic one", "title preserved through substitution")
+	assert.equal(result.issues[0]?.body, "body 1", "body preserved through substitution")
+	assert.equal(result.created[0]?.url, "https://github.com/acme/proj/issues/501", "created record carries the real URL")
+	assert.equal(result.created[1]?.number, 502, "created records carry the real numbers")
+}
+
+async function testFileSyntheticIssuesLeavesRealSourcedEntriesUntouched(): Promise<void> {
+	const issues = [
+		{ number: 7, title: "real issue (gh-sourced)", body: "real body" },
+		{ number: 101, title: "synthetic one", body: "body 1" },
+	]
+	// Gated on "loaded via --issues-json": only the entries the caller marks
+	// for filing (the synthetic ones) get filed; anything already carrying a
+	// real number passes through byte-identical.
+	const result = fileSyntheticIssues(issues, (issue) => ({ number: 900, url: "https://github.com/acme/proj/issues/900" }), (i) =>
+		i.number === 101,
+	)
+	assert.equal(result.created.length, 1, "only the flagged synthetic entry is filed")
+	assert.equal(result.issues[0]?.number, 7, "real-sourced entry untouched")
+	assert.equal(result.issues[0]?.title, "real issue (gh-sourced)", "real-sourced entry title untouched")
+	assert.equal(result.issues[1]?.number, 900, "synthetic entry replaced with the real number")
 }
 
 // ─── parseOrchestrateArgs: --max-rework-cycles ───────────────────────────────
@@ -962,6 +1100,20 @@ async function testBuildPlanFirstTaskFileContent(): Promise<void> {
 	// A group with no recorded issues must still produce a valid planner task.
 	const noIssues = buildPlanFirstTaskFileContent({ name: "w1" })
 	assert.ok(noIssues.includes("read ORCHESTRATOR_TASK.md"), "no-issues fallback directs the planner to the task file")
+}
+
+async function testPlanFirstTaskFileContentEmbedsIssueTitleAndBody(): Promise<void> {
+	const content = buildPlanFirstTaskFileContent(
+		{ name: "w1", issues: [27, 29] },
+		[
+			{ number: 27, title: "Auth token validation", body: "hot path body text" },
+			{ number: 29, title: "Split utils", body: "split body text" },
+		],
+	)
+	assert.ok(content.includes("### Issue #27: Auth token validation"), "issue title embedded (Fix 2)")
+	assert.ok(content.includes("hot path body text"), "issue body embedded (Fix 2)")
+	assert.ok(!content.includes("gh issue view"), "no runtime gh fetch when bodies are in hand")
+	assert.ok(content.includes("inline bodies above"), "planner reads the inline bodies, not a fetch")
 }
 
 async function testWriteTaskFilesWritesPlanFilesWhenPlanFirst(): Promise<void> {
@@ -1498,8 +1650,13 @@ async function testOrchestrateMainWarnsOnDriftWhenSyncDisabled(): Promise<void> 
 const tests: Array<[string, () => Promise<void>]> = [
 	["rework task file includes findings, issues, rework count", testReworkTaskFileContentIncludesFindingsAndIssues],
 	["rework task file handles empty findings gracefully", testReworkTaskFileContentHandlesEmptyFindings],
+	["task file embeds real issue title/body, no gh fetch (Fix 2)", testTaskFileContentEmbedsIssueTitleAndBody],
+	["all five task builders omit the hardcoded rules-read instruction (Fix 1)", testAllTaskBuildersNoHardcodedRulesReadInstruction],
+	["rework task file embeds persisted issueBodies, falls back to gh without (Fix 2)", testReworkTaskFileContentEmbedsPersistedIssueBodies],
 	["QA rework task file includes evidence, issues, report pointer (issue #52)", testQaReworkTaskFileContentIncludesEvidenceAndIssues],
 	["QA rework task file handles empty evidence gracefully (issue #52)", testQaReworkTaskFileContentHandlesEmptyEvidence],
+	["QA rework task file embeds persisted issueBodies (Fix 2)", testQaReworkTaskFileContentEmbedsPersistedIssueBodies],
+	["continuation task file embeds persisted issueBodies (Fix 2)", testContinuationTaskFileContentEmbedsPersistedIssueBodies],
 	["finding below cap triggers rework spawn + state reset", testFindingBelowCapSpawnsAndResetsState],
 	["review session error goes straight to needs-human, never a rework spawn", testReviewSessionErrorGoesStraightToNeedsHumanNoRework],
 	["QA session error goes straight to needs-human, not settled as an ordinary failed QA", testQaSessionErrorGoesStraightToNeedsHuman],
@@ -1514,6 +1671,9 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["finding at cap marks needs-human and does NOT spawn", testFindingAtCapMarksNeedsHumanAndDoesNotSpawn],
 	["clean verdict never touches reworkCount", testCleanVerdictNeverTouchesReworkCount],
 	["multiple groups rework independently", testMultipleGroupsReworkIndependently],
+	["--file-issues parses with --issues-json, usage error without (Fix 3)", testParseOrchestrateArgsFileIssues],
+	["fileSyntheticIssues substitutes real returned numbers (Fix 3)", testFileSyntheticIssuesSubstitutesRealNumbers],
+	["fileSyntheticIssues leaves real-sourced entries untouched (Fix 3)", testFileSyntheticIssuesLeavesRealSourcedEntriesUntouched],
 	["--max-rework-cycles parses (default 3, custom, invalid)", testParseOrchestrateArgsMaxReworkCycles],
 	["watchGroups re-polls a group after a rework reset", testWatchGroupsRepollsGroupAfterReworkReset],
 	["spawn env carries the resolved model when the worker's mode is mapped", testSpawnEnvCarriesResolvedModelWhenModeMapped],
@@ -1526,6 +1686,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["spawn env carries HEADLESSCODE_MAX_ITERATIONS (flag > env, untouched when unset)", testSpawnEnvCarriesMaxIterations],
 	["--plan-first parses (default off, mode architect, cap 15, invalid rejected)", testParseOrchestrateArgsPlanFirst],
 	["plan-first task file instructs a planning-only session writing PLAN.md", testBuildPlanFirstTaskFileContent],
+	["plan-first task file embeds real issue title/body (Fix 2)", testPlanFirstTaskFileContentEmbedsIssueTitleAndBody],
 	["writeTaskFiles writes <name>-plan.md per spec only when planFirst", testWriteTaskFilesWritesPlanFilesWhenPlanFirst],
 	["spawn env carries PLAN_FIRST/MODE/MAX_ITERATIONS only when plan-first is on", testSpawnEnvCarriesPlanFirst],
 	["continuation task file includes issues, cycle, and scope", testContinuationTaskFileContentIncludesIssuesAndCycle],

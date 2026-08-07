@@ -335,7 +335,7 @@ run_plan_first() {
         # a generic planner prompt (the planner derives context from the
         # ORCHESTRATOR_TASK.md always copied into the worktree above).
         cat > "$wt_path/ORCHESTRATOR_PLAN.md" <<'EOF'
-Before anything else: read `.roo/rules-code/rules.md` in full (or `.roo/rules/rules.md` if rules-code is absent) and treat it as binding for this entire session.
+Project and mode-specific rules (from the central shared store and this project's own .roo/rules*) are already spliced into your system prompt automatically — you do not need to read any rules file yourself.
 
 You are the PLANNING phase of an autonomous two-phase workflow. Your ONLY job is to produce a compact, actionable implementation plan for the code session that follows.
 
