@@ -63,14 +63,15 @@ done
 
 echo "Installed headlesscode -> $TARGET (harness: $HARNESS_ROOT)"
 
-# Install the shipped stack-rules content (shared/stacks/<stack>/rules.md)
-# into the machine-global central store — this is what "ships with
-# headlesscode" means for the central tier (see docs/stack-rules.md).
-# Routes through the SAME resolution getCentralStackRulesDir() uses
-# (projectStoreRoot()/$HEADLESSCODE_DATA_DIR) — a separate ad hoc
+# Install the shipped shared-rules content (shared/stacks/<stack>/rules.md +
+# shared/rules-<mode>/rules.md, e.g. rules-code) into the machine-global
+# central store — this is what "ships with headlesscode" means for the central
+# tier (see docs/stack-rules.md). Routes through the SAME resolution the
+# runtime readers use (getCentralStackRulesDir()/getGlobalRooDirectory(), both
+# projectStoreRoot()/$HEADLESSCODE_DATA_DIR-derived) — a separate ad hoc
 # $HEADLESSCODE_SHARED_DIR copy path here previously diverged from that and
 # silently installed to the wrong place (issue #10's review finding).
-bash "$HARNESS_ROOT/scripts/sync-stack-rules.sh"
+bash "$HARNESS_ROOT/scripts/sync-shared-rules.sh"
 if ! command -v headlesscode >/dev/null 2>&1; then
     echo "warning: $INSTALL_DIR is not on your PATH" >&2
 fi

@@ -543,9 +543,54 @@ const RULES_SPLICED_NOTE = [
 	"need to read any rules file yourself.",
 ]
 
+/**
+ * One issue's title/body keyed by issue number as a string (JSON object keys
+ * are always strings). Persisted on OrchestratorGroup at dispatch time so the
+ * rework/QA/continuation task files — generated LATER from state alone, when
+ * the original issue objects are no longer in hand — can embed the real
+ * title/body instead of telling the worker to `gh issue view <n>` (which
+ * fails outright for synthetic --issues-json numbers).
+ */
+export type IssueBodies = Record<string, { title: string; body?: string }>
+
+/**
+ * Render each assigned issue as an inline markdown block
+ * ("### Issue #<n>: <title>\n\n<body>") for a task file — the issue title/body
+ * is already in hand, so nothing needs fetching at session start. An issue
+ * whose body was never recorded gets an explicit note; an issue with NO entry
+ * at all falls back to the OLD `gh issue view <n>` instruction for that issue
+ * only (state written before bodies were persisted — never silently produce an
+ * empty assignment section).
+ */
+function issueBodyBlocks(
+	numbers: number[],
+	lookup: (n: number) => { title: string; body?: string } | undefined,
+): string[] {
+	const blocks: string[] = []
+	for (const n of numbers) {
+		const entry = lookup(n)
+		if (entry === undefined) {
+			blocks.push(
+				`### Issue #${n}`,
+				"",
+				`No issue body recorded — fetch it yourself: \`gh issue view ${n}\`.`,
+			)
+		} else {
+			blocks.push(
+				`### Issue #${n}: ${entry.title}`,
+				"",
+				entry.body && entry.body.trim() !== ""
+					? entry.body
+					: "(no issue body recorded — inspect the codebase and git history for context)",
+			)
+		}
+	}
+	return blocks
+}
+
 export function buildTaskFileContent(spec: WorktreeSpec, issues: SplitIssue[]): string {
 	const assigned = spec.issues.map((n) => `#${n}`).join(", ")
-	const ghLines = spec.issues.map((n) => `gh issue view ${n}`).join("\n")
+	const issueBlocks = issueBodyBlocks(spec.issues, (n) => issues.find((i) => i.number === n))
 	return [
 		...RULES_SPLICED_NOTE,
 		"",
@@ -555,11 +600,9 @@ export function buildTaskFileContent(spec: WorktreeSpec, issues: SplitIssue[]): 
 		"",
 		"## Your assignment",
 		"",
-		`GitHub issues assigned to this worktree: ${assigned}. Fetch each issue's real body yourself:`,
-		"```",
-		ghLines,
-		"```",
-		"Do not rely on a stale copy of any issue body.",
+		`GitHub issues assigned to this worktree: ${assigned}. The real title/body of each is inline below.`,
+		"",
+		...(issueBlocks.length > 0 ? issueBlocks : ["(no issue numbers recorded — inspect the worktree for context)"]),
 		"",
 		"## Environment",
 		"",
@@ -568,7 +611,7 @@ export function buildTaskFileContent(spec: WorktreeSpec, issues: SplitIssue[]): 
 		"",
 		"## Workflow",
 		"",
-		"1. Read each assigned issue body via `gh issue view <n>` and the relevant source files.",
+		"1. Read each assigned issue's inline body above and the relevant source files.",
 		"2. Implement the change following the project's own conventions and the rules files.",
 		"3. Verify for real (run the project's tests / boot check) and capture the output.",
 		"4. Commit with the issue number referenced, one logical change per commit.",
@@ -623,9 +666,14 @@ export function buildTaskFileContent(spec: WorktreeSpec, issues: SplitIssue[]): 
  * follows executes against it. Reuses the other task files' conventions (rules
  * preamble, scope line).
  */
-export function buildPlanFirstTaskFileContent(group: { name: string; issues?: number[] }): string {
+export function buildPlanFirstTaskFileContent(
+	group: { name: string; issues?: number[] },
+	/** The in-hand issues (their title/body is embedded inline). Optional for
+	 * backward compatibility with callers that only have persisted state. */
+	issues?: SplitIssue[],
+): string {
 	const assigned = (group.issues ?? []).map((n) => `#${n}`).join(", ") || "this worktree"
-	const ghLines = (group.issues ?? []).map((n) => `gh issue view ${n}`).join("\n")
+	const issueBlocks = issueBodyBlocks(group.issues ?? [], (n) => issues?.find((i) => i.number === n))
 	return [
 		...RULES_SPLICED_NOTE,
 		"",
@@ -635,13 +683,14 @@ export function buildPlanFirstTaskFileContent(group: { name: string; issues?: nu
 		"",
 		"## Your assignment (planning only — DO NOT implement)",
 		"",
-		`Assigned issues: ${assigned}. Fetch each issue's real body yourself:`,
-		"```",
-		ghLines || "# (no issue numbers recorded — read ORCHESTRATOR_TASK.md for the full task)",
-		"```",
+		`Assigned issues: ${assigned}. The real title/body of each is inline below.`,
+		"",
+		...(issueBlocks.length > 0
+			? issueBlocks
+			: ["(no issue numbers recorded — read ORCHESTRATOR_TASK.md for the full task)"]),
 		"",
 		"1. Read `ORCHESTRATOR_TASK.md` at the workspace root — it is the FULL task the code session",
-		"   must execute. Read the assigned issues' real bodies (via gh issue view above).",
+		"   must execute. Read the assigned issues' inline bodies above.",
 		"2. Explore the codebase just enough to ground the plan (grep/read the files the issues touch).",
 		"3. Write the plan to `PLAN.md` at the workspace root (OVERWRITE any existing PLAN.md) as a",
 		"   compact markdown document: goal, concrete steps (files + functions), verification steps",
@@ -681,7 +730,7 @@ export function writeTaskFiles(
 			// from the worktree name alone, so a standalone spawner invocation
 			// can fall back to a generic planner prompt when it is absent.
 			const planTarget = path.join(dir, `${spec.name}-plan.md`)
-			fs.writeFileSync(planTarget, buildPlanFirstTaskFileContent(spec), "utf-8")
+			fs.writeFileSync(planTarget, buildPlanFirstTaskFileContent(spec, issues), "utf-8")
 			written.push(planTarget)
 		}
 	}
@@ -698,12 +747,16 @@ export function writeTaskFiles(
  * closing-report template — same contract as the first attempt.
  */
 export function buildReworkTaskFileContent(
-	group: { name: string; issues?: number[] },
+	group: { name: string; issues?: number[]; issueBodies?: IssueBodies },
 	findings: string[],
 	reworkCount: number,
+	/** Persisted issue title/body captured at dispatch time (see
+	 * OrchestratorGroup.issueBodies). Absent for state written before the
+	 * bodies feature — falls back to the old `gh issue view <n>` instruction. */
+	issueBodies?: IssueBodies,
 ): string {
 	const assigned = (group.issues ?? []).map((n) => `#${n}`).join(", ") || "this worktree"
-	const ghLines = (group.issues ?? []).map((n) => `gh issue view ${n}`).join("\n")
+	const issueBlocks = issueBodyBlocks(group.issues ?? [], (n) => group.issueBodies?.[String(n)] ?? issueBodies?.[String(n)])
 	const findingsList = findings.length > 0 ? findings.map((f, i) => `${i + 1}. ${f}`).join("\n") : ""
 	return [
 		...RULES_SPLICED_NOTE,
@@ -714,11 +767,11 @@ export function buildReworkTaskFileContent(
 		"",
 		`## Rework cycle ${reworkCount} — address the review findings`,
 		"",
-		`Assigned issues: ${assigned}. Fetch each issue's real body yourself (do not rely on a stale`,
-		"copy of any issue body):",
-		"```",
-		ghLines || "# (no issue numbers recorded — inspect the worktree for context)",
-		"```",
+		`Assigned issues: ${assigned}. The real title/body of each is inline below.`,
+		"",
+		...(issueBlocks.length > 0
+			? issueBlocks
+			: ["(no issue numbers recorded — inspect the worktree for context)"]),
 		"",
 		"## Review findings to fix (from the automated review)",
 		"",
@@ -787,13 +840,17 @@ export function buildReworkTaskFileContent(
 	* the closing-report template — same contract as the first attempt.
 	*/
 export function buildQaReworkTaskFileContent(
-	group: { name: string; issues?: number[] },
+	group: { name: string; issues?: number[]; issueBodies?: IssueBodies },
 	evidence: string,
 	reworkCount: number,
 	reportPath?: string,
+	/** Persisted issue title/body captured at dispatch time (see
+	 * OrchestratorGroup.issueBodies). Absent for state written before the
+	 * bodies feature — falls back to the old `gh issue view <n>` instruction. */
+	issueBodies?: IssueBodies,
 ): string {
 	const assigned = (group.issues ?? []).map((n) => `#${n}`).join(", ") || "this worktree"
-	const ghLines = (group.issues ?? []).map((n) => `gh issue view ${n}`).join("\n")
+	const issueBlocks = issueBodyBlocks(group.issues ?? [], (n) => group.issueBodies?.[String(n)] ?? issueBodies?.[String(n)])
 	// Issue #34-style: point at the QA session's COMPLETE final report so the
 	// full reasoning is one file-read away (evidence is only a 4000-char slice).
 	const reportLines = reportPath
@@ -812,11 +869,11 @@ export function buildQaReworkTaskFileContent(
 		"",
 		`## Rework cycle ${reworkCount} — address the QA findings`,
 		"",
-		`Assigned issues: ${assigned}. Fetch each issue's real body yourself (do not rely on a stale`,
-		"copy of any issue body):",
-		"```",
-		ghLines || "# (no issue numbers recorded — inspect the worktree for context)",
-		"```",
+		`Assigned issues: ${assigned}. The real title/body of each is inline below.`,
+		"",
+		...(issueBlocks.length > 0
+			? issueBlocks
+			: ["(no issue numbers recorded — inspect the worktree for context)"]),
 		"",
 		"## QA findings to fix (from the automated QA)",
 		"",
@@ -890,11 +947,15 @@ export function buildQaReworkTaskFileContent(
 	* issues.
 	*/
 export function buildContinuationTaskFileContent(
-	group: { name: string; issues?: number[] },
+	group: { name: string; issues?: number[]; issueBodies?: IssueBodies },
 	continuationCount: number,
+	/** Persisted issue title/body captured at dispatch time (see
+	 * OrchestratorGroup.issueBodies). Absent for state written before the
+	 * bodies feature — falls back to the old `gh issue view <n>` instruction. */
+	issueBodies?: IssueBodies,
 ): string {
 	const assigned = (group.issues ?? []).map((n) => `#${n}`).join(", ") || "this worktree"
-	const ghLines = (group.issues ?? []).map((n) => `gh issue view ${n}`).join("\n")
+	const issueBlocks = issueBodyBlocks(group.issues ?? [], (n) => group.issueBodies?.[String(n)] ?? issueBodies?.[String(n)])
 	return [
 		...RULES_SPLICED_NOTE,
 		"",
@@ -906,11 +967,11 @@ export function buildContinuationTaskFileContent(
 		"",
 		`## Continuation cycle ${continuationCount} — complete the task`,
 		"",
-		`Assigned issues: ${assigned}. Fetch each issue's real body yourself (do not rely on a stale`,
-		"copy of any issue body):",
-		"```",
-		ghLines || "# (no issue numbers recorded — inspect the worktree for context)",
-		"```",
+		`Assigned issues: ${assigned}. The real title/body of each is inline below.`,
+		"",
+		...(issueBlocks.length > 0
+			? issueBlocks
+			: ["(no issue numbers recorded — inspect the worktree for context)"]),
 		"",
 		"## What the previous session did",
 		"",
@@ -921,7 +982,7 @@ export function buildContinuationTaskFileContent(
 		"",
 		"## Workflow",
 		"",
-		"1. Read each assigned issue body via `gh issue view <n>` and the relevant source files.",
+		"1. Read each assigned issue's inline body above and the relevant source files.",
 		"2. Continue the implementation following the project's own conventions and the rules files.",
 		"3. Verify for real (run the project's tests / boot check) and capture the output —",
 		"   output in a report is a claim, not evidence, until reproduced.",
@@ -1019,7 +1080,7 @@ export function handleReviewVerdict(
 
 	if (currentRework < maxReworkCycles) {
 		const taskFilePath = path.join(repo, "plans", "parallel-tasks", `${group.name}-rework${newReworkCount}.md`)
-		const taskContent = buildReworkTaskFileContent(group, result.findings, newReworkCount)
+		const taskContent = buildReworkTaskFileContent(group, result.findings, newReworkCount, group.issueBodies)
 		const worktreePath = groupWorktreePath(repo, group)
 		const spawnCommand =
 			`bash ${path.join(HARNESS_ROOT_TS, "scripts", "run-worker.sh")} ` +
@@ -1103,7 +1164,13 @@ export function handleQaVerdict(
 
 	if (currentRework < maxReworkCycles) {
 		const taskFilePath = path.join(repo, "plans", "parallel-tasks", `${group.name}-qa-rework${newReworkCount}.md`)
-		const taskContent = buildQaReworkTaskFileContent(group, result.evidence, newReworkCount, result.reportPath)
+		const taskContent = buildQaReworkTaskFileContent(
+			group,
+			result.evidence,
+			newReworkCount,
+			result.reportPath,
+			group.issueBodies,
+		)
 		const worktreePath = groupWorktreePath(repo, group)
 		const spawnCommand =
 			`bash ${path.join(HARNESS_ROOT_TS, "scripts", "run-worker.sh")} ` +
@@ -1267,7 +1334,7 @@ export function handleIterationExhaustion(
 
 	if (current < maxContinuations) {
 		const taskFilePath = path.join(repo, "plans", "parallel-tasks", `${group.name}-continue${newContinuationCount}.md`)
-		const taskContent = buildContinuationTaskFileContent(group, newContinuationCount)
+		const taskContent = buildContinuationTaskFileContent(group, newContinuationCount, group.issueBodies)
 		const worktreePath = groupWorktreePath(repo, group)
 		const spawnCommand =
 			`bash ${path.join(HARNESS_ROOT_TS, "scripts", "run-worker.sh")} ` +
@@ -2373,9 +2440,17 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	// invocation) and only has issue numbers; the shape is what lets
 	// cost-estimate.ts match a NEW task to similar past ones, so it must be
 	// captured here and persisted in the state file (OrchestratorGroup.shapes).
+	// The titles/bodies themselves are captured at the same moment into
+	// OrchestratorGroup.issueBodies: the rework/QA/continuation task files are
+	// generated LATER from state alone (a separate orchestrate invocation) and
+	// need them to embed each issue's real title/body inline instead of a
+	// runtime `gh issue view` (which fails for synthetic --issues-json
+	// numbers).
 	const shapeByNumber = new Map<number, string>()
+	const issueBodiesByNumber = new Map<number, { title: string; body?: string }>()
 	for (const issue of issues) {
 		shapeByNumber.set(issue.number, issueShape(issue))
+		issueBodiesByNumber.set(issue.number, { title: issue.title, body: issue.body })
 	}
 	const groupNamesOnDisk = new Set(state.groups.map((g) => g.name))
 	for (const spec of specs) {
@@ -2383,7 +2458,14 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 			continue
 		}
 		const shapes = spec.issues.map((n) => shapeByNumber.get(n) ?? "generic")
-		state = updateGroup(state, spec.name, { shapes })
+		const issueBodies: IssueBodies = {}
+		for (const n of spec.issues) {
+			const entry = issueBodiesByNumber.get(n)
+			if (entry) {
+				issueBodies[String(n)] = entry
+			}
+		}
+		state = updateGroup(state, spec.name, { shapes, issueBodies })
 	}
 	// Issue #13: persist the preflight probe so the dashboard can surface the
 	// preflight line on the round view (see aggregate.ts RoundSummary.preflight).
