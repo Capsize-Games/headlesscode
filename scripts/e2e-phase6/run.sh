@@ -129,7 +129,7 @@ else
 fi
 
 # Budgeted run: tiny per-session cost cap (via env, as run-worker.sh would).
-# The session uses the harness DEFAULT model (deepseek/deepseek-v4-flash =
+# The session uses the harness DEFAULT model (deepseek/deepseek-v4-flash-0731 =
 # $0.14/1M in + $0.28/1M out — see DEFAULT_MODEL in src/llm/openrouter.ts);
 # one mock call is 16 in + 24 out ≈ $0.00000896, so a $0.000005 cap means the
 # FIRST recorded call trips the budget.

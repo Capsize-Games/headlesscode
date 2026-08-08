@@ -50,6 +50,20 @@ async function testDeepseekV4FlashPriced(): Promise<void> {
 	assert.ok(cost < 2, `expected well under $2 for the real incident's token counts, got $${cost.toFixed(4)}`)
 }
 
+/**
+ * The harness default model was bumped to the dated point release
+ * `deepseek/deepseek-v4-flash-0731` (src/llm/openrouter.ts's DEFAULT_MODEL).
+ * Same regression risk as testDeepseekV4FlashPriced: this id must have its
+ * own real pricing entry, not fall through to FALLBACK_MODEL_PRICE.
+ */
+async function testDeepseekV4Flash0731Priced(): Promise<void> {
+	const price = DEFAULT_PRICING_TABLE["deepseek/deepseek-v4-flash-0731"]
+	assert.ok(price, "deepseek/deepseek-v4-flash-0731 must be a real entry, not fall through to the fallback")
+	assert.notDeepEqual(price, FALLBACK_MODEL_PRICE, "must not accidentally equal the unknown-model fallback price")
+	assert.ok(price.input < 1, `input price should be well under $1/1M (real rate is ~$0.14), got $${price.input}`)
+	assert.ok(price.cacheRead !== undefined && price.cacheRead < price.input, "cacheRead must be a real discount, not left unset")
+}
+
 async function testDefaultTableShape(): Promise<void> {
 	// The default table covers the models the harness uses: deepseek-chat,
 	// deepseek-reasoner and at least one general model.
@@ -291,6 +305,7 @@ async function testMergeLivePriceOverridesDefaults(): Promise<void> {
 const tests: Array<[string, () => Promise<void>]> = [
 	["default pricing table covers deepseek-chat + reasoner + a general model", testDefaultTableShape],
 	["deepseek/deepseek-v4-flash is priced correctly (2026-08-01 incident regression)", testDeepseekV4FlashPriced],
+	["deepseek/deepseek-v4-flash-0731 (current default) is priced correctly", testDeepseekV4Flash0731Priced],
 	["estimateCost math (per-1M input/output, mixed, zero defaults)", testEstimateCostMath],
 	["unknown model falls back to the conservative rate (never $0)", testModelFallback],
 	["in-code pricing override table + per-model fallback", testPriceOverrideTable],

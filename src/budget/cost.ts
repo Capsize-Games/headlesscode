@@ -55,10 +55,13 @@ export type PricingTable = Record<string, ModelPrice>
 /**
  * Default pricing table (OpenRouter list rates, USD per 1M tokens).
  *
- * - `deepseek/deepseek-v4-flash` — the harness default (Phase 1/2/5 workers;
- *   see `DEFAULT_MODEL` in src/llm/openrouter.ts). The rate is the OFFICIAL
- *   DeepSeek provider's own rate specifically (verified against OpenRouter's
- *   own `/api/v1/models/deepseek/deepseek-v4-flash/endpoints` on 2026-08-01,
+ * - `deepseek/deepseek-v4-flash-0731` — the harness default (Phase 1/2/5
+ *   workers; see `DEFAULT_MODEL` in src/llm/openrouter.ts). Priced the same
+ *   as the prior default, `deepseek/deepseek-v4-flash` (kept below for
+ *   override compat) — same model line, dated point-release id. The rate is
+ *   the OFFICIAL DeepSeek provider's own rate specifically (verified
+ *   against OpenRouter's own
+ *   `/api/v1/models/deepseek/deepseek-v4-flash/endpoints` on 2026-08-01,
  *   cross-checked against OpenRouter's own pricing UI). This price is only
  *   actually correct because `src/llm/openrouter.ts` pins routing to this
  *   exact provider (`provider: { order: ["deepseek"], allow_fallbacks:
@@ -73,6 +76,8 @@ export type PricingTable = Record<string, ModelPrice>
  *   cost estimates and at least one false-positive budget abort. A second,
  *   smaller error (`cacheRead` off by 10x — $0.028 instead of the real
  *   $0.0028/1M) was caught and fixed the same day.
+ * - `deepseek/deepseek-v4-flash` — the previous default, kept priced so an
+ *   explicit override to the un-dated id still estimates correctly.
  * - `deepseek/deepseek-chat` — the legacy default, still priced so an
  *   explicit `OPENROUTER_MODEL=deepseek/deepseek-chat` override accounts
  *   correctly.
@@ -94,6 +99,7 @@ export type PricingTable = Record<string, ModelPrice>
 export const DEFAULT_PRICING_TABLE: PricingTable = {
  "deepseek/deepseek-chat": { input: 0.27, output: 1.1 },
  "deepseek/deepseek-reasoner": { input: 0.55, output: 2.19 },
+ "deepseek/deepseek-v4-flash-0731": { input: 0.14, output: 0.28, cacheRead: 0.0028 },
  "deepseek/deepseek-v4-flash": { input: 0.14, output: 0.28, cacheRead: 0.0028 },
  "anthropic/claude-3.5-sonnet": { input: 3.0, output: 15.0 },
  "qwen/qwen3-embedding-4b": { input: 0.15, output: 0.15 },
