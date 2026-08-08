@@ -47,7 +47,7 @@ import { randomUUID } from "node:crypto"
 
 import { BudgetExceededError, BudgetTracker, type SessionBudget } from "../budget/budget.js"
 import { loadPricingTable, mergeLivePrice, type ModelPrice, type PricingTable } from "../budget/cost.js"
-import { DEFAULT_MODEL } from "../llm/openrouter.js"
+import { DEFAULT_MODEL, isRetryableOpenRouterError } from "../llm/openrouter.js"
 import { DECISION_PROXY_ANSWER_PREFIX } from "../decision-proxy/proxy.js"
 import {
 	createHeadlessExecutor,
@@ -95,10 +95,13 @@ import {
 	DEFAULT_CONDENSE_EARLY_FIRE_FRACTION,
 	DEFAULT_CONDENSE_THRESHOLD_FRACTION,
 	DEFAULT_CONTEXT_WINDOW_TOKENS,
+	estimateMessageChars,
+	MAX_CONDENSE_INPUT_CHARS,
 	maybeCondense,
 	MIN_CONDENSE_TAIL_GROWTH,
 	skipOrphanedToolMessages,
 } from "./condense.js"
+import { writeHandoffSummary } from "./handoff.js"
 import { runLocalExplorePhase, type LocalExploreOptions, type LocalExploreResult } from "./local-explore.js"
 import { DEFAULT_LINE_LIMIT } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/read_file.js"
 import { hasCodebaseIndex } from "../index-util.js"
@@ -121,7 +124,20 @@ const PAUSED_FILENAME = ".harness.paused"
  */
 export const INJECT_MESSAGE_FILENAME = ".harness.inject-message"
 
-export const DEFAULT_MAX_ITERATIONS = 50
+/**
+ * 2026-08-08: raised from 50 — real rounds against non-trivial issues
+ * routinely needed MORE than 50 (exploration alone regularly ate 30-45 of
+ * them before the first edit; see the read-only-equivalent execute_command
+ * guardrail extension for the biggest driver), so 50 was hitting the cap
+ * and forcing a continuation restart (see src/engine/handoff.ts) far more
+ * often than it should have. 250 gives a real multi-file task room to
+ * finish in ONE session instead of routinely needing 2-4 continuation
+ * cycles — each iteration is cheap (prompt caching + condensation keep
+ * later iterations from ballooning in cost), so the main cost of a higher
+ * cap is wall-clock time on a task that was never going to finish anyway,
+ * not spend.
+ */
+export const DEFAULT_MAX_ITERATIONS = 250
 export const DEFAULT_CONSECUTIVE_ERROR_LIMIT = 3
 /**
  * Recursive task decomposition (`new_task`): hard cap on recursion depth.
@@ -211,6 +227,113 @@ const READ_ONLY_TOOL_NAMES = new Set(["list_files", "read_file", "search_files"]
 /** The injected nudge (user-role, seen by the model on its next turn). */
 const READ_ONLY_NUDGE_MESSAGE =
 	"You've made several read/exploration calls without using `codebase_search`. If the workspace has an index (it lives in the central project store — see `~/.local/share/headlesscode/projects/`), try `codebase_search` for targeted semantic search instead of blind tree-walking. If the workspace is not indexed, ignore this nudge."
+
+/**
+ * Leading command names treated as read-only-equivalent by
+ * isReadOnlyEquivalentShellCommand — every one of these inspects the
+ * workspace without changing it. Deliberately an ALLOW-list (default "not
+ * read-only" for anything unrecognized) rather than a deny-list of mutating
+ * commands: a shell one-liner is too open-ended to safely enumerate every
+ * way it could mutate something, so the safe default is to under-count
+ * (miss a real read-only command occasionally) rather than over-count (wrongly
+ * treat a mutation as exploration and never nudge). Low stakes either way —
+ * this only feeds a SOFT, reversible nudge, never a block.
+ */
+const READ_ONLY_SHELL_LEADING_COMMANDS = new Set([
+	"grep",
+	"egrep",
+	"fgrep",
+	"rg",
+	"ag",
+	"find",
+	"ls",
+	"cat",
+	"head",
+	"tail",
+	"wc",
+	"tree",
+	"pwd",
+	"echo",
+	"printf",
+	"stat",
+	"file",
+	"du",
+	"basename",
+	"dirname",
+	"realpath",
+	// A no-op — common as a `git status || true`-style fallback to suppress a
+	// read-only command's non-zero exit (e.g. `git log` in a fresh repo).
+	"true",
+])
+/** git/docker subcommands that only inspect state (vs. `git commit`, `docker up`, ...). */
+const READ_ONLY_GIT_SUBCOMMANDS = new Set(["log", "diff", "status", "show", "blame", "branch", "rev-parse", "remote"])
+const READ_ONLY_DOCKER_SUBCOMMANDS = new Set(["ps", "images", "logs", "inspect"])
+
+/**
+ * Measured on a live round (issue: harness slowness investigation, 2026-08-08):
+ * `execute_command` — NOT `read_file`/`list_files` — was the dominant
+ * exploration tool by a wide margin (e.g. 37-48 execute_command calls per
+ * session vs. 0-1 codebase_search calls), almost entirely ad hoc
+ * grep/ls/sed/find one-liners doing the exact job `codebase_search` exists to
+ * shortcut. The blind-tree-walking guardrail above never saw any of this
+ * because `execute_command` wasn't in READ_ONLY_TOOL_NAMES — a long streak of
+ * pure shell-grep exploration could run the entire session without ever
+ * tripping the nudge. This classifier closes that gap: a `sed -n`/`cat`/`git
+ * log`/`docker ps`-style command reads exactly like `read_file`/`list_files`
+ * for this guardrail's purposes and should count the same way. Compound
+ * commands (`&&`/`;`/`|`/newline-joined) count only if EVERY segment is
+ * read-only — one mutating segment (a `git commit`, `docker compose up`, a
+ * bare `>` redirect, `sed -i`) marks the whole command as NOT read-only.
+ */
+export function isReadOnlyEquivalentShellCommand(command: string): boolean {
+	// `\|\|` MUST be tried before the bare `\|` alternative below it, or a
+	// `cmd || true` fallback splits into a stray `true` segment (not on the
+	// allow-list) and the whole command wrongly reads as mutating.
+	const segments = command.split(/\|\||&&|;|\||\n/).map((s) => s.trim())
+	if (segments.length === 0 || segments.every((s) => s === "")) {
+		return false
+	}
+	for (const segment of segments) {
+		if (segment === "") {
+			continue
+		}
+		// A bare `>`/`>>` writes a file; `2>&1`/`>&2` (fd-to-fd redirects) don't.
+		if (/(?<!\d)>>?(?!&)/.test(segment)) {
+			return false
+		}
+		const words = segment.split(/\s+/).filter(Boolean)
+		const head = words[0]
+		if (head === "cd") {
+			continue // a leading `cd x &&` is just a working-dir change, not itself an inspection
+		}
+		if (head === "sed") {
+			// `sed -n '...'` (print-only) is read-only; anything with `-i` is not.
+			if (words.includes("-i") || words.some((w) => w.startsWith("-i"))) {
+				return false
+			}
+			continue
+		}
+		if (head === "git") {
+			if (READ_ONLY_GIT_SUBCOMMANDS.has(words[1] ?? "")) {
+				continue
+			}
+			return false
+		}
+		if (head === "docker") {
+			// `docker compose ps/logs` vs. `docker compose up/down/build`.
+			const sub = words[1] === "compose" ? words[2] : words[1]
+			if (READ_ONLY_DOCKER_SUBCOMMANDS.has(sub ?? "")) {
+				continue
+			}
+			return false
+		}
+		if (READ_ONLY_SHELL_LEADING_COMMANDS.has(head ?? "")) {
+			continue
+		}
+		return false
+	}
+	return true
+}
 
 /**
  * Same-file multi-edit diagnosis (see the tool-execution loop): when the
@@ -366,7 +489,7 @@ export interface HeadlessSessionConfig {
 	maxModeSwitches?: number
 	/** Mode slug, default 'code' (built-in or from .roomodes). */
 	mode?: string
-	/** Model id; default env OPENROUTER_MODEL or 'deepseek/deepseek-v4-flash'. */
+	/** Model id; default env OPENROUTER_MODEL or 'deepseek/deepseek-v4-flash-0731'. */
 	model?: string
 	taskText: string
 	maxIterations?: number
@@ -1944,6 +2067,104 @@ export class HeadlessSession {
 		})
 	}
 
+	/** recordCondensationUsage, but a budget trip is swallowed (logged, not rethrown) — see writeIterationCapHandoff's doc comment. */
+	private recordHandoffCondensationUsage(usage: NonNullable<LlmResponse["usage"]>, budgetTracker: BudgetTracker): void {
+		try {
+			this.recordCondensationUsage(usage, budgetTracker)
+		} catch (err) {
+			this.logger.warn("[handoff] usage accounting hit a budget limit (non-fatal, ignored)", {
+				error: err instanceof Error ? err.message : String(err),
+			})
+		}
+	}
+
+	/**
+	 * Cross-restart handoff (see src/engine/handoff.ts): called ONLY when a
+	 * session is about to end with `maxIterations` exhausted — the case where
+	 * the orchestrator spawns a brand-new-conversation continuation worker on
+	 * the same worktree. Summarizes the ENTIRE session history (not just the
+	 * oldest chunk — there is no future turn left to keep a verbatim tail for)
+	 * via the same condenseOldestTurns LLM-compression call the mid-session
+	 * condensation path uses, and writes the result to
+	 * `<workspaceRoot>/.headlesscode/handoff-summary.md` for the continuation
+	 * task file to inline.
+	 *
+	 * Non-fatal by design: this is a courtesy write on the way out of a
+	 * session that has already failed for a different reason (the iteration
+	 * cap). ANY failure here — including a BudgetExceededError from the
+	 * summarization call's own usage — is caught and logged, never allowed to
+	 * change or mask the max-iterations result the caller is about to return.
+	 */
+	private async writeIterationCapHandoff(messages: ChatMessage[], budgetTracker: BudgetTracker): Promise<void> {
+		const config = this.config
+		try {
+			// No system/first-user messages to summarize, or a session too short
+			// for the tool-group-safe slice below to be meaningful.
+			if (messages.length <= 3) {
+				return
+			}
+			// Cap the input handed to the summarization call (MAX_CONDENSE_INPUT_CHARS):
+			// walk forward from the oldest turn until the REMAINING suffix fits the
+			// cap, dropping only the oldest, least-actionable material if the full
+			// history is too large for one call. Reconstructed as a
+			// [system, firstUser, ...tail] array so condenseOldestTurns's
+			// `slice(2, 2 + count)` contract still lands exactly on the tail.
+			let startIndex = 2
+			let suffixChars = 0
+			for (let i = messages.length - 1; i >= 2; i--) {
+				suffixChars += estimateMessageChars(messages[i])
+				if (suffixChars > MAX_CONDENSE_INPUT_CHARS) {
+					startIndex = i + 1
+					break
+				}
+			}
+			const toSummarize = [messages[0], messages[1], ...messages.slice(startIndex)]
+			const count = toSummarize.length - 2
+			if (count < 1) {
+				return
+			}
+			// Retry once on failure: this call happens at MOST once per session
+			// (right on the way out, when there's no further iteration to fall
+			// back to), so a single transient hiccup — observed live: DeepSeek's
+			// pinned official endpoint briefly reporting "no allowed providers
+			// available" — would otherwise silently drop the entire handoff for
+			// that continuation cycle. Mirrors fetchModelContextWindow's own
+			// once-per-session retry-with-backoff (src/llm/openrouter.ts).
+			let summary: string
+			try {
+				summary = await condenseOldestTurns(this.llmClient, {
+					messages: toSummarize,
+					count,
+					model: config.condenseModel,
+					maxTokens: config.condenseMaxTokens ?? config.maxTokens,
+					onUsage: (usage) => this.recordHandoffCondensationUsage(usage, budgetTracker),
+				})
+			} catch (firstError) {
+				this.logger.warn("[handoff] condensation call failed, retrying once after a short backoff", {
+					error: firstError instanceof Error ? firstError.message : String(firstError),
+				})
+				await sleep(250) // matches fetchModelContextWindow's own once-per-session backoff
+				summary = await condenseOldestTurns(this.llmClient, {
+					messages: toSummarize,
+					count,
+					model: config.condenseModel,
+					maxTokens: config.condenseMaxTokens ?? config.maxTokens,
+					onUsage: (usage) => this.recordHandoffCondensationUsage(usage, budgetTracker),
+				})
+			}
+			const header =
+				`# Handoff summary — written when the previous session hit the iteration cap\n\n` +
+				`Generated ${new Date().toISOString()}, condensing ${count} of ${messages.length - 2} history messages ` +
+				`(startIndex=${startIndex}) with model ${config.condenseModel}.\n\n---\n\n`
+			const file = await writeHandoffSummary(config.workspaceRoot, header + summary)
+			this.logger.info("[handoff] wrote iteration-cap handoff summary", { file, count })
+		} catch (error) {
+			this.logger.warn("[handoff] failed to write iteration-cap handoff summary (non-fatal)", {
+				error: error instanceof Error ? error.message : String(error),
+			})
+		}
+	}
+
 	/**
 		* Feed an auxiliary LLM call's usage — cloud vision captioning
 		* (src/vision/describe.ts): browser screenshots and the describe_image
@@ -1984,6 +2205,43 @@ export class HeadlessSession {
 			cachedTokens,
 			costUsd: budgetTracker.totalCostUsd,
 		})
+	}
+
+	/**
+	 * One attempt at the main per-iteration LLM call, with its own fresh
+	 * AbortController/timeout (a retried attempt must not inherit an
+	 * already-aborted signal from a prior attempt's timer — see the two
+	 * call sites in runIterations). Throws on failure exactly like a direct
+	 * `this.llmClient.createChatCompletion` call would; callers decide
+	 * whether a given failure is worth retrying (isRetryableOpenRouterError).
+	 */
+	private async callMainLlm(requestMessages: ChatMessage[], iteration: number): Promise<LlmResponse> {
+		const controller = new AbortController()
+		const timer = setTimeout(() => controller.abort(), this.config.llmTimeoutMs)
+		try {
+			return await this.llmClient.createChatCompletion({
+				model: this.config.model,
+				messages: requestMessages,
+				tools: this.state.tools,
+				temperature: this.config.temperature,
+				maxTokens: this.config.maxTokens,
+				signal: controller.signal,
+				stream: this.config.stream,
+				reasoningEffort: this.config.reasoningEffort,
+				onStreamChunk: (kind, chunk) => {
+					// Dashboard live-typing: forward each chunk to the event feed
+					// (truncated like other large fields). Non-fatal — a feed
+					// write failure must never abort the LLM call.
+					void this.emitEvent(
+						"llm_stream_chunk",
+						() => this.eventFeed.llmStreamChunk({ iteration, kind, chunk }),
+						{ iteration },
+					)
+				},
+			})
+		} finally {
+			clearTimeout(timer)
+		}
 	}
 
 	private async runIterations(budgetTracker: BudgetTracker, startedAt: string): Promise<SessionResult> {
@@ -2063,34 +2321,33 @@ export class HeadlessSession {
 			}
 			requestMessages = truncateHistory(requestMessages, this.config.windowSize)
 
-			// 4. Call the LLM with an abort timeout.
+			// 4. Call the LLM with an abort timeout. Retried ONCE on a classified
+			// transient provider error (see isRetryableOpenRouterError) — this
+			// is the main call, with no fallback provider to smooth over a
+			// blip on the pinned deepseek/* endpoint (allow_fallbacks: false),
+			// so without this a single hiccup used to kill the entire session
+			// outright (observed live: an HTTP 520 "Provider returned error"
+			// mid-session, iteration budget otherwise untouched). A second
+			// failure — retryable or not — still falls through to the
+			// catch block below exactly as before.
 			let assistant: ChatMessage
 			try {
-				const controller = new AbortController()
-				const timer = setTimeout(() => controller.abort(), this.config.llmTimeoutMs)
+				let response: LlmResponse
 				try {
-					const response = await this.llmClient.createChatCompletion({
-						model: this.config.model,
-						messages: requestMessages,
-						tools: this.state.tools,
-						temperature: this.config.temperature,
-						maxTokens: this.config.maxTokens,
-						signal: controller.signal,
-						stream: this.config.stream,
-						reasoningEffort: this.config.reasoningEffort,
-						onStreamChunk: (kind, chunk) => {
-							// Dashboard live-typing: forward each chunk to the event
-							// feed (truncated like other large fields). Non-fatal —
-							// a feed write failure must never abort the LLM call.
-							void this.emitEvent(
-								"llm_stream_chunk",
-								() => this.eventFeed.llmStreamChunk({ iteration, kind, chunk }),
-								{ iteration },
-							)
-						},
+					response = await this.callMainLlm(requestMessages, iteration)
+				} catch (firstAttemptError) {
+					if (!isRetryableOpenRouterError(firstAttemptError)) {
+						throw firstAttemptError
+					}
+					this.logger.warn("[loop] main LLM call failed with a retryable provider error, retrying once", {
+						iteration,
+						error: firstAttemptError instanceof Error ? firstAttemptError.message : String(firstAttemptError),
 					})
-					assistant = response.message
-					// Cost/token accounting (workstream 3): feed the provider's usage
+					await sleep(500)
+					response = await this.callMainLlm(requestMessages, iteration)
+				}
+				assistant = response.message
+				// Cost/token accounting (workstream 3): feed the provider's usage
 					// tokens into the budget tracker unconditionally now (it always
 					// exists — see `run()` — with no limits when no budget was
 					// configured, so this only ever accumulates, never trips).
@@ -2142,9 +2399,6 @@ export class HeadlessSession {
 					// a write failure must never affect the session (same idiom
 					// as the final usage record / checkpoints).
 					await this.writeLiveSnapshot(startedAt, iteration, budgetTracker.totalCostUsd)
-				} finally {
-					clearTimeout(timer)
-				}
 			} catch (error) {
 				// Live worker monitoring: surface the LLM call failure on the
 				// event feed too (the session is ending with an error). The
@@ -2474,14 +2728,24 @@ export class HeadlessSession {
 
 			// Blind tree-walking guardrail (P1.6): after N consecutive
 			// iterations whose every tool call is a plain read/exploration
-			// tool (list_files / read_file / search_files) with no
-			// codebase_search, code-intel, or edit, inject a soft user-role
-			// nudge pointing at codebase_search. One nudge per streak; any
-			// non-read-only tool resets the streak. Never fires on an
-			// unindexed workspace (blind walking is then the only option).
-			// Soft + reversible — a later productive call resets everything.
+			// tool (list_files / read_file / search_files, OR an
+			// execute_command whose shell command is read-only-equivalent —
+			// see isReadOnlyEquivalentShellCommand's doc comment for why that
+			// half matters: it's the dominant real-world exploration pattern)
+			// with no codebase_search, code-intel, or edit, inject a soft
+			// user-role nudge pointing at codebase_search. One nudge per
+			// streak; any non-read-only tool resets the streak. Never fires
+			// on an unindexed workspace (blind walking is then the only
+			// option). Soft + reversible — a later productive call resets
+			// everything.
 			if (calls.length > 0) {
-				const allReadOnly = calls.every((call) => READ_ONLY_TOOL_NAMES.has(call.name))
+				const allReadOnly = calls.every(
+					(call) =>
+						READ_ONLY_TOOL_NAMES.has(call.name) ||
+						(call.name === "execute_command" &&
+							typeof call.args.command === "string" &&
+							isReadOnlyEquivalentShellCommand(call.args.command)),
+				)
 				if (allReadOnly) {
 					readOnlyStreak++
 					if (readOnlyStreak >= readOnlyNudgeThreshold && !readOnlyNudgeInjected) {
@@ -2510,7 +2774,14 @@ export class HeadlessSession {
 			await this.saveIterationCheckpoint(iteration)
 		}
 
-		// maxIterations exhausted without completion.
+		// maxIterations exhausted without completion: this is specifically the
+		// case where the orchestrator spawns a continuation worker as a
+		// brand-new conversation on the same worktree (see
+		// isIterationExhaustion in src/orchestrator/watch.ts, which matches
+		// this exact error string) — write a handoff summary so that new
+		// conversation doesn't start from a blank slate. Non-fatal; never
+		// changes the result below.
+		await this.writeIterationCapHandoff(messages, budgetTracker)
 		return {
 			status: "error",
 			error: `Max iterations (${maxIterations}) reached without task completion`,

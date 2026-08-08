@@ -240,8 +240,9 @@ Options:
                              Used by the dashboard's session-launch endpoint so
                              the browser can open the session's event view
                              immediately; rarely needed from a terminal.
-  --model <id>               OpenRouter model id (default: $OPENROUTER_MODEL or deepseek/deepseek-v4-flash)
-  --max-iterations <n>       Loop iteration cap (default: 50)
+  --model <id>               OpenRouter model id (default: $OPENROUTER_MODEL or deepseek/deepseek-v4-flash-0731)
+  --max-iterations <n>       Loop iteration cap (default: 250 — see DEFAULT_MAX_ITERATIONS
+                               in src/engine/loop.ts)
   --max-recursion-depth <n>  Recursive task decomposition (new_task): hard cap
                                on how deep one root session may delegate
                                (default: 2 = root → child → grandchild; a
@@ -775,7 +776,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 			process.stdout.write(
 				`\n───── dry-run summary ─────\n` +
 					`mode:             ${options.mode}\n` +
-					`model:            ${dryRunModel ?? "deepseek/deepseek-v4-flash (client default)"}\n` +
+					`model:            ${dryRunModel ?? "deepseek/deepseek-v4-flash-0731 (client default)"}\n` +
 					`reasoning effort: ${dryRunEffort ?? "(unset — endpoint default)"}\n` +
 					`workspace:        ${workspaceRoot}\n` +
 					`custom modes:     ${customModes.length ? customModes.map((m) => m.slug).join(", ") : "(none, using built-ins)"}\n` +

@@ -1304,6 +1304,53 @@ async function testExhaustionSpawnForwardsMaxIterations(): Promise<void> {
 	assert.ok(!withoutCap.spawnCommand?.includes("--max-iterations"), "no cap -> no flag (harness default applies)")
 }
 
+// ─── handleIterationExhaustion: transient provider failures also auto-continue ──
+// A hard-pinned model with no fallback provider hit an HTTP 520 mid-session
+// live (2026-08-08) and killed the whole thing — this earns the SAME
+// bounded auto-continue treatment as the iteration cap (isProviderFailure),
+// not the generic "failed, no continuation" path.
+
+function providerFailureGroup(overrides: Partial<OrchestratorGroup> = {}): OrchestratorGroup {
+	return baseGroup({
+		status: "failed",
+		exit_code: 1,
+		summary:
+			'headlesscode: task failed: LLM request failed on iteration 28: OpenRouter returned HTTP 520: {"error":{"message":"Provider returned error","code":520,"metadata":{"provider_name":"DeepSeek"}}}',
+		...overrides,
+	})
+}
+
+async function testProviderFailureBelowCapSpawnsAndResetsState(): Promise<void> {
+	const group = providerFailureGroup({ issues: [27], continuationCount: 0 })
+	const decision = handleIterationExhaustion(group, "/tmp/example-repo", 3, "code")
+
+	assert.equal(decision.shouldSpawn, true, "a transient provider failure below the cap gets a continuation spawn")
+	assert.equal(decision.newContinuationCount, 1)
+	assert.equal(decision.patch.status, "running")
+	assert.equal(decision.patch.exit_code, undefined, "previous attempt's exit code cleared")
+	assert.equal(decision.patch.summary, undefined, "previous attempt's summary cleared")
+}
+
+async function testProviderFailureAtCapMarksNeedsHuman(): Promise<void> {
+	const group = providerFailureGroup({ continuationCount: 3 })
+	const decision = handleIterationExhaustion(group, "/tmp/repo", 3, "code")
+	assert.equal(decision.shouldSpawn, false, "at the cap a provider failure still stops auto-continuing")
+	assert.equal(decision.patch.status, "needs-human", "still surfaces to a human eventually, just after a few free retries")
+}
+
+async function testDeterministicProviderErrorDoesNotContinue(): Promise<void> {
+	// A 401 (bad API key) is deterministic — retrying changes nothing, so this
+	// must fall to the generic "failed, no continuation" path, not auto-continue.
+	const group = baseGroup({
+		status: "failed",
+		exit_code: 1,
+		summary: 'headlesscode: task failed: LLM request failed on iteration 2: OpenRouter returned HTTP 401: {"error":{"message":"Invalid API key"}}',
+	})
+	const decision = handleIterationExhaustion(group, "/tmp/repo", 3, "code")
+	assert.equal(decision.shouldSpawn, false, "a deterministic 4xx must never auto-continue")
+	assert.deepEqual(decision.patch, {})
+}
+
 // ─── watchGroups re-polls a group after a continuation reset ─────────────────
 // Mirrors the rework-loop test above: after onGroupUpdate resets a failed
 // group to "running" (and the watcher reloads on the callback's `true`), the
@@ -1697,6 +1744,9 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["generic failure never auto-continues (stays failed)", testGenericFailureDoesNotContinue],
 	["clean exit with the max-iterations text never auto-continues", testCleanExitWithMaxIterationsTextDoesNotContinue],
 	["continuation spawn forwards the round-level --max-iterations when set", testExhaustionSpawnForwardsMaxIterations],
+	["a transient provider failure below the cap also auto-continues", testProviderFailureBelowCapSpawnsAndResetsState],
+	["a transient provider failure at the cap still marks needs-human", testProviderFailureAtCapMarksNeedsHuman],
+	["a deterministic provider error (401) must never auto-continue", testDeterministicProviderErrorDoesNotContinue],
 	["watchGroups re-polls a group after a continuation reset", testWatchGroupsRepollsGroupAfterContinuationReset],
 	["orchestrateMain skips an occupied w1 slot and names the group w2", testOrchestrateMainSkipsOccupiedWorktreeSlot],
 	["orchestrateMain skips multiple occupied slots (w1+w2 -> w3)", testOrchestrateMainSkipsMultipleOccupiedSlots],

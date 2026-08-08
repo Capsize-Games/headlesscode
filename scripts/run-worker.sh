@@ -44,17 +44,20 @@
 #                      autonomous decision; default 30 min). Answer a blocked
 #                      worker with scripts/headlesscode-answer.sh.
 #   HEADLESSCODE_MAX_ITERATIONS  when set, forwarded to the CLI as
-#                      --max-iterations (default 50 — often too low for a
-#                      multi-phase plan doc that needs substantial file
-#                      exploration before its first edit; each iteration is
-#                      now cheap, roughly $0.002 with the fixed pricing/
-#                      caching, so raising this is a cost-cheap way to avoid
-#                      "max iterations reached without task completion").
-#                      An explicit --max-iterations flag below overrides it.
+#                      --max-iterations (default 250, raised 2026-08-08 from
+#                      50 — a multi-phase plan doc routinely needs
+#                      substantial file exploration before its first edit,
+#                      and 50 was hitting the cap on real rounds far more
+#                      often than it should have; each iteration is cheap,
+#                      roughly $0.002 with the fixed pricing/caching, so
+#                      raising this further still is a cost-cheap way to
+#                      avoid "max iterations reached without task
+#                      completion"). An explicit --max-iterations flag below
+#                      overrides it.
 #   HEADLESSCODE_WINDOW_SIZE  when set, forwarded to the CLI as
 #                      --window-size (default 300 messages). Rarely needs
 #                      overriding now that the default accounts for
-#                      deepseek/deepseek-v4-flash's 1M-token context — only
+#                      deepseek/deepseek-v4-flash-0731's 1M-token context — only
 #                      raise it further for a task that reads an unusually
 #                      large number of files before it starts writing.
 #

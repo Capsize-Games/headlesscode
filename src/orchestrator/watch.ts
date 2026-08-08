@@ -77,6 +77,33 @@ export function isIterationExhaustion(summary: string | undefined): boolean {
 	return typeof summary === "string" && MAX_ITERATIONS_ERROR_RE.test(summary)
 }
 
+/**
+ * The harness loop's main-call failure message (src/engine/loop.ts's
+ * `LLM request failed on iteration N: ...`) — this is what used to be a
+ * completely SILENT dead end: a provider blip that outlasted the one retry
+ * in src/engine/loop.ts's callMainLlm (see isRetryableOpenRouterError in
+ * src/llm/openrouter.ts) killed the whole session, the group landed in the
+ * generic terminal "failed" state indistinguishable from a real code/logic
+ * failure, and nothing ever looked at it again — a human had to happen to
+ * open harness.log to learn the task itself was never actually attempted at
+ * fault. Observed live 2026-08-08: a hard-pinned model with no fallback
+ * provider (allow_fallbacks: false) hit an HTTP 520 mid-session and the
+ * group just sat there.
+ *
+ * Matched by the SAME error-message shapes isRetryableOpenRouterError
+ * classifies as transient (provider 5xx/429/no-allowed-providers, or a raw
+ * network-error message) — this is deliberately a narrower net than "any
+ * failure": a deterministic error (bad tool call, budget stop, real bug)
+ * must never auto-continue, only "the model provider itself misbehaved."
+ */
+export const PROVIDER_FAILURE_RE =
+	/LLM request failed on iteration \d+:.*(?:OpenRouter returned HTTP (?:429|5\d\d)|no allowed providers|Network error calling OpenRouter)/is
+
+/** Whether a worker's log summary indicates a transient LLM-provider failure (see PROVIDER_FAILURE_RE) rather than a real task/code failure. */
+export function isProviderFailure(summary: string | undefined): boolean {
+	return typeof summary === "string" && PROVIDER_FAILURE_RE.test(summary)
+}
+
 export interface WatchOptions {
 	/** Target repo root containing `.worktrees/` (also used to resolve). */
 	repoRoot: string

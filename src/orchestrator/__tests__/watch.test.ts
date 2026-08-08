@@ -13,7 +13,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { spawnSync } from "node:child_process"
 
-import { inspectGroup, isIterationExhaustion, tailLog, watchGroups, DEFAULT_STALL_TIMEOUT_MS } from "../watch.js"
+import { inspectGroup, isIterationExhaustion, isProviderFailure, tailLog, watchGroups, DEFAULT_STALL_TIMEOUT_MS } from "../watch.js"
 import {
 	defaultState,
 	loadStateSync,
@@ -636,6 +636,64 @@ async function testIsIterationExhaustionRejectsOtherFailures(): Promise<void> {
 	assert.equal(isIterationExhaustion(""), false, "empty summary is never exhaustion")
 }
 
+// ─── isProviderFailure: the second continuable-failure predicate ────────────
+// A transient LLM-provider failure on the MAIN call (src/engine/loop.ts's
+// callMainLlm) — observed live 2026-08-08: a hard-pinned model with no
+// fallback provider hit an HTTP 520 mid-session and killed the whole thing.
+// This earns the same auto-continue treatment as the iteration cap; a real
+// task/code failure must never match.
+
+async function testIsProviderFailureMatchesKnownShapes(): Promise<void> {
+	assert.equal(
+		isProviderFailure(
+			'headlesscode: task failed: LLM request failed on iteration 28: OpenRouter returned HTTP 520: {"error":{"message":"Provider returned error","code":520,"metadata":{"raw":"error code: 520\\n","provider_name":"DeepSeek","is_byok":false}}}',
+		),
+		true,
+		"a provider 5xx on the main call must match",
+	)
+	assert.equal(
+		isProviderFailure(
+			'LLM request failed on iteration 12: OpenRouter returned HTTP 429: {"error":{"message":"Rate limited"}}',
+		),
+		true,
+		"a provider 429 must match",
+	)
+	assert.equal(
+		isProviderFailure(
+			'LLM request failed on iteration 5: OpenRouter returned HTTP 404: {"error":{"message":"No allowed providers are available for the selected model."}}',
+		),
+		true,
+		'the "no allowed providers" 404 must match despite the 4xx status (see isRetryableOpenRouterError)',
+	)
+	assert.equal(
+		isProviderFailure("LLM request failed on iteration 3: Network error calling OpenRouter: fetch failed"),
+		true,
+		"a raw network-transport failure must match",
+	)
+}
+
+async function testIsProviderFailureRejectsOtherFailures(): Promise<void> {
+	assert.equal(
+		isProviderFailure(
+			'LLM request failed on iteration 9: OpenRouter returned HTTP 401: {"error":{"message":"Invalid API key"}}',
+		),
+		false,
+		"a deterministic 4xx (auth failure) must NOT auto-continue — retrying changes nothing",
+	)
+	assert.equal(
+		isProviderFailure("headlesscode: task aborted by budget: max cost exceeded"),
+		false,
+		"a budget stop is not a provider failure",
+	)
+	assert.equal(
+		isProviderFailure("headlesscode: task failed: Max iterations (50) reached without task completion"),
+		false,
+		"iteration exhaustion is handled by isIterationExhaustion, not this predicate",
+	)
+	assert.equal(isProviderFailure(undefined), false, "no summary is never a provider failure")
+	assert.equal(isProviderFailure(""), false, "empty summary is never a provider failure")
+}
+
 /**
  * 2026-08-05 incident regression: `inspectGroup`'s captured `summary` field
  * silently dropped the ACTUAL final lines of a long-running worker's
@@ -756,6 +814,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["watchGroups: FAILED line printed on the transition to failed", testWatchGroupsPrintsFailedTransitionToStderr],
 	["isIterationExhaustion matches the exact max-iterations error", testIsIterationExhaustionMatchesExactError],
 	["isIterationExhaustion rejects budget/real failures and empty summaries", testIsIterationExhaustionRejectsOtherFailures],
+	["isProviderFailure matches provider 5xx/429/no-allowed-providers/network-error shapes", testIsProviderFailureMatchesKnownShapes],
+	["isProviderFailure rejects deterministic 4xx, budget stops, and iteration exhaustion", testIsProviderFailureRejectsOtherFailures],
 	["inspectGroup: captured summary preserves the true tail, not the head, of a long harness.log", testInspectGroupSummaryPreservesTrueTailNotHead],
 	["tailLog: scopes the summary to content after the latest run-start separator", testTailLogScopesToLatestRunAfterAppend],
 	["tailLog: appended harness.log preserves every prior session's output on disk", testTailLogPreservesFullHistoryOnDisk],

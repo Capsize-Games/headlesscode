@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict"
 
-import { buildRequestBody, OpenRouterClient, parseReasoningEffort } from "../openrouter.js"
+import { buildRequestBody, isRetryableOpenRouterError, OpenRouterClient, OpenRouterError, parseReasoningEffort } from "../openrouter.js"
 import type { LlmRequest } from "../../engine/types.js"
 
 const baseRequest: LlmRequest = {
@@ -558,7 +558,41 @@ function stubFetch(response: Response): () => void {
 	}
 }
 
+// ─── isRetryableOpenRouterError ──────────────────────────────────────────────
+// A hard-pinned model (deepseek/* with allow_fallbacks: false) has no
+// fallback provider to smooth over a blip, so the main call and the handoff
+// condensation call (src/engine/loop.ts) both retry ONCE on these shapes.
+
+async function testIsRetryableOpenRouterErrorMatchesTransientShapes(): Promise<void> {
+	assert.equal(
+		isRetryableOpenRouterError(new OpenRouterError("network error", undefined)),
+		true,
+		"no status at all (a transport failure) must be retryable",
+	)
+	assert.equal(isRetryableOpenRouterError(new OpenRouterError("rate limited", 429)), true, "429 must be retryable")
+	assert.equal(isRetryableOpenRouterError(new OpenRouterError("provider returned error", 520)), true, "5xx must be retryable")
+	assert.equal(isRetryableOpenRouterError(new OpenRouterError("bad gateway", 502)), true, "any 5xx must be retryable")
+	assert.equal(
+		isRetryableOpenRouterError(new OpenRouterError("No allowed providers are available for the selected model.", 404)),
+		true,
+		"the specific 'no allowed providers' 404 is an availability signal despite the 4xx status",
+	)
+}
+
+async function testIsRetryableOpenRouterErrorRejectsDeterministicFailures(): Promise<void> {
+	assert.equal(
+		isRetryableOpenRouterError(new OpenRouterError("invalid model id", 404)),
+		false,
+		"a normal 'model not found' 404 (no matching message) must NOT retry",
+	)
+	assert.equal(isRetryableOpenRouterError(new OpenRouterError("invalid api key", 401)), false, "401 must not retry")
+	assert.equal(isRetryableOpenRouterError(new OpenRouterError("malformed request", 400)), false, "400 must not retry")
+	assert.equal(isRetryableOpenRouterError(new Error("some unrelated error")), false, "a non-OpenRouterError must never be classified as retryable")
+}
+
 const tests: Array<[string, () => Promise<void>]> = [
+	["isRetryableOpenRouterError matches network/429/5xx/no-allowed-providers shapes", testIsRetryableOpenRouterErrorMatchesTransientShapes],
+	["isRetryableOpenRouterError rejects deterministic 4xx and non-OpenRouterError values", testIsRetryableOpenRouterErrorRejectsDeterministicFailures],
 	["deepseek/* models are pinned to the official DeepSeek provider", testDeepseekModelsArePinnedToOfficialProvider],
 	["the pin applies to any deepseek/* model, not just one id", testDeepseekReasonerAlsoPinned],
 	["non-deepseek models are never pinned to the deepseek provider", testNonDeepseekModelsAreNotPinned],

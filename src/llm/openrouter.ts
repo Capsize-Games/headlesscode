@@ -14,7 +14,7 @@
  *     identifying the app and enabling higher rate limits.
  *
  * Chat model resolution order (per request): `request.model` → constructor
- * `defaultModel` → `OPENROUTER_MODEL` env var → `deepseek/deepseek-v4-flash`.
+ * `defaultModel` → `OPENROUTER_MODEL` env var → `deepseek/deepseek-v4-flash-0731`.
  */
 
 import type {
@@ -28,7 +28,7 @@ import type {
 import { parseEndpointPricing, type EndpointPricingEntry, type ModelPrice } from "../budget/cost.js"
 
 export const OPENROUTER_BASE_URL = "https://openrouter.ai"
-export const DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
+export const DEFAULT_MODEL = "deepseek/deepseek-v4-flash-0731"
 
 export interface OpenRouterClientOptions {
 	apiKey?: string
@@ -49,6 +49,40 @@ export class OpenRouterError extends Error {
 		this.status = status
 		this.body = body
 	}
+}
+
+/**
+ * Whether a `createChatCompletion` failure is worth ONE retry rather than
+ * failing the caller outright. Observed live (issue: harness provider-error
+ * resilience, 2026-08-08): a hard-pinned model (`allow_fallbacks: false`,
+ * see buildRequestBody's deepseek/* pin) has NO fallback to smooth over a
+ * blip on that one provider, so a transient hiccup that a normal
+ * multi-provider request would silently route around instead kills the
+ * request outright. Two shapes seen in one session:
+ *   - HTTP 404 "No allowed providers are available for the selected model"
+ *     — despite the 4xx status this is an AVAILABILITY signal (the pinned
+ *     provider is temporarily down), not a real "this model/slug doesn't
+ *     exist" error, which is the normal meaning of 404 elsewhere in this
+ *     client (see fetchModelContextWindow's comment) — so it's retryable
+ *     here specifically, by message content, not by status code alone.
+ *   - HTTP 520 "Provider returned error" — an opaque upstream failure,
+ *     retryable like any 5xx.
+ * Also retryable: 429 (rate limit) and network-transport failures (thrown
+ * with no `.status` — see the network-error catch below). NOT retryable:
+ * any other 4xx (auth failure, malformed request, unknown model) — those
+ * are deterministic and retrying would just fail the same way again.
+ */
+export function isRetryableOpenRouterError(error: unknown): boolean {
+	if (!(error instanceof OpenRouterError)) {
+		return false
+	}
+	if (error.status === undefined) {
+		return true // network/transport failure — see the catch in createChatCompletion
+	}
+	if (error.status === 429 || error.status >= 500) {
+		return true
+	}
+	return error.status === 404 && /no allowed providers/i.test(error.message)
 }
 
 /**

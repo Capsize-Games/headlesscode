@@ -41,7 +41,10 @@ import {
 import { runReviewWithRetries, type ReviewResult } from "./reviewer.js"
 import { analyzeWorktreeSessions } from "./log-analysis.js"
 import { runQaWithRetries, type QaResult } from "../qa/qa.js"
-import { groupWorktreePath, isIterationExhaustion, isPidAlive, watchGroups } from "./watch.js"
+import { groupWorktreePath, isIterationExhaustion, isPidAlive, isProviderFailure, watchGroups } from "./watch.js"
+import { clearHandoffSummary, readHandoffSummary } from "../engine/handoff.js"
+import { autoSplitOversizedIssues, proposeSemanticSplit } from "./auto-split.js"
+import { DEFAULT_MODEL, OpenRouterClient } from "../llm/openrouter.js"
 import {
 	buildStatusSummary,
 	formatStatusText,
@@ -150,6 +153,18 @@ Options:
                  shape that burned iteration caps + budget on real rounds
                  (headlesscode #17, airunnerweb #80/#85). ON by default; the
                  warning never aborts the round, so this only silences it
+  --no-auto-split        Skip auto-split: when an issue is flagged by the size
+                         check above, an LLM proposes the smallest number of
+                         independently-shippable sub-issues (grouped by
+                         deliverable, NOT one per bullet — sequential steps of
+                         one fix stay together), files them as real GitHub
+                         issues, and closes the oversized parent with a link
+                         to each. Fails open (LLM/filing error, or the model
+                         deciding the issue is genuinely one coherent piece of
+                         work) by dispatching the original issue unchanged.
+                         ON by default when a GitHub origin remote is present
+                         and issueSizeCheck is on; this flag falls back to
+                         warn-only
   --dry-run              Print the split plan, a cost estimate (from recorded
                          cost-history, keyed by issue shape — issue #16), and
                          the spawn commands; spawn nothing
@@ -234,6 +249,17 @@ interface OrchestrateOptions {
 	 * --no-issue-size-check silences it.
 	 */
 	issueSizeCheck: boolean
+	/**
+	 * Auto-split (issue #53 follow-up): when the size check flags an issue,
+	 * propose a SEMANTIC split (LLM-decided independent deliverables, not a
+	 * mechanical one-sub-issue-per-bullet explosion — see auto-split.ts) and
+	 * file the result as real GitHub issues, closing the oversized parent.
+	 * ON by default when a GitHub 'origin' remote is available; --no-auto-split
+	 * falls back to warn-only. Requires issueSizeCheck (nothing to act on
+	 * otherwise) and a real (non---issues-json) round (there is no GitHub
+	 * issue to close for a synthetic entry).
+	 */
+	autoSplit: boolean
 	dryRun: boolean
 	help: boolean
 }
@@ -289,6 +315,7 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 		planFirstMaxIterations: planFirstMaxIterationsFromEnv(),
 		preflight: true,
 		issueSizeCheck: true,
+		autoSplit: true,
 		dryRun: false,
 		help: false,
 	}
@@ -478,6 +505,9 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 			case "--no-issue-size-check":
 				options.issueSizeCheck = false
 				break
+			case "--no-auto-split":
+				options.autoSplit = false
+				break
 			case "--dry-run":
 				options.dryRun = true
 				break
@@ -558,6 +588,21 @@ function createGhIssue(repo: string, ownerRepo: string, issue: SplitIssue): { nu
 		throw new Error(`gh issue create returned an unrecognized response: ${out.trim()}`)
 	}
 	return { number: Number(numberMatch[1]), url }
+}
+
+/**
+ * Close a real GitHub issue with a comment (auto-split's parent-issue
+ * closeout) — mirrors createGhIssue's execFileSync idiom. `gh issue close
+ * --comment` posts the comment atomically with the close, so there's no
+ * window where the issue is closed without the sub-issue links, or vice
+ * versa.
+ */
+function closeGhIssue(repo: string, ownerRepo: string, issueNumber: number, comment: string): void {
+	execFileSync("gh", ["issue", "close", String(issueNumber), "--repo", ownerRepo, "--comment", comment], {
+		cwd: repo,
+		encoding: "utf-8",
+		timeout: 30_000,
+	})
 }
 
 /**
@@ -1043,6 +1088,13 @@ export function buildContinuationTaskFileContent(
 	 * OrchestratorGroup.issueBodies). Absent for state written before the
 	 * bodies feature — falls back to the old `gh issue view <n>` instruction. */
 	issueBodies?: IssueBodies,
+	/** The previous session's own condensed summary of its history (see
+	 * src/engine/handoff.ts) — file reads, command outputs, decisions made —
+	 * so this cycle doesn't have to re-derive them from scratch. Absent when
+	 * the previous session's handoff write failed/didn't run (older state,
+	 * or a very short session); the git-status-inspection instruction below
+	 * is the fallback either way, not a redundant step. */
+	handoffSummary?: string,
 ): string {
 	const assigned = (group.issues ?? []).map((n) => `#${n}`).join(", ") || "this worktree"
 	const issueBlocks = issueBodyBlocks(group.issues ?? [], (n) => group.issueBodies?.[String(n)] ?? issueBodies?.[String(n)])
@@ -1050,10 +1102,11 @@ export function buildContinuationTaskFileContent(
 		...RULES_SPLICED_NOTE,
 		"",
 		"You are working autonomously in the SAME isolated git worktree as the previous session(s), on",
-		"the same branch. The previous session was cut short because it hit the harness's iteration cap",
-		"(a bounded-failure guard, not a review verdict) — its partial work is still on disk: uncommitted",
-		"edits, commits, notes — pick up exactly where it left off. Read this entire file",
-		"before doing anything.",
+		"the same branch. The previous session was cut short — either it hit the harness's iteration cap, or",
+		"it hit a transient LLM-provider failure (a hard-pinned model with no fallback provider had a bad",
+		"moment; not a fault in your task or the code). Neither is a review verdict — its partial work is",
+		"still on disk: uncommitted edits, commits, notes — pick up exactly where it left off. Read this",
+		"entire file before doing anything.",
 		"",
 		`## Continuation cycle ${continuationCount} — complete the task`,
 		"",
@@ -1063,10 +1116,30 @@ export function buildContinuationTaskFileContent(
 			? issueBlocks
 			: ["(no issue numbers recorded — inspect the worktree for context)"]),
 		"",
+		"## What the previous session already learned — do not re-derive this",
+		"",
+		...(handoffSummary
+			? [
+					"The previous session summarized its own history before it ran out of iterations. Trust it and",
+					"build on it — re-reading files or re-running commands it already covered wastes iterations you",
+					"need for finishing the actual task. It CAN be wrong (compression loses detail, and the session's",
+					"own notes may be incomplete) — if something below conflicts with what you observe on disk, what",
+					"you observe wins, but don't re-verify things it reports with confidence just to be safe.",
+					"",
+					"```",
+					handoffSummary.trim(),
+					"```",
+				]
+			: [
+					"(No handoff summary available for this cycle — the previous session's write either failed or",
+					"never ran. Fall back to inspecting the worktree yourself, below.)",
+				]),
+		"",
 		"## What the previous session did",
 		"",
 		"- Inspect the worktree's git status, recent commits, and uncommitted changes to see exactly",
-		"  how far the previous session got.",
+		"  how far the previous session got — this is a real-state CHECK, not your primary source of",
+		"  context; the summary above should already tell you most of this.",
 		"- Do NOT restart from scratch: continue the existing work toward the issues above.",
 		"- If the previous session left a partial fix, finish it and verify it for real.",
 		"",
@@ -1394,9 +1467,20 @@ export interface ContinuationDecision {
 	* the caller needs (state patch, task file, spawn command). Extracted from the
 	* watchGroups callback so every branch is unit-testable without a live round.
 	*
-	* - The failure is NOT the iteration-cap reason (budget stop, tool-error
-	*   storm, crash — or a clean exit with the string merely in the log tail):
-	*   no continuation; the patch is empty and the watcher's "failed" stands.
+	* - The failure is NEITHER the iteration-cap reason NOR a transient
+	*   LLM-provider failure (budget stop, tool-error storm, a real code/task
+	*   bug — or a clean exit with either string merely in the log tail): no
+	*   continuation; the patch is empty and the watcher's "failed" stands.
+	*   Provider failures earned the same auto-continue treatment as the
+	*   iteration cap after a live incident (2026-08-08): a hard-pinned model
+	*   with no fallback provider hit an HTTP 520 mid-session, the session
+	*   died outright (this predates src/engine/loop.ts's callMainLlm retry —
+	*   even with that retry, a longer outage still exhausts it), and the
+	*   group sat in the generic terminal "failed" state — indistinguishable
+	*   from a real bug — until a human happened to read harness.log. Bounded
+	*   the same way as the iteration cap (maxContinuations), so a genuinely
+	*   dead provider still surfaces to a human eventually, it just gets a
+	*   few free retries first instead of zero.
 	* - Below the cap: the group is reset to "running" on the SAME worktree with a
 	*   fresh `spawned` timestamp (so the stall guard measures the continuation
 	*   worker, not the attempt that hit the cap), continuationCount is
@@ -1414,7 +1498,7 @@ export function handleIterationExhaustion(
 	maxIterations?: number,
 ): ContinuationDecision {
 	const current = typeof group.continuationCount === "number" ? group.continuationCount : 0
-	if (group.exit_code === 0 || !isIterationExhaustion(group.summary)) {
+	if (group.exit_code === 0 || !(isIterationExhaustion(group.summary) || isProviderFailure(group.summary))) {
 		// Real failure — budget stops and every other exit reason stay
 		// terminal. No patch: the watcher's "failed" stands.
 		return { shouldSpawn: false, newContinuationCount: current, patch: {} }
@@ -1424,8 +1508,16 @@ export function handleIterationExhaustion(
 
 	if (current < maxContinuations) {
 		const taskFilePath = path.join(repo, "plans", "parallel-tasks", `${group.name}-continue${newContinuationCount}.md`)
-		const taskContent = buildContinuationTaskFileContent(group, newContinuationCount, group.issueBodies)
 		const worktreePath = groupWorktreePath(repo, group)
+		// The session that just hit the cap wrote its own condensed history
+		// here (src/engine/handoff.ts) right before exiting — inline it into
+		// the continuation task file so the new conversation doesn't have to
+		// re-derive everything from scratch, then clear it: it's about to be
+		// baked into the task file text, and a stale copy must never leak
+		// into a LATER, unrelated continuation on this same worktree.
+		const handoffSummary = readHandoffSummary(worktreePath)
+		clearHandoffSummary(worktreePath)
+		const taskContent = buildContinuationTaskFileContent(group, newContinuationCount, group.issueBodies, handoffSummary)
 		const spawnCommand =
 			`bash ${path.join(HARNESS_ROOT_TS, "scripts", "run-worker.sh")} ` +
 			`"${worktreePath}" "${taskFilePath}" --mode "${mode}"` +
@@ -1619,7 +1711,7 @@ function printPlan(
 	process.stdout.write(
 		maxIterations !== undefined
 			? `  max iterations: ${maxIterations} (workers get --max-iterations ${maxIterations})\n`
-			: "  max iterations: <harness default 50>\n",
+			: "  max iterations: <harness default 250>\n",
 	)
 	if (models) {
 		process.stdout.write(`  models:   worker: ${models.worker}\n`)
@@ -2303,6 +2395,53 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		}
 	}
 
+	// Issue #53 pre-flight issue-size check + auto-split: a FREE deterministic
+	// scan (split.ts's topLevelSectionCount) flags issues whose body reads
+	// like 3+ independent pieces of work. Runs BEFORE splitIssues() below —
+	// unlike the original warn-only version, this can REPLACE a flagged issue
+	// with real sub-issues, and splitIssues must see the replacement, not the
+	// oversized original. Auto-split needs a real (non-synthetic) issue to
+	// close and a GitHub remote to file into; --issues-json entries and
+	// remote-less repos fall back to warn-only (auto-split has nothing to
+	// close/file against). --dry-run ALSO falls back to warn-only: filing
+	// real issues and closing the parent are exactly the kind of visible,
+	// hard-to-reverse side effects a dry run promises never to do.
+	if (options.issueSizeCheck) {
+		const warnings = issueSizeWarnings(issues)
+		const ownerRepo = options.autoSplit && !options.issuesJson && !options.dryRun ? originOwnerRepo(repo) : undefined
+		if (warnings.length > 0 && ownerRepo) {
+			const model = options.model ?? DEFAULT_MODEL
+			const llmClient = new OpenRouterClient({ apiKey: process.env.HEADLESSCODE_OPENROUTER_API_KEY })
+			const { issues: split, outcomes } = await autoSplitOversizedIssues(issues, warnings, {
+				proposeSplit: (issue) => proposeSemanticSplit(issue, llmClient, model),
+				createIssue: (issue) => createGhIssue(repo, ownerRepo, issue),
+				closeParent: (n, comment) => closeGhIssue(repo, ownerRepo, n, comment),
+			})
+			issues = split
+			for (const o of outcomes) {
+				if (o.outcome === "split") {
+					process.stdout.write(
+						`[orchestrate] auto-split #${o.number} ("${o.title}") into ${o.created?.length} sub-issue(s): ` +
+							(o.created ?? []).map((c) => `#${c.number} (${c.url})`).join(", ") +
+							` — parent closed\n`,
+					)
+				} else if (o.outcome === "kept-as-is") {
+					process.stdout.write(
+						`[orchestrate] #${o.number} ("${o.title}") flagged by the size heuristic, but the model determined ` +
+							`it's one coherent piece of work — dispatching as-is\n`,
+					)
+				} else {
+					process.stderr.write(
+						`headlesscode orchestrate: WARNING: auto-split failed for #${o.number} ("${o.title}"): ${o.reason} — ` +
+							`dispatching the original issue as-is. --no-auto-split silences future attempts.\n`,
+					)
+				}
+			}
+		} else if (warnings.length > 0) {
+			printIssueSizeWarnings(warnings)
+		}
+	}
+
 	// Naming collision avoidance: a still-running round in the same repo
 	// already occupies some `.worktrees/wN` dirs. Scan them and let
 	// splitIssues name this round's groups around the gap instead of always
@@ -2365,15 +2504,6 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		return 1
 	}
 
-	// Issue #53 pre-flight issue-size check: warn loudly (never abort) when an
-	// issue's body reads like 3+ independent pieces of work, BEFORE task files
-	// are written or anything is spawned. Pure deterministic heuristic
-	// (split.ts topLevelSectionCount) — no LLM cost. Prints for BOTH --dry-run
-	// (so the preview shows it before any commit to spawn) and real runs.
-	if (options.issueSizeCheck) {
-		printIssueSizeWarnings(issueSizeWarnings(issues))
-	}
-
 	if (options.dryRun) {
 		// Per-mode model assignment: resolve each role's model exactly like a
 		// real round so the dry-run preview shows the effective model per role
@@ -2381,7 +2511,7 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		// always wins). undefined -> the OpenRouter client's built-in default.
 		const previewModel = (mode: string): string =>
 			resolveModelForMode({ workspaceRoot: repo, mode, explicitModel: options.model, env: process.env }) ??
-			"deepseek/deepseek-v4-flash (client default)"
+			"deepseek/deepseek-v4-flash-0731 (client default)"
 		// Issue #16: estimate the round's expected cost/iterations from
 		// recorded cost history, keyed by issue shape. Advisory only — a
 		// history read failure must never fail the dry-run, just omit the

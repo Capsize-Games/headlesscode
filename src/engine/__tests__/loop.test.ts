@@ -14,7 +14,8 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 
-import { HeadlessSession, truncateHistory, TRUNCATION_BATCH_SIZE } from "../loop.js"
+import { HeadlessSession, isReadOnlyEquivalentShellCommand, truncateHistory, TRUNCATION_BATCH_SIZE } from "../loop.js"
+import { OpenRouterError } from "../../llm/openrouter.js"
 import { createHeadlessExecutor } from "../../tools/executor.js"
 import { createCheckpointService } from "../../checkpoints/service.js"
 import { parseToolCall } from "../parser.js"
@@ -435,6 +436,161 @@ async function testMaxIterationsBound(): Promise<void> {
 	}
 }
 
+// ─── Main-loop retry on a transient provider error ───────────────────────────
+// A hard-pinned model (deepseek/*, allow_fallbacks: false) has no fallback
+// provider to smooth over a blip, so callMainLlm retries ONCE on a
+// classified-transient error (isRetryableOpenRouterError) before giving up —
+// see the doc comment on callMainLlm in loop.ts. Observed live: an HTTP 520
+// mid-session used to kill the entire session outright with iteration
+// budget otherwise untouched.
+
+async function testMainLlmCallRetriesOnceOnTransientProviderError(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-main-retry-"))
+	try {
+		let calls = 0
+		const client = new FakeLlmClient([
+			() => {
+				calls++
+				throw new OpenRouterError("Provider returned error", 520)
+			},
+			() => {
+				calls++
+				return toolCall("attempt_completion", { result: "done after retry" })
+			},
+		])
+		const session = await makeSession({ task: "retry me", client, workspaceRoot: ws })
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success after the retry, got ${JSON.stringify(result)}`)
+		assert.equal(calls, 2, "expected exactly one retry (2 total calls) for a single transient failure")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testMainLlmCallFailsAfterRetryAlsoFails(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-main-retry-fail-"))
+	try {
+		let calls = 0
+		const client = new FakeLlmClient([
+			() => {
+				calls++
+				throw new OpenRouterError("Provider returned error", 520)
+			},
+			() => {
+				calls++
+				throw new OpenRouterError("Provider returned error", 520)
+			},
+		])
+		const session = await makeSession({ task: "retry me twice", client, workspaceRoot: ws })
+		const result = await session.run()
+		assert.equal(result.status, "error", "a second consecutive failure must still fail the session (only one retry)")
+		assert.equal(calls, 2, "exactly two attempts — no unbounded retry loop")
+		assert.equal(result.iterations, 1, "the session never advanced past iteration 1")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testMainLlmCallDoesNotRetryDeterministicError(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-main-no-retry-"))
+	try {
+		let calls = 0
+		const client = new FakeLlmClient([
+			() => {
+				calls++
+				throw new OpenRouterError("Invalid API key", 401)
+			},
+			() => {
+				calls++
+				return toolCall("attempt_completion", { result: "should never be reached" })
+			},
+		])
+		const session = await makeSession({ task: "auth failure", client, workspaceRoot: ws })
+		const result = await session.run()
+		assert.equal(result.status, "error", "a deterministic 401 must fail immediately")
+		assert.equal(calls, 1, "no retry attempted for a non-retryable error")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testIterationCapHandoffSummary(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-handoff-"))
+	try {
+		// 4 tool-call iterations to exhaust maxIterations, then ONE more script
+		// step: the loop's own condensation call for the handoff write (see
+		// writeIterationCapHandoff in loop.ts), which must get a real text
+		// answer back (condenseOldestTurns rejects an empty/tool-call reply).
+		const client = new FakeLlmClient([
+			...Array.from({ length: 4 }, (_, i) => () => toolCall("execute_command", { command: `node -e 'console.log(${i})'` })),
+			() => ({ role: "assistant", content: "Read useConversations.ts; the fix belongs in refresh()." }),
+		])
+		const session = await makeSession({ task: "loop forever", client, workspaceRoot: ws, maxIterations: 4 })
+		const result = await session.run()
+		assert.equal(result.status, "error", `expected max-iterations failure, got ${JSON.stringify(result)}`)
+
+		const handoffPath = path.join(ws, ".headlesscode", "handoff-summary.md")
+		const content = await fs.readFile(handoffPath, "utf-8")
+		assert.match(content, /Handoff summary/)
+		assert.match(content, /Read useConversations\.ts; the fix belongs in refresh\(\)\./)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testIterationCapHandoffSummaryNonFatalWhenCondenseCallFails(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-handoff-short-"))
+	try {
+		// maxIterations: 1, and the script has exactly ONE step (consumed by
+		// that one iteration) — none left for the handoff write's own
+		// condensation call, which now retries ONCE (a live round hit DeepSeek's
+		// pinned endpoint erroring transiently on this exact call — see
+		// writeIterationCapHandoff), so BOTH the first attempt and the retry
+		// throw "script exhausted". That failure must still be swallowed
+		// (non-fatal): the session's own max-iterations result is unaffected
+		// and no handoff file is written.
+		const client = new FakeLlmClient([() => toolCall("execute_command", { command: "true" })])
+		const session = await makeSession({ task: "short", client, workspaceRoot: ws, maxIterations: 1 })
+		const result = await session.run()
+		assert.equal(result.status, "error")
+		assert.match(result.error ?? "", /Max iterations/)
+
+		await assert.rejects(fs.access(path.join(ws, ".headlesscode", "handoff-summary.md")))
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testIterationCapHandoffSummaryRetriesOnceAfterCondenseFailure(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-handoff-retry-"))
+	try {
+		// First condensation attempt throws (simulating the live DeepSeek
+		// "no allowed providers" blip); the retry succeeds and the handoff
+		// summary is written from the retry's response.
+		let condenseAttempts = 0
+		const client = new FakeLlmClient([
+			...Array.from({ length: 4 }, (_, i) => () => toolCall("execute_command", { command: `node -e 'console.log(${i})'` })),
+			() => {
+				condenseAttempts++
+				throw new Error("simulated transient provider error")
+			},
+			() => {
+				condenseAttempts++
+				return { role: "assistant" as const, content: "Retry succeeded: root cause is in refresh()." }
+			},
+		])
+		const session = await makeSession({ task: "loop forever", client, workspaceRoot: ws, maxIterations: 4 })
+		const result = await session.run()
+		assert.equal(result.status, "error")
+		assert.equal(condenseAttempts, 2, "expected exactly one retry after the first condensation failure")
+
+		const content = await fs.readFile(path.join(ws, ".headlesscode", "handoff-summary.md"), "utf-8")
+		assert.match(content, /Retry succeeded: root cause is in refresh\(\)\./)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Blind tree-walking guardrail (P1.6) ─────────────────────────────────────
 
 const NUDGE_FRAGMENT = "You've made several read/exploration calls"
@@ -524,6 +680,104 @@ async function testReadOnlyNudgeNotInjectedWhenUnindexed(): Promise<void> {
 		assert.deepEqual(requestsContainingNudge(client.requests), [], "no nudge when the workspace has no codebase-search index")
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testReadOnlyNudgeTriggeredByGrepStyleExecuteCommand(): Promise<void> {
+	const ws = await makeIndexedWorkspace("headlesscode-nudge-grep-", 1)
+	try {
+		// A live round (issue: harness slowness investigation) measured
+		// execute_command grep/ls/sed one-liners as the DOMINANT exploration
+		// pattern, far more than read_file/list_files — this guardrail must
+		// count that pattern too, not just the literal read_file/list_files
+		// tool names (see isReadOnlyEquivalentShellCommand).
+		const client = new FakeLlmClient([
+			() => toolCall("execute_command", { command: "grep -rn content . | head -20" }),
+			() => toolCall("execute_command", { command: "ls ." }),
+			() => toolCall("execute_command", { command: "cat f1.txt" }),
+			() => toolCall("execute_command", { command: "sed -n '1,1p' f1.txt" }),
+			() => toolCall("execute_command", { command: "git log --oneline -5 || true" }),
+			() => toolCall("execute_command", { command: "git status --short || true" }),
+			() => toolCall("execute_command", { command: "echo simulated-docker-compose-ps" }),
+			() => toolCall("execute_command", { command: "find . -name '*.txt' | head" }),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({ task: "explore", client, workspaceRoot: ws })
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.deepEqual(
+			requestsContainingNudge(client.requests),
+			[8],
+			"8 consecutive read-only-equivalent execute_command calls should trip the nudge, same as read_file",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testReadOnlyNudgeNotTrippedByMutatingExecuteCommand(): Promise<void> {
+	const ws = await makeIndexedWorkspace("headlesscode-nudge-mutating-", 1)
+	try {
+		// Same 8-call length as the triggering case above, but one call is a
+		// real mutation (docker compose UP, not ps) — the whole streak must
+		// never count, exactly like a write_to_file resets it.
+		const client = new FakeLlmClient([
+			() => toolCall("execute_command", { command: "grep -rn content . | head -20" }),
+			() => toolCall("execute_command", { command: "ls ." }),
+			() => toolCall("execute_command", { command: "echo hi > mutated.txt" }), // mutating: writes a file
+			() => toolCall("execute_command", { command: "sed -n '1,1p' f1.txt" }),
+			() => toolCall("execute_command", { command: "git log --oneline -5 || true" }),
+			() => toolCall("execute_command", { command: "git status --short || true" }),
+			() => toolCall("execute_command", { command: "find . -name '*.txt' | head" }),
+			() => toolCall("execute_command", { command: "cat f1.txt" }),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({ task: "explore", client, workspaceRoot: ws })
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.deepEqual(requestsContainingNudge(client.requests), [], "one mutating command in the streak must suppress the nudge")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// ─── isReadOnlyEquivalentShellCommand (unit-level) ───────────────────────────
+
+async function testIsReadOnlyEquivalentShellCommandClassifiesCorrectly(): Promise<void> {
+	const readOnly = [
+		"grep -rn foo src",
+		"ls -la src",
+		"cat file.txt",
+		"sed -n '1,10p' file.txt",
+		"git log --oneline -5",
+		"git diff HEAD~1",
+		"git status --short",
+		"docker compose ps",
+		"docker ps -a",
+		"find . -name '*.ts' | head -20",
+		"cd src && grep -rn foo . && cat bar.ts",
+		"grep -rn foo src 2>&1 | head",
+		"git log --oneline -5 || true", // a bare `||` must not split into a stray non-allow-listed "true" segment
+	]
+	const mutating = [
+		"sed -i 's/foo/bar/' file.txt",
+		"git commit -m x",
+		"git checkout -b new-branch",
+		"docker compose up -d",
+		"docker run --rm image",
+		"rm -rf node_modules",
+		"echo hi > out.txt",
+		"grep foo src && rm bar.txt", // one mutating segment taints the whole compound command
+		"npm install",
+		"echo hi >> out.txt",
+	]
+	for (const cmd of readOnly) {
+		assert.equal(isReadOnlyEquivalentShellCommand(cmd), true, `expected read-only: ${cmd}`)
+	}
+	for (const cmd of mutating) {
+		assert.equal(isReadOnlyEquivalentShellCommand(cmd), false, `expected NOT read-only: ${cmd}`)
 	}
 }
 
@@ -1151,9 +1405,18 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["scenario 4: malformed JSON args -> parser fallback exercised", testScenario4MalformedJsonArgs],
 	["path-traversal guard rejects escaping paths", testPathTraversalGuard],
 	["max iterations -> bounded failure", testMaxIterationsBound],
+	["main LLM call retries once on a transient provider error then succeeds", testMainLlmCallRetriesOnceOnTransientProviderError],
+	["main LLM call fails after the retry also fails (no unbounded retry loop)", testMainLlmCallFailsAfterRetryAlsoFails],
+	["main LLM call does not retry a deterministic 401", testMainLlmCallDoesNotRetryDeterministicError],
+	["max iterations -> handoff summary written for the next continuation", testIterationCapHandoffSummary],
+	["max iterations -> handoff write is non-fatal when its own condense call fails", testIterationCapHandoffSummaryNonFatalWhenCondenseCallFails],
+	["max iterations -> handoff write retries once after a transient condense failure", testIterationCapHandoffSummaryRetriesOnceAfterCondenseFailure],
 	["blind tree-walking: nudge after N consecutive read-only iterations (indexed ws)", testReadOnlyNudgeTriggered],
 	["blind tree-walking: a productive tool call resets the streak", testReadOnlyNudgeResetsOnProductiveCall],
 	["blind tree-walking: no nudge when the workspace is unindexed", testReadOnlyNudgeNotInjectedWhenUnindexed],
+	["blind tree-walking: grep/ls/sed/git/docker-ps execute_command streak trips the nudge same as read_file", testReadOnlyNudgeTriggeredByGrepStyleExecuteCommand],
+	["blind tree-walking: one mutating execute_command in the streak suppresses the nudge", testReadOnlyNudgeNotTrippedByMutatingExecuteCommand],
+	["isReadOnlyEquivalentShellCommand: classifies read-only vs. mutating shell commands", testIsReadOnlyEquivalentShellCommandClassifiesCorrectly],
 	["live snapshot: created + updated in place during a running session's iterations", testLiveSnapshotCreatedAndUpdatedDuringIterations],
 	["live snapshot: removed on successful completion", testLiveSnapshotRemovedOnSuccess],
 	["live snapshot: removed when the session ends with an error", testLiveSnapshotRemovedOnError],
