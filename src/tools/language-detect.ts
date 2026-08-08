@@ -2,23 +2,27 @@
  * Cheap workspace-language detection used to CONDITIONALLY register tools that
  * only work for specific languages (Part D of the central-store round):
  *
- * - The `ts.Program`-based code-intelligence tools (outline, go_to_definition,
- *   find_references, import_graph, rename_symbol — src/codeintel/) only scan
- *   TS/JS files, and
- * - `run_tests`'s direct-match discovery + `tsx` invocation are TS-specific.
+ * - The code-intelligence tools (outline, go_to_definition, find_references,
+ *   import_graph, rename_symbol — src/codeintel/) are registered per language
+ *   (issue #59): the executor asks this detector which languages the
+ *   workspace has, then wires a backend for each language that has one
+ *   available (TypeScript/JavaScript via ts.Program, Python via the bundled
+ *   pyright language server).
+ * - `run_tests`'s direct-match discovery + `tsx` invocation are TS-specific
+ *   and remain gated on TS/JS workspaces only.
  *
- * On a real target project like a C++ or Python repo these tools are dead
- * weight — advertised on every request, costing prompt tokens, silently
- * useless if tried. `codebase_search` already handles many languages (its
- * chunker has a broad extension list), so the bar is: gate the TS-only tools
- * to TS/JS workspaces the same way `codebase_search` is language-generic.
+ * On a real target project like a C++ or Rust repo with no wired language
+ * server, the code-intelligence tools are dead weight — advertised on every
+ * request, costing prompt tokens, silently useless if tried — so they are
+ * simply not registered there (the same "match the tool list to what actually
+ * works" discipline `codebase_search` already models with its broad extension
+ * list).
  *
  * The detector is deliberately crude — marker files at the root plus a
  * BOUNDED extension-frequency walk (see MAX_SCAN_FILES) — accurate enough to
  * gate on, and cheap enough to run synchronously at every executor creation.
- * It is NOT a language taxonomy: it only needs to answer "is this workspace
- * TS/JS (so the TS-only tools make sense)?" and, secondarily, what other
- * languages are present for future generic-tool gating.
+ * It is NOT a language taxonomy: it only needs to answer "which languages are
+ * present (so the per-language code-intel backends make sense)?".
  */
 
 import * as fs from "node:fs"
