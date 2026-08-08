@@ -109,24 +109,31 @@ async function testNodeModulesSkipped(): Promise<void> {
 }
 
 async function testExecutorGatesTsToolsByWorkspaceLanguage(): Promise<void> {
-	// Python workspace: the TS-only tools must NOT be registered (and would
-	// not be advertised — loop.ts gates advertisement on executor.has).
+	// Python workspace (issue #59): the pyright-backed code-intelligence tools
+	// ARE now registered — this is the whole point of the multi-language
+	// backend. import_graph is NOT (no TypeScript backend to implement it) and
+	// run_tests is NOT (it runs tsx + walks the ts.Program import graph — an
+	// inherently TS-only tool). Advertisement follows executor.has in loop.ts.
 	const py = await mkTmp("hc-lang-exec-py-")
 	try {
 		await fs.writeFile(path.join(py, "pyproject.toml"), "[project]\n")
 		await fs.writeFile(path.join(py, "mod.py"), "def f():\n    return 1\n")
 		const execPy = createHeadlessExecutor(py)
-		for (const name of ["outline", "go_to_definition", "find_references", "import_graph", "rename_symbol", "run_tests"]) {
-			assert.equal(execPy.has(name), false, `${name} must not be registered on a Python workspace`)
+		for (const name of ["outline", "go_to_definition", "find_references", "rename_symbol"]) {
+			assert.equal(execPy.has(name), true, `${name} must be registered on a Python workspace (pyright backend)`)
+		}
+		for (const name of ["import_graph", "run_tests"]) {
+			assert.equal(execPy.has(name), false, `${name} must not be registered on a Python-only workspace`)
 		}
 		const readPy = createReadOnlyHeadlessExecutor(py)
-		assert.equal(readPy.has("outline"), false, "read-only executor also omits TS-only tools on Python")
+		assert.equal(readPy.has("outline"), true, "read-only executor keeps the pyright-backed tools on Python")
+		assert.equal(readPy.has("rename_symbol"), false, "read-only executor still never registers the edit tool")
 		assert.ok(readPy.has("execute_command"), "language-generic tools stay registered")
 	} finally {
 		await fs.rm(py, { recursive: true, force: true })
 	}
 
-	// TS workspace: the same tools ARE registered.
+	// TS workspace: all six tools ARE registered.
 	const ts = await mkTmp("hc-lang-exec-ts-")
 	try {
 		await fs.writeFile(path.join(ts, "package.json"), '{ "name": "x" }\n')
@@ -141,6 +148,22 @@ async function testExecutorGatesTsToolsByWorkspaceLanguage(): Promise<void> {
 		assert.equal(readTs.has("rename_symbol"), false, "read-only executor still never registers the edit tool")
 	} finally {
 		await fs.rm(ts, { recursive: true, force: true })
+	}
+
+	// A workspace whose detected language has NO configured backend (Rust):
+	// none of the six tools register — same as the old TS-only behavior for
+	// non-TS workspaces, no crash, no confusing partial registration.
+	const rust = await mkTmp("hc-lang-exec-rust-")
+	try {
+		await fs.writeFile(path.join(rust, "Cargo.toml"), "[package]\nname = \"x\"\nversion = \"0.1.0\"\n")
+		await fs.mkdir(path.join(rust, "src"))
+		await fs.writeFile(path.join(rust, "src", "main.rs"), "fn main() {}\n")
+		const execRust = createHeadlessExecutor(rust)
+		for (const name of ["outline", "go_to_definition", "find_references", "import_graph", "rename_symbol"]) {
+			assert.equal(execRust.has(name), false, `${name} must not be registered when no backend is configured`)
+		}
+	} finally {
+		await fs.rm(rust, { recursive: true, force: true })
 	}
 }
 

@@ -32,6 +32,7 @@
 
 import * as fs from "node:fs"
 import * as path from "node:path"
+import { setTimeout as sleep } from "node:timers/promises"
 
 import * as lsp from "vscode-languageserver-protocol"
 
@@ -50,6 +51,9 @@ export type LspBackendLogger = { warn: (message: string) => void }
 const PYTHON_IMPORT_GRAPH_GAP =
 	"import_graph is not supported for this language yet: LSP has no standard import-graph request. " +
 	"It works for TypeScript/JavaScript workspaces; for other languages use the import statements in the file."
+
+/** Retry delay when a freshly-spawned server answers rename with null. */
+const RENAME_RETRY_DELAY_MS = 300
 
 /**
  * A generic LSP server wrapped behind the language-neutral backend interface.
@@ -151,11 +155,24 @@ export class LspCodeIntelBackend implements CodeIntelBackend {
 			if (newName.trim() === "" || /\s/.test(newName)) {
 				throw new Error(`'${newName}' is not a valid identifier — use a plain name like 'renamedFoo'`)
 			}
-			const edit = (await client.sendRequest(lsp.RenameRequest.type, {
+			let edit = (await client.sendRequest(lsp.RenameRequest.type, {
 				textDocument: { uri },
 				position: lspPosition,
 				newName,
 			})) as lsp.WorkspaceEdit | null
+			if (edit === null || edit === undefined) {
+				// Freshly-spawned servers answer rename with null when their
+				// initial workspace analysis hasn't settled yet (observed live
+				// with pyright). Wait briefly and retry ONCE before giving up —
+				// a genuinely un-renameable symbol still returns null after
+				// the retry and falls through to the clear error below.
+				await sleep(RENAME_RETRY_DELAY_MS)
+				edit = (await client.sendRequest(lsp.RenameRequest.type, {
+					textDocument: { uri },
+					position: lspPosition,
+					newName,
+				})) as lsp.WorkspaceEdit | null
+			}
 			if (edit === null || edit === undefined) {
 				throw new Error(
 					`the language server for '${this.language}' returned no rename edits — the symbol may not be renameable or the new name may be invalid`,
@@ -282,17 +299,21 @@ export class LspCodeIntelBackend implements CodeIntelBackend {
 			return undefined
 		}
 
+		// Aim one character INTO the identifier rather than at its first
+		// character: pyright (and some other servers) have been observed to
+		// miss references when the position sits exactly on the identifier's
+		// leading edge, while any position inside it resolves correctly.
 		if (position.character !== undefined && position.character >= 1) {
 			const char0 = position.character - 1
 			const token = tokenAt(lineText, char0)
 			if (token !== undefined) {
-				return { line: line0, character: token.start }
+				return { line: line0, character: token.start + (token.length > 1 ? 1 : 0) }
 			}
 		}
 		if (position.symbol !== undefined && position.symbol.trim() !== "") {
-			const idx = indexOfWord(lineText, position.symbol)
-			if (idx !== -1) {
-				return { line: line0, character: idx }
+			const match = indexOfWord(lineText, position.symbol)
+			if (match !== undefined) {
+				return { line: line0, character: match.index + (match.length > 1 ? 1 : 0) }
 			}
 			return undefined
 		}
@@ -300,7 +321,7 @@ export class LspCodeIntelBackend implements CodeIntelBackend {
 		if (first === undefined) {
 			return undefined
 		}
-		return { line: line0, character: first.start }
+		return { line: line0, character: first.start + (first.length > 1 ? 1 : 0) }
 	}
 }
 
@@ -635,7 +656,7 @@ function textAtRange(text: string, range: lsp.Range): string {
 const IDENTIFIER_CHAR = /[A-Za-z0-9_]/
 
 /** The identifier token touching a 0-based column, or undefined (whitespace). */
-function tokenAt(line: string, char0: number): { start: number } | undefined {
+function tokenAt(line: string, char0: number): { start: number; length: number } | undefined {
 	if (char0 < 0 || char0 >= line.length || !IDENTIFIER_CHAR.test(line[char0]!)) {
 		return undefined
 	}
@@ -643,20 +664,24 @@ function tokenAt(line: string, char0: number): { start: number } | undefined {
 	while (start > 0 && IDENTIFIER_CHAR.test(line[start - 1]!)) {
 		start--
 	}
-	return { start }
+	let end = char0 + 1
+	while (end < line.length && IDENTIFIER_CHAR.test(line[end]!)) {
+		end++
+	}
+	return { start, length: end - start }
 }
 
-/** 0-based column of the first whole-word occurrence of `word` in the line. */
-function indexOfWord(line: string, word: string): number {
+/** The first whole-word occurrence of `word` in the line (index + length). */
+function indexOfWord(line: string, word: string): { index: number; length: number } | undefined {
 	const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 	const match = line.match(new RegExp(`\\b${escaped}\\b`))
-	return match?.index ?? -1
+	return match?.index !== undefined ? { index: match.index, length: match[0].length } : undefined
 }
 
 /** The first identifier-like token on the line, or undefined. */
-function firstToken(line: string): { start: number } | undefined {
+function firstToken(line: string): { start: number; length: number } | undefined {
 	const match = line.match(/[A-Za-z_][A-Za-z0-9_]*/)
-	return match?.index !== undefined ? { start: match.index } : undefined
+	return match?.index !== undefined ? { start: match.index, length: match[0].length } : undefined
 }
 
 /** True when `p` resolves inside `root` (lexical containment, like safeTarget). */
