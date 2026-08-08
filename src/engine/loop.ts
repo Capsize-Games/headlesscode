@@ -104,7 +104,7 @@ import {
 import { writeHandoffSummary } from "./handoff.js"
 import { runLocalExplorePhase, type LocalExploreOptions, type LocalExploreResult } from "./local-explore.js"
 import { DEFAULT_LINE_LIMIT } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/read_file.js"
-import { hasCodebaseIndex } from "../index-util.js"
+import { hasCodebaseIndex } from "../codesearch/index.js"
 // Recursive task decomposition (`new_task`): child mode resolution uses the
 // SAME lookup the top-level session does (custom modes from .roomodes first,
 // then the vendored built-ins — see src/engine/prompt.ts).

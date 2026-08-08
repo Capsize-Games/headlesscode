@@ -1628,8 +1628,9 @@ function stubHandler(name: string, implemented: readonly string[] = ["read_file"
  * If no index exists yet, returns a clear ACTIONABLE error telling the model
  * to ask a human to run `headlesscode index` — deliberately NOT a silent
  * empty result ("no matches" would look like a legitimately empty search).
- * The index is built by a separate, explicit CLI step and is never
- * auto-triggered mid-session (it costs real money and takes real time).
+ * The index is built by a separate, explicit CLI step AND auto-refreshed at
+ * session/round start (issue #58 — src/auto-index.ts: throttled, non-fatal,
+ * skippable), so this "no index" error should be the rare first-run case.
  */
 async function codebaseSearchHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
 	const query = requireString(args, "query")

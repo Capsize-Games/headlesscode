@@ -217,6 +217,11 @@ fi
 
 WRAPPER="
 cd '$HARNESS_ROOT'
+# Issue #58: a spawned worker must NOT auto-refresh the codebase index — the
+# orchestrator's round-start refresh already covered this round, and a worker
+# re-indexing against its OWN worktree mid-round would race on the shared
+# central index for no benefit (committed state hasn't moved since round start).
+export HEADLESSCODE_SKIP_AUTO_INDEX=1
 $CLI $TASK_FLAG '$TASK_PATH' --workspace '$WT_PATH' --mode '$MODE' $MODEL_ARG $LOG_FILE_ARG $MEMORY_DIR_ARG $BUDGET_ARG
 CODE=\$?
 printf '%s' \"\$CODE\" > '$WT_PATH/.harness.exit'

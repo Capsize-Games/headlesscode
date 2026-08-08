@@ -131,13 +131,13 @@ REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
 #   HEADLESSCODE_AUTO_INDEX=1  build the index first (opt-in; costs real
 #                              cloud-embedding money via `headlesscode index`)
 # Resolve the central index path via the REAL TypeScript logic
-# (src/index-util.ts, indexFilePathFor) — never a bash reimplementation.
+# (src/codesearch/index.ts, indexFilePath) — never a bash reimplementation.
 central_index_file() {
     (
         cd "$HARNESS_ROOT"
         npx tsx -e '
-            import { indexFilePathFor } from "./src/index-util.ts"
-            process.stdout.write(indexFilePathFor(process.argv[1]))
+            import { indexFilePath } from "./src/codesearch/index.ts"
+            process.stdout.write(indexFilePath(process.argv[1]))
         ' "$REPO_ROOT"
     )
 }

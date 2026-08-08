@@ -107,12 +107,15 @@ HARNESS_OUT="$(mktemp /tmp/headlesscode-e2e-codesearch-cli-XXXXXX.out)"
 # Orientation-style task: "where is X / how does Y work" — exactly the
 # shape of task the new code-mode guidance says to open with codebase_search.
 TASK_TEXT='Where is the greet function and how does it handle the name argument? Do not edit anything — just locate it and report back.'
-
+# Session-start auto-index (issue #58) is off here — this e2e tests the
+# codebase_search guidance, not indexing, and the mock serves no embeddings
+# endpoint (a doomed embed request would just add noise).
 (
 	cd "$ROOT" &&
 		OPENROUTER_BASE_URL="http://127.0.0.1:$MOCK_PORT" \
 		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 		HEADLESSCODE_WORKSPACE_ROOT="$WORKTREE" \
+		HEADLESSCODE_SKIP_AUTO_INDEX=1 \
 		npx tsx src/cli.ts --task "$TASK_TEXT" --mode code \
 			--workspace "$WORKTREE" --max-iterations 10
 ) >"$HARNESS_OUT" 2>&1

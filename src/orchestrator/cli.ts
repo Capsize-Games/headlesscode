@@ -67,6 +67,7 @@ import {
 } from "./git-sync.js"
 import { resolveModelForMode } from "../config/mode-models.js"
 import { runPreflight, type PreflightResult } from "../llm/preflight.js"
+import { refreshIndexIfDue } from "../auto-index.js"
 
 const ORCHESTRATE_USAGE = `headlesscode orchestrate — Phase 2 parallel round
 
@@ -146,6 +147,14 @@ Options:
                  key-invalid / account-balance-exhausted / pinned-provider-down
                  / all-clear. ON by default; skip for CI/non-interactive
                  contexts that don't want the extra round-trip
+  --skip-auto-index     Skip the round-start auto-refresh of the codebase-search
+                 index (issue #58): by default orchestrate refreshes the index
+                 ONCE against the main checkout (throttled to once per
+                 $HEADLESSCODE_AUTO_INDEX_MIN_INTERVAL_MS, default 15 min; any
+                 failure is a warning, never an abort) so workers have fresh
+                 semantic-search data. Also settable via
+                 $HEADLESSCODE_SKIP_AUTO_INDEX=1 — the CI escape hatch for
+                 environments with no embedding API key
   --no-issue-size-check Skip the pre-flight issue-size warning (issue #53): a
                  FREE deterministic scan of each issue body that warns loudly
                  when it reads like 3+ independent pieces of work (top-level
@@ -250,6 +259,14 @@ interface OrchestrateOptions {
 	 */
 	issueSizeCheck: boolean
 	/**
+	 * Issue #58: skip the round-start auto-refresh of the codebase-search
+	 * index. ON by default (a refresh is throttled, non-fatal, and costs zero
+	 * embedding calls when nothing changed); --skip-auto-index / the
+	 * $HEADLESSCODE_SKIP_AUTO_INDEX=1 env var disable it for CI/test contexts
+	 * with no embedding API key.
+	 */
+	skipAutoIndex: boolean
+	/**
 	 * Auto-split (issue #53 follow-up): when the size check flags an issue,
 	 * propose a SEMANTIC split (LLM-decided independent deliverables, not a
 	 * mechanical one-sub-issue-per-bullet explosion — see auto-split.ts) and
@@ -315,6 +332,7 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 		planFirstMaxIterations: planFirstMaxIterationsFromEnv(),
 		preflight: true,
 		issueSizeCheck: true,
+		skipAutoIndex: false,
 		autoSplit: true,
 		dryRun: false,
 		help: false,
@@ -507,6 +525,9 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 				break
 			case "--no-auto-split":
 				options.autoSplit = false
+				break
+			case "--skip-auto-index":
+				options.skipAutoIndex = true
 				break
 			case "--dry-run":
 				options.dryRun = true
@@ -2587,6 +2608,18 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 			process.stderr.write(`headlesscode orchestrate: ${line}\n`)
 		}
 	}
+
+	// 1a-idx. Issue #58 round-start auto-index: refresh the codebase-search
+	// index ONCE, against the MAIN checkout, before any worktree exists. This
+	// deliberately runs in the ORCHESTRATOR's own process (not once per spawned
+	// worker): every worktree of a repo shares the SAME central index
+	// (src/project-store.ts), so per-worktree refreshes would race on one file
+	// — and the main checkout's committed state is the right thing to index
+	// anyway (a worker's not-yet-committed edits are transient). Throttled,
+	// non-fatal, skippable — see src/auto-index.ts. Spawned workers skip via
+	// run-worker.sh's HEADLESSCODE_SKIP_AUTO_INDEX=1; continuations/rework
+	// re-spawns on an existing worktree never re-trigger this.
+	await refreshIndexIfDue(repo, { skip: options.skipAutoIndex })
 
 	// 1a-pre. Issue #13 pre-spawn preflight probe: a cheap 1-token completion
 	// using the EXACT model + provider pin a real worker will use, so a dead

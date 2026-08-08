@@ -113,10 +113,13 @@ echo "  mock 1 listening on 127.0.0.1:$MOCK1_PORT (pid $MOCK1_PID)"
 
 HARNESS1_LOG="$(mktemp /tmp/headlesscode-e2e-perm-harness1-XXXXXX.log)"
 OUT1="$(mktemp /tmp/headlesscode-e2e-perm-cli1-XXXXXX.out)"
+# Session-start auto-index (issue #58) is off here — this e2e tests
+# permissions, and the mock serves no embeddings endpoint.
 (
 	cd "$ROOT" &&
 		OPENROUTER_BASE_URL="http://127.0.0.1:$MOCK1_PORT" \
 		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
+		HEADLESSCODE_SKIP_AUTO_INDEX=1 \
 		npx tsx src/cli.ts --task "attempt a protected write and a denied command" --mode code \
 			--workspace "$WT1" --max-iterations 10 --log-file "$HARNESS1_LOG" \
 			--denied-commands "$DENIED_COMMAND"
@@ -159,10 +162,12 @@ echo "  mock 2 listening on 127.0.0.1:$MOCK2_PORT (pid $MOCK2_PID)"
 
 HARNESS2_LOG="$(mktemp /tmp/headlesscode-e2e-perm-harness2-XXXXXX.log)"
 OUT2="$(mktemp /tmp/headlesscode-e2e-perm-cli2-XXXXXX.out)"
+# Session-start auto-index (issue #58) is off here — see pass 1.
 (
 	cd "$ROOT" &&
 		OPENROUTER_BASE_URL="http://127.0.0.1:$MOCK2_PORT" \
 		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
+		HEADLESSCODE_SKIP_AUTO_INDEX=1 \
 		npx tsx src/cli.ts --task "attempt a protected write and a denied command" --mode code \
 			--workspace "$WT2" --max-iterations 10 --log-file "$HARNESS2_LOG" \
 			--denied-commands "$DENIED_COMMAND" --allow-protected-writes

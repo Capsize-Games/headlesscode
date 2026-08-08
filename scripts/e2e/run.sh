@@ -146,11 +146,14 @@ HARNESS_LOG="/tmp/headlesscode-e2e.log"
 HARNESS_OUT="$(mktemp /tmp/headlesscode-e2e-cli-XXXXXX.out)"
 TASK_TEXT='fix the greet function in src/greet.js so it returns "Hello, " + name (issue #29)'
 
+# Session-start auto-index (issue #58) is off here — this e2e tests the
+# condense demo, and the mock serves no embeddings endpoint.
 (
 	cd "$ROOT" &&
 		OPENROUTER_BASE_URL="http://127.0.0.1:$MOCK_PORT" \
 		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 		HEADLESSCODE_WORKSPACE_ROOT="$WORKTREE" \
+		HEADLESSCODE_SKIP_AUTO_INDEX=1 \
 		npx tsx src/cli.ts --task "$TASK_TEXT" --mode code \
 			--workspace "$WORKTREE" --max-iterations 10 --log-file "$HARNESS_LOG"
 ) >"$HARNESS_OUT" 2>&1

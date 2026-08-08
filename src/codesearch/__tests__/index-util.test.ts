@@ -1,12 +1,13 @@
 /**
  * Smoke test for the codebase-index detection contract used by the
  * spawn-parallel-worktrees scripts and HeadlessSession's read-only-nudge
- * guardrail.
+ * guardrail. (Moved here from src/index-util.test.ts when the duplicate
+ * index-path helpers were consolidated into src/codesearch/index.ts — issue #58.)
  *
  * Plain assert-based script (no test framework, no network), run via
- * `npm test` → `tsx src/index-util.test.ts`. The index now lives in the
- * CENTRAL per-project data store (src/project-store.ts), keyed by the repo's
- * git-common-dir so worktrees share it — these tests pin the
+ * `npm test` → `tsx src/codesearch/__tests__/index-util.test.ts`. The index
+ * lives in the CENTRAL per-project data store (src/project-store.ts), keyed
+ * by the repo's git-common-dir so worktrees share it — these tests pin the
  * detection helpers against that store, redirecting it to a temp dir via
  * $HEADLESSCODE_DATA_DIR so no test touches the real home directory.
  */
@@ -16,8 +17,8 @@ import * as fsp from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 
-import { hasCodebaseIndex, indexFilePathFor } from "./index-util.js"
-import { migrateLegacyProjectData, projectStoreRoot, resolveProjectDataDir, resolveProjectIdentity } from "./project-store.js"
+import { hasCodebaseIndex, indexFilePath } from "../index.js"
+import { migrateLegacyProjectData, projectStoreRoot, resolveProjectDataDir, resolveProjectIdentity } from "../../project-store.js"
 
 async function mkTmp(prefix: string): Promise<string> {
 	return fsp.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -30,7 +31,7 @@ async function testAbsentIndexIsDetected(): Promise<void> {
 	try {
 		assert.equal(await hasCodebaseIndex(ws), false, "no index file → not indexed")
 		assert.ok(
-			indexFilePathFor(ws).startsWith(projectStoreRoot() + path.sep),
+			indexFilePath(ws).startsWith(projectStoreRoot() + path.sep),
 			"index path lives under the central store, not the workspace",
 		)
 	} finally {
@@ -47,8 +48,8 @@ async function testEmptyIndexIsTreatedAsAbsent(): Promise<void> {
 	try {
 		// Empty file = crashed/partial build — must be treated as absent so a
 		// worker never starts from a guaranteed-broken index.
-		await fsp.mkdir(path.dirname(indexFilePathFor(ws)), { recursive: true })
-		await fsp.writeFile(indexFilePathFor(ws), "")
+		await fsp.mkdir(path.dirname(indexFilePath(ws)), { recursive: true })
+		await fsp.writeFile(indexFilePath(ws), "")
 		assert.equal(await hasCodebaseIndex(ws), false, "empty index file is not usable")
 	} finally {
 		delete process.env.HEADLESSCODE_DATA_DIR
@@ -62,11 +63,11 @@ async function testRealIndexIsDetected(): Promise<void> {
 	const ws = await mkTmp("hc-idxutil-real-")
 	process.env.HEADLESSCODE_DATA_DIR = data
 	try {
-		await fsp.mkdir(path.dirname(indexFilePathFor(ws)), { recursive: true })
+		await fsp.mkdir(path.dirname(indexFilePath(ws)), { recursive: true })
 		// Content is irrelevant to detection (any non-empty file counts — the
 		// reader-side loose validation in src/codesearch/index.ts is a
 		// separate concern from "is there a usable index at all").
-		await fsp.writeFile(indexFilePathFor(ws), '{"file":"a.ts","startLine":1,"endLine":2}\n')
+		await fsp.writeFile(indexFilePath(ws), '{"file":"a.ts","startLine":1,"endLine":2}\n')
 		assert.equal(await hasCodebaseIndex(ws), true, "non-empty index file is usable")
 	} finally {
 		delete process.env.HEADLESSCODE_DATA_DIR
@@ -103,7 +104,7 @@ async function testLegacyWorkspaceIndexIsMigratedOnFirstResolution(): Promise<vo
 			"legacy index source moved out of the workspace after migration",
 		)
 		assert.equal(
-			await fsp.readFile(indexFilePathFor(ws), "utf-8"),
+			await fsp.readFile(indexFilePath(ws), "utf-8"),
 			"legacy-line\n",
 			"legacy index content lands in the central store",
 		)

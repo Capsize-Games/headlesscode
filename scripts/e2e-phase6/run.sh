@@ -113,11 +113,14 @@ start_mock "MOCK_SCENARIO=success MOCK_FIXTURE_ROOT=$FIXTURE node scripts/e2e/mo
 sleep 0.2
 
 # Control run WITHOUT a budget: the success scenario completes (exit 0).
+# Session-start auto-index (issue #58) is off here — this e2e tests budget
+# caps, and the mock serves no embeddings endpoint.
 CONTROL_OUT="$(mktemp /tmp/headlesscode-e2e6-control-XXXXXX.out)"
 (
 	cd "$ROOT" &&
 		HEADLESSCODE_OPENROUTER_API_KEY="test" \
 		OPENROUTER_BASE_URL="http://127.0.0.1:$LLM_PORT" \
+		HEADLESSCODE_SKIP_AUTO_INDEX=1 \
 		npx tsx src/cli.ts --task "Fix the greet bug" --workspace "$FIXTURE"
 ) >"$CONTROL_OUT" 2>&1
 CONTROL_EXIT=$?
@@ -133,12 +136,14 @@ fi
 # $0.14/1M in + $0.28/1M out — see DEFAULT_MODEL in src/llm/openrouter.ts);
 # one mock call is 16 in + 24 out ≈ $0.00000896, so a $0.000005 cap means the
 # FIRST recorded call trips the budget.
+# Session-start auto-index (issue #58) is off here — see the control run.
 BUDGET_OUT="$(mktemp /tmp/headlesscode-e2e6-budget-XXXXXX.out)"
 (
 	cd "$ROOT" &&
 		HEADLESSCODE_OPENROUTER_API_KEY="test" \
 		OPENROUTER_BASE_URL="http://127.0.0.1:$LLM_PORT" \
 		HEADLESSCODE_MAX_COST_USD="0.000005" \
+		HEADLESSCODE_SKIP_AUTO_INDEX=1 \
 		npx tsx src/cli.ts --task "Fix the greet bug" --workspace "$FIXTURE"
 ) >"$BUDGET_OUT" 2>&1
 BUDGET_EXIT=$?

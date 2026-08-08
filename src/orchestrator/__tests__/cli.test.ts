@@ -9,6 +9,7 @@
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
 import * as fs from "node:fs/promises"
+import * as http from "node:http"
 import * as os from "node:os"
 import * as path from "node:path"
 
@@ -34,6 +35,7 @@ import { watchGroups } from "../watch.js"
 import { defaultState, loadStateSync, saveStateSync, updateGroup, type OrchestratorGroup, type OrchestratorState } from "../state.js"
 import type { ReviewResult } from "../reviewer.js"
 import type { QaResult } from "../../qa/qa.js"
+import { hasCodebaseIndex, indexFilePath } from "../../codesearch/index.js"
 
 async function tmpRepo(): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-cli-rework-"))
@@ -914,6 +916,19 @@ async function testParseOrchestrateArgsNoPreflight(): Promise<void> {
 	assert.equal(skipped.options.preflight, false, "--no-preflight turns the probe off for CI/non-interactive")
 }
 
+// ─── --skip-auto-index (issue #58) ───────────────────────────────────────────
+
+async function testParseOrchestrateArgsSkipAutoIndex(): Promise<void> {
+	// The round-start auto-index refresh is ON by default.
+	const def = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1"])
+	assert.equal(def.error, undefined)
+	assert.equal(def.options.skipAutoIndex, false, "auto-index is on by default")
+
+	const skipped = parseOrchestrateArgs(["--repo", "/tmp/x", "--issue", "1", "--skip-auto-index"])
+	assert.equal(skipped.error, undefined)
+	assert.equal(skipped.options.skipAutoIndex, true, "--skip-auto-index disables the round-start refresh")
+}
+
 // ─── --no-issue-size-check (issue #53) ──────────────────────────────────────
 
 async function testParseOrchestrateArgsNoIssueSizeCheck(): Promise<void> {
@@ -1622,6 +1637,164 @@ async function testOrchestrateMainPreflightFailureAbortsBeforeSpawn(): Promise<v
 	}
 }
 
+// ─── Round-start auto-index (issue #58) ─────────────────────────────────────
+
+/**
+ * A tiny fake Ollama `/api/embed` server: returns one deterministic 3-dim
+ * vector per input. Lets the REAL createEmbedder → OllamaEmbedder → HTTP →
+ * buildIndex path run end-to-end inside orchestrateMain without any network
+ * or real embeddings.
+ */
+function startFakeOllama(): Promise<{ port: number; close: () => Promise<void> }> {
+	return new Promise((resolve, reject) => {
+		const server = http.createServer((req, res) => {
+			if (req.method === "POST" && req.url === "/api/embed") {
+				let body = ""
+				req.on("data", (c) => (body += c))
+				req.on("end", () => {
+					let input: unknown[] = []
+					try {
+						input = (JSON.parse(body) as { input?: unknown[] }).input ?? []
+					} catch {
+						// leave input empty — the embedder validates count
+					}
+					res.writeHead(200, { "Content-Type": "application/json" })
+					res.end(JSON.stringify({ model: "fake/embed", embeddings: input.map(() => [0.1, 0.2, 0.3]) }))
+				})
+			} else {
+				res.writeHead(404, { "Content-Type": "application/json" })
+				res.end(JSON.stringify({ error: { message: `not found: ${req.url}` } }))
+			}
+		})
+		server.on("error", reject)
+		server.listen(0, "127.0.0.1", () => {
+			const addr = server.address() as { port: number }
+			resolve({
+				port: addr.port,
+				close: () => new Promise((r) => server.close(() => r())),
+			})
+		})
+	})
+}
+
+/** Commit every file in `repo` (so the git-aware index walker sees them). */
+function commitAll(repo: string, message: string): void {
+	execFileSync("git", ["-C", repo, "config", "user.email", "test@headlesscode.invalid"], { stdio: "ignore" })
+	execFileSync("git", ["-C", repo, "config", "user.name", "AutoIndex Test"], { stdio: "ignore" })
+	execFileSync("git", ["-C", repo, "config", "commit.gpgsign", "false"], { stdio: "ignore" })
+	execFileSync("git", ["-C", repo, "add", "-A"], { stdio: "ignore" })
+	execFileSync("git", ["-C", repo, "commit", "-qm", message], { stdio: "ignore" })
+}
+
+async function testOrchestrateMainAutoIndexesAtRoundStart(): Promise<void> {
+	// Issue #58: a round against a repo with NO index must auto-build the
+	// index ONCE against the main checkout BEFORE anything spawns — and the
+	// round must proceed past the index step regardless. Here it dies at the
+	// preflight probe (dead LLM endpoint), which is a separate, LATER gate:
+	// the exit is the preflight's, not a missing-index block.
+	const repo = await tmpRepo()
+	const saved = {
+		key: process.env.HEADLESSCODE_OPENROUTER_API_KEY,
+		baseUrl: process.env.OPENROUTER_BASE_URL,
+		dataDir: process.env.HEADLESSCODE_DATA_DIR,
+		backend: process.env.HEADLESSCODE_EMBEDDING_BACKEND,
+		ollamaUrl: process.env.HEADLESSCODE_OLLAMA_URL,
+		noSync: process.env.HEADLESSCODE_ORCHESTRATE_NO_SYNC,
+	}
+	const ollama = await startFakeOllama()
+	const store = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-cli-auto-idx-"))
+	process.env.HEADLESSCODE_OPENROUTER_API_KEY = "k"
+	process.env.OPENROUTER_BASE_URL = "http://127.0.0.1:1"
+	process.env.HEADLESSCODE_DATA_DIR = store
+	process.env.HEADLESSCODE_EMBEDDING_BACKEND = "ollama"
+	process.env.HEADLESSCODE_OLLAMA_URL = `http://127.0.0.1:${ollama.port}`
+	process.env.HEADLESSCODE_ORCHESTRATE_NO_SYNC = "1"
+	try {
+		initGitRepo(repo)
+		await fs.mkdir(path.join(repo, "src"), { recursive: true })
+		await fs.writeFile(path.join(repo, "src", "a.ts"), "export function alpha() {\n  return 1\n}\n", "utf-8")
+		commitAll(repo, "init")
+		const issuesPath = path.join(repo, "issues.json")
+		await fs.writeFile(issuesPath, JSON.stringify([{ number: 1, title: "Fix the thing", body: "Do it" }]), "utf-8")
+
+		const { exit, stdout, stderr } = await withCapturedIo(() =>
+			orchestrateMain(["--repo", repo, "--issues-json", issuesPath]),
+		)
+
+		// The round proceeds past the index step and dies at the preflight —
+		// never on a missing index.
+		assert.notEqual(exit, 0, "round still aborts (here: at the preflight probe, which is unrelated to indexing)")
+		assert.ok(stdout.includes("[preflight]"), "the preflight line is printed after the index refresh, got: " + stdout)
+		assert.ok(stderr.includes("preflight FAILED (network)"), `preflight names the failure mode, got: ${stderr}`)
+		// The auto-index fired and built a real index.
+		assert.ok(stdout.includes("[auto-index] refreshed"), `the refresh line is printed, got: ${stdout}`)
+		assert.ok(await hasCodebaseIndex(repo), "a usable index now exists for the repo")
+		const entries = (await fs.readFile(indexFilePath(repo), "utf-8")).trim().split("\n").filter(Boolean)
+		assert.ok(entries.length >= 1, `index has entries (got ${entries.length})`)
+	} finally {
+		await ollama.close()
+		await restoreEnv(saved)
+		await fs.rm(store, { recursive: true, force: true })
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testOrchestrateMainSkipAutoIndexDoesNotBuild(): Promise<void> {
+	// --skip-auto-index: no build attempt at all (not even a stale check), and
+	// the round still proceeds normally to its own (preflight) outcome.
+	const repo = await tmpRepo()
+	const saved = {
+		key: process.env.HEADLESSCODE_OPENROUTER_API_KEY,
+		baseUrl: process.env.OPENROUTER_BASE_URL,
+		dataDir: process.env.HEADLESSCODE_DATA_DIR,
+		backend: process.env.HEADLESSCODE_EMBEDDING_BACKEND,
+		ollamaUrl: process.env.HEADLESSCODE_OLLAMA_URL,
+		noSync: process.env.HEADLESSCODE_ORCHESTRATE_NO_SYNC,
+	}
+	const ollama = await startFakeOllama()
+	const store = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-cli-no-auto-idx-"))
+	process.env.HEADLESSCODE_OPENROUTER_API_KEY = "k"
+	process.env.OPENROUTER_BASE_URL = "http://127.0.0.1:1"
+	process.env.HEADLESSCODE_DATA_DIR = store
+	process.env.HEADLESSCODE_EMBEDDING_BACKEND = "ollama"
+	process.env.HEADLESSCODE_OLLAMA_URL = `http://127.0.0.1:${ollama.port}`
+	process.env.HEADLESSCODE_ORCHESTRATE_NO_SYNC = "1"
+	try {
+		initGitRepo(repo)
+		await fs.mkdir(path.join(repo, "src"), { recursive: true })
+		await fs.writeFile(path.join(repo, "src", "a.ts"), "export function alpha() {\n  return 1\n}\n", "utf-8")
+		commitAll(repo, "init")
+		const issuesPath = path.join(repo, "issues.json")
+		await fs.writeFile(issuesPath, JSON.stringify([{ number: 1, title: "Fix the thing", body: "Do it" }]), "utf-8")
+
+		const { exit, stdout, stderr } = await withCapturedIo(() =>
+			orchestrateMain(["--repo", repo, "--issues-json", issuesPath, "--skip-auto-index"]),
+		)
+
+		assert.notEqual(exit, 0, "the round still reaches its own (preflight) failure")
+		assert.ok(stderr.includes("preflight FAILED (network)"), `preflight still runs, got: ${stderr}`)
+		assert.ok(!stdout.includes("[auto-index] refreshed"), `no refresh happened, got: ${stdout}`)
+		assert.ok(stdout.includes("[auto-index] skipped"), "the skip is logged (visible, not silent), got: " + stdout)
+		assert.equal(await hasCodebaseIndex(repo), false, "no index was built when skipped")
+	} finally {
+		await ollama.close()
+		await restoreEnv(saved)
+		await fs.rm(store, { recursive: true, force: true })
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+/** Restore the env vars an orchestrateMain integration test may have touched. */
+function restoreEnv(saved: Record<string, string | undefined>): void {
+	for (const [key, value] of Object.entries(saved)) {
+		if (value === undefined) {
+			delete process.env[key]
+		} else {
+			process.env[key] = value
+		}
+	}
+}
+
 // ─── master ↔ origin sync before spawn (issue #25) ───────────────────────────
 
 async function testOrchestrateMainWarnsOnDriftWhenSyncDisabled(): Promise<void> {
@@ -1751,6 +1924,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["orchestrateMain skips an occupied w1 slot and names the group w2", testOrchestrateMainSkipsOccupiedWorktreeSlot],
 	["orchestrateMain skips multiple occupied slots (w1+w2 -> w3)", testOrchestrateMainSkipsMultipleOccupiedSlots],
 	["--no-preflight parses (default on, flag off)", testParseOrchestrateArgsNoPreflight],
+	["--skip-auto-index parses (default on, flag off)", testParseOrchestrateArgsSkipAutoIndex],
 	["--no-issue-size-check parses (default on, flag off)", testParseOrchestrateArgsNoIssueSizeCheck],
 	["orchestrateMain dry-run warns loudly on a 3+-section issue but never aborts (issue #53)", testOrchestrateMainDryRunWarnsOnOversizedIssue],
 	["orchestrateMain dry-run: --no-issue-size-check silences the warning (issue #53)", testOrchestrateMainDryRunNoIssueSizeWarningWithFlag],
@@ -1760,6 +1934,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["orchestrateMain dry-run shows a cost estimate derived from recorded history", testOrchestrateMainDryRunShowsCostEstimateFromHistory],
 	["orchestrateMain aborts before spawn when the preflight probe fails", testOrchestrateMainPreflightFailureAbortsBeforeSpawn],
 	["orchestrateMain warns loudly on drift when the auto-sync is disabled", testOrchestrateMainWarnsOnDriftWhenSyncDisabled],
+	["orchestrateMain auto-indexes the repo at round start (issue #58)", testOrchestrateMainAutoIndexesAtRoundStart],
+	["orchestrateMain --skip-auto-index does not build an index (issue #58)", testOrchestrateMainSkipAutoIndexDoesNotBuild],
 ]
 
 async function main(): Promise<void> {

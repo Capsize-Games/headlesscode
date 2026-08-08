@@ -28,6 +28,11 @@
 #
 # Requires: node >= 18, npm/npx with tsx (npm install), git >= 2.28, bash.
 # Exit code: 0 = PASS, 1 = FAIL.
+#
+# The orchestrate invocations below set HEADLESSCODE_SKIP_AUTO_INDEX=1: the
+# round-start auto-index refresh (issue #58) is out of scope for this suite,
+# and the mock LLM serves no embeddings endpoint (a doomed embed request
+# would just add noise). Spawned workers skip it anyway via run-worker.sh.
 
 set -u
 
@@ -222,6 +227,7 @@ ORCH1_OUT="$(mktemp /tmp/headlesscode-e2e4-orch1-XXXXXX.out)"
 		OPENROUTER_BASE_URL="http://127.0.0.1:$AUTO_PORT" \
 		HEADLESSCODE_ROOT="$ROOT" \
 		ALLOW_UNINDEXED=1 \
+		HEADLESSCODE_SKIP_AUTO_INDEX=1 \
 		npx tsx src/cli.ts orchestrate --repo "$FIXTURE" --issues-json "$ISSUES_JSON" \
 			--qa --qa-mode qa-agent --poll-interval-ms 200
 ) >"$ORCH1_OUT" 2>&1
@@ -474,6 +480,7 @@ ORCH2_OUT="$(mktemp /tmp/headlesscode-e2e4-orch2-XXXXXX.out)"
 		OPENROUTER_BASE_URL="http://127.0.0.1:$AUTO_PORT" \
 		HEADLESSCODE_ROOT="$ROOT" \
 		ALLOW_UNINDEXED=1 \
+		HEADLESSCODE_SKIP_AUTO_INDEX=1 \
 		DEPLOY_APPROVAL_TOKEN="correct-token" \
 		npx tsx src/cli.ts orchestrate --repo "$FIXTURE" --issues-json "$ISSUES_JSON" \
 			--qa --qa-mode qa-agent --deploy --deploy-args "--local --fastsearch-only" --poll-interval-ms 200
@@ -503,6 +510,7 @@ ORCH3_OUT="$(mktemp /tmp/headlesscode-e2e4-orch3-XXXXXX.out)"
 		OPENROUTER_BASE_URL="http://127.0.0.1:$AUTO_PORT" \
 		HEADLESSCODE_ROOT="$ROOT" \
 		ALLOW_UNINDEXED=1 \
+		HEADLESSCODE_SKIP_AUTO_INDEX=1 \
 		DEPLOY_APPROVAL_TOKEN="wrong-token" \
 		npx tsx src/cli.ts orchestrate --repo "$FIXTURE" --issues-json "$ISSUES_JSON" \
 			--qa --qa-mode qa-agent --deploy --poll-interval-ms 200
@@ -556,6 +564,7 @@ REWORK_OUT="$(mktemp /tmp/headlesscode-e2e4-rework-XXXXXX.out)"
 		OPENROUTER_BASE_URL="http://127.0.0.1:$REWORK_PORT" \
 		HEADLESSCODE_ROOT="$ROOT" \
 		ALLOW_UNINDEXED=1 \
+		HEADLESSCODE_SKIP_AUTO_INDEX=1 \
 		npx tsx src/cli.ts orchestrate --repo "$FIXTURE2" --issues-json "$REWORK_ISSUES" \
 			--poll-interval-ms 200
 ) >"$REWORK_OUT" 2>&1
@@ -666,6 +675,7 @@ REWORK_QA_OUT="$(mktemp /tmp/headlesscode-e2e4-qarework-XXXXXX.out)"
 		OPENROUTER_BASE_URL="http://127.0.0.1:$REWORK_QA_PORT" \
 		HEADLESSCODE_ROOT="$ROOT" \
 		ALLOW_UNINDEXED=1 \
+		HEADLESSCODE_SKIP_AUTO_INDEX=1 \
 		npx tsx src/cli.ts orchestrate --repo "$FIXTURE3" --issues-json "$REWORK_QA_ISSUES" \
 			--qa --qa-mode qa-agent --poll-interval-ms 200
 ) >"$REWORK_QA_OUT" 2>&1

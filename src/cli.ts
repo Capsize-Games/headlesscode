@@ -39,6 +39,7 @@ import { analyzeCliMain } from "./orchestrator/analyze-cli.js"
 import { costHistoryCliMain } from "./orchestrator/cost-history-cli.js"
 import { resolvePermissions, type PermissionsConfig } from "./permissions/config.js"
 import { resolveModelForMode, resolveReasoningEffortForMode } from "./config/mode-models.js"
+import { refreshIndexIfDue } from "./auto-index.js"
 
 const VERSION = "0.1.0"
 
@@ -143,6 +144,12 @@ interface CliOptions {
 	autoApproveModeSwitch: boolean
 	/** switch_mode: hard cap on total in-place mode switches per session (default 5). */
 	maxModeSwitches?: number
+	/**
+	 * Issue #58: skip the session-start auto-refresh of the codebase-search
+	 * index (throttled + non-fatal by default — see src/auto-index.ts).
+	 * Also settable via $HEADLESSCODE_SKIP_AUTO_INDEX=1.
+	 */
+	skipAutoIndex: boolean
 }
 
 const USAGE = `headlesscode — headless coding-agent harness (Phase 1 engine)
@@ -185,10 +192,11 @@ Subcommands:
               \`npx tsx src/cli.ts trend --help\` for full options.
   headlesscode index --workspace <path> [--model <id>] [--embedding-backend <b>]
               Build/refresh the codebase semantic-search index for a workspace
-              (used by the codebase_search tool). A separate, explicit step —
-              never auto-triggered mid-session. --embedding-backend picks
-              openrouter (default) or ollama (local). See
-              \`npx tsx src/cli.ts index --help\` for full options.
+              (used by the codebase_search tool). The explicit/manual step —
+              sessions also auto-refresh it at start (throttled, non-fatal,
+              skippable — issue #58, see --skip-auto-index).
+              --embedding-backend picks openrouter (default) or ollama (local).
+              See \`npx tsx src/cli.ts index --help\` for full options.
   headlesscode codemap --workspace <path> [--force] [--watch] [--interval-ms <n>]
               Build/refresh a project's deterministic module/import map
               (codemap.json/codemap.lock/codemap.html in the central project
@@ -345,6 +353,15 @@ Options:
                                DEFAULT_MAX_MODE_SWITCHES in src/engine/loop.ts).
                                Also settable via
                                $HEADLESSCODE_MAX_MODE_SWITCHES
+  --skip-auto-index          Skip the session-start auto-refresh of the
+                               codebase-search index (issue #58): by default a
+                               non-orchestrated session refreshes the index for
+                               its workspace once before the loop starts
+                               (throttled to once per
+                               $HEADLESSCODE_AUTO_INDEX_MIN_INTERVAL_MS,
+                               default 15 min; any failure is a warning, never
+                               an abort) so codebase_search has fresh data.
+                               Also settable via $HEADLESSCODE_SKIP_AUTO_INDEX=1
   --version                  Print version and exit
   --help                     Show this help and exit
 
@@ -391,6 +408,7 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 		stream: false,
 		localExplore: false,
 		autoApproveModeSwitch: false,
+		skipAutoIndex: false,
 	}
 
 	for (let i = 0; i < argv.length; i++) {
@@ -597,6 +615,9 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 			case "--no-checkpoints":
 				options.noCheckpoints = true
 				break
+			case "--skip-auto-index":
+				options.skipAutoIndex = true
+				break
 			case "--dry-run":
 				options.dryRun = true
 				break
@@ -652,9 +673,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	}
 
 	// Codebase semantic-search index subcommand: `headlesscode index ...` —
-	// build/refresh <workspace>/.headlesscode/codesearch/index.jsonl for the
-	// codebase_search tool (see src/codesearch/). A separate, EXPLICIT step —
-	// never auto-triggered mid-session (it costs real money and takes time).
+	// build/refresh the codebase-search index for the codebase_search tool
+	// (see src/codesearch/). The explicit/manual step — sessions also
+	// auto-refresh the index at start (throttled, non-fatal, skippable —
+	// issue #58, see src/auto-index.ts).
 	if (argv[0] === "index") {
 		return indexMain(argv.slice(1))
 	}
@@ -931,6 +953,16 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		process.stderr.write(`headlesscode: ${err instanceof Error ? err.message : String(err)}\n`)
 		return 2
 	}
+
+	// Issue #58 session-start auto-index: the non-orchestrated, single-
+	// workspace case (a human or script running the bare CLI directly). All
+	// config above has already validated by this point, so a refresh here
+	// never happens for a session that was about to fail startup anyway.
+	// Throttled, non-fatal, skippable (--skip-auto-index /
+	// $HEADLESSCODE_SKIP_AUTO_INDEX=1) — see src/auto-index.ts. Orchestrator-
+	// spawned workers skip via run-worker.sh's HEADLESSCODE_SKIP_AUTO_INDEX=1
+	// (the orchestrator's round-start refresh already covered them).
+	await refreshIndexIfDue(workspaceRoot, { skip: options.skipAutoIndex })
 
 	const session = new HeadlessSession({
 		workspaceRoot,

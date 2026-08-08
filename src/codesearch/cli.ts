@@ -20,9 +20,11 @@
  *     reindex — the build handles it automatically by treating every stored
  *     vector from the other backend as stale).
  *
- * Indexing is a SEPARATE, EXPLICIT step (it costs real money and takes real
- * time) — it is never auto-triggered mid-session. Sessions consume whatever
- * index already exists or tell the model to ask a human to build one.
+ * Indexing is ALSO auto-refreshed at session/round start (issue #58 —
+ * src/auto-index.ts): throttled, non-fatal, skippable, and cheap when nothing
+ * changed (the incremental build embeds zero chunks on a no-op refresh). This
+ * subcommand remains the explicit/manual path for a human who wants to build
+ * or refresh the index on demand (or force a backend/model switch).
  */
 
 import * as path from "node:path"

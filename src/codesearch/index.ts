@@ -198,6 +198,13 @@ export interface IndexMetadata {
 	backend: EmbeddingBackend
 	/** Embedding model that built the index. */
 	model: string
+	/**
+	 * ISO timestamp of the last build (written by buildIndex on EVERY build,
+	 * manual `headlesscode index` and auto-refresh alike). This is the
+	 * auto-index throttle key (src/auto-index.ts): a recent build means the
+	 * walk+hash pass can be skipped entirely.
+	 */
+	lastBuiltAt?: string
 }
 
 /** Load the metadata sibling file; undefined when missing/unreadable/malformed. */
@@ -221,10 +228,34 @@ export function loadIndexMetadata(workspaceRoot: string): IndexMetadata | undefi
 		if (model === undefined) {
 			return undefined
 		}
-		return { backend, model }
+		const lastBuiltAt = typeof parsed.lastBuiltAt === "string" ? parsed.lastBuiltAt : undefined
+		return { backend, model, ...(lastBuiltAt !== undefined ? { lastBuiltAt } : {}) }
 	} catch {
 		return undefined
 	}
+}
+
+/**
+ * True when the workspace already has a non-empty codebase-search index (the
+ * guardrail's notion of "usable": exists AND non-empty — an empty file is a
+ * crashed/partial build and must count as absent so nothing ever starts from
+ * a guaranteed-broken index). Also counts a legacy workspace-relative
+ * `.headlesscode/codesearch/index.jsonl` (pre-central-store grace — the same
+ * rule the spawn scripts rely on so a fresh worktree of an already-indexed
+ * repo never rebuilds unnecessarily).
+ */
+export async function hasCodebaseIndex(workspaceRoot: string): Promise<boolean> {
+	for (const file of [indexFilePath(workspaceRoot), legacyIndexFilePath(workspaceRoot)]) {
+		try {
+			const st = await fsp.stat(file)
+			if (st.isFile() && st.size > 0) {
+				return true
+			}
+		} catch {
+			// missing — try the next candidate
+		}
+	}
+	return false
 }
 
 /** Validate a new batch of embeddings before it enters the index. */
@@ -331,6 +362,25 @@ export async function writeIndexEntries(file: string, entries: IndexEntry[]): Pr
 }
 
 /**
+ * Write a file atomically: write to a temp sibling in the SAME directory,
+ * then rename over the target (rename is atomic on POSIX). Two concurrent
+ * builds of one repo (two orchestrate rounds coexisting — issue #15's
+ * scenario) can then only ever leave the OLD or the NEW complete file at the
+ * final path, never a torn/partial JSONL interleaved by both writers. Last
+ * writer wins; readers see either the old or the new file.
+ */
+async function atomicWriteFile(file: string, write: (tmp: string) => Promise<void>): Promise<void> {
+	const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString("hex")}`
+	try {
+		await write(tmp)
+		await fsp.rename(tmp, file)
+	} catch (err) {
+		await fsp.rm(tmp, { force: true }).catch(() => {})
+		throw err
+	}
+}
+
+/**
  * Build (or incrementally refresh) the codebase index for a workspace.
  *
  * @param embedder  embedder to use for changed/new chunks
@@ -423,14 +473,23 @@ export async function buildIndex(
 
 	const file = indexFilePath(root)
 	await fsp.mkdir(path.dirname(file), { recursive: true })
-	await writeIndexEntries(file, newEntries)
+	// Atomic write (temp + rename): a concurrent build of the same repo must
+	// never leave a torn JSONL visible at the final path — see atomicWriteFile.
+	await atomicWriteFile(file, (tmp) => writeIndexEntries(tmp, newEntries))
 	// Sibling metadata records which backend/model built this index, so a
 	// query can refuse a backend mismatch with a clear error instead of
-	// comparing different-dimension vectors (see loadIndexMetadata).
-	await fsp.writeFile(
-		indexMetadataFilePath(root),
-		JSON.stringify({ [METADATA_BACKEND_KEY]: backend, [METADATA_MODEL_KEY]: embedder.model }, null, 2) + "\n",
-		"utf-8",
+	// comparing different-dimension vectors (see loadIndexMetadata), plus the
+	// build timestamp that drives the auto-index throttle (src/auto-index.ts).
+	await atomicWriteFile(indexMetadataFilePath(root), (tmp) =>
+		fsp.writeFile(
+			tmp,
+			JSON.stringify(
+				{ [METADATA_BACKEND_KEY]: backend, [METADATA_MODEL_KEY]: embedder.model, lastBuiltAt: new Date().toISOString() },
+				null,
+				2,
+			) + "\n",
+			"utf-8",
+		),
 	)
 
 	return {

@@ -8,9 +8,10 @@
 //
 // Discovery: every `*.test.ts` under src/ (this already covers both
 // `__tests__/*.test.ts` dirs and the few top-level `*.test.ts` files, e.g.
-// src/index-util.test.ts), run in sorted order for determinism, plus a short
-// explicit list of non-test-suffixed check scripts that were previously
-// chained in by hand.
+// src/index-util.test.ts — moved into src/codesearch/__tests__/ with the
+// index-util consolidation, issue #58), run in sorted order for determinism,
+// plus a short explicit list of non-test-suffixed check scripts that were
+// previously chained in by hand.
 //
 // Semantics preserved from the old `&&` chain: run sequentially, stop at the
 // first failure (fail-fast), exit with that failure's exit code.

@@ -149,6 +149,10 @@ fi
 
 WRAPPER="
 cd '$HARNESS_ROOT'
+# Issue #58: a spawned QA session must NOT auto-refresh the codebase index —
+# the orchestrator's round-start refresh already covered this round (see
+# run-worker.sh for the same rationale).
+export HEADLESSCODE_SKIP_AUTO_INDEX=1
 $CLI --task-file '$TASK_FILE' --workspace '$WT_PATH' --mode '$MODE' $MODEL_ARG $LOG_FILE_ARG $BUDGET_ARG
 CODE=\$?
 printf '%s' \"\$CODE\" > '$WT_PATH/.qa.exit'
