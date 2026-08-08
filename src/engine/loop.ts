@@ -1154,14 +1154,15 @@ export class HeadlessSession {
 		// browser_action, describe_image and the code-intelligence tools are
 		// not part of the vendored tool set, so selectToolsForMode can't
 		// include them — append them explicitly (see src/tools/browser/,
-		// src/vision/ and src/codeintel/). The TS-only code-intelligence tools
+		// src/vision/ and src/codeintel/). The code-intelligence tools
 		// (outline/go_to_definition/find_references/import_graph), rename_symbol
 		// (edits files) and run_tests (runs the test suite) are only advertised
 		// when THIS session's executor actually registers the handlers: the
 		// read-only reviewer/QA executors must not be advertised tools they
-		// can't run, and on a non-TS/JS workspace (Python/C++/…) the executor
-		// deliberately does not register the ts.Program-based tools at all —
-		// so the tool list matches what actually works for the project.
+		// can't run, and on a workspace with no available code-intelligence
+		// backend (Rust/C++/… with no wired language server) the executor
+		// deliberately does not register them at all — so the tool list
+		// matches what actually works for the project.
 		let tools = appendDescribeImageTool(appendBrowserActionTool(this.config.tools ?? selectToolsForMode(mode, customModes)))
 		if (this.executor.has("outline")) {
 			tools = appendCodeIntelTools(tools)

@@ -15,10 +15,13 @@
  *   - browser_action    { action, url?, selector?, text? } — Playwright-backed
  *     headless browser inspection (launch/screenshot/click/type/getConsoleLogs/
  *     getNetworkErrors/close); NEW work, no upstream port (see src/tools/browser/).
- *   - outline / go_to_definition / find_references / import_graph — the four
- *     code-intelligence tools (TS Compiler API backed, src/codeintel/): one
- *     cached ts.Program per workspace serves all four. NEW work, no upstream
- *     port (see src/codeintel/).
+ *   - outline / go_to_definition / find_references / import_graph /
+ *     rename_symbol — the code-intelligence tools (src/codeintel/), backed
+ *     by a language-neutral backend seam (issue #59): TypeScript/JavaScript
+ *     via one cached ts.Program per workspace, Python via a bundled pyright
+ *     language server (LSP over stdio), dispatched per target-file extension
+ *     so a mixed workspace gets the right backend for each file. NEW work, no
+ *     upstream port (see src/codeintel/).
  *
  * Every file operation resolves relative to the configured workspace root and
  * is rejected if it escapes the workspace (path-traversal guard). Results are
@@ -55,7 +58,8 @@ import { createHash } from "node:crypto"
 import { spawn, type ChildProcess } from "node:child_process"
 import { setTimeout as sleep } from "node:timers/promises"
 
-import { isTypeScriptWorkspace } from "./language-detect.js"
+import { detectWorkspaceLanguages, isTypeScriptWorkspace } from "./language-detect.js"
+import { CodeIntelService } from "../codeintel/service.js"
 import type { Logger } from "../engine/logger.js"
 
 // Side effect: installs String.prototype.toPosix() used by path formatting.
@@ -173,6 +177,13 @@ export interface ToolExecutorOptions {
 	 * `describe_image` explicitly).
 	 */
 	onAuxLlmUsage?: (usage: AuxLlmUsage) => void
+	/**
+	 * Language → server registry override for the code-intelligence backends
+	 * (issue #59). Tests inject a broken registry to prove a failing language
+	 * server fails closed (tools simply not registered, session unaffected).
+	 * Absent → the real registry (src/codeintel/lsp/registry.ts).
+	 */
+	codeIntelServerRegistry?: Record<string, import("../codeintel/lsp/registry.js").LanguageServerSpec>
 }
 
 export class ToolExecutor {
@@ -193,6 +204,8 @@ export class ToolExecutor {
 	 * Conversational/session state — NEVER written to a workspace file.
 	 */
 	private readonly todoList = new TodoListState()
+	/** Per-session resources that must be released at session end (e.g. LSP servers). */
+	private readonly disposeHooks: Array<() => void> = []
 	/** Resolved permissions handed to every handler call (see ToolExecutorOptions.permissions). */
 	readonly permissions: PermissionsConfig
 
@@ -207,6 +220,17 @@ export class ToolExecutor {
 
 	register(name: string, handler: ToolHandler): void {
 		this.handlers.set(name, handler)
+	}
+
+	/**
+	 * Register a per-session cleanup hook, run by `dispose()` at true session
+	 * end — the same lifecycle slot as the backgrounded-command kill and
+	 * browser teardown (see dispose below). The code-intelligence service uses
+	 * this to kill its spawned language servers so a session never leaks a
+	 * child process.
+	 */
+	onDispose(hook: () => void): void {
+		this.disposeHooks.push(hook)
 	}
 
 	has(name: string): boolean {
@@ -304,6 +328,9 @@ export class ToolExecutor {
 	dispose(): void {
 		killBackgroundCommands()
 		disposeBrowserSessions()
+		for (const hook of this.disposeHooks.splice(0)) {
+			hook()
+		}
 	}
 }
 
@@ -1764,17 +1791,78 @@ const IMPLEMENTED_TOOLS = new Set([
 ])
 
 /**
- * Register the TS-ONLY code-intelligence tools + run_tests — CONDITIONALLY,
- * gated on the workspace actually being TS/JS (src/tools/language-detect.ts).
- * All of these are built on ts.Program/tsx: on a Python/C++/Rust workspace
- * they are dead weight (advertised on every request, costing prompt tokens,
- * silently useless if tried) — the same "match the tool list to what actually
- * works" discipline `codebase_search` already models with its broad extension
- * list. On non-TS workspaces they are NOT registered here, so both the
- * executor and the advertised tool list (loop.ts gates advertisement on
- * executor.has) omit them.
+ * Register the code-intelligence tools (issue #59) — CONDITIONALLY, gated on
+ * the workspace actually having a language a backend can serve
+ * (src/codeintel/service.ts). The old gate was TS-only
+ * (`isTypeScriptWorkspace`); now EVERY detected language with an available
+ * backend contributes, and each tool call dispatches per-file to the backend
+ * that owns the target file's extension — so a mixed TS+Python workspace
+ * (e.g. airunner) gets real find_references/go_to_definition on BOTH `.ts`
+ * and `.py` files in the same session, while a workspace with no backend at
+ * all (Rust/C++/… with no wired server) still gets none of the six tools —
+ * the same "match the tool list to what actually works" discipline
+ * `codebase_search` already models.
+ *
+ * Registration is per-workspace, availability is per-language:
+ *   - outline / go_to_definition / find_references register when ANY backend
+ *     is available.
+ *   - import_graph registers only when a backend that IMPLEMENTS it exists
+ *     (the TypeScript backend; LSP has no import-graph request — see
+ *     src/codeintel/lsp/backend.ts).
+ *   - rename_symbol EDITS files, so it is deliberately NOT registered on the
+ *     read-only executors (reviewer/QA/local explore) — they must never be
+ *     able to modify source, and their tool lists don't advertise it either
+ *     (see the RENAME_SYMBOL_TOOL note in src/codeintel/tools.ts).
+ *   - A detected language whose backend is unavailable WARNs once and is
+ *     skipped (fail closed per-language, never a hard failure).
  */
-function registerTypeScriptGatedTools(
+function registerCodeIntelTools(
+	executor: ToolExecutor,
+	workspaceRoot: string,
+	options: ToolExecutorOptions = {},
+	editCapable: boolean,
+): void {
+	const languages = detectWorkspaceLanguages(workspaceRoot)
+	const service = new CodeIntelService(workspaceRoot, { serverRegistry: options.codeIntelServerRegistry })
+	const available = service.availableLanguages(languages)
+	for (const language of languages) {
+		if (!available.includes(language)) {
+			process.stderr.write(
+				`[code-intel] no backend available for detected language '${language}' in ${workspaceRoot} — ` +
+					`code-intelligence tools for it are not registered\n`,
+			)
+		}
+	}
+	if (available.length === 0) {
+		return
+	}
+	executor.register("outline", (args, ctx) => outlineHandler(args, ctx, service))
+	executor.register("go_to_definition", (args, ctx) => goToDefinitionHandler(args, ctx, service))
+	executor.register("find_references", (args, ctx) => findReferencesHandler(args, ctx, service))
+	if (service.supportsImportGraph(languages)) {
+		executor.register("import_graph", (args, ctx) => importGraphHandler(args, ctx, service))
+	}
+	if (editCapable) {
+		executor.register("rename_symbol", (args, ctx) => renameSymbolHandler(args, ctx, service))
+	}
+	// Session teardown: kill every spawned language server at true session end
+	// (same lifecycle slot as the backgrounded-command kill / browser teardown).
+	executor.onDispose(() => {
+		void service.dispose()
+	})
+}
+
+/**
+ * Register `run_tests` — gated on TypeScript/JavaScript workspaces ONLY.
+ * Deliberately separate from the code-intelligence registration above: the
+ * coupling is INTENTIONAL, not incidental — the tool's test selection walks
+ * the ts.Program import graph (src/tools/test-selection.ts) and runs suites
+ * via `tsx`, so it is inherently TypeScript-specific; a Python-only workspace
+ * gets no run_tests because there is nothing for it to run. On non-TS
+ * workspaces it is not registered, so both the executor and the advertised
+ * tool list (loop.ts gates advertisement on executor.has) omit it.
+ */
+function registerRunTests(
 	executor: ToolExecutor,
 	workspaceRoot: string,
 	options: ToolExecutorOptions = {},
@@ -1782,19 +1870,6 @@ function registerTypeScriptGatedTools(
 	if (!isTypeScriptWorkspace(workspaceRoot)) {
 		return
 	}
-	executor.register("outline", outlineHandler)
-	executor.register("go_to_definition", goToDefinitionHandler)
-	executor.register("find_references", findReferencesHandler)
-	executor.register("import_graph", importGraphHandler)
-	// rename_symbol EDITS files, so it is deliberately NOT registered on the
-	// read-only executors (reviewer/QA/local explore) — they must never be
-	// able to modify source, and their tool lists don't advertise it either
-	// (see the RENAME_SYMBOL_TOOL note in src/codeintel/tools.ts).
-	executor.register("rename_symbol", renameSymbolHandler)
-	// run_tests RUNS the project's test suite — an edit-loop tool, not a
-	// read-only inspection, so like rename_symbol it is only registered on
-	// the headless (edit-capable) executor. Reviewer/QA use execute_command
-	// to run tests themselves; their tool lists don't advertise run_tests.
 	executor.register("run_tests", (args, ctx) => runTestsHandler(args, ctx, options.getSessionChangedFiles))
 }
 
@@ -1817,7 +1892,8 @@ export function createHeadlessExecutor(workspaceRoot: string, options: ToolExecu
 	executor.register("codebase_search", codebaseSearchHandler)
 	executor.register("browser_action", browserActionHandler)
 	executor.register("describe_image", describeImageHandler)
-	registerTypeScriptGatedTools(executor, workspaceRoot, options)
+	registerCodeIntelTools(executor, workspaceRoot, options, /* editCapable */ true)
+	registerRunTests(executor, workspaceRoot, options)
 	executor.registerTodoList()
 
 	executor.register("attempt_completion", attemptCompletionHandler)
@@ -1856,15 +1932,11 @@ function createReadCommandExecutor(workspaceRoot: string, options: ToolExecutorO
 	executor.register("list_files", listFilesHandler)
 	executor.register("execute_command", executeCommandHandler)
 	executor.register("browser_action", browserActionHandler)
-	// The four read-only code-intelligence tools (TS-only) follow the same
-	// language gate as the headless executor — a reviewer of a C++/Python
-	// workspace must not be handed ts.Program tools.
-	if (isTypeScriptWorkspace(workspaceRoot)) {
-		executor.register("outline", outlineHandler)
-		executor.register("go_to_definition", goToDefinitionHandler)
-		executor.register("find_references", findReferencesHandler)
-		executor.register("import_graph", importGraphHandler)
-	}
+	// The read-only code-intelligence tools follow the same per-language gate
+	// as the headless executor (editCapable=false → no rename_symbol) — a
+	// reviewer of a Python workspace must get the pyright-backed tools for
+	// `.py` files, not be handed nothing (or worse, ts.Program-only tools).
+	registerCodeIntelTools(executor, workspaceRoot, options, /* editCapable */ false)
 
 	executor.register("attempt_completion", attemptCompletionHandler)
 	executor.register("ask_followup_question", askFollowupQuestionHandler)

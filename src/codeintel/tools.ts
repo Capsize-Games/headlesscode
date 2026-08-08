@@ -26,7 +26,7 @@ const OUTLINE_DESCRIPTION = `List every top-level (and one level of nested) decl
 
 Use this instead of read_file when you only need a file's structure (symbol names, kinds, and line numbers) to plan where to read or what to call.
 
-Only works on TypeScript/JavaScript source files (.ts/.tsx/.mts/.cts/.js/.jsx). Non-TS files return a clear "not supported" result.
+Works on source files of any language this workspace has a code-intelligence backend for: TypeScript/JavaScript (.ts/.tsx/.mts/.cts/.js/.jsx) always, Python (.py) via a bundled language server, and more languages as backends are wired. A file whose language has no backend returns a clear "not supported" result.
 
 Parameters:
 - path: (required) Path to the source file, relative to the workspace root.
@@ -57,17 +57,17 @@ export const outlineTool = {
 
 // ─── go_to_definition ────────────────────────────────────────────────────────
 
-const GO_TO_DEFINITION_DESCRIPTION = `Resolve the definition of the symbol at a given line of a source file, using the TypeScript compiler's real symbol resolution (not a text search). Returns the real definition location(s) as "<file>:<line>:<column> <kind> <name> — <snippet of the definition line>" — one entry per definition; overloaded functions return ALL definitions. Definitions in vendored/d.ts/node_modules files are returned as their real locations.
+const GO_TO_DEFINITION_DESCRIPTION = `Resolve the definition of the symbol at a given line of a source file, using the language's real symbol resolution (the TypeScript compiler for TS/JS files, a language server for others — not a text search). Returns the real definition location(s) as "<file>:<line>:<column> <kind> <name> — <snippet of the definition line>" — one entry per definition; symbols with multiple declarations return ALL of them. Definitions in vendored/d.ts/node_modules (or the equivalent for other languages) are returned as their real locations.
 
 Use this to jump straight to where a symbol is actually defined instead of grep-ing for it.
 
-Only works on TypeScript/JavaScript source files. A symbol with no resolvable definition (ambient, any-typed, etc.) returns a clear "could not resolve" message.
+Works on source files of any language this workspace has a code-intelligence backend for (TypeScript/JavaScript always, Python via a bundled language server, …). A symbol with no resolvable definition returns a clear "could not resolve" message.
 
 Parameters:
 - path: (required) Path to the source file containing the symbol, relative to the workspace root.
 - line: (required) 1-based line number of the symbol.
 - character: (optional) 1-based column of the symbol within the line. Needed when the line has multiple symbols and you want a specific one; omit to use the symbol name or the first identifier on the line.
-- symbol: (optional) The symbol's name, used to disambiguate when the line has several identifiers (e.g. { "path": "src/foo.ts", "line": 12, "symbol": "bar" }). Ignored when character is given.
+- symbol: (optional) The symbol's name, used to disambiguate when the line has several identifiers (e.g. { "path": "src/engine/loop.ts", "line": 42, "symbol": "truncateHistory" }). Ignored when character is given.
 
 Example: go to the definition of the call on line 42: { "path": "src/engine/loop.ts", "line": 42, "symbol": "truncateHistory" }`
 
@@ -110,11 +110,11 @@ export const goToDefinitionTool = {
 
 // ─── find_references ─────────────────────────────────────────────────────────
 
-const FIND_REFERENCES_DESCRIPTION = `Find every real usage site of the symbol at a given line of a source file, using the TypeScript compiler's real reference resolution (not grep). Returns compact "<file>:<line> — <snippet of the line>" entries (the declaration site itself is included), so you can see all callers/uses without reading each file. Results are capped at 50 with a clear "N more references not shown" note — narrow your search to a more specific symbol if you need the rest.
+const FIND_REFERENCES_DESCRIPTION = `Find every real usage site of the symbol at a given line of a source file, using the language's real reference resolution (the TypeScript compiler for TS/JS files, a language server for others — not grep). Returns compact "<file>:<line> — <snippet of the line>" entries (the declaration site itself is included), so you can see all callers/uses without reading each file. Results are capped at 50 with a clear "N more references not shown" note — narrow your search to a more specific symbol if you need the rest.
 
 Use this to answer "who uses this symbol / what would this change affect".
 
-Only works on TypeScript/JavaScript source files.
+Works on source files of any language this workspace has a code-intelligence backend for (TypeScript/JavaScript always, Python via a bundled language server, …).
 
 Parameters:
 - path: (required) Path to the source file containing the symbol, relative to the workspace root.
@@ -163,18 +163,18 @@ export const findReferencesTool = {
 
 // ─── rename_symbol ───────────────────────────────────────────────────────────
 
-const RENAME_SYMBOL_DESCRIPTION = `Rename a symbol at a given line of a source file to a new name EVERYWHERE it's used across the workspace, as ONE atomic operation — either every call site updates or none do (on any failure, already-applied edits are rolled back and the error names the failing site). Uses the TypeScript compiler's real reference resolution (the same engine as find_references) to enumerate sites, so it is correct on overloads, re-exports, and aliased imports where a text find/replace would miss or wrongly hit.
+const RENAME_SYMBOL_DESCRIPTION = `Rename a symbol at a given line of a source file to a new name EVERYWHERE it's used across the workspace, as ONE atomic operation — either every call site updates or none do (on any failure, already-applied edits are rolled back and the error names the failing site). Uses the language's real reference resolution (the same engine as find_references — the TypeScript compiler for TS/JS files, a language server for others) to enumerate sites, so it is correct on overloads, re-exports, and aliased imports where a text find/replace would miss or wrongly hit.
 
 Use this instead of composing N separate apply_diff/search_replace edits when you need to rename a symbol used across multiple files — one call replaces the whole read-every-file + edit-every-file round trip.
 
-Only works on TypeScript/JavaScript source files, and refuses (with nothing changed) when any reference site lies outside the workspace root.
+Works on source files of any language this workspace has a code-intelligence backend for (TypeScript/JavaScript always, Python via a bundled language server, …), and refuses (with nothing changed) when any reference site lies outside the workspace root.
 
 Parameters:
 - path: (required) Path to the source file containing the symbol, relative to the workspace root.
 - line: (required) 1-based line number of the symbol.
 - character: (optional) 1-based column of the symbol within the line; omit to use the symbol name or the first identifier on the line.
 - symbol: (optional) The symbol's name, used to disambiguate when the line has several identifiers (e.g. { "path": "src/foo.ts", "line": 12, "symbol": "bar" }). Ignored when character is given.
-- new_name: (required) The new identifier to rename the symbol to (must be a valid TypeScript identifier).
+- new_name: (required) The new identifier to rename the symbol to (must be a valid identifier for the language).
 
 Example: rename the function on line 1 of src/util.ts to "compute": { "path": "src/util.ts", "line": 1, "symbol": "util", "new_name": "compute" }`
 
@@ -222,11 +222,11 @@ export const renameSymbolTool = {
 
 // ─── import_graph ────────────────────────────────────────────────────────────
 
-const IMPORT_GRAPH_DESCRIPTION = `Show a file's import relationships: (a) everything it imports, resolved to the REAL file paths the TypeScript compiler resolves them to (tsconfig paths aliases like "vscode" -> src/vendor/zoo-code/shim/vscode.ts included), and (b) everything that imports it (reverse lookup across the whole program). Static analysis of import/export declarations — deterministic and fast (the program-wide import map is cached).
+const IMPORT_GRAPH_DESCRIPTION = `Show a file's import relationships: (a) everything it imports, resolved to the REAL file paths (tsconfig paths aliases like "vscode" -> src/vendor/zoo-code/shim/vscode.ts included for TypeScript), and (b) everything that imports it (reverse lookup across the whole project). Static analysis of import/export declarations — deterministic and fast (the project-wide import map is cached).
 
 Use this to understand module dependencies before editing, or to find every file that depends on a module you're about to change.
 
-Only works on TypeScript/JavaScript source files.
+Available when this workspace has a TypeScript/JavaScript backend (the only backend that implements it today — LSP has no standard import-graph request). On a file of another language in a mixed workspace it returns a clear "not supported for this language yet" error.
 
 Parameters:
 - path: (required) Path to the source file, relative to the workspace root.
