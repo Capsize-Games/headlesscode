@@ -39,6 +39,18 @@ async function testNonDeepseekModelsAreNotPinned(): Promise<void> {
 	assert.equal(body.provider, undefined, "pinning to the deepseek provider for a non-deepseek model would be wrong")
 }
 
+/**
+ * `max_tokens` is emitted on the wire exactly when the request carries a
+ * `maxTokens` cap — the condensation path relies on this to always bound its
+ * output (the session now always resolves a condenseMaxTokens default).
+ */
+async function testRequestBodyEmitsMaxTokensWhenSet(): Promise<void> {
+	const body = buildRequestBody({ ...baseRequest, maxTokens: 4096 }, "deepseek/deepseek-v4-flash")
+	assert.equal(body.max_tokens, 4096, "max_tokens must be emitted when maxTokens is set")
+	const bare = buildRequestBody(baseRequest, "deepseek/deepseek-v4-flash")
+	assert.equal(bare.max_tokens, undefined, "max_tokens must be omitted when maxTokens is unset")
+}
+
 // ─── fetchModelContextWindow (Phase 3 condensation trigger) ─────────────────
 
 async function testFetchModelContextWindowParsesEndpoints(): Promise<void> {
@@ -596,6 +608,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["deepseek/* models are pinned to the official DeepSeek provider", testDeepseekModelsArePinnedToOfficialProvider],
 	["the pin applies to any deepseek/* model, not just one id", testDeepseekReasonerAlsoPinned],
 	["non-deepseek models are never pinned to the deepseek provider", testNonDeepseekModelsAreNotPinned],
+	["buildRequestBody emits max_tokens when set, omits it when unset", testRequestBodyEmitsMaxTokensWhenSet],
 	["deepseek/* requests include include_reasoning (load-bearing)", testDeepseekRequestIncludesReasoning],
 	["non-deepseek requests do not include include_reasoning", testNonDeepseekRequestsDoNotIncludeReasoning],
 	["deepseek/* requests send reasoning: { effort } when configured", testDeepseekRequestSendsReasoningEffort],

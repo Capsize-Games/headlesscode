@@ -117,6 +117,15 @@ export const CONDENSE_TARGET_CHARS = 6_000
 /** Hard cap on what the condensation response is ALLOWED to become. */
 export const MAX_CONDENSED_MESSAGE_CHARS = 16_000
 
+/**
+ * Default cap on the condensation call's OUTPUT tokens. Always sent on the
+ * wire (`max_tokens`) so a runaway reasoning generation can't burn unbounded
+ * tokens and then get rejected anyway by the `MAX_CONDENSED_MESSAGE_CHARS`
+ * post-generation check. 4096 is well above the 6,000-char target summary
+ * (`CONDENSE_TARGET_CHARS`) for typical output while bounding the worst case.
+ */
+export const DEFAULT_CONDENSE_MAX_TOKENS = 4096
+
 /** Cap on the raw oldest-turn chunk fed to the condensation call. */
 export const MAX_CONDENSE_INPUT_CHARS = 200_000
 

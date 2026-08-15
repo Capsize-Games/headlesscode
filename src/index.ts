@@ -19,7 +19,7 @@ main()
 export * from "./cli.js"
 export * from "./memory/index.js"
 export { OpenRouterClient, OpenRouterError, DEFAULT_MODEL } from "./llm/openrouter.js"
-export { HeadlessSession, truncateHistory } from "./engine/loop.js"
+export { HeadlessSession, truncateHistory, DEFAULT_MAX_TOKENS } from "./engine/loop.js"
 export {
 	maybeCondense,
 	condenseOldestTurns,
@@ -27,6 +27,7 @@ export {
 	computeCondensePlan,
 	DEFAULT_CONDENSE_THRESHOLD_FRACTION,
 	DEFAULT_CONDENSE_EARLY_FIRE_FRACTION,
+	DEFAULT_CONDENSE_MAX_TOKENS,
 	DEFAULT_CONTEXT_WINDOW_TOKENS,
 } from "./engine/condense.js"
 export {
