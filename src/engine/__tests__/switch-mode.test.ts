@@ -52,10 +52,14 @@ interface ScriptStep {
 class ScriptedLlmClient implements LlmClient {
 	requests: LlmRequest[] = []
 
-	constructor(private readonly script: ScriptStep[]) {}
+	constructor(
+		private readonly script: ScriptStep[],
+		private readonly onRequest?: (req: LlmRequest) => void,
+	) {}
 
 	async createChatCompletion(request: LlmRequest): Promise<LlmResponse> {
 		this.requests.push(request)
+		this.onRequest?.(request)
 		const step = this.script.shift()
 		if (!step) {
 			throw new Error("ScriptedLlmClient: script exhausted (model kept calling)")
@@ -522,6 +526,112 @@ async function testReadOnlyExecutorStillStubsSwitchMode(): Promise<void> {
 	}
 }
 
+/**
+ * A ScriptedLlmClient plus request-time snapshots of the system prompt
+ * (messages[0].content) for the first `count` requests. The loop mutates
+ * messages[0].content IN PLACE on a rebuild, so the raw request objects can't
+ * be compared after the run — capture the string at request time instead
+ * (strings are immutable, so each snapshot stays stable).
+ */
+function makeSnapshotClient(
+	script: ScriptStep[],
+	count: number,
+): { client: ScriptedLlmClient; snapshots: (string | null | undefined)[] } {
+	const snapshots: (string | null | undefined)[] = []
+	const client = new ScriptedLlmClient(script, (req) => {
+		if (snapshots.length < count) {
+			snapshots.push(req.messages[0]?.content)
+		}
+	})
+	return { client, snapshots }
+}
+
+async function testToolSetUnchangedSkipsPromptRebuild(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-switchmode-sametools-")
+	try {
+		// code and debug share the same groups (read/edit/command/mcp), so the
+		// target mode's tool set equals the current one. The system prompt must
+		// NOT be rebuilt and messages[0] must NOT be replaced — rewriting it
+		// would invalidate the provider's cached prompt prefix for the whole
+		// session. Asserted on what the client actually received across the
+		// switch boundary, not just internal state.
+		const { client, snapshots } = makeSnapshotClient(
+			[
+				{ message: toolCall("switch_mode", { mode_slug: "debug", reason: "same groups as code" }) },
+				{ message: toolCall("attempt_completion", { result: "done" }) },
+			],
+			2,
+		)
+		const session = await makeSession({
+			task: "switch to debug",
+			client,
+			workspaceRoot: ws,
+			autoApproveModeSwitch: true,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(session.state.mode, "debug", "state.mode must be the new mode")
+		assert.equal(
+			snapshots[1],
+			snapshots[0],
+			"messages[0] must be untouched when the target mode's tool set equals the current one",
+		)
+		// The switch still took effect in every other respect: mode label,
+		// visible transcript marker, result text, and the mode_switched event.
+		const marker = findModeSwitchMarker(session.state.messages, "debug")
+		assert.ok(marker, "a visible '[mode switched: code -> debug' marker must be in the transcript")
+		const callId = findSwitchModeCallId(session.state.messages)
+		const toolMsg = findToolResult(session.state.messages, callId)
+		assert.ok(toolMsg, "switch_mode tool result should be in history")
+		assert.match(toolMsg.content ?? "", /tool set unchanged/)
+		const feeds = await readAllEventFeeds(ws)
+		const records = [...feeds.values()].flat()
+		const switched = records.find((r) => r.type === "mode_switched")
+		assert.ok(switched, "expected a mode_switched event")
+		assert.equal(switched.from, "code")
+		assert.equal(switched.to, "debug")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testToolSetChangeRebuildsPrompt(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-switchmode-difftools-")
+	try {
+		// code → ask changes the tool set (ask drops the edit/command tools),
+		// so the system prompt IS rebuilt and messages[0] replaced — the
+		// original behavior must be preserved when the tool set differs.
+		const { client, snapshots } = makeSnapshotClient(
+			[
+				{ message: toolCall("switch_mode", { mode_slug: "ask", reason: "read-only" }) },
+				{ message: toolCall("attempt_completion", { result: "done" }) },
+			],
+			2,
+		)
+		const session = await makeSession({
+			task: "switch to ask",
+			client,
+			workspaceRoot: ws,
+			autoApproveModeSwitch: true,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(session.state.mode, "ask")
+		assert.notEqual(
+			snapshots[1],
+			snapshots[0],
+			"messages[0] must be rebuilt when the target mode's tool set differs",
+		)
+		// The transcript marker is still present (the rebuild-skip logic must
+		// not remove it on a real tool-set change).
+		assert.ok(findModeSwitchMarker(session.state.messages, "ask"), "marker present after a real tool-set change")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -535,6 +645,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["switch_mode: max-switches cap is a recoverable tool error (session continues)", testMaxModeSwitchesCapIsRecoverable],
 	["switch_mode: called alongside siblings is refused, sibling still executes", testSwitchModeRefusedWhenCalledAlongsideSiblings],
 	["switch_mode: read-only reviewer/QA executor still stubs it (regression)", testReadOnlyExecutorStillStubsSwitchMode],
+	["switch_mode: identical target tool set skips the prompt rebuild (messages[0] untouched)", testToolSetUnchangedSkipsPromptRebuild],
+	["switch_mode: differing target tool set rebuilds the prompt (messages[0] replaced)", testToolSetChangeRebuildsPrompt],
 ]
 
 async function main(): Promise<void> {
