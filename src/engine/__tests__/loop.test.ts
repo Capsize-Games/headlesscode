@@ -14,7 +14,13 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 
-import { HeadlessSession, isReadOnlyEquivalentShellCommand, truncateHistory, TRUNCATION_BATCH_SIZE } from "../loop.js"
+import {
+	HeadlessSession,
+	isReadOnlyEquivalentShellCommand,
+	stripStaleReasoning,
+	truncateHistory,
+	TRUNCATION_BATCH_SIZE,
+} from "../loop.js"
 import { OpenRouterError } from "../../llm/openrouter.js"
 import { createHeadlessExecutor } from "../../tools/executor.js"
 import { createCheckpointService } from "../../checkpoints/service.js"
@@ -1130,6 +1136,129 @@ async function testTruncateHistoryStablePrefixBetweenBatches(): Promise<void> {
 	)
 }
 
+// ─── stripStaleReasoning — stop re-billing reasoning tokens ──────────────────
+
+function reasoningAsst(prefix: string): ChatMessage {
+	return {
+		role: "assistant",
+		content: null,
+		tool_calls: [{ id: `call_${prefix}`, type: "function", function: { name: "read_file", arguments: "{}" } }],
+		reasoning: `${prefix} thinking`,
+	}
+}
+
+async function testStripStaleReasoningKeepsOnlyLastAssistant(): Promise<void> {
+	const a1 = reasoningAsst("a1")
+	const t1: ChatMessage = { role: "tool", tool_call_id: "call_a1", name: "read_file", content: "x" }
+	const a2 = reasoningAsst("a2")
+	const t2: ChatMessage = { role: "tool", tool_call_id: "call_a2", name: "read_file", content: "y" }
+	const a3 = reasoningAsst("a3")
+	const t3: ChatMessage = { role: "tool", tool_call_id: "call_a3", name: "read_file", content: "z" }
+	const input: ChatMessage[] = [
+		{ role: "system", content: "sys" },
+		{ role: "user", content: "task" },
+		a1,
+		t1,
+		a2,
+		t2,
+		a3,
+		t3,
+	]
+	const out = stripStaleReasoning(input)
+	assert.notEqual(out, input, "stripping must produce a new array when something changed")
+	const assistants = out.filter((m) => m.role === "assistant")
+	assert.equal(assistants.length, 3, "all assistant messages survive the strip")
+	assert.equal(assistants[0]!.reasoning, undefined, "completed chain A1's reasoning is stripped")
+	assert.equal(assistants[1]!.reasoning, undefined, "completed chain A2's reasoning is stripped")
+	assert.equal(assistants[2]!.reasoning, "a3 thinking", "the active chain head A3 keeps its reasoning")
+	assert.equal(assistants[0]!.tool_calls?.length, 1, "tool_calls survive the strip")
+	assert.equal((out.find((m) => m.role === "tool") as ChatMessage).content, "x", "tool results are untouched")
+}
+
+async function testStripStaleReasoningNoOpWithoutReasoning(): Promise<void> {
+	const msgs: ChatMessage[] = [
+		{ role: "system", content: "sys" },
+		{ role: "user", content: "task" },
+		reasoningAsst("a1"),
+		{ role: "tool", tool_call_id: "call_a1", name: "read_file", content: "x" },
+	]
+	const noReasoning = msgs.map((m) => {
+		if (m.role === "assistant") {
+			const { reasoning: _drop, ...rest } = m
+			return rest
+		}
+		return m
+	})
+	assert.equal(stripStaleReasoning(noReasoning), noReasoning, "nothing to strip -> same array (no churn)")
+}
+
+async function testStripStaleReasoningNonMutating(): Promise<void> {
+	const a1 = reasoningAsst("a1")
+	const input: ChatMessage[] = [
+		{ role: "system", content: "sys" },
+		{ role: "user", content: "task" },
+		a1,
+		{ role: "tool", tool_call_id: "call_a1", name: "read_file", content: "x" },
+		reasoningAsst("a2"),
+	]
+	const snapshot = JSON.stringify(input)
+	stripStaleReasoning(input)
+	assert.equal(JSON.stringify(input), snapshot, "the long-term message state must never be mutated in place")
+	assert.equal(a1.reasoning, "a1 thinking", "the original assistant object is untouched")
+}
+
+async function testStaleReasoningStrippedFromLoopRequests(): Promise<void> {
+	// End-to-end: after two completed tool-call chains, the third request must
+	// carry the FIRST chain's assistant message with reasoning STRIPPED while
+	// the active chain head (the last assistant message) keeps its reasoning.
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-reason-"))
+	try {
+		const client = new FakeLlmClient([
+			() => ({
+				role: "assistant",
+				content: null,
+				tool_calls: [
+					{ id: "call_1", type: "function", function: { name: "write_to_file", arguments: JSON.stringify({ path: "a.txt", content: "a" }) } },
+				],
+				reasoning: "R1: writing file a",
+			}),
+			() => ({
+				role: "assistant",
+				content: null,
+				tool_calls: [
+					{ id: "call_2", type: "function", function: { name: "write_to_file", arguments: JSON.stringify({ path: "b.txt", content: "b" }) } },
+				],
+				reasoning: "R2: writing file b",
+			}),
+			() => textReply("Done."),
+		])
+		const session = await makeSession({ task: "write two files then finish", client, workspaceRoot: ws })
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.ok(client.requests.length >= 3, `expected at least 3 requests, got ${client.requests.length}`)
+
+		const third = client.requests[2]!.messages
+		const assistants = third.filter((m) => m.role === "assistant")
+		assert.equal(assistants.length, 2, "two assistant messages in the third request")
+		assert.equal(
+			assistants[0]!.reasoning,
+			undefined,
+			"the first (completed) chain's reasoning must be stripped from the request",
+		)
+		assert.equal(
+			assistants[1]!.reasoning,
+			"R2: writing file b",
+			"the active chain head's reasoning must still be echoed",
+		)
+		// The long-term session state must keep the reasoning (the strip is
+		// request-only): find the FIRST assistant message in session state.
+		const stateAssistants = session.state.messages.filter((m) => m.role === "assistant")
+		assert.equal(stateAssistants[0]!.reasoning, "R1: writing file a", "session state keeps reasoning untouched")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // Diff markers built via concatenation (not literal template text) so the
 // harness's own diff parser never mistakes them for real SEARCH/REPLACE
 // markers in this test file.
@@ -1434,6 +1563,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["truncateHistory: evicts in TRUNCATION_BATCH_SIZE-sized batches", testTruncateHistoryEvictsInBatches],
 	["truncateHistory: never splits an assistant tool_calls / tool response group", testTruncateHistoryNeverSplitsToolCallGroup],
 	["truncateHistory: prefix stays stable across a batch (cache-eligible)", testTruncateHistoryStablePrefixBetweenBatches],
+	["stripStaleReasoning: keeps only the last assistant message's reasoning", testStripStaleReasoningKeepsOnlyLastAssistant],
+	["stripStaleReasoning: no-op (same array) when nothing to strip", testStripStaleReasoningNoOpWithoutReasoning],
+	["stripStaleReasoning: never mutates the long-term message state", testStripStaleReasoningNonMutating],
+	["stripStaleReasoning: stale reasoning stripped from live loop requests", testStaleReasoningStrippedFromLoopRequests],
 	["Part E: live pricing feeds the session's BudgetTracker", testBudgetUsesLivePricingWhenAvailable],
 	["Part E: no live pricing → hardcoded table fallback, unchanged behavior", testBudgetFallsBackToHardcodedTableWithoutLivePricing],
 ]

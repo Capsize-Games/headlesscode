@@ -521,10 +521,11 @@ export interface HeadlessSessionConfig {
 	 * Graded reasoning effort for deepseek/* models (issue #30 experiment):
 	 * low/medium/high/max (native DeepSeek levels; max is normalized to
 	 * OpenRouter's "xhigh" on the wire) or "xhigh" directly. Optional — when
-	 * unset, no `reasoning.effort` is sent and the endpoint's default applies
-	 * (pre-existing behavior). Resolved by the CLI from the `_reasoning_effort`
-	 * key in mode-models.json then $HEADLESSCODE_REASONING_EFFORT; falls back
-	 * to the env var here for direct construction.
+	 * unset, no `reasoning.effort` is sent and the endpoint's default applies.
+	 * Resolved by the CLI from the `_reasoning_effort` key in mode-models.json,
+	 * then $HEADLESSCODE_REASONING_EFFORT, then the built-in per-mode default
+	 * (code -> "low", see src/config/mode-models.ts); falls back to the env
+	 * var here for direct construction.
 	 */
 	reasoningEffort?: string
 	/** Sliding-window cap on messages sent per request (default 40). */
@@ -2320,6 +2321,20 @@ export class HeadlessSession {
 				throw err
 			}
 			requestMessages = truncateHistory(requestMessages, this.config.windowSize)
+			// Streaming-and-reasoning (stop re-billing reasoning tokens): drop
+			// the echoed `reasoning` from every assistant history message EXCEPT
+			// the last one before the request goes out. DeepSeek's official
+			// endpoint only needs prior reasoning echoed on the immediately-
+			// preceding assistant message in the ACTIVE tool-call chain — the
+			// completed chains' thinking text is re-sent purely at input-token
+			// cost (measured 2-10x the visible output per turn, re-billed as
+			// input on every later request). Probe-verified 2026-08-15 against
+			// the pinned endpoint (2- and 3-turn tool-call conversations): 200
+			// with only the active head's reasoning echoed, chain continues
+			// normally; even a full strip is accepted, but the active head is
+			// kept as the conservative default (see stripStaleReasoning). Non-
+			// mutating — the long-term `messages` state keeps its fields.
+			requestMessages = stripStaleReasoning(requestMessages)
 
 			// 4. Call the LLM with an abort timeout. Retried ONCE on a classified
 			// transient provider error (see isRetryableOpenRouterError) — this
@@ -2451,11 +2466,14 @@ export class HeadlessSession {
 				)
 			}
 
-			// 5. Append the assistant message. Reasoning is echoed back on the
-			// assistant history message (OpenRouter accepts it and providers
+			// 5. Append the assistant message. Reasoning is echoed back onto the
+			// long-term history message (OpenRouter accepts it and providers
 			// like native DeepSeek drop prior reasoning if it is not echoed on
-			// assistant messages within tool-call turns — see api-docs.deepseek.com
-			// /guides/thinking_mode). Harmless for providers that ignore it.
+			// assistant messages within tool-call turns — see
+			// api-docs.deepseek.com /guides/thinking_mode). The per-request
+			// assembly then strips stale reasoning from completed chains before
+			// re-sending (see stripStaleReasoning) — this field is what keeps
+			// the ACTIVE chain head's reasoning available to the next turn.
 			const assistantMessage: ChatMessage = {
 				role: "assistant",
 				content: assistant.content ?? null,
@@ -3397,6 +3415,50 @@ export function summarizeToolArg(name: string, args: Record<string, unknown>): s
 		default:
 			return undefined
 	}
+}
+
+/**
+ * Streaming-and-reasoning (stop re-billing reasoning tokens): strip the
+ * `reasoning` field from every assistant history message EXCEPT the last one
+ * before a request is sent. DeepSeek's official endpoint only needs prior
+ * reasoning echoed on the immediately-preceding assistant message in the
+ * ACTIVE tool-call chain — the assistant message whose tool results form the
+ * conversation tail (probe-verified 2026-08-15 against the pinned endpoint:
+ * a 3-turn tool-call conversation re-sent with ONLY the active head's
+ * reasoning kept returns 200 and continues the chain; the completed chains'
+ * thinking is not load-bearing). The active head is deliberately kept (not
+ * stripped) even though a full strip is also accepted: DeepSeek's thinking-
+ * mode docs say prior reasoning within an active tool-call turn is dropped
+ * if not echoed, so the head's reasoning may carry mid-chain state the next
+ * turn relies on — older turns' reasoning carries none.
+ *
+ * Non-mutating: returns the same array when nothing changes, otherwise a new
+ * array with fresh message objects for the stripped entries. The long-term
+ * message state must stay byte-identical across calls for prompt-cache /
+ * condensation-prefix stability (see messagesPrefixEquals), so request
+ * assembly copies rather than edits in place.
+ */
+export function stripStaleReasoning(messages: ChatMessage[]): ChatMessage[] {
+	let lastAssistantIndex = -1
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (messages[i]!.role === "assistant") {
+			lastAssistantIndex = i
+			break
+		}
+	}
+	if (lastAssistantIndex < 0) {
+		return messages
+	}
+	let changed = false
+	const out = messages.map((msg, i) => {
+		if (i !== lastAssistantIndex && msg.role === "assistant" && msg.reasoning !== undefined) {
+			changed = true
+			const { reasoning: _drop, ...rest } = msg
+			return rest
+		}
+		return msg
+	})
+	return changed ? out : messages
 }
 
 /** Batch size for truncateHistory's eviction — see its own doc comment for why. */

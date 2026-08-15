@@ -241,6 +241,59 @@ async function testReasoningEffortModeEntriesNotConsulted(): Promise<void> {
 	}
 }
 
+async function testReasoningEffortBuiltinCodeDefault(): Promise<void> {
+	// No config key, no env: the built-in per-mode default applies for the
+	// routine `code` mode only (issue #30 extension — routine turns should
+	// generate less thinking text).
+	const repo = await tmpRepo()
+	try {
+		const resolved = resolveReasoningEffortForMode({ workspaceRoot: repo, mode: "code", env: {} })
+		assert.equal(resolved, "low", "code mode defaults to low when nothing is configured")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testReasoningEffortBuiltinDefaultSkipsReviewModes(): Promise<void> {
+	// review/QA/architect roles are deliberately NOT in the built-in default
+	// map — their value is the deep reasoning, so they keep the endpoint's own
+	// default (unset) unless a repo explicitly configures one.
+	const repo = await tmpRepo()
+	try {
+		for (const mode of ["deepseek-reviewer", "qa-agent", "architect", "debug", "ask"]) {
+			const resolved = resolveReasoningEffortForMode({ workspaceRoot: repo, mode, env: {} })
+			assert.equal(resolved, undefined, `mode '${mode}' must keep the endpoint default (unset)`)
+		}
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testReasoningEffortConfigStillBeatsBuiltinDefault(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		await writeConfig(repo, JSON.stringify({ _reasoning_effort: "high" }))
+		const resolved = resolveReasoningEffortForMode({ workspaceRoot: repo, mode: "code", env: {} })
+		assert.equal(resolved, "high", "an explicit _reasoning_effort key beats the built-in code default")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testReasoningEffortEnvStillBeatsBuiltinDefault(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const resolved = resolveReasoningEffortForMode({
+			workspaceRoot: repo,
+			mode: "code",
+			env: { HEADLESSCODE_REASONING_EFFORT: "medium" },
+		})
+		assert.equal(resolved, "medium", "an explicit env value beats the built-in code default")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 // ─── Missing file = zero-config ──────────────────────────────────────────────
 
 async function testMissingFileFallsThroughToEnv(): Promise<void> {
@@ -342,6 +395,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["_reasoning_effort: env used when key absent", testReasoningEffortEnvUsedWhenKeyAbsent],
 	["_reasoning_effort: nothing configured -> undefined", testReasoningEffortNothingConfiguredReturnsUndefined],
 	["_reasoning_effort: mode entries are never consulted", testReasoningEffortModeEntriesNotConsulted],
+	["_reasoning_effort: built-in code default is low", testReasoningEffortBuiltinCodeDefault],
+	["_reasoning_effort: built-in default skips review/QA/architect", testReasoningEffortBuiltinDefaultSkipsReviewModes],
+	["_reasoning_effort: config key beats built-in default", testReasoningEffortConfigStillBeatsBuiltinDefault],
+	["_reasoning_effort: env beats built-in default", testReasoningEffortEnvStillBeatsBuiltinDefault],
 	["missing file falls through to env (zero-config)", testMissingFileFallsThroughToEnv],
 	["missing file with no env -> undefined", testMissingFileWithNoEnvReturnsUndefined],
 	["malformed JSON throws clearly", testMalformedJsonThrowsClearly],

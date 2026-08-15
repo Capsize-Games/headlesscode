@@ -769,7 +769,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 			// --dry-run catches a bad value (e.g. a typo in the env var or
 			// mode-models.json `_reasoning_effort` key) BEFORE the experiment
 			// burns any real LLM calls. A throw lands in the catch below.
-			const dryRunEffort = resolveReasoningEffortForMode({ workspaceRoot, env: process.env })
+			const dryRunEffort = resolveReasoningEffortForMode({ workspaceRoot, mode: options.mode, env: process.env })
 			parseReasoningEffort(dryRunEffort)
 
 			process.stdout.write(built.prompt + "\n")
@@ -865,7 +865,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// surface to keep in sync. Validated here so a typo fails at startup
 	// (exit 2) with a clear message instead of mid-session on the first LLM
 	// call (fail-loudly, same idiom as mode-models.ts).
-	const reasoningEffort = resolveReasoningEffortForMode({ workspaceRoot, env: process.env })
+	const reasoningEffort = resolveReasoningEffortForMode({ workspaceRoot, mode: options.mode, env: process.env })
 	try {
 		parseReasoningEffort(reasoningEffort)
 	} catch (err) {

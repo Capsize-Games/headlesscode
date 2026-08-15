@@ -36,6 +36,7 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 
 import { resolveProjectDataDir } from "../project-store.js"
+import type { WireReasoningEffort } from "../llm/openrouter.js"
 
 /** Config file basename inside the central project data dir. */
 export const MODE_MODELS_CONFIG_FILE = "mode-models.json"
@@ -169,28 +170,57 @@ export const REASONING_EFFORT_KEY = "_reasoning_effort"
 
 export interface ResolveReasoningEffortOptions {
 	workspaceRoot: string
+	/**
+	 * Mode slug for the session. Only used for the BUILT-IN per-mode default
+	 * (applied when neither the config key nor the env var is set); absent =
+	 * no built-in default, exactly the pre-existing behavior.
+	 */
+	mode?: string
 	/** Env to read HEADLESSCODE_REASONING_EFFORT from (default: process.env). */
 	env?: NodeJS.ProcessEnv
 }
 
 /**
+ * Built-in per-mode reasoning-effort defaults (issue #30 experiment, extended):
+ * applied ONLY when neither the `_reasoning_effort` config key nor
+ * `$HEADLESSCODE_REASONING_EFFORT` is set. Routine editing/exploring modes
+ * default to "low" so everyday turns produce less thinking text — reasoning is
+ * the single largest recurring input-token cost in a long session (measured
+ * 2-10x the visible output, re-billed as input on every later turn). Review/
+ * QA/architect modes are deliberately ABSENT here: their whole value is the
+ * deep reasoning, so they keep the endpoint's own default (unset), and any
+ * mode can still be overridden repo-wide via the config key / env.
+ */
+const BUILTIN_REASONING_EFFORT_BY_MODE: Partial<Record<string, WireReasoningEffort>> = {
+	code: "low",
+}
+
+/**
  * Resolve the session's graded reasoning effort (issue #30 experiment) from
  * the central `mode-models.json` `_reasoning_effort` key (beats env), then
- * `$HEADLESSCODE_REASONING_EFFORT`, then `undefined` — no effort sent, the
- * endpoint's undeclared default applies (pre-existing behavior). The value is
- * a plain string in the same `Record<string, string>` format as model ids, so
- * no format change is needed. The caller validates/normalizes the value
- * (parseReasoningEffort in src/llm/openrouter.ts); a missing file/key/env is
- * NOT an error — zero config means zero behavior change.
+ * `$HEADLESSCODE_REASONING_EFFORT`, then the built-in per-mode default (see
+ * BUILTIN_REASONING_EFFORT_BY_MODE — only when `mode` is passed), then
+ * `undefined` — no effort sent, the endpoint's undeclared default applies.
+ * The value is a plain string in the same `Record<string, string>` format as
+ * model ids, so no format change is needed. The caller validates/normalizes
+ * the value (parseReasoningEffort in src/llm/openrouter.ts); a missing
+ * file/key/env is NOT an error — zero config means only the built-in default
+ * (if any) applies, never a hard failure.
  */
 export function resolveReasoningEffortForMode(options: ResolveReasoningEffortOptions): string | undefined {
-	const { workspaceRoot, env = process.env } = options
+	const { workspaceRoot, mode, env = process.env } = options
 	const file = loadModeModelsFile(workspaceRoot)
 	if (file !== null && typeof file[REASONING_EFFORT_KEY] === "string") {
 		return file[REASONING_EFFORT_KEY]
 	}
 	const envValue = env.HEADLESSCODE_REASONING_EFFORT
-	return envValue === undefined || envValue === "" ? undefined : envValue
+	if (envValue !== undefined && envValue !== "") {
+		return envValue
+	}
+	if (mode !== undefined) {
+		return BUILTIN_REASONING_EFFORT_BY_MODE[mode]
+	}
+	return undefined
 }
 
 /**
