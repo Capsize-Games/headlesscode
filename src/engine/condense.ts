@@ -168,6 +168,10 @@ export function buildCondensedMessage(summary: string): ChatMessage {
  * delimited, with an explicit target size.
  */
 export function buildCondenseUserPrompt(chunk: ChatMessage[], targetChars: number): string {
+	// Deliberately omit `reasoning` from the transcript: it is disposable (the
+	// model already spent its generation on it) and reading it only inflates
+	// this call's own input cost. estimateMessageChars still counts it for
+	// SIZING — the summarizer just doesn't need to read it.
 	const transcript = chunk
 		.map((m) => {
 			const head =
@@ -311,6 +315,9 @@ export function skipOrphanedToolMessages(messages: ChatMessage[], from: number):
 /** Rough character-length estimate of one message (cheap, monotonic). */
 export function estimateMessageChars(m: ChatMessage): number {
 	let chars = typeof m.content === "string" ? m.content.length : 0
+	// Reasoning is echoed onto outgoing history and costs real prompt tokens —
+	// count it or sizing under-estimates reasoning-heavy sessions.
+	chars += m.reasoning?.length ?? 0
 	if (m.tool_calls) {
 		for (const c of m.tool_calls) {
 			chars += (c.function?.name?.length ?? 0) + (c.function?.arguments?.length ?? 0) + 8

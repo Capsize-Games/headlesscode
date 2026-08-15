@@ -34,6 +34,7 @@ import {
 	computeCondenseCount,
 	computeEvictCount,
 	condenseOldestTurns,
+	estimateMessageChars,
 	DEFAULT_CONDENSE_THRESHOLD_FRACTION,
 	DEFAULT_CONTEXT_WINDOW_TOKENS,
 	maybeCondense,
@@ -267,6 +268,71 @@ function testCondenseUserPromptDelimitsAndCaps(): void {
 	assert.match(prompt, /TRANSCRIPT END/)
 	assert.match(prompt, /file-0\.txt/, "the prompt must contain the actual file paths being condensed")
 	assert.match(prompt, /4000 characters/, "the prompt must carry the target size")
+}
+
+function testCondenseUserPromptOmitsReasoning(): void {
+	// The condensation call must NOT be asked to read the model's reasoning —
+	// it is disposable and would only inflate the summarizer's own input cost.
+	const chunk: ChatMessage[] = [
+		{ role: "assistant", content: "I read the file", reasoning: "THINKING_SECRET: weigh every alternative before answering" },
+		{ role: "user", content: "continue" },
+	]
+	const prompt = buildCondenseUserPrompt(chunk, 4000)
+	assert.match(prompt, /I read the file/, "the transcript must carry the message content")
+	assert.doesNotMatch(prompt, /THINKING_SECRET/, "reasoning must NOT be transcribed into the condensation prompt")
+}
+
+function testEstimateMessageCharsCountsReasoning(): void {
+	// A message carrying `reasoning` must size LARGER than the same message
+	// without it — reasoning is real prompt-token weight once echoed onto
+	// history. Exact delta: the reasoning length.
+	const base: ChatMessage = { role: "assistant", content: "hello" }
+	const withReasoning: ChatMessage = { role: "assistant", content: "hello", reasoning: "x".repeat(500) }
+	assert.equal(estimateMessageChars(withReasoning), estimateMessageChars(base) + 500)
+	// Reasoning is counted even when content is null (a pure tool-call turn).
+	const toolOnly: ChatMessage = {
+		role: "assistant",
+		content: null,
+		reasoning: "r".repeat(123),
+		tool_calls: [{ id: "c1", type: "function", function: { name: "read_file", arguments: "{}" } }],
+	}
+	const toolOnlyNoReasoning: ChatMessage = { role: "assistant", content: null, tool_calls: toolOnly.tool_calls }
+	assert.equal(estimateMessageChars(toolOnly), estimateMessageChars(toolOnlyNoReasoning) + 123)
+}
+
+function testComputeCondenseCountCountsReasoningTowardBudget(): void {
+	// The SAME fixed token budget must fold FEWER messages when the history
+	// carries reasoning: counting it makes each message consume its true share
+	// of the budget instead of treating the reasoning payload as free, so the
+	// loop no longer folds far past the intended token budget.
+	const stripped = buildTurnHistory(40)
+	const withReasoning = stripped.map((m) => (m.role === "assistant" ? { ...m, reasoning: "r".repeat(2000) } : m))
+	const wantTokens = 200 // budget = 200 * 8 = 1600 chars
+	const countWith = computeCondenseCount(withReasoning, wantTokens)
+	const countStripped = computeCondenseCount(stripped, wantTokens)
+	assert.ok(
+		countWith < countStripped,
+		`reasoning must consume budget: folded ${countWith} messages vs ${countStripped} when reasoning is ignored`,
+	)
+	// The folded chunk's real size (reasoning included) lands within the
+	// intended budget plus the always-folded first turn, and the reasoning
+	// length is accounted for EXACTLY in the estimate.
+	const budgetChars = wantTokens * 8
+	const foldedWith = withReasoning.slice(2, 2 + countWith)
+	const foldedStripped = stripped.slice(2, 2 + countWith)
+	const realWith = foldedWith.reduce((sum, m) => sum + estimateMessageChars(m), 0)
+	const realStripped = foldedStripped.reduce((sum, m) => sum + estimateMessageChars(m), 0)
+	const reasoningContribution = foldedWith.reduce((sum, m) => sum + (m.reasoning?.length ?? 0), 0)
+	const firstTurnOvershoot = estimateMessageChars(withReasoning[2]) + estimateMessageChars(withReasoning[3])
+	assert.ok(
+		realWith <= budgetChars + firstTurnOvershoot,
+		`folded real size ${realWith} must stay within budget ${budgetChars} (plus the always-folded first turn)`,
+	)
+	assert.equal(
+		realWith - realStripped,
+		reasoningContribution,
+		"the size difference must be exactly the reasoning being counted",
+	)
 }
 
 // ─── maybeCondense unit-level (boundary + stability + accounting) ───────────
@@ -848,6 +914,9 @@ const tests: Array<[string, () => Promise<void> | void]> = [
 	["skipOrphanedToolMessages: skips leading tool messages", testSkipOrphanedToolMessagesSkipsLeadingTools],
 	["buildCondensedMessage: synthetic message is a user message", testBuildCondensedMessageIsUserRole],
 	["buildCondenseUserPrompt: delimits the transcript and carries the target", testCondenseUserPromptDelimitsAndCaps],
+	["buildCondenseUserPrompt: omits reasoning from the transcript", testCondenseUserPromptOmitsReasoning],
+	["estimateMessageChars: counts reasoning toward the size", testEstimateMessageCharsCountsReasoning],
+	["computeCondenseCount: reasoning consumes the fold budget (no free lunch)", testComputeCondenseCountCountsReasoningTowardBudget],
 	["maybeCondense: below threshold -> NO condensation call (call counter)", testMaybeCondenseBelowThresholdNoCall],
 	["maybeCondense: above threshold -> summary + shorter history + usage surfaced", testMaybeCondenseAboveThresholdSummarizesAndShrinks],
 	["maybeCondense: batch-once stability (same head never re-condensed)", testMaybeCondenseRespectsBatchOnceStability],
