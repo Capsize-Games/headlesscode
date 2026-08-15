@@ -325,12 +325,27 @@ export function loadStateSync(statePath: string): OrchestratorState {
 	return sanitize(JSON.parse(raw))
 }
 
+/**
+ * Unique sibling temp path for an atomic state write. The pid + counter
+ * suffix keeps concurrent saves — even in-process, e.g. across watcher
+ * callbacks — from ever sharing a temp file, which would race their renames.
+ */
+let stateWriteCounter = 0
+function stateTmpPath(statePath: string): string {
+	return `${statePath}.tmp-${process.pid}-${++stateWriteCounter}`
+}
+
 /** Write the state file (pretty-printed + trailing newline), creating dirs. */
 export async function saveState(statePath: string, state: OrchestratorState): Promise<void> {
 	const cleaned = sanitize(state)
 	cleaned.updated = new Date().toISOString()
 	await fsp.mkdir(path.dirname(statePath), { recursive: true })
-	await fsp.writeFile(statePath, JSON.stringify(cleaned, null, 2) + "\n", "utf-8")
+	// Atomic write: temp sibling + rename, so a crash mid-write can never
+	// truncate the one file treated as the round's source of truth (rename is
+	// atomic on the same filesystem — the temp lives next to the target).
+	const tmpPath = stateTmpPath(statePath)
+	await fsp.writeFile(tmpPath, JSON.stringify(cleaned, null, 2) + "\n", "utf-8")
+	await fsp.rename(tmpPath, statePath)
 }
 
 /** Synchronous variant of saveState. */
@@ -338,7 +353,9 @@ export function saveStateSync(statePath: string, state: OrchestratorState): void
 	const cleaned = sanitize(state)
 	cleaned.updated = new Date().toISOString()
 	fs.mkdirSync(path.dirname(statePath), { recursive: true })
-	fs.writeFileSync(statePath, JSON.stringify(cleaned, null, 2) + "\n", "utf-8")
+	const tmpPath = stateTmpPath(statePath)
+	fs.writeFileSync(tmpPath, JSON.stringify(cleaned, null, 2) + "\n", "utf-8")
+	fs.renameSync(tmpPath, statePath)
 }
 
 /**

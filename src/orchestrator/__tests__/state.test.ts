@@ -108,6 +108,23 @@ async function testSyncVariants(): Promise<void> {
 	assert.deepEqual(state.groups, [])
 }
 
+/** E4: atomic write-to-temp-then-rename leaves no `.tmp-*` residue. */
+async function testNoTempResidueAfterAtomicSave(): Promise<void> {
+	const p = await tmpStatePath()
+	await saveState(p, defaultState("atomic-async"))
+	await saveStateSync(p, defaultState("atomic-sync"))
+
+	// The async write's content was replaced by the sync write — the file
+	// round-trips the LATEST state, and both writes must have renamed their
+	// temp files away cleanly.
+	const state = await loadState(p)
+	assert.equal(state.batch, "atomic-sync")
+
+	const dirEntries = await fs.readdir(path.dirname(p))
+	const leftovers = dirEntries.filter((name) => name.includes(".tmp"))
+	assert.deepEqual(leftovers, [], `no temp file may remain after a successful atomic save (found: ${leftovers.join(", ")})`)
+}
+
 /** Resolve tsx by walking up ancestor node_modules/.bin/ (same as scripts/run-tests.mjs). */
 function resolveTsxBin(dir: string): string {
 	let current = dir
@@ -188,6 +205,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["invalid JSON throws", testLoadInvalidJsonThrows],
 	["updateGroup upserts by name, merges, immutable", testUpdateGroupUpsertsAndMerges],
 	["sync load/save variants", testSyncVariants],
+	["atomic save leaves no .tmp residue (async + sync)", testNoTempResidueAfterAtomicSave],
 	["patchGroup survives two concurrent OS processes racing the same state file (issue #43)", testPatchGroupSurvivesTwoConcurrentProcesses],
 ]
 

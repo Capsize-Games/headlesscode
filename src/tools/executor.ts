@@ -119,6 +119,14 @@ if (BASH_PATH === undefined) {
 export const MAX_RESULT_CHARS = 30_000
 
 /**
+ * Per-stream accumulation cap for execute_command output. The small margin
+ * above MAX_RESULT_CHARS guarantees the final combined string always exceeds
+ * the cap, so truncate()'s "output truncated" trailer still fires (a combined
+ * string exactly at the cap would be returned unchanged, silently losing it).
+ */
+const MAX_COMMAND_STREAM_CHARS = MAX_RESULT_CHARS + 1024
+
+/**
  * Default read_file slice-mode line limit when the model passes no explicit
  * `limit`. 600 lines, down from the vendored tool-schema default of 2000: a
  * no-arg broad read historically pulled up to ~30k chars (~7-8k tokens) of
@@ -540,10 +548,18 @@ type ReadFileCacheKey = {
 	windowLines?: number
 }
 
-/** One cache entry: the content hash from the last real read + streak state. */
+/** One cache entry: content identity (hash + size + mtime) + streak state. */
 type ReadFileCacheEntry = {
 	/** sha256 of the file content as of the last real read of this key. */
 	hash: string
+	/** File size at the last real read — half of the fast-path identity. */
+	size: number
+	/**
+	 * mtime at the last real read — the other half of the fast-path identity.
+	 * mtimeMs (float, sub-ms precision) is the highest-resolution mtime this
+	 * Node exposes on a non-bigint stat (mtimeNs needs { bigint: true }).
+	 */
+	mtimeMs: number
 	/**
 	 * Whether the last read of this key was already served as a cache-hit
 	 * message. When true, the next identical call serves real content again
@@ -601,6 +617,22 @@ function readFileHandler(
 		const indentation = args.indentation as Record<string, unknown> | undefined
 		const windowLines = mode === "indentation" ? toNonNegativeInt(indentation?.["max_lines"], DEFAULT_INDENTATION_WINDOW_LINES) : undefined
 
+		const key = makeReadFileCacheKey({ target, mode, offset, limit, windowLines })
+
+		// Trust model: unchanged size AND mtime ⇒ identical content, so the
+		// cached hash can be reused without re-reading the file; any mismatch
+		// (including a same-length rewrite, which changes mtime) falls back to
+		// a full read + sha256 below.
+		if (
+			cache !== undefined &&
+			!cache.toldUnchanged &&
+			cache.size === stat.size &&
+			cache.mtimeMs === stat.mtimeMs
+		) {
+			cache.toldUnchanged = true
+			return ok(READ_FILE_CACHE_HIT_MESSAGE)
+		}
+
 		let content: string
 		try {
 			content = await fsp.readFile(target, "utf-8")
@@ -610,7 +642,6 @@ function readFileHandler(
 
 		// Cache-check the CURRENT on-disk content (never "no write tool was
 		// called"): identical args + identical hash => byte-identical output.
-		const key = makeReadFileCacheKey({ target, mode, offset, limit, windowLines })
 		const currentHash = hashFileContent(content)
 		if (cache !== undefined && cache.hash === currentHash && !cache.toldUnchanged) {
 			cache.toldUnchanged = true
@@ -628,9 +659,9 @@ function readFileHandler(
 			result = ok(formatFileSlice(rel, allLines, Math.max(1, offset), limit))
 		}
 
-		// Serve (or re-serve) real content; record hash + reset the hit flag so
-		// the next identical call may short-circuit once more.
-		entry.set(key, { hash: currentHash, toldUnchanged: false })
+		// Serve (or re-serve) real content; record identity + reset the hit
+		// flag so the next identical call may short-circuit once more.
+		entry.set(key, { hash: currentHash, size: stat.size, mtimeMs: stat.mtimeMs, toldUnchanged: false })
 		return result
 	})()
 }
@@ -1252,13 +1283,15 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 			child.stdout?.on("data", (chunk) => {
 				// After a timeout the model already got its partial output; keep
 				// draining the pipe (so the child never blocks on a full buffer)
-				// but stop accumulating output we can no longer deliver.
-				if (!timedOut) {
+				// but stop accumulating output we can no longer deliver. Once a
+				// stream hits its cap, keep draining but discard — the final
+				// truncation/summarization at close stays the single cut point.
+				if (!timedOut && stdout.length < MAX_COMMAND_STREAM_CHARS) {
 					stdout += chunk.toString()
 				}
 			})
 			child.stderr?.on("data", (chunk) => {
-				if (!timedOut) {
+				if (!timedOut && stderr.length < MAX_COMMAND_STREAM_CHARS) {
 					stderr += chunk.toString()
 				}
 			})
@@ -1305,25 +1338,29 @@ function listFilesHandler(args: Record<string, unknown>, ctx: ToolContext): Prom
 		const target = safeTarget(ctx, dirPath)
 		const rel = path.relative(ctx.workspaceRoot, target).toPosix() || path.basename(target) || "."
 
-		let entries: Array<{ rel: string; isDir: boolean }> = []
+		let collected: { entries: Array<{ rel: string; isDir: boolean }>; truncated: boolean }
 		try {
-			entries = await collectEntries(target, ctx.workspaceRoot, recursive)
+			collected = await collectEntries(target, ctx.workspaceRoot, recursive)
 		} catch (error) {
 			return err(`list_files: cannot list '${rel}': ${errorMessage(error)}`)
 		}
 
-		// Sort dirs first, then alphabetically.
-		entries.sort((a, b) => {
+		// Sort dirs first, then alphabetically (over the collected subset).
+		collected.entries.sort((a, b) => {
 			if (a.isDir !== b.isDir) {
 				return a.isDir ? -1 : 1
 			}
 			return a.rel.localeCompare(b.rel)
 		})
 
-		const lines = entries.slice(0, MAX_LIST_FILES).map((e) => (e.isDir ? `${e.rel}/` : e.rel))
-		const truncated = entries.length > MAX_LIST_FILES ? `\n(File list truncated: ${MAX_LIST_FILES} of ${entries.length} entries shown. Use list_files on specific subdirectories to see more.)` : ""
+		const lines = collected.entries.slice(0, MAX_LIST_FILES).map((e) => (e.isDir ? `${e.rel}/` : e.rel))
+		// Once the walk was capped the true total is unknown, so the trailer
+		// omits it — the trailer itself is still the signal that more exists.
+		const truncatedNote = collected.truncated
+			? `\n(File list truncated: ${MAX_LIST_FILES} entries shown. Use list_files on specific subdirectories to see more.)`
+			: ""
 
-		return ok(lines.length > 0 ? lines.join("\n") + truncated : "(empty directory)")
+		return ok(lines.length > 0 ? lines.join("\n") + truncatedNote : "(empty directory)")
 	})()
 }
 
@@ -1332,25 +1369,36 @@ async function collectEntries(
 	root: string,
 	recursive: boolean,
 	depth = 0,
-): Promise<Array<{ rel: string; isDir: boolean }>> {
+	budget = MAX_LIST_FILES,
+): Promise<{ entries: Array<{ rel: string; isDir: boolean }>; truncated: boolean }> {
 	if (depth > 32) {
-		return []
+		return { entries: [], truncated: false }
 	}
 	const dirents = await fsp.readdir(dir, { withFileTypes: true })
 	const out: Array<{ rel: string; isDir: boolean }> = []
+	let truncated = false
 	for (const ent of dirents) {
+		// Budget exhausted: stop pushing and stop descending — the caller only
+		// keeps the first MAX_LIST_FILES anyway, so a huge tree is never fully
+		// walked, collected, or sorted.
+		if (out.length >= budget) {
+			truncated = true
+			break
+		}
 		const abs = path.join(dir, ent.name)
 		const rel = path.relative(root, abs).toPosix() || ent.name
 		if (ent.isDirectory()) {
 			out.push({ rel, isDir: true })
 			if (recursive) {
-				out.push(...(await collectEntries(abs, root, recursive, depth + 1)))
+				const sub = await collectEntries(abs, root, recursive, depth + 1, budget - out.length)
+				out.push(...sub.entries)
+				truncated = truncated || sub.truncated
 			}
 		} else {
 			out.push({ rel, isDir: false })
 		}
 	}
-	return out
+	return { entries: out, truncated }
 }
 
 /** attempt_completion — the loop intercepts this; registering it keeps the executor total. */

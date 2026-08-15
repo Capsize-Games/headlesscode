@@ -252,6 +252,28 @@ async function testWalkSkipsNodeModules(): Promise<void> {
 	assert.ok(!stacks.has("python"), "node_modules .py must not detect python (walk path)")
 }
 
+/** S4: detectStacks memoizes per root and invalidates on root mtime change. */
+async function testDetectStacksCacheSameRootAndInvalidation(): Promise<void> {
+	await sandboxHome()
+	// (a) Same unchanged root → repeat calls return equal results (cached).
+	const ws = await makeProject({ "tsconfig.json": "{}" })
+	const first = await detectStacks(ws)
+	const second = await detectStacks(ws)
+	assert.equal(sorted(first), "typescript", "first detection finds typescript")
+	assert.equal(sorted(second), sorted(first), "repeat detection on an unchanged root returns the same stacks")
+
+	// (b) A new root-level stack-signal file added AFTER the first call is
+	// picked up on the next call — the root mtime bump invalidates the cache.
+	const ws2 = await makeProject({ "tsconfig.json": "{}" })
+	assert.equal(sorted(await detectStacks(ws2)), "typescript", "no cpp before the signal file exists")
+	await fs.writeFile(path.join(ws2, "CMakeLists.txt"), "cmake_minimum_required(VERSION 3.20)\n")
+	// Bump the root mtime explicitly so coarse-mtime filesystems still invalidate.
+	const future = new Date(Date.now() + 5_000)
+	await fs.utimes(ws2, future, future)
+	const after = await detectStacks(ws2)
+	assert.equal(sorted(after), "cpp,typescript", "adding CMakeLists.txt must invalidate the cache and detect cpp")
+}
+
 // ─── loadStackRules tests ────────────────────────────────────────────────────
 
 /** No central dir and no project rules-stack-* dir -> empty content, no detection cost. */
@@ -518,6 +540,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["multi-stack project detects all 7 stacks", testMultiStackProject],
 	["git-tracked sources honored, gitignored dirs excluded", testGitTrackedDetection],
 	["non-git walk skips node_modules", testWalkSkipsNodeModules],
+	["detectStacks cache: same root repeats equal; new root-level signal file invalidates (S4)", testDetectStacksCacheSameRootAndInvalidation],
 	["no rules source is zero-config (empty content, no detection)", testNoRulesSourceIsZeroConfig],
 	["central stack rules loaded with source label", testCentralStackRulesLoaded],
 	["central stack rules honor the $HEADLESSCODE_DATA_DIR override", testCentralStackRulesHonorDataDirOverride],

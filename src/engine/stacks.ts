@@ -235,6 +235,22 @@ async function hasPostgresComposeService(root: string): Promise<boolean> {
 	return false
 }
 
+// ─── Detection cache ─────────────────────────────────────────────────────────
+
+/**
+ * Per-workspace in-process cache for detectStacks, keyed by the resolved root
+ * and invalidated by the root directory's own mtime: a stack signal can only
+ * appear when a top-level entry is added/removed/renamed, which bumps that
+ * mtime. Callers receive a copy so the cached Set is never mutated. mtimeMs
+ * (float, sub-ms precision) is the highest-resolution mtime a non-bigint stat
+ * exposes on this Node (mtimeNs needs { bigint: true }).
+ */
+interface DetectStacksCacheEntry {
+	rootMtimeMs: number
+	stacks: Set<StackName>
+}
+const detectStacksCache = new Map<string, DetectStacksCacheEntry>()
+
 /**
  * Detect the stack(s) a target project uses. Cheap, filesystem-only, and a
  * project can match MULTIPLE stacks at once. Never throws: a missing or
@@ -242,6 +258,21 @@ async function hasPostgresComposeService(root: string): Promise<boolean> {
  */
 export async function detectStacks(workspaceRoot: string): Promise<Set<StackName>> {
 	const root = path.resolve(workspaceRoot)
+
+	// Stat the root once and reuse it for both the cache check and the cache
+	// store. A failed stat (missing/unreadable root) means no caching — the
+	// full detection below still runs and still never throws.
+	let rootMtimeMs: number | undefined
+	try {
+		rootMtimeMs = (await fsp.stat(root)).mtimeMs
+	} catch {
+		rootMtimeMs = undefined
+	}
+	const cached = detectStacksCache.get(root)
+	if (cached !== undefined && rootMtimeMs !== undefined && rootMtimeMs === cached.rootMtimeMs) {
+		return new Set(cached.stacks)
+	}
+
 	const stacks = new Set<StackName>()
 
 	// ── Manifest checks (top-level, cheap stats/reads) ──
@@ -323,6 +354,9 @@ export async function detectStacks(workspaceRoot: string): Promise<Set<StackName
 		}
 	}
 
+	if (rootMtimeMs !== undefined) {
+		detectStacksCache.set(root, { rootMtimeMs, stacks: new Set(stacks) })
+	}
 	return stacks
 }
 

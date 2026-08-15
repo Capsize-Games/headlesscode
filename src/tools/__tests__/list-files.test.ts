@@ -1,0 +1,111 @@
+/**
+ * Unit tests for list_files truncation (src/tools/executor.ts's
+ * listFilesHandler + collectEntries): the recursive walk stops collecting
+ * once MAX_LIST_FILES is exceeded, and small listings stay complete and
+ * dirs-first. Plain assert-based script (no test framework), run via
+ * `npm test` -> `tsx src/tools/__tests__/list-files.test.ts`.
+ */
+
+import assert from "node:assert/strict"
+import * as fs from "node:fs/promises"
+import * as os from "node:os"
+import * as path from "node:path"
+
+import { createHeadlessExecutor, MAX_LIST_FILES } from "../executor.js"
+
+async function mkTmpWorkspace(prefix: string): Promise<string> {
+	return fs.mkdtemp(path.join(os.tmpdir(), prefix))
+}
+
+// ─── (a) > MAX_LIST_FILES entries → capped listing + trailer, no hang ────────
+
+async function testLargeTreeIsBoundedAndTruncated(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-ls-large-")
+	try {
+		const dir = path.join(ws, "many")
+		await fs.mkdir(dir, { recursive: true })
+		// 600 files — well over the 500-entry cap. Before the short-circuit this
+		// would collect all 600, sort them, and only then truncate.
+		for (let i = 0; i < 600; i++) {
+			await fs.writeFile(path.join(dir, `f${String(i).padStart(4, "0")}.txt`), "x", "utf-8")
+		}
+
+		const executor = createHeadlessExecutor(ws)
+		const started = Date.now()
+		const result = await executor.execute("list_files", { path: "many", recursive: true })
+		const elapsed = Date.now() - started
+
+		assert.equal(result.isError, false, "listing should succeed")
+		const lines = result.content.split("\n")
+		assert.equal(
+			lines.length,
+			MAX_LIST_FILES + 1,
+			`expected exactly ${MAX_LIST_FILES} entries plus one trailer line, got ${lines.length}`,
+		)
+		assert.match(
+			result.content,
+			/File list truncated: 500 entries shown\. Use list_files on specific subdirectories to see more\./,
+			"truncation trailer present (total omitted — the walk was stopped)",
+		)
+		assert.ok(elapsed < 10_000, `bounded walk must complete quickly (took ${elapsed}ms)`)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// ─── (b) small tree → complete, dirs-first listing, no trailer ───────────────
+
+async function testSmallTreeIsCompleteDirsFirst(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-ls-small-")
+	try {
+		await fs.mkdir(path.join(ws, "zdir"), { recursive: true })
+		await fs.mkdir(path.join(ws, "adir"), { recursive: true })
+		await fs.writeFile(path.join(ws, "adir", "file.txt"), "x", "utf-8")
+		await fs.writeFile(path.join(ws, "top.txt"), "x", "utf-8")
+
+		const executor = createHeadlessExecutor(ws)
+		const result = await executor.execute("list_files", { path: ".", recursive: true })
+
+		assert.equal(result.isError, false, "listing should succeed")
+		assert.doesNotMatch(result.content, /File list truncated/, "no trailer for a small tree")
+		const lines = result.content.split("\n")
+		assert.ok(lines[0].endsWith("/"), "directories come first in a dirs-first listing")
+		assert.ok(lines.some((l) => l === "adir/"), "nested dir listed")
+		assert.ok(lines.some((l) => l === "zdir/"), "second dir listed")
+		assert.ok(lines.some((l) => l === "top.txt"), "top-level file listed")
+		assert.ok(lines.some((l) => l === "adir/file.txt"), "nested file listed")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// ─── Runner ──────────────────────────────────────────────────────────────────
+
+const tests: Array<[string, () => Promise<void>]> = [
+	["large tree (>500 entries): listing capped at 500 + trailer, completes quickly", testLargeTreeIsBoundedAndTruncated],
+	["small tree: complete dirs-first listing with no trailer", testSmallTreeIsCompleteDirsFirst],
+]
+
+async function main(): Promise<void> {
+	let failed = 0
+	for (const [name, fn] of tests) {
+		try {
+			await fn()
+			console.log(`  ok   ${name}`)
+		} catch (err) {
+			failed++
+			console.error(`  FAIL ${name}`)
+			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
+		}
+	}
+	if (failed > 0) {
+		console.error(`\n${failed} test(s) failed`)
+		process.exit(1)
+	}
+	console.log(`\nAll ${tests.length} list-files tests passed`)
+}
+
+main().catch((err) => {
+	console.error("Test runner crashed:", err)
+	process.exit(1)
+})

@@ -237,7 +237,37 @@ async function testDefaultLimitIsSmallerAndExplicitLimitWins(): Promise<void> {
 	}
 }
 
-// ─── (i) HEADLESSCODE_READ_LIMIT env override + invalid-value fallback ───────
+// ─── (i) same-length rewrite → size+mtime fast-path must NOT serve a stale hit
+
+async function testSameLengthRewriteServesRealContent(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-readcache-samelen-")
+	try {
+		const file = path.join(ws, "toggle.txt")
+		await fs.writeFile(file, "aaaa", "utf-8")
+
+		const executor = createHeadlessExecutor(ws)
+		const first = await executor.execute("read_file", { path: "toggle.txt" })
+		assert.ok(!isCacheHit(first), "first read is real content")
+		assert.ok(first.content.includes("aaaa"), "first read shows the original bytes")
+
+		// Same byte length, different content. The size+mtime fast-path MUST
+		// fall back to a full hash and detect the change — this is the exact
+		// correctness edge the fast-path must not regress.
+		await fs.writeFile(file, "bbbb", "utf-8")
+		// Bump mtime explicitly so coarse-mtime filesystems still invalidate.
+		const future = new Date(Date.now() + 5_000)
+		await fs.utimes(file, future, future)
+
+		const second = await executor.execute("read_file", { path: "toggle.txt" })
+		assert.equal(second.isError, false, "re-read after a same-length rewrite should succeed")
+		assert.ok(!isCacheHit(second), "same-length content change must NOT be served as a cache hit")
+		assert.ok(second.content.includes("bbbb"), "re-read returns the new bytes")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// ─── (j) HEADLESSCODE_READ_LIMIT env override + invalid-value fallback ───────
 
 async function testReadLimitEnvOverride(): Promise<void> {
 	const saved = process.env.HEADLESSCODE_READ_LIMIT
@@ -294,6 +324,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["two independent executors (sessions): no cross-instance cache", testNoCacheHitAcrossExecutors],
 	["slice vs indentation mode on same path: never a cache hit", testSliceVsIndentationIsNotCacheHit],
 	["default slice limit is smaller (600), explicit limit 2000 wins", testDefaultLimitIsSmallerAndExplicitLimitWins],
+	["same-length rewrite (aaaa->bbbb): fast-path falls back to full hash, fresh content", testSameLengthRewriteServesRealContent],
 	["HEADLESSCODE_READ_LIMIT env override + invalid fallback", testReadLimitEnvOverride],
 ]
 

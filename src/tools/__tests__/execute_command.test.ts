@@ -18,7 +18,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 
-import { createHeadlessExecutor, BASH_PATH } from "../executor.js"
+import { createHeadlessExecutor, BASH_PATH, MAX_RESULT_CHARS } from "../executor.js"
 
 async function mkTmpWorkspace(prefix: string): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -280,6 +280,37 @@ async function testBashOnlySyntaxDoesNotFalselyFailTheCommand(): Promise<void> {
 	}
 }
 
+// ─── (i) oversized stdout is bounded at the cap while the pipe keeps draining ─
+
+async function testOversizedOutputIsBoundedAtCap(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-ec-cap-")
+	const savedSumm = process.env.HEADLESSCODE_LOCAL_SUMMARIZATION
+	delete process.env.HEADLESSCODE_LOCAL_SUMMARIZATION // pin blunt truncation (the default)
+	try {
+		const executor = createHeadlessExecutor(ws)
+		// ~200k chars of stdout — several times MAX_RESULT_CHARS. This also
+		// exceeds the OS pipe buffer, so a handler that stopped draining the
+		// pipe would deadlock the child until the 30s timeout fires.
+		const result = await executor.execute("execute_command", {
+			command: `node -e 'process.stdout.write("x".repeat(200000))'`,
+			timeout: 30,
+		})
+
+		assert.equal(result.isError, false, "a big-output command that finishes must be a normal result")
+		assert.doesNotMatch(result.content, /timed out/, "the pipe must be drained so the command completes, not hang")
+		assert.ok(result.content.length < 200_000, `output must be bounded well below the raw 200k (got ${result.content.length})`)
+		assert.ok(result.content.length > MAX_RESULT_CHARS, "result still exceeds the cap (cap + trailer)")
+		assert.match(result.content, /output truncated at \d+ chars to keep context bounded/, "blunt truncation trailer present (summarization off)")
+	} finally {
+		if (savedSumm === undefined) {
+			delete process.env.HEADLESSCODE_LOCAL_SUMMARIZATION
+		} else {
+			process.env.HEADLESSCODE_LOCAL_SUMMARIZATION = savedSumm
+		}
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -291,6 +322,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["execute_command: non-destructive store access (echo) is allowed", testNonDestructiveStoreAccessAllowed],
 	["execute_command: bash-only syntax (${PIPESTATUS[0]}) does not falsely fail the command", testBashOnlySyntaxDoesNotFalselyFailTheCommand],
 	["execute_command: BASH_PATH resolves to a real binary (CI safety net for issue #35)", testBashPathResolvesToARealBinary],
+	["execute_command: oversized stdout bounded at the cap, pipe drains, truncation trailer present", testOversizedOutputIsBoundedAtCap],
 ]
 
 async function main(): Promise<void> {
