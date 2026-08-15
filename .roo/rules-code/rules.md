@@ -78,8 +78,12 @@ that's a real, final answer for that file/symbol — fall back to
   `indentation` mode anchored on that line (`{ path, mode: "indentation",
   indentation: { anchor_line: N } }`) over a broad `slice` read. It extracts
   the containing function/class/logical block — complete and syntactically
-  valid, no mid-function truncation — instead of pulling up to 2,000 lines
-  of surrounding file you then have to scroll through.
+  valid, no mid-function truncation — instead of pulling hundreds of
+  surrounding lines you then have to scroll through.
+- A no-arg `slice` read returns only the first 600 lines by default
+  (configurable via `HEADLESSCODE_READ_LIMIT`) — for a file longer than
+  that, page the rest with explicit `offset`/`limit` rather than assuming
+  the whole file came back.
 - This is guidance, not a hard rule. A `slice` read is still the right tool
   for initial file orientation (seeing the overall structure before you know
   which line matters), for reading a small config/data file in full, and for

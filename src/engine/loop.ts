@@ -53,6 +53,7 @@ import {
 	createHeadlessExecutor,
 	escalateDecision,
 	NEEDS_DECISION_FILENAME,
+	readLimitFromEnv,
 	ToolExecutor,
 } from "../tools/executor.js"
 import type { PermissionsConfig } from "../permissions/config.js"
@@ -103,7 +104,6 @@ import {
 } from "./condense.js"
 import { writeHandoffSummary } from "./handoff.js"
 import { runLocalExplorePhase, type LocalExploreOptions, type LocalExploreResult } from "./local-explore.js"
-import { DEFAULT_LINE_LIMIT } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/read_file.js"
 import { hasCodebaseIndex } from "../index-util.js"
 // Recursive task decomposition (`new_task`): child mode resolution uses the
 // SAME lookup the top-level session does (custom modes from .roomodes first,
@@ -3380,7 +3380,7 @@ export function summarizeToolArg(name: string, args: Record<string, unknown>): s
 			// No slice args: show the tool's real defaults (mirrors the
 			// executor's toNonNegativeInt fallbacks) so a default broad read is
 			// distinguishable from a targeted one at a glance.
-			return `${filePath} [slice offset=1 limit=${DEFAULT_LINE_LIMIT}]`
+			return `${filePath} [slice offset=1 limit=${readLimitFromEnv()}]`
 		}
 		case "list_files":
 		case "write_to_file":

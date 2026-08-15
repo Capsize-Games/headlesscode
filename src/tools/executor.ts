@@ -118,6 +118,27 @@ if (BASH_PATH === undefined) {
 /** Cap on tool-result text fed back to the model (keep context bounded). */
 export const MAX_RESULT_CHARS = 30_000
 
+/**
+ * Default read_file slice-mode line limit when the model passes no explicit
+ * `limit`. 600 lines, down from the vendored tool-schema default of 2000: a
+ * no-arg broad read historically pulled up to ~30k chars (~7-8k tokens) of
+ * history per call, and the truncation header already tells the model to page
+ * with `offset` for anything bigger. An explicit `limit` arg always wins, so
+ * 2000 stays available as an opt-in. Measured from real session logs: ~29% of
+ * read_file calls were no-arg broad reads.
+ */
+export const DEFAULT_READ_LIMIT = 600
+
+/** Resolve the read_file slice-mode default limit (env-overridable). */
+export function readLimitFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+	const raw = env.HEADLESSCODE_READ_LIMIT
+	if (raw === undefined || raw === "") {
+		return DEFAULT_READ_LIMIT
+	}
+	const n = Number(raw)
+	return Number.isInteger(n) && n > 0 ? n : DEFAULT_READ_LIMIT
+}
+
 /** Default execute_command timeout in seconds (matches vendored default ~120s). */
 export const DEFAULT_COMMAND_TIMEOUT_S = 120
 
@@ -513,7 +534,7 @@ type ReadFileCacheKey = {
 	mode: string
 	/** Effective 1-based offset (default 1). */
 	offset: number
-	/** Effective limit (default 2000). */
+	/** Effective limit (default readLimitFromEnv()). */
 	limit: number
 	/** Effective indentation-mode max_lines (default 60); undefined in slice mode. */
 	windowLines?: number
@@ -576,7 +597,7 @@ function readFileHandler(
 
 		const mode = typeof args.mode === "string" ? args.mode : "slice"
 		const offset = toNonNegativeInt(args.offset, 1) // 1-based
-		const limit = toNonNegativeInt(args.limit, 2000)
+		const limit = toNonNegativeInt(args.limit, readLimitFromEnv())
 		const indentation = args.indentation as Record<string, unknown> | undefined
 		const windowLines = mode === "indentation" ? toNonNegativeInt(indentation?.["max_lines"], DEFAULT_INDENTATION_WINDOW_LINES) : undefined
 
@@ -626,7 +647,7 @@ function readFileKey(args: Record<string, unknown>, ctx: ToolContext): string {
 	const target = safeTarget(ctx, filePath)
 	const mode = typeof args.mode === "string" ? args.mode : "slice"
 	const offset = toNonNegativeInt(args.offset, 1) // 1-based
-	const limit = toNonNegativeInt(args.limit, 2000)
+	const limit = toNonNegativeInt(args.limit, readLimitFromEnv())
 	const indentation = args.indentation as Record<string, unknown> | undefined
 	const windowLines =
 		mode === "indentation" ? toNonNegativeInt(indentation?.["max_lines"], DEFAULT_INDENTATION_WINDOW_LINES) : undefined
