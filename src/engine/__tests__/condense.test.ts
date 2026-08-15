@@ -26,7 +26,7 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 
-import { HeadlessSession, truncateHistory } from "../loop.js"
+import { HeadlessSession, truncateHistory, DEFAULT_MAX_TOKENS } from "../loop.js"
 import { DEFAULT_WINDOW_SIZE } from "../loop.js"
 import {
 	buildCondenseUserPrompt,
@@ -35,6 +35,7 @@ import {
 	computeEvictCount,
 	condenseOldestTurns,
 	estimateMessageChars,
+	DEFAULT_CONDENSE_MAX_TOKENS,
 	DEFAULT_CONDENSE_THRESHOLD_FRACTION,
 	DEFAULT_CONTEXT_WINDOW_TOKENS,
 	maybeCondense,
@@ -128,6 +129,7 @@ async function makeSession(options: {
 	condenseThresholdFraction?: number
 	condenseModel?: string
 	condenseMaxTokens?: number
+	maxTokens?: number
 }) {
 	const session = new HeadlessSession({
 		workspaceRoot: options.workspaceRoot,
@@ -142,6 +144,7 @@ async function makeSession(options: {
 		condenseThresholdFraction: options.condenseThresholdFraction,
 		condenseModel: options.condenseModel,
 		condenseMaxTokens: options.condenseMaxTokens,
+		maxTokens: options.maxTokens,
 		// Checkpoints off — this suite isn't testing shadow-git.
 		checkpoints: false,
 	})
@@ -668,6 +671,108 @@ async function testSessionAboveThresholdCondensesAndAccounts(): Promise<void> {
 }
 
 /**
+	* The condensation call must ALWAYS carry its own `max_tokens` cap
+	* (DEFAULT_CONDENSE_MAX_TOKENS) even when the session has no `maxTokens`
+	* configured anywhere — an unbounded generation can't be produced and then
+	* rejected by the post-generation MAX_CONDENSED_MESSAGE_CHARS check. The
+	* main call gets DEFAULT_MAX_TOKENS. Both defaults come from the resolved
+	* config (loop.ts's constructor), so this is a full-session assertion.
+	*/
+async function testSessionCondenseRequestAlwaysCarriesMaxTokens(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-condense-maxtokens-"))
+	try {
+		// NO maxTokens / condenseMaxTokens configured: only the defaults apply.
+		const client = new FakeLlmClient(
+			[
+				() => toolCall("write_to_file", { path: "a.txt", content: "hello" }),
+				() => textReply("CONDENSED SUMMARY HERE"),
+				() => toolCall("attempt_completion", { result: "done" }),
+			],
+			// Every call reports a large prompt count so condensation fires
+			// after the first iteration.
+			{ promptTokens: 110_000, completionTokens: 100 },
+		)
+		const session = await makeSession({
+			task: "write a file and continue",
+			client,
+			workspaceRoot: ws,
+			contextWindowTokens: 128_000,
+			condenseThresholdFraction: 0.75,
+		})
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(client.condenseCalls, 1, "exactly one condensation call happened")
+
+		const condenseReq = client.requests.find(
+			(r) =>
+				!r.tools &&
+				typeof r.messages[0]?.content === "string" &&
+				r.messages[0].content.includes("conversation-compression engine"),
+		)
+		assert.ok(condenseReq, "condensation request present")
+		assert.equal(
+			condenseReq.maxTokens,
+			DEFAULT_CONDENSE_MAX_TOKENS,
+			"the condensation call must always carry max_tokens (its own default), even with no session maxTokens",
+		)
+
+		const mainReq = client.requests.find((r) => r.tools)
+		assert.ok(mainReq, "main request present")
+		assert.equal(
+			mainReq.maxTokens,
+			DEFAULT_MAX_TOKENS,
+			"the main call must carry the default max_tokens cap when none is configured",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+/**
+	* An explicit `condenseMaxTokens` / `maxTokens` on the session config must
+	* win over the defaults — the caps are defaults, not hard constants.
+	*/
+async function testSessionExplicitMaxTokensOverridesDefaults(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-condense-override-"))
+	try {
+		const client = new FakeLlmClient(
+			[
+				() => toolCall("write_to_file", { path: "a.txt", content: "hello" }),
+				() => textReply("CONDENSED SUMMARY HERE"),
+				() => toolCall("attempt_completion", { result: "done" }),
+			],
+			{ promptTokens: 110_000, completionTokens: 100 },
+		)
+		const session = await makeSession({
+			task: "write a file and continue",
+			client,
+			workspaceRoot: ws,
+			contextWindowTokens: 128_000,
+			condenseThresholdFraction: 0.75,
+			condenseMaxTokens: 1234,
+			maxTokens: 5678,
+		})
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+
+		const condenseReq = client.requests.find(
+			(r) =>
+				!r.tools &&
+				typeof r.messages[0]?.content === "string" &&
+				r.messages[0].content.includes("conversation-compression engine"),
+		)
+		assert.ok(condenseReq, "condensation request present")
+		assert.equal(condenseReq.maxTokens, 1234, "an explicit condenseMaxTokens must win over the default")
+
+		const mainReq = client.requests.find((r) => r.tools)
+		assert.ok(mainReq, "main request present")
+		assert.equal(mainReq.maxTokens, 5678, "an explicit maxTokens must win over the default")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+/**
  * Regression test for a 2026-08-04 bug: the live-resolved context window was
  * cached via a boolean (`contextWindowResolved`) recording only that a
  * lookup was ATTEMPTED, never the value it resolved TO. Every condensation
@@ -925,6 +1030,8 @@ const tests: Array<[string, () => Promise<void> | void]> = [
 	["condenseOldestTurns: usage callback fires with the real usage", testCondenseOldestTurnsDirectUsageCallback],
 	["session: below threshold -> byte-identical behavior, zero condensation calls", testSessionBelowThresholdNoCondensationCall],
 	["session: above threshold -> condensation + budget accounting includes it", testSessionAboveThresholdCondensesAndAccounts],
+	["session: condensation call always carries max_tokens (defaults, no session maxTokens)", testSessionCondenseRequestAlwaysCarriesMaxTokens],
+	["session: explicit condenseMaxTokens/maxTokens override the defaults", testSessionExplicitMaxTokensOverridesDefaults],
 	["session: live-resolved context window is cached and reused across checks (regression)", testSessionReusesLiveResolvedContextWindowAcrossChecks],
 	["session: condensation never splits a tool-call group", testSessionCondensationNeverSplitsToolGroup],
 	["session: post-condensation prefix stays stable across calls", testSessionPostCondensePrefixStable],

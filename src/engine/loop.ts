@@ -93,6 +93,7 @@ import {
 	computeEvictCount,
 	condenseOldestTurns,
 	DEFAULT_CONDENSE_EARLY_FIRE_FRACTION,
+	DEFAULT_CONDENSE_MAX_TOKENS,
 	DEFAULT_CONDENSE_THRESHOLD_FRACTION,
 	DEFAULT_CONTEXT_WINDOW_TOKENS,
 	estimateMessageChars,
@@ -206,6 +207,18 @@ export const DEFAULT_WINDOW_SIZE = 300
  * without masking an actually-hung request as something else.
  */
 export const DEFAULT_LLM_TIMEOUT_MS = 300_000
+/**
+ * Default cap on the main per-iteration call's OUTPUT tokens, applied when
+ * the caller doesn't set `maxTokens` explicitly (there is no CLI flag/env
+ * for it today — the config object is the plumbing). Chosen at 32k: 4x the
+ * heaviest generation observed in a real session (8,000+ tokens on one
+ * iteration — see the DEFAULT_LLM_TIMEOUT_MS comment above; reasoning models
+ * emit long tool-call turns by design), so a legitimate multi-file write
+ * turn never truncates mid-tool-call, while still bounding the worst-case
+ * cost of a runaway generation. Overridable by passing `maxTokens` in the
+ * session config.
+ */
+export const DEFAULT_MAX_TOKENS = 32_768
 /**
  * Blind tree-walking guardrail (speed workstream, P1.6): after this many
  * CONSECUTIVE iterations whose every tool call is a plain read/exploration
@@ -506,6 +519,10 @@ export interface HeadlessSessionConfig {
 	tools?: ChatTool[]
 	logger?: Logger
 	temperature?: number
+	/**
+	 * Cap on the main call's output tokens (default: DEFAULT_MAX_TOKENS in
+	 * loop.ts — 32,768; an explicit value here always wins).
+	 */
 	maxTokens?: number
 	/** Abort timeout per LLM call, ms (default 120s). */
 	llmTimeoutMs?: number
@@ -564,7 +581,9 @@ export interface HeadlessSessionConfig {
 	condenseModel?: string
 	/**
 	 * Phase 3 context condensation: max output tokens for the condensation
-	 * call (default: the session's `maxTokens`, if set).
+	 * call (default: DEFAULT_CONDENSE_MAX_TOKENS in src/engine/condense.ts —
+	 * 4096, independent of the session's `maxTokens`, so the call always
+	 * sends `max_tokens`; an explicit value here always wins).
 	 */
 	condenseMaxTokens?: number
 	globalCustomInstructions?: string
@@ -975,10 +994,10 @@ export class HeadlessSession {
 			condenseThresholdFraction: config.condenseThresholdFraction ?? DEFAULT_CONDENSE_THRESHOLD_FRACTION,
 			condenseEarlyFireFraction: config.condenseEarlyFireFraction ?? DEFAULT_CONDENSE_EARLY_FIRE_FRACTION,
 			condenseModel: config.condenseModel ?? config.model ?? process.env.OPENROUTER_MODEL ?? DEFAULT_MODEL,
-			condenseMaxTokens: config.condenseMaxTokens,
+			condenseMaxTokens: config.condenseMaxTokens ?? DEFAULT_CONDENSE_MAX_TOKENS,
 			logger: config.logger,
 			temperature: config.temperature,
-			maxTokens: config.maxTokens,
+			maxTokens: config.maxTokens ?? DEFAULT_MAX_TOKENS,
 			globalCustomInstructions: config.globalCustomInstructions,
 			workspaceRoot: config.workspaceRoot,
 			llmClient: config.llmClient,
@@ -1663,7 +1682,7 @@ export class HeadlessSession {
 				condensedUpTo: this.condensedUpToMsgIndex,
 				condenseInFlight: this.condenseInFlight,
 				condenseModel: config.condenseModel,
-				condenseMaxTokens: config.condenseMaxTokens ?? config.maxTokens,
+				condenseMaxTokens: config.condenseMaxTokens,
 				condenseAbortSignal: undefined,
 				onUsage: (usage) => this.recordCondensationUsage(usage, budgetTracker),
 			})
@@ -1894,7 +1913,7 @@ export class HeadlessSession {
 			messages: snapshot,
 			count: plan.count,
 			model: config.condenseModel,
-			maxTokens: config.condenseMaxTokens ?? config.maxTokens,
+			maxTokens: config.condenseMaxTokens,
 			onUsage: (usage) => this.recordCondensationUsage(usage, budgetTracker),
 		})
 			.then(async (summary) => {
@@ -2136,7 +2155,7 @@ export class HeadlessSession {
 					messages: toSummarize,
 					count,
 					model: config.condenseModel,
-					maxTokens: config.condenseMaxTokens ?? config.maxTokens,
+					maxTokens: config.condenseMaxTokens,
 					onUsage: (usage) => this.recordHandoffCondensationUsage(usage, budgetTracker),
 				})
 			} catch (firstError) {
@@ -2148,7 +2167,7 @@ export class HeadlessSession {
 					messages: toSummarize,
 					count,
 					model: config.condenseModel,
-					maxTokens: config.condenseMaxTokens ?? config.maxTokens,
+					maxTokens: config.condenseMaxTokens,
 					onUsage: (usage) => this.recordHandoffCondensationUsage(usage, budgetTracker),
 				})
 			}
