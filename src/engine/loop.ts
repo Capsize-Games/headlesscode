@@ -81,6 +81,7 @@ import type {
 	ChatTool,
 	LlmClient,
 	LlmResponse,
+	ParsedToolCall,
 	SessionResult,
 	SessionBudgetUsage,
 	ToolContext,
@@ -333,6 +334,40 @@ export function isReadOnlyEquivalentShellCommand(command: string): boolean {
 		return false
 	}
 	return true
+}
+
+/** Edit tools whose execution can change files on disk (the checkpoint trigger). */
+const CHECKPOINT_EDIT_TOOL_NAMES = new Set([
+	"write_to_file",
+	"apply_diff",
+	"search_replace",
+	"edit_file",
+	// rename_symbol rewrites source files in place — an edit, not an
+	// inspection (registered only on edit-capable executors; see
+	// src/tools/executor.ts registerTypeScriptGatedTools).
+	"rename_symbol",
+])
+
+/**
+ * True when an iteration's tool calls could have changed the workspace — the
+ * per-iteration checkpoint trigger. A turn counts as an edit if ANY call is
+ * one of the edit tools, or an execute_command that is NOT
+ * read-only-equivalent (a `git commit`, a bare `>` redirect, `sed -i`, … —
+ * see isReadOnlyEquivalentShellCommand). Everything else (read_file,
+ * list_files, search_files, codebase_search, the code-intel tools, read-only
+ * shell commands) cannot change files on disk, so a checkpoint commit after
+ * such a turn would be empty pure waste — and read-heavy turns are exactly
+ * the common case (see isReadOnlyEquivalentShellCommand's measurement
+ * comment above).
+ */
+function turnChangedWorkspace(calls: ParsedToolCall[]): boolean {
+	return calls.some(
+		(call) =>
+			CHECKPOINT_EDIT_TOOL_NAMES.has(call.name) ||
+			(call.name === "execute_command" &&
+				typeof call.args.command === "string" &&
+				!isReadOnlyEquivalentShellCommand(call.args.command)),
+	)
 }
 
 /**
@@ -794,6 +829,8 @@ export class HeadlessSession {
 	private checkpointService: CheckpointService | null = null
 	/** Whether checkpoints actually run this session: config on AND the executor is edit-capable. */
 	private readonly checkpointsActive: boolean
+	/** Checkpoints: ordered queue of pending fire-and-forget shadow-git saves (see saveIterationCheckpoint). */
+	private checkpointQueue: Promise<void> = Promise.resolve()
 	/** Cost/token monitoring (workstream 3): cumulative usage tokens across all LLM calls this run. */
 	private totalInputTokens = 0
 	private totalOutputTokens = 0
@@ -1066,6 +1103,11 @@ export class HeadlessSession {
 					if (!svc) {
 						return undefined
 					}
+					// In-flight iteration saves are fire-and-forget (see
+					// saveIterationCheckpoint) — drain the queue so the diff
+					// sees the latest committed state and never races a
+					// background `git add` on the shadow repo's index.
+					await this.flushCheckpoints()
 					const entries = await svc.list()
 					const baseline = entries[0]?.hash
 					if (!baseline) {
@@ -1293,6 +1335,10 @@ export class HeadlessSession {
 			// condensation resolving from here on must discard, not splice a
 			// message array already consumed by completion (see
 			// applyBackgroundCondense).
+			// Checkpoints: drain any pending fire-and-forget saves first so no
+			// checkpoint is lost when the session ends (the git commit runs in
+			// the background — see saveIterationCheckpoint). Never throws.
+			await this.flushCheckpoints()
 			this.sessionEnded = true
 			this.executor.dispose()
 		}
@@ -2717,7 +2763,12 @@ export class HeadlessSession {
 						reason: isError ? "tool error" : call.parseError ? "parse error" : isRepeat ? "identical repeat" : "empty result",
 					})
 					if (consecutiveMistakes >= consecutiveErrorLimit) {
-						await this.saveIterationCheckpoint(iteration)
+						// Last-ditch snapshot before giving up — but only when
+						// this turn could have changed the workspace (a
+						// read-only mistake turn leaves nothing new to capture).
+						if (turnChangedWorkspace(calls)) {
+							await this.saveIterationCheckpoint(iteration)
+						}
 						return this.boundedFailure("consecutive mistakes", iteration, toolCalls, consecutiveMistakes)
 					}
 				} else {
@@ -2768,10 +2819,16 @@ export class HeadlessSession {
 				}
 			}
 
-			// Checkpoints: this iteration executed at least one tool call (we only
-			// reach here when `calls.length > 0`), so snapshot the workspace.
-			// Non-fatal — see saveIterationCheckpoint.
-			await this.saveIterationCheckpoint(iteration)
+			// Checkpoints: snapshot only after a turn that could have changed
+			// the workspace (an edit tool, or a non-read-only execute_command —
+			// see turnChangedWorkspace). Read-only turns (read_file, list_files,
+			// search_files, codebase_search, read-only shell commands) change
+			// nothing on disk, so a commit would be empty pure waste — the
+			// measured cost driver on the LLM critical path. The save itself is
+			// fire-and-forget (see saveIterationCheckpoint). Non-fatal.
+			if (turnChangedWorkspace(calls)) {
+				await this.saveIterationCheckpoint(iteration)
+			}
 		}
 
 		// maxIterations exhausted without completion: this is specifically the
@@ -2841,28 +2898,54 @@ export class HeadlessSession {
 	}
 
 	/**
-	 * Checkpoints: save a per-iteration snapshot after a turn that executed
-	 * at least one tool call (mirrors Zoo Code's
-	 * `presentAssistantMessage.ts:~988`, `task.checkpointSave(true)`). Non-fatal
-	 * — a failure here is logged and silently drops checkpointing for the rest
-	 * of the session (never fails the run).
+	 * Checkpoints: save a per-iteration snapshot after a turn that could have
+	 * changed the workspace (callers gate on turnChangedWorkspace — read-only
+	 * turns skip it entirely). FIRE-AND-FORGET: the shadow-git commit runs on
+	 * an ordered single-flight queue (each commit's parent is the previous
+	 * one, so saves must stay serialized) and the next iteration's LLM call
+	 * never waits on it — the synchronous per-iteration `git add -A` + commit
+	 * was the measured wall-clock cost on the LLM critical path. run() drains
+	 * the queue before the session returns (see flushCheckpoints), so no save
+	 * is lost. Non-fatal — a failure here is logged and silently drops
+	 * checkpointing for the rest of the session (never fails the run).
 	 */
-	private async saveIterationCheckpoint(iteration: number): Promise<void> {
+	private saveIterationCheckpoint(iteration: number): void {
 		if (!this.checkpointsActive || !this.checkpointService) {
 			return
 		}
-		try {
-			await this.checkpointService.save(`Task: ${this.checkpointLineage}, Time: ${Date.now()}`, { allowEmpty: true })
-			this.logger.debug("[checkpoints] iteration checkpoint saved", { iteration })
-			// Live worker monitoring: mirror the existing checkpoint hook point.
-			// Non-fatal.
-			await this.emitEvent("checkpoint_saved", () => this.eventFeed.checkpointSaved(iteration))
-		} catch (error) {
-			this.checkpointService = null
-			this.logger.warn("[checkpoints] save failed (non-fatal; checkpoints disabled for the rest of this session)", {
-				error: error instanceof Error ? error.message : String(error),
+		const svc = this.checkpointService
+		this.checkpointQueue = this.checkpointQueue
+			.then(async () => {
+				// An earlier queued save failed and disabled checkpoints before
+				// this one ran — drop it (nothing valid to save against).
+				if (this.checkpointService !== svc) {
+					return
+				}
+				try {
+					await svc.save(`Task: ${this.checkpointLineage}, Time: ${Date.now()}`, { allowEmpty: true })
+					this.logger.debug("[checkpoints] iteration checkpoint saved", { iteration })
+					// Live worker monitoring: mirror the existing checkpoint
+					// hook point. Non-fatal.
+					await this.emitEvent("checkpoint_saved", () => this.eventFeed.checkpointSaved(iteration))
+				} catch (error) {
+					this.checkpointService = null
+					this.logger.warn("[checkpoints] save failed (non-fatal; checkpoints disabled for the rest of this session)", {
+						error: error instanceof Error ? error.message : String(error),
+					})
+				}
 			})
-		}
+			// Keep the chain alive even if a queued task throws unexpectedly
+			// (the inner try/catch already handles save/emit errors; same
+			// keep-alive idiom as EventFeed's emit queue).
+			.catch(() => {})
+	}
+
+	/**
+	 * Checkpoints: await any pending fire-and-forget saves (see
+	 * saveIterationCheckpoint). Never rejects — failures are swallowed there.
+	 */
+	private async flushCheckpoints(): Promise<void> {
+		await this.checkpointQueue
 	}
 
 	/**

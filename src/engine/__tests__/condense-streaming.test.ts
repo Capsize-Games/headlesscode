@@ -217,8 +217,10 @@ function estimateChars(messages: ChatMessage[]): number {
  * `condenseIteration`, 0 = never), the `condensed` event lands immediately
  * after that iteration's `iteration_start` — the loop emits it from
  * maybeCondenseHistory before the main LLM call — so the feed reads as a
- * clean session_start → checkpoint_saved → per-iteration streamed-turn blocks
- * → (condensed) → final streamed completion → attempt_completion → session_end
+ * clean session_start → checkpoint_saved (baseline ONLY — every turn here
+ * calls read_file, and read-only turns no longer snapshot; see
+ * turnChangedWorkspace in loop.ts) → per-iteration streamed-turn blocks →
+ * (condensed) → final streamed completion → attempt_completion → session_end
  * (the attempt_completion event is issue #34's final-report event, emitted
  * before session_end when the loop accepts completion).
  */
@@ -229,7 +231,7 @@ function expectedEventTypes(
 	condenseIteration = 0,
 ): string[] {
 	const types: string[] = ["session_start", "checkpoint_saved"]
-	const pushIteration = (k: number, chunks: number, withCheckpoint: boolean) => {
+	const pushIteration = (k: number, chunks: number) => {
 		types.push("iteration_start")
 		if (k + 1 === condenseIteration) types.push("condensed")
 		for (let c = 0; c < chunks; c++) types.push("llm_stream_chunk")
@@ -238,9 +240,8 @@ function expectedEventTypes(
 			types.push("tool_call")
 			types.push("tool_result")
 		}
-		if (withCheckpoint) types.push("checkpoint_saved")
 	}
-	for (let k = 0; k < callCounts.length; k++) pushIteration(k, perTurnChunks[k], true)
+	for (let k = 0; k < callCounts.length; k++) pushIteration(k, perTurnChunks[k])
 	types.push("iteration_start")
 	if (callCounts.length + 1 === condenseIteration) types.push("condensed")
 	for (let c = 0; c < finalChunks; c++) types.push("llm_stream_chunk")
@@ -349,7 +350,7 @@ async function testCondensationAndStreamingInOneSession(): Promise<void> {
 		assert.deepEqual(
 			events.map((e) => e.type),
 			expectedEventTypes(callCounts, callCounts.map(() => 1), 3, 12),
-			"full event sequence must be exactly ordered (incl. checkpoint_saved placement and the condensed event at iteration 12)",
+			"full event sequence must be exactly ordered (baseline checkpoint only + the condensed event at iteration 12)",
 		)
 
 		const iterStarts = events.filter((e) => e.type === "iteration_start")
@@ -408,12 +409,13 @@ async function testCondensationAndStreamingInOneSession(): Promise<void> {
 		assert.equal(responses[11].outputTokens, 100)
 		assert.equal(responses[10].inputTokens, 120_000, "the threshold-crossing call reports its own usage")
 
-		// Checkpoint events: baseline + one per tool-call iteration; the
-		// streamed completion iteration emits none.
+		// Checkpoint events: baseline only — every turn here is read-only
+		// (read_file), so no iteration snapshots are taken (see
+		// turnChangedWorkspace in loop.ts).
 		assert.deepEqual(
 			events.filter((e) => e.type === "checkpoint_saved").map((e) => e.iteration),
-			[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-			"checkpoint_saved lands once per tool-call iteration, exactly between tool_result and the next iteration_start",
+			[0],
+			"read-only turns must not produce iteration checkpoints — only the baseline",
 		)
 
 		// ── Budget/cost: condensation call AND streamed calls combined ───────

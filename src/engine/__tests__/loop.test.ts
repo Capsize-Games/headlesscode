@@ -1021,6 +1021,54 @@ async function testCheckpointTriggeredByApplyDiffOnly(): Promise<void> {
 	}
 }
 
+/**
+	* Checkpoint cadence (speed workstream): a session whose turns are all reads
+	* produces NO iteration checkpoints beyond the baseline, while edit turns
+	* (write_to_file / apply_diff / …) and NON-read-only execute_command turns
+	* still snapshot. Also proves the fire-and-forget saves are all durable by
+	* the time run() returns (the loop drains its save queue in teardown — see
+	* flushCheckpoints in loop.ts).
+	*/
+async function testCheckpointSkipsReadOnlyTurnsButSnapshotsEdits(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-ckpt-readonly-"))
+	const checkpointDir = await fs.mkdtemp(path.join(os.tmpdir(), "hc-ckpt-readonly-"))
+	try {
+		await fs.writeFile(path.join(ws, "seed.txt"), "seed\n", "utf-8")
+		const client = new FakeLlmClient([
+			() => toolCall("read_file", { path: "seed.txt" }),
+			() => toolCall("write_to_file", { path: "a.txt", content: "hello" }),
+			() => toolCall("execute_command", { command: "ls ." }), // read-only shell command
+			() => toolCall("execute_command", { command: "echo hi > b.txt" }), // mutating: writes a file
+			() => toolCall("execute_command", { command: "cat a.txt" }), // read-only shell command
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({
+			task: "read then write",
+			client,
+			workspaceRoot: ws,
+			checkpoints: true,
+			checkpointDir,
+		})
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+
+		// Exactly four commits: initShadowGit's own "initial commit" + the
+		// baseline + the write_to_file turn + the mutating execute_command
+		// turn. The read_file and read-only execute_command turns must
+		// produce nothing.
+		const tasksDir = path.join(checkpointDir, "tasks")
+		const taskIds = await fs.readdir(tasksDir)
+		assert.equal(taskIds.length, 1, `expected exactly one checkpoint task, got: ${taskIds.join(", ")}`)
+		const svc = createCheckpointService({ taskId: taskIds[0], workspaceRoot: ws, checkpointDir })
+		await svc.init()
+		const entries = await svc.list()
+		assert.equal(entries.length, 4, `expected initial commit + baseline + 2 edit checkpoints, got ${entries.length}`)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+		await fs.rm(checkpointDir, { recursive: true, force: true })
+	}
+}
+
 // ─── truncateHistory — batch eviction (cache-stability regression) ───────────
 
 function fakeMsg(i: number): ChatMessage {
@@ -1424,6 +1472,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["execute_command: a timed-out call does NOT count toward the consecutive-mistake limit", testTimeoutDoesNotCountAsMistake],
 	["execute_command: session end reaps backgrounded children (no orphans left behind)", testSessionEndReapsBackgroundedChildren],
 	["checkpoints: apply_diff-only iteration still triggers a checkpoint", testCheckpointTriggeredByApplyDiffOnly],
+	["checkpoints: read-only turns are skipped, edit + mutating-exec turns still snapshot", testCheckpointSkipsReadOnlyTurnsButSnapshotsEdits],
 	["same-file batch: a second same-file edit failure gets the stale-SEARCH diagnosis", testSameFileBatchFailureGetsDiagnosis],
 	["same-file batch: a failure on a DIFFERENT file gets no diagnosis", testDifferentFileBatchFailureGetsNoDiagnosis],
 	["commit guard: attempt_completion with uncommitted tracked changes gets one nudge, then is accepted", testCompletionNudgedOnUncommittedChanges],
