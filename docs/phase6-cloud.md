@@ -303,7 +303,7 @@ burst capacity is actually required — at which point
 
 ## 6. Cost model example for one session
 
-Baseline: one harness session, `deepseek/deepseek-v4-flash`
+Baseline: one harness session, `deepseek/deepseek-v4-flash-0731`
 ($0.14/1M input, $0.28/1M output).
 
 | Call | Input | Output | Cost |
@@ -317,7 +317,7 @@ Baseline: one harness session, `deepseek/deepseek-v4-flash`
 At the default `maxIterations = 50`, the absolute worst case is ~50 tool-call
 rounds ≈ $0.03–$0.08 depending on context growth — hence the default
 recommendation of a per-session cap like `--max-cost-usd 0.05` for
-`deepseek/deepseek-v4-flash` work. A fleet of 3 concurrent sessions (default cap) with that
+`deepseek/deepseek-v4-flash-0731` work. A fleet of 3 concurrent sessions (default cap) with that
 per-session budget bounds a full pipeline round at roughly **$0.15 worst
 case**, before the review/QA rounds (which reuse the same budget mechanism via
 the same env vars). Raise the cap only when a session legitimately needs more

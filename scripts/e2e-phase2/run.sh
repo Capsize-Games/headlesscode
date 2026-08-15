@@ -212,8 +212,8 @@ echo "== [5/10] spawn-parallel-worktrees.sh (2 specs) =="
 mkdir -p "$FIXTURE/.headlesscode"
 cat > "$FIXTURE/.headlesscode/mode-models.json" <<'EOF'
 {
-  "_default": "deepseek/deepseek-v4-flash",
-  "code": "deepseek/deepseek-v4-flash",
+  "_default": "deepseek/deepseek-v4-flash-0731",
+  "code": "deepseek/deepseek-v4-flash-0731",
   "architect": "deepseek/architect-plan",
   "_condensation": "qwen/qwen3-8b"
 }
@@ -750,7 +750,7 @@ fi
 # The plan session used the architect mode's model; the worker used the code
 # model. Both must appear in the plan-first mock's request log.
 if grep -q "model=deepseek/architect-plan" "$PLAN_MOCK_LOG" &&
-	grep -q "model=deepseek/deepseek-v4-flash" "$PLAN_MOCK_LOG"; then
+	grep -q "model=deepseek/deepseek-v4-flash-0731" "$PLAN_MOCK_LOG"; then
 	pass "plan-first: mock saw the plan session (architect model) + the worker (code model)"
 else
 	fail "plan-first: mock log missing the plan and/or worker model requests"

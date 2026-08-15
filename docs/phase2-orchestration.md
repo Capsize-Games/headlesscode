@@ -344,7 +344,7 @@ warns when local master is ahead of origin by more than `TRIVIAL_DRIFT_AHEAD`
 ```bash
 # 1. Configure
 export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-...
-export OPENROUTER_MODEL=deepseek/deepseek-v4-flash
+export OPENROUTER_MODEL=deepseek/deepseek-v4-flash-0731
 
 # 2. Preview the split + spawn command (no API key needed)
 npx tsx src/cli.ts orchestrate --repo ~/Projects/airunner \

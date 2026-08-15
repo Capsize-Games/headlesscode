@@ -28,7 +28,7 @@ Optional but recommended:
 
 | Variable | Purpose |
 | --- | --- |
-| `OPENROUTER_MODEL` | Model id (e.g. `deepseek/deepseek-v4-flash`). Defaults to `deepseek/deepseek-v4-flash` if unset; overridable per-run with `--model`. |
+| `OPENROUTER_MODEL` | Model id (e.g. `deepseek/deepseek-v4-flash-0731`). Defaults to `deepseek/deepseek-v4-flash-0731` if unset; overridable per-run with `--model`. |
 | `OPENROUTER_HTTP_REFERER` / `OPENROUTER_APP_TITLE` | Passed as `HTTP-Referer` / `X-Title` headers (OpenRouter rate-limit friendliness). |
 | `OPENROUTER_BASE_URL` | Base URL override for testing/proxies — see §4. |
 | `HEADLESSCODE_REASONING_EFFORT` | Graded reasoning effort for `deepseek/*` models (issue #30 experiment): `low` / `medium` / `high` / `max` (native DeepSeek levels) or `xhigh` (OpenRouter's normalized alias for `max`). Unset = the endpoint's undeclared default (pre-existing behavior, unchanged). Also settable per-project via the `_reasoning_effort` key in `mode-models.json` (that key beats this env var) — see below. |
@@ -132,7 +132,7 @@ git -C ~/Projects/<target-repo> worktree add -b fix/issue-N ~/Projects/<target-r
 cd /path/to/headlesscode
 
 export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-v1-...        # required
-export OPENROUTER_MODEL=deepseek/deepseek-v4-flash # optional (default model)
+export OPENROUTER_MODEL=deepseek/deepseek-v4-flash-0731 # optional (default model)
 
 npx tsx src/cli.ts \
   --task "<issue #N: the full issue text>" \
@@ -187,7 +187,7 @@ and the env var wins over the built-in default.
 
 ### Model
 
-- `--model <id>` (CLI flag) → `OPENROUTER_MODEL` env var → `deepseek/deepseek-v4-flash`.
+- `--model <id>` (CLI flag) → `OPENROUTER_MODEL` env var → `deepseek/deepseek-v4-flash-0731`.
 - Resolution happens per request: request model → client default → env → built-in.
 
 ### Cost / time bounds
