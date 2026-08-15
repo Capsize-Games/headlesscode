@@ -19,6 +19,7 @@ import * as path from "node:path"
 
 import { HeadlessSession } from "../loop.js"
 import { eventsDir, eventsFilePath, readEventsFile, EVENT_TRUNCATE_CHARS, truncateField } from "../events.js"
+import { readLimitFromEnv } from "../../tools/executor.js"
 import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } from "../types.js"
 
 // ─── Fake LLM client (mirrors src/engine/__tests__/loop.test.ts) ────────────
@@ -318,7 +319,7 @@ async function testLongContentIsTruncated(): Promise<void> {
 			// slices) — the same summarizeToolArg helper as harness.log.
 			const readCallEvent = events2.find((e) => e.type === "tool_call" && e.tool === "read_file")
 			assert.ok(readCallEvent, "expected a read_file tool_call event")
-			assert.equal(readCallEvent?.args, "big.txt [slice offset=1 limit=2000]")
+			assert.equal(readCallEvent?.args, `big.txt [slice offset=1 limit=${readLimitFromEnv()}]`)
 			assert.equal(readCallEvent?.argsTruncated, undefined)
 
 			const toolResultEvent2 = events2.find((e) => e.type === "tool_result")

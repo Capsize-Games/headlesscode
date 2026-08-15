@@ -12,6 +12,7 @@
 
 import assert from "node:assert/strict"
 
+import { readLimitFromEnv } from "../../tools/executor.js"
 import { summarizeToolArg } from "../loop.js"
 
 function testSliceModeWithExplicitOffsetLimit(): void {
@@ -22,10 +23,14 @@ function testSliceModeWithExplicitOffsetLimit(): void {
 }
 
 function testSliceModeWithNoArgsShowsDefaults(): void {
-	// No mode/offset/limit → slice mode with the tool's real defaults
-	// (offset 1, DEFAULT_LINE_LIMIT 2000), so a default broad read is
-	// distinguishable from a targeted one.
-	assert.equal(summarizeToolArg("read_file", { path: "src/app.ts" }), "src/app.ts [slice offset=1 limit=2000]")
+	// No mode/offset/limit → slice mode with the harness's effective default
+	// (offset 1, readLimitFromEnv() — 600 unless HEADLESSCODE_READ_LIMIT
+	// overrides), so a default broad read is distinguishable from a targeted
+	// one.
+	assert.equal(
+		summarizeToolArg("read_file", { path: "src/app.ts" }),
+		`src/app.ts [slice offset=1 limit=${readLimitFromEnv()}]`,
+	)
 }
 
 function testSliceModeWithPartialRangeArgs(): void {

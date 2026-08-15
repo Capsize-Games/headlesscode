@@ -208,6 +208,81 @@ async function testSliceVsIndentationIsNotCacheHit(): Promise<void> {
 	}
 }
 
+// ─── (h) default slice limit is the smaller harness default; explicit limit wins ─
+
+async function testDefaultLimitIsSmallerAndExplicitLimitWins(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-readcache-limit-")
+	try {
+		const file = path.join(ws, "long.txt")
+		const lines = Array.from({ length: 700 }, (_, i) => `line-${i + 1}`)
+		await fs.writeFile(file, lines.join("\n"), "utf-8")
+
+		const executor = createHeadlessExecutor(ws)
+		const defaultRead = await executor.execute("read_file", { path: "long.txt" })
+		assert.equal(defaultRead.isError, false, "default read should succeed")
+		assert.ok(
+			defaultRead.content.includes("Showing lines 1-600 of 700 total lines"),
+			`no-arg read must honor the harness default (600 lines), got: ${defaultRead.content.slice(0, 160)}`,
+		)
+		assert.ok(defaultRead.content.includes("line-600"), "default read shows line 600")
+		assert.ok(!defaultRead.content.includes("line-601"), "default read must NOT include line 601")
+
+		const explicitRead = await executor.execute("read_file", { path: "long.txt", limit: 2000 })
+		assert.equal(explicitRead.isError, false, "explicit-limit read should succeed")
+		assert.ok(!isCacheHit(explicitRead), "different effective limit must NOT be a cache hit")
+		assert.ok(explicitRead.content.includes("line-700"), "explicit limit 2000 returns the whole file")
+		assert.ok(!explicitRead.content.includes("Showing lines"), "limit 2000 covers all 700 lines, no truncation header")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// ─── (i) HEADLESSCODE_READ_LIMIT env override + invalid-value fallback ───────
+
+async function testReadLimitEnvOverride(): Promise<void> {
+	const saved = process.env.HEADLESSCODE_READ_LIMIT
+	try {
+		const ws = await mkTmpWorkspace("hc-readcache-env-")
+		try {
+			const file = path.join(ws, "long.txt")
+			const lines = Array.from({ length: 700 }, (_, i) => `line-${i + 1}`)
+			await fs.writeFile(file, lines.join("\n"), "utf-8")
+
+			process.env.HEADLESSCODE_READ_LIMIT = "500"
+			const exec500 = createHeadlessExecutor(ws)
+			const r500 = await exec500.execute("read_file", { path: "long.txt" })
+			assert.ok(
+				r500.content.includes("Showing lines 1-500 of 700 total lines"),
+				`env override 500 honored, got: ${r500.content.slice(0, 160)}`,
+			)
+
+			process.env.HEADLESSCODE_READ_LIMIT = "garbage"
+			const execGarbage = createHeadlessExecutor(ws)
+			const rGarbage = await execGarbage.execute("read_file", { path: "long.txt" })
+			assert.ok(
+				rGarbage.content.includes("Showing lines 1-600 of 700 total lines"),
+				`invalid env falls back to default 600, got: ${rGarbage.content.slice(0, 160)}`,
+			)
+
+			delete process.env.HEADLESSCODE_READ_LIMIT
+			const execDefault = createHeadlessExecutor(ws)
+			const rDefault = await execDefault.execute("read_file", { path: "long.txt" })
+			assert.ok(
+				rDefault.content.includes("Showing lines 1-600 of 700 total lines"),
+				`unset env uses default 600, got: ${rDefault.content.slice(0, 160)}`,
+			)
+		} finally {
+			await fs.rm(ws, { recursive: true, force: true })
+		}
+	} finally {
+		if (saved === undefined) {
+			delete process.env.HEADLESSCODE_READ_LIMIT
+		} else {
+			process.env.HEADLESSCODE_READ_LIMIT = saved
+		}
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -218,6 +293,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["write_to_file then read: edit path invalidates via hash-check", testEditThenReadReturnsFreshContent],
 	["two independent executors (sessions): no cross-instance cache", testNoCacheHitAcrossExecutors],
 	["slice vs indentation mode on same path: never a cache hit", testSliceVsIndentationIsNotCacheHit],
+	["default slice limit is smaller (600), explicit limit 2000 wins", testDefaultLimitIsSmallerAndExplicitLimitWins],
+	["HEADLESSCODE_READ_LIMIT env override + invalid fallback", testReadLimitEnvOverride],
 ]
 
 async function main(): Promise<void> {
