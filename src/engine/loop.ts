@@ -3143,41 +3143,55 @@ export class HeadlessSession {
 			this.logger.info("[switch_mode] approved by human/orchestrator", { from, to: modeSlug })
 		}
 
-		// Perform the switch: recompute the system prompt + tool list the SAME
-		// way run() does at session start (including the config.tools override
-		// precedence), mutate session state in place (the iteration loop reads
-		// this.state.tools fresh on every LLM call — see run()), and leave a
-		// visible marker in the transcript so the model's own history honestly
-		// shows when/why the switch happened rather than having it silently
-		// rewritten underneath.
-		const built = await buildSystemPrompt({
-			workspaceRoot: this.config.workspaceRoot,
-			mode: modeSlug,
-			customModes: this.customModes,
-			globalCustomInstructions: this.config.globalCustomInstructions,
-		})
-		let newTools = appendCodeIntelTools(
-			appendDescribeImageTool(
-				appendBrowserActionTool(this.config.tools ?? selectToolsForMode(modeSlug, this.customModes)),
-			),
+		// Perform the switch: compute the target mode's tool list FIRST (the
+		// SAME way run() does at session start, including the config.tools
+		// override precedence) and compare it against the session's current
+		// tool set. When the tool names are identical (e.g. two custom modes
+		// that differ only in role text but share the same groups), the system
+		// prompt does NOT need rebuilding and messages[0] must NOT be replaced:
+		// rewriting it invalidates the provider's cached prompt prefix for the
+		// whole session, costing a full-prompt cache miss after every such
+		// switch. When the tool set differs, rebuild the prompt as before.
+		let newTools = appendDescribeImageTool(
+			appendBrowserActionTool(this.config.tools ?? selectToolsForMode(modeSlug, this.customModes)),
 		)
+		if (this.executor.has("outline")) {
+			newTools = appendCodeIntelTools(newTools)
+		}
 		if (this.executor.has("rename_symbol")) {
 			newTools = appendCodeIntelEditTools(newTools)
 		}
 		if (this.executor.has("run_tests")) {
 			newTools = appendRunTestsTool(newTools)
 		}
+		const toolSetUnchanged = sameToolNames(this.state.tools, newTools)
 		this.state.mode = modeSlug
 		this.state.tools = newTools
-		this.state.systemPrompt = built.prompt
-		// The "living" system prompt each LLM call reads (messages[0] is
-		// otherwise just a regular history entry — update it in place). The
-		// visible "[mode switched: …]" marker is NOT pushed here: the loop
-		// appends it right after this call's tool result, so the strict
-		// assistant-with-tool_calls → tool-result adjacency contract is kept
-		// (see pendingModeSwitchMarker).
-		if (this.state.messages[0]?.role === "system") {
-			this.state.messages[0].content = built.prompt
+		let switchResultContent: string
+		if (toolSetUnchanged) {
+			// Tool set unchanged: keep the current system prompt and
+			// messages[0] untouched so the cached prompt prefix survives the
+			// switch. The visible "[mode switched: …]" marker below still
+			// tells the model's own history when/why the label changed.
+			switchResultContent = `Switched to mode '${modeSlug}' (tool set unchanged — system prompt kept for prompt-cache continuity). Reason acknowledged: ${reason}`
+		} else {
+			const built = await buildSystemPrompt({
+				workspaceRoot: this.config.workspaceRoot,
+				mode: modeSlug,
+				customModes: this.customModes,
+				globalCustomInstructions: this.config.globalCustomInstructions,
+			})
+			this.state.systemPrompt = built.prompt
+			// The "living" system prompt each LLM call reads (messages[0] is
+			// otherwise just a regular history entry — update it in place). The
+			// visible "[mode switched: …]" marker is NOT pushed here: the loop
+			// appends it right after this call's tool result, so the strict
+			// assistant-with-tool_calls → tool-result adjacency contract is kept
+			// (see pendingModeSwitchMarker).
+			if (this.state.messages[0]?.role === "system") {
+				this.state.messages[0].content = built.prompt
+			}
+			switchResultContent = `Switched to mode '${modeSlug}'. Reason acknowledged: ${reason}`
 		}
 		this.pendingModeSwitchMarker = `[mode switched: ${from} -> ${modeSlug}. Reason: ${reason}]`
 		this.modeSwitchCount++
@@ -3186,9 +3200,15 @@ export class HeadlessSession {
 		await this.emitEvent("mode_switched", () =>
 			this.eventFeed.modeSwitched({ from, to: modeSlug, reason, autoApproved }),
 		)
-		this.logger.info("[switch_mode] switched", { from, to: modeSlug, count: this.modeSwitchCount, autoApproved })
+		this.logger.info("[switch_mode] switched", {
+			from,
+			to: modeSlug,
+			count: this.modeSwitchCount,
+			autoApproved,
+			toolSetUnchanged,
+		})
 		return {
-			content: `Switched to mode '${modeSlug}'. Reason acknowledged: ${reason}`,
+			content: switchResultContent,
 			isError: false,
 		}
 	}
@@ -3401,6 +3421,32 @@ export function summarizeToolArg(name: string, args: Record<string, unknown>): s
 
 /** Batch size for truncateHistory's eviction — see its own doc comment for why. */
 export const TRUNCATION_BATCH_SIZE = 10
+
+/**
+ * True when two tool lists advertise the same set of tool names (sorted name
+ * comparison — cheap and sufficient). Used by switch_mode to detect that the
+ * target mode's effective tool set equals the current one, in which case the
+ * system prompt / messages[0] are left untouched so the provider's cached
+ * prompt prefix survives the switch.
+ */
+function sameToolNames(a: ChatTool[], b: ChatTool[]): boolean {
+	const names = (tools: ChatTool[]): string[] =>
+		tools
+			.filter((t) => t.type === "function")
+			.map((t) => t.function.name)
+			.sort()
+	const na = names(a)
+	const nb = names(b)
+	if (na.length !== nb.length) {
+		return false
+	}
+	for (let i = 0; i < na.length; i++) {
+		if (na[i] !== nb[i]) {
+			return false
+		}
+	}
+	return true
+}
 
 /**
  * Verify the stable-prefix assumption for a background condensation
