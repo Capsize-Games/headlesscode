@@ -9,6 +9,11 @@
  * These run the REAL executeCommandHandler against a real shell + a fake
  * Ollama server, so they prove the actual wiring:
  *   - OFF by default => today's exact blunt truncation (no HTTP call at all)
+ *     — the default is a pinned, measured decision
+ *     (LOCAL_SUMMARIZATION_DEFAULT_ENABLED = false; r3-summarize round found
+ *     oversized exec results are ~1.8% of real results, saving ~4k tokens/
+ *     session at +2.5-3.4s latency per result — not worth a default flip),
+ *     and an explicit "0"/"false" env forces it off even after a flip
  *   - ON + unreachable Ollama => falls back to blunt truncation, no error,
  *     no hang
  *   - ON + small result => never sent to the summarizer (no HTTP call)
@@ -24,6 +29,7 @@ import * as path from "node:path"
 
 import { createHeadlessExecutor } from "../executor.js"
 import { MAX_RESULT_CHARS } from "../executor.js"
+import { LOCAL_SUMMARIZATION_DEFAULT_ENABLED } from "../output-summarizer.js"
 
 const SUMMARIZATION_ENV = "HEADLESSCODE_LOCAL_SUMMARIZATION"
 const OLLAMA_URL_ENV = "HEADLESSCODE_OLLAMA_URL"
@@ -84,6 +90,38 @@ async function testOffByDefaultUsesBluntTruncation(): Promise<void> {
 			assert.ok(result.content.length > MAX_RESULT_CHARS, "truncated result still over the cap (cap + trailer)")
 			assert.doesNotMatch(result.content, /\[Output summarized by local model/, "NO summary header when OFF")
 			assert.equal(fake.count(), 0, "summarizer must not be called when OFF")
+		} finally {
+			process.env = oldEnv
+		}
+	} finally {
+		await fake.close()
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// ─── (a2) default pinned OFF + explicit "0" opt-out stays OFF ────────────────
+
+async function testDefaultPinnedOffAndOptOut(): Promise<void> {
+	// The default is a measured decision (see the constant's comment in
+	// src/tools/output-summarizer.ts); asserting it here means a deliberate
+	// flip is a visible change that must update this test too.
+	assert.equal(LOCAL_SUMMARIZATION_DEFAULT_ENABLED, false, "default pinned OFF (measured decision)")
+	const ws = await mkTmpWorkspace("hc-summ-optout-")
+	const fake = await startFakeOllama()
+	try {
+		const oldEnv = { ...process.env }
+		// Explicit "0" must force the feature off even if the default ever
+		// flips — the opt-out path the round's decision relies on.
+		process.env[SUMMARIZATION_ENV] = "0"
+		process.env[OLLAMA_URL_ENV] = fake.url
+		try {
+			const executor = createHeadlessExecutor(ws)
+			const result = await executor.execute("execute_command", { command: bigOutputCommand() })
+
+			assert.equal(result.isError, false, "normal completion")
+			assert.match(result.content, /output truncated at \d+ chars to keep context bounded/, "blunt truncation trailer present")
+			assert.doesNotMatch(result.content, /\[Output summarized by local model/, "NO summary header when opt-out")
+			assert.equal(fake.count(), 0, "summarizer must not be called when explicitly opted out")
 		} finally {
 			process.env = oldEnv
 		}
@@ -215,6 +253,7 @@ async function testOnOversizedResultIsSummarized(): Promise<void> {
 
 const tests: Array<[string, () => Promise<void>]> = [
 	["OFF by default: execute_command oversized output uses today's exact blunt truncation, summarizer never called", testOffByDefaultUsesBluntTruncation],
+	["default pinned OFF + explicit '0' opt-out stays OFF (no summarizer call)", testDefaultPinnedOffAndOptOut],
 	["ON + Ollama unreachable: falls back to blunt truncation, no error, no hang", testOnWithUnreachableOllamaFallsBackCleanly],
 	["ON + malformed Ollama response: falls back cleanly, no error", testOnWithMalformedResponseFallsBackCleanly],
 	["ON + small result: never sent to the summarizer", testSmallResultNeverSummarized],

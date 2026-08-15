@@ -100,3 +100,52 @@ try it: set `HEADLESSCODE_LOCAL_SUMMARIZATION=1`, keep `qwen3:8b` (or switch
 to `llama3.1:8b` via `HEADLESSCODE_SUMMARIZATION_MODEL` for error-heavy logs),
 and treat results as advisory — the transparency header tells the cloud model
 what it's reading.
+
+---
+
+## Addendum 2026-08-15 (r3-summarize round) — default-flip re-evaluation: token cost + latency
+
+Re-examined the "should this be default ON?" question from the token-economics
+side (the original eval above was quality-focused). Measured from real session
+logs (50 sessions across all worktrees) and a real A/B (real executor + real
+local Ollama, `gemma4:e4b` — the only 8B chat model installed on this machine;
+`qwen3:8b`, the code default, is not installed).
+
+**Cost of the current default (measured, 50 real sessions, 1,676
+`execute_command` results):**
+
+- 56% of results exceed 500 chars, but only **30 iterations (~1.8%)** grew the
+  next prompt by >7,500 tokens (≈30k chars) — the only size class the
+  summarizer would engage. Several of those were `git diff`/`git show` output
+  (code-content risk, see below).
+- Total prompt-token spend on those oversized results ≈ 277k tokens across 50
+  sessions ≈ **5.5k tokens/session** — and real sessions serve ~90%+ of
+  re-sent content from the provider's prompt cache (cacheRead ≈ $0.0028/M vs
+  $0.14/M input for `deepseek/deepseek-v4-flash-0731`), so the marginal dollar
+  cost is ≈ $0.0001-0.001/session. Median oversized-result prompt growth is
+  1,272 tokens (≈5k chars) — summarization never engages for the typical case.
+
+**A/B (scripted comparable sessions, mock LLM reporting real prompt sizes,
+real Ollama):**
+
+- Per oversized (~45KB, error past the 30k cutoff) result: OFF = 30,059 chars
+  ≈ 7,515 tokens, error discarded; ON = 1,346-1,862 chars ≈ 337-466 tokens,
+  92-94% smaller.
+- Session-level `lastPromptTokens` growth: **+7,731 tokens (OFF) vs +601 (ON)**.
+- Latency: **+2.5-3.4s per oversized result** (warm, 48KB input) — notably more
+  than the 1-2s estimate in the code header (which was for ~7KB inputs); a cold
+  model load is ~20s before the first call.
+
+**Decision: keep default OFF.** Savings are real per-result (~92%) but the
+results are rare (1.8% of exec results, ~0.5/session → ~4-5k tokens/session,
+mostly cache-covered), while the latency (+2.5-3.4s/result, up to 15s timeout)
+and the model-dependent quality risk would be imposed on every deployment by
+default — including hosts with no Ollama or no good local model. Two new
+quality findings from the real A/B: `gemma4:e4b` kept the buried error verbatim
+but added "Analysis / Next steps" advice sections the prompt forbids; and
+several real oversized results are `git diff` output — compressing those with
+an 8B model is the same correctness hazard the executor deliberately avoids for
+file/diff content. The default is now an explicit, tested constant
+(`LOCAL_SUMMARIZATION_DEFAULT_ENABLED` in `src/tools/output-summarizer.ts`), so
+flipping later is a one-line auditable change; `HEADLESSCODE_LOCAL_SUMMARIZATION=0|false`
+remains the explicit opt-out.

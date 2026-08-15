@@ -97,9 +97,25 @@ export const SUMMARIZATION_TARGET_CHARS = 400
 /** Hard safety cap on what the summarizer is ALLOWED to return. */
 export const MAX_SUMMARY_CHARS = 8_000
 
+/**
+ * Whether local output summarization is enabled when
+ * HEADLESSCODE_LOCAL_SUMMARIZATION is unset. Measured decision (2026-08-15,
+ * r3-summarize round): oversized execute_command results that would engage
+ * the summarizer occur in ~1.8% of real exec results (~0.5/session), saving
+ * ~4k input tokens/session (mostly provider-cache-covered) at +2.5-3.4s
+ * latency per result — not material enough to impose on every deployment,
+ * and summary quality is model-dependent. Flipping to true is a one-line
+ * default change; the env var then acts as the opt-out ("0"/"false").
+ */
+export const LOCAL_SUMMARIZATION_DEFAULT_ENABLED = false
+
 /** Env-var gate: is local summarization enabled for this process? */
 export function isLocalSummarizationEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-	return env[LOCAL_SUMMARIZATION_ENV] === "1" || env[LOCAL_SUMMARIZATION_ENV]?.toLowerCase() === "true"
+	if (env[LOCAL_SUMMARIZATION_ENV] !== undefined) {
+		const v = env[LOCAL_SUMMARIZATION_ENV].toLowerCase()
+		return v === "1" || v === "true"
+	}
+	return LOCAL_SUMMARIZATION_DEFAULT_ENABLED
 }
 
 /** Resolve the Ollama base URL: env → default. */
