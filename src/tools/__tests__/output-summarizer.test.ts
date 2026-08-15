@@ -24,6 +24,8 @@ import {
 	MAX_RESULT_CHARS_FOR_FALLBACK,
 	DEFAULT_OLLAMA_URL,
 	DEFAULT_SUMMARIZATION_MODEL,
+	LOCAL_SUMMARIZATION_DEFAULT_ENABLED,
+	LOCAL_SUMMARIZATION_ENV,
 } from "../output-summarizer.js"
 
 // ─── Fake Ollama server ───────────────────────────────────────────────────────
@@ -179,10 +181,21 @@ async function testTruncatedFlagSurfaced(): Promise<void> {
 // ─── (g) env-var gate + resolution helpers ───────────────────────────────────
 
 async function testEnvGateAndResolvers(): Promise<void> {
+	// The default is a pinned, explicit decision (r3-summarize measured the
+	// trade: ~1.8% of real exec results are oversized, saving ~4k tokens/
+	// session at +2.5-3.4s latency per result — not enough to flip ON for
+	// everyone). Tests assert the CONSTANT so a deliberate default flip is a
+	// visible one-line change that must update these assertions too.
+	assert.equal(LOCAL_SUMMARIZATION_DEFAULT_ENABLED, false, "default stays OFF (measured decision, see constant comment)")
+	assert.equal(isLocalSummarizationEnabled({}), LOCAL_SUMMARIZATION_DEFAULT_ENABLED, "unset env == the pinned default")
 	assert.equal(isLocalSummarizationEnabled({}), false, "OFF by default")
 	assert.equal(isLocalSummarizationEnabled({ HEADLESSCODE_LOCAL_SUMMARIZATION: "1" }), true, "1 enables")
 	assert.equal(isLocalSummarizationEnabled({ HEADLESSCODE_LOCAL_SUMMARIZATION: "true" }), true, "true enables")
-	assert.equal(isLocalSummarizationEnabled({ HEADLESSCODE_LOCAL_SUMMARIZATION: "0" }), false, "0 stays off")
+	assert.equal(isLocalSummarizationEnabled({ HEADLESSCODE_LOCAL_SUMMARIZATION: "TRUE" }), true, "case-insensitive enable")
+	assert.equal(isLocalSummarizationEnabled({ HEADLESSCODE_LOCAL_SUMMARIZATION: "0" }), false, "0 forces off (opt-out)")
+	assert.equal(isLocalSummarizationEnabled({ HEADLESSCODE_LOCAL_SUMMARIZATION: "false" }), false, "false forces off (opt-out)")
+	assert.equal(isLocalSummarizationEnabled({ HEADLESSCODE_LOCAL_SUMMARIZATION: "garbage" }), false, "unrecognized value stays off")
+	assert.equal(LOCAL_SUMMARIZATION_ENV, "HEADLESSCODE_LOCAL_SUMMARIZATION", "env var name pinned")
 
 	assert.equal(resolveOllamaUrl({}), DEFAULT_OLLAMA_URL, "default Ollama URL")
 	assert.equal(resolveOllamaUrl({ HEADLESSCODE_OLLAMA_URL: "http://10.0.0.1:11434/" }), "http://10.0.0.1:11434", "trailing slash stripped")
