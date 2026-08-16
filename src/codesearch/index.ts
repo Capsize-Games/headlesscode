@@ -342,6 +342,7 @@ export async function buildIndex(
 	workspaceRoot: string,
 	onProgress?: (scanned: number, total: number) => void,
 	backend: EmbeddingBackend = DEFAULT_EMBEDDING_BACKEND,
+	onEmbedProgress?: (embedded: number, total: number) => void,
 ): Promise<IndexBuildResult> {
 	const root = path.resolve(workspaceRoot)
 	const files = await walkSourceFiles(root)
@@ -367,6 +368,15 @@ export async function buildIndex(
 		onProgress?.(fi + 1, files.length)
 		const chunks = chunkFile(file.abs, file.rel)
 		for (const chunk of chunks) {
+			if (chunk.content.trim() === "") {
+				// Whitespace-only chunks produce no useful vector and are
+				// rejected outright by embedding providers (live crash
+				// 2026-08-16: OpenRouter HTTP 400 "too_small" for an empty
+				// string at input[90]). Skip entirely — and deliberately do
+				// NOT add the key to survivingKeys, so a stale entry for it
+				// (from an older build that didn't filter) is dropped on write.
+				continue
+			}
 			const hash = chunkHash(chunk.content)
 			const key = `${chunk.file}:${chunk.startLine}`
 			survivingKeys.add(key)
@@ -416,6 +426,7 @@ export async function buildIndex(
 			})
 		}
 		i += batch.length
+		onEmbedProgress?.(Math.min(i, chunksToEmbed.length), chunksToEmbed.length)
 	}
 
 	// Deterministic order for the on-disk file (stable across rebuilds).

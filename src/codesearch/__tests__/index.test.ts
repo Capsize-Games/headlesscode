@@ -115,6 +115,55 @@ async function testRebuildWithNoChangesEmbedsNothing(): Promise<void> {
 	}
 }
 
+async function testBuildSkipsEmptyChunks(): Promise<void> {
+	// Regression (live crash 2026-08-16): a whitespace-only file produced an
+	// empty chunk string that OpenRouter rejected with HTTP 400 "too_small"
+	// (input[90]). The build must filter empty chunks BEFORE the embedder.
+	const ws = await mkTmpWorkspace({
+		"src/blank.txt": "\n\n\n\n\n\n\n\n\n",
+		"src/real.ts": "export function alpha() {\n  return 1\n}\n",
+	})
+	try {
+		const embedder = new FakeEmbedder()
+		const orig = embedder.embedBatch.bind(embedder)
+		embedder.embedBatch = async (texts) => {
+			for (const t of texts) {
+				assert.ok(t.trim() !== "", "embedder must never receive an empty/whitespace-only chunk")
+			}
+			return orig(texts)
+		}
+		const result = await buildIndex(embedder, ws)
+		assert.equal(result.filesScanned, 2)
+		assert.ok(result.chunksEmbedded >= 1, "the real file's chunks still get embedded")
+		assert.ok(embedder.textsEmbedded >= 1, "some texts were embedded")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testBuildReportsEmbeddingProgress(): Promise<void> {
+	const ws = await mkTmpWorkspace({
+		"src/a.ts": "export function alpha() {\n  return 1\n}\n",
+		"src/b.ts": "export function beta() {\n  return 2\n}\n",
+	})
+	try {
+		const embedder = new FakeEmbedder()
+		const progress: Array<[number, number]> = []
+		const result = await buildIndex(embedder, ws, undefined, "openrouter", (embedded, total) => {
+			progress.push([embedded, total])
+		})
+		assert.ok(progress.length >= 1, "embedding progress reported at least once")
+		const last = progress[progress.length - 1]
+		assert.equal(last[0], last[1], "final progress reports embedded == total")
+		assert.equal(last[1], result.chunksEmbedded, "progress total matches chunks embedded")
+		for (const [embedded, total] of progress) {
+			assert.ok(embedded >= 1 && embedded <= total, `embedded ${embedded} within [1, ${total}]`)
+		}
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 async function testChangedChunkGetsReembeddedUnchangedDoesNot(): Promise<void> {
 	const ws = await mkTmpWorkspace({
 		"src/a.ts": "export function alpha() {\n  return 1\n}\n\nexport function beta() {\n  return 2\n}\n",
@@ -281,6 +330,8 @@ async function testBuildPersistsRoundedEmbeddings(): Promise<void> {
 const tests: Array<[string, () => Promise<void>]> = [
 	["build writes a valid index.jsonl with sane entries", testBuildWritesIndex],
 	["rebuild with no changes re-embeds NOTHING (call-counter proof)", testRebuildWithNoChangesEmbedsNothing],
+	["whitespace-only chunks are filtered before the embedder (OpenRouter 400 regression)", testBuildSkipsEmptyChunks],
+	["embedding phase reports per-batch progress (no more silent stall)", testBuildReportsEmbeddingProgress],
 	["a changed chunk is re-embedded, an unchanged one is not", testChangedChunkGetsReembeddedUnchangedDoesNot],
 	["chunks for deleted files are dropped on rebuild", testDeletedFileChunksRemoved],
 	["file walker + index build round-trip", testWalkAndIndexRoundTrip],

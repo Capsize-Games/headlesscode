@@ -157,14 +157,26 @@ export async function indexMain(argv: string[]): Promise<number> {
 	}
 
 	try {
-		const result = await buildIndex(embedder, workspaceRoot, (scanned, total) => {
-			process.stdout.write(`\r  scanned ${scanned}/${total} files`)
-		}, backend)
+		const result = await buildIndex(
+			embedder,
+			workspaceRoot,
+			(scanned, total) => {
+				process.stdout.write(`\r  scanned ${scanned}/${total} files`)
+			},
+			backend,
+			(embedded, total) => {
+				process.stdout.write(`\r  embedded ${embedded}/${total} chunks`)
+			},
+		)
 		if (result.filesScanned > 0) {
 			process.stdout.write(`\r  scanned ${result.filesScanned}/${result.filesScanned} files\n`)
 		} else {
 			process.stdout.write("\n")
 		}
+		// The embedding phase used to run fully silent (a large repo looked
+		// "stalled" between the scan line and the summary — live report
+		// 2026-08-16). Keep the final state of the per-batch progress visible.
+		process.stdout.write(`  embedded ${result.chunksEmbedded}/${result.chunksEmbedded} chunks\n`)
 
 		const indexFile = indexFilePath(workspaceRoot)
 		const costLine =

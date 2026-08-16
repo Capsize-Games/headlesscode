@@ -109,6 +109,13 @@ export class OllamaEmbedder {
 			return { embeddings: [], model: this.model, promptTokens: 0, totalTokens: 0 }
 		}
 
+		// Same guard as OpenRouterEmbedder: empty inputs are rejected upstream
+		// and produce no useful vector anyway.
+		const emptyIndex = texts.findIndex((t) => t.trim() === "")
+		if (emptyIndex !== -1) {
+			throw new OllamaEmbedError(`cannot embed empty/whitespace-only input at index ${emptyIndex} — providers reject it`)
+		}
+
 		const url = `${this.baseUrl}/api/embed`
 		let response: Response
 		try {

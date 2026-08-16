@@ -251,6 +251,15 @@ export class OpenRouterEmbedder implements Embedder {
 			return { embeddings: [], model: this.model, promptTokens: 0, totalTokens: 0 }
 		}
 
+		// Defensive: embedding providers reject empty strings outright (live
+		// crash 2026-08-16 — OpenRouter HTTP 400 "too_small"). buildIndex
+		// filters these before calling, but any other caller must get a clear
+		// diagnostic here, not a cryptic 400 from upstream.
+		const emptyIndex = texts.findIndex((t) => t.trim() === "")
+		if (emptyIndex !== -1) {
+			throw new Error(`embedder: cannot embed empty/whitespace-only input at index ${emptyIndex} — providers reject it`)
+		}
+
 		const embeddings: number[][] = []
 		let promptTokens = 0
 		let totalTokens = 0
