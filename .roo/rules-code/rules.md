@@ -51,6 +51,19 @@ next to it — reach for the specific tool, not the general one:
   confidence run right before `attempt_completion`; a passing selective run
   is NOT full-suite green.
 
+## Execute the verification step your todo list names — don't re-derive it
+
+- If your todo list's next item is "run baseline tests" or "verify coverage",
+  call `run_tests` FIRST. One test run answers "is coverage intact" in a
+  single shot; endless greps/reads of individual mappings cannot — and they
+  burn the iteration budget (live failure: a 250-iteration round spent ~200
+  read-only grep iterations re-verifying what one test run would have shown).
+- Re-answering the same question with a slightly rephrased grep is a
+  verification loop, not progress. The harness nudges you after 8 consecutive
+  read-only iterations and hard-stops with a bounded failure after 75
+  (`HEADLESSCODE_READ_ONLY_STALL_LIMIT`) — treat that nudge as a command to
+  take a progress action: an edit, a `run_tests` call, or `attempt_completion`.
+
 If a tool returns "not supported" (non-TS/JS file) or "could not resolve,"
 that's a real, final answer for that file/symbol — fall back to
 `read_file`/grep, don't retry.

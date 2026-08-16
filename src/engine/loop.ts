@@ -236,11 +236,26 @@ export const DEFAULT_MAX_TOKENS = 32_768
  * via $HEADLESSCODE_READ_ONLY_NUDGE_THRESHOLD.
  */
 export const DEFAULT_READ_ONLY_NUDGE_THRESHOLD = 8
+/**
+ * Hard cap on consecutive all-read-only iterations (env
+ * $HEADLESSCODE_READ_ONLY_STALL_LIMIT). A session doing this many pure
+ * read/exploration iterations with NO edit, test run, or completion is stuck —
+ * live round w3 (issue #103, 2026-08-16) burned ~200 grep iterations this way,
+ * substituting manual verification for the one run_tests call it had planned.
+ * Terminate it like a consecutive-mistakes bounded failure instead of letting
+ * it eat the whole iteration budget. Any non-read-only call resets the streak,
+ * so a legitimately read-heavy task only trips this if it never produces
+ * anything for a very long time.
+ */
+export const DEFAULT_READ_ONLY_STALL_LIMIT = 75
 /** Tool names that count as "blind tree-walking" for the guardrail above. */
 const READ_ONLY_TOOL_NAMES = new Set(["list_files", "read_file", "search_files"])
-/** The injected nudge (user-role, seen by the model on its next turn). */
+/** The injected nudge (user-role, seen by the model on its next turn), indexed workspaces. */
 const READ_ONLY_NUDGE_MESSAGE =
-	"You've made several read/exploration calls without using `codebase_search`. If the workspace has an index (it lives in the central project store — see `~/.local/share/headlesscode/projects/`), try `codebase_search` for targeted semantic search instead of blind tree-walking. If the workspace is not indexed, ignore this nudge."
+	"You've made several read/exploration calls without using `codebase_search`. If the workspace has an index (it lives in the central project store — see `~/.local/share/headlesscode/projects/`), try `codebase_search` for targeted semantic search instead of blind tree-walking."
+/** The injected nudge for unindexed workspaces — no index to point at, so lead with progress. */
+const READ_ONLY_PROGRESS_NUDGE_MESSAGE =
+	"You've made several read/exploration calls without progress. If the next step in your todo list is verification, `run_tests` answers it in one shot — prefer running the project's test suite over more manual greps/reads. Take a progress action now (edit, test run, or completion) instead of further read-only exploration."
 
 /**
  * Leading command names treated as read-only-equivalent by
@@ -2448,10 +2463,13 @@ export class HeadlessSession {
 		// attempt_completion is always accepted afterwards (see
 		// COMMIT_NUDGE_CONTENT).
 		let completionNudged = false
-		// Blind tree-walking guardrail (P1.6): count consecutive read-only
-		// iterations; when the streak crosses the threshold AND the workspace
-		// is indexed, inject one soft nudge per streak (see READ_ONLY_NUDGE_MESSAGE).
+		// Blind tree-walking guardrail (P1.6): count consecutive all-read-only
+		// iterations; when the streak crosses the threshold, inject one soft
+		// nudge per streak (codebase_search-specific when indexed, progress-
+		// focused when not); when it crosses the hard stall limit, terminate
+		// like a bounded failure.
 		const readOnlyNudgeThreshold = envReadOnlyNudgeThreshold()
+		const readOnlyStallLimit = envReadOnlyStallLimit()
 		let readOnlyStreak = 0
 		let readOnlyNudgeInjected = false
 
@@ -3011,12 +3029,19 @@ export class HeadlessSession {
 			// execute_command whose shell command is read-only-equivalent —
 			// see isReadOnlyEquivalentShellCommand's doc comment for why that
 			// half matters: it's the dominant real-world exploration pattern)
-			// with no codebase_search, code-intel, or edit, inject a soft
-			// user-role nudge pointing at codebase_search. One nudge per
-			// streak; any non-read-only tool resets the streak. Never fires
-			// on an unindexed workspace (blind walking is then the only
-			// option). Soft + reversible — a later productive call resets
-			// everything.
+			// with no edit, test run, or completion, inject a soft user-role
+			// nudge. One nudge per streak; any non-read-only tool resets the
+			// streak. When the streak crosses the hard stall limit, terminate
+			// with a bounded failure — a session that read-only for this long
+			// without producing anything is stuck, and letting it burn the
+			// whole iteration budget buys nothing (live round w3, issue #103,
+			// 2026-08-16: ~200 pure grep iterations replacing one run_tests
+			// call). The nudge fires in BOTH indexed and unindexed workspaces —
+			// the message just points at codebase_search only where one exists
+			// (in an unindexed workspace there is nothing better than walking
+			// the tree, so the nudge leads with "make progress / run tests").
+			// Soft + reversible — a later productive call resets everything;
+			// the stall termination is the only hard stop.
 			// Whether every call in this turn is a plain read/exploration call
 			// (list_files / read_file / search_files, or a read-only-equivalent
 			// execute_command). Shared by the blind-tree-walking nudge above and
@@ -3034,16 +3059,16 @@ export class HeadlessSession {
 				if (allReadOnly) {
 					readOnlyStreak++
 					if (readOnlyStreak >= readOnlyNudgeThreshold && !readOnlyNudgeInjected) {
-						if (await hasCodebaseIndex(this.config.workspaceRoot)) {
-							readOnlyNudgeInjected = true
-							messages.push({ role: "user", content: READ_ONLY_NUDGE_MESSAGE })
-							this.logger.warn("[loop] blind tree-walking nudge injected", { readOnlyStreak })
-						} else {
-							// Unindexed workspace: the nudge would be noise (the
-							// model has no better option than walking the tree).
-							// Reset so we stop re-checking every iteration.
-							readOnlyStreak = 0
-						}
+						readOnlyNudgeInjected = true
+						const message = (await hasCodebaseIndex(this.config.workspaceRoot))
+							? READ_ONLY_NUDGE_MESSAGE
+							: READ_ONLY_PROGRESS_NUDGE_MESSAGE
+						messages.push({ role: "user", content: message })
+						this.logger.warn("[loop] blind tree-walking nudge injected", { readOnlyStreak })
+					}
+					if (readOnlyStreak >= readOnlyStallLimit) {
+						await this.saveIterationCheckpoint(iteration)
+						return this.boundedFailure("read-only stagnation", iteration, toolCalls, readOnlyStreak, readOnlyStallLimit)
 					}
 				} else {
 					// Any non-read-only call (edit, codebase_search, code-intel,
@@ -3639,11 +3664,12 @@ export class HeadlessSession {
 		iterations: number,
 		toolCalls: number,
 		consecutiveMistakes: number,
+		limit: number = this.config.consecutiveErrorLimit,
 	): SessionResult {
-		this.logger.error("[loop] bounded failure", { reason, consecutiveMistakes })
+		this.logger.error("[loop] bounded failure", { reason, consecutiveMistakes, limit })
 		return {
 			status: "error",
-			error: `Bounded failure: ${consecutiveMistakes} ${reason} (limit ${this.config.consecutiveErrorLimit})`,
+			error: `Bounded failure: ${consecutiveMistakes} ${reason} (limit ${limit})`,
 			iterations,
 			toolCalls,
 		}
@@ -3872,6 +3898,15 @@ function envReadOnlyNudgeThreshold(): number {
 	}
 	const n = Number(raw)
 	return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_READ_ONLY_NUDGE_THRESHOLD
+}
+
+function envReadOnlyStallLimit(): number {
+	const raw = process.env.HEADLESSCODE_READ_ONLY_STALL_LIMIT
+	if (raw === undefined || raw === "") {
+		return DEFAULT_READ_ONLY_STALL_LIMIT
+	}
+	const n = Number(raw)
+	return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_READ_ONLY_STALL_LIMIT
 }
 
 /**

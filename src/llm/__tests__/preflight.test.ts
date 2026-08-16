@@ -221,11 +221,19 @@ async function testRunPreflightOkReportsProbeCostFromUsage(): Promise<void> {
 // ─── round cost estimate ─────────────────────────────────────────────────────
 
 async function testEstimateRoundCost(): Promise<void> {
-	// deepseek/deepseek-v4-flash: $0.14/1M in, $0.28/1M out.
+	// deepseek/deepseek-v4-flash: $0.14/1M in, $0.28/1M out, $0.0028/1M cached.
+	// The estimator must model the ITERATIVE loop (context resends, mostly
+	// cache-read) — the old single-request model was ~27x low on a live round
+	// (round1-consolidation 2026-08-16: estimated $0.0336 for the round vs a
+	// ~$0.90 actual: $0.09–$0.39/session over 83–241 iterations).
 	const perSession = estimateRoundCost("deepseek/deepseek-v4-flash", 1)
-	const expectedPerSession = (NOMINAL_SESSION_INPUT_TOKENS * 0.14 + NOMINAL_SESSION_OUTPUT_TOKENS * 0.28) / 1_000_000
-	assert.ok(Math.abs(perSession - expectedPerSession) < 1e-9, `per-session estimate ${perSession} ≈ ${expectedPerSession}`)
-	assert.ok(Math.abs(estimateRoundCost("deepseek/deepseek-v4-flash", 4) - expectedPerSession * 4) < 1e-9, "scales with sessions")
+	const singleRequest = (NOMINAL_SESSION_INPUT_TOKENS * 0.14 + NOMINAL_SESSION_OUTPUT_TOKENS * 0.28) / 1_000_000
+	assert.ok(
+		perSession > singleRequest * 10,
+		`iterative model must price a real multi-iteration session, not one request (perSession ${perSession} vs single-request ${singleRequest})`,
+	)
+	assert.ok(perSession > 0.02 && perSession < 1.0, `per-session estimate lands in a plausible band: ${perSession}`)
+	assert.ok(Math.abs(estimateRoundCost("deepseek/deepseek-v4-flash", 4) - perSession * 4) < 1e-9, "scales with sessions")
 	// Unknown model falls back to FALLBACK_MODEL_PRICE (conservative, > 0).
 	assert.ok(estimateRoundCost("nope/model", 1) > 0, "unknown models still produce a conservative estimate")
 }

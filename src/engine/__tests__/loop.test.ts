@@ -16,6 +16,7 @@ import { setTimeout as sleep } from "node:timers/promises"
 
 import {
 	HeadlessSession,
+	DEFAULT_READ_ONLY_STALL_LIMIT,
 	isReadOnlyEquivalentShellCommand,
 	stripSupersededReasoning,
 	truncateHistory,
@@ -669,7 +670,12 @@ async function testReadOnlyNudgeResetsOnProductiveCall(): Promise<void> {
 	}
 }
 
-async function testReadOnlyNudgeNotInjectedWhenUnindexed(): Promise<void> {
+async function testReadOnlyNudgeInjectedWhenUnindexed(): Promise<void> {
+	// Regression (round w3, issue #103, 2026-08-16): the guardrail was gated
+	// on hasCodebaseIndex() and so was INERT on the unindexed workspaces where
+	// grep-spirals are worst — ~200 pure read-only iterations replaced one
+	// run_tests call. The nudge must now fire there too, leading with progress
+	// (run_tests) since there is no codebase_search to point at.
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-nudge-noindex-"))
 	try {
 		for (let i = 1; i <= 9; i++) {
@@ -683,7 +689,17 @@ async function testReadOnlyNudgeNotInjectedWhenUnindexed(): Promise<void> {
 		const result = await session.run()
 
 		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
-		assert.deepEqual(requestsContainingNudge(client.requests), [], "no nudge when the workspace has no codebase-search index")
+		assert.deepEqual(
+			requestsContainingNudge(client.requests),
+			[8, 9],
+			"unindexed workspace still gets the nudge after 8 read-only iterations (and it persists for the rest of the session)",
+		)
+		const nudgeMsg = client.requests[8].messages.find(
+			(m) => m.role === "user" && typeof m.content === "string" && m.content.includes(NUDGE_FRAGMENT),
+		)
+		assert.ok(nudgeMsg && typeof nudgeMsg.content === "string", "nudge message present in the 9th request")
+		assert.ok(nudgeMsg.content.includes("run_tests"), "unindexed nudge leads with run_tests (no index to point at)")
+		assert.ok(!nudgeMsg.content.includes("codebase_search"), "unindexed nudge must not suggest codebase_search")
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -744,6 +760,59 @@ async function testReadOnlyNudgeNotTrippedByMutatingExecuteCommand(): Promise<vo
 
 		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
 		assert.deepEqual(requestsContainingNudge(client.requests), [], "one mutating command in the streak must suppress the nudge")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// ─── Read-only stagnation stall limit ────────────────────────────────────────
+
+async function testReadOnlyStallLimitTerminates(): Promise<void> {
+	// The w3 failure shape, on an unindexed workspace: ~200 consecutive
+	// grep-style read-only iterations. The hard stall limit (default 75) must
+	// end the session with a bounded failure long before the iteration cap.
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-stall-"))
+	try {
+		const client = new FakeLlmClient([
+			...Array.from({ length: 90 }, (_, i) => () =>
+				toolCall("execute_command", { command: `grep -rn 'pat${i}' . | head` })),
+		])
+		const session = await makeSession({ task: "verify forever", client, workspaceRoot: ws, maxIterations: 250 })
+		const result = await session.run()
+
+		assert.equal(result.status, "error", `expected bounded failure, got ${JSON.stringify(result)}`)
+		assert.match(result.error ?? "", /read-only stagnation/)
+		assert.equal(
+			result.iterations,
+			DEFAULT_READ_ONLY_STALL_LIMIT,
+			`stall fires exactly at iteration ${DEFAULT_READ_ONLY_STALL_LIMIT}`,
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testReadOnlyStallLimitNotTrippedByProductiveInterleave(): Promise<void> {
+	// 40 read-only, one edit, 40 read-only: neither streak approaches the 75
+	// stall limit, so the session must complete normally (a soft nudge per
+	// streak is expected — it never hard-stops a productive session).
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-stall-reset-"))
+	try {
+		const client = new FakeLlmClient([
+			// `grep | head` pipelines exit 0 even with no matches, so no tool
+			// errors and no consecutive-mistake noise (unlike read_file on a
+			// path that does not exist).
+			...Array.from({ length: 40 }, (_, i) => () =>
+				toolCall("execute_command", { command: `grep -rn 'pat${i}' . | head` })),
+			() => toolCall("write_to_file", { path: "out.txt", content: "reset" }),
+			...Array.from({ length: 40 }, (_, i) => () =>
+				toolCall("execute_command", { command: `grep -rn 'pat${i}' . | head` })),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({ task: "explore then write", client, workspaceRoot: ws, maxIterations: 250 })
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -1580,9 +1649,11 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["max iterations -> handoff write retries once after a transient condense failure", testIterationCapHandoffSummaryRetriesOnceAfterCondenseFailure],
 	["blind tree-walking: nudge after N consecutive read-only iterations (indexed ws)", testReadOnlyNudgeTriggered],
 	["blind tree-walking: a productive tool call resets the streak", testReadOnlyNudgeResetsOnProductiveCall],
-	["blind tree-walking: no nudge when the workspace is unindexed", testReadOnlyNudgeNotInjectedWhenUnindexed],
+	["blind tree-walking: nudge fires on unindexed workspaces too, leading with run_tests", testReadOnlyNudgeInjectedWhenUnindexed],
 	["blind tree-walking: grep/ls/sed/git/docker-ps execute_command streak trips the nudge same as read_file", testReadOnlyNudgeTriggeredByGrepStyleExecuteCommand],
 	["blind tree-walking: one mutating execute_command in the streak suppresses the nudge", testReadOnlyNudgeNotTrippedByMutatingExecuteCommand],
+	["read-only stagnation: a long pure-read streak ends in bounded failure before the iteration cap", testReadOnlyStallLimitTerminates],
+	["read-only stagnation: an edit in the middle resets the streak (no false stall)", testReadOnlyStallLimitNotTrippedByProductiveInterleave],
 	["isReadOnlyEquivalentShellCommand: classifies read-only vs. mutating shell commands", testIsReadOnlyEquivalentShellCommandClassifiesCorrectly],
 	["live snapshot: created + updated in place during a running session's iterations", testLiveSnapshotCreatedAndUpdatedDuringIterations],
 	["live snapshot: removed on successful completion", testLiveSnapshotRemovedOnSuccess],

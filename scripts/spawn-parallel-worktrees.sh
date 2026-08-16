@@ -410,11 +410,33 @@ for spec in "$@"; do
 
     echo "=== Creating worktree '$name' at $wt_path (branch $branch, port offset $offset) ==="
 
-    git -C "$REPO_ROOT" fetch origin master --quiet 2>/dev/null || echo "  (note: git fetch origin master failed — using local master)"
-    if ! git -C "$REPO_ROOT" worktree add -b "$branch" "$wt_path" origin/master; then
-        echo "  (origin/master unavailable — falling back to local master)"
-        if ! git -C "$REPO_ROOT" worktree add -b "$branch" "$wt_path" master; then
-            echo "ERROR: $name — could not create worktree on branch '$branch' (it may already exist; see the collision note above). Remove the leftover and retry." >&2
+    # Base-branch resolution (round1-consolidation 2026-08-16: hardcoding
+    # origin/master silently branched every worktree off the WRONG lineage when
+    # the fetch failed and the repo's primary branch is not master — this repo
+    # works off pyside6-desktop). Resolution order: $HEADLESSCODE_BASE_BRANCH
+    # override → origin's default branch → the main checkout's current branch.
+    # A fetch failure falls back to the SAME-NAMED local branch (correct lineage
+    # offline) rather than a hardcoded master. Unresolvable base = hard failure:
+    # a wrong-lineage round is worse than no round.
+    base_branch="${HEADLESSCODE_BASE_BRANCH:-}"
+    if [ -z "$base_branch" ]; then
+        # `|| true`: with set -euo pipefail a missing ref would abort the script.
+        base_branch="$(git -C "$REPO_ROOT" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' || true)"
+    fi
+    if [ -z "$base_branch" ]; then
+        base_branch="$(git -C "$REPO_ROOT" symbolic-ref --short HEAD 2>/dev/null || true)"
+    fi
+    if [ -z "$base_branch" ]; then
+        echo "ERROR: $name — cannot resolve a base branch (set HEADLESSCODE_BASE_BRANCH or check out the repo's primary branch). Refusing to guess." >&2
+        exit 1
+    fi
+
+    echo "  (base branch: $base_branch)"
+    git -C "$REPO_ROOT" fetch origin "$base_branch" --quiet 2>/dev/null || echo "  (note: git fetch origin $base_branch failed — will use local '$base_branch' if it exists)"
+    if ! git -C "$REPO_ROOT" worktree add -b "$branch" "$wt_path" "origin/$base_branch"; then
+        echo "  (origin/$base_branch unavailable — falling back to local $base_branch)"
+        if ! git -C "$REPO_ROOT" worktree add -b "$branch" "$wt_path" "$base_branch"; then
+            echo "ERROR: $name — could not create worktree on branch '$branch' from base '$base_branch' (neither origin/$base_branch nor local $base_branch resolvable). Remove the leftover and retry." >&2
             exit 1
         fi
     fi

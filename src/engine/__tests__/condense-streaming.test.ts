@@ -333,8 +333,11 @@ async function testCondensationAndStreamingInOneSession(): Promise<void> {
 		// ── History sent to the model after condensation is shorter ──────────
 		const preReq = client.requests[10]
 		const postReq = client.requests[12]
-		assert.equal(preReq.messages.length, 31, "pre-condensation request had 31 messages (full grown history)")
-		assert.equal(postReq.messages.length, 12, "post-condensation request is shorter: system + task + summary + 9-message tail")
+		// The unindexed-workspace read-only nudge fires at iteration 8, adding
+		// one user message to every subsequent request (all 11 turns here are
+		// read_file-only, so it's 31+1 before and 12+1 after condensation).
+		assert.equal(preReq.messages.length, 32, "pre-condensation request had 32 messages (full grown history incl. the read-only nudge)")
+		assert.equal(postReq.messages.length, 13, "post-condensation request is shorter: system + task + summary + 10-message tail (nudge survives the condense window)")
 		assert.equal(postReq.stream, true, "the post-condensation main call is still streamed")
 		assert.equal(typeof postReq.onStreamChunk, "function")
 		assert.equal(postReq.messages[2].role, "user", "summary lands at index 2 (no orphaned tool message)")
@@ -363,8 +366,8 @@ async function testCondensationAndStreamingInOneSession(): Promise<void> {
 		assert.deepEqual(iterStarts.map((e) => e.iteration), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
 		assert.deepEqual(
 			iterStarts.map((e) => e.historyMessageCount),
-			[2, 5, 7, 11, 13, 16, 20, 22, 25, 27, 31, 34],
-			"iteration_start reports the PRE-condensation history (34 at iteration 12)",
+			[2, 5, 7, 11, 13, 16, 20, 22, 26, 28, 32, 35],
+			"iteration_start reports the PRE-condensation history (35 at iteration 12 — the nudge injected after iteration 8 shows from iteration 9 on)",
 		)
 
 		// The condensation moment itself: the condensed event lands immediately
@@ -381,13 +384,13 @@ async function testCondensationAndStreamingInOneSession(): Promise<void> {
 		assert.equal(events[i12 + 5].type, "llm_response")
 
 		// The condensed event's payload: the message counts the timeline shows
-		// (31 → 12) and the condensation call's own usage, so condensation
+		// (32 → 13) and the condensation call's own usage, so condensation
 		// spend is visible in the feed, not just the session totals.
 		const condensedEvents = events.filter((e) => e.type === "condensed")
 		assert.equal(condensedEvents.length, 1, "exactly one condensed event across the session")
 		assert.equal(condensedEvents[0].iteration, 12)
-		assert.equal(condensedEvents[0].messagesBefore, 34, "history length at condensation time (matches the iteration_start count)")
-		assert.equal(condensedEvents[0].messagesAfter, 12, "history length after condensation")
+		assert.equal(condensedEvents[0].messagesBefore, 35, "history length at condensation time (matches the iteration_start count)")
+		assert.equal(condensedEvents[0].messagesAfter, 13, "history length after condensation")
 		assert.equal(condensedEvents[0].inputTokens, 40_000, "condensed event carries the condensation call's input tokens")
 		assert.equal(condensedEvents[0].outputTokens, 2_000, "condensed event carries the condensation call's output tokens")
 

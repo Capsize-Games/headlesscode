@@ -78,28 +78,51 @@ export interface PreflightOptions {
 
 /**
  * Nominal per-session token profile for the round cost estimate. Deliberately
- * an ORDER-OF-MAGNITUDE heuristic (a mid-size agentic session — ~50 iterations
- * of a few thousand tokens each), clearly labeled as such in the output: the
+ * an ORDER-OF-MAGNITUDE heuristic, clearly labeled as such in the output: the
  * estimate is for deciding whether a round is affordable, not for billing.
  */
+/** Prefix/first-request size per session (system prompt + tool catalog). */
 export const NOMINAL_SESSION_INPUT_TOKENS = 40_000
+/** Single-request output baseline (kept for compatibility/testing). */
 export const NOMINAL_SESSION_OUTPUT_TOKENS = 10_000
+/** Nominal iterations per worker session for the estimate. */
+export const NOMINAL_SESSION_ITERATIONS = 120
+/** History growth per iteration (tokens) — tool-call turns accumulate. */
+export const NOMINAL_HISTORY_GROWTH_PER_ITERATION = 700
+/** Output tokens per iteration (a tool-call turn, not a big generation). */
+export const NOMINAL_OUTPUT_TOKENS_PER_ITERATION = 1_000
+/**
+ * Cache-hit rate for resends of the growing history. Live rounds measured
+ * ~94% (round1-consolidation 2026-08-16, deepseek-v4-flash) — context resends
+ * are cheap cache reads; only the prefix and misses pay full input price.
+ */
+export const NOMINAL_CACHE_HIT_RATE = 0.9
 
 /**
- * Estimate the round's LLM cost: nominal per-session tokens × the model's
- * price × worker session count. Uses the effective pricing table (defaults +
+ * Estimate the round's LLM cost by modeling the ITERATIVE loop, not a single
+ * request: history grows ~linearly each iteration, so total input ≈
+ * iterations × average-history-size, most of it cache-read; output scales with
+ * iterations. Calibrated against a live 4-worker round (2026-08-16) that
+ * measured $0.09–$0.39/session over 83–241 iterations — the old single-request
+ * model (40k in / 10k out) estimated $0.0336 for the whole round, ~27× under
+ * the ~$0.90 actual. Uses the effective pricing table (defaults +
  * $HEADLESSCODE_PRICING_JSON overrides), same as the budget guardrail.
  */
 export function estimateRoundCost(
 	model: string,
 	workerSessions: number,
-	options: { pricing?: PricingTable; env?: NodeJS.ProcessEnv } = {},
+	options: { pricing?: PricingTable; env?: NodeJS.ProcessEnv; iterationsPerSession?: number } = {},
 ): number {
 	const table = options.pricing ?? loadPricingTable(options.env ?? process.env)
+	const iterations = options.iterationsPerSession ?? NOMINAL_SESSION_ITERATIONS
+	// Average history size over the session ≈ prefix + (iterations/2) × growth.
+	const avgHistoryTokens = NOMINAL_SESSION_INPUT_TOKENS + (iterations / 2) * NOMINAL_HISTORY_GROWTH_PER_ITERATION
+	const totalInputTokens = avgHistoryTokens * iterations
 	const perSession = estimateCost({
 		model,
-		inputTokens: NOMINAL_SESSION_INPUT_TOKENS,
-		outputTokens: NOMINAL_SESSION_OUTPUT_TOKENS,
+		inputTokens: totalInputTokens,
+		cachedTokens: Math.round(totalInputTokens * NOMINAL_CACHE_HIT_RATE),
+		outputTokens: iterations * NOMINAL_OUTPUT_TOKENS_PER_ITERATION,
 		pricing: table,
 	})
 	return perSession * Math.max(1, workerSessions)
