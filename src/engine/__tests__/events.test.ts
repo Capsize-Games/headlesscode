@@ -33,7 +33,11 @@ class FakeLlmClient implements LlmClient {
 	) {}
 
 	async createChatCompletion(request: LlmRequest): Promise<LlmResponse> {
-		this.requests.push(request)
+		// Snapshot messages: the loop mutates the SAME array across iterations
+		// (assistant/tool pushes, T1 reasoning strip), so without a copy every
+		// recorded request aliases to the array's final state — the same
+		// aliasing loop.test.ts's fake already guards against.
+		this.requests.push({ ...request, messages: request.messages.map((m) => ({ ...m })) })
 		const step = this.script.shift()
 		if (!step) {
 			throw new Error("FakeLlmClient: script exhausted (model kept calling)")
@@ -538,6 +542,47 @@ async function testReasoningFlowsToEventFeedTruncated(): Promise<void> {
 }
 
 /**
+ * (T1) Superseded reasoning is stripped from assistant history: on request 3
+ * of a 3-turn session, turn-1's reasoning must be GONE while turn-2's (the
+ * immediately-preceding assistant message) is still echoed — native DeepSeek
+ * only needs reasoning on that one message, older echoes are pure token cost.
+ */
+async function testSupersededReasoningStrippedFromHistory(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-events-reason-strip-"))
+	try {
+		// Seed the files so the read_file turns succeed (no mistake-limit edge).
+		await fs.writeFile(path.join(ws, "a.txt"), "aaa", "utf-8")
+		await fs.writeFile(path.join(ws, "b.txt"), "bbb", "utf-8")
+		const client = new FakeLlmClient([
+			// Turn 1: tool call carrying reasoning-1.
+			() => ({ ...toolCall("read_file", { path: "a.txt" }), reasoning: "reasoning-1" }),
+			// Turn 2: tool call carrying reasoning-2.
+			() => ({ ...toolCall("read_file", { path: "b.txt" }), reasoning: "reasoning-2" }),
+			// Turn 3: completion.
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({ task: "three turns", client, workspaceRoot: ws })
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+
+		// Request 3's history: turn-2's assistant message is the immediately
+		// preceding one, so it keeps reasoning-2; turn-1's is superseded.
+		const third = client.requests[2]
+		assert.ok(third, "expected a third request")
+		assert.ok(
+			third.messages.some((m) => m.role === "assistant" && m.reasoning === "reasoning-2"),
+			"the most-recent assistant message keeps its reasoning (DeepSeek requires it on the immediately-preceding message)",
+		)
+		assert.ok(
+			!third.messages.some((m) => m.role === "assistant" && m.reasoning === "reasoning-1"),
+			"superseded turn-1 reasoning is stripped from the request-3 history",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+/**
  * A streamed session must emit `llm_stream_chunk` events incrementally (in
  * order, reasoning before text), and the final `llm_response` summary still
  * fires once with the assembled text + usage.
@@ -710,6 +755,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["events: feed file is KEPT after the session ends (unlike the live usage snapshot)", testEventFeedKeptAfterSessionEnds],
 	["events: ask_followup_question mirrors decision_blocked/decision_answered on the feed", testDecisionEventsMirrorMarkerLifecycle],
 	["events: reasoning flows to the feed truncated + echoed on next call history", testReasoningFlowsToEventFeedTruncated],
+	["events: (T1) superseded reasoning is stripped from assistant history, most-recent kept", testSupersededReasoningStrippedFromHistory],
 	["events: streamed chunks emit incrementally, llm_response summary fires once", testStreamedChunksEmitIncrementally],
 	["events: a streamed tool-call turn emits tool chunks + a single tool_call", testStreamedToolCallTurnEmitsToolChunks],
 	["events: streamed response usage feeds the budget tracker exactly once (no double-count)", testStreamedResponseUsageFeedsBudgetOnce],

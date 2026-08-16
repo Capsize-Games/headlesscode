@@ -82,6 +82,7 @@ import type {
 	ChatTool,
 	LlmClient,
 	LlmResponse,
+	ParsedToolCall,
 	SessionResult,
 	SessionBudgetUsage,
 	ToolContext,
@@ -349,7 +350,62 @@ export function isReadOnlyEquivalentShellCommand(command: string): boolean {
 }
 
 /**
- * Same-file multi-edit diagnosis (see the tool-execution loop): when the
+	* (S3) Tool names that are safe to run CONCURRENTLY with their siblings in a
+	* single turn: plain read/exploration tools with no shared mutable state.
+	* `execute_command` is additionally gated per-call by
+	* isReadOnlyEquivalentShellCommand (see isParallelReadOnlyCall).
+	*/
+const PARALLEL_READ_ONLY_TOOL_NAMES = new Set([
+	"read_file",
+	"list_files",
+	"search_files",
+	// TS code-intelligence reads (src/codeintel/) — read-only, executor-side.
+	"outline",
+	"go_to_definition",
+	"find_references",
+	"import_graph",
+])
+
+/**
+	* (S3) Whether a call may run concurrently with the turn's other read-only
+	* calls. Only pure reads qualify: the tools above, plus an execute_command
+	* whose shell command is read-only-equivalent. Everything else — any
+	* edit-capable call, switch_mode / ask_followup_question / new_task (the
+	* single decision-marker protocol), or anything ambiguous — is serial.
+	* A read_file whose path collides with a file an edit call in this turn
+	* modifies is ALSO serial: the model composed that read against the file's
+	* state at its position in the turn, so submission order must be preserved
+	* (a read-then-edit must see pre-edit content; an edit-then-read must see
+	* post-edit content).
+	*/
+function isParallelReadOnlyCall(
+	workspaceRoot: string,
+	call: { name: string; args: Record<string, unknown> },
+	editedPaths: ReadonlySet<string>,
+): boolean {
+	if (call.name === "execute_command") {
+		return typeof call.args.command === "string" && isReadOnlyEquivalentShellCommand(call.args.command)
+	}
+	if (!PARALLEL_READ_ONLY_TOOL_NAMES.has(call.name)) {
+		return false
+	}
+	if (call.name === "read_file") {
+		const raw = typeof call.args.path === "string" && call.args.path.trim() !== "" ? call.args.path : undefined
+		if (raw !== undefined) {
+			try {
+				if (editedPaths.has(path.resolve(workspaceRoot, raw))) {
+					return false
+				}
+			} catch {
+				// Unresolvable path: fall through — a parallel read is harmless.
+			}
+		}
+	}
+	return true
+}
+
+/**
+	* Same-file multi-edit diagnosis (see the tool-execution loop): when the
  * model submits several edit calls to the SAME file in ONE turn, the later
  * calls' SEARCH text was typically composed against the file's PRE-first-edit
  * content — so they fail with a "diff didn't match" error the model has to
@@ -371,6 +427,30 @@ const BATCH_EDIT_TOOL_NAMES = new Set(["apply_diff", "search_replace", "edit_fil
  * (the executor's own safeTarget is) — a mis-extraction only skips a
  * diagnosis, never blocks anything.
  */
+/**
+ * (T1) Strip reasoning from every assistant history message except the most
+ * recent one. Native DeepSeek only needs reasoning echoed on the
+ * IMMEDIATELY-PRECEDING assistant message in an active tool-call chain — older
+ * echoes are pure token cost on every subsequent request (the whole history is
+ * re-sent). Tool and user messages are never touched. Mutates `messages` in
+ * place: the caller pushes the new assistant message FIRST, so "most recent"
+ * is the message that must keep its reasoning for the next request.
+ */
+export function stripSupersededReasoning(messages: ChatMessage[]): void {
+	let lastAssistant = -1
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (messages[i].role === "assistant") {
+			lastAssistant = i
+			break
+		}
+	}
+	for (let i = 0; i < messages.length; i++) {
+		if (i !== lastAssistant && messages[i].role === "assistant" && messages[i].reasoning !== undefined) {
+			messages[i].reasoning = undefined
+		}
+	}
+}
+
 function editToolTargetPath(workspaceRoot: string, call: { name: string; args: Record<string, unknown> }): string | undefined {
 	if (!BATCH_EDIT_TOOL_NAMES.has(call.name)) {
 		return undefined
@@ -953,6 +1033,14 @@ export class HeadlessSession {
 	 * that result. null when no switch is awaiting its marker.
 	 */
 	private pendingModeSwitchMarker: string | null = null
+	/**
+	 * (S2) Ordering guard for fire-and-forget auxiliary writes: a per-session
+	 * promise chain so a later-scheduled write never overtakes an earlier one
+	 * (event-feed appends and the live-snapshot overwrite must land in
+	 * occurrence order). Drained at the end of run() so "session ended" implies
+	 * "aux writes flushed" — see scheduleAux/drainAuxWrites.
+	 */
+	private _auxChain: Promise<void> = Promise.resolve()
 
 	constructor(config: HeadlessSessionConfig) {
 		if (!config.llmClient) {
@@ -1035,35 +1123,43 @@ export class HeadlessSession {
 				// Live worker monitoring: mirror ask_followup_question's
 				// .harness.needs-decision marker lifecycle on the session's
 				// event feed (decision_blocked / decision_answered). Non-fatal.
+				// (S2) Routed through scheduleAux so the event lands in the feed
+				// in occurrence order (these fire during tool execution, while
+				// earlier events may still be queued in the chain).
 				onDecisionEvent: (eventType, fields) => {
-					void this.emitEvent(
-						eventType,
-						() =>
-							eventType === "decision_blocked"
-								? this.eventFeed.decisionBlocked(
-										typeof fields.question === "string" ? fields.question : "(no question)",
-										Array.isArray(fields.suggestions) ? (fields.suggestions as string[]) : undefined,
-									)
-								: this.eventFeed.decisionAnswered(
-										typeof fields.answer === "string" ? fields.answer : undefined,
-										fields.timedOut === true,
-									),
-						fields,
+					this.scheduleAux(() =>
+						this.emitEvent(
+							eventType,
+							() =>
+								eventType === "decision_blocked"
+									? this.eventFeed.decisionBlocked(
+											typeof fields.question === "string" ? fields.question : "(no question)",
+											Array.isArray(fields.suggestions) ? (fields.suggestions as string[]) : undefined,
+										)
+									: this.eventFeed.decisionAnswered(
+											typeof fields.answer === "string" ? fields.answer : undefined,
+											fields.timedOut === true,
+										),
+							fields,
+						),
 					)
 				},
 				// Live worker monitoring: mirror each update_todo_list state
 				// change on the session's event feed (todo_updated). Non-fatal.
+				// (S2) Same ordering reasoning as onDecisionEvent.
 				onTodoEvent: (fields) => {
-					void this.emitEvent(
-						"todo_updated",
-						() =>
-							this.eventFeed.todoUpdated({
-								todos: fields.todos,
-								done: fields.done,
-								inProgress: fields.inProgress,
-								pending: fields.pending,
-							}),
-						fields,
+					this.scheduleAux(() =>
+						this.emitEvent(
+							"todo_updated",
+							() =>
+								this.eventFeed.todoUpdated({
+									todos: fields.todos,
+									done: fields.done,
+									inProgress: fields.inProgress,
+									pending: fields.pending,
+								}),
+							fields,
+						),
 					)
 				},
 				// Cloud vision captioning: every auxiliary LLM call's usage
@@ -1173,15 +1269,21 @@ export class HeadlessSession {
 		// browser_action, describe_image and the code-intelligence tools are
 		// not part of the vendored tool set, so selectToolsForMode can't
 		// include them — append them explicitly (see src/tools/browser/,
-		// src/vision/ and src/codeintel/). The TS-only code-intelligence tools
-		// (outline/go_to_definition/find_references/import_graph), rename_symbol
-		// (edits files) and run_tests (runs the test suite) are only advertised
-		// when THIS session's executor actually registers the handlers: the
+		// src/vision/ and src/codeintel/). Every non-vendored append is gated
+		// on THIS session's executor actually registering the handler: the
 		// read-only reviewer/QA executors must not be advertised tools they
-		// can't run, and on a non-TS/JS workspace (Python/C++/…) the executor
-		// deliberately does not register the ts.Program-based tools at all —
-		// so the tool list matches what actually works for the project.
-		let tools = appendDescribeImageTool(appendBrowserActionTool(this.config.tools ?? selectToolsForMode(mode, customModes)))
+		// can't run (they register browser_action but not describe_image), and
+		// on a non-TS/JS workspace (Python/C++/…) the executor deliberately
+		// does not register the ts.Program-based tools at all — so the tool
+		// list matches what actually works for the project (and read-only
+		// sessions don't carry a describe_image schema they'd error on).
+		let tools = this.config.tools ?? selectToolsForMode(mode, customModes)
+		if (this.executor.has("browser_action")) {
+			tools = appendBrowserActionTool(tools)
+		}
+		if (this.executor.has("describe_image")) {
+			tools = appendDescribeImageTool(tools)
+		}
 		if (this.executor.has("outline")) {
 			tools = appendCodeIntelTools(tools)
 		}
@@ -1194,6 +1296,8 @@ export class HeadlessSession {
 
 		this.state.systemPrompt = systemPrompt
 		this.state.tools = tools
+		// (T2/T3 measure-first) Log the fixed prompt + tool-catalog prefix size.
+		this.logPrefixSize(systemPrompt, tools, "session-start")
 
 		// 2. Seed history.
 		const messages: ChatMessage[] = [
@@ -1295,8 +1399,10 @@ export class HeadlessSession {
 			result = await this.runIterations(budgetTracker, startedAt)
 		} catch (error) {
 			// Defensive: runIterations normally returns SessionResults instead
-			// of throwing, but if it ever does, don't leave a stale live usage
-			// snapshot behind. Non-fatal (see removeLiveSnapshot), then rethrow.
+			// of throwing, but if it ever does, flush any still-in-flight aux
+			// writes (the last iteration's live snapshot) before removing the
+			// snapshot, then rethrow. Non-fatal (see removeLiveSnapshot).
+			await this.drainAuxWrites()
 			await this.removeLiveSnapshot()
 			throw error
 		} finally {
@@ -1315,6 +1421,11 @@ export class HeadlessSession {
 			this.sessionEnded = true
 			this.executor.dispose()
 		}
+		// (S2) "Session ended" implies "aux writes flushed": drain the background
+		// chain before returning so post-run readers see the final feed/snapshot
+		// state, and recordUsage's live-snapshot removal below never races a
+		// still-in-flight write from the last iteration.
+		await this.drainAuxWrites()
 		await this.recordMemory(result)
 		// Surface the budget/usage accounting on every result now (previously
 		// only present when a budget was configured).
@@ -1452,6 +1563,57 @@ export class HeadlessSession {
 	}
 
 	/**
+	 * (S2) Fire-and-forget auxiliary write dispatcher with an ordering guard:
+	 * appends `fn` to a per-session promise chain so a later-scheduled write
+	 * never overtakes an earlier one — event-feed appends and the live-snapshot
+	 * overwrite must land in occurrence order. The wrapped functions are all
+	 * non-fatal already (try/catch inside emitEvent/writeLiveSnapshot/
+	 * saveIterationCheckpoint); the catch here is a belt-and-suspenders no-op
+	 * log so a scheduling bug can never reject the chain and strand later
+	 * writes.
+	 */
+	private scheduleAux(fn: () => Promise<void>): void {
+		this._auxChain = this._auxChain.then(fn).catch((error) => {
+			this.logger.warn("[aux] background write failed (non-fatal)", {
+				error: error instanceof Error ? error.message : String(error),
+			})
+		})
+	}
+
+	/**
+	 * (S2) Await every scheduled auxiliary write. Called at the end of run() so
+	 * "session ended" implies "aux writes flushed" — post-run readers (tests,
+	 * orchestrators) see the final feed/snapshot state, and the live-snapshot
+	 * removal in recordUsage never races a still-in-flight write from the last
+	 * iteration.
+	 */
+	private async drainAuxWrites(): Promise<void> {
+		await this._auxChain
+	}
+
+	/**
+	 * (T2/T3 measure-first) Log the fixed prefix cost — final system prompt +
+	 * serialized tool catalog — at session start and on each switch_mode, so
+	 * real sessions in harness.log carry the numbers that justify (or kill)
+	 * prompt/tool-catalog surgery. Approximate tokens via ~4 chars/token (see
+	 * estimateTokenSize).
+	 */
+	private logPrefixSize(systemPrompt: string, tools: ChatTool[], context: string): void {
+		const toolJson = JSON.stringify(tools)
+		const totalChars = systemPrompt.length + toolJson.length
+		this.logger.info("[prefix-size]", {
+			context,
+			systemPromptChars: systemPrompt.length,
+			systemPromptTokensEstimate: estimateTokenSize(systemPrompt.length),
+			toolCount: tools.length,
+			toolCatalogChars: toolJson.length,
+			toolCatalogTokensEstimate: estimateTokenSize(toolJson.length),
+			totalPrefixChars: totalChars,
+			totalPrefixTokensEstimate: estimateTokenSize(totalChars),
+		})
+	}
+
+	/**
 	 * Issue #34 — the final report was the single most information-dense
 	 * moment of any session and the least observable: `attempt_completion`
 	 * short-circuits at step 6a BEFORE the tool-execution loop, so no
@@ -1473,10 +1635,15 @@ export class HeadlessSession {
 	 * completes with `reportPath` absent.
 	 */
 	private async persistFinalReport(iteration: number, result: string): Promise<string | undefined> {
-		await this.emitEvent(
-			"attempt_completion",
-			() => this.eventFeed.attemptCompletion({ iteration, result }),
-			{ iteration },
+		// (S2) The attempt_completion event is a feed append like any other —
+		// schedule it so it lands AFTER this turn's llm_response, which the
+		// critical path de-awaited (see scheduleAux).
+		this.scheduleAux(() =>
+			this.emitEvent(
+				"attempt_completion",
+				() => this.eventFeed.attemptCompletion({ iteration, result }),
+				{ iteration },
+			),
 		)
 		try {
 			const reportPath = await writeSessionReport(this.config.workspaceRoot, this.sessionId, result)
@@ -1696,19 +1863,23 @@ export class HeadlessSession {
 				messages.splice(0, messages.length, ...condensed)
 				// Emit the feed event the timeline needs: condensation used to
 				// be only a log line, invisible to the dashboard. Non-fatal.
-				await this.emitEvent("condensed", () =>
-					this.eventFeed.condensed({
-						iteration,
-						messagesBefore,
-						messagesAfter: condensed.length,
-						...(this.lastCondenseUsage
-							? {
-									inputTokens: this.lastCondenseUsage.inputTokens,
-									outputTokens: this.lastCondenseUsage.outputTokens,
-									cachedTokens: this.lastCondenseUsage.cachedTokens,
-								}
-							: {}),
-					}),
+				// (S2) Scheduled so it lands after this iteration's
+				// iteration_start, in occurrence order.
+				this.scheduleAux(() =>
+					this.emitEvent("condensed", () =>
+						this.eventFeed.condensed({
+							iteration,
+							messagesBefore,
+							messagesAfter: condensed.length,
+							...(this.lastCondenseUsage
+								? {
+										inputTokens: this.lastCondenseUsage.inputTokens,
+										outputTokens: this.lastCondenseUsage.outputTokens,
+										cachedTokens: this.lastCondenseUsage.cachedTokens,
+									}
+								: {}),
+						}),
+					),
 				)
 				return messages
 			}
@@ -2032,19 +2203,22 @@ export class HeadlessSession {
 		})
 		// Same feed event the synchronous path emits (see maybeCondenseHistory)
 		// so the dashboard timeline shows background condensation too. Non-fatal.
-		await this.emitEvent("condensed", () =>
-			this.eventFeed.condensed({
-				iteration: job.firedAtIteration,
-				messagesBefore,
-				messagesAfter: condensed.length,
-				...(this.lastCondenseUsage
-					? {
-							inputTokens: this.lastCondenseUsage.inputTokens,
-							outputTokens: this.lastCondenseUsage.outputTokens,
-							cachedTokens: this.lastCondenseUsage.cachedTokens,
-						}
-					: {}),
-			}),
+		// (S2) Scheduled for occurrence-order placement in the feed.
+		this.scheduleAux(() =>
+			this.emitEvent("condensed", () =>
+				this.eventFeed.condensed({
+					iteration: job.firedAtIteration,
+					messagesBefore,
+					messagesAfter: condensed.length,
+					...(this.lastCondenseUsage
+						? {
+								inputTokens: this.lastCondenseUsage.inputTokens,
+								outputTokens: this.lastCondenseUsage.outputTokens,
+								cachedTokens: this.lastCondenseUsage.cachedTokens,
+							}
+						: {}),
+				}),
+			),
 		)
 	}
 
@@ -2288,8 +2462,12 @@ export class HeadlessSession {
 			this.currentIteration = iteration
 			this.logger.info(`[loop] iteration ${iteration}/${maxIterations}`, { history: messages.length })
 			// Live worker monitoring: emit the iteration_start event alongside
-			// the human-readable log line above. Non-fatal.
-			await this.emitEvent("iteration_start", () => this.eventFeed.iterationStart(iteration, messages.length))
+			// the human-readable log line above. Non-fatal. The history count is
+			// captured EAGERLY: the write runs later (scheduleAux), by which
+			// point condensation may have spliced `messages` — the event must
+			// report the count at iteration start, not after.
+			const historyMessageCount = messages.length
+			this.scheduleAux(() => this.emitEvent("iteration_start", () => this.eventFeed.iterationStart(iteration, historyMessageCount)))
 
 			// Pause/resume (dashboard control): block between iterations (never
 			// mid-tool-call — same safe boundary as the budget check below)
@@ -2339,6 +2517,15 @@ export class HeadlessSession {
 				throw err
 			}
 			requestMessages = truncateHistory(requestMessages, this.config.windowSize)
+
+			// (S2) Coalesce the aux-write flush: per-iteration feed/snapshot
+			// writes are fire-and-forget (scheduleAux). Await them as ONE batch
+			// before the expensive LLM call so the previous turn's monitoring
+			// (and this iteration's iteration_start) is durable when the next
+			// request begins — usually already flushed during tool execution,
+			// so this is a resolved-promise no-op in practice, not the per-write
+			// serialization S2 removed from the critical path.
+			await this.drainAuxWrites()
 
 			// 4. Call the LLM with an abort timeout. Retried ONCE on a classified
 			// transient provider error (see isRetryableOpenRouterError) — this
@@ -2417,19 +2604,23 @@ export class HeadlessSession {
 					// session's accumulating cost/tokens/iterations. Non-fatal —
 					// a write failure must never affect the session (same idiom
 					// as the final usage record / checkpoints).
-					await this.writeLiveSnapshot(startedAt, iteration, budgetTracker.totalCostUsd)
+					this.scheduleAux(() => this.writeLiveSnapshot(startedAt, iteration, budgetTracker.totalCostUsd))
 			} catch (error) {
 				// Live worker monitoring: surface the LLM call failure on the
 				// event feed too (the session is ending with an error). The
 				// assistant variable is unset here, so emit via raw fields.
-				await this.emitEvent(
-					"llm_error",
-					() =>
-						this.eventFeed.emit("llm_error", {
-							iteration,
-							error: truncateField(error instanceof Error ? error.message : String(error)).text,
-						}),
-					{ iteration },
+				// (S2) Scheduled so it lands AFTER this iteration's earlier
+				// queued events (iteration_start), not ahead of them.
+				this.scheduleAux(() =>
+					this.emitEvent(
+						"llm_error",
+						() =>
+							this.eventFeed.emit("llm_error", {
+								iteration,
+								error: truncateField(error instanceof Error ? error.message : String(error)).text,
+							}),
+						{ iteration },
+					),
 				)
 				const message = error instanceof Error ? error.message : String(error)
 				this.logger.error("[loop] LLM request failed", { iteration, error: message })
@@ -2447,26 +2638,28 @@ export class HeadlessSession {
 			// content — see src/engine/events.ts). Non-fatal.
 			{
 				const text = typeof assistant.content === "string" ? assistant.content.trim() : ""
-				await this.emitEvent(
-					"llm_response",
-					() =>
-						this.eventFeed.llmResponse({
-							iteration,
-							hadToolCalls: Array.isArray(assistant.tool_calls) && assistant.tool_calls.length > 0,
-							textPreview: text || undefined,
-							// The full reasoning string: EventFeed.llmResponse
-							// truncates it (EVENT_TRUNCATE_CHARS) and flags the cut,
-							// exactly once — pre-truncating here would double-truncate
-							// and lose the truncated flag for boundary-length content.
-							reasoningPreview:
-								typeof assistant.reasoning === "string" && assistant.reasoning.trim()
-									? assistant.reasoning
-									: undefined,
-							inputTokens: this.lastLlmUsage?.inputTokens,
-							outputTokens: this.lastLlmUsage?.outputTokens,
-							cachedTokens: this.lastLlmUsage?.cachedTokens,
-						}),
-					{ iteration },
+				this.scheduleAux(() =>
+					this.emitEvent(
+						"llm_response",
+						() =>
+							this.eventFeed.llmResponse({
+								iteration,
+								hadToolCalls: Array.isArray(assistant.tool_calls) && assistant.tool_calls.length > 0,
+								textPreview: text || undefined,
+								// The full reasoning string: EventFeed.llmResponse
+								// truncates it (EVENT_TRUNCATE_CHARS) and flags the cut,
+								// exactly once — pre-truncating here would double-truncate
+								// and lose the truncated flag for boundary-length content.
+								reasoningPreview:
+									typeof assistant.reasoning === "string" && assistant.reasoning.trim()
+										? assistant.reasoning
+										: undefined,
+								inputTokens: this.lastLlmUsage?.inputTokens,
+								outputTokens: this.lastLlmUsage?.outputTokens,
+								cachedTokens: this.lastLlmUsage?.cachedTokens,
+							}),
+						{ iteration },
+					),
 				)
 			}
 
@@ -2482,6 +2675,11 @@ export class HeadlessSession {
 				reasoning: assistant.reasoning,
 			}
 			messages.push(assistantMessage)
+			// (T1) Keep reasoning only on the message just pushed — the
+			// immediately-preceding assistant message for the NEXT request — and
+			// strip it from every older assistant message (pure token cost;
+			// DeepSeek only requires it on that one message).
+			stripSupersededReasoning(messages)
 
 			const calls = parseToolCalls(assistant)
 
@@ -2605,21 +2803,43 @@ export class HeadlessSession {
 			// turn — the executor re-reads the file per call, so the failure
 			// mechanism is stale SEARCH text, not a stale executor).
 			const batchEditedPaths = new Map<string, string>()
-			for (const call of calls) {
-				toolCalls++
-				let resultContent: string
-				let isError: boolean
-				const targetPath = editToolTargetPath(this.config.workspaceRoot, call)
-				const previouslyEditedBy = targetPath === undefined ? undefined : batchEditedPaths.get(targetPath)
 
-				// Live worker monitoring: emit the tool_call event BEFORE
-				// executing (a truncated argument summary — the path for file
-				// tools, the command for execute_command — never full content).
-				// Non-fatal.
-				{
-					const argSummary = summarizeToolArg(call.name, call.args) ?? ""
-					const truncated = argSummary.length > EVENT_TRUNCATE_CHARS
-					await this.emitEvent(
+			// (S3) Partition this turn's calls: pure read-only/exploration calls
+			// (read_file/list_files/search_files, the TS code-intel reads, and a
+			// read-only-equivalent execute_command) run CONCURRENTLY — no shared
+			// mutable state — while everything else stays serialized in
+			// submission order: any edit-capable call (editToolTargetPath),
+			// switch_mode / ask_followup_question / new_task (the single
+			// decision-marker protocol), and anything ambiguous. A read_file
+			// whose path collides with a file an edit in this turn modifies is
+			// ALSO serial (see isParallelReadOnlyCall).
+			const editedPaths = new Set<string>()
+			for (const call of calls) {
+				const target = editToolTargetPath(this.config.workspaceRoot, call)
+				if (target !== undefined) {
+					editedPaths.add(target)
+				}
+			}
+			const parallelGroup: Array<{ call: ParsedToolCall; index: number }> = []
+			const serialGroup: Array<{ call: ParsedToolCall; index: number }> = []
+			calls.forEach((call, index) => {
+				if (isParallelReadOnlyCall(this.config.workspaceRoot, call, editedPaths)) {
+					parallelGroup.push({ call, index })
+				} else {
+					serialGroup.push({ call, index })
+				}
+			})
+
+			// Live worker monitoring: schedule the tool_call events for the whole
+			// turn in assistant.tool_calls order (a truncated argument summary —
+			// the path for file tools, the command for execute_command — never
+			// full content), so the ordering guard keeps them ahead of the
+			// tool_result events. Non-fatal.
+			for (const call of calls) {
+				const argSummary = summarizeToolArg(call.name, call.args) ?? ""
+				const truncated = argSummary.length > EVENT_TRUNCATE_CHARS
+				this.scheduleAux(() =>
+					this.emitEvent(
 						"tool_call",
 						() =>
 							this.eventFeed.toolCall({
@@ -2629,9 +2849,18 @@ export class HeadlessSession {
 								argsTruncated: truncated,
 							}),
 						{ iteration },
-					)
-				}
+					),
+				)
+			}
 
+			// Execution outcomes keyed by the call's ORIGINAL position, so the
+			// post-pass below feeds results back — tool messages, diagnosis,
+			// mistake accounting — in assistant.tool_calls order regardless of
+			// execution order.
+			const executed = new Map<number, { resultContent: string; isError: boolean }>()
+			const runCall = async (call: ParsedToolCall, index: number): Promise<void> => {
+				let resultContent: string
+				let isError: boolean
 				if (call.parseError) {
 					resultContent = `[Error] Failed to parse arguments for tool '${call.name}': ${call.parseError}. Raw arguments: ${call.rawArguments}`
 					isError = true
@@ -2656,6 +2885,35 @@ export class HeadlessSession {
 					resultContent = result.content
 					isError = result.isError
 				}
+				executed.set(index, { resultContent, isError })
+			}
+
+			// Parallel wave: the turn's independent read-only/exploration calls
+			// run concurrently (the S3 win — reads share no mutable state).
+			// Serial calls still execute at their exact submission position in
+			// the post-pass below, so an early mistake-limit abort never runs an
+			// edit the serial loop would have skipped.
+			await Promise.all(parallelGroup.map(({ call, index }) => runCall(call, index)))
+
+			// Feed results back + bookkeeping in ORIGINAL tool_calls order: the
+			// assistant→tool adjacency contract, same-file diagnosis,
+			// batchEditedPaths, switch marker, pause checks, and mistake
+			// accounting all behave exactly as in the serial loop.
+			for (let i = 0; i < calls.length; i++) {
+				const call = calls[i]
+				toolCalls++
+				if (!executed.has(i)) {
+					// Serial call: execute at its submission position.
+					await runCall(call, i)
+				}
+				const outcome = executed.get(i)
+				if (outcome === undefined) {
+					// Unreachable: runCall always records its outcome before resolving.
+					throw new Error(`[loop] internal: no execution outcome for '${call.name}'`)
+				}
+				let { resultContent, isError } = outcome
+				const targetPath = editToolTargetPath(this.config.workspaceRoot, call)
+				const previouslyEditedBy = targetPath === undefined ? undefined : batchEditedPaths.get(targetPath)
 
 				// Same-file multi-edit diagnosis: a LATER edit call failing on a
 				// path an EARLIER call in this batch already modified gets the
@@ -2679,7 +2937,7 @@ export class HeadlessSession {
 				if (!isError && targetPath !== undefined) {
 					batchEditedPaths.set(targetPath, call.name)
 				}
-	
+
 				// switch_mode (plans/switch-mode-headless.md): append the approved
 				// switch's visible transcript marker AFTER the tool result — the
 				// assistant-with-tool_calls → tool-result adjacency must stay
@@ -2689,13 +2947,13 @@ export class HeadlessSession {
 					messages.push({ role: "user", content: this.pendingModeSwitchMarker })
 					this.pendingModeSwitchMarker = null
 				}
-	
-				// Pause/resume (dashboard control): after each tool execution is
-				// still a safe boundary (never mid-tool-call, never mid-LLM-call)
-				// and makes a pause request responsive even when the LLM is fast
+
+				// Pause/resume (dashboard control): after tool execution is still
+				// a safe boundary (never mid-tool-call, never mid-LLM-call) and
+				// makes a pause request responsive even when the LLM is fast
 				// enough to run many iterations between the pre-iteration checks.
 				// A request that lands during a tool call is honored as soon as
-				// that call returns.
+				// that call (and its parallel siblings) settle.
 				await this.checkPauseRequested(budgetTracker)
 
 				this.logger.info(`[loop] tool result: ${call.name}`, {
@@ -2705,19 +2963,21 @@ export class HeadlessSession {
 				})
 				// Live worker monitoring: emit the tool_result event (a
 				// truncated preview — never the full result). Non-fatal.
-				await this.emitEvent(
-					"tool_result",
-					() => {
-						const preview = truncateField(resultContent)
-						return this.eventFeed.toolResult({
-							iteration,
-							tool: call.name,
-							isError,
-							result: preview.text,
-							resultTruncated: preview.truncated,
-						})
-					},
-					{ iteration },
+				this.scheduleAux(() =>
+					this.emitEvent(
+						"tool_result",
+						() => {
+							const preview = truncateField(resultContent)
+							return this.eventFeed.toolResult({
+								iteration,
+								tool: call.name,
+								isError,
+								result: preview.text,
+								resultTruncated: preview.truncated,
+							})
+						},
+						{ iteration },
+					),
 				)
 
 				// Consecutive-mistake accounting: errors, parse failures, empty
@@ -2757,14 +3017,20 @@ export class HeadlessSession {
 			// on an unindexed workspace (blind walking is then the only
 			// option). Soft + reversible — a later productive call resets
 			// everything.
-			if (calls.length > 0) {
-				const allReadOnly = calls.every(
+			// Whether every call in this turn is a plain read/exploration call
+			// (list_files / read_file / search_files, or a read-only-equivalent
+			// execute_command). Shared by the blind-tree-walking nudge above and
+			// the read-only checkpoint skip below.
+			const allReadOnly =
+				calls.length > 0 &&
+				calls.every(
 					(call) =>
 						READ_ONLY_TOOL_NAMES.has(call.name) ||
 						(call.name === "execute_command" &&
 							typeof call.args.command === "string" &&
 							isReadOnlyEquivalentShellCommand(call.args.command)),
 				)
+			if (calls.length > 0) {
 				if (allReadOnly) {
 					readOnlyStreak++
 					if (readOnlyStreak >= readOnlyNudgeThreshold && !readOnlyNudgeInjected) {
@@ -2787,10 +3053,17 @@ export class HeadlessSession {
 				}
 			}
 
-			// Checkpoints: this iteration executed at least one tool call (we only
-			// reach here when `calls.length > 0`), so snapshot the workspace.
-			// Non-fatal — see saveIterationCheckpoint.
-			await this.saveIterationCheckpoint(iteration)
+			// Checkpoints (S1): this iteration executed at least one tool call (we
+			// only reach here when `calls.length > 0`). All-read-only turns skip
+			// the snapshot entirely — a pure read/explore turn pays no shadow-git
+			// commit. Edit-capable turns schedule the snapshot OFF the critical
+			// path via scheduleAux; the in-flight ordering guard keeps a later
+			// snapshot's commit from landing before an earlier one. The baseline
+			// in initCheckpoints is never skipped. Non-fatal — see
+			// saveIterationCheckpoint.
+			if (!allReadOnly) {
+				this.scheduleAux(() => this.saveIterationCheckpoint(iteration))
+			}
 		}
 
 		// maxIterations exhausted without completion: this is specifically the
@@ -3171,9 +3444,15 @@ export class HeadlessSession {
 		// rewriting it invalidates the provider's cached prompt prefix for the
 		// whole session, costing a full-prompt cache miss after every such
 		// switch. When the tool set differs, rebuild the prompt as before.
-		let newTools = appendDescribeImageTool(
-			appendBrowserActionTool(this.config.tools ?? selectToolsForMode(modeSlug, this.customModes)),
-		)
+		let newTools = this.config.tools ?? selectToolsForMode(modeSlug, this.customModes)
+		// Same executor.gated non-vendored appends as run() — see the comment
+		// there (T2/T3: a session never carries a schema its executor can't run).
+		if (this.executor.has("browser_action")) {
+			newTools = appendBrowserActionTool(newTools)
+		}
+		if (this.executor.has("describe_image")) {
+			newTools = appendDescribeImageTool(newTools)
+		}
 		if (this.executor.has("outline")) {
 			newTools = appendCodeIntelTools(newTools)
 		}
@@ -3186,6 +3465,10 @@ export class HeadlessSession {
 		const toolSetUnchanged = sameToolNames(this.state.tools, newTools)
 		this.state.mode = modeSlug
 		this.state.tools = newTools
+		// (T2/T3 measure-first) Log the post-switch prefix size: state.systemPrompt
+		// below reflects the EFFECTIVE prompt (tool-set-unchanged keeps the old
+		// one for prompt-cache continuity; a changed tool set rebuilds it).
+		this.logPrefixSize(this.state.systemPrompt, newTools, `switch-to-${modeSlug}`)
 		let switchResultContent: string
 		if (toolSetUnchanged) {
 			// Tool set unchanged: keep the current system prompt and
@@ -3215,9 +3498,12 @@ export class HeadlessSession {
 		this.pendingModeSwitchMarker = `[mode switched: ${from} -> ${modeSlug}. Reason: ${reason}]`
 		this.modeSwitchCount++
 		// Live worker monitoring: structured event for the dashboard (non-fatal
-		// like every other event emission).
-		await this.emitEvent("mode_switched", () =>
-			this.eventFeed.modeSwitched({ from, to: modeSlug, reason, autoApproved }),
+		// like every other event emission). (S2) Scheduled so it lands after
+		// this turn's queued tool_call event, in occurrence order.
+		this.scheduleAux(() =>
+			this.emitEvent("mode_switched", () =>
+				this.eventFeed.modeSwitched({ from, to: modeSlug, reason, autoApproved }),
+			),
 		)
 		this.logger.info("[switch_mode] switched", {
 			from,
@@ -3382,6 +3668,15 @@ export class HeadlessSession {
 			toolCalls,
 		}
 	}
+}
+
+/**
+ * (T2/T3 measure-first) Approximate token count from a character count using
+ * the standard ~4 chars/token heuristic. Used for prefix-size logging, never
+ * for billing or condensation sizing (those use real usage data).
+ */
+export function estimateTokenSize(chars: number): number {
+	return Math.ceil(chars / 4)
 }
 
 /**

@@ -14,9 +14,15 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 
-import { HeadlessSession, isReadOnlyEquivalentShellCommand, truncateHistory, TRUNCATION_BATCH_SIZE } from "../loop.js"
+import {
+	HeadlessSession,
+	isReadOnlyEquivalentShellCommand,
+	stripSupersededReasoning,
+	truncateHistory,
+	TRUNCATION_BATCH_SIZE,
+} from "../loop.js"
 import { OpenRouterError } from "../../llm/openrouter.js"
-import { createHeadlessExecutor } from "../../tools/executor.js"
+import { createHeadlessExecutor, createReadOnlyHeadlessExecutor } from "../../tools/executor.js"
 import { createCheckpointService } from "../../checkpoints/service.js"
 import { parseToolCall } from "../parser.js"
 import { readUsageFile } from "../usage.js"
@@ -1021,10 +1027,125 @@ async function testCheckpointTriggeredByApplyDiffOnly(): Promise<void> {
 	}
 }
 
+/**
+	* (S1) A turn whose every call is read-only must NOT pay a per-iteration
+	* shadow-git checkpoint: pure read/explore turns skip the snapshot entirely.
+	* Fixture mirrors testCheckpointTriggeredByApplyDiffOnly (baseline + per-turn
+	* snapshots); here the history must hold ONLY the baseline.
+	*/
+async function testReadOnlyTurnDoesNotTriggerCheckpoint(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-ckpt-readonly-"))
+	const checkpointDir = await fs.mkdtemp(path.join(os.tmpdir(), "hc-ckpt-loop-"))
+	try {
+		await fs.writeFile(path.join(ws, "a.txt"), "hello\n", "utf-8")
+		const client = new FakeLlmClient([
+			() => toolCall("read_file", { path: "a.txt" }),
+			() => toolCall("attempt_completion", { result: "read only, done" }),
+		])
+		const session = await makeSession({
+			task: "read a file",
+			client,
+			workspaceRoot: ws,
+			checkpoints: true,
+			checkpointDir,
+		})
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+
+		// Shadow-git history holds ONLY the baseline — the read-only turn was
+		// skipped (the apply_diff checkpoint test above asserts a NON-read-only
+		// turn still snapshots, so the two tests bracket the skip). list() is
+		// [shadow-git initial commit, baseline snapshot] — no per-iteration
+		// snapshot, which would make it 3.
+		const tasksDir = path.join(checkpointDir, "tasks")
+		const taskIds = await fs.readdir(tasksDir)
+		assert.equal(taskIds.length, 1, `expected exactly one checkpoint task, got: ${taskIds.join(", ")}`)
+		const svc = createCheckpointService({ taskId: taskIds[0], workspaceRoot: ws, checkpointDir })
+		await svc.init()
+		const entries = await svc.list()
+		assert.equal(
+			entries.length,
+			2,
+			`read-only turn must not add an iteration checkpoint (initial commit + baseline only), got ${entries.length}`,
+		)
+		assert.ok(!entries.some((e) => (e.message ?? "").includes("iteration")), "no per-iteration snapshot message")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+		await fs.rm(checkpointDir, { recursive: true, force: true })
+	}
+}
+
+/**
+ * (T2/T3 step 2) The non-vendored tool appends are gated on the session's
+ * executor: a read-only reviewer/QA executor registers browser_action but NOT
+ * describe_image, so its advertised catalog must exclude describe_image (a
+ * schema it would only error on) while keeping browser_action; the default
+ * executor advertises both.
+ */
+async function testToolCatalogGatedOnExecutorHandlers(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-toolgate-"))
+	try {
+		const roClient = new FakeLlmClient([() => toolCall("attempt_completion", { result: "done" })])
+		const roSession = new HeadlessSession({
+			workspaceRoot: ws,
+			mode: "code",
+			model: "fake-model",
+			taskText: "inspect",
+			llmClient: roClient,
+			maxIterations: 3,
+			executor: createReadOnlyHeadlessExecutor(ws),
+			checkpoints: false,
+		})
+		const roResult = await roSession.run()
+		assert.equal(roResult.status, "success", `expected success, got ${JSON.stringify(roResult)}`)
+		const roNames = roSession.state.tools.map((t) => (t.type === "function" ? t.function.name : t.type))
+		assert.ok(roNames.includes("browser_action"), "read-only executor CAN browse — browser_action stays advertised")
+		assert.ok(!roNames.includes("describe_image"), "read-only executor has no describe_image handler — schema not advertised")
+
+		const fullClient = new FakeLlmClient([() => toolCall("attempt_completion", { result: "done" })])
+		const fullSession = new HeadlessSession({
+			workspaceRoot: ws,
+			mode: "code",
+			model: "fake-model",
+			taskText: "inspect",
+			llmClient: fullClient,
+			maxIterations: 3,
+			checkpoints: false,
+		})
+		const fullResult = await fullSession.run()
+		assert.equal(fullResult.status, "success", `expected success, got ${JSON.stringify(fullResult)}`)
+		const fullNames = fullSession.state.tools.map((t) => (t.type === "function" ? t.function.name : t.type))
+		assert.ok(fullNames.includes("browser_action"), "default executor advertises browser_action")
+		assert.ok(fullNames.includes("describe_image"), "default executor advertises describe_image")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── truncateHistory — batch eviction (cache-stability regression) ───────────
 
 function fakeMsg(i: number): ChatMessage {
 	return { role: i % 2 === 0 ? "assistant" : "tool", content: `msg-${i}`, name: i % 2 === 0 ? undefined : "tool" }
+}
+
+/**
+ * (T1) stripSupersededReasoning keeps reasoning only on the most-recent
+ * assistant message; every earlier assistant message has it removed, and tool /
+ * user messages are never touched.
+ */
+async function testStripSupersededReasoningKeepsOnlyMostRecent(): Promise<void> {
+	const messages: ChatMessage[] = [
+		{ role: "system", content: "sys" },
+		{ role: "user", content: "task" },
+		{ role: "assistant", content: "first", reasoning: "reas-1" },
+		{ role: "tool", tool_call_id: "c1", name: "read_file", content: "ok" },
+		{ role: "assistant", content: "second", reasoning: "reas-2" },
+	]
+	stripSupersededReasoning(messages)
+	assert.equal(messages[2].reasoning, undefined, "superseded assistant reasoning is stripped")
+	assert.equal(messages[4].reasoning, "reas-2", "the most-recent assistant keeps its reasoning")
+	assert.equal(messages[3].role, "tool", "tool messages are never touched")
+	assert.equal(messages[1].role, "user", "user messages are never touched")
 }
 
 async function testTruncateHistoryNoOpBelowWindow(): Promise<void> {
@@ -1200,6 +1321,52 @@ async function mkGitWorkspace(): Promise<string | null> {
 	execFileSync("git", ["add", "notes.txt"], { cwd: ws })
 	execFileSync("git", ["commit", "-q", "-m", "initial"], { cwd: ws })
 	return ws
+}
+
+/**
+ * (S3) A turn whose calls are all read-only runs them CONCURRENTLY; the tool
+ * results must still be fed back in assistant.tool_calls order (the
+ * assistant→tool adjacency contract), regardless of execution order.
+ */
+async function testParallelReadOnlyCallsFeedResultsInOrder(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-parread-"))
+	try {
+		await fs.writeFile(path.join(ws, "a.txt"), "AAA\n", "utf-8")
+		await fs.writeFile(path.join(ws, "b.txt"), "BBB\n", "utf-8")
+		await fs.writeFile(path.join(ws, "c.txt"), "CCC\n", "utf-8")
+		const client = new FakeLlmClient([
+			// ONE turn with THREE read_file calls (the parallelizable group).
+			() =>
+				toolCallBatch([
+					{ name: "read_file", args: { path: "a.txt" } },
+					{ name: "read_file", args: { path: "b.txt" } },
+					{ name: "read_file", args: { path: "c.txt" } },
+				]),
+			() => toolCall("attempt_completion", { result: "read all three" }),
+		])
+		const session = await makeSession({ task: "read three files", client, workspaceRoot: ws })
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+
+		const toolMsgs = session.state.messages.filter((m) => m.role === "tool" && m.name === "read_file")
+		assert.equal(toolMsgs.length, 3, "all three reads produced a tool message")
+		const assistantMsg = session.state.messages.find((m) => m.role === "assistant" && (m.tool_calls?.length ?? 0) === 3)
+		assert.ok(assistantMsg?.tool_calls, "found the assistant message with all three tool_calls")
+		for (let i = 0; i < 3; i++) {
+			assert.equal(
+				toolMsgs[i].tool_call_id,
+				assistantMsg.tool_calls![i].id,
+				`tool message ${i} must reference tool_call ${i} (submission order preserved under concurrency)`,
+			)
+		}
+		// Each read returned ITS OWN file's content (no cross-talk from the
+		// concurrent executions).
+		assert.match(toolMsgs[0].content ?? "", /AAA/)
+		assert.match(toolMsgs[1].content ?? "", /BBB/)
+		assert.match(toolMsgs[2].content ?? "", /CCC/)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
 }
 
 // ─── Commit-before-finishing guardrail ───────────────────────────────────────
@@ -1424,12 +1591,16 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["execute_command: a timed-out call does NOT count toward the consecutive-mistake limit", testTimeoutDoesNotCountAsMistake],
 	["execute_command: session end reaps backgrounded children (no orphans left behind)", testSessionEndReapsBackgroundedChildren],
 	["checkpoints: apply_diff-only iteration still triggers a checkpoint", testCheckpointTriggeredByApplyDiffOnly],
+	["checkpoints: (S1) an all-read-only turn does NOT trigger a checkpoint", testReadOnlyTurnDoesNotTriggerCheckpoint],
 	["same-file batch: a second same-file edit failure gets the stale-SEARCH diagnosis", testSameFileBatchFailureGetsDiagnosis],
+	["parallel reads: (S3) three read_file calls feed tool results back in tool_calls order", testParallelReadOnlyCallsFeedResultsInOrder],
 	["same-file batch: a failure on a DIFFERENT file gets no diagnosis", testDifferentFileBatchFailureGetsNoDiagnosis],
 	["commit guard: attempt_completion with uncommitted tracked changes gets one nudge, then is accepted", testCompletionNudgedOnUncommittedChanges],
 	["commit guard: a clean tree is never nudged", testCompletionAcceptedWhenClean],
 	["commit guard: committing before finishing means no nudge", testCompletionAcceptedAfterCommit],
 	["commit guard: read-only modes never get the nudge", testNoNudgeInReadOnlyMode],
+	["stripSupersededReasoning: (T1) keeps only the most-recent assistant reasoning", testStripSupersededReasoningKeepsOnlyMostRecent],
+	["tool catalog: (T2/T3) non-vendored appends gated on the session executor's handlers", testToolCatalogGatedOnExecutorHandlers],
 	["truncateHistory: no-op below the window", testTruncateHistoryNoOpBelowWindow],
 	["truncateHistory: evicts in TRUNCATION_BATCH_SIZE-sized batches", testTruncateHistoryEvictsInBatches],
 	["truncateHistory: never splits an assistant tool_calls / tool response group", testTruncateHistoryNeverSplitsToolCallGroup],

@@ -221,26 +221,33 @@ function estimateChars(messages: ChatMessage[]): number {
  * → (condensed) → final streamed completion → attempt_completion → session_end
  * (the attempt_completion event is issue #34's final-report event, emitted
  * before session_end when the loop accepts completion).
+ *
+ * (S1) These turns are all-read-only (read_file), so no per-iteration
+ * checkpoint_saved is emitted — only the baseline at session start. (S3) The
+ * tool_call events for a turn are scheduled up front and the tool_result
+ * events after execution, so the feed batches each kind rather than
+ * interleaving them per call.
  */
 function expectedEventTypes(
-	callCounts: number[],
-	perTurnChunks: number[],
-	finalChunks: number,
-	condenseIteration = 0,
+ callCounts: number[],
+ perTurnChunks: number[],
+ finalChunks: number,
+ condenseIteration = 0,
 ): string[] {
-	const types: string[] = ["session_start", "checkpoint_saved"]
-	const pushIteration = (k: number, chunks: number, withCheckpoint: boolean) => {
-		types.push("iteration_start")
-		if (k + 1 === condenseIteration) types.push("condensed")
-		for (let c = 0; c < chunks; c++) types.push("llm_stream_chunk")
-		types.push("llm_response")
-		for (let t = 0; t < callCounts[k]; t++) {
-			types.push("tool_call")
-			types.push("tool_result")
-		}
-		if (withCheckpoint) types.push("checkpoint_saved")
-	}
-	for (let k = 0; k < callCounts.length; k++) pushIteration(k, perTurnChunks[k], true)
+ const types: string[] = ["session_start", "checkpoint_saved"]
+ const pushIteration = (k: number, chunks: number) => {
+ 	types.push("iteration_start")
+ 	if (k + 1 === condenseIteration) types.push("condensed")
+ 	for (let c = 0; c < chunks; c++) types.push("llm_stream_chunk")
+ 	types.push("llm_response")
+ 	for (let t = 0; t < callCounts[k]; t++) {
+ 		types.push("tool_call")
+ 	}
+ 	for (let t = 0; t < callCounts[k]; t++) {
+ 		types.push("tool_result")
+ 	}
+ }
+ for (let k = 0; k < callCounts.length; k++) pushIteration(k, perTurnChunks[k])
 	types.push("iteration_start")
 	if (callCounts.length + 1 === condenseIteration) types.push("condensed")
 	for (let c = 0; c < finalChunks; c++) types.push("llm_stream_chunk")
@@ -408,12 +415,13 @@ async function testCondensationAndStreamingInOneSession(): Promise<void> {
 		assert.equal(responses[11].outputTokens, 100)
 		assert.equal(responses[10].inputTokens, 120_000, "the threshold-crossing call reports its own usage")
 
-		// Checkpoint events: baseline + one per tool-call iteration; the
-		// streamed completion iteration emits none.
+		// Checkpoint events (S1): the baseline is saved at session start; every
+		// tool-call iteration here is all-read-only (read_file), so the
+		// read-only checkpoint skip means NO per-iteration snapshot is taken.
 		assert.deepEqual(
 			events.filter((e) => e.type === "checkpoint_saved").map((e) => e.iteration),
-			[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-			"checkpoint_saved lands once per tool-call iteration, exactly between tool_result and the next iteration_start",
+			[0],
+			"all-read-only turns skip per-iteration checkpoints (S1); only the baseline remains",
 		)
 
 		// ── Budget/cost: condensation call AND streamed calls combined ───────
