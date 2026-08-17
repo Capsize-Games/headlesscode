@@ -100,8 +100,9 @@ export async function trendMain(argv: string[]): Promise<number> {
 		return 2
 	}
 
+	let server: Awaited<ReturnType<typeof startTrendServer>>
 	try {
-		await startTrendServer({ port: options.port, repos: options.repos })
+		server = await startTrendServer({ port: options.port, repos: options.repos })
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err)
 		if ((err as NodeJS.ErrnoException)?.code === "EADDRINUSE") {
@@ -115,8 +116,23 @@ export async function trendMain(argv: string[]): Promise<number> {
 	process.stdout.write(`[trend] listening on http://127.0.0.1:${options.port} (repos: ${options.repos.join(", ")})\n`)
 
 	return new Promise<number>((resolve) => {
+		let shuttingDown = false
 		const onSignal = (): void => {
+			// Only the first signal shuts down; a second Ctrl-C while the
+			// server is mid-close is ignored (the process exits on its own
+			// once the listening handle is gone).
+			if (shuttingDown) {
+				return
+			}
+			shuttingDown = true
 			process.stdout.write("\n[trend] shutting down\n")
+			process.removeListener("SIGINT", onSignal)
+			process.removeListener("SIGTERM", onSignal)
+			// Release the port: stop accepting new connections and drop
+			// keep-alive sockets so the process can exit. Without close the
+			// listening handle keeps the event loop alive and the port bound.
+			server.close()
+			server.closeAllConnections?.()
 			resolve(0)
 		}
 		process.on("SIGINT", onSignal)

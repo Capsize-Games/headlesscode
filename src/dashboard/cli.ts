@@ -117,8 +117,9 @@ export async function dashboardMain(argv: string[]): Promise<number> {
 		return 0
 	}
 
+	let server: Awaited<ReturnType<typeof startDashboardServer>>
 	try {
-		await startDashboardServer({
+		server = await startDashboardServer({
 			port: options.port,
 			repo: options.repo,
 			token: process.env.HEADLESSCODE_DASHBOARD_TOKEN || undefined,
@@ -141,8 +142,23 @@ export async function dashboardMain(argv: string[]): Promise<number> {
 
 	// Keep the process alive until interrupted; clean shutdown on SIGINT/SIGTERM.
 	return new Promise<number>((resolve) => {
+		let shuttingDown = false
 		const onSignal = (): void => {
+			// Only the first signal shuts down; a second Ctrl-C while the
+			// server is mid-close is ignored (the process exits on its own
+			// once the listening handle is gone).
+			if (shuttingDown) {
+				return
+			}
+			shuttingDown = true
 			process.stdout.write("\n[dashboard] shutting down\n")
+			process.removeListener("SIGINT", onSignal)
+			process.removeListener("SIGTERM", onSignal)
+			// Release the port: stop accepting new connections and drop
+			// keep-alive sockets so the process can exit. Without close the
+			// listening handle keeps the event loop alive and the port bound.
+			server.close()
+			server.closeAllConnections?.()
 			resolve(0)
 		}
 		process.on("SIGINT", onSignal)

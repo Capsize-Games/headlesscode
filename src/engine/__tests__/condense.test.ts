@@ -109,6 +109,48 @@ class FakeLlmClientWithContextWindow extends FakeLlmClient {
 	}
 }
 
+/**
+	* A client whose condensation call NEVER resolves on its own — it hangs
+	* until the caller's abort signal fires, then rejects with AbortError (how
+	* OpenRouterClient behaves on a mid-call abort). Main calls are served by
+	* the normal script. Proves the loop's condensation timeout
+	* (maybeCondenseHistory) unblocks the session instead of hanging forever
+	* when the provider never responds.
+	*/
+class HangingCondenseClient extends FakeLlmClient {
+	/** The signal the condensation call was given (undefined = wiring missing). */
+	condenseSignal: AbortSignal | undefined
+
+	async createChatCompletion(request: LlmRequest): Promise<LlmResponse> {
+		const isCondense =
+			!request.tools &&
+			request.messages[0]?.role === "system" &&
+			typeof request.messages[0]?.content === "string" &&
+			request.messages[0].content.includes("conversation-compression engine")
+		if (isCondense) {
+			this.condenseCalls++
+			this.requests.push(request)
+			this.condenseSignal = request.signal
+			return new Promise<LlmResponse>((_resolve, reject) => {
+				const signal = request.signal
+				if (!signal) {
+					// No abort signal wired (the pre-fix bug): the call can
+					// never be unblocked — reject instead of hanging the
+					// whole test suite.
+					reject(new Error("condensation call received no abort signal — timeout wiring missing"))
+					return
+				}
+				if (signal.aborted) {
+					reject(new DOMException("aborted", "AbortError"))
+					return
+				}
+				signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true })
+			})
+		}
+		return super.createChatCompletion(request)
+	}
+}
+
 function toolCall(name: string, args: unknown, id = `call_${Math.random().toString(36).slice(2)}`): ChatMessage {
 	const argumentsStr = typeof args === "string" ? args : JSON.stringify(args)
 	const call: ChatToolCall = { id, type: "function", function: { name, arguments: argumentsStr } }
@@ -1010,6 +1052,76 @@ async function testCondensationUsageTripsBudget(): Promise<void> {
 	}
 }
 
+/**
+ * The condensation LLM call must time out instead of hanging the session
+ * forever (issue #74): a provider that never responds must be aborted on
+ * the per-LLM-call timeout (llmTimeoutMs — the same mechanism as the main
+ * call), and the session must degrade gracefully (non-fatal fallback to
+ * truncateHistory), not crash or block.
+ */
+async function testSessionCondenseCallTimesOutNonFatally(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-condense-timeout-"))
+	try {
+		const client = new HangingCondenseClient(
+			[
+				() => toolCall("write_to_file", { path: "a.txt", content: "hello" }),
+				() => toolCall("attempt_completion", { result: "done after condensation timeout" }),
+			],
+			// Large prompt count so condensation fires after the first call.
+			{ promptTokens: 110_000, completionTokens: 100 },
+		)
+		const session = new HeadlessSession({
+			workspaceRoot: ws,
+			mode: "code",
+			model: "fake-model",
+			taskText: "write a file",
+			llmClient: client,
+			maxIterations: 10,
+			consecutiveErrorLimit: 3,
+			windowSize: DEFAULT_WINDOW_SIZE,
+			contextWindowTokens: 128_000,
+			condenseThresholdFraction: 0.75,
+			// Tiny per-LLM-call timeout: the hanging condensation call must be
+			// aborted and the session fall back ~50ms after it starts.
+			llmTimeoutMs: 50,
+			// Checkpoints off — this suite isn't testing shadow-git.
+			checkpoints: false,
+		})
+		// Race the session against a hard deadline so a regression (timeout
+		// never wired) fails loudly instead of hanging `npm test` forever.
+		let deadline: NodeJS.Timeout | undefined
+		try {
+			const result = await Promise.race([
+				session.run(),
+				new Promise<never>((_, reject) => {
+					deadline = setTimeout(() => reject(new Error("session hung: condensation call never timed out")), 10_000)
+				}),
+			])
+			assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+			assert.equal(client.condenseCalls, 1, "the condensation call WAS attempted (and timed out)")
+			const condenseReq = client.requests.find(
+				(r) =>
+					!r.tools &&
+					typeof r.messages[0]?.content === "string" &&
+					r.messages[0].content.includes("conversation-compression engine"),
+			)
+			assert.ok(condenseReq, "condensation request present")
+			assert.ok(condenseReq.signal, "the condensation call must carry an abort signal (timeout wiring)")
+			assert.ok(client.condenseSignal?.aborted, "the condensation call's signal must have been aborted (timed out)")
+			// Graceful degradation: no summary landed in state, and the
+			// session still completed (history bounded by truncateHistory).
+			const stateHasSummary = session.state.messages.some(
+				(m) => typeof m.content === "string" && m.content.includes("Condensed summary"),
+			)
+			assert.equal(stateHasSummary, false, "a timed-out condensation must NOT leave a summary in state")
+		} finally {
+			clearTimeout(deadline)
+		}
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void> | void]> = [
@@ -1036,6 +1148,7 @@ const tests: Array<[string, () => Promise<void> | void]> = [
 	["session: condensation never splits a tool-call group", testSessionCondensationNeverSplitsToolGroup],
 	["session: post-condensation prefix stays stable across calls", testSessionPostCondensePrefixStable],
 	["session: condensation usage can trip the budget like a main call", testCondensationUsageTripsBudget],
+	["session: condensation call times out instead of hanging forever (non-fatal)", testSessionCondenseCallTimesOutNonFatally],
 ]
 
 async function main(): Promise<void> {

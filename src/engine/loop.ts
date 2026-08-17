@@ -1852,6 +1852,12 @@ export class HeadlessSession {
 		// the load-bearing safety property of the design).
 		this.fireBackgroundCondense(iteration, messages, budgetTracker, contextWindowTokens)
 
+		// Same abort-timeout mechanism as the main call (callMainLlm): a
+		// provider that never responds must not hang the session forever —
+		// on timeout the call aborts and the non-fatal catch below falls back
+		// to truncateHistory.
+		const controller = new AbortController()
+		const timer = setTimeout(() => controller.abort(), this.config.llmTimeoutMs)
 		try {
 			const condensed = await maybeCondense({
 				llmClient: this.llmClient,
@@ -1865,7 +1871,7 @@ export class HeadlessSession {
 				condenseInFlight: this.condenseInFlight,
 				condenseModel: config.condenseModel,
 				condenseMaxTokens: config.condenseMaxTokens,
-				condenseAbortSignal: undefined,
+				condenseAbortSignal: controller.signal,
 				onUsage: (usage) => this.recordCondensationUsage(usage, budgetTracker),
 			})
 			if (condensed !== null) {
@@ -1911,6 +1917,8 @@ export class HeadlessSession {
 				error: error instanceof Error ? error.message : String(error),
 			})
 			return messages
+		} finally {
+			clearTimeout(timer)
 		}
 	}
 
@@ -2095,20 +2103,28 @@ export class HeadlessSession {
 		})
 		const job = { snapshot, count: plan.count, firedAtIteration: iteration }
 		this.backgroundCondense = job
+		// Same abort-timeout mechanism as the synchronous path / the main
+		// call: a hung background condensation must abort on the configured
+		// per-LLM-call timeout instead of leaking a never-resolving call.
+		const controller = new AbortController()
+		const timer = setTimeout(() => controller.abort(), this.config.llmTimeoutMs)
 		condenseOldestTurns(this.llmClient, {
 			messages: snapshot,
 			count: plan.count,
 			model: config.condenseModel,
 			maxTokens: config.condenseMaxTokens,
+			signal: controller.signal,
 			onUsage: (usage) => this.recordCondensationUsage(usage, budgetTracker),
 		})
 			.then(async (summary) => {
+				clearTimeout(timer)
 				// The job is done (applied or discarded) — a NEW background job
 				// may fire on a later iteration.
 				this.backgroundCondense = null
 				await this.applyBackgroundCondense(job, summary)
 			})
 			.catch((error) => {
+				clearTimeout(timer)
 				this.backgroundCondense = null
 				if (error instanceof BudgetExceededError) {
 					// Budget trip from the background call's OWN accounting: the
