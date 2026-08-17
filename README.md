@@ -34,6 +34,16 @@ and a Hetzner runner-fleet evaluation (see
 [`docs/phase6-cloud.md`](./docs/phase6-cloud.md)). No live cloud resources
 are launched; the caps/budgets land before any scaling.
 
+> ⚠️ **Security warning: default-allow arbitrary command execution.**
+> `headlesscode` is a headless coding agent: by default it runs **arbitrary
+> shell commands with your full user privileges** (no sandbox, no approval
+> prompts) and can read and modify your files — including `~/.ssh`, `~/.aws`,
+> and any other credentials your user can access. Run it only on machines and
+> with tasks you trust, and isolate it (container/VM/dedicated user) whenever
+> untrusted content is involved. See [`SECURITY.md`](./SECURITY.md) for the
+> full disclosure and the optional permissions layer that provides defense in
+> depth (not a security boundary).
+
 ## Purpose
 
 Drive a coding agent headlessly against real git repos: read a target repo's
@@ -160,6 +170,24 @@ headlesscode watch --owner <o> --repo <path> --label <name> [options]
                                 (enabled; default $HEADLESSCODE_MEMORY_DIR or
                                 <workspace>/.headlesscode/memory). Memory is OFF unless set.
   --no-memory                   Explicitly disable memory even if HEADLESSCODE_MEMORY_DIR is set
+  --allowed-commands <list>  Comma-separated command prefixes the agent may run.
+                               Default: $HEADLESSCODE_ALLOWED_COMMANDS, else
+                               .headlesscode/permissions.json, else empty (=
+                               allow everything except --denied-commands; see
+                               SECURITY.md)
+  --denied-commands <list>   Comma-separated command prefixes that are ALWAYS
+                               refused (deny wins over allow; dangerous shell
+                               substitutions are always blocked regardless).
+                               Default: $HEADLESSCODE_DENIED_COMMANDS, else
+                               .headlesscode/permissions.json, else empty
+  --protected-files <list>   Comma-separated glob patterns of files the agent may
+                               not write. Default: $HEADLESSCODE_PROTECTED_FILES,
+                               else .headlesscode/permissions.json, else
+                               ".env,.env.*,*.pem,*.key,id_rsa*"
+  --allow-protected-writes   Escape hatch: permit writes to protected files
+                               (default: OFF). Also settable via
+                               "allowProtectedWrites": true in
+                               .headlesscode/permissions.json
   --dry-run                     Build the system prompt + validate config, then exit (no API key)
   --version / --help
 
