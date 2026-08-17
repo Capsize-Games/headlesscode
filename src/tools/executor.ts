@@ -698,6 +698,32 @@ function formatFileSlice(rel: string, allLines: string[], offset: number, limit:
 	return `${header}\n${body}`.replace(/\n$/, "")
 }
 
+/**
+	* Shared protected-files guard for every write tool. Returns a refusal
+	* ToolResult when `rel` (workspace-relative, POSIX-separated) matches a
+	* protected pattern and the escape hatch — --allow-protected-writes or
+	* "allowProtectedWrites": true in .headlesscode/permissions.json — is
+	* explicitly on (OFF by default). Naming the matched pattern gives a
+	* well-behaved model a concrete reason to stop. A refusal is a real tool
+	* error (isError: true) and counts toward the consecutive-mistake bound,
+	* exactly like any other tool failure.
+	*/
+function protectedWriteRefusal(toolName: string, rel: string, permissions: PermissionsConfig): ToolResult | null {
+	if (permissions.allowProtectedWrites) {
+		return null
+	}
+	const matchedPattern = findMatchingPattern(rel, permissions.protectedFiles)
+	if (matchedPattern === null) {
+		return null
+	}
+	return err(
+		`${toolName}: refusing to write protected file '${rel}' (matches protected pattern '${matchedPattern}'). ` +
+			`This file is protected by the harness permissions policy and cannot be overwritten. If this write is ` +
+			`genuinely required, re-run with --allow-protected-writes (or set "allowProtectedWrites": true in ` +
+			`<workspaceRoot>/.headlesscode/permissions.json); it is OFF by default.`,
+	)
+}
+
 /** write_to_file — create parent dirs as needed, overwrite existing files. */
 function writeToFileHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
 	const filePath = requireString(args, "path")
@@ -709,20 +735,11 @@ function writeToFileHandler(args: Record<string, unknown>, ctx: ToolContext): Pr
 		// Permissions: refuse writes to protected files (secret/credential
 		// patterns) unless the escape hatch — --allow-protected-writes or
 		// "allowProtectedWrites": true in .headlesscode/permissions.json — is
-		// explicitly on (OFF by default). Naming the matched pattern gives a
-		// well-behaved model a concrete reason to stop. A refusal is a real
-		// tool error (isError: true) and counts toward the consecutive-mistake
-		// bound, exactly like any other tool failure.
-		if (!ctx.permissions.allowProtectedWrites) {
-			const matchedPattern = findMatchingPattern(rel, ctx.permissions.protectedFiles)
-			if (matchedPattern !== null) {
-				return err(
-					`write_to_file: refusing to write protected file '${rel}' (matches protected pattern '${matchedPattern}'). ` +
-						`This file is protected by the harness permissions policy and cannot be overwritten. If this write is ` +
-						`genuinely required, re-run with --allow-protected-writes (or set "allowProtectedWrites": true in ` +
-						`<workspaceRoot>/.headlesscode/permissions.json); it is OFF by default.`,
-				)
-			}
+		// explicitly on (OFF by default). All four write tools share the
+		// protectedWriteRefusal helper below, so no write path can bypass it.
+		const refusal = protectedWriteRefusal("write_to_file", rel, ctx.permissions)
+		if (refusal !== null) {
+			return refusal
 		}
 
 		try {
@@ -814,6 +831,14 @@ async function applyDiffHandler(args: Record<string, unknown>, ctx: ToolContext)
 		const target = safeTarget(ctx, filePath)
 		const rel = path.relative(ctx.workspaceRoot, target).toPosix() || path.basename(target)
 
+		// Permissions: same protected-files guard as write_to_file (shared
+		// helper) — an agent must not edit .env / *.pem / *.key through a
+		// different write tool than the one the guard was originally wired to.
+		const refusal = protectedWriteRefusal("apply_diff", rel, ctx.permissions)
+		if (refusal !== null) {
+			return refusal
+		}
+
 		let originalContent: string
 		try {
 			originalContent = await fsp.readFile(target, "utf-8")
@@ -884,6 +909,14 @@ async function searchReplaceHandler(args: Record<string, unknown>, ctx: ToolCont
 
 		const target = safeTarget(ctx, filePath)
 		const rel = path.relative(ctx.workspaceRoot, target).toPosix() || path.basename(target)
+
+		// Permissions: same protected-files guard as write_to_file (shared
+		// helper) — an agent must not edit .env / *.pem / *.key through a
+		// different write tool than the one the guard was originally wired to.
+		const refusal = protectedWriteRefusal("search_replace", rel, ctx.permissions)
+		if (refusal !== null) {
+			return refusal
+		}
 
 		let fileContent: string
 		try {
@@ -1046,6 +1079,14 @@ async function editFileHandler(args: Record<string, unknown>, ctx: ToolContext):
 	return (async () => {
 		const target = safeTarget(ctx, filePath)
 		const rel = path.relative(ctx.workspaceRoot, target).toPosix() || path.basename(target)
+
+		// Permissions: same protected-files guard as write_to_file (shared
+		// helper) — an agent must not edit .env / *.pem / *.key through a
+		// different write tool than the one the guard was originally wired to.
+		const refusal = protectedWriteRefusal("edit_file", rel, ctx.permissions)
+		if (refusal !== null) {
+			return refusal
+		}
 
 		let currentContent: string | null = null
 		let currentContentLF: string | null = null
