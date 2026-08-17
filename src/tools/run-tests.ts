@@ -10,6 +10,12 @@
  * `tsx` invocation `npm test` uses per-file, sequentially, stopping at the
  * first failure exactly like `npm test`'s `&&` chain.
  *
+ * SECURITY: the selected test paths come from an untrusted workspace (they
+ * are file names that can contain shell metacharacters), so they are passed
+ * to `spawn` as ARGV with `shell: false` — never interpolated into a shell
+ * command string. See issue #62 (the old `shellQuote` allowed command
+ * substitution via `$()`/backticks in a hostile test file name).
+ *
  * IMPORTANT (this is the tool's whole point, stated to the model): a
  * passing selective run is NOT full-suite green. The FULL `npm test` is
  * still what gates a merge/PR and is still required once before
@@ -129,10 +135,6 @@ function truncateOutput(text: string): { text: string; truncated: boolean } {
 	return { text: `${text.slice(0, MAX_TEST_OUTPUT_CHARS)}\n…[output truncated]`, truncated: true }
 }
 
-function shellQuote(p: string): string {
-	return `"${p.replace(/"/g, '\\"')}"`
-}
-
 interface OneFileResult {
 	rel: string
 	exitCode: number | null
@@ -140,8 +142,15 @@ interface OneFileResult {
 	timedOut: boolean
 }
 
-/** Run one test file via `npx --no-install tsx <file>` (the npm-test invocation). */
-function runOneTestFile(workspaceRoot: string, rel: string, timeoutS: number): Promise<OneFileResult> {
+/**
+ * Run one test file via `npx --no-install tsx <file>` (the npm-test
+ * invocation). The test path is treated as UNTRUSTED input (it comes from a
+ * workspace's file names): it is passed as a separate argv element with
+ * `shell: false`, so no shell metacharacter in it — `$()`, backticks, `;`,
+ * `&`, spaces, quotes — can ever be interpreted (issue #62). `npx
+ * --no-install` avoids any network fetch if the local tsx is missing.
+ */
+export function runOneTestFile(workspaceRoot: string, rel: string, timeoutS: number): Promise<OneFileResult> {
 	return new Promise((resolve) => {
 		let stdout = ""
 		let stderr = ""
@@ -157,9 +166,11 @@ function runOneTestFile(workspaceRoot: string, rel: string, timeoutS: number): P
 
 		let child
 		try {
-			child = spawn(`npx --no-install tsx ${shellQuote(rel)}`, {
+			child = spawn("npx", ["--no-install", "tsx", rel], {
 				cwd: workspaceRoot,
-				shell: true,
+				// `shell: false` (default) — argv is passed verbatim, never
+				// re-parsed by a shell. This is the actual security boundary.
+				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 				env: { ...process.env, LANG: "en_US.UTF-8", LC_ALL: "en_US.UTF-8" },
 			})
@@ -254,6 +265,16 @@ export async function runTestsHandler(
 	// full-suite green (the trailer says so explicitly).
 	const blocks: string[] = [header, noteLine, ""]
 	for (const rel of tests) {
+		// Defense-in-depth (the argv spawn in runOneTestFile is the primary
+		// boundary): reject paths containing newlines outright — they cannot
+		// be legitimate test files, and they would let a workspace smuggle
+		// forged "test result" content (a fake pass/fail line) into the tool
+		// result. Nothing is run for such a path.
+		if (/\r?\n/.test(rel)) {
+			blocks.push(`── ${rel} ─ (skipped: path contains a newline — not a legitimate test file)`)
+			blocks.push("[run_tests] FAILED: test path contains a newline (potential output-injection attempt)")
+			return err(blocks.join("\n"))
+		}
 		const result = await runOneTestFile(ctx.workspaceRoot, rel, timeoutS)
 		const { text: output, truncated } = truncateOutput(result.output)
 		blocks.push(`── ${rel} ─${truncated ? " (output truncated)" : ""}`)

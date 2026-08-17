@@ -22,7 +22,7 @@ import * as path from "node:path"
 
 import { createHeadlessExecutor } from "../executor.js"
 import { getCodeIntelCache, resetCodeIntelCaches } from "../../codeintel/program.js"
-import { changedFilesFromGit } from "../run-tests.js"
+import { changedFilesFromGit, runOneTestFile } from "../run-tests.js"
 import { directTestMatch, isTestFile, selectTestsForChangedFiles } from "../test-selection.js"
 
 const FIXTURE_TSCONFIG = JSON.stringify(
@@ -151,7 +151,107 @@ async function testChangedFilesFromGit(): Promise<void> {
 	}
 }
 
-// ─── (e) end-to-end: run a REAL matched test through the handler ─────────────
+// ─── (e) security regression (issue #62): hostile test-path selection ────────
+//
+// Test paths are untrusted input (workspace file names). The old
+// implementation interpolated them into a `shell: true` command string via a
+// double-quote wrapper that escaped `"` but NOT `$`/backticks — so a file
+// named like `x$(cmd).test.ts` ran `cmd` via command substitution. The fix
+// passes the path as a separate spawn ARGV element with `shell: false`; the
+// assertions below prove a hostile name neither executes anything nor breaks
+// out of the tool's output framing.
+
+async function testHostileTestPathIsNotExecuted(): Promise<void> {
+	const ws = await mkWorkspace("hc-rt-hostile-")
+	try {
+		await fs.mkdir(path.join(ws, "src", "__tests__"), { recursive: true })
+		// A real test file whose NAME carries command substitution + newline +
+		// backticks (the audit's exact attack). If the old shellQuote path were
+		// still in use, the `$()` here would execute `touch` inside the
+		// workspace (or `echo` a marker into the tool result).
+		const hostile = 'x$(touch PWNED).test.ts`echo PWNED2`\nsecondline'
+		await fs.writeFile(path.join(ws, "src", "__tests__", hostile), 'import assert from "node:assert/strict"\nassert.equal(1, 1)\n')
+
+		resetCodeIntelCaches()
+		const executor = createHeadlessExecutor(ws)
+		const result = await executor.execute("run_tests", { paths: ["src/lib/util.ts"], timeout: 60 })
+
+		// The selection heuristic finds the direct sibling of a changed file;
+		// a hostile file that isn't a sibling is NOT selected, so assert the
+		// fail-safe fires (nothing ran, nothing executed).
+		assert.equal(result.isError, true, "a changed file with no test must fail safe, not run a hostile path")
+		assert.match(result.content, /no specific tests matched/, "no test was selected, so no hostile path ran")
+
+		// Now select the hostile file DIRECTLY (it IS a test file): the newline
+		// is rejected outright (output-injection defense), and the `$()`/
+		// backticks in the remainder are passed as a literal argv element, so
+		// they must never be interpreted by a shell.
+		const direct = await executor.execute("run_tests", { paths: [`src/__tests__/${hostile}`], timeout: 60 })
+		assert.equal(direct.isError, true, "a newline-containing test path must be refused, not run")
+		assert.match(direct.content, /contains a newline/, "the refusal names the reason")
+
+		// A hostile name WITHOUT the newline but with `$()` + backticks (the
+		// issue #62 attack shape) must be passed through as ONE literal argv
+		// element. tsx's module loader itself chokes on backticks in a file
+		// name (`ERR_UNKNOWN_FILE_EXTENSION .ts%60...%60`) and npx may or may
+		// not resolve a local tsx at all, so asserting "runs green" would
+		// conflate those unrelated failures with the security property — the
+		// assertions below check the property that matters: the metacharacters
+		// were NEVER interpreted (no PWNED2 marker in the output, no PWNED
+		// file, no hang).
+		const hostileNoNewline = "x$(touch PWNED).test.ts`echo PWNED2`"
+		await fs.writeFile(path.join(ws, "src", "__tests__", hostileNoNewline), 'import assert from "node:assert/strict"\nassert.equal(1, 1)\n')
+		const direct2 = await executor.execute("run_tests", { paths: [`src/__tests__/${hostileNoNewline}`], timeout: 60 })
+		// The path appears VERBATIM in the selection header (metacharacters
+		// intact — they were never interpreted).
+		assert.match(
+			direct2.content,
+			new RegExp(escapeRegExp(`src/__tests__/${hostileNoNewline}`)),
+			"the literal hostile path was selected and reported verbatim",
+		)
+		// Whatever npx/tsx did with the file, `$()`/backticks must never
+		// EXECUTE: the only legitimate appearance of PWNED in the result is
+		// inside the echoed path itself. An executed `echo PWNED2` would
+		// produce a bare PWNED2 on its own line (or a PWNED file).
+		const afterMarker = direct2.content.split(`src/__tests__/${hostileNoNewline}`).slice(1).join("")
+		assert.doesNotMatch(afterMarker, /PWNED2/, "no executed backtick/`$()` output after the path echo")
+
+		// Direct proof at the spawn boundary (no tsx extension-resolution
+		// noise): the hostile name must be delivered to the child as ONE
+		// literal argv element — backticks/`$()`/spaces are never re-parsed.
+		const spawned = await runOneTestFile(ws, `src/__tests__/${hostileNoNewline}`, 60)
+		const hasMarker = spawned.output.includes("PWNED2")
+		assert.equal(
+			hasMarker,
+			false,
+			`shell metacharacters in the path must never be interpreted: ${spawned.output.slice(0, 300)}`,
+		)
+		assert.equal(spawned.timedOut, false, "no hang (a shell waiting on a substituted command would time out)")
+
+		// Control: the hostile run did NOT hang (timedOut stays false) — a
+		// shell that had interpreted `$()`/backticks as commands to run would
+		// still be waiting on them. (A green run is NOT asserted for the
+		// hostile path: npx cannot resolve a local tsx in a node_modules-less
+		// temp workspace — that's an environment artifact, not the security
+		// property under test. The existing end-to-end test asserts the same
+		// argv spawn machinery runs a REAL test green in the real workspace.)
+
+		// No side-effect file was created by `$()`/backticks — the true proof
+		// nothing was executed through a shell.
+		let pwned = false
+		try {
+			await fs.access(path.join(ws, "PWNED"))
+			pwned = true
+		} catch {
+			// not created — good
+		}
+		assert.equal(pwned, false, "`$(touch PWNED)` in the test filename must NOT execute")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// ─── (f) end-to-end: run a REAL matched test through the handler ─────────────
 
 async function testEndToEndRunsMatchedTest(): Promise<void> {
 	// The repo root is the only workspace with tsx installed (devDependency),
@@ -174,11 +274,17 @@ async function testEndToEndRunsMatchedTest(): Promise<void> {
 
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
+/** Escape a string for use inside a RegExp (literal matching). */
+function escapeRegExp(s: string): string {
+	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
 const tests: Array<[string, () => Promise<void>]> = [
 	["direct match: src/foo/bar.ts → src/foo/__tests__/bar.test.ts", testDirectMatchSelectsSiblingTest],
 	["reverse dependency: 2-hop importer test selected via the real import graph", testReverseDependencySelectsImportingTest],
 	["fail-safe: no matching test reports honestly and runs nothing", testNoMatchFailsSafe],
 	["git-status fallback inference returns modified + untracked files", testChangedFilesFromGit],
+	["security: hostile test path (`$()`, backticks, newline) is never shell-interpreted", testHostileTestPathIsNotExecuted],
 	["end-to-end: selects and runs a real matched test via tsx", testEndToEndRunsMatchedTest],
 ]
 
