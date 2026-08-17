@@ -67,9 +67,10 @@ RUN chmod +x scripts/spawn-parallel-worktrees.sh scripts/run-worker.sh scripts/h
 # central store lives on the /data volume, which shadows image content.
 COPY shared ./shared
 
-# The package.json `bin` entry (src/cli.ts, shebang `#!/usr/bin/env tsx`)
-# only becomes executable when headlesscode is installed as a dependency of
-# another package, so wire a fixed wrapper that mirrors the repo's own
+# The package.json `bin` entry (bin/headlesscode.mjs — a JS launcher that
+# resolves the package's own node_modules/tsx, see issue #99) only becomes
+# executable when headlesscode is installed as a dependency of another
+# package, so wire a fixed wrapper that mirrors the repo's own
 # `tsx src/cli.ts` invocation.
 #
 # TSX_TSCONFIG_PATH: tsx discovers tsconfig.json from the *cwd*, but the CLI

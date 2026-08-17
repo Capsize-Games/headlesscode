@@ -68,8 +68,10 @@ and compose placement here don't constrain that choice.
   shadow-git checkpoints, reviewers; ca-certificates for OpenRouter/npm TLS).
 - `npm ci` (full, devDependencies included) — headlesscode has **no compiled
   output**; `tsx` + `typescript` run the TypeScript source at runtime, so they
-  must be installed. The playwright npm package comes along as a devDependency
-  but installs JS-only (no browser download on install — no install script).
+  are runtime `dependencies` (since issue #99, the package's `bin` must work
+  from a clean `npm install -g`, which installs dependencies only). The
+  playwright npm package is also a runtime dependency but installs JS-only
+  (no browser download on install — no install script).
 - `src/` copied; a `/usr/local/bin/headlesscode` wrapper runs
   `tsx /opt/headlesscode/src/cli.ts` (the package's `bin` entry only becomes
   executable when installed as a dependency, so a fixed wrapper mirrors the
