@@ -23,7 +23,7 @@ import { fileURLToPath } from "node:url"
 const repoRoot = path.resolve(fileURLToPath(import.meta.url), "..", "..")
 
 /** Non-test-suffixed scripts that ran as part of the old chain. */
-const EXTRA_FILES = ["scripts/check-page-script.mjs"]
+const EXTRA_FILES = ["scripts/check-page-script.mjs", "scripts/check-tmpdir-project-store.mjs"]
 
 function findTestFiles(dir) {
 	const found = []

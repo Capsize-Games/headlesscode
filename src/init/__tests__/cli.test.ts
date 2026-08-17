@@ -156,9 +156,16 @@ async function testEndToEndRegistersProjectAndDetectsCpp(): Promise<void> {
 		const meta = JSON.parse(await fs.readFile(path.join(central, "project.json"), "utf-8")) as {
 			path: string
 			kind: string
+			firstSeen: string
+			lastSeen: string
+			registered: boolean
 		}
 		assert.equal(meta.kind, "plain", "a plain non-git fixture dir registers as kind=plain")
 		assert.equal(meta.path, path.resolve(ws), "project.json records the real workspace path")
+		// Part B: `headlesscode init` is the ONLY call site that ever passes
+		// registered:true — the field must land as true, with timestamps set.
+		assert.equal(meta.registered, true, "init registers the project (registered: true)")
+		assert.ok(meta.firstSeen.length > 0 && meta.lastSeen.length > 0, "first/last seen timestamps are written")
 		assert.ok(
 			printed.includes(central),
 			"init stdout must print the resolved central data dir",

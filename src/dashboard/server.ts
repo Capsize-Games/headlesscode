@@ -48,6 +48,11 @@
  *                                     (see src/orchestrator/cost-history.ts) as JSON,
  *                                     optionally windowed by recordedAt (since) or
  *                                     most-recent-N (limit)
+ *   GET  /api/projects[?all=1]        enumerate the central per-project store
+ *                                     (see src/project-store.ts's listProjectEntries):
+ *                                     every registered or still-existing project by
+ *                                     default; ?all=1 also shows pure stale-unregistered
+ *                                     litter (the pre-Part-A orphaned dirs)
  *
  * NOTE (control plane): the POST /api/session/start route can launch real,
  * billed work and run arbitrary shell via `gh`/`orchestrate` from a form
@@ -96,6 +101,7 @@ import {
 	type ModeModelsFile,
 } from "../config/mode-models.js"
 import { readCostHistory, readSessionCostHistory } from "../orchestrator/cost-history.js"
+import { listProjectEntries } from "../project-store.js"
 import { listWorkspaceDir, readWorkspaceFile } from "./files.js"
 import {
 	loadPermissionsFile,
@@ -827,6 +833,28 @@ async function handleRequest(
 			}
 			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(
 				JSON.stringify({ generatedAt: new Date().toISOString(), repo: path.resolve(repo), groups, sessions }),
+			)
+		} catch (error) {
+			res
+				.writeHead(500, { "content-type": "application/json; charset=utf-8" })
+				.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+		}
+		return
+	}
+
+	// Central per-project store registry (project-registry-and-store-cleanup):
+	// GET /api/projects enumerates every <key>/ dir under the store root via
+	// the same listProjectEntries the `headlesscode projects list` CLI uses.
+	// Default view hides pure stale-unregistered litter (registered or
+	// still-existing only); ?all=1 shows everything. Read-only, no ?repo=
+	// needed — the store root is machine-global, not repo-scoped.
+	if (url.pathname === "/api/projects" && req.method === "GET") {
+		try {
+			const all = url.searchParams.get("all") === "1"
+			const entries = listProjectEntries()
+			const filtered = all ? entries : entries.filter((e) => e.registered || e.exists)
+			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ projects: filtered }),
 			)
 		} catch (error) {
 			res

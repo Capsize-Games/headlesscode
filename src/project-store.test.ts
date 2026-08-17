@@ -295,6 +295,96 @@ async function testCentralSettings(): Promise<void> {
 	}
 }
 
+/**
+	* Part A guard: a workspace root literally under os.tmpdir() must NOT get a
+	* project.json stamped into the store even with NO $HEADLESSCODE_DATA_DIR
+	* override in effect — only test/scratch workspaces live under the system
+	* temp dir, and the directory still gets created (callers write
+	* permissions.json/mode-models.json/index into it) but never the metadata
+	* write or the legacy migration. This test necessarily probes the REAL
+	* ~/.local/share/headlesscode path (that's the point — it verifies the
+	* guard), but if the guard is broken the finally block still cleans up the
+	* dir it created rather than adding to the litter the guard exists to
+	* prevent.
+	*/
+async function testTmpDirWorkspaceDoesNotWriteRealStore(): Promise<void> {
+	const ws = await mkTmp("hc-store-tmpguard-")
+	const prevOverride = process.env.HEADLESSCODE_DATA_DIR
+	delete process.env.HEADLESSCODE_DATA_DIR
+	let realDir: string | undefined
+	try {
+		const dir = resolveProjectDataDir(ws)
+		realDir = dir
+		// Override is unset, so dir resolved under the REAL store root.
+		assert.ok(dir.startsWith(path.join(os.homedir(), ".local", "share", "headlesscode")), "probes the real store root")
+		// The dir itself is still created (callers need somewhere to write).
+		assert.ok(fs.statSync(dir).isDirectory(), "project dir still created for a /tmp workspace")
+		// But the guard must skip the metadata write entirely.
+		const metaPath = path.join(dir, "project.json")
+		assert.equal(fs.existsSync(metaPath), false, "no project.json for a /tmp workspace even in the real store")
+	} finally {
+		if (prevOverride === undefined) {
+			delete process.env.HEADLESSCODE_DATA_DIR
+		} else {
+			process.env.HEADLESSCODE_DATA_DIR = prevOverride
+		}
+		await fsp.rm(ws, { recursive: true, force: true })
+		if (realDir) {
+			await fsp.rm(realDir, { recursive: true, force: true })
+		}
+	}
+}
+
+/**
+	* Part B: writeProjectMetadata is an upsert — registered is only ever
+	* promoted true (never downgraded by later unregistered contact), firstSeen
+	* is preserved, lastSeen advances on every contact.
+	*/
+async function testMetadataUpsertRegisteredAndLastSeen(): Promise<void> {
+	const data = await mkTmp("hc-store-data7-")
+	const ws = await mkTmp("hc-store-upsert-")
+	process.env.HEADLESSCODE_DATA_DIR = data
+	try {
+		const { keySource, kind } = resolveProjectIdentity(ws)
+		const dir = path.join(projectStoreRoot(), "projects", projectKeyFor(keySource))
+		fs.mkdirSync(dir, { recursive: true })
+		const metaPath = path.join(dir, "project.json")
+
+		// 1. First contact WITHOUT registered → registered:false, firstSeen set.
+		writeProjectMetadata(dir, keySource, kind)
+		const meta1 = JSON.parse(fs.readFileSync(metaPath, "utf-8")) as {
+			firstSeen: string
+			lastSeen: string
+			registered: boolean
+		}
+		assert.equal(meta1.registered, false, "first contact is unregistered")
+		assert.ok(meta1.firstSeen.length > 0 && meta1.lastSeen.length > 0, "first/last seen are timestamps")
+
+		// 2. Second contact WITH registered:true → flips true, firstSeen
+		//    unchanged, lastSeen advances.
+		await new Promise((r) => setTimeout(r, 10))
+		writeProjectMetadata(dir, keySource, kind, { registered: true })
+		const meta2 = JSON.parse(fs.readFileSync(metaPath, "utf-8")) as {
+			firstSeen: string
+			lastSeen: string
+			registered: boolean
+		}
+		assert.equal(meta2.registered, true, "registered flips true on init-style contact")
+		assert.equal(meta2.firstSeen, meta1.firstSeen, "firstSeen is preserved across upserts")
+		assert.notEqual(meta2.lastSeen, meta1.lastSeen, "lastSeen advances on every contact")
+
+		// 3. Third contact WITHOUT registered → no downgrade.
+		writeProjectMetadata(dir, keySource, kind)
+		const meta3 = JSON.parse(fs.readFileSync(metaPath, "utf-8")) as { firstSeen: string; registered: boolean }
+		assert.equal(meta3.registered, true, "registered is never downgraded by later unregistered contact")
+		assert.equal(meta3.firstSeen, meta1.firstSeen, "firstSeen still preserved")
+	} finally {
+		delete process.env.HEADLESSCODE_DATA_DIR
+		await fsp.rm(data, { recursive: true, force: true })
+		await fsp.rm(ws, { recursive: true, force: true })
+	}
+}
+
 const tests: Array<[string, () => Promise<void>]> = [
 	["plain dirs get distinct realpath-derived keys + project.json metadata", testPlainDirGetsDistinctKey],
 	["a git repo and its worktree share the SAME central store key", testGitRepoAndWorktreeShareKey],
@@ -303,6 +393,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["checkpoint store migrates into the central store", testCheckpointStoreMigrates],
 	["shared-instructions migrate out of ~/.roo-shaped roots", testSharedInstructionsMigrate],
 	["central settings.json loads loose / fail-open", testCentralSettings],
+	["a /tmp workspace never writes project.json into the real store (Part A guard)", testTmpDirWorkspaceDoesNotWriteRealStore],
+	["project.json upsert: registered flips true and is never downgraded, lastSeen advances", testMetadataUpsertRegisteredAndLastSeen],
 ]
 
 async function main(): Promise<void> {

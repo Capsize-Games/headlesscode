@@ -139,8 +139,10 @@ export async function initMain(argv: string[]): Promise<number> {
 	process.stdout.write("headlesscode init — one-command project registration\n\n")
 
 	// Step 1: resolve + register (the existing, sole registration mechanism —
-	// writes <central>/project.json on first contact).
-	const centralDir = resolveProjectDataDir(workspaceRoot)
+	// writes <central>/project.json on first contact). `registered: true` is
+	// ONLY ever set here — no other call site in the codebase passes it, so a
+	// human-deliberate registration is the single thing that flips the flag.
+	const centralDir = resolveProjectDataDir(workspaceRoot, { registered: true })
 	process.stdout.write(
 		"Step 1/5 — project registration\n" +
 			`  workspace:        ${workspaceRoot}\n` +

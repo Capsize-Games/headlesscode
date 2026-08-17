@@ -35,6 +35,7 @@ import { initMain } from "./init/cli.js"
 import { provisionMain, pushPrMain } from "./github/cli.js"
 import { decisionProxyMain } from "./decision-proxy/cli.js"
 import { migrateMain } from "./migrate/cli.js"
+import { projectsMain } from "./projects/cli.js"
 import { analyzeCliMain } from "./orchestrator/analyze-cli.js"
 import { costHistoryCliMain } from "./orchestrator/cost-history-cli.js"
 import { resolvePermissions, type PermissionsConfig } from "./permissions/config.js"
@@ -230,6 +231,17 @@ Subcommands:
               mode-models.json, permissions.json) into the central project
               store. Idempotent; each move is verified before the source is
               removed. See \`npx tsx src/cli.ts migrate --help\`.
+  headlesscode projects list [--json] [--registered-only] [--stale] [--size]
+              Enumerate the central per-project store as a table (or JSON),
+              optionally filtered to registered/stale entries, with an
+              opt-in size column. See
+              \`npx tsx src/cli.ts projects list --help\` for full options.
+  headlesscode projects prune [--dry-run] [--yes] [--include-registered]
+              Reclaim orphaned store entries (missing paths that were never
+              registered, plus pre-registry no-project.json litter). Never
+              deletes a registered project without --include-registered; the
+              escape hatch for a deleted repo / unmounted drive. See
+              \`npx tsx src/cli.ts projects prune --help\` for full options.
 
 Options:
   --mode <slug>              Mode to run in (built-in or from .roomodes). Default: code
@@ -720,6 +732,13 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// the mandatory, automatic recording in watch.ts (recordCostIfTerminal).
 	if (argv[0] === "cost-history") {
 		return costHistoryCliMain(argv.slice(1))
+	}
+
+	// Central-store project registry: `headlesscode projects ...` — enumerate
+	// (`list`) and reclaim (`prune`) the central per-project store
+	// (~/.local/share/headlesscode/projects/; see src/projects/ + src/project-store.ts).
+	if (argv[0] === "projects") {
+		return projectsMain(argv.slice(1))
 	}
 
 	const { options, error } = parseArgs(argv)

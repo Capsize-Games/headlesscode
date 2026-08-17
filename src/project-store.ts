@@ -76,6 +76,19 @@ export interface ProjectIdentity {
 	kind: "git" | "plain"
 }
 
+/** The `<project-key>/project.json` metadata schema (see writeProjectMetadata). */
+export interface ProjectMetadata {
+	/** Absolute filesystem path the project key was derived from. */
+	path: string
+	kind: ProjectIdentity["kind"]
+	/** ISO-8601 timestamp of first recorded contact (absent in pre-Part-B files). */
+	firstSeen?: string
+	/** ISO-8601 timestamp of the most recent contact (touched on every resolve). */
+	lastSeen?: string
+	/** True only when a human deliberately ran `headlesscode init` on this project. */
+	registered: boolean
+}
+
 /**
  * Resolve the project identity source for a workspace root. Purely
  * filesystem-derived — zero registration, any directory works on first contact.
@@ -140,7 +153,10 @@ export interface MigrateOptions {
  * override the legacy files are still READ via the pre-migration-grace fallback
  * paths in mode-models/permissions/codesearch-index instead.
  */
-export function resolveProjectDataDir(workspaceRoot: string): string {
+export function resolveProjectDataDir(
+	workspaceRoot: string,
+	options: { registered?: boolean } = {},
+): string {
 	const root = path.resolve(workspaceRoot)
 	const cached = projectDirCache.get(root)
 	if (cached !== undefined) {
@@ -157,38 +173,165 @@ export function resolveProjectDataDir(workspaceRoot: string): string {
 	} catch {
 		// Non-fatal: a read-only store root falls back to legacy reads.
 	}
-	// Under a $HEADLESSCODE_DATA_DIR override neither the metadata write nor
-	// the migration touches the store: the override means "test/scratch —
-	// don't leave real store entries behind" (direct test runs construct
-	// executors against throwaway /tmp workspaces; without this guard every
-	// one of them would litter the real ~/.local/share/headlesscode with a
-	// projects/<hash>/project.json stub).
-	if (!storeOverridden()) {
-		writeProjectMetadata(dir, keySource, kind)
+	// Neither the metadata write nor the migration touches the store under a
+	// $HEADLESSCODE_DATA_DIR override (the override means "test/scratch — don't
+	// leave real store entries behind"; direct test runs construct executors
+	// against throwaway /tmp workspaces, and without this guard every one of
+	// them would litter the real ~/.local/share/headlesscode with a
+	// projects/<hash>/project.json stub). The same applies when the resolved
+	// keySource itself lives under the OS temp dir AND the store is the REAL
+	// one: production code paths never create real workspaces under
+	// os.tmpdir() (grep src/ for mkdtemp — only test files do), so it's a
+	// reliable "ephemeral test/scratch" signal — BUT only when the write would
+	// land in the real store. A test that sandboxes HOME under os.tmpdir()
+	// (e.g. the init CLI's end-to-end registration test, which drops the
+	// override to exercise the real no-override registration path) has both
+	// its workspace AND its store under the temp dir; writing project.json
+	// into that throwaway store is harmless and must keep working. The project
+	// dir is always created (callers need somewhere to write
+	// permissions.json/mode-models.json/index files); the guard only decides
+	// whether a project.json gets stamped in and the legacy migration runs.
+	if (!storeOverridden() && (isUnderSystemTmpDir(projectStoreRoot()) || !isUnderSystemTmpDir(keySource))) {
+		writeProjectMetadata(dir, keySource, kind, { registered: options.registered })
 		migrateLegacyProjectData(root, keySource, dir)
 	}
 	return dir
 }
 
+/** True when `p` resolves inside the OS temp directory (os.tmpdir()). */
+export function isUnderSystemTmpDir(p: string): boolean {
+	const tmp = realpathOrResolve(os.tmpdir())
+	const rel = path.relative(tmp, p)
+	return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel))
+}
+
 /** Project metadata file name inside each `<project-key>/` dir. */
 export const PROJECT_METADATA_FILE = "project.json"
 
-/** Write `<project-key>/project.json` once (path the key was derived from + first-seen). */
-export function writeProjectMetadata(dir: string, keySource: string, kind: ProjectIdentity["kind"]): void {
+/** Options controlling a project.json upsert. */
+export interface WriteProjectMetadataOptions {
+	/**
+	 * True ONLY from `headlesscode init` (a human deliberately registering the
+	 * project). Never downgraded by later contact: once true, it stays true
+	 * until `headlesscode projects prune` removes the store entry.
+	 */
+	registered?: boolean
+}
+
+/**
+ * Upsert `<project-key>/project.json`: a fresh write on first contact
+ * (firstSeen = lastSeen = now, registered only when the caller opts in) and a
+ * touch on every later contact (lastSeen = now; firstSeen and registered
+ * preserved — registered is only ever promoted to true, never demoted back).
+ */
+export function writeProjectMetadata(
+	dir: string,
+	keySource: string,
+	kind: ProjectIdentity["kind"],
+	options: WriteProjectMetadataOptions = {},
+): void {
 	try {
 		const metaPath = path.join(dir, PROJECT_METADATA_FILE)
+		const now = new Date().toISOString()
+		let existing: Record<string, unknown> = {}
 		if (fs.existsSync(metaPath)) {
-			return
+			try {
+				const parsed = JSON.parse(fs.readFileSync(metaPath, "utf-8")) as Record<string, unknown>
+				if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+					existing = parsed
+				}
+			} catch {
+				// Malformed existing file — fall through and rewrite fresh.
+			}
 		}
+		const registered = options.registered === true || existing.registered === true
+		const firstSeen = typeof existing.firstSeen === "string" ? existing.firstSeen : now
 		fs.mkdirSync(dir, { recursive: true })
 		fs.writeFileSync(
 			metaPath,
-			JSON.stringify({ path: keySource, kind, firstSeen: new Date().toISOString() }, null, 2) + "\n",
+			JSON.stringify({ path: keySource, kind, firstSeen, lastSeen: now, registered }, null, 2) + "\n",
 			"utf-8",
 		)
 	} catch {
 		// Non-fatal: metadata is a human-convenience, never load-bearing.
 	}
+}
+
+/** Loose-parse `<project-key>/project.json`; undefined when absent, {} when malformed. */
+function readProjectMetadata(dir: string): Partial<ProjectMetadata> | undefined {
+	const metaPath = path.join(dir, PROJECT_METADATA_FILE)
+	let raw: string
+	try {
+		raw = fs.readFileSync(metaPath, "utf-8")
+	} catch {
+		return undefined
+	}
+	try {
+		const parsed = JSON.parse(raw) as Record<string, unknown>
+		if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+			return {}
+		}
+		return parsed as Partial<ProjectMetadata>
+	} catch {
+		return {}
+	}
+}
+
+/** One row of `headlesscode projects list` / GET /api/projects. */
+export interface ProjectListEntry {
+	/** `<project-key>` — the store directory name. */
+	key: string
+	/** Real filesystem path from project.json; undefined when the file is missing/unparseable. */
+	path: string | undefined
+	kind: ProjectIdentity["kind"] | undefined
+	firstSeen: string | undefined
+	lastSeen: string | undefined
+	registered: boolean
+	/** Live fs.existsSync(path) check; false when path is undefined. */
+	exists: boolean
+}
+
+/**
+ * Enumerate every directory in `<root>/projects/`. A dir with a missing or
+ * unparseable project.json still yields an entry (registered:false,
+ * exists:false, everything else undefined) — those are exactly the
+ * pre-Part-A litter already on disk, and they must be visible/prunable too,
+ * not silently skipped. Does NOT compute directory sizes (walking 2500+ dirs
+ * recursively would make `list` slow on a polluted store); callers that want
+ * sizes compute them lazily only for the entries they print.
+ */
+export function listProjectEntries(): ProjectListEntry[] {
+	const root = path.join(projectStoreRoot(), "projects")
+	let dirNames: string[]
+	try {
+		dirNames = fs.readdirSync(root)
+	} catch {
+		// Store root doesn't exist yet (or is unreadable) — nothing to list.
+		return []
+	}
+	const entries: ProjectListEntry[] = []
+	for (const name of dirNames) {
+		const dir = path.join(root, name)
+		try {
+			if (!fs.statSync(dir).isDirectory()) {
+				continue
+			}
+		} catch {
+			continue
+		}
+		const meta = readProjectMetadata(dir)
+		const projectPath = meta?.path
+		entries.push({
+			key: name,
+			path: projectPath,
+			kind: meta?.kind,
+			firstSeen: meta?.firstSeen,
+			lastSeen: meta?.lastSeen,
+			registered: meta?.registered === true,
+			exists: projectPath !== undefined && fs.existsSync(projectPath),
+		})
+	}
+	return entries
 }
 
 /** Old workspace-relative config dir name (also referenced from spawn scripts' docs). */
