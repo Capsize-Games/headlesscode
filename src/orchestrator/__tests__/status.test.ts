@@ -94,6 +94,43 @@ async function testFormattedTextOmitsPlanFirstWhenNotRun(): Promise<void> {
 	assert.ok(!text.includes("plan-first:"), `plan-first should not render for a plain round, got: ${text}`)
 }
 
+// ─── batchUsage visibility (issue #118) ──────────────────────────────────────
+
+const BATCH_USAGE = { costUsd: 0.8, inputTokens: 2000, outputTokens: 1000, iterations: 80 }
+
+async function testSummaryCarriesBatchUsage(): Promise<void> {
+	const state = stateOf([baseGroup()])
+	state.totalUsage = { costUsd: 9.8, inputTokens: 10000, outputTokens: 5000, iterations: 900 }
+	state.batchUsage = BATCH_USAGE
+	const summary = buildStatusSummary(state)
+	assert.deepEqual(summary.batchUsage, BATCH_USAGE, "batchUsage threaded through the summary")
+	assert.equal(summary.totalUsage?.costUsd, 9.8, "totalUsage stays distinct (cumulative)")
+}
+
+async function testSummaryLeavesBatchUsageUndefinedWhenAbsent(): Promise<void> {
+	const state = stateOf([baseGroup()])
+	const summary = buildStatusSummary(state)
+	assert.equal(summary.batchUsage, undefined, "no batchUsage in state -> summary omits it")
+}
+
+async function testFormattedTextShowsBatchUsageLine(): Promise<void> {
+	const state = stateOf([baseGroup()])
+	state.totalUsage = { costUsd: 9.8, inputTokens: 10000, outputTokens: 5000, iterations: 900 }
+	state.batchUsage = BATCH_USAGE
+	const summary = buildStatusSummary(state)
+	const text = formatStatusText(summary, { repo: "/tmp/repo", statePath: "/tmp/state.json" })
+	assert.match(text, /total usage: \$9.8000/, "cumulative total line stays")
+	assert.match(text, /batch usage: \$0.8000 · 2000 in \/ 1000 out tokens · 80 iterations \(this round only\)/, "batch line rendered")
+}
+
+async function testFormattedTextOmitsBatchUsageWhenAbsent(): Promise<void> {
+	const state = stateOf([baseGroup()])
+	state.totalUsage = { costUsd: 0.042, inputTokens: 1000, outputTokens: 500, iterations: 3 }
+	const summary = buildStatusSummary(state)
+	const text = formatStatusText(summary, { repo: "/tmp/repo", statePath: "/tmp/state.json" })
+	assert.ok(!text.includes("batch usage:"), `batch usage should not render without batchUsage, got: ${text}`)
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: [string, () => Promise<void>][] = [
@@ -106,6 +143,10 @@ const tests: [string, () => Promise<void>][] = [
 	["formatStatusText shows plan-first:ok (plan in task file)", testFormattedTextShowsPlanFirstOk],
 	["formatStatusText shows plan-first:failed without claiming a plan", testFormattedTextShowsPlanFirstFailed],
 	["formatStatusText omits plan-first for a plain round", testFormattedTextOmitsPlanFirstWhenNotRun],
+	["buildStatusSummary carries batchUsage", testSummaryCarriesBatchUsage],
+	["buildStatusSummary leaves batchUsage undefined when absent", testSummaryLeavesBatchUsageUndefinedWhenAbsent],
+	["formatStatusText shows the batch usage line (this round only)", testFormattedTextShowsBatchUsageLine],
+	["formatStatusText omits batch usage when absent", testFormattedTextOmitsBatchUsageWhenAbsent],
 ]
 
 async function main(): Promise<void> {

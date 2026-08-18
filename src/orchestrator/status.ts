@@ -132,6 +132,8 @@ export interface StatusSummary {
 	groups: StatusGroupRow[]
 	counts: StatusCounts
 	totalUsage?: OrchestratorState["totalUsage"]
+	/** Issue #118: usage summed over only the current batch's groups (undefined when none yet). */
+	batchUsage?: OrchestratorState["batchUsage"]
 }
 
 function lastActivityText(group: OrchestratorGroup): string {
@@ -198,7 +200,14 @@ export function buildStatusSummary(state: OrchestratorState): StatusSummary {
 			planFirst: g.plan_first,
 		}
 	})
-	return { batch: state.batch, updated: state.updated, groups, counts, totalUsage: state.totalUsage }
+	return {
+		batch: state.batch,
+		updated: state.updated,
+		groups,
+		counts,
+		totalUsage: state.totalUsage,
+		batchUsage: state.batchUsage,
+	}
 }
 
 /**
@@ -265,6 +274,14 @@ export function formatStatusText(
 		lines.push(
 			`total usage: $${u.costUsd.toFixed(4)} · ${u.inputTokens} in / ${u.outputTokens} out tokens` +
 				(u.iterations > 0 ? ` · ${u.iterations} iterations` : ""),
+		)
+	}
+	if (summary.batchUsage) {
+		const u = summary.batchUsage
+		lines.push(
+			`batch usage: $${u.costUsd.toFixed(4)} · ${u.inputTokens} in / ${u.outputTokens} out tokens` +
+				(u.iterations > 0 ? ` · ${u.iterations} iterations` : "") +
+				" (this round only)",
 		)
 	}
 

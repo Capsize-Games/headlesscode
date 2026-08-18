@@ -71,6 +71,8 @@ export interface RoundSummary {
 	batch?: string
 	updated?: string
 	totalUsage?: OrchestratorState["totalUsage"]
+	/** Issue #118: usage summed over only the current batch's groups (undefined when none yet). */
+	batchUsage?: OrchestratorState["batchUsage"]
 	groups: OrchestratorGroup[]
 	blocked: BlockedGroup[]
 	/** Issue #13 preflight probe result (present once orchestrate ran it). */
@@ -322,6 +324,7 @@ export async function buildSummary(repo?: string): Promise<DashboardSummary> {
 			batch: state.batch,
 			updated: state.updated,
 			totalUsage: state.totalUsage,
+			batchUsage: state.batchUsage,
 			groups: state.groups,
 			blocked,
 			preflight: state.preflight,

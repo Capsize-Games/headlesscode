@@ -43,6 +43,8 @@ function mixedState(): OrchestratorState {
 	state = updateGroup(state, "w-fail", baseGroup({ name: "w-fail", status: "failed", exit_code: 7 }))
 	state = updateGroup(state, "w-run", baseGroup({ name: "w-run", status: "running" }))
 	state.totalUsage = { costUsd: 0.042, inputTokens: 1000, outputTokens: 500, iterations: 3 }
+	// Issue #118: per-batch aggregate sits alongside the cumulative total.
+	state.batchUsage = { costUsd: 0.021, inputTokens: 500, outputTokens: 250, iterations: 1 }
 	return state
 }
 
@@ -136,6 +138,7 @@ async function testOneShotPrintsHumanSummary(): Promise<void> {
 		assert.ok(text.includes("state file:"), "state file line")
 		assert.ok(text.includes("batch:      r1"), "batch line")
 		assert.ok(text.includes("total usage: $0.0420"), "round totals line")
+		assert.ok(text.includes("batch usage: $0.0210"), "issue #118 batch totals line")
 		assert.ok(text.includes("w-done"), "done group row")
 		assert.ok(text.includes("w-fail"), "failed group row")
 		assert.ok(text.includes("w-run"), "group row present")
@@ -183,6 +186,7 @@ async function testOneShotJsonShape(): Promise<void> {
 		)
 		assert.deepEqual(parsed.reconciled, ["w-run"], "--json notes the group this call reconciled")
 		assert.ok(parsed.totalUsage && parsed.totalUsage.costUsd === 0.042, "round totals preserved")
+		assert.ok(parsed.batchUsage && parsed.batchUsage.costUsd === 0.021, "issue #118 batch totals preserved")
 	} finally {
 		await fs.rm(repo, { recursive: true, force: true })
 	}

@@ -158,6 +158,8 @@ async function testBlockedGroupSurfacesQuestion(): Promise<void> {
 				},
 			],
 			totalUsage: { costUsd: 0.01, inputTokens: 500, outputTokens: 250, iterations: 5 },
+			// Issue #118: per-batch aggregate is threaded through to the round summary.
+			batchUsage: { costUsd: 0.006, inputTokens: 300, outputTokens: 150, iterations: 3 },
 		}
 		await saveState(statePath, state)
 
@@ -169,6 +171,7 @@ async function testBlockedGroupSurfacesQuestion(): Promise<void> {
 		assert.equal(summary.round?.blocked[0].question, "Which auth strategy?")
 		assert.deepEqual(summary.round?.blocked[0].suggestions, ["JWT", "sessions"])
 		assert.equal(summary.round?.totalUsage?.costUsd, 0.01)
+		assert.equal(summary.round?.batchUsage?.costUsd, 0.006, "issue #118 batch aggregate threaded through")
 		assert.equal(summary.round?.groups.length, 2)
 	} finally {
 		await fs.rm(repo, { recursive: true, force: true })

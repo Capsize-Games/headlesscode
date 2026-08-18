@@ -13,7 +13,16 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { spawnSync } from "node:child_process"
 
-import { inspectGroup, isIterationExhaustion, isProviderFailure, tailLog, watchGroups, DEFAULT_STALL_TIMEOUT_MS } from "../watch.js"
+import {
+	computeBatchUsage,
+	computeTotalUsage,
+	inspectGroup,
+	isIterationExhaustion,
+	isProviderFailure,
+	tailLog,
+	watchGroups,
+	DEFAULT_STALL_TIMEOUT_MS,
+} from "../watch.js"
 import {
 	defaultState,
 	loadStateSync,
@@ -694,8 +703,95 @@ async function testIsProviderFailureRejectsOtherFailures(): Promise<void> {
 	assert.equal(isProviderFailure(""), false, "empty summary is never a provider failure")
 }
 
+// ─── computeTotalUsage / computeBatchUsage (issue #118) ─────────────────────
+
+/** A group usage fixture (cost, tokens, iterations). */
+function usageFixture(costUsd: number, iterations: number): OrchestratorGroup["usage"] {
+	return { costUsd, inputTokens: 1000, outputTokens: 500, iterations }
+}
+
+/** State with two batches' worth of groups: current batch + one historical round. */
+function twoBatchState(): OrchestratorState {
+	let state = defaultState("round-2026-08-17")
+	// Current batch groups (spawned timestamps carry the batch date prefix).
+	state = updateGroup(
+		state,
+		"w1",
+		baseGroup({ name: "w1", status: "done", spawned: "2026-08-17T08:00:00.000Z", usage: usageFixture(0.5, 50) }),
+	)
+	state = updateGroup(
+		state,
+		"w2",
+		baseGroup({ name: "w2", status: "done", spawned: "2026-08-17T09:00:00.000Z", usage: usageFixture(0.3, 30) }),
+	)
+	// A historical group from a PRIOR round, retained in the state file for
+	// history/cleanup bookkeeping (this is the accumulation that makes
+	// totalUsage misleading for "what did THIS round cost?").
+	state = updateGroup(
+		state,
+		"w-old",
+		baseGroup({ name: "w-old", status: "done", spawned: "2026-08-10T10:00:00.000Z", usage: usageFixture(9.0, 900) }),
+	)
+	return state
+}
+
+async function testComputeBatchUsageScopesToCurrentBatch(): Promise<void> {
+	const state = twoBatchState()
+	const batch = computeBatchUsage(state)
+	assert.ok(batch, "current-batch groups have usage -> a batchUsage is produced")
+	assert.equal(batch?.costUsd, 0.8, "sums ONLY the current batch's groups (w1 + w2), not w-old")
+	assert.equal(batch?.iterations, 80)
+	assert.equal(batch?.inputTokens, 2000)
+	assert.equal(batch?.outputTokens, 1000)
+}
+
+async function testComputeBatchUsageExcludesHistoricalGroups(): Promise<void> {
+	const state = twoBatchState()
+	const total = computeTotalUsage(state)
+	assert.ok(total, "totalUsage exists")
+	assert.equal(total?.costUsd, 9.8, "totalUsage stays cumulative across ALL groups (w1 + w2 + w-old)")
+	const batch = computeBatchUsage(state)
+	assert.equal(batch?.costUsd, 0.8, "batchUsage excludes the historical round's group")
+}
+
+async function testComputeBatchUsageUndefinedWithoutBatchOrGroupUsage(): Promise<void> {
+	// No batch id at all -> nothing to scope against.
+	assert.equal(computeBatchUsage(defaultState("unnamed")), undefined)
+	// Current-batch groups with no usage records -> undefined (never a spurious all-zero rollup).
+	const empty = twoBatchState()
+	for (const g of empty.groups) {
+		empty.groups = empty.groups.map((gg) => ({ ...gg, usage: undefined }))
+	}
+	assert.equal(computeBatchUsage(empty), undefined)
+}
+
+async function testComputeBatchUsageMatchesSpawnedByDatePrefix(): Promise<void> {
+	// A timestamp-prefixed batch (e.g. custom --batch) matches by prefix, and
+	// the 'T' guard (>= 11 chars) keeps a truncated prefix from over-matching.
+	let state = defaultState("round-2026-08-17T12")
+	state = updateGroup(
+		state,
+		"w1",
+		baseGroup({ name: "w1", status: "done", spawned: "2026-08-17T12:00:00.000Z", usage: usageFixture(0.4, 40) }),
+	)
+	state = updateGroup(
+		state,
+		"w2",
+		baseGroup({ name: "w2", status: "done", spawned: "2026-08-17T13:00:00.000Z", usage: usageFixture(0.2, 20) }),
+	)
+	state = updateGroup(
+		state,
+		"w-old",
+		baseGroup({ name: "w-old", status: "done", spawned: "2026-08-16T12:00:00.000Z", usage: usageFixture(5.0, 500) }),
+	)
+	const batch = computeBatchUsage(state)
+	assert.ok(batch, "timestamp-prefixed batch matches by prefix")
+	assert.equal(batch?.costUsd, 0.4, "only groups spawned under the batch's exact date/hour prefix count (w2 is hour 13)")
+	assert.equal(batch?.iterations, 40)
+}
+
 /**
- * 2026-08-05 incident regression: `inspectGroup`'s captured `summary` field
+	* 2026-08-05 incident regression: `inspectGroup`'s captured `summary` field
  * silently dropped the ACTUAL final lines of a long-running worker's
  * harness.log. tailLog() correctly returns the last SUMMARY_TAIL_LINES
  * lines of the current run, but that tail was then capped with
@@ -816,6 +912,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["isIterationExhaustion rejects budget/real failures and empty summaries", testIsIterationExhaustionRejectsOtherFailures],
 	["isProviderFailure matches provider 5xx/429/no-allowed-providers/network-error shapes", testIsProviderFailureMatchesKnownShapes],
 	["isProviderFailure rejects deterministic 4xx, budget stops, and iteration exhaustion", testIsProviderFailureRejectsOtherFailures],
+	["computeBatchUsage scopes usage to the current batch, excluding historical groups", testComputeBatchUsageScopesToCurrentBatch],
+	["computeTotalUsage stays cumulative while computeBatchUsage excludes history", testComputeBatchUsageExcludesHistoricalGroups],
+	["computeBatchUsage is undefined without a batch id or any group usage", testComputeBatchUsageUndefinedWithoutBatchOrGroupUsage],
+	["computeBatchUsage matches a timestamp-prefixed batch by prefix", testComputeBatchUsageMatchesSpawnedByDatePrefix],
 	["inspectGroup: captured summary preserves the true tail, not the head, of a long harness.log", testInspectGroupSummaryPreservesTrueTailNotHead],
 	["tailLog: scopes the summary to content after the latest run-start separator", testTailLogScopesToLatestRunAfterAppend],
 	["tailLog: appended harness.log preserves every prior session's output on disk", testTailLogPreservesFullHistoryOnDisk],

@@ -340,7 +340,8 @@ export function buildHeadlessConventions(mode: string, customModes: ModeConfig[]
 
 - Commit before finishing: real, working changes must be committed via \`git add\` + \`git commit\` BEFORE calling attempt_completion. Use one commit per logical change with a descriptive message, matching this repo's normal style (run \`git log --oneline\` for examples). If you genuinely have no changes to commit (e.g. a read-only investigation), finish without committing.
 - Test selection during iterative work: after editing a file, run the SPECIFIC test file(s) for what you changed (the \`run_tests\` tool, or \`npx tsx <test-file>\` directly) instead of the full suite on every edit. The full \`npm test\` is still required once, right before attempt_completion, for real confidence.
-- Batch same-file diffs: when several changes target the SAME file, include them as separate SEARCH/REPLACE blocks in ONE apply_diff call — and after any successful edit, re-read the file before composing further diffs, because its content has changed.`
+- Batch same-file diffs: when several changes target the SAME file, include them as separate SEARCH/REPLACE blocks in ONE apply_diff call — and after any successful edit, re-read the file before composing further diffs, because its content has changed.
+- Waiting on an external check (CI run, registry, live service) is legitimate verification work, but every wait call still counts against your iteration budget: prefer ONE long-running command with an explicit \`timeout\` — e.g. \`gh run watch <id> --interval 30 --exit-status\` — over repeated \`sleep N && gh run list\` polls. (Issue #119: polling burns iterations with no token spend.)`
 }
 
 // ─── Tool selection ──────────────────────────────────────────────────────────

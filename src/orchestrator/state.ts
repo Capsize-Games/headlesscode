@@ -262,11 +262,31 @@ export interface OrchestratorState {
 	preflight?: PreflightRecord
 	/**
 	 * Cost/token monitoring (workstream 3): round-level total, the sum of
-	 * every group's `usage` field. Recomputed by the watcher each time a
-	 * group's usage is rolled in, so "this round cost $X" is answerable
-	 * without summing client-side.
+	 * every group's `usage` field — CUMULATIVE across every round ever
+	 * recorded in this state file (groups from prior rounds are retained for
+	 * history/cleanup bookkeeping). Recomputed by the watcher each time a
+	 * group's usage is rolled in, so "all rounds cost $X total" is
+	 * answerable without summing client-side.
 	 */
 	totalUsage?: {
+		costUsd: number
+		inputTokens: number
+		outputTokens: number
+		/** Subset of inputTokens served from the provider's prompt cache (0 when unreported). */
+		cachedTokens?: number
+		iterations: number
+	}
+	/**
+	 * Issue #118: per-batch cost aggregate — the same shape as `totalUsage`
+	 * but summed ONLY over the groups belonging to the CURRENT batch (their
+	 * `spawned` ISO timestamp carries the batch prefix, e.g.
+	 * `batch: "round-2026-08-17"` -> `spawned: "2026-08-17T…"`), so
+	 * "what did THIS round cost?" is answerable even when the state file
+	 * has accumulated many rounds' groups. Recomputed alongside `totalUsage`
+	 * by the watcher; undefined when no group of the current batch has a
+	 * usage record yet.
+	 */
+	batchUsage?: {
 		costUsd: number
 		inputTokens: number
 		outputTokens: number

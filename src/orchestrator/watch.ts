@@ -251,15 +251,60 @@ export function readWorktreeUsage(wtPath: string): OrchestratorGroup["usage"] | 
 	return found ? { costUsd, inputTokens, outputTokens, cachedTokens, iterations } : undefined
 }
 
+/** The rollup shape shared by totalUsage/batchUsage (see OrchestratorState). */
+export interface UsageRollup {
+	costUsd: number
+	inputTokens: number
+	outputTokens: number
+	cachedTokens?: number
+	iterations: number
+}
+
 /** Sum every group's `usage` into a round-level total (see OrchestratorState.totalUsage). */
-export function computeTotalUsage(state: OrchestratorState): OrchestratorState["totalUsage"] {
+export function computeTotalUsage(state: OrchestratorState): UsageRollup | undefined {
+	return sumGroupUsage(state.groups)
+}
+
+/**
+ * Issue #118: per-batch usage aggregate — the sum of every group's `usage`
+ * that BELONGS to the current batch, matching `state.batch` by prefix against
+ * the group's `spawned` ISO timestamp (e.g. `batch: "round-2026-08-17"` ->
+ * `spawned: "2026-08-17T…"`). `totalUsage` is cumulative across ALL groups
+ * ever recorded in the state file (prior rounds' groups are retained for
+ * history/cleanup bookkeeping), so it can diverge arbitrarily from what the
+ * CURRENT round actually cost; this scopes the sum back to the round at hand.
+ * Returns undefined when no current-batch group has a usage record yet.
+ */
+export function computeBatchUsage(state: OrchestratorState): UsageRollup | undefined {
+	const batch = state.batch
+	if (!batch) {
+		return undefined
+	}
+	const prefix = batch.replace(/^round-/, "")
+	return sumGroupUsage(
+		state.groups.filter((group) => {
+			if (!group.spawned) {
+				return false
+			}
+			const spawned = group.spawned
+			const spawnedDate = spawned.slice(0, 10)
+			// Full-date batch ("2026-08-17") must match the spawned DATE
+			// exactly; a timestamp-prefixed batch ("2026-08-17T…") must run
+			// through the 'T' separator (>= 11 chars) so a truncated prefix
+			// like "2026-08-1" can never over-match a whole day.
+			return spawnedDate === prefix || (prefix.length >= 11 && spawned.startsWith(prefix))
+		}),
+	)
+}
+
+function sumGroupUsage(groups: OrchestratorGroup[]): UsageRollup | undefined {
 	let costUsd = 0
 	let inputTokens = 0
 	let outputTokens = 0
 	let cachedTokens = 0
 	let iterations = 0
 	let found = false
-	for (const group of state.groups) {
+	for (const group of groups) {
 		if (!group.usage) {
 			continue
 		}
@@ -737,10 +782,16 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 				lastSeenStatus.set(group.name, patch.status)
 			}
 			state = updateGroup(state, group.name, patch)
-			// Cost/token monitoring: recompute the round-level total whenever a
+			// Cost/token monitoring: recompute the round-level totals whenever a
 			// group's usage may have changed (i.e. every state update — cheap,
-			// and keeps totalUsage never stale).
-			state = { ...state, totalUsage: computeTotalUsage(state) }
+			// and keeps totalUsage/batchUsage never stale). totalUsage is
+			// cumulative across every group ever recorded; batchUsage is scoped
+			// to the current batch (issue #118).
+			state = {
+				...state,
+				totalUsage: computeTotalUsage(state),
+				batchUsage: computeBatchUsage(state),
+			}
 			saveStateSync(statePath, state)
 			changed = true
 			const updated = state.groups.find((g) => g.name === group.name)

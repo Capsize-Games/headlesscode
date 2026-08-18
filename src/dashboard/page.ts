@@ -1552,7 +1552,8 @@ function renderRound(round) {
     : "";
   el.innerHTML = \`
     <div class="sub">batch: \${esc(round.batch ?? "—")} · updated: \${esc(round.updated ?? "—")}
-      · round total: \${round.totalUsage ? fmtCost(round.totalUsage.costUsd) : "$0.000000"}</div>
+      · batch total: \${round.batchUsage ? fmtCost(round.batchUsage.costUsd) : "$0.000000"}
+      · round total (all history): \${round.totalUsage ? fmtCost(round.totalUsage.costUsd) : "$0.000000"}</div>
     \${preflight}
     <table>
       <thead><tr><th>group</th><th>status</th><th>cost</th><th>in tok</th><th>cached tok</th><th>out tok</th><th>iter</th></tr></thead>

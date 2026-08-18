@@ -27,6 +27,7 @@ import {
 	appendCodeIntelTools,
 	appendDescribeImageTool,
 	appendRunTestsTool,
+	buildHeadlessConventions,
 	selectToolsForMode,
 } from "../prompt.js"
 import type { ChatTool } from "../types.js"
@@ -107,10 +108,39 @@ async function testReadFileSpecificallyIsNotStrictModeBroken(): Promise<void> {
 	}
 }
 
+async function testHeadlessConventionsGuideExternalCheckWaiting(): Promise<void> {
+	const conventions = buildHeadlessConventions("code", [])
+	assert.ok(conventions, "edit-capable modes must get the headless workflow conventions")
+	assert.match(
+		conventions ?? "",
+		/gh run watch/,
+		"issue #119: conventions must steer workers toward a single gh run watch over repeated polls",
+	)
+	assert.match(
+		conventions ?? "",
+		/iteration budget/,
+		"issue #119: conventions must name why (waits count against the iteration budget)",
+	)
+	assert.match(
+		conventions ?? "",
+		/sleep/,
+		"issue #119: conventions must name the wasteful polling pattern it replaces",
+	)
+}
+
+async function testHeadlessConventionsNotShownToReadOnlyModes(): Promise<void> {
+	// Read-only reviewer/QA roles never see the edit-workflow conventions
+	// (modeHasEditGroup gate) — and that includes the new waiting guidance.
+	assert.equal(buildHeadlessConventions("reviewer", []), undefined)
+	assert.equal(buildHeadlessConventions("qa", []), undefined)
+}
+
 const tests: Array<[string, () => Promise<void>]> = [
 	["no strict-mode schema violations across the code mode's full tool set", testNoStrictModeViolationsInCodeMode],
 	["no strict-mode schema violations in the appended (non-vendored) tools", testNoStrictModeViolationsInAppendedTools],
 	["read_file specifically: strict/required are consistent", testReadFileSpecificallyIsNotStrictModeBroken],
+	["headless conventions guide external-check waiting (gh run watch, iteration budget)", testHeadlessConventionsGuideExternalCheckWaiting],
+	["headless conventions are not shown to read-only modes", testHeadlessConventionsNotShownToReadOnlyModes],
 ]
 
 async function main(): Promise<void> {
