@@ -5,7 +5,7 @@
  * Run with: npm run smoke  (i.e. tsx src/vendor/tests/smoke.ts)
  */
 
-import type { ExtensionContext } from "vscode"
+import type { ExtensionContext } from "../zoo-code/shim/vscode.js"
 
 // Side effect: installs String.prototype.toPosix() used by prompt sections.
 import "../zoo-code/src/utils/path.js"

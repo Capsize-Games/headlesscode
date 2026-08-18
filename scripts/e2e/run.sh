@@ -116,7 +116,7 @@ echo "== [4/7] dry-run validation (rules + custom modes) =="
 DRYRUN_CODE_OUT="$(mktemp /tmp/headlesscode-e2e-dryrun-code-XXXXXX.out)"
 (
 	cd "$ROOT" &&
-		npx tsx src/cli.ts --dry-run --mode code --workspace "$WORKTREE"
+		npx --no-install tsx src/cli.ts --dry-run --mode code --workspace "$WORKTREE"
 ) >"$DRYRUN_CODE_OUT" 2>&1
 DRYRUN_CODE_EXIT=$?
 if [ "$DRYRUN_CODE_EXIT" -eq 0 ] &&
@@ -131,7 +131,7 @@ fi
 DRYRUN_MODE_OUT="$(mktemp /tmp/headlesscode-e2e-dryrun-mode-XXXXXX.out)"
 (
 	cd "$ROOT" &&
-		npx tsx src/cli.ts --dry-run --mode issue-fixer --workspace "$WORKTREE"
+		npx --no-install tsx src/cli.ts --dry-run --mode issue-fixer --workspace "$WORKTREE"
 ) >"$DRYRUN_MODE_OUT" 2>&1
 DRYRUN_MODE_EXIT=$?
 if [ "$DRYRUN_MODE_EXIT" -eq 0 ] && grep -q "issue-fixer" "$DRYRUN_MODE_OUT"; then
@@ -151,7 +151,7 @@ TASK_TEXT='fix the greet function in src/greet.js so it returns "Hello, " + name
 		OPENROUTER_BASE_URL="http://127.0.0.1:$MOCK_PORT" \
 		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 		HEADLESSCODE_WORKSPACE_ROOT="$WORKTREE" \
-		npx tsx src/cli.ts --task "$TASK_TEXT" --mode code \
+		npx --no-install tsx src/cli.ts --task "$TASK_TEXT" --mode code \
 			--workspace "$WORKTREE" --max-iterations 10 --log-file "$HARNESS_LOG"
 ) >"$HARNESS_OUT" 2>&1
 CLI_EXIT=$?

@@ -68,16 +68,18 @@ and compose placement here don't constrain that choice.
   shadow-git checkpoints, reviewers; ca-certificates for OpenRouter/npm TLS).
 - `npm ci` (full, devDependencies included) — headlesscode has **no compiled
   output**; `tsx` + `typescript` run the TypeScript source at runtime, so they
-  must be installed. The playwright npm package comes along as a devDependency
-  but installs JS-only (no browser download on install — no install script).
+  are runtime `dependencies` (since issue #99, the package's `bin` must work
+  from a clean `npm install -g`, which installs dependencies only). The
+  playwright npm package is also a runtime dependency but installs JS-only
+  (no browser download on install — no install script).
 - `src/` copied; a `/usr/local/bin/headlesscode` wrapper runs
   `tsx /opt/headlesscode/src/cli.ts` (the package's `bin` entry only becomes
   executable when installed as a dependency, so a fixed wrapper mirrors the
   repo's own invocation). The wrapper exports `TSX_TSCONFIG_PATH=/opt/headlesscode/tsconfig.json`:
   tsx discovers tsconfig from the *cwd*, and the CLI is invoked from arbitrary
   working directories (orchestrated checkouts, scratch repos, `/data/...`) —
-  without the pin, the `vscode` -> `src/vendor/zoo-code/shim` path alias
-  wouldn't resolve and every command dies with `ERR_MODULE_NOT_FOUND`.
+  without the pin, tsx would pick up some unrelated tsconfig (or none) and
+  the CLI would fail to boot from a foreign cwd.
 - The three runtime orchestration scripts (`scripts/spawn-parallel-worktrees.sh`,
   `run-worker.sh`, `headlesscode-answer.sh`) are copied in — a real
   non-dry-run `orchestrate` run shells out to them (the rest of `scripts/` is

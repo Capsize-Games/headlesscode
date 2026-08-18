@@ -1,4 +1,4 @@
-import * as vscode from "vscode"
+import * as vscode from "../../shim/vscode"
 
 import {
 	type GroupEntry,
@@ -7,7 +7,7 @@ import {
 	type ToolGroup,
 	type PromptComponent,
 	DEFAULT_MODES,
-} from "@roo-code/types"
+} from "../../types"
 
 import { addCustomInstructions } from "../core/prompts/sections/custom-instructions"
 

@@ -1,8 +1,9 @@
 /**
  * SHIM — minimal stand-in for the `@anthropic-ai/sdk` package.
  *
- * Maps to this file via the "@anthropic-ai/sdk" entry in tsconfig.json
- * "paths". The vendored `shared/tools.ts` imports the `Anthropic` value only
+ * The vendored `shared/tools.ts`'s `import { Anthropic } from
+ * "@anthropic-ai/sdk"` is rewritten to import this file by relative path
+ * (issue #99 rework). It imports the `Anthropic` value only
  * for its types (TextBlockParam/ImageBlockParam), and
  * `native-tools/converters.ts` imports it with `import type`. The class +
  * namespace merging below mirrors how the real SDK exports `Anthropic`: the

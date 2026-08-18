@@ -33,6 +33,8 @@ build/
 
 # Harness bookkeeping artifacts that must never be committed from a worktree.
 /.harness.pid
+/.harness.pgid
+/.harness.exit
 /ORCHESTRATOR_TASK.md
 
 # Local tool runtime artifacts (Claude Code scheduled-task lock, etc.)

@@ -21,9 +21,11 @@
  *     port (see src/codeintel/).
  *
  * Every file operation resolves relative to the configured workspace root and
- * is rejected if it escapes the workspace (path-traversal guard). Results are
- * plain strings + an { isError } flag; long outputs are truncated to keep the
- * model context bounded.
+ * is rejected if it escapes the workspace — both lexically (`../` traversal)
+ * and after following symlinks (a symlink whose real location is outside the
+ * workspace is refused; see resolveWithinWorkspace). Results are plain strings
+ * + an { isError } flag; long outputs are truncated to keep the model context
+ * bounded.
  *
  * The three surgical edit tools are backed by the vendored Zoo Code diff
  * logic: `apply_diff` uses the fuzzy MultiSearchReplaceDiffStrategy
@@ -346,9 +348,42 @@ export class PathTraversalError extends Error {
 }
 
 /**
+ * A path whose REAL location (after following symlinks) escapes the workspace
+ * even though its lexical path stays inside it (issue #64). Subclasses
+ * PathTraversalError so existing callers that catch the base class (e.g. the
+ * dashboard's HTTP layer, which maps it to a 400) keep treating it the same
+ * way.
+ */
+export class SymlinkEscapeError extends PathTraversalError {
+	constructor(requested: string, root: string, resolvedTo: string) {
+		super(requested, root)
+		this.name = "SymlinkEscapeError"
+		this.message = `Path escapes the workspace root through a symlink (${root}): ${requested} — it resolves to ${resolvedTo}`
+	}
+}
+
+/**
  * Resolve `p` against the workspace root and reject anything that escapes it.
- * Uses path.resolve + a containment check, mirroring the harness's Phase 1
- * requirement (no symlink-following resolution — lexical containment only).
+ *
+ * Two layers of containment (issue #64):
+ *  1. Lexical: path.resolve + a prefix check — the classic `../` traversal
+ *     guard. This alone is NOT sufficient: every `fsp` call in the file tools
+ *     FOLLOWS symlinks, so an agent can `ln -s ~/.ssh <ws>/sshlink` and then
+ *     read AND write outside the workspace through it. The protected-files
+ *     guard is bypassed the same way — it only ever sees the
+ *     workspace-relative lexical path.
+ *  2. Symlink-following (assertNoSymlinkEscape): the real path of the deepest
+ *     resolvable ancestor must stay inside the workspace root's own real
+ *     path. An escaping symlink — as a directory component, as the target
+ *     itself, or as a dangling symlink a later write would create THROUGH —
+ *     is refused with SymlinkEscapeError. The ancestor walk keeps writes to
+ *     not-yet-existing paths working (realpath on a nonexistent path throws).
+ *
+ * Documented boundary: a path is usable only if every existing component of
+ * it really lives inside the workspace. A symlink that escapes is refused
+ * even when it points somewhere "useful" (e.g. a node_modules symlinked to a
+ * sibling checkout) — the model can still reach such paths through
+ * execute_command, which has its own permission gate.
  */
 export function resolveWithinWorkspace(root: string, p: string): string {
 	const rootAbs = path.resolve(root)
@@ -356,7 +391,81 @@ export function resolveWithinWorkspace(root: string, p: string): string {
 	if (target !== rootAbs && !target.startsWith(rootAbs + path.sep)) {
 		throw new PathTraversalError(p, rootAbs)
 	}
+	assertNoSymlinkEscape(rootAbs, target, p)
 	return target
+}
+
+/**
+ * Reject a `target` whose real location (after following symlinks) escapes
+ * `rootAbs`. Called by resolveWithinWorkspace after the lexical check.
+ *
+ * Walk up from `target` until an existing path is found, realpath it, and
+ * require the result to stay inside the root's own realpath. Three cases
+ * realpath can't answer directly, each handled explicitly:
+ *  - Path doesn't exist yet (a write to a new file): walk up to the deepest
+ *    existing ancestor — its real location decides where the write lands.
+ *  - A component is a DANGLING symlink: realpath fails, but a write through
+ *    it would create the target AT THE SYMLINK'S DESTINATION, so follow the
+ *    chain (re-running the containment check on each hop) instead of walking
+ *    past it.
+ *  - A symlink cycle (realpath throws ELOOP): unresolvable — the kernel
+ *    refuses reads/writes through it too, so nothing can escape; walk up.
+ */
+function assertNoSymlinkEscape(rootAbs: string, target: string, requested: string): void {
+	const rootReal = realpathOrSelf(rootAbs)
+	const seen = new Set<string>()
+	let probe = target
+	for (;;) {
+		if (seen.has(probe)) {
+			// Symlink cycle: unresolvable, so no read/write can escape through
+			// it — walk up and keep checking the ancestors.
+			const parent = path.dirname(probe)
+			if (parent === probe) {
+				return
+			}
+			probe = parent
+			continue
+		}
+		seen.add(probe)
+
+		let real: string
+		try {
+			real = fs.realpathSync(probe)
+		} catch {
+			let st: fs.Stats | undefined
+			try {
+				st = fs.lstatSync(probe)
+			} catch {
+				st = undefined
+			}
+			if (st?.isSymbolicLink()) {
+				// Dangling symlink: a later write would create the target at
+				// the symlink's destination, so verify the destination chain
+				// instead of skipping the symlink.
+				probe = path.resolve(path.dirname(probe), fs.readlinkSync(probe))
+				continue
+			}
+			const parent = path.dirname(probe)
+			if (parent === probe) {
+				return
+			}
+			probe = parent
+			continue
+		}
+		if (real !== rootReal && !real.startsWith(rootReal + path.sep)) {
+			throw new SymlinkEscapeError(requested, rootAbs, real)
+		}
+		return
+	}
+}
+
+/** realpath of `p`, falling back to the lexical path when it can't resolve. */
+function realpathOrSelf(p: string): string {
+	try {
+		return fs.realpathSync(p)
+	} catch {
+		return p
+	}
 }
 
 /** Build a path-safety-checked absolute path, catching traversal errors. */
@@ -698,6 +807,32 @@ function formatFileSlice(rel: string, allLines: string[], offset: number, limit:
 	return `${header}\n${body}`.replace(/\n$/, "")
 }
 
+/**
+	* Shared protected-files guard for every write tool. Returns a refusal
+	* ToolResult when `rel` (workspace-relative, POSIX-separated) matches a
+	* protected pattern and the escape hatch — --allow-protected-writes or
+	* "allowProtectedWrites": true in .headlesscode/permissions.json — is
+	* explicitly on (OFF by default). Naming the matched pattern gives a
+	* well-behaved model a concrete reason to stop. A refusal is a real tool
+	* error (isError: true) and counts toward the consecutive-mistake bound,
+	* exactly like any other tool failure.
+	*/
+function protectedWriteRefusal(toolName: string, rel: string, permissions: PermissionsConfig): ToolResult | null {
+	if (permissions.allowProtectedWrites) {
+		return null
+	}
+	const matchedPattern = findMatchingPattern(rel, permissions.protectedFiles)
+	if (matchedPattern === null) {
+		return null
+	}
+	return err(
+		`${toolName}: refusing to write protected file '${rel}' (matches protected pattern '${matchedPattern}'). ` +
+			`This file is protected by the harness permissions policy and cannot be overwritten. If this write is ` +
+			`genuinely required, re-run with --allow-protected-writes (or set "allowProtectedWrites": true in ` +
+			`<workspaceRoot>/.headlesscode/permissions.json); it is OFF by default.`,
+	)
+}
+
 /** write_to_file — create parent dirs as needed, overwrite existing files. */
 function writeToFileHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
 	const filePath = requireString(args, "path")
@@ -709,20 +844,11 @@ function writeToFileHandler(args: Record<string, unknown>, ctx: ToolContext): Pr
 		// Permissions: refuse writes to protected files (secret/credential
 		// patterns) unless the escape hatch — --allow-protected-writes or
 		// "allowProtectedWrites": true in .headlesscode/permissions.json — is
-		// explicitly on (OFF by default). Naming the matched pattern gives a
-		// well-behaved model a concrete reason to stop. A refusal is a real
-		// tool error (isError: true) and counts toward the consecutive-mistake
-		// bound, exactly like any other tool failure.
-		if (!ctx.permissions.allowProtectedWrites) {
-			const matchedPattern = findMatchingPattern(rel, ctx.permissions.protectedFiles)
-			if (matchedPattern !== null) {
-				return err(
-					`write_to_file: refusing to write protected file '${rel}' (matches protected pattern '${matchedPattern}'). ` +
-						`This file is protected by the harness permissions policy and cannot be overwritten. If this write is ` +
-						`genuinely required, re-run with --allow-protected-writes (or set "allowProtectedWrites": true in ` +
-						`<workspaceRoot>/.headlesscode/permissions.json); it is OFF by default.`,
-				)
-			}
+		// explicitly on (OFF by default). All four write tools share the
+		// protectedWriteRefusal helper below, so no write path can bypass it.
+		const refusal = protectedWriteRefusal("write_to_file", rel, ctx.permissions)
+		if (refusal !== null) {
+			return refusal
 		}
 
 		try {
@@ -814,6 +940,14 @@ async function applyDiffHandler(args: Record<string, unknown>, ctx: ToolContext)
 		const target = safeTarget(ctx, filePath)
 		const rel = path.relative(ctx.workspaceRoot, target).toPosix() || path.basename(target)
 
+		// Permissions: same protected-files guard as write_to_file (shared
+		// helper) — an agent must not edit .env / *.pem / *.key through a
+		// different write tool than the one the guard was originally wired to.
+		const refusal = protectedWriteRefusal("apply_diff", rel, ctx.permissions)
+		if (refusal !== null) {
+			return refusal
+		}
+
 		let originalContent: string
 		try {
 			originalContent = await fsp.readFile(target, "utf-8")
@@ -884,6 +1018,14 @@ async function searchReplaceHandler(args: Record<string, unknown>, ctx: ToolCont
 
 		const target = safeTarget(ctx, filePath)
 		const rel = path.relative(ctx.workspaceRoot, target).toPosix() || path.basename(target)
+
+		// Permissions: same protected-files guard as write_to_file (shared
+		// helper) — an agent must not edit .env / *.pem / *.key through a
+		// different write tool than the one the guard was originally wired to.
+		const refusal = protectedWriteRefusal("search_replace", rel, ctx.permissions)
+		if (refusal !== null) {
+			return refusal
+		}
 
 		let fileContent: string
 		try {
@@ -1046,6 +1188,14 @@ async function editFileHandler(args: Record<string, unknown>, ctx: ToolContext):
 	return (async () => {
 		const target = safeTarget(ctx, filePath)
 		const rel = path.relative(ctx.workspaceRoot, target).toPosix() || path.basename(target)
+
+		// Permissions: same protected-files guard as write_to_file (shared
+		// helper) — an agent must not edit .env / *.pem / *.key through a
+		// different write tool than the one the guard was originally wired to.
+		const refusal = protectedWriteRefusal("edit_file", rel, ctx.permissions)
+		if (refusal !== null) {
+			return refusal
+		}
 
 		let currentContent: string | null = null
 		let currentContentLF: string | null = null

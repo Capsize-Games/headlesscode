@@ -257,20 +257,35 @@ export class DockerSessionProvider implements CloudProvider {
 		return { exitCode, done, summary, worktree: wtPath }
 	}
 
-	/** Remove the container AND verify it is actually gone — a leaked container is a real cost/security problem. */
+	/**
+	 * Remove the container AND verify it is actually gone — a leaked container
+	 * is a real cost/security problem. Docker's "removal of container ... is
+	 * already in progress" (a benign race between `docker rm` calls on the
+	 * same container, hit when parallel sessions teardown close together) is
+	 * treated as success: the removal IS in progress, and the enumeration
+	 * below is what actually proves the container is gone.
+	 */
 	async teardown(handle: SessionHandle): Promise<void> {
 		const name = this.containerName(handle)
 		const rm = this.run(`docker rm -f ${name}`)
-		if (rm.exitCode !== 0 && rm.output.includes("No such container")) {
-			return // already gone — nothing to leak
-		}
-		if (rm.exitCode !== 0) {
+		if (rm.exitCode !== 0 && !rm.output.includes("No such container") && !rm.output.includes("is already in progress")) {
 			throw new Error(`DockerSessionProvider: teardown rm failed for ${name} (exit ${rm.exitCode}): ${rm.output}`)
 		}
 		// Prove removal by enumeration, not by trusting the exit code.
-		const remaining = this.listContainers().filter((n) => n === name)
-		if (remaining.length > 0) {
-			throw new Error(`DockerSessionProvider: teardown did not remove ${name} (still listed by docker ps -a)`)
+		// `docker rm` is async in the daemon: a just-issued rm can still list
+		// the container for a few ms, so retry the enumeration briefly before
+		// declaring a leak — an eventual rm failure (auth, I/O) IS a real leak
+		// and still fails this loop.
+		const deadline = Date.now() + 5_000
+		for (;;) {
+			const remaining = this.listContainers().filter((n) => n === name)
+			if (remaining.length === 0) {
+				return
+			}
+			if (Date.now() > deadline) {
+				throw new Error(`DockerSessionProvider: teardown did not remove ${name} (still listed by docker ps -a)`)
+			}
+			await sleep(100)
 		}
 	}
 }

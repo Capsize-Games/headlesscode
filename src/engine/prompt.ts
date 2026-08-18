@@ -33,7 +33,7 @@ import { ensureSharedInstructionsMigration, sharedInstructionsRoot } from "../pr
 // Side effect: installs String.prototype.toPosix() used by the prompt sections.
 import "../vendor/zoo-code/src/utils/path.js"
 
-import type { ExtensionContext } from "vscode"
+import type { ExtensionContext } from "../vendor/zoo-code/shim/vscode.js"
 import { SYSTEM_PROMPT } from "../vendor/zoo-code/src/core/prompts/system.js"
 import { getNativeTools } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/index.js"
 import { getGroupName, getModeBySlug, modes, getToolsForMode } from "../vendor/zoo-code/src/shared/modes.js"
@@ -43,7 +43,7 @@ import { browserActionTool } from "../tools/browser/tool.js"
 import { describeImageTool } from "../vision/tool.js"
 import { runTestsTool } from "../tools/run-tests.js"
 import { CODE_INTEL_TOOLS, RENAME_SYMBOL_TOOL } from "../codeintel/tools.js"
-import type { ModeConfig } from "@roo-code/types"
+import type { ModeConfig } from "../vendor/zoo-code/types/index.js"
 
 import { appendStackRulesSection, loadStackRules } from "./stacks.js"
 import type { ChatTool } from "./types.js"

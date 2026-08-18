@@ -9,7 +9,7 @@
 import * as path from "path"
 import * as os from "os"
 import * as fs from "fs/promises"
-import type { ExtensionContext } from "vscode"
+import type { ExtensionContext } from "../../shim/vscode"
 
 export async function ensureSettingsDirectoryExists(_context?: ExtensionContext): Promise<string> {
 	const dir = path.join(os.homedir(), ".roo")
