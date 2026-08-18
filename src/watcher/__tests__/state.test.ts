@@ -80,11 +80,24 @@ async function testLoadMalformedShapeIsSanitized(): Promise<void> {
 	assert.deepEqual(state.processed, {}, "non-object processed coerced to {}")
 }
 
-async function testLoadInvalidJsonThrows(): Promise<void> {
+// Issue #78: unlike the orchestrator's state file (the source of truth for
+// in-flight work, where a parse error must be loud), watcher state is a
+// resumable idempotency cache — a crash-truncated file falls back to a fresh
+// default rather than hard-failing the watcher on every subsequent poll.
+async function testLoadInvalidJsonFallsBackToDefault(): Promise<void> {
 	const p = await tmpStatePath()
 	await fs.mkdir(path.dirname(p), { recursive: true })
 	await fs.writeFile(p, "{ definitely not json", "utf-8")
-	await assert.rejects(() => loadWatcherState(p), SyntaxError)
+	const state = await loadWatcherState(p)
+	assert.deepEqual(state.processed, {}, "corrupt file yields a fresh default, not a throw")
+}
+
+async function testLoadInvalidJsonFallsBackToDefaultSync(): Promise<void> {
+	const p = await tmpStatePath()
+	await fs.mkdir(path.dirname(p), { recursive: true })
+	await fs.writeFile(p, "{ definitely not json", "utf-8")
+	const state = loadWatcherStateSync(p)
+	assert.deepEqual(state.processed, {}, "corrupt file yields a fresh default, not a throw")
 }
 
 async function testIsProcessedSemantics(): Promise<void> {
@@ -179,7 +192,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["save/load round-trip preserves entries + groups", testSaveLoadRoundTrip],
 	["missing state file -> default state", testLoadMissingFileReturnsDefault],
 	["malformed shape sanitized to processed {}", testLoadMalformedShapeIsSanitized],
-	["invalid JSON throws", testLoadInvalidJsonThrows],
+	["invalid JSON falls back to default (async)", testLoadInvalidJsonFallsBackToDefault],
+	["invalid JSON falls back to default (sync)", testLoadInvalidJsonFallsBackToDefaultSync],
 	["isProcessed semantics (pending spawnable, others processed)", testIsProcessedSemantics],
 	["failed is not auto-retried; retryFailed forces it", testFailedNotRetriedByDefaultButRetriedWithFlag],
 	["write-ahead: spawned entry is durable before the spawn step", testWriteAheadOrderingEntryVisibleBeforeSpawnStep],

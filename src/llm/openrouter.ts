@@ -381,18 +381,6 @@ export class OpenRouterClient implements LlmClient {
 		return (await this.fetchModelInfo(model, signal))?.contextWindow
 	}
 
-	/**
-	 * Fetch live per-token pricing for a model from the same
-	 * `/api/v1/models/<id>/endpoints` response (thin wrapper over
-	 * fetchModelInfo). Returns `undefined` on any failure/missing data — the
-	 * caller falls back to DEFAULT_PRICING_TABLE exactly as before live
-	 * pricing existed. Resolved once per session and cached by the caller
-	 * (loop.ts), mirroring the context-window caching fix.
-	 */
-	async fetchModelPricing(model: string, signal?: AbortSignal): Promise<ModelPrice | undefined> {
-		return (await this.fetchModelInfo(model, signal))?.price
-	}
-
 	async createChatCompletion(request: LlmRequest): Promise<LlmResponse> {
 		if (!this.apiKey) {
 			throw new OpenRouterError(

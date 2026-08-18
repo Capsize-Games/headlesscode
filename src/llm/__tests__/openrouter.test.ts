@@ -186,7 +186,10 @@ async function testFetchModelContextWindowRetriesTransientFailure(): Promise<voi
 	}
 }
 
-// ─── fetchModelPricing (Part E: live pricing from the same endpoints response) ─
+// ─── live pricing via fetchModelInfo (Part E: same endpoints response as the
+// context-window lookup; issue #86 dropped the unused fetchModelPricing
+// wrapper — loop.ts calls fetchModelInfo directly and reads `.price` off the
+// result, so these assert against fetchModelInfo instead) ─
 
 async function testFetchModelPricingPrefersPinnedProvider(): Promise<void> {
 	// deepseek/* pins routing to the official endpoint — the live price must
@@ -216,7 +219,7 @@ async function testFetchModelPricingPrefersPinnedProvider(): Promise<void> {
 			{ status: 200, headers: { "Content-Type": "application/json" } },
 		)) as typeof fetch
 	try {
-		const price = await client.fetchModelPricing("deepseek/deepseek-v4-flash")
+		const price = (await client.fetchModelInfo("deepseek/deepseek-v4-flash"))?.price
 		assert.ok(price, "a live price is resolved")
 		assert.ok(Math.abs(price.input - 0.14) < 1e-9, `official DeepSeek prompt price wins, got $${price.input}`)
 		assert.ok(Math.abs(price.output - 0.28) < 1e-9, `official DeepSeek completion price wins, got $${price.output}`)
@@ -234,23 +237,23 @@ async function testFetchModelPricingFailOpen(): Promise<void> {
 	const originalFetch = globalThis.fetch
 	globalThis.fetch = (async () => new Response("not found", { status: 404 })) as typeof fetch
 	try {
-		assert.equal(await client.fetchModelPricing("nope/model"), undefined)
+		assert.equal(await client.fetchModelInfo("nope/model"), undefined)
 	} finally {
 		globalThis.fetch = originalFetch
 	}
-	// No pricing fields on the endpoints → undefined.
+	// No pricing fields on the endpoints → price undefined.
 	globalThis.fetch = (async () =>
 		new Response(
 			JSON.stringify({ data: { id: "m/m", endpoints: [{ provider_name: "HostA", context_length: 131072 }] } }),
 			{ status: 200, headers: { "Content-Type": "application/json" } },
 		)) as typeof fetch
 	try {
-		assert.equal(await client.fetchModelPricing("m/m"), undefined)
+		assert.equal((await client.fetchModelInfo("m/m"))?.price, undefined)
 	} finally {
 		globalThis.fetch = originalFetch
 	}
 	const noKey = new OpenRouterClient({ baseUrl: "http://mock" })
-	assert.equal(await noKey.fetchModelPricing("deepseek/deepseek-v4-flash"), undefined)
+	assert.equal(await noKey.fetchModelInfo("deepseek/deepseek-v4-flash"), undefined)
 }
 
 async function testFetchModelInfoSharesOneFetch(): Promise<void> {
@@ -626,8 +629,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["fetchModelContextWindow: accepts the legacy array shape", testFetchModelContextWindowAcceptsLegacyArrayShape],
 	["fetchModelContextWindow: retries transient failures, not 404s", testFetchModelContextWindowRetriesTransientFailure],
 	["fetchModelContextWindow: undefined on failure / missing key", testFetchModelContextWindowReturnsUndefinedOnFailure],
-	["fetchModelPricing: pinned provider's endpoint price wins", testFetchModelPricingPrefersPinnedProvider],
-	["fetchModelPricing: fail-open (404/no-pricing/no-key) → undefined", testFetchModelPricingFailOpen],
+	["fetchModelInfo price: pinned provider's endpoint price wins", testFetchModelPricingPrefersPinnedProvider],
+	["fetchModelInfo price: fail-open (404/no-pricing/no-key) → undefined", testFetchModelPricingFailOpen],
 	["fetchModelInfo: one fetch resolves window AND price together", testFetchModelInfoSharesOneFetch],
 ]
 

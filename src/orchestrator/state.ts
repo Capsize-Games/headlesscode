@@ -514,3 +514,29 @@ export async function patchGroup(
 		}
 	})
 }
+
+/**
+ * General-purpose locked read-modify-write for the state file: reloads
+ * fresh, hands it to `mutator`, saves whatever `mutator` returns, all inside
+ * BOTH the in-process write lock and the cross-process file lock — same
+ * guarantee as patchGroup, for callers (e.g. the initial post-spawn state
+ * write in cli.ts, issue #80) that need to merge more than one group's worth
+ * of changes in a single transaction rather than patching one group at a
+ * time.
+ */
+export async function mutateState(
+	statePath: string,
+	mutator: (state: OrchestratorState) => OrchestratorState | Promise<OrchestratorState>,
+): Promise<OrchestratorState> {
+	return withStateLock(async () => {
+		const release = await acquireCrossProcessLock(`${statePath}.lock`)
+		try {
+			const fresh = await loadState(statePath)
+			const next = await mutator(fresh)
+			await saveState(statePath, next)
+			return next
+		} finally {
+			release()
+		}
+	})
+}

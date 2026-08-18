@@ -108,8 +108,21 @@ export function resolveProjectIdentity(workspaceRoot: string): ProjectIdentity {
 			const commonDir = path.isAbsolute(out) ? out : path.resolve(root, out)
 			return { keySource: realpathOrResolve(path.dirname(commonDir)), kind: "git" }
 		}
-	} catch {
+	} catch (err) {
 		// Not a git repo (or git missing) — fall through to the plain fallback.
+		// Issue #83: "not a git repository" (exit 128) is the ordinary,
+		// expected case for a plain directory and would spam every non-repo
+		// workspace's log for no reason — only warn on a genuinely surprising
+		// failure (git binary missing, permission denied, unexpected exit
+		// code), so a real broken git invocation is still visible instead of
+		// silently mis-keying the project.
+		const status = (err as NodeJS.ErrnoException & { status?: number }).status
+		const code = (err as NodeJS.ErrnoException).code
+		if (code === "ENOENT" || (status !== undefined && status !== 128)) {
+			process.stderr.write(
+				`[project-store] git identity lookup failed for ${root} (falling back to plain-directory identity): ${err instanceof Error ? err.message : String(err)}\n`,
+			)
+		}
 	}
 	// 2. Plain directory → resolved absolute realpath of the workspace root.
 	return { keySource: realpathOrResolve(root), kind: "plain" }
@@ -252,8 +265,13 @@ export function writeProjectMetadata(
 			JSON.stringify({ path: keySource, kind, firstSeen, lastSeen: now, registered }, null, 2) + "\n",
 			"utf-8",
 		)
-	} catch {
+	} catch (err) {
 		// Non-fatal: metadata is a human-convenience, never load-bearing.
+		// Issue #83: still log it — a silently failing metadata write would
+		// otherwise be invisible in harness.log.
+		process.stderr.write(
+			`[project-store] failed to write project metadata under ${dir} (non-fatal): ${err instanceof Error ? err.message : String(err)}\n`,
+		)
 	}
 }
 
@@ -388,8 +406,10 @@ export function migrateLegacyProjectData(
 			if (fs.readdirSync(legacyRoot).length === 0) {
 				fs.rmdirSync(legacyRoot)
 			}
-		} catch {
-			// non-fatal
+		} catch (err) {
+			// non-fatal: leftover empty legacy dir is harmless clutter, but
+			// issue #83 wants it visible rather than silently swallowed.
+			log(`could not remove legacy dir ${legacyRoot}: ${err instanceof Error ? err.message : String(err)}`)
 		}
 	}
 }

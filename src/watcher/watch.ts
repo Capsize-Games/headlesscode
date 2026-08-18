@@ -538,15 +538,21 @@ function sleepOrAbort(ms: number, signal?: AbortSignal): Promise<void> {
 			resolve()
 			return
 		}
-		const timer = setTimeout(resolve, ms)
-		signal?.addEventListener(
-			"abort",
-			() => {
-				clearTimeout(timer)
-				resolve()
-			},
-			{ once: true },
-		)
+		// Issue #85: on the normal (timer-fires-first) path, `{once:true}` only
+		// stops the listener from firing TWICE — it does not detach it. Every
+		// poll of a long-running watch loop reuses the same `config.signal`, so
+		// without an explicit removeEventListener here each poll's listener
+		// stayed attached for the rest of the process's life — a slow leak over
+		// a long continuous watch.
+		const onAbort = () => {
+			clearTimeout(timer)
+			resolve()
+		}
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort)
+			resolve()
+		}, ms)
+		signal?.addEventListener("abort", onAbort, { once: true })
 	})
 }
 

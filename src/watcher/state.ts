@@ -142,7 +142,13 @@ function sanitize(raw: unknown): WatcherState {
 
 /**
  * Read + parse the watcher state file. Missing or malformed files yield a
- * fresh default state (never throws for missing files). Invalid JSON throws.
+ * fresh default state (never throws for missing files). Issue #78: a parse
+ * error (e.g. a crash truncated the file mid-write, back when writes were
+ * non-atomic) is NOT fatal here either — unlike the orchestrator's state
+ * file, watcher state is a resumable idempotency cache, not the source of
+ * truth for in-flight work, so falling back to a fresh default lets the
+ * watcher keep running (worst case: a few issues get re-evaluated) instead
+ * of hard-failing on every subsequent poll.
  */
 export async function loadWatcherState(statePath: string): Promise<WatcherState> {
 	let raw: string
@@ -154,7 +160,11 @@ export async function loadWatcherState(statePath: string): Promise<WatcherState>
 		}
 		throw error
 	}
-	return sanitize(JSON.parse(raw))
+	try {
+		return sanitize(JSON.parse(raw))
+	} catch {
+		return defaultWatcherState()
+	}
 }
 
 /** Synchronous variant; same semantics as loadWatcherState. */
@@ -168,15 +178,37 @@ export function loadWatcherStateSync(statePath: string): WatcherState {
 		}
 		throw error
 	}
-	return sanitize(JSON.parse(raw))
+	try {
+		return sanitize(JSON.parse(raw))
+	} catch {
+		return defaultWatcherState()
+	}
 }
 
-/** Write the state file (pretty-printed + trailing newline), creating dirs. */
+/**
+ * Unique sibling temp path for an atomic state write (mirrors
+ * src/orchestrator/state.ts's stateTmpPath). The pid + counter suffix keeps
+ * concurrent saves from ever sharing a temp file, which would race their
+ * renames.
+ */
+let watcherStateWriteCounter = 0
+function watcherStateTmpPath(statePath: string): string {
+	return `${statePath}.tmp-${process.pid}-${++watcherStateWriteCounter}`
+}
+
+/**
+ * Write the state file (pretty-printed + trailing newline), creating dirs.
+ * Issue #78: atomic temp+rename write, matching the orchestrator's
+ * saveState (src/orchestrator/state.ts) — a crash mid-write can no longer
+ * truncate .watcher-state.json (rename is atomic on the same filesystem).
+ */
 export async function saveWatcherState(statePath: string, state: WatcherState): Promise<void> {
 	const cleaned = sanitize(state)
 	cleaned.updated = new Date().toISOString()
 	await fsp.mkdir(path.dirname(statePath), { recursive: true })
-	await fsp.writeFile(statePath, JSON.stringify(cleaned, null, 2) + "\n", "utf-8")
+	const tmpPath = watcherStateTmpPath(statePath)
+	await fsp.writeFile(tmpPath, JSON.stringify(cleaned, null, 2) + "\n", "utf-8")
+	await fsp.rename(tmpPath, statePath)
 }
 
 /** Synchronous variant of saveWatcherState. */
@@ -184,7 +216,9 @@ export function saveWatcherStateSync(statePath: string, state: WatcherState): vo
 	const cleaned = sanitize(state)
 	cleaned.updated = new Date().toISOString()
 	fs.mkdirSync(path.dirname(statePath), { recursive: true })
-	fs.writeFileSync(statePath, JSON.stringify(cleaned, null, 2) + "\n", "utf-8")
+	const tmpPath = watcherStateTmpPath(statePath)
+	fs.writeFileSync(tmpPath, JSON.stringify(cleaned, null, 2) + "\n", "utf-8")
+	fs.renameSync(tmpPath, statePath)
 }
 
 /**

@@ -37,7 +37,13 @@ import * as path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 
 import type { UsageRecord } from "../engine/usage.js"
-import { loadStateSync, saveStateSync, updateGroup, type OrchestratorGroup, type OrchestratorState } from "./state.js"
+import {
+	loadStateSync,
+	mutateState,
+	updateGroup,
+	type OrchestratorGroup,
+	type OrchestratorState,
+} from "./state.js"
 import { recordGroupCost, recordAllSessionCosts } from "./cost-history.js"
 
 export const DEFAULT_POLL_INTERVAL_MS = 5_000
@@ -719,17 +725,16 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 		// write (undefined return = nothing to record, e.g. failed before any
 		// session wrote a usage file) — either way, don't retry forever.
 		//
-		// Reload fresh from disk before merging in cost_recorded, rather than
-		// persisting the caller's in-memory `state` closure variable: a
-		// onGroupUpdate callback can write directly to the state file without
-		// returning `reload: true` (e.g. cli.ts's clean-verdict path after a
-		// rework reset), which leaves this function's in-memory `state` stale
-		// relative to disk. Blindly saving that stale copy back would clobber
-		// the callback's own write — a real regression this exact fix caught
-		// (cli.test.ts's rework/continuation-reset re-poll tests).
-		const fresh = loadStateSync(statePath)
-		state = updateGroup(fresh, g.name, { cost_recorded: new Date().toISOString() })
-		saveStateSync(statePath, state)
+		// Issue #79: go through mutateState (cross-process lock, same as
+		// patchGroup) rather than a manual loadStateSync/updateGroup/
+		// saveStateSync sequence — reloading fresh right before the save
+		// narrows the race but does not close it; a concurrent onGroupUpdate
+		// callback can write directly to the state file via patchGroup between
+		// this function's loadStateSync and its saveStateSync (e.g. cli.ts's
+		// clean-verdict path after a rework reset), which would otherwise
+		// clobber the callback's own write — a real regression this exact fix
+		// caught (cli.test.ts's rework/continuation-reset re-poll tests).
+		state = await mutateState(statePath, (fresh) => updateGroup(fresh, g.name, { cost_recorded: new Date().toISOString() }))
 	}
 
 	// onGroupUpdate calls in flight (keyed by group name), fired without
@@ -803,18 +808,29 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 				}
 				lastSeenStatus.set(group.name, patch.status)
 			}
-			state = updateGroup(state, group.name, patch)
-			// Cost/token monitoring: recompute the round-level totals whenever a
-			// group's usage may have changed (i.e. every state update — cheap,
-			// and keeps totalUsage/batchUsage never stale). totalUsage is
-			// cumulative across every group ever recorded; batchUsage is scoped
-			// to the current batch (issue #118).
-			state = {
-				...state,
-				totalUsage: computeTotalUsage(state),
-				batchUsage: computeBatchUsage(state),
-			}
-			saveStateSync(statePath, state)
+			// Issue #79: route this write through mutateState's cross-process
+			// lock (the same infra patchGroup uses) rather than applying `patch`
+			// to this pass's start-of-loop `state` snapshot and saving that
+			// directly. Without this, a concurrent in-flight onGroupUpdate
+			// callback (see inFlightCallbacks below) writing via patchGroup can
+			// have its just-written review/QA verdict silently clobbered by this
+			// loop's stale snapshot the next time it saves — the exact
+			// lost-update bug patchGroup exists to prevent, just reached from
+			// this loop instead of from a callback.
+			state = await mutateState(statePath, (fresh) => {
+				let next = updateGroup(fresh, group.name, patch)
+				// Cost/token monitoring: recompute the round-level totals whenever
+				// a group's usage may have changed (i.e. every state update —
+				// cheap, and keeps totalUsage/batchUsage never stale). totalUsage
+				// is cumulative across every group ever recorded; batchUsage is
+				// scoped to the current batch (issue #118).
+				next = {
+					...next,
+					totalUsage: computeTotalUsage(next),
+					batchUsage: computeBatchUsage(next),
+				}
+				return next
+			})
 			changed = true
 			const updated = state.groups.find((g) => g.name === group.name)
 			// Fire the callback WITHOUT blocking this loop's iteration over the

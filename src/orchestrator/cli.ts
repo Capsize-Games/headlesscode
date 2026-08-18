@@ -31,8 +31,8 @@ import { buildEstimateSection, estimateGroups } from "./cost-estimate.js"
 import {
 	loadState,
 	loadStateSync,
+	mutateState,
 	patchGroup,
-	saveState,
 	saveStateSync,
 	updateGroup,
 	type OrchestratorGroup,
@@ -2703,61 +2703,95 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	// 3. Record batch + groups in the state file (the spawner already wrote
 	//    group entries; add the batch id).
 	const batch = options.batch ?? `round-${new Date().toISOString().slice(0, 10)}`
-	let state: OrchestratorState = { batch, groups: [] }
 	try {
-		state = await loadState(statePath)
-	} catch {
-		state = { batch, groups: [] }
-	}
-	state.batch = batch
-	// Issue #16: stamp every group with its per-issue shape (split.ts's
-	// issueShape) at dispatch time — the only moment the issue titles/bodies
-	// are in hand. cost-history recording happens LATER (when the group
-	// reaches a terminal status, possibly in a separate orchestrate
-	// invocation) and only has issue numbers; the shape is what lets
-	// cost-estimate.ts match a NEW task to similar past ones, so it must be
-	// captured here and persisted in the state file (OrchestratorGroup.shapes).
-	// The titles/bodies themselves are captured at the same moment into
-	// OrchestratorGroup.issueBodies: the rework/QA/continuation task files are
-	// generated LATER from state alone (a separate orchestrate invocation) and
-	// need them to embed each issue's real title/body inline instead of a
-	// runtime `gh issue view` (which fails for synthetic --issues-json
-	// numbers).
-	const shapeByNumber = new Map<number, string>()
-	const issueBodiesByNumber = new Map<number, { title: string; body?: string }>()
-	for (const issue of issues) {
-		shapeByNumber.set(issue.number, issueShape(issue))
-		issueBodiesByNumber.set(issue.number, { title: issue.title, body: issue.body })
-	}
-	const groupNamesOnDisk = new Set(state.groups.map((g) => g.name))
-	for (const spec of specs) {
-		if (!groupNamesOnDisk.has(spec.name)) {
-			continue
-		}
-		const shapes = spec.issues.map((n) => shapeByNumber.get(n) ?? "generic")
-		const issueBodies: IssueBodies = {}
-		for (const n of spec.issues) {
-			const entry = issueBodiesByNumber.get(n)
-			if (entry) {
-				issueBodies[String(n)] = entry
+		// Issue #80: the whole load-merge-save below runs inside mutateState's
+		// cross-process lock. Without it, two concurrent `orchestrate` invocations
+		// against the same repo (explicitly supported — see the concurrency
+		// budget check above) can both loadState the same on-disk snapshot, then
+		// whichever saveState runs last silently discards the other's round's
+		// groups. patchGroup already guards single-group patches this way; this
+        // is the same guarantee for this multi-group initial-write transaction.
+		await mutateState(statePath, async (fresh) => {
+			let state = fresh
+			state.batch = batch
+			// Issue #16: stamp every group with its per-issue shape (split.ts's
+			// issueShape) at dispatch time — the only moment the issue titles/bodies
+			// are in hand. cost-history recording happens LATER (when the group
+			// reaches a terminal status, possibly in a separate orchestrate
+			// invocation) and only has issue numbers; the shape is what lets
+			// cost-estimate.ts match a NEW task to similar past ones, so it must be
+			// captured here and persisted in the state file (OrchestratorGroup.shapes).
+			// The titles/bodies themselves are captured at the same moment into
+			// OrchestratorGroup.issueBodies: the rework/QA/continuation task files are
+			// generated LATER from state alone (a separate orchestrate invocation) and
+			// need them to embed each issue's real title/body inline instead of a
+			// runtime `gh issue view` (which fails for synthetic --issues-json
+			// numbers).
+			const shapeByNumber = new Map<number, string>()
+			const issueBodiesByNumber = new Map<number, { title: string; body?: string }>()
+			for (const issue of issues) {
+				shapeByNumber.set(issue.number, issueShape(issue))
+				issueBodiesByNumber.set(issue.number, { title: issue.title, body: issue.body })
 			}
+			const groupNamesOnDisk = new Set(state.groups.map((g) => g.name))
+			for (const spec of specs) {
+				if (!groupNamesOnDisk.has(spec.name)) {
+					continue
+				}
+				const shapes = spec.issues.map((n) => shapeByNumber.get(n) ?? "generic")
+				const issueBodies: IssueBodies = {}
+				for (const n of spec.issues) {
+					const entry = issueBodiesByNumber.get(n)
+					if (entry) {
+						issueBodies[String(n)] = entry
+					}
+				}
+				state = updateGroup(state, spec.name, { shapes, issueBodies })
+			}
+			// Issue #13: persist the preflight probe so the dashboard can surface the
+			// preflight line on the round view (see aggregate.ts RoundSummary.preflight).
+			if (preflightProbe) {
+				state.preflight = {
+					status: preflightProbe.status,
+					model: preflightProbe.model,
+					baseUrl: preflightProbe.baseUrl,
+					line: preflightProbe.line,
+					latencyMs: preflightProbe.latencyMs,
+					probeCostUsd: preflightProbe.probeCostUsd,
+					roundCostEstimateUsd: preflightProbe.roundCostEstimateUsd,
+				}
+			}
+			return state
+		})
+	} catch (err) {
+		if (!(err instanceof SyntaxError)) {
+			// Not a corrupt-JSON case (e.g. the cross-process lock timed out) —
+			// nothing to back up, just report and abort loudly.
+			process.stderr.write(
+				`headlesscode orchestrate: failed to record round state in ${statePath}: ` +
+					`${err instanceof Error ? err.message : String(err)}\n`,
+			)
+			return 1
 		}
-		state = updateGroup(state, spec.name, { shapes, issueBodies })
-	}
-	// Issue #13: persist the preflight probe so the dashboard can surface the
-	// preflight line on the round view (see aggregate.ts RoundSummary.preflight).
-	if (preflightProbe) {
-		state.preflight = {
-			status: preflightProbe.status,
-			model: preflightProbe.model,
-			baseUrl: preflightProbe.baseUrl,
-			line: preflightProbe.line,
-			latencyMs: preflightProbe.latencyMs,
-			probeCostUsd: preflightProbe.probeCostUsd,
-			roundCostEstimateUsd: preflightProbe.roundCostEstimateUsd,
+		// Issue #77: loadState (inside mutateState) only throws SyntaxError for a
+		// genuinely corrupt/truncated state file (ENOENT is already handled
+		// inside loadState and returns a fresh default). Silently replacing it
+		// here would destroy every group's status/review verdict with no
+		// warning. Back the corrupt file up so it isn't lost, then refuse to
+		// start rather than clobber it.
+		const backupPath = `${statePath}.corrupt-${Date.now()}`
+		try {
+			await fs.promises.rename(statePath, backupPath)
+		} catch {
+			/* best-effort backup; fall through to the loud abort either way */
 		}
+		process.stderr.write(
+			`headlesscode orchestrate: state file ${statePath} is corrupt and could not be parsed ` +
+				`(${err.message}). Backed up to ${backupPath}. ` +
+				`Refusing to start with an empty state — restore or repair the backup, then retry.\n`,
+		)
+		return 1
 	}
-	await saveState(statePath, state)
 
 	// 4. Watch + review. Per-mode model assignment: each role resolves its OWN
 	// model — workers use the group's mode (resolved in 1c, above — the SAME

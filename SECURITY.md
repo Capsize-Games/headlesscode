@@ -69,6 +69,32 @@ The harness itself cannot provide this isolation, and no amount of prompt
 engineering, rules files, or "trusted mode" configuration is a substitute for
 it.
 
+## Browser and vision cloud data flow
+
+Two agent-driven tools send data off the machine as part of their normal
+operation — not a bug, but worth knowing before pointing either at anything
+sensitive:
+
+- **Browser tool.** `browser_action` (see
+  [`src/tools/browser/service.ts`](src/tools/browser/service.ts:112)) launches
+  a headless Chromium instance and navigates it to whatever URL the model
+  supplies. The page content, cookies set by the site, and any redirects are
+  fetched directly by the browser process on your machine/network — the same
+  as visiting the URL yourself. If the model is given (or invents) a URL for
+  an internal or sensitive endpoint, that page's content becomes visible to
+  the model in its response.
+- **Vision (image description).** `describeImage`
+  (see [`src/vision/describe.ts`](src/vision/describe.ts:118)) base64-encodes
+  a screenshot or workspace image and POSTs it to OpenRouter
+  (`openrouter.ai`, or `HEADLESSCODE_VISION_MODEL`'s configured provider) for
+  captioning, then feeds the description back into the model's context. The
+  image bytes themselves leave the machine and are processed by a third-party
+  cloud model, subject to that provider's own data-handling policy.
+
+Neither flow has a local-only mode today. Do not use `browser_action` against
+URLs, or `describeImage` against screenshots/images, that contain data you
+would not otherwise send to a third-party cloud API.
+
 ## The permissions mechanism (defense in depth, not a boundary)
 
 The harness ships an optional permissions layer that can restrict what the
