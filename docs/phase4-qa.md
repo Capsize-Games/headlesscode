@@ -95,7 +95,11 @@ under a QA-specific name so the intent is explicit at every call site.
   - If the target repo defines **no** `qa-agent` mode, `GENERIC_QA_CHECKLIST`
     is used as a `systemPromptOverride`: boot the app, run the relevant test
     suite, exercise the changed behavior, report evidence with real command
-    output, terminate with `QA PASS`/`QA FAIL` + an Evidence section.
+    output, terminate with `QA PASS`/`QA FAIL` + an Evidence section. Any
+    scratch the QA session needs goes in `<workspace>/.headlesscode/scratch/`
+    — never `/tmp` (issue #123, same workspace-containment rule as the
+    reviewer; a probe script written to `/tmp` is an outside-workspace write
+    and a documented violation).
   - Returns `{ verdict: 'pass'|'fail'|'error', evidence, summary }`.
   - `parseQaResult(text)` (exported, unit-tested) mirrors
     `src/orchestrator/reviewer.ts`:

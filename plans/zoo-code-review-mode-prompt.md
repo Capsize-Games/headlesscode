@@ -88,6 +88,17 @@ range/labels):
    anything is red, determine whether it's caused by this work or
    genuinely pre-existing/unrelated (check if the same check fails
    identically on current `master`) before dismissing it.
+6. **Keep every scratch/temp file inside the workspace — no `/tmp`.**
+   Any scratch you need (probe scripts, temp output captures,
+   throwaway test files) goes in `<workspace>/.headlesscode/scratch/`
+   (create it if it doesn't exist; `/.headlesscode/` is gitignored).
+   Writing to `/tmp` or any path outside the workspace is a documented
+   recurring reviewer violation (round-2026-08-17 wrote
+   `/tmp/prsummary.md`, `/tmp/review62.md`, `/tmp/review90.md`,
+   `/tmp/review98.md`, `/tmp/review-pr113.md`,
+   `/tmp/hc-review-check/probe.ts`) — outside-workspace writes cannot
+   be auto-approved in the interactive GUI and are rejected by the
+   file tools in headless workers.
 
 ## Verdict and action
 
@@ -122,6 +133,9 @@ For each issue:
   reproduced it.
 - Do not review by reading only the PR description — read the actual
   diff and run actual commands every time.
+- No `/tmp` — scratch goes in `<workspace>/.headlesscode/scratch/`
+  (the repo rule "Never write to /tmp" is binding here too; a `/tmp`
+  write in a review session is a finding).
 
 ## When you're done with all assigned issues
 

@@ -136,7 +136,9 @@ function defaultTaskText(workspaceRoot: string): string {
 	return (
 		`Review the work done in this workspace (branch: ${currentBranch(workspaceRoot)}) ` +
 		"exactly as your operating procedure instructs. For each issue the worker closed, read the " +
-		"closing report, read the real diff, and re-run every checkable claim yourself. When you are " +
+		"closing report, read the real diff, and re-run every checkable claim yourself. Any scratch " +
+		"you need (probe scripts, temp output captures) goes in `.headlesscode/scratch/` inside this " +
+		"workspace — NEVER write to `/tmp` or any other path outside the workspace. When you are " +
 		"done, call attempt_completion with a structured summary: a Findings section listing anything " +
 		"wrong with file:line evidence (omit or write 'none' if clean), and the final baseline numbers " +
 		"you personally confirmed.\n\n" +

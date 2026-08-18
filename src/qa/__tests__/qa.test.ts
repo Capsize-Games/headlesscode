@@ -14,9 +14,12 @@ import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } fr
 // ─── Fake LLM client (same pattern as engine/__tests__/loop.test.ts) ─────────
 
 class FakeLlmClient implements LlmClient {
+	/** Captured system/task prompt text for the session (assert-able in tests). */
+	public lastRequestText = ""
 	constructor(private readonly script: Array<() => ChatMessage>) {}
 
-	async createChatCompletion(_request: LlmRequest): Promise<LlmResponse> {
+	async createChatCompletion(request: LlmRequest): Promise<LlmResponse> {
+		this.lastRequestText = request.messages.map((m) => m.content ?? "").join("\n")
 		const step = this.script.shift()
 		if (!step) {
 			throw new Error("FakeLlmClient: script exhausted (model kept calling)")
@@ -205,6 +208,31 @@ async function testRunQaWritesATailableLogFile(): Promise<void> {
 	}
 }
 
+/** Issue #123: the generic QA checklist must designate the workspace scratch
+ * dir and explicitly forbid /tmp (a QA probe script written to /tmp is an
+ * outside-workspace write, same containment rule as the reviewer). */
+async function testRunQaGenericChecklistForbidsTmpAndPointsAtWorkspaceScratch(): Promise<void> {
+	const ws = await makeWorkspace()
+	try {
+		const client = new FakeLlmClient([() => attemptCompletion("QA_VERDICT: PASS")])
+		// A workspace with no qa-agent mode -> GENERIC_QA_CHECKLIST is used
+		// as the systemPromptOverride, so its text reaches the session prompt.
+		await runQa({ workspaceRoot: ws, llmClient: client, maxIterations: 5, mode: "qa-agent" })
+		assert.match(
+			client.lastRequestText,
+			/\.headlesscode\/scratch\//,
+			"generic QA checklist points scratch at the workspace dir",
+		)
+		assert.match(
+			client.lastRequestText,
+			/NEVER write\s+to `\/tmp`/,
+			"generic QA checklist explicitly forbids /tmp",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 /**
  * Issue #34: the QA session's COMPLETE final report is persisted per session
  * (`<workspaceRoot>/.headlesscode/reports/<sessionId>.md`) and surfaced on
@@ -290,6 +318,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["structured qa verdict line is case-insensitive and trims whitespace", testStructuredVerdictIsCaseInsensitiveAndTrimsWhitespace],
 	["missing structured QA_VERDICT falls back to the heuristic", testMissingStructuredQaVerdictFallsBackToHeuristic],
 	["runQa writes a tailable qa.log", testRunQaWritesATailableLogFile],
+	["runQa generic checklist designates workspace scratch and forbids /tmp (issue #123)", testRunQaGenericChecklistForbidsTmpAndPointsAtWorkspaceScratch],
 	["runQa surfaces the complete final report path (issue #34)", testRunQaSurfacesFullReportPath],
 	["runQaWithRetries: a normal pass verdict returns immediately, no retry", testRunQaWithRetriesReturnsPassImmediately],
 	["runQaWithRetries: retries after a QA-session error and succeeds on the 2nd attempt", testRunQaWithRetriesRetriesAfterSessionError],

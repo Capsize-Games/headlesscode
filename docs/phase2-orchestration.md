@@ -152,6 +152,13 @@ runs a **second harness session** against a worker's worktree/branch:
   `write_to_file` at all, so the reviewer can inspect, re-run commands
   (tests, `gh`, `git diff`) and report, but can never fix anything
   (reviewer non-edit discipline enforced at the executor level).
+- **Workspace-contained scratch (issue #123)** — the checklist and the
+  session's task text both point any scratch the reviewer needs (probe
+  scripts, temp output captures) at `<workspace>/.headlesscode/scratch/`
+  and explicitly forbid `/tmp`: reviewers were the worst `/tmp` offenders
+  in round-2026-08-17 (`cat > /tmp/review62.md`, …), and a `/tmp` write is
+  an outside-workspace write — un-approvable in the GUI, rejected by the
+  file tools, and a documented repo-rule violation.
 - Returns `{ findings, verdict: "clean"|"finding", summary }` parsed from the
   `attempt_completion` result (`parseReviewResult`, exported for unit tests).
   A failed review session (LLM error / max iterations) is reported as

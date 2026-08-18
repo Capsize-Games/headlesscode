@@ -20,6 +20,16 @@
  * several issues, so costs/iterations are normalized per-issue
  * (total / max(issues.length, 1)) before matching against a NEW issue.
  *
+ * Verification-intensity multiplier (issue #124): test-shaped issues (and
+ * issues whose remediation mentions CI/GitHub Actions) are verification-
+ * heavy — a diff that adds CI config forces real GitHub-runner round-trips,
+ * which dominated round-2026-08-17's cost. The thin samples for those shapes
+ * under-predicted ~2.6x (preflight ~$0.79 vs ~$2.09 actual; w13's test/hot
+ * group estimated ~$0.05-$0.27, actual $1.03). A shape-match estimate's
+ * COST is therefore scaled up until real samples accumulate — the recorded
+ * median of a verification-heavy shape is not trusted as-is while its
+ * samples are thin (see TEST_SHAPE_VERIFICATION_MULTIPLIER).
+ *
  * Pure functions (no fs, no network) — fully unit-testable; the only I/O is
  * readCostHistory() at the call site (cli.ts's dry-run).
  */
@@ -35,6 +45,28 @@ import { issueShape, type SplitIssue, type WorktreeSpec } from "./split.js"
  * estimated is meaningful on its own.
  */
 export const MIN_SHAPE_SAMPLES = 3
+
+/**
+ * Issue #124: multiplier applied to a verification-heavy issue's shape-match
+ * COST estimate while that shape's recorded samples are thin (the observed
+ * under-prediction was ~2.6x in round-2026-08-17, dominated by test/CI
+ * shapes). Maintainers' discretion per the issue; 2.5 sits between the 2-3x
+ * observed misses. Tapers toward 1 as real samples accumulate — the median
+ * of a well-sampled verification-heavy shape already reflects real
+ * verification cost.
+ */
+export const TEST_SHAPE_VERIFICATION_MULTIPLIER = 2.5
+
+/**
+ * Issue #124: the sample count at which the verification multiplier has
+ * fully tapered to 1 (samples >= this are trusted as-is). Between
+ * MIN_SHAPE_SAMPLES (full multiplier) and this (1.0) it tapers linearly.
+ */
+export const VERIFICATION_MULTIPLIER_FULL_SAMPLES = 6
+
+/** CI/GitHub Actions mention in an issue's title/body — a signal that its
+ * remediation is verification-heavy (real runner round-trips dominate cost). */
+const CI_MENTION_RE = /(github\s*actions|\bci\b|workflow|runner|continuous\s+integration)/i
 
 /** Per-shape aggregate over recorded history (one per distinct shape seen). */
 export interface ShapeStats {
@@ -81,6 +113,14 @@ export interface IssueEstimate {
 	continuationRate?: number
 	/** Mean rework cycles per group among the matched records. */
 	reworkRate?: number
+	/**
+	 * Issue #124: multiplier applied to a verification-heavy issue's COST
+	 * (not iterations) while its shape's samples are thin — see
+	 * TEST_SHAPE_VERIFICATION_MULTIPLIER. 1 when not verification-heavy,
+	 * when samples >= VERIFICATION_MULTIPLIER_FULL_SAMPLES, or on a direct
+	 * match (a direct record of the very task is trusted as-is).
+	 */
+	verificationMultiplier?: number
 }
 
 /** A whole dry-run group's estimate — the sum of its issues' per-issue estimates. */
@@ -103,6 +143,15 @@ export interface GroupEstimate {
 	reworkRate?: number
 	/** Issues with no usable history (excluded from the sums above). */
 	unmatched: number
+	/**
+	 * Issue #124: the maximum per-issue verification multiplier among the
+	 * group's USABLE (cost-bearing) estimates — i.e. the largest multiplier
+	 * that actually scaled the group's expected cost. Undefined when no
+	 * usable estimate was scaled: a multiplier recorded on an
+	 * insufficient-data estimate never surfaces here, because it did not
+	 * scale the displayed cost.
+	 */
+	verificationMultiplier?: number
 }
 
 function median(values: number[]): number {
@@ -175,40 +224,101 @@ export function aggregateByShape(records: CostHistoryRecord[]): ShapeStats[] {
 		.sort((a, b) => b.samples - a.samples || a.shape.localeCompare(b.shape))
 }
 
+/** Whether an issue's work is verification-heavy: test-shaped, or its
+ * title/body mentions CI/GitHub Actions (a diff that adds CI config forces
+ * real GitHub-runner round-trips, which dominated round-2026-08-17's cost). */
+export function isVerificationHeavy(shape: string, issue?: SplitIssue): boolean {
+	if (shape === "test") {
+		return true
+	}
+	if (!issue) {
+		return false
+	}
+	return CI_MENTION_RE.test(`${issue.title}\n${issue.body ?? ""}`)
+}
+
+/**
+ * Issue #124: the cost multiplier for a verification-heavy issue. Tapers
+ * linearly from TEST_SHAPE_VERIFICATION_MULTIPLIER at MIN_SHAPE_SAMPLES to 1
+ * at VERIFICATION_MULTIPLIER_FULL_SAMPLES — the thin samples for test/CI
+ * shapes are not trusted as-is, but once real samples accumulate the recorded
+ * median already reflects real verification cost. CLAMPED at
+ * TEST_SHAPE_VERIFICATION_MULTIPLIER below MIN_SHAPE_SAMPLES: a thin-but-
+ * nonzero sample set gets the full scale, never more — the multiplier never
+ * exceeds its documented maximum (the taper formula is only meaningful on
+ * [MIN_SHAPE_SAMPLES, VERIFICATION_MULTIPLIER_FULL_SAMPLES], so it must not
+ * be extrapolated below the lower bound). 1 for a direct match (a record of
+ * the VERY task is meaningful on its own), for a non-verification-heavy
+ * issue, or when no usable numeric estimate is offered (samples <= 0).
+ */
+export function verificationMultiplier(
+	shape: string,
+	issue: SplitIssue | undefined,
+	match: IssueEstimate["match"],
+	samples: number,
+): number {
+	if (match === "direct" || samples <= 0 || !isVerificationHeavy(shape, issue)) {
+		return 1
+	}
+	if (samples < MIN_SHAPE_SAMPLES) {
+		return TEST_SHAPE_VERIFICATION_MULTIPLIER
+	}
+	if (samples >= VERIFICATION_MULTIPLIER_FULL_SAMPLES) {
+		return 1
+	}
+	const span = VERIFICATION_MULTIPLIER_FULL_SAMPLES - MIN_SHAPE_SAMPLES
+	const progress = (samples - MIN_SHAPE_SAMPLES) / span
+	return TEST_SHAPE_VERIFICATION_MULTIPLIER - (TEST_SHAPE_VERIFICATION_MULTIPLIER - 1) * progress
+}
+
 /** Estimate one new issue from recorded history. */
-export function estimateIssue(records: CostHistoryRecord[], issueNumber: number, shape: string): IssueEstimate {
+export function estimateIssue(
+	records: CostHistoryRecord[],
+	issueNumber: number,
+	shape: string,
+	issue?: SplitIssue,
+): IssueEstimate {
 	// Exact issue-number history is the strongest signal — the same task ran
 	// before (e.g. a re-opened issue, or an issue batched in a prior round).
 	const direct = records.filter((r) => (r.issues ?? []).includes(issueNumber))
 	if (direct.length > 0) {
-		return issueEstimateFrom(issueNumber, shape, "direct", direct)
+		return issueEstimateFrom(issueNumber, shape, "direct", direct, issue)
 	}
 	const byShape = records.filter((r) => (r.shapes ?? []).includes(shape))
 	if (byShape.length >= MIN_SHAPE_SAMPLES) {
-		return issueEstimateFrom(issueNumber, shape, "shape", byShape)
+		return issueEstimateFrom(issueNumber, shape, "shape", byShape, issue)
 	}
 	return {
 		issue: issueNumber,
 		shape,
 		match: byShape.length > 0 ? "shape" : "none",
 		samples: byShape.length,
+		verificationMultiplier: verificationMultiplier(shape, issue, "shape", byShape.length),
 	}
 }
 
-function issueEstimateFrom(issueNumber: number, shape: string, match: IssueEstimate["match"], records: CostHistoryRecord[]): IssueEstimate {
+function issueEstimateFrom(
+	issueNumber: number,
+	shape: string,
+	match: IssueEstimate["match"],
+	records: CostHistoryRecord[],
+	issue?: SplitIssue,
+): IssueEstimate {
 	const [costLo, costMed, costHi] = minMedMax(records.map(perIssueCost))
 	const [iterLo, iterMed, iterHi] = minMedMax(records.map(perIssueIterations))
+	const multiplier = verificationMultiplier(shape, issue, match, records.length)
 	return {
 		issue: issueNumber,
 		shape,
 		match,
 		samples: records.length,
-		costPerIssueUsd: costMed,
-		costPerIssueRangeUsd: [costLo, costHi],
+		costPerIssueUsd: costMed * multiplier,
+		costPerIssueRangeUsd: [costLo * multiplier, costHi * multiplier],
 		iterationsPerIssue: iterMed,
 		iterationsPerIssueRange: [iterLo, iterHi],
 		continuationRate: mean(records.map((r) => r.continuationCount ?? 0)),
 		reworkRate: mean(records.map((r) => r.reworkCount ?? 0)),
+		verificationMultiplier: multiplier,
 	}
 }
 
@@ -232,6 +342,16 @@ export function estimateGroup(spec: WorktreeSpec, perIssue: IssueEstimate[]): Gr
 		shapes: [...new Set(perIssue.map((e) => e.shape))],
 		perIssue,
 		unmatched: perIssue.length - usable.length,
+	}
+	// Only a multiplier that actually scaled a USABLE estimate (one that
+	// contributes to expectedCostUsd) is surfaced — a multiplier recorded on
+	// an insufficient-data estimate never scaled the displayed cost, so
+	// claiming it in the dry-run line would be false.
+	const multipliers = usable
+		.map((e) => e.verificationMultiplier ?? 1)
+		.filter((m) => m > 1)
+	if (multipliers.length > 0) {
+		estimate.verificationMultiplier = Math.max(...multipliers)
 	}
 	if (usable.length > 0) {
 		estimate.expectedCostUsd = sum(costs)
@@ -257,7 +377,7 @@ export function estimateGroups(records: CostHistoryRecord[], specs: WorktreeSpec
 		shapes.set(issue.number, issueShape(issue))
 	}
 	return specs.map((spec) => {
-		const perIssue = spec.issues.map((n) => estimateIssue(records, n, shapes.get(n) ?? "generic"))
+		const perIssue = spec.issues.map((n) => estimateIssue(records, n, shapes.get(n) ?? "generic", issues.find((i) => i.number === n)))
 		return estimateGroup(spec, perIssue)
 	})
 }
@@ -290,6 +410,9 @@ export function buildEstimateSection(estimates: GroupEstimate[], historyRecordCo
 			let line =
 				`${group.name} (issues ${issuesLabel} — ${shapeLabel}): expected ~${formatUsd(costLo)}–${formatUsd(costHi)} · ` +
 				`~${iterLo}–${iterHi} iterations · ${samples} sample(s)`
+			if (group.verificationMultiplier !== undefined && group.verificationMultiplier > 1) {
+				line += ` · ${group.verificationMultiplier.toFixed(2)}x verification multiplier`
+			}
 			if (group.unmatched > 0) {
 				line += ` (${group.unmatched} issue(s) unmatched)`
 			}

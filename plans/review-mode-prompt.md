@@ -51,6 +51,14 @@ touched pass," a claimed e2e run that was never actually executed, a
    asked, including anything under "What NOT to do" — a worker that built
    something not requested, or built something explicitly excluded, is a
    real finding even if the code itself is otherwise fine.
+6. **Keep every scratch/temp file inside the workspace — no `/tmp`.**
+   Any scratch you need (probe scripts, temp output captures, throwaway
+   test files) goes in `<workspace>/.headlesscode/scratch/` (create it
+   if it doesn't exist; `/.headlesscode/` is gitignored). Writing to
+   `/tmp` or any other path outside the workspace violates the repo's
+   "Never write to /tmp" rule — outside-workspace writes cannot be
+   auto-approved in the interactive GUI and are rejected by the file
+   tools in headless workers.
 
 ## Verdict and action
 
@@ -74,6 +82,9 @@ touched pass," a claimed e2e run that was never actually executed, a
   output — output in a report is a claim, not evidence, until reproduced.
 - Do not review by reading only the summary — read the actual diff and run
   actual commands every time.
+- No `/tmp` — scratch goes in `<workspace>/.headlesscode/scratch/` (the
+  repo rule "Never write to /tmp" is binding here too; a `/tmp` write in
+  a review session is a finding).
 
 ## When you're done
 

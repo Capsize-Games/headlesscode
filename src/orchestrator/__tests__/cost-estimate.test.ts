@@ -14,7 +14,11 @@ import {
 	buildEstimateSection,
 	estimateGroups,
 	estimateIssue,
+	isVerificationHeavy,
 	MIN_SHAPE_SAMPLES,
+	TEST_SHAPE_VERIFICATION_MULTIPLIER,
+	VERIFICATION_MULTIPLIER_FULL_SAMPLES,
+	verificationMultiplier,
 } from "../cost-estimate.js"
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -133,6 +137,137 @@ async function testEstimateIssueNoMatch(): Promise<void> {
 	assert.equal(estimate.costPerIssueUsd, undefined)
 }
 
+// ─── Issue #124: verification-intensity multiplier ───────────────────────────
+
+async function testIsVerificationHeavy(): Promise<void> {
+	assert.equal(isVerificationHeavy("test", undefined), true, "test shape is verification-heavy by definition")
+	assert.equal(isVerificationHeavy("split", undefined), false)
+	assert.equal(
+		isVerificationHeavy("coverage", issue(9, "COV-1: add GitHub Actions CI config")),
+		true,
+		"CI/GitHub Actions mention in the title marks the issue verification-heavy",
+	)
+	assert.equal(
+		isVerificationHeavy("split", issue(10, "Split utils", "Adds a workflow that runs tests on a runner")),
+		true,
+		"workflow/runner mention in the body marks the issue verification-heavy",
+	)
+	assert.equal(isVerificationHeavy("docs", issue(11, "Document the API")), false)
+}
+
+async function testVerificationMultiplierTapersWithSamples(): Promise<void> {
+	// Direct match: trusted as-is, no multiplier even for a test shape.
+	assert.equal(verificationMultiplier("test", undefined, "direct", 1), 1, "direct match never scaled")
+	// Not verification-heavy: no multiplier regardless of samples.
+	assert.equal(verificationMultiplier("split", undefined, "shape", 3), 1)
+	// Below MIN_SHAPE_SAMPLES the multiplier is CLAMPED at the full value —
+	// regression (rework cycle 1): the old taper formula extrapolated below
+	// MIN_SHAPE_SAMPLES, returning 3.5 at 1 sample and 3.0 at 2, above the
+	// documented 2.5 cap. Thin-but-nonzero samples get the full scale, never
+	// more.
+	assertClose(
+		verificationMultiplier("test", undefined, "shape", 1),
+		TEST_SHAPE_VERIFICATION_MULTIPLIER,
+		"1 sample clamps at the full multiplier, never above it",
+	)
+	assertClose(
+		verificationMultiplier("test", undefined, "shape", 2),
+		TEST_SHAPE_VERIFICATION_MULTIPLIER,
+		"2 samples clamp at the full multiplier, never above it",
+	)
+	// Test shape at MIN_SHAPE_SAMPLES: full multiplier.
+	assertClose(
+		verificationMultiplier("test", undefined, "shape", MIN_SHAPE_SAMPLES),
+		TEST_SHAPE_VERIFICATION_MULTIPLIER,
+		"full multiplier at MIN_SHAPE_SAMPLES",
+	)
+	// Fully sampled: trusted as-is.
+	assert.equal(
+		verificationMultiplier("test", undefined, "shape", VERIFICATION_MULTIPLIER_FULL_SAMPLES),
+		1,
+		"no multiplier once real samples accumulate",
+	)
+	// Between the two: linear taper.
+	const mid = verificationMultiplier("test", undefined, "shape", 4)
+	assert.ok(mid > 1 && mid < TEST_SHAPE_VERIFICATION_MULTIPLIER, `mid-samples multiplier tapers (got ${mid})`)
+	// No usable numeric estimate (0 samples): 1 (nothing to scale).
+	assert.equal(verificationMultiplier("test", undefined, "shape", 0), 1)
+}
+
+async function testEstimateIssueTestShapeScalesCostNotIterations(): Promise<void> {
+	const records = [
+		record({ groupName: "a", issues: [100], shapes: ["test"], costUsd: 0.1, iterations: 40 }),
+		record({ groupName: "b", issues: [101], shapes: ["test"], costUsd: 0.2, iterations: 50 }),
+		record({ groupName: "c", issues: [102], shapes: ["test"], costUsd: 0.3, iterations: 60 }),
+	]
+	const estimate = estimateIssue(records, 99, "test", issue(99, "Add tests for the parser"))
+	assert.equal(estimate.match, "shape")
+	assert.equal(estimate.samples, 3)
+	// Median per-issue cost $0.2 * 2.5 = $0.5; iterations NOT scaled.
+	assertClose(estimate.costPerIssueUsd ?? 0, 0.2 * TEST_SHAPE_VERIFICATION_MULTIPLIER, "test-shape cost scaled up")
+	assert.equal(estimate.iterationsPerIssue, 50, "iterations not scaled by the verification multiplier")
+	assert.deepEqual(estimate.costPerIssueRangeUsd, [0.1 * 2.5, 0.3 * 2.5], "range scaled too")
+	assertClose(estimate.verificationMultiplier ?? 0, TEST_SHAPE_VERIFICATION_MULTIPLIER, "multiplier recorded on the estimate")
+}
+
+async function testEstimateIssueCiMentionScalesEvenWithOtherShape(): Promise<void> {
+	const records = [
+		record({ groupName: "a", issues: [100], shapes: ["coverage"], costUsd: 0.1, iterations: 40 }),
+		record({ groupName: "b", issues: [101], shapes: ["coverage"], costUsd: 0.2, iterations: 50 }),
+		record({ groupName: "c", issues: [102], shapes: ["coverage"], costUsd: 0.3, iterations: 60 }),
+	]
+	// "COV-1"-style: a coverage-shaped issue whose remediation adds CI config.
+	const estimate = estimateIssue(records, 99, "coverage", issue(99, "COV-1: add coverage with GitHub Actions CI"))
+	assert.equal(estimate.match, "shape")
+	assertClose(estimate.costPerIssueUsd ?? 0, 0.2 * TEST_SHAPE_VERIFICATION_MULTIPLIER, "CI-bearing issue cost scaled up")
+}
+
+async function testEstimateIssueWellSampledTestShapeNotScaled(): Promise<void> {
+	const records = [1, 2, 3, 4, 5, 6, 7].map((n) =>
+		record({ groupName: `g${n}`, issues: [n], shapes: ["test"], costUsd: 0.2, iterations: 50 }),
+	)
+	const estimate = estimateIssue(records, 99, "test", issue(99, "Add tests"))
+	assert.equal(estimate.samples, 7)
+	assertClose(estimate.costPerIssueUsd ?? 0, 0.2, "well-sampled test shape is trusted as-is")
+	assert.equal(estimate.verificationMultiplier, 1)
+}
+
+async function testEstimateGroupsShowsVerificationMultiplier(): Promise<void> {
+	const records = [
+		record({ groupName: "a", issues: [100], shapes: ["test"], costUsd: 0.1, iterations: 40 }),
+		record({ groupName: "b", issues: [101], shapes: ["test"], costUsd: 0.2, iterations: 50 }),
+		record({ groupName: "c", issues: [102], shapes: ["test"], costUsd: 0.3, iterations: 60 }),
+	]
+	const issues = [issue(29, "Add tests for the API")]
+	const groups = estimateGroups(records, [spec("w1", [29])], issues)
+	assert.equal(groups[0]?.verificationMultiplier, TEST_SHAPE_VERIFICATION_MULTIPLIER)
+	assertClose(groups[0]?.expectedCostUsd ?? 0, 0.2 * TEST_SHAPE_VERIFICATION_MULTIPLIER, "group cost includes the scaled issue")
+	const lines = buildEstimateSection(groups, records.length)
+	assert.match(lines[0] ?? "", /2\.50x verification multiplier/, "dry-run line names the multiplier")
+}
+
+async function testEstimateGroupsDoesNotSurfaceUnappliedMultiplier(): Promise<void> {
+	// A mixed group: 1 test-shaped record (thin — below MIN_SHAPE_SAMPLES, so
+	// the test issue contributes NO cost) + 3 split-shaped records (usable,
+	// scaled 1.0). Regression (rework cycle 1): the old code surfaced the max
+	// per-issue multiplier (3.5 at 1 sample) next to a cost it never scaled —
+	// the "3.50x" on the dry-run line was a false claim exceeding the cap.
+	const records = [
+		record({ groupName: "t1", issues: [100], shapes: ["test"], costUsd: 0.2, iterations: 40 }),
+		record({ groupName: "a", issues: [101], shapes: ["split"], costUsd: 0.1, iterations: 40 }),
+		record({ groupName: "b", issues: [102], shapes: ["split"], costUsd: 0.2, iterations: 50 }),
+		record({ groupName: "c", issues: [103], shapes: ["split"], costUsd: 0.3, iterations: 60 }),
+	]
+	const issues = [issue(29, "Add tests for the API"), issue(5, "Split the big file into modules")]
+	const groups = estimateGroups(records, [spec("w1", [29, 5])], issues)
+	const g = groups[0]
+	assert.equal(g?.unmatched, 1, "the thin test issue contributes no usable cost")
+	assertClose(g?.expectedCostUsd ?? 0, 0.2, "only the split issue contributes ($0.2 median, unscaled)")
+	assert.equal(g?.verificationMultiplier, undefined, "no multiplier surfaces — nothing usable was scaled")
+	const lines = buildEstimateSection(groups, records.length)
+	assert.doesNotMatch(lines[0] ?? "", /verification multiplier/, "dry-run line must not claim a multiplier that never scaled the cost")
+}
+
 async function testEstimateGroupsSumsPerIssueIntoGroup(): Promise<void> {
 	const records = [
 		record({ groupName: "a", issues: [100], shapes: ["split"], costUsd: 0.2, iterations: 40 }),
@@ -212,6 +347,13 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["estimateIssue: exact issue-number history beats shape matching", testEstimateIssueDirectMatchBeatsShapeMatch],
 	["estimateIssue: shape matching needs MIN_SHAPE_SAMPLES before offering numbers", testEstimateIssueShapeNeedsMinSamples],
 	["estimateIssue: no matching history -> match none", testEstimateIssueNoMatch],
+	["isVerificationHeavy: test shape and CI mention detection (issue #124)", testIsVerificationHeavy],
+	["verificationMultiplier: tapers from full multiplier to 1 as samples accumulate (issue #124)", testVerificationMultiplierTapersWithSamples],
+	["estimateIssue: test shape scales COST, not iterations (issue #124)", testEstimateIssueTestShapeScalesCostNotIterations],
+	["estimateIssue: CI/GitHub Actions mention scales cost even with another shape (issue #124)", testEstimateIssueCiMentionScalesEvenWithOtherShape],
+	["estimateIssue: well-sampled test shape is trusted as-is (issue #124)", testEstimateIssueWellSampledTestShapeNotScaled],
+	["estimateGroups: verification multiplier surfaces on the group + dry-run line (issue #124)", testEstimateGroupsShowsVerificationMultiplier],
+	["estimateGroups: an unapplied multiplier (thin issue contributes no cost) never surfaces (rework cycle 1)", testEstimateGroupsDoesNotSurfaceUnappliedMultiplier],
 	["estimateGroups sums per-issue medians into a group range", testEstimateGroupsSumsPerIssueIntoGroup],
 	["estimateGroups reports unmatched issues as partial", testEstimateGroupsPartialMatchReportsUnmatched],
 	["buildEstimateSection: empty history -> single no-history note", testBuildEstimateSectionEmptyHistory],

@@ -14,9 +14,12 @@ import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } fr
 // ─── Fake LLM client (same pattern as engine/__tests__/loop.test.ts) ─────────
 
 class FakeLlmClient implements LlmClient {
+	/** Captured system/task prompt text for the session (assert-able in tests). */
+	public lastRequestText = ""
 	constructor(private readonly script: Array<() => ChatMessage>) {}
 
-	async createChatCompletion(_request: LlmRequest): Promise<LlmResponse> {
+	async createChatCompletion(request: LlmRequest): Promise<LlmResponse> {
+		this.lastRequestText = request.messages.map((m) => m.content ?? "").join("\n")
 		const step = this.script.shift()
 		if (!step) {
 			throw new Error("FakeLlmClient: script exhausted (model kept calling)")
@@ -321,6 +324,30 @@ async function testRunReviewWritesATailableLogFile(): Promise<void> {
 	}
 }
 
+/** Issue #123: the review session's task text must designate the workspace
+ * scratch dir and explicitly forbid /tmp — reviewers were the worst /tmp
+ * offenders in round-2026-08-17, so the instruction is injected per-session
+ * (not only in the checklist doc). */
+async function testRunReviewTaskTextForbidsTmpAndPointsAtWorkspaceScratch(): Promise<void> {
+	const ws = await makeWorkspace()
+	try {
+		const client = new FakeLlmClient([() => attemptCompletion("VERDICT: CLEAN")])
+		await runReview({ workspaceRoot: ws, llmClient: client, maxIterations: 5 })
+		assert.match(
+			client.lastRequestText,
+			/\.headlesscode\/scratch\//,
+			"review session task text points scratch at the workspace dir",
+		)
+		assert.match(
+			client.lastRequestText,
+			/NEVER write to `\/tmp`/,
+			"review session task text explicitly forbids /tmp",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 /**
 	* Issue #34: the reviewer's COMPLETE final report is persisted per session
 	* (`<workspaceRoot>/.headlesscode/reports/<sessionId>.md`) and surfaced on
@@ -412,6 +439,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["missing structured verdict falls back to the heuristic", testMissingStructuredVerdictFallsBackToHeuristic],
 	["bare 'wrong'/'regression'/'does not' in clean prose does not mark a finding", testBareWrongRegressionDoesNotMarkFinding],
 	["runReview writes a tailable review.log, appended across sessions (not truncated)", testRunReviewWritesATailableLogFile],
+	["runReview task text designates workspace scratch and forbids /tmp (issue #123)", testRunReviewTaskTextForbidsTmpAndPointsAtWorkspaceScratch],
 	["runReview surfaces the complete final report path (issue #34)", testRunReviewSurfacesFullReportPath],
 	["runReviewWithRetries: a normal clean verdict returns immediately, no retry", testRunReviewWithRetriesReturnsCleanImmediately],
 	["runReviewWithRetries: retries after a review-session error and succeeds on the 2nd attempt", testRunReviewWithRetriesRetriesAfterSessionError],

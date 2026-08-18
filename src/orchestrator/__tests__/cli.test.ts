@@ -196,6 +196,26 @@ async function testAllTaskBuildersNoHardcodedRulesReadInstruction(): Promise<voi
 	}
 }
 
+/** Issue #123 regression guard: every task builder designates the workspace
+ * scratch dir and explicitly forbids /tmp (reviewers/workers wrote scratch to
+ * /tmp in round-2026-08-17, violating the workspace-containment rule). */
+async function testAllTaskBuildersDesignateWorkspaceScratchAndForbidTmp(): Promise<void> {
+	const outputs = [
+		buildTaskFileContent({ name: "w1", issues: [1], taskFile: "w1.md" }, []),
+		buildPlanFirstTaskFileContent({ name: "w1", issues: [1] }),
+		buildReworkTaskFileContent({ name: "w1", issues: [1] }, [], 1),
+		buildQaReworkTaskFileContent({ name: "w1", issues: [1] }, "", 1),
+		buildContinuationTaskFileContent({ name: "w1", issues: [1] }, 1),
+	]
+	for (const content of outputs) {
+		assert.ok(content.includes(".headlesscode/scratch/"), "task builder points scratch at the workspace dir")
+		assert.ok(
+			content.includes("NEVER write to `/tmp`") || content.includes("never `/tmp`") || content.includes("No /tmp"),
+			"task builder explicitly forbids /tmp",
+		)
+	}
+}
+
 // ─── buildQaReworkTaskFileContent (issue #52) ────────────────────────────────
 
 async function testQaReworkTaskFileContentIncludesEvidenceAndIssues(): Promise<void> {
@@ -1574,6 +1594,54 @@ async function testOrchestrateMainDryRunShowsCostEstimateFromHistory(): Promise<
 	}
 }
 
+/** Issue #124: a test-shaped issue with thin recorded samples gets its cost
+ * scaled by the verification multiplier, surfaced on the dry-run line. */
+async function testOrchestrateMainDryRunShowsVerificationMultiplier(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		initGitRepo(repo)
+		const issuesPath = path.join(repo, "issues.json")
+		await fs.writeFile(
+			issuesPath,
+			JSON.stringify([{ number: 1, title: "Add tests for the API", body: "Test-shaped work." }]),
+			"utf-8",
+		)
+		// Seed three test-shaped records — enough for a shape-match estimate,
+		// but thin enough (3 < VERIFICATION_MULTIPLIER_FULL_SAMPLES) that the
+		// verification multiplier applies to the recorded median.
+		for (const [cost, iters] of [
+			[0.2, 40],
+			[0.3, 50],
+			[0.4, 60],
+		] as const) {
+			await appendCostHistoryRecord(repo, {
+				recordedAt: "2026-08-05T00:00:00.000Z",
+				repo: path.resolve(repo),
+				groupName: `past${cost}`,
+				issues: [100],
+				shapes: ["test"],
+				status: "done",
+				costUsd: cost,
+				inputTokens: 2000,
+				outputTokens: 200,
+				cachedTokens: 0,
+				iterations: iters,
+				continuationCount: 0,
+				reworkCount: 0,
+			})
+		}
+		const { exit, stdout } = await withCapturedStdout(() =>
+			orchestrateMain(["--repo", repo, "--issues-json", issuesPath, "--dry-run"]),
+		)
+		assert.equal(exit, 0)
+		assert.match(stdout, /Cost estimate \(from recorded cost-history/)
+		// Median per-issue cost $0.3 * 2.5 = $0.75; the multiplier is named.
+		assert.match(stdout, /w1 \(issues 1 — test\): expected ~\$0\.5000–\$1\.0000 · ~40–60 iterations · 3 sample\(s\) · 2\.50x verification multiplier/)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 // ─── Pre-spawn preflight probe (issue #13) ───────────────────────────────────
 
 async function testOrchestrateMainPreflightFailureAbortsBeforeSpawn(): Promise<void> {
@@ -1699,6 +1767,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["rework task file handles empty findings gracefully", testReworkTaskFileContentHandlesEmptyFindings],
 	["task file embeds real issue title/body, no gh fetch (Fix 2)", testTaskFileContentEmbedsIssueTitleAndBody],
 	["all five task builders omit the hardcoded rules-read instruction (Fix 1)", testAllTaskBuildersNoHardcodedRulesReadInstruction],
+	["all five task builders designate workspace scratch and forbid /tmp (issue #123)", testAllTaskBuildersDesignateWorkspaceScratchAndForbidTmp],
 	["rework task file embeds persisted issueBodies, falls back to gh without (Fix 2)", testReworkTaskFileContentEmbedsPersistedIssueBodies],
 	["QA rework task file includes evidence, issues, report pointer (issue #52)", testQaReworkTaskFileContentIncludesEvidenceAndIssues],
 	["QA rework task file handles empty evidence gracefully (issue #52)", testQaReworkTaskFileContentHandlesEmptyEvidence],
@@ -1758,6 +1827,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["orchestrateMain dry-run proceeds when all worktree dirs are clear", testOrchestrateMainDryRunProceedsWhenNoCollision],
 	["orchestrateMain dry-run shows the no-history estimate note on a fresh repo", testOrchestrateMainDryRunShowsEmptyCostEstimateNote],
 	["orchestrateMain dry-run shows a cost estimate derived from recorded history", testOrchestrateMainDryRunShowsCostEstimateFromHistory],
+	["orchestrateMain dry-run shows the verification multiplier on a thin test-shaped estimate (issue #124)", testOrchestrateMainDryRunShowsVerificationMultiplier],
 	["orchestrateMain aborts before spawn when the preflight probe fails", testOrchestrateMainPreflightFailureAbortsBeforeSpawn],
 	["orchestrateMain warns loudly on drift when the auto-sync is disabled", testOrchestrateMainWarnsOnDriftWhenSyncDisabled],
 ]
