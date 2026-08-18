@@ -126,11 +126,16 @@ in the harness's own wrapper module.
 
 ## 2. Shims created (all under `src/vendor/zoo-code/`)
 
-Wired through `tsconfig.json` → `compilerOptions.paths` unless noted:
+Wired by rewriting the vendored imports to real relative paths (e.g.
+`import * as vscode from "../../shim/vscode"`, `import ... from "../../types"`)
+— since issue #99, the package must boot from a clean `npm install`, where
+tsx does NOT apply tsconfig `paths` to files under `node_modules`. The shims
+sit at the same depth-relative locations regardless of install prefix, so the
+relative imports resolve with no tsconfig magic:
 
 | Shim file | Replaces (upstream) | Why / notes |
 |---|---|---|
-| `shim/vscode.ts` | the `vscode` module | Headless no-op stand-in: `ExtensionContext.globalState`, `workspace.workspaceFolders` (= `undefined`), no-op `createFileSystemWatcher`, `getConfiguration`, `window.showErrorMessage/WarningMessage` → console, `env.language` = `"en"`. Mapped via `paths: "vscode"`. |
+| `shim/vscode.ts` | the `vscode` module | Headless no-op stand-in: `ExtensionContext.globalState`, `workspace.workspaceFolders` (= `undefined`), no-op `createFileSystemWatcher`, `getConfiguration`, `window.showErrorMessage/WarningMessage` → console, `env.language` = `"en"`. Imported by relative path (`../../shim/vscode`). |
 | `shim/openai.d.ts` | the `openai` package (types only) | Vendored schemas only use `import type OpenAI` — no runtime needed. Declares just `Chat.ChatCompletionTool` (+ `FunctionParameters`, `ChatCompletionCreateParams["tool_choice"]`). |
 | `shim/anthropic.ts` | `@anthropic-ai/sdk` | Class + namespace merge (mirrors the real SDK's export shape) providing `Anthropic.Tool`/`Tool.InputSchema`/`Messages.MessageCreateParams["tool_choice"]`/`TextBlockParam`/`ImageBlockParam` plus an empty runtime class so the named import in `shared/tools.ts` resolves. Mapped via `paths`. |
 | `shim/os-name.ts` | the `os-name` npm package | Returns the same `<platform> <release>` fallback the original code uses when `os-name` fails. Mapped via `paths`. |
@@ -145,7 +150,7 @@ Wired through `tsconfig.json` → `compilerOptions.paths` unless noted:
 | `src/services/skills/SkillsManager.ts` | `zoo-code/src/services/skills/SkillsManager.ts` | Stub returning no skills from `getSkillsForMode()`. |
 | `src/services/search/file-search.ts` | `zoo-code/src/services/search/file-search.ts` | `executeRipgrep` implemented with pure Node fs + a small glob matcher (`**`, `*`, `!`-excludes). Originally only served `.roo` subdirectory discovery (`roo-config`); extended for the checkpoints vendoring to also serve `ShadowCheckpointService#getNestedGitRepository()`'s `**/.git/HEAD` nested-repo scan (returns `{ path, type }`, not just `path`, to match what that caller destructures). |
 | `src/i18n/index.ts` | `zoo-code/src/i18n/index.ts` | `t()` returns the key with `{param}` interpolation; original is the webview UI catalog. |
-| `types/index.ts` | the `@roo-code/types` package | Re-export barrel over the vendored `types/*` modules. Mapped via `paths: "@roo-code/types"`. |
+| `types/index.ts` | the `@roo-code/types` package | Re-export barrel over the vendored `types/*` modules. Imported by relative path (`../../types`). |
 
 ---
 

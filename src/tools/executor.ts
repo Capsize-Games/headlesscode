@@ -21,9 +21,11 @@
  *     port (see src/codeintel/).
  *
  * Every file operation resolves relative to the configured workspace root and
- * is rejected if it escapes the workspace (path-traversal guard). Results are
- * plain strings + an { isError } flag; long outputs are truncated to keep the
- * model context bounded.
+ * is rejected if it escapes the workspace — both lexically (`../` traversal)
+ * and after following symlinks (a symlink whose real location is outside the
+ * workspace is refused; see resolveWithinWorkspace). Results are plain strings
+ * + an { isError } flag; long outputs are truncated to keep the model context
+ * bounded.
  *
  * The three surgical edit tools are backed by the vendored Zoo Code diff
  * logic: `apply_diff` uses the fuzzy MultiSearchReplaceDiffStrategy
@@ -346,9 +348,42 @@ export class PathTraversalError extends Error {
 }
 
 /**
+ * A path whose REAL location (after following symlinks) escapes the workspace
+ * even though its lexical path stays inside it (issue #64). Subclasses
+ * PathTraversalError so existing callers that catch the base class (e.g. the
+ * dashboard's HTTP layer, which maps it to a 400) keep treating it the same
+ * way.
+ */
+export class SymlinkEscapeError extends PathTraversalError {
+	constructor(requested: string, root: string, resolvedTo: string) {
+		super(requested, root)
+		this.name = "SymlinkEscapeError"
+		this.message = `Path escapes the workspace root through a symlink (${root}): ${requested} — it resolves to ${resolvedTo}`
+	}
+}
+
+/**
  * Resolve `p` against the workspace root and reject anything that escapes it.
- * Uses path.resolve + a containment check, mirroring the harness's Phase 1
- * requirement (no symlink-following resolution — lexical containment only).
+ *
+ * Two layers of containment (issue #64):
+ *  1. Lexical: path.resolve + a prefix check — the classic `../` traversal
+ *     guard. This alone is NOT sufficient: every `fsp` call in the file tools
+ *     FOLLOWS symlinks, so an agent can `ln -s ~/.ssh <ws>/sshlink` and then
+ *     read AND write outside the workspace through it. The protected-files
+ *     guard is bypassed the same way — it only ever sees the
+ *     workspace-relative lexical path.
+ *  2. Symlink-following (assertNoSymlinkEscape): the real path of the deepest
+ *     resolvable ancestor must stay inside the workspace root's own real
+ *     path. An escaping symlink — as a directory component, as the target
+ *     itself, or as a dangling symlink a later write would create THROUGH —
+ *     is refused with SymlinkEscapeError. The ancestor walk keeps writes to
+ *     not-yet-existing paths working (realpath on a nonexistent path throws).
+ *
+ * Documented boundary: a path is usable only if every existing component of
+ * it really lives inside the workspace. A symlink that escapes is refused
+ * even when it points somewhere "useful" (e.g. a node_modules symlinked to a
+ * sibling checkout) — the model can still reach such paths through
+ * execute_command, which has its own permission gate.
  */
 export function resolveWithinWorkspace(root: string, p: string): string {
 	const rootAbs = path.resolve(root)
@@ -356,7 +391,81 @@ export function resolveWithinWorkspace(root: string, p: string): string {
 	if (target !== rootAbs && !target.startsWith(rootAbs + path.sep)) {
 		throw new PathTraversalError(p, rootAbs)
 	}
+	assertNoSymlinkEscape(rootAbs, target, p)
 	return target
+}
+
+/**
+ * Reject a `target` whose real location (after following symlinks) escapes
+ * `rootAbs`. Called by resolveWithinWorkspace after the lexical check.
+ *
+ * Walk up from `target` until an existing path is found, realpath it, and
+ * require the result to stay inside the root's own realpath. Three cases
+ * realpath can't answer directly, each handled explicitly:
+ *  - Path doesn't exist yet (a write to a new file): walk up to the deepest
+ *    existing ancestor — its real location decides where the write lands.
+ *  - A component is a DANGLING symlink: realpath fails, but a write through
+ *    it would create the target AT THE SYMLINK'S DESTINATION, so follow the
+ *    chain (re-running the containment check on each hop) instead of walking
+ *    past it.
+ *  - A symlink cycle (realpath throws ELOOP): unresolvable — the kernel
+ *    refuses reads/writes through it too, so nothing can escape; walk up.
+ */
+function assertNoSymlinkEscape(rootAbs: string, target: string, requested: string): void {
+	const rootReal = realpathOrSelf(rootAbs)
+	const seen = new Set<string>()
+	let probe = target
+	for (;;) {
+		if (seen.has(probe)) {
+			// Symlink cycle: unresolvable, so no read/write can escape through
+			// it — walk up and keep checking the ancestors.
+			const parent = path.dirname(probe)
+			if (parent === probe) {
+				return
+			}
+			probe = parent
+			continue
+		}
+		seen.add(probe)
+
+		let real: string
+		try {
+			real = fs.realpathSync(probe)
+		} catch {
+			let st: fs.Stats | undefined
+			try {
+				st = fs.lstatSync(probe)
+			} catch {
+				st = undefined
+			}
+			if (st?.isSymbolicLink()) {
+				// Dangling symlink: a later write would create the target at
+				// the symlink's destination, so verify the destination chain
+				// instead of skipping the symlink.
+				probe = path.resolve(path.dirname(probe), fs.readlinkSync(probe))
+				continue
+			}
+			const parent = path.dirname(probe)
+			if (parent === probe) {
+				return
+			}
+			probe = parent
+			continue
+		}
+		if (real !== rootReal && !real.startsWith(rootReal + path.sep)) {
+			throw new SymlinkEscapeError(requested, rootAbs, real)
+		}
+		return
+	}
+}
+
+/** realpath of `p`, falling back to the lexical path when it can't resolve. */
+function realpathOrSelf(p: string): string {
+	try {
+		return fs.realpathSync(p)
+	} catch {
+		return p
+	}
 }
 
 /** Build a path-safety-checked absolute path, catching traversal errors. */

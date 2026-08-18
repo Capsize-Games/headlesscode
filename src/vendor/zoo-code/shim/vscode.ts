@@ -1,9 +1,11 @@
 /**
  * SHIM — headless stand-in for the `vscode` module.
  *
- * Maps to this file via the "vscode" entry in tsconfig.json "paths". The real
- * Zoo Code imports `vscode.*` all over its GUI-coupled layer; the vendored core
- * only touches the small surface below. Every method is a harmless no-op —
+ * The vendored core's `import * as vscode from "vscode"` is rewritten to
+ * import this file by relative path (issue #99 rework — the package must boot
+ * from a clean npm install, where tsx does not apply tsconfig `paths`). The
+ * real Zoo Code imports `vscode.*` all over its GUI-coupled layer; the vendored
+ * core only touches the small surface below. Every method is a harmless no-op —
  * a headless harness must never depend on VS Code UI or file watchers.
  *
  * See VENDOR-NOTES.md for the full shim inventory.

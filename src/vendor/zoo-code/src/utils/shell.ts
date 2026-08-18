@@ -1,4 +1,4 @@
-import * as vscode from "vscode"
+import * as vscode from "../../shim/vscode"
 import { existsSync } from "fs"
 import { userInfo } from "os"
 import * as path from "path"

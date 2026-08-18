@@ -1,12 +1,12 @@
-import * as vscode from "vscode"
+import * as vscode from "../../../shim/vscode"
 import * as path from "path"
 import * as fs from "fs/promises"
 import * as os from "os"
 
 import * as yaml from "yaml"
-import stripBom from "strip-bom"
+import stripBom from "../../../shim/strip-bom"
 
-import { type ModeConfig, type PromptComponent, customModesSettingsSchema, modeConfigSchema } from "@roo-code/types"
+import { type ModeConfig, type PromptComponent, customModesSettingsSchema, modeConfigSchema } from "../../../types"
 
 import { fileExistsAtPath } from "../../utils/fs"
 import { getWorkspacePath } from "../../utils/path"

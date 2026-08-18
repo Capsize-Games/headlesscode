@@ -3,8 +3,9 @@
  *
  * The harness does not depend on the published `@roo-code/types` package. The
  * type modules below are copied verbatim from `packages/types/src/`, and this
- * barrel re-exports exactly the surface the vendored core imports. It is wired
- * up via the "@roo-code/types" entry in tsconfig.json "paths".
+ * barrel re-exports exactly the surface the vendored core imports. Vendored
+ * files' `@roo-code/types` imports are rewritten to import this barrel by
+ * relative path (issue #99 rework).
  *
  * Files: tool.ts, mode.ts, todo.ts, vscode.ts are verbatim copies.
  * message.ts and tool-params.ts are also verbatim copies; only the two types

@@ -1,5 +1,5 @@
 import os from "os"
-import osName from "os-name"
+import osName from "../../../../shim/os-name"
 
 import { getShell } from "../../../utils/shell"
 

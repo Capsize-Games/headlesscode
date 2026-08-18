@@ -5,7 +5,8 @@
  * `stripBom()` function that removes a leading UTF-8 byte order mark. This shim
  * implements exactly that so the dependency count stays at the project minimum.
  *
- * Maps to this file via the "strip-bom" entry in tsconfig.json "paths".
+ * The vendored `CustomModesManager.ts`'s default import of `strip-bom` is
+ * rewritten to import this file by relative path (issue #99 rework).
  */
 
 export default function stripBom(string: string): string {

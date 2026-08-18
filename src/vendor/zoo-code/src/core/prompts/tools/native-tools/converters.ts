@@ -1,5 +1,5 @@
 import type OpenAI from "openai"
-import type Anthropic from "@anthropic-ai/sdk"
+import type Anthropic from "../../../../../shim/anthropic"
 
 /**
  * Converts an OpenAI ChatCompletionTool to Anthropic's Tool format.
