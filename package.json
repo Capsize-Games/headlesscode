@@ -31,6 +31,19 @@
 	"bin": {
 		"headlesscode": "bin/headlesscode.mjs"
 	},
+	"files": [
+		"LICENSE",
+		"README.md",
+		"ATTRIBUTION.md",
+		"SECURITY.md",
+		"CONTRIBUTING.md",
+		"CODE_OF_CONDUCT.md",
+		"tsconfig.json",
+		"shared/",
+		"src/",
+		"!src/**/__tests__/",
+		"!src/**/*.test.ts"
+	],
 	"scripts": {
 		"typecheck": "tsc --noEmit",
 		"smoke": "tsx src/vendor/tests/smoke.ts",

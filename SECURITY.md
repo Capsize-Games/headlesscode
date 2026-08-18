@@ -100,6 +100,32 @@ tagged `security`, or a pull request with a fix. See the project's
 [`headless-coding-harness-project.md`](headless-coding-harness-project.md) for
 the overall design.
 
+## Supported versions
+
+Only the current `master` branch is supported. The project has not cut
+releases yet (no tags, `version: 0.1.0`); patches land on `master` and are
+expected to be forward-only.
+
+## Security-relevant areas
+
+If you are auditing the codebase, the highest-value targets are:
+
+- `src/tools/executor.ts` — the tool executor, including the
+  `execute_command` handler that spawns shell commands and the path-traversal
+  guard for file tools.
+- `src/permissions/` — command allow/deny, protected files, and the
+  central-store protection; defaults are documented in `config.ts`.
+- `src/cloud/` and `src/orchestrator/` — session isolation, worktree
+  spawning, and the scripts they shell out to (`scripts/*.sh`).
+- `src/vendor/zoo-code/` — the vendored Apache-2.0 portable core (see
+  `ATTRIBUTION.md`); upstream security fixes should be tracked via
+  `VENDOR-NOTES.md`.
+
+The npm package (`npm pack`) ships only the runtime source under `src/`
+(excluding `__tests__/`), `shared/`, and the top-level docs — internal
+`plans/`, `recon/`, `.roo/`, and dev scripts are intentionally excluded (see
+the `files` field in `package.json`).
+
 ## Responsible-use checklist
 
 Before running `headlesscode` on anything you care about:
