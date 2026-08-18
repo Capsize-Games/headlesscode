@@ -749,6 +749,17 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 
 	while (true) {
 		if (options.signal?.aborted) {
+			// Issue #135: a group's onGroupUpdate callback can itself be what
+			// triggers the abort (e.g. a caller stopping the loop the moment it
+			// observes the first update) — at that point the callback's own
+			// async tail (state re-fetch + recordCostIfSettled's saveState) is
+			// still in flight in inFlightCallbacks. Returning immediately let
+			// that write race the caller's own post-return cleanup (a test's
+			// `finally { rm(tmpDir) }`, or a real process exit) and occasionally
+			// lose: an ENOENT on saveState's rename once the target directory
+			// was already gone. Drain every in-flight callback before handing
+			// control back, so no write from this loop can ever outlive it.
+			await Promise.all(inFlightCallbacks.values())
 			break
 		}
 		// Refresh the watcher heartbeat FIRST so a concurrently-running
