@@ -27,6 +27,12 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # The full test suite includes src/tools/__tests__/browser-action.test.ts,
+      # which launches a REAL headless Chromium via Playwright — the browser
+      # binary is a separate download, not part of npm ci.
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
       - name: Typecheck
         run: npx tsc --noEmit
 
