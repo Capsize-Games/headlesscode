@@ -222,7 +222,7 @@ export const renameSymbolTool = {
 
 // ─── import_graph ────────────────────────────────────────────────────────────
 
-const IMPORT_GRAPH_DESCRIPTION = `Show a file's import relationships: (a) everything it imports, resolved to the REAL file paths the TypeScript compiler resolves them to (tsconfig paths aliases like "vscode" -> src/vendor/zoo-code/shim/vscode.ts included), and (b) everything that imports it (reverse lookup across the whole program). Static analysis of import/export declarations — deterministic and fast (the program-wide import map is cached).
+const IMPORT_GRAPH_DESCRIPTION = `Show a file's import relationships: (a) everything it imports, resolved to the REAL file paths the TypeScript compiler resolves them to (relative specifiers like "./foo" resolve to the actual file; bare specifiers like "vscode" resolve to the module the compiler maps them to, e.g. the vendored shim), and (b) everything that imports it (reverse lookup across the whole program). Static analysis of import/export declarations — deterministic and fast (the program-wide import map is cached).
 
 Use this to understand module dependencies before editing, or to find every file that depends on a module you're about to change.
 

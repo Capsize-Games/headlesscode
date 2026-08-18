@@ -75,10 +75,10 @@ COPY shared ./shared
 #
 # TSX_TSCONFIG_PATH: tsx discovers tsconfig.json from the *cwd*, but the CLI
 # is invoked from arbitrary working directories (orchestrated project
-# checkouts, scratch repos, /data/...), so without this the `vscode` ->
-# src/vendor/zoo-code/shim path alias wouldn't resolve and every command
-# fails with ERR_MODULE_NOT_FOUND. Pinning the tsconfig makes resolution
-# cwd-independent.
+# checkouts, scratch repos, /data/...). Pinning the tsconfig keeps the
+# package's compiler options stable regardless of the cwd (the imports are
+# all relative now — issue #99 rework — but the pin still prevents tsx from
+# picking up an unrelated tsconfig from wherever the CLI is invoked).
 RUN printf '#!/bin/sh\nexport TSX_TSCONFIG_PATH=/opt/headlesscode/tsconfig.json\nexec /opt/headlesscode/node_modules/.bin/tsx /opt/headlesscode/src/cli.ts "$@"\n' \
         > /usr/local/bin/headlesscode \
     && chmod +x /usr/local/bin/headlesscode

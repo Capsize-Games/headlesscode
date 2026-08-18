@@ -11,10 +11,11 @@
  * directly (the same ancestor walk-up `scripts/run-tests.mjs` uses — npm
  * flattens node_modules, so tsx may live in this package's node_modules OR
  * be hoisted to an ancestor's) and re-execing node through tsx's CLI entry.
- * It also pins TSX_TSCONFIG_PATH to this package's tsconfig.json, which is
- * required for the `vscode` -> src/vendor/zoo-code/shim path aliases
- * (tsconfig.json "paths") — tsx would otherwise discover tsconfig from the
- * CWD and fail to resolve those aliases when invoked from elsewhere.
+ * It also pins TSX_TSCONFIG_PATH to this package's tsconfig.json so tsx
+ * resolves the package's own tsconfig instead of discovering one from the
+ * caller's CWD (the tsconfig now has no `paths` aliases — issue #99 rework —
+ * but the pin keeps the package's compiler options, e.g. `moduleResolution`,
+ * stable regardless of where the CLI is invoked from).
  *
  * A small amount of JS (not TS) on purpose: the launcher must run without
  * tsx — the whole point is that it finds tsx itself.

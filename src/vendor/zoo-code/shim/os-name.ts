@@ -7,7 +7,8 @@
  * string the original code falls back to when `os-name` itself fails, keeping
  * the dependency count at the project minimum.
  *
- * Maps to this file via the "os-name" entry in tsconfig.json "paths".
+ * The vendored `system-info.ts`'s default import of `os-name` is rewritten to
+ * import this file by relative path (issue #99 rework).
  */
 
 import * as os from "os"

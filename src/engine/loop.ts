@@ -88,7 +88,7 @@ import type {
 	ToolContext,
 	ToolResult,
 } from "./types.js"
-import type { ModeConfig } from "@roo-code/types"
+import type { ModeConfig } from "../vendor/zoo-code/types/index.js"
 import {
 	buildCondensedMessage,
 	computeCondensePlan,

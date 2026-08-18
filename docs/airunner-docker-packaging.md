@@ -78,8 +78,8 @@ and compose placement here don't constrain that choice.
   repo's own invocation). The wrapper exports `TSX_TSCONFIG_PATH=/opt/headlesscode/tsconfig.json`:
   tsx discovers tsconfig from the *cwd*, and the CLI is invoked from arbitrary
   working directories (orchestrated checkouts, scratch repos, `/data/...`) —
-  without the pin, the `vscode` -> `src/vendor/zoo-code/shim` path alias
-  wouldn't resolve and every command dies with `ERR_MODULE_NOT_FOUND`.
+  without the pin, tsx would pick up some unrelated tsconfig (or none) and
+  the CLI would fail to boot from a foreign cwd.
 - The three runtime orchestration scripts (`scripts/spawn-parallel-worktrees.sh`,
   `run-worker.sh`, `headlesscode-answer.sh`) are copied in — a real
   non-dry-run `orchestrate` run shells out to them (the rest of `scripts/` is
