@@ -480,8 +480,12 @@ async function makeWorktree(repo: string, name: string, exitCode?: number): Prom
 	if (exitCode === undefined) {
 		return
 	}
-	await fs.mkdir(path.join(wt, ".harness.done"), { recursive: true })
+	// Order matters: run-worker.sh writes .harness.exit FIRST, then creates
+	// the .harness.done marker dir (the done marker is the atomic last write
+	// — see scripts/run-worker.sh:222-223). Reverse the order and a reader
+	// can observe done-without-exit, which reconciles to "failed".
 	await fs.writeFile(path.join(wt, ".harness.exit"), String(exitCode), "utf8")
+	await fs.mkdir(path.join(wt, ".harness.done"), { recursive: true })
 }
 
 async function testOneShotReconcilesDoneFromMarkersAndPersists(): Promise<void> {
@@ -607,6 +611,185 @@ async function testWaitReconcilesStaleGroupPromptly(): Promise<void> {
 		assert.equal(parsed.verdict, "2/2 groups done, 0 failed")
 		assert.deepEqual(parsed.reconciled, ["w1"], "wait reports the reconciled group")
 		assert.ok(elapsed < 2000, `returned promptly instead of waiting the timeout (${elapsed}ms)`)
+
+		// Issue #116: with NO live watcher (no heartbeat file), the wait is
+		// the only writer and its reconcile patch must still persist.
+		const onDisk = loadStateSync(statePath)
+		assert.equal(onDisk.groups[0].status, "done", "wait persisted the reconcile with no live watcher")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+/**
+ * Issue #116: `status --wait` running CONCURRENTLY with a live orchestrate
+ * round used to persist its read-side reconciliation, pre-empting the
+ * watcher (which then short-circuited the group and silently skipped log
+ * analysis + the automated review). With the watcher's heartbeat present,
+ * the wait must reconcile IN MEMORY only — the shared state file must keep
+ * saying "running" so the watcher still owns the done transition.
+ */
+async function testWaitDoesNotPersistReconcileWhenWatcherHeartbeatFresh(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
+		saveStateSync(statePath, updateGroup(defaultState("r1"), "w1", baseGroup({ status: "running" })))
+		await makeWorktree(repo, "w1", 0)
+		// A live watcher owns the state: its heartbeat file is fresh.
+		await fs.writeFile(`${statePath}.watcher`, "99999", "utf8")
+
+		const cap = capture()
+		const code = await statusMain(
+			["--repo", repo, "--wait", "--json", "--timeout-ms", "5000", "--poll-interval-ms", "25"],
+			cap.io,
+		)
+
+		assert.equal(code, 0, "in-memory reconcile to done -> all done -> exit 0")
+		const parsed = JSON.parse(cap.out.join("")) as OrchestratorState & { reconciled?: string[] }
+		assert.equal(parsed.groups[0].status, "done", "the wait's REPORTED state reflects the in-memory reconcile")
+		assert.deepEqual(parsed.reconciled, ["w1"], "wait still reports the group it reconciled")
+		// The persisted file must be untouched — the watcher owns the done
+		// transition and must still observe the group as running.
+		const onDisk = loadStateSync(statePath)
+		assert.equal(onDisk.groups[0].status, "running", "no persist while a live watcher owns the state")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+/** A STALE heartbeat means the watcher is gone — the wait may persist again. */
+async function testWaitPersistsWhenWatcherHeartbeatStale(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
+		saveStateSync(statePath, updateGroup(defaultState("r1"), "w1", baseGroup({ status: "running" })))
+		await makeWorktree(repo, "w1", 0)
+		// A heartbeat from 10 minutes ago: the watcher is dead; the wait is
+		// the only writer and must patch the stale entry back.
+		const stale = new Date(Date.now() - 10 * 60 * 1000)
+		await fs.writeFile(`${statePath}.watcher`, "99999", "utf8")
+		const { utimes } = await import("node:fs/promises")
+		await utimes(`${statePath}.watcher`, stale, stale)
+
+		const cap = capture()
+		const code = await statusMain(
+			["--repo", repo, "--wait", "--json", "--timeout-ms", "5000", "--poll-interval-ms", "25"],
+			cap.io,
+		)
+
+		assert.equal(code, 0, "all done -> exit 0")
+		const onDisk = loadStateSync(statePath)
+		assert.equal(onDisk.groups[0].status, "done", "stale watcher heartbeat -> wait persists the reconcile")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+/**
+ * Issue #116 (rework cycle 1): a watcher-less --wait with a worker that
+ * finishes MID-wait must still persist the reconciled done transition. The
+ * first #116 fix made the wait write its own heartbeat (<statePath>.watcher
+ * = its own PID) on every poll, and liveWatcher() treated ANY fresh
+ * heartbeat as a live watcher — so from the second poll onward the wait
+ * believed a watcher owned the state, skipped saveStateSync, exited 0
+ * reporting "done", and left the on-disk state stuck on "running" forever
+ * (no watcher existed to ever persist it). A fresh heartbeat only counts
+ * when it carries a DIFFERENT process's PID.
+ */
+async function testWaitPersistsMidWaitReconcileWithNoWatcher(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
+		// Genuinely running at wait-start: worktree exists, NO .harness.done
+		// marker yet (a missing worktree would reconcile to orphaned instantly).
+		await fs.mkdir(path.join(repo, ".worktrees", "w1"), { recursive: true })
+		saveStateSync(statePath, updateGroup(defaultState("r1"), "w1", baseGroup({ status: "running" })))
+
+		const cap = capture()
+		const waitPromise = statusMain(
+			["--repo", repo, "--wait", "--json", "--timeout-ms", "5000", "--poll-interval-ms", "25"],
+			cap.io,
+		)
+
+		// Let the wait poll a few times — with the regression, its own
+		// heartbeat is now fresh and it would wrongly see a "live watcher".
+		await new Promise((resolve) => setTimeout(resolve, 150))
+		// The worker finishes mid-wait: drop the real completion markers.
+		// Exit first, then the done marker (run-worker.sh order).
+		await fs.writeFile(path.join(repo, ".worktrees", "w1", ".harness.exit"), "0", "utf8")
+		await fs.mkdir(path.join(repo, ".worktrees", "w1", ".harness.done"), { recursive: true })
+
+		const code = await waitPromise
+		assert.equal(code, 0, "worker finished mid-wait -> exit 0")
+		const parsed = JSON.parse(cap.out.join("")) as OrchestratorState & { allDone: boolean; timedOut: boolean }
+		assert.equal(parsed.allDone, true, "wait reports all done")
+		assert.equal(parsed.timedOut, false, "wait did not time out")
+		// The on-disk state MUST be done: with no watcher, the wait is the
+		// only writer, and a watcher-less round depends on this persist.
+		const onDisk = loadStateSync(statePath)
+		assert.equal(onDisk.groups[0].status, "done", "mid-wait reconcile persisted with no live watcher")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+/**
+ * Issue #116 (rework cycle 2): the exact repro that reopened the bug. A
+ * fresh heartbeat from a DIFFERENT process (PID 99999 = live watcher) is
+ * present when the wait starts, and the worker finishes MID-wait (markers
+ * dropped after the wait's first poll). The cycle-1 fix reintroduced the
+ * bug by having the wait stamp its own PID into the shared heartbeat file
+ * every poll: from the second poll onward the wait read its OWN PID,
+ * concluded "no live watcher", and persisted the done reconcile on disk —
+ * the watcher's next poll then short-circuited the group and silently
+ * skipped log analysis + review. The wait must NEVER write the heartbeat
+ * file: the live watcher's fresh heartbeat (different PID) must keep the
+ * on-disk state on "running" so the watcher still owns the done transition.
+ *
+ * Staleness is judged against the WATCHER's heartbeat cadence
+ * (DEFAULT_POLL_INTERVAL_MS = 5s), not the wait's own poll interval — a
+ * fast-polling wait must not declare a live watcher dead between the
+ * watcher's own refreshes.
+ */
+async function testWaitMidWaitReconcileWithLiveWatcherDoesNotPersist(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
+		// Genuinely running at wait-start: worktree exists, NO .harness.done
+		// marker yet (a missing worktree would reconcile to orphaned instantly).
+		await fs.mkdir(path.join(repo, ".worktrees", "w1"), { recursive: true })
+		saveStateSync(statePath, updateGroup(defaultState("r1"), "w1", baseGroup({ status: "running" })))
+		// A live watcher owns the state: its heartbeat is fresh AND carries a
+		// DIFFERENT PID. The wait must leave this file untouched.
+		await fs.writeFile(`${statePath}.watcher`, "99999", "utf8")
+
+		const cap = capture()
+		const waitPromise = statusMain(
+			["--repo", repo, "--wait", "--json", "--timeout-ms", "5000", "--poll-interval-ms", "25"],
+			cap.io,
+		)
+
+		// Let the wait poll a few times first — with the cycle-1 regression
+		// its own heartbeat had already clobbered the live watcher's by now.
+		await new Promise((resolve) => setTimeout(resolve, 150))
+		// The worker finishes mid-wait: drop the real completion markers.
+		// Exit first, then the done marker (run-worker.sh order).
+		await fs.writeFile(path.join(repo, ".worktrees", "w1", ".harness.exit"), "0", "utf8")
+		await fs.mkdir(path.join(repo, ".worktrees", "w1", ".harness.done"), { recursive: true })
+
+		const code = await waitPromise
+		assert.equal(code, 0, "worker finished mid-wait -> exit 0")
+		const parsed = JSON.parse(cap.out.join("")) as OrchestratorState & { allDone: boolean; timedOut: boolean }
+		assert.equal(parsed.allDone, true, "wait reports all done (in-memory reconcile)")
+		assert.equal(parsed.timedOut, false, "wait did not time out")
+		// The on-disk state MUST stay running: the live watcher owns the done
+		// transition and must still observe the group as running so its log
+		// analysis + automated review fire.
+		const onDisk = loadStateSync(statePath)
+		assert.equal(onDisk.groups[0].status, "running", "no persist while a live watcher owns the state")
+		// The live watcher's heartbeat must be untouched by the wait.
+		const heartbeatPid = await fs.readFile(`${statePath}.watcher`, "utf8")
+		assert.equal(heartbeatPid, "99999", "wait never writes the shared watcher heartbeat file")
 	} finally {
 		await fs.rm(repo, { recursive: true, force: true })
 	}
@@ -658,7 +841,11 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["one-shot reconciles failed from a non-zero .harness.exit", testOneShotReconcilesFailedFromNonZeroExit],
 	["one-shot reconciles orphaned and renders it distinctly (text + json)", testOneShotReconcilesOrphanedDistinctly],
 	["one-shot leaves a running group with a live worktree alone", testOneShotLeavesRunningGroupWithLiveWorktreeAlone],
-	["wait reconciles a stale-but-reconcilable group promptly", testWaitReconcilesStaleGroupPromptly],
+	["wait reconciles a stale-but-reconcilable group promptly (and persists without a watcher)", testWaitReconcilesStaleGroupPromptly],
+	["wait does NOT persist reconcile while a watcher heartbeat is fresh (issue #116)", testWaitDoesNotPersistReconcileWhenWatcherHeartbeatFresh],
+	["wait persists reconcile again once the watcher heartbeat is stale", testWaitPersistsWhenWatcherHeartbeatStale],
+	["wait persists a mid-wait reconcile with no watcher (issue #116 rework)", testWaitPersistsMidWaitReconcileWithNoWatcher],
+	["wait never persists mid-wait reconcile with a live watcher (issue #116 rework 2)", testWaitMidWaitReconcileWithLiveWatcherDoesNotPersist],
 	["wait treats orphaned as terminal and returns promptly", testWaitTreatsOrphanedAsTerminal],
 ]
 

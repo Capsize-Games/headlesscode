@@ -17,6 +17,20 @@
  * This closes the gap where a direct-path round (spawn-parallel-worktrees.sh,
  * no watcher) left group entries stuck on "running" forever.
  *
+ * Issue #116: the --wait form NEVER persists its reconciliation while a live
+ * watcher owns the state (watchGroups' heartbeat file under
+ * `<statePath>.watcher` is fresh AND written by a DIFFERENT process — the
+ * wait never writes that file itself, so its own PID can never masquerade as
+ * a live watcher; the different-PID check exists so a watcher-less wait
+ * keeps its persist-through behavior instead of locking itself out from its
+ * second poll onward) — it reconciles in-memory for terminality checks only.
+ * Persisting there would pre-empt the watcher, which then short-circuits the
+ * group as already-terminal and silently skips log analysis + the automated
+ * review pass. The one-shot form (and --wait against a watcher-less round)
+ * keeps the persist-through behavior: for a direct-path round with no
+ * watcher, `status` is the state file's only writer and must patch stale
+ * entries back.
+ *
  * Two forms:
  *   - one-shot: print a compact per-group summary (or the reconciled state
  *     with --json) and exit.
@@ -40,7 +54,14 @@ import * as path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 
 import type { CleanupStatus } from "./cleanup.js"
-import { defaultState, loadStateSync, updateGroup, type OrchestratorGroup, type OrchestratorState } from "./state.js"
+import {
+	defaultState,
+	loadStateSync,
+	saveStateSync,
+	updateGroup,
+	type OrchestratorGroup,
+	type OrchestratorState,
+} from "./state.js"
 import { DEFAULT_POLL_INTERVAL_MS, DEFAULT_STALL_TIMEOUT_MS, groupWorktreePath } from "./watch.js"
 
 /**
@@ -513,10 +534,11 @@ export async function waitForTerminalState(
 	const reconciledSeen = new Set<string>()
 
 	// Apply read-side reconciliation to a freshly-read state and record any
-	// patched group names (deduped across polls).
-	const applyReconcile = (s: OrchestratorState): OrchestratorState => {
+	// patched group names (deduped across polls). Returns the ReconcileResult
+	// (state + names patched) so callers can decide whether to persist.
+	const applyReconcile = (s: OrchestratorState): ReconcileResult => {
 		if (!opts.reconcile) {
-			return s
+			return { state: s, reconciled: [] }
 		}
 		const result = opts.reconcile(s)
 		for (const name of result.reconciled) {
@@ -525,12 +547,78 @@ export async function waitForTerminalState(
 				reconciled.push(name)
 			}
 		}
+		return result
+	}
+
+	// The 2026-08-18 bug (issue #116): a `status --wait` running CONCURRENTLY
+	// with a live orchestrate round used to persist its read-side
+	// reconciliation straight back to the shared state file. The watcher's
+	// next poll then loaded the group as already-terminal and short-circuited
+	// on it — log analysis and the automated review pass never fired (groups
+	// w13/w14 settled as "done" with review_verdict/log_analysis absent).
+	// The watcher is the only process that owns review/QA/continuation
+	// workflows; a read-side `status` must never pre-empt it.
+	//
+	// Watcher heartbeat: the live watching process (watchGroups, watch.ts)
+	// stamps its own PID under <statePath>.watcher (a plain file write, no
+	// lock — the point is not exclusivity but honesty: if the watcher wrote
+	// the file RECENTLY, it is alive and owns the state). The wait NEVER
+	// writes this file itself — a wait's own PID must never masquerade as a
+	// live watcher (rework cycle 2 finding: be11a6d reintroduced the exact
+	// #116 pre-emption bug by stamping the wait's PID every poll, clobbering
+	// the real watcher's fresh heartbeat and unlocking the persist). A round
+	// with no watcher at all (direct-path spawn-parallel-worktrees.sh rounds,
+	// which `status` exists to reconcile for) leaves no heartbeat file, so
+	// the wait keeps its persist-through behavior in that case.
+	//
+	// Staleness is measured against the WATCHER's heartbeat cadence
+	// (DEFAULT_POLL_INTERVAL_MS — the watcher stamps the file once per poll),
+	// NOT this wait's own poll interval: a --wait polled faster than the
+	// watcher (e.g. --poll-interval-ms 1000 against a 5s watcher) must not
+	// declare the watcher dead between the watcher's refreshes, or it would
+	// unlock the exact #116 persist again (rework cycle 2 finding: the
+	// rework-2 mid-wait test with a 25ms poll exposed this — 3×25ms expired
+	// before the live watcher's 5s heartbeat had refreshed).
+	const WATCHER_STALENESS_MS = 3 * DEFAULT_POLL_INTERVAL_MS
+
+	const liveWatcher = (): boolean => {
+		try {
+			const stat = fs.statSync(`${statePath}.watcher`)
+			if (Date.now() - stat.mtimeMs >= WATCHER_STALENESS_MS) {
+				return false
+			}
+			// The heartbeat file must carry a DIFFERENT process's PID to
+			// count: a wait must never mistake its own earlier write for a
+			// live watcher (the reviewer's finding on the first #116 fix).
+			const pid = Number(fs.readFileSync(`${statePath}.watcher`, "utf-8"))
+			return Number.isFinite(pid) && pid !== process.pid
+		} catch {
+			return false
+		}
+	}
+
+	// A single reconcile pass: apply the hook, and ONLY persist when no
+	// live watcher owns the state file (see liveWatcher above). Never
+	// persisted while a watch loop is running — that is exactly the race
+	// #116 fixes (the watcher's next poll would short-circuit the group as
+	// already-terminal and silently skip log analysis + the automated
+	// review).
+	const reconcilePass = (s: OrchestratorState): OrchestratorState => {
+		const result = applyReconcile(s)
+		if (result.reconciled.length > 0 && !liveWatcher()) {
+			try {
+				saveStateSync(statePath, result.state)
+			} catch {
+				// A read-side reconcile must never crash the wait; the next
+				// poll re-attempts.
+			}
+		}
 		return result.state
 	}
 
 	let state = readTolerant()
 	if (state !== null) {
-		state = applyReconcile(state)
+		state = reconcilePass(state)
 	}
 
 	// Previously-seen status per group, seeded from the FIRST reconciled
@@ -587,7 +675,7 @@ export async function waitForTerminalState(
 		}
 		if (Date.now() >= deadline) {
 			let finalState = readTolerant() ?? state ?? defaultState()
-			finalState = applyReconcile(finalState)
+			finalState = reconcilePass(finalState)
 			// The final read can observe a transition that landed right at the
 			// deadline — report it before returning the timed-out result.
 			await notifyTerminal(finalState.groups)
@@ -596,7 +684,7 @@ export async function waitForTerminalState(
 		await sleep(pollIntervalMs)
 		state = readTolerant()
 		if (state !== null) {
-			state = applyReconcile(state)
+			state = reconcilePass(state)
 			await notifyTerminal(state.groups)
 		}
 	}

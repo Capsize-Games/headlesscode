@@ -619,6 +619,24 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 
 	const writeStderr = options.stderrWriter ?? ((text: string) => process.stderr.write(text))
 
+	// Watcher heartbeat (issue #116): stamp <statePath>.watcher with our PID
+	// at the same cadence as the poll loop. A concurrent read-side `status
+	// --wait` (status.ts) checks this file's freshness to decide whether a
+	// live watch loop owns the state — when it does, the status call must NOT
+	// persist its read-side reconciliation (that would pre-empt this loop,
+	// which then short-circuits the group as already-terminal and silently
+	// skips log analysis + the automated review). Best-effort: a heartbeat
+	// write failure must never crash the watcher.
+	const heartbeatPath = `${statePath}.watcher`
+	const heartbeat = (): void => {
+		try {
+			fs.writeFileSync(heartbeatPath, String(process.pid))
+		} catch {
+			// Best-effort — see above.
+		}
+	}
+	heartbeat()
+
 	// Previously-seen status per group, seeded from the loaded state: the
 	// loop only prints a status-change line on a genuine transition, so a
 	// group that stays blocked/running across polls never re-spams it.
@@ -728,6 +746,10 @@ export async function watchGroups(options: WatchOptions): Promise<WatchSummary> 
 		if (options.signal?.aborted) {
 			break
 		}
+		// Refresh the watcher heartbeat FIRST so a concurrently-running
+		// `status --wait` (status.ts) sees this loop as alive before it
+		// considers persisting its own read-side reconciliation.
+		heartbeat()
 		// Reload fresh from disk every pass rather than trusting the loop's
 		// in-memory `state`: a concurrently in-flight onGroupUpdate call (see
 		// inFlightCallbacks above) writes review/QA patches and rework/

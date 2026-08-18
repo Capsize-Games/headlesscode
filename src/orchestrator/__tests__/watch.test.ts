@@ -513,6 +513,46 @@ async function testWatchGroupsRunsReviewForMultipleGroupsConcurrently(): Promise
 	}
 }
 
+/**
+ * Issue #116: the watcher writes a heartbeat file (<statePath>.watcher) at
+ * poll cadence so a concurrent read-side `status --wait` can tell a live
+ * watch loop owns the state and must NOT persist its own read-side
+ * reconciliation. The heartbeat must exist before the first poll pass.
+ */
+async function testWatchGroupsWritesWatcherHeartbeat(): Promise<void> {
+	const repoRoot = await tmpRepo()
+	try {
+		const wtPath = path.join(repoRoot, ".worktrees", "w1")
+		await fs.mkdir(wtPath, { recursive: true })
+		const statePath = path.join(repoRoot, ".worktrees", ".orchestrator-state.json")
+		saveStateSync(statePath, { ...defaultState("round-1"), groups: [baseGroup()] })
+		await fs.mkdir(path.join(wtPath, ".harness.done"))
+		await fs.writeFile(path.join(wtPath, ".harness.exit"), "0", "utf-8")
+
+		const heartbeatPath = `${statePath}.watcher`
+		const controller = new AbortController()
+		await watchGroups({
+			repoRoot,
+			statePath,
+			pollIntervalMs: 20,
+			stderrWriter: () => {},
+			reviewEnabled: false,
+			// Stop the loop once the heartbeat has been observed and the group
+			// has reached done (otherwise it loops forever).
+			onGroupUpdate: async () => {
+				controller.abort()
+			},
+			signal: controller.signal,
+		})
+
+		const stat = await fs.stat(heartbeatPath)
+		assert.ok(stat.isFile(), "heartbeat file exists")
+		assert.ok(Date.now() - stat.mtimeMs < 60_000, "heartbeat was written recently (this run)")
+	} finally {
+		await fs.rm(repoRoot, { recursive: true, force: true })
+	}
+}
+
 async function testWatchGroupsPrintsFailedTransitionToStderr(): Promise<void> {
 	const repoRoot = await tmpRepo()
 	try {
@@ -908,6 +948,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["watchGroups: waits for review before recording cost, then includes the review session's own usage", testWatchGroupsWaitsForReviewBeforeRecordingCost],
 	["watchGroups: runs review for multiple groups concurrently, not serialized (issue #24)", testWatchGroupsRunsReviewForMultipleGroupsConcurrently],
 	["watchGroups: FAILED line printed on the transition to failed", testWatchGroupsPrintsFailedTransitionToStderr],
+	["watchGroups: writes the watcher heartbeat file at poll cadence (issue #116)", testWatchGroupsWritesWatcherHeartbeat],
 	["isIterationExhaustion matches the exact max-iterations error", testIsIterationExhaustionMatchesExactError],
 	["isIterationExhaustion rejects budget/real failures and empty summaries", testIsIterationExhaustionRejectsOtherFailures],
 	["isProviderFailure matches provider 5xx/429/no-allowed-providers/network-error shapes", testIsProviderFailureMatchesKnownShapes],

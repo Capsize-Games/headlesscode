@@ -12,9 +12,12 @@ import type { SplitIssue, WorktreeSpec } from "../split.js"
 import {
 	aggregateByShape,
 	buildEstimateSection,
+	CI_CONFIG_HIGHER_BOUND_MULTIPLIER,
 	estimateGroups,
 	estimateIssue,
+	isCiConfigChange,
 	isVerificationHeavy,
+	lowConfidenceReason,
 	MIN_SHAPE_SAMPLES,
 	TEST_SHAPE_VERIFICATION_MULTIPLIER,
 	VERIFICATION_MULTIPLIER_FULL_SAMPLES,
@@ -339,6 +342,170 @@ async function testBuildEstimateSectionNoHistoryForShape(): Promise<void> {
 	assert.match(lines[0] ?? "", /no history for this shape yet/)
 }
 
+// ─── Issue #125: CI/config-change higher bound ───────────────────────────────
+
+async function testIsCiConfigChangeMatchesTitleAndBody(): Promise<void> {
+	assert.ok(isCiConfigChange(issue(1, "Add CI workflow for tests")), "title 'CI workflow'")
+	assert.ok(isCiConfigChange(issue(2, "Fix the GitHub Actions runner config")), "title 'Actions runner'")
+	assert.ok(
+		isCiConfigChange(issue(3, "Bump deps", "The workflow file at .github/workflows/ci.yml needs updating")),
+		"body 'workflow'",
+	)
+	assert.ok(!isCiConfigChange(issue(4, "Refactor user auth")), "plain refactor")
+	assert.ok(!isCiConfigChange(issue(5, "Handle transactions safely")), "'transactions' contains 'actions' but is not CI")
+}
+
+async function testCiConfigIssueGetsFlaggedHigherBound(): Promise<void> {
+	// 3 split records: the CI issue's shape estimate is a normal per-issue
+	// median; its flagged higher bound is that median * multiplier, and the
+	// group total's higher bound replaces the CI issue's contribution. The
+	// title keeps the "split" shape ("Split ... actions ...") so it matches
+	// the split records and trips CI_CONFIG_RE (\bactions\b) WITHOUT also
+	// tripping CI_MENTION_RE's verification-heavy signal (issue #124), which
+	// requires "github actions"/"ci"/"workflow"/"runner" as a unit — this
+	// isolates the #125 flagged-bound behavior from the #124 cost multiplier
+	// so the two independently-stacking features can each be tested alone.
+	const records = [
+		record({ groupName: "a", issues: [100], shapes: ["split"], costUsd: 0.2, iterations: 40 }),
+		record({ groupName: "b", issues: [101], shapes: ["split"], costUsd: 0.3, iterations: 50 }),
+		record({ groupName: "c", issues: [102], shapes: ["split"], costUsd: 0.4, iterations: 60 }),
+	]
+	const issues = [issue(29, "Split the release actions into modules")]
+	const groups = estimateGroups(records, [spec("w1", [29])], issues)
+	const g = groups[0]
+	const perIssue = g?.perIssue[0]
+	assert.equal(perIssue?.ciConfig, true, "CI/config issue is flagged")
+	assert.equal(perIssue?.costPerIssueUsd, 0.3, "plain shape estimate is still the split median")
+	assertClose(
+		perIssue?.higherBoundUsd ?? 0,
+		0.3 * CI_CONFIG_HIGHER_BOUND_MULTIPLIER,
+		"per-issue higher bound = median * multiplier",
+	)
+	assertClose(g?.higherBoundUsd ?? 0, 0.3 * CI_CONFIG_HIGHER_BOUND_MULTIPLIER, "group higher bound rolls the flagged issue in")
+	assert.equal(g?.expectedCostUsd, 0.3, "expectedCostUsd stays the plain median")
+}
+
+async function testCiConfigHigherBoundMixesWithNonCiIssues(): Promise<void> {
+	// One CI issue + one plain issue: the group higher bound = CI bound +
+	// plain median; the plain expected total is the sum of both medians.
+	const records = [
+		record({ groupName: "a", issues: [100], shapes: ["split"], costUsd: 0.2, iterations: 40 }),
+		record({ groupName: "b", issues: [101], shapes: ["split"], costUsd: 0.3, iterations: 50 }),
+		record({ groupName: "c", issues: [102], shapes: ["split"], costUsd: 0.4, iterations: 60 }),
+	]
+	const issues = [issue(29, "Split the release actions into modules"), issue(36, "Split the big file into modules")]
+	const groups = estimateGroups(records, [spec("w1", [29, 36])], issues)
+	const g = groups[0]
+	assertClose(g?.expectedCostUsd ?? 0, 0.6, "both medians sum into the plain total")
+	assertClose(
+		g?.higherBoundUsd ?? 0,
+		0.3 * CI_CONFIG_HIGHER_BOUND_MULTIPLIER + 0.3,
+		"CI issue contributes its higher bound, the plain issue its median",
+	)
+}
+
+async function testBuildEstimateSectionShowsCiHigherBound(): Promise<void> {
+	const records = [
+		record({ groupName: "a", issues: [100], shapes: ["split"], costUsd: 0.2, iterations: 40 }),
+		record({ groupName: "b", issues: [101], shapes: ["split"], costUsd: 0.3, iterations: 50 }),
+		record({ groupName: "c", issues: [102], shapes: ["split"], costUsd: 0.4, iterations: 60 }),
+	]
+	const issues = [issue(29, "Split the release actions into modules")]
+	const groups = estimateGroups(records, [spec("w1", [29])], issues)
+	const lines = buildEstimateSection(groups, records.length)
+	assert.ok(
+		lines.some((l) => l.includes("CI/config work: higher bound ~$0.9000")),
+		`higher bound rendered on the estimate line: ${lines.join(" | ")}`,
+	)
+}
+
+// ─── Issue #126: LOW-CONFIDENCE warnings ─────────────────────────────────────
+
+async function testLowConfidenceFlaggedWhenIssuesUnmatched(): Promise<void> {
+	const records = [
+		record({ groupName: "a", issues: [100], shapes: ["split"], costUsd: 0.2, iterations: 40 }),
+		record({ groupName: "b", issues: [101], shapes: ["split"], costUsd: 0.3, iterations: 50 }),
+		record({ groupName: "c", issues: [102], shapes: ["split"], costUsd: 0.4, iterations: 60 }),
+	]
+	const issues = [issue(29, "Split the big file"), issue(12, "Add docs for the API")]
+	const groups = estimateGroups(records, [spec("w1", [29, 12])], issues)
+	const g = groups[0]
+	assert.equal(g?.unmatched, 1)
+	assert.equal(g?.lowConfidence, true, "an unmatched issue's excluded cost makes the total low-confidence")
+	assert.match(lowConfidenceReason(g), /1 issue\(s\) unmatched/)
+	const lines = buildEstimateSection(groups, records.length)
+	assert.ok(
+		lines.some((l) => l.includes("⚠ LOW-CONFIDENCE") && l.includes("unmatched")),
+		`unmatched low-confidence rendered: ${lines.join(" | ")}`,
+	)
+}
+
+async function testLowConfidenceFlaggedOnNoHistoryForShape(): Promise<void> {
+	const records = [record({ groupName: "a", issues: [100], shapes: ["split"], costUsd: 0.2, iterations: 40 })]
+	const issues = [issue(12, "Add docs for the API")]
+	const groups = estimateGroups(records, [spec("w1", [12])], issues)
+	const g = groups[0]
+	assert.equal(g?.lowConfidence, true, "no usable history -> low-confidence")
+	assert.match(lowConfidenceReason(g), /no history for this shape yet/)
+	const lines = buildEstimateSection(groups, records.length)
+	assert.ok(
+		lines.some((l) => l.includes("⚠ LOW-CONFIDENCE") && l.includes("no history")),
+		`no-history low-confidence rendered: ${lines.join(" | ")}`,
+	)
+}
+
+async function testLowConfidenceFlaggedOnInsufficientSamples(): Promise<void> {
+	const records = [
+		record({ groupName: "a", issues: [100], shapes: ["split"], costUsd: 0.2, iterations: 40 }),
+		record({ groupName: "b", issues: [101], shapes: ["split"], costUsd: 0.3, iterations: 50 }),
+	]
+	const issues = [issue(29, "Split the big file into modules")]
+	const groups = estimateGroups(records, [spec("w1", [29])], issues)
+	const g = groups[0]
+	assert.equal(g?.lowConfidence, true, "2 samples < MIN_SHAPE_SAMPLES -> low-confidence")
+	assert.match(lowConfidenceReason(g), /insufficient history/)
+	const lines = buildEstimateSection(groups, records.length)
+	assert.ok(
+		lines.some((l) => l.includes("⚠ LOW-CONFIDENCE")),
+		`insufficient-samples low-confidence rendered: ${lines.join(" | ")}`,
+	)
+}
+
+async function testLowConfidenceNotFlaggedWithEnoughSamples(): Promise<void> {
+	const records = [
+		record({ groupName: "a", issues: [100], shapes: ["split"], costUsd: 0.2, iterations: 40 }),
+		record({ groupName: "b", issues: [101], shapes: ["split"], costUsd: 0.3, iterations: 50 }),
+		record({ groupName: "c", issues: [102], shapes: ["split"], costUsd: 0.4, iterations: 60 }),
+	]
+	const issues = [issue(29, "Split the big file into modules")]
+	const groups = estimateGroups(records, [spec("w1", [29])], issues)
+	const g = groups[0]
+	assert.equal(g?.lowConfidence, false, "3 samples, all matched -> solid estimate")
+	const lines = buildEstimateSection(groups, records.length)
+	assert.ok(
+		!lines.some((l) => l.includes("LOW-CONFIDENCE")),
+		`no LOW-CONFIDENCE marker on a solid estimate: ${lines.join(" | ")}`,
+	)
+}
+
+async function testLowConfidenceFlaggedOnUnderSampledDirectMatch(): Promise<void> {
+	// A direct issue-number match with a SINGLE record is offered (it IS
+	// meaningful) but is an anecdote — low-confidence (issue #126).
+	const records = [
+		record({ groupName: "past", issues: [7], shapes: ["split"], costUsd: 0.5, iterations: 70 }),
+		record({ groupName: "a", issues: [100], shapes: ["split"], costUsd: 0.2, iterations: 40 }),
+		record({ groupName: "b", issues: [101], shapes: ["split"], costUsd: 0.3, iterations: 50 }),
+		record({ groupName: "c", issues: [102], shapes: ["split"], costUsd: 0.4, iterations: 60 }),
+	]
+	const issues = [issue(7, "Re-open: add a CI workflow (was split before)")]
+	const groups = estimateGroups(records, [spec("w1", [7])], issues)
+	const g = groups[0]
+	assert.equal(g?.perIssue[0]?.match, "direct")
+	assert.equal(g?.perIssue[0]?.samples, 1)
+	assert.equal(g?.lowConfidence, true, "single-record direct match is low-confidence")
+	assert.match(lowConfidenceReason(g), /single-run anecdote/)
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -360,6 +527,15 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["buildEstimateSection: sufficient data -> expected range + rates", testBuildEstimateSectionSufficientData],
 	["buildEstimateSection: sparse data -> explicit insufficient-data note", testBuildEstimateSectionInsufficientData],
 	["buildEstimateSection: unrelated shapes -> no-history-for-this-shape note", testBuildEstimateSectionNoHistoryForShape],
+	["isCiConfigChange matches CI/actions/workflow/runner in title+body, rejects lookalikes", testIsCiConfigChangeMatchesTitleAndBody],
+	["CI/config issue gets a flagged higher bound (per-issue and group, #125)", testCiConfigIssueGetsFlaggedHigherBound],
+	["CI/config higher bound mixes with plain issues in the group total (#125)", testCiConfigHigherBoundMixesWithNonCiIssues],
+	["buildEstimateSection renders the CI higher bound on the estimate line (#125)", testBuildEstimateSectionShowsCiHigherBound],
+	["LOW-CONFIDENCE flagged + rendered when issues are unmatched (#126)", testLowConfidenceFlaggedWhenIssuesUnmatched],
+	["LOW-CONFIDENCE flagged + rendered when no history for the shape (#126)", testLowConfidenceFlaggedOnNoHistoryForShape],
+	["LOW-CONFIDENCE flagged + rendered when samples < MIN_SHAPE_SAMPLES (#126)", testLowConfidenceFlaggedOnInsufficientSamples],
+	["no LOW-CONFIDENCE marker when the estimate is solid (#126)", testLowConfidenceNotFlaggedWithEnoughSamples],
+	["LOW-CONFIDENCE flagged on an under-sampled direct match (#126)", testLowConfidenceFlaggedOnUnderSampledDirectMatch],
 ]
 
 async function main(): Promise<void> {

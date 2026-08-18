@@ -2029,16 +2029,14 @@ export async function statusMain(argv: string[], io: StatusIo = {}): Promise<num
 		const result = await waitForTerminalState(statePath, {
 			timeoutMs: options.timeoutMs,
 			pollIntervalMs: options.pollIntervalMs,
-			// Reconcile on EVERY poll (a group can finish mid-wait), persisting
-			// any patch straight back to the state file so the next poll reads
-			// the reconciled truth.
-			reconcile: (state) => {
-				const r = reconcileGroups(state, repo)
-				if (r.reconciled.length > 0) {
-					saveStateSync(statePath, r.state)
-				}
-				return r
-			},
+			// Reconcile on EVERY poll (a group can finish mid-wait). The
+			// hook reports the patch; waitForTerminalState persists it ONLY
+			// when no live watcher owns the state file (issue #116: a
+			// concurrent `status --wait` persisting its read-side reconcile
+			// pre-empted the watcher, which then short-circuited the group
+			// and silently skipped log analysis + the automated review —
+			// see waitForTerminalState's live-watcher heartbeat check).
+			reconcile: (state) => reconcileGroups(state, repo),
 			onGroupTerminal: hookCmd ? (group) => runGroupTerminalHook(hookCmd, group, writeErr) : undefined,
 		})
 		const summary = buildStatusSummary(result.state)

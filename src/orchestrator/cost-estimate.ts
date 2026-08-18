@@ -30,6 +30,23 @@
  * median of a verification-heavy shape is not trusted as-is while its
  * samples are thin (see TEST_SHAPE_VERIFICATION_MULTIPLIER).
  *
+ * Flagged CI/config higher bound (issue #125): complementary to the
+ * verification multiplier above, but a SEPARATE mechanism — an issue whose
+ * title/body itself names CI/config work (CI_CONFIG_RE) gets an additional
+ * flagged higher-bound estimate (its per-issue median times
+ * CI_CONFIG_HIGHER_BOUND_MULTIPLIER, rolled into the group's higherBoundUsd)
+ * surfaced alongside — not instead of — the primary cost estimate, since
+ * CI/test-infrastructure work historically costs 2-3x its shape median and
+ * the plain shape estimate under-predicted rounds containing it
+ * (round-2026-08-17: ~$0.79 estimated vs ~$2.09 actual).
+ *
+ * Issue #126: every group estimate carries a lowConfidence flag, set when
+ * the estimate is built on thin or missing history (unmatched issues whose
+ * cost is excluded from the total, an under-sampled direct match, or no
+ * usable history at all) — buildEstimateSection renders it as a prominent
+ * LOW-CONFIDENCE marker so preflight output can't present an unreliable
+ * total as if it were solid.
+ *
  * Pure functions (no fs, no network) — fully unit-testable; the only I/O is
  * readCostHistory() at the call site (cli.ts's dry-run).
  */
@@ -42,7 +59,8 @@ import { issueShape, type SplitIssue, type WorktreeSpec } from "./split.js"
  * estimate is offered. Below this the estimate is suppressed in favor of an
  * explicit "insufficient data" note. Exact issue-number matches (direct
  * history of the SAME task) are exempt — one record of the very task being
- * estimated is meaningful on its own.
+ * estimated is meaningful on its own (though it counts as LOW-CONFIDENCE,
+ * issue #126 — see estimateGroup).
  */
 export const MIN_SHAPE_SAMPLES = 3
 
@@ -67,6 +85,29 @@ export const VERIFICATION_MULTIPLIER_FULL_SAMPLES = 6
 /** CI/GitHub Actions mention in an issue's title/body — a signal that its
  * remediation is verification-heavy (real runner round-trips dominate cost). */
 const CI_MENTION_RE = /(github\s*actions|\bci\b|workflow|runner|continuous\s+integration)/i
+
+/**
+ * CI/config-change keyword scan (issue #125). Matched against an issue's
+ * title AND body; `\b` guards around "ci"/"actions" keep false positives
+ * out ("transactions" contains "actions" but is not CI work — the observed
+ * 2026-08-17 under-prediction was specifically rounds touching GitHub
+ * Actions/workflow config, e.g. w13's `test/hot` group for issues #62/#90/
+ * #98 which added .github/workflows and forced real runner round-trips).
+ */
+export const CI_CONFIG_RE = /(\bci\b|workflow|\bactions\b|runner)/i
+
+/**
+ * The flagged higher-bound multiplier for a CI/config-changing issue
+ * (issue #125): round-2026-08-17's preflight under-predicted rounds
+ * containing CI/test-infrastructure work by 2-3x (~$0.79 estimated vs
+ * ~$2.09 actual), so the higher bound uses the top of that observed range.
+ */
+export const CI_CONFIG_HIGHER_BOUND_MULTIPLIER = 3
+
+/** Whether an issue touches CI/config (title or body — see CI_CONFIG_RE). */
+export function isCiConfigChange(issue: SplitIssue): boolean {
+	return CI_CONFIG_RE.test(`${issue.title}\n${issue.body ?? ""}`)
+}
 
 /** Per-shape aggregate over recorded history (one per distinct shape seen). */
 export interface ShapeStats {
@@ -121,6 +162,18 @@ export interface IssueEstimate {
 	 * match (a direct record of the very task is trusted as-is).
 	 */
 	verificationMultiplier?: number
+	/**
+	 * The issue touches CI/config (title/body matches CI_CONFIG_RE, issue
+	 * #125). CI work historically costs 2-3x its shape median — see
+	 * higherBoundUsd.
+	 */
+	ciConfig?: boolean
+	/**
+	 * Flagged higher-bound per-issue cost for a CI/config change:
+	 * costPerIssueUsd * CI_CONFIG_HIGHER_BOUND_MULTIPLIER. Only present when
+	 * the issue is a CI/config change AND has usable history (issue #125).
+	 */
+	higherBoundUsd?: number
 }
 
 /** A whole dry-run group's estimate — the sum of its issues' per-issue estimates. */
@@ -152,6 +205,20 @@ export interface GroupEstimate {
 	 * scale the displayed cost.
 	 */
 	verificationMultiplier?: number
+	/**
+	 * Issue #125: the flagged higher-bound group total — CI/config-changing
+	 * issues contribute their higherBoundUsd, everything else its plain
+	 * median. Only present when at least one usable CI/config issue exists.
+	 */
+	higherBoundUsd?: number
+	/**
+	 * Issue #126: the estimate is built on thin or missing history —
+	 * unmatched issues (their cost is silently excluded from the total), a
+	 * usable-but-under-sampled direct match (fewer than MIN_SHAPE_SAMPLES
+	 * records of the same task), or NO usable history at all. Preflight
+	 * renders this as a prominent LOW-CONFIDENCE marker.
+	 */
+	lowConfidence: boolean
 }
 
 function median(values: number[]): number {
@@ -307,12 +374,13 @@ function issueEstimateFrom(
 	const [costLo, costMed, costHi] = minMedMax(records.map(perIssueCost))
 	const [iterLo, iterMed, iterHi] = minMedMax(records.map(perIssueIterations))
 	const multiplier = verificationMultiplier(shape, issue, match, records.length)
-	return {
+	const costPerIssueUsd = costMed * multiplier
+	const estimate: IssueEstimate = {
 		issue: issueNumber,
 		shape,
 		match,
 		samples: records.length,
-		costPerIssueUsd: costMed * multiplier,
+		costPerIssueUsd,
 		costPerIssueRangeUsd: [costLo * multiplier, costHi * multiplier],
 		iterationsPerIssue: iterMed,
 		iterationsPerIssueRange: [iterLo, iterHi],
@@ -320,6 +388,15 @@ function issueEstimateFrom(
 		reworkRate: mean(records.map((r) => r.reworkCount ?? 0)),
 		verificationMultiplier: multiplier,
 	}
+	// Issue #125: flag the CI/config issue and stamp its higher bound (the
+	// per-issue median, multiplied) — a separate, complementary signal to
+	// the verification multiplier above, which scales the primary estimate;
+	// this instead surfaces an additional flagged higher-bound alongside it.
+	if (issue !== undefined && isCiConfigChange(issue)) {
+		estimate.ciConfig = true
+		estimate.higherBoundUsd = costPerIssueUsd * CI_CONFIG_HIGHER_BOUND_MULTIPLIER
+	}
+	return estimate
 }
 
 function sum(values: number[]): number {
@@ -342,6 +419,13 @@ export function estimateGroup(spec: WorktreeSpec, perIssue: IssueEstimate[]): Gr
 		shapes: [...new Set(perIssue.map((e) => e.shape))],
 		perIssue,
 		unmatched: perIssue.length - usable.length,
+		// Issue #126: a usable DIRECT match with fewer than MIN_SHAPE_SAMPLES
+		// records of the same task is still an anecdote, not a real estimate
+		// (estimateIssue offers it because one record of the very task IS
+		// meaningful, but its confidence is low).
+		lowConfidence: perIssue.some(
+			(e) => e.costPerIssueUsd === undefined || (e.match === "direct" && e.samples < MIN_SHAPE_SAMPLES),
+		),
 	}
 	// Only a multiplier that actually scaled a USABLE estimate (one that
 	// contributes to expectedCostUsd) is surfaced — a multiplier recorded on
@@ -352,6 +436,20 @@ export function estimateGroup(spec: WorktreeSpec, perIssue: IssueEstimate[]): Gr
 		.filter((m) => m > 1)
 	if (multipliers.length > 0) {
 		estimate.verificationMultiplier = Math.max(...multipliers)
+	}
+	// Issue #125: flagged higher-bound total — CI/config-changing issues
+	// historically cost 2-3x their shape median (round-2026-08-17: w13
+	// `test/hot` estimated ~$0.05-$0.27, actual $1.03 then $1.11 with
+	// review). Emit it whenever at least one usable CI/config issue exists.
+	const ciUsable = usable.filter((e) => e.ciConfig === true)
+	if (ciUsable.length > 0) {
+		estimate.higherBoundUsd = sum(
+			usable.map((e) =>
+				e.ciConfig === true
+					? (e.higherBoundUsd ?? e.costPerIssueUsd ?? 0)
+					: (e.costPerIssueUsd ?? 0),
+			),
+		)
 	}
 	if (usable.length > 0) {
 		estimate.expectedCostUsd = sum(costs)
@@ -416,6 +514,12 @@ export function buildEstimateSection(estimates: GroupEstimate[], historyRecordCo
 			if (group.unmatched > 0) {
 				line += ` (${group.unmatched} issue(s) unmatched)`
 			}
+			// Issue #125: CI/config-changing issues historically cost 2-3x
+			// their shape median — surface the flagged higher bound right on
+			// the estimate line instead of burying it in a footnote.
+			if (group.higherBoundUsd !== undefined) {
+				line += ` · CI/config work: higher bound ~${formatUsd(group.higherBoundUsd)}`
+			}
 			lines.push(line)
 			lines.push(
 				`       continuation/rework: ${formatRate(group.continuationRate)} / ${formatRate(group.reworkRate)} cycles per group avg`,
@@ -431,6 +535,30 @@ export function buildEstimateSection(estimates: GroupEstimate[], historyRecordCo
 				lines.push(`${group.name} (issues ${issuesLabel} — ${shapeLabel}): no history for this shape yet`)
 			}
 		}
+		// Issue #126: prominent LOW-CONFIDENCE marker whenever the estimate
+		// is built on thin or missing history (unmatched issues, an
+		// under-sampled direct match, or no usable history at all).
+		if (group.lowConfidence) {
+			lines.push(`       ⚠ LOW-CONFIDENCE: ${lowConfidenceReason(group)}`)
+		}
 	}
 	return lines
+}
+
+/** Human-readable reason behind a group's low-confidence flag (issue #126). */
+export function lowConfidenceReason(group: GroupEstimate): string {
+	if (group.expectedCostUsd === undefined) {
+		const withData = group.perIssue.filter((e) => e.match !== "none")
+		return withData.length > 0
+			? `insufficient history (${Math.max(...withData.map((e) => e.samples))} sample(s), need ${MIN_SHAPE_SAMPLES}) — no numeric estimate`
+			: "no history for this shape yet"
+	}
+	if (group.unmatched > 0) {
+		return `${group.unmatched} issue(s) unmatched (their cost is NOT included in the estimate)`
+	}
+	const underSampled = group.perIssue.find((e) => e.match === "direct" && e.samples < MIN_SHAPE_SAMPLES)
+	if (underSampled) {
+		return `direct history for issue ${underSampled.issue} is a single-run anecdote (${underSampled.samples} sample(s), need ${MIN_SHAPE_SAMPLES})`
+	}
+	return "estimate relies on thin history"
 }
