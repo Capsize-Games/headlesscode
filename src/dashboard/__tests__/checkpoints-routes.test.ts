@@ -81,8 +81,10 @@ async function postJson(
 	return { status: res.status, body }
 }
 
-async function getJson(base: string, urlPath: string): Promise<{ status: number; body: unknown }> {
-	const res = await fetch(base + urlPath)
+async function getJson(base: string, urlPath: string, token?: string): Promise<{ status: number; body: unknown }> {
+	const headers: Record<string, string> = {}
+	if (token) headers.authorization = `Bearer ${token}`
+	const res = await fetch(base + urlPath, { headers })
 	const text = await res.text()
 	let body: unknown
 	try {
@@ -264,9 +266,17 @@ async function testRestoreRequiresBearerTokenWhenConfigured(): Promise<void> {
 			const goodAuth = await postJson(base, urlPath, { hash: baselineHash }, "sekret")
 			assert.equal(goodAuth.status, 200)
 
-			// GET routes stay open (read-only is unaffected by the token).
-			const list = await getJson(base, `/api/checkpoints?repo=${encodeURIComponent(workspace)}&session=session-1`)
-			assert.equal(list.status, 200)
+			// GET routes are gated by the same token too (SEC-7 — a GET route
+			// that reads checkpoint data is exactly the DNS-rebinding/localhost
+			// -CSRF surface the token exists to close).
+			const listNoAuth = await getJson(base, `/api/checkpoints?repo=${encodeURIComponent(workspace)}&session=session-1`)
+			assert.equal(listNoAuth.status, 401)
+			const listAuthed = await getJson(
+				base,
+				`/api/checkpoints?repo=${encodeURIComponent(workspace)}&session=session-1`,
+				"sekret",
+			)
+			assert.equal(listAuthed.status, 200)
 		} finally {
 			server.close()
 		}

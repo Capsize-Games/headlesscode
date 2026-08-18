@@ -30,6 +30,14 @@ npm run typecheck    # npx tsc --noEmit
 
 `node >= 18` is required (see `engines` in `package.json`).
 
+**Optional: the `browser_action` tool's tests.** `src/tools/__tests__/browser-action.test.ts`
+launches a real headless Chromium via Playwright. `npm install` only installs
+the `playwright` npm package, not the browser binary itself — run
+`npx playwright install chromium` once to enable those tests. Without it, the
+suite detects the missing binary, prints a clear skip message, and exits 0
+(this is treated as an environment gap, not a test failure — the rest of
+`npm test` still runs and still gates your change).
+
 ## Test conventions
 
 - **No test framework.** The project deliberately uses no jest/mocha/vitest.

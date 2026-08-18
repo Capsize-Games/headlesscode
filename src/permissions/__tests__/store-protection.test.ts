@@ -168,6 +168,47 @@ async function testMechanismAgainstTmpStore(): Promise<void> {
 	await fsp.rm(tmp, { recursive: true, force: true })
 }
 
+// ─── (b2) SEC-6: descendants, symlinks, and cd-chains ───────────────────────
+
+async function testSec6DescendantsSymlinksCdChains(): Promise<void> {
+	const tmp = await mkTmp("hc-store-protect-sec6-")
+	const storeRoot = path.join(tmp, "central-store")
+	const workspace = path.join(tmp, "workspace")
+	await fsp.mkdir(path.join(storeRoot, "projects", "foo"), { recursive: true })
+	await fsp.mkdir(workspace, { recursive: true })
+	await withEnv("HEADLESSCODE_DATA_DIR", storeRoot, async () => {
+		assert.equal(projectStoreRoot(), storeRoot)
+
+		// Descendant of the store is now refused (previously out of scope).
+		const descendantRefusal = checkCommand(`rm -rf ${storeRoot}/projects`, [], [], { workspaceRoot: workspace })
+		assert.ok(descendantRefusal !== null, "rm -rf <store>/projects must be refused")
+		assert.equal(descendantRefusal?.kind, "protected_store")
+
+		const nestedRefusal = checkCommand(`rm -rf ${path.join(storeRoot, "projects", "foo")}`, [], [], {
+			workspaceRoot: workspace,
+		})
+		assert.ok(nestedRefusal !== null, "rm -rf <store>/projects/foo must be refused")
+
+		// Symlink into the store is followed and refused.
+		const link = path.join(tmp, "store-link")
+		await fsp.symlink(storeRoot, link, "dir")
+		const symlinkRefusal = checkCommand(`rm -rf ${link}`, [], [], { workspaceRoot: workspace })
+		assert.ok(symlinkRefusal !== null, "rm -rf through a symlink to the store must be refused")
+		assert.equal(symlinkRefusal?.kind, "protected_store")
+
+		// cd-chain: a relative target resolves against the post-cd cwd, not the
+		// pre-cd workspaceRoot.
+		const cdChainRefusal = checkCommand(`cd ${tmp} && rm -rf central-store`, [], [], { workspaceRoot: workspace })
+		assert.ok(cdChainRefusal !== null, "cd <tmp> && rm -rf central-store must resolve against the post-cd cwd")
+		assert.equal(cdChainRefusal?.kind, "protected_store")
+
+		// cd-chain into an unrelated dir does not false-positive.
+		const cdChainAllowed = checkCommand(`cd ${workspace} && rm -rf ./scratch`, [], [], { workspaceRoot: workspace })
+		assert.equal(cdChainAllowed, null, "cd into workspace + relative cleanup must not be refused")
+	})
+	await fsp.rm(tmp, { recursive: true, force: true })
+}
+
 // ─── (c) workspace cleanup is NOT blocked ───────────────────────────────────
 
 async function testWorkspaceCleanupNotBlocked(): Promise<void> {
@@ -301,7 +342,7 @@ async function testWordSplittingAndPathResolution(): Promise<void> {
 		assert.equal(isCentralStoreOrParent("/srv"), true, "a parent of the store")
 		assert.equal(isCentralStoreOrParent("/"), true, "the filesystem root is a parent of everything")
 		assert.equal(isCentralStoreOrParent("/srv/central-store-other"), false, "prefix sibling is NOT the store")
-		assert.equal(isCentralStoreOrParent("/srv/central-store/sub"), false, "descendant is out of v1 scope (documented)")
+		assert.equal(isCentralStoreOrParent("/srv/central-store/sub"), true, "descendant is protected too (SEC-6)")
 		assert.equal(isCentralStoreOrParent("/etc"), false)
 	})
 }
@@ -311,6 +352,7 @@ async function testWordSplittingAndPathResolution(): Promise<void> {
 const tests: Array<[string, () => Promise<void>]> = [
 	["THE incident: rm -rf ~/.local/share/headlesscode + variants refused with ZERO config", testIncidentRefusedWithZeroConfig],
 	["mechanism: tmp store refuses recursive deletes (flags, quoting, env vars, parents, relative escapes)", testMechanismAgainstTmpStore],
+	["SEC-6: descendants, symlinks, and cd-chains are protected too", testSec6DescendantsSymlinksCdChains],
 	["workspace cleanup (rm -rf ./tmp-scratch) and non-destructive access are NOT blocked", testWorkspaceCleanupNotBlocked],
 	["the check cannot be bypassed by permissions.json allow-lists", testNotOverridableByConfig],
 	["legitimate central-store access (project-store + migrate paths) is unaffected", testLegitimateAccessUnaffected],

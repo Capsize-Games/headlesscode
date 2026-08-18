@@ -102,6 +102,49 @@ async function testTimeoutFallsBackToAutonomousDecision(): Promise<void> {
 
 // ─── (c1) budget clock pause/resume excludes blocked time (pure) ───────────
 
+// ─── (b2) BUG-3: an answer written in the narrow window between the poll
+// loop's LAST read-miss and the deadline must still be cleaned up, or it
+// poisons a LATER, unrelated escalation ─────────────────────────────────────
+
+async function testTimeoutAlsoCleansUpAStaleAnswerFile(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-decision-stale-answer-")
+	try {
+		// A single poll iteration: the loop reads (miss) at t=0, then sleeps the
+		// full timeout window and exits WITHOUT reading again (Date.now() >=
+		// deadline by the time the sleep resolves). Writing the answer file
+		// partway through that sleep reproduces the exact race BUG-3 describes:
+		// the write lands after the last read but before the timeout path's
+		// cleanup runs.
+		const executor = createHeadlessExecutor(ws, { decisionTimeoutMs: 80, decisionPollIntervalMs: 80 })
+
+		const execPromise = executor.execute("ask_followup_question", {
+			question: "Should I delete the old branch?",
+			follow_up: [{ text: "Yes", mode: null }],
+		})
+		// Land the write mid-window — after the loop's only read, before the
+		// deadline the loop is sleeping out.
+		void (async () => {
+			await sleep(40)
+			await fs.writeFile(path.join(ws, DECISION_ANSWER), "Yes, delete it\n", "utf-8")
+		})()
+
+		const result = await execPromise
+		assert.equal(result.isError, true, "still times out — the race-landed answer arrived too late to be read")
+
+		// The real assertion: the timeout path must not leave the race-landed
+		// answer file behind for a LATER, unrelated escalateDecision call to
+		// misread as its own answer.
+		assert.equal(
+			await exists(path.join(ws, DECISION_ANSWER)),
+			false,
+			"BUG-3: a decision-answer file written just after the poll deadline must be unlinked by the timeout path too, not just the needs-decision marker",
+		)
+		assert.equal(await exists(path.join(ws, NEEDS_DECISION)), false)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 async function testBudgetPauseResumeExcludesBlockedTime(): Promise<void> {
 	let nowMs = 1_000_000
 	const now = () => nowMs
@@ -324,6 +367,7 @@ async function testReadOnlyExecutorAlsoGatesCommands(): Promise<void> {
 const tests: Array<[string, () => Promise<void>]> = [
 	["ask_followup_question: answer arrives before timeout -> non-error result, markers cleaned up", testAnswerArrivesBeforeTimeout],
 	["ask_followup_question: timeout -> falls back to today's error, marker cleaned up", testTimeoutFallsBackToAutonomousDecision],
+	["ask_followup_question: BUG-3 — a race-landed answer file is still cleaned up on timeout", testTimeoutAlsoCleansUpAStaleAnswerFile],
 	["BudgetTracker: pauseClock/resumeClock excludes blocked time from elapsedMs", testBudgetPauseResumeExcludesBlockedTime],
 	["ToolExecutor: wires pause/resume hooks around the ask_followup_question wait", testExecutorWiresBudgetClockHooksAroundTheWait],
 	["permissions: denied execute_command is isError:true and counts as a mistake (session-level)", testDeniedCommandIsErrorAndCountsAsMistake],

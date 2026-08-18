@@ -27,6 +27,7 @@ import * as fsp from "node:fs/promises"
 import * as path from "node:path"
 
 import { resolveWithinWorkspace, PathTraversalError, MAX_RESULT_CHARS } from "../tools/executor.js"
+import { DEFAULT_PROTECTED_FILES, isProtectedPath } from "../permissions/protected-files.js"
 
 /** One directory entry, ready for JSON. */
 export interface FileEntry {
@@ -81,10 +82,23 @@ export type FileContentResult =
  * previewable: content over `MAX_RESULT_CHARS` or containing NUL bytes (the
  * strongest cheap binary signal) returns a "not previewable" reason instead
  * of raw bytes. Throws `PathTraversalError` for escaping paths.
+ *
+ * SEC-7: files matching the protected-file patterns (`.env`, `*.pem`, `*.key`,
+ * `id_rsa*`, etc. — the same defaults `src/permissions/protected-files.ts`
+ * uses to stop the WRITE tools from touching secrets) are refused here too,
+ * unconditionally — the dashboard's GET file-content route must not become a
+ * read side-channel for the exact files the write-side guard protects. This
+ * check is independent of the optional bearer-token gate in server.ts (it
+ * applies even when no token is configured).
  */
 export async function readWorkspaceFile(workspaceRoot: string, file: string): Promise<FileContentResult> {
 	const root = path.resolve(workspaceRoot)
 	const target = resolveWithinWorkspace(root, file)
+
+	const relFromRoot = path.relative(root, target).replace(/\\/g, "/")
+	if (isProtectedPath(relFromRoot, DEFAULT_PROTECTED_FILES)) {
+		return { previewable: false, reason: "protected file — not previewable via the dashboard (matches a secrets pattern like .env/*.key/*.pem)" }
+	}
 
 	const st = await fsp.stat(target)
 	if (!st.isFile()) {

@@ -964,38 +964,72 @@ export function checkCommand(
  	return { kind: "malformed", parseError, subCommand: command }
  }
 
- for (const sub of subCommands) {
- 	const cmd = sub.replace(/\d*>&\d*/, "").trim()
- 	if (!cmd) {
- 		continue
- 	}
- 	// Always-applied central-store protection: runs before (and
- 	// independently of) the allow/deny lists, so the empty-allow-list
- 	// default-ALLOW branch can never bypass it and no permissions.json
- 	// entry can override it.
- 	const storeRefusal = checkCentralStoreDestruction(cmd, options?.workspaceRoot)
- 	if (storeRefusal !== null) {
- 		return {
- 			kind: "protected_store",
- 			subCommand: cmd,
- 			target: storeRefusal.target,
- 			storeRoot: storeRefusal.storeRoot,
- 		}
- 	}
- 	// Per-sub-command redirect-escape guard (the pre-parse scan above is
- 	// the same check on the whole command; this names the offending
- 	// sub-command for the refusal message).
- 	const subRedirect = checkRedirectEscape(cmd, options?.workspaceRoot)
- 	if (subRedirect !== null) {
- 		return { kind: "redirect_escape", subCommand: cmd, redirect: subRedirect }
- 	}
- 	const refusal = checkSingleCommand(cmd, allowedCommands, deniedCommands)
- 	if (refusal !== null) {
- 		return refusal
- 	}
- }
+	// Track a leading `cd <dir> && ...` chain's effective cwd across
+	// sub-commands (SEC-6): `cd /tmp && rm -rf x` must resolve `x` against
+	// /tmp, not the pre-cd workspace root, or a relative-path rm evades the
+	// central-store check. Only a plain `cd <path>` sub-command updates the
+	// tracked cwd (best-effort — `cd` inside a subshell, via a variable, or
+	// via `pushd`/`popd` is not tracked; see store-protection.ts header).
+	let effectiveCwd = path.resolve(options?.workspaceRoot ?? process.cwd())
+
+	for (const sub of subCommands) {
+		const cmd = sub.replace(/\d*>&\d*/, "").trim()
+		if (!cmd) {
+			continue
+		}
+		// Always-applied central-store protection: runs before (and
+		// independently of) the allow/deny lists, so the empty-allow-list
+		// default-ALLOW branch can never bypass it and no permissions.json
+		// entry can override it.
+		const storeRefusal = checkCentralStoreDestruction(cmd, effectiveCwd)
+		if (storeRefusal !== null) {
+			return {
+				kind: "protected_store",
+				subCommand: cmd,
+				target: storeRefusal.target,
+				storeRoot: storeRefusal.storeRoot,
+			}
+		}
+		// Per-sub-command redirect-escape guard (the pre-parse scan above is
+		// the same check on the whole command; this names the offending
+		// sub-command for the refusal message). Anchored to the tracked
+		// cd-chain cwd for the same reason as the store-destruction check
+		// above — a relative redirect after `cd /tmp && ...` must resolve
+		// against /tmp, not the pre-cd workspace root.
+		const subRedirect = checkRedirectEscape(cmd, effectiveCwd)
+		if (subRedirect !== null) {
+			return { kind: "redirect_escape", subCommand: cmd, redirect: subRedirect }
+		}
+		const refusal = checkSingleCommand(cmd, allowedCommands, deniedCommands)
+		if (refusal !== null) {
+			return refusal
+		}
+		const cdTarget = matchLeadingCd(cmd)
+		if (cdTarget !== null) {
+			effectiveCwd = path.resolve(effectiveCwd, expandEnv(expandHome(cdTarget)))
+		}
+	}
 
  return null
+}
+
+/**
+ * When `cmd` is a plain `cd <path>` (optionally quoted, no other words), return
+ * the raw path argument; otherwise null. Deliberately narrow — `cd` combined
+ * with anything else on the same sub-command word (e.g. `cd /tmp; ls`, already
+ * split by parseCommand into separate sub-commands) or with no argument
+ * (`cd` alone, which goes to $HOME) is not tracked.
+ */
+function matchLeadingCd(cmd: string): string | null {
+	const m = cmd.match(/^cd\s+(.+)$/)
+	if (!m) {
+		return null
+	}
+	let arg = m[1].trim()
+	if ((arg.startsWith('"') && arg.endsWith('"')) || (arg.startsWith("'") && arg.endsWith("'"))) {
+		arg = arg.slice(1, -1)
+	}
+	return arg || null
 }
 
 function checkSingleCommand(

@@ -187,14 +187,35 @@ async function handleRequest(
 	// answer), the destructive POST /api/checkpoints/restore (reverts real
 	// workspace files — never gated looser than the session routes), and
 	// POST /api/settings/permissions (a weakened permissions file is more
-	// consequential than starting a session — same gate). Unset = no auth,
-	// exactly today's behavior.
+	// consequential than starting a session — same gate).
+	//
+	// SEC-7: the same token ALSO gates the GET routes that read workspace
+	// files or project data (file browser, checkpoints, codemap, cost
+	// history, project listing). Without this, any page open in the
+	// operator's browser — including a malicious one, via DNS-rebinding or
+	// simple localhost-CSRF (`fetch("http://127.0.0.1:4390/api/files/content?...")`
+	// from an unrelated origin) — could read `.env` and other workspace
+	// files with zero auth, since GETs carry no CSRF protection by default
+	// and the dashboard binds 127.0.0.1 only (reachable by anything running
+	// on the same machine, including browser tabs). Unset token = no auth,
+	// exactly today's behavior — this is opt-in defense in depth, not a
+	// guarantee (see SECURITY.md's "Known limitations").
+	const tokenGatedGetPrefixes = [
+		"/api/files",
+		"/api/checkpoints",
+		"/api/codemap",
+		"/api/cost-history",
+		"/api/projects",
+	]
+	const isTokenGatedGet =
+		req.method === "GET" && tokenGatedGetPrefixes.some((p) => url.pathname === p || url.pathname.startsWith(`${p}/`))
 	if (
 		options.token &&
-		req.method === "POST" &&
-		(url.pathname.startsWith("/api/session/") ||
-			url.pathname === "/api/checkpoints/restore" ||
-			url.pathname === "/api/settings/permissions")
+		((req.method === "POST" &&
+			(url.pathname.startsWith("/api/session/") ||
+				url.pathname === "/api/checkpoints/restore" ||
+				url.pathname === "/api/settings/permissions")) ||
+			isTokenGatedGet)
 	) {
 		const auth = req.headers.authorization ?? ""
 		const expected = `Bearer ${options.token}`

@@ -1730,9 +1730,18 @@ export async function escalateDecision(
 	if (!answered) {
 		ctx.onDecisionEvent?.("decision_answered", { timedOut: true })
 	}
-	// Timed out: clean up the needs-decision marker (the answer file was never
-	// written). The caller decides the model-facing outcome.
+	// Timed out: clean up BOTH markers (BUG-3). The answer file is usually
+	// absent here, but a write can land just after the poll loop's last read
+	// and before this point (a narrow but real race — the poller's last
+	// `readFile` above can lose to a concurrent writer by a few ms). If that
+	// happens and only needsDecisionPath were unlinked, the stale answerPath
+	// would sit on disk and get read as the answer to a LATER, unrelated
+	// escalateDecision call (the next ask_followup_question/switch_mode, or a
+	// later session reusing the same worktree) — poisoning it with a stale
+	// answer for the wrong question. Unlinking both here, unconditionally,
+	// closes that gap.
 	await safeUnlink(needsDecisionPath)
+	await safeUnlink(answerPath)
 	return { status: "timedOut" }
 }
 

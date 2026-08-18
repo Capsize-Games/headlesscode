@@ -117,6 +117,51 @@ writing a script and running it, or by abusing any command that is allowed), so
 **do not rely on it to contain untrusted code.** Restricting commands does not
 restrict what the agent can *read* or what allowed commands can accomplish.
 
+## Known limitations (tracked audit findings)
+
+These are specific, known gaps in the defense-in-depth layers above — not new
+risks beyond the "not a sandbox" scope already documented, but concrete ways
+the prefix-match and pattern-based checks can be evaded. Documented here per
+the project's own audit process rather than silently left implicit.
+
+- **Deny-list is a raw-string prefix match, not a program-identity check**
+  (`src/permissions/commands.ts` — `findLongestPrefixMatch`). A deny entry of
+  `rm` is trivially evaded by `command rm`, `/bin/rm`, `env rm`, `xargs rm`,
+  or `python -c "shutil.rmtree(...)"` — none of these share the `rm` prefix.
+  The allow/deny mechanism is prefix matching on the literal command string by
+  design (ported verbatim from upstream for parity); it does not resolve
+  `argv[0]`, follow `PATH`, or understand that many programs can accomplish
+  the same effect. Treat every deny-list entry as a speed bump against
+  accidental/careless commands, never as a guarantee that a given program
+  cannot run.
+- **Central-store protection (`src/permissions/store-protection.ts`) is
+  pattern-based, not a sandbox.** As of the SEC-6 fix it protects the store
+  root, its ancestors, AND its descendants, and it follows symlinks
+  (`fs.realpathSync`) and tracks a leading `cd <dir> &&` chain's effective
+  cwd. It still does **not** catch: `cd` performed inside a subshell
+  (`(cd /x && rm -rf y)`) or via a shell variable/`pushd`/`popd`; `sudo rm`;
+  non-`rm` deletion (`find ... -delete`, `python -c shutil.rmtree(...)`, a
+  script that deletes the store); or a non-recursive `rm` of a single file
+  inside the store. It only recognizes GNU/POSIX `rm` flag syntax.
+- **The dashboard's local HTTP server gates only POST routes with the bearer
+  token** (`HEADLESSCODE_DASHBOARD_TOKEN`); GET routes that list/read
+  workspace files, checkpoints, codemap, cost history, and projects are
+  reachable by any request that can reach `127.0.0.1` on the dashboard port
+  (including via DNS-rebinding or localhost-CSRF from a browser tab open to a
+  malicious page). Do not run the dashboard on a shared or multi-user machine
+  without additional network isolation (see also
+  [`src/dashboard/files.ts`](src/dashboard/files.ts) and
+  [`src/dashboard/trend.ts`](src/dashboard/trend.ts)).
+- **`execute_command` children inherit the full process environment,**
+  including `HEADLESSCODE_OPENROUTER_API_KEY` and any other secret exported
+  into the harness's own env. `protected-files.ts` only prevents the agent
+  from *writing* `.env`; nothing stops the agent from reading its own
+  process's environment (`printenv`, `env`) and having that flow into the LLM
+  context. Acceptable for the documented trusted-single-user model; a real
+  constraint if this project is ever run multi-tenant (see
+  `docs/multi-tenant-hosting-design.md`) — don't put shared secrets in a
+  session's environment that a given task should not be able to see.
+
 ## Reporting vulnerabilities
 
 This project is pre-1.0 and has no private disclosure channel yet. For now,

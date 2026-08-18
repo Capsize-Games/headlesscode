@@ -44,8 +44,12 @@ async function startServer(
 	return { server, port }
 }
 
-async function getJson(base: string, urlPath: string): Promise<{ status: number; body: unknown }> {
-	const res = await fetch(base + urlPath)
+async function getJson(
+	base: string,
+	urlPath: string,
+	headers: Record<string, string> = {},
+): Promise<{ status: number; body: unknown }> {
+	const res = await fetch(base + urlPath, { headers })
 	const text = await res.text()
 	let body: unknown
 	try {
@@ -199,6 +203,37 @@ async function testFilesOversizedAndBinaryHandled(): Promise<void> {
 			const binBody = binRes.body as { previewable: boolean; reason: string }
 			assert.equal(binBody.previewable, false)
 			assert.match(binBody.reason, /binary/i)
+		} finally {
+			server.close()
+		}
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testFilesContentRefusesProtectedFile(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		await fs.writeFile(path.join(repo, ".env"), "HEADLESSCODE_OPENROUTER_API_KEY=super-secret\n", "utf-8")
+		await fs.mkdir(path.join(repo, "sub"), { recursive: true })
+		await fs.writeFile(path.join(repo, "sub", "id_rsa"), "not-a-real-key", "utf-8")
+		const { server, port } = await startServer(repo)
+		try {
+			const base = `http://127.0.0.1:${port}`
+
+			// .env at the repo root is refused (SEC-7) — content never leaves the
+			// server, even though the path itself is legitimately inside the workspace.
+			const envRes = await getJson(base, `/api/files/content?${repoParam(repo)}&file=.env`)
+			assert.equal(envRes.status, 200, "the route itself succeeds (it's not a 4xx/5xx)")
+			const envBody = envRes.body as { previewable: boolean; reason?: string }
+			assert.equal(envBody.previewable, false)
+			assert.ok(!JSON.stringify(envBody).includes("super-secret"), "the secret content must never appear in the response")
+
+			// A protected pattern nested in a subdirectory is refused too
+			// (bare-filename patterns like id_rsa* match at any depth).
+			const idRsaRes = await getJson(base, `/api/files/content?${repoParam(repo)}&file=sub/id_rsa`)
+			const idRsaBody = idRsaRes.body as { previewable: boolean }
+			assert.equal(idRsaBody.previewable, false)
 		} finally {
 			server.close()
 		}
@@ -469,13 +504,20 @@ async function testPermissionsTokenGate(): Promise<void> {
 			)
 			assert.equal(goodAuth.status, 200)
 
-			// GET stays open (read-only) even when a token is configured.
+			// GET /api/settings/permissions stays open (read-only, and not a
+			// workspace-file-content route) even when a token is configured.
 			const get = await getJson(base, url)
 			assert.equal(get.status, 200)
 
-			// The file routes are read-only GETs — also unaffected by the gate.
-			const files = await getJson(base, `/api/files?${repoParam(repo)}`)
-			assert.equal(files.status, 200)
+			// The file-browser GET routes ARE gated by the same token (SEC-7):
+			// they read workspace file contents, which is exactly the surface a
+			// DNS-rebinding/localhost-CSRF attack would target.
+			const filesNoAuth = await getJson(base, `/api/files?${repoParam(repo)}`)
+			assert.equal(filesNoAuth.status, 401)
+			const filesAuthed = await getJson(base, `/api/files?${repoParam(repo)}`, {
+				authorization: "Bearer sekret",
+			})
+			assert.equal(filesAuthed.status, 200)
 		} finally {
 			server.close()
 		}
@@ -491,6 +533,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["files: GET /api/files/content returns text content", testFilesContentReturnsText],
 	["files: path-traversal attempts against both routes are refused (400)", testFilesRejectsTraversal],
 	["files: oversized + binary files are not previewable (never dumped raw)", testFilesOversizedAndBinaryHandled],
+	["files: protected files (.env, id_rsa*) are refused even inside the workspace (SEC-7)", testFilesContentRefusesProtectedFile],
 	["files: routes require repo (param or --repo) and file param", testFilesRequiresRepoAndFile],
 	["files: non-GET methods to the file routes are rejected (405)", testFilesNonGetMethodsRejected],
 	["permissions: GET returns clearly-labeled defaults when no file exists", testPermissionsGetReturnsDefaultsWhenMissing],

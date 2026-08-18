@@ -22,8 +22,14 @@ import { fileURLToPath } from "node:url"
 
 const repoRoot = path.resolve(fileURLToPath(import.meta.url), "..", "..")
 
-/** Non-test-suffixed scripts that ran as part of the old chain. */
-const EXTRA_FILES = ["scripts/check-page-script.mjs", "scripts/check-tmpdir-project-store.mjs"]
+/**
+ * Non-test-suffixed scripts that ran as part of the old chain. Includes
+ * src/vendor/tests/smoke.ts (COV-6): previously only reachable via
+ * `npm run smoke`, so it never ran in `npm test`/CI unless someone
+ * remembered to invoke it separately — the only DIRECT check that the
+ * vendored Zoo Code prompt builder still imports and runs headlessly.
+ */
+const EXTRA_FILES = ["scripts/check-page-script.mjs", "scripts/check-tmpdir-project-store.mjs", "src/vendor/tests/smoke.ts"]
 
 function findTestFiles(dir) {
 	const found = []
@@ -68,7 +74,33 @@ function resolveTsxBin(dir) {
 	}
 }
 
+function printHelp() {
+	process.stdout.write(
+		[
+			"Usage: node scripts/run-tests.mjs [--filter <substring>] [<substring>]",
+			"",
+			"Runs every src/**/*.test.ts file (plus a short list of extra check",
+			"scripts) sequentially, fail-fast, in sorted order.",
+			"",
+			"  --filter <substring>   only run test files whose relative path",
+			"                         includes <substring>",
+			"  <substring>            same as --filter, as a bare positional arg",
+			"                         (so `npm test -- orchestrator` works)",
+			"  -h, --help             print this help and exit 0 (does NOT run",
+			"                         any tests — a bare --help used to be",
+			'                         misread as "no filter", running all 116+',
+			"                         files; see BUG-14)",
+			"",
+		].join("\n"),
+	)
+}
+
 function main() {
+	if (process.argv.slice(2).some((a) => a === "--help" || a === "-h")) {
+		printHelp()
+		process.exit(0)
+	}
+
 	const filterArgIndex = process.argv.indexOf("--filter")
 	// `npm test -- orchestrator` passes "orchestrator" through as a bare
 	// positional arg (no `--filter` flag) — support both forms so the exact
@@ -92,11 +124,38 @@ function main() {
 		process.exit(1)
 	}
 
-	process.env.HEADLESSCODE_DATA_DIR = process.env.HEADLESSCODE_DATA_DIR ?? ".headlesscode/test-store"
+	// COV-7: a fixed ".headlesscode/test-store" HEADLESSCODE_DATA_DIR (no
+	// override) means (a) stale checkpoint/project dirs from past runs pile up
+	// forever, and (b) two concurrent `npm test` invocations on the same
+	// checkout (e.g. two worktrees sharing a HOME, or a dev running a targeted
+	// filter in one terminal while CI runs in another) collide on the same
+	// path. An explicit override is respected as-is (the caller owns its own
+	// cleanup); otherwise generate a per-PID subdir and remove it when this
+	// run finishes, so the dir never outlives the process that created it.
+	const explicitDataDir = process.env.HEADLESSCODE_DATA_DIR
+	const dataDir = explicitDataDir ?? path.join(".headlesscode", `test-store-${process.pid}`)
+	const ownsDataDir = explicitDataDir === undefined
+	process.env.HEADLESSCODE_DATA_DIR = dataDir
 
 	process.stdout.write(`run-tests: running ${files.length} file(s)${filter ? ` (filter: "${filter}")` : ""}\n\n`)
 
 	const tsxBin = resolveTsxBin(repoRoot)
+
+	const cleanupDataDir = () => {
+		if (!ownsDataDir) {
+			return
+		}
+		try {
+			fs.rmSync(path.join(repoRoot, dataDir), { recursive: true, force: true })
+		} catch {
+			// best-effort — a leftover dir from a crashed run is a disk-space
+			// nit, never worth failing the test run over.
+		}
+	}
+	// Belt-and-suspenders: the loop below also cleans up on both exit paths,
+	// but a signal (Ctrl-C mid-run) skips straight to process exit, so also
+	// register a normal 'exit' handler.
+	process.on("exit", cleanupDataDir)
 
 	for (const file of files) {
 		try {

@@ -73,11 +73,28 @@ async function testNoMatchExitsNonZeroWithClearMessage(): Promise<void> {
 	)
 }
 
+/**
+ * BUG-14 regression: `--help` starts with `--`, so the old bareArg lookup
+ * (`find((a) => !a.startsWith("--"))`) skipped it entirely, leaving `filter`
+ * undefined and running the ENTIRE suite (116+ files) instead of printing
+ * usage. `-h` hit the same gap for a different reason (no bareArg match
+ * either, since it doesn't look like a real filter but wasn't special-cased).
+ * Both must now print usage and exit 0 WITHOUT running any test file.
+ */
+async function testHelpFlagPrintsUsageAndExitsWithoutRunningTests(): Promise<void> {
+	for (const flag of ["--help", "-h"]) {
+		const out = run([flag])
+		assert.match(out, /Usage: node scripts\/run-tests\.mjs/, `${flag}: expected usage text, got:\n${out}`)
+		assert.doesNotMatch(out, /running \d+ file\(s\)/, `${flag}: must NOT run any test files, got:\n${out}`)
+	}
+}
+
 const tests: Array<[string, () => Promise<void>]> = [
 	["bare positional arg filters like `npm test -- <pattern>` (issue #4)", testBarePositionalArgFilters],
 	["explicit --filter flag still works", testExplicitFilterFlagStillWorks],
 	["filter matching nothing exits non-zero with a clear message", testNoMatchExitsNonZeroWithClearMessage],
 	["resolves tsx via ancestor walk-up in a bare worktree with no node_modules (issue #32)", testResolvesTsxViaWalkUpInABareWorktree],
+	["--help / -h print usage and exit 0 without running the suite (BUG-14)", testHelpFlagPrintsUsageAndExitsWithoutRunningTests],
 ]
 
 async function main(): Promise<void> {

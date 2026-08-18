@@ -17,22 +17,32 @@
  * Honest scope: this is PATTERN-BASED detection, not a hermetic sandbox. It
  * catches recursive `rm` invocations (`rm -rf`, `rm -r`, `rm -fr`, `-R`,
  * `--recursive`, in any flag order/bundle) whose resolved target is the store
- * root or a PARENT of it. It deliberately does NOT try to enumerate every way
- * to destroy a file — a script, `python -c "shutil.rmtree(...)"`,
- * `find ... -delete`, `command rm`, `sudo rm`, a non-recursive `rm` of a
- * single file inside the store, or `rm -rf <store>/<subdir>` (a descendant)
- * are all out of scope for this first version. It is a speed bump against the
- * exact class of mistake that already happened, not a proof of safety.
+ * root, a PARENT of it, or a DESCENDANT of it (`rm -rf <store>/<subdir>`). It
+ * also follows symlinks when resolving the target (via `fs.realpathSync`,
+ * falling back to the lexical path when the target doesn't exist yet — e.g.
+ * `ln -s <store> /tmp/x && rm -rf /tmp/x` resolves through the symlink). It
+ * deliberately does NOT try to enumerate every way to destroy a file — a
+ * script, `python -c "shutil.rmtree(...)"`, `find ... -delete`, `command rm`,
+ * `sudo rm`, or a non-recursive `rm` of a single file inside the store are all
+ * out of scope for this version. It is a speed bump against the exact class
+ * of mistake that already happened, not a proof of safety. See SEC-5/SEC-6 in
+ * SECURITY.md for the full honest-scope writeup, including the residual
+ * cd-chain caveat (only a leading `cd <dir> &&` prefix chain updates the
+ * effective cwd used for later sub-commands; `cd` inside a subshell, via a
+ * variable, or via `pushd` is not tracked).
  *
  * Matching rule (per the plan): a command's target is refused when the
- * RESOLVED path equals the store root or is an ancestor of it. Resolution
- * handles `~` / `~/`, `$VAR` / `${VAR}` env expansion, quoting, and
- * relative-vs-absolute paths (relative targets anchor on the command's
- * working directory — the executor passes the resolved `cwd`). A trailing
- * `/*` glob is treated as the directory itself (the "delete the contents"
- * idiom targets the same resource).
+ * RESOLVED path equals the store root, is an ancestor of it, or is a
+ * descendant of it. Resolution handles `~` / `~/`, `$VAR` / `${VAR}` env
+ * expansion, quoting, symlink following, and relative-vs-absolute paths
+ * (relative targets anchor on the command's working directory — the executor
+ * passes the resolved `cwd`, and `checkCommand` additionally tracks a leading
+ * `cd` chain across `&&`-joined sub-commands). A trailing `/*` glob is treated
+ * as the directory itself (the "delete the contents" idiom targets the same
+ * resource).
  */
 
+import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
 
@@ -190,19 +200,45 @@ export function resolveCommandTarget(target: string, workspaceRoot: string): str
 }
 
 /**
- * True when the resolved `target` is the central store root or an ancestor of
- * it. Lexical containment (path.resolve, no symlink following) — the same
- * convention `resolveWithinWorkspace` documents for the harness's own path
- * safety. The store root comes from project-store.ts's own resolver
- * (projectStoreRoot), never a second copy of that path logic.
+ * Best-effort symlink resolution: `fs.realpathSync` when the path exists,
+ * otherwise the lexical path unchanged (a not-yet-existing target can't be
+ * resolved through a symlink, and that's fine — a `rm -rf` of a nonexistent
+ * path is a no-op anyway). Never throws.
+ */
+function tryRealpath(p: string): string {
+	try {
+		return fs.realpathSync(p)
+	} catch {
+		return p
+	}
+}
+
+/**
+ * True when the resolved `target` is the central store root, an ancestor of
+ * it, or a DESCENDANT of it. Checked both lexically (path.resolve) and
+ * against the symlink-resolved realpath — the same convention
+ * `resolveWithinWorkspace` documents for the harness's own path safety, plus
+ * realpath so `ln -s <store> /tmp/x && rm -rf /tmp/x` is caught too. The
+ * store root comes from project-store.ts's own resolver (projectStoreRoot),
+ * never a second copy of that path logic.
  */
 export function isCentralStoreOrParent(target: string): boolean {
 	const storeRoot = projectStoreRoot()
-	const t = path.resolve(target)
-	if (t === storeRoot) {
-		return true
+	const candidates = new Set([path.resolve(target), tryRealpath(path.resolve(target))])
+	for (const t of candidates) {
+		if (t === storeRoot) {
+			return true
+		}
+		// Ancestor: storeRoot is inside t.
+		if (storeRoot.startsWith(t.endsWith(path.sep) ? t : t + path.sep)) {
+			return true
+		}
+		// Descendant: t is inside storeRoot.
+		if (t.startsWith(storeRoot.endsWith(path.sep) ? storeRoot : storeRoot + path.sep)) {
+			return true
+		}
 	}
-	return storeRoot.startsWith(t.endsWith(path.sep) ? t : t + path.sep)
+	return false
 }
 
 /** What a refused destructive command hit, for the model-facing message. */
