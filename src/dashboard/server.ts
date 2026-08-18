@@ -148,7 +148,21 @@ export interface DashboardServerOptions {
 /** Start the dashboard HTTP server. Resolves once it's listening. */
 export function startDashboardServer(options: DashboardServerOptions): Promise<http.Server> {
 	const server = http.createServer((req, res) => {
-		void handleRequest(req, res, options)
+		// .catch (issue #82): handleRequest is fire-and-forget from this
+		// callback's perspective (http.createServer's handler isn't awaited),
+		// so an unhandled rejection here would crash the whole process on
+		// Node 15+ if any route ever threw instead of writing a response.
+		// Fall back to a bare 500 — best-effort, since the response may
+		// already be (partially) written by the time a route fails.
+		void handleRequest(req, res, options).catch((error) => {
+			if (!res.headersSent) {
+				res.writeHead(500, { "content-type": "application/json; charset=utf-8" }).end(
+					JSON.stringify({ error: `internal error: ${error instanceof Error ? error.message : String(error)}` }),
+				)
+			} else {
+				res.end()
+			}
+		})
 	})
 
 	return new Promise((resolve, reject) => {

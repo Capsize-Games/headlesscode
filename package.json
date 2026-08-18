@@ -19,15 +19,6 @@
 	"engines": {
 		"node": ">=18"
 	},
-	"files": [
-		"src",
-		"scripts",
-		"docs",
-		"plans",
-		"ATTRIBUTION.md",
-		"LICENSE",
-		"README.md"
-	],
 	"bin": {
 		"headlesscode": "bin/headlesscode.mjs"
 	},

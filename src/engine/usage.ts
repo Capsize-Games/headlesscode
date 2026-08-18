@@ -116,6 +116,14 @@ export async function removeLiveUsage(workspaceRoot: string, sessionId: string):
  * Read + loosely validate one usage JSONL file. Malformed/partially-written
  * lines are skipped; a missing file yields an empty array (never throws for
  * ENOENT — matches the memory store's `readJsonl` idiom).
+ *
+ * Deduped by `sessionId` (issue #81): a session id can be reused across a
+ * restart/retry of the same worker, which appends another line to the same
+ * file (the file itself is named `<sessionId>.jsonl`, so every line here
+ * already shares one id) — without dedup, dashboard `sumSessions` would sum
+ * every one of those rows and double/triple-count cost and tokens. The last
+ * record for a given sessionId wins (most recent write reflects the final
+ * outcome of that session id).
  */
 export async function readUsageFile(file: string): Promise<UsageRecord[]> {
 	let raw: string
@@ -127,7 +135,8 @@ export async function readUsageFile(file: string): Promise<UsageRecord[]> {
 		}
 		throw error
 	}
-	const records: UsageRecord[] = []
+	const bySessionId = new Map<string, UsageRecord>()
+	const order: string[] = []
 	for (const line of raw.split("\n")) {
 		const trimmed = line.trim()
 		if (!trimmed) {
@@ -136,13 +145,16 @@ export async function readUsageFile(file: string): Promise<UsageRecord[]> {
 		try {
 			const parsed = JSON.parse(trimmed) as Partial<UsageRecord>
 			if (typeof parsed.sessionId === "string" && typeof parsed.status === "string") {
-				records.push(parsed as UsageRecord)
+				if (!bySessionId.has(parsed.sessionId)) {
+					order.push(parsed.sessionId)
+				}
+				bySessionId.set(parsed.sessionId, parsed as UsageRecord)
 			}
 		} catch {
 			// Loose validation: skip malformed / partially-written lines.
 		}
 	}
-	return records
+	return order.map((id) => bySessionId.get(id) as UsageRecord)
 }
 
 /**

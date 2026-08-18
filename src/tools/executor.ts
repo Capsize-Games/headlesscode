@@ -48,6 +48,19 @@
  * execute_command output — read_file / write_to_file / diff content always
  * stays verbatim (summarizing code a model is about to edit would be a
  * correctness hazard).
+ *
+ * KNOWN LIMITATION (issue #88) — edit-tool read-modify-write is NOT atomic:
+ * `apply_diff`, `search_replace`, `edit_file`, and `write_to_file` each read
+ * the current file, compute the new content, and write it back with a plain
+ * `fs.writeFile` — no mtime re-check, no lock, no compare-and-swap. Within
+ * one session this is safe: the loop serializes edits to the same file and
+ * restricts the parallel read-only tool-call group to paths that aren't
+ * being edited (see loop.ts's same-file batching / parallel-group
+ * restriction). It is NOT safe across an external editor or a second,
+ * concurrent headlesscode session touching the same file — whichever write
+ * lands last silently wins and the other one's changes are lost (classic
+ * TOCTOU). No fix is planned; this is accepted as a known limitation rather
+ * than adding locking complexity for a single-session tool.
  */
 
 import * as fs from "node:fs"
@@ -1493,14 +1506,24 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 					// Command failed: the stderr/stdout tail is exactly what the
 					// model needs. Summarize it (opt-in) exactly like the success
 					// path — a failed verbose test run is THE canonical case.
-					void summarizeCommandOutput(combined).then((content) =>
-						finish(err(`execute_command: command '${command}' exited with code ${code}.\n${content}`)),
-					)
+					// .catch (issue #82): summarizeCommandOutput never rejects today,
+					// but this is a fire-and-forget .then() with no caller to
+					// propagate a rejection to — an unhandled rejection would crash
+					// the whole process on Node 15+ if that invariant ever breaks.
+					// Fall back to the raw (unsummarized) output rather than lose
+					// the result.
+					void summarizeCommandOutput(combined)
+						.then((content) =>
+							finish(err(`execute_command: command '${command}' exited with code ${code}.\n${content}`)),
+						)
+						.catch(() =>
+							finish(err(`execute_command: command '${command}' exited with code ${code}.\n${combined}`)),
+						)
 					return
 				}
-				void summarizeCommandOutput(combined === "" ? `(command completed with no output)` : combined).then(
-					(content) => finish(ok(content)),
-				)
+				void summarizeCommandOutput(combined === "" ? `(command completed with no output)` : combined)
+					.then((content) => finish(ok(content)))
+					.catch(() => finish(ok(combined === "" ? `(command completed with no output)` : combined)))
 			})
 		})
 	})()

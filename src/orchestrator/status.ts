@@ -508,9 +508,15 @@ export interface WaitForTerminalResult {
  * immediately — there is nothing to wait for, and hanging on a wrong path
  * would be worse than returning a clear "no groups" result.
  *
- * Transient JSON parse errors (the writer's writeFileSync is not atomic, so
- * a read can land mid-save) are treated as "not readable yet": the loop
- * retries on the next poll instead of crashing the wait.
+ * Transient JSON parse errors are treated as "not readable yet": the loop
+ * retries on the next poll instead of crashing the wait. This tolerance is
+ * NOT because the writer is non-atomic — saveStateSync (state.ts) writes to
+ * a pid+counter-suffixed temp sibling and renames it over the target, so a
+ * concurrent reader never observes a partially-written file. It's defensive
+ * anyway: a reader could still race a rename on filesystems/platforms where
+ * rename isn't atomic, or hit a transient ENOENT between the old file being
+ * gone and the new one appearing, so treating a parse failure as "retry, not
+ * crash" costs nothing and remains correct.
  */
 export async function waitForTerminalState(
 	statePath: string,

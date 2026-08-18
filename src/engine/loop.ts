@@ -2235,6 +2235,25 @@ export class HeadlessSession {
 		// Same feed event the synchronous path emits (see maybeCondenseHistory)
 		// so the dashboard timeline shows background condensation too. Non-fatal.
 		// (S2) Scheduled for occurrence-order placement in the feed.
+		//
+		// Issue #84: re-check sessionEnded here, immediately before scheduling,
+		// not just at function entry. The whole method body above is
+		// synchronous today so the entry check already covers this call, but
+		// that's an easy invariant for a future edit to silently break by
+		// inserting an `await` earlier in this function — a stale entry check
+		// would then let a post-session_end write slip into `scheduleAux` and
+		// land in the feed AFTER the terminal session_end event (run()'s
+		// drainAuxWrites at the point sessionEnded flips true, loop.ts:1443,
+		// only awaits writes already in the chain at that moment). Checking
+		// right at the scheduling point keeps the guard correct regardless of
+		// what runs earlier in the method.
+		if (this.sessionEnded) {
+			this.logger.info(
+				"[condense] background condensation applied, but session ended before the feed event could be scheduled — event discarded",
+				{ firedAtIteration: job.firedAtIteration, count: job.count },
+			)
+			return
+		}
 		this.scheduleAux(() =>
 			this.emitEvent("condensed", () =>
 				this.eventFeed.condensed({
