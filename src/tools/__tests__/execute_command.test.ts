@@ -235,6 +235,61 @@ async function testNonDestructiveStoreAccessAllowed(): Promise<void> {
 	}
 }
 
+// ─── (d2) redirect-escape guard (issue #122) ────────────────────────────────
+
+async function testOutsideRedirectRefusedBeforeSpawn(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-ec-redir-")
+	const outside = path.join(os.tmpdir(), `hc-ec-redir-outside-${process.pid}`)
+	await fs.rm(outside, { recursive: true, force: true })
+	const outsideTarget = path.join(outside, "foo.md")
+	const savedVar = process.env.HC_EC_TEST_OUTDIR
+	process.env.HC_EC_TEST_OUTDIR = os.tmpdir()
+	try {
+		const executor = createHeadlessExecutor(ws) // ZERO permissions config
+		// The classic review-session scratch write — must be refused BEFORE
+		// spawn, so nothing is written and the command never runs.
+		const denied = [
+			`cat > /tmp/foo.md`,
+			`echo hi 2> /tmp/err.log`,
+			`echo hi > ${outsideTarget}`,
+			`echo hi > $HC_EC_TEST_OUTDIR/x.txt`,
+			`cat > /tmp/x && echo should-not-run`, // compound: escaping part blocks the chain
+		]
+		for (const cmd of denied) {
+			const result = await executor.execute("execute_command", { command: cmd, timeout: 10 })
+			assert.equal(result.isError, true, `command '${cmd}' must be refused`)
+			assert.match(result.content, /outside the workspace/, `refusal must name the boundary, got: ${result.content}`)
+			assert.match(result.content, /redirects output/, `refusal must say "redirects output", got: ${result.content}`)
+		}
+		// Nothing was written anywhere (the refusal happens before spawn).
+		assert.equal(await exists(path.join(ws, "foo.md")), false, "workspace foo.md must not exist")
+		assert.equal(await exists(path.join(ws, "x")), false, "workspace x must not exist")
+		assert.equal(await exists(outsideTarget), false, "outside target must not exist")
+		assert.equal(await exists(path.join(os.tmpdir(), "x.txt")), false, "env-var target must not exist")
+
+		// A redirect INSIDE the workspace still runs and writes.
+		const inside = await executor.execute("execute_command", {
+			command: "echo hello > out.txt",
+			timeout: 10,
+		})
+		assert.equal(inside.isError, false, "an inside-workspace redirect must run")
+		assert.equal(await fs.readFile(path.join(ws, "out.txt"), "utf-8"), "hello\n", "the file must actually be written")
+
+		// write_to_file to /tmp STILL throws PathTraversalError (unchanged).
+		const wtf = await executor.execute("write_to_file", { path: "/tmp/foo.md", content: "x" })
+		assert.equal(wtf.isError, true, "write_to_file to /tmp must still fail")
+		assert.match(wtf.content, /escapes the workspace/, `write_to_file refusal must name the boundary, got: ${wtf.content}`)
+	} finally {
+		if (savedVar === undefined) {
+			delete process.env.HC_EC_TEST_OUTDIR
+		} else {
+			process.env.HC_EC_TEST_OUTDIR = savedVar
+		}
+		await fs.rm(outside, { recursive: true, force: true })
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 /**
  * CI safety net for issue #35's fix: `BASH_PATH` must resolve to a REAL
  * bash binary on whatever machine runs this test, not silently fall back to
@@ -320,6 +375,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["execute_command: store protection is NOT overridable by an allow-everything permissions config", testStoreProtectionNotOverridableByPermissions],
 	["execute_command: rm -rf of workspace scratch still runs (not the store)", testWorkspaceScratchCleanupStillAllowed],
 	["execute_command: non-destructive store access (echo) is allowed", testNonDestructiveStoreAccessAllowed],
+	["execute_command: outside-workspace redirect (/tmp, $VAR, compound) refused before spawn; inside redirect runs", testOutsideRedirectRefusedBeforeSpawn],
 	["execute_command: bash-only syntax (${PIPESTATUS[0]}) does not falsely fail the command", testBashOnlySyntaxDoesNotFalselyFailTheCommand],
 	["execute_command: BASH_PATH resolves to a real binary (CI safety net for issue #35)", testBashPathResolvesToARealBinary],
 	["execute_command: oversized stdout bounded at the cap, pipe drains, truncation trailer present", testOversizedOutputIsBoundedAtCap],

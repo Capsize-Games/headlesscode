@@ -43,6 +43,16 @@
  *   sandbox; see src/permissions/store-protection.ts for the honest scope.
  *   Per-workspace permissions.json cannot override it (the whole point is
  *   protecting the SHARED resource from any single workspace).
+ * - REDIRECT-ESCAPE PROTECTION (always-applied, NOT configurable, issue #122):
+ *   an output redirect (`>`, `>>`, `2>`, `2>>`, `&>`, `&>>`) whose resolved
+ *   target escapes the workspace root is refused EVEN with an empty allow/deny
+ *   config. This closes the same-class hole the rules doc calls out in
+ *   .roo/rules/rules.md: shell redirects to `/tmp` previously slipped through
+ *   the command-string allow/deny gate even though every file tool rejects
+ *   outside-workspace paths. Pattern-based like the store check — a script
+ *   that writes outside the workspace via a non-redirect mechanism (e.g.
+ *   `python -c "open('/tmp/x','w')"`) is out of scope; see
+ *   redirectTargets/checkRedirectEscape below.
  *
  * `parseCommand` is ported WITHOUT the `shell-quote` dependency (not present in
  * this repo's node_modules): quoted strings, arithmetic, parameter expansions,
@@ -56,7 +66,10 @@
  * verbatim.
  */
 
-import { checkCentralStoreDestruction } from "./store-protection.js"
+import * as os from "node:os"
+import * as path from "node:path"
+
+import { checkCentralStoreDestruction, expandEnv, expandHome, splitCommandWords } from "./store-protection.js"
 
 // ─── parseCommand port (zoo-code/src/shared/parse-command.ts) ───────────────
 
@@ -593,6 +606,132 @@ function restorePlaceholders(
 	return result
 }
 
+// ─── redirect-target extraction (shell redirects to outside the workspace) ──
+
+/**
+ * A redirection found in a command string: the raw `>`-style operator
+ * (including an optional numeric fd prefix and `&` for `&>`), the index it
+ * starts at, and the word that follows it (the redirect target). Quoted words
+ * (e.g. `> "out file.txt"`) arrive with their quotes intact; callers strip
+ * them via splitCommandWords, which also removes backslash escapes.
+ */
+export interface RedirectTarget {
+	operator: string
+	/** Index in the ORIGINAL command string where the operator starts. */
+	index: number
+	/** The raw word following the operator (quote-stripped by splitCommandWords). */
+	word: string
+}
+
+/**
+ * Extract the target words of every output redirection in a command string.
+ *
+ * Recognized operators: `>`, `>>`, `>|` (noclobber), `2>`, `2>>`, `2>|`,
+ * `&>`, `&>>`, `&>|` — the alternation is ordered longest-first so `>>` wins
+ * over `>`. `<`/`<<`/`<<<` input redirects are deliberately NOT matched —
+ * they read from a path instead of writing to it, so they cannot smuggle an
+ * outside-workspace WRITE. `2>&1`/`3>&2` fd duplication is not a path
+ * redirect: the `&` immediately after the `>` terminates the word, leaving
+ * no target, so it is skipped (see parseCommandLine, which masks the same
+ * shape).
+ *
+ * A target word is a shell WORD: unquoted characters up to the next
+ * metacharacter (`;`, `|`, `&`, `<`, `>`, whitespace) or a quote/escape that
+ * stays part of the word. When the redirect is immediately followed by a
+ * metacharacter (`echo hi >;ls`, `echo hi >`), no word exists — the shell
+ * errors on the missing operand and no file is created, so nothing is
+ * emitted. A quoted target (`> "out file.txt"`, `> '/tmp/x y'`) is emitted
+ * with its quotes intact; callers strip them via splitCommandWords.
+ */
+export function redirectTargets(command: string): RedirectTarget[] {
+	const targets: RedirectTarget[] = []
+	// Word chars: anything but unquoted shell metacharacters/quotes, plus
+	// quoted regions (which may contain metacharacters) and backslash escapes.
+	const re =
+		/(?:\d*&>>|\d*&>\||\d*&>|\d*>>\||\d*>\||\d*>>|\d*>)(?:\s*)(?:[^\s;|&<>()'"]|"[^"]*"|'[^']*'|\\.)*/g
+	let match: RegExpExecArray | null
+	while ((match = re.exec(command)) !== null) {
+		const raw = match[0]
+		if (raw === undefined) {
+			continue
+		}
+		const operatorMatch = raw.match(/^(\d*&>>|\d*&>\||\d*&>|\d*>>\||\d*>\||\d*>>|\d*>)/)
+		if (operatorMatch === null) {
+			continue
+		}
+		const operator = operatorMatch[1] ?? raw
+		const wordText = raw.slice(operator.length).trimStart()
+		if (wordText === "") {
+			continue
+		}
+		const words = splitCommandWords(wordText)
+		if (words.length === 0) {
+			continue
+		}
+		targets.push({ operator, index: match.index, word: words[0] })
+	}
+	return targets
+}
+
+/**
+ * Resolve a redirect target word to an absolute path, anchored on the command's
+ * working directory. Applies the same `~`/`$VAR` expansion and `/*`-glob
+ * truncation as the central-store check (store-protection.ts's
+ * resolveCommandTarget), so `/tmp` and `/tmp/x` behave identically to `~` and
+ * `$TMPDIR` — a relative target like `> out.txt` anchors inside the workspace.
+ *
+ * A word the shell could expand (e.g. `$TMPDIR/x.txt`) resolves through the
+ * SAME expansions the central-store check applies (expandHome/expandEnv), so
+ * `> $TMPDIR/x` with TMPDIR set to /tmp refuses like the literal `/tmp/x` it
+ * expands to. An UNKNOWN variable stays literal — the shell would expand it
+ * to an empty word (the redirect would then hit a missing-operand error),
+ * which cannot write outside the workspace, so resolving it literally is the
+ * safe direction.
+ */
+export function resolveRedirectTarget(target: string, workspaceRoot: string): string {
+	const expanded = expandEnv(expandHome(target))
+	return path.resolve(workspaceRoot, expanded)
+}
+
+/**
+ * True when the resolved redirect target escapes the workspace root — the
+ * same lexical containment rule `resolveWithinWorkspace` uses for the file
+ * tools (path.resolve prefix check; no symlink following, which matches the
+ * store-protection check's documented boundary).
+ */
+export function isOutsideWorkspace(root: string, target: string): boolean {
+	const rootAbs = path.resolve(root)
+	const t = path.resolve(target)
+	if (t === rootAbs) {
+		return false
+	}
+	return !t.startsWith(rootAbs.endsWith(path.sep) ? rootAbs : rootAbs + path.sep)
+}
+
+/**
+ * Check ONE sub-command (already split by parseCommand) for an output
+ * redirect whose resolved target escapes the workspace root. Returns the
+ * first offending redirect, or `null` when every redirect target stays inside
+ * the workspace. `workspaceRoot` anchors relative targets (defaults to
+ * process.cwd()).
+ */
+export function checkRedirectEscape(subCommand: string, workspaceRoot?: string): RedirectTarget | null {
+	const root = path.resolve(workspaceRoot ?? process.cwd())
+	for (const target of redirectTargets(subCommand)) {
+		if (isOutsideWorkspace(root, resolveRedirectTarget(target.word, root))) {
+			return target
+		}
+	}
+	return null
+}
+
+/** Human-readable operator for the model-facing refusal message. */
+export function describeRedirect(target: RedirectTarget): string {
+	const compact =
+		target.operator.includes("&") || target.operator.includes("|") || /^\d*>>/.test(target.operator)
+	return compact ? `${target.operator}${target.word}` : `${target.operator} ${target.word}`
+}
+
 // ─── allow/deny logic port (zoo-code/src/core/auto-approval/commands.ts) ────
 
 /**
@@ -742,6 +881,11 @@ export interface CommandRefusal {
 	 * - "dangerous": contains a dangerous shell substitution — always blocked,
 	 *   not configurable (upstream never auto-approves these).
 	 * - "malformed": shell syntax error (unterminated quote/heredoc).
+	 * - "redirect_escape": an output redirect (`>`, `>>`, `2>`, `&>`) whose
+	 *   resolved target escapes the workspace root — always blocked, NOT
+	 *   configurable, closing the execute_command hole where shell redirects
+	 *   could write outside the workspace (e.g. `/tmp`) even though every
+	 *   file tool rejects those paths (issue #122).
 	 * - "denied": matched the deny-list (deny wins over allow).
 	 * - "not_allowed": allow-list configured but this sub-command matches
 	 *   neither list; a headless harness has no human to ask, so it is denied.
@@ -749,8 +893,8 @@ export interface CommandRefusal {
 	 *   or a parent of it — always blocked, NOT configurable (see
 	 *   src/permissions/store-protection.ts).
 	 */
-	kind: "dangerous" | "malformed" | "denied" | "not_allowed" | "protected_store"
-	/** The sub-command that triggered the refusal (denied/not_allowed/protected_store). */
+	kind: "dangerous" | "malformed" | "redirect_escape" | "denied" | "not_allowed" | "protected_store"
+	/** The sub-command that triggered the refusal (denied/not_allowed/protected_store/redirect_escape). */
 	subCommand?: string
 	/** The deny-list pattern that matched (denied). */
 	pattern?: string
@@ -760,6 +904,8 @@ export interface CommandRefusal {
 	target?: string
 	/** The protected central store root (protected_store). */
 	storeRoot?: string
+	/** The redirect that escaped the workspace (redirect_escape). */
+	redirect?: RedirectTarget
 }
 
 /**
@@ -769,61 +915,87 @@ export interface CommandRefusal {
  * Order (per the spec + upstream behavior):
  * 1. Dangerous substitution → unconditional refuse (not configurable).
  * 2. Malformed command (unterminated quote/heredoc) → refuse.
- * 3. Each sub-command from `parseCommand` (so `echo hi && rm -rf /` is checked
+ * 3. Always-applied redirect-escape guard: an output redirect (`>`, `>>`,
+ *    `2>`, `&>`) whose target escapes the workspace root — e.g. `> /tmp/x`,
+ *    `> $HOME/out`, `2> ../outside.log` — is refused even with an empty
+ *    allow/deny config, and is NOT overridable. This closes the documented
+ *    execute_command hole (issue #122): every file tool hard-rejects
+ *    outside-workspace paths via resolveWithinWorkspace, but a shell redirect
+ *    previously slipped through the command-string allow/deny gate and wrote
+ *    to `/tmp`. Runs before parsing so it also catches redirects embedded in
+ *    unparseable fragments (e.g. a heredoc body's own `> /tmp` line).
+ * 4. Each sub-command from `parseCommand` (so `echo hi && rm -rf /` is checked
  *    per sub-command, not as one opaque string): FIRST the central-store
  *    protection (recursive delete targeting the shared store or a parent of it
  *    — always refused, even with empty allow/deny config, and NOT overridable
- *    by any permissions config), THEN the deny-list, then the allow-list, with
- *    upstream's longest-prefix-match precedence.
+ *    by any permissions config), THEN the redirect-escape guard per
+ *    sub-command, then the deny-list, then the allow-list, with upstream's
+ *    longest-prefix-match precedence.
  *
  * `options.workspaceRoot` anchors relative command targets for the
- * central-store check (the executor passes the command's resolved `cwd`;
- * default: process.cwd()). It has no effect on the allow/deny lists.
+ * central-store and redirect-escape checks (the executor passes the command's
+ * resolved `cwd`; default: process.cwd()). It has no effect on the
+ * allow/deny lists.
  */
 export function checkCommand(
-	command: string,
-	allowedCommands: string[],
-	deniedCommands: string[],
-	options?: { workspaceRoot?: string },
+ command: string,
+ allowedCommands: string[],
+ deniedCommands: string[],
+ options?: { workspaceRoot?: string },
 ): CommandRefusal | null {
-	if (!command?.trim()) {
-		return null
-	}
+ if (!command?.trim()) {
+ 	return null
+ }
 
-	if (containsDangerousSubstitution(command)) {
-		return { kind: "dangerous" }
-	}
+ if (containsDangerousSubstitution(command)) {
+ 	return { kind: "dangerous" }
+ }
 
-	const { commands: subCommands, parseError } = parseCommand(command)
-	if (parseError !== null) {
-		return { kind: "malformed", parseError, subCommand: command }
-	}
+ // Pre-parse redirect-escape scan: redirectTargets walks the raw command
+ // (heredoc bodies included), so it still catches redirects that parseCommand
+ // would classify as malformed (unterminated quote/heredoc).
+ const redirectEscape = checkRedirectEscape(command, options?.workspaceRoot)
+ if (redirectEscape !== null) {
+ 	return { kind: "redirect_escape", subCommand: command, redirect: redirectEscape }
+ }
 
-	for (const sub of subCommands) {
-		const cmd = sub.replace(/\d*>&\d*/, "").trim()
-		if (!cmd) {
-			continue
-		}
-		// Always-applied central-store protection: runs before (and
-		// independently of) the allow/deny lists, so the empty-allow-list
-		// default-ALLOW branch can never bypass it and no permissions.json
-		// entry can override it.
-		const storeRefusal = checkCentralStoreDestruction(cmd, options?.workspaceRoot)
-		if (storeRefusal !== null) {
-			return {
-				kind: "protected_store",
-				subCommand: cmd,
-				target: storeRefusal.target,
-				storeRoot: storeRefusal.storeRoot,
-			}
-		}
-		const refusal = checkSingleCommand(cmd, allowedCommands, deniedCommands)
-		if (refusal !== null) {
-			return refusal
-		}
-	}
+ const { commands: subCommands, parseError } = parseCommand(command)
+ if (parseError !== null) {
+ 	return { kind: "malformed", parseError, subCommand: command }
+ }
 
-	return null
+ for (const sub of subCommands) {
+ 	const cmd = sub.replace(/\d*>&\d*/, "").trim()
+ 	if (!cmd) {
+ 		continue
+ 	}
+ 	// Always-applied central-store protection: runs before (and
+ 	// independently of) the allow/deny lists, so the empty-allow-list
+ 	// default-ALLOW branch can never bypass it and no permissions.json
+ 	// entry can override it.
+ 	const storeRefusal = checkCentralStoreDestruction(cmd, options?.workspaceRoot)
+ 	if (storeRefusal !== null) {
+ 		return {
+ 			kind: "protected_store",
+ 			subCommand: cmd,
+ 			target: storeRefusal.target,
+ 			storeRoot: storeRefusal.storeRoot,
+ 		}
+ 	}
+ 	// Per-sub-command redirect-escape guard (the pre-parse scan above is
+ 	// the same check on the whole command; this names the offending
+ 	// sub-command for the refusal message).
+ 	const subRedirect = checkRedirectEscape(cmd, options?.workspaceRoot)
+ 	if (subRedirect !== null) {
+ 		return { kind: "redirect_escape", subCommand: cmd, redirect: subRedirect }
+ 	}
+ 	const refusal = checkSingleCommand(cmd, allowedCommands, deniedCommands)
+ 	if (refusal !== null) {
+ 		return refusal
+ 	}
+ }
+
+ return null
 }
 
 function checkSingleCommand(

@@ -77,7 +77,13 @@ import {
 import { runTestsHandler } from "./run-tests.js"
 
 import type { AuxLlmUsage, ToolContext, ToolHandler, ToolResult } from "../engine/types.js"
-import { checkCommand, type CommandRefusal } from "../permissions/commands.js"
+import {
+	checkCommand,
+	checkRedirectEscape,
+	describeRedirect,
+	type CommandRefusal,
+	type RedirectTarget,
+} from "../permissions/commands.js"
 import {
 	OllamaOutputSummarizer,
 	isLocalSummarizationEnabled,
@@ -523,6 +529,17 @@ function refusalMessage(command: string, refusal: CommandRefusal): ToolResult {
 					`permissions.json — it is shared across every project on this machine, and no single workspace may ` +
 					`delete it. Do not attempt to reset it from inside the harness.`,
 			)
+		case "redirect_escape": {
+			const redirect = refusal.redirect
+			const shown = redirect !== undefined ? describeRedirect(redirect) : "an output redirect"
+			return err(
+				`execute_command: refusing to run '${command}': it redirects output outside the workspace root ` +
+					`('${shown}') — the resolved target is outside the workspace and cannot be written from a harness ` +
+					`session. This is the same boundary every file tool enforces (write_to_file/apply_diff/... reject ` +
+					`outside-workspace paths) and cannot be overridden via --allowed-commands or permissions.json. ` +
+					`Write scratch files under <workspaceRoot>/.headlesscode/scratch/ instead.`,
+			)
+		}
 	}
 }
 
@@ -1334,16 +1351,26 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 		}
 
 		// Permissions gate (command allow/deny + dangerous substitution +
-		// central-store protection): refuse BEFORE spawning so nothing is ever
-		// executed. Compound commands are checked per sub-command (parseCommand
-		// splits on &&/||/;/|/&) — a denied or unallow-listed sub-command
-		// blocks the whole chain. This applies to every executor built on this
-		// handler, including the read-only reviewer/QA executors (they share
-		// it), which also run unattended and could otherwise run arbitrary
-		// commands. A refusal is a real tool error (isError: true) and
-		// therefore counts toward the loop's consecutive-mistake bound, same as
-		// any tool error. The command's resolved `cwd` anchors relative targets
-		// for the central-store check (see src/permissions/store-protection.ts).
+		// central-store protection + redirect-escape): refuse BEFORE spawning
+		// so nothing is ever executed. Compound commands are checked per
+		// sub-command (parseCommand splits on &&/||/;/|/&) — a denied or
+		// unallow-listed sub-command blocks the whole chain. This applies to
+		// every executor built on this handler, including the read-only
+		// reviewer/QA executors (they share it), which also run unattended and
+		// could otherwise run arbitrary commands. A refusal is a real tool
+		// error (isError: true) and therefore counts toward the loop's
+		// consecutive-mistake bound, same as any tool error. The command's
+		// resolved `cwd` anchors relative targets for the central-store and
+		// redirect-escape checks (see src/permissions/store-protection.ts and
+		// src/permissions/commands.ts). The redirect-escape scan runs against
+		// the RAW command before checkCommand parses it (a redirect embedded
+		// in an unparseable fragment — e.g. a heredoc body's `> /tmp` line —
+		// would otherwise be swallowed by the malformed-command path).
+		const redirectRoot = cwd
+		const redirectEscape = checkRedirectEscape(command, redirectRoot)
+		if (redirectEscape !== null) {
+			return refusalMessage(command, { kind: "redirect_escape", subCommand: command, redirect: redirectEscape })
+		}
 		const refusal = checkCommand(command, ctx.permissions.allowedCommands, ctx.permissions.deniedCommands, {
 			workspaceRoot: cwd,
 		})

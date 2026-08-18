@@ -120,11 +120,11 @@ Before considering any change to `src/` done:
   `edit_file` all hard-reject any path outside the workspace root
   (`resolveWithinWorkspace` in `src/tools/executor.ts` throws
   `PathTraversalError` — `/tmp/...` is never workspace-relative, so this
-  always fails). `execute_command` has no equivalent guard (it's a
-  command-string allow/deny list, not path-aware — see
-  `src/permissions/commands.ts`), so a shell redirect to `/tmp` currently
-  succeeds there even though every other write path rejects it — that
-  inconsistency is exactly how workers have been getting away with it.
+  always fails). `execute_command` enforces the same boundary for shell
+  redirects: an output redirect (`>`, `>>`, `2>`, `&>`) whose target
+  resolves outside the workspace is refused before spawn (see
+  `checkRedirectEscape` in `src/permissions/commands.ts`), closing the
+  inconsistency that let workers write to `/tmp` via `cat > /tmp/x`.
   There is no context in this project where writing to `/tmp` is correct;
   don't rely on `execute_command` being the one path that happens to allow
   it.

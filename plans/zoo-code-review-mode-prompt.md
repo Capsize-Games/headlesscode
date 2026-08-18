@@ -99,6 +99,15 @@ range/labels):
    `/tmp/hc-review-check/probe.ts`) — outside-workspace writes cannot
    be auto-approved in the interactive GUI and are rejected by the
    file tools in headless workers.
+7. **If the diff adds or changes CI configuration** (`.github/workflows/*`,
+   `scripts/e2e*`), verify it against the REAL runner (push/PR runs,
+   `gh run watch --exit-status`), not only locally — a workflow green
+   under the local mock is not evidence it runs. This exists because a
+   round's most valuable catch was exactly this class: a SIGINT test
+   passing 5/5 locally (where `process.emit("SIGINT")` never terminates
+   Node) while the real workflow failed deterministically on the runner.
+   Local-only verification of a CI change is a re-review finding even
+   when every local check is green.
 
 ## Verdict and action
 

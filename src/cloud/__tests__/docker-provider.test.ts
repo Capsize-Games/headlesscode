@@ -160,6 +160,12 @@ async function testIsolationBetweenConcurrentSessions(provider: DockerSessionPro
 	const repoA = tmpRepo()
 	const repoB = tmpRepo()
 	try {
+		// Pre-clean containers from a previous run of THIS test (e.g. a crashed
+		// or interrupted suite, or another worktree's npm test running in
+		// parallel). Without this, spawnWorktreeSession's pre-clean races with
+		// the daemon's own state and the second run fails with a stale-name
+		// conflict or a "No such container" mid-test.
+		sh(`docker rm -f $(docker ps -aq --filter name=hcls-test-iso) 2>/dev/null || true`)
 		const handleA = await provider.spawnWorktreeSession(request(repoA, "iso-a"))
 		const handleB = await provider.spawnWorktreeSession(request(repoB, "iso-b"))
 		try {

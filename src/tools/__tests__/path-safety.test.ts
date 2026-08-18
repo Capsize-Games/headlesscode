@@ -40,6 +40,15 @@ async function mkOutsideDir(ws: string, prefix: string): Promise<{ outside: stri
 	return { outside, secret }
 }
 
+async function exists(p: string): Promise<boolean> {
+	try {
+		await fs.access(p)
+		return true
+	} catch {
+		return false
+	}
+}
+
 // ─── (a) read through an escaping symlink is refused ─────────────────────────
 
 async function testReadThroughEscapingSymlinkRefused(): Promise<void> {
@@ -115,6 +124,40 @@ async function testAllFileToolsRefuseEscapingSymlink(): Promise<void> {
 		const cwdResult = await executor.execute("execute_command", { command: "pwd", cwd: "escape" })
 		assert.equal(cwdResult.isError, true, "execute_command cwd through an escaping symlink must be refused")
 		assert.match(cwdResult.content, /symlink/i, `cwd refusal must name symlink, got: ${cwdResult.content}`)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// ─── (c2) execute_command redirects are subject to the same boundary (issue #122) ─
+
+async function testExecuteCommandRedirectsRefuseOutsideWorkspace(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-symlink-redir-")
+	try {
+		const { outside, secret } = await mkOutsideDir(ws, "hc-symlink-outside-")
+		// A redirect target outside the workspace — the exact class of scratch
+		// write (e.g. `cat > /tmp/foo.md`) that previously slipped through the
+		// command-string allow/deny gate while every file tool refused it.
+		const outsideTarget = path.join(outside, "leak.txt")
+
+		const executor = createHeadlessExecutor(ws)
+		const result = await executor.execute("execute_command", {
+			command: `echo hi > ${outsideTarget}`,
+			timeout: 10,
+		})
+		assert.equal(result.isError, true, "an execute_command redirect outside the workspace must be refused")
+		assert.match(result.content, /outside the workspace/, `must name the boundary, got: ${result.content}`)
+		// The refusal happens BEFORE spawn — nothing was written.
+		assert.equal(await exists(outsideTarget), false, "the outside file must not have been created")
+		assert.equal(await exists(secret), true, "the outside dir's sentinel must survive untouched")
+
+		// The same redirect INSIDE the workspace runs fine.
+		const ok = await executor.execute("execute_command", {
+			command: `echo hi > leak.txt`,
+			timeout: 10,
+		})
+		assert.equal(ok.isError, false, "an inside-workspace redirect must run")
+		assert.equal(await fs.readFile(path.join(ws, "leak.txt"), "utf-8"), "hi\n", "the inside file must be written")
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -256,6 +299,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["read through an escaping symlink is refused", testReadThroughEscapingSymlinkRefused],
 	["write through an escaping symlink is refused (protected-file bypass)", testWriteThroughEscapingSymlinkRefused],
 	["every file tool refuses an escaping symlink (read/write/list/describe/cwd)", testAllFileToolsRefuseEscapingSymlink],
+	["execute_command redirects outside the workspace are refused before spawn; inside redirects run", testExecuteCommandRedirectsRefuseOutsideWorkspace],
 	["read-only executors get the same symlink guard", testReadOnlyExecutorsRefuseEscapingSymlink],
 	["symlinks that stay inside the workspace keep working", testInternalSymlinkStillAllowed],
 	["dangling symlink escaping the workspace is refused", testDanglingEscapingSymlinkRefused],

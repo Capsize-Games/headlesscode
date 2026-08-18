@@ -10,14 +10,22 @@
  */
 
 import assert from "node:assert/strict"
+import * as fs from "node:fs/promises"
+import * as os from "node:os"
+import * as path from "node:path"
 
 import {
 	checkCommand,
+	checkRedirectEscape,
 	containsDangerousSubstitution,
 	decideCommand,
+	describeRedirect,
 	findLongestPrefixMatch,
 	getCommandDecision,
+	isOutsideWorkspace,
 	parseCommand,
+	redirectTargets,
+	resolveRedirectTarget,
 } from "../commands.js"
 
 // ─── (a) dangerous substitutions are always refused, regardless of config ───
@@ -149,6 +157,170 @@ async function testFindLongestPrefixMatch(): Promise<void> {
 	assert.equal(findLongestPrefixMatch("", ["git"]), null)
 }
 
+// ─── (e) redirect-escape guard (issue #122): >/>>/2>/&> outside the workspace ─
+
+async function testRedirectEscapeAlwaysDenied(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-commands-redir-"))
+	try {
+		const outside = path.join(os.tmpdir(), `hc-commands-outside-${process.pid}`)
+		await fs.rm(outside, { recursive: true, force: true })
+		try {
+			const escaping = [
+				`cat > /tmp/foo.md`,
+				`cat >> /tmp/foo.md`,
+				`echo hi 2> /tmp/err.log`,
+				`echo hi 2>> /tmp/err.log`,
+				`echo hi &> /tmp/both.log`,
+				`echo hi &>> /tmp/both.log`,
+				`cat >| /tmp/foo.md`,
+				`echo hi 2>| /tmp/err.log`,
+				`echo hi > ~/out.txt`,
+				`echo hi > ${outside}/out.txt`,
+				`echo hi > $HC_TEST_OUTDIR/x.txt`,
+				`echo hi > "${outside}/a b.txt"`,
+				`echo hi > '${outside}/single.txt'`,
+				`cat > /tmp/x && echo ok`, // compound: escaping sub-command blocks the chain
+				`echo a > /tmp/a.txt; echo b > /tmp/b.txt`,
+			]
+			// $HC_TEST_OUTDIR resolves through expandEnv like any $VAR — pin it
+			// to the temp dir so the escaping case is deterministic.
+			const savedVar = process.env.HC_TEST_OUTDIR
+			process.env.HC_TEST_OUTDIR = os.tmpdir()
+			try {
+				for (const cmd of escaping) {
+					// Refused even with an allow-list that would otherwise permit it…
+					assert.equal(
+						decideCommand(cmd, ["cat", "echo", "rm"], [], { workspaceRoot: ws }),
+						"deny",
+						`decideCommand(${cmd}) with allow-list should deny`,
+					)
+					// …and with ZERO config (default-allow never covers redirect escapes).
+					assert.equal(
+						decideCommand(cmd, [], [], { workspaceRoot: ws }),
+						"deny",
+						`decideCommand(${cmd}) with zero config should deny`,
+					)
+					const refusal = checkCommand(cmd, ["cat", "echo", "rm"], [], { workspaceRoot: ws })
+					assert.ok(
+						refusal !== null && refusal.kind === "redirect_escape",
+						`checkCommand(${cmd}) should be kind=redirect_escape (got ${refusal?.kind})`,
+					)
+					assert.ok(refusal.redirect !== undefined, "refusal must carry the offending redirect")
+					assert.ok(
+						isOutsideWorkspace(ws, resolveRedirectTarget(refusal.redirect.word, ws)),
+						`refusal.redirect.word (${refusal.redirect.word}) must resolve outside the workspace`,
+					)
+				}
+
+				// Redirects that STAY inside the workspace are allowed.
+				const allowed = [
+					`cat > out.txt`,
+					`echo hi > ./out.txt`,
+					`echo hi > ${path.join(ws, "sub")}/out.txt`,
+					`echo hi >> ${ws}/out.log`,
+					`echo hi 2> ${ws}/err.log`,
+					`cat > "${ws}/a b.txt"`,
+					`echo hi > $TMPDIR/x 2>&1`, // 2>&1 is fd duplication, NOT a path redirect
+					`echo hi > out.txt && echo ok > out2.txt`,
+				]
+				for (const cmd of allowed) {
+					assert.equal(
+						decideCommand(cmd, [], [], { workspaceRoot: ws }),
+						"allow",
+						`decideCommand(${cmd}) should allow (target inside the workspace)`,
+					)
+				}
+			} finally {
+				if (savedVar === undefined) {
+					delete process.env.HC_TEST_OUTDIR
+				} else {
+					process.env.HC_TEST_OUTDIR = savedVar
+				}
+			}
+		} finally {
+			await fs.rm(outside, { recursive: true, force: true })
+		}
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testRedirectTargetParsing(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-commands-redir-parse-"))
+	try {
+		// Targets are extracted with quote-stripped words.
+		assert.deepEqual(
+			redirectTargets(`echo hi > /tmp/foo.md`).map((t) => t.word),
+			["/tmp/foo.md"],
+		)
+		assert.deepEqual(
+			redirectTargets(`echo hi >> /tmp/foo.md`).map((t) => t.word),
+			["/tmp/foo.md"],
+		)
+		assert.deepEqual(
+			redirectTargets(`echo hi 2> /tmp/err.log`).map((t) => t.word),
+			["/tmp/err.log"],
+		)
+		assert.deepEqual(
+			redirectTargets(`echo hi 2>> /tmp/err.log`).map((t) => t.word),
+			["/tmp/err.log"],
+		)
+		assert.deepEqual(
+			redirectTargets(`echo hi &> /tmp/both.log`).map((t) => t.word),
+			["/tmp/both.log"],
+		)
+		assert.deepEqual(
+			redirectTargets(`echo hi &>> /tmp/both.log`).map((t) => t.word),
+			["/tmp/both.log"],
+		)
+		assert.deepEqual(
+			redirectTargets(`cat > "${os.tmpdir()}/a b.txt"`).map((t) => t.word),
+			[`${os.tmpdir()}/a b.txt`],
+		)
+		assert.deepEqual(
+			redirectTargets(`echo a > /tmp/a.txt; echo b > /tmp/b.txt`).map((t) => t.word),
+			["/tmp/a.txt", "/tmp/b.txt"],
+		)
+		// Input redirects (<, <<, <<<) and fd duplication (2>&1) carry no OUTPUT path.
+		assert.deepEqual(redirectTargets(`cat < /etc/hostname`), [])
+		assert.deepEqual(redirectTargets(`cat <<EOF\nhi\nEOF`), [])
+		assert.deepEqual(redirectTargets(`cat <<< hi`), [])
+		assert.deepEqual(redirectTargets(`echo hi 2>&1`), [])
+		assert.deepEqual(redirectTargets(`echo hi 3>&2`), [])
+		// A redirect with NO target word emits nothing (the shell would error).
+		assert.deepEqual(redirectTargets(`echo hi >`), [])
+
+		// checkRedirectEscape resolves `~` and `$VAR` against the workspace root.
+		assert.notEqual(checkRedirectEscape(`echo hi > ~/x.txt`, ws), null, "~ escapes the workspace")
+		assert.notEqual(checkRedirectEscape(`echo hi > $HOME/x.txt`, ws), null, "$HOME escapes the workspace")
+		assert.equal(checkRedirectEscape(`echo hi > ./x.txt`, ws), null, "relative targets stay inside")
+		assert.equal(checkRedirectEscape(`echo hi > out.txt`, ws), null)
+		assert.equal(checkRedirectEscape(`echo hi > $TMPDIR/x 2>&1`, ws), null, "fd duplication is not a redirect target")
+		// Heredoc BODY redirects are still caught (raw scan, pre-parse).
+		assert.notEqual(checkRedirectEscape(`cat <<EOF\n> /tmp/x\nEOF`, ws), null, "heredoc body redirect escapes")
+
+		// describeRedirect renders an operator + word pair for refusal messages.
+		assert.equal(describeRedirect({ operator: ">", word: "/tmp/foo.md", index: 0 }), "> /tmp/foo.md")
+		assert.equal(describeRedirect({ operator: ">>", word: "/tmp/foo.md", index: 0 }), ">>/tmp/foo.md")
+		assert.equal(describeRedirect({ operator: "2>", word: "/tmp/err.log", index: 0 }), "2> /tmp/err.log")
+		assert.equal(describeRedirect({ operator: "&>", word: "/tmp/both.log", index: 0 }), "&>/tmp/both.log")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testRedirectEscapeNotOverridableByAllowList(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-commands-redir-override-"))
+	try {
+		// An allow-everything config does NOT bypass the redirect-escape guard.
+		const refusal = checkCommand(`cat > /tmp/foo.md`, ["*", "cat"], [], { workspaceRoot: ws })
+		assert.ok(refusal !== null && refusal.kind === "redirect_escape", "allow-everything config cannot override the guard")
+		assert.equal(decideCommand(`cat > /tmp/foo.md`, ["*"], [], { workspaceRoot: ws }), "deny")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -158,6 +330,9 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["compound commands (&&/;||/|/&) checked per sub-command; malformed refused", testCompoundCommandsCheckedPerSubCommand],
 	["getCommandDecision port matches upstream decision vocabulary", testGetCommandDecisionPortParity],
 	["findLongestPrefixMatch port matches upstream semantics", testFindLongestPrefixMatch],
+	["redirect-escape guard (issue #122): >/>>/2>/&> outside the workspace always denied, inside allowed", testRedirectEscapeAlwaysDenied],
+	["redirect target extraction + resolution + describeRedirect", testRedirectTargetParsing],
+	["redirect-escape guard is NOT overridable by an allow-everything config", testRedirectEscapeNotOverridableByAllowList],
 ]
 
 async function main(): Promise<void> {
