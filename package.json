@@ -1,12 +1,33 @@
 {
 	"name": "headlesscode",
 	"version": "0.1.0",
-	"private": true,
-	"description": "Standalone headless coding-agent harness reusing Zoo Code's portable prompt/tool/mode core (Apache-2.0). Phase 1 engine.",
+	"description": "Standalone headless coding-agent harness: runs the Zoo Code agent loop (prompts, tools, modes) without a VS Code UI, driven by CLI, HTTP, and parallel worktree orchestration.",
+	"license": "Apache-2.0",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/Capsize-Games/headlesscode.git"
+	},
+	"author": "The headlesscode contributors",
+	"keywords": [
+		"cli",
+		"coding-agent",
+		"headless",
+		"automation",
+		"agent"
+	],
 	"type": "module",
 	"engines": {
 		"node": ">=18"
 	},
+	"files": [
+		"src",
+		"scripts",
+		"docs",
+		"plans",
+		"ATTRIBUTION.md",
+		"LICENSE",
+		"README.md"
+	],
 	"bin": {
 		"headlesscode": "src/cli.ts"
 	},
