@@ -16,6 +16,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 
 import { createHeadlessExecutor } from "../executor.js"
+import type { PermissionsConfig } from "../../permissions/config.js"
 
 async function mkTmpWorkspace(prefix: string): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -213,6 +214,63 @@ async function testEditMissingFileFails(): Promise<void> {
 	}
 }
 
+// ─── (i) protected files are refused (shared write-path guard) ───────────────
+
+const PROTECTED_PERMISSIONS: PermissionsConfig = {
+	allowedCommands: [],
+	deniedCommands: [],
+	protectedFiles: [".env", "*.pem"],
+	allowProtectedWrites: false,
+}
+
+async function testProtectedFileRefused(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-ef-protected-")
+	try {
+		const file = path.join(ws, ".env")
+		const original = "API_KEY=secret\n"
+		await fs.writeFile(file, original, "utf-8")
+
+		const executor = createHeadlessExecutor(ws, { permissions: { ...PROTECTED_PERMISSIONS } })
+		const result = await executor.execute("edit_file", {
+			file_path: ".env",
+			old_string: "API_KEY=secret\n",
+			new_string: "API_KEY=leaked\n",
+		})
+
+		assert.equal(result.isError, true, "edit_file on a protected file must be refused")
+		assert.match(result.content, /refusing to write protected file '\.env'/, "refusal must name the file")
+		assert.match(result.content, /protected pattern '\.env'/, "refusal must name the matched pattern")
+		assert.match(result.content, /allow-protected-writes/, "refusal must mention the escape hatch")
+		assert.equal(await fs.readFile(file, "utf-8"), original, "protected file must be untouched")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// ─── (j) the escape hatch bypasses the protected-file guard ──────────────────
+
+async function testProtectedFileEscapeHatch(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-ef-protected-hatch-")
+	try {
+		const file = path.join(ws, ".env")
+		await fs.writeFile(file, "API_KEY=secret\n", "utf-8")
+
+		const executor = createHeadlessExecutor(ws, {
+			permissions: { ...PROTECTED_PERMISSIONS, allowProtectedWrites: true },
+		})
+		const result = await executor.execute("edit_file", {
+			file_path: ".env",
+			old_string: "API_KEY=secret\n",
+			new_string: "API_KEY=rotated\n",
+		})
+
+		assert.equal(result.isError, false, `the escape hatch must permit the protected edit: ${result.content}`)
+		assert.equal(await fs.readFile(file, "utf-8"), "API_KEY=rotated\n")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -224,6 +282,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["file creation: old_string '' on new file succeeds", testCreateNewFile],
 	["file creation: old_string '' on existing file fails clearly", testCreateExistingFileFails],
 	["editing a non-existent file: clear error", testEditMissingFileFails],
+	["protected file: refused via shared write-path guard", testProtectedFileRefused],
+	["protected file: --allow-protected-writes escape hatch permits the edit", testProtectedFileEscapeHatch],
 ]
 
 async function main(): Promise<void> {
