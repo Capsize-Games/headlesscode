@@ -201,9 +201,9 @@ After=network-online.target
 
 [Service]
 Type=simple
-Environment=GH_TOKEN=ghp_...
-WorkingDirectory=/home/joe/Projects
-ExecStart=/usr/bin/npx --prefix /home/joe/Projects/headlesscode tsx /home/joe/Projects/headlesscode/src/cli.ts watch --owner my-org --repo /home/joe/Projects/my-repo --label needs-agent --poll-interval-ms 60000
+Environment=GH_TOKEN=ghp_your_token_here
+WorkingDirectory=/opt/headlesscode
+ExecStart=/usr/bin/npx --prefix /opt/headlesscode tsx /opt/headlesscode/src/cli.ts watch --owner my-org --repo /opt/my-repo --label needs-agent --poll-interval-ms 60000
 Restart=on-failure
 
 [Install]

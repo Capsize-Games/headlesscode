@@ -1,28 +1,33 @@
 # syntax=docker/dockerfile:1
 # ---------------------------------------------------------------------------
 # headlesscode — standalone headless coding-agent CLI, packaged as a Docker
-# image.
+# image. Runs headlesscode as a standalone service (CLI/orchestrator/watcher)
+# next to whatever application container wants to drive it over the Docker
+# network.
 #
-# This is the image airunner's compose stack runs as a sidecar service next
-# to the Python `server` container (see docs/airunner-docker-packaging.md).
-# Node 22 (matching the LTS this stack's client build already uses in
-# Dockerfile.caddy) + git; tsx executes the TypeScript source directly —
-# there is no compiled output in this repo, so devDependencies are needed at
-# runtime and installed via `npm ci`.
+# Node 22 + git; tsx executes the TypeScript source directly — there is no
+# compiled output in this repo, so devDependencies are needed at runtime and
+# installed via `npm ci`.
 #
 # Build context = headlesscode repo root:
 #   docker build -f docker/Dockerfile -t headlesscode:0.1.0 .
+#
+# Registry + tag policy: images are published to
+# ghcr.io/capsize-games/headlesscode, tagged with the exact `version` from
+# package.json (e.g. `0.1.0`) plus a floating `latest` pointing at the most
+# recent release build. Pin the versioned tag in any deployment that needs
+# reproducibility — `latest` is for local experimentation only.
 #
 # Deliberately NOT installed here:
 #   - Playwright browser binaries. The `playwright` npm package installs as
 #     JS-only (no browser download on npm ci — no install script), and
 #     browser binaries are a ~400MB addition, so browser_action is disabled
 #     until an explicit `npx playwright install chromium` (+ install-deps)
-#     step is run. See docs/airunner-docker-packaging.md §Playwright.
+#     step is run.
 #   - Docker CLI / docker.sock. Per-session container isolation
 #     (DockerSessionProvider) is a separate, undecided security expansion —
 #     v1 runs sessions as plain git worktrees + sibling processes, which
-#     needs no Docker. See docs/airunner-docker-packaging.md §Isolation.
+#     needs no Docker.
 # ---------------------------------------------------------------------------
 
 FROM node:22-bookworm-slim
@@ -83,9 +88,9 @@ RUN printf '#!/bin/sh\nexport TSX_TSCONFIG_PATH=/opt/headlesscode/tsconfig.json\
         > /usr/local/bin/headlesscode \
     && chmod +x /usr/local/bin/headlesscode
 
-# Persistent state lives on the /data volume (named `server_data` in
-# airunner's compose) so it survives image rebuilds — never inside the
-# container filesystem. HEADLESSCODE_WORKSPACE_ROOT is where orchestrated
+# Persistent state lives on the /data volume (a named volume in whatever
+# compose stack runs this image) so it survives image rebuilds — never
+# inside the container filesystem. HEADLESSCODE_WORKSPACE_ROOT is where orchestrated
 # project checkouts + their .headlesscode/ dirs go; HOME (default
 # ~/.headlesscode/checkpoints, playwright cache) also lands under /data.
 ENV HEADLESSCODE_WORKSPACE_ROOT=/data/headlesscode-workspaces \
@@ -98,8 +103,8 @@ RUN chmod +x /usr/local/bin/headlesscode-entrypoint.sh
 
 EXPOSE 4390
 ENTRYPOINT ["/usr/local/bin/headlesscode-entrypoint.sh"]
-# v1: the sidecar is an install target, not yet wired into uwu's tool
-# calling (that's plans/uwuchat-integration.md's Tier 1). Keep it alive so
-# the server container can reach it over the Docker network; Tier 1 replaces
-# this with the real invocation surface.
+# v1: the container is an install target, not yet wired into any specific
+# caller's tool-calling surface. Keep it alive so another container can
+# reach it over the Docker network; a future integration replaces this with
+# the real invocation surface.
 CMD ["sleep", "infinity"]

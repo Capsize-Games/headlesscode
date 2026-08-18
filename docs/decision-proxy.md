@@ -2,9 +2,8 @@
 
 The decision-proxy (`src/decision-proxy/`) is an **LLM stand-in for the
 human on `ask_followup_question`** — and `switch_mode`, which shares the same
-escalation primitive. The work order it was built from is
-[`plans/decision-proxy-agent.md`](../plans/decision-proxy-agent.md); this doc
-describes what shipped and what the live pilot measured.
+escalation primitive. This doc describes what shipped and what the live
+pilot measured.
 
 ## The problem
 

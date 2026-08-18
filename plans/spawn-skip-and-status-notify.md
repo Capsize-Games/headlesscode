@@ -20,7 +20,7 @@ Both surfaced by a real orchestrate round on 2026-08-04 against
 (never cleaned up — no automated purge exists). The spawn script printed:
 
 ```
-Skipping w1 — /home/joe/Projects/airunner/.worktrees/w1 already exists.
+Skipping w1 — /path/to/target-repo/.worktrees/w1 already exists.
 ```
 
 and `continue`d to w2/w3/w4 — but w1 never got a worker spawned, was never

@@ -3,7 +3,7 @@
 ## Status: active work order (dispatch via headlesscode orchestrate)
 
 This is the work order for creating a NEW airunner project `projects/headlesscode/`
-in the airunner repo (`/home/joe/Projects/airunner`), so the user can stop using
+in the airunner repo (`~/Projects/airunner`), so the user can stop using
 VS Code for headlesscode work entirely: log into a website (like uwuchat.com),
 register any folder on the workstation as a project, and launch headlesscode
 sessions against it from the chat UI.
@@ -18,7 +18,7 @@ CRITICAL provider requirement: DeepSeek must route through the **deepseek
 provider on OpenRouter** (`provider.order: ["deepseek"]`), NOT DeepInfra
 (`["deepinfra"]`) — see the provider section below.
 
-All paths below are relative to `/home/joe/Projects/airunner`. Every citation
+All paths below are relative to `~/Projects/airunner`. Every citation
 was verified against current file content.
 
 ## Architecture recap (what the clone needs to reuse)
@@ -275,7 +275,7 @@ Two runtime bugs found during bring-up and fixed on master (commit
 
 ## Verification bar
 
-- `cd /home/joe/Projects/airunner && grep -rn "projects.uwuchat" projects/headlesscode/` → no hits (all rewritten).
+- `cd ~/Projects/airunner && grep -rn "projects.uwuchat" projects/headlesscode/` → no hits (all rewritten).
 - Server: run the new project's tests — `docker compose exec server python -m pytest projects/headlesscode/server/tests/ -q` (or the docker-run boot check pattern from the airunner convention) with `AIRUNNER_PROJECT=headlesscode`. Framework must boot with `register_routes` including the new routes (use the airunner convention boot check).
 - Provider: assert `_provider_order_for_model("deepseek/deepseek-v4-flash")` returns `["deepseek"]` when `AIRUNNER_PROJECT=headlesscode` and `["deepinfra"]` otherwise.
 - Client: `cd client && VITE_PROJECT=headlesscode npm run build` (or the repo's client build convention) — must compile.
@@ -285,9 +285,9 @@ Two runtime bugs found during bring-up and fixed on master (commit
 
 Dispatch via the headlesscode orchestrator against the airunner repo with
 synthetic issues (`--issues-json`, no `--file-issues` — no real GitHub
-writes): `cd /home/joe/Projects/airunner && scripts/headlesscode-orchestrate.sh --issues-json <this-plan-dir>/headlesscode-project-issues.json --max-iterations 150`. The airunner wrapper
+writes): `cd ~/Projects/airunner && scripts/headlesscode-orchestrate.sh --issues-json <this-plan-dir>/headlesscode-project-issues.json --max-iterations 150`. The airunner wrapper
 exports `HEADLESSCODE_OPENROUTER_API_KEY` from airunner's `.env` and execs
-`headlesscode orchestrate --repo /home/joe/Projects/airunner`.
+`headlesscode orchestrate --repo ~/Projects/airunner`.
 
 Issue split (each becomes its own worktree):
 - Issue 1: sections A + D (server project + provider change).

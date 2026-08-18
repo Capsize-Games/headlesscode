@@ -122,8 +122,7 @@ restrict what the agent can *read* or what allowed commands can accomplish.
 This project is pre-1.0 and has no private disclosure channel yet. For now,
 report security findings by opening a GitHub issue on
 [Capsize-Games/headlesscode](https://github.com/Capsize-Games/headlesscode)
-tagged `security`, or a pull request with a fix. See the project's
-[`headless-coding-harness-project.md`](headless-coding-harness-project.md) for
+tagged `security`, or a pull request with a fix. See the docs in `docs/` for
 the overall design.
 
 ## Supported versions

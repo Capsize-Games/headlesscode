@@ -17,11 +17,11 @@ unverified until you personally reproduce it.
 **Important about your workspace:** your own workspace is `.worktrees/review-r3`
 — the two worktrees under review are SIBLINGS, not children of your workspace.
 Use absolute paths for everything:
-- orchselfheal worktree: `/home/joe/Projects/headlesscode/.worktrees/orchselfheal`
-- imgsupport worktree: `/home/joe/Projects/headlesscode/.worktrees/imgsupport`
+- orchselfheal worktree: `/path/to/headlesscode/.worktrees/orchselfheal`
+- imgsupport worktree: `/path/to/headlesscode/.worktrees/imgsupport`
 
 Run commands via `execute_command` with `cd <worktree-abs-path> && ...` (e.g.
-`cd /home/joe/Projects/headlesscode/.worktrees/orchselfheal && npx tsc --noEmit`).
+`cd /path/to/headlesscode/.worktrees/orchselfheal && npx tsc --noEmit`).
 `git -C <abs-path>` also works for diffs/logs. If a read tool rejects paths
 outside your workspace, fall back to `git -C <abs> diff/show` and
 `cd <abs> && cat` through `execute_command` — the diff is what matters, not
@@ -66,7 +66,7 @@ which tool produced it.
 ### 1. orchselfheal — core orchestrator state semantics (the genuinely dangerous class)
 
 Verify personally, not from the report:
-- `cd /home/joe/Projects/headlesscode/.worktrees/orchselfheal && npx tsc --noEmit`
+- `cd /path/to/headlesscode/.worktrees/orchselfheal && npx tsc --noEmit`
   and `npm test` — compare actual suite/pass counts to the claims.
 - Re-run `bash scripts/e2e-phase2/run.sh` in the worktree (the change touches
   `src/orchestrator/` and the e2e-phase2 suite is the one that exercises real
@@ -96,7 +96,7 @@ Verify personally, not from the report:
 ### 2. imgsupport — new subsystem + real-money evaluation + cost accounting
 
 Verify personally:
-- `cd /home/joe/Projects/headlesscode/.worktrees/imgsupport && npx tsc --noEmit`
+- `cd /path/to/headlesscode/.worktrees/imgsupport && npx tsc --noEmit`
   and `npm test` — compare suite/pass counts to claims (new suites:
   `describe.test.ts`, `describe_image.test.ts`, extended browser-action test).
 - Re-run every e2e suite under `scripts/e2e*/run.sh` in the worktree (the spec

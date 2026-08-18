@@ -89,7 +89,7 @@ owner's own suggestion), with this layout:
 directory, not the worktree's own — confirmed:
 ```
 $ cd .worktrees/condense-async && git rev-parse --git-common-dir
-/home/joe/Projects/headlesscode/.git
+/path/to/headlesscode/.git
 ```
 This means keying the project store by the resolved, absolute
 `git-common-dir` (or its parent directory) rather than by the raw workspace

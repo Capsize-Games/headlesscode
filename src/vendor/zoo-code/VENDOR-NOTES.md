@@ -4,7 +4,7 @@ This directory contains a verbatim vendored copy of the portable (VS Code-free)
 core of **Zoo Code** (`Zoo-Code-Org/Zoo-Code`, a Roo Code fork), Apache-2.0,
 Copyright 2026 Zoo Code.
 
-- Upstream clone: `/home/joe/Projects/zoo-code` (also at `./zoo-code` inside
+- Upstream clone: `~/Projects/zoo-code` (also at `./zoo-code` inside
   this workspace while vendoring is in progress).
 - Inspected commit: `ca9b60fbc7b72a27352b0e2084271c28f2419f94`.
 - License: `LICENSE` at repo root is the verbatim Apache 2.0 text from

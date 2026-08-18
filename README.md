@@ -6,33 +6,32 @@ Code fork) good — its system prompts, native tool schemas, and
 mode/rules configuration format — without carrying along the VS Code GUI
 dependency.
 
-See [`headless-coding-harness-project.md`](./headless-coding-harness-project.md)
-for the full project plan (Phases 0–6). This repo currently implements
-**Phase 1** — vendoring the portable Apache-2.0 core and the headless runtime
-engine (OpenRouter client, tool executor, tool-call parser, orchestration
-loop, CLI) — and **Phase 2**: the headless orchestration layer that replaces
-the airunner repo's xdotool/GUI-based parallel-worktree orchestration with
-harness subprocesses, while reusing its issue-splitting heuristics and its
-reviewer checklist (see
-[`docs/phase2-orchestration.md`](./docs/phase2-orchestration.md)),
-**Phase 3**: the memory subsystem (per-project knowledge facts + rolling
-session summaries, local semantic recall, and a UwUChat-backable `MemoryStore`
-contract — see [`docs/memory-uwuchat-contract.md`](./docs/memory-uwuchat-contract.md)),
-**Phase 4**: headless QA (run the target repo's `qa-agent` mode as a
-second harness session — see [`docs/phase4-qa.md`](./docs/phase4-qa.md)) and a
-human-approval deploy gate in front of the repo's `deploy-production.sh` (see
-[`docs/phase4-deploy-gate.md`](./docs/phase4-deploy-gate.md)),
-and **Phase 5**: the GitHub issue watcher (see
-[`docs/phase5-issue-watcher.md`](./docs/phase5-issue-watcher.md)) — file an
-issue with a target label and a poll loop automatically splits and spawns it
-through the existing orchestration pipeline, with durable idempotency so a
-restart never double-spawns,
-and **Phase 6**: cloud scaling, guardrails-first — a hard concurrent-session
-cap + a per-session cost/time/iteration budget, a `CloudProvider` abstraction
-(container/VM per issue behind the same lifecycle as the local worktree flow),
-and a Hetzner runner-fleet evaluation (see
-[`docs/phase6-cloud.md`](./docs/phase6-cloud.md)). No live cloud resources
-are launched; the caps/budgets land before any scaling.
+This repo implements:
+
+- The **headless runtime engine** — vendoring the portable Apache-2.0 core and
+  the headless runtime (OpenRouter client, tool executor, tool-call parser,
+  orchestration loop, CLI).
+- A **headless orchestration layer** — split an issue into worker groups, run
+  each as a harness subprocess in its own git worktree, review, and merge
+  (see [`docs/phase2-orchestration.md`](./docs/phase2-orchestration.md)).
+- A **memory subsystem** — per-project knowledge facts + rolling session
+  summaries, with local semantic recall and a pluggable `MemoryStore`
+  contract for a remote backend.
+- **Headless QA** — run the target repo's `qa-agent` mode as a second harness
+  session (see [`docs/phase4-qa.md`](./docs/phase4-qa.md)) and a
+  human-approval deploy gate in front of the repo's `deploy-production.sh`
+  (see [`docs/phase4-deploy-gate.md`](./docs/phase4-deploy-gate.md)).
+- A **GitHub issue watcher** (see
+  [`docs/phase5-issue-watcher.md`](./docs/phase5-issue-watcher.md)) — file an
+  issue with a target label and a poll loop automatically splits and spawns it
+  through the existing orchestration pipeline, with durable idempotency so a
+  restart never double-spawns.
+- **Cloud-scaling guardrails** — a hard concurrent-session cap, a per-session
+  cost/time/iteration budget, and a `CloudProvider` abstraction (container/VM
+  per issue behind the same lifecycle as the local worktree flow) with an
+  evaluation-only cloud-provider sketch (see
+  [`docs/phase6-cloud.md`](./docs/phase6-cloud.md)). No live cloud resources
+  are launched; the caps/budgets land before any scaling.
 
 > ⚠️ **Security warning: default-allow arbitrary command execution.**
 > `headlesscode` is a headless coding agent: by default it runs **arbitrary
@@ -54,7 +53,12 @@ until completion. Non-interactive by design.
 
 ## Quick start
 
+`headlesscode` is not yet published to the npm registry, so install it from a
+checkout:
+
 ```bash
+git clone https://github.com/Capsize-Games/headlesscode.git
+cd headlesscode
 npm install
 
 # Required (except for --dry-run):
@@ -66,15 +70,14 @@ export OPENROUTER_HTTP_REFERER=https://example.com       # OpenRouter app header
 export OPENROUTER_APP_TITLE="headlesscode"               # OpenRouter X-Title header
 export HEADLESSCODE_WORKSPACE_ROOT=/path/to/target/repo  # default workspace root
 
-# Run a task against a target repo:
-npx headlesscode --task "Fix the bug in src/index.ts" --workspace /path/to/target/repo
+# Run a task against a target repo, straight from the checkout:
+node bin/headlesscode.mjs --task "Fix the bug in src/index.ts" --workspace /path/to/target/repo
 ```
 
 ### Systemwide `headlesscode` command
 
-Other projects on this machine currently invoke headlesscode via
-`(cd ~/Projects/headlesscode && npx tsx src/cli.ts ...)`. To skip that, install
-a `headlesscode` command onto your `PATH` once:
+To avoid re-typing `node <checkout>/bin/headlesscode.mjs` from every project,
+install a `headlesscode` command onto your `PATH` once:
 
 ```bash
 scripts/install-cli.sh
@@ -92,6 +95,10 @@ need updating for ordinary code changes.
 headlesscode orchestrate --repo . --issue 42
 ```
 
+The rest of this README uses the plain `headlesscode` form for brevity —
+substitute `node <checkout>/bin/headlesscode.mjs` if you haven't run
+`scripts/install-cli.sh` yet.
+
 ## The `--dry-run` flow (no API key needed)
 
 `--dry-run` builds the full system prompt and validates configuration loading
@@ -99,7 +106,7 @@ without calling the LLM — useful for CI and for checking that a target repo's
 `.roomodes` / `.roo/rules-<slug>/` / `AGENTS.md` are picked up:
 
 ```bash
-npx headlesscode --dry-run --mode code --workspace /path/to/target/repo
+headlesscode --dry-run --mode code --workspace /path/to/target/repo
 ```
 
 It prints the assembled system prompt plus a summary line (mode, custom modes
@@ -113,12 +120,12 @@ export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-...
 export HEADLESSCODE_WORKSPACE_ROOT=~/Projects/some-target-repo
 
 # Point the agent at an already-scoped issue, in an isolated worktree:
-npx headlesscode \
+headlesscode \
   --mode code \
   --task "Implement issue #29: add retry logic to the HTTP client (see .roo/rules for project conventions)." \
   --workspace ~/Projects/some-target-repo \
   --max-iterations 50 \
-  --log-file /tmp/headlesscode-session.log
+  --log-file ./headlesscode-session.log
 ```
 
 The agent reads files, runs commands, writes code, and finishes by calling
@@ -133,7 +140,7 @@ To use headlesscode against a project that isn't set up as a headlesscode
 project yet, register it in one step:
 
 ```bash
-npx headlesscode init --workspace ~/Projects/rts_cpp
+headlesscode init --workspace ~/Projects/your-project
 ```
 
 This detects the project's stack(s) (which drives per-session instruction
@@ -141,7 +148,7 @@ selection), makes sure the project's `.gitignore` excludes `.headlesscode/`
 session artifacts, and builds the codebase-search index and the codemap — no
 manual `index`/`codemap`/`.gitignore` steps needed. The index step calls the
 embedding API and costs real money unless you pass `--skip-index` or
-`--embedding-backend ollama`. See `npx headlesscode init --help` for the full
+`--embedding-backend ollama`. See `headlesscode init --help` for the full
 options.
 
 ## CLI reference
@@ -296,14 +303,14 @@ watch subcommand (Phase 5 — GitHub issue watcher, poll-based intake):
   a fake; the CLI wires `OpenRouterClient`.
 - [`src/engine/logger.ts`](./src/engine/logger.ts) — structured logger
   (timestamped lines to stdout/stderr, optional file).
-- [`src/memory/`](./src/memory/index.ts) — Phase 3 memory subsystem:
+- [`src/memory/`](./src/memory/index.ts) — memory subsystem:
   - [`src/memory/types.ts`](./src/memory/types.ts) — the `MemoryFact` /
     `SessionSummary` schema (per-project scoped, kinds
     `convention|decision|failure|knowledge` where "things that didn't work"
-    are `failure`) and the two contracts: `MemoryStore` (the UwUChat-backable
-    boundary) and `Embedder`. Hard data-isolation requirement documented: the
-    harness knowledge is a dedicated schema, never reachable through any
-    customer tenant route.
+    are `failure`) and the two contracts: `MemoryStore` (the pluggable
+    storage boundary) and `Embedder`. Hard data-isolation requirement
+    documented: the harness knowledge is a dedicated schema, never reachable
+    through any customer tenant route.
   - [`src/memory/local.ts`](./src/memory/local.ts) — `LocalMemoryStore`: the
     fully working file backend (`facts/<project>.jsonl` +
     `sessions/<project>.jsonl`, append-only, idempotent `addFact` by content
@@ -316,21 +323,18 @@ watch subcommand (Phase 5 — GitHub issue watcher, poll-based intake):
   - [`src/memory/summarizer.ts`](./src/memory/summarizer.ts) —
     `extractSessionSummary` (deterministic; files/commands derived from the
     tool history, facts via keyword heuristics) + `buildRollingSummary`
-    (compact markdown recap of the last N sessions — the AgentMemory
-    equivalent, so a session never needs the infinite raw history).
-  - [`src/memory/uwuchat.ts`](./src/memory/uwuchat.ts) — `UwUChatMemoryStore`:
-    the harness-side client for the future AIRunner/UwUChat memory API
-    (contract in
-    [`docs/memory-uwuchat-contract.md`](./docs/memory-uwuchat-contract.md)).
-    Throws "not implemented — awaiting AIRunner endpoint" until
-    `UWUCHAT_BASE_URL` (+ `UWUCHAT_TOKEN`) is set.
+    (compact markdown recap of the last N sessions, so a session never needs
+    the infinite raw history).
+  - [`src/memory/uwuchat.ts`](./src/memory/uwuchat.ts) — a remote
+    `MemoryStore` implementation stub for a future hosted memory API. Throws
+    "not implemented" until its base-URL/token env vars are set.
   - Memory is wired into `HeadlessSession` as an **opt-in** config (`memory`
     + `project`); when unset the loop behaves exactly as before. When set, the
     loop injects a `## PROJECT MEMORY` section (recalled facts + rolling
     recap) into the first user message and records the session + extracted
     facts afterwards — and memory failures are always non-fatal.
 - [`src/orchestrator/`](./src/orchestrator/index.ts) — Phase 2 orchestration
-  layer: `split.ts` (airunner issue-splitting heuristics port, deterministic +
+  layer: `split.ts` (issue-splitting heuristics, deterministic +
   unit-tested), `state.ts` (`.worktrees/.orchestrator-state.json` read/write),
   `reviewer.ts` (adversarial fresh-context review run with a read-only
   executor), `watch.ts` (completion polling of `.harness.done` markers + stall
@@ -390,9 +394,8 @@ watch subcommand (Phase 5 — GitHub issue watcher, poll-based intake):
   (and only then) invokes the repo's `scripts/deploy-production.sh` with
   forwarded deploy args. Exit 3 = human DENIED (hard stop).
 - [`scripts/spawn-parallel-worktrees.sh`](./scripts/spawn-parallel-worktrees.sh)
-  — drop-in replacement for the airunner spawner (same CLI contract, same
-  worktree/.env/branch conventions; replaces the GUI block with
-  `run-worker.sh` + state-file writes).
+  — spawns one git worktree + harness worker per group (worktree/.env/branch
+  conventions, `run-worker.sh` + state-file writes, no GUI involved).
 
 ### Phase 1 tool filtering decision
 
@@ -447,9 +450,8 @@ server with a stubbed spawner).
   [`docs/phase2-orchestration.md`](./docs/phase2-orchestration.md)).
 - ✅ Phase 3 — memory subsystem: per-project knowledge facts + rolling session
   summaries (`src/memory/`), local deterministic embedder for semantic recall,
-  opt-in `HeadlessSession`/CLI wiring (`--memory-dir`, `--no-memory`), and the
-  UwUChat-facing `MemoryStore` contract + client stub (see
-  [`docs/memory-uwuchat-contract.md`](./docs/memory-uwuchat-contract.md)).
+  opt-in `HeadlessSession`/CLI wiring (`--memory-dir`, `--no-memory`), and a
+  pluggable `MemoryStore` contract with a remote-backend client stub.
 - ✅ Phase 4 — QA + deploy gate: headless QA runs the target repo's `qa-agent`
   mode (`--qa` / `--qa-mode`), verdict parsing is fail-closed, results land in
   the state file's per-group `qa` field; the human-approval deploy gate
@@ -469,9 +471,9 @@ server with a stubbed spawner).
   results, worker env forwarding) + a hard concurrent-session cap
   (`HEADLESSCODE_MAX_CONCURRENT_SESSIONS`, orchestrate aborts / watcher defers
   to `pending`) + the `CloudProvider` abstraction with `LocalProcessProvider`
-  and a Hetzner runner-fleet evaluation (see
+  and an evaluation-only cloud-provider sketch (see
   [`docs/phase6-cloud.md`](./docs/phase6-cloud.md)). No live cloud launched;
-  6.1's container/VM-per-issue slots in behind the same interface.
+  a container/VM-per-issue backend slots in behind the same interface.
 - ⏳ Phase 3 (remaining) — token-based condensation.
 
 ## Attribution

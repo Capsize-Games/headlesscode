@@ -8,9 +8,8 @@ to run the verification bar, and what a merge-ready change looks like.
 `headlesscode` is a standalone Node/TypeScript CLI that runs a headless
 coding-agent loop, ported from a VS Code extension (vendored verbatim under
 `src/vendor/zoo-code/`, Apache-2.0 — see `ATTRIBUTION.md`). There is **no
-build step**: everything runs directly via `tsx`. Read the project plan
-(`headless-coding-harness-project.md`) and the docs in `docs/` before diving
-into a subsystem.
+build step**: everything runs directly via `tsx`. Read the docs in `docs/`
+before diving into a subsystem.
 
 ## Security first
 

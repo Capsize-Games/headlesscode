@@ -70,11 +70,10 @@ Before considering any change to `src/` done:
   checkpoints CLI". The location must be VERIFIED by actually reading or
   grepping the file at plan-writing time — never recalled from memory or
   guessed. Measured justification: two comparable headlesscode sessions,
-  same model and machine, ran back-to-back — round 1
-  (`plans/orchestrator-worktree-cleanup.md`, narrative file mentions
-  only) took 4:03 / $0.0216 to reach iteration 20; round 2
-  (`plans/harness-tooling-efficiency-round2.md`, every finding pinned to
-  an exact location) took 2:00 / $0.0169 — over 2x faster, with no other
+  same model and machine, ran back-to-back on otherwise-equivalent work
+  orders — the one whose findings were narrative mentions only took 4:03
+  to reach the same iteration count the other one (every finding pinned
+  to an exact location) reached in 2:00 — over 2x faster, with no other
   variable differing (cache-hit rates 92-94% in both). A citation can go
   stale between plan-writing and dispatch: a worker finding that its
   cited lines no longer match current file content should treat them as
@@ -142,13 +141,13 @@ the durable source of truth for a round's status — treat it as
 authoritative over your own memory of what happened, especially across
 separate tasks/sessions.
 
-- **Branch naming (issue #15):** push whatever `git branch --show-current`
-  prints in your worktree — the spawner already disambiguates a colliding
+- **Branch naming:** push whatever `git branch --show-current` prints in
+  your worktree — the spawner already disambiguates a colliding
   `issues/<name>-<date>` at creation time and records the REAL final name
   in `group.branch` in the orchestrator state. If a push still fails
   because origin owns the name (a race between spawn and push), rename the
   LOCAL branch first (`git branch -m <new-name>`), then push the renamed
   branch, and put the final branch name — not just the PR link — in the
   closing report. Never push a renamed branch while the local worktree
-  branch keeps the old name: that mismatch is exactly what issue #15
-  removed.
+  branch keeps the old name — that mismatch breaks the spawner's ability
+  to reconcile the round's state with what actually landed.

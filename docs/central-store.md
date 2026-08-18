@@ -18,8 +18,7 @@ checkpoints and the shared modes/rules, under ONE central directory:
 `$HEADLESSCODE_DATA_DIR` overrides the root (tests and scratch setups redirect
 it; see `src/project-store.ts:58`). All of the path resolution lives in
 `src/project-store.ts` — the protection described below reuses that resolver
-rather than duplicating it. Design rationale and the one-time migration story:
-`plans/central-project-store-and-shared-instructions.md`.
+rather than duplicating it.
 
 ## Default-on protection against destructive commands
 
@@ -30,7 +29,7 @@ is a different resource — it is SHARED across every project on the machine, so
 a single misbehaving workspace deleting it has a blast radius far beyond that
 workspace. This happened for real: a worker ran
 `rm -rf ~/.local/share/headlesscode` against the live store three times as an
-ad-hoc verification step (`plans/protect-shared-store-from-destructive-commands.md`).
+ad-hoc verification step.
 
 The protection (`src/permissions/store-protection.ts`, wired into
 `checkCommand` in `src/permissions/commands.ts`) therefore:

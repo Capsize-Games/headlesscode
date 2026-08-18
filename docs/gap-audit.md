@@ -132,7 +132,7 @@ extension it's ported from. Documented for prioritization, not all scheduled.
   Correctly parked per the project owner's stated local-first priority.
 - **Hetzner cloud provider** — documented sketch, not implemented (`docs/phase6-cloud.md`), a
   deliberate scope decision.
-- **Playwright-MCP QA interactivity** — documented (`docs/phase4-qa.md`), a deliberate scope
+- **Playwright-MCP QA interactivity** — a deliberate scope
   decision; QA sessions can run commands/tests but not interact with a live browser
   interactively (distinct from the new `browser_action` tool above, which the CODING agent can
   use — QA's gap is specifically about live MCP-driven interactivity during QA verification).

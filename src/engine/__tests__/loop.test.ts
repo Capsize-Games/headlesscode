@@ -27,6 +27,7 @@ import { createHeadlessExecutor, createReadOnlyHeadlessExecutor } from "../../to
 import { createCheckpointService } from "../../checkpoints/service.js"
 import { parseToolCall } from "../parser.js"
 import { readUsageFile } from "../usage.js"
+import { reportFilePath } from "../reports.js"
 import type { SessionBudget } from "../../budget/budget.js"
 import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } from "../types.js"
 
@@ -193,6 +194,8 @@ async function makeSession(options: {
 	/** Checkpoints on/off + shadow-git storage dir (default off — see below). */
 	checkpoints?: boolean
 	checkpointDir?: string
+	/** Explicit session id override (see HeadlessSessionConfig.sessionId). */
+	sessionId?: string
 }) {
 	const session = new HeadlessSession({
 		workspaceRoot: options.workspaceRoot,
@@ -211,6 +214,7 @@ async function makeSession(options: {
 		// hermetic and fast. The checkpoint test passes a tmp checkpointDir.
 		checkpoints: options.checkpoints ?? false,
 		checkpointDir: options.checkpointDir,
+		sessionId: options.sessionId,
 	})
 	return session
 }
@@ -297,6 +301,28 @@ async function testScenario1WriteThenCompletion(): Promise<void> {
 		assert.ok(toolNames?.includes("search_replace"), "search_replace should be exposed (implemented)")
 		assert.ok(toolNames?.includes("edit_file"), "edit_file should be exposed (implemented)")
 		assert.ok(toolNames?.includes("codebase_search"), "codebase_search should be exposed (implemented)")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// Issue #97 (COV-8): reports.ts is imported by loop.ts and runs in every
+// loop test via persistFinalReport, but until now the written report FILE's
+// content was never asserted anywhere — mirrors the handoff assertion above
+// (testIterationCapHandoffSummary) but for the `.headlesscode/reports/` path
+// instead of `.headlesscode/handoff-summary.md`.
+async function testFinalReportPersistedWithFullText(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-report-"))
+	try {
+		const client = new FakeLlmClient([
+			() => toolCall("attempt_completion", { result: "Done: implemented the widget and verified with tests." }),
+		])
+		const session = await makeSession({ task: "implement widget", client, workspaceRoot: ws, sessionId: "report-test-session" })
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+
+		const content = await fs.readFile(reportFilePath(ws, "report-test-session"), "utf-8")
+		assert.equal(content, "Done: implemented the widget and verified with tests.")
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -1636,6 +1662,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["reasoning effort: unset config falls back to the env var", testReasoningEffortEnvFallbackWhenNotConfigured],
 	["reasoning effort: absent by default (endpoint default applies)", testReasoningEffortAbsentByDefault],
 	["scenario 1: write_to_file + attempt_completion -> success, file written", testScenario1WriteThenCompletion],
+	["final report: attempt_completion result persisted verbatim to .headlesscode/reports/<sessionId>.md", testFinalReportPersistedWithFullText],
 	["scenario 2: execute_command + text answer -> success with text result", testScenario2CommandThenTextAnswer],
 	["scenario 3: erroring tool x3 -> bounded failure", testScenario3ErroringToolBoundedFailure],
 	["scenario 4: malformed JSON args -> parser fallback exercised", testScenario4MalformedJsonArgs],
