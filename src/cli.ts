@@ -14,6 +14,8 @@ import * as path from "node:path"
 import { LocalMemoryStore } from "./memory/local.js"
 import type { MemoryStore } from "./memory/types.js"
 import { OpenRouterClient, parseReasoningEffort } from "./llm/openrouter.js"
+import { OllamaClient } from "./llm/ollama.js"
+import type { LlmClient } from "./engine/types.js"
 import { HeadlessSession } from "./engine/loop.js"
 import { isLocalExploreEnabled } from "./engine/local-explore.js"
 import { Logger } from "./engine/logger.js"
@@ -858,7 +860,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		explicitModel: options.model,
 		env: process.env,
 	})
-	const client = new OpenRouterClient({ apiKey, defaultModel: model })
+
+	// Local dual-model code agent (plans/local-dual-model-code-agent.md, D2):
+	// `code` mode may opt into a local Ollama-compatible backend instead of
+	// OpenRouter. Scoped to `code` mode only — every other mode
+	// (orchestrator, architect, deepseek-reviewer, qa-agent) always resolves
+	// OpenRouterClient regardless of these env vars.
+	const codeModeBackend = process.env.HEADLESSCODE_CODE_MODE_BACKEND ?? "openrouter"
+	const useLocalCodeBackend = options.mode === "code" && codeModeBackend === "ollama"
+	const client: LlmClient = useLocalCodeBackend
+		? new OllamaClient({ defaultModel: process.env.HEADLESSCODE_CODE_MODE_MODEL ?? model })
+		: new OpenRouterClient({ apiKey, defaultModel: model })
 
 	// Phase 3 context condensation: a cheaper model for the condensation
 	// call can be assigned via the `_condensation` key in
