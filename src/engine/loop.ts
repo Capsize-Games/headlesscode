@@ -71,7 +71,9 @@ import {
 	appendCodeIntelTools,
 	appendDescribeImageTool,
 	appendRunTestsTool,
+	buildLeanSystemPrompt,
 	buildSystemPrompt,
+	isLeanSystemPromptEnabled,
 	loadCustomModes,
 	modeHasEditGroup,
 	selectToolsForMode,
@@ -105,6 +107,13 @@ import {
 	skipOrphanedToolMessages,
 } from "./condense.js"
 import { writeHandoffSummary } from "./handoff.js"
+import {
+	isLazyToolCatalogEnabled,
+	LIST_TOOLS_NAME,
+	REQUEST_TOOL_NAME,
+	renderToolIndex,
+	splitCoreAndLazyTools,
+} from "./lazy-tools.js"
 import { runLocalExplorePhase, type LocalExploreOptions, type LocalExploreResult } from "./local-explore.js"
 import { hasCodebaseIndex } from "../index-util.js"
 // Recursive task decomposition (`new_task`): child mode resolution uses the
@@ -1056,6 +1065,12 @@ export class HeadlessSession {
 	 * "aux writes flushed" — see scheduleAux/drainAuxWrites.
 	 */
 	private _auxChain: Promise<void> = Promise.resolve()
+	/**
+	 * Lazy tool catalog (see src/engine/lazy-tools.ts): tools available via
+	 * request_tool but not yet added to state.tools for this session. Empty
+	 * when HEADLESSCODE_LAZY_TOOL_CATALOG is off (the default).
+	 */
+	private lazyToolsByName: Map<string, ChatTool> = new Map()
 
 	constructor(config: HeadlessSessionConfig) {
 		if (!config.llmClient) {
@@ -1240,6 +1255,18 @@ export class HeadlessSession {
 		if (!this.executor.has("switch_mode")) {
 			this.executor.register("switch_mode", (args, ctx) => this.handleSwitchMode(args, ctx))
 		}
+		// Lazy tool catalog (src/engine/lazy-tools.ts): list_tools/request_tool
+		// are pure session-state operations, registered the same session-bound
+		// way as new_task/switch_mode regardless of executor capabilities —
+		// they exist whenever lazy loading is on, not gated by workspace type.
+		if (isLazyToolCatalogEnabled()) {
+			if (!this.executor.has(LIST_TOOLS_NAME)) {
+				this.executor.register(LIST_TOOLS_NAME, () => this.handleListTools())
+			}
+			if (!this.executor.has(REQUEST_TOOL_NAME)) {
+				this.executor.register(REQUEST_TOOL_NAME, (args) => this.handleRequestTool(args))
+			}
+		}
 		// Checkpoints are active when the executor is edit-capable: write_to_file
 		// OR any of the surgical edit tools (apply_diff / search_replace /
 		// edit_file). An iteration that used ONLY a diff tool must still snapshot
@@ -1273,9 +1300,10 @@ export class HeadlessSession {
 		// resolution (avoid re-reading .roomodes per delegation).
 		const customModes = this.config.customModes ?? (await loadCustomModes(workspaceRoot))
 		this.customModes = customModes
+		const buildPrompt = isLeanSystemPromptEnabled() ? buildLeanSystemPrompt : buildSystemPrompt
 		const systemPrompt =
 			this.config.systemPromptOverride ??
-			(await buildSystemPrompt({
+			(await buildPrompt({
 				workspaceRoot,
 				mode,
 				customModes,
@@ -1307,6 +1335,11 @@ export class HeadlessSession {
 		}
 		if (this.executor.has("run_tests")) {
 			tools = appendRunTestsTool(tools)
+		}
+		if (isLazyToolCatalogEnabled()) {
+			const split = splitCoreAndLazyTools(tools)
+			this.lazyToolsByName = split.lazyByName
+			tools = split.core
 		}
 
 		this.state.systemPrompt = systemPrompt
@@ -3522,6 +3555,11 @@ export class HeadlessSession {
 		if (this.executor.has("run_tests")) {
 			newTools = appendRunTestsTool(newTools)
 		}
+		if (isLazyToolCatalogEnabled()) {
+			const split = splitCoreAndLazyTools(newTools)
+			this.lazyToolsByName = split.lazyByName
+			newTools = split.core
+		}
 		const toolSetUnchanged = sameToolNames(this.state.tools, newTools)
 		this.state.mode = modeSlug
 		this.state.tools = newTools
@@ -3537,7 +3575,8 @@ export class HeadlessSession {
 			// tells the model's own history when/why the label changed.
 			switchResultContent = `Switched to mode '${modeSlug}' (tool set unchanged — system prompt kept for prompt-cache continuity). Reason acknowledged: ${reason}`
 		} else {
-			const built = await buildSystemPrompt({
+			const buildPrompt = isLeanSystemPromptEnabled() ? buildLeanSystemPrompt : buildSystemPrompt
+			const built = await buildPrompt({
 				workspaceRoot: this.config.workspaceRoot,
 				mode: modeSlug,
 				customModes: this.customModes,
@@ -3576,6 +3615,41 @@ export class HeadlessSession {
 			content: switchResultContent,
 			isError: false,
 		}
+	}
+
+	/**
+	 * list_tools (src/engine/lazy-tools.ts): return the index of tools not
+	 * currently in state.tools. Pure introspection — no executor involved.
+	 */
+	private async handleListTools(): Promise<ToolResult> {
+		return { content: renderToolIndex(this.lazyToolsByName), isError: false }
+	}
+
+	/**
+	 * request_tool (src/engine/lazy-tools.ts): make one lazily-held tool
+	 * callable from the NEXT turn onward by appending its schema to
+	 * state.tools. Idempotent — calling it again for an already-active tool
+	 * is a no-op success, not an error, since a small local model may not
+	 * reliably remember what it already unlocked.
+	 */
+	private async handleRequestTool(args: Record<string, unknown>): Promise<ToolResult> {
+		const name = typeof args.name === "string" ? args.name.trim() : ""
+		if (!name) {
+			return { content: "[Error] request_tool: 'name' is required.", isError: true }
+		}
+		if (this.state.tools.some((t) => t.type === "function" && t.function.name === name)) {
+			return { content: `Tool '${name}' is already available.`, isError: false }
+		}
+		const tool = this.lazyToolsByName.get(name)
+		if (!tool) {
+			const available = [...this.lazyToolsByName.keys()].join(", ") || "(none)"
+			return {
+				content: `[Error] request_tool: unknown tool '${name}'. Available: ${available}`,
+				isError: true,
+			}
+		}
+		this.state.tools = [...this.state.tools, tool]
+		return { content: `Tool '${name}' is now available starting next turn.`, isError: false }
 	}
 
 	/**

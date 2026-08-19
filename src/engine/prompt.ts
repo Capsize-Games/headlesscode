@@ -35,6 +35,9 @@ import "../vendor/zoo-code/src/utils/path.js"
 
 import type { ExtensionContext } from "../vendor/zoo-code/shim/vscode.js"
 import { SYSTEM_PROMPT } from "../vendor/zoo-code/src/core/prompts/system.js"
+import { addCustomInstructions } from "../vendor/zoo-code/src/core/prompts/sections/custom-instructions.js"
+import { getObjectiveSection } from "../vendor/zoo-code/src/core/prompts/sections/objective.js"
+import { getSystemInfoSection } from "../vendor/zoo-code/src/core/prompts/sections/system-info.js"
 import { getNativeTools } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/index.js"
 import { getGroupName, getModeBySlug, modes, getToolsForMode } from "../vendor/zoo-code/src/shared/modes.js"
 import { TOOL_GROUPS } from "../vendor/zoo-code/src/shared/tools.js"
@@ -47,6 +50,14 @@ import type { ModeConfig } from "../vendor/zoo-code/types/index.js"
 
 import { appendStackRulesSection, loadStackRules } from "./stacks.js"
 import type { ChatTool } from "./types.js"
+
+/** Opt-in gate for buildLeanSystemPrompt — see its doc comment. Default OFF. */
+export const LEAN_SYSTEM_PROMPT_ENV = "HEADLESSCODE_LEAN_SYSTEM_PROMPT"
+
+export function isLeanSystemPromptEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+	const v = env[LEAN_SYSTEM_PROMPT_ENV]
+	return v !== undefined && v !== "" && v !== "0" && v.toLowerCase() !== "false"
+}
 
 export interface BuildSystemPromptOptions {
 	workspaceRoot: string
@@ -320,6 +331,61 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions): Prom
 	// batching same-file diffs into one apply_diff. Edit-workflow guidance
 	// only applies to modes that can actually edit files (modeHasEditGroup);
 	// read-only reviewer/QA roles never see it.
+	const conventions = buildHeadlessConventions(modeConfig.slug, customModes)
+	const fullPrompt = conventions === undefined ? withStackRules : `${withStackRules}\n${conventions}`
+
+	return { prompt: fullPrompt, modeConfig, customModes }
+}
+
+/**
+ * A minimal alternative to buildSystemPrompt for small-context local models
+ * (opt-in — see HEADLESSCODE_LEAN_SYSTEM_PROMPT in loop.ts). The vendored
+ * SYSTEM_PROMPT (~9.5K tokens measured live 2026-08-19 for headlesscode's
+ * own `code` mode) is GUI-oriented: a full modes-listing section, generic
+ * tool-use-guidelines prose, and a capabilities section describing VS
+ * Code-only features — all irrelevant to a native-tool-calling headless
+ * session and a severe cost against a ~24K-token local context budget.
+ *
+ * This does NOT edit or reimplement the vendored prompt; it composes the
+ * SAME exported section builders `buildSystemPrompt` uses, minus the
+ * GUI-oriented ones (markdownFormattingSection, getSharedToolUseSection,
+ * getToolUseGuidelinesSection, getCapabilitiesSection, getModesSection,
+ * getSkillsSection). Critically, addCustomInstructions (this project's own
+ * `.roo/rules/`, `.roo/rules-<mode>/`, AGENTS.md) is KEPT — that content is
+ * project-specific behavioral guidance, not boilerplate, and dropping it
+ * would silently change what the model is told it must/must not do.
+ */
+export async function buildLeanSystemPrompt(options: BuildSystemPromptOptions): Promise<BuiltPrompt> {
+	const { workspaceRoot, mode, globalCustomInstructions } = options
+	const customModes = options.customModes ?? (await loadCustomModes(workspaceRoot))
+	const modeConfig =
+		getModeBySlug(mode, customModes) ?? modes.find((m) => m.slug === mode) ?? modes[0]
+
+	const toolUseNote =
+		"Tool calls are native — call a tool directly, never describe an action " +
+		"in prose instead of calling it, and never fabricate file contents or " +
+		"command output you have not actually seen."
+	const verificationNote =
+		"Only call attempt_completion after you have verified the change actually " +
+		"works (typecheck/tests as applicable) — a plausible-looking but " +
+		"unverified change is not done."
+
+	const basePrompt = [
+		modeConfig.roleDefinition,
+		toolUseNote,
+		verificationNote,
+		getObjectiveSection(),
+		getSystemInfoSection(workspaceRoot),
+		await addCustomInstructions(modeConfig.customInstructions ?? "", globalCustomInstructions ?? "", workspaceRoot, modeConfig.slug, {}),
+	]
+		.filter((section) => section.trim().length > 0)
+		.join("\n\n")
+
+	const stackRules = await loadStackRules(workspaceRoot)
+	const withStackRules = stackRules.content
+		? appendStackRulesSection(basePrompt, stackRules.content, stackRules.stacks)
+		: basePrompt
+
 	const conventions = buildHeadlessConventions(modeConfig.slug, customModes)
 	const fullPrompt = conventions === undefined ? withStackRules : `${withStackRules}\n${conventions}`
 

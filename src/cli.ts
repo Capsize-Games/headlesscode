@@ -871,6 +871,19 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	const client: LlmClient = useLocalCodeBackend
 		? new OllamaClient({ defaultModel: process.env.HEADLESSCODE_CODE_MODE_MODEL ?? model })
 		: new OpenRouterClient({ apiKey, defaultModel: model })
+	// A small local model's context is dominated by the full tool catalog
+	// (see src/engine/lazy-tools.ts) — default lazy loading ON for local
+	// sessions specifically, without touching the cloud path's prompt-cache-
+	// friendly static catalog. An explicit env value always wins.
+	if (useLocalCodeBackend && process.env.HEADLESSCODE_LAZY_TOOL_CATALOG === undefined) {
+		process.env.HEADLESSCODE_LAZY_TOOL_CATALOG = "1"
+	}
+	// Same rationale (src/engine/prompt.ts's buildLeanSystemPrompt doc comment):
+	// the vendored system prompt alone is ~9.5K tokens, GUI-oriented content a
+	// headless local session doesn't need. Default on for local, off for cloud.
+	if (useLocalCodeBackend && process.env.HEADLESSCODE_LEAN_SYSTEM_PROMPT === undefined) {
+		process.env.HEADLESSCODE_LEAN_SYSTEM_PROMPT = "1"
+	}
 
 	// Phase 3 context condensation: a cheaper model for the condensation
 	// call can be assigned via the `_condensation` key in
