@@ -36,7 +36,6 @@ import "../vendor/zoo-code/src/utils/path.js"
 import type { ExtensionContext } from "../vendor/zoo-code/shim/vscode.js"
 import { SYSTEM_PROMPT } from "../vendor/zoo-code/src/core/prompts/system.js"
 import { addCustomInstructions } from "../vendor/zoo-code/src/core/prompts/sections/custom-instructions.js"
-import { getObjectiveSection } from "../vendor/zoo-code/src/core/prompts/sections/objective.js"
 import { getSystemInfoSection } from "../vendor/zoo-code/src/core/prompts/sections/system-info.js"
 import { getNativeTools } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/index.js"
 import { getGroupName, getModeBySlug, modes, getToolsForMode } from "../vendor/zoo-code/src/shared/modes.js"
@@ -368,13 +367,33 @@ export async function buildLeanSystemPrompt(options: BuildSystemPromptOptions): 
 	const verificationNote =
 		"Only call attempt_completion after you have verified the change actually " +
 		"works (typecheck/tests as applicable) — a plausible-looking but " +
-		"unverified change is not done."
+		"unverified change is not done. Call attempt_completion ALONE, never in " +
+		"the same turn as other tool calls — a bundled attempt_completion is " +
+		"refused and your other calls are wasted."
+	// Replaces the vendored getObjectiveSection() (buildSystemPrompt uses that
+	// one): it references an "environment_details" file that does not exist
+	// in this headless harness (verified live 2026-08-19 — a local session
+	// tried to read_file a literal file named "environment_details" after
+	// reading that section) and describes GUI-chat framing ("the user may
+	// provide feedback") that does not apply to a one-shot headless task.
+	// Also states the one concrete literalism trap that broke a real local
+	// session that same night: a tool description's [bracketed] example is a
+	// placeholder to replace with a real value, not text to copy verbatim.
+	const objectiveNote =
+		"Work through the task step by step: read what you need, make the " +
+		"edit, then verify it before finishing. There is no separate " +
+		"'environment_details' file — file listings and tool results appear " +
+		"directly in this conversation as they happen. When a tool's own " +
+		"description shows an example value inside [square brackets] (e.g. " +
+		"[line_number], [path]), that is a placeholder: replace the WHOLE " +
+		"bracketed expression with a real value — never include the literal " +
+		"brackets or the word inside them in an actual tool call."
 
 	const basePrompt = [
 		modeConfig.roleDefinition,
 		toolUseNote,
 		verificationNote,
-		getObjectiveSection(),
+		objectiveNote,
 		getSystemInfoSection(workspaceRoot),
 		await addCustomInstructions(modeConfig.customInstructions ?? "", globalCustomInstructions ?? "", workspaceRoot, modeConfig.slug, {}),
 	]

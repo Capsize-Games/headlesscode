@@ -31,9 +31,20 @@ export function isLazyToolCatalogEnabled(env: NodeJS.ProcessEnv = process.env): 
  * to read, edit, run commands, delegate, and finish a task. Everything else
  * in a session's full tool list is offered lazily via `list_tools` /
  * `request_tool` instead.
+ *
+ * `apply_diff` deliberately excluded (available lazily, not core) — its
+ * SEARCH/REPLACE block format requires escaping literal `=======`/`<<<<<<<`
+ * markers found in real file content, and a `:start_line:[line_number]`
+ * header where `[line_number]` is a template placeholder to substitute a
+ * real integer into. Verified live 2026-08-19 against Qwen2.5-Coder-14B:
+ * it copied `:start_line:[line_number]` into a real call verbatim (treating
+ * the placeholder as literal syntax) and separately failed to escape a
+ * literal `=======` divider inside a file's own content across 4 consecutive
+ * retries despite an explicit corrective error message each time. `edit_file`
+ * and `search_replace` need none of this — plain old_string/new_string with
+ * NO escaping rules and (edit_file) a fuzzy-match fallback — and stay core.
  */
 export const CORE_TOOL_NAMES = new Set([
-	"apply_diff",
 	"ask_followup_question",
 	"attempt_completion",
 	"execute_command",
