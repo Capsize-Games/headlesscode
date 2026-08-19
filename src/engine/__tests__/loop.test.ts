@@ -1523,6 +1523,51 @@ async function testCompletionAcceptedWhenClean(): Promise<void> {
 	}
 }
 
+async function testCompletionRefusedWhenBundledWithSiblings(): Promise<void> {
+	const ws = await mkGitWorkspace()
+	if (ws === null) {
+		console.log("  skip bundled-completion test (git not installed)")
+		return
+	}
+	try {
+		// One turn: attempt_completion bundled alongside a real write. The
+		// write must execute for real; the completion must be refused so the
+		// model is forced to check the write's actual result before finishing.
+		const client = new FakeLlmClient([
+			() =>
+				toolCallBatch([
+					{ name: "write_to_file", args: { path: "hello.txt", content: "hello" } },
+					{ name: "attempt_completion", args: { result: "done (premature)" } },
+				]),
+			() => toolCall("attempt_completion", { result: "done for real" }),
+		])
+		const session = await makeSession({ task: "write then finish", client, workspaceRoot: ws })
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "done for real", "the premature bundled completion must not be accepted")
+		assert.equal(
+			await fs.readFile(path.join(ws, "hello.txt"), "utf-8"),
+			"hello",
+			"the sibling write must execute for real, not be discarded",
+		)
+		const completionMsgs = session.state.messages.filter((m) => m.role === "tool" && m.name === "attempt_completion")
+		assert.equal(completionMsgs.length, 1, "only the refused bundled completion produced a tool message")
+		assert.match(
+			completionMsgs[0]?.content ?? "",
+			/alongside other tool calls/,
+			"the refusal explains why it was not accepted",
+		)
+		assert.match(
+			completionMsgs[0]?.content ?? "",
+			/Re-issue attempt_completion ALONE/,
+			"the refusal tells the model how to retry correctly",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 async function testCompletionAcceptedAfterCommit(): Promise<void> {
 	const ws = await mkGitWorkspace()
 	if (ws === null) {
@@ -1695,6 +1740,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["same-file batch: a failure on a DIFFERENT file gets no diagnosis", testDifferentFileBatchFailureGetsNoDiagnosis],
 	["commit guard: attempt_completion with uncommitted tracked changes gets one nudge, then is accepted", testCompletionNudgedOnUncommittedChanges],
 	["commit guard: a clean tree is never nudged", testCompletionAcceptedWhenClean],
+	["attempt_completion bundled with other tool calls is refused; the siblings execute for real", testCompletionRefusedWhenBundledWithSiblings],
 	["commit guard: committing before finishing means no nudge", testCompletionAcceptedAfterCommit],
 	["commit guard: read-only modes never get the nudge", testNoNudgeInReadOnlyMode],
 	["stripSupersededReasoning: (T1) keeps only the most-recent assistant reasoning", testStripSupersededReasoningKeepsOnlyMostRecent],

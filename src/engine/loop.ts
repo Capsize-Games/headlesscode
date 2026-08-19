@@ -2805,9 +2805,29 @@ export class HeadlessSession {
 				}
 			}
 
-			// 6a. SUCCESS via attempt_completion.
+			// 6a. SUCCESS via attempt_completion — only accepted when it is the
+			// SOLE call this turn. A model (esp. a smaller/weaker local one) that
+			// bundles attempt_completion together with real work calls in the
+			// SAME turn — predicting its own writes will land rather than waiting
+			// to see them actually happen — must NOT have those real calls
+			// silently discarded by an early return here: that produces a
+			// confidently-worded "success" report describing work that never
+			// happened (observed live 2026-08-19 against Qwen2.5-Coder-14B: 7
+			// tool calls in one turn, one of them attempt_completion, and the
+			// other 6 — including the actual write_to_file calls — never ran).
+			// Refuse the completion (same "refused, siblings still execute"
+			// pattern as new_task/switch_mode above) instead, so the batch's
+			// real work executes for real and the model's NEXT attempt_completion
+			// is judged against actual tool results, not its own prediction.
 			const completionCall = calls.find((call) => call.name === "attempt_completion")
-			if (completionCall) {
+			const refusedCompletionIds = new Set<string>()
+			if (completionCall && calls.length > 1) {
+				refusedCompletionIds.add(completionCall.id)
+				this.logger.warn("[loop] attempt_completion refused — bundled with other tool calls this turn", {
+					iteration,
+					siblingCount: calls.length - 1,
+				})
+			} else if (completionCall) {
 				const result =
 					typeof completionCall.args?.result === "string"
 						? completionCall.args.result
@@ -2965,6 +2985,15 @@ export class HeadlessSession {
 					// execute normally. See the refusal-set construction above.
 					resultContent =
 						"[Error] switch_mode cannot run alongside other tools in the same message turn: its approval waits on a single .harness.decision-answer marker that must not collide with a sibling tool's escalation. Re-issue switch_mode as the ONLY tool call in its own turn."
+					isError = true
+				} else if (refusedCompletionIds.has(call.id)) {
+					// attempt_completion was bundled with other tool calls this
+					// turn — refuse it WITHOUT executing it so the real work
+					// siblings below execute for real (see the refusal-set
+					// construction above); the model must re-check actual results
+					// before declaring done again.
+					resultContent =
+						"[Error] attempt_completion was not accepted: it was called alongside other tool calls in the same turn, so it was refused and your other calls ran for real instead — check their results below (including any errors) before deciding the task is actually done. Re-issue attempt_completion ALONE, as the only tool call in its own turn, once you've verified the real outcome."
 					isError = true
 				} else {
 					const result = await this.executor.execute(call.name, call.args)
