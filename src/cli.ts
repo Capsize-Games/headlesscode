@@ -874,7 +874,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	const codeModeBackend = process.env.HEADLESSCODE_CODE_MODE_BACKEND ?? "openrouter"
 	const useLocalCodeBackend = options.mode === "code" && codeModeBackend === "ollama"
 	const client: LlmClient = useLocalCodeBackend
-		? new OllamaClient({ defaultModel: process.env.HEADLESSCODE_CODE_MODE_MODEL ?? model })
+		? new OllamaClient({
+				defaultModel: process.env.HEADLESSCODE_CODE_MODE_MODEL ?? model,
+				// Without this, --llm-timeout-ms is silently ignored for the
+				// Ollama backend: OllamaClient has its own independent abort
+				// timer (ollama.ts's DEFAULT_OLLAMA_TIMEOUT_MS), separate
+				// from loop.ts's llmTimeoutMs-driven AbortControllers —
+				// verified live 2026-08-20: a trial dispatched with
+				// --llm-timeout-ms 900000 still aborted at exactly 300000ms
+				// because this constructor call never forwarded the option.
+				timeoutMs: options.llmTimeoutMs,
+			})
 		: new OpenRouterClient({ apiKey, defaultModel: model })
 	// A small local model's context is dominated by the full tool catalog
 	// (see src/engine/lazy-tools.ts) — default lazy loading ON for local
