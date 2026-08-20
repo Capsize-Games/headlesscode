@@ -312,6 +312,29 @@ const READ_ONLY_PROGRESS_NUDGE_MESSAGE =
 	"You've made several read/exploration calls without progress. If the next step in your todo list is verification, `run_tests` answers it in one shot — prefer running the project's test suite over more manual greps/reads. Take a progress action now (edit, test run, or completion) instead of further read-only exploration."
 
 /**
+ * airunnerdesktop's own synthetic fallback text (generation_response_support.py's
+ * `fallback_response_for_empty_result`) when the underlying generation
+ * produced no real content — a diagnostic string for the wire response, NOT
+ * model-authored text. Same failure family as the narrated-tool-call fix
+ * (see extractEmbeddedToolCall's doc comment and the c274ddc commit it
+ * references): if persisted into history verbatim, the model is fed its
+ * own (fake) prior "reply" on the next turn, and if that turn ALSO
+ * produces nothing, the two-message pair (this + the standard nudge) gets
+ * evicted and re-added by truncateHistory in exactly matching batches
+ * every cycle — the rendered prompt becomes byte-for-byte IDENTICAL
+ * turn after turn, a stable, self-reinforcing trap. Verified live
+ * 2026-08-20: diffed the daemon's own rendered prompt across three
+ * consecutive requests during exactly this pattern — byte-identical.
+ * Matched by exact string rather than any heuristic since it's a fixed,
+ * known constant on the daemon side, not model-generated text that could
+ * coincidentally resemble it.
+ */
+const AIRUNNERDESKTOP_EMPTY_REPLY_FALLBACK_TEXTS = [
+	"The model produced an empty reply for this request. No changes were applied.",
+	"The model attempted a tool-based response but did not produce a final reply. No changes were applied.",
+]
+
+/**
  * Extract the first not-done line from a todo checklist (`[ ]` pending or
  * `[-]` in-progress — never `[x]` done), for identicalCallNudgeMessage.
  * Best-effort: any list shape it doesn't recognize just yields undefined,
@@ -3205,7 +3228,19 @@ export class HeadlessSession {
 			// retrying or calling attempt_completion must not be recorded as
 			// a successful session.
 			if (calls.length === 0) {
-				const text = (assistant.content ?? "").trim()
+				let text = (assistant.content ?? "").trim()
+
+				// See AIRUNNERDESKTOP_EMPTY_REPLY_FALLBACK_TEXTS's doc comment: this
+				// is the backend's own synthetic diagnostic string, not something
+				// the model said. Treat it exactly like no text at all — persisting
+				// it into history (assistantMessage.content, mutated below since
+				// the object was already pushed) would feed the model its own fake
+				// prior "reply" next turn and risk the self-reinforcing empty-reply
+				// loop this was caught causing live.
+				if (AIRUNNERDESKTOP_EMPTY_REPLY_FALLBACK_TEXTS.includes(text)) {
+					text = ""
+					assistantMessage.content = null
+				}
 
 				// A local model can reason correctly about which tool to call
 				// and then write the call as prose instead of using the native

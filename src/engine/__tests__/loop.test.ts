@@ -440,6 +440,44 @@ async function testEmbeddedToolCallRecoveryClearsHallucinatedNarrationFromHistor
 	}
 }
 
+// Verified live 2026-08-20: airunnerdesktop's own synthetic diagnostic
+// string ("The model produced an empty reply...", NOT model-authored text)
+// was being persisted into history verbatim and fed back to the model on
+// the next turn — the daemon's rendered prompt was confirmed byte-for-byte
+// IDENTICAL across three consecutive requests during this exact pattern, a
+// stable self-reinforcing trap. Same failure family as the narrated-tool-
+// call fix above (c274ddc): synthetic non-model text must never be
+// persisted as if the model said it.
+async function testEmptyReplyFallbackTextIsNotPersistedToHistory(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-empty-fallback-"))
+	try {
+		const client = new FakeLlmClient([
+			() => textReply("The model produced an empty reply for this request. No changes were applied."),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({
+			task: "do something",
+			client,
+			workspaceRoot: ws,
+			requireExplicitCompletion: true,
+		})
+		await session.run()
+
+		const secondRequestMessages = client.requests[1].messages
+		const fallbackAssistantMsg = secondRequestMessages.find(
+			(m) => m.role === "assistant" && (!m.tool_calls || m.tool_calls.length === 0),
+		)
+		assert.ok(fallbackAssistantMsg, "expected the text-only assistant turn in the persisted history")
+		assert.equal(
+			fallbackAssistantMsg?.content,
+			null,
+			"the synthetic empty-reply fallback text must be cleared, not sent back to the model on the next turn",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 async function testRequireExplicitCompletionBoundedFailureWhenNeverCompletes(): Promise<void> {
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-rec2-"))
 	try {
@@ -2341,6 +2379,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	[
 		"embedded tool call recovery clears hallucinated narration from persisted history",
 		testEmbeddedToolCallRecoveryClearsHallucinatedNarrationFromHistory,
+	],
+	[
+		"the daemon's synthetic empty-reply fallback text is not persisted to history",
+		testEmptyReplyFallbackTextIsNotPersistedToHistory,
 	],
 	[
 		"requireExplicitCompletion: repeated text-only replies -> bounded failure, never a fabricated success",
