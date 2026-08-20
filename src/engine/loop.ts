@@ -3161,8 +3161,21 @@ export class HeadlessSession {
 				// prose must not be able to trigger tool execution.
 				if (text && this.config.requireExplicitCompletion) {
 					const embedded = extractEmbeddedToolCall(text)
+					// Validate against the tools actually OFFERED on the request that
+					// just ran, not the session's full default catalog. Without this,
+					// the identical-call guardrail's tool exclusion (see callMainLlm's
+					// doc comment) is fully circumventable: llama.cpp's grammar
+					// constraint correctly refuses to emit a genuine tool_calls entry
+					// for an excluded tool, but the model can still narrate the SAME
+					// call as prose instead — verified live 2026-08-20, list_files
+					// still executed via this exact recovery path on a request where
+					// its schema had been excluded, because this check was reading
+					// the unfiltered session catalog.
+					const excludedThisTurn = new Set(excludedToolNames ?? [])
 					const isRealTool =
-						embedded && this.state.tools.some((t) => t.type === "function" && t.function.name === embedded.name)
+						embedded &&
+						!excludedThisTurn.has(embedded.name) &&
+						this.state.tools.some((t) => t.type === "function" && t.function.name === embedded.name)
 					if (embedded && isRealTool) {
 						this.logger.warn("[loop] recovered tool call written as text instead of tool_calls", {
 							iteration,

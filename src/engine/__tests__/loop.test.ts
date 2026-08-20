@@ -1288,6 +1288,47 @@ async function testIdenticalCallStreakExcludesTheRepeatedToolOnRetry(): Promise<
 	}
 }
 
+// Verified live 2026-08-20 against Qwen3-14B: with list_files excluded from
+// the request's own `tools` array (the identical-call guardrail's tool
+// exclusion), llama.cpp's grammar constraint correctly refused to emit a
+// genuine tool_calls entry for it — but the model narrated the SAME call as
+// prose instead ("[Called tool \"list_files\" with arguments {...}]"), and
+// extractEmbeddedToolCall's validation against the session's full default
+// catalog (this.state.tools) let it through anyway, fully circumventing the
+// exclusion. Fixed: validate against the tools actually offered on the
+// request that just ran, not the unfiltered catalog.
+async function testExcludedToolCannotBeRecoveredFromNarratedText(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-excluded-recovery-"))
+	try {
+		const narratedListFiles = '[Called tool "list_files" with arguments {\'path\': \'.\'}]'
+		const client = new FakeLlmClient([
+			() => toolCall("list_files", { path: "." }),
+			() => toolCall("list_files", { path: "." }),
+			// 3rd call: streak is now >= threshold, list_files is excluded from
+			// the request's tools — the model narrates it as text instead.
+			() => textReply(narratedListFiles),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({
+			task: "look around then finish",
+			client,
+			workspaceRoot: ws,
+			maxIterations: 250,
+			requireExplicitCompletion: true,
+		})
+		await session.run()
+
+		// The LAST request's own message history is the complete accumulated
+		// conversation — checking only it avoids double-counting the same
+		// earlier tool-result messages that reappear in every later request.
+		const finalMessages = client.requests[client.requests.length - 1].messages
+		const listFilesCalls = finalMessages.filter((m) => m.role === "tool" && m.name === "list_files").length
+		assert.equal(listFilesCalls, 2, "the narrated 3rd list_files call must NOT be recovered/executed as a real call")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // Verified live 2026-08-21: a generic "try something different" nudge did
 // NOT change the model's next action — it repeated the same call again
 // right past the nudge, across several trials. Naming the concrete next
@@ -2262,6 +2303,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["identical-call stall: fires on a repeated WRITE tool call too, not just reads", testIdenticalCallStallLimitFiresOnWriteToolToo],
 	["identical-call stall: streak at/past threshold boosts repeat_penalty on the retry request", testIdenticalCallStreakBoostsRepeatPenaltyOnRetry],
 	["identical-call stall: streak at/past threshold excludes the repeated tool on the retry request", testIdenticalCallStreakExcludesTheRepeatedToolOnRetry],
+	["identical-call stall: an excluded tool cannot be recovered back in via narrated-text extraction", testExcludedToolCannotBeRecoveredFromNarratedText],
 	["identical-call stall: a genuine edit/verify/edit/verify interleave never trips it", testIdenticalCallStreakResetByAnyDifferentCall],
 	["identical-call nudge: names the concrete next todo-list step, not just generic advice", testIdenticalCallNudgeNamesTheNextTodoStep],
 	["isReadOnlyEquivalentShellCommand: classifies read-only vs. mutating shell commands", testIsReadOnlyEquivalentShellCommandClassifiesCorrectly],
