@@ -404,11 +404,31 @@ export async function buildLeanSystemPrompt(options: BuildSystemPromptOptions): 
 		"bracketed expression with a real value — never include the literal " +
 		"brackets or the word inside them in an actual tool call."
 
+	// Added 2026-08-21 after a live failure pattern reproduced identically
+	// across two separate trials: the model completed the FIRST step of a
+	// two-step task (edit a file) correctly, then — instead of proceeding to
+	// the second step (write the test file) — called list_files repeatedly
+	// until the identical-call guardrail ended the session. `update_todo_list`
+	// is registered and offered every turn, but the vendored system prompt's
+	// todo-list guidance is disabled for this harness (`todoListEnabled:
+	// false` in buildSystemPrompt, kept off deliberately — Phase 1 scope, and
+	// this note is scoped to local sessions only). A smaller local model
+	// plausibly needs the EXTERNAL scaffolding of a written-out plan more
+	// than a larger cloud model does, since it has less working "attention"
+	// left over after a growing tool-result-heavy context to track what it
+	// still needs to do implicitly.
+	const planningNote =
+		"For any task with more than one concrete step (e.g. edit a file AND write a test for it), call " +
+		"update_todo_list ONCE near the start to write out every step as a checklist, then mark each one done " +
+		"as you complete it and check the list again before deciding what to do next. After finishing one step, " +
+		"your next action should come from that checklist — not a fresh look around the workspace."
+
 	const basePrompt = [
 		modeConfig.roleDefinition,
 		toolUseNote,
 		verificationNote,
 		objectiveNote,
+		planningNote,
 		getSystemInfoSection(workspaceRoot),
 		await addCustomInstructions(modeConfig.customInstructions ?? "", globalCustomInstructions ?? "", workspaceRoot, modeConfig.slug, {}),
 	]
