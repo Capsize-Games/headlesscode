@@ -88,6 +88,18 @@ export interface LlmRequest {
 	 * (pre-existing behavior, unchanged).
 	 */
 	reasoningEffort?: string
+	/**
+	 * Sampling-level override for llama.cpp's `repeat_penalty`, applied for
+	 * exactly one request. The loop sets this once its identical-consecutive-
+	 * call guardrail (see DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD in
+	 * src/engine/loop.ts) detects a repeat starting, as an alternative to a
+	 * text-only nudge — three rounds of increasingly specific injected
+	 * corrections were verified live not to reliably interrupt a local model
+	 * mid-repetition (2026-08-21/22), so this escalates at the sampler
+	 * instead of only in the prompt. Ignored by clients/backends that don't
+	 * support per-request sampling overrides (e.g. OpenRouter).
+	 */
+	repeatPenalty?: number
 }
 
 /** Response shape returned by an LlmClient. */

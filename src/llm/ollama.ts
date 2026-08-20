@@ -103,6 +103,7 @@ export class OllamaClient implements LlmClient {
 					options: {
 						temperature: request.temperature ?? 0,
 						...(request.maxTokens !== undefined ? { num_predict: request.maxTokens } : {}),
+						...(request.repeatPenalty !== undefined ? { repeat_penalty: request.repeatPenalty } : {}),
 					},
 				}),
 			})

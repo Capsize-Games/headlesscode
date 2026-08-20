@@ -281,6 +281,18 @@ const READ_ONLY_TOOL_NAMES = new Set(["list_files", "read_file", "search_files"]
  */
 export const DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD = 2
 export const DEFAULT_IDENTICAL_CALL_STALL_LIMIT = 4
+/**
+ * Sampling-level companion to the text nudge above (see
+ * LlmRequest.repeatPenalty's doc comment): once the streak reaches the
+ * nudge threshold, the RETRY request itself carries this repeat_penalty
+ * instead of whatever the backend's own default/persisted value is. Chosen
+ * as a clear step up from this harness's raw-mode default of 1.15
+ * (airunnerdesktop's generation_execution_support.py) without being so high
+ * it degrades otherwise-fluent output — not yet tuned against a live trial,
+ * treat as a starting point. Ignored entirely by non-Ollama clients
+ * (OpenRouter has no equivalent per-request knob).
+ */
+export const DEFAULT_IDENTICAL_CALL_REPEAT_PENALTY_BOOST = 1.3
 /** The injected nudge (user-role, seen by the model on its next turn), indexed workspaces. */
 const READ_ONLY_NUDGE_MESSAGE =
 	"You've made several read/exploration calls without using `codebase_search`. If the workspace has an index (it lives in the central project store — see `~/.local/share/headlesscode/projects/`), try `codebase_search` for targeted semantic search instead of blind tree-walking."
@@ -2636,8 +2648,18 @@ export class HeadlessSession {
 	 * call sites in runIterations). Throws on failure exactly like a direct
 	 * `this.llmClient.createChatCompletion` call would; callers decide
 	 * whether a given failure is worth retrying (isRetryableOpenRouterError).
+	 *
+	 * `repeatPenaltyOverride` is the sampling-level identical-call
+	 * intervention (see LlmRequest.repeatPenalty's doc comment): set by the
+	 * caller once the identical-consecutive-call guardrail has detected a
+	 * repeat streak at or past the nudge threshold, so the retry request
+	 * itself, not just the injected text, pushes the model off the loop.
 	 */
-	private async callMainLlm(requestMessages: ChatMessage[], iteration: number): Promise<LlmResponse> {
+	private async callMainLlm(
+		requestMessages: ChatMessage[],
+		iteration: number,
+		repeatPenaltyOverride?: number,
+	): Promise<LlmResponse> {
 		const controller = new AbortController()
 		const timer = setTimeout(() => controller.abort(), this.config.llmTimeoutMs)
 		try {
@@ -2650,6 +2672,7 @@ export class HeadlessSession {
 				signal: controller.signal,
 				stream: this.config.stream,
 				reasoningEffort: this.config.reasoningEffort,
+				...(repeatPenaltyOverride !== undefined ? { repeatPenalty: repeatPenaltyOverride } : {}),
 				onStreamChunk: (kind, chunk) => {
 					// Dashboard live-typing: forward each chunk to the event feed
 					// (truncated like other large fields). Non-fatal — a feed
@@ -2781,11 +2804,29 @@ export class HeadlessSession {
 			// mid-session, iteration budget otherwise untouched). A second
 			// failure — retryable or not — still falls through to the
 			// catch block below exactly as before.
+			// Sampling-level identical-call intervention (see
+			// DEFAULT_IDENTICAL_CALL_REPEAT_PENALTY_BOOST's doc comment):
+			// `identicalCallStreak` still holds the value computed at the END
+			// of the PREVIOUS iteration, i.e. "was the last completed turn
+			// already repeating" — exactly the request this call is about to
+			// make, so the boost applies from the same turn the text nudge
+			// starts firing on.
+			const repeatPenaltyOverride =
+				identicalCallStreak >= DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD
+					? envIdenticalCallRepeatPenaltyBoost()
+					: undefined
+			if (repeatPenaltyOverride !== undefined) {
+				this.logger.info("[loop] identical-call repeat_penalty boost applied", {
+					iteration,
+					identicalCallStreak,
+					repeatPenaltyOverride,
+				})
+			}
 			let assistant: ChatMessage
 			try {
 				let response: LlmResponse
 				try {
-					response = await this.callMainLlm(requestMessages, iteration)
+					response = await this.callMainLlm(requestMessages, iteration, repeatPenaltyOverride)
 				} catch (firstAttemptError) {
 					if (!isRetryableOpenRouterError(firstAttemptError)) {
 						throw firstAttemptError
@@ -2795,7 +2836,7 @@ export class HeadlessSession {
 						error: firstAttemptError instanceof Error ? firstAttemptError.message : String(firstAttemptError),
 					})
 					await sleep(500)
-					response = await this.callMainLlm(requestMessages, iteration)
+					response = await this.callMainLlm(requestMessages, iteration, repeatPenaltyOverride)
 				}
 				assistant = response.message
 				// Cost/token accounting (workstream 3): feed the provider's usage
@@ -4349,6 +4390,15 @@ function envReadOnlyStallLimit(): number {
 	}
 	const n = Number(raw)
 	return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_READ_ONLY_STALL_LIMIT
+}
+
+function envIdenticalCallRepeatPenaltyBoost(): number {
+	const raw = process.env.HEADLESSCODE_IDENTICAL_CALL_REPEAT_PENALTY_BOOST
+	if (raw === undefined || raw === "") {
+		return DEFAULT_IDENTICAL_CALL_REPEAT_PENALTY_BOOST
+	}
+	const n = Number(raw)
+	return Number.isFinite(n) && n > 1 ? n : DEFAULT_IDENTICAL_CALL_REPEAT_PENALTY_BOOST
 }
 
 /**

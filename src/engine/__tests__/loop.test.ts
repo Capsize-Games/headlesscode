@@ -18,6 +18,7 @@ import {
 	HeadlessSession,
 	DEFAULT_READ_ONLY_STALL_LIMIT,
 	DEFAULT_IDENTICAL_CALL_STALL_LIMIT,
+	DEFAULT_IDENTICAL_CALL_REPEAT_PENALTY_BOOST,
 	isReadOnlyEquivalentShellCommand,
 	stripSupersededReasoning,
 	truncateHistory,
@@ -1212,6 +1213,45 @@ async function testIdenticalCallStallLimitFiresOnWriteToolToo(): Promise<void> {
 	}
 }
 
+// Sampling-level companion to the text nudge (see
+// DEFAULT_IDENTICAL_CALL_REPEAT_PENALTY_BOOST's doc comment): the request
+// that immediately follows a detected repeat streak must itself carry the
+// boosted repeat_penalty, not just an injected message — verified here at
+// the request-shape level since the fake client can't demonstrate whether
+// a real backend's sampling actually changes behavior.
+async function testIdenticalCallStreakBoostsRepeatPenaltyOnRetry(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-identical-boost-"))
+	try {
+		const client = new FakeLlmClient([
+			...Array.from({ length: 3 }, () => () => toolCall("list_files", { path: "." })),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({
+			task: "look around then finish",
+			client,
+			workspaceRoot: ws,
+			maxIterations: 250,
+		})
+		await session.run()
+
+		const boosts = client.requests.map((r) => r.repeatPenalty)
+		// Iterations 1-2 (the first two identical list_files calls) see no
+		// override yet — the streak only reaches the nudge threshold (2)
+		// AFTER iteration 2 completes. From iteration 3 onward (the request
+		// made once the streak is already >= threshold) every request must
+		// carry the boost.
+		assert.equal(boosts[0], undefined, "no boost on the very first call")
+		assert.equal(boosts[1], undefined, "no boost yet on the 2nd call — streak becomes >= threshold only after it")
+		assert.equal(
+			boosts[2],
+			DEFAULT_IDENTICAL_CALL_REPEAT_PENALTY_BOOST,
+			"3rd call (streak already at threshold) must carry the boosted repeat_penalty",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // Verified live 2026-08-21: a generic "try something different" nudge did
 // NOT change the model's next action — it repeated the same call again
 // right past the nudge, across several trials. Naming the concrete next
@@ -2184,6 +2224,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["read-only stagnation: an edit in the middle resets the streak (no false stall)", testReadOnlyStallLimitNotTrippedByProductiveInterleave],
 	["identical-call stall: the same call repeated verbatim ends in bounded failure quickly", testIdenticalCallStallLimitTerminates],
 	["identical-call stall: fires on a repeated WRITE tool call too, not just reads", testIdenticalCallStallLimitFiresOnWriteToolToo],
+	["identical-call stall: streak at/past threshold boosts repeat_penalty on the retry request", testIdenticalCallStreakBoostsRepeatPenaltyOnRetry],
 	["identical-call stall: a genuine edit/verify/edit/verify interleave never trips it", testIdenticalCallStreakResetByAnyDifferentCall],
 	["identical-call nudge: names the concrete next todo-list step, not just generic advice", testIdenticalCallNudgeNamesTheNextTodoStep],
 	["isReadOnlyEquivalentShellCommand: classifies read-only vs. mutating shell commands", testIsReadOnlyEquivalentShellCommandClassifiesCorrectly],
