@@ -385,6 +385,59 @@ async function testRequireExplicitCompletionRefusesTextOnlyReply(): Promise<void
 	}
 }
 
+// A local model was observed live (2026-08-20 against Qwen3-14B) writing a
+// tool call as narrated prose that ALSO hallucinated a fake surrounding
+// exchange — "[Called tool X with arguments {...}]\n\n[Result of X]:
+// <thousands of characters of plausible-looking fake tool output>" — instead
+// of a real native tool_calls entry. extractEmbeddedToolCall recovers the
+// real call from inside that text (see its doc comment), but the recovered
+// call used to be persisted to history with the ENTIRE hallucinated blob
+// still attached as the message's content. Every reproduction of that showed
+// the daemon hang mid-generation on the VERY NEXT request that included this
+// message — a shape no real training data has (an assistant turn that is
+// simultaneously plain narration AND a tool call). Fixed: the persisted
+// message's content is cleared once a call is recovered from it, matching
+// how a genuine native tool-call message looks (content: null).
+async function testEmbeddedToolCallRecoveryClearsHallucinatedNarrationFromHistory(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-embedded-"))
+	try {
+		const narratedBlob =
+			'[Called tool "read_file" with arguments {\'path\': \'src/engine/condense.ts\'}]\n\n' +
+			'[Result of "read_file"]: File: src/engine/condense.ts\n' +
+			"92 |  */\n93 | export const DEFAULT_CONDENSE_THRESHOLD_FRACTION = 0.75\n".repeat(50)
+		const client = new FakeLlmClient([
+			() => textReply(narratedBlob),
+			() => toolCall("attempt_completion", { result: "Done." }),
+		])
+		const session = await makeSession({
+			task: "read a file",
+			client,
+			workspaceRoot: ws,
+			requireExplicitCompletion: true,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+		assert.equal(client.requests.length, 2, "the recovered call must not end the session early")
+
+		// The SECOND request's history is what the fix targets: the persisted
+		// assistant message from turn 1 must carry the recovered tool call but
+		// NOT the raw hallucinated narration.
+		const secondRequestMessages = client.requests[1].messages
+		const recoveredAssistantMsg = secondRequestMessages.find(
+			(m) => m.role === "assistant" && m.tool_calls?.some((c) => c.function?.name === "read_file"),
+		)
+		assert.ok(recoveredAssistantMsg, "expected the recovered read_file call in the persisted history")
+		assert.equal(
+			recoveredAssistantMsg?.content,
+			null,
+			"the hallucinated narration must be cleared from the persisted message, not sent back on the next turn",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 async function testRequireExplicitCompletionBoundedFailureWhenNeverCompletes(): Promise<void> {
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-rec2-"))
 	try {
@@ -1965,6 +2018,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	[
 		"requireExplicitCompletion: text-only reply is nudged, not accepted, until attempt_completion",
 		testRequireExplicitCompletionRefusesTextOnlyReply,
+	],
+	[
+		"embedded tool call recovery clears hallucinated narration from persisted history",
+		testEmbeddedToolCallRecoveryClearsHallucinatedNarrationFromHistory,
 	],
 	[
 		"requireExplicitCompletion: repeated text-only replies -> bounded failure, never a fabricated success",

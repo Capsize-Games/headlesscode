@@ -3040,6 +3040,7 @@ export class HeadlessSession {
 						this.logger.warn("[loop] recovered tool call written as text instead of tool_calls", {
 							iteration,
 							tool: embedded.name,
+							textLength: text.length,
 						})
 						assistantMessage.tool_calls = [
 							{
@@ -3048,6 +3049,20 @@ export class HeadlessSession {
 								function: { name: embedded.name, arguments: embedded.rawArguments },
 							},
 						]
+						// Clear the raw prose from the PERSISTED history message — a
+						// local model writing a tool call as text was observed live
+						// (2026-08-20) narrating an entire fake exchange around it
+						// ("[Called tool X]... [Result of X]: <plausible-looking fake
+						// tool output>"), sometimes thousands of characters. Left in
+						// history verbatim, this self-narrated blob — an assistant
+						// message shaped unlike anything in real training data —
+						// reliably preceded a generation hang on the NEXT request in
+						// every reproduction. A real tool-call message has no
+						// meaningful content alongside tool_calls (see the `content:
+						// 0`-length pattern on every genuine tool-call turn); this
+						// recovered one now matches that shape instead of keeping the
+						// hallucinated narration.
+						assistantMessage.content = null
 						calls = [embedded]
 					}
 				}
