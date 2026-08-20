@@ -903,6 +903,16 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// backend.
 	const patchLocalToolSchemas =
 		useLocalCodeBackend && !envBoolean("HEADLESSCODE_ALLOW_UNPATCHED_LOCAL_TOOL_SCHEMAS")
+	// A local model was observed calling attempt_completion for real and
+	// claiming success (e.g. "typecheck and tests passed") while the last
+	// execute_command it actually ran was still failing, never re-verifying
+	// in between (verified live 2026-08-20 against both Qwen2.5-Coder-14B
+	// and Qwen3-14B). requireExplicitCompletion above only catches a
+	// text-only non-call; this catches a real completion call whose claim
+	// the session's own last command result already contradicts. See
+	// loop.ts's HeadlessSessionConfig.verifyBeforeCompletion doc comment.
+	const verifyBeforeCompletion =
+		useLocalCodeBackend && !envBoolean("HEADLESSCODE_ALLOW_UNVERIFIED_COMPLETION")
 
 	// Phase 3 context condensation: a cheaper model for the condensation
 	// call can be assigned via the `_condensation` key in
@@ -1015,6 +1025,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		reasoningEffort,
 		requireExplicitCompletion,
 		patchLocalToolSchemas,
+		verifyBeforeCompletion,
 		llmClient: client,
 		logger,
 		memory,

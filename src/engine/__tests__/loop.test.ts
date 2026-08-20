@@ -197,6 +197,7 @@ async function makeSession(options: {
 	/** Explicit session id override (see HeadlessSessionConfig.sessionId). */
 	sessionId?: string
 	requireExplicitCompletion?: boolean
+	verifyBeforeCompletion?: boolean
 }) {
 	const session = new HeadlessSession({
 		workspaceRoot: options.workspaceRoot,
@@ -210,6 +211,7 @@ async function makeSession(options: {
 		budget: options.budget ?? null,
 		reasoningEffort: options.reasoningEffort,
 		requireExplicitCompletion: options.requireExplicitCompletion,
+		verifyBeforeCompletion: options.verifyBeforeCompletion,
 		// Checkpoints are default-on and would otherwise write real shadow-git
 		// commits to ~/.headlesscode/checkpoints on every test run; this suite
 		// isn't testing checkpoints (except the one that is), so keep tests
@@ -402,6 +404,64 @@ async function testRequireExplicitCompletionBoundedFailureWhenNeverCompletes(): 
 
 		assert.equal(result.status, "error", `expected bounded failure, got ${JSON.stringify(result)}`)
 		assert.match(result.error ?? "", /consecutive empty replies/)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// A local model was observed live (2026-08-20, both Qwen2.5-Coder-14B and
+// Qwen3-14B) calling attempt_completion for real and claiming success (e.g.
+// "typecheck and tests passed") while the last execute_command it actually
+// ran was still failing, without ever re-running it — verifyBeforeCompletion
+// refuses that completion instead of accepting a claim the session's own
+// last command result already contradicts.
+async function testVerifyBeforeCompletionRefusesAfterFailedCommand(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc-"))
+	try {
+		const client = new FakeLlmClient([
+			() => toolCall("execute_command", { command: "exit 1" }),
+			() => toolCall("attempt_completion", { result: "Done (but tests are still red)." }),
+			() => toolCall("execute_command", { command: "true" }),
+			() => toolCall("attempt_completion", { result: "Done for real." }),
+		])
+		const session = await makeSession({
+			task: "fix the build",
+			client,
+			workspaceRoot: ws,
+			verifyBeforeCompletion: true,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "Done for real.")
+		assert.equal(client.requests.length, 4, "the false completion must not end the session early")
+		const nudge = session.state.messages.find(
+			(m) => m.role === "tool" && (m.content ?? "").includes("was NOT accepted"),
+		)
+		assert.ok(nudge, "expected a nudge telling the model its last command failed")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testVerifyBeforeCompletionAcceptsAfterSuccessfulCommand(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc2-"))
+	try {
+		const client = new FakeLlmClient([
+			() => toolCall("execute_command", { command: "true" }),
+			() => toolCall("attempt_completion", { result: "Done, verified." }),
+		])
+		const session = await makeSession({
+			task: "fix the build",
+			client,
+			workspaceRoot: ws,
+			verifyBeforeCompletion: true,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "Done, verified.")
+		assert.equal(client.requests.length, 2, "a completion after a successful command needs no nudge")
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -1869,6 +1929,14 @@ const tests: Array<[string, () => Promise<void>]> = [
 	[
 		"requireExplicitCompletion: a tool call written as prose is recovered and actually executed",
 		testRecoversTextEmbeddedToolCallForRealTool,
+	],
+	[
+		"verifyBeforeCompletion: attempt_completion is refused when the last execute_command failed",
+		testVerifyBeforeCompletionRefusesAfterFailedCommand,
+	],
+	[
+		"verifyBeforeCompletion: attempt_completion is accepted right away after a successful execute_command",
+		testVerifyBeforeCompletionAcceptsAfterSuccessfulCommand,
 	],
 	[
 		"requireExplicitCompletion: an embedded call naming an unknown tool is never executed",

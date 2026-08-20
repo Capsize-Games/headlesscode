@@ -675,6 +675,23 @@ export interface HeadlessSessionConfig {
 	 */
 	patchLocalToolSchemas?: boolean
 	/**
+	 * Refuse `attempt_completion` when the most recent `execute_command` call
+	 * in the session ended in an error and no LATER `execute_command` has
+	 * succeeded since. Catches a real, observed failure mode distinct from
+	 * `requireExplicitCompletion` (which only rejects a bare-text non-call):
+	 * a local model calls `attempt_completion` for real, but claims success
+	 * while the last verification command it ran (tsc/tests/build/…) is
+	 * still failing — e.g. after a destructive edit it never actually
+	 * fixed. Verified live 2026-08-20 against Qwen3-14B: this exact
+	 * sequence (failing tsc/test run → one more edit → attempt_completion
+	 * with a false "typecheck and tests passed" claim, never re-running
+	 * either) went through unchecked. Generic on purpose — it doesn't know
+	 * what a "test" command looks like, only whether the last command this
+	 * session actually ran succeeded. Default false; the local Ollama
+	 * code-mode backend turns this on.
+	 */
+	verifyBeforeCompletion?: boolean
+	/**
 	 * Phase 3 context condensation: the model's real context window in
 	 * tokens, used to decide WHEN to condense (the last request's real
 	 * prompt-token count vs. `condenseThresholdFraction` of this). When
@@ -852,6 +869,8 @@ export interface ResolvedSessionConfig {
 	requireExplicitCompletion: boolean
 	/** See HeadlessSessionConfig.patchLocalToolSchemas (default false). */
 	patchLocalToolSchemas: boolean
+	/** See HeadlessSessionConfig.verifyBeforeCompletion (default false). */
+	verifyBeforeCompletion: boolean
 	/**
 	 * Phase 3 context condensation: the model's real context window in
 	 * tokens, when explicitly configured (undefined = resolve live from
@@ -1133,6 +1152,7 @@ export class HeadlessSession {
 			windowSize: config.windowSize ?? DEFAULT_WINDOW_SIZE,
 			requireExplicitCompletion: config.requireExplicitCompletion ?? false,
 			patchLocalToolSchemas: config.patchLocalToolSchemas ?? false,
+			verifyBeforeCompletion: config.verifyBeforeCompletion ?? false,
 			// Deliberately left undefined when the caller didn't configure it:
 			// the live OpenRouter models-endpoint lookup in maybeCondenseHistory
 			// resolves the real context window (never hardcode a stale number —
@@ -2564,6 +2584,16 @@ export class HeadlessSession {
 		// attempt_completion is always accepted afterwards (see
 		// COMMIT_NUDGE_CONTENT).
 		let completionNudged = false
+		// verifyBeforeCompletion guardrail: whether the most recent
+		// execute_command call in the session (across all iterations) ended
+		// in an error. Updated on every execute_command result below;
+		// checked (only when the config flag is on) right before honoring
+		// attempt_completion.
+		let lastExecuteCommandFailed = false
+		// One-per-session nudge budget for the verifyBeforeCompletion
+		// guardrail, mirroring completionNudged's shape (a retried
+		// attempt_completion after the nudge is always accepted).
+		let verificationNudged = false
 		// Blind tree-walking guardrail (P1.6): count consecutive all-read-only
 		// iterations; when the streak crosses the threshold, inject one soft
 		// nudge per streak (codebase_search-specific when indexed, progress-
@@ -2866,6 +2896,41 @@ export class HeadlessSession {
 						? completionCall.args.result
 						: JSON.stringify(completionCall.args)
 
+				// Verify-before-finishing guardrail (see
+				// HeadlessSessionConfig.verifyBeforeCompletion's doc comment): the
+				// most recent execute_command this session actually ran ended in
+				// an error and nothing since has re-run it successfully — refuse
+				// the completion (one nudge, same "refused, siblings still
+				// execute" shape as the commit guardrail below) instead of
+				// accepting a claim the session's own last command result already
+				// contradicts.
+				if (!verificationNudged && this.config.verifyBeforeCompletion && lastExecuteCommandFailed) {
+					verificationNudged = true
+					for (const sibling of calls) {
+						if (sibling.id === completionCall.id) {
+							continue
+						}
+						messages.push({
+							role: "tool",
+							tool_call_id: sibling.id,
+							name: sibling.name,
+							content:
+								"[System: not executed — attempt_completion was deferred because the last command you ran ended in an error; re-issue this call if still needed.]",
+						})
+					}
+					messages.push({
+						role: "tool",
+						tool_call_id: completionCall.id,
+						name: "attempt_completion",
+						content:
+							"[System: attempt_completion was NOT accepted. The most recent command you ran ended in an error, and you have not run a command since that succeeded. Fix the issue, re-run the relevant check, and only call attempt_completion again once it actually passes.]",
+					})
+					this.logger.warn("[loop] attempt_completion deferred — last execute_command failed", {
+						iteration,
+					})
+					continue
+				}
+
 				// Commit-before-finishing guardrail (structural backstop — see
 				// plans/harness-tooling-efficiency.md item 4): in an EDIT-CAPABLE
 				// mode, before accepting completion, check for uncommitted
@@ -3098,6 +3163,9 @@ export class HeadlessSession {
 					throw new Error(`[loop] internal: no execution outcome for '${call.name}'`)
 				}
 				let { resultContent, isError } = outcome
+				if (call.name === "execute_command") {
+					lastExecuteCommandFailed = isError
+				}
 				const targetPath = editToolTargetPath(this.config.workspaceRoot, call)
 				const previouslyEditedBy = targetPath === undefined ? undefined : batchEditedPaths.get(targetPath)
 
@@ -3453,6 +3521,7 @@ export class HeadlessSession {
 			reasoningEffort: this.config.reasoningEffort,
 			requireExplicitCompletion: this.config.requireExplicitCompletion,
 			patchLocalToolSchemas: this.config.patchLocalToolSchemas,
+			verifyBeforeCompletion: this.config.verifyBeforeCompletion,
 			llmClient: this.llmClient,
 			logger: this.logger,
 			memory: this.config.memory,
