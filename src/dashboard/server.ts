@@ -91,7 +91,7 @@ import { buildSummary, findSessionEventsFile, readSessionEvents } from "./aggreg
 import { diffCheckpoints, listCheckpoints, renderUnifiedDiff, restoreCheckpoint } from "./checkpoints.js"
 import { codemapMissingError, readCodemapHtml, readCodemapJson } from "./codemap.js"
 import { renderPage } from "./page.js"
-import { answerSessionDecision, injectSessionMessage, launchSession, validateSessionStartBody } from "./session-launch.js"
+import { answerSessionDecision, ensureWorktree, injectSessionMessage, launchSession, validateSessionStartBody } from "./session-launch.js"
 import { loadCustomModes } from "../engine/prompt.js"
 import {
 	loadModeModelsFile,
@@ -136,6 +136,13 @@ export interface DashboardServerOptions {
 	cli?: string
 	/** Directory the launched CLI runs in (default: process.cwd()). Test-only. */
 	repoRoot?: string
+	/**
+	 * Root directory for POST /api/projects/ensure-worktree's disposable
+	 * per-project worktrees (see session-launch.ts's ensureWorktree).
+	 * Unset (default) = that endpoint responds 501; registration is
+	 * expected to fall back to the raw repo path in that case.
+	 */
+	worktreeRoot?: string
 	/**
 	 * Shadow-git storage root for the /api/checkpoints/* routes (default:
 	 * `~/.headlesscode/checkpoints` — the same default the CLI/engine use).
@@ -297,6 +304,51 @@ async function handleRequest(
 			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(
 				JSON.stringify({ sessionId, action, ok: true, worktree: found.source }),
 			)
+		} catch (error) {
+			res
+				.writeHead(500, { "content-type": "application/json; charset=utf-8" })
+				.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+		}
+		return
+	}
+
+	// Resolve (creating if needed) the disposable worktree a registered
+	// project's sessions should run against: POST /api/projects/ensure-worktree
+	// {repo: <source repo path>} -> {workspace: <worktree path>}. Called once
+	// at project-registration time (see airunner's headlesscode_service.py),
+	// not per-launch — the caller stores the returned path and reuses it for
+	// every session/poll/pause/resume/message operation on that project.
+	if (url.pathname === "/api/projects/ensure-worktree" && req.method !== "POST") {
+		res.writeHead(405, { "content-type": "text/plain" }).end("Method Not Allowed")
+		return
+	}
+	if (url.pathname === "/api/projects/ensure-worktree" && req.method === "POST") {
+		if (!options.worktreeRoot) {
+			res
+				.writeHead(501, { "content-type": "application/json; charset=utf-8" })
+				.end(JSON.stringify({ error: "worktreeRoot not configured (HEADLESSCODE_DASHBOARD_WORKTREE_ROOT)" }))
+			return
+		}
+		try {
+			const raw = await readJsonBody(req)
+			let body: unknown
+			try {
+				body = JSON.parse(raw || "{}")
+			} catch (err) {
+				res
+					.writeHead(400, { "content-type": "application/json; charset=utf-8" })
+					.end(JSON.stringify({ error: `invalid JSON body: ${err instanceof Error ? err.message : String(err)}` }))
+				return
+			}
+			const repo = (body as { repo?: string }).repo?.trim()
+			if (!repo) {
+				res
+					.writeHead(400, { "content-type": "application/json; charset=utf-8" })
+					.end(JSON.stringify({ error: "missing 'repo'" }))
+				return
+			}
+			const workspace = ensureWorktree(options.worktreeRoot, repo)
+			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(JSON.stringify({ workspace }))
 		} catch (error) {
 			res
 				.writeHead(500, { "content-type": "application/json; charset=utf-8" })

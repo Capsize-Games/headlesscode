@@ -48,6 +48,9 @@ Environment:
                  session's CLI runs in (default: process.cwd()). Same
                  container rationale as above — the dashboard's own cwd may
                  be a baked image copy while the live source lives elsewhere.
+  HEADLESSCODE_DASHBOARD_WORKTREE_ROOT    Root directory for POST
+                 /api/projects/ensure-worktree's disposable per-project
+                 worktrees. Unset (default) = that endpoint responds 501.
 
 Notes:
   Binds to 127.0.0.1 only — no auth unless HEADLESSCODE_DASHBOARD_TOKEN is
@@ -137,6 +140,7 @@ export async function dashboardMain(argv: string[]): Promise<number> {
 			token: process.env.HEADLESSCODE_DASHBOARD_TOKEN || undefined,
 			cli: process.env.HEADLESSCODE_DASHBOARD_SESSION_CLI || undefined,
 			repoRoot: process.env.HEADLESSCODE_DASHBOARD_SESSION_REPO_ROOT || undefined,
+			worktreeRoot: process.env.HEADLESSCODE_DASHBOARD_WORKTREE_ROOT || undefined,
 		})
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err)

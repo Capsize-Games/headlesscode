@@ -35,10 +35,11 @@
  * without spinning up the dashboard server (see the server.ts wrapper).
  */
 
+import * as fs from "node:fs"
 import * as fsp from "node:fs/promises"
 import * as path from "node:path"
-import { spawn } from "node:child_process"
-import { randomUUID } from "node:crypto"
+import { execFileSync, spawn } from "node:child_process"
+import { createHash, randomUUID } from "node:crypto"
 
 /** Marker basenames, relative to the session's workspace root (src/tools/executor.ts idiom). */
 const NEEDS_DECISION_FILENAME = ".harness.needs-decision"
@@ -69,6 +70,37 @@ export interface LaunchSessionResult {
 	pid: number
 	workspace: string
 	mode: string
+}
+
+/**
+ * Return a stable, disposable worktree path for `sourceRepo` under
+ * `worktreeRoot`, creating it (a fresh branch off the source repo's
+ * current HEAD) the first time this pair is seen. Reused on every
+ * subsequent call for the same source repo — NOT reset between
+ * sessions, so it accumulates history like a real feature branch
+ * rather than behaving as a throwaway per-launch sandbox.
+ *
+ * Container-deployment note: a worktree's `.git` is a
+ * `gitdir: <host-absolute-path>` pointer back into the source repo's
+ * `.git/worktrees/<name>` — the caller MUST mount `sourceRepo` at its
+ * real host-absolute path (not a container-local alias) for that
+ * pointer to resolve. `worktreeRoot` has no such constraint.
+ */
+export function ensureWorktree(worktreeRoot: string, sourceRepo: string): string {
+	const resolvedRepo = path.resolve(sourceRepo)
+	const slug = path.basename(resolvedRepo).replace(/[^a-zA-Z0-9._-]+/g, "-") || "repo"
+	const hash = createHash("sha1").update(resolvedRepo).digest("hex").slice(0, 8)
+	const wtPath = path.join(worktreeRoot, `${slug}-${hash}`)
+	if (fs.existsSync(path.join(wtPath, ".git"))) {
+		return wtPath
+	}
+	fs.mkdirSync(worktreeRoot, { recursive: true })
+	const branch = `headlesscode-session/${slug}-${hash}`
+	execFileSync("git", ["-C", resolvedRepo, "worktree", "add", "-b", branch, wtPath], {
+		stdio: "ignore",
+		timeout: 60_000,
+	})
+	return wtPath
 }
 
 /**
