@@ -443,13 +443,24 @@ export async function buildLeanSystemPrompt(options: BuildSystemPromptOptions): 
 	// human to say "go read an existing file first" explicitly — this note
 	// makes that the DEFAULT behavior instead of something that only
 	// happens after a wasted round trip.)
+	// 2026-08-22 addendum, same failure family: a trial that DID avoid the
+	// Jest mistake above still skipped the read_file step entirely and wrote
+	// a NEW test file using `console.assert(...)` — plausible-looking (it
+	// even has the word "assert" in it), but `console.assert` never throws
+	// on failure, so a genuinely wrong implementation (verified live:
+	// truncateMiddle producing length 33 instead of the required 30) still
+	// printed as a clean pass. Calling out the exact trap by name, since
+	// "read an example first" alone did not stop the model from guessing.
 	const conventionNote =
 		"Before writing a NEW file of a kind that likely already has examples in this codebase (a test file, a " +
 		"config file, a module following an established pattern), actually read_file an existing example FIRST " +
 		"and match its real conventions — imports, style, framework/assertion library, naming. Do not assume a " +
 		"generic default (e.g. Jest-style describe/test/expect) is correct just because it is common elsewhere; " +
 		"this project may use something else entirely, and a task that says 'follow the existing style' means " +
-		"look at the existing style, not guess at it."
+		"look at the existing style, not guess at it. This specifically includes the assertion call itself: this " +
+		"codebase's 'plain assert' style is Node's own `assert` module (`import assert from \"node:assert/strict\"`, " +
+		"then `assert.equal(...)` / `assert.match(...)`), which THROWS on failure — never `console.assert(...)`, " +
+		"which only prints a warning and lets execution continue, so a real bug would print as a clean pass."
 
 	const basePrompt = [
 		modeConfig.roleDefinition,
