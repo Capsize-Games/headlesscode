@@ -1252,6 +1252,42 @@ async function testIdenticalCallStreakBoostsRepeatPenaltyOnRetry(): Promise<void
 	}
 }
 
+// Harder companion to the repeat_penalty boost (see callMainLlm's doc
+// comment): verified live 2026-08-20 that repeat_penalty alone — at 1.3
+// AND 1.8 — does not reliably stop this model repeating one tool call.
+// Once the guard is active, the repeated tool's schema must be removed
+// from the request's own `tools` array entirely, not merely discouraged.
+async function testIdenticalCallStreakExcludesTheRepeatedToolOnRetry(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-identical-exclude-"))
+	try {
+		const client = new FakeLlmClient([
+			...Array.from({ length: 3 }, () => () => toolCall("list_files", { path: "." })),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({
+			task: "look around then finish",
+			client,
+			workspaceRoot: ws,
+			maxIterations: 250,
+		})
+		await session.run()
+
+		const hasListFiles = client.requests.map((r) => (r.tools ?? []).some((t) => t.function.name === "list_files"))
+		assert.equal(hasListFiles[0], true, "list_files still offered on the very first call")
+		assert.equal(hasListFiles[1], true, "list_files still offered on the 2nd call — streak becomes >= threshold only after it")
+		assert.equal(hasListFiles[2], false, "3rd call (streak already at threshold): list_files must be excluded entirely")
+		const hasAttemptCompletion = client.requests.map((r) =>
+			(r.tools ?? []).some((t) => t.function.name === "attempt_completion"),
+		)
+		assert.ok(
+			hasAttemptCompletion.every(Boolean),
+			"attempt_completion must never be excluded — it is the model's only escape hatch",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // Verified live 2026-08-21: a generic "try something different" nudge did
 // NOT change the model's next action — it repeated the same call again
 // right past the nudge, across several trials. Naming the concrete next
@@ -2225,6 +2261,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["identical-call stall: the same call repeated verbatim ends in bounded failure quickly", testIdenticalCallStallLimitTerminates],
 	["identical-call stall: fires on a repeated WRITE tool call too, not just reads", testIdenticalCallStallLimitFiresOnWriteToolToo],
 	["identical-call stall: streak at/past threshold boosts repeat_penalty on the retry request", testIdenticalCallStreakBoostsRepeatPenaltyOnRetry],
+	["identical-call stall: streak at/past threshold excludes the repeated tool on the retry request", testIdenticalCallStreakExcludesTheRepeatedToolOnRetry],
 	["identical-call stall: a genuine edit/verify/edit/verify interleave never trips it", testIdenticalCallStreakResetByAnyDifferentCall],
 	["identical-call nudge: names the concrete next todo-list step, not just generic advice", testIdenticalCallNudgeNamesTheNextTodoStep],
 	["isReadOnlyEquivalentShellCommand: classifies read-only vs. mutating shell commands", testIsReadOnlyEquivalentShellCommandClassifiesCorrectly],

@@ -2654,19 +2654,34 @@ export class HeadlessSession {
 	 * caller once the identical-consecutive-call guardrail has detected a
 	 * repeat streak at or past the nudge threshold, so the retry request
 	 * itself, not just the injected text, pushes the model off the loop.
+	 *
+	 * `excludedToolNames` is the harder companion lever, applied from the
+	 * same nudge threshold as the penalty boost: live trials (2026-08-20,
+	 * three at repeat_penalty=1.3, one at 1.8, all with a widened
+	 * last_n_tokens_size ruling out the sampler simply not "seeing" the
+	 * repeat) verified the penalty alone does not reliably stop this model
+	 * from repeating one tool call. This removes the repeated tool's schema
+	 * from the request entirely, so the grammar-constrained decoder cannot
+	 * select it at all — not merely a discouraged option. `attempt_completion`
+	 * is never excludable — it's the one escape hatch the model must always
+	 * retain even mid-guardrail.
 	 */
 	private async callMainLlm(
 		requestMessages: ChatMessage[],
 		iteration: number,
 		repeatPenaltyOverride?: number,
+		excludedToolNames?: string[],
 	): Promise<LlmResponse> {
 		const controller = new AbortController()
 		const timer = setTimeout(() => controller.abort(), this.config.llmTimeoutMs)
+		const excluded = new Set((excludedToolNames ?? []).filter((name) => name !== "attempt_completion"))
+		const tools =
+			excluded.size > 0 ? this.state.tools.filter((tool) => !excluded.has(tool.function.name)) : this.state.tools
 		try {
 			return await this.llmClient.createChatCompletion({
 				model: this.config.model,
 				messages: requestMessages,
-				tools: this.state.tools,
+				tools,
 				temperature: this.config.temperature,
 				maxTokens: this.config.maxTokens,
 				signal: controller.signal,
@@ -2720,6 +2735,7 @@ export class HeadlessSession {
 		// canonical signature of the LAST turn's tool call batch and how many
 		// consecutive turns it has repeated unchanged.
 		let lastCallBatchSignature: string | null = null
+		let lastCallBatchNames: string[] = []
 		let identicalCallStreak = 0
 		let identicalCallNudgeInjected = false
 
@@ -2811,22 +2827,22 @@ export class HeadlessSession {
 			// already repeating" — exactly the request this call is about to
 			// make, so the boost applies from the same turn the text nudge
 			// starts firing on.
-			const repeatPenaltyOverride =
-				identicalCallStreak >= DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD
-					? envIdenticalCallRepeatPenaltyBoost()
-					: undefined
+			const identicalCallGuardActive = identicalCallStreak >= DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD
+			const repeatPenaltyOverride = identicalCallGuardActive ? envIdenticalCallRepeatPenaltyBoost() : undefined
+			const excludedToolNames = identicalCallGuardActive ? lastCallBatchNames : undefined
 			if (repeatPenaltyOverride !== undefined) {
 				this.logger.info("[loop] identical-call repeat_penalty boost applied", {
 					iteration,
 					identicalCallStreak,
 					repeatPenaltyOverride,
+					excludedToolNames,
 				})
 			}
 			let assistant: ChatMessage
 			try {
 				let response: LlmResponse
 				try {
-					response = await this.callMainLlm(requestMessages, iteration, repeatPenaltyOverride)
+					response = await this.callMainLlm(requestMessages, iteration, repeatPenaltyOverride, excludedToolNames)
 				} catch (firstAttemptError) {
 					if (!isRetryableOpenRouterError(firstAttemptError)) {
 						throw firstAttemptError
@@ -2836,7 +2852,7 @@ export class HeadlessSession {
 						error: firstAttemptError instanceof Error ? firstAttemptError.message : String(firstAttemptError),
 					})
 					await sleep(500)
-					response = await this.callMainLlm(requestMessages, iteration, repeatPenaltyOverride)
+					response = await this.callMainLlm(requestMessages, iteration, repeatPenaltyOverride, excludedToolNames)
 				}
 				assistant = response.message
 				// Cost/token accounting (workstream 3): feed the provider's usage
@@ -3487,6 +3503,7 @@ export class HeadlessSession {
 					identicalCallStreak++
 				} else {
 					lastCallBatchSignature = callBatchSignature
+					lastCallBatchNames = [...new Set(calls.map((call) => call.name))]
 					identicalCallStreak = 1
 					identicalCallNudgeInjected = false
 				}
