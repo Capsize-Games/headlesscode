@@ -72,6 +72,9 @@ export interface LaunchSessionResult {
 	mode: string
 }
 
+/** `chown` target for newly-created worktree files, e.g. "1000:1000". Unset = skip. */
+export const WORKTREE_OWNER_ENV = "HEADLESSCODE_DASHBOARD_WORKTREE_OWNER"
+
 /**
  * Return a stable, disposable worktree path for `sourceRepo` under
  * `worktreeRoot`, creating it (a fresh branch off the source repo's
@@ -85,6 +88,17 @@ export interface LaunchSessionResult {
  * `.git/worktrees/<name>` — the caller MUST mount `sourceRepo` at its
  * real host-absolute path (not a container-local alias) for that
  * pointer to resolve. `worktreeRoot` has no such constraint.
+ *
+ * `git worktree add` writes into BOTH the new worktree dir AND the
+ * source repo's own `.git` (a new `worktrees/<name>` admin dir, a new
+ * `refs/heads/<branch>`) — when this process runs as root (a
+ * container's default; running as the host UID instead breaks the
+ * image's own baked root-owned paths — see the compose file's
+ * comment), those end up root-owned on the host, breaking ordinary
+ * host-side git commands on `sourceRepo` afterward. `ownerEnv`
+ * (`HEADLESSCODE_DASHBOARD_WORKTREE_OWNER`, e.g. "1000:1000") chowns
+ * every path this call touched back to the host user; unset = skip
+ * (today's behavior, for a deployment that doesn't need it).
  */
 export function ensureWorktree(worktreeRoot: string, sourceRepo: string): string {
 	const resolvedRepo = path.resolve(sourceRepo)
@@ -95,12 +109,43 @@ export function ensureWorktree(worktreeRoot: string, sourceRepo: string): string
 		return wtPath
 	}
 	fs.mkdirSync(worktreeRoot, { recursive: true })
-	const branch = `headlesscode-session/${slug}-${hash}`
+	const branchLeaf = `${slug}-${hash}`
+	const branch = `headlesscode-session/${branchLeaf}`
 	execFileSync("git", ["-C", resolvedRepo, "worktree", "add", "-b", branch, wtPath], {
 		stdio: "ignore",
 		timeout: 60_000,
 	})
+	chownWorktreeArtifacts(wtPath, resolvedRepo)
 	return wtPath
+}
+
+/** chown everything `ensureWorktree`'s `git worktree add` call just created, if configured. */
+function chownWorktreeArtifacts(wtPath: string, sourceRepo: string): void {
+	const owner = process.env[WORKTREE_OWNER_ENV]?.trim()
+	if (!owner) {
+		return
+	}
+	const targets = [
+		wtPath,
+		path.join(sourceRepo, ".git", "worktrees", path.basename(wtPath)),
+		// The branch lives under refs/heads/headlesscode-session/<leaf> —
+		// chown the whole headlesscode-session/ dir since every worktree
+		// this function creates shares it.
+		path.join(sourceRepo, ".git", "refs", "heads", "headlesscode-session"),
+	]
+	for (const target of targets) {
+		if (!fs.existsSync(target)) {
+			continue
+		}
+		try {
+			execFileSync("chown", ["-R", owner, target], { stdio: "ignore", timeout: 10_000 })
+		} catch (error) {
+			process.stderr.write(
+				`[worktree] chown ${owner} ${target} failed (non-fatal; host-side git commands on ` +
+					`${sourceRepo} may need manual chown): ${error instanceof Error ? error.message : String(error)}\n`,
+			)
+		}
+	}
 }
 
 /**

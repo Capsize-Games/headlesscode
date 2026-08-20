@@ -51,6 +51,14 @@ Environment:
   HEADLESSCODE_DASHBOARD_WORKTREE_ROOT    Root directory for POST
                  /api/projects/ensure-worktree's disposable per-project
                  worktrees. Unset (default) = that endpoint responds 501.
+  HEADLESSCODE_DASHBOARD_WORKTREE_OWNER   chown target (e.g. "1000:1000")
+                 for a newly-created worktree and the ref/admin files
+                 'git worktree add' writes into the source repo's own
+                 .git — read directly by session-launch.ts, not a
+                 startDashboardServer option. Only matters when this
+                 process runs as root (a container's usual default);
+                 unset (default) = skip, leaving those files owned by
+                 whoever ran the dashboard.
 
 Notes:
   Binds to 127.0.0.1 only — no auth unless HEADLESSCODE_DASHBOARD_TOKEN is
