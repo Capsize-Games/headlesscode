@@ -36,6 +36,18 @@ Environment:
                  POST routes (/api/session/start|pause|resume|answer) and
                  the destructive /api/checkpoints/restore. Unset (default) =
                  no auth. Local-only tool; see the notes below.
+  HEADLESSCODE_DASHBOARD_SESSION_CLI      Override the CLI invocation
+                 POST /api/session/start spawns (default: "npx tsx
+                 src/cli.ts", resolved from HEADLESSCODE_DASHBOARD_SESSION_REPO_ROOT).
+                 Not a CLI flag deliberately (DashboardServerOptions.cli is a
+                 test-only injection point) — this exists for container
+                 deployments where the dashboard runs from a live bind-mounted
+                 source tree but "npx tsx" has no node_modules there to
+                 resolve against (see docker-compose.headlesscode-local.yml).
+  HEADLESSCODE_DASHBOARD_SESSION_REPO_ROOT  Override the directory a launched
+                 session's CLI runs in (default: process.cwd()). Same
+                 container rationale as above — the dashboard's own cwd may
+                 be a baked image copy while the live source lives elsewhere.
 
 Notes:
   Binds to 127.0.0.1 only — no auth unless HEADLESSCODE_DASHBOARD_TOKEN is
@@ -123,6 +135,8 @@ export async function dashboardMain(argv: string[]): Promise<number> {
 			port: options.port,
 			repo: options.repo,
 			token: process.env.HEADLESSCODE_DASHBOARD_TOKEN || undefined,
+			cli: process.env.HEADLESSCODE_DASHBOARD_SESSION_CLI || undefined,
+			repoRoot: process.env.HEADLESSCODE_DASHBOARD_SESSION_REPO_ROOT || undefined,
 		})
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err)
