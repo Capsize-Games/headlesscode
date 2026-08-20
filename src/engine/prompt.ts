@@ -416,14 +416,20 @@ export async function buildLeanSystemPrompt(options: BuildSystemPromptOptions): 
 	// plausibly needs the EXTERNAL scaffolding of a written-out plan more
 	// than a larger cloud model does, since it has less working "attention"
 	// left over after a growing tool-result-heavy context to track what it
-	// still needs to do implicitly.
+	// still needs to do implicitly. Strengthened again same day: a trial
+	// wrote its FIRST update_todo_list call with all three steps already
+	// marked [x] done, before doing any of the actual work — a premature,
+	// theatrical completion-marking pattern that defeats the whole point
+	// (it also meant the identical-call nudge's "next pending step" lookup,
+	// see identicalCallNudgeMessage in loop.ts, found nothing to point at).
 	const planningNote =
 		"For any task with more than one concrete step (e.g. edit a file AND write a test for it), call " +
-		"update_todo_list ONCE near the start to write out every step as a checklist, then mark each one done " +
-		"as you complete it and check the list again before deciding what to do next. After finishing one step, " +
-		"your next action should come from that checklist — not a fresh look around the workspace. If a step " +
-		"fails (a tool error, a failing command), your next action is to read that error and address it " +
-		"specifically — not to fall back on list_files or another unrelated exploration call."
+		"update_todo_list ONCE near the start to write out every step as PENDING [ ] — not already checked off; " +
+		"you have not done any of it yet at that point. Only mark a step done [x] AFTER you have actually " +
+		"performed it and, where applicable, verified it. Then check the list again before deciding what to do " +
+		"next: your next action should come from the first step still marked pending, not a fresh look around " +
+		"the workspace. If a step fails (a tool error, a failing command), your next action is to read that " +
+		"error and address it specifically — not to fall back on list_files or another unrelated exploration call."
 
 	// Added 2026-08-21 after a live failure pattern reproduced across THREE
 	// separate trials: asked to write a new test file "following the
