@@ -17,6 +17,7 @@ import { OpenRouterClient, parseReasoningEffort } from "./llm/openrouter.js"
 import { OllamaClient } from "./llm/ollama.js"
 import type { LlmClient } from "./engine/types.js"
 import { HeadlessSession } from "./engine/loop.js"
+import { chownWorktreeWorkspace } from "./dashboard/session-launch.js"
 import { isLocalExploreEnabled } from "./engine/local-explore.js"
 import { Logger } from "./engine/logger.js"
 import {
@@ -1092,6 +1093,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	})
 
 	const result = await session.run()
+
+	// A session writes into workspaceRoot throughout the run (file edits,
+	// its own .headlesscode/{events,usage,reports}, git's index as it
+	// stages things) AND, when workspaceRoot is a worktree, into the
+	// source repo's separate .git/worktrees/<name>/ admin dir — chowning
+	// only at worktree *creation* time (see session-launch.ts's
+	// ensureWorktree) misses all of this. Runs regardless of success/
+	// failure — a failed session can leave root-owned files too. No-ops
+	// when HEADLESSCODE_DASHBOARD_WORKTREE_OWNER isn't set (today's
+	// default for a non-container / non-root run).
+	chownWorktreeWorkspace(workspaceRoot)
 
 	if (session.memoryStats) {
 		process.stdout.write(

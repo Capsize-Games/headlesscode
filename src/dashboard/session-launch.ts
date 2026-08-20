@@ -119,12 +119,66 @@ export function ensureWorktree(worktreeRoot: string, sourceRepo: string): string
 	return wtPath
 }
 
-/** chown everything `ensureWorktree`'s `git worktree add` call just created, if configured. */
-function chownWorktreeArtifacts(wtPath: string, sourceRepo: string): void {
+/**
+ * chown `target` (recursive) to `HEADLESSCODE_DASHBOARD_WORKTREE_OWNER`, if
+ * configured. Shared by `ensureWorktree`'s one-time setup chown and the
+ * CLI's own post-session chown (see cli.ts, right after `session.run()`
+ * returns) — worktree creation isn't the only thing that leaves root-owned
+ * files behind when the whole process runs as root: the SESSION ITSELF
+ * writes into the worktree throughout the run (file edits, its own
+ * .headlesscode/{events,usage,reports}, git's own index as it stages
+ * things) — see the doc comment on ensureWorktree for the container-as-
+ * root rationale this all follows from. `label` is only used in the
+ * non-fatal failure log line.
+ */
+export function chownPathForHostUser(target: string, label: string): void {
 	const owner = process.env[WORKTREE_OWNER_ENV]?.trim()
-	if (!owner) {
+	if (!owner || !fs.existsSync(target)) {
 		return
 	}
+	try {
+		execFileSync("chown", ["-R", owner, target], { stdio: "ignore", timeout: 30_000 })
+	} catch (error) {
+		process.stderr.write(
+			`[worktree] chown ${owner} ${target} failed (non-fatal; ${label} may need manual chown): ` +
+				`${error instanceof Error ? error.message : String(error)}\n`,
+		)
+	}
+}
+
+/**
+ * `chownPathForHostUser(workspaceRoot, ...)` alone misses one thing: a
+ * worktree's own `.git` is a plain-text `gitdir: <path>` pointer into the
+ * SOURCE repo's `.git/worktrees/<name>/` admin dir (index, HEAD, etc.),
+ * which git keeps updating for the life of the worktree (e.g. its own
+ * `index` file changes as the session's `git` commands stage things) —
+ * that admin dir lives OUTSIDE workspaceRoot entirely, so it needs its
+ * own chown. No-ops (same as chownPathForHostUser) when the owner env
+ * isn't configured or `workspaceRoot` isn't actually a worktree (a plain
+ * `.git` directory, not a file, when a session runs directly against a
+ * real repo instead of ensureWorktree's disposable copy).
+ */
+export function chownWorktreeWorkspace(workspaceRoot: string): void {
+	chownPathForHostUser(workspaceRoot, `session workspace ${workspaceRoot}`)
+	const gitPath = path.join(workspaceRoot, ".git")
+	let stat: fs.Stats
+	try {
+		stat = fs.statSync(gitPath)
+	} catch {
+		return
+	}
+	if (!stat.isFile()) {
+		return
+	}
+	const contents = fs.readFileSync(gitPath, "utf-8").trim()
+	const match = /^gitdir:\s*(.+)$/.exec(contents)
+	if (match) {
+		chownPathForHostUser(match[1], `git-worktree admin dir for ${workspaceRoot}`)
+	}
+}
+
+/** chown everything `ensureWorktree`'s `git worktree add` call just created, if configured. */
+function chownWorktreeArtifacts(wtPath: string, sourceRepo: string): void {
 	const targets = [
 		wtPath,
 		// The parent .git/worktrees/ dir itself gets created (root-owned)
@@ -140,17 +194,7 @@ function chownWorktreeArtifacts(wtPath: string, sourceRepo: string): void {
 		path.join(sourceRepo, ".git", "logs", "refs", "heads", "headlesscode-session"),
 	]
 	for (const target of targets) {
-		if (!fs.existsSync(target)) {
-			continue
-		}
-		try {
-			execFileSync("chown", ["-R", owner, target], { stdio: "ignore", timeout: 10_000 })
-		} catch (error) {
-			process.stderr.write(
-				`[worktree] chown ${owner} ${target} failed (non-fatal; host-side git commands on ` +
-					`${sourceRepo} may need manual chown): ${error instanceof Error ? error.message : String(error)}\n`,
-			)
-		}
+		chownPathForHostUser(target, `host-side git commands on ${sourceRepo}`)
 	}
 }
 
