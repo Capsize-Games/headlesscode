@@ -2771,6 +2771,15 @@ export class HeadlessSession {
 		// checked (only when the config flag is on) right before honoring
 		// attempt_completion.
 		let lastExecuteCommandFailed = false
+		// Concrete command + truncated error output for the failure above,
+		// so the attempt_completion rejection below can restate WHAT failed
+		// instead of pointing at it abstractly — by the time a model reaches
+		// a rejected attempt_completion, history truncation/condensation has
+		// often already evicted the original error from context, leaving it
+		// with nothing concrete to act on (observed live 2026-08-20: this
+		// produced a stuck loop of a repeated, unmodified attempt_completion
+		// call alternating with genuinely empty replies).
+		let lastExecuteCommandSummary: string | undefined
 		// Blind tree-walking guardrail (P1.6): count consecutive all-read-only
 		// iterations; when the streak crosses the threshold, inject one soft
 		// nudge per streak (codebase_search-specific when indexed, progress-
@@ -3172,7 +3181,9 @@ export class HeadlessSession {
 						tool_call_id: completionCall.id,
 						name: "attempt_completion",
 						content:
-							"[System: attempt_completion was NOT accepted. The most recent command you ran ended in an error, and you have not run a command since that succeeded. Fix the issue, re-run the relevant check, and only call attempt_completion again once it actually passes.]",
+							"[System: attempt_completion was NOT accepted. The most recent command you ran ended in an error, and you have not run a command since that succeeded:\n" +
+							`${lastExecuteCommandSummary ?? "(command output no longer available)"}\n` +
+							"Fix the issue, re-run the exact command above, and only call attempt_completion again once it actually passes.]",
 					})
 					this.logger.warn("[loop] attempt_completion deferred — last execute_command failed", {
 						iteration,
@@ -3493,6 +3504,16 @@ export class HeadlessSession {
 				let { resultContent, isError } = outcome
 				if (call.name === "execute_command") {
 					lastExecuteCommandFailed = isError
+					if (isError) {
+						const command = summarizeToolArg(call.name, call.args) ?? "(unknown command)"
+						const output =
+							typeof resultContent === "string"
+								? resultContent.slice(0, 500)
+								: JSON.stringify(resultContent).slice(0, 500)
+						lastExecuteCommandSummary = `${command}\n${output}`
+					} else {
+						lastExecuteCommandSummary = undefined
+					}
 				}
 				const targetPath = editToolTargetPath(this.config.workspaceRoot, call)
 				const previouslyEditedBy = targetPath === undefined ? undefined : batchEditedPaths.get(targetPath)
