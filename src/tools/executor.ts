@@ -188,6 +188,8 @@ export interface ToolExecutorOptions {
 	 * enforce the repo's committed policy.
 	 */
 	permissions?: PermissionsConfig
+	/** See ToolContext.guardLargeOverwrites (types.ts) for the full writeup. */
+	guardLargeOverwrites?: boolean
 	/**
 	 * Live worker monitoring: fired at the same lifecycle points where the
 	 * `.harness.needs-decision` marker is written/cleared, so the session can
@@ -322,6 +324,7 @@ export class ToolExecutor {
 			return await handler(args, {
 				workspaceRoot: this.workspaceRoot,
 				permissions: this.permissions,
+				guardLargeOverwrites: this.options.guardLargeOverwrites,
 				decisionTimeoutMs: this.options.decisionTimeoutMs,
 				decisionPollIntervalMs: this.options.decisionPollIntervalMs,
 				pauseBudgetClock: this.pauseBudgetClock,
@@ -863,6 +866,55 @@ function protectedWriteRefusal(toolName: string, rel: string, permissions: Permi
 	)
 }
 
+/**
+ * Existing-file content length (bytes) above which write_to_file refuses to
+ * overwrite when ctx.guardLargeOverwrites is on. Chosen well above trivial
+ * stub/placeholder content (empty scaffolds, one-liners) so the common
+ * legitimate case — write_to_file creating or replacing a small/new file —
+ * is never affected; see largeOverwriteRefusal's doc comment.
+ */
+const LARGE_OVERWRITE_GUARD_BYTES = 200
+
+/**
+ * guardLargeOverwrites (see ToolContext.guardLargeOverwrites, types.ts):
+ * refuse write_to_file against a file that already exists and has
+ * substantial content, mirroring edit_file's empty-old_string refusal in
+ * the other direction. Verified live 2026-08-20 against Qwen2.5-Coder-14B
+ * and Qwen3-14B: given a real ~500-line file and a one-function-add task,
+ * both had a strong bias toward regenerating the ENTIRE file from scratch
+ * via write_to_file instead of a targeted diff — and since a full
+ * regeneration needs far more output budget than a precise edit, this
+ * reliably truncates mid-file, silently destroying everything after the
+ * cutoff. The escape hatch (delete-then-write) is deliberate: it requires a
+ * SEPARATE, explicit destructive action instead of one accidental call, so
+ * a genuine full-file rewrite is still possible without disabling the
+ * guard.
+ */
+async function largeOverwriteRefusal(target: string, rel: string, ctx: ToolContext): Promise<ToolResult | null> {
+	if (!ctx.guardLargeOverwrites) {
+		return null
+	}
+	let existingSize: number
+	try {
+		existingSize = (await fsp.stat(target)).size
+	} catch {
+		return null // Target doesn't exist yet — the legitimate new-file case.
+	}
+	if (existingSize <= LARGE_OVERWRITE_GUARD_BYTES) {
+		return null
+	}
+	return err(
+		`write_to_file: refusing to overwrite '${rel}' (${existingSize} bytes of existing content).\n\n` +
+			`<error_details>\nwrite_to_file replaces this file's ENTIRE content. For an existing file of this size, ` +
+			`regenerating it from scratch instead of making a targeted change risks silently losing content that ` +
+			`isn't reproduced (especially if generation is cut off before finishing the full file).\n\n` +
+			`Recovery suggestions:\n1. Use edit_file or search_replace to make a precise, targeted change instead\n` +
+			`2. Use read_file first if you haven't seen the file's current contents\n3. If a full-file rewrite is ` +
+			`genuinely intended, delete the file first (execute_command) — write_to_file always succeeds against a ` +
+			`path that doesn't exist\n</error_details>`,
+	)
+}
+
 /** write_to_file — create parent dirs as needed, overwrite existing files. */
 function writeToFileHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
 	const filePath = requireString(args, "path")
@@ -879,6 +931,11 @@ function writeToFileHandler(args: Record<string, unknown>, ctx: ToolContext): Pr
 		const refusal = protectedWriteRefusal("write_to_file", rel, ctx.permissions)
 		if (refusal !== null) {
 			return refusal
+		}
+
+		const overwriteRefusal = await largeOverwriteRefusal(target, rel, ctx)
+		if (overwriteRefusal !== null) {
+			return overwriteRefusal
 		}
 
 		try {

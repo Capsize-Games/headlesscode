@@ -155,6 +155,15 @@ export interface ToolContext {
 	 */
 	permissions: PermissionsConfig
 	/**
+	 * See HeadlessSessionConfig.guardLargeOverwrites (loop.ts) for the full
+	 * writeup. When true, `write_to_file` refuses to overwrite an existing
+	 * file that already has substantial content (see the guard in
+	 * `writeToFileHandler`, src/tools/executor.ts) — creating a brand-new
+	 * file is never affected. Absent/false for cloud sessions and bare
+	 * executors (tests, reviewer/QA).
+	 */
+	guardLargeOverwrites?: boolean
+	/**
 	 * Decision escalation (ask_followup_question, see src/tools/executor.ts):
 	 * how long to block waiting for `.harness.decision-answer` before falling
 	 * back to today's autonomous-decision error, and how often to poll for it.

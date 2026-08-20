@@ -692,6 +692,24 @@ export interface HeadlessSessionConfig {
 	 */
 	verifyBeforeCompletion?: boolean
 	/**
+	 * Refuse `write_to_file` (whole-file overwrite) against a file that
+	 * already has substantial content, nudging the model toward `edit_file`/
+	 * `search_replace` instead. Verified live 2026-08-20 against both
+	 * Qwen2.5-Coder-14B and Qwen3-14B, and reproduced with a synthetic
+	 * request bypassing headlesscode entirely: given a real ~500-line file
+	 * and a one-function-add task, both models had a strong bias toward
+	 * regenerating the ENTIRE file from scratch via `write_to_file` instead
+	 * of a targeted diff — and since a full regeneration needs far more
+	 * output budget than a precise edit, this reliably truncates mid-file,
+	 * silently destroying everything after the cutoff (see
+	 * plans/local-dual-model-code-agent-PROMPT-2026-08-20.md, "Tonight's
+	 * core finding"). `write_to_file` against a NEW file (the common,
+	 * legitimate case — e.g. a test file) is never affected; see
+	 * `writeToFileHandler`'s guard in src/tools/executor.ts. Default false;
+	 * the local Ollama code-mode backend turns this on.
+	 */
+	guardLargeOverwrites?: boolean
+	/**
 	 * Phase 3 context condensation: the model's real context window in
 	 * tokens, used to decide WHEN to condense (the last request's real
 	 * prompt-token count vs. `condenseThresholdFraction` of this). When
@@ -871,6 +889,8 @@ export interface ResolvedSessionConfig {
 	patchLocalToolSchemas: boolean
 	/** See HeadlessSessionConfig.verifyBeforeCompletion (default false). */
 	verifyBeforeCompletion: boolean
+	/** See HeadlessSessionConfig.guardLargeOverwrites (default false). */
+	guardLargeOverwrites: boolean
 	/**
 	 * Phase 3 context condensation: the model's real context window in
 	 * tokens, when explicitly configured (undefined = resolve live from
@@ -1153,6 +1173,7 @@ export class HeadlessSession {
 			requireExplicitCompletion: config.requireExplicitCompletion ?? false,
 			patchLocalToolSchemas: config.patchLocalToolSchemas ?? false,
 			verifyBeforeCompletion: config.verifyBeforeCompletion ?? false,
+			guardLargeOverwrites: config.guardLargeOverwrites ?? false,
 			// Deliberately left undefined when the caller didn't configure it:
 			// the live OpenRouter models-endpoint lookup in maybeCondenseHistory
 			// resolves the real context window (never hardcode a stale number —
@@ -1200,6 +1221,7 @@ export class HeadlessSession {
 				decisionTimeoutMs: this.config.decisionTimeoutMs,
 				decisionPollIntervalMs: this.config.decisionPollIntervalMs,
 				permissions: this.config.permissions,
+				guardLargeOverwrites: this.config.guardLargeOverwrites,
 				// Live worker monitoring: mirror ask_followup_question's
 				// .harness.needs-decision marker lifecycle on the session's
 				// event feed (decision_blocked / decision_answered). Non-fatal.
@@ -2590,10 +2612,6 @@ export class HeadlessSession {
 		// checked (only when the config flag is on) right before honoring
 		// attempt_completion.
 		let lastExecuteCommandFailed = false
-		// One-per-session nudge budget for the verifyBeforeCompletion
-		// guardrail, mirroring completionNudged's shape (a retried
-		// attempt_completion after the nudge is always accepted).
-		let verificationNudged = false
 		// Blind tree-walking guardrail (P1.6): count consecutive all-read-only
 		// iterations; when the streak crosses the threshold, inject one soft
 		// nudge per streak (codebase_search-specific when indexed, progress-
@@ -2900,12 +2918,24 @@ export class HeadlessSession {
 				// HeadlessSessionConfig.verifyBeforeCompletion's doc comment): the
 				// most recent execute_command this session actually ran ended in
 				// an error and nothing since has re-run it successfully — refuse
-				// the completion (one nudge, same "refused, siblings still
-				// execute" shape as the commit guardrail below) instead of
-				// accepting a claim the session's own last command result already
-				// contradicts.
-				if (!verificationNudged && this.config.verifyBeforeCompletion && lastExecuteCommandFailed) {
-					verificationNudged = true
+				// the completion (same "refused, siblings still execute" shape as
+				// the commit guardrail below) instead of accepting a claim the
+				// session's own last command result already contradicts.
+				// Deliberately NOT a one-per-session nudge (unlike
+				// completionNudged below): verified live 2026-08-20 against
+				// Qwen3-14B that a one-shot budget lets a SECOND, later
+				// fabricated completion through unchecked once the nudge is
+				// spent — the model got nudged once after a failing tsc run,
+				// made another failing edit_file (not execute_command) attempt,
+				// then called attempt_completion again claiming "typecheck and
+				// tests passed" while tsc was still genuinely broken (confirmed
+				// by re-running it directly). This guardrail must keep refusing
+				// every single time lastExecuteCommandFailed is true, however
+				// many times that takes — a model that can't fix the failure
+				// eventually hits maxIterations or the consecutive-mistake
+				// bound from OTHER errors, which is the correct outcome, not a
+				// false "success".
+				if (this.config.verifyBeforeCompletion && lastExecuteCommandFailed) {
 					for (const sibling of calls) {
 						if (sibling.id === completionCall.id) {
 							continue
@@ -3522,6 +3552,7 @@ export class HeadlessSession {
 			requireExplicitCompletion: this.config.requireExplicitCompletion,
 			patchLocalToolSchemas: this.config.patchLocalToolSchemas,
 			verifyBeforeCompletion: this.config.verifyBeforeCompletion,
+			guardLargeOverwrites: this.config.guardLargeOverwrites,
 			llmClient: this.llmClient,
 			logger: this.logger,
 			memory: this.config.memory,

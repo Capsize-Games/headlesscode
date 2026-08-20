@@ -444,6 +444,50 @@ async function testVerifyBeforeCompletionRefusesAfterFailedCommand(): Promise<vo
 	}
 }
 
+// Verified live 2026-08-20 against Qwen3-14B: the guardrail above used to
+// spend a one-per-session nudge budget (mirroring the unrelated commit-nudge
+// pattern), which meant a SECOND fabricated completion later in the same
+// session — after a fresh execute_command failure, once the one nudge was
+// already used — went through unchecked, even though the last command was
+// still genuinely failing (confirmed by re-running tsc/tests directly: both
+// failed exactly as the pre-nudge command had). The guardrail must refuse
+// EVERY time the last execute_command failed and nothing since succeeded,
+// however many times that takes in one session.
+async function testVerifyBeforeCompletionRefusesEveryFailureNotJustTheFirst(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc3-"))
+	try {
+		const client = new FakeLlmClient([
+			() => toolCall("execute_command", { command: "exit 1" }),
+			() => toolCall("attempt_completion", { result: "Done (first fabricated claim)." }),
+			// A non-execute_command tool call between the two fabricated
+			// completions — mirrors the live trial (an edit_file attempt), so
+			// lastExecuteCommandFailed is never cleared by a real re-verification.
+			() => toolCall("read_file", { path: "notes.txt" }),
+			() => toolCall("attempt_completion", { result: "Done (second fabricated claim)." }),
+			() => toolCall("execute_command", { command: "true" }),
+			() => toolCall("attempt_completion", { result: "Done for real." }),
+		])
+		const session = await makeSession({
+			task: "fix the build",
+			client,
+			workspaceRoot: ws,
+			verifyBeforeCompletion: true,
+		})
+		await fs.writeFile(path.join(ws, "notes.txt"), "hello\n", "utf-8")
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "Done for real.")
+		assert.equal(client.requests.length, 6, "both fabricated completions must be refused, not just the first")
+		const nudges = session.state.messages.filter(
+			(m) => m.role === "tool" && (m.content ?? "").includes("was NOT accepted"),
+		)
+		assert.equal(nudges.length, 2, "expected a nudge on EACH fabricated completion attempt, not just the first")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 async function testVerifyBeforeCompletionAcceptsAfterSuccessfulCommand(): Promise<void> {
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc2-"))
 	try {
@@ -1937,6 +1981,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	[
 		"verifyBeforeCompletion: attempt_completion is accepted right away after a successful execute_command",
 		testVerifyBeforeCompletionAcceptsAfterSuccessfulCommand,
+	],
+	[
+		"verifyBeforeCompletion: refuses every fabricated completion in a session, not just the first",
+		testVerifyBeforeCompletionRefusesEveryFailureNotJustTheFirst,
 	],
 	[
 		"requireExplicitCompletion: an embedded call naming an unknown tool is never executed",

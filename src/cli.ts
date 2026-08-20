@@ -913,6 +913,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// loop.ts's HeadlessSessionConfig.verifyBeforeCompletion doc comment.
 	const verifyBeforeCompletion =
 		useLocalCodeBackend && !envBoolean("HEADLESSCODE_ALLOW_UNVERIFIED_COMPLETION")
+	// A local model was observed regenerating an entire existing ~500-line
+	// file from scratch via write_to_file for a one-function-add task
+	// instead of a targeted diff, getting cut off mid-regeneration and
+	// silently destroying everything after the cutoff (verified live
+	// 2026-08-20 against both Qwen2.5-Coder-14B and Qwen3-14B, reproduced
+	// with a synthetic request bypassing headlesscode entirely — see
+	// plans/local-dual-model-code-agent-PROMPT-2026-08-20.md, "Tonight's
+	// core finding"). See loop.ts's HeadlessSessionConfig.guardLargeOverwrites
+	// doc comment and executor.ts's largeOverwriteRefusal.
+	const guardLargeOverwrites =
+		useLocalCodeBackend && !envBoolean("HEADLESSCODE_ALLOW_UNGUARDED_OVERWRITES")
 
 	// Phase 3 context condensation: a cheaper model for the condensation
 	// call can be assigned via the `_condensation` key in
@@ -1026,6 +1037,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		requireExplicitCompletion,
 		patchLocalToolSchemas,
 		verifyBeforeCompletion,
+		guardLargeOverwrites,
 		llmClient: client,
 		logger,
 		memory,
