@@ -1196,6 +1196,14 @@ async function searchReplaceHandler(args: Record<string, unknown>, ctx: ToolCont
 type LineEnding = "\r\n" | "\n"
 
 /**
+ * Character-count growth (new_string longer than old_string) above which a
+ * multi-site edit_file replacement (expected_replacements > 1) is refused.
+ * See the guard's call site in editFileHandler for the live-verified
+ * failure this exists to prevent.
+ */
+const UNSAFE_MULTI_REPLACE_GROWTH_CHARS = 40
+
+/**
 	 * Count occurrences of a substring in a string (non-overlapping).
 	 * Ported verbatim from upstream EditFileTool.ts.
 	 */
@@ -1373,6 +1381,36 @@ async function editFileHandler(args: Record<string, unknown>, ctx: ToolContext):
 				)
 			}
 
+			// Unsafe-multi-replace-insertion guard: verified live 2026-08-20 —
+			// a local model's old_string ("estimateMessageChars", a bare
+			// identifier) matched 4 unrelated sites (one function definition,
+			// three call sites) in condense.ts. edit_file's own error message
+			// on the first (correctly refused, count-mismatch) attempt
+			// suggested "if you intend to replace all occurrences, set
+			// expected_replacements to N" — reasonable advice for a genuine
+			// rename, but the model's real intent was to INSERT a large new
+			// function body once, right after the definition. Taking that
+			// suggestion literally applied the same large insertion at all 4
+			// sites, corrupting the 3 call sites (each ended up with the new
+			// function body spliced into the middle of a function call). A
+			// multi-site replacement whose new_string is much LONGER than
+			// old_string is exactly the insertion shape, not the rename
+			// shape (a genuine rename keeps old_string and new_string close
+			// in length) — refuse it up front rather than let the "set
+			// expected_replacements" suggestion above walk a model into this.
+			if (expectedReplacements > 1 && newLF.length - oldLF.length > UNSAFE_MULTI_REPLACE_GROWTH_CHARS) {
+				return err(
+					`edit_file: refusing expected_replacements=${expectedReplacements} — new_string is ${newLF.length - oldLF.length} characters longer than old_string.\n\n` +
+						`<error_details>\nReplacing several sites at once with a much LARGER block of text is almost always a mistake: ` +
+						`it means the SAME large insertion would be spliced into every matching location, not just the one you actually ` +
+						`intend to change. A genuine multi-site replacement (a rename, for example) keeps old_string and new_string close ` +
+						`in length.\n\nRecovery suggestions:\n1. Use read_file to see the exact surrounding context, then include enough of ` +
+						`it in old_string to uniquely identify the ONE location you actually want to change\n2. Set expected_replacements back ` +
+						`to 1 once old_string is unique\n3. If you genuinely want the SAME large content at multiple locations, make separate ` +
+						`edit_file calls, one per location, each with a uniquely-identifying old_string\n</error_details>`,
+				)
+			}
+
 			const wsRegex = buildWhitespaceTolerantRegex(oldLF)
 			const tokenRegex = buildTokenRegex(oldLF)
 
@@ -1399,11 +1437,11 @@ async function editFileHandler(args: Record<string, unknown>, ctx: ToolContext):
 						}
 						if (exactOccurrences > 0) {
 							return err(
-								`edit_file: occurrence count mismatch in file '${rel}'\n\n<error_details>\nExpected ${expectedReplacements} occurrence(s) but found ${exactOccurrences} exact match(es).\n\nRecovery suggestions:\n1. Provide a more specific old_string so it matches exactly once\n2. If you intend to replace all occurrences, set expected_replacements to ${exactOccurrences}\n3. Use read_file to confirm the exact text and counts\n</error_details>`,
+								`edit_file: occurrence count mismatch in file '${rel}'\n\n<error_details>\nExpected ${expectedReplacements} occurrence(s) but found ${exactOccurrences} exact match(es).\n\nRecovery suggestions:\n1. Provide a more specific old_string so it matches exactly once — this is almost always the right fix; a short old_string like a bare identifier matches every place that name is USED, not just the one place you want to change\n2. Only set expected_replacements to ${exactOccurrences} if new_string is a genuine like-for-like replacement (e.g. a rename) that is EQUALLY correct at all ${exactOccurrences} locations — an insertion or a large addition is essentially never correct at multiple sites\n3. Use read_file to confirm the exact text and counts\n</error_details>`,
 							)
 						}
 						return err(
-							`edit_file: occurrence count mismatch in file '${rel}'\n\n<error_details>\nExpected ${expectedReplacements} occurrence(s), but matching found ${wsOccurrences} (whitespace-tolerant) and ${tokenOccurrences} (token-based).\n\nRecovery suggestions:\n1. Provide more surrounding context in old_string to make the match unique\n2. If multiple replacements are intended, adjust expected_replacements to the intended count\n3. Use read_file to confirm the current file contents and refine the match\n</error_details>`,
+							`edit_file: occurrence count mismatch in file '${rel}'\n\n<error_details>\nExpected ${expectedReplacements} occurrence(s), but matching found ${wsOccurrences} (whitespace-tolerant) and ${tokenOccurrences} (token-based).\n\nRecovery suggestions:\n1. Provide more surrounding context in old_string to make the match unique — this is almost always the right fix\n2. Only adjust expected_replacements to match multiple sites if new_string is EQUALLY correct at every one of them (e.g. a rename) — never for an insertion or addition\n3. Use read_file to confirm the current file contents and refine the match\n</error_details>`,
 						)
 					}
 				}

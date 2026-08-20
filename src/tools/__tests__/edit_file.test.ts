@@ -94,6 +94,71 @@ async function testMultipleReplacements(): Promise<void> {
 	}
 }
 
+// ─── (c2) unsafe multi-replace insertion guard ────────────────────────────────
+// Live reproduction, 2026-08-20: a local model's old_string ("estimateMessageChars",
+// a bare identifier) matched a function definition plus 3 unrelated call sites.
+// edit_file's own error message on the first (correctly refused) attempt
+// suggested "if you intend to replace all occurrences, set expected_replacements
+// to N" — the model took that literally and inserted an entire new function
+// body at all 4 sites, corrupting the 3 call sites (each ended up with the new
+// function spliced into the middle of a function call). This guard refuses
+// that shape (expected_replacements > 1 with new_string much longer than
+// old_string) instead of applying it.
+
+async function testUnsafeMultiReplaceInsertionRefused(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-ef-unsafe-multi-")
+	try {
+		const file = path.join(ws, "condense.ts")
+		const original =
+			"export function estimateMessageChars(m: Msg): number {\n  return m.content.length\n}\n\n" +
+			"function a(m: Msg) {\n  return estimateMessageChars(m)\n}\n\n" +
+			"function b(m: Msg) {\n  return estimateMessageChars(m)\n}\n"
+		await fs.writeFile(file, original, "utf-8")
+
+		const executor = createHeadlessExecutor(ws)
+		// The model's real intent: insert a new function right after the
+		// estimateMessageChars DEFINITION only. old_string is too short/generic
+		// (matches the definition AND both call sites) and new_string is a large
+		// insertion — exactly the shape that corrupted the 3 call sites live.
+		const insertion = "\n\n" + "x".repeat(80) // well over the 40-char growth threshold
+		const result = await executor.execute("edit_file", {
+			file_path: "condense.ts",
+			old_string: "estimateMessageChars",
+			new_string: "estimateMessageChars" + insertion,
+			expected_replacements: 3,
+		})
+
+		assert.equal(result.isError, true, "a large insertion applied at multiple sites must be refused")
+		assert.match(result.content, /refusing expected_replacements/, "error explains the refusal")
+		assert.equal(await fs.readFile(file, "utf-8"), original, "file must be untouched — no partial corruption")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testSafeMultiReplaceRenameStillWorks(): Promise<void> {
+	// A genuine like-for-like rename (new_string close in length to old_string)
+	// at multiple sites must NOT be blocked by the insertion guard above.
+	const ws = await mkTmpWorkspace("hc-ef-safe-multi-")
+	try {
+		const file = path.join(ws, "app.ts")
+		await fs.writeFile(file, "oldName(1)\noldName(2)\noldName(3)\n", "utf-8")
+
+		const executor = createHeadlessExecutor(ws)
+		const result = await executor.execute("edit_file", {
+			file_path: "app.ts",
+			old_string: "oldName",
+			new_string: "newName",
+			expected_replacements: 3,
+		})
+
+		assert.equal(result.isError, false, `a genuine rename across multiple sites must still succeed: ${result.content}`)
+		assert.equal(await fs.readFile(file, "utf-8"), "newName(1)\nnewName(2)\nnewName(3)\n")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── (d) whitespace-tolerant match (only strategy 2 would catch it) ──────────
 
 async function testWhitespaceTolerantFallback(): Promise<void> {
@@ -277,6 +342,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["exact match: literal replacement applies", testExactMatchReplaces],
 	["wrong occurrence count: clear error, file untouched", testWrongOccurrenceCountFails],
 	["expected_replacements > 1: replaces all occurrences", testMultipleReplacements],
+	["unsafe multi-replace insertion (large growth, N>1) is refused, file untouched", testUnsafeMultiReplaceInsertionRefused],
+	["safe multi-replace rename (no growth, N>1) still succeeds", testSafeMultiReplaceRenameStillWorks],
 	["whitespace-tolerant fallback: catches indentation drift", testWhitespaceTolerantFallback],
 	["token-based fallback: catches newline drift", testTokenBasedFallback],
 	["file creation: old_string '' on new file succeeds", testCreateNewFile],
