@@ -127,11 +127,17 @@ function chownWorktreeArtifacts(wtPath: string, sourceRepo: string): void {
 	}
 	const targets = [
 		wtPath,
-		path.join(sourceRepo, ".git", "worktrees", path.basename(wtPath)),
-		// The branch lives under refs/heads/headlesscode-session/<leaf> —
-		// chown the whole headlesscode-session/ dir since every worktree
-		// this function creates shares it.
+		// The parent .git/worktrees/ dir itself gets created (root-owned)
+		// on this repo's FIRST worktree ever — chown the whole thing, not
+		// just this call's <name> subdirectory, so an earlier root-owned
+		// parent doesn't linger.
+		path.join(sourceRepo, ".git", "worktrees"),
+		// The branch lives under refs/heads/headlesscode-session/<leaf>,
+		// with a matching reflog under logs/ — chown both whole
+		// headlesscode-session/ dirs since every worktree this function
+		// creates shares them.
 		path.join(sourceRepo, ".git", "refs", "heads", "headlesscode-session"),
+		path.join(sourceRepo, ".git", "logs", "refs", "heads", "headlesscode-session"),
 	]
 	for (const target of targets) {
 		if (!fs.existsSync(target)) {
