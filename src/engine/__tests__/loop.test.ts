@@ -1288,6 +1288,48 @@ async function testIdenticalCallStreakExcludesTheRepeatedToolOnRetry(): Promise<
 	}
 }
 
+// Verified live 2026-08-20: once the identical-call guard's tool exclusion
+// kicked in, a trial's follow-up requests kept carrying the boosted
+// repeat_penalty AND the exclusion turn after turn even though the model
+// had already stopped making tool calls entirely (shifted to text-only
+// replies) — because the streak state only ever updates inside the
+// `calls.length > 0` branch. This produced a run of consecutive genuinely-
+// EMPTY generations. A text-only reply is definitionally not a repeat of
+// the previous tool-call batch, so the guard must reset when one happens.
+async function testTextOnlyReplyResetsTheIdenticalCallGuard(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-identical-textreset-"))
+	try {
+		const client = new FakeLlmClient([
+			() => toolCall("list_files", { path: "." }),
+			() => toolCall("list_files", { path: "." }),
+			// 3rd call: streak >= threshold, boost/exclusion active — but the
+			// model replies with text instead of any tool call at all.
+			() => textReply("thinking about what to do next..."),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({
+			task: "look around then finish",
+			client,
+			workspaceRoot: ws,
+			maxIterations: 250,
+			requireExplicitCompletion: true,
+		})
+		await session.run()
+
+		// The 4th request is the one made right after the text-only reply —
+		// the guard must have reset by then, not still be applying the boost
+		// from a streak that stopped incrementing two turns ago.
+		const fourthRequest = client.requests[3]
+		assert.equal(fourthRequest.repeatPenalty, undefined, "repeat_penalty boost must not still be active after a text-only reply")
+		assert.ok(
+			(fourthRequest.tools ?? []).some((t) => t.function.name === "list_files"),
+			"list_files must be offered again — the exclusion must not still be active after a text-only reply",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // Verified live 2026-08-20 against Qwen3-14B: with list_files excluded from
 // the request's own `tools` array (the identical-call guardrail's tool
 // exclusion), llama.cpp's grammar constraint correctly refused to emit a
@@ -2301,6 +2343,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["read-only stagnation: an edit in the middle resets the streak (no false stall)", testReadOnlyStallLimitNotTrippedByProductiveInterleave],
 	["identical-call stall: the same call repeated verbatim ends in bounded failure quickly", testIdenticalCallStallLimitTerminates],
 	["identical-call stall: fires on a repeated WRITE tool call too, not just reads", testIdenticalCallStallLimitFiresOnWriteToolToo],
+	["identical-call stall: a text-only reply resets the guard (no frozen boost/exclusion)", testTextOnlyReplyResetsTheIdenticalCallGuard],
 	["identical-call stall: streak at/past threshold boosts repeat_penalty on the retry request", testIdenticalCallStreakBoostsRepeatPenaltyOnRetry],
 	["identical-call stall: streak at/past threshold excludes the repeated tool on the retry request", testIdenticalCallStreakExcludesTheRepeatedToolOnRetry],
 	["identical-call stall: an excluded tool cannot be recovered back in via narrated-text extraction", testExcludedToolCannotBeRecoveredFromNarratedText],

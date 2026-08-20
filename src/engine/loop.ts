@@ -3208,6 +3208,27 @@ export class HeadlessSession {
 				}
 
 				if (calls.length === 0) {
+					// Identical-consecutive-call guardrail state (identicalCallStreak,
+					// lastCallBatchSignature/Names) only ever updates inside the
+					// `calls.length > 0` branch below — a genuine text-only/empty
+					// reply skips it entirely, so without this reset the streak
+					// (and therefore the repeat_penalty boost + tool exclusion it
+					// drives — see callMainLlm) stays frozen at whatever it was and
+					// keeps applying to every subsequent request indefinitely, long
+					// after the model has stopped making the repeated call at all.
+					// Verified live 2026-08-20: this produced a run of consecutive
+					// genuinely-EMPTY generations (zero tokens, the daemon's own
+					// "The model produced an empty reply" fallback) immediately
+					// after tool exclusion kicked in — the elevated penalty + a
+					// missing tool, still applied turn after turn with no new
+					// repeat ever having occurred, is a plausible degenerate
+					// sampling combination. A text-only reply is definitionally not
+					// a repeat of the previous tool-call batch, so the guard has no
+					// reason to still be active.
+					lastCallBatchSignature = null
+					lastCallBatchNames = []
+					identicalCallStreak = 0
+					identicalCallNudgeInjected = false
 					if (text && !this.config.requireExplicitCompletion) {
 						this.logger.info("[loop] text-only reply (no tool calls) — success", { iteration })
 						const reportPath = await this.persistFinalReport(iteration, text)
@@ -3222,7 +3243,11 @@ export class HeadlessSession {
 							? "[System: a text reply alone does not end the session. Continue working: call a tool, or provide your final answer via attempt_completion.]"
 							: "[System: your last response contained no tool calls and no text. Continue working: call a tool or provide your final answer via attempt_completion.]",
 					})
-					this.logger.warn("[loop] non-completing reply counted as mistake", { consecutiveMistakes, hadText: Boolean(text) })
+					this.logger.warn("[loop] non-completing reply counted as mistake", {
+						consecutiveMistakes,
+						hadText: Boolean(text),
+						textPreview: text.slice(0, 300),
+					})
 					if (consecutiveMistakes >= consecutiveErrorLimit) {
 						return this.boundedFailure("consecutive empty replies", iteration, toolCalls, consecutiveMistakes)
 					}
