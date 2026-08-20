@@ -1355,15 +1355,17 @@ async function testIdenticalCallStreakExcludesTheRepeatedToolOnRetry(): Promise<
 			"attempt_completion must never be excluded — it is the model's only escape hatch",
 		)
 
-		// tool_choice: "required" (see callMainLlm's doc comment) — verified
-		// live that with the default "auto", once a preferred tool is
-		// excluded the model produces an empty generation instead of picking
-		// a different tool. Must be forced exactly when — and only when — an
-		// exclusion is active, matching the tools-array assertions above.
+		// tool_choice: "required" is wired (LlmRequest.toolChoice) but
+		// deliberately NOT applied by callMainLlm — see its doc comment for
+		// why: verified live to be inert for tool selection on this daemon's
+		// handler, and implicated in a SEPARATE frozen-prompt artifact
+		// unrelated to conversation history. Must never be set until that's
+		// resolved.
 		const toolChoices = client.requests.map((r) => r.toolChoice)
-		assert.equal(toolChoices[0], undefined, "no forced tool_choice on the very first call — nothing excluded yet")
-		assert.equal(toolChoices[1], undefined, "no forced tool_choice on the 2nd call — nothing excluded yet")
-		assert.equal(toolChoices[2], "required", "3rd call (exclusion active) must force tool_choice: required")
+		assert.ok(
+			toolChoices.every((tc) => tc === undefined),
+			"tool_choice must never be forced — see callMainLlm's doc comment for why",
+		)
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}

@@ -2700,14 +2700,21 @@ export class HeadlessSession {
 	 * is never excludable — it's the one escape hatch the model must always
 	 * retain even mid-guardrail.
 	 *
-	 * Whenever an exclusion is active, the request also forces
-	 * `tool_choice: "required"` (see LlmRequest.toolChoice's doc comment):
-	 * verified live 2026-08-20 that with the default "auto" choice, once a
-	 * strongly-preferred tool is excluded the model doesn't pick a
-	 * different one — it produces a genuinely EMPTY generation instead,
-	 * 100% of the time across 148 occurrences in one trial. "required"
-	 * closes off the free-text/empty branch the grammar-constrained
-	 * decoder was apparently collapsing into.
+	 * `tool_choice: "required"` (LlmRequest.toolChoice) is wired but
+	 * deliberately NOT applied here. Tried it (2026-08-20) hoping to close
+	 * off a presumed free-text/empty branch once a preferred tool is
+	 * excluded — verified live it does nothing for tool SELECTION on this
+	 * daemon's Qwen3/HF-chat-template handler (a raw daemon-bypass repro
+	 * confirmed the model still freely declines with plain text even with
+	 * "required" set), and worse, a request-shape only visible in "required"
+	 * requests (a pre-closed empty `<think></think>` block, no conversation
+	 * history content at all) showed up as a SEPARATE byte-for-byte-frozen
+	 * prompt pattern, unrelated to and unfixed by the history-poisoning
+	 * fixes below — suggesting "required" routes through a different
+	 * internal prompt-construction path in llama-cpp-python entirely, not
+	 * just an inert no-op. Left wired for a future model/handler that might
+	 * actually respect it, but not applied by default until that
+	 * alternate-path theory is confirmed or ruled out.
 	 */
 	private async callMainLlm(
 		requestMessages: ChatMessage[],
@@ -2731,7 +2738,6 @@ export class HeadlessSession {
 				stream: this.config.stream,
 				reasoningEffort: this.config.reasoningEffort,
 				...(repeatPenaltyOverride !== undefined ? { repeatPenalty: repeatPenaltyOverride } : {}),
-				...(excluded.size > 0 ? { toolChoice: "required" as const } : {}),
 				onStreamChunk: (kind, chunk) => {
 					// Dashboard live-typing: forward each chunk to the event feed
 					// (truncated like other large fields). Non-fatal — a feed
