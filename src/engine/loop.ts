@@ -293,6 +293,17 @@ export const DEFAULT_IDENTICAL_CALL_STALL_LIMIT = 4
  * (OpenRouter has no equivalent per-request knob).
  */
 export const DEFAULT_IDENTICAL_CALL_REPEAT_PENALTY_BOOST = 1.3
+/**
+ * How many iterations a tool stays excluded PAST the streak that
+ * triggered it (see excludedToolCooldowns' doc comment in runIterations).
+ * Verified live 2026-08-20: without a cooldown, exclusion is a one-shot
+ * deterrent — the model returns to the same denied tool on its very next
+ * real action and re-triggers exclusion 2 turns later, an indefinite
+ * oscillation (48+ cycles observed with no cooldown). Not yet tuned
+ * against a live trial with the cooldown active — treat as a starting
+ * point, same as the repeat_penalty boost value above.
+ */
+export const DEFAULT_IDENTICAL_CALL_TOOL_COOLDOWN_TURNS = 4
 /** The injected nudge (user-role, seen by the model on its next turn), indexed workspaces. */
 const READ_ONLY_NUDGE_MESSAGE =
 	"You've made several read/exploration calls without using `codebase_search`. If the workspace has an index (it lives in the central project store — see `~/.local/share/headlesscode/projects/`), try `codebase_search` for targeted semantic search instead of blind tree-walking."
@@ -2738,6 +2749,19 @@ export class HeadlessSession {
 		let lastCallBatchNames: string[] = []
 		let identicalCallStreak = 0
 		let identicalCallNudgeInjected = false
+		// Tool-exclusion cooldown: verified live 2026-08-20 (trial 36) that a
+		// bare streak-based exclusion is a ONE-SHOT deterrent — the guard
+		// (correctly, see c1dd87b) resets as soon as the model produces a
+		// text-only reply instead of repeating the excluded tool, but the
+		// model's very next REAL action was to call that same tool again
+		// immediately, rebuilding the streak from scratch and re-triggering
+		// exclusion 2 turns later — an indefinite exclude/retry oscillation
+		// (48+ cycles observed, never resolving on its own). Extends a
+		// tool's exclusion for several turns PAST the streak that triggered
+		// it, independent of the streak/nudge state resetting, so the model
+		// has more than one turn's worth of pressure to actually pick
+		// something else before the door reopens.
+		const excludedToolCooldowns = new Map<string, number>()
 
 		for (let iteration = 1; iteration <= maxIterations; iteration++) {
 			// Recursive task decomposition (`new_task`): remember the iteration
@@ -2829,13 +2853,34 @@ export class HeadlessSession {
 			// starts firing on.
 			const identicalCallGuardActive = identicalCallStreak >= DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD
 			const repeatPenaltyOverride = identicalCallGuardActive ? envIdenticalCallRepeatPenaltyBoost() : undefined
-			const excludedToolNames = identicalCallGuardActive ? lastCallBatchNames : undefined
-			if (repeatPenaltyOverride !== undefined) {
+			// Decay existing cooldowns one turn, dropping any that expire, THEN
+			// refresh cooldowns for whatever the active streak is currently
+			// excluding — so a tool that keeps getting re-triggered stays
+			// excluded continuously rather than the cooldown counting down
+			// underneath an active exclusion.
+			for (const [name, remaining] of excludedToolCooldowns) {
+				if (remaining <= 1) {
+					excludedToolCooldowns.delete(name)
+				} else {
+					excludedToolCooldowns.set(name, remaining - 1)
+				}
+			}
+			if (identicalCallGuardActive) {
+				for (const name of lastCallBatchNames) {
+					excludedToolCooldowns.set(name, DEFAULT_IDENTICAL_CALL_TOOL_COOLDOWN_TURNS)
+				}
+			}
+			const excludedToolNames =
+				excludedToolCooldowns.size > 0
+					? [...new Set([...(identicalCallGuardActive ? lastCallBatchNames : []), ...excludedToolCooldowns.keys()])]
+					: undefined
+			if (repeatPenaltyOverride !== undefined || excludedToolNames !== undefined) {
 				this.logger.info("[loop] identical-call repeat_penalty boost applied", {
 					iteration,
 					identicalCallStreak,
 					repeatPenaltyOverride,
 					excludedToolNames,
+					excludedToolCooldowns: Object.fromEntries(excludedToolCooldowns),
 				})
 			}
 			let assistant: ChatMessage
