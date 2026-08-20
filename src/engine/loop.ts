@@ -288,14 +288,45 @@ const READ_ONLY_NUDGE_MESSAGE =
 const READ_ONLY_PROGRESS_NUDGE_MESSAGE =
 	"You've made several read/exploration calls without progress. If the next step in your todo list is verification, `run_tests` answers it in one shot — prefer running the project's test suite over more manual greps/reads. Take a progress action now (edit, test run, or completion) instead of further read-only exploration."
 
-/** The injected nudge when the SAME call repeats back-to-back — see DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD. */
-function identicalCallNudgeMessage(signature: string, streak: number): string {
+/**
+ * Extract the first not-done line from a todo checklist (`[ ]` pending or
+ * `[-]` in-progress — never `[x]` done), for identicalCallNudgeMessage.
+ * Best-effort: any list shape it doesn't recognize just yields undefined,
+ * which the nudge message handles by omitting the concrete suggestion
+ * rather than guessing.
+ */
+function firstPendingTodoLine(todos: string | undefined): string | undefined {
+	if (!todos) {
+		return undefined
+	}
+	for (const line of todos.split("\n")) {
+		const trimmed = line.trim()
+		if (trimmed.startsWith("[ ]") || trimmed.startsWith("[-]")) {
+			return trimmed
+		}
+	}
+	return undefined
+}
+
+/**
+ * The injected nudge when the SAME call repeats back-to-back — see
+ * DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD. Verified live 2026-08-21: a
+ * generic version of this message ("try something different") did not
+ * change the model's next action across several trials — it called
+ * list_files a 3rd and 4th time anyway, right past the nudge. When a todo
+ * list exists, naming the concrete next pending step explicitly is a much
+ * more specific, harder-to-ignore instruction than "do something else."
+ */
+function identicalCallNudgeMessage(signature: string, streak: number, nextTodo: string | undefined): string {
+	const concreteNextStep = nextTodo
+		? ` Your own todo list's next unfinished step is: ${nextTodo} — do THAT now, not another ${signature} call.`
+		: ""
 	return (
 		`You have called ${signature} ${streak} times in a row with IDENTICAL arguments. Repeating the exact same call ` +
 		`will not produce a different result. The information from your earlier call is still visible above in this ` +
-		`conversation — re-read it there instead of calling again. If you need something DIFFERENT, change the ` +
-		`arguments (a different path, a different question, a different edit). If you are stuck on a persistent ` +
-		`error, try a genuinely different approach instead of resubmitting the same call.`
+		`conversation — re-read it there instead of calling again.${concreteNextStep} If you are stuck on a ` +
+		`persistent error, address that error specifically instead of resubmitting the same call or looking around ` +
+		`the workspace again.`
 	)
 }
 
@@ -3421,7 +3452,8 @@ export class HeadlessSession {
 				if (identicalCallStreak >= DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD && !identicalCallNudgeInjected) {
 					identicalCallNudgeInjected = true
 					const signatureLabel = calls.map((call) => call.name).join("+")
-					messages.push({ role: "user", content: identicalCallNudgeMessage(signatureLabel, identicalCallStreak) })
+					const nextTodo = firstPendingTodoLine(this.executor.getTodoList()?.todos)
+					messages.push({ role: "user", content: identicalCallNudgeMessage(signatureLabel, identicalCallStreak, nextTodo) })
 					this.logger.warn("[loop] identical-consecutive-call nudge injected", {
 						iteration,
 						signature: signatureLabel,

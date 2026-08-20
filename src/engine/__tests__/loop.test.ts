@@ -1212,6 +1212,34 @@ async function testIdenticalCallStallLimitFiresOnWriteToolToo(): Promise<void> {
 	}
 }
 
+// Verified live 2026-08-21: a generic "try something different" nudge did
+// NOT change the model's next action — it repeated the same call again
+// right past the nudge, across several trials. Naming the concrete next
+// todo-list step explicitly is a much more specific instruction.
+async function testIdenticalCallNudgeNamesTheNextTodoStep(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-identical-todo-"))
+	try {
+		const client = new FakeLlmClient([
+			() => toolCall("update_todo_list", { todos: "[x] Edit the file\n[ ] Write the test file\n[ ] Run tests" }),
+			...Array.from({ length: 5 }, () => () => toolCall("list_files", { path: "." })),
+		])
+		const session = await makeSession({ task: "get distracted", client, workspaceRoot: ws, maxIterations: 250 })
+		await session.run()
+
+		const nudge = session.state.messages.find(
+			(m) => m.role === "user" && (m.content ?? "").includes("times in a row with IDENTICAL arguments"),
+		)
+		assert.ok(nudge, "expected the identical-call nudge to have fired")
+		assert.match(
+			nudge?.content as string,
+			/Write the test file/,
+			"the nudge should name the concrete next pending todo step, not just generic advice",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 async function testIdenticalCallStreakResetByAnyDifferentCall(): Promise<void> {
 	// A genuine edit/verify/edit/verify workflow: `npx tsc --noEmit` repeats
 	// several times but NEVER back-to-back — a different call (write_to_file)
@@ -2157,6 +2185,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["identical-call stall: the same call repeated verbatim ends in bounded failure quickly", testIdenticalCallStallLimitTerminates],
 	["identical-call stall: fires on a repeated WRITE tool call too, not just reads", testIdenticalCallStallLimitFiresOnWriteToolToo],
 	["identical-call stall: a genuine edit/verify/edit/verify interleave never trips it", testIdenticalCallStreakResetByAnyDifferentCall],
+	["identical-call nudge: names the concrete next todo-list step, not just generic advice", testIdenticalCallNudgeNamesTheNextTodoStep],
 	["isReadOnlyEquivalentShellCommand: classifies read-only vs. mutating shell commands", testIsReadOnlyEquivalentShellCommandClassifiesCorrectly],
 	["live snapshot: created + updated in place during a running session's iterations", testLiveSnapshotCreatedAndUpdatedDuringIterations],
 	["live snapshot: removed on successful completion", testLiveSnapshotRemovedOnSuccess],
