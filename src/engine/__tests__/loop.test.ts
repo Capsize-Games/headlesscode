@@ -1283,6 +1283,16 @@ async function testIdenticalCallStreakExcludesTheRepeatedToolOnRetry(): Promise<
 			hasAttemptCompletion.every(Boolean),
 			"attempt_completion must never be excluded — it is the model's only escape hatch",
 		)
+
+		// tool_choice: "required" (see callMainLlm's doc comment) — verified
+		// live that with the default "auto", once a preferred tool is
+		// excluded the model produces an empty generation instead of picking
+		// a different tool. Must be forced exactly when — and only when — an
+		// exclusion is active, matching the tools-array assertions above.
+		const toolChoices = client.requests.map((r) => r.toolChoice)
+		assert.equal(toolChoices[0], undefined, "no forced tool_choice on the very first call — nothing excluded yet")
+		assert.equal(toolChoices[1], undefined, "no forced tool_choice on the 2nd call — nothing excluded yet")
+		assert.equal(toolChoices[2], "required", "3rd call (exclusion active) must force tool_choice: required")
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}

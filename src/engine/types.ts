@@ -100,6 +100,20 @@ export interface LlmRequest {
 	 * support per-request sampling overrides (e.g. OpenRouter).
 	 */
 	repeatPenalty?: number
+	/**
+	 * Forces the model to call SOME tool rather than allowing a free
+	 * text/empty response — the OpenAI-style `"required"` value (also
+	 * `"none"`/`"auto"`). Verified live 2026-08-20: once the identical-call
+	 * guard's tool exclusion removes a strongly-preferred tool from the
+	 * schema, the model doesn't substitute a different tool call — it
+	 * produces a genuinely EMPTY (zero-token) generation instead, 100% of
+	 * the time (148/148 in one trial), consistent with the default
+	 * `tool_choice: "auto"` leaving a free-text/empty branch available for
+	 * the grammar-constrained decoder to collapse into once its preferred
+	 * path is removed. `"required"` closes that branch. Ignored by
+	 * clients/backends that don't support it.
+	 */
+	toolChoice?: "auto" | "none" | "required"
 }
 
 /** Response shape returned by an LlmClient. */

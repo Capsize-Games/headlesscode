@@ -2676,6 +2676,15 @@ export class HeadlessSession {
 	 * select it at all — not merely a discouraged option. `attempt_completion`
 	 * is never excludable — it's the one escape hatch the model must always
 	 * retain even mid-guardrail.
+	 *
+	 * Whenever an exclusion is active, the request also forces
+	 * `tool_choice: "required"` (see LlmRequest.toolChoice's doc comment):
+	 * verified live 2026-08-20 that with the default "auto" choice, once a
+	 * strongly-preferred tool is excluded the model doesn't pick a
+	 * different one — it produces a genuinely EMPTY generation instead,
+	 * 100% of the time across 148 occurrences in one trial. "required"
+	 * closes off the free-text/empty branch the grammar-constrained
+	 * decoder was apparently collapsing into.
 	 */
 	private async callMainLlm(
 		requestMessages: ChatMessage[],
@@ -2699,6 +2708,7 @@ export class HeadlessSession {
 				stream: this.config.stream,
 				reasoningEffort: this.config.reasoningEffort,
 				...(repeatPenaltyOverride !== undefined ? { repeatPenalty: repeatPenaltyOverride } : {}),
+				...(excluded.size > 0 ? { toolChoice: "required" as const } : {}),
 				onStreamChunk: (kind, chunk) => {
 					// Dashboard live-typing: forward each chunk to the event feed
 					// (truncated like other large fields). Non-fatal — a feed

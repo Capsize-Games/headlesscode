@@ -100,6 +100,7 @@ export class OllamaClient implements LlmClient {
 					stream: false,
 					think: this.think,
 					tools: request.tools,
+					...(request.toolChoice !== undefined ? { tool_choice: request.toolChoice } : {}),
 					options: {
 						temperature: request.temperature ?? 0,
 						...(request.maxTokens !== undefined ? { num_predict: request.maxTokens } : {}),
