@@ -451,6 +451,53 @@ export async function buildLeanSystemPrompt(options: BuildSystemPromptOptions): 
 	// truncateMiddle producing length 33 instead of the required 30) still
 	// printed as a clean pass. Calling out the exact trap by name, since
 	// "read an example first" alone did not stop the model from guessing.
+	// 2026-08-20 addendum, same failure family, now with the describe/it
+	// example promoted from a passing "e.g." to its own explicit trap:
+	// despite the "generic default... is not correct" line already above,
+	// separate live trials against Qwen3-14B STILL wrote `describe(...)` /
+	// `it(...)` test files every time (verified live, repeated across
+	// several trials the same day) — the assertion-library part of the
+	// note (node:assert vs console.assert) was being followed correctly,
+	// but the test-STRUCTURE convention (no test-runner globals at all;
+	// flat top-level functions) was not landing from the "e.g." mention
+	// alone. tsc's own error for `describe`/`it` suggests installing
+	// `@types/jest` or `@types/mocha` — which reads as a legitimate fix
+	// to a model that hasn't internalized this project has no test
+	// runner, producing an ask_followup_question instead of a self-
+	// correction. Naming the concrete pattern by name, same reasoning as
+	// the console.assert addendum below: a soft "e.g." was not enough to
+	// stop a strong prior toward the generic default.
+	const testStructureNote =
+		"This codebase has NO test runner (no Jest, no Mocha, no Vitest) — never write `describe(...)`, `it(...)`, " +
+		"`test(...)`, or `expect(...)`, and never suggest installing `@types/jest` or `@types/mocha` even if a tsc " +
+		"error recommends it; that error means the test file itself is wrong, not that a dependency is missing. " +
+		"The real convention is flat top-level functions (e.g. `function testSomething(): void { ... }` or " +
+		"`async function testSomething(): Promise<void> { ... }`), each containing plain assert calls, collected " +
+		"into an array of `[name, fn]` pairs and run by a `main()` that calls each one and reports pass/fail — " +
+		"read an existing `*.test.ts` file in the same directory to copy the exact shape before writing a new one."
+
+	// 2026-08-20 addendum, tool-call JSON specifically: verified live
+	// against Qwen3-14B — asked to edit_file a line of source that itself
+	// contains double-quoted string literals (e.g. a TypeScript file full
+	// of `"..."` text), the model wrapped its `old_string` JSON value in
+	// SINGLE quotes instead ('...') to dodge escaping the embedded double
+	// quotes, escaping only the occasional literal apostrophe inside
+	// (`\'`) — this produces invalid JSON (JSON strings are ALWAYS
+	// double-quoted; single quotes are never valid), the tool call fails
+	// to parse, and the same broken JSON then repeats verbatim across
+	// every retry because the model doesn't recognize single-quoting as
+	// the actual defect. Naming it explicitly since escaping quotes
+	// correctly is exactly the kind of mechanical detail a general "write
+	// valid JSON" instruction doesn't reliably cover for code containing
+	// its own quote-heavy string literals.
+	const jsonEscapingNote =
+		"Tool call arguments are JSON: every string value MUST be wrapped in double quotes, never single quotes " +
+		"— JSON has no single-quoted string syntax at all, so a single-quoted value is not a formatting choice, " +
+		"it is invalid JSON that will fail to parse. When the text you are copying into an argument (e.g. " +
+		"edit_file's old_string/new_string) itself contains double-quote characters — common when editing code " +
+		"that has string literals — keep the outer JSON string double-quoted and escape each embedded `\"` as " +
+		"`\\\"`. Do not switch the outer quote character to avoid escaping; that is the mistake, not a workaround."
+
 	const conventionNote =
 		"Before writing a NEW file of a kind that likely already has examples in this codebase (a test file, a " +
 		"config file, a module following an established pattern), actually read_file an existing example FIRST " +
@@ -460,7 +507,10 @@ export async function buildLeanSystemPrompt(options: BuildSystemPromptOptions): 
 		"look at the existing style, not guess at it. This specifically includes the assertion call itself: this " +
 		"codebase's 'plain assert' style is Node's own `assert` module (`import assert from \"node:assert/strict\"`, " +
 		"then `assert.equal(...)` / `assert.match(...)`), which THROWS on failure — never `console.assert(...)`, " +
-		"which only prints a warning and lets execution continue, so a real bug would print as a clean pass."
+		"which only prints a warning and lets execution continue, so a real bug would print as a clean pass. " +
+		testStructureNote +
+		" " +
+		jsonEscapingNote
 
 	const basePrompt = [
 		modeConfig.roleDefinition,
