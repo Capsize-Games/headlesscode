@@ -51,7 +51,18 @@ export const CORE_TOOL_NAMES = new Set([
 	"list_files",
 	"new_task",
 	"read_file",
-	"search_replace",
+	// search_replace deliberately excluded — same reasoning as apply_diff
+	// above it in git history: search_replace requires an EXACT literal
+	// match (see searchReplaceHandler, src/tools/executor.ts) with no
+	// fallback, while edit_file has a 3-stage fallback chain (exact →
+	// whitespace-tolerant → token-based) specifically built to survive the
+	// whitespace/indentation drift a model's old_string commonly has.
+	// Verified live 2026-08-20: given both tools, a local model picked
+	// search_replace, hit exactly the whitespace-mismatch failure edit_file
+	// exists to prevent, then spiralled into an unrelated list_files loop
+	// instead of recovering — a harness/tool-catalog problem, not
+	// necessarily a model capability ceiling. Still reachable via
+	// request_tool for a session that genuinely needs it.
 	"edit_file",
 	"switch_mode",
 	"update_todo_list",
