@@ -17,6 +17,7 @@ import { setTimeout as sleep } from "node:timers/promises"
 import {
 	HeadlessSession,
 	DEFAULT_READ_ONLY_STALL_LIMIT,
+	DEFAULT_IDENTICAL_CALL_STALL_LIMIT,
 	isReadOnlyEquivalentShellCommand,
 	stripSupersededReasoning,
 	truncateHistory,
@@ -1150,6 +1151,91 @@ async function testReadOnlyStallLimitNotTrippedByProductiveInterleave(): Promise
 	}
 }
 
+// ─── Identical-consecutive-call guardrail ────────────────────────────────────
+// Live evidence across several separate nights: a local model repeating the
+// SAME tool call with the SAME arguments turn after turn — apply_diff with
+// an identical failing diff, ask_followup_question with the identical
+// generic question, and (2026-08-20, the trial that motivated this specific
+// guardrail) list_files "." succeeding identically 86 times in a row before
+// the much looser read-only-stall limit (75) finally caught it. Distinct
+// from that guardrail: fires on non-read-only tools too, fires on a SUCCESS
+// streak, and its threshold is tight since there's no legitimate reason for
+// a truly identical back-to-back repeat to run long.
+
+async function testIdenticalCallStallLimitTerminates(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-identical-"))
+	try {
+		const client = new FakeLlmClient([
+			...Array.from({ length: 10 }, () => () => toolCall("list_files", { path: "." })),
+		])
+		const session = await makeSession({ task: "look around forever", client, workspaceRoot: ws, maxIterations: 250 })
+		const result = await session.run()
+
+		assert.equal(result.status, "error", `expected bounded failure, got ${JSON.stringify(result)}`)
+		assert.match(result.error ?? "", /identical call repeated/)
+		assert.equal(
+			result.iterations,
+			DEFAULT_IDENTICAL_CALL_STALL_LIMIT,
+			`stall fires exactly at iteration ${DEFAULT_IDENTICAL_CALL_STALL_LIMIT}, not the much looser read-only limit`,
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testIdenticalCallStallLimitFiresOnWriteToolToo(): Promise<void> {
+	// The apply_diff-repeating-the-identical-failing-diff shape: a WRITE tool,
+	// erroring every time, repeated verbatim. The read-only-stall guardrail
+	// would never catch this (apply_diff is not a read-only tool) — this one
+	// must. A generous consecutiveErrorLimit isolates that it's specifically
+	// the identical-call guard firing here, not the generic mistake limit
+	// (which would otherwise legitimately fire first, at 3, since every
+	// repeat is also an error — see the identical AND erroring case).
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-identical-write-"))
+	try {
+		const client = new FakeLlmClient([
+			...Array.from({ length: 10 }, () => () => toolCall("apply_diff", { path: "nope.ts", diff: "broken" })),
+		])
+		const session = await makeSession({
+			task: "keep retrying the same bad diff",
+			client,
+			workspaceRoot: ws,
+			maxIterations: 250,
+			consecutiveErrorLimit: 20,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "error", `expected bounded failure, got ${JSON.stringify(result)}`)
+		assert.match(result.error ?? "", /identical call repeated/)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testIdenticalCallStreakResetByAnyDifferentCall(): Promise<void> {
+	// A genuine edit/verify/edit/verify workflow: `npx tsc --noEmit` repeats
+	// several times but NEVER back-to-back — a different call (write_to_file)
+	// always sits between two verification calls. Must never trip.
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-identical-reset-"))
+	try {
+		const client = new FakeLlmClient([
+			() => toolCall("write_to_file", { path: "a.ts", content: "v1" }),
+			() => toolCall("execute_command", { command: "npx tsc --noEmit" }),
+			() => toolCall("write_to_file", { path: "a.ts", content: "v2" }),
+			() => toolCall("execute_command", { command: "npx tsc --noEmit" }),
+			() => toolCall("write_to_file", { path: "a.ts", content: "v3" }),
+			() => toolCall("execute_command", { command: "npx tsc --noEmit" }),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({ task: "iterate to a clean build", client, workspaceRoot: ws, maxIterations: 250 })
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── isReadOnlyEquivalentShellCommand (unit-level) ───────────────────────────
 
 async function testIsReadOnlyEquivalentShellCommandClassifiesCorrectly(): Promise<void> {
@@ -2068,6 +2154,9 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["blind tree-walking: one mutating execute_command in the streak suppresses the nudge", testReadOnlyNudgeNotTrippedByMutatingExecuteCommand],
 	["read-only stagnation: a long pure-read streak ends in bounded failure before the iteration cap", testReadOnlyStallLimitTerminates],
 	["read-only stagnation: an edit in the middle resets the streak (no false stall)", testReadOnlyStallLimitNotTrippedByProductiveInterleave],
+	["identical-call stall: the same call repeated verbatim ends in bounded failure quickly", testIdenticalCallStallLimitTerminates],
+	["identical-call stall: fires on a repeated WRITE tool call too, not just reads", testIdenticalCallStallLimitFiresOnWriteToolToo],
+	["identical-call stall: a genuine edit/verify/edit/verify interleave never trips it", testIdenticalCallStreakResetByAnyDifferentCall],
 	["isReadOnlyEquivalentShellCommand: classifies read-only vs. mutating shell commands", testIsReadOnlyEquivalentShellCommandClassifiesCorrectly],
 	["live snapshot: created + updated in place during a running session's iterations", testLiveSnapshotCreatedAndUpdatedDuringIterations],
 	["live snapshot: removed on successful completion", testLiveSnapshotRemovedOnSuccess],

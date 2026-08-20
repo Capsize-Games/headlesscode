@@ -260,12 +260,44 @@ export const DEFAULT_READ_ONLY_NUDGE_THRESHOLD = 8
 export const DEFAULT_READ_ONLY_STALL_LIMIT = 75
 /** Tool names that count as "blind tree-walking" for the guardrail above. */
 const READ_ONLY_TOOL_NAMES = new Set(["list_files", "read_file", "search_files"])
+
+/**
+ * Identical-consecutive-call guardrail: a local model was repeatedly
+ * observed (across several separate sessions/nights — apply_diff repeating
+ * the exact same failing diff 4x despite a corrective error message,
+ * ask_followup_question asking the identical generic question 4x in a row,
+ * list_files calling the exact same path back-to-back tens of times) making
+ * the SAME tool call with the SAME arguments turn after turn, with no
+ * different action in between. This is distinct from the read-only-stall
+ * guardrail above: it fires for ANY tool (not just reads), fires on a
+ * SUCCESS streak just as readily as an error streak (list_files kept
+ * succeeding every time in the reproduction that motivated this), and its
+ * threshold is deliberately tight — a genuine workflow (edit, verify,
+ * edit again, verify again) always has a DIFFERENT call between two
+ * verification calls, so this only trips on true immediate repetition, not
+ * legitimate re-checking. One soft nudge, then a hard stop shortly after —
+ * unlike the read-only stall limit's 75, there is no legitimate reason for
+ * this specific pattern to run long before intervening.
+ */
+export const DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD = 2
+export const DEFAULT_IDENTICAL_CALL_STALL_LIMIT = 4
 /** The injected nudge (user-role, seen by the model on its next turn), indexed workspaces. */
 const READ_ONLY_NUDGE_MESSAGE =
 	"You've made several read/exploration calls without using `codebase_search`. If the workspace has an index (it lives in the central project store — see `~/.local/share/headlesscode/projects/`), try `codebase_search` for targeted semantic search instead of blind tree-walking."
 /** The injected nudge for unindexed workspaces — no index to point at, so lead with progress. */
 const READ_ONLY_PROGRESS_NUDGE_MESSAGE =
 	"You've made several read/exploration calls without progress. If the next step in your todo list is verification, `run_tests` answers it in one shot — prefer running the project's test suite over more manual greps/reads. Take a progress action now (edit, test run, or completion) instead of further read-only exploration."
+
+/** The injected nudge when the SAME call repeats back-to-back — see DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD. */
+function identicalCallNudgeMessage(signature: string, streak: number): string {
+	return (
+		`You have called ${signature} ${streak} times in a row with IDENTICAL arguments. Repeating the exact same call ` +
+		`will not produce a different result. The information from your earlier call is still visible above in this ` +
+		`conversation — re-read it there instead of calling again. If you need something DIFFERENT, change the ` +
+		`arguments (a different path, a different question, a different edit). If you are stuck on a persistent ` +
+		`error, try a genuinely different approach instead of resubmitting the same call.`
+	)
+}
 
 /**
  * Leading command names treated as read-only-equivalent by
@@ -2629,6 +2661,13 @@ export class HeadlessSession {
 		const readOnlyStallLimit = envReadOnlyStallLimit()
 		let readOnlyStreak = 0
 		let readOnlyNudgeInjected = false
+		// Identical-consecutive-call guardrail (see
+		// DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD's doc comment): tracks the
+		// canonical signature of the LAST turn's tool call batch and how many
+		// consecutive turns it has repeated unchanged.
+		let lastCallBatchSignature: string | null = null
+		let identicalCallStreak = 0
+		let identicalCallNudgeInjected = false
 
 		for (let iteration = 1; iteration <= maxIterations; iteration++) {
 			// Recursive task decomposition (`new_task`): remember the iteration
@@ -3364,6 +3403,40 @@ export class HeadlessSession {
 					// execute_command, …) breaks the blind-walk pattern.
 					readOnlyStreak = 0
 					readOnlyNudgeInjected = false
+				}
+
+				// Identical-consecutive-call guardrail (see
+				// DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD's doc comment) — runs
+				// independently of the read-only-only check above: it must catch a
+				// repeated WRITE call (e.g. the same failing apply_diff) just as
+				// readily as a repeated read.
+				const callBatchSignature = calls.map((call) => `${call.name}(${JSON.stringify(call.args)})`).join("|")
+				if (callBatchSignature === lastCallBatchSignature) {
+					identicalCallStreak++
+				} else {
+					lastCallBatchSignature = callBatchSignature
+					identicalCallStreak = 1
+					identicalCallNudgeInjected = false
+				}
+				if (identicalCallStreak >= DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD && !identicalCallNudgeInjected) {
+					identicalCallNudgeInjected = true
+					const signatureLabel = calls.map((call) => call.name).join("+")
+					messages.push({ role: "user", content: identicalCallNudgeMessage(signatureLabel, identicalCallStreak) })
+					this.logger.warn("[loop] identical-consecutive-call nudge injected", {
+						iteration,
+						signature: signatureLabel,
+						streak: identicalCallStreak,
+					})
+				}
+				if (identicalCallStreak >= DEFAULT_IDENTICAL_CALL_STALL_LIMIT) {
+					await this.saveIterationCheckpoint(iteration)
+					return this.boundedFailure(
+						"identical call repeated",
+						iteration,
+						toolCalls,
+						identicalCallStreak,
+						DEFAULT_IDENTICAL_CALL_STALL_LIMIT,
+					)
 				}
 			}
 
