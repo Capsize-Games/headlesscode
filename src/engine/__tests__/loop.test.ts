@@ -196,6 +196,7 @@ async function makeSession(options: {
 	checkpointDir?: string
 	/** Explicit session id override (see HeadlessSessionConfig.sessionId). */
 	sessionId?: string
+	requireExplicitCompletion?: boolean
 }) {
 	const session = new HeadlessSession({
 		workspaceRoot: options.workspaceRoot,
@@ -208,6 +209,7 @@ async function makeSession(options: {
 		windowSize: options.windowSize ?? 40,
 		budget: options.budget ?? null,
 		reasoningEffort: options.reasoningEffort,
+		requireExplicitCompletion: options.requireExplicitCompletion,
 		// Checkpoints are default-on and would otherwise write real shadow-git
 		// commits to ~/.headlesscode/checkpoints on every test run; this suite
 		// isn't testing checkpoints (except the one that is), so keep tests
@@ -344,6 +346,153 @@ async function testScenario2CommandThenTextAnswer(): Promise<void> {
 		const toolMsg = session.state.messages.find((m) => m.role === "tool")
 		assert.ok(toolMsg, "expected a tool message in history")
 		assert.match(toolMsg?.content ?? "", /2/, "command output should be in the tool result")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// A local model giving up mid-task and dumping prose was observed live
+// (2026-08-19 baseline run against Qwen2.5-Coder-14B) getting recorded as
+// `session succeeded` with zero files touched — requireExplicitCompletion
+// closes that gap by refusing the bare-text-reply pragmatic-success
+// fallback and nudging the model to retry or call attempt_completion.
+async function testRequireExplicitCompletionRefusesTextOnlyReply(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-rec-"))
+	try {
+		const client = new FakeLlmClient([
+			() => textReply("I looked at the file but couldn't figure out the edit."),
+			() => toolCall("attempt_completion", { result: "Done: wrote the fallback file." }),
+		])
+		const session = await makeSession({
+			task: "write a file",
+			client,
+			workspaceRoot: ws,
+			requireExplicitCompletion: true,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "Done: wrote the fallback file.")
+		assert.equal(client.requests.length, 2, "the text-only reply must not end the session early")
+		const nudge = session.state.messages.find(
+			(m) => m.role === "user" && (m.content ?? "").includes("does not end the session"),
+		)
+		assert.ok(nudge, "expected a nudge telling the model text alone isn't completion")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testRequireExplicitCompletionBoundedFailureWhenNeverCompletes(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-rec2-"))
+	try {
+		const client = new FakeLlmClient([
+			() => textReply("Still thinking."),
+			() => textReply("Still thinking."),
+			() => textReply("Still thinking."),
+		])
+		const session = await makeSession({
+			task: "write a file",
+			client,
+			workspaceRoot: ws,
+			requireExplicitCompletion: true,
+			consecutiveErrorLimit: 3,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "error", `expected bounded failure, got ${JSON.stringify(result)}`)
+		assert.match(result.error ?? "", /consecutive empty replies/)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// Qwen2.5-Coder-14B was observed live (2026-08-19) reasoning correctly
+// about a tool call, then writing it as prose instead of using the native
+// tool_calls channel — e.g. a fenced ```json block containing
+// {"name": "write_to_file", "arguments": {...}}. requireExplicitCompletion
+// sessions now recover and execute a text-embedded call, but ONLY when its
+// name matches a real tool in the session's catalog.
+async function testRecoversTextEmbeddedToolCallForRealTool(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-embed-"))
+	try {
+		const client = new FakeLlmClient([
+			() =>
+				textReply(
+					'I will write the file now.\n\n```json\n{"name": "write_to_file", "arguments": {\'path\': \'hello.txt\', \'content\': \'hi there\'}}\n```',
+				),
+			() => toolCall("attempt_completion", { result: "Done: wrote hello.txt" }),
+		])
+		const session = await makeSession({
+			task: "write a hello file",
+			client,
+			workspaceRoot: ws,
+			requireExplicitCompletion: true,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		const content = await fs.readFile(path.join(ws, "hello.txt"), "utf-8")
+		assert.equal(content, "hi there", "the text-embedded call must have actually executed write_to_file")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// A different observed shape (same 2026-08-19 session): the model
+// narrating in past tense that it already called a tool — no JSON blob at
+// all, just "[Called tool "read_file" with arguments {...}]" — when no
+// such call was ever made. Still recovered and actually executed, same
+// real-tool-name safety gate as the JSON shape.
+async function testRecoversNarratedToolCall(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-embed3-"))
+	try {
+		await fs.writeFile(path.join(ws, "notes.txt"), "line one\nline two\n")
+		const client = new FakeLlmClient([
+			() =>
+				textReply(
+					"I'll check the file first.\n\n[Called tool \"read_file\" with arguments {'path': 'notes.txt', 'mode': 'slice'}]",
+				),
+			() => toolCall("attempt_completion", { result: "Done: read notes.txt" }),
+		])
+		const session = await makeSession({
+			task: "look at notes.txt",
+			client,
+			workspaceRoot: ws,
+			requireExplicitCompletion: true,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		const toolMsg = session.state.messages.find((m) => m.role === "tool")
+		assert.ok(toolMsg, "expected a real tool message from the recovered read_file call")
+		assert.match(toolMsg?.content ?? "", /line one/, "the recovered call must have actually read the file")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testDoesNotExecuteEmbeddedCallForUnknownToolName(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-embed2-"))
+	try {
+		const client = new FakeLlmClient([
+			() => textReply('Here is my plan: {"name": "delete_everything", "arguments": {"path": "/"}}'),
+			() => toolCall("attempt_completion", { result: "Done: recovered from the bad suggestion" }),
+		])
+		const session = await makeSession({
+			task: "write a hello file",
+			client,
+			workspaceRoot: ws,
+			requireExplicitCompletion: true,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+		assert.equal(
+			client.requests.length,
+			2,
+			"an unknown tool name must not be executed — the reply is nudged like any other text-only reply",
+		)
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -1709,6 +1858,26 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["scenario 1: write_to_file + attempt_completion -> success, file written", testScenario1WriteThenCompletion],
 	["final report: attempt_completion result persisted verbatim to .headlesscode/reports/<sessionId>.md", testFinalReportPersistedWithFullText],
 	["scenario 2: execute_command + text answer -> success with text result", testScenario2CommandThenTextAnswer],
+	[
+		"requireExplicitCompletion: text-only reply is nudged, not accepted, until attempt_completion",
+		testRequireExplicitCompletionRefusesTextOnlyReply,
+	],
+	[
+		"requireExplicitCompletion: repeated text-only replies -> bounded failure, never a fabricated success",
+		testRequireExplicitCompletionBoundedFailureWhenNeverCompletes,
+	],
+	[
+		"requireExplicitCompletion: a tool call written as prose is recovered and actually executed",
+		testRecoversTextEmbeddedToolCallForRealTool,
+	],
+	[
+		"requireExplicitCompletion: an embedded call naming an unknown tool is never executed",
+		testDoesNotExecuteEmbeddedCallForUnknownToolName,
+	],
+	[
+		"requireExplicitCompletion: a narrated 'Called tool X' claim is recovered and actually executed",
+		testRecoversNarratedToolCall,
+	],
 	["scenario 3: erroring tool x3 -> bounded failure", testScenario3ErroringToolBoundedFailure],
 	["scenario 4: malformed JSON args -> parser fallback exercised", testScenario4MalformedJsonArgs],
 	["path-traversal guard rejects escaping paths", testPathTraversalGuard],

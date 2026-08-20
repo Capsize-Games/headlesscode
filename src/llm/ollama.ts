@@ -6,13 +6,20 @@
  * plans/local-dual-model-code-agent.md (Phase 2 step 4) and
  * plans/local-code-mode-trial.md for the design this implements.
  *
- * Reuses the two wire-format findings already verified live against Ollama
+ * Reuses the wire-format findings already verified live against Ollama
  * 0.24.0 / the airunnerdesktop daemon's ollama-compat route in
  * src/engine/local-explore.ts's OllamaLocalChatClient:
  *   - `function.arguments` must be a parsed OBJECT on the wire in both
  *     directions (Ollama rejects the OpenAI/OpenRouter JSON-string form).
- *   - `think: false` is required or qwen3-class models leave
- *     `message.content` empty and put the reply in `message.thinking`.
+ *   - `think` previously had to be hardcoded `false`: a prior local model
+ *     was observed leaving `message.content` empty and putting the reply in
+ *     `message.thinking` when thinking was on. Re-verified live 2026-08-20
+ *     against Qwen3-14B (the first thinking-capable local model this harness
+ *     has run) on both a plain reply and a tool call — `content`/`tool_calls`
+ *     came back correctly populated with `think: true`, so that failure mode
+ *     doesn't reproduce for this model. Rather than flip the default (and
+ *     risk the original model that motivated `false`), `think` is now
+ *     configurable per client instance — see `OLLAMA_THINK_ENV`.
  * Cost is always $0 (no OpenRouter billing involved) but real token counts
  * are still reported via `usage` so budget/report accounting stays accurate.
  */
@@ -22,12 +29,16 @@ import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } fr
 export const OLLAMA_URL_ENV = "HEADLESSCODE_OLLAMA_URL"
 export const DEFAULT_OLLAMA_URL = "http://localhost:11434"
 export const DEFAULT_OLLAMA_TIMEOUT_MS = 300_000
+/** Opt a thinking-capable local model into `think: true` (default false — see the module doc comment). */
+export const OLLAMA_THINK_ENV = "HEADLESSCODE_OLLAMA_THINK"
 
 export interface OllamaClientOptions {
 	baseUrl?: string
 	defaultModel?: string
 	timeoutMs?: number
 	fetchImpl?: typeof fetch
+	/** Send `think: true` to the daemon (default false). See `OLLAMA_THINK_ENV`. */
+	think?: boolean
 }
 
 /** Typed error for a non-2xx response or a malformed payload from the daemon. */
@@ -43,17 +54,24 @@ export class OllamaError extends Error {
 	}
 }
 
+function envThinkEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+	const v = env[OLLAMA_THINK_ENV]
+	return v !== undefined && v !== "" && v !== "0" && v.toLowerCase() !== "false"
+}
+
 export class OllamaClient implements LlmClient {
 	private readonly baseUrl: string
 	private readonly defaultModel: string
 	private readonly timeoutMs: number
 	private readonly fetchImpl: typeof fetch
+	private readonly think: boolean
 
 	constructor(options: OllamaClientOptions = {}) {
 		this.baseUrl = (options.baseUrl ?? process.env[OLLAMA_URL_ENV] ?? DEFAULT_OLLAMA_URL).replace(/\/+$/, "")
 		this.defaultModel = options.defaultModel ?? ""
 		this.timeoutMs = options.timeoutMs ?? DEFAULT_OLLAMA_TIMEOUT_MS
 		this.fetchImpl = options.fetchImpl ?? ((...args) => fetch(...args))
+		this.think = options.think ?? envThinkEnabled()
 	}
 
 	resolveModel(requestModel?: string): string {
@@ -80,7 +98,7 @@ export class OllamaClient implements LlmClient {
 					model,
 					messages: toOllamaMessages(request.messages),
 					stream: false,
-					think: false,
+					think: this.think,
 					tools: request.tools,
 					options: {
 						temperature: request.temperature ?? 0,

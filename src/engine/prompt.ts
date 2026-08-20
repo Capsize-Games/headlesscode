@@ -360,10 +360,25 @@ export async function buildLeanSystemPrompt(options: BuildSystemPromptOptions): 
 	const modeConfig =
 		getModeBySlug(mode, customModes) ?? modes.find((m) => m.slug === mode) ?? modes[0]
 
+	// Strengthened 2026-08-19 after a live failure: Qwen2.5-Coder-14B
+	// reasoned correctly about which tool to call, then wrote
+	// `{"name": "edit_file", "arguments": {...}}` as PROSE TEXT (sometimes
+	// in a ```json fence) instead of issuing a real tool_calls entry — the
+	// harness now has a best-effort recovery for this specific shape (see
+	// extractEmbeddedToolCall in parser.ts), but recovery only fires for a
+	// name that matches a real tool and is not a substitute for calling
+	// correctly the first time: it costs a wasted turn, and anything that
+	// doesn't match a known tool name gets no recovery at all.
 	const toolUseNote =
-		"Tool calls are native — call a tool directly, never describe an action " +
-		"in prose instead of calling it, and never fabricate file contents or " +
-		"command output you have not actually seen."
+		"Tool calls are native — call a tool directly through the tool-calling " +
+		"mechanism, never describe an action in prose instead of calling it. " +
+		"Concretely: if your response's text content contains something that " +
+		"LOOKS like a tool call — a JSON object with \"name\" and \"arguments\" " +
+		"keys, with or without a ```json fence — that is a MISTAKE, not a way " +
+		"to invoke a tool. It will not run. Writing out what a tool call would " +
+		"look like is never itself progress; only an actual tool_calls entry " +
+		"executes anything. Never fabricate file contents or command output " +
+		"you have not actually seen."
 	const verificationNote =
 		"Only call attempt_completion after you have verified the change actually " +
 		"works (typecheck/tests as applicable) — a plausible-looking but " +
@@ -560,4 +575,54 @@ export function appendRunTestsTool(tools: ChatTool[]): ChatTool[] {
 		return tools
 	}
 	return [...tools, runTestsTool as unknown as ChatTool]
+}
+
+/**
+ * Patch `edit_file`'s schema for local GGUF sessions: move
+ * `expected_replacements` from optional into `required` (the model must
+ * always supply it, e.g. 1 — the executor already defaults to 1 when it's
+ * absent, so behavior is unchanged either way — see
+ * src/tools/executor.ts's `toNonNegativeInt(args.expected_replacements, 1)`).
+ *
+ * Root cause this works around: llama.cpp/llama-cpp-python constrain tool
+ * calls by converting each tool's JSON schema to a GBNF grammar. A known bug
+ * in that conversion corrupts structured decoding whenever a multi-parameter
+ * tool has ANY optional parameter — the model omits/duplicates/blanks a
+ * field instead of completing the call (ggml-org/llama.cpp#20164, confirmed
+ * against Qwen3.5/Qwen3-Coder; the reporter's own fix was moving the
+ * optional param to required). Verified live 2026-08-20 against
+ * Qwen2.5-Coder-14B: `edit_file` (3 required + 1 optional param) failed 3/3
+ * calls on an existing file in three different malformed shapes (empty
+ * old_string, identical old_string/new_string, missing file_path), while
+ * `write_to_file` (2 required params, zero optional) succeeded on the first
+ * try every time in the same session — exactly the schema-shape signature
+ * from the upstream bug report, not a reasoning failure.
+ *
+ * Cloud sessions are untouched (OpenRouter models aren't grammar-constrained
+ * this way), so this is applied only for the local backend, never to the
+ * vendored schema itself.
+ */
+export function patchEditFileToolForLocalModels(tools: ChatTool[]): ChatTool[] {
+	return tools.map((tool) => {
+		if (tool.type !== "function" || tool.function.name !== "edit_file") {
+			return tool
+		}
+		const params = tool.function.parameters as {
+			required?: string[]
+			[key: string]: unknown
+		}
+		if (params.required?.includes("expected_replacements")) {
+			return tool
+		}
+		return {
+			...tool,
+			function: {
+				...tool.function,
+				parameters: {
+					...params,
+					required: [...(params.required ?? []), "expected_replacements"],
+				},
+			},
+		}
+	})
 }

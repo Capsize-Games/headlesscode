@@ -884,6 +884,25 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	if (useLocalCodeBackend && process.env.HEADLESSCODE_LEAN_SYSTEM_PROMPT === undefined) {
 		process.env.HEADLESSCODE_LEAN_SYSTEM_PROMPT = "1"
 	}
+	// A local model that gives up mid-task and dumps prose was observed live
+	// (2026-08-19 baseline run) getting recorded as `session succeeded` with
+	// zero files touched — the bare-text-reply pragmatic-success fallback
+	// (loop.ts, HeadlessSessionConfig.requireExplicitCompletion) exists for
+	// cloud models that reliably signal completion through prose; a local
+	// session can't trust that signal, so require attempt_completion instead.
+	const requireExplicitCompletion =
+		useLocalCodeBackend && !envBoolean("HEADLESSCODE_ALLOW_TEXT_ONLY_COMPLETION")
+	// Works around a llama.cpp/llama-cpp-python grammar-constrained-decoding
+	// bug (ggml-org/llama.cpp#20164) that corrupts tool calls when a
+	// multi-parameter tool has any optional parameter — verified live
+	// 2026-08-20 against Qwen2.5-Coder-14B (edit_file failed 3/3 on an
+	// existing file; write_to_file, which has zero optional params,
+	// succeeded every time). See prompt.ts's
+	// patchEditFileToolForLocalModels doc comment. Cloud sessions aren't
+	// grammar-constrained this way, so this only applies to the local
+	// backend.
+	const patchLocalToolSchemas =
+		useLocalCodeBackend && !envBoolean("HEADLESSCODE_ALLOW_UNPATCHED_LOCAL_TOOL_SCHEMAS")
 
 	// Phase 3 context condensation: a cheaper model for the condensation
 	// call can be assigned via the `_condensation` key in
@@ -994,6 +1013,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		llmTimeoutMs: options.llmTimeoutMs,
 		stream: options.stream,
 		reasoningEffort,
+		requireExplicitCompletion,
+		patchLocalToolSchemas,
 		llmClient: client,
 		logger,
 		memory,

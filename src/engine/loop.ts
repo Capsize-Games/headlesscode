@@ -64,7 +64,7 @@ import { recordSessionUsage, removeLiveUsage, writeLiveUsage } from "./usage.js"
 import { EventFeed, EVENT_TRUNCATE_CHARS, truncateField } from "./events.js"
 import { writeSessionReport } from "./reports.js"
 import { Logger } from "./logger.js"
-import { parseToolCalls } from "./parser.js"
+import { extractEmbeddedToolCall, parseToolCalls } from "./parser.js"
 import {
 	appendBrowserActionTool,
 	appendCodeIntelEditTools,
@@ -76,6 +76,7 @@ import {
 	isLeanSystemPromptEnabled,
 	loadCustomModes,
 	modeHasEditGroup,
+	patchEditFileToolForLocalModels,
 	selectToolsForMode,
 } from "./prompt.js"
 import type {
@@ -651,6 +652,29 @@ export interface HeadlessSessionConfig {
 	/** Sliding-window cap on messages sent per request (default 40). */
 	windowSize?: number
 	/**
+	 * When true, a bare text-only reply (no tool_calls) is NOT accepted as a
+	 * successful completion — it's nudged the same as an empty reply, and
+	 * only an explicit `attempt_completion` tool call ends the session
+	 * successfully. Default false (preserves the pragmatic fallback cloud
+	 * models rely on). The local Ollama code-mode backend turns this on: a
+	 * model that gives up mid-task and dumps prose (observed live — see
+	 * plans/local-dual-model-code-agent.md's handoff doc, 2026-08-19) was
+	 * otherwise recorded as `session succeeded` with zero files touched.
+	 */
+	requireExplicitCompletion?: boolean
+	/**
+	 * Patch `edit_file`'s schema (move `expected_replacements` into
+	 * `required`) before it reaches the model — works around a
+	 * llama.cpp/llama-cpp-python grammar-constrained-decoding bug that
+	 * corrupts tool calls when a multi-parameter tool has any optional
+	 * parameter (ggml-org/llama.cpp#20164). See
+	 * prompt.ts's `patchEditFileToolForLocalModels` doc comment for the full
+	 * root-cause writeup. Default false; the local Ollama code-mode backend
+	 * turns this on. No effect on cloud sessions, which aren't
+	 * grammar-constrained this way.
+	 */
+	patchLocalToolSchemas?: boolean
+	/**
 	 * Phase 3 context condensation: the model's real context window in
 	 * tokens, used to decide WHEN to condense (the last request's real
 	 * prompt-token count vs. `condenseThresholdFraction` of this). When
@@ -824,6 +848,10 @@ export interface ResolvedSessionConfig {
 	/** Graded reasoning effort for deepseek/* models (issue #30); undefined = endpoint default. */
 	reasoningEffort?: string
 	windowSize: number
+	/** See HeadlessSessionConfig.requireExplicitCompletion (default false). */
+	requireExplicitCompletion: boolean
+	/** See HeadlessSessionConfig.patchLocalToolSchemas (default false). */
+	patchLocalToolSchemas: boolean
 	/**
 	 * Phase 3 context condensation: the model's real context window in
 	 * tokens, when explicitly configured (undefined = resolve live from
@@ -1103,6 +1131,8 @@ export class HeadlessSession {
 			stream: config.stream ?? envStreaming(),
 			reasoningEffort: config.reasoningEffort ?? process.env.HEADLESSCODE_REASONING_EFFORT,
 			windowSize: config.windowSize ?? DEFAULT_WINDOW_SIZE,
+			requireExplicitCompletion: config.requireExplicitCompletion ?? false,
+			patchLocalToolSchemas: config.patchLocalToolSchemas ?? false,
 			// Deliberately left undefined when the caller didn't configure it:
 			// the live OpenRouter models-endpoint lookup in maybeCondenseHistory
 			// resolves the real context window (never hardcode a stale number —
@@ -1335,6 +1365,9 @@ export class HeadlessSession {
 		}
 		if (this.executor.has("run_tests")) {
 			tools = appendRunTestsTool(tools)
+		}
+		if (this.config.patchLocalToolSchemas) {
+			tools = patchEditFileToolForLocalModels(tools)
 		}
 		if (isLazyToolCatalogEnabled()) {
 			const split = splitCoreAndLazyTools(tools)
@@ -2767,7 +2800,7 @@ export class HeadlessSession {
 			// DeepSeek only requires it on that one message).
 			stripSupersededReasoning(messages)
 
-			const calls = parseToolCalls(assistant)
+			let calls = parseToolCalls(assistant)
 
 			// 6a.5 Recursive task decomposition (`new_task`): the vendored tool
 			// description mandates "This tool MUST be called alone. Do NOT call
@@ -2881,26 +2914,64 @@ export class HeadlessSession {
 				return { status: "success", result, iterations: iteration, toolCalls: toolCalls + 1, reportPath }
 			}
 
-			// 6b. Text-only reply (no tool_calls) → pragmatic success fallback.
+			// 6b. Text-only reply (no tool_calls) → pragmatic success fallback,
+			// UNLESS requireExplicitCompletion is set (see the config doc
+			// comment): a model that gives up and dumps prose instead of
+			// retrying or calling attempt_completion must not be recorded as
+			// a successful session.
 			if (calls.length === 0) {
 				const text = (assistant.content ?? "").trim()
-				if (text) {
-					this.logger.info("[loop] text-only reply (no tool calls) — success", { iteration })
-					const reportPath = await this.persistFinalReport(iteration, text)
-					return { status: "success", result: text, iterations: iteration, toolCalls, reportPath }
+
+				// A local model can reason correctly about which tool to call
+				// and then write the call as prose instead of using the native
+				// tool-calling channel (observed live against Qwen2.5-Coder-14B —
+				// see extractEmbeddedToolCall's doc comment). Only ever treated
+				// as a real call when its name matches a tool actually in this
+				// session's catalog — an arbitrary JSON-shaped blob in ordinary
+				// prose must not be able to trigger tool execution.
+				if (text && this.config.requireExplicitCompletion) {
+					const embedded = extractEmbeddedToolCall(text)
+					const isRealTool =
+						embedded && this.state.tools.some((t) => t.type === "function" && t.function.name === embedded.name)
+					if (embedded && isRealTool) {
+						this.logger.warn("[loop] recovered tool call written as text instead of tool_calls", {
+							iteration,
+							tool: embedded.name,
+						})
+						assistantMessage.tool_calls = [
+							{
+								id: embedded.id,
+								type: "function",
+								function: { name: embedded.name, arguments: embedded.rawArguments },
+							},
+						]
+						calls = [embedded]
+					}
 				}
-				// Empty reply: nudge and count as a mistake.
-				consecutiveMistakes++
-				messages.push({
-					role: "user",
-					content:
-						"[System: your last response contained no tool calls and no text. Continue working: call a tool or provide your final answer via attempt_completion.]",
-				})
-				this.logger.warn("[loop] empty reply counted as mistake", { consecutiveMistakes })
-				if (consecutiveMistakes >= consecutiveErrorLimit) {
-					return this.boundedFailure("consecutive empty replies", iteration, toolCalls, consecutiveMistakes)
+
+				if (calls.length === 0) {
+					if (text && !this.config.requireExplicitCompletion) {
+						this.logger.info("[loop] text-only reply (no tool calls) — success", { iteration })
+						const reportPath = await this.persistFinalReport(iteration, text)
+						return { status: "success", result: text, iterations: iteration, toolCalls, reportPath }
+					}
+					// Empty reply, or a text reply that requireExplicitCompletion
+					// refuses to treat as final: nudge and count as a mistake.
+					consecutiveMistakes++
+					messages.push({
+						role: "user",
+						content: text
+							? "[System: a text reply alone does not end the session. Continue working: call a tool, or provide your final answer via attempt_completion.]"
+							: "[System: your last response contained no tool calls and no text. Continue working: call a tool or provide your final answer via attempt_completion.]",
+					})
+					this.logger.warn("[loop] non-completing reply counted as mistake", { consecutiveMistakes, hadText: Boolean(text) })
+					if (consecutiveMistakes >= consecutiveErrorLimit) {
+						return this.boundedFailure("consecutive empty replies", iteration, toolCalls, consecutiveMistakes)
+					}
+					continue
 				}
-				continue
+				// calls.length > 0 here means a text-embedded call was recovered
+				// above — fall through to step 7 to execute it for real.
 			}
 
 			// 7. Execute each tool call, feeding results back as `tool` messages.
@@ -3380,6 +3451,8 @@ export class HeadlessSession {
 			llmTimeoutMs: this.config.llmTimeoutMs,
 			stream: this.config.stream,
 			reasoningEffort: this.config.reasoningEffort,
+			requireExplicitCompletion: this.config.requireExplicitCompletion,
+			patchLocalToolSchemas: this.config.patchLocalToolSchemas,
 			llmClient: this.llmClient,
 			logger: this.logger,
 			memory: this.config.memory,
@@ -3583,6 +3656,9 @@ export class HeadlessSession {
 		}
 		if (this.executor.has("run_tests")) {
 			newTools = appendRunTestsTool(newTools)
+		}
+		if (this.config.patchLocalToolSchemas) {
+			newTools = patchEditFileToolForLocalModels(newTools)
 		}
 		if (isLazyToolCatalogEnabled()) {
 			const split = splitCoreAndLazyTools(newTools)
