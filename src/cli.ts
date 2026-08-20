@@ -279,11 +279,16 @@ Options:
                              src/engine/condense.ts)
   --condense-threshold <f>   Phase 3 context condensation: fraction of the context
                              window at which the oldest turns are condensed into one
-                             summary (default: 0.75; must be between 0 and 1)
+                             summary (default: 0.75, or 0.92 for the local code-mode
+                             backend — see cli.ts's LOCAL_CONDENSE_THRESHOLD_FRACTION;
+                             must be between 0 and 1)
   --condense-early-fire <f>  Async condensation: fraction of the context window at
                              which the condensation LLM call fires EARLY, in the
                              background against a snapshot, while the loop keeps
-                             running (default: 0.6, provisional — must be below
+                             running (default: 0.6, provisional; DISABLED for the
+                             local code-mode backend — a second concurrent call
+                             against a single locally-loaded model has no latency to
+                             hide and only adds GPU contention — must be below
                              --condense-threshold or the async path is off)
   --condense-model <id>      Phase 3 context condensation: model id for the
                              condensation call (default: the session model, or the
@@ -924,6 +929,26 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// doc comment and executor.ts's largeOverwriteRefusal.
 	const guardLargeOverwrites =
 		useLocalCodeBackend && !envBoolean("HEADLESSCODE_ALLOW_UNGUARDED_OVERWRITES")
+	// The cloud-tuned condensation defaults (0.75 hard threshold, 0.6 early-fire
+	// — see condense.ts) were measured firing needlessly aggressively against a
+	// local model: a trial condensing at 38 messages against a 16384-token
+	// --context-window left most of the daemon's real n_ctx unused (verified
+	// live 2026-08-20 — see plans/local-dual-model-code-agent-PROMPT-2026-08-21.md,
+	// "Why is condensation firing so heavily"). Two local-only changes, an
+	// explicit --condense-threshold/--condense-early-fire flag always wins:
+	// (1) the hard threshold moves from 0.75 to 0.92 — condense only once the
+	// session is genuinely close to the real limit, not at 3/4 of it; (2) the
+	// early-fire background path (designed to hide a CLOUD provider's
+	// condensation-call latency behind the main loop) is disabled outright —
+	// against a single locally-loaded model it just fires a second concurrent
+	// generation request competing with the main loop for the same GPU, with
+	// no latency to hide. Disabling it is `earlyFire === hardThreshold`
+	// (fireBackgroundCondense's own off-switch, see loop.ts).
+	const LOCAL_CONDENSE_THRESHOLD_FRACTION = 0.92
+	const condenseThresholdFraction =
+		options.condenseThreshold ?? (useLocalCodeBackend ? LOCAL_CONDENSE_THRESHOLD_FRACTION : undefined)
+	const condenseEarlyFireFraction =
+		options.condenseEarlyFire ?? (useLocalCodeBackend ? LOCAL_CONDENSE_THRESHOLD_FRACTION : undefined)
 
 	// Phase 3 context condensation: a cheaper model for the condensation
 	// call can be assigned via the `_condensation` key in
@@ -1028,8 +1053,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		consecutiveErrorLimit: options.consecutiveErrorLimit,
 		windowSize: options.windowSize,
 		contextWindowTokens: options.contextWindowTokens,
-		condenseThresholdFraction: options.condenseThreshold,
-		condenseEarlyFireFraction: options.condenseEarlyFire,
+		condenseThresholdFraction,
+		condenseEarlyFireFraction,
 		condenseModel,
 		llmTimeoutMs: options.llmTimeoutMs,
 		stream: options.stream,

@@ -1990,6 +1990,10 @@ export class HeadlessSession {
 				// (never re-condense the same chunk).
 				const messagesBefore = messages.length
 				messages.splice(0, messages.length, ...condensed)
+				// See ToolExecutor.notifyCondensed: lets the list_files repeat-call
+				// guard allow a re-list now that some earlier result may have been
+				// compressed away.
+				this.executor.notifyCondensed()
 				// Emit the feed event the timeline needs: condensation used to
 				// be only a log line, invisible to the dashboard. Non-fatal.
 				// (S2) Scheduled so it lands after this iteration's
@@ -2334,6 +2338,10 @@ export class HeadlessSession {
 		// hits the batch-once-stable guard (the sent prefix with the summary at
 		// index 2 stays byte-identical across calls — what prompt caching needs).
 		this.condensedUpToMsgIndex.value = 3
+		// See ToolExecutor.notifyCondensed: lets the list_files repeat-call
+		// guard allow a re-list now that some earlier result may have been
+		// compressed away.
+		this.executor.notifyCondensed()
 		this.logger.info("[condense] background condensation applied", {
 			firedAtIteration: job.firedAtIteration,
 			count: job.count,

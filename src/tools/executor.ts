@@ -245,6 +245,20 @@ export class ToolExecutor {
 	 * Conversational/session state — NEVER written to a workspace file.
 	 */
 	private readonly todoList = new TodoListState()
+	/**
+	 * Session-scoped repeat-call guard for list_files (see listFilesHandler's
+	 * doc comment). Keyed by the call's effective (path, recursive) — value is
+	 * the condensationGeneration this key was last listed at, so a repeat is
+	 * only refused when nothing has been condensed since (the earlier result
+	 * might have been evicted from context, in which case re-listing is the
+	 * only way to see it again).
+	 */
+	private readonly listFilesCalls = new Map<string, number>()
+	/**
+	 * Incremented by notifyCondensed() every time HeadlessSession applies a
+	 * condensation (sync or background) — see listFilesCalls above.
+	 */
+	private condensationGeneration = 0
 	/** Resolved permissions handed to every handler call (see ToolExecutorOptions.permissions). */
 	readonly permissions: PermissionsConfig
 
@@ -289,6 +303,26 @@ export class ToolExecutor {
 		this.register("read_file", (args, ctx) =>
 			readFileHandler(args, ctx, this.readCache.get(readFileKey(args, ctx)), this.readCache),
 		)
+	}
+
+	/**
+	 * Register list_files wired to THIS executor's session-scoped repeat-call
+	 * guard (see listFilesCalls above and listFilesHandler's doc comment).
+	 * Every construction path that offers list_files should call this instead
+	 * of a bare `register("list_files", listFilesHandler)`.
+	 */
+	registerListFiles(): void {
+		this.register("list_files", (args, ctx) => listFilesHandler(args, ctx, this.listFilesCalls, this.condensationGeneration))
+	}
+
+	/**
+	 * Called by HeadlessSession right after it splices a condensation into the
+	 * live history (both the synchronous and background paths) — advances the
+	 * generation the list_files repeat-call guard checks against, so a call
+	 * repeated after a condensation is allowed again instead of refused.
+	 */
+	notifyCondensed(): void {
+		this.condensationGeneration++
 	}
 
 	/**
@@ -1586,8 +1620,26 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 	})()
 }
 
-/** list_files — top-level or recursive listing, dirs first, truncated. */
-function listFilesHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+/**
+ * list_files — top-level or recursive listing, dirs first, truncated.
+ *
+ * Repeat-call guard: a local model was observed calling list_files with the
+ * SAME (path, recursive) twice in one turn pair with no condensation in
+ * between (verified live 2026-08-20 — see
+ * plans/local-dual-model-code-agent-PROMPT-2026-08-21.md's trial 4), which
+ * cost ~7.5K prompt tokens for a result already sitting in context. When
+ * `calls`/`generation` are supplied (see ToolExecutor.registerListFiles), an
+ * identical call within the same condensation generation is refused instead
+ * of re-run — the model is pointed back at its own earlier result. A repeat
+ * AFTER a condensation is always allowed again: the earlier result may have
+ * been the part that got compressed away.
+ */
+function listFilesHandler(
+	args: Record<string, unknown>,
+	ctx: ToolContext,
+	calls?: Map<string, number>,
+	generation?: number,
+): Promise<ToolResult> {
 	const dirPath = args.path == null || args.path === "" ? "." : requireString(args, "path")
 	const recursive = args.recursive === true
 
@@ -1595,11 +1647,33 @@ function listFilesHandler(args: Record<string, unknown>, ctx: ToolContext): Prom
 		const target = safeTarget(ctx, dirPath)
 		const rel = path.relative(ctx.workspaceRoot, target).toPosix() || path.basename(target) || "."
 
+		if (calls !== undefined && generation !== undefined) {
+			const key = `${target} ${recursive}`
+			const lastGeneration = calls.get(key)
+			if (lastGeneration === generation) {
+				return err(
+					`list_files: '${rel}' (recursive=${recursive}) was already listed earlier this session and nothing has ` +
+						`been condensed since — the result is still in your context above.\n\n<error_details>\nRe-listing an ` +
+						`unchanged directory wastes context for a result you already have.\n\nRecovery suggestions:\n` +
+						`1. Scroll back to your earlier list_files call for '${rel}' in this conversation and use that result\n` +
+						`2. If you need a DIFFERENT directory or the recursive flag flipped, call list_files with those ` +
+						`different arguments instead\n</error_details>`,
+				)
+			}
+		}
+
 		let collected: { entries: Array<{ rel: string; isDir: boolean }>; truncated: boolean }
 		try {
 			collected = await collectEntries(target, ctx.workspaceRoot, recursive)
 		} catch (error) {
 			return err(`list_files: cannot list '${rel}': ${errorMessage(error)}`)
+		}
+
+		// Only recorded on SUCCESS: a failed listing (e.g. bad path) should
+		// remain retryable with the real error, never masked by the repeat
+		// refusal above.
+		if (calls !== undefined && generation !== undefined) {
+			calls.set(`${target} ${recursive}`, generation)
 		}
 
 		// Sort dirs first, then alphabetically (over the collected subset).
@@ -2148,7 +2222,7 @@ export function createHeadlessExecutor(workspaceRoot: string, options: ToolExecu
 	executor.register("search_replace", searchReplaceHandler)
 	executor.register("edit_file", editFileHandler)
 	executor.register("execute_command", executeCommandHandler)
-	executor.register("list_files", listFilesHandler)
+	executor.registerListFiles()
 	executor.register("codebase_search", codebaseSearchHandler)
 	executor.register("browser_action", browserActionHandler)
 	executor.register("describe_image", describeImageHandler)
@@ -2188,7 +2262,7 @@ function createReadCommandExecutor(workspaceRoot: string, options: ToolExecutorO
 	const executor = new ToolExecutor(workspaceRoot, options)
 
 	executor.registerReadFile()
-	executor.register("list_files", listFilesHandler)
+	executor.registerListFiles()
 	executor.register("execute_command", executeCommandHandler)
 	executor.register("browser_action", browserActionHandler)
 	// The four read-only code-intelligence tools (TS-only) follow the same
@@ -2251,7 +2325,7 @@ export function createLocalExploreExecutor(workspaceRoot: string, options: ToolE
 	const executor = new ToolExecutor(workspaceRoot, options)
 
 	executor.registerReadFile()
-	executor.register("list_files", listFilesHandler)
+	executor.registerListFiles()
 	executor.register("codebase_search", codebaseSearchHandler)
 	executor.register("attempt_completion", attemptCompletionHandler)
 

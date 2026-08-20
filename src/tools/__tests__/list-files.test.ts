@@ -79,11 +79,61 @@ async function testSmallTreeIsCompleteDirsFirst(): Promise<void> {
 	}
 }
 
+// ─── (c) repeat-call guard: identical call refused, condensation resets it ───
+
+async function testRepeatListFilesRefusedUntilCondensed(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-ls-repeat-")
+	try {
+		await fs.writeFile(path.join(ws, "top.txt"), "x", "utf-8")
+
+		const executor = createHeadlessExecutor(ws)
+		const first = await executor.execute("list_files", { path: "." })
+		assert.equal(first.isError, false, "first listing succeeds")
+
+		const repeat = await executor.execute("list_files", { path: "." })
+		assert.equal(repeat.isError, true, "identical repeat is refused")
+		assert.match(repeat.content, /already listed earlier this session/, "refusal explains why")
+
+		const differentArgs = await executor.execute("list_files", { path: ".", recursive: true })
+		assert.equal(differentArgs.isError, false, "a call with DIFFERENT args (recursive flipped) is not refused")
+
+		executor.notifyCondensed()
+		const afterCondense = await executor.execute("list_files", { path: "." })
+		assert.equal(afterCondense.isError, false, "the same call is allowed again after a condensation")
+
+		const repeatAgain = await executor.execute("list_files", { path: "." })
+		assert.equal(repeatAgain.isError, true, "refused again once re-established in the new generation")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testFailedListFilesNotRecordedByGuard(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-ls-repeat-fail-")
+	try {
+		const executor = createHeadlessExecutor(ws)
+		const first = await executor.execute("list_files", { path: "does-not-exist" })
+		assert.equal(first.isError, true, "listing a missing dir fails")
+
+		const second = await executor.execute("list_files", { path: "does-not-exist" })
+		assert.equal(second.isError, true, "still fails")
+		assert.doesNotMatch(
+			second.content,
+			/already listed earlier this session/,
+			"a failed call is retryable — the guard must not mask the real error as a refusal",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
 	["large tree (>500 entries): listing capped at 500 + trailer, completes quickly", testLargeTreeIsBoundedAndTruncated],
 	["small tree: complete dirs-first listing with no trailer", testSmallTreeIsCompleteDirsFirst],
+	["repeat identical list_files is refused; condensation resets the guard", testRepeatListFilesRefusedUntilCondensed],
+	["a failed list_files call is never recorded by the repeat-call guard", testFailedListFilesNotRecordedByGuard],
 ]
 
 async function main(): Promise<void> {
