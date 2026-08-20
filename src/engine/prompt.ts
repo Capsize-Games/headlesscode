@@ -421,7 +421,29 @@ export async function buildLeanSystemPrompt(options: BuildSystemPromptOptions): 
 		"For any task with more than one concrete step (e.g. edit a file AND write a test for it), call " +
 		"update_todo_list ONCE near the start to write out every step as a checklist, then mark each one done " +
 		"as you complete it and check the list again before deciding what to do next. After finishing one step, " +
-		"your next action should come from that checklist — not a fresh look around the workspace."
+		"your next action should come from that checklist — not a fresh look around the workspace. If a step " +
+		"fails (a tool error, a failing command), your next action is to read that error and address it " +
+		"specifically — not to fall back on list_files or another unrelated exploration call."
+
+	// Added 2026-08-21 after a live failure pattern reproduced across THREE
+	// separate trials: asked to write a new test file "following the
+	// existing plain-assert test style used elsewhere," the model instead
+	// defaulted to generic Jest syntax (describe/test/expect — not used
+	// anywhere in this codebase) every time, then got a tsc error pointing
+	// at exactly that mismatch. The task text already SAID to match the
+	// existing style; the model never actually looked at an existing file
+	// to see what that style was before writing its own. (The one trial
+	// that recovered did so only after an ask_followup_question forced a
+	// human to say "go read an existing file first" explicitly — this note
+	// makes that the DEFAULT behavior instead of something that only
+	// happens after a wasted round trip.)
+	const conventionNote =
+		"Before writing a NEW file of a kind that likely already has examples in this codebase (a test file, a " +
+		"config file, a module following an established pattern), actually read_file an existing example FIRST " +
+		"and match its real conventions — imports, style, framework/assertion library, naming. Do not assume a " +
+		"generic default (e.g. Jest-style describe/test/expect) is correct just because it is common elsewhere; " +
+		"this project may use something else entirely, and a task that says 'follow the existing style' means " +
+		"look at the existing style, not guess at it."
 
 	const basePrompt = [
 		modeConfig.roleDefinition,
@@ -429,6 +451,7 @@ export async function buildLeanSystemPrompt(options: BuildSystemPromptOptions): 
 		verificationNote,
 		objectiveNote,
 		planningNote,
+		conventionNote,
 		getSystemInfoSection(workspaceRoot),
 		await addCustomInstructions(modeConfig.customInstructions ?? "", globalCustomInstructions ?? "", workspaceRoot, modeConfig.slug, {}),
 	]
