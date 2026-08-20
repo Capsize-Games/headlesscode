@@ -253,7 +253,7 @@ export class ToolExecutor {
 	 * might have been evicted from context, in which case re-listing is the
 	 * only way to see it again).
 	 */
-	private readonly listFilesCalls = new Map<string, number>()
+	private readonly listFilesCalls = new Map<string, ListFilesCallEntry>()
 	/**
 	 * Incremented by notifyCondensed() every time HeadlessSession applies a
 	 * condensation (sync or background) — see listFilesCalls above.
@@ -1620,6 +1620,20 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 	})()
 }
 
+/** One list_files repeat-call guard entry — see listFilesHandler's doc comment. */
+type ListFilesCallEntry = {
+	/** The condensation generation this key was last (really) listed at. */
+	generation: number
+	/**
+	 * Whether the LAST identical call already got the short cache-hit
+	 * message instead of a real listing. When true, the next identical
+	 * call gets a real listing again — mirrors read_file's toldUnchanged
+	 * (readFileHandler) exactly, and for the same reason: a one-shot notice
+	 * never loops forever.
+	 */
+	toldUnchanged: boolean
+}
+
 /**
  * list_files — top-level or recursive listing, dirs first, truncated.
  *
@@ -1629,15 +1643,22 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
  * plans/local-dual-model-code-agent-PROMPT-2026-08-21.md's trial 4), which
  * cost ~7.5K prompt tokens for a result already sitting in context. When
  * `calls`/`generation` are supplied (see ToolExecutor.registerListFiles), an
- * identical call within the same condensation generation is refused instead
- * of re-run — the model is pointed back at its own earlier result. A repeat
- * AFTER a condensation is always allowed again: the earlier result may have
- * been the part that got compressed away.
+ * identical call within the same condensation generation gets a short
+ * cache-hit notice INSTEAD of a refusal — not an error, so it never counts
+ * against the consecutive-mistake budget. This was originally a hard
+ * refusal (matching guardLargeOverwrites' shape); verified live 2026-08-20
+ * that this was actively harmful — a model that repeats an identical call
+ * verbatim after an error (the SAME cross-tool tic already documented for
+ * apply_diff/ask_followup_question, see the plan doc above) burned an
+ * entire 8-mistake budget refusing the identical list_files call 8 times in
+ * a row and never reached the real task. A repeat AFTER a condensation is
+ * always treated as fresh: the earlier result may have been the part that
+ * got compressed away.
  */
 function listFilesHandler(
 	args: Record<string, unknown>,
 	ctx: ToolContext,
-	calls?: Map<string, number>,
+	calls?: Map<string, ListFilesCallEntry>,
 	generation?: number,
 ): Promise<ToolResult> {
 	const dirPath = args.path == null || args.path === "" ? "." : requireString(args, "path")
@@ -1646,20 +1667,21 @@ function listFilesHandler(
 	return (async () => {
 		const target = safeTarget(ctx, dirPath)
 		const rel = path.relative(ctx.workspaceRoot, target).toPosix() || path.basename(target) || "."
+		const key = `${target} ${recursive}`
+		const entry = calls?.get(key)
 
-		if (calls !== undefined && generation !== undefined) {
-			const key = `${target} ${recursive}`
-			const lastGeneration = calls.get(key)
-			if (lastGeneration === generation) {
-				return err(
-					`list_files: '${rel}' (recursive=${recursive}) was already listed earlier this session and nothing has ` +
-						`been condensed since — the result is still in your context above.\n\n<error_details>\nRe-listing an ` +
-						`unchanged directory wastes context for a result you already have.\n\nRecovery suggestions:\n` +
-						`1. Scroll back to your earlier list_files call for '${rel}' in this conversation and use that result\n` +
-						`2. If you need a DIFFERENT directory or the recursive flag flipped, call list_files with those ` +
-						`different arguments instead\n</error_details>`,
+		if (calls !== undefined && generation !== undefined && entry !== undefined && entry.generation === generation) {
+			if (!entry.toldUnchanged) {
+				entry.toldUnchanged = true
+				return ok(
+					`[cache] '${rel}' (recursive=${recursive}) was already listed earlier this session and nothing has been ` +
+						`condensed since — reuse the earlier result above instead of re-listing. Re-listing again will re-run ` +
+						`the real listing.`,
 				)
 			}
+			// Fall through to a real listing: a second identical call in a row
+			// means the cache-hit notice alone didn't redirect the model, and
+			// refusing again would just repeat the same unproductive exchange.
 		}
 
 		let collected: { entries: Array<{ rel: string; isDir: boolean }>; truncated: boolean }
@@ -1670,10 +1692,10 @@ function listFilesHandler(
 		}
 
 		// Only recorded on SUCCESS: a failed listing (e.g. bad path) should
-		// remain retryable with the real error, never masked by the repeat
-		// refusal above.
+		// remain retryable with the real error, never masked by the cache-hit
+		// notice above.
 		if (calls !== undefined && generation !== undefined) {
-			calls.set(`${target} ${recursive}`, generation)
+			calls.set(key, { generation, toldUnchanged: false })
 		}
 
 		// Sort dirs first, then alphabetically (over the collected subset).

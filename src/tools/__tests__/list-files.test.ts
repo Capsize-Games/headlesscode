@@ -79,9 +79,14 @@ async function testSmallTreeIsCompleteDirsFirst(): Promise<void> {
 	}
 }
 
-// ─── (c) repeat-call guard: identical call refused, condensation resets it ───
+// ─── (c) repeat-call guard: identical call gets a cache-hit notice ONCE ──────
+// (never a refusal — see listFilesHandler's doc comment: a hard refusal was
+// tried first and verified live 2026-08-20 to be actively harmful, since a
+// model that repeats an identical call verbatim after an error burns its
+// whole mistake budget refusing the SAME call over and over. This mirrors
+// read_file's toldUnchanged cache exactly.)
 
-async function testRepeatListFilesRefusedUntilCondensed(): Promise<void> {
+async function testRepeatListFilesGetsOneCacheHitThenRealListingAgain(): Promise<void> {
 	const ws = await mkTmpWorkspace("hc-ls-repeat-")
 	try {
 		await fs.writeFile(path.join(ws, "top.txt"), "x", "utf-8")
@@ -89,20 +94,29 @@ async function testRepeatListFilesRefusedUntilCondensed(): Promise<void> {
 		const executor = createHeadlessExecutor(ws)
 		const first = await executor.execute("list_files", { path: "." })
 		assert.equal(first.isError, false, "first listing succeeds")
+		assert.match(first.content, /top\.txt/, "first listing has the real content")
 
 		const repeat = await executor.execute("list_files", { path: "." })
-		assert.equal(repeat.isError, true, "identical repeat is refused")
-		assert.match(repeat.content, /already listed earlier this session/, "refusal explains why")
+		assert.equal(repeat.isError, false, "identical repeat is NOT an error — never counts as a mistake")
+		assert.match(repeat.content, /\[cache\]/, "repeat gets the short cache-hit notice instead of a full re-listing")
+		assert.doesNotMatch(repeat.content, /top\.txt/, "cache-hit notice doesn't repeat the full listing")
+
+		const repeatAgain = await executor.execute("list_files", { path: "." })
+		assert.equal(repeatAgain.isError, false, "a THIRD identical call succeeds too")
+		assert.match(
+			repeatAgain.content,
+			/top\.txt/,
+			"the cache-hit notice never loops forever — a second repeat gets the real listing again",
+		)
 
 		const differentArgs = await executor.execute("list_files", { path: ".", recursive: true })
-		assert.equal(differentArgs.isError, false, "a call with DIFFERENT args (recursive flipped) is not refused")
+		assert.equal(differentArgs.isError, false, "a call with DIFFERENT args (recursive flipped) is unaffected")
+		assert.match(differentArgs.content, /top\.txt/, "different args always get a real listing")
 
 		executor.notifyCondensed()
 		const afterCondense = await executor.execute("list_files", { path: "." })
-		assert.equal(afterCondense.isError, false, "the same call is allowed again after a condensation")
-
-		const repeatAgain = await executor.execute("list_files", { path: "." })
-		assert.equal(repeatAgain.isError, true, "refused again once re-established in the new generation")
+		assert.equal(afterCondense.isError, false, "a call right after condensation always gets a real listing")
+		assert.match(afterCondense.content, /top\.txt/, "condensation resets to a real listing, not a cache-hit notice")
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -119,8 +133,8 @@ async function testFailedListFilesNotRecordedByGuard(): Promise<void> {
 		assert.equal(second.isError, true, "still fails")
 		assert.doesNotMatch(
 			second.content,
-			/already listed earlier this session/,
-			"a failed call is retryable — the guard must not mask the real error as a refusal",
+			/\[cache\]/,
+			"a failed call is retryable — the guard must not mask the real error with a cache-hit notice",
 		)
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
@@ -132,7 +146,10 @@ async function testFailedListFilesNotRecordedByGuard(): Promise<void> {
 const tests: Array<[string, () => Promise<void>]> = [
 	["large tree (>500 entries): listing capped at 500 + trailer, completes quickly", testLargeTreeIsBoundedAndTruncated],
 	["small tree: complete dirs-first listing with no trailer", testSmallTreeIsCompleteDirsFirst],
-	["repeat identical list_files is refused; condensation resets the guard", testRepeatListFilesRefusedUntilCondensed],
+	[
+		"repeat identical list_files gets one cache-hit notice, then real listings again",
+		testRepeatListFilesGetsOneCacheHitThenRealListingAgain,
+	],
 	["a failed list_files call is never recorded by the repeat-call guard", testFailedListFilesNotRecordedByGuard],
 ]
 
