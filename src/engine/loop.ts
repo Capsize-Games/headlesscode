@@ -3327,11 +3327,25 @@ export class HeadlessSession {
 					// Empty reply, or a text reply that requireExplicitCompletion
 					// refuses to treat as final: nudge and count as a mistake.
 					consecutiveMistakes++
+					// The mistake count is appended to the nudge text itself (see
+					// AIRUNNERDESKTOP_EMPTY_REPLY_FALLBACK_TEXTS's doc comment for the
+					// full mechanism this guards against): clearing the fake fallback
+					// content alone was NOT enough to prevent a byte-for-byte-
+					// identical, self-reinforcing prompt — the nudge text itself was
+					// just as static, and truncateHistory evicting/re-adding a fixed-
+					// size pair every cycle reproduces the exact same trap regardless
+					// of what the persisted content specifically is. Verified live
+					// 2026-08-20 (trial 41): even after AIRUNNERDESKTOP_EMPTY_REPLY_
+					// FALLBACK_TEXTS's fix, the rendered prompt was STILL byte-
+					// identical across consecutive requests. Varying the nudge text
+					// structurally prevents the trap from re-forming, independent of
+					// whatever is causing the model to produce nothing in the first
+					// place.
 					messages.push({
 						role: "user",
 						content: text
-							? "[System: a text reply alone does not end the session. Continue working: call a tool, or provide your final answer via attempt_completion.]"
-							: "[System: your last response contained no tool calls and no text. Continue working: call a tool or provide your final answer via attempt_completion.]",
+							? `[System: a text reply alone does not end the session (attempt ${consecutiveMistakes}). Continue working: call a tool, or provide your final answer via attempt_completion.]`
+							: `[System: your last response contained no tool calls and no text (attempt ${consecutiveMistakes}). Continue working: call a tool or provide your final answer via attempt_completion.]`,
 					})
 					this.logger.warn("[loop] non-completing reply counted as mistake", {
 						consecutiveMistakes,

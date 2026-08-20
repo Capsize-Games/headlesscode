@@ -478,6 +478,39 @@ async function testEmptyReplyFallbackTextIsNotPersistedToHistory(): Promise<void
 	}
 }
 
+// Verified live 2026-08-20 (trial 41): clearing the synthetic fallback text
+// from history (see the test above) was NOT enough on its own — the
+// injected nudge message itself was just as static, and truncateHistory
+// evicting/re-adding a fixed-size pair every cycle reproduced a byte-for-
+// byte-identical rendered prompt regardless of what the persisted content
+// specifically was. The nudge must vary per occurrence to structurally
+// prevent the trap from re-forming.
+async function testNonCompletingReplyNudgeVariesAcrossRepeatedOccurrences(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-nudge-vary-"))
+	try {
+		const client = new FakeLlmClient([
+			() => textReply(""),
+			() => textReply(""),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({
+			task: "do something",
+			client,
+			workspaceRoot: ws,
+			requireExplicitCompletion: true,
+		})
+		await session.run()
+
+		const nudges = session.state.messages
+			.filter((m) => m.role === "user" && (m.content ?? "").includes("contained no tool calls"))
+			.map((m) => m.content)
+		assert.equal(nudges.length, 2, "expected one nudge per non-completing reply")
+		assert.notEqual(nudges[0], nudges[1], "repeated nudges must not be byte-identical")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 async function testRequireExplicitCompletionBoundedFailureWhenNeverCompletes(): Promise<void> {
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-rec2-"))
 	try {
@@ -2383,6 +2416,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	[
 		"the daemon's synthetic empty-reply fallback text is not persisted to history",
 		testEmptyReplyFallbackTextIsNotPersistedToHistory,
+	],
+	[
+		"the non-completing-reply nudge varies across repeated occurrences",
+		testNonCompletingReplyNudgeVariesAcrossRepeatedOccurrences,
 	],
 	[
 		"requireExplicitCompletion: repeated text-only replies -> bounded failure, never a fabricated success",
