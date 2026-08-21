@@ -203,6 +203,7 @@ async function makeSession(options: {
 	requireArtifactBeforeCompletion?: boolean
 	requireArtifactPathPattern?: string
 	requireArtifactMinCitations?: number
+	requireArtifactSections?: string[]
 }) {
 	const session = new HeadlessSession({
 		workspaceRoot: options.workspaceRoot,
@@ -220,6 +221,7 @@ async function makeSession(options: {
 		requireArtifactBeforeCompletion: options.requireArtifactBeforeCompletion,
 		requireArtifactPathPattern: options.requireArtifactPathPattern,
 		requireArtifactMinCitations: options.requireArtifactMinCitations,
+		requireArtifactSections: options.requireArtifactSections,
 		// Checkpoints are default-on and would otherwise write real shadow-git
 		// commits to ~/.headlesscode/checkpoints on every test run; this suite
 		// isn't testing checkpoints (except the one that is), so keep tests
@@ -872,6 +874,51 @@ async function testRequireArtifactMinCitationsRefusesAStubDoc(): Promise<void> {
 			(m) => m.role === "tool" && (m.content ?? "").includes("Your NEXT tool call must be edit_file"),
 		)
 		assert.ok(nudge, "expected a nudge specifically naming the missing-citations reason and the required next action")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// Live-verified 2026-08-21: a real, well-cited document can still be a
+// general SURVEY rather than the specific scoped proposal the task asked
+// for. requireArtifactSections forces required headings/content to exist,
+// not just citations.
+async function testRequireArtifactSectionsRefusesASurveyWithoutAProposal(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-sections-"))
+	try {
+		const client = new FakeLlmClient([
+			() =>
+				toolCall("write_to_file", {
+					path: "plans/research/finding.md",
+					content: "# Survey\n\nsrc/engine/loop.ts:42 does a thing. src/tools/executor.ts:10 does another.\n",
+				}),
+			() => toolCall("attempt_completion", { result: "Wrote the survey." }),
+			() =>
+				toolCall("write_to_file", {
+					path: "plans/research/finding.md",
+					content:
+						"# Finding\n\nsrc/engine/loop.ts:42 has a bug, confirmed against src/tools/executor.ts:10.\n\n" +
+						"## What to build\n\nFix the bug.\n\n## What NOT to do\n\nDon't touch anything else.\n",
+				}),
+			() => toolCall("attempt_completion", { result: "Wrote the real proposal." }),
+		])
+		const session = await makeSession({
+			task: "research something and propose a concrete fix",
+			client,
+			workspaceRoot: ws,
+			requireArtifactPathPattern: "plans/research/*.md",
+			requireArtifactMinCitations: 2,
+			requireArtifactSections: ["What to build", "What NOT to do"],
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "Wrote the real proposal.")
+		assert.equal(client.requests.length, 4, "a cited-but-sectionless survey must not satisfy the gate")
+		const nudge = session.state.messages.find(
+			(m) => m.role === "tool" && (m.content ?? "").includes("missing required section"),
+		)
+		assert.ok(nudge, "expected a nudge naming the missing sections")
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -2838,6 +2885,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	[
 		"requireArtifactMinCitations: refuses a contentless stub, accepts once real file:line citations exist",
 		testRequireArtifactMinCitationsRefusesAStubDoc,
+	],
+	[
+		"requireArtifactSections: refuses a cited-but-sectionless survey, accepts once required sections exist",
+		testRequireArtifactSectionsRefusesASurveyWithoutAProposal,
 	],
 	[
 		"verifyBeforeCompletion: refuses every fabricated completion in a session, not just the first",

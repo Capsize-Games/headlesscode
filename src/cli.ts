@@ -57,6 +57,8 @@ interface CliOptions {
 	requireArtifactPath?: string
 	/** See HeadlessSessionConfig.requireArtifactMinCitations (loop.ts). */
 	requireArtifactMinCitations?: number
+	/** See HeadlessSessionConfig.requireArtifactSections (loop.ts) — pipe-separated on the CLI. */
+	requireArtifactSections?: string[]
 	model?: string
 	maxIterations?: number
 	consecutiveErrorLimit?: number
@@ -442,7 +444,8 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 			case "--model":
 			case "--log-file":
 			case "--session-id":
-			case "--require-artifact-path": {
+			case "--require-artifact-path":
+			case "--require-artifact-sections": {
 				const value = next()
 				if (value === undefined) {
 					return { options, error: `Missing value for ${flag}` }
@@ -471,6 +474,12 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 						break
 					case "--require-artifact-path":
 						options.requireArtifactPath = value
+						break
+					case "--require-artifact-sections":
+						options.requireArtifactSections = value
+							.split("|")
+							.map((s) => s.trim())
+							.filter(Boolean)
 						break
 				}
 				break
@@ -1141,6 +1150,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		requireArtifactBeforeCompletion,
 		requireArtifactPathPattern: options.requireArtifactPath,
 		requireArtifactMinCitations: options.requireArtifactMinCitations,
+		requireArtifactSections: options.requireArtifactSections,
 		guardLargeOverwrites,
 		llmClient: client,
 		logger,

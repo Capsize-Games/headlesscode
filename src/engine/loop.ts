@@ -629,7 +629,7 @@ const CITATION_PATTERN = /\b[\w.-]+(?:\/[\w.-]+)+\.\w+:\d+(?:-\d+)?\b/g
 async function matchingArtifactFileStatus(
 	workspaceRoot: string,
 	pattern: string,
-): Promise<{ found: boolean; citationCount: number; relativePath?: string }> {
+): Promise<{ found: boolean; citationCount: number; relativePath?: string; content?: string }> {
 	const lastSlash = pattern.lastIndexOf("/")
 	const dirPart = lastSlash === -1 ? "." : pattern.slice(0, lastSlash)
 	const namePattern = lastSlash === -1 ? pattern : pattern.slice(lastSlash + 1)
@@ -650,7 +650,7 @@ async function matchingArtifactFileStatus(
 			if (stat.isFile() && stat.size > 0) {
 				const content = await fsp.readFile(filePath, "utf-8")
 				const citationCount = content.match(CITATION_PATTERN)?.length ?? 0
-				return { found: true, citationCount, relativePath: path.relative(workspaceRoot, filePath) }
+				return { found: true, citationCount, relativePath: path.relative(workspaceRoot, filePath), content }
 			}
 		} catch {
 			// Race with a concurrent delete/rename — treat as not-yet-matched.
@@ -925,6 +925,21 @@ export interface HeadlessSessionConfig {
 	 */
 	requireArtifactMinCitations?: number
 	/**
+	 * Second companion to requireArtifactPathPattern — a list of required
+	 * section headings (case-insensitive substring match, e.g. "What to
+	 * build", "What NOT to do", "How to verify") that must ALL appear in
+	 * the matched file's content before completion is accepted. Live-
+	 * verified 2026-08-21: a research session satisfied
+	 * requireArtifactMinCitations with a real, well-cited document that
+	 * was nonetheless a general SURVEY (what each file does) rather than
+	 * the specific "here is one concrete finding, what to build, what not
+	 * to, how to verify" deliverable the task actually asked for — real
+	 * citations alone don't guarantee the document commits to a scoped
+	 * proposal. Requires requireArtifactPathPattern to also be set.
+	 * Undefined/empty = no required sections.
+	 */
+	requireArtifactSections?: string[]
+	/**
 	 * Refuse `write_to_file` (whole-file overwrite) against a file that
 	 * already has substantial content, nudging the model toward `edit_file`/
 	 * `search_replace` instead. Verified live 2026-08-20 against both
@@ -1128,6 +1143,8 @@ export interface ResolvedSessionConfig {
 	requireArtifactPathPattern?: string
 	/** See HeadlessSessionConfig.requireArtifactMinCitations (default undefined = no minimum). */
 	requireArtifactMinCitations?: number
+	/** See HeadlessSessionConfig.requireArtifactSections (default undefined = none required). */
+	requireArtifactSections?: string[]
 	/** See HeadlessSessionConfig.guardLargeOverwrites (default false). */
 	guardLargeOverwrites: boolean
 	/**
@@ -1428,6 +1445,7 @@ export class HeadlessSession {
 			requireArtifactBeforeCompletion: config.requireArtifactBeforeCompletion ?? false,
 			requireArtifactPathPattern: config.requireArtifactPathPattern,
 			requireArtifactMinCitations: config.requireArtifactMinCitations,
+			requireArtifactSections: config.requireArtifactSections,
 			guardLargeOverwrites: config.guardLargeOverwrites ?? false,
 			// Deliberately left undefined when the caller didn't configure it:
 			// the live OpenRouter models-endpoint lookup in maybeCondenseHistory
@@ -3453,6 +3471,40 @@ export class HeadlessSession {
 						this.logger.warn("[loop] attempt_completion deferred", {
 							iteration,
 							reason: !artifactStatus.found ? "no file matching requireArtifactPathPattern" : "below requireArtifactMinCitations",
+						})
+						continue
+					}
+
+					// requireArtifactSections: citations alone don't guarantee the
+					// doc actually commits to a scoped proposal rather than a
+					// general survey (live-verified 2026-08-21 — see doc comment).
+					const requiredSections = this.config.requireArtifactSections ?? []
+					const content = artifactStatus.content ?? ""
+					const missingSections = requiredSections.filter(
+						(section) => !content.toLowerCase().includes(section.toLowerCase()),
+					)
+					if (requiredSections.length > 0 && missingSections.length > 0) {
+						for (const sibling of calls) {
+							if (sibling.id === completionCall.id) {
+								continue
+							}
+							messages.push({
+								role: "tool",
+								tool_call_id: sibling.id,
+								name: sibling.name,
+								content: `[System: not executed — attempt_completion was deferred because '${artifactStatus.relativePath}' is missing required section(s): ${missingSections.join(", ")}; re-issue this call if still needed.]`,
+							})
+						}
+						messages.push({
+							role: "tool",
+							tool_call_id: completionCall.id,
+							name: "attempt_completion",
+							content: `[System: attempt_completion was NOT accepted. '${artifactStatus.relativePath}' exists and has citations, but is missing required section(s): ${missingSections.join(", ")}. This document must be a scoped, actionable proposal, not a general survey — your NEXT tool call must be edit_file on '${artifactStatus.relativePath}' to add each missing section with real, specific content (not a placeholder heading).]`,
+						})
+						this.logger.warn("[loop] attempt_completion deferred", {
+							iteration,
+							reason: "missing required artifact sections",
+							missingSections,
 						})
 						continue
 					}
