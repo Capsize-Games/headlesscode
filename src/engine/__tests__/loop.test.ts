@@ -200,6 +200,7 @@ async function makeSession(options: {
 	sessionId?: string
 	requireExplicitCompletion?: boolean
 	verifyBeforeCompletion?: boolean
+	requireArtifactBeforeCompletion?: boolean
 }) {
 	const session = new HeadlessSession({
 		workspaceRoot: options.workspaceRoot,
@@ -214,6 +215,7 @@ async function makeSession(options: {
 		reasoningEffort: options.reasoningEffort,
 		requireExplicitCompletion: options.requireExplicitCompletion,
 		verifyBeforeCompletion: options.verifyBeforeCompletion,
+		requireArtifactBeforeCompletion: options.requireArtifactBeforeCompletion,
 		// Checkpoints are default-on and would otherwise write real shadow-git
 		// commits to ~/.headlesscode/checkpoints on every test run; this suite
 		// isn't testing checkpoints (except the one that is), so keep tests
@@ -680,6 +682,71 @@ async function testVerifyBeforeCompletionRefusesAfterFailedEdit(): Promise<void>
 			(m) => m.role === "tool" && (m.content ?? "").includes("was NOT accepted"),
 		)
 		assert.ok(nudge, "expected a nudge telling the model its last edit_file call failed")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// Issue #143: verified live 2026-08-21 (twice, word-for-word identical
+// both times) — a session claimed "I have completed the task... and
+// implemented the identified modification" having called only
+// list_files/read_file/update_todo_list/a failed ask_followup_question.
+// No execute_command, write_to_file, or edit_file call ever happened.
+// requireArtifactBeforeCompletion must refuse that, then accept once a
+// real artifact-producing call actually occurs — even a FAILED one (an
+// attempt still proves the session tried; lastWriteToolFailed/
+// lastExecuteCommandFailed above separately catch a failed attempt).
+async function testRequireArtifactBeforeCompletionRefusesWithNoRealToolCall(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-artifact-"))
+	try {
+		const client = new FakeLlmClient([
+			() => toolCall("list_files", { path: "." }),
+			() => toolCall("attempt_completion", { result: "I have implemented the fix." }),
+			() => toolCall("execute_command", { command: "true" }),
+			() => toolCall("attempt_completion", { result: "Done for real." }),
+		])
+		const session = await makeSession({
+			task: "fix something",
+			client,
+			workspaceRoot: ws,
+			requireArtifactBeforeCompletion: true,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "Done for real.")
+		assert.equal(client.requests.length, 4, "the false completion must not end the session early")
+		const nudge = session.state.messages.find(
+			(m) => m.role === "tool" && (m.content ?? "").includes("was NOT accepted"),
+		)
+		assert.ok(nudge, "expected a nudge telling the model it has not made any real change yet")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testRequireArtifactBeforeCompletionAcceptsAfterFailedAttempt(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-artifact2-"))
+	try {
+		const client = new FakeLlmClient([
+			() => toolCall("execute_command", { command: "exit 1" }),
+			() => toolCall("attempt_completion", { result: "Done, I tried the command." }),
+		])
+		const session = await makeSession({
+			task: "run something",
+			client,
+			workspaceRoot: ws,
+			requireArtifactBeforeCompletion: true,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "Done, I tried the command.")
+		assert.equal(
+			client.requests.length,
+			2,
+			"a failed-but-real attempt already satisfies requireArtifactBeforeCompletion; only verifyBeforeCompletion (a separate flag, off here) would still refuse",
+		)
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -2626,6 +2693,14 @@ const tests: Array<[string, () => Promise<void>]> = [
 	[
 		"verifyBeforeCompletion: attempt_completion is refused when the last edit_file/write_to_file call failed (#round-4-demo)",
 		testVerifyBeforeCompletionRefusesAfterFailedEdit,
+	],
+	[
+		"requireArtifactBeforeCompletion: refuses a completion claim with zero execute_command/write_to_file/edit_file calls (#143)",
+		testRequireArtifactBeforeCompletionRefusesWithNoRealToolCall,
+	],
+	[
+		"requireArtifactBeforeCompletion: accepts once a real (even failed) artifact-producing call has happened",
+		testRequireArtifactBeforeCompletionAcceptsAfterFailedAttempt,
 	],
 	[
 		"verifyBeforeCompletion: refuses every fabricated completion in a session, not just the first",

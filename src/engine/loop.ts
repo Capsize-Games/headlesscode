@@ -819,6 +819,30 @@ export interface HeadlessSessionConfig {
 	 */
 	verifyBeforeCompletion?: boolean
 	/**
+	 * Refuse attempt_completion when this session has never once called
+	 * execute_command, write_to_file, or edit_file — i.e. it has produced
+	 * no real, verifiable artifact or side effect. Issue #143: verified
+	 * live 2026-08-21 (twice, word-for-word identical both times) against
+	 * Qwen3-14B running the multi-agent-orchestrator-headless mode — a
+	 * session claimed to have "implemented the identified modification"
+	 * having called only list_files, read_file, update_todo_list, and a
+	 * failed ask_followup_question. No file was touched, no command was
+	 * run, no GitHub issue was filed.
+	 *
+	 * NOT folded into verifyBeforeCompletion itself: that flag is set
+	 * uniformly by useLocalBackend for every local-backend mode, including
+	 * deepseek-reviewer and qa-agent — read-only modes whose CORRECT,
+	 * non-fabricated completion is very often "I read the files, formed a
+	 * judgment, verdict: clean" with zero write/execute calls. Applying
+	 * this check there would force spurious command execution or wrongly
+	 * refuse valid clean verdicts. This is deliberately a separate flag the
+	 * caller opts into per-mode (cli.ts sets it for `code` and
+	 * `multi-agent-orchestrator-headless`, not for read-only modes) rather
+	 * than something loop.ts infers from the tool catalog or task text.
+	 * Default false.
+	 */
+	requireArtifactBeforeCompletion?: boolean
+	/**
 	 * Refuse `write_to_file` (whole-file overwrite) against a file that
 	 * already has substantial content, nudging the model toward `edit_file`/
 	 * `search_replace` instead. Verified live 2026-08-20 against both
@@ -1016,6 +1040,8 @@ export interface ResolvedSessionConfig {
 	patchLocalToolSchemas: boolean
 	/** See HeadlessSessionConfig.verifyBeforeCompletion (default false). */
 	verifyBeforeCompletion: boolean
+	/** See HeadlessSessionConfig.requireArtifactBeforeCompletion (default false). */
+	requireArtifactBeforeCompletion: boolean
 	/** See HeadlessSessionConfig.guardLargeOverwrites (default false). */
 	guardLargeOverwrites: boolean
 	/**
@@ -1313,6 +1339,7 @@ export class HeadlessSession {
 			requireExplicitCompletion: config.requireExplicitCompletion ?? false,
 			patchLocalToolSchemas: config.patchLocalToolSchemas ?? false,
 			verifyBeforeCompletion: config.verifyBeforeCompletion ?? false,
+			requireArtifactBeforeCompletion: config.requireArtifactBeforeCompletion ?? false,
 			guardLargeOverwrites: config.guardLargeOverwrites ?? false,
 			// Deliberately left undefined when the caller didn't configure it:
 			// the live OpenRouter models-endpoint lookup in maybeCondenseHistory
@@ -2806,6 +2833,13 @@ export class HeadlessSession {
 		// write_to_file — see the doc comment where it's set for why this
 		// exists as a separate flag.
 		let lastWriteToolFailed = false
+		// See HeadlessSessionConfig.requireArtifactBeforeCompletion's doc
+		// comment (issue #143). Set true the first time this session calls
+		// execute_command, write_to_file, or edit_file — regardless of
+		// whether that call succeeded (an attempt still proves the session
+		// tried to produce a real effect; lastExecuteCommandFailed/
+		// lastWriteToolFailed above separately catch a FAILED attempt).
+		let hasCalledArtifactTool = false
 		// Concrete command + truncated error output for the failure above,
 		// so the attempt_completion rejection below can restate WHAT failed
 		// instead of pointing at it abstractly — by the time a model reaches
@@ -3260,6 +3294,37 @@ export class HeadlessSession {
 					continue
 				}
 
+				// requireArtifactBeforeCompletion guardrail (issue #143) — see
+				// HeadlessSessionConfig.requireArtifactBeforeCompletion's doc
+				// comment for why this is a separate opt-in flag rather than
+				// folded into verifyBeforeCompletion above.
+				if (this.config.requireArtifactBeforeCompletion && !hasCalledArtifactTool) {
+					for (const sibling of calls) {
+						if (sibling.id === completionCall.id) {
+							continue
+						}
+						messages.push({
+							role: "tool",
+							tool_call_id: sibling.id,
+							name: sibling.name,
+							content:
+								"[System: not executed — attempt_completion was deferred because this session has not yet made any real change (no execute_command, write_to_file, or edit_file call); re-issue this call if still needed.]",
+						})
+					}
+					messages.push({
+						role: "tool",
+						tool_call_id: completionCall.id,
+						name: "attempt_completion",
+						content:
+							"[System: attempt_completion was NOT accepted. This task requires producing a real, verifiable artifact or side effect, but this session has not yet called execute_command, write_to_file, or edit_file even once. Take a real action (e.g. run the command, write the file) before calling attempt_completion again — do not describe work as done that you have not actually performed.]",
+					})
+					this.logger.warn("[loop] attempt_completion deferred", {
+						iteration,
+						reason: "no artifact-producing tool call in this session",
+					})
+					continue
+				}
+
 				// Commit-before-finishing guardrail (structural backstop — see
 				// plans/harness-tooling-efficiency.md item 4): in an EDIT-CAPABLE
 				// mode, before accepting completion, check for uncommitted
@@ -3596,6 +3661,13 @@ export class HeadlessSession {
 					throw new Error(`[loop] internal: no execution outcome for '${call.name}'`)
 				}
 				let { resultContent, isError } = outcome
+				if (
+					call.name === "execute_command" ||
+					call.name === "write_to_file" ||
+					call.name === "edit_file"
+				) {
+					hasCalledArtifactTool = true
+				}
 				if (call.name === "execute_command") {
 					lastExecuteCommandFailed = isError
 					if (isError) {

@@ -966,6 +966,23 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// loop.ts's HeadlessSessionConfig.verifyBeforeCompletion doc comment.
 	const verifyBeforeCompletion =
 		useLocalCodeBackend && !envBoolean("HEADLESSCODE_ALLOW_UNVERIFIED_COMPLETION")
+	// Issue #143: unlike verifyBeforeCompletion above, this must NOT apply
+	// to every useLocalCodeBackend mode — deepseek-reviewer/qa-agent are
+	// read-only and their correct completion is often "read the files,
+	// verdict: clean" with zero write/execute calls. Scoped to an explicit
+	// allow-list (default: code + the orchestrator meta-mode, both of
+	// which are expected to actually change something or file something
+	// real), same opt-in pattern as HEADLESSCODE_LOCAL_BACKEND_MODES.
+	const artifactRequiredModes = new Set(
+		(process.env.HEADLESSCODE_REQUIRE_ARTIFACT_MODES ?? "code,multi-agent-orchestrator-headless")
+			.split(",")
+			.map((s) => s.trim())
+			.filter(Boolean),
+	)
+	const requireArtifactBeforeCompletion =
+		useLocalCodeBackend &&
+		artifactRequiredModes.has(options.mode) &&
+		!envBoolean("HEADLESSCODE_ALLOW_UNVERIFIED_COMPLETION")
 	// A local model was observed regenerating an entire existing ~500-line
 	// file from scratch via write_to_file for a one-function-add task
 	// instead of a targeted diff, getting cut off mid-regeneration and
@@ -1110,6 +1127,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		requireExplicitCompletion,
 		patchLocalToolSchemas,
 		verifyBeforeCompletion,
+		requireArtifactBeforeCompletion,
 		guardLargeOverwrites,
 		llmClient: client,
 		logger,
