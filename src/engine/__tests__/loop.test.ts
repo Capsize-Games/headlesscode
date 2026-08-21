@@ -201,6 +201,7 @@ async function makeSession(options: {
 	requireExplicitCompletion?: boolean
 	verifyBeforeCompletion?: boolean
 	requireArtifactBeforeCompletion?: boolean
+	requireArtifactPathPattern?: string
 }) {
 	const session = new HeadlessSession({
 		workspaceRoot: options.workspaceRoot,
@@ -216,6 +217,7 @@ async function makeSession(options: {
 		requireExplicitCompletion: options.requireExplicitCompletion,
 		verifyBeforeCompletion: options.verifyBeforeCompletion,
 		requireArtifactBeforeCompletion: options.requireArtifactBeforeCompletion,
+		requireArtifactPathPattern: options.requireArtifactPathPattern,
 		// Checkpoints are default-on and would otherwise write real shadow-git
 		// commits to ~/.headlesscode/checkpoints on every test run; this suite
 		// isn't testing checkpoints (except the one that is), so keep tests
@@ -746,6 +748,83 @@ async function testRequireArtifactBeforeCompletionAcceptsAfterFailedAttempt(): P
 			client.requests.length,
 			2,
 			"a failed-but-real attempt already satisfies requireArtifactBeforeCompletion; only verifyBeforeCompletion (a separate flag, off here) would still refuse",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// Research-harness primitive (product direction 2026-08-21): a session can
+// call SOME write tool (satisfying requireArtifactBeforeCompletion above)
+// while never producing the ACTUAL expected deliverable. Live-observed: a
+// stage-1 research session kept claiming "analysis complete" with no file
+// ever written to plans/research/. requireArtifactPathPattern checks the
+// REAL filesystem for a specific glob, not tool-call bookkeeping.
+async function testRequireArtifactPathPatternRefusesUntilRealFileExists(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-artifact-path-"))
+	try {
+		const client = new FakeLlmClient([
+			() => toolCall("attempt_completion", { result: "Analysis complete, no changes needed." }),
+			() =>
+				toolCall("write_to_file", {
+					path: "plans/research/finding.md",
+					content: "# A real finding\n\nSome real content.\n",
+				}),
+			() => toolCall("attempt_completion", { result: "Wrote the research doc." }),
+		])
+		const session = await makeSession({
+			task: "research something and write a finding",
+			client,
+			workspaceRoot: ws,
+			requireArtifactPathPattern: "plans/research/*.md",
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "Wrote the research doc.")
+		assert.equal(client.requests.length, 3, "the premature completion must not end the session early")
+		const nudge = session.state.messages.find(
+			(m) => m.role === "tool" && (m.content ?? "").includes("was NOT accepted"),
+		)
+		assert.ok(nudge, "expected a nudge naming the missing file pattern")
+		const realFile = await fs.readFile(path.join(ws, "plans/research/finding.md"), "utf-8")
+		assert.ok(realFile.includes("Some real content."), "the real file must actually exist with real content")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testRequireArtifactPathPatternAcceptsAnEmptyDirWrongFile(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-artifact-path2-"))
+	try {
+		const client = new FakeLlmClient([
+			() =>
+				toolCall("write_to_file", {
+					path: "plans/research/notes.txt",
+					content: "wrong extension, should not satisfy the .md glob",
+				}),
+			() => toolCall("attempt_completion", { result: "Done (wrong file)." }),
+			() =>
+				toolCall("write_to_file", {
+					path: "plans/research/finding.md",
+					content: "# Real finding\n",
+				}),
+			() => toolCall("attempt_completion", { result: "Done for real." }),
+		])
+		const session = await makeSession({
+			task: "research something",
+			client,
+			workspaceRoot: ws,
+			requireArtifactPathPattern: "plans/research/*.md",
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "Done for real.")
+		assert.equal(
+			client.requests.length,
+			4,
+			"a wrong-extension file in the same directory must not satisfy the glob",
 		)
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
@@ -2701,6 +2780,14 @@ const tests: Array<[string, () => Promise<void>]> = [
 	[
 		"requireArtifactBeforeCompletion: accepts once a real (even failed) artifact-producing call has happened",
 		testRequireArtifactBeforeCompletionAcceptsAfterFailedAttempt,
+	],
+	[
+		"requireArtifactPathPattern: refuses completion until a real file matching the glob actually exists on disk",
+		testRequireArtifactPathPatternRefusesUntilRealFileExists,
+	],
+	[
+		"requireArtifactPathPattern: a wrong-extension file in the same directory does not satisfy the glob",
+		testRequireArtifactPathPatternAcceptsAnEmptyDirWrongFile,
 	],
 	[
 		"verifyBeforeCompletion: refuses every fabricated completion in a session, not just the first",

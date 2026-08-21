@@ -53,6 +53,8 @@ interface CliOptions {
 	workspace?: string
 	/** Explicit session id override (set by the dashboard's session-launch endpoint). */
 	sessionId?: string
+	/** See HeadlessSessionConfig.requireArtifactPathPattern (loop.ts) — a research-harness primitive. */
+	requireArtifactPath?: string
 	model?: string
 	maxIterations?: number
 	consecutiveErrorLimit?: number
@@ -437,7 +439,8 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 			case "--workspace":
 			case "--model":
 			case "--log-file":
-			case "--session-id": {
+			case "--session-id":
+			case "--require-artifact-path": {
 				const value = next()
 				if (value === undefined) {
 					return { options, error: `Missing value for ${flag}` }
@@ -463,6 +466,9 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 						break
 					case "--session-id":
 						options.sessionId = value
+						break
+					case "--require-artifact-path":
+						options.requireArtifactPath = value
 						break
 				}
 				break
@@ -1128,6 +1134,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		patchLocalToolSchemas,
 		verifyBeforeCompletion,
 		requireArtifactBeforeCompletion,
+		requireArtifactPathPattern: options.requireArtifactPath,
 		guardLargeOverwrites,
 		llmClient: client,
 		logger,

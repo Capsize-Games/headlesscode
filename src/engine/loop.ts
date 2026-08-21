@@ -606,6 +606,42 @@ function editToolTargetPath(workspaceRoot: string, call: { name: string; args: R
 }
 
 /**
+ * requireArtifactPathPattern's real check (see HeadlessSessionConfig's doc
+ * comment) — a single-directory glob relative to workspaceRoot, e.g.
+ * `"plans/research/*.md"`. Checks the REAL filesystem (not tool-call
+ * bookkeeping): at least one non-empty file in the target directory whose
+ * name matches the glob. Deliberately one directory level only — this
+ * exists to verify one specific expected deliverable, not to implement a
+ * general recursive glob engine.
+ */
+async function hasMatchingArtifactFile(workspaceRoot: string, pattern: string): Promise<boolean> {
+	const lastSlash = pattern.lastIndexOf("/")
+	const dirPart = lastSlash === -1 ? "." : pattern.slice(0, lastSlash)
+	const namePattern = lastSlash === -1 ? pattern : pattern.slice(lastSlash + 1)
+	const dirAbs = path.resolve(workspaceRoot, dirPart)
+	let entries: string[]
+	try {
+		entries = await fsp.readdir(dirAbs)
+	} catch {
+		return false
+	}
+	for (const entry of entries) {
+		if (!path.matchesGlob(entry, namePattern)) {
+			continue
+		}
+		try {
+			const stat = await fsp.stat(path.join(dirAbs, entry))
+			if (stat.isFile() && stat.size > 0) {
+				return true
+			}
+		} catch {
+			// Race with a concurrent delete/rename — treat as not-yet-matched.
+		}
+	}
+	return false
+}
+
+/**
  * Commit-before-finishing guardrail: the corrective note pushed as the
  * attempt_completion tool RESULT (keeping the assistant-with-tool_calls →
  * tool-result adjacency contract) when a worker tries to finish with
@@ -843,6 +879,22 @@ export interface HeadlessSessionConfig {
 	 */
 	requireArtifactBeforeCompletion?: boolean
 	/**
+	 * A "research harness" primitive (product direction 2026-08-21: an
+	 * agent's MODE has both TOOLS and a HARNESS — a structural runtime
+	 * guarantee, not a prompt suggestion). requireArtifactBeforeCompletion
+	 * above only checks "did you call ANY write/execute tool at all" —
+	 * verified live 2026-08-21 that this is too weak: a session can call
+	 * edit_file against some unrelated file (or nothing) while never
+	 * producing the actual deliverable it was tasked with, and still pass
+	 * that check. This is stricter: a single glob pattern (relative to
+	 * workspaceRoot, one directory level — e.g. `"plans/research/*.md"`)
+	 * that must match at least one REAL, non-empty file on disk at
+	 * attempt_completion time, checked directly against the filesystem
+	 * (not tool-call bookkeeping) so it can't be satisfied by a call that
+	 * later failed or targeted the wrong file. Undefined = no check.
+	 */
+	requireArtifactPathPattern?: string
+	/**
 	 * Refuse `write_to_file` (whole-file overwrite) against a file that
 	 * already has substantial content, nudging the model toward `edit_file`/
 	 * `search_replace` instead. Verified live 2026-08-20 against both
@@ -1042,6 +1094,8 @@ export interface ResolvedSessionConfig {
 	verifyBeforeCompletion: boolean
 	/** See HeadlessSessionConfig.requireArtifactBeforeCompletion (default false). */
 	requireArtifactBeforeCompletion: boolean
+	/** See HeadlessSessionConfig.requireArtifactPathPattern (default undefined = no check). */
+	requireArtifactPathPattern?: string
 	/** See HeadlessSessionConfig.guardLargeOverwrites (default false). */
 	guardLargeOverwrites: boolean
 	/**
@@ -1340,6 +1394,7 @@ export class HeadlessSession {
 			patchLocalToolSchemas: config.patchLocalToolSchemas ?? false,
 			verifyBeforeCompletion: config.verifyBeforeCompletion ?? false,
 			requireArtifactBeforeCompletion: config.requireArtifactBeforeCompletion ?? false,
+			requireArtifactPathPattern: config.requireArtifactPathPattern,
 			guardLargeOverwrites: config.guardLargeOverwrites ?? false,
 			// Deliberately left undefined when the caller didn't configure it:
 			// the live OpenRouter models-endpoint lookup in maybeCondenseHistory
@@ -3321,6 +3376,41 @@ export class HeadlessSession {
 					this.logger.warn("[loop] attempt_completion deferred", {
 						iteration,
 						reason: "no artifact-producing tool call in this session",
+					})
+					continue
+				}
+
+				// requireArtifactPathPattern guardrail (research-harness
+				// primitive) — see HeadlessSessionConfig's doc comment. Checks
+				// the real filesystem, not tool-call bookkeeping, so a session
+				// that wrote SOMETHING but not the actual expected deliverable
+				// still gets refused.
+				if (
+					this.config.requireArtifactPathPattern !== undefined &&
+					!(await hasMatchingArtifactFile(this.config.workspaceRoot, this.config.requireArtifactPathPattern))
+				) {
+					for (const sibling of calls) {
+						if (sibling.id === completionCall.id) {
+							continue
+						}
+						messages.push({
+							role: "tool",
+							tool_call_id: sibling.id,
+							name: sibling.name,
+							content:
+								`[System: not executed — attempt_completion was deferred because no file matching '${this.config.requireArtifactPathPattern}' exists yet; re-issue this call if still needed.]`,
+						})
+					}
+					messages.push({
+						role: "tool",
+						tool_call_id: completionCall.id,
+						name: "attempt_completion",
+						content:
+							`[System: attempt_completion was NOT accepted. This task requires producing a real file matching '${this.config.requireArtifactPathPattern}', and no such file exists on disk yet. Use write_to_file to actually create it with real content before calling attempt_completion again — analysis alone does not satisfy this task.]`,
+					})
+					this.logger.warn("[loop] attempt_completion deferred", {
+						iteration,
+						reason: "no file matching requireArtifactPathPattern",
 					})
 					continue
 				}
