@@ -786,6 +786,56 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	const workspaceRoot = path.resolve(options.workspace ?? process.env.HEADLESSCODE_WORKSPACE_ROOT ?? process.cwd())
 	const logger = new Logger({ level: "info", filePath: options.logFile })
 
+	// Silent-death observability (issue #150): live-verified 2026-08-21
+	// (twice, across two different models) that this process can disappear
+	// entirely mid-run — no exit code, no error log, no trace, not even the
+	// wrapping shell's own `echo "exited with code $?"`. Confirmed via
+	// `grep -rn` across this file and loop.ts before this fix: zero
+	// process-level handlers existed for any of these events. Logger.error/
+	// warn write via fs.appendFileSync (synchronous — see logger.ts), so
+	// these are safe to call immediately before process.exit without an
+	// async flush race. This does NOT catch SIGKILL (uncatchable by
+	// definition — the suspected OOM-kill case in #150 may still be
+	// SIGKILL, not SIGTERM) or a hard crash inside a native addon, but it
+	// closes every JS-level silent-exit path: an uncaught throw, a rejected
+	// promise nobody awaited, or a graceful termination request.
+	process.on("uncaughtException", (err) => {
+		logger.error("[cli] uncaughtException — process terminating", {
+			message: err instanceof Error ? err.message : String(err),
+			stack: err instanceof Error ? err.stack : undefined,
+		})
+		process.exit(3)
+	})
+	process.on("unhandledRejection", (reason) => {
+		logger.error("[cli] unhandledRejection — process terminating", {
+			reason:
+				reason instanceof Error
+					? (reason.stack ?? reason.message)
+					: (() => {
+							try {
+								return JSON.stringify(reason)
+							} catch {
+								return String(reason)
+							}
+						})(),
+		})
+		process.exit(3)
+	})
+	process.on("SIGTERM", () => {
+		logger.warn("[cli] SIGTERM received — process terminating", {
+			rssMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+		})
+		process.exit(143)
+	})
+	// Cheap postmortem diagnostic for the #150 OOM hypothesis (unconfirmed —
+	// dmesg showed no OOM-killer entries when checked live, but access may
+	// have been permission-limited): RSS at session start costs one log
+	// line and needs no periodic timer, unlike full memory-pressure polling.
+	logger.info("[cli] session process started", {
+		pid: process.pid,
+		rssMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+	})
+
 	// ── dry-run: no API key required ──────────────────────────────────────────
 	if (options.dryRun) {
 		try {

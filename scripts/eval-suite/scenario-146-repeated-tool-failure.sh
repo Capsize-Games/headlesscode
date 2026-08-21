@@ -18,10 +18,20 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAMP="$(date +%Y%m%d-%H%M%S)"
-WS="$REPO_ROOT/.headlesscode/scratch/eval-suite/146-repeated-failure-$STAMP"
+# The fixture workspace is git-init'd (a separate, standalone repo the
+# session runs against) — it MUST live OUTSIDE this repo's own tree, or
+# it becomes a nested git repo that this repo's own checkpoint system
+# then detects and refuses to work with (live-verified 2026-08-21: this
+# happened for real, disabling checkpoints — "non-fatal" but real
+# pollution — for every subsequent session in THIS repo until the old
+# fixture dirs were manually removed). ${TMPDIR:-/tmp} is the right home
+# for it — this is a throwaway fixture repo, not a headlesscode session's
+# own scratch output (the "never write to /tmp" rule is about a
+# DISPATCHED session's own writes relative to ITS --workspace, not where
+# a wrapper script creates a fresh, separate --workspace to point one at).
+WS="$(mktemp -d "${TMPDIR:-/tmp}/headlesscode-eval-146-XXXXXX")"
 LOG="$REPO_ROOT/.headlesscode/scratch/eval-suite/146-repeated-failure-$STAMP.log"
 
-mkdir -p "$WS"
 cd "$WS"
 git init -q
 git config user.email "eval@local"
@@ -46,7 +56,8 @@ EOF
 git add -A
 git commit -q -m "initial fixture"
 
-cat > "$WS/../146-task-$STAMP.md" <<'EOF'
+TASK_FILE="${TMPDIR:-/tmp}/headlesscode-eval-146-task-$STAMP.md"
+cat > "$TASK_FILE" <<'EOF'
 ## Rules
 - Unattended: never use ask_followup_question.
 - This is a whitespace-ONLY fix. Do not change anything else about the file.
@@ -60,7 +71,6 @@ line's indentation to match the surrounding block (3 leading tabs before
 do not change any other line. When done, call attempt_completion.
 EOF
 
-TASK_FILE="$WS/../146-task-$STAMP.md"
 echo "Workspace: $WS"
 echo "Task file: $TASK_FILE"
 echo "Log file:  $LOG"
