@@ -615,19 +615,27 @@ function editToolTargetPath(workspaceRoot: string, call: { name: string; args: R
  * uncommitted.
  */
 const COMMIT_NUDGE_CONTENT =
-	"[System: attempt_completion not accepted — the workspace has uncommitted tracked-file changes. Real, working changes must be committed via `git add` + `git commit` BEFORE finishing: one commit per logical change, with a descriptive message matching this repo's normal style (run `git log --oneline` for examples). Commit your changes, then call attempt_completion again. If you genuinely have a reason to leave changes uncommitted (e.g. a read-only investigation), call attempt_completion again as-is and it will be accepted.]"
+	"[System: attempt_completion not accepted — the workspace has uncommitted changes: either an existing tracked file was modified, or a new file YOU wrote this session is still untracked. Real, working changes must be committed via `git add` + `git commit` BEFORE finishing: one commit per logical change, with a descriptive message matching this repo's normal style (run `git log --oneline` for examples) — `git add` a brand-new file too, it does not commit itself. Commit your changes, then call attempt_completion again. If you genuinely have a reason to leave changes uncommitted (e.g. a read-only investigation), call attempt_completion again as-is and it will be accepted.]"
 
 const execFileP = promisify(execFile)
 
 /**
  * True when the workspace's git repo has uncommitted TRACKED-file changes
- * (modified/staged/deleted/renamed — NOT `??` untracked files, which may be
- * deliberate scratch work the model shouldn't be forced to commit). False
- * when git fails (no repo) or the status is clean. The commit-before-
- * finishing guardrail's structural backstop — independent of whether the
- * prompt instruction alone is followed.
+ * (modified/staged/deleted/renamed — NOT `??` untracked files in general,
+ * which may be pre-existing scratch work the model shouldn't be forced to
+ * commit) OR an untracked file that THIS session itself wrote via an edit
+ * tool (*sessionWrittenPaths* — see the field doc on HeadlessSession for
+ * why the general untracked-file exemption has a blind spot for a
+ * session's own new-file deliverables, e.g. "write tests for X" almost
+ * always produces a brand-new, still-untracked file). False when git fails
+ * (no repo) or the status is clean. The commit-before-finishing
+ * guardrail's structural backstop — independent of whether the prompt
+ * instruction alone is followed.
  */
-async function hasUncommittedTrackedChanges(workspaceRoot: string): Promise<boolean> {
+async function hasUncommittedTrackedChanges(
+	workspaceRoot: string,
+	sessionWrittenPaths: ReadonlySet<string>,
+): Promise<boolean> {
 	try {
 		const { stdout } = await execFileP("git", ["status", "--short"], {
 			cwd: workspaceRoot,
@@ -640,6 +648,16 @@ async function hasUncommittedTrackedChanges(workspaceRoot: string): Promise<bool
 			// `?? path` = untracked only; every other status ( M, M , A, D,
 			// R, AM, …) is a tracked-file change.
 			if (!line.startsWith("??")) {
+				return true
+			}
+			const untrackedPath = line.slice(3).trim()
+			let resolved: string
+			try {
+				resolved = path.resolve(workspaceRoot, untrackedPath)
+			} catch {
+				continue
+			}
+			if (sessionWrittenPaths.has(resolved)) {
 				return true
 			}
 		}
@@ -1233,6 +1251,19 @@ export class HeadlessSession {
 	 * that result. null when no switch is awaiting its marker.
 	 */
 	private pendingModeSwitchMarker: string | null = null
+	/**
+	 * Commit-before-finishing guardrail, new-file blind spot fix: every path
+	 * this session itself successfully wrote to via an edit tool
+	 * (write_to_file/apply_diff/search_replace/edit_file — see
+	 * editToolTargetPath), accumulated across the WHOLE session, not just one
+	 * turn's batch. hasUncommittedTrackedChanges()'s own `git status --short`
+	 * check deliberately exempts `??` untracked files (they may be
+	 * pre-existing scratch work unrelated to this session) — but a brand-new
+	 * file THIS session just wrote is never "someone else's scratch work",
+	 * so it must still force the commit nudge even though it shows up as
+	 * `??`. See attempt_completion's call site for how this is consulted.
+	 */
+	private sessionWrittenPaths = new Set<string>()
 	/**
 	 * (S2) Ordering guard for fire-and-forget auxiliary writes: a per-session
 	 * promise chain so a later-scheduled write never overtakes an earlier one
@@ -3204,7 +3235,10 @@ export class HeadlessSession {
 				if (
 					!completionNudged &&
 					modeHasEditGroup(this.config.mode, this.customModes) &&
-					(await hasUncommittedTrackedChanges(this.config.workspaceRoot))
+					(await hasUncommittedTrackedChanges(
+						this.config.workspaceRoot,
+						this.sessionWrittenPaths,
+					))
 				) {
 					completionNudged = true
 					// Siblings of a deferred attempt_completion never ran — push a
@@ -3539,6 +3573,7 @@ export class HeadlessSession {
 				// path can be diagnosed (see above).
 				if (!isError && targetPath !== undefined) {
 					batchEditedPaths.set(targetPath, call.name)
+					this.sessionWrittenPaths.add(targetPath)
 				}
 
 				// switch_mode (plans/switch-mode-headless.md): append the approved

@@ -2187,11 +2187,79 @@ async function testCompletionNudgedOnUncommittedChanges(): Promise<void> {
 		assert.equal(completionMsgs.length, 1, "only the deferred completion produced a tool message")
 		assert.match(
 			completionMsgs[0]?.content ?? "",
-			/uncommitted tracked-file changes/,
+			/attempt_completion not accepted — the workspace has uncommitted/,
 			"the corrective nudge names the situation",
 		)
 		assert.match(completionMsgs[0]?.content ?? "", /git commit/, "it points at git commit")
 		assert.match(completionMsgs[0]?.content ?? "", /attempt_completion again/, "it is a retry nudge, not a hard block")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+/**
+ * Regression test: hasUncommittedTrackedChanges()'s blanket `??` exemption
+ * used to let a session finish with a brand-new, never-`git add`ed file it
+ * just wrote — e.g. "write tests for X" almost always produces a new file,
+ * which shows up as untracked, not a tracked-file modification. Found live
+ * dogfooding UwUChat's code mode: a session reported "success" after
+ * writing a new test file it never committed. sessionWrittenPaths closes
+ * this — an untracked path THIS session wrote via an edit tool still nudges.
+ */
+async function testCompletionNudgedOnNewUncommittedFile(): Promise<void> {
+	const ws = await mkGitWorkspace()
+	if (ws === null) {
+		console.log("  skip commit-guard test (git not installed)")
+		return
+	}
+	try {
+		// write_to_file creates a brand-new file — untracked, not a
+		// modification to the repo's existing tracked notes.txt.
+		const client = new FakeLlmClient([
+			() => toolCall("write_to_file", { path: "new_feature.txt", content: "brand new\n" }),
+			() => toolCall("attempt_completion", { result: "wrote the new file" }),
+			() => toolCall("attempt_completion", { result: "wrote the new file (retried)" }),
+		])
+		const session = await makeSession({ task: "add new_feature.txt", client, workspaceRoot: ws })
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "wrote the new file (retried)", "the retried completion is the one accepted")
+		const completionMsgs = session.state.messages.filter((m) => m.role === "tool" && m.name === "attempt_completion")
+		assert.equal(completionMsgs.length, 1, "only the deferred completion produced a tool message")
+		assert.match(
+			completionMsgs[0]?.content ?? "",
+			/attempt_completion not accepted — the workspace has uncommitted/,
+			"a new file the session itself wrote must still nudge, despite being untracked",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+/**
+ * A pre-existing untracked file the session never touched (genuine scratch
+ * work left by something else, or simply not part of this task) must still
+ * be exempted — only files THIS session wrote via an edit tool count.
+ */
+async function testNoNudgeForPreexistingUntrackedFile(): Promise<void> {
+	const ws = await mkGitWorkspace()
+	if (ws === null) {
+		console.log("  skip commit-guard test (git not installed)")
+		return
+	}
+	try {
+		await fs.writeFile(path.join(ws, "scratch.txt"), "not part of this task\n", "utf-8")
+		const client = new FakeLlmClient([
+			() => toolCall("attempt_completion", { result: "nothing to do" }),
+		])
+		const session = await makeSession({ task: "do nothing", client, workspaceRoot: ws })
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(result.iterations, 1, "a pre-existing untracked file the session never wrote must not nudge")
+		const nudges = session.state.messages.filter((m) => (m.content ?? "").includes("attempt_completion not accepted — the workspace has uncommitted"))
+		assert.equal(nudges.length, 0, "pre-existing scratch files are still exempt")
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -2214,7 +2282,7 @@ async function testCompletionAcceptedWhenClean(): Promise<void> {
 		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
 		assert.equal(result.result, "nothing to do")
 		assert.equal(result.iterations, 1, "no nudge, no extra iteration")
-		const nudges = session.state.messages.filter((m) => (m.content ?? "").includes("uncommitted tracked-file changes"))
+		const nudges = session.state.messages.filter((m) => (m.content ?? "").includes("attempt_completion not accepted — the workspace has uncommitted"))
 		assert.equal(nudges.length, 0, "a clean tree must not be nudged")
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
@@ -2231,12 +2299,16 @@ async function testCompletionRefusedWhenBundledWithSiblings(): Promise<void> {
 		// One turn: attempt_completion bundled alongside a real write. The
 		// write must execute for real; the completion must be refused so the
 		// model is forced to check the write's actual result before finishing.
+		// Commits hello.txt before the final completion — sessionWrittenPaths
+		// would otherwise ALSO defer the second attempt_completion via the
+		// (separate) commit guard, which isn't what this test is about.
 		const client = new FakeLlmClient([
 			() =>
 				toolCallBatch([
 					{ name: "write_to_file", args: { path: "hello.txt", content: "hello" } },
 					{ name: "attempt_completion", args: { result: "done (premature)" } },
 				]),
+			() => toolCall("execute_command", { command: "git add hello.txt && git commit -q -m \"add hello\"" }),
 			() => toolCall("attempt_completion", { result: "done for real" }),
 		])
 		const session = await makeSession({ task: "write then finish", client, workspaceRoot: ws })
@@ -2284,7 +2356,7 @@ async function testCompletionAcceptedAfterCommit(): Promise<void> {
 
 		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
 		assert.equal(result.result, "committed and done")
-		const nudges = session.state.messages.filter((m) => (m.content ?? "").includes("uncommitted tracked-file changes"))
+		const nudges = session.state.messages.filter((m) => (m.content ?? "").includes("attempt_completion not accepted — the workspace has uncommitted"))
 		assert.equal(nudges.length, 0, "committing before finishing means no nudge")
 		// The commit actually landed.
 		const { execFileSync } = await import("node:child_process")
@@ -2313,7 +2385,7 @@ async function testNoNudgeInReadOnlyMode(): Promise<void> {
 
 		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
 		assert.equal(result.iterations, 1, "read-only mode accepts completion immediately")
-		const nudges = session.state.messages.filter((m) => (m.content ?? "").includes("uncommitted tracked-file changes"))
+		const nudges = session.state.messages.filter((m) => (m.content ?? "").includes("attempt_completion not accepted — the workspace has uncommitted"))
 		assert.equal(nudges.length, 0, "read-only modes never get the commit nudge")
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
@@ -2490,6 +2562,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["parallel reads: (S3) three read_file calls feed tool results back in tool_calls order", testParallelReadOnlyCallsFeedResultsInOrder],
 	["same-file batch: a failure on a DIFFERENT file gets no diagnosis", testDifferentFileBatchFailureGetsNoDiagnosis],
 	["commit guard: attempt_completion with uncommitted tracked changes gets one nudge, then is accepted", testCompletionNudgedOnUncommittedChanges],
+	["commit guard: a brand-new file the session wrote also nudges, even though it's untracked", testCompletionNudgedOnNewUncommittedFile],
+	["commit guard: a pre-existing untracked file the session never touched is still exempt", testNoNudgeForPreexistingUntrackedFile],
 	["commit guard: a clean tree is never nudged", testCompletionAcceptedWhenClean],
 	["attempt_completion bundled with other tool calls is refused; the siblings execute for real", testCompletionRefusedWhenBundledWithSiblings],
 	["commit guard: committing before finishing means no nudge", testCompletionAcceptedAfterCommit],
