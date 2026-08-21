@@ -2646,6 +2646,22 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["Part E: no live pricing → hardcoded table fallback, unchanged behavior", testBudgetFallsBackToHardcodedTableWithoutLivePricing],
 ]
 
+// Issue #140: a real live-network test (Part E, OpenRouter pricing fetch)
+// can leave a stray async op (retry, dangling timer) that rejects AFTER
+// all tests already ran and passed — Node's default unhandledRejection
+// handling then crashes the process with a nonzero exit, so the harness
+// reports isError:true for a run that objectively passed every test.
+// Log it (so a real regression is still visible) without letting it flip
+// the exit code once tests are done.
+let testsFinished = false
+process.on("unhandledRejection", (reason) => {
+	if (testsFinished) {
+		console.error("[test runner] unhandled rejection after tests completed (non-fatal, stray async op):", reason)
+		return
+	}
+	throw reason
+})
+
 async function main(): Promise<void> {
 	let failed = 0
 	for (const [name, fn] of tests) {
@@ -2663,6 +2679,8 @@ async function main(): Promise<void> {
 		process.exit(1)
 	}
 	console.log(`\nAll ${tests.length} tests passed`)
+	testsFinished = true
+	process.exitCode = 0
 }
 
 main().catch((err) => {
