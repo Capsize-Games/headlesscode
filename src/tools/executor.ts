@@ -1620,16 +1620,16 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 				finish(err(`execute_command: spawn error for '${command}': ${errorMessage(error)}`))
 			})
 			child.on("close", (code, signal) => {
-		clearTimeout(timer)
-		backgroundCommands.delete(child)
-		const combined = [stdout, stderr].filter(Boolean).join("\n")
-		// Log debug information
-		if (process.env.HEADLESSCODE_DEBUG) {
-			console.error(`[execute_command debug] Command: ${command}, Code: ${code}, Signal: ${signal}, stdout: ${stdout.slice(0, 200)}, stderr: ${stderr.slice(0, 200)}`);
-		}
-		if (signal === "SIGKILL") {
+				clearTimeout(timer)
+				backgroundCommands.delete(child)
+				const combined = [stdout, stderr].filter(Boolean).join("\n")
+				// Log debug information
+				if (process.env.HEADLESSCODE_DEBUG) {
+					console.error(`[execute_command debug] Command: ${command}, Code: ${code}, Signal: ${signal}, stdout: ${stdout.slice(0, 200)}, stderr: ${stderr.slice(0, 200)}`)
+				}
+				if (signal === "SIGKILL") {
 					// Defensive path only: a timeout never sends SIGKILL anymore,
-					// so this is reachable solely when something external killed
+// so this is reachable solely when something external killed
 					// the process (the model's own `pkill` cleanup command, or
 					// ToolExecutor.dispose during session teardown).
 					finish(err(`execute_command: command '${command}' was killed by signal ${signal}.\n${combined}`))
