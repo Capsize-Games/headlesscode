@@ -874,6 +874,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// OpenRouterClient regardless of these env vars.
 	const codeModeBackend = process.env.HEADLESSCODE_CODE_MODE_BACKEND ?? "openrouter"
 	const useLocalCodeBackend = options.mode === "code" && codeModeBackend === "ollama"
+
+	// Issue #139: this was a completely silent fallback — a session with
+	// the local backend requested via env var but a non-"code" mode would
+	// just quietly run on cloud OpenRouter with no indication anything
+	// was off. Verified live 2026-08-21: an `--mode issue-filer` session
+	// ran on cloud DeepSeek with this env var set, with zero warning.
+	if (codeModeBackend === "ollama" && options.mode !== "code") {
+		process.stderr.write(
+			`[headlesscode] NOTE: HEADLESSCODE_CODE_MODE_BACKEND=ollama is set, but --mode is "${options.mode}", not "code" — the local backend only applies to code mode today (see issue #139). This session will use the cloud OpenRouter model instead.\n`,
+		)
+	}
 	// When the local backend is selected, every downstream consumer of
 	// `model` (session-start logs, event-feed session_start, cost/usage
 	// records, and — critically — the `request.model` sent on each
