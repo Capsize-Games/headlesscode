@@ -2802,6 +2802,10 @@ export class HeadlessSession {
 		// checked (only when the config flag is on) right before honoring
 		// attempt_completion.
 		let lastExecuteCommandFailed = false
+		// Same as lastExecuteCommandFailed above, but for edit_file /
+		// write_to_file — see the doc comment where it's set for why this
+		// exists as a separate flag.
+		let lastWriteToolFailed = false
 		// Concrete command + truncated error output for the failure above,
 		// so the attempt_completion rejection below can restate WHAT failed
 		// instead of pointing at it abstractly — by the time a model reaches
@@ -2811,6 +2815,7 @@ export class HeadlessSession {
 		// produced a stuck loop of a repeated, unmodified attempt_completion
 		// call alternating with genuinely empty replies).
 		let lastExecuteCommandSummary: string | undefined
+		let lastWriteToolSummary: string | undefined
 		// Blind tree-walking guardrail (P1.6): count consecutive all-read-only
 		// iterations; when the streak crosses the threshold, inject one soft
 		// nudge per streak (codebase_search-specific when indexed, progress-
@@ -3213,7 +3218,15 @@ export class HeadlessSession {
 					!messages.some(
 						(m) => m.role === "tool" && m.name === "execute_command" && /\d/.test(String(m.content ?? "")),
 					)
-				if (this.config.verifyBeforeCompletion && (lastExecuteCommandFailed || unsupportedMeasurementClaim)) {
+				if (
+					this.config.verifyBeforeCompletion &&
+					(lastExecuteCommandFailed || lastWriteToolFailed || unsupportedMeasurementClaim)
+				) {
+					const reason = unsupportedMeasurementClaim
+						? "unsupported measurement claim"
+						: lastExecuteCommandFailed
+							? "last execute_command failed"
+							: "last edit_file/write_to_file failed"
 					for (const sibling of calls) {
 						if (sibling.id === completionCall.id) {
 							continue
@@ -3224,7 +3237,9 @@ export class HeadlessSession {
 							name: sibling.name,
 							content: unsupportedMeasurementClaim
 								? "[System: not executed — attempt_completion was deferred because it makes a specific measurement/benchmark claim with no execute_command output in this session's history containing any supporting number; re-issue this call if still needed.]"
-								: "[System: not executed — attempt_completion was deferred because the last command you ran ended in an error; re-issue this call if still needed.]",
+								: lastExecuteCommandFailed
+									? "[System: not executed — attempt_completion was deferred because the last command you ran ended in an error; re-issue this call if still needed.]"
+									: "[System: not executed — attempt_completion was deferred because your last edit_file/write_to_file call failed; re-issue this call if still needed.]",
 						})
 					}
 					messages.push({
@@ -3233,14 +3248,15 @@ export class HeadlessSession {
 						name: "attempt_completion",
 						content: unsupportedMeasurementClaim
 							? "[System: attempt_completion was NOT accepted. Your result claims a specific measurement/benchmark, but no execute_command output anywhere in this session contains a supporting number. Either run the real command that produces this evidence and re-issue attempt_completion, or restate the result without the unsupported claim.]"
-							: "[System: attempt_completion was NOT accepted. The most recent command you ran ended in an error, and you have not run a command since that succeeded:\n" +
-								`${lastExecuteCommandSummary ?? "(command output no longer available)"}\n` +
-								"Fix the issue, re-run the exact command above, and only call attempt_completion again once it actually passes.]",
+							: lastExecuteCommandFailed
+								? "[System: attempt_completion was NOT accepted. The most recent command you ran ended in an error, and you have not run a command since that succeeded:\n" +
+									`${lastExecuteCommandSummary ?? "(command output no longer available)"}\n` +
+									"Fix the issue, re-run the exact command above, and only call attempt_completion again once it actually passes.]"
+								: "[System: attempt_completion was NOT accepted. Your result describes a change as made, but your most recent edit_file/write_to_file call failed and you have not successfully edited anything since:\n" +
+									`${lastWriteToolSummary ?? "(edit output no longer available)"}\n` +
+									"Fix the issue, make the edit succeed, and only call attempt_completion again once it actually applied.]",
 					})
-					this.logger.warn("[loop] attempt_completion deferred", {
-						iteration,
-						reason: unsupportedMeasurementClaim ? "unsupported measurement claim" : "last execute_command failed",
-					})
+					this.logger.warn("[loop] attempt_completion deferred", { iteration, reason })
 					continue
 				}
 
@@ -3591,6 +3607,29 @@ export class HeadlessSession {
 						lastExecuteCommandSummary = `${command}\n${output}`
 					} else {
 						lastExecuteCommandSummary = undefined
+					}
+				}
+				// Issue found live 2026-08-21 (round 4 of the full-cycle demo):
+				// a session's last several real tool calls before
+				// attempt_completion were 4 straight FAILED edit_file calls
+				// (never a successful one), yet it claimed "I've implemented
+				// the optimization" — verifyBeforeCompletion didn't catch it
+				// because lastExecuteCommandFailed only tracks execute_command,
+				// and edit_file/write_to_file failures were invisible to it.
+				// Same shape as the execute_command case above, tracked
+				// separately since a failed edit and a failed command are
+				// different evidence for the rejection message below.
+				if (call.name === "edit_file" || call.name === "write_to_file") {
+					lastWriteToolFailed = isError
+					if (isError) {
+						const target = summarizeToolArg(call.name, call.args) ?? "(unknown target)"
+						const output =
+							typeof resultContent === "string"
+								? resultContent.slice(0, 500)
+								: JSON.stringify(resultContent).slice(0, 500)
+						lastWriteToolSummary = `${call.name} ${target}\n${output}`
+					} else {
+						lastWriteToolSummary = undefined
 					}
 				}
 				const targetPath = editToolTargetPath(this.config.workspaceRoot, call)

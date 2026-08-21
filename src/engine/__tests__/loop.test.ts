@@ -637,6 +637,54 @@ async function testVerifyBeforeCompletionAcceptsAfterSuccessfulCommand(): Promis
 	}
 }
 
+// Live round 4 of the 2026-08-21 full-cycle demo (local Qwen3-14B): a
+// session's last several real tool calls before attempt_completion were 4
+// straight FAILED edit_file calls (bad old_string match) — never a
+// successful one — yet it claimed "I've implemented the optimization."
+// lastExecuteCommandFailed didn't catch it because it only tracks
+// execute_command; edit_file/write_to_file failures were invisible to
+// verifyBeforeCompletion. This mirrors testVerifyBeforeCompletionRefusesAfterFailedCommand
+// but for the write-tool path.
+async function testVerifyBeforeCompletionRefusesAfterFailedEdit(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc-edit-"))
+	try {
+		await fs.writeFile(path.join(ws, "notes.txt"), "hello\n", "utf-8")
+		const client = new FakeLlmClient([
+			() =>
+				toolCall("edit_file", {
+					file_path: "notes.txt",
+					old_string: "this text does not appear in the file",
+					new_string: "replacement",
+				}),
+			() => toolCall("attempt_completion", { result: "Done (but the edit never actually applied)." }),
+			() =>
+				toolCall("edit_file", {
+					file_path: "notes.txt",
+					old_string: "hello",
+					new_string: "goodbye",
+				}),
+			() => toolCall("attempt_completion", { result: "Done for real." }),
+		])
+		const session = await makeSession({
+			task: "update notes.txt",
+			client,
+			workspaceRoot: ws,
+			verifyBeforeCompletion: true,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "Done for real.")
+		assert.equal(client.requests.length, 4, "the false completion must not end the session early")
+		const nudge = session.state.messages.find(
+			(m) => m.role === "tool" && (m.content ?? "").includes("was NOT accepted"),
+		)
+		assert.ok(nudge, "expected a nudge telling the model its last edit_file call failed")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // Qwen2.5-Coder-14B was observed live (2026-08-19) reasoning correctly
 // about a tool call, then writing it as prose instead of using the native
 // tool_calls channel — e.g. a fenced ```json block containing
@@ -2574,6 +2622,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	[
 		"verifyBeforeCompletion: attempt_completion is accepted right away after a successful execute_command",
 		testVerifyBeforeCompletionAcceptsAfterSuccessfulCommand,
+	],
+	[
+		"verifyBeforeCompletion: attempt_completion is refused when the last edit_file/write_to_file call failed (#round-4-demo)",
+		testVerifyBeforeCompletionRefusesAfterFailedEdit,
 	],
 	[
 		"verifyBeforeCompletion: refuses every fabricated completion in a session, not just the first",
