@@ -17,6 +17,7 @@ build/
 # Parallel orchestration worktrees (spawned per-issue, cleaned up by the harness)
 .worktrees/
 
+TASK.md
 # Manual smoke-test output (src/tools/browser/smoke.ts)
 .smoke-artifacts/
 
