@@ -2513,7 +2513,30 @@ async function testVerifyBeforeCompletionRefusesUnsupportedMeasurementClaim(): P
 
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
+import { resolvePerModeEnv } from "../../cli.js";
+
+async function testResolvePerModeEnvFallback(): Promise<void> {
+	// per-mode override wins
+	assert.equal(
+		resolvePerModeEnv("HEADLESSCODE_OLLAMA_URL", "deepseek-reviewer", {
+			HEADLESSCODE_OLLAMA_URL__DEEPSEEK_REVIEWER: "http://192.168.1.170:11500",
+			HEADLESSCODE_OLLAMA_URL: "http://localhost:11435",
+		}),
+		"http://192.168.1.170:11500",
+	)
+	// falls back to the global var when no per-mode override is set
+	assert.equal(
+		resolvePerModeEnv("HEADLESSCODE_OLLAMA_URL", "code", {
+			HEADLESSCODE_OLLAMA_URL: "http://localhost:11435",
+		}),
+		"http://localhost:11435",
+	)
+	// undefined when neither is set
+	assert.equal(resolvePerModeEnv("HEADLESSCODE_OLLAMA_URL", "code", {}), undefined)
+}
+
 const tests: Array<[string, () => Promise<void>]> = [
+	["resolvePerModeEnv: per-mode override wins, falls back to global, undefined when neither set", testResolvePerModeEnvFallback],
 	["reasoning effort: configured value flows onto every request", testReasoningEffortFlowsIntoRequests],
 	["reasoning effort: unset config falls back to the env var", testReasoningEffortEnvFallbackWhenNotConfigured],
 	["reasoning effort: absent by default (endpoint default applies)", testReasoningEffortAbsentByDefault],

@@ -867,22 +867,27 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		env: process.env,
 	})
 
-	// Local dual-model code agent (plans/local-dual-model-code-agent.md, D2):
-	// `code` mode may opt into a local Ollama-compatible backend instead of
-	// OpenRouter. Scoped to `code` mode only — every other mode
-	// (orchestrator, architect, deepseek-reviewer, qa-agent) always resolves
-	// OpenRouterClient regardless of these env vars.
+	// Generalized 2026-08-21 (issue #142) beyond the original `code`-only
+	// scope (plans/local-dual-model-code-agent.md, D2) — real need: two
+	// separate local daemons on two different GPUs (a coder model and a
+	// review model), each needing its own mode -> URL/model mapping.
+	// HEADLESSCODE_LOCAL_BACKEND_MODES defaults to "code" alone, so
+	// nobody's existing setup changes behavior unless they opt in.
 	const codeModeBackend = process.env.HEADLESSCODE_CODE_MODE_BACKEND ?? "openrouter"
-	const useLocalCodeBackend = options.mode === "code" && codeModeBackend === "ollama"
+	const localBackendModes = new Set(
+		(process.env.HEADLESSCODE_LOCAL_BACKEND_MODES ?? "code")
+			.split(",")
+			.map((s) => s.trim())
+			.filter(Boolean),
+	)
+	const useLocalCodeBackend = localBackendModes.has(options.mode) && codeModeBackend === "ollama"
 
-	// Issue #139: this was a completely silent fallback — a session with
-	// the local backend requested via env var but a non-"code" mode would
-	// just quietly run on cloud OpenRouter with no indication anything
-	// was off. Verified live 2026-08-21: an `--mode issue-filer` session
-	// ran on cloud DeepSeek with this env var set, with zero warning.
-	if (codeModeBackend === "ollama" && options.mode !== "code") {
+	// Issue #139 (updated for #142): warn whenever the local backend was
+	// requested via env var but the CURRENT mode isn't in the allow-list
+	// — was hardcoded to "code", now checks the real list.
+	if (codeModeBackend === "ollama" && !localBackendModes.has(options.mode)) {
 		process.stderr.write(
-			`[headlesscode] NOTE: HEADLESSCODE_CODE_MODE_BACKEND=ollama is set, but --mode is "${options.mode}", not "code" — the local backend only applies to code mode today (see issue #139). This session will use the cloud OpenRouter model instead.\n`,
+			`[headlesscode] NOTE: HEADLESSCODE_CODE_MODE_BACKEND=ollama is set, but --mode "${options.mode}" is not in HEADLESSCODE_LOCAL_BACKEND_MODES ("${[...localBackendModes].join(",")}") — this session will use the cloud OpenRouter model instead.\n`,
 		)
 	}
 	// When the local backend is selected, every downstream consumer of
@@ -898,10 +903,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// is recorded or reported (verified live 2026-08-21: session_start
 	// logged the cloud model id while actually running against the
 	// local Ollama daemon).
-	const effectiveModel = useLocalCodeBackend ? (process.env.HEADLESSCODE_CODE_MODE_MODEL ?? model) : model
+	const effectiveModel = useLocalCodeBackend
+		? (resolvePerModeEnv("HEADLESSCODE_CODE_MODE_MODEL", options.mode) ?? model)
+		: model
 	const client: LlmClient = useLocalCodeBackend
 		? new OllamaClient({
 				defaultModel: effectiveModel,
+				// Issue #142: per-mode URL override (e.g. a review daemon on a
+				// different GPU than the code daemon) — falls back to the
+				// existing global HEADLESSCODE_OLLAMA_URL, then OllamaClient's
+				// own DEFAULT_OLLAMA_URL, when neither is set.
+				baseUrl: resolvePerModeEnv("HEADLESSCODE_OLLAMA_URL", options.mode),
 				// Without this, --llm-timeout-ms is silently ignored for the
 				// Ollama backend: OllamaClient has its own independent abort
 				// timer (ollama.ts's DEFAULT_OLLAMA_TIMEOUT_MS), separate
@@ -1155,6 +1167,21 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	}
 	process.stderr.write(`headlesscode: task failed: ${result.error ?? "unknown error"}\n`)
 	return 1
+}
+
+/**
+ * Per-mode env var lookup for issue #142: `HEADLESSCODE_<BASE>__<MODE>`
+ * (mode slug uppercased, "-" -> "_") wins if set, else the plain global
+ * `HEADLESSCODE_<BASE>`, else undefined. Shared by both the per-mode
+ * Ollama URL and model lookups so they resolve identically.
+ */
+export function resolvePerModeEnv(
+	baseName: string,
+	mode: string,
+	env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+	const modeKey = mode.toUpperCase().replace(/-/g, "_")
+	return env[`${baseName}__${modeKey}`] ?? env[baseName]
 }
 
 /** Parse a positive finite number from env (undefined when unset/invalid). */
