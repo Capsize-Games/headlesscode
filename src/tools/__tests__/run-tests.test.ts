@@ -210,17 +210,31 @@ async function testHostileTestPathIsNotExecuted(): Promise<void> {
 			"the literal hostile path was selected and reported verbatim",
 		)
 		// Whatever npx/tsx did with the file, `$()`/backticks must never
-		// EXECUTE: the only legitimate appearance of PWNED in the result is
-		// inside the echoed path itself. An executed `echo PWNED2` would
-		// produce a bare PWNED2 on its own line (or a PWNED file).
-		const afterMarker = direct2.content.split(`src/__tests__/${hostileNoNewline}`).slice(1).join("")
-		assert.doesNotMatch(afterMarker, /PWNED2/, "no executed backtick/`$()` output after the path echo")
+		// EXECUTE. A prior version of this check stripped the literal path
+		// from `direct2.content` and looked for a bare "PWNED2" in what was
+		// left — unreliable (issue #156): Node's own ERR_UNKNOWN_FILE_EXTENSION
+		// error text embeds a SEPARATE, percent-encoded fragment of the
+		// hostile filename (`.ts%60echo%20PWNED2%60`) that no amount of
+		// stripping the literal path string accounts for, since it comes
+		// from Node's internal error formatting, not this tool's own report.
+		// A REAL `echo PWNED2` would print "PWNED2" as a standalone line —
+		// check for THAT specific shape instead of a bare substring match.
+		assert.doesNotMatch(direct2.content, /(?:^|\n)PWNED2(?:\r?\n|$)/, "no executed backtick/`$()` output (a standalone PWNED2 line)")
 
 		// Direct proof at the spawn boundary (no tsx extension-resolution
 		// noise): the hostile name must be delivered to the child as ONE
 		// literal argv element — backticks/`$()`/spaces are never re-parsed.
 		const spawned = await runOneTestFile(ws, `src/__tests__/${hostileNoNewline}`, 60)
-		const hasMarker = spawned.output.includes("PWNED2")
+		// A bare `.includes("PWNED2")` also false-positives (issue #156): the
+		// SAME Node ERR_UNKNOWN_FILE_EXTENSION crash embeds "PWNED2" inside a
+		// percent-encoded fragment of the bad extension
+		// (`.ts%60echo%20PWNED2%60`), which legitimately appears in
+		// `spawned.output` too — that crash is expected, correct behavior
+		// (tsx refusing to load a garbage-extension file), not evidence of
+		// execution. A REAL `echo PWNED2` would print "PWNED2" as a
+		// standalone line with nothing else on it — check for THAT specific
+		// shape instead of a bare substring match.
+		const hasMarker = /(?:^|\n)PWNED2(?:\r?\n|$)/.test(spawned.output)
 		assert.equal(
 			hasMarker,
 			false,
