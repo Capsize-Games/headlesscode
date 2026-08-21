@@ -12,9 +12,14 @@
  */
 
 import assert from "node:assert/strict"
+import * as fs from "node:fs/promises"
+import * as path from "node:path"
+import { fileURLToPath } from "node:url"
 
 import { buildTimeline, classifyTool } from "../timeline.js"
 import type { EventRecord } from "../../engine/events.js"
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 let tsCounter = 1_000_000_000_000
 function t(): string {
@@ -63,6 +68,7 @@ async function testClassifyToolBuckets(): Promise<void> {
 	assert.equal(classifyTool("apply_diff"), "write")
 	assert.equal(classifyTool("search_replace"), "write")
 	assert.equal(classifyTool("edit_file"), "write")
+	assert.equal(classifyTool("set_indentation"), "write")
 	assert.equal(classifyTool("execute_command"), "exec")
 	// codebase_search is its own bucket so "N searches" is a real number.
 	assert.equal(classifyTool("codebase_search"), "search")
@@ -266,6 +272,47 @@ async function testEmptyFeed(): Promise<void> {
 	assert.equal(model.totals.toolCalls, 0)
 }
 
+// ─── page.ts stays in sync with timeline.ts ──────────────────────────────────
+//
+// src/dashboard/page.ts's tool-classification sets (TL_READ/TL_WRITE/
+// TL_EXEC/TL_SEARCH) are a deliberately duplicated, NOT-imported inline
+// vanilla-JS twin of this file's READ_TOOLS/WRITE_TOOLS/EXEC_TOOLS/
+// SEARCH_TOOLS (see page.ts's own comment: "keep the two in sync") — no
+// build step means page.ts can't import timeline.ts directly. Found live
+// 2026-08-21: adding set_indentation to WRITE_TOOLS here did NOT
+// automatically update page.ts's TL_WRITE, and nothing caught the drift —
+// zero test coverage existed for page.ts's copy at all. This reads both
+// files' real source and asserts the four sets match exactly, member for
+// member, so a future addition here that forgets the twin fails loudly.
+
+function extractSetMembers(source: string, varName: string): string[] {
+	const match = new RegExp(`${varName}\\s*=\\s*new Set\\(\\[([^\\]]*)\\]\\)`).exec(source)
+	assert.ok(match, `expected to find "${varName} = new Set([...])" in the source`)
+	const items = match[1].match(/"([^"]*)"/g) ?? []
+	return items.map((s) => s.slice(1, -1)).sort()
+}
+
+async function testPageTsWriteToolsStayInSyncWithTimelineTs(): Promise<void> {
+	const timelineSource = await fs.readFile(path.join(__dirname, "..", "timeline.ts"), "utf-8")
+	const pageSource = await fs.readFile(path.join(__dirname, "..", "page.ts"), "utf-8")
+
+	const pairs: Array<[string, string]> = [
+		["READ_TOOLS", "TL_READ"],
+		["WRITE_TOOLS", "TL_WRITE"],
+		["EXEC_TOOLS", "TL_EXEC"],
+		["SEARCH_TOOLS", "TL_SEARCH"],
+	]
+	for (const [timelineVar, pageVar] of pairs) {
+		const timelineMembers = extractSetMembers(timelineSource, timelineVar)
+		const pageMembers = extractSetMembers(pageSource, pageVar)
+		assert.deepEqual(
+			pageMembers,
+			timelineMembers,
+			`page.ts's ${pageVar} has drifted from timeline.ts's ${timelineVar} — keep the two in sync (see page.ts's own comment)`,
+		)
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -275,6 +322,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["timeline: condensation point becomes a marker with before/after counts", testCondensationMarker],
 	["timeline: dominant-category ties break deterministically", testTieBreakPriority],
 	["timeline: empty feed degrades gracefully", testEmptyFeed],
+	["timeline: page.ts's TL_READ/WRITE/EXEC/SEARCH sets stay in sync with timeline.ts's", testPageTsWriteToolsStayInSyncWithTimelineTs],
 ]
 
 async function main(): Promise<void> {

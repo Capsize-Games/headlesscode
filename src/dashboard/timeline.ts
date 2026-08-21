@@ -35,7 +35,7 @@ const READ_TOOLS = new Set([
 	"find_references",
 	"import_graph",
 ])
-const WRITE_TOOLS = new Set(["write_to_file", "apply_diff", "search_replace", "edit_file"])
+const WRITE_TOOLS = new Set(["write_to_file", "apply_diff", "search_replace", "edit_file", "set_indentation"])
 const EXEC_TOOLS = new Set(["execute_command"])
 const SEARCH_TOOLS = new Set(["codebase_search"])
 
