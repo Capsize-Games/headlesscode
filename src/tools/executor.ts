@@ -1629,7 +1629,7 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 				}
 				if (signal === "SIGKILL") {
 					// Defensive path only: a timeout never sends SIGKILL anymore,
-// so this is reachable solely when something external killed
+					// so this is reachable solely when something external killed
 					// the process (the model's own `pkill` cleanup command, or
 					// ToolExecutor.dispose during session teardown).
 					finish(err(`execute_command: command '${command}' was killed by signal ${signal}.\n${combined}`))
