@@ -836,6 +836,57 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		rssMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
 	})
 
+	// Fresh-session memory trap (issue #138): every `npx tsx src/cli.ts`
+	// invocation is a COMPLETELY fresh process with zero memory of any
+	// prior invocation's model reads/edits, even against the same
+	// --workspace and --task-file. A task file written/edited across a
+	// restart can easily (and wrongly) claim "you already read X, don't
+	// re-read it" — live-verified 2026-08-21: a local model trusted
+	// exactly that kind of false claim and hallucinated a plausible-but-
+	// wrong edit_file call from the claim alone. Cheapest mitigation (the
+	// issue's own "direction 1"): a marker file this process itself
+	// writes/updates on every run against a workspace, so the NEXT
+	// invocation can print a loud, impossible-to-miss note when one
+	// existed already. Doesn't stop a bad task file from lying — makes
+	// the failure mode visible in the log for whoever's supervising.
+	// Scoped to --task-file specifically: the trap is about a task file's
+	// own false claims, not sessions in general.
+	if (options.taskFile) {
+		const markerPath = path.join(workspaceRoot, ".headlesscode", "last-session.json")
+		try {
+			const prior = JSON.parse(fs.readFileSync(markerPath, "utf-8")) as {
+				sessionId?: string
+				taskFile?: string
+				startedAt?: string
+			}
+			logger.warn(
+				"[cli] NOTE: this is a FRESH process with ZERO memory of any prior run against this workspace, even if the task file references one",
+				{
+					priorSessionId: prior.sessionId,
+					priorTaskFile: prior.taskFile,
+					priorStartedAt: prior.startedAt,
+					guidance:
+						"If the task file claims you already read/did something in an earlier turn, that claim is about a DIFFERENT process — verify everything yourself before acting on it.",
+				},
+			)
+		} catch {
+			// No marker (first run against this workspace) or unreadable/
+			// corrupt — either way, nothing to warn about, proceed silently.
+		}
+		try {
+			fs.mkdirSync(path.join(workspaceRoot, ".headlesscode"), { recursive: true })
+			fs.writeFileSync(
+				markerPath,
+				JSON.stringify({ sessionId: options.sessionId, taskFile: options.taskFile, startedAt: new Date().toISOString() }),
+				"utf-8",
+			)
+		} catch (err) {
+			// Non-fatal: the marker is a best-effort diagnostic, never a
+			// reason to abort a real session over a write failure.
+			logger.warn("[cli] failed to write last-session marker (non-fatal)", { error: String(err) })
+		}
+	}
+
 	// ── dry-run: no API key required ──────────────────────────────────────────
 	if (options.dryRun) {
 		try {
