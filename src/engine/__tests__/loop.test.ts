@@ -869,9 +869,9 @@ async function testRequireArtifactMinCitationsRefusesAStubDoc(): Promise<void> {
 		assert.equal(result.result, "Wrote the real doc.")
 		assert.equal(client.requests.length, 4, "the citation-less stub must not satisfy the gate")
 		const nudge = session.state.messages.find(
-			(m) => m.role === "tool" && (m.content ?? "").includes("path:line citations"),
+			(m) => m.role === "tool" && (m.content ?? "").includes("Your NEXT tool call must be edit_file"),
 		)
-		assert.ok(nudge, "expected a nudge specifically naming the missing-citations reason")
+		assert.ok(nudge, "expected a nudge specifically naming the missing-citations reason and the required next action")
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}

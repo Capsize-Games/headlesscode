@@ -629,7 +629,7 @@ const CITATION_PATTERN = /\b[\w.-]+(?:\/[\w.-]+)+\.\w+:\d+(?:-\d+)?\b/g
 async function matchingArtifactFileStatus(
 	workspaceRoot: string,
 	pattern: string,
-): Promise<{ found: boolean; citationCount: number }> {
+): Promise<{ found: boolean; citationCount: number; relativePath?: string }> {
 	const lastSlash = pattern.lastIndexOf("/")
 	const dirPart = lastSlash === -1 ? "." : pattern.slice(0, lastSlash)
 	const namePattern = lastSlash === -1 ? pattern : pattern.slice(lastSlash + 1)
@@ -650,7 +650,7 @@ async function matchingArtifactFileStatus(
 			if (stat.isFile() && stat.size > 0) {
 				const content = await fsp.readFile(filePath, "utf-8")
 				const citationCount = content.match(CITATION_PATTERN)?.length ?? 0
-				return { found: true, citationCount }
+				return { found: true, citationCount, relativePath: path.relative(workspaceRoot, filePath) }
 			}
 		} catch {
 			// Race with a concurrent delete/rename — treat as not-yet-matched.
@@ -3448,7 +3448,7 @@ export class HeadlessSession {
 							name: "attempt_completion",
 							content: !artifactStatus.found
 								? `[System: attempt_completion was NOT accepted. This task requires producing a real file matching '${this.config.requireArtifactPathPattern}', and no such file exists on disk yet. Use write_to_file to actually create it with real content before calling attempt_completion again — analysis alone does not satisfy this task.]`
-								: `[System: attempt_completion was NOT accepted. ${missingReason}. Go back and read more of the real code, then rewrite the file with real path:line citations (e.g. 'src/engine/loop.ts:123') backing every claim — a document without grounded evidence is not real research.]`,
+								: `[System: attempt_completion was NOT accepted. ${missingReason}. Your NEXT tool call must be edit_file on '${artifactStatus.relativePath}' (the file that already exists — do not read more code first, you already have enough; do not call write_to_file, that would discard what you already wrote). Add at least ${minCitations - artifactStatus.citationCount} line(s) of the exact literal form 'path/to/file.ts:123' (a real file path you already read, a colon, a real line number) into that file's existing content, each backing a specific claim already in the doc.]`,
 						})
 						this.logger.warn("[loop] attempt_completion deferred", {
 							iteration,
