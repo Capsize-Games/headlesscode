@@ -874,9 +874,23 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// OpenRouterClient regardless of these env vars.
 	const codeModeBackend = process.env.HEADLESSCODE_CODE_MODE_BACKEND ?? "openrouter"
 	const useLocalCodeBackend = options.mode === "code" && codeModeBackend === "ollama"
+	// When the local backend is selected, every downstream consumer of
+	// `model` (session-start logs, event-feed session_start, cost/usage
+	// records, and — critically — the `request.model` sent on each
+	// OllamaClient call, since OllamaClient.resolveModel() prefers a
+	// non-empty request.model over its own defaultModel) must see the
+	// LOCAL model id, not the OpenRouter-resolved one. Without this,
+	// local sessions were tagged and logged as
+	// e.g. "deepseek/deepseek-v4-flash-0731" throughout — cosmetic for
+	// generation itself (the local daemon ignores the model string and
+	// serves whatever GGUF is loaded) but wrong everywhere the model id
+	// is recorded or reported (verified live 2026-08-21: session_start
+	// logged the cloud model id while actually running against the
+	// local Ollama daemon).
+	const effectiveModel = useLocalCodeBackend ? (process.env.HEADLESSCODE_CODE_MODE_MODEL ?? model) : model
 	const client: LlmClient = useLocalCodeBackend
 		? new OllamaClient({
-				defaultModel: process.env.HEADLESSCODE_CODE_MODE_MODEL ?? model,
+				defaultModel: effectiveModel,
 				// Without this, --llm-timeout-ms is silently ignored for the
 				// Ollama backend: OllamaClient has its own independent abort
 				// timer (ollama.ts's DEFAULT_OLLAMA_TIMEOUT_MS), separate
@@ -1056,7 +1070,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		workspaceRoot,
 		sessionId: options.sessionId,
 		mode: options.mode,
-		model,
+		model: effectiveModel,
 		taskText,
 		maxIterations: options.maxIterations,
 		maxRecursionDepth,

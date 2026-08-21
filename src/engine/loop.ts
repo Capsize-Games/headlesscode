@@ -3280,6 +3280,10 @@ export class HeadlessSession {
 			// a successful session.
 			if (calls.length === 0) {
 				let text = (assistant.content ?? "").trim()
+				// Set below when the model's text-embedded tool call named a real
+				// tool that's currently excluded by the identical-call cooldown —
+				// see the nudge-message branch further down for why this matters.
+				let blockedToolName: string | null = null
 
 				// See AIRUNNERDESKTOP_EMPTY_REPLY_FALLBACK_TEXTS's doc comment: this
 				// is the backend's own synthetic diagnostic string, not something
@@ -3317,6 +3321,22 @@ export class HeadlessSession {
 						embedded &&
 						!excludedThisTurn.has(embedded.name) &&
 						this.state.tools.some((t) => t.type === "function" && t.function.name === embedded.name)
+					// The model correctly picked a real tool but it's on cooldown
+					// (see callMainLlm's excludedToolNames doc comment) — the block
+					// itself is intentional (verified 2026-08-20 it must not be
+					// circumventable via text), but the model was previously given
+					// no explanation why its call "failed", just a generic "call a
+					// tool" nudge — so it kept re-emitting the SAME excluded call
+					// every turn for the whole cooldown window, burning consecutive-
+					// mistake budget on retries it couldn't have known were futile.
+					// Verified live 2026-08-21: execute_command excluded for 4 turns
+					// after 2 near-duplicate retries (one a legitimate retry after a
+					// real build error, not a true loop) drove 4 straight "mistake"
+					// turns this way alone. Naming the blocked tool and its cooldown
+					// lets the model choose something else instead of guessing blind.
+					if (embedded && !isRealTool && excludedThisTurn.has(embedded.name)) {
+						blockedToolName = embedded.name
+					}
 					if (embedded && isRealTool) {
 						this.logger.warn("[loop] recovered tool call written as text instead of tool_calls", {
 							iteration,
@@ -3394,9 +3414,11 @@ export class HeadlessSession {
 					// place.
 					messages.push({
 						role: "user",
-						content: text
-							? `[System: a text reply alone does not end the session (attempt ${consecutiveMistakes}). Continue working: call a tool, or provide your final answer via attempt_completion.]`
-							: `[System: your last response contained no tool calls and no text (attempt ${consecutiveMistakes}). Continue working: call a tool or provide your final answer via attempt_completion.]`,
+						content: blockedToolName
+							? `[System: "${blockedToolName}" is temporarily unavailable (attempt ${consecutiveMistakes}) — it was excluded for a few turns after repeated identical calls. Use a different tool now, or wait; it will become available again on its own. Retrying the same call will not work until then.]`
+							: text
+								? `[System: a text reply alone does not end the session (attempt ${consecutiveMistakes}). Continue working: call a tool, or provide your final answer via attempt_completion.]`
+								: `[System: your last response contained no tool calls and no text (attempt ${consecutiveMistakes}). Continue working: call a tool or provide your final answer via attempt_completion.]`,
 					})
 					this.logger.warn("[loop] non-completing reply counted as mistake", {
 						consecutiveMistakes,
