@@ -1829,6 +1829,141 @@ async function testIdenticalCallStreakResetByAnyDifferentCall(): Promise<void> {
 	}
 }
 
+// ─── Repeated-tool-failure guardrail (issue #146) ────────────────────────────
+// identicalCallStreak (above) only fires on byte-identical repeats. These
+// tests exercise the varied-args sibling: the SAME tool failing repeatedly
+// with DIFFERENT arguments each time — real edit_file calls against a real
+// workspace file (not a mocked executor), each with a different, still-wrong
+// old_string, so every attempt genuinely errors and no two attempts are
+// identical.
+
+async function testToolFailureNudgeFiresOnVariedArgsRepeatedFailure(): Promise<void> {
+	// Threshold is 2 (see DEFAULT_TOOL_FAILURE_NUDGE_THRESHOLD's doc comment
+	// for why it must stay strictly below DEFAULT_CONSECUTIVE_ERROR_LIMIT's
+	// default of 3 — live-verified 2026-08-21 via
+	// scripts/eval-suite/scenario-146-repeated-tool-failure.sh: at 3, the
+	// generic consecutive-mistake check always wins the race and ends the
+	// session first, so this guardrail's own nudge never gets a turn to fire
+	// under default settings). No consecutiveErrorLimit override needed here
+	// for that reason — the default (3) is exactly what makes the 2-failure
+	// threshold meaningful: the nudge must land BEFORE the hard stop.
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-toolfail-"))
+	try {
+		await fs.writeFile(path.join(ws, "target.ts"), "export const value = 1\n")
+		const client = new FakeLlmClient([
+			() => toolCall("edit_file", { file_path: "target.ts", old_string: "wrong attempt 1", new_string: "x" }),
+			() => toolCall("edit_file", { file_path: "target.ts", old_string: "wrong attempt 2", new_string: "x" }),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({ task: "fix the file", client, workspaceRoot: ws, maxIterations: 250 })
+		await session.run()
+
+		const failedEdits = client.requests
+			.flatMap((r) => r.messages)
+			.filter((m) => m.role === "tool" && m.name === "edit_file" && typeof m.content === "string" && /no match found/i.test(m.content))
+		assert.ok(failedEdits.length >= 2, `expected at least 2 real edit_file failures, got ${failedEdits.length}`)
+
+		const nudge = session.state.messages.find(
+			(m) => m.role === "user" && typeof m.content === "string" && m.content.includes("all failed, even though the arguments were"),
+		)
+		assert.ok(nudge, "expected the repeated-tool-failure nudge to have fired despite varied args")
+		assert.match(nudge?.content as string, /edit_file/, "nudge should name the failing tool")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testToolFailureStreakDoesNotFireOnIdenticalCallGuardAlone(): Promise<void> {
+	// Sanity check for the "varied args" framing itself: a single failure
+	// (below this guardrail's threshold of 2) must not fire it, proving the
+	// nudge isn't just piggybacking on some other guardrail's threshold.
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-toolfail-under-"))
+	try {
+		await fs.writeFile(path.join(ws, "target.ts"), "export const value = 1\n")
+		const client = new FakeLlmClient([
+			() => toolCall("edit_file", { file_path: "target.ts", old_string: "wrong attempt 1", new_string: "x" }),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({ task: "fix the file", client, workspaceRoot: ws, maxIterations: 250 })
+		await session.run()
+
+		const nudge = session.state.messages.find(
+			(m) => m.role === "user" && typeof m.content === "string" && m.content.includes("all failed, even though the arguments were"),
+		)
+		assert.equal(nudge, undefined, "1 failure is below the threshold (2) — must not fire yet")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testToolFailureStreakResetsOnRediagnosticReadFile(): Promise<void> {
+	// 1 failure, then a REAL read_file on the SAME target path (genuine
+	// re-diagnosis), then 1 more failure — the streak must restart after the
+	// read, so it never reaches the threshold (2) even though 2 real
+	// failures happened across the session (which, WITHOUT the reset,
+	// would be exactly enough to fire — see the main firing test above).
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-toolfail-reset-"))
+	try {
+		await fs.writeFile(path.join(ws, "target.ts"), "export const value = 1\n")
+		const client = new FakeLlmClient([
+			() => toolCall("edit_file", { file_path: "target.ts", old_string: "wrong attempt 1", new_string: "x" }),
+			// read_file's real arg is `path`, NOT `file_path` (edit_file/
+			// write_to_file's arg name) — using the wrong name here would make
+			// this call fail too, which would still pass the assertion below for
+			// the wrong reason (a differently-named failing tool also resets the
+			// streak) without ever exercising the SAME-TARGET re-diagnosis path
+			// this test is actually meant to cover.
+			() => toolCall("read_file", { path: "target.ts" }),
+			() => toolCall("edit_file", { file_path: "target.ts", old_string: "wrong attempt 2", new_string: "x" }),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({ task: "fix the file", client, workspaceRoot: ws, maxIterations: 250 })
+		await session.run()
+
+		const readFileFailed = client.requests
+			.flatMap((r) => r.messages)
+			.some((m) => m.role === "tool" && m.name === "read_file" && typeof m.content === "string" && /error/i.test(m.content))
+		assert.equal(readFileFailed, false, "the re-diagnosis read_file call itself must succeed for real (sanity check on the test setup)")
+
+		const nudge = session.state.messages.find(
+			(m) => m.role === "user" && typeof m.content === "string" && m.content.includes("all failed, even though the arguments were"),
+		)
+		assert.equal(nudge, undefined, "a real read_file on the same target between failures must reset the streak")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testToolFailureStreakResetsOnSuccess(): Promise<void> {
+	// 1 failure, then a REAL successful edit_file call, then 1 more failure —
+	// never 2 consecutive failures, so the threshold (2) is never reached,
+	// even though 2 real failures happened across the session.
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-toolfail-success-"))
+	try {
+		await fs.writeFile(path.join(ws, "target.ts"), "export const value = 1\n")
+		const client = new FakeLlmClient([
+			() => toolCall("edit_file", { file_path: "target.ts", old_string: "wrong attempt 1", new_string: "x" }),
+			() => toolCall("edit_file", { file_path: "target.ts", old_string: "export const value = 1", new_string: "export const value = 2" }),
+			() => toolCall("edit_file", { file_path: "target.ts", old_string: "wrong attempt 2", new_string: "x" }),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({ task: "fix the file", client, workspaceRoot: ws, maxIterations: 250 })
+		await session.run()
+
+		const succeededEdit = client.requests
+			.flatMap((r) => r.messages)
+			.some((m) => m.role === "tool" && m.name === "edit_file" && typeof m.content === "string" && !/no match found/i.test(m.content))
+		assert.ok(succeededEdit, "the middle edit_file call must succeed for real (sanity check on the test setup)")
+
+		const nudge = session.state.messages.find(
+			(m) => m.role === "user" && typeof m.content === "string" && m.content.includes("all failed, even though the arguments were"),
+		)
+		assert.equal(nudge, undefined, "a real successful edit_file call in between must reset the streak")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── isReadOnlyEquivalentShellCommand (unit-level) ───────────────────────────
 
 async function testIsReadOnlyEquivalentShellCommandClassifiesCorrectly(): Promise<void> {
@@ -2932,6 +3067,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["identical-call stall: an excluded tool cannot be recovered back in via narrated-text extraction", testExcludedToolCannotBeRecoveredFromNarratedText],
 	["identical-call stall: a genuine edit/verify/edit/verify interleave never trips it", testIdenticalCallStreakResetByAnyDifferentCall],
 	["identical-call nudge: names the concrete next todo-list step, not just generic advice", testIdenticalCallNudgeNamesTheNextTodoStep],
+	["repeated-tool-failure (#146): nudge fires after 2 real failures with VARIED args (identicalCallStreak never trips)", testToolFailureNudgeFiresOnVariedArgsRepeatedFailure],
+	["repeated-tool-failure (#146): 1 failure (below threshold) does not fire the nudge", testToolFailureStreakDoesNotFireOnIdenticalCallGuardAlone],
+	["repeated-tool-failure (#146): a real read_file on the same target between failures resets the streak", testToolFailureStreakResetsOnRediagnosticReadFile],
+	["repeated-tool-failure (#146): a real successful edit_file call between failures resets the streak", testToolFailureStreakResetsOnSuccess],
 	["isReadOnlyEquivalentShellCommand: classifies read-only vs. mutating shell commands", testIsReadOnlyEquivalentShellCommandClassifiesCorrectly],
 	["live snapshot: created + updated in place during a running session's iterations", testLiveSnapshotCreatedAndUpdatedDuringIterations],
 	["live snapshot: removed on successful completion", testLiveSnapshotRemovedOnSuccess],

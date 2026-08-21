@@ -304,6 +304,29 @@ export const DEFAULT_IDENTICAL_CALL_REPEAT_PENALTY_BOOST = 1.3
  * point, same as the repeat_penalty boost value above.
  */
 export const DEFAULT_IDENTICAL_CALL_TOOL_COOLDOWN_TURNS = 4
+/**
+ * Repeated-tool-failure guardrail (issue #146): the varied-args sibling of
+ * the identical-call guardrail above. identicalCallStreak only fires when
+ * retries repeat byte-identical arguments — it does nothing when a model
+ * keeps retrying the SAME tool with DIFFERENT arguments every time, never
+ * pausing to re-diagnose why each attempt failed the same way. Live
+ * round 7 of the 2026-08-21 full-cycle demo: `edit_file` failed 17 times in
+ * a row against `src/orchestrator/state.ts`, each attempt with a different
+ * old_string/new_string, before the session ran out of budget —
+ * identicalCallStreak never trips in that shape. MUST stay strictly below
+ * DEFAULT_CONSECUTIVE_ERROR_LIMIT (3): the generic consecutive-mistake
+ * check runs INSIDE the same per-call loop this guardrail's own tracking
+ * runs after, and returns immediately once it trips — live-verified
+ * 2026-08-21 (scripts/eval-suite/scenario-146-repeated-tool-failure.sh
+ * against the real code-daemon): with this threshold also at 3, the
+ * generic check fired first on the 3rd failure and ended the session
+ * before this guardrail's post-turn block ever ran, so the specific nudge
+ * never had a chance to redirect the model. At 2, the nudge is injected
+ * after the 2nd failure — visible in the request that produces the 3rd
+ * attempt — giving the model one genuinely-informed try before the
+ * generic hard stop would otherwise end the session on an uninformed one.
+ */
+export const DEFAULT_TOOL_FAILURE_NUDGE_THRESHOLD = 2
 /** The injected nudge (user-role, seen by the model on its next turn), indexed workspaces. */
 const READ_ONLY_NUDGE_MESSAGE =
 	"You've made several read/exploration calls without using `codebase_search`. If the workspace has an index (it lives in the central project store — see `~/.local/share/headlesscode/projects/`), try `codebase_search` for targeted semantic search instead of blind tree-walking."
@@ -373,6 +396,26 @@ function identicalCallNudgeMessage(signature: string, streak: number, nextTodo: 
 		`conversation — re-read it there instead of calling again.${concreteNextStep} If you are stuck on a ` +
 		`persistent error, address that error specifically instead of resubmitting the same call or looking around ` +
 		`the workspace again.`
+	)
+}
+
+/**
+ * The injected nudge when the SAME TOOL NAME fails repeatedly with VARIED
+ * arguments (issue #146) — see DEFAULT_TOOL_FAILURE_NUDGE_THRESHOLD's doc
+ * comment for why this is distinct from identicalCallNudgeMessage above.
+ * Directive, not generic: names the exact re-diagnosis step (re-read the
+ * CURRENT real content, quote the exact text to match) rather than a vague
+ * "try something different" — the same lesson identicalCallNudgeMessage's
+ * own doc comment already draws from a prior failed generic-nudge attempt.
+ */
+function toolFailureNudgeMessage(toolName: string, streak: number, targetLabel: string | undefined): string {
+	const targetHint = targetLabel ? ` on '${targetLabel}'` : ""
+	return (
+		`Your last ${streak} attempts to use ${toolName}${targetHint} all failed, even though the arguments were ` +
+		`different each time. Varying the arguments and hoping is not working. Before trying again: use read_file ` +
+		`to see the file's CURRENT exact content around your target, quote the exact text you intend to match, and ` +
+		`only THEN retry ${toolName} — do not just adjust the arguments again without first confirming what the ` +
+		`file actually contains right now.`
 	)
 }
 
@@ -585,10 +628,15 @@ export function stripSupersededReasoning(messages: ChatMessage[]): void {
 	}
 }
 
-function editToolTargetPath(workspaceRoot: string, call: { name: string; args: Record<string, unknown> }): string | undefined {
-	if (!BATCH_EDIT_TOOL_NAMES.has(call.name)) {
-		return undefined
-	}
+/**
+ * Best-effort absolute path for ANY tool call's `path`/`file_path` arg —
+ * factored out of editToolTargetPath (below) so the repeated-tool-failure
+ * guardrail (issue #146) can recognize a `read_file` call as re-diagnosis
+ * of the SAME target a different, currently-failing tool is acting on
+ * (read_file isn't in BATCH_EDIT_TOOL_NAMES, so editToolTargetPath alone
+ * never resolves it).
+ */
+function toolCallPathArg(workspaceRoot: string, call: { args: Record<string, unknown> }): string | undefined {
 	const raw =
 		typeof call.args.path === "string" && call.args.path.trim() !== ""
 			? call.args.path
@@ -603,6 +651,13 @@ function editToolTargetPath(workspaceRoot: string, call: { name: string; args: R
 	} catch {
 		return undefined
 	}
+}
+
+function editToolTargetPath(workspaceRoot: string, call: { name: string; args: Record<string, unknown> }): string | undefined {
+	if (!BATCH_EDIT_TOOL_NAMES.has(call.name)) {
+		return undefined
+	}
+	return toolCallPathArg(workspaceRoot, call)
 }
 
 /**
@@ -2973,6 +3028,15 @@ export class HeadlessSession {
 		let lastCallBatchNames: string[] = []
 		let identicalCallStreak = 0
 		let identicalCallNudgeInjected = false
+		// Repeated-tool-failure guardrail (issue #146): tracks consecutive
+		// FAILURES of the SAME TOOL NAME since the last success of that tool
+		// or the last genuine re-diagnosis (a read_file call on the same
+		// target path the failing tool is acting on) — see
+		// DEFAULT_TOOL_FAILURE_NUDGE_THRESHOLD's doc comment.
+		let toolFailureStreakName: string | undefined
+		let toolFailureStreakCount = 0
+		let toolFailureStreakTargetPath: string | undefined
+		let toolFailureNudgeInjected = false
 		// Tool-exclusion cooldown: verified live 2026-08-20 (trial 36) that a
 		// bare streak-based exclusion is a ONE-SHOT deterrent — the guard
 		// (correctly, see c1dd87b) resets as soon as the model produces a
@@ -3678,6 +3742,10 @@ export class HeadlessSession {
 					lastCallBatchNames = []
 					identicalCallStreak = 0
 					identicalCallNudgeInjected = false
+					toolFailureStreakName = undefined
+					toolFailureStreakCount = 0
+					toolFailureStreakTargetPath = undefined
+					toolFailureNudgeInjected = false
 					if (text && !this.config.requireExplicitCompletion) {
 						this.logger.info("[loop] text-only reply (no tool calls) — success", { iteration })
 						const reportPath = await this.persistFinalReport(iteration, text)
@@ -4071,6 +4139,63 @@ export class HeadlessSession {
 						identicalCallStreak,
 						DEFAULT_IDENTICAL_CALL_STALL_LIMIT,
 					)
+				}
+
+				// Repeated-tool-failure guardrail (issue #146): see
+				// DEFAULT_TOOL_FAILURE_NUDGE_THRESHOLD's doc comment. Walked in
+				// submission order (not the identical-call guardrail's whole-batch
+				// signature) since a single turn can mix a failing call with an
+				// unrelated one, and a read_file mid-turn must be able to reset the
+				// streak before a LATER call in the same turn is evaluated.
+				for (let i = 0; i < calls.length; i++) {
+					const call = calls[i]
+					const outcome = executed.get(i)
+					if (outcome === undefined) {
+						continue
+					}
+					if (call.name === "read_file" && toolFailureStreakTargetPath !== undefined) {
+						const readTarget = toolCallPathArg(this.config.workspaceRoot, call)
+						if (readTarget !== undefined && readTarget === toolFailureStreakTargetPath) {
+							toolFailureStreakName = undefined
+							toolFailureStreakCount = 0
+							toolFailureStreakTargetPath = undefined
+							toolFailureNudgeInjected = false
+						}
+					}
+					if (outcome.isError) {
+						if (call.name !== toolFailureStreakName) {
+							toolFailureStreakName = call.name
+							toolFailureStreakCount = 0
+							toolFailureNudgeInjected = false
+						}
+						toolFailureStreakCount++
+						toolFailureStreakTargetPath = toolCallPathArg(this.config.workspaceRoot, call) ?? toolFailureStreakTargetPath
+					} else if (call.name === toolFailureStreakName) {
+						toolFailureStreakName = undefined
+						toolFailureStreakCount = 0
+						toolFailureStreakTargetPath = undefined
+						toolFailureNudgeInjected = false
+					}
+				}
+				if (
+					toolFailureStreakName !== undefined &&
+					toolFailureStreakCount >= envToolFailureNudgeThreshold() &&
+					!toolFailureNudgeInjected
+				) {
+					toolFailureNudgeInjected = true
+					const targetLabel =
+						toolFailureStreakTargetPath !== undefined
+							? path.relative(this.config.workspaceRoot, toolFailureStreakTargetPath)
+							: undefined
+					messages.push({
+						role: "user",
+						content: toolFailureNudgeMessage(toolFailureStreakName, toolFailureStreakCount, targetLabel),
+					})
+					this.logger.warn("[loop] repeated-tool-failure nudge injected", {
+						iteration,
+						toolName: toolFailureStreakName,
+						streak: toolFailureStreakCount,
+					})
 				}
 			}
 
@@ -4951,6 +5076,15 @@ function envReadOnlyStallLimit(): number {
 	}
 	const n = Number(raw)
 	return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_READ_ONLY_STALL_LIMIT
+}
+
+function envToolFailureNudgeThreshold(): number {
+	const raw = process.env.HEADLESSCODE_TOOL_FAILURE_NUDGE_THRESHOLD
+	if (raw === undefined || raw === "") {
+		return DEFAULT_TOOL_FAILURE_NUDGE_THRESHOLD
+	}
+	const n = Number(raw)
+	return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_TOOL_FAILURE_NUDGE_THRESHOLD
 }
 
 function envIdenticalCallRepeatPenaltyBoost(): number {
