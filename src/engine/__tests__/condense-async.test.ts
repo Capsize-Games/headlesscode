@@ -262,10 +262,10 @@ async function testHardFallbackFiresDespitePendingBackground(): Promise<void> {
 		const client = new AsyncCondenseClient(
 			[
 				() => toolCall("list_files", { path: "." }),
-				() => toolCall("list_files", { path: "." }),
-				() => toolCall("list_files", { path: "." }),
-				() => toolCall("list_files", { path: "." }),
-				() => toolCall("attempt_completion", { result: "done after hard fallback" }),
+() => toolCall("list_files", { path: "./" }),
+() => toolCall("list_files", { path: "src" }),
+() => toolCall("list_files", { path: "src/" }),
+() => toolCall("attempt_completion", { result: "done after hard fallback" }),
 			],
 			{ promptTokens: 80_000, completionTokens: 100 },
 			{ promptTokens: 5_000, completionTokens: 100 },
