@@ -3194,7 +3194,26 @@ export class HeadlessSession {
 				// eventually hits maxIterations or the consecutive-mistake
 				// bound from OTHER errors, which is the correct outcome, not a
 				// false "success".
-				if (this.config.verifyBeforeCompletion && lastExecuteCommandFailed) {
+				//
+				// unsupportedMeasurementClaim (#136): lastExecuteCommandFailed
+				// only catches "the last command failed, you lied about
+				// success" — it says nothing about a completion that invents
+				// specific measurements (tokens/sec, percentages, "measured",
+				// "benchmark") nobody actually produced. Verified live
+				// 2026-08-21: a local session declared an infra POC
+				// "successfully completed" with fabricated performance
+				// numbers, having never run the command that would produce
+				// them — the last command it DID run had succeeded, so this
+				// guardrail never fired. Checked against every message in
+				// history (not just the immediately preceding one), since the
+				// evidence for a claim can legitimately come from several
+				// tool calls back.
+				const unsupportedMeasurementClaim =
+					/\d+(\.\d+)?\s*(tokens?\/sec|t\/s|%|ms|seconds?)\b|measured|benchmark/i.test(result) &&
+					!messages.some(
+						(m) => m.role === "tool" && m.name === "execute_command" && /\d/.test(String(m.content ?? "")),
+					)
+				if (this.config.verifyBeforeCompletion && (lastExecuteCommandFailed || unsupportedMeasurementClaim)) {
 					for (const sibling of calls) {
 						if (sibling.id === completionCall.id) {
 							continue
@@ -3203,21 +3222,24 @@ export class HeadlessSession {
 							role: "tool",
 							tool_call_id: sibling.id,
 							name: sibling.name,
-							content:
-								"[System: not executed — attempt_completion was deferred because the last command you ran ended in an error; re-issue this call if still needed.]",
+							content: unsupportedMeasurementClaim
+								? "[System: not executed — attempt_completion was deferred because it makes a specific measurement/benchmark claim with no execute_command output in this session's history containing any supporting number; re-issue this call if still needed.]"
+								: "[System: not executed — attempt_completion was deferred because the last command you ran ended in an error; re-issue this call if still needed.]",
 						})
 					}
 					messages.push({
 						role: "tool",
 						tool_call_id: completionCall.id,
 						name: "attempt_completion",
-						content:
-							"[System: attempt_completion was NOT accepted. The most recent command you ran ended in an error, and you have not run a command since that succeeded:\n" +
-							`${lastExecuteCommandSummary ?? "(command output no longer available)"}\n` +
-							"Fix the issue, re-run the exact command above, and only call attempt_completion again once it actually passes.]",
+						content: unsupportedMeasurementClaim
+							? "[System: attempt_completion was NOT accepted. Your result claims a specific measurement/benchmark, but no execute_command output anywhere in this session contains a supporting number. Either run the real command that produces this evidence and re-issue attempt_completion, or restate the result without the unsupported claim.]"
+							: "[System: attempt_completion was NOT accepted. The most recent command you ran ended in an error, and you have not run a command since that succeeded:\n" +
+								`${lastExecuteCommandSummary ?? "(command output no longer available)"}\n` +
+								"Fix the issue, re-run the exact command above, and only call attempt_completion again once it actually passes.]",
 					})
-					this.logger.warn("[loop] attempt_completion deferred — last execute_command failed", {
+					this.logger.warn("[loop] attempt_completion deferred", {
 						iteration,
+						reason: unsupportedMeasurementClaim ? "unsupported measurement claim" : "last execute_command failed",
 					})
 					continue
 				}

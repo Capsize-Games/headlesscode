@@ -2470,6 +2470,47 @@ async function testBudgetFallsBackToHardcodedTableWithoutLivePricing(): Promise<
 	}
 }
 
+// GitHub issue #136: verifyBeforeCompletion's lastExecuteCommandFailed
+// check says nothing about a completion that invents specific
+// measurements nobody actually produced. Verified live 2026-08-21: a
+// local session declared an infra POC complete with fabricated
+// tokens/sec numbers, having never run the command that would produce
+// them — the last command it DID run had succeeded, so the existing
+// check never fired.
+async function testVerifyBeforeCompletionRefusesUnsupportedMeasurementClaim(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc-measure-"))
+	try {
+		const client = new FakeLlmClient([
+			() => toolCall("execute_command", { command: "echo ready" }),
+			() => toolCall("attempt_completion", { result: "Benchmark complete: 205.9 tokens/sec measured." }),
+			() => toolCall("execute_command", { command: "echo real-result 205.9" }),
+			() => toolCall("attempt_completion", { result: "Ran the real benchmark: 205.9 tokens/sec." }),
+		])
+		const session = await makeSession({
+			task: "benchmark something",
+			client,
+			workspaceRoot: ws,
+			verifyBeforeCompletion: true,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "Ran the real benchmark: 205.9 tokens/sec.")
+		assert.equal(client.requests.length, 4, "the unsupported claim must not end the session early")
+		const nudge = session.state.messages.find(
+			(m) => m.role === "tool" && (m.content ?? "").includes("was NOT accepted"),
+		)
+		assert.ok(nudge, "expected a nudge refusing the unsupported measurement claim")
+		assert.match(
+			nudge?.content ?? "",
+			/measurement\/benchmark/,
+			"the nudge names the unsupported-measurement reason, not the failed-command reason",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -2514,6 +2555,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	[
 		"verifyBeforeCompletion: refuses every fabricated completion in a session, not just the first",
 		testVerifyBeforeCompletionRefusesEveryFailureNotJustTheFirst,
+	],
+	[
+		"verifyBeforeCompletion: refuses an unsupported measurement/benchmark claim (#136)",
+		testVerifyBeforeCompletionRefusesUnsupportedMeasurementClaim,
 	],
 	[
 		"requireExplicitCompletion: an embedded call naming an unknown tool is never executed",
