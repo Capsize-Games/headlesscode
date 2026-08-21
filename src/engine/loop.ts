@@ -408,28 +408,74 @@ function identicalCallNudgeMessage(signature: string, streak: number, nextTodo: 
  * "try something different" — the same lesson identicalCallNudgeMessage's
  * own doc comment already draws from a prior failed generic-nudge attempt.
  *
- * `readFileAvailable` (issue #153): live-verified 2026-08-21
- * (scripts/eval-suite/scenario-146-repeated-tool-failure.sh) that this
- * nudge's own advice — "use read_file" — can collide with the SEPARATE
- * identical-call guardrail's tool-exclusion cooldown (excludedToolCooldowns
- * in runIterations) making read_file temporarily unavailable at the exact
- * moment this nudge fires, e.g. right after two identical read_file calls
- * tripped that OTHER guardrail. A model told to use a tool it cannot
- * currently call has no good move — in the observed trial it fabricated a
- * fake `<tool_call>` text block for the excluded tool instead of a real
- * one. When the caller reports read_file is unavailable, this message
- * points at re-deriving the content from context already in the
- * conversation instead of recommending a call that would just fail.
+ * `readFileAvailable`/`retryToolAvailable` (issue #153): live-verified
+ * 2026-08-21 (scripts/eval-suite/scenario-146-repeated-tool-failure.sh,
+ * two separate live runs) that this nudge's own advice — "use read_file"
+ * and "retry `toolName`" — can each independently collide with the
+ * SEPARATE identical-call guardrail's tool-exclusion cooldown
+ * (excludedToolCooldowns in runIterations): first observed with
+ * `read_file` on cooldown (fixed below), then on a second live run with
+ * `toolName` itself (e.g. `edit_file`) on cooldown from its own identical
+ * repeat. A model told to do something it cannot currently do has no good
+ * move — in both observed trials it fabricated a fake `<tool_call>` text
+ * block for the unavailable tool rather than a real one, which the harness
+ * correctly refuses to execute (see the excludedThisTurn check around
+ * `extractEmbeddedToolCall`'s call site) but still counts as a mistake.
+ * This message checks BOTH tools independently and adapts to whichever
+ * combination is actually true, rather than assuming either is available.
+ *
+ * Known remaining gap, not fixed here: `excludedToolCooldowns` is only
+ * populated at the START of the NEXT iteration's request prep (reading
+ * identicalCallStreak's value as of the end of THIS one) — so if
+ * identicalCallStreak and this guardrail's own streak both cross their
+ * threshold on the exact same call, this nudge (fired in that same turn)
+ * still sees the about-to-be-excluded tool as available one turn early.
+ * Narrow (requires both guardrails tripping simultaneously) and not
+ * reproduced in the 2026-08-21 live re-verification after this fix — left
+ * as a documented limitation rather than adding cross-guardrail lookahead.
  */
-function toolFailureNudgeMessage(toolName: string, streak: number, targetLabel: string | undefined, readFileAvailable: boolean): string {
+function toolFailureNudgeMessage(
+	toolName: string,
+	streak: number,
+	targetLabel: string | undefined,
+	readFileAvailable: boolean,
+	retryToolAvailable: boolean,
+): string {
 	const targetHint = targetLabel ? ` on '${targetLabel}'` : ""
-	const reDiagnoseStep = readFileAvailable
-		? `use read_file to see the file's CURRENT exact content around your target, quote the exact text you intend to match, and only THEN retry ${toolName}`
-		: `read_file is temporarily unavailable (cooldown from a recent repeat) — instead, carefully re-derive the exact current content from what you already read earlier in this conversation, quote the exact text you intend to match, and only THEN retry ${toolName}`
-	return (
+	const base =
 		`Your last ${streak} attempts to use ${toolName}${targetHint} all failed, even though the arguments were ` +
-		`different each time. Varying the arguments and hoping is not working. Before trying again: ${reDiagnoseStep} ` +
-		`— do not just adjust the arguments again without first confirming what the file actually contains right now.`
+		`different each time. Varying the arguments and hoping is not working. `
+	if (readFileAvailable && retryToolAvailable) {
+		return (
+			base +
+			`Before trying again: use read_file to see the file's CURRENT exact content around your target, quote the ` +
+			`exact text you intend to match, and only THEN retry ${toolName} — do not just adjust the arguments again ` +
+			`without first confirming what the file actually contains right now.`
+		)
+	}
+	if (!readFileAvailable && retryToolAvailable) {
+		return (
+			base +
+			`read_file is temporarily unavailable right now (cooldown from a recent repeat) — instead, carefully ` +
+			`re-derive the exact current content from what you already read earlier in this conversation, quote the ` +
+			`exact text you intend to match, and only THEN retry ${toolName} — do not just adjust the arguments ` +
+			`again without first confirming what the file actually contains right now.`
+		)
+	}
+	if (readFileAvailable && !retryToolAvailable) {
+		return (
+			base +
+			`${toolName} is temporarily unavailable right now (cooldown from a recent repeat), so retrying it this ` +
+			`turn will not work no matter what arguments you use. Use read_file now to see the file's CURRENT exact ` +
+			`content and carefully work out the exact text you'll need to match — you'll be able to retry ${toolName} ` +
+			`again in a few turns, and having the exact match ready will make that attempt count.`
+		)
+	}
+	return (
+		base +
+		`Both read_file and ${toolName} are temporarily unavailable right now (cooldown from recent repeats). Do not ` +
+		`fabricate a call to either — call a genuinely different tool, or give a plain text status update, and wait ` +
+		`for them to become available again before retrying.`
 	)
 }
 
@@ -4208,6 +4254,7 @@ export class HeadlessSession {
 							toolFailureStreakCount,
 							targetLabel,
 							!excludedToolCooldowns.has("read_file"),
+							!excludedToolCooldowns.has(toolFailureStreakName),
 						),
 					})
 					this.logger.warn("[loop] repeated-tool-failure nudge injected", {
