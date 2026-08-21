@@ -71,6 +71,7 @@ import {
 	appendCodeIntelTools,
 	appendDescribeImageTool,
 	appendRunTestsTool,
+	appendSetIndentationTool,
 	buildLeanSystemPrompt,
 	buildSystemPrompt,
 	isLeanSystemPromptEnabled,
@@ -654,7 +655,7 @@ const SAME_FILE_BATCH_DIAGNOSIS =
 	"\n\n<diagnosis>this file was already edited by an earlier tool call in this same turn — your SEARCH text may have been composed against the file's content BEFORE that edit. Re-read the file to get its current state, or next time include both changes as separate SEARCH/REPLACE blocks in ONE apply_diff call.</diagnosis>"
 
 /** Edit tools whose args name a target file (for the same-file batch diagnosis). */
-const BATCH_EDIT_TOOL_NAMES = new Set(["apply_diff", "search_replace", "edit_file", "write_to_file"])
+const BATCH_EDIT_TOOL_NAMES = new Set(["apply_diff", "search_replace", "edit_file", "write_to_file", "set_indentation"])
 
 /**
  * Best-effort extraction of the file path an edit tool call targets, for the
@@ -1804,6 +1805,9 @@ export class HeadlessSession {
 		}
 		if (this.executor.has("run_tests")) {
 			tools = appendRunTestsTool(tools)
+		}
+		if (this.executor.has("set_indentation")) {
+			tools = appendSetIndentationTool(tools)
 		}
 		if (this.config.patchLocalToolSchemas) {
 			tools = patchEditFileToolForLocalModels(tools)
@@ -3989,7 +3993,15 @@ export class HeadlessSession {
 				if (
 					call.name === "execute_command" ||
 					call.name === "write_to_file" ||
-					call.name === "edit_file"
+					call.name === "edit_file" ||
+					// set_indentation (issue #141) genuinely writes to the
+					// workspace, same as edit_file — live-verified 2026-08-21
+					// that omitting it here left a session unable to ever
+					// satisfy requireArtifactBeforeCompletion after a
+					// successful, file-changing set_indentation call, looping
+					// on "no artifact-producing tool call" until the
+					// iteration cap.
+					call.name === "set_indentation"
 				) {
 					hasCalledArtifactTool = true
 				}
@@ -4016,7 +4028,7 @@ export class HeadlessSession {
 				// Same shape as the execute_command case above, tracked
 				// separately since a failed edit and a failed command are
 				// different evidence for the rejection message below.
-				if (call.name === "edit_file" || call.name === "write_to_file") {
+				if (call.name === "edit_file" || call.name === "write_to_file" || call.name === "set_indentation") {
 					lastWriteToolFailed = isError
 					if (isError) {
 						const target = summarizeToolArg(call.name, call.args) ?? "(unknown target)"
@@ -4689,6 +4701,9 @@ export class HeadlessSession {
 		}
 		if (this.executor.has("run_tests")) {
 			newTools = appendRunTestsTool(newTools)
+		}
+		if (this.executor.has("set_indentation")) {
+			newTools = appendSetIndentationTool(newTools)
 		}
 		if (this.config.patchLocalToolSchemas) {
 			newTools = patchEditFileToolForLocalModels(newTools)

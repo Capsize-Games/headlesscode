@@ -51,6 +51,19 @@ next to it — reach for the specific tool, not the general one:
   confidence run right before `attempt_completion`; a passing selective run
   is NOT full-suite green.
 
+## Use `set_indentation` for a pure indentation/whitespace-only fix
+
+- **Need to fix ONE line's leading indentation and nothing else about
+  it?** `set_indentation` (a line number + a tab count) over `edit_file`
+  — edit_file requires typing the full line out twice, once in
+  `old_string` and once in `new_string`, differing only in leading
+  whitespace, which is easy to get subtly wrong (issue #141). Give it the
+  real line number (confirm with `read_file` first if unsure) and the
+  exact tab count you want the line to end up with — it replaces whatever
+  indentation was there, it does not add to it.
+- Only handles TAB-based indentation. If the file uses spaces, use
+  `edit_file` instead.
+
 ## Execute the verification step your todo list names — don't re-derive it
 
 - If your todo list's next item is "run baseline tests" or "verify coverage",

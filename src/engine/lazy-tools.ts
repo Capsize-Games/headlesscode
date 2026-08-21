@@ -64,6 +64,16 @@ export const CORE_TOOL_NAMES = new Set([
 	// necessarily a model capability ceiling. Still reachable via
 	// request_tool for a session that genuinely needs it.
 	"edit_file",
+	// set_indentation deliberately core, not lazy (issue #141): it exists
+	// specifically to give local sessions — the same sessions lazy-loading
+	// targets — a way to fix a pure indentation mismatch without edit_file's
+	// two-near-identical-multi-line-strings shape. Live-verified 2026-08-21:
+	// gating it behind request_tool defeated the whole point — a model given
+	// an explicit task-level instruction to use it still defaulted back to
+	// (always-visible) edit_file 2/2 times, then on a 3rd trial DID try to
+	// call it correctly but only as narrated text, never having pulled its
+	// real schema in via request_tool first.
+	"set_indentation",
 	"switch_mode",
 	"update_todo_list",
 	"write_to_file",

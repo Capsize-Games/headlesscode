@@ -1470,6 +1470,84 @@ async function editFileHandler(args: Record<string, unknown>, ctx: ToolContext):
 }
 
 /**
+ * set_indentation — change ONE line's leading indentation to an exact tab
+ * count, given as a plain integer rather than a literal whitespace string
+ * (issue #141). edit_file's old_string/new_string already tolerates
+ * whitespace-amount differences via buildWhitespaceTolerantRegex, but that
+ * only helps once the MATCH succeeds — live-verified 2026-08-21 that a
+ * local model asked to fix a pure-indentation mismatch, even given the
+ * exact current and desired content verbatim, sometimes submits an
+ * old_string byte-identical to new_string (refused by the "no changes to
+ * apply" check below `oldLF === newLF`) rather than actually varying the
+ * leading whitespace between the two multi-line strings it has to type
+ * out. An integer tab count sidesteps the problem structurally: there is
+ * no pair of near-identical multi-line strings for the model to get
+ * subtly wrong, just one small number.
+ */
+async function setIndentationHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+	const filePath = requireString(args, "path")
+	const line = toNonNegativeInt(args.line, 0)
+	const tabs = toNonNegativeInt(args.tabs, -1)
+
+	if (line < 1) {
+		return err(`set_indentation: 'line' must be a positive integer (1-indexed), got ${String(args.line)}`)
+	}
+	if (tabs < 0) {
+		return err(`set_indentation: 'tabs' must be a non-negative integer, got ${String(args.tabs)}`)
+	}
+
+	return (async () => {
+		const target = safeTarget(ctx, filePath)
+		const rel = path.relative(ctx.workspaceRoot, target).toPosix() || path.basename(target)
+
+		const refusal = protectedWriteRefusal("set_indentation", rel, ctx.permissions)
+		if (refusal !== null) {
+			return refusal
+		}
+
+		let content: string
+		try {
+			content = await fsp.readFile(target, "utf-8")
+		} catch (error) {
+			return err(`set_indentation: failed to read file '${rel}': ${errorMessage(error)}`)
+		}
+
+		const eol = detectLineEnding(content)
+		const lines = normalizeToLF(content).split("\n")
+		if (line > lines.length) {
+			return err(
+				`set_indentation: line ${line} does not exist — '${rel}' has ${lines.length} line(s).\n\nRecovery suggestions:\n1. Use read_file to confirm the real line number\n2. If the file has changed since you last read it, re-read and retry`,
+			)
+		}
+
+		const targetLine = lines[line - 1] ?? ""
+		const currentIndentMatch = /^[\t ]*/.exec(targetLine)
+		const currentIndent = currentIndentMatch ? currentIndentMatch[0] : ""
+		const rest = targetLine.slice(currentIndent.length)
+		const newIndent = "\t".repeat(tabs)
+
+		if (currentIndent === newIndent) {
+			return err(
+				`set_indentation: line ${line} of '${rel}' already has exactly ${tabs} leading tab(s) — no change to make.\n\nRecovery suggestions:\n1. Use read_file to confirm the real current indentation\n2. If a different line needs the fix, check the line number`,
+			)
+		}
+
+		lines[line - 1] = newIndent + rest
+		const newContent = restoreLineEnding(lines.join("\n"), eol)
+
+		try {
+			await fsp.writeFile(target, newContent, "utf-8")
+		} catch (error) {
+			return err(`set_indentation: failed to write '${rel}': ${errorMessage(error)}`)
+		}
+
+		return ok(
+			`File updated: ${rel} (line ${line} indentation changed from ${currentIndent.length} to ${tabs} tab${tabs === 1 ? "" : "s"})`,
+		)
+	})()
+}
+
+/**
  * execute_command — spawn via child_process, capture stdout+stderr.
  *
  * Timeout semantics follow the vendored tool's own contract (see
@@ -2285,6 +2363,7 @@ export function createHeadlessExecutor(workspaceRoot: string, options: ToolExecu
 	executor.register("apply_diff", applyDiffHandler)
 	executor.register("search_replace", searchReplaceHandler)
 	executor.register("edit_file", editFileHandler)
+	executor.register("set_indentation", setIndentationHandler)
 	executor.register("execute_command", executeCommandHandler)
 	executor.registerListFiles()
 	executor.register("codebase_search", codebaseSearchHandler)

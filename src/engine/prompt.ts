@@ -44,6 +44,7 @@ import { customModesSettingsSchema } from "../vendor/zoo-code/types/index.js"
 import { browserActionTool } from "../tools/browser/tool.js"
 import { describeImageTool } from "../vision/tool.js"
 import { runTestsTool } from "../tools/run-tests.js"
+import { setIndentationTool } from "../tools/set-indentation-tool.js"
 import { CODE_INTEL_TOOLS, RENAME_SYMBOL_TOOL } from "../codeintel/tools.js"
 import type { ModeConfig } from "../vendor/zoo-code/types/index.js"
 
@@ -699,6 +700,19 @@ export function appendRunTestsTool(tools: ChatTool[]): ChatTool[] {
 		return tools
 	}
 	return [...tools, runTestsTool as unknown as ChatTool]
+}
+
+/**
+ * Append the `set_indentation` tool schema if it isn't already present
+ * (issue #141). Only meaningful to edit-capable sessions — gated on the
+ * executor actually registering it, same as run_tests above (the headless
+ * executor does; read-only reviewer/QA executors do not).
+ */
+export function appendSetIndentationTool(tools: ChatTool[]): ChatTool[] {
+	if (tools.some((t) => t.type === "function" && t.function.name === setIndentationTool.function.name)) {
+		return tools
+	}
+	return [...tools, setIndentationTool as unknown as ChatTool]
 }
 
 /**
