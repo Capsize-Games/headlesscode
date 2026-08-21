@@ -39,6 +39,19 @@ while true; do
 		echo "[smart-log-watch] ATTENTION: same tool-call target repeated ${REPEAT_COUNT}x in the last 400 log lines (${REPEAT_TARGET}) — likely an unproductive read loop, not real progress"
 		continue
 	fi
+	# Bug found live 2026-08-21 (round 7): a FAILED tool result logs as
+	# `tool result: edit_file {"isError":true,"toolCalls":N}` — no "arg"
+	# field at all, so the check above is structurally blind to a tool
+	# repeatedly FAILING with varied args (62 straight edit_file
+	# failures went completely undetected this way for a full 20-minute
+	# round). Count failed-result lines per tool name instead, no "arg"
+	# dependency.
+	FAIL_TARGET=$(tail -n 400 "$LOGFILE" 2>/dev/null | grep -oE 'tool result: [a-z_]+ \{"isError":true' | sort | uniq -c | sort -rn | head -1)
+	FAIL_COUNT=$(echo "$FAIL_TARGET" | awk '{print $1}')
+	if [ -n "$FAIL_COUNT" ] && [ "$FAIL_COUNT" -ge 10 ] 2>/dev/null; then
+		echo "[smart-log-watch] ATTENTION: same tool failed ${FAIL_COUNT}x in the last 400 log lines (${FAIL_TARGET}) — likely stuck thrashing, not real progress"
+		continue
+	fi
 
 	TAIL=$(tail -c 8000 "$LOGFILE" 2>/dev/null | tr -d '\000')
 	PROMPT=$(python3 -c '

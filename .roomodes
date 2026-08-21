@@ -129,6 +129,7 @@ customModes:
       every worker downstream) as a one-time manual step.
     groups:
       - read
+      - command
       - ["edit", { fileRegex: "\\.md$", description: "Markdown files only" }]
     source: project
 
