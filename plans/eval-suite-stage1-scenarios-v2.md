@@ -23,9 +23,41 @@
 or if no appropriate logging takes place during this phase.
 
 ### Why This Wasn't Already Covered
-Existing tests focus on single-point failures rather than complex scenarios involving batched interactions across various tools. For example, existing unit testing covers basic cases like individual read/write commands failing once�but doesn't explore what happens under more realistic conditions where several distinct types of actions fail repeatedly over time. Additionally, current test suites don’t fully examine situations requiring interaction between identical call cooldown mechanisms described in issue #153.
 
-- src/engine/loop.ts:123 - Reference to DEFAULT_MAX_ITERATIONS and DEFAULT_CONSECUTIVE_ERROR_LIMIT which are crucial for handling error streaks.
-- src/engine/__tests__/loop.test.ts:102 - Example of a test setup that simulates tool calls and their outcomes.
-- src/engine/__tests__/loop.test.ts:205 - Illustration of how the harness handles errors during execution.
-- plans/live-message-injection-for-chat-uis.md:123 - Context about message injection and its impact on process termination.
+**Editor's note (added after mechanical citation verification —
+`scripts/eval-suite/verify-citations.mjs`, 2026-08-21): the citations
+originally written here were real file:line locations but carried
+FABRICATED claims that did not match the actual content at those
+lines — e.g. `loop.ts:123` was cited as "DEFAULT_CONSECUTIVE_ERROR_LIMIT"
+but is actually an unrelated `import` statement; a review-daemon
+judgment pass (deepseek-r1-distill-qwen-7b) scored this document PASS
+without catching the mismatch, since a text-only judge has no way to
+cross-check a citation against the real file. Replaced below with
+citations verified by actually reading each location.**
+
+Neither #150 (silent process death) nor this specific multi-tool
+repeated-failure interaction has an existing test:
+
+- `src/engine/loop.ts:153` — `DEFAULT_CONSECUTIVE_ERROR_LIMIT = 3`, the
+  generic consecutive-mistake limit. It counts ANY mistake (error,
+  parse failure, empty result, identical repeat) toward one shared
+  counter — it has no concept of "this specific tool has failed
+  repeatedly across a multi-tool turn," only a flat total.
+- `src/engine/loop.ts:3052` — `excludedToolCooldowns`, the identical-call
+  guardrail's tool-exclusion mechanism (issue #153's interaction
+  partner). No existing test exercises this cooldown excluding a tool
+  at the SAME time the repeated-tool-failure nudge (issue #146's fix)
+  is telling the model to use that exact tool for re-diagnosis.
+- `src/engine/__tests__/loop.test.ts:1840` —
+  `testToolFailureNudgeFiresOnVariedArgsRepeatedFailure`, the only
+  existing test for #146's fix. It uses a SINGLE tool (`edit_file`)
+  failing twice in a row — it never exercises a MIXED-tool turn (e.g.
+  `read_file` + `edit_file` + `execute_command` in one batch, or
+  interleaved across turns) or the cooldown interaction from #153.
+- `src/cli.ts:1264` — the process's real entry point
+  (`if (import.meta.url === ...) { main().then(...) }`). It catches a
+  rejected `main()` promise, but nothing here or in `loop.ts` registers
+  a `process.on("SIGTERM"|"uncaughtException"|"unhandledRejection")`
+  handler (confirmed via `grep -rn` across both files: zero matches) —
+  there is no code path that guarantees a final log line before the
+  process disappears, which is exactly #150's observed failure mode.
