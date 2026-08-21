@@ -62,6 +62,13 @@ export interface BudgetTrackerOptions {
 	now?: () => number
 	/** Pricing table (default: env-merged defaults) — inject for cost tests. */
 	pricing?: PricingTable
+	/**
+	 * When false, record() never accumulates cost (stays 0 forever) and
+	 * maxCostUsd checks never trip. Default true. Issue #144: a local-
+	 * backend session has no real dollar cost — computing and logging a
+	 * fabricated figure for it is noise at best, misleading at worst.
+	 */
+	trackCost?: boolean
 }
 
 /** Non-throwing snapshot of the budget state (surfaced on SessionResult). */
@@ -77,6 +84,7 @@ export class BudgetTracker {
 	private readonly budget: SessionBudget
 	private readonly now: () => number
 	private readonly pricing: PricingTable
+	private readonly trackCost: boolean
 	private readonly startedAt: number
 	private iterations = 0
 	private costUsd = 0
@@ -89,6 +97,7 @@ export class BudgetTracker {
 		this.budget = budget
 		this.now = options.now ?? (() => Date.now())
 		this.pricing = options.pricing ?? loadPricingTable()
+		this.trackCost = options.trackCost ?? true
 		this.startedAt = this.now()
 	}
 
@@ -145,6 +154,9 @@ export class BudgetTracker {
 	 * `BudgetExceededError` when the cost limit trips.
 	 */
 	record(input: { model: string; inputTokens?: number; outputTokens?: number; cachedTokens?: number }): void {
+		if (!this.trackCost) {
+			return
+		}
 		const cost = estimateCost({
 			model: input.model,
 			inputTokens: input.inputTokens ?? 0,

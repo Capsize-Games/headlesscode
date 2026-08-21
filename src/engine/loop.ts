@@ -988,6 +988,12 @@ export interface HeadlessSessionConfig {
 	 */
 	verifyBeforeCompletion?: boolean
 	/**
+	 * When false, cost is never tracked/accumulated for this session (see
+	 * BudgetTrackerOptions.trackCost) — local-backend sessions have no real
+	 * dollar cost. Default true.
+	 */
+	trackCost?: boolean
+	/**
 	 * Refuse attempt_completion when this session has never once called
 	 * execute_command, write_to_file, or edit_file — i.e. it has produced
 	 * no real, verifiable artifact or side effect. Issue #143: verified
@@ -1252,6 +1258,8 @@ export interface ResolvedSessionConfig {
 	patchLocalToolSchemas: boolean
 	/** See HeadlessSessionConfig.verifyBeforeCompletion (default false). */
 	verifyBeforeCompletion: boolean
+	/** See HeadlessSessionConfig.trackCost (default true). */
+	trackCost: boolean
 	/** See HeadlessSessionConfig.requireArtifactBeforeCompletion (default false). */
 	requireArtifactBeforeCompletion: boolean
 	/** See HeadlessSessionConfig.requireArtifactPathPattern (default undefined = no check). */
@@ -1557,6 +1565,7 @@ export class HeadlessSession {
 			requireExplicitCompletion: config.requireExplicitCompletion ?? false,
 			patchLocalToolSchemas: config.patchLocalToolSchemas ?? false,
 			verifyBeforeCompletion: config.verifyBeforeCompletion ?? false,
+			trackCost: config.trackCost ?? true,
 			requireArtifactBeforeCompletion: config.requireArtifactBeforeCompletion ?? false,
 			requireArtifactPathPattern: config.requireArtifactPathPattern,
 			requireArtifactMinCitations: config.requireArtifactMinCitations,
@@ -1894,7 +1903,10 @@ export class HeadlessSession {
 		}
 		const budgetTracker =
 			this.config.budgetTracker ??
-			new BudgetTracker(this.config.budget ?? {}, pricingTable ? { pricing: pricingTable } : {})
+			new BudgetTracker(this.config.budget ?? {}, {
+				trackCost: this.config.trackCost,
+				...(pricingTable ? { pricing: pricingTable } : {}),
+			})
 		// Stash it on the session so the new_task handler can hand the SAME
 		// instance to children (see handleNewTask).
 		this.budgetTracker = budgetTracker
@@ -3286,7 +3298,7 @@ export class HeadlessSession {
 					// growth. Both are already in memory — logged, not computed.
 					this.logger.info("[usage] running total", {
 						iteration,
-						costUsd: budgetTracker.totalCostUsd,
+						costUsd: this.config.trackCost ? budgetTracker.totalCostUsd : null,
 						iterations: budgetTracker.iterationCount,
 						inputTokens: this.totalInputTokens,
 						outputTokens: this.totalOutputTokens,

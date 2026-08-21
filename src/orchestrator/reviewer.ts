@@ -226,6 +226,10 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 		executor: createReadOnlyHeadlessExecutor(workspaceRoot),
 		llmClient: client,
 		logger,
+		// Issue #144: mirror cli.ts's local-backend cost-tracking skip — a
+		// review session on a local daemon (e.g. the 2080 review-daemon) has
+		// no real dollar cost either.
+		trackCost: !useLocalBackend,
 	})
 
 	const result: SessionResult = await session.run()

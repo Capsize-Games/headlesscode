@@ -1036,6 +1036,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// loop.ts's HeadlessSessionConfig.verifyBeforeCompletion doc comment.
 	const verifyBeforeCompletion =
 		useLocalCodeBackend && !envBoolean("HEADLESSCODE_ALLOW_UNVERIFIED_COMPLETION")
+	// Issue #144: local inference is free — a fabricated dollar figure in
+	// every log line is noise at best, misleading at worst.
+	const trackCost = !useLocalCodeBackend || envBoolean("HEADLESSCODE_FORCE_COST_TRACKING")
 	// Issue #143: unlike verifyBeforeCompletion above, this must NOT apply
 	// to every useLocalCodeBackend mode — deepseek-reviewer/qa-agent are
 	// read-only and their correct completion is often "read the files,
@@ -1197,6 +1200,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		requireExplicitCompletion,
 		patchLocalToolSchemas,
 		verifyBeforeCompletion,
+		trackCost,
 		requireArtifactBeforeCompletion,
 		requireArtifactPathPattern: options.requireArtifactPath,
 		requireArtifactMinCitations: options.requireArtifactMinCitations,

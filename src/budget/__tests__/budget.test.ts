@@ -89,6 +89,20 @@ async function testCostTripsOnFirstRecord(): Promise<void> {
 	assert.equal(t.check().reason, "cost")
 }
 
+async function testTrackCostFalseNeverAccumulatesOrTrips(): Promise<void> {
+	// Issue #144: local-backend sessions pass trackCost: false — cost must
+	// stay 0 forever (never computed at all, not just discarded) and
+	// maxCostUsd must never trip, even set low enough that it WOULD trip
+	// immediately with tracking on (see testCostTripsOnFirstRecord above).
+	const t = new BudgetTracker({ maxCostUsd: 0.001, maxDurationMs: 10_000, maxIterations: 10 }, { pricing: TEST_PRICING, trackCost: false })
+	for (let i = 0; i < 5; i++) {
+		t.tick()
+		t.record({ model: TEST_MODEL, inputTokens: 1000, outputTokens: 1000 })
+	}
+	assert.equal(t.totalCostUsd, 0, "cost must stay exactly 0 with trackCost: false")
+	assert.equal(t.check().ok, true, "a maxCostUsd cap that would otherwise trip immediately must never trip")
+}
+
 async function testDurationTrips(): Promise<void> {
 	const clock = new FakeClock()
 	const t = costTracker({ maxDurationMs: 100 }, clock.now)
@@ -322,6 +336,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["tracker: under budget -> ok with correct costUsd/elapsedMs/iterations", testUnderBudgetOk],
 	["tracker: cost trips at the threshold (record throws, check flags)", testCostTripsAtThreshold],
 	["tracker: cost trips on the first record below one call's cost", testCostTripsOnFirstRecord],
+	["tracker: trackCost false never accumulates cost or trips maxCostUsd (#144)", testTrackCostFalseNeverAccumulatesOrTrips],
 	["tracker: duration trips via a fake clock (tick re-checks elapsed)", testDurationTrips],
 	["tracker: iterations cap trips on the (maxIterations+1)th tick", testIterationsCap],
 	["tracker: check() reports the correct reason", testCheckReasons],
