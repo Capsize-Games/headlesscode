@@ -144,16 +144,87 @@ print(result)
 PYEOF
 }
 
-if [ -f "$REPO_ROOT/$ARTIFACT" ]; then
-	echo ""
-	echo "=== Phase 2: review-daemon judgment (2080, deepseek-r1-distill-qwen-7b) ==="
-	REVIEW1="$SCRATCH/guided-research-$STAMP-review1.txt"
-	review_doc "$REPO_ROOT/$ARTIFACT" "$REVIEW1"
-else
+if [ ! -f "$REPO_ROOT/$ARTIFACT" ]; then
 	echo "PHASE 1 FAILED: $ARTIFACT was never created."
 	exit 1
 fi
 
 echo ""
-echo "Artifact: $REPO_ROOT/$ARTIFACT"
-echo "Review:   $REVIEW1"
+echo "=== Phase 2: review-daemon judgment (2080, deepseek-r1-distill-qwen-7b) ==="
+REVIEW1="$SCRATCH/guided-research-$STAMP-review1.txt"
+review_doc "$REPO_ROOT/$ARTIFACT" "$REVIEW1"
+
+# Pull just the OVERALL line (the judge's chain-of-thought before it can
+# otherwise contain the string "FAIL" in passing, e.g. "did NOT fail") —
+# grep for the specific "OVERALL:" line and normalize whitespace/case.
+overall="$(grep -oiE 'OVERALL:[[:space:]]*(PASS|FAIL)' "$REVIEW1" | tail -1 | tr '[:upper:]' '[:lower:]')"
+
+if [[ "$overall" == *fail* ]]; then
+	echo ""
+	echo "=== Review FAILED. Dispatching ONE corrective retry (bounded — no further retries after this). ==="
+	RETRY_TASK_FILE="$REPO_ROOT/TASK_guided_research_retry_$STAMP.md"
+	LOG3="$SCRATCH/guided-research-$STAMP-phase3.log"
+
+	cat > "$RETRY_TASK_FILE" <<EOF
+## Rules
+- Unattended: never use ask_followup_question, never use switch_mode.
+- Fresh process, zero memory of any other session — you have never seen
+  the file below before this task told you about it.
+- Tools: read-only plus editing .md files only.
+
+## Task
+An independent reviewer already read \`$ARTIFACT\` (which exists — read
+it yourself first) and rejected it against this checklist:
+
+$(cat "$REVIEW1")
+
+Fix the document to genuinely satisfy every item the review marked NO
+(or the overall verdict, if individual items aren't clear from the text
+above) — edit \`$ARTIFACT\` in place using edit_file. Do not rewrite
+parts that were already fine. Every citation you add or keep must be
+verified by YOU via read_file immediately before writing it — a wrong
+line-number-but-plausible-claim citation is exactly the kind of defect
+that gets caught later (see issue #152/#153 if you want the full
+history), so re-verify, don't assume the existing ones are already
+correct either.
+
+When done, call attempt_completion with the file path as your result.
+EOF
+
+	cd "$REPO_ROOT"
+	HEADLESSCODE_CODE_MODE_BACKEND=ollama \
+	HEADLESSCODE_LOCAL_BACKEND_MODES=researcher \
+	HEADLESSCODE_OLLAMA_URL__RESEARCHER=http://localhost:11435 \
+	HEADLESSCODE_CODE_MODE_MODEL__RESEARCHER=qwen3-14b:latest \
+	npx tsx src/cli.ts \
+		--mode researcher \
+		--task-file "$RETRY_TASK_FILE" \
+		--workspace "$REPO_ROOT" \
+		--require-artifact-path "$ARTIFACT" \
+		--require-artifact-min-citations 4 \
+		--require-artifact-sections "Scenario 1|Scenario 2|Why This Wasn't Already Covered" \
+		--log-file "$LOG3" \
+		> "$LOG3.stdout" 2>&1
+	echo "phase 3 (retry) exit: $?"
+
+	echo ""
+	echo "=== Phase 4: re-review after the corrective retry ==="
+	REVIEW2="$SCRATCH/guided-research-$STAMP-review2.txt"
+	review_doc "$REPO_ROOT/$ARTIFACT" "$REVIEW2"
+	overall2="$(grep -oiE 'OVERALL:[[:space:]]*(PASS|FAIL)' "$REVIEW2" | tail -1 | tr '[:upper:]' '[:lower:]')"
+
+	echo ""
+	echo "Artifact:      $REPO_ROOT/$ARTIFACT"
+	echo "Review 1:      $REVIEW1 ($overall)"
+	echo "Retry task:    $RETRY_TASK_FILE"
+	echo "Review 2:      $REVIEW2 ($overall2)"
+	if [[ "$overall2" == *fail* ]]; then
+		echo "FINAL: still FAILING after the one bounded retry — needs a human/Claude look, not another automatic retry."
+	else
+		echo "FINAL: PASS after one corrective retry."
+	fi
+else
+	echo ""
+	echo "Artifact: $REPO_ROOT/$ARTIFACT"
+	echo "Review:   $REVIEW1 (PASS — no retry needed)"
+fi
