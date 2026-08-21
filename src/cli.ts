@@ -55,6 +55,8 @@ interface CliOptions {
 	sessionId?: string
 	/** See HeadlessSessionConfig.requireArtifactPathPattern (loop.ts) — a research-harness primitive. */
 	requireArtifactPath?: string
+	/** See HeadlessSessionConfig.requireArtifactMinCitations (loop.ts). */
+	requireArtifactMinCitations?: number
 	model?: string
 	maxIterations?: number
 	consecutiveErrorLimit?: number
@@ -479,7 +481,8 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 			case "--context-window":
 			case "--llm-timeout-ms":
 			case "--max-recursion-depth":
-			case "--max-mode-switches": {
+			case "--max-mode-switches":
+			case "--require-artifact-min-citations": {
 				const value = next()
 				const num = value === undefined ? Number.NaN : Number(value)
 				if (!Number.isInteger(num) || num <= 0) {
@@ -497,6 +500,8 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 					options.maxRecursionDepth = num
 				} else if (flag === "--max-mode-switches") {
 					options.maxModeSwitches = num
+				} else if (flag === "--require-artifact-min-citations") {
+					options.requireArtifactMinCitations = num
 				} else {
 					options.llmTimeoutMs = num
 				}
@@ -1135,6 +1140,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		verifyBeforeCompletion,
 		requireArtifactBeforeCompletion,
 		requireArtifactPathPattern: options.requireArtifactPath,
+		requireArtifactMinCitations: options.requireArtifactMinCitations,
 		guardLargeOverwrites,
 		llmClient: client,
 		logger,

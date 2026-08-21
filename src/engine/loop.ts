@@ -606,15 +606,30 @@ function editToolTargetPath(workspaceRoot: string, call: { name: string; args: R
 }
 
 /**
+ * A real file:line-shaped citation — e.g. `src/engine/loop.ts:123` or
+ * `src/tools/executor.ts:45-67`. Used by requireArtifactMinCitations to
+ * detect whether a research doc contains grounded evidence, not just
+ * unverified prose. Deliberately permissive on the file-extension part
+ * (any non-slash, non-colon run) so it matches citations across
+ * languages, not just TypeScript.
+ */
+const CITATION_PATTERN = /\b[\w.-]+(?:\/[\w.-]+)+\.\w+:\d+(?:-\d+)?\b/g
+
+/**
  * requireArtifactPathPattern's real check (see HeadlessSessionConfig's doc
  * comment) — a single-directory glob relative to workspaceRoot, e.g.
  * `"plans/research/*.md"`. Checks the REAL filesystem (not tool-call
  * bookkeeping): at least one non-empty file in the target directory whose
  * name matches the glob. Deliberately one directory level only — this
  * exists to verify one specific expected deliverable, not to implement a
- * general recursive glob engine.
+ * general recursive glob engine. Returns the matched file's citation count
+ * (via CITATION_PATTERN) so the caller can also enforce
+ * requireArtifactMinCitations without a second filesystem pass.
  */
-async function hasMatchingArtifactFile(workspaceRoot: string, pattern: string): Promise<boolean> {
+async function matchingArtifactFileStatus(
+	workspaceRoot: string,
+	pattern: string,
+): Promise<{ found: boolean; citationCount: number }> {
 	const lastSlash = pattern.lastIndexOf("/")
 	const dirPart = lastSlash === -1 ? "." : pattern.slice(0, lastSlash)
 	const namePattern = lastSlash === -1 ? pattern : pattern.slice(lastSlash + 1)
@@ -623,22 +638,25 @@ async function hasMatchingArtifactFile(workspaceRoot: string, pattern: string): 
 	try {
 		entries = await fsp.readdir(dirAbs)
 	} catch {
-		return false
+		return { found: false, citationCount: 0 }
 	}
 	for (const entry of entries) {
 		if (!path.matchesGlob(entry, namePattern)) {
 			continue
 		}
 		try {
-			const stat = await fsp.stat(path.join(dirAbs, entry))
+			const filePath = path.join(dirAbs, entry)
+			const stat = await fsp.stat(filePath)
 			if (stat.isFile() && stat.size > 0) {
-				return true
+				const content = await fsp.readFile(filePath, "utf-8")
+				const citationCount = content.match(CITATION_PATTERN)?.length ?? 0
+				return { found: true, citationCount }
 			}
 		} catch {
 			// Race with a concurrent delete/rename — treat as not-yet-matched.
 		}
 	}
-	return false
+	return { found: false, citationCount: 0 }
 }
 
 /**
@@ -895,6 +913,18 @@ export interface HeadlessSessionConfig {
 	 */
 	requireArtifactPathPattern?: string
 	/**
+	 * Companion to requireArtifactPathPattern — a MINIMUM number of real
+	 * file:line-shaped citations (e.g. `src/engine/loop.ts:123`) the
+	 * matched file's content must contain before completion is accepted.
+	 * File-existence alone (requireArtifactPathPattern with no minimum)
+	 * can still be satisfied by a stub — this forces the deliverable to
+	 * actually contain the kind of grounded evidence a real research pass
+	 * produces, not just a title and a paragraph of unverified prose.
+	 * Requires requireArtifactPathPattern to also be set. Undefined/0 =
+	 * no minimum (existence alone suffices).
+	 */
+	requireArtifactMinCitations?: number
+	/**
 	 * Refuse `write_to_file` (whole-file overwrite) against a file that
 	 * already has substantial content, nudging the model toward `edit_file`/
 	 * `search_replace` instead. Verified live 2026-08-20 against both
@@ -1096,6 +1126,8 @@ export interface ResolvedSessionConfig {
 	requireArtifactBeforeCompletion: boolean
 	/** See HeadlessSessionConfig.requireArtifactPathPattern (default undefined = no check). */
 	requireArtifactPathPattern?: string
+	/** See HeadlessSessionConfig.requireArtifactMinCitations (default undefined = no minimum). */
+	requireArtifactMinCitations?: number
 	/** See HeadlessSessionConfig.guardLargeOverwrites (default false). */
 	guardLargeOverwrites: boolean
 	/**
@@ -1395,6 +1427,7 @@ export class HeadlessSession {
 			verifyBeforeCompletion: config.verifyBeforeCompletion ?? false,
 			requireArtifactBeforeCompletion: config.requireArtifactBeforeCompletion ?? false,
 			requireArtifactPathPattern: config.requireArtifactPathPattern,
+			requireArtifactMinCitations: config.requireArtifactMinCitations,
 			guardLargeOverwrites: config.guardLargeOverwrites ?? false,
 			// Deliberately left undefined when the caller didn't configure it:
 			// the live OpenRouter models-endpoint lookup in maybeCondenseHistory
@@ -3380,39 +3413,49 @@ export class HeadlessSession {
 					continue
 				}
 
-				// requireArtifactPathPattern guardrail (research-harness
-				// primitive) — see HeadlessSessionConfig's doc comment. Checks
-				// the real filesystem, not tool-call bookkeeping, so a session
-				// that wrote SOMETHING but not the actual expected deliverable
-				// still gets refused.
-				if (
-					this.config.requireArtifactPathPattern !== undefined &&
-					!(await hasMatchingArtifactFile(this.config.workspaceRoot, this.config.requireArtifactPathPattern))
-				) {
-					for (const sibling of calls) {
-						if (sibling.id === completionCall.id) {
-							continue
+				// requireArtifactPathPattern / requireArtifactMinCitations
+				// guardrail (research-harness primitive) — see
+				// HeadlessSessionConfig's doc comments. Checks the real
+				// filesystem, not tool-call bookkeeping, so a session that
+				// wrote SOMETHING but not the actual expected deliverable (or
+				// wrote a contentless stub) still gets refused.
+				if (this.config.requireArtifactPathPattern !== undefined) {
+					const artifactStatus = await matchingArtifactFileStatus(
+						this.config.workspaceRoot,
+						this.config.requireArtifactPathPattern,
+					)
+					const minCitations = this.config.requireArtifactMinCitations ?? 0
+					const missingReason = !artifactStatus.found
+						? `no file matching '${this.config.requireArtifactPathPattern}' exists yet`
+						: artifactStatus.citationCount < minCitations
+							? `the file matching '${this.config.requireArtifactPathPattern}' only contains ${artifactStatus.citationCount} real file:line citation(s), fewer than the required ${minCitations}`
+							: undefined
+					if (missingReason !== undefined) {
+						for (const sibling of calls) {
+							if (sibling.id === completionCall.id) {
+								continue
+							}
+							messages.push({
+								role: "tool",
+								tool_call_id: sibling.id,
+								name: sibling.name,
+								content: `[System: not executed — attempt_completion was deferred because ${missingReason}; re-issue this call if still needed.]`,
+							})
 						}
 						messages.push({
 							role: "tool",
-							tool_call_id: sibling.id,
-							name: sibling.name,
-							content:
-								`[System: not executed — attempt_completion was deferred because no file matching '${this.config.requireArtifactPathPattern}' exists yet; re-issue this call if still needed.]`,
+							tool_call_id: completionCall.id,
+							name: "attempt_completion",
+							content: !artifactStatus.found
+								? `[System: attempt_completion was NOT accepted. This task requires producing a real file matching '${this.config.requireArtifactPathPattern}', and no such file exists on disk yet. Use write_to_file to actually create it with real content before calling attempt_completion again — analysis alone does not satisfy this task.]`
+								: `[System: attempt_completion was NOT accepted. ${missingReason}. Go back and read more of the real code, then rewrite the file with real path:line citations (e.g. 'src/engine/loop.ts:123') backing every claim — a document without grounded evidence is not real research.]`,
 						})
+						this.logger.warn("[loop] attempt_completion deferred", {
+							iteration,
+							reason: !artifactStatus.found ? "no file matching requireArtifactPathPattern" : "below requireArtifactMinCitations",
+						})
+						continue
 					}
-					messages.push({
-						role: "tool",
-						tool_call_id: completionCall.id,
-						name: "attempt_completion",
-						content:
-							`[System: attempt_completion was NOT accepted. This task requires producing a real file matching '${this.config.requireArtifactPathPattern}', and no such file exists on disk yet. Use write_to_file to actually create it with real content before calling attempt_completion again — analysis alone does not satisfy this task.]`,
-					})
-					this.logger.warn("[loop] attempt_completion deferred", {
-						iteration,
-						reason: "no file matching requireArtifactPathPattern",
-					})
-					continue
 				}
 
 				// Commit-before-finishing guardrail (structural backstop — see

@@ -202,6 +202,7 @@ async function makeSession(options: {
 	verifyBeforeCompletion?: boolean
 	requireArtifactBeforeCompletion?: boolean
 	requireArtifactPathPattern?: string
+	requireArtifactMinCitations?: number
 }) {
 	const session = new HeadlessSession({
 		workspaceRoot: options.workspaceRoot,
@@ -218,6 +219,7 @@ async function makeSession(options: {
 		verifyBeforeCompletion: options.verifyBeforeCompletion,
 		requireArtifactBeforeCompletion: options.requireArtifactBeforeCompletion,
 		requireArtifactPathPattern: options.requireArtifactPathPattern,
+		requireArtifactMinCitations: options.requireArtifactMinCitations,
 		// Checkpoints are default-on and would otherwise write real shadow-git
 		// commits to ~/.headlesscode/checkpoints on every test run; this suite
 		// isn't testing checkpoints (except the one that is), so keep tests
@@ -826,6 +828,50 @@ async function testRequireArtifactPathPatternAcceptsAnEmptyDirWrongFile(): Promi
 			4,
 			"a wrong-extension file in the same directory must not satisfy the glob",
 		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// Product direction 2026-08-21: file-existence alone can still be a
+// contentless stub — requireArtifactMinCitations forces the deliverable
+// to contain real file:line-shaped evidence (e.g. "src/engine/loop.ts:42"),
+// not just a title and unverified prose.
+async function testRequireArtifactMinCitationsRefusesAStubDoc(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-citations-"))
+	try {
+		const client = new FakeLlmClient([
+			() =>
+				toolCall("write_to_file", {
+					path: "plans/research/finding.md",
+					content: "# A finding\n\nSomething is probably wrong somewhere, I think.\n",
+				}),
+			() => toolCall("attempt_completion", { result: "Wrote the stub." }),
+			() =>
+				toolCall("write_to_file", {
+					path: "plans/research/finding.md",
+					content:
+						"# A finding\n\nReal evidence: src/engine/loop.ts:42 shows the bug, " +
+						"and src/tools/executor.ts:100-110 confirms it.\n",
+				}),
+			() => toolCall("attempt_completion", { result: "Wrote the real doc." }),
+		])
+		const session = await makeSession({
+			task: "research something and cite real evidence",
+			client,
+			workspaceRoot: ws,
+			requireArtifactPathPattern: "plans/research/*.md",
+			requireArtifactMinCitations: 2,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "Wrote the real doc.")
+		assert.equal(client.requests.length, 4, "the citation-less stub must not satisfy the gate")
+		const nudge = session.state.messages.find(
+			(m) => m.role === "tool" && (m.content ?? "").includes("path:line citations"),
+		)
+		assert.ok(nudge, "expected a nudge specifically naming the missing-citations reason")
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -2788,6 +2834,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	[
 		"requireArtifactPathPattern: a wrong-extension file in the same directory does not satisfy the glob",
 		testRequireArtifactPathPatternAcceptsAnEmptyDirWrongFile,
+	],
+	[
+		"requireArtifactMinCitations: refuses a contentless stub, accepts once real file:line citations exist",
+		testRequireArtifactMinCitationsRefusesAStubDoc,
 	],
 	[
 		"verifyBeforeCompletion: refuses every fabricated completion in a session, not just the first",
