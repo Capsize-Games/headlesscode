@@ -385,6 +385,19 @@ export async function buildLeanSystemPrompt(options: BuildSystemPromptOptions): 
 		"unverified change is not done. Call attempt_completion ALONE, never in " +
 		"the same turn as other tool calls — a bundled attempt_completion is " +
 		"refused and your other calls are wasted."
+	// GitHub issue #137: local sessions were observed calling
+	// ask_followup_question for routine implementation decisions they
+	// should just make themselves, even when the task text explicitly
+	// said not to — a per-task instruction alone is not enough, because
+	// it competes with whatever baseline tendency this prompt otherwise
+	// leaves unaddressed. Stated once, here, so it applies regardless of
+	// what any individual task file does or doesn't say.
+	const followupQuestionNote =
+		"Prefer making a reasonable, reversible decision yourself and stating " +
+		"your reasoning over calling ask_followup_question. Reserve that tool " +
+		"for choices that are genuinely destructive or ambiguous enough that " +
+		"guessing wrong would be costly — not for routine implementation " +
+		"decisions you can just make and adjust later if wrong."
 	// Replaces the vendored getObjectiveSection() (buildSystemPrompt uses that
 	// one): it references an "environment_details" file that does not exist
 	// in this headless harness (verified live 2026-08-19 — a local session
@@ -516,6 +529,7 @@ export async function buildLeanSystemPrompt(options: BuildSystemPromptOptions): 
 		modeConfig.roleDefinition,
 		toolUseNote,
 		verificationNote,
+		followupQuestionNote,
 		objectiveNote,
 		planningNote,
 		conventionNote,
