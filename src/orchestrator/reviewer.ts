@@ -29,6 +29,8 @@ import { fileURLToPath } from "node:url"
 import { HeadlessSession } from "../engine/loop.js"
 import { Logger } from "../engine/logger.js"
 import { OpenRouterClient } from "../llm/openrouter.js"
+import { OllamaClient } from "../llm/ollama.js"
+import { resolvePerModeEnv } from "../cli.js"
 import { createReadOnlyHeadlessExecutor } from "../tools/executor.js"
 import { getNativeTools } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/index.js"
 import type { ChatTool, LlmClient, SessionResult } from "../engine/types.js"
@@ -176,7 +178,27 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 	} = options
 
 	const systemPromptOverride = await fs.readFile(reviewPromptPath, "utf-8")
-	const client = llmClient ?? new OpenRouterClient({ apiKey: process.env.HEADLESSCODE_OPENROUTER_API_KEY, defaultModel: model })
+	// Issue #142 follow-up: orchestrate's review pass built its own
+	// OpenRouterClient unconditionally, so a local-backend setup (e.g. a
+	// review daemon on its own GPU) had no effect on it — only the
+	// single-session `--mode` CLI path respected HEADLESSCODE_LOCAL_BACKEND_MODES.
+	// Mirror cli.ts's gate here so `mode` (default "deepseek-reviewer")
+	// routes to the same local daemon a direct CLI invocation would.
+	const useLocalBackend =
+		process.env.HEADLESSCODE_CODE_MODE_BACKEND === "ollama" &&
+		(process.env.HEADLESSCODE_LOCAL_BACKEND_MODES ?? "code")
+			.split(",")
+			.map((s) => s.trim())
+			.filter(Boolean)
+			.includes(mode)
+	const client =
+		llmClient ??
+		(useLocalBackend
+			? new OllamaClient({
+					baseUrl: resolvePerModeEnv("HEADLESSCODE_OLLAMA_URL", mode),
+					defaultModel: resolvePerModeEnv("HEADLESSCODE_CODE_MODE_MODEL", mode) ?? model,
+				})
+			: new OpenRouterClient({ apiKey: process.env.HEADLESSCODE_OPENROUTER_API_KEY, defaultModel: model }))
 
 	// Mirror every log line to <worktree>/review.log — the same visibility
 	// `run-worker.sh` gives a worker via harness.log (a plain `tail -f`
