@@ -18,6 +18,7 @@ build/
 .worktrees/
 
 TASK.md
+TASK_*.md
 # Manual smoke-test output (src/tools/browser/smoke.ts)
 .smoke-artifacts/
 
