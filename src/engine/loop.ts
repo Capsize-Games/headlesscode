@@ -407,15 +407,29 @@ function identicalCallNudgeMessage(signature: string, streak: number, nextTodo: 
  * CURRENT real content, quote the exact text to match) rather than a vague
  * "try something different" — the same lesson identicalCallNudgeMessage's
  * own doc comment already draws from a prior failed generic-nudge attempt.
+ *
+ * `readFileAvailable` (issue #153): live-verified 2026-08-21
+ * (scripts/eval-suite/scenario-146-repeated-tool-failure.sh) that this
+ * nudge's own advice — "use read_file" — can collide with the SEPARATE
+ * identical-call guardrail's tool-exclusion cooldown (excludedToolCooldowns
+ * in runIterations) making read_file temporarily unavailable at the exact
+ * moment this nudge fires, e.g. right after two identical read_file calls
+ * tripped that OTHER guardrail. A model told to use a tool it cannot
+ * currently call has no good move — in the observed trial it fabricated a
+ * fake `<tool_call>` text block for the excluded tool instead of a real
+ * one. When the caller reports read_file is unavailable, this message
+ * points at re-deriving the content from context already in the
+ * conversation instead of recommending a call that would just fail.
  */
-function toolFailureNudgeMessage(toolName: string, streak: number, targetLabel: string | undefined): string {
+function toolFailureNudgeMessage(toolName: string, streak: number, targetLabel: string | undefined, readFileAvailable: boolean): string {
 	const targetHint = targetLabel ? ` on '${targetLabel}'` : ""
+	const reDiagnoseStep = readFileAvailable
+		? `use read_file to see the file's CURRENT exact content around your target, quote the exact text you intend to match, and only THEN retry ${toolName}`
+		: `read_file is temporarily unavailable (cooldown from a recent repeat) — instead, carefully re-derive the exact current content from what you already read earlier in this conversation, quote the exact text you intend to match, and only THEN retry ${toolName}`
 	return (
 		`Your last ${streak} attempts to use ${toolName}${targetHint} all failed, even though the arguments were ` +
-		`different each time. Varying the arguments and hoping is not working. Before trying again: use read_file ` +
-		`to see the file's CURRENT exact content around your target, quote the exact text you intend to match, and ` +
-		`only THEN retry ${toolName} — do not just adjust the arguments again without first confirming what the ` +
-		`file actually contains right now.`
+		`different each time. Varying the arguments and hoping is not working. Before trying again: ${reDiagnoseStep} ` +
+		`— do not just adjust the arguments again without first confirming what the file actually contains right now.`
 	)
 }
 
@@ -4189,7 +4203,12 @@ export class HeadlessSession {
 							: undefined
 					messages.push({
 						role: "user",
-						content: toolFailureNudgeMessage(toolFailureStreakName, toolFailureStreakCount, targetLabel),
+						content: toolFailureNudgeMessage(
+							toolFailureStreakName,
+							toolFailureStreakCount,
+							targetLabel,
+							!excludedToolCooldowns.has("read_file"),
+						),
 					})
 					this.logger.warn("[loop] repeated-tool-failure nudge injected", {
 						iteration,

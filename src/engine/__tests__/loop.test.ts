@@ -1964,6 +1964,49 @@ async function testToolFailureStreakResetsOnSuccess(): Promise<void> {
 	}
 }
 
+// Issue #153: the nudge's own advice ("use read_file") must not recommend a
+// tool that's currently excluded by the SEPARATE identical-call cooldown —
+// live-verified 2026-08-21 that this collision made a real session fabricate
+// a fake tool call for the unavailable tool. Two identical read_file calls
+// first trip that cooldown, THEN two varied-args edit_file failures fire
+// this guardrail's nudge — it must not tell the model to do the one thing
+// it currently cannot do.
+async function testToolFailureNudgeAdaptsWhenReadFileIsOnCooldown(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-toolfail-cooldown-"))
+	try {
+		await fs.writeFile(path.join(ws, "target.ts"), "export const value = 1\n")
+		const client = new FakeLlmClient([
+			() => toolCall("read_file", { path: "target.ts" }),
+			() => toolCall("read_file", { path: "target.ts" }),
+			() => toolCall("edit_file", { file_path: "target.ts", old_string: "wrong attempt 1", new_string: "x" }),
+			() => toolCall("edit_file", { file_path: "target.ts", old_string: "wrong attempt 2", new_string: "x" }),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({ task: "fix the file", client, workspaceRoot: ws, maxIterations: 250 })
+		await session.run()
+
+		const readFileExcluded = client.requests.some((r) => !(r.tools ?? []).some((t) => t.function.name === "read_file"))
+		assert.ok(readFileExcluded, "sanity check: read_file must actually have been excluded by the identical-call cooldown at some point")
+
+		const nudge = session.state.messages.find(
+			(m) => m.role === "user" && typeof m.content === "string" && m.content.includes("all failed, even though the arguments were"),
+		)
+		assert.ok(nudge, "expected the repeated-tool-failure nudge to have fired")
+		assert.match(
+			nudge?.content as string,
+			/read_file is temporarily unavailable/,
+			"nudge must not recommend read_file while it's excluded by the identical-call cooldown",
+		)
+		assert.doesNotMatch(
+			nudge?.content as string,
+			/^Your.*use read_file to see/s,
+			"nudge must not use the normal 'use read_file' phrasing while it's unavailable",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── isReadOnlyEquivalentShellCommand (unit-level) ───────────────────────────
 
 async function testIsReadOnlyEquivalentShellCommandClassifiesCorrectly(): Promise<void> {
@@ -3071,6 +3114,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["repeated-tool-failure (#146): 1 failure (below threshold) does not fire the nudge", testToolFailureStreakDoesNotFireOnIdenticalCallGuardAlone],
 	["repeated-tool-failure (#146): a real read_file on the same target between failures resets the streak", testToolFailureStreakResetsOnRediagnosticReadFile],
 	["repeated-tool-failure (#146): a real successful edit_file call between failures resets the streak", testToolFailureStreakResetsOnSuccess],
+	["repeated-tool-failure (#153): nudge adapts its wording when read_file is excluded by the identical-call cooldown", testToolFailureNudgeAdaptsWhenReadFileIsOnCooldown],
 	["isReadOnlyEquivalentShellCommand: classifies read-only vs. mutating shell commands", testIsReadOnlyEquivalentShellCommandClassifiesCorrectly],
 	["live snapshot: created + updated in place during a running session's iterations", testLiveSnapshotCreatedAndUpdatedDuringIterations],
 	["live snapshot: removed on successful completion", testLiveSnapshotRemovedOnSuccess],
