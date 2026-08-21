@@ -732,6 +732,47 @@ function editToolTargetPath(workspaceRoot: string, call: { name: string; args: R
 const CITATION_PATTERN = /\b[\w.-]+(?:\/[\w.-]+)+\.\w+:\d+(?:-\d+)?\b/g
 
 /**
+ * Verifies a CITATION_PATTERN match's file:line actually exists on disk —
+ * closes PART of issue #152's gap (a citation-shaped string previously
+ * counted toward requireArtifactMinCitations even when the cited file
+ * doesn't exist, or the line number is past the file's real length).
+ * Does NOT verify the citation's CLAIM matches the real content at that
+ * location — that needs semantic understanding no deterministic check
+ * can provide (confirmed live 2026-08-21: a real-line-number-but-
+ * fabricated-claim citation slipped past both this kind of mechanical
+ * count AND an LLM judge given only document text — see
+ * scripts/eval-suite/verify-citations.mjs, the human/Claude-facing tool
+ * that surfaces the real content for that judgment call instead). This
+ * only catches a citation pointing at something that doesn't exist at
+ * all — a real, if partial, improvement: previously ANY citation-shaped
+ * text counted, even a wholly invented file path.
+ */
+async function countVerifiedCitations(content: string, workspaceRoot: string): Promise<number> {
+	const matches = content.match(CITATION_PATTERN) ?? []
+	let verified = 0
+	for (const citation of matches) {
+		const parsed = /^(.+):(\d+)(?:-(\d+))?$/.exec(citation)
+		if (!parsed) {
+			continue
+		}
+		const [, filePart, startStr, endStr] = parsed
+		const start = Number(startStr)
+		const end = endStr ? Number(endStr) : start
+		try {
+			const fileContent = await fsp.readFile(path.resolve(workspaceRoot, filePart), "utf-8")
+			const lineCount = fileContent.split("\n").length
+			if (start >= 1 && end <= lineCount) {
+				verified++
+			}
+		} catch {
+			// File doesn't exist, unreadable, or outside the workspace — not
+			// a real citation regardless of how plausible the text looks.
+		}
+	}
+	return verified
+}
+
+/**
  * requireArtifactPathPattern's real check (see HeadlessSessionConfig's doc
  * comment) — a single-directory glob relative to workspaceRoot, e.g.
  * `"plans/research/*.md"`. Checks the REAL filesystem (not tool-call
@@ -765,7 +806,7 @@ async function matchingArtifactFileStatus(
 			const stat = await fsp.stat(filePath)
 			if (stat.isFile() && stat.size > 0) {
 				const content = await fsp.readFile(filePath, "utf-8")
-				const citationCount = content.match(CITATION_PATTERN)?.length ?? 0
+				const citationCount = await countVerifiedCitations(content, workspaceRoot)
 				return { found: true, citationCount, relativePath: path.relative(workspaceRoot, filePath), content }
 			}
 		} catch {

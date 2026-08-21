@@ -839,9 +839,21 @@ async function testRequireArtifactPathPatternAcceptsAnEmptyDirWrongFile(): Promi
 // contentless stub — requireArtifactMinCitations forces the deliverable
 // to contain real file:line-shaped evidence (e.g. "src/engine/loop.ts:42"),
 // not just a title and unverified prose.
+// Citations must point at REAL files that genuinely exist in the session's
+// own workspace (issue #152: a citation-shaped string used to count toward
+// requireArtifactMinCitations even when the file didn't exist) — creates
+// two small real fixture files a test's citations can verifiably reference.
+async function writeCitationFixtureFiles(ws: string): Promise<void> {
+	await fs.mkdir(path.join(ws, "src"), { recursive: true })
+	const lines = (n: number) => Array.from({ length: n }, (_, i) => `line ${i + 1}`).join("\n") + "\n"
+	await fs.writeFile(path.join(ws, "src", "example.ts"), lines(60))
+	await fs.writeFile(path.join(ws, "src", "other.ts"), lines(150))
+}
+
 async function testRequireArtifactMinCitationsRefusesAStubDoc(): Promise<void> {
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-citations-"))
 	try {
+		await writeCitationFixtureFiles(ws)
 		const client = new FakeLlmClient([
 			() =>
 				toolCall("write_to_file", {
@@ -853,8 +865,8 @@ async function testRequireArtifactMinCitationsRefusesAStubDoc(): Promise<void> {
 				toolCall("write_to_file", {
 					path: "plans/research/finding.md",
 					content:
-						"# A finding\n\nReal evidence: src/engine/loop.ts:42 shows the bug, " +
-						"and src/tools/executor.ts:100-110 confirms it.\n",
+						"# A finding\n\nReal evidence: src/example.ts:42 shows the bug, " +
+						"and src/other.ts:100-110 confirms it.\n",
 				}),
 			() => toolCall("attempt_completion", { result: "Wrote the real doc." }),
 		])
@@ -886,18 +898,19 @@ async function testRequireArtifactMinCitationsRefusesAStubDoc(): Promise<void> {
 async function testRequireArtifactSectionsRefusesASurveyWithoutAProposal(): Promise<void> {
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-sections-"))
 	try {
+		await writeCitationFixtureFiles(ws)
 		const client = new FakeLlmClient([
 			() =>
 				toolCall("write_to_file", {
 					path: "plans/research/finding.md",
-					content: "# Survey\n\nsrc/engine/loop.ts:42 does a thing. src/tools/executor.ts:10 does another.\n",
+					content: "# Survey\n\nsrc/example.ts:42 does a thing. src/other.ts:10 does another.\n",
 				}),
 			() => toolCall("attempt_completion", { result: "Wrote the survey." }),
 			() =>
 				toolCall("write_to_file", {
 					path: "plans/research/finding.md",
 					content:
-						"# Finding\n\nsrc/engine/loop.ts:42 has a bug, confirmed against src/tools/executor.ts:10.\n\n" +
+						"# Finding\n\nsrc/example.ts:42 has a bug, confirmed against src/other.ts:10.\n\n" +
 						"## What to build\n\nFix the bug.\n\n## What NOT to do\n\nDon't touch anything else.\n",
 				}),
 			() => toolCall("attempt_completion", { result: "Wrote the real proposal." }),
@@ -919,6 +932,55 @@ async function testRequireArtifactSectionsRefusesASurveyWithoutAProposal(): Prom
 			(m) => m.role === "tool" && (m.content ?? "").includes("missing required section"),
 		)
 		assert.ok(nudge, "expected a nudge naming the missing sections")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// Issue #152: a citation-shaped string used to count toward
+// requireArtifactMinCitations even when the cited file was completely
+// fabricated (didn't exist at all) — live-verified 2026-08-21 that a real
+// document passed this gate with citations carrying real line numbers but
+// WRONG file paths pointing at nothing. countVerifiedCitations now checks
+// each citation's file:line genuinely exists before counting it.
+async function testRequireArtifactMinCitationsRejectsFabricatedFileCitations(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-fakecite-"))
+	try {
+		await writeCitationFixtureFiles(ws)
+		const client = new FakeLlmClient([
+			() =>
+				toolCall("write_to_file", {
+					path: "plans/research/finding.md",
+					content:
+						"# A finding\n\nFabricated evidence: src/does/not/exist.ts:42 shows the bug, " +
+						"and src/also/fake.ts:10-20 confirms it. Two citation-shaped strings, zero real files.\n",
+				}),
+			() => toolCall("attempt_completion", { result: "Wrote the fabricated-citation doc." }),
+			() =>
+				toolCall("write_to_file", {
+					path: "plans/research/finding.md",
+					content:
+						"# A finding\n\nReal evidence: src/example.ts:42 shows the bug, " +
+						"and src/other.ts:100-110 confirms it.\n",
+				}),
+			() => toolCall("attempt_completion", { result: "Wrote the real doc." }),
+		])
+		const session = await makeSession({
+			task: "research something and cite real evidence",
+			client,
+			workspaceRoot: ws,
+			requireArtifactPathPattern: "plans/research/*.md",
+			requireArtifactMinCitations: 2,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "Wrote the real doc.")
+		assert.equal(
+			client.requests.length,
+			4,
+			"citation-shaped strings pointing at files that don't exist must NOT satisfy the gate, even with real line numbers",
+		)
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -3063,6 +3125,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	[
 		"requireArtifactMinCitations: refuses a contentless stub, accepts once real file:line citations exist",
 		testRequireArtifactMinCitationsRefusesAStubDoc,
+	],
+	[
+		"requireArtifactMinCitations (#152): rejects citation-shaped strings pointing at files that don't exist",
+		testRequireArtifactMinCitationsRejectsFabricatedFileCitations,
 	],
 	[
 		"requireArtifactSections: refuses a cited-but-sectionless survey, accepts once required sections exist",
