@@ -36,8 +36,11 @@ FROM node:22-bookworm-slim
 # shells out to git constantly. ca-certificates: HTTPS for OpenRouter + npm.
 # curl: handy for debugging the sidecar (no healthcheck dependency on it —
 # the compose healthcheck calls `headlesscode --version`).
+# gh: the GitHub CLI, used by execute_command inside worktrees (UwUChat
+# code-mode proxy tools call execute_command with `gh ...`); token auth
+# via GH_TOKEN/GITHUB_TOKEN env, matching src/watcher/github.ts.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates curl \
+    && apt-get install -y --no-install-recommends git ca-certificates curl gh \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/headlesscode
