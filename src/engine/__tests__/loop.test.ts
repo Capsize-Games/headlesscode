@@ -22,6 +22,7 @@ import {
 	DEFAULT_MAX_MODE_SWITCHES,
 	DEFAULT_MAX_RECURSION_DEPTH,
 	DEFAULT_MAX_TOKENS,
+	DEFAULT_MIN_CHILD_ITERATIONS,
 	isReadOnlyEquivalentShellCommand,
 	stripSupersededReasoning,
 	truncateHistory,
@@ -2282,6 +2283,68 @@ async function testMaxRecursionDepthAllowsDelegationBelowCap(): Promise<void> {
 	}
 }
 
+// ─── Child-iteration floor (issue #151 coverage gap) ─────────────────────────
+// new_task's child iteration budget is
+// max(minChildIterations, floor(remaining * childIterationFraction)),
+// clamped to remaining (handleNewTask, loop.ts). Zero test coverage —
+// confirmed by grepping this file for "childIteration"/"minChildIterations":
+// no hits before this test. With a small parent maxIterations, the
+// fraction-based share rounds below DEFAULT_MIN_CHILD_ITERATIONS (3), so the
+// floor must win regardless of the exact `remaining` value at call time.
+
+async function testMinChildIterationsFloorApplies(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-child-floor-"))
+	try {
+		// Parent maxIterations=5: remaining is 4 or 5 depending on exactly
+		// when currentIteration is read, but floor(4*0.5)=2 and
+		// floor(5*0.5)=2 are both below minChildIterations(3) either way —
+		// the floor wins regardless, so this test doesn't depend on that
+		// exact off-by-one. The child never completes (distinct successful
+		// execute_command calls, same shape as testMaxIterationsBound, so no
+		// OTHER guardrail fires first) and must hit its own bounded
+		// max-iterations failure at exactly 3.
+		const client = new FakeLlmClient([
+			() => toolCall("new_task", { mode: "code", message: "do a subtask that never finishes" }),
+			() => toolCall("execute_command", { command: "node -e 'console.log(0)'" }), // child iter 1
+			() => toolCall("execute_command", { command: "node -e 'console.log(1)'" }), // child iter 2
+			() => toolCall("execute_command", { command: "node -e 'console.log(2)'" }), // child iter 3, hits its cap
+			// Hitting its own iteration cap makes the CHILD issue one more
+			// internal LLM call to write its handoff summary (loop.ts's
+			// writeHandoffSummary path) — a real request that must be
+			// answered on the same shared script queue, discovered live
+			// while writing this test (an earlier version without this
+			// entry threw "script exhausted" because this call silently ate
+			// the entry meant for the parent's resumption below).
+			() => textReply("Session hit its iteration cap after exploring."),
+			() => toolCall("attempt_completion", { result: "parent done" }), // parent, resumed
+		])
+		const session = await makeSession({
+			task: "delegate a subtask with a tight parent budget",
+			client,
+			workspaceRoot: ws,
+			maxIterations: 5,
+		})
+		const result = await session.run()
+
+		assert.equal(
+			result.status,
+			"success",
+			`the child's own bounded failure is recoverable — the parent should still finish; got ${JSON.stringify(result)}`,
+		)
+		const childFailure = session.state.messages.find(
+			(m) => m.role === "tool" && (m.content ?? "").includes("new_task child session"),
+		)
+		assert.ok(childFailure, "expected new_task to report the child's bounded failure to the parent")
+		assert.match(
+			childFailure?.content as string,
+			new RegExp(`over ${DEFAULT_MIN_CHILD_ITERATIONS} iteration\\(s\\)`),
+			`the child must be capped at exactly DEFAULT_MIN_CHILD_ITERATIONS (${DEFAULT_MIN_CHILD_ITERATIONS}), not a fraction-derived value below the floor`,
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── isReadOnlyEquivalentShellCommand (unit-level) ───────────────────────────
 
 async function testIsReadOnlyEquivalentShellCommandClassifiesCorrectly(): Promise<void> {
@@ -3425,6 +3488,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["mode-switch cap (#151): switching below the threshold never trips it", testMaxModeSwitchesCapDoesNotFireBelowThreshold],
 	["maxTokens (#151): the session's configured maxTokens is on every LLM request", testMaxTokensFlowsIntoRequests],
 	["maxTokens (#151): zero config falls back to DEFAULT_MAX_TOKENS", testMaxTokensDefaultsWhenNotConfigured],
+	["child-iteration floor (#151): a tight parent budget still caps the child at DEFAULT_MIN_CHILD_ITERATIONS", testMinChildIterationsFloorApplies],
 	["recursion-depth cap (#151): new_task is refused once recursionDepth reaches DEFAULT_MAX_RECURSION_DEPTH", testMaxRecursionDepthRefusesDelegationAtCap],
 	["recursion-depth cap (#151): a delegation below the cap runs the child session for real and never trips it", testMaxRecursionDepthAllowsDelegationBelowCap],
 ]
