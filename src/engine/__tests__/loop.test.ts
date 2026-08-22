@@ -21,6 +21,7 @@ import {
 	DEFAULT_IDENTICAL_CALL_REPEAT_PENALTY_BOOST,
 	DEFAULT_MAX_MODE_SWITCHES,
 	DEFAULT_MAX_RECURSION_DEPTH,
+	DEFAULT_MAX_TOKENS,
 	isReadOnlyEquivalentShellCommand,
 	stripSupersededReasoning,
 	truncateHistory,
@@ -195,6 +196,7 @@ async function makeSession(options: {
 	budget?: SessionBudget
 	/** Graded reasoning effort for deepseek/* models (issue #30). */
 	reasoningEffort?: string
+	maxTokens?: number
 	/** Checkpoints on/off + shadow-git storage dir (default off — see below). */
 	checkpoints?: boolean
 	checkpointDir?: string
@@ -222,6 +224,7 @@ async function makeSession(options: {
 		windowSize: options.windowSize ?? 40,
 		budget: options.budget ?? null,
 		reasoningEffort: options.reasoningEffort,
+		maxTokens: options.maxTokens,
 		requireExplicitCompletion: options.requireExplicitCompletion,
 		verifyBeforeCompletion: options.verifyBeforeCompletion,
 		requireArtifactBeforeCompletion: options.requireArtifactBeforeCompletion,
@@ -292,6 +295,44 @@ async function testReasoningEffortAbsentByDefault(): Promise<void> {
 			client.requests[0]?.reasoningEffort,
 			undefined,
 			"zero config -> no reasoningEffort on requests (endpoint default applies)",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// ─── maxTokens request wiring (issue #151 coverage gap) ──────────────────────
+// DEFAULT_MAX_TOKENS (loop.ts:233) sits on the same request-building line as
+// reasoningEffort (loop.ts:3072-3074) but had zero test coverage — confirmed
+// by grepping this file for "maxTokens": no hits before this pair.
+
+async function testMaxTokensFlowsIntoRequests(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-mt-"))
+	try {
+		const client = new FakeLlmClient([() => textReply("Done.")])
+		const session = await makeSession({ task: "say done", client, workspaceRoot: ws, maxTokens: 4096 })
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(
+			client.requests[0]?.maxTokens,
+			4096,
+			"the session's configured maxTokens must be on every LLM request",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testMaxTokensDefaultsWhenNotConfigured(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-mt2-"))
+	try {
+		const client = new FakeLlmClient([() => textReply("Done.")])
+		const session = await makeSession({ task: "say done", client, workspaceRoot: ws })
+		await session.run()
+		assert.equal(
+			client.requests[0]?.maxTokens,
+			DEFAULT_MAX_TOKENS,
+			"zero config -> DEFAULT_MAX_TOKENS on requests",
 		)
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
@@ -3382,6 +3423,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["Part E: no live pricing → hardcoded table fallback, unchanged behavior", testBudgetFallsBackToHardcodedTableWithoutLivePricing],
 	["mode-switch cap (#151): the 6th switch is refused once modeSwitchCount reaches DEFAULT_MAX_MODE_SWITCHES", testMaxModeSwitchesCapsAtThreshold],
 	["mode-switch cap (#151): switching below the threshold never trips it", testMaxModeSwitchesCapDoesNotFireBelowThreshold],
+	["maxTokens (#151): the session's configured maxTokens is on every LLM request", testMaxTokensFlowsIntoRequests],
+	["maxTokens (#151): zero config falls back to DEFAULT_MAX_TOKENS", testMaxTokensDefaultsWhenNotConfigured],
 	["recursion-depth cap (#151): new_task is refused once recursionDepth reaches DEFAULT_MAX_RECURSION_DEPTH", testMaxRecursionDepthRefusesDelegationAtCap],
 	["recursion-depth cap (#151): a delegation below the cap runs the child session for real and never trips it", testMaxRecursionDepthAllowsDelegationBelowCap],
 ]
