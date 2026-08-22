@@ -88,6 +88,7 @@ import * as http from "node:http"
 import * as path from "node:path"
 
 import { buildSummary, findSessionEventsFile, readSessionEvents } from "./aggregate.js"
+import { computeSelfImprovementMetrics, type SelfImprovementMetrics } from "./self-improvement-metrics.js"
 import { diffCheckpoints, listCheckpoints, renderUnifiedDiff, restoreCheckpoint } from "./checkpoints.js"
 import { codemapMissingError, readCodemapHtml, readCodemapJson } from "./codemap.js"
 import { renderPage } from "./page.js"
@@ -115,6 +116,19 @@ import { PathTraversalError } from "../tools/executor.js"
 
 /** Default dashboard port (overridable via --port or $HEADLESSCODE_DASHBOARD_PORT). */
 export const DEFAULT_DASHBOARD_PORT = 4390
+
+/**
+ * Self-improvement metrics (issue #145) cache: computeSelfImprovementMetrics
+ * shells out to `gh issue list` (real network + GitHub API), which the
+ * dashboard's poll loop hitting this endpoint every few seconds would
+ * otherwise fire on every poll — a short in-memory TTL keeps the page
+ * responsive and avoids hammering the GitHub API for a value that only
+ * meaningfully changes on the order of minutes, not seconds. Deliberately
+ * a server/HTTP-layer concern, not baked into the (pure, unit-tested)
+ * computation module itself.
+ */
+const SELF_IMPROVEMENT_CACHE_TTL_MS = 30_000
+let selfImprovementCache: { repo: string; computedAt: number; data: SelfImprovementMetrics } | undefined
 
 export interface DashboardServerOptions {
 	port: number
@@ -851,6 +865,35 @@ async function handleRequest(
 		try {
 			const summary = await buildSummary(options.repo)
 			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(JSON.stringify(summary))
+		} catch (error) {
+			res
+				.writeHead(500, { "content-type": "application/json; charset=utf-8" })
+				.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+		}
+		return
+	}
+
+	// Recursive self-improvement progress metrics (issue #145): GET
+	// /api/self-improvement?repo=<path>. Local-dashboard-only per direct
+	// product direction (2026-08-21) — the external home.capsize.online
+	// deploy the original issue named is explicitly out of scope; this repo
+	// only needs to expose the data + a local view of it.
+	if (url.pathname === "/api/self-improvement" && req.method === "GET") {
+		const repo = url.searchParams.get("repo") || options.repo
+		if (!repo) {
+			res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ error: "missing repo — pass ?repo=<path> or start the dashboard with --repo" }),
+			)
+			return
+		}
+		try {
+			const cached = selfImprovementCache
+			const fresh = cached && cached.repo === repo && Date.now() - cached.computedAt < SELF_IMPROVEMENT_CACHE_TTL_MS
+			const data = fresh && cached ? cached.data : await computeSelfImprovementMetrics(repo)
+			if (!fresh) {
+				selfImprovementCache = { repo, computedAt: Date.now(), data }
+			}
+			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(JSON.stringify(data))
 		} catch (error) {
 			res
 				.writeHead(500, { "content-type": "application/json; charset=utf-8" })

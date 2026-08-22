@@ -387,19 +387,21 @@ export function renderPage(repo?: string): string {
   .tl-iter-body { padding: 2px 2px 6px 14px; color: GrayText; }
 
   /* Cost history (issue #29): historical per-round cost/token/duration charts,
-     rendered as inline SVG (no charting library). */
-  #costHistory .ch-chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
-  #costHistory .ch-chip {
+     rendered as inline SVG (no charting library). Same rules also style the
+     self-improvement progress section (issue #145) — shared look, separate
+     data source. */
+  #costHistory .ch-chips, #selfImprovement .ch-chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  #costHistory .ch-chip, #selfImprovement .ch-chip {
     border: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
     border-radius: 8px; padding: 4px 10px; display: flex; gap: 6px; align-items: baseline;
     background: color-mix(in srgb, CanvasText 4%, transparent);
   }
-  #costHistory .ch-chip .ch-chip-label { color: GrayText; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.03em; }
-  #costHistory .ch-chip .ch-chip-value { font-weight: 600; }
-  #costHistory .ch-chip.ch-wasted .ch-chip-value { color: #c0392b; }
-  #costHistory .ch-block { margin-bottom: 16px; }
-  #costHistory .ch-block-title { font-size: 0.82rem; font-weight: 600; margin-bottom: 4px; }
-  #costHistory .ch-block-sub { font-size: 0.72rem; color: GrayText; margin-bottom: 6px; }
+  #costHistory .ch-chip .ch-chip-label, #selfImprovement .ch-chip .ch-chip-label { color: GrayText; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.03em; }
+  #costHistory .ch-chip .ch-chip-value, #selfImprovement .ch-chip .ch-chip-value { font-weight: 600; }
+  #costHistory .ch-chip.ch-wasted .ch-chip-value, #selfImprovement .ch-chip.ch-wasted .ch-chip-value { color: #c0392b; }
+  #costHistory .ch-block, #selfImprovement .ch-block { margin-bottom: 16px; }
+  #costHistory .ch-block-title, #selfImprovement .ch-block-title { font-size: 0.82rem; font-weight: 600; margin-bottom: 4px; }
+  #costHistory .ch-block-sub, #selfImprovement .ch-block-sub { font-size: 0.72rem; color: GrayText; margin-bottom: 6px; }
   #costHistory .ch-table-wrap { overflow-x: auto; }
 </style>
 </head>
@@ -467,6 +469,13 @@ export function renderPage(repo?: string): string {
     <code>/api/cost-history</code>. Uses the workspace path from the file browser above
     (or <code>--repo</code>); reload with the file browser's Load button.</div>
   <div id="costHistory"><div class="empty">loading…</div></div>
+
+  <h2>Self-improvement progress</h2>
+  <div class="sub">Recursive self-improvement loop metrics (issue #145) — computed from this
+    repo's own session records, <code>git log</code>, and <code>gh issue list</code>, served by
+    <code>/api/self-improvement</code>. Local-machine only; no external dashboard. Hourly buckets,
+    oldest → newest.</div>
+  <div id="selfImprovement"><div class="empty">loading…</div></div>
 
   <div id="detail">
     <div class="detail-head">
@@ -1934,9 +1943,11 @@ async function fbLoad() {
   holder.className = "fb-tree";
   fbEl.appendChild(holder);
   await renderFbLevel(holder, ".");
-  // The repo path also drives the cost-history + permissions views — reload
-  // them together so a repo switch updates the whole page, not just the tree.
+  // The repo path also drives the cost-history + self-improvement +
+  // permissions views — reload them together so a repo switch updates the
+  // whole page, not just the tree.
   loadCostHistory();
+  loadSelfImprovement();
   loadPermissions();
 }
 
@@ -2255,6 +2266,7 @@ async function submitAnswer(e, text, box) {
 // no-dependency ethos. The server returns newest-first; the charts read
 // oldest-first.
 const costHistoryEl = document.getElementById("costHistory");
+const selfImprovementEl = document.getElementById("selfImprovement");
 
 function chRepo() {
   return fbRepo() || "";
@@ -2316,6 +2328,61 @@ function chBars(items, opts) {
     out += '<rect x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '" width="' + barW.toFixed(1) + '" height="' + h.toFixed(1) + '" rx="2" fill="' + (it.color || "#8250df") + '"><title>' + esc(it.title || it.label) + "</title></rect>";
     if (n <= 24) {
       out += '<text x="' + (x + barW / 2).toFixed(1) + '" y="' + (height - 6) + '" text-anchor="middle" font-size="8.5" fill="currentColor" fill-opacity="0.7">' + esc(it.label) + "</text>";
+    }
+  });
+  out += "</svg>";
+  return out;
+}
+
+// Generic inline-SVG single-series line chart (issue #145). items:
+// [{label, value, title}]. opts.max fixes the y-axis scale (e.g. 1 for a
+// 0..100% rate); omitted = auto-scale to the data's own max. opts.format(v)
+// renders y-axis labels. Deliberately a plain line (no fill/area) — this
+// page's other charts (chBars, chCostChart) already cover bars; this fills
+// the "a rate/mean trending over time" gap those don't fit well.
+function chLine(items, opts) {
+  opts = opts || {};
+  const width = 640;
+  const height = opts.height || 170;
+  const padL = 48, padR = 8, padT = 10, padB = 20;
+  const plotW = width - padL - padR;
+  const plotH = height - padT - padB;
+  let max = typeof opts.max === "number" ? opts.max : 0;
+  if (typeof opts.max !== "number") {
+    for (const it of items) {
+      if (typeof it.value === "number" && it.value > max) max = it.value;
+    }
+  }
+  if (max <= 0) max = 1;
+  const n = items.length;
+  const slot = n > 1 ? plotW / (n - 1) : plotW;
+  const steps = 4;
+  let out = '<svg viewBox="0 0 ' + width + " " + height + '" width="100%" style="max-width:640px;height:auto" role="img">';
+  for (let i = 0; i <= steps; i++) {
+    const v = (max * i) / steps;
+    const y = padT + plotH - (plotH * i) / steps;
+    out += '<line x1="' + padL + '" y1="' + y + '" x2="' + (width - padR) + '" y2="' + y + '" stroke="currentColor" stroke-opacity="0.12"/>';
+    out += '<text x="' + (padL - 6) + '" y="' + (y + 3) + '" text-anchor="end" font-size="9" fill="currentColor" fill-opacity="0.7">' +
+      esc(opts.format ? opts.format(v) : Math.round(v)) + "</text>";
+  }
+  const pts = [];
+  items.forEach(function (it, i) {
+    const x = n > 1 ? padL + i * slot : padL + plotW / 2;
+    const v = typeof it.value === "number" ? it.value : 0;
+    const y = padT + plotH - (plotH * Math.min(v, max)) / max;
+    pts.push(x.toFixed(1) + "," + y.toFixed(1));
+  });
+  if (pts.length > 1) {
+    out += '<polyline points="' + pts.join(" ") + '" fill="none" stroke="' + (opts.color || "#1a7f37") + '" stroke-width="1.5"/>';
+  }
+  items.forEach(function (it, i) {
+    const x = n > 1 ? padL + i * slot : padL + plotW / 2;
+    const v = typeof it.value === "number" ? it.value : 0;
+    const y = padT + plotH - (plotH * Math.min(v, max)) / max;
+    out += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="2.5" fill="' + (opts.color || "#1a7f37") + '"><title>' +
+      esc(it.title || (it.label + ": " + (opts.format ? opts.format(v) : v))) + "</title></circle>";
+    if (n <= 24) {
+      out += '<text x="' + x.toFixed(1) + '" y="' + (height - 6) + '" text-anchor="middle" font-size="8.5" fill="currentColor" fill-opacity="0.7">' + esc(it.label) + "</text>";
     }
   });
   out += "</svg>";
@@ -2560,6 +2627,116 @@ function renderCostHistory(data) {
   el.appendChild(tableBlock);
 }
 
+// ── Self-improvement progress (issue #145) ──────────────────────────────────
+// Recursive self-improvement loop metrics: session outcome/efficiency trends
+// from this repo's own .headlesscode/usage/*.jsonl, standing guardrails
+// landed from git log, issue lifecycle from "gh issue list" — served by
+// GET /api/self-improvement?repo=<path> (see self-improvement-metrics.ts for
+// the computation). Local-machine only, per direct product direction
+// (2026-08-21): no external dashboard, this page IS the dashboard.
+
+function siFmtHour(iso) {
+  const d = new Date(iso);
+  const mo = d.toLocaleString(undefined, { month: "short" });
+  return mo + " " + d.getDate() + " " + String(d.getHours()).padStart(2, "0") + ":00";
+}
+
+function siFmtPct(v) {
+  return Math.round(v * 100) + "%";
+}
+
+async function loadSelfImprovement() {
+  const el = selfImprovementEl;
+  if (!el) return;
+  const repo = chRepo();
+  if (!repo) {
+    el.innerHTML = '<div class="empty">enter a workspace path in the file browser above (or start the dashboard with --repo) to load self-improvement metrics</div>';
+    return;
+  }
+  try {
+    const res = await fetch("/api/self-improvement?repo=" + encodeURIComponent(repo));
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    renderSelfImprovement(data);
+  } catch (err) {
+    el.innerHTML = '<div class="empty">failed to load self-improvement metrics: ' + esc(err) + "</div>";
+  }
+}
+
+function renderSelfImprovement(data) {
+  const el = selfImprovementEl;
+  if (!el) return;
+  el.innerHTML = "";
+  if (!data.totalSessions) {
+    el.innerHTML = '<div class="empty">no session records yet for this repo — run a session (any mode) to start building history</div>';
+    return;
+  }
+
+  const lifecycle = data.issueLifecycle;
+  const chips = document.createElement("div");
+  chips.className = "ch-chips";
+  chips.innerHTML =
+    chChip("sessions", fmtInt(data.totalSessions)) +
+    chChip("overall success rate", siFmtPct(data.overallSuccessRate), data.overallSuccessRate < 0.5 ? "ch-wasted" : "") +
+    chChip("standing guardrails landed", fmtInt(data.standingGuardrails.totalCount)) +
+    (lifecycle
+      ? chChip("issues open / closed", fmtInt(lifecycle.currentOpenCount) + " / " + fmtInt(lifecycle.currentClosedCount))
+      : chChip("issue lifecycle", "gh unavailable"));
+  el.appendChild(chips);
+
+  const outcomeItems = data.sessionOutcomesByHour.map(function (b) {
+    return { label: siFmtHour(b.hour), value: b.successRate, title: siFmtHour(b.hour) + ": " + siFmtPct(b.successRate) + " (" + b.success + "/" + b.total + ")" };
+  });
+  const outcomeBlock = document.createElement("div");
+  outcomeBlock.className = "ch-block";
+  outcomeBlock.innerHTML = '<div class="ch-block-title">Session success rate over time</div>' +
+    '<div class="ch-block-sub">the most direct "is it working" signal — % of dispatched sessions reaching real completion, per hour.</div>' +
+    chLine(outcomeItems, { max: 1, format: siFmtPct });
+  el.appendChild(outcomeBlock);
+
+  const volItems = data.sessionVolumeByHour.map(function (b) {
+    return { label: siFmtHour(b.hour), value: b.count, title: siFmtHour(b.hour) + ": " + b.count + " session(s)", color: "#4f9cf9" };
+  });
+  const volBlock = document.createElement("div");
+  volBlock.className = "ch-block";
+  volBlock.innerHTML = '<div class="ch-block-title">Session volume over time</div>' +
+    '<div class="ch-block-sub">activity level — read the success-rate chart above against this: a spike on 2 sessions means less than one on 20.</div>' +
+    chBars(volItems);
+  el.appendChild(volBlock);
+
+  const iterItems = data.iterationEfficiencyByHour.map(function (b) {
+    return { label: siFmtHour(b.hour), value: b.meanIterations, title: siFmtHour(b.hour) + ": " + b.meanIterations.toFixed(1) + " mean iterations (" + b.successCount + " successes)" };
+  });
+  const iterBlock = document.createElement("div");
+  iterBlock.className = "ch-block";
+  iterBlock.innerHTML = '<div class="ch-block-title">Iteration efficiency (successful sessions only)</div>' +
+    '<div class="ch-block-sub">mean iterations to reach a real completion — trending down means the model is getting more direct, not just more numerous.</div>' +
+    chLine(iterItems, { color: "#8250df" });
+  el.appendChild(iterBlock);
+
+  const guardItems = data.standingGuardrails.cumulativeByHour.map(function (b) {
+    return { label: siFmtHour(b.hour), value: b.cumulative, title: siFmtHour(b.hour) + ": " + b.cumulative + " cumulative guardrail commit(s)" };
+  });
+  const guardBlock = document.createElement("div");
+  guardBlock.className = "ch-block";
+  guardBlock.innerHTML = '<div class="ch-block-title">Standing guardrails landed (cumulative)</div>' +
+    '<div class="ch-block-sub">commits referencing a real issue number — a proxy for "the system is learning from its own failures" (each fix still human/Claude-authored today).</div>' +
+    (guardItems.length ? chLine(guardItems, { color: "#c0392b" }) : '<div class="empty">no guardrail commits found</div>');
+  el.appendChild(guardBlock);
+
+  if (lifecycle && lifecycle.hours.length) {
+    const lifeItems = lifecycle.hours.map(function (h) {
+      return { label: siFmtHour(h.hour), value: h.filed, title: siFmtHour(h.hour) + ": " + h.filed + " filed, " + h.closed + " closed" };
+    });
+    const lifeBlock = document.createElement("div");
+    lifeBlock.className = "ch-block";
+    lifeBlock.innerHTML = '<div class="ch-block-title">Issues filed over time</div>' +
+      '<div class="ch-block-sub">' + fmtInt(lifecycle.totalTracked) + ' issues tracked total on this repo (via gh issue list).</div>' +
+      chBars(lifeItems, { color: "#f0883e" });
+    el.appendChild(lifeBlock);
+  }
+}
+
 async function poll() {
   try {
     const res = await fetch("/api/summary");
@@ -2614,6 +2791,7 @@ loadModeModels();
 loadPermissions();
 loadModes();
 loadCostHistory();
+loadSelfImprovement();
 setInterval(poll, 4000);
 // Live event feed poll: faster than the summary poll (1.5s) so the detail
 // view feels live, and only runs while a detail view is open.
