@@ -75,6 +75,12 @@ interface CliOptions {
 	 * $HEADLESSCODE_CHILD_ITERATION_FRACTION). See src/engine/loop.ts.
 	 */
 	childIterationFraction?: number
+	/**
+	 * Hard cap on tokens the model may generate per LLM call (default
+	 * DEFAULT_MAX_TOKENS = 32768; also $HEADLESSCODE_MAX_TOKENS). See
+	 * src/engine/loop.ts.
+	 */
+	maxTokens?: number
 	/** Sliding-window history cap, in messages (also see DEFAULT_WINDOW_SIZE in engine/loop.ts). */
 	windowSize?: number
 	/**
@@ -276,6 +282,9 @@ Options:
                                floor 3 — a child never exceeds what its parent
                                has left). Default:
                                $HEADLESSCODE_CHILD_ITERATION_FRACTION
+  --max-tokens <n>           Hard cap on tokens the model may generate per LLM
+                               call (default: 32768 — see DEFAULT_MAX_TOKENS in
+                               src/engine/loop.ts). Default: $HEADLESSCODE_MAX_TOKENS
   --consecutive-error-limit <n>  Consecutive mistakes before giving up (default: 3)
   --window-size <n>          Sliding-window history cap, in messages, before the
                              oldest are evicted (default: 300; see DEFAULT_WINDOW_SIZE
@@ -388,6 +397,7 @@ Environment:
   HEADLESSCODE_ALLOW_PROTECTED_WRITES  Allow protected-file writes ("1"/"true")
   HEADLESSCODE_MAX_RECURSION_DEPTH    Default --max-recursion-depth (positive int)
   HEADLESSCODE_CHILD_ITERATION_FRACTION  Default --child-iteration-fraction (0 < f <= 1)
+  HEADLESSCODE_MAX_TOKENS      Default --max-tokens (positive int)
   HEADLESSCODE_STREAM          Opt-in SSE streaming ("1"/"true"/"yes"/"on")
   HEADLESSCODE_LOCAL_EXPLORE   Opt-in local exploration phase ("1"/"true")
   HEADLESSCODE_AUTO_APPROVE_MODE_SWITCH  Auto-approve switch_mode calls ("1"/"true"/"yes"/"on")
@@ -491,6 +501,7 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 			case "--llm-timeout-ms":
 			case "--max-recursion-depth":
 			case "--max-mode-switches":
+			case "--max-tokens":
 			case "--require-artifact-min-citations": {
 				const value = next()
 				const num = value === undefined ? Number.NaN : Number(value)
@@ -509,6 +520,8 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 					options.maxRecursionDepth = num
 				} else if (flag === "--max-mode-switches") {
 					options.maxModeSwitches = num
+				} else if (flag === "--max-tokens") {
+					options.maxTokens = num
 				} else if (flag === "--require-artifact-min-citations") {
 					options.requireArtifactMinCitations = num
 				} else {
@@ -1210,6 +1223,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		options.autoApproveModeSwitch || envBoolean("HEADLESSCODE_AUTO_APPROVE_MODE_SWITCH")
 	const maxModeSwitches = options.maxModeSwitches ?? envNumber("HEADLESSCODE_MAX_MODE_SWITCHES")
 
+	// Flag wins over the env fallback; undefined falls back to loop.ts's own
+	// default (DEFAULT_MAX_TOKENS = 32768).
+	const maxTokens = options.maxTokens ?? envNumber("HEADLESSCODE_MAX_TOKENS")
+
 	// Permissions (command allow/deny + protected files): CLI flags > env vars
 	// > <workspaceRoot>/.headlesscode/permissions.json > built-in defaults.
 	// A malformed permissions.json fails loudly (mirrors HEADLESSCODE_PRICING_JSON).
@@ -1267,6 +1284,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		decisionTimeoutMs,
 		autoApproveModeSwitch,
 		maxModeSwitches,
+		maxTokens,
 		maxPauseMs,
 		permissions,
 		// Opt-in local exploration phase (default OFF). Flag OR env var — the
