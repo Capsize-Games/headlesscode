@@ -19,6 +19,7 @@ import {
 	DEFAULT_READ_ONLY_STALL_LIMIT,
 	DEFAULT_IDENTICAL_CALL_STALL_LIMIT,
 	DEFAULT_IDENTICAL_CALL_REPEAT_PENALTY_BOOST,
+	DEFAULT_MAX_MODE_SWITCHES,
 	isReadOnlyEquivalentShellCommand,
 	stripSupersededReasoning,
 	truncateHistory,
@@ -204,6 +205,8 @@ async function makeSession(options: {
 	requireArtifactPathPattern?: string
 	requireArtifactMinCitations?: number
 	requireArtifactSections?: string[]
+	maxModeSwitches?: number
+	autoApproveModeSwitch?: boolean
 }) {
 	const session = new HeadlessSession({
 		workspaceRoot: options.workspaceRoot,
@@ -222,6 +225,8 @@ async function makeSession(options: {
 		requireArtifactPathPattern: options.requireArtifactPathPattern,
 		requireArtifactMinCitations: options.requireArtifactMinCitations,
 		requireArtifactSections: options.requireArtifactSections,
+		maxModeSwitches: options.maxModeSwitches,
+		autoApproveModeSwitch: options.autoApproveModeSwitch,
 		// Checkpoints are default-on and would otherwise write real shadow-git
 		// commits to ~/.headlesscode/checkpoints on every test run; this suite
 		// isn't testing checkpoints (except the one that is), so keep tests
@@ -2069,6 +2074,93 @@ async function testToolFailureNudgeAdaptsWhenReadFileIsOnCooldown(): Promise<voi
 	}
 }
 
+// ─── Mode-switch cap guardrail (issue #151 coverage gap) ────────────────────
+// switch_mode (loop.ts:4656) hard-caps total in-place mode switches per
+// session at DEFAULT_MAX_MODE_SWITCHES (5) — checked BEFORE the approval
+// gate so a capped-out session never even escalates. Confirmed zero test
+// coverage under any name (grepped loop.test.ts for "switch_mode",
+// "modeSwitch", "MAX_MODE_SWITCHES": no hits) before this was added.
+
+async function testMaxModeSwitchesCapsAtThreshold(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-mode-switch-"))
+	try {
+		const client = new FakeLlmClient([
+			() => toolCall("switch_mode", { mode_slug: "architect", reason: "look around" }),
+			() => toolCall("switch_mode", { mode_slug: "code", reason: "back to editing" }),
+			() => toolCall("switch_mode", { mode_slug: "architect", reason: "look around" }),
+			() => toolCall("switch_mode", { mode_slug: "code", reason: "back to editing" }),
+			() => toolCall("switch_mode", { mode_slug: "architect", reason: "look around" }),
+			// 6th switch: modeSwitchCount is already 5 (== DEFAULT_MAX_MODE_SWITCHES),
+			// so this one must be refused as a normal tool error, not escalated.
+			() => toolCall("switch_mode", { mode_slug: "code", reason: "one too many" }),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({
+			task: "switch modes repeatedly",
+			client,
+			workspaceRoot: ws,
+			maxIterations: 20,
+			autoApproveModeSwitch: true,
+		})
+		const result = await session.run()
+
+		assert.equal(
+			result.status,
+			"success",
+			`the cap is a recoverable tool error, not a fatal one — session should still reach attempt_completion; got ${JSON.stringify(result)}`,
+		)
+
+		const toolResults = session.state.messages.filter((m) => m.role === "tool")
+		const capped = toolResults.find((m) => (m.content ?? "").includes("max mode switches reached"))
+		assert.ok(capped, "expected the 6th switch_mode call to hit the max-switches cap")
+		assert.match(
+			capped?.content as string,
+			new RegExp(
+				`max mode switches reached \\(${DEFAULT_MAX_MODE_SWITCHES} >= max ${DEFAULT_MAX_MODE_SWITCHES}\\)`,
+			),
+			"cap message must report the real count and the real configured max",
+		)
+
+		const successfulSwitches = toolResults.filter(
+			(m) => (m.content ?? "").startsWith("Switched to mode"),
+		)
+		assert.equal(
+			successfulSwitches.length,
+			DEFAULT_MAX_MODE_SWITCHES,
+			`exactly ${DEFAULT_MAX_MODE_SWITCHES} switches should succeed before the cap fires`,
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testMaxModeSwitchesCapDoesNotFireBelowThreshold(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-mode-switch-ok-"))
+	try {
+		const client = new FakeLlmClient([
+			() => toolCall("switch_mode", { mode_slug: "architect", reason: "look around" }),
+			() => toolCall("switch_mode", { mode_slug: "code", reason: "back to editing" }),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({
+			task: "switch modes twice",
+			client,
+			workspaceRoot: ws,
+			maxIterations: 20,
+			autoApproveModeSwitch: true,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		const capped = session.state.messages.find(
+			(m) => m.role === "tool" && (m.content ?? "").includes("max mode switches reached"),
+		)
+		assert.ok(!capped, "the cap must not fire when the switch count stays below the threshold")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── isReadOnlyEquivalentShellCommand (unit-level) ───────────────────────────
 
 async function testIsReadOnlyEquivalentShellCommandClassifiesCorrectly(): Promise<void> {
@@ -3208,6 +3300,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["truncateHistory: prefix stays stable across a batch (cache-eligible)", testTruncateHistoryStablePrefixBetweenBatches],
 	["Part E: live pricing feeds the session's BudgetTracker", testBudgetUsesLivePricingWhenAvailable],
 	["Part E: no live pricing → hardcoded table fallback, unchanged behavior", testBudgetFallsBackToHardcodedTableWithoutLivePricing],
+	["mode-switch cap (#151): the 6th switch is refused once modeSwitchCount reaches DEFAULT_MAX_MODE_SWITCHES", testMaxModeSwitchesCapsAtThreshold],
+	["mode-switch cap (#151): switching below the threshold never trips it", testMaxModeSwitchesCapDoesNotFireBelowThreshold],
 ]
 
 // Issue #140: a real live-network test (Part E, OpenRouter pricing fetch)
