@@ -17,6 +17,9 @@
  *   GET  /api/settings/mode-models?repo=<path>   current mode-models.json content ({} if absent)
  *   POST /api/settings/mode-models?repo=<path>   validate + write mode-models.json (creates .headlesscode/)
  *   POST /api/session/start       launch a detached top-level session (see src/dashboard/session-launch.ts)
+ *   POST /api/tool/execute        run ONE executor tool synchronously against a workspace
+ *                                 (see src/dashboard/tool-exec.ts; used by UwUChat's code-mode
+ *                                 agent tools — inherits all executor guardrails)
  *   POST /api/session/:id/answer  write `.harness.decision-answer` to unblock an escalated question
  *   POST /api/session/:id/message write `.harness.inject-message` ({ text, injectedAt }) — a new
  *                                 user message the RUNNING session picks up before its next LLM call
@@ -104,6 +107,7 @@ import {
 import { readCostHistory, readSessionCostHistory } from "../orchestrator/cost-history.js"
 import { listProjectEntries } from "../project-store.js"
 import { listWorkspaceDir, readWorkspaceFile } from "./files.js"
+import { executeTool, type ToolExecuteRequest } from "./tool-exec.js"
 import {
 	loadPermissionsFile,
 	parsePermissionsFileBody,
@@ -235,7 +239,8 @@ async function handleRequest(
 		((req.method === "POST" &&
 			(url.pathname.startsWith("/api/session/") ||
 				url.pathname === "/api/checkpoints/restore" ||
-				url.pathname === "/api/settings/permissions")) ||
+				url.pathname === "/api/settings/permissions" ||
+				url.pathname === "/api/tool/execute")) ||
 			isTokenGatedGet)
 	) {
 		const auth = req.headers.authorization ?? ""
@@ -420,6 +425,42 @@ async function handleRequest(
 				repoRoot: options.repoRoot,
 			})
 			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(JSON.stringify(launched))
+		} catch (error) {
+			res
+				.writeHead(500, { "content-type": "application/json; charset=utf-8" })
+				.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+		}
+		return
+	}
+
+	// Run ONE executor tool synchronously against a workspace (UwUChat's
+	// code-mode agent tools): POST /api/tool/execute { workspace, name, args }.
+	// Builds a fresh ToolExecutor per call (stateless), runs the named tool,
+	// returns { ok, isError, content }. Every guardrail is inherited from the
+	// executor — workspace path safety, command allow/deny, protected-file
+	// permissions, output truncation. Backgrounded execute_command children are
+	// hard-killed after the call (executeTool's dispose() — the proxy does not
+	// support long-running background commands). Gated by the same optional
+	// bearer token as /api/session/* (see the token check above).
+	if (url.pathname === "/api/tool/execute" && req.method !== "POST") {
+		res.writeHead(405, { "content-type": "text/plain" }).end("Method Not Allowed")
+		return
+	}
+	if (url.pathname === "/api/tool/execute" && req.method === "POST") {
+		try {
+			const raw = await readJsonBody(req)
+			let body: unknown
+			try {
+				body = JSON.parse(raw || "{}")
+			} catch (err) {
+				res
+					.writeHead(400, { "content-type": "application/json; charset=utf-8" })
+					.end(JSON.stringify({ error: `invalid JSON body: ${err instanceof Error ? err.message : String(err)}` }))
+				return
+			}
+			const request = body as ToolExecuteRequest
+			const result = await executeTool(request)
+			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(JSON.stringify(result))
 		} catch (error) {
 			res
 				.writeHead(500, { "content-type": "application/json; charset=utf-8" })
