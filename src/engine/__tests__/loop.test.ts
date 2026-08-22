@@ -20,6 +20,7 @@ import {
 	DEFAULT_IDENTICAL_CALL_STALL_LIMIT,
 	DEFAULT_IDENTICAL_CALL_REPEAT_PENALTY_BOOST,
 	DEFAULT_MAX_MODE_SWITCHES,
+	DEFAULT_MAX_RECURSION_DEPTH,
 	isReadOnlyEquivalentShellCommand,
 	stripSupersededReasoning,
 	truncateHistory,
@@ -207,6 +208,8 @@ async function makeSession(options: {
 	requireArtifactSections?: string[]
 	maxModeSwitches?: number
 	autoApproveModeSwitch?: boolean
+	recursionDepth?: number
+	maxRecursionDepth?: number
 }) {
 	const session = new HeadlessSession({
 		workspaceRoot: options.workspaceRoot,
@@ -227,6 +230,8 @@ async function makeSession(options: {
 		requireArtifactSections: options.requireArtifactSections,
 		maxModeSwitches: options.maxModeSwitches,
 		autoApproveModeSwitch: options.autoApproveModeSwitch,
+		recursionDepth: options.recursionDepth,
+		maxRecursionDepth: options.maxRecursionDepth,
 		// Checkpoints are default-on and would otherwise write real shadow-git
 		// commits to ~/.headlesscode/checkpoints on every test run; this suite
 		// isn't testing checkpoints (except the one that is), so keep tests
@@ -2161,6 +2166,81 @@ async function testMaxModeSwitchesCapDoesNotFireBelowThreshold(): Promise<void> 
 	}
 }
 
+// ─── Recursion-depth cap guardrail (issue #151 coverage gap) ────────────────
+// new_task (loop.ts:4471) hard-caps how deep a session tree can delegate at
+// DEFAULT_MAX_RECURSION_DEPTH (2) — a normal, recoverable tool error, not a
+// crash. Confirmed zero test coverage: new_task has no test in this file at
+// all under any name (grepped for "new_task"/"newTask": no hits).
+
+async function testMaxRecursionDepthRefusesDelegationAtCap(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-recursion-cap-"))
+	try {
+		const client = new FakeLlmClient([
+			() => toolCall("new_task", { mode: "code", message: "delegate one more level" }),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		// Already AT the cap: recursionDepth === maxRecursionDepth, so this
+		// session's own new_task call must be refused immediately.
+		const session = await makeSession({
+			task: "try to delegate at max depth",
+			client,
+			workspaceRoot: ws,
+			maxIterations: 10,
+			recursionDepth: DEFAULT_MAX_RECURSION_DEPTH,
+		})
+		const result = await session.run()
+
+		assert.equal(
+			result.status,
+			"success",
+			`the depth cap is a recoverable tool error, not fatal — session should still reach attempt_completion; got ${JSON.stringify(result)}`,
+		)
+		const capped = session.state.messages.find(
+			(m) => m.role === "tool" && (m.content ?? "").includes("max recursion depth reached"),
+		)
+		assert.ok(capped, "expected new_task to be refused once recursionDepth reaches the cap")
+		assert.match(
+			capped?.content as string,
+			new RegExp(
+				`max recursion depth reached \\(depth ${DEFAULT_MAX_RECURSION_DEPTH} >= max ${DEFAULT_MAX_RECURSION_DEPTH}\\)`,
+			),
+			"cap message must report the real depth and the real configured max",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testMaxRecursionDepthAllowsDelegationBelowCap(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-recursion-ok-"))
+	try {
+		// Shared FakeLlmClient script: new_task synchronously spawns and runs a
+		// full child session against the SAME script queue before the parent's
+		// next turn, so the child's own attempt_completion must be queued
+		// between the parent's two calls.
+		const client = new FakeLlmClient([
+			() => toolCall("new_task", { mode: "code", message: "do a subtask" }),
+			() => toolCall("attempt_completion", { result: "child done" }), // child, depth 1
+			() => toolCall("attempt_completion", { result: "parent done" }), // parent, resumed
+		])
+		const session = await makeSession({
+			task: "delegate one level below the cap",
+			client,
+			workspaceRoot: ws,
+			maxIterations: 10,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		const capped = session.state.messages.find(
+			(m) => m.role === "tool" && (m.content ?? "").includes("max recursion depth reached"),
+		)
+		assert.ok(!capped, "the depth cap must not fire for a delegation below the threshold")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── isReadOnlyEquivalentShellCommand (unit-level) ───────────────────────────
 
 async function testIsReadOnlyEquivalentShellCommandClassifiesCorrectly(): Promise<void> {
@@ -3302,6 +3382,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["Part E: no live pricing → hardcoded table fallback, unchanged behavior", testBudgetFallsBackToHardcodedTableWithoutLivePricing],
 	["mode-switch cap (#151): the 6th switch is refused once modeSwitchCount reaches DEFAULT_MAX_MODE_SWITCHES", testMaxModeSwitchesCapsAtThreshold],
 	["mode-switch cap (#151): switching below the threshold never trips it", testMaxModeSwitchesCapDoesNotFireBelowThreshold],
+	["recursion-depth cap (#151): new_task is refused once recursionDepth reaches DEFAULT_MAX_RECURSION_DEPTH", testMaxRecursionDepthRefusesDelegationAtCap],
+	["recursion-depth cap (#151): a delegation below the cap runs the child session for real and never trips it", testMaxRecursionDepthAllowsDelegationBelowCap],
 ]
 
 // Issue #140: a real live-network test (Part E, OpenRouter pricing fetch)
