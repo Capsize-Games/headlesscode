@@ -91,8 +91,16 @@ npx tsx src/cli.ts \
 DISPATCH_EXIT=$?
 echo "dispatch exit: $DISPATCH_EXIT"
 
-if [ -n "$(git status --short)" ]; then
-	echo "FAILED: working tree still dirty after dispatch — commit did not land." >&2
+# Scoped to the SPECIFIC files this dispatch was told to commit, not the
+# whole working tree — a bare `git status --short` false-positived here
+# live 2026-08-21 when a second, unrelated dispatch running concurrently
+# against the same workspace left its own untracked scratch file sitting
+# around at the moment this check ran. The commit had actually landed
+# correctly; this script just misread someone else's mess as its own
+# failure. `-- "${FILES[@]}"` restricts git status to exactly the paths
+# this dispatch owns.
+if [ -n "$(git status --short -- "${FILES[@]}")" ]; then
+	echo "FAILED: the specific files this dispatch was told to commit are still dirty — commit did not land." >&2
 	echo "See $LOG.stdout for the transcript." >&2
 	rm -f "$TASK_FILE"
 	exit 1
