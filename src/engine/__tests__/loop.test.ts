@@ -1850,6 +1850,64 @@ async function testToolExclusionCooldownOutlivesAStreakReset(): Promise<void> {
 	}
 }
 
+// ─── Tool-cooldown exact expiration (issue #151 coverage gap) ────────────────
+// The test above only checks the tool STAYS excluded one turn after the
+// cooldown starts — it never checks the cooldown's actual DURATION
+// (DEFAULT_IDENTICAL_CALL_TOOL_COOLDOWN_TURNS = 4). Per the decay loop in
+// loop.ts (runIterations): each request-build first decays every entry by 1,
+// deleting it once `remaining <= 1` — so a cooldown set to 4 keeps the tool
+// excluded on the 4 subsequent request-builds and is gone by the 5th,
+// PROVIDED nothing re-triggers the identical-call guard in between (a
+// continued streak refreshes it back to 4 instead of decaying — covered by
+// the test above, not this one).
+
+async function testToolExclusionCooldownExpiresAfterExactTurnCount(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-cooldown-expiry-"))
+	try {
+		for (let i = 1; i <= 4; i++) {
+			await fs.writeFile(path.join(ws, `f${i}.txt`), `content ${i}\n`)
+		}
+		const client = new FakeLlmClient([
+			() => toolCall("list_files", { path: "." }),
+			() => toolCall("list_files", { path: "." }),
+			// Request 3 is built with list_files already excluded (streak hit
+			// threshold after the 2 calls above) — the cooldown is set to 4 here.
+			// Requests 3-6 must do something else so the guard never re-triggers
+			// and the cooldown decays naturally: 4 -> 3 -> 2 -> 1 -> gone.
+			() => toolCall("read_file", { path: "f1.txt" }),
+			() => toolCall("read_file", { path: "f2.txt" }),
+			() => toolCall("read_file", { path: "f3.txt" }),
+			() => toolCall("read_file", { path: "f4.txt" }),
+			// Request 7: the cooldown decayed past 1 on request 6's build and
+			// was deleted before request 7 was built — list_files must be back.
+			() => toolCall("list_files", { path: "." }),
+			() => toolCall("attempt_completion", { result: "done" }),
+		])
+		const session = await makeSession({
+			task: "look around, read some files, look around again",
+			client,
+			workspaceRoot: ws,
+			maxIterations: 20,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+
+		for (let i = 2; i <= 5; i++) {
+			assert.ok(
+				!(client.requests[i]?.tools ?? []).some((t) => t.function.name === "list_files"),
+				`request index ${i} (turn ${i + 1}) must still exclude list_files — cooldown has not decayed to 0 yet`,
+			)
+		}
+		assert.ok(
+			(client.requests[6]?.tools ?? []).some((t) => t.function.name === "list_files"),
+			"request index 6 (turn 7) must offer list_files again — the cooldown has fully decayed by now",
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // Verified live 2026-08-20 against Qwen3-14B: with list_files excluded from
 // the request's own `tools` array (the identical-call guardrail's tool
 // exclusion), llama.cpp's grammar constraint correctly refused to emit a
@@ -3447,6 +3505,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["identical-call stall: fires on a repeated WRITE tool call too, not just reads", testIdenticalCallStallLimitFiresOnWriteToolToo],
 	["identical-call stall: a text-only reply resets the streak (no frozen penalty boost)", testTextOnlyReplyResetsTheIdenticalCallGuard],
 	["identical-call stall: the tool-exclusion cooldown outlives a streak reset", testToolExclusionCooldownOutlivesAStreakReset],
+	["tool-exclusion cooldown (#151): expires after exactly DEFAULT_IDENTICAL_CALL_TOOL_COOLDOWN_TURNS turns", testToolExclusionCooldownExpiresAfterExactTurnCount],
 	["identical-call stall: streak at/past threshold boosts repeat_penalty on the retry request", testIdenticalCallStreakBoostsRepeatPenaltyOnRetry],
 	["identical-call stall: streak at/past threshold excludes the repeated tool on the retry request", testIdenticalCallStreakExcludesTheRepeatedToolOnRetry],
 	["identical-call stall: an excluded tool cannot be recovered back in via narrated-text extraction", testExcludedToolCannotBeRecoveredFromNarratedText],
