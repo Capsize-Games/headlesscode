@@ -328,6 +328,28 @@ export const DEFAULT_IDENTICAL_CALL_TOOL_COOLDOWN_TURNS = 4
  * generic hard stop would otherwise end the session on an uninformed one.
  */
 export const DEFAULT_TOOL_FAILURE_NUDGE_THRESHOLD = 2
+/**
+ * Artifact-gate rejection guardrail (issue #152): requireArtifactMinCitations
+ * and requireArtifactSections check PRESENCE (a citation-shaped regex match
+ * count, a required substring) — they cannot and do not check that a
+ * citation actually backs the specific claim it was required to back, or
+ * that a required section actually contains what was asked for. Live
+ * evidence 2026-08-21 (issue #152's own transcript): a session rejected 3
+ * times in a row for missing citations/sections patched in EXACTLY the
+ * missing surface feature each time (a citation-shaped string, a required
+ * heading) with ZERO read_file calls between rejections — the retry
+ * nudge's own "you already have enough, don't read more" guidance
+ * (deliberately anti-context-bloat, see the requireArtifactMinCitations
+ * rejection message below) is exactly what let this slide: the model
+ * never went back to verify the patch was actually true. This guardrail
+ * detects that specific shape — N consecutive artifact-gate rejections
+ * with no real read_file call in between — and escalates to an explicit
+ * warning naming the pattern, rather than repeating the same
+ * easily-satisfied-by-patching instruction. Same threshold as
+ * DEFAULT_TOOL_FAILURE_NUDGE_THRESHOLD for consistency; no evidence yet
+ * that a different value is warranted.
+ */
+export const DEFAULT_ARTIFACT_REJECTION_NUDGE_THRESHOLD = 2
 /** The injected nudge (user-role, seen by the model on its next turn), indexed workspaces. */
 const READ_ONLY_NUDGE_MESSAGE =
 	"You've made several read/exploration calls without using `codebase_search`. If the workspace has an index (it lives in the central project store — see `~/.local/share/headlesscode/projects/`), try `codebase_search` for targeted semantic search instead of blind tree-walking."
@@ -477,6 +499,23 @@ function toolFailureNudgeMessage(
 		`Both read_file and ${toolName} are temporarily unavailable right now (cooldown from recent repeats). Do not ` +
 		`fabricate a call to either — call a genuinely different tool, or give a plain text status update, and wait ` +
 		`for them to become available again before retrying.`
+	)
+}
+
+/**
+ * Artifact-gate rejection guardrail (issue #152) — see
+ * DEFAULT_ARTIFACT_REJECTION_NUDGE_THRESHOLD's doc comment for the real
+ * failure shape this addresses.
+ */
+function artifactRejectionNudgeMessage(streak: number, relativePath: string): string {
+	return (
+		`Your last ${streak} attempts to complete this task were rejected for the same reason, and each time you ` +
+		`edited '${relativePath}' without making any read_file call in between. Adding a citation-shaped string or a ` +
+		`section heading does NOT satisfy this requirement unless it reflects something real you actually verified — ` +
+		`a citation with a real line number but a wrong description of what's there, or a section heading with ` +
+		`placeholder content, is worse than not having it at all. Before your next edit: use read_file on the real ` +
+		`source file(s) you intend to cite, confirm exactly what's at that line, and only then write content that ` +
+		`genuinely reflects it. Do not just patch in the missing surface feature again.`
 	)
 }
 
@@ -3154,6 +3193,13 @@ export class HeadlessSession {
 		let toolFailureStreakCount = 0
 		let toolFailureStreakTargetPath: string | undefined
 		let toolFailureNudgeInjected = false
+		// Artifact-gate rejection guardrail (issue #152): consecutive
+		// requireArtifactMinCitations/requireArtifactSections rejections since
+		// the last real (isError:false) read_file call anywhere in the
+		// session — see DEFAULT_ARTIFACT_REJECTION_NUDGE_THRESHOLD's doc
+		// comment.
+		let artifactRejectionStreak = 0
+		let artifactRejectionNudgeInjected = false
 		// Tool-exclusion cooldown: verified live 2026-08-20 (trial 36) that a
 		// bare streak-based exclusion is a ONE-SHOT deterrent — the guard
 		// (correctly, see c1dd87b) resets as soon as the model produces a
@@ -3653,6 +3699,28 @@ export class HeadlessSession {
 							iteration,
 							reason: !artifactStatus.found ? "no file matching requireArtifactPathPattern" : "below requireArtifactMinCitations",
 						})
+						// Artifact-gate rejection guardrail (issue #152): only the
+						// "file exists but citations are insufficient" case counts —
+						// "no file yet" isn't a patch-without-re-reading situation,
+						// there's nothing to have patched yet.
+						if (artifactStatus.found) {
+							artifactRejectionStreak++
+							if (
+								artifactRejectionStreak >= envArtifactRejectionNudgeThreshold() &&
+								!artifactRejectionNudgeInjected
+							) {
+								artifactRejectionNudgeInjected = true
+								messages.push({
+									role: "user",
+									content: artifactRejectionNudgeMessage(artifactRejectionStreak, artifactStatus.relativePath ?? this.config.requireArtifactPathPattern ?? ""),
+								})
+								this.logger.warn("[loop] artifact-rejection nudge injected", {
+									iteration,
+									streak: artifactRejectionStreak,
+									reason: "below requireArtifactMinCitations",
+								})
+							}
+						}
 						continue
 					}
 
@@ -3687,6 +3755,27 @@ export class HeadlessSession {
 							reason: "missing required artifact sections",
 							missingSections,
 						})
+						// Artifact-gate rejection guardrail (issue #152) — same
+						// pattern as the requireArtifactMinCitations site above:
+						// adding a missing heading without re-verifying the section
+						// actually contains what was asked is the exact exploit this
+						// guards against.
+						artifactRejectionStreak++
+						if (
+							artifactRejectionStreak >= envArtifactRejectionNudgeThreshold() &&
+							!artifactRejectionNudgeInjected
+						) {
+							artifactRejectionNudgeInjected = true
+							messages.push({
+								role: "user",
+								content: artifactRejectionNudgeMessage(artifactRejectionStreak, artifactStatus.relativePath ?? this.config.requireArtifactPathPattern ?? ""),
+							})
+							this.logger.warn("[loop] artifact-rejection nudge injected", {
+								iteration,
+								streak: artifactRejectionStreak,
+								reason: "missing required artifact sections",
+							})
+						}
 						continue
 					}
 				}
@@ -3863,6 +3952,8 @@ export class HeadlessSession {
 					toolFailureStreakCount = 0
 					toolFailureStreakTargetPath = undefined
 					toolFailureNudgeInjected = false
+					artifactRejectionStreak = 0
+					artifactRejectionNudgeInjected = false
 					if (text && !this.config.requireExplicitCompletion) {
 						this.logger.info("[loop] text-only reply (no tool calls) — success", { iteration })
 						const reportPath = await this.persistFinalReport(iteration, text)
@@ -4286,6 +4377,16 @@ export class HeadlessSession {
 							toolFailureStreakTargetPath = undefined
 							toolFailureNudgeInjected = false
 						}
+					}
+					// Artifact-gate rejection guardrail (issue #152): ANY genuine
+					// successful read_file counts as re-diagnosis here (unlike
+					// toolFailureStreak above, this isn't scoped to a single
+					// failing tool's target path — the concern is "did the model
+					// go back to verify anything at all before patching the
+					// artifact again").
+					if (call.name === "read_file" && !outcome.isError) {
+						artifactRejectionStreak = 0
+						artifactRejectionNudgeInjected = false
 					}
 					if (outcome.isError) {
 						if (call.name !== toolFailureStreakName) {
@@ -5219,6 +5320,15 @@ function envToolFailureNudgeThreshold(): number {
 	}
 	const n = Number(raw)
 	return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_TOOL_FAILURE_NUDGE_THRESHOLD
+}
+
+function envArtifactRejectionNudgeThreshold(): number {
+	const raw = process.env.HEADLESSCODE_ARTIFACT_REJECTION_NUDGE_THRESHOLD
+	if (raw === undefined || raw === "") {
+		return DEFAULT_ARTIFACT_REJECTION_NUDGE_THRESHOLD
+	}
+	const n = Number(raw)
+	return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_ARTIFACT_REJECTION_NUDGE_THRESHOLD
 }
 
 function envIdenticalCallRepeatPenaltyBoost(): number {
