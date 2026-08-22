@@ -64,6 +64,7 @@
 
 import { OpenRouterClient } from "../llm/openrouter.js"
 import { loadCentralSettings, type CentralSettings } from "../project-store.js"
+import { AirunnerEmbedder, resolveAirunnerEmbeddingModel, resolveAirunnerUrl } from "./airunner-embedder.js"
 import {
 	DEFAULT_OLLAMA_EMBEDDING_MODEL,
 	DEFAULT_OLLAMA_URL,
@@ -88,12 +89,12 @@ export const DEFAULT_EMBEDDING_MODEL = "qwen/qwen3-embedding-8b"
 export const EMBEDDING_MODEL_ENV = "HEADLESSCODE_EMBEDDING_MODEL"
 
 /** Embedding backends (the codebase index build + query can pick between). */
-export const EMBEDDING_BACKENDS = ["openrouter", "ollama"] as const
+export const EMBEDDING_BACKENDS = ["openrouter", "ollama", "airunner"] as const
 
 /** Default backend — OpenRouter, matching the pre-existing behavior. */
 export const DEFAULT_EMBEDDING_BACKEND = "openrouter"
 
-/** Env var that selects the backend (`openrouter` | `ollama`). */
+/** Env var that selects the backend (`openrouter` | `ollama` | `airunner`). */
 export const EMBEDDING_BACKEND_ENV = "HEADLESSCODE_EMBEDDING_BACKEND"
 
 /** Env var that overrides the OpenRouter embedding model. */
@@ -121,11 +122,11 @@ export type EmbeddingBackend = (typeof EMBEDDING_BACKENDS)[number]
  */
 export function resolveEmbeddingBackend(env: NodeJS.ProcessEnv = process.env, override?: string): EmbeddingBackend {
 	const raw = (override?.trim() || env[EMBEDDING_BACKEND_ENV]?.trim() || DEFAULT_EMBEDDING_BACKEND).toLowerCase()
-	if (raw === "ollama" || raw === "openrouter") {
+	if (raw === "ollama" || raw === "openrouter" || raw === "airunner") {
 		return raw
 	}
 	throw new Error(
-		`Invalid embedding backend "${raw}" (from ${EMBEDDING_BACKEND_ENV} or --embedding-backend): expected "openrouter" or "ollama"`,
+		`Invalid embedding backend "${raw}" (from ${EMBEDDING_BACKEND_ENV} or --embedding-backend): expected "openrouter", "ollama", or "airunner"`,
 	)
 }
 
@@ -215,12 +216,22 @@ export function createEmbedder(
 		ollamaModel?: string
 		/** Ollama server URL override (HEADLESSCODE_OLLAMA_URL). */
 		ollamaUrl?: string
+		/** AIRunner embedding model override (HEADLESSCODE_AIRUNNER_EMBED_MODEL). */
+		airunnerModel?: string
+		/** AIRunner server URL override (HEADLESSCODE_AIRUNNER_EMBED_URL). */
+		airunnerUrl?: string
 	} = {},
 	env: NodeJS.ProcessEnv = process.env,
 ): Embedder {
 	const resolved = resolveEmbeddingBackend(env, backend)
 	if (resolved === "ollama") {
 		return new OllamaEmbedder(options.ollamaModel ?? resolveOllamaEmbeddingModel(env), options.ollamaUrl ?? resolveOllamaUrl(env))
+	}
+	if (resolved === "airunner") {
+		return new AirunnerEmbedder(
+			options.airunnerModel ?? resolveAirunnerEmbeddingModel(env),
+			options.airunnerUrl ?? resolveAirunnerUrl(env),
+		)
 	}
 	return new OpenRouterEmbedder(
 		options.model ?? env[OPENROUTER_EMBEDDING_MODEL_ENV] ?? resolveEmbeddingModel(env),

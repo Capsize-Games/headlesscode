@@ -39,6 +39,7 @@ import {
 	type OrchestratorState,
 } from "./state.js"
 import { runReviewWithRetries, type ReviewResult } from "./reviewer.js"
+import { runFilingStage, runResearchStage } from "./pipeline.js"
 import { analyzeWorktreeSessions } from "./log-analysis.js"
 import { runQaWithRetries, type QaResult } from "../qa/qa.js"
 import { groupWorktreePath, isIterationExhaustion, isPidAlive, isProviderFailure, watchGroups } from "./watch.js"
@@ -2332,6 +2333,160 @@ export async function stopMain(argv: string[], io: StopIo = {}): Promise<number>
 	return failed > 0 ? 1 : 0
 }
 
+// ─── `pipeline` subcommand (issue #148) ───────────────────────────────────────
+
+const PIPELINE_USAGE = `headlesscode pipeline — run the stage-isolated research→filing pipeline
+
+Usage:
+	 headlesscode pipeline --workspace <path> [--research-task <text>] [--skip-filing]
+	                       [--model <id>] [--max-iterations <n>]
+
+Runs the stage-isolated pipeline from issue #148: a fresh \`researcher\`-mode
+session produces ONE well-cited research doc on disk (the artifact gate is
+bound by default), then a fresh \`issue-filer\`-mode session turns that doc's
+CONTENT (read off disk — never the prior session's conversation) into real
+GitHub issue(s). Each stage is a genuinely separate \`HeadlessSession\` with
+its own context, mode, and executor.
+
+Options:
+	 --workspace <path>   Workspace root the stages run against (required; must be
+	                      a git repo — the filer needs \`gh\` against its origin)
+	 --research-task <t>  Task text for the research stage (default: a built-in
+	                      prompt naming the artifact pattern + required sections)
+	 --skip-filing        Stop after the research stage; do NOT run the filing stage
+	 --model <id>         Model override for both stages (default: env / client)
+	 --max-iterations <n> Per-stage iteration cap (default: 60)
+	 --help               Show this help and exit
+
+Exit codes:
+	 0  all run stages succeeded
+	 1  a run stage failed (research session error / no artifact / filing parse error)
+	 2  usage error (missing --workspace, unknown flag)
+`
+
+interface PipelineCliOptions {
+	workspace?: string
+	researchTask?: string
+	skipFiling: boolean
+	model?: string
+	maxIterations?: number
+	help: boolean
+}
+
+export function parsePipelineArgs(argv: string[]): { options: PipelineCliOptions; error?: string } {
+	const options: PipelineCliOptions = { skipFiling: false, help: false }
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i]
+		const eq = arg.indexOf("=")
+		const flag = eq === -1 ? arg : arg.slice(0, eq)
+		const inlineValue = eq === -1 ? undefined : arg.slice(eq + 1)
+		const next = (): string | undefined => {
+			if (inlineValue !== undefined) {
+				return inlineValue
+			}
+			const v = argv[i + 1]
+			if (v === undefined || v.startsWith("--")) {
+				return undefined
+			}
+			i++
+			return v
+		}
+		switch (flag) {
+			case "--workspace":
+			case "--research-task":
+			case "--model":
+			case "--max-iterations": {
+				const value = next()
+				if (value === undefined) {
+					return { options, error: `Missing value for ${flag}` }
+				}
+				if (flag === "--workspace") {
+					options.workspace = value
+				} else if (flag === "--research-task") {
+					options.researchTask = value
+				} else if (flag === "--model") {
+					options.model = value
+				} else {
+					const n = Number(value)
+					if (!Number.isInteger(n) || n <= 0) {
+						return { options, error: "--max-iterations requires a positive integer" }
+					}
+					options.maxIterations = n
+				}
+				break
+			}
+			case "--skip-filing":
+				options.skipFiling = true
+				break
+			case "--help":
+			case "-h":
+				options.help = true
+				break
+			default:
+				return { options, error: `Unknown argument: ${arg}` }
+		}
+	}
+	return { options }
+}
+
+/**
+	* `headlesscode pipeline` — run the stage-isolated research→filing pipeline
+	* (issue #148) against one workspace. Research produces the artifact; filing
+	* (unless --skip-filing) turns it into real GitHub issues.
+	*/
+export async function pipelineMain(argv: string[]): Promise<number> {
+	const { options, error } = parsePipelineArgs(argv)
+	if (error) {
+		process.stderr.write(`headlesscode pipeline: ${error}\n\n${PIPELINE_USAGE}`)
+		return 2
+	}
+	if (options.help) {
+		process.stdout.write(PIPELINE_USAGE)
+		return 0
+	}
+	if (!options.workspace) {
+		process.stderr.write(`headlesscode pipeline: --workspace <path> is required\n\n${PIPELINE_USAGE}`)
+		return 2
+	}
+
+	const workspaceRoot = path.resolve(options.workspace)
+	process.stdout.write(`headlesscode pipeline: running research stage (mode researcher, artifact gate ON)...\n`)
+	const research = await runResearchStage({
+		workspaceRoot,
+		taskText: options.researchTask,
+		model: options.model,
+		maxIterations: options.maxIterations,
+	})
+	if (research.status !== "ok" || !research.artifactPath) {
+		process.stderr.write(
+			`headlesscode pipeline: research stage failed — ${research.summary}\n`,
+		)
+		return 1
+	}
+	process.stdout.write(`headlesscode pipeline: research artifact at ${research.artifactPath}\n`)
+	if (options.skipFiling) {
+		return 0
+	}
+
+	process.stdout.write(`headlesscode pipeline: running filing stage (mode issue-filer)...\n`)
+	const filing = await runFilingStage({
+		workspaceRoot,
+		researchArtifactPath: research.artifactPath,
+		model: options.model,
+		maxIterations: options.maxIterations,
+	})
+	if (filing.status !== "ok") {
+		process.stderr.write(
+			`headlesscode pipeline: filing stage failed — ${filing.summary}\n`,
+		)
+		return 1
+	}
+	process.stdout.write(
+		`headlesscode pipeline: filed issue(s): ${filing.issueNumbers.join(", ")}\n`,
+	)
+	return 0
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 export async function orchestrateMain(argv: string[]): Promise<number> {
@@ -2349,6 +2504,9 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	}
 	if (argv[0] === "cleanup") {
 		return cleanupMain(argv.slice(1))
+	}
+	if (argv[0] === "pipeline") {
+		return pipelineMain(argv.slice(1))
 	}
 	// Issue #14 standalone recovery subcommands. Imported lazily (not
 	// statically) because resume.ts imports this module's rework-decision

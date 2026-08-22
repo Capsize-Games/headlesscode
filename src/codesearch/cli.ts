@@ -1,7 +1,7 @@
 /**
  * `headlesscode index` subcommand — build/refresh the codebase-search index.
  *
- *   npx tsx src/cli.ts index --workspace <path> [--model <id>] [--embedding-backend <openrouter|ollama>]
+ *   npx tsx src/cli.ts index --workspace <path> [--model <id>] [--embedding-backend <openrouter|ollama|airunner>]
  *
  * Walks the workspace's real source files (git-aware, .gitignore-respecting),
  * chunks them, embeds ONLY the chunks whose content hash changed since the
@@ -10,7 +10,7 @@
  * (~/.local/share/headlesscode/projects/<key>/codesearch/index.jsonl — see
  * src/project-store.ts). Worktrees of a repo share that store automatically.
  *
- * Two embedding backends are supported:
+ * Three embedding backends are supported:
  *   - openrouter (default) — cloud, `qwen/qwen3-embedding-4b`, costs real
  *     money (priced in src/budget/cost.ts);
  *   - ollama (opt-in) — local `qwen3-embedding:8b` via
@@ -18,7 +18,11 @@
  *     cost tracking; produces 4096-dim vectors, NOT interchangeable with the
  *     cloud model's 2560-dim vectors (a backend switch requires a full
  *     reindex — the build handles it automatically by treating every stored
- *     vector from the other backend as stale).
+ *     vector from the other backend as stale);
+ *   - airunner (opt-in) — local intfloat/e5-large via the AIRunner server's
+ *     native embedding endpoint (HEADLESSCODE_AIRUNNER_EMBED_URL, default
+ *     http://localhost:8080). Free, no cost tracking; produces 1024-dim
+ *     vectors, again NOT interchangeable with the other backends' vectors.
  *
  * Indexing is a SEPARATE, EXPLICIT step (it costs real money and takes real
  * time) — it is never auto-triggered mid-session. Sessions consume whatever
@@ -36,29 +40,33 @@ import {
 } from "./embedder.js"
 import { buildIndex, indexFilePath } from "./index.js"
 import { estimateCost, priceFor } from "../budget/cost.js"
+import { DEFAULT_AIRUNNER_EMBEDDING_MODEL, AIRUNNER_EMBEDDING_MODEL_ENV } from "./airunner-embedder.js"
 import { DEFAULT_OLLAMA_EMBEDDING_MODEL, OLLAMA_EMBEDDING_MODEL_ENV } from "./ollama-embedder.js"
 
 const INDEX_USAGE = `headlesscode index — build/refresh the codebase semantic-search index
 
 Usage:
-  headlesscode index --workspace <path> [--model <id>] [--embedding-backend <openrouter|ollama>]
+  headlesscode index --workspace <path> [--model <id>] [--embedding-backend <openrouter|ollama|airunner>]
 
 Options:
   --workspace <path>      Workspace root to index (required)
   --model <id>            OpenRouter embedding model id (default:
                           $OPENROUTER_EMBEDDING_MODEL or ${resolveEmbeddingModel()})
-  --embedding-backend <b> Embedding backend: openrouter (default) or ollama
-                          (local, opt-in). Default: $HEADLESSCODE_EMBEDDING_BACKEND
+  --embedding-backend <b> Embedding backend: openrouter (default), ollama
+                          (local, opt-in), or airunner (local AIRunner
+                          server, opt-in). Default: $HEADLESSCODE_EMBEDDING_BACKEND
                           or openrouter
   --help                  Show this help and exit
 
 Environment:
-  HEADLESSCODE_EMBEDDING_BACKEND          openrouter | ollama (default openrouter)
+  HEADLESSCODE_EMBEDDING_BACKEND          openrouter | ollama | airunner (default openrouter)
   HEADLESSCODE_EMBEDDING_MODEL            OpenRouter embedding model override
   HEADLESSCODE_OPENROUTER_EMBEDDING_MODEL OpenRouter embedding model override
                                           (preferred for clarity)
   HEADLESSCODE_OLLAMA_URL                 Ollama server URL (default http://localhost:11434)
   HEADLESSCODE_OLLAMA_EMBEDDING_MODEL     Ollama embedding model (default ${DEFAULT_OLLAMA_EMBEDDING_MODEL})
+  HEADLESSCODE_AIRUNNER_EMBED_URL         AIRunner server URL (default http://localhost:8080)
+  HEADLESSCODE_AIRUNNER_EMBED_MODEL       AIRunner embedding model (default ${DEFAULT_AIRUNNER_EMBEDDING_MODEL})
 
 This builds (or incrementally refreshes) the codebase-search index used by the
 codebase_search tool. The index is stored in the CENTRAL per-project data store
@@ -154,6 +162,10 @@ export async function indexMain(argv: string[]): Promise<number> {
 	if (backend === "ollama") {
 		const ollamaModel = process.env[OLLAMA_EMBEDDING_MODEL_ENV]?.trim() || DEFAULT_OLLAMA_EMBEDDING_MODEL
 		process.stdout.write(`  (local, no embedding cost — model: ${ollamaModel})\n`)
+	}
+	if (backend === "airunner") {
+		const airunnerModel = process.env[AIRUNNER_EMBEDDING_MODEL_ENV]?.trim() || DEFAULT_AIRUNNER_EMBEDDING_MODEL
+		process.stdout.write(`  (local AIRunner server, no embedding cost — model: ${airunnerModel})\n`)
 	}
 
 	try {

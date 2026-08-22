@@ -29,6 +29,7 @@ import {
 	type Embedder,
 } from "../embedder.js"
 import { buildIndex, indexMetadataFilePath, loadIndex, loadIndexMetadata } from "../index.js"
+import { AirunnerEmbedder } from "../airunner-embedder.js"
 import { OllamaEmbedder } from "../ollama-embedder.js"
 import { OpenRouterEmbedder } from "../embedder.js"
 import { createHeadlessExecutor } from "../../tools/executor.js"
@@ -65,12 +66,20 @@ async function testEnvVarSwitchesEmbedder(): Promise<void> {
 	// Default: openrouter.
 	const env: NodeJS.ProcessEnv = {}
 	assert.equal(resolveEmbeddingBackend(env), "openrouter")
-	assert.equal(DEFAULT_EMBEDDING_BACKEND, "openrouter", "default must stay openrouter (opt-in Ollama)")
+	assert.equal(DEFAULT_EMBEDDING_BACKEND, "openrouter", "default must stay openrouter (opt-in Ollama/AIRunner)")
 
 	// Env var → ollama.
 	const ollamaEnv: NodeJS.ProcessEnv = { [EMBEDDING_BACKEND_ENV]: "ollama" }
 	assert.equal(resolveEmbeddingBackend(ollamaEnv), "ollama")
 	assert.ok(createEmbedder("ollama", {}, ollamaEnv) instanceof OllamaEmbedder, "ollama backend constructs OllamaEmbedder")
+
+	// Env var → airunner.
+	const airunnerEnv: NodeJS.ProcessEnv = { [EMBEDDING_BACKEND_ENV]: "airunner" }
+	assert.equal(resolveEmbeddingBackend(airunnerEnv), "airunner")
+	assert.ok(
+		createEmbedder("airunner", {}, airunnerEnv) instanceof AirunnerEmbedder,
+		"airunner backend constructs AirunnerEmbedder",
+	)
 
 	// Flag (explicit override) beats env.
 	const flagEnv: NodeJS.ProcessEnv = { [EMBEDDING_BACKEND_ENV]: "ollama" }
@@ -133,6 +142,45 @@ async function testBuildRecordsBackendAndReindexBackendSwitch(): Promise<void> {
 	}
 }
 
+async function testAirunnerIndexMetadataRoundTrips(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-be-airunner-")
+	try {
+		await fs.mkdir(path.join(ws, "src"), { recursive: true })
+		await fs.writeFile(path.join(ws, "src", "a.ts"), "export function alpha() {\n  return 1\n}\n")
+
+		// Build with the airunner backend.
+		const airunner = new TaggedEmbedder("intfloat/e5-large", "airunner")
+		const first = await buildIndex(airunner, ws, undefined, "airunner")
+		assert.equal(first.backend, "airunner")
+
+		// Every entry records the airunner backend (regression guard for the
+		// old hardcoded binary ternary that would silently map it to
+		// openrouter on read).
+		for (const e of loadIndex(ws)) {
+			assert.equal(e.backend, "airunner", "each entry records its airunner backend")
+		}
+
+		// The metadata sibling must round-trip "airunner" — NOT be misread as
+		// "openrouter" (the exact bug loadIndexMetadata used to have).
+		const meta = loadIndexMetadata(ws)
+		assert.ok(meta, "metadata file written")
+		assert.equal(meta!.backend, "airunner", "metadata round-trips the airunner backend")
+		assert.equal(meta!.model, "intfloat/e5-large")
+
+		// Rebuild with the SAME backend: unchanged chunks are skipped.
+		const second = await buildIndex(airunner, ws, undefined, "airunner")
+		assert.equal(second.chunksEmbedded, 0, "unchanged + same backend → no re-embed")
+
+		// Rebuild with a DIFFERENT backend: stored airunner vectors are NOT
+		// reusable → everything re-embeds.
+		const ollama = new TaggedEmbedder("qwen3-embedding:8b", "ollama")
+		const third = await buildIndex(ollama, ws, undefined, "ollama")
+		assert.ok(third.chunksEmbedded >= 1, "backend switch must re-embed every chunk")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 async function testLegacyEntriesDefaultToOpenrouter(): Promise<void> {
 	const ws = await mkTmpWorkspace("hc-be-legacy-")
 	try {
@@ -190,6 +238,7 @@ async function testHandlerRefusesBackendMismatch(): Promise<void> {
 const tests: Array<[string, () => Promise<void>]> = [
 	["HEADLESSCODE_EMBEDDING_BACKEND env/flag switches the embedder (default stays openrouter)", testEnvVarSwitchesEmbedder],
 	["build records backend per-entry + in metadata; same-backend reindex skips, switch re-embeds", testBuildRecordsBackendAndReindexBackendSwitch],
+	["airunner index metadata round-trips the airunner backend (not openrouter)", testAirunnerIndexMetadataRoundTrips],
 	["legacy pre-Ollama entries default to openrouter", testLegacyEntriesDefaultToOpenrouter],
 	["codebase_search refuses a backend mismatch with a rebuild instruction", testHandlerRefusesBackendMismatch],
 ]

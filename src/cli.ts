@@ -203,8 +203,9 @@ Subcommands:
               Build/refresh the codebase semantic-search index for a workspace
               (used by the codebase_search tool). A separate, explicit step —
               never auto-triggered mid-session. --embedding-backend picks
-              openrouter (default) or ollama (local). See
-              \`npx tsx src/cli.ts index --help\` for full options.
+              openrouter (default), ollama (local), or airunner (local
+              AIRunner server). See \`npx tsx src/cli.ts index --help\` for
+              full options.
   headlesscode codemap --workspace <path> [--force] [--watch] [--interval-ms <n>]
               Build/refresh a project's deterministic module/import map
               (codemap.json/codemap.lock/codemap.html in the central project
@@ -674,6 +675,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// run path untouched.
 	if (argv[0] === "orchestrate") {
 		return orchestrateMain(argv.slice(1))
+	}
+
+	// Issue #148 subcommand: `headlesscode pipeline ...` — run the stage-
+	// isolated research→filing pipeline (each stage a fresh session taking the
+	// prior stage's artifact as input).
+	if (argv[0] === "pipeline") {
+		const { pipelineMain } = await import("./orchestrator/cli.js")
+		return pipelineMain(argv.slice(1))
 	}
 
 	// Phase 5 subcommand: `headlesscode watch ...` — GitHub issue watcher

@@ -39,6 +39,7 @@ import * as path from "node:path"
 import { chunkFile, type Chunk } from "./chunk.js"
 import {
 	DEFAULT_EMBEDDING_BACKEND,
+	EMBEDDING_BACKENDS,
 	METADATA_BACKEND_KEY,
 	METADATA_MODEL_KEY,
 	type Embedder,
@@ -100,10 +101,14 @@ function parseIndexLine(line: string): IndexEntry | undefined {
 			parsed.embedding.every((v) => typeof v === "number") &&
 			typeof parsed.hash === "string"
 		) {
-			// Entries written before the Ollama backend existed carry no
-			// `backend` field — they were necessarily built with the only
-			// backend that existed then (openrouter).
-			const backend = parsed.backend === "ollama" ? "ollama" : "openrouter"
+			// Entries written before the Ollama/AIRunner backends existed
+			// carry no `backend` field — they were necessarily built with the
+			// only backend that existed then (openrouter). Any other backend
+			// value passes through as-is (validated against EMBEDDING_BACKENDS).
+			const backend =
+				typeof parsed.backend === "string" && (EMBEDDING_BACKENDS as readonly string[]).includes(parsed.backend)
+					? (parsed.backend as EmbeddingBackend)
+					: "openrouter"
 			return { ...parsed, backend } as IndexEntry
 		}
 		// Malformed lines are skipped (loose validation, matching the
@@ -216,7 +221,14 @@ export function loadIndexMetadata(workspaceRoot: string): IndexMetadata | undefi
 	}
 	try {
 		const parsed = JSON.parse(raw) as Record<string, unknown>
-		const backend = parsed[METADATA_BACKEND_KEY] === "ollama" ? "ollama" : "openrouter"
+		// Generic 3-way mapping driven off EMBEDDING_BACKENDS, NOT a hardcoded
+		// binary (ollama ?: openrouter) ternary — an index built with the
+		// airunner backend would otherwise be silently misread as openrouter.
+		const rawBackend = parsed[METADATA_BACKEND_KEY]
+		const backend =
+			typeof rawBackend === "string" && (EMBEDDING_BACKENDS as readonly string[]).includes(rawBackend)
+				? (rawBackend as EmbeddingBackend)
+				: "openrouter"
 		const model = typeof parsed[METADATA_MODEL_KEY] === "string" ? parsed[METADATA_MODEL_KEY] : undefined
 		if (model === undefined) {
 			return undefined

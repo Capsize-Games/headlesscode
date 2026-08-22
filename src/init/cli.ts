@@ -2,7 +2,7 @@
  * `headlesscode init` subcommand — one-command project registration.
  *
  *   npx tsx src/cli.ts init --workspace <path> [--skip-index] [--skip-codemap]
- *                           [--embedding-backend <openrouter|ollama>]
+ *                           [--embedding-backend <openrouter|ollama|airunner>]
  *
  * A thin orchestration layer over EXISTING functionality: project registration
  * (resolveProjectDataDir), stack detection (detectStacks), .gitignore hygiene
@@ -26,7 +26,7 @@ const INIT_USAGE = `headlesscode init — one-command project registration
 
 Usage:
   headlesscode init --workspace <path> [--skip-index] [--skip-codemap]
-                    [--embedding-backend <openrouter|ollama>]
+                    [--embedding-backend <openrouter|ollama|airunner>]
 
 Options:
   --workspace <path>      Workspace root to register (required; must be a
@@ -35,8 +35,9 @@ Options:
                           (saves embedding API cost)
   --skip-codemap          Do not build/refresh the codemap
   --embedding-backend <b> Embedding backend for the index step: openrouter
-                          (default) or ollama (local). Passed straight
-                          through to \`headlesscode index\`
+                          (default), ollama (local), or airunner (local
+                          AIRunner server). Passed straight through to
+                          \`headlesscode index\`
   --help                  Show this help and exit
 
 Registers a new project with headlesscode in one step: resolves the central
@@ -48,8 +49,9 @@ codebase-search index and the codemap. Each step is independent: a failure in
 one is reported inline and the remaining steps still run, but the command
 exits non-zero.
 
-The index step costs real money (embedding API calls) unless
---embedding-backend ollama is used or the step is skipped with --skip-index.
+The index step costs real money (embedding API calls) unless a local backend
+(--embedding-backend ollama or airunner) is used or the step is skipped with
+--skip-index.
 `
 
 interface InitCliOptions {
