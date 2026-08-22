@@ -989,6 +989,106 @@ async function testRequireArtifactSectionsRefusesASurveyWithoutAProposal(): Prom
 	}
 }
 
+// ─── Artifact-rejection guardrail (issue #152) ───────────────────────────────
+// requireArtifactMinCitations/Sections check presence, not truth — a session
+// can patch in exactly the missing surface feature (a citation-shaped
+// string, a required heading) without ever re-reading anything. This
+// guardrail (DEFAULT_ARTIFACT_REJECTION_NUDGE_THRESHOLD) tracks consecutive
+// rejections since the last real read_file call and escalates to an
+// explicit nudge naming the pattern.
+
+async function testArtifactRejectionNudgeFiresWithoutRereading(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-artifact-nudge-"))
+	try {
+		await writeCitationFixtureFiles(ws)
+		const client = new FakeLlmClient([
+			() =>
+				toolCall("write_to_file", {
+					path: "plans/research/finding.md",
+					content: "# A finding\n\nSomething is probably wrong somewhere, I think.\n",
+				}),
+			() => toolCall("attempt_completion", { result: "Wrote the stub." }), // rejection 1 (0 citations)
+			() =>
+				toolCall("write_to_file", {
+					path: "plans/research/finding.md",
+					content: "# A finding\n\nsrc/example.ts:1 shows something.\n",
+				}),
+			() => toolCall("attempt_completion", { result: "Added one citation." }), // rejection 2 -> nudge fires
+			() =>
+				toolCall("write_to_file", {
+					path: "plans/research/finding.md",
+					content:
+						"# A finding\n\nReal evidence: src/example.ts:42 shows the bug, " +
+						"and src/other.ts:100-110 confirms it.\n",
+				}),
+			() => toolCall("attempt_completion", { result: "Wrote the real doc." }),
+		])
+		const session = await makeSession({
+			task: "research something and cite real evidence",
+			client,
+			workspaceRoot: ws,
+			requireArtifactPathPattern: "plans/research/*.md",
+			requireArtifactMinCitations: 2,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "Wrote the real doc.")
+		const nudge = session.state.messages.find(
+			(m) => m.role === "user" && (m.content ?? "").includes("read_file call in between"),
+		)
+		assert.ok(nudge, "expected the artifact-rejection nudge after 2 consecutive rejections with no read_file")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testArtifactRejectionNudgeSuppressedByARealRead(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-artifact-nudge-reset-"))
+	try {
+		await writeCitationFixtureFiles(ws)
+		const client = new FakeLlmClient([
+			() =>
+				toolCall("write_to_file", {
+					path: "plans/research/finding.md",
+					content: "# A finding\n\nSomething is probably wrong somewhere, I think.\n",
+				}),
+			() => toolCall("attempt_completion", { result: "Wrote the stub." }), // rejection 1 (0 citations)
+			() => toolCall("read_file", { path: "src/example.ts" }), // real re-diagnosis -> resets the streak
+			() =>
+				toolCall("write_to_file", {
+					path: "plans/research/finding.md",
+					content: "# A finding\n\nsrc/example.ts:1 shows something.\n",
+				}),
+			() => toolCall("attempt_completion", { result: "Added one citation." }), // rejection 2, but streak was reset
+			() =>
+				toolCall("write_to_file", {
+					path: "plans/research/finding.md",
+					content:
+						"# A finding\n\nReal evidence: src/example.ts:42 shows the bug, " +
+						"and src/other.ts:100-110 confirms it.\n",
+				}),
+			() => toolCall("attempt_completion", { result: "Wrote the real doc." }),
+		])
+		const session = await makeSession({
+			task: "research something and cite real evidence",
+			client,
+			workspaceRoot: ws,
+			requireArtifactPathPattern: "plans/research/*.md",
+			requireArtifactMinCitations: 2,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+		const nudge = session.state.messages.find(
+			(m) => m.role === "user" && (m.content ?? "").includes("read_file call in between"),
+		)
+		assert.ok(!nudge, "a real read_file between rejections must suppress the nudge")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // Issue #152: a citation-shaped string used to count toward
 // requireArtifactMinCitations even when the cited file was completely
 // fabricated (didn't exist at all) — live-verified 2026-08-21 that a real
@@ -3506,6 +3606,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["identical-call stall: a text-only reply resets the streak (no frozen penalty boost)", testTextOnlyReplyResetsTheIdenticalCallGuard],
 	["identical-call stall: the tool-exclusion cooldown outlives a streak reset", testToolExclusionCooldownOutlivesAStreakReset],
 	["tool-exclusion cooldown (#151): expires after exactly DEFAULT_IDENTICAL_CALL_TOOL_COOLDOWN_TURNS turns", testToolExclusionCooldownExpiresAfterExactTurnCount],
+	["artifact-rejection nudge (#152): fires after 2 consecutive rejections with no read_file in between", testArtifactRejectionNudgeFiresWithoutRereading],
+	["artifact-rejection nudge (#152): suppressed when a real read_file happens between rejections", testArtifactRejectionNudgeSuppressedByARealRead],
 	["identical-call stall: streak at/past threshold boosts repeat_penalty on the retry request", testIdenticalCallStreakBoostsRepeatPenaltyOnRetry],
 	["identical-call stall: streak at/past threshold excludes the repeated tool on the retry request", testIdenticalCallStreakExcludesTheRepeatedToolOnRetry],
 	["identical-call stall: an excluded tool cannot be recovered back in via narrated-text extraction", testExcludedToolCannotBeRecoveredFromNarratedText],
