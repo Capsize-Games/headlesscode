@@ -307,6 +307,9 @@ export interface ProjectListEntry {
 	registered: boolean
 	/** Live fs.existsSync(path) check; false when path is undefined. */
 	exists: boolean
+	/** GitHub "owner/name" from the repo's origin remote (e.g.
+	 * "Capsize-Games/airunnerweb"); undefined when unparseable. */
+	gitOwnerName: string | undefined
 }
 
 /**
@@ -318,6 +321,27 @@ export interface ProjectListEntry {
  * recursively would make `list` slow on a polluted store); callers that want
  * sizes compute them lazily only for the entries they print.
  */
+function gitRemoteOwnerName(projectPath: string | undefined): string | undefined {
+	if (!projectPath) return undefined
+	try {
+		const url = execFileSync("git", ["-C", projectPath, "remote", "get-url", "origin"], {
+			encoding: "utf8",
+			timeout: 5000,
+			stdio: ["ignore", "pipe", "ignore"],
+		}).trim()
+		if (!url) return undefined
+		// git@host:owner/name.git  |  https://host/owner/name.git
+		const ownerName = url.startsWith("git@")
+			? url.slice(url.indexOf(":") + 1)
+			: url.includes("://")
+				? url.slice(url.indexOf("://") + 3).split("/").slice(1).join("/")
+				: url
+		return ownerName.replace(/\.git$/, "") || undefined
+	} catch {
+		return undefined
+	}
+}
+
 export function listProjectEntries(): ProjectListEntry[] {
 	const root = path.join(projectStoreRoot(), "projects")
 	let dirNames: string[]
@@ -347,6 +371,7 @@ export function listProjectEntries(): ProjectListEntry[] {
 			lastSeen: meta?.lastSeen,
 			registered: meta?.registered === true,
 			exists: projectPath !== undefined && fs.existsSync(projectPath),
+			gitOwnerName: gitRemoteOwnerName(projectPath),
 		})
 	}
 	return entries

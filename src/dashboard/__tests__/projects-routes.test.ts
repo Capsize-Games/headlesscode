@@ -152,10 +152,54 @@ async function testEmptyStoreReturnsEmptyArray(): Promise<void> {
 	}
 }
 
+
+async function testGitOwnerNameDerivedFromOrigin(): Promise<void> {
+	// Seed a temp GIT repo with an SSH origin, register it in the store,
+	// and assert GET /api/projects surfaces the derived owner/name.
+	const data = await mkTmp("hc-projects-route-git-")
+	const repoDir = await mkTmp("hc-projects-route-gitrepo-")
+	try {
+		// Minimal git repo with an origin remote (no commits needed).
+		const { execFileSync } = await import("node:child_process")
+		execFileSync("git", ["init", "-q", repoDir])
+		execFileSync("git", ["-C", repoDir, "remote", "add", "origin", "git@github.com:Capsize-Games/airunnerweb.git"])
+
+		const projects = path.join(data, "projects")
+		writeMeta(path.join(projects, "gitproj"), {
+			path: repoDir,
+			kind: "git",
+			firstSeen: "2026-08-05T00:00:00.000Z",
+			lastSeen: "2026-08-17T10:00:00.000Z",
+			registered: true,
+		})
+
+		process.env.HEADLESSCODE_DATA_DIR = data
+		try {
+			const { server, port } = await startServer()
+			try {
+				const res = await get(`http://127.0.0.1:${port}`, "/api/projects")
+				assert.equal(res.status, 200)
+				const body = JSON.parse(res.body) as { projects: Array<{ key: string; gitOwnerName: string }> }
+				const entry = body.projects.find((e) => e.key === "gitproj")
+				assert.ok(entry, "registered git project is listed")
+				assert.equal(entry.gitOwnerName, "Capsize-Games/airunnerweb", "gitOwnerName derived from origin remote")
+			} finally {
+				server.close()
+			}
+		} finally {
+			delete process.env.HEADLESSCODE_DATA_DIR
+		}
+	} finally {
+		await fsp.rm(data, { recursive: true, force: true })
+		await fsp.rm(repoDir, { recursive: true, force: true })
+	}
+}
+
 const tests: Array<[string, () => Promise<void>]> = [
 	["GET /api/projects: default view hides stale-unregistered litter", testDefaultViewHidesStaleUnregisteredLitter],
 	["GET /api/projects?all=1: shows every entry including no-project.json dirs", testAllViewShowsEverything],
 	["GET /api/projects: empty store returns an empty array", testEmptyStoreReturnsEmptyArray],
+	["GET /api/projects: gitOwnerName derived from origin remote", testGitOwnerNameDerivedFromOrigin],
 ]
 
 async function main(): Promise<void> {
