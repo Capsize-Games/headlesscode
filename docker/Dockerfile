@@ -39,9 +39,17 @@ FROM node:22-bookworm-slim
 # gh: the GitHub CLI, used by execute_command inside worktrees (UwUChat
 # code-mode proxy tools call execute_command with `gh ...`); token auth
 # via GH_TOKEN/GITHUB_TOKEN env, matching src/watcher/github.ts.
+# Installed from the official GitHub release tarball, not Debian apt:
+# bookworm ships gh 2.23.0 (2023), whose `issue view` GraphQL query still
+# requests the removed repository.issue.projectCards field and fails with
+# "Projects (classic) is being deprecated" on every modern repo. Pin a
+# recent release so detail queries (issue/pr view) keep working.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates curl gh \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends ca-certificates curl git \
+    && curl -fsSL https://github.com/cli/cli/releases/download/v2.98.0/gh_2.98.0_linux_amd64.tar.gz -o /tmp/gh.tar.gz \
+    && tar -xzf /tmp/gh.tar.gz -C /tmp \
+    && install -m 0755 /tmp/gh_2.98.0_linux_amd64/bin/gh /usr/local/bin/gh \
+    && rm -rf /tmp/gh.tar.gz /tmp/gh_2.98.0_linux_amd64 /var/lib/apt/lists/*
 
 WORKDIR /opt/headlesscode
 
