@@ -1,0 +1,43 @@
+# CI — enforces the repo's own verification bar (.roo/rules/rules.md):
+#   clean `npx tsc --noEmit` + full `npm test` for any src/ change, plus one
+#   e2e pass (scripts/e2e/run.sh) since the e2e suites exercise real
+#   spawn/worker flows against a local mock OpenRouter server.
+#
+# No API key and no network access are needed — the mock server serves the
+# entire session, so this is safe to run on any push/PR, including from forks.
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  typecheck-test-e2e:
+    runs-on: [self-hosted, linux, x64, homeserver]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The full test suite includes src/tools/__tests__/browser-action.test.ts,
+      # which launches a REAL headless Chromium via Playwright — the browser
+      # binary is a separate download, not part of npm ci.
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Full test suite
+        run: npm test
+
+      - name: End-to-end (mock OpenRouter, no key)
+        run: bash scripts/e2e/run.sh

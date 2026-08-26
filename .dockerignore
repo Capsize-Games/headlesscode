@@ -1,0 +1,40 @@
+# Build context exclusions for the headlesscode image (docker/Dockerfile).
+# The Dockerfile only COPYs package.json/package-lock.json/tsconfig.json +
+# src/ + docker/entrypoint.sh, so these are belt-and-braces: they keep the
+# context sent to the daemon small and keep local-only/secret/session data
+# out of any accidental COPY . .
+
+# Secrets & local env
+.env
+.env.*
+
+# Dependencies & build output
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# Session/state dirs (this repo's own .headlesscode can be hundreds of MB)
+.headlesscode/
+.worktrees/
+*.log
+.harness.pid
+.smoke-artifacts/
+
+# VCS
+.git/
+.gitignore
+
+# Upstream vendoring clone (gitignored build input, not part of the package)
+/zoo-code/
+
+# Repo docs/plans are not needed at runtime; scripts/ is mostly dev/deploy
+# tooling too, EXCEPT the three the orchestration path shells out to at
+# runtime (spawn/worker/answer) — re-included explicitly below.
+docs/
+plans/
+recon/
+scripts/
+!scripts/spawn-parallel-worktrees.sh
+!scripts/run-worker.sh
+!scripts/headlesscode-answer.sh

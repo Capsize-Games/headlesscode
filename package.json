@@ -1,0 +1,61 @@
+{
+	"name": "headlesscode",
+	"version": "0.1.0",
+	"description": "Standalone headless coding-agent harness: runs the Zoo Code agent loop (prompts, tools, modes) without a VS Code UI, driven by CLI, HTTP, and parallel worktree orchestration.",
+	"license": "Apache-2.0",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/Capsize-Games/headlesscode.git"
+	},
+	"author": "The headlesscode contributors",
+	"keywords": [
+		"cli",
+		"coding-agent",
+		"headless",
+		"automation",
+		"agent"
+	],
+	"type": "module",
+	"engines": {
+		"node": ">=18"
+	},
+	"bin": {
+		"headlesscode": "bin/headlesscode.mjs"
+	},
+	"files": [
+		"LICENSE",
+		"README.md",
+		"ATTRIBUTION.md",
+		"SECURITY.md",
+		"CONTRIBUTING.md",
+		"CODE_OF_CONDUCT.md",
+		"tsconfig.json",
+		"shared/",
+		"src/",
+		"!src/**/__tests__/",
+		"!src/**/*.test.ts"
+	],
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"smoke": "tsx src/vendor/tests/smoke.ts",
+		"dev": "tsx src/index.ts",
+		"start": "tsx src/cli.ts",
+		"cli": "tsx src/cli.ts",
+		"test": "node scripts/run-tests.mjs"
+	},
+	"dependencies": {
+		"@modelcontextprotocol/sdk": "^1.30.0",
+		"@octokit/auth-app": "^8.2.0",
+		"fastest-levenshtein": "^1.0.16",
+		"p-wait-for": "^5.0.2",
+		"simple-git": "^3.36.0",
+		"tsx": "^4.19.0",
+		"typescript": "^5.6.0",
+		"playwright": "^1.62.1",
+		"yaml": "^2.5.1",
+		"zod": "^3.25.76"
+	},
+	"devDependencies": {
+		"@types/node": "^22.10.0"
+	}
+}

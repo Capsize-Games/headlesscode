@@ -1,0 +1,50 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Logs and temp files
+*.log
+.DS_Store
+*.tmp
+
+# Phase 3 memory subsystem default storage (facts + session summaries JSONL)
+/.headlesscode/
+
+# Parallel orchestration worktrees (spawned per-issue, cleaned up by the harness)
+.worktrees/
+
+TASK.md
+TASK_*.md
+# Manual smoke-test output (src/tools/browser/smoke.ts)
+.smoke-artifacts/
+
+# Environment
+.env
+.env.*
+
+# Key/credential material a contributor could accidentally generate into the
+# tree (SEC-10) — none of these are expected to ever be legitimately tracked.
+*.pem
+*.key
+credentials.json
+id_rsa*
+
+# Upstream Zoo Code clone used as a vendoring source (see VENDOR-NOTES.md)
+# This is a build input, not part of the harness. Root-anchored so the vendored
+# portable core under src/vendor/zoo-code/ (Apache-2.0, with attribution) stays tracked.
+# NOTE: no trailing slash on purpose — in spawned worktrees `zoo-code` is a
+# SYMLINK to the main checkout (a symlink does not match a dir-only pattern).
+/zoo-code
+
+# Harness bookkeeping artifacts that must never be committed from a worktree.
+/.harness.pid
+/.harness.pgid
+/.harness.exit
+/ORCHESTRATOR_TASK.md
+
+# Local tool runtime artifacts (Claude Code scheduled-task lock, etc.)
+/.claude/
