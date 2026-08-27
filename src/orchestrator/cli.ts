@@ -67,7 +67,8 @@ import {
 	TRIVIAL_DRIFT_AHEAD,
 } from "./git-sync.js"
 import { resolveModelForMode } from "../config/mode-models.js"
-import { runPreflight, type PreflightResult } from "../llm/preflight.js"
+import { runPreflight, runLocalPreflight, type PreflightResult, type LocalPreflightResult } from "../llm/preflight.js"
+import { resolvePerModeEnv } from "../cli.js"
 
 const ORCHESTRATE_USAGE = `headlesscode orchestrate — Phase 2 parallel round
 
@@ -2782,24 +2783,44 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	// contexts that don't want the extra round-trip. The probe's model is
 	// resolved exactly like the worker's first spawn (same resolveModelForMode
 	// precedence as 1c below), so what we probe is what the worker will call.
-	let preflightProbe: PreflightResult | undefined
+	let preflightProbe: PreflightResult | LocalPreflightResult | undefined
 	if (options.preflight) {
-		const workerModelForProbe = resolveModelForMode({
-			workspaceRoot: repo,
-			mode: options.mode,
-			explicitModel: options.model,
-			env: process.env,
-		})
-		const maxCostRaw = process.env.HEADLESSCODE_MAX_COST_USD
-		const maxCostUsd = maxCostRaw !== undefined && maxCostRaw !== "" ? Number(maxCostRaw) : undefined
+		// 2026-08-27: probe whichever backend the WORKER's mode will actually
+		// use (see cli.ts's useLocalCodeBackend / reviewer.ts's runReview /
+		// qa.ts's runQa — same gate, repeated here since orchestrate never
+		// otherwise imports cli.ts). Before this, a round configured entirely
+		// for the local daemon still probed OpenRouter/DeepSeek unconditionally
+		// and aborted on a cloud key that round would never touch.
+		const useLocalBackendForWorker =
+			process.env.HEADLESSCODE_CODE_MODE_BACKEND === "ollama" &&
+			(process.env.HEADLESSCODE_LOCAL_BACKEND_MODES ?? "code")
+				.split(",")
+				.map((s) => s.trim())
+				.filter(Boolean)
+				.includes(options.mode)
 		try {
-			preflightProbe = await runPreflight({
-				model: workerModelForProbe,
-				workerSessions: specs.length,
-				maxCostUsd: maxCostUsd !== undefined && Number.isFinite(maxCostUsd) && maxCostUsd > 0 ? maxCostUsd : undefined,
-			})
+			if (useLocalBackendForWorker) {
+				preflightProbe = await runLocalPreflight({
+					model: options.model ?? resolvePerModeEnv("HEADLESSCODE_CODE_MODE_MODEL", options.mode),
+					baseUrl: resolvePerModeEnv("HEADLESSCODE_OLLAMA_URL", options.mode),
+				})
+			} else {
+				const workerModelForProbe = resolveModelForMode({
+					workspaceRoot: repo,
+					mode: options.mode,
+					explicitModel: options.model,
+					env: process.env,
+				})
+				const maxCostRaw = process.env.HEADLESSCODE_MAX_COST_USD
+				const maxCostUsd = maxCostRaw !== undefined && maxCostRaw !== "" ? Number(maxCostRaw) : undefined
+				preflightProbe = await runPreflight({
+					model: workerModelForProbe,
+					workerSessions: specs.length,
+					maxCostUsd: maxCostUsd !== undefined && Number.isFinite(maxCostUsd) && maxCostUsd > 0 ? maxCostUsd : undefined,
+				})
+			}
 		} catch (err) {
-			// runPreflight never throws by contract, but if it ever does the
+			// Neither probe throws by contract, but if either ever does the
 			// round must not proceed on an unchecked gate.
 			process.stderr.write(
 				`headlesscode orchestrate: preflight probe crashed unexpectedly: ${err instanceof Error ? err.message : String(err)}\n`,
@@ -2909,14 +2930,18 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 			// Issue #13: persist the preflight probe so the dashboard can surface the
 			// preflight line on the round view (see aggregate.ts RoundSummary.preflight).
 			if (preflightProbe) {
+				// LocalPreflightResult has no cost fields at all (local inference
+				// is genuinely free) — default to 0/undefined rather than widen
+				// PreflightRecord's required probeCostUsd to optional for a case
+				// that's always a real number either way.
 				state.preflight = {
 					status: preflightProbe.status,
 					model: preflightProbe.model,
 					baseUrl: preflightProbe.baseUrl,
 					line: preflightProbe.line,
 					latencyMs: preflightProbe.latencyMs,
-					probeCostUsd: preflightProbe.probeCostUsd,
-					roundCostEstimateUsd: preflightProbe.roundCostEstimateUsd,
+					probeCostUsd: "probeCostUsd" in preflightProbe ? preflightProbe.probeCostUsd : 0,
+					roundCostEstimateUsd: "roundCostEstimateUsd" in preflightProbe ? preflightProbe.roundCostEstimateUsd : undefined,
 				}
 			}
 			return state

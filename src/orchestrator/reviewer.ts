@@ -191,12 +191,21 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 			.map((s) => s.trim())
 			.filter(Boolean)
 			.includes(mode)
+	// 2026-08-27: cli.ts's own useLocalCodeBackend path learned this the hard
+	// way (see its effectiveModel doc comment) — every downstream consumer of
+	// `model` (session-start logs, cost/usage records, the `request.model`
+	// OllamaClient sends, which OllamaClient.resolveModel() prefers over its
+	// own defaultModel) must see the LOCAL model id when local backend is
+	// active, not the cloud one, or a local review session logs/tags itself
+	// as e.g. "deepseek/deepseek-v4-flash-0731" throughout even though it
+	// never touches OpenRouter.
+	const effectiveModel = useLocalBackend ? (resolvePerModeEnv("HEADLESSCODE_CODE_MODE_MODEL", mode) ?? model) : model
 	const client =
 		llmClient ??
 		(useLocalBackend
 			? new OllamaClient({
 					baseUrl: resolvePerModeEnv("HEADLESSCODE_OLLAMA_URL", mode),
-					defaultModel: resolvePerModeEnv("HEADLESSCODE_CODE_MODE_MODEL", mode) ?? model,
+					defaultModel: effectiveModel,
 				})
 			: new OpenRouterClient({ apiKey: process.env.HEADLESSCODE_OPENROUTER_API_KEY, defaultModel: model }))
 
@@ -217,7 +226,7 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 	const session = new HeadlessSession({
 		workspaceRoot,
 		mode,
-		model,
+		model: effectiveModel,
 		taskText: taskText ?? defaultTaskText(workspaceRoot),
 		maxIterations,
 		budget,

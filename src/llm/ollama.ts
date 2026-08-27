@@ -22,8 +22,32 @@
  *     configurable per client instance — see `OLLAMA_THINK_ENV`.
  * Cost is always $0 (no OpenRouter billing involved) but real token counts
  * are still reported via `usage` so budget/report accounting stays accurate.
+ *
+ * `node_id` continuity (found 2026-08-27 debugging a live daemon): the
+ * airunnerdesktop daemon's `/api/chat` route is NOT actually stateless
+ * despite implementing the Ollama wire protocol — `_get_or_create_conversation`
+ * (conversation_management_mixin.py) opens a BRAND NEW, empty DB-backed
+ * conversation on every call unless the request body carries a stable
+ * `node_id` string, which this client never sent. Verified live: without
+ * `node_id`, every call got a fresh `conversation_id` (confirmed via the
+ * daemon's own logs incrementing 5912 -> 5913 one call apart) with zero
+ * prior messages, so on any turn after the first — once the daemon's own
+ * chat-template tries to render a multi-turn tool-calling exchange whose
+ * "history" is actually empty — the underlying jinja2 chat template raises
+ * `TemplateError: No user query found in messages` (the DB truly has no
+ * user-role message, since only the single newest turn — a tool result,
+ * not the original user turn — ever got attached to that fresh
+ * conversation). One real request in isolation "works" (a fresh
+ * conversation containing exactly the current user message renders fine),
+ * which is why this was easy to misdiagnose as a context-window or
+ * capability issue rather than a continuity bug. Sending a stable `node_id`
+ * (generated once per `OllamaClient` instance, i.e. once per headlesscode
+ * session) makes the daemon reuse the SAME conversation record across every
+ * call in a session, matching how a real chat UI like uwuchat's own
+ * LangChain-based client drives this same daemon successfully.
  */
 
+import { randomUUID } from "node:crypto"
 import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } from "../engine/types.js"
 
 export const OLLAMA_URL_ENV = "HEADLESSCODE_OLLAMA_URL"
@@ -39,6 +63,8 @@ export interface OllamaClientOptions {
 	fetchImpl?: typeof fetch
 	/** Send `think: true` to the daemon (default false). See `OLLAMA_THINK_ENV`. */
 	think?: boolean
+	/** Override the `node_id` sent with every request (default: a fresh UUID per client instance). See the module doc comment. */
+	nodeId?: string
 }
 
 /** Typed error for a non-2xx response or a malformed payload from the daemon. */
@@ -65,6 +91,8 @@ export class OllamaClient implements LlmClient {
 	private readonly timeoutMs: number
 	private readonly fetchImpl: typeof fetch
 	private readonly think: boolean
+	/** Stable per-client identifier sent as `node_id` so a stateful daemon (e.g. airunnerdesktop) reuses one conversation for this session instead of a fresh, history-less one per call. See the module doc comment. */
+	private readonly nodeId: string
 
 	constructor(options: OllamaClientOptions = {}) {
 		this.baseUrl = (options.baseUrl ?? process.env[OLLAMA_URL_ENV] ?? DEFAULT_OLLAMA_URL).replace(/\/+$/, "")
@@ -72,6 +100,7 @@ export class OllamaClient implements LlmClient {
 		this.timeoutMs = options.timeoutMs ?? DEFAULT_OLLAMA_TIMEOUT_MS
 		this.fetchImpl = options.fetchImpl ?? ((...args) => fetch(...args))
 		this.think = options.think ?? envThinkEnabled()
+		this.nodeId = options.nodeId ?? randomUUID()
 	}
 
 	resolveModel(requestModel?: string): string {
@@ -96,6 +125,7 @@ export class OllamaClient implements LlmClient {
 				signal: controller.signal,
 				body: JSON.stringify({
 					model,
+					node_id: this.nodeId,
 					messages: toOllamaMessages(request.messages),
 					stream: false,
 					think: this.think,

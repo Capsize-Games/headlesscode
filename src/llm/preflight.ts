@@ -25,6 +25,7 @@
 
 import type { PricingTable } from "../budget/cost.js"
 import { estimateCost, loadPricingTable } from "../budget/cost.js"
+import { OllamaClient, DEFAULT_OLLAMA_URL } from "./ollama.js"
 import { OpenRouterClient, OpenRouterError, OPENROUTER_BASE_URL, DEFAULT_MODEL } from "./openrouter.js"
 import type { LlmRequest } from "../engine/types.js"
 
@@ -296,4 +297,71 @@ export async function runPreflight(options: PreflightOptions): Promise<Preflight
 	const line = buildPreflightLine({ ...result, workerSessions, maxCostUsd: options.maxCostUsd })
 	result.line = status === "ok" ? line : `${line} — ${excerpt(detail)}`
 	return result
+}
+
+/**
+ * Local-backend counterpart to `runPreflight` — 2026-08-27: `orchestrate`
+ * unconditionally ran the OpenRouter probe above even when a round's worker/
+ * reviewer/QA mode was configured for the local Ollama-compat daemon
+ * (`useLocalCodeBackend` in cli.ts), so switching a project fully to local
+ * inference made every `orchestrate` invocation fail preflight against a
+ * cloud key/model that round was never going to use (verified live: a round
+ * with only local env vars set still probed `deepseek/deepseek-v4-flash-0731`
+ * and aborted on a stale/invalid OpenRouter key that was irrelevant to the
+ * actual run). This does the same "one cheap real completion before spawning
+ * anything" check, but against the local daemon — catching the daemon being
+ * down, the model not loaded, or a wrong base URL before burning iterations
+ * on it, the same value `runPreflight` provides for the cloud path.
+ *
+ * Deliberately NOT a variant of `PreflightStatus` above (no-api-key/balance/
+ * provider-pin are cloud-specific concepts with no local equivalent) — a
+ * local daemon is either reachable-and-generating or it isn't.
+ */
+export type LocalPreflightStatus = "ok" | "unreachable" | "other"
+
+export interface LocalPreflightResult {
+	status: LocalPreflightStatus
+	model: string
+	baseUrl: string
+	line: string
+	latencyMs: number
+}
+
+export interface LocalPreflightOptions {
+	/** The model id a worker would use (default: OllamaClient's own default). */
+	model?: string
+	/** Ollama-compat base URL (default: $HEADLESSCODE_OLLAMA_URL or the built-in). */
+	baseUrl?: string
+	env?: NodeJS.ProcessEnv
+	signal?: AbortSignal
+}
+
+export async function runLocalPreflight(options: LocalPreflightOptions): Promise<LocalPreflightResult> {
+	const env = options.env ?? process.env
+	const baseUrl = (options.baseUrl ?? env.HEADLESSCODE_OLLAMA_URL ?? DEFAULT_OLLAMA_URL).replace(/\/+$/, "")
+	const model = options.model?.trim() || "(daemon default)"
+	const client = new OllamaClient({ baseUrl, defaultModel: options.model })
+	const startedAt = Date.now()
+	let status: LocalPreflightStatus
+	let detail = ""
+	try {
+		await client.createChatCompletion({
+			model,
+			messages: [{ role: "user", content: "ping" }],
+			maxTokens: 1,
+			temperature: 0,
+			signal: options.signal,
+		})
+		status = "ok"
+	} catch (err) {
+		detail = err instanceof Error ? err.message : String(err)
+		const cause = err instanceof Error ? (err.cause as { code?: string } | undefined) : undefined
+		status = /ECONNREFUSED|ENOTFOUND|fetch failed|is the daemon running/i.test(detail) || cause?.code === "ECONNREFUSED" ? "unreachable" : "other"
+	}
+	const latencyMs = Date.now() - startedAt
+	const line =
+		status === "ok"
+			? `${model} @ ${baseUrl}: all clear — 1-token probe OK in ${latencyMs}ms (local daemon, $0)`
+			: `${model} @ ${baseUrl}: ${status === "unreachable" ? "daemon unreachable" : "probe failed"} — ${excerpt(detail)}`
+	return { status, model, baseUrl, line, latencyMs }
 }

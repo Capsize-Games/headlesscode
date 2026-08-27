@@ -90,6 +90,13 @@ interface CliOptions {
 	 */
 	contextWindowTokens?: number
 	/**
+	 * Sampling temperature sent on every LLM call (default: 0 — fully
+	 * deterministic/greedy). Exposed 2026-08-27 while investigating whether
+	 * greedy decoding was a factor in local-model task failures — there was
+	 * previously no way to override this at all.
+	 */
+	temperature?: number
+	/**
 	 * Phase 3 context condensation: fraction of the context window at which
 	 * the oldest turns are condensed (default
 	 * DEFAULT_CONDENSE_THRESHOLD_FRACTION in src/engine/condense.ts).
@@ -286,14 +293,20 @@ Options:
   --max-tokens <n>           Hard cap on tokens the model may generate per LLM
                                call (default: 32768 — see DEFAULT_MAX_TOKENS in
                                src/engine/loop.ts). Default: $HEADLESSCODE_MAX_TOKENS
-  --consecutive-error-limit <n>  Consecutive mistakes before giving up (default: 3)
+  --consecutive-error-limit <n>  Consecutive mistakes before giving up (default: 3,
+                               or 6 for the local code-mode backend — see cli.ts's
+                               DEFAULT_LOCAL_CONSECUTIVE_ERROR_LIMIT)
   --window-size <n>          Sliding-window history cap, in messages, before the
                              oldest are evicted (default: 300; see DEFAULT_WINDOW_SIZE
                              in src/engine/loop.ts for why)
+  --temperature <f>          Sampling temperature, 0-2 (default: 0 — fully deterministic/
+                             greedy; every LLM call uses this, no per-role override)
   --context-window <n>       Phase 3 context condensation: the model's real context
                              window in tokens (default: live OpenRouter lookup, else
-                             128000; see DEFAULT_CONTEXT_WINDOW_TOKENS in
-                             src/engine/condense.ts)
+                             128000, or 40960 for the local code-mode backend — see
+                             DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS in cli.ts and
+                             DEFAULT_CONTEXT_WINDOW_TOKENS in src/engine/condense.ts;
+                             override with $HEADLESSCODE_CODE_MODE_CONTEXT_WINDOW)
   --condense-threshold <f>   Phase 3 context condensation: fraction of the context
                              window at which the oldest turns are condensed into one
                              summary (default: 0.75, or 0.92 for the local code-mode
@@ -537,6 +550,15 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 					return { options, error: "--child-iteration-fraction requires a fraction between 0 and 1 (e.g. 0.5)" }
 				}
 				options.childIterationFraction = num
+				break
+			}
+			case "--temperature": {
+				const value = next()
+				const num = value === undefined ? Number.NaN : Number(value)
+				if (!Number.isFinite(num) || num < 0 || num > 2) {
+					return { options, error: "--temperature requires a number between 0 and 2 (e.g. 0.3)" }
+				}
+				options.temperature = num
 				break
 			}
 			case "--condense-threshold": {
@@ -1109,6 +1131,28 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// loop.ts's HeadlessSessionConfig.verifyBeforeCompletion doc comment.
 	const verifyBeforeCompletion =
 		useLocalCodeBackend && !envBoolean("HEADLESSCODE_ALLOW_UNVERIFIED_COMPLETION")
+	// A local (Qwen3.5-9B) session was observed live 2026-08-27 doing the
+	// actual work correctly (a real, correct edit_file call) and then dying
+	// anyway: its first attempt_completion was deferred (a prior
+	// execute_command had failed), its next two execute_command retries
+	// ALSO failed (nested-quote shell one-liners it wrote — a
+	// jsonEscapingNote-class mistake, see prompt.ts — that ran fine when
+	// re-run by hand outside the harness), and by the time it gave up and
+	// wrote a prose explanation instead of retrying attempt_completion, that
+	// was already its 3rd consecutive mistake — DEFAULT_CONSECUTIVE_ERROR_LIMIT
+	// (3) counts tool errors and non-completing replies on the SAME counter,
+	// so two ordinary tool mistakes leave a local model exactly one strike
+	// from a hard stop even when the underlying task is already done. Cloud
+	// models haven't shown this failure shape (see prompt.ts's jsonEscapingNote
+	// doc comment — that failure was Qwen3-14B-specific too), so this is
+	// scoped to the local backend only, same opt-in-override pattern as the
+	// flags above. DEFAULT_TOOL_FAILURE_NUDGE_THRESHOLD (2) only needs to
+	// stay strictly below this value (see its own doc comment) — 6 leaves
+	// that comfortably true.
+	const DEFAULT_LOCAL_CONSECUTIVE_ERROR_LIMIT = 6
+	const consecutiveErrorLimit =
+		options.consecutiveErrorLimit ??
+		(useLocalCodeBackend ? DEFAULT_LOCAL_CONSECUTIVE_ERROR_LIMIT : undefined)
 	// Issue #144: local inference is free — a fabricated dollar figure in
 	// every log line is noise at best, misleading at worst.
 	const trackCost = !useLocalCodeBackend || envBoolean("HEADLESSCODE_FORCE_COST_TRACKING")
@@ -1177,6 +1221,32 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 			extraKeys: ["_condensation"],
 			env: process.env,
 		})
+
+	// loop.ts's resolveContextWindowTokens() live-queries the OpenRouter
+	// catalog for the real context window and falls back to
+	// DEFAULT_CONTEXT_WINDOW_TOKENS (128000) when that lookup fails or isn't
+	// applicable — which is unconditional for the local backend (there's no
+	// OpenRouter catalog entry for a locally-loaded GGUF). Verified live
+	// 2026-08-27: the code-daemon's actual configured window
+	// (AIRUNNER_GGUF_N_CTX, checked via `docker inspect`) is 40960, well
+	// under the assumed 128000 — the opposite-direction version of the
+	// condenseThresholdFraction incident above (that one was a too-SMALL
+	// assumed window firing condensation too early; an unset context window
+	// here is too LARGE, so condensation at 92% of a wrong 128000 would fire
+	// at ~118000 tokens, past the real 40960 limit, risking a hard daemon
+	// failure/silent truncation instead of a graceful condense). No session
+	// observed tonight actually reached anywhere near 40960 real tokens, so
+	// this didn't cause any of tonight's local-model failures — but it's a
+	// real latent gap for any longer local session. Not auto-detectable (the
+	// Ollama-compat API doesn't expose it), so a documented env default,
+	// same override precedence as every other local-only default above.
+	const DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS = 40960
+	const localContextWindowTokens = Number(process.env.HEADLESSCODE_CODE_MODE_CONTEXT_WINDOW ?? DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS)
+	const contextWindowTokens =
+		options.contextWindowTokens ??
+		(useLocalCodeBackend && Number.isFinite(localContextWindowTokens) && localContextWindowTokens > 0
+			? localContextWindowTokens
+			: undefined)
 
 	// Graded reasoning effort for deepseek/* models (issue #30 experiment):
 	// the `_reasoning_effort` key in mode-models.json beats
@@ -1265,15 +1335,16 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		maxIterations: options.maxIterations,
 		maxRecursionDepth,
 		childIterationFraction,
-		consecutiveErrorLimit: options.consecutiveErrorLimit,
+		consecutiveErrorLimit,
 		windowSize: options.windowSize,
-		contextWindowTokens: options.contextWindowTokens,
+		contextWindowTokens,
 		condenseThresholdFraction,
 		condenseEarlyFireFraction,
 		condenseModel,
 		llmTimeoutMs: options.llmTimeoutMs,
 		stream: options.stream,
 		reasoningEffort,
+		temperature: options.temperature,
 		requireExplicitCompletion,
 		patchLocalToolSchemas,
 		verifyBeforeCompletion,

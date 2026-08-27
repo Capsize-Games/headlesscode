@@ -512,6 +512,44 @@ export async function buildLeanSystemPrompt(options: BuildSystemPromptOptions): 
 		"that has string literals — keep the outer JSON string double-quoted and escape each embedded `\"` as " +
 		"`\\\"`. Do not switch the outer quote character to avoid escaping; that is the mistake, not a workaround."
 
+	// 2026-08-27 addendum, execute_command specifically: verified live
+	// against Qwen3.5-9B — asked to verify an edit it had already made
+	// correctly, the model wrote a multi-line `python3 -c "with open(...) as
+	// f: ..."` verification command whose JSON argument had the exact
+	// single/double-quote-nesting defect jsonEscapingNote describes above,
+	// which errored through the tool (the identical command ran fine when
+	// re-run by hand outside the harness, confirming the JSON encoding —
+	// not the shell command itself — was the defect). Because
+	// attempt_completion had ALREADY been deferred once by that point (a
+	// prior command had failed), the model was one mistake from the
+	// session's hard stop and used its last one narrating in prose instead
+	// of retrying — see execute_command_recovery_note below for that half
+	// of the failure.
+	const executeCommandQuotingNote =
+		"For verification commands specifically (checking a file's contents, confirming a string appears " +
+		"somewhere), prefer the simplest command that answers the question — grep, cat, wc, test — over a " +
+		"multi-line python3/node one-liner. A simple command has far less quoting for you to get right in the " +
+		"JSON argument; a one-liner that mixes single quotes, double quotes, and embedded code is exactly where " +
+		"the jsonEscapingNote mistake above tends to happen, and a failure there costs you a mistake strike for " +
+		"no benefit over the simpler command."
+	// 2026-08-27 addendum, the other half of the same live failure: after
+	// attempt_completion was deferred, the model's recovery attempts
+	// (execute_command retries, then prose) never included just re-issuing
+	// attempt_completion once it believed — correctly, per the read_file
+	// re-check it had already done — that the task was actually finished.
+	// Three non-recovering turns in a row (two failed execute_command
+	// retries, one prose-only reply) hit the session's hard stop on a task
+	// that was already done. The deferral message already names the exact
+	// fix; this states the general rule so it's not the model's first time
+	// seeing this pattern.
+	const executeCommandRecoveryNote =
+		"If attempt_completion is deferred (a system message will say so and name the reason), your NEXT reply " +
+		"must be a real tool call, not prose — either fix the specific thing the message names and re-verify with " +
+		"a command that actually succeeds, or, if you already have real evidence the work is correct, simply call " +
+		"attempt_completion again. A text-only reply explaining why you think you're done does not end the " +
+		"session and counts against your mistake budget the same as a failed command — it is never the right " +
+		"response to a deferral."
+
 	const conventionNote =
 		"Before writing a NEW file of a kind that likely already has examples in this codebase (a test file, a " +
 		"config file, a module following an established pattern), actually read_file an existing example FIRST " +
@@ -524,7 +562,9 @@ export async function buildLeanSystemPrompt(options: BuildSystemPromptOptions): 
 		"which only prints a warning and lets execution continue, so a real bug would print as a clean pass. " +
 		testStructureNote +
 		" " +
-		jsonEscapingNote
+		jsonEscapingNote +
+		" " +
+		executeCommandQuotingNote
 
 	const basePrompt = [
 		modeConfig.roleDefinition,
@@ -534,6 +574,7 @@ export async function buildLeanSystemPrompt(options: BuildSystemPromptOptions): 
 		objectiveNote,
 		planningNote,
 		conventionNote,
+		executeCommandRecoveryNote,
 		getSystemInfoSection(workspaceRoot),
 		await addCustomInstructions(modeConfig.customInstructions ?? "", globalCustomInstructions ?? "", workspaceRoot, modeConfig.slug, {}),
 	]

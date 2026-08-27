@@ -39,7 +39,9 @@ import * as path from "node:path"
 
 import { HeadlessSession } from "../engine/loop.js"
 import { Logger } from "../engine/logger.js"
+import { OllamaClient } from "../llm/ollama.js"
 import { OpenRouterClient } from "../llm/openrouter.js"
+import { resolvePerModeEnv } from "../cli.js"
 import { appendBrowserActionTool, appendCodeIntelTools, loadCustomModes } from "../engine/prompt.js"
 import { createQaHeadlessExecutor } from "../tools/executor.js"
 import { getNativeTools } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/index.js"
@@ -236,9 +238,34 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
 	const modeExists = customModes.some((m) => m.slug === mode)
 	const systemPromptOverride = modeExists ? undefined : GENERIC_QA_CHECKLIST
 
+	// Mirror reviewer.ts's runReview gate (issue #142 follow-up): unlike
+	// reviewer.ts, this constructed an OpenRouterClient unconditionally, so
+	// a local-backend setup (HEADLESSCODE_CODE_MODE_BACKEND=ollama +
+	// HEADLESSCODE_LOCAL_BACKEND_MODES including this QA mode) had no effect
+	// on QA sessions at all, even though the worker and reviewer both
+	// respected it. Same gate, same precedence (an explicit llmClient/model/
+	// baseUrl injected by a caller still wins).
+	const useLocalBackend =
+		process.env.HEADLESSCODE_CODE_MODE_BACKEND === "ollama" &&
+		(process.env.HEADLESSCODE_LOCAL_BACKEND_MODES ?? "code")
+			.split(",")
+			.map((s) => s.trim())
+			.filter(Boolean)
+			.includes(mode)
+	// Same fix as reviewer.ts's effectiveModel (2026-08-27): downstream
+	// consumers of `model` (session-start logs, cost records, the
+	// `request.model` OllamaClient sends) must see the LOCAL model id when
+	// local backend is active, or a local QA session logs itself as the
+	// cloud model throughout even though it never touches OpenRouter.
+	const effectiveModel = useLocalBackend ? (resolvePerModeEnv("HEADLESSCODE_CODE_MODE_MODEL", mode) ?? model) : model
 	const client =
 		llmClient ??
-		new OpenRouterClient({ apiKey: process.env.HEADLESSCODE_OPENROUTER_API_KEY, defaultModel: model, baseUrl })
+		(useLocalBackend
+			? new OllamaClient({
+					baseUrl: baseUrl ?? resolvePerModeEnv("HEADLESSCODE_OLLAMA_URL", mode),
+					defaultModel: effectiveModel,
+				})
+			: new OpenRouterClient({ apiKey: process.env.HEADLESSCODE_OPENROUTER_API_KEY, defaultModel: model, baseUrl }))
 
 	// Mirror every log line to <worktree>/qa.log — see reviewer.ts's runReview
 	// for the full rationale (same fix, same incident: review/QA run
@@ -251,7 +278,7 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
 	const session = new HeadlessSession({
 		workspaceRoot,
 		mode,
-		model,
+		model: effectiveModel,
 		taskText: options.taskText ?? defaultTaskText(workspaceRoot, mode),
 		maxIterations,
 		budget,
@@ -259,6 +286,9 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
 		tools: qaTools(),
 		executor: createQaHeadlessExecutor(workspaceRoot),
 		llmClient: client,
+		// Issue #144 (mirrors reviewer.ts): local inference is free — a
+		// fabricated dollar figure in the QA log is noise at best.
+		trackCost: !useLocalBackend,
 		memory,
 		project,
 		logger,
