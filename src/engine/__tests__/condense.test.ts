@@ -172,6 +172,7 @@ async function makeSession(options: {
 	condenseModel?: string
 	condenseMaxTokens?: number
 	maxTokens?: number
+	disableLlmCondensation?: boolean
 }) {
 	const session = new HeadlessSession({
 		workspaceRoot: options.workspaceRoot,
@@ -187,6 +188,7 @@ async function makeSession(options: {
 		condenseModel: options.condenseModel,
 		condenseMaxTokens: options.condenseMaxTokens,
 		maxTokens: options.maxTokens,
+		disableLlmCondensation: options.disableLlmCondensation,
 		// Checkpoints off — this suite isn't testing shadow-git.
 		checkpoints: false,
 	})
@@ -947,6 +949,65 @@ async function testSessionCondensationNeverSplitsToolGroup(): Promise<void> {
 }
 
 /**
+ * `disableLlmCondensation` (see HeadlessSessionConfig's doc comment,
+ * verified live 2026-08-28 against Qwen3.5-9B+LoRA): a weak local
+ * summarizer can turn a hedged note into a confidently WRONG "fact" that
+ * then gets trusted as real history. When the flag is set, crossing the
+ * condensation threshold must NOT trigger the LLM summarization call at
+ * all — but truncateHistory's plain drop-oldest eviction must still keep
+ * the sent request bounded, since that safety net runs unconditionally
+ * regardless of condensation.
+ */
+async function testSessionDisableLlmCondensationSkipsSummarizationCall(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-condense-disabled-"))
+	try {
+		const system: ChatMessage = { role: "system", content: "system prompt" }
+		const firstUser: ChatMessage = { role: "user", content: "the task" }
+		const rest: ChatMessage[] = []
+		const callCounts = [1, 3, 2, 1, 2, 3, 1, 1, 2, 3, 1, 2, 3, 2, 1]
+		for (const n of callCounts) {
+			const calls: ChatToolCall[] = Array.from({ length: n }, (_, i) => ({
+				id: `call_${rest.length}_${i}`,
+				type: "function",
+				function: { name: "read_file", arguments: "{}" },
+			}))
+			rest.push({ role: "assistant", content: null, tool_calls: calls })
+			for (const c of calls) {
+				rest.push({ role: "tool", content: "ok", tool_call_id: c.id, name: "read_file" })
+			}
+		}
+		const client = new FakeLlmClient(
+			[() => toolCall("list_files", { path: "." }), () => toolCall("attempt_completion", { result: "done" })],
+			{ promptTokens: 120_000, completionTokens: 100 },
+		)
+		const session = await makeSession({
+			task: "task",
+			client,
+			workspaceRoot: ws,
+			contextWindowTokens: 128_000,
+			condenseThresholdFraction: 0.75,
+			// Small enough that truncateHistory (which always runs after
+			// condensation, whether or not condensation itself ran) has
+			// real eviction to do against this history.
+			windowSize: 20,
+			disableLlmCondensation: true,
+		})
+		session.state.messages = [system, firstUser, ...rest]
+
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(client.condenseCalls, 0, "the LLM summarization call must never run when disabled")
+		const lastReq = client.requests[client.requests.length - 1]
+		assert.ok(
+			lastReq.messages.length <= 20,
+			`truncateHistory must still bound the request even with condensation disabled (got ${lastReq.messages.length} messages)`,
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+/**
  * Prompt-cache stability across the condensation boundary: after the
  * condensation, the sent prefix (summary + tail) must stay IDENTICAL across
  * subsequent requests — not reshuffled every call.
@@ -1146,6 +1207,10 @@ const tests: Array<[string, () => Promise<void> | void]> = [
 	["session: explicit condenseMaxTokens/maxTokens override the defaults", testSessionExplicitMaxTokensOverridesDefaults],
 	["session: live-resolved context window is cached and reused across checks (regression)", testSessionReusesLiveResolvedContextWindowAcrossChecks],
 	["session: condensation never splits a tool-call group", testSessionCondensationNeverSplitsToolGroup],
+	[
+		"session: disableLlmCondensation skips the summarization call but truncateHistory still bounds it",
+		testSessionDisableLlmCondensationSkipsSummarizationCall,
+	],
 	["session: post-condensation prefix stays stable across calls", testSessionPostCondensePrefixStable],
 	["session: condensation usage can trip the budget like a main call", testCondensationUsageTripsBudget],
 	["session: condensation call times out instead of hanging forever (non-fatal)", testSessionCondenseCallTimesOutNonFatally],

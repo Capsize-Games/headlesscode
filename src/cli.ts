@@ -1204,6 +1204,22 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		options.condenseThreshold ?? (useLocalCodeBackend ? LOCAL_CONDENSE_THRESHOLD_FRACTION : undefined)
 	const condenseEarlyFireFraction =
 		options.condenseEarlyFire ?? (useLocalCodeBackend ? LOCAL_CONDENSE_THRESHOLD_FRACTION : undefined)
+	// A local (Qwen3.5-9B+LoRA) condensation call was observed live
+	// 2026-08-28 turning a correctly-hedged note ("X is an existing gate,
+	// for reference") into a flat false claim ("X passed, ready to merge")
+	// for a feature the session never touched — a lossy ~13:1 compression
+	// under CONDENSE_SYSTEM_PROMPT's "never invent content" rule is only as
+	// reliable as the model executing it, and this one wasn't. The
+	// corrupted summary then re-entered history as trusted fact and the
+	// session repeated the false completion claim until bounded failure
+	// killed it. See HeadlessSessionConfig.disableLlmCondensation's doc
+	// comment (loop.ts) for the full tradeoff: local inference has no
+	// per-token cost pressure, so summarization's risk (a fabricated "fact"
+	// the model can't distinguish from a real one) isn't worth taking when
+	// truncateHistory's plain drop-oldest eviction — which keeps running
+	// either way — only ever loses information, never invents it.
+	const disableLlmCondensation =
+		useLocalCodeBackend && !envBoolean("HEADLESSCODE_ALLOW_LLM_CONDENSATION")
 
 	// Phase 3 context condensation: a cheaper model for the condensation
 	// call can be assigned via the `_condensation` key in
@@ -1341,6 +1357,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		condenseThresholdFraction,
 		condenseEarlyFireFraction,
 		condenseModel,
+		disableLlmCondensation,
 		llmTimeoutMs: options.llmTimeoutMs,
 		stream: options.stream,
 		reasoningEffort,
@@ -1439,7 +1456,7 @@ function envNumber(name: string): number | undefined {
 }
 
 /** Parse an env boolean opt-in: "1"/"true"/"yes"/"on" → true; anything else (incl. unset) → false. */
-function envBoolean(name: string): boolean {
+export function envBoolean(name: string): boolean {
 	const raw = process.env[name]
 	if (raw === undefined || raw === "") {
 		return false

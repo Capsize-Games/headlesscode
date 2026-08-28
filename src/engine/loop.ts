@@ -1199,6 +1199,13 @@ export interface HeadlessSessionConfig {
 	 * sends `max_tokens`; an explicit value here always wins).
 	 */
 	condenseMaxTokens?: number
+	/**
+	 * Skip the LLM-summarization condensation call entirely and rely on
+	 * `truncateHistory`'s plain drop-oldest eviction (which always runs
+	 * afterward regardless — see maybeCondenseHistory's call site). See the
+	 * field's twin in the resolved config below for the full rationale.
+	 */
+	disableLlmCondensation?: boolean
 	globalCustomInstructions?: string
 	/**
 	 * Phase 3 memory store (default null = memory OFF, zero behavior change).
@@ -1366,6 +1373,33 @@ export interface ResolvedSessionConfig {
 	condenseModel: string
 	/** Phase 3 context condensation: max output tokens for the condensation call. */
 	condenseMaxTokens?: number
+	/**
+	 * Verified live 2026-08-28 against Qwen3.5-9B+LoRA on the local backend:
+	 * asked to compress a 30998-token transcript chunk into ~4096 tokens (a
+	 * ~13:1 ratio), the condensation call turned a correctly-hedged earlier
+	 * note ("qemu-net-smoke is the EXISTING gate, for reference") into a flat
+	 * factual claim ("the qemu-net-smoke gate passed... ready to merge") for
+	 * an unrelated, already-merged feature that this session never touched —
+	 * the CONDENSE_SYSTEM_PROMPT's "never invent content" rule is only as
+	 * reliable as the summarizer model executing it, and a 9B model doing a
+	 * lossy 13:1 compression under time/token pressure is not reliably that
+	 * model. The corrupted summary then re-entered history as trusted fact
+	 * and the main loop built on it, repeating the false completion claim
+	 * deterministically until bounded failure killed the session. Unlike a
+	 * plain truncation gap (the model can always re-read/re-run to recover
+	 * lost information), a confidently WRONG summary is not self-correcting
+	 * — the model has no way to tell a condensed fact from a fabricated one.
+	 * Given local inference has no per-token cost pressure (the entire reason
+	 * cloud sessions accept summarization's risk to save a paid, latency-
+	 * bearing call), the tradeoff doesn't hold locally: default OFF for the
+	 * local backend (cli.ts's useLocalCodeBackend gate, same opt-in-override
+	 * pattern as requireExplicitCompletion/verifyBeforeCompletion above —
+	 * HEADLESSCODE_ALLOW_LLM_CONDENSATION opts back in). `truncateHistory`'s
+	 * message-count eviction (loop.ts's unconditional post-condensation call)
+	 * remains fully active either way — this only removes the LLM summary
+	 * step, not history management itself.
+	 */
+	disableLlmCondensation?: boolean
 	temperature?: number
 	maxTokens?: number
 	globalCustomInstructions?: string
@@ -1662,6 +1696,7 @@ export class HeadlessSession {
 			condenseEarlyFireFraction: config.condenseEarlyFireFraction ?? DEFAULT_CONDENSE_EARLY_FIRE_FRACTION,
 			condenseModel: config.condenseModel ?? config.model ?? process.env.OPENROUTER_MODEL ?? DEFAULT_MODEL,
 			condenseMaxTokens: config.condenseMaxTokens ?? DEFAULT_CONDENSE_MAX_TOKENS,
+			disableLlmCondensation: config.disableLlmCondensation ?? false,
 			logger: config.logger,
 			temperature: config.temperature,
 			maxTokens: config.maxTokens ?? DEFAULT_MAX_TOKENS,
@@ -2427,6 +2462,16 @@ export class HeadlessSession {
 			return messages
 		}
 		const config = this.config
+
+		// See HeadlessSessionConfig.disableLlmCondensation's doc comment: a
+		// weak summarizer can turn hedged context into a confidently WRONG
+		// "fact" that then gets trusted as real history. Skipping straight to
+		// `messages` unchanged is safe — truncateHistory (this method's
+		// caller, unconditionally, right after) still manages context size
+		// via plain drop-oldest eviction either way.
+		if (config.disableLlmCondensation) {
+			return messages
+		}
 
 		// Resolve the real context window at most once per session (explicit
 		// config, then a live OpenRouter lookup, then the conservative default
@@ -4248,10 +4293,44 @@ export class HeadlessSession {
 				const isRepeat = signature === lastCallSignature
 				lastCallSignature = signature
 
-				const isMistake =
-					isError || call.parseError !== undefined || resultContent.trim() === "" || isRepeat
+				// 2026-08-27: `execute_command`'s own spawn-ENOENT retry (see
+				// executor.ts's isBashSpawnEnoent/MAX_SPAWN_ATTEMPTS) already
+				// exhausted up to ~14s of escalating-backoff retries before this
+				// result ever reached the loop — verified live it can still fail
+				// after the FULL retry budget, so this is not a rare edge case
+				// the retry alone resolves. Whatever is causing it, it is
+				// unambiguously an infrastructure condition (the exact same
+				// benign command — `git log`, `pwd` — reproduces cleanly outside
+				// this process every time), not a model mistake, and the model
+				// has no way to avoid or fix it by behaving differently. Counting
+				// it against the mistake budget punishes the model for something
+				// entirely outside its control and was observed live burning
+				// through an otherwise-healthy review session's entire budget on
+				// pure infrastructure noise. Excluded from mistake accounting
+				// here (a genuine model mistake immediately afterward still
+				// counts normally) rather than silently retried again — the
+				// model still needs to see the failure and retry the command
+				// itself, just without it costing anything.
+				// Two message shapes reach here for the same underlying spawn
+				// failure, depending on which Node event fired last before the
+				// retry budget in executor.ts's spawnAttempt was exhausted: the
+				// `error`-event shape ("spawn error for '...': spawn /bin/bash
+				// ENOENT") and the negative-close-code shape ("command '...'
+				// exited with code -2.", where -2 is -ENOENT). Both are covered.
+				const isInfrastructureSpawnFailure =
+					isError &&
+					(/spawn error for '.*': spawn \S*bash ENOENT/.test(resultContent) ||
+						/exited with code -\d+\./.test(resultContent))
 
-				if (isMistake) {
+				const isMistake =
+					!isInfrastructureSpawnFailure &&
+					(isError || call.parseError !== undefined || resultContent.trim() === "" || isRepeat)
+
+				if (isInfrastructureSpawnFailure) {
+					this.logger.warn("[loop] infrastructure spawn failure — not counted as a mistake", {
+						tool: call.name,
+					})
+				} else if (isMistake) {
 					consecutiveMistakes++
 					this.logger.warn("[loop] mistake counted", {
 						consecutiveMistakes,
@@ -4630,6 +4709,7 @@ export class HeadlessSession {
 			condenseThresholdFraction: this.config.condenseThresholdFraction,
 			condenseModel: this.config.condenseModel,
 			condenseMaxTokens: this.config.condenseMaxTokens,
+			disableLlmCondensation: this.config.disableLlmCondensation,
 			temperature: this.config.temperature,
 			maxTokens: this.config.maxTokens,
 			globalCustomInstructions: this.config.globalCustomInstructions,
