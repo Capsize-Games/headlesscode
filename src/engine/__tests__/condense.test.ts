@@ -1008,6 +1008,70 @@ async function testSessionDisableLlmCondensationSkipsSummarizationCall(): Promis
 }
 
 /**
+ * `disableLlmCondensation` must itself perform TOKEN-aware eviction, not
+ * rely solely on truncateHistory's downstream message-COUNT window — a
+ * real session hit a hard context-overflow 400 (65,824 tokens against a
+ * 65,536-token real window) at only 45 messages, nowhere near a
+ * default-300 windowSize, because nothing token-aware was trimming the
+ * history once LLM summarization was skipped (see
+ * HeadlessSessionConfig.disableLlmCondensation's doc comment). Uses a
+ * generous windowSize specifically so truncateHistory's own eviction
+ * cannot be what shrinks the history — only the token-threshold-driven
+ * eviction inside maybeCondenseHistory can explain a smaller request here.
+ */
+async function testSessionDisableLlmCondensationStillEvictsByTokenBudget(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-condense-disabled-evict-"))
+	try {
+		const system: ChatMessage = { role: "system", content: "system prompt" }
+		const firstUser: ChatMessage = { role: "user", content: "the task" }
+		const rest: ChatMessage[] = []
+		const callCounts = [1, 3, 2, 1, 2, 3, 1, 1, 2, 3, 1, 2, 3, 2, 1]
+		for (const n of callCounts) {
+			const calls: ChatToolCall[] = Array.from({ length: n }, (_, i) => ({
+				id: `call_${rest.length}_${i}`,
+				type: "function",
+				function: { name: "read_file", arguments: "{}" },
+			}))
+			rest.push({ role: "assistant", content: null, tool_calls: calls })
+			for (const c of calls) {
+				rest.push({ role: "tool", content: "ok", tool_call_id: c.id, name: "read_file" })
+			}
+		}
+		const fullHistoryLength = 2 + rest.length
+		const client = new FakeLlmClient(
+			[() => toolCall("list_files", { path: "." }), () => toolCall("attempt_completion", { result: "done" })],
+			{ promptTokens: 120_000, completionTokens: 100 },
+		)
+		const session = await makeSession({
+			task: "task",
+			client,
+			workspaceRoot: ws,
+			contextWindowTokens: 128_000,
+			condenseThresholdFraction: 0.75,
+			// Deliberately generous — larger than the full history, so
+			// truncateHistory's own message-count eviction never engages;
+			// any shrinkage must come from disableLlmCondensation's own
+			// token-aware eviction instead.
+			windowSize: fullHistoryLength + 50,
+			disableLlmCondensation: true,
+		})
+		session.state.messages = [system, firstUser, ...rest]
+
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(client.condenseCalls, 0, "the LLM summarization call must never run when disabled")
+		const lastReq = client.requests[client.requests.length - 1]
+		assert.ok(
+			lastReq.messages.length < fullHistoryLength,
+			`expected token-aware eviction to shrink the request below the full ${fullHistoryLength}-message ` +
+				`history even with a generous windowSize (got ${lastReq.messages.length})`,
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+/**
  * Prompt-cache stability across the condensation boundary: after the
  * condensation, the sent prefix (summary + tail) must stay IDENTICAL across
  * subsequent requests — not reshuffled every call.
@@ -1210,6 +1274,10 @@ const tests: Array<[string, () => Promise<void> | void]> = [
 	[
 		"session: disableLlmCondensation skips the summarization call but truncateHistory still bounds it",
 		testSessionDisableLlmCondensationSkipsSummarizationCall,
+	],
+	[
+		"session: disableLlmCondensation still evicts by token budget, not just windowSize",
+		testSessionDisableLlmCondensationStillEvictsByTokenBudget,
 	],
 	["session: post-condensation prefix stays stable across calls", testSessionPostCondensePrefixStable],
 	["session: condensation usage can trip the budget like a main call", testCondensationUsageTripsBudget],

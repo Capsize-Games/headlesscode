@@ -2463,20 +2463,52 @@ export class HeadlessSession {
 		}
 		const config = this.config
 
-		// See HeadlessSessionConfig.disableLlmCondensation's doc comment: a
-		// weak summarizer can turn hedged context into a confidently WRONG
-		// "fact" that then gets trusted as real history. Skipping straight to
-		// `messages` unchanged is safe — truncateHistory (this method's
-		// caller, unconditionally, right after) still manages context size
-		// via plain drop-oldest eviction either way.
-		if (config.disableLlmCondensation) {
-			return messages
-		}
-
 		// Resolve the real context window at most once per session (explicit
 		// config, then a live OpenRouter lookup, then the conservative default
 		// — see resolveContextWindowTokens).
 		const contextWindowTokens = await this.resolveContextWindowTokens()
+
+		// See HeadlessSessionConfig.disableLlmCondensation's doc comment: a
+		// weak summarizer can turn hedged context into a confidently WRONG
+		// "fact" that then gets trusted as real history, so the LLM
+		// summarization call itself is skipped. That is NOT the same as
+		// doing nothing, though — truncateHistory (this method's caller,
+		// unconditionally, right after) only bounds message COUNT
+		// (config.windowSize, default 300), never tokens, and a local
+		// model's real context window is far smaller than 300 messages'
+		// worth of file reads/edits can stay under. Verified live
+		// 2026-08-28: with condensation fully skipped and no token-aware
+		// eviction in its place, a real session hit a hard "request exceeds
+		// context size" 400 from llama-server at only 45 messages (65,824
+		// tokens against a 65,536-token window) — nowhere near windowSize,
+		// so truncateHistory never engaged either. Reuse the exact same
+		// token-threshold trigger and tool-call-group-safe message count
+		// the LLM path computes (computeCondensePlan), but DROP the
+		// selected oldest messages outright instead of summarizing them —
+		// plain eviction has no fabrication risk (the gap is honest: the
+		// model can re-read/re-run to recover it, exactly like
+		// truncateHistory's own drop-oldest eviction already relies on
+		// elsewhere), unlike a confidently wrong LLM summary.
+		if (config.disableLlmCondensation) {
+			const { count } = computeCondensePlan(
+				messages,
+				this.lastLlmUsage.inputTokens,
+				contextWindowTokens,
+				config.condenseThresholdFraction,
+			)
+			if (count >= 2) {
+				const messagesBefore = messages.length
+				messages.splice(2, count)
+				this.executor.notifyCondensed()
+				this.logger.info("[condense] disableLlmCondensation: evicted oldest turns (no summary)", {
+					iteration,
+					evictedCount: count,
+					messagesBefore,
+					messagesAfter: messages.length,
+				})
+			}
+			return messages
+		}
 
 		// Async early-fire (plans/smart-condensation-async.md part 2): when
 		// the last request's real size is inside the EARLY window (above the
