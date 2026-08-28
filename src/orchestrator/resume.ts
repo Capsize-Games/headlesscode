@@ -40,6 +40,7 @@ import {
 } from "./cli.js"
 import { recordAllSessionCosts, recordGroupCost } from "./cost-history.js"
 import { resolveModelForMode } from "../config/mode-models.js"
+import { eventsFilePath } from "../engine/events.js"
 import { runQaWithRetries } from "../qa/qa.js"
 import { HARNESS_ROOT, parseReviewResult, runReviewWithRetries, type ReviewResult } from "./reviewer.js"
 import { loadStateSync, patchGroup, type OrchestratorGroup, type OrchestratorState } from "./state.js"
@@ -808,7 +809,7 @@ const HARNESS_ARTIFACT_RE =
  * — those exist in every worktree regardless of whether real work
  * happened and must never count as "changed something".
  */
-function hasRealWorktreeChanges(wtPath: string): boolean {
+export function hasRealWorktreeChanges(wtPath: string): boolean {
 	let upstream = "origin/master"
 	try {
 		const tracked = execFileSync(
@@ -848,6 +849,59 @@ function hasRealWorktreeChanges(wtPath: string): boolean {
 	} catch {
 		// Can't determine either way — err toward NOT trusting an
 		// unverifiable "clean" (return false, same as "no changes found").
+	}
+	return false
+}
+
+/**
+ * Tier 2 of the same 2026-08-28 incident's fix (see hasRealWorktreeChanges):
+ * even once real work exists to review, a "clean"/"pass" verdict is only as
+ * trustworthy as the verification the session actually did. Cross-checks
+ * the review/QA session's OWN event-log transcript (never re-derived from
+ * its summary prose, which is exactly what was fabricated) for at least one
+ * REAL, non-error `execute_command` result — the one tool that actually
+ * proves something was run and checked, as opposed to read_file/list_files
+ * (which only prove something was looked at). A session that declares
+ * "clean"/"pass" without ever running a single successful command has
+ * nothing behind that verdict but its own prose, the exact gap that let
+ * the fabricated 2026-08-28 review through even with a structured,
+ * required-format verdict line.
+ *
+ * Deliberately narrow like hasRealWorktreeChanges: this checks that SOME
+ * real verification activity happened at all, not that specific claimed
+ * numbers (e.g. "8691 insertions") match specific tool outputs — matching
+ * every claim in free-form prose against the transcript has no realistic
+ * false-positive ceiling (the exact trap parseReviewResult/parseQaResult's
+ * own docs already warn against for heuristic text matching). Absent or
+ * unreadable event log → false (same fail-closed posture as an empty
+ * diff): a verdict this codebase cannot verify at all is never trusted.
+ */
+export function hasRealVerificationActivity(workspaceRoot: string, reportPath: string | undefined): boolean {
+	if (!reportPath) {
+		return false
+	}
+	const sessionId = path.basename(reportPath, ".md")
+	const eventsPath = eventsFilePath(workspaceRoot, sessionId)
+	let raw: string
+	try {
+		raw = fs.readFileSync(eventsPath, "utf-8")
+	} catch {
+		return false
+	}
+	for (const line of raw.split("\n")) {
+		const trimmed = line.trim()
+		if (!trimmed) {
+			continue
+		}
+		let record: { type?: unknown; tool?: unknown; isError?: unknown }
+		try {
+			record = JSON.parse(trimmed)
+		} catch {
+			continue
+		}
+		if (record.type === "tool_result" && record.tool === "execute_command" && record.isError === false) {
+			return true
+		}
 	}
 	return false
 }
@@ -936,15 +990,35 @@ export async function runReviewStep(opts: ReviewStepOptions): Promise<ReviewStep
 		write(`NEEDS-HUMAN: ${group.name}'s review session failed repeatedly — ${result.summary}\n`)
 		return { group: updated, result, skipped: false, message: "review session error → needs-human" }
 	}
+	// See hasRealVerificationActivity's doc comment (Tier 2 of the
+	// 2026-08-28 incident fix): a "clean" claim backed by zero real,
+	// successful execute_command results in the session's OWN transcript
+	// is downgraded to a finding rather than trusted — the exact gap that
+	// let a fabricated review through even with the required structured
+	// verdict line.
+	let effectiveResult = result
+	if (result.verdict === "clean" && !hasRealVerificationActivity(wtPath, result.reportPath)) {
+		write(
+			`  note: verdict was "clean" but the session's own transcript shows no real, successful execute_command result — downgrading to a finding rather than trust an unverified claim\n`,
+		)
+		effectiveResult = {
+			...result,
+			verdict: "finding",
+			findings: [
+				...result.findings,
+				"Review declared \"clean\" but its own transcript shows no real, successful execute_command result — nothing to substantiate the verdict was actually run. Treated as a finding rather than trusted.",
+			],
+		}
+	}
 	const stateAfter = await patchGroup(statePath, group.name, {
-		review_verdict: result.verdict,
-		pending_review_findings: result.findings,
+		review_verdict: effectiveResult.verdict,
+		pending_review_findings: effectiveResult.findings,
 		reviewed_at: new Date().toISOString(),
-		last_activity: { note: `reviewed: verdict=${result.verdict} (${result.findings.length} finding(s))` },
+		last_activity: { note: `reviewed: verdict=${effectiveResult.verdict} (${effectiveResult.findings.length} finding(s))` },
 	})
 	const updated = stateAfter.groups.find((g) => g.name === group.name) ?? group
-	write(`review verdict: ${result.verdict} (${result.findings.length} finding(s))\n`)
-	return { group: updated, result, skipped: false, message: `reviewed: ${result.verdict}` }
+	write(`review verdict: ${effectiveResult.verdict} (${effectiveResult.findings.length} finding(s))\n`)
+	return { group: updated, result: effectiveResult, skipped: false, message: `reviewed: ${effectiveResult.verdict}` }
 }
 
 export type ReworkOutcome = "spawned" | "cap" | "not-applicable" | "already-running" | "dry-run"
@@ -1136,19 +1210,35 @@ export async function runQaStep(opts: QaStepOptions): Promise<QaStepResult> {
 		write(`NEEDS-HUMAN: ${group.name}'s QA session failed repeatedly — ${qaResult.summary}\n`)
 		return { group: updated, skipped: false, message: "QA session error → needs-human" }
 	}
-	const qaStatus = qaResult.verdict === "pass" ? "done" : "failed"
+	// See hasRealVerificationActivity's doc comment (Tier 2 of the
+	// 2026-08-28 incident fix): same downgrade as runReviewStep — a "pass"
+	// claim backed by zero real, successful execute_command results in the
+	// session's own transcript is not trusted.
+	let effectiveVerdict = qaResult.verdict
+	let effectiveEvidence = qaResult.evidence
+	if (qaResult.verdict === "pass" && !hasRealVerificationActivity(wtPath, qaResult.reportPath)) {
+		write(
+			`  note: verdict was "pass" but the session's own transcript shows no real, successful execute_command result — downgrading to fail rather than trust an unverified claim\n`,
+		)
+		effectiveVerdict = "fail"
+		effectiveEvidence =
+			`QA declared "pass" but its own transcript shows no real, successful execute_command result — ` +
+			`nothing to substantiate the verdict was actually run. Treated as fail rather than trusted.\n\n` +
+			`Original evidence: ${qaResult.evidence}`
+	}
+	const qaStatus = effectiveVerdict === "pass" ? "done" : "failed"
 	const stateAfter = await patchGroup(statePath, group.name, {
 		qa: {
 			status: qaStatus,
-			verdict: qaResult.verdict,
-			evidence: qaResult.evidence.slice(0, 4000),
+			verdict: effectiveVerdict,
+			evidence: effectiveEvidence.slice(0, 4000),
 			updated: new Date().toISOString(),
 		},
-		last_activity: { note: `QA: verdict=${qaResult.verdict}` },
+		last_activity: { note: `QA: verdict=${effectiveVerdict}` },
 	})
 	const updated = stateAfter.groups.find((g) => g.name === group.name) ?? group
-	write(`QA verdict: ${qaResult.verdict} (status ${qaStatus})\n`)
-	return { group: updated, skipped: false, message: `QA: ${qaResult.verdict}` }
+	write(`QA verdict: ${effectiveVerdict} (status ${qaStatus})\n`)
+	return { group: updated, skipped: false, message: `QA: ${effectiveVerdict}` }
 }
 
 export interface RecordCostOptions {

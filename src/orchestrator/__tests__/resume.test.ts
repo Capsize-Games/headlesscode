@@ -26,6 +26,7 @@ import {
 	resumeMain,
 	reviewMain,
 	reworkMain,
+	hasRealVerificationActivity,
 	runQaStep,
 	runReviewStep,
 	runReworkStep,
@@ -573,6 +574,90 @@ async function testAutomaticFailGateIgnoresHarnessArtifacts(): Promise<void> {
 	}
 }
 
+// ─── hasRealVerificationActivity: Tier 2 of the same incident's fix ─────────
+//
+// A "clean"/"pass" verdict is only as trustworthy as the verification the
+// session actually did. Cross-checks the session's OWN event-log transcript
+// (never re-derived from its summary prose, which is exactly what was
+// fabricated live) for at least one real, non-error execute_command result.
+
+async function writeSessionEventsFixture(workspaceRoot: string, sessionId: string, lines: unknown[]): Promise<string> {
+	const reportsDir = path.join(workspaceRoot, ".headlesscode", "reports")
+	const eventsDir = path.join(workspaceRoot, ".headlesscode", "events")
+	await fs.mkdir(reportsDir, { recursive: true })
+	await fs.mkdir(eventsDir, { recursive: true })
+	const reportPath = path.join(reportsDir, `${sessionId}.md`)
+	await fs.writeFile(reportPath, "report body", "utf-8")
+	await fs.writeFile(path.join(eventsDir, `${sessionId}.jsonl`), lines.map((l) => JSON.stringify(l)).join("\n"), "utf-8")
+	return reportPath
+}
+
+async function testHasRealVerificationActivityFalseWithoutReportPath(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		assert.equal(hasRealVerificationActivity(repo, undefined), false)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testHasRealVerificationActivityFalseWhenEventsFileMissing(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const reportPath = path.join(repo, ".headlesscode", "reports", "no-such-session.md")
+		assert.equal(hasRealVerificationActivity(repo, reportPath), false)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testHasRealVerificationActivityFalseWithOnlyReadsNoExecuteCommand(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const reportPath = await writeSessionEventsFixture(repo, "s1", [
+			{ ts: "t", sessionId: "s1", type: "session_start" },
+			{ ts: "t", sessionId: "s1", type: "tool_result", iteration: 1, tool: "read_file", isError: false },
+			{ ts: "t", sessionId: "s1", type: "tool_result", iteration: 2, tool: "list_files", isError: false },
+		])
+		assert.equal(
+			hasRealVerificationActivity(repo, reportPath),
+			false,
+			"reading/listing files alone proves nothing was actually verified",
+		)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testHasRealVerificationActivityFalseWhenAllExecuteCommandsFailed(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const reportPath = await writeSessionEventsFixture(repo, "s2", [
+			{ ts: "t", sessionId: "s2", type: "tool_result", iteration: 1, tool: "execute_command", isError: true },
+			{ ts: "t", sessionId: "s2", type: "tool_result", iteration: 2, tool: "execute_command", isError: true },
+		])
+		assert.equal(hasRealVerificationActivity(repo, reportPath), false)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testHasRealVerificationActivityTrueWithOneRealSuccessfulCommand(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		// Reproduces the 2026-08-28 incident's own transcript shape: mostly
+		// spawn-failure noise, but ONE real successful execute_command.
+		const reportPath = await writeSessionEventsFixture(repo, "s3", [
+			{ ts: "t", sessionId: "s3", type: "tool_result", iteration: 1, tool: "execute_command", isError: true },
+			{ ts: "t", sessionId: "s3", type: "tool_result", iteration: 2, tool: "read_file", isError: false },
+			{ ts: "t", sessionId: "s3", type: "tool_result", iteration: 3, tool: "execute_command", isError: false },
+		])
+		assert.equal(hasRealVerificationActivity(repo, reportPath), true)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 // ─── reviewMain (dry-run: no LLM, no state mutation) ─────────────────────────
 
 async function testReviewMainDryRunOnDoneGroup(): Promise<void> {
@@ -1099,6 +1184,11 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["runReviewStep: a real committed change reaches the normal dry-run path", testRunReviewStepProceedsWithRealCommittedChange],
 	["runQaStep: automatic fail on an empty worktree (issue #26 incident)", testRunQaStepAutomaticFailOnEmptyWorktree],
 	["automatic-fail gate ignores harness bookkeeping artifacts", testAutomaticFailGateIgnoresHarnessArtifacts],
+	["hasRealVerificationActivity: false without a reportPath", testHasRealVerificationActivityFalseWithoutReportPath],
+	["hasRealVerificationActivity: false when the events file is missing", testHasRealVerificationActivityFalseWhenEventsFileMissing],
+	["hasRealVerificationActivity: false with only reads, no execute_command", testHasRealVerificationActivityFalseWithOnlyReadsNoExecuteCommand],
+	["hasRealVerificationActivity: false when every execute_command failed", testHasRealVerificationActivityFalseWhenAllExecuteCommandsFailed],
+	["hasRealVerificationActivity: true with one real successful command (issue #26 incident shape)", testHasRealVerificationActivityTrueWithOneRealSuccessfulCommand],
 	["reviewMain --dry-run on a done group exits 0, changes nothing", testReviewMainDryRunOnDoneGroup],
 	["reviewMain rebuilds a stale running group before reviewing (dry-run)", testReviewMainRebuildsStaleRunningGroup],
 	["reviewMain without a target is a usage error", testReviewMainRequiresTarget],
