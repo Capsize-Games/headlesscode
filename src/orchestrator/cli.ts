@@ -39,6 +39,7 @@ import {
 	type OrchestratorState,
 } from "./state.js"
 import { runReviewWithRetries, type ReviewResult } from "./reviewer.js"
+import { hasRealVerificationActivity, hasRealWorktreeChanges } from "./verification-gate.js"
 import { runFilingStage, runResearchStage } from "./pipeline.js"
 import { analyzeWorktreeSessions } from "./log-analysis.js"
 import { runQaWithRetries, type QaResult } from "../qa/qa.js"
@@ -3119,20 +3120,62 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 			}
 			process.stdout.write(`[orchestrate] reviewing ${group.name} (branch ${group.branch ?? "?"})...\n`)
 			try {
-				const result = await runReviewWithRetries({
-					workspaceRoot: groupWorktreePath(repo, group),
+				const reviewWtPath = groupWorktreePath(repo, group)
+				// See hasRealWorktreeChanges's doc comment (Tier 1 of the
+				// 2026-08-28 fabricated-review incident fix): a "clean" verdict
+				// is structurally impossible with zero real changes, checked
+				// directly against git — never asked of (or trusted from) the
+				// review LLM itself. Skips the review session entirely rather
+				// than spend a call that has nothing real to verify.
+				if (!hasRealWorktreeChanges(reviewWtPath)) {
+					await patchGroup(statePath, group.name, {
+						review_verdict: "finding",
+						pending_review_findings: [
+							"No real changes found in the worktree (empty diff vs the tracked upstream, no uncommitted changes outside harness bookkeeping files) — there is nothing for a review to verify. Automatic fail: a \"clean\" verdict is structurally impossible with zero changes.",
+						],
+						reviewed_at: new Date().toISOString(),
+						last_activity: { note: "review skipped: worktree has no real changes (automatic fail)" },
+					})
+					process.stdout.write(
+						`[orchestrate] AUTOMATIC FAIL: ${group.name}'s worktree has no real changes — skipping the review session (a "clean" verdict is structurally impossible with an empty diff)\n`,
+					)
+					return true
+				}
+				const rawResult = await runReviewWithRetries({
+					workspaceRoot: reviewWtPath,
 					mode: options.reviewMode,
 					model: reviewerModel,
+					issues: group.issues,
 				})
 				// A review-SESSION failure must not feed into the rework-a-worker
 				// path below — see handleReviewSessionError's doc comment.
-				if (result.verdict === "error") {
-					await patchGroup(statePath, group.name, handleReviewSessionError(result))
+				if (rawResult.verdict === "error") {
+					await patchGroup(statePath, group.name, handleReviewSessionError(rawResult))
 					process.stderr.write(
 						`[orchestrate] NEEDS-HUMAN: ${group.name}'s review session failed repeatedly — ` +
-							`${result.summary}\n`,
+							`${rawResult.summary}\n`,
 					)
 					return true
+				}
+				// See hasRealVerificationActivity's doc comment (Tier 2 of the
+				// 2026-08-28 incident fix): a "clean" claim backed by zero real,
+				// successful execute_command results in the session's OWN
+				// transcript is downgraded to a finding rather than trusted —
+				// the exact gap that let a fabricated review through even with
+				// the required structured verdict line.
+				let result = rawResult
+				if (rawResult.verdict === "clean" && !hasRealVerificationActivity(reviewWtPath, rawResult.reportPath)) {
+					process.stdout.write(
+						`[orchestrate]   note: ${group.name}'s review verdict was "clean" but the session's own transcript shows no real, successful execute_command result — downgrading to a finding rather than trust an unverified claim\n`,
+					)
+					result = {
+						...rawResult,
+						verdict: "finding",
+						findings: [
+							...rawResult.findings,
+							"Review declared \"clean\" but its own transcript shows no real, successful execute_command result — nothing to substantiate the verdict was actually run. Treated as a finding rather than trusted.",
+						],
+					}
 				}
 				const patch = {
 					review_verdict: result.verdict,
@@ -3242,8 +3285,29 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 			}
 			process.stdout.write(`[orchestrate] QA ${group.name} (branch ${group.branch ?? "?"})...\n`)
 			try {
-				const qaResult = await runQaWithRetries({
-					workspaceRoot: groupWorktreePath(repo, group),
+				const qaWtPath = groupWorktreePath(repo, group)
+				// See hasRealWorktreeChanges's doc comment: same automatic-fail
+				// gate as the review step above, checked directly against git
+				// before the QA LLM session ever runs — a "pass" verdict is
+				// structurally impossible with zero real changes.
+				if (!hasRealWorktreeChanges(qaWtPath)) {
+					await patchGroup(statePath, group.name, {
+						qa: {
+							status: "failed",
+							verdict: "fail",
+							evidence:
+								"No real changes found in the worktree (empty diff vs the tracked upstream, no uncommitted changes outside harness bookkeeping files) — there is nothing for QA to verify. Automatic fail: a \"pass\" verdict is structurally impossible with zero changes.",
+							updated: new Date().toISOString(),
+						},
+						last_activity: { note: "QA skipped: worktree has no real changes (automatic fail)" },
+					})
+					process.stdout.write(
+						`[orchestrate] AUTOMATIC FAIL: ${group.name}'s worktree has no real changes — skipping the QA session (a "pass" verdict is structurally impossible with an empty diff)\n`,
+					)
+					return true
+				}
+				const rawQaResult = await runQaWithRetries({
+					workspaceRoot: qaWtPath,
 					mode: options.qaMode,
 					model: qaModel,
 				})
@@ -3255,13 +3319,33 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 				// the round (cost recorded, nothing left to retry) while QA never
 				// actually validated anything. Caught live 2026-08-05 on issue
 				// #18's own round: the QA-side twin of #33's review bug.
-				if (qaResult.verdict === "error") {
-					await patchGroup(statePath, group.name, handleQaSessionError(qaResult))
+				if (rawQaResult.verdict === "error") {
+					await patchGroup(statePath, group.name, handleQaSessionError(rawQaResult))
 					process.stderr.write(
 						`[orchestrate] NEEDS-HUMAN: ${group.name}'s QA session failed repeatedly — ` +
-							`${qaResult.summary}\n`,
+							`${rawQaResult.summary}\n`,
 					)
 					return
+				}
+				// See hasRealVerificationActivity's doc comment (Tier 2 of the
+				// 2026-08-28 incident fix): same downgrade as the review step
+				// above — a "pass" claim backed by zero real, successful
+				// execute_command results in the session's OWN transcript is
+				// downgraded to fail (and routed through the same rework loop
+				// as a real QA fail below) rather than trusted.
+				let qaResult = rawQaResult
+				if (rawQaResult.verdict === "pass" && !hasRealVerificationActivity(qaWtPath, rawQaResult.reportPath)) {
+					process.stdout.write(
+						`[orchestrate]   note: ${group.name}'s QA verdict was "pass" but the session's own transcript shows no real, successful execute_command result — downgrading to fail rather than trust an unverified claim\n`,
+					)
+					qaResult = {
+						...rawQaResult,
+						verdict: "fail",
+						evidence:
+							`QA declared "pass" but its own transcript shows no real, successful execute_command result — ` +
+							`nothing to substantiate the verdict was actually run. Treated as fail rather than trusted.\n\n` +
+							`Original evidence: ${rawQaResult.evidence}`,
+					}
 				}
 				// A real QA FAIL verdict is NEW WORK, not a settled "done"
 				// (issue #52, caught live 2026-08-05): the group passed review
