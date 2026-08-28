@@ -26,6 +26,8 @@ import {
 	resumeMain,
 	reviewMain,
 	reworkMain,
+	runQaStep,
+	runReviewStep,
 	runReworkStep,
 	resolveTargetGroups,
 	type ResumeTarget,
@@ -403,6 +405,169 @@ async function testRecheckoutWorktreeFailsWithoutBranch(): Promise<void> {
 		const result = recheckoutWorktree(repo, group)
 		assert.equal(result.ok, false, "no recorded branch → cannot re-checkout")
 		assert.ok(result.error?.includes("no recorded branch"))
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+// ─── runReviewStep / runQaStep: automatic-fail gate on an empty worktree ────
+//
+// 2026-08-28 production incident (joeos issue #26): a review session
+// fabricated an ENTIRE false completion — invented commit counts, invented
+// diff stats, invented passing test output, even a fabricated GitHub PR
+// link — and declared VERDICT: CLEAN via the structured, supposedly-
+// authoritative verdict line, for a worktree that in reality had ZERO
+// commits and ZERO changes. These verify the fix runs BEFORE any LLM call:
+// with no real changes in the worktree, runReviewStep/runQaStep must record
+// an automatic fail deterministically, never spawning a review/QA session
+// (no llmClient needed in these tests at all — that's the point: the gate
+// short-circuits before the code path that would ever need one).
+
+/** A worktree checked out on its own branch with no divergence from base. */
+function makeEmptyWorktree(repo: string, branch: string): string {
+	execFileSync("git", ["-C", repo, "checkout", "-qb", branch], { stdio: "ignore" })
+	execFileSync("git", ["-C", repo, "checkout", "-q", "main"], { stdio: "ignore" })
+	const wtPath = path.join(repo, ".worktrees", "w1")
+	execFileSync("git", ["-C", repo, "worktree", "add", "-q", wtPath, branch], { stdio: "ignore" })
+	return wtPath
+}
+
+async function testRunReviewStepAutomaticFailOnEmptyWorktree(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		initGitRepo(repo)
+		configureGit(repo)
+		await fs.writeFile(path.join(repo, "base.txt"), "base\n", "utf-8")
+		commitFile(repo, "base.txt", "base\n", "base")
+		const branch = "issues/w1-2026-08-28"
+		makeEmptyWorktree(repo, branch)
+
+		const group = baseGroup({ branch, status: "done" })
+		const statePath = writeState(repo, [group])
+		const written: string[] = []
+		const result = await runReviewStep({
+			repo,
+			statePath,
+			group,
+			reviewMode: "deepseek-reviewer",
+			forceReview: false,
+			dryRun: false,
+			write: (t) => written.push(t),
+		})
+
+		assert.equal(result.skipped, false)
+		assert.equal(result.message, "no real changes → automatic fail (review session never ran)")
+		assert.equal(result.group.review_verdict, "finding")
+		assert.ok(result.group.pending_review_findings?.[0]?.includes("structurally impossible"))
+		assert.ok(written.some((line) => line.startsWith("AUTOMATIC FAIL:")))
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testRunReviewStepProceedsWithRealCommittedChange(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		initGitRepo(repo)
+		configureGit(repo)
+		await fs.writeFile(path.join(repo, "base.txt"), "base\n", "utf-8")
+		commitFile(repo, "base.txt", "base\n", "base")
+		const branch = "issues/w1-2026-08-28"
+		execFileSync("git", ["-C", repo, "checkout", "-qb", branch], { stdio: "ignore" })
+		await fs.writeFile(path.join(repo, "fix.txt"), "fix\n", "utf-8")
+		commitFile(repo, "fix.txt", "fix\n", "fix")
+		execFileSync("git", ["-C", repo, "checkout", "-q", "main"], { stdio: "ignore" })
+		const wtPath = path.join(repo, ".worktrees", "w1")
+		execFileSync("git", ["-C", repo, "worktree", "add", "-q", wtPath, branch], { stdio: "ignore" })
+
+		const group = baseGroup({ branch, status: "done" })
+		const statePath = writeState(repo, [group])
+		// dry-run: proves the gate did NOT trip (a real committed change is
+		// present) without actually needing a real/fake LLM client — the
+		// dry-run branch returns before ever calling runReviewWithRetries.
+		const result = await runReviewStep({
+			repo,
+			statePath,
+			group,
+			reviewMode: "deepseek-reviewer",
+			forceReview: false,
+			dryRun: true,
+			write: () => {},
+		})
+		assert.equal(result.message, "dry-run: review not run", "a real change must reach the normal dry-run path, not the automatic-fail gate")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testRunQaStepAutomaticFailOnEmptyWorktree(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		initGitRepo(repo)
+		configureGit(repo)
+		await fs.writeFile(path.join(repo, "base.txt"), "base\n", "utf-8")
+		commitFile(repo, "base.txt", "base\n", "base")
+		const branch = "issues/w1-2026-08-28"
+		makeEmptyWorktree(repo, branch)
+
+		const group = baseGroup({ branch, status: "done" })
+		const statePath = writeState(repo, [group])
+		const written: string[] = []
+		const result = await runQaStep({
+			repo,
+			statePath,
+			group,
+			qaMode: "qa-agent",
+			dryRun: false,
+			write: (t) => written.push(t),
+		})
+
+		assert.equal(result.skipped, false)
+		assert.equal(result.message, "no real changes → automatic fail (QA session never ran)")
+		assert.equal(result.group.qa?.verdict, "fail")
+		assert.equal(result.group.qa?.status, "failed")
+		assert.ok(result.group.qa?.evidence.includes("structurally impossible"))
+		assert.ok(written.some((line) => line.startsWith("AUTOMATIC FAIL:")))
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+/** Harness bookkeeping files alone must not count as "real changes". */
+async function testAutomaticFailGateIgnoresHarnessArtifacts(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		initGitRepo(repo)
+		configureGit(repo)
+		await fs.writeFile(path.join(repo, "base.txt"), "base\n", "utf-8")
+		commitFile(repo, "base.txt", "base\n", "base")
+		const branch = "issues/w1-2026-08-28"
+		const wtPath = makeEmptyWorktree(repo, branch)
+		// Exactly the artifacts a real worker/review/QA session leaves behind
+		// (see harness.log/qa.log/review.log/.env/ORCHESTRATOR_TASK.md/
+		// .headlesscode/ observed live in every round tonight) — none of
+		// these are real work and must not defeat the gate.
+		await fs.writeFile(path.join(wtPath, "harness.log"), "log\n", "utf-8")
+		await fs.writeFile(path.join(wtPath, ".env"), "X=1\n", "utf-8")
+		await fs.mkdir(path.join(wtPath, ".headlesscode"), { recursive: true })
+		await fs.writeFile(path.join(wtPath, ".headlesscode", "state.json"), "{}", "utf-8")
+
+		const group = baseGroup({ branch, status: "done" })
+		const statePath = writeState(repo, [group])
+		const result = await runReviewStep({
+			repo,
+			statePath,
+			group,
+			reviewMode: "deepseek-reviewer",
+			forceReview: false,
+			dryRun: false,
+			write: () => {},
+		})
+		assert.equal(
+			result.message,
+			"no real changes → automatic fail (review session never ran)",
+			"harness bookkeeping files alone must still trip the automatic-fail gate",
+		)
 	} finally {
 		await fs.rm(repo, { recursive: true, force: true })
 	}
@@ -930,6 +1095,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["rebuild from markers: genuinely running → no patch", testRebuildNoChangeWhenGenuinelyRunning],
 	["recheckoutWorktree recreates a removed worktree on its branch", testRecheckoutWorktreeRecreatesRemovedWorktree],
 	["recheckoutWorktree fails without a recorded branch", testRecheckoutWorktreeFailsWithoutBranch],
+	["runReviewStep: automatic fail on an empty worktree (issue #26 incident)", testRunReviewStepAutomaticFailOnEmptyWorktree],
+	["runReviewStep: a real committed change reaches the normal dry-run path", testRunReviewStepProceedsWithRealCommittedChange],
+	["runQaStep: automatic fail on an empty worktree (issue #26 incident)", testRunQaStepAutomaticFailOnEmptyWorktree],
+	["automatic-fail gate ignores harness bookkeeping artifacts", testAutomaticFailGateIgnoresHarnessArtifacts],
 	["reviewMain --dry-run on a done group exits 0, changes nothing", testReviewMainDryRunOnDoneGroup],
 	["reviewMain rebuilds a stale running group before reviewing (dry-run)", testReviewMainRebuildsStaleRunningGroup],
 	["reviewMain without a target is a usage error", testReviewMainRequiresTarget],

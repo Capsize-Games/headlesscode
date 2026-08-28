@@ -776,6 +776,82 @@ function reloadedGroup(statePath: string, name: string, fallback: OrchestratorGr
 	}
 }
 
+// Bookkeeping artifacts the harness itself writes into a worktree — never
+// real work, must not count as "the group changed something".
+const HARNESS_ARTIFACT_RE =
+	/^(\.harness\.|harness\.log$|qa\.log$|review\.log$|\.env$|ORCHESTRATOR_TASK\.md$|\.headlesscode\/)/
+
+/**
+ * Deterministic, un-hallucinate-able gate: does this worktree actually
+ * contain any real change at all? Run directly by the orchestrator's own
+ * git commands — never asked of an LLM — before either runReviewStep or
+ * runQaStep ever trusts a "clean"/"pass" verdict.
+ *
+ * Verified live 2026-08-28 (joeos issue #26): a review session fabricated
+ * an ENTIRE false completion — invented commit counts, invented diff
+ * stats ("8691 insertions... across 47 files"), invented passing test
+ * output, even a fabricated GitHub PR link — and declared VERDICT: CLEAN
+ * via the structured, supposedly-authoritative verdict line, for a
+ * worktree that in reality had ZERO commits and ZERO changes. No amount
+ * of parser hardening closes this: the fabrication was coherent,
+ * well-formatted prose: the model's own summary is not a source of
+ * truth about what really happened. This checks the actual filesystem/
+ * git state instead, which the model cannot talk its way around.
+ *
+ * Checks BOTH: (1) committed changes vs the tracked upstream (mirrors
+ * exactly what worker/review/QA sessions are themselves told to check
+ * via `git diff origin/master...HEAD`), and (2) uncommitted working-tree
+ * changes — a worker's write_to_file calls land in the real working tree
+ * with nothing forcing it to also commit them, so a committed-only check
+ * could false-negative on real, uncommitted work. Ignores the harness's
+ * own bookkeeping files (harness.log, .env, etc.) via HARNESS_ARTIFACT_RE
+ * — those exist in every worktree regardless of whether real work
+ * happened and must never count as "changed something".
+ */
+function hasRealWorktreeChanges(wtPath: string): boolean {
+	let upstream = "origin/master"
+	try {
+		const tracked = execFileSync(
+			"git",
+			["-C", wtPath, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+			{ encoding: "utf-8", timeout: 5000 },
+		).trim()
+		if (tracked) {
+			upstream = tracked
+		}
+	} catch {
+		// No tracked upstream configured — fall back to origin/master.
+	}
+	try {
+		const diffStat = execFileSync("git", ["-C", wtPath, "diff", `${upstream}...HEAD`, "--stat"], {
+			encoding: "utf-8",
+			timeout: 10_000,
+		}).trim()
+		if (diffStat.length > 0) {
+			return true
+		}
+	} catch {
+		// A failed diff isn't proof of "no changes" — fall through to the
+		// working-tree check below rather than assume real work happened.
+	}
+	try {
+		const status = execFileSync("git", ["-C", wtPath, "status", "--porcelain"], {
+			encoding: "utf-8",
+			timeout: 10_000,
+		})
+		for (const line of status.split("\n")) {
+			const filePath = line.slice(3).trim()
+			if (filePath && !HARNESS_ARTIFACT_RE.test(filePath)) {
+				return true
+			}
+		}
+	} catch {
+		// Can't determine either way — err toward NOT trusting an
+		// unverifiable "clean" (return false, same as "no changes found").
+	}
+	return false
+}
+
 export interface ReviewStepOptions {
 	repo: string
 	statePath: string
@@ -828,7 +904,32 @@ export async function runReviewStep(opts: ReviewStepOptions): Promise<ReviewStep
 		write(`  dry-run: would run a headless review session (mode ${reviewMode}, model ${reviewerModel ?? "(default)"}) against ${wtPath}\n`)
 		return { group, skipped: false, message: "dry-run: review not run" }
 	}
-	const result = await runReviewWithRetries({ workspaceRoot: wtPath, mode: reviewMode, model: reviewerModel })
+	// See hasRealWorktreeChanges's doc comment: a "clean" verdict is
+	// structurally impossible with zero real changes, checked directly
+	// against git — never asked of (or trusted from) the review LLM
+	// itself. Skips the review session entirely rather than spend a call
+	// that has nothing real to verify.
+	if (!hasRealWorktreeChanges(wtPath)) {
+		const stateAfter = await patchGroup(statePath, group.name, {
+			review_verdict: "finding",
+			pending_review_findings: [
+				"No real changes found in the worktree (empty diff vs the tracked upstream, no uncommitted changes outside harness bookkeeping files) — there is nothing for a review to verify. Automatic fail: a \"clean\" verdict is structurally impossible with zero changes.",
+			],
+			reviewed_at: new Date().toISOString(),
+			last_activity: { note: "review skipped: worktree has no real changes (automatic fail)" },
+		})
+		const updated = stateAfter.groups.find((g) => g.name === group.name) ?? group
+		write(
+			`AUTOMATIC FAIL: ${group.name}'s worktree has no real changes — skipping the review session (a "clean" verdict is structurally impossible with an empty diff)\n`,
+		)
+		return { group: updated, skipped: false, message: "no real changes → automatic fail (review session never ran)" }
+	}
+	const result = await runReviewWithRetries({
+		workspaceRoot: wtPath,
+		mode: reviewMode,
+		model: reviewerModel,
+		issues: group.issues,
+	})
 	if (result.verdict === "error") {
 		const stateAfter = await patchGroup(statePath, group.name, handleReviewSessionError(result))
 		const updated = stateAfter.groups.find((g) => g.name === group.name) ?? group
@@ -1006,6 +1107,27 @@ export async function runQaStep(opts: QaStepOptions): Promise<QaStepResult> {
 	if (dryRun) {
 		write(`  dry-run: would run a headless QA session (mode ${qaMode}, model ${qaModel ?? "(default)"}) against ${wtPath}\n`)
 		return { group, skipped: false, message: "dry-run: QA not run" }
+	}
+	// See hasRealWorktreeChanges's doc comment: same automatic-fail gate as
+	// runReviewStep, checked directly against git before the QA LLM session
+	// ever runs — a "pass" verdict is structurally impossible with zero
+	// real changes.
+	if (!hasRealWorktreeChanges(wtPath)) {
+		const stateAfter = await patchGroup(statePath, group.name, {
+			qa: {
+				status: "failed",
+				verdict: "fail",
+				evidence:
+					"No real changes found in the worktree (empty diff vs the tracked upstream, no uncommitted changes outside harness bookkeeping files) — there is nothing for QA to verify. Automatic fail: a \"pass\" verdict is structurally impossible with zero changes.",
+				updated: new Date().toISOString(),
+			},
+			last_activity: { note: "QA skipped: worktree has no real changes (automatic fail)" },
+		})
+		const updated = stateAfter.groups.find((g) => g.name === group.name) ?? group
+		write(
+			`AUTOMATIC FAIL: ${group.name}'s worktree has no real changes — skipping the QA session (a "pass" verdict is structurally impossible with an empty diff)\n`,
+		)
+		return { group: updated, skipped: false, message: "no real changes → automatic fail (QA session never ran)" }
 	}
 	const qaResult = await runQaWithRetries({ workspaceRoot: wtPath, mode: qaMode, model: qaModel })
 	if (qaResult.verdict === "error") {
