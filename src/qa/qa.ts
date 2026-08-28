@@ -406,11 +406,28 @@ export function parseQaResult(text: string): QaResult {
 	}
 
 	// Fallback for a session that didn't emit the required line.
+	//
+	// "QA PASS"/"QA FAIL" as a real verdict declaration must LEAD a line
+	// (like the structured QA_VERDICT: line above) -- not match anywhere in
+	// flowing prose. Verified live 2026-08-28: a QA report that correctly
+	// reported failure ("a QA PASS requires all checks to have run clean...
+	// I must fail rather than guess") got silently flipped to "pass"
+	// because the old bare `\bqa\s*pass\b` match fired on the substring
+	// "QA PASS" inside that EXPLANATORY sentence, which was never a real
+	// verdict declaration — and the actual conclusion ("I must fail")
+	// never matched `\bqa\s*fail\b` since it lacks the literal word "qa".
+	// Same bug class this file's own history already documents once (an
+	// over-eager FAIL match on "12 failed" baseline counts, see
+	// testBaselineFailedCountsDoNotFalselyFailAPassingQaReport) — this
+	// time in the opposite direction, an over-eager PASS match.
+	const qaPassLeadsLine = /^\s*(?:[#*-]\s*)*qa\s*pass\b/im.test(summary)
+	const qaFailLeadsLine = /^\s*(?:[#*-]\s*)*qa\s*fail\b/im.test(summary)
 	const hasPassMarker =
-		/\b(qa\s*pass|all\s*tests?\s*pass|no\s+errors?\s+found|no\s+failures|definition\s+of\s+done\s+(is\s+|was\s+)?(met|satisfied)|errors?\s*:\s*\[\s*\]|passed\s+(\d+)\/\d+|verified\s+ok)\b/i.test(
+		qaPassLeadsLine ||
+		/\b(all\s*tests?\s*pass|no\s+errors?\s+found|no\s+failures|definition\s+of\s+done\s+(is\s+|was\s+)?(met|satisfied)|errors?\s*:\s*\[\s*\]|passed\s+(\d+)\/\d+|verified\s+ok)\b/i.test(
 			lower,
 		)
-	const hasFailMarker = /\b(qa\s*fail|definition\s+of\s+done\s+not|does\s+not\s+work)\b/i.test(lower)
+	const hasFailMarker = qaFailLeadsLine || /\b(definition\s+of\s+done\s+not|does\s+not\s+work)\b/i.test(lower)
 
 	let verdict: QaVerdict
 	if (hasPassMarker && !hasFailMarker) {

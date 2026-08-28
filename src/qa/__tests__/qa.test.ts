@@ -180,6 +180,26 @@ async function testMissingStructuredQaVerdictFallsBackToHeuristic(): Promise<voi
 	assert.equal(result.verdict, "pass")
 }
 
+/**
+ * 2026-08-28 production incident: a QA session correctly reported it
+ * COULD NOT run any checks (tooling unavailable) and concluded it must
+ * fail, but explained itself using the phrase "a QA PASS requires..." —
+ * the bare `\bqa\s*pass\b` match fired on that substring even though it
+ * was never a real verdict declaration, silently flipping a correct
+ * failure report to "pass". "QA PASS"/"QA FAIL" must LEAD a line to count
+ * as a real verdict declaration in the fallback, same as the structured
+ * QA_VERDICT: line above already requires.
+ */
+async function testExplanatoryQaPassMentionInFailureProseDoesNotFlipToPass(): Promise<void> {
+	const result = parseQaResult(
+		"The workspace's `git` tool is unavailable... I cannot boot the app, run any test suite, or exercise " +
+			"specific behavior without a working shell. Per the operating instructions, a QA PASS requires all " +
+			"checks to have run clean; with the core tooling unavailable, I must fail rather than guess.\n\n" +
+			"Evidence:\n- git diff origin/master...HEAD --stat -> no output\n\nFinal baseline: tooling unavailable; no checks ran.",
+	)
+	assert.equal(result.verdict, "fail")
+}
+
 // ─── runQaWithRetries: end-to-end against a real HeadlessSession ────────────
 //
 // 2026-08-05 incident (QA-side twin of the reviewer.ts incident): a QA
@@ -317,6 +337,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["structured QA_VERDICT: FAIL wins even with pass language elsewhere", testStructuredVerdictFailWinsEvenWithPassLanguage],
 	["structured qa verdict line is case-insensitive and trims whitespace", testStructuredVerdictIsCaseInsensitiveAndTrimsWhitespace],
 	["missing structured QA_VERDICT falls back to the heuristic", testMissingStructuredQaVerdictFallsBackToHeuristic],
+	[
+		"explanatory 'a QA PASS requires...' inside a failure report does not flip to pass",
+		testExplanatoryQaPassMentionInFailureProseDoesNotFlipToPass,
+	],
 	["runQa writes a tailable qa.log", testRunQaWritesATailableLogFile],
 	["runQa generic checklist designates workspace scratch and forbids /tmp (issue #123)", testRunQaGenericChecklistForbidsTmpAndPointsAtWorkspaceScratch],
 	["runQa surfaces the complete final report path (issue #34)", testRunQaSurfacesFullReportPath],
