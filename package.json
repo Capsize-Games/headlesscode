@@ -48,10 +48,11 @@
 		"@octokit/auth-app": "^8.2.0",
 		"fastest-levenshtein": "^1.0.16",
 		"p-wait-for": "^5.0.2",
+		"playwright": "^1.62.1",
 		"simple-git": "^3.36.0",
 		"tsx": "^4.19.0",
 		"typescript": "^5.6.0",
-		"playwright": "^1.62.1",
+		"undici": "^8.10.0",
 		"yaml": "^2.5.1",
 		"zod": "^3.25.76"
 	},
