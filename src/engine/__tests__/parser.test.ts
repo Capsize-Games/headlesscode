@@ -12,7 +12,7 @@
 
 import assert from "node:assert/strict"
 
-import { bestEffortPartialJson, parseToolCall, parseToolCalls } from "../parser.js"
+import { bestEffortPartialJson, extractEmbeddedToolCall, parseToolCall, parseToolCalls } from "../parser.js"
 import type { ChatMessage, ChatToolCall } from "../types.js"
 
 function call(overrides: Partial<ChatToolCall> = {}, id = "call_1"): ChatToolCall {
@@ -161,6 +161,41 @@ function testNoRecoverablePairsReturnsUndefined(): void {
 	assert.equal(bestEffortPartialJson("nothing json-like here"), undefined)
 }
 
+// ─── extractEmbeddedToolCall ─────────────────────────────────────────────────
+
+function testEmbeddedBareResultObjectRecoveredAsAttemptCompletion(): void {
+	const text = '```json\n{\n  "result": "The check passed cleanly — no diagnostics."\n}\n```'
+	const recovered = extractEmbeddedToolCall(text)
+	assert.equal(recovered?.name, "attempt_completion")
+	assert.deepEqual(recovered?.args, { result: "The check passed cleanly — no diagnostics." })
+}
+
+function testEmbeddedBareResultObjectRecoveredWithoutFence(): void {
+	const text = '{"result": "done"}'
+	const recovered = extractEmbeddedToolCall(text)
+	assert.equal(recovered?.name, "attempt_completion")
+	assert.deepEqual(recovered?.args, { result: "done" })
+}
+
+function testEmbeddedResultObjectWithExtraKeysNotRecovered(): void {
+	// Only a single-key {"result": "..."} object is treated as an implicit
+	// attempt_completion — an object with other keys alongside "result" is
+	// ambiguous (could be ordinary narrated JSON, e.g. quoting a program's
+	// own output) and must fall through unrecovered.
+	const text = '```json\n{"result": "done", "status": "ok"}\n```'
+	assert.equal(extractEmbeddedToolCall(text), undefined)
+}
+
+function testEmbeddedResultObjectWithEmptyStringNotRecovered(): void {
+	const text = '{"result": "  "}'
+	assert.equal(extractEmbeddedToolCall(text), undefined)
+}
+
+function testEmbeddedResultObjectWithNonStringResultNotRecovered(): void {
+	const text = '{"result": 42}'
+	assert.equal(extractEmbeddedToolCall(text), undefined)
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => void]> = [
@@ -181,6 +216,26 @@ const tests: Array<[string, () => void]> = [
 	["bestEffortPartialJson: scavenging handles all value types", testScavengingHandlesStringsNumbersBooleansNull],
 	["bestEffortPartialJson: scavenging unescapes string values", testScavengingUnescapesStringValues],
 	["bestEffortPartialJson: no recoverable pairs -> undefined", testNoRecoverablePairsReturnsUndefined],
+	[
+		"extractEmbeddedToolCall: bare {result} recovered as attempt_completion",
+		testEmbeddedBareResultObjectRecoveredAsAttemptCompletion,
+	],
+	[
+		"extractEmbeddedToolCall: bare {result} recovered without fence",
+		testEmbeddedBareResultObjectRecoveredWithoutFence,
+	],
+	[
+		"extractEmbeddedToolCall: {result, ...extra} not recovered",
+		testEmbeddedResultObjectWithExtraKeysNotRecovered,
+	],
+	[
+		"extractEmbeddedToolCall: {result: \"\"} not recovered",
+		testEmbeddedResultObjectWithEmptyStringNotRecovered,
+	],
+	[
+		"extractEmbeddedToolCall: {result: <non-string>} not recovered",
+		testEmbeddedResultObjectWithNonStringResultNotRecovered,
+	],
 ]
 
 function main(): void {

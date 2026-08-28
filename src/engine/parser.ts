@@ -156,7 +156,11 @@ function unescapeJsonString(s: string): string {
  * turns a hallucinated claim into real, verified progress instead of
  * wasting the turn on a nudge.
  *
- * Returns undefined when neither shape can be found — this is a
+ * A third shape (2026-08-27, see below) is an XML/Hermes-style
+ * `<tool_call><function=NAME><parameter=KEY>VALUE</parameter>...</function></tool_call>`
+ * block — also recovered.
+ *
+ * Returns undefined when none of the shapes can be found — this is a
  * best-effort scan, not a guarantee.
  */
 export function extractEmbeddedToolCall(text: string): ParsedToolCall | undefined {
@@ -166,6 +170,36 @@ export function extractEmbeddedToolCall(text: string): ParsedToolCall | undefine
 		return {
 			id: "embedded_0",
 			name: narrated[1],
+			args,
+			rawArguments: JSON.stringify(args),
+		}
+	}
+
+	// Third observed shape, verified live 2026-08-27 against Qwen3.5-9B
+	// across several review/QA sessions in the same night, always the SAME
+	// deterministic reproduction at temperature 0 given the same context:
+	// `<tool_call>\n<function=execute_command>\n<parameter=cwd>\n.\n</parameter>\n
+	// <parameter=command>\ngit log --oneline -15\n</parameter>\n...\n</function>\n
+	// </tool_call>` — an XML/Hermes-style function-call template the model
+	// falls back to as plain text instead of a real tool_calls entry. Every
+	// occurrence went unrecovered before this: extractEmbeddedToolCall only
+	// recognized the narrated-past-tense and JSON-object shapes, so this one
+	// always burned a mistake and lost real, correctly-formed tool-call
+	// intent (a real `git log --oneline -15` in the example above) that could
+	// otherwise have just been executed.
+	const xmlToolCall = /<tool_call>\s*<function=([\w.-]+)>([\s\S]*?)<\/function>\s*<\/tool_call>/.exec(text)
+	if (xmlToolCall) {
+		const args: Record<string, unknown> = {}
+		const paramRe = /<parameter=([\w.-]+)>\s*([\s\S]*?)\s*<\/parameter>/g
+		let paramMatch: RegExpExecArray | null
+		while ((paramMatch = paramRe.exec(xmlToolCall[2])) !== null) {
+			const raw = paramMatch[2]
+			const num = Number(raw)
+			args[paramMatch[1]] = raw !== "" && !Number.isNaN(num) ? num : raw
+		}
+		return {
+			id: "embedded_0",
+			name: xmlToolCall[1],
 			args,
 			rawArguments: JSON.stringify(args),
 		}
@@ -190,6 +224,42 @@ export function extractEmbeddedToolCall(text: string): ParsedToolCall | undefine
 			name: name.trim(),
 			args,
 			rawArguments: JSON.stringify(args),
+		}
+	}
+
+	// A fourth shape (2026-08-28, verified live against Qwen3.5-9B+LoRA):
+	// once the model believes the task is done, it drops the `<tool_call>`
+	// wrapper (and the `{"name": ..., "arguments": {...}}` envelope above)
+	// entirely and just writes attempt_completion's own payload bare —
+	// ```json\n{"result": "..."}\n``` — with no name/arguments field at
+	// all. None of the shapes above match this (no `name` key), so it fell
+	// through to a hard "non-completing reply" mistake every time, and
+	// because the model reproduces this same text deterministically at
+	// temperature 0, it burned the ENTIRE consecutive-mistake budget
+	// (verified live: 5 identical repeats, then bounded failure) even
+	// though its actual answer was sitting right there in the reply.
+	// Recognized ONLY as a single-key `{"result": "<string>"}` object (no
+	// `name`, no other keys) specifically to avoid misreading some other,
+	// unrelated JSON blob the model may legitimately include in prose
+	// (e.g. quoting a program's own output) as a fake completion signal —
+	// this shape is distinctive enough that a false-positive match on
+	// ordinary task-narration text is very unlikely. The caller (loop.ts)
+	// still validates "attempt_completion" against the session's real tool
+	// catalog exactly like every other recovered shape here, so this can't
+	// fabricate a tool that isn't actually offered.
+	for (const candidate of candidates) {
+		const obj = parsePermissiveObject(candidate)
+		if (!obj) {
+			continue
+		}
+		const keys = Object.keys(obj)
+		if (keys.length === 1 && keys[0] === "result" && typeof obj.result === "string" && obj.result.trim() !== "") {
+			return {
+				id: "embedded_0",
+				name: "attempt_completion",
+				args: { result: obj.result },
+				rawArguments: JSON.stringify({ result: obj.result }),
+			}
 		}
 	}
 	return undefined
