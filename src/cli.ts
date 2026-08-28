@@ -1220,6 +1220,28 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// either way — only ever loses information, never invents it.
 	const disableLlmCondensation =
 		useLocalCodeBackend && !envBoolean("HEADLESSCODE_ALLOW_LLM_CONDENSATION")
+	// The local daemon's own proxy (ollama_shim.py) deliberately runs a 600s
+	// upstream request timeout — its own comment documents WHY: a 280s value
+	// there was found live to be SHORTER than this harness's 300s client
+	// timeout, so the shim was aborting slow calls before the harness's own
+	// timeout ever would have, and got bumped specifically so it would
+	// "never be the thing that cuts a call off early." That fix only holds
+	// if the harness's own client-side timeout is actually longer than the
+	// shim's — it was left at the generic DEFAULT_LLM_TIMEOUT_MS (300s)
+	// regardless of backend, silently re-introducing the exact race the
+	// shim fix was meant to close: the harness now gives up at 300s before
+	// the shim's 600s patience is ever exercised. Verified live 2026-08-28
+	// (joeos issue #26): a plain, non-condensation main-loop call died with
+	// "Ollama /api/chat timed out after 300000ms" at iteration 4 — nothing
+	// runaway or malformed about it, a 9B local model doing real prefill +
+	// generation work at this prompt depth (50k+ tokens) can legitimately
+	// take longer than 5 minutes. Local inference has no per-call cost to
+	// weigh against waiting longer, so default the client timeout to
+	// comfortably exceed the shim's own 600s — long enough that the SHIM's
+	// clean timeout/error handling is what surfaces first on a genuine hang,
+	// not the harness's blunter zero-content abort.
+	const LOCAL_LLM_TIMEOUT_MS = 630_000
+	const llmTimeoutMs = options.llmTimeoutMs ?? (useLocalCodeBackend ? LOCAL_LLM_TIMEOUT_MS : undefined)
 
 	// Phase 3 context condensation: a cheaper model for the condensation
 	// call can be assigned via the `_condensation` key in
@@ -1358,7 +1380,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		condenseEarlyFireFraction,
 		condenseModel,
 		disableLlmCondensation,
-		llmTimeoutMs: options.llmTimeoutMs,
+		llmTimeoutMs,
 		stream: options.stream,
 		reasoningEffort,
 		temperature: options.temperature,

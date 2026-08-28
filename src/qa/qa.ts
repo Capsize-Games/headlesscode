@@ -289,6 +289,13 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
 		// Issue #144 (mirrors reviewer.ts): local inference is free — a
 		// fabricated dollar figure in the QA log is noise at best.
 		trackCost: !useLocalBackend,
+		// Same gap as cli.ts's LOCAL_LLM_TIMEOUT_MS (see its doc comment for
+		// the full story): this session construction never set llmTimeoutMs
+		// at all, so a QA session on the local daemon always used the
+		// generic DEFAULT_LLM_TIMEOUT_MS (300s) — shorter than the shim's
+		// own deliberately-raised 600s upstream patience, so the harness
+		// gives up first on a genuinely slow (not hung) local call.
+		llmTimeoutMs: useLocalBackend ? 630_000 : undefined,
 		memory,
 		project,
 		logger,

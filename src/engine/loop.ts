@@ -2490,6 +2490,21 @@ export class HeadlessSession {
 		// truncateHistory's own drop-oldest eviction already relies on
 		// elsewhere), unlike a confidently wrong LLM summary.
 		if (config.disableLlmCondensation) {
+			// computeCondensePlan is a pure calculator — it does not itself
+			// check whether the threshold was crossed (maybeCondense in
+			// condense.ts does that BEFORE ever calling it on the LLM path).
+			// Omitting the same guard here was a real bug, verified live
+			// 2026-08-28: eviction fired on iteration 2 of a brand-new
+			// session at 17,019 tokens (nowhere near any real threshold)
+			// because a negative `wantTokens` (lastPromptTokens well under
+			// targetTokens) still yields a near-zero budget that
+			// computeCondenseCount always fills with at least one tool-call
+			// group by design — silently discarding the model's very first
+			// turn before it had a chance to make any progress.
+			const threshold = Math.max(1, contextWindowTokens * config.condenseThresholdFraction)
+			if (this.lastLlmUsage.inputTokens < threshold) {
+				return messages
+			}
 			const { count } = computeCondensePlan(
 				messages,
 				this.lastLlmUsage.inputTokens,

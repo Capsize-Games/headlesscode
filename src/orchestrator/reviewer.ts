@@ -239,6 +239,13 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 		// review session on a local daemon (e.g. the 2080 review-daemon) has
 		// no real dollar cost either.
 		trackCost: !useLocalBackend,
+		// Same gap as cli.ts's LOCAL_LLM_TIMEOUT_MS (see its doc comment for
+		// the full story): this session construction never set llmTimeoutMs
+		// at all, so a review session on the local daemon always used the
+		// generic DEFAULT_LLM_TIMEOUT_MS (300s) — shorter than the shim's
+		// own deliberately-raised 600s upstream patience, so the harness
+		// gives up first on a genuinely slow (not hung) local call.
+		llmTimeoutMs: useLocalBackend ? 630_000 : undefined,
 	})
 
 	const result: SessionResult = await session.run()

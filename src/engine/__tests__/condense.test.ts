@@ -1072,6 +1072,56 @@ async function testSessionDisableLlmCondensationStillEvictsByTokenBudget(): Prom
 }
 
 /**
+ * `disableLlmCondensation` eviction must NOT fire before the real
+ * threshold is crossed. Regression test for a real bug (verified live
+ * 2026-08-28, joeos issue #26): computeCondensePlan is a pure calculator
+ * with no threshold check of its own (maybeCondense on the LLM path checks
+ * BEFORE calling it) — omitting the same check here meant a negative
+ * `wantTokens` (prompt tokens well under the target) still produced a
+ * near-zero eviction budget that computeCondenseCount always fills with at
+ * least one tool-call group, silently discarding a session's very first
+ * turn on iteration 2, nowhere near any real context pressure.
+ */
+async function testSessionDisableLlmCondensationDoesNotEvictBelowThreshold(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-condense-disabled-noevict-"))
+	try {
+		const client = new FakeLlmClient(
+			[
+				() => toolCall("list_files", { path: "." }),
+				() => toolCall("read_file", { path: "a.txt" }),
+				() => toolCall("attempt_completion", { result: "done" }),
+			],
+			// Well under any real threshold (0.75 * 128_000 = 96_000).
+			{ promptTokens: 17_000, completionTokens: 100 },
+		)
+		const session = await makeSession({
+			task: "task",
+			client,
+			workspaceRoot: ws,
+			contextWindowTokens: 128_000,
+			condenseThresholdFraction: 0.75,
+			disableLlmCondensation: true,
+		})
+
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(client.condenseCalls, 0, "the LLM summarization call must never run when disabled")
+		// [system, firstUser] (2) + 2 real tool turns (assistant + tool
+		// result each, +4) + the final attempt_completion assistant message
+		// (no paired tool-result — the session terminates right there) = 7.
+		// Any eviction below threshold would have spliced this down.
+		const finalHistoryLength = session.state.messages.length
+		assert.equal(
+			finalHistoryLength,
+			7,
+			`expected no below-threshold eviction to have shrunk history (got ${finalHistoryLength} messages)`,
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+/**
  * Prompt-cache stability across the condensation boundary: after the
  * condensation, the sent prefix (summary + tail) must stay IDENTICAL across
  * subsequent requests — not reshuffled every call.
@@ -1278,6 +1328,10 @@ const tests: Array<[string, () => Promise<void> | void]> = [
 	[
 		"session: disableLlmCondensation still evicts by token budget, not just windowSize",
 		testSessionDisableLlmCondensationStillEvictsByTokenBudget,
+	],
+	[
+		"session: disableLlmCondensation does not evict below the real threshold",
+		testSessionDisableLlmCondensationDoesNotEvictBelowThreshold,
 	],
 	["session: post-condensation prefix stays stable across calls", testSessionPostCondensePrefixStable],
 	["session: condensation usage can trip the budget like a main call", testCondensationUsageTripsBudget],
