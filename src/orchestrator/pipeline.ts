@@ -135,6 +135,12 @@ function resolveStageClient(mode: string, model?: string, llmClient?: LlmClient)
 		return new OllamaClient({
 			baseUrl: resolvePerModeEnv("HEADLESSCODE_OLLAMA_URL", mode),
 			defaultModel: resolvePerModeEnv("HEADLESSCODE_CODE_MODE_MODEL", mode) ?? model,
+			// OllamaClient has its own independent abort timer (ollama.ts's
+			// DEFAULT_OLLAMA_TIMEOUT_MS, 300s) — see cli.ts's
+			// LOCAL_LLM_TIMEOUT_MS doc comment (verified live 2026-08-28)
+			// for why local sessions need this raised past the shim's own
+			// 600s upstream patience.
+			timeoutMs: 630_000,
 		})
 	}
 	return new OpenRouterClient({ apiKey: process.env.HEADLESSCODE_OPENROUTER_API_KEY, defaultModel: model })

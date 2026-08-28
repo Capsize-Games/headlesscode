@@ -206,6 +206,15 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 			? new OllamaClient({
 					baseUrl: resolvePerModeEnv("HEADLESSCODE_OLLAMA_URL", mode),
 					defaultModel: effectiveModel,
+					// OllamaClient has its own independent abort timer
+					// (ollama.ts's DEFAULT_OLLAMA_TIMEOUT_MS, 300s), separate
+					// from the llmTimeoutMs passed to HeadlessSession below —
+					// verified live 2026-08-28 (cli.ts's LOCAL_LLM_TIMEOUT_MS
+					// doc comment has the full story): raising the session-
+					// level timeout alone still left review sessions dying at
+					// exactly 300000ms because this constructor never heard
+					// about it.
+					timeoutMs: useLocalBackend ? 630_000 : undefined,
 				})
 			: new OpenRouterClient({ apiKey: process.env.HEADLESSCODE_OPENROUTER_API_KEY, defaultModel: model }))
 
