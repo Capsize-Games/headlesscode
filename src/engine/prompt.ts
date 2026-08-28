@@ -380,6 +380,29 @@ export async function buildLeanSystemPrompt(options: BuildSystemPromptOptions): 
 		"look like is never itself progress; only an actual tool_calls entry " +
 		"executes anything. Never fabricate file contents or command output " +
 		"you have not actually seen."
+	// Verified live 2026-08-27: a local session correctly diagnosed a fix in
+	// its own reasoning text ("the error message says X, which means it's
+	// expecting Y instead") — genuinely correct — and then, instead of
+	// calling edit_file to apply that exact fix, just repeated the same
+	// diagnosis as plain text for 6 consecutive turns until it hit the
+	// session's mistake limit and lost the work entirely. In the same
+	// transcript, one of those repeats was a text-only tool call for a tool
+	// that was on a short cooldown from an earlier repeated call — a
+	// different, uncooled tool (edit_file) was available the whole time but
+	// never attempted. Reasoning correctly about a fix is not the same as
+	// applying it — the moment you know what change to make, make it with a
+	// real tool call (edit_file/write_to_file) in that same turn, don't
+	// restate the diagnosis first. If your last attempted action didn't run
+	// (a tool was blocked, on cooldown, or errored), the fix is to try a
+	// DIFFERENT tool that is actually available right now, not to explain
+	// the same conclusion again and wait.
+	const stalledRetryNote =
+		"When you've figured out what change to make, make it immediately with " +
+		"a real tool call (edit_file/write_to_file) in the same turn — restating " +
+		"your diagnosis in plain text first is not progress and will not retry " +
+		"itself. If a tool call didn't go through (blocked, on cooldown, or " +
+		"errored), pick a different tool that IS available right now instead of " +
+		"repeating the same reasoning or the same blocked call again."
 	const verificationNote =
 		"Only call attempt_completion after you have verified the change actually " +
 		"works (typecheck/tests as applicable) — a plausible-looking but " +
@@ -550,6 +573,34 @@ export async function buildLeanSystemPrompt(options: BuildSystemPromptOptions): 
 		"session and counts against your mistake budget the same as a failed command — it is never the right " +
 		"response to a deferral."
 
+	// 2026-08-27 addendum, general case (executeCommandRecoveryNote above
+	// only covers the narrower attempt_completion-deferral scenario):
+	// verified live against Qwen3.5-9B with the lean prompt active — a
+	// read_file call errored on a malformed path, and the model's next SIX
+	// replies in a row were short text-only acknowledgments ("I see the
+	// issue - I need to read from line 601 correctly. Let me continue
+	// reading the file:") with NO tool call attached, nearly identical
+	// each time, until the session hit its bounded-failure limit. This
+	// was not a fabricated/malformed tool call (extractEmbeddedToolCall's
+	// recovery does not apply here) and not task drift — the model
+	// correctly identified the fix in its own words but never issued the
+	// corrected call itself. The harness's reactive per-turn nudge
+	// ("[System: a text reply alone does not end the session...]") did
+	// not break the pattern. Independent evidence (a practitioner test
+	// against Qwen3:14b hitting the same "narrate instead of retry"
+	// pattern after a shell error) found that stating the rule as a
+	// standing directive IN THE SYSTEM PROMPT, rather than only as a
+	// reactive after-the-fact correction, was what actually fixed it —
+	// taking that model from <20% to 100% success on the same task. This
+	// note is the same intervention, generalized from execute_command to
+	// every tool.
+	const toolErrorRecoveryNote =
+		"When any tool call returns an error, your NEXT reply must be the actual corrected tool call itself — " +
+		"never a sentence describing that you will retry, are about to fix the path, or see the issue. Narrating " +
+		"an intended retry is not progress and does not get executed; only a real tool call does. If you catch " +
+		"yourself about to write something like 'let me try again' or 'I need to correct the path', stop and " +
+		"put the corrected call in that same reply instead of describing it."
+
 	const conventionNote =
 		"Before writing a NEW file of a kind that likely already has examples in this codebase (a test file, a " +
 		"config file, a module following an established pattern), actually read_file an existing example FIRST " +
@@ -569,12 +620,14 @@ export async function buildLeanSystemPrompt(options: BuildSystemPromptOptions): 
 	const basePrompt = [
 		modeConfig.roleDefinition,
 		toolUseNote,
+		stalledRetryNote,
 		verificationNote,
 		followupQuestionNote,
 		objectiveNote,
 		planningNote,
 		conventionNote,
 		executeCommandRecoveryNote,
+		toolErrorRecoveryNote,
 		getSystemInfoSection(workspaceRoot),
 		await addCustomInstructions(modeConfig.customInstructions ?? "", globalCustomInstructions ?? "", workspaceRoot, modeConfig.slug, {}),
 	]

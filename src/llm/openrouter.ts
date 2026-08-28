@@ -26,6 +26,7 @@ import type {
 	ChatToolCall,
 } from "../engine/types.js"
 import { parseEndpointPricing, type EndpointPricingEntry, type ModelPrice } from "../budget/cost.js"
+import { captureTranscript, isTranscriptCaptureEnabled } from "./transcript-capture.js"
 
 export const OPENROUTER_BASE_URL = "https://openrouter.ai"
 export const DEFAULT_MODEL = "deepseek/deepseek-v4-flash-0731"
@@ -390,6 +391,7 @@ export class OpenRouterClient implements LlmClient {
 
 		const model = this.resolveModel(request.model)
 		const url = `${this.baseUrl}/api/v1/chat/completions`
+		const startedAt = Date.now()
 
 		const headers = this.authHeaders()
 
@@ -403,6 +405,33 @@ export class OpenRouterClient implements LlmClient {
 			return this.streamChatCompletion(request, url, headers, body)
 		}
 
+		try {
+			return await this.createChatCompletionNonStreaming(request, url, headers, body, model, startedAt)
+		} catch (err) {
+			if (isTranscriptCaptureEnabled()) {
+				captureTranscript(
+					{ provider: "openrouter", model },
+					{
+						messages: request.messages,
+						tools: request.tools,
+						temperature: request.temperature,
+						error: err instanceof Error ? err.message : String(err),
+						durationMs: Date.now() - startedAt,
+					},
+				)
+			}
+			throw err
+		}
+	}
+
+	private async createChatCompletionNonStreaming(
+		request: LlmRequest,
+		url: string,
+		headers: Record<string, string>,
+		body: Record<string, unknown>,
+		model: string,
+		startedAt: number,
+	): Promise<LlmResponse> {
 		let response: Response
 		try {
 			response = await fetch(url, {
@@ -469,10 +498,17 @@ export class OpenRouterClient implements LlmClient {
 			)
 		}
 
-		return {
+		const result: LlmResponse = {
 			message,
 			usage: mapUsage(data.usage),
 		}
+		if (isTranscriptCaptureEnabled()) {
+			captureTranscript(
+				{ provider: "openrouter", model },
+				{ messages: request.messages, tools: request.tools, temperature: request.temperature, response: result, durationMs: Date.now() - startedAt },
+			)
+		}
+		return result
 	}
 
 	/**

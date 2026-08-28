@@ -30,9 +30,10 @@ import { HeadlessSession } from "../engine/loop.js"
 import { Logger } from "../engine/logger.js"
 import { OpenRouterClient } from "../llm/openrouter.js"
 import { OllamaClient } from "../llm/ollama.js"
-import { resolvePerModeEnv } from "../cli.js"
+import { envBoolean, resolvePerModeEnv } from "../cli.js"
 import { createReadOnlyHeadlessExecutor } from "../tools/executor.js"
 import { getNativeTools } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/index.js"
+import { addCustomInstructions } from "../vendor/zoo-code/src/core/prompts/sections/custom-instructions.js"
 import type { ChatTool, LlmClient, SessionResult } from "../engine/types.js"
 import type { SessionBudget } from "../budget/budget.js"
 
@@ -64,6 +65,26 @@ export interface ReviewOptions {
 	llmClient?: LlmClient
 	/** Review task text (default: built from the workspace/branch). */
 	taskText?: string
+	/**
+	 * Issue number(s) this group was actually assigned, when known (the
+	 * orchestrator always has this in `group.issues`). When provided (and
+	 * `taskText` is not explicitly overridden), the default task text names
+	 * them directly instead of asking the reviewer to discover what was
+	 * worked on via `gh issue list --state closed`. 2026-08-27: verified
+	 * live — a review session given the generic "figure out which issues
+	 * were closed" task, against a group whose issue had NOT actually been
+	 * filed to GitHub (a synthetic `--issues-json` test group, closed
+	 * locally but with no real issue thread to find), stalled into repeated
+	 * empty replies ("I need to review the work... let me first understand
+	 * what issues were closed") across all 3 retry attempts and correctly
+	 * escalated to NEEDS-HUMAN — the fail-closed path worked, but a review
+	 * that already knows the issue number shouldn't have to search for it
+	 * at all. This closes that gap generally, not just for the synthetic
+	 * case: even in normal use, `gh issue list --state closed` can miss
+	 * for other reasons (API lag, pagination, label filtering) and there's
+	 * no reason to re-derive data the caller already has.
+	 */
+	issues?: number[]
 	/**
 	 * Iteration ceiling — a backstop, not the primary guard (see `budget`
 	 * below). Default is deliberately generous (200): a review that
@@ -134,11 +155,23 @@ function currentBranch(workspaceRoot: string): string {
 	}
 }
 
-function defaultTaskText(workspaceRoot: string): string {
+function defaultTaskText(workspaceRoot: string, issues?: number[]): string {
+	const targetLine =
+		issues && issues.length > 0
+			? `Review the work done in this workspace (branch: ${currentBranch(workspaceRoot)}) for ` +
+				`issue${issues.length > 1 ? "s" : ""} ${issues.map((n) => `#${n}`).join(", ")} — that is exactly ` +
+				`what this group was assigned, so start there directly (\`gh issue view ${issues[0]}\`, etc.) ` +
+				"rather than searching for it. If the issue number doesn't resolve on GitHub (e.g. a locally-" +
+				"tracked or synthetic task never filed as a real issue), that is not a review blocker — fall " +
+				"back to the worktree's own git log and diff against its base branch as the source of truth " +
+				"for what was actually done, and review that directly instead of stalling on the missing issue " +
+				"thread.\n\n"
+			: `Review the work done in this workspace (branch: ${currentBranch(workspaceRoot)}) ` +
+				"exactly as your operating procedure instructs. For each issue the worker closed, read the " +
+				"closing report, read the real diff, and re-run every checkable claim yourself.\n\n"
 	return (
-		`Review the work done in this workspace (branch: ${currentBranch(workspaceRoot)}) ` +
-		"exactly as your operating procedure instructs. For each issue the worker closed, read the " +
-		"closing report, read the real diff, and re-run every checkable claim yourself. Any scratch " +
+		targetLine +
+		"Any scratch " +
 		"you need (probe scripts, temp output captures) goes in `.headlesscode/scratch/` inside this " +
 		"workspace — NEVER write to `/tmp` or any other path outside the workspace. When you are " +
 		"done, call attempt_completion with a structured summary: a Findings section listing anything " +
@@ -173,11 +206,29 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 		reviewPromptPath = `${HARNESS_ROOT}${DEFAULT_REVIEW_PROMPT_PATH}`,
 		llmClient,
 		taskText,
+		issues,
 		maxIterations = 200,
 		budget,
 	} = options
 
-	const systemPromptOverride = await fs.readFile(reviewPromptPath, "utf-8")
+	// 2026-08-27: verified live — a review session couldn't find the `curlee`
+	// compiler at all ("curlee runtime is not available in this environment"),
+	// fell back to eyeballing source code instead of running real checks, and
+	// separately had no idea `.roo/rules/rules.md` (this workspace's own
+	// language/build reference — e.g. joeos's documented curlee compiler
+	// location and Curlee syntax rules) existed. Root cause: `systemPromptOverride`
+	// is used VERBATIM by loop.ts (`this.config.systemPromptOverride ?? (await
+	// buildPrompt(...))`), which means review sessions skip `buildPrompt`
+	// entirely and, with it, `addCustomInstructions` — the exact mechanism
+	// that splices `.roo/rules/` into a WORKER session's prompt. Review
+	// sessions were structurally blind to project-specific guidance that
+	// worker sessions always get. Splicing it in here closes that gap the
+	// same way buildSystemPrompt already does for workers (see prompt.ts).
+	const reviewPromptText = await fs.readFile(reviewPromptPath, "utf-8")
+	const workspaceCustomInstructions = await addCustomInstructions("", "", workspaceRoot, mode, {})
+	const systemPromptOverride = workspaceCustomInstructions
+		? `${reviewPromptText}\n\n${workspaceCustomInstructions}`
+		: reviewPromptText
 	// Issue #142 follow-up: orchestrate's review pass built its own
 	// OpenRouterClient unconditionally, so a local-backend setup (e.g. a
 	// review daemon on its own GPU) had no effect on it — only the
@@ -236,7 +287,7 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 		workspaceRoot,
 		mode,
 		model: effectiveModel,
-		taskText: taskText ?? defaultTaskText(workspaceRoot),
+		taskText: taskText ?? defaultTaskText(workspaceRoot, issues),
 		maxIterations,
 		budget,
 		systemPromptOverride,
@@ -248,6 +299,27 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 		// review session on a local daemon (e.g. the 2080 review-daemon) has
 		// no real dollar cost either.
 		trackCost: !useLocalBackend,
+		// 2026-08-27: verified live — a local Qwen3.5-9B review session
+		// fabricated a fake `<tool_call>...</tool_call>` text block as its
+		// very first reply, never ran a single real verification command, and
+		// the harness's bare-text pragmatic-success fallback (see cli.ts's
+		// requireExplicitCompletion doc comment) accepted that garbage as a
+		// normal `status: "success"` result. Because the session-level result
+		// looked like an ordinary success, `parseReviewResult`'s deliberate
+		// fail-open default ("no finding marker found -> clean", see its own
+		// doc comment) then silently recorded verdict "clean" for a worker
+		// whose `git diff --stat` was completely empty — the exact false
+		// completion this review stage exists to catch. cli.ts's worker path
+		// was already hardened against this for local sessions
+		// (requireExplicitCompletion); the review path never got the same
+		// treatment, even though it runs on the same daemon and hits the same
+		// failure mode. Without this, a garbage local-reviewer reply is
+		// silently indistinguishable from a real "verified clean" verdict —
+		// forcing it here means a bare/fabricated reply becomes a
+		// non-completing mistake (retried, then a genuine session error) so
+		// runReviewWithRetries's existing fail-closed handling actually
+		// triggers instead of being bypassed.
+		requireExplicitCompletion: useLocalBackend && !envBoolean("HEADLESSCODE_ALLOW_TEXT_ONLY_COMPLETION"),
 		// Same gap as cli.ts's LOCAL_LLM_TIMEOUT_MS (see its doc comment for
 		// the full story): this session construction never set llmTimeoutMs
 		// at all, so a review session on the local daemon always used the

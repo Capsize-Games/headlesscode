@@ -1611,99 +1611,187 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 				}
 			}
 
-			let child
-			try {
-				// `detached: true` puts the shell in its own process group
-				// (pgid = child.pid). That serves two purposes: (a) a timed-out
-				// command can keep running fully independent of the harness's
-				// own process group, and (b) session teardown can kill the whole
-				// group (`process.kill(-pid)`) so grandchildren are reaped too.
-				// The process-group kill is the only way to clean up the full
-				// tree of a `shell: true` spawn — killing the shell alone would
-				// orphan whatever it had launched.
-				child = spawn(command, {
-					cwd,
-					// `shell: true` alone defaults to `/bin/sh` (dash on Debian/
-					// Ubuntu, the common host here), which has no bash-only
-					// features — `${PIPESTATUS[0]}`, `[[ ]]`, arrays. A model that
-					// reaches for one of these (common; every mode's rules files
-					// are silent on which shell dialect execute_command actually
-					// runs) gets a shell PARSE error on the whole command line —
-					// including whatever real command preceded it (e.g.
-					// `npm test 2>&1 | tail -60; echo "EXIT=${PIPESTATUS[0]}"`)
-					// fails with exit 2 even though `npm test` itself may have
-					// passed cleanly. Confirmed live 2026-08-05: this produced a
-					// genuine FALSE "QA_VERDICT: FAIL" on issue #17's round — a
-					// manual re-run of the identical code passed cleanly. Every
-					// `scripts/*.sh` in this repo already assumes bash; making
-					// execute_command match removes an entire class of spurious
-					// tool/verification failures instead of just working around
-					// each occurrence as it's spotted.
-					shell: BASH_PATH ?? true,
-					detached: true,
-					// Matches the vendored Execa-based terminal's own spawn options
-					// (zoo-code/src/integrations/terminal/ExecaTerminalProcess.ts):
-					// ignore stdin so a command that reads from it gets an immediate
-					// EOF instead of hanging on an open, never-written pipe (there is
-					// no interactive user here to type anything), and force a UTF-8
-					// locale so tools sensitive to it (Ruby, CocoaPods, etc. per the
-					// vendored comment) behave consistently regardless of the host's
-					// own locale configuration.
-					stdio: ["ignore", "pipe", "pipe"],
-					env: { ...process.env, LANG: "en_US.UTF-8", LC_ALL: "en_US.UTF-8" },
+			// 2026-08-27: verified live, repeatedly, across several otherwise-
+			// healthy long-running sessions (no memory pressure per
+			// /proc/pressure/memory, no zombie/fd accumulation found) — spawn()
+			// intermittently throws ENOENT for the shell itself ("spawn
+			// /bin/bash ENOENT") even though /bin/bash demonstrably exists and
+			// BASH_PATH resolved it correctly at module load. Root cause not
+			// pinned down (a transient Node/libuv spawn hiccup is the leading
+			// theory, not a real missing binary), but the failure mode is
+			// unambiguous: a completely benign command (`git log`, `pwd`) fails
+			// this way, derails the model with a spurious mistake, and burns
+			// through the session's mistake budget on pure infrastructure
+			// noise. One transparent retry (fresh spawn, same command/options)
+			// before surfacing anything to the model treats this as the
+			// transient it appears to be instead of a model-facing error.
+			const isBashSpawnEnoent = (error: unknown): boolean =>
+				error instanceof Error &&
+				"code" in error &&
+				(error as NodeJS.ErrnoException).code === "ENOENT" &&
+				("path" in error ? String((error as { path?: unknown }).path ?? "") : "").includes("bash")
+
+			// 2026-08-27: with the double-fire bug above fixed (each attempt now
+			// genuinely settles once), the same daemon-review sessions still hit
+			// this on some runs even across the full retry budget — the real
+			// transient window can outlast a ~1.5s total retry span. Widened to
+			// 8 attempts with a longer per-step backoff (500ms * attempt, so the
+			// full span is several seconds) rather than assume 4 attempts was
+			// already enough patience.
+			const MAX_SPAWN_ATTEMPTS = 8
+			const SPAWN_RETRY_DELAY_MS = 500
+			const spawnAttempt = (attempt: number) => {
+				// 2026-08-27: verified live — a failed spawn can fire BOTH the
+				// `error` event AND the `close` event for the SAME underlying
+				// failure (a known Node/libuv behavior: a child that never truly
+				// started still gets its close lifecycle completed). Without a
+				// guard, each independently retried, so one real failure produced
+				// TWO parallel retry chains, each of which could again double —
+				// confirmed live via temporary diagnostic logging: attempt counts
+				// literally doubled at each level (2, 4, 8 duplicate retries for
+				// the same command). That storm of concurrent spawns was plausibly
+				// making the underlying transient WORSE, not better. This attempt's
+				// own outcome (retry-or-finish) must be decided exactly once.
+				let attemptSettled = false
+				let child
+				try {
+					// `detached: true` puts the shell in its own process group
+					// (pgid = child.pid). That serves two purposes: (a) a timed-out
+					// command can keep running fully independent of the harness's
+					// own process group, and (b) session teardown can kill the whole
+					// group (`process.kill(-pid)`) so grandchildren are reaped too.
+					// The process-group kill is the only way to clean up the full
+					// tree of a `shell: true` spawn — killing the shell alone would
+					// orphan whatever it had launched.
+					child = spawn(command, {
+						cwd,
+						// `shell: true` alone defaults to `/bin/sh` (dash on Debian/
+						// Ubuntu, the common host here), which has no bash-only
+						// features — `${PIPESTATUS[0]}`, `[[ ]]`, arrays. A model that
+						// reaches for one of these (common; every mode's rules files
+						// are silent on which shell dialect execute_command actually
+						// runs) gets a shell PARSE error on the whole command line —
+						// including whatever real command preceded it (e.g.
+						// `npm test 2>&1 | tail -60; echo "EXIT=${PIPESTATUS[0]}"`)
+						// fails with exit 2 even though `npm test` itself may have
+						// passed cleanly. Confirmed live 2026-08-05: this produced a
+						// genuine FALSE "QA_VERDICT: FAIL" on issue #17's round — a
+						// manual re-run of the identical code passed cleanly. Every
+						// `scripts/*.sh` in this repo already assumes bash; making
+						// execute_command match removes an entire class of spurious
+						// tool/verification failures instead of just working around
+						// each occurrence as it's spotted.
+						shell: BASH_PATH ?? true,
+						detached: true,
+						// Matches the vendored Execa-based terminal's own spawn options
+						// (zoo-code/src/integrations/terminal/ExecaTerminalProcess.ts):
+						// ignore stdin so a command that reads from it gets an immediate
+						// EOF instead of hanging on an open, never-written pipe (there is
+						// no interactive user here to type anything), and force a UTF-8
+						// locale so tools sensitive to it (Ruby, CocoaPods, etc. per the
+						// vendored comment) behave consistently regardless of the host's
+						// own locale configuration.
+						stdio: ["ignore", "pipe", "pipe"],
+						env: { ...process.env, LANG: "en_US.UTF-8", LC_ALL: "en_US.UTF-8" },
+					})
+				} catch (error) {
+					if (attempt < MAX_SPAWN_ATTEMPTS && isBashSpawnEnoent(error)) {
+						// A live standalone repro of one of these exact failures spawned
+						// cleanly on the first try outside the long-running harness
+						// process — this is not an inherently broken command, so a
+						// single immediate retry was landing in the same narrow window
+						// as the original failure. Verified live 2026-08-27: failures
+						// can come in bursts of several consecutive calls, not just an
+						// isolated blip (plausibly a GC pause in this specific
+						// long-running process interacting with posix_spawn) — one
+						// retry wasn't always enough. Escalating delay across up to
+						// MAX_SPAWN_ATTEMPTS gives a longer transient window room to
+						// clear before this surfaces to the model as a real failure.
+						setTimeout(() => spawnAttempt(attempt + 1), SPAWN_RETRY_DELAY_MS * attempt)
+						return
+					}
+					finish(err(`execute_command: failed to spawn '${command}': ${errorMessage(error)}`))
+					return
+				}
+
+				const timer = setTimeout(() => {
+					// Do NOT kill the child — the vendored contract says a timed-out
+					// command keeps running in the background so the model can start
+					// dev servers / long migrations and get control back.
+					timedOut = true
+					backgroundCommands.add(child)
+					// Detach from the harness's event loop: the child and its pipes
+					// must not keep the process alive once a session is done. The
+					// child stays tracked in backgroundCommands so session teardown
+					// (ToolExecutor.dispose) can hard-kill it rather than orphan it.
+					child.unref()
+					unrefStream(child.stdout)
+					unrefStream(child.stderr)
+					const combined = [stdout, stderr].filter(Boolean).join("\n")
+					finish(
+						ok(
+							`[execute_command] timed out after ${timeoutS}s — process is still running in the background, output captured so far:\n${combined}`,
+						),
+					)
+				}, timeoutS * 1000)
+
+				child.stdout?.on("data", (chunk) => {
+					// After a timeout the model already got its partial output; keep
+					// draining the pipe (so the child never blocks on a full buffer)
+					// but stop accumulating output we can no longer deliver. Once a
+					// stream hits its cap, keep draining but discard — the final
+					// truncation/summarization at close stays the single cut point.
+					if (!timedOut && stdout.length < MAX_COMMAND_STREAM_CHARS) {
+						stdout += chunk.toString()
+					}
 				})
-			} catch (error) {
-				return finish(err(`execute_command: failed to spawn '${command}': ${errorMessage(error)}`))
-			}
-
-			const timer = setTimeout(() => {
-				// Do NOT kill the child — the vendored contract says a timed-out
-				// command keeps running in the background so the model can start
-				// dev servers / long migrations and get control back.
-				timedOut = true
-				backgroundCommands.add(child)
-				// Detach from the harness's event loop: the child and its pipes
-				// must not keep the process alive once a session is done. The
-				// child stays tracked in backgroundCommands so session teardown
-				// (ToolExecutor.dispose) can hard-kill it rather than orphan it.
-				child.unref()
-				unrefStream(child.stdout)
-				unrefStream(child.stderr)
-				const combined = [stdout, stderr].filter(Boolean).join("\n")
-				finish(
-					ok(
-						`[execute_command] timed out after ${timeoutS}s — process is still running in the background, output captured so far:\n${combined}`,
-					),
-				)
-			}, timeoutS * 1000)
-
-			child.stdout?.on("data", (chunk) => {
-				// After a timeout the model already got its partial output; keep
-				// draining the pipe (so the child never blocks on a full buffer)
-				// but stop accumulating output we can no longer deliver. Once a
-				// stream hits its cap, keep draining but discard — the final
-				// truncation/summarization at close stays the single cut point.
-				if (!timedOut && stdout.length < MAX_COMMAND_STREAM_CHARS) {
-					stdout += chunk.toString()
+				child.stderr?.on("data", (chunk) => {
+					if (!timedOut && stderr.length < MAX_COMMAND_STREAM_CHARS) {
+						stderr += chunk.toString()
+					}
+				})
+				child.on("error", (error) => {
+					if (attemptSettled) {
+						return
+					}
+					attemptSettled = true
+					clearTimeout(timer)
+					backgroundCommands.delete(child)
+					if (attempt < MAX_SPAWN_ATTEMPTS && isBashSpawnEnoent(error)) {
+						stdout = ""
+						stderr = ""
+						setTimeout(() => spawnAttempt(attempt + 1), SPAWN_RETRY_DELAY_MS * attempt)
+						return
+					}
+					finish(err(`execute_command: spawn error for '${command}': ${errorMessage(error)}`))
+				})
+				child.on("close", (code, signal) => {
+				if (attemptSettled) {
+					return
 				}
-			})
-			child.stderr?.on("data", (chunk) => {
-				if (!timedOut && stderr.length < MAX_COMMAND_STREAM_CHARS) {
-					stderr += chunk.toString()
-				}
-			})
-			child.on("error", (error) => {
-				clearTimeout(timer)
-				backgroundCommands.delete(child)
-				finish(err(`execute_command: spawn error for '${command}': ${errorMessage(error)}`))
-			})
-			child.on("close", (code, signal) => {
+				attemptSettled = true
 				clearTimeout(timer)
 				backgroundCommands.delete(child)
 				const combined = [stdout, stderr].filter(Boolean).join("\n")
 				// Log debug information
 				if (process.env.HEADLESSCODE_DEBUG) {
 					console.error(`[execute_command debug] Command: ${command}, Code: ${code}, Signal: ${signal}, stdout: ${stdout.slice(0, 200)}, stderr: ${stderr.slice(0, 200)}`)
+				}
+				// 2026-08-27: the SAME bash-spawn-ENOENT failure this file already
+				// retries on (see isBashSpawnEnoent / the `error` handler above)
+				// was found live to ALSO surface via a completely different path --
+				// no `error` event at all, just `close` firing with `code: -2`
+				// (Node's posix_spawn fast path reporting a negated errno directly:
+				// -2 is -ENOENT). A retry that only listens for the `error` event
+				// silently misses this shape entirely. `code` is negative here in
+				// no other real scenario (a genuine command exit code is always
+				// 0-255), so treat any negative code on the first attempt the same
+				// way: retry once before surfacing anything to the model.
+				if (attempt < MAX_SPAWN_ATTEMPTS && code !== null && code < 0) {
+					stdout = ""
+					stderr = ""
+						setTimeout(() => spawnAttempt(attempt + 1), SPAWN_RETRY_DELAY_MS * attempt)
+					return
 				}
 				if (signal === "SIGKILL") {
 					// Defensive path only: a timeout never sends SIGKILL anymore,
@@ -1736,6 +1824,9 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 					.then((content) => finish(ok(content)))
 					.catch(() => finish(ok(combined === "" ? `(command completed with no output)` : combined)))
 			})
+			}
+
+			spawnAttempt(1)
 		})
 	})()
 }

@@ -41,10 +41,11 @@ import { HeadlessSession } from "../engine/loop.js"
 import { Logger } from "../engine/logger.js"
 import { OllamaClient } from "../llm/ollama.js"
 import { OpenRouterClient } from "../llm/openrouter.js"
-import { resolvePerModeEnv } from "../cli.js"
+import { envBoolean, resolvePerModeEnv } from "../cli.js"
 import { appendBrowserActionTool, appendCodeIntelTools, loadCustomModes } from "../engine/prompt.js"
 import { createQaHeadlessExecutor } from "../tools/executor.js"
 import { getNativeTools } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/index.js"
+import { addCustomInstructions } from "../vendor/zoo-code/src/core/prompts/sections/custom-instructions.js"
 import type { ChatTool, LlmClient, SessionResult } from "../engine/types.js"
 import type { MemoryStore } from "../memory/types.js"
 import type { SessionBudget } from "../budget/budget.js"
@@ -90,16 +91,30 @@ export const GENERIC_QA_CHECKLIST = [
 	"",
 	"## How to perform QA",
 	"",
-	"1. Boot the application or relevant service using the repo's own start script / command",
-	"   (check `scripts/`, README, package.json). Run it as a background process if it would",
-	"   block; set a timeout on every wait loop and every command. Any scratch you need (probe",
-	"   scripts, temp output captures) goes in `<workspace>/.headlesscode/scratch/` — NEVER write",
-	"   to `/tmp` or any other path outside the workspace.",
-	"2. Run the project's test suite (`npm test` / `pytest` / whatever the repo uses) and capture",
-	"   the REAL output — counts of passed/failed tests are the primary evidence.",
-	"3. Exercise the changed behavior described in your task: run the relevant command, script,",
+	"0. FIRST, before anything else: run `git status --porcelain` and",
+	"   `git diff <upstream>...HEAD` to see exactly what changed in this worktree — including",
+	"   UNTRACKED files (this pipeline's workers frequently do not commit; an untracked new",
+	"   file IS the change under review, same as a committed diff would be). Verify against",
+	"   THAT real change, not against whatever existing file happens to be topically similar",
+	"   or easiest to find — reviewing/exercising the wrong file produces a verdict about code",
+	"   that was never actually touched.",
+	"1. This checklist is generic (`npm test`/`pytest`/\"boot the application\") because it is a",
+	"   fallback for when the repo defines no project-specific QA mode — it will not literally",
+	"   apply to every repo (e.g. a kernel/systems project has no `npm start` to boot). Discover",
+	"   the REAL build/verify/boot commands from the repo itself first — check the Makefile",
+	"   (`make help`, or just read it), README, CI config, and `scripts/` — and use those,",
+	"   not whatever this checklist's generic examples happen to name.",
+	"2. Boot the application or relevant service using the repo's own start script / command.",
+	"   Run it as a background process if it would block; set a timeout on every wait loop and",
+	"   every command. Any scratch you need (probe scripts, temp output captures) goes in",
+	"   `<workspace>/.headlesscode/scratch/` — NEVER write to `/tmp` or any other path outside",
+	"   the workspace.",
+	"3. Run the project's real test/verification suite and capture the REAL output — counts of",
+	"   passed/failed tests (or the equivalent pass/fail signal for this repo's toolchain) are",
+	"   the primary evidence.",
+	"4. Exercise the changed behavior identified in step 0: run the relevant command, script,",
 	"   or browser check (e.g. a Playwright runner script the repo already has) and capture output.",
-	"4. If anything fails, report it — do not modify source files to make it pass.",
+	"5. If anything fails, report it — do not modify source files to make it pass.",
 	"",
 	"## Definition of done",
 	"",
@@ -236,7 +251,20 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
 	// not, fall back to the generic checklist as a system prompt override.
 	const customModes = await loadCustomModes(workspaceRoot)
 	const modeExists = customModes.some((m) => m.slug === mode)
-	const systemPromptOverride = modeExists ? undefined : GENERIC_QA_CHECKLIST
+	// 2026-08-27 (mirrors reviewer.ts's runReview — same incident): when
+	// modeExists is true, systemPromptOverride stays undefined and loop.ts's
+	// own buildPrompt() path already splices in `.roo/rules/` via
+	// addCustomInstructions. But the GENERIC_QA_CHECKLIST fallback is used
+	// VERBATIM by loop.ts, bypassing buildPrompt (and addCustomInstructions
+	// with it) entirely — a QA session taking this fallback path would be
+	// just as blind to project-specific guidance (e.g. joeos's documented
+	// curlee compiler location) as the review session was found to be.
+	const workspaceCustomInstructions = modeExists ? "" : await addCustomInstructions("", "", workspaceRoot, mode, {})
+	const systemPromptOverride = modeExists
+		? undefined
+		: workspaceCustomInstructions
+			? `${GENERIC_QA_CHECKLIST}\n\n${workspaceCustomInstructions}`
+			: GENERIC_QA_CHECKLIST
 
 	// Mirror reviewer.ts's runReview gate (issue #142 follow-up): unlike
 	// reviewer.ts, this constructed an OpenRouterClient unconditionally, so
@@ -298,6 +326,18 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
 		// Issue #144 (mirrors reviewer.ts): local inference is free — a
 		// fabricated dollar figure in the QA log is noise at best.
 		trackCost: !useLocalBackend,
+		memory,
+		project,
+		logger,
+		// 2026-08-27 (mirrors reviewer.ts's runReview — same incident, same
+		// fix): without this, a local QA session's bare/fabricated text reply
+		// is accepted as an ordinary success, so a QA verdict parser has no
+		// way to tell "genuinely verified" from "session produced garbage" —
+		// exactly the gap that let a local reviewer session silently rubber-
+		// stamp a worker's false completion. Forcing explicit completion here
+		// makes a garbage QA reply a retried mistake / genuine session error
+		// instead of a silent false pass.
+		requireExplicitCompletion: useLocalBackend && !envBoolean("HEADLESSCODE_ALLOW_TEXT_ONLY_COMPLETION"),
 		// Same gap as cli.ts's LOCAL_LLM_TIMEOUT_MS (see its doc comment for
 		// the full story): this session construction never set llmTimeoutMs
 		// at all, so a QA session on the local daemon always used the
@@ -305,9 +345,6 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
 		// own deliberately-raised 600s upstream patience, so the harness
 		// gives up first on a genuinely slow (not hung) local call.
 		llmTimeoutMs: useLocalBackend ? 630_000 : undefined,
-		memory,
-		project,
-		logger,
 	})
 
 	const result: SessionResult = await session.run()

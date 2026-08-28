@@ -50,6 +50,7 @@
 import { randomUUID } from "node:crypto"
 import { Agent, fetch as undiciFetch } from "undici"
 import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } from "../engine/types.js"
+import { captureTranscript, isTranscriptCaptureEnabled } from "./transcript-capture.js"
 
 export const OLLAMA_URL_ENV = "HEADLESSCODE_OLLAMA_URL"
 export const DEFAULT_OLLAMA_URL = "http://localhost:11434"
@@ -152,6 +153,7 @@ export class OllamaClient implements LlmClient {
 		if (!model) {
 			throw new OllamaError("OllamaClient: no model resolved (pass request.model or defaultModel)")
 		}
+		const startedAt = Date.now()
 
 		const controller = new AbortController()
 		const onAbort = () => controller.abort()
@@ -218,7 +220,7 @@ export class OllamaClient implements LlmClient {
 				...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
 				...(data.message.thinking ? { reasoning: data.message.thinking } : {}),
 			}
-			return {
+			const response: LlmResponse = {
 				message,
 				usage: {
 					promptTokens: data.prompt_eval_count ?? 0,
@@ -226,7 +228,26 @@ export class OllamaClient implements LlmClient {
 					totalTokens: (data.prompt_eval_count ?? 0) + (data.eval_count ?? 0),
 				},
 			}
+			if (isTranscriptCaptureEnabled()) {
+				captureTranscript(
+					{ provider: "ollama", model },
+					{ messages: request.messages, tools: request.tools, temperature: request.temperature, response, durationMs: Date.now() - startedAt },
+				)
+			}
+			return response
 		} catch (err) {
+			if (isTranscriptCaptureEnabled()) {
+				captureTranscript(
+					{ provider: "ollama", model },
+					{
+						messages: request.messages,
+						tools: request.tools,
+						temperature: request.temperature,
+						error: err instanceof Error ? err.message : String(err),
+						durationMs: Date.now() - startedAt,
+					},
+				)
+			}
 			if (err instanceof OllamaError) {
 				throw err
 			}
