@@ -3,6 +3,7 @@
 #   e2e pass (scripts/e2e/run.sh) since the e2e suites exercise real
 #   spawn/worker flows against a local mock OpenRouter server.
 #
+# Runs on GitHub-hosted runners (public repo — no self-hosted worker).
 # No API key and no network access are needed — the mock server serves the
 # entire session, so this is safe to run on any push/PR, including from forks.
 name: ci
@@ -14,7 +15,7 @@ on:
 
 jobs:
   typecheck-test-e2e:
-    runs-on: [self-hosted, linux, x64, homeserver]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
