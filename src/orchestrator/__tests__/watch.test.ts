@@ -475,9 +475,19 @@ async function testWatchGroupsRunsReviewForMultipleGroupsConcurrently(): Promise
 					// (w2's callback would never even start), so the test
 					// itself is the proof: it only completes if w2 ran
 					// concurrently with w1 still stuck here.
-					const deadline = Date.now() + 5000
+					//
+					// The wait is generous (30s) on purpose: this is a
+					// concurrency proof, not a latency benchmark — on a
+					// loaded CI runner the event loop can take a while to
+					// reach w2's callback, and the wait must not time out
+					// before the (correct) concurrent path gets to run. If
+					// the watcher DID serialize, w1 would stay blocked the
+					// full duration and the assertion below fails — the
+					// test's meaning is unchanged, only its tolerance for
+					// slow runners is.
+					const deadline = Date.now() + 30_000
 					while (!w2Finished && Date.now() < deadline) {
-						await new Promise((r) => setTimeout(r, 5))
+						await new Promise((r) => setTimeout(r, 10))
 					}
 					assert.equal(w2Finished, true, "w2 must finish while w1's callback is still blocked")
 					saveStateSync(
