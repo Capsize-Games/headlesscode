@@ -1343,8 +1343,25 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	const maxModeSwitches = options.maxModeSwitches ?? envNumber("HEADLESSCODE_MAX_MODE_SWITCHES")
 
 	// Flag wins over the env fallback; undefined falls back to loop.ts's own
-	// default (DEFAULT_MAX_TOKENS = 32768).
-	const maxTokens = options.maxTokens ?? envNumber("HEADLESSCODE_MAX_TOKENS")
+	// default (DEFAULT_MAX_TOKENS = 32768) — sized for a CLOUD reasoning
+	// model against a 128K+ context window (4x the heaviest real generation
+	// observed there, ~8,000 tokens). Verified live 2026-08-28 (joeos issue
+	// #26): applied unchanged to the local backend, this let a single
+	// generation run to 29,664 output tokens — on a real llama-server
+	// context window of only 65,536 total, that alone pushed the very next
+	// request to 65,657 tokens and crashed the session outright ("exceeds
+	// the available context size"), un-recoverably, unlike an iteration-cap
+	// exhaustion (no auto-continuation exists for a hard crash). The
+	// existing condensation threshold guard cannot prevent this class of
+	// failure: it only checks the LAST completed request's size before
+	// building the next one, with no way to know in advance that the
+	// upcoming single response will be enormous. Same local-only-override
+	// pattern already used for condenseThresholdFraction below: a runaway
+	// generation's blast radius should be a small fraction of the REAL
+	// local context window, not up to half of it.
+	const LOCAL_MAX_TOKENS = 8192
+	const maxTokens =
+		options.maxTokens ?? envNumber("HEADLESSCODE_MAX_TOKENS") ?? (useLocalCodeBackend ? LOCAL_MAX_TOKENS : undefined)
 
 	// Permissions (command allow/deny + protected files): CLI flags > env vars
 	// > <workspaceRoot>/.headlesscode/permissions.json > built-in defaults.

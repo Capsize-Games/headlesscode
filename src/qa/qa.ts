@@ -345,6 +345,13 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
 		// own deliberately-raised 600s upstream patience, so the harness
 		// gives up first on a genuinely slow (not hung) local call.
 		llmTimeoutMs: useLocalBackend ? 630_000 : undefined,
+		// Same gap as cli.ts's LOCAL_MAX_TOKENS (see its doc comment for the
+		// full incident): unset here, a QA session on the local daemon falls
+		// back to loop.ts's DEFAULT_MAX_TOKENS (32768) — sized for a cloud
+		// reasoning model's 128K+ window, not this daemon's real
+		// 65,536-token total context, where one runaway generation can crash
+		// the whole session outright.
+		maxTokens: useLocalBackend ? 8192 : undefined,
 	})
 
 	const result: SessionResult = await session.run()
