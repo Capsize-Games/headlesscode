@@ -1695,6 +1695,7 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 						env: { ...process.env, LANG: "en_US.UTF-8", LC_ALL: "en_US.UTF-8" },
 					})
 				} catch (error) {
+					logSpawnDiagnostics(command, attempt, "sync-catch", error)
 					if (attempt < MAX_SPAWN_ATTEMPTS && isBashSpawnEnoent(error)) {
 						// A live standalone repro of one of these exact failures spawned
 						// cleanly on the first try outside the long-running harness
@@ -1757,6 +1758,7 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 					attemptSettled = true
 					clearTimeout(timer)
 					backgroundCommands.delete(child)
+					logSpawnDiagnostics(command, attempt, "error-event", error)
 					if (attempt < MAX_SPAWN_ATTEMPTS && isBashSpawnEnoent(error)) {
 						stdout = ""
 						stderr = ""
@@ -1787,11 +1789,17 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 				// no other real scenario (a genuine command exit code is always
 				// 0-255), so treat any negative code on the first attempt the same
 				// way: retry once before surfacing anything to the model.
-				if (attempt < MAX_SPAWN_ATTEMPTS && code !== null && code < 0) {
-					stdout = ""
-					stderr = ""
+				if (code !== null && code < 0) {
+					// The same bash-spawn-ENOENT failure surfaced via `close`
+					// (no `error` event). Snapshot system state at the moment of
+					// the failure, before any retry backoff begins (issue #1).
+					logSpawnDiagnostics(command, attempt, "close-negative-code", undefined, code)
+					if (attempt < MAX_SPAWN_ATTEMPTS) {
+						stdout = ""
+						stderr = ""
 						setTimeout(() => spawnAttempt(attempt + 1), SPAWN_RETRY_DELAY_MS * attempt)
-					return
+						return
+					}
 				}
 				if (signal === "SIGKILL") {
 					// Defensive path only: a timeout never sends SIGKILL anymore,
@@ -2328,6 +2336,147 @@ async function codebaseSearchHandler(args: Record<string, unknown>, ctx: ToolCon
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * Spawn-failure diagnostics snapshot (issue #1).
+ *
+ * The bash-spawn-ENOENT failure ("spawn /bin/bash ENOENT", and the
+ * close-event variant with a negative code) has one CONFIRMED contributing
+ * factor — system memory commit pressure: when /proc/meminfo's Committed_AS
+ * sits above ~95-98% of CommitLimit, spawn failure rates spike — plus several
+ * unconfirmed candidates (open-fd exhaustion, the ulimit -u process-count
+ * ceiling, zombie/defunct accumulation, RSS growth in the long-running
+ * harness process). Rather than infer the cause after the fact from separate
+ * /proc snapshots, capture a one-shot snapshot AT the moment of each spawn
+ * failure. Every read is best-effort: a missing /proc file (non-Linux host,
+ * restricted container) yields "n/a" for that field instead of throwing, and
+ * a failure here must never abort the spawn-retry logic this is diagnosing.
+ */
+export function collectSpawnDiagnostics(): Record<string, string> {
+	const diag: Record<string, string> = {}
+
+	// Memory commit pressure — the confirmed contributor. Values in kB.
+	let committedAsKb = "n/a"
+	let commitLimitKb = "n/a"
+	try {
+		const meminfo = fs.readFileSync("/proc/meminfo", "utf8")
+		for (const line of meminfo.split("\n")) {
+			if (line.startsWith("Committed_AS:")) {
+				committedAsKb = (line.split(/\s+/)[1] ?? "n/a").trim()
+			} else if (line.startsWith("CommitLimit:")) {
+				commitLimitKb = (line.split(/\s+/)[1] ?? "n/a").trim()
+			}
+		}
+	} catch {
+		// non-Linux or /proc not mounted — fields stay "n/a"
+	}
+	diag.committedAsKb = committedAsKb
+	diag.commitLimitKb = commitLimitKb
+	const committed = Number(committedAsKb)
+	const limit = Number(commitLimitKb)
+	diag.committedPct =
+		Number.isFinite(committed) && Number.isFinite(limit) && limit > 0
+			? `${((committed / limit) * 100).toFixed(1)}%`
+			: "n/a"
+
+	// Open fd count for THIS process — fd exhaustion near the soft limit is a
+	// candidate contributor (posix_spawn needs fds for the child's stdio).
+	try {
+		diag.openFds = String(fs.readdirSync("/proc/self/fd").length)
+	} catch {
+		diag.openFds = "n/a"
+	}
+
+	// System process count + zombie/defunct count + the ulimit -u ceiling.
+	// The zombie scan is bounded to the first 1024 pids so the diagnostic
+	// stays lightweight even on a box with tens of thousands of processes —
+	// this runs ON a spawn-failure path and must never make it slower.
+	let procs = 0
+	let zombies = 0
+	try {
+		const pids = fs.readdirSync("/proc").filter((e) => /^\d+$/.test(e))
+		procs = pids.length
+		for (const pid of pids.slice(0, 1024)) {
+			try {
+				const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8")
+				// comm can contain spaces and parens — the state char is the
+				// first field after the LAST ')', two chars later.
+				const closeParen = stat.lastIndexOf(")")
+				if (closeParen !== -1 && closeParen + 2 < stat.length && stat[closeParen + 2] === "Z") {
+					zombies++
+				}
+			} catch {
+				// pid exited between readdir and read — not a zombie
+			}
+		}
+	} catch {
+		// non-Linux — both stay at their defaults
+	}
+	diag.systemProcs = procs > 0 ? String(procs) : "n/a"
+	diag.zombies = procs > 0 ? String(zombies) : "n/a"
+	let maxProcs = "n/a"
+	try {
+		const limits = fs.readFileSync("/proc/self/limits", "utf8")
+		const m = limits.match(/Max processes\s+(\d+)/)
+		if (m) {
+			maxProcs = m[1]!
+		}
+	} catch {
+		// non-Linux
+	}
+	diag.maxProcs = maxProcs
+
+	// The long-running harness's own footprint — RSS climbs slowly over hours
+	// (the observed llama-server pattern); heap/uptime come from process.*.
+	let rssMb = "n/a"
+	try {
+		const status = fs.readFileSync("/proc/self/status", "utf8")
+		const m = status.match(/VmRSS:\s+(\d+) kB/)
+		if (m) {
+			rssMb = `${(Number(m[1]!) / 1024).toFixed(0)}`
+		}
+	} catch {
+		// non-Linux
+	}
+	diag.rssMb = rssMb
+	diag.heapMb = `${Math.round(process.memoryUsage().heapUsed / (1024 * 1024))}`
+	diag.uptimeS = `${Math.round(process.uptime())}`
+
+	return diag
+}
+
+/** Render a diagnostics snapshot as one grep-friendly `key=value` line. */
+export function formatSpawnDiagnostics(diag: Record<string, string>): string {
+	return [
+		`committed=${diag.committedPct} (${diag.committedAsKb}/${diag.commitLimitKb} kB)`,
+		`openFds=${diag.openFds}`,
+		`procs=${diag.systemProcs}`,
+		`zombies=${diag.zombies}`,
+		`maxProcs=${diag.maxProcs}`,
+		`rss=${diag.rssMb}MB`,
+		`heap=${diag.heapMb}MB`,
+		`uptime=${diag.uptimeS}s`,
+	].join(" ")
+}
+
+/**
+ * One-line, always-on stderr log emitted at the moment of a spawn failure.
+ * Unconditional (NOT HEADLESSCODE_DEBUG-gated): the whole point is that the
+ * NEXT real-session occurrence gets captured without anyone having to
+ * remember to enable a flag first.
+ */
+function logSpawnDiagnostics(command: string, attempt: number, shape: string, error?: unknown, code?: number | null): void {
+	const detail =
+		error !== undefined
+			? ` error=${errorMessage(error)}`
+			: code !== undefined
+				? ` code=${code}`
+				: ""
+	const shown = command.length > 200 ? `${command.slice(0, 200)}…` : command
+	process.stderr.write(
+		`[execute_command spawn-diagnostics] shape=${shape} attempt=${attempt}${detail} cmd=${JSON.stringify(shown)} ${formatSpawnDiagnostics(collectSpawnDiagnostics())}\n`,
+	)
 }
 
 /**

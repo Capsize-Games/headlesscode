@@ -18,7 +18,13 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 
-import { createHeadlessExecutor, BASH_PATH, MAX_RESULT_CHARS } from "../executor.js"
+import {
+	createHeadlessExecutor,
+	BASH_PATH,
+	MAX_RESULT_CHARS,
+	collectSpawnDiagnostics,
+	formatSpawnDiagnostics,
+} from "../executor.js"
 
 async function mkTmpWorkspace(prefix: string): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -366,6 +372,93 @@ async function testOversizedOutputIsBoundedAtCap(): Promise<void> {
 	}
 }
 
+// ─── (j) spawn-failure diagnostics snapshot (issue #1) ────────────────────────
+
+/**
+ * The issue-#1 diagnostic snapshot must be best-effort and always shaped the
+ * same way, so the next real-session occurrence produces a grep-friendly line
+ * that directly confirms or rules out the known contributing factors
+ * (memory commit pressure, fd exhaustion, process-count ceiling, zombies).
+ */
+async function testSpawnDiagnosticsSnapshotShape(): Promise<void> {
+	const diag = collectSpawnDiagnostics()
+
+	// Every field must be present; non-Linux hosts get "n/a" rather than a
+	// missing key or a throw (the collector must never crash the spawn path
+	// it exists to diagnose).
+	for (const key of [
+		"committedAsKb",
+		"commitLimitKb",
+		"committedPct",
+		"openFds",
+		"systemProcs",
+		"zombies",
+		"maxProcs",
+		"rssMb",
+		"heapMb",
+		"uptimeS",
+	]) {
+		assert.ok(key in diag, `collectSpawnDiagnostics must include '${key}'`)
+	}
+
+	// On this Linux host /proc is present — the values must be real numbers,
+	// and commit pressure must parse as a percentage. (On a non-Linux host
+	// these asserts would be relaxed; CI here runs Linux.)
+	const committedPct = diag.committedPct
+	assert.match(committedPct, /^\d+(\.\d+)?%$/, `committedPct must be a percentage, got: ${committedPct}`)
+	assert.match(diag.openFds, /^\d+$/, `openFds must be a count, got: ${diag.openFds}`)
+	assert.match(diag.systemProcs, /^\d+$/, `systemProcs must be a count, got: ${diag.systemProcs}`)
+	assert.match(diag.zombies, /^\d+$/, `zombies must be a count, got: ${diag.zombies}`)
+	assert.match(diag.heapMb, /^\d+$/, `heapMb must be a number, got: ${diag.heapMb}`)
+	assert.match(diag.uptimeS, /^\d+$/, `uptimeS must be a number, got: ${diag.uptimeS}`)
+
+	// The formatted line is one grep-friendly key=value string.
+	const line = formatSpawnDiagnostics(diag)
+	for (const token of [
+		"committed=",
+		"openFds=",
+		"procs=",
+		"zombies=",
+		"maxProcs=",
+		"rss=",
+		"heap=",
+		"uptime=",
+	]) {
+		assert.ok(line.includes(token), `formatted diagnostics line must include ${token}: ${line}`)
+	}
+}
+
+/**
+ * A NORMAL command completion must NOT emit the spawn-diagnostics line: the
+ * close-path log is guarded to fire only on the negative-code failure shape,
+ * so healthy sessions stay silent instead of logging on every single
+ * execute_command call (which would make the diagnostics useless as a
+ * failure signal).
+ */
+async function testNoDiagnosticsOnNormalClose(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-ec-diag-")
+	try {
+		const executor = createHeadlessExecutor(ws)
+		const writes: string[] = []
+		const originalWrite = process.stderr.write.bind(process.stderr)
+		process.stderr.write = ((chunk: unknown, ...rest: unknown[]) => {
+			writes.push(String(chunk))
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			return (originalWrite as any)(chunk, ...rest)
+		}) as typeof process.stderr.write
+		try {
+			const result = await executor.execute("execute_command", { command: "echo diag-silent", timeout: 10 })
+			assert.equal(result.isError, false, "a normal echo must succeed")
+		} finally {
+			process.stderr.write = originalWrite
+		}
+		const diagLines = writes.filter((w) => w.includes("spawn-diagnostics"))
+		assert.equal(diagLines.length, 0, `normal close must not emit spawn-diagnostics, got: ${diagLines.join("")}`)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -379,6 +472,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["execute_command: bash-only syntax (${PIPESTATUS[0]}) does not falsely fail the command", testBashOnlySyntaxDoesNotFalselyFailTheCommand],
 	["execute_command: BASH_PATH resolves to a real binary (CI safety net for issue #35)", testBashPathResolvesToARealBinary],
 	["execute_command: oversized stdout bounded at the cap, pipe drains, truncation trailer present", testOversizedOutputIsBoundedAtCap],
+	["execute_command: spawn-failure diagnostics snapshot is complete and well-formed (issue #1)", testSpawnDiagnosticsSnapshotShape],
+	["execute_command: normal command close does NOT emit the spawn-diagnostics line", testNoDiagnosticsOnNormalClose],
 ]
 
 async function main(): Promise<void> {
