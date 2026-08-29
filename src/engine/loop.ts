@@ -3681,6 +3681,41 @@ export class HeadlessSession {
 					this.config.verifyBeforeCompletion &&
 					(lastExecuteCommandFailed || lastWriteToolFailed || unsupportedMeasurementClaim)
 				) {
+					// Verified live 2026-08-29 (joeos issue #26, rounds 17 + 20):
+					// the `continue` at the end of this block skips the
+					// identical-call streak update below (it's part of the
+					// normal per-iteration `calls` processing this branch
+					// exits before reaching) — so lastCallBatchSignature/
+					// lastCallBatchNames/identicalCallStreak stay FROZEN at
+					// whatever they were when this deferral first started
+					// firing (typically two identical execute_command
+					// failures in a row, which is often exactly what triggers
+					// the deferral in the first place). Every subsequent
+					// deferred-completion turn then re-enters the SAME request
+					// -prep cooldown-refresh loop above with identicalCall-
+					// GuardActive still true and lastCallBatchNames still
+					// ["execute_command"], re-arming that tool's exclusion to
+					// the full cooldown value EVERY turn before it ever ticks
+					// down — the model has no legal move (attempt_completion
+					// deferred, execute_command excluded) and just keeps
+					// re-calling attempt_completion, which is exactly the
+					// input that keeps re-triggering this same `continue`
+					// path. Confirmed live: 30+ iterations spinning between
+					// "attempt_completion deferred" and an unchanging
+					// "excludedToolCooldowns: {execute_command: 4}" until the
+					// iteration cap was hit. Same failure class, same fix
+					// pattern as the text-only-reply reset a few hundred lines
+					// below (lastCallBatchSignature/lastCallBatchNames/
+					// identicalCallStreak = null/[]/0) — that reset just never
+					// covered this exit path. A deferred completion is
+					// definitionally not a repeat of whatever tool-call batch
+					// came before it, so the guard has no reason to stay
+					// active into the next turn.
+					lastCallBatchSignature = null
+					lastCallBatchNames = []
+					identicalCallStreak = 0
+					identicalCallNudgeInjected = false
+					excludedToolCooldowns.delete("execute_command")
 					const reason = unsupportedMeasurementClaim
 						? "unsupported measurement claim"
 						: lastExecuteCommandFailed
