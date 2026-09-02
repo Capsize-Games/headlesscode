@@ -49,7 +49,6 @@ export const CORE_TOOL_NAMES = new Set([
 	"attempt_completion",
 	"execute_command",
 	"list_files",
-	"new_task",
 	"read_file",
 	// search_replace deliberately excluded — same reasoning as apply_diff
 	// above it in git history: search_replace requires an EXACT literal
@@ -74,9 +73,23 @@ export const CORE_TOOL_NAMES = new Set([
 	// call it correctly but only as narrated text, never having pulled its
 	// real schema in via request_tool first.
 	"set_indentation",
-	"switch_mode",
-	"update_todo_list",
 	"write_to_file",
+	// 2026-09-02: new_task, switch_mode, and update_todo_list demoted from
+	// core to lazy — real usage data across 62 logged local-backend eval
+	// sessions (grep "tool result: <name>" across eval_verifier_runs/*/
+	// session.log) showed ZERO calls to any of these three, ever, while
+	// still paying ~3,700 combined chars of their schemas on every single
+	// turn of every session. Unlike set_indentation (which has a specific
+	// documented live failure showing the model won't request_tool it when
+	// it's actually needed), there is no equivalent evidence for these
+	// three — no session in that corpus needed delegation (new_task), a
+	// mode switch (switch_mode), or a multi-step plan register
+	// (update_todo_list) at all, since these are single-file scratch
+	// eval tasks. If a session genuinely needs one, it's still one
+	// request_tool call away. Revisit if live data ever shows a session
+	// that needed one of these three but never called request_tool for it
+	// (the set_indentation failure shape) — that would argue for
+	// re-promoting that specific tool back to core.
 ])
 
 export const LIST_TOOLS_NAME = "list_tools"
@@ -111,17 +124,25 @@ export function splitCoreAndLazyTools(allTools: ChatTool[]): SplitTools {
 }
 
 export function buildListToolsTool(): ChatTool {
+	// 2026-09-02: built from CORE_TOOL_NAMES itself rather than a hand-
+	// written duplicate list — the previous static string had already
+	// drifted (it named apply_diff/search_replace as "always available",
+	// which was never true; both are deliberately lazy, see
+	// CORE_TOOL_NAMES's own comments) and would have drifted again the
+	// moment core membership changed without this description changing
+	// with it. request_tool/list_tools themselves are the delivery
+	// mechanism, not part of the "core" the model chooses among, so they're
+	// deliberately left out of this parenthetical (the tool's own name
+	// already makes clear it exists).
+	const coreList = [...CORE_TOOL_NAMES].join(", ")
 	return {
 		type: "function",
 		function: {
 			name: LIST_TOOLS_NAME,
 			description:
-				"List additional tools available in this session beyond the core set " +
-				"(read_file, write_to_file, apply_diff, search_replace, edit_file, " +
-				"execute_command, list_files, attempt_completion, ask_followup_question, " +
-				"switch_mode, new_task, update_todo_list — always available, not listed " +
-				"here). Call request_tool with a name from this list to make that tool " +
-				"callable on your NEXT turn.",
+				`List additional tools available in this session beyond the core set (${coreList} — ` +
+				"always available, not listed here). Call request_tool with a name from this list " +
+				"to make that tool callable on your NEXT turn.",
 			parameters: { type: "object", properties: {}, required: [] },
 		},
 	}
