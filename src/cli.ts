@@ -166,6 +166,16 @@ interface CliOptions {
 	autoApproveModeSwitch: boolean
 	/** switch_mode: hard cap on total in-place mode switches per session (default 5). */
 	maxModeSwitches?: number
+	/**
+	 * Evidence-gated completion (fabrication fix, 2026-09-01): when set,
+	 * attempt_completion is refused unless every machine-checkable claim in
+	 * its result is independently verified against ground truth (file
+	 * existence, real command re-runs, serial logs, git history — see
+	 * src/engine/claims.ts). Default ON for the local code backend; this
+	 * flag forces it on for cloud sessions too. Also settable via
+	 * HEADLESSCODE_REQUIRE_EVIDENCE.
+	 */
+	requireEvidence: boolean
 }
 
 const USAGE = `headlesscode — headless coding-agent harness (Phase 1 engine)
@@ -389,6 +399,15 @@ Options:
                                granting itself a broader mode's edit
                                permissions. Also settable via
                                $HEADLESSCODE_AUTO_APPROVE_MODE_SWITCH
+  --require-evidence          Evidence-gated completion (fabrication fix):
+                               refuse attempt_completion unless every
+                               machine-checkable claim in its result is
+                               independently verified against ground truth
+                               (file existence, real command re-runs, serial
+                               logs, git history). Default ON for the local
+                               code backend; this forces it on for cloud
+                               sessions too. Also settable via
+                               $HEADLESSCODE_REQUIRE_EVIDENCE
   --max-mode-switches <n>    switch_mode: hard cap on total in-place mode
                                switches per session (default: 5 — see
                                DEFAULT_MAX_MODE_SWITCHES in src/engine/loop.ts).
@@ -415,6 +434,7 @@ Environment:
   HEADLESSCODE_STREAM          Opt-in SSE streaming ("1"/"true"/"yes"/"on")
   HEADLESSCODE_LOCAL_EXPLORE   Opt-in local exploration phase ("1"/"true")
   HEADLESSCODE_AUTO_APPROVE_MODE_SWITCH  Auto-approve switch_mode calls ("1"/"true"/"yes"/"on")
+  HEADLESSCODE_REQUIRE_EVIDENCE  Force evidence-gated completion ("1"/"true"/"yes"/"on")
   HEADLESSCODE_MAX_MODE_SWITCHES      switch_mode: hard cap on total in-place
                                mode switches per session (positive int)
   HEADLESSCODE_LOCAL_EXPLORE_MODEL    Local model (default qwen3.5:9b)
@@ -441,6 +461,7 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 		stream: false,
 		localExplore: false,
 		autoApproveModeSwitch: false,
+		requireEvidence: false,
 	}
 
 	for (let i = 0; i < argv.length; i++) {
@@ -658,6 +679,9 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 				break
 			case "--auto-approve-mode-switch":
 				options.autoApproveModeSwitch = true
+				break
+			case "--require-evidence":
+				options.requireEvidence = true
 				break
 			case "--checkpoint-dir": {
 				const value = next()
@@ -1155,6 +1179,26 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// loop.ts's HeadlessSessionConfig.verifyBeforeCompletion doc comment.
 	const verifyBeforeCompletion =
 		useLocalCodeBackend && !envBoolean("HEADLESSCODE_ALLOW_UNVERIFIED_COMPLETION")
+	// Evidence-gated completion (fabrication fix, 2026-09-01): when on,
+	// attempt_completion is refused unless every machine-checkable claim in
+	// its result (a file exists, a specific command passed, serial markers
+	// appear, a PR exists) is independently verified against ground truth —
+	// the real filesystem, a real re-run of the exact command, the newest
+	// serial log, and real git history (see src/engine/claims.ts). This is
+	// the structural backstop for the FINAL_REPORT's central finding (§4): a
+	// session claimed "all three hard gates pass" with a fabricated serial
+	// excerpt when the driver was never merged and the claimed target didn't
+	// exist. Default ON for the local code backend (the finetune harness and
+	// real acceptance gates run local) unless explicitly disabled via
+	// HEADLESSCODE_ALLOW_UNVERIFIED_COMPLETION (same opt-in-override pattern
+	// as verifyBeforeCompletion); explicitly forceable via --require-evidence
+	// OR HEADLESSCODE_REQUIRE_EVIDENCE for cloud sessions too (the pure
+	// resolver also honors the env var — see resolveEvidenceRequiredCompletion).
+	const evidenceRequiredCompletion = resolveEvidenceRequiredCompletion(
+		options.requireEvidence,
+		process.env,
+		useLocalCodeBackend,
+	)
 	// A local (Qwen3.5-9B) session was observed live 2026-08-27 doing the
 	// actual work correctly (a real, correct edit_file call) and then dying
 	// anyway: its first attempt_completion was deferred (a prior
@@ -1359,7 +1403,16 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// pattern already used for condenseThresholdFraction below: a runaway
 	// generation's blast radius should be a small fraction of the REAL
 	// local context window, not up to half of it.
-	const LOCAL_MAX_TOKENS = 8192
+	// 2026-09-02: 8192 was still too generous in practice -- verified live,
+	// repeatedly (joeos_finetune_data's eval_verifier.py ground-truth runs,
+	// same day): a stuck local-model turn reliably ran to the FULL 8192-token
+	// cap every time, taking 8-9 real minutes at this model's ~15 tok/s and
+	// consuming the entire session's remaining time budget without ever
+	// producing a tool call. Real, productive turns in the same logs (a tool
+	// call + a few sentences of reasoning) topped out around 1000-2000
+	// output tokens. Lowered so a stuck turn gets cut off in well under a
+	// minute instead of silently eating the whole budget.
+	const LOCAL_MAX_TOKENS = 2048
 	const maxTokens =
 		options.maxTokens ?? envNumber("HEADLESSCODE_MAX_TOKENS") ?? (useLocalCodeBackend ? LOCAL_MAX_TOKENS : undefined)
 
@@ -1406,6 +1459,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		requireExplicitCompletion,
 		patchLocalToolSchemas,
 		verifyBeforeCompletion,
+		evidenceRequiredCompletion,
 		trackCost,
 		requireArtifactBeforeCompletion,
 		requireArtifactPathPattern: options.requireArtifactPath,
@@ -1496,13 +1550,44 @@ function envNumber(name: string): number | undefined {
 	return Number.isFinite(n) && n > 0 ? n : undefined
 }
 
-/** Parse an env boolean opt-in: "1"/"true"/"yes"/"on" → true; anything else (incl. unset) → false. */
-export function envBoolean(name: string): boolean {
-	const raw = process.env[name]
+/** Pure env-boolean parse: "1"/"true"/"yes"/"on" → true; anything else (incl. unset) → false. */
+export function envBooleanValue(name: string, env: NodeJS.ProcessEnv): boolean {
+	const raw = env[name]
 	if (raw === undefined || raw === "") {
 		return false
 	}
 	return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase())
+}
+
+/** Parse an env boolean opt-in from process.env: "1"/"true"/"yes"/"on" → true; anything else (incl. unset) → false. */
+export function envBoolean(name: string): boolean {
+	return envBooleanValue(name, process.env)
+}
+
+/**
+ * Resolve whether evidence-gated completion is ON for a session. Pure
+ * (flag + env + local-backend in, boolean out) so the full wiring is
+ * testable without spinning up a session.
+ *
+ * Order of precedence:
+ *   1. the explicit --require-evidence flag always wins;
+ *   2. HEADLESSCODE_REQUIRE_EVIDENCE env forces it on (cloud sessions
+ *      included — this is the finetune-harness/acceptance-gate hook, plan
+ *      A5: "force evidence-gated completion without code changes");
+ *   3. the local code backend defaults it ON unless explicitly disabled
+ *      via HEADLESSCODE_ALLOW_UNVERIFIED_COMPLETION (same opt-in-override
+ *      pattern as verifyBeforeCompletion).
+ */
+export function resolveEvidenceRequiredCompletion(
+	requireEvidenceFlag: boolean,
+	env: NodeJS.ProcessEnv,
+	useLocalCodeBackend: boolean,
+): boolean {
+	return (
+		requireEvidenceFlag ||
+		envBooleanValue("HEADLESSCODE_REQUIRE_EVIDENCE", env) ||
+		(useLocalCodeBackend && !envBooleanValue("HEADLESSCODE_ALLOW_UNVERIFIED_COMPLETION", env))
+	)
 }
 
 /**

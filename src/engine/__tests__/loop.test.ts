@@ -205,6 +205,7 @@ async function makeSession(options: {
 	sessionId?: string
 	requireExplicitCompletion?: boolean
 	verifyBeforeCompletion?: boolean
+	evidenceRequiredCompletion?: boolean
 	requireArtifactBeforeCompletion?: boolean
 	requireArtifactPathPattern?: string
 	requireArtifactMinCitations?: number
@@ -228,6 +229,7 @@ async function makeSession(options: {
 		maxTokens: options.maxTokens,
 		requireExplicitCompletion: options.requireExplicitCompletion,
 		verifyBeforeCompletion: options.verifyBeforeCompletion,
+		evidenceRequiredCompletion: options.evidenceRequiredCompletion,
 		requireArtifactBeforeCompletion: options.requireArtifactBeforeCompletion,
 		requireArtifactPathPattern: options.requireArtifactPathPattern,
 		requireArtifactMinCitations: options.requireArtifactMinCitations,
@@ -3472,6 +3474,246 @@ async function testVerifyBeforeCompletionRefusesUnsupportedMeasurementClaim(): P
 	}
 }
 
+// ─── Evidence-gated completion (fabrication fix, 2026-09-01) ─────────────────
+//
+// The FINAL_REPORT's central finding (§4): a real session reported "all three
+// hard gates pass" with a fabricated serial-log excerpt ("E1000: 1 / E1000: 2")
+// when the driver was never merged and the claimed Makefile target didn't
+// exist. These tests reproduce that exact shape at the loop level with
+// evidenceRequiredCompletion on:
+//   (a) the claimed target doesn't exist → completion DEFERRED, model must
+//       re-verify for real;
+//   (b) the target exists but the re-run fails → completion DEFERRED, model
+//       must fix and re-run;
+//   (c) the target exists and the re-run passes → completion ACCEPTED, and
+//       SessionResult.verification records the claim counts.
+
+// (a) Fabricated gate claim, target does not exist → deferred.
+async function testEvidenceRequiredRefusesNonexistentGateTarget(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-evid1-"))
+	try {
+		const client = new FakeLlmClient([
+			() =>
+				toolCall("attempt_completion", {
+					result:
+						"All three hard gates pass: make check passed cleanly, make qemu-e1000-smoke passed, and the serial log shows E1000: 1 then E1000: 2.",
+				}),
+			() => toolCall("execute_command", { command: "echo real-evidence" }),
+			() => toolCall("attempt_completion", { result: "Done for real after verifying." }),
+		])
+		const session = await makeSession({
+			task: "add the e1000 driver and confirm the gate",
+			client,
+			workspaceRoot: ws,
+			evidenceRequiredCompletion: true,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "Done for real after verifying.")
+		assert.equal(client.requests.length, 3, "the fabricated completion must not end the session early")
+		const nudge = session.state.messages.find(
+			(m) => m.role === "tool" && (m.content ?? "").includes("was NOT accepted"),
+		)
+		assert.ok(nudge, "expected a deferral nudge")
+		assert.match(
+			nudge?.content ?? "",
+			/None of these could be independently confirmed/,
+			"the nudge must name that the claims were not verified",
+		)
+		// The specific unverified claims must be named.
+		assert.match(nudge?.content ?? "", /make qemu-e1000-smoke/, "the nudge names the fabricated target")
+		assert.match(nudge?.content ?? "", /E1000: 1, E1000: 2/, "the nudge names the fabricated serial markers")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// (b) Claimed target exists but the real re-run fails → deferred.
+async function testEvidenceRequiredRefusesFailingGateTarget(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-evid2-"))
+	try {
+		const client = new FakeLlmClient([
+			() => toolCall("attempt_completion", { result: "make qemu-e1000-smoke passed." }),
+			() => toolCall("execute_command", { command: "echo still-need-real-verify" }),
+			() => toolCall("attempt_completion", { result: "Done honestly." }),
+		])
+		const session = await makeSession({
+			task: "confirm the gate",
+			client,
+			workspaceRoot: ws,
+			evidenceRequiredCompletion: true,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "Done honestly.")
+		assert.equal(client.requests.length, 3)
+		const nudge = session.state.messages.find(
+			(m) => m.role === "tool" && (m.content ?? "").includes("was NOT accepted"),
+		)
+		assert.ok(nudge, "expected a deferral nudge")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// (d) Finding 4 (review round 1): a text-only reply that CLAIMS a gate passed
+// without any real run must NOT be accepted as success when
+// evidenceRequiredCompletion is on — cloud sessions default
+// requireExplicitCompletion OFF, so the old code accepted "all three hard
+// gates pass…" prose with zero evidence. The text must run the SAME
+// extract/verify gate as attempt_completion and defer on any unverifiable
+// claim.
+async function testEvidenceRequiredRefusesTextOnlyFabricatedGateClaim(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-evid4-"))
+	try {
+		const client = new FakeLlmClient([
+			// Text-only reply claiming a gate passed with no real run behind it.
+			() => textReply("All three hard gates pass: make check passed cleanly, make qemu-e1000-smoke passed."),
+			() => toolCall("execute_command", { command: "echo real-evidence" }),
+			() => toolCall("attempt_completion", { result: "Done for real after verifying." }),
+		])
+		const session = await makeSession({
+			task: "confirm the gates pass",
+			client,
+			workspaceRoot: ws,
+			evidenceRequiredCompletion: true,
+			// requireExplicitCompletion OFF models the cloud session shape —
+			// the exact bypass the finding described.
+			requireExplicitCompletion: false,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "Done for real after verifying.")
+		assert.equal(client.requests.length, 3, "the fabricated text-only claim must not end the session early")
+		const nudge = session.state.messages.find(
+			(m) => m.role === "user" && (m.content ?? "").includes("text-only reply was NOT accepted"),
+		)
+		assert.ok(nudge, "expected a text-only deferral nudge")
+		assert.match(nudge?.content ?? "", /make qemu-e1000-smoke/, "the nudge names the fabricated target")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// (e) Finding 4 + non-blocking #2: a text-only reply whose claims ALL verify
+// (real passing gate re-run) IS accepted — and the unverified_claim event
+// lands on the feed (with truncation applied) when a claim is deferred.
+async function testEvidenceRequiredAcceptsTextOnlyWithVerifiedClaims(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-evid5-"))
+	try {
+		await fs.writeFile(
+			path.join(ws, "Makefile"),
+			"check:\n\t@echo 'ALL CHECKS OK'\n",
+			"utf-8",
+		)
+		const client = new FakeLlmClient([
+			// Text-only reply whose command claim re-runs AND passes, with the
+			// quoted marker present in the real output.
+			() => textReply("make check passed with 'ALL CHECKS OK'."),
+		])
+		const session = await makeSession({
+			task: "confirm the gate",
+			client,
+			workspaceRoot: ws,
+			evidenceRequiredCompletion: true,
+			requireExplicitCompletion: false,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(client.requests.length, 1, "a text-only reply whose claims verify needs no retry")
+		assert.ok(result.verification, "the SessionResult must carry the verification field")
+		assert.equal(result.verification?.claimsChecked, 1)
+		assert.equal(result.verification?.claimsPassed, 1)
+		assert.equal(result.verification?.claimsUnverified, 0)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// (f) Non-blocking #2: the unverified_claim event actually lands on the feed
+// with the verification counts + the first unverified claim's detail.
+async function testUnverifiedClaimEventLandsOnFeed(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-evid6-"))
+	try {
+		const client = new FakeLlmClient([
+			() => toolCall("attempt_completion", { result: "make qemu-e1000-smoke passed." }),
+			() => toolCall("attempt_completion", { result: "Done for real after verifying." }),
+		])
+		const session = await makeSession({
+			task: "confirm the gate",
+			client,
+			workspaceRoot: ws,
+			evidenceRequiredCompletion: true,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+
+		// The session id is private — recover it from the events dir (one file).
+		const evDir = path.join(ws, ".headlesscode", "events")
+		const files = await fs.readdir(evDir)
+		assert.equal(files.length, 1, `expected one events file, got: ${files.join(", ")}`)
+		const sessionId = files[0].replace(/\.jsonl$/, "")
+		const records = (
+			await fs.readFile(path.join(evDir, files[0]), "utf-8")
+		)
+			.split("\n")
+			.filter((l) => l.trim() !== "")
+			.map((l) => JSON.parse(l) as Record<string, unknown>)
+
+		const unverified = records.filter((r) => r.type === "unverified_claim")
+		assert.equal(unverified.length, 1, "exactly one unverified_claim event must land on the feed")
+		const ev = unverified[0]
+		assert.equal(ev.claimsChecked, 1)
+		assert.equal(ev.claimsPassed, 0)
+		assert.equal(ev.claimsUnverified, 1)
+		assert.ok(typeof ev.detail === "string" && (ev.detail as string).length > 0, "detail names the unverified claim")
+		assert.match(String(ev.detail), /qemu-e1000-smoke/, "the detail names the fabricated target")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// (c) Claimed target exists AND the real re-run passes → accepted, with the
+// verification field recording claim counts.
+async function testEvidenceRequiredAcceptsRealPassingGate(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-evid3-"))
+	try {
+		// A REAL `make check` target that actually passes — the evidence gate
+		// re-runs the exact claimed command, so the claim is only accepted
+		// when the ground truth genuinely confirms it.
+		await fs.writeFile(
+			path.join(ws, "Makefile"),
+			"check:\n\t@echo 'all checks passed'\n",
+			"utf-8",
+		)
+		const client = new FakeLlmClient([
+			() => toolCall("attempt_completion", { result: "make check passed cleanly." }),
+		])
+		const session = await makeSession({
+			task: "confirm the gate",
+			client,
+			workspaceRoot: ws,
+			evidenceRequiredCompletion: true,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "make check passed cleanly.")
+		assert.equal(client.requests.length, 1, "a real passing gate needs no nudge")
+		assert.ok(result.verification, "the SessionResult must carry the verification field")
+		assert.equal(result.verification?.claimsChecked, 1)
+		assert.equal(result.verification?.claimsPassed, 1)
+		assert.equal(result.verification?.claimsUnverified, 0)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 import { resolvePerModeEnv } from "../../cli.js";
@@ -3575,6 +3817,30 @@ const tests: Array<[string, () => Promise<void>]> = [
 	[
 		"verifyBeforeCompletion: refuses an unsupported measurement/benchmark claim (#136)",
 		testVerifyBeforeCompletionRefusesUnsupportedMeasurementClaim,
+	],
+	[
+		"evidence-gated completion: refuses a fabricated gate claim when the claimed target doesn't exist",
+		testEvidenceRequiredRefusesNonexistentGateTarget,
+	],
+	[
+		"evidence-gated completion: refuses a gate claim whose real re-run fails",
+		testEvidenceRequiredRefusesFailingGateTarget,
+	],
+	[
+		"evidence-gated completion: accepts a real passing gate and records the verification field",
+		testEvidenceRequiredAcceptsRealPassingGate,
+	],
+	[
+		"evidence-gated completion: refuses a text-only fabricated gate claim (Finding 4)",
+		testEvidenceRequiredRefusesTextOnlyFabricatedGateClaim,
+	],
+	[
+		"evidence-gated completion: accepts a text-only reply whose claims verify",
+		testEvidenceRequiredAcceptsTextOnlyWithVerifiedClaims,
+	],
+	[
+		"evidence-gated completion: unverified_claim event lands on the feed",
+		testUnverifiedClaimEventLandsOnFeed,
 	],
 	[
 		"requireExplicitCompletion: an embedded call naming an unknown tool is never executed",

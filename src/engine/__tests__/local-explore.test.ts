@@ -38,7 +38,7 @@ import * as path from "node:path"
 
 import { HeadlessSession } from "../loop.js"
 import { createLocalExploreExecutor } from "../../tools/executor.js"
-import { parseArgs } from "../../cli.js"
+import { parseArgs, resolveEvidenceRequiredCompletion } from "../../cli.js"
 import {
 	buildLocalExploreHandoffMessage,
 	buildLocalExploreTools,
@@ -431,6 +431,39 @@ test("--local-explore CLI flag parses, absent is off", () => {
 	assert.equal(parseArgs(["--local-explore", "--task", "x"]).options.localExplore, true)
 	assert.equal(parseArgs(["--task", "x"]).options.localExplore, false)
 	assert.equal(parseArgs([]).options.localExplore, false)
+})
+
+// 14b. Evidence-gated completion flag (fabrication fix, 2026-09-01):
+// --require-evidence turns the gate on; absent → off.
+test("--require-evidence CLI flag parses, absent is off", () => {
+	assert.equal(parseArgs(["--require-evidence", "--task", "x"]).options.requireEvidence, true)
+	assert.equal(parseArgs(["--task", "x"]).options.requireEvidence, false)
+	assert.equal(parseArgs([]).options.requireEvidence, false)
+})
+
+// 14c. HEADLESSCODE_REQUIRE_EVIDENCE env var forces evidence-gated completion
+// on even for a pure cloud session (plan A5: force the gate without code
+// changes). The pure resolver honors flag, env var, and the local-backend
+// default in that precedence order.
+test("HEADLESSCODE_REQUIRE_EVIDENCE env forces the evidence gate on (review fix 1)", () => {
+	const local = true
+	const cloud = false
+	// Env var alone turns it on for a CLOUD session (the exact case the old
+	// expression missed — options.requireEvidence was the only cloud lever).
+	assert.equal(resolveEvidenceRequiredCompletion(false, { HEADLESSCODE_REQUIRE_EVIDENCE: "1" }, cloud), true)
+	assert.equal(resolveEvidenceRequiredCompletion(false, { HEADLESSCODE_REQUIRE_EVIDENCE: "true" }, cloud), true)
+	// Unset → off for cloud.
+	assert.equal(resolveEvidenceRequiredCompletion(false, {}, cloud), false)
+	// Local backend default ON unless explicitly disabled.
+	assert.equal(resolveEvidenceRequiredCompletion(false, {}, local), true)
+	assert.equal(resolveEvidenceRequiredCompletion(false, { HEADLESSCODE_ALLOW_UNVERIFIED_COMPLETION: "1" }, local), false)
+	// Explicit flag always wins, and beats the env override to OFF is impossible
+	// (no --no-require-evidence) — but flag OR env is true.
+	assert.equal(resolveEvidenceRequiredCompletion(true, {}, cloud), true)
+	assert.equal(
+		resolveEvidenceRequiredCompletion(true, { HEADLESSCODE_ALLOW_UNVERIFIED_COMPLETION: "1" }, local),
+		true,
+	)
 })
 
 // 15. HEADLESSCODE_LOCAL_EXPLORE unset/false is a COMPLETE no-op at the

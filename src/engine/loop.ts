@@ -62,6 +62,14 @@ import type { MemoryStore, RecallResult } from "../memory/types.js"
 import { createCheckpointService, type CheckpointService } from "../checkpoints/service.js"
 import { recordSessionUsage, removeLiveUsage, writeLiveUsage } from "./usage.js"
 import { EventFeed, EVENT_TRUNCATE_CHARS, truncateField } from "./events.js"
+import {
+	allClaimsVerified,
+	claimLabel,
+	extractClaims,
+	firstUnverifiedDetail,
+	verifyClaims,
+	type ClaimVerification,
+} from "./claims.js"
 import { writeSessionReport } from "./reports.js"
 import { Logger } from "./logger.js"
 import { extractEmbeddedToolCall, parseToolCalls } from "./parser.js"
@@ -89,6 +97,7 @@ import type {
 	ParsedToolCall,
 	SessionResult,
 	SessionBudgetUsage,
+	SessionCompletionVerification,
 	ToolContext,
 	ToolResult,
 } from "./types.js"
@@ -1069,6 +1078,37 @@ export interface HeadlessSessionConfig {
 	 */
 	verifyBeforeCompletion?: boolean
 	/**
+	 * Evidence-gated completion — the fabrication fix (2026-09-01, see
+	 * src/engine/claims.ts). When true, `attempt_completion` is refused
+	 * unless every machine-checkable claim its result text makes (a file
+	 * exists, a specific command passed, serial markers appear, a PR
+	 * exists) is independently verified against ground truth:
+	 *
+	 *   - file claim    → fs.stat on the resolved workspace path
+	 *   - command claim → RE-RUN the exact command (same permission gate as
+	 *                     execute_command), require exit 0
+	 *   - serial marker → grep the newest build/serial-*.log for the claimed
+	 *                     ordered markers
+	 *   - PR claim      → require real git-history evidence of the number
+	 *
+	 * Ground truth comes from the filesystem and real re-runs — never from
+	 * the model's own prose. This is the structural backstop for the exact
+	 * failure the FINAL_REPORT documented (§4): a session claimed "all
+	 * three hard gates pass" with a fabricated serial-log excerpt when the
+	 * driver was never merged and the claimed Makefile target didn't exist.
+	 * Fail-closed: any unverifiable claim defers the completion with a
+	 * corrective message naming the specific unverified claim.
+	 *
+	 * Deliberately separate from verifyBeforeCompletion (which is
+	 * token/state-based and only looks at the LAST command): this checks
+	 * the CONTENT of the completion's claims against the real world,
+	 * independent of what the session did or didn't run before.
+	 *
+	 * Default false; opt-in via --require-evidence or the local code
+	 * backend (see cli.ts).
+	 */
+	evidenceRequiredCompletion?: boolean
+	/**
 	 * When false, cost is never tracked/accumulated for this session (see
 	 * BudgetTrackerOptions.trackCost) — local-backend sessions have no real
 	 * dollar cost. Default true.
@@ -1346,6 +1386,8 @@ export interface ResolvedSessionConfig {
 	patchLocalToolSchemas: boolean
 	/** See HeadlessSessionConfig.verifyBeforeCompletion (default false). */
 	verifyBeforeCompletion: boolean
+	/** See HeadlessSessionConfig.evidenceRequiredCompletion (default false). */
+	evidenceRequiredCompletion: boolean
 	/** See HeadlessSessionConfig.trackCost (default true). */
 	trackCost: boolean
 	/** See HeadlessSessionConfig.requireArtifactBeforeCompletion (default false). */
@@ -1537,6 +1579,17 @@ export class HeadlessSession {
 	 */
 	private sessionEnded = false
 	/**
+	 * Evidence-gated completion (fabrication fix, 2026-09-01): the outcome of
+	 * the last attempt_completion claim-verification pass, when
+	 * evidenceRequiredCompletion was on and the result contained
+	 * machine-checkable claims. Carried onto the SessionResult (see
+	 * src/engine/types.ts SessionResult.verification) so callers can
+	 * distinguish "success claim independently verified" from "success
+	 * accepted on prose alone". undefined when the gate didn't run (flag off,
+	 * or no claims to check).
+	 */
+	private lastCompletionVerification: SessionCompletionVerification | undefined = undefined
+	/**
 	 * True once the real context window has been resolved (from config, the
 	 * OpenRouter models endpoint, or the conservative default) — the lookup
 	 * is done at most once per session, on the first iteration that needs it.
@@ -1680,6 +1733,7 @@ export class HeadlessSession {
 			requireExplicitCompletion: config.requireExplicitCompletion ?? false,
 			patchLocalToolSchemas: config.patchLocalToolSchemas ?? false,
 			verifyBeforeCompletion: config.verifyBeforeCompletion ?? false,
+			evidenceRequiredCompletion: config.evidenceRequiredCompletion ?? false,
 			trackCost: config.trackCost ?? true,
 			requireArtifactBeforeCompletion: config.requireArtifactBeforeCompletion ?? false,
 			requireArtifactPathPattern: config.requireArtifactPathPattern,
@@ -3953,9 +4007,139 @@ export class HeadlessSession {
 					continue
 				}
 
+				// Evidence-gated completion (fabrication fix, 2026-09-01 — see
+				// src/engine/claims.ts's module doc for the full writeup): when
+				// evidenceRequiredCompletion is on, every machine-checkable claim
+				// in the completion's result text (a file exists, a specific
+				// command passed, serial markers appear, a PR exists) must be
+				// independently verified against ground truth — the filesystem,
+				// a real re-run of the exact command, the newest serial log, and
+				// real git history — BEFORE the completion is accepted. This is
+				// the structural backstop for the FINAL_REPORT's central finding:
+				// a session claimed "all three hard gates pass" with a fabricated
+				// serial-log excerpt when the driver was never merged and the
+				// claimed Makefile target didn't exist. Fail-closed: any
+				// unverifiable claim defers the completion with a corrective
+				// message naming the specific claim, and emits an
+				// `unverified_claim` feed event so downstream consumers (eval,
+				// selfplay miner, orchestrator) can see WHY the completion was
+				// not accepted. A result with NO machine-checkable claims (pure
+				// prose) does not gate — but it also can never *pass* a gate.
+				this.lastCompletionVerification = undefined
+				if (this.config.evidenceRequiredCompletion) {
+					const claims = extractClaims(result)
+					if (claims.length > 0) {
+						const verification = await verifyClaims(claims, {
+							workspaceRoot: this.config.workspaceRoot,
+							permissions: this.executor.permissions,
+						})
+						this.lastCompletionVerification = {
+							claimsChecked: claims.length,
+							claimsPassed: verification.filter((v) => v.verified).length,
+							claimsUnverified: verification.filter((v) => !v.verified).length,
+						}
+						if (!allClaimsVerified(verification)) {
+							// Identical-call guardrail reset — the same live
+							// failure the verifyBeforeCompletion deferral above
+							// documents (joeos issue #26, rounds 17 + 20): the
+							// `continue` at the end of this block skips the
+							// identical-call streak update below (it's part of
+							// the normal per-iteration `calls` processing this
+							// branch exits before reaching), so without this
+							// reset lastCallBatchSignature/lastCallBatchNames/
+							// identicalCallStreak stay FROZEN at whatever they
+							// were when this deferral first started firing —
+							// typically two identical execute_command failures
+							// in a row, which is often exactly what triggers a
+							// fabricated-completion deferral in the first
+							// place (a model re-calling the same failing gate).
+							// Every subsequent deferred-completion turn then
+							// re-enters the request-prep cooldown-refresh loop
+							// with identicalCallGuardActive still true and
+							// lastCallBatchNames still ["execute_command"],
+							// re-arming that tool's exclusion to the full
+							// cooldown value EVERY turn before it ever ticks
+							// down — the model has no legal move
+							// (attempt_completion deferred, execute_command
+							// excluded) and just keeps re-calling
+							// attempt_completion, which is exactly the input
+							// that keeps re-triggering this same `continue`
+							// path. Confirmed live: 30+ iterations spinning
+							// between "attempt_completion deferred" and an
+							// unchanging "excludedToolCooldowns:
+							// {execute_command: 4}" until the iteration cap was
+							// hit. A deferred completion is definitionally not
+							// a repeat of whatever tool-call batch came before
+							// it, so the guard has no reason to stay active
+							// into the next turn.
+							lastCallBatchSignature = null
+							lastCallBatchNames = []
+							identicalCallStreak = 0
+							identicalCallNudgeInjected = false
+							excludedToolCooldowns.delete("execute_command")
+							const firstBad = verification.find((v) => !v.verified)
+							const unverifiedLabels = verification
+								.filter((v) => !v.verified)
+								.map((v) => claimLabel(v.claim))
+								.join(", ")
+							for (const sibling of calls) {
+								if (sibling.id === completionCall.id) {
+									continue
+								}
+								messages.push({
+									role: "tool",
+									tool_call_id: sibling.id,
+									name: sibling.name,
+									content:
+										"[System: not executed — attempt_completion was deferred because your result makes claims that could not be verified against the real workspace; re-issue this call if still needed.]",
+								})
+							}
+							messages.push({
+								role: "tool",
+								tool_call_id: completionCall.id,
+								name: "attempt_completion",
+								content:
+									"[System: attempt_completion was NOT accepted. Your result claims: " +
+									`${unverifiedLabels}. None of these could be independently confirmed: ` +
+									`${firstBad?.detail ?? "no evidence found"}. ` +
+									"Ground truth comes from the real filesystem and real command re-runs — never from a written report. " +
+									"Either run/verify the real thing (re-run the exact command, confirm the file actually exists on disk, check the real serial log) and re-issue attempt_completion, " +
+									"or restate the result to only claim what you have actually verified.]",
+							})
+							this.logger.warn("[loop] attempt_completion deferred — unverifiable claims in result", {
+								iteration,
+								claims,
+								verification: verification.map((v) => ({ verified: v.verified, detail: v.detail })),
+							})
+							this.scheduleAux(() =>
+								this.emitEvent(
+									"unverified_claim",
+									() =>
+										this.eventFeed.unverifiedClaim({
+											iteration,
+											claimsChecked: this.lastCompletionVerification?.claimsChecked ?? 0,
+											claimsPassed: this.lastCompletionVerification?.claimsPassed ?? 0,
+											claimsUnverified: this.lastCompletionVerification?.claimsUnverified ?? 0,
+											detail: firstBad?.detail ?? "",
+										}),
+									{ iteration },
+								),
+							)
+							continue
+						}
+					}
+				}
+
 				this.logger.info("[loop] attempt_completion received — success", { iteration })
 				const reportPath = await this.persistFinalReport(iteration, result)
-				return { status: "success", result, iterations: iteration, toolCalls: toolCalls + 1, reportPath }
+				return {
+					status: "success",
+					result,
+					iterations: iteration,
+					toolCalls: toolCalls + 1,
+					reportPath,
+					verification: this.lastCompletionVerification,
+				}
 			}
 
 			// 6b. Text-only reply (no tool_calls) → pragmatic success fallback,
@@ -4082,9 +4266,93 @@ export class HeadlessSession {
 					artifactRejectionStreak = 0
 					artifactRejectionNudgeInjected = false
 					if (text && !this.config.requireExplicitCompletion) {
+						// Evidence-gated completion (fabrication fix, 2026-09-01)
+						// — the text-only success fallback is a REAL bypass for
+						// cloud sessions: requireExplicitCompletion defaults OFF
+						// for the cloud backend, so with --require-evidence a
+						// cloud model could dump prose ("all three hard gates
+						// pass…") and be recorded as success with ZERO
+						// evidence, exactly the fabrication shape the gate
+						// exists to stop. When evidenceRequiredCompletion is
+						// ON, a text-only reply is treated as a completion
+						// CANDIDATE and runs the SAME extract/verify gate as an
+						// attempt_completion: pure prose (no machine-checkable
+						// claims) or fully-verified claims are accepted; any
+						// unverifiable claim defers with the corrective nudge
+						// and an unverified_claim event, never a success.
+						this.lastCompletionVerification = undefined
+						if (this.config.evidenceRequiredCompletion) {
+							const claims = extractClaims(text)
+							if (claims.length > 0) {
+								const verification = await verifyClaims(claims, {
+									workspaceRoot: this.config.workspaceRoot,
+									permissions: this.executor.permissions,
+								})
+								this.lastCompletionVerification = {
+									claimsChecked: claims.length,
+									claimsPassed: verification.filter((v) => v.verified).length,
+									claimsUnverified: verification.filter((v) => !v.verified).length,
+								}
+								if (!allClaimsVerified(verification)) {
+									// Same identical-call guardrail reset as the
+									// attempt_completion deferral above — a text-only
+									// reply is definitionally not a repeat of the
+									// previous tool-call batch.
+									lastCallBatchSignature = null
+									lastCallBatchNames = []
+									identicalCallStreak = 0
+									identicalCallNudgeInjected = false
+									excludedToolCooldowns.delete("execute_command")
+									const firstBad = verification.find((v) => !v.verified)
+									const unverifiedLabels = verification
+										.filter((v) => !v.verified)
+										.map((v) => claimLabel(v.claim))
+										.join(", ")
+									messages.push({
+										role: "user",
+										content:
+											`[System: your text-only reply was NOT accepted as a completion. It claims: ${unverifiedLabels}. ` +
+											`None of these could be independently confirmed: ${firstBad?.detail ?? "no evidence found"}. ` +
+											"Ground truth comes from the real filesystem and real command re-runs — never from a written report. " +
+											"Either run/verify the real thing (re-run the exact command, confirm the file actually exists on disk, check the real serial log) and then call attempt_completion, " +
+											"or restate your answer to only claim what you have actually verified.]",
+									})
+									this.logger.warn("[loop] text-only reply NOT accepted — unverifiable claims", {
+										iteration,
+										claims,
+										verification: verification.map((v) => ({
+											verified: v.verified,
+											detail: v.detail,
+										})),
+									})
+									this.scheduleAux(() =>
+										this.emitEvent(
+											"unverified_claim",
+											() =>
+												this.eventFeed.unverifiedClaim({
+													iteration,
+													claimsChecked: this.lastCompletionVerification?.claimsChecked ?? 0,
+													claimsPassed: this.lastCompletionVerification?.claimsPassed ?? 0,
+													claimsUnverified: this.lastCompletionVerification?.claimsUnverified ?? 0,
+													detail: firstBad?.detail ?? "",
+												}),
+											{ iteration },
+										),
+									)
+									continue
+								}
+							}
+						}
 						this.logger.info("[loop] text-only reply (no tool calls) — success", { iteration })
 						const reportPath = await this.persistFinalReport(iteration, text)
-						return { status: "success", result: text, iterations: iteration, toolCalls, reportPath }
+						return {
+							status: "success",
+							result: text,
+							iterations: iteration,
+							toolCalls,
+							reportPath,
+							...(this.lastCompletionVerification ? { verification: this.lastCompletionVerification } : {}),
+						}
 					}
 					// Empty reply, or a text reply that requireExplicitCompletion
 					// refuses to treat as final: nudge and count as a mistake.
@@ -5311,9 +5579,20 @@ export function summarizeToolArg(name: string, args: Record<string, unknown>): s
 		case "list_files":
 		case "write_to_file":
 		case "apply_diff":
+			return str(args.path)
 		case "search_replace":
 		case "edit_file":
-			return str(args.path)
+			// 2026-09-02: real, confirmed bug -- these two tools' native
+			// schemas (src/vendor/zoo-code/.../native-tools/edit_file.ts,
+			// search_replace.ts) declare `file_path`, not `path` (unlike
+			// write_to_file/apply_diff/list_files, which really do use
+			// `path`) -- so this always returned undefined -> "" here,
+			// making the tool_call event's path summary silently blank for
+			// every edit_file/search_replace call. That's exactly what made
+			// live log-watching during a real session unable to show which
+			// file was being edited. Fall back to `path` too in case an
+			// older/alias caller still sends that key.
+			return str(args.file_path) ?? str(args.path)
 		case "execute_command":
 			return str(args.command)?.slice(0, 200)
 		case "update_todo_list":

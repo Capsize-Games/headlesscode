@@ -269,6 +269,24 @@ export interface SessionBudgetUsage {
 	model: string
 }
 
+/**
+ * Evidence-gated completion (fabrication fix, 2026-09-01): the outcome of
+ * the claim-verification pass that ran against the final attempt_completion
+ * result when evidenceRequiredCompletion was on (see src/engine/claims.ts).
+ * Present on a successful SessionResult ONLY when the gate actually ran and
+ * found at least one machine-checkable claim — its presence is the caller's
+ * signal that "success" means "claims independently verified against ground
+ * truth", not "the model said so". Absent when the gate didn't run.
+ */
+export interface SessionCompletionVerification {
+	/** Number of machine-checkable claims extracted from the result text. */
+	claimsChecked: number
+	/** Number of claims independently confirmed against the real world. */
+	claimsPassed: number
+	/** Number of claims that could not be confirmed (0 on an accepted completion). */
+	claimsUnverified: number
+}
+
 export interface SessionResult {
 	status: SessionStatus
 	result?: string
@@ -277,6 +295,15 @@ export interface SessionResult {
 	reason?: string
 	iterations: number
 	toolCalls: number
+	/**
+	 * Evidence-gated completion (fabrication fix): present when the
+	 * completion's claims were independently verified against ground truth
+	 * (file existence, real command re-runs, serial logs, git history) — see
+	 * SessionCompletionVerification. Absent when the gate didn't run (flag
+	 * off, no claims in the result) — callers must NOT treat that as
+	 * "verified", only as "not checked".
+	 */
+	verification?: SessionCompletionVerification
 	/**
 	 * Issue #34: absolute path to the session's complete final report
 	 * (`<workspaceRoot>/.headlesscode/reports/<sessionId>.md`), present when

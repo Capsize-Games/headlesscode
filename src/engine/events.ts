@@ -14,6 +14,11 @@
  *   session_start / iteration_start / llm_response / tool_call / tool_result
  *   checkpoint_saved / decision_blocked / decision_answered
  *   condensed / todo_updated / paused / resumed / session_end
+ *   unverified_claim (fabrication fix, 2026-09-01): emitted when
+ *   evidenceRequiredCompletion was on and an attempt_completion was DEFERRED
+ *   because a machine-checkable claim in its result could not be verified
+ *   against ground truth — carries the verification counts + the first
+ *   unverified claim's detail (see EventFeed.unverifiedClaim)
  *   attempt_completion (issue #34): the session's FINAL report, emitted when
  *   the loop accepts completion (attempt_completion tool call OR the
  *   text-only success fallback) and carries the FULL report text — this is
@@ -297,6 +302,33 @@ export class EventFeed {
 		return this.emit("attempt_completion", {
 			iteration: fields.iteration,
 			result: fields.result,
+		})
+	}
+
+	/**
+	 * Evidence-gated completion (fabrication fix, 2026-09-01): emitted when
+	 * evidenceRequiredCompletion was on and an attempt_completion was DEFERRED
+	 * because one or more machine-checkable claims in its result (a file
+	 * exists, a command passed, serial markers appear, a PR exists) could not
+	 * be independently verified against ground truth (src/engine/claims.ts).
+	 * Carries the verification counts + the first unverified claim's detail so
+	 * downstream consumers (eval, selfplay miner, orchestrator) can see WHY a
+	 * completion was refused — the structured record that a fabrication
+	 * attempt was caught, not just a log line.
+	 */
+	unverifiedClaim(fields: {
+		iteration: number
+		claimsChecked: number
+		claimsPassed: number
+		claimsUnverified: number
+		detail: string
+	}): Promise<void> {
+		return this.emit("unverified_claim", {
+			iteration: fields.iteration,
+			claimsChecked: fields.claimsChecked,
+			claimsPassed: fields.claimsPassed,
+			claimsUnverified: fields.claimsUnverified,
+			detail: truncateField(fields.detail).text,
 		})
 	}
 

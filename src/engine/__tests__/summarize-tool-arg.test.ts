@@ -75,6 +75,22 @@ function testOtherToolsUnchanged(): void {
 	assert.equal(summarizeToolArg("read_file", {}), undefined, "read_file without a path → undefined")
 }
 
+function testEditFileAndSearchReplaceUseFilePath(): void {
+	// 2026-09-02: real, confirmed bug -- edit_file and search_replace's
+	// native tool schemas declare `file_path`, not `path` (unlike
+	// write_to_file/apply_diff/list_files, which really do use `path`), so
+	// this always fell through to `str(args.path)` → undefined → "" in the
+	// emitted tool_call event, making live log-watching unable to show
+	// which file was being edited.
+	assert.equal(summarizeToolArg("edit_file", { file_path: "server.py", old_string: "a", new_string: "b" }), "server.py")
+	assert.equal(
+		summarizeToolArg("search_replace", { file_path: "server.py", old_string: "a", new_string: "b" }),
+		"server.py",
+	)
+	// `path` still works as a fallback (e.g. an older/alias caller).
+	assert.equal(summarizeToolArg("edit_file", { path: "server.py" }), "server.py")
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => void]> = [
@@ -85,6 +101,7 @@ const tests: Array<[string, () => void]> = [
 	["read_file indentation mode with anchor_line", testIndentationModeWithAnchorLine],
 	["read_file indentation mode without anchor_line", testIndentationModeWithoutAnchorLine],
 	["other tools' summaries unchanged", testOtherToolsUnchanged],
+	["edit_file/search_replace use file_path", testEditFileAndSearchReplaceUseFilePath],
 ]
 
 function main(): void {
