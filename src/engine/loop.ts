@@ -3296,6 +3296,38 @@ export class HeadlessSession {
 		// write_to_file — see the doc comment where it's set for why this
 		// exists as a separate flag.
 		let lastWriteToolFailed = false
+		// 2026-09-02: real, confirmed bug -- lastWriteToolFailed only ever
+		// gets updated when edit_file/write_to_file/set_indentation is
+		// called AGAIN, so once ANY such call fails, this stayed
+		// permanently true for the REST of the session if the model never
+		// touched that tool again -- even when it correctly determined, by
+		// re-reading the real file, that no further edit was needed at
+		// all. Verified live: a session read the file, correctly
+		// concluded the /health handler it was asked to add already
+		// existed and worked, and every subsequent honest, accurate
+		// attempt_completion was deferred anyway with a stale "fix the
+		// issue, make the edit succeed" message that no longer applied --
+		// 15+ consecutive identical deferrals with no bounded-failure
+		// kill-switch to end it (would have spun to the iteration cap).
+		// Tracks the failed call's resolved target path so a genuine
+		// re-verification (a successful read_file of that SAME file)
+		// clears the flag -- narrow and hard to game (it requires actually
+		// re-reading the exact file that failed to edit), unlike a blanket
+		// reset on any successful tool call of any kind.
+		let lastWriteToolFailedTarget: string | undefined
+		// Second layer of defense alongside the lastWriteToolFailedTarget
+		// fix above: even a LEGITIMATE reason to keep deferring (a real,
+		// still-unfixed failure) has no bounded-failure kill-switch on this
+		// specific path today — verified live it can spin to the full
+		// iteration cap on unchanging identical deferrals with zero new
+		// information, the same failure shape as issue #26's fix already
+		// handled for the identical-tool-call-streak case but never for
+		// this one. Counts consecutive verifyBeforeCompletion deferrals
+		// carrying the SAME reason string; resets whenever the reason
+		// changes (a changing reason means real progress/new information is
+		// happening) or a real tool call succeeds.
+		let consecutiveDeferralReason: string | undefined
+		let consecutiveDeferralStreak = 0
 		// See HeadlessSessionConfig.requireArtifactBeforeCompletion's doc
 		// comment (issue #143). Set true the first time this session calls
 		// execute_command, write_to_file, or edit_file — regardless of
@@ -3805,8 +3837,28 @@ export class HeadlessSession {
 									"Fix the issue, make the edit succeed, and only call attempt_completion again once it actually applied.]",
 					})
 					this.logger.warn("[loop] attempt_completion deferred", { iteration, reason })
+					if (reason === consecutiveDeferralReason) {
+						consecutiveDeferralStreak++
+					} else {
+						consecutiveDeferralReason = reason
+						consecutiveDeferralStreak = 1
+					}
+					if (consecutiveDeferralStreak >= this.config.consecutiveErrorLimit) {
+						return this.boundedFailure(
+							"consecutive completion deferrals (same reason, no new evidence)",
+							iteration,
+							toolCalls,
+							consecutiveDeferralStreak,
+						)
+					}
 					continue
 				}
+				// A turn that reaches here without hitting the deferral branch
+				// above represents real progress (a normal tool call ran, or
+				// this SPECIFIC completion was actually accepted) — the streak
+				// above only means anything as CONSECUTIVE identical deferrals.
+				consecutiveDeferralReason = undefined
+				consecutiveDeferralStreak = 0
 
 				// requireArtifactBeforeCompletion guardrail (issue #143) — see
 				// HeadlessSessionConfig.requireArtifactBeforeCompletion's doc
@@ -4564,8 +4616,25 @@ export class HeadlessSession {
 								? resultContent.slice(0, 500)
 								: JSON.stringify(resultContent).slice(0, 500)
 						lastWriteToolSummary = `${call.name} ${target}\n${output}`
+						lastWriteToolFailedTarget = toolCallPathArg(this.config.workspaceRoot, call)
 					} else {
 						lastWriteToolSummary = undefined
+						lastWriteToolFailedTarget = undefined
+					}
+				}
+				// See lastWriteToolFailedTarget's doc comment above: a
+				// successful read_file of the EXACT file a write tool just
+				// failed to edit is real re-verification evidence, not just
+				// time passing — clear the stale-failure flag so a
+				// subsequent honest completion (including "no edit was
+				// actually needed") isn't blocked by a failure the model
+				// has since genuinely re-checked.
+				if (call.name === "read_file" && !isError && lastWriteToolFailed) {
+					const readTarget = toolCallPathArg(this.config.workspaceRoot, call)
+					if (readTarget !== undefined && readTarget === lastWriteToolFailedTarget) {
+						lastWriteToolFailed = false
+						lastWriteToolSummary = undefined
+						lastWriteToolFailedTarget = undefined
 					}
 				}
 				const targetPath = editToolTargetPath(this.config.workspaceRoot, call)

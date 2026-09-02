@@ -747,6 +747,132 @@ async function testVerifyBeforeCompletionRefusesAfterFailedEdit(): Promise<void>
 	}
 }
 
+// 2026-09-02: real, confirmed bug — lastWriteToolFailed only updates when
+// edit_file/write_to_file/set_indentation is called AGAIN, so it stayed
+// permanently true for the REST of the session once any such call failed,
+// even after the model correctly re-read the file and determined no
+// further edit was actually needed. Verified live: a session asked to add
+// a /health endpoint read the file, correctly found the endpoint already
+// existed and worked, and every subsequent honest attempt_completion was
+// deferred anyway with a stale "fix the issue, make the edit succeed"
+// message — 15+ consecutive identical deferrals with no way out. Fix: a
+// successful read_file of the EXACT file the write call failed on clears
+// the flag.
+async function testVerifyBeforeCompletionClearsAfterReReadingSameFile(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc-reread-"))
+	try {
+		await fs.writeFile(path.join(ws, "server.py"), "def health():\n    return 'ok'\n", "utf-8")
+		const client = new FakeLlmClient([
+			() =>
+				toolCall("edit_file", {
+					file_path: "server.py",
+					old_string: "this text does not appear in the file",
+					new_string: "replacement",
+				}),
+			// Real re-verification of the SAME file the edit failed on — the
+			// model correctly concludes no edit is needed.
+			() => toolCall("read_file", { path: "server.py" }),
+			() => toolCall("attempt_completion", { result: "The /health endpoint already exists; no edit needed." }),
+		])
+		const session = await makeSession({
+			task: "add a /health endpoint",
+			client,
+			workspaceRoot: ws,
+			verifyBeforeCompletion: true,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected the re-read to clear the stale failure, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "The /health endpoint already exists; no edit needed.")
+		assert.equal(client.requests.length, 3, "must be accepted on the first attempt after the re-read, no extra deferral round-trip")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// A read of a DIFFERENT file must NOT clear the flag — only re-verifying
+// the exact file that failed to edit counts as real evidence.
+async function testVerifyBeforeCompletionStaysSetAfterReadingADifferentFile(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc-reread-other-"))
+	try {
+		await fs.writeFile(path.join(ws, "server.py"), "def health():\n    return 'ok'\n", "utf-8")
+		await fs.writeFile(path.join(ws, "other.py"), "x = 1\n", "utf-8")
+		const client = new FakeLlmClient([
+			() =>
+				toolCall("edit_file", {
+					file_path: "server.py",
+					old_string: "this text does not appear in the file",
+					new_string: "replacement",
+				}),
+			() => toolCall("read_file", { path: "other.py" }),
+			() => toolCall("attempt_completion", { result: "Done (but server.py was never actually fixed)." }),
+			() =>
+				toolCall("edit_file", {
+					file_path: "server.py",
+					old_string: "def health():",
+					new_string: "def health(): # fixed",
+				}),
+			() => toolCall("attempt_completion", { result: "Done for real." }),
+		])
+		const session = await makeSession({
+			task: "fix server.py",
+			client,
+			workspaceRoot: ws,
+			verifyBeforeCompletion: true,
+			consecutiveErrorLimit: 20,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "Done for real.")
+		assert.equal(client.requests.length, 5, "reading a different file must not clear the stale failure")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// 2026-09-02: real, confirmed gap — a verifyBeforeCompletion deferral for a
+// failure that genuinely never gets fixed had NO bounded-failure kill-switch
+// at all (unlike the identical-tool-call-streak case issue #26 already
+// covers), so it could spin all the way to the iteration cap on unchanging
+// identical deferrals with zero new information each turn. Verified live
+// this could run 15+ turns burning real tokens/time for nothing.
+async function testVerifyBeforeCompletionBoundedFailureOnRepeatedIdenticalDeferral(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc-spin-"))
+	try {
+		await fs.writeFile(path.join(ws, "server.py"), "def health():\n    return 'ok'\n", "utf-8")
+		const client = new FakeLlmClient([
+			() =>
+				toolCall("edit_file", {
+					file_path: "server.py",
+					old_string: "this text does not appear in the file",
+					new_string: "replacement",
+				}),
+			// The model just keeps re-attempting completion with no
+			// corrective action and no re-read — the failure never gets a
+			// chance to be genuinely resolved or re-verified.
+			...Array.from({ length: 10 }, () => () => toolCall("attempt_completion", { result: "Done." })),
+		])
+		const session = await makeSession({
+			task: "fix server.py",
+			client,
+			workspaceRoot: ws,
+			verifyBeforeCompletion: true,
+			consecutiveErrorLimit: 3,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "error", `expected a bounded failure instead of spinning, got ${JSON.stringify(result)}`)
+		assert.match((result as { error: string }).error, /consecutive completion deferrals/)
+		assert.ok(
+			client.requests.length < 10,
+			`must stop well before exhausting all 11 scripted responses, made ${client.requests.length} requests`,
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // Issue #143: verified live 2026-08-21 (twice, word-for-word identical
 // both times) — a session claimed "I have completed the task... and
 // implemented the identified modification" having called only
@@ -3781,6 +3907,18 @@ const tests: Array<[string, () => Promise<void>]> = [
 	[
 		"verifyBeforeCompletion: attempt_completion is refused when the last edit_file/write_to_file call failed (#round-4-demo)",
 		testVerifyBeforeCompletionRefusesAfterFailedEdit,
+	],
+	[
+		"verifyBeforeCompletion: a successful read_file of the SAME file clears a stale failed-edit deferral",
+		testVerifyBeforeCompletionClearsAfterReReadingSameFile,
+	],
+	[
+		"verifyBeforeCompletion: reading a DIFFERENT file does not clear a stale failed-edit deferral",
+		testVerifyBeforeCompletionStaysSetAfterReadingADifferentFile,
+	],
+	[
+		"verifyBeforeCompletion: bounded failure instead of spinning on repeated identical deferrals",
+		testVerifyBeforeCompletionBoundedFailureOnRepeatedIdenticalDeferral,
 	],
 	[
 		"requireArtifactBeforeCompletion: refuses a completion claim with zero execute_command/write_to_file/edit_file calls (#143)",

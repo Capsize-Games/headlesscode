@@ -1565,9 +1565,48 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 
 	return (async () => {
 		let cwd = ctx.workspaceRoot
-		if (args.cwd != null && args.cwd !== "") {
+		// 2026-09-02: real, confirmed, fully deterministic bug -- a local
+		// LoRA backend's tool-call parser was found sending the literal
+		// 4-character STRING "null" (or "None") for an unset optional
+		// `cwd`, not a real absent/null value. `args.cwd != null` is only
+		// false for the JS primitive null -- a non-empty string "null"
+		// sails through this check as if it were a real requested cwd,
+		// resolving to "<workspaceRoot>/null", which (almost) never
+		// exists. That was fixed at the source (the LoRA server's own
+		// parser), but defend here too: any backend/model can make the
+		// same JSON-serialization slip, and treating the literal text
+		// null/None the same as a real null is cheap and unambiguous --
+		// no real directory is ever named exactly "null" or "None".
+		const isNullish = args.cwd == null || args.cwd === "" || args.cwd === "null" || args.cwd === "None"
+		if (!isNullish) {
 			const cwdArg = requireString(args, "cwd")
 			cwd = safeTarget(ctx, cwdArg)
+			// Validate BEFORE spawning rather than let a bad cwd reach
+			// spawn(): Node's child_process misattributes a chdir()
+			// failure (nonexistent cwd) to the SHELL itself -- "spawn
+			// /bin/bash ENOENT" -- with no mention of cwd anywhere in the
+			// error, which is exactly the "infrastructure spawn failure"
+			// pattern several ground-truth eval runs hit today (verified
+			// directly: spawning with a nonexistent cwd reproduces that
+			// precise error string/code/path). That misattribution isn't
+			// specific to the null-string bug above -- ANY nonexistent
+			// cwd the model supplies (a stale/hallucinated path) hits it
+			// the same way. Checking here turns a misleading spawn crash
+			// into a clear, actionable, model-facing error instead, and
+			// correctly counts it as a real mistake (it's the model's
+			// bad path, not infrastructure).
+			let cwdStat: fs.Stats | undefined
+			try {
+				cwdStat = fs.statSync(cwd)
+			} catch {
+				cwdStat = undefined
+			}
+			if (cwdStat === undefined || !cwdStat.isDirectory()) {
+				const rel = path.relative(ctx.workspaceRoot, cwd).toPosix() || path.basename(cwd)
+				return err(
+					`execute_command: cwd '${rel}' does not exist in this workspace.\n\nRecovery suggestions:\n1. Use list_files to confirm the real directory structure before setting cwd\n2. Omit cwd (or pass null) to run in the workspace root\n3. If you meant a path from a different task/workspace, it doesn't exist here`,
+				)
+			}
 		}
 
 		// Permissions gate (command allow/deny + dangerous substitution +

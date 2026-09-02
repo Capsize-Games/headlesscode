@@ -74,6 +74,87 @@ async function testNormalCompletionWithinTimeout(): Promise<void> {
 	}
 }
 
+// 2026-09-02: real, confirmed, fully deterministic bug — a nonexistent
+// `cwd` used to reach spawn() unchecked. Node/libuv MISATTRIBUTES a
+// chdir() failure (nonexistent cwd) to the SHELL itself: the error is
+// "spawn /bin/bash ENOENT" with no mention of cwd anywhere, indistinguishable
+// from bash genuinely being missing. Reproduced directly (no model
+// involved): spawning with a nonexistent cwd reproduces that exact
+// error/code/path. Root-caused live: a local LoRA backend's tool-call
+// parser was sending the literal STRING "null" for an unset `cwd` (fixed
+// separately at the source), which resolved to "<workspaceRoot>/null" — a
+// directory that never exists — and hit exactly this path, misleadingly
+// counted as "infrastructure", not the model's fault, and silently
+// retried up to 8 times before ever telling the model what was actually
+// wrong. Now validated BEFORE spawn with a clear, actionable error.
+async function testNonexistentCwdRefusedBeforeSpawnWithClearError(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-ec-badcwd-")
+	try {
+		const executor = createHeadlessExecutor(ws)
+
+		const result = await executor.execute("execute_command", {
+			command: "echo hi",
+			cwd: "does/not/exist",
+			timeout: 10,
+		})
+
+		assert.equal(result.isError, true, "a nonexistent cwd must be a real tool error, not silently retried")
+		assert.match(result.content, /does not exist/, `must clearly name the real problem, got: ${result.content}`)
+		assert.match(result.content, /does\/not\/exist/, `must name the actual cwd that doesn't exist, got: ${result.content}`)
+		assert.doesNotMatch(result.content, /ENOENT/, "must not surface the misleading raw spawn/bash ENOENT text")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// The literal STRING "null"/"None" (the confirmed real bug's exact shape —
+// a backend sending JSON-style or Python-style unset-value text instead of
+// a real null) must be treated exactly like an actually-absent cwd: run in
+// the workspace root, no error.
+async function testStringNullCwdTreatedAsUnset(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-ec-nullcwd-")
+	try {
+		const executor = createHeadlessExecutor(ws)
+
+		for (const nullish of ["null", "None"]) {
+			const result = await executor.execute("execute_command", {
+				command: "pwd",
+				cwd: nullish,
+				timeout: 10,
+			})
+			assert.equal(result.isError, false, `cwd: "${nullish}" must be treated as unset, not a real path`)
+			assert.match(
+				result.content,
+				new RegExp(path.basename(ws)),
+				`must have run in the workspace root, not <root>/${nullish}`,
+			)
+		}
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// A real, legitimate cwd (an actual subdirectory) must still work normally
+// — the validation must not become a false refusal for the common case.
+async function testRealSubdirectoryCwdStillWorks(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-ec-realcwd-")
+	try {
+		const executor = createHeadlessExecutor(ws)
+		await fs.mkdir(path.join(ws, "sub"), { recursive: true })
+
+		const result = await executor.execute("execute_command", {
+			command: "pwd",
+			cwd: "sub",
+			timeout: 10,
+		})
+
+		assert.equal(result.isError, false, "a real subdirectory cwd must still run normally")
+		assert.match(result.content, /sub$/m, `must have actually run inside sub/, got: ${result.content}`)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── (b) timeout: non-error result, partial output, process keeps running ───
 
 async function testTimeoutKeepsProcessAliveAndWritesMarker(): Promise<void> {
@@ -463,6 +544,9 @@ async function testNoDiagnosticsOnNormalClose(): Promise<void> {
 
 const tests: Array<[string, () => Promise<void>]> = [
 	["execute_command: command finishes within timeout -> normal non-error result with full output", testNormalCompletionWithinTimeout],
+	["execute_command: a nonexistent cwd is refused before spawn with a clear error, not a misleading bash ENOENT", testNonexistentCwdRefusedBeforeSpawnWithClearError],
+	["execute_command: cwd \"null\"/\"None\" (the confirmed real bug's exact shape) is treated as unset", testStringNullCwdTreatedAsUnset],
+	["execute_command: a real subdirectory cwd still works normally", testRealSubdirectoryCwdStillWorks],
 	["execute_command: timeout -> non-error result, partial output, process keeps running and completes on its own", testTimeoutKeepsProcessAliveAndWritesMarker],
 	["execute_command: rm -rf of the central store is refused BEFORE spawn (zero config)", testRecursiveDeleteOfCentralStoreRefusedBeforeSpawn],
 	["execute_command: store protection is NOT overridable by an allow-everything permissions config", testStoreProtectionNotOverridableByPermissions],
