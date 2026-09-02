@@ -267,6 +267,60 @@ async function testSameLengthRewriteServesRealContent(): Promise<void> {
 	}
 }
 
+// ─── (j.5) disableReadFileCache: always real content, never a cache hit ─────
+
+// 2026-09-02: real, confirmed, live-observed failure this option exists to
+// prevent — a local-backend session's edit_file call failed, the error told
+// it to re-read and retry, it DID call read_file again exactly as
+// instructed, got the "[cache] unchanged" notice instead of real content
+// (correct per the mechanism's own two-strikes design), never made the
+// second identical call that would have returned real content again, and
+// fabricated an attempt_completion instead of pushing through. The local
+// backend now sets this option so that short-circuit never fires at all.
+async function testDisableReadFileCacheAlwaysServesRealContent(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-readcache-disabled-")
+	try {
+		const file = path.join(ws, "data.txt")
+		await fs.writeFile(file, "line one\nline two\n", "utf-8")
+
+		const executor = createHeadlessExecutor(ws, { disableReadFileCache: true })
+		const first = await executor.execute("read_file", { path: "data.txt" })
+		const second = await executor.execute("read_file", { path: "data.txt" })
+		const third = await executor.execute("read_file", { path: "data.txt" })
+
+		for (const [label, result] of [
+			["first", first],
+			["second", second],
+			["third", third],
+		] as const) {
+			assert.ok(!isCacheHit(result), `${label} read must be real content, never a cache hit, when disabled`)
+			assert.ok(result.content.includes("line two"), `${label} read must contain the real file body`)
+		}
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// Default (option absent/false) behavior must be completely unaffected —
+// this is an explicit opt-in, not a change to the default cache behavior.
+async function testCacheStillWorksWhenOptionIsAbsentOrFalse(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-readcache-default-")
+	try {
+		const file = path.join(ws, "data.txt")
+		await fs.writeFile(file, "line one\nline two\n", "utf-8")
+
+		for (const options of [{}, { disableReadFileCache: false }]) {
+			const executor = createHeadlessExecutor(ws, options)
+			const first = await executor.execute("read_file", { path: "data.txt" })
+			const second = await executor.execute("read_file", { path: "data.txt" })
+			assert.ok(!isCacheHit(first), "first read is real content")
+			assert.ok(isCacheHit(second), `default/false behavior must still cache-hit on the second identical read (options: ${JSON.stringify(options)})`)
+		}
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── (j) HEADLESSCODE_READ_LIMIT env override + invalid-value fallback ───────
 
 async function testReadLimitEnvOverride(): Promise<void> {
@@ -326,6 +380,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["default slice limit is smaller (600), explicit limit 2000 wins", testDefaultLimitIsSmallerAndExplicitLimitWins],
 	["same-length rewrite (aaaa->bbbb): fast-path falls back to full hash, fresh content", testSameLengthRewriteServesRealContent],
 	["HEADLESSCODE_READ_LIMIT env override + invalid fallback", testReadLimitEnvOverride],
+	["disableReadFileCache: always real content, never a cache hit (2026-09-02)", testDisableReadFileCacheAlwaysServesRealContent],
+	["disableReadFileCache absent/false: default cache behavior unaffected", testCacheStillWorksWhenOptionIsAbsentOrFalse],
 ]
 
 async function main(): Promise<void> {

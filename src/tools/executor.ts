@@ -190,6 +190,8 @@ export interface ToolExecutorOptions {
 	permissions?: PermissionsConfig
 	/** See ToolContext.guardLargeOverwrites (types.ts) for the full writeup. */
 	guardLargeOverwrites?: boolean
+	/** See ToolContext.disableReadFileCache (types.ts) for the full writeup. */
+	disableReadFileCache?: boolean
 	/**
 	 * Live worker monitoring: fired at the same lifecycle points where the
 	 * `.harness.needs-decision` marker is written/cleared, so the session can
@@ -359,6 +361,7 @@ export class ToolExecutor {
 				workspaceRoot: this.workspaceRoot,
 				permissions: this.permissions,
 				guardLargeOverwrites: this.options.guardLargeOverwrites,
+				disableReadFileCache: this.options.disableReadFileCache,
 				decisionTimeoutMs: this.options.decisionTimeoutMs,
 				decisionPollIntervalMs: this.options.decisionPollIntervalMs,
 				pauseBudgetClock: this.pauseBudgetClock,
@@ -799,7 +802,32 @@ function readFileHandler(
 		// cached hash can be reused without re-reading the file; any mismatch
 		// (including a same-length rewrite, which changes mtime) falls back to
 		// a full read + sha256 below.
+		//
+		// 2026-09-02: real, confirmed, live-observed failure mode of this
+		// short-circuit against a local model -- ctx.disableReadFileCache
+		// skips both cache-hit checks in this function entirely, always
+		// serving real content. A session's edit_file call failed ("no
+		// match found"), the error told it to re-read and retry, it DID
+		// call read_file again exactly as instructed, and got back
+		// "[cache] this file is unchanged... re-read the earlier tool
+		// result" instead of the actual content -- correct per this
+		// mechanism's own design (the safety valve is "the SECOND
+		// consecutive identical call serves real content again"), but the
+		// model never made that second call: it read the cache-hit message
+		// as "you already have what you need", gave up, and called
+		// attempt_completion claiming the endpoint worked -- a genuine
+		// fabrication directly caused by this response, not a model
+		// hallucination from nothing. This short-circuit's own rationale
+		// (avoid paying full token cost for content the conversation
+		// already has) is a real concern for a REMOTE model's per-token API
+		// bill; re-serving a few hundred lines of file content costs a
+		// local session near-nothing (it's prefill, not generation, so it
+		// barely affects wall-clock time either) against a GPU with no
+		// per-token price. Cheap insurance against a much more expensive
+		// failure mode locally; the cloud sessions this genuinely saves
+		// money for are unaffected (disableReadFileCache stays unset there).
 		if (
+			!ctx.disableReadFileCache &&
 			cache !== undefined &&
 			!cache.toldUnchanged &&
 			cache.size === stat.size &&
@@ -818,8 +846,9 @@ function readFileHandler(
 
 		// Cache-check the CURRENT on-disk content (never "no write tool was
 		// called"): identical args + identical hash => byte-identical output.
+		// See the disableReadFileCache comment on the check above.
 		const currentHash = hashFileContent(content)
-		if (cache !== undefined && cache.hash === currentHash && !cache.toldUnchanged) {
+		if (!ctx.disableReadFileCache && cache !== undefined && cache.hash === currentHash && !cache.toldUnchanged) {
 			cache.toldUnchanged = true
 			return ok(READ_FILE_CACHE_HIT_MESSAGE)
 		}
@@ -1928,7 +1957,15 @@ function listFilesHandler(
 		const key = `${target} ${recursive}`
 		const entry = calls?.get(key)
 
-		if (calls !== undefined && generation !== undefined && entry !== undefined && entry.generation === generation) {
+		// See readFileHandler's disableReadFileCache comment for the full
+		// rationale (same short-circuit shape, same local-backend risk).
+		if (
+			!ctx.disableReadFileCache &&
+			calls !== undefined &&
+			generation !== undefined &&
+			entry !== undefined &&
+			entry.generation === generation
+		) {
 			if (!entry.toldUnchanged) {
 				entry.toldUnchanged = true
 				return ok(

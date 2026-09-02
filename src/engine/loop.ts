@@ -1200,6 +1200,24 @@ export interface HeadlessSessionConfig {
 	 */
 	guardLargeOverwrites?: boolean
 	/**
+	 * read_file/list_files carry a session-scoped "[cache] unchanged, reuse
+	 * the earlier result" short-circuit (src/tools/executor.ts) that saves
+	 * real, measured token cost against a remote model's per-token bill.
+	 * Verified live 2026-09-02 against the local backend: an edit_file
+	 * failure told a session to re-read and retry; it DID call read_file
+	 * again exactly as instructed, got the cache-hit notice instead of real
+	 * content (correct per the mechanism's own design — the safety valve
+	 * is "a SECOND consecutive identical call serves real content again"),
+	 * never made that second call, and fabricated an attempt_completion
+	 * instead. Re-serving a few hundred lines of file content costs a
+	 * local session near-nothing (prefill, not generation, against a GPU
+	 * with no per-token price) — cheap insurance locally against a much
+	 * more expensive failure mode. Default false; the local Ollama code-mode
+	 * backend turns this on (same opt-in shape as guardLargeOverwrites
+	 * above).
+	 */
+	disableReadFileCache?: boolean
+	/**
 	 * Phase 3 context condensation: the model's real context window in
 	 * tokens, used to decide WHEN to condense (the last request's real
 	 * prompt-token count vs. `condenseThresholdFraction` of this). When
@@ -1400,6 +1418,8 @@ export interface ResolvedSessionConfig {
 	requireArtifactSections?: string[]
 	/** See HeadlessSessionConfig.guardLargeOverwrites (default false). */
 	guardLargeOverwrites: boolean
+	/** See HeadlessSessionConfig.disableReadFileCache (default false). */
+	disableReadFileCache: boolean
 	/**
 	 * Phase 3 context condensation: the model's real context window in
 	 * tokens, when explicitly configured (undefined = resolve live from
@@ -1740,6 +1760,7 @@ export class HeadlessSession {
 			requireArtifactMinCitations: config.requireArtifactMinCitations,
 			requireArtifactSections: config.requireArtifactSections,
 			guardLargeOverwrites: config.guardLargeOverwrites ?? false,
+			disableReadFileCache: config.disableReadFileCache ?? false,
 			// Deliberately left undefined when the caller didn't configure it:
 			// the live OpenRouter models-endpoint lookup in maybeCondenseHistory
 			// resolves the real context window (never hardcode a stale number —
@@ -1789,6 +1810,7 @@ export class HeadlessSession {
 				decisionPollIntervalMs: this.config.decisionPollIntervalMs,
 				permissions: this.config.permissions,
 				guardLargeOverwrites: this.config.guardLargeOverwrites,
+				disableReadFileCache: this.config.disableReadFileCache,
 				// Live worker monitoring: mirror ask_followup_question's
 				// .harness.needs-decision marker lifecycle on the session's
 				// event feed (decision_blocked / decision_answered). Non-fatal.
@@ -5139,6 +5161,7 @@ export class HeadlessSession {
 			patchLocalToolSchemas: this.config.patchLocalToolSchemas,
 			verifyBeforeCompletion: this.config.verifyBeforeCompletion,
 			guardLargeOverwrites: this.config.guardLargeOverwrites,
+			disableReadFileCache: this.config.disableReadFileCache,
 			llmClient: this.llmClient,
 			logger: this.logger,
 			memory: this.config.memory,

@@ -122,6 +122,30 @@ async function testRepeatListFilesGetsOneCacheHitThenRealListingAgain(): Promise
 	}
 }
 
+// 2026-09-02: same disableReadFileCache option read_file's cache-hit
+// short-circuit respects (src/tools/__tests__/read-cache.test.ts) — the
+// local backend sets it because the mechanism's own real token-cost
+// savings only matter for a remote model's per-token bill, and it directly
+// caused a fabricated attempt_completion in a live local session (see that
+// file's comment for the full incident).
+async function testDisableReadFileCacheAlsoCoversListFiles(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-ls-disabled-")
+	try {
+		await fs.writeFile(path.join(ws, "a.txt"), "x", "utf-8")
+
+		const executor = createHeadlessExecutor(ws, { disableReadFileCache: true })
+		const first = await executor.execute("list_files", { path: ".", recursive: false })
+		const second = await executor.execute("list_files", { path: ".", recursive: false })
+
+		assert.equal(first.isError, false)
+		assert.equal(second.isError, false)
+		assert.doesNotMatch(second.content, /\[cache\]/, "disableReadFileCache must also suppress list_files' cache hit")
+		assert.match(second.content, /a\.txt/, "second call must return the real listing, not a cache notice")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 async function testFailedListFilesNotRecordedByGuard(): Promise<void> {
 	const ws = await mkTmpWorkspace("hc-ls-repeat-fail-")
 	try {
@@ -151,6 +175,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 		testRepeatListFilesGetsOneCacheHitThenRealListingAgain,
 	],
 	["a failed list_files call is never recorded by the repeat-call guard", testFailedListFilesNotRecordedByGuard],
+	["disableReadFileCache also suppresses list_files' cache-hit notice (2026-09-02)", testDisableReadFileCacheAlsoCoversListFiles],
 ]
 
 async function main(): Promise<void> {

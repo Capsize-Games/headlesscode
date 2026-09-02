@@ -1252,6 +1252,19 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// doc comment and executor.ts's largeOverwriteRefusal.
 	const guardLargeOverwrites =
 		useLocalCodeBackend && !envBoolean("HEADLESSCODE_ALLOW_UNGUARDED_OVERWRITES")
+	// 2026-09-02: real, confirmed, live-observed failure -- the read_file/
+	// list_files session cache's "[cache] unchanged, reuse the earlier
+	// result" short-circuit (src/tools/executor.ts) saves real token cost
+	// against a remote model's per-token bill, but against the local
+	// backend it directly produced a fabricated attempt_completion: an
+	// edit_file failure told a session to re-read and retry, it DID call
+	// read_file again exactly as instructed, got the cache-hit notice
+	// instead of real content, never made the SECOND identical call that
+	// would have returned real content again (the mechanism's own safety
+	// valve), and gave up with a false success claim instead. See loop.ts's
+	// HeadlessSessionConfig.disableReadFileCache doc comment.
+	const disableReadFileCache =
+		useLocalCodeBackend && !envBoolean("HEADLESSCODE_ALLOW_READ_FILE_CACHE_HIT")
 	// The cloud-tuned condensation defaults (0.75 hard threshold, 0.6 early-fire
 	// — see condense.ts) were measured firing needlessly aggressively against a
 	// local model: a trial condensing at 38 messages against a 16384-token
@@ -1466,6 +1479,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		requireArtifactMinCitations: options.requireArtifactMinCitations,
 		requireArtifactSections: options.requireArtifactSections,
 		guardLargeOverwrites,
+		disableReadFileCache,
 		llmClient: client,
 		logger,
 		memory,

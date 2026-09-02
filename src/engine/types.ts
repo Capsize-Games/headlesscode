@@ -190,6 +190,15 @@ export interface ToolContext {
 	 */
 	guardLargeOverwrites?: boolean
 	/**
+	 * See HeadlessSessionConfig.disableReadFileCache (loop.ts) for the full
+	 * writeup. When true, read_file/list_files always serve real content —
+	 * the session-scoped "[cache] unchanged, re-read the earlier result"
+	 * short-circuit (src/tools/executor.ts) never fires. Absent/false for
+	 * cloud sessions and bare executors (tests, reviewer/QA), where that
+	 * short-circuit's real token-cost savings still apply.
+	 */
+	disableReadFileCache?: boolean
+	/**
 	 * Decision escalation (ask_followup_question, see src/tools/executor.ts):
 	 * how long to block waiting for `.harness.decision-answer` before falling
 	 * back to today's autonomous-decision error, and how often to poll for it.
