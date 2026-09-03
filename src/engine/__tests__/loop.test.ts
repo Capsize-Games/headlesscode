@@ -831,6 +831,100 @@ async function testVerifyBeforeCompletionStaysSetAfterReadingADifferentFile(): P
 	}
 }
 
+// 2026-09-02 (same-day follow-up to the re-read clearing above): the re-read
+// escape hatch assumes a model that re-reads the file it failed to edit has
+// concluded "no edit needed" and is about to finish honestly. Verified live
+// (followthrough sweep, "add an entry to a JSON array" case): edit_file
+// failed, the model re-read tasks.json exactly as the hatch expects, then
+// called attempt_completion claiming *"I added {...} to the tasks array in
+// tasks.json"* — an edit it never landed. The re-read had cleared the flag
+// so the fabricated completion sailed through. Fix: when the flag was
+// cleared by a re-read ONLY (no successful write since) AND the completion
+// prose still asserts an edit was made, defer it.
+async function testVerifyBeforeCompletionDefersEditClaimAfterReReadOnly(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc-reread-claim-"))
+	try {
+		await fs.writeFile(path.join(ws, "tasks.json"), '{\n  "tasks": [\n    {"id": 6, "name": "build"}\n  ]\n}\n', "utf-8")
+		const client = new FakeLlmClient([
+			() =>
+				toolCall("edit_file", {
+					file_path: "tasks.json",
+					// Deliberately does not appear in the file — this edit fails.
+					old_string: '{"id": 6, "name": "build"},\n    {"id": 7, "name": "lint"}',
+					new_string: '{"id": 6, "name": "build"},\n    {"id": 7, "name": "lint"},\n    {"id": 8}',
+				}),
+			// Re-reads the exact file the edit failed on — the shape the
+			// re-read hatch treats as "concluded no edit needed".
+			() => toolCall("read_file", { path: "tasks.json" }),
+			// ...but then claims the edit was actually made.
+			() =>
+				toolCall("attempt_completion", {
+					result: 'I added {"id": 7, "name": "lint"} to the tasks array in tasks.json.',
+				}),
+			// After the deferral: actually land the edit, then finish honestly.
+			() =>
+				toolCall("edit_file", {
+					file_path: "tasks.json",
+					old_string: '    {"id": 6, "name": "build"}\n',
+					new_string: '    {"id": 6, "name": "build"},\n    {"id": 7, "name": "lint"}\n',
+				}),
+			() => toolCall("attempt_completion", { result: 'Added the {"id": 7, "name": "lint"} entry to tasks.json.' }),
+		])
+		const session = await makeSession({
+			task: "add an entry to the JSON array",
+			client,
+			workspaceRoot: ws,
+			verifyBeforeCompletion: true,
+			consecutiveErrorLimit: 20,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, 'Added the {"id": 7, "name": "lint"} entry to tasks.json.')
+		assert.equal(client.requests.length, 5, "the edit-claim completion must be deferred until a real write lands")
+		const written = await fs.readFile(path.join(ws, "tasks.json"), "utf-8")
+		assert.match(written, /"id": 7/, "the entry must actually be on disk before the completion is accepted")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+// The companion to the test above: a re-read followed by an HONEST "no edit
+// was needed" completion (no change verb) must still be accepted on the
+// first try — the narrow prose check must not swallow the legitimate case
+// the re-read hatch was built for.
+async function testVerifyBeforeCompletionAcceptsHonestNoOpAfterReReadOnly(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc-reread-noop-"))
+	try {
+		await fs.writeFile(path.join(ws, "server.py"), "def health():\n    return 'ok'\n", "utf-8")
+		const client = new FakeLlmClient([
+			() =>
+				toolCall("edit_file", {
+					file_path: "server.py",
+					old_string: "this text does not appear in the file",
+					new_string: "replacement",
+				}),
+			() => toolCall("read_file", { path: "server.py" }),
+			() =>
+				toolCall("attempt_completion", {
+					result: "The /health endpoint already exists and returns 'ok'; no change was required.",
+				}),
+		])
+		const session = await makeSession({
+			task: "add a /health endpoint",
+			client,
+			workspaceRoot: ws,
+			verifyBeforeCompletion: true,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `honest no-op completion must pass, got ${JSON.stringify(result)}`)
+		assert.equal(client.requests.length, 3, "no extra deferral round-trip for an honest no-op")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // 2026-09-02: real, confirmed gap — a verifyBeforeCompletion deferral for a
 // failure that genuinely never gets fixed had NO bounded-failure kill-switch
 // at all (unlike the identical-tool-call-streak case issue #26 already
@@ -3915,6 +4009,14 @@ const tests: Array<[string, () => Promise<void>]> = [
 	[
 		"verifyBeforeCompletion: reading a DIFFERENT file does not clear a stale failed-edit deferral",
 		testVerifyBeforeCompletionStaysSetAfterReadingADifferentFile,
+	],
+	[
+		"verifyBeforeCompletion: a re-read-only clear + a completion still claiming the edit was made is deferred",
+		testVerifyBeforeCompletionDefersEditClaimAfterReReadOnly,
+	],
+	[
+		"verifyBeforeCompletion: a re-read-only clear + an honest no-op completion is still accepted first try",
+		testVerifyBeforeCompletionAcceptsHonestNoOpAfterReReadOnly,
 	],
 	[
 		"verifyBeforeCompletion: bounded failure instead of spinning on repeated identical deferrals",

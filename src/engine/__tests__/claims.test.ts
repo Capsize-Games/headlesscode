@@ -42,6 +42,22 @@ function testExtractsFileExistenceClaims(): void {
 	assert.ok(paths.includes("docs/e1000.md"))
 }
 
+function testExtractsFileClaimBehindPreposition(): void {
+	// The real followthrough-sweep shape: the changed file sits behind a
+	// preposition with JSON punctuation between it and the verb — the
+	// within-4-words fileVerb pattern can't reach it.
+	const claims = extractClaims('I added {"id": 7, "name": "lint"} to the tasks array in tasks.json.')
+	const paths = claims.filter((c) => c.kind === "file_exists").map((c) => (c as { path: string }).path)
+	assert.ok(paths.includes("tasks.json"), `expected tasks.json, got ${JSON.stringify(claims)}`)
+}
+
+function testPrepositionPatternStillNeedsAVerb(): void {
+	// "the value in config.json" — a bare prepositional phrase with no
+	// affirmative change verb is not a claim the model changed the file.
+	const claims = extractClaims("The timeout is defined in config.json and looks correct.")
+	assert.equal(claims.filter((c) => c.kind === "file_exists").length, 0)
+}
+
 function testIgnoresBarePathMentionsWithoutVerbs(): void {
 	// "read kernel/e1000.curlee" is not a claim the model WROTE it — no
 	// affirmative creation/change verb, so no file-existence claim.
@@ -323,6 +339,8 @@ function testAllClaimsVerifiedHelpers(): void {
 
 const tests: Array<{ name: string; fn: () => void | Promise<void> }> = [
 	{ name: "extract: file-existence claims", fn: testExtractsFileExistenceClaims },
+	{ name: "extract: file claim behind a preposition (verb … to <path>)", fn: testExtractsFileClaimBehindPreposition },
+	{ name: "extract: prepositional phrase without a change verb is not a claim", fn: testPrepositionPatternStillNeedsAVerb },
 	{ name: "extract: bare path mentions without verbs ignored", fn: testIgnoresBarePathMentionsWithoutVerbs },
 	{ name: "extract: command-passed claims", fn: testExtractsCommandPassedClaims },
 	{ name: "extract: serial markers only when serial mentioned", fn: testExtractsSerialMarkersOnlyWhenSerialMentioned },

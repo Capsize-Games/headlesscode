@@ -3337,6 +3337,25 @@ export class HeadlessSession {
 		// re-reading the exact file that failed to edit), unlike a blanket
 		// reset on any successful tool call of any kind.
 		let lastWriteToolFailedTarget: string | undefined
+		// 2026-09-02 (same-day follow-up to the re-read clearing above): the
+		// re-read escape hatch clears lastWriteToolFailed on the assumption
+		// that a model which re-reads the file it failed to edit has
+		// concluded "no edit was needed" and is about to finish honestly.
+		// Verified live (followthrough sweep, "add an entry to a JSON array"
+		// case): a session's edit_file failed, it re-read tasks.json exactly
+		// as the re-read hatch expects, then called attempt_completion
+		// claiming *"I added {\"id\": 7, \"name\": \"lint\"} to the tasks
+		// array in tasks.json."* — an edit it never actually landed. The
+		// re-read had cleared the flag, so the completion sailed through and
+		// the sweep scored it a fabrication. The re-read alone can't tell
+		// "no edit needed" (legit) from "edit still not made" (fabrication);
+		// the completion prose is the discriminator. This flag records that
+		// a failed write was cleared ONLY by a re-read (never by a real
+		// successful write since); at completion time, if the result also
+		// asserts an edit was made, the completion is deferred. A later
+		// genuinely successful write tool call clears it for good.
+		let writeFailedClearedByReReadOnly = false
+		let reReadClearedWriteSummary: string | undefined
 		// Second layer of defense alongside the lastWriteToolFailedTarget
 		// fix above: even a LEGITIMATE reason to keep deferring (a real,
 		// still-unfixed failure) has no bounded-failure kill-switch on this
@@ -3785,9 +3804,30 @@ export class HeadlessSession {
 					!messages.some(
 						(m) => m.role === "tool" && m.name === "execute_command" && /\d/.test(String(m.content ?? "")),
 					)
+				// staleReReadEditClaim: a failed write was cleared by a re-read
+				// ONLY (never a real successful write since — see
+				// writeFailedClearedByReReadOnly's doc), yet this completion's prose
+				// still asserts an edit was actually made. The re-read hatch exists
+				// for the honest "no edit was needed" finish; a completion that
+				// claims it *did* edit contradicts the still-unlanded write and is
+				// deferred. Deliberately narrow: only affirmative "I/we added|
+				// wrote|created|…", "added|inserted|… <x> (in)to <file>", or "the
+				// edit/change has been made/applied" shapes — "already exists",
+				// "no edit needed", "was already correct" carry no change verb and
+				// still pass cleanly.
+				const completionAssertsEditMade =
+					/\b(?:I|we|I've|we've|I have|we have)\s+(?:just\s+|now\s+|successfully\s+)?(?:added|inserted|appended|wrote|written|created|updated|edited|modified|applied|replaced|changed)\b/i.test(
+						result,
+					) ||
+					/\b(?:added|inserted|appended|wrote|created|placed)\s+[^.\n]{0,80}?\b(?:in)?to\b\s+\S*[A-Za-z0-9_-]/i.test(result) ||
+					/\bthe\s+(?:edit|change|fix|update|modification|entry|line|function|field)\s+(?:was|has been|is now)\s+(?:made|applied|written|added|inserted|in place|complete)\b/i.test(
+						result,
+					) ||
+					/\bhas been\s+(?:added|inserted|appended|written|updated|applied|modified|replaced)\b/i.test(result)
+				const staleReReadEditClaim = writeFailedClearedByReReadOnly && completionAssertsEditMade
 				if (
 					this.config.verifyBeforeCompletion &&
-					(lastExecuteCommandFailed || lastWriteToolFailed || unsupportedMeasurementClaim)
+					(lastExecuteCommandFailed || lastWriteToolFailed || unsupportedMeasurementClaim || staleReReadEditClaim)
 				) {
 					// Verified live 2026-08-29 (joeos issue #26, rounds 17 + 20):
 					// the `continue` at the end of this block skips the
@@ -3824,7 +3864,9 @@ export class HeadlessSession {
 					identicalCallStreak = 0
 					identicalCallNudgeInjected = false
 					excludedToolCooldowns.delete("execute_command")
-					const reason = unsupportedMeasurementClaim
+					const reason = staleReReadEditClaim
+						? "edit claimed but never landed (only a re-read since the failed write)"
+						: unsupportedMeasurementClaim
 						? "unsupported measurement claim"
 						: lastExecuteCommandFailed
 							? "last execute_command failed"
@@ -3837,7 +3879,9 @@ export class HeadlessSession {
 							role: "tool",
 							tool_call_id: sibling.id,
 							name: sibling.name,
-							content: unsupportedMeasurementClaim
+							content: staleReReadEditClaim
+								? "[System: not executed — attempt_completion was deferred because your result claims an edit was made, but the edit_file/write_to_file call for it failed and you have only re-read the file since (never landed a successful write); re-issue this call if still needed.]"
+								: unsupportedMeasurementClaim
 								? "[System: not executed — attempt_completion was deferred because it makes a specific measurement/benchmark claim with no execute_command output in this session's history containing any supporting number; re-issue this call if still needed.]"
 								: lastExecuteCommandFailed
 									? "[System: not executed — attempt_completion was deferred because the last command you ran ended in an error; re-issue this call if still needed.]"
@@ -3848,7 +3892,11 @@ export class HeadlessSession {
 						role: "tool",
 						tool_call_id: completionCall.id,
 						name: "attempt_completion",
-						content: unsupportedMeasurementClaim
+						content: staleReReadEditClaim
+							? "[System: attempt_completion was NOT accepted. Your result describes an edit as made (e.g. \"added …\", \"the entry has been added\"), but the edit_file/write_to_file call for it failed and the only thing you have done since is re-read the file — no successful write ever landed:\n" +
+								`${reReadClearedWriteSummary ?? "(edit output no longer available)"}\n` +
+								"Either actually make the edit succeed and re-issue attempt_completion, or, if no edit was truly needed, restate the result to say so plainly (e.g. \"no change was required\") without claiming an edit you did not land.]"
+							: unsupportedMeasurementClaim
 							? "[System: attempt_completion was NOT accepted. Your result claims a specific measurement/benchmark, but no execute_command output anywhere in this session contains a supporting number. Either run the real command that produces this evidence and re-issue attempt_completion, or restate the result without the unsupported claim.]"
 							: lastExecuteCommandFailed
 								? "[System: attempt_completion was NOT accepted. The most recent command you ran ended in an error, and you have not run a command since that succeeded:\n" +
@@ -4642,6 +4690,11 @@ export class HeadlessSession {
 					} else {
 						lastWriteToolSummary = undefined
 						lastWriteToolFailedTarget = undefined
+						// A genuinely successful write resolves the situation for
+						// real — the re-read-only clearing no longer needs to gate
+						// anything (see writeFailedClearedByReReadOnly's doc above).
+						writeFailedClearedByReReadOnly = false
+						reReadClearedWriteSummary = undefined
 					}
 				}
 				// See lastWriteToolFailedTarget's doc comment above: a
@@ -4655,8 +4708,13 @@ export class HeadlessSession {
 					const readTarget = toolCallPathArg(this.config.workspaceRoot, call)
 					if (readTarget !== undefined && readTarget === lastWriteToolFailedTarget) {
 						lastWriteToolFailed = false
+						reReadClearedWriteSummary = lastWriteToolSummary
 						lastWriteToolSummary = undefined
 						lastWriteToolFailedTarget = undefined
+						// Remember this was cleared by a re-read ONLY, not by a
+						// real successful write — completion still has to prove
+						// it isn't claiming an edit it never landed.
+						writeFailedClearedByReReadOnly = true
 					}
 				}
 				const targetPath = editToolTargetPath(this.config.workspaceRoot, call)

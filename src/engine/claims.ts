@@ -127,6 +127,30 @@ export function extractClaims(result: string): ExtractedClaim[] {
 		add({ kind: "file_exists", path: raw }, `file:${raw}`)
 	}
 
+	// The fileVerb pattern above only sees a path that sits within ~4 word
+	// tokens of the verb. The other common real shape puts the changed
+	// artifact BEHIND a preposition, with arbitrary (often non-word:
+	// braces, quotes, colons) content between — verified live in the
+	// followthrough sweep: *"I added {"id": 7, "name": "lint"} to the tasks
+	// array in tasks.json."* The path there ("tasks.json") is ~40 chars past
+	// the verb and separated by JSON punctuation the `\s+word` gap can't
+	// cross. Match an affirmative change verb, then up to ~90 chars of any
+	// non-sentence-ending text, then an `in|into|to <path>` — the file the
+	// model says it changed. Existence is still the only check (a claim
+	// "added … to tasks.json" against a tasks.json that never got the edit
+	// isn't caught here when the file already existed for other reasons —
+	// that specific hole is closed loop-side by the re-read-only completion
+	// guard — but a claim naming a file that does not exist AT ALL is).
+	const fileVerbPrep =
+		/\b(?:added|inserted|appended|wrote|written|created|placed|moved|copied|saved)\b[^.\n]{0,90}?\b(?:into|onto|in|to)\s+([A-Za-z0-9_./-]+\.(?:curlee|ts|js|py|sh|c|h|rs|go|json|md|mk|txt|toml|ya?ml|cfg|ini))\b/gi
+	for (const m of result.matchAll(fileVerbPrep)) {
+		const raw = m[1] as string
+		if (raw.startsWith("/") || raw.includes("..")) {
+			continue
+		}
+		add({ kind: "file_exists", path: raw }, `file:${raw}`)
+	}
+
 	// --- Command-passed claims ---------------------------------------------
 	// "make qemu-e1000-smoke passed" / "curlee check kernel/foo.curlee
 	// passed cleanly" / "npm test passed" — the verification-shaped commands
