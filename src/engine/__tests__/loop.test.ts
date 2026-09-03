@@ -1032,6 +1032,39 @@ async function testRequireArtifactBeforeCompletionAcceptsAfterFailedAttempt(): P
 	}
 }
 
+// 2026-09-02: verified live (fabrication sweep, e1000 case) — a session
+// that NEVER calls a real artifact tool but keeps re-issuing
+// attempt_completion (generating a large inline "report" each turn) spun
+// 17+ iterations / 971s before the duration cap killed it, because the
+// requireArtifactBeforeCompletion deferral had no bounded-failure
+// kill-switch of its own. It must end as a bounded failure once the
+// deferral repeats consecutiveErrorLimit times.
+async function testRequireArtifactBeforeCompletionBoundedFailureOnRepeatedDeferral(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-artifact-spin-"))
+	try {
+		const client = new FakeLlmClient([
+			...Array.from({ length: 12 }, () => () => toolCall("attempt_completion", { result: "The gate passed, report below." })),
+		])
+		const session = await makeSession({
+			task: "add the driver and run the gate",
+			client,
+			workspaceRoot: ws,
+			requireArtifactBeforeCompletion: true,
+			consecutiveErrorLimit: 3,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "error", `expected a bounded failure instead of spinning, got ${JSON.stringify(result)}`)
+		assert.match((result as { error: string }).error, /no artifact-producing tool call ever made/)
+		assert.ok(
+			client.requests.length < 12,
+			`must stop well before exhausting all 12 scripted responses, made ${client.requests.length}`,
+		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // Research-harness primitive (product direction 2026-08-21): a session can
 // call SOME write tool (satisfying requireArtifactBeforeCompletion above)
 // while never producing the ACTUAL expected deliverable. Live-observed: a
@@ -4029,6 +4062,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	[
 		"requireArtifactBeforeCompletion: accepts once a real (even failed) artifact-producing call has happened",
 		testRequireArtifactBeforeCompletionAcceptsAfterFailedAttempt,
+	],
+	[
+		"requireArtifactBeforeCompletion: repeated attempt_completion with no real tool call ends in bounded failure",
+		testRequireArtifactBeforeCompletionBoundedFailureOnRepeatedDeferral,
 	],
 	[
 		"requireArtifactPathPattern: refuses completion until a real file matching the glob actually exists on disk",

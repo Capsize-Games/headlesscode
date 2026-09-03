@@ -3376,6 +3376,23 @@ export class HeadlessSession {
 		// tried to produce a real effect; lastExecuteCommandFailed/
 		// lastWriteToolFailed above separately catch a FAILED attempt).
 		let hasCalledArtifactTool = false
+		// 2026-09-02: verified live in the fabrication sweep's e1000 case —
+		// the requireArtifactBeforeCompletion deferral (below) has no
+		// bounded-failure kill-switch of its own, unlike the
+		// verifyBeforeCompletion deferral (consecutiveDeferralStreak) and the
+		// identical-call streak (issue #26). A session that never once calls
+		// a real artifact tool, keeps re-issuing attempt_completion, and
+		// generates a large inline "report" each turn spun 17+ iterations /
+		// 971s before the duration cap finally killed it — the model even
+		// correctly diagnosed its own fabrication ("I never actually called
+		// write_to_file… the report I gave was the real output I expected to
+		// see AFTER running the gate") and kept going anyway. Count
+		// consecutive hits of that specific deferral; once it reaches
+		// consecutiveErrorLimit, end as a bounded failure. No reset needed:
+		// the branch only fires while hasCalledArtifactTool is false, and the
+		// first real execute_command/write_to_file/edit_file call (even a
+		// failed one) flips that permanently.
+		let artifactBeforeCompletionDeferrals = 0
 		// Concrete command + truncated error output for the failure above,
 		// so the attempt_completion rejection below can restate WHAT failed
 		// instead of pointing at it abstractly — by the time a model reaches
@@ -3958,6 +3975,15 @@ export class HeadlessSession {
 						iteration,
 						reason: "no artifact-producing tool call in this session",
 					})
+					artifactBeforeCompletionDeferrals++
+					if (artifactBeforeCompletionDeferrals >= this.config.consecutiveErrorLimit) {
+						return this.boundedFailure(
+							"repeated attempt_completion with no artifact-producing tool call ever made",
+							iteration,
+							toolCalls,
+							artifactBeforeCompletionDeferrals,
+						)
+					}
 					continue
 				}
 
