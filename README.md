@@ -53,14 +53,19 @@ until completion. Non-interactive by design.
 
 ## Quick start
 
-`headlesscode` is not yet published to the npm registry, so install it from a
-checkout:
+Install from npm:
 
 ```bash
-git clone https://github.com/Capsize-Games/headlesscode.git
-cd headlesscode
-npm install
+npm install -g headlesscode
+```
 
+Or run it without installing, via npx:
+
+```bash
+npx headlesscode --task "Fix the bug in src/index.ts" --workspace /path/to/target/repo
+```
+
+```bash
 # Required (except for --dry-run):
 export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-...
 
@@ -70,7 +75,15 @@ export OPENROUTER_HTTP_REFERER=https://example.com       # OpenRouter app header
 export OPENROUTER_APP_TITLE="headlesscode"               # OpenRouter X-Title header
 export HEADLESSCODE_WORKSPACE_ROOT=/path/to/target/repo  # default workspace root
 
-# Run a task against a target repo, straight from the checkout:
+headlesscode --task "Fix the bug in src/index.ts" --workspace /path/to/target/repo
+```
+
+To work from a source checkout instead (for contributing):
+
+```bash
+git clone https://github.com/Capsize-Games/headlesscode.git
+cd headlesscode
+npm install
 node bin/headlesscode.mjs --task "Fix the bug in src/index.ts" --workspace /path/to/target/repo
 ```
 
