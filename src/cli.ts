@@ -43,6 +43,7 @@ import { analyzeCliMain } from "./orchestrator/analyze-cli.js"
 import { costHistoryCliMain } from "./orchestrator/cost-history-cli.js"
 import { resolvePermissions, type PermissionsConfig } from "./permissions/config.js"
 import { resolveModelForMode, resolveReasoningEffortForMode } from "./config/mode-models.js"
+import { improveMain } from "./rsi/controller.js"
 
 const VERSION = "0.1.0"
 
@@ -186,6 +187,10 @@ Usage:
   headlesscode --dry-run [options]          # build system prompt + validate config, no LLM call
 
 Subcommands:
+  headlesscode improve --repo <path> [--model <id>] [--population <n>] [--dry-run]
+              Run a bounded recursive self-improvement generation. Candidates
+              use isolated git worktrees; evaluator/scoring paths are protected.
+              The default worker is the local Qwen 3.5 9B model.
   headlesscode orchestrate --repo <path> --issue <n>... [--qa] [--deploy] [--dry-run]
               Run a full parallel orchestration round
               (split → spawn → review → QA → deploy gate). See
@@ -716,6 +721,13 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 }
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
+	// Bounded recursive self-improvement: the supervisor owns the evaluator,
+	// archive, and selection logic while each candidate runs in its own
+	// worktree. See docs/recursive-self-improvement.md.
+	if (argv[0] === "improve") {
+		return improveMain(argv.slice(1))
+	}
+
 	// Phase 2 subcommand: `headlesscode orchestrate ...` — delegates to the
 	// orchestrator module (split → spawn → watch → review). Keeps the Phase 1
 	// run path untouched.

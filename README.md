@@ -1,55 +1,47 @@
 # headlesscode
 
-A small, purpose-built, genuinely headless coding-agent harness. It reuses what
-makes [Zoo Code](https://github.com/Zoo-Code-Org/Zoo-Code) (an Apache-2.0 Roo
-Code fork) good — its system prompts, native tool schemas, and
-mode/rules configuration format — without carrying along the VS Code GUI
-dependency.
+[![CI](https://github.com/Capsize-Games/headlesscode/actions/workflows/ci.yml/badge.svg)](https://github.com/Capsize-Games/headlesscode/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/headlesscode?logo=npm)](https://www.npmjs.com/package/headlesscode)
+[![Node.js >=18](https://img.shields.io/badge/node-%3E%3D18-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](./LICENSE)
 
-This repo implements:
+Run a coding agent where the work actually happens: in a terminal, a CI job,
+or an isolated git worktree. `headlesscode` brings the useful parts of
+[Zoo Code](https://github.com/Zoo-Code-Org/Zoo-Code) to a plain Node.js process,
+without requiring a VS Code window.
 
-- The **headless runtime engine** — vendoring the portable Apache-2.0 core and
-  the headless runtime (OpenRouter client, tool executor, tool-call parser,
-  orchestration loop, CLI).
-- A **headless orchestration layer** — split an issue into worker groups, run
-  each as a harness subprocess in its own git worktree, review, and merge
-  (see [`docs/phase2-orchestration.md`](./docs/phase2-orchestration.md)).
-- A **memory subsystem** — per-project knowledge facts + rolling session
-  summaries, with local semantic recall and a pluggable `MemoryStore`
-  contract for a remote backend.
-- **Headless QA** — run the target repo's `qa-agent` mode as a second harness
-  session (see [`docs/phase4-qa.md`](./docs/phase4-qa.md)) and a
-  human-approval deploy gate in front of the repo's `deploy-production.sh`
-  (see [`docs/phase4-deploy-gate.md`](./docs/phase4-deploy-gate.md)).
-- A **GitHub issue watcher** (see
-  [`docs/phase5-issue-watcher.md`](./docs/phase5-issue-watcher.md)) — file an
-  issue with a target label and a poll loop automatically splits and spawns it
-  through the existing orchestration pipeline, with durable idempotency so a
-  restart never double-spawns.
-- **Cloud-scaling guardrails** — a hard concurrent-session cap, a per-session
-  cost/time/iteration budget, and a `CloudProvider` abstraction (container/VM
-  per issue behind the same lifecycle as the local worktree flow) with an
-  evaluation-only cloud-provider sketch (see
-  [`docs/phase6-cloud.md`](./docs/phase6-cloud.md)). No live cloud resources
-  are launched; the caps/budgets land before any scaling.
+It is made for real repositories and real engineering loops. The harness reads
+the target project's modes and rules, gives the model a controlled tool set,
+keeps work separated in git worktrees, and leaves behind logs and state that a
+person can inspect.
 
-> ⚠️ **Security warning: default-allow arbitrary command execution.**
-> `headlesscode` is a headless coding agent: by default it runs **arbitrary
-> shell commands with your full user privileges** (no sandbox, no approval
-> prompts) and can read and modify your files — including `~/.ssh`, `~/.aws`,
-> and any other credentials your user can access. Run it only on machines and
-> with tasks you trust, and isolate it (container/VM/dedicated user) whenever
-> untrusted content is involved. See [`SECURITY.md`](./SECURITY.md) for the
-> full disclosure and the optional permissions layer that provides defense in
-> depth (not a security boundary).
+## Why use it?
 
-## Purpose
+- **Run repeatable repository tasks.** Give it a task or GitHub issue and let
+  it work through files, commands, and tests from a non-interactive process.
+- **Keep parallel work organized.** Split issues into worker groups, run them
+  in separate worktrees, review the results, and optionally run QA before a
+  human-approved deploy.
+- **Remember the project.** Opt-in local memory stores project facts and
+  rolling session summaries, with a pluggable storage boundary for a future
+  remote backend.
+- **Bound the expensive parts.** Per-session cost, duration, iteration, and
+  fleet-concurrency limits are built into the orchestration and watcher paths.
+- **Experiment with improvement.** The `improve` command runs a bounded
+  recursive self-improvement loop against an external evaluator, with the
+  default worker using a local Qwen 3.5 9B model through Ollama.
 
-Drive a coding agent headlessly against real git repos: read a target repo's
-`.roomodes` and `.roo/rules-<slug>/` files, build a system prompt from mode +
-rules, call an LLM API (OpenRouter in Phase 1) with the tool schema, execute
-tool calls via plain `fs`/`child_process` (no `vscode.*` anywhere), and loop
-until completion. Non-interactive by design.
+The project also includes a GitHub issue watcher and an evaluation-only cloud
+provider interface. No live cloud resources are launched by the current
+implementation.
+
+> **Security warning: default-allow arbitrary command execution.**
+> By default, `headlesscode` runs arbitrary shell commands with the invoking
+> user's privileges. It can read and modify files, including credentials such
+> as `~/.ssh` and `~/.aws`, without approval prompts. Use it only with trusted
+> tasks and isolate it with a container, VM, or dedicated user when untrusted
+> content is involved. The optional permissions layer is defense in depth, not
+> a security boundary. See [`SECURITY.md`](./SECURITY.md).
 
 ## Quick start
 
@@ -146,6 +138,45 @@ The agent reads files, runs commands, writes code, and finishes by calling
 printed to stdout. Exit code 0 = success; 1 = task failed (max iterations or
 consecutive-mistake limit); 2 = usage/config error (e.g. missing
 `HEADLESSCODE_OPENROUTER_API_KEY`).
+
+## Recursive self-improvement
+
+`headlesscode improve` is a bounded research loop for improving the harness
+itself. A supervisor creates isolated candidate worktrees, asks the local Qwen
+3.5 9B worker to make focused changes, runs regression plus visible and hidden
+evaluations, and keeps the archive, score, and selection decision outside the
+candidate worktree. Each generation also produces a report for human review.
+
+```bash
+# Inspect the planned experiment without creating worktrees or calling a model:
+npx tsx src/cli.ts improve --repo . --dry-run
+
+# Run one small generation with the local Ollama model:
+npx tsx src/cli.ts improve --repo . --population 2 --generations 1
+```
+
+This is an experiment, not unattended model training and not a security
+boundary. The current loop records model-candidate and training interfaces,
+trajectory datasets, parent-selection policies, and resource-tagged jobs, but
+does not yet train adapters, schedule multiple trajectories, or provide
+OS-level candidate isolation. Those limits are tracked in [the RSI roadmap](#rsi-roadmap).
+
+## RSI roadmap
+
+The implemented loop is intentionally honest about what remains. Follow-up
+work is tracked in GitHub:
+
+- [OS-level candidate sandbox](https://github.com/Capsize-Games/headlesscode/issues/3)
+- [Cryptographically verifiable evaluator and artifacts](https://github.com/Capsize-Games/headlesscode/issues/4)
+- [Resource-aware resumable scheduler](https://github.com/Capsize-Games/headlesscode/issues/5)
+- [Adaptive multi-trajectory search](https://github.com/Capsize-Games/headlesscode/issues/6)
+- [Validated curriculum fixtures](https://github.com/Capsize-Games/headlesscode/issues/7)
+- [Adversarial evaluation and cross-model supervision](https://github.com/Capsize-Games/headlesscode/issues/8)
+- [Real LoRA or QLoRA backend](https://github.com/Capsize-Games/headlesscode/issues/9)
+
+See [`docs/recursive-self-improvement.md`](./docs/recursive-self-improvement.md)
+for the design and [`docs/rsi-progress.md`](./docs/rsi-progress.md) for the
+record of the first bounded runs.
 
 ## Registering a new project
 
