@@ -393,6 +393,32 @@ async function testChildBoundedFailureIsHonest(): Promise<void> {
 	}
 }
 
+async function testMalformedChildCompletionFailsClosed(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-newtask-malformed-result-"))
+	try {
+		// A child that calls attempt_completion without a non-empty string result
+		// must end as a bounded failure. The malformed payload must not become a
+		// successful tool result in the parent's next prompt.
+		const client = new ScriptedLlmClient([
+			{ message: toolCall("new_task", { mode: "code", message: "return a malformed result", todos: null }) },
+			{ message: toolCall("attempt_completion", { result: {} }) },
+			{ message: toolCall("attempt_completion", { result: "parent handled malformed child" }) },
+		])
+		const session = await makeSession({ task: "delegate a malformed step", client, workspaceRoot: ws })
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected the parent to recover, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "parent handled malformed child")
+		const callId = findNewTaskCallId(session.state.messages)
+		const toolMsg = findToolResult(session.state.messages, callId)
+		assert.ok(toolMsg, "expected a new_task tool result in parent history")
+		assert.match(toolMsg.content ?? "", /malformed attempt_completion result/)
+		assert.doesNotMatch(toolMsg.content ?? "", /\{\}/, "raw malformed child payload must not be forwarded")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -402,6 +428,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["new_task: called alongside another tool is refused, sibling still executes", testNewTaskMustBeCalledAlone],
 	["new_task: child edits checkpoint into the SAME shadow-git history, lineage-tagged", testChildCheckpointSharesParentHistory],
 	["new_task: child bounded failure surfaces as an honest error, not fabricated success", testChildBoundedFailureIsHonest],
+	["new_task: malformed child completion fails closed", testMalformedChildCompletionFailsClosed],
 ]
 
 async function main(): Promise<void> {

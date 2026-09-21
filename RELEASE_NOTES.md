@@ -1,3 +1,20 @@
+# headlesscode v1.2.1
+
+Released 2026-09-21.
+
+## Fixes
+
+- Malformed `attempt_completion` results now fail closed as bounded session
+  failures. Recursive child sessions return an honest failure to their parent
+  instead of promoting malformed completion data into the next prompt.
+
+## Verification
+
+- `npm run typecheck`
+- `npm test` (147 test files passed)
+- `bash scripts/e2e/run.sh` (9 assertions passed)
+- `git diff --check`
+
 # headlesscode v1.2.0
 
 Released 2026-09-20.

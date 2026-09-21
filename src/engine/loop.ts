@@ -3776,10 +3776,17 @@ export class HeadlessSession {
 					siblingCount: calls.length - 1,
 				})
 			} else if (completionCall) {
-				const result =
-					typeof completionCall.args?.result === "string"
-						? completionCall.args.result
-						: JSON.stringify(completionCall.args)
+				const rawResult = completionCall.args?.result
+				if (typeof rawResult !== "string" || rawResult.trim() === "") {
+					return this.boundedFailure(
+						"malformed attempt_completion result",
+						iteration,
+						toolCalls + 1,
+						1,
+						1,
+					)
+				}
+				const result = rawResult
 
 				// Verify-before-finishing guardrail (see
 				// HeadlessSessionConfig.verifyBeforeCompletion's doc comment): the
