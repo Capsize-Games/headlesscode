@@ -151,6 +151,48 @@ export interface ToolResult {
 	isError: boolean
 }
 
+/** Fixed corrections available to an iteration-boundary monitor. */
+export type IterationInterventionTemplateId = "specific-correction" | "generic-review"
+
+/** One completed tool call and its result at an iteration boundary. */
+export interface IterationBoundaryToolRecord {
+	readonly id: string
+	readonly name: string
+	readonly arguments: Readonly<Record<string, unknown>>
+	readonly isError: boolean
+	readonly result: string
+	readonly normalizedError?: string
+}
+
+/** Immutable, versioned observation passed to an optional monitor hook. */
+export interface IterationBoundarySnapshot {
+	readonly schemaVersion: 1
+	readonly sessionId: string
+	readonly iteration: number
+	readonly maxIterations: number
+	readonly toolCalls: readonly IterationBoundaryToolRecord[]
+	readonly consecutiveMistakes: number
+	readonly readOnlyStreak: number
+	readonly identicalCallStreak: number
+	readonly repeatedToolFailureStreak: number
+	readonly inputTokens: number
+	readonly outputTokens: number
+	readonly cachedTokens: number
+	readonly totalToolCalls: number
+	readonly reasoningAvailable: boolean
+}
+
+/** Advisory response accepted from an iteration-boundary monitor. */
+export interface IterationBoundaryIntervention {
+	readonly id: string
+	readonly templateId: IterationInterventionTemplateId
+}
+
+/** Optional monitor callback. It has no authority beyond requesting a fixed correction. */
+export type IterationBoundaryHook = (
+	snapshot: IterationBoundarySnapshot,
+) => IterationBoundaryIntervention | null | undefined | Promise<IterationBoundaryIntervention | null | undefined>
+
 /**
  * Usage of one LLM call made OUTSIDE the main loop's request path — e.g. the
  * cloud vision captioning in src/vision/describe.ts (browser screenshots and

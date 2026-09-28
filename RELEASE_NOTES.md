@@ -1,3 +1,40 @@
+# headlesscode v1.2.2
+
+Released 2026-09-28.
+
+## NVIDIA OpenShell and security enhancements
+
+- Added an NVIDIA OpenShell execution provider for orchestrated workers,
+  planning, continuation, review, QA, and rework, plus a one-off
+  `openshell-session` command. Each session runs from a disposable Git clone;
+  the host worktree and harness control files are not mounted in the sandbox.
+- Validate and import worker results only after sandbox deletion. Bundle checks
+  enforce size, expected branch, ancestry, and unchanged host branch state.
+- Added OpenShell setup guidance, a worker image, sample provider profile and
+  policy, and lifecycle tests. A live OpenShell 0.1.2 gateway run completed a
+  DeepSeek V4 Flash task through OpenRouter and imported its result.
+- Hardened iteration-boundary callbacks and added a bounded synthetic monitor
+  pilot. The pilot uses local scripted trajectories and does not establish
+  real-model monitoring effectiveness.
+
+OpenShell Landlock permissions are additive. The prior host-worktree mount was
+removed after a live probe showed that nested read-only rules did not revoke
+write access inherited from a writable parent. The current provider mounts a
+disposable clone instead. NVIDIA Sentry, BlueField enforcement, hardware
+telemetry, quarantine, and hardware-level containment are not configured.
+Committed secrets remain readable through Git history in the clone; do not
+commit credentials to a repository.
+
+## Verification
+
+- `npm run typecheck`
+- `npm test` (151 test files passed; the optional 6 Chromium tests were run
+  separately after installing Playwright Chromium)
+- `npm test -- browser-action` (6 tests passed)
+- `bash scripts/e2e/run.sh` (9 assertions passed)
+- `bash -n scripts/run-worker.sh scripts/spawn-parallel-worktrees.sh scripts/stop-worker.sh`
+- `git diff --check`
+
 # headlesscode v1.2.1
 
 Released 2026-09-21.

@@ -37,6 +37,9 @@
  *   → `.harness.inject-message` marker; see loop.ts's checkInjectedMessage.
  *   The text has been appended to the session's live history as a plain
  *   user-role message and the next LLM call sees it)
+ *   iteration_intervention_queued / applied / abstained (optional typed
+ *   iteration-boundary monitor; fixed-template requests only, with abstains
+ *   recording malformed, duplicate, timed-out, or late requests)
  *
  * `condensed` is the one structural event that was originally only a log line
  * (`[condense] oldest turns condensed…` in src/engine/condense.ts) — the

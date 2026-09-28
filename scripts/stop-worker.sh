@@ -74,6 +74,71 @@ if [ ! -d "$WT_PATH" ]; then
     exit 2
 fi
 
+SANDBOX_MARKER="$WT_PATH/.harness.openshell-sandbox"
+stop_openshell_sandbox() {
+    [ -f "$SANDBOX_MARKER" ] || return 0
+    SANDBOX_NAME="$(tr -d '[:space:]' < "$SANDBOX_MARKER")"
+    if ! [[ "$SANDBOX_NAME" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+        echo "stop-worker: invalid OpenShell sandbox name in $SANDBOX_MARKER" >&2
+        exit 1
+    fi
+    if ! command -v openshell >/dev/null 2>&1; then
+        echo "stop-worker: openshell CLI is required to stop sandbox $SANDBOX_NAME" >&2
+        exit 1
+    fi
+    DELETE_OUTPUT="$(openshell sandbox delete "$SANDBOX_NAME" 2>&1)" || {
+        if ! [[ "$DELETE_OUTPUT" =~ [Nn]ot\ found|does\ not\ exist ]]; then
+            echo "stop-worker: failed to delete OpenShell sandbox $SANDBOX_NAME: $DELETE_OUTPUT" >&2
+            exit 1
+        fi
+    }
+    DEADLINE=$((SECONDS + 30))
+    while :; do
+        LIST_OUTPUT="$(openshell sandbox list --output json 2>&1)" || {
+            echo "stop-worker: could not verify OpenShell sandbox deletion: $LIST_OUTPUT" >&2
+            exit 1
+        }
+        SANDBOX_LIST="$LIST_OUTPUT" SANDBOX_NAME="$SANDBOX_NAME" node -e '
+            let x;
+            try { x = JSON.parse(process.env.SANDBOX_LIST); } catch { process.exit(2); }
+            const a = Array.isArray(x) ? x : (x && Array.isArray(x.sandboxes) ? x.sandboxes : null);
+            if (!a || a.some(s => !s || typeof s.name !== "string")) process.exit(2);
+            process.exit(a.some(s => s.name === process.env.SANDBOX_NAME) ? 0 : 1);
+        ' 2>/dev/null
+        LIST_STATUS=$?
+        if [ "$LIST_STATUS" -eq 1 ]; then
+            echo "stop-worker: OpenShell sandbox $SANDBOX_NAME confirmed deleted"
+            OPENSHELL_SANDBOX_NAME="$SANDBOX_NAME" node -e '
+                const fs = require("node:fs");
+                const os = require("node:os");
+                const path = require("node:path");
+                const name = process.env.OPENSHELL_SANDBOX_NAME;
+                if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(name)) process.exit(2);
+                const root = path.resolve(process.env.HEADLESSCODE_OPENSHELL_SCRATCH_ROOT || path.join(os.homedir(), ".local", "share", "headlesscode", "openshell-sessions"));
+                fs.rmSync(path.join(root, `headlesscode-openshell-session-${name}`), { recursive: true, force: true });
+                fs.rmSync(path.join(root, `headlesscode-openshell-session-${name}.lock`), { recursive: true, force: true });
+            ' || {
+                echo "stop-worker: failed to clean OpenShell scratch workspace for $SANDBOX_NAME" >&2
+                exit 1
+            }
+            return 0
+        fi
+        if [ "$LIST_STATUS" -ne 0 ]; then
+            echo "stop-worker: OpenShell sandbox list returned malformed JSON; cannot verify deletion" >&2
+            exit 1
+        fi
+        if [ "$SECONDS" -ge "$DEADLINE" ]; then
+            echo "stop-worker: OpenShell sandbox $SANDBOX_NAME remains after delete" >&2
+            exit 1
+        fi
+        sleep 0.25
+    done
+}
+
+# Delete first to stop remote execution promptly, then verify deletion again
+# after killing the launcher to close the create/stop race.
+stop_openshell_sandbox || exit 1
+
 # Kill ONE process tree identified by its pid/pgid marker files.
 # $1 = label ("harness"|"qa"), $2 = worktree path.
 # Returns 0 when the tree is confirmed gone, 1 when it is not.
@@ -145,4 +210,8 @@ stop_tree() {
 RC=0
 stop_tree harness "$WT_PATH" || RC=1
 stop_tree qa "$WT_PATH" || RC=1
+stop_openshell_sandbox || RC=1
+if [ "$RC" -eq 0 ] && [ -f "$SANDBOX_MARKER" ]; then
+    rm -f "$SANDBOX_MARKER"
+fi
 exit "$RC"

@@ -1,6 +1,6 @@
 {
 	"name": "headlesscode",
-	"version": "1.2.1",
+	"version": "1.2.2",
 	"description": "Standalone headless coding-agent harness: runs the Zoo Code agent loop (prompts, tools, modes) without a VS Code UI, driven by CLI, HTTP, and parallel worktree orchestration.",
 	"license": "Apache-2.0",
 	"repository": {
@@ -41,6 +41,7 @@
 		"dev": "tsx src/index.ts",
 		"start": "tsx src/cli.ts",
 		"cli": "tsx src/cli.ts",
+		"monitor:pilot": "tsx scripts/monitor-pilot/run.ts",
 		"test": "node scripts/run-tests.mjs",
 		"prepublishOnly": "npm ci && npm test"
 	},

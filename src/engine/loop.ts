@@ -98,6 +98,10 @@ import type {
 	SessionResult,
 	SessionBudgetUsage,
 	SessionCompletionVerification,
+	IterationBoundaryHook,
+	IterationBoundarySnapshot,
+	IterationBoundaryIntervention,
+	IterationBoundaryToolRecord,
 	ToolContext,
 	ToolResult,
 } from "./types.js"
@@ -145,6 +149,14 @@ const PAUSED_FILENAME = ".harness.paused"
  * consumed + deleted by checkInjectedMessage (see plans/live-message-injection-for-chat-uis.md).
  */
 export const INJECT_MESSAGE_FILENAME = ".harness.inject-message"
+
+/** Fixed, repository-owned monitor corrections. Monitor output never supplies text. */
+const ITERATION_INTERVENTION_TEMPLATES: Record<string, string> = {
+	"specific-correction":
+		"Check the latest tool result. Re-read the affected configuration if necessary, identify the failed precondition, and change the next action before retrying.",
+	"generic-review": "Pause and review your approach before continuing.",
+}
+const DEFAULT_ITERATION_BOUNDARY_TIMEOUT_MS = 250
 
 /**
  * 2026-08-08: raised from 50 — real rounds against non-trivial issues
@@ -1356,6 +1368,10 @@ export interface HeadlessSessionConfig {
 	 * pattern as the live-usage-snapshot tests).
 	 */
 	eventHook?: (eventType: string, fields: Record<string, unknown>) => void
+	/** Optional awaited monitor invoked between complete iterations. */
+	iterationBoundaryHook?: IterationBoundaryHook
+	/** Fail-closed timeout for the optional iteration-boundary monitor. */
+	iterationBoundaryTimeoutMs?: number
 	/**
 	 * OPT-IN local exploration phase (default OFF — see
 	 * plans/local-explore-phase-experiment.md): when truthy, HeadlessSession runs a
@@ -1509,6 +1525,8 @@ export interface ResolvedSessionConfig {
 	pausePollIntervalMs: number
 	/** Live event hook (see HeadlessSessionConfig.eventHook). */
 	eventHook?: (eventType: string, fields: Record<string, unknown>) => void
+	iterationBoundaryHook?: IterationBoundaryHook
+	iterationBoundaryTimeoutMs: number
 	/**
 	 * Opt-in local exploration phase (see HeadlessSessionConfig.localExplore).
 	 * undefined/false = OFF (zero behavior change); options object = enabled
@@ -1718,6 +1736,8 @@ export class HeadlessSession {
 	 * when HEADLESSCODE_LAZY_TOOL_CATALOG is off (the default).
 	 */
 	private lazyToolsByName: Map<string, ChatTool> = new Map()
+	/** Intervention ids already applied during this run. */
+	private readonly appliedIterationInterventionIds = new Set<string>()
 
 	constructor(config: HeadlessSessionConfig) {
 		if (!config.llmClient) {
@@ -1798,6 +1818,8 @@ export class HeadlessSession {
 			maxPauseMs: config.maxPauseMs ?? envMaxPauseMs() ?? DEFAULT_MAX_PAUSE_MS,
 			pausePollIntervalMs: config.pausePollIntervalMs ?? DEFAULT_PAUSE_POLL_INTERVAL_MS,
 			eventHook: config.eventHook,
+			iterationBoundaryHook: config.iterationBoundaryHook,
+			iterationBoundaryTimeoutMs: config.iterationBoundaryTimeoutMs ?? DEFAULT_ITERATION_BOUNDARY_TIMEOUT_MS,
 			localExplore: config.localExplore,
 		}
 
@@ -2277,6 +2299,97 @@ export class HeadlessSession {
 			this.logger.warn(`[events] failed to record '${eventType}' (non-fatal; dashboard misses this event)`, {
 				error: error instanceof Error ? error.message : String(error),
 			})
+		}
+	}
+
+	/**
+	 * Observe one complete iteration and, if requested, append exactly one
+	 * repository-owned correction before the next model request. Runtime
+	 * validation is deliberate: callers may be JavaScript or otherwise bypass
+	 * TypeScript, and malformed monitor output must abstain rather than gain
+	 * authority over the session.
+	 */
+	private async runIterationBoundaryHook(
+		snapshot: IterationBoundarySnapshot,
+		messages: ChatMessage[],
+	): Promise<void> {
+		const hook = this.config.iterationBoundaryHook
+		if (hook === undefined || this.sessionEnded) {
+			return
+		}
+		let timedOut = false
+		let timer: ReturnType<typeof setTimeout> | undefined
+		try {
+			const result = await Promise.race([
+				Promise.resolve().then(() => hook(snapshot)),
+				new Promise<undefined>((resolve) => {
+					timer = setTimeout(() => {
+						timedOut = true
+						resolve(undefined)
+					}, this.config.iterationBoundaryTimeoutMs)
+				}),
+			])
+			if (timedOut || result === undefined) {
+				await this.emitEvent("iteration_intervention_abstained", () =>
+					this.eventFeed.emit("iteration_intervention_abstained", {
+						iteration: snapshot.iteration,
+						reason: timedOut ? "timeout" : "missing",
+					}), { iteration: snapshot.iteration })
+				return
+			}
+			const candidate = result as Partial<IterationBoundaryIntervention> | null
+			if (
+				candidate === null ||
+				typeof candidate !== "object" ||
+				typeof candidate.id !== "string" ||
+				candidate.id.trim() === "" ||
+				typeof candidate.templateId !== "string" ||
+				!Object.prototype.hasOwnProperty.call(ITERATION_INTERVENTION_TEMPLATES, candidate.templateId)
+			) {
+				await this.emitEvent("iteration_intervention_abstained", () =>
+					this.eventFeed.emit("iteration_intervention_abstained", {
+						iteration: snapshot.iteration,
+						reason: "malformed",
+					}), { iteration: snapshot.iteration })
+				return
+			}
+			const id = candidate.id.trim()
+			const templateId = candidate.templateId as string
+			await this.emitEvent("iteration_intervention_queued", () =>
+				this.eventFeed.emit("iteration_intervention_queued", {
+					iteration: snapshot.iteration,
+					interventionId: id,
+					templateId,
+				}), { iteration: snapshot.iteration })
+			if (this.sessionEnded || this.appliedIterationInterventionIds.has(id)) {
+				await this.emitEvent("iteration_intervention_abstained", () =>
+					this.eventFeed.emit("iteration_intervention_abstained", {
+						iteration: snapshot.iteration,
+						interventionId: id,
+						reason: this.sessionEnded ? "session-ended" : "duplicate",
+					}), { iteration: snapshot.iteration })
+				return
+			}
+			this.appliedIterationInterventionIds.add(id)
+			messages.push({ role: "user", content: ITERATION_INTERVENTION_TEMPLATES[templateId] })
+			await this.emitEvent("iteration_intervention_applied", () =>
+				this.eventFeed.emit("iteration_intervention_applied", {
+					iteration: snapshot.iteration,
+					interventionId: id,
+					templateId,
+				}), { iteration: snapshot.iteration })
+		} catch (error) {
+			await this.emitEvent("iteration_intervention_abstained", () =>
+				this.eventFeed.emit("iteration_intervention_abstained", {
+					iteration: snapshot.iteration,
+					reason: "error",
+				}), { iteration: snapshot.iteration })
+			this.logger.warn("[monitor] iteration-boundary hook abstained", {
+				iteration: snapshot.iteration,
+				error: error instanceof Error ? error.message : String(error),
+			})
+		} finally {
+			if (timer !== undefined) clearTimeout(timer)
 		}
 	}
 
@@ -3303,6 +3416,7 @@ export class HeadlessSession {
 		let consecutiveMistakes = 0
 		let lastCallSignature: string | undefined
 		let toolCalls = 0
+		let previousIterationTools: readonly IterationBoundaryToolRecord[] = []
 		// Commit-before-finishing guardrail: whether the one-per-session
 		// "uncommitted changes" nudge has already been given. A retried
 		// attempt_completion is always accepted afterwards (see
@@ -3463,6 +3577,25 @@ export class HeadlessSession {
 			// report the count at iteration start, not after.
 			const historyMessageCount = messages.length
 			this.scheduleAux(() => this.emitEvent("iteration_start", () => this.eventFeed.iterationStart(iteration, historyMessageCount)))
+			if (iteration > 1) {
+				const boundarySnapshot = Object.freeze({
+						schemaVersion: 1,
+						sessionId: this.sessionId,
+						iteration,
+						maxIterations,
+						toolCalls: previousIterationTools,
+						consecutiveMistakes,
+						readOnlyStreak,
+						identicalCallStreak,
+						repeatedToolFailureStreak: toolFailureStreakCount,
+						inputTokens: this.totalInputTokens,
+						outputTokens: this.totalOutputTokens,
+						cachedTokens: this.totalCachedTokens,
+						totalToolCalls: toolCalls,
+					reasoningAvailable: messages.some((message) => typeof message.reasoning === "string" && message.reasoning.length > 0),
+				})
+				await this.runIterationBoundaryHook(boundarySnapshot, messages)
+			}
 
 			// Pause/resume (dashboard control): block between iterations (never
 			// mid-tool-call — same safe boundary as the budget check below)
@@ -4554,6 +4687,7 @@ export class HeadlessSession {
 			// turn — the executor re-reads the file per call, so the failure
 			// mechanism is stale SEARCH text, not a stale executor).
 			const batchEditedPaths = new Map<string, string>()
+			const boundaryTools: IterationBoundaryToolRecord[] = []
 
 			// (S3) Partition this turn's calls: pure read-only/exploration calls
 			// (read_file/list_files/search_files, the TS code-intel reads, and a
@@ -4769,6 +4903,14 @@ export class HeadlessSession {
 					name: call.name,
 					content: resultContent,
 				})
+				boundaryTools.push({
+					id: call.id,
+					name: call.name,
+					arguments: Object.freeze({ ...call.args }),
+					isError,
+					result: resultContent,
+					...(isError ? { normalizedError: resultContent.split("\n", 1)[0]?.slice(0, 200) ?? "tool_error" } : {}),
+				})
 
 				// Record successful edits so a later sibling call on the same
 				// path can be diagnosed (see above).
@@ -4877,6 +5019,7 @@ export class HeadlessSession {
 					lastCallSignature = undefined
 				}
 			}
+			previousIterationTools = Object.freeze(boundaryTools.map((record) => Object.freeze(record)))
 
 			// Blind tree-walking guardrail (P1.6): after N consecutive
 			// iterations whose every tool call is a plain read/exploration

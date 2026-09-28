@@ -5,520 +5,306 @@
 [![Node.js >=18](https://img.shields.io/badge/node-%3E%3D18-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](./LICENSE)
 
-Run a coding agent where the work actually happens: in a terminal, a CI job,
-or an isolated git worktree. `headlesscode` brings the useful parts of
-[Zoo Code](https://github.com/Zoo-Code-Org/Zoo-Code) to a plain Node.js process,
-without requiring a VS Code window.
+`headlesscode` runs the Zoo Code agent loop from a Node.js process, without a
+VS Code window. Run one task directly, launch parallel workers in Git
+worktrees, or use the NVIDIA OpenShell provider for sandboxed sessions.
 
-It is made for real repositories and real engineering loops. The harness reads
-the target project's modes and rules, gives the model a controlled tool set,
-keeps work separated in git worktrees, and leaves behind logs and state that a
-person can inspect.
+| Use it for | What it does |
+| --- | --- |
+| One repository task | Reads project modes and instructions, edits files, runs commands, and reports a result. |
+| Parallel issue work | Splits GitHub issues into Git worktrees, runs workers, monitors completion, and reviews changes. |
+| Intake automation | Watches a GitHub label and starts bounded batches of work. |
+| OpenShell sessions | Runs worker and review sessions in disposable clones, then validates and imports results after sandbox deletion. |
+| Harness experiments | Runs a bounded recursive self-improvement loop against an external evaluator. |
 
-## Why use it?
+## Security
 
-- **Run repeatable repository tasks.** Give it a task or GitHub issue and let
-  it work through files, commands, and tests from a non-interactive process.
-- **Keep parallel work organized.** Split issues into worker groups, run them
-  in separate worktrees, review the results, and optionally run QA before a
-  human-approved deploy.
-- **Remember the project.** Opt-in local memory stores project facts and
-  rolling session summaries, with a pluggable storage boundary for a future
-  remote backend.
-- **Bound the expensive parts.** Per-session cost, duration, iteration, and
-  fleet-concurrency limits are built into the orchestration and watcher paths.
-- **Experiment with improvement.** The `improve` command runs a bounded
-  recursive self-improvement loop against an external evaluator, with the
-  default worker using a local Qwen 3.5 9B model through Ollama.
+> **Default-allow arbitrary command execution.** By default, `headlesscode`
+> runs shell commands with the invoking user's privileges. It can read and
+> modify files, including credentials such as `~/.ssh` and `~/.aws`, without
+> approval prompts. Use it only with trusted tasks and isolate it with a
+> container, VM, or dedicated user when untrusted content is involved. The
+> optional permissions layer is defense in depth, not a security boundary.
+> See [`SECURITY.md`](./SECURITY.md).
 
-The project also includes a GitHub issue watcher and an evaluation-only cloud
-provider interface. No live cloud resources are launched by the current
-implementation.
-
-> **Security warning: default-allow arbitrary command execution.**
-> By default, `headlesscode` runs arbitrary shell commands with the invoking
-> user's privileges. It can read and modify files, including credentials such
-> as `~/.ssh` and `~/.aws`, without approval prompts. Use it only with trusted
-> tasks and isolate it with a container, VM, or dedicated user when untrusted
-> content is involved. The optional permissions layer is defense in depth, not
-> a security boundary. See [`SECURITY.md`](./SECURITY.md).
+OpenShell runs each session in a disposable Git clone mounted at `/workspace`;
+the host worktree and harness control files are not mounted. After the sandbox
+is deleted, HeadlessCode validates a Git bundle and imports the result into the
+host worktree. The gateway must support Docker bind mounts and must see the
+configured scratch root at the same absolute path as the host. See the
+[OpenShell guide](./docs/openshell-integration.md) for setup and security
+details. This integration does not configure NVIDIA Sentry or hardware
+monitoring.
 
 ## Quick start
 
-Install from npm:
+Requires Node.js 18 or newer. Install globally or run with `npx`:
 
 ```bash
 npm install -g headlesscode
+# or
+npx headlesscode --task "Fix the bug in src/index.ts" --workspace /path/to/repo
 ```
 
-Or run it without installing, via npx:
+For a real model call, set the OpenRouter key. `--dry-run` does not need a key.
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `HEADLESSCODE_OPENROUTER_API_KEY` | For OpenRouter calls | OpenRouter API key. |
+| `OPENROUTER_MODEL` | No | Default model; `deepseek/deepseek-v4-flash-0731`. `--model` overrides it. |
+| `OPENROUTER_HTTP_REFERER` | No | OpenRouter application referer header. |
+| `OPENROUTER_APP_TITLE` | No | OpenRouter application title header. |
+| `HEADLESSCODE_WORKSPACE_ROOT` | No | Default workspace; otherwise the current directory. |
 
 ```bash
-npx headlesscode --task "Fix the bug in src/index.ts" --workspace /path/to/target/repo
-```
-
-```bash
-# Required (except for --dry-run):
 export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-...
-
-# Optional:
-export OPENROUTER_MODEL=deepseek/deepseek-v4-flash-0731  # default model
-export OPENROUTER_HTTP_REFERER=https://example.com       # OpenRouter app header
-export OPENROUTER_APP_TITLE="headlesscode"               # OpenRouter X-Title header
-export HEADLESSCODE_WORKSPACE_ROOT=/path/to/target/repo  # default workspace root
-
-headlesscode --task "Fix the bug in src/index.ts" --workspace /path/to/target/repo
+headlesscode --task "Fix the bug in src/index.ts" --workspace /path/to/repo
 ```
 
-To work from a source checkout instead (for contributing):
+For a source checkout:
 
 ```bash
 git clone https://github.com/Capsize-Games/headlesscode.git
 cd headlesscode
 npm install
-node bin/headlesscode.mjs --task "Fix the bug in src/index.ts" --workspace /path/to/target/repo
+node bin/headlesscode.mjs --task "Fix the bug in src/index.ts" --workspace /path/to/repo
 ```
 
-### Systemwide `headlesscode` command
+To install a `headlesscode` wrapper on your `PATH`, run `scripts/install-cli.sh`.
+It writes to `~/.local/bin` by default (override with `HEADLESSCODE_BIN_DIR`)
+and runs this checkout's local `tsx`. Re-run it if you move the checkout.
 
-To avoid re-typing `node <checkout>/bin/headlesscode.mjs` from every project,
-install a `headlesscode` command onto your `PATH` once:
+### Check project instructions without calling a model
+
+`--dry-run` builds the system prompt and validates project configuration. It
+prints the prompt and a summary of loaded modes, tools, and prompt size. A
+successful exit means prompt building and mode/rules loading succeeded.
 
 ```bash
-scripts/install-cli.sh
+headlesscode --dry-run --mode code --workspace /path/to/repo
 ```
 
-This writes a wrapper to `~/.local/bin/headlesscode` (override with
-`HEADLESSCODE_BIN_DIR`) that runs this checkout's `src/cli.ts` via its local
-`tsx`, without `cd`-ing — so `--repo`/`--workspace` still default to whatever
-directory you're standing in when you invoke it. Re-run the script any time
-after `git pull` to point it at a moved checkout; the wrapper itself doesn't
-need updating for ordinary code changes.
+Project `.roomodes`, `.roo/rules-<slug>/`, and `AGENTS.md` instructions are
+loaded by the prompt builder when applicable. The selected mode controls which
+tools are exposed. See [Architecture](#architecture) for the relevant code.
+
+## OpenShell
+
+Build the worker image and import the OpenRouter provider profile once. Configure
+a Docker-backed OpenShell gateway with driver-config and bind-mount support;
+keep that gateway restricted to trusted operators.
 
 ```bash
-# from any repo, no HEADLESSCODE_ROOT plumbing needed:
-headlesscode orchestrate --repo . --issue 42
-```
+# Run these commands from a HeadlessCode source checkout.
+docker build -f docker/OpenShell.Dockerfile -t headlesscode-openshell:local .
+openshell profile import -f shared/openshell/headlesscode-openrouter.yaml
 
-The rest of this README uses the plain `headlesscode` form for brevity —
-substitute `node <checkout>/bin/headlesscode.mjs` if you haven't run
-`scripts/install-cli.sh` yet.
-
-## The `--dry-run` flow (no API key needed)
-
-`--dry-run` builds the full system prompt and validates configuration loading
-without calling the LLM — useful for CI and for checking that a target repo's
-`.roomodes` / `.roo/rules-<slug>/` / `AGENTS.md` are picked up:
-
-```bash
-headlesscode --dry-run --mode code --workspace /path/to/target/repo
-```
-
-It prints the assembled system prompt plus a summary line (mode, custom modes
-loaded, exposed tools, prompt size). Exit code 0 means prompt building + mode /
-rules loading succeeded; non-zero means a config error.
-
-## Real-usage example against a target repo
-
-```bash
 export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-...
-export HEADLESSCODE_WORKSPACE_ROOT=~/Projects/some-target-repo
-
-# Point the agent at an already-scoped issue, in an isolated worktree:
-headlesscode \
-  --mode code \
-  --task "Implement issue #29: add retry logic to the HTTP client (see .roo/rules for project conventions)." \
-  --workspace ~/Projects/some-target-repo \
-  --max-iterations 50 \
-  --log-file ./headlesscode-session.log
+export HEADLESSCODE_OPENSHELL_POLICY="$PWD/shared/openshell/headlesscode-policy.yaml"
+headlesscode orchestrate --repo /path/to/repo --issue 42 \
+  --execution-provider openshell
 ```
 
-The agent reads files, runs commands, writes code, and finishes by calling
-`attempt_completion` (or by giving a final text answer). The final result is
-printed to stdout. Exit code 0 = success; 1 = task failed (max iterations or
-consecutive-mistake limit); 2 = usage/config error (e.g. missing
-`HEADLESSCODE_OPENROUTER_API_KEY`).
+Each worker gets an independent clone and a temporary result directory. Neither
+bind source is the host worktree. After the sandbox is deleted, HeadlessCode
+imports a verified Git bundle into the host branch. The default scratch root is
+`~/.local/share/headlesscode/openshell-sessions`; create it before starting the
+gateway and bind-mount it into the gateway container at the same absolute path.
+If you choose another root, set `HEADLESSCODE_OPENSHELL_SCRATCH_ROOT` and mount
+that host directory into the gateway container at the same path. Project data and shared instructions
+are copied into the scratch tree and mounted separately. The writable scratch
+checkpoint store supports checkpoints during a session and is discarded at
+teardown. Opt-in memory uses a scratch snapshot and merges validated JSONL
+records after sandbox deletion. No OpenRouter key is passed as a normal sandbox
+environment argument; OpenShell injects the imported provider credential.
 
-## Recursive self-improvement
+`headlesscode watch` accepts the same `--execution-provider openshell` option.
+OpenShell applies to worker, plan-first, continuation, reviewer, QA, and rework
+sessions. The one-off `headlesscode openshell-session` command runs a single
+task and keeps its host worktree for review. Set up a gateway callback address
+that the sandbox's Docker bridge can reach; keep the client endpoint loopback
+only when possible. Read the [OpenShell guide](./docs/openshell-integration.md)
+before adapting the sample gateway or filesystem policy.
 
-`headlesscode improve` is a bounded research loop for improving the harness
-itself. A supervisor creates isolated candidate worktrees, asks the local Qwen
-3.5 9B worker to make focused changes, runs regression plus visible and hidden
-evaluations, and keeps the archive, score, and selection decision outside the
-candidate worktree. Each generation also produces a report for human review.
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `--execution-provider` | `local` | `orchestrate`/`watch` runtime: `local` or `openshell`. Also settable with `HEADLESSCODE_EXECUTION_PROVIDER`. |
+| `HEADLESSCODE_OPENSHELL_POLICY` | No default | Base OpenShell policy YAML; required for OpenShell sessions. |
+| `HEADLESSCODE_OPENSHELL_IMAGE` | `headlesscode-openshell:local` | Sandbox image. |
+| `HEADLESSCODE_OPENSHELL_PROVIDERS` | `headlesscode-openrouter` | Comma-separated credential profile names. |
+| `HEADLESSCODE_OPENSHELL_CPU` / `HEADLESSCODE_OPENSHELL_MEMORY` | `2` / `4Gi` | Per-sandbox resource requests. |
+| `HEADLESSCODE_OPENSHELL_NAME_PREFIX` | `hcls` | Prefix for deterministic sandbox names. |
+| `HEADLESSCODE_OPENSHELL_SCRATCH_ROOT` | `~/.local/share/headlesscode/openshell-sessions` | Host scratch directory that the gateway container must see at the same path. |
+
+The `headlesscode openshell-session` command provides a single-session live
+entry point; run `headlesscode openshell-session --help` for options.
+
+## Parallel work and GitHub intake
+
+`orchestrate` runs a parallel round from GitHub issue numbers or a JSON file.
+It splits work, creates a worktree per group, starts workers, watches for
+completion, and reviews results. QA and deployment approval are optional.
 
 ```bash
-# Inspect the planned experiment without creating worktrees or calling a model:
-npx tsx src/cli.ts improve --repo . --dry-run
-
-# Run one small generation with the local Ollama model:
-npx tsx src/cli.ts improve --repo . --population 2 --generations 1
+headlesscode orchestrate --repo /path/to/repo --issue 42 --issue 43 --qa
+headlesscode orchestrate status --repo /path/to/repo --wait --timeout-ms 7200000
 ```
 
-This is an experiment, not unattended model training and not a security
-boundary. The current loop records model-candidate and training interfaces,
-trajectory datasets, parent-selection policies, and resource-tagged jobs, but
-does not yet train adapters, schedule multiple trajectories, or provide
-OS-level candidate isolation. Those limits are tracked in [the RSI roadmap](#rsi-roadmap).
+`watch` polls GitHub for issues with a chosen label and starts bounded batches.
+It requires `GH_TOKEN` or `GITHUB_TOKEN`; it performs intake only. Use a later
+`orchestrate` run to monitor, review, QA, or deploy a batch.
 
-## RSI roadmap
+```bash
+GH_TOKEN=... headlesscode watch \
+  --owner my-org --repo /path/to/repo --label needs-agent --run-once
+```
 
-The implemented loop is intentionally honest about what remains. Follow-up
-work is tracked in GitHub:
+| Command | Important options | Behavior and limits |
+| --- | --- | --- |
+| `headlesscode orchestrate --repo <path>` | Repeat `--issue <n>` or use `--issues-json <file>`; `--execution-provider local|openshell`, `--qa`, `--deploy`, `--no-review`, `--dry-run`, `--max-iterations <n>`, `--max-rework-cycles <n>`, `--max-continuations <n>` | Worktree per group; default review is enabled. OpenShell applies to worker, plan-first, continuation, reviewer, QA, and rework sessions. `--deploy` uses the human-approval gate. |
+| `headlesscode orchestrate status --repo <path>` | `--wait`, `--timeout-ms <n>`, `--json` | Reads durable round state; `--wait` blocks until terminal state or timeout. |
+| `headlesscode orchestrate stop --repo <path>` | Repeat `--group <name>` | Stops selected groups' worker process trees. |
+| `headlesscode watch --owner <o> --repo <path> --label <name>` | `--execution-provider local|openshell`, `--run-once`, `--dry-run`, `--max-per-sweep <n>`, `--max-concurrent-sessions <n>`, `--retry-failed` | Label-based intake. `--dry-run` still needs a GitHub token to list issues, but writes no state and starts no workers. |
 
-- [OS-level candidate sandbox](https://github.com/Capsize-Games/headlesscode/issues/3)
-- [Cryptographically verifiable evaluator and artifacts](https://github.com/Capsize-Games/headlesscode/issues/4)
-- [Resource-aware resumable scheduler](https://github.com/Capsize-Games/headlesscode/issues/5)
-- [Adaptive multi-trajectory search](https://github.com/Capsize-Games/headlesscode/issues/6)
-- [Validated curriculum fixtures](https://github.com/Capsize-Games/headlesscode/issues/7)
-- [Adversarial evaluation and cross-model supervision](https://github.com/Capsize-Games/headlesscode/issues/8)
-- [Real LoRA or QLoRA backend](https://github.com/Capsize-Games/headlesscode/issues/9)
+Both orchestration and watcher enforce a shared concurrency cap, defaulting to
+3 (`HEADLESSCODE_MAX_CONCURRENT_SESSIONS`). Orchestration aborts when the cap
+is full; the watcher leaves excess issues pending. The watcher records
+idempotency state under `<repo>/.worktrees/.watcher-state.json` by default.
+Use `--help` on a command for its complete options. Detailed guides:
+[orchestration](./docs/phase2-orchestration.md),
+[issue watcher](./docs/phase5-issue-watcher.md),
+[QA implementation](./src/qa/qa.ts), and
+[deployment gate](./docs/phase4-deploy-gate.md).
 
-See [`docs/recursive-self-improvement.md`](./docs/recursive-self-improvement.md)
-for the design and [`docs/rsi-progress.md`](./docs/rsi-progress.md) for the
-record of the first bounded runs.
+## Project registration and search
 
-## Registering a new project
-
-To use headlesscode against a project that isn't set up as a headlesscode
-project yet, register it in one step:
+Registering a project detects its stack, ensures `.gitignore` excludes
+`.headlesscode/`, and builds a code-search index and codemap. Indexing calls an
+embedding API and can incur charges unless skipped or configured for Ollama.
 
 ```bash
 headlesscode init --workspace ~/Projects/your-project
+headlesscode init --workspace ~/Projects/your-project --skip-index
 ```
 
-This detects the project's stack(s) (which drives per-session instruction
-selection), makes sure the project's `.gitignore` excludes `.headlesscode/`
-session artifacts, and builds the codebase-search index and the codemap — no
-manual `index`/`codemap`/`.gitignore` steps needed. The index step calls the
-embedding API and costs real money unless you pass `--skip-index` or
-`--embedding-backend ollama`. See `headlesscode init --help` for the full
-options.
+See `headlesscode init --help` for `--skip-codemap` and embedding-backend
+options. The CLI also provides `index`, `codemap`, project-store, GitHub App,
+and decision-proxy commands; run `headlesscode --help` for the command list
+and each subcommand's `--help` for complete usage.
 
-## CLI reference
+## Recursive self-improvement
 
+`headlesscode improve` runs a bounded experiment against an external evaluator.
+The supervisor creates candidate worktrees, asks the local Ollama worker to
+make focused changes, runs regression and visible/hidden evaluations, and
+keeps selection state outside candidate worktrees. Each generation produces a
+report for human review.
+
+```bash
+npx tsx src/cli.ts improve --repo . --dry-run
+npx tsx src/cli.ts improve --repo . --population 2 --generations 1
 ```
-headlesscode --task "<task text>" [options]
-headlesscode --task-file <path> [options]
-headlesscode --dry-run [options]
-headlesscode orchestrate --repo <path> --issue <n> [--issue <n> ...] [options]
-headlesscode watch --owner <o> --repo <path> --label <name> [options]
 
-  --mode <slug>                 Mode to run in (built-in or from .roomodes). Default: code
-  --task <text>                 The task description for the agent
-  --task-file <path>            Read the task from a file (relative to workspace)
-  --workspace <root>            Workspace root (default: $HEADLESSCODE_WORKSPACE_ROOT or cwd)
-  --model <id>                  OpenRouter model id (default: $OPENROUTER_MODEL or deepseek/deepseek-v4-flash-0731)
-  --max-iterations <n>          Loop iteration cap (default: 50)
-  --consecutive-error-limit <n> Consecutive mistakes before giving up (default: 3)
-  --max-cost-usd <n>            Phase 6: per-session cost cap in USD (decimal). Default
-                                $HEADLESSCODE_MAX_COST_USD; off when neither is set
-  --max-duration-ms <n>         Phase 6: per-session wall-clock cap in ms. Default
-                                $HEADLESSCODE_MAX_DURATION_MS; off when neither is set.
-                                A tripped cap aborts with reason "budget"
-  --log-file <path>             Also append structured logs to this file
-  --memory-dir <path>           Phase 3 memory: store facts + session summaries under <path>
-                                (enabled; default $HEADLESSCODE_MEMORY_DIR or
-                                <workspace>/.headlesscode/memory). Memory is OFF unless set.
-  --no-memory                   Explicitly disable memory even if HEADLESSCODE_MEMORY_DIR is set
-  --allowed-commands <list>  Comma-separated command prefixes the agent may run.
-                               Default: $HEADLESSCODE_ALLOWED_COMMANDS, else
-                               .headlesscode/permissions.json, else empty (=
-                               allow everything except --denied-commands; see
-                               SECURITY.md)
-  --denied-commands <list>   Comma-separated command prefixes that are ALWAYS
-                               refused (deny wins over allow; dangerous shell
-                               substitutions are always blocked regardless).
-                               Default: $HEADLESSCODE_DENIED_COMMANDS, else
-                               .headlesscode/permissions.json, else empty
-  --protected-files <list>   Comma-separated glob patterns of files the agent may
-                               not write. Default: $HEADLESSCODE_PROTECTED_FILES,
-                               else .headlesscode/permissions.json, else
-                               ".env,.env.*,*.pem,*.key,id_rsa*"
-  --allow-protected-writes   Escape hatch: permit writes to protected files
-                               (default: OFF). Also settable via
-                               "allowProtectedWrites": true in
-                               .headlesscode/permissions.json
-  --dry-run                     Build the system prompt + validate config, then exit (no API key)
-  --version / --help
+This loop does not yet train adapters, schedule multiple trajectories, or
+provide OS-level candidate isolation. Follow-up work is tracked as:
 
-orchestrate subcommand (Phase 2 — parallel worktrees, headless workers):
-  --repo <path>                 Target repo root (required)
-  --issue <n>                   Issue number to include (repeatable)
-  --issues-json <file>          Read issues from a JSON array of {number,title,body}
-                                (used when gh is unavailable, or for tests)
-  --file-issues                 With --issues-json: file a REAL GitHub issue for
-                                each synthetic entry (gh issue create --repo
-                                <origin-owner>/<origin-repo>), swap in the real
-                                number returned, and print one confirmation line
-                                per created issue. A real, visible write to
-                                GitHub — opt-in, never automatic. Requires
-                                --issues-json
-  --batch <name>                Batch id in the state file (default round-<date>)
-  --review-mode <slug>          Mode slug for review sessions (default deepseek-reviewer)
-  --no-review                   Spawn + watch only; skip the reviewer
-  --qa                         Phase 4: run a headless QA session (--mode qa-agent)
-                                on each group after its review passes; record
-                                qa {status,verdict,evidence} in the state file
-  --qa-mode <slug>              Mode slug for QA sessions (default qa-agent; the
-                                target repo's .roomodes + .roo/rules-<slug>/ are
-                                spliced automatically)
-  --deploy                      Phase 4: after all groups done + reviewed + QA passed,
-                                run the human-approval deploy gate
-                                (scripts/deploy-gate.sh) — a hard stop that never runs
-                                the repo's deploy-production.sh without explicit human
-                                approval (interactive on a TTY, token/file otherwise)
-  --deploy-args <str>           Deploy args forwarded to the deploy script after the
-                                gate approves (space-separated flags; also DEPLOY_ARGS env)
-  --poll-interval-ms <n>        Watcher poll interval (default 5000)
-  --max-concurrent-sessions <n> Phase 6 global cap on concurrent sessions across
-                                processes (default $HEADLESSCODE_MAX_CONCURRENT_
-                                SESSIONS or 3). At/over the cap this run ABORTS
-                                with a clear message, exit 1
-  --dry-run                     Print the split plan + spawn commands, spawn nothing
+| Issue | Work |
+| --- | --- |
+| [#3](https://github.com/Capsize-Games/headlesscode/issues/3) | OS-level candidate sandbox |
+| [#4](https://github.com/Capsize-Games/headlesscode/issues/4) | Cryptographically verifiable evaluator and artifacts |
+| [#5](https://github.com/Capsize-Games/headlesscode/issues/5) | Resource-aware resumable scheduler |
+| [#6](https://github.com/Capsize-Games/headlesscode/issues/6) | Adaptive multi-trajectory search |
+| [#7](https://github.com/Capsize-Games/headlesscode/issues/7) | Validated curriculum fixtures |
+| [#8](https://github.com/Capsize-Games/headlesscode/issues/8) | Adversarial evaluation and cross-model supervision |
+| [#9](https://github.com/Capsize-Games/headlesscode/issues/9) | Real LoRA or QLoRA backend |
 
-watch subcommand (Phase 5 — GitHub issue watcher, poll-based intake):
-  --owner <o>                   GitHub owner (required)
-  --repo <path>                 Local clone of the target repo (required; worktrees
-                                are spawned under <path>/.worktrees/). The GitHub repo
-                                name defaults to the directory basename (--gh-repo overrides)
-  --label <name>                The label that triggers processing, e.g. needs-agent
-  --poll-interval-ms <n>        Sweep interval in continuous mode (default 60000)
-  --run-once                    One sweep then exit 0 (or 1 if any spawn failed)
-  --max-per-sweep <n>           Max NEW issues spawned per sweep (default 5); the rest
-                                stay 'pending' in state and are picked up next sweep
-  --max-concurrent-sessions <n> Phase 6 GLOBAL cap on concurrent sessions across
-                                processes (default $HEADLESSCODE_MAX_CONCURRENT_
-                                SESSIONS or 3). Interplay: maxPerSweep bounds one
-                                sweep's burst; this bounds the total fleet — issues
-                                beyond it stay 'pending' until slots free up
-  --state-file <path>           Durable idempotency state (default
-                                <repo>/.worktrees/.watcher-state.json)
-  --mode <slug> / --memory-dir <path>
-                                Forwarded to the spawner (ORCHESTRATOR_MODE /
-                                HEADLESSCODE_MEMORY_DIR)
-  --qa / --deploy               Pass-through: recorded per batch for the follow-up
-                                orchestrate completion run
-  --dry-run                     Sweep + print the spawn plan, spawn nothing, write no
-                                state (still needs a GitHub token for listIssues)
-  --retry-failed                Retry previously-failed spawns next sweep
-```
+See the [RSI design](./docs/recursive-self-improvement.md) and
+[run progress](./docs/rsi-progress.md).
+
+## Core CLI options
+
+| Option | Default or source | Purpose |
+| --- | --- | --- |
+| `--task <text>` / `--task-file <path>` | One is required unless `--dry-run` | Task prompt; task file is resolved relative to the workspace. |
+| `--workspace <path>` | `HEADLESSCODE_WORKSPACE_ROOT` or current directory | Repository directory exposed to the worker. |
+| `--mode <slug>` | `code` | Built-in or project `.roomodes` mode. |
+| `--model <id>` | `OPENROUTER_MODEL` or `deepseek/deepseek-v4-flash-0731` | Model ID. |
+| `--max-iterations <n>` | 250 for direct CLI sessions; orchestrator workers default to 50 | Per-session loop bound. |
+| `--consecutive-error-limit <n>` | 3 (local code backend may use 6) | Consecutive tool/model errors before stopping. |
+| `--max-cost-usd <n>` / `--max-duration-ms <n>` | `HEADLESSCODE_MAX_COST_USD` / `HEADLESSCODE_MAX_DURATION_MS`; disabled if unset | Per-session budget caps. A tripped cap aborts the session. |
+| `--memory-dir <path>` / `--no-memory` | Off unless `HEADLESSCODE_MEMORY_DIR` or option is set | Enable project facts and rolling session summaries, or explicitly disable. |
+| `--allowed-commands <list>` / `--denied-commands <list>` | CLI, environment, `.headlesscode/permissions.json`; allow list is empty by default | Command-prefix policy. Denials win; dangerous shell substitutions are blocked. See [`SECURITY.md`](./SECURITY.md). |
+| `--protected-files <globs>` / `--allow-protected-writes` | `.env,.env.*,*.pem,*.key,id_rsa*` | Block writes matching protected files; explicit escape hatch. |
+| `--dry-run` | Off | Build prompt and validate configuration without a model call or API key. |
+| `--log-file <path>` | No file | Also append structured session logs to a file. |
+
+Run `headlesscode --help` for advanced controls such as context condensation,
+checkpoints, recursive delegation, session pause, and LLM timeout. Some options
+are backend-specific; help output and source defaults are authoritative.
 
 ## Architecture
 
-- [`src/llm/openrouter.ts`](./src/llm/openrouter.ts) — OpenRouter
-  chat-completions client using native `fetch` (no axios/node-fetch/openai
-  SDK). Reads `HEADLESSCODE_OPENROUTER_API_KEY`, optional `OPENROUTER_HTTP_REFERER` /
-  `OPENROUTER_APP_TITLE`; model default `deepseek/deepseek-v4-flash-0731` (env
-  `OPENROUTER_MODEL` overrides). Non-2xx → typed `OpenRouterError` with status +
-  body excerpt; supports `AbortSignal` timeouts.
-- [`src/tools/executor.ts`](./src/tools/executor.ts) — headless executor for
-  `read_file`, `write_to_file`, `execute_command`, `list_files` (plain
-  `fs`/`child_process`), plus `attempt_completion` / `ask_followup_question`
-  handlers and "not implemented" stubs for every other vendored tool schema.
-  All file operations are resolved relative to the workspace root and rejected
-  if they escape it (path-traversal guard via `path.resolve` + containment
-  check). Command results are truncated (~30k chars) to keep context bounded.
-- [`src/tools/output-summarizer.ts`](./src/tools/output-summarizer.ts) —
-  OPT-IN local summarization of oversized `execute_command` output: when
-  `HEADLESSCODE_LOCAL_SUMMARIZATION=1`, a result that would exceed the 30k
-  char cap is compressed by a local Ollama chat model before reaching the
-  cloud model, with a `[Output summarized by local model…]` transparency
-  header. OFF by default; on any failure it falls back to today's exact blunt
-  truncation (never an error, never a hang). Endpoint/model configurable via
-  `HEADLESSCODE_OLLAMA_URL` (default `http://localhost:11434`) and
-  `HEADLESSCODE_SUMMARIZATION_MODEL` (default `qwen3:8b`). Deliberately
-  limited to command output — file/diff content always stays verbatim.
-- [`src/engine/parser.ts`](./src/engine/parser.ts) — OpenAI function-calling
-  parser: JSON.parses `tool_calls[].function.arguments` with a best-effort
-  partial-JSON fallback; parse failures are marked and fed back as errors.
-- [`src/engine/prompt.ts`](./src/engine/prompt.ts) — wraps the vendored
-  `SYSTEM_PROMPT` builder: loads project `.roomodes` (same zod schema as Zoo
-  Code's `CustomModesManager`), passes the workspace as `cwd` so `.roo/rules-*`
-  / `AGENTS.md` splice in, and selects the mode's exposed tools.
-- [`src/engine/loop.ts`](./src/engine/loop.ts) — `HeadlessSession`, the
-  orchestration loop. System + user → LLM → assistant (with tool_calls) → parse
-  → execute → `tool` role message → repeat. Terminates on `attempt_completion`
-  (its `args.result` is the final answer) or a text-only reply; fails bounded
-  on max iterations or `consecutiveErrorLimit` consecutive mistakes (tool
-  errors / parse errors / identical repeated calls). History truncation is a
-  Phase 1 placeholder: system + first user always kept, sliding window of the
-  last ~40 messages. The loop accepts an injected `llmClient` (DI) so tests use
-  a fake; the CLI wires `OpenRouterClient`.
-- [`src/engine/logger.ts`](./src/engine/logger.ts) — structured logger
-  (timestamped lines to stdout/stderr, optional file).
-- [`src/memory/`](./src/memory/index.ts) — memory subsystem:
-  - [`src/memory/types.ts`](./src/memory/types.ts) — the `MemoryFact` /
-    `SessionSummary` schema (per-project scoped, kinds
-    `convention|decision|failure|knowledge` where "things that didn't work"
-    are `failure`) and the two contracts: `MemoryStore` (the pluggable
-    storage boundary) and `Embedder`. Hard data-isolation requirement
-    documented: the harness knowledge is a dedicated schema, never reachable
-    through any customer tenant route.
-  - [`src/memory/local.ts`](./src/memory/local.ts) — `LocalMemoryStore`: the
-    fully working file backend (`facts/<project>.jsonl` +
-    `sessions/<project>.jsonl`, append-only, idempotent `addFact` by content
-    hash, `queryRecall` = keyword matches (high weight) + local-embedder
-    cosine similarity, deterministic ordering).
-  - [`src/memory/embed.ts`](./src/memory/embed.ts) — `createLocalEmbedder()`:
-    zero-dependency, deterministic lexical-hash embedder (lowercase word +
-    char-bigram tokens → fixed-dim L2-normalized vector). Placeholder for a
-    real local embedding model behind the same `Embedder` interface.
-  - [`src/memory/summarizer.ts`](./src/memory/summarizer.ts) —
-    `extractSessionSummary` (deterministic; files/commands derived from the
-    tool history, facts via keyword heuristics) + `buildRollingSummary`
-    (compact markdown recap of the last N sessions, so a session never needs
-    the infinite raw history).
-  - [`src/memory/uwuchat.ts`](./src/memory/uwuchat.ts) — a remote
-    `MemoryStore` implementation stub for a future hosted memory API. Throws
-    "not implemented" until its base-URL/token env vars are set.
-  - Memory is wired into `HeadlessSession` as an **opt-in** config (`memory`
-    + `project`); when unset the loop behaves exactly as before. When set, the
-    loop injects a `## PROJECT MEMORY` section (recalled facts + rolling
-    recap) into the first user message and records the session + extracted
-    facts afterwards — and memory failures are always non-fatal.
-- [`src/orchestrator/`](./src/orchestrator/index.ts) — Phase 2 orchestration
-  layer: `split.ts` (issue-splitting heuristics, deterministic +
-  unit-tested), `state.ts` (`.worktrees/.orchestrator-state.json` read/write),
-  `reviewer.ts` (adversarial fresh-context review run with a read-only
-  executor), `watch.ts` (completion polling of `.harness.done` markers + stall
-  guard), and `cli.ts` (the `orchestrate` subcommand — split → spawn via
-  `scripts/spawn-parallel-worktrees.sh` → watch → review → QA → deploy gate).
-- [`src/qa/qa.ts`](./src/qa/qa.ts) — Phase 4 headless QA: `runQa()` runs a
-  second harness session against a worktree in the target repo's `qa-agent`
-  mode (auto-spliced from `.roomodes` + `.roo/rules-qa-agent/`), with a
-  generic checklist fallback when the repo has no such mode. Read + command
-  tools only (no `write_to_file`) — QA verifies and reports, it never edits.
-  Verdict parsing is fail-closed (`pass`/`fail`/`error`, default `fail`).
-- [`src/deploy/gate.ts`](./src/deploy/gate.ts) + [`src/deploy/gate-cli.ts`](./src/deploy/gate-cli.ts) —
-  Phase 4 human-approval deploy gate: the pure, unit-tested decision function
-  `decideApproval` (interactive y/N, one-time approval file, or
-  `DEPLOY_APPROVAL_TOKEN` matching `<repo>/.deploy-approval`; never
-  auto-approves) plus a thin CLI the bash wrapper calls.
-- [`src/watcher/`](./src/watcher/index.ts) — Phase 5 GitHub issue watcher:
-	[`github.ts`](./src/watcher/github.ts) (native-fetch GitHub REST client with
-	label filter, PR filtering, pagination, `GITHUB_API_BASE_URL` override for
-	tests/mocks), [`state.ts`](./src/watcher/state.ts) (durable idempotency
-	state file — write-ahead `spawned` → `done`/`failed`, `pending` for capped
-	issues, restart-safe), [`watch.ts`](./src/watcher/watch.ts) (the poll loop:
-	list by label → split → spawn via the existing bash spawner, bounded by
-	`maxPerSweep` and the Phase 6 global cap), and [`cli.ts`](./src/watcher/cli.ts)
-	(the `watch` subcommand — continuous or `--run-once`, `--dry-run`,
-	`--retry-failed`).
-- [`src/budget/`](./src/budget/index.ts) — Phase 6 guardrails:
-	[`cost.ts`](./src/budget/cost.ts) (model pricing table + `estimateCost`,
-	`HEADLESSCODE_PRICING_JSON` override, conservative fallback for unlisted
-	models), [`budget.ts`](./src/budget/budget.ts) (`SessionBudget` +
-	`BudgetTracker`: `tick()` before each LLM call, `record()` after with usage
-	tokens, `check()` snapshot, `BudgetExceededError`), and
-	[`concurrency.ts`](./src/budget/concurrency.ts) (`ConcurrencyLimiter` —
-	fail-fast in-process semaphore — plus `activeSessionCount` reading the
-	durable orchestrator/watcher state files for a cross-process view). Wired
-	into `HeadlessSession` (`budget` config, `budgetUsage` on results), the base
-	CLI (`--max-cost-usd` / `--max-duration-ms`), `orchestrate` (aborts at the
-	cap), the watcher (defers cap-exceeding issues to `pending`), and
-	`run-worker.sh`/`run-qa.sh` (env forwarding).
-- [`src/cloud/`](./src/cloud/provider.ts) — Phase 6 ephemeral compute
-	abstraction: the `CloudProvider` lifecycle interface
-	(`spawnWorktreeSession` → `waitReady` → `runHarness` → `collectResults` →
-	`teardown`) with `LocalProcessProvider` as the current local behavior behind
-	it (reuses `spawn-parallel-worktrees.sh` + `run-worker.sh`), so a
-	container/VM-per-issue backend slots in without touching the orchestration
-	layer. A cloud-provider sketch is documented (evaluation only — no
-	live setup; see [`docs/phase6-cloud.md`](./docs/phase6-cloud.md)).
-- [`src/cli.ts`](./src/cli.ts) — the `headlesscode` bin entry (+ `orchestrate`
-  and `watch` subcommand dispatch).
-- [`scripts/run-worker.sh`](./scripts/run-worker.sh) — launches one headless
-  harness worker per worktree (pid, log, exit code, `.harness.done` marker).
-- [`scripts/run-qa.sh`](./scripts/run-qa.sh) — Phase 4 QA wrapper mirroring
-  run-worker.sh: launches one harness QA session per worktree (`.qa-task.md`,
-  `.qa.pid`, `qa.log`, `.qa.exit`, `.qa.done/`).
-- [`scripts/deploy-gate.sh`](./scripts/deploy-gate.sh) — Phase 4 gate wrapper:
-  path safety, deployment summary, interactive + token/file approval, then
-  (and only then) invokes the repo's `scripts/deploy-production.sh` with
-  forwarded deploy args. Exit 3 = human DENIED (hard stop).
-- [`scripts/spawn-parallel-worktrees.sh`](./scripts/spawn-parallel-worktrees.sh)
-  — spawns one git worktree + harness worker per group (worktree/.env/branch
-  conventions, `run-worker.sh` + state-file writes, no GUI involved).
+The core loop builds the project-specific prompt, calls the configured model,
+executes the selected mode's available tools, and repeats until completion or a
+configured limit. File tools are confined to the workspace path; shell commands
+run with the process user's privileges unless an external boundary such as
+OpenShell is configured. Mode instructions and safety controls are distinct:
+prompt instructions guide the model, while filesystem or command restrictions
+must be enforced by the runtime or sandbox.
 
-### Phase 1 tool filtering decision
+| Area | Entry points | Responsibility |
+| --- | --- | --- |
+| CLI and session loop | [`src/cli.ts`](./src/cli.ts), [`src/engine/`](./src/engine/) | Command dispatch, prompt construction, LLM/tool loop, iteration and context limits. |
+| Model and tools | [`src/llm/`](./src/llm/), [`src/tools/`](./src/tools/) | OpenRouter client, tool execution, output handling, and workspace path checks. |
+| Parallel orchestration | [`src/orchestrator/`](./src/orchestrator/), [`scripts/spawn-parallel-worktrees.sh`](./scripts/spawn-parallel-worktrees.sh) | Issue grouping, worktree workers, completion state, review, rework, QA, and deploy gating. |
+| GitHub intake | [`src/watcher/`](./src/watcher/) | Label polling, durable idempotency, pending work, and bounded spawning. |
+| Runtime providers | [`src/cloud/`](./src/cloud/) | Local process, Docker, and OpenShell implementations of the session lifecycle. `orchestrate` and `watch` can select OpenShell for worker sessions. |
+| Memory and budgets | [`src/memory/`](./src/memory/), [`src/budget/`](./src/budget/) | Opt-in project memory, cost/time budgets, and session concurrency accounting. |
+| QA and deploy gate | [`src/qa/`](./src/qa/), [`src/deploy/`](./src/deploy/) | Read-only QA verdicts and explicit human approval before deployment. |
+| Project map and search | [`src/codemap/`](./src/codemap/), [`src/codesearch/`](./src/codesearch/) | Deterministic module maps and repository search indexes. |
 
-The loop exposes to the model exactly the tools the executor can actually run
-for the selected mode: the intersection of the vendored mode tool groups
-(`getToolsForMode`) with the Phase 1 executable set
-(`read_file`, `write_to_file`, `execute_command`, `list_files`,
-`attempt_completion`, `ask_followup_question`). Stub-only tools (`apply_diff`,
-`search_files`, …) stay registered in the executor purely as a safety net
-(clear "not implemented" error) but are NOT advertised to the model, so it
-doesn't waste turns calling them.
+The model only receives tools supported by the selected mode and executable
+runtime. Unsupported vendored tool schemas are not advertised. This keeps the
+model's action set aligned with the current executor; it does not make arbitrary
+shell commands safe by itself.
 
 ## Development
 
-```bash
-npm run typecheck     # npx tsc --noEmit (whole repo incl. vendored core)
-npm run smoke         # vendored prompt builder smoke test (no network)
-npm test              # unit tests with fake LLM clients (no network/key)
-bash scripts/e2e/run.sh            # Phase 1 integration (mock OpenRouter)
-bash scripts/e2e-phase2/run.sh     # Phase 2 integration (spawn + watch + review)
-bash scripts/e2e-phase4/run.sh     # Phase 4 integration (QA + deploy gate, fake deploy)
-bash scripts/e2e-phase5/run.sh     # Phase 5 integration (watcher vs fake GitHub server,
-                                   #   stubbed spawner: state transitions + no double-spawn)
-bash scripts/e2e-phase6/run.sh     # Phase 6 integration (budget abort via mock OpenRouter
-                                   #   + concurrency-cap sweep via fake GitHub + stubbed spawner)
-npm run cli -- --dry-run --workspace .   # build this repo's system prompt
-```
+| Command | Purpose |
+| --- | --- |
+| `npm install` | Install dependencies. |
+| `npm run typecheck` | TypeScript type check. |
+| `npm run smoke` | Vendored prompt-builder smoke test; no network. |
+| `npm test` | Unit tests using local/fake dependencies where provided. |
+| `npm run cli -- --dry-run --workspace .` | Build this repository's system prompt. |
+| `bash scripts/e2e/run.sh` | Phase 1 CLI integration against mock OpenRouter. |
+| `bash scripts/e2e-phase2/run.sh` | Orchestrator spawn/watch/review integration. |
+| `bash scripts/e2e-phase4/run.sh` | QA and deploy-gate integration with fake deploy. |
+| `bash scripts/e2e-phase5/run.sh` | Watcher integration against fake GitHub and stubbed spawner. |
+| `bash scripts/e2e-phase6/run.sh` | Budget-abort and concurrency-cap integration. |
 
-The engine tests (`src/engine/__tests__/loop.test.ts`) run the full loop with a
-fake `LlmClient` injected via the `HeadlessSession` constructor — no network,
-no API key required. Phase 2 adds `src/orchestrator/__tests__/` (split
-heuristics, state round-trip, reviewer verdict parsing), and the e2e scripts
-drive the real CLI through a local mock OpenRouter server, including a
-2-worktree parallel spawn, completion-marker polling, and a read-only review
-invocation. Phase 5 adds `src/watcher/__tests__/` (github client with an
-injected fetch, watcher-state idempotency semantics, and the watch loop with
-an injected gh client + spawner covering spawn/idempotency/cap/failure/
-dry-run/abort) and `scripts/e2e-phase5/run.sh` (watcher against a fake GitHub
-server with a stubbed spawner).
+Unit tests can inject a fake LLM client into `HeadlessSession`; the listed
+end-to-end scripts use local mock services. OpenShell provider tests use a
+fake CLI. A live OpenShell 0.1.2 run called DeepSeek V4 Flash through OpenRouter,
+imported its Git result, and denied a host-worktree canary write. The earlier
+shared-worktree mount was removed after a live probe showed it exposed host Git
+and control files. See the [OpenShell guide](./docs/openshell-integration.md)
+for the current clone-and-import boundary and its validation.
 
-## Phase status
+## Implementation status
 
-- ✅ Phase 1 Subtask 1 — vendored portable Zoo Code core
-  ([`src/vendor/zoo-code/`](./src/vendor/zoo-code/), read-only dependency).
-- ✅ Phase 1 Subtask 2 — runtime engine (OpenRouter client, tool executor,
-  parser, orchestration loop, CLI, tests).
-- ✅ Phase 2 — headless orchestration layer: drop-in
-  `spawn-parallel-worktrees.sh` + `run-worker.sh` (harness subprocess per
-  worktree, `.harness.done` completion markers), issue-splitting heuristics
-  port, `.orchestrator-state.json` state management, headless reviewer, and
-  the `orchestrate` CLI subcommand (see
-  [`docs/phase2-orchestration.md`](./docs/phase2-orchestration.md)).
-- ✅ Phase 3 — memory subsystem: per-project knowledge facts + rolling session
-  summaries (`src/memory/`), local deterministic embedder for semantic recall,
-  opt-in `HeadlessSession`/CLI wiring (`--memory-dir`, `--no-memory`), and a
-  pluggable `MemoryStore` contract with a remote-backend client stub.
-- ✅ Phase 4 — QA + deploy gate: headless QA runs the target repo's `qa-agent`
-  mode (`--qa` / `--qa-mode`), verdict parsing is fail-closed, results land in
-  the state file's per-group `qa` field; the human-approval deploy gate
-  (`--deploy`, `scripts/deploy-gate.sh` + `src/deploy/gate.ts`) is a hard stop
-  in front of `deploy-production.sh` that never auto-approves (see
-  [`docs/phase4-qa.md`](./docs/phase4-qa.md) and
-  [`docs/phase4-deploy-gate.md`](./docs/phase4-deploy-gate.md)).
-- ✅ Phase 5 — GitHub issue watcher: poll-based intake (`watch` subcommand) —
-  detect issues by label via the GitHub REST API (`GH_TOKEN`), fan each out
-  through `splitIssues` + the existing `spawn-parallel-worktrees.sh`, track
-  idempotency durably (`.worktrees/.watcher-state.json`, write-ahead
-  ordering, `pending` cap deferral, restart-safe), optional `--dry-run` /
-  `--run-once` / `--retry-failed`; webhook upgrade designed but not built as
-  a server (see [`docs/phase5-issue-watcher.md`](./docs/phase5-issue-watcher.md)).
-- ✅ Phase 6 — cloud scaling, guardrails-first: per-session cost/time/iteration
-  budget (`src/budget/`, `--max-cost-usd` / `--max-duration-ms`, budgetUsage on
-  results, worker env forwarding) + a hard concurrent-session cap
-  (`HEADLESSCODE_MAX_CONCURRENT_SESSIONS`, orchestrate aborts / watcher defers
-  to `pending`) + the `CloudProvider` abstraction with `LocalProcessProvider`
-  and an evaluation-only cloud-provider sketch (see
-  [`docs/phase6-cloud.md`](./docs/phase6-cloud.md)). No live cloud launched;
-  a container/VM-per-issue backend slots in behind the same interface.
-- ⏳ Phase 3 (remaining) — token-based condensation.
+| Area | Status | Details |
+| --- | --- | --- |
+| Runtime engine | Implemented | Portable Zoo Code core, model client, tool executor, parser, CLI, and tests. |
+| Orchestration | Implemented | Parallel worktrees, issue splitting, status tracking, review, and recovery. See [guide](./docs/phase2-orchestration.md). |
+| Memory | Implemented | Opt-in per-project facts and session summaries with a local store; remote store remains a stub. |
+| QA and deploy approval | Implemented | Read-only QA plus a fail-closed human-approval deploy gate. See [orchestration guide](./docs/phase2-orchestration.md) and [deploy gate](./docs/phase4-deploy-gate.md). |
+| GitHub watcher | Implemented | Poll-based label intake; webhook server is not implemented. See [guide](./docs/phase5-issue-watcher.md). |
+| Budget and concurrency controls | Implemented | Per-session limits and a cross-process concurrency cap. |
+| Local process provider | Implemented | Existing host-process worker path behind the provider lifecycle interface. |
+| Docker provider | Implemented | Container-backed provider implementation; `orchestrate` does not currently select it. |
+| OpenShell provider | Implemented | Disposable clone, separate scratch data, validated Git bundle import, and sandbox teardown. See [guide](./docs/openshell-integration.md). |
+| Context management | Implemented | Token-aware condensation summarizes older turns; message-count truncation remains the non-fatal fallback. See [`src/engine/condense.ts`](./src/engine/condense.ts). |
 
 ## Attribution
 

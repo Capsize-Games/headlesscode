@@ -129,6 +129,7 @@ export interface WatcherConfig {
 	spawn?: (batch: SpawnBatch) => SpawnResult | Promise<SpawnResult>
 	/** Harness mode for workers (forwarded to the spawner as ORCHESTRATOR_MODE). */
 	mode?: string
+	executionProvider?: "local" | "openshell"
 	/** Memory dir for workers (forwarded to the spawner as HEADLESSCODE_MEMORY_DIR). */
 	memoryDir?: string
 	/** Phase 4 pass-through: recorded on the batch entry (see docs). */
@@ -480,7 +481,7 @@ function batchId(): string {
  * with cwd = the target repo so `git rev-parse --show-toplevel` resolves).
  * No worktree creation happens in TS; the bash script remains the spawner.
  */
-export function defaultSpawn(batch: SpawnBatch, config: Pick<WatcherConfig, "mode" | "memoryDir">): SpawnResult {
+export function defaultSpawn(batch: SpawnBatch, config: Pick<WatcherConfig, "mode" | "memoryDir" | "executionProvider">): SpawnResult {
 	const issues: SplitIssue[] = [
 		{ number: batch.issue.number, title: batch.issue.title, body: batch.issue.body },
 	]
@@ -511,6 +512,7 @@ export function defaultSpawn(batch: SpawnBatch, config: Pick<WatcherConfig, "mod
 			...process.env,
 			TARGET_REPO: batch.repoRoot,
 			ORCHESTRATOR_MODE: config.mode ?? "code",
+			HEADLESSCODE_EXECUTION_PROVIDER: config.executionProvider ?? process.env.HEADLESSCODE_EXECUTION_PROVIDER ?? "local",
 			HEADLESSCODE_PROJECT: path.basename(batch.repoRoot),
 			...(config.memoryDir ? { HEADLESSCODE_MEMORY_DIR: path.resolve(config.memoryDir) } : {}),
 		},

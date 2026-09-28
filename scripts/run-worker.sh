@@ -224,6 +224,35 @@ mkdir '$WT_PATH/.harness.done' 2>/dev/null
 exit \$CODE
 "
 
+if [ "${HEADLESSCODE_EXECUTION_PROVIDER:-local}" = "openshell" ]; then
+    if [ -z "${HEADLESSCODE_OPENSHELL_POLICY:-}" ] || [ ! -f "$HEADLESSCODE_OPENSHELL_POLICY" ]; then
+        echo "run-worker: set HEADLESSCODE_OPENSHELL_POLICY to an existing policy file when using OpenShell" >&2
+        exit 2
+    fi
+    REPO_ROOT="${TARGET_REPO:-$(git -C "$WT_PATH" rev-parse --show-toplevel)}"
+    SANDBOX_ARGS=(openshell-worker --repo "$REPO_ROOT" --worktree "$WT_PATH" -- "$TASK_FLAG" "$TASK_PATH" --workspace "$WT_PATH" --mode "$MODE")
+    [ -n "$MODEL" ] && SANDBOX_ARGS+=(--model "$MODEL")
+    [ -n "$LOG_FILE" ] && SANDBOX_ARGS+=(--log-file "$LOG_FILE")
+    [ -n "${HEADLESSCODE_MEMORY_DIR:-}" ] && SANDBOX_ARGS+=(--memory-dir "$HEADLESSCODE_MEMORY_DIR")
+    [ -n "$MAX_ITERATIONS_VALUE" ] && SANDBOX_ARGS+=(--max-iterations "$MAX_ITERATIONS_VALUE")
+    [ -n "${HEADLESSCODE_MAX_COST_USD:-}" ] && SANDBOX_ARGS+=(--max-cost-usd "$HEADLESSCODE_MAX_COST_USD")
+    [ -n "${HEADLESSCODE_MAX_DURATION_MS:-}" ] && SANDBOX_ARGS+=(--max-duration-ms "$HEADLESSCODE_MAX_DURATION_MS")
+    [ -n "${HEADLESSCODE_DECISION_TIMEOUT_MS:-}" ] && SANDBOX_ARGS+=(--decision-timeout-ms "$HEADLESSCODE_DECISION_TIMEOUT_MS")
+    [ -n "${HEADLESSCODE_WINDOW_SIZE:-}" ] && SANDBOX_ARGS+=(--window-size "$HEADLESSCODE_WINDOW_SIZE")
+    printf -v SANDBOX_ARGS_QUOTED ' %q' "${SANDBOX_ARGS[@]}"
+    WRAPPER="
+cd '$HARNESS_ROOT'
+$CLI${SANDBOX_ARGS_QUOTED}
+CODE=\$?
+printf '%s' \"\$CODE\" > '$WT_PATH/.harness.exit'
+mkdir '$WT_PATH/.harness.done' 2>/dev/null
+exit \$CODE
+"
+elif [ "${HEADLESSCODE_EXECUTION_PROVIDER:-local}" != "local" ]; then
+    echo "run-worker: unsupported HEADLESSCODE_EXECUTION_PROVIDER='$HEADLESSCODE_EXECUTION_PROVIDER' (expected local or openshell)" >&2
+    exit 2
+fi
+
 # ── Launch detached + record pid + pgid ─────────────────────────────────────
 rm -f "$WT_PATH/.harness.exit"
 rm -rf "$WT_PATH/.harness.done"

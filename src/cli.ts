@@ -44,6 +44,7 @@ import { costHistoryCliMain } from "./orchestrator/cost-history-cli.js"
 import { resolvePermissions, type PermissionsConfig } from "./permissions/config.js"
 import { resolveModelForMode, resolveReasoningEffortForMode } from "./config/mode-models.js"
 import { improveMain } from "./rsi/controller.js"
+import { openShellSessionMain } from "./cloud/openshell-session.js"
 
 const VERSION = "0.1.0"
 
@@ -187,6 +188,9 @@ Usage:
   headlesscode --dry-run [options]          # build system prompt + validate config, no LLM call
 
 Subcommands:
+  headlesscode openshell-session --repo <path> --task <text> --policy <path>
+              Run one task in an OpenShell sandbox and keep its Git worktree
+              for review. See \`openshell-session --help\` for options.
   headlesscode improve --repo <path> [--model <id>] [--population <n>] [--dry-run]
               Run a bounded recursive self-improvement generation. Candidates
               use isolated git worktrees; evaluator/scoring paths are protected.
@@ -721,6 +725,32 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 }
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
+	if (argv[0] === "openshell-review-session" || argv[0] === "openshell-qa-session") {
+		let payload: Record<string, unknown>
+		try {
+			payload = JSON.parse(Buffer.from(argv[1] ?? "", "base64url").toString("utf8")) as Record<string, unknown>
+		} catch {
+			process.stderr.write("headlesscode: invalid OpenShell session payload\n")
+			return 2
+		}
+		if (argv[0] === "openshell-review-session") {
+			const { runReview } = await import("./orchestrator/reviewer.js")
+			const result = await runReview(payload as unknown as Parameters<typeof runReview>[0])
+			process.stdout.write(`HEADLESSCODE_RESULT_JSON:${JSON.stringify(result)}\n`)
+			return 0
+		}
+		const { runQa } = await import("./qa/qa.js")
+		const result = await runQa(payload as unknown as Parameters<typeof runQa>[0])
+		process.stdout.write(`HEADLESSCODE_RESULT_JSON:${JSON.stringify(result)}\n`)
+		return 0
+	}
+	if (argv[0] === "openshell-worker") {
+		const { openShellWorkerMain } = await import("./cloud/openshell-worker.js")
+		return openShellWorkerMain(argv.slice(1))
+	}
+	if (argv[0] === "openshell-session") {
+		return openShellSessionMain(argv.slice(1))
+	}
 	// Bounded recursive self-improvement: the supervisor owns the evaluator,
 	// archive, and selection logic while each candidate runs in its own
 	// worktree. See docs/recursive-self-improvement.md.

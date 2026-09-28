@@ -36,6 +36,7 @@ import { getNativeTools } from "../vendor/zoo-code/src/core/prompts/tools/native
 import { addCustomInstructions } from "../vendor/zoo-code/src/core/prompts/sections/custom-instructions.js"
 import type { ChatTool, LlmClient, SessionResult } from "../engine/types.js"
 import type { SessionBudget } from "../budget/budget.js"
+import { runOpenShellSubsession } from "../cloud/openshell-subsession.js"
 
 /** Default location of the reviewer checklist, relative to the harness repo. */
 export const DEFAULT_REVIEW_PROMPT_PATH = "shared/prompts/review-mode-prompt.md"
@@ -210,6 +211,16 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 		maxIterations = 200,
 		budget,
 	} = options
+	if (process.env.HEADLESSCODE_EXECUTION_PROVIDER === "openshell" && !llmClient) {
+		try {
+			return await runOpenShellSubsession<ReviewResult>("review", workspaceRoot, {
+				workspaceRoot, mode, model, reviewPromptPath, taskText, issues, maxIterations, budget,
+			})
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error)
+			return { findings: [`[review session error] ${message}`], verdict: "error", summary: `Review session failed: ${message}` }
+		}
+	}
 
 	// 2026-08-27: verified live — a review session couldn't find the `curlee`
 	// compiler at all ("curlee runtime is not available in this environment"),

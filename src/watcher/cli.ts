@@ -32,6 +32,7 @@ import * as path from "node:path"
 
 import { Logger } from "../engine/logger.js"
 import { watchIssues, type SweepResult } from "./watch.js"
+import { openshellPreflight } from "../cloud/openshell-preflight.js"
 
 const WATCH_USAGE = `headlesscode watch — Phase 5 GitHub issue watcher
 
@@ -61,6 +62,7 @@ Options:
                          <repo>/.worktrees/.watcher-state.json)
   --mode <slug>          Harness mode for workers (default: code; forwarded
                          to the spawner as ORCHESTRATOR_MODE)
+  --execution-provider <local|openshell> Worker runtime (default: local)
   --qa                   Pass-through: record that a QA round should follow
                          each batch (see docs/phase5-issue-watcher.md)
   --deploy               Pass-through: record that a deploy gate should follow
@@ -92,6 +94,7 @@ export interface WatchCliOptions {
 	maxConcurrentSessions: number
 	stateFile?: string
 	mode: string
+	executionProvider: "local" | "openshell"
 	qa: boolean
 	deploy: boolean
 	memoryDir?: string
@@ -110,6 +113,7 @@ export function parseWatchArgs(argv: string[]): { options: WatchCliOptions; erro
 		maxPerSweep: 5,
 		maxConcurrentSessions: 3,
 		mode: "code",
+		executionProvider: process.env.HEADLESSCODE_EXECUTION_PROVIDER === "openshell" ? "openshell" : "local",
 		qa: false,
 		deploy: false,
 		dryRun: false,
@@ -135,6 +139,12 @@ export function parseWatchArgs(argv: string[]): { options: WatchCliOptions; erro
 		}
 
 		switch (flag) {
+			case "--execution-provider": {
+				const v = next()
+				if (v !== "local" && v !== "openshell") return { options, error: "--execution-provider must be local or openshell" }
+				options.executionProvider = v
+				break
+			}
 			case "--owner": {
 				const v = next()
 				if (v === undefined) {
@@ -300,6 +310,13 @@ export async function watchMain(argv: string[]): Promise<number> {
 			return 2
 		}
 	}
+	if (!options.dryRun && options.executionProvider === "openshell") {
+		const issue = openshellPreflight()
+		if (issue) {
+			process.stderr.write(`headlesscode watch: OpenShell preflight failed: ${issue}\n`)
+			return 2
+		}
+	}
 
 	const ghRepo = options.ghRepo ?? path.basename(repoRoot)
 	const logger = new Logger({ level: "info" })
@@ -328,6 +345,7 @@ export async function watchMain(argv: string[]): Promise<number> {
 			retryFailed: options.retryFailed,
 			dryRun: options.dryRun,
 			mode: options.mode,
+			executionProvider: options.executionProvider,
 			memoryDir: options.memoryDir,
 			qa: options.qa,
 			deploy: options.deploy,

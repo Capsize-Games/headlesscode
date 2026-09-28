@@ -1,0 +1,21 @@
+id: headlesscode-openrouter
+display_name: HeadlessCode OpenRouter
+description: OpenRouter inference access for HeadlessCode workers running in Node.js
+category: inference
+inference_capable: true
+credentials:
+  - name: api_key
+    description: OpenRouter API key
+    env_vars: [HEADLESSCODE_OPENROUTER_API_KEY]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: openrouter.ai
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries: [/usr/local/bin/node]

@@ -95,11 +95,22 @@ export interface ProjectMetadata {
  */
 export function resolveProjectIdentity(workspaceRoot: string): ProjectIdentity {
 	const root = path.resolve(workspaceRoot)
+	// OpenShell runs an independent Git clone so its writable workspace does not
+	// expose host repository metadata. Preserve the original project's store key
+	// without mounting or reading the original repository path in the sandbox.
+	const identityRoot = process.env.HEADLESSCODE_PROJECT_IDENTITY_ROOT?.trim()
+	if (identityRoot && path.isAbsolute(identityRoot)) return { keySource: path.resolve(identityRoot), kind: "git" }
+	// Sandboxed workers may set these to a private Git directory so ordinary
+	// commits cannot touch shared host metadata. Project identity must still
+	// resolve through the workspace's real .git pointer and shared common dir.
+	const gitEnv = { ...process.env }
+	for (const key of ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_NAMESPACE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_INDEX_FILE"]) delete gitEnv[key]
 	// 1. Git repo → `--git-common-dir` (worktree-aware: resolves to the main
 	//    repo's .git from inside a worktree), parent = identity source.
 	try {
 		const out = execFileSync("git", ["rev-parse", "--git-common-dir"], {
 			cwd: root,
+			env: gitEnv,
 			encoding: "utf-8",
 			timeout: 10_000,
 			stdio: ["ignore", "pipe", "ignore"],

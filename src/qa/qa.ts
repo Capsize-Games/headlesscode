@@ -49,6 +49,7 @@ import { addCustomInstructions } from "../vendor/zoo-code/src/core/prompts/secti
 import type { ChatTool, LlmClient, SessionResult } from "../engine/types.js"
 import type { MemoryStore } from "../memory/types.js"
 import type { SessionBudget } from "../budget/budget.js"
+import { runOpenShellSubsession } from "../cloud/openshell-subsession.js"
 
 /** Default mode slug used for QA sessions (the qa-agent mode). */
 export const DEFAULT_QA_MODE = "qa-agent"
@@ -246,6 +247,17 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
 		memory = null,
 		project,
 	} = options
+	if (process.env.HEADLESSCODE_EXECUTION_PROVIDER === "openshell" && !llmClient) {
+		try {
+			return await runOpenShellSubsession<QaResult>("qa", workspaceRoot, {
+				workspaceRoot, mode, model, baseUrl, maxIterations, budget, project,
+				...(options.taskText ? { taskText: options.taskText } : {}),
+			})
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error)
+			return { verdict: "error", evidence: "", summary: `QA session failed: ${message}` }
+		}
+	}
 
 	// Detect whether the target repo actually defines the requested mode. If
 	// not, fall back to the generic checklist as a system prompt override.

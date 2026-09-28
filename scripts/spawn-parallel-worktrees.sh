@@ -360,7 +360,12 @@ EOF
     printf '\n===== plan-first run start: %s (mode %s, max-iterations %s) =====\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PLAN_FIRST_MODE" "$PLAN_FIRST_MAX_ITERATIONS" >>"$wt_path/harness.log"
     local plan_ok=1
-    (cd "$HARNESS_ROOT" && $CLI "${planner_args[@]}") >>"$wt_path/harness.log" 2>&1 || plan_ok=0
+    if [ "${HEADLESSCODE_EXECUTION_PROVIDER:-local}" = "openshell" ]; then
+        local sandbox_args=(openshell-worker --repo "$REPO_ROOT" --worktree "$wt_path" -- "${planner_args[@]}")
+        (cd "$HARNESS_ROOT" && $CLI "${sandbox_args[@]}") >>"$wt_path/harness.log" 2>&1 || plan_ok=0
+    else
+        (cd "$HARNESS_ROOT" && $CLI "${planner_args[@]}") >>"$wt_path/harness.log" 2>&1 || plan_ok=0
+    fi
 
     if [ "$plan_ok" -eq 1 ] && [ -s "$wt_path/PLAN.md" ]; then
         {
@@ -464,9 +469,12 @@ for spec in "$@"; do
     http_port=$((8090 + offset * 10))
     vite_port=$((5174 + offset))
 
-    # Copy the main repo's .env (secrets/keys) and override the
-    # port + project-name knobs so this stack is fully isolated.
-    if [ -f "$REPO_ROOT/.env" ]; then
+    # OpenShell receives a scoped filesystem grant, not the target repo's
+    # secrets. Keep only the generated isolation settings in its .env. Local
+    # workers retain the historical full copy for development workflows.
+    if [ "${HEADLESSCODE_EXECUTION_PROVIDER:-local}" = "openshell" ]; then
+        touch "$wt_path/.env"
+    elif [ -f "$REPO_ROOT/.env" ]; then
         cp "$REPO_ROOT/.env" "$wt_path/.env"
     else
         touch "$wt_path/.env"

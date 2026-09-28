@@ -68,6 +68,7 @@ import {
 	TRIVIAL_DRIFT_AHEAD,
 } from "./git-sync.js"
 import { resolveModelForMode } from "../config/mode-models.js"
+import { openshellPreflight } from "../cloud/openshell-preflight.js"
 import { runPreflight, runLocalPreflight, type PreflightResult, type LocalPreflightResult } from "../llm/preflight.js"
 import { resolvePerModeEnv } from "../cli.js"
 
@@ -110,6 +111,7 @@ Options:
   --poll-interval-ms <n> Watcher poll interval (default: 5000)
   --memory-dir <path>    Phase 3 memory dir for workers (passed as HEADLESSCODE_MEMORY_DIR,
                          which run-worker.sh forwards as --memory-dir to each worker CLI)
+  --execution-provider <local|openshell> Worker runtime (default: local)
   --max-concurrent-sessions <n>  Phase 6 GLOBAL cap on concurrent sessions across
                          processes (default: $HEADLESSCODE_MAX_CONCURRENT_SESSIONS or 3).
                          When the cap is already reached this run ABORTS with a clear
@@ -195,6 +197,7 @@ Environment:
 interface OrchestrateOptions {
 	repo: string
 	issues: number[]
+	executionProvider: "local" | "openshell"
 	issuesJson?: string
 	/**
 	 * Fix 3: file a REAL GitHub issue for every synthetic --issues-json entry
@@ -301,6 +304,7 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 	const options: OrchestrateOptions = {
 		repo: "",
 		issues: [],
+		executionProvider: process.env.HEADLESSCODE_EXECUTION_PROVIDER === "openshell" ? "openshell" : "local",
 		mode: process.env.ORCHESTRATOR_MODE ?? "code",
 		reviewMode: "deepseek-reviewer",
 		review: true,
@@ -341,6 +345,12 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 		}
 
 		switch (flag) {
+			case "--execution-provider": {
+				const v = next()
+				if (v !== "local" && v !== "openshell") return { options, error: "--execution-provider must be local or openshell" }
+				options.executionProvider = v
+				break
+			}
 			case "--repo": {
 				const v = next()
 				if (v === undefined) {
@@ -1614,6 +1624,7 @@ export interface BuildSpawnEnvOptions {
 	repo: string
 	/** Harness mode for the workers (e.g. "code"). */
 	mode: string
+	executionProvider?: "local" | "openshell"
 	/** An explicit --model flag value, if the caller passed one — always wins (resolveModelForMode rule 1). */
 	explicitModel?: string
 	memoryDir?: string
@@ -1649,6 +1660,7 @@ export function buildSpawnEnv(options: BuildSpawnEnvOptions): { env: NodeJS.Proc
 		...(options.env ?? process.env),
 		TARGET_REPO: options.repo,
 		ORCHESTRATOR_MODE: options.mode,
+		HEADLESSCODE_EXECUTION_PROVIDER: options.executionProvider ?? process.env.HEADLESSCODE_EXECUTION_PROVIDER ?? "local",
 		// The resolved worker model must reach the spawner (and the workers it
 		// launches) — same pattern as HEADLESSCODE_PROJECT below.
 		...(workerModel ? { OPENROUTER_MODEL: workerModel } : {}),
@@ -2545,6 +2557,14 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		process.stderr.write(`headlesscode orchestrate: not a git repo: ${repo}\n`)
 		return 2
 	}
+	if (!options.dryRun && options.executionProvider === "openshell") {
+		const issue = openshellPreflight()
+		if (issue) {
+			process.stderr.write(`headlesscode orchestrate: OpenShell preflight failed: ${issue}\n`)
+			return 2
+		}
+	}
+	process.env.HEADLESSCODE_EXECUTION_PROVIDER = options.executionProvider
 
 	let issues: SplitIssue[]
 	try {
@@ -2852,6 +2872,7 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	const { env: spawnEnv, workerModel } = buildSpawnEnv({
 		repo,
 		mode: options.mode,
+		executionProvider: options.executionProvider,
 		explicitModel: options.model,
 		memoryDir: options.memoryDir,
 		maxIterations: options.maxIterations,
@@ -3032,6 +3053,7 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 						cwd: repo,
 						env: {
 							...process.env,
+							HEADLESSCODE_EXECUTION_PROVIDER: options.executionProvider,
 							HEADLESSCODE_ROOT: HARNESS_ROOT_TS,
 							...(options.memoryDir ? { HEADLESSCODE_MEMORY_DIR: path.resolve(options.memoryDir) } : {}),
 						},
@@ -3221,6 +3243,7 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 							cwd: repo,
 							env: {
 								...process.env,
+								HEADLESSCODE_EXECUTION_PROVIDER: options.executionProvider,
 								HEADLESSCODE_ROOT: HARNESS_ROOT_TS,
 								...(options.memoryDir ? { HEADLESSCODE_MEMORY_DIR: path.resolve(options.memoryDir) } : {}),
 							},
@@ -3376,6 +3399,7 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 							cwd: repo,
 							env: {
 								...process.env,
+								HEADLESSCODE_EXECUTION_PROVIDER: options.executionProvider,
 								HEADLESSCODE_ROOT: HARNESS_ROOT_TS,
 								...(options.memoryDir ? { HEADLESSCODE_MEMORY_DIR: path.resolve(options.memoryDir) } : {}),
 							},
