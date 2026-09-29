@@ -17,6 +17,8 @@ function testDryRunAndCommandsParse(): void {
 		"--dry-run",
 		"--eval",
 		"npm test;;npm run typecheck",
+		"--regression",
+		"npm test -- --filter mode-models",
 		"--hidden-eval",
 		"./hidden-check.sh",
 		"--population",
@@ -25,6 +27,7 @@ function testDryRunAndCommandsParse(): void {
 	assert.ok(parsed.config)
 	assert.equal(parsed.config.dryRun, true)
 	assert.deepEqual(parsed.config.evalCommands, ["npm test", "npm run typecheck"])
+	assert.equal(parsed.config.regressionCommand, "npm test -- --filter mode-models")
 	assert.deepEqual(parsed.config.hiddenEvalCommands, ["./hidden-check.sh"])
 	assert.equal(parsed.config.population, 3)
 }
@@ -34,18 +37,49 @@ function testUnknownFlagIsUsageError(): void {
 	assert.match(parsed.error ?? "", /unknown improve argument/)
 }
 
+function testRegressionCommandCannotBeEmpty(): void {
+	const parsed = parseRsiArgs(["--repo", "/tmp/repo", "--regression", "  "])
+	assert.match(parsed.error ?? "", /--regression must not be empty/)
+}
+
 function testRoleRoutingIsProviderIndependent(): void {
-	const roles = resolveRoles(undefined, { HEADLESSCODE_RSI_ROLE_CRITIC_MODEL: "critic-model" }, DEFAULT_RSI_MODEL)
+	const roles = resolveRoles(undefined, {
+		HEADLESSCODE_RSI_ROLE_CRITIC_MODEL: "critic-model",
+		HEADLESSCODE_RSI_ROLE_ADVERSARY_MODEL: "review-model",
+		HEADLESSCODE_RSI_ROLE_ADVERSARY_PROVIDER: "openrouter",
+		HEADLESSCODE_RSI_ROLE_ADVERSARY_BASE_URL: "https://router.example.invalid",
+	}, DEFAULT_RSI_MODEL)
 	assert.equal(roles.worker?.provider, "ollama")
 	assert.equal(roles.worker?.model, DEFAULT_RSI_MODEL)
 	assert.equal(roles.critic?.model, "critic-model")
+	assert.equal(roles.adversary?.model, "review-model")
+	assert.equal(roles.adversary?.provider, "openrouter")
+	assert.equal(roles.adversary?.baseUrl, "https://router.example.invalid")
+}
+
+function testAdaptivePolicyHasExplicitBudgets(): void {
+	const defaults = parseRsiArgs(["--repo", "/tmp/repo", "--compute-policy", "adaptive-independent"])
+	assert.equal(defaults.config?.generations, 1, "one configured adaptive generation permits one follow-up stage")
+	const parsed = parseRsiArgs(["--repo", "/tmp/repo", "--compute-policy", "adaptive-independent", "--population", "3", "--max-iterations", "5", "--max-trajectories", "4", "--max-total-iterations", "20", "--max-runtime-ms", "90000"])
+	assert.ok(parsed.config)
+	assert.equal(parsed.config.maxTrajectories, 4)
+	assert.equal(parsed.config.maxTotalIterations, 20)
+	assert.equal(parsed.config.maxRuntimeMs, 90_000)
+	assert.match(parseRsiArgs(["--repo", "/tmp/repo", "--compute-policy", "adaptive-independent", "--population", "3", "--max-trajectories", "2"]).error ?? "", /must cover the initial --population/)
+	assert.match(parseRsiArgs(["--repo", "/tmp/repo", "--compute-policy", "adaptive-independent", "--max-trajectories", "4"]).error ?? "", /at most one follow-up/)
+	assert.match(parseRsiArgs(["--repo", "/tmp/repo", "--compute-policy", "adaptive-independent", "--generations", "2"]).error ?? "", /exactly one follow-up generation/)
+	assert.match(parseRsiArgs(["--repo", "/tmp/repo", "--compute-policy", "adaptive-independent", "--max-total-iterations", "200"]).error ?? "", /cannot exceed max-iterations times max-trajectories/)
+	assert.match(parseRsiArgs(["--repo", "/tmp/repo", "--compute-policy", "adaptive-independent", "--population", "1"]).error ?? "", /population of at least 2/)
+	assert.match(parseRsiArgs(["--repo", "/tmp/repo", "--compute-policy", "adaptive-independent", "--max-total-iterations", "40"]).error ?? "", /cover the initial population/)
 }
 
 const tests = [
 	["defaults select local Qwen", testDefaultsUseLocalQwen],
 	["dry-run and evaluation commands parse", testDryRunAndCommandsParse],
 	["unknown flags return usage errors", testUnknownFlagIsUsageError],
+	["empty regression command is rejected", testRegressionCommandCannotBeEmpty],
 	["role routing resolves configured critic models", testRoleRoutingIsProviderIndependent],
+	["adaptive trajectories require explicit bounded capacity", testAdaptivePolicyHasExplicitBudgets],
 ] as const
 
 for (const [name, test] of tests) {

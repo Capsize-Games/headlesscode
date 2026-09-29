@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Capsize-Games/headlesscode/actions/workflows/ci.yml/badge.svg)](https://github.com/Capsize-Games/headlesscode/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/headlesscode?logo=npm)](https://www.npmjs.com/package/headlesscode)
-[![Node.js >=18](https://img.shields.io/badge/node-%3E%3D18-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![Node.js >=22.19](https://img.shields.io/badge/node-%3E%3D22.19-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](./LICENSE)
 
 `headlesscode` runs the Zoo Code agent loop from a Node.js process, without a
@@ -38,7 +38,7 @@ monitoring.
 
 ## Quick start
 
-Requires Node.js 18 or newer. Install globally or run with `npx`:
+Requires Node.js 22.19 or newer. Install globally or run with `npx`:
 
 ```bash
 npm install -g headlesscode
@@ -194,29 +194,59 @@ and each subcommand's `--help` for complete usage.
 
 ## Recursive self-improvement
 
-`headlesscode improve` runs a bounded experiment against an external evaluator.
-The supervisor creates candidate worktrees, asks the local Ollama worker to
-make focused changes, runs regression and visible/hidden evaluations, and
-keeps selection state outside candidate worktrees. Each generation produces a
-report for human review.
+`headlesscode improve --dry-run` resolves the base commit and prints planned
+candidate worktrees. A real run requires PostgreSQL, a shared S3-compatible
+artifact store, and at least one registered `headlesscode rsi-worker`. The
+coordinator queues sanitized mutation snapshots and visible evaluation jobs;
+workers run each in a fresh OpenShell guest. Fitness, paired baseline
+comparison, archives, and selection stay in the coordinator. Hidden evaluation
+remains disabled. A 2026-09-29 bounded run used two workers on the same local
+OpenShell gateway; both candidate evaluation jobs were leased concurrently.
+The run used a temporary `clamp.js` fixture and does not establish general
+headlesscode improvement or multi-gateway operation. An earlier bounded run
+passed visible checks but made no source change and was rejected.
 
 ```bash
 npx tsx src/cli.ts improve --repo . --dry-run
 npx tsx src/cli.ts improve --repo . --population 2 --generations 1
 ```
 
-This loop does not yet train adapters, schedule multiple trajectories, or
-provide OS-level candidate isolation. Follow-up work is tracked as:
+Before starting workers, build the standard and RSI guest images on each
+OpenShell gateway host that will run RSI jobs. Build the larger training image
+only on gateways whose workers will accept model-training or paired
+model-evaluation jobs:
+
+```bash
+docker build -f docker/OpenShell.Dockerfile -t headlesscode-openshell:local .
+docker build -f docker/OpenShell-RSI.Dockerfile -t headlesscode-openshell-rsi:local .
+docker build -f docker/OpenShell-RSI-Training.Dockerfile -t headlesscode-openshell-rsi-training:local .
+```
+
+The RSI Dockerfile extends `headlesscode-openshell:local` and removes the RSI
+source, test files, and hidden evaluation suite from the guest image. See the [RSI design](./docs/recursive-self-improvement.md)
+for worker and queue configuration.
+
+The queue stores job state, worker registrations, leases, retries, and admission
+policy in PostgreSQL; artifact bytes remain in object storage. Local integration
+tests used 12 simulated workers and 100 queued jobs, including a 20 MiB artifact. Each
+worker process currently runs one guest at a time and must be configured with a
+unique worker ID and OpenShell gateway ID. The two-worker run observed 4.008
+seconds of concurrent evaluation leases on one gateway. A local PostgreSQL/
+RustFS test drained the remaining 96 jobs with 12 simulated workers in 446 ms
+(215.2 jobs/s), after the initial four jobs were claimed and completed to
+verify admission limits;
+claims still serialize on a queue-policy row, and neither result qualifies a
+multi-host deployment. Remaining work is:
 
 | Issue | Work |
 | --- | --- |
-| [#3](https://github.com/Capsize-Games/headlesscode/issues/3) | OS-level candidate sandbox |
-| [#4](https://github.com/Capsize-Games/headlesscode/issues/4) | Cryptographically verifiable evaluator and artifacts |
-| [#5](https://github.com/Capsize-Games/headlesscode/issues/5) | Resource-aware resumable scheduler |
-| [#6](https://github.com/Capsize-Games/headlesscode/issues/6) | Adaptive multi-trajectory search |
-| [#7](https://github.com/Capsize-Games/headlesscode/issues/7) | Validated curriculum fixtures |
-| [#8](https://github.com/Capsize-Games/headlesscode/issues/8) | Adversarial evaluation and cross-model supervision |
-| [#9](https://github.com/Capsize-Games/headlesscode/issues/9) | Real LoRA or QLoRA backend |
+| [#3](https://github.com/Capsize-Games/headlesscode/issues/3) | OpenShell candidate isolation is implemented; live multi-gateway qualification remains. |
+| [#4](https://github.com/Capsize-Games/headlesscode/issues/4) | Content-addressed artifacts are implemented; signed evaluator provenance and hidden evaluation remain. |
+| [#5](https://github.com/Capsize-Games/headlesscode/issues/5) | PostgreSQL queue, leases, retries, admission, and configured workers are implemented; live fleet qualification remains. |
+| [#6](https://github.com/Capsize-Games/headlesscode/issues/6) | Bounded adaptive independent search supports an initial population plus one evidence-driven follow-up; repeated stages remain out of scope. |
+| [#7](https://github.com/Capsize-Games/headlesscode/issues/7) | Fixture-backed curriculum replay and explicit promotion are implemented; wording-to-capability measurement remains unproven. |
+| [#8](https://github.com/Capsize-Games/headlesscode/issues/8) | Adversarial review and bounded OpenShell break tests are implemented; live provider-backed review is unvalidated. |
+| [#9](https://github.com/Capsize-Games/headlesscode/issues/9) | An OpenShell QLoRA prototype is covered by mocked job tests; the supplied GGUF is rejected before enqueue, and no live training is validated. |
 
 See the [RSI design](./docs/recursive-self-improvement.md) and
 [run progress](./docs/rsi-progress.md).

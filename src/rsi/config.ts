@@ -13,6 +13,7 @@ export const DEFAULT_PROTECTED_PATHS = [
 	"package-lock.json",
 	".gitignore",
 	"scripts/eval-suite/",
+	"fixtures/rsi-curriculum/",
 	".headlesscode/",
 	".worktrees/",
 ]
@@ -47,13 +48,18 @@ Usage:
 Options:
   --model <id>                 worker model (default: ${DEFAULT_RSI_MODEL})
   --population <n>             candidates per generation (default: 2)
-  --generations <n>            bounded generations (default: 1)
+  --generations <n>            bounded generations (default: 1; adaptive policy uses this as follow-up stages)
   --parent-policy <name>      champion-specialist-novelty | pareto-front | all-eligible
   --mutation-kind <name>      corrective | architectural | search-policy | curriculum | model-adaptation
   --hypothesis <text>         recorded reason for the mutation
   --expected-effect <text>    measurable benefit to test
   --potential-downside <text> recorded cost or regression risk
   --compute-policy <name>     single | independent | planner-executors | critic-retry
+                              adaptive-independent enables bounded adaptive trajectories
+  --max-trajectories <n>       maximum independent trajectories (adaptive default: population + 1)
+  --max-total-iterations <n>   aggregate model-iteration budget (adaptive default: max-iterations * trajectories)
+  --max-runtime-ms <n>         wall-clock admission budget for adaptive follow-ups (default: 3600000)
+  --regression <command>      paired regression gate (default: npm test)
   --eval <command>             visible command; repeat or separate with ;; 
   --hidden-eval <command>      supervisor-only hidden command
   --mutation-task <text>       improvement objective
@@ -89,6 +95,7 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 	}
 	let computePolicy: ComputePolicy = "single"
 	let evalCommands = [...DEFAULT_VISIBLE_EVALS]
+	let regressionCommand = "npm test"
 	let hiddenEvalCommands: string[] = []
 	let archiveDir: string | undefined
 	let worktreeDir: string | undefined
@@ -97,6 +104,9 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 	let dryRun = false
 	let keepWorktrees = false
 	let maxIterations = 40
+	let maxTrajectories: number | undefined
+	let maxTotalIterations: number | undefined
+	let maxRuntimeMs: number | undefined
 	let commandTimeoutMs = 15 * 60_000
 	let trajectoryDir: string | undefined
 	let curriculumDir: string | undefined
@@ -177,7 +187,7 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 				}
 				case "--compute-policy": {
 					const [value, next] = take(index, arg)
-					if (!["single", "independent", "planner-executors", "critic-retry"].includes(value)) throw new Error(`${arg} has an invalid policy`)
+					if (!["single", "independent", "adaptive-independent", "planner-executors", "critic-retry"].includes(value)) throw new Error(`${arg} has an invalid policy`)
 					computePolicy = value as ComputePolicy
 					index = next
 					break
@@ -191,6 +201,13 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 				case "--eval": {
 					const [value, next] = take(index, arg)
 					evalCommands = splitCommands(value)
+					index = next
+					break
+				}
+				case "--regression": {
+					const [value, next] = take(index, arg)
+					if (!value.trim()) throw new Error("--regression must not be empty")
+					regressionCommand = value.trim()
 					index = next
 					break
 				}
@@ -266,6 +283,24 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 					index = next
 					break
 				}
+				case "--max-trajectories": {
+					const [value, next] = take(index, arg)
+					maxTrajectories = positiveInteger(value, arg)
+					index = next
+					break
+				}
+				case "--max-total-iterations": {
+					const [value, next] = take(index, arg)
+					maxTotalIterations = positiveInteger(value, arg)
+					index = next
+					break
+				}
+				case "--max-runtime-ms": {
+					const [value, next] = take(index, arg)
+					maxRuntimeMs = positiveInteger(value, arg)
+					index = next
+					break
+				}
 				case "--dry-run":
 					dryRun = true
 					break
@@ -277,6 +312,15 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 			}
 		}
 		const resolvedRepo = path.resolve(repoRoot)
+		const adaptiveTrajectories = maxTrajectories ?? population + 1
+		const adaptiveIterations = maxTotalIterations ?? maxIterations * adaptiveTrajectories
+		const adaptiveRuntime = maxRuntimeMs ?? 60 * 60_000
+		if (computePolicy === "adaptive-independent" && population < 2) throw new Error("adaptive-independent requires --population of at least 2")
+		if (computePolicy === "adaptive-independent" && generations !== 1) throw new Error("adaptive-independent currently supports exactly one follow-up generation")
+		if (computePolicy === "adaptive-independent" && adaptiveTrajectories < population) throw new Error("adaptive-independent --max-trajectories must cover the initial --population")
+		if (computePolicy === "adaptive-independent" && adaptiveTrajectories > population + 1) throw new Error("adaptive-independent supports at most one follow-up trajectory beyond --population")
+		if (computePolicy === "adaptive-independent" && adaptiveIterations < maxIterations * population) throw new Error("adaptive-independent --max-total-iterations must cover the initial population at --max-iterations each")
+		if (computePolicy === "adaptive-independent" && adaptiveIterations > maxIterations * adaptiveTrajectories) throw new Error("adaptive-independent --max-total-iterations cannot exceed max-iterations times max-trajectories")
 		return {
 			config: {
 				repoRoot: resolvedRepo,
@@ -285,6 +329,7 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 				generations,
 				maxConcurrent,
 				mutationTask,
+				regressionCommand,
 				parentSelectionPolicy,
 				mutationKind,
 				hypothesis: { ...hypothesis },
@@ -300,6 +345,9 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 				dryRun,
 				keepWorktrees,
 				maxIterations,
+				maxTrajectories: adaptiveTrajectories,
+				maxTotalIterations: adaptiveIterations,
+				maxRuntimeMs: adaptiveRuntime,
 				protectedPaths: [...DEFAULT_PROTECTED_PATHS],
 				commandTimeoutMs,
 				resumeRunId,

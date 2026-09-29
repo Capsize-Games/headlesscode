@@ -38,7 +38,10 @@ async function main(): Promise<void> {
 		assert.equal(archive.activeRuns.length, 0)
 		assert.equal((await readArchive(dir)).runs[0]?.runId, "rsi-fixture")
 		assert.ok((await fs.stat(archivePath(dir))).isFile())
-		console.log("All 3 RSI archive tests passed")
+		await fs.writeFile(archivePath(dir), "{broken", "utf8")
+		await assert.rejects(readArchive(dir), /Could not read RSI archive/)
+		await assert.rejects(appendRun(dir, run), /Could not read RSI archive/)
+		console.log("All 5 RSI archive assertions passed")
 	} finally {
 		await fs.rm(dir, { recursive: true, force: true })
 	}

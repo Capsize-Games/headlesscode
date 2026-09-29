@@ -1,36 +1,16 @@
-import { exec as execCallback } from "node:child_process"
-import { promisify } from "node:util"
 import type { CommandRunner, EvaluationSummary, RsiConfig, TrialResult } from "./types.js"
 import { changedFiles, candidateCommits, gitOutput } from "./workspace.js"
 import { protectedPathViolations } from "./sandbox.js"
-
-const exec = promisify(execCallback)
-
-export const runCommand: CommandRunner = async (command, cwd, timeoutMs, env) => {
-	const started = Date.now()
-	try {
-		const result = await exec(command, { cwd, env, timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 })
-		return { ok: true, command, exitCode: 0, durationMs: Date.now() - started, stdout: result.stdout, stderr: result.stderr }
-	} catch (error) {
-		const failure = error as { code?: number | string; killed?: boolean; stdout?: string; stderr?: string }
-		return {
-			ok: false,
-			command,
-			exitCode: typeof failure.code === "number" ? failure.code : null,
-			durationMs: Date.now() - started,
-			stdout: failure.stdout ?? "",
-			stderr: failure.stderr ?? String(error),
-			timedOut: failure.killed === true,
-		}
-	}
-}
+import { createOpenShellCommandRunner } from "./openshell.js"
 
 export async function evaluateCandidate(
 	config: RsiConfig,
 	candidateRoot: string,
 	baseCommit: string,
-	runner: CommandRunner = runCommand,
+	runner?: CommandRunner,
 ): Promise<EvaluationSummary> {
+	if (config.hiddenEvalCommands.length > 0) throw new Error("RSI hidden evaluations require a supervisor-only evaluator service; refusing to run hidden commands in a candidate guest")
+	const isolatedRunner = runner ?? createOpenShellCommandRunner(config)
 	const files = await changedFiles(candidateRoot, baseCommit)
 	const commits = await candidateCommits(candidateRoot, baseCommit)
 	const complexity = await complexityMetrics(candidateRoot, baseCommit, files)
@@ -59,23 +39,12 @@ export async function evaluateCandidate(
 			failureClassification: "protected-path-violation",
 		}
 	}
-	const regression = await runner("npm test", candidateRoot, config.commandTimeoutMs)
+	const regression = await isolatedRunner(config.regressionCommand, candidateRoot, config.commandTimeoutMs)
 	const visible: TrialResult[] = []
 	for (const command of config.evalCommands) {
-		visible.push(await runner(command, candidateRoot, config.commandTimeoutMs))
+		visible.push(await isolatedRunner(command, candidateRoot, config.commandTimeoutMs))
 	}
 	const hidden: TrialResult[] = []
-	for (const command of config.hiddenEvalCommands) {
-		// Hidden commands belong to the supervisor checkout. They receive the
-		// candidate path explicitly so a candidate cannot replace the evaluator
-		// script or package metadata in the process that scores it.
-		hidden.push(
-			await runner(command, config.repoRoot, config.commandTimeoutMs, {
-				...process.env,
-				HEADLESSCODE_RSI_CANDIDATE_ROOT: candidateRoot,
-			}),
-		)
-	}
 	return {
 		regression,
 		visible,

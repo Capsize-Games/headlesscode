@@ -43,7 +43,6 @@ import { analyzeCliMain } from "./orchestrator/analyze-cli.js"
 import { costHistoryCliMain } from "./orchestrator/cost-history-cli.js"
 import { resolvePermissions, type PermissionsConfig } from "./permissions/config.js"
 import { resolveModelForMode, resolveReasoningEffortForMode } from "./config/mode-models.js"
-import { improveMain } from "./rsi/controller.js"
 import { openShellSessionMain } from "./cloud/openshell-session.js"
 
 const VERSION = "0.1.0"
@@ -751,10 +750,47 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	if (argv[0] === "openshell-session") {
 		return openShellSessionMain(argv.slice(1))
 	}
+	if (argv[0] === "rsi-worker") {
+		const { rsiWorkerMain } = await import("./rsi/worker.js")
+		return rsiWorkerMain()
+	}
+	if (argv[0] === "rsi-train-model") {
+		const { parseRsiArgs } = await import("./rsi/config.js")
+		const { readArchive } = await import("./rsi/archive.js")
+		const { PostgresRsiJobQueue, fleetQueuePolicy } = await import("./rsi/postgres-queue.js")
+		const { runBoundedModelCandidate } = await import("./rsi/model-training.js")
+		const parsed = parseRsiArgs(argv.slice(1))
+		if (parsed.help) {
+			process.stdout.write("Usage: headlesscode rsi-train-model --repo <path> --archive-dir <path> --resume <run-id> --model-candidate-id <id>\nThe registered worker must use an OpenShell training image and a local Hugging Face checkpoint.\n")
+			return 0
+		}
+		if (parsed.error || !parsed.config || !parsed.config.resumeRunId || !parsed.config.modelCandidateId || parsed.config.dryRun) {
+			process.stderr.write(`headlesscode rsi-train-model: ${parsed.error ?? "--resume and --model-candidate-id are required; dry-run is unsupported"}\n`)
+			return 2
+		}
+		const config = parsed.config
+		const archive = await readArchive(config.archiveDir)
+		const run = archive.activeRuns.find((entry) => entry.runId === config.resumeRunId) ?? archive.runs.find((entry) => entry.runId === config.resumeRunId)
+		if (!run) {
+			process.stderr.write(`headlesscode rsi-train-model: RSI run not found in ${config.archiveDir}\n`)
+			return 2
+		}
+		const policy = fleetQueuePolicy(process.env.HEADLESSCODE_RSI_QUEUE_NAME?.trim() || "rsi-default", config.maxConcurrent, process.env)
+		const queue = PostgresRsiJobQueue.fromEnvironment(policy, process.env)
+		try {
+			await queue.migrate()
+			const model = await runBoundedModelCandidate(config, run, queue, config.modelCandidateId!)
+			process.stdout.write(`[rsi-model] ${model.id}: ${model.status}; eligible=${model.eligibleForSelection === true}\n`)
+			return model.eligibleForSelection ? 0 : 1
+		} finally {
+			await queue.close()
+		}
+	}
 	// Bounded recursive self-improvement: the supervisor owns the evaluator,
 	// archive, and selection logic while each candidate runs in its own
 	// worktree. See docs/recursive-self-improvement.md.
 	if (argv[0] === "improve") {
+		const { improveMain } = await import("./rsi/controller.js")
 		return improveMain(argv.slice(1))
 	}
 
@@ -1049,9 +1085,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		}
 	}
 
-	// ── real run: API key required ────────────────────────────────────────────
+	// ── real run: OpenRouter key required unless this mode is local ────────────
+	const codeModeBackend = process.env.HEADLESSCODE_CODE_MODE_BACKEND ?? "openrouter"
+	const localBackendModes = new Set(
+		(process.env.HEADLESSCODE_LOCAL_BACKEND_MODES ?? "code")
+			.split(",")
+			.map((s) => s.trim())
+			.filter(Boolean),
+	)
+	const useLocalCodeBackend = localBackendModes.has(options.mode) && codeModeBackend === "ollama"
 	const apiKey = process.env.HEADLESSCODE_OPENROUTER_API_KEY
-	if (!apiKey) {
+	if (!apiKey && !useLocalCodeBackend) {
 		process.stderr.write(
 			"headlesscode: HEADLESSCODE_OPENROUTER_API_KEY is not set.\n" +
 				"  Export it (e.g. export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-...) or use --dry-run to\n" +
@@ -1097,21 +1141,6 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		explicitModel: options.model,
 		env: process.env,
 	})
-
-	// Generalized 2026-08-21 (issue #142) beyond the original `code`-only
-	// scope (plans/local-dual-model-code-agent.md, D2) — real need: two
-	// separate local daemons on two different GPUs (a coder model and a
-	// review model), each needing its own mode -> URL/model mapping.
-	// HEADLESSCODE_LOCAL_BACKEND_MODES defaults to "code" alone, so
-	// nobody's existing setup changes behavior unless they opt in.
-	const codeModeBackend = process.env.HEADLESSCODE_CODE_MODE_BACKEND ?? "openrouter"
-	const localBackendModes = new Set(
-		(process.env.HEADLESSCODE_LOCAL_BACKEND_MODES ?? "code")
-			.split(",")
-			.map((s) => s.trim())
-			.filter(Boolean),
-	)
-	const useLocalCodeBackend = localBackendModes.has(options.mode) && codeModeBackend === "ollama"
 
 	// The local daemon's own proxy (ollama_shim.py) deliberately runs a 600s
 	// upstream request timeout — its own comment documents why: a shorter

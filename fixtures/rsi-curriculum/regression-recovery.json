@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "regression-recovery",
+  "capability": "regression-recovery",
+  "description": "Executable reference and known-mutant checks for stable regression repair.",
+  "task": "Implement stableUnique(items) so duplicate entries are removed without changing the order of first occurrences.",
+  "cases": [
+    {
+      "name": "preserve first occurrence order",
+      "input": [
+        [
+          "b",
+          "a",
+          "b",
+          "c",
+          "a"
+        ]
+      ],
+      "expected": [
+        "b",
+        "a",
+        "c"
+      ]
+    }
+  ]
+}

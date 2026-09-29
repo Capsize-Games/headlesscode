@@ -34,7 +34,7 @@ async function main(): Promise<void> {
 			components: { regression: 1, visible: 1, hidden: 1, efficiency: 1, recovery: 1 },
 			metrics: { correctness: 1, reliability: 1, generalization: 1, hidden: 1, efficiency: 1, latency: 1, tokenUse: 1, recovery: 1, fabricationRate: 0, complexityPenalty: 0 },
 			complexity: { diffLines: 1, changedFiles: 1, newDependencies: 0, additionalModelCalls: 0, runtimeOverheadMs: 0 },
-			hardGates: { regressionPass: true, visibleEvalPass: true, hiddenEvalPass: true, noProtectedPathViolation: true, completed: true, noCrash: true, committed: true },
+			hardGates: { regressionPass: true, visibleEvalPass: true, hiddenEvalPass: true, adversarialPass: true, noProtectedPathViolation: true, completed: true, noCrash: true, committed: true },
 			reason: "all hard gates passed",
 		},
 	}
@@ -45,6 +45,7 @@ async function main(): Promise<void> {
 		generations: 1,
 		maxConcurrent: 1,
 		mutationTask: "fixture",
+		regressionCommand: "npm test",
 		evalCommands: [],
 		hiddenEvalCommands: [],
 		archiveDir: path.join(root, "archive"),

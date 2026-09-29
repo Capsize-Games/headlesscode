@@ -24,7 +24,7 @@ function candidate(id: string, vector: MetricVector, score: number): CandidateRe
 		components: { regression: 1, visible: vector.generalization, hidden: vector.hidden, efficiency: vector.efficiency, recovery: vector.recovery },
 		metrics: vector,
 		complexity: { diffLines: 10, changedFiles: 1, newDependencies: 0, additionalModelCalls: 0, runtimeOverheadMs: 0 },
-		hardGates: { regressionPass: true, visibleEvalPass: true, hiddenEvalPass: true, noProtectedPathViolation: true, completed: true, noCrash: true, committed: true },
+		hardGates: { regressionPass: true, visibleEvalPass: true, hiddenEvalPass: true, adversarialPass: true, noProtectedPathViolation: true, completed: true, noCrash: true, committed: true },
 		reason: "all hard gates passed",
 	}
 	return {
@@ -43,6 +43,7 @@ function candidate(id: string, vector: MetricVector, score: number): CandidateRe
 		changedFiles: ["src/engine/loop.ts"],
 		protectedPathViolations: [],
 		fitness,
+		pairedComparison: { baselinePasses: 1, candidatePasses: 1, trialCount: 1, baselineDurationMs: 100, candidateDurationMs: 50, durationRatio: 0.5, improved: true, reason: "test fixture" },
 	}
 }
 
@@ -64,6 +65,16 @@ function testParentPolicyRecordsReasons(): void {
 	assert.ok(choices.some((choice) => choice.reason.strategy === "specialist"))
 }
 
+function testRejectedAndIncompleteCandidatesCannotBecomeParents(): void {
+	const rejected = candidate("rejected", metrics({ correctness: 1 }), 100)
+	rejected.status = "rejected"
+	const failing = candidate("failing", metrics({ correctness: 1 }), 99)
+	failing.fitness!.hardGates.noProtectedPathViolation = false
+	const eligibleCandidate = candidate("accepted", metrics({ correctness: 1 }), 90)
+	const choices = selectParentChoices(archive([rejected, failing, eligibleCandidate]), "all-eligible", 4)
+	assert.ok(choices.every((entry) => entry.candidateId === "accepted"))
+}
+
 function testJobsAreResourceTaggedAndMonotonic(): void {
 	const job = newExperimentJob("mutation", { class: "LOCAL_GPU", units: 1, concurrencyKey: "ollama" }, "now", "a")
 	const running = transitionJob(job, "running", "later")
@@ -75,5 +86,6 @@ function testJobsAreResourceTaggedAndMonotonic(): void {
 
 testParetoFrontRetainsTradeoffs()
 testParentPolicyRecordsReasons()
+testRejectedAndIncompleteCandidatesCannotBecomeParents()
 testJobsAreResourceTaggedAndMonotonic()
 console.log("All 3 RSI selection tests passed")

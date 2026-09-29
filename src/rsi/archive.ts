@@ -45,17 +45,18 @@ function migrate(raw: Partial<RsiArchive> & { schemaVersion?: number }): RsiArch
 }
 
 export async function readArchive(archiveDir: string): Promise<RsiArchive> {
+	const file = archivePath(archiveDir)
 	try {
-		const raw = await fs.readFile(archivePath(archiveDir), "utf8")
+		const raw = await fs.readFile(file, "utf8")
 		const parsed = JSON.parse(raw) as Record<string, unknown> & { schemaVersion?: number }
 		if ((parsed.schemaVersion === 1 || parsed.schemaVersion === 2) && Array.isArray(parsed.runs)) {
 			return migrate(parsed as Partial<RsiArchive> & { schemaVersion?: number })
 		}
-	} catch {
-		// A missing or malformed archive starts a new durable history. The next
-		// write makes the state explicit and inspectable.
+		throw new Error(`RSI archive has an unsupported or invalid schema: ${file}`)
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyArchive()
+		throw new Error(`Could not read RSI archive ${file}: ${error instanceof Error ? error.message : String(error)}`)
 	}
-	return emptyArchive()
 }
 
 export async function writeArchive(archiveDir: string, archive: RsiArchive): Promise<void> {

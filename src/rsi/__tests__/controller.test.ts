@@ -7,8 +7,8 @@ import { readArchive } from "../archive.js"
 import { runRsi } from "../controller.js"
 import type { RsiConfig, TrialResult } from "../types.js"
 
-function ok(command: string): TrialResult {
-	return { ok: true, command, exitCode: 0, durationMs: 1, stdout: "", stderr: "" }
+function ok(command: string, durationMs = 1): TrialResult {
+	return { ok: true, command, exitCode: 0, durationMs, stdout: "", stderr: "" }
 }
 
 async function main(): Promise<void> {
@@ -28,8 +28,9 @@ async function main(): Promise<void> {
 			generations: 2,
 			maxConcurrent: 1,
 			mutationTask: "fixture evolution",
+			regressionCommand: "npm test",
 			evalCommands: ["visible"],
-			hiddenEvalCommands: ["hidden"],
+			hiddenEvalCommands: [],
 			archiveDir: path.join(repo, ".rsi-archive"),
 			worktreeDir: path.join(repo, ".rsi-worktrees"),
 			trajectoryDir: path.join(repo, ".rsi-trajectories"),
@@ -48,7 +49,7 @@ async function main(): Promise<void> {
 				return () => `2026-09-20T00:00:${String(tick++).padStart(2, "0")}.000Z`
 			})(),
 			log: () => undefined,
-			runCommand: async (command) => ok(command),
+			runCommand: async (command, cwd) => ok(command, path.basename(cwd).startsWith("rsi-baseline-") ? 100 : 1),
 			runMutation: async (candidate) => {
 				const file = path.join(candidate.worktree, "src", `${candidate.id}.ts`)
 				await fs.writeFile(file, `export const candidate = ${JSON.stringify(candidate.id)}\n`)

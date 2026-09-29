@@ -81,11 +81,22 @@ export async function removeCandidateWorktree(config: RsiConfig, candidate: Cand
 
 export async function changedFiles(repoRoot: string, baseCommit: string): Promise<string[]> {
 	const output = await gitOutput(repoRoot, ["diff", "--name-only", `${baseCommit}...HEAD`])
-	const status = await gitOutput(repoRoot, ["status", "--short"])
 	const files = new Set(output.split("\n").map((file) => file.trim()).filter(Boolean))
-	for (const line of status.split("\n")) {
-		const file = line.slice(3).trim()
+	const status = await execFile("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], {
+		cwd: repoRoot,
+		encoding: "utf8",
+		maxBuffer: 4 * 1024 * 1024,
+	})
+	const entries = status.stdout.split("\0")
+	for (let index = 0; index < entries.length; index++) {
+		const entry = entries[index]
+		if (!entry) continue
+		const file = entry.slice(3)
 		if (file) files.add(file)
+		if (/[RC]/.test(entry.slice(0, 2))) {
+			const original = entries[++index]
+			if (original) files.add(original)
+		}
 	}
 	return [...files].sort()
 }

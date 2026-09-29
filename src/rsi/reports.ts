@@ -5,7 +5,8 @@ export function formatCandidate(candidate: CandidateRecord): string {
 	const parent = candidate.parentSelection ? `, parent=${candidate.parent} (${candidate.parentSelection.strategy})` : ""
 	const mutation = candidate.mutationKind ? `, mutation=${candidate.mutationKind}` : ""
 	const metrics = fitness ? `, metrics=${JSON.stringify(fitness.metrics)}` : ""
-	return `${candidate.id}: ${candidate.status}${parent}${mutation}${fitness ? `, score=${fitness.score}, ${fitness.reason}` : ""}${metrics}`
+	const comparison = candidate.pairedComparison ? `, paired=${candidate.pairedComparison.reason} (${candidate.pairedComparison.baselinePasses}/${candidate.pairedComparison.trialCount} → ${candidate.pairedComparison.candidatePasses}/${candidate.pairedComparison.trialCount}; duration ratio ${candidate.pairedComparison.durationRatio.toFixed(3)})` : ""
+	return `${candidate.id}: ${candidate.status}${parent}${mutation}${fitness ? `, score=${fitness.score}, ${fitness.reason}` : ""}${comparison}${metrics}`
 }
 
 export function formatRunReport(run: RsiRunRecord, config: RsiConfig): string {
@@ -17,20 +18,46 @@ export function formatRunReport(run: RsiRunRecord, config: RsiConfig): string {
 		`- Generations: ${run.generations}`,
 		`- Started: ${run.startedAt}`,
 		`- Finished: ${run.finishedAt ?? "in progress"}`,
-		`- Baseline: ${run.baseline ? (run.baseline.ok ? "pass" : "fail") : "not run (dry-run)"}`,
+		`- Baseline: ${run.baseline ? (run.baseline.ok ? "pass" : "fail") : "not run (dry-run)"}${run.baselineFitness ? `, score=${run.baselineFitness.score}` : ""}`,
 		`- Selected candidate: ${run.selected ?? "none"}`,
 		`- Pareto candidates: ${run.selectedCandidates?.join(", ") || "none"}`,
 		`- Parent policy: ${run.parentSelectionPolicy ?? config.parentSelectionPolicy ?? "champion-specialist-novelty"}`,
 		`- Model candidates: ${run.modelCandidates?.map((model) => `${model.id} (${model.status})`).join(", ") || "none"}`,
 		`- Experiment jobs: ${run.jobs?.length ?? 0}`,
 		`- Trajectories: ${run.trajectoryRefs?.length ?? 0}`,
+		...(config.computePolicy === "adaptive-independent" ? [
+			`- Adaptive budgets: trajectories ${config.maxTrajectories ?? config.population + 1}; total iterations ${config.maxTotalIterations ?? (config.population + 1) * config.maxIterations}; runtime admission ${config.maxRuntimeMs ?? 60 * 60_000} ms; max concurrent ${config.maxConcurrent}`,
+		] : []),
 		"",
 		"## Candidates",
 		"",
 		...run.candidates.map((candidate) => `- ${formatCandidate(candidate)}${candidate.failure ? `; failure=${candidate.failure}` : ""}`),
 		"",
+		...(run.adaptiveSearch?.length ? [
+			"## Adaptive allocation decisions",
+			"",
+			...run.adaptiveSearch.map((decision) => `- Generation ${decision.generation}: ${decision.decision} (${decision.reason}); candidates=${decision.candidateIds.join(", ") || "none"}; evidence=${decision.evidence.map((entry) => `${entry.candidateId}:${entry.status}${entry.visiblePassRate === undefined ? "" : `:${entry.visiblePassRate.toFixed(3)}`}`).join(", ") || "none"}; allocated=${decision.allocatedTrajectories} trajectories/${decision.allocatedIterations} iterations; remaining=${decision.remainingTrajectories} trajectories/${decision.remainingIterations} iterations; elapsed=${decision.elapsedMs} ms.`),
+			"",
+		] : []),
+		...(run.curriculumTasks?.length ? [
+			"## Curriculum fixture status",
+			"",
+			...run.curriculumTasks.map((task) => `- ${task.id}: ${task.promotedAt ? `promoted at ${task.promotedAt}` : task.validated ? "fixture-replay validated; not promoted" : "proposal; unvalidated"}; fixture=${task.fixtureId}; ${task.fixtureDescription}${task.validation ? `; base=${task.validation.baseCommit}; replays=${task.validation.replays.length}; reproducible=${task.validation.reproducible}; reason=${task.validation.reason}` : "; no executable validation recorded"}`),
+			"",
+			"Validated means the registered fixture reference passed, a known incorrect mutant was rejected, and two clean OpenShell replays produced identical output digests. It does not certify that task wording measures the named capability.",
+			"",
+		] : []),
+		...(run.adversarialReviews?.length ? [
+			"## Adversarial review",
+			"",
+			...run.adversarialReviews.map((review) => `- ${review.candidateId}: ${review.status}; role=${review.role}; provider=${review.provider}; model=${review.model}; promptVersion=${review.promptVersion}; prompt=${review.promptSha256 || "unavailable"}; result=${review.resultSha256 || "unavailable"}; error=${review.errorSha256 || "none"}; tests=${review.testArtifactSha256 || "unavailable"}; OpenShell output=${review.testResults.map((entry) => entry.outputArtifactSha256).filter(Boolean).join(", ") || "none"}; penalty=${review.penaltyPoints}; findings=${review.findings.map((finding) => finding.severity + ":" + finding.message.replace(/\s+/g, " ").slice(0, 240)).join(" | ") || "none"}; ${review.testResults.map((entry) => entry.id + ":" + (entry.passed ? "pass" : "fail")).join(", ") || review.error || "no test result"}${review.summary ? `; summary=${review.summary.replace(/\s+/g, " ").slice(0, 400)}` : ""}`),
+			"",
+			"Adversarial tests run in a fresh OpenShell evaluation guest. The coordinator alone applies their pass/fail gate and bounded finding penalty.",
+			"",
+		] : []),
 		"## Guardrails",
 		"",
+		`- Regression gate: ${config.regressionCommand}`,
 		`- Visible evaluations: ${config.evalCommands.join("; ") || "none"}`,
 		`- Hidden evaluations: ${config.hiddenEvalCommands.length || 0}`,
 		`- Compute policy: ${config.computePolicy ?? "single"}`,

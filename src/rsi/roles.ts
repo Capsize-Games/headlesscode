@@ -28,9 +28,19 @@ export function resolveRoles(
 	const roles: RsiRoleConfig = { ...defaultRoles(workerModel), ...configured }
 	for (const role of ROLE_ENV_NAMES) {
 		const model = env[envKey(role)]
-		if (model) {
-			const existing = roles[role]
-			roles[role] = { ...(existing ?? { provider: "ollama" }), model } as RoleModelConfig
+		const prefix = `HEADLESSCODE_RSI_ROLE_${role.toUpperCase().replace(/-/g, "_")}_`
+		const provider = env[`${prefix}PROVIDER`]?.trim()
+		const baseUrl = env[`${prefix}BASE_URL`]?.trim()
+		const command = env[`${prefix}COMMAND`]?.trim()
+		if (provider && !["ollama", "openrouter", "command"].includes(provider)) throw new Error(`${prefix}PROVIDER must be ollama, openrouter, or command`)
+		if (model || provider || baseUrl || command) {
+			roles[role] = {
+				...(roles[role] ?? { provider: "ollama" as const, model: workerModel }),
+				...(model ? { model } : {}),
+				...(provider ? { provider: provider as RoleModelConfig["provider"] } : {}),
+				...(baseUrl ? { baseUrl } : {}),
+				...(command ? { command } : {}),
+			}
 		}
 	}
 	return roles

@@ -1,10 +1,13 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
+import { execFileSync } from "node:child_process"
 import * as fs from "node:fs/promises"
+import * as path from "node:path"
+import { setTimeout as delay } from "node:timers/promises"
 import { appendRun, checkpointRun, findActiveRun, readArchive } from "./archive.js"
 import { parseRsiArgs, rsiHelp } from "./config.js"
-import { generateCurriculumProposals, writeCurriculumProposals } from "./curriculum.js"
-import { evaluateCandidate, runCommand } from "./evaluator.js"
-import { computeFitness, compareFitness } from "./fitness.js"
+import { generateCurriculumProposals, validateCurriculumProposals, writeCurriculumProposals } from "./curriculum.js"
+import { evaluateCandidate } from "./evaluator.js"
+import { computeFitness, compareFitness, comparePairedEvaluation } from "./fitness.js"
 import { baseModelCandidate, createCombination } from "./models.js"
 import { runMutation } from "./mutation.js"
 import { formatRunReport } from "./reports.js"
@@ -12,7 +15,12 @@ import { protectedPathViolations } from "./sandbox.js"
 import { resolveRoles } from "./roles.js"
 import { newExperimentJob, paretoFront, selectParentChoices, transitionJob } from "./selection.js"
 import { captureCandidateTrajectory, exportTrajectoryDatasets } from "./trajectory.js"
-import type { CandidateRecord, ExperimentJob, RsiArchive, RsiConfig, RsiHooks, RsiRunRecord, TrajectoryRecord } from "./types.js"
+import { decideAdaptiveContinuation } from "./adaptive.js"
+import { createOpenShellCommandRunner } from "./openshell.js"
+import { createAdversarialEvaluationSnapshotBundle, createEvaluationSnapshotBundle, createMutationSnapshotBundle, applyFleetMutationPatch } from "./openshell.js"
+import { ADVERSARIAL_COMMAND, ADVERSARIAL_PROMPT_VERSION, ADVERSARIAL_TESTS_PATH, buildAdversarialPrompt, parseAdversarialReview, requestAdversarialReview, sha256 } from "./adversarial.js"
+import { fleetJobMatches, PostgresRsiJobQueue, fleetQueuePolicy, requiredFleetJobLeaseMs, type FleetJob, type FleetJobIdentity, type FleetJobPayload } from "./postgres-queue.js"
+import type { AdversarialReviewRecord, CandidateRecord, ExperimentJob, RsiArchive, RsiConfig, RsiHooks, RsiRunRecord, TrajectoryRecord, TrialResult } from "./types.js"
 import {
 	candidateCommits,
 	changedFiles,
@@ -59,8 +67,295 @@ function initialRun(config: RsiConfig, baseCommit: string, now: string): RsiRunR
 		jobs: [],
 		trajectoryRefs: [],
 		curriculumTasks: [],
+		adversarialReviews: [],
 		candidates: [],
 		reports: [],
+	}
+}
+
+async function waitForFleetJob(queue: PostgresRsiJobQueue, jobId: string, timeoutMs: number): Promise<FleetJob> {
+	const deadline = Date.now() + timeoutMs
+	while (Date.now() < deadline) {
+		const job = await queue.getJob(jobId)
+		if (!job) throw new Error(`fleet job ${jobId} disappeared`)
+		if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") return job
+		await delay(500)
+	}
+	await queue.cancel(jobId, "coordinator wait timeout")
+	throw new Error(`fleet job ${jobId} exceeded coordinator timeout`)
+}
+
+function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: { content: Buffer; snapshotCommit: string }): FleetJobPayload {
+	return {
+		schemaVersion: 1,
+		snapshotSha256: "", // replaced with the verified artifact digest before enqueue
+		snapshotBytes: snapshot.content.byteLength,
+		snapshotCommit: snapshot.snapshotCommit,
+		task: config.mutationTask,
+		model: candidate.model,
+		maxIterations: config.maxIterations,
+		timeoutMs: config.commandTimeoutMs,
+		protectedPaths: config.protectedPaths,
+		candidate: {
+			id: candidate.id, generation: candidate.generation, parent: candidate.parent,
+			mutationKind: candidate.mutationKind, hypothesis: candidate.hypothesis,
+			modelCandidateId: candidate.modelCandidateId, computePolicy: config.computePolicy,
+		},
+		regressionCommand: config.regressionCommand,
+		evalCommands: config.evalCommands,
+	}
+}
+
+function fleetEvaluationResult(value: unknown): { regression: TrialResult; visible: TrialResult[] } {
+	if (!value || typeof value !== "object") throw new Error("fleet evaluation result is malformed")
+	const result = value as {
+		evaluation?: { regression?: unknown; visible?: unknown[] }
+		outputArtifact?: { sha256?: unknown; bytes?: unknown }
+	}
+	const output = result.outputArtifact
+	if (!output || typeof output.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(output.sha256) || !Number.isSafeInteger(output.bytes) || Number(output.bytes) < 1) {
+		throw new Error("fleet evaluation output artifact reference is missing or malformed")
+	}
+	const compactTrial = (trial: unknown): TrialResult => {
+		if (!trial || typeof trial !== "object") throw new Error("fleet evaluation trial is malformed")
+		const item = trial as TrialResult
+		if (typeof item.ok !== "boolean" || (item.exitCode !== null && !Number.isSafeInteger(item.exitCode)) || !Number.isFinite(item.durationMs) || item.durationMs < 0 || typeof item.command !== "string" || item.command.length > 512 || typeof item.stdout !== "string" || item.stdout.length > 2048 || typeof item.stderr !== "string" || item.stderr.length > 2048 || item.outputArtifactSha256 !== output.sha256 || item.outputArtifactBytes !== output.bytes) {
+			throw new Error("fleet evaluation trial exceeds bounded result fields or lacks its output artifact reference")
+		}
+		return item
+	}
+	const evaluation = result.evaluation
+	if (!evaluation || !Array.isArray(evaluation.visible)) throw new Error("fleet evaluation trial list is malformed")
+	return { regression: compactTrial(evaluation.regression), visible: evaluation.visible.map(compactTrial) }
+}
+
+async function validateCurriculumOnFleet(
+	tasks: RsiRunRecord["curriculumTasks"],
+	config: RsiConfig,
+	run: RsiRunRecord,
+	queue: PostgresRsiJobQueue,
+	now: () => string,
+): Promise<NonNullable<RsiRunRecord["curriculumTasks"]>> {
+	if (!tasks?.length) return []
+	return validateCurriculumProposals(tasks, run.baseCommit, async (task, attempt, replayKey) => {
+		const replayCandidate: CandidateRecord = {
+			id: `${task.fixtureId}-replay-${attempt}`,
+			generation: 0,
+			parent: run.baseCommit,
+			branch: `curriculum-${task.fixtureId}`,
+			worktree: config.repoRoot,
+			baseCommit: run.baseCommit,
+			status: "evaluating",
+			model: config.model,
+			mutation: task.task,
+			createdAt: now(),
+			updatedAt: now(),
+			commits: [],
+			changedFiles: [],
+			protectedPathViolations: [],
+		}
+		const idempotencyKey = `${run.runId}:${replayKey}`
+		const snapshot = createEvaluationSnapshotBundle(config.repoRoot, run.baseCommit, config)
+		const artifact = await queue.putArtifact(snapshot.content)
+		const payload = fleetPayload(config, replayCandidate, snapshot)
+		payload.snapshotSha256 = artifact.sha256
+		payload.task = `Replay registered curriculum fixture ${task.fixtureId}`
+		payload.regressionCommand = "true"
+		payload.evalCommands = [task.groundTruthCommand]
+		const expected = {
+			idempotencyKey,
+			runId: run.runId,
+			candidateId: replayCandidate.id,
+			jobKind: "evaluation" as const,
+			resourceClass: "CPU" as const,
+			concurrencyKey: `curriculum:${task.fixtureId}`,
+			artifactSha256: artifact.sha256,
+			payload,
+		}
+		let job = await queue.getJobByIdempotencyKey(idempotencyKey)
+		if (!job) {
+			job = await queue.enqueue({
+				idempotencyKey,
+				runId: run.runId,
+				candidateId: replayCandidate.id,
+				jobKind: "evaluation",
+				resourceClass: "CPU",
+				concurrencyKey: expected.concurrencyKey,
+				artifactSha256: artifact.sha256,
+				payload,
+			})
+		}
+		if (!fleetJobMatches(job, expected)) return { ok: false, exitCode: null, failure: "idempotent curriculum replay key refers to a stale or mismatched fleet job payload" }
+		const completed = await waitForFleetJob(queue, job.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, 1) + 60_000)
+		if (completed.status !== "completed" || !completed.result || typeof completed.result !== "object") return { ok: false, exitCode: null, failure: completed.error ?? `OpenShell curriculum replay ended ${completed.status}` }
+		try {
+			const evaluation = fleetEvaluationResult(completed.result)
+			const trial = evaluation.visible[0]
+			if (!trial) return { ok: false, exitCode: null, failure: "OpenShell curriculum replay returned no fixture trial" }
+			return {
+				ok: trial.ok,
+				exitCode: trial.exitCode,
+				outputSha256: trial.outputArtifactSha256,
+				...(!trial.ok ? { failure: `fixture command exited ${trial.exitCode ?? "unknown"}` } : {}),
+			}
+		} catch (error) {
+			return { ok: false, exitCode: null, failure: error instanceof Error ? error.message : String(error) }
+		}
+	}, now())
+}
+
+async function runAdversarialStage(
+	candidate: CandidateRecord,
+	evaluation: { regression: TrialResult; visible: TrialResult[] },
+	config: RsiConfig,
+	run: RsiRunRecord,
+	queue: PostgresRsiJobQueue,
+	hooks: RsiHooks,
+	now: () => string,
+): Promise<AdversarialReviewRecord> {
+	const role = config.roles?.adversary
+	if (!role) throw new Error("adversary role is not configured")
+	const base: AdversarialReviewRecord = {
+		candidateId: candidate.id, role: "adversary", provider: role.provider, model: role.model,
+		promptVersion: ADVERSARIAL_PROMPT_VERSION, promptSha256: "", promptArtifactSha256: "",
+		createdAt: now(), status: "error", findings: [], testResults: [], penaltyPoints: 0,
+	}
+	let internalJob: ExperimentJob | undefined
+	try {
+		const workerRole = config.roles?.worker
+		const workerModel = workerRole?.model ?? candidate.model
+		if (!role.model?.trim() || role.model === workerModel) throw new Error("adversary role must use a different model from the configured worker role")
+		const patch = execFileSync("git", ["diff", "--binary", "--no-ext-diff", "--no-renames", candidate.baseCommit + "...HEAD"], { cwd: candidate.worktree, encoding: "buffer", maxBuffer: 4 * 1024 * 1024 }).toString("utf8")
+		if (!patch || Buffer.byteLength(patch) > 512 * 1024) throw new Error("candidate diff is empty or exceeds the 512 KiB reviewer input limit")
+		const prompt = buildAdversarialPrompt(candidate, patch, evaluation)
+		const promptBytes = Buffer.from(prompt)
+		if (promptBytes.byteLength > 600 * 1024) throw new Error("adversarial prompt exceeds the 600 KiB limit")
+		const promptArtifact = await queue.putArtifact(promptBytes)
+		base.promptSha256 = sha256(promptBytes)
+		base.promptArtifactSha256 = promptArtifact.sha256
+		const raw = await (hooks.runAdversary ? hooks.runAdversary({ role, prompt }) : requestAdversarialReview(role, prompt))
+		const resultBytes = Buffer.from(raw)
+		const resultArtifact = await queue.putArtifact(resultBytes)
+		base.resultSha256 = sha256(resultBytes)
+		base.resultArtifactSha256 = resultArtifact.sha256
+		const parsed = parseAdversarialReview(raw, candidate.changedFiles)
+		base.summary = parsed.summary
+		base.findings = parsed.findings
+		base.penaltyPoints = Math.min(10, parsed.findings.reduce((points, finding) => points + (finding.severity === "major" ? 5 : 1), 0))
+		const tests = Buffer.from(JSON.stringify({ schemaVersion: 1, tests: parsed.tests }))
+		const testsArtifact = await queue.putArtifact(tests)
+		base.testArtifactSha256 = testsArtifact.sha256
+		const candidateCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: candidate.worktree, encoding: "utf8" }).trim()
+		const snapshot = createAdversarialEvaluationSnapshotBundle(candidate.worktree, candidateCommit, config, tests)
+		const snapshotArtifact = await queue.putArtifact(snapshot.content)
+		base.snapshotArtifactSha256 = snapshotArtifact.sha256
+		internalJob = newExperimentJob("adversarial", { class: "CPU", units: 1, concurrencyKey: "adversarial:" + candidate.id }, now(), candidate.id)
+		run.jobs ??= []
+		run.jobs.push(internalJob)
+		const candidateId = candidate.id + "-adversarial"
+		const payload = fleetPayload(config, { ...candidate, id: candidateId, baseCommit: snapshot.snapshotCommit }, snapshot)
+		payload.snapshotSha256 = snapshotArtifact.sha256
+		payload.task = "Run supervisor-generated adversarial checks for " + candidate.id
+		payload.regressionCommand = "true"
+		payload.evalCommands = [ADVERSARIAL_COMMAND]
+		const idempotencyKey = run.runId + ":" + candidate.id + ":adversarial:" + testsArtifact.sha256
+		const expected = {
+			idempotencyKey, runId: run.runId, candidateId, jobKind: "evaluation" as const,
+			resourceClass: "CPU" as const, concurrencyKey: "adversarial:" + candidate.id,
+			artifactSha256: snapshotArtifact.sha256, payload,
+		}
+		let job = await queue.getJobByIdempotencyKey(idempotencyKey)
+		if (!job) job = await queue.enqueue({ ...expected, payload })
+		if (!fleetJobMatches(job, expected)) throw new Error("existing adversarial evaluation idempotency key has mismatched test artifact or execution payload")
+		const completed = await waitForFleetJob(queue, job.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, 1) + 60_000)
+		if (completed.status !== "completed" || !completed.result || typeof completed.result !== "object") throw new Error(completed.error ?? "OpenShell adversarial tests ended " + completed.status)
+		const result = fleetEvaluationResult(completed.result)
+		const trial = result.visible[0]
+		if (!trial) throw new Error("OpenShell adversarial job returned no test result")
+		const passedIds = new Set(trial.stdout.split("\n").filter((line) => line.startsWith("PASS ")).map((line) => line.slice(5).trim()))
+		base.testResults = parsed.tests.map((test) => ({ id: test.id, passed: trial.ok && passedIds.has(test.id), outputArtifactSha256: trial.outputArtifactSha256, ...(!trial.ok || !passedIds.has(test.id) ? { failure: trial.stdout.slice(0, 1000) || "OpenShell adversarial test failed with exit " + (trial.exitCode ?? "unknown") } : {}) }))
+		base.jobId = job.jobId
+		const allTestsPassed = trial.ok && base.testResults.length === parsed.tests.length && base.testResults.every((entry) => entry.passed)
+		base.status = allTestsPassed ? "passed" : "failed"
+		internalJob.status = allTestsPassed ? "completed" : "failed"
+		internalJob.updatedAt = now()
+		if (!allTestsPassed) internalJob.error = "adversarial test failure (" + (trial.exitCode ?? "unknown") + ")"
+		return base
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error)
+		base.error = message.slice(0, 2000)
+		base.status = "error"
+		if (internalJob) {
+			internalJob.status = "failed"
+			internalJob.updatedAt = now()
+			internalJob.error = base.error
+		}
+		try {
+			const failureArtifact = await queue.putArtifact(Buffer.from(base.error))
+			base.errorSha256 = sha256(base.error)
+			base.errorArtifactSha256 = failureArtifact.sha256
+		} catch { /* preserve the primary failure if artifact storage itself is unavailable */ }
+		return base
+	}
+}
+
+async function evaluateBaselineLocal(config: RsiConfig, baseCommit: string, runner: RsiHooks["runCommand"]): Promise<NonNullable<RsiRunRecord["baselineEvaluation"]>> {
+	const name = `rsi-baseline-${randomUUID().slice(0, 12)}`
+	const baselineRoot = path.join(config.repoRoot, ".worktrees", name)
+	execFileSync("git", ["worktree", "add", "--detach", baselineRoot, baseCommit], { cwd: config.repoRoot, stdio: "pipe" })
+	try {
+		return await evaluateCandidate(config, baselineRoot, baseCommit, runner)
+	} finally {
+		execFileSync("git", ["worktree", "remove", "--force", baselineRoot], { cwd: config.repoRoot, stdio: "pipe" })
+	}
+}
+
+async function evaluateBaselineFleet(
+	config: RsiConfig,
+	baseCommit: string,
+	queue: PostgresRsiJobQueue,
+	runId: string,
+): Promise<NonNullable<RsiRunRecord["baselineEvaluation"]>> {
+	const idempotencyKey = `${runId}:baseline:evaluation`
+	const snapshot = createEvaluationSnapshotBundle(config.repoRoot, baseCommit, config)
+	const artifact = await queue.putArtifact(snapshot.content)
+	const baseline: CandidateRecord = {
+			id: "baseline",
+			generation: 0,
+			parent: "baseline",
+			branch: "baseline",
+			worktree: config.repoRoot,
+			baseCommit,
+			status: "evaluating",
+			model: config.model,
+			mutation: "Baseline visible evaluation",
+			createdAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString(),
+			commits: [],
+			changedFiles: [],
+			protectedPathViolations: [],
+		}
+	const payload = fleetPayload(config, baseline, snapshot)
+	payload.snapshotSha256 = artifact.sha256
+	const expected: FleetJobIdentity = {
+		idempotencyKey, runId, candidateId: "baseline", jobKind: "evaluation",
+		resourceClass: "CPU", concurrencyKey: "eval:baseline", artifactSha256: artifact.sha256, payload,
+	}
+	const existing = await queue.getJobByIdempotencyKey(idempotencyKey)
+	const job = existing ?? await queue.enqueue(expected)
+	if (!fleetJobMatches(job, expected)) throw new Error("existing baseline evaluation idempotency key has mismatched execution identity or payload")
+
+	const completed = await waitForFleetJob(queue, job.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, config.evalCommands.length) + 60_000)
+	if (completed.status !== "completed" || !completed.result || typeof completed.result !== "object") throw new Error(completed.error ?? `fleet baseline evaluation ended ${completed.status}`)
+	const evaluation = fleetEvaluationResult(completed.result)
+	const trials = [evaluation.regression, ...evaluation.visible]
+	let resultIndex = 0
+	const baselineRoot = path.join(config.repoRoot, ".worktrees", `rsi-baseline-${randomUUID().slice(0, 12)}`)
+	execFileSync("git", ["worktree", "add", "--detach", baselineRoot, baseCommit], { cwd: config.repoRoot, stdio: "pipe" })
+	try {
+		return await evaluateCandidate(config, baselineRoot, baseCommit, async () => trials[resultIndex++] as TrialResult)
+	} finally {
+		execFileSync("git", ["worktree", "remove", "--force", baselineRoot], { cwd: config.repoRoot, stdio: "pipe" })
 	}
 }
 
@@ -72,6 +367,24 @@ function recoverInterruptedCandidates(run: RsiRunRecord, now: string): void {
 			candidate.updatedAt = now
 		}
 	}
+}
+
+async function ensureCandidateWorktree(config: RsiConfig, candidate: CandidateRecord): Promise<{ created: boolean; commits: number }> {
+	let created = false
+	try {
+		await fs.access(candidate.worktree)
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+		await createCandidateWorktree(config, candidate)
+		created = true
+	}
+	const top = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: candidate.worktree, encoding: "utf8" }).trim()
+	if (path.resolve(top) !== path.resolve(candidate.worktree)) throw new Error("candidate worktree path resolved outside its recorded location")
+	const commits = Number(execFileSync("git", ["rev-list", "--count", `${candidate.baseCommit}..HEAD`], { cwd: candidate.worktree, encoding: "utf8" }).trim())
+	if (!Number.isSafeInteger(commits) || commits < 0 || commits > 1) throw new Error("candidate worktree has an unexpected commit count while resuming")
+	const status = execFileSync("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd: candidate.worktree, encoding: "buffer" })
+	if (status.byteLength > 0) throw new Error("candidate worktree has uncommitted state; refusing unsafe fleet resume")
+	return { created, commits }
 }
 
 async function captureCandidate(
@@ -93,7 +406,14 @@ async function captureCandidate(
 	}
 }
 
-export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}): Promise<RsiRunRecord> {
+export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverride?: PostgresRsiJobQueue): Promise<RsiRunRecord> {
+	if (config.computePolicy === "adaptive-independent") {
+		const trajectoryLimit = config.maxTrajectories ?? config.population + 1
+		const iterationLimit = config.maxTotalIterations ?? trajectoryLimit * config.maxIterations
+		if (config.population < 2 || config.generations !== 1 || trajectoryLimit < config.population || trajectoryLimit > config.population + 1 || iterationLimit < config.population * config.maxIterations || iterationLimit > trajectoryLimit * config.maxIterations) {
+			throw new Error("invalid adaptive-independent budgets: require population >= 2, exactly one follow-up generation, and trajectory/iteration limits for only the initial cohort plus at most one candidate")
+		}
+	}
 	const now = hooks.now ?? (() => new Date().toISOString())
 	const archive = await readArchive(config.archiveDir)
 	const roles = resolveRoles(config.roles, process.env, config.model)
@@ -102,7 +422,8 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}): Promise<R
 	if (config.resumeRunId && !resumed) throw new Error(`no active RSI run found for --resume ${config.resumeRunId}`)
 	const baseCommit = resumed?.baseCommit ?? (await resolveBaseCommit(config))
 	const run = resumed ?? initialRun({ ...config, model: workerModel, roles }, baseCommit, now())
-	run.generations = config.generations
+	const stageCount = config.computePolicy === "adaptive-independent" ? 2 : config.generations
+	run.generations = stageCount
 	run.model = workerModel
 	run.parentSelectionPolicy = config.parentSelectionPolicy ?? run.parentSelectionPolicy ?? "champion-specialist-novelty"
 	run.modelCandidates ??= [baseModelCandidate(config.model, now(), config.modelCandidateId ?? "model-base")]
@@ -113,18 +434,55 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}): Promise<R
 	run.jobs ??= []
 	run.trajectoryRefs ??= []
 	run.curriculumTasks ??= []
+	run.adversarialReviews ??= []
 	run.parentChoices ??= {}
-	if (resumed) recoverInterruptedCandidates(run, now())
 	const runConfig: RsiConfig = { ...config, model: workerModel, roles, seed: `${config.seed}-${run.runId.slice(-8)}` }
 	const trajectories: TrajectoryRecord[] = []
 
-	if (!config.dryRun && !run.baseline) {
-		run.baseline = await (hooks.runCommand ?? runCommand)("npm test", config.repoRoot, config.commandTimeoutMs)
+	if (!config.dryRun && config.hiddenEvalCommands.length > 0) {
+		throw new Error("RSI hidden evaluations are disabled until their evaluator assets can remain unavailable to candidate processes")
+	}
+	const fleetQueue = !config.dryRun && (queueOverride !== undefined || !hooks.runMutation)
+		? queueOverride ?? PostgresRsiJobQueue.fromEnvironment(fleetQueuePolicy(process.env.HEADLESSCODE_RSI_QUEUE_NAME?.trim() || "rsi-default", config.maxConcurrent, process.env), process.env)
+		: undefined
+	if (!config.dryRun && config.roles?.adversary && !fleetQueue) throw new Error("RSI adversarial break tests require the OpenShell fleet evaluation path")
+	const commandRunner = hooks.runCommand ?? (fleetQueue ? undefined : createOpenShellCommandRunner(runConfig))
+	try {
+	if (fleetQueue) {
+		if (fleetQueue.artifactBackend !== "s3") throw new Error("RSI production runs require a shared S3-compatible artifact store")
+		await fleetQueue.migrate()
+		if (await fleetQueue.activeWorkerCount() < 1) throw new Error("no live OpenShell RSI worker is registered for the configured queue")
+	}
+	if (resumed && !fleetQueue) recoverInterruptedCandidates(run, now())
+	if (!config.dryRun && !run.baselineEvaluation) {
+		run.baselineEvaluation = fleetQueue
+			? await evaluateBaselineFleet(runConfig, baseCommit, fleetQueue, run.runId)
+			: await evaluateBaselineLocal(runConfig, baseCommit, commandRunner)
+		run.baselineFitness = computeFitness(run.baselineEvaluation)
+		run.baseline = run.baselineEvaluation.regression
 		log(hooks, `[rsi] baseline: ${run.baseline.ok ? "pass" : "fail"}`)
 		await checkpointRun(config.archiveDir, run)
 	}
 
-	for (let generation = 0; generation < config.generations; generation++) {
+	for (let generation = 0; generation < stageCount; generation++) {
+		if (config.computePolicy === "adaptive-independent" && generation > 0) {
+			let previousDecision = run.adaptiveSearch?.find((entry) => entry.generation === generation - 1)
+			if (!previousDecision) {
+				const priorCandidates = run.candidates.filter((candidate) => candidate.generation === generation - 1)
+				previousDecision = decideAdaptiveContinuation({
+					generation: generation - 1,
+					generationCandidates: priorCandidates,
+					allCandidates: run.candidates,
+					config,
+					elapsedMs: Math.max(0, Date.now() - Date.parse(run.startedAt)),
+					decidedAt: now(),
+				})
+				run.adaptiveSearch ??= []
+				run.adaptiveSearch.push(previousDecision)
+				await checkpointRun(config.archiveDir, run)
+			}
+			if (previousDecision.decision !== "continue") break
+		}
 		let candidates = run.candidates.filter((candidate) => candidate.generation === generation)
 		if (candidates.length === 0) {
 			const merged = combinedArchive(archive, run)
@@ -134,7 +492,8 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}): Promise<R
 			const fallbackBase = run.selected
 				? run.candidates.find((candidate) => candidate.id === run.selected)?.commits[0] ?? run.baseCommit
 				: run.baseCommit
-			candidates = Array.from({ length: config.population }, (_, index) => {
+			const candidateCount = config.computePolicy === "adaptive-independent" && generation > 0 ? 1 : config.population
+			candidates = Array.from({ length: candidateCount }, (_, index) => {
 				const parentChoice = choices[index]
 				const candidate = newCandidate(runConfig, generation, index, parentChoice?.baseCommit ?? fallbackBase, now(), parentChoice)
 				if (parentChoice) run.parentChoices![candidate.id] = parentChoice.reason
@@ -148,6 +507,67 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}): Promise<R
 		}
 		if (config.dryRun) continue
 
+		const mutationJobs = new Map<string, FleetJob>()
+		const evaluationJobs = new Map<string, FleetJob>()
+		const managedWorktrees = new Set<string>()
+		if (fleetQueue) {
+			try {
+				for (const candidate of candidates) {
+					if (isTerminal(candidate)) continue
+					const worktree = await ensureCandidateWorktree(runConfig, candidate)
+					managedWorktrees.add(candidate.id)
+					const key = `${run.runId}:${candidate.id}:mutation`
+					const snapshot = createMutationSnapshotBundle(candidate.worktree, candidate.baseCommit, runConfig)
+					const artifact = await fleetQueue.putArtifact(snapshot.content)
+					const payload = fleetPayload(runConfig, candidate, snapshot)
+					payload.snapshotSha256 = artifact.sha256
+					const expected: FleetJobIdentity = {
+						idempotencyKey: key, runId: run.runId, candidateId: candidate.id,
+						jobKind: "mutation", resourceClass: "LOCAL_GPU", concurrencyKey: `ollama:${candidate.model}`,
+						artifactSha256: artifact.sha256, payload,
+					}
+					const existing = await fleetQueue.getJobByIdempotencyKey(key)
+					if (existing && !fleetJobMatches(existing, expected)) throw new Error("existing idempotent mutation job has mismatched execution identity, snapshot, or task payload")
+					if (worktree.commits > 0) {
+						const completed = existing
+						if (completed?.candidateId !== candidate.id || completed.jobKind !== "mutation" || completed.status !== "completed" || !completed.result || typeof completed.result !== "object") {
+							throw new Error("candidate worktree contains an applied mutation commit without its completed idempotent fleet job")
+						}
+						const result = completed.result as { patchSha256?: string; patchBytes?: number }
+						if (!result.patchSha256 || !Number.isSafeInteger(result.patchBytes) || Number(result.patchBytes) < 1) throw new Error("completed fleet mutation has no valid patch artifact reference for resume")
+						const patch = await fleetQueue.getArtifact(result.patchSha256)
+						const appliedPatch = execFileSync("git", ["diff", "--binary", "--no-ext-diff", "--no-renames", `${candidate.baseCommit}...HEAD`], { cwd: candidate.worktree, encoding: "buffer" })
+						if (patch.byteLength !== result.patchBytes || appliedPatch.byteLength !== result.patchBytes || createHash("sha256").update(appliedPatch).digest("hex") !== result.patchSha256) {
+							throw new Error("candidate worktree commit does not match the completed fleet mutation patch")
+						}
+						let recorded = run.jobs.find((entry) => entry.candidateId === candidate.id && entry.kind === "mutation")
+						if (!recorded) {
+							recorded = newExperimentJob("mutation", { class: "LOCAL_GPU", units: 1, concurrencyKey: "ollama" }, now(), candidate.id)
+							run.jobs.push(recorded)
+						}
+						if (recorded.status !== "completed") replaceJob(run, transitionJob(recorded, "completed", now()))
+						candidate.status = "evaluating"
+						candidate.changedFiles = await changedFiles(candidate.worktree, candidate.baseCommit)
+						candidate.commits = await candidateCommits(candidate.worktree, candidate.baseCommit)
+						candidate.protectedPathViolations = protectedPathViolations(candidate.changedFiles, config.protectedPaths)
+						candidate.updatedAt = now()
+						await checkpointRun(config.archiveDir, run)
+						continue
+					}
+					const job = existing ?? await fleetQueue.enqueue(expected)
+					if (!fleetJobMatches(job, expected)) throw new Error("enqueued mutation job does not match its expected execution identity or payload")
+					mutationJobs.set(candidate.id, job)
+				}
+			} catch (error) {
+				for (const candidate of candidates.filter((entry) => managedWorktrees.has(entry.id))) {
+					await removeCandidateWorktree(runConfig, candidate).catch(() => undefined)
+				}
+				throw error
+			}
+		}
+
+		// Resolve every mutation first. Evaluation submission is a separate
+		// generation-wide phase so CPU workers can claim the full ready set.
 		for (const candidate of candidates) {
 			if (isTerminal(candidate)) continue
 			let job = run.jobs.find((entry) => entry.candidateId === candidate.id && entry.kind === "mutation")
@@ -155,37 +575,115 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}): Promise<R
 				job = newExperimentJob("mutation", { class: "LOCAL_GPU", units: 1, concurrencyKey: "ollama" }, now(), candidate.id)
 				run.jobs.push(job)
 			}
-			candidate.status = "mutating"
-			candidate.updatedAt = now()
-			job = transitionJob(job, "running", now())
-			replaceJob(run, job)
-			await checkpointRun(config.archiveDir, run)
-			let worktreeCreated = false
 			try {
-				await createCandidateWorktree(runConfig, candidate)
-				worktreeCreated = true
-				const mutation = await (hooks.runMutation ?? runMutation)(candidate, runConfig)
-				if (!mutation.ok) {
-					candidate.status = "failed"
-					candidate.failure = mutation.error
-					candidate.result = mutation.result
+				const worktree = fleetQueue ? await ensureCandidateWorktree(runConfig, candidate) : { created: false, commits: 0 }
+				managedWorktrees.add(candidate.id)
+				if (worktree.commits === 0) {
+					candidate.status = "mutating"
 					candidate.updatedAt = now()
-					job = transitionJob(job, "failed", now(), mutation.error)
+					if (job.status !== "running") job = transitionJob(job, "running", now())
 					replaceJob(run, job)
-					await captureCandidate(candidate, runConfig, run, trajectories, now(), hooks)
-					log(hooks, `[rsi] ${candidate.id}: mutation failed${mutation.error ? `: ${mutation.error}` : ""}`)
-					continue
+					await checkpointRun(config.archiveDir, run)
+					if (fleetQueue) {
+						const submitted = mutationJobs.get(candidate.id)
+						if (!submitted) throw new Error("candidate mutation was not admitted to the RSI fleet queue")
+						const completed = await waitForFleetJob(fleetQueue, submitted.jobId, config.commandTimeoutMs * 4 + 180_000)
+						if (completed.status !== "completed" || !completed.result || typeof completed.result !== "object") throw new Error(completed.error ?? `fleet mutation ended ${completed.status}`)
+						const result = completed.result as { patchSha256?: string; patchBytes?: number }
+						if (!result.patchSha256 || !Number.isSafeInteger(result.patchBytes) || Number(result.patchBytes) < 1) throw new Error("fleet mutation result is missing its patch artifact reference")
+						const patch = await fleetQueue.getArtifact(result.patchSha256)
+						if (patch.byteLength !== result.patchBytes) throw new Error("fleet mutation patch length did not match result metadata")
+						applyFleetMutationPatch(patch, candidate, runConfig)
+					} else {
+					await createCandidateWorktree(runConfig, candidate)
+					managedWorktrees.add(candidate.id)
+					const mutation = await (hooks.runMutation ?? runMutation)(candidate, runConfig)
+					if (!mutation.ok) throw new Error(mutation.error ?? "RSI mutation failed")
 				}
-				candidate.status = "evaluating"
-				candidate.changedFiles = await changedFiles(candidate.worktree, candidate.baseCommit)
-				candidate.commits = await candidateCommits(candidate.worktree, candidate.baseCommit)
-				candidate.protectedPathViolations = protectedPathViolations(candidate.changedFiles, config.protectedPaths)
-				const evaluation = await evaluateCandidate(runConfig, candidate.worktree, candidate.baseCommit, hooks.runCommand ?? runCommand)
+				job = transitionJob(job, "completed", now())
+				replaceJob(run, job)
+			}
+			candidate.status = "evaluating"
+			candidate.changedFiles = await changedFiles(candidate.worktree, candidate.baseCommit)
+			candidate.commits = await candidateCommits(candidate.worktree, candidate.baseCommit)
+			candidate.protectedPathViolations = protectedPathViolations(candidate.changedFiles, config.protectedPaths)
+			candidate.updatedAt = now()
+			await checkpointRun(config.archiveDir, run)
+		} catch (error) {
+			candidate.status = "failed"
+			candidate.failure = error instanceof Error ? error.message : String(error)
+			candidate.updatedAt = now()
+			job = transitionJob(job, "failed", now(), candidate.failure)
+			replaceJob(run, job)
+			await captureCandidate(candidate, runConfig, run, trajectories, now(), hooks)
+			log(hooks, `[rsi] ${candidate.id}: mutation failed: ${candidate.failure}`)
+			if (!config.keepWorktrees && managedWorktrees.has(candidate.id)) await removeCandidateWorktree(runConfig, candidate).catch(() => undefined)
+			await checkpointRun(config.archiveDir, run)
+		}
+		await checkpointRun(config.archiveDir, run)
+		}
+
+		if (fleetQueue) {
+			for (const candidate of candidates.filter((entry) => entry.status === "evaluating")) {
+				try {
+					const key = `${run.runId}:${candidate.id}:evaluation`
+					const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: candidate.worktree, encoding: "utf8" }).trim()
+					const snapshot = createEvaluationSnapshotBundle(candidate.worktree, head, runConfig)
+					const artifact = await fleetQueue.putArtifact(snapshot.content)
+					const payload = fleetPayload(runConfig, candidate, snapshot)
+					payload.snapshotSha256 = artifact.sha256
+					const expected: FleetJobIdentity = {
+						idempotencyKey: key, runId: run.runId, candidateId: candidate.id,
+						jobKind: "evaluation", resourceClass: "CPU", concurrencyKey: `eval:${candidate.id}`,
+						artifactSha256: artifact.sha256, payload,
+					}
+					const existing = await fleetQueue.getJobByIdempotencyKey(key)
+					if (existing && !fleetJobMatches(existing, expected)) throw new Error("existing idempotent evaluation job has mismatched execution identity, snapshot, or evaluation configuration")
+					const job = existing ?? await fleetQueue.enqueue(expected)
+					if (!fleetJobMatches(job, expected)) throw new Error("enqueued evaluation job does not match its expected execution identity or payload")
+					evaluationJobs.set(candidate.id, job)
+				} catch (error) {
+					candidate.status = "failed"
+					candidate.failure = error instanceof Error ? error.message : String(error)
+					candidate.updatedAt = now()
+					log(hooks, `[rsi] ${candidate.id}: evaluation admission failed: ${candidate.failure}`)
+					if (!config.keepWorktrees && managedWorktrees.has(candidate.id)) await removeCandidateWorktree(runConfig, candidate).catch(() => undefined)
+					await checkpointRun(config.archiveDir, run)
+				}
+			}
+		}
+
+		for (const candidate of candidates.filter((entry) => entry.status === "evaluating")) {
+			let job = run.jobs.find((entry) => entry.candidateId === candidate.id && entry.kind === "mutation")!
+			try {
+				let evaluation
+				if (fleetQueue) {
+					const submitted = evaluationJobs.get(candidate.id) ?? await fleetQueue.getJobByIdempotencyKey(`${run.runId}:${candidate.id}:evaluation`)
+					if (!submitted) throw new Error("candidate evaluation was not admitted to the RSI fleet queue")
+					const completed = await waitForFleetJob(fleetQueue, submitted.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, config.evalCommands.length) + 60_000)
+					if (completed.status !== "completed" || !completed.result || typeof completed.result !== "object") throw new Error(completed.error ?? `fleet evaluation ended ${completed.status}`)
+					const visible = fleetEvaluationResult(completed.result)
+					const trials = [visible.regression, ...visible.visible]
+					let resultIndex = 0
+					evaluation = await evaluateCandidate(runConfig, candidate.worktree, candidate.baseCommit, async () => trials[resultIndex++] as Awaited<ReturnType<NonNullable<typeof hooks.runCommand>>>)
+				} else {
+					evaluation = await evaluateCandidate(runConfig, candidate.worktree, candidate.baseCommit, commandRunner)
+				}
+				if (runConfig.roles?.adversary) {
+					if (!fleetQueue) throw new Error("adversarial break tests require an OpenShell fleet worker")
+					const review = await runAdversarialStage(candidate, evaluation, runConfig, run, fleetQueue, hooks, now)
+					run.adversarialReviews ??= []
+					run.adversarialReviews.push(review)
+					evaluation.adversarialPass = review.status === "passed" && review.testResults.length > 0 && review.testResults.every((entry) => entry.passed)
+					evaluation.adversarialPenalty = review.penaltyPoints
+					await checkpointRun(config.archiveDir, run)
+				}
 				candidate.changedFiles = evaluation.changedFiles
 				candidate.commits = candidate.commits.length > 0 ? candidate.commits : await candidateCommits(candidate.worktree, candidate.baseCommit)
 				candidate.result = evaluation.regression
 				candidate.fitness = computeFitness({ ...evaluation, protectedPathViolation: candidate.protectedPathViolations.length > 0 })
-				candidate.status = candidate.fitness.score > 0 ? "accepted" : "rejected"
+				if (run.baselineEvaluation) candidate.pairedComparison = comparePairedEvaluation(run.baselineEvaluation, evaluation)
+				candidate.status = candidate.fitness.score > 0 && candidate.pairedComparison?.improved === true ? "accepted" : "rejected"
 				candidate.updatedAt = now()
 				const combination = createCombination(candidate.id, candidate.modelCandidateId ?? "model-base", now())
 				combination.status = candidate.status === "accepted" ? "accepted" : "rejected"
@@ -202,14 +700,11 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}): Promise<R
 				candidate.updatedAt = now()
 				job = transitionJob(job, "failed", now(), candidate.failure)
 				replaceJob(run, job)
-				log(hooks, `[rsi] ${candidate.id}: lifecycle failed: ${candidate.failure}`)
+				await captureCandidate(candidate, runConfig, run, trajectories, now(), hooks)
+				log(hooks, `[rsi] ${candidate.id}: evaluation failed: ${candidate.failure}`)
 			} finally {
-				if (worktreeCreated && !config.keepWorktrees) {
-					try {
-						await removeCandidateWorktree(runConfig, candidate)
-					} catch (error) {
-						log(hooks, `[rsi] ${candidate.id}: worktree cleanup failed: ${String(error)}`)
-					}
+				if (!config.keepWorktrees && managedWorktrees.has(candidate.id)) {
+					await removeCandidateWorktree(runConfig, candidate).catch((error) => log(hooks, `[rsi] ${candidate.id}: worktree cleanup failed: ${String(error)}`))
 				}
 				await checkpointRun(config.archiveDir, run)
 			}
@@ -220,12 +715,33 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}): Promise<R
 		const ranked = [...accepted].sort((a, b) => compareFitness(b.fitness, a.fitness))
 		run.selectedCandidates = front.map((candidate) => candidate.id)
 		if (ranked[0]) run.selected = ranked[0].id
+		if (config.computePolicy === "adaptive-independent") {
+			run.adaptiveSearch ??= []
+			const decision = decideAdaptiveContinuation({
+				generation,
+				generationCandidates: candidates,
+				allCandidates: run.candidates,
+				config,
+				elapsedMs: Math.max(0, Date.now() - Date.parse(run.startedAt)),
+				decidedAt: now(),
+			})
+			const existingDecision = run.adaptiveSearch.findIndex((entry) => entry.generation === generation)
+			if (existingDecision >= 0) run.adaptiveSearch[existingDecision] = decision
+			else run.adaptiveSearch.push(decision)
+			log(hooks, `[rsi] adaptive search: ${decision.decision} after generation ${generation} (${decision.reason})`)
+		}
 		await checkpointRun(config.archiveDir, run)
 	}
 
 	const merged = combinedArchive(archive, run)
-	const curriculum = generateCurriculumProposals(merged, now())
-	run.curriculumTasks = curriculum
+	let curriculum = generateCurriculumProposals(merged, now())
+	if (fleetQueue && !config.dryRun && curriculum.length > 0) {
+		curriculum = await validateCurriculumOnFleet(curriculum, runConfig, run, fleetQueue, now)
+		run.curriculumTasks = curriculum
+		await checkpointRun(config.archiveDir, run)
+	} else {
+		run.curriculumTasks = curriculum
+	}
 	if (!config.dryRun && curriculum.length > 0) {
 		await writeCurriculumProposals(curriculum, config.curriculumDir ?? `${config.archiveDir}/curriculum`)
 	}
@@ -245,6 +761,9 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}): Promise<R
 		log(hooks, report.trimEnd())
 	}
 	return run
+	} finally {
+		if (fleetQueue) await fleetQueue.close()
+	}
 }
 
 export async function improveMain(argv: string[]): Promise<number> {
