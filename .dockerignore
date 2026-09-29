@@ -38,3 +38,6 @@ scripts/
 !scripts/spawn-parallel-worktrees.sh
 !scripts/run-worker.sh
 !scripts/headlesscode-answer.sh
+!scripts/rsi-training/
+!scripts/rsi-training/*.py
+!scripts/rsi-training/requirements.lock

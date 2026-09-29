@@ -3,7 +3,7 @@ import { execFileSync, spawnSync } from "node:child_process"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { OpenShellSessionProvider } from "../openshell-provider.js"
+import { OpenShellSessionProvider, validateReadOnlyMountTargets } from "../openshell-provider.js"
 import type { CloudSessionRequest } from "../provider.js"
 
 async function testIsolatedCloneExportAndImport(): Promise<void> {
@@ -12,9 +12,13 @@ async function testIsolatedCloneExportAndImport(): Promise<void> {
 	const policy = path.join(repo, "policy.yaml")
 	const memoryDir = path.join(repo, "host-memory")
 	const promptDir = path.join(repo, "prompt-source")
+	const checkpointDir = path.join(repo, "checkpoint-source")
 	let sandboxWorkspace = ""
 	let resultDir = ""
+	let capturedBundle = ""
 	let memorySnapshotDir = ""
+	let promptSnapshotDir = ""
+	let checkpointSnapshotDir = ""
 	let lastExecutedCommand = ""
 	let createArgs: string[] = []
 	try {
@@ -35,14 +39,19 @@ async function testIsolatedCloneExportAndImport(): Promise<void> {
 		fs.writeFileSync(path.join(memoryDir, "facts", "project.jsonl"), '{"content":"existing"}\n')
 		fs.mkdirSync(promptDir)
 		fs.writeFileSync(path.join(promptDir, "review-prompt.md"), "review instructions\n")
+		fs.mkdirSync(checkpointDir)
+		fs.writeFileSync(path.join(checkpointDir, "config.json"), '{"model_type":"sentinel"}\n')
+		fs.writeFileSync(path.join(checkpointDir, "sentinel.weights"), "DO_NOT_EXPORT_LOCAL_MODEL")
 		fs.writeFileSync(policy, "version: 1\nfilesystem_policy:\n  include_workdir: true\n  read_only: [/usr, /lib, /etc]\n  read_write: [/sandbox, /tmp, /dev/null]\nlandlock:\n  compatibility: hard_requirement\n")
 		const cliRun = (args: string[]) => {
 			if (args[0] === "sandbox" && args[1] === "create") {
 				createArgs = args
-				const driver = JSON.parse(args[args.indexOf("--driver-config-json") + 1]) as { docker: { mounts: Array<{ source: string; target: string }> } }
+				const driver = JSON.parse(args[args.indexOf("--driver-config-json") + 1]) as { docker: { mounts: Array<{ source: string; target: string; read_only: boolean }> } }
 				sandboxWorkspace = driver.docker.mounts.find((mount) => mount.target === "/workspace")!.source
 				resultDir = driver.docker.mounts.find((mount) => mount.target === "/result")!.source
 				memorySnapshotDir = driver.docker.mounts.find((mount) => mount.target === "/opt/headlesscode-memory")!.source
+				promptSnapshotDir = driver.docker.mounts.find((mount) => mount.target === "/workspace/.headlesscode-session")!.source
+				checkpointSnapshotDir = driver.docker.mounts.find((mount) => mount.target === "/workspace/.rsi-base-model")!.source
 				return { exitCode: 0, output: "created" }
 			}
 			if (args[0] === "sandbox" && args[1] === "delete") return { exitCode: 0, output: "deleted" }
@@ -52,23 +61,28 @@ async function testIsolatedCloneExportAndImport(): Promise<void> {
 					lastExecutedCommand = command
 					command = command.replaceAll("/workspace", "__WORKSPACE__").replaceAll("/result/", "__RESULT__/").replaceAll("/opt/headlesscode-memory", "__MEMORY__").replaceAll("__WORKSPACE__", sandboxWorkspace).replaceAll("__RESULT__", resultDir).replaceAll("__MEMORY__", memorySnapshotDir)
 					const executed = spawnSync("/bin/bash", ["-c", command], { cwd: sandboxWorkspace, encoding: "utf8", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } })
+					if (command.includes("git bundle create") && command.includes(path.join(resultDir, "result.bundle"))) capturedBundle = path.join(repo, "captured-result.bundle"), fs.copyFileSync(path.join(resultDir, "result.bundle"), capturedBundle)
 					return { exitCode: executed.status ?? 1, output: `${executed.stdout ?? ""}${executed.stderr ?? ""}` }
 				}
 				return { exitCode: 0, output: "ready" }
 			}
 			return { exitCode: 1, output: `unexpected: ${args.join(" ")}` }
 		}
-		const provider = new OpenShellSessionProvider({ image: "worker:test", policy, providers: [], scratchRoot: path.join(repo, "gateway-visible-scratch"), readOnlyMounts: [{ source: promptDir, target: "/workspace/.headlesscode-session" }], run: cliRun, listSandboxes: () => [] })
+		const provider = new OpenShellSessionProvider({ image: "worker:test", policy, providers: [], scratchRoot: path.join(repo, "gateway-visible-scratch"), readOnlyMounts: [{ source: promptDir, target: "/workspace/.headlesscode-session" }, { source: checkpointDir, target: "/workspace/.rsi-base-model" }], run: cliRun, listSandboxes: () => [] })
 		const request: CloudSessionRequest = { repo, issue: { number: 1, title: "test" }, worktreeSpec: { name: "worker", issues: [1], taskFile: "worker.md" }, env: { HEADLESSCODE_MEMORY_DIR: memoryDir } }
 		const handle = await provider.spawnExistingWorktreeSession(request, hostWorkspace)
 		assert.equal(handle.address, hostWorkspace)
-		const mounts = JSON.parse(createArgs[createArgs.indexOf("--driver-config-json") + 1]).docker.mounts as Array<{ source: string; target: string }>
+		const mounts = JSON.parse(createArgs[createArgs.indexOf("--driver-config-json") + 1]).docker.mounts as Array<{ source: string; target: string; read_only: boolean }>
 		assert.deepEqual(mounts.map((mount) => mount.target).slice(0, 2), ["/workspace", "/result"])
 		assert.equal(mounts.some((mount) => mount.source === repo || mount.source === hostWorkspace), false, "host repository and orchestration worktree are never bind-mounted")
 		const memoryMount = mounts.find((mount) => mount.target === "/opt/headlesscode-memory")!
 		assert.notEqual(memoryMount.source, memoryDir, "configured host memory is snapshotted instead of mounted")
-		assert.equal(fs.readFileSync(path.join(sandboxWorkspace, ".headlesscode-session", "review-prompt.md"), "utf8"), "review instructions\n", "review prompt directory maps to the requested in-workspace target")
+		const checkpointMount = mounts.find((mount) => mount.target === "/workspace/.rsi-base-model")!
+		assert.equal(checkpointMount.read_only, true, "the model mount uses Docker's read-only bind option")
+		assert.ok(checkpointMount.source !== sandboxWorkspace && !checkpointMount.source.startsWith(`${sandboxWorkspace}${path.sep}`), "the checkpoint snapshot is outside the writable workspace source")
+		assert.equal(fs.readFileSync(path.join(promptSnapshotDir, "review-prompt.md"), "utf8"), "review instructions\n", "review prompt is snapshotted outside the workspace and mounted at its requested target")
 		assert.equal(fs.readFileSync(path.join(sandboxWorkspace, "ORCHESTRATOR_PLAN.md"), "utf8"), "plan prompt\n", "plan-first input is copied into the isolated workspace")
+		assert.equal(fs.readFileSync(path.join(checkpointSnapshotDir, "sentinel.weights"), "utf8"), "DO_NOT_EXPORT_LOCAL_MODEL")
 		assert.equal(fs.readFileSync(path.join(sandboxWorkspace, ".env"), "utf8"), "\n", "tracked .env is filtered before sandbox execution")
 		const duplicateAttempt = provider.spawnExistingWorktreeSession(request, hostWorkspace)
 		await assert.rejects(duplicateAttempt, /already held|EEXIST|file already exists/i)
@@ -78,6 +92,14 @@ async function testIsolatedCloneExportAndImport(): Promise<void> {
 		assert.ok(!lastExecutedCommand.includes(memoryDir), "host memory path in commands is remapped")
 		fs.appendFileSync(path.join(memoryMount.source, "facts", "project.jsonl"), '{"content":"learned in sandbox"}\n')
 		await provider.teardown(handle)
+		const exported = path.join(repo, "bundle-clone")
+		const bundleHead = execFileSync("git", ["bundle", "list-heads", capturedBundle], { encoding: "utf8" }).trim().split(/\s+/)[1]
+		assert.ok(bundleHead, "OpenShell returned a bundle with a ref")
+		execFileSync("git", ["init", "-q", exported])
+		execFileSync("git", ["fetch", "--quiet", capturedBundle, bundleHead], { cwd: exported })
+		execFileSync("git", ["checkout", "-q", "FETCH_HEAD"], { cwd: exported })
+		assert.equal(execFileSync("git", ["ls-tree", "-r", "--name-only", "HEAD"], { cwd: exported, encoding: "utf8" }).includes(".rsi-base-model"), false, "read-only base model mount never enters the exported Git bundle")
+		assert.equal(fs.existsSync(path.join(exported, ".rsi-base-model", "sentinel.weights")), false)
 		assert.equal(fs.readFileSync(path.join(hostWorkspace, "result.txt"), "utf8"), "sandbox change\n")
 		assert.equal(execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: hostWorkspace, encoding: "utf8" }).trim(), hostWorkspace)
 		assert.equal(fs.readFileSync(path.join(hostWorkspace, ".harness.pgid"), "utf8"), "123\n")
@@ -89,6 +111,20 @@ async function testIsolatedCloneExportAndImport(): Promise<void> {
 	} finally {
 		fs.rmSync(repo, { recursive: true, force: true })
 	}
+}
+
+async function testReadOnlyMountTargetsAreSafeAndNonOverlapping(): Promise<void> {
+	assert.deepEqual(validateReadOnlyMountTargets([
+		{ source: "/tmp/a", target: "/workspace/.rsi-base-model" },
+		{ source: "/tmp/b", target: "/workspace/.headlesscode-session" },
+	]), ["/workspace/.rsi-base-model", "/workspace/.headlesscode-session"])
+	for (const target of ["/", "/workspace", "/workspace/../etc", "/workspace//model", "/workspace/./model", "/workspace\\model"]) {
+		assert.throws(() => validateReadOnlyMountTargets([{ source: "/tmp/model", target }]), /read-only mount target/)
+	}
+	assert.throws(() => validateReadOnlyMountTargets([
+		{ source: "/tmp/model", target: "/workspace/model" },
+		{ source: "/tmp/nested", target: "/workspace/model/nested" },
+	]), /targets overlap/)
 }
 
 async function testSandboxNameIsStableAndDistinct(): Promise<void> {
@@ -109,5 +145,10 @@ testIsolatedCloneExportAndImport().then(
 
 testSandboxNameIsStableAndDistinct().then(
 	() => console.log("  ok   OpenShell sandbox names are stable per repo+worktree and distinct across worktrees"),
+	(error) => { console.error(error); process.exitCode = 1 },
+)
+
+testReadOnlyMountTargetsAreSafeAndNonOverlapping().then(
+	() => console.log("  ok   OpenShell read-only mount targets are safe and non-overlapping"),
 	(error) => { console.error(error); process.exitCode = 1 },
 )

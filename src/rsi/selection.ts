@@ -31,7 +31,13 @@ function metrics(candidate: CandidateRecord): MetricVector {
 }
 
 function eligible(candidates: CandidateRecord[]): CandidateRecord[] {
-	return candidates.filter((candidate) => candidate.fitness && candidate.fitness.hardGates.committed !== false && candidate.commits[0])
+	return candidates.filter((candidate) =>
+		candidate.status === "accepted" &&
+		candidate.fitness &&
+		Object.values(candidate.fitness.hardGates).every(Boolean) &&
+		candidate.pairedComparison?.improved === true &&
+		candidate.commits.length > 0,
+	)
 }
 
 export interface ParentChoice {

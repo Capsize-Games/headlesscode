@@ -1,0 +1,264 @@
+import assert from "node:assert/strict"
+import { execFileSync } from "node:child_process"
+import * as fs from "node:fs"
+import * as os from "node:os"
+import * as path from "node:path"
+import { applyFleetMutationPatch, createEvaluationSnapshotBundle, createMutationSnapshotBundle, inspectLocalRsiCheckpoint, networkRules, runOpenShellMutation } from "../openshell.js"
+import type { RsiOpenShellProviderFactory } from "../openshell.js"
+import type { CandidateRecord, RsiConfig } from "../types.js"
+
+async function run(mode: "source" | "escape" | "symlink"): Promise<void> {
+	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-openshell-"))
+	const worktree = path.join(repo, ".worktrees", "rsi", `candidate-${mode}`)
+	let guestPath = ""
+	let factoryOptions: Parameters<RsiOpenShellProviderFactory>[0] | undefined
+	let sessionEnv: Record<string, string> | undefined
+	try {
+		execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: repo })
+		execFileSync("git", ["config", "user.name", "Test"], { cwd: repo })
+		execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: repo })
+		fs.mkdirSync(path.join(repo, "src", "engine"), { recursive: true })
+		fs.mkdirSync(path.join(repo, "src", "rsi"), { recursive: true })
+		fs.mkdirSync(path.join(repo, "scripts", "eval-suite"), { recursive: true })
+		fs.mkdirSync(path.join(repo, "test"), { recursive: true })
+		fs.writeFileSync(path.join(repo, "src", "engine", "loop.ts"), "export const value = 1\n")
+		fs.writeFileSync(path.join(repo, "src", "rsi", "evaluator.ts"), "export const hiddenScoring = 'secret'\n")
+		fs.writeFileSync(path.join(repo, "scripts", "eval-suite", "hidden.sh"), "secret\n")
+		fs.writeFileSync(path.join(repo, "test", "engine.test.ts"), "test secret\n")
+		fs.writeFileSync(path.join(repo, ".env"), "TOKEN=secret\n")
+		execFileSync("git", ["add", "."], { cwd: repo })
+		execFileSync("git", ["commit", "--quiet", "-m", "base"], { cwd: repo })
+		const baseCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim()
+		fs.mkdirSync(path.dirname(worktree), { recursive: true })
+		execFileSync("git", ["worktree", "add", "--quiet", "-b", `rsi/${mode}`, worktree, baseCommit], { cwd: repo })
+		const candidate: CandidateRecord = {
+			id: `candidate-${mode}`,
+			generation: 0,
+			parent: "baseline",
+			branch: `rsi/${mode}`,
+			worktree,
+			baseCommit,
+			status: "mutating",
+			model: "test-model",
+			mutation: "test task",
+			createdAt: "now",
+			updatedAt: "now",
+			commits: [],
+			changedFiles: [],
+			protectedPathViolations: [],
+		}
+		const config: RsiConfig = {
+			repoRoot: repo,
+			model: "test-model",
+			population: 1,
+			generations: 1,
+			maxConcurrent: 1,
+			mutationTask: "test task",
+			regressionCommand: "npm test",
+			evalCommands: ["npm test"],
+			hiddenEvalCommands: [],
+			archiveDir: path.join(repo, ".headlesscode", "archive"),
+			worktreeDir: path.join(repo, ".worktrees", "rsi"),
+			baseRef: "HEAD",
+			seed: "test",
+			dryRun: false,
+			keepWorktrees: false,
+			maxIterations: 2,
+			// Deliberately incomplete: supervisor-only paths must still be omitted.
+			protectedPaths: [],
+			commandTimeoutMs: 10_000,
+		}
+		const providerFactory: RsiOpenShellProviderFactory = (options) => {
+			factoryOptions = options
+			return {
+				async spawnExistingWorktreeSession(request, workspace) {
+					guestPath = workspace
+					sessionEnv = request.env ?? {}
+					assert.equal(path.relative(repo, workspace).startsWith(".."), false)
+					assert.equal(fs.existsSync(path.join(workspace, "src", "rsi", "evaluator.ts")), false)
+					assert.equal(fs.existsSync(path.join(workspace, "scripts", "eval-suite", "hidden.sh")), false)
+					assert.equal(fs.existsSync(path.join(workspace, "test", "engine.test.ts")), false)
+					assert.equal(fs.existsSync(path.join(workspace, ".env")), false)
+					return { id: request.worktreeSpec.name, provider: "mock-openshell", address: workspace }
+				},
+				async waitReady() {},
+				async runHarness(_handle, command) {
+					assert.match(command, /rev-list --count HEAD/)
+					assert.match(command, /\/opt\/headlesscode\/src\/rsi/)
+					assert.match(command, /OPENROUTER_API_KEY/)
+					if (mode === "source") {
+						fs.writeFileSync(path.join(guestPath, "src", "engine", "loop.ts"), "export const value = 2\n")
+					} else if (mode === "escape") {
+						fs.mkdirSync(path.join(guestPath, "scripts", "eval-suite"), { recursive: true })
+						fs.writeFileSync(path.join(guestPath, "scripts", "eval-suite", "injected.sh"), "secret\n")
+					} else {
+						fs.symlinkSync("/etc/passwd", path.join(guestPath, "src", "engine", "external"))
+					}
+					execFileSync("git", ["add", "--all"], { cwd: guestPath })
+					execFileSync("git", ["-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "guest output"], { cwd: guestPath })
+					return { exitCode: 0, output: "bounded fake guest result" }
+				},
+				async teardown() {},
+			}
+		}
+		const result = await runOpenShellMutation(candidate, config, providerFactory)
+		assert.equal(factoryOptions?.includeProjectData, false)
+		assert.equal(factoryOptions?.image, "headlesscode-openshell-rsi:local")
+		assert.deepEqual(factoryOptions?.providers, [])
+		assert.equal(sessionEnv?.HEADLESSCODE_CODE_MODE_BACKEND, "ollama")
+		if (mode === "source") {
+			assert.equal(result.ok, true, result.error)
+			assert.equal(fs.readFileSync(path.join(worktree, "src", "engine", "loop.ts"), "utf8"), "export const value = 2\n")
+		} else if (mode === "escape") {
+			assert.equal(result.ok, false)
+			assert.match(result.error ?? "", /protected paths/)
+			assert.equal(fs.readFileSync(path.join(worktree, "src", "engine", "loop.ts"), "utf8"), "export const value = 1\n")
+		} else {
+			assert.equal(result.ok, false)
+			assert.match(result.error ?? "", /symlinks, submodules, or special files/)
+			assert.equal(fs.existsSync(path.join(worktree, "src", "engine", "external")), false)
+		}
+	} finally {
+		fs.rmSync(repo, { recursive: true, force: true })
+	}
+}
+
+await run("source")
+await run("escape")
+await run("symlink")
+
+{
+	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-eval-bundle-"))
+	const unpack = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-eval-unpack-"))
+	try {
+		execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: repo })
+		execFileSync("git", ["config", "user.name", "Test"], { cwd: repo })
+		execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: repo })
+		for (const [relative, body] of [["src/app.ts", "source\n"], ["test/app.test.ts", "visible test\n"], ["scripts/eval-suite/hidden.js", "hidden suite\n"], ["src/rsi/fitness.ts", "hidden scorer\n"], [".headlesscode/archive.json", "operator archive\n"], ["fixtures/rsi-curriculum/generalization.json", "{}\n"]]) {
+			const target = path.join(repo, relative)
+			fs.mkdirSync(path.dirname(target), { recursive: true })
+			fs.writeFileSync(target, body)
+		}
+		execFileSync("git", ["add", "--all"], { cwd: repo })
+		execFileSync("git", ["commit", "--quiet", "-m", "snapshot source"], { cwd: repo })
+		const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim()
+		const bundle = createEvaluationSnapshotBundle(repo, head, { protectedPaths: [], repoRoot: repo } as unknown as RsiConfig)
+		const replayBundle = createEvaluationSnapshotBundle(repo, head, { protectedPaths: [], repoRoot: repo } as unknown as RsiConfig)
+		assert.equal(replayBundle.snapshotCommit, bundle.snapshotCommit, "the same clean base/config must produce a stable snapshot commit on resume")
+		assert.deepEqual(replayBundle.content, bundle.content, "the same clean base/config must produce the same content-addressed bundle")
+		const bundlePath = path.join(unpack, "snapshot.bundle")
+		const clonePath = path.join(unpack, "repo")
+		fs.writeFileSync(bundlePath, bundle.content)
+		execFileSync("git", ["clone", "--quiet", bundlePath, clonePath], { cwd: unpack })
+		assert.equal(fs.existsSync(path.join(clonePath, "test/app.test.ts")), true, "visible tests remain available for evaluation jobs")
+		assert.equal(fs.existsSync(path.join(clonePath, "scripts/eval-suite/hidden.js")), false)
+		assert.equal(fs.existsSync(path.join(clonePath, "src/rsi/fitness.ts")), false)
+		assert.equal(fs.existsSync(path.join(clonePath, ".headlesscode/archive.json")), false)
+		assert.equal(fs.existsSync(path.join(clonePath, "fixtures/rsi-curriculum/generalization.json")), true, "registered curriculum fixtures remain available to evaluation guests")
+		assert.equal(fs.lstatSync(path.join(clonePath, "test/app.test.ts")).isSymbolicLink(), false, "bundle transfer excludes harness-only dependency symlinks")
+		const mutation = createMutationSnapshotBundle(repo, head, { protectedPaths: [], repoRoot: repo } as unknown as RsiConfig)
+		const mutationBundle = path.join(unpack, "mutation.bundle")
+		const mutationClone = path.join(unpack, "mutation-repo")
+		fs.writeFileSync(mutationBundle, mutation.content)
+		execFileSync("git", ["clone", "--quiet", mutationBundle, mutationClone], { cwd: unpack })
+		assert.equal(fs.existsSync(path.join(mutationClone, "fixtures/rsi-curriculum/generalization.json")), false, "mutation guests never receive evaluator-owned fixture assets")
+	} finally {
+		fs.rmSync(repo, { recursive: true, force: true })
+		fs.rmSync(unpack, { recursive: true, force: true })
+	}
+}
+console.log("RSI OpenShell isolation assertions passed")
+
+{
+	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-fleet-patch-"))
+	try {
+		execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: repo })
+		execFileSync("git", ["config", "user.name", "Test"], { cwd: repo })
+		execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: repo })
+		fs.writeFileSync(path.join(repo, "app.js"), "module.exports = 1\n")
+		fs.writeFileSync(path.join(repo, "protected.txt"), "unchanged\n")
+		execFileSync("git", ["add", "--all"], { cwd: repo })
+		execFileSync("git", ["commit", "--quiet", "-m", "base"], { cwd: repo })
+		const baseCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim()
+		const createWorktree = (name: string): string => {
+			const directory = path.join(repo, ".worktrees", name)
+			fs.mkdirSync(path.dirname(directory), { recursive: true })
+			execFileSync("git", ["worktree", "add", "--quiet", "-b", name, directory, baseCommit], { cwd: repo })
+			return directory
+		}
+		const makeCandidate = (name: string, worktree: string): CandidateRecord => ({
+			id: name,
+			generation: 0,
+			parent: "baseline",
+			branch: name,
+			worktree,
+			baseCommit,
+			status: "mutating",
+			model: "test-model",
+			mutation: "test patch import",
+			createdAt: "now",
+			updatedAt: "now",
+			commits: [],
+			changedFiles: [],
+			protectedPathViolations: [],
+		})
+		const config = { protectedPaths: ["protected.txt"] } as RsiConfig
+
+		const validSource = createWorktree("valid-source")
+		const validTarget = createWorktree("valid-target")
+		fs.writeFileSync(path.join(validSource, "app.js"), "module.exports = 2\n")
+		fs.writeFileSync(path.join(validSource, "asset.bin"), Buffer.from([0, 1, 2, 255, 0]))
+		execFileSync("git", ["add", "--all"], { cwd: validSource })
+		execFileSync("git", ["commit", "--quiet", "-m", "valid source patch"], { cwd: validSource })
+		const validPatch = execFileSync("git", ["diff", "--binary", "--no-renames", `${baseCommit}...HEAD`], { cwd: validSource })
+		const changed = applyFleetMutationPatch(validPatch, makeCandidate("valid-target", validTarget), config)
+		assert.deepEqual(changed.sort(), ["app.js", "asset.bin"])
+		assert.deepEqual(fs.readFileSync(path.join(validTarget, "asset.bin")), Buffer.from([0, 1, 2, 255, 0]))
+		assert.equal(execFileSync("git", ["status", "--porcelain"], { cwd: validTarget, encoding: "utf8" }), "")
+
+		const protectedSource = createWorktree("protected-source")
+		const protectedTarget = createWorktree("protected-target")
+		fs.writeFileSync(path.join(protectedSource, "protected.txt"), "tampered\n")
+		execFileSync("git", ["add", "--all"], { cwd: protectedSource })
+		execFileSync("git", ["commit", "--quiet", "-m", "protected source patch"], { cwd: protectedSource })
+		const protectedPatch = execFileSync("git", ["diff", "--binary", "--no-renames", `${baseCommit}...HEAD`], { cwd: protectedSource })
+		assert.throws(() => applyFleetMutationPatch(protectedPatch, makeCandidate("protected-target", protectedTarget), config), /protected paths/)
+		assert.equal(execFileSync("git", ["status", "--porcelain"], { cwd: protectedTarget, encoding: "utf8" }), "")
+		assert.equal(fs.readFileSync(path.join(protectedTarget, "protected.txt"), "utf8"), "unchanged\n")
+
+		const modeSource = createWorktree("mode-source")
+		const modeTarget = createWorktree("mode-target")
+		fs.rmSync(path.join(modeSource, "app.js"))
+		fs.symlinkSync("protected.txt", path.join(modeSource, "app.js"))
+		execFileSync("git", ["add", "--all"], { cwd: modeSource })
+		execFileSync("git", ["commit", "--quiet", "-m", "mode source patch"], { cwd: modeSource })
+		const modePatch = execFileSync("git", ["diff", "--binary", "--no-renames", `${baseCommit}...HEAD`], { cwd: modeSource })
+		assert.throws(() => applyFleetMutationPatch(modePatch, makeCandidate("mode-target", modeTarget), config), /symlinks or special files/)
+		assert.equal(execFileSync("git", ["status", "--porcelain"], { cwd: modeTarget, encoding: "utf8" }), "")
+		assert.equal(fs.lstatSync(path.join(modeTarget, "app.js")).isSymbolicLink(), false)
+	} finally {
+		fs.rmSync(repo, { recursive: true, force: true })
+	}
+}
+const checkpointRoot = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-model-checkpoint-"))
+try {
+	const checkpoint = path.join(checkpointRoot, "checkpoint")
+	fs.mkdirSync(checkpoint)
+	fs.writeFileSync(path.join(checkpoint, "config.json"), '{"model_type":"fixture"}\n')
+	fs.writeFileSync(path.join(checkpoint, "weights.bin"), "small")
+	assert.equal(inspectLocalRsiCheckpoint(checkpoint, "training").files, 2)
+	fs.truncateSync(path.join(checkpoint, "weights.bin"), 2 * 1024 * 1024 * 1024 + 1)
+	assert.throws(() => inspectLocalRsiCheckpoint(checkpoint, "model-evaluation"), /larger than 2 GiB/)
+	fs.truncateSync(path.join(checkpoint, "weights.bin"), 5)
+	const outside = path.join(checkpointRoot, "outside")
+	fs.writeFileSync(outside, "external")
+	fs.symlinkSync(outside, path.join(checkpoint, "linked-weights"))
+	assert.throws(() => inspectLocalRsiCheckpoint(checkpoint, "training"), /symlink or special file/)
+} finally {
+	fs.rmSync(checkpointRoot, { recursive: true, force: true })
+}
+assert.deepEqual(networkRules("evaluation"), {}, "visible evaluation receives no network allowance")
+assert.deepEqual(networkRules("training"), {}, "offline training receives no network allowance")
+assert.deepEqual(networkRules("model-evaluation"), {}, "offline model evaluation receives no network allowance")
+assert.deepEqual(Object.keys(networkRules("mutation")), ["rsi_local_ollama"], "only the mutation worker receives the local Ollama allowance")
+console.log("RSI fleet mutation and model checkpoint assertions passed")

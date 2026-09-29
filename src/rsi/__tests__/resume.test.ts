@@ -8,8 +8,8 @@ import { runRsi } from "../controller.js"
 import { newCandidate, resolveBaseCommit } from "../workspace.js"
 import type { RsiConfig, RsiRunRecord, TrialResult } from "../types.js"
 
-function ok(command: string): TrialResult {
-	return { ok: true, command, exitCode: 0, durationMs: 1, stdout: "", stderr: "" }
+function ok(command: string, durationMs = 1): TrialResult {
+	return { ok: true, command, exitCode: 0, durationMs, stdout: "", stderr: "" }
 }
 
 async function main(): Promise<void> {
@@ -28,7 +28,8 @@ async function main(): Promise<void> {
 			generations: 1,
 			maxConcurrent: 1,
 			mutationTask: "resume fixture",
-			evalCommands: [],
+			regressionCommand: "npm test",
+			evalCommands: ["visible"],
 			hiddenEvalCommands: [],
 			archiveDir: path.join(repo, "archive"),
 			worktreeDir: path.join(repo, "worktrees"),
@@ -55,7 +56,7 @@ async function main(): Promise<void> {
 		await checkpointRun(config.archiveDir, interrupted)
 		const resumed = await runRsi({ ...config, resumeRunId: "resume-fixture" }, {
 			log: () => undefined,
-			runCommand: async (command) => ok(command),
+			runCommand: async (command, cwd) => ok(command, path.basename(cwd).startsWith("rsi-baseline-") ? 100 : 1),
 			runMutation: async (entry) => {
 				await fs.writeFile(path.join(entry.worktree, "resumed.txt"), "resumed\n")
 				execFileSync("git", ["add", "resumed.txt"], { cwd: entry.worktree })

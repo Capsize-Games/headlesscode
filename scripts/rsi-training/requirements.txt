@@ -1,0 +1,6 @@
+# Pinned direct runtime stack for the OpenShell QLoRA training image.
+torch==2.14.0
+transformers==5.17.0
+peft==0.21.0
+accelerate==1.15.0
+bitsandbytes==0.50.2

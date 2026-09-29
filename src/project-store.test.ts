@@ -385,6 +385,28 @@ async function testMetadataUpsertRegisteredAndLastSeen(): Promise<void> {
 	}
 }
 
+async function testOpenShellIdentityOverrideIsWorkspaceScoped(): Promise<void> {
+	const target = await mkTmp("hc-store-openshell-target-")
+	const other = await mkTmp("hc-store-openshell-other-")
+	const previousTarget = process.env.TARGET_REPO
+	const previousIdentity = process.env.HEADLESSCODE_PROJECT_IDENTITY_ROOT
+	try {
+		execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: target })
+		execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: other })
+		process.env.TARGET_REPO = target
+		process.env.HEADLESSCODE_PROJECT_IDENTITY_ROOT = "/workspace"
+		assert.deepEqual(resolveProjectIdentity(target), { keySource: "/workspace", kind: "git" })
+		assert.equal(resolveProjectIdentity(other).keySource, other, "a nested test/project root keeps its own Git identity")
+	} finally {
+		if (previousTarget === undefined) delete process.env.TARGET_REPO
+		else process.env.TARGET_REPO = previousTarget
+		if (previousIdentity === undefined) delete process.env.HEADLESSCODE_PROJECT_IDENTITY_ROOT
+		else process.env.HEADLESSCODE_PROJECT_IDENTITY_ROOT = previousIdentity
+		await fsp.rm(target, { recursive: true, force: true })
+		await fsp.rm(other, { recursive: true, force: true })
+	}
+}
+
 const tests: Array<[string, () => Promise<void>]> = [
 	["plain dirs get distinct realpath-derived keys + project.json metadata", testPlainDirGetsDistinctKey],
 	["a git repo and its worktree share the SAME central store key", testGitRepoAndWorktreeShareKey],
@@ -395,6 +417,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["central settings.json loads loose / fail-open", testCentralSettings],
 	["a /tmp workspace never writes project.json into the real store (Part A guard)", testTmpDirWorkspaceDoesNotWriteRealStore],
 	["project.json upsert: registered flips true and is never downgraded, lastSeen advances", testMetadataUpsertRegisteredAndLastSeen],
+	["OpenShell identity override applies only to TARGET_REPO", testOpenShellIdentityOverrideIsWorkspaceScoped],
 ]
 
 async function main(): Promise<void> {

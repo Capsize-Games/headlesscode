@@ -3,7 +3,21 @@ import type { ChildProcess } from "node:child_process"
 export type CandidateStatus = "planned" | "mutating" | "evaluating" | "accepted" | "rejected" | "failed"
 export type MutationKind = "corrective" | "architectural" | "search-policy" | "curriculum" | "model-adaptation"
 export type ParentSelectionPolicy = "champion-specialist-novelty" | "pareto-front" | "all-eligible"
-export type ComputePolicy = "single" | "independent" | "planner-executors" | "critic-retry"
+export type ComputePolicy = "single" | "independent" | "adaptive-independent" | "planner-executors" | "critic-retry"
+
+export interface AdaptiveSearchDecision {
+	generation: number
+	decision: "continue" | "stop"
+	reason: "mixed-evidence" | "consistent-evidence" | "trajectory-cap" | "iteration-cap" | "runtime-cap" | "generation-cap" | "insufficient-results"
+	candidateIds: string[]
+	evidence: Array<{ candidateId: string; status: CandidateStatus; visiblePassRate?: number }>
+	allocatedTrajectories: number
+	remainingTrajectories: number
+	allocatedIterations: number
+	remainingIterations: number
+	elapsedMs: number
+	decidedAt: string
+}
 
 export interface MutationHypothesis {
 	statement: string
@@ -73,8 +87,30 @@ export interface ModelCandidate {
 	trainingConfig: TrainingConfig
 	artifactPath?: string
 	artifactHash?: string
-	status: "base" | "prepared" | "trained" | "evaluated" | "accepted" | "rejected"
+	status: "base" | "prepared" | "trained" | "evaluated" | "accepted" | "rejected" | "failed" | "partial"
 	createdAt: string
+	eligibleForSelection?: boolean
+	trainingResult?: {
+		status: "completed" | "failed" | "partial"
+		datasetVersion: string
+		datasetSha256: string
+		baseModelSha256: string
+		artifactSha256?: string
+		artifactBytes?: number
+		stepsCompleted: number
+		maxSteps: number
+		error?: string
+	}
+	pairedEvaluation?: {
+		cellSetSha256: string
+		baseResultSha256: string
+		adapterResultSha256?: string
+		baseMetric: number
+		adapterMetric?: number
+		completedCellCount: number
+		expectedCellCount: number
+		seed: number
+	}
 	provenance?: Record<string, string>
 }
 
@@ -151,8 +187,19 @@ export interface CurriculumTask {
 	difficulty: 1 | 2 | 3 | 4 | 5
 	capability: string
 	groundTruthCommand: string
+	fixtureId: string
+	fixtureDescription: string
 	provenance: { sourceCandidateIds: string[]; failureClass: string; generatedAt: string }
 	validated: boolean
+	validation?: {
+		baseCommit: string
+		command: string
+		validatedAt: string
+		replays: Array<{ idempotencyKey: string; ok: boolean; exitCode: number | null; outputSha256?: string; failure?: string }>
+		reproducible: boolean
+		reason: string
+	}
+	promotedAt?: string
 }
 
 export interface RsiConfig {
@@ -162,6 +209,7 @@ export interface RsiConfig {
 	generations: number
 	maxConcurrent: number
 	mutationTask: string
+	regressionCommand: string
 	evalCommands: string[]
 	hiddenEvalCommands: string[]
 	archiveDir: string
@@ -171,6 +219,9 @@ export interface RsiConfig {
 	dryRun: boolean
 	keepWorktrees: boolean
 	maxIterations: number
+	maxTrajectories?: number
+	maxTotalIterations?: number
+	maxRuntimeMs?: number
 	protectedPaths: string[]
 	commandTimeoutMs: number
 	parentSelectionPolicy?: ParentSelectionPolicy
@@ -212,7 +263,19 @@ export interface CandidateRecord {
 	failure?: string
 	result?: TrialResult
 	fitness?: Fitness
+	pairedComparison?: PairedComparison
 	trajectory?: TrajectorySummary
+}
+
+export interface PairedComparison {
+	baselinePasses: number
+	candidatePasses: number
+	trialCount: number
+	baselineDurationMs: number
+	candidateDurationMs: number
+	durationRatio: number
+	improved: boolean
+	reason: string
 }
 
 export interface TrialResult {
@@ -223,6 +286,8 @@ export interface TrialResult {
 	stdout: string
 	stderr: string
 	timedOut?: boolean
+	outputArtifactSha256?: string
+	outputArtifactBytes?: number
 }
 
 export interface EvaluationSummary {
@@ -236,12 +301,15 @@ export interface EvaluationSummary {
 	committed?: boolean
 	complexity?: ComplexityMetrics
 	failureClassification?: string
+	adversarialPass?: boolean
+	adversarialPenalty?: number
 }
 
 export interface HardGates {
 	regressionPass: boolean
 	visibleEvalPass: boolean
 	hiddenEvalPass: boolean
+	adversarialPass: boolean
 	noProtectedPathViolation: boolean
 	completed: boolean
 	noCrash: boolean
@@ -262,6 +330,46 @@ export interface Fitness {
 	paretoRank?: number
 	hardGates: HardGates
 	reason: string
+	adversarialPenalty?: number
+}
+
+export interface AdversarialTestCase {
+	id: string
+	modulePath: string
+	exportName: string
+	args: unknown[]
+	expected: unknown
+	reason: string
+}
+
+export interface AdversarialFinding {
+	severity: "major" | "minor"
+	message: string
+	testId?: string
+}
+
+export interface AdversarialReviewRecord {
+	candidateId: string
+	role: "adversary"
+	provider: RoleModelConfig["provider"]
+	model: string
+	promptVersion: string
+	promptSha256: string
+	promptArtifactSha256: string
+	summary?: string
+	resultSha256?: string
+	resultArtifactSha256?: string
+	errorSha256?: string
+	errorArtifactSha256?: string
+	testArtifactSha256?: string
+	snapshotArtifactSha256?: string
+	createdAt: string
+	status: "passed" | "failed" | "error"
+	findings: AdversarialFinding[]
+	testResults: Array<{ id: string; passed: boolean; outputArtifactSha256?: string; failure?: string }>
+	penaltyPoints: number
+	jobId?: string
+	error?: string
 }
 
 export interface RsiRunRecord {
@@ -269,6 +377,8 @@ export interface RsiRunRecord {
 	startedAt: string
 	finishedAt?: string
 	baseline?: TrialResult
+	baselineEvaluation?: EvaluationSummary
+	baselineFitness?: Fitness
 	model: string
 	baseRef: string
 	baseCommit: string
@@ -281,7 +391,9 @@ export interface RsiRunRecord {
 	combinations?: HarnessModelCombination[]
 	jobs?: ExperimentJob[]
 	trajectoryRefs?: string[]
+	adaptiveSearch?: AdaptiveSearchDecision[]
 	curriculumTasks?: CurriculumTask[]
+	adversarialReviews?: AdversarialReviewRecord[]
 	candidates: CandidateRecord[]
 	reports: string[]
 }
@@ -310,6 +422,7 @@ export interface MutationRunner {
 export interface RsiHooks {
 	runCommand?: CommandRunner
 	runMutation?: MutationRunner
+	runAdversary?: (request: { role: RoleModelConfig; prompt: string }) => Promise<string>
 	now?: () => string
 	log?: (line: string) => void
 }

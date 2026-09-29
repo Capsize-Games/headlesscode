@@ -27,9 +27,10 @@ async function main(): Promise<void> {
 			population: 1,
 			generations: 1,
 			maxConcurrent: 1,
-			mutationTask: "fixture",
+		mutationTask: "fixture",
+		regressionCommand: "npm test",
 			evalCommands: ["visible-check"],
-			hiddenEvalCommands: ["hidden-check"],
+			hiddenEvalCommands: [],
 			archiveDir: path.join(repo, "archive"),
 			worktreeDir: path.join(repo, "worktrees"),
 			baseRef: "HEAD",
@@ -41,9 +42,12 @@ async function main(): Promise<void> {
 			commandTimeoutMs: 1000,
 		} satisfies RsiConfig
 		const summary = await evaluateCandidate(config, repo, base, runner)
-		assert.equal(summary.hidden.length, 1)
-		assert.equal(calls[2].cwd, repo, "hidden evaluation runs from supervisor checkout")
-		assert.equal(calls[2].env?.HEADLESSCODE_RSI_CANDIDATE_ROOT, repo)
+		assert.equal(summary.hidden.length, 0)
+		assert.equal(calls[0].command, "npm test")
+		assert.equal(calls[1].command, "visible-check")
+		assert.equal(calls[0].cwd, repo)
+		assert.equal(calls[1].cwd, repo)
+		await assert.rejects(evaluateCandidate({ ...config, hiddenEvalCommands: ["./scripts/eval-suite/hidden.sh"] }, repo, base, runner), /hidden evaluations require a supervisor-only evaluator service/)
 	} finally {
 		await fs.rm(repo, { recursive: true, force: true })
 	}

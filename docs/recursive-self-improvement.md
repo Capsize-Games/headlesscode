@@ -1,17 +1,24 @@
 # Recursive Self-Improvement
 
-`headlesscode improve` is an intentionally bounded experiment for improving the
-agent harness under an external evaluator. The supervisor owns the evaluator,
-fitness calculation, archive, and selection decision. The local worker model
-only proposes changes inside an isolated candidate worktree.
+`headlesscode improve --dry-run` plans candidate worktrees. A real run requires
+a PostgreSQL queue, a shared S3-compatible artifact store, and at least one
+registered `headlesscode rsi-worker` connected to an OpenShell gateway. The
+coordinator queues a sanitized baseline visible evaluation, candidate mutation
+snapshots, and candidate visible evaluations; workers run each job in a fresh
+OpenShell guest. The coordinator applies returned patches, calculates fitness,
+compares results with the baseline, and owns the archive and candidate
+selection. Full visible-test output is content-addressed in the object store;
+PostgreSQL keeps bounded previews and artifact references. Hidden evaluation
+remains disabled.
 
-## Phase 1: Implemented
+## Earlier bounded runs (historical)
 
-Phase 1 established the mutation-to-evaluation loop: a worker session runs in a
-git worktree, regression and visible/hidden commands are measured, hard gates
-protect acceptance, and a JSON/Markdown record is written. The worker default
-is local Qwen through Ollama. The initial real run produced two bounded worker
-failures and selected no candidate, which is retained as experimental data.
+Before the fail-closed mutation runner was added, RSI ran bounded local Qwen
+experiments through Ollama. The records documented for 2026-09-20 are
+`rsi-20260920091313-78f3e206` (the worker reached its eight-iteration cap) and
+`rsi-20260920025005-b0ef3ddf` (both workers reached the 20-iteration cap).
+Neither run selected a candidate. These are historical results from an earlier
+implementation and do not describe current `headlesscode improve` behavior.
 
 The phase-one audit found four constraints that shaped phase two: candidate
 execution was sequential, `--max-concurrent` was only parsed, the archive was
@@ -20,38 +27,83 @@ generation followed only one scalar champion. Hidden commands were not shown in
 the mutation prompt, but their tracked scripts were still physically present
 in candidate worktrees.
 
-## Phase 2: Current Work
+## Current implementation and tested limits
 
 The current extension adds archive v2 migration and active-run checkpoints,
 resume support, explicit champion/specialist/novelty and Pareto parent policies,
 raw multi-objective metric vectors, mutation hypotheses and classes,
 resource-tagged experiment jobs, model-candidate and harness/model-combination
 records, structured transcript-backed trajectory exports, and deterministic
-curriculum proposals from recurring failures. Hidden commands now execute from
-the supervisor checkout with `HEADLESSCODE_RSI_CANDIDATE_ROOT` identifying the
-candidate under test.
+curriculum proposals from recurring failures. The fleet queue stores worker
+registrations, capacity policy, leases, fencing tokens, retries, and job
+results in PostgreSQL. Snapshot and patch bytes live in a shared S3-compatible
+object store; PostgreSQL keeps only content digests and object references.
+Each worker process registers one configured gateway and runs one guest at a
+time. Multiple explicitly configured workers can claim jobs across gateways;
+there is no automatic gateway discovery.
 
-These pieces are deliberately small interfaces. They make the research data
-and lifecycle explicit without pretending that a training backend, adversarial
-critic, or OS-level sandbox exists yet.
+Queue integration tests ran against disposable local PostgreSQL and RustFS
+services: 12 simulated worker identities contended for 100 queued jobs,
+exercised admission caps, and transferred a 20 MiB artifact. Four jobs first
+verified the initial admission cap; the remaining 96 were then drained
+concurrently. OpenShell mutation tests use
+a fake provider for isolation checks. A prior bounded local OpenShell run
+passed its visible checks but made no source change and was rejected. A
+2026-09-29 bounded two-candidate controller run completed against a temporary
+`clamp.js` fixture. The baseline passed 1/2 visible/regression trials; both
+candidates passed 2/2 and returned the same 764-byte patch. Two worker
+identities on the same `rsi-local` gateway held the candidate evaluation
+leases concurrently for an observed 4.008 seconds. This demonstrates
+controller fan-out and same-gateway OpenShell execution only; it does not
+qualify multiple gateways or hosts. At the time, `openshell gateway list`
+showed `rsi-local` reachable and `headlesscode-local` at
+`http://127.0.0.1:18080`; a TCP connection to that endpoint was refused, so no
+second live gateway was available. The fixture result does not establish
+general harness improvement. Hidden evaluation count was zero; the current
+empty-suite rate helper reports `hidden: 1`, so the score includes an untested
+hidden component. One mutation attempt was retried; the saved error truncates
+before its terminal cause. The adversarial role and OpenShell break-test path
+are implemented but have not been exercised with a live review provider.
 
-## Loop
+The opt-in `adaptive-independent` compute policy evaluates the initial
+population independently, then admits at most one follow-up candidate when
+that cohort has mixed statuses or visible pass rates. This version requires
+`--generations 1` and limits `--max-trajectories` to the initial population plus
+one. The archive and report record the evidence, decision, allocation,
+remaining budgets, and stop reason. `--max-trajectories` defaults to population
+plus one, `--max-total-iterations` defaults to the per-candidate iteration cap
+multiplied by the trajectory cap, and `--max-runtime-ms` defaults to one hour.
+These budgets must cover the initial population. `--max-concurrent` sets queue
+admission capacity. Runtime is checked before admitting a follow-up; it does
+not terminate a job already running. Iterations are a bounded model-call proxy
+for the local worker, not a dollar-cost estimate.
 
-1. Resolve a base commit and create a small population of candidate worktrees.
-2. Ask the worker model to make a focused, test-backed improvement.
-3. Inspect the candidate before evaluation. Changes to `src/rsi/`, `scripts/`,
-   tests, package metadata, git metadata, and configured protected paths are
-   rejected before candidate-controlled tests execute.
-4. Run regression tests and visible evaluations, followed by supervisor-only
-   hidden evaluations when configured.
-5. Apply hard gates, calculate a multidimensional fitness score, select the
-   highest-scoring candidate, and retain the result in a JSON archive.
-6. Write a Markdown report so a person can inspect the generation without
-   reconstructing the run from logs.
+## Bounded run sequence
 
-The initial worker default is the locally installed `wxrq-qwen3.5-9b:latest`
-model. Override it with `--model`. The worker is invoked through the existing
-Ollama backend, so the normal local-model guardrails remain active.
+1. Resolve a base commit and queue a sanitized baseline visible evaluation to
+   an OpenShell worker before scoring it in the coordinator.
+2. Create a small population of candidate worktrees and one-commit mutation
+   snapshots that omit RSI policy, evaluator suites, tests, credentials, and
+   operator data; enqueue one idempotent job per candidate.
+3. Workers claim jobs with expiring fenced leases, run the mutation in a fresh
+   OpenShell guest, and return a patch through the object store. The coordinator
+   validates and applies the patch before evaluation.
+4. Enqueue visible evaluation jobs with separate sanitized snapshots. Each
+   evaluation command runs in a fresh OpenShell guest. Complete stdout and
+   stderr content is stored as a content-addressed object; PostgreSQL holds
+   bounded previews and references. Hidden evaluations are
+   unavailable because their evaluator assets do not yet have a separate
+   trusted service boundary.
+5. The coordinator computes fitness and paired baseline comparisons, selects
+   candidates that pass all gates, and writes the archive and report.
+
+Earlier bounded runs used the locally installed `wxrq-qwen3.5-9b:latest` model
+through Ollama before the fleet adapter existed. In the current setup,
+AirunnerDesktop's LLM worker exposes the local Qwen GGUF through its
+Ollama-compatible endpoint. Current fleet workers call that endpoint using the
+configured model ID; mutation and visible evaluation jobs are dispatched
+through PostgreSQL and S3-compatible storage. This is inference through the
+Airunner worker, not GGUF fine-tuning.
 
 ## Usage
 
@@ -60,11 +112,155 @@ npx tsx src/cli.ts improve --repo . --dry-run
 npx tsx src/cli.ts improve --repo . --population 2 --generations 1
 ```
 
+### Build the RSI guest image
+
+On each host whose OpenShell gateway will execute RSI jobs, build the standard
+and RSI guest images. The RSI Dockerfile extends the standard image, so build
+that base image first. Build the larger training derivative only on gateways
+whose workers will accept model-training or paired model-evaluation jobs:
+
+```sh
+docker build -f docker/OpenShell.Dockerfile -t headlesscode-openshell:local .
+docker build -f docker/OpenShell-RSI.Dockerfile -t headlesscode-openshell-rsi:local .
+docker build -f docker/OpenShell-RSI-Training.Dockerfile -t headlesscode-openshell-rsi-training:local .
+```
+
+`docker/OpenShell-RSI.Dockerfile` uses `FROM headlesscode-openshell:local` and
+adds the RSI guest's Python runtime while removing the RSI source, test files,
+and hidden evaluation suite. RSI execution requires the resulting
+`headlesscode-openshell-rsi:local` image; custom images are rejected until
+their contents are verified.
+
+The training image extends `headlesscode-openshell-rsi:local`. Its Python
+dependencies are installed from `scripts/rsi-training/requirements.lock` with
+hash checking; direct versions and transitive hashes were resolved on
+2026-09-28. The image build rejects a CPU-only PyTorch wheel. Training also
+checks `torch.cuda.is_available()` inside the guest before it starts.
+
+The npm package does not include the Dockerfiles, training scripts, fixtures,
+or test runner needed by this workflow. Build and run RSI workers from a source
+checkout.
+
 The default archive is `.headlesscode/rsi/archive.json`; generation reports are
-written beside it. Candidate worktrees live under `.worktrees/rsi/` and are
-removed after evaluation unless `--keep-worktrees` is supplied. Dry runs resolve
-the base commit and print the planned candidates without creating worktrees or
-writing the archive.
+written beside it. Dry runs resolve the base commit and print planned
+candidates without creating worktrees or writing the archive. For real runs,
+configure `HEADLESSCODE_RSI_DATABASE_URL`, S3 artifact-store settings, and at
+least one worker. Start each worker process with a unique
+`HEADLESSCODE_RSI_WORKER_ID` and explicit `HEADLESSCODE_RSI_GATEWAY_ID`; the
+worker sets that OpenShell gateway before running its preflight. Worker
+processes currently run one job at a time, so add another process and unique
+worker ID for each additional slot.
+
+### Fleet configuration
+
+Set these values on the coordinator and every worker. All processes in one
+queue must use the same queue policy and artifact-store identity.
+
+| Variable | Default | Use |
+| --- | --- | --- |
+| `HEADLESSCODE_RSI_DATABASE_URL` | Required | PostgreSQL connection for queue state and worker leases. |
+| `HEADLESSCODE_RSI_QUEUE_NAME` | `rsi-default` | Shared queue identifier. |
+| `HEADLESSCODE_RSI_MAX_IN_FLIGHT` | `1` | Queue-wide admission cap on workers; match `--max-concurrent` on `improve`. |
+| `HEADLESSCODE_RSI_LEASE_MS` | `3600000` | Minimum lease duration. Jobs expand this from their timeout and visible-command count. |
+| `HEADLESSCODE_RSI_MAX_ATTEMPTS` | `2` | Maximum attempts before a job becomes failed. |
+| `HEADLESSCODE_RSI_CLASS_CAPACITY` | Empty map | Optional JSON map of resource-class admission caps. |
+| `HEADLESSCODE_RSI_KEY_CAPACITY` | Empty map | Optional JSON map of concurrency-key admission caps. |
+| `HEADLESSCODE_RSI_ARTIFACT_BACKEND` | `s3` | Fleet jobs require shared S3-compatible storage; `file` is same-host development only. |
+| `HEADLESSCODE_RSI_ARTIFACT_BUCKET` | Required | Bucket shared by coordinators and workers. |
+| `HEADLESSCODE_RSI_ARTIFACT_ENDPOINT` | AWS S3 | Optional S3-compatible endpoint. |
+| `HEADLESSCODE_RSI_ARTIFACT_REGION` | `us-east-1` | S3 region. |
+| `HEADLESSCODE_RSI_ARTIFACT_PATH_STYLE` | `0` | Set to `1` for path-style endpoint addressing. |
+| `HEADLESSCODE_RSI_ARTIFACT_PREFIX` | `headlesscode/rsi` | Object key prefix. |
+| `HEADLESSCODE_RSI_MAX_ARTIFACT_BYTES` | `536870912` | Maximum bytes per artifact (512 MiB). |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | AWS SDK credentials | Credentials for the shared artifact bucket; keep them in host processes. |
+| `HEADLESSCODE_RSI_WORKER_ID` | Required on worker | Unique worker process identity. |
+| `HEADLESSCODE_RSI_GATEWAY_ID` | Required on worker | Configured OpenShell gateway alias selected by this worker. |
+| `HEADLESSCODE_RSI_WORKER_MAX_ACTIVE` | `1` | Must remain `1`; one process runs one guest at a time. |
+| `HEADLESSCODE_RSI_WORKER_RESOURCE_CLASSES` | `LOCAL_GPU,CPU` | Comma-separated queue resource classes this process accepts. |
+| `HEADLESSCODE_RSI_BASE_MODEL_PATH` | Required on coordinator and model workers | Local Hugging Face checkpoint directory copied outside the guest workspace and attached as a separate Docker `read_only` bind; symlinks/special files are rejected, with 64 GiB and 100,000-file bounds. A `.gguf` path or GGUF model identity is rejected before admission. |
+| `HEADLESSCODE_RSI_BASE_MODEL_ID` | Required on coordinator running `rsi-train-model` | Operator-supplied checkpoint identity/revision recorded with results; workers receive it in each job payload. |
+| `HEADLESSCODE_RSI_WORKER_SCRATCH_DIR` | System temp `headlesscode-rsi-worker` | Private local scratch for downloaded snapshots. |
+| `HEADLESSCODE_RSI_WORKER_POLL_MS` | `1000` | Delay between empty queue polls. |
+| `HEADLESSCODE_OPENSHELL_POLICY` | Required | Base OpenShell policy YAML. |
+| `HEADLESSCODE_OPENSHELL_IMAGE` | `headlesscode-openshell-rsi:local` | RSI guest image; custom images are rejected. |
+| `HEADLESSCODE_RSI_OLLAMA_HOST` | `host.openshell.internal` | Local Ollama host permitted by the RSI mutation policy. |
+
+Run `headlesscode rsi-worker` once per worker identity. It sets
+`OPENSHELL_GATEWAY` from `HEADLESSCODE_RSI_GATEWAY_ID` before preflight.
+Database and object-store credentials stay in host processes and are not sent
+to candidate guests.
+
+### Model-training prototype and GGUF support boundary
+
+The bounded model command requires an existing RSI run in the archive, a
+shared PostgreSQL/S3 queue, a fresh worker advertising `TRAINING_GPU`, and a
+CPU worker for paired evaluation. The prototype's training script expects a
+local Hugging Face checkpoint directory; model workers need the training image,
+`HEADLESSCODE_RSI_WORKER_RESOURCE_CLASSES=TRAINING_GPU,CPU`, and the local
+checkpoint path above. The training job requests one OpenShell GPU. Paired
+inference runs on CPU and fails closed when the checkpoint exceeds 2 GiB. For
+a finished run, invoke:
+
+The OpenShell Docker gateway must allow caller driver configuration and host
+bind mounts for the checkpoint mount. A gateway administrator must enable
+`allow_driver_config = true` and `enable_bind_mounts = true` in its Docker
+driver configuration and disable Docker resource admission for that driver.
+Host bind mounts expose gateway-host files inside guests; restrict gateway
+administration and use only the RSI provider's bounded read-only checkpoint
+mount. See NVIDIA's [gateway configuration reference](https://docs.nvidia.com/openshell/latest/reference/gateway-config)
+and [Docker driver mount guidance](https://docs.nvidia.com/openshell/latest/reference/sandbox-compute-drivers).
+
+```sh
+npx tsx src/cli.ts rsi-train-model --repo . --archive-dir .headlesscode/rsi \
+  --resume <run-id> --model-candidate-id <candidate-id> \
+  --model <worker-model> --base-ref <run-base-ref>
+```
+
+The prototype dataset has three reference solutions from registered curriculum
+fixtures. Its intended HF-checkpoint path uses NF4 with double quantization,
+rank 8, alpha 16, dropout 0.05, fixed seed 1337, and eight optimizer steps. It
+does not use collected agent trajectories. The held-out fixture contains three
+task/input cells; the base checkpoint and adapter are intended to run those
+same cells in separate OpenShell jobs with greedy decoding and a 256 new-token
+maximum. The metric is the fraction of outputs exactly matching normalized
+reference solution text. This fixture is a smoke comparison, not evidence of
+general improvement or performance on the full headlesscode harness.
+
+The base checkpoint is copied for each OpenShell job. This adds storage and
+startup cost; no gateway-side immutable checkpoint cache has been implemented
+or qualified. The supervisor records dataset and model digests, training
+job/result, adapter artifact reference, and each paired result. Failed or
+partial training, an artifact digest mismatch, an incomplete cell set, or a
+base-checkpoint mismatch leaves the candidate ineligible. Eligibility requires
+all eight training steps and complete results from both models; the adapter
+must score higher than the base on the exact-match metric. These checks are
+exercised with mocked job results; no successful training or paired model
+evaluation has been run with real weights.
+
+The operator-supplied `Qwen3.5-9B-Q8_0.gguf` is not supported by this QLoRA
+prototype. The command requires `HEADLESSCODE_RSI_BASE_MODEL_PATH` on the
+coordinator and workers, and rejects a `.gguf` path or model identity before
+checking worker capacity or enqueueing work. In the built training image,
+Transformers 5.17 rejects combining GGUF loading with bitsandbytes
+quantization. Its non-quantized loader reports no GGUF CUDA matmul kernel for
+the RTX 5080 and
+attempts to dequantize the full model, which exceeds the available 16 GiB GPU
+memory. No training was started. Airunner's authenticated OpenAI-compatible
+chat API returned 401 without a credential, and its chat request contract has
+no adapter selector; RSI does not pass credentials or claim this as an adapter
+evaluator. The AirunnerDesktop Ollama-compatible worker remains the supported
+inference route for mutation, but it does not provide the paired base/adapter
+training path.
+
+The 10.1 GiB training image was built and its CUDA-enabled PyTorch wheel was
+verified. The repository-checkout scripts and fixture files needed to build
+the RSI images and run the model prototype are not included in the npm package;
+build and run this workflow from a source checkout. A disposable local PostgreSQL/RustFS load
+test first claimed and completed four jobs to verify admission, then drained
+the remaining 96 jobs with 12 simulated workers in 446 ms (215.2 jobs/s), with
+two overlapping jobs under a configured cap of four. Claims still lock one
+queue-policy row to enforce global admission; this same-host measurement is a
+functional benchmark, not a multi-host throughput guarantee.
 
 ## Fitness and safety
 
@@ -75,22 +271,77 @@ efficiency, and recovery components. A candidate that fails a hard gate cannot
 be selected even when its partial score is high.
 
 Trajectory datasets are written as separate `sft.jsonl`, `preferences.jsonl`,
-and `failures.jsonl` files with a manifest. Only independently verified success
-trajectories enter the SFT or preferred side of a preference pair.
+and `failures.jsonl` files with a manifest. Their current verification derives
+from RSI gates; it is not independent verification and must not be treated as
+training-grade evidence.
 
-This is an experiment, not an unattended permission escalation mechanism. The
-candidate process receives no hidden evaluation details, and the supervisor
-must remain the only writer of archive and scoring state. Future work should
-move from post-hoc protected-path checks to a stronger OS-level sandbox before
-running untrusted candidate code for long periods.
+RSI snapshots contain one sanitized commit rather than the source repository's
+Git history. Mutation guests do not receive test files, RSI policy/scoring
+code, hidden evaluator files, or candidate environment secrets. Visible
+evaluation guests receive the test inputs needed by configured commands but
+omit RSI internals, operator archives, and `scripts/eval-suite`. The supervisor
+alone computes fitness and paired comparisons. The OpenShell image, configured
+network policy, and gateway remain operator-managed; no multi-host deployment
+or live gateway fleet has been qualified by the local integration tests.
 
-## Future Phases
+## Curriculum fixture validation
 
-- Add adaptive multi-trajectory compute and critic/adversarial evaluation.
-- Connect the model-candidate interface to one small external LoRA/QLoRA
-  backend, then evaluate model × harness factorial cells.
-- Add cross-model role routing, curriculum validation from executable fixtures,
-  plateau detection, regression retention, and meta-evaluation of mutation
+Failure-derived curriculum proposals use the task wording and capability from
+their checked-in fixture manifest. A proposal is eligible for validation only
+when its fixture ID, task text, capability, description, and fixed argv command
+match that manifest and it names at least one source candidate. The coordinator
+submits two evaluation jobs against the run's clean base commit; workers execute
+the registered fixture command in OpenShell guests. Missing fixtures, malformed
+proposals, failed commands, or different output digests leave a task
+unvalidated. A task marked `validated` passed the fixture's reference cases,
+rejected its checked-in known mutant, and produced the same output digest in
+both clean replays. This is execution and repeatability evidence; it does not
+show that task wording measures the named capability.
+
+Validation does not promote a task. After reviewing the archive, an operator
+can promote one explicitly with
+`npm run rsi:promote-curriculum -- --archive-dir <path> --task-id <id>`.
+Promotion requires reproducible validation and records its timestamp in the
+archive and associated run report.
+
+## Adversarial review
+
+When an adversary role is configured, the coordinator sends it a bounded
+candidate diff and visible evaluation summary. The reviewer returns strict JSON
+with findings and one to eight test cases. Each case can call only an exported
+function in an eligible changed source file, with bounded JSON arguments and
+expected output. The coordinator stores the prompt, provider response, test
+specification, sanitized evaluation snapshot, and OpenShell output as
+content-addressed artifacts. A fixed runner executes the generated checks in a
+separate OpenShell evaluation guest; reviewer-provided shell commands are not
+accepted. The coordinator alone applies the result: every generated test must
+pass to keep the adversarial hard gate open, while each major finding costs five
+fitness points and each minor finding one, capped at ten points.
+
+The adversary model name must differ from the configured worker model name;
+using the same model name through another provider does not qualify as
+cross-model supervision. Supported adversary providers are Ollama and
+OpenRouter. A configured command provider is rejected because no RSI command
+adapter is implemented. This path is covered by mocked-provider and fake-fleet
+tests, including failed replay and finding-penalty cases; no live
+provider-backed adversarial run has been validated.
+
+Set HEADLESSCODE_RSI_ROLE_ADVERSARY_MODEL and optionally
+HEADLESSCODE_RSI_ROLE_ADVERSARY_PROVIDER (ollama by default for an added role,
+or openrouter) and HEADLESSCODE_RSI_ROLE_ADVERSARY_BASE_URL. OpenRouter
+credentials stay on the coordinator in HEADLESSCODE_OPENROUTER_API_KEY.
+HEADLESSCODE_RSI_ROLE_WORKER_MODEL and HEADLESSCODE_RSI_ROLE_WORKER_PROVIDER
+can explicitly set the worker identity used for the distinct-model check.
+
+## Remaining work
+
+- Issue #9 has a fixed OpenShell QLoRA prototype and CLI covered by mocked job
+  tests. The supplied Q8 GGUF is rejected before enqueue; live training,
+  adapter evaluation, larger-checkpoint paired evaluation, and model × harness
+  factorial cells remain unvalidated.
+- Add plateau detection, regression retention, and meta-evaluation of mutation
   strategies.
-- Add OS-level isolation and artifact hashing before treating the loop as a
-  long-running unattended research process.
+- Add a trusted hidden-evaluation service and validate cross-gateway recovery
+  under real network, worker-loss, and artifact-store failures.
+- Add signed evaluator provenance before using review outputs as
+  training-grade evidence.

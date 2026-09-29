@@ -1,3 +1,36 @@
+# headlesscode v1.3.0
+
+Released 2026-09-28.
+
+## Recursive self-improvement
+
+- Added an OpenShell-backed RSI worker fleet with PostgreSQL job state,
+  resource admission, fenced leases, retries, and S3-compatible content-addressed
+  artifacts. Candidate mutation and visible evaluation run in separate guests
+  from sanitized snapshots.
+- Added bounded adaptive candidate allocation, fixture-validated curriculum
+  proposals with explicit promotion, adversarial review, and model-candidate
+  provenance.
+- Added a bounded QLoRA prototype with paired base/adapter evaluation. The
+  AirunnerDesktop Ollama-compatible worker can serve the local Qwen GGUF for
+  inference in RSI mutation. The GGUF is not supported as a QLoRA training
+  checkpoint; no live adapter training has been validated.
+- Documented local load-test results and the current limits: no live
+  multi-host qualification, trusted hidden evaluator, or signed evaluator
+  provenance.
+- Updated vulnerable transitive dependencies; `npm audit` reports zero
+  vulnerabilities.
+
+## Verification
+
+- `npm run typecheck`
+- `npm test`
+- `bash scripts/e2e/run.sh` (9 assertions passed)
+- `python3 -m unittest discover -s scripts/rsi-training -p 'test_*.py'`
+- OpenShell read-only checkpoint bind probe (read succeeded; write rejected by
+  the guest filesystem)
+- `git diff --check`
+
 # headlesscode v1.2.2
 
 Released 2026-09-28.

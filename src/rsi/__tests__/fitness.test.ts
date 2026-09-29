@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { computeFitness, hardGatesFor } from "../fitness.js"
+import { comparePairedEvaluation, computeFitness, hardGatesFor } from "../fitness.js"
 import type { EvaluationSummary, TrialResult } from "../types.js"
 
 function trial(ok: boolean): TrialResult {
@@ -38,10 +38,25 @@ function testProtectedPathIsHardGate(): void {
 	assert.equal(computeFitness(summary({ protectedPathViolation: true })).score, 0)
 }
 
+function testEmptyTaskEvaluationCannotPass(): void {
+	const fitness = computeFitness(summary({ visible: [], hidden: [] }))
+	assert.equal(fitness.score, 0)
+	assert.equal(fitness.hardGates.visibleEvalPass, false)
+}
+
+function testPairedComparisonRequiresMaterialImprovement(): void {
+	const baseline = summary({ regression: { ...trial(true), durationMs: 100 }, visible: [{ ...trial(true), durationMs: 100 }] })
+	const candidate = summary({ regression: { ...trial(true), durationMs: 80 }, visible: [{ ...trial(true), durationMs: 80 }] })
+	assert.equal(comparePairedEvaluation(baseline, candidate).improved, true)
+	assert.equal(comparePairedEvaluation(baseline, baseline).improved, false)
+}
+
 const tests = [
 	["passing candidate gets full score", testPassingCandidateGetsNonzeroScore],
 	["regression failure overrides partial score", testHardGateFailureRejectsPartialScore],
 	["protected paths are a hard gate", testProtectedPathIsHardGate],
+	["empty task evaluation is rejected", testEmptyTaskEvaluationCannotPass],
+	["paired comparison needs a correctness or 10% duration gain", testPairedComparisonRequiresMaterialImprovement],
 ] as const
 
 for (const [name, test] of tests) {

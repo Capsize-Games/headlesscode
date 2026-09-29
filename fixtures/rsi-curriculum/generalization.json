@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "generalization",
+  "capability": "generalization",
+  "description": "Executable reference and known-mutant checks for generalizing numeric input handling.",
+  "task": "Implement classifySign(value) so numeric values and numeric strings share negative, zero, or positive classification.",
+  "cases": [
+    {
+      "name": "positive numeric string",
+      "input": [
+        "5"
+      ],
+      "expected": "positive"
+    },
+    {
+      "name": "negative number",
+      "input": [
+        -2
+      ],
+      "expected": "negative"
+    },
+    {
+      "name": "zero string",
+      "input": [
+        "0"
+      ],
+      "expected": "zero"
+    }
+  ]
+}

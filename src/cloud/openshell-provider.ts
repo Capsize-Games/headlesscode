@@ -59,12 +59,24 @@ export interface OpenShellSessionProviderOptions {
 	image?: string
 	policy?: string
 	providers?: string[]
+	/** Attach automatically discovered host provider profiles to the sandbox. */
+	autoProviders?: boolean
 	cpu?: string
 	memory?: string
 	namePrefix?: string
 	readOnlyMounts?: Array<{ source: string; target: string }>
 	importResults?: boolean
 	scratchRoot?: string
+	/** Omit project/shared data snapshots for experiments that must not inherit operator context. */
+	includeProjectData?: boolean
+	/** Use a guest-safe identity path instead of the supervisor checkout path. */
+	projectIdentityRoot?: string
+	/** Additional exact OpenShell network rules needed by the workload. */
+	networkPolicy?: Record<string, unknown>
+	/** Timeout for sandbox commands, including agent mutation. */
+	commandTimeoutMs?: number
+	/** Number of GPU devices requested for a training-only sandbox. */
+	gpu?: number
 	run?: (args: string[], timeoutMs?: number) => CommandResult
 	listSandboxes?: () => string[]
 }
@@ -74,6 +86,7 @@ export class OpenShellSessionProvider implements CloudProvider {
 	private readonly image: string
 	private readonly policy?: string
 	private readonly providers: string[]
+	private readonly autoProviders: boolean
 	private readonly cpu: string
 	private readonly memory: string
 	private readonly namePrefix: string
@@ -82,18 +95,30 @@ export class OpenShellSessionProvider implements CloudProvider {
 	private readonly listSandboxes: () => string[]
 	private readonly importResults: boolean
 	private readonly scratchRoot: string
+	private readonly includeProjectData: boolean
+	private readonly projectIdentityRoot?: string
+	private readonly networkPolicy: Record<string, unknown>
+	private readonly commandTimeoutMs: number
+	private readonly gpu?: number
 	private readonly workspaces = new Map<string, OpenShellWorkspaceState>()
 
 	constructor(options: OpenShellSessionProviderOptions = {}) {
 		this.image = options.image ?? process.env.HEADLESSCODE_OPENSHELL_IMAGE ?? "headlesscode-openshell:local"
 		this.policy = options.policy ?? process.env.HEADLESSCODE_OPENSHELL_POLICY
 		this.providers = options.providers ?? (process.env.HEADLESSCODE_OPENSHELL_PROVIDERS ?? "headlesscode-openrouter").split(",").map((name) => name.trim()).filter(Boolean)
+		this.autoProviders = options.autoProviders ?? true
 		this.cpu = options.cpu ?? process.env.HEADLESSCODE_OPENSHELL_CPU ?? "2"
 		this.memory = options.memory ?? process.env.HEADLESSCODE_OPENSHELL_MEMORY ?? "4Gi"
 		this.namePrefix = options.namePrefix ?? process.env.HEADLESSCODE_OPENSHELL_NAME_PREFIX ?? "hcls"
 		this.readOnlyMounts = options.readOnlyMounts ?? []
 		this.importResults = options.importResults ?? true
 		this.scratchRoot = path.resolve(options.scratchRoot ?? process.env.HEADLESSCODE_OPENSHELL_SCRATCH_ROOT ?? path.join(os.homedir(), ".local", "share", "headlesscode", "openshell-sessions"))
+		this.includeProjectData = options.includeProjectData ?? true
+		this.projectIdentityRoot = options.projectIdentityRoot
+		this.networkPolicy = options.networkPolicy ?? {}
+		this.commandTimeoutMs = options.commandTimeoutMs ?? 15 * 60_000
+		if (options.gpu !== undefined && (!Number.isInteger(options.gpu) || options.gpu < 1 || options.gpu > 8)) throw new Error("OpenShell GPU count must be an integer from 1 to 8")
+		this.gpu = options.gpu
 		this.run = options.run ?? ((args, timeoutMs) => {
 			const result = spawnSync("openshell", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs })
 			return { exitCode: result.status ?? 1, output: `${result.stdout ?? ""}${result.stderr ?? ""}`.trim() }
@@ -258,7 +283,8 @@ export class OpenShellSessionProvider implements CloudProvider {
 	): Promise<SessionHandle> {
 		const { sandboxWorkspace } = isolated
 		if (!this.policy || !fs.existsSync(this.policy)) throw new Error("OpenShell requires a base policy file")
-		const args = ["sandbox", "create", "--detach", "--auto-providers", "--cpu", this.cpu, "--memory", this.memory, "--name", name, "--from", this.image]
+		const args = ["sandbox", "create", "--detach", this.autoProviders ? "--auto-providers" : "--no-auto-providers", "--cpu", this.cpu, "--memory", this.memory, "--name", name, "--from", this.image]
+		if (this.gpu !== undefined) args.push("--gpu", String(this.gpu))
 		if (this.policy) args.push("--policy", path.resolve(this.policy))
 		for (const provider of this.providers) args.push("--provider", provider)
 		// Only the disposable clone is writable inside the sandbox. Host Git
@@ -268,13 +294,7 @@ export class OpenShellSessionProvider implements CloudProvider {
 			{ type: "bind", source: sandboxWorkspace, target: OPENSHELL_WORKSPACE_TARGET, read_only: false },
 			{ type: "bind", source: isolated.exportDir, target: "/result", read_only: false },
 		]
-		const projectData = resolveProjectDataDir(repo)
-		const projectDataTarget = "/opt/headlesscode-data/projects/" + path.basename(projectData)
 		const dataSnapshotRoot = path.join(isolated.tempRoot, "data")
-		const projectDataSnapshot = path.join(dataSnapshotRoot, "projects", path.basename(projectData))
-		fs.mkdirSync(path.dirname(projectDataSnapshot), { recursive: true })
-		fs.cpSync(projectData, projectDataSnapshot, { recursive: true, dereference: true })
-		mounts.push({ type: "bind", source: projectDataSnapshot, target: projectDataTarget, read_only: true })
 		const policy = this.policy ? parse(fs.readFileSync(this.policy, "utf8")) as Record<string, any> : undefined
 		const filesystemPolicy = policy?.filesystem_policy
 		if (!filesystemPolicy || !Array.isArray(filesystemPolicy.read_only) || !Array.isArray(filesystemPolicy.read_write)) {
@@ -282,18 +302,33 @@ export class OpenShellSessionProvider implements CloudProvider {
 		}
 		filesystemPolicy.read_write.push(OPENSHELL_WORKSPACE_TARGET)
 		filesystemPolicy.read_write.push("/result")
-		filesystemPolicy.read_only.push(projectDataTarget, OPENSHELL_HARNESS_ROOT)
-		const sharedData = path.join(projectStoreRoot(), "shared")
-		if (fs.existsSync(sharedData)) {
-			const sharedDataSnapshot = path.join(dataSnapshotRoot, "shared")
-			fs.cpSync(sharedData, sharedDataSnapshot, { recursive: true, dereference: true })
-			mounts.push({ type: "bind", source: sharedDataSnapshot, target: "/opt/headlesscode-data/shared", read_only: true })
-			filesystemPolicy.read_only.push("/opt/headlesscode-data/shared")
+		policy.network_policies = { ...(policy.network_policies ?? {}), ...this.networkPolicy }
+		filesystemPolicy.read_only.push(OPENSHELL_HARNESS_ROOT)
+		let projectDataMounted = false
+		if (this.includeProjectData) {
+			const projectData = resolveProjectDataDir(repo)
+			if (fs.existsSync(projectData)) {
+				const projectDataTarget = "/opt/headlesscode-data/projects/" + path.basename(projectData)
+				const projectDataSnapshot = path.join(dataSnapshotRoot, "projects", path.basename(projectData))
+				fs.mkdirSync(path.dirname(projectDataSnapshot), { recursive: true })
+				fs.cpSync(projectData, projectDataSnapshot, { recursive: true, dereference: true })
+				mounts.push({ type: "bind", source: projectDataSnapshot, target: projectDataTarget, read_only: true })
+				filesystemPolicy.read_only.push(projectDataTarget)
+				projectDataMounted = true
+			}
+			const sharedData = path.join(projectStoreRoot(), "shared")
+			if (fs.existsSync(sharedData)) {
+				const sharedDataSnapshot = path.join(dataSnapshotRoot, "shared")
+				fs.cpSync(sharedData, sharedDataSnapshot, { recursive: true, dereference: true })
+				mounts.push({ type: "bind", source: sharedDataSnapshot, target: "/opt/headlesscode-data/shared", read_only: true })
+				filesystemPolicy.read_only.push("/opt/headlesscode-data/shared")
+			}
 		}
 		const checkpointsSnapshot = path.join(dataSnapshotRoot, "checkpoints")
 		fs.mkdirSync(checkpointsSnapshot, { recursive: true })
 		mounts.push({ type: "bind", source: checkpointsSnapshot, target: "/opt/headlesscode-data/checkpoints", read_only: false })
-		filesystemPolicy.read_only.push("/opt/headlesscode-data")
+		if (projectDataMounted) filesystemPolicy.read_only.push("/opt/headlesscode-data")
+		else filesystemPolicy.read_write.push("/opt/headlesscode-data")
 		filesystemPolicy.read_write.push("/opt/headlesscode-data/checkpoints")
 		const memoryDir = request.env?.HEADLESSCODE_MEMORY_DIR
 		if (memoryDir) {
@@ -312,12 +347,13 @@ export class OpenShellSessionProvider implements CloudProvider {
 			mounts.push({ type: "bind", source: memorySnapshot, target: "/opt/headlesscode-memory", read_only: false })
 			filesystemPolicy.read_write.push("/opt/headlesscode-memory")
 		}
-		for (const mount of this.readOnlyMounts) {
-			const relativeTarget = path.relative(OPENSHELL_WORKSPACE_TARGET, path.resolve(mount.target))
-			if (relativeTarget.startsWith("..") || path.isAbsolute(relativeTarget)) throw new Error(`OpenShell read-only mount target must be under ${OPENSHELL_WORKSPACE_TARGET}: ${mount.target}`)
-			const target = path.join(sandboxWorkspace, relativeTarget)
-			fs.mkdirSync(path.dirname(target), { recursive: true })
-			fs.cpSync(path.resolve(mount.source), target, { recursive: true, dereference: true })
+		const mountTargets = validateReadOnlyMountTargets(this.readOnlyMounts)
+		for (const [index, mount] of this.readOnlyMounts.entries()) {
+			const sourceSnapshot = path.join(isolated.tempRoot, "read-only-mounts", String(index))
+			fs.mkdirSync(path.dirname(sourceSnapshot), { recursive: true, mode: 0o700 })
+			fs.cpSync(path.resolve(mount.source), sourceSnapshot, { recursive: true, dereference: true })
+			mounts.push({ type: "bind", source: sourceSnapshot, target: mountTargets[index]!, read_only: true })
+			filesystemPolicy.read_only.push(mountTargets[index]!)
 		}
 		const generatedPolicy = path.join(os.tmpdir(), `headlesscode-openshell-policy-${process.pid}-${Date.now()}.yaml`)
 		fs.writeFileSync(generatedPolicy, stringify(policy), { mode: 0o600 })
@@ -327,13 +363,13 @@ export class OpenShellSessionProvider implements CloudProvider {
 			if (key === "HEADLESSCODE_MEMORY_DIR" && isolated.memorySnapshot) args.push("--env", "HEADLESSCODE_MEMORY_DIR=/opt/headlesscode-memory")
 			else if (key !== "TARGET_REPO") args.push("--env", `${key}=${value}`)
 		}
-		args.push("--env", `TARGET_REPO=${OPENSHELL_WORKSPACE_TARGET}`, "--env", `HEADLESSCODE_ROOT=${OPENSHELL_HARNESS_ROOT}`, "--env", "HEADLESSCODE_DATA_DIR=/opt/headlesscode-data", "--env", `HEADLESSCODE_PROJECT_IDENTITY_ROOT=${repo}`, "--env", "GIT_CONFIG_NOSYSTEM=1", "--env", "GIT_CONFIG_GLOBAL=/dev/null")
+		args.push("--env", `TARGET_REPO=${OPENSHELL_WORKSPACE_TARGET}`, "--env", `HEADLESSCODE_ROOT=${OPENSHELL_HARNESS_ROOT}`, "--env", "HEADLESSCODE_DATA_DIR=/opt/headlesscode-data", "--env", `HEADLESSCODE_PROJECT_IDENTITY_ROOT=${this.projectIdentityRoot ?? repo}`, "--env", "GIT_CONFIG_NOSYSTEM=1", "--env", "GIT_CONFIG_GLOBAL=/dev/null")
 		args.push("--", "sleep", "infinity")
 		this.workspaces.set(name, isolated)
 		writeOpenShellSandboxMarker(hostWorkspace, name)
 		let result: CommandResult
 		try {
-			result = this.run(args)
+			result = this.run(args, this.commandTimeoutMs)
 		} finally {
 			fs.rmSync(generatedPolicy, { force: true })
 		}
@@ -403,7 +439,7 @@ export class OpenShellSessionProvider implements CloudProvider {
 				"for f in /workspace/.harness.* /workspace/.qa.* /workspace/.review.*; do [ -e \"$f\" ] || continue; rel=\"${f#/workspace/}\"; [ -z \"$(git ls-files -- \"$rel\")\" ] && rm -f -- \"$f\"; done",
 				"git ls-files -z -- .env '.env.*' | while IFS= read -r -d '' rel; do git show \"HEAD:$rel\" > \"/workspace/$rel\"; done",
 				"for f in /workspace/.env /workspace/.env.*; do [ -e \"$f\" ] || continue; rel=\"${f#/workspace/}\"; git ls-files --error-unmatch -- \"$rel\" >/dev/null 2>&1 || rm -f -- \"$f\"; done",
-				"git add -A",
+				"git rm -r --cached --ignore-unmatch -- .rsi-base-model && git add -A -- . ':!.rsi-base-model'",
 				"if ! git diff --cached --quiet HEAD; then git -c core.hooksPath=/dev/null commit -m 'HeadlessCode sandbox result'; fi",
 				`git bundle create /result/result.bundle ${branchRef}`,
 			].join(" && ")
@@ -557,6 +593,30 @@ function importMemorySnapshot(snapshot: string, destination: string): void {
 
 function pathsOverlap(left: string, right: string): boolean {
 	return isSameOrInside(left, right) || isSameOrInside(right, left)
+}
+
+/** Validate nested read-only bind targets before taking filesystem snapshots. */
+export function validateReadOnlyMountTargets(readOnlyMounts: Array<{ source: string; target: string }>): string[] {
+	const targets = readOnlyMounts.map(({ target }) => {
+		if (typeof target !== "string" || target.includes("\0") || target.includes("\\") || /[\r\n]/.test(target)) {
+			throw new Error(`OpenShell read-only mount target is unsafe: ${String(target)}`)
+		}
+		const normalized = path.posix.normalize(target)
+		if (target === "/" || !target.startsWith(`${OPENSHELL_WORKSPACE_TARGET}/`) || normalized !== target || target.slice(1).split("/").some((part) => part === ".." || part === "." || part === "")) {
+			throw new Error(`OpenShell read-only mount target must be a normalized non-root path beneath ${OPENSHELL_WORKSPACE_TARGET}: ${target}`)
+		}
+		return normalized
+	})
+	for (let left = 0; left < targets.length; left += 1) {
+		for (let right = left + 1; right < targets.length; right += 1) {
+			const a = targets[left]!
+			const b = targets[right]!
+			if (a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`)) {
+				throw new Error(`OpenShell read-only mount targets overlap: ${a} and ${b}`)
+			}
+		}
+	}
+	return targets
 }
 
 function isSameOrInside(parent: string, child: string): boolean {

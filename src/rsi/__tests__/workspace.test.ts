@@ -1,6 +1,9 @@
 import assert from "node:assert/strict"
 import * as path from "node:path"
-import { candidateBranch, candidateId, candidateWorktree, newCandidate } from "../workspace.js"
+import { candidateBranch, candidateId, candidateWorktree, changedFiles, newCandidate } from "../workspace.js"
+import { execFileSync } from "node:child_process"
+import * as fs from "node:fs/promises"
+import * as os from "node:os"
 import type { RsiConfig } from "../types.js"
 
 const config: RsiConfig = {
@@ -9,7 +12,8 @@ const config: RsiConfig = {
 	population: 2,
 	generations: 1,
 	maxConcurrent: 1,
-	mutationTask: "fixture",
+		mutationTask: "fixture",
+		regressionCommand: "npm test",
 	evalCommands: [],
 	hiddenEvalCommands: [],
 	archiveDir: "/tmp/repo/.headlesscode/rsi",
@@ -37,6 +41,26 @@ function testLineageMetadata(): void {
 	assert.equal(candidate.status, "planned")
 }
 
+async function testPorcelainStatusPreservesFilenameAndSpaces(): Promise<void> {
+	const repo = await fs.mkdtemp(path.join(os.tmpdir(), "hc-rsi-paths-"))
+	try {
+		execFileSync("git", ["init", "-q"], { cwd: repo })
+		execFileSync("git", ["config", "user.email", "rsi@example.invalid"], { cwd: repo })
+		execFileSync("git", ["config", "user.name", "RSI Test"], { cwd: repo })
+		await fs.mkdir(path.join(repo, "scripts"), { recursive: true })
+		await fs.writeFile(path.join(repo, "scripts", "check.cjs"), "base\n")
+		execFileSync("git", ["add", "."], { cwd: repo })
+		execFileSync("git", ["commit", "-qm", "base"], { cwd: repo })
+		const base = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim()
+		await fs.writeFile(path.join(repo, "scripts", "check.cjs"), "changed\n")
+		await fs.writeFile(path.join(repo, "untracked file.txt"), "new\n")
+		assert.deepEqual(await changedFiles(repo, base), ["scripts/check.cjs", "untracked file.txt"])
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 testStableNames()
 testLineageMetadata()
-console.log("All 2 RSI workspace tests passed")
+await testPorcelainStatusPreservesFilenameAndSpaces()
+console.log("All 3 RSI workspace tests passed")
