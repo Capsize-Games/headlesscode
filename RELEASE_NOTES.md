@@ -18,6 +18,8 @@ Released 2026-09-28.
 - Documented local load-test results and the current limits: no live
   multi-host qualification, trusted hidden evaluator, or signed evaluator
   provenance.
+- Updated vulnerable transitive dependencies; `npm audit` reports zero
+  vulnerabilities.
 
 ## Verification
 
