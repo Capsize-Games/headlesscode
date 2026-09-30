@@ -161,6 +161,7 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 						if (mode === "self-hosted-missing-cli" || mode === "dependency-escape") {
 							assert.equal(boundary.status, 79, "the actual shell preflight must stop on the missing CLI or escaped dependency link")
 							assert.match(boundary.stderr, /RSI_BENCHMARK_PREFLIGHT_FAILURE/)
+							assert.match(boundary.stderr, mode === "dependency-escape" ? /RSI_BENCHMARK_PREFLIGHT_FAILURE:1/ : /RSI_BENCHMARK_PREFLIGHT_FAILURE:2/)
 							return { exitCode: 79, output: boundary.stderr }
 						}
 						assert.equal(boundary.status, 0, "an existing but corrupted CLI passes only the readability/link preflight")

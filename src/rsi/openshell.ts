@@ -663,7 +663,7 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 				: "test -z \"$(find /workspace /opt/headlesscode/src -type f \\( -path '*/__tests__/*' -o -name '*.test.*' -o -name '*.spec.*' \\) -print -quit)\"",
 			'test -z "${HEADLESSCODE_OPENROUTER_API_KEY:-}${OPENROUTER_API_KEY:-}${OPENAI_API_KEY:-}${ANTHROPIC_API_KEY:-}"',
 		]
-		const boundaryGuard = `${boundaryChecks.map((check) => `(${check}) || { echo RSI_BENCHMARK_PREFLIGHT_FAILURE >&2; exit 79; }`).join(" && ")} && exec ${workerCommand}`
+		const boundaryGuard = `${boundaryChecks.map((check, index) => `(${check}) || { echo RSI_BENCHMARK_PREFLIGHT_FAILURE:${index} >&2; exit 79; }`).join(" && ")} && exec ${workerCommand}`
 		const env = rsiMutationGuestEnvironment(config, candidate, inferenceBroker)
 		const isolation = await runSnapshot({
 			config,
