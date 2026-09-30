@@ -23,3 +23,31 @@ test("failed unqualified OpenRouter mutation report retains only denial categori
 	} as unknown as CandidateRecord
 	assert.match(formatCandidate(candidate), /usage=unmeasured denials=413:request-size-limit=1/)
 })
+
+test("candidate report preserves the exact executed harness and source snapshot identity", () => {
+	const candidate = {
+		id: "candidate-self-hosted",
+		status: "accepted",
+		workerHarnessExecution: {
+			mode: "self-hosted",
+			parentCommit: "a".repeat(40),
+			snapshotCommit: "b".repeat(40),
+			snapshotTreeDigest: "c".repeat(64),
+			runtime: {
+				imageName: "headlesscode-openshell-rsi:release",
+				imageDigest: `sha256:${"d".repeat(64)}`,
+				harnessCommit: "e".repeat(40),
+				dependencyLockDigest: "f".repeat(64),
+			},
+			executedCliPath: "/workspace/src/cli.ts",
+		},
+	} as unknown as CandidateRecord
+	const report = formatCandidate(candidate)
+	assert.match(report, /harness=self-hosted/)
+	assert.match(report, /parent=a{40}/)
+	assert.match(report, /snapshot=b{40}\/c{64}/)
+	assert.match(report, /image=sha256:d{64}/)
+	assert.match(report, /commit=e{40}/)
+	assert.match(report, /lock=f{64}/)
+	assert.match(report, /cli=\/workspace\/src\/cli\.ts/)
+})

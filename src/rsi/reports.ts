@@ -15,7 +15,10 @@ export function formatCandidate(candidate: CandidateRecord): string {
 		: candidate.developmentProof ? `, development=ineligible (${candidate.developmentProof.reason || "incomplete proof record"})` : ", development=unmeasured (no benchmark proof recorded)"
 	const formatDenials = (denials: NonNullable<CandidateRecord["inferenceDenials"]>) => denials.map((entry) => `${entry.statusCode}:${entry.reason}=${entry.count}`).join(",") || "none"
 	const model = candidate.modelProvider ? `, worker=${candidate.modelProvider}/${candidate.model}${candidate.inferenceUsage ? ` returned=${candidate.inferenceUsage.returnedModels.join(",")} calls=${candidate.inferenceUsage.calls} tokens=${candidate.inferenceUsage.totalTokens} costUsd=${candidate.inferenceUsage.costUsd} denials=${formatDenials(candidate.inferenceUsage.denials)}` : ` usage=unmeasured${candidate.inferenceDenials ? ` denials=${formatDenials(candidate.inferenceDenials)}` : ""}`}` : ""
-	return `${candidate.id}: ${candidate.status}${parent}${mutation}${model}${fitness ? `, score=${fitness.score}, ${fitness.reason}` : ""}${proof}${comparison}${metrics}`
+	const workerHarness = candidate.workerHarnessExecution
+		? `, harness=${candidate.workerHarnessExecution.mode} parent=${candidate.workerHarnessExecution.parentCommit} snapshot=${candidate.workerHarnessExecution.snapshotCommit}/${candidate.workerHarnessExecution.snapshotTreeDigest} image=${candidate.workerHarnessExecution.runtime.imageDigest} commit=${candidate.workerHarnessExecution.runtime.harnessCommit} lock=${candidate.workerHarnessExecution.runtime.dependencyLockDigest} cli=${candidate.workerHarnessExecution.executedCliPath}`
+		: ""
+	return `${candidate.id}: ${candidate.status}${parent}${mutation}${model}${workerHarness}${fitness ? `, score=${fitness.score}, ${fitness.reason}` : ""}${proof}${comparison}${metrics}`
 }
 
 export function formatRunReport(run: RsiRunRecord, config: RsiConfig): string {
@@ -24,6 +27,7 @@ export function formatRunReport(run: RsiRunRecord, config: RsiConfig): string {
 		"",
 		`- Model: ${run.model}`,
 		`- Base commit: ${run.baseCommit}`,
+		`- Worker harness: mode=${run.workerHarnessMode ?? "fixed-control"}; pair=${run.workerHarnessPairId ?? "unpaired"}; plannedGenerations=${run.workerHarnessPlannedGenerations ?? run.generations}; configDigest=${run.workerHarnessConfigDigest ?? "unavailable"}; samplingSeed=${run.workerHarnessSamplingSeed ?? "unavailable"}${run.workerHarnessRuntime ? `; image=${run.workerHarnessRuntime.imageDigest}; harnessCommit=${run.workerHarnessRuntime.harnessCommit}; dependencyLock=${run.workerHarnessRuntime.dependencyLockDigest}` : ""}`,
 		`- Development proof: ${run.developmentProofProtocol ? `frozen protocol ${run.developmentProofProtocol.protocolDigest}; ${run.developmentProofProtocol.taskIds.length} development tasks; minimum net wins ${run.developmentProofProtocol.rule.minimumNetWins}; retention tasks ${run.developmentProofProtocol.rule.retentionTaskIds.join(", ")}; maximum mean-token increase ratio ${run.developmentProofProtocol.rule.maximumMeanTokenIncreaseRatio}` : "unavailable"}`,
 		`- Confirmation evidence: ${run.confirmationEvidence ?? "unmeasured"}`,
 		`- Generations: ${run.generations}`,

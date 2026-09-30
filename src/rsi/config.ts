@@ -1,6 +1,6 @@
 import * as path from "node:path"
 import { DEFAULT_PROTECTED_FILES } from "../permissions/protected-files.js"
-import type { ComputePolicy, MutationHypothesis, MutationKind, ParentSelectionPolicy, RsiConfig } from "./types.js"
+import type { ComputePolicy, MutationHypothesis, MutationKind, ParentSelectionPolicy, RsiConfig, WorkerHarnessMode } from "./types.js"
 import { DEFAULT_DEVELOPMENT_PROOF_RULE } from "./development-proof.js"
 
 export const DEFAULT_RSI_MODEL = "wxrq-qwen3.5-9b:latest"
@@ -73,6 +73,8 @@ Options:
   --curriculum-dir <path>      generated curriculum proposal directory
   --resume <run-id>            resume a checkpointed active run
   --model-candidate-id <id>    model identity used for combination tracking
+  --worker-harness-mode <mode> fixed-control | self-hosted (generation zero is always fixed-control)
+  --worker-harness-pair-id <id> shared identifier for matching fixed-control and self-hosted runs
   --base-ref <ref>             git ref to branch from (default: HEAD)
   --dry-run                    print the planned loop without changing files
   --keep-worktrees              retain candidate worktrees after evaluation
@@ -120,6 +122,8 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 	let curriculumDir: string | undefined
 	let resumeRunId: string | undefined
 	let modelCandidateId: string | undefined
+	let workerHarnessMode: WorkerHarnessMode | undefined
+	let workerHarnessPairId: string | undefined
 	let proofMinimumNetWins = DEFAULT_DEVELOPMENT_PROOF_RULE.minimumNetWins
 	let proofRetentionTaskIds = [...DEFAULT_DEVELOPMENT_PROOF_RULE.retentionTaskIds]
 	let proofRetentionWasConfigured = false
@@ -271,6 +275,20 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 					index = next
 					break
 				}
+				case "--worker-harness-mode": {
+					const [value, next] = take(index, arg)
+					if (value !== "fixed-control" && value !== "self-hosted") throw new Error(`${arg} must be fixed-control or self-hosted`)
+					workerHarnessMode = value
+					index = next
+					break
+				}
+				case "--worker-harness-pair-id": {
+					const [value, next] = take(index, arg)
+					if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value)) throw new Error(`${arg} must be a 1-64 character identifier`)
+					workerHarnessPairId = value
+					index = next
+					break
+				}
 				case "--proof-min-net-wins": {
 					const [value, next] = take(index, arg)
 					proofMinimumNetWins = positiveInteger(value, arg)
@@ -398,6 +416,8 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 				commandTimeoutMs,
 				resumeRunId,
 				modelCandidateId,
+				...(workerHarnessMode ? { workerHarnessMode } : {}),
+				...(workerHarnessPairId ? { workerHarnessPairId } : {}),
 			},
 		}
 	} catch (error) {

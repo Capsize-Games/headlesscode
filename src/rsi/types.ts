@@ -6,6 +6,23 @@ import type { OpenRouterDenialSummary } from "./inference-broker.js"
 export type CandidateStatus = "planned" | "mutating" | "evaluating" | "accepted" | "rejected" | "failed"
 export type MutationKind = "corrective" | "architectural" | "search-policy" | "curriculum" | "model-adaptation"
 export type ParentSelectionPolicy = "champion-specialist-novelty" | "pareto-front" | "all-eligible"
+export type WorkerHarnessMode = "fixed-control" | "self-hosted"
+
+export interface WorkerHarnessRuntimeIdentity {
+	imageName: string
+	imageDigest: string
+	harnessCommit: string
+	dependencyLockDigest: string
+}
+
+export interface WorkerHarnessExecution {
+	mode: WorkerHarnessMode
+	parentCommit: string
+	snapshotCommit: string
+	snapshotTreeDigest: string
+	runtime: WorkerHarnessRuntimeIdentity
+	executedCliPath: string
+}
 export type ComputePolicy = "single" | "independent" | "adaptive-independent" | "planner-executors" | "critic-retry"
 
 export interface AdaptiveSearchDecision {
@@ -225,6 +242,12 @@ export interface RsiConfig {
 	maxIterations: number
 	maxTokens?: number
 	benchmarkHarnessCommit?: string
+	workerHarnessMode?: WorkerHarnessMode
+	workerHarnessPairId?: string
+	workerHarnessRuntime?: WorkerHarnessRuntimeIdentity
+	workerHarnessParentCommit?: string
+	workerHarnessSnapshotTreeDigest?: string
+	candidateIdNamespace?: string
 	maxTrajectories?: number
 	maxTotalIterations?: number
 	maxRuntimeMs?: number
@@ -289,6 +312,7 @@ export interface CandidateRecord {
 	fitness?: Fitness
 	pairedComparison?: PairedComparison
 	developmentProof?: CandidateDevelopmentProof
+	workerHarnessExecution?: WorkerHarnessExecution
 	trajectory?: TrajectorySummary
 }
 
@@ -421,6 +445,12 @@ export interface RsiRunRecord {
 	adaptiveSearch?: AdaptiveSearchDecision[]
 	curriculumTasks?: CurriculumTask[]
 	developmentProofProtocol?: DevelopmentProofProtocol
+	workerHarnessMode?: WorkerHarnessMode
+	workerHarnessPairId?: string
+	workerHarnessConfigDigest?: string
+	workerHarnessPlannedGenerations?: number
+	workerHarnessSamplingSeed?: string
+	workerHarnessRuntime?: WorkerHarnessRuntimeIdentity
 	confirmationEvidence?: "unmeasured"
 	adversarialReviews?: AdversarialReviewRecord[]
 	candidates: CandidateRecord[]
@@ -445,7 +475,7 @@ export interface CommandRunner {
 }
 
 export interface MutationRunner {
-	(candidate: CandidateRecord, config: RsiConfig): Promise<{ ok: boolean; result?: TrialResult; error?: string }>
+	(candidate: CandidateRecord, config: RsiConfig): Promise<{ ok: boolean; result?: TrialResult; error?: string; workerHarnessExecution?: WorkerHarnessExecution }>
 }
 
 export interface RsiHooks {

@@ -99,6 +99,59 @@ for the local worker, not a dollar-cost estimate.
    comparable verified evidence that pass the frozen development rule and all
    evaluator gates, then writes the archive and report.
 
+## Self-hosted worker harness experiments
+
+`--worker-harness-mode fixed-control|self-hosted` selects the worker code used
+for mutation jobs. Generation zero uses the pinned runtime harness in both
+modes. Fixed-control executes `/opt/headlesscode/src/cli.ts`. Self-hosted
+generations after zero execute `/workspace/src/cli.ts` from the selected
+parent's sanitized source snapshot. Both use the runtime image's read-only
+`/opt/headlesscode/node_modules` and TypeScript configuration.
+
+Before admitting a mutation, the coordinator checks that the selected parent
+descends from the run base and that its complete base-to-parent tree change
+contains no protected paths. The hard-protected set includes RSI policy, tests
+and evaluators, fixture corpora, package metadata, Docker build inputs, and
+supervisor state, even if a caller supplies an incomplete protected-path list.
+The worker receives a one-commit sanitized snapshot with those paths omitted.
+Its tree digest is checked before OpenShell provider creation. The runtime
+image digest, embedded harness commit, dependency-lock digest, selected parent
+commit, snapshot commit and tree digest, mode, and executed CLI path are stored
+with the mutation result before evaluation or promotion.
+
+Use the same `--worker-harness-pair-id`, task, base commit, model/provider,
+seed, population, iteration and token ceilings, timeout, and evaluation
+settings in both runs. The coordinator freezes a config digest and rejects a
+second arm with different settings or runtime identity. Candidate IDs remain
+distinct between arms. Pairing records the configured experiment seed; the
+current code worker uses temperature zero, while the seed does not create a
+provider-side random seed parameter.
+
+```mermaid
+flowchart LR
+  C[Coordinator] --> P[Validate selected parent and protected tree]
+  P --> S[Create sanitized one-commit snapshot and digest]
+  S --> G[OpenShell guest]
+  G -->|fixed-control| F[/opt/headlesscode/src/cli.ts]
+  G -->|self-hosted after generation zero| W[/workspace/src/cli.ts]
+  F --> D[Read-only runtime dependencies]
+  W --> D
+  G --> I[Return patch and execution identity]
+  I --> V[Validate and import outside guest]
+  V --> E[Independent evaluation and promotion]
+  X[RSI policy, tests, evaluators, confirmation fixtures] -. omitted .-> G
+```
+
+`scripts/rsi-benchmark/self-hosted-harness-smoke.ts` is a bounded integration
+probe for this path. It creates a prompt sentinel in generation zero, records
+the same parent marker in generation one, then observes the real model request
+in generation two. Only the self-hosted workspace CLI should include the
+sentinel in that request; the fixed-control CLI remains pinned to the image.
+The mock upstream returns deterministic, different tool edits for those two
+generation-two requests. Each task allows three calls, 256 output tokens per
+call, and a 180-second job timeout. The probe uses no production provider
+credential and requires an exact image built from a clean commit.
+
 Earlier bounded runs used the locally installed `wxrq-qwen3.5-9b:latest` model
 through Ollama before the fleet adapter existed. In the current setup,
 AirunnerDesktop's LLM worker exposes the local Qwen GGUF through its
@@ -267,6 +320,10 @@ sudo -n nsenter -t "$gateway_pid" -n -- runuser -u "$(id -un)" -- env \
   OPENSHELL_GATEWAY_ENDPOINT=https://127.0.0.1:18080 \
   HEADLESSCODE_RSI_BROKER_BIND_HOST="$gateway_ip" \
   npx tsx scripts/rsi-benchmark/mock-openrouter-guest-smoke.ts .
+sudo -n nsenter -t "$gateway_pid" -n -- runuser -u "$(id -un)" -- env \
+  OPENSHELL_GATEWAY_ENDPOINT=https://127.0.0.1:18080 \
+  HEADLESSCODE_RSI_BROKER_BIND_HOST="$gateway_ip" \
+  npx tsx scripts/rsi-benchmark/self-hosted-harness-smoke.ts .
 ```
 
 The `openshell-rsi-gateway` container name and `rsi-local` alias must match the
@@ -280,6 +337,13 @@ in the gateway network namespace (or use another specifically tested,
 gateway-reachable interface), set `OPENSHELL_GATEWAY_ENDPOINT` to its mTLS
 gateway endpoint, and bind the broker on an address reachable through that
 namespace. Do not expose the broker on wildcard or unrelated host interfaces.
+
+The second command runs three generations in each of two paired arms (six
+mutation attempts total), capped at three mock calls per attempt. It checks that the
+generation-zero prompt edit reaches the generation-two self-hosted request,
+that the fixed-control request remains unchanged, and that the mock model
+returns different generation-two task edits. It uses only a local mock
+upstream and does not provide model-improvement evidence.
 
 Run `headlesscode rsi-worker` once per worker identity. It sets
 `OPENSHELL_GATEWAY` from `HEADLESSCODE_RSI_GATEWAY_ID` before preflight.

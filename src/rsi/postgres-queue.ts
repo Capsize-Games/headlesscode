@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto"
 import { readFileSync } from "node:fs"
 import { Pool, type PoolClient } from "pg"
-import type { ResourceClass } from "./types.js"
+import type { ResourceClass, WorkerHarnessMode, WorkerHarnessRuntimeIdentity } from "./types.js"
 import { createRsiArtifactStore, type RsiArtifactReference, type RsiArtifactStore } from "./artifact-store.js"
 import type { OpenRouterBrokerGrant, OpenRouterBrokerReceipt, OpenRouterCallReceipt, OpenRouterCallReservation, OpenRouterCallSettlement, OpenRouterDenialReason, OpenRouterInferenceLedger } from "./inference-broker.js"
 import type { OpenRouterBrokerLimits } from "./inference-broker.js"
@@ -85,6 +85,15 @@ export interface FleetJobPayload {
 	candidate: Record<string, unknown>
 	regressionCommand?: string
 	evalCommands?: string[]
+	workerHarness?: {
+		runMode: WorkerHarnessMode
+		mode: WorkerHarnessMode
+		pairId?: string
+		parentCommit: string
+		snapshotTreeDigest: string
+		runtime: WorkerHarnessRuntimeIdentity
+		executedCliPath: string
+	}
 	modelTask?: {
 		kind: "qlora-train" | "model-evaluation"
 		datasetVersion: string

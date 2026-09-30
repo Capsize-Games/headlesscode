@@ -8,9 +8,10 @@ import type { ParentChoice } from "./selection.js"
 
 const execFile = promisify(execFileCallback)
 
-export function candidateId(generation: number, index: number, seed: string): string {
+export function candidateId(generation: number, index: number, seed: string, namespace?: string): string {
 	const cleanSeed = seed.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "run"
-	return `g${generation}-c${String(index + 1).padStart(2, "0")}-${cleanSeed.slice(0, 20)}`
+	const cleanNamespace = namespace?.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 12)
+	return `g${generation}-c${String(index + 1).padStart(2, "0")}-${cleanSeed.slice(0, 20)}${cleanNamespace ? `-${cleanNamespace}` : ""}`
 }
 
 export function candidateBranch(id: string): string {
@@ -38,7 +39,7 @@ export function newCandidate(
 	now: string,
 	parentChoice?: ParentChoice,
 ): CandidateRecord {
-	const id = candidateId(generation, index, config.seed)
+	const id = candidateId(generation, index, config.seed, config.candidateIdNamespace)
 	const modelCandidateId = config.modelCandidateId ?? "model-base"
 	return {
 		id,
