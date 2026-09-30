@@ -636,7 +636,7 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 		const boundaryChecks = [
 			"if test -L /workspace/node_modules; then :; else test ! -e /workspace/node_modules && ln -s /opt/headlesscode/node_modules /workspace/node_modules; fi",
 			'test "$(readlink /workspace/node_modules)" = /opt/headlesscode/node_modules',
-			"test -r /workspace/src/cli.ts",
+			effectiveMode === "self-hosted" ? "test -r /workspace/src/cli.ts" : "test -r /opt/headlesscode/src/cli.ts",
 			"test -r /opt/headlesscode/tsconfig.json",
 			"test -r /opt/headlesscode/package-lock.json",
 			'test "$(git -C /workspace rev-list --count HEAD)" = 1',

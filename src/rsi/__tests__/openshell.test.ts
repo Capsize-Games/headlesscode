@@ -50,7 +50,7 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 		execFileSync("git", ["worktree", "add", "--quiet", "-b", `rsi/${mode}`, worktree, baseCommit], { cwd: repo })
 		const candidate: CandidateRecord = {
 			id: `candidate-${mode}`,
-			generation: 0,
+			generation: ["self-hosted-missing-cli", "self-hosted-corrupt-cli", "dependency-escape"].includes(mode) ? 1 : 0,
 			parent: "baseline",
 			branch: `rsi/${mode}`,
 			worktree,
@@ -141,7 +141,11 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 					assert.match(command, /rev-list --count HEAD/)
 					assert.match(command, /\/opt\/headlesscode\/src\/rsi/)
 					assert.match(command, /OPENROUTER_API_KEY/)
-					assert.match(command, /test -r \/workspace\/src\/cli\.ts/, "guest preflight must reject a missing self-hosted CLI")
+					if (["self-hosted-missing-cli", "self-hosted-corrupt-cli", "dependency-escape"].includes(mode)) {
+						assert.match(command, /test -r \/workspace\/src\/cli\.ts/, "self-hosted preflight checks the selected-parent CLI")
+					} else {
+						assert.match(command, /test -r \/opt\/headlesscode\/src\/cli\.ts/, "fixed-control preflight checks the pinned release CLI")
+					}
 					assert.match(command, /readlink \/workspace\/node_modules/)
 					assert.match(command, /test \! -e \/workspace\/__rsi_benchmark_verifier__/)
 					assert.match(command, /test \! -e \/opt\/headlesscode\/scripts\/rsi-benchmark\/task-spec\.mjs/)
@@ -173,7 +177,7 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 						assert.match(command, /headlesscode-harness-commit/)
 						return { exitCode: 79, output: "RSI_BENCHMARK_PREFLIGHT_FAILURE wrong harness image commit" }
 					}
-					assert.equal(command.split("/opt/headlesscode/src/cli.ts").length - 1, 1, "the benchmark coding worker command must execute exactly once")
+					assert.equal(command.split(" && exec ").length - 1, 1, "the benchmark coding worker command must execute exactly once after preflight")
 					if (mode === "worker-failure") return { exitCode: 1, output: "model process failed" }
 					if (mode === "source") {
 						fs.writeFileSync(path.join(guestPath, "src", "engine", "loop.ts"), "export const value = 2\n")
