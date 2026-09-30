@@ -170,6 +170,7 @@ await run("preflight")
 				assert.match(command, /RSI_BENCHMARK_VERIFIER_COMPLETED/)
 				assert.match(command, /readlink \/workspace\/node_modules/)
 				assert.match(command, /\/usr\/local\/bin\/node/)
+				assert.match(command, /HEADLESSCODE_BENCHMARK_TSX=\/opt\/headlesscode\/node_modules\/tsx\/dist\/cli\.mjs/)
 				assert.doesNotMatch(command, /ln -s .*\/workspace\/node_modules/)
 				assert.equal(fs.readFileSync(path.join(verifierGuest, "src", "candidate.js"), "utf8"), "export const value = 1\n")
 				return { exitCode: 1, output: "AssertionError: known-bad candidate\nRSI_BENCHMARK_VERIFIER_COMPLETED:1\n" }

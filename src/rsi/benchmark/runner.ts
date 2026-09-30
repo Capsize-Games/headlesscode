@@ -21,7 +21,7 @@ function safeRelative(value: string): boolean {
 export async function benchmarkTreeDigest(root: string): Promise<string> {
 	const entries: Array<{ path: string; mode: number; content: Buffer }> = []
 	const visit = async (directory: string, prefix: string): Promise<void> => {
-		for (const entry of (await fs.readdir(directory, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+		for (const entry of (await fs.readdir(directory, { withFileTypes: true })).sort((a, b) => Buffer.compare(Buffer.from(a.name, "utf8"), Buffer.from(b.name, "utf8")))) {
 			const relative = prefix ? `${prefix}/${entry.name}` : entry.name
 			if (!safeRelative(relative)) throw new Error(`unsafe benchmark fixture path: ${relative}`)
 			const absolute = path.join(directory, entry.name)
