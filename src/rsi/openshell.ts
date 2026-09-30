@@ -634,7 +634,7 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 			mutationTask(candidate, config),
 		].map(shellQuote).join(" ")
 		const boundaryChecks = [
-			"ln -s /opt/headlesscode/node_modules /workspace/node_modules",
+			"if test -L /workspace/node_modules; then :; else test ! -e /workspace/node_modules && ln -s /opt/headlesscode/node_modules /workspace/node_modules; fi",
 			'test "$(readlink /workspace/node_modules)" = /opt/headlesscode/node_modules',
 			"test -r /workspace/src/cli.ts",
 			"test -r /opt/headlesscode/tsconfig.json",

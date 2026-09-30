@@ -131,6 +131,7 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 					assert.equal(fs.existsSync(path.join(workspace, "package.json")), false, "candidate-controlled package metadata must not enter the mutation guest")
 					if (mode === "self-hosted-missing-cli") fs.rmSync(path.join(workspace, "src", "cli.ts"))
 					if (mode === "self-hosted-corrupt-cli") fs.writeFileSync(path.join(workspace, "src", "cli.ts"), "export const = ;\n")
+					if (mode === "self-hosted-corrupt-cli") fs.symlinkSync(path.join(trustedRuntimeRoot, "node_modules"), path.join(workspace, "node_modules"))
 					if (mode === "dependency-escape") fs.symlinkSync("/tmp/candidate-owned-node-modules", path.join(workspace, "node_modules"))
 					return { id: request.worktreeSpec.name, provider: "mock-openshell", address: workspace }
 				},
