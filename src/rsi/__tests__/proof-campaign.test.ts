@@ -13,7 +13,7 @@ import { openRouterAllocatedEnvironment, openRouterBrokerLimitsFromEnvironment, 
 import { readArchive, writeArchive } from "../archive.js"
 import { createProofCampaignManifest, proofBrokerCampaignId, reconcileProofCampaignJob, rebuildEvaluatedProofCampaignArchive, rebuildFinishedProofCampaignArchive } from "../controller.js"
 import { loadBenchmark, runBenchmark, type BenchmarkVerifier } from "../benchmark/runner.js"
-import type { BenchmarkAgent, BenchmarkImageIdentity, BenchmarkTask } from "../benchmark/types.js"
+import type { BenchmarkAgent, BenchmarkAttempt, BenchmarkImageIdentity, BenchmarkTask } from "../benchmark/types.js"
 import type { CandidateRecord, RsiConfig, RsiRunRecord } from "../types.js"
 
 const databaseUrl = process.env.HEADLESSCODE_RSI_TEST_DATABASE_URL
@@ -70,6 +70,34 @@ test("proof campaign retains uncertain dispatched spend and enforces one key per
 		assert.equal(Number((snapshot.campaign as Record<string, unknown>).reserved_calls), 1)
 		assert.equal(Number((snapshot.campaign as Record<string, unknown>).used_calls), 0)
 		assert.equal((await pool.query("SELECT count(*)::int AS count FROM headlesscode_rsi_proof_campaign_attempts WHERE campaign_id=$1", [frozen.campaignId])).rows[0]?.count, 1)
+	})
+})
+
+test("engineering-only proof pair finishes after development and freezes no confirmation cells", { skip: !databaseUrl }, async () => {
+	await withCampaign(async (campaign) => {
+		const campaignId = `engineering-${randomUUID()}`
+		const schedule: ProofCampaignManifest["schedule"] = ["fixed", "self"].map((armId) => ({ armId, generation: 0, candidateId: "g0-candidate-0", taskId: "mutation", seed: "seed-0", attemptKind: "mutation", phase: "development" }))
+		const frozen = manifest(campaignId, schedule)
+		frozen.phaseMode = "engineering-only"
+		frozen.benchmarkDigests.confirmation = createHash("sha256").update("[]").digest("hex")
+		frozen.settings = { phaseMode: "engineering-only", confirmationTaskIdentities: [] }
+		for (const armId of ["fixed", "self"]) {
+			const lease = await campaign.acquire(frozen, armId, `run-${armId}`, `coordinator-${armId}`)
+			const cell = schedule.find((entry) => entry.armId === armId)!
+			const attemptKey = `engineering-${armId}`
+			await admit(campaign, lease, cell, attemptKey)
+			await campaign.markDispatched(lease, attemptKey)
+			await campaign.settle(lease, attemptKey, { status: "completed", resultSha256: "9".repeat(64), actualCalls: 1, actualTokens: 10, actualSpendUsd: 0.001 })
+			await campaign.recordDecision(lease, { generation: 0, candidateId: cell.candidateId, parentId: "baseline", status: "accepted", childCommit: "b".repeat(40), parentCommit: frozen.rootCommit, proof: { developmentAccepted: true }, attemptKeys: [attemptKey] })
+			await campaign.selectGeneration(lease, 0, [cell.candidateId])
+			await campaign.finishDevelopmentArm(lease)
+		}
+		const snapshot = await campaign.snapshot(campaignId)
+		assert.equal((snapshot.campaign as Record<string, unknown>).state, "finished")
+		assert.ok((snapshot.arms as Array<Record<string, unknown>>).every((arm) => arm.state === "finished" && arm.phase === "development"))
+		assert.equal((snapshot.attempts as Array<Record<string, unknown>>).some((attempt) => attempt.attempt_kind === "confirmation"), false)
+		assert.equal((snapshot.events as Array<Record<string, unknown>>).filter((event) => event.event_type === "engineering-development-finished").length, 2)
+		await assert.rejects(() => campaign.acquire(frozen, "fixed", "run-fixed", "coordinator-reopen"), /finished/)
 	})
 })
 
@@ -143,6 +171,16 @@ test("controller freezes paired broker allocations as separate campaigns under o
 			assert.equal(frozen.budgets.root.maxTokens, 645_120, "root tokens sum effective task-specific grants rather than the base per-call defaults")
 			assert.equal(frozen.budgets.root.maxSpendUsd, 0.2, "root spend is the sum of every frozen provider-job reservation")
 			assert.equal(frozen.settings.taskWallBoundMs, 140_000, "the runtime plan sums mutation, required evaluation, development proof, and selected-final/root confirmation deadlines")
+			const engineering = createProofCampaignManifest({
+				config: { ...config, workerHarnessEngineeringOnly: true }, campaignId: `${campaignId}-engineering`, baseCommit: "f".repeat(40), model: RSI_OPENROUTER_MODEL, provider: "openshell-openrouter",
+				runtime: { imageName: "rsi:test", imageDigest: `sha256:${"9".repeat(64)}`, harnessCommit: "8".repeat(40), dependencyLockDigest: "7".repeat(64) },
+				developmentManifest, developmentManifestDigest: "4".repeat(64), plannedGenerations: 2, proofProtocol: protocol,
+			})
+			assert.equal(engineering.phaseMode, "engineering-only")
+			assert.ok(engineering.schedule.every((cell) => cell.phase === "development"), "engineering-only authority freezes no confirmation cells")
+			assert.deepEqual(engineering.settings.confirmationTaskIdentities, [], "engineering manifest carries no holdout task identities")
+			assert.equal(engineering.benchmarkDigests.confirmation, createHash("sha256").update("[]").digest("hex"), "engineering manifest records an empty confirmation schedule, not holdout task identities")
+			assert.notEqual(proofCampaignManifestDigest(engineering), proofCampaignManifestDigest(frozen), "phase mode and schedule are bound into the campaign identity")
 			assert.throws(() => createProofCampaignManifest({ config: { ...config, maxRuntimeMs: 139_999 }, campaignId: `${campaignId}-short`, baseCommit: "f".repeat(40), model: RSI_OPENROUTER_MODEL, provider: "openshell-openrouter", runtime: { imageName: "rsi:test", imageDigest: `sha256:${"9".repeat(64)}`, harnessCommit: "8".repeat(40), dependencyLockDigest: "7".repeat(64) }, developmentManifest, developmentManifestDigest: "4".repeat(64), plannedGenerations: 2, proofProtocol: protocol }), /below the summed frozen task-time ceiling/)
 			process.env.HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD = "0.19"
 			process.env.HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD = "0.04"
@@ -599,14 +637,51 @@ test("finished ledger rebuilds the final report from a reloaded active-run check
 		}
 		const run: RsiRunRecord = {
 			runId: "finished-run", startedAt: "2026-01-01T00:00:00.000Z", model: "test/model", baseRef: "main", baseCommit: "a".repeat(40),
-			generations: 1, candidates: [candidate], reports: [],
+			generations: 1, candidates: [candidate], reports: [], confirmationEvidence: "complete",
+			proofConfirmation: {
+				selectedHarness: { candidateId: candidate.id, slotId: "g0-candidate-0", generation: 0, commit: "b".repeat(40), attemptIds: ["confirm-selected"] },
+				rootHarness: { commit: "a".repeat(40), attemptIds: ["confirm-root"] },
+			},
 		}
 		const config = { archiveDir, regressionCommand: "npm test", evalCommands: [], hiddenEvalCommands: [], protectedPaths: [] } as unknown as RsiConfig
-		const frozen = manifest("finished-campaign", [{ armId: "fixed", generation: 0, candidateId: "g0-candidate-0", taskId: "mutation", seed: "seed-0", attemptKind: "mutation" }])
+		const confirmationSchedule: ProofCampaignManifest["schedule"] = [
+			{ armId: "fixed", generation: 0, candidateId: "g0-candidate-0", taskId: "confirm", seed: "seed-0", attemptKind: "confirmation", phase: "confirmation" },
+			{ armId: "fixed", generation: 0, candidateId: "root-control", taskId: "confirm", seed: "seed-0", attemptKind: "fixed-control", phase: "confirmation" },
+		]
+		const frozen = manifest("finished-campaign", confirmationSchedule)
+		const makeAttempt = (attemptId: string, candidateId: string, kind: "confirmation" | "fixed-control", commit: string): BenchmarkAttempt => ({
+			schemaVersion: 1, manifestDigest: "d".repeat(64), taskId: "confirm", split: "confirmation", attemptId, harnessCommit: commit,
+			agentImage: null, model: { provider: "mock", id: "test/model", sampling: {} }, seed: 1, family: "confirmation",
+			startDigest: "e".repeat(64), ceilings: { timeoutMs: 1000, maxCalls: 1, maxOutputTokensPerCall: 10, maxPatchBytes: 1000 },
+			verifiedSuccess: true, proofQualified: true, resourceAccounting: "supervisor-enforced", proofRequestSha256: "f".repeat(64),
+			inferenceReceipt: { provider: "openrouter", endpointProvider: "deepinfra", jobId: attemptId, campaignId: "finished-campaign:benchmark", model: "deepseek/deepseek-v4-flash-0731", returnedModels: ["deepseek/deepseek-v4-flash-0731"], returnedProviders: ["deepinfra"], calls: 1, promptTokens: 1, completionTokens: 1, totalTokens: 2, costUsd: 0.0001, accounting: "supervisor-enforced", qualified: true, callReceipts: [], denials: [] },
+			validity: "valid", calls: 1, tokens: 2, wallTimeMs: 10, stopReason: "completed", patchDigest: null,
+			evaluatorDigest: "a".repeat(64), artifactRefs: { stdout: createHash("sha256").update(attemptId + " stdout").digest("hex"), stderr: createHash("sha256").update(attemptId + " stderr").digest("hex") },
+		})
+		const selectedAttempt = makeAttempt("confirm-selected", "g0-candidate-0", "confirmation", "b".repeat(40))
+		const rootAttempt = makeAttempt("confirm-root", "root-control", "fixed-control", "a".repeat(40))
+		const confirmationAttempts = [selectedAttempt, rootAttempt]
+		for (const [attempt, candidateId, kind] of [[selectedAttempt, "g0-candidate-0", "confirmation"], [rootAttempt, "root-control", "fixed-control"]] as const) {
+			for (const [name, digest] of Object.entries(attempt.artifactRefs)) {
+				const bytes = Buffer.from(attempt.attemptId + (name === "stdout" ? " stdout" : " stderr"))
+				const artifact = path.join(archiveDir, "confirmation", frozen.campaignId, "fixed", candidateId, kind, "harness", attempt.harnessCommit, "artifacts", "sha256", digest.slice(0, 2), digest)
+				await fs.mkdir(path.dirname(artifact), { recursive: true })
+				await fs.writeFile(artifact, bytes)
+			}
+		}
+		run.confirmationAttempts = confirmationAttempts
 		const snapshot = {
 			campaign: { manifest_sha256: proofCampaignManifestDigest(frozen) },
 			arms: [{ arm_id: "fixed", run_id: run.runId, state: "finished", epoch: 3 }],
-			events: [{ sequence: 4, arm_id: "fixed", event_type: "generation-selected", payload: { generation: 0, selectedCandidateIds: ["g0-candidate-0"] } }],
+			events: [
+				{ sequence: 4, arm_id: "fixed", event_type: "generation-selected", payload: { generation: 0, selectedCandidateIds: ["g0-candidate-0"] } },
+				{ sequence: 5, arm_id: "fixed", event_type: "final-harness-selected", payload: { generation: 0, candidateId: "g0-candidate-0", commit: "b".repeat(40) } },
+			],
+			attempts: confirmationAttempts.map((attempt, index) => ({
+				arm_id: "fixed", generation: 0, candidate_id: index === 0 ? "g0-candidate-0" : "root-control", task_id: "confirm", seed: "seed-0",
+				attempt_kind: index === 0 ? "confirmation" : "fixed-control", status: "completed", broker_job_id: attempt.attemptId,
+				result_sha256: createHash("sha256").update(JSON.stringify(attempt)).digest("hex"), artifact_refs: Object.fromEntries(Object.entries(attempt.artifactRefs).map(([name, digest]) => [name, { sha256: digest }])),
+			})),
 		}
 		await writeArchive(archiveDir, { schemaVersion: 2, updatedAt: run.startedAt, runs: [], activeRuns: [run], candidates: [candidate], modelCandidates: [], combinations: [], jobs: [], trajectoryRefs: [], curriculumTasks: [] })
 		const checkpoint = await readArchive(archiveDir)

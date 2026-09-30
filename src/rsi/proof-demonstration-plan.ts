@@ -9,6 +9,8 @@ export interface ProofDemonstrationPlan {
 	campaign: ProofDemonstrationArmPlan
 	totalReservedSpendUsd: number
 	totalRootSpendCeilingUsd: number
+	engineeringRootSpendCeilingUsd: number
+	campaignRootsSpendCeilingUsd: number
 	totalPriceDerivedSpendCeilingUsd: number
 	totalRootPriceDerivedSpendCeilingUsd: number
 	totalCalls: number
@@ -23,7 +25,7 @@ export interface ProofDemonstrationArmPlan {
 	verificationJobs: number
 	developmentProofCells: number
 	confirmationScheduleCells: number
-	confirmationDisposition: "pre-registered-deferred" | "executed-after-development"
+	confirmationDisposition: "not-frozen-until-engineering-passes" | "executed-after-development"
 	confirmationNotSelectedCells: number
 	paidConfirmationCells: number
 	rootControlCells: number
@@ -92,9 +94,9 @@ export function planProofDemonstrationArm(args: {
 	const candidateConfirmationCells = candidateSlotsBothArms * confirmation.length
 	const paidConfirmationCells = args.phase === "campaign" ? 2 * confirmation.length : 0
 	const rootControlCells = args.phase === "campaign" ? 2 * confirmation.length : 0
-	const deferredConfirmationReservationCells = args.phase === "engineering" ? 4 * confirmation.length : 0
+	const deferredConfirmationReservationCells = 0
 	const confirmationNotSelectedCells = args.phase === "campaign" ? candidateConfirmationCells - paidConfirmationCells : 0
-	const confirmationScheduleCells = candidateConfirmationCells + 2 * confirmation.length
+	const confirmationScheduleCells = args.phase === "campaign" ? candidateConfirmationCells + 2 * confirmation.length : 0
 	const mutationCalls = mutationJobs * args.mutationLimits.maxCalls
 	const mutationTokensPerJob = Math.min(args.mutationLimits.maxTotalTokens, args.mutationLimits.maxCalls * (args.mutationLimits.maxInputTokensPerCall + args.mutationLimits.maxOutputTokensPerCall))
 	const mutationPriceMicros = assertPriceFeasible("mutation", args.mutationLimits.maxCalls, args.mutationLimits.maxOutputTokensPerCall, args.mutationLimits)
@@ -116,11 +118,6 @@ export function planProofDemonstrationArm(args: {
 	priceDerivedSpendMicros += proofRoles * devPriceMicrosPerRole
 	rootSpendMicros = reservedSpendMicros
 	rootPriceSpendMicros = priceDerivedSpendMicros
-	if (args.phase === "engineering") {
-		const deferredFinalAndRoot = 4 * confirmation.length
-		rootSpendMicros += deferredFinalAndRoot * microsCeil(args.benchmarkLimits.maxJobSpendUsd)
-		rootPriceSpendMicros += confirmation.reduce((sum, task) => sum + taskPrice(task), 0) * 4
-	}
 	if (args.phase === "campaign") {
 		const finalAndRoot = 4 // selected final and root control, in both arms
 		const confirmationCalls = confirmation.reduce((sum, task) => sum + taskCalls(task), 0) * finalAndRoot
@@ -138,12 +135,12 @@ export function planProofDemonstrationArm(args: {
 	return {
 		phase: args.phase, generations: args.generations, population: args.population,
 		mutationJobs, verificationJobs, developmentProofCells, confirmationScheduleCells,
-		confirmationDisposition: args.phase === "campaign" ? "executed-after-development" : "pre-registered-deferred",
+		confirmationDisposition: args.phase === "campaign" ? "executed-after-development" : "not-frozen-until-engineering-passes",
 		confirmationNotSelectedCells, paidConfirmationCells, rootControlCells, deferredConfirmationReservationCells,
 		maximumCalls, maximumTokens, reservedSpendUsd: fromMicros(reservedSpendMicros),
 		rootSpendCeilingUsd: fromMicros(rootSpendMicros), priceDerivedSpendCeilingUsd: fromMicros(priceDerivedSpendMicros),
 		rootPriceDerivedSpendCeilingUsd: fromMicros(rootPriceSpendMicros), taskWallBoundMs,
-		developmentTaskIds: development.map((task) => task.id), confirmationTaskIds: confirmation.map((task) => task.id),
+		developmentTaskIds: development.map((task) => task.id), confirmationTaskIds: args.phase === "campaign" ? confirmation.map((task) => task.id) : [],
 	}
 }
 
@@ -158,6 +155,8 @@ export function planProofDemonstration(args: {
 	return {
 		engineering, campaign,
 		totalReservedSpendUsd: fromMicros(microsCeil(engineering.reservedSpendUsd) + 3 * microsCeil(campaign.reservedSpendUsd)),
+		engineeringRootSpendCeilingUsd: fromMicros(microsCeil(engineering.rootSpendCeilingUsd)),
+		campaignRootsSpendCeilingUsd: fromMicros(3 * microsCeil(campaign.rootSpendCeilingUsd)),
 		totalRootSpendCeilingUsd: fromMicros(microsCeil(engineering.rootSpendCeilingUsd) + 3 * microsCeil(campaign.rootSpendCeilingUsd)),
 		totalPriceDerivedSpendCeilingUsd: fromMicros(microsCeil(engineering.priceDerivedSpendCeilingUsd) + 3 * microsCeil(campaign.priceDerivedSpendCeilingUsd)),
 		totalRootPriceDerivedSpendCeilingUsd: fromMicros(microsCeil(engineering.rootPriceDerivedSpendCeilingUsd) + 3 * microsCeil(campaign.rootPriceDerivedSpendCeilingUsd)),
@@ -165,4 +164,18 @@ export function planProofDemonstration(args: {
 		totalTokens: engineering.maximumTokens + 3 * campaign.maximumTokens,
 		totalTaskWallMs: engineering.taskWallBoundMs + 3 * campaign.taskWallBoundMs,
 	}
+}
+
+function canonical(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(canonical)
+	if (value && typeof value === "object") return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+		.filter(([, item]) => item !== undefined)
+		.sort(([a], [b]) => Buffer.compare(Buffer.from(a), Buffer.from(b)))
+		.map(([key, item]) => [key, canonical(item)]))
+	return value
+}
+
+export function assertFrozenProofDemonstrationPlanMatches(frozen: ProofDemonstrationPlan, args: Parameters<typeof planProofDemonstration>[0]): void {
+	const recomputed = planProofDemonstration(args)
+	if (JSON.stringify(canonical(frozen)) !== JSON.stringify(canonical(recomputed))) throw new Error("frozen proof budget plan differs from the recomputed schedule and resource ceilings")
 }

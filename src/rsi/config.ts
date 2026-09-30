@@ -126,6 +126,7 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 	let workerHarnessMode: WorkerHarnessMode | undefined
 	let workerHarnessPhase: "development" | "confirmation" = "development"
 	let workerHarnessPairId: string | undefined
+	let workerHarnessEngineeringOnly = false
 	let proofMinimumNetWins = DEFAULT_DEVELOPMENT_PROOF_RULE.minimumNetWins
 	let proofRetentionTaskIds = [...DEFAULT_DEVELOPMENT_PROOF_RULE.retentionTaskIds]
 	let proofRetentionWasConfigured = false
@@ -298,6 +299,9 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 					index = next
 					break
 				}
+				case "--worker-harness-engineering-only":
+					workerHarnessEngineeringOnly = true
+					break
 				case "--proof-min-net-wins": {
 					const [value, next] = take(index, arg)
 					proofMinimumNetWins = positiveInteger(value, arg)
@@ -378,6 +382,8 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 					throw new Error(`unknown improve argument: ${arg}`)
 			}
 		}
+		if (workerHarnessEngineeringOnly && (!workerHarnessMode || !workerHarnessPairId)) throw new Error("--worker-harness-engineering-only requires an explicit paired campaign ID and arm")
+		if (workerHarnessEngineeringOnly && workerHarnessPhase !== "development") throw new Error("engineering-only worker harness runs support only the development phase")
 		const resolvedRepo = path.resolve(repoRoot)
 		const adaptiveTrajectories = maxTrajectories ?? population + 1
 		const adaptiveIterations = maxTotalIterations ?? maxIterations * adaptiveTrajectories
@@ -428,6 +434,7 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 				...(workerHarnessMode ? { workerHarnessMode } : {}),
 				...(workerHarnessMode ? { workerHarnessPhase } : {}),
 				...(workerHarnessPairId ? { workerHarnessPairId } : {}),
+				...(workerHarnessPairId && workerHarnessEngineeringOnly ? { workerHarnessEngineeringOnly: true } : {}),
 			},
 		}
 	} catch (error) {

@@ -246,7 +246,10 @@ OpenRouter is available for RSI fleet mutations and the development benchmark
 when the worker role is configured with
 `HEADLESSCODE_RSI_ROLE_WORKER_PROVIDER=openrouter` and
 `HEADLESSCODE_RSI_ROLE_WORKER_MODEL=deepseek/deepseek-v4-flash-0731`. The model
-is pinned to DeepSeek's OpenRouter endpoint with fallback routing disabled.
+is routed through OpenRouter's available DeepInfra fp8 endpoint
+(`deepinfra/fp8`) with fallback routing disabled. The broker checks endpoint
+metadata and requires the returned selected-provider metadata to identify
+DeepInfra before qualifying usage.
 Include `REMOTE_API` in `HEADLESSCODE_RSI_WORKER_RESOURCE_CLASSES` for workers
 that claim brokered calls; Ollama workers continue to claim `LOCAL_GPU`.
 Workers need the host-side `HEADLESSCODE_OPENROUTER_API_KEY` and
@@ -311,15 +314,66 @@ benchmark inference use distinct broker campaign IDs derived from the shared
 proof campaign ID, so their allocation caps remain separate while their
 reservations count against the one PostgreSQL proof-campaign root ceiling.
 
-The current controller completes only the development phase. It records the
-arm as `evaluated` and releases its lease without finishing the proof campaign.
-A later confirmation phase can reacquire the same arm and use only the
-predeclared cells. Every selected final candidate and each root-control
-comparison must complete; each unused final candidate slot must be recorded
-with the zero-spend `not-selected` disposition. Only then may `finishArm`
-mark that arm terminal. Confirmation execution is not yet wired into the
-controller; until that work is added, these campaigns remain development-only
-and are not complete proof results.
+The demonstration launcher separates engineering from holdout planning. The
+engineering run freezes development-only cells and runs both arms for two
+generations. It must record an accepted generation-zero self-hosted candidate
+and an accepted generation-one child whose worker execution used that exact
+parent commit. The fixed-control arm must also reach a terminal generation-one
+decision. Only after these checks pass may the operator create the final plan;
+that plan binds the engineering evidence and freezes the three confirmation
+campaigns. Engineering-only manifests contain no confirmation task IDs or
+confirmation schedule cells.
+
+Use the staged commands below from a clean checkout with the exact fixed and
+self-hosted harness image identities configured. Estimate and plan fetch only
+the pinned endpoint's read-only price metadata. Execution requires PostgreSQL,
+OpenShell, the broker, the model key on the supervisor, finite per-role
+allocations, and a separately reviewed operator cap. No production inference
+has been run as part of this implementation.
+
+```sh
+# Review the engineering-only schedule and live price before choosing a cap.
+npm run rsi:proof-demonstration -- engineering --repo "$PWD" --seed "$ENGINEERING_SEED"
+
+# Run the two-generation engineering pair. The cap must cover this root's
+# frozen reservation and fit the configured mutation + benchmark allocations.
+npm run rsi:proof-demonstration -- engineering --repo "$PWD" --seed "$ENGINEERING_SEED" \
+  --operator-cap-usd "$ENGINEERING_CAP_USD" --execute
+
+# Freeze three new campaign seeds only after the engineering evidence passes.
+npm run rsi:proof-demonstration -- plan --repo "$PWD" \
+  --engineering-evidence .headlesscode/rsi-proof/engineering-evidence.json \
+  --operator-cap-usd "$CAMPAIGN_CAP_USD" --seed "$ENGINEERING_SEED" \
+  --campaign-seed "$CAMPAIGN_SEED_A" --campaign-seed "$CAMPAIGN_SEED_B" \
+  --campaign-seed "$CAMPAIGN_SEED_C" --out .headlesscode/rsi-proof/frozen-plan.json
+
+# Verify the frozen identities and cap, execute all three paired development
+# and confirmation campaigns, then write JSON and Markdown analysis reports.
+npm run rsi:proof-demonstration -- verify --repo "$PWD" --plan .headlesscode/rsi-proof/frozen-plan.json
+npm run rsi:proof-demonstration -- execute --repo "$PWD" --plan .headlesscode/rsi-proof/frozen-plan.json \
+  --operator-cap-usd "$CAMPAIGN_CAP_USD" --execute
+npm run rsi:proof-demonstration -- analyze --repo "$PWD" --plan .headlesscode/rsi-proof/frozen-plan.json \
+  --archive .headlesscode/rsi
+```
+
+The engineering command binds each campaign arm to a deterministic
+campaign-and-arm run ID. A restart reuses a finished arm's verified archive
+record or resumes the same active identity; an archived incomplete arm is
+rejected. Final campaign execution likewise reuses terminal arm records and
+will not dispatch a second attempt for an already completed cell. A crash
+after broker dispatch but before a verified result artifact remains uncertain
+and fails closed under the PostgreSQL ledger; it is not retried automatically.
+Each final campaign's cap is checked against its frozen root reservation, and
+the command's supplied cap must exactly match the value in the plan. The
+engineering cap is separate from the final plan's cap for the three campaigns.
+
+Analysis verifies the three paired terminal campaign records, frozen
+manifest/config/model/runtime identities, each confirmation schedule cell,
+the selected-parent lineage, broker receipts, artifact digests, and PostgreSQL
+root accounting. Missing, unqualified, or altered evidence yields
+`inconclusive`; a completed set that misses the frozen improvement gates yields
+`not-demonstrated`. A demonstration verdict is not a release or promotion
+action.
 
 To exercise the worker image and guest network boundary without a production
 provider credential or paid request, build the exact current harness image

@@ -77,12 +77,14 @@ export function createProofCampaignManifest(args: {
 	plannedGenerations: number
 	proofProtocol: NonNullable<RsiRunRecord["developmentProofProtocol"]>
 }): ProofCampaignManifest {
+	const engineeringOnly = args.config.workerHarnessEngineeringOnly === true
+	if (engineeringOnly && args.config.workerHarnessPhase === "confirmation") throw new Error("engineering-only proof runs cannot enter confirmation")
 	if (args.provider !== "openshell-openrouter") throw new Error("restart-safe proof campaigns require supervisor-accounted OpenRouter inference")
 	if (args.config.computePolicy === "adaptive-independent") throw new Error("restart-safe proof campaigns require every frozen generation to run; adaptive early-stop is not admitted")
 	const benchmarkTasks = args.developmentManifest.tasks.filter((task) => task.split === "development")
 	const confirmationTasks = args.developmentManifest.tasks.filter((task) => task.split === "confirmation")
-	if (!benchmarkTasks.length || !confirmationTasks.length) throw new Error("proof campaign requires nonempty development and confirmation benchmark splits")
-	if (RSI_CONFIRMATION_RETENTION_TASK_IDS.some((taskId) => !confirmationTasks.some((task) => task.id === taskId))) throw new Error("frozen benchmark manifest is missing a preregistered confirmation retention task")
+	if (!benchmarkTasks.length || (!engineeringOnly && !confirmationTasks.length)) throw new Error("proof campaign requires nonempty development tasks and, unless engineering-only, confirmation tasks")
+	if (!engineeringOnly && RSI_CONFIRMATION_RETENTION_TASK_IDS.some((taskId) => !confirmationTasks.some((task) => task.id === taskId))) throw new Error("frozen benchmark manifest is missing a preregistered confirmation retention task")
 	const taskDigest = (tasks: typeof args.developmentManifest.tasks) => createHash("sha256").update(JSON.stringify(tasks)).digest("hex")
 	const mutationCampaignId = proofBrokerCampaignId(args.campaignId, "mutation")
 	const benchmarkCampaignId = proofBrokerCampaignId(args.campaignId, "benchmark")
@@ -100,7 +102,7 @@ export function createProofCampaignManifest(args: {
 	}
 	if (jobCostCeiling(mutationLimits, mutationLimits.maxCalls, mutationLimits.maxOutputTokensPerCall) > mutationLimits.maxJobSpendUsd) throw new Error("OpenRouter mutation job spend cap is below its admitted token and price ceilings")
 	for (const task of benchmarkTasks) if (jobCostCeiling(benchmarkLimits, task.ceilings.maxCalls, task.ceilings.maxOutputTokensPerCall) > benchmarkLimits.maxJobSpendUsd) throw new Error(`OpenRouter benchmark job spend cap is below the frozen token and price ceiling for ${task.id}`)
-	for (const task of confirmationTasks) if (jobCostCeiling(confirmationLimits, task.ceilings.maxCalls, task.ceilings.maxOutputTokensPerCall) > confirmationLimits.maxJobSpendUsd) throw new Error(`OpenRouter confirmation job spend cap is below the frozen token and price ceiling for ${task.id}`)
+	if (!engineeringOnly) for (const task of confirmationTasks) if (jobCostCeiling(confirmationLimits, task.ceilings.maxCalls, task.ceilings.maxOutputTokensPerCall) > confirmationLimits.maxJobSpendUsd) throw new Error(`OpenRouter confirmation job spend cap is below the frozen token and price ceiling for ${task.id}`)
 	const candidateCounts = Array.from({ length: args.plannedGenerations }, (_, generation) => args.config.computePolicy === "adaptive-independent" && generation > 0 ? 1 : args.config.population)
 	const schedule: ProofCampaignManifest["schedule"] = []
 	for (const armId of ["fixed-control", "self-hosted"]) for (let generation = 0; generation < args.plannedGenerations; generation++) {
@@ -114,19 +116,19 @@ export function createProofCampaignManifest(args: {
 		}
 	}
 	const finalGeneration = args.plannedGenerations - 1
-	for (const armId of ["fixed-control", "self-hosted"]) {
+	if (!engineeringOnly) for (const armId of ["fixed-control", "self-hosted"]) {
 		for (let generation = 0; generation < args.plannedGenerations; generation++) {
 			for (let index = 0; index < candidateCounts[generation]!; index++) for (const task of confirmationTasks) schedule.push({ armId, generation, candidateId: proofCandidateSlot(generation, index), taskId: task.id, seed: String(task.seed), attemptKind: "confirmation", phase: "confirmation" })
 		}
 		for (const task of confirmationTasks) schedule.push({ armId, generation: finalGeneration, candidateId: "root-control", taskId: task.id, seed: String(task.seed), attemptKind: "fixed-control", phase: "confirmation" })
 	}
 	const developmentCallsPerProofRole = benchmarkTasks.reduce((sum, task) => sum + task.ceilings.maxCalls, 0)
-	const confirmationCalls = 4 * confirmationTasks.reduce((sum, task) => sum + task.ceilings.maxCalls, 0) // selected final and root-control, for both arms
+	const confirmationCalls = engineeringOnly ? 0 : 4 * confirmationTasks.reduce((sum, task) => sum + task.ceilings.maxCalls, 0) // selected final and root-control, for both arms
 	const rootCalls = 2 * candidateCounts.reduce((sum, count) => sum + count * (mutationLimits.maxCalls + 3 * developmentCallsPerProofRole), 0) + confirmationCalls
 	const developmentTokensPerProofRole = benchmarkTasks.reduce((sum, task) => sum + Math.min(benchmarkLimits.maxTotalTokens, task.ceilings.maxCalls * (benchmarkLimits.maxInputTokensPerCall + task.ceilings.maxOutputTokensPerCall)), 0)
 	const confirmationTokensPerHarness = confirmationTasks.reduce((sum, task) => sum + Math.min(confirmationLimits.maxTotalTokens, task.ceilings.maxCalls * (confirmationLimits.maxInputTokensPerCall + task.ceilings.maxOutputTokensPerCall)), 0)
 	const mutationTokens = Math.min(mutationLimits.maxTotalTokens, mutationLimits.maxCalls * (mutationLimits.maxInputTokensPerCall + mutationLimits.maxOutputTokensPerCall))
-	const rootTokens = 2 * candidateCounts.reduce((sum, count) => sum + count * (mutationTokens + 3 * developmentTokensPerProofRole), 0) + 4 * confirmationTokensPerHarness
+	const rootTokens = 2 * candidateCounts.reduce((sum, count) => sum + count * (mutationTokens + 3 * developmentTokensPerProofRole), 0) + (engineeringOnly ? 0 : 4 * confirmationTokensPerHarness)
 	if (!Number.isSafeInteger(rootCalls) || !Number.isSafeInteger(rootTokens)) throw new Error("proof campaign root call or token ceiling exceeds safe integer accounting")
 	const spendAllocation = Number(process.env.HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD)
 	if (!Number.isFinite(spendAllocation) || spendAllocation <= 0) throw new Error("HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD is required for a bounded proof campaign")
@@ -135,26 +137,26 @@ export function createProofCampaignManifest(args: {
 	const slotsPerArm = candidateCounts.reduce((sum, count) => sum + count, 0)
 	const mutationReservationsUsd = 2 * slotsPerArm * mutationLimits.maxJobSpendUsd
 	const developmentReservationsUsd = 2 * slotsPerArm * 3 * benchmarkTasks.length * benchmarkLimits.maxJobSpendUsd
-	const confirmationReservationsUsd = 4 * confirmationTasks.length * confirmationLimits.maxJobSpendUsd
+	const confirmationReservationsUsd = engineeringOnly ? 0 : 4 * confirmationTasks.length * confirmationLimits.maxJobSpendUsd
 	const requiredBenchmarkUsd = developmentReservationsUsd + confirmationReservationsUsd
 	if (openRouterBrokerLimitsFromEnvironment(openRouterAllocatedEnvironment(process.env, "mutation"), mutationCampaignId).maxCampaignSpendUsd < mutationReservationsUsd) throw new Error("mutation broker campaign allocation is below the sum of frozen mutation job reservations")
-	if (benchmarkLimits.maxCampaignSpendUsd < requiredBenchmarkUsd) throw new Error("benchmark broker campaign allocation is below development plus selected-final/root confirmation job reservations")
+	if (benchmarkLimits.maxCampaignSpendUsd < requiredBenchmarkUsd) throw new Error(engineeringOnly ? "benchmark broker campaign allocation is below development proof job reservations" : "benchmark broker campaign allocation is below development plus selected-final/root confirmation job reservations")
 	if (totalBudgetUsd < mutationReservationsUsd + requiredBenchmarkUsd) throw new Error("proof campaign role allocations cannot fund every frozen provider job reservation")
-	const taskWallBoundMs = proofCampaignTaskWallBoundMs(args.config, args.plannedGenerations, benchmarkTasks, confirmationTasks)
+	const taskWallBoundMs = proofCampaignTaskWallBoundMs(args.config, args.plannedGenerations, benchmarkTasks, confirmationTasks, !engineeringOnly)
 	const maxRuntimeMs = args.config.maxRuntimeMs ?? 60 * 60_000
 	if (maxRuntimeMs < taskWallBoundMs) throw new Error(`proof campaign runtime ceiling ${maxRuntimeMs}ms is below the summed frozen task-time ceiling ${taskWallBoundMs}ms`)
 	return {
-		schemaVersion: 1, campaignId: args.campaignId, rootCommit: args.baseCommit,
-		benchmarkDigests: { manifest: args.developmentManifestDigest, development: taskDigest(benchmarkTasks), confirmation: taskDigest(confirmationTasks) },
+		schemaVersion: 1, phaseMode: engineeringOnly ? "engineering-only" : "paired-confirmation", campaignId: args.campaignId, rootCommit: args.baseCommit,
+		benchmarkDigests: { manifest: args.developmentManifestDigest, development: taskDigest(benchmarkTasks), confirmation: taskDigest(engineeringOnly ? [] : confirmationTasks) },
 		armAssignment: { fixedControl: "fixed-control", selfHosted: "self-hosted" },
 		model: { provider: args.provider, id: args.model, settings: { sampling: args.proofProtocol.model.sampling, roles: args.config.roles ?? {}, maxIterations: args.config.maxIterations, maxTokens: args.config.maxTokens ?? null } },
-		seed: args.config.seed, taskOrder: ["mutation", "regression", "typecheck", ...args.config.evalCommands.map((_, index) => `visible-${index}`), ...benchmarkTasks.map((task) => task.id), ...confirmationTasks.map((task) => task.id)], schedule,
+		seed: args.config.seed, taskOrder: ["mutation", "regression", "typecheck", ...args.config.evalCommands.map((_, index) => `visible-${index}`), ...benchmarkTasks.map((task) => task.id), ...(engineeringOnly ? [] : confirmationTasks.map((task) => task.id))], schedule,
 		budgets: {
-			attempt: { maxCalls: Math.max(mutationLimits.maxCalls, benchmarkLimits.maxCalls, confirmationLimits.maxCalls), maxTokens: Math.max(mutationLimits.maxTotalTokens, benchmarkLimits.maxTotalTokens, confirmationLimits.maxTotalTokens), maxSpendUsd: Math.max(mutationLimits.maxJobSpendUsd, benchmarkLimits.maxJobSpendUsd, confirmationLimits.maxJobSpendUsd), maxDurationMs: Math.max(args.config.commandTimeoutMs, ...benchmarkTasks.map((task) => task.ceilings.timeoutMs), ...confirmationTasks.map((task) => task.ceilings.timeoutMs)) },
+			attempt: { maxCalls: Math.max(mutationLimits.maxCalls, benchmarkLimits.maxCalls, ...(!engineeringOnly ? [confirmationLimits.maxCalls] : [])), maxTokens: Math.max(mutationLimits.maxTotalTokens, benchmarkLimits.maxTotalTokens, ...(!engineeringOnly ? [confirmationLimits.maxTotalTokens] : [])), maxSpendUsd: Math.max(mutationLimits.maxJobSpendUsd, benchmarkLimits.maxJobSpendUsd, ...(!engineeringOnly ? [confirmationLimits.maxJobSpendUsd] : [])), maxDurationMs: Math.max(args.config.commandTimeoutMs, ...benchmarkTasks.map((task) => task.ceilings.timeoutMs), ...(!engineeringOnly ? confirmationTasks.map((task) => task.ceilings.timeoutMs) : [])) },
 			root: { maxCalls: rootCalls, maxTokens: rootTokens, maxSpendUsd: Math.min(spendAllocation, totalBudgetUsd, mutationReservationsUsd + requiredBenchmarkUsd), maxRuntimeMs },
 		},
-			acceptanceRule: { ...args.proofProtocol.rule, confirmationRetentionTaskIds: [...RSI_CONFIRMATION_RETENTION_TASK_IDS], minimumSelfHostedCampaigns: 2, requiredSuccessiveTransitions: 2, clusterConfidence: 0.9 }, runtime: { imageDigest: args.runtime.imageDigest, harnessCommit: args.runtime.harnessCommit, dependencyLockDigest: args.runtime.dependencyLockDigest },
-		analysisVersion: args.proofProtocol.schemaVersion.toString(), settings: { configDigest: workerHarnessConfigDigest(args.config, { baseCommit: args.baseCommit, model: args.model, provider: args.provider, proofProtocolDigest: args.proofProtocol.protocolDigest }), candidateCounts, taskWallBoundMs, evaluationCells: ["regression", "typecheck", ...args.config.evalCommands.map((_, index) => `visible-${index}`)], developmentTaskIdentities: benchmarkTasks.map((task) => ({ id: task.id, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings })), confirmationTaskIdentities: confirmationTasks.map((task) => ({ id: task.id, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings })), inferenceCeilings: { maxInputTokensPerCall: benchmarkLimits.maxInputTokensPerCall, maxOutputTokensPerCall: benchmarkLimits.maxOutputTokensPerCall, maxCallsPerAttempt: benchmarkLimits.maxCalls, maxTotalTokens: benchmarkLimits.maxTotalTokens, maxCallSpendUsd: benchmarkLimits.maxCallSpendUsd, maxJobSpendUsd: benchmarkLimits.maxJobSpendUsd, maxInputPricePerMillionUsd: benchmarkLimits.maxInputPricePerMillionUsd, maxOutputPricePerMillionUsd: benchmarkLimits.maxOutputPricePerMillionUsd }, inferenceCampaignIds: { mutation: mutationCampaignId, benchmark: benchmarkCampaignId }, inferenceAllocationsUsd: { mutation: mutationLimits.maxCampaignSpendUsd, benchmark: benchmarkLimits.maxCampaignSpendUsd } },
+		acceptanceRule: { ...args.proofProtocol.rule, confirmationRetentionTaskIds: engineeringOnly ? [] : [...RSI_CONFIRMATION_RETENTION_TASK_IDS], minimumSelfHostedCampaigns: 2, requiredSuccessiveTransitions: 2, clusterConfidence: 0.9 }, runtime: { imageDigest: args.runtime.imageDigest, harnessCommit: args.runtime.harnessCommit, dependencyLockDigest: args.runtime.dependencyLockDigest },
+		analysisVersion: args.proofProtocol.schemaVersion.toString(), settings: { phaseMode: engineeringOnly ? "engineering-only" : "paired-confirmation", configDigest: workerHarnessConfigDigest(args.config, { baseCommit: args.baseCommit, model: args.model, provider: args.provider, proofProtocolDigest: args.proofProtocol.protocolDigest }), effectiveConfig: Object.fromEntries(Object.entries(args.config).filter(([key]) => !["workerHarnessMode", "workerHarnessPhase", "workerHarnessEngineeringOnly", "workerHarnessPairId", "workerHarnessRunId", "resumeRunId", "candidateIdNamespace", "workerHarnessParentCommit", "workerHarnessSnapshotTreeDigest"].includes(key))), candidateCounts, taskWallBoundMs, evaluationCells: ["regression", "typecheck", ...args.config.evalCommands.map((_, index) => `visible-${index}`)], developmentTaskIdentities: benchmarkTasks.map((task) => ({ id: task.id, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings })), confirmationTaskIdentities: engineeringOnly ? [] : confirmationTasks.map((task) => ({ id: task.id, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings })), inferenceCeilings: { maxInputTokensPerCall: benchmarkLimits.maxInputTokensPerCall, maxOutputTokensPerCall: benchmarkLimits.maxOutputTokensPerCall, maxCallsPerAttempt: benchmarkLimits.maxCalls, maxTotalTokens: benchmarkLimits.maxTotalTokens, maxCallSpendUsd: benchmarkLimits.maxCallSpendUsd, maxJobSpendUsd: benchmarkLimits.maxJobSpendUsd, maxInputPricePerMillionUsd: benchmarkLimits.maxInputPricePerMillionUsd, maxOutputPricePerMillionUsd: benchmarkLimits.maxOutputPricePerMillionUsd }, inferenceCampaignIds: { mutation: mutationCampaignId, benchmark: benchmarkCampaignId }, inferenceAllocationsUsd: { mutation: mutationLimits.maxCampaignSpendUsd, benchmark: benchmarkLimits.maxCampaignSpendUsd } },
 	}
 }
 
@@ -186,6 +188,10 @@ export async function rebuildFinishedProofCampaignArchive(args: {
 	const expectedDigest = proofCampaignManifestDigest(args.manifest)
 	if (!campaign || !arm || arm.state !== "finished" || String(campaign.manifest_sha256).trim() !== expectedDigest) throw new Error("finished proof campaign snapshot does not match the frozen manifest and arm")
 	if (arm.run_id !== args.run.runId || args.run.candidates.some((candidate) => !isTerminal(candidate))) throw new Error("finished proof campaign arm cannot rebuild an incomplete or foreign run archive")
+	if (args.manifest.phaseMode === "engineering-only") {
+		const events = args.snapshot.events as Array<Record<string, unknown>> | undefined
+		if (!events?.some((event) => event.arm_id === args.armId && event.event_type === "engineering-development-finished") || args.run.proofConfirmation || args.run.confirmationAttempts?.length) throw new Error("engineering-only recovery must have a terminal development event and no confirmation evidence")
+	} else await verifyFinishedConfirmationCheckpoint(args.run, args.config.archiveDir, args.snapshot, args.manifest, args.armId)
 	args.run.proofCampaign = { manifest: args.manifest, manifestSha256: expectedDigest, campaignId: args.manifest.campaignId, armId: args.armId, epoch: Number(arm.epoch), state: "finished", ledgerSnapshot: args.snapshot }
 	const selections = (args.snapshot.events as Array<Record<string, unknown>>).filter((event) => event.arm_id === args.armId && event.event_type === "generation-selected").sort((left, right) => Number(left.sequence) - Number(right.sequence))
 	const finalSelection = selections.at(-1)?.payload as { generation?: number; selectedCandidateIds?: string[] } | undefined
@@ -204,6 +210,41 @@ export async function rebuildFinishedProofCampaignArchive(args: {
 	args.run.reports = [...new Set([...args.run.reports, recoveredReportPath])]
 	await appendRun(args.config.archiveDir, args.run)
 	return args.run
+}
+
+async function verifyFinishedConfirmationCheckpoint(run: RsiRunRecord, archiveDir: string, snapshot: Record<string, unknown>, manifest: ProofCampaignManifest, armId: string): Promise<void> {
+	const events = snapshot.events as Array<Record<string, unknown>> | undefined
+	const attempts = snapshot.attempts as Array<Record<string, unknown>> | undefined
+	const selection = events?.filter((event) => event.arm_id === armId && event.event_type === "final-harness-selected")
+	const payload = selection?.length === 1 ? selection[0]!.payload as { generation?: number; candidateId?: string; commit?: string } : undefined
+	const saved = run.proofConfirmation
+	if (!payload || !saved || saved.selectedHarness.slotId !== payload.candidateId || saved.selectedHarness.generation !== payload.generation || saved.selectedHarness.commit !== payload.commit || saved.rootHarness.commit !== manifest.rootCommit || run.confirmationEvidence !== "complete") throw new Error("finished campaign recovery requires a matching checkpointed final-harness selection and confirmation result")
+	const cells = manifest.schedule.filter((cell) => cell.armId === armId && cell.phase === "confirmation" && (cell.candidateId === "root-control" || (cell.candidateId === payload.candidateId && cell.generation === payload.generation)))
+	const byCandidateKind = (candidateId: string, kind: string) => cells.filter((cell) => cell.candidateId === candidateId && cell.attemptKind === kind)
+	const selectedRows = byCandidateKind(String(payload.candidateId), payload.candidateId === "root-control" ? "fixed-control" : "confirmation")
+	const rootRows = byCandidateKind("root-control", "fixed-control")
+	const rowFor = (cell: typeof cells[number]) => attempts?.filter((row) => row.arm_id === armId && Number(row.generation) === cell.generation && row.candidate_id === cell.candidateId && row.task_id === cell.taskId && row.seed === cell.seed && row.attempt_kind === cell.attemptKind && row.status === "completed") ?? []
+	const expectedSelectedRows = selectedRows.flatMap((cell) => rowFor(cell))
+	const expectedRootRows = rootRows.flatMap((cell) => rowFor(cell))
+	const orderedIds = (rows: Array<Record<string, unknown>>) => rows.map((row) => String(row.broker_job_id)).sort()
+	if (expectedSelectedRows.length !== selectedRows.length || expectedRootRows.length !== rootRows.length || JSON.stringify(orderedIds(expectedSelectedRows)) !== JSON.stringify([...saved.selectedHarness.attemptIds].sort()) || JSON.stringify(orderedIds(expectedRootRows)) !== JSON.stringify([...saved.rootHarness.attemptIds].sort())) throw new Error("finished campaign recovery checkpoint does not name the completed selected and root confirmation cells")
+	const artifacts = new Map((run.confirmationAttempts ?? []).map((attempt) => [attempt.attemptId, attempt]))
+	for (const row of [...expectedSelectedRows, ...expectedRootRows]) {
+		const attemptId = String(row.broker_job_id)
+		const attempt = artifacts.get(attemptId)
+		if (!attempt || attempt.validity !== "valid" || !attempt.proofQualified || attempt.resourceAccounting !== "supervisor-enforced" || !attempt.inferenceReceipt?.qualified || attempt.inferenceReceipt.endpointProvider !== "deepinfra" || attempt.inferenceReceipt.returnedProviders?.join(",") !== "deepinfra" || createHash("sha256").update(JSON.stringify(attempt)).digest("hex") !== String(row.result_sha256).trim()) throw new Error(`finished campaign recovery attempt ${attemptId} does not match its verified durable result`)
+		const storedRefs = row.artifact_refs as Record<string, { sha256?: string }> | undefined
+		if (!storedRefs || Object.entries(attempt.artifactRefs).some(([name, digest]) => storedRefs[name]?.sha256 !== digest)) throw new Error(`finished campaign recovery attempt ${attemptId} has different artifact references`)
+		const candidateId = String(row.candidate_id)
+		const kind = String(row.attempt_kind)
+		const outputRoot = path.join(archiveDir, "confirmation", manifest.campaignId, armId, candidateId, kind, "harness", attempt.harnessCommit)
+		for (const digest of Object.values(attempt.artifactRefs)) {
+			if (!/^[a-f0-9]{64}$/.test(digest)) throw new Error(`finished campaign recovery attempt ${attemptId} has a malformed artifact digest`)
+			const artifact = path.join(outputRoot, "artifacts", "sha256", digest.slice(0, 2), digest)
+			const stat = await fs.lstat(artifact)
+			if (!stat.isFile() || stat.isSymbolicLink() || createHash("sha256").update(await fs.readFile(artifact)).digest("hex") !== digest) throw new Error(`finished campaign recovery artifact ${digest} is missing or changed`)
+		}
+	}
 }
 
 /** Rebuild only the durable development-phase checkpoint after its DB commit. */
@@ -269,10 +310,18 @@ function combinedArchive(archive: RsiArchive, run: RsiRunRecord): RsiArchive {
 	return { ...archive, candidates: [...archive.candidates.filter((candidate) => !currentIds.has(candidate.id)), ...run.candidates] }
 }
 
+function validateDeterministicWorkerHarnessRunId(config: RsiConfig): void {
+	if (config.workerHarnessRunId) {
+		const suffix = config.workerHarnessMode === "fixed-control" ? "fixed" : config.workerHarnessMode === "self-hosted" ? "self" : undefined
+		if (!config.workerHarnessPairId || !suffix || config.workerHarnessRunId !== `${config.workerHarnessPairId}-${suffix}` || !/^rsi-proof-[a-f0-9]{20}-(fixed|self)$/.test(config.workerHarnessRunId)) throw new Error("deterministic worker harness run ID must match its paired campaign and arm")
+	}
+	}
+
 function initialRun(config: RsiConfig, baseCommit: string, now: string): RsiRunRecord {
 	const modelCandidateId = config.modelCandidateId ?? "model-base"
+	validateDeterministicWorkerHarnessRunId(config)
 	return {
-		runId: `rsi-${now.replace(/[^0-9]/g, "").slice(0, 14)}-${randomUUID().slice(0, 8)}`,
+		runId: config.workerHarnessRunId ?? `rsi-${now.replace(/[^0-9]/g, "").slice(0, 14)}-${randomUUID().slice(0, 8)}`,
 		startedAt: now,
 		model: config.model,
 		baseRef: config.baseRef,
@@ -726,8 +775,11 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		: undefined
 	if (workerHarnessRuntime && !validWorkerHarnessRuntimeIdentity(workerHarnessRuntime)) throw new Error("worker harness runtime identity is malformed")
 	const requestedPhase = config.workerHarnessPhase ?? "development"
+	if (config.workerHarnessEngineeringOnly && (!config.workerHarnessPairId || !config.workerHarnessMode || requestedPhase !== "development")) throw new Error("engineering-only paired runs require an explicit campaign, arm, and development phase")
+	validateDeterministicWorkerHarnessRunId(config)
 	const resumed = config.resumeRunId ? requestedPhase === "confirmation" ? await findRun(config.archiveDir, config.resumeRunId) : await findActiveRun(config.archiveDir, config.resumeRunId) : undefined
 	if (config.resumeRunId && !resumed) throw new Error(`no active RSI run found for --resume ${config.resumeRunId}`)
+	if (resumed && config.workerHarnessRunId && resumed.runId !== config.workerHarnessRunId) throw new Error("worker harness deterministic run identity differs from the resumed archive record")
 	const baseCommit = resumed?.baseCommit ?? (await resolveBaseCommit(config))
 	const run = resumed ?? initialRun({ ...config, model: workerModel, roles }, baseCommit, now())
 	const stageCount = requestedPhase === "confirmation" ? 0 : config.computePolicy === "adaptive-independent" ? 2 : config.generations
@@ -892,6 +944,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	}
 	if (config.workerHarnessPairId && !config.dryRun) {
 		if (!config.workerHarnessMode || !workerHarnessRuntime || !fleetQueue) throw new Error("restart-safe paired worker-harness campaigns require an explicit arm, frozen runtime identity, and PostgreSQL fleet queue")
+				if (config.workerHarnessEngineeringOnly && (requestedPhase !== "development" || config.resumeRunId && resumed?.proofCampaign?.manifest.phaseMode !== "engineering-only")) throw new Error("engineering-only execution cannot resume or enter a confirmation campaign")
 		const manifest = createProofCampaignManifest({ config: runConfig, campaignId: config.workerHarnessPairId, baseCommit, model: workerModel, provider: workerProvider, runtime: workerHarnessRuntime, developmentManifest: loadedProofBenchmark.manifest, developmentManifestDigest: loadedProofBenchmark.manifestDigest, plannedGenerations, proofProtocol })
 		campaignStore = fleetQueue.proofCampaignCoordinator()
 		if (hooks.runDevelopmentBenchmark) throw new Error("paired proof campaigns cannot use an injected benchmark hook that bypasses durable campaign admission and settlement")
@@ -920,12 +973,21 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	if (requestedPhase === "confirmation") {
 		if (!campaignStore || !campaignLease || campaignLease.phase !== "confirmation" || !config.workerHarnessPairId || config.dryRun) throw new Error("confirmation execution requires a resumed, frozen, supervised paired proof campaign")
 		const confirmation = await runProofConfirmation({ run, config, manifest: run.proofCampaign!.manifest, benchmark: loadedProofBenchmark.manifest, fixturesRoot: proofFixturesRoot, store: campaignStore, lease: campaignLease, assertLease: assertCampaignLease, model: workerModel, provider: "openshell-openrouter" })
-		run.confirmationAttempts = [...(run.confirmationAttempts ?? []), ...confirmation.attempts]
+		const attemptsById = new Map((run.confirmationAttempts ?? []).map((attempt) => [attempt.attemptId, attempt]))
+		for (const attempt of confirmation.attempts) attemptsById.set(attempt.attemptId, attempt)
+		run.confirmationAttempts = [...attemptsById.values()]
 		run.proofConfirmation = {
 			selectedHarness: { candidateId: confirmation.selectedHarnessCandidate, slotId: confirmation.selectedCandidateId, generation: confirmation.selectedGeneration, commit: confirmation.selectedCommit, attemptIds: confirmation.selectedAttempts.map((attempt) => attempt.attemptId) },
 			rootHarness: { commit: run.baseCommit, attemptIds: confirmation.rootAttempts.map((attempt) => attempt.attemptId) },
 		}
 		run.confirmationEvidence = confirmation.attempts.length > 0 && confirmation.attempts.every((attempt) => attempt.validity === "valid" && attempt.proofQualified && attempt.inferenceReceipt?.qualified) ? "complete" : "incomplete"
+		await assertCampaignLease()
+		// Persist the exact attempts and selected/root identities before the
+		// authoritative DB terminal transition. If the process dies after
+		// finishArm but before appendRun, recovery can rebuild from this
+		// checkpoint and the durable campaign snapshot without paid replay.
+		run.proofCampaign = { ...run.proofCampaign!, state: "running", ledgerSnapshot: await campaignStore.snapshot(campaignLease.campaignId) }
+		await checkpointRun(config.archiveDir, run)
 		await assertCampaignLease()
 		await campaignStore.finishArm(campaignLease, [confirmation.selectedCandidateId])
 		run.proofCampaign = { ...run.proofCampaign!, state: "finished", ledgerSnapshot: await campaignStore.snapshot(campaignLease.campaignId) }
@@ -1443,7 +1505,18 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	if (campaignStore && campaignLease) {
 		await assertCampaignLease()
 		await campaignStore.finishDevelopmentArm(campaignLease)
-		run.proofCampaign = { ...run.proofCampaign!, state: "evaluated", ledgerSnapshot: await campaignStore.snapshot(campaignLease.campaignId) }
+		const snapshot = await campaignStore.snapshot(campaignLease.campaignId)
+		const engineeringOnly = run.proofCampaign?.manifest.phaseMode === "engineering-only"
+		run.proofCampaign = { ...run.proofCampaign!, state: engineeringOnly ? "finished" : "evaluated", ledgerSnapshot: snapshot }
+		if (engineeringOnly) {
+			run.finishedAt = now()
+			const reportPath = `${config.archiveDir}/${run.runId}.md`
+			await fs.mkdir(config.archiveDir, { recursive: true })
+			await fs.writeFile(reportPath, formatRunReport(run, config), "utf8")
+			run.reports = [...new Set([...run.reports, reportPath])]
+			await appendRun(config.archiveDir, run)
+			return run
+		}
 	}
 
 	run.finishedAt = now()

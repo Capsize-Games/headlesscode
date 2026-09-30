@@ -6,6 +6,8 @@ export type ProofCampaignAttemptKind = "mutation" | "development-proof" | "verif
 
 export interface ProofCampaignManifest {
 	schemaVersion: 1
+	/** Engineering-only roots terminate after development and never freeze confirmation task IDs. */
+	phaseMode?: "paired-confirmation" | "engineering-only"
 	campaignId: string
 	rootCommit: string
 	benchmarkDigests: { manifest: string; development: string; confirmation: string }
@@ -125,6 +127,8 @@ export function validateProofCampaignManifest(manifest: ProofCampaignManifest): 
 	if (manifest.budgets.root.maxRuntimeMs < 1) throw new Error("proof campaign root runtime ceiling must be positive")
 	if (!/^sha256:[a-f0-9]{64}$/.test(manifest.runtime.imageDigest) || !/^[a-f0-9]{40}$/.test(manifest.runtime.harnessCommit) || !/^[a-f0-9]{64}$/.test(manifest.runtime.dependencyLockDigest)) throw new Error("proof campaign runtime identity is malformed")
 	if (!manifest.analysisVersion.trim()) throw new Error("proof campaign analysis version is required")
+	if (manifest.phaseMode !== undefined && !["paired-confirmation", "engineering-only"].includes(manifest.phaseMode)) throw new Error("proof campaign phase mode is invalid")
+	if (manifest.phaseMode === "engineering-only" && manifest.schedule.some((cell) => (cell.phase ?? "development") === "confirmation")) throw new Error("engineering-only proof campaign may not freeze confirmation cells")
 	stableJson(manifest)
 }
 
@@ -531,13 +535,15 @@ export class PostgresProofCampaign {
 
 	async finishDevelopmentArm(lease: ProofCampaignArmLease): Promise<void> {
 		await transaction(this.pool, async (client) => {
-			const stateResult = await client.query(`SELECT campaign.manifest, campaign.manifest_sha256, arm.phase AS arm_phase, arm.epoch AS arm_epoch, arm.run_id
+			const stateResult = await client.query(`SELECT campaign.manifest, campaign.manifest_sha256, arm.phase AS arm_phase, arm.epoch AS arm_epoch, arm.state AS arm_state, arm.run_id
 				FROM headlesscode_rsi_proof_campaigns campaign JOIN headlesscode_rsi_proof_campaign_arms arm USING(campaign_id)
 				WHERE campaign.campaign_id=$1 AND arm.arm_id=$2 FOR UPDATE OF campaign,arm`, [lease.campaignId, lease.armId])
 			const state = stateResult.rows[0]
 			if (!state || state.manifest_sha256.trim() !== lease.manifestSha256 || state.run_id !== lease.runId) throw new Error("proof campaign development completion has a stale campaign or arm identity")
 			const priorFinish = await client.query("SELECT 1 FROM headlesscode_rsi_proof_campaign_events WHERE campaign_id=$1 AND arm_id=$2 AND epoch=$3 AND event_type='development-phase-finished' AND payload->>'remainingPhase'='confirmation'", [lease.campaignId, lease.armId, lease.epoch])
 			if (state.arm_phase === "confirmation" && lease.phase === "development" && priorFinish.rowCount === 1) return
+			const priorEngineeringFinish = await client.query("SELECT 1 FROM headlesscode_rsi_proof_campaign_events WHERE campaign_id=$1 AND arm_id=$2 AND event_type='engineering-development-finished'", [lease.campaignId, lease.armId])
+			if (state.arm_state === "finished" && lease.phase === "development" && priorEngineeringFinish.rowCount === 1) return
 			const campaign = await this.lockLease(client, lease)
 			if (lease.phase === "confirmation" && campaign.arm_phase === "confirmation") {
 				const finished = await client.query("SELECT 1 FROM headlesscode_rsi_proof_campaign_events WHERE campaign_id=$1 AND arm_id=$2 AND event_type='development-phase-finished' AND payload->>'remainingPhase'='confirmation' LIMIT 1", [lease.campaignId, lease.armId])
@@ -556,9 +562,18 @@ export class PostgresProofCampaign {
 				const result = await client.query("SELECT status FROM headlesscode_rsi_proof_campaign_attempts WHERE campaign_id=$1 AND arm_id=$2 AND generation=$3 AND candidate_id=$4 AND task_id=$5 AND seed=$6 AND attempt_kind=$7", [lease.campaignId, lease.armId, cell.generation, cell.candidateId, cell.taskId, cell.seed, cell.attemptKind])
 				if (result.rowCount !== 1 || !["completed", "skipped-after-hard-gate"].includes(String(result.rows[0].status))) throw new Error("cannot finish development phase with incomplete or uncertain development evidence")
 			}
-			await client.query("UPDATE headlesscode_rsi_proof_campaign_arms SET state='evaluated',phase='confirmation',coordinator_id=NULL,lease_token_sha256=NULL,lease_expires_at=NULL,updated_at=clock_timestamp() WHERE campaign_id=$1 AND arm_id=$2 AND epoch=$3", [lease.campaignId, lease.armId, lease.epoch])
-			await this.appendEvent(client, lease.campaignId, lease.armId, lease.epoch, "development-phase-finished", { remainingPhase: "confirmation" })
-			await client.query("UPDATE headlesscode_rsi_proof_campaigns SET state='evaluated',updated_at=clock_timestamp() WHERE campaign_id=$1 AND state <> 'finished'", [lease.campaignId])
+			if (manifest.phaseMode === "engineering-only") {
+				const prior = await client.query("SELECT 1 FROM headlesscode_rsi_proof_campaign_events WHERE campaign_id=$1 AND arm_id=$2 AND event_type='engineering-development-finished'", [lease.campaignId, lease.armId])
+				if (prior.rowCount) return
+				await client.query("UPDATE headlesscode_rsi_proof_campaign_arms SET state='finished',coordinator_id=NULL,lease_token_sha256=NULL,lease_expires_at=NULL,updated_at=clock_timestamp() WHERE campaign_id=$1 AND arm_id=$2 AND epoch=$3", [lease.campaignId, lease.armId, lease.epoch])
+				await this.appendEvent(client, lease.campaignId, lease.armId, lease.epoch, "engineering-development-finished", { confirmationFrozen: false })
+				const arms = await client.query("SELECT count(*)::int AS total,count(*) FILTER (WHERE state='finished')::int AS finished FROM headlesscode_rsi_proof_campaign_arms WHERE campaign_id=$1", [lease.campaignId])
+				if (Number(arms.rows[0]?.total) === 2 && Number(arms.rows[0]?.finished) === 2) await client.query("UPDATE headlesscode_rsi_proof_campaigns SET state='finished',updated_at=clock_timestamp() WHERE campaign_id=$1", [lease.campaignId])
+			} else {
+				await client.query("UPDATE headlesscode_rsi_proof_campaign_arms SET state='evaluated',phase='confirmation',coordinator_id=NULL,lease_token_sha256=NULL,lease_expires_at=NULL,updated_at=clock_timestamp() WHERE campaign_id=$1 AND arm_id=$2 AND epoch=$3", [lease.campaignId, lease.armId, lease.epoch])
+				await this.appendEvent(client, lease.campaignId, lease.armId, lease.epoch, "development-phase-finished", { remainingPhase: "confirmation" })
+				await client.query("UPDATE headlesscode_rsi_proof_campaigns SET state='evaluated',updated_at=clock_timestamp() WHERE campaign_id=$1 AND state <> 'finished'", [lease.campaignId])
+			}
 		})
 	}
 

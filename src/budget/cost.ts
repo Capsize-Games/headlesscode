@@ -55,21 +55,13 @@ export type PricingTable = Record<string, ModelPrice>
 /**
  * Default pricing table (OpenRouter list rates, USD per 1M tokens).
  *
- * - `deepseek/deepseek-v4-flash-0731` — the harness default (Phase 1/2/5
- *   workers; see `DEFAULT_MODEL` in src/llm/openrouter.ts). Priced the same
- *   as the prior default, `deepseek/deepseek-v4-flash` (kept below for
- *   override compat) — same model line, dated point-release id. The rate is
- *   the OFFICIAL DeepSeek provider's own rate specifically (verified
- *   against OpenRouter's own
- *   `/api/v1/models/deepseek/deepseek-v4-flash/endpoints` on 2026-08-01,
- *   cross-checked against OpenRouter's own pricing UI). This price is only
- *   actually correct because `src/llm/openrouter.ts` pins routing to this
- *   exact provider (`provider: { order: ["deepseek"], allow_fallbacks:
- *   false }`) for deepseek/* models — OTHER routed endpoints behind the
- *   same model id (DeepInfra, Baidu, Mancer, ...) have meaningfully
- *   different prices, especially for cache reads, so this number would be
- *   wrong/unverifiable without that pin. If the pin is ever removed, this
- *   price must be revisited, not left as a stale guess.
+ * - `deepseek/deepseek-v4-flash-0731` — the RSI proof model. It is routed
+ *   exclusively to OpenRouter's available DeepInfra fp8 endpoint by
+ *   `src/llm/openrouter.ts`. The 2026-09 endpoint metadata reports
+ *   $0.06/1M input and $0.18/1M output tokens; cached input is conservatively
+ *   charged at the full input rate because this endpoint metadata provides
+ *   no verified cache-read rate. The RSI broker independently fetches and
+ *   pins endpoint pricing before admitting work.
  *   Missing entirely from this table before was the actual root cause of a
  *   real incident: sessions silently fell through to `FALLBACK_MODEL_PRICE`
  *   (7x+ this model's real input rate), producing wildly inflated internal
@@ -99,7 +91,7 @@ export type PricingTable = Record<string, ModelPrice>
 export const DEFAULT_PRICING_TABLE: PricingTable = {
  "deepseek/deepseek-chat": { input: 0.27, output: 1.1 },
  "deepseek/deepseek-reasoner": { input: 0.55, output: 2.19 },
- "deepseek/deepseek-v4-flash-0731": { input: 0.14, output: 0.28, cacheRead: 0.0028 },
+ "deepseek/deepseek-v4-flash-0731": { input: 0.06, output: 0.18 },
  "deepseek/deepseek-v4-flash": { input: 0.14, output: 0.28, cacheRead: 0.0028 },
  "anthropic/claude-3.5-sonnet": { input: 3.0, output: 15.0 },
  "qwen/qwen3-embedding-4b": { input: 0.15, output: 0.15 },

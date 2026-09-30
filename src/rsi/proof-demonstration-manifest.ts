@@ -25,6 +25,9 @@ export interface FrozenProofDemonstrationManifest {
 	campaignIds: { engineering: string; campaigns: [string, string, string] }
 	operatorCapUsd: number
 	plan: ProofDemonstrationPlan
+	analysis: { bootstrapSeed: string; bootstrapReplicates: number; confirmationRetentionTaskIds: string[] }
+	/** Digest-bound development-only engineering pair that had to pass before this holdout manifest was frozen. */
+	engineeringEvidence: { path: string; sha256: string; campaignId: string; rootCommit: string; manifestSha256: string; snapshotSha256: string }
 	digestSha256: string
 }
 
@@ -55,7 +58,10 @@ export function freezeProofDemonstrationManifest(args: Omit<FrozenProofDemonstra
 	if (![args.priceCeilingsPerMillionUsd.input, args.priceCeilingsPerMillionUsd.output].every((value) => Number.isFinite(value) && value > 0) || args.priceCeilingsPerMillionUsd.input < args.endpointPrice.inputPricePerMillionUsd || args.priceCeilingsPerMillionUsd.output < args.endpointPrice.outputPricePerMillionUsd) throw new Error("configured price ceilings do not cover the observed endpoint rates")
 	if (!/^[a-f0-9]{64}$/.test(args.execution.configSha256) || args.execution.configSha256 !== frozenProofConfigDigest(args.execution.configs) || !/^[a-f0-9]{64}$/.test(args.execution.analysisSourceSha256)) throw new Error("proof demonstration config or analysis-source digest is malformed")
 	if (!args.execution.taskIdentities.length || args.execution.taskIdentities.some((task) => !/^[a-f0-9]{64}$/.test(task.verifierDigest) || !/^[a-f0-9]{64}$/.test(task.knownGoodDigest) || !/^[a-f0-9]{64}$/.test(task.knownBadDigest))) throw new Error("proof demonstration task identities are incomplete")
-	if (args.operatorCapUsd + 1e-9 < args.plan.totalRootSpendCeilingUsd) throw new Error(`operator cap $${args.operatorCapUsd.toFixed(6)} is below the frozen root reservation $${args.plan.totalRootSpendCeilingUsd.toFixed(6)}`)
+	const confirmationIds = new Set(args.execution.taskIdentities.filter((task) => task.split === "confirmation").map((task) => task.id))
+	if (!args.analysis.bootstrapSeed.trim() || !Number.isSafeInteger(args.analysis.bootstrapReplicates) || args.analysis.bootstrapReplicates < 1 || !args.analysis.confirmationRetentionTaskIds.length || new Set(args.analysis.confirmationRetentionTaskIds).size !== args.analysis.confirmationRetentionTaskIds.length || args.analysis.confirmationRetentionTaskIds.some((id) => !confirmationIds.has(id))) throw new Error("proof demonstration analysis settings or confirmation retention set are invalid")
+	if (args.operatorCapUsd + 1e-9 < args.plan.campaignRootsSpendCeilingUsd) throw new Error(`operator cap $${args.operatorCapUsd.toFixed(6)} is below the three frozen campaign roots reservation $${args.plan.campaignRootsSpendCeilingUsd.toFixed(6)}`)
+	if (!args.engineeringEvidence.path || !/^[a-f0-9]{64}$/.test(args.engineeringEvidence.sha256) || !/^[A-Za-z0-9._:-]{1,160}$/.test(args.engineeringEvidence.campaignId) || args.engineeringEvidence.rootCommit !== args.rootCommit || !/^[a-f0-9]{64}$/.test(args.engineeringEvidence.manifestSha256) || !/^[a-f0-9]{64}$/.test(args.engineeringEvidence.snapshotSha256)) throw new Error("engineering evidence identity is malformed or belongs to another root")
 	const body = { schemaVersion: 1 as const, ...args }
 	return { ...body, digestSha256: frozenProofDemonstrationDigest(body) }
 }
@@ -67,7 +73,10 @@ export function verifyFrozenProofDemonstrationManifest(value: unknown): FrozenPr
 	const { digestSha256, ...body } = manifest
 	if (frozenProofDemonstrationDigest(body) !== digestSha256) throw new Error("frozen proof demonstration manifest digest mismatch")
 	if (manifest.endpointPrice.model !== manifest.model.requestedId || manifest.endpointPrice.provider !== RSI_OPENROUTER_ENDPOINT_PROVIDER || manifest.endpointPrice.endpointTag !== RSI_OPENROUTER_ENDPOINT_TAG || manifest.endpointPrice.quantization !== RSI_OPENROUTER_ENDPOINT_QUANTIZATION || !["max_tokens", "temperature", "tools", "tool_choice"].every((parameter) => manifest.endpointPrice.supportedParameters.includes(parameter))) throw new Error("frozen proof demonstration endpoint is not the pinned DeepInfra fp8 route with required parameters")
-	if (manifest.operatorCapUsd + 1e-9 < manifest.plan.totalRootSpendCeilingUsd) throw new Error("frozen proof demonstration operator cap is below root reservations")
+	if (manifest.operatorCapUsd + 1e-9 < manifest.plan.campaignRootsSpendCeilingUsd) throw new Error("frozen proof demonstration operator cap is below the three campaign root reservations")
+	if (!manifest.engineeringEvidence || !manifest.engineeringEvidence.path || !/^[a-f0-9]{64}$/.test(manifest.engineeringEvidence.sha256) || manifest.engineeringEvidence.rootCommit !== manifest.rootCommit || !/^[a-f0-9]{64}$/.test(manifest.engineeringEvidence.manifestSha256) || !/^[a-f0-9]{64}$/.test(manifest.engineeringEvidence.snapshotSha256)) throw new Error("frozen engineering evidence reference is missing or malformed")
 	if (frozenProofConfigDigest(manifest.execution.configs) !== manifest.execution.configSha256) throw new Error("frozen proof demonstration config digest mismatch")
+	const confirmationIds = new Set(manifest.execution.taskIdentities.filter((task) => task.split === "confirmation").map((task) => task.id))
+	if (!manifest.analysis.bootstrapSeed.trim() || !Number.isSafeInteger(manifest.analysis.bootstrapReplicates) || manifest.analysis.bootstrapReplicates < 1 || !manifest.analysis.confirmationRetentionTaskIds.length || new Set(manifest.analysis.confirmationRetentionTaskIds).size !== manifest.analysis.confirmationRetentionTaskIds.length || manifest.analysis.confirmationRetentionTaskIds.some((id) => !confirmationIds.has(id))) throw new Error("frozen proof demonstration analysis settings or confirmation retention set is invalid")
 	return manifest
 }

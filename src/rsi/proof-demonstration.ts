@@ -1,8 +1,11 @@
 import { createHash } from "node:crypto"
+import * as fs from "node:fs/promises"
+import * as path from "node:path"
 import type { BenchmarkAttempt } from "./benchmark/types.js"
 import type { RsiRunRecord } from "./types.js"
 import { proofCampaignManifestDigest } from "./proof-campaign.js"
 import { RSI_OPENROUTER_MODEL } from "./inference-broker.js"
+import { frozenProofConfigDigest, verifyFrozenProofDemonstrationManifest, type FrozenProofDemonstrationManifest } from "./proof-demonstration-manifest.js"
 
 export type ProofDemonstrationVerdict = "demonstrated" | "inconclusive" | "not-demonstrated"
 export interface ProofDemonstrationReport {
@@ -12,16 +15,27 @@ export interface ProofDemonstrationReport {
   verdictReasons: string[]
   campaigns: Array<{
     campaignId: string
-    selfHosted: { runId: string; finalCommit: string; selectedCandidateId: string; adjacentAcceptedDepth: number; confirmation: Array<Record<string, unknown>>; root: Array<Record<string, unknown>>; netWinsVsRoot: number; retentionLosses: string[]; resources: Record<string, number | null>; complete: boolean }
-    fixedControl: { runId: string; finalCommit: string; selectedCandidateId: string; confirmation: Array<Record<string, unknown>>; root: Array<Record<string, unknown>>; resources: Record<string, number | null>; complete: boolean }
+    selfHosted: { runId: string; finalCommit: string; selectedCandidateId: string; lineage: Array<{ generation: number; candidateId: string; parentId: string; parentCommit: string | null; commit: string }>; development: Record<string, unknown>; adjacentAcceptedDepth: number; confirmation: Array<Record<string, unknown>>; root: Array<Record<string, unknown>>; netWinsVsRoot: number; retentionLosses: string[]; resources: Record<string, number | null>; complete: boolean }
+    fixedControl: { runId: string; finalCommit: string; selectedCandidateId: string; development: Record<string, unknown>; confirmation: Array<Record<string, unknown>>; root: Array<Record<string, unknown>>; resources: Record<string, number | null>; complete: boolean }
   }>
   pooled: { taskIds: string[]; campaignCount: number; selfHostedSuccesses: number; fixedControlSuccesses: number; difference: number; cluster90PercentInterval: [number, number] | null; bootstrapReplicates: number; bootstrapSeed: string }
   denominators: { campaigns: number; pairedConfirmationTasks: number; missingCells: string[]; excludedAttempts: string[] }
   limitations: string[]
 }
 
-function sha256(value: string): string { return createHash("sha256").update(value).digest("hex") }
+function sha256(value: string | Buffer): string { return createHash("sha256").update(value).digest("hex") }
 function sorted<T extends string>(items: T[]): T[] { return [...items].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b))) }
+function campaignConfig(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {}
+  const config = { ...(value as Record<string, unknown>) }
+  for (const key of ["workerHarnessMode", "workerHarnessPairId", "candidateIdNamespace", "workerHarnessParentCommit", "workerHarnessSnapshotTreeDigest"]) delete config[key]
+  return config
+}
+function campaignConfigWithoutSeed(value: unknown): string {
+  const config = campaignConfig(value)
+  delete config.seed
+  return frozenProofConfigDigest(config)
+}
 function percentile(values: number[], fraction: number): number {
   if (!values.length) throw new Error("cannot calculate percentile from no bootstrap samples")
   return values[Math.min(values.length - 1, Math.max(0, Math.ceil(fraction * values.length) - 1))]!
@@ -64,6 +78,16 @@ function chainDepth(run: RsiRunRecord): number {
     current = parent
   }
 }
+function selectedLineage(run: RsiRunRecord): Array<{ generation: number; candidateId: string; parentId: string; parentCommit: string | null; commit: string }> {
+	const selectedId = run.proofConfirmation?.selectedHarness.candidateId
+	let current = selectedId ? run.candidates.find((candidate) => candidate.id === selectedId) : undefined
+	const lineage: Array<{ generation: number; candidateId: string; parentId: string; parentCommit: string | null; commit: string }> = []
+	while (current && current.status === "accepted" && current.commits[0] && durablySelected(run, current)) {
+		lineage.push({ generation: current.generation, candidateId: current.id, parentId: current.parent ?? "baseline", parentCommit: current.parentCommit ?? null, commit: current.commits[0] })
+		current = current.parent && current.parent !== "baseline" ? run.candidates.find((candidate) => candidate.id === current!.parent) : undefined
+	}
+	return lineage.reverse()
+}
 
 function attemptSummary(attempt: BenchmarkAttempt): Record<string, unknown> {
   return {
@@ -97,13 +121,73 @@ function validateScheduledConfirmation(run: RsiRunRecord, missing: string[]): bo
   }
   return complete
 }
+function developmentDenominators(run: RsiRunRecord): Record<string, unknown> {
+	const manifest = run.proofCampaign?.manifest
+	const rows = (run.proofCampaign?.ledgerSnapshot?.attempts as Array<Record<string, unknown>> | undefined) ?? []
+	const candidates = run.candidates.map((candidate) => ({ id: candidate.id, generation: candidate.generation, status: candidate.status, proofAccepted: candidate.developmentProof?.accepted ?? false, reason: candidate.developmentProof?.reason ?? candidate.failure ?? "no durable development decision" }))
+	const slotsByGeneration = (manifest?.settings.candidateCounts as number[] | undefined) ?? []
+	const scheduledCells = manifest?.schedule.filter((cell) => cell.armId === run.proofCampaign?.armId && cell.phase === "development") ?? []
+	const scheduledCandidateSlots = slotsByGeneration.reduce((sum, value) => sum + (Number.isSafeInteger(value) && value >= 0 ? value : 0), 0)
+	const completedCells = scheduledCells.filter((cell) => rows.filter((row) => row.arm_id === run.proofCampaign?.armId && Number(row.generation) === cell.generation && row.candidate_id === cell.candidateId && row.task_id === cell.taskId && row.seed === cell.seed && row.attempt_kind === cell.attemptKind && row.status === "completed").length === 1)
+	const cellStatus = scheduledCells.map((cell) => {
+		const matches = rows.filter((row) => row.arm_id === run.proofCampaign?.armId && Number(row.generation) === cell.generation && row.candidate_id === cell.candidateId && row.task_id === cell.taskId && row.seed === cell.seed && row.attempt_kind === cell.attemptKind)
+		return { generation: cell.generation, candidateId: cell.candidateId, taskId: cell.taskId, attemptKind: cell.attemptKind, status: matches.length === 1 ? matches[0]!.status : matches.length === 0 ? "missing" : "duplicate" }
+	})
+	return {
+		scheduledCandidateSlots,
+		missingCandidateSlots: Math.max(0, scheduledCandidateSlots - candidates.length),
+		candidateCounts: { accepted: candidates.filter((candidate) => candidate.status === "accepted").length, rejected: candidates.filter((candidate) => candidate.status === "rejected").length, failed: candidates.filter((candidate) => candidate.status === "failed").length, incomplete: candidates.filter((candidate) => !["accepted", "rejected", "failed"].includes(candidate.status)).length + Math.max(0, scheduledCandidateSlots - candidates.length) },
+		candidates, scheduledDevelopmentProofCells: scheduledCells.length, completedDevelopmentProofCells: completedCells.length,
+		otherDevelopmentCells: cellStatus.filter((cell) => cell.status !== "completed"),
+	}
+}
+
+/** Verify confirmation attempt bytes against the immutable ledger references before offline analysis. */
+export async function verifyProofDemonstrationArtifactBytes(runs: RsiRunRecord[], archiveDir: string): Promise<void> {
+	const root = await fs.realpath(archiveDir)
+	for (const run of runs) {
+		const campaign = run.proofCampaign
+		if (!campaign || !run.proofConfirmation) continue
+		const rows = campaign.ledgerSnapshot?.attempts as Array<Record<string, unknown>> | undefined
+		if (!rows) throw new Error(`campaign ${campaign.campaignId}/${campaign.armId} has no durable attempt rows`)
+		const ids = [...run.proofConfirmation.selectedHarness.attemptIds, ...run.proofConfirmation.rootHarness.attemptIds]
+		for (const attemptId of ids) {
+			const attemptMatches = (run.confirmationAttempts ?? []).filter((attempt) => attempt.attemptId === attemptId)
+			const rowMatches = rows.filter((row) => row.broker_job_id === attemptId && row.arm_id === campaign.armId && row.status === "completed")
+			if (attemptMatches.length !== 1 || rowMatches.length !== 1) throw new Error(`campaign ${campaign.campaignId}/${campaign.armId} attempt ${attemptId} is missing or duplicated`)
+			const attempt = attemptMatches[0]!
+			const row = rowMatches[0]!
+			if (String(row.result_sha256).trim() !== sha256(JSON.stringify(attempt))) throw new Error(`campaign ${campaign.campaignId}/${campaign.armId} attempt ${attemptId} result digest mismatch`)
+			const savedRefs = row.artifact_refs as Record<string, { sha256?: string }> | undefined
+			if (!savedRefs || Object.entries(attempt.artifactRefs).some(([name, digest]) => savedRefs[name]?.sha256 !== digest)) throw new Error(`campaign ${campaign.campaignId}/${campaign.armId} attempt ${attemptId} artifact references differ from the durable ledger`)
+			const candidateId = String(row.candidate_id)
+			const kind = String(row.attempt_kind)
+			const relativeRoot = path.join("confirmation", campaign.campaignId, campaign.armId, candidateId, kind, "harness", attempt.harnessCommit, "artifacts", "sha256")
+			for (const digest of Object.values(attempt.artifactRefs)) {
+				if (!/^[a-f0-9]{64}$/.test(digest)) throw new Error(`campaign ${campaign.campaignId} attempt ${attemptId} has malformed artifact digest`)
+				const relativeFile = path.join(relativeRoot, digest.slice(0, 2), digest)
+				const file = path.resolve(root, relativeFile)
+				if (file !== root && !file.startsWith(root + path.sep)) throw new Error("confirmation artifact path escapes the archive")
+				let current = root
+				for (const segment of relativeFile.split(path.sep)) {
+					current = path.join(current, segment)
+					const stat = await fs.lstat(current)
+					if (stat.isSymbolicLink()) throw new Error(`confirmation artifact path contains a symlink: ${attemptId}`)
+				}
+				const stat = await fs.lstat(file)
+				const bytes = await fs.readFile(file)
+				if (!stat.isFile() || sha256(bytes) !== digest) throw new Error(`confirmation artifact ${digest} is missing or changed`)
+			}
+		}
+	}
+}
 type FrozenTaskIdentity = { id: string; seed: number; startDigest: string; verifierDigest: string; ceilings: BenchmarkAttempt["ceilings"] }
 function validateAttempt(run: RsiRunRecord, attempt: BenchmarkAttempt, expectedCommit: string, expectedTask: FrozenTaskIdentity | undefined, missing: string[], excluded: string[]): boolean {
 	const expectedTaskId = expectedTask?.id ?? "unknown-task"
 	const label = run.runId + "/" + expectedTaskId
 	if (!expectedTask || attempt.taskId !== expectedTaskId || attempt.harnessCommit !== expectedCommit || attempt.split !== "confirmation" || attempt.seed !== expectedTask.seed || attempt.startDigest !== expectedTask.startDigest || attempt.evaluatorDigest !== expectedTask.verifierDigest || JSON.stringify(attempt.ceilings) !== JSON.stringify(expectedTask.ceilings)) { missing.push(label + ":identity"); return false }
 	const expectedModel = run.proofCampaign?.manifest.model
-	if (!expectedModel || attempt.model.provider !== expectedModel.provider || attempt.model.id !== expectedModel.id || JSON.stringify(attempt.model.sampling) !== JSON.stringify(expectedModel.settings.sampling) || attempt.inferenceReceipt?.model !== expectedModel.id || attempt.inferenceReceipt.returnedModels.length !== 1 || attempt.inferenceReceipt.returnedModels[0] !== expectedModel.id) { missing.push(label + ":model-identity"); return false }
+	if (!expectedModel || attempt.model.provider !== expectedModel.provider || attempt.model.id !== expectedModel.id || JSON.stringify(attempt.model.sampling) !== JSON.stringify(expectedModel.settings.sampling) || attempt.inferenceReceipt?.model !== expectedModel.id || attempt.inferenceReceipt.returnedModels.length !== 1 || attempt.inferenceReceipt.returnedModels[0] !== expectedModel.id || attempt.inferenceReceipt.endpointProvider !== "deepinfra" || attempt.inferenceReceipt.returnedProviders.length !== 1 || attempt.inferenceReceipt.returnedProviders[0] !== "deepinfra") { missing.push(label + ":model-or-provider-identity"); return false }
 	const limits = run.proofCampaign?.manifest.settings.inferenceCeilings as { maxInputTokensPerCall?: unknown; maxTotalTokens?: unknown; maxJobSpendUsd?: unknown } | undefined
 	const maxTokens = Math.min(Number(limits?.maxTotalTokens), expectedTask.ceilings.maxCalls * (Number(limits?.maxInputTokensPerCall) + expectedTask.ceilings.maxOutputTokensPerCall))
 	if (!Number.isSafeInteger(maxTokens) || attempt.wallTimeMs > expectedTask.ceilings.timeoutMs || attempt.calls === null || attempt.calls > expectedTask.ceilings.maxCalls || attempt.tokens === null || attempt.tokens > maxTokens || attempt.inferenceReceipt?.costUsd === null || attempt.inferenceReceipt?.costUsd === undefined || attempt.inferenceReceipt.costUsd > Number(limits?.maxJobSpendUsd) || attempt.inferenceReceipt.calls !== attempt.calls || attempt.inferenceReceipt.totalTokens !== attempt.tokens) { missing.push(label + ":resource-ceiling"); return false }
@@ -131,14 +215,22 @@ function matchAttempts(run: RsiRunRecord, attemptIds: string[], commit: string, 
 }
 
 /** Recompute the preregistered verdict from immutable attempt artifacts and durable campaign snapshots. */
-export function analyzeProofDemonstration(runs: RsiRunRecord[], options: { expectedCampaignIds: string[]; retentionTaskIds?: string[]; bootstrapSeed: string; bootstrapReplicates?: number }): ProofDemonstrationReport {
+export function analyzeProofDemonstration(runs: RsiRunRecord[], options: { frozenPlan: FrozenProofDemonstrationManifest; expectedCampaignIds?: string[]; retentionTaskIds?: string[]; bootstrapSeed?: string; bootstrapReplicates?: number }): ProofDemonstrationReport {
   const missing: string[] = []
   const excluded: string[] = []
-  const campaignIds = sorted([...new Set(options.expectedCampaignIds)])
-  if (campaignIds.length !== 3 || options.expectedCampaignIds.length !== 3) throw new Error("analysis requires exactly three distinct preregistered campaign IDs")
-  const confirmationTasks = sorted([...new Set(runs.flatMap((run) => run.proofCampaign?.manifest.schedule.filter((cell) => cell.phase === "confirmation" && cell.candidateId === "root-control").map((cell) => cell.taskId) ?? []))])
-  if (!confirmationTasks.length) throw new Error("confirmation task schedule is empty")
-  const frozenRetentionTaskIds = (runs.find((run) => run.proofCampaign)?.proofCampaign?.manifest.acceptanceRule.confirmationRetentionTaskIds as string[] | undefined) ?? []
+  const frozenPlan = verifyFrozenProofDemonstrationManifest(options.frozenPlan)
+  const campaignIds = sorted([...frozenPlan.campaignIds.campaigns])
+  if (new Set(campaignIds).size !== 3 || (options.expectedCampaignIds && JSON.stringify(sorted(options.expectedCampaignIds)) !== JSON.stringify(campaignIds))) throw new Error("analysis campaign IDs differ from the frozen top-level plan")
+  if ((options.bootstrapSeed && options.bootstrapSeed !== frozenPlan.analysis.bootstrapSeed) || (options.bootstrapReplicates !== undefined && options.bootstrapReplicates !== frozenPlan.analysis.bootstrapReplicates)) throw new Error("analysis bootstrap settings differ from the frozen top-level plan")
+  if (campaignConfigWithoutSeed(frozenPlan.execution.configs[1]) !== campaignConfigWithoutSeed(frozenPlan.execution.configs[2]) || campaignConfigWithoutSeed(frozenPlan.execution.configs[1]) !== campaignConfigWithoutSeed(frozenPlan.execution.configs[3])) throw new Error("frozen campaign configs differ in settings other than the seed")
+  const frozenConfirmationIds = sorted(frozenPlan.execution.taskIdentities.filter((task) => task.split === "confirmation").map((task) => task.id))
+  if (!frozenConfirmationIds.length) throw new Error("frozen plan confirmation task set is empty")
+  const confirmationTasks = frozenConfirmationIds
+  for (const run of runs) {
+    const rootSchedule = run.proofCampaign?.manifest.schedule.filter((cell) => cell.armId === run.proofCampaign?.armId && cell.phase === "confirmation" && cell.candidateId === "root-control").map((cell) => cell.taskId)
+    if (rootSchedule && JSON.stringify(sorted(rootSchedule)) !== JSON.stringify(confirmationTasks)) missing.push(run.runId + ":confirmation-task-schedule-differs-from-frozen-plan")
+  }
+  const frozenRetentionTaskIds = frozenPlan.analysis.confirmationRetentionTaskIds
   if (!frozenRetentionTaskIds.length || frozenRetentionTaskIds.some((id) => !confirmationTasks.includes(id))) throw new Error("frozen confirmation retention set is missing or outside the confirmation split")
   if (options.retentionTaskIds && JSON.stringify(sorted(options.retentionTaskIds)) !== JSON.stringify(sorted(frozenRetentionTaskIds))) throw new Error("analysis retention set differs from the frozen confirmation rule")
   const campaigns: ProofDemonstrationReport["campaigns"] = []
@@ -150,18 +242,45 @@ export function analyzeProofDemonstration(runs: RsiRunRecord[], options: { expec
   let selfSuccesses = 0
   let fixedSuccesses = 0
   for (const campaignId of campaignIds) {
+    const campaignIndex = frozenPlan.campaignIds.campaigns.indexOf(campaignId)
+    const expectedSeed = frozenPlan.seeds.campaigns[campaignIndex]
+    const expectedConfig = campaignConfig(frozenPlan.execution.configs[campaignIndex + 1])
+    const expectedConfigDigest = frozenProofConfigDigest(expectedConfig)
     const arms = runs.filter((run) => run.workerHarnessPairId === campaignId)
-    const selfRun = arms.find((run) => run.workerHarnessMode === "self-hosted")
-    const fixedRun = arms.find((run) => run.workerHarnessMode === "fixed-control")
-    if (!selfRun || !fixedRun) { missing.push(campaignId + ":missing-arm"); continue }
+    const selfRuns = arms.filter((run) => run.workerHarnessMode === "self-hosted")
+    const fixedRuns = arms.filter((run) => run.workerHarnessMode === "fixed-control")
+    if (selfRuns.length !== 1 || fixedRuns.length !== 1) {
+      missing.push(campaignId + (selfRuns.length > 1 || fixedRuns.length > 1 ? ":duplicate-arm-runs" : ":missing-arm"))
+      continue
+    }
+    const selfRun = selfRuns[0]!
+    const fixedRun = fixedRuns[0]!
+    for (const run of [selfRun, fixedRun]) {
+      if (!run.finishedAt || run.proofCampaign?.state !== "finished") missing.push(campaignId + ":arm-run-not-terminal")
+    }
     if (selfRun.proofCampaign?.manifestSha256 !== fixedRun.proofCampaign?.manifestSha256 || selfRun.workerHarnessConfigDigest !== fixedRun.workerHarnessConfigDigest || selfRun.workerHarnessSamplingSeed !== fixedRun.workerHarnessSamplingSeed) missing.push(campaignId + ":paired-manifest-or-seed-mismatch")
     for (const run of [selfRun, fixedRun]) {
       const frozen = run.proofCampaign?.manifest
       if (frozen) {
+        if (frozen.phaseMode !== "paired-confirmation") missing.push(campaignId + ":campaign-manifest-is-not-the-frozen-confirmation-phase")
+        if (frozen.campaignId !== campaignId || frozen.seed !== expectedSeed || run.workerHarnessSamplingSeed !== expectedSeed) missing.push(campaignId + ":campaign-id-or-seed-differs-from-frozen-plan")
+        if (frozen.rootCommit !== frozenPlan.rootCommit || frozen.benchmarkDigests.manifest !== frozenPlan.benchmarkManifestSha256 || run.proofCampaign?.manifestSha256 !== proofCampaignManifestDigest(frozen)) missing.push(campaignId + ":arm-manifest-root-or-benchmark-identity-mismatch")
+        if (frozenProofConfigDigest(campaignConfig(frozen.settings.effectiveConfig)) !== expectedConfigDigest) missing.push(campaignId + ":effective-config-differs-from-frozen-seeded-config")
+        if (JSON.stringify(frozen.runtime) !== JSON.stringify({ imageDigest: frozenPlan.runtime.imageDigest, harnessCommit: frozenPlan.runtime.harnessCommit, dependencyLockDigest: frozenPlan.runtime.dependencyLockDigest }) || frozenProofConfigDigest(run.workerHarnessRuntime) !== frozenProofConfigDigest(frozenPlan.runtime)) missing.push(campaignId + ":runtime-identity-differs-from-frozen-plan")
+        if (frozen.model.provider !== frozenPlan.model.provider || frozen.model.id !== frozenPlan.model.requestedId || frozenProofConfigDigest(frozen.model.settings.sampling) !== frozenProofConfigDigest(frozenPlan.model.sampling)) missing.push(campaignId + ":model-identity-differs-from-frozen-plan")
+        const armConfirmationTasks = frozen.settings.confirmationTaskIdentities as FrozenTaskIdentity[] | undefined
+        const expectedConfirmationTasks = frozenPlan.execution.taskIdentities.filter((task) => task.split === "confirmation").map(({ id, seed, startDigest, verifierDigest, ceilings }) => ({ id, seed, startDigest, verifierDigest, ceilings }))
+        if (!armConfirmationTasks || frozenProofConfigDigest(armConfirmationTasks) !== frozenProofConfigDigest(expectedConfirmationTasks)) missing.push(campaignId + ":confirmation-task-identities-differ-from-frozen-plan")
         benchmarkManifestDigests.add(frozen.benchmarkDigests.manifest)
         providerModels.add(frozen.model.provider + "/" + frozen.model.id)
         campaignSeeds.add(frozen.seed)
         const frozenSettings = Object.fromEntries(Object.entries(frozen.settings).filter(([key]) => key !== "configDigest" && key !== "inferenceCampaignIds"))
+        const protocolConfig = frozenSettings.effectiveConfig
+        if (protocolConfig && typeof protocolConfig === "object" && !Array.isArray(protocolConfig)) {
+          const normalized = { ...(protocolConfig as Record<string, unknown>) }
+          delete normalized.seed
+          frozenSettings.effectiveConfig = normalized
+        }
         protocolIdentities.add(JSON.stringify({ rootCommit: frozen.rootCommit, benchmarkDigests: frozen.benchmarkDigests, provider: frozen.model.provider, model: frozen.model.id, modelSettings: frozen.model.settings, settings: frozenSettings, acceptanceRule: frozen.acceptanceRule, runtime: frozen.runtime, budgets: frozen.budgets, taskOrder: frozen.taskOrder, analysisVersion: frozen.analysisVersion }))
         for (const armId of [frozen.armAssignment.fixedControl, frozen.armAssignment.selfHosted]) {
           const rootTaskIds = sorted(frozen.schedule.filter((cell) => cell.armId === armId && cell.phase === "confirmation" && cell.candidateId === "root-control").map((cell) => cell.taskId))
@@ -224,8 +343,8 @@ export function analyzeProofDemonstration(runs: RsiRunRecord[], options: { expec
     })
     campaigns.push({
       campaignId,
-      selfHosted: { runId: selfRun.runId, finalCommit: selfMeta.selectedHarness.commit, selectedCandidateId: selfMeta.selectedHarness.candidateId, adjacentAcceptedDepth: depth, confirmation: [...selfFinal.values()].map(attemptSummary), root: [...selfRoot.values()].map(attemptSummary), netWinsVsRoot: wins - losses, retentionLosses, resources: sumResources([...selfFinal.values(), ...selfRoot.values()]), complete: selfComplete },
-      fixedControl: { runId: fixedRun.runId, finalCommit: fixedMeta.selectedHarness.commit, selectedCandidateId: fixedMeta.selectedHarness.candidateId, confirmation: [...fixedFinal.values()].map(attemptSummary), root: [...fixedRoot.values()].map(attemptSummary), resources: sumResources([...fixedFinal.values(), ...fixedRoot.values()]), complete: fixedComplete },
+      selfHosted: { runId: selfRun.runId, finalCommit: selfMeta.selectedHarness.commit, selectedCandidateId: selfMeta.selectedHarness.candidateId, lineage: selectedLineage(selfRun), development: developmentDenominators(selfRun), adjacentAcceptedDepth: depth, confirmation: [...selfFinal.values()].map(attemptSummary), root: [...selfRoot.values()].map(attemptSummary), netWinsVsRoot: wins - losses, retentionLosses, resources: sumResources([...selfFinal.values(), ...selfRoot.values()]), complete: selfComplete },
+      fixedControl: { runId: fixedRun.runId, finalCommit: fixedMeta.selectedHarness.commit, selectedCandidateId: fixedMeta.selectedHarness.candidateId, development: developmentDenominators(fixedRun), confirmation: [...fixedFinal.values()].map(attemptSummary), root: [...fixedRoot.values()].map(attemptSummary), resources: sumResources([...fixedFinal.values(), ...fixedRoot.values()]), complete: fixedComplete },
     })
   }
   if (benchmarkManifestDigests.size !== 1) missing.push("paired:benchmark-manifest-digest-mismatch")
@@ -234,7 +353,7 @@ export function analyzeProofDemonstration(runs: RsiRunRecord[], options: { expec
   if (protocolIdentities.size !== 1) missing.push("paired:frozen-protocol-runtime-budget-or-selection-mismatch")
   if (campaignSeeds.size !== 3) missing.push("paired:campaign-seeds-are-not-three-independent-values")
   const taskIds = sorted([...new Set(paired.map((entry) => entry.taskId))])
-  const replicates = options.bootstrapReplicates ?? 10_000
+  const replicates = frozenPlan.analysis.bootstrapReplicates
   if (!Number.isSafeInteger(replicates) || replicates < 1) throw new Error("bootstrap replicates must be a positive safe integer")
   let interval: [number, number] | null = null
   let difference = 0
@@ -244,7 +363,7 @@ export function analyzeProofDemonstration(runs: RsiRunRecord[], options: { expec
       return cluster.reduce((sum, entry) => sum + entry.self - entry.fixed, 0) / cluster.length
     })
     difference = clusterMeans.reduce((sum, value) => sum + value, 0) / clusterMeans.length
-    const random = seededRandom(options.bootstrapSeed)
+    const random = seededRandom(frozenPlan.analysis.bootstrapSeed)
     const samples: number[] = []
     for (let sample = 0; sample < replicates; sample++) {
       let total = 0
@@ -268,7 +387,7 @@ export function analyzeProofDemonstration(runs: RsiRunRecord[], options: { expec
     verdict: demonstrated ? "demonstrated" : allComplete ? "not-demonstrated" : "inconclusive",
     verdictReasons: demonstrated ? ["all frozen campaign, lineage, confirmation, retention, and task-cluster interval gates passed"] : reasons,
     campaigns,
-    pooled: { taskIds, campaignCount: campaignIds.length, selfHostedSuccesses: selfSuccesses, fixedControlSuccesses: fixedSuccesses, difference, cluster90PercentInterval: interval, bootstrapReplicates: replicates, bootstrapSeed: options.bootstrapSeed },
+    pooled: { taskIds, campaignCount: campaignIds.length, selfHostedSuccesses: selfSuccesses, fixedControlSuccesses: fixedSuccesses, difference, cluster90PercentInterval: interval, bootstrapReplicates: replicates, bootstrapSeed: frozenPlan.analysis.bootstrapSeed },
     denominators: { campaigns: campaignIds.length, pairedConfirmationTasks: taskIds.length, missingCells: sorted(missing), excludedAttempts: sorted(excluded) },
     limitations: ["This analysis covers only the registered tasks, runtime, model endpoint, prompts, and budgets.", "A result does not establish model-weight improvement or broad coding ability.", "Input and output artifacts must remain available for independent digest and verifier replay."],
   }

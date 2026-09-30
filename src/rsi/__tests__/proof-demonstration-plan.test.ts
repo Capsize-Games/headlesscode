@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { readFile } from "node:fs/promises"
-import { planProofDemonstration } from "../proof-demonstration-plan.js"
+import { assertFrozenProofDemonstrationPlanMatches, planProofDemonstration } from "../proof-demonstration-plan.js"
 import type { BenchmarkManifest } from "../benchmark/types.js"
 import type { RsiConfig } from "../types.js"
 import type { ProofRoleLimits } from "../proof-demonstration-plan.js"
@@ -22,13 +22,16 @@ const limits = (campaignId: string): ProofRoleLimits => ({
 	maxCallSpendUsd: 0.01, maxJobSpendUsd: 0.2, maxCampaignSpendUsd: 100,
 })
 const plan = planProofDemonstration({ config, manifest, mutationLimits: limits("mutation"), benchmarkLimits: limits("benchmark") })
-assert.deepEqual({ mutation: plan.engineering.mutationJobs, verification: plan.engineering.verificationJobs, dev: plan.engineering.developmentProofCells, confirmationSchedule: plan.engineering.confirmationScheduleCells }, { mutation: 8, verification: 16, dev: 48, confirmationSchedule: 10 })
+assert.deepEqual({ mutation: plan.engineering.mutationJobs, verification: plan.engineering.verificationJobs, dev: plan.engineering.developmentProofCells, confirmationSchedule: plan.engineering.confirmationScheduleCells }, { mutation: 8, verification: 16, dev: 48, confirmationSchedule: 0 })
 assert.deepEqual({ candidateConfirm: plan.campaign.confirmationScheduleCells, notSelected: plan.campaign.confirmationNotSelectedCells, final: plan.campaign.paidConfirmationCells, root: plan.campaign.rootControlCells }, { candidateConfirm: 14, notSelected: 10, final: 2, root: 2 })
 assert.equal(plan.engineering.maximumCalls, 128)
 assert.equal(plan.campaign.maximumCalls, 204)
 assert.equal(plan.totalReservedSpendUsd, plan.engineering.reservedSpendUsd + 3 * plan.campaign.reservedSpendUsd)
 assert.equal(plan.totalCalls, plan.engineering.maximumCalls + 3 * plan.campaign.maximumCalls)
 assert.throws(() => planProofDemonstration({ config, manifest, mutationLimits: { ...limits("mutation"), maxCallSpendUsd: 0.00001 }, benchmarkLimits: limits("benchmark") }), /per-call spend cap is below/)
+assert.doesNotThrow(() => assertFrozenProofDemonstrationPlanMatches(plan, { config, manifest, mutationLimits: limits("mutation"), benchmarkLimits: limits("benchmark") }))
+assert.throws(() => assertFrozenProofDemonstrationPlanMatches({ ...plan, campaignRootsSpendCeilingUsd: 0.000001, totalRootSpendCeilingUsd: 0.000001 }, { config, manifest, mutationLimits: limits("mutation"), benchmarkLimits: limits("benchmark") }), /frozen proof budget plan differs/)
+assert.throws(() => assertFrozenProofDemonstrationPlanMatches(plan, { config: { ...config, evalCommands: ["npm test"] }, manifest, mutationLimits: limits("mutation"), benchmarkLimits: limits("benchmark") }), /frozen proof budget plan differs/)
 
 const corpus = JSON.parse(await readFile("fixtures/rsi-benchmark/manifest.json", "utf8")) as BenchmarkManifest
 const corpusConfig = { ...config, generations: 3, maxIterations: 40, commandTimeoutMs: 900_000, evalCommands: ["npm test"], maxRuntimeMs: 72 * 60 * 60_000 }
@@ -36,9 +39,9 @@ const corpusMutationLimits = { ...limits("mutation"), maxCalls: 40, maxInputToke
 const corpusBenchmarkLimits = { ...corpusMutationLimits, campaignId: "benchmark", maxCalls: 8, maxOutputTokensPerCall: 4096 }
 const corpusPlan = planProofDemonstration({ config: corpusConfig, manifest: corpus, mutationLimits: corpusMutationLimits, benchmarkLimits: corpusBenchmarkLimits })
 assert.equal(corpusPlan.engineering.developmentProofCells, 384)
-assert.equal(corpusPlan.engineering.confirmationDisposition, "pre-registered-deferred")
+assert.equal(corpusPlan.engineering.confirmationDisposition, "not-frozen-until-engineering-passes")
 assert.equal(corpusPlan.engineering.paidConfirmationCells, 0)
-assert.equal(corpusPlan.engineering.deferredConfirmationReservationCells, 64)
+assert.equal(corpusPlan.engineering.deferredConfirmationReservationCells, 0)
 assert.equal(corpusPlan.campaign.developmentProofCells, 576)
 assert.equal(corpusPlan.campaign.confirmationScheduleCells, 224)
 assert.equal(corpusPlan.campaign.confirmationNotSelectedCells, 160)
@@ -47,5 +50,5 @@ assert.equal(corpusPlan.campaign.rootControlCells, 32)
 assert.equal(corpusPlan.campaign.maximumCalls, 19_680)
 assert.equal(corpusPlan.totalCalls, 70_880)
 assert.equal(corpusPlan.totalReservedSpendUsd, 93.92)
-assert.equal(corpusPlan.totalRootSpendCeilingUsd, 96.48, "operator cap includes the engineering root's frozen, deferred final/root confirmation reservation")
+assert.equal(corpusPlan.totalRootSpendCeilingUsd, 93.92, "engineering root cap is reported separately from the three campaign roots")
 console.log("RSI proof demonstration schedule and ceiling assertions passed")

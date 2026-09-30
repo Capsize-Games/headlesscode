@@ -152,10 +152,10 @@ try {
 	const brokerFactory = async (options: Parameters<typeof startOpenRouterBroker>[0]) => {
 		const broker = await startOpenRouterBroker({ ...options, upstreamFetch: async (input, init) => {
 			const url = String(input)
-			if (url.endsWith(`/models/${RSI_OPENROUTER_MODEL}/endpoints`)) return new Response(JSON.stringify({ data: { endpoints: [{ provider_slug: "deepseek", pricing: { prompt: "0.000001", completion: "0.000001" } }] } }), { status: 200, headers: { "content-type": "application/json" } })
+			if (url.endsWith(`/models/${RSI_OPENROUTER_MODEL}/endpoints`)) return new Response(JSON.stringify({ data: { endpoints: [{ provider_name: "DeepInfra", tag: "deepinfra/fp8", quantization: "fp8", status: 0, supported_parameters: ["max_tokens", "temperature", "tools", "tool_choice"], supports_tool_choice: { "auto": true, "required": true }, pricing: { prompt: "0.00000006", completion: "0.00000018" } }] } }), { status: 200, headers: { "content-type": "application/json" } })
 			assert.equal(url, "https://openrouter.ai/api/v1/chat/completions")
 			assert.equal(new Headers(init?.headers).get("authorization"), "Bearer host-test-key-never-forwarded-to-guest")
-			return new Response(JSON.stringify({ id: "mock-provider-response", model: RSI_OPENROUTER_MODEL, choices: [{ message: { role: "assistant", content: "done" } }], usage: { prompt_tokens: 12, completion_tokens: 4, cost: 0.000016 } }), { status: 200, headers: { "content-type": "application/json" } })
+			return new Response(JSON.stringify({ id: "mock-provider-response", model: RSI_OPENROUTER_MODEL, openrouter_metadata: { endpoints: { available: [{ provider: "deepinfra", selected: true }] } }, choices: [{ message: { role: "assistant", content: "done" } }], usage: { prompt_tokens: 12, completion_tokens: 4, cost: 0.00000144 } }), { status: 200, headers: { "content-type": "application/json" } })
 		} })
 		brokerBaseUrl = broker.localBaseUrl
 		lastCapability = broker.capability

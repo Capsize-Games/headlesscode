@@ -5,7 +5,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { createServer } from "node:http"
 import { OpenShellBenchmarkAgent, initializeTaskRepository } from "../../src/rsi/benchmark/openshell-agent.js"
-import { RSI_OPENROUTER_MODEL, startOpenRouterBroker } from "../../src/rsi/inference-broker.js"
+import { RSI_OPENROUTER_ENDPOINT_PROVIDER, RSI_OPENROUTER_ENDPOINT_TAG, RSI_OPENROUTER_MODEL, startOpenRouterBroker } from "../../src/rsi/inference-broker.js"
 import { OpenShellSessionProvider } from "../../src/cloud/openshell-provider.js"
 
 const repoRoot = path.resolve(process.argv[2] ?? process.cwd())
@@ -60,7 +60,7 @@ try {
 		upstreamFetch: async (input, init) => {
 			const url = String(input)
 			if (url.endsWith(`/models/${RSI_OPENROUTER_MODEL}/endpoints`)) {
-				return new Response(JSON.stringify({ data: { endpoints: [{ provider_slug: "deepseek", pricing: { prompt: "0.000001", completion: "0.000001" } }] } }), { status: 200, headers: { "content-type": "application/json" } })
+				return new Response(JSON.stringify({ data: { endpoints: [{ provider_name: "DeepInfra", tag: RSI_OPENROUTER_ENDPOINT_TAG, quantization: "fp8", status: 0, supported_parameters: ["tools", "tool_choice", "temperature", "seed", "max_tokens"], supports_tool_choice: { auto: true, required: true, function: true }, pricing: { prompt: "0.000001", completion: "0.000001" } }] } }), { status: 200, headers: { "content-type": "application/json" } })
 			}
 			assert.equal(url, "https://openrouter.ai/api/v1/chat/completions")
 			assert.equal(new Headers(init?.headers).get("authorization"), `Bearer ${key}`)
@@ -76,6 +76,7 @@ try {
 			assert.ok(body.messages?.length)
 			return new Response(JSON.stringify({
 				id: `mock-response-${upstreamCalls}`, model: RSI_OPENROUTER_MODEL,
+				openrouter_metadata: { endpoints: { available: [{ provider: RSI_OPENROUTER_ENDPOINT_PROVIDER, selected: true }] } },
 				choices: [{ message, finish_reason: "tool_calls" }],
 				usage: { prompt_tokens: 400, completion_tokens: 24, cost: 0.000424 },
 			}), { status: 200, headers: { "content-type": "application/json" } })

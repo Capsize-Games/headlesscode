@@ -133,7 +133,7 @@ test("PostgreSQL OpenRouter admission persists reservations, blocks overspend, a
 		const admissions = await Promise.allSettled([queue.reserve(grant, reservation("call-concurrent-0001")), queue.reserve(grant, reservation("call-concurrent-0002"))])
 		assert.equal(admissions.filter((item) => item.status === "fulfilled").length, 1, "campaign and job spend locks admit only one call under contention")
 		const callId = admissions[0]?.status === "fulfilled" ? "call-concurrent-0001" : "call-concurrent-0002"
-		await queue.settle(grant, { callId, state: "complete", qualified: true, returnedModel: grant.model, promptTokens: 12, completionTokens: 8, costUsd: 0.001, responseSha256: "b".repeat(64), completedAt: new Date().toISOString() })
+		await queue.settle(grant, { callId, state: "complete", qualified: true, returnedModel: grant.model, returnedProvider: "deepinfra", promptTokens: 12, completionTokens: 8, costUsd: 0.001, responseSha256: "b".repeat(64), completedAt: new Date().toISOString() })
 		const receipt = await queue.receipt(grant)
 		assert.equal(receipt.qualified, true)
 		assert.equal(receipt.totalTokens, 20)
@@ -179,7 +179,7 @@ test("PostgreSQL OpenRouter admission persists reservations, blocks overspend, a
 		const lateReservation = reservation("call-late-12345678")
 		await queue.reserve(lateGrant, lateReservation)
 		await queue.pool.query("UPDATE headlesscode_rsi_inference_jobs SET started_at=clock_timestamp()-interval '61 seconds' WHERE job_id=$1", [lateJob.jobId])
-		await queue.settle(lateGrant, { callId: lateReservation.callId, state: "complete", qualified: true, returnedModel: lateGrant.model, promptTokens: 12, completionTokens: 8, costUsd: 0.001, responseSha256: "c".repeat(64), completedAt: new Date().toISOString() })
+		await queue.settle(lateGrant, { callId: lateReservation.callId, state: "complete", qualified: true, returnedModel: lateGrant.model, returnedProvider: "deepinfra", promptTokens: 12, completionTokens: 8, costUsd: 0.001, responseSha256: "c".repeat(64), completedAt: new Date().toISOString() })
 		assert.equal((await queue.receipt(lateGrant)).qualified, false, "a late settlement is persisted as non-qualifying")
 	} finally {
 		await queue.close().catch(() => undefined)

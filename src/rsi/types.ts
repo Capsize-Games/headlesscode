@@ -245,7 +245,11 @@ export interface RsiConfig {
 	benchmarkHarnessCommit?: string
 	workerHarnessMode?: WorkerHarnessMode
 	workerHarnessPhase?: WorkerHarnessPhase
+	/** Terminal, development-only paired run used to qualify the engineering chain before holdout freeze. */
+	workerHarnessEngineeringOnly?: boolean
 	workerHarnessPairId?: string
+	/** Deterministic supervisor-owned run ID for restart-safe paired campaign admission. */
+	workerHarnessRunId?: string
 	workerHarnessRuntime?: WorkerHarnessRuntimeIdentity
 	workerHarnessParentCommit?: string
 	workerHarnessSnapshotTreeDigest?: string
