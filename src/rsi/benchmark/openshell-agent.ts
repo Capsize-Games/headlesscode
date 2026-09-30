@@ -53,6 +53,10 @@ export class OpenShellBenchmarkAgent implements BenchmarkAgent {
 		const privateWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), `headlesscode-benchmark-agent-${request.taskId}-`))
 		await fs.rmdir(privateWorkspace)
 		execFileSync("git", ["clone", "--quiet", "--no-hardlinks", "--shared", request.workspace, privateWorkspace], { stdio: ["ignore", "pipe", "pipe"] })
+		// Importing the guest patch creates a supervisor commit in this private clone.
+		// Keep that behavior independent of the host user's global Git identity.
+		git(privateWorkspace, ["config", "user.name", "HeadlessCode Benchmark"])
+		git(privateWorkspace, ["config", "user.email", "benchmark@invalid.example"])
 		const baseCommit = git(privateWorkspace, ["rev-parse", "HEAD"])
 		const parsed = parseRsiArgs(["--repo", this.harnessRoot, "--model", request.model.id, "--max-iterations", String(request.ceilings.maxCalls), "--timeout-ms", String(request.ceilings.timeoutMs), "--max-tokens", String(request.ceilings.maxOutputTokensPerCall)])
 		if (!parsed.config || parsed.error) throw new Error(parsed.error ?? "could not construct OpenShell benchmark configuration")

@@ -10,8 +10,12 @@ import type { RsiOpenShellProviderFactory } from "../../openshell.js"
 
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "rsi-openshell-integrated-proof-"))
 const originalPath = process.env.PATH
+const originalHome = process.env.HOME
 const originalHarnessCommit = process.env.HEADLESSCODE_RSI_BENCHMARK_HARNESS_COMMIT
 try {
+	const emptyHome = path.join(tempRoot, "empty-home")
+	await fs.mkdir(emptyHome)
+	process.env.HOME = emptyHome
 	const fakeBin = path.join(tempRoot, "bin")
 	await fs.mkdir(fakeBin)
 	const fakeDocker = path.join(fakeBin, "docker")
@@ -122,6 +126,8 @@ try {
 } finally {
 	if (originalPath === undefined) delete process.env.PATH
 	else process.env.PATH = originalPath
+	if (originalHome === undefined) delete process.env.HOME
+	else process.env.HOME = originalHome
 	if (originalHarnessCommit === undefined) delete process.env.HEADLESSCODE_RSI_BENCHMARK_HARNESS_COMMIT
 	else process.env.HEADLESSCODE_RSI_BENCHMARK_HARNESS_COMMIT = originalHarnessCommit
 	delete process.env.RSI_TEST_IMAGE_DIGEST
