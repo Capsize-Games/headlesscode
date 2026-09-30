@@ -1,0 +1,6 @@
+{
+  "files": {
+    "src/solution.js": "import {info} from \"./helper.js\";export function solve(x){return {items:x.items.slice(x.page*x.size,(x.page+1)*x.size),...info(x)}}\n",
+    "src/helper.js": "export function info(x){return {page:x.page,pages:Math.ceil(x.items.length/x.size)}}\n"
+  }
+}

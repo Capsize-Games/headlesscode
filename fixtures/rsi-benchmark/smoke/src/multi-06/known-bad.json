@@ -1,0 +1,6 @@
+{
+  "files": {
+    "src/solution.js": "import {ascii} from \"./helper.js\";export function solve(s){return ascii(s).toLowerCase().replace(/\\s+/g,\"-\")}\n",
+    "src/helper.js": "export function ascii(s){return s.normalize(\"NFD\").replace(/[\\u0300-\\u036f]/g,\"\")}\n"
+  }
+}

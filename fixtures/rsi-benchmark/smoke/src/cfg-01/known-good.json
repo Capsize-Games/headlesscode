@@ -1,0 +1,5 @@
+{
+  "files": {
+    "src/solution.js": "export function solve(s,f){if(s==null||s===\"\")return f;let v=String(s).trim().toLowerCase();if([\"true\",\"1\",\"yes\"].includes(v))return true;if([\"false\",\"0\",\"no\"].includes(v))return false;throw Error(\"invalid boolean\")}\n"
+  }
+}

@@ -1,0 +1,1 @@
+export function solve(n,r){return Math.min(1000*2**n,30000)}

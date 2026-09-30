@@ -1,0 +1,5 @@
+{
+  "files": {
+    "src/solution.js": "export function solve(s){return JSON.parse(s)}\n"
+  }
+}

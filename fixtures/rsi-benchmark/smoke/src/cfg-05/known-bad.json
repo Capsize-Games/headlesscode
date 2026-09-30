@@ -1,0 +1,5 @@
+{
+  "files": {
+    "src/solution.js": "export function solve(x){return {...x}}\n"
+  }
+}

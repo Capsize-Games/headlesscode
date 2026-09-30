@@ -123,7 +123,7 @@ function verifySanitizedBundle(root: string, expectedCommit: string, jobKind: Fl
 		const [mode] = entry.slice(0, tab).split(" ")
 		const relativePath = entry.slice(tab + 1).replaceAll("\\", "/")
 		if (mode !== "100644" && mode !== "100755") throw new Error("fleet snapshot contains a symlink, submodule or special file")
-		if (relativePath === ".env" || relativePath.startsWith(".env.") || relativePath.startsWith("src/rsi/") || relativePath.startsWith(".headlesscode/") || relativePath.startsWith("scripts/eval-suite/") || (jobKind === "mutation" && (relativePath.startsWith("fixtures/rsi-curriculum/") || relativePath.startsWith("scripts/") || relativePath.startsWith("tests/") || relativePath.startsWith("test/") || relativePath.includes("/__tests__/") || /(?:^|\/)\D[^/]*\.(?:test|spec)\.[^/]+$/.test(relativePath)))) {
+		if (relativePath === ".env" || relativePath.startsWith(".env.") || relativePath.startsWith("src/rsi/") || relativePath.startsWith(".headlesscode/") || relativePath.startsWith("scripts/eval-suite/") || (jobKind === "mutation" && (relativePath.startsWith("fixtures/rsi-curriculum/") || relativePath.startsWith("fixtures/rsi-benchmark/") || relativePath.startsWith("scripts/") || relativePath.startsWith("tests/") || relativePath.startsWith("test/") || relativePath.includes("/__tests__/") || /(?:^|\/)\D[^/]*\.(?:test|spec)\.[^/]+$/.test(relativePath)))) {
 			throw new Error(`fleet snapshot contains protected evaluator or credential material: ${relativePath}`)
 		}
 		if ((jobKind === "training" || jobKind === "model-evaluation") && !relativePath.startsWith(".headlesscode-rsi-model/")) {

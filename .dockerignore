@@ -13,6 +13,9 @@ node_modules/
 dist/
 build/
 *.tsbuildinfo
+**/__tests__/
+**/*.test.ts
+**/*.spec.ts
 
 # Session/state dirs (this repo's own .headlesscode can be hundreds of MB)
 .headlesscode/

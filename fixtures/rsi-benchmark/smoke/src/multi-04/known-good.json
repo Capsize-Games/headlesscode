@@ -1,0 +1,6 @@
+{
+  "files": {
+    "src/solution.js": "import {info} from \"./helper.js\";export function solve(x){let p=Math.max(1,x.page|0);return {items:x.items.slice((p-1)*x.size,p*x.size),...info({...x,page:p})}}\n",
+    "src/helper.js": "export function info(x){return {page:x.page,pages:Math.max(1,Math.ceil(x.items.length/x.size))}}\n"
+  }
+}

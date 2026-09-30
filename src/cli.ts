@@ -754,6 +754,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		const { rsiWorkerMain } = await import("./rsi/worker.js")
 		return rsiWorkerMain()
 	}
+	if (argv[0] === "rsi-benchmark") {
+		const { benchmarkMain } = await import("./rsi/benchmark/cli.js")
+		return benchmarkMain(argv.slice(1))
+	}
 	if (argv[0] === "rsi-train-model") {
 		const { parseRsiArgs } = await import("./rsi/config.js")
 		const { readArchive } = await import("./rsi/archive.js")

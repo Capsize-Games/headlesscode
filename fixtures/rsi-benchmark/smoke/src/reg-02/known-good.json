@@ -1,0 +1,5 @@
+{
+  "files": {
+    "src/solution.js": "export function solve(v){let n=Number(v);return Number.isFinite(n)?n:5}\n"
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "files": {
+    "src/solution.js": "export function solve(x){let n=Number(x);if(!Number.isInteger(n)||n<1||n>120000)throw Error(\"invalid timeout\");return n}\n"
+  }
+}

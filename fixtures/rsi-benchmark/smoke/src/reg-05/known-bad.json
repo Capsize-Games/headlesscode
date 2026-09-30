@@ -1,0 +1,5 @@
+{
+  "files": {
+    "src/solution.js": "export function solve(s){return Object.fromEntries(new URLSearchParams(s))}\n"
+  }
+}

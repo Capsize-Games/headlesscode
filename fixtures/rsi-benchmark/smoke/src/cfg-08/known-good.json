@@ -1,0 +1,5 @@
+{
+  "files": {
+    "src/solution.js": "export function solve(x){if(x.version!==1)return x;let {retries,...r}=x;return {...r,version:2,maxAttempts:retries??3,enabled:true}\n"
+  }
+}
