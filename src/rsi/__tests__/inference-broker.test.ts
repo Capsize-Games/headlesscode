@@ -187,7 +187,9 @@ test("OpenRouter broker marks timeouts unmeasured and does not automatically spe
 		dispatched += 1
 		return await new Promise<Response>((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(new DOMException("timed out", "AbortError")), { once: true }))
 	}) as typeof fetch
-	const { broker } = await setup(t, { limits: limits("campaign-timeout", { maxDurationMs: 25 }), upstreamFetch: upstream })
+	// Leave enough time for the local HTTP request to reach the broker on loaded CI
+	// workers; the delayed mock response still exercises the real abort deadline.
+	const { broker } = await setup(t, { limits: limits("campaign-timeout", { maxDurationMs: 2_000 }), upstreamFetch: upstream })
 	const send = (callId: string) => fetch(`${broker.localBaseUrl}/api/v1/chat/completions`, {
 		method: "POST", headers: { authorization: `Bearer ${broker.capability}`, "content-type": "application/json", "x-rsi-call-id": callId }, body: requestBody(),
 	})

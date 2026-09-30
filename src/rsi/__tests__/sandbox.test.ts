@@ -17,7 +17,7 @@ function testNormalSourceChangeIsAllowed(): void {
 }
 
 function testMutationSnapshotHardProtectionsCannotBeRemovedByConfiguration(): void {
-	const inheritedChanges = ["package.json", "package-lock.json", "docker/OpenShell-RSI.Dockerfile", ".dockerignore", "src/rsi/controller.ts", "fixtures/rsi-benchmark/manifest.json"]
+	const inheritedChanges = ["package.json", "package-lock.json", "docker/OpenShell-RSI.Dockerfile", ".dockerignore", "src/rsi/controller.ts", "fixtures/rsi-benchmark/manifest.json", "__rsi_benchmark_verifier__/verify.mjs"]
 	assert.deepEqual(
 		mutationSnapshotProtectedPathViolations(inheritedChanges, []),
 		inheritedChanges,

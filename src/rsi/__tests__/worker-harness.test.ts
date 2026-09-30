@@ -49,11 +49,47 @@ function testPairedArmDigestIgnoresOnlyTheHarnessArm(): void {
 	const fixed = workerHarnessConfigDigest({ ...config, workerHarnessMode: "fixed-control", workerHarnessPairId: "pair-a" }, identity)
 	const selfHosted = workerHarnessConfigDigest({ ...config, workerHarnessMode: "self-hosted", workerHarnessPairId: "pair-a" }, identity)
 	assert.equal(fixed, selfHosted)
-	assert.notEqual(workerHarnessConfigDigest({ ...config, mutationTask: "different task" }, identity), fixed)
-	assert.notEqual(workerHarnessConfigDigest({ ...config, seed: "different seed" }, identity), fixed)
-	assert.notEqual(workerHarnessConfigDigest({ ...config, generations: 3 }, identity), fixed)
-	assert.notEqual(workerHarnessConfigDigest({ ...config, maxTokens: 512 }, identity), fixed)
-	assert.notEqual(workerHarnessConfigDigest({ ...config, commandTimeoutMs: 60_001 }, identity), fixed)
+	const differingSettings: Array<Partial<RsiConfig>> = [
+		{ mutationTask: "different task" },
+		{ seed: "different seed" },
+		{ generations: 3 },
+		{ maxTokens: 512 },
+		{ commandTimeoutMs: 60_001 },
+		{ parentSelectionPolicy: "all-eligible" },
+		{ eliteCount: 3 },
+		{ specialistCount: 2 },
+		{ noveltyRate: 0.25 },
+		{ maxTrajectories: 4 },
+		{ maxTotalIterations: 13 },
+		{ maxRuntimeMs: 90_000 },
+		{ roles: { worker: { provider: "openrouter", model: "pinned-model" }, critic: { provider: "ollama", model: "critic-v2" } } },
+		{ modelCandidateId: "different-model-candidate" },
+		{ modelCandidates: [{ id: "model-alt", parentModel: "pinned-model", trainingMethod: "none", trainingConfig: { method: "none" }, status: "base", createdAt: "now" }] },
+	]
+	for (const settings of differingSettings) {
+		assert.notEqual(workerHarnessConfigDigest({ ...config, ...settings }, identity), fixed, `paired config digest must bind ${Object.keys(settings).join(",")}`)
+	}
+	const defaulted = workerHarnessConfigDigest(config, identity)
+	const explicitDefaults = workerHarnessConfigDigest({
+		...config,
+		roles: { worker: { provider: "openrouter", model: identity.model } },
+		parentSelectionPolicy: "champion-specialist-novelty",
+		maxTrajectories: config.population + 1,
+		maxTotalIterations: (config.population + 1) * config.maxIterations,
+		maxRuntimeMs: 60 * 60_000,
+		modelCandidateId: "model-base",
+		modelCandidates: [],
+	}, identity)
+	assert.equal(defaulted, explicitDefaults, "omitted and explicitly supplied effective defaults must have the same paired digest")
+	const sameRolesDifferentInsertionOrder = workerHarnessConfigDigest({
+		...config,
+		roles: { critic: { provider: "ollama", model: "critic" }, worker: { provider: "openrouter", model: identity.model } },
+	}, identity)
+	const canonicalRoleOrder = workerHarnessConfigDigest({
+		...config,
+		roles: { worker: { provider: "openrouter", model: identity.model }, critic: { provider: "ollama", model: "critic" } },
+	}, identity)
+	assert.equal(sameRolesDifferentInsertionOrder, canonicalRoleOrder, "role map insertion order must not change the frozen digest")
 	assert.notEqual(workerHarnessConfigDigest(config, { ...identity, model: "different-model" }), fixed)
 	assert.notEqual(workerHarnessConfigDigest(config, { ...identity, proofProtocolDigest: "c".repeat(64) }), fixed)
 }

@@ -51,7 +51,7 @@ function isTerminal(candidate: CandidateRecord): boolean {
 
 class CandidateLineageError extends Error {}
 
-function validateCandidateParent(candidate: CandidateRecord, run: RsiRunRecord, config: RsiConfig, protocol: NonNullable<RsiRunRecord["developmentProofProtocol"]>): void {
+export function validateCandidateParent(candidate: CandidateRecord, run: RsiRunRecord, config: RsiConfig, protocol: NonNullable<RsiRunRecord["developmentProofProtocol"]>): void {
 	if (candidate.parent === "baseline") {
 		if (candidate.baseCommit !== run.baseCommit || candidate.parentCommit !== run.baseCommit) throw new CandidateLineageError("baseline child does not use the frozen run base commit")
 		return
@@ -580,7 +580,12 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	if (resumed && (config.workerHarnessMode !== undefined || run.workerHarnessPairId !== undefined) && stageCount !== plannedGenerations) {
 		throw new Error("worker harness planned generation count differs from the frozen paired experiment")
 	}
-	const pairedConfig = { ...config, generations: plannedGenerations }
+	const pairedConfig = {
+		...config,
+		generations: plannedGenerations,
+		roles,
+		parentSelectionPolicy: run.parentSelectionPolicy,
+	}
 	const pairedDigest = workerHarnessConfigDigest(pairedConfig, {
 		baseCommit,
 		model: workerModel,

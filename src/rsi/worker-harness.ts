@@ -28,18 +28,35 @@ export function validWorkerHarnessRuntimeIdentity(identity: WorkerHarnessRuntime
 		&& /^[a-f0-9]{64}$/.test(identity.dependencyLockDigest)
 }
 
+function canonicalConfigValue(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(canonicalConfigValue)
+	if (value && typeof value === "object") {
+		return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+			.filter(([, entry]) => entry !== undefined)
+			.sort(([left], [right]) => Buffer.compare(Buffer.from(left), Buffer.from(right)))
+			.map(([key, entry]) => [key, canonicalConfigValue(entry)]))
+	}
+	return value
+}
+
 export function workerHarnessConfigDigest(config: RsiConfig, identity: {
 	baseCommit: string
 	model: string
 	provider: string
 	proofProtocolDigest: string
 }): string {
+	const maxTrajectories = config.maxTrajectories ?? config.population + 1
+	const workerRole = config.roles?.worker ?? {
+		provider: identity.provider === "openshell-openrouter" ? "openrouter" : "ollama",
+		model: identity.model,
+	}
 	const comparable = {
-		schemaVersion: 1,
+		schemaVersion: 2,
 		baseCommit: identity.baseCommit,
 		mutationTask: config.mutationTask,
 		model: identity.model,
 		provider: identity.provider,
+		roles: { ...config.roles, worker: workerRole },
 		seed: config.seed,
 		population: config.population,
 		generations: config.generations,
@@ -47,12 +64,23 @@ export function workerHarnessConfigDigest(config: RsiConfig, identity: {
 		maxTokens: config.maxTokens ?? null,
 		timeoutMs: config.commandTimeoutMs,
 		maxConcurrent: config.maxConcurrent,
+		maxTrajectories,
+		maxTotalIterations: config.maxTotalIterations ?? maxTrajectories * config.maxIterations,
+		maxRuntimeMs: config.maxRuntimeMs ?? 60 * 60_000,
 		computePolicy: config.computePolicy ?? "single",
 		mutationKind: config.mutationKind ?? "corrective",
+		hypothesis: config.hypothesis ?? null,
+		parentSelectionPolicy: config.parentSelectionPolicy ?? "champion-specialist-novelty",
+		eliteCount: config.eliteCount ?? null,
+		specialistCount: config.specialistCount ?? null,
+		noveltyRate: config.noveltyRate ?? null,
+		modelCandidateId: config.modelCandidateId ?? "model-base",
+		modelCandidates: config.modelCandidates ?? [],
 		regressionCommand: config.regressionCommand,
 		evalCommands: [...config.evalCommands],
+		hiddenEvalCommands: [...config.hiddenEvalCommands],
 		protectedPaths: [...config.protectedPaths].sort(),
 		proofProtocolDigest: identity.proofProtocolDigest,
 	}
-	return createHash("sha256").update(JSON.stringify(comparable)).digest("hex")
+	return createHash("sha256").update(JSON.stringify(canonicalConfigValue(comparable))).digest("hex")
 }

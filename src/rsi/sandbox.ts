@@ -3,7 +3,7 @@ import { DEFAULT_PROTECTED_FILES, findMatchingPattern } from "../permissions/pro
 const MUTATION_HARD_PROTECTIONS = [
 	"src/rsi/", "scripts/", "tests/", "test/", "fixtures/rsi-curriculum/", "fixtures/rsi-benchmark/",
 	"**/*.test.ts", "**/*.spec.ts", "package.json", "package-lock.json", ".gitignore", "docker/", ".dockerignore",
-	".headlesscode/", ".worktrees/",
+	".headlesscode/", ".worktrees/", "__rsi_benchmark_verifier__/",
 ]
 
 export function protectedPathViolations(changedFiles: string[], patterns: string[]): string[] {

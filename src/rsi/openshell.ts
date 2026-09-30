@@ -71,7 +71,7 @@ function pathIsSafe(relativePath: string): boolean {
 
 function alwaysOmit(relativePath: string): boolean {
 	const normalized = relativePath.replaceAll("\\", "/")
-	return normalized.startsWith("__headlesscode_rsi_adversarial__/") || findMatchingPattern(normalized, [...DEFAULT_PROTECTED_FILES, ".headlesscode/", ".worktrees/", "node_modules/", "src/rsi/", "scripts/eval-suite/", "fixtures/rsi-benchmark/"]) !== null
+	return normalized.startsWith("__headlesscode_rsi_adversarial__/") || findMatchingPattern(normalized, [...DEFAULT_PROTECTED_FILES, ".headlesscode/", ".worktrees/", "node_modules/", "src/rsi/", "scripts/eval-suite/", "fixtures/rsi-benchmark/", "__rsi_benchmark_verifier__/"]) !== null
 }
 
 function shouldInclude(relativePath: string, mode: IsolatedRunOptions["mode"], config: RsiConfig): boolean {
@@ -645,6 +645,7 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 			"test ! -e /workspace/tests",
 			"test ! -e /workspace/test",
 			"test ! -e /workspace/fixtures",
+			"test ! -e /workspace/__rsi_benchmark_verifier__",
 			"test ! -e /workspace/package.json",
 			"test ! -e /workspace/package-lock.json",
 			"test ! -e /workspace/docker",

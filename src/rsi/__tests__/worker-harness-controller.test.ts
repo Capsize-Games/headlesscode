@@ -7,8 +7,9 @@ import { checkpointRun } from "../archive.js"
 import { runRsi } from "../controller.js"
 import { createMutationSnapshotIdentity } from "../openshell.js"
 import { effectiveWorkerHarnessMode, workerHarnessCliPath } from "../worker-harness.js"
-import type { RsiConfig, TrialResult, WorkerHarnessRuntimeIdentity } from "../types.js"
+import type { CandidateRecord, RsiConfig, RsiRunRecord, TrialResult, WorkerHarnessRuntimeIdentity } from "../types.js"
 import { fakeDevelopmentBenchmarkHook } from "./development-proof-fixture.js"
+import { validateCandidateParent } from "../controller.js"
 
 function ok(command: string): TrialResult {
 	return { ok: true, command, exitCode: 0, durationMs: 1, stdout: "", stderr: "" }
@@ -86,6 +87,30 @@ async function main(): Promise<void> {
 			runRsi({ ...config, generations: 3, resumeRunId: run.runId }, { log: () => undefined, runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook() }),
 			/planned generation count/,
 			"explicit harness resume must reject a changed paired generation count",
+		)
+		await fs.mkdir(path.join(repo, "docker"), { recursive: true })
+		await fs.writeFile(path.join(repo, "docker", "OpenShell-RSI.Dockerfile"), "FROM malicious-parent\n")
+		execFileSync("git", ["add", "docker/OpenShell-RSI.Dockerfile"], { cwd: repo })
+		execFileSync("git", ["commit", "-qm", "tampered protected ancestor"], { cwd: repo })
+		const protectedParentCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim()
+		await fs.writeFile(path.join(repo, "src", "agent.ts"), "export const safeChildPatch = true\n")
+		execFileSync("git", ["add", "src/agent.ts"], { cwd: repo })
+		execFileSync("git", ["commit", "-qm", "safe child patch after protected parent"], { cwd: repo })
+		const safeChildCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim()
+		const acceptedParent = {
+			id: "tampered-parent", status: "accepted", commits: [protectedParentCommit],
+			developmentProof: { accepted: true, runId: "lineage-run", protocolDigest: "p" },
+			fitness: { hardGates: { regression: true, typecheck: true, visible: true } },
+		} as unknown as CandidateRecord
+		const launderingChild = {
+			id: "safe-looking-child", parent: acceptedParent.id, baseCommit: protectedParentCommit,
+			parentCommit: protectedParentCommit, commits: [safeChildCommit],
+		} as unknown as CandidateRecord
+		const lineageRun = { runId: "lineage-run", baseCommit: rootCommit, candidates: [acceptedParent] } as unknown as RsiRunRecord
+		assert.throws(
+			() => validateCandidateParent(launderingChild, lineageRun, { ...config, protectedPaths: [] }, { protocolDigest: "p" } as NonNullable<RsiRunRecord["developmentProofProtocol"]>),
+			/parent .*inherits protected path changes: docker\/OpenShell-RSI\.Dockerfile/,
+			"a safe child patch cannot launder a protected change inherited from its accepted parent",
 		)
 		console.log("Controller selected-parent worker harness assertions passed")
 	} finally {
