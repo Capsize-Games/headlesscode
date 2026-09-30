@@ -5,6 +5,7 @@ import type { ResourceClass, WorkerHarnessMode, WorkerHarnessRuntimeIdentity } f
 import { createRsiArtifactStore, type RsiArtifactReference, type RsiArtifactStore } from "./artifact-store.js"
 import type { OpenRouterBrokerGrant, OpenRouterBrokerReceipt, OpenRouterCallReceipt, OpenRouterCallReservation, OpenRouterCallSettlement, OpenRouterDenialReason, OpenRouterInferenceLedger } from "./inference-broker.js"
 import type { OpenRouterBrokerLimits } from "./inference-broker.js"
+import { PostgresProofCampaign, type ProofCampaignArmLease, type ProofCampaignManifest } from "./proof-campaign.js"
 
 const MIGRATIONS = [
 	{ version: 1, sql: readFileSync(new URL("./migrations/001_postgres_fleet_queue.sql", import.meta.url), "utf8") },
@@ -12,6 +13,7 @@ const MIGRATIONS = [
 	{ version: 3, sql: readFileSync(new URL("./migrations/003_model_training_jobs.sql", import.meta.url), "utf8") },
 	{ version: 4, sql: readFileSync(new URL("./migrations/004_openrouter_inference_broker.sql", import.meta.url), "utf8") },
 	{ version: 5, sql: readFileSync(new URL("./migrations/005_openrouter_denial_summaries.sql", import.meta.url), "utf8") },
+	{ version: 6, sql: readFileSync(new URL("./migrations/006_proof_campaigns.sql", import.meta.url), "utf8") },
 ]
 
 function sha256Text(value: string): string { return createHash("sha256").update(value).digest("hex") }
@@ -78,6 +80,7 @@ export interface FleetJobPayload {
 	task: string
 	model: string
 	provider?: "ollama" | "openrouter"
+	proofCampaign?: { campaignId: string; armId: string; epoch: number; manifestSha256: string; cells: Array<{ attemptKey: string; slotId: string; attemptKind: "mutation" | "verification" }> }
 	inferenceLimits?: OpenRouterBrokerLimits
 	maxIterations: number
 	timeoutMs: number
@@ -148,16 +151,32 @@ function stableJson(value: unknown): string {
 	return encoded === undefined ? "undefined" : encoded
 }
 
+export function fleetPayloadDigest(payload: FleetJobPayload): string { return sha256Text(stableJson(payload)) }
+
 /** Compare every queued execution input before a coordinator reuses an idempotent job. */
 export function fleetJobMatches(job: FleetJob, expected: FleetJobIdentity): boolean {
-	return job.idempotencyKey === expected.idempotencyKey
+	const identityMatches = job.idempotencyKey === expected.idempotencyKey
 		&& job.runId === expected.runId
 		&& job.candidateId === expected.candidateId
 		&& job.jobKind === expected.jobKind
 		&& job.resourceClass === expected.resourceClass
 		&& (job.concurrencyKey ?? undefined) === (expected.concurrencyKey ?? undefined)
 		&& job.artifactSha256 === expected.artifactSha256
-		&& stableJson(job.payload) === stableJson(expected.payload)
+	if (!identityMatches) return false
+	if (stableJson(job.payload) === stableJson(expected.payload)) return true
+	return completedProofJobMatches(job, expected)
+}
+
+function normalizedProofReplayPayload(payload: FleetJobPayload): FleetJobPayload {
+	const normalized = structuredClone(payload)
+	if (normalized.proofCampaign) normalized.proofCampaign.epoch = 0
+	if (normalized.inferenceLimits) normalized.inferenceLimits.maxDurationMs = 0
+	return normalized
+}
+
+function completedProofJobMatches(job: FleetJob, expected: FleetJobIdentity): boolean {
+	if (job.status !== "completed" || !job.payload.proofCampaign || !expected.payload.proofCampaign) return false
+	return stableJson(normalizedProofReplayPayload(job.payload)) === stableJson(normalizedProofReplayPayload(expected.payload))
 }
 
 function validatePolicy(policy: FleetQueuePolicy): FleetQueuePolicy {
@@ -265,6 +284,8 @@ export class PostgresRsiJobQueue {
 		}
 	}
 
+	proofCampaignCoordinator(): PostgresProofCampaign { return new PostgresProofCampaign(this.pool) }
+
 	async registerWorker(registration: FleetWorkerRegistration): Promise<void> {
 		if (!registration.workerId.trim() || !registration.gatewayId.trim() || !registration.hostname.trim()) throw new Error("worker id, gateway id and hostname are required")
 		if (!Number.isInteger(registration.maxActive) || registration.maxActive < 1) throw new Error("worker maxActive must be a positive integer")
@@ -319,12 +340,36 @@ export class PostgresRsiJobQueue {
 		if (input.payload.snapshotBytes < 1) throw new Error("job payload declares an invalid snapshot size")
 		return inTransaction(this.pool, async (client) => {
 			const jobId = randomUUID()
+			const proof = input.payload.proofCampaign
+			const priorJob = proof ? await client.query("SELECT job_id FROM headlesscode_rsi_jobs WHERE queue_name=$1 AND idempotency_key=$2", [this.policy.queueName, input.idempotencyKey]) : undefined
+			if (proof) {
+			if (!proof.cells.length || new Set(proof.cells.map((cell) => cell.attemptKey)).size !== proof.cells.length || proof.cells.some((cell) => cell.attemptKind !== (input.jobKind === "mutation" ? "mutation" : "verification"))) throw new Error("proof-bound queue job requires unique campaign task cells matching its job kind")
+				const campaign = await client.query("SELECT manifest,manifest_sha256,deadline_at > clock_timestamp() AS deadline_valid FROM headlesscode_rsi_proof_campaigns WHERE campaign_id=$1 FOR UPDATE", [proof.campaignId])
+				const arm = await client.query("SELECT epoch,run_id,lease_expires_at > clock_timestamp() AS lease_valid,state FROM headlesscode_rsi_proof_campaign_arms WHERE campaign_id=$1 AND arm_id=$2 FOR UPDATE", [proof.campaignId, proof.armId])
+				const attempt = await client.query("SELECT status,epoch,candidate_id,source_candidate_id,attempt_kind,generation,task_id,seed,job_id,attempt_key FROM headlesscode_rsi_proof_campaign_attempts WHERE campaign_id=$1 AND arm_id=$2 AND attempt_key=ANY($3::text[]) ORDER BY attempt_key FOR UPDATE", [proof.campaignId, proof.armId, proof.cells.map((cell) => cell.attemptKey).sort()])
+				const cellsValid = attempt.rowCount === proof.cells.length && proof.cells.every((cell) => {
+					const row = attempt.rows.find((entry) => entry.attempt_key === cell.attemptKey)
+					return row?.status === "dispatched" && Number(row.epoch) === proof.epoch && row.candidate_id === cell.slotId && row.source_candidate_id === input.candidateId && row.attempt_kind === cell.attemptKind && (!row.job_id || String(row.job_id) === String(priorJob?.rows[0]?.job_id ?? ""))
+				})
+				const manifest = campaign.rows[0]?.manifest as { schedule?: Array<{ armId: string; generation: number; candidateId: string; taskId: string; seed: string; attemptKind: string }> } | undefined
+				const rows = attempt.rows
+				const generation = rows[0]?.generation
+				const expectedCells = manifest?.schedule?.filter((cell) => cell.armId === proof.armId && cell.generation === Number(generation) && cell.candidateId === rows[0]?.candidate_id && cell.attemptKind === (input.jobKind === "mutation" ? "mutation" : "verification")) ?? []
+				const actualCells = rows.map((row) => ({ generation: Number(row.generation), candidateId: row.candidate_id, taskId: row.task_id, seed: row.seed, attemptKind: row.attempt_kind }))
+				const frozenCells = expectedCells.map((cell) => JSON.stringify({ generation: cell.generation, candidateId: cell.candidateId, taskId: cell.taskId, seed: cell.seed, attemptKind: cell.attemptKind })).sort()
+				const admittedCells = actualCells.map((cell) => JSON.stringify(cell)).sort()
+				const bindingOwnsJob = arm.rows[0]?.run_id === input.runId && rows.every((row) => row.source_candidate_id === input.candidateId && Number(row.generation) === Number(generation))
+				if (!campaign.rows[0] || campaign.rows[0].manifest_sha256.trim() !== proof.manifestSha256 || campaign.rows[0].deadline_valid !== true || !arm.rows[0] || Number(arm.rows[0].epoch) !== proof.epoch || arm.rows[0].lease_valid !== true || arm.rows[0].state === "finished" || !cellsValid || !bindingOwnsJob || expectedCells.length !== actualCells.length || frozenCells.some((cell, index) => cell !== admittedCells[index])) throw new Error("proof-bound queue job admission requires exact current dispatched cells for this run and candidate")
+			}
 			const inserted = await client.query(
 				`INSERT INTO headlesscode_rsi_jobs(job_id,queue_name,idempotency_key,run_id,candidate_id,job_kind,resource_class,concurrency_key,artifact_sha256,payload,status,max_attempts,lease_duration_ms)
 				 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,'queued',$11,$12) ON CONFLICT(queue_name,idempotency_key) DO NOTHING RETURNING *`,
 				[jobId, this.policy.queueName, input.idempotencyKey, input.runId, input.candidateId, input.jobKind, input.resourceClass, input.concurrencyKey ?? null, input.artifactSha256, JSON.stringify(input.payload), this.policy.maxAttempts, Math.max(this.policy.leaseMs, requiredFleetJobLeaseMs(input.jobKind, input.payload.timeoutMs, input.payload.evalCommands?.length ?? 0))],
 			)
-			if (inserted.rowCount === 1) return rowToJob(inserted.rows[0])
+			if (inserted.rowCount === 1) {
+				if (proof) await client.query("UPDATE headlesscode_rsi_proof_campaign_attempts SET job_id=$4,updated_at=clock_timestamp() WHERE campaign_id=$1 AND arm_id=$2 AND attempt_key=ANY($3::text[]) AND job_id IS NULL", [proof.campaignId, proof.armId, proof.cells.map((cell) => cell.attemptKey), jobId])
+				return rowToJob(inserted.rows[0])
+			}
 			const existing = await client.query("SELECT * FROM headlesscode_rsi_jobs WHERE queue_name=$1 AND idempotency_key=$2 FOR UPDATE", [this.policy.queueName, input.idempotencyKey])
 			const row = existing.rows[0]
 			if (!row || row.run_id !== input.runId || row.candidate_id !== input.candidateId || row.job_kind !== input.jobKind || row.resource_class !== input.resourceClass || row.concurrency_key !== (input.concurrencyKey ?? null) || row.artifact_sha256.trim() !== input.artifactSha256 || stableJson(row.payload) !== stableJson(input.payload)) {
@@ -586,7 +631,91 @@ export class PostgresRsiJobQueue {
 
 	async complete(lease: FleetJobLease, resultValue: unknown): Promise<QueueMutationResult> {
 		const resultJson = JSON.stringify(resultValue)
+		const resultDigest = sha256Text(stableJson(resultValue))
+		const resultArtifactRefs: Record<string, RsiArtifactReference> = {}
+		const resultObject = resultValue && typeof resultValue === "object" ? resultValue as Record<string, unknown> : {}
+		const declaredArtifacts: Array<{ key: string; sha256: unknown; bytes?: unknown }> = []
+		if (typeof resultObject.patchSha256 === "string") declaredArtifacts.push({ key: "patch", sha256: resultObject.patchSha256, bytes: resultObject.patchBytes })
+		const outputArtifact = resultObject.outputArtifact as Record<string, unknown> | undefined
+		if (outputArtifact && typeof outputArtifact.sha256 === "string") declaredArtifacts.push({ key: "evaluation-output", sha256: outputArtifact.sha256, bytes: outputArtifact.bytes })
+		for (const artifact of declaredArtifacts) {
+			const artifactDigest = String(artifact.sha256)
+			if (!/^[a-f0-9]{64}$/.test(artifactDigest)) throw new Error(`fleet result ${artifact.key} artifact digest is malformed`)
+			const bytes = await this.getArtifact(artifactDigest)
+			if (createHash("sha256").update(bytes).digest("hex") !== artifactDigest || (artifact.bytes !== undefined && artifact.bytes !== bytes.byteLength)) throw new Error(`fleet result ${artifact.key} artifact bytes do not match its declared digest and length`)
+			const metadata = await this.pool.query("SELECT storage_id,object_key,backend,byte_length FROM headlesscode_rsi_artifacts WHERE sha256=$1", [artifactDigest])
+			if (metadata.rowCount !== 1) throw new Error(`fleet result ${artifact.key} artifact metadata is missing`)
+			const row = metadata.rows[0]
+			resultArtifactRefs[artifact.key] = { sha256: artifactDigest, storageId: String(row.storage_id), objectKey: String(row.object_key), backend: row.backend, byteLength: Number(row.byte_length) }
+		}
 		return inTransaction(this.pool, async (client) => {
+			const peekResult = await client.query("SELECT payload FROM headlesscode_rsi_jobs WHERE job_id=$1 AND queue_name=$2", [lease.job.jobId, this.policy.queueName])
+			const binding = peekResult.rows[0]?.payload?.proofCampaign as FleetJobPayload["proofCampaign"] | undefined
+			let proofAttemptRows: Array<Record<string, unknown>> = []
+			let proofManifest: ProofCampaignManifest | undefined
+			if (binding) {
+				const campaignResult = await client.query("SELECT * FROM headlesscode_rsi_proof_campaigns WHERE campaign_id=$1 FOR UPDATE", [binding.campaignId])
+				const armResult = await client.query("SELECT * FROM headlesscode_rsi_proof_campaign_arms WHERE campaign_id=$1 AND arm_id=$2 FOR UPDATE", [binding.campaignId, binding.armId])
+				const campaign = campaignResult.rows[0]
+				const arm = armResult.rows[0]
+				if (!campaign || !arm || arm.run_id !== lease.job.runId || campaign.manifest_sha256.trim() !== binding.manifestSha256 || Number(arm.epoch) !== binding.epoch || arm.state === "finished" || new Date(String(arm.lease_expires_at)).getTime() <= Date.now() || new Date(String(campaign.deadline_at)).getTime() <= Date.now()) throw new Error("fleet result import rejected by stale proof campaign epoch, lease, manifest, run, or deadline")
+				proofManifest = campaign.manifest as ProofCampaignManifest
+				if (!binding.cells.length || new Set(binding.cells.map((cell) => cell.attemptKey)).size !== binding.cells.length) throw new Error("fleet result import has no unique proof campaign cells")
+				const attemptResult = await client.query("SELECT * FROM headlesscode_rsi_proof_campaign_attempts WHERE campaign_id=$1 AND arm_id=$2 AND attempt_key=ANY($3::text[]) ORDER BY attempt_key FOR UPDATE", [binding.campaignId, binding.armId, binding.cells.map((cell) => cell.attemptKey).sort()])
+				proofAttemptRows = attemptResult.rows as Array<Record<string, unknown>>
+				if (attemptResult.rowCount !== binding.cells.length || binding.cells.some((cell) => {
+					const row = attemptResult.rows.find((entry) => entry.attempt_key === cell.attemptKey)
+					return !row || Number(row.epoch) !== binding.epoch || row.candidate_id !== cell.slotId || row.source_candidate_id !== lease.job.candidateId || row.attempt_kind !== cell.attemptKind
+				})) throw new Error("fleet result import does not match its preadmitted proof campaign task cells")
+				const firstAttempt = attemptResult.rows[0]
+				const scheduled = (campaign.manifest as { schedule?: Array<{ armId: string; generation: number; candidateId: string; taskId: string; seed: string; attemptKind: string }> }).schedule?.filter((cell) => cell.armId === binding.armId && cell.generation === Number(firstAttempt?.generation) && cell.candidateId === firstAttempt?.candidate_id && cell.attemptKind === (lease.job.jobKind === "mutation" ? "mutation" : "verification")) ?? []
+				const scheduledIdentities = scheduled.map((cell) => JSON.stringify({ generation: cell.generation, candidateId: cell.candidateId, taskId: cell.taskId, seed: cell.seed, attemptKind: cell.attemptKind })).sort()
+				const attemptIdentities = attemptResult.rows.map((row) => JSON.stringify({ generation: Number(row.generation), candidateId: row.candidate_id, taskId: row.task_id, seed: row.seed, attemptKind: row.attempt_kind })).sort()
+				if (scheduledIdentities.length !== attemptIdentities.length || scheduledIdentities.some((identity, index) => identity !== attemptIdentities[index])) throw new Error("fleet result import does not cover the exact frozen task cells for this job")
+				if (binding.cells.some((cell) => cell.attemptKind === "mutation")) {
+					if (binding.cells.length !== 1 || binding.cells[0]?.attemptKind !== "mutation") throw new Error("a proof-bound mutation job must have exactly one mutation cell")
+					const inferenceCampaignLookup = await client.query("SELECT campaign_id FROM headlesscode_rsi_inference_jobs WHERE job_id=$1", [lease.job.jobId])
+					const inferenceCampaignId = inferenceCampaignLookup.rows[0]?.campaign_id
+					if (!inferenceCampaignId) throw new Error("proof campaign mutation has no durable OpenRouter campaign record")
+					await client.query("SELECT campaign_id FROM headlesscode_rsi_inference_campaigns WHERE campaign_id=$1 FOR UPDATE", [inferenceCampaignId])
+					await client.query("SELECT job_id FROM headlesscode_rsi_inference_jobs WHERE job_id=$1 FOR UPDATE", [lease.job.jobId])
+				}
+			}
+			const currentResult = await client.query("SELECT * FROM headlesscode_rsi_jobs WHERE job_id=$1 AND queue_name=$2 FOR UPDATE", [lease.job.jobId, this.policy.queueName])
+			const current = currentResult.rows[0]
+			if (current?.status === "completed" && stableJson(current.result) === stableJson(resultValue)) return { accepted: true, duplicate: true, job: rowToJob(current) }
+			if (!current || stableJson(current.payload?.proofCampaign) !== stableJson(binding) || current.status !== "leased" || current.lease_owner !== lease.workerId || current.lease_token !== lease.token || new Date(String(current.lease_expires_at)).getTime() <= Date.now()) return { accepted: false, duplicate: false, ...(current ? { job: rowToJob(current) } : {}) }
+			if (binding) {
+				const attempts = proofAttemptRows
+				if (attempts.some((attempt) => attempt.status !== "dispatched" || attempt.job_id !== current.job_id)) throw new Error("proof campaign attempts do not reference the current fenced queue job")
+				if (binding.cells.some((cell) => cell.attemptKind !== (current.job_kind === "mutation" ? "mutation" : "verification"))) throw new Error("proof campaign task kind differs from the fenced queue job")
+				let actualCalls = 0; let actualTokens = 0; let actualSpend = 0
+				if (current.job_kind === "mutation") {
+					if (current.job_kind !== "mutation" || !resultArtifactRefs.patch) throw new Error("proof campaign mutation result is missing its patch or mutation job identity")
+					const manifestSettings = proofManifest?.settings as { inferenceCampaignIds?: { mutation?: unknown } } | undefined
+					const mutationBrokerCampaignId = manifestSettings?.inferenceCampaignIds?.mutation
+					if (typeof mutationBrokerCampaignId !== "string" || current.payload.inferenceLimits?.campaignId !== mutationBrokerCampaignId) throw new Error("proof campaign mutation payload does not match its frozen mutation broker campaign identity")
+					const inference = await client.query("SELECT * FROM headlesscode_rsi_inference_jobs WHERE job_id=$1", [current.job_id])
+					const inferenceJob = inference.rows[0]
+					if (!inferenceJob || inferenceJob.campaign_id !== mutationBrokerCampaignId || inferenceJob.model !== current.payload.model || inferenceJob.provider !== "openrouter" || inferenceJob.blocked || Number(inferenceJob.reserved_spend_microusd) !== 0 || Number(inferenceJob.reserved_tokens) !== 0) throw new Error("proof campaign mutation result has no settled authoritative broker job")
+					const calls = await client.query("SELECT * FROM headlesscode_rsi_inference_calls WHERE job_id=$1 ORDER BY started_at,call_id", [current.job_id])
+					if (!calls.rowCount || calls.rows.some((call) => call.state !== "complete" || call.qualified !== true || call.returned_model !== inferenceJob.model || call.prompt_tokens === null || call.completion_tokens === null || call.actual_spend_microusd === null)) throw new Error("proof campaign mutation result has an incomplete or unqualified broker call")
+					actualCalls = calls.rowCount
+					actualTokens = calls.rows.reduce((sum, call) => sum + Number(call.prompt_tokens) + Number(call.completion_tokens), 0)
+					actualSpend = calls.rows.reduce((sum, call) => sum + Number(call.actual_spend_microusd), 0)
+					const reported = resultObject.inferenceReceipt as Record<string, unknown> | undefined
+					if (!reported || reported.provider !== "openrouter" || reported.jobId !== current.job_id || reported.campaignId !== mutationBrokerCampaignId || reported.model !== inferenceJob.model || reported.qualified !== true || reported.calls !== actualCalls || reported.totalTokens !== actualTokens || typeof reported.costUsd !== "number" || Math.ceil(reported.costUsd * 1_000_000) !== actualSpend) throw new Error("proof campaign result receipt does not match durable broker call accounting")
+				} else if (current.job_kind !== "evaluation" || binding.cells.some((cell) => cell.attemptKind !== "verification") || !resultArtifactRefs["evaluation-output"]) throw new Error("proof campaign verification result is missing its independently produced output artifact")
+				for (const cell of binding.cells) {
+					const attempt = attempts.find((row) => row.attempt_key === cell.attemptKey)!
+					if (attempt.status !== "dispatched" || actualCalls > Number(attempt.reserved_calls) || actualTokens > Number(attempt.reserved_tokens) || actualSpend > Number(attempt.reserved_spend_microusd)) throw new Error("proof campaign result exceeded or mismatched its preadmission reservation")
+					await client.query(`UPDATE headlesscode_rsi_proof_campaign_attempts SET status='completed',result_sha256=$4,artifact_refs=$5::jsonb,actual_calls=$6,actual_tokens=$7,actual_spend_microusd=$8,updated_at=clock_timestamp() WHERE campaign_id=$1 AND arm_id=$2 AND attempt_key=$3`, [binding.campaignId, binding.armId, cell.attemptKey, resultDigest, stableJson(resultArtifactRefs), actualCalls, actualTokens, actualSpend])
+					await client.query(`UPDATE headlesscode_rsi_proof_campaigns SET reserved_calls=reserved_calls-$2,reserved_tokens=reserved_tokens-$3,reserved_spend_microusd=reserved_spend_microusd-$4,used_calls=used_calls+$5,used_tokens=used_tokens+$6,used_spend_microusd=used_spend_microusd+$7,updated_at=clock_timestamp() WHERE campaign_id=$1`, [binding.campaignId, Number(attempt.reserved_calls), Number(attempt.reserved_tokens), Number(attempt.reserved_spend_microusd), actualCalls, actualTokens, actualSpend])
+				}
+				const payload = stableJson({ attemptKeys: binding.cells.map((cell) => cell.attemptKey), resultSha256: resultDigest, artifactRefs: resultArtifactRefs, actualCalls, actualTokens, actualSpendMicrousd: actualSpend })
+				const sequence = await client.query("UPDATE headlesscode_rsi_proof_campaigns SET sequence=sequence+1 WHERE campaign_id=$1 RETURNING sequence", [binding.campaignId])
+				await client.query("INSERT INTO headlesscode_rsi_proof_campaign_events(campaign_id,sequence,arm_id,epoch,event_type,payload,payload_sha256) VALUES($1,$2,$3,$4,'attempt-result-imported',$5::jsonb,$6)", [binding.campaignId, sequence.rows[0].sequence, binding.armId, binding.epoch, payload, sha256Text(payload)])
+			}
 			const updated = await client.query(
 				`UPDATE headlesscode_rsi_jobs SET status='completed', result=$4::jsonb, completed_at=clock_timestamp(), updated_at=clock_timestamp(),
 				 lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL
@@ -594,10 +723,7 @@ export class PostgresRsiJobQueue {
 				[lease.job.jobId, lease.workerId, lease.token, resultJson, this.policy.queueName],
 			)
 			if (updated.rowCount === 1) return { accepted: true, duplicate: false, job: rowToJob(updated.rows[0]) }
-			const existing = await client.query("SELECT * FROM headlesscode_rsi_jobs WHERE job_id=$1 AND queue_name=$2", [lease.job.jobId, this.policy.queueName])
-			const row = existing.rows[0]
-			if (row?.status === "completed" && stableJson(row.result) === stableJson(resultValue)) return { accepted: true, duplicate: true, job: rowToJob(row) }
-			return { accepted: false, duplicate: false, ...(row ? { job: rowToJob(row) } : {}) }
+			throw new Error("fleet completion lost its locked lease before committing the result")
 		})
 	}
 
@@ -620,6 +746,54 @@ export class PostgresRsiJobQueue {
 	async getJobByIdempotencyKey(idempotencyKey: string): Promise<FleetJob | undefined> {
 		const result = await this.pool.query("SELECT * FROM headlesscode_rsi_jobs WHERE queue_name=$1 AND idempotency_key=$2", [this.policy.queueName, idempotencyKey])
 		return result.rowCount === 1 ? rowToJob(result.rows[0]) : undefined
+	}
+
+	/** Rebind only a never-claimed queued proof job after arm recovery. */
+	async rebindQueuedProofJob(jobId: string, expected: FleetJobIdentity, lease: ProofCampaignArmLease): Promise<FleetJob> {
+		const proof = expected.payload.proofCampaign
+		if (!proof || proof.campaignId !== lease.campaignId || proof.armId !== lease.armId || proof.epoch !== lease.epoch || proof.manifestSha256 !== lease.manifestSha256 || !proof.cells.length) throw new Error("queued proof job rebind does not match the current campaign lease")
+		return inTransaction(this.pool, async (client) => {
+			const campaignResult = await client.query("SELECT * FROM headlesscode_rsi_proof_campaigns WHERE campaign_id=$1 FOR UPDATE", [lease.campaignId])
+			const armResult = await client.query("SELECT * FROM headlesscode_rsi_proof_campaign_arms WHERE campaign_id=$1 AND arm_id=$2 FOR UPDATE", [lease.campaignId, lease.armId])
+			const attemptsResult = await client.query("SELECT * FROM headlesscode_rsi_proof_campaign_attempts WHERE campaign_id=$1 AND arm_id=$2 AND attempt_key=ANY($3::text[]) ORDER BY attempt_key FOR UPDATE", [lease.campaignId, lease.armId, proof.cells.map((cell) => cell.attemptKey).sort()])
+			const jobResult = await client.query("SELECT * FROM headlesscode_rsi_jobs WHERE job_id=$1 AND queue_name=$2 FOR UPDATE", [jobId, this.policy.queueName])
+			const campaign = campaignResult.rows[0]
+			const arm = armResult.rows[0]
+			const jobRow = jobResult.rows[0]
+			if (!campaign || !arm || !jobRow) throw new Error("queued proof job rebind target is missing")
+			const armTokenHash = sha256Text(lease.token)
+			if (campaign.manifest_sha256.trim() !== proof.manifestSha256 || new Date(String(campaign.deadline_at)).getTime() <= Date.now()
+				|| Number(arm.epoch) !== lease.epoch || arm.run_id !== lease.runId || arm.lease_token_sha256 !== armTokenHash || new Date(String(arm.lease_expires_at)).getTime() <= Date.now() || arm.state === "finished") throw new Error("queued proof job rebind lost the current campaign lease or deadline")
+			const existingJob = rowToJob(jobRow)
+			if (existingJob.status !== "queued" || existingJob.attempts !== 0 || existingJob.runId !== expected.runId || existingJob.candidateId !== expected.candidateId || existingJob.jobKind !== expected.jobKind || existingJob.resourceClass !== expected.resourceClass || existingJob.concurrencyKey !== expected.concurrencyKey || existingJob.artifactSha256 !== expected.artifactSha256 || !existingJob.payload.proofCampaign
+				|| existingJob.payload.proofCampaign.epoch >= lease.epoch || stableJson(normalizedProofReplayPayload(existingJob.payload)) !== stableJson(normalizedProofReplayPayload(expected.payload))) throw new Error("only an identical, never-claimed queued proof job can be rebound")
+			const oldProof = existingJob.payload.proofCampaign
+			if (existingJob.payload.inferenceLimits && expected.payload.inferenceLimits && expected.payload.inferenceLimits.maxDurationMs > existingJob.payload.inferenceLimits.maxDurationMs) throw new Error("queued proof job rebind cannot extend its previously frozen execution duration")
+			const attempts = attemptsResult.rows
+			if (attempts.length !== proof.cells.length || proof.cells.some((cell) => {
+				const attempt = attempts.find((row) => row.attempt_key === cell.attemptKey)
+				const limits = existingJob.payload.inferenceLimits
+				const reservationMatches = expected.jobKind === "mutation"
+					? !!limits && Number(attempt?.reserved_calls) === limits.maxCalls && Number(attempt?.reserved_tokens) === limits.maxTotalTokens && Number(attempt?.reserved_spend_microusd) === usdToMicrosCeiling(limits.maxJobSpendUsd)
+					: Number(attempt?.reserved_calls) === 0 && Number(attempt?.reserved_tokens) === 0 && Number(attempt?.reserved_spend_microusd) === 0
+				return !attempt || !reservationMatches || attempt.status !== "dispatched" || Number(attempt.epoch) !== oldProof.epoch || attempt.job_id !== jobId || attempt.candidate_id !== cell.slotId || attempt.source_candidate_id !== expected.candidateId || attempt.attempt_kind !== cell.attemptKind
+			})) throw new Error("queued proof job task cells are missing, claimed, terminal, or changed")
+			if (oldProof.campaignId !== proof.campaignId || oldProof.armId !== proof.armId || oldProof.manifestSha256 !== proof.manifestSha256 || stableJson(oldProof.cells) !== stableJson(proof.cells)) throw new Error("queued proof job frozen cell binding changed during rebind")
+			const manifest = campaign.manifest as { schedule?: Array<{ armId: string; generation: number; candidateId: string; taskId: string; seed: string; attemptKind: string }> }
+			const actualCells = attempts.map((row) => ({ generation: Number(row.generation), candidateId: row.candidate_id, taskId: row.task_id, seed: row.seed, attemptKind: row.attempt_kind }))
+			const first = attempts[0]
+			const frozenCells = manifest.schedule?.filter((cell) => cell.armId === proof.armId && cell.generation === Number(first?.generation) && cell.candidateId === first?.candidate_id && cell.attemptKind === (expected.jobKind === "mutation" ? "mutation" : "verification")).map((cell) => ({ generation: cell.generation, candidateId: cell.candidateId, taskId: cell.taskId, seed: cell.seed, attemptKind: cell.attemptKind })) ?? []
+			const sortCells = (cells: typeof actualCells) => cells.map(stableJson).sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))
+			if (stableJson(sortCells(actualCells)) !== stableJson(sortCells(frozenCells))) throw new Error("queued proof job rebind does not cover the exact frozen task cells")
+			const requestSha256 = fleetPayloadDigest(expected.payload)
+			await client.query("UPDATE headlesscode_rsi_proof_campaign_attempts SET epoch=$4,request_sha256=$5,updated_at=clock_timestamp() WHERE campaign_id=$1 AND arm_id=$2 AND attempt_key=ANY($3::text[])", [lease.campaignId, lease.armId, proof.cells.map((cell) => cell.attemptKey), lease.epoch, requestSha256])
+			const updated = await client.query("UPDATE headlesscode_rsi_jobs SET payload=$3::jsonb,updated_at=clock_timestamp() WHERE job_id=$1 AND queue_name=$2 AND status='queued' RETURNING *", [jobId, this.policy.queueName, JSON.stringify(expected.payload)])
+			if (updated.rowCount !== 1) throw new Error("queued proof job changed during epoch rebind")
+			const eventPayload = stableJson({ jobId, attemptKeys: proof.cells.map((cell) => cell.attemptKey), oldEpoch: oldProof.epoch, newEpoch: lease.epoch })
+			const sequence = await client.query("UPDATE headlesscode_rsi_proof_campaigns SET sequence=sequence+1,updated_at=clock_timestamp() WHERE campaign_id=$1 RETURNING sequence", [lease.campaignId])
+			await client.query("INSERT INTO headlesscode_rsi_proof_campaign_events(campaign_id,sequence,arm_id,epoch,event_type,payload,payload_sha256) VALUES($1,$2,$3,$4,'queued-job-rebound',$5::jsonb,$6)", [lease.campaignId, sequence.rows[0].sequence, lease.armId, lease.epoch, eventPayload, sha256Text(eventPayload)])
+			return rowToJob(updated.rows[0])
+		})
 	}
 
 	async cancel(jobId: string, reason: string): Promise<boolean> {

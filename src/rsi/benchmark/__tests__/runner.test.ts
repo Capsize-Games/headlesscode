@@ -88,6 +88,17 @@ try {
 	const replayed = await runBenchmark({ loaded, agent, verifier, harnessCommit, modelId: "fake-model-v1", split: "development", outputRoot })
 	assert.deepEqual(replayed.map((attempt) => attempt.attemptId), development.map((attempt) => attempt.attemptId))
 	assert.equal(agentCalls, 16, "recorded task cells are replayed idempotently without rerunning the model")
+	const missingCompletedArtifactRoot = path.join(tempRoot, "missing-completed-artifact")
+	const callsBeforeMissingArtifact = agentCalls
+	await assert.rejects(runBenchmark({
+		loaded, agent, verifier, harnessCommit, modelId: "completed-cell-missing-artifact", split: "development", outputRoot: missingCompletedArtifactRoot,
+		taskIds: ["multi-01"],
+		attemptLifecycle: {
+			beforeAttempt: async () => { throw new Error("completed benchmark proof cell has no verified local attempt artifact; refusing to dispatch it again") },
+			settledAttempt: async () => undefined,
+		},
+	}), /refusing to dispatch it again/)
+	assert.equal(agentCalls, callsBeforeMissingArtifact, "a durable completed cell without its local artifact must fail closed before calling the model")
 	const tamperedAttemptPath = path.join(outputRoot, "attempts", `${development[0]!.attemptId}.json`)
 	const pristineAttempt = await fs.readFile(tamperedAttemptPath, "utf8")
 	const tamperedAttempt = JSON.parse(pristineAttempt) as Record<string, unknown>

@@ -16,6 +16,14 @@ function trial(command: string, ok: boolean): TrialResult {
 	return { command, ok, exitCode: ok ? 0 : 1, durationMs: 1, stdout: "", stderr: "" }
 }
 
+test("paired restart-safe proof campaigns reject unmanifested adaptive early-stop before campaign admission", async () => {
+	const config = {
+		workerHarnessPairId: "paired-adaptive", computePolicy: "adaptive-independent", population: 2, generations: 1,
+		maxIterations: 1, maxTrajectories: 2, maxTotalIterations: 2,
+	} as RsiConfig
+	await assert.rejects(() => runRsiImplementation(config), /every frozen generation to run; adaptive early-stop is not admitted/)
+})
+
 test("hook-level controller evaluates an independent cohort then allocates an evidence-driven follow-up", async () => {
 	const repo = await fs.mkdtemp(path.join(os.tmpdir(), "hc-rsi-adaptive-"))
 	try {

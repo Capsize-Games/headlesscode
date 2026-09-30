@@ -325,7 +325,7 @@ test("fleet adversarial replay failure rejects candidate and closes the adversar
 			...config,
 			roles: { worker: { provider: "ollama", model: "worker-model" }, adversary: { provider: "openrouter", model: "review-model" } },
 		}, { log: () => undefined, runAdversary: async () => adversarialResponse() }, queue as unknown as PostgresRsiJobQueue)
-		assert.ok(run.candidates.every((candidate) => candidate.status === "rejected"))
+		assert.ok(run.candidates.every((candidate) => candidate.status === "rejected"), JSON.stringify(run.candidates.map(({ id, status, failure }) => ({ id, status, failure }))))
 		assert.ok(run.candidates.every((candidate) => candidate.fitness?.score === 0 && candidate.fitness.hardGates.adversarialPass === false))
 		assert.equal(run.adversarialReviews?.length, 2)
 		assert.ok(run.adversarialReviews?.every((review) => review.status === "failed" && review.testResults.length === 1 && !review.testResults[0]?.passed))
@@ -343,7 +343,7 @@ test("fleet adversarial major finding records a bounded penalty when its OpenShe
 			...config,
 			roles: { worker: { provider: "ollama", model: "worker-model" }, adversary: { provider: "openrouter", model: "review-model" } },
 		}, { log: () => undefined, runAdversary: async () => adversarialResponse([{ severity: "major", message: "A boundary case may be mishandled.", testId: "adversary-case" }]) }, queue as unknown as PostgresRsiJobQueue)
-		assert.ok(run.candidates.every((candidate) => candidate.status === "rejected"))
+		assert.ok(run.candidates.every((candidate) => candidate.status === "rejected"), JSON.stringify(run.candidates.map(({ id, status, failure }) => ({ id, status, failure }))))
 		assert.ok(run.candidates.every((candidate) => candidate.fitness?.hardGates.adversarialPass === true && candidate.fitness.adversarialPenalty === 5 && candidate.fitness.score === 95))
 		assert.equal(run.adversarialReviews?.length, 2)
 		assert.ok(run.adversarialReviews?.every((review) => review.status === "passed" && review.findings[0]?.severity === "major" && review.penaltyPoints === 5 && review.testResults[0]?.passed))
@@ -370,7 +370,7 @@ test("adversarial role with same model name on a different provider is not cross
 			roles: { worker: { provider: "ollama", model: "shared-model-name" }, adversary: { provider: "openrouter", model: "shared-model-name" } },
 		}, { log: () => undefined, runAdversary: async () => { reviewerCalled = true; return adversarialResponse() } }, queue as unknown as PostgresRsiJobQueue)
 		assert.equal(reviewerCalled, false)
-		assert.ok(run.candidates.every((candidate) => candidate.status === "rejected" && candidate.fitness?.hardGates.adversarialPass === false))
+		assert.ok(run.candidates.every((candidate) => candidate.status === "rejected" && candidate.fitness?.hardGates.adversarialPass === false), JSON.stringify(run.candidates.map(({ id, status, failure, fitness }) => ({ id, status, failure, gates: fitness?.hardGates }))))
 		assert.ok(run.adversarialReviews?.every((review) => review.status === "error" && /different model/.test(review.error ?? "")))
 		assert.equal(queue.adversarialEvaluationJobCount, 0)
 	} finally {
@@ -581,7 +581,7 @@ test("fleet resume reattaches to the persisted mutation idempotency key without 
 		await checkpointRun(config.archiveDir, run)
 		const resumed = await runRsi({ ...config, resumeRunId: runId }, { log: () => undefined }, queue as unknown as PostgresRsiJobQueue)
 		assert.equal(resumed.runId, runId)
-		assert.equal(resumed.candidates[0]?.status, "rejected")
+		assert.equal(resumed.candidates[0]?.status, "rejected", JSON.stringify({ failure: resumed.candidates[0]?.failure, status: resumed.candidates[0]?.status }))
 		assert.equal(queue.mutationJobCount, 1, "resume should reuse the already-completed mutation job")
 		assert.equal(resumed.jobs?.find((job) => job.id === "mutation-experiment")?.status, "completed")
 		assert.equal(queue.closeCount, 1)
@@ -644,7 +644,7 @@ test("fleet resume recognizes an applied patch before the status checkpoint and 
 		}
 		await checkpointRun(config.archiveDir, run)
 		const resumed = await runRsi({ ...config, resumeRunId: runId }, { log: () => undefined }, queue as unknown as PostgresRsiJobQueue)
-		assert.equal(resumed.candidates[0]?.status, "rejected")
+		assert.equal(resumed.candidates[0]?.status, "rejected", JSON.stringify({ failure: resumed.candidates[0]?.failure, status: resumed.candidates[0]?.status }))
 		assert.equal(queue.mutationJobCount, 1, "resume must validate and reuse the completed mutation job")
 		assert.equal(resumed.jobs?.find((job) => job.id === "mutation-experiment")?.status, "completed")
 		await assert.rejects(fs.access(candidate.worktree), /ENOENT/, "resumed worktrees must be removed when keepWorktrees is false")

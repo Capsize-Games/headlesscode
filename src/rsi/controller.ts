@@ -20,7 +20,7 @@ import { decideAdaptiveContinuation } from "./adaptive.js"
 import { createOpenShellCommandRunner } from "./openshell.js"
 import { createAdversarialEvaluationSnapshotBundle, createEvaluationSnapshotBundle, createMutationSnapshotBundle, createMutationSnapshotIdentity, applyFleetMutationPatch } from "./openshell.js"
 import { ADVERSARIAL_COMMAND, ADVERSARIAL_PROMPT_VERSION, ADVERSARIAL_TESTS_PATH, buildAdversarialPrompt, parseAdversarialReview, requestAdversarialReview, sha256 } from "./adversarial.js"
-import { fleetJobMatches, PostgresRsiJobQueue, fleetQueuePolicy, requiredFleetJobLeaseMs, type FleetJob, type FleetJobIdentity, type FleetJobPayload } from "./postgres-queue.js"
+import { fleetJobMatches, fleetPayloadDigest, PostgresRsiJobQueue, fleetQueuePolicy, requiredFleetJobLeaseMs, type FleetJob, type FleetJobIdentity, type FleetJobPayload } from "./postgres-queue.js"
 import type { AdversarialReviewRecord, CandidateRecord, ExperimentJob, RsiArchive, RsiConfig, RsiHooks, RsiRunRecord, TrajectoryRecord, TrialResult, WorkerHarnessExecution } from "./types.js"
 import {
 	candidateCommits,
@@ -40,6 +40,7 @@ import type { BenchmarkManifest } from "./benchmark/types.js"
 import { runDevelopmentBenchmarkForCommit } from "./development-benchmark.js"
 import { workerHarnessConfigDigest, workerHarnessRuntimeIdentityFromEnvironment, validWorkerHarnessRuntimeIdentity, effectiveWorkerHarnessMode } from "./worker-harness.js"
 import { workerHarnessCliPath } from "./worker-harness.js"
+import { PostgresProofCampaign, proofCampaignManifestDigest, type ProofCampaignArmLease, type ProofCampaignManifest } from "./proof-campaign.js"
 
 function log(hooks: RsiHooks, line: string): void {
 	(hooks.log ?? ((message) => process.stdout.write(`${message}\n`)))(line)
@@ -47,6 +48,120 @@ function log(hooks: RsiHooks, line: string): void {
 
 function isTerminal(candidate: CandidateRecord): boolean {
 	return candidate.status === "accepted" || candidate.status === "rejected" || candidate.status === "failed"
+}
+
+function proofCandidateSlot(generation: number, index: number): string { return `g${generation}-candidate-${index}` }
+
+export function createProofCampaignManifest(args: {
+	config: RsiConfig
+	campaignId: string
+	baseCommit: string
+	model: string
+	provider: string
+	runtime: NonNullable<RsiRunRecord["workerHarnessRuntime"]>
+	developmentManifest: BenchmarkManifest
+	developmentManifestDigest: string
+	plannedGenerations: number
+	proofProtocol: NonNullable<RsiRunRecord["developmentProofProtocol"]>
+}): ProofCampaignManifest {
+	if (args.provider !== "openshell-openrouter") throw new Error("restart-safe proof campaigns require supervisor-accounted OpenRouter inference")
+	if (args.config.computePolicy === "adaptive-independent") throw new Error("restart-safe proof campaigns require every frozen generation to run; adaptive early-stop is not admitted")
+	const benchmarkTasks = args.developmentManifest.tasks.filter((task) => task.split === "development")
+	const confirmationTasks = args.developmentManifest.tasks.filter((task) => task.split === "confirmation")
+	if (!benchmarkTasks.length || !confirmationTasks.length) throw new Error("proof campaign requires nonempty development and confirmation benchmark splits")
+	const taskDigest = (tasks: typeof args.developmentManifest.tasks) => createHash("sha256").update(JSON.stringify(tasks)).digest("hex")
+	const mutationCampaignId = proofBrokerCampaignId(args.campaignId, "mutation")
+	const benchmarkCampaignId = proofBrokerCampaignId(args.campaignId, "benchmark")
+	const mutationLimits = openRouterBrokerLimitsFromEnvironment(openRouterAllocatedEnvironment(process.env, "mutation"), mutationCampaignId, { maxCalls: args.config.maxIterations, ...(args.config.maxTokens ? { maxOutputTokensPerCall: args.config.maxTokens } : {}), maxDurationMs: args.config.commandTimeoutMs })
+	const benchmarkEnv = openRouterAllocatedEnvironment(process.env, "benchmark")
+	const benchmarkLimits = openRouterBrokerLimitsFromEnvironment(benchmarkEnv, benchmarkCampaignId, { maxDurationMs: Math.min(...benchmarkTasks.map((task) => task.ceilings.timeoutMs)) })
+	const confirmationLimits = openRouterBrokerLimitsFromEnvironment(benchmarkEnv, benchmarkCampaignId, { maxDurationMs: Math.min(...confirmationTasks.map((task) => task.ceilings.timeoutMs)) })
+	const candidateCounts = Array.from({ length: args.plannedGenerations }, (_, generation) => args.config.computePolicy === "adaptive-independent" && generation > 0 ? 1 : args.config.population)
+	const schedule: ProofCampaignManifest["schedule"] = []
+	for (const armId of ["fixed-control", "self-hosted"]) for (let generation = 0; generation < args.plannedGenerations; generation++) {
+		for (let index = 0; index < candidateCounts[generation]!; index++) {
+			const slot = proofCandidateSlot(generation, index)
+			schedule.push({ armId, generation, candidateId: slot, taskId: "mutation", seed: args.config.seed, attemptKind: "mutation", phase: "development" })
+			schedule.push({ armId, generation, candidateId: slot, taskId: "regression", seed: args.config.seed, attemptKind: "verification", phase: "development" })
+			schedule.push({ armId, generation, candidateId: slot, taskId: "typecheck", seed: args.config.seed, attemptKind: "verification", phase: "development" })
+			for (const [taskIndex] of args.config.evalCommands.entries()) schedule.push({ armId, generation, candidateId: slot, taskId: `visible-${taskIndex}`, seed: args.config.seed, attemptKind: "verification", phase: "development" })
+			for (const role of ["child", "parent", "base"]) for (const task of benchmarkTasks) schedule.push({ armId, generation, candidateId: `${slot}:${role}`, taskId: task.id, seed: String(task.seed), attemptKind: "development-proof", phase: "development" })
+		}
+	}
+	const finalGeneration = args.plannedGenerations - 1
+	const finalSlots = candidateCounts[finalGeneration]!
+	for (const armId of ["fixed-control", "self-hosted"]) {
+		for (let index = 0; index < finalSlots; index++) for (const task of confirmationTasks) schedule.push({ armId, generation: finalGeneration, candidateId: proofCandidateSlot(finalGeneration, index), taskId: task.id, seed: String(task.seed), attemptKind: "confirmation", phase: "confirmation" })
+		for (const task of confirmationTasks) schedule.push({ armId, generation: finalGeneration, candidateId: "root-control", taskId: task.id, seed: String(task.seed), attemptKind: "fixed-control", phase: "confirmation" })
+	}
+	const rootCalls = 2 * candidateCounts.reduce((sum, count, generation) => sum + count * (mutationLimits.maxCalls + 3 * benchmarkTasks.length * benchmarkLimits.maxCalls) + (generation === finalGeneration ? (finalSlots + 1) * confirmationTasks.length * confirmationLimits.maxCalls : 0), 0)
+	const rootTokens = 2 * candidateCounts.reduce((sum, count, generation) => sum + count * (mutationLimits.maxTotalTokens + 3 * benchmarkTasks.length * benchmarkLimits.maxTotalTokens) + (generation === finalGeneration ? (finalSlots + 1) * confirmationTasks.length * confirmationLimits.maxTotalTokens : 0), 0)
+	if (!Number.isSafeInteger(rootCalls) || !Number.isSafeInteger(rootTokens)) throw new Error("proof campaign root call or token ceiling exceeds safe integer accounting")
+	const spendAllocation = Number(process.env.HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD)
+	if (!Number.isFinite(spendAllocation) || spendAllocation <= 0) throw new Error("HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD is required for a bounded proof campaign")
+	const totalBudgetUsd = Number(process.env.HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD) + Number(process.env.HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD)
+	if (!Number.isFinite(totalBudgetUsd) || totalBudgetUsd <= 0 || totalBudgetUsd > spendAllocation) throw new Error("proof campaign mutation and benchmark allocations must fit the operator spend ceiling")
+	return {
+		schemaVersion: 1, campaignId: args.campaignId, rootCommit: args.baseCommit,
+		benchmarkDigests: { manifest: args.developmentManifestDigest, development: taskDigest(benchmarkTasks), confirmation: taskDigest(confirmationTasks) },
+		armAssignment: { fixedControl: "fixed-control", selfHosted: "self-hosted" },
+		model: { provider: args.provider, id: args.model, settings: { sampling: args.proofProtocol.model.sampling, roles: args.config.roles ?? {}, maxIterations: args.config.maxIterations, maxTokens: args.config.maxTokens ?? null } },
+		seed: args.config.seed, taskOrder: ["mutation", "regression", "typecheck", ...args.config.evalCommands.map((_, index) => `visible-${index}`), ...benchmarkTasks.map((task) => task.id), ...confirmationTasks.map((task) => task.id)], schedule,
+		budgets: {
+			attempt: { maxCalls: Math.max(mutationLimits.maxCalls, benchmarkLimits.maxCalls, confirmationLimits.maxCalls), maxTokens: Math.max(mutationLimits.maxTotalTokens, benchmarkLimits.maxTotalTokens, confirmationLimits.maxTotalTokens), maxSpendUsd: Math.max(mutationLimits.maxJobSpendUsd, benchmarkLimits.maxJobSpendUsd, confirmationLimits.maxJobSpendUsd), maxDurationMs: Math.max(args.config.commandTimeoutMs, ...benchmarkTasks.map((task) => task.ceilings.timeoutMs), ...confirmationTasks.map((task) => task.ceilings.timeoutMs)) },
+			root: { maxCalls: rootCalls, maxTokens: rootTokens, maxSpendUsd: Math.min(spendAllocation, totalBudgetUsd), maxRuntimeMs: args.config.maxRuntimeMs ?? 60 * 60_000 },
+		},
+			acceptanceRule: { ...args.proofProtocol.rule }, runtime: { imageDigest: args.runtime.imageDigest, harnessCommit: args.runtime.harnessCommit, dependencyLockDigest: args.runtime.dependencyLockDigest },
+		analysisVersion: args.proofProtocol.schemaVersion.toString(), settings: { configDigest: workerHarnessConfigDigest(args.config, { baseCommit: args.baseCommit, model: args.model, provider: args.provider, proofProtocolDigest: args.proofProtocol.protocolDigest }), candidateCounts, evaluationCells: ["regression", "typecheck", ...args.config.evalCommands.map((_, index) => `visible-${index}`)], inferenceCampaignIds: { mutation: mutationCampaignId, benchmark: benchmarkCampaignId }, inferenceAllocationsUsd: { mutation: mutationLimits.maxCampaignSpendUsd, benchmark: benchmarkLimits.maxCampaignSpendUsd } },
+	}
+}
+
+export function proofBrokerCampaignId(rootCampaignId: string, allocation: "mutation" | "benchmark"): string {
+	if (!rootCampaignId.trim()) throw new Error("proof campaign ID is required to derive broker campaign identity")
+	return `${rootCampaignId}:${allocation}`
+}
+
+export async function reconcileProofCampaignJob(queue: PostgresRsiJobQueue, existing: FleetJob | undefined, expected: FleetJobIdentity, lease: ProofCampaignArmLease): Promise<FleetJob | undefined> {
+	if (!existing || fleetJobMatches(existing, expected)) return existing
+	if (existing.status === "queued") {
+		const rebound = await queue.rebindQueuedProofJob(existing.jobId, expected, lease)
+		if (fleetJobMatches(rebound, expected)) return rebound
+	}
+	throw new Error("existing proof campaign job is not the same completed result or a safely rebindable queued job")
+}
+
+export async function rebuildFinishedProofCampaignArchive(args: {
+	run: RsiRunRecord
+	config: RsiConfig
+	snapshot: Record<string, unknown>
+	manifest: ProofCampaignManifest
+	armId: string
+	now: () => string
+}): Promise<RsiRunRecord> {
+	const campaign = args.snapshot.campaign as Record<string, unknown> | undefined
+	const arms = args.snapshot.arms as Array<Record<string, unknown>> | undefined
+	const arm = arms?.find((entry) => entry.arm_id === args.armId)
+	const expectedDigest = proofCampaignManifestDigest(args.manifest)
+	if (!campaign || !arm || arm.state !== "finished" || String(campaign.manifest_sha256).trim() !== expectedDigest) throw new Error("finished proof campaign snapshot does not match the frozen manifest and arm")
+	if (arm.run_id !== args.run.runId || args.run.candidates.some((candidate) => !isTerminal(candidate))) throw new Error("finished proof campaign arm cannot rebuild an incomplete or foreign run archive")
+	args.run.proofCampaign = { manifest: args.manifest, manifestSha256: expectedDigest, campaignId: args.manifest.campaignId, armId: args.armId, epoch: Number(arm.epoch), state: "finished", ledgerSnapshot: args.snapshot }
+	const selections = (args.snapshot.events as Array<Record<string, unknown>>).filter((event) => event.arm_id === args.armId && event.event_type === "generation-selected").sort((left, right) => Number(left.sequence) - Number(right.sequence))
+	const finalSelection = selections.at(-1)?.payload as { generation?: number; selectedCandidateIds?: string[] } | undefined
+	if (finalSelection && Number.isSafeInteger(finalSelection.generation)) {
+		args.run.selectedCandidates = (finalSelection.selectedCandidateIds ?? []).map((slot) => {
+			const generationCandidates = args.run.candidates.filter((candidate) => candidate.generation === finalSelection.generation)
+			const index = Number(/candidate-(\d+)$/.exec(slot)?.[1] ?? -1)
+			return generationCandidates[index]?.id ?? ""
+		}).filter(Boolean)
+		args.run.selected ??= [...args.run.candidates.filter((candidate) => candidate.status === "accepted")].sort((a, b) => compareFitness(b.fitness, a.fitness))[0]?.id
+	}
+	args.run.finishedAt ??= args.now()
+	const recoveredReportPath = `${args.config.archiveDir}/${args.run.runId}.md`
+	await fs.mkdir(args.config.archiveDir, { recursive: true })
+	await fs.writeFile(recoveredReportPath, formatRunReport(args.run, args.config), "utf8")
+	args.run.reports = [...new Set([...args.run.reports, recoveredReportPath])]
+	await appendRun(args.config.archiveDir, args.run)
+	return args.run
 }
 
 class CandidateLineageError extends Error {}
@@ -118,14 +233,14 @@ async function waitForFleetJob(queue: PostgresRsiJobQueue, jobId: string, timeou
 	throw new Error(`fleet job ${jobId} exceeded coordinator timeout`)
 }
 
-function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: { content: Buffer; snapshotCommit: string; snapshotTreeDigest?: string }, options: { campaignId?: string; boundedInference?: boolean; includeWorkerHarness?: boolean } = {}): FleetJobPayload {
+function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: { content: Buffer; snapshotCommit: string; snapshotTreeDigest?: string }, options: { campaignId?: string; boundedInference?: boolean; includeWorkerHarness?: boolean; proofCampaign?: FleetJobPayload["proofCampaign"]; remainingCampaignMs?: number } = {}): FleetJobPayload {
 	const provider = config.roles?.worker?.provider === "openrouter" ? "openrouter" : "ollama"
 	if (provider === "openrouter" && candidate.model !== RSI_OPENROUTER_MODEL) throw new Error(`RSI OpenRouter worker model must be pinned to ${RSI_OPENROUTER_MODEL}`)
 	const inferenceLimits = provider === "openrouter" && options.boundedInference
 		? openRouterBrokerLimitsFromEnvironment(openRouterAllocatedEnvironment(process.env, "mutation"), options.campaignId ?? "", {
 			maxCalls: config.maxIterations,
 			...(config.maxTokens ? { maxOutputTokensPerCall: config.maxTokens } : {}),
-			maxDurationMs: config.commandTimeoutMs,
+			maxDurationMs: Math.max(1, Math.min(config.commandTimeoutMs, options.remainingCampaignMs ?? config.commandTimeoutMs)),
 		})
 		: undefined
 	const effectiveMode = effectiveWorkerHarnessMode(config.workerHarnessMode ?? "fixed-control", candidate.generation)
@@ -139,6 +254,7 @@ function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: {
 		task: config.mutationTask,
 		model: candidate.model,
 		provider,
+		...(options.proofCampaign ? { proofCampaign: options.proofCampaign } : {}),
 		...(inferenceLimits ? { inferenceLimits } : {}),
 		maxIterations: config.maxIterations,
 		timeoutMs: config.commandTimeoutMs,
@@ -524,6 +640,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		if (config.population < 2 || config.generations !== 1 || trajectoryLimit < config.population || trajectoryLimit > config.population + 1 || iterationLimit < config.population * config.maxIterations || iterationLimit > trajectoryLimit * config.maxIterations) {
 			throw new Error("invalid adaptive-independent budgets: require population >= 2, exactly one follow-up generation, and trajectory/iteration limits for only the initial cohort plus at most one candidate")
 		}
+		if (config.workerHarnessPairId) throw new Error("paired restart-safe proof campaigns require every frozen generation to run; adaptive early-stop is not admitted")
 	}
 	const now = hooks.now ?? (() => new Date().toISOString())
 	const archive = await readArchive(config.archiveDir)
@@ -614,7 +731,8 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	run.developmentProofProtocol ??= proofProtocol
 	run.confirmationEvidence = "unmeasured"
 	const proofAttemptCache = new Map<string, Promise<BenchmarkAttempt[]>>()
-	const runDevelopmentProof = async (harnessCommit: string, evidenceRunId = run.runId): Promise<DevelopmentTaskCell[]> => {
+	const runDevelopmentProof = async (harnessCommit: string, slotId: string, proofRole: "child" | "parent" | "base", sourceCandidateId = slotId): Promise<DevelopmentTaskCell[]> => {
+		const evidenceRunId = `${run.runId}:${slotId}:${proofRole}`
 		const cacheKey = `${evidenceRunId}\0${harnessCommit}`
 		const cached = proofAttemptCache.get(cacheKey)
 		if (cached) return developmentCells(await cached)
@@ -624,9 +742,46 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		const lineagePaths = execFileSync("git", ["diff", "--name-only", "-z", "--no-renames", run.baseCommit, harnessCommit], { cwd: config.repoRoot, encoding: "buffer" }) as Buffer
 		const lineageViolations = protectedPathViolations(lineagePaths.toString("utf8").split("\0").filter(Boolean), config.protectedPaths)
 		if (lineageViolations.length > 0) throw new Error(`development proof harness changes protected paths relative to the run base: ${lineageViolations.join(", ")}`)
+		const outputRoot = path.join(config.archiveDir, "development-proof", evidenceRunId, proofProtocol.protocolDigest)
 		const pending = hooks.runDevelopmentBenchmark
-			? hooks.runDevelopmentBenchmark({ harnessCommit, model: workerModel, outputRoot: path.join(config.archiveDir, "development-proof", evidenceRunId, proofProtocol.protocolDigest), protocol: proofProtocol })
-			: runDevelopmentBenchmarkForCommit({ repoRoot: config.repoRoot, fixturesRoot: proofFixturesRoot, outputRoot: path.join(config.archiveDir, "development-proof", evidenceRunId, proofProtocol.protocolDigest), harnessCommit, model: workerModel, provider: workerProvider, campaignId: `proof-${evidenceRunId}-${proofProtocol.protocolDigest.slice(0, 16)}` })
+			? hooks.runDevelopmentBenchmark({ harnessCommit, model: workerModel, outputRoot, protocol: proofProtocol })
+			: runDevelopmentBenchmarkForCommit({
+				repoRoot: config.repoRoot, fixturesRoot: proofFixturesRoot, outputRoot, harnessCommit, model: workerModel, provider: workerProvider,
+			campaignId: campaignLease ? proofBrokerCampaignId(campaignLease.campaignId, "benchmark") : `proof-${evidenceRunId}-${proofProtocol.protocolDigest.slice(0, 16)}`,
+			...(campaignLease ? {
+				attemptNamespace: `${slotId}:${proofRole}`,
+				inferenceLedgerPath: path.join(config.archiveDir, "development-proof", campaignLease.campaignId, "benchmark-openrouter-inference-ledger.json"),
+				attemptLifecycle: {
+					beforeAttempt: async ({ task, attemptId, campaignId: inferenceCampaignId, agentImage, model, sampling }) => {
+						await assertCampaignLease()
+						const remaining = Math.max(1, Date.parse(campaignLease!.deadlineAt) - Date.now())
+						const limits = openRouterBrokerLimitsFromEnvironment(openRouterAllocatedEnvironment(process.env, "benchmark"), proofBrokerCampaignId(campaignLease!.campaignId, "benchmark"), { maxCalls: task.ceilings.maxCalls, maxOutputTokensPerCall: task.ceilings.maxOutputTokensPerCall, maxDurationMs: Math.max(1, Math.min(task.ceilings.timeoutMs, remaining)) })
+							const request = { taskId: task.id, attemptId, campaignId: inferenceCampaignId, harnessCommit, agentImage, model, sampling, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings }
+							const requestSha256 = createHash("sha256").update(JSON.stringify(request)).digest("hex")
+							const attemptKey = `development:${slotId}:${proofRole}:${attemptId}`
+							const admitted = await campaignStore!.admit(campaignLease!, { attemptKey, brokerJobId: attemptId, kind: "development-proof", identity: { generation: Number(/^g(\d+)-/.exec(slotId)?.[1] ?? -1), candidateId: `${slotId}:${proofRole}`, taskId: task.id, seed: String(task.seed), attemptKind: "development-proof" }, sourceCandidateId, requestSha256, calls: limits.maxCalls, tokens: limits.maxTotalTokens, spendUsd: limits.maxJobSpendUsd })
+							if (admitted.status !== "admitted") throw new Error("benchmark proof cell was already dispatched or completed but has no verified local attempt artifact; refusing to dispatch it again")
+							await campaignStore!.markDispatched(campaignLease!, attemptKey)
+							return requestSha256
+						},
+						settledAttempt: async ({ attempt }) => {
+							const attemptKey = `development:${slotId}:${proofRole}:${attempt.attemptId}`
+							if (!attempt.proofRequestSha256) throw new Error("verified benchmark replay is missing its durable campaign request digest")
+						const limits = openRouterBrokerLimitsFromEnvironment(openRouterAllocatedEnvironment(process.env, "benchmark"), proofBrokerCampaignId(campaignLease!.campaignId, "benchmark"), { maxCalls: attempt.ceilings.maxCalls, maxOutputTokensPerCall: attempt.ceilings.maxOutputTokensPerCall, maxDurationMs: Math.max(1, Math.min(attempt.ceilings.timeoutMs, Date.parse(campaignLease!.deadlineAt) - Date.now())) })
+							const admitted = await campaignStore!.admit(campaignLease!, {
+								attemptKey, brokerJobId: attempt.attemptId, kind: "development-proof",
+								identity: { generation: Number(/^g(\d+)-/.exec(slotId)?.[1] ?? -1), candidateId: `${slotId}:${proofRole}`, taskId: attempt.taskId, seed: String(attempt.seed), attemptKind: "development-proof" },
+								sourceCandidateId, requestSha256: attempt.proofRequestSha256, calls: limits.maxCalls, tokens: limits.maxTotalTokens, spendUsd: limits.maxJobSpendUsd,
+							})
+							if (admitted.status === "admitted" || admitted.status === "dispatched") await campaignStore!.markDispatched(campaignLease!, attemptKey)
+							else if (admitted.status !== "completed") throw new Error("benchmark proof cell cannot be settled after campaign recovery")
+							const receipt = attempt.inferenceReceipt
+							if (!receipt?.qualified) await campaignStore!.settle(campaignLease!, attemptKey, { status: "uncertain", error: "benchmark broker receipt is missing or unqualified" })
+							else await campaignStore!.settle(campaignLease!, attemptKey, { status: "completed", resultSha256: createHash("sha256").update(JSON.stringify(attempt)).digest("hex"), artifactRefs: Object.fromEntries(Object.entries(attempt.artifactRefs).map(([key, value]) => [key, { sha256: value }])), actualCalls: receipt.calls, actualTokens: receipt.totalTokens ?? 0, actualSpendUsd: receipt.costUsd ?? 0 })
+						},
+					},
+				} : {}),
+			})
 		proofAttemptCache.set(cacheKey, pending)
 		return developmentCells(await pending)
 	}
@@ -641,11 +796,47 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	if (!config.dryRun && workerProvider === "openshell-openrouter" && !fleetQueue) throw new Error("RSI OpenRouter inference requires the supervised fleet broker path")
 	if (!config.dryRun && config.roles?.adversary && !fleetQueue) throw new Error("RSI adversarial break tests require the OpenShell fleet evaluation path")
 	const commandRunner = hooks.runCommand ?? (fleetQueue ? undefined : createOpenShellCommandRunner(runConfig))
+	let campaignStore: PostgresProofCampaign | undefined
+	let campaignLease: ProofCampaignArmLease | undefined
+	let campaignHeartbeat: NodeJS.Timeout | undefined
+	let campaignLeaseFailure: Error | undefined
+	let heartbeatInFlight = false
+	const assertCampaignLease = async (): Promise<void> => {
+		if (!campaignStore || !campaignLease) return
+		if (campaignLeaseFailure) throw campaignLeaseFailure
+		if (Date.now() >= Date.parse(campaignLease.deadlineAt)) throw new Error("proof campaign hard runtime deadline expired; refusing further admission or selection")
+		if (!await campaignStore.renew(campaignLease)) {
+			campaignLeaseFailure = new Error("proof campaign coordinator lease was fenced; refusing result import or promotion")
+			throw campaignLeaseFailure
+		}
+	}
 	try {
 	if (fleetQueue) {
 		if (fleetQueue.artifactBackend !== "s3") throw new Error("RSI production runs require a shared S3-compatible artifact store")
 		await fleetQueue.migrate()
 		if (await fleetQueue.activeWorkerCount() < 1) throw new Error("no live OpenShell RSI worker is registered for the configured queue")
+	}
+	if (config.workerHarnessPairId && !config.dryRun) {
+		if (!config.workerHarnessMode || !workerHarnessRuntime || !fleetQueue) throw new Error("restart-safe paired worker-harness campaigns require an explicit arm, frozen runtime identity, and PostgreSQL fleet queue")
+		const manifest = createProofCampaignManifest({ config: runConfig, campaignId: config.workerHarnessPairId, baseCommit, model: workerModel, provider: workerProvider, runtime: workerHarnessRuntime, developmentManifest: loadedProofBenchmark.manifest, developmentManifestDigest: loadedProofBenchmark.manifestDigest, plannedGenerations, proofProtocol })
+		campaignStore = fleetQueue.proofCampaignCoordinator()
+		if (hooks.runDevelopmentBenchmark) throw new Error("paired proof campaigns cannot use an injected benchmark hook that bypasses durable campaign admission and settlement")
+		const priorSnapshot = await campaignStore.snapshotIfExists(config.workerHarnessPairId)
+		const priorArm = (priorSnapshot?.arms as Array<Record<string, unknown>> | undefined)?.find((entry) => entry.arm_id === workerHarnessMode)
+		if (priorArm?.state === "finished") {
+			return rebuildFinishedProofCampaignArchive({ run, config, snapshot: priorSnapshot!, manifest, armId: workerHarnessMode, now })
+		}
+		campaignLease = await campaignStore.acquire(manifest, workerHarnessMode, run.runId, `${process.pid}:${randomUUID()}`)
+		run.proofCampaign = { manifest, manifestSha256: campaignLease.manifestSha256, campaignId: campaignLease.campaignId, armId: campaignLease.armId, epoch: campaignLease.epoch, state: "running" }
+		campaignHeartbeat = setInterval(() => {
+			if (heartbeatInFlight || !campaignStore || !campaignLease) return
+			heartbeatInFlight = true
+			void campaignStore.renew(campaignLease).then((renewed) => {
+				if (!renewed) campaignLeaseFailure = new Error("proof campaign coordinator heartbeat was fenced; refusing result import or promotion")
+			}).catch((error) => { campaignLeaseFailure = error instanceof Error ? error : new Error(String(error)) }).finally(() => { heartbeatInFlight = false })
+		}, 5_000)
+		campaignHeartbeat.unref()
+		await checkpointRun(config.archiveDir, run)
 	}
 	if (resumed && !fleetQueue) recoverInterruptedCandidates(run, now())
 	if (!config.dryRun && !run.baselineEvaluation) {
@@ -688,10 +879,12 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 						const expectedParentCommit = prior.parentCommit ?? prior.baseCommit
 						if (!childCommit || saved.runId !== run.runId || saved.protocolDigest !== proofProtocol.protocolDigest) throw new CandidateLineageError("accepted parent has no current frozen development proof")
 						if (saved.immediateParent.childCommit !== childCommit || saved.immediateParent.referenceCommit !== expectedParentCommit || saved.originalBase.childCommit !== childCommit || saved.originalBase.referenceCommit !== run.baseCommit) throw new CandidateLineageError("saved development proof references do not match the candidate, immediate parent, and run base")
+						const priorIndex = run.candidates.filter((entry) => entry.generation === prior.generation).indexOf(prior)
+						const priorSlot = proofCandidateSlot(prior.generation, priorIndex)
 						const [childCells, parentCells, rootCells] = await Promise.all([
-							runDevelopmentProof(childCommit, saved.runId),
-							runDevelopmentProof(saved.immediateParent.referenceCommit, saved.runId),
-							runDevelopmentProof(saved.originalBase.referenceCommit, saved.runId),
+							runDevelopmentProof(childCommit, priorSlot, "child", prior.id),
+							runDevelopmentProof(saved.immediateParent.referenceCommit, priorSlot, "parent", prior.id),
+							runDevelopmentProof(saved.originalBase.referenceCommit, priorSlot, "base", prior.id),
 						])
 						const attemptIdsMatch = (expected: string[], cells: DevelopmentTaskCell[]) => JSON.stringify([...expected].sort()) === JSON.stringify(cells.map((cell) => cell.attemptId).sort())
 						if (!attemptIdsMatch(saved.childAttemptIds, childCells) || !attemptIdsMatch(saved.parentAttemptIds, parentCells) || !attemptIdsMatch(saved.originalBaseAttemptIds, rootCells)) throw new CandidateLineageError("accepted parent attempt references do not match replayed benchmark artifacts")
@@ -752,10 +945,17 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 					const worktree = await ensureCandidateWorktree(runConfig, candidate)
 					managedWorktrees.add(candidate.id)
 					const key = `${run.runId}:${candidate.id}:mutation`
+					const slotId = proofCandidateSlot(candidate.generation, candidates.indexOf(candidate))
 					const snapshot = createMutationSnapshotBundle(candidate.worktree, candidate.baseCommit, runConfig)
 					const artifact = await fleetQueue.putArtifact(snapshot.content)
 					const useOpenRouter = runConfig.roles?.worker?.provider === "openrouter"
-			const payload = fleetPayload(runConfig, candidate, snapshot, { campaignId: run.runId, boundedInference: true, includeWorkerHarness: true })
+					await assertCampaignLease()
+					const remainingCampaignMs = campaignLease ? Math.max(1, Date.parse(campaignLease.deadlineAt) - Date.now()) : undefined
+					const attemptKey = key
+					const payload = fleetPayload(runConfig, candidate, snapshot, {
+						campaignId: campaignLease ? proofBrokerCampaignId(campaignLease.campaignId, "mutation") : run.runId, boundedInference: true, includeWorkerHarness: true, remainingCampaignMs,
+						...(campaignLease ? { proofCampaign: { campaignId: campaignLease.campaignId, armId: campaignLease.armId, epoch: campaignLease.epoch, manifestSha256: campaignLease.manifestSha256, cells: [{ attemptKey, slotId, attemptKind: "mutation" as const }] } } : {}),
+					})
 					payload.snapshotSha256 = artifact.sha256
 					const resourceClass = useOpenRouter ? "REMOTE_API" as const : "LOCAL_GPU" as const
 					const concurrencyKey = `${useOpenRouter ? "openrouter" : "ollama"}:${candidate.model}`
@@ -764,8 +964,19 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 						jobKind: "mutation", resourceClass, concurrencyKey,
 						artifactSha256: artifact.sha256, payload,
 					}
-					const existing = await fleetQueue.getJobByIdempotencyKey(key)
+					let existing = await fleetQueue.getJobByIdempotencyKey(key)
+					if (campaignLease) existing = await reconcileProofCampaignJob(fleetQueue, existing, expected, campaignLease)
 					if (existing && !fleetJobMatches(existing, expected)) throw new Error("existing idempotent mutation job has mismatched execution identity, snapshot, or task payload")
+					if (campaignStore && campaignLease) {
+						const limits = payload.inferenceLimits
+						if (!limits) throw new Error("proof campaign mutation has no bounded broker limits")
+						const requestSha256 = fleetPayloadDigest(existing?.status === "completed" ? existing.payload : payload)
+						const admitted = await campaignStore.admit(campaignLease, {
+							attemptKey, kind: "mutation", identity: { generation: candidate.generation, candidateId: slotId, taskId: "mutation", seed: runConfig.seed, attemptKind: "mutation" }, sourceCandidateId: candidate.id,
+							requestSha256, calls: limits.maxCalls, tokens: limits.maxTotalTokens, spendUsd: limits.maxJobSpendUsd, ...(existing ? { jobId: existing.jobId } : {}),
+						})
+						if (admitted.status !== "completed") await campaignStore.markDispatched(campaignLease, attemptKey, existing?.jobId)
+					}
 					if (worktree.commits > 0) {
 						const completed = existing
 						if (completed?.candidateId !== candidate.id || completed.jobKind !== "mutation" || completed.status !== "completed" || !completed.result || typeof completed.result !== "object") {
@@ -796,6 +1007,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 					}
 					const job = existing ?? await fleetQueue.enqueue(expected)
 					if (!fleetJobMatches(job, expected)) throw new Error("enqueued mutation job does not match its expected execution identity or payload")
+					if (campaignStore && campaignLease) await campaignStore.markDispatched(campaignLease, attemptKey, job.jobId)
 					mutationJobs.set(candidate.id, job)
 				}
 			} catch (error) {
@@ -884,15 +1096,37 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 					const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: candidate.worktree, encoding: "utf8" }).trim()
 					const snapshot = createEvaluationSnapshotBundle(candidate.worktree, head, runConfig)
 					const artifact = await fleetQueue.putArtifact(snapshot.content)
-					const payload = fleetPayload(runConfig, candidate, snapshot)
+					const slotId = proofCandidateSlot(candidate.generation, candidates.indexOf(candidate))
+					const verificationTaskIds = ["regression", "typecheck", ...config.evalCommands.map((_, index) => `visible-${index}`)]
+					const attemptKeys = verificationTaskIds.map((taskId) => `${run.runId}:${candidate.id}:evaluation:${taskId}`)
+					const payload = fleetPayload(runConfig, candidate, snapshot, {
+						...(campaignLease ? { proofCampaign: {
+							campaignId: campaignLease.campaignId, armId: campaignLease.armId, epoch: campaignLease.epoch, manifestSha256: campaignLease.manifestSha256,
+							cells: verificationTaskIds.map((taskId, index) => ({ attemptKey: attemptKeys[index]!, slotId, attemptKind: "verification" as const })),
+						} } : {}),
+					})
 					payload.snapshotSha256 = artifact.sha256
 					const expected: FleetJobIdentity = {
 						idempotencyKey: key, runId: run.runId, candidateId: candidate.id,
 						jobKind: "evaluation", resourceClass: "CPU", concurrencyKey: `eval:${candidate.id}`,
 						artifactSha256: artifact.sha256, payload,
 					}
-					const existing = await fleetQueue.getJobByIdempotencyKey(key)
+					let existing = await fleetQueue.getJobByIdempotencyKey(key)
+					if (campaignLease) existing = await reconcileProofCampaignJob(fleetQueue, existing, expected, campaignLease)
 					if (existing && !fleetJobMatches(existing, expected)) throw new Error("existing idempotent evaluation job has mismatched execution identity, snapshot, or evaluation configuration")
+					if (campaignStore && campaignLease) {
+						const requestSha256 = fleetPayloadDigest(existing?.status === "completed" ? existing.payload : payload)
+						for (let index = 0; index < verificationTaskIds.length; index++) {
+							const taskId = verificationTaskIds[index]!
+							const attemptKey = attemptKeys[index]!
+							const admitted = await campaignStore.admit(campaignLease, {
+								attemptKey, kind: "verification",
+								identity: { generation: candidate.generation, candidateId: slotId, taskId, seed: runConfig.seed, attemptKind: "verification" }, sourceCandidateId: candidate.id,
+								requestSha256, calls: 0, tokens: 0, spendUsd: 0, ...(existing ? { jobId: existing.jobId } : {}),
+							})
+							if (admitted.status !== "completed") await campaignStore.markDispatched(campaignLease, attemptKey, existing?.jobId)
+						}
+					}
 					const job = existing ?? await fleetQueue.enqueue(expected)
 					if (!fleetJobMatches(job, expected)) throw new Error("enqueued evaluation job does not match its expected execution identity or payload")
 					evaluationJobs.set(candidate.id, job)
@@ -939,24 +1173,61 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 				if (run.baselineEvaluation) candidate.pairedComparison = comparePairedEvaluation(run.baselineEvaluation, evaluation)
 				const childCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: candidate.worktree, encoding: "utf8" }).trim()
 				const parentCommit = candidate.parentCommit ?? candidate.baseCommit
+				const parentCandidate = candidate.parent ? run.candidates.find((entry) => entry.id === candidate.parent) : undefined
+				if (candidate.parent && candidate.parent !== "baseline" && !parentCandidate) throw new Error(`candidate ${candidate.id} has no durable parent record for proof lineage`)
+				const campaignParentId = parentCandidate
+					? proofCandidateSlot(parentCandidate.generation, run.candidates.filter((entry) => entry.generation === parentCandidate.generation).indexOf(parentCandidate))
+					: "baseline"
 				validateCandidateParent(candidate, run, config, proofProtocol)
+				let campaignDependentAttemptKeys: string[] = []
 				if (Object.values(candidate.fitness.hardGates).some((passed) => passed === false)) {
 					const empty: DevelopmentTaskCell[] = []
 					const immediateParent = compareDevelopmentAttempts({ protocol: proofProtocol, childCommit, referenceCommit: parentCommit, referenceKind: "immediate-parent", child: empty, reference: empty })
 					const originalBase = compareDevelopmentAttempts({ protocol: proofProtocol, childCommit, referenceCommit: run.baseCommit, referenceKind: "original-base", child: empty, reference: empty })
 					candidate.developmentProof = candidateProofDecision({ runId: run.runId, protocol: proofProtocol, child: empty, parent: empty, originalBase: empty, immediateParent, originalBaseComparison: originalBase })
 					candidate.developmentProof.reason = "development benchmark skipped because regression, typecheck, or evaluator hard gate failed"
+					if (campaignStore && campaignLease) {
+						const slotId = proofCandidateSlot(candidate.generation, candidates.indexOf(candidate))
+						const skippedKeys: string[] = []
+					for (const role of ["child", "parent", "base"] as const) for (const task of proofProtocol.taskIdentities) {
+						const candidateId = `${slotId}:${role}`
+						const attemptKey = `skipped:${slotId}:${role}:${task.id}`
+						const evidence = { candidateId, role, taskId: task.id, reason: candidate.developmentProof.reason, fitness: candidate.fitness, protocolDigest: proofProtocol.protocolDigest }
+						await campaignStore.skipAfterHardGate(campaignLease, {
+							attemptKey, identity: { generation: candidate.generation, candidateId, taskId: task.id, seed: String(task.seed), attemptKind: "development-proof" },
+							requestSha256: createHash("sha256").update(JSON.stringify(evidence)).digest("hex"), reason: candidate.developmentProof.reason,
+						})
+						skippedKeys.push(attemptKey)
+					}
+					campaignDependentAttemptKeys = skippedKeys
+				}
 				} else {
+					const slotId = proofCandidateSlot(candidate.generation, candidates.indexOf(candidate))
 					const [childCells, parentCells, rootCells] = await Promise.all([
-						runDevelopmentProof(childCommit),
-						runDevelopmentProof(parentCommit),
-						runDevelopmentProof(run.baseCommit),
+						runDevelopmentProof(childCommit, slotId, "child", candidate.id),
+						runDevelopmentProof(parentCommit, slotId, "parent", candidate.id),
+						runDevelopmentProof(run.baseCommit, slotId, "base", candidate.id),
 					])
 					const immediateParent = compareDevelopmentAttempts({ protocol: proofProtocol, childCommit, referenceCommit: parentCommit, referenceKind: "immediate-parent", child: childCells, reference: parentCells })
 					const originalBase = compareDevelopmentAttempts({ protocol: proofProtocol, childCommit, referenceCommit: run.baseCommit, referenceKind: "original-base", child: childCells, reference: rootCells })
 					candidate.developmentProof = candidateProofDecision({ runId: run.runId, protocol: proofProtocol, child: childCells, parent: parentCells, originalBase: rootCells, immediateParent, originalBaseComparison: originalBase })
+					campaignDependentAttemptKeys = [
+						...childCells.map((cell) => `development:${slotId}:child:${cell.attemptId}`),
+						...parentCells.map((cell) => `development:${slotId}:parent:${cell.attemptId}`),
+						...rootCells.map((cell) => `development:${slotId}:base:${cell.attemptId}`),
+					]
 				}
 				candidate.status = candidate.fitness.score > 0 && candidate.developmentProof.accepted ? "accepted" : "rejected"
+				if (campaignStore && campaignLease) {
+					const slotId = proofCandidateSlot(candidate.generation, candidates.indexOf(candidate))
+					const verificationKeys = ["regression", "typecheck", ...config.evalCommands.map((_, index) => `visible-${index}`)].map((taskId) => `${run.runId}:${candidate.id}:evaluation:${taskId}`)
+					const decisionStatus = candidate.status === "accepted" ? "accepted" : "rejected"
+					await campaignStore.recordDecision(campaignLease, {
+						generation: candidate.generation, candidateId: slotId, parentId: campaignParentId, status: decisionStatus, childCommit, parentCommit,
+						proof: { fitness: candidate.fitness, developmentProof: candidate.developmentProof, protocolDigest: proofProtocol.protocolDigest, skippedTaskKeys: campaignDependentAttemptKeys.filter((key) => key.startsWith("skipped:")) },
+						attemptKeys: [`${run.runId}:${candidate.id}:mutation`, ...verificationKeys, ...campaignDependentAttemptKeys],
+					})
+				}
 				candidate.updatedAt = now()
 				const combination = createCombination(candidate.id, candidate.modelCandidateId ?? "model-base", now())
 				combination.status = candidate.status === "accepted" ? "accepted" : "rejected"
@@ -983,9 +1254,59 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 			}
 		}
 
+		if (campaignStore && campaignLease) {
+			const snapshot = await campaignStore.snapshot(campaignLease.campaignId)
+			const attempts = snapshot.attempts as Array<Record<string, unknown>>
+			const decisions = snapshot.decisions as Array<Record<string, unknown>>
+			for (const candidate of candidates.filter((entry) => entry.status === "rejected" || entry.status === "failed")) {
+				const slotId = proofCandidateSlot(candidate.generation, candidates.indexOf(candidate))
+				if (decisions.some((decision) => decision.arm_id === campaignLease!.armId && decision.candidate_id === slotId)) continue
+				const scheduled = (run.proofCampaign!.manifest.schedule).filter((cell) => cell.armId === campaignLease!.armId && cell.generation === candidate.generation && (cell.candidateId === slotId || cell.candidateId.startsWith(`${slotId}:`)))
+				const keys: string[] = []
+				let allSettled = true
+				for (const cell of scheduled) {
+					const existing = attempts.find((attempt) => attempt.arm_id === campaignLease!.armId && Number(attempt.generation) === cell.generation && attempt.candidate_id === cell.candidateId && attempt.task_id === cell.taskId && attempt.seed === cell.seed && attempt.attempt_kind === cell.attemptKind)
+					if (existing?.status === "completed" || existing?.status === "skipped-after-hard-gate") {
+						keys.push(String(existing.attempt_key))
+						continue
+					}
+					if (!existing || existing.status === "admitted") {
+						const attemptKey = existing ? String(existing.attempt_key) : `skipped:${cell.candidateId}:${cell.taskId}`
+						const evidence = { candidateId: cell.candidateId, taskId: cell.taskId, reason: candidate.failure ?? "candidate rejected by a hard gate before dependent task dispatch", candidateStatus: candidate.status, runId: run.runId }
+						await campaignStore.skipAfterHardGate(campaignLease, {
+							attemptKey, identity: { generation: cell.generation, candidateId: cell.candidateId, taskId: cell.taskId, seed: cell.seed, attemptKind: cell.attemptKind },
+							requestSha256: createHash("sha256").update(JSON.stringify(evidence)).digest("hex"), reason: String(evidence.reason),
+						})
+						keys.push(attemptKey)
+						continue
+					}
+					allSettled = false
+					break
+				}
+				if (allSettled && scheduled.length > 0) {
+					const childCommit = candidate.commits[0] ?? candidate.baseCommit
+					const parentCandidate = candidate.parent ? run.candidates.find((entry) => entry.id === candidate.parent) : undefined
+					if (candidate.parent && candidate.parent !== "baseline" && !parentCandidate) throw new Error(`candidate ${candidate.id} has no durable parent record for proof lineage`)
+					const campaignParentId = parentCandidate
+						? proofCandidateSlot(parentCandidate.generation, run.candidates.filter((entry) => entry.generation === parentCandidate.generation).indexOf(parentCandidate))
+						: "baseline"
+					await campaignStore.recordDecision(campaignLease, {
+						generation: candidate.generation, candidateId: slotId, parentId: campaignParentId, status: candidate.status === "failed" ? "failed" : "rejected",
+						childCommit, parentCommit: candidate.parentCommit ?? candidate.baseCommit,
+						proof: { failure: candidate.failure ?? "candidate hard gate rejected before task dispatch", status: candidate.status, attemptKeys: keys }, attemptKeys: keys,
+					})
+				}
+			}
+		}
+
 		const accepted = candidates.filter((candidate) => candidate.status === "accepted")
 		const front = paretoFront(accepted)
 		const ranked = [...accepted].sort((a, b) => compareFitness(b.fitness, a.fitness))
+		if (campaignStore && campaignLease) {
+			await assertCampaignLease()
+			const selectedSlots = front.map((candidate) => proofCandidateSlot(candidate.generation, candidates.indexOf(candidate)))
+			await campaignStore.selectGeneration(campaignLease, generation, selectedSlots)
+		}
 		run.selectedCandidates = front.map((candidate) => candidate.id)
 		if (ranked[0]) run.selected = ranked[0].id
 		if (config.computePolicy === "adaptive-independent") {
@@ -1021,6 +1342,11 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	if (!config.dryRun && trajectories.length > 0) {
 		await exportTrajectoryDatasets(trajectories, `${config.trajectoryDir ?? `${config.archiveDir}/trajectories`}/datasets`)
 	}
+	if (campaignStore && campaignLease) {
+		await assertCampaignLease()
+		await campaignStore.finishDevelopmentArm(campaignLease)
+		run.proofCampaign = { ...run.proofCampaign!, state: "evaluated", ledgerSnapshot: await campaignStore.snapshot(campaignLease.campaignId) }
+	}
 
 	run.finishedAt = now()
 	const report = formatRunReport(run, config)
@@ -1035,6 +1361,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	}
 	return run
 	} finally {
+		if (campaignHeartbeat) clearInterval(campaignHeartbeat)
 		if (fleetQueue) await fleetQueue.close()
 	}
 }
