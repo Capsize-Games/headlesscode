@@ -85,7 +85,7 @@ export interface OpenShellSessionProviderOptions {
 
 export function runOpenShellCommandAsync(args: string[], timeoutMs?: number, executable = "openshell"): Promise<CommandResult> {
 	return new Promise((resolve, reject) => {
-		execFile(executable, args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs }, (error, stdout, stderr) => {
+		const child = execFile(executable, args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs }, (error, stdout, stderr) => {
 			if (error && (error as NodeJS.ErrnoException).code === "ENOENT") {
 				reject(new Error("OpenShell CLI executable was not found"))
 				return
@@ -106,6 +106,10 @@ export function runOpenShellCommandAsync(args: string[], timeoutMs?: number, exe
 			}
 			resolve({ exitCode: code, output })
 		})
+		// OpenShell's exec relay waits for EOF on stdin before starting a command.
+		// The synchronous provider path closes it automatically; close this pipe
+		// explicitly so long-running guest commands begin immediately as well.
+		child.stdin?.end()
 	})
 }
 
@@ -468,6 +472,7 @@ export class OpenShellSessionProvider implements CloudProvider {
 			const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
 			const branchRef = quote(state.branchRef)
 			const script = [
+				"if [ -L /workspace/node_modules ]; then [ \"$(readlink /workspace/node_modules)\" = /opt/headlesscode/node_modules ] || { echo RSI_UNEXPECTED_DEPENDENCY_LINK >&2; exit 79; }; rm -- /workspace/node_modules; elif [ -e /workspace/node_modules ]; then echo RSI_UNEXPECTED_DEPENDENCY_PATH >&2; exit 79; fi",
 				"for p in .headlesscode-session .headlesscode .harness.done ORCHESTRATOR_TASK.md ORCHESTRATOR_PLAN.md .qa-task.md harness.log qa.log review.log; do if [ -z \"$(git ls-files -- \"$p\" \"$p/**\")\" ]; then rm -rf -- \"/workspace/$p\"; fi; done",
 				"for f in /workspace/.harness.* /workspace/.qa.* /workspace/.review.*; do [ -e \"$f\" ] || continue; rel=\"${f#/workspace/}\"; [ -z \"$(git ls-files -- \"$rel\")\" ] && rm -f -- \"$f\"; done",
 				"git ls-files -z -- .env '.env.*' | while IFS= read -r -d '' rel; do git show \"HEAD:$rel\" > \"/workspace/$rel\"; done",

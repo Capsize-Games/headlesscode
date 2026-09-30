@@ -28,6 +28,8 @@ export interface OpenRouterBrokerGrant {
 	capability: string
 	model: typeof RSI_OPENROUTER_MODEL
 	limits: OpenRouterBrokerLimits
+	/** Local start instant; durable ledgers preserve the first registration across restarts. */
+	issuedAtMs?: number
 }
 
 export interface OpenRouterCallReservation {
@@ -59,6 +61,10 @@ export interface OpenRouterCallReceipt extends OpenRouterCallReservation, Omit<O
 	authoritative: boolean
 }
 
+export type OpenRouterDenialReason = "metadata-not-admitted" | "unsupported-endpoint" | "malformed-call-id" | "invalid-request" | "request-size-limit" | "budget-or-fence" | "job-deadline" | "upstream-ambiguous" | "usage-unverifiable" | "usage-out-of-bounds" | "settlement-failed" | "request-failed"
+
+export interface OpenRouterDenialSummary { statusCode: number; reason: OpenRouterDenialReason; count: number }
+
 export interface OpenRouterBrokerReceipt {
 	provider: "openrouter"
 	jobId: string
@@ -73,10 +79,12 @@ export interface OpenRouterBrokerReceipt {
 	accounting: "supervisor-enforced" | "incomplete"
 	qualified: boolean
 	callReceipts: OpenRouterCallReceipt[]
+	denials: OpenRouterDenialSummary[]
 }
 
 export interface OpenRouterInferenceLedger {
-	register(grant: OpenRouterBrokerGrant): Promise<void>
+	register(grant: OpenRouterBrokerGrant): Promise<number>
+	recordDenial(grant: OpenRouterBrokerGrant, statusCode: number, reason: OpenRouterDenialReason): Promise<void>
 	reserve(grant: OpenRouterBrokerGrant, reservation: OpenRouterCallReservation): Promise<void>
 	settle(grant: OpenRouterBrokerGrant, settlement: OpenRouterCallSettlement & { callId: string }): Promise<void>
 	receipt(grant: OpenRouterBrokerGrant): Promise<OpenRouterBrokerReceipt>
@@ -87,7 +95,17 @@ interface PersistedBrokerJob {
 	capabilitySha256: string
 	leaseSha256: string
 	blocked: boolean
+	deadlineAtMs: number
 	reservations: OpenRouterCallReceipt[]
+	denials?: Record<string, number>
+}
+
+function denialSummaries(denials: Record<string, number> | undefined): OpenRouterDenialSummary[] {
+	return Object.entries(denials ?? {}).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, count]) => {
+		const match = /^(\d{3}):([a-z-]+)$/.exec(key)
+		if (!match) throw new Error("OpenRouter ledger contains a malformed denial summary")
+		return { statusCode: Number(match[1]), reason: match[2] as OpenRouterDenialReason, count }
+	})
 }
 
 interface PersistedBrokerState {
@@ -158,19 +176,22 @@ export class FileOpenRouterInferenceLedger implements OpenRouterInferenceLedger 
 		}
 	}
 
-	async register(grant: OpenRouterBrokerGrant): Promise<void> {
+	async register(grant: OpenRouterBrokerGrant): Promise<number> {
 		const fingerprint = { campaignId: grant.limits.campaignId, model: grant.model, limits: grant.limits }
-		await this.locked((state) => {
+		return this.locked((state) => {
 			const current = state.jobs[grant.jobId]
 			if (current && JSON.stringify(current.grant) !== JSON.stringify(fingerprint)) throw new Error("OpenRouter file ledger job identity conflicts with prior accounting")
+			if (current && (!Number.isSafeInteger(current.deadlineAtMs) || current.deadlineAtMs <= 0)) throw new Error("OpenRouter file ledger is missing a durable job deadline; refusing restart")
 			const campaign = state.campaigns[grant.limits.campaignId]
 			if (campaign && campaign.maxSpendUsd !== grant.limits.maxCampaignSpendUsd) throw new Error("OpenRouter file ledger campaign cap differs from prior accounting")
 			state.campaigns[grant.limits.campaignId] ??= { maxSpendUsd: grant.limits.maxCampaignSpendUsd, spentUsd: 0, reservedUsd: 0, blocked: false }
-			state.jobs[grant.jobId] = current ?? { grant: fingerprint, capabilitySha256: sha256(grant.capability), leaseSha256: sha256(grant.leaseToken), blocked: false, reservations: [] }
+			const deadlineAtMs = current?.deadlineAtMs ?? (grant.issuedAtMs ?? Date.now()) + grant.limits.maxDurationMs
+			state.jobs[grant.jobId] = current ?? { grant: fingerprint, capabilitySha256: sha256(grant.capability), leaseSha256: sha256(grant.leaseToken), blocked: false, deadlineAtMs, reservations: [] }
 			if (current) {
 				current.capabilitySha256 = sha256(grant.capability)
 				current.leaseSha256 = sha256(grant.leaseToken)
 			}
+			return deadlineAtMs
 		})
 	}
 
@@ -179,6 +200,7 @@ export class FileOpenRouterInferenceLedger implements OpenRouterInferenceLedger 
 			const job = state.jobs[grant.jobId]
 			const campaign = state.campaigns[grant.limits.campaignId]
 			if (!job || !campaign || job.blocked || campaign.blocked || job.capabilitySha256 !== sha256(grant.capability) || job.leaseSha256 !== sha256(grant.leaseToken)) throw new Error("OpenRouter file ledger grant is stale or blocked")
+			if (!Number.isFinite(Date.parse(reservation.startedAt)) || Date.parse(reservation.startedAt) >= job.deadlineAtMs) throw new Error("OpenRouter job duration limit exhausted")
 			if (job.reservations.some((call) => call.callId === reservation.callId)) throw new Error("duplicate OpenRouter call id is rejected")
 			const reservedCalls = job.reservations.length
 			const tokens = job.reservations.reduce((sum, call) => sum + call.reservedTokens, 0)
@@ -190,6 +212,17 @@ export class FileOpenRouterInferenceLedger implements OpenRouterInferenceLedger 
 		})
 	}
 
+	async recordDenial(grant: OpenRouterBrokerGrant, statusCode: number, reason: OpenRouterDenialReason): Promise<void> {
+		if (!Number.isSafeInteger(statusCode) || statusCode < 400 || statusCode > 599) throw new Error("invalid OpenRouter denial status")
+		await this.locked((state) => {
+			const job = state.jobs[grant.jobId]
+			if (!job || job.capabilitySha256 !== sha256(grant.capability) || job.leaseSha256 !== sha256(grant.leaseToken)) throw new Error("OpenRouter denial grant mismatch")
+			job.denials ??= {}
+			const key = `${statusCode}:${reason}`
+			job.denials[key] = (job.denials[key] ?? 0) + 1
+		})
+	}
+
 	async settle(grant: OpenRouterBrokerGrant, settlement: OpenRouterCallSettlement & { callId: string }): Promise<void> {
 		await this.locked((state) => {
 			const job = state.jobs[grant.jobId]
@@ -197,7 +230,8 @@ export class FileOpenRouterInferenceLedger implements OpenRouterInferenceLedger 
 			const call = job?.reservations.find((entry) => entry.callId === settlement.callId)
 			if (!job || !campaign || !call || job.capabilitySha256 !== sha256(grant.capability) || job.leaseSha256 !== sha256(grant.leaseToken) || call.state !== "reserved") throw new Error("OpenRouter file ledger settlement does not match a pending call")
 			Object.assign(call, settlement)
-			const measurable = settlement.state === "complete" && settlement.returnedModel !== undefined && settlement.promptTokens !== undefined && settlement.completionTokens !== undefined && settlement.costUsd !== undefined && settlement.responseSha256 !== undefined
+			const completedAtMs = Date.parse(settlement.completedAt)
+			const measurable = settlement.state === "complete" && Number.isFinite(completedAtMs) && completedAtMs <= job.deadlineAtMs && settlement.returnedModel !== undefined && settlement.promptTokens !== undefined && settlement.completionTokens !== undefined && settlement.costUsd !== undefined && settlement.responseSha256 !== undefined
 			if (!measurable) {
 				call.state = "unmeasured"
 				call.authoritative = false
@@ -229,7 +263,7 @@ export class FileOpenRouterInferenceLedger implements OpenRouterInferenceLedger 
 			return { provider: "openrouter", jobId: grant.jobId, campaignId: grant.limits.campaignId, model: grant.model,
 				returnedModels: [...new Set(calls.map((call) => call.returnedModel).filter((model): model is string => Boolean(model)))],
 				calls: calls.length, promptTokens, completionTokens, totalTokens: promptTokens === null || completionTokens === null ? null : promptTokens + completionTokens,
-				costUsd, accounting: qualified ? "supervisor-enforced" : "incomplete", qualified, callReceipts: structuredClone(calls) }
+				costUsd, accounting: qualified ? "supervisor-enforced" : "incomplete", qualified, callReceipts: structuredClone(calls), denials: denialSummaries(job.denials) }
 		})
 	}
 
@@ -248,7 +282,7 @@ export class FileOpenRouterInferenceLedger implements OpenRouterInferenceLedger 
 			return { provider: "openrouter", jobId, campaignId, model: job.grant.model,
 				returnedModels: [...new Set(calls.map((call) => call.returnedModel).filter((model): model is string => Boolean(model)))],
 				calls: calls.length, promptTokens, completionTokens, totalTokens: promptTokens === null || completionTokens === null ? null : promptTokens + completionTokens,
-				costUsd, accounting: qualified ? "supervisor-enforced" : "incomplete", qualified, callReceipts: structuredClone(calls) }
+				costUsd, accounting: qualified ? "supervisor-enforced" : "incomplete", qualified, callReceipts: structuredClone(calls), denials: denialSummaries(job.denials) }
 		})
 	}
 }
@@ -264,6 +298,8 @@ export interface OpenRouterBrokerOptions {
 	port?: number
 	upstreamFetch?: typeof fetch
 	now?: () => number
+	/** Observes response status and method only; request bodies and credentials are never exposed. */
+	onHttpResponse?: (event: { method: string; statusCode: number; requestBytes?: number }) => void
 }
 
 export interface RunningOpenRouterBroker {
@@ -505,40 +541,64 @@ export async function startOpenRouterBroker(options: OpenRouterBrokerOptions): P
 	if (!/^[A-Za-z0-9._:-]{1,160}$/.test(options.jobId) || !options.leaseToken) throw new Error("OpenRouter broker requires a job id and active lease token")
 	const limits = validateOpenRouterBrokerLimits(options.limits)
 	const capability = randomBytes(32).toString("base64url")
-	const grant: OpenRouterBrokerGrant = { jobId: options.jobId, leaseToken: options.leaseToken, capability, model, limits }
 	const upstreamFetch = options.upstreamFetch ?? fetch
 	const now = options.now ?? Date.now
 	await verifyPinnedPriceCeiling(upstreamFetch, options.apiKey, limits)
 	if (!options.bindHost || options.bindHost === "0.0.0.0" || options.bindHost === "::" || !isHostInterfaceAddress(options.bindHost)) throw new Error("OpenRouter broker requires an address assigned to a host interface; wildcard or non-local listeners are disabled")
-	await options.ledger.register(grant)
+	const issuedAtMs = now()
+	const grant: OpenRouterBrokerGrant = { jobId: options.jobId, leaseToken: options.leaseToken, capability, model, limits, issuedAtMs }
+	const jobDeadlineAtMs = await options.ledger.register(grant)
+	if (!Number.isFinite(jobDeadlineAtMs) || jobDeadlineAtMs <= now()) throw new Error("OpenRouter job duration limit exhausted")
 	const server: Server = createServer((request, response) => {
+		let requestBytes = Number(request.headers["content-length"] ?? 0)
+		if (!Number.isSafeInteger(requestBytes) || requestBytes < 0) requestBytes = 0
+		response.once("finish", () => {
+			try { options.onHttpResponse?.({ method: request.method ?? "UNKNOWN", statusCode: response.statusCode, requestBytes }) } catch { /* diagnostics must not affect request handling */ }
+		})
+		let authenticated = false
 		void (async () => {
+			const deny = async (status: number, reason: OpenRouterDenialReason, message: string): Promise<void> => {
+				try { await options.ledger.recordDenial(grant, status, reason) }
+				catch { sendJson(response, 500, { error: { message: "broker could not durably record request denial" } }); return }
+				sendJson(response, status, { error: { message } })
+			}
 			if (!capabilityMatches(request.headers.authorization, capability)) { sendJson(response, 401, { error: { message: "broker authorization failed" } }); return }
+			authenticated = true
 			const url = new URL(request.url ?? "/", "http://rsi-broker.invalid")
 			const endpointPath = `/api/v1/models/${model}/endpoints`
 			if (request.method === "GET" && url.pathname === endpointPath && !url.search) {
-				response.writeHead(404, { "content-type": "application/json", "cache-control": "no-store" }); response.end('{"error":{"message":"model metadata is not provided by the RSI broker"}}'); return
+				await deny(404, "metadata-not-admitted", "model metadata is not provided by the RSI broker"); return
 			}
-			if (request.method !== "POST" || url.pathname !== "/api/v1/chat/completions" || url.search) { sendJson(response, 404, { error: { message: "broker endpoint is not admitted" } }); return }
+			if (request.method !== "POST" || url.pathname !== "/api/v1/chat/completions" || url.search) { await deny(404, "unsupported-endpoint", "broker endpoint is not admitted"); return }
 			const callId = request.headers["x-rsi-call-id"]
-			if (typeof callId !== "string" || !/^[A-Za-z0-9_-]{16,100}$/.test(callId)) { sendJson(response, 400, { error: { message: "broker call id is missing or malformed" } }); return }
+			if (typeof callId !== "string" || !/^[A-Za-z0-9_-]{16,100}$/.test(callId)) { await deny(400, "malformed-call-id", "broker call id is missing or malformed"); return }
 			let rawBody: Buffer
 			let checked: { encodedBody: Buffer; outputLimit: number }
 			try {
 				rawBody = await readBody(request, limits.maxRequestBytes)
+				requestBytes = rawBody.byteLength
 				checked = validateRequestBody(rawBody, limits, model)
 			} catch (error) {
 				const message = error instanceof Error ? error.message : "invalid request"
-				sendJson(response, /exceeds|too large|byte bound/i.test(message) ? 413 : 400, { error: { message } }); return
+				const limited = /exceeds|too large|byte bound/i.test(message)
+				await deny(limited ? 413 : 400, limited ? "request-size-limit" : "invalid-request", message); return
 			}
 			const reservation: OpenRouterCallReservation = {
 				callId, requestSha256: sha256(checked.encodedBody), reservedUsd: limits.maxCallSpendUsd,
 				reservedTokens: limits.maxInputTokensPerCall + checked.outputLimit, startedAt: new Date(now()).toISOString(),
 			}
 			try { await options.ledger.reserve(grant, reservation) }
-			catch (error) { sendJson(response, 429, { error: { message: error instanceof Error ? error.message : "broker budget admission failed" } }); return }
+			catch (error) {
+				const message = error instanceof Error ? error.message : "broker budget admission failed"
+				await deny(429, /duration limit|duration exhausted/i.test(message) ? "job-deadline" : "budget-or-fence", message); return
+			}
+			const remainingJobMs = jobDeadlineAtMs - now()
+			if (remainingJobMs <= 0) {
+				await options.ledger.settle(grant, { callId, state: "unmeasured", completedAt: new Date(now()).toISOString() }).catch(() => undefined)
+				await deny(429, "job-deadline", "OpenRouter job duration limit exhausted"); return
+			}
 			const controller = new AbortController()
-			const timer = setTimeout(() => controller.abort(), limits.maxDurationMs)
+			const timer = setTimeout(() => controller.abort(), Math.min(limits.maxDurationMs, remainingJobMs))
 			let upstream: Response
 			let upstreamBody: Buffer
 			try {
@@ -550,14 +610,18 @@ export async function startOpenRouterBroker(options: OpenRouterBrokerOptions): P
 			} catch {
 				clearTimeout(timer)
 				await options.ledger.settle(grant, { callId, state: "unmeasured", completedAt: new Date(now()).toISOString() }).catch(() => undefined)
-				sendJson(response, 502, { error: { message: "upstream outcome is ambiguous; reserved budget remains charged" } }); return
+				await deny(502, "upstream-ambiguous", "upstream outcome is ambiguous; reserved budget remains charged"); return
 			} finally { clearTimeout(timer) }
+			if (now() >= jobDeadlineAtMs) {
+				await options.ledger.settle(grant, { callId, state: "unmeasured", completedAt: new Date(now()).toISOString() }).catch(() => undefined)
+				await deny(429, "job-deadline", "OpenRouter job duration limit exhausted"); return
+			}
 			const contentType = upstream.headers.get("content-type") ?? "application/json"
 			const usage = upstream.ok ? parseUsage(upstreamBody, contentType) : {}
 			const measurable = usage.promptTokens !== undefined && usage.completionTokens !== undefined && usage.costUsd !== undefined
 			if (!upstream.ok || !measurable) {
 				await options.ledger.settle(grant, { callId, state: "unmeasured", ...(usage.model ? { returnedModel: usage.model } : {}), ...(usage.id ? { providerRequestId: usage.id } : {}), ...(usage.promptTokens !== undefined ? { promptTokens: usage.promptTokens } : {}), ...(usage.completionTokens !== undefined ? { completionTokens: usage.completionTokens } : {}), ...(usage.costUsd !== undefined ? { costUsd: usage.costUsd } : {}), responseSha256: sha256(upstreamBody), completedAt: new Date(now()).toISOString() }).catch(() => undefined)
-				sendJson(response, 502, { error: { message: "upstream response lacks verifiable usage or cost; request is unqualified" } }); return
+				await deny(502, "usage-unverifiable", "upstream response lacks verifiable usage or cost; request is unqualified"); return
 			}
 			const promptTokens = usage.promptTokens!
 			const completionTokens = usage.completionTokens!
@@ -566,7 +630,7 @@ export async function startOpenRouterBroker(options: OpenRouterBrokerOptions): P
 			if (usage.model !== model || !usageWithinBounds) {
 				await options.ledger.settle(grant, { callId, state: "complete", qualified: false, returnedModel: usage.model ?? "", ...(usage.id ? { providerRequestId: usage.id } : {}), promptTokens: usage.promptTokens, completionTokens: usage.completionTokens, costUsd: usage.costUsd, responseSha256: sha256(upstreamBody), completedAt: new Date(now()).toISOString() }).catch(() => undefined)
 				const message = usage.model !== model ? "upstream returned a different model" : "upstream usage exceeded admitted broker limits"
-				sendJson(response, 502, { error: { message: `${message}; request is unqualified` } }); return
+				await deny(502, "usage-out-of-bounds", `${message}; request is unqualified`); return
 			}
 			try {
 				await options.ledger.settle(grant, {
@@ -575,14 +639,17 @@ export async function startOpenRouterBroker(options: OpenRouterBrokerOptions): P
 					responseSha256: sha256(upstreamBody), completedAt: new Date(now()).toISOString(),
 				})
 			} catch {
-				sendJson(response, 502, { error: { message: "broker could not durably reconcile usage; request is unqualified" } }); return
+				await deny(502, "settlement-failed", "broker could not durably reconcile usage; request is unqualified"); return
 			}
 			response.writeHead(upstream.status, {
 				"content-type": contentType, "content-length": String(upstreamBody.byteLength), "cache-control": "no-store",
 				...(upstream.headers.get("x-request-id") ? { "x-request-id": upstream.headers.get("x-request-id")! } : {}),
 			})
 			response.end(upstreamBody)
-		})().catch(() => { if (!response.headersSent) sendJson(response, 500, { error: { message: "broker request failed closed" } }); else response.destroy() })
+		})().catch(async () => {
+			if (authenticated) await options.ledger.recordDenial(grant, 500, "request-failed").catch(() => undefined)
+			if (!response.headersSent) sendJson(response, 500, { error: { message: "broker request failed closed" } }); else response.destroy()
+		})
 	})
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject)

@@ -72,6 +72,49 @@ test("OpenRouter broker pins model/provider, accounts usage, and survives broker
 	finally { await restarted.close() }
 })
 
+test("file ledger preserves the job deadline across broker restart and rejects a late response", async (t) => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "rsi-inference-deadline-"))
+	t.after(() => fs.rm(root, { recursive: true, force: true }))
+	const ledgerPath = path.join(root, "ledger.json")
+	const ledger = new FileOpenRouterInferenceLedger(ledgerPath)
+	const jobLimits = limits("campaign-deadline", { maxDurationMs: 1_000 })
+	const startedAt = 2_000_000
+	let nowMs = startedAt
+	let releaseUpstream!: (response: Response) => void
+	let dispatched!: () => void
+	const wasDispatched = new Promise<void>((resolve) => { dispatched = resolve })
+	const upstreamFetch = (async (input: string | URL) => {
+		if (String(input).includes("/models/")) return new Response(JSON.stringify({ data: { endpoints: [{ provider_slug: "deepseek", pricing: { prompt: "0.000001", completion: "0.000001" } }] } }), { status: 200 })
+		dispatched()
+		return await new Promise<Response>((resolve) => { releaseUpstream = resolve })
+	}) as typeof fetch
+	const first = await startOpenRouterBroker({
+		jobId: "attempt-deadline-123456", leaseToken: "lease-test", limits: jobLimits, apiKey: "host-secret",
+		bindHost: "127.0.0.1", ledger, upstreamFetch, now: () => nowMs,
+	})
+	const firstReceipt = await ledger.receipt({ jobId: "attempt-deadline-123456", leaseToken: "lease-test", capability: first.capability, model: RSI_OPENROUTER_MODEL, limits: jobLimits })
+	assert.equal(firstReceipt.qualified, false)
+	await first.close()
+	nowMs = startedAt + 500
+	const restarted = await startOpenRouterBroker({
+		jobId: "attempt-deadline-123456", leaseToken: "lease-test", limits: jobLimits, apiKey: "host-secret",
+		bindHost: "127.0.0.1", ledger, upstreamFetch, now: () => nowMs,
+	})
+	t.after(() => restarted.close())
+	const post = fetch(`${restarted.localBaseUrl}/api/v1/chat/completions`, {
+		method: "POST", headers: { authorization: `Bearer ${restarted.capability}`, "content-type": "application/json", "x-rsi-call-id": "call-deadline-123456" }, body: requestBody(),
+	})
+	await wasDispatched
+	nowMs = startedAt + 1_001
+	releaseUpstream(new Response(JSON.stringify({ id: "late", model: RSI_OPENROUTER_MODEL, choices: [], usage: { prompt_tokens: 20, completion_tokens: 10, cost: 0.0002 } }), { status: 200, headers: { "content-type": "application/json" } }))
+	const response = await post
+	assert.equal(response.status, 429, "a response arriving after the persisted job deadline is not returned to the guest")
+	assert.match((await response.json() as { error: { message: string } }).error.message, /duration limit exhausted/)
+	const receipt = await restarted.receipt()
+	assert.equal(receipt.qualified, false)
+	assert.equal(receipt.callReceipts[0]?.state, "unmeasured")
+})
+
 test("OpenRouter broker rejects unknown models and oversized tool schemas before paid dispatch", async (t) => {
 	const { broker, upstream } = await setup(t)
 	const post = (body: string) => fetch(`${broker.localBaseUrl}/api/v1/chat/completions`, {
@@ -81,6 +124,26 @@ test("OpenRouter broker rejects unknown models and oversized tool schemas before
 	const oversized = requestBody({ tools: [{ type: "function", function: { name: "x", parameters: { description: "x".repeat(8_100) } } }] })
 	assert.equal((await post(oversized)).status, 413)
 	assert.equal(upstream.requests.filter((entry) => entry.url.endsWith("/chat/completions")).length, 0)
+})
+
+test("authenticated denials persist as status and reason counts without storing request or credential data", async (t) => {
+	const { broker, root } = await setup(t)
+	const unauthorized = await fetch(`${broker.localBaseUrl}/api/v1/chat/completions`, { headers: { authorization: "Bearer wrong-secret" } })
+	assert.equal(unauthorized.status, 401)
+	const endpoint = await fetch(`${broker.localBaseUrl}/v1/admin`, { headers: { authorization: `Bearer ${broker.capability}` } })
+	assert.equal(endpoint.status, 404)
+	const invalid = await fetch(`${broker.localBaseUrl}/api/v1/chat/completions`, {
+		method: "POST", headers: { authorization: `Bearer ${broker.capability}`, "x-rsi-call-id": "call-invalid-123456", "content-type": "application/json" }, body: JSON.stringify({ model: "private-prompt-is-not-retained" }),
+	})
+	assert.equal(invalid.status, 400)
+	const receipt = await broker.receipt()
+	assert.deepEqual(receipt.denials, [
+		{ statusCode: 400, reason: "invalid-request", count: 1 },
+		{ statusCode: 404, reason: "unsupported-endpoint", count: 1 },
+	])
+	const saved = await fs.readFile(path.join(root, "ledger.json"))
+	assert.equal(saved.includes(Buffer.from("private-prompt-is-not-retained")), false)
+	assert.equal(JSON.stringify(receipt).includes("wrong-secret"), false)
 })
 
 test("OpenRouter broker enforces auth, endpoint allowlist, duplicate IDs, and call ceilings", async (t) => {
@@ -95,6 +158,26 @@ test("OpenRouter broker enforces auth, endpoint allowlist, duplicate IDs, and ca
 	assert.equal((await send("/api/v1/chat/completions", broker.capability, "call-duplicate-1234")).status, 429, "duplicate paid call IDs are rejected")
 	assert.equal((await send("/api/v1/chat/completions", broker.capability, "call-new-1234567890")).status, 429, "a call ceiling is enforced before dispatch")
 	assert.equal(upstream.requests.filter((entry) => entry.url.endsWith("/chat/completions")).length, 1)
+})
+
+test("OpenRouter broker can expose status-only access counters without request data", async (t) => {
+	const responses: Array<{ method: string; statusCode: number; requestBytes?: number }> = []
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "rsi-inference-status-"))
+	t.after(() => fs.rm(root, { recursive: true, force: true }))
+	const upstream = fakeFetch()
+	const broker = await startOpenRouterBroker({
+		jobId: "attempt-status-1234567890", leaseToken: "lease-test", limits: limits("campaign-status"), apiKey: "host-secret",
+		bindHost: "127.0.0.1", ledger: new FileOpenRouterInferenceLedger(path.join(root, "ledger.json")), upstreamFetch: upstream.fetcher,
+		onHttpResponse: (event) => responses.push(event),
+	})
+	t.after(() => broker.close())
+	await fetch(`${broker.localBaseUrl}/api/v1/chat/completions`, { method: "POST", headers: { authorization: "Bearer wrong", "content-type": "application/json" }, body: requestBody() })
+	assert.equal(responses.length, 1)
+	assert.equal(responses[0]?.method, "POST")
+	assert.equal(responses[0]?.statusCode, 401)
+	assert.ok(Number.isSafeInteger(responses[0]?.requestBytes) && (responses[0]?.requestBytes ?? 0) > 0, "status-only diagnostics can report request byte size")
+	assert.equal(JSON.stringify(responses).includes("host-secret"), false)
+	assert.equal(JSON.stringify(responses).includes("Bearer"), false)
 })
 
 test("OpenRouter broker marks timeouts unmeasured and does not automatically spend again", async (t) => {

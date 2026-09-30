@@ -81,9 +81,11 @@ test("PostgreSQL migrations upgrade an earlier artifact and lease schema", { ski
 		assert.ok(artifactColumns.rows.some((row) => row.column_name === "byte_length"))
 		assert.equal(artifactColumns.rows.some((row) => row.column_name === "content"), false, "empty legacy NOT NULL PostgreSQL blob column is removed")
 		assert.ok(jobColumns.rows.some((row) => row.column_name === "lease_duration_ms"))
-		assert.equal((await scopedPool.query("SELECT version FROM headlesscode_rsi_schema_migrations ORDER BY version")).rowCount, 4)
+		assert.equal((await scopedPool.query("SELECT version FROM headlesscode_rsi_schema_migrations ORDER BY version")).rowCount, 5)
 		const campaignColumns = await scopedPool.query("SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name='headlesscode_rsi_inference_campaigns'", [schema])
 		assert.ok(campaignColumns.rows.some((row) => row.column_name === "blocked"), "migration 004 adds the campaign block state used by admission and settlement")
+		const inferenceJobColumns = await scopedPool.query("SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name='headlesscode_rsi_inference_jobs'", [schema])
+		assert.ok(inferenceJobColumns.rows.some((row) => row.column_name === "denials"), "migration 005 persists authenticated broker-denial summaries")
 		await scopedPool.query("DELETE FROM headlesscode_rsi_schema_migrations WHERE version=2")
 		await scopedPool.query("ALTER TABLE headlesscode_rsi_artifacts DROP COLUMN storage_id, DROP COLUMN object_key, DROP COLUMN backend, DROP COLUMN byte_length, ADD COLUMN content bytea NOT NULL")
 		await scopedPool.query("INSERT INTO headlesscode_rsi_artifacts(sha256,content) VALUES($1,decode('0102','hex'))", ["a".repeat(64)])
@@ -117,7 +119,9 @@ test("PostgreSQL OpenRouter admission persists reservations, blocks overspend, a
 			maxInputPricePerMillionUsd: 1, maxOutputPricePerMillionUsd: 1, maxCallSpendUsd: 0.01, maxJobSpendUsd: 0.01, maxCampaignSpendUsd: 0.01,
 		}
 		const grant: OpenRouterBrokerGrant = { jobId: job.jobId, leaseToken: lease.token, capability: randomUUID(), model: "deepseek/deepseek-v4-flash-0731", limits }
-		await queue.register(grant)
+		const registeredDeadline = await queue.register(grant)
+		assert.ok(registeredDeadline > Date.now() - 1_000 && registeredDeadline <= Date.now() + limits.maxDurationMs + 1_000, "the durable queue start time sets the broker job deadline")
+		await queue.recordDenial(grant, 429, "budget-or-fence")
 		const reservation = (callId: string): OpenRouterCallReservation => ({ callId, requestSha256: "a".repeat(64), reservedUsd: 0.01, reservedTokens: 100, startedAt: new Date().toISOString() })
 		const admissions = await Promise.allSettled([queue.reserve(grant, reservation("call-concurrent-0001")), queue.reserve(grant, reservation("call-concurrent-0002"))])
 		assert.equal(admissions.filter((item) => item.status === "fulfilled").length, 1, "campaign and job spend locks admit only one call under contention")
@@ -126,16 +130,50 @@ test("PostgreSQL OpenRouter admission persists reservations, blocks overspend, a
 		const receipt = await queue.receipt(grant)
 		assert.equal(receipt.qualified, true)
 		assert.equal(receipt.totalTokens, 20)
+		assert.deepEqual(receipt.denials, [{ statusCode: 429, reason: "budget-or-fence", count: 1 }])
 		await queue.pool.query("UPDATE headlesscode_rsi_jobs SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE job_id=$1", [job.jobId])
 		assert.equal((await queue.receipt(grant)).qualified, false, "expired lease invalidates an otherwise measured receipt before publication")
 		await queue.pool.query("UPDATE headlesscode_rsi_jobs SET lease_expires_at=clock_timestamp()+interval '1 minute' WHERE job_id=$1", [job.jobId])
 		assert.equal((await queue.complete(lease, { ok: true })).accepted, true, "current lease publishes the result")
 		assert.equal((await queue.receipt(grant)).qualified, true, "accepted completed job retains its immutable authoritative receipt")
+		assert.deepEqual((await queue.receipt(grant)).denials, [{ statusCode: 429, reason: "budget-or-fence", count: 1 }], "denial audit survives result publication")
 		await queue.close()
 		queue = new PostgresRsiJobQueue(new Pool(connection), policy, new FileRsiArtifactStore(root))
 		assert.equal((await queue.receipt(grant)).qualified, true, "durable receipt survives queue process reconstruction")
 		await queue.pool.query("UPDATE headlesscode_rsi_jobs SET status='failed' WHERE job_id=$1", [job.jobId])
 		assert.equal((await queue.receipt(grant)).qualified, false, "failed/fenced work cannot retain proof qualification")
+
+		const expiredJob = await addJob(queue, "broker-expired-reservation", "LOCAL_GPU", "openrouter:expired")
+		const expiredLease = await queue.claim("broker-worker")
+		assert.ok(expiredLease)
+		const expiredLimits = { ...limits, campaignId: `campaign-${randomUUID()}`, maxDurationMs: 1_000 }
+		const expiredGrant: OpenRouterBrokerGrant = { jobId: expiredJob.jobId, leaseToken: expiredLease.token, capability: randomUUID(), model: grant.model, limits: expiredLimits }
+		const expiredDeadline = await queue.register(expiredGrant)
+		assert.ok(expiredDeadline > Date.now() - 1_000 && expiredDeadline <= Date.now() + expiredLimits.maxDurationMs + 1_000)
+		await queue.pool.query("UPDATE headlesscode_rsi_inference_jobs SET started_at=clock_timestamp()-interval '2 seconds' WHERE job_id=$1", [expiredJob.jobId])
+		await assert.rejects(queue.reserve(expiredGrant, reservation("call-expired-123456")), /duration limit exhausted/)
+		await queue.recordDenial(expiredGrant, 429, "job-deadline")
+		const expiredReceipt = await queue.receipt(expiredGrant)
+		assert.deepEqual(expiredReceipt.denials, [{ statusCode: 429, reason: "job-deadline", count: 1 }])
+		await queue.pool.query("UPDATE headlesscode_rsi_jobs SET attempts=max_attempts WHERE job_id=$1", [expiredJob.jobId])
+		assert.equal(await queue.fail(expiredLease, "OpenRouter job duration limit exhausted", {
+			ok: false, provider: "openrouter", model: expiredGrant.model,
+			inferenceAudit: { accounting: "incomplete", jobId: expiredJob.jobId, denials: expiredReceipt.denials },
+		}), true)
+		const failedMutation = await queue.getJob(expiredJob.jobId)
+		assert.deepEqual((failedMutation?.result as { inferenceAudit?: unknown } | undefined)?.inferenceAudit, { accounting: "incomplete", jobId: expiredJob.jobId, denials: [{ statusCode: 429, reason: "job-deadline", count: 1 }] }, "retry/failure record retains only the bounded denial summary")
+
+		const lateJob = await addJob(queue, "broker-late-settlement", "LOCAL_GPU", "openrouter:late")
+		const lateLease = await queue.claim("broker-worker")
+		assert.ok(lateLease)
+		const lateLimits = { ...limits, campaignId: `campaign-${randomUUID()}`, maxDurationMs: 60_000 }
+		const lateGrant: OpenRouterBrokerGrant = { jobId: lateJob.jobId, leaseToken: lateLease.token, capability: randomUUID(), model: grant.model, limits: lateLimits }
+		await queue.register(lateGrant)
+		const lateReservation = reservation("call-late-12345678")
+		await queue.reserve(lateGrant, lateReservation)
+		await queue.pool.query("UPDATE headlesscode_rsi_inference_jobs SET started_at=clock_timestamp()-interval '61 seconds' WHERE job_id=$1", [lateJob.jobId])
+		await queue.settle(lateGrant, { callId: lateReservation.callId, state: "complete", qualified: true, returnedModel: lateGrant.model, promptTokens: 12, completionTokens: 8, costUsd: 0.001, responseSha256: "c".repeat(64), completedAt: new Date().toISOString() })
+		assert.equal((await queue.receipt(lateGrant)).qualified, false, "a late settlement is persisted as non-qualifying")
 	} finally {
 		await queue.close().catch(() => undefined)
 		await admin.query(`DROP SCHEMA ${schema} CASCADE`)

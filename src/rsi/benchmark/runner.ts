@@ -483,6 +483,12 @@ export function printBenchmarkSummary(attempts: BenchmarkAttempt[]): string {
 	const calls = attempts.reduce((sum, attempt) => sum + (attempt.calls ?? 0), 0)
 	const tokens = attempts.reduce((sum, attempt) => sum + (attempt.tokens ?? 0), 0)
 	const wallMs = attempts.reduce((sum, attempt) => sum + attempt.wallTimeMs, 0)
+	const denials = new Map<string, number>()
+	for (const attempt of attempts) for (const denial of attempt.inferenceReceipt?.denials ?? []) {
+		const key = `${denial.statusCode}:${denial.reason}`
+		denials.set(key, (denials.get(key) ?? 0) + denial.count)
+	}
+	const denialSummary = [...denials.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, count]) => `${key}=${count}`).join(",") || "none"
 	const failures = attempts.filter((attempt) => !attempt.verifiedSuccess).map((attempt) => `${attempt.taskId}: ${attempt.validity}${attempt.failure ? ` (${attempt.failure})` : ""}`).join("\n")
-	return `RSI benchmark: ${successes}/${attempts.length} verified\nProof-qualified: ${proofQualified}/${attempts.length}; local Ollama resource ceilings are not broker-enforced\nGuest-reported calls: ${calls}; guest-reported tokens: ${tokens}; measured wall time: ${wallMs} ms${failures ? `\nFailures:\n${failures}` : ""}`
+	return `RSI benchmark: ${successes}/${attempts.length} verified\nProof-qualified: ${proofQualified}/${attempts.length}; local Ollama resource ceilings are not broker-enforced\nGuest-reported calls: ${calls}; guest-reported tokens: ${tokens}; measured wall time: ${wallMs} ms\nAuthenticated broker denials: ${denialSummary}${failures ? `\nFailures:\n${failures}` : ""}`
 }

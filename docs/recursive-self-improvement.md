@@ -197,10 +197,16 @@ is pinned to DeepSeek's OpenRouter endpoint with fallback routing disabled.
 Include `REMOTE_API` in `HEADLESSCODE_RSI_WORKER_RESOURCE_CLASSES` for workers
 that claim brokered calls; Ollama workers continue to claim `LOCAL_GPU`.
 Workers need the host-side `HEADLESSCODE_OPENROUTER_API_KEY` and
-`HEADLESSCODE_RSI_BROKER_BIND_HOST`; the bind address must be an address on a
-host network interface that the OpenShell guest can reach. The key remains in
-the worker process. Guests receive a job-scoped capability for a host broker,
-and their OpenShell network rule admits only that broker endpoint.
+`HEADLESSCODE_RSI_BROKER_BIND_HOST`; the bind address must be assigned in the
+worker process's network namespace and reachable from the OpenShell guest. The
+key remains in the worker process. Guests receive a job-scoped capability for
+a host broker, and their OpenShell network rule admits only that broker
+endpoint. With the local Docker gateway, `host.openshell.internal` resolves
+inside the gateway network namespace. Run the worker in that namespace and
+bind the broker to the gateway container's address; a host-side bind to the
+Docker bridge gateway address is not reachable from this route. Keep the
+worker's PID and mount namespaces on the host; only its network namespace
+needs to match the gateway.
 
 Set explicit price and spend ceilings on the coordinator and workers:
 
@@ -220,11 +226,18 @@ for a run. Configure the job spend ceiling no higher than either allocation;
 the broker rejects a job cap that exceeds its branch's campaign allocation.
 The broker also accepts finite call, input-token, output-token,
 total-token, duration, and request/response-byte limits through the
-`HEADLESSCODE_RSI_OPENROUTER_MAX_*` variables. If a response has missing or
+`HEADLESSCODE_RSI_OPENROUTER_MAX_*` variables. The duration deadline starts
+when the broker registers the job, before guest provisioning and execution, so
+setup time counts against the attempt bound. If a response has missing or
 ambiguous usage, the reservation stays charged and that job cannot qualify;
 the broker does not retry an ambiguous paid dispatch. Attempt receipts record
-the requested and returned model, token counts, provider cost, and response
-digest. Guest transcript counts remain observational and do not qualify proof.
+the requested and returned model, token counts, provider cost, response digest,
+and authenticated denial counts grouped by status and reason. Denial summaries
+contain no request body or credential data; unauthenticated requests are not
+attributed to a job. Attempt receipts and RSI reports preserve these summaries;
+failed fleet mutations retain only the denial summary with accounting marked
+incomplete. Guest transcript counts remain observational and do not qualify
+proof.
 
 The same-host development benchmark uses a file-backed spend ledger. A process
 crash can leave its exclusive ledger lock in place; the next run fails closed
@@ -232,24 +245,41 @@ and requires an operator to inspect the ledger and remove a stale lock. Fleet
 mutation reservations use PostgreSQL instead. Configure the database migration
 before scheduling brokered fleet work.
 
-To exercise the worker image and guest network boundary without a provider
-credential or paid request, build the exact current harness image from a clean
-checkout, then run the bounded mock-upstream smoke:
+To exercise the worker image and guest network boundary without a production
+provider credential or paid request, build the exact current harness image
+from a clean checkout, then run the bounded mock-upstream smoke. This local
+Docker gateway recipe obtains the gateway PID and address at runtime. It uses
+the existing `rsi-local` mTLS client bundle through a temporary endpoint alias;
+the trap removes that alias when the smoke exits:
 
 ```sh
 npx tsx scripts/rsi-benchmark/build-image.mjs "$(git rev-parse HEAD)" --commit-context
-OPENSHELL_GATEWAY=rsi-local \
-HEADLESSCODE_RSI_BROKER_BIND_HOST=172.17.0.1 \
-npx tsx scripts/rsi-benchmark/mock-openrouter-guest-smoke.ts .
+gateway_container=openshell-rsi-gateway
+gateway_pid=$(docker inspect --format '{{.State.Pid}}' "$gateway_container")
+gateway_ip=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$gateway_container")
+gateway_alias=${OPENSHELL_GATEWAY:-rsi-local}
+gateway_config="$HOME/.config/openshell/gateways"
+endpoint_alias="$gateway_config/https___127.0.0.1_18080"
+test ! -e "$endpoint_alias" && test ! -L "$endpoint_alias"
+ln -s "$gateway_config/$gateway_alias" "$endpoint_alias"
+trap 'unlink "$endpoint_alias"' EXIT
+sudo -n nsenter -t "$gateway_pid" -n -- runuser -u "$(id -un)" -- env \
+  OPENSHELL_GATEWAY_ENDPOINT=https://127.0.0.1:18080 \
+  HEADLESSCODE_RSI_BROKER_BIND_HOST="$gateway_ip" \
+  npx tsx scripts/rsi-benchmark/mock-openrouter-guest-smoke.ts .
 ```
 
-Replace `rsi-local` and `172.17.0.1` with the configured gateway alias and its
-gateway-reachable host interface address. The smoke makes at most three brokered
-calls to an in-process mock upstream, checks the host credential stays out of
-the guest result, and requires a guest request to a second live local HTTP
-sentinel on a port outside the broker allowlist to fail without reaching it.
-It is an integration check, not model improvement evidence or a live
-OpenRouter result.
+The `openshell-rsi-gateway` container name and `rsi-local` alias must match the
+local installation. This smoke makes at most three brokered calls to an
+in-process mock upstream, checks the host credential stays out of the guest
+result, and requires a guest request to a second live local HTTP sentinel on a
+port outside the broker allowlist to fail without reaching it. It verifies
+the mock route and network boundary only; it is not model improvement evidence
+or a live OpenRouter result. A long-running local worker must likewise start
+in the gateway network namespace (or use another specifically tested,
+gateway-reachable interface), set `OPENSHELL_GATEWAY_ENDPOINT` to its mTLS
+gateway endpoint, and bind the broker on an address reachable through that
+namespace. Do not expose the broker on wildcard or unrelated host interfaces.
 
 Run `headlesscode rsi-worker` once per worker identity. It sets
 `OPENSHELL_GATEWAY` from `HEADLESSCODE_RSI_GATEWAY_ID` before preflight.

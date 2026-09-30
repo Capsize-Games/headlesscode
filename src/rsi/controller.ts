@@ -32,6 +32,7 @@ import {
 } from "./workspace.js"
 import { loadBenchmark } from "./benchmark/runner.js"
 import { openRouterAllocatedEnvironment, openRouterBrokerLimitsFromEnvironment, RSI_OPENROUTER_MODEL } from "./inference-broker.js"
+import type { OpenRouterDenialSummary } from "./inference-broker.js"
 import { candidateProofDecision, compareDevelopmentAttempts, developmentCells, freezeDevelopmentProofProtocol } from "./development-proof.js"
 import type { DevelopmentTaskCell } from "./development-proof.js"
 import type { BenchmarkAttempt } from "./benchmark/types.js"
@@ -158,12 +159,24 @@ function recordFleetInferenceUsage(candidate: CandidateRecord, resultValue: unkn
 	}
 	const values = [receipt.calls, receipt.promptTokens, receipt.completionTokens, receipt.totalTokens, receipt.costUsd]
 	if (!values.every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0) || !Number.isSafeInteger(receipt.calls) || !Number.isSafeInteger(receipt.promptTokens) || !Number.isSafeInteger(receipt.completionTokens) || !Number.isSafeInteger(receipt.totalTokens)) throw new Error("OpenRouter fleet mutation receipt contains malformed resource totals")
+	if (!Array.isArray(receipt.denials) || !receipt.denials.every((entry) => entry && typeof entry === "object" && Number.isSafeInteger((entry as OpenRouterDenialSummary).statusCode) && (entry as OpenRouterDenialSummary).statusCode >= 400 && (entry as OpenRouterDenialSummary).statusCode <= 599 && Number.isSafeInteger((entry as OpenRouterDenialSummary).count) && (entry as OpenRouterDenialSummary).count >= 1 && /^[a-z-]+$/.test((entry as OpenRouterDenialSummary).reason))) throw new Error("OpenRouter fleet mutation receipt contains malformed denial summaries")
 	candidate.inferenceUsage = {
 		provider: "openrouter", model: payload.model, returnedModels: receipt.returnedModels as string[], calls: receipt.calls as number,
 		promptTokens: receipt.promptTokens as number, completionTokens: receipt.completionTokens as number, totalTokens: receipt.totalTokens as number,
 		costUsd: receipt.costUsd as number, accounting: "supervisor-enforced", qualified: true, jobId,
 		campaignId: payload.inferenceLimits.campaignId,
+		denials: receipt.denials as OpenRouterDenialSummary[],
 	}
+}
+
+function recordFleetInferenceDenials(candidate: CandidateRecord, resultValue: unknown, payload: FleetJobPayload, jobId: string): void {
+	if (payload.provider !== "openrouter" || !resultValue || typeof resultValue !== "object") return
+	const result = resultValue as { provider?: unknown; model?: unknown; inferenceAudit?: { accounting?: unknown; jobId?: unknown; denials?: unknown } }
+	const audit = result.inferenceAudit
+	if (result.provider !== "openrouter" || result.model !== payload.model || audit?.accounting !== "incomplete" || audit.jobId !== jobId || !Array.isArray(audit.denials)) return
+	const denials = audit.denials as OpenRouterDenialSummary[]
+	if (!denials.every((entry) => entry && typeof entry === "object" && Number.isSafeInteger(entry.statusCode) && entry.statusCode >= 400 && entry.statusCode <= 599 && Number.isSafeInteger(entry.count) && entry.count >= 1 && /^[a-z-]+$/.test(entry.reason))) return
+	candidate.inferenceDenials = structuredClone(denials)
 }
 
 function fleetEvaluationResult(value: unknown): { regression: TrialResult; typecheck: TrialResult; visible: TrialResult[] } {
@@ -670,6 +683,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 					if (worktree.commits > 0) {
 						const completed = existing
 						if (completed?.candidateId !== candidate.id || completed.jobKind !== "mutation" || completed.status !== "completed" || !completed.result || typeof completed.result !== "object") {
+							if (completed?.result) recordFleetInferenceDenials(candidate, completed.result, expected.payload, completed.jobId)
 							throw new Error("candidate worktree contains an applied mutation commit without its completed idempotent fleet job")
 						}
 						const result = completed.result as { patchSha256?: string; patchBytes?: number }
@@ -729,7 +743,10 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 						const submitted = mutationJobs.get(candidate.id)
 						if (!submitted) throw new Error("candidate mutation was not admitted to the RSI fleet queue")
 						const completed = await waitForFleetJob(fleetQueue, submitted.jobId, config.commandTimeoutMs * 4 + 180_000)
-						if (completed.status !== "completed" || !completed.result || typeof completed.result !== "object") throw new Error(completed.error ?? `fleet mutation ended ${completed.status}`)
+						if (completed.status !== "completed" || !completed.result || typeof completed.result !== "object") {
+							recordFleetInferenceDenials(candidate, completed.result, submitted.payload, completed.jobId)
+							throw new Error(completed.error ?? `fleet mutation ended ${completed.status}`)
+						}
 						const result = completed.result as { patchSha256?: string; patchBytes?: number }
 						if (!result.patchSha256 || !Number.isSafeInteger(result.patchBytes) || Number(result.patchBytes) < 1) throw new Error("fleet mutation result is missing its patch artifact reference")
 						recordFleetInferenceUsage(candidate, completed.result, submitted.payload, completed.jobId)

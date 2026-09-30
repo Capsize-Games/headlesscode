@@ -1,6 +1,7 @@
 import type { ChildProcess } from "node:child_process"
 import type { CandidateDevelopmentProof, DevelopmentProofProtocol, DevelopmentProofRule } from "./development-proof.js"
 import type { BenchmarkAttempt } from "./benchmark/types.js"
+import type { OpenRouterDenialSummary } from "./inference-broker.js"
 
 export type CandidateStatus = "planned" | "mutating" | "evaluating" | "accepted" | "rejected" | "failed"
 export type MutationKind = "corrective" | "architectural" | "search-policy" | "curriculum" | "model-adaptation"
@@ -268,7 +269,9 @@ export interface CandidateRecord {
 		qualified: true
 		jobId: string
 		campaignId: string
+		denials: OpenRouterDenialSummary[]
 	}
+	inferenceDenials?: OpenRouterDenialSummary[]
 	mutation: string
 	createdAt: string
 	updatedAt: string

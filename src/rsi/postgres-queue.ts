@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs"
 import { Pool, type PoolClient } from "pg"
 import type { ResourceClass } from "./types.js"
 import { createRsiArtifactStore, type RsiArtifactReference, type RsiArtifactStore } from "./artifact-store.js"
-import type { OpenRouterBrokerGrant, OpenRouterBrokerReceipt, OpenRouterCallReceipt, OpenRouterCallReservation, OpenRouterCallSettlement, OpenRouterInferenceLedger } from "./inference-broker.js"
+import type { OpenRouterBrokerGrant, OpenRouterBrokerReceipt, OpenRouterCallReceipt, OpenRouterCallReservation, OpenRouterCallSettlement, OpenRouterDenialReason, OpenRouterInferenceLedger } from "./inference-broker.js"
 import type { OpenRouterBrokerLimits } from "./inference-broker.js"
 
 const MIGRATIONS = [
@@ -11,6 +11,7 @@ const MIGRATIONS = [
 	{ version: 2, sql: readFileSync(new URL("./migrations/002_external_artifacts_and_job_leases.sql", import.meta.url), "utf8") },
 	{ version: 3, sql: readFileSync(new URL("./migrations/003_model_training_jobs.sql", import.meta.url), "utf8") },
 	{ version: 4, sql: readFileSync(new URL("./migrations/004_openrouter_inference_broker.sql", import.meta.url), "utf8") },
+	{ version: 5, sql: readFileSync(new URL("./migrations/005_openrouter_denial_summaries.sql", import.meta.url), "utf8") },
 ]
 
 function sha256Text(value: string): string { return createHash("sha256").update(value).digest("hex") }
@@ -390,12 +391,12 @@ export class PostgresRsiJobQueue {
 		return result.rowCount === 1
 	}
 
-	async register(grant: OpenRouterBrokerGrant): Promise<void> {
+	async register(grant: OpenRouterBrokerGrant): Promise<number> {
 		const campaignMicros = usdCapToMicros(grant.limits.maxCampaignSpendUsd)
 		const jobMicros = usdCapToMicros(grant.limits.maxJobSpendUsd)
 		const capabilityHash = sha256Text(grant.capability)
 		const leaseHash = sha256Text(grant.leaseToken)
-		await inTransaction(this.pool, async (client) => {
+		return inTransaction(this.pool, async (client) => {
 			const leased = await client.query("SELECT 1 FROM headlesscode_rsi_jobs WHERE job_id=$1 AND queue_name=$2 AND status='leased' AND lease_token=$3 AND lease_expires_at > clock_timestamp()", [grant.jobId, this.policy.queueName, grant.leaseToken])
 			if (leased.rowCount !== 1) throw new Error("OpenRouter broker grant is stale or fenced")
 			await client.query(
@@ -419,10 +420,25 @@ export class PostgresRsiJobQueue {
 				 AND headlesscode_rsi_inference_jobs.limits=EXCLUDED.limits`,
 				[grant.jobId, grant.limits.campaignId, grant.model, limitsJson, leaseHash, capabilityHash, jobMicros, grant.limits.maxCalls, grant.limits.maxTotalTokens, grant.limits.maxDurationMs],
 			)
-			const job = await client.query("SELECT lease_token_sha256,capability_sha256,campaign_id,model,limits FROM headlesscode_rsi_inference_jobs WHERE job_id=$1 FOR UPDATE", [grant.jobId])
+			const job = await client.query("SELECT lease_token_sha256,capability_sha256,campaign_id,model,limits,started_at FROM headlesscode_rsi_inference_jobs WHERE job_id=$1 FOR UPDATE", [grant.jobId])
 			const row = job.rows[0]
 			if (!row || row.lease_token_sha256 !== leaseHash || row.capability_sha256 !== capabilityHash || row.campaign_id !== grant.limits.campaignId || row.model !== grant.model || stableJson(row.limits) !== stableJson(grant.limits)) throw new Error("OpenRouter job grant conflicts with existing accounting identity")
+			const startedAtMs = Date.parse(String(row.started_at))
+			if (!Number.isFinite(startedAtMs)) throw new Error("OpenRouter job has an invalid durable start time")
+			return startedAtMs + grant.limits.maxDurationMs
 		})
+	}
+
+	async recordDenial(grant: OpenRouterBrokerGrant, statusCode: number, reason: OpenRouterDenialReason): Promise<void> {
+		if (!Number.isSafeInteger(statusCode) || statusCode < 400 || statusCode > 599 || !/^[a-z-]+$/.test(reason)) throw new Error("invalid OpenRouter denial summary")
+		const key = `${statusCode}:${reason}`
+		const updated = await this.pool.query(
+			`UPDATE headlesscode_rsi_inference_jobs
+			 SET denials=jsonb_set(denials,ARRAY[$4],to_jsonb(COALESCE((denials->>$4)::integer,0)+1),true)
+			 WHERE job_id=$1 AND lease_token_sha256=$2 AND capability_sha256=$3`,
+			[grant.jobId, sha256Text(grant.leaseToken), sha256Text(grant.capability), key],
+		)
+		if (updated.rowCount !== 1) throw new Error("OpenRouter denial summary does not match an authenticated job grant")
 	}
 
 	async reserve(grant: OpenRouterBrokerGrant, reservation: OpenRouterCallReservation): Promise<void> {
@@ -436,14 +452,15 @@ export class PostgresRsiJobQueue {
 			const campaign = await client.query("SELECT * FROM headlesscode_rsi_inference_campaigns WHERE campaign_id=$1 FOR UPDATE", [campaignId])
 			const jobResult = await client.query(
 				`SELECT inference.*, jobs.status AS queue_status,jobs.lease_token AS current_lease_token,jobs.lease_expires_at,
-				 jobs.lease_expires_at > clock_timestamp() AS lease_valid
+					 jobs.lease_expires_at > clock_timestamp() AS lease_valid,
+					 inference.started_at + (inference.max_duration_ms::text || ' milliseconds')::interval > clock_timestamp() AS duration_valid
 				 FROM headlesscode_rsi_inference_jobs AS inference JOIN headlesscode_rsi_jobs AS jobs USING(job_id)
 				 WHERE inference.job_id=$1 AND jobs.queue_name=$2 FOR UPDATE OF inference,jobs`, [grant.jobId, this.policy.queueName],
 			)
 			const job = jobResult.rows[0]
 			const camp = campaign.rows[0]
 			if (!job || !camp || job.queue_status !== "leased" || job.current_lease_token !== grant.leaseToken || job.lease_valid !== true || job.lease_token_sha256 !== leaseHash || job.capability_sha256 !== capabilityHash || job.blocked || camp.blocked) throw new Error("OpenRouter request denied: lease is stale, fenced, expired or blocked")
-			if (Date.now() - new Date(String(job.started_at)).getTime() > grant.limits.maxDurationMs) throw new Error("OpenRouter job duration limit exhausted")
+			if (job.duration_valid !== true) throw new Error("OpenRouter job duration limit exhausted")
 			if (await client.query("SELECT 1 FROM headlesscode_rsi_inference_calls WHERE job_id=$1 AND call_id=$2", [grant.jobId, reservation.callId]).then((value) => value.rowCount)) throw new Error("duplicate OpenRouter call id is rejected; ambiguous retries are not replayed")
 			const campaignUsed = Number(camp.spent_microusd) + Number(camp.reserved_spend_microusd)
 			const jobUsed = Number(job.spent_microusd) + Number(job.reserved_spend_microusd)
@@ -470,7 +487,8 @@ export class PostgresRsiJobQueue {
 			await client.query("SELECT 1 FROM headlesscode_rsi_inference_campaigns WHERE campaign_id=$1 FOR UPDATE", [campaignId])
 			const jobResult = await client.query(
 				`SELECT inference.*, jobs.status AS queue_status,jobs.lease_token AS current_lease_token,jobs.lease_expires_at,
-				 jobs.lease_expires_at > clock_timestamp() AS lease_valid
+					 jobs.lease_expires_at > clock_timestamp() AS lease_valid,
+					 inference.started_at + (inference.max_duration_ms::text || ' milliseconds')::interval > clock_timestamp() AS duration_valid
 				 FROM headlesscode_rsi_inference_jobs AS inference JOIN headlesscode_rsi_jobs AS jobs USING(job_id)
 				 WHERE inference.job_id=$1 AND jobs.queue_name=$2 FOR UPDATE OF inference,jobs`, [grant.jobId, this.policy.queueName],
 			)
@@ -486,7 +504,7 @@ export class PostgresRsiJobQueue {
 			const costMicros = usdToMicrosCeiling(settlement.costUsd)
 			const actualTokens = settlement.promptTokens + settlement.completionTokens
 			const currentLease = job.queue_status === "leased" && job.current_lease_token === grant.leaseToken && job.lease_valid === true
-			const overLimit = settlement.qualified === false || costMicros > Number(call.reserved_spend_microusd) || costMicros > usdCapToMicros(grant.limits.maxCallSpendUsd)
+			const overLimit = job.duration_valid !== true || settlement.qualified === false || costMicros > Number(call.reserved_spend_microusd) || costMicros > usdCapToMicros(grant.limits.maxCallSpendUsd)
 				|| settlement.promptTokens > grant.limits.maxInputTokensPerCall || settlement.completionTokens > grant.limits.maxOutputTokensPerCall
 				|| actualTokens > Number(call.reserved_tokens) || settlement.returnedModel !== grant.model || !currentLease
 			await client.query(
@@ -518,6 +536,12 @@ export class PostgresRsiJobQueue {
 		])
 		const job = jobResult.rows[0]
 		if (!job) throw new Error("OpenRouter broker receipt is missing its job record")
+		const denialRecord = (typeof job.denials === "string" ? JSON.parse(job.denials) : job.denials ?? {}) as Record<string, unknown>
+		const denials = Object.entries(denialRecord).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, rawCount]) => {
+			const match = /^(\d{3}):([a-z-]+)$/.exec(key)
+			if (!match || !Number.isSafeInteger(rawCount) || Number(rawCount) < 1) throw new Error("OpenRouter job contains a malformed denial summary")
+			return { statusCode: Number(match[1]), reason: match[2] as OpenRouterDenialReason, count: Number(rawCount) }
+		})
 		const calls: OpenRouterCallReceipt[] = callResult.rows.map((row) => ({
 			jobId: grant.jobId, campaignId: String(job.campaign_id), model: grant.model,
 			callId: String(row.call_id), requestSha256: String(row.request_sha256), reservedUsd: microsToUsd(row.reserved_spend_microusd),
@@ -547,7 +571,7 @@ export class PostgresRsiJobQueue {
 			returnedModels: [...new Set(calls.map((call) => call.returnedModel).filter((model): model is string => Boolean(model)))],
 			calls: calls.length, promptTokens, completionTokens,
 			totalTokens: promptTokens === null || completionTokens === null ? null : promptTokens + completionTokens,
-			costUsd, accounting: allMeasured && withinLimits ? "supervisor-enforced" : "incomplete", qualified: allMeasured && withinLimits, callReceipts: calls,
+			costUsd, accounting: allMeasured && withinLimits ? "supervisor-enforced" : "incomplete", qualified: allMeasured && withinLimits, callReceipts: calls, denials,
 		}
 	}
 
@@ -568,12 +592,13 @@ export class PostgresRsiJobQueue {
 		})
 	}
 
-	async fail(lease: FleetJobLease, error: string): Promise<boolean> {
+	async fail(lease: FleetJobLease, error: string, failureResult?: Record<string, unknown>): Promise<boolean> {
+		const failureJson = failureResult === undefined ? null : JSON.stringify(failureResult)
 		const result = await this.pool.query(
-			`UPDATE headlesscode_rsi_jobs SET status=CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'queued' END, error=$4,
+			`UPDATE headlesscode_rsi_jobs SET status=CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'queued' END, error=$4,result=$6::jsonb,
 			 updated_at=clock_timestamp(), lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL
 			 WHERE job_id=$1 AND queue_name=$5 AND lease_owner=$2 AND lease_token=$3 AND status='leased' AND lease_expires_at > clock_timestamp()`,
-			[lease.job.jobId, lease.workerId, lease.token, error.slice(0, 4000), this.policy.queueName],
+			[lease.job.jobId, lease.workerId, lease.token, error.slice(0, 4000), this.policy.queueName, failureJson],
 		)
 		return result.rowCount === 1
 	}

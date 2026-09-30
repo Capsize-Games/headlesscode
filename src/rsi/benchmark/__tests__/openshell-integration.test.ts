@@ -78,7 +78,7 @@ try {
 		startCommit: taskBase, startDigest: "a".repeat(64), verifierPath: "verifiers/task.mjs",
 		verifierDigest: createHash("sha256").update(verifierBytes).digest("hex"), knownGoodCommit: taskBase,
 		knownGoodDigest: "b".repeat(64), knownBadCommit: taskBase, knownBadDigest: "c".repeat(64), seed: 1,
-		ceilings: { timeoutMs: 5000, maxCalls: 2, maxOutputTokensPerCall: 32, maxPatchBytes: 65536 },
+		ceilings: { timeoutMs: 60_000, maxCalls: 2, maxOutputTokensPerCall: 32, maxPatchBytes: 65536 },
 	}
 	const events: string[] = []
 	let codingSnapshot = ""

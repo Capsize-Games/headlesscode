@@ -164,7 +164,7 @@ try {
 				inferenceReceipt: {
 					provider: "openrouter", jobId: request.attemptId, campaignId: request.campaignId, model: "deepseek/deepseek-v4-flash-0731",
 					returnedModels: ["deepseek/deepseek-v4-flash-0731"], calls: 1, promptTokens: 5, completionTokens: 5, totalTokens: 10,
-					costUsd: 0.001, accounting: "supervisor-enforced", qualified: true, callReceipts: [],
+					costUsd: 0.001, accounting: "supervisor-enforced", qualified: true, callReceipts: [], denials: [],
 				},
 			}
 		},

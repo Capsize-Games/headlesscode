@@ -151,6 +151,7 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions): Pr
 	const root = await fs.mkdtemp(path.join(options.scratchRoot, `${lease.job.jobId}-${lease.job.attempts}-`))
 	const bundlePath = path.join(root, "snapshot.bundle")
 	const repoRoot = path.join(root, "repo")
+	let failureResult: Record<string, unknown> | undefined
 	try {
 		const bundle = await options.queue.getArtifact(payload.snapshotSha256)
 		if (bundle.byteLength !== payload.snapshotBytes) throw new Error("fleet snapshot artifact length differed from queued metadata")
@@ -182,7 +183,13 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions): Pr
 				}
 				mutation = await (options.runMutation ?? runOpenShellMutation)(candidate, config, undefined, undefined, broker)
 				if (broker) receipt = await broker.receipt()
-			} finally { await broker?.close().catch(() => undefined) }
+			} finally {
+				if (broker && (payload.provider ?? "ollama") === "openrouter") {
+					const receipt = await broker.receipt().catch(() => undefined)
+					if (receipt) failureResult = { ok: false, provider: "openrouter", model: payload.model, inferenceAudit: { accounting: "incomplete", jobId: lease.job.jobId, denials: receipt.denials } }
+				}
+				await broker?.close().catch(() => undefined)
+			}
 			if (!mutation.ok) throw new Error(mutation.error ?? mutation.result?.stderr ?? "OpenShell mutation failed")
 			if ((payload.provider ?? "ollama") === "openrouter" && (!receipt?.qualified || receipt.model !== payload.model || receipt.provider !== "openrouter")) throw new Error("OpenRouter mutation did not produce a qualified, model-bound broker receipt")
 			const patch = execFileSync("git", ["diff", "--binary", "--no-ext-diff", "--no-renames", `${candidate.baseCommit}...HEAD`], { cwd: repoRoot, encoding: "buffer", maxBuffer: options.queue.policy.maxInFlight * 1024 * 1024 * 16 })
@@ -210,7 +217,7 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions): Pr
 		const completion = await options.queue.complete(lease, result)
 		if (!completion.accepted) throw new Error("OpenShell result was fenced because this worker no longer owns the lease")
 	} catch (error) {
-		await options.queue.fail(lease, error instanceof Error ? error.message : String(error))
+		await options.queue.fail(lease, error instanceof Error ? error.message : String(error), failureResult)
 	} finally {
 		await fs.rm(root, { recursive: true, force: true })
 	}
