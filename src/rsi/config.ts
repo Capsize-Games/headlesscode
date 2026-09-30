@@ -14,6 +14,7 @@ export const DEFAULT_PROTECTED_PATHS = [
 	".gitignore",
 	"scripts/eval-suite/",
 	"fixtures/rsi-curriculum/",
+	"fixtures/rsi-benchmark/",
 	".headlesscode/",
 	".worktrees/",
 ]
@@ -104,6 +105,7 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 	let dryRun = false
 	let keepWorktrees = false
 	let maxIterations = 40
+	let maxTokens: number | undefined
 	let maxTrajectories: number | undefined
 	let maxTotalIterations: number | undefined
 	let maxRuntimeMs: number | undefined
@@ -277,6 +279,12 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 					index = next
 					break
 				}
+				case "--max-tokens": {
+					const [value, next] = take(index, arg)
+					maxTokens = positiveInteger(value, arg)
+					index = next
+					break
+				}
 				case "--timeout-ms": {
 					const [value, next] = take(index, arg)
 					commandTimeoutMs = positiveInteger(value, arg)
@@ -345,6 +353,7 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 				dryRun,
 				keepWorktrees,
 				maxIterations,
+				...(maxTokens !== undefined ? { maxTokens } : {}),
 				maxTrajectories: adaptiveTrajectories,
 				maxTotalIterations: adaptiveIterations,
 				maxRuntimeMs: adaptiveRuntime,

@@ -39,6 +39,8 @@ export interface IsolatedRunOptions {
 	mode: "mutation" | "evaluation" | "training" | "model-evaluation"
 	sessionName?: string
 	env?: Record<string, string>
+	extraFiles?: Record<string, Buffer>
+	image?: string
 	providerFactory?: RsiOpenShellProviderFactory
 }
 
@@ -58,7 +60,7 @@ function pathIsSafe(relativePath: string): boolean {
 
 function alwaysOmit(relativePath: string): boolean {
 	const normalized = relativePath.replaceAll("\\", "/")
-	return normalized.startsWith("__headlesscode_rsi_adversarial__/") || findMatchingPattern(normalized, [...DEFAULT_PROTECTED_FILES, ".headlesscode/", ".worktrees/", "node_modules/", "src/rsi/", "scripts/eval-suite/"]) !== null
+	return normalized.startsWith("__headlesscode_rsi_adversarial__/") || findMatchingPattern(normalized, [...DEFAULT_PROTECTED_FILES, ".headlesscode/", ".worktrees/", "node_modules/", "src/rsi/", "scripts/eval-suite/", "fixtures/rsi-benchmark/"]) !== null
 }
 
 function shouldInclude(relativePath: string, mode: IsolatedRunOptions["mode"], config: RsiConfig): boolean {
@@ -68,7 +70,7 @@ function shouldInclude(relativePath: string, mode: IsolatedRunOptions["mode"], c
 		// their exclusion even when a caller supplies an incomplete protectedPaths list.
 		const segments = relativePath.split("/")
 		if (segments.includes("__tests__") || /(?:^|\/)(?:test|spec)\.[^/]+$/.test(relativePath) || /\.(?:test|spec)\.[^/]+$/.test(relativePath)) return false
-		if (findMatchingPattern(relativePath, ["src/rsi/", "tests/", "test/", "scripts/", "fixtures/rsi-curriculum/"]) !== null) return false
+		if (findMatchingPattern(relativePath, ["src/rsi/", "tests/", "test/", "scripts/", "fixtures/rsi-curriculum/", "fixtures/rsi-benchmark/"]) !== null) return false
 		if (findMatchingPattern(relativePath, config.protectedPaths) !== null) return false
 	}
 	return true
@@ -319,13 +321,13 @@ export function inspectLocalRsiCheckpoint(configuredBase: string, mode: Isolated
 	return { path: source, files, bytes }
 }
 
-function providerOptions(config: RsiConfig, mode: IsolatedRunOptions["mode"], timeoutMs: number): OpenShellSessionProviderOptions {
+function providerOptions(config: RsiConfig, mode: IsolatedRunOptions["mode"], timeoutMs: number, imageReference?: string): OpenShellSessionProviderOptions {
 	const policy = process.env.HEADLESSCODE_OPENSHELL_POLICY ?? POLICY_PATH
 	const configuredImage = process.env.HEADLESSCODE_OPENSHELL_IMAGE?.trim()
 	const trainingMode = mode === "training" || mode === "model-evaluation"
-	const image = trainingMode ? RSI_TRAINING_OPENSHELL_IMAGE : RSI_OPENSHELL_IMAGE
-	if (configuredImage && configuredImage !== image) {
-		throw new Error(`RSI requires the verified OpenShell image ${image} for ${mode}; custom images are not verified`)
+	const defaultImage = trainingMode ? RSI_TRAINING_OPENSHELL_IMAGE : RSI_OPENSHELL_IMAGE
+	if (configuredImage && configuredImage !== defaultImage) {
+		throw new Error(`RSI requires the verified OpenShell image ${defaultImage} for ${mode}; custom images are not verified`)
 	}
 	let readOnlyMounts: Array<{ source: string; target: string }> = []
 	if (trainingMode) {
@@ -335,7 +337,7 @@ function providerOptions(config: RsiConfig, mode: IsolatedRunOptions["mode"], ti
 		readOnlyMounts = [{ source: checkpoint.path, target: "/workspace/.rsi-base-model" }]
 	}
 	return {
-		image,
+		image: imageReference ?? defaultImage,
 		policy,
 		providers: [],
 		autoProviders: false,
@@ -448,8 +450,18 @@ async function runSnapshot(options: IsolatedRunOptions & { preserveSnapshot?: bo
 	const snapshot = path.join(options.config.repoRoot, ".worktrees", name)
 	fs.mkdirSync(path.dirname(snapshot), { recursive: true })
 	const snapshotBase = initializeSnapshot(options.sourceRoot, options.commit, snapshot, options.mode, options.config)
+	if (options.extraFiles && Object.keys(options.extraFiles).length > 0) {
+		for (const [relativePath, content] of Object.entries(options.extraFiles)) {
+			if (!pathIsSafe(relativePath)) throw new Error(`OpenShell evaluation input has an unsafe path: ${relativePath}`)
+			const target = path.join(snapshot, relativePath)
+			fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
+			fs.writeFileSync(target, content, { mode: 0o600, flag: "wx" })
+		}
+		execFileSync("git", ["add", "--all"], { cwd: snapshot })
+		execFileSync("git", ["-c", "core.hooksPath=/dev/null", "commit", "--amend", "--quiet", "--no-edit"], { cwd: snapshot, env: snapshotCommitEnvironment() })
+	}
 	const factory = options.providerFactory ?? ((providerConfig) => new OpenShellSessionProvider(providerConfig))
-	const provider = factory(providerOptions(options.config, options.mode, options.timeoutMs))
+	const provider = factory(providerOptions(options.config, options.mode, options.timeoutMs, options.image))
 	const request = makeRequest(options.config.repoRoot, name, options.env ?? {})
 	let handle: SessionHandle | undefined
 	const started = Date.now()
@@ -528,7 +540,7 @@ export async function runOpenShellModelJob(candidate: CandidateRecord, config: R
 	}
 }
 
-export async function runOpenShellMutation(candidate: CandidateRecord, config: RsiConfig, providerFactory?: RsiOpenShellProviderFactory): Promise<{ ok: boolean; result?: TrialResult; error?: string }> {
+export async function runOpenShellMutation(candidate: CandidateRecord, config: RsiConfig, providerFactory?: RsiOpenShellProviderFactory, image?: string): Promise<{ ok: boolean; result?: TrialResult; error?: string; patchRejected?: boolean; calls?: number | null; tokens?: number | null }> {
 	try {
 		const workerCommand = [
 			"/opt/headlesscode/node_modules/.bin/tsx",
@@ -537,11 +549,13 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 			"code",
 			"--max-iterations",
 			String(config.maxIterations),
+			...(config.maxTokens ? ["--max-tokens", String(config.maxTokens)] : []),
 			"--no-checkpoints",
 			"--task",
 			mutationTask(candidate, config),
 		].map(shellQuote).join(" ")
-		const boundaryGuard = [
+		const boundaryChecks = [
+			"ln -s /opt/headlesscode/node_modules /workspace/node_modules",
 			'test "$(git -C /workspace rev-list --count HEAD)" = 1',
 			"test ! -e /workspace/src/rsi",
 			"test ! -e /workspace/scripts",
@@ -551,10 +565,14 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 			"test ! -e /workspace/.headlesscode",
 			"test ! -e /opt/headlesscode/src/rsi",
 			"test ! -e /opt/headlesscode/scripts/eval-suite",
-			"test -z \"$(find /workspace /opt/headlesscode/src -type f \\( -path '*/__tests__/*' -o -name '*.test.*' -o -name '*.spec.*' \\) -print -quit)\"",
+			...(config.benchmarkHarnessCommit ? ["test -f /opt/headlesscode/.headlesscode-harness-commit", `test "$(cat /opt/headlesscode/.headlesscode-harness-commit)" = ${shellQuote(config.benchmarkHarnessCommit)}`] : []),
+			config.benchmarkHarnessCommit
+				? "test -z \"$(find /opt/headlesscode/src -type f \\( -path '*/__tests__/*' -o -name '*.test.*' -o -name '*.spec.*' \\) -print -quit)\""
+				: "test -z \"$(find /workspace /opt/headlesscode/src -type f \\( -path '*/__tests__/*' -o -name '*.test.*' -o -name '*.spec.*' \\) -print -quit)\"",
 			'test -z "${HEADLESSCODE_OPENROUTER_API_KEY:-}${OPENROUTER_API_KEY:-}${OPENAI_API_KEY:-}${ANTHROPIC_API_KEY:-}"',
 			`exec ${workerCommand}`,
-		].join(" && ")
+		]
+		const boundaryGuard = `${boundaryChecks.map((check) => `(${check}) || { echo RSI_BENCHMARK_PREFLIGHT_FAILURE >&2; exit 79; }`).join(" && ")} && exec ${workerCommand}`
 		const env = workerEnvironment(config, candidate)
 		const isolation = await runSnapshot({
 			config,
@@ -565,21 +583,32 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 			mode: "mutation",
 			sessionName: `rsi-mutation-${candidate.id}-${randomUUID().slice(0, 6)}`,
 			env,
+			image,
 			providerFactory,
 		})
 		if (!isolation.result.ok) {
 			const detail = isolation.result.stderr || isolation.result.stdout
+			if (isolation.result.exitCode === 79 && detail.includes("RSI_BENCHMARK_PREFLIGHT_FAILURE")) throw new Error(`OpenShell benchmark preflight failed: ${detail.slice(0, 3000)}`)
 			return { ok: false, result: isolation.result, error: `OpenShell mutation worker failed (exit ${isolation.result.exitCode ?? "unknown"})${detail ? `: ${detail.slice(0, 3000)}` : ""}` }
 		}
-		const changedFiles = applyCandidatePatch(isolation.snapshot, isolation.snapshotBase, candidate, config)
-		if (isolation.result.ok && changedFiles.length === 0) return { ok: false, result: isolation.result, error: "OpenShell worker returned success without a candidate change" }
-		return { ok: true, result: isolation.result }
-	} catch (error) {
-		return {
-			ok: false,
-			result: { ok: false, command: "openshell-rsi-mutation", exitCode: null, durationMs: 0, stdout: "", stderr: error instanceof Error ? error.message : String(error) },
-			error: error instanceof Error ? error.message : String(error),
+		const usage = readMutationTranscriptUsage(isolation.snapshot)
+		let changedFiles: string[]
+		try {
+			changedFiles = applyCandidatePatch(isolation.snapshot, isolation.snapshotBase, candidate, config)
+		} catch (error) {
+			// A worker can finish successfully while producing a patch that violates
+			// the import contract. Keep that as a rejected task result; failures
+			// before artifact validation (including OpenShell setup) still propagate.
+			return {
+				ok: false,
+				result: isolation.result,
+				error: error instanceof Error ? error.message : String(error),
+				patchRejected: true,
+				...usage,
+			}
 		}
+		if (isolation.result.ok && changedFiles.length === 0) return { ok: false, result: isolation.result, error: "OpenShell worker returned success without a candidate change", ...usage }
+		return { ok: true, result: isolation.result, ...usage }
 	} finally {
 		const snapshotPrefix = `rsi-mutation-${candidate.id}`
 		try {
@@ -593,6 +622,34 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 			// Keep a failed cleanup visible for operator recovery.
 		}
 	}
+}
+
+function readMutationTranscriptUsage(snapshot: string): { calls: number | null; tokens: number | null } {
+	const directory = path.join(snapshot, ".headlesscode", "rsi-transcripts")
+	if (!fs.existsSync(directory)) return { calls: null, tokens: null }
+	const files = fs.readdirSync(directory).filter((name) => name.endsWith(".jsonl"))
+	if (files.length < 1 || files.length > 16) return { calls: null, tokens: null }
+	let calls = 0
+	let tokens = 0
+	let bytes = 0
+	for (const name of files) {
+		const file = path.join(directory, name)
+		const stat = fs.lstatSync(file)
+		if (!stat.isFile() || stat.isSymbolicLink()) return { calls: null, tokens: null }
+		bytes += stat.size
+		if (bytes > 32 * 1024 * 1024) return { calls: null, tokens: null }
+		for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean)) {
+			if (line.length > 2 * 1024 * 1024) return { calls: null, tokens: null }
+			let record: { response?: { usage?: { totalTokens?: number; promptTokens?: number; completionTokens?: number } } }
+			try { record = JSON.parse(line) as typeof record } catch { return { calls: null, tokens: null } }
+			const usage = record.response?.usage
+			if (!usage || !Number.isSafeInteger(usage.promptTokens) || !Number.isSafeInteger(usage.completionTokens)) return { calls: null, tokens: null }
+			calls += 1
+			tokens += usage.totalTokens ?? (usage.promptTokens! + usage.completionTokens!)
+		}
+	}
+	if (calls < 1 || !Number.isSafeInteger(tokens)) return { calls: null, tokens: null }
+	return { calls, tokens }
 }
 
 function mutationTask(candidate: CandidateRecord, config: RsiConfig): string {
@@ -632,6 +689,29 @@ export async function runOpenShellEvaluation(candidate: CandidateRecord, config:
 		results.push(isolated.result)
 	}
 	return { regression: results[0], visible: results.slice(1) }
+}
+
+/** Run one supervisor-supplied benchmark verifier after the coding guest has been torn down. */
+export async function runOpenShellBenchmarkVerifier(candidate: CandidateRecord, config: RsiConfig, verifier: Buffer, taskId: string, providerFactory?: RsiOpenShellProviderFactory, image?: string): Promise<TrialResult> {
+	if (verifier.byteLength < 1 || verifier.byteLength > 1024 * 1024) throw new Error("benchmark verifier must be between 1 byte and 1 MiB")
+	if (!/^[a-z0-9][a-z0-9-]{1,63}$/.test(taskId)) throw new Error("benchmark verifier task id is malformed")
+	const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: candidate.worktree, encoding: "utf8" }).trim()
+	const isolated = await runSnapshot({
+		config,
+		sourceRoot: candidate.worktree,
+		commit,
+		command: `ln -s /opt/headlesscode/node_modules /workspace/node_modules && command -v node >/dev/null && test -f /workspace/__rsi_benchmark_verifier__/verify.mjs && { node /workspace/__rsi_benchmark_verifier__/verify.mjs /workspace ${taskId}; verifier_status=$?; printf '\\nRSI_BENCHMARK_VERIFIER_COMPLETED:%s\\n' "$verifier_status"; exit "$verifier_status"; }`,
+		timeoutMs: config.commandTimeoutMs,
+		mode: "evaluation",
+		sessionName: `rsi-benchmark-verifier-${candidate.id}-${randomUUID().slice(0, 8)}`,
+		extraFiles: { "__rsi_benchmark_verifier__/verify.mjs": verifier },
+		image,
+		providerFactory,
+	})
+	const marker = /(?:^|\n)RSI_BENCHMARK_VERIFIER_COMPLETED:(\d+)(?:\n|$)/.exec(isolated.result.stdout + isolated.result.stderr)
+	if (!marker) throw new Error(`OpenShell benchmark verifier did not return its completion marker (exit ${isolated.result.exitCode ?? "unknown"}): ${(isolated.result.stderr || isolated.result.stdout).slice(0, 3000)}`)
+	if (Number(marker[1]) !== isolated.result.exitCode) throw new Error("OpenShell benchmark verifier completion marker disagrees with the sandbox exit code")
+	return isolated.result
 }
 
 export function openShellMutationRunner(): typeof runOpenShellMutation {

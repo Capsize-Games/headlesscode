@@ -1,0 +1,5 @@
+{
+  "files": {
+    "src/solution.js": "export function solve(e){return e.status===429?1000:0}\n"
+  }
+}

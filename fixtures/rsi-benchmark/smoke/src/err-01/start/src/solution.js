@@ -1,0 +1,1 @@
+export function solve(e){return e.status===429?1000:0}

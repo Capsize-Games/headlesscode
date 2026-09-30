@@ -1,0 +1,6 @@
+{
+  "files": {
+    "src/solution.js": "import {split} from \"./helper.js\";export function solve(s){return split(s)}\n",
+    "src/helper.js": "export function split(s){return s.split(\",\").map(x=>x.replace(/^\"|\"$/g,\"\"))}\n"
+  }
+}

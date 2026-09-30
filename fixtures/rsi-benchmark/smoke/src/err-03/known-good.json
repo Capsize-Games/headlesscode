@@ -1,0 +1,5 @@
+{
+  "files": {
+    "src/solution.js": "export function solve(s){let a=s.indexOf(\"{\");if(a<0)return null;let d=0,q=false,e=false;for(let i=a;i<s.length;i++){let c=s[i];if(e){e=false;continue}if(c===\"\\\\\"&&q){e=true;continue}if(c==='\"'){q=!q;continue}if(q)continue;if(c===\"{\")d++;if(c===\"}\"&&--d===0){try{return JSON.parse(s.slice(a,i+1))}catch{return null}}}return null}\n"
+  }
+}

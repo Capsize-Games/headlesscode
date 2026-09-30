@@ -1,0 +1,5 @@
+{
+  "files": {
+    "src/solution.js": "export function solve(e){return e.code===\"EACCES\"?{ok:false,kind:\"permission-denied\",message:e.message}:{ok:false,kind:e.code??\"unknown\",message:e.message??\"failed\"}\n"
+  }
+}

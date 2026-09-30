@@ -1,0 +1,320 @@
+{
+  "schemaVersion": 1,
+  "uniqueFixCommits": true,
+  "uniqueManualOraclePaths": true,
+  "crossSplitNearDuplicates": [],
+  "tasks": [
+    {
+      "id": "tool-symlink-escape",
+      "split": "development",
+      "fix": "aa472e4c500ffd32fac2950c5d09df0ade0ebfe4",
+      "changedPaths": [
+        "src/tools/__tests__/path-safety.test.ts",
+        "src/tools/executor.ts"
+      ]
+    },
+    {
+      "id": "tool-test-argv",
+      "split": "development",
+      "fix": "267f3cc4ebe9364422270980860434ff0a1670d2",
+      "changedPaths": [
+        "src/tools/__tests__/run-tests.test.ts",
+        "src/tools/run-tests.ts"
+      ]
+    },
+    {
+      "id": "tool-protected-write",
+      "split": "development",
+      "fix": "ad60e871806ebfdd412f8afe5ec9614f6bdc9a5c",
+      "changedPaths": [
+        "src/tools/__tests__/apply_diff.test.ts",
+        "src/tools/__tests__/edit_file.test.ts",
+        "src/tools/__tests__/search_replace.test.ts",
+        "src/tools/executor.ts"
+      ]
+    },
+    {
+      "id": "store-delete-guard",
+      "split": "development",
+      "fix": "7f002e0e454a525009e1c536ec904ab93b848e70",
+      "changedPaths": [
+        "src/permissions/commands.ts",
+        "src/permissions/store-protection.ts",
+        "src/tools/executor.ts"
+      ]
+    },
+    {
+      "id": "redirect-escape",
+      "split": "confirmation",
+      "fix": "578f1a524bbf5a22854489da820ddcca1d57e89b",
+      "changedPaths": [
+        "src/cloud/__tests__/docker-provider.test.ts",
+        "src/permissions/__tests__/commands.test.ts",
+        "src/permissions/commands.ts",
+        "src/tools/__tests__/execute_command.test.ts",
+        "src/tools/__tests__/path-safety.test.ts",
+        "src/tools/executor.ts"
+      ]
+    },
+    {
+      "id": "codesearch-empty-chunks",
+      "split": "confirmation",
+      "fix": "7d08a0bd62a08c56d3d0fedffdfb26927d885826",
+      "changedPaths": [
+        "src/codesearch/__tests__/index.test.ts",
+        "src/codesearch/cli.ts",
+        "src/codesearch/embedder.ts",
+        "src/codesearch/index.ts",
+        "src/codesearch/ollama-embedder.ts"
+      ]
+    },
+    {
+      "id": "codesearch-generated",
+      "split": "confirmation",
+      "fix": "41105114a71d85e47d45585e17fabbe874beca47",
+      "changedPaths": [
+        "package.json",
+        "src/codesearch/__tests__/files.test.ts",
+        "src/codesearch/files.ts"
+      ]
+    },
+    {
+      "id": "edit-insertion-guard",
+      "split": "confirmation",
+      "fix": "c9d6a4876c7e8ea5ed17fe9b347289c6793e5856",
+      "changedPaths": [
+        "src/tools/__tests__/edit_file.test.ts",
+        "src/tools/executor.ts"
+      ]
+    },
+    {
+      "id": "malformed-child-completion",
+      "split": "development",
+      "fix": "afc1701c439e3527cc9649e4d3f9d0277abdcae3",
+      "changedPaths": [
+        "package.json",
+        "src/engine/__tests__/new-task.test.ts",
+        "src/engine/loop.ts"
+      ]
+    },
+    {
+      "id": "artifact-deferral-bound",
+      "split": "development",
+      "fix": "e16326082be85e64f1b8ba833c9bd6f5bb1b5501",
+      "changedPaths": [
+        "src/engine/__tests__/loop.test.ts",
+        "src/engine/loop.ts"
+      ]
+    },
+    {
+      "id": "cwd-enoent-report",
+      "split": "development",
+      "fix": "46559ae3d59c5095c12e5cf62109ace0efe52b9d",
+      "changedPaths": [
+        "src/engine/__tests__/loop.test.ts",
+        "src/engine/loop.ts",
+        "src/tools/__tests__/execute_command.test.ts",
+        "src/tools/executor.ts"
+      ]
+    },
+    {
+      "id": "bare-result-recovery",
+      "split": "development",
+      "fix": "eed2c86a4edbcae3d65d654a58794348a2024dc7",
+      "changedPaths": [
+        "src/engine/__tests__/parser.test.ts",
+        "src/engine/parser.ts"
+      ]
+    },
+    {
+      "id": "qa-pass-marker",
+      "split": "confirmation",
+      "fix": "eaef3393794751ac3c8574d46a6898268a4bbad4",
+      "changedPaths": [
+        "src/qa/__tests__/qa.test.ts",
+        "src/qa/qa.ts"
+      ]
+    },
+    {
+      "id": "qa-baseline-counts",
+      "split": "confirmation",
+      "fix": "fd5f499b4e1cb167f496cf5466626de4da665224",
+      "changedPaths": [
+        "src/qa/__tests__/qa.test.ts",
+        "src/qa/qa.ts"
+      ]
+    },
+    {
+      "id": "review-baseline-counts",
+      "split": "confirmation",
+      "fix": "7535f1fc3f887309b25e796a731b1cb344d82a56",
+      "changedPaths": [
+        "src/orchestrator/__tests__/reviewer.test.ts",
+        "src/orchestrator/reviewer.ts"
+      ]
+    },
+    {
+      "id": "structured-review-verdict",
+      "split": "confirmation",
+      "fix": "c802d6361ffe5f8fd422fe40c019574ec9dacd49",
+      "changedPaths": [
+        "src/orchestrator/__tests__/reviewer.test.ts",
+        "src/orchestrator/reviewer.ts",
+        "src/qa/__tests__/qa.test.ts",
+        "src/qa/qa.ts"
+      ]
+    },
+    {
+      "id": "ollama-request-timeout",
+      "split": "development",
+      "fix": "9bc8a356175d9ea10e5a8d75bb00467df575c0a1",
+      "changedPaths": [
+        "src/cli.ts",
+        "src/orchestrator/pipeline.ts",
+        "src/orchestrator/reviewer.ts",
+        "src/qa/qa.ts"
+      ]
+    },
+    {
+      "id": "ollama-fetch-timeout",
+      "split": "development",
+      "fix": "af4195913d858e0a8db8fd9626a7f836a0cc74f3",
+      "changedPaths": [
+        "package.json",
+        "src/llm/ollama.ts"
+      ]
+    },
+    {
+      "id": "cli-ollama-timeout",
+      "split": "development",
+      "fix": "13f1a9fb8ab20fe5df44d38edbbe9a9f9e6d45cd",
+      "changedPaths": [
+        "src/cli.ts"
+      ]
+    },
+    {
+      "id": "cli-max-tokens",
+      "split": "development",
+      "fix": "90f835462d1ef90252b0a3379b97d417388cfac1",
+      "changedPaths": [
+        "src/cli.ts"
+      ]
+    },
+    {
+      "id": "local-output-cap",
+      "split": "confirmation",
+      "fix": "b64ed98e5472c29de5db2f804dffaa5bf52b8854",
+      "changedPaths": [
+        "src/cli.ts",
+        "src/orchestrator/reviewer.ts",
+        "src/qa/qa.ts"
+      ]
+    },
+    {
+      "id": "reasoning-token-sizing",
+      "split": "confirmation",
+      "fix": "b0e2cf65e4d700dc8977ef7d611b4a6adbf65b91",
+      "changedPaths": [
+        "src/engine/__tests__/condense.test.ts",
+        "src/engine/condense.ts"
+      ]
+    },
+    {
+      "id": "truncate-tool-groups",
+      "split": "confirmation",
+      "fix": "19d186c19303f53ad3bed15ccd6a246402d8348c",
+      "changedPaths": [
+        "src/engine/__tests__/loop.test.ts",
+        "src/engine/loop.ts"
+      ]
+    },
+    {
+      "id": "strict-tool-schema",
+      "split": "confirmation",
+      "fix": "56ab99d3dd8159ef0c415a10d95c4beba0a6671f",
+      "changedPaths": [
+        "src/codeintel/tools.ts"
+      ]
+    },
+    {
+      "id": "watch-abort-callbacks",
+      "split": "development",
+      "fix": "5f08b81f696f54484c156aeab5d0067b34804c8f",
+      "changedPaths": [
+        "src/orchestrator/watch.ts"
+      ]
+    },
+    {
+      "id": "status-wait-preemption",
+      "split": "development",
+      "fix": "0d441dc4e2aa561d030557d689ce5ce7825ec411",
+      "changedPaths": [
+        "src/orchestrator/__tests__/cost-estimate.test.ts",
+        "src/orchestrator/__tests__/status-cli.test.ts",
+        "src/orchestrator/__tests__/watch.test.ts",
+        "src/orchestrator/cli.ts",
+        "src/orchestrator/cost-estimate.ts",
+        "src/orchestrator/status.ts",
+        "src/orchestrator/watch.ts"
+      ]
+    },
+    {
+      "id": "watch-stalled-worker",
+      "split": "development",
+      "fix": "a92f95aa57f4dfb0150f35236551fa8d91cfc1d4",
+      "changedPaths": [
+        "src/orchestrator/__tests__/watch.test.ts",
+        "src/orchestrator/watch.ts"
+      ]
+    },
+    {
+      "id": "preserve-harness-log",
+      "split": "development",
+      "fix": "c977258142838296c71e2185ffb391f4e6f26097",
+      "changedPaths": [
+        "src/orchestrator/__tests__/watch.test.ts",
+        "src/orchestrator/watch.ts"
+      ]
+    },
+    {
+      "id": "captured-summary-final-outcome",
+      "split": "confirmation",
+      "fix": "40aa1d6209c820df2eed057f0b039e87838f38f5",
+      "changedPaths": [
+        "src/orchestrator/__tests__/watch.test.ts",
+        "src/orchestrator/watch.ts"
+      ]
+    },
+    {
+      "id": "cost-history-order",
+      "split": "confirmation",
+      "fix": "11696e552d918cb93c10713ef9d6b3211afcf4b8",
+      "changedPaths": [
+        "src/orchestrator/__tests__/watch.test.ts",
+        "src/orchestrator/cli.ts",
+        "src/orchestrator/watch.ts"
+      ]
+    },
+    {
+      "id": "qa-failure-rework",
+      "split": "confirmation",
+      "fix": "27c86aa136d467ef3a597ae56d38a9fc55b824da",
+      "changedPaths": [
+        "src/orchestrator/__tests__/cli.test.ts",
+        "src/orchestrator/__tests__/resume.test.ts",
+        "src/orchestrator/cli.ts",
+        "src/orchestrator/resume.ts",
+        "src/orchestrator/state.ts"
+      ]
+    },
+    {
+      "id": "dashboard-git-owner-api",
+      "split": "confirmation",
+      "fix": "6372a39a29232a36980d8dcb9b30f8d7b74b5b21",
+      "changedPaths": [
+        "src/dashboard/__tests__/projects-routes.test.ts",
+        "src/project-store.ts"
+      ]
+    }
+  ]
+}

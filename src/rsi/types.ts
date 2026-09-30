@@ -219,6 +219,8 @@ export interface RsiConfig {
 	dryRun: boolean
 	keepWorktrees: boolean
 	maxIterations: number
+	maxTokens?: number
+	benchmarkHarnessCommit?: string
 	maxTrajectories?: number
 	maxTotalIterations?: number
 	maxRuntimeMs?: number

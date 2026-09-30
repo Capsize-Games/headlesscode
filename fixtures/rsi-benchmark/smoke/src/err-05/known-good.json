@@ -1,0 +1,5 @@
+{
+  "files": {
+    "src/solution.js": "export function solve(x){return x.timedOut?{ok:false,retryable:true,partial:x.stdout??\"\"}:{ok:x.exitCode===0,retryable:false,partial:x.stdout??\"\"}\n"
+  }
+}

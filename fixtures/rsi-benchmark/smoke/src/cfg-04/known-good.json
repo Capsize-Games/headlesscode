@@ -1,0 +1,5 @@
+{
+  "files": {
+    "src/solution.js": "export function solve(e){return {status:Number.isInteger(e.status)?e.status:500,code:typeof e.code===\"string\"?e.code:\"internal_error\",message:typeof e.message===\"string\"?e.message:\"Request failed\"}\n"
+  }
+}

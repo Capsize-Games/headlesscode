@@ -1,0 +1,5 @@
+{
+  "files": {
+    "src/solution.js": "export function solve(xs,n,c){let p=xs.slice(0,n);return {items:p,nextCursor:xs.length>n?(p.at(-1)?.id??c):null}}\n"
+  }
+}

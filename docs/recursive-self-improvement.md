@@ -333,6 +333,53 @@ credentials stay on the coordinator in HEADLESSCODE_OPENROUTER_API_KEY.
 HEADLESSCODE_RSI_ROLE_WORKER_MODEL and HEADLESSCODE_RSI_ROLE_WORKER_PROVIDER
 can explicitly set the worker identity used for the distinct-model check.
 
+## Fixed-harness reliability benchmark
+
+`headlesscode rsi-benchmark` runs the specified committed HeadlessCode harness
+as the coding agent against separate, materialized task repositories. The
+benchmark corpus has 32 historical repository changes split evenly between
+development and confirmation, across tool security, agent completion, provider
+runtime, and orchestration. Each task pins its starting tree, a known-good fix,
+and a supervisor verifier. `check-oracles` runs the known-good and untouched
+known-bad snapshots through the verifier in a separate OpenShell guest; it
+stops if the guest cannot complete the verifier. The coding guest receives one
+task repository and its task text, without the verifier files or confirmation
+fixtures. The fixture materializer rejects symlinks and submodules and checks
+tree paths and size limits before writing files.
+
+Build both worker images from the clean, exact Git commit with the image
+builder. It checks the worktree, safely materializes the selected commit, then
+checks the marker and Docker image ID on both images. The resulting IDs are
+stored in each attempt and in the frozen protocol:
+
+```sh
+HARNESS_COMMIT=$(git rev-parse HEAD)
+npx tsx scripts/rsi-benchmark/build-image.mjs "$HARNESS_COMMIT"
+export HEADLESSCODE_RSI_BENCHMARK_HARNESS_COMMIT="$HARNESS_COMMIT"
+npx tsx src/cli.ts rsi-benchmark verify-fixtures
+npx tsx src/cli.ts rsi-benchmark check-oracles
+npx tsx src/cli.ts rsi-benchmark baseline --harness-commit "$HARNESS_COMMIT"
+npx tsx src/cli.ts rsi-benchmark freeze --harness-commit "$HARNESS_COMMIT"
+npx tsx src/cli.ts rsi-benchmark confirm --harness-commit "$HARNESS_COMMIT"
+```
+
+`check-oracles` writes per-task pass/fail status, verifier duration and output
+digests, the manifest digest, and verifier image identity to
+`.headlesscode/rsi-benchmark/oracle-qualification.json`.
+
+`baseline` records task outcomes, including expected failures; exit status zero
+means the requested task cells ran and were recorded, not that every task
+passed. Setup, image-identity, and verifier failures invalidate the run. The
+worker receives configured iteration, timeout, and per-call output-token
+values, and the supervisor validates the imported patch size. Guest-reported
+transcript counts are post-run observations; the worker can change that file,
+so counts do not enforce call or token ceilings. Aggregate token enforcement is
+unavailable, and attempts are not marked proof-qualified. Reports retain the
+harness, model, manifest and verifier digests, per-task outcomes, guest-reported
+resource observations, and replay artifact digests. Replaying an attempt
+validates and re-verifies its referenced artifacts. Authoritative per-attempt
+resource enforcement requires the broker planned for issue #17.
+
 ## Remaining work
 
 - Issue #9 has a fixed OpenShell QLoRA prototype and CLI covered by mocked job

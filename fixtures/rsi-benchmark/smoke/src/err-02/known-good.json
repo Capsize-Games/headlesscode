@@ -1,0 +1,5 @@
+{
+  "files": {
+    "src/solution.js": "export function solve(p,fb,exists){return [...fb,p].find(x=>exists.includes(x))??null}\n"
+  }
+}

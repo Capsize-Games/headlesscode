@@ -1,0 +1,5 @@
+{
+  "files": {
+    "src/solution.js": "export function solve(x){return Object.fromEntries(Object.entries(x).map(([k,v])=>[k,/token|secret|password|key/i.test(k)?\"[REDACTED]\":v]))}\n"
+  }
+}

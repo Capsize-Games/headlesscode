@@ -3,11 +3,12 @@ import { execFileSync } from "node:child_process"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { applyFleetMutationPatch, createEvaluationSnapshotBundle, createMutationSnapshotBundle, inspectLocalRsiCheckpoint, networkRules, runOpenShellMutation } from "../openshell.js"
+import { applyFleetMutationPatch, createEvaluationSnapshotBundle, createMutationSnapshotBundle, inspectLocalRsiCheckpoint, networkRules, runOpenShellBenchmarkVerifier, runOpenShellMutation } from "../openshell.js"
 import type { RsiOpenShellProviderFactory } from "../openshell.js"
 import type { CandidateRecord, RsiConfig } from "../types.js"
+import { parseRsiArgs } from "../config.js"
 
-async function run(mode: "source" | "escape" | "symlink"): Promise<void> {
+async function run(mode: "source" | "escape" | "symlink" | "preflight"): Promise<void> {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-openshell-"))
 	const worktree = path.join(repo, ".worktrees", "rsi", `candidate-${mode}`)
 	let guestPath = ""
@@ -67,6 +68,7 @@ async function run(mode: "source" | "escape" | "symlink"): Promise<void> {
 			// Deliberately incomplete: supervisor-only paths must still be omitted.
 			protectedPaths: [],
 			commandTimeoutMs: 10_000,
+			...(mode === "preflight" ? { benchmarkHarnessCommit: "f".repeat(40) } : {}),
 		}
 		const providerFactory: RsiOpenShellProviderFactory = (options) => {
 			factoryOptions = options
@@ -86,6 +88,10 @@ async function run(mode: "source" | "escape" | "symlink"): Promise<void> {
 					assert.match(command, /rev-list --count HEAD/)
 					assert.match(command, /\/opt\/headlesscode\/src\/rsi/)
 					assert.match(command, /OPENROUTER_API_KEY/)
+					if (mode === "preflight") {
+						assert.match(command, /headlesscode-harness-commit/)
+						return { exitCode: 79, output: "RSI_BENCHMARK_PREFLIGHT_FAILURE wrong harness image commit" }
+					}
 					if (mode === "source") {
 						fs.writeFileSync(path.join(guestPath, "src", "engine", "loop.ts"), "export const value = 2\n")
 					} else if (mode === "escape") {
@@ -96,14 +102,22 @@ async function run(mode: "source" | "escape" | "symlink"): Promise<void> {
 					}
 					execFileSync("git", ["add", "--all"], { cwd: guestPath })
 					execFileSync("git", ["-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "guest output"], { cwd: guestPath })
+					fs.mkdirSync(path.join(guestPath, ".headlesscode", "rsi-transcripts"), { recursive: true })
+					fs.writeFileSync(path.join(guestPath, ".headlesscode", "rsi-transcripts", "mock.jsonl"), `${JSON.stringify({ response: { usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 } } })}\n`)
 					return { exitCode: 0, output: "bounded fake guest result" }
 				},
 				async teardown() {},
 			}
 		}
-		const result = await runOpenShellMutation(candidate, config, providerFactory)
+		if (mode === "preflight") {
+			await assert.rejects(runOpenShellMutation(candidate, config, providerFactory), /OpenShell benchmark preflight failed/)
+			assert.equal(fs.readFileSync(path.join(worktree, "src", "engine", "loop.ts"), "utf8"), "export const value = 1\n", "wrong harness image must abort before task code runs")
+			return
+		}
+		const imageRef = mode === "source" ? `sha256:${"a".repeat(64)}` : undefined
+		const result = await runOpenShellMutation(candidate, config, providerFactory, imageRef)
 		assert.equal(factoryOptions?.includeProjectData, false)
-		assert.equal(factoryOptions?.image, "headlesscode-openshell-rsi:local")
+		assert.equal(factoryOptions?.image, imageRef ?? "headlesscode-openshell-rsi:local")
 		assert.deepEqual(factoryOptions?.providers, [])
 		assert.equal(sessionEnv?.HEADLESSCODE_CODE_MODE_BACKEND, "ollama")
 		if (mode === "source") {
@@ -126,6 +140,49 @@ async function run(mode: "source" | "escape" | "symlink"): Promise<void> {
 await run("source")
 await run("escape")
 await run("symlink")
+await run("preflight")
+
+{
+	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-benchmark-verifier-"))
+	const worktree = path.join(repo, ".worktrees", "task")
+	let verifierGuest = ""
+	let tornDown = false
+	try {
+		fs.mkdirSync(path.join(worktree, "src"), { recursive: true })
+		fs.writeFileSync(path.join(worktree, "src", "candidate.js"), "export const value = 1\n")
+		execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: worktree })
+		execFileSync("git", ["config", "user.name", "Test"], { cwd: worktree })
+		execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: worktree })
+		execFileSync("git", ["add", "--all"], { cwd: worktree })
+		execFileSync("git", ["-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "candidate"], { cwd: worktree })
+		const parsed = parseRsiArgs(["--repo", repo, "--regression", "true", "--max-runtime-ms", "5000"])
+		assert.ok(parsed.config)
+		const candidate: CandidateRecord = { id: "multi-01", generation: 0, parent: "test", branch: "main", worktree, baseCommit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: worktree, encoding: "utf8" }).trim(), status: "evaluating", model: "test", mutation: "test", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), commits: [], changedFiles: [], protectedPathViolations: [] }
+		const factory: RsiOpenShellProviderFactory = () => ({
+			async spawnExistingWorktreeSession(_request, snapshot) {
+				verifierGuest = snapshot
+				assert.equal(fs.existsSync(path.join(snapshot, "fixtures", "rsi-benchmark")), false, "confirmation and corpus fixtures must not enter the verifier task snapshot")
+				assert.equal(fs.readFileSync(path.join(snapshot, "__rsi_benchmark_verifier__", "verify.mjs"), "utf8"), "assert.fail('known-bad candidate')\n", "the verifier bytes are supplied only to the isolated verifier guest")
+				return { id: "mock-verifier", provider: "mock-openshell", address: snapshot }
+			},
+			async waitReady() {},
+			async runHarness(_handle, command) {
+				assert.match(command, /RSI_BENCHMARK_VERIFIER_COMPLETED/)
+				assert.equal(fs.readFileSync(path.join(verifierGuest, "src", "candidate.js"), "utf8"), "export const value = 1\n")
+				return { exitCode: 1, output: "AssertionError: known-bad candidate\nRSI_BENCHMARK_VERIFIER_COMPLETED:1\n" }
+			},
+			async teardown() { tornDown = true },
+		})
+		const result = await runOpenShellBenchmarkVerifier(candidate, parsed.config, Buffer.from("assert.fail('known-bad candidate')\n"), "multi-01", factory)
+		assert.equal(result.exitCode, 1, "completed verifier assertion failure is a task rejection, not infrastructure failure")
+		assert.equal(tornDown, true)
+		assert.equal(fs.existsSync(verifierGuest), false, "verifier guest snapshot is removed after teardown")
+		await assert.rejects(runOpenShellBenchmarkVerifier(candidate, parsed.config, Buffer.from("true\n"), "multi-01", () => ({
+			async spawnExistingWorktreeSession(_request, snapshot) { verifierGuest = snapshot; return { id: "missing-marker", provider: "mock-openshell", address: snapshot } },
+			async waitReady() {}, async runHarness() { return { exitCode: 1, output: "sandbox transport failed" } }, async teardown() { tornDown = true },
+		})), /did not return its completion marker/)
+	} finally { fs.rmSync(repo, { recursive: true, force: true }) }
+}
 
 {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-eval-bundle-"))
@@ -134,7 +191,7 @@ await run("symlink")
 		execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: repo })
 		execFileSync("git", ["config", "user.name", "Test"], { cwd: repo })
 		execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: repo })
-		for (const [relative, body] of [["src/app.ts", "source\n"], ["test/app.test.ts", "visible test\n"], ["scripts/eval-suite/hidden.js", "hidden suite\n"], ["src/rsi/fitness.ts", "hidden scorer\n"], [".headlesscode/archive.json", "operator archive\n"], ["fixtures/rsi-curriculum/generalization.json", "{}\n"]]) {
+		for (const [relative, body] of [["src/app.ts", "source\n"], ["test/app.test.ts", "visible test\n"], ["scripts/eval-suite/hidden.js", "hidden suite\n"], ["src/rsi/fitness.ts", "hidden scorer\n"], [".headlesscode/archive.json", "operator archive\n"], ["fixtures/rsi-curriculum/generalization.json", "{}\n"], ["fixtures/rsi-benchmark/confirmation.json", "private proof task\n"]]) {
 			const target = path.join(repo, relative)
 			fs.mkdirSync(path.dirname(target), { recursive: true })
 			fs.writeFileSync(target, body)
@@ -155,6 +212,7 @@ await run("symlink")
 		assert.equal(fs.existsSync(path.join(clonePath, "src/rsi/fitness.ts")), false)
 		assert.equal(fs.existsSync(path.join(clonePath, ".headlesscode/archive.json")), false)
 		assert.equal(fs.existsSync(path.join(clonePath, "fixtures/rsi-curriculum/generalization.json")), true, "registered curriculum fixtures remain available to evaluation guests")
+		assert.equal(fs.existsSync(path.join(clonePath, "fixtures/rsi-benchmark/confirmation.json")), false, "benchmark task and verifier data stays outside evaluation guests")
 		assert.equal(fs.lstatSync(path.join(clonePath, "test/app.test.ts")).isSymbolicLink(), false, "bundle transfer excludes harness-only dependency symlinks")
 		const mutation = createMutationSnapshotBundle(repo, head, { protectedPaths: [], repoRoot: repo } as unknown as RsiConfig)
 		const mutationBundle = path.join(unpack, "mutation.bundle")
@@ -162,6 +220,7 @@ await run("symlink")
 		fs.writeFileSync(mutationBundle, mutation.content)
 		execFileSync("git", ["clone", "--quiet", mutationBundle, mutationClone], { cwd: unpack })
 		assert.equal(fs.existsSync(path.join(mutationClone, "fixtures/rsi-curriculum/generalization.json")), false, "mutation guests never receive evaluator-owned fixture assets")
+		assert.equal(fs.existsSync(path.join(mutationClone, "fixtures/rsi-benchmark/confirmation.json")), false, "mutation guests never receive benchmark task and verifier data")
 	} finally {
 		fs.rmSync(repo, { recursive: true, force: true })
 		fs.rmSync(unpack, { recursive: true, force: true })
