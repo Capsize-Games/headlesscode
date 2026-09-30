@@ -5,6 +5,7 @@ import { Pool } from "pg"
 import test from "node:test"
 import { S3RsiArtifactStore } from "../artifact-store.js"
 import { FileRsiArtifactStore } from "../artifact-store.js"
+import type { OpenRouterBrokerGrant, OpenRouterCallReservation, OpenRouterBrokerLimits } from "../inference-broker.js"
 import { fleetJobMatches, fleetQueuePolicy, PostgresRsiJobQueue, requiredFleetJobLeaseMs, type FleetJob, type FleetJobIdentity, type FleetJobPayload, type FleetQueuePolicy } from "../postgres-queue.js"
 
 test("fleet job replay identity rejects stale snapshots, tasks, base commits, evaluation config, and routing", () => {
@@ -80,11 +81,61 @@ test("PostgreSQL migrations upgrade an earlier artifact and lease schema", { ski
 		assert.ok(artifactColumns.rows.some((row) => row.column_name === "byte_length"))
 		assert.equal(artifactColumns.rows.some((row) => row.column_name === "content"), false, "empty legacy NOT NULL PostgreSQL blob column is removed")
 		assert.ok(jobColumns.rows.some((row) => row.column_name === "lease_duration_ms"))
-		assert.equal((await scopedPool.query("SELECT version FROM headlesscode_rsi_schema_migrations ORDER BY version")).rowCount, 3)
+		assert.equal((await scopedPool.query("SELECT version FROM headlesscode_rsi_schema_migrations ORDER BY version")).rowCount, 4)
+		const campaignColumns = await scopedPool.query("SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name='headlesscode_rsi_inference_campaigns'", [schema])
+		assert.ok(campaignColumns.rows.some((row) => row.column_name === "blocked"), "migration 004 adds the campaign block state used by admission and settlement")
 		await scopedPool.query("DELETE FROM headlesscode_rsi_schema_migrations WHERE version=2")
 		await scopedPool.query("ALTER TABLE headlesscode_rsi_artifacts DROP COLUMN storage_id, DROP COLUMN object_key, DROP COLUMN backend, DROP COLUMN byte_length, ADD COLUMN content bytea NOT NULL")
 		await scopedPool.query("INSERT INTO headlesscode_rsi_artifacts(sha256,content) VALUES($1,decode('0102','hex'))", ["a".repeat(64)])
 		await assert.rejects(queue.migrate(), /still contains PostgreSQL blobs; upload legacy bytes to the configured shared object store/)
+	} finally {
+		await queue.close().catch(() => undefined)
+		await admin.query(`DROP SCHEMA ${schema} CASCADE`)
+		await admin.end()
+		await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true }))
+	}
+})
+
+test("PostgreSQL OpenRouter admission persists reservations, blocks overspend, and invalidates stale lease receipts", { skip: !databaseUrl }, async () => {
+	const schema = `rsi_broker_${randomUUID().replaceAll("-", "")}`
+	const root = await import("node:fs/promises").then(({ mkdtemp }) => mkdtemp(`${process.env.TMPDIR ?? "/tmp"}/rsi-broker-test-`))
+	const admin = new Pool({ connectionString: databaseUrl })
+	await admin.query(`CREATE SCHEMA ${schema}`)
+	const connection = { connectionString: databaseUrl, options: `-c search_path=${schema}` }
+	const pool = new Pool(connection)
+	const policy = testPolicy(`broker-${randomUUID().slice(0, 8)}`)
+	let queue = new PostgresRsiJobQueue(pool, policy, new FileRsiArtifactStore(root))
+	try {
+		await queue.migrate()
+		const job = await addJob(queue, "broker-admission", "LOCAL_GPU", "openrouter:test-model")
+		await queue.registerWorker({ workerId: "broker-worker", gatewayId: "test-gateway", hostname: "test-host", maxActive: 1, resourceClasses: ["LOCAL_GPU"] })
+		const lease = await queue.claim("broker-worker")
+		assert.ok(lease)
+		const limits: OpenRouterBrokerLimits = {
+			campaignId: `campaign-${randomUUID()}`, maxCalls: 2, maxInputTokensPerCall: 500, maxOutputTokensPerCall: 500,
+			maxTotalTokens: 1000, maxDurationMs: 60_000, maxRequestBytes: 16_384, maxResponseBytes: 16_384,
+			maxInputPricePerMillionUsd: 1, maxOutputPricePerMillionUsd: 1, maxCallSpendUsd: 0.01, maxJobSpendUsd: 0.01, maxCampaignSpendUsd: 0.01,
+		}
+		const grant: OpenRouterBrokerGrant = { jobId: job.jobId, leaseToken: lease.token, capability: randomUUID(), model: "deepseek/deepseek-v4-flash-0731", limits }
+		await queue.register(grant)
+		const reservation = (callId: string): OpenRouterCallReservation => ({ callId, requestSha256: "a".repeat(64), reservedUsd: 0.01, reservedTokens: 100, startedAt: new Date().toISOString() })
+		const admissions = await Promise.allSettled([queue.reserve(grant, reservation("call-concurrent-0001")), queue.reserve(grant, reservation("call-concurrent-0002"))])
+		assert.equal(admissions.filter((item) => item.status === "fulfilled").length, 1, "campaign and job spend locks admit only one call under contention")
+		const callId = admissions[0]?.status === "fulfilled" ? "call-concurrent-0001" : "call-concurrent-0002"
+		await queue.settle(grant, { callId, state: "complete", qualified: true, returnedModel: grant.model, promptTokens: 12, completionTokens: 8, costUsd: 0.001, responseSha256: "b".repeat(64), completedAt: new Date().toISOString() })
+		const receipt = await queue.receipt(grant)
+		assert.equal(receipt.qualified, true)
+		assert.equal(receipt.totalTokens, 20)
+		await queue.pool.query("UPDATE headlesscode_rsi_jobs SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE job_id=$1", [job.jobId])
+		assert.equal((await queue.receipt(grant)).qualified, false, "expired lease invalidates an otherwise measured receipt before publication")
+		await queue.pool.query("UPDATE headlesscode_rsi_jobs SET lease_expires_at=clock_timestamp()+interval '1 minute' WHERE job_id=$1", [job.jobId])
+		assert.equal((await queue.complete(lease, { ok: true })).accepted, true, "current lease publishes the result")
+		assert.equal((await queue.receipt(grant)).qualified, true, "accepted completed job retains its immutable authoritative receipt")
+		await queue.close()
+		queue = new PostgresRsiJobQueue(new Pool(connection), policy, new FileRsiArtifactStore(root))
+		assert.equal((await queue.receipt(grant)).qualified, true, "durable receipt survives queue process reconstruction")
+		await queue.pool.query("UPDATE headlesscode_rsi_jobs SET status='failed' WHERE job_id=$1", [job.jobId])
+		assert.equal((await queue.receipt(grant)).qualified, false, "failed/fenced work cannot retain proof qualification")
 	} finally {
 		await queue.close().catch(() => undefined)
 		await admin.query(`DROP SCHEMA ${schema} CASCADE`)

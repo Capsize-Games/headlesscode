@@ -64,7 +64,8 @@ export async function captureCandidateTrajectory(
 		id: `trajectory-${candidate.id}`,
 		task: candidate.mutation,
 		environment: { repoRoot: config.repoRoot, baseCommit: candidate.baseCommit, generation: candidate.generation },
-		model: { id: candidate.model, candidateId: candidate.modelCandidateId },
+		model: { id: candidate.model, provider: candidate.modelProvider, candidateId: candidate.modelCandidateId, returnedModels: candidate.inferenceUsage?.returnedModels },
+		...(candidate.inferenceUsage ? { inferenceUsage: candidate.inferenceUsage } : {}),
 		harnessVersion: candidate.parentCommit ?? candidate.baseCommit,
 		promptConfig: {
 			mutationKind: candidate.mutationKind,

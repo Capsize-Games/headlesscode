@@ -25,6 +25,7 @@ import type {
 	ChatTool,
 	ChatToolCall,
 } from "../engine/types.js"
+import { randomUUID } from "node:crypto"
 import { parseEndpointPricing, type EndpointPricingEntry, type ModelPrice } from "../budget/cost.js"
 import { captureTranscript, isTranscriptCaptureEnabled } from "./transcript-capture.js"
 
@@ -141,6 +142,7 @@ export class OpenRouterClient implements LlmClient {
 		if (this.appTitle) {
 			headers["X-Title"] = this.appTitle
 		}
+		if (process.env.HEADLESSCODE_RSI_INFERENCE_CAPABILITY) headers["X-RSI-Call-ID"] = randomUUID()
 		return headers
 	}
 
@@ -865,4 +867,3 @@ function mapUsage(raw: RawUsage | undefined): LlmResponse["usage"] {
 function excerpt(body: string): string {
 	return body.length > 500 ? `${body.slice(0, 500)}…` : body
 }
-

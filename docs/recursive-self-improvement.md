@@ -187,6 +187,70 @@ queue must use the same queue policy and artifact-store identity.
 | `HEADLESSCODE_OPENSHELL_IMAGE` | `headlesscode-openshell-rsi:local` | RSI guest image; custom images are rejected. |
 | `HEADLESSCODE_RSI_OLLAMA_HOST` | `host.openshell.internal` | Local Ollama host permitted by the RSI mutation policy. |
 
+### OpenRouter mutation and development-proof jobs
+
+OpenRouter is available for RSI fleet mutations and the development benchmark
+when the worker role is configured with
+`HEADLESSCODE_RSI_ROLE_WORKER_PROVIDER=openrouter` and
+`HEADLESSCODE_RSI_ROLE_WORKER_MODEL=deepseek/deepseek-v4-flash-0731`. The model
+is pinned to DeepSeek's OpenRouter endpoint with fallback routing disabled.
+Include `REMOTE_API` in `HEADLESSCODE_RSI_WORKER_RESOURCE_CLASSES` for workers
+that claim brokered calls; Ollama workers continue to claim `LOCAL_GPU`.
+Workers need the host-side `HEADLESSCODE_OPENROUTER_API_KEY` and
+`HEADLESSCODE_RSI_BROKER_BIND_HOST`; the bind address must be an address on a
+host network interface that the OpenShell guest can reach. The key remains in
+the worker process. Guests receive a job-scoped capability for a host broker,
+and their OpenShell network rule admits only that broker endpoint.
+
+Set explicit price and spend ceilings on the coordinator and workers:
+
+| Variable | Use |
+| --- | --- |
+| `HEADLESSCODE_RSI_OPENROUTER_MAX_INPUT_PRICE_PER_MILLION_USD` | Maximum admitted input-token price; broker checks the pinned endpoint price before serving a job. |
+| `HEADLESSCODE_RSI_OPENROUTER_MAX_OUTPUT_PRICE_PER_MILLION_USD` | Maximum admitted output-token price. |
+| `HEADLESSCODE_RSI_OPENROUTER_MAX_CALL_SPEND_USD` | Worst-case reservation for one call; must cover the configured per-call token ceilings at the price ceilings. |
+| `HEADLESSCODE_RSI_OPENROUTER_MAX_JOB_SPEND_USD` | Maximum reserved and settled spend for one job. |
+| `HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD` | Operator's total inference ceiling for mutation and benchmark work. |
+| `HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD` | Portion allocated to mutation jobs. |
+| `HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD` | Portion allocated to development benchmark jobs. |
+
+The mutation and benchmark allocations are rounded conservatively and must
+sum to no more than the total campaign ceiling. Keep all three values fixed
+for a run. Configure the job spend ceiling no higher than either allocation;
+the broker rejects a job cap that exceeds its branch's campaign allocation.
+The broker also accepts finite call, input-token, output-token,
+total-token, duration, and request/response-byte limits through the
+`HEADLESSCODE_RSI_OPENROUTER_MAX_*` variables. If a response has missing or
+ambiguous usage, the reservation stays charged and that job cannot qualify;
+the broker does not retry an ambiguous paid dispatch. Attempt receipts record
+the requested and returned model, token counts, provider cost, and response
+digest. Guest transcript counts remain observational and do not qualify proof.
+
+The same-host development benchmark uses a file-backed spend ledger. A process
+crash can leave its exclusive ledger lock in place; the next run fails closed
+and requires an operator to inspect the ledger and remove a stale lock. Fleet
+mutation reservations use PostgreSQL instead. Configure the database migration
+before scheduling brokered fleet work.
+
+To exercise the worker image and guest network boundary without a provider
+credential or paid request, build the exact current harness image from a clean
+checkout, then run the bounded mock-upstream smoke:
+
+```sh
+npx tsx scripts/rsi-benchmark/build-image.mjs "$(git rev-parse HEAD)" --commit-context
+OPENSHELL_GATEWAY=rsi-local \
+HEADLESSCODE_RSI_BROKER_BIND_HOST=172.17.0.1 \
+npx tsx scripts/rsi-benchmark/mock-openrouter-guest-smoke.ts .
+```
+
+Replace `rsi-local` and `172.17.0.1` with the configured gateway alias and its
+gateway-reachable host interface address. The smoke makes at most three brokered
+calls to an in-process mock upstream, checks the host credential stays out of
+the guest result, and requires a guest request to a second live local HTTP
+sentinel on a port outside the broker allowlist to fail without reaching it.
+It is an integration check, not model improvement evidence or a live
+OpenRouter result.
+
 Run `headlesscode rsi-worker` once per worker identity. It sets
 `OPENSHELL_GATEWAY` from `HEADLESSCODE_RSI_GATEWAY_ID` before preflight.
 Database and object-store credentials stay in host processes and are not sent

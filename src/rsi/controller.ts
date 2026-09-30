@@ -31,6 +31,7 @@ import {
 	resolveBaseCommit,
 } from "./workspace.js"
 import { loadBenchmark } from "./benchmark/runner.js"
+import { openRouterAllocatedEnvironment, openRouterBrokerLimitsFromEnvironment, RSI_OPENROUTER_MODEL } from "./inference-broker.js"
 import { candidateProofDecision, compareDevelopmentAttempts, developmentCells, freezeDevelopmentProofProtocol } from "./development-proof.js"
 import type { DevelopmentTaskCell } from "./development-proof.js"
 import type { BenchmarkAttempt } from "./benchmark/types.js"
@@ -114,7 +115,16 @@ async function waitForFleetJob(queue: PostgresRsiJobQueue, jobId: string, timeou
 	throw new Error(`fleet job ${jobId} exceeded coordinator timeout`)
 }
 
-function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: { content: Buffer; snapshotCommit: string }): FleetJobPayload {
+function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: { content: Buffer; snapshotCommit: string }, options: { campaignId?: string; boundedInference?: boolean } = {}): FleetJobPayload {
+	const provider = config.roles?.worker?.provider === "openrouter" ? "openrouter" : "ollama"
+	if (provider === "openrouter" && candidate.model !== RSI_OPENROUTER_MODEL) throw new Error(`RSI OpenRouter worker model must be pinned to ${RSI_OPENROUTER_MODEL}`)
+	const inferenceLimits = provider === "openrouter" && options.boundedInference
+		? openRouterBrokerLimitsFromEnvironment(openRouterAllocatedEnvironment(process.env, "mutation"), options.campaignId ?? "", {
+			maxCalls: config.maxIterations,
+			...(config.maxTokens ? { maxOutputTokensPerCall: config.maxTokens } : {}),
+			maxDurationMs: config.commandTimeoutMs,
+		})
+		: undefined
 	return {
 		schemaVersion: 1,
 		snapshotSha256: "", // replaced with the verified artifact digest before enqueue
@@ -122,6 +132,8 @@ function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: {
 		snapshotCommit: snapshot.snapshotCommit,
 		task: config.mutationTask,
 		model: candidate.model,
+		provider,
+		...(inferenceLimits ? { inferenceLimits } : {}),
 		maxIterations: config.maxIterations,
 		timeoutMs: config.commandTimeoutMs,
 		protectedPaths: config.protectedPaths,
@@ -132,6 +144,25 @@ function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: {
 		},
 		regressionCommand: config.regressionCommand,
 		evalCommands: config.evalCommands,
+	}
+}
+
+function recordFleetInferenceUsage(candidate: CandidateRecord, resultValue: unknown, payload: FleetJobPayload, jobId: string): void {
+	candidate.modelProvider = `openshell-${payload.provider ?? "ollama"}`
+	if ((payload.provider ?? "ollama") !== "openrouter") return
+	if (!resultValue || typeof resultValue !== "object" || !payload.inferenceLimits) throw new Error("OpenRouter fleet mutation result is missing its broker identity")
+	const result = resultValue as { provider?: unknown; model?: unknown; inferenceReceipt?: Record<string, unknown> }
+	const receipt = result.inferenceReceipt
+	if (result.provider !== "openrouter" || result.model !== payload.model || !receipt || receipt.provider !== "openrouter" || receipt.jobId !== jobId || receipt.campaignId !== payload.inferenceLimits.campaignId || receipt.model !== payload.model || receipt.accounting !== "supervisor-enforced" || receipt.qualified !== true || !Array.isArray(receipt.returnedModels) || receipt.returnedModels.length !== 1 || receipt.returnedModels[0] !== payload.model) {
+		throw new Error("OpenRouter fleet mutation result lacks a qualified receipt bound to the admitted provider, model, job and campaign")
+	}
+	const values = [receipt.calls, receipt.promptTokens, receipt.completionTokens, receipt.totalTokens, receipt.costUsd]
+	if (!values.every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0) || !Number.isSafeInteger(receipt.calls) || !Number.isSafeInteger(receipt.promptTokens) || !Number.isSafeInteger(receipt.completionTokens) || !Number.isSafeInteger(receipt.totalTokens)) throw new Error("OpenRouter fleet mutation receipt contains malformed resource totals")
+	candidate.inferenceUsage = {
+		provider: "openrouter", model: payload.model, returnedModels: receipt.returnedModels as string[], calls: receipt.calls as number,
+		promptTokens: receipt.promptTokens as number, completionTokens: receipt.completionTokens as number, totalTokens: receipt.totalTokens as number,
+		costUsd: receipt.costUsd as number, accounting: "supervisor-enforced", qualified: true, jobId,
+		campaignId: payload.inferenceLimits.campaignId,
 	}
 }
 
@@ -447,6 +478,8 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	const archive = await readArchive(config.archiveDir)
 	const roles = resolveRoles(config.roles, process.env, config.model)
 	const workerModel = roles.worker?.model ?? config.model
+	const workerProvider = roles.worker?.provider === "openrouter" ? "openshell-openrouter" : "openshell-ollama"
+	if (workerProvider === "openshell-openrouter" && workerModel !== RSI_OPENROUTER_MODEL) throw new Error(`RSI OpenRouter worker model must be pinned to ${RSI_OPENROUTER_MODEL}`)
 	const resumed = config.resumeRunId ? await findActiveRun(config.archiveDir, config.resumeRunId) : undefined
 	if (config.resumeRunId && !resumed) throw new Error(`no active RSI run found for --resume ${config.resumeRunId}`)
 	const baseCommit = resumed?.baseCommit ?? (await resolveBaseCommit(config))
@@ -474,7 +507,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	const proofProtocol = freezeDevelopmentProofProtocol(
 		loadedProofBenchmark.manifest,
 		loadedProofBenchmark.manifestDigest,
-		{ provider: "openshell-ollama", id: workerModel, sampling: { temperature: 0, think: false, seed: "provider-default" } },
+		{ provider: workerProvider, id: workerModel, sampling: { temperature: 0, think: false, seed: "provider-default" } },
 		config.developmentProofRule,
 	)
 	if (resumed && !resumed.developmentProofProtocol) throw new Error("cannot resume an RSI run without its frozen development proof protocol")
@@ -494,7 +527,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		if (lineageViolations.length > 0) throw new Error(`development proof harness changes protected paths relative to the run base: ${lineageViolations.join(", ")}`)
 		const pending = hooks.runDevelopmentBenchmark
 			? hooks.runDevelopmentBenchmark({ harnessCommit, model: workerModel, outputRoot: path.join(config.archiveDir, "development-proof", evidenceRunId, proofProtocol.protocolDigest), protocol: proofProtocol })
-			: runDevelopmentBenchmarkForCommit({ repoRoot: config.repoRoot, fixturesRoot: proofFixturesRoot, outputRoot: path.join(config.archiveDir, "development-proof", evidenceRunId, proofProtocol.protocolDigest), harnessCommit, model: workerModel })
+			: runDevelopmentBenchmarkForCommit({ repoRoot: config.repoRoot, fixturesRoot: proofFixturesRoot, outputRoot: path.join(config.archiveDir, "development-proof", evidenceRunId, proofProtocol.protocolDigest), harnessCommit, model: workerModel, provider: workerProvider, campaignId: `proof-${evidenceRunId}-${proofProtocol.protocolDigest.slice(0, 16)}` })
 		proofAttemptCache.set(cacheKey, pending)
 		return developmentCells(await pending)
 	}
@@ -506,6 +539,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	const fleetQueue = !config.dryRun && (queueOverride !== undefined || !hooks.runMutation)
 		? queueOverride ?? PostgresRsiJobQueue.fromEnvironment(fleetQueuePolicy(process.env.HEADLESSCODE_RSI_QUEUE_NAME?.trim() || "rsi-default", config.maxConcurrent, process.env), process.env)
 		: undefined
+	if (!config.dryRun && workerProvider === "openshell-openrouter" && !fleetQueue) throw new Error("RSI OpenRouter inference requires the supervised fleet broker path")
 	if (!config.dryRun && config.roles?.adversary && !fleetQueue) throw new Error("RSI adversarial break tests require the OpenShell fleet evaluation path")
 	const commandRunner = hooks.runCommand ?? (fleetQueue ? undefined : createOpenShellCommandRunner(runConfig))
 	try {
@@ -609,6 +643,9 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		const mutationJobs = new Map<string, FleetJob>()
 		const evaluationJobs = new Map<string, FleetJob>()
 		const managedWorktrees = new Set<string>()
+		const mutationResource = runConfig.roles?.worker?.provider === "openrouter"
+			? { class: "REMOTE_API" as const, units: 1, concurrencyKey: `openrouter:${runConfig.roles.worker.model}` }
+			: { class: "LOCAL_GPU" as const, units: 1, concurrencyKey: "ollama" }
 		if (fleetQueue) {
 			try {
 				for (const candidate of candidates) {
@@ -618,11 +655,14 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 					const key = `${run.runId}:${candidate.id}:mutation`
 					const snapshot = createMutationSnapshotBundle(candidate.worktree, candidate.baseCommit, runConfig)
 					const artifact = await fleetQueue.putArtifact(snapshot.content)
-					const payload = fleetPayload(runConfig, candidate, snapshot)
+					const useOpenRouter = runConfig.roles?.worker?.provider === "openrouter"
+					const payload = fleetPayload(runConfig, candidate, snapshot, { campaignId: run.runId, boundedInference: true })
 					payload.snapshotSha256 = artifact.sha256
+					const resourceClass = useOpenRouter ? "REMOTE_API" as const : "LOCAL_GPU" as const
+					const concurrencyKey = `${useOpenRouter ? "openrouter" : "ollama"}:${candidate.model}`
 					const expected: FleetJobIdentity = {
 						idempotencyKey: key, runId: run.runId, candidateId: candidate.id,
-						jobKind: "mutation", resourceClass: "LOCAL_GPU", concurrencyKey: `ollama:${candidate.model}`,
+						jobKind: "mutation", resourceClass, concurrencyKey,
 						artifactSha256: artifact.sha256, payload,
 					}
 					const existing = await fleetQueue.getJobByIdempotencyKey(key)
@@ -634,6 +674,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 						}
 						const result = completed.result as { patchSha256?: string; patchBytes?: number }
 						if (!result.patchSha256 || !Number.isSafeInteger(result.patchBytes) || Number(result.patchBytes) < 1) throw new Error("completed fleet mutation has no valid patch artifact reference for resume")
+						recordFleetInferenceUsage(candidate, completed.result, expected.payload, completed.jobId)
 						const patch = await fleetQueue.getArtifact(result.patchSha256)
 						const appliedPatch = execFileSync("git", ["diff", "--binary", "--no-ext-diff", "--no-renames", `${candidate.baseCommit}...HEAD`], { cwd: candidate.worktree, encoding: "buffer" })
 						if (patch.byteLength !== result.patchBytes || appliedPatch.byteLength !== result.patchBytes || createHash("sha256").update(appliedPatch).digest("hex") !== result.patchSha256) {
@@ -641,7 +682,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 						}
 						let recorded = run.jobs.find((entry) => entry.candidateId === candidate.id && entry.kind === "mutation")
 						if (!recorded) {
-							recorded = newExperimentJob("mutation", { class: "LOCAL_GPU", units: 1, concurrencyKey: "ollama" }, now(), candidate.id)
+							recorded = newExperimentJob("mutation", mutationResource, now(), candidate.id)
 							run.jobs.push(recorded)
 						}
 						if (recorded.status !== "completed") replaceJob(run, transitionJob(recorded, "completed", now()))
@@ -669,9 +710,10 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		// generation-wide phase so CPU workers can claim the full ready set.
 		for (const candidate of candidates) {
 			if (isTerminal(candidate)) continue
+			candidate.modelProvider ??= workerProvider
 			let job = run.jobs.find((entry) => entry.candidateId === candidate.id && entry.kind === "mutation")
 			if (!job) {
-				job = newExperimentJob("mutation", { class: "LOCAL_GPU", units: 1, concurrencyKey: "ollama" }, now(), candidate.id)
+				job = newExperimentJob("mutation", mutationResource, now(), candidate.id)
 				run.jobs.push(job)
 			}
 			try {
@@ -690,6 +732,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 						if (completed.status !== "completed" || !completed.result || typeof completed.result !== "object") throw new Error(completed.error ?? `fleet mutation ended ${completed.status}`)
 						const result = completed.result as { patchSha256?: string; patchBytes?: number }
 						if (!result.patchSha256 || !Number.isSafeInteger(result.patchBytes) || Number(result.patchBytes) < 1) throw new Error("fleet mutation result is missing its patch artifact reference")
+						recordFleetInferenceUsage(candidate, completed.result, submitted.payload, completed.jobId)
 						const patch = await fleetQueue.getArtifact(result.patchSha256)
 						if (patch.byteLength !== result.patchBytes) throw new Error("fleet mutation patch length did not match result metadata")
 						applyFleetMutationPatch(patch, candidate, runConfig)

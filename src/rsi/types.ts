@@ -161,7 +161,8 @@ export interface TrajectoryRecord {
 	id: string
 	task: string
 	environment: { repoRoot: string; baseCommit: string; generation: number }
-	model: { id: string; provider?: string; candidateId?: string }
+	model: { id: string; provider?: string; candidateId?: string; returnedModels?: string[] }
+	inferenceUsage?: CandidateRecord["inferenceUsage"]
 	harnessVersion: string
 	promptConfig: Record<string, unknown>
 	messages: TrajectoryMessage[]
@@ -253,6 +254,21 @@ export interface CandidateRecord {
 	baseCommit: string
 	status: CandidateStatus
 	model: string
+	modelProvider?: string
+	inferenceUsage?: {
+		provider: "openrouter"
+		model: string
+		returnedModels: string[]
+		calls: number
+		promptTokens: number
+		completionTokens: number
+		totalTokens: number
+		costUsd: number
+		accounting: "supervisor-enforced"
+		qualified: true
+		jobId: string
+		campaignId: string
+	}
 	mutation: string
 	createdAt: string
 	updatedAt: string

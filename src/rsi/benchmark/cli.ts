@@ -4,6 +4,7 @@ import * as path from "node:path"
 import { loadBenchmark, freezeBenchmarkProtocol, runBenchmark, printBenchmarkSummary } from "./runner.js"
 import { OpenShellBenchmarkAgent, OpenShellBenchmarkVerifier } from "./openshell-agent.js"
 import type { BenchmarkSplit } from "./types.js"
+import { RSI_OPENROUTER_MODEL } from "../inference-broker.js"
 
 interface Options {
 	repo: string
@@ -34,8 +35,8 @@ Options:
   --fixtures <path>          Benchmark fixtures (default: fixtures/rsi-benchmark)
   --output <path>            Results and content-addressed artifacts directory
   --harness-commit <sha>     Exact harness commit under evaluation
-  --model <id>               Local Ollama model ID (default: wxrq-qwen3.5-9b:latest)
-  --provider <id>            Provider identity (default: openshell-ollama)
+	--model <id>               Pinned model ID (OpenRouter requires ${RSI_OPENROUTER_MODEL})
+	--provider <id>            openshell-ollama (default) or openshell-openrouter
   --task <id>                Single task ID (required for replay)
   --result <path>            JSON completion with optional patchBase64 (replay only)
 `
@@ -49,6 +50,7 @@ function parse(argv: string[]): { command?: string; options?: Options; help?: bo
 		model: "wxrq-qwen3.5-9b:latest", provider: "openshell-ollama",
 		sampling: { temperature: 0, think: false, seed: "provider-default" }, split: "development",
 	}
+	let modelExplicit = false
 	try {
 		for (let index = 1; index < argv.length; index++) {
 			const arg = argv[index]!
@@ -60,7 +62,7 @@ function parse(argv: string[]): { command?: string; options?: Options; help?: bo
 				case "--fixtures": options.fixtures = path.resolve(value); break
 				case "--output": options.output = path.resolve(value); break
 				case "--harness-commit": options.harnessCommit = value; break
-				case "--model": options.model = value; break
+				case "--model": options.model = value; modelExplicit = true; break
 				case "--provider": options.provider = value; break
 				case "--task": options.taskId = value; break
 				case "--result": options.replayFile = path.resolve(value); break
@@ -68,6 +70,8 @@ function parse(argv: string[]): { command?: string; options?: Options; help?: bo
 			}
 			index++
 		}
+		if (options.provider === "openshell-openrouter" && !modelExplicit) options.model = RSI_OPENROUTER_MODEL
+		if (!['openshell-ollama', 'openshell-openrouter'].includes(options.provider)) throw new Error("--provider must be openshell-ollama or openshell-openrouter")
 		if (!["verify-fixtures", "check-oracles", "freeze", "baseline", "confirm", "replay"].includes(command ?? "")) throw new Error(`unknown rsi-benchmark command: ${command ?? ""}`)
 		return { command, options }
 	} catch (error) { return { command, options, error: error instanceof Error ? error.message : String(error) } }
@@ -97,7 +101,7 @@ export async function benchmarkMain(argv: string[]): Promise<number> {
 		}
 		if (!options.harnessCommit || !/^[a-f0-9]{40}$/.test(options.harnessCommit)) throw new Error("--harness-commit must be a full 40-character commit SHA")
 		execFileSync("git", ["cat-file", "-e", `${options.harnessCommit}^{commit}`], { cwd: options.repo, stdio: "ignore" })
-		const agent = new OpenShellBenchmarkAgent(options.repo)
+		const agent = new OpenShellBenchmarkAgent(options.repo, undefined, "headlesscode-openshell-rsi:local", undefined, undefined, options.provider)
 		const agentImageIdentity = await agent.imageIdentity(options.harnessCommit)
 		if (parsed.command === "freeze") {
 			if (options.provider !== agent.provider) throw new Error(`provider ${options.provider} is not available in this runner; use ${agent.provider}`)

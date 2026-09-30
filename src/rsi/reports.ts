@@ -13,7 +13,8 @@ export function formatCandidate(candidate: CandidateRecord): string {
 	const proof = candidate.developmentProof?.immediateParent && candidate.developmentProof.originalBase
 		? `, development=${candidate.developmentProof.accepted ? "eligible" : "ineligible"} (${candidate.developmentProof.reason}); ${describeProofArm("immediate-parent", candidate.developmentProof.immediateParent)}; ${describeProofArm("original-base", candidate.developmentProof.originalBase)}; protocol=${candidate.developmentProof.protocolDigest}; attemptRefs child/parent/root=${candidate.developmentProof.childAttemptIds.length}/${candidate.developmentProof.parentAttemptIds.length}/${candidate.developmentProof.originalBaseAttemptIds.length}`
 		: candidate.developmentProof ? `, development=ineligible (${candidate.developmentProof.reason || "incomplete proof record"})` : ", development=unmeasured (no benchmark proof recorded)"
-	return `${candidate.id}: ${candidate.status}${parent}${mutation}${fitness ? `, score=${fitness.score}, ${fitness.reason}` : ""}${proof}${comparison}${metrics}`
+	const model = candidate.modelProvider ? `, worker=${candidate.modelProvider}/${candidate.model}${candidate.inferenceUsage ? ` returned=${candidate.inferenceUsage.returnedModels.join(",")} calls=${candidate.inferenceUsage.calls} tokens=${candidate.inferenceUsage.totalTokens} costUsd=${candidate.inferenceUsage.costUsd}` : " usage=unmeasured"}` : ""
+	return `${candidate.id}: ${candidate.status}${parent}${mutation}${model}${fitness ? `, score=${fitness.score}, ${fitness.reason}` : ""}${proof}${comparison}${metrics}`
 }
 
 export function formatRunReport(run: RsiRunRecord, config: RsiConfig): string {

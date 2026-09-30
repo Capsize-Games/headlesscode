@@ -3,12 +3,28 @@ import { readFileSync } from "node:fs"
 import { Pool, type PoolClient } from "pg"
 import type { ResourceClass } from "./types.js"
 import { createRsiArtifactStore, type RsiArtifactReference, type RsiArtifactStore } from "./artifact-store.js"
+import type { OpenRouterBrokerGrant, OpenRouterBrokerReceipt, OpenRouterCallReceipt, OpenRouterCallReservation, OpenRouterCallSettlement, OpenRouterInferenceLedger } from "./inference-broker.js"
+import type { OpenRouterBrokerLimits } from "./inference-broker.js"
 
 const MIGRATIONS = [
 	{ version: 1, sql: readFileSync(new URL("./migrations/001_postgres_fleet_queue.sql", import.meta.url), "utf8") },
 	{ version: 2, sql: readFileSync(new URL("./migrations/002_external_artifacts_and_job_leases.sql", import.meta.url), "utf8") },
 	{ version: 3, sql: readFileSync(new URL("./migrations/003_model_training_jobs.sql", import.meta.url), "utf8") },
+	{ version: 4, sql: readFileSync(new URL("./migrations/004_openrouter_inference_broker.sql", import.meta.url), "utf8") },
 ]
+
+function sha256Text(value: string): string { return createHash("sha256").update(value).digest("hex") }
+function usdToMicrosCeiling(value: number): number {
+	const result = Math.ceil(value * 1_000_000)
+	if (!Number.isSafeInteger(result) || result < 0) throw new Error("invalid broker USD amount")
+	return result
+}
+function usdCapToMicros(value: number): number {
+	const result = Math.floor(value * 1_000_000)
+	if (!Number.isSafeInteger(result) || result < 0) throw new Error("invalid broker USD cap")
+	return result
+}
+function microsToUsd(value: unknown): number { return Number(value ?? 0) / 1_000_000 }
 
 export interface FleetQueuePolicy {
 	queueName: string
@@ -60,6 +76,8 @@ export interface FleetJobPayload {
 	snapshotCommit: string
 	task: string
 	model: string
+	provider?: "ollama" | "openrouter"
+	inferenceLimits?: OpenRouterBrokerLimits
 	maxIterations: number
 	timeoutMs: number
 	protectedPaths: string[]
@@ -370,6 +388,167 @@ export class PostgresRsiJobQueue {
 			[lease.job.jobId, lease.workerId, lease.token, this.policy.queueName],
 		)
 		return result.rowCount === 1
+	}
+
+	async register(grant: OpenRouterBrokerGrant): Promise<void> {
+		const campaignMicros = usdCapToMicros(grant.limits.maxCampaignSpendUsd)
+		const jobMicros = usdCapToMicros(grant.limits.maxJobSpendUsd)
+		const capabilityHash = sha256Text(grant.capability)
+		const leaseHash = sha256Text(grant.leaseToken)
+		await inTransaction(this.pool, async (client) => {
+			const leased = await client.query("SELECT 1 FROM headlesscode_rsi_jobs WHERE job_id=$1 AND queue_name=$2 AND status='leased' AND lease_token=$3 AND lease_expires_at > clock_timestamp()", [grant.jobId, this.policy.queueName, grant.leaseToken])
+			if (leased.rowCount !== 1) throw new Error("OpenRouter broker grant is stale or fenced")
+			await client.query(
+				`INSERT INTO headlesscode_rsi_inference_campaigns(campaign_id,provider,model,max_spend_microusd)
+				 VALUES($1,'openrouter',$2,$3) ON CONFLICT(campaign_id) DO NOTHING`,
+				[grant.limits.campaignId, grant.model, campaignMicros],
+			)
+			const campaign = await client.query("SELECT provider,model,max_spend_microusd,blocked FROM headlesscode_rsi_inference_campaigns WHERE campaign_id=$1 FOR UPDATE", [grant.limits.campaignId])
+			const campaignRow = campaign.rows[0]
+			if (!campaignRow || campaignRow.provider !== "openrouter" || campaignRow.model !== grant.model || Number(campaignRow.max_spend_microusd) !== campaignMicros || campaignRow.blocked) throw new Error("OpenRouter campaign already exists with a different model, cap or blocked status")
+			const leaseLock = await client.query("SELECT 1 FROM headlesscode_rsi_jobs WHERE job_id=$1 AND queue_name=$2 AND status='leased' AND lease_token=$3 AND lease_expires_at > clock_timestamp() FOR UPDATE", [grant.jobId, this.policy.queueName, grant.leaseToken])
+			if (leaseLock.rowCount !== 1) throw new Error("OpenRouter broker grant is stale or fenced")
+			const limitsJson = JSON.stringify(grant.limits)
+			await client.query(
+				`INSERT INTO headlesscode_rsi_inference_jobs(job_id,campaign_id,provider,model,limits,lease_token_sha256,capability_sha256,max_spend_microusd,max_calls,max_tokens,max_duration_ms)
+				 VALUES($1,$2,'openrouter',$3,$4::jsonb,$5,$6,$7,$8,$9,$10)
+				 ON CONFLICT(job_id) DO UPDATE SET lease_token_sha256=EXCLUDED.lease_token_sha256, capability_sha256=EXCLUDED.capability_sha256
+				 WHERE headlesscode_rsi_inference_jobs.campaign_id=EXCLUDED.campaign_id
+				 AND headlesscode_rsi_inference_jobs.provider=EXCLUDED.provider
+				 AND headlesscode_rsi_inference_jobs.model=EXCLUDED.model
+				 AND headlesscode_rsi_inference_jobs.limits=EXCLUDED.limits`,
+				[grant.jobId, grant.limits.campaignId, grant.model, limitsJson, leaseHash, capabilityHash, jobMicros, grant.limits.maxCalls, grant.limits.maxTotalTokens, grant.limits.maxDurationMs],
+			)
+			const job = await client.query("SELECT lease_token_sha256,capability_sha256,campaign_id,model,limits FROM headlesscode_rsi_inference_jobs WHERE job_id=$1 FOR UPDATE", [grant.jobId])
+			const row = job.rows[0]
+			if (!row || row.lease_token_sha256 !== leaseHash || row.capability_sha256 !== capabilityHash || row.campaign_id !== grant.limits.campaignId || row.model !== grant.model || stableJson(row.limits) !== stableJson(grant.limits)) throw new Error("OpenRouter job grant conflicts with existing accounting identity")
+		})
+	}
+
+	async reserve(grant: OpenRouterBrokerGrant, reservation: OpenRouterCallReservation): Promise<void> {
+		const reserveMicros = usdToMicrosCeiling(reservation.reservedUsd)
+		const capabilityHash = sha256Text(grant.capability)
+		const leaseHash = sha256Text(grant.leaseToken)
+		await inTransaction(this.pool, async (client) => {
+			const rowResult = await client.query("SELECT campaign_id FROM headlesscode_rsi_inference_jobs WHERE job_id=$1", [grant.jobId])
+			const campaignId = rowResult.rows[0]?.campaign_id
+			if (campaignId !== grant.limits.campaignId) throw new Error("OpenRouter job grant is not registered")
+			const campaign = await client.query("SELECT * FROM headlesscode_rsi_inference_campaigns WHERE campaign_id=$1 FOR UPDATE", [campaignId])
+			const jobResult = await client.query(
+				`SELECT inference.*, jobs.status AS queue_status,jobs.lease_token AS current_lease_token,jobs.lease_expires_at,
+				 jobs.lease_expires_at > clock_timestamp() AS lease_valid
+				 FROM headlesscode_rsi_inference_jobs AS inference JOIN headlesscode_rsi_jobs AS jobs USING(job_id)
+				 WHERE inference.job_id=$1 AND jobs.queue_name=$2 FOR UPDATE OF inference,jobs`, [grant.jobId, this.policy.queueName],
+			)
+			const job = jobResult.rows[0]
+			const camp = campaign.rows[0]
+			if (!job || !camp || job.queue_status !== "leased" || job.current_lease_token !== grant.leaseToken || job.lease_valid !== true || job.lease_token_sha256 !== leaseHash || job.capability_sha256 !== capabilityHash || job.blocked || camp.blocked) throw new Error("OpenRouter request denied: lease is stale, fenced, expired or blocked")
+			if (Date.now() - new Date(String(job.started_at)).getTime() > grant.limits.maxDurationMs) throw new Error("OpenRouter job duration limit exhausted")
+			if (await client.query("SELECT 1 FROM headlesscode_rsi_inference_calls WHERE job_id=$1 AND call_id=$2", [grant.jobId, reservation.callId]).then((value) => value.rowCount)) throw new Error("duplicate OpenRouter call id is rejected; ambiguous retries are not replayed")
+			const campaignUsed = Number(camp.spent_microusd) + Number(camp.reserved_spend_microusd)
+			const jobUsed = Number(job.spent_microusd) + Number(job.reserved_spend_microusd)
+			if (Number(job.call_count) >= grant.limits.maxCalls) throw new Error("OpenRouter job call ceiling exhausted")
+			if (Number(job.reserved_tokens) + Number(job.used_tokens) + reservation.reservedTokens > grant.limits.maxTotalTokens) throw new Error("OpenRouter job token ceiling exhausted")
+			if (jobUsed + reserveMicros > Number(job.max_spend_microusd)) throw new Error("OpenRouter job spend ceiling exhausted")
+			if (campaignUsed + reserveMicros > Number(camp.max_spend_microusd)) throw new Error("OpenRouter campaign spend ceiling exhausted")
+			await client.query(
+				`INSERT INTO headlesscode_rsi_inference_calls(job_id,call_id,capability_sha256,request_sha256,state,reserved_spend_microusd,reserved_tokens,started_at)
+				 VALUES($1,$2,$3,$4,'reserved',$5,$6,$7)`,
+				[grant.jobId, reservation.callId, capabilityHash, reservation.requestSha256, reserveMicros, reservation.reservedTokens, reservation.startedAt],
+			)
+			await client.query("UPDATE headlesscode_rsi_inference_jobs SET reserved_spend_microusd=reserved_spend_microusd+$2, reserved_tokens=reserved_tokens+$3, call_count=call_count+1 WHERE job_id=$1", [grant.jobId, reserveMicros, reservation.reservedTokens])
+			await client.query("UPDATE headlesscode_rsi_inference_campaigns SET reserved_spend_microusd=reserved_spend_microusd+$2 WHERE campaign_id=$1", [campaignId, reserveMicros])
+		})
+	}
+
+	async settle(grant: OpenRouterBrokerGrant, settlement: OpenRouterCallSettlement & { callId: string }): Promise<void> {
+		const capabilityHash = sha256Text(grant.capability)
+		await inTransaction(this.pool, async (client) => {
+			const lookup = await client.query("SELECT campaign_id FROM headlesscode_rsi_inference_jobs WHERE job_id=$1", [grant.jobId])
+			const campaignId = lookup.rows[0]?.campaign_id
+			if (!campaignId) throw new Error("OpenRouter job accounting record is missing")
+			await client.query("SELECT 1 FROM headlesscode_rsi_inference_campaigns WHERE campaign_id=$1 FOR UPDATE", [campaignId])
+			const jobResult = await client.query(
+				`SELECT inference.*, jobs.status AS queue_status,jobs.lease_token AS current_lease_token,jobs.lease_expires_at,
+				 jobs.lease_expires_at > clock_timestamp() AS lease_valid
+				 FROM headlesscode_rsi_inference_jobs AS inference JOIN headlesscode_rsi_jobs AS jobs USING(job_id)
+				 WHERE inference.job_id=$1 AND jobs.queue_name=$2 FOR UPDATE OF inference,jobs`, [grant.jobId, this.policy.queueName],
+			)
+			const job = jobResult.rows[0]
+			const callResult = await client.query("SELECT * FROM headlesscode_rsi_inference_calls WHERE job_id=$1 AND call_id=$2 FOR UPDATE", [grant.jobId, settlement.callId])
+			const call = callResult.rows[0]
+			if (!job || !call || call.capability_sha256 !== capabilityHash || call.state !== "reserved") throw new Error("OpenRouter settlement does not match a pending broker call")
+			if (settlement.state !== "complete" || settlement.promptTokens === undefined || settlement.completionTokens === undefined || settlement.costUsd === undefined || settlement.returnedModel === undefined || !settlement.responseSha256) {
+				await client.query("UPDATE headlesscode_rsi_inference_calls SET state='unmeasured',completed_at=$3 WHERE job_id=$1 AND call_id=$2", [grant.jobId, settlement.callId, settlement.completedAt])
+				await client.query("UPDATE headlesscode_rsi_inference_jobs SET blocked=true WHERE job_id=$1", [grant.jobId])
+				return
+			}
+			const costMicros = usdToMicrosCeiling(settlement.costUsd)
+			const actualTokens = settlement.promptTokens + settlement.completionTokens
+			const currentLease = job.queue_status === "leased" && job.current_lease_token === grant.leaseToken && job.lease_valid === true
+			const overLimit = settlement.qualified === false || costMicros > Number(call.reserved_spend_microusd) || costMicros > usdCapToMicros(grant.limits.maxCallSpendUsd)
+				|| settlement.promptTokens > grant.limits.maxInputTokensPerCall || settlement.completionTokens > grant.limits.maxOutputTokensPerCall
+				|| actualTokens > Number(call.reserved_tokens) || settlement.returnedModel !== grant.model || !currentLease
+			await client.query(
+				`UPDATE headlesscode_rsi_inference_calls SET state='complete',actual_spend_microusd=$3,prompt_tokens=$4,completion_tokens=$5,
+				 returned_model=$6,provider_request_id=$7,response_sha256=$8,completed_at=$9,qualified=$10 WHERE job_id=$1 AND call_id=$2`,
+				[grant.jobId, settlement.callId, costMicros, settlement.promptTokens, settlement.completionTokens, settlement.returnedModel, settlement.providerRequestId ?? null, settlement.responseSha256, settlement.completedAt, !overLimit],
+			)
+			await client.query(
+				`UPDATE headlesscode_rsi_inference_jobs SET reserved_spend_microusd=reserved_spend_microusd-$2,spent_microusd=spent_microusd+$3,
+				 reserved_tokens=reserved_tokens-$4,used_tokens=used_tokens+$5,blocked=blocked OR $6 WHERE job_id=$1`,
+				[grant.jobId, Number(call.reserved_spend_microusd), costMicros, Number(call.reserved_tokens), actualTokens, overLimit],
+			)
+			await client.query(
+				`UPDATE headlesscode_rsi_inference_campaigns SET reserved_spend_microusd=reserved_spend_microusd-$2,spent_microusd=spent_microusd+$3,
+				 blocked=blocked OR spent_microusd+$3 > max_spend_microusd WHERE campaign_id=$1`,
+				[campaignId, Number(call.reserved_spend_microusd), costMicros],
+			)
+		})
+	}
+
+	async receipt(grant: OpenRouterBrokerGrant): Promise<OpenRouterBrokerReceipt> {
+		const [jobResult, callResult, campaignResult] = await Promise.all([
+			this.pool.query(`SELECT inference.*, jobs.status AS queue_status,jobs.lease_token AS current_lease_token,
+				jobs.lease_expires_at > clock_timestamp() AS lease_valid
+				FROM headlesscode_rsi_inference_jobs AS inference JOIN headlesscode_rsi_jobs AS jobs USING(job_id)
+				WHERE inference.job_id=$1 AND jobs.queue_name=$2`, [grant.jobId, this.policy.queueName]),
+			this.pool.query("SELECT * FROM headlesscode_rsi_inference_calls WHERE job_id=$1 ORDER BY started_at,call_id", [grant.jobId]),
+			this.pool.query("SELECT blocked FROM headlesscode_rsi_inference_campaigns WHERE campaign_id=$1", [grant.limits.campaignId]),
+		])
+		const job = jobResult.rows[0]
+		if (!job) throw new Error("OpenRouter broker receipt is missing its job record")
+		const calls: OpenRouterCallReceipt[] = callResult.rows.map((row) => ({
+			jobId: grant.jobId, campaignId: String(job.campaign_id), model: grant.model,
+			callId: String(row.call_id), requestSha256: String(row.request_sha256), reservedUsd: microsToUsd(row.reserved_spend_microusd),
+			reservedTokens: Number(row.reserved_tokens), startedAt: new Date(String(row.started_at)).toISOString(),
+			state: row.state as OpenRouterCallSettlement["state"],
+			...(row.returned_model ? { returnedModel: String(row.returned_model) } : {}),
+			...(row.provider_request_id ? { providerRequestId: String(row.provider_request_id) } : {}),
+			...(row.prompt_tokens !== null ? { promptTokens: Number(row.prompt_tokens) } : {}),
+			...(row.completion_tokens !== null ? { completionTokens: Number(row.completion_tokens) } : {}),
+			...(row.actual_spend_microusd !== null ? { costUsd: microsToUsd(row.actual_spend_microusd) } : {}),
+			...(row.response_sha256 ? { responseSha256: String(row.response_sha256) } : {}),
+			...(row.completed_at ? { completedAt: new Date(String(row.completed_at)).toISOString() } : {}),
+			authoritative: row.state === "complete" && row.qualified === true && row.returned_model === grant.model && row.prompt_tokens !== null && row.completion_tokens !== null && row.actual_spend_microusd !== null,
+		}))
+		const allMeasured = calls.length > 0 && calls.every((call) => call.authoritative)
+		const promptTokens = allMeasured ? calls.reduce((sum, call) => sum + (call.promptTokens ?? 0), 0) : null
+		const completionTokens = allMeasured ? calls.reduce((sum, call) => sum + (call.completionTokens ?? 0), 0) : null
+		const costUsd = allMeasured ? calls.reduce((sum, call) => sum + (call.costUsd ?? 0), 0) : null
+		const grantMatches = job.lease_token_sha256 === sha256Text(grant.leaseToken) && job.capability_sha256 === sha256Text(grant.capability)
+		const currentLease = (job.queue_status === "leased" && job.current_lease_token === grant.leaseToken && job.lease_valid === true)
+			|| (job.queue_status === "completed" && grantMatches)
+		const withinLimits = Number(job.call_count) <= grant.limits.maxCalls && Number(job.used_tokens) <= grant.limits.maxTotalTokens
+			&& Number(job.spent_microusd) <= Number(job.max_spend_microusd) && Number(job.reserved_spend_microusd) === 0
+			&& Number(job.reserved_tokens) === 0 && !job.blocked && campaignResult.rows[0]?.blocked !== true && currentLease && grantMatches
+		return {
+			provider: "openrouter", jobId: grant.jobId, campaignId: String(job.campaign_id), model: grant.model,
+			returnedModels: [...new Set(calls.map((call) => call.returnedModel).filter((model): model is string => Boolean(model)))],
+			calls: calls.length, promptTokens, completionTokens,
+			totalTokens: promptTokens === null || completionTokens === null ? null : promptTokens + completionTokens,
+			costUsd, accounting: allMeasured && withinLimits ? "supervisor-enforced" : "incomplete", qualified: allMeasured && withinLimits, callReceipts: calls,
+		}
 	}
 
 	async complete(lease: FleetJobLease, resultValue: unknown): Promise<QueueMutationResult> {

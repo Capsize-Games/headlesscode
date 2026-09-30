@@ -155,6 +155,23 @@ try {
 	await assert.rejects(runBenchmark({ loaded, agent: malformedResourceAgent, verifier, harnessCommit, modelId: "fake-malformed-error-resources", split: "development", outputRoot: malformedResourceRoot, taskIds: ["multi-01"] }), /invalid or over-limit resource observations/)
 	assert.deepEqual(await fs.readdir(path.join(malformedResourceRoot, "attempts")).catch(() => []), [], "invalid counters on a failed agent result must not become a scored attempt")
 
+	const forgedReceiptRoot = path.join(tempRoot, "forged-inference-receipt")
+	const forgedReceiptAgent: BenchmarkAgent = {
+		provider: "openshell-openrouter",
+		async run(request) {
+			return {
+				validity: "agent-error", stdout: "", stderr: "", calls: 1, tokens: 10, wallTimeMs: 1, stopReason: "fake",
+				inferenceReceipt: {
+					provider: "openrouter", jobId: request.attemptId, campaignId: request.campaignId, model: "deepseek/deepseek-v4-flash-0731",
+					returnedModels: ["deepseek/deepseek-v4-flash-0731"], calls: 1, promptTokens: 5, completionTokens: 5, totalTokens: 10,
+					costUsd: 0.001, accounting: "supervisor-enforced", qualified: true, callReceipts: [],
+				},
+			}
+		},
+	}
+	await assert.rejects(runBenchmark({ loaded, agent: forgedReceiptAgent, verifier, harnessCommit, modelId: "deepseek/deepseek-v4-flash-0731", split: "development", outputRoot: forgedReceiptRoot, taskIds: ["multi-01"] }), /not present in the trusted supervisor ledger/)
+	assert.deepEqual(await fs.readdir(path.join(forgedReceiptRoot, "attempts")).catch(() => []), [], "a forged first-run receipt cannot mint a proof-qualified attempt")
+
 	const identityRoot = path.join(tempRoot, "image-identity")
 	const actualHarnessCommit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim()
 	let imageIdentityReads = 0

@@ -5,6 +5,7 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 import { OpenShellBenchmarkAgent, OpenShellBenchmarkVerifier } from "../openshell-agent.js"
+import { startOpenRouterBroker, RSI_OPENROUTER_MODEL } from "../../inference-broker.js"
 import type { BenchmarkAgentRequest, BenchmarkTask } from "../types.js"
 import type { RsiOpenShellProviderFactory } from "../../openshell.js"
 
@@ -12,6 +13,14 @@ const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "rsi-openshell-integrat
 const originalPath = process.env.PATH
 const originalHome = process.env.HOME
 const originalHarnessCommit = process.env.HEADLESSCODE_RSI_BENCHMARK_HARNESS_COMMIT
+const brokerEnvNames = [
+	"HEADLESSCODE_OPENROUTER_API_KEY", "HEADLESSCODE_RSI_BROKER_BIND_HOST",
+	"HEADLESSCODE_RSI_OPENROUTER_MAX_INPUT_TOKENS_PER_CALL",
+	"HEADLESSCODE_RSI_OPENROUTER_MAX_INPUT_PRICE_PER_MILLION_USD", "HEADLESSCODE_RSI_OPENROUTER_MAX_OUTPUT_PRICE_PER_MILLION_USD",
+	"HEADLESSCODE_RSI_OPENROUTER_MAX_CALL_SPEND_USD", "HEADLESSCODE_RSI_OPENROUTER_MAX_JOB_SPEND_USD", "HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD",
+	"HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD", "HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD",
+] as const
+const originalBrokerEnv = Object.fromEntries(brokerEnvNames.map((name) => [name, process.env[name]]))
 try {
 	const emptyHome = path.join(tempRoot, "empty-home")
 	await fs.mkdir(emptyHome)
@@ -22,6 +31,16 @@ try {
 	await fs.writeFile(fakeDocker, "#!/bin/sh\nif [ \"$1\" = image ]; then printf '%s\\n' \"$RSI_TEST_IMAGE_DIGEST\"; elif [ \"$1\" = run ]; then printf '%s\\n' \"$RSI_TEST_HARNESS_COMMIT\"; else exit 2; fi\n", { mode: 0o755 })
 	process.env.PATH = `${fakeBin}:${originalPath ?? "/usr/bin:/bin"}`
 	process.env.RSI_TEST_IMAGE_DIGEST = `sha256:${"d".repeat(64)}`
+	process.env.HEADLESSCODE_OPENROUTER_API_KEY = "host-test-key-never-forwarded-to-guest"
+	process.env.HEADLESSCODE_RSI_BROKER_BIND_HOST = "127.0.0.1"
+	process.env.HEADLESSCODE_RSI_OPENROUTER_MAX_INPUT_TOKENS_PER_CALL = "512"
+	process.env.HEADLESSCODE_RSI_OPENROUTER_MAX_INPUT_PRICE_PER_MILLION_USD = "1"
+	process.env.HEADLESSCODE_RSI_OPENROUTER_MAX_OUTPUT_PRICE_PER_MILLION_USD = "1"
+	process.env.HEADLESSCODE_RSI_OPENROUTER_MAX_CALL_SPEND_USD = "0.01"
+	process.env.HEADLESSCODE_RSI_OPENROUTER_MAX_JOB_SPEND_USD = "0.04"
+	process.env.HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD = "0.10"
+	process.env.HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD = "0.04"
+	process.env.HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD = "0.04"
 
 	const harnessRoot = path.join(tempRoot, "harness")
 	await fs.mkdir(path.join(harnessRoot, "src"), { recursive: true })
@@ -65,9 +84,16 @@ try {
 	let codingSnapshot = ""
 	let verifierSnapshot = ""
 	let phase: "agent" | "verifier" = "agent"
-	const providerFactory: RsiOpenShellProviderFactory = () => ({
+	let guestEnvironment: Record<string, string> = {}
+	let brokerBaseUrl = ""
+	let upstreamCalls = 0
+	let guestNetworkPolicy: Record<string, unknown> = {}
+	const providerFactory: RsiOpenShellProviderFactory = (options) => {
+		guestNetworkPolicy = options.networkPolicy ?? {}
+		return ({
 		async spawnExistingWorktreeSession(request, snapshot) {
 			if (phase === "agent") {
+				guestEnvironment = request.env ?? {}
 				codingSnapshot = snapshot
 				events.push("agent-spawn")
 				assert.equal(await fs.stat(path.join(snapshot, "src", "app.js")).then(() => true), true)
@@ -88,6 +114,21 @@ try {
 			if (phase === "agent") {
 				events.push("agent-command")
 				assert.equal(command.split("/opt/headlesscode/src/cli.ts").length - 1, 1, "coding worker command should execute once")
+				assert.equal(guestEnvironment.HEADLESSCODE_RSI_INFERENCE_CAPABILITY, lastCapability)
+				assert.equal(guestEnvironment.HEADLESSCODE_OPENROUTER_API_KEY, undefined, "raw provider credential must stay on the supervisor")
+				assert.equal(guestEnvironment.OPENROUTER_API_KEY, undefined)
+				assert.match(guestEnvironment.OPENROUTER_BASE_URL ?? "", /^http:\/\/host\.openshell\.internal:\d+$/)
+				const brokerRule = guestNetworkPolicy.rsi_openrouter_broker as { endpoints?: Array<{ host?: string; port?: number; protocol?: string }> } | undefined
+				assert.deepEqual(brokerRule?.endpoints, [{ host: "host.openshell.internal", port: Number(new URL(brokerBaseUrl).port), protocol: "tcp" }])
+				assert.equal(JSON.stringify(guestNetworkPolicy).includes("example.com"), false, "guest network policy must not grant arbitrary external access")
+				const brokerCall = await fetch(`${brokerBaseUrl}/api/v1/chat/completions`, {
+					method: "POST", headers: { authorization: `Bearer ${guestEnvironment.HEADLESSCODE_RSI_INFERENCE_CAPABILITY}`, "content-type": "application/json", "x-rsi-call-id": "openshell-mock-call-001" },
+					body: JSON.stringify({ model: RSI_OPENROUTER_MODEL, messages: [{ role: "user", content: "Return a small change." }], max_completion_tokens: 8 }),
+				})
+				assert.equal(brokerCall.status, 200)
+				const rejectedRoute = await fetch(`${brokerBaseUrl}/v1/admin`, { headers: { authorization: `Bearer ${guestEnvironment.HEADLESSCODE_RSI_INFERENCE_CAPABILITY}` } })
+				assert.equal(rejectedRoute.status, 404, "broker capability cannot be used as an arbitrary proxy")
+				upstreamCalls += 1
 				await fs.writeFile(path.join(codingSnapshot, "src", "app.js"), "export const answer = 2\n")
 				git(codingSnapshot, ["config", "user.name", "RSI Test"])
 				git(codingSnapshot, ["config", "user.email", "rsi-test@invalid.example"])
@@ -100,16 +141,37 @@ try {
 			return { exitCode: 0, output: "verifier passed\nRSI_BENCHMARK_VERIFIER_COMPLETED:0\n" }
 		},
 		async teardown() { events.push(phase === "agent" ? "agent-teardown" : "verifier-teardown") },
-	})
+		})
+	}
 
 	const request: BenchmarkAgentRequest = {
-		taskId: task.id, task: task.task, seed: task.seed, workspace: taskWorkspace, harnessCommit,
-		model: { provider: "openshell-ollama", id: "fake-model", sampling: {} }, ceilings: task.ceilings,
+		taskId: task.id, attemptId: `attempt-${task.id}`, campaignId: "campaign-test", brokerLedgerPath: path.join(tempRoot, "inference-ledger.json"), task: task.task, seed: task.seed, workspace: taskWorkspace, harnessCommit,
+		model: { provider: "openshell-openrouter", id: RSI_OPENROUTER_MODEL, sampling: {} }, ceilings: task.ceilings,
 	}
-	const agent = new OpenShellBenchmarkAgent(harnessRoot, providerFactory, "headlesscode-openshell-rsi:local", harnessCommit)
+	let lastCapability = ""
+	const brokerFactory = async (options: Parameters<typeof startOpenRouterBroker>[0]) => {
+		const broker = await startOpenRouterBroker({ ...options, upstreamFetch: async (input, init) => {
+			const url = String(input)
+			if (url.endsWith(`/models/${RSI_OPENROUTER_MODEL}/endpoints`)) return new Response(JSON.stringify({ data: { endpoints: [{ provider_slug: "deepseek", pricing: { prompt: "0.000001", completion: "0.000001" } }] } }), { status: 200, headers: { "content-type": "application/json" } })
+			assert.equal(url, "https://openrouter.ai/api/v1/chat/completions")
+			assert.equal(new Headers(init?.headers).get("authorization"), "Bearer host-test-key-never-forwarded-to-guest")
+			return new Response(JSON.stringify({ id: "mock-provider-response", model: RSI_OPENROUTER_MODEL, choices: [{ message: { role: "assistant", content: "done" } }], usage: { prompt_tokens: 12, completion_tokens: 4, cost: 0.000016 } }), { status: 200, headers: { "content-type": "application/json" } })
+		} })
+		brokerBaseUrl = broker.localBaseUrl
+		lastCapability = broker.capability
+		return broker
+	}
+	const agent = new OpenShellBenchmarkAgent(harnessRoot, providerFactory, "headlesscode-openshell-rsi:local", harnessCommit, undefined, "openshell-openrouter", brokerFactory)
 	const agentResult = await agent.run(request)
 	assert.equal(agentResult.validity, "valid")
 	assert.ok(agentResult.patch)
+	assert.equal(upstreamCalls, 1, "the guest path must complete one brokered provider request")
+	assert.equal(agentResult.inferenceReceipt?.qualified, true)
+	assert.equal(agentResult.inferenceReceipt?.calls, 1)
+	assert.equal(agentResult.inferenceReceipt?.totalTokens, 16)
+	const archivedOutput = [agentResult.stdout, agentResult.stderr, agentResult.patch?.toString("utf8") ?? ""].join("\n")
+	assert.equal(archivedOutput.includes("host-test-key-never-forwarded-to-guest"), false, "provider credential must not appear in guest output or imported patch")
+	assert.equal(archivedOutput.includes("Return a small change."), false, "prompt contents must not appear in guest output or imported patch")
 	assert.equal(events.includes("agent-teardown"), true)
 	await fs.rm(codingSnapshot, { recursive: true, force: true })
 	// Apply only the result returned by the coding adapter to the task repository.
@@ -132,5 +194,10 @@ try {
 	else process.env.HEADLESSCODE_RSI_BENCHMARK_HARNESS_COMMIT = originalHarnessCommit
 	delete process.env.RSI_TEST_IMAGE_DIGEST
 	delete process.env.RSI_TEST_HARNESS_COMMIT
+	for (const name of brokerEnvNames) {
+		const value = originalBrokerEnv[name]
+		if (value === undefined) delete process.env[name]
+		else process.env[name] = value
+	}
 	await fs.rm(tempRoot, { recursive: true, force: true })
 }
