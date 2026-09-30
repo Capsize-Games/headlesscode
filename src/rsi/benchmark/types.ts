@@ -82,9 +82,9 @@ export interface BenchmarkAttempt {
 	startDigest: string
 	ceilings: BenchmarkResourceCeilings
 	verifiedSuccess: boolean
-	/** Candidate behavior was verified; aggregate token enforcement remains unsupported on the local provider. */
-	proofQualified: false
-	resourceAccounting: "guest-reported" | "incomplete"
+	/** True only when a trusted supervisor boundary enforced all requested resource ceilings. */
+	proofQualified: boolean
+	resourceAccounting: "guest-reported" | "supervisor-enforced" | "incomplete"
 	validity: BenchmarkAgentResult["validity"]
 	calls: number | null
 	tokens: number | null

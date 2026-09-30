@@ -12,9 +12,9 @@ const EVALUATION_PREVIEW_CHARS = 2048
 
 export async function externalizeEvaluationOutputs(
 	queue: PostgresRsiJobQueue,
-	evaluation: Pick<EvaluationSummary, "regression" | "visible">,
-): Promise<{ evaluation: Pick<EvaluationSummary, "regression" | "visible">; outputArtifact: { sha256: string; bytes: number } }> {
-	const trials = [evaluation.regression, ...evaluation.visible]
+	evaluation: Pick<EvaluationSummary, "regression" | "typecheck" | "visible">,
+): Promise<{ evaluation: Pick<EvaluationSummary, "regression" | "typecheck" | "visible">; outputArtifact: { sha256: string; bytes: number } }> {
+	const trials = [evaluation.regression, ...(evaluation.typecheck ? [evaluation.typecheck] : []), ...evaluation.visible]
 	const rawOutputs = Buffer.from(JSON.stringify(trials.map((trial) => ({
 		command: trial.command,
 		stdout: trial.stdout,
@@ -30,7 +30,7 @@ export async function externalizeEvaluationOutputs(
 		outputArtifactBytes: artifact.byteLength,
 	})
 	return {
-		evaluation: { regression: compact(evaluation.regression), visible: evaluation.visible.map(compact) },
+		evaluation: { regression: compact(evaluation.regression), ...(evaluation.typecheck ? { typecheck: compact(evaluation.typecheck) } : {}), visible: evaluation.visible.map(compact) },
 		outputArtifact: { sha256: artifact.sha256, bytes: artifact.byteLength },
 	}
 }

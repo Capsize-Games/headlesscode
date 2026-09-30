@@ -24,7 +24,7 @@ function candidate(id: string, vector: MetricVector, score: number): CandidateRe
 		components: { regression: 1, visible: vector.generalization, hidden: vector.hidden, efficiency: vector.efficiency, recovery: vector.recovery },
 		metrics: vector,
 		complexity: { diffLines: 10, changedFiles: 1, newDependencies: 0, additionalModelCalls: 0, runtimeOverheadMs: 0 },
-		hardGates: { regressionPass: true, visibleEvalPass: true, hiddenEvalPass: true, adversarialPass: true, noProtectedPathViolation: true, completed: true, noCrash: true, committed: true },
+		hardGates: { regressionPass: true, typecheckPass: true, visibleEvalPass: true, hiddenEvalPass: true, adversarialPass: true, noProtectedPathViolation: true, completed: true, noCrash: true, committed: true },
 		reason: "all hard gates passed",
 	}
 	return {
@@ -43,6 +43,7 @@ function candidate(id: string, vector: MetricVector, score: number): CandidateRe
 		changedFiles: ["src/engine/loop.ts"],
 		protectedPathViolations: [],
 		fitness,
+		developmentProof: { accepted: true } as NonNullable<CandidateRecord["developmentProof"]>,
 		pairedComparison: { baselinePasses: 1, candidatePasses: 1, trialCount: 1, baselineDurationMs: 100, candidateDurationMs: 50, durationRatio: 0.5, improved: true, reason: "test fixture" },
 	}
 }
@@ -75,6 +76,12 @@ function testRejectedAndIncompleteCandidatesCannotBecomeParents(): void {
 	assert.ok(choices.every((entry) => entry.candidateId === "accepted"))
 }
 
+function testArchiveCandidatesWithoutCurrentDevelopmentProofAreIneligible(): void {
+	const legacy = candidate("legacy", metrics({ correctness: 1 }), 100)
+	delete legacy.developmentProof
+	assert.deepEqual(selectParentChoices(archive([legacy]), "all-eligible", 1), [])
+}
+
 function testJobsAreResourceTaggedAndMonotonic(): void {
 	const job = newExperimentJob("mutation", { class: "LOCAL_GPU", units: 1, concurrencyKey: "ollama" }, "now", "a")
 	const running = transitionJob(job, "running", "later")
@@ -87,5 +94,6 @@ function testJobsAreResourceTaggedAndMonotonic(): void {
 testParetoFrontRetainsTradeoffs()
 testParentPolicyRecordsReasons()
 testRejectedAndIncompleteCandidatesCannotBecomeParents()
+testArchiveCandidatesWithoutCurrentDevelopmentProofAreIneligible()
 testJobsAreResourceTaggedAndMonotonic()
 console.log("All 3 RSI selection tests passed")

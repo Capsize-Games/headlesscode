@@ -162,7 +162,7 @@ try {
 	try {
 		await assert.rejects(runBenchmark({
 			loaded, agent: new OpenShellBenchmarkAgent(), verifier, harnessCommit: actualHarnessCommit, agentImageIdentity: { name: "headlesscode-openshell-rsi:local", digest: `sha256:${"c".repeat(64)}`, harnessCommit: actualHarnessCommit }, modelId: "fake-image-identity", split: "development", outputRoot: identityRoot, taskIds: ["multi-01"],
-		}), /must identify the harness commit baked into the OpenShell image/)
+		}), /does not match requested commit/)
 		assert.deepEqual(await fs.readdir(path.join(identityRoot, "attempts")).catch(() => []), [], "wrong image identity must abort without a scored attempt")
 	} finally {
 		if (savedImageIdentity === undefined) delete process.env.HEADLESSCODE_RSI_BENCHMARK_HARNESS_COMMIT

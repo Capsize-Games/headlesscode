@@ -38,7 +38,7 @@ try {
 	initRepo(harnessRoot)
 	const harnessCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: harnessRoot, encoding: "utf8" }).trim()
 	process.env.RSI_TEST_HARNESS_COMMIT = harnessCommit
-	process.env.HEADLESSCODE_RSI_BENCHMARK_HARNESS_COMMIT = harnessCommit
+	delete process.env.HEADLESSCODE_RSI_BENCHMARK_HARNESS_COMMIT
 
 	const taskWorkspace = path.join(tempRoot, "task")
 	await fs.mkdir(path.join(taskWorkspace, "src"), { recursive: true })
@@ -106,7 +106,7 @@ try {
 		taskId: task.id, task: task.task, seed: task.seed, workspace: taskWorkspace, harnessCommit,
 		model: { provider: "openshell-ollama", id: "fake-model", sampling: {} }, ceilings: task.ceilings,
 	}
-	const agent = new OpenShellBenchmarkAgent(harnessRoot, providerFactory)
+	const agent = new OpenShellBenchmarkAgent(harnessRoot, providerFactory, "headlesscode-openshell-rsi:local", harnessCommit)
 	const agentResult = await agent.run(request)
 	assert.equal(agentResult.validity, "valid")
 	assert.ok(agentResult.patch)

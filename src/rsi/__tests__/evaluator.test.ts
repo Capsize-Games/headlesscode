@@ -44,9 +44,12 @@ async function main(): Promise<void> {
 		const summary = await evaluateCandidate(config, repo, base, runner)
 		assert.equal(summary.hidden.length, 0)
 		assert.equal(calls[0].command, "npm test")
-		assert.equal(calls[1].command, "visible-check")
+		assert.equal(calls[1].command, "npm run typecheck")
+		assert.equal(calls[2].command, "visible-check")
 		assert.equal(calls[0].cwd, repo)
 		assert.equal(calls[1].cwd, repo)
+		assert.equal(calls[2].cwd, repo)
+		assert.equal(summary.typecheck?.ok, true)
 		await assert.rejects(evaluateCandidate({ ...config, hiddenEvalCommands: ["./scripts/eval-suite/hidden.sh"] }, repo, base, runner), /hidden evaluations require a supervisor-only evaluator service/)
 	} finally {
 		await fs.rm(repo, { recursive: true, force: true })

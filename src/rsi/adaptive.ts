@@ -17,7 +17,7 @@ export function decideAdaptiveContinuation(input: {
 	const evidence = generationCandidates.map((candidate) => ({
 		candidateId: candidate.id,
 		status: candidate.status,
-		...(candidate.fitness
+		...(candidate.fitness?.metrics.generalization !== null && candidate.fitness
 			? { visiblePassRate: candidate.fitness.metrics.generalization }
 			: {}),
 	}))

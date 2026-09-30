@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process"
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
+import { fileURLToPath } from "node:url"
 import { appendRun, checkpointRun, findActiveRun, readArchive } from "./archive.js"
 import { parseRsiArgs, rsiHelp } from "./config.js"
 import { generateCurriculumProposals, validateCurriculumProposals, writeCurriculumProposals } from "./curriculum.js"
@@ -29,6 +30,12 @@ import {
 	removeCandidateWorktree,
 	resolveBaseCommit,
 } from "./workspace.js"
+import { loadBenchmark } from "./benchmark/runner.js"
+import { candidateProofDecision, compareDevelopmentAttempts, developmentCells, freezeDevelopmentProofProtocol } from "./development-proof.js"
+import type { DevelopmentTaskCell } from "./development-proof.js"
+import type { BenchmarkAttempt } from "./benchmark/types.js"
+import type { BenchmarkManifest } from "./benchmark/types.js"
+import { runDevelopmentBenchmarkForCommit } from "./development-benchmark.js"
 
 function log(hooks: RsiHooks, line: string): void {
 	(hooks.log ?? ((message) => process.stdout.write(`${message}\n`)))(line)
@@ -36,6 +43,27 @@ function log(hooks: RsiHooks, line: string): void {
 
 function isTerminal(candidate: CandidateRecord): boolean {
 	return candidate.status === "accepted" || candidate.status === "rejected" || candidate.status === "failed"
+}
+
+class CandidateLineageError extends Error {}
+
+function validateCandidateParent(candidate: CandidateRecord, run: RsiRunRecord, config: RsiConfig, protocol: NonNullable<RsiRunRecord["developmentProofProtocol"]>): void {
+	if (candidate.parent === "baseline") {
+		if (candidate.baseCommit !== run.baseCommit || candidate.parentCommit !== run.baseCommit) throw new CandidateLineageError("baseline child does not use the frozen run base commit")
+		return
+	}
+	const parent = run.candidates.find((entry) => entry.id === candidate.parent)
+	if (!parent || parent.status !== "accepted" || parent.developmentProof?.accepted !== true || parent.developmentProof.runId !== run.runId || parent.developmentProof.protocolDigest !== protocol.protocolDigest || !parent.fitness || Object.values(parent.fitness.hardGates).some((passed) => passed === false)) {
+		throw new CandidateLineageError(`candidate parent ${candidate.parent} is missing, rejected, from another run/protocol, or fails hard gates`)
+	}
+	const parentCommit = parent.commits[0]
+	if (!parentCommit || candidate.baseCommit !== parentCommit || candidate.parentCommit !== parentCommit) throw new CandidateLineageError(`candidate parent ${candidate.parent} commit does not match its mutation base`)
+	try {
+		execFileSync("git", ["merge-base", "--is-ancestor", run.baseCommit, parentCommit], { cwd: config.repoRoot, stdio: "ignore" })
+	} catch { throw new CandidateLineageError(`candidate parent ${candidate.parent} is outside the frozen run base lineage`) }
+	const inheritedPaths = execFileSync("git", ["diff", "--name-only", "-z", "--no-renames", run.baseCommit, parentCommit], { cwd: config.repoRoot, encoding: "buffer" }) as Buffer
+	const violations = protectedPathViolations(inheritedPaths.toString("utf8").split("\0").filter(Boolean), config.protectedPaths)
+	if (violations.length > 0) throw new CandidateLineageError(`candidate parent ${candidate.parent} inherits protected path changes: ${violations.join(", ")}`)
 }
 
 function replaceJob(run: RsiRunRecord, job: ExperimentJob): void {
@@ -70,6 +98,7 @@ function initialRun(config: RsiConfig, baseCommit: string, now: string): RsiRunR
 		adversarialReviews: [],
 		candidates: [],
 		reports: [],
+		confirmationEvidence: "unmeasured",
 	}
 }
 
@@ -106,10 +135,10 @@ function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: {
 	}
 }
 
-function fleetEvaluationResult(value: unknown): { regression: TrialResult; visible: TrialResult[] } {
+function fleetEvaluationResult(value: unknown): { regression: TrialResult; typecheck: TrialResult; visible: TrialResult[] } {
 	if (!value || typeof value !== "object") throw new Error("fleet evaluation result is malformed")
 	const result = value as {
-		evaluation?: { regression?: unknown; visible?: unknown[] }
+		evaluation?: { regression?: unknown; typecheck?: unknown; visible?: unknown[] }
 		outputArtifact?: { sha256?: unknown; bytes?: unknown }
 	}
 	const output = result.outputArtifact
@@ -126,7 +155,7 @@ function fleetEvaluationResult(value: unknown): { regression: TrialResult; visib
 	}
 	const evaluation = result.evaluation
 	if (!evaluation || !Array.isArray(evaluation.visible)) throw new Error("fleet evaluation trial list is malformed")
-	return { regression: compactTrial(evaluation.regression), visible: evaluation.visible.map(compactTrial) }
+	return { regression: compactTrial(evaluation.regression), typecheck: compactTrial(evaluation.typecheck), visible: evaluation.visible.map(compactTrial) }
 }
 
 async function validateCurriculumOnFleet(
@@ -345,10 +374,10 @@ async function evaluateBaselineFleet(
 	const job = existing ?? await queue.enqueue(expected)
 	if (!fleetJobMatches(job, expected)) throw new Error("existing baseline evaluation idempotency key has mismatched execution identity or payload")
 
-	const completed = await waitForFleetJob(queue, job.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, config.evalCommands.length) + 60_000)
+	const completed = await waitForFleetJob(queue, job.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, config.evalCommands.length + 2) + 60_000)
 	if (completed.status !== "completed" || !completed.result || typeof completed.result !== "object") throw new Error(completed.error ?? `fleet baseline evaluation ended ${completed.status}`)
 	const evaluation = fleetEvaluationResult(completed.result)
-	const trials = [evaluation.regression, ...evaluation.visible]
+	const trials = [evaluation.regression, evaluation.typecheck, ...evaluation.visible]
 	let resultIndex = 0
 	const baselineRoot = path.join(config.repoRoot, ".worktrees", `rsi-baseline-${randomUUID().slice(0, 12)}`)
 	execFileSync("git", ["worktree", "add", "--detach", baselineRoot, baseCommit], { cwd: config.repoRoot, stdio: "pipe" })
@@ -437,6 +466,38 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	run.adversarialReviews ??= []
 	run.parentChoices ??= {}
 	const runConfig: RsiConfig = { ...config, model: workerModel, roles, seed: `${config.seed}-${run.runId.slice(-8)}` }
+	const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
+	const proofFixturesRoot = path.join(packageRoot, "fixtures", "rsi-benchmark")
+	const loadedProofBenchmark = hooks.runDevelopmentBenchmark
+		? await fs.readFile(path.join(proofFixturesRoot, "manifest.json"), "utf8").then((rawManifest) => ({ manifest: JSON.parse(rawManifest) as BenchmarkManifest, manifestDigest: createHash("sha256").update(rawManifest).digest("hex") }))
+		: await loadBenchmark(proofFixturesRoot, config.repoRoot)
+	const proofProtocol = freezeDevelopmentProofProtocol(
+		loadedProofBenchmark.manifest,
+		loadedProofBenchmark.manifestDigest,
+		{ provider: "openshell-ollama", id: workerModel, sampling: { temperature: 0, think: false, seed: "provider-default" } },
+		config.developmentProofRule,
+	)
+	if (resumed && !resumed.developmentProofProtocol) throw new Error("cannot resume an RSI run without its frozen development proof protocol")
+	if (resumed && resumed.developmentProofProtocol?.protocolDigest !== proofProtocol.protocolDigest) throw new Error("development proof protocol differs from the frozen protocol on this run")
+	run.developmentProofProtocol ??= proofProtocol
+	run.confirmationEvidence = "unmeasured"
+	const proofAttemptCache = new Map<string, Promise<BenchmarkAttempt[]>>()
+	const runDevelopmentProof = async (harnessCommit: string, evidenceRunId = run.runId): Promise<DevelopmentTaskCell[]> => {
+		const cacheKey = `${evidenceRunId}\0${harnessCommit}`
+		const cached = proofAttemptCache.get(cacheKey)
+		if (cached) return developmentCells(await cached)
+		try {
+			execFileSync("git", ["merge-base", "--is-ancestor", run.baseCommit, harnessCommit], { cwd: config.repoRoot, stdio: "ignore" })
+		} catch { throw new Error(`development proof harness ${harnessCommit} is outside run base lineage ${run.baseCommit}`) }
+		const lineagePaths = execFileSync("git", ["diff", "--name-only", "-z", "--no-renames", run.baseCommit, harnessCommit], { cwd: config.repoRoot, encoding: "buffer" }) as Buffer
+		const lineageViolations = protectedPathViolations(lineagePaths.toString("utf8").split("\0").filter(Boolean), config.protectedPaths)
+		if (lineageViolations.length > 0) throw new Error(`development proof harness changes protected paths relative to the run base: ${lineageViolations.join(", ")}`)
+		const pending = hooks.runDevelopmentBenchmark
+			? hooks.runDevelopmentBenchmark({ harnessCommit, model: workerModel, outputRoot: path.join(config.archiveDir, "development-proof", evidenceRunId, proofProtocol.protocolDigest), protocol: proofProtocol })
+			: runDevelopmentBenchmarkForCommit({ repoRoot: config.repoRoot, fixturesRoot: proofFixturesRoot, outputRoot: path.join(config.archiveDir, "development-proof", evidenceRunId, proofProtocol.protocolDigest), harnessCommit, model: workerModel })
+		proofAttemptCache.set(cacheKey, pending)
+		return developmentCells(await pending)
+	}
 	const trajectories: TrajectoryRecord[] = []
 
 	if (!config.dryRun && config.hiddenEvalCommands.length > 0) {
@@ -485,7 +546,34 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		}
 		let candidates = run.candidates.filter((candidate) => candidate.generation === generation)
 		if (candidates.length === 0) {
-			const merged = combinedArchive(archive, run)
+			if (generation > 0) {
+				for (const prior of run.candidates.filter((entry) => entry.generation < generation && entry.status === "accepted").sort((left, right) => left.generation - right.generation)) {
+					try {
+						validateCandidateParent(prior, run, config, proofProtocol)
+						const saved = prior.developmentProof!
+						const childCommit = prior.commits[0]
+						const expectedParentCommit = prior.parentCommit ?? prior.baseCommit
+						if (!childCommit || saved.runId !== run.runId || saved.protocolDigest !== proofProtocol.protocolDigest) throw new CandidateLineageError("accepted parent has no current frozen development proof")
+						if (saved.immediateParent.childCommit !== childCommit || saved.immediateParent.referenceCommit !== expectedParentCommit || saved.originalBase.childCommit !== childCommit || saved.originalBase.referenceCommit !== run.baseCommit) throw new CandidateLineageError("saved development proof references do not match the candidate, immediate parent, and run base")
+						const [childCells, parentCells, rootCells] = await Promise.all([
+							runDevelopmentProof(childCommit, saved.runId),
+							runDevelopmentProof(saved.immediateParent.referenceCommit, saved.runId),
+							runDevelopmentProof(saved.originalBase.referenceCommit, saved.runId),
+						])
+						const attemptIdsMatch = (expected: string[], cells: DevelopmentTaskCell[]) => JSON.stringify([...expected].sort()) === JSON.stringify(cells.map((cell) => cell.attemptId).sort())
+						if (!attemptIdsMatch(saved.childAttemptIds, childCells) || !attemptIdsMatch(saved.parentAttemptIds, parentCells) || !attemptIdsMatch(saved.originalBaseAttemptIds, rootCells)) throw new CandidateLineageError("accepted parent attempt references do not match replayed benchmark artifacts")
+						const immediateParent = compareDevelopmentAttempts({ protocol: proofProtocol, childCommit, referenceCommit: saved.immediateParent.referenceCommit, referenceKind: "immediate-parent", child: childCells, reference: parentCells })
+						const originalBase = compareDevelopmentAttempts({ protocol: proofProtocol, childCommit, referenceCommit: saved.originalBase.referenceCommit, referenceKind: "original-base", child: childCells, reference: rootCells })
+						prior.developmentProof = candidateProofDecision({ runId: run.runId, protocol: proofProtocol, child: childCells, parent: parentCells, originalBase: rootCells, immediateParent, originalBaseComparison: originalBase })
+						if (!prior.developmentProof.accepted || prior.fitness?.score === 0 || Object.values(prior.fitness?.hardGates ?? {}).some((passed) => passed === false)) throw new CandidateLineageError("accepted parent no longer passes replayed proof or evaluator gates")
+					} catch (error) {
+						prior.status = "rejected"
+						prior.failure = error instanceof Error ? error.message : String(error)
+						log(hooks, `[rsi] ${prior.id}: excluded from parent pool after proof replay: ${prior.failure}`)
+					}
+				}
+			}
+			const merged = { ...combinedArchive(archive, run), candidates: run.candidates }
 			const choices = generation === 0
 				? []
 				: selectParentChoices(merged, run.parentSelectionPolicy ?? "champion-specialist-novelty", config.population)
@@ -506,6 +594,17 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 			log(hooks, `[rsi] generation ${generation}: resuming ${candidates.length} persisted candidate(s)`)
 		}
 		if (config.dryRun) continue
+		for (const candidate of candidates.filter((entry) => !isTerminal(entry))) {
+			try { validateCandidateParent(candidate, run, config, proofProtocol) }
+			catch (error) {
+				if (!(error instanceof CandidateLineageError)) throw error
+				candidate.status = "rejected"
+				candidate.failure = error.message
+				candidate.updatedAt = now()
+				log(hooks, `[rsi] ${candidate.id}: rejected before mutation: ${candidate.failure}`)
+			}
+		}
+		await checkpointRun(config.archiveDir, run)
 
 		const mutationJobs = new Map<string, FleetJob>()
 		const evaluationJobs = new Map<string, FleetJob>()
@@ -660,10 +759,10 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 				if (fleetQueue) {
 					const submitted = evaluationJobs.get(candidate.id) ?? await fleetQueue.getJobByIdempotencyKey(`${run.runId}:${candidate.id}:evaluation`)
 					if (!submitted) throw new Error("candidate evaluation was not admitted to the RSI fleet queue")
-					const completed = await waitForFleetJob(fleetQueue, submitted.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, config.evalCommands.length) + 60_000)
+					const completed = await waitForFleetJob(fleetQueue, submitted.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, config.evalCommands.length + 2) + 60_000)
 					if (completed.status !== "completed" || !completed.result || typeof completed.result !== "object") throw new Error(completed.error ?? `fleet evaluation ended ${completed.status}`)
 					const visible = fleetEvaluationResult(completed.result)
-					const trials = [visible.regression, ...visible.visible]
+					const trials = [visible.regression, visible.typecheck, ...visible.visible]
 					let resultIndex = 0
 					evaluation = await evaluateCandidate(runConfig, candidate.worktree, candidate.baseCommit, async () => trials[resultIndex++] as Awaited<ReturnType<NonNullable<typeof hooks.runCommand>>>)
 				} else {
@@ -683,7 +782,26 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 				candidate.result = evaluation.regression
 				candidate.fitness = computeFitness({ ...evaluation, protectedPathViolation: candidate.protectedPathViolations.length > 0 })
 				if (run.baselineEvaluation) candidate.pairedComparison = comparePairedEvaluation(run.baselineEvaluation, evaluation)
-				candidate.status = candidate.fitness.score > 0 && candidate.pairedComparison?.improved === true ? "accepted" : "rejected"
+				const childCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: candidate.worktree, encoding: "utf8" }).trim()
+				const parentCommit = candidate.parentCommit ?? candidate.baseCommit
+				validateCandidateParent(candidate, run, config, proofProtocol)
+				if (Object.values(candidate.fitness.hardGates).some((passed) => passed === false)) {
+					const empty: DevelopmentTaskCell[] = []
+					const immediateParent = compareDevelopmentAttempts({ protocol: proofProtocol, childCommit, referenceCommit: parentCommit, referenceKind: "immediate-parent", child: empty, reference: empty })
+					const originalBase = compareDevelopmentAttempts({ protocol: proofProtocol, childCommit, referenceCommit: run.baseCommit, referenceKind: "original-base", child: empty, reference: empty })
+					candidate.developmentProof = candidateProofDecision({ runId: run.runId, protocol: proofProtocol, child: empty, parent: empty, originalBase: empty, immediateParent, originalBaseComparison: originalBase })
+					candidate.developmentProof.reason = "development benchmark skipped because regression, typecheck, or evaluator hard gate failed"
+				} else {
+					const [childCells, parentCells, rootCells] = await Promise.all([
+						runDevelopmentProof(childCommit),
+						runDevelopmentProof(parentCommit),
+						runDevelopmentProof(run.baseCommit),
+					])
+					const immediateParent = compareDevelopmentAttempts({ protocol: proofProtocol, childCommit, referenceCommit: parentCommit, referenceKind: "immediate-parent", child: childCells, reference: parentCells })
+					const originalBase = compareDevelopmentAttempts({ protocol: proofProtocol, childCommit, referenceCommit: run.baseCommit, referenceKind: "original-base", child: childCells, reference: rootCells })
+					candidate.developmentProof = candidateProofDecision({ runId: run.runId, protocol: proofProtocol, child: childCells, parent: parentCells, originalBase: rootCells, immediateParent, originalBaseComparison: originalBase })
+				}
+				candidate.status = candidate.fitness.score > 0 && candidate.developmentProof.accepted ? "accepted" : "rejected"
 				candidate.updatedAt = now()
 				const combination = createCombination(candidate.id, candidate.modelCandidateId ?? "model-base", now())
 				combination.status = candidate.status === "accepted" ? "accepted" : "rejected"
@@ -695,7 +813,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 				await captureCandidate(candidate, runConfig, run, trajectories, now(), hooks)
 				log(hooks, `[rsi] ${candidate.id}: ${candidate.status}, score=${candidate.fitness.score}`)
 			} catch (error) {
-				candidate.status = "failed"
+				candidate.status = error instanceof CandidateLineageError ? "rejected" : "failed"
 				candidate.failure = error instanceof Error ? error.message : String(error)
 				candidate.updatedAt = now()
 				job = transitionJob(job, "failed", now(), candidate.failure)

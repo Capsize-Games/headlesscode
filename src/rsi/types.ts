@@ -1,4 +1,6 @@
 import type { ChildProcess } from "node:child_process"
+import type { CandidateDevelopmentProof, DevelopmentProofProtocol, DevelopmentProofRule } from "./development-proof.js"
+import type { BenchmarkAttempt } from "./benchmark/types.js"
 
 export type CandidateStatus = "planned" | "mutating" | "evaluating" | "accepted" | "rejected" | "failed"
 export type MutationKind = "corrective" | "architectural" | "search-policy" | "curriculum" | "model-adaptation"
@@ -29,8 +31,8 @@ export interface MutationHypothesis {
 export interface MetricVector {
 	correctness: number
 	reliability: number
-	generalization: number
-	hidden: number
+	generalization: number | null
+	hidden: number | null
 	efficiency: number
 	latency: number
 	tokenUse: number
@@ -225,6 +227,7 @@ export interface RsiConfig {
 	maxTotalIterations?: number
 	maxRuntimeMs?: number
 	protectedPaths: string[]
+	developmentProofRule?: DevelopmentProofRule
 	commandTimeoutMs: number
 	parentSelectionPolicy?: ParentSelectionPolicy
 	eliteCount?: number
@@ -266,6 +269,7 @@ export interface CandidateRecord {
 	result?: TrialResult
 	fitness?: Fitness
 	pairedComparison?: PairedComparison
+	developmentProof?: CandidateDevelopmentProof
 	trajectory?: TrajectorySummary
 }
 
@@ -294,6 +298,7 @@ export interface TrialResult {
 
 export interface EvaluationSummary {
 	regression: TrialResult
+	typecheck?: TrialResult
 	visible: TrialResult[]
 	hidden: TrialResult[]
 	completed: boolean
@@ -309,8 +314,9 @@ export interface EvaluationSummary {
 
 export interface HardGates {
 	regressionPass: boolean
+	typecheckPass: boolean
 	visibleEvalPass: boolean
-	hiddenEvalPass: boolean
+	hiddenEvalPass: boolean | null
 	adversarialPass: boolean
 	noProtectedPathViolation: boolean
 	completed: boolean
@@ -322,8 +328,8 @@ export interface Fitness {
 	score: number
 	components: {
 	regression: number
-	visible: number
-		hidden: number
+		visible: number | null
+		hidden: number | null
 		efficiency: number
 		recovery: number
 	}
@@ -395,6 +401,8 @@ export interface RsiRunRecord {
 	trajectoryRefs?: string[]
 	adaptiveSearch?: AdaptiveSearchDecision[]
 	curriculumTasks?: CurriculumTask[]
+	developmentProofProtocol?: DevelopmentProofProtocol
+	confirmationEvidence?: "unmeasured"
 	adversarialReviews?: AdversarialReviewRecord[]
 	candidates: CandidateRecord[]
 	reports: string[]
@@ -425,6 +433,7 @@ export interface RsiHooks {
 	runCommand?: CommandRunner
 	runMutation?: MutationRunner
 	runAdversary?: (request: { role: RoleModelConfig; prompt: string }) => Promise<string>
+	runDevelopmentBenchmark?: (request: { harnessCommit: string; model: string; outputRoot: string; protocol: DevelopmentProofProtocol }) => Promise<BenchmarkAttempt[]>
 	now?: () => string
 	log?: (line: string) => void
 }

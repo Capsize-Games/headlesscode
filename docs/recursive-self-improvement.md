@@ -59,9 +59,8 @@ qualify multiple gateways or hosts. At the time, `openshell gateway list`
 showed `rsi-local` reachable and `headlesscode-local` at
 `http://127.0.0.1:18080`; a TCP connection to that endpoint was refused, so no
 second live gateway was available. The fixture result does not establish
-general harness improvement. Hidden evaluation count was zero; the current
-empty-suite rate helper reports `hidden: 1`, so the score includes an untested
-hidden component. One mutation attempt was retried; the saved error truncates
+general harness improvement. Hidden evaluation was not measured. One mutation
+attempt was retried; the saved error truncates
 before its terminal cause. The adversarial role and OpenShell break-test path
 are implemented but have not been exercised with a live review provider.
 
@@ -94,8 +93,11 @@ for the local worker, not a dollar-cost estimate.
    bounded previews and references. Hidden evaluations are
    unavailable because their evaluator assets do not yet have a separate
    trusted service boundary.
-5. The coordinator computes fitness and paired baseline comparisons, selects
-   candidates that pass all gates, and writes the archive and report.
+5. The coordinator runs regression, typecheck, and visible evaluation gates,
+   then obtains the fixed-harness development benchmark for the candidate, its
+   exact immediate parent, and the run base. It selects only candidates with
+   comparable verified evidence that pass the frozen development rule and all
+   evaluator gates, then writes the archive and report.
 
 Earlier bounded runs used the locally installed `wxrq-qwen3.5-9b:latest` model
 through Ollama before the fleet adapter existed. In the current setup,
@@ -264,11 +266,30 @@ functional benchmark, not a multi-host throughput guarantee.
 
 ## Fitness and safety
 
-Regression success is the first hard gate. Visible and hidden evaluations,
-completion, absence of a crash, and protected-path integrity are also gates.
-The score combines regression, visible evaluation, hidden evaluation,
-efficiency, and recovery components. A candidate that fails a hard gate cannot
-be selected even when its partial score is high.
+Regression, typecheck, completion, absence of a crash, protected-path
+integrity, and configured visible evaluations are hard gates. Empty visible or
+hidden suites are unmeasured; they do not contribute a perfect score. Hidden
+and confirmation evidence is currently unmeasured. The score uses only measured
+components. A candidate that fails a hard gate cannot be selected even when
+its partial score is high.
+
+Development-proof decisions use a protocol frozen into the run archive. The
+protocol pins the development task identities and verifiers, model and sampling
+settings, per-task ceilings, and rule. The coordinator compares each candidate
+with its exact immediate parent and separately with the original run base.
+Parent lineage must be accepted within the same run and protocol, and protected
+paths must match the run base. Archived candidates from earlier runs are not
+eligible parents. A per-commit image is required for each harness; image marker
+and Docker image ID are checked before an attempt. Missing images or
+non-comparable attempts fail closed.
+
+The current local Ollama adapter does not provide supervisor-enforced
+aggregate token accounting. Its guest-reported usage is observational, and
+those attempts remain unqualified and cannot make a candidate eligible. The
+proof gate can accept only attempts with authoritative resource accounting;
+broker enforcement is required for a qualified live run. Confirmation
+fixtures and verifier inputs are kept outside the coding guest and selection
+inputs.
 
 Trajectory datasets are written as separate `sft.jsonl`, `preferences.jsonl`,
 and `failures.jsonl` files with a manifest. Their current verification derives

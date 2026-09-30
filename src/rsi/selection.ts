@@ -18,8 +18,8 @@ function metrics(candidate: CandidateRecord): MetricVector {
 		candidate.fitness?.metrics ?? {
 			correctness: candidate.fitness?.components.regression ?? 0,
 			reliability: candidate.fitness?.components.recovery ?? 0,
-			generalization: candidate.fitness?.components.visible ?? 0,
-			hidden: candidate.fitness?.components.hidden ?? 0,
+			generalization: candidate.fitness?.components.visible ?? null,
+			 hidden: candidate.fitness?.components.hidden ?? null,
 			efficiency: candidate.fitness?.components.efficiency ?? 0,
 			latency: 0,
 			tokenUse: 0,
@@ -34,8 +34,8 @@ function eligible(candidates: CandidateRecord[]): CandidateRecord[] {
 	return candidates.filter((candidate) =>
 		candidate.status === "accepted" &&
 		candidate.fitness &&
-		Object.values(candidate.fitness.hardGates).every(Boolean) &&
-		candidate.pairedComparison?.improved === true &&
+		Object.values(candidate.fitness.hardGates).every((passed) => passed !== false) &&
+		candidate.developmentProof?.accepted === true &&
 		candidate.commits.length > 0,
 	)
 }
@@ -51,6 +51,7 @@ export function paretoDominates(left: MetricVector, right: MetricVector): boolea
 	for (const key of Object.keys(left) as Array<keyof MetricVector>) {
 		const leftValue = key === "fabricationRate" || key === "complexityPenalty" || key === "latency" || key === "tokenUse" ? -left[key] : left[key]
 		const rightValue = key === "fabricationRate" || key === "complexityPenalty" || key === "latency" || key === "tokenUse" ? -right[key] : right[key]
+		if (leftValue === null || rightValue === null) continue
 		if (leftValue < rightValue) return false
 		if (leftValue > rightValue) strictlyBetter = true
 	}
@@ -94,7 +95,8 @@ export function selectParentChoices(
 	selected.push(choice(champion, "champion", "highest hard-gated scalar fitness"))
 	for (const metric of SPECIALIST_METRICS) {
 		if (selected.length >= count) break
-		const specialist = [...pool].sort((a, b) => metrics(b)[metric] - metrics(a)[metric])[0]
+		if (metric === "hidden" && pool.every((candidate) => metrics(candidate).hidden === null)) continue
+		const specialist = [...pool].filter((candidate) => metrics(candidate)[metric] !== null).sort((a, b) => (metrics(b)[metric] ?? 0) - (metrics(a)[metric] ?? 0))[0]
 		if (specialist && !selected.some((entry) => entry.candidateId === specialist.id)) {
 			selected.push(choice(specialist, "specialist", `best archived candidate on ${metric}`))
 		}
