@@ -19,6 +19,10 @@ COPY src ./src
 COPY shared ./shared
 COPY scripts/spawn-parallel-worktrees.sh scripts/run-worker.sh scripts/headlesscode-answer.sh ./scripts/
 RUN chmod -R a+rX /opt/headlesscode/src /opt/headlesscode/shared /opt/headlesscode/scripts
+RUN test ! -e /opt/headlesscode/scripts/rsi-benchmark/task-spec.mjs \
+    && test ! -e /opt/headlesscode/scripts/rsi-benchmark/manual-tests \
+    && test ! -e /opt/headlesscode/fixtures/rsi-benchmark \
+    && test ! -e /opt/headlesscode/.git
 RUN printf '%s\n' "$HEADLESSCODE_HARNESS_COMMIT" > /opt/headlesscode/.headlesscode-harness-commit
 LABEL org.capsize.headlesscode.harness-commit="$HEADLESSCODE_HARNESS_COMMIT"
 RUN chmod +x scripts/spawn-parallel-worktrees.sh scripts/run-worker.sh scripts/headlesscode-answer.sh

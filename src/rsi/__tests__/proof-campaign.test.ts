@@ -98,13 +98,13 @@ test("controller freezes paired broker allocations as separate campaigns under o
 		const oldEnv = { ...process.env }
 		try {
 			Object.assign(process.env, {
-				HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD: "1",
-				HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD: "0.4",
-				HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD: "0.2",
-				HEADLESSCODE_RSI_OPENROUTER_MAX_INPUT_PRICE_PER_MILLION_USD: "2",
-				HEADLESSCODE_RSI_OPENROUTER_MAX_OUTPUT_PRICE_PER_MILLION_USD: "4",
-				HEADLESSCODE_RSI_OPENROUTER_MAX_CALL_SPEND_USD: "0.1",
-				HEADLESSCODE_RSI_OPENROUTER_MAX_JOB_SPEND_USD: "0.2",
+				HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD: "0.32",
+				HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD: "0.04",
+				HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD: "0.28",
+				HEADLESSCODE_RSI_OPENROUTER_MAX_INPUT_PRICE_PER_MILLION_USD: "0.0001",
+				HEADLESSCODE_RSI_OPENROUTER_MAX_OUTPUT_PRICE_PER_MILLION_USD: "0.0001",
+				HEADLESSCODE_RSI_OPENROUTER_MAX_CALL_SPEND_USD: "0.01",
+				HEADLESSCODE_RSI_OPENROUTER_MAX_JOB_SPEND_USD: "0.01",
 			})
 			const task = {
 				id: "proof-task", family: "controller-integration", split: "development" as const, task: "change a real repository behavior",
@@ -135,10 +135,19 @@ test("controller freezes paired broker allocations as separate campaigns under o
 			assert.deepEqual(frozen.armAssignment, { fixedControl: "fixed-control", selfHosted: "self-hosted" })
 			assert.equal(frozen.benchmarkDigests.manifest, "4".repeat(64), "the full loaded manifest digest, including runner/version metadata, is frozen")
 			assert.deepEqual(frozen.settings.inferenceCampaignIds, { mutation: `${campaignId}:mutation`, benchmark: `${campaignId}:benchmark` })
-			assert.deepEqual(frozen.settings.inferenceAllocationsUsd, { mutation: 0.4, benchmark: 0.2 })
+			assert.deepEqual(frozen.settings.inferenceAllocationsUsd, { mutation: 0.04, benchmark: 0.28 })
 			assert.equal(frozen.schedule.filter((cell) => cell.armId === "fixed-control").length, 14)
 			assert.equal(frozen.schedule.filter((cell) => cell.armId === "self-hosted").length, 14)
-			assert.equal(frozen.schedule.filter((cell) => cell.armId === "fixed-control" && cell.phase === "confirmation").length, 2, "final candidate and root-control confirmation cells are frozen")
+			assert.equal(frozen.schedule.filter((cell) => cell.armId === "fixed-control" && cell.phase === "confirmation").length, 5, "all generation candidate slots and root-control confirmation cells are frozen")
+			assert.equal(frozen.budgets.root.maxCalls, 40, "root calls sum mutation calls, all three development proof roles, and selected-final/root confirmation grants for both arms")
+			assert.equal(frozen.budgets.root.maxTokens, 645_120, "root tokens sum effective task-specific grants rather than the base per-call defaults")
+			assert.equal(frozen.budgets.root.maxSpendUsd, 0.2, "root spend is the sum of every frozen provider-job reservation")
+			assert.equal(frozen.settings.taskWallBoundMs, 140_000, "the runtime plan sums mutation, required evaluation, development proof, and selected-final/root confirmation deadlines")
+			assert.throws(() => createProofCampaignManifest({ config: { ...config, maxRuntimeMs: 139_999 }, campaignId: `${campaignId}-short`, baseCommit: "f".repeat(40), model: RSI_OPENROUTER_MODEL, provider: "openshell-openrouter", runtime: { imageName: "rsi:test", imageDigest: `sha256:${"9".repeat(64)}`, harnessCommit: "8".repeat(40), dependencyLockDigest: "7".repeat(64) }, developmentManifest, developmentManifestDigest: "4".repeat(64), plannedGenerations: 2, proofProtocol: protocol }), /below the summed frozen task-time ceiling/)
+			process.env.HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD = "0.19"
+			process.env.HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD = "0.04"
+			process.env.HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD = "0.15"
+			assert.throws(() => createProofCampaignManifest({ config, campaignId: `${campaignId}-underfunded`, baseCommit: "f".repeat(40), model: RSI_OPENROUTER_MODEL, provider: "openshell-openrouter", runtime: { imageName: "rsi:test", imageDigest: `sha256:${"9".repeat(64)}`, harnessCommit: "8".repeat(40), dependencyLockDigest: "7".repeat(64) }, developmentManifest, developmentManifestDigest: "4".repeat(64), plannedGenerations: 2, proofProtocol: protocol }), /below development plus selected-final\/root confirmation job reservations/)
 			const fixed = await campaign.acquire(frozen, "fixed-control", "run-fixed", "coordinator-fixed")
 			const selfHosted = await campaign.acquire(frozen, "self-hosted", "run-self", "coordinator-self")
 			assert.equal(fixed.manifestSha256, selfHosted.manifestSha256)
@@ -211,6 +220,7 @@ test("development completion preserves frozen confirmation cells for fenced post
 		assert.equal(confirmationLease.epoch, lease.epoch + 1)
 		assert.equal(confirmationLease.phase, "confirmation")
 		await assert.rejects(() => campaign.finishArm(confirmationLease, ["candidate-a"]), /missing, incomplete, or uncertain frozen task cell/)
+		await campaign.selectFinalHarness(confirmationLease, { generation: 0, candidateId: "candidate-a", commit: "2".repeat(40) })
 		await campaign.markNotSelected(confirmationLease, { attemptKey: "not-selected-b", generation: 0, candidateId: "candidate-b", taskId: "hidden", seed: "seed-1", reason: "slot was not selected by the development decision" })
 		await assert.rejects(() => campaign.markNotSelected(confirmationLease, { attemptKey: "not-selected-a", generation: 0, candidateId: "candidate-a", taskId: "hidden", seed: "seed-1", reason: "selected slots cannot be skipped" }), /selected or undecided/)
 		for (const cell of [schedule[2]!, schedule[4]!]) {
@@ -471,7 +481,7 @@ test("runner replays a saved benchmark file through settlement after a crash and
 					const patch = execFileSync("git", ["diff", "--binary", "--no-ext-diff", `${base}...HEAD`], { cwd: candidate, encoding: "buffer" })
 				return {
 					validity: "valid", patch, stdout: "bounded mock response", stderr: "", calls: 1, tokens: 22, wallTimeMs: 10, stopReason: "mock-complete",
-					inferenceReceipt: { provider: "openrouter", jobId: request.attemptId, campaignId: frozen.campaignId, model: request.model.id, returnedModels: [request.model.id], calls: 1, promptTokens: 10, completionTokens: 12, totalTokens: 22, costUsd: 0.001, accounting: "supervisor-enforced", qualified: true, callReceipts: [], denials: [] },
+				inferenceReceipt: { provider: "openrouter", endpointProvider: "deepinfra", jobId: request.attemptId, campaignId: frozen.campaignId, model: request.model.id, returnedModels: [request.model.id], returnedProviders: ["deepinfra"], calls: 1, promptTokens: 10, completionTokens: 12, totalTokens: 22, costUsd: 0.001, accounting: "supervisor-enforced", qualified: true, callReceipts: [], denials: [] },
 			}
 				} finally { await fs.rm(candidate, { recursive: true, force: true }) }
 			},

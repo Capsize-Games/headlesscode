@@ -4,8 +4,8 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
 import { OpenShellBenchmarkAgent, OpenShellBenchmarkVerifier } from "./benchmark/openshell-agent.js"
-import { loadBenchmark, runBenchmark } from "./benchmark/runner.js"
-import type { BenchmarkAttempt, BenchmarkImageIdentity } from "./benchmark/types.js"
+import { freezeBenchmarkProtocol, loadBenchmark, runBenchmark } from "./benchmark/runner.js"
+import type { BenchmarkAttempt, BenchmarkImageIdentity, BenchmarkSplit } from "./benchmark/types.js"
 import type { RunBenchmarkOptions } from "./benchmark/runner.js"
 
 const moduleRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
@@ -60,6 +60,7 @@ export async function runDevelopmentBenchmarkForCommit(args: {
 	campaignId?: string
 	inferenceLedgerPath?: string
 	attemptNamespace?: string
+	split?: BenchmarkSplit
 	attemptLifecycle?: RunBenchmarkOptions["attemptLifecycle"]
 }): Promise<BenchmarkAttempt[]> {
 	const repoRoot = path.resolve(args.repoRoot)
@@ -70,6 +71,15 @@ export async function runDevelopmentBenchmarkForCommit(args: {
 	return await withCommitWorktree(repoRoot, args.harnessCommit, async (harnessRoot) => {
 		const agent = new OpenShellBenchmarkAgent(harnessRoot, undefined, agentImage.name, args.harnessCommit, undefined, args.provider ?? "openshell-ollama")
 		const verifier = new OpenShellBenchmarkVerifier(repoRoot, undefined, verifierImage.name)
+		const split = args.split ?? "development"
+		const outputRoot = path.join(args.outputRoot, "harness", args.harnessCommit)
+		if (split === "confirmation") {
+			try { await fs.access(path.join(outputRoot, "frozen-protocol.json")) }
+			catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+				await freezeBenchmarkProtocol({ loaded, harnessCommit: args.harnessCommit, agentImageIdentity: agentImage, modelId: args.model, outputRoot, sampling: { temperature: 0, think: false, seed: "provider-default" }, provider: agent.provider })
+			}
+		}
 		return await runBenchmark({
 			loaded,
 			agent,
@@ -78,8 +88,9 @@ export async function runDevelopmentBenchmarkForCommit(args: {
 			agentImageIdentity: agentImage,
 			modelId: args.model,
 			sampling: { temperature: 0, think: false, seed: "provider-default" },
-			split: "development",
-			outputRoot: path.join(args.outputRoot, "harness", args.harnessCommit),
+			split,
+			...(split === "confirmation" ? { confirmProtocol: true } : {}),
+			outputRoot,
 			...(args.campaignId ? { inferenceCampaignId: args.campaignId } : {}),
 			inferenceLedgerPath: args.inferenceLedgerPath ?? path.join(args.outputRoot, "openrouter-inference-ledger.json"),
 			...(args.attemptNamespace ? { attemptNamespace: args.attemptNamespace } : {}),

@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs"
 import { Pool, type PoolClient } from "pg"
 import type { ResourceClass, WorkerHarnessMode, WorkerHarnessRuntimeIdentity } from "./types.js"
 import { createRsiArtifactStore, type RsiArtifactReference, type RsiArtifactStore } from "./artifact-store.js"
-import type { OpenRouterBrokerGrant, OpenRouterBrokerReceipt, OpenRouterCallReceipt, OpenRouterCallReservation, OpenRouterCallSettlement, OpenRouterDenialReason, OpenRouterInferenceLedger } from "./inference-broker.js"
+import { RSI_OPENROUTER_ENDPOINT_PROVIDER, type OpenRouterBrokerGrant, type OpenRouterBrokerReceipt, type OpenRouterCallReceipt, type OpenRouterCallReservation, type OpenRouterCallSettlement, type OpenRouterDenialReason, type OpenRouterInferenceLedger } from "./inference-broker.js"
 import type { OpenRouterBrokerLimits } from "./inference-broker.js"
 import { PostgresProofCampaign, type ProofCampaignArmLease, type ProofCampaignManifest } from "./proof-campaign.js"
 
@@ -15,6 +15,7 @@ const MIGRATIONS = [
 	{ version: 5, sql: readFileSync(new URL("./migrations/005_openrouter_denial_summaries.sql", import.meta.url), "utf8") },
 	{ version: 6, sql: readFileSync(new URL("./migrations/006_proof_campaigns.sql", import.meta.url), "utf8") },
 	{ version: 7, sql: readFileSync(new URL("./migrations/007_proof_campaign_phases.sql", import.meta.url), "utf8") },
+	{ version: 8, sql: readFileSync(new URL("./migrations/008_openrouter_returned_provider.sql", import.meta.url), "utf8") },
 ]
 
 function sha256Text(value: string): string { return createHash("sha256").update(value).digest("hex") }
@@ -551,7 +552,7 @@ export class PostgresRsiJobQueue {
 			const callResult = await client.query("SELECT * FROM headlesscode_rsi_inference_calls WHERE job_id=$1 AND call_id=$2 FOR UPDATE", [grant.jobId, settlement.callId])
 			const call = callResult.rows[0]
 			if (!job || !call || call.capability_sha256 !== capabilityHash || call.state !== "reserved") throw new Error("OpenRouter settlement does not match a pending broker call")
-			if (settlement.state !== "complete" || settlement.promptTokens === undefined || settlement.completionTokens === undefined || settlement.costUsd === undefined || settlement.returnedModel === undefined || !settlement.responseSha256) {
+			if (settlement.state !== "complete" || settlement.promptTokens === undefined || settlement.completionTokens === undefined || settlement.costUsd === undefined || settlement.returnedModel === undefined || settlement.returnedProvider === undefined || !settlement.responseSha256) {
 				await client.query("UPDATE headlesscode_rsi_inference_calls SET state='unmeasured',completed_at=$3 WHERE job_id=$1 AND call_id=$2", [grant.jobId, settlement.callId, settlement.completedAt])
 				await client.query("UPDATE headlesscode_rsi_inference_jobs SET blocked=true WHERE job_id=$1", [grant.jobId])
 				return
@@ -561,11 +562,11 @@ export class PostgresRsiJobQueue {
 			const currentLease = job.queue_status === "leased" && job.current_lease_token === grant.leaseToken && job.lease_valid === true
 			const overLimit = job.duration_valid !== true || settlement.qualified === false || costMicros > Number(call.reserved_spend_microusd) || costMicros > usdCapToMicros(grant.limits.maxCallSpendUsd)
 				|| settlement.promptTokens > grant.limits.maxInputTokensPerCall || settlement.completionTokens > grant.limits.maxOutputTokensPerCall
-				|| actualTokens > Number(call.reserved_tokens) || settlement.returnedModel !== grant.model || !currentLease
+				|| actualTokens > Number(call.reserved_tokens) || settlement.returnedModel !== grant.model || settlement.returnedProvider !== RSI_OPENROUTER_ENDPOINT_PROVIDER || !currentLease
 			await client.query(
 				`UPDATE headlesscode_rsi_inference_calls SET state='complete',actual_spend_microusd=$3,prompt_tokens=$4,completion_tokens=$5,
-				 returned_model=$6,provider_request_id=$7,response_sha256=$8,completed_at=$9,qualified=$10 WHERE job_id=$1 AND call_id=$2`,
-				[grant.jobId, settlement.callId, costMicros, settlement.promptTokens, settlement.completionTokens, settlement.returnedModel, settlement.providerRequestId ?? null, settlement.responseSha256, settlement.completedAt, !overLimit],
+				 returned_model=$6,returned_provider=$7,provider_request_id=$8,response_sha256=$9,completed_at=$10,qualified=$11 WHERE job_id=$1 AND call_id=$2`,
+				[grant.jobId, settlement.callId, costMicros, settlement.promptTokens, settlement.completionTokens, settlement.returnedModel, settlement.returnedProvider, settlement.providerRequestId ?? null, settlement.responseSha256, settlement.completedAt, !overLimit],
 			)
 			await client.query(
 				`UPDATE headlesscode_rsi_inference_jobs SET reserved_spend_microusd=reserved_spend_microusd-$2,spent_microusd=spent_microusd+$3,
@@ -603,13 +604,14 @@ export class PostgresRsiJobQueue {
 			reservedTokens: Number(row.reserved_tokens), startedAt: new Date(String(row.started_at)).toISOString(),
 			state: row.state as OpenRouterCallSettlement["state"],
 			...(row.returned_model ? { returnedModel: String(row.returned_model) } : {}),
+			...(row.returned_provider ? { returnedProvider: String(row.returned_provider) } : {}),
 			...(row.provider_request_id ? { providerRequestId: String(row.provider_request_id) } : {}),
 			...(row.prompt_tokens !== null ? { promptTokens: Number(row.prompt_tokens) } : {}),
 			...(row.completion_tokens !== null ? { completionTokens: Number(row.completion_tokens) } : {}),
 			...(row.actual_spend_microusd !== null ? { costUsd: microsToUsd(row.actual_spend_microusd) } : {}),
 			...(row.response_sha256 ? { responseSha256: String(row.response_sha256) } : {}),
 			...(row.completed_at ? { completedAt: new Date(String(row.completed_at)).toISOString() } : {}),
-			authoritative: row.state === "complete" && row.qualified === true && row.returned_model === grant.model && row.prompt_tokens !== null && row.completion_tokens !== null && row.actual_spend_microusd !== null,
+			authoritative: row.state === "complete" && row.qualified === true && row.returned_model === grant.model && row.returned_provider === RSI_OPENROUTER_ENDPOINT_PROVIDER && row.prompt_tokens !== null && row.completion_tokens !== null && row.actual_spend_microusd !== null,
 		}))
 		const allMeasured = calls.length > 0 && calls.every((call) => call.authoritative)
 		const promptTokens = allMeasured ? calls.reduce((sum, call) => sum + (call.promptTokens ?? 0), 0) : null
@@ -622,8 +624,9 @@ export class PostgresRsiJobQueue {
 			&& Number(job.spent_microusd) <= Number(job.max_spend_microusd) && Number(job.reserved_spend_microusd) === 0
 			&& Number(job.reserved_tokens) === 0 && !job.blocked && campaignResult.rows[0]?.blocked !== true && currentLease && grantMatches
 		return {
-			provider: "openrouter", jobId: grant.jobId, campaignId: String(job.campaign_id), model: grant.model,
+			provider: "openrouter", endpointProvider: RSI_OPENROUTER_ENDPOINT_PROVIDER, jobId: grant.jobId, campaignId: String(job.campaign_id), model: grant.model,
 			returnedModels: [...new Set(calls.map((call) => call.returnedModel).filter((model): model is string => Boolean(model)))],
+			returnedProviders: [...new Set(calls.map((call) => call.returnedProvider).filter((provider): provider is string => Boolean(provider)))],
 			calls: calls.length, promptTokens, completionTokens,
 			totalTokens: promptTokens === null || completionTokens === null ? null : promptTokens + completionTokens,
 			costUsd, accounting: allMeasured && withinLimits ? "supervisor-enforced" : "incomplete", qualified: allMeasured && withinLimits, callReceipts: calls, denials,

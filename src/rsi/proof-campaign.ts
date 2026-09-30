@@ -290,10 +290,8 @@ export class PostgresProofCampaign {
 			const manifest = campaign.manifest as ProofCampaignManifest
 			const cell = manifest.schedule.find((entry) => entry.armId === lease.armId && (entry.phase ?? "development") === "confirmation" && entry.generation === input.generation && entry.candidateId === input.candidateId && entry.taskId === input.taskId && entry.seed === input.seed && entry.attemptKind === "confirmation")
 			if (!cell) throw new Error("not-selected disposition is outside the frozen confirmation schedule")
-			const finalGeneration = Math.max(...manifest.schedule.filter((entry) => entry.armId === lease.armId && (entry.phase ?? "development") === "confirmation").map((entry) => entry.generation))
-			if (input.generation !== finalGeneration) throw new Error("not-selected disposition is only valid for final confirmation slots")
-			const selection = await client.query("SELECT payload FROM headlesscode_rsi_proof_campaign_events WHERE campaign_id=$1 AND arm_id=$2 AND event_type='generation-selected' AND payload->>'generation'=$3 FOR UPDATE", [lease.campaignId, lease.armId, String(finalGeneration)])
-			if (selection.rowCount !== 1 || (selection.rows[0].payload as { selectedCandidateIds?: string[] }).selectedCandidateIds?.includes(input.candidateId)) throw new Error("selected or undecided confirmation slot cannot be marked not-selected")
+		const finalSelection = await client.query("SELECT payload FROM headlesscode_rsi_proof_campaign_events WHERE campaign_id=$1 AND arm_id=$2 AND event_type='final-harness-selected' FOR UPDATE", [lease.campaignId, lease.armId])
+		if (finalSelection.rowCount !== 1 || (finalSelection.rows[0].payload as { candidateId?: string }).candidateId === input.candidateId) throw new Error("selected or undecided confirmation slot cannot be marked not-selected")
 			const identity = { generation: input.generation, candidateId: input.candidateId, taskId: input.taskId, seed: input.seed, attemptKind: "confirmation" as const }
 			const identitySha256 = digest({ ...identity, sourceCandidateId: input.candidateId })
 			const requestSha256 = digest({ identity, disposition: "not-selected", reason: input.reason })
@@ -306,6 +304,42 @@ export class PostgresProofCampaign {
 			await client.query(`INSERT INTO headlesscode_rsi_proof_campaign_attempts(campaign_id,arm_id,attempt_key,attempt_kind,generation,candidate_id,source_candidate_id,task_id,seed,identity_sha256,request_sha256,status,epoch,reserved_calls,reserved_tokens,reserved_spend_microusd,error)
 				VALUES($1,$2,$3,'confirmation',$4,$5,$5,$6,$7,$8,$9,'not-selected',$10,0,0,0,$11)`, [lease.campaignId, lease.armId, input.attemptKey, input.generation, input.candidateId, input.taskId, input.seed, identitySha256, requestSha256, lease.epoch, input.reason.slice(0, 512)])
 			await this.appendEvent(client, lease.campaignId, lease.armId, lease.epoch, "confirmation-not-selected", { attemptKey: input.attemptKey, identitySha256, requestSha256, reason: input.reason.slice(0, 512), spendMicrousd: 0 })
+		})
+	}
+
+	/** Freeze the one final harness whose result will be compared with root on confirmation tasks. */
+	async selectFinalHarness(lease: ProofCampaignArmLease, selection: { generation: number; candidateId: string; commit: string }): Promise<void> {
+		if (!Number.isSafeInteger(selection.generation) || selection.generation < 0 || !selection.candidateId.trim() || !/^[a-f0-9]{40}$/.test(selection.commit)) throw new Error("final confirmation harness identity is malformed")
+		await transaction(this.pool, async (client) => {
+			const campaign = await this.lockLease(client, lease)
+			if (lease.phase !== "confirmation" || campaign.arm_phase !== "confirmation") throw new Error("final harness selection requires the confirmation phase")
+			const manifest = campaign.manifest as ProofCampaignManifest
+			const confirmationCells = manifest.schedule.filter((cell) => cell.armId === lease.armId && (cell.phase ?? "development") === "confirmation")
+			const finalGeneration = Math.max(...confirmationCells.map((cell) => cell.generation))
+			if (selection.generation > finalGeneration) throw new Error("final harness selection is outside the frozen generation schedule")
+			const generationSelections = await client.query("SELECT payload FROM headlesscode_rsi_proof_campaign_events WHERE campaign_id=$1 AND arm_id=$2 AND event_type='generation-selected' ORDER BY (payload->>'generation')::int", [lease.campaignId, lease.armId])
+			const selectedGenerations = generationSelections.rows.filter((entry) => Array.isArray((entry.payload as { selectedCandidateIds?: unknown }).selectedCandidateIds) && ((entry.payload as { selectedCandidateIds: string[] }).selectedCandidateIds.length > 0))
+			const latestSelected = selectedGenerations.at(-1)
+			if (selection.candidateId === "root-control") {
+				if (latestSelected || selection.generation !== finalGeneration || selection.commit !== manifest.rootCommit) throw new Error("root may be selected as final harness only when no campaign generation selected an accepted candidate")
+			} else {
+				const latestGeneration = Number((latestSelected?.payload as { generation?: unknown } | undefined)?.generation)
+				const latestSelectedIds = (latestSelected?.payload as { selectedCandidateIds?: unknown } | undefined)?.selectedCandidateIds
+				if (!latestSelected || latestGeneration !== selection.generation || !Array.isArray(latestSelectedIds) || !latestSelectedIds.includes(selection.candidateId)) throw new Error("final confirmation harness must come from the latest nonempty durable generation selection")
+				const eligible = await client.query(`SELECT 1 FROM headlesscode_rsi_proof_campaign_decisions AS decision
+					JOIN headlesscode_rsi_proof_campaign_events AS selected ON selected.campaign_id=decision.campaign_id AND selected.arm_id=decision.arm_id AND selected.event_type='generation-selected'
+					AND selected.payload->>'generation'=$4 AND selected.payload->'selectedCandidateIds' ? decision.candidate_id
+					WHERE decision.campaign_id=$1 AND decision.arm_id=$2 AND decision.generation=$3 AND decision.candidate_id=$5 AND decision.child_commit=$6 AND decision.decision='accepted'`,
+				[lease.campaignId, lease.armId, selection.generation, String(selection.generation), selection.candidateId, selection.commit])
+				if (eligible.rowCount !== 1) throw new Error("final confirmation harness must be an accepted candidate selected by its generation")
+			}
+			const payload = { generation: selection.generation, candidateId: selection.candidateId, commit: selection.commit }
+			const existing = await client.query("SELECT payload FROM headlesscode_rsi_proof_campaign_events WHERE campaign_id=$1 AND arm_id=$2 AND event_type='final-harness-selected' FOR UPDATE", [lease.campaignId, lease.armId])
+			if (existing.rowCount) {
+				if (existing.rowCount !== 1 || stableJson(existing.rows[0].payload) !== stableJson(payload)) throw new Error("final confirmation harness conflicts with an earlier durable selection")
+				return
+			}
+			await this.appendEvent(client, lease.campaignId, lease.armId, lease.epoch, "final-harness-selected", payload)
 		})
 	}
 
@@ -472,15 +506,14 @@ export class PostgresProofCampaign {
 			}
 			const confirmation = scheduled.filter((cell) => (cell.phase ?? "development") === "confirmation")
 			if (confirmation.length) {
-				const finalGeneration = Math.max(...confirmation.map((cell) => cell.generation))
-				const selectedEvent = await client.query("SELECT payload FROM headlesscode_rsi_proof_campaign_events WHERE campaign_id=$1 AND arm_id=$2 AND event_type='generation-selected' AND payload->>'generation'=$3", [lease.campaignId, lease.armId, String(finalGeneration)])
-				if (selectedEvent.rowCount !== 1) throw new Error("cannot finish proof campaign without final-generation selection")
-				const selected = (selectedEvent.rows[0].payload as { selectedCandidateIds: string[] }).selectedCandidateIds
+				const selectedEvent = await client.query("SELECT payload FROM headlesscode_rsi_proof_campaign_events WHERE campaign_id=$1 AND arm_id=$2 AND event_type='final-harness-selected'", [lease.campaignId, lease.armId])
+				if (selectedEvent.rowCount !== 1) throw new Error("cannot finish proof campaign without final-harness selection")
+				const selected = selectedEvent.rows[0].payload as { candidateId: string; generation: number; commit: string }
 				const recordedSelection = [...selectedCandidateIds].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))
-				if (stableJson(recordedSelection) !== stableJson(selected)) throw new Error("final arm selection does not match its frozen campaign selection")
+				if (stableJson(recordedSelection) !== stableJson([selected.candidateId])) throw new Error("final arm selection does not match its frozen campaign selection")
 				for (const cell of confirmation) {
 					const attempt = await client.query("SELECT status FROM headlesscode_rsi_proof_campaign_attempts WHERE campaign_id=$1 AND arm_id=$2 AND generation=$3 AND candidate_id=$4 AND task_id=$5 AND seed=$6 AND attempt_kind=$7", [lease.campaignId, lease.armId, cell.generation, cell.candidateId, cell.taskId, cell.seed, cell.attemptKind])
-					const required = cell.candidateId === "root-control" || selected.includes(cell.candidateId)
+					const required = cell.candidateId === "root-control" || (cell.candidateId === selected.candidateId && cell.generation === selected.generation)
 					const expectedStatus = required ? "completed" : "not-selected"
 					if (attempt.rowCount !== 1 || attempt.rows[0].status !== expectedStatus) throw new Error(`final confirmation cell ${cell.candidateId}/${cell.taskId} must be ${expectedStatus}`)
 				}

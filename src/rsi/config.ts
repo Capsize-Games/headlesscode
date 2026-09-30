@@ -75,6 +75,7 @@ Options:
   --model-candidate-id <id>    model identity used for combination tracking
   --worker-harness-mode <mode> fixed-control | self-hosted (generation zero is always fixed-control)
   --worker-harness-pair-id <id> shared identifier for matching fixed-control and self-hosted runs
+  --worker-harness-phase <phase> development | confirmation (default: development)
   --base-ref <ref>             git ref to branch from (default: HEAD)
   --dry-run                    print the planned loop without changing files
   --keep-worktrees              retain candidate worktrees after evaluation
@@ -123,6 +124,7 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 	let resumeRunId: string | undefined
 	let modelCandidateId: string | undefined
 	let workerHarnessMode: WorkerHarnessMode | undefined
+	let workerHarnessPhase: "development" | "confirmation" = "development"
 	let workerHarnessPairId: string | undefined
 	let proofMinimumNetWins = DEFAULT_DEVELOPMENT_PROOF_RULE.minimumNetWins
 	let proofRetentionTaskIds = [...DEFAULT_DEVELOPMENT_PROOF_RULE.retentionTaskIds]
@@ -289,6 +291,13 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 					index = next
 					break
 				}
+				case "--worker-harness-phase": {
+					const [value, next] = take(index, arg)
+					if (value !== "development" && value !== "confirmation") throw new Error(`${arg} must be development or confirmation`)
+					workerHarnessPhase = value
+					index = next
+					break
+				}
 				case "--proof-min-net-wins": {
 					const [value, next] = take(index, arg)
 					proofMinimumNetWins = positiveInteger(value, arg)
@@ -417,6 +426,7 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 				resumeRunId,
 				modelCandidateId,
 				...(workerHarnessMode ? { workerHarnessMode } : {}),
+				...(workerHarnessMode ? { workerHarnessPhase } : {}),
 				...(workerHarnessPairId ? { workerHarnessPairId } : {}),
 			},
 		}

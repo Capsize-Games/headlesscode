@@ -12,6 +12,12 @@ RUN apt-get update \
     && find /opt/headlesscode/src -type d -name __tests__ -prune -exec rm -rf {} + \
     && find /opt/headlesscode/src -type f \( -name '*.test.ts' -o -name '*.spec.ts' \) -delete \
     && rm -rf /opt/headlesscode/scripts/eval-suite \
+    && rm -rf /opt/headlesscode/scripts/rsi-benchmark \
+    && rm -rf /opt/headlesscode/fixtures/rsi-benchmark \
     && test ! -e /opt/headlesscode/src/rsi
+
+RUN test ! -e /opt/headlesscode/scripts/rsi-benchmark/task-spec.mjs \
+    && test ! -e /opt/headlesscode/fixtures/rsi-benchmark \
+    && test ! -e /opt/headlesscode/.git
 
 USER sandbox

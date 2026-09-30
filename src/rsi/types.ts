@@ -7,6 +7,7 @@ export type CandidateStatus = "planned" | "mutating" | "evaluating" | "accepted"
 export type MutationKind = "corrective" | "architectural" | "search-policy" | "curriculum" | "model-adaptation"
 export type ParentSelectionPolicy = "champion-specialist-novelty" | "pareto-front" | "all-eligible"
 export type WorkerHarnessMode = "fixed-control" | "self-hosted"
+export type WorkerHarnessPhase = "development" | "confirmation"
 
 export interface WorkerHarnessRuntimeIdentity {
 	imageName: string
@@ -243,6 +244,7 @@ export interface RsiConfig {
 	maxTokens?: number
 	benchmarkHarnessCommit?: string
 	workerHarnessMode?: WorkerHarnessMode
+	workerHarnessPhase?: WorkerHarnessPhase
 	workerHarnessPairId?: string
 	workerHarnessRuntime?: WorkerHarnessRuntimeIdentity
 	workerHarnessParentCommit?: string
@@ -281,8 +283,10 @@ export interface CandidateRecord {
 	modelProvider?: string
 	inferenceUsage?: {
 		provider: "openrouter"
+		endpointProvider: "deepinfra"
 		model: string
 		returnedModels: string[]
+		returnedProviders: string[]
 		calls: number
 		promptTokens: number
 		completionTokens: number
@@ -451,7 +455,12 @@ export interface RsiRunRecord {
 	workerHarnessPlannedGenerations?: number
 	workerHarnessSamplingSeed?: string
 	workerHarnessRuntime?: WorkerHarnessRuntimeIdentity
-	confirmationEvidence?: "unmeasured"
+	confirmationEvidence?: "unmeasured" | "complete" | "incomplete"
+	confirmationAttempts?: BenchmarkAttempt[]
+	proofConfirmation?: {
+		selectedHarness: { candidateId: string; slotId: string; generation: number; commit: string; attemptIds: string[] }
+		rootHarness: { commit: string; attemptIds: string[] }
+	}
 	proofCampaign?: {
 		manifest: import("./proof-campaign.js").ProofCampaignManifest
 		manifestSha256: string

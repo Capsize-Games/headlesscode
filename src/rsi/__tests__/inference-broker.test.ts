@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 import test from "node:test"
-import { FileOpenRouterInferenceLedger, openRouterCampaignBudgetAllocation, RSI_OPENROUTER_MODEL, startOpenRouterBroker, validateOpenRouterBrokerLimits } from "../inference-broker.js"
+import { fetchPinnedOpenRouterEndpointPrice, FileOpenRouterInferenceLedger, openRouterCampaignBudgetAllocation, RSI_OPENROUTER_ENDPOINT_PROVIDER, RSI_OPENROUTER_ENDPOINT_TAG, RSI_OPENROUTER_MODEL, startOpenRouterBroker, validateOpenRouterBrokerLimits } from "../inference-broker.js"
 import type { OpenRouterBrokerLimits } from "../inference-broker.js"
 
 function limits(campaignId: string, overrides: Partial<OpenRouterBrokerLimits> = {}): OpenRouterBrokerLimits {
@@ -15,21 +15,30 @@ function limits(campaignId: string, overrides: Partial<OpenRouterBrokerLimits> =
 	}
 }
 
-function fakeFetch(options: { usage?: Record<string, unknown>; model?: string } = {}) {
+function fakeFetch(options: { usage?: Record<string, unknown>; model?: string; returnedProvider?: string | null } = {}) {
 	const requests: Array<{ url: string; init?: RequestInit }> = []
 	const fetcher = (async (input: string | URL, init?: RequestInit) => {
 		const url = String(input)
 		requests.push({ url, init })
-		if (url.includes("/models/")) return new Response(JSON.stringify({ data: { endpoints: [{ provider_slug: "deepseek", provider_name: "DeepSeek", pricing: { prompt: "0.000001", completion: "0.000001" } }] } }), { status: 200 })
+		if (url.includes("/models/")) return new Response(JSON.stringify({ data: { endpoints: [endpointMetadata()] } }), { status: 200 })
 		const body = JSON.parse(String(init?.body)) as Record<string, unknown>
 		assert.equal(body.model, RSI_OPENROUTER_MODEL)
-		assert.deepEqual(body.provider, { order: ["deepseek"], allow_fallbacks: false })
-		assert.equal(body.max_completion_tokens, 64)
+		assert.deepEqual(body.provider, { only: [RSI_OPENROUTER_ENDPOINT_PROVIDER], allow_fallbacks: false })
+		assert.equal(body.max_tokens, 64)
+		assert.equal((init?.headers as Record<string, string>)["X-OpenRouter-Metadata"], "enabled")
 		assert.equal((init?.headers as Record<string, string>).authorization, "Bearer host-secret")
-		const response = { id: "or-test-1", model: options.model ?? RSI_OPENROUTER_MODEL, choices: [], usage: options.usage ?? { prompt_tokens: 20, completion_tokens: 10, cost: 0.0002 } }
+		const response = routedResponse({ id: "or-test-1", model: options.model ?? RSI_OPENROUTER_MODEL, choices: [], usage: options.usage ?? { prompt_tokens: 20, completion_tokens: 10, cost: 0.0002 } }, options.returnedProvider)
 		return new Response(JSON.stringify(response), { status: 200, headers: { "content-type": "application/json" } })
 	}) as typeof fetch
 	return { fetcher, requests }
+}
+
+function endpointMetadata(overrides: Record<string, unknown> = {}) {
+	return { provider_name: "DeepInfra", tag: RSI_OPENROUTER_ENDPOINT_TAG, quantization: "fp8", status: 0, pricing: { prompt: "0.00000006", completion: "0.00000018" }, supported_parameters: ["tools", "tool_choice", "temperature", "seed", "max_tokens"], supports_tool_choice: { auto: true, required: true, function: true }, ...overrides }
+}
+
+function routedResponse(response: Record<string, unknown>, selectedProvider: string | null = RSI_OPENROUTER_ENDPOINT_PROVIDER): Record<string, unknown> {
+	return selectedProvider === null ? response : { ...response, openrouter_metadata: { endpoints: { available: [{ provider: selectedProvider, selected: true }] } } }
 }
 
 const requestBody = (extra: Record<string, unknown> = {}) => JSON.stringify({
@@ -37,6 +46,32 @@ const requestBody = (extra: Record<string, unknown> = {}) => JSON.stringify({
 	messages: [{ role: "user", content: "Fix the small function and run its tests." }],
 	max_completion_tokens: 256,
 	...extra,
+})
+
+test("pinned endpoint pricing is a timestamped metadata GET with no inference submission", async () => {
+	const requests: Array<{ url: string; method?: string }> = []
+	const fetcher = (async (input: string | URL, init?: RequestInit) => {
+		requests.push({ url: String(input), method: init?.method })
+		return new Response(JSON.stringify({ data: { endpoints: [endpointMetadata({ pricing: { prompt: "0.000002", completion: "0.00003" } })] } }), { status: 200 })
+	}) as typeof fetch
+	const price = await fetchPinnedOpenRouterEndpointPrice("metadata-test-key", fetcher, () => 1_800_000_000_000)
+	assert.equal(price.model, RSI_OPENROUTER_MODEL)
+	assert.equal(price.provider, "deepinfra")
+	assert.equal(price.endpointTag, "deepinfra/fp8")
+	assert.equal(price.quantization, "fp8")
+	assert.equal(price.inputPricePerMillionUsd, 2)
+	assert.equal(price.outputPricePerMillionUsd, 30)
+	assert.equal(price.observedAt, "2027-01-15T08:00:00.000Z")
+	assert.equal(requests.length, 1)
+	assert.equal(requests[0]?.method, "GET")
+	assert.match(requests[0]?.url ?? "", /\/models\/deepseek\/deepseek-v4-flash-0731\/endpoints$/)
+})
+
+test("pinned endpoint preflight rejects unavailable, retagged, or parameter-incomplete routes", async () => {
+	for (const endpoint of [endpointMetadata({ status: -2 }), endpointMetadata({ tag: "deepinfra/other" }), endpointMetadata({ supported_parameters: ["tools"] }), endpointMetadata({ supports_tool_choice: { auto: false, required: false } })]) {
+		const fetcher = (async () => new Response(JSON.stringify({ data: { endpoints: [endpoint] } }), { status: 200 })) as typeof fetch
+		await assert.rejects(fetchPinnedOpenRouterEndpointPrice("", fetcher), /pinned DeepInfra fp8 endpoint/)
+	}
 })
 
 async function setup(t: { after(fn: () => void | Promise<void>): void }, overrides: { usage?: Record<string, unknown>; model?: string; limits?: OpenRouterBrokerLimits; upstreamFetch?: typeof fetch } = {}) {
@@ -72,6 +107,21 @@ test("OpenRouter broker pins model/provider, accounts usage, and survives broker
 	finally { await restarted.close() }
 })
 
+test("OpenRouter broker leaves missing or mismatched returned endpoint identity unqualified", async (t) => {
+	for (const returnedProvider of ["openai", null] as const) {
+		const { broker } = await setup(t, { upstreamFetch: fakeFetch({ returnedProvider }).fetcher })
+		const response = await fetch(`${broker.localBaseUrl}/api/v1/chat/completions`, {
+			method: "POST", headers: { authorization: `Bearer ${broker.capability}`, "content-type": "application/json", "x-rsi-call-id": `call-${returnedProvider ?? "missing"}-provider-123` }, body: requestBody(),
+		})
+		assert.equal(response.status, 502)
+		const receipt = await broker.receipt()
+		assert.equal(receipt.qualified, false)
+		assert.equal(receipt.callReceipts[0]?.authoritative, false)
+		assert.deepEqual(receipt.returnedProviders, returnedProvider ? [returnedProvider] : [])
+		await broker.close()
+	}
+})
+
 test("file ledger preserves the job deadline across broker restart and rejects a late response", async (t) => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "rsi-inference-deadline-"))
 	t.after(() => fs.rm(root, { recursive: true, force: true }))
@@ -84,7 +134,7 @@ test("file ledger preserves the job deadline across broker restart and rejects a
 	let dispatched!: () => void
 	const wasDispatched = new Promise<void>((resolve) => { dispatched = resolve })
 	const upstreamFetch = (async (input: string | URL) => {
-		if (String(input).includes("/models/")) return new Response(JSON.stringify({ data: { endpoints: [{ provider_slug: "deepseek", pricing: { prompt: "0.000001", completion: "0.000001" } }] } }), { status: 200 })
+		if (String(input).includes("/models/")) return new Response(JSON.stringify({ data: { endpoints: [endpointMetadata({ pricing: { prompt: "0.000001", completion: "0.000001" } })] } }), { status: 200 })
 		dispatched()
 		return await new Promise<Response>((resolve) => { releaseUpstream = resolve })
 	}) as typeof fetch
@@ -106,7 +156,7 @@ test("file ledger preserves the job deadline across broker restart and rejects a
 	})
 	await wasDispatched
 	nowMs = startedAt + 1_001
-	releaseUpstream(new Response(JSON.stringify({ id: "late", model: RSI_OPENROUTER_MODEL, choices: [], usage: { prompt_tokens: 20, completion_tokens: 10, cost: 0.0002 } }), { status: 200, headers: { "content-type": "application/json" } }))
+	releaseUpstream(new Response(JSON.stringify(routedResponse({ id: "late", model: RSI_OPENROUTER_MODEL, choices: [], usage: { prompt_tokens: 20, completion_tokens: 10, cost: 0.0002 } })), { status: 200, headers: { "content-type": "application/json" } }))
 	const response = await post
 	assert.equal(response.status, 429, "a response arriving after the persisted job deadline is not returned to the guest")
 	assert.match((await response.json() as { error: { message: string } }).error.message, /duration limit exhausted/)
@@ -183,7 +233,7 @@ test("OpenRouter broker can expose status-only access counters without request d
 test("OpenRouter broker marks timeouts unmeasured and does not automatically spend again", async (t) => {
 	let dispatched = 0
 	const upstream = (async (input: string | URL, init?: RequestInit) => {
-		if (String(input).includes("/models/")) return new Response(JSON.stringify({ data: { endpoints: [{ provider_slug: "deepseek", pricing: { prompt: "0.000001", completion: "0.000001" } }] } }), { status: 200 })
+		if (String(input).includes("/models/")) return new Response(JSON.stringify({ data: { endpoints: [endpointMetadata({ pricing: { prompt: "0.000001", completion: "0.000001" } })] } }), { status: 200 })
 		dispatched += 1
 		return await new Promise<Response>((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(new DOMException("timed out", "AbortError")), { once: true }))
 	}) as typeof fetch
@@ -201,8 +251,8 @@ test("OpenRouter broker marks timeouts unmeasured and does not automatically spe
 
 test("OpenRouter broker parses final SSE usage when streaming is enabled", async (t) => {
 	const sseFetch = (async (input: string | URL) => {
-		if (String(input).includes("/models/")) return new Response(JSON.stringify({ data: { endpoints: [{ provider_slug: "deepseek", pricing: { prompt: "0.000001", completion: "0.000001" } }] } }), { status: 200 })
-		return new Response(`data: ${JSON.stringify({ id: "stream-id", model: RSI_OPENROUTER_MODEL, choices: [{ delta: { content: "done" } }] })}\n\ndata: ${JSON.stringify({ id: "stream-id", model: RSI_OPENROUTER_MODEL, usage: { prompt_tokens: 8, completion_tokens: 2, cost: 0.00001 } })}\n\ndata: [DONE]\n\n`, { status: 200, headers: { "content-type": "text/event-stream" } })
+		if (String(input).includes("/models/")) return new Response(JSON.stringify({ data: { endpoints: [endpointMetadata({ pricing: { prompt: "0.000001", completion: "0.000001" } })] } }), { status: 200 })
+		return new Response(`data: ${JSON.stringify({ id: "stream-id", model: RSI_OPENROUTER_MODEL, choices: [{ delta: { content: "done" } }] })}\n\ndata: ${JSON.stringify(routedResponse({ id: "stream-id", model: RSI_OPENROUTER_MODEL, usage: { prompt_tokens: 8, completion_tokens: 2, cost: 0.00001 } }))}\n\ndata: [DONE]\n\n`, { status: 200, headers: { "content-type": "text/event-stream" } })
 	}) as typeof fetch
 	const { broker } = await setup(t, { upstreamFetch: sseFetch })
 	const response = await fetch(`${broker.localBaseUrl}/api/v1/chat/completions`, {

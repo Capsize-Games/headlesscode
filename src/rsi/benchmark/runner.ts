@@ -451,7 +451,7 @@ export async function runBenchmark(options: RunBenchmarkOptions & { replayFile?:
 				harnessCommit: options.harnessCommit, agentImage, model: { provider: options.agent.provider, id: options.modelId, sampling }, seed: task.seed,
 				family: task.family, startDigest: task.startDigest, ceilings: task.ceilings,
 				verifiedSuccess,
-				proofQualified: Boolean(result.inferenceReceipt?.qualified && result.inferenceReceipt.provider === "openrouter" && result.inferenceReceipt.jobId === attemptId && result.inferenceReceipt.campaignId === campaignId && result.inferenceReceipt.model === options.modelId && result.inferenceReceipt.returnedModels.length === 1 && result.inferenceReceipt.returnedModels[0] === options.modelId),
+				proofQualified: Boolean(result.inferenceReceipt?.qualified && result.inferenceReceipt.provider === "openrouter" && result.inferenceReceipt.endpointProvider === "deepinfra" && result.inferenceReceipt.jobId === attemptId && result.inferenceReceipt.campaignId === campaignId && result.inferenceReceipt.model === options.modelId && result.inferenceReceipt.returnedModels.length === 1 && result.inferenceReceipt.returnedModels[0] === options.modelId),
 				resourceAccounting: result.inferenceReceipt?.qualified ? "supervisor-enforced" : result.inferenceReceipt ? "incomplete" : result.calls !== null && result.tokens !== null ? "guest-reported" : "incomplete",
 				...(proofRequestSha256 ? { proofRequestSha256 } : {}),
 				...(result.inferenceReceipt ? { inferenceReceipt: result.inferenceReceipt } : {}),

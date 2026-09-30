@@ -654,6 +654,9 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 			"test ! -e /workspace/.headlesscode",
 			"test ! -e /opt/headlesscode/src/rsi",
 			"test ! -e /opt/headlesscode/scripts/eval-suite",
+			"test ! -e /opt/headlesscode/scripts/rsi-benchmark/task-spec.mjs",
+			"test ! -e /opt/headlesscode/fixtures/rsi-benchmark",
+			"test ! -e /opt/headlesscode/.git",
 			...(config.benchmarkHarnessCommit ? ["test -f /opt/headlesscode/.headlesscode-harness-commit", `test "$(cat /opt/headlesscode/.headlesscode-harness-commit)" = ${shellQuote(config.benchmarkHarnessCommit)}`] : []),
 			config.benchmarkHarnessCommit
 				? "test -z \"$(find /opt/headlesscode/src -type f \\( -path '*/__tests__/*' -o -name '*.test.*' -o -name '*.spec.*' \\) -print -quit)\""
