@@ -1,6 +1,7 @@
 import type { ChildProcess } from "node:child_process"
 import type { CandidateDevelopmentProof, DevelopmentProofProtocol, DevelopmentProofRule } from "./development-proof.js"
 import type { BenchmarkAttempt } from "./benchmark/types.js"
+import type { OpenRouterDenialSummary } from "./inference-broker.js"
 
 export type CandidateStatus = "planned" | "mutating" | "evaluating" | "accepted" | "rejected" | "failed"
 export type MutationKind = "corrective" | "architectural" | "search-policy" | "curriculum" | "model-adaptation"
@@ -161,7 +162,8 @@ export interface TrajectoryRecord {
 	id: string
 	task: string
 	environment: { repoRoot: string; baseCommit: string; generation: number }
-	model: { id: string; provider?: string; candidateId?: string }
+	model: { id: string; provider?: string; candidateId?: string; returnedModels?: string[] }
+	inferenceUsage?: CandidateRecord["inferenceUsage"]
 	harnessVersion: string
 	promptConfig: Record<string, unknown>
 	messages: TrajectoryMessage[]
@@ -253,6 +255,23 @@ export interface CandidateRecord {
 	baseCommit: string
 	status: CandidateStatus
 	model: string
+	modelProvider?: string
+	inferenceUsage?: {
+		provider: "openrouter"
+		model: string
+		returnedModels: string[]
+		calls: number
+		promptTokens: number
+		completionTokens: number
+		totalTokens: number
+		costUsd: number
+		accounting: "supervisor-enforced"
+		qualified: true
+		jobId: string
+		campaignId: string
+		denials: OpenRouterDenialSummary[]
+	}
+	inferenceDenials?: OpenRouterDenialSummary[]
 	mutation: string
 	createdAt: string
 	updatedAt: string

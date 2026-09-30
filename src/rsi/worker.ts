@@ -7,6 +7,7 @@ import { openshellPreflight } from "../cloud/openshell-preflight.js"
 import { PostgresRsiJobQueue, fleetQueuePolicy, requiredFleetJobLeaseMs, type FleetJobLease, type FleetJobPayload } from "./postgres-queue.js"
 import { runOpenShellEvaluation, runOpenShellModelJob, runOpenShellMutation } from "./openshell.js"
 import type { CandidateRecord, ComputePolicy, EvaluationSummary, MutationHypothesis, MutationKind, RsiConfig, RsiRoleConfig, TrialResult } from "./types.js"
+import { startOpenRouterBroker, RSI_OPENROUTER_MODEL, type OpenRouterBrokerReceipt, type OpenRouterBrokerOptions } from "./inference-broker.js"
 
 const EVALUATION_PREVIEW_CHARS = 2048
 
@@ -49,6 +50,7 @@ export interface RsiWorkerOptions {
 	runMutation?: typeof runOpenShellMutation
 	runEvaluation?: typeof runOpenShellEvaluation
 	runModelJob?: typeof runOpenShellModelJob
+	createInferenceBroker?: typeof startOpenRouterBroker
 }
 
 function parsePositiveInteger(value: string | undefined, fallback: number, name: string): number {
@@ -59,7 +61,7 @@ function parsePositiveInteger(value: string | undefined, fallback: number, name:
 }
 
 function taskConfig(payload: FleetJobPayload, root: string, queue: PostgresRsiJobQueue): RsiConfig {
-	const roles: RsiRoleConfig = { worker: { provider: "ollama", model: payload.model } }
+	const roles: RsiRoleConfig = { worker: { provider: payload.provider ?? "ollama", model: payload.model } }
 	return {
 		repoRoot: root,
 		model: payload.model,
@@ -99,6 +101,7 @@ function candidateFromPayload(payload: FleetJobPayload, root: string): Candidate
 		baseCommit: payload.snapshotCommit,
 		status: "mutating",
 		model: payload.model,
+		modelProvider: `openshell-${payload.provider ?? "ollama"}`,
 		mutation: payload.task,
 		createdAt: new Date().toISOString(),
 		updatedAt: new Date().toISOString(),
@@ -148,6 +151,7 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions): Pr
 	const root = await fs.mkdtemp(path.join(options.scratchRoot, `${lease.job.jobId}-${lease.job.attempts}-`))
 	const bundlePath = path.join(root, "snapshot.bundle")
 	const repoRoot = path.join(root, "repo")
+	let failureResult: Record<string, unknown> | undefined
 	try {
 		const bundle = await options.queue.getArtifact(payload.snapshotSha256)
 		if (bundle.byteLength !== payload.snapshotBytes) throw new Error("fleet snapshot artifact length differed from queued metadata")
@@ -162,12 +166,36 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions): Pr
 		const started = Date.now()
 		let result: Record<string, unknown>
 		if (lease.job.jobKind === "mutation") {
-			const mutation = await (options.runMutation ?? runOpenShellMutation)(candidate, config)
+			let broker: Awaited<ReturnType<typeof startOpenRouterBroker>> | undefined
+			let receipt: OpenRouterBrokerReceipt | undefined
+			let mutation
+			try {
+				if ((payload.provider ?? "ollama") === "openrouter") {
+					if (payload.model !== RSI_OPENROUTER_MODEL || !payload.inferenceLimits) throw new Error("OpenRouter fleet job is missing the pinned model or explicit spend and token ceilings")
+					const apiKey = process.env.HEADLESSCODE_OPENROUTER_API_KEY?.trim()
+					const bindHost = process.env.HEADLESSCODE_RSI_BROKER_BIND_HOST?.trim()
+					if (!apiKey || !bindHost) throw new Error("OpenRouter fleet worker requires the host API key and explicit RSI broker interface address")
+					const brokerOptions: OpenRouterBrokerOptions = {
+						jobId: lease.job.jobId, leaseToken: lease.token, model: RSI_OPENROUTER_MODEL, limits: payload.inferenceLimits,
+						apiKey, bindHost, ledger: options.queue,
+					}
+					broker = await (options.createInferenceBroker ?? startOpenRouterBroker)(brokerOptions)
+				}
+				mutation = await (options.runMutation ?? runOpenShellMutation)(candidate, config, undefined, undefined, broker)
+				if (broker) receipt = await broker.receipt()
+			} finally {
+				if (broker && (payload.provider ?? "ollama") === "openrouter") {
+					const receipt = await broker.receipt().catch(() => undefined)
+					if (receipt) failureResult = { ok: false, provider: "openrouter", model: payload.model, inferenceAudit: { accounting: "incomplete", jobId: lease.job.jobId, denials: receipt.denials } }
+				}
+				await broker?.close().catch(() => undefined)
+			}
 			if (!mutation.ok) throw new Error(mutation.error ?? mutation.result?.stderr ?? "OpenShell mutation failed")
+			if ((payload.provider ?? "ollama") === "openrouter" && (!receipt?.qualified || receipt.model !== payload.model || receipt.provider !== "openrouter")) throw new Error("OpenRouter mutation did not produce a qualified, model-bound broker receipt")
 			const patch = execFileSync("git", ["diff", "--binary", "--no-ext-diff", "--no-renames", `${candidate.baseCommit}...HEAD`], { cwd: repoRoot, encoding: "buffer", maxBuffer: options.queue.policy.maxInFlight * 1024 * 1024 * 16 })
 			if (patch.byteLength === 0) throw new Error("OpenShell mutation produced no patch")
 			const artifact = await options.queue.putArtifact(patch)
-			result = { ok: true, patchSha256: artifact.sha256, patchBytes: artifact.byteLength, durationMs: Date.now() - started }
+			result = { ok: true, provider: payload.provider ?? "ollama", model: payload.model, ...(receipt ? { inferenceReceipt: receipt } : {}), patchSha256: artifact.sha256, patchBytes: artifact.byteLength, durationMs: Date.now() - started }
 		} else if (lease.job.jobKind === "evaluation") {
 			const evaluation = await (options.runEvaluation ?? runOpenShellEvaluation)(candidate, config)
 			const externalized = await externalizeEvaluationOutputs(options.queue, evaluation)
@@ -189,7 +217,7 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions): Pr
 		const completion = await options.queue.complete(lease, result)
 		if (!completion.accepted) throw new Error("OpenShell result was fenced because this worker no longer owns the lease")
 	} catch (error) {
-		await options.queue.fail(lease, error instanceof Error ? error.message : String(error))
+		await options.queue.fail(lease, error instanceof Error ? error.message : String(error), failureResult)
 	} finally {
 		await fs.rm(root, { recursive: true, force: true })
 	}

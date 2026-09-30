@@ -5,6 +5,7 @@ import * as path from "node:path"
 import { execFileSync, spawn } from "node:child_process"
 import { FileRsiArtifactStore } from "../artifact-store.js"
 import type { BenchmarkAgent, BenchmarkAgentResult, BenchmarkAttempt, BenchmarkImageIdentity, BenchmarkManifest, BenchmarkResourceCeilings, BenchmarkSplit, BenchmarkTask } from "./types.js"
+import { RSI_OPENROUTER_MODEL } from "../inference-broker.js"
 
 export const RSI_BENCHMARK_RUNNER_VERSION = "1.0.0"
 const DEFAULT_FIXTURE_ROOT = path.resolve("fixtures/rsi-benchmark")
@@ -246,6 +247,8 @@ export interface RunBenchmarkOptions {
 	confirmProtocol?: boolean
 	taskIds?: string[]
 	agentImageIdentity?: BenchmarkImageIdentity | null
+	inferenceCampaignId?: string
+	inferenceLedgerPath?: string
 }
 
 async function artifactByDigest(store: FileRsiArtifactStore, root: string, digest: string): Promise<Buffer> {
@@ -295,7 +298,11 @@ async function loadReplayResult(filename: string): Promise<BenchmarkAgentResult>
 	return { ...value, patch: value.patchBase64 ? Buffer.from(value.patchBase64, "base64") : undefined }
 }
 
-function validateExistingAttempt(existing: BenchmarkAttempt, task: BenchmarkTask, options: RunBenchmarkOptions, split: BenchmarkSplit, attemptId: string, sampling: Record<string, number | string | boolean>, agentImage: BenchmarkImageIdentity | null): void {
+function inferenceCampaignId(options: RunBenchmarkOptions, sampling: Record<string, number | string | boolean>): string {
+	return options.inferenceCampaignId ?? `rsi-${sha256(JSON.stringify([options.loaded.manifestDigest, options.agent.provider, options.modelId, sampling])).slice(0, 32)}`
+}
+
+async function validateExistingAttempt(existing: BenchmarkAttempt, task: BenchmarkTask, options: RunBenchmarkOptions, split: BenchmarkSplit, attemptId: string, sampling: Record<string, number | string | boolean>, agentImage: BenchmarkImageIdentity | null, campaignId: string, ledgerPath: string): Promise<void> {
 	const expected = {
 		schemaVersion: 1,
 		manifestDigest: options.loaded.manifestDigest,
@@ -316,8 +323,15 @@ function validateExistingAttempt(existing: BenchmarkAttempt, task: BenchmarkTask
 	}
 	if (!Number.isSafeInteger(existing.wallTimeMs) || existing.wallTimeMs < 0 || existing.wallTimeMs > task.ceilings.timeoutMs) throw new Error("existing benchmark attempt has invalid wall-time accounting")
 	if (![existing.calls, existing.tokens].every((count) => count === null || (Number.isSafeInteger(count) && count >= 0))) throw new Error("existing benchmark attempt has invalid resource counters")
-	if (existing.resourceAccounting !== (existing.calls !== null && existing.tokens !== null ? "guest-reported" : "incomplete")) throw new Error("existing benchmark attempt resource-accounting status is inconsistent")
-	if (existing.proofQualified !== false) throw new Error("existing benchmark attempt cannot claim aggregate-token proof qualification")
+	const receipt = existing.inferenceReceipt
+	if (receipt) {
+		if (receipt.provider !== "openrouter" || receipt.jobId !== attemptId || receipt.campaignId !== campaignId || receipt.model !== options.modelId || receipt.returnedModels.length !== 1 || receipt.returnedModels[0] !== options.modelId) throw new Error("existing benchmark attempt inference receipt identity mismatch")
+		if (existing.calls !== receipt.calls || existing.tokens !== receipt.totalTokens || existing.resourceAccounting !== (receipt.qualified ? "supervisor-enforced" : "incomplete") || existing.proofQualified !== receipt.qualified) throw new Error("existing benchmark attempt inference receipt accounting mismatch")
+		if (!options.agent.verifyReceipt || !(await options.agent.verifyReceipt(attemptId, receipt, ledgerPath))) throw new Error("existing benchmark inference receipt cannot be reverified against its ledger")
+	} else {
+		if (existing.resourceAccounting !== (existing.calls !== null && existing.tokens !== null ? "guest-reported" : "incomplete")) throw new Error("existing benchmark attempt resource-accounting status is inconsistent")
+		if (existing.proofQualified !== false) throw new Error("existing benchmark attempt cannot claim aggregate-token proof qualification")
+	}
 	if (!existing.artifactRefs || typeof existing.artifactRefs !== "object" || !/^[a-f0-9]{64}$/.test(existing.artifactRefs.stdout) || !/^[a-f0-9]{64}$/.test(existing.artifactRefs.stderr)) throw new Error("existing benchmark attempt has invalid artifact references")
 	if ((existing.artifactRefs.patch ?? null) !== existing.patchDigest || (existing.patchDigest !== null && !/^[a-f0-9]{64}$/.test(existing.patchDigest))) throw new Error("existing benchmark attempt patch digest is inconsistent")
 	if (existing.verifiedSuccess && (existing.validity !== "valid" || !existing.patchDigest)) throw new Error("existing benchmark attempt claims success without a valid patch")
@@ -333,8 +347,10 @@ export async function runBenchmark(options: RunBenchmarkOptions & { replayFile?:
 	const tasks = options.loaded.manifest.tasks.filter((task) => task.split === split && (!options.taskIds || options.taskIds.includes(task.id)))
 	if (tasks.length === 0) throw new Error(`benchmark ${split} split is empty; empty evaluations are not success`)
 	const outputRoot = path.resolve(options.outputRoot ?? DEFAULT_OUTPUT_ROOT)
+	const ledgerPath = path.resolve(options.inferenceLedgerPath ?? path.join(outputRoot, "openrouter-inference-ledger.json"))
 	const artifacts = new FileRsiArtifactStore(path.join(outputRoot, "artifacts"), 256 * 1024 * 1024)
 	const sampling = options.sampling ?? { temperature: 0, think: false, seed: "provider-default" }
+	const campaignId = inferenceCampaignId(options, sampling)
 	const attempts: BenchmarkAttempt[] = []
 	for (const task of tasks) {
 			const attemptId = cellId(options.loaded, task, options, sampling, agentImage)
@@ -345,7 +361,7 @@ export async function runBenchmark(options: RunBenchmarkOptions & { replayFile?:
 			let existing: BenchmarkAttempt | undefined
 			try {
 				existing = JSON.parse(await fs.readFile(attemptPath, "utf8")) as BenchmarkAttempt
-				validateExistingAttempt(existing, task, options, split, attemptId, sampling, agentImage)
+				await validateExistingAttempt(existing, task, options, split, attemptId, sampling, agentImage, campaignId, ledgerPath)
 			} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") { await fs.rm(workspace, { recursive: true, force: true }); throw error } }
 			let result: BenchmarkAgentResult
 			let verifiedSuccess = false
@@ -391,9 +407,14 @@ export async function runBenchmark(options: RunBenchmarkOptions & { replayFile?:
 				throw error
 			}
 			result = options.replayFile ? await loadReplayResult(options.replayFile) : await options.agent.run({
-				taskId: task.id, task: task.task, seed: task.seed, workspace, harnessCommit: options.harnessCommit,
+				taskId: task.id, attemptId, campaignId, brokerLedgerPath: ledgerPath, task: task.task, seed: task.seed, workspace, harnessCommit: options.harnessCommit,
 				model: { provider: options.agent.provider, id: options.modelId, sampling }, ceilings: task.ceilings,
 			})
+			if (result.inferenceReceipt) {
+				const receipt = result.inferenceReceipt
+				if (options.agent.provider !== "openshell-openrouter" || receipt.provider !== "openrouter" || receipt.jobId !== attemptId || receipt.campaignId !== campaignId || receipt.model !== options.modelId || receipt.returnedModels.length !== 1 || receipt.returnedModels[0] !== options.modelId) throw new Error("agent returned an inference receipt with mismatched provider, attempt, campaign or model identity")
+				if (!options.agent.verifyReceipt || !(await options.agent.verifyReceipt(attemptId, receipt, ledgerPath))) throw new Error("agent inference receipt is not present in the trusted supervisor ledger")
+			}
 			if (!Number.isSafeInteger(result.wallTimeMs) || result.wallTimeMs < 0 || result.wallTimeMs > task.ceilings.timeoutMs || ![result.calls, result.tokens].every((count) => count === null || (Number.isSafeInteger(count) && count >= 0))) throw new Error("agent result contained invalid or over-limit resource observations")
 			if (result.validity === "valid" && result.patch) {
 				patchDigest = sha256(result.patch)
@@ -420,8 +441,11 @@ export async function runBenchmark(options: RunBenchmarkOptions & { replayFile?:
 				schemaVersion: 1, manifestDigest: options.loaded.manifestDigest, taskId: task.id, split, attemptId,
 				harnessCommit: options.harnessCommit, agentImage, model: { provider: options.agent.provider, id: options.modelId, sampling }, seed: task.seed,
 				family: task.family, startDigest: task.startDigest, ceilings: task.ceilings,
-				verifiedSuccess, proofQualified: false, resourceAccounting: result.calls !== null && result.tokens !== null ? "guest-reported" : "incomplete",
-				validity: result.validity, calls: result.calls, tokens: result.tokens, wallTimeMs: result.wallTimeMs,
+				verifiedSuccess,
+				proofQualified: Boolean(result.inferenceReceipt?.qualified && result.inferenceReceipt.provider === "openrouter" && result.inferenceReceipt.jobId === attemptId && result.inferenceReceipt.campaignId === campaignId && result.inferenceReceipt.model === options.modelId && result.inferenceReceipt.returnedModels.length === 1 && result.inferenceReceipt.returnedModels[0] === options.modelId),
+				resourceAccounting: result.inferenceReceipt?.qualified ? "supervisor-enforced" : result.inferenceReceipt ? "incomplete" : result.calls !== null && result.tokens !== null ? "guest-reported" : "incomplete",
+				...(result.inferenceReceipt ? { inferenceReceipt: result.inferenceReceipt } : {}),
+				validity: result.validity, calls: result.inferenceReceipt?.calls ?? result.calls, tokens: result.inferenceReceipt?.totalTokens ?? result.tokens, wallTimeMs: result.wallTimeMs,
 				stopReason: result.stopReason, patchDigest, evaluatorDigest: task.verifierDigest,
 				artifactRefs: { ...(patchArtifact ? { patch: patchArtifact } : {}), stdout: stdoutArtifact.sha256, stderr: stderrArtifact.sha256 },
 				...(failure ? { failure } : {}),
@@ -459,6 +483,12 @@ export function printBenchmarkSummary(attempts: BenchmarkAttempt[]): string {
 	const calls = attempts.reduce((sum, attempt) => sum + (attempt.calls ?? 0), 0)
 	const tokens = attempts.reduce((sum, attempt) => sum + (attempt.tokens ?? 0), 0)
 	const wallMs = attempts.reduce((sum, attempt) => sum + attempt.wallTimeMs, 0)
+	const denials = new Map<string, number>()
+	for (const attempt of attempts) for (const denial of attempt.inferenceReceipt?.denials ?? []) {
+		const key = `${denial.statusCode}:${denial.reason}`
+		denials.set(key, (denials.get(key) ?? 0) + denial.count)
+	}
+	const denialSummary = [...denials.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, count]) => `${key}=${count}`).join(",") || "none"
 	const failures = attempts.filter((attempt) => !attempt.verifiedSuccess).map((attempt) => `${attempt.taskId}: ${attempt.validity}${attempt.failure ? ` (${attempt.failure})` : ""}`).join("\n")
-	return `RSI benchmark: ${successes}/${attempts.length} verified\nProof-qualified: ${proofQualified}/${attempts.length}; local Ollama resource ceilings are not broker-enforced\nGuest-reported calls: ${calls}; guest-reported tokens: ${tokens}; measured wall time: ${wallMs} ms${failures ? `\nFailures:\n${failures}` : ""}`
+	return `RSI benchmark: ${successes}/${attempts.length} verified\nProof-qualified: ${proofQualified}/${attempts.length}; local Ollama resource ceilings are not broker-enforced\nGuest-reported calls: ${calls}; guest-reported tokens: ${tokens}; measured wall time: ${wallMs} ms\nAuthenticated broker denials: ${denialSummary}${failures ? `\nFailures:\n${failures}` : ""}`
 }

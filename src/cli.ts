@@ -1098,7 +1098,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 			.filter(Boolean),
 	)
 	const useLocalCodeBackend = localBackendModes.has(options.mode) && codeModeBackend === "ollama"
-	const apiKey = process.env.HEADLESSCODE_OPENROUTER_API_KEY
+	const apiKey = process.env.HEADLESSCODE_OPENROUTER_API_KEY ?? process.env.HEADLESSCODE_RSI_INFERENCE_CAPABILITY
 	if (!apiKey && !useLocalCodeBackend) {
 		process.stderr.write(
 			"headlesscode: HEADLESSCODE_OPENROUTER_API_KEY is not set.\n" +

@@ -18,6 +18,7 @@ RUN npm ci --no-audit --no-fund
 COPY src ./src
 COPY shared ./shared
 COPY scripts/spawn-parallel-worktrees.sh scripts/run-worker.sh scripts/headlesscode-answer.sh ./scripts/
+RUN chmod -R a+rX /opt/headlesscode/src /opt/headlesscode/shared /opt/headlesscode/scripts
 RUN printf '%s\n' "$HEADLESSCODE_HARNESS_COMMIT" > /opt/headlesscode/.headlesscode-harness-commit
 LABEL org.capsize.headlesscode.harness-commit="$HEADLESSCODE_HARNESS_COMMIT"
 RUN chmod +x scripts/spawn-parallel-worktrees.sh scripts/run-worker.sh scripts/headlesscode-answer.sh
@@ -27,4 +28,8 @@ RUN mkdir -p /opt/headlesscode-session /opt/headlesscode-data/projects /opt/head
 ENV HEADLESSCODE_ROOT=/opt/headlesscode
 WORKDIR /sandbox
 USER sandbox
+RUN test -r /opt/headlesscode/src/cli.ts \
+    && test -r /opt/headlesscode/src/memory/local.ts \
+    && test -x /opt/headlesscode/src/memory \
+    && test ! -w /opt/headlesscode/src/memory
 CMD ["sleep", "infinity"]

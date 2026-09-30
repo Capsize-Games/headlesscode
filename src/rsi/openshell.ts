@@ -11,6 +11,7 @@ import type { OpenShellSessionProviderOptions } from "../cloud/openshell-provide
 import type { CloudSessionRequest, CommandResult, SessionHandle } from "../cloud/provider.js"
 import type { CandidateRecord, CommandRunner, RsiConfig, TrialResult } from "./types.js"
 import { ADVERSARIAL_RUNNER_PATH, ADVERSARIAL_TESTS_PATH } from "./adversarial.js"
+import { RSI_OPENROUTER_MODEL } from "./inference-broker.js"
 
 const POLICY_PATH = fileURLToPath(new URL("../../shared/openshell/headlesscode-policy.yaml", import.meta.url))
 const MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024
@@ -30,6 +31,12 @@ export interface RsiOpenShellProvider {
 
 export type RsiOpenShellProviderFactory = (options: OpenShellSessionProviderOptions) => RsiOpenShellProvider
 
+export interface RsiInferenceBrokerAccess {
+	guestBaseUrl: string
+	capability: string
+	port: number
+}
+
 export interface IsolatedRunOptions {
 	config: RsiConfig
 	sourceRoot: string
@@ -42,6 +49,7 @@ export interface IsolatedRunOptions {
 	extraFiles?: Record<string, Buffer>
 	image?: string
 	providerFactory?: RsiOpenShellProviderFactory
+	inferenceBroker?: RsiInferenceBrokerAccess
 }
 
 function execFileBuffer(command: string, args: string[], options: { cwd?: string; input?: Buffer | string } = {}): Buffer {
@@ -265,9 +273,23 @@ function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`
 }
 
-function workerEnvironment(config: RsiConfig, candidate: CandidateRecord): Record<string, string> {
+export function rsiMutationGuestEnvironment(config: RsiConfig, candidate: CandidateRecord, inferenceBroker?: RsiInferenceBrokerAccess): Record<string, string> {
 	const worker = config.roles?.worker
-	if (worker && worker.provider !== "ollama") throw new Error("RSI OpenShell currently permits only the local Ollama worker; other providers require an explicit reviewed credential policy")
+	const provider = worker?.provider ?? "ollama"
+	if (provider === "openrouter") {
+		if (!inferenceBroker || worker?.model !== RSI_OPENROUTER_MODEL) throw new Error(`RSI OpenRouter requires a host broker and pinned model ${RSI_OPENROUTER_MODEL}`)
+		if (!/^http:\/\/host\.openshell\.internal:\d+$/.test(inferenceBroker.guestBaseUrl) || !Number.isInteger(inferenceBroker.port) || inferenceBroker.port < 1 || inferenceBroker.port > 65535) throw new Error("RSI OpenRouter broker endpoint is malformed")
+		return {
+			HEADLESSCODE_CODE_MODE_BACKEND: "openrouter",
+			HEADLESSCODE_CODE_MODE_MODEL: worker.model,
+			OPENROUTER_BASE_URL: inferenceBroker.guestBaseUrl,
+			HEADLESSCODE_RSI_INFERENCE_CAPABILITY: inferenceBroker.capability,
+			HEADLESSCODE_CAPTURE_TRANSCRIPT_DIR: path.join("/workspace", ".headlesscode", "rsi-transcripts"),
+			HEADLESSCODE_MAX_ITERATIONS: String(config.maxIterations),
+			HEADLESSCODE_MAX_DURATION_MS: String(config.commandTimeoutMs),
+		}
+	}
+	if (provider !== "ollama") throw new Error("RSI OpenShell worker provider must be ollama or explicitly brokered openrouter")
 	const host = process.env.HEADLESSCODE_RSI_OLLAMA_HOST?.trim() || "host.openshell.internal"
 	if (host !== "host.openshell.internal") throw new Error("RSI OpenShell permits Ollama access only through host.openshell.internal:11434")
 	return {
@@ -282,8 +304,15 @@ function workerEnvironment(config: RsiConfig, candidate: CandidateRecord): Recor
 	}
 }
 
-export function networkRules(mode: IsolatedRunOptions["mode"]): Record<string, unknown> {
+export function networkRules(mode: IsolatedRunOptions["mode"], inferenceBroker?: RsiInferenceBrokerAccess): Record<string, unknown> {
 	if (mode !== "mutation") return {}
+	if (inferenceBroker) return {
+		rsi_openrouter_broker: {
+			name: "rsi-openrouter-broker-only",
+			endpoints: [{ host: "host.openshell.internal", port: inferenceBroker.port, protocol: "tcp" }],
+			binaries: [{ path: "/usr/local/bin/node" }],
+		},
+	}
 	const host = process.env.HEADLESSCODE_RSI_OLLAMA_HOST?.trim() || "host.openshell.internal"
 	if (host !== "host.openshell.internal") throw new Error("RSI OpenShell permits Ollama access only through host.openshell.internal:11434")
 	return {
@@ -321,7 +350,7 @@ export function inspectLocalRsiCheckpoint(configuredBase: string, mode: Isolated
 	return { path: source, files, bytes }
 }
 
-function providerOptions(config: RsiConfig, mode: IsolatedRunOptions["mode"], timeoutMs: number, imageReference?: string): OpenShellSessionProviderOptions {
+function providerOptions(config: RsiConfig, mode: IsolatedRunOptions["mode"], timeoutMs: number, imageReference?: string, inferenceBroker?: RsiInferenceBrokerAccess): OpenShellSessionProviderOptions {
 	const policy = process.env.HEADLESSCODE_OPENSHELL_POLICY ?? POLICY_PATH
 	const configuredImage = process.env.HEADLESSCODE_OPENSHELL_IMAGE?.trim()
 	const trainingMode = mode === "training" || mode === "model-evaluation"
@@ -345,7 +374,7 @@ function providerOptions(config: RsiConfig, mode: IsolatedRunOptions["mode"], ti
 		includeProjectData: false,
 		projectIdentityRoot: "/workspace",
 		commandTimeoutMs: timeoutMs,
-		networkPolicy: networkRules(mode),
+		networkPolicy: networkRules(mode, inferenceBroker),
 		...(trainingMode ? { readOnlyMounts } : {}),
 		...(mode === "training" ? { gpu: 1 } : {}),
 	}
@@ -461,7 +490,7 @@ async function runSnapshot(options: IsolatedRunOptions & { preserveSnapshot?: bo
 		execFileSync("git", ["-c", "core.hooksPath=/dev/null", "commit", "--amend", "--quiet", "--no-edit"], { cwd: snapshot, env: snapshotCommitEnvironment() })
 	}
 	const factory = options.providerFactory ?? ((providerConfig) => new OpenShellSessionProvider(providerConfig))
-	const provider = factory(providerOptions(options.config, options.mode, options.timeoutMs, options.image))
+	const provider = factory(providerOptions(options.config, options.mode, options.timeoutMs, options.image, options.inferenceBroker))
 	const request = makeRequest(options.config.repoRoot, name, options.env ?? {})
 	let handle: SessionHandle | undefined
 	const started = Date.now()
@@ -540,7 +569,7 @@ export async function runOpenShellModelJob(candidate: CandidateRecord, config: R
 	}
 }
 
-export async function runOpenShellMutation(candidate: CandidateRecord, config: RsiConfig, providerFactory?: RsiOpenShellProviderFactory, image?: string): Promise<{ ok: boolean; result?: TrialResult; error?: string; patchRejected?: boolean; calls?: number | null; tokens?: number | null }> {
+export async function runOpenShellMutation(candidate: CandidateRecord, config: RsiConfig, providerFactory?: RsiOpenShellProviderFactory, image?: string, inferenceBroker?: RsiInferenceBrokerAccess): Promise<{ ok: boolean; result?: TrialResult; error?: string; patchRejected?: boolean; calls?: number | null; tokens?: number | null }> {
 	try {
 		const workerCommand = [
 			"/opt/headlesscode/node_modules/.bin/tsx",
@@ -572,7 +601,7 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 			'test -z "${HEADLESSCODE_OPENROUTER_API_KEY:-}${OPENROUTER_API_KEY:-}${OPENAI_API_KEY:-}${ANTHROPIC_API_KEY:-}"',
 		]
 		const boundaryGuard = `${boundaryChecks.map((check) => `(${check}) || { echo RSI_BENCHMARK_PREFLIGHT_FAILURE >&2; exit 79; }`).join(" && ")} && exec ${workerCommand}`
-		const env = workerEnvironment(config, candidate)
+		const env = rsiMutationGuestEnvironment(config, candidate, inferenceBroker)
 		const isolation = await runSnapshot({
 			config,
 			sourceRoot: candidate.worktree,
@@ -582,6 +611,7 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 			mode: "mutation",
 			sessionName: `rsi-mutation-${candidate.id}-${randomUUID().slice(0, 6)}`,
 			env,
+			inferenceBroker,
 			image,
 			providerFactory,
 		})

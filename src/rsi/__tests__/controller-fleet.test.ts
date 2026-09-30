@@ -238,6 +238,39 @@ test("fleet controller queues baseline and all candidate evaluations before wait
 	}
 })
 
+test("OpenRouter mutation resource is recorded as REMOTE_API for first dispatch and resume", async () => {
+	const { root, config } = await setup()
+	const queue = new FakeFleetQueue(1)
+	const saved = Object.fromEntries([
+		"HEADLESSCODE_RSI_OPENROUTER_MAX_INPUT_PRICE_PER_MILLION_USD", "HEADLESSCODE_RSI_OPENROUTER_MAX_OUTPUT_PRICE_PER_MILLION_USD",
+		"HEADLESSCODE_RSI_OPENROUTER_MAX_CALL_SPEND_USD", "HEADLESSCODE_RSI_OPENROUTER_MAX_JOB_SPEND_USD", "HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD",
+		"HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD", "HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD",
+	].map((name) => [name, process.env[name]]))
+	try {
+		Object.assign(process.env, {
+			HEADLESSCODE_RSI_OPENROUTER_MAX_INPUT_PRICE_PER_MILLION_USD: "1",
+			HEADLESSCODE_RSI_OPENROUTER_MAX_OUTPUT_PRICE_PER_MILLION_USD: "1",
+			HEADLESSCODE_RSI_OPENROUTER_MAX_CALL_SPEND_USD: "0.01",
+			HEADLESSCODE_RSI_OPENROUTER_MAX_JOB_SPEND_USD: "0.04",
+			HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD: "0.10",
+			HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD: "0.04",
+			HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD: "0.04",
+		})
+		const model = "deepseek/deepseek-v4-flash-0731"
+		const run = await runRsi({ ...config, population: 1, roles: { worker: { provider: "openrouter", model } } }, { log: () => undefined }, queue as unknown as PostgresRsiJobQueue)
+		const submitted = [...queue.jobs.values()].find((job) => job.jobKind === "mutation")
+		assert.equal(submitted?.resourceClass, "REMOTE_API")
+		assert.equal(submitted?.concurrencyKey, `openrouter:${model}`)
+		assert.equal(run.jobs?.find((job) => job.kind === "mutation")?.resource.class, "REMOTE_API")
+	} finally {
+		for (const [name, value] of Object.entries(saved)) {
+			if (value === undefined) delete process.env[name]
+			else process.env[name] = value
+		}
+		await fs.rm(root, { recursive: true, force: true })
+	}
+})
+
 test("fleet baseline resume rejects a stale idempotency row before waiting", async () => {
 	const { root, config } = await setup()
 	const queue = new FakeFleetQueue(1)
@@ -504,6 +537,7 @@ test("fleet resume reattaches to the persisted mutation idempotency key without 
 			snapshotCommit: snapshot.snapshotCommit,
 			task: config.mutationTask,
 			model: config.model,
+			provider: "ollama",
 			maxIterations: config.maxIterations,
 			timeoutMs: config.commandTimeoutMs,
 			protectedPaths: config.protectedPaths,
@@ -581,6 +615,7 @@ test("fleet resume recognizes an applied patch before the status checkpoint and 
 			snapshotCommit: snapshot.snapshotCommit,
 			task: config.mutationTask,
 			model: config.model,
+			provider: "ollama",
 			maxIterations: config.maxIterations,
 			timeoutMs: config.commandTimeoutMs,
 			protectedPaths: config.protectedPaths,

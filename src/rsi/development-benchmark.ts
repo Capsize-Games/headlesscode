@@ -55,6 +55,8 @@ export async function runDevelopmentBenchmarkForCommit(args: {
 	outputRoot: string
 	harnessCommit: string
 	model: string
+	provider?: "openshell-ollama" | "openshell-openrouter"
+	campaignId?: string
 }): Promise<BenchmarkAttempt[]> {
 	const repoRoot = path.resolve(args.repoRoot)
 	const loaded = await loadBenchmark(args.fixturesRoot, repoRoot)
@@ -62,7 +64,7 @@ export async function runDevelopmentBenchmarkForCommit(args: {
 	const verifierCommit = git(repoRoot, ["rev-parse", "HEAD"])
 	const verifierImage = buildCommitImage(repoRoot, verifierCommit)
 	return await withCommitWorktree(repoRoot, args.harnessCommit, async (harnessRoot) => {
-		const agent = new OpenShellBenchmarkAgent(harnessRoot, undefined, agentImage.name, args.harnessCommit)
+		const agent = new OpenShellBenchmarkAgent(harnessRoot, undefined, agentImage.name, args.harnessCommit, undefined, args.provider ?? "openshell-ollama")
 		const verifier = new OpenShellBenchmarkVerifier(repoRoot, undefined, verifierImage.name)
 		return await runBenchmark({
 			loaded,
@@ -74,6 +76,8 @@ export async function runDevelopmentBenchmarkForCommit(args: {
 			sampling: { temperature: 0, think: false, seed: "provider-default" },
 			split: "development",
 			outputRoot: path.join(args.outputRoot, "harness", args.harnessCommit),
+			...(args.campaignId ? { inferenceCampaignId: args.campaignId } : {}),
+			inferenceLedgerPath: path.join(args.outputRoot, "openrouter-inference-ledger.json"),
 		})
 	})
 }

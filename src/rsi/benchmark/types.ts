@@ -1,3 +1,5 @@
+import type { OpenRouterBrokerReceipt } from "../inference-broker.js"
+
 export type BenchmarkSplit = "development" | "confirmation"
 
 export interface BenchmarkResourceCeilings {
@@ -37,6 +39,9 @@ export interface BenchmarkManifest {
 
 export interface BenchmarkAgentRequest {
 	taskId: string
+	attemptId: string
+	campaignId: string
+	brokerLedgerPath: string
 	task: string
 	seed: number
 	workspace: string
@@ -54,6 +59,7 @@ export interface BenchmarkAgentResult {
 	tokens: number | null
 	wallTimeMs: number
 	stopReason: string
+	inferenceReceipt?: OpenRouterBrokerReceipt
 }
 
 export interface BenchmarkImageIdentity {
@@ -66,6 +72,7 @@ export interface BenchmarkAgent {
 	readonly provider: string
 	imageIdentity?(harnessCommit: string): Promise<BenchmarkImageIdentity>
 	run(request: BenchmarkAgentRequest): Promise<BenchmarkAgentResult>
+	verifyReceipt?(attemptId: string, receipt: OpenRouterBrokerReceipt, brokerLedgerPath: string): Promise<boolean>
 }
 
 export interface BenchmarkAttempt {
@@ -85,6 +92,7 @@ export interface BenchmarkAttempt {
 	/** True only when a trusted supervisor boundary enforced all requested resource ceilings. */
 	proofQualified: boolean
 	resourceAccounting: "guest-reported" | "supervisor-enforced" | "incomplete"
+	inferenceReceipt?: OpenRouterBrokerReceipt
 	validity: BenchmarkAgentResult["validity"]
 	calls: number | null
 	tokens: number | null
