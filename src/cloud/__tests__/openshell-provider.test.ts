@@ -4,7 +4,7 @@ import { createServer } from "node:http"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { OpenShellSessionProvider, validateReadOnlyMountTargets } from "../openshell-provider.js"
+import { OpenShellSessionProvider, runOpenShellCommandAsync, validateReadOnlyMountTargets } from "../openshell-provider.js"
 import type { CloudSessionRequest } from "../provider.js"
 
 async function testIsolatedCloneExportAndImport(): Promise<void> {
@@ -168,6 +168,17 @@ async function testSandboxNameIsStableAndDistinct(): Promise<void> {
 	assert.match(first, /^[a-z0-9](?:[a-z0-9-]{0,17}[a-z0-9])?$/, "the sandbox name is a DNS-safe label")
 }
 
+async function testAsyncOpenShellCommandReportsSafeExitAndTimeoutDetails(): Promise<void> {
+	const nonzero = await runOpenShellCommandAsync(["-e", "process.exit(7)"], undefined, process.execPath)
+	assert.equal(nonzero.exitCode, 7)
+	assert.match(nonzero.output, /exitCode=7/)
+	assert.doesNotMatch(nonzero.output, /process\.exit|--task|API_KEY/i, "diagnostics omit command arguments and environment")
+	const timeout = await runOpenShellCommandAsync(["-e", "setTimeout(() => {}, 10000)"], 25, process.execPath)
+	assert.equal(timeout.exitCode, 1)
+	assert.match(timeout.output, /timeout=true/)
+	assert.match(timeout.output, /signal=SIGTERM/)
+}
+
 testIsolatedCloneExportAndImport().then(
 	() => console.log("  ok   OpenShell exports isolated clone results without mounting the host worktree"),
 	(error) => { console.error(error); process.exitCode = 1 },
@@ -180,5 +191,10 @@ testSandboxNameIsStableAndDistinct().then(
 
 testReadOnlyMountTargetsAreSafeAndNonOverlapping().then(
 	() => console.log("  ok   OpenShell read-only mount targets are safe and non-overlapping"),
+	(error) => { console.error(error); process.exitCode = 1 },
+)
+
+testAsyncOpenShellCommandReportsSafeExitAndTimeoutDetails().then(
+	() => console.log("  ok   OpenShell async command errors report safe exit and timeout details"),
 	(error) => { console.error(error); process.exitCode = 1 },
 )

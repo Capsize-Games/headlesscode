@@ -85,14 +85,15 @@ try {
 
 	const imageName = `headlesscode-openshell-rsi:${harnessCommit}`
 	const agent = new OpenShellBenchmarkAgent(repoRoot, undefined, imageName, harnessCommit, undefined, "openshell-openrouter", brokerFactory)
-	const result = await agent.run({
+const result = await agent.run({
 		taskId: "mock-openrouter-smoke", attemptId: `attempt-${Date.now()}-mock`, campaignId: "rsi-mock-guest-smoke",
 		brokerLedgerPath: path.join(root, "broker-ledger.json"), task: taskPrompt,
 		seed: 17, workspace, harnessCommit,
 		model: { provider: "openshell-openrouter", id: RSI_OPENROUTER_MODEL, sampling: { temperature: 0 } },
 		ceilings: { maxCalls: 3, maxOutputTokensPerCall: 256, timeoutMs: 120_000, maxPatchBytes: 256 * 1024 },
-	})
-	assert.equal(result.validity, "valid", result.stderr)
+})
+if (result.validity !== "valid") process.stderr.write(`SMOKE_DIAGNOSTICS ${JSON.stringify({ validity: result.validity, stopReason: result.stopReason, stderr: result.stderr.replaceAll(key, "[REDACTED_KEY]").replaceAll(taskPrompt, "[REDACTED_TASK]"), stdoutLength: result.stdout.length, upstreamCalls, receipt: result.inferenceReceipt })}\n`)
+assert.equal(result.validity, "valid", result.stderr)
 	assert.ok(result.patch)
 	assert.equal(result.inferenceReceipt?.qualified, true)
 	assert.equal(result.inferenceReceipt?.calls, 3)

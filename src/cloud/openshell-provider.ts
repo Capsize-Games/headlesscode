@@ -83,17 +83,28 @@ export interface OpenShellSessionProviderOptions {
 	listSandboxes?: () => string[]
 }
 
-function runOpenShellCommandAsync(args: string[], timeoutMs?: number): Promise<CommandResult> {
+export function runOpenShellCommandAsync(args: string[], timeoutMs?: number, executable = "openshell"): Promise<CommandResult> {
 	return new Promise((resolve, reject) => {
-		execFile("openshell", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs }, (error, stdout, stderr) => {
+		execFile(executable, args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs }, (error, stdout, stderr) => {
 			if (error && (error as NodeJS.ErrnoException).code === "ENOENT") {
 				reject(new Error("OpenShell CLI executable was not found"))
 				return
 			}
-			const code = error && typeof (error as NodeJS.ErrnoException & { code?: unknown }).code === "number"
-				? (error as NodeJS.ErrnoException & { code: number }).code
-				: error ? 1 : 0
-			resolve({ exitCode: code, output: `${stdout ?? ""}${stderr ?? ""}`.trim() })
+			const errorCode = (error as NodeJS.ErrnoException & { code?: unknown } | null)?.code
+			const code = typeof errorCode === "number" ? errorCode : error ? 1 : 0
+			let output = `${stdout ?? ""}${stderr ?? ""}`.trim()
+			if (error && !output) {
+				const processError = error as NodeJS.ErrnoException & { signal?: unknown; killed?: boolean }
+				const signal = processError.signal
+				const timedOut = errorCode === "ETIMEDOUT" || (timeoutMs !== undefined && processError.killed === true && typeof signal === "string")
+				const details = [
+					timedOut ? "timeout=true" : undefined,
+					typeof errorCode === "string" ? `code=${errorCode}` : `exitCode=${code}`,
+					typeof signal === "string" ? `signal=${signal}` : undefined,
+				].filter(Boolean)
+				output = `OpenShell CLI returned no output (${details.join(" ")})`
+			}
+			resolve({ exitCode: code, output })
 		})
 	})
 }
