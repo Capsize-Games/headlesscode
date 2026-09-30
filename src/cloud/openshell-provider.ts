@@ -5,7 +5,7 @@
  * After sandbox deletion, a verified Git bundle imports changes to the assigned
  * host branch.
  */
-import { execFileSync, spawnSync } from "node:child_process"
+import { execFile, execFileSync, spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import * as fs from "node:fs"
 import * as os from "node:os"
@@ -78,7 +78,24 @@ export interface OpenShellSessionProviderOptions {
 	/** Number of GPU devices requested for a training-only sandbox. */
 	gpu?: number
 	run?: (args: string[], timeoutMs?: number) => CommandResult
+	/** Async command runner used for long guest commands so host services can keep serving requests. */
+	runAsync?: (args: string[], timeoutMs?: number) => Promise<CommandResult>
 	listSandboxes?: () => string[]
+}
+
+function runOpenShellCommandAsync(args: string[], timeoutMs?: number): Promise<CommandResult> {
+	return new Promise((resolve, reject) => {
+		execFile("openshell", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs }, (error, stdout, stderr) => {
+			if (error && (error as NodeJS.ErrnoException).code === "ENOENT") {
+				reject(new Error("OpenShell CLI executable was not found"))
+				return
+			}
+			const code = error && typeof (error as NodeJS.ErrnoException & { code?: unknown }).code === "number"
+				? (error as NodeJS.ErrnoException & { code: number }).code
+				: error ? 1 : 0
+			resolve({ exitCode: code, output: `${stdout ?? ""}${stderr ?? ""}`.trim() })
+		})
+	})
 }
 
 export class OpenShellSessionProvider implements CloudProvider {
@@ -92,6 +109,7 @@ export class OpenShellSessionProvider implements CloudProvider {
 	private readonly namePrefix: string
 	private readonly readOnlyMounts: Array<{ source: string; target: string }>
 	private readonly run: (args: string[], timeoutMs?: number) => CommandResult
+	private readonly runHarnessCommand: (args: string[], timeoutMs?: number) => Promise<CommandResult>
 	private readonly listSandboxes: () => string[]
 	private readonly importResults: boolean
 	private readonly scratchRoot: string
@@ -119,10 +137,14 @@ export class OpenShellSessionProvider implements CloudProvider {
 		this.commandTimeoutMs = options.commandTimeoutMs ?? 15 * 60_000
 		if (options.gpu !== undefined && (!Number.isInteger(options.gpu) || options.gpu < 1 || options.gpu > 8)) throw new Error("OpenShell GPU count must be an integer from 1 to 8")
 		this.gpu = options.gpu
-		this.run = options.run ?? ((args, timeoutMs) => {
+		const injectedRun = options.run
+		this.run = injectedRun ?? ((args, timeoutMs) => {
 			const result = spawnSync("openshell", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs })
 			return { exitCode: result.status ?? 1, output: `${result.stdout ?? ""}${result.stderr ?? ""}`.trim() }
 		})
+		this.runHarnessCommand = options.runAsync ?? (injectedRun
+			? async (args, timeoutMs) => injectedRun(args, timeoutMs)
+			: runOpenShellCommandAsync)
 		this.listSandboxes = options.listSandboxes ?? (() => {
 			const result = this.run(["sandbox", "list", "--output", "json"])
 			if (result.exitCode !== 0) throw new Error(`OpenShell sandbox list failed: ${result.output}`)
@@ -410,7 +432,7 @@ export class OpenShellSessionProvider implements CloudProvider {
 		if (!state) throw new Error(`OpenShell isolated workspace state is unavailable for ${name}`)
 		let mappedCommand = cmd.split(state.hostWorkspace).join(OPENSHELL_WORKSPACE_TARGET)
 		if (state.memoryHost) mappedCommand = mappedCommand.split(state.memoryHost).join("/opt/headlesscode-memory")
-		return this.run(["sandbox", "exec", "--name", name, "--workdir", OPENSHELL_WORKSPACE_TARGET, "--no-login-shell", "--", "/bin/bash", "-c", mappedCommand])
+		return this.runHarnessCommand(["sandbox", "exec", "--name", name, "--workdir", OPENSHELL_WORKSPACE_TARGET, "--no-login-shell", "--", "/bin/bash", "-c", mappedCommand], this.commandTimeoutMs)
 	}
 
 	async collectResults(handle: SessionHandle): Promise<Record<string, unknown>> {
