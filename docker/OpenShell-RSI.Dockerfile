@@ -11,6 +11,7 @@ RUN apt-get update \
     && rm -rf /opt/headlesscode/src/rsi \
     && find /opt/headlesscode/src -type d -name __tests__ -prune -exec rm -rf {} + \
     && find /opt/headlesscode/src -type f \( -name '*.test.ts' -o -name '*.spec.ts' \) -delete \
-    && rm -rf /opt/headlesscode/scripts/eval-suite
+    && rm -rf /opt/headlesscode/scripts/eval-suite \
+    && test ! -e /opt/headlesscode/src/rsi
 
 USER sandbox

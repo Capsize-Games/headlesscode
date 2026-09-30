@@ -28,4 +28,8 @@ RUN mkdir -p /opt/headlesscode-session /opt/headlesscode-data/projects /opt/head
 ENV HEADLESSCODE_ROOT=/opt/headlesscode
 WORKDIR /sandbox
 USER sandbox
+RUN test -r /opt/headlesscode/src/cli.ts \
+    && test -r /opt/headlesscode/src/memory/local.ts \
+    && test -x /opt/headlesscode/src/memory \
+    && test ! -w /opt/headlesscode/src/memory
 CMD ["sleep", "infinity"]
