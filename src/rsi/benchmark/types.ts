@@ -92,6 +92,8 @@ export interface BenchmarkAttempt {
 	/** True only when a trusted supervisor boundary enforced all requested resource ceilings. */
 	proofQualified: boolean
 	resourceAccounting: "guest-reported" | "supervisor-enforced" | "incomplete"
+	/** Digest of the durable proof admission request; present for restart-safe campaign attempts. */
+	proofRequestSha256?: string
 	inferenceReceipt?: OpenRouterBrokerReceipt
 	validity: BenchmarkAgentResult["validity"]
 	calls: number | null

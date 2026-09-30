@@ -249,6 +249,11 @@ export interface RunBenchmarkOptions {
 	agentImageIdentity?: BenchmarkImageIdentity | null
 	inferenceCampaignId?: string
 	inferenceLedgerPath?: string
+	attemptNamespace?: string
+	attemptLifecycle?: {
+		beforeAttempt: (input: { task: BenchmarkTask; attemptId: string; campaignId: string; harnessCommit: string; agentImage: BenchmarkImageIdentity | null; model: string; sampling: Record<string, number | string | boolean> }) => Promise<string | void>
+		settledAttempt: (input: { task: BenchmarkTask; attempt: BenchmarkAttempt }) => Promise<void>
+	}
 }
 
 async function artifactByDigest(store: FileRsiArtifactStore, root: string, digest: string): Promise<Buffer> {
@@ -266,7 +271,7 @@ async function applyAndVerify(task: BenchmarkTask, loaded: LoadedBenchmark, work
 }
 
 function cellId(loaded: LoadedBenchmark, task: BenchmarkTask, options: RunBenchmarkOptions, sampling: Record<string, number | string | boolean>, agentImage: BenchmarkImageIdentity | null): string {
-	return sha256(JSON.stringify([loaded.manifestDigest, task.id, options.harnessCommit, agentImage, options.agent.provider, options.modelId, sampling, task.seed]))
+	return sha256(JSON.stringify([loaded.manifestDigest, task.id, options.harnessCommit, agentImage, options.agent.provider, options.modelId, sampling, task.seed, options.attemptNamespace ?? null]))
 }
 
 export async function freezeBenchmarkProtocol(options: Omit<RunBenchmarkOptions, "agent" | "verifier" | "split" | "confirmProtocol" | "taskIds"> & { provider: string }): Promise<string> {
@@ -333,6 +338,7 @@ async function validateExistingAttempt(existing: BenchmarkAttempt, task: Benchma
 		if (existing.proofQualified !== false) throw new Error("existing benchmark attempt cannot claim aggregate-token proof qualification")
 	}
 	if (!existing.artifactRefs || typeof existing.artifactRefs !== "object" || !/^[a-f0-9]{64}$/.test(existing.artifactRefs.stdout) || !/^[a-f0-9]{64}$/.test(existing.artifactRefs.stderr)) throw new Error("existing benchmark attempt has invalid artifact references")
+	if (options.attemptLifecycle && !/^[a-f0-9]{64}$/.test(existing.proofRequestSha256 ?? "")) throw new Error("existing restart-safe benchmark attempt is missing its proof request digest")
 	if ((existing.artifactRefs.patch ?? null) !== existing.patchDigest || (existing.patchDigest !== null && !/^[a-f0-9]{64}$/.test(existing.patchDigest))) throw new Error("existing benchmark attempt patch digest is inconsistent")
 	if (existing.verifiedSuccess && (existing.validity !== "valid" || !existing.patchDigest)) throw new Error("existing benchmark attempt claims success without a valid patch")
 	if (existing.validity !== "valid" && existing.verifiedSuccess) throw new Error("non-valid benchmark attempt cannot be marked successful")
@@ -393,6 +399,7 @@ export async function runBenchmark(options: RunBenchmarkOptions & { replayFile?:
 						if (checked.success !== existing.verifiedSuccess) throw new Error("recorded benchmark attempt no longer matches its independent verifier result")
 					} else throw new Error("recorded benchmark attempt has a patch artifact for an unsupported result class")
 					} else if (existing.patchDigest !== null || existing.verifiedSuccess) throw new Error("recorded successful benchmark attempt is missing its patch")
+					if (options.attemptLifecycle) await options.attemptLifecycle.settledAttempt({ task, attempt: existing })
 					attempts.push(existing)
 					await fs.rm(workspace, { recursive: true, force: true })
 					continue
@@ -406,6 +413,8 @@ export async function runBenchmark(options: RunBenchmarkOptions & { replayFile?:
 				}
 				throw error
 			}
+			const proofRequestSha256 = await options.attemptLifecycle?.beforeAttempt({ task, attemptId, campaignId, harnessCommit: options.harnessCommit, agentImage, model: options.modelId, sampling })
+			if (proofRequestSha256 !== undefined && !/^[a-f0-9]{64}$/.test(proofRequestSha256)) throw new Error("attempt lifecycle returned a malformed proof request digest")
 			result = options.replayFile ? await loadReplayResult(options.replayFile) : await options.agent.run({
 				taskId: task.id, attemptId, campaignId, brokerLedgerPath: ledgerPath, task: task.task, seed: task.seed, workspace, harnessCommit: options.harnessCommit,
 				model: { provider: options.agent.provider, id: options.modelId, sampling }, ceilings: task.ceilings,
@@ -444,6 +453,7 @@ export async function runBenchmark(options: RunBenchmarkOptions & { replayFile?:
 				verifiedSuccess,
 				proofQualified: Boolean(result.inferenceReceipt?.qualified && result.inferenceReceipt.provider === "openrouter" && result.inferenceReceipt.jobId === attemptId && result.inferenceReceipt.campaignId === campaignId && result.inferenceReceipt.model === options.modelId && result.inferenceReceipt.returnedModels.length === 1 && result.inferenceReceipt.returnedModels[0] === options.modelId),
 				resourceAccounting: result.inferenceReceipt?.qualified ? "supervisor-enforced" : result.inferenceReceipt ? "incomplete" : result.calls !== null && result.tokens !== null ? "guest-reported" : "incomplete",
+				...(proofRequestSha256 ? { proofRequestSha256 } : {}),
 				...(result.inferenceReceipt ? { inferenceReceipt: result.inferenceReceipt } : {}),
 				validity: result.validity, calls: result.inferenceReceipt?.calls ?? result.calls, tokens: result.inferenceReceipt?.totalTokens ?? result.tokens, wallTimeMs: result.wallTimeMs,
 				stopReason: result.stopReason, patchDigest, evaluatorDigest: task.verifierDigest,
@@ -451,6 +461,7 @@ export async function runBenchmark(options: RunBenchmarkOptions & { replayFile?:
 				...(failure ? { failure } : {}),
 			}
 			await fs.writeFile(attemptPath, `${JSON.stringify(attempt, null, 2)}\n`, { mode: 0o600, flag: "wx" })
+			if (options.attemptLifecycle) await options.attemptLifecycle.settledAttempt({ task, attempt })
 			attempts.push(attempt)
 			} finally { await fs.rm(workspace, { recursive: true, force: true }) }
 	}

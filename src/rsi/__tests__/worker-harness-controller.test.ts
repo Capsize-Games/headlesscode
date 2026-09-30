@@ -37,7 +37,7 @@ async function main(): Promise<void> {
 			mutationTask: "add a small incremental improvement", regressionCommand: "npm test", evalCommands: ["visible"], hiddenEvalCommands: [],
 			archiveDir: path.join(repo, "archive"), worktreeDir: path.join(repo, "worktrees"), baseRef: "HEAD", seed: "worker-harness-controller",
 			dryRun: false, keepWorktrees: false, maxIterations: 2, maxTokens: 256, protectedPaths: [".env", "docker/", ".dockerignore"], commandTimeoutMs: 1000,
-			workerHarnessMode: "self-hosted", workerHarnessPairId: "controller-pair",
+			workerHarnessMode: "self-hosted",
 			workerHarnessRuntime: runtime,
 		}
 		const observed: Array<{ generation: number; mode: string; parentCommit: string; digest: string }> = []

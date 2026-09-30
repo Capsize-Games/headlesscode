@@ -298,6 +298,29 @@ and requires an operator to inspect the ledger and remove a stale lock. Fleet
 mutation reservations use PostgreSQL instead. Configure the database migration
 before scheduling brokered fleet work.
 
+Restart-safe paired proof campaigns freeze every planned generation in the
+manifest. They reject the `adaptive-independent` policy before campaign
+admission because an early stop would leave scheduled generations unmeasured.
+Use a fixed generation count for these campaigns.
+
+The proof manifest stores the digest of the complete benchmark manifest,
+including runner/version metadata, plus separate development and confirmation
+task digests. It also freezes the final-generation confirmation cells for every
+candidate slot and a root-control comparison in each arm. Mutation and
+benchmark inference use distinct broker campaign IDs derived from the shared
+proof campaign ID, so their allocation caps remain separate while their
+reservations count against the one PostgreSQL proof-campaign root ceiling.
+
+The current controller completes only the development phase. It records the
+arm as `evaluated` and releases its lease without finishing the proof campaign.
+A later confirmation phase can reacquire the same arm and use only the
+predeclared cells. Every selected final candidate and each root-control
+comparison must complete; each unused final candidate slot must be recorded
+with the zero-spend `not-selected` disposition. Only then may `finishArm`
+mark that arm terminal. Confirmation execution is not yet wired into the
+controller; until that work is added, these campaigns remain development-only
+and are not complete proof results.
+
 To exercise the worker image and guest network boundary without a production
 provider credential or paid request, build the exact current harness image
 from a clean checkout, then run the bounded mock-upstream smoke. This local

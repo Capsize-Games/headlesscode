@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url"
 import { OpenShellBenchmarkAgent, OpenShellBenchmarkVerifier } from "./benchmark/openshell-agent.js"
 import { loadBenchmark, runBenchmark } from "./benchmark/runner.js"
 import type { BenchmarkAttempt, BenchmarkImageIdentity } from "./benchmark/types.js"
+import type { RunBenchmarkOptions } from "./benchmark/runner.js"
 
 const moduleRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 const builtImages = new Set<string>()
@@ -57,6 +58,9 @@ export async function runDevelopmentBenchmarkForCommit(args: {
 	model: string
 	provider?: "openshell-ollama" | "openshell-openrouter"
 	campaignId?: string
+	inferenceLedgerPath?: string
+	attemptNamespace?: string
+	attemptLifecycle?: RunBenchmarkOptions["attemptLifecycle"]
 }): Promise<BenchmarkAttempt[]> {
 	const repoRoot = path.resolve(args.repoRoot)
 	const loaded = await loadBenchmark(args.fixturesRoot, repoRoot)
@@ -77,7 +81,9 @@ export async function runDevelopmentBenchmarkForCommit(args: {
 			split: "development",
 			outputRoot: path.join(args.outputRoot, "harness", args.harnessCommit),
 			...(args.campaignId ? { inferenceCampaignId: args.campaignId } : {}),
-			inferenceLedgerPath: path.join(args.outputRoot, "openrouter-inference-ledger.json"),
+			inferenceLedgerPath: args.inferenceLedgerPath ?? path.join(args.outputRoot, "openrouter-inference-ledger.json"),
+			...(args.attemptNamespace ? { attemptNamespace: args.attemptNamespace } : {}),
+			...(args.attemptLifecycle ? { attemptLifecycle: args.attemptLifecycle } : {}),
 		})
 	})
 }

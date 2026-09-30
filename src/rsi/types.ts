@@ -452,6 +452,16 @@ export interface RsiRunRecord {
 	workerHarnessSamplingSeed?: string
 	workerHarnessRuntime?: WorkerHarnessRuntimeIdentity
 	confirmationEvidence?: "unmeasured"
+	proofCampaign?: {
+		manifest: import("./proof-campaign.js").ProofCampaignManifest
+		manifestSha256: string
+		campaignId: string
+		armId: string
+		epoch: number
+		sequence?: number
+		ledgerSnapshot?: Record<string, unknown>
+		state: "running" | "evaluated" | "selected" | "rejected" | "finished"
+	}
 	adversarialReviews?: AdversarialReviewRecord[]
 	candidates: CandidateRecord[]
 	reports: string[]
