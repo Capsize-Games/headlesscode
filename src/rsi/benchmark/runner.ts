@@ -40,12 +40,13 @@ export async function benchmarkTreeDigest(root: string): Promise<string> {
 	return hash.digest("hex")
 }
 
-async function resolveFixture(root: string, relative: string): Promise<string> {
+export async function resolveBenchmarkFixturePath(root: string, relative: string): Promise<string> {
 	if (!safeRelative(relative)) throw new Error(`unsafe benchmark manifest path: ${relative}`)
 	const absolute = path.resolve(root, relative)
 	if (!absolute.startsWith(root + path.sep)) throw new Error(`benchmark fixture path escaped root: ${relative}`)
+	await assertNoSymlinkComponents(root, relative)
 	const stat = await fs.lstat(absolute)
-	if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`benchmark fixture is not a regular file: ${relative}`)
+	if (!stat.isFile()) throw new Error(`benchmark fixture is not a regular file: ${relative}`)
 	return absolute
 }
 
@@ -53,9 +54,23 @@ async function resolveStartDirectory(root: string, relative: string): Promise<st
 	if (!safeRelative(relative)) throw new Error(`unsafe benchmark manifest path: ${relative}`)
 	const absolute = path.resolve(root, relative)
 	if (!absolute.startsWith(root + path.sep)) throw new Error(`benchmark fixture path escaped root: ${relative}`)
+	await assertNoSymlinkComponents(root, relative)
 	const stat = await fs.lstat(absolute)
-	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`benchmark start snapshot is not a regular directory: ${relative}`)
+	if (!stat.isDirectory()) throw new Error(`benchmark start snapshot is not a regular directory: ${relative}`)
 	return absolute
+}
+
+async function assertNoSymlinkComponents(root: string, relative: string): Promise<void> {
+	const rootStat = await fs.lstat(root)
+	if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("benchmark fixture root must be a regular directory")
+	let current = root
+	const segments = relative.split("/")
+	for (let index = 0; index < segments.length; index++) {
+		current = path.join(current, segments[index]!)
+		const stat = await fs.lstat(current)
+		if (stat.isSymbolicLink()) throw new Error(`benchmark fixture path contains a symlink: ${relative}`)
+		if (index < segments.length - 1 && !stat.isDirectory()) throw new Error(`benchmark fixture path parent is not a directory: ${relative}`)
+	}
 }
 
 function parseManifest(raw: string): BenchmarkManifest {
@@ -134,9 +149,9 @@ export async function loadBenchmark(fixtureRoot = DEFAULT_FIXTURE_ROOT, repoRoot
 	const rawManifest = await fs.readFile(manifestPath, "utf8")
 	const manifest = parseManifest(rawManifest)
 	for (const task of manifest.tasks) {
-		const verifier = await resolveFixture(root, task.verifierPath)
-		const knownGood = task.knownGoodPath ? await resolveFixture(root, task.knownGoodPath) : undefined
-		const knownBad = task.knownBadPath ? await resolveFixture(root, task.knownBadPath) : undefined
+		const verifier = await resolveBenchmarkFixturePath(root, task.verifierPath)
+		const knownGood = task.knownGoodPath ? await resolveBenchmarkFixturePath(root, task.knownGoodPath) : undefined
+		const knownBad = task.knownBadPath ? await resolveBenchmarkFixturePath(root, task.knownBadPath) : undefined
 		const snapshot = await fs.mkdtemp(path.join(os.tmpdir(), `headlesscode-benchmark-snapshot-${task.id}-`))
 		try {
 			if (task.startCommit) {
@@ -379,9 +394,7 @@ export async function runBenchmark(options: RunBenchmarkOptions & { replayFile?:
 				taskId: task.id, task: task.task, seed: task.seed, workspace, harnessCommit: options.harnessCommit,
 				model: { provider: options.agent.provider, id: options.modelId, sampling }, ceilings: task.ceilings,
 			})
-			if (result.validity === "valid" && result.patch) {
-				if (!Number.isSafeInteger(result.wallTimeMs) || result.wallTimeMs < 0 || ![result.calls, result.tokens].every((count) => count === null || (Number.isSafeInteger(count) && count >= 0))) throw new Error("agent result contained invalid resource observations")
-			}
+			if (!Number.isSafeInteger(result.wallTimeMs) || result.wallTimeMs < 0 || result.wallTimeMs > task.ceilings.timeoutMs || ![result.calls, result.tokens].every((count) => count === null || (Number.isSafeInteger(count) && count >= 0))) throw new Error("agent result contained invalid or over-limit resource observations")
 			if (result.validity === "valid" && result.patch) {
 				patchDigest = sha256(result.patch)
 				if (result.patch.byteLength > task.ceilings.maxPatchBytes) throw new Error("agent patch exceeded the task patch limit")

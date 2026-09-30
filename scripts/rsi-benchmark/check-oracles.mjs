@@ -5,6 +5,7 @@ import * as path from "node:path"
 import { fileURLToPath } from "node:url"
 import { createHash } from "node:crypto"
 import { materializeBenchmarkSnapshot } from "../../src/rsi/benchmark/runner.ts"
+import { classifyOracleChild } from "../../src/rsi/benchmark/oracle-process.mjs"
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 const fixtureRoot = path.join(root, "fixtures/rsi-benchmark")
@@ -35,8 +36,8 @@ const runVerifier = async (task, commit, label) => {
 		// expected fail-before result and may include missing candidate modules or
 		// text about a timeout that the task is meant to fix.
 		const timedOut = result.error?.code === "ETIMEDOUT" || result.signal === "SIGTERM" || /spawnSync .* ETIMEDOUT|spawn .* ETIMEDOUT/i.test(output)
-		const infrastructure = Boolean(result.error || result.signal)
-		const kind = timedOut ? "timeout" : infrastructure ? "infrastructure-failure" : result.status === 0 ? "pass" : "test-failure"
+		const classified = classifyOracleChild(result)
+		const kind = timedOut ? "timeout" : classified
 		return {
 			elapsedMs: Date.now() - started,
 			kind,

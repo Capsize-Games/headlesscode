@@ -342,10 +342,12 @@ development and confirmation, across tool security, agent completion, provider
 runtime, and orchestration. Each task pins its starting tree, a known-good fix,
 and a supervisor verifier. `check-oracles` runs the known-good and untouched
 known-bad snapshots through the verifier in a separate OpenShell guest; it
-stops if the guest cannot complete the verifier. The coding guest receives one
-task repository and its task text, without the verifier files or confirmation
-fixtures. The fixture materializer rejects symlinks and submodules and checks
-tree paths and size limits before writing files.
+stops if the guest cannot complete the verifier. A historical test assertion
+failure rejects a known-bad snapshot; a verifier child timeout, signal, spawn
+error, or reserved infrastructure exit invalidates the pair. The coding guest
+receives one task repository and its task text, without the verifier files or
+confirmation fixtures. The fixture materializer rejects symlinks and
+submodules and checks tree paths and size limits before writing files.
 
 Build both worker images from the clean, exact Git commit with the image
 builder. It checks the worktree, safely materializes the selected commit, then

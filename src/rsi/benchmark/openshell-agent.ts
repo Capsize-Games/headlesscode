@@ -6,9 +6,11 @@ import * as path from "node:path"
 import { parseRsiArgs } from "../config.js"
 import { runOpenShellMutation } from "../openshell.js"
 import type { CandidateRecord } from "../types.js"
+import type { RsiOpenShellProviderFactory } from "../openshell.js"
 import { runOpenShellBenchmarkVerifier } from "../openshell.js"
 import type { BenchmarkAgent, BenchmarkAgentRequest, BenchmarkAgentResult, BenchmarkImageIdentity } from "./types.js"
 import type { BenchmarkTask } from "./types.js"
+import { resolveBenchmarkFixturePath } from "./runner.js"
 import type { BenchmarkVerifier } from "./runner.js"
 
 function git(cwd: string, args: string[]): string {
@@ -27,8 +29,9 @@ export async function initializeTaskRepository(root: string): Promise<string> {
 export class OpenShellBenchmarkAgent implements BenchmarkAgent {
 	readonly provider = "openshell-ollama"
 	private readonly harnessRoot: string
+	private readonly providerFactory?: RsiOpenShellProviderFactory
 	private cachedImageIdentity?: BenchmarkImageIdentity
-	constructor(harnessRoot = process.cwd()) { this.harnessRoot = path.resolve(harnessRoot) }
+	constructor(harnessRoot = process.cwd(), providerFactory?: RsiOpenShellProviderFactory) { this.harnessRoot = path.resolve(harnessRoot); this.providerFactory = providerFactory }
 
 	async imageIdentity(harnessCommit: string): Promise<BenchmarkImageIdentity> {
 		const name = "headlesscode-openshell-rsi:local"
@@ -72,7 +75,7 @@ export class OpenShellBenchmarkAgent implements BenchmarkAgent {
 		}
 		const started = Date.now()
 		try {
-			const outcome = await runOpenShellMutation(candidate, parsed.config, undefined, image.digest)
+			const outcome = await runOpenShellMutation(candidate, parsed.config, this.providerFactory, image.digest)
 			const elapsed = Date.now() - started
 			if (!outcome.ok) {
 				const reason = outcome.error ?? outcome.result?.stderr ?? "OpenShell mutation failed"
@@ -88,8 +91,9 @@ export class OpenShellBenchmarkAgent implements BenchmarkAgent {
 
 export class OpenShellBenchmarkVerifier implements BenchmarkVerifier {
 	private readonly harnessRoot: string
+	private readonly providerFactory?: RsiOpenShellProviderFactory
 	private cachedImageIdentity?: BenchmarkImageIdentity
-	constructor(harnessRoot = process.cwd()) { this.harnessRoot = path.resolve(harnessRoot) }
+	constructor(harnessRoot = process.cwd(), providerFactory?: RsiOpenShellProviderFactory) { this.harnessRoot = path.resolve(harnessRoot); this.providerFactory = providerFactory }
 
 	async imageIdentity(harnessCommit: string): Promise<BenchmarkImageIdentity> {
 		const name = "headlesscode-openshell-rsi:local"
@@ -106,8 +110,7 @@ export class OpenShellBenchmarkVerifier implements BenchmarkVerifier {
 	async run(task: BenchmarkTask, fixtureRoot: string, workspace: string): Promise<{ success: boolean; output: string }> {
 		const harnessCommit = git(this.harnessRoot, ["rev-parse", "HEAD"])
 		const image = await this.imageIdentity(harnessCommit)
-		const verifierPath = path.resolve(fixtureRoot, task.verifierPath)
-		if (!verifierPath.startsWith(path.resolve(fixtureRoot) + path.sep)) throw new Error(`verifier escaped fixture root for ${task.id}`)
+		const verifierPath = await resolveBenchmarkFixturePath(fixtureRoot, task.verifierPath)
 		const verifier = await fs.readFile(verifierPath)
 		if (createHash("sha256").update(verifier).digest("hex") !== task.verifierDigest) throw new Error(`verifier digest changed after manifest load: ${task.id}`)
 		const baseCommit = git(workspace, ["rev-parse", "HEAD"])
@@ -119,7 +122,8 @@ export class OpenShellBenchmarkVerifier implements BenchmarkVerifier {
 			worktree: workspace, baseCommit, status: "evaluating", model: "supervisor-verifier", mutation: task.task,
 			createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), commits: [], changedFiles: [], protectedPathViolations: [],
 		}
-		const result = await runOpenShellBenchmarkVerifier(candidate, parsed.config, verifier, task.id, undefined, image.digest)
+		const result = await runOpenShellBenchmarkVerifier(candidate, parsed.config, verifier, task.id, this.providerFactory, image.digest)
+		if (result.exitCode === 125) throw new Error(`OpenShell benchmark verifier reported child infrastructure failure: ${result.stdout || result.stderr}`)
 		return { success: result.ok, output: `${result.stdout}${result.stderr}`.slice(0, 16_384) }
 	}
 }

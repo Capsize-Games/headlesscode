@@ -4,7 +4,7 @@ import * as os from "node:os"
 import { createHash } from "node:crypto"
 import { execFileSync } from "node:child_process"
 import { initializeTaskRepository } from "./openshell-agent.js"
-import { materializeBenchmarkSnapshot } from "./runner.js"
+import { materializeBenchmarkSnapshot, resolveBenchmarkFixturePath } from "./runner.js"
 import type { LoadedBenchmark, BenchmarkVerifier } from "./runner.js"
 import type { BenchmarkTask } from "./types.js"
 
@@ -16,8 +16,7 @@ async function installOracle(loaded: LoadedBenchmark, task: BenchmarkTask, works
 		return
 	}
 	if (!oraclePath) throw new Error(`oracle has no solution reference: ${task.id}`)
-	const source = path.resolve(loaded.fixtureRoot, oraclePath)
-	if (!source.startsWith(loaded.fixtureRoot + path.sep)) throw new Error(`oracle escaped benchmark fixture root: ${task.id}`)
+	const source = await resolveBenchmarkFixturePath(loaded.fixtureRoot, oraclePath)
 	const raw = JSON.parse(await fs.readFile(source, "utf8")) as { files?: Record<string, string> }
 	if (!raw.files || typeof raw.files !== "object") throw new Error(`oracle has no file map: ${task.id}`)
 	for (const [relative, content] of Object.entries(raw.files)) {

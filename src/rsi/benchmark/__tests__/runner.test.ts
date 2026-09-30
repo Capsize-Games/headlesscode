@@ -40,6 +40,8 @@ const agent: BenchmarkAgent = {
 		await fs.rm(candidate, { recursive: true, force: true })
 		execFileSync("git", ["clone", "--quiet", "--no-hardlinks", "--shared", request.workspace, candidate], { stdio: ["ignore", "pipe", "pipe"] })
 		try {
+			execFileSync("git", ["config", "user.name", "RSI Benchmark Test"], { cwd: candidate })
+			execFileSync("git", ["config", "user.email", "rsi-benchmark-test@invalid.example"], { cwd: candidate })
 			for (const [relative, content] of Object.entries(oracle.files)) {
 				const target = path.join(candidate, relative)
 				await fs.mkdir(path.dirname(target), { recursive: true })
@@ -144,6 +146,14 @@ try {
 		verifier: { async run() { throw new Error("verifier sandbox launch failed") } },
 	}), /verifier sandbox launch failed/)
 	assert.deepEqual(await fs.readdir(path.join(verifierInfraRoot, "attempts")).catch(() => []), [], "verifier infrastructure failure must not create a scored attempt")
+
+	const malformedResourceRoot = path.join(tempRoot, "malformed-error-resources")
+	const malformedResourceAgent: BenchmarkAgent = {
+		provider: "fake-model",
+		async run() { return { validity: "agent-error", stdout: "worker failed", stderr: "worker failed", calls: -1, tokens: null, wallTimeMs: 1, stopReason: "worker-error" } },
+	}
+	await assert.rejects(runBenchmark({ loaded, agent: malformedResourceAgent, verifier, harnessCommit, modelId: "fake-malformed-error-resources", split: "development", outputRoot: malformedResourceRoot, taskIds: ["multi-01"] }), /invalid or over-limit resource observations/)
+	assert.deepEqual(await fs.readdir(path.join(malformedResourceRoot, "attempts")).catch(() => []), [], "invalid counters on a failed agent result must not become a scored attempt")
 
 	const identityRoot = path.join(tempRoot, "image-identity")
 	const savedImageIdentity = process.env.HEADLESSCODE_RSI_BENCHMARK_HARNESS_COMMIT

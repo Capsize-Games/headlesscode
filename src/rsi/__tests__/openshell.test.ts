@@ -8,12 +8,13 @@ import type { RsiOpenShellProviderFactory } from "../openshell.js"
 import type { CandidateRecord, RsiConfig } from "../types.js"
 import { parseRsiArgs } from "../config.js"
 
-async function run(mode: "source" | "escape" | "symlink" | "preflight"): Promise<void> {
+async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker-failure"): Promise<void> {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-openshell-"))
 	const worktree = path.join(repo, ".worktrees", "rsi", `candidate-${mode}`)
 	let guestPath = ""
 	let factoryOptions: Parameters<RsiOpenShellProviderFactory>[0] | undefined
 	let sessionEnv: Record<string, string> | undefined
+	let workerInvocations = 0
 	try {
 		execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: repo })
 		execFileSync("git", ["config", "user.name", "Test"], { cwd: repo })
@@ -85,6 +86,7 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight"): Promise
 				},
 				async waitReady() {},
 				async runHarness(_handle, command) {
+					workerInvocations += 1
 					assert.match(command, /rev-list --count HEAD/)
 					assert.match(command, /\/opt\/headlesscode\/src\/rsi/)
 					assert.match(command, /OPENROUTER_API_KEY/)
@@ -92,6 +94,8 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight"): Promise
 						assert.match(command, /headlesscode-harness-commit/)
 						return { exitCode: 79, output: "RSI_BENCHMARK_PREFLIGHT_FAILURE wrong harness image commit" }
 					}
+					assert.equal(command.split("/opt/headlesscode/src/cli.ts").length - 1, 1, "the benchmark coding worker command must execute exactly once")
+					if (mode === "worker-failure") return { exitCode: 1, output: "model process failed" }
 					if (mode === "source") {
 						fs.writeFileSync(path.join(guestPath, "src", "engine", "loop.ts"), "export const value = 2\n")
 					} else if (mode === "escape") {
@@ -112,6 +116,14 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight"): Promise
 		if (mode === "preflight") {
 			await assert.rejects(runOpenShellMutation(candidate, config, providerFactory), /OpenShell benchmark preflight failed/)
 			assert.equal(fs.readFileSync(path.join(worktree, "src", "engine", "loop.ts"), "utf8"), "export const value = 1\n", "wrong harness image must abort before task code runs")
+			return
+		}
+		if (mode === "worker-failure") {
+			const result = await runOpenShellMutation(candidate, config, providerFactory)
+			assert.equal(result.ok, false)
+			assert.match(result.error ?? "", /OpenShell mutation worker failed/)
+			assert.doesNotMatch(result.error ?? "", /preflight failed/)
+			assert.equal(workerInvocations, 1)
 			return
 		}
 		const imageRef = mode === "source" ? `sha256:${"a".repeat(64)}` : undefined
@@ -141,6 +153,7 @@ await run("source")
 await run("escape")
 await run("symlink")
 await run("preflight")
+await run("worker-failure")
 
 {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-benchmark-verifier-"))
@@ -181,6 +194,10 @@ await run("preflight")
 		assert.equal(result.exitCode, 1, "completed verifier assertion failure is a task rejection, not infrastructure failure")
 		assert.equal(tornDown, true)
 		assert.equal(fs.existsSync(verifierGuest), false, "verifier guest snapshot is removed after teardown")
+		await assert.rejects(runOpenShellBenchmarkVerifier(candidate, parsed.config, Buffer.from("true\n"), "multi-01", () => ({
+			async spawnExistingWorktreeSession(_request, snapshot) { verifierGuest = snapshot; return { id: "timeout-marker", provider: "mock-openshell", address: snapshot } },
+			async waitReady() {}, async runHarness() { return { exitCode: 125, output: "RSI_BENCHMARK_VERIFIER_INFRA_FAILURE:ETIMEDOUT\nRSI_BENCHMARK_VERIFIER_COMPLETED:125\n" } }, async teardown() { tornDown = true },
+		})), /child reported infrastructure failure/)
 		await assert.rejects(runOpenShellBenchmarkVerifier(candidate, parsed.config, Buffer.from("true\n"), "multi-01", () => ({
 			async spawnExistingWorktreeSession(_request, snapshot) { verifierGuest = snapshot; return { id: "missing-marker", provider: "mock-openshell", address: snapshot } },
 			async waitReady() {}, async runHarness() { return { exitCode: 1, output: "sandbox transport failed" } }, async teardown() { tornDown = true },

@@ -570,7 +570,6 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 				? "test -z \"$(find /opt/headlesscode/src -type f \\( -path '*/__tests__/*' -o -name '*.test.*' -o -name '*.spec.*' \\) -print -quit)\""
 				: "test -z \"$(find /workspace /opt/headlesscode/src -type f \\( -path '*/__tests__/*' -o -name '*.test.*' -o -name '*.spec.*' \\) -print -quit)\"",
 			'test -z "${HEADLESSCODE_OPENROUTER_API_KEY:-}${OPENROUTER_API_KEY:-}${OPENAI_API_KEY:-}${ANTHROPIC_API_KEY:-}"',
-			`exec ${workerCommand}`,
 		]
 		const boundaryGuard = `${boundaryChecks.map((check) => `(${check}) || { echo RSI_BENCHMARK_PREFLIGHT_FAILURE >&2; exit 79; }`).join(" && ")} && exec ${workerCommand}`
 		const env = workerEnvironment(config, candidate)
@@ -711,6 +710,7 @@ export async function runOpenShellBenchmarkVerifier(candidate: CandidateRecord, 
 	const marker = /(?:^|\n)RSI_BENCHMARK_VERIFIER_COMPLETED:(\d+)(?:\n|$)/.exec(isolated.result.stdout + isolated.result.stderr)
 	if (!marker) throw new Error(`OpenShell benchmark verifier did not return its completion marker (exit ${isolated.result.exitCode ?? "unknown"}): ${(isolated.result.stderr || isolated.result.stdout).slice(0, 3000)}`)
 	if (Number(marker[1]) !== isolated.result.exitCode) throw new Error("OpenShell benchmark verifier completion marker disagrees with the sandbox exit code")
+	if (Number(marker[1]) === 125) throw new Error(`OpenShell benchmark verifier child reported infrastructure failure: ${(isolated.result.stderr || isolated.result.stdout).slice(0, 3000)}`)
 	return isolated.result
 }
 
