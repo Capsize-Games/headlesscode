@@ -11,7 +11,7 @@ import { fleetJobMatches, fleetPayloadDigest, PostgresRsiJobQueue, type FleetJob
 import { PostgresProofCampaign, proofCampaignManifestDigest, type ProofCampaignManifest } from "../proof-campaign.js"
 import { openRouterAllocatedEnvironment, openRouterBrokerLimitsFromEnvironment, RSI_OPENROUTER_MODEL, type OpenRouterBrokerGrant, type OpenRouterBrokerLimits } from "../inference-broker.js"
 import { readArchive, writeArchive } from "../archive.js"
-import { createProofCampaignManifest, proofBrokerCampaignId, reconcileProofCampaignJob, rebuildFinishedProofCampaignArchive } from "../controller.js"
+import { createProofCampaignManifest, proofBrokerCampaignId, reconcileProofCampaignJob, rebuildEvaluatedProofCampaignArchive, rebuildFinishedProofCampaignArchive } from "../controller.js"
 import { loadBenchmark, runBenchmark, type BenchmarkVerifier } from "../benchmark/runner.js"
 import type { BenchmarkAgent, BenchmarkImageIdentity, BenchmarkTask } from "../benchmark/types.js"
 import type { CandidateRecord, RsiConfig, RsiRunRecord } from "../types.js"
@@ -181,12 +181,14 @@ test("development completion preserves frozen confirmation cells for fenced post
 	await withCampaign(async (campaign) => {
 		const schedule: ProofCampaignManifest["schedule"] = [
 			{ armId: "fixed", generation: 0, candidateId: "candidate-a", taskId: "mutation", seed: "seed-0", attemptKind: "mutation", phase: "development" },
+			{ armId: "self", generation: 0, candidateId: "candidate-self", taskId: "mutation", seed: "seed-0", attemptKind: "mutation", phase: "development" },
 			{ armId: "fixed", generation: 0, candidateId: "candidate-a", taskId: "hidden", seed: "seed-1", attemptKind: "confirmation", phase: "confirmation" },
 			{ armId: "fixed", generation: 0, candidateId: "candidate-b", taskId: "hidden", seed: "seed-1", attemptKind: "confirmation", phase: "confirmation" },
 			{ armId: "fixed", generation: 0, candidateId: "root-control", taskId: "hidden", seed: "seed-1", attemptKind: "fixed-control", phase: "confirmation" },
 		]
 		const frozen = manifest("campaign-" + randomUUID(), schedule)
 		const lease = await campaign.acquire(frozen, "fixed", "run-fixed", "coordinator-dev")
+		await assert.rejects(() => admit(campaign, lease, schedule[2]!, "early-confirmation"), /cannot be admitted during the development phase/)
 		const dev = schedule[0]!
 		await admit(campaign, lease, dev, "development-mutation")
 		await campaign.markDispatched(lease, "development-mutation")
@@ -194,13 +196,24 @@ test("development completion preserves frozen confirmation cells for fenced post
 		await campaign.recordDecision(lease, { generation: 0, candidateId: "candidate-a", parentId: "baseline", status: "accepted", childCommit: "2".repeat(40), parentCommit: frozen.rootCommit, proof: { developmentPassed: true }, attemptKeys: ["development-mutation"] })
 		await campaign.selectGeneration(lease, 0, ["candidate-a"])
 		await campaign.finishDevelopmentArm(lease)
+		await campaign.finishDevelopmentArm(lease)
 		await assert.rejects(() => campaign.finishArm(lease, ["candidate-a"]), /stale coordinator/)
+		await assert.rejects(() => campaign.acquire(frozen, "fixed", "run-fixed", "coordinator-early-confirmation"), /until both arms finish development/)
+		const selfLease = await campaign.acquire(frozen, "self", "run-self", "coordinator-self-dev")
+		const selfCell = schedule[1]!
+		await admit(campaign, selfLease, selfCell, "self-development-mutation")
+		await campaign.markDispatched(selfLease, "self-development-mutation")
+		await campaign.settle(selfLease, "self-development-mutation", { status: "completed", resultSha256: "6".repeat(64), actualCalls: 1, actualTokens: 10, actualSpendUsd: 0.01 })
+		await campaign.recordDecision(selfLease, { generation: 0, candidateId: "candidate-self", parentId: "baseline", status: "accepted", childCommit: "7".repeat(40), parentCommit: frozen.rootCommit, proof: { developmentPassed: true }, attemptKeys: ["self-development-mutation"] })
+		await campaign.selectGeneration(selfLease, 0, ["candidate-self"])
+		await campaign.finishDevelopmentArm(selfLease)
 		const confirmationLease = await campaign.acquire(frozen, "fixed", "run-fixed", "coordinator-confirmation")
 		assert.equal(confirmationLease.epoch, lease.epoch + 1)
+		assert.equal(confirmationLease.phase, "confirmation")
 		await assert.rejects(() => campaign.finishArm(confirmationLease, ["candidate-a"]), /missing, incomplete, or uncertain frozen task cell/)
 		await campaign.markNotSelected(confirmationLease, { attemptKey: "not-selected-b", generation: 0, candidateId: "candidate-b", taskId: "hidden", seed: "seed-1", reason: "slot was not selected by the development decision" })
 		await assert.rejects(() => campaign.markNotSelected(confirmationLease, { attemptKey: "not-selected-a", generation: 0, candidateId: "candidate-a", taskId: "hidden", seed: "seed-1", reason: "selected slots cannot be skipped" }), /selected or undecided/)
-		for (const cell of [schedule[1]!, schedule[3]!]) {
+		for (const cell of [schedule[2]!, schedule[4]!]) {
 			const key = "confirmation-" + cell.candidateId
 			await campaign.admit(confirmationLease, { attemptKey: key, kind: cell.attemptKind, identity: { generation: 0, candidateId: cell.candidateId, taskId: cell.taskId, seed: cell.seed, attemptKind: cell.attemptKind }, requestSha256: "3".repeat(64), calls: 1, tokens: 10, spendUsd: 0.01 })
 			await campaign.markDispatched(confirmationLease, key)
@@ -210,6 +223,41 @@ test("development completion preserves frozen confirmation cells for fenced post
 		const snapshot = await campaign.snapshot(frozen.campaignId)
 		assert.equal((snapshot.arms as Array<Record<string, unknown>>)[0]?.state, "finished")
 		assert.ok((snapshot.attempts as Array<Record<string, unknown>>).some((attempt) => attempt.status === "not-selected" && attempt.candidate_id === "candidate-b"))
+	})
+})
+
+test("development-phase finalization is replay-safe and prevents later development admissions", { skip: !databaseUrl }, async () => {
+	await withCampaign(async (campaign) => {
+		const schedule: ProofCampaignManifest["schedule"] = [
+			{ armId: "fixed", generation: 0, candidateId: "fixed-candidate", taskId: "mutation", seed: "seed-0", attemptKind: "mutation", phase: "development" },
+			{ armId: "self", generation: 0, candidateId: "self-candidate", taskId: "mutation", seed: "seed-0", attemptKind: "mutation", phase: "development" },
+			{ armId: "fixed", generation: 0, candidateId: "fixed-candidate", taskId: "hidden", seed: "seed-1", attemptKind: "confirmation", phase: "confirmation" },
+			{ armId: "self", generation: 0, candidateId: "self-candidate", taskId: "hidden", seed: "seed-1", attemptKind: "confirmation", phase: "confirmation" },
+		]
+		const frozen = manifest(`phase-replay-${randomUUID()}`, schedule)
+		const fixed = await campaign.acquire(frozen, "fixed", "run-fixed", "dev-fixed")
+		await admit(campaign, fixed, schedule[0]!, "fixed-dev")
+		await campaign.markDispatched(fixed, "fixed-dev")
+		await campaign.settle(fixed, "fixed-dev", { status: "completed", resultSha256: "8".repeat(64), actualCalls: 1, actualTokens: 10, actualSpendUsd: 0.01 })
+		await campaign.recordDecision(fixed, { generation: 0, candidateId: "fixed-candidate", parentId: "baseline", status: "accepted", childCommit: "9".repeat(40), parentCommit: frozen.rootCommit, proof: { ok: true }, attemptKeys: ["fixed-dev"] })
+		await campaign.selectGeneration(fixed, 0, ["fixed-candidate"])
+		await campaign.finishDevelopmentArm(fixed)
+		await campaign.finishDevelopmentArm(fixed) // DB committed, archive checkpoint may not have happened.
+		await assert.rejects(() => campaign.acquire(frozen, "fixed", "run-fixed", "confirmation-too-early"), /until both arms finish development/)
+		const self = await campaign.acquire(frozen, "self", "run-self", "dev-self")
+		await admit(campaign, self, schedule[1]!, "self-dev")
+		await campaign.markDispatched(self, "self-dev")
+		await campaign.settle(self, "self-dev", { status: "completed", resultSha256: "a".repeat(64), actualCalls: 1, actualTokens: 10, actualSpendUsd: 0.01 })
+		await campaign.recordDecision(self, { generation: 0, candidateId: "self-candidate", parentId: "baseline", status: "accepted", childCommit: "c".repeat(40), parentCommit: frozen.rootCommit, proof: { ok: true }, attemptKeys: ["self-dev"] })
+		await campaign.selectGeneration(self, 0, ["self-candidate"])
+		await campaign.finishDevelopmentArm(self)
+		const recoveredFixed = await campaign.acquire(frozen, "fixed", "run-fixed", "confirmation-fixed")
+		assert.equal(recoveredFixed.phase, "confirmation")
+		await assert.rejects(() => admit(campaign, recoveredFixed, schedule[0]!, "late-development"), /cannot be admitted during the confirmation phase/)
+		await assert.rejects(() => campaign.skipAfterHardGate(recoveredFixed, { attemptKey: "late-skip", identity: { generation: 0, candidateId: "fixed-candidate", taskId: "mutation", seed: "seed-0", attemptKind: "mutation" }, requestSha256: "1".repeat(64), reason: "late skip" }), /hard-gate skips cannot be added after the development phase closes/)
+		await assert.rejects(() => campaign.recordDecision(recoveredFixed, { generation: 0, candidateId: "fixed-candidate", parentId: "baseline", status: "accepted", childCommit: "9".repeat(40), parentCommit: frozen.rootCommit, proof: { ok: true }, attemptKeys: ["fixed-dev"] }), /candidate decisions are closed after the development phase/)
+		await assert.rejects(() => campaign.selectGeneration(recoveredFixed, 0, ["fixed-candidate"]), /generation selections are closed after the development phase/)
+		await campaign.finishDevelopmentArm(recoveredFixed) // Read-only replay is safe under the new fenced lease.
 	})
 })
 
@@ -567,6 +615,44 @@ test("finished ledger rebuilds the final report from a reloaded active-run check
 	}
 })
 
+test("development finish crash rebuilds only the evaluated active checkpoint without starting the next arm", async () => {
+	const archiveDir = await mkdtemp(`${process.env.TMPDIR ?? "/tmp"}/rsi-proof-development-rebuild-`)
+	try {
+		const campaignId = "evaluated-campaign"
+		const candidate: CandidateRecord = {
+			id: "candidate-one", generation: 0, parent: "baseline", branch: "rsi/candidate-one", worktree: "/tmp/candidate-one",
+			baseCommit: "a".repeat(40), status: "accepted", model: "test/model", mutation: "test mutation",
+			createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:01.000Z", commits: ["b".repeat(40)], changedFiles: ["src/example.ts"], protectedPathViolations: [],
+		}
+		const run: RsiRunRecord = {
+			runId: "evaluated-run", startedAt: "2026-01-01T00:00:00.000Z", model: "test/model", baseRef: "main", baseCommit: "a".repeat(40),
+			generations: 1, candidates: [candidate], reports: [], workerHarnessPairId: campaignId, workerHarnessMode: "fixed-control",
+		}
+		const config = { archiveDir, regressionCommand: "npm test", evalCommands: [], hiddenEvalCommands: [], protectedPaths: [] } as unknown as RsiConfig
+		const frozen = manifest(campaignId, [
+			{ armId: "fixed", generation: 0, candidateId: "g0-candidate-0", taskId: "mutation", seed: "seed-0", attemptKind: "mutation", phase: "development" },
+			{ armId: "fixed", generation: 0, candidateId: "g0-candidate-0", taskId: "hidden", seed: "seed-1", attemptKind: "confirmation", phase: "confirmation" },
+		])
+		const snapshot = {
+			campaign: { manifest_sha256: proofCampaignManifestDigest(frozen) },
+			arms: [{ arm_id: "fixed", run_id: run.runId, state: "evaluated", phase: "confirmation", epoch: 4, lease_expires_at: null }],
+			events: [{ sequence: 7, arm_id: "fixed", event_type: "development-phase-finished", payload: { remainingPhase: "confirmation" } }],
+		}
+		await writeArchive(archiveDir, { schemaVersion: 2, updatedAt: run.startedAt, runs: [], activeRuns: [run], candidates: [candidate], modelCandidates: [], combinations: [], jobs: [], trajectoryRefs: [], curriculumTasks: [] })
+		const checkpoint = (await readArchive(archiveDir)).activeRuns[0]
+		assert.ok(checkpoint)
+		const recovered = await rebuildEvaluatedProofCampaignArchive({ run: checkpoint, config, snapshot, manifest: frozen, armId: "fixed", now: () => "2026-01-01T00:00:02.000Z" })
+		assert.equal(recovered.proofCampaign?.state, "evaluated")
+		assert.equal(recovered.finishedAt, "2026-01-01T00:00:02.000Z", "development-phase recovery must rebuild the terminal arm archive view")
+		const after = await readArchive(archiveDir)
+		assert.equal(after.runs.length, 1, "evaluated recovery reproduces the terminal archive write after the DB commit")
+		assert.equal(after.runs[0]?.proofCampaign?.state, "evaluated")
+		assert.equal(after.activeRuns.length, 0)
+	} finally {
+		await rm(archiveDir, { recursive: true, force: true })
+	}
+})
+
 test("proof campaign cannot finish while a frozen generation has no selection", { skip: !databaseUrl }, async () => {
 	await withCampaign(async (campaign) => {
 		const schedule: ProofCampaignManifest["schedule"] = [
@@ -607,7 +693,7 @@ test("proof campaign root deadline rejects admission and renewal", { skip: !data
 		const lease = await campaign.acquire(frozen, "fixed", "run-fixed", "coordinator-1")
 		await pool.query("UPDATE headlesscode_rsi_proof_campaigns SET deadline_at=clock_timestamp()-interval '1 second' WHERE campaign_id=$1", [frozen.campaignId])
 		assert.equal(await campaign.renew(lease), false)
-		await assert.rejects(() => admit(campaign, lease, schedule[0]!, "expired-attempt"), /stale coordinator epoch, lease, manifest, or root deadline/)
+		await assert.rejects(() => admit(campaign, lease, schedule[0]!, "expired-attempt"), /stale coordinator epoch, phase, lease, manifest, or root deadline/)
 	})
 })
 

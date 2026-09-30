@@ -33,6 +33,7 @@ export interface ProofCampaignArmLease {
 	token: string
 	manifestSha256: string
 	deadlineAt: string
+	phase: "development" | "confirmation"
 }
 
 export interface ProofAttemptReservation {
@@ -174,12 +175,16 @@ export class PostgresProofCampaign {
 			if (!arm || arm.run_id !== runId) throw new Error("proof campaign arm is already bound to a different run ID")
 			if (arm.state === "finished") throw new Error("proof campaign arm is terminal and cannot be reacquired")
 			if (arm.lease_valid === true) throw new Error("proof campaign arm already has an active coordinator; wait for lease expiry before recovery")
+			if (arm.phase === "confirmation") {
+				const phases = await client.query("SELECT arm_id,phase FROM headlesscode_rsi_proof_campaign_arms WHERE campaign_id=$1 AND arm_id=ANY($2::text[]) ORDER BY arm_id", [manifest.campaignId, [manifest.armAssignment.fixedControl, manifest.armAssignment.selfHosted]])
+				if (phases.rowCount !== 2 || phases.rows.some((entry) => entry.phase !== "confirmation")) throw new Error("proof campaign confirmation phase is unavailable until both arms finish development")
+			}
 			const epoch = Number(arm.epoch) + 1
 			await client.query("UPDATE headlesscode_rsi_proof_campaign_arms SET epoch=$3,coordinator_id=$4,lease_token_sha256=$5,lease_expires_at=clock_timestamp()+($6::text || ' milliseconds')::interval,state='running',updated_at=clock_timestamp() WHERE campaign_id=$1 AND arm_id=$2", [manifest.campaignId, armId, epoch, coordinatorId, tokenHash, this.leaseMs])
 			await client.query("UPDATE headlesscode_rsi_proof_campaigns SET state='running',updated_at=clock_timestamp() WHERE campaign_id=$1 AND state IN ('planned','running','evaluated','selected','rejected')", [manifest.campaignId])
 			await this.appendEvent(client, manifest.campaignId, armId, epoch, "arm-acquired", { runId, coordinatorId, manifestSha256 })
 			const deadline = await client.query("SELECT deadline_at FROM headlesscode_rsi_proof_campaigns WHERE campaign_id=$1", [manifest.campaignId])
-			return { campaignId: manifest.campaignId, armId, runId, epoch, coordinatorId, token, manifestSha256, deadlineAt: new Date(String(deadline.rows[0].deadline_at)).toISOString() }
+			return { campaignId: manifest.campaignId, armId, runId, epoch, coordinatorId, token, manifestSha256, deadlineAt: new Date(String(deadline.rows[0].deadline_at)).toISOString(), phase: arm.phase }
 		})
 	}
 
@@ -206,18 +211,22 @@ export class PostgresProofCampaign {
 			const campaign = await this.lockLease(client, lease)
 			const frozenAttempt = (campaign.manifest as ProofCampaignManifest).budgets.attempt
 			if (input.calls > frozenAttempt.maxCalls || input.tokens > frozenAttempt.maxTokens || reserveSpend > floorMicros(frozenAttempt.maxSpendUsd)) throw new Error("proof campaign attempt reservation exceeds its frozen per-attempt ceiling")
+			const schedule = (campaign.manifest as ProofCampaignManifest).schedule
+			const frozenCell = schedule.find((cell) => cell.armId === lease.armId && cell.generation === input.identity.generation && cell.candidateId === input.identity.candidateId && cell.taskId === input.identity.taskId && cell.seed === input.identity.seed && cell.attemptKind === input.kind)
+			if (!frozenCell) throw new Error("proof campaign attempt is outside the frozen task schedule")
+			const cellPhase = frozenCell.phase ?? "development"
 			const existingResult = await client.query("SELECT * FROM headlesscode_rsi_proof_campaign_attempts WHERE campaign_id=$1 AND arm_id=$2 AND attempt_key=$3 FOR UPDATE", [lease.campaignId, lease.armId, input.attemptKey])
 			const existing = existingResult.rows[0]
 			if (existing) {
 				if (existing.identity_sha256.trim() !== identitySha256 || existing.source_candidate_id !== sourceCandidateId || existing.request_sha256.trim() !== input.requestSha256 || existing.attempt_kind !== input.kind
 					|| Number(existing.reserved_calls) !== input.calls || Number(existing.reserved_tokens) !== input.tokens || Number(existing.reserved_spend_microusd) !== reserveSpend || (input.brokerJobId && existing.broker_job_id !== input.brokerJobId)) throw new Error("proof campaign attempt key was reused with changed identity or reservation")
+				if (cellPhase !== lease.phase && !(cellPhase === "development" && lease.phase === "confirmation" && existing.status === "completed")) throw new Error(`proof campaign ${cellPhase} cell cannot be admitted during the ${lease.phase} phase`)
 				if (Number(existing.epoch) !== lease.epoch && existing.status !== "completed") await client.query("UPDATE headlesscode_rsi_proof_campaign_attempts SET epoch=$4,updated_at=clock_timestamp() WHERE campaign_id=$1 AND arm_id=$2 AND attempt_key=$3", [lease.campaignId, lease.armId, input.attemptKey, lease.epoch])
 				return { duplicate: true, status: String(existing.status) }
 			}
+			if (cellPhase !== lease.phase) throw new Error(`proof campaign ${cellPhase} cell cannot be admitted during the ${lease.phase} phase`)
 			const logicalCell = await client.query("SELECT attempt_key FROM headlesscode_rsi_proof_campaign_attempts WHERE campaign_id=$1 AND arm_id=$2 AND generation=$3 AND candidate_id=$4 AND task_id=$5 AND seed=$6 AND attempt_kind=$7 FOR UPDATE", [lease.campaignId, lease.armId, input.identity.generation, input.identity.candidateId, input.identity.taskId, input.identity.seed, input.kind])
 			if (logicalCell.rowCount) throw new Error("proof campaign logical task cell was already admitted under a different attempt key")
-		const frozenCell = (campaign.manifest as ProofCampaignManifest).schedule.some((cell) => cell.armId === lease.armId && cell.generation === input.identity.generation && cell.candidateId === input.identity.candidateId && cell.taskId === input.identity.taskId && cell.seed === input.identity.seed && cell.attemptKind === input.kind)
-			if (!frozenCell) throw new Error("proof campaign attempt is outside the frozen task schedule")
 			if (Number(campaign.used_calls) + Number(campaign.reserved_calls) + input.calls > Number(campaign.max_calls)
 				|| Number(campaign.used_tokens) + Number(campaign.reserved_tokens) + input.tokens > Number(campaign.max_tokens)
 				|| Number(campaign.used_spend_microusd) + Number(campaign.reserved_spend_microusd) + reserveSpend > Number(campaign.max_spend_microusd)) throw new Error("proof campaign root admission budget exhausted")
@@ -247,6 +256,7 @@ export class PostgresProofCampaign {
 		if (skip.identity.attemptKind !== "mutation" && skip.identity.attemptKind !== "development-proof" && skip.identity.attemptKind !== "verification") throw new Error("only predeclared mutation, proof, or verification cells can be skipped after a hard gate")
 		await transaction(this.pool, async (client) => {
 			const campaign = await this.lockLease(client, lease)
+			if (lease.phase !== "development" || campaign.arm_phase !== "development") throw new Error("hard-gate skips cannot be added after the development phase closes")
 			const identitySha256 = digest({ ...skip.identity, sourceCandidateId: skip.identity.candidateId })
 			const frozenCell = (campaign.manifest as ProofCampaignManifest).schedule.some((cell) => cell.armId === lease.armId && (cell.phase ?? "development") === "development" && cell.generation === skip.identity.generation && cell.candidateId === skip.identity.candidateId && cell.taskId === skip.identity.taskId && cell.seed === skip.identity.seed && cell.attemptKind === skip.identity.attemptKind)
 			if (!frozenCell) throw new Error("hard-gate skip is outside the frozen task schedule")
@@ -276,6 +286,7 @@ export class PostgresProofCampaign {
 		validCounter(input.generation, "not-selected generation")
 		await transaction(this.pool, async (client) => {
 			const campaign = await this.lockLease(client, lease)
+			if (lease.phase !== "confirmation" || campaign.arm_phase !== "confirmation") throw new Error("confirmation dispositions require the confirmation phase")
 			const manifest = campaign.manifest as ProofCampaignManifest
 			const cell = manifest.schedule.find((entry) => entry.armId === lease.armId && (entry.phase ?? "development") === "confirmation" && entry.generation === input.generation && entry.candidateId === input.candidateId && entry.taskId === input.taskId && entry.seed === input.seed && entry.attemptKind === "confirmation")
 			if (!cell) throw new Error("not-selected disposition is outside the frozen confirmation schedule")
@@ -346,7 +357,8 @@ export class PostgresProofCampaign {
 		const proofSha256 = digest(decision.proof)
 		if (!decision.attemptKeys.length || new Set(decision.attemptKeys).size !== decision.attemptKeys.length) throw new Error("proof campaign candidate decision must name unique proof attempts")
 		return transaction(this.pool, async (client) => {
-			await this.lockLease(client, lease)
+			const leaseState = await this.lockLease(client, lease)
+			if (lease.phase !== "development" || leaseState.arm_phase !== "development") throw new Error("candidate decisions are closed after the development phase")
 			const manifestResult = await client.query("SELECT manifest FROM headlesscode_rsi_proof_campaigns WHERE campaign_id=$1", [lease.campaignId])
 			const manifest = manifestResult.rows[0]?.manifest as ProofCampaignManifest | undefined
 			if (!manifest || !manifest.schedule.some((cell) => cell.armId === lease.armId && cell.generation === decision.generation && cell.attemptKind === "mutation" && cell.candidateId === decision.candidateId)) throw new Error("candidate decision is outside the frozen campaign schedule")
@@ -400,7 +412,8 @@ export class PostgresProofCampaign {
 
 	async selectGeneration(lease: ProofCampaignArmLease, generation: number, selectedCandidateIds: string[]): Promise<void> {
 		await transaction(this.pool, async (client) => {
-			await this.lockLease(client, lease)
+			const leaseState = await this.lockLease(client, lease)
+			if (lease.phase !== "development" || leaseState.arm_phase !== "development") throw new Error("generation selections are closed after the development phase")
 			const decisions = await client.query("SELECT candidate_id,decision,attempt_keys FROM headlesscode_rsi_proof_campaign_decisions WHERE campaign_id=$1 AND arm_id=$2 AND generation=$3 FOR UPDATE", [lease.campaignId, lease.armId, generation])
 			const byId = new Map(decisions.rows.map((row) => [String(row.candidate_id), row]))
 			const manifestResult = await client.query("SELECT manifest FROM headlesscode_rsi_proof_campaigns WHERE campaign_id=$1", [lease.campaignId])
@@ -445,6 +458,7 @@ export class PostgresProofCampaign {
 			const manifest = campaign.manifest as ProofCampaignManifest
 			const scheduled = manifest.schedule.filter((cell) => cell.armId === lease.armId)
 			if (!scheduled.length) throw new Error("cannot finish an arm with no frozen task schedule")
+			if (scheduled.some((cell) => (cell.phase ?? "development") === "confirmation") && (lease.phase !== "confirmation" || campaign.arm_phase !== "confirmation")) throw new Error("proof campaign arm cannot finish before both arms complete development")
 			for (const generation of [...new Set(scheduled.map((cell) => cell.generation))]) {
 				const selection = await client.query("SELECT payload FROM headlesscode_rsi_proof_campaign_events WHERE campaign_id=$1 AND arm_id=$2 AND event_type='generation-selected' AND payload->>'generation'=$3 FOR UPDATE", [lease.campaignId, lease.armId, String(generation)])
 				if (selection.rowCount !== 1) throw new Error(`cannot finish proof campaign arm: generation ${generation} has no canonical selection`)
@@ -484,7 +498,20 @@ export class PostgresProofCampaign {
 
 	async finishDevelopmentArm(lease: ProofCampaignArmLease): Promise<void> {
 		await transaction(this.pool, async (client) => {
+			const stateResult = await client.query(`SELECT campaign.manifest, campaign.manifest_sha256, arm.phase AS arm_phase, arm.epoch AS arm_epoch, arm.run_id
+				FROM headlesscode_rsi_proof_campaigns campaign JOIN headlesscode_rsi_proof_campaign_arms arm USING(campaign_id)
+				WHERE campaign.campaign_id=$1 AND arm.arm_id=$2 FOR UPDATE OF campaign,arm`, [lease.campaignId, lease.armId])
+			const state = stateResult.rows[0]
+			if (!state || state.manifest_sha256.trim() !== lease.manifestSha256 || state.run_id !== lease.runId) throw new Error("proof campaign development completion has a stale campaign or arm identity")
+			const priorFinish = await client.query("SELECT 1 FROM headlesscode_rsi_proof_campaign_events WHERE campaign_id=$1 AND arm_id=$2 AND epoch=$3 AND event_type='development-phase-finished' AND payload->>'remainingPhase'='confirmation'", [lease.campaignId, lease.armId, lease.epoch])
+			if (state.arm_phase === "confirmation" && lease.phase === "development" && priorFinish.rowCount === 1) return
 			const campaign = await this.lockLease(client, lease)
+			if (lease.phase === "confirmation" && campaign.arm_phase === "confirmation") {
+				const finished = await client.query("SELECT 1 FROM headlesscode_rsi_proof_campaign_events WHERE campaign_id=$1 AND arm_id=$2 AND event_type='development-phase-finished' AND payload->>'remainingPhase'='confirmation' LIMIT 1", [lease.campaignId, lease.armId])
+				if (finished.rowCount === 1) return
+				throw new Error("proof campaign confirmation phase has no durable development completion event")
+			}
+			if (lease.phase !== "development" || campaign.arm_phase !== "development") throw new Error("proof campaign development phase is already closed")
 			const manifest = campaign.manifest as ProofCampaignManifest
 			const development = manifest.schedule.filter((cell) => cell.armId === lease.armId && (cell.phase ?? "development") === "development")
 			if (!development.length) throw new Error("cannot finish development phase without frozen development cells")
@@ -496,7 +523,7 @@ export class PostgresProofCampaign {
 				const result = await client.query("SELECT status FROM headlesscode_rsi_proof_campaign_attempts WHERE campaign_id=$1 AND arm_id=$2 AND generation=$3 AND candidate_id=$4 AND task_id=$5 AND seed=$6 AND attempt_kind=$7", [lease.campaignId, lease.armId, cell.generation, cell.candidateId, cell.taskId, cell.seed, cell.attemptKind])
 				if (result.rowCount !== 1 || !["completed", "skipped-after-hard-gate"].includes(String(result.rows[0].status))) throw new Error("cannot finish development phase with incomplete or uncertain development evidence")
 			}
-			await client.query("UPDATE headlesscode_rsi_proof_campaign_arms SET state='evaluated',coordinator_id=NULL,lease_token_sha256=NULL,lease_expires_at=NULL,updated_at=clock_timestamp() WHERE campaign_id=$1 AND arm_id=$2 AND epoch=$3", [lease.campaignId, lease.armId, lease.epoch])
+			await client.query("UPDATE headlesscode_rsi_proof_campaign_arms SET state='evaluated',phase='confirmation',coordinator_id=NULL,lease_token_sha256=NULL,lease_expires_at=NULL,updated_at=clock_timestamp() WHERE campaign_id=$1 AND arm_id=$2 AND epoch=$3", [lease.campaignId, lease.armId, lease.epoch])
 			await this.appendEvent(client, lease.campaignId, lease.armId, lease.epoch, "development-phase-finished", { remainingPhase: "confirmation" })
 			await client.query("UPDATE headlesscode_rsi_proof_campaigns SET state='evaluated',updated_at=clock_timestamp() WHERE campaign_id=$1 AND state <> 'finished'", [lease.campaignId])
 		})
@@ -513,7 +540,7 @@ export class PostgresProofCampaign {
 			await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
 			const campaign = await client.query("SELECT * FROM headlesscode_rsi_proof_campaigns WHERE campaign_id=$1", [campaignId])
 			if (campaign.rowCount !== 1) throw new Error(`proof campaign ${campaignId} does not exist`)
-			const arms = await client.query("SELECT arm_id,run_id,epoch,state,lease_expires_at FROM headlesscode_rsi_proof_campaign_arms WHERE campaign_id=$1 ORDER BY arm_id", [campaignId])
+			const arms = await client.query("SELECT arm_id,run_id,epoch,state,phase,lease_expires_at FROM headlesscode_rsi_proof_campaign_arms WHERE campaign_id=$1 ORDER BY arm_id", [campaignId])
 			const attempts = await client.query("SELECT arm_id,attempt_key,attempt_kind,generation,candidate_id,source_candidate_id,task_id,seed,status,identity_sha256,request_sha256,epoch,job_id,reserved_calls,reserved_tokens,reserved_spend_microusd,actual_calls,actual_tokens,actual_spend_microusd,result_sha256,artifact_refs,error FROM headlesscode_rsi_proof_campaign_attempts WHERE campaign_id=$1 ORDER BY arm_id,attempt_key", [campaignId])
 			const decisions = await client.query("SELECT arm_id,generation,candidate_id,parent_id,lineage_kind,parent_generation,decision,child_commit,parent_commit,proof,proof_sha256,attempt_keys,epoch FROM headlesscode_rsi_proof_campaign_decisions WHERE campaign_id=$1 ORDER BY arm_id,generation,candidate_id", [campaignId])
 			const events = await client.query("SELECT sequence,arm_id,epoch,event_type,payload,payload_sha256,created_at FROM headlesscode_rsi_proof_campaign_events WHERE campaign_id=$1 ORDER BY sequence", [campaignId])
@@ -539,14 +566,14 @@ export class PostgresProofCampaign {
 	private async lockLease(client: PoolClient, lease: ProofCampaignArmLease): Promise<Record<string, unknown>> {
 		const tokenHash = createHash("sha256").update(lease.token).digest("hex")
 		const result = await client.query(
-			`SELECT campaign.*,arm.epoch AS arm_epoch,arm.run_id,arm.lease_token_sha256,arm.lease_expires_at,
+			`SELECT campaign.*,arm.epoch AS arm_epoch,arm.phase AS arm_phase,arm.run_id,arm.lease_token_sha256,arm.lease_expires_at,
 			 arm.lease_expires_at > clock_timestamp() AS arm_lease_valid,campaign.deadline_at > clock_timestamp() AS deadline_valid
 			 FROM headlesscode_rsi_proof_campaigns AS campaign JOIN headlesscode_rsi_proof_campaign_arms AS arm USING(campaign_id)
 			 WHERE campaign.campaign_id=$1 AND arm.arm_id=$2 FOR UPDATE OF campaign,arm`,
 			[lease.campaignId, lease.armId],
 		)
 		const row = result.rows[0]
-		if (!row || Number(row.arm_epoch) !== lease.epoch || row.run_id !== lease.runId || row.lease_token_sha256?.trim() !== tokenHash || row.manifest_sha256.trim() !== lease.manifestSha256 || row.arm_lease_valid !== true || row.deadline_valid !== true || row.state === "finished") throw new Error("proof campaign write rejected by stale coordinator epoch, lease, manifest, or root deadline")
+		if (!row || Number(row.arm_epoch) !== lease.epoch || row.run_id !== lease.runId || row.arm_phase !== lease.phase || row.lease_token_sha256?.trim() !== tokenHash || row.manifest_sha256.trim() !== lease.manifestSha256 || row.arm_lease_valid !== true || row.deadline_valid !== true || row.state === "finished") throw new Error("proof campaign write rejected by stale coordinator epoch, phase, lease, manifest, or root deadline")
 		return row
 	}
 

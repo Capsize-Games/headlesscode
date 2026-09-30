@@ -164,6 +164,36 @@ export async function rebuildFinishedProofCampaignArchive(args: {
 	return args.run
 }
 
+/** Rebuild only the durable development-phase checkpoint after its DB commit. */
+export async function rebuildEvaluatedProofCampaignArchive(args: {
+	run: RsiRunRecord
+	config: RsiConfig
+	snapshot: Record<string, unknown>
+	manifest: ProofCampaignManifest
+	armId: string
+	now: () => string
+}): Promise<RsiRunRecord> {
+	const campaign = args.snapshot.campaign as Record<string, unknown> | undefined
+	const arms = args.snapshot.arms as Array<Record<string, unknown>> | undefined
+	const events = args.snapshot.events as Array<Record<string, unknown>> | undefined
+	const arm = arms?.find((entry) => entry.arm_id === args.armId)
+	const expectedDigest = proofCampaignManifestDigest(args.manifest)
+	const finishEvent = events?.some((event) => event.arm_id === args.armId && event.event_type === "development-phase-finished" && (event.payload as { remainingPhase?: unknown })?.remainingPhase === "confirmation")
+	if (!campaign || !arm || !finishEvent || arm.phase !== "confirmation" || !["evaluated", "selected", "rejected"].includes(String(arm.state)) || String(campaign.manifest_sha256).trim() !== expectedDigest) throw new Error("evaluated proof campaign snapshot does not match the frozen manifest and development completion")
+	if (arm.run_id !== args.run.runId || args.run.candidates.some((candidate) => !isTerminal(candidate))) throw new Error("evaluated proof campaign arm cannot rebuild from an incomplete or foreign run checkpoint")
+	const expectedMode = args.armId === args.manifest.armAssignment.fixedControl ? "fixed-control" : "self-hosted"
+	if (args.run.workerHarnessPairId !== args.manifest.campaignId || args.run.workerHarnessMode !== expectedMode) throw new Error("evaluated proof campaign checkpoint has a foreign paired-run identity")
+	if (arm.lease_expires_at && new Date(String(arm.lease_expires_at)).getTime() > Date.now()) throw new Error("evaluated proof campaign arm has an active coordinator; refusing read-only recovery during confirmation work")
+	args.run.proofCampaign = { manifest: args.manifest, manifestSha256: expectedDigest, campaignId: args.manifest.campaignId, armId: args.armId, epoch: Number(arm.epoch), state: "evaluated", ledgerSnapshot: args.snapshot }
+	args.run.finishedAt ??= args.now()
+	const reportPath = `${args.config.archiveDir}/${args.run.runId}.md`
+	await fs.mkdir(args.config.archiveDir, { recursive: true })
+	await fs.writeFile(reportPath, formatRunReport(args.run, args.config), "utf8")
+	args.run.reports = [...new Set([...args.run.reports, reportPath])]
+	await appendRun(args.config.archiveDir, args.run)
+	return args.run
+}
+
 class CandidateLineageError extends Error {}
 
 export function validateCandidateParent(candidate: CandidateRecord, run: RsiRunRecord, config: RsiConfig, protocol: NonNullable<RsiRunRecord["developmentProofProtocol"]>): void {
@@ -825,6 +855,9 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		const priorArm = (priorSnapshot?.arms as Array<Record<string, unknown>> | undefined)?.find((entry) => entry.arm_id === workerHarnessMode)
 		if (priorArm?.state === "finished") {
 			return rebuildFinishedProofCampaignArchive({ run, config, snapshot: priorSnapshot!, manifest, armId: workerHarnessMode, now })
+		}
+		if (priorArm?.phase === "confirmation") {
+			return rebuildEvaluatedProofCampaignArchive({ run, config, snapshot: priorSnapshot!, manifest, armId: workerHarnessMode, now })
 		}
 		campaignLease = await campaignStore.acquire(manifest, workerHarnessMode, run.runId, `${process.pid}:${randomUUID()}`)
 		run.proofCampaign = { manifest, manifestSha256: campaignLease.manifestSha256, campaignId: campaignLease.campaignId, armId: campaignLease.armId, epoch: campaignLease.epoch, state: "running" }

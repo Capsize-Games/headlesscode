@@ -14,6 +14,7 @@ const MIGRATIONS = [
 	{ version: 4, sql: readFileSync(new URL("./migrations/004_openrouter_inference_broker.sql", import.meta.url), "utf8") },
 	{ version: 5, sql: readFileSync(new URL("./migrations/005_openrouter_denial_summaries.sql", import.meta.url), "utf8") },
 	{ version: 6, sql: readFileSync(new URL("./migrations/006_proof_campaigns.sql", import.meta.url), "utf8") },
+	{ version: 7, sql: readFileSync(new URL("./migrations/007_proof_campaign_phases.sql", import.meta.url), "utf8") },
 ]
 
 function sha256Text(value: string): string { return createHash("sha256").update(value).digest("hex") }
