@@ -156,18 +156,17 @@ try {
 	assert.deepEqual(await fs.readdir(path.join(malformedResourceRoot, "attempts")).catch(() => []), [], "invalid counters on a failed agent result must not become a scored attempt")
 
 	const identityRoot = path.join(tempRoot, "image-identity")
-	const savedImageIdentity = process.env.HEADLESSCODE_RSI_BENCHMARK_HARNESS_COMMIT
 	const actualHarnessCommit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim()
-	process.env.HEADLESSCODE_RSI_BENCHMARK_HARNESS_COMMIT = "b".repeat(40)
-	try {
-		await assert.rejects(runBenchmark({
-			loaded, agent: new OpenShellBenchmarkAgent(), verifier, harnessCommit: actualHarnessCommit, agentImageIdentity: { name: "headlesscode-openshell-rsi:local", digest: `sha256:${"c".repeat(64)}`, harnessCommit: actualHarnessCommit }, modelId: "fake-image-identity", split: "development", outputRoot: identityRoot, taskIds: ["multi-01"],
-		}), /must identify the harness commit baked into the OpenShell image/)
-		assert.deepEqual(await fs.readdir(path.join(identityRoot, "attempts")).catch(() => []), [], "wrong image identity must abort without a scored attempt")
-	} finally {
-		if (savedImageIdentity === undefined) delete process.env.HEADLESSCODE_RSI_BENCHMARK_HARNESS_COMMIT
-		else process.env.HEADLESSCODE_RSI_BENCHMARK_HARNESS_COMMIT = savedImageIdentity
-	}
+	let imageIdentityReads = 0
+	const identityAgent = new OpenShellBenchmarkAgent(process.cwd(), undefined, "headlesscode-openshell-rsi:test-stub", undefined, async (name) => {
+		imageIdentityReads += 1
+		return { name, digest: `sha256:${"c".repeat(64)}`, harnessCommit: "b".repeat(40) }
+	})
+	await assert.rejects(runBenchmark({
+		loaded, agent: identityAgent, verifier, harnessCommit: actualHarnessCommit, agentImageIdentity: { name: "headlesscode-openshell-rsi:test-stub", digest: `sha256:${"c".repeat(64)}`, harnessCommit: actualHarnessCommit }, modelId: "fake-image-identity", split: "development", outputRoot: identityRoot, taskIds: ["multi-01"],
+	}), /does not match requested commit/)
+	assert.equal(imageIdentityReads, 1, "mismatched identity must come from the deterministic resolver without Docker")
+	assert.deepEqual(await fs.readdir(path.join(identityRoot, "attempts")).catch(() => []), [], "wrong image identity must abort without a scored attempt")
 	console.log("All 18 RSI benchmark runner integration assertions passed")
 } finally {
 	await fs.rm(tempRoot, { recursive: true, force: true })

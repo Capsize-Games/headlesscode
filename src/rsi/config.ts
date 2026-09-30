@@ -1,6 +1,7 @@
 import * as path from "node:path"
 import { DEFAULT_PROTECTED_FILES } from "../permissions/protected-files.js"
 import type { ComputePolicy, MutationHypothesis, MutationKind, ParentSelectionPolicy, RsiConfig } from "./types.js"
+import { DEFAULT_DEVELOPMENT_PROOF_RULE } from "./development-proof.js"
 
 export const DEFAULT_RSI_MODEL = "wxrq-qwen3.5-9b:latest"
 export const DEFAULT_VISIBLE_EVALS = ["npm test -- --filter rsi"]
@@ -15,6 +16,8 @@ export const DEFAULT_PROTECTED_PATHS = [
 	"scripts/eval-suite/",
 	"fixtures/rsi-curriculum/",
 	"fixtures/rsi-benchmark/",
+	"docker/",
+	".dockerignore",
 	".headlesscode/",
 	".worktrees/",
 ]
@@ -73,6 +76,9 @@ Options:
   --base-ref <ref>             git ref to branch from (default: HEAD)
   --dry-run                    print the planned loop without changing files
   --keep-worktrees              retain candidate worktrees after evaluation
+  --proof-min-net-wins <n>      required verified task wins over the immediate parent (default: 1)
+  --proof-retention-task <id>   development task that must not regress; repeat to set the frozen subset
+  --proof-max-mean-token-increase <ratio>  maximum child/parent mean tokens (default: 1.1)
   --help                       show this help
 
 The evaluator and scoring code are protected from candidates. The first run
@@ -114,6 +120,10 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 	let curriculumDir: string | undefined
 	let resumeRunId: string | undefined
 	let modelCandidateId: string | undefined
+	let proofMinimumNetWins = DEFAULT_DEVELOPMENT_PROOF_RULE.minimumNetWins
+	let proofRetentionTaskIds = [...DEFAULT_DEVELOPMENT_PROOF_RULE.retentionTaskIds]
+	let proofRetentionWasConfigured = false
+	let proofMaximumMeanTokenIncreaseRatio = DEFAULT_DEVELOPMENT_PROOF_RULE.maximumMeanTokenIncreaseRatio
 
 	const take = (index: number, name: string): [string, number] => {
 		const value = argv[index + 1]
@@ -261,6 +271,28 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 					index = next
 					break
 				}
+				case "--proof-min-net-wins": {
+					const [value, next] = take(index, arg)
+					proofMinimumNetWins = positiveInteger(value, arg)
+					index = next
+					break
+				}
+				case "--proof-retention-task": {
+					const [value, next] = take(index, arg)
+					if (!/^[a-z0-9][a-z0-9-]{1,63}$/.test(value)) throw new Error(`${arg} has an invalid task ID`)
+					if (!proofRetentionWasConfigured) proofRetentionTaskIds = []
+					proofRetentionWasConfigured = true
+					proofRetentionTaskIds.push(value)
+					index = next
+					break
+				}
+				case "--proof-max-mean-token-increase": {
+					const [value, next] = take(index, arg)
+					proofMaximumMeanTokenIncreaseRatio = Number(value)
+					if (!Number.isFinite(proofMaximumMeanTokenIncreaseRatio) || proofMaximumMeanTokenIncreaseRatio < 1) throw new Error(`${arg} must be a finite ratio of at least 1`)
+					index = next
+					break
+				}
 				case "--base-ref": {
 					const [value, next] = take(index, arg)
 					baseRef = value
@@ -358,6 +390,11 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 				maxTotalIterations: adaptiveIterations,
 				maxRuntimeMs: adaptiveRuntime,
 				protectedPaths: [...DEFAULT_PROTECTED_PATHS],
+				developmentProofRule: {
+					minimumNetWins: proofMinimumNetWins,
+					retentionTaskIds: proofRetentionTaskIds,
+					maximumMeanTokenIncreaseRatio: proofMaximumMeanTokenIncreaseRatio,
+				},
 				commandTimeoutMs,
 				resumeRunId,
 				modelCandidateId,

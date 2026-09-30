@@ -43,7 +43,7 @@ export function newCandidate(
 	return {
 		id,
 		generation,
-		parent: parentChoice?.candidateId ?? (generation === 0 ? "baseline" : "champion"),
+		parent: parentChoice?.candidateId ?? "baseline",
 		branch: candidateBranch(id),
 		worktree: candidateWorktree(config, id),
 		baseCommit,

@@ -6,11 +6,17 @@ import * as os from "node:os"
 import * as path from "node:path"
 import test from "node:test"
 import { checkpointRun } from "../archive.js"
-import { runRsi } from "../controller.js"
+import { runRsi as runRsiImplementation } from "../controller.js"
 import { createMutationSnapshotBundle } from "../openshell.js"
 import type { FleetJob, FleetJobPayload, PostgresRsiJobQueue } from "../postgres-queue.js"
 import { newCandidate } from "../workspace.js"
-import type { CandidateRecord, RsiConfig, RsiRunRecord, TrialResult } from "../types.js"
+import type { CandidateRecord, RsiConfig, RsiRunRecord, RsiHooks, TrialResult } from "../types.js"
+import { fakeDevelopmentBenchmarkHook } from "./development-proof-fixture.js"
+import { fixtureDevelopmentProofProtocol } from "./development-proof-fixture.js"
+
+function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queue?: PostgresRsiJobQueue): Promise<RsiRunRecord> {
+	return runRsiImplementation(config, { runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook(), ...hooks }, queue)
+}
 
 class FakeFleetQueue {
 	artifactBackend = "s3"
@@ -155,6 +161,7 @@ class FakeFleetQueue {
 				ok: true,
 				evaluation: {
 					regression: trial(!this.failRegressionForCandidates || input.candidateId === "baseline", "regression"),
+					typecheck: trial(true, "npm run typecheck"),
 					visible: [trial(visibleOkay, "visible")],
 				},
 				outputArtifact: { sha256: output.sha256, bytes: output.byteLength },
@@ -222,7 +229,7 @@ test("fleet controller queues baseline and all candidate evaluations before wait
 	const queue = new FakeFleetQueue(2)
 	try {
 		const run = await runRsi(config, { log: () => undefined }, queue as unknown as PostgresRsiJobQueue)
-		assert.equal(run.candidates.filter((candidate) => candidate.status === "accepted").length, 2)
+		assert.equal(run.candidates.filter((candidate) => candidate.status === "accepted").length, 0, "guest-reported token counts cannot make fleet candidates proof-qualified")
 		assert.equal(queue.evaluationJobCount, 2)
 		assert.equal(queue.firstCandidateEvaluationObserved, true)
 		assert.equal(queue.closeCount, 1)
@@ -303,7 +310,7 @@ test("fleet adversarial major finding records a bounded penalty when its OpenShe
 			...config,
 			roles: { worker: { provider: "ollama", model: "worker-model" }, adversary: { provider: "openrouter", model: "review-model" } },
 		}, { log: () => undefined, runAdversary: async () => adversarialResponse([{ severity: "major", message: "A boundary case may be mishandled.", testId: "adversary-case" }]) }, queue as unknown as PostgresRsiJobQueue)
-		assert.ok(run.candidates.every((candidate) => candidate.status === "accepted"))
+		assert.ok(run.candidates.every((candidate) => candidate.status === "rejected"))
 		assert.ok(run.candidates.every((candidate) => candidate.fitness?.hardGates.adversarialPass === true && candidate.fitness.adversarialPenalty === 5 && candidate.fitness.score === 95))
 		assert.equal(run.adversarialReviews?.length, 2)
 		assert.ok(run.adversarialReviews?.every((review) => review.status === "passed" && review.findings[0]?.severity === "major" && review.penaltyPoints === 5 && review.testResults[0]?.passed))
@@ -484,6 +491,7 @@ test("fleet resume reattaches to the persisted mutation idempotency key without 
 	const runConfig: RsiConfig = { ...config, seed: `${config.seed}-${runId.slice(-8)}` }
 	try {
 		const baseCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim()
+		const developmentProofProtocol = await fixtureDevelopmentProofProtocol(config.model)
 		const candidate = newCandidate(runConfig, 0, 0, baseCommit, new Date().toISOString())
 		candidate.status = "mutating"
 		execFileSync("git", ["worktree", "add", "--quiet", "-b", candidate.branch, candidate.worktree, candidate.baseCommit], { cwd: root })
@@ -522,6 +530,8 @@ test("fleet resume reattaches to the persisted mutation idempotency key without 
 			model: config.model,
 			baseRef: "HEAD",
 			baseCommit,
+			developmentProofProtocol,
+			confirmationEvidence: "unmeasured",
 			generations: 1,
 			selectedCandidates: [],
 			modelCandidates: [],
@@ -537,7 +547,7 @@ test("fleet resume reattaches to the persisted mutation idempotency key without 
 		await checkpointRun(config.archiveDir, run)
 		const resumed = await runRsi({ ...config, resumeRunId: runId }, { log: () => undefined }, queue as unknown as PostgresRsiJobQueue)
 		assert.equal(resumed.runId, runId)
-		assert.equal(resumed.candidates[0]?.status, "accepted")
+		assert.equal(resumed.candidates[0]?.status, "rejected")
 		assert.equal(queue.mutationJobCount, 1, "resume should reuse the already-completed mutation job")
 		assert.equal(resumed.jobs?.find((job) => job.id === "mutation-experiment")?.status, "completed")
 		assert.equal(queue.closeCount, 1)
@@ -553,6 +563,7 @@ test("fleet resume recognizes an applied patch before the status checkpoint and 
 	const runConfig: RsiConfig = { ...config, seed: `${config.seed}-${runId.slice(-8)}` }
 	try {
 		const baseCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim()
+		const developmentProofProtocol = await fixtureDevelopmentProofProtocol(config.model)
 		const candidate = newCandidate(runConfig, 0, 0, baseCommit, new Date().toISOString())
 		candidate.status = "mutating"
 		execFileSync("git", ["worktree", "add", "--quiet", "-b", candidate.branch, candidate.worktree, candidate.baseCommit], { cwd: root })
@@ -589,6 +600,8 @@ test("fleet resume recognizes an applied patch before the status checkpoint and 
 		const run: RsiRunRecord = {
 			runId, startedAt, model: config.model, baseRef: "HEAD", baseCommit, generations: 1,
 			selectedCandidates: [], modelCandidates: [], combinations: [],
+			developmentProofProtocol,
+			confirmationEvidence: "unmeasured",
 			jobs: [{ id: "mutation-experiment", kind: "mutation", status: "running", resource: { class: "LOCAL_GPU", units: 1 }, candidateId: candidate.id, createdAt: startedAt, updatedAt: startedAt, attempts: 1 }],
 			trajectoryRefs: [], curriculumTasks: [], candidates: [candidate], reports: [],
 			baselineEvaluation: { regression: pass, visible: [fail], hidden: [], completed: false, crashed: false, protectedPathViolation: false, changedFiles: [], committed: false },
@@ -596,7 +609,7 @@ test("fleet resume recognizes an applied patch before the status checkpoint and 
 		}
 		await checkpointRun(config.archiveDir, run)
 		const resumed = await runRsi({ ...config, resumeRunId: runId }, { log: () => undefined }, queue as unknown as PostgresRsiJobQueue)
-		assert.equal(resumed.candidates[0]?.status, "accepted")
+		assert.equal(resumed.candidates[0]?.status, "rejected")
 		assert.equal(queue.mutationJobCount, 1, "resume must validate and reuse the completed mutation job")
 		assert.equal(resumed.jobs?.find((job) => job.id === "mutation-experiment")?.status, "completed")
 		await assert.rejects(fs.access(candidate.worktree), /ENOENT/, "resumed worktrees must be removed when keepWorktrees is false")

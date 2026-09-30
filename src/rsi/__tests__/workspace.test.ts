@@ -36,7 +36,7 @@ function testStableNames(): void {
 
 function testLineageMetadata(): void {
 	const candidate = newCandidate(config, 2, 0, "abc123", "2026-09-19T20:00:00.000Z")
-	assert.equal(candidate.parent, "champion")
+	assert.equal(candidate.parent, "baseline")
 	assert.equal(candidate.baseCommit, "abc123")
 	assert.equal(candidate.status, "planned")
 }

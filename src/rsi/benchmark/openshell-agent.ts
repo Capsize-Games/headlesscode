@@ -17,6 +17,8 @@ function git(cwd: string, args: string[]): string {
 	return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim()
 }
 
+export type BenchmarkImageIdentityResolver = (imageName: string, requestedHarnessCommit: string) => Promise<BenchmarkImageIdentity>
+
 export async function initializeTaskRepository(root: string): Promise<string> {
 	git(root, ["init", "--quiet", "--initial-branch=main"])
 	git(root, ["config", "user.name", "HeadlessCode Benchmark"])
@@ -30,16 +32,25 @@ export class OpenShellBenchmarkAgent implements BenchmarkAgent {
 	readonly provider = "openshell-ollama"
 	private readonly harnessRoot: string
 	private readonly providerFactory?: RsiOpenShellProviderFactory
+	private readonly imageName: string
+	private readonly expectedHarnessCommit?: string
+	private readonly imageIdentityResolver?: BenchmarkImageIdentityResolver
 	private cachedImageIdentity?: BenchmarkImageIdentity
-	constructor(harnessRoot = process.cwd(), providerFactory?: RsiOpenShellProviderFactory) { this.harnessRoot = path.resolve(harnessRoot); this.providerFactory = providerFactory }
+	constructor(harnessRoot = process.cwd(), providerFactory?: RsiOpenShellProviderFactory, imageName = "headlesscode-openshell-rsi:local", expectedHarnessCommit?: string, imageIdentityResolver?: BenchmarkImageIdentityResolver) { this.harnessRoot = path.resolve(harnessRoot); this.providerFactory = providerFactory; this.imageName = imageName; this.expectedHarnessCommit = expectedHarnessCommit; this.imageIdentityResolver = imageIdentityResolver }
 
 	async imageIdentity(harnessCommit: string): Promise<BenchmarkImageIdentity> {
-		const name = "headlesscode-openshell-rsi:local"
-		const digest = execFileSync("docker", ["image", "inspect", "--format={{.Id}}", name], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim()
-		if (!/^sha256:[a-f0-9]{64}$/.test(digest)) throw new Error(`OpenShell benchmark worker image has an invalid Docker image ID: ${digest}`)
-		const marker = execFileSync("docker", ["run", "--rm", "--entrypoint", "/bin/cat", name, "/opt/headlesscode/.headlesscode-harness-commit"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim()
-		if (marker !== harnessCommit) throw new Error(`OpenShell worker image harness marker ${marker} does not match requested commit ${harnessCommit}`)
-		const identity = { name, digest, harnessCommit: marker }
+		const name = this.imageName
+		let identity: BenchmarkImageIdentity
+		if (this.imageIdentityResolver) {
+			identity = await this.imageIdentityResolver(name, harnessCommit)
+		} else {
+			const digest = execFileSync("docker", ["image", "inspect", "--format={{.Id}}", name], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim()
+			if (!/^sha256:[a-f0-9]{64}$/.test(digest)) throw new Error(`OpenShell benchmark worker image has an invalid Docker image ID: ${digest}`)
+			const marker = execFileSync("docker", ["run", "--rm", "--entrypoint", "/bin/cat", name, "/opt/headlesscode/.headlesscode-harness-commit"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim()
+			identity = { name, digest, harnessCommit: marker }
+		}
+		if (identity.name !== name || !/^sha256:[a-f0-9]{64}$/.test(identity.digest)) throw new Error("OpenShell benchmark worker image identity is malformed")
+		if (identity.harnessCommit !== harnessCommit) throw new Error(`OpenShell worker image harness marker ${identity.harnessCommit} does not match requested commit ${harnessCommit}`)
 		if (this.cachedImageIdentity && JSON.stringify(this.cachedImageIdentity) !== JSON.stringify(identity)) throw new Error("OpenShell benchmark worker image changed after its identity was frozen")
 		this.cachedImageIdentity = identity
 		return identity
@@ -48,7 +59,7 @@ export class OpenShellBenchmarkAgent implements BenchmarkAgent {
 	async run(request: BenchmarkAgentRequest): Promise<BenchmarkAgentResult> {
 		const checkout = git(this.harnessRoot, ["rev-parse", "HEAD"])
 		if (checkout !== request.harnessCommit) throw new Error(`benchmark harness checkout ${checkout} does not match requested commit ${request.harnessCommit}`)
-		if (process.env.HEADLESSCODE_RSI_BENCHMARK_HARNESS_COMMIT !== request.harnessCommit) throw new Error("HEADLESSCODE_RSI_BENCHMARK_HARNESS_COMMIT must identify the harness commit baked into the OpenShell image")
+		if (this.expectedHarnessCommit && this.expectedHarnessCommit !== request.harnessCommit) throw new Error(`benchmark agent was pinned to harness ${this.expectedHarnessCommit}, not requested commit ${request.harnessCommit}`)
 		const image = await this.imageIdentity(request.harnessCommit)
 		const privateWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), `headlesscode-benchmark-agent-${request.taskId}-`))
 		await fs.rmdir(privateWorkspace)
@@ -96,11 +107,12 @@ export class OpenShellBenchmarkAgent implements BenchmarkAgent {
 export class OpenShellBenchmarkVerifier implements BenchmarkVerifier {
 	private readonly harnessRoot: string
 	private readonly providerFactory?: RsiOpenShellProviderFactory
+	private readonly imageName: string
 	private cachedImageIdentity?: BenchmarkImageIdentity
-	constructor(harnessRoot = process.cwd(), providerFactory?: RsiOpenShellProviderFactory) { this.harnessRoot = path.resolve(harnessRoot); this.providerFactory = providerFactory }
+	constructor(harnessRoot = process.cwd(), providerFactory?: RsiOpenShellProviderFactory, imageName = "headlesscode-openshell-rsi:local") { this.harnessRoot = path.resolve(harnessRoot); this.providerFactory = providerFactory; this.imageName = imageName }
 
 	async imageIdentity(harnessCommit: string): Promise<BenchmarkImageIdentity> {
-		const name = "headlesscode-openshell-rsi:local"
+		const name = this.imageName
 		const digest = execFileSync("docker", ["image", "inspect", "--format={{.Id}}", name], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim()
 		if (!/^sha256:[a-f0-9]{64}$/.test(digest)) throw new Error(`OpenShell verifier image has an invalid Docker image ID: ${digest}`)
 		const marker = execFileSync("docker", ["run", "--rm", "--entrypoint", "/bin/cat", name, "/opt/headlesscode/.headlesscode-harness-commit"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim()

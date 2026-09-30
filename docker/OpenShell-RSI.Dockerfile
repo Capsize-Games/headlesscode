@@ -1,7 +1,8 @@
 # RSI worker/evaluator runtime derived from the standard OpenShell image.
 # The RSI coordinator, evaluator, and test files must stay in the supervisor
 # process or candidate workspace; they are not part of this guest image.
-FROM headlesscode-openshell:local
+ARG HEADLESSCODE_BASE_IMAGE=headlesscode-openshell:local
+FROM ${HEADLESSCODE_BASE_IMAGE}
 
 USER root
 RUN apt-get update \

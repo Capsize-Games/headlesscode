@@ -6,7 +6,14 @@ export function formatCandidate(candidate: CandidateRecord): string {
 	const mutation = candidate.mutationKind ? `, mutation=${candidate.mutationKind}` : ""
 	const metrics = fitness ? `, metrics=${JSON.stringify(fitness.metrics)}` : ""
 	const comparison = candidate.pairedComparison ? `, paired=${candidate.pairedComparison.reason} (${candidate.pairedComparison.baselinePasses}/${candidate.pairedComparison.trialCount} → ${candidate.pairedComparison.candidatePasses}/${candidate.pairedComparison.trialCount}; duration ratio ${candidate.pairedComparison.durationRatio.toFixed(3)})` : ""
-	return `${candidate.id}: ${candidate.status}${parent}${mutation}${fitness ? `, score=${fitness.score}, ${fitness.reason}` : ""}${comparison}${metrics}`
+	const describeProofArm = (label: string, arm: NonNullable<CandidateRecord["developmentProof"]>["immediateParent"]): string => {
+		const resources = (totals: typeof arm.childTotals) => `cost=${totals.costUsd ?? "unmeasured"}, calls=${totals.calls ?? "unmeasured"}, tokens=${totals.tokens ?? "unmeasured"}, wallMs=${totals.wallTimeMs ?? "unmeasured"}`
+		return `${label}[${arm.childCommit} vs ${arm.referenceCommit}]: ${arm.comparable ? "comparable" : "incomparable"} (${arm.reason}); wins=${arm.childWins}-${arm.parentWins}, bothPass=${arm.bothPass}, bothFail=${arm.bothFail}, invalid=${arm.invalid}; child(${resources(arm.childTotals)}), reference(${resources(arm.parentTotals)}); meanTokenRatio=${arm.meanTokenIncreaseRatio ?? "unmeasured"}`
+	}
+	const proof = candidate.developmentProof?.immediateParent && candidate.developmentProof.originalBase
+		? `, development=${candidate.developmentProof.accepted ? "eligible" : "ineligible"} (${candidate.developmentProof.reason}); ${describeProofArm("immediate-parent", candidate.developmentProof.immediateParent)}; ${describeProofArm("original-base", candidate.developmentProof.originalBase)}; protocol=${candidate.developmentProof.protocolDigest}; attemptRefs child/parent/root=${candidate.developmentProof.childAttemptIds.length}/${candidate.developmentProof.parentAttemptIds.length}/${candidate.developmentProof.originalBaseAttemptIds.length}`
+		: candidate.developmentProof ? `, development=ineligible (${candidate.developmentProof.reason || "incomplete proof record"})` : ", development=unmeasured (no benchmark proof recorded)"
+	return `${candidate.id}: ${candidate.status}${parent}${mutation}${fitness ? `, score=${fitness.score}, ${fitness.reason}` : ""}${proof}${comparison}${metrics}`
 }
 
 export function formatRunReport(run: RsiRunRecord, config: RsiConfig): string {
@@ -15,6 +22,8 @@ export function formatRunReport(run: RsiRunRecord, config: RsiConfig): string {
 		"",
 		`- Model: ${run.model}`,
 		`- Base commit: ${run.baseCommit}`,
+		`- Development proof: ${run.developmentProofProtocol ? `frozen protocol ${run.developmentProofProtocol.protocolDigest}; ${run.developmentProofProtocol.taskIds.length} development tasks; minimum net wins ${run.developmentProofProtocol.rule.minimumNetWins}; retention tasks ${run.developmentProofProtocol.rule.retentionTaskIds.join(", ")}; maximum mean-token increase ratio ${run.developmentProofProtocol.rule.maximumMeanTokenIncreaseRatio}` : "unavailable"}`,
+		`- Confirmation evidence: ${run.confirmationEvidence ?? "unmeasured"}`,
 		`- Generations: ${run.generations}`,
 		`- Started: ${run.startedAt}`,
 		`- Finished: ${run.finishedAt ?? "in progress"}`,

@@ -40,6 +40,7 @@ export async function evaluateCandidate(
 		}
 	}
 	const regression = await isolatedRunner(config.regressionCommand, candidateRoot, config.commandTimeoutMs)
+	const typecheck = await isolatedRunner("npm run typecheck", candidateRoot, config.commandTimeoutMs)
 	const visible: TrialResult[] = []
 	for (const command of config.evalCommands) {
 		visible.push(await isolatedRunner(command, candidateRoot, config.commandTimeoutMs))
@@ -49,13 +50,14 @@ export async function evaluateCandidate(
 		regression,
 		visible,
 		hidden,
-		completed: regression.ok && visible.every((trial) => trial.ok) && hidden.every((trial) => trial.ok),
-		crashed: [regression, ...visible, ...hidden].some((trial) => trial.exitCode === null && !trial.timedOut),
+		completed: regression.ok && typecheck.ok && visible.every((trial) => trial.ok) && hidden.every((trial) => trial.ok),
+		crashed: [regression, typecheck, ...visible, ...hidden].some((trial) => trial.exitCode === null && !trial.timedOut),
 		protectedPathViolation: false,
 		changedFiles: files,
 		committed: commits.length > 0,
 		complexity,
-		failureClassification: [regression, ...visible, ...hidden].some((trial) => !trial.ok) ? "evaluation-failure" : undefined,
+		typecheck,
+		failureClassification: [regression, typecheck, ...visible, ...hidden].some((trial) => !trial.ok) ? "evaluation-failure" : undefined,
 	}
 }
 

@@ -679,15 +679,15 @@ export function createOpenShellCommandRunner(config: RsiConfig): CommandRunner {
 }
 
 /** Execute only visible candidate checks inside a fresh OpenShell guest. */
-export async function runOpenShellEvaluation(candidate: CandidateRecord, config: RsiConfig): Promise<{ regression: TrialResult; visible: TrialResult[] }> {
+export async function runOpenShellEvaluation(candidate: CandidateRecord, config: RsiConfig): Promise<{ regression: TrialResult; typecheck: TrialResult; visible: TrialResult[] }> {
 	if (config.hiddenEvalCommands.length > 0) throw new Error("hidden RSI evaluation is supervisor-only and cannot be submitted as a worker job")
-	const commands = [config.regressionCommand, ...config.evalCommands]
+	const commands = [config.regressionCommand, "npm run typecheck", ...config.evalCommands]
 	const results: TrialResult[] = []
 	for (const command of commands) {
 		const isolated = await runSnapshot({ config, sourceRoot: candidate.worktree, commit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: candidate.worktree, encoding: "utf8" }).trim(), command, timeoutMs: config.commandTimeoutMs, mode: "evaluation" })
 		results.push(isolated.result)
 	}
-	return { regression: results[0], visible: results.slice(1) }
+	return { regression: results[0]!, typecheck: results[1]!, visible: results.slice(2) }
 }
 
 /** Run one supervisor-supplied benchmark verifier after the coding guest has been torn down. */
