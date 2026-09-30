@@ -12,16 +12,16 @@ import { computeFitness, compareFitness, comparePairedEvaluation } from "./fitne
 import { baseModelCandidate, createCombination } from "./models.js"
 import { runMutation } from "./mutation.js"
 import { formatRunReport } from "./reports.js"
-import { protectedPathViolations } from "./sandbox.js"
+import { mutationSnapshotProtectedPathViolations, protectedPathViolations } from "./sandbox.js"
 import { resolveRoles } from "./roles.js"
 import { newExperimentJob, paretoFront, selectParentChoices, transitionJob } from "./selection.js"
 import { captureCandidateTrajectory, exportTrajectoryDatasets } from "./trajectory.js"
 import { decideAdaptiveContinuation } from "./adaptive.js"
 import { createOpenShellCommandRunner } from "./openshell.js"
-import { createAdversarialEvaluationSnapshotBundle, createEvaluationSnapshotBundle, createMutationSnapshotBundle, applyFleetMutationPatch } from "./openshell.js"
+import { createAdversarialEvaluationSnapshotBundle, createEvaluationSnapshotBundle, createMutationSnapshotBundle, createMutationSnapshotIdentity, applyFleetMutationPatch } from "./openshell.js"
 import { ADVERSARIAL_COMMAND, ADVERSARIAL_PROMPT_VERSION, ADVERSARIAL_TESTS_PATH, buildAdversarialPrompt, parseAdversarialReview, requestAdversarialReview, sha256 } from "./adversarial.js"
 import { fleetJobMatches, PostgresRsiJobQueue, fleetQueuePolicy, requiredFleetJobLeaseMs, type FleetJob, type FleetJobIdentity, type FleetJobPayload } from "./postgres-queue.js"
-import type { AdversarialReviewRecord, CandidateRecord, ExperimentJob, RsiArchive, RsiConfig, RsiHooks, RsiRunRecord, TrajectoryRecord, TrialResult } from "./types.js"
+import type { AdversarialReviewRecord, CandidateRecord, ExperimentJob, RsiArchive, RsiConfig, RsiHooks, RsiRunRecord, TrajectoryRecord, TrialResult, WorkerHarnessExecution } from "./types.js"
 import {
 	candidateCommits,
 	changedFiles,
@@ -38,6 +38,8 @@ import type { DevelopmentTaskCell } from "./development-proof.js"
 import type { BenchmarkAttempt } from "./benchmark/types.js"
 import type { BenchmarkManifest } from "./benchmark/types.js"
 import { runDevelopmentBenchmarkForCommit } from "./development-benchmark.js"
+import { workerHarnessConfigDigest, workerHarnessRuntimeIdentityFromEnvironment, validWorkerHarnessRuntimeIdentity, effectiveWorkerHarnessMode } from "./worker-harness.js"
+import { workerHarnessCliPath } from "./worker-harness.js"
 
 function log(hooks: RsiHooks, line: string): void {
 	(hooks.log ?? ((message) => process.stdout.write(`${message}\n`)))(line)
@@ -64,7 +66,7 @@ function validateCandidateParent(candidate: CandidateRecord, run: RsiRunRecord, 
 		execFileSync("git", ["merge-base", "--is-ancestor", run.baseCommit, parentCommit], { cwd: config.repoRoot, stdio: "ignore" })
 	} catch { throw new CandidateLineageError(`candidate parent ${candidate.parent} is outside the frozen run base lineage`) }
 	const inheritedPaths = execFileSync("git", ["diff", "--name-only", "-z", "--no-renames", run.baseCommit, parentCommit], { cwd: config.repoRoot, encoding: "buffer" }) as Buffer
-	const violations = protectedPathViolations(inheritedPaths.toString("utf8").split("\0").filter(Boolean), config.protectedPaths)
+	const violations = mutationSnapshotProtectedPathViolations(inheritedPaths.toString("utf8").split("\0").filter(Boolean), config.protectedPaths)
 	if (violations.length > 0) throw new CandidateLineageError(`candidate parent ${candidate.parent} inherits protected path changes: ${violations.join(", ")}`)
 }
 
@@ -116,7 +118,7 @@ async function waitForFleetJob(queue: PostgresRsiJobQueue, jobId: string, timeou
 	throw new Error(`fleet job ${jobId} exceeded coordinator timeout`)
 }
 
-function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: { content: Buffer; snapshotCommit: string }, options: { campaignId?: string; boundedInference?: boolean } = {}): FleetJobPayload {
+function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: { content: Buffer; snapshotCommit: string; snapshotTreeDigest?: string }, options: { campaignId?: string; boundedInference?: boolean; includeWorkerHarness?: boolean } = {}): FleetJobPayload {
 	const provider = config.roles?.worker?.provider === "openrouter" ? "openrouter" : "ollama"
 	if (provider === "openrouter" && candidate.model !== RSI_OPENROUTER_MODEL) throw new Error(`RSI OpenRouter worker model must be pinned to ${RSI_OPENROUTER_MODEL}`)
 	const inferenceLimits = provider === "openrouter" && options.boundedInference
@@ -126,6 +128,9 @@ function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: {
 			maxDurationMs: config.commandTimeoutMs,
 		})
 		: undefined
+	const effectiveMode = effectiveWorkerHarnessMode(config.workerHarnessMode ?? "fixed-control", candidate.generation)
+	const runtime = config.workerHarnessRuntime
+	if (config.workerHarnessMode && options.includeWorkerHarness && (!runtime || !validWorkerHarnessRuntimeIdentity(runtime) || !snapshot.snapshotTreeDigest)) throw new Error("worker harness job lacks its frozen runtime and sanitized snapshot identity")
 	return {
 		schemaVersion: 1,
 		snapshotSha256: "", // replaced with the verified artifact digest before enqueue
@@ -140,11 +145,21 @@ function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: {
 		protectedPaths: config.protectedPaths,
 		candidate: {
 			id: candidate.id, generation: candidate.generation, parent: candidate.parent,
+			...(config.workerHarnessMode && options.includeWorkerHarness ? { baseCommit: candidate.baseCommit } : {}),
 			mutationKind: candidate.mutationKind, hypothesis: candidate.hypothesis,
 			modelCandidateId: candidate.modelCandidateId, computePolicy: config.computePolicy,
 		},
 		regressionCommand: config.regressionCommand,
 		evalCommands: config.evalCommands,
+		...(config.workerHarnessMode && options.includeWorkerHarness ? { workerHarness: {
+			runMode: config.workerHarnessMode,
+			mode: effectiveMode,
+			...(config.workerHarnessPairId ? { pairId: config.workerHarnessPairId } : {}),
+			parentCommit: candidate.baseCommit,
+			snapshotTreeDigest: snapshot.snapshotTreeDigest!,
+			runtime: runtime!,
+			executedCliPath: workerHarnessCliPath(effectiveMode),
+		} } : {}),
 	}
 }
 
@@ -200,6 +215,29 @@ function fleetEvaluationResult(value: unknown): { regression: TrialResult; typec
 	const evaluation = result.evaluation
 	if (!evaluation || !Array.isArray(evaluation.visible)) throw new Error("fleet evaluation trial list is malformed")
 	return { regression: compactTrial(evaluation.regression), typecheck: compactTrial(evaluation.typecheck), visible: evaluation.visible.map(compactTrial) }
+}
+
+function fleetWorkerHarnessExecution(value: unknown, expected: FleetJobPayload): WorkerHarnessExecution | undefined {
+	if (!expected.workerHarness) return undefined
+	if (!value || typeof value !== "object") throw new Error("fleet mutation result omitted its worker harness identity")
+	const execution = (value as { workerHarnessExecution?: WorkerHarnessExecution }).workerHarnessExecution
+	const plan = expected.workerHarness
+	if (!execution || execution.mode !== plan.mode || execution.parentCommit !== plan.parentCommit
+		|| execution.snapshotTreeDigest !== plan.snapshotTreeDigest || execution.executedCliPath !== plan.executedCliPath
+		|| JSON.stringify(execution.runtime) !== JSON.stringify(plan.runtime)
+		|| !/^[a-f0-9]{40}$/.test(execution.snapshotCommit)) throw new Error("fleet mutation result does not match its frozen worker harness identity")
+	return execution
+}
+
+function validateCandidateWorkerHarnessExecution(candidate: CandidateRecord, run: RsiRunRecord, config: RsiConfig, execution?: WorkerHarnessExecution): void {
+	if (!config.workerHarnessMode) return
+	const expectedMode = effectiveWorkerHarnessMode(config.workerHarnessMode, candidate.generation)
+	if (!execution || execution.mode !== expectedMode || execution.parentCommit !== candidate.baseCommit
+		|| execution.executedCliPath !== workerHarnessCliPath(expectedMode)
+		|| !/^[a-f0-9]{64}$/.test(execution.snapshotTreeDigest)
+		|| !/^[a-f0-9]{40}$/.test(execution.snapshotCommit)
+		|| JSON.stringify(execution.runtime) !== JSON.stringify(run.workerHarnessRuntime)) throw new Error("mutation result lacks the frozen worker harness execution identity")
+	candidate.workerHarnessExecution = execution
 }
 
 async function validateCurriculumOnFleet(
@@ -493,6 +531,11 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	const workerModel = roles.worker?.model ?? config.model
 	const workerProvider = roles.worker?.provider === "openrouter" ? "openshell-openrouter" : "openshell-ollama"
 	if (workerProvider === "openshell-openrouter" && workerModel !== RSI_OPENROUTER_MODEL) throw new Error(`RSI OpenRouter worker model must be pinned to ${RSI_OPENROUTER_MODEL}`)
+	const workerHarnessMode = config.workerHarnessMode ?? "fixed-control"
+	const workerHarnessRuntime = config.workerHarnessMode
+		? config.workerHarnessRuntime ?? workerHarnessRuntimeIdentityFromEnvironment(process.env)
+		: undefined
+	if (workerHarnessRuntime && !validWorkerHarnessRuntimeIdentity(workerHarnessRuntime)) throw new Error("worker harness runtime identity is malformed")
 	const resumed = config.resumeRunId ? await findActiveRun(config.archiveDir, config.resumeRunId) : undefined
 	if (config.resumeRunId && !resumed) throw new Error(`no active RSI run found for --resume ${config.resumeRunId}`)
 	const baseCommit = resumed?.baseCommit ?? (await resolveBaseCommit(config))
@@ -501,6 +544,9 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	run.generations = stageCount
 	run.model = workerModel
 	run.parentSelectionPolicy = config.parentSelectionPolicy ?? run.parentSelectionPolicy ?? "champion-specialist-novelty"
+	if (resumed && (run.workerHarnessMode ?? "fixed-control") !== workerHarnessMode) throw new Error("worker harness mode differs from the frozen run manifest")
+	if (resumed && (run.workerHarnessPairId ?? undefined) !== config.workerHarnessPairId) throw new Error("worker harness pair ID differs from the frozen run manifest")
+	if (resumed && workerHarnessRuntime && JSON.stringify(run.workerHarnessRuntime) !== JSON.stringify(workerHarnessRuntime)) throw new Error("worker harness runtime identity differs from the frozen run manifest")
 	run.modelCandidates ??= [baseModelCandidate(config.model, now(), config.modelCandidateId ?? "model-base")]
 	if (config.modelCandidates?.length) {
 		run.modelCandidates = [...run.modelCandidates, ...config.modelCandidates.filter((model) => !run.modelCandidates!.some((entry) => entry.id === model.id))]
@@ -511,7 +557,14 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	run.curriculumTasks ??= []
 	run.adversarialReviews ??= []
 	run.parentChoices ??= {}
-	const runConfig: RsiConfig = { ...config, model: workerModel, roles, seed: `${config.seed}-${run.runId.slice(-8)}` }
+	const runConfig: RsiConfig = {
+		...config,
+		model: workerModel,
+		roles,
+		seed: config.workerHarnessPairId ? config.seed : `${config.seed}-${run.runId.slice(-8)}`,
+		...(config.workerHarnessPairId ? { candidateIdNamespace: run.runId.slice(-8) } : {}),
+		...(workerHarnessRuntime ? { workerHarnessRuntime } : {}),
+	}
 	const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 	const proofFixturesRoot = path.join(packageRoot, "fixtures", "rsi-benchmark")
 	const loadedProofBenchmark = hooks.runDevelopmentBenchmark
@@ -523,6 +576,34 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		{ provider: workerProvider, id: workerModel, sampling: { temperature: 0, think: false, seed: "provider-default" } },
 		config.developmentProofRule,
 	)
+	const plannedGenerations = resumed?.workerHarnessPlannedGenerations ?? stageCount
+	if (resumed && (config.workerHarnessMode !== undefined || run.workerHarnessPairId !== undefined) && stageCount !== plannedGenerations) {
+		throw new Error("worker harness planned generation count differs from the frozen paired experiment")
+	}
+	const pairedConfig = { ...config, generations: plannedGenerations }
+	const pairedDigest = workerHarnessConfigDigest(pairedConfig, {
+		baseCommit,
+		model: workerModel,
+		provider: workerProvider,
+		proofProtocolDigest: proofProtocol.protocolDigest,
+	})
+	if (resumed && (config.workerHarnessMode !== undefined || run.workerHarnessConfigDigest !== undefined) && run.workerHarnessConfigDigest !== pairedDigest) {
+		throw new Error("worker harness paired experiment configuration differs from the frozen run manifest")
+	}
+	const conflictingArm = config.workerHarnessPairId
+		? [...archive.runs, ...archive.activeRuns].find((entry) => entry.workerHarnessPairId === config.workerHarnessPairId && entry.runId !== run.runId && (entry.workerHarnessMode ?? "fixed-control") !== workerHarnessMode)
+		: undefined
+	if (conflictingArm && (conflictingArm.workerHarnessConfigDigest !== pairedDigest
+		|| conflictingArm.workerHarnessPlannedGenerations !== plannedGenerations
+		|| JSON.stringify(conflictingArm.workerHarnessRuntime) !== JSON.stringify(workerHarnessRuntime))) {
+		throw new Error("paired fixed-control and self-hosted runs must use identical experiment settings and runtime identity")
+	}
+	run.workerHarnessMode = workerHarnessMode
+	run.workerHarnessPairId = config.workerHarnessPairId
+	run.workerHarnessConfigDigest = pairedDigest
+	run.workerHarnessPlannedGenerations ??= plannedGenerations
+	run.workerHarnessSamplingSeed = config.seed
+	if (workerHarnessRuntime) run.workerHarnessRuntime = workerHarnessRuntime
 	if (resumed && !resumed.developmentProofProtocol) throw new Error("cannot resume an RSI run without its frozen development proof protocol")
 	if (resumed && resumed.developmentProofProtocol?.protocolDigest !== proofProtocol.protocolDigest) throw new Error("development proof protocol differs from the frozen protocol on this run")
 	run.developmentProofProtocol ??= proofProtocol
@@ -669,7 +750,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 					const snapshot = createMutationSnapshotBundle(candidate.worktree, candidate.baseCommit, runConfig)
 					const artifact = await fleetQueue.putArtifact(snapshot.content)
 					const useOpenRouter = runConfig.roles?.worker?.provider === "openrouter"
-					const payload = fleetPayload(runConfig, candidate, snapshot, { campaignId: run.runId, boundedInference: true })
+			const payload = fleetPayload(runConfig, candidate, snapshot, { campaignId: run.runId, boundedInference: true, includeWorkerHarness: true })
 					payload.snapshotSha256 = artifact.sha256
 					const resourceClass = useOpenRouter ? "REMOTE_API" as const : "LOCAL_GPU" as const
 					const concurrencyKey = `${useOpenRouter ? "openrouter" : "ollama"}:${candidate.model}`
@@ -749,6 +830,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 						}
 						const result = completed.result as { patchSha256?: string; patchBytes?: number }
 						if (!result.patchSha256 || !Number.isSafeInteger(result.patchBytes) || Number(result.patchBytes) < 1) throw new Error("fleet mutation result is missing its patch artifact reference")
+						validateCandidateWorkerHarnessExecution(candidate, run, runConfig, fleetWorkerHarnessExecution(completed.result, submitted.payload))
 						recordFleetInferenceUsage(candidate, completed.result, submitted.payload, completed.jobId)
 						const patch = await fleetQueue.getArtifact(result.patchSha256)
 						if (patch.byteLength !== result.patchBytes) throw new Error("fleet mutation patch length did not match result metadata")
@@ -756,7 +838,15 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 					} else {
 					await createCandidateWorktree(runConfig, candidate)
 					managedWorktrees.add(candidate.id)
-					const mutation = await (hooks.runMutation ?? runMutation)(candidate, runConfig)
+					const candidateRunConfig = runConfig.workerHarnessMode
+						? {
+							...runConfig,
+							workerHarnessParentCommit: candidate.baseCommit,
+							workerHarnessSnapshotTreeDigest: createMutationSnapshotIdentity(candidate.worktree, candidate.baseCommit, runConfig).snapshotTreeDigest,
+						}
+						: runConfig
+					const mutation = await (hooks.runMutation ?? runMutation)(candidate, candidateRunConfig)
+					validateCandidateWorkerHarnessExecution(candidate, run, runConfig, mutation.workerHarnessExecution)
 					if (!mutation.ok) throw new Error(mutation.error ?? "RSI mutation failed")
 				}
 				job = transitionJob(job, "completed", now())

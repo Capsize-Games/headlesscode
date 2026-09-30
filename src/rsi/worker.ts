@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { execFileSync } from "node:child_process"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
@@ -8,6 +9,8 @@ import { PostgresRsiJobQueue, fleetQueuePolicy, requiredFleetJobLeaseMs, type Fl
 import { runOpenShellEvaluation, runOpenShellModelJob, runOpenShellMutation } from "./openshell.js"
 import type { CandidateRecord, ComputePolicy, EvaluationSummary, MutationHypothesis, MutationKind, RsiConfig, RsiRoleConfig, TrialResult } from "./types.js"
 import { startOpenRouterBroker, RSI_OPENROUTER_MODEL, type OpenRouterBrokerReceipt, type OpenRouterBrokerOptions } from "./inference-broker.js"
+import { effectiveWorkerHarnessMode, workerHarnessCliPath, validWorkerHarnessRuntimeIdentity } from "./worker-harness.js"
+import { mutationSnapshotProtectedPathViolations } from "./sandbox.js"
 
 const EVALUATION_PREVIEW_CHARS = 2048
 
@@ -85,6 +88,13 @@ function taskConfig(payload: FleetJobPayload, root: string, queue: PostgresRsiJo
 		mutationKind: payload.candidate.mutationKind as MutationKind | undefined,
 		hypothesis: payload.candidate.hypothesis as MutationHypothesis | undefined,
 		roles,
+		...(payload.workerHarness ? {
+			workerHarnessMode: payload.workerHarness.runMode,
+			workerHarnessPairId: payload.workerHarness.pairId,
+			workerHarnessRuntime: payload.workerHarness.runtime,
+			workerHarnessParentCommit: payload.workerHarness.parentCommit,
+			workerHarnessSnapshotTreeDigest: payload.workerHarness.snapshotTreeDigest,
+		} : {}),
 	}
 }
 
@@ -114,7 +124,7 @@ function candidateFromPayload(payload: FleetJobPayload, root: string): Candidate
 	}
 }
 
-function verifySanitizedBundle(root: string, expectedCommit: string, jobKind: FleetJobLease["job"]["jobKind"]): void {
+function verifySanitizedBundle(root: string, expectedCommit: string, jobKind: FleetJobLease["job"]["jobKind"], protectedPaths: string[] = []): void {
 	const actual = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim()
 	if (actual !== expectedCommit) throw new Error("fleet snapshot commit did not match the queued digest-bound commit")
 	const count = execFileSync("git", ["rev-list", "--count", "--all"], { cwd: root, encoding: "utf8" }).trim()
@@ -126,6 +136,7 @@ function verifySanitizedBundle(root: string, expectedCommit: string, jobKind: Fl
 		const [mode] = entry.slice(0, tab).split(" ")
 		const relativePath = entry.slice(tab + 1).replaceAll("\\", "/")
 		if (mode !== "100644" && mode !== "100755") throw new Error("fleet snapshot contains a symlink, submodule or special file")
+		if (jobKind === "mutation" && mutationSnapshotProtectedPathViolations([relativePath], protectedPaths).length > 0) throw new Error(`fleet mutation snapshot contains a protected path: ${relativePath}`)
 		if (relativePath === ".env" || relativePath.startsWith(".env.") || relativePath.startsWith("src/rsi/") || relativePath.startsWith(".headlesscode/") || relativePath.startsWith("scripts/eval-suite/") || (jobKind === "mutation" && (relativePath.startsWith("fixtures/rsi-curriculum/") || relativePath.startsWith("fixtures/rsi-benchmark/") || relativePath.startsWith("scripts/") || relativePath.startsWith("tests/") || relativePath.startsWith("test/") || relativePath.includes("/__tests__/") || /(?:^|\/)\D[^/]*\.(?:test|spec)\.[^/]+$/.test(relativePath)))) {
 			throw new Error(`fleet snapshot contains protected evaluator or credential material: ${relativePath}`)
 		}
@@ -135,6 +146,23 @@ function verifySanitizedBundle(root: string, expectedCommit: string, jobKind: Fl
 			if (/^(?:\.rsi-base-model|\.headlesscode-rsi-model-output)(?:\/|$)/.test(relativePath)) throw new Error("model job snapshot contains a local model or prior result artifact")
 		}
 	}
+}
+
+export function verifyWorkerHarnessPayload(payload: FleetJobPayload, root: string): void {
+	const identity = payload.workerHarness
+	if (!identity) return
+	const candidate = payload.candidate as { generation?: unknown; baseCommit?: unknown }
+	const generation = candidate.generation
+	if ((identity.runMode !== "fixed-control" && identity.runMode !== "self-hosted")
+		|| !Number.isSafeInteger(generation) || Number(generation) < 0
+		|| identity.mode !== effectiveWorkerHarnessMode(identity.runMode, Number(generation))
+		|| typeof candidate.baseCommit !== "string" || identity.parentCommit !== candidate.baseCommit
+		|| !/^[a-f0-9]{40}$/.test(identity.parentCommit)
+		|| !/^[a-f0-9]{64}$/.test(identity.snapshotTreeDigest)
+		|| !validWorkerHarnessRuntimeIdentity(identity.runtime)
+		|| identity.executedCliPath !== workerHarnessCliPath(identity.mode)) throw new Error("fleet worker harness identity is malformed or does not match its generation/mode")
+	const actualTreeDigest = createHash("sha256").update(execFileSync("git", ["ls-tree", "-r", "-z", "--full-tree", "HEAD"], { cwd: root, encoding: "buffer" })).digest("hex")
+	if (actualTreeDigest !== identity.snapshotTreeDigest) throw new Error("fleet worker harness snapshot tree differs from the frozen job identity")
 }
 
 async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions): Promise<void> {
@@ -160,7 +188,8 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions): Pr
 		execFileSync("git", ["init", "--bare", "--quiet", verifyRoot], { cwd: root, stdio: "pipe" })
 		execFileSync("git", ["bundle", "verify", bundlePath], { cwd: verifyRoot, stdio: "pipe" })
 		execFileSync("git", ["clone", "--quiet", "--no-hardlinks", bundlePath, repoRoot], { cwd: root, stdio: "pipe" })
-		verifySanitizedBundle(repoRoot, payload.snapshotCommit, lease.job.jobKind)
+		verifySanitizedBundle(repoRoot, payload.snapshotCommit, lease.job.jobKind, payload.protectedPaths)
+		if (lease.job.jobKind === "mutation") verifyWorkerHarnessPayload(payload, repoRoot)
 		const candidate = candidateFromPayload(payload, repoRoot)
 		const config = taskConfig(payload, repoRoot, options.queue)
 		const started = Date.now()
@@ -191,11 +220,19 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions): Pr
 				await broker?.close().catch(() => undefined)
 			}
 			if (!mutation.ok) throw new Error(mutation.error ?? mutation.result?.stderr ?? "OpenShell mutation failed")
+			if (payload.workerHarness && (!mutation.workerHarnessExecution
+				|| mutation.workerHarnessExecution.mode !== payload.workerHarness.mode
+				|| mutation.workerHarnessExecution.parentCommit !== payload.workerHarness.parentCommit
+				|| mutation.workerHarnessExecution.snapshotTreeDigest !== payload.workerHarness.snapshotTreeDigest
+				|| mutation.workerHarnessExecution.executedCliPath !== payload.workerHarness.executedCliPath
+				|| JSON.stringify(mutation.workerHarnessExecution.runtime) !== JSON.stringify(payload.workerHarness.runtime))) {
+				throw new Error("OpenShell mutation result does not match its frozen worker harness identity")
+			}
 			if ((payload.provider ?? "ollama") === "openrouter" && (!receipt?.qualified || receipt.model !== payload.model || receipt.provider !== "openrouter")) throw new Error("OpenRouter mutation did not produce a qualified, model-bound broker receipt")
 			const patch = execFileSync("git", ["diff", "--binary", "--no-ext-diff", "--no-renames", `${candidate.baseCommit}...HEAD`], { cwd: repoRoot, encoding: "buffer", maxBuffer: options.queue.policy.maxInFlight * 1024 * 1024 * 16 })
 			if (patch.byteLength === 0) throw new Error("OpenShell mutation produced no patch")
 			const artifact = await options.queue.putArtifact(patch)
-			result = { ok: true, provider: payload.provider ?? "ollama", model: payload.model, ...(receipt ? { inferenceReceipt: receipt } : {}), patchSha256: artifact.sha256, patchBytes: artifact.byteLength, durationMs: Date.now() - started }
+			result = { ok: true, provider: payload.provider ?? "ollama", model: payload.model, ...(receipt ? { inferenceReceipt: receipt } : {}), ...(mutation.workerHarnessExecution ? { workerHarnessExecution: mutation.workerHarnessExecution } : {}), patchSha256: artifact.sha256, patchBytes: artifact.byteLength, durationMs: Date.now() - started }
 		} else if (lease.job.jobKind === "evaluation") {
 			const evaluation = await (options.runEvaluation ?? runOpenShellEvaluation)(candidate, config)
 			const externalized = await externalizeEvaluationOutputs(options.queue, evaluation)

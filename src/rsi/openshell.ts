@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process"
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
@@ -9,9 +9,11 @@ import { DEFAULT_PROTECTED_FILES, findMatchingPattern } from "../permissions/pro
 import { OpenShellSessionProvider, OPENSHELL_HARNESS_ROOT } from "../cloud/openshell-provider.js"
 import type { OpenShellSessionProviderOptions } from "../cloud/openshell-provider.js"
 import type { CloudSessionRequest, CommandResult, SessionHandle } from "../cloud/provider.js"
-import type { CandidateRecord, CommandRunner, RsiConfig, TrialResult } from "./types.js"
+import type { CandidateRecord, CommandRunner, RsiConfig, TrialResult, WorkerHarnessExecution, WorkerHarnessRuntimeIdentity } from "./types.js"
 import { ADVERSARIAL_RUNNER_PATH, ADVERSARIAL_TESTS_PATH } from "./adversarial.js"
 import { RSI_OPENROUTER_MODEL } from "./inference-broker.js"
+import { effectiveWorkerHarnessMode, workerHarnessCliPath, validWorkerHarnessRuntimeIdentity } from "./worker-harness.js"
+import { mutationSnapshotProtectedPathViolations } from "./sandbox.js"
 
 const POLICY_PATH = fileURLToPath(new URL("../../shared/openshell/headlesscode-policy.yaml", import.meta.url))
 const MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024
@@ -50,6 +52,7 @@ export interface IsolatedRunOptions {
 	image?: string
 	providerFactory?: RsiOpenShellProviderFactory
 	inferenceBroker?: RsiInferenceBrokerAccess
+	expectedSnapshotTreeDigest?: string
 }
 
 function execFileBuffer(command: string, args: string[], options: { cwd?: string; input?: Buffer | string } = {}): Buffer {
@@ -74,6 +77,7 @@ function alwaysOmit(relativePath: string): boolean {
 function shouldInclude(relativePath: string, mode: IsolatedRunOptions["mode"], config: RsiConfig): boolean {
 	if (alwaysOmit(relativePath)) return false
 	if (mode === "mutation") {
+		if (mutationSnapshotProtectedPathViolations([relativePath], config.protectedPaths).length > 0) return false
 		// These are supervisor-controlled RSI policy/evaluation inputs. Enforce
 		// their exclusion even when a caller supplies an incomplete protectedPaths list.
 		const segments = relativePath.split("/")
@@ -153,6 +157,20 @@ function initializeSnapshot(sourceRoot: string, commit: string, destination: str
 	return execFileSync("git", ["rev-parse", "HEAD"], { cwd: destination, encoding: "utf8" }).trim()
 }
 
+function sha256SnapshotTree(snapshot: string): string {
+	return createHash("sha256").update(execFileBuffer("git", ["ls-tree", "-r", "-z", "--full-tree", "HEAD"], { cwd: snapshot })).digest("hex")
+}
+
+function verifyWorkerHarnessRuntime(expected: WorkerHarnessRuntimeIdentity): void {
+	if (!validWorkerHarnessRuntimeIdentity(expected)) throw new Error("RSI worker harness runtime identity is malformed")
+	const actualDigest = execFileSync("docker", ["image", "inspect", "--format={{.Id}}", expected.imageName], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim()
+	if (actualDigest !== expected.imageDigest) throw new Error("RSI worker image digest differs from the frozen run identity")
+	const marker = execFileSync("docker", ["run", "--rm", "--entrypoint", "/bin/cat", expected.imageDigest, "/opt/headlesscode/.headlesscode-harness-commit"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim()
+	if (marker !== expected.harnessCommit) throw new Error("RSI worker image harness marker differs from the frozen run identity")
+	const lock = execFileSync("docker", ["run", "--rm", "--entrypoint", "/bin/sha256sum", expected.imageDigest, "/opt/headlesscode/package-lock.json"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim().split(/\s+/, 1)[0]
+	if (lock !== expected.dependencyLockDigest) throw new Error("RSI worker image dependency lock differs from the frozen run identity")
+}
+
 function snapshotCommitEnvironment(): NodeJS.ProcessEnv {
 	const date = "2000-01-01T00:00:00Z"
 	return { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date }
@@ -186,19 +204,32 @@ export function createModelJobSnapshotBundle(sourceRoot: string, commit: string,
 }
 
 /** Build a one-commit mutation-only bundle for transfer to a remote worker. */
-export function createMutationSnapshotBundle(sourceRoot: string, commit: string, config: RsiConfig): { content: Buffer; snapshotCommit: string } {
+export function createMutationSnapshotBundle(sourceRoot: string, commit: string, config: RsiConfig): { content: Buffer; snapshotCommit: string; snapshotTreeDigest: string } {
 	const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "headlesscode-rsi-fleet-snapshot-"))
 	const snapshot = path.join(tempRoot, "repo")
 	const bundlePath = path.join(tempRoot, "snapshot.bundle")
 	try {
 		const snapshotCommit = initializeSnapshot(sourceRoot, commit, snapshot, "mutation", config)
+		const snapshotTreeDigest = sha256SnapshotTree(snapshot)
 		const commitCount = execFileSync("git", ["rev-list", "--count", "--all"], { cwd: snapshot, encoding: "utf8" }).trim()
 		if (commitCount !== "1") throw new Error("fleet mutation snapshot must contain exactly one sanitized commit")
 		execFileSync("git", ["bundle", "create", bundlePath, "--all"], { cwd: snapshot, stdio: "pipe" })
 		execFileSync("git", ["bundle", "verify", bundlePath], { cwd: snapshot, stdio: "pipe" })
 		const content = fs.readFileSync(bundlePath)
 		if (content.byteLength > MAX_SNAPSHOT_BYTES) throw new Error("fleet mutation bundle exceeds the 512 MiB snapshot limit")
-		return { content, snapshotCommit }
+		return { content, snapshotCommit, snapshotTreeDigest }
+	} finally {
+		fs.rmSync(tempRoot, { recursive: true, force: true })
+	}
+}
+
+/** Calculate the exact sanitized source identity before a local mutation guest is admitted. */
+export function createMutationSnapshotIdentity(sourceRoot: string, commit: string, config: RsiConfig): { snapshotCommit: string; snapshotTreeDigest: string } {
+	const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "headlesscode-rsi-mutation-identity-"))
+	const snapshot = path.join(tempRoot, "repo")
+	try {
+		const snapshotCommit = initializeSnapshot(sourceRoot, commit, snapshot, "mutation", config)
+		return { snapshotCommit, snapshotTreeDigest: sha256SnapshotTree(snapshot) }
 	} finally {
 		fs.rmSync(tempRoot, { recursive: true, force: true })
 	}
@@ -409,7 +440,7 @@ function applyCandidatePatch(snapshot: string, snapshotBase: string, candidate: 
 	const invalidModes = changes.filter((change) => change.status !== "D" && change.mode !== "100644" && change.mode !== "100755")
 	if (invalidModes.length > 0) throw new Error(`OpenShell mutation artifact contains symlinks, submodules, or special files: ${invalidModes.map((change) => change.path).join(", ")}`)
 	const forbiddenMetadata = new Set([".gitattributes", ".gitmodules", ".gitignore"])
-	const violations = files.filter((file) => findMatchingPattern(file, config.protectedPaths) !== null || alwaysOmit(file) || file === "node_modules" || forbiddenMetadata.has(file))
+	const violations = [...new Set([...mutationSnapshotProtectedPathViolations(files, config.protectedPaths), ...files.filter((file) => alwaysOmit(file) || file === "node_modules" || forbiddenMetadata.has(file))])]
 	if (violations.length > 0) throw new Error(`OpenShell mutation artifact changed protected paths: ${violations.join(", ")}`)
 	const commits = execFileSync("git", ["rev-list", "--count", `${snapshotBase}..HEAD`], { cwd: snapshot, encoding: "utf8" }).trim()
 	if (Number(commits) === 0 || files.length === 0) throw new Error("OpenShell mutation produced no committed source changes")
@@ -443,7 +474,7 @@ export function applyFleetMutationPatch(patch: Buffer, candidate: CandidateRecor
 		const invalidModes = changes.filter((change) => change.status !== "D" && change.mode !== "100644" && change.mode !== "100755")
 		if (invalidModes.length > 0) throw new Error(`fleet worker patch contains symlinks or special files: ${invalidModes.map((change) => change.path).join(", ")}`)
 		const forbiddenMetadata = new Set([".gitattributes", ".gitmodules", ".gitignore"])
-		const violations = files.filter((file) => findMatchingPattern(file, config.protectedPaths) !== null || alwaysOmit(file) || file === "node_modules" || forbiddenMetadata.has(file))
+		const violations = [...new Set([...mutationSnapshotProtectedPathViolations(files, config.protectedPaths), ...files.filter((file) => alwaysOmit(file) || file === "node_modules" || forbiddenMetadata.has(file))])]
 		if (violations.length > 0) throw new Error(`fleet worker patch changed protected paths: ${violations.join(", ")}`)
 		execFileSync("git", ["-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", `RSI candidate ${candidate.id}`], { cwd: candidate.worktree, stdio: "pipe" })
 		return files
@@ -468,7 +499,7 @@ function stagedSnapshotChanges(snapshot: string): Array<{ path: string; mode: st
 	return changes
 }
 
-async function runSnapshot(options: IsolatedRunOptions & { preserveSnapshot?: boolean }): Promise<{ result: TrialResult; snapshot: string; snapshotBase: string }> {
+async function runSnapshot(options: IsolatedRunOptions & { preserveSnapshot?: boolean }): Promise<{ result: TrialResult; snapshot: string; snapshotBase: string; snapshotTreeDigest: string }> {
 	if (options.config.hiddenEvalCommands.length > 0) {
 		throw new Error("RSI hidden evaluations are disabled until an evaluator service can keep test inputs outside candidate execution")
 	}
@@ -488,6 +519,10 @@ async function runSnapshot(options: IsolatedRunOptions & { preserveSnapshot?: bo
 		}
 		execFileSync("git", ["add", "--all"], { cwd: snapshot })
 		execFileSync("git", ["-c", "core.hooksPath=/dev/null", "commit", "--amend", "--quiet", "--no-edit"], { cwd: snapshot, env: snapshotCommitEnvironment() })
+	}
+	const snapshotTreeDigest = sha256SnapshotTree(snapshot)
+	if (options.expectedSnapshotTreeDigest && snapshotTreeDigest !== options.expectedSnapshotTreeDigest) {
+		throw new Error("worker sanitized snapshot tree digest differs from the frozen fleet job identity")
 	}
 	const factory = options.providerFactory ?? ((providerConfig) => new OpenShellSessionProvider(providerConfig))
 	const provider = factory(providerOptions(options.config, options.mode, options.timeoutMs, options.image, options.inferenceBroker))
@@ -519,6 +554,7 @@ async function runSnapshot(options: IsolatedRunOptions & { preserveSnapshot?: bo
 			},
 			snapshot,
 			snapshotBase,
+			snapshotTreeDigest,
 		}
 	} finally {
 		try {
@@ -569,15 +605,29 @@ export async function runOpenShellModelJob(candidate: CandidateRecord, config: R
 	}
 }
 
-export async function runOpenShellMutation(candidate: CandidateRecord, config: RsiConfig, providerFactory?: RsiOpenShellProviderFactory, image?: string, inferenceBroker?: RsiInferenceBrokerAccess): Promise<{ ok: boolean; result?: TrialResult; error?: string; patchRejected?: boolean; calls?: number | null; tokens?: number | null }> {
+export async function runOpenShellMutation(candidate: CandidateRecord, config: RsiConfig, providerFactory?: RsiOpenShellProviderFactory, image?: string, inferenceBroker?: RsiInferenceBrokerAccess): Promise<{ ok: boolean; result?: TrialResult; error?: string; patchRejected?: boolean; calls?: number | null; tokens?: number | null; workerHarnessExecution?: WorkerHarnessExecution }> {
 	try {
+		const requestedMode = config.workerHarnessMode ?? "fixed-control"
+		const effectiveMode = effectiveWorkerHarnessMode(requestedMode, candidate.generation)
+		const runtime = config.workerHarnessRuntime
+		let pinnedImage = image
+		if (config.workerHarnessMode) {
+			if (!runtime) throw new Error("RSI worker harness requires a frozen runtime image and dependency identity")
+			verifyWorkerHarnessRuntime(runtime)
+			pinnedImage = runtime.imageDigest
+		}
+		const cliPath = workerHarnessCliPath(effectiveMode)
 		const workerCommand = [
 			"/opt/headlesscode/node_modules/.bin/tsx",
-			"/opt/headlesscode/src/cli.ts",
+			"--tsconfig",
+			"/opt/headlesscode/tsconfig.json",
+			cliPath,
 			"--mode",
 			"code",
 			"--max-iterations",
 			String(config.maxIterations),
+			"--temperature",
+			"0",
 			...(config.maxTokens ? ["--max-tokens", String(config.maxTokens)] : []),
 			"--no-checkpoints",
 			"--task",
@@ -585,11 +635,20 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 		].map(shellQuote).join(" ")
 		const boundaryChecks = [
 			"ln -s /opt/headlesscode/node_modules /workspace/node_modules",
+			'test "$(readlink /workspace/node_modules)" = /opt/headlesscode/node_modules',
+			"test -r /workspace/src/cli.ts",
+			"test -r /opt/headlesscode/tsconfig.json",
+			"test -r /opt/headlesscode/package-lock.json",
 			'test "$(git -C /workspace rev-list --count HEAD)" = 1',
 			"test ! -e /workspace/src/rsi",
 			"test ! -e /workspace/scripts",
 			"test ! -e /workspace/tests",
 			"test ! -e /workspace/test",
+			"test ! -e /workspace/fixtures",
+			"test ! -e /workspace/package.json",
+			"test ! -e /workspace/package-lock.json",
+			"test ! -e /workspace/docker",
+			"test ! -e /workspace/.dockerignore",
 			"test ! -e /workspace/.env",
 			"test ! -e /workspace/.headlesscode",
 			"test ! -e /opt/headlesscode/src/rsi",
@@ -612,13 +671,25 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 			sessionName: `rsi-mutation-${candidate.id}-${randomUUID().slice(0, 6)}`,
 			env,
 			inferenceBroker,
-			image,
+			image: pinnedImage,
 			providerFactory,
+			expectedSnapshotTreeDigest: config.workerHarnessSnapshotTreeDigest,
 		})
+		const workerHarnessExecution = config.workerHarnessMode && runtime ? {
+			mode: effectiveMode,
+			parentCommit: config.workerHarnessParentCommit ?? candidate.baseCommit,
+			snapshotCommit: isolation.snapshotBase,
+			snapshotTreeDigest: isolation.snapshotTreeDigest,
+			runtime,
+			executedCliPath: cliPath,
+		} satisfies WorkerHarnessExecution : undefined
+		if (config.workerHarnessSnapshotTreeDigest && isolation.snapshotTreeDigest !== config.workerHarnessSnapshotTreeDigest) {
+			throw new Error("worker sanitized snapshot tree digest differs from the frozen fleet job identity")
+		}
 		if (!isolation.result.ok) {
 			const detail = isolation.result.stderr || isolation.result.stdout
 			if (isolation.result.exitCode === 79 && detail.includes("RSI_BENCHMARK_PREFLIGHT_FAILURE")) throw new Error(`OpenShell benchmark preflight failed: ${detail.slice(0, 3000)}`)
-			return { ok: false, result: isolation.result, error: `OpenShell mutation worker failed (exit ${isolation.result.exitCode ?? "unknown"})${detail ? `: ${detail.slice(0, 3000)}` : ""}` }
+			return { ok: false, result: isolation.result, error: `OpenShell mutation worker failed (exit ${isolation.result.exitCode ?? "unknown"})${detail ? `: ${detail.slice(0, 3000)}` : ""}`, ...(workerHarnessExecution ? { workerHarnessExecution } : {}) }
 		}
 		const usage = readMutationTranscriptUsage(isolation.snapshot)
 		let changedFiles: string[]
@@ -634,10 +705,11 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 				error: error instanceof Error ? error.message : String(error),
 				patchRejected: true,
 				...usage,
+				...(workerHarnessExecution ? { workerHarnessExecution } : {}),
 			}
 		}
-		if (isolation.result.ok && changedFiles.length === 0) return { ok: false, result: isolation.result, error: "OpenShell worker returned success without a candidate change", ...usage }
-		return { ok: true, result: isolation.result, ...usage }
+		if (isolation.result.ok && changedFiles.length === 0) return { ok: false, result: isolation.result, error: "OpenShell worker returned success without a candidate change", ...usage, ...(workerHarnessExecution ? { workerHarnessExecution } : {}) }
+		return { ok: true, result: isolation.result, ...usage, ...(workerHarnessExecution ? { workerHarnessExecution } : {}) }
 	} finally {
 		const snapshotPrefix = `rsi-mutation-${candidate.id}`
 		try {

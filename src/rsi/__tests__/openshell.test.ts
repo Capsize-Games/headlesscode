@@ -8,7 +8,7 @@ import type { RsiOpenShellProviderFactory } from "../openshell.js"
 import type { CandidateRecord, RsiConfig } from "../types.js"
 import { parseRsiArgs } from "../config.js"
 
-async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker-failure"): Promise<void> {
+async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker-failure" | "snapshot-mismatch" | "protected-package"): Promise<void> {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-openshell-"))
 	const worktree = path.join(repo, ".worktrees", "rsi", `candidate-${mode}`)
 	let guestPath = ""
@@ -24,6 +24,7 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 		fs.mkdirSync(path.join(repo, "scripts", "eval-suite"), { recursive: true })
 		fs.mkdirSync(path.join(repo, "test"), { recursive: true })
 		fs.writeFileSync(path.join(repo, "src", "engine", "loop.ts"), "export const value = 1\n")
+		fs.writeFileSync(path.join(repo, "package.json"), "{\"name\":\"fixture\"}\n")
 		fs.writeFileSync(path.join(repo, "src", "rsi", "evaluator.ts"), "export const hiddenScoring = 'secret'\n")
 		fs.writeFileSync(path.join(repo, "scripts", "eval-suite", "hidden.sh"), "secret\n")
 		fs.writeFileSync(path.join(repo, "test", "engine.test.ts"), "test secret\n")
@@ -70,6 +71,7 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 			protectedPaths: [],
 			commandTimeoutMs: 10_000,
 			...(mode === "preflight" ? { benchmarkHarnessCommit: "f".repeat(40) } : {}),
+			...(mode === "snapshot-mismatch" ? { workerHarnessSnapshotTreeDigest: "f".repeat(64) } : {}),
 		}
 		const providerFactory: RsiOpenShellProviderFactory = (options) => {
 			factoryOptions = options
@@ -82,6 +84,7 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 					assert.equal(fs.existsSync(path.join(workspace, "scripts", "eval-suite", "hidden.sh")), false)
 					assert.equal(fs.existsSync(path.join(workspace, "test", "engine.test.ts")), false)
 					assert.equal(fs.existsSync(path.join(workspace, ".env")), false)
+					assert.equal(fs.existsSync(path.join(workspace, "package.json")), false, "candidate-controlled package metadata must not enter the mutation guest")
 					return { id: request.worktreeSpec.name, provider: "mock-openshell", address: workspace }
 				},
 				async waitReady() {},
@@ -101,6 +104,8 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 					} else if (mode === "escape") {
 						fs.mkdirSync(path.join(guestPath, "scripts", "eval-suite"), { recursive: true })
 						fs.writeFileSync(path.join(guestPath, "scripts", "eval-suite", "injected.sh"), "secret\n")
+					} else if (mode === "protected-package") {
+						fs.writeFileSync(path.join(guestPath, "package.json"), "{\"scripts\":{\"preinstall\":\"touch /tmp/pwned\"}}\n")
 					} else {
 						fs.symlinkSync("/etc/passwd", path.join(guestPath, "src", "engine", "external"))
 					}
@@ -116,6 +121,19 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 		if (mode === "preflight") {
 			await assert.rejects(runOpenShellMutation(candidate, config, providerFactory), /OpenShell benchmark preflight failed/)
 			assert.equal(fs.readFileSync(path.join(worktree, "src", "engine", "loop.ts"), "utf8"), "export const value = 1\n", "wrong harness image must abort before task code runs")
+			return
+		}
+		if (mode === "snapshot-mismatch") {
+			await assert.rejects(runOpenShellMutation(candidate, config, providerFactory), /snapshot tree digest differs from the frozen fleet job identity/)
+			assert.equal(factoryOptions, undefined, "a snapshot identity mismatch must abort before provider creation")
+			assert.equal(workerInvocations, 0, "a snapshot identity mismatch must abort before guest execution")
+			return
+		}
+		if (mode === "protected-package") {
+			const result = await runOpenShellMutation(candidate, config, providerFactory)
+			assert.equal(result.ok, false)
+			assert.match(result.error ?? "", /protected paths/)
+			assert.equal(fs.readFileSync(path.join(worktree, "package.json"), "utf8"), "{\"name\":\"fixture\"}\n", "candidate package metadata must not be imported")
 			return
 		}
 		if (mode === "worker-failure") {
@@ -154,6 +172,8 @@ await run("escape")
 await run("symlink")
 await run("preflight")
 await run("worker-failure")
+await run("snapshot-mismatch")
+await run("protected-package")
 
 {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-benchmark-verifier-"))
