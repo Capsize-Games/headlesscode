@@ -11,7 +11,7 @@ import { fleetJobMatches, fleetPayloadDigest, PostgresRsiJobQueue, type FleetJob
 import { PostgresProofCampaign, proofCampaignManifestDigest, type ProofCampaignManifest } from "../proof-campaign.js"
 import { openRouterAllocatedEnvironment, openRouterBrokerLimitsFromEnvironment, RSI_OPENROUTER_MODEL, type OpenRouterBrokerGrant, type OpenRouterBrokerLimits } from "../inference-broker.js"
 import { readArchive, writeArchive } from "../archive.js"
-import { createProofCampaignManifest, proofBrokerCampaignId, reconcileProofCampaignJob, rebuildEvaluatedProofCampaignArchive, rebuildFinishedProofCampaignArchive } from "../controller.js"
+import { createProofCampaignManifest, proofBrokerCampaignId, reconcileProofCampaignJob, rebuildEvaluatedProofCampaignArchive, rebuildFinishedProofCampaignArchive, RSI_CONFIRMATION_RETENTION_TASK_IDS } from "../controller.js"
 import { loadBenchmark, runBenchmark, type BenchmarkVerifier } from "../benchmark/runner.js"
 import type { BenchmarkAgent, BenchmarkAttempt, BenchmarkImageIdentity, BenchmarkTask } from "../benchmark/types.js"
 import type { CandidateRecord, RsiConfig, RsiRunRecord } from "../types.js"
@@ -141,8 +141,8 @@ test("controller freezes paired broker allocations as separate campaigns under o
 				knownBadPath: "bad.patch", knownBadCommit: "d".repeat(40), knownBadDigest: "d".repeat(64),
 				seed: 17, ceilings: { timeoutMs: 5_000, maxCalls: 2, maxOutputTokensPerCall: 128, maxPatchBytes: 16_384 },
 			}
-			const confirmationTask = { ...task, id: "confirmation-task", family: "confirmation-integration", split: "confirmation" as const, seed: 23 }
-			const developmentManifest = { schemaVersion: 1 as const, runnerVersion: "test", createdFromCommit: "e".repeat(40), tasks: [task, confirmationTask] }
+			const confirmationTasks = RSI_CONFIRMATION_RETENTION_TASK_IDS.map((id, index) => ({ ...task, id, family: `confirmation-integration-${index}`, split: "confirmation" as const, seed: 23 + index }))
+			const developmentManifest = { schemaVersion: 1 as const, runnerVersion: "test", createdFromCommit: "e".repeat(40), tasks: [task, ...confirmationTasks] }
 			const protocol = {
 				schemaVersion: 1 as const, manifestDigest: "1".repeat(64), taskSetDigest: "2".repeat(64), taskIds: [task.id],
 				taskIdentities: [{ id: task.id, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings }],
@@ -164,13 +164,13 @@ test("controller freezes paired broker allocations as separate campaigns under o
 			assert.equal(frozen.benchmarkDigests.manifest, "4".repeat(64), "the full loaded manifest digest, including runner/version metadata, is frozen")
 			assert.deepEqual(frozen.settings.inferenceCampaignIds, { mutation: `${campaignId}:mutation`, benchmark: `${campaignId}:benchmark` })
 			assert.deepEqual(frozen.settings.inferenceAllocationsUsd, { mutation: 0.04, benchmark: 0.28 })
-			assert.equal(frozen.schedule.filter((cell) => cell.armId === "fixed-control").length, 14)
-			assert.equal(frozen.schedule.filter((cell) => cell.armId === "self-hosted").length, 14)
-			assert.equal(frozen.schedule.filter((cell) => cell.armId === "fixed-control" && cell.phase === "confirmation").length, 5, "all generation candidate slots and root-control confirmation cells are frozen")
-			assert.equal(frozen.budgets.root.maxCalls, 40, "root calls sum mutation calls, all three development proof roles, and selected-final/root confirmation grants for both arms")
-			assert.equal(frozen.budgets.root.maxTokens, 645_120, "root tokens sum effective task-specific grants rather than the base per-call defaults")
-			assert.equal(frozen.budgets.root.maxSpendUsd, 0.2, "root spend is the sum of every frozen provider-job reservation")
-			assert.equal(frozen.settings.taskWallBoundMs, 140_000, "the runtime plan sums mutation, required evaluation, development proof, and selected-final/root confirmation deadlines")
+			assert.equal(frozen.schedule.filter((cell) => cell.armId === "fixed-control").length, 24)
+			assert.equal(frozen.schedule.filter((cell) => cell.armId === "self-hosted").length, 24)
+			assert.equal(frozen.schedule.filter((cell) => cell.armId === "fixed-control" && cell.phase === "confirmation").length, 12, "all generation candidate slots and root-control confirmation cells are frozen")
+			assert.equal(frozen.budgets.root.maxCalls, 64, "root calls sum mutation calls, all three development proof roles, and selected-final/root confirmation grants for both arms")
+			assert.equal(frozen.budgets.root.maxTokens, 1_032_192, "root tokens sum effective task-specific grants rather than the base per-call defaults")
+			assert.equal(frozen.budgets.root.maxSpendUsd, 0.32, "root spend is the sum of every frozen provider-job reservation")
+			assert.equal(frozen.settings.taskWallBoundMs, 200_000, "the runtime plan sums mutation, required evaluation, development proof, and selected-final/root confirmation deadlines")
 			const engineering = createProofCampaignManifest({
 				config: { ...config, workerHarnessEngineeringOnly: true }, campaignId: `${campaignId}-engineering`, baseCommit: "f".repeat(40), model: RSI_OPENROUTER_MODEL, provider: "openshell-openrouter",
 				runtime: { imageName: "rsi:test", imageDigest: `sha256:${"9".repeat(64)}`, harnessCommit: "8".repeat(40), dependencyLockDigest: "7".repeat(64) },
@@ -186,18 +186,21 @@ test("controller freezes paired broker allocations as separate campaigns under o
 			process.env.HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD = "0.04"
 			process.env.HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD = "0.15"
 			assert.throws(() => createProofCampaignManifest({ config, campaignId: `${campaignId}-underfunded`, baseCommit: "f".repeat(40), model: RSI_OPENROUTER_MODEL, provider: "openshell-openrouter", runtime: { imageName: "rsi:test", imageDigest: `sha256:${"9".repeat(64)}`, harnessCommit: "8".repeat(40), dependencyLockDigest: "7".repeat(64) }, developmentManifest, developmentManifestDigest: "4".repeat(64), plannedGenerations: 2, proofProtocol: protocol }), /below development plus selected-final\/root confirmation job reservations/)
+			process.env.HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD = "0.32"
+			process.env.HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD = "0.04"
+			process.env.HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD = "0.28"
 			const fixed = await campaign.acquire(frozen, "fixed-control", "run-fixed", "coordinator-fixed")
 			const selfHosted = await campaign.acquire(frozen, "self-hosted", "run-self", "coordinator-self")
 			assert.equal(fixed.manifestSha256, selfHosted.manifestSha256)
 			await assert.rejects(() => campaign.acquire({ ...frozen, benchmarkDigests: { ...frozen.benchmarkDigests, manifest: "5".repeat(64) } }, "fixed-control", "run-fixed", "coordinator-tampered"), /manifest or root budget changed/)
 			const mutationCell = frozen.schedule.find((cell) => cell.armId === fixed.armId && cell.attemptKind === "mutation")!
 			const benchmarkCell = frozen.schedule.find((cell) => cell.armId === fixed.armId && cell.attemptKind === "development-proof")!
-			await campaign.admit(fixed, { attemptKey: "role-mutation-attempt", kind: "mutation", identity: { generation: mutationCell.generation, candidateId: mutationCell.candidateId, taskId: mutationCell.taskId, seed: mutationCell.seed, attemptKind: mutationCell.attemptKind }, requestSha256: "a".repeat(64), calls: 1, tokens: 10, spendUsd: 0.1 })
-			await campaign.admit(fixed, { attemptKey: "role-benchmark-attempt", kind: "development-proof", identity: { generation: benchmarkCell.generation, candidateId: benchmarkCell.candidateId, taskId: benchmarkCell.taskId, seed: benchmarkCell.seed, attemptKind: benchmarkCell.attemptKind }, sourceCandidateId: "g0-candidate-0", requestSha256: "b".repeat(64), calls: 1, tokens: 10, spendUsd: 0.1 })
+			await campaign.admit(fixed, { attemptKey: "role-mutation-attempt", kind: "mutation", identity: { generation: mutationCell.generation, candidateId: mutationCell.candidateId, taskId: mutationCell.taskId, seed: mutationCell.seed, attemptKind: mutationCell.attemptKind }, requestSha256: "a".repeat(64), calls: 1, tokens: 10, spendUsd: 0.01 })
+			await campaign.admit(fixed, { attemptKey: "role-benchmark-attempt", kind: "development-proof", identity: { generation: benchmarkCell.generation, candidateId: benchmarkCell.candidateId, taskId: benchmarkCell.taskId, seed: benchmarkCell.seed, attemptKind: benchmarkCell.attemptKind }, sourceCandidateId: "g0-candidate-0", requestSha256: "b".repeat(64), calls: 1, tokens: 10, spendUsd: 0.01 })
 			const proofSnapshot = await campaign.snapshot(campaignId)
-			assert.equal(Number((proofSnapshot.campaign as Record<string, unknown>).reserved_spend_microusd), 200_000, "both allocations reserve against the same root spend ledger")
+			assert.equal(Number((proofSnapshot.campaign as Record<string, unknown>).reserved_spend_microusd), 20_000, "both allocations reserve against the same root spend ledger")
 			const limits = ["mutation", "benchmark"].map((role) => openRouterBrokerLimitsFromEnvironment(openRouterAllocatedEnvironment(process.env, role as "mutation" | "benchmark"), proofBrokerCampaignId(campaignId, role as "mutation" | "benchmark"), { maxCalls: 1, maxDurationMs: 5_000 }))
-			assert.deepEqual(limits.map((limit) => limit.maxCampaignSpendUsd), [0.4, 0.2])
+			assert.deepEqual(limits.map((limit) => limit.maxCampaignSpendUsd), [0.04, 0.28])
 			await queue.registerWorker({ workerId: "paired-broker-worker", gatewayId: "proof-gateway", hostname: "proof-host", maxActive: 1, resourceClasses: ["REMOTE_API"] })
 			for (const [index, role] of (["mutation", "benchmark"] as const).entries()) {
 				const artifact = await queue.putArtifact(Buffer.from(`paired ${role} broker request`))
@@ -212,7 +215,7 @@ test("controller freezes paired broker allocations as separate campaigns under o
 			}
 			const brokerCampaigns = (await _pool.query("SELECT campaign_id,max_spend_microusd FROM headlesscode_rsi_inference_campaigns WHERE campaign_id=ANY($1::text[]) ORDER BY campaign_id", [[proofBrokerCampaignId(campaignId, "benchmark"), proofBrokerCampaignId(campaignId, "mutation")]])).rows
 			assert.equal(brokerCampaigns.length, 2)
-			assert.deepEqual(brokerCampaigns.map((row) => [row.campaign_id, Number(row.max_spend_microusd)]), [[`${campaignId}:benchmark`, 200_000], [`${campaignId}:mutation`, 400_000]])
+			assert.deepEqual(brokerCampaigns.map((row) => [row.campaign_id, Number(row.max_spend_microusd)]), [[`${campaignId}:benchmark`, 280_000], [`${campaignId}:mutation`, 40_000]])
 			const snapshot = await campaign.snapshot(campaignId)
 			assert.deepEqual((snapshot.arms as Array<Record<string, unknown>>).map((arm) => [arm.arm_id, arm.run_id]).sort(), [
 				["fixed-control", "run-fixed"], ["self-hosted", "run-self"],
@@ -1043,9 +1046,10 @@ test("FileArtifactStore PostgreSQL proof-bound mutation imports only matching du
 		const grant: OpenRouterBrokerGrant = { jobId: job.jobId, leaseToken: jobLease.token, capability: randomUUID(), model: RSI_OPENROUTER_MODEL, limits }
 		await queue.register(grant)
 		await queue.reserve(grant, { callId: "mock-call-000001", requestSha256: "2".repeat(64), reservedUsd: 0.01, reservedTokens: 100, startedAt: new Date().toISOString() })
-		await queue.settle(grant, { callId: "mock-call-000001", state: "complete", qualified: true, returnedModel: RSI_OPENROUTER_MODEL, promptTokens: 10, completionTokens: 20, costUsd: 0.001, responseSha256: "3".repeat(64), completedAt: new Date().toISOString() })
+		await queue.settle(grant, { callId: "mock-call-000001", state: "complete", qualified: true, returnedModel: RSI_OPENROUTER_MODEL, returnedProvider: "deepinfra", promptTokens: 10, completionTokens: 20, costUsd: 0.001, responseSha256: "3".repeat(64), completedAt: new Date().toISOString() })
 		const receipt = await queue.receipt(grant)
 		assert.equal(receipt.qualified, true)
+		assert.deepEqual(receipt.returnedProviders, ["deepinfra"])
 		const patch = await queue.putArtifact(Buffer.from("verified candidate patch bytes"))
 		const result = { patchSha256: patch.sha256, patchBytes: patch.byteLength, inferenceReceipt: receipt }
 		assert.equal((await queue.complete(jobLease, result)).accepted, true)

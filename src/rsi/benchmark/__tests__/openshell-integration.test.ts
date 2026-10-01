@@ -113,7 +113,10 @@ try {
 		async runHarness(_handle, command) {
 			if (phase === "agent") {
 				events.push("agent-command")
-				assert.equal(command.split("/opt/headlesscode/src/cli.ts").length - 1, 1, "coding worker command should execute once")
+				const workerCommand = command.split(" && exec ")[1] ?? ""
+				assert.equal(command.split(" && exec ").length - 1, 1, "coding worker command should execute once after preflight")
+				assert.equal(workerCommand.split("/opt/headlesscode/src/cli.ts").length - 1, 1, "fixed-control must execute the pinned release CLI exactly once")
+				assert.equal(workerCommand.includes("/workspace/src/cli.ts"), false, "fixed-control must not execute the candidate CLI")
 				assert.equal(guestEnvironment.HEADLESSCODE_RSI_INFERENCE_CAPABILITY, lastCapability)
 				assert.equal(guestEnvironment.HEADLESSCODE_OPENROUTER_API_KEY, undefined, "raw provider credential must stay on the supervisor")
 				assert.equal(guestEnvironment.OPENROUTER_API_KEY, undefined)

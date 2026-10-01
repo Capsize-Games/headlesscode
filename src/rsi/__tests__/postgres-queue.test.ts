@@ -81,7 +81,7 @@ test("PostgreSQL migrations upgrade an earlier artifact and lease schema", { ski
 		assert.ok(artifactColumns.rows.some((row) => row.column_name === "byte_length"))
 		assert.equal(artifactColumns.rows.some((row) => row.column_name === "content"), false, "empty legacy NOT NULL PostgreSQL blob column is removed")
 		assert.ok(jobColumns.rows.some((row) => row.column_name === "lease_duration_ms"))
-		assert.equal((await scopedPool.query("SELECT version FROM headlesscode_rsi_schema_migrations ORDER BY version")).rowCount, 7)
+		assert.equal((await scopedPool.query("SELECT version FROM headlesscode_rsi_schema_migrations ORDER BY version")).rowCount, 8)
 		const campaignColumns = await scopedPool.query("SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name='headlesscode_rsi_inference_campaigns'", [schema])
 		assert.ok(campaignColumns.rows.some((row) => row.column_name === "blocked"), "migration 004 adds the campaign block state used by admission and settlement")
 		const inferenceJobColumns = await scopedPool.query("SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name='headlesscode_rsi_inference_jobs'", [schema])
