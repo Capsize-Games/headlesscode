@@ -800,7 +800,7 @@ export function buildRequestBody(request: LlmRequest, model: string): Record<str
 		body.stream = true
 		body.stream_options = { include_usage: true }
 	}
-	// Pin routing to DeepSeek's own official endpoint for deepseek/* models,
+	// Pin routing to DeepSeek's own official endpoint for most deepseek/* models,
 	// not whichever third-party host (DeepInfra, Baidu, Mancer, ...) OpenRouter's
 	// automatic price-based routing might otherwise pick behind the same model
 	// id. This matters beyond preference: those endpoints have meaningfully
@@ -812,7 +812,13 @@ export function buildRequestBody(request: LlmRequest, model: string): Record<str
 	// endpoint is down, rather than silently routing elsewhere at a different
 	// (unpriced-by-us) rate.
 	if (model.startsWith("deepseek/")) {
-		body.provider = { order: ["deepseek"], allow_fallbacks: false }
+		// The RSI proof protocol uses a separately price- and capability-pinned
+		// DeepInfra endpoint for the dated V4 Flash model. Keep this exact route
+		// aligned with the broker's provider.only policy; other DeepSeek models
+		// retain the established official-provider route below.
+		body.provider = model === "deepseek/deepseek-v4-flash-0731"
+			? { only: ["deepinfra"], allow_fallbacks: false }
+			: { order: ["deepseek"], allow_fallbacks: false }
 		// Reasoning content (streaming-and-reasoning): request it explicitly for
 		// the only model family this harness pins. Verified live 2026-08-01 on
 		// deepseek/deepseek-v4-flash: `include_reasoning: true` is in every
@@ -825,16 +831,20 @@ export function buildRequestBody(request: LlmRequest, model: string): Record<str
 		// 404s seen were account/data-policy endpoint availability, not the
 		// param). Kept to the deepseek/ prefix rather than unconditional to match
 		// the existing pin boundary.
-		body.include_reasoning = true
-		// Graded reasoning effort (issue #30): DeepSeek's native low/medium/
-		// high/max is normalized by OpenRouter to `reasoning: { effort: "high" |
-		// "xhigh" }` ("xhigh" = max). Unset = send nothing = the endpoint's
-		// undeclared default, exactly as before. Same deepseek/ boundary as
-		// include_reasoning.
-		if (request.reasoningEffort !== undefined) {
-			const effort = parseReasoningEffort(request.reasoningEffort)
-			if (effort !== undefined) {
-				body.reasoning = { effort }
+		// The pinned DeepInfra endpoint does not advertise these reasoning
+		// parameters. Do not send undocumented options to the RSI proof model.
+		if (model !== "deepseek/deepseek-v4-flash-0731") {
+			body.include_reasoning = true
+			// Graded reasoning effort (issue #30): DeepSeek's native low/medium/
+			// high/max is normalized by OpenRouter to `reasoning: { effort: "high" |
+			// "xhigh" } ("xhigh" = max). Unset = send nothing = the endpoint's
+			// undeclared default, exactly as before. Same deepseek/ boundary as
+			// include_reasoning.
+			if (request.reasoningEffort !== undefined) {
+				const effort = parseReasoningEffort(request.reasoningEffort)
+				if (effort !== undefined) {
+					body.reasoning = { effort }
+				}
 			}
 		}
 	}

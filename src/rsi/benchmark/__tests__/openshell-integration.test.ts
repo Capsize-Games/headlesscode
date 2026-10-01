@@ -113,7 +113,10 @@ try {
 		async runHarness(_handle, command) {
 			if (phase === "agent") {
 				events.push("agent-command")
-				assert.equal(command.split("/opt/headlesscode/src/cli.ts").length - 1, 1, "coding worker command should execute once")
+				const workerCommand = command.split(" && exec ")[1] ?? ""
+				assert.equal(command.split(" && exec ").length - 1, 1, "coding worker command should execute once after preflight")
+				assert.equal(workerCommand.split("/opt/headlesscode/src/cli.ts").length - 1, 1, "fixed-control must execute the pinned release CLI exactly once")
+				assert.equal(workerCommand.includes("/workspace/src/cli.ts"), false, "fixed-control must not execute the candidate CLI")
 				assert.equal(guestEnvironment.HEADLESSCODE_RSI_INFERENCE_CAPABILITY, lastCapability)
 				assert.equal(guestEnvironment.HEADLESSCODE_OPENROUTER_API_KEY, undefined, "raw provider credential must stay on the supervisor")
 				assert.equal(guestEnvironment.OPENROUTER_API_KEY, undefined)
@@ -152,10 +155,10 @@ try {
 	const brokerFactory = async (options: Parameters<typeof startOpenRouterBroker>[0]) => {
 		const broker = await startOpenRouterBroker({ ...options, upstreamFetch: async (input, init) => {
 			const url = String(input)
-			if (url.endsWith(`/models/${RSI_OPENROUTER_MODEL}/endpoints`)) return new Response(JSON.stringify({ data: { endpoints: [{ provider_slug: "deepseek", pricing: { prompt: "0.000001", completion: "0.000001" } }] } }), { status: 200, headers: { "content-type": "application/json" } })
+			if (url.endsWith(`/models/${RSI_OPENROUTER_MODEL}/endpoints`)) return new Response(JSON.stringify({ data: { endpoints: [{ provider_name: "DeepInfra", tag: "deepinfra/fp8", quantization: "fp8", status: 0, supported_parameters: ["max_tokens", "temperature", "tools", "tool_choice"], supports_tool_choice: { "auto": true, "required": true }, pricing: { prompt: "0.00000006", completion: "0.00000018" } }] } }), { status: 200, headers: { "content-type": "application/json" } })
 			assert.equal(url, "https://openrouter.ai/api/v1/chat/completions")
 			assert.equal(new Headers(init?.headers).get("authorization"), "Bearer host-test-key-never-forwarded-to-guest")
-			return new Response(JSON.stringify({ id: "mock-provider-response", model: RSI_OPENROUTER_MODEL, choices: [{ message: { role: "assistant", content: "done" } }], usage: { prompt_tokens: 12, completion_tokens: 4, cost: 0.000016 } }), { status: 200, headers: { "content-type": "application/json" } })
+			return new Response(JSON.stringify({ id: "mock-provider-response", model: RSI_OPENROUTER_MODEL, openrouter_metadata: { endpoints: { available: [{ provider: "deepinfra", selected: true }] } }, choices: [{ message: { role: "assistant", content: "done" } }], usage: { prompt_tokens: 12, completion_tokens: 4, cost: 0.00000144 } }), { status: 200, headers: { "content-type": "application/json" } })
 		} })
 		brokerBaseUrl = broker.localBaseUrl
 		lastCapability = broker.capability

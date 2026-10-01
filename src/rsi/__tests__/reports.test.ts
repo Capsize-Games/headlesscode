@@ -7,7 +7,7 @@ test("candidate report includes authenticated broker-denial summary from its rec
 	const candidate = {
 		id: "candidate-1", status: "accepted", model: "deepseek/deepseek-v4-flash-0731", modelProvider: "openshell-openrouter",
 		inferenceUsage: {
-			provider: "openrouter", model: "deepseek/deepseek-v4-flash-0731", returnedModels: ["deepseek/deepseek-v4-flash-0731"],
+			provider: "openrouter", endpointProvider: "deepinfra", model: "deepseek/deepseek-v4-flash-0731", returnedModels: ["deepseek/deepseek-v4-flash-0731"],
 			calls: 1, promptTokens: 10, completionTokens: 2, totalTokens: 12, costUsd: 0.000012,
 			accounting: "supervisor-enforced", qualified: true, jobId: "job-1", campaignId: "campaign-1",
 			denials: [{ statusCode: 429, reason: "budget-or-fence", count: 2 }],

@@ -26,6 +26,7 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 		fs.mkdirSync(path.join(repo, "src", "engine"), { recursive: true })
 		fs.mkdirSync(path.join(repo, "src", "rsi"), { recursive: true })
 		fs.mkdirSync(path.join(repo, "scripts", "eval-suite"), { recursive: true })
+		fs.mkdirSync(path.join(repo, "scripts", "rsi-benchmark", "manual-tests"), { recursive: true })
 		fs.mkdirSync(path.join(repo, "test"), { recursive: true })
 		fs.mkdirSync(path.join(repo, "fixtures", "rsi-benchmark"), { recursive: true })
 		fs.mkdirSync(path.join(repo, "__rsi_benchmark_verifier__"), { recursive: true })
@@ -38,6 +39,8 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 		fs.writeFileSync(path.join(repo, "package.json"), "{\"name\":\"fixture\"}\n")
 		fs.writeFileSync(path.join(repo, "src", "rsi", "evaluator.ts"), "export const hiddenScoring = 'secret'\n")
 		fs.writeFileSync(path.join(repo, "scripts", "eval-suite", "hidden.sh"), "secret\n")
+		fs.writeFileSync(path.join(repo, "scripts", "rsi-benchmark", "task-spec.mjs"), 'export const confirmationFix = "private-known-good-sha"\n')
+		fs.writeFileSync(path.join(repo, "scripts", "rsi-benchmark", "manual-tests", "confirmation.mjs"), 'throw new Error("private confirmation oracle")\n')
 		fs.writeFileSync(path.join(repo, "test", "engine.test.ts"), "test secret\n")
 		fs.writeFileSync(path.join(repo, ".env"), "TOKEN=secret\n")
 		execFileSync("git", ["add", "."], { cwd: repo })
@@ -47,7 +50,7 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 		execFileSync("git", ["worktree", "add", "--quiet", "-b", `rsi/${mode}`, worktree, baseCommit], { cwd: repo })
 		const candidate: CandidateRecord = {
 			id: `candidate-${mode}`,
-			generation: 0,
+			generation: ["self-hosted-missing-cli", "self-hosted-corrupt-cli", "dependency-escape"].includes(mode) ? 1 : 0,
 			parent: "baseline",
 			branch: `rsi/${mode}`,
 			worktree,
@@ -116,6 +119,8 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 					sessionEnv = request.env ?? {}
 					assert.equal(path.relative(repo, workspace).startsWith(".."), false)
 					assert.equal(fs.existsSync(path.join(workspace, "fixtures", "rsi-benchmark", "confirmation.json")), false, "mutation guest cannot read confirmation fixtures")
+					assert.equal(fs.existsSync(path.join(workspace, "scripts", "rsi-benchmark", "task-spec.mjs")), false, "mutation guest cannot read confirmation task descriptions or known-good SHAs")
+					assert.equal(fs.existsSync(path.join(workspace, "scripts", "rsi-benchmark", "manual-tests", "confirmation.mjs")), false, "mutation guest cannot read confirmation verifier code")
 					assert.equal(fs.existsSync(path.join(workspace, "__rsi_benchmark_verifier__", "verify.mjs")), false, "mutation guest cannot read verifier source")
 					assert.equal(fs.existsSync(path.join(workspace, "node_modules", "private.js")), false, "candidate dependencies are excluded from the guest snapshot")
 					assert.throws(() => fs.readFileSync(path.join(workspace, "__rsi_benchmark_verifier__", "verify.mjs")), /ENOENT/, "an attempted verifier read has no guest-visible file")
@@ -126,6 +131,7 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 					assert.equal(fs.existsSync(path.join(workspace, "package.json")), false, "candidate-controlled package metadata must not enter the mutation guest")
 					if (mode === "self-hosted-missing-cli") fs.rmSync(path.join(workspace, "src", "cli.ts"))
 					if (mode === "self-hosted-corrupt-cli") fs.writeFileSync(path.join(workspace, "src", "cli.ts"), "export const = ;\n")
+					if (mode === "self-hosted-corrupt-cli") fs.symlinkSync(path.join(trustedRuntimeRoot, "node_modules"), path.join(workspace, "node_modules"))
 					if (mode === "dependency-escape") fs.symlinkSync("/tmp/candidate-owned-node-modules", path.join(workspace, "node_modules"))
 					return { id: request.worktreeSpec.name, provider: "mock-openshell", address: workspace }
 				},
@@ -135,9 +141,15 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 					assert.match(command, /rev-list --count HEAD/)
 					assert.match(command, /\/opt\/headlesscode\/src\/rsi/)
 					assert.match(command, /OPENROUTER_API_KEY/)
-					assert.match(command, /test -r \/workspace\/src\/cli\.ts/, "guest preflight must reject a missing self-hosted CLI")
+					if (["self-hosted-missing-cli", "self-hosted-corrupt-cli", "dependency-escape"].includes(mode)) {
+						assert.match(command, /test -r \/workspace\/src\/cli\.ts/, "self-hosted preflight checks the selected-parent CLI")
+					} else {
+						assert.match(command, /test -r \/opt\/headlesscode\/src\/cli\.ts/, "fixed-control preflight checks the pinned release CLI")
+					}
 					assert.match(command, /readlink \/workspace\/node_modules/)
 					assert.match(command, /test \! -e \/workspace\/__rsi_benchmark_verifier__/)
+					assert.match(command, /test \! -e \/opt\/headlesscode\/scripts\/rsi-benchmark\/task-spec\.mjs/)
+					assert.match(command, /test \! -e \/opt\/headlesscode\/fixtures\/rsi-benchmark/)
 					if (["self-hosted-missing-cli", "self-hosted-corrupt-cli", "dependency-escape"].includes(mode)) {
 						assert.match(command, /\/workspace\/src\/cli\.ts/)
 						assert.match(command, /test "\$\(readlink \/workspace\/node_modules\)" = \/opt\/headlesscode\/node_modules/)
@@ -153,6 +165,7 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 						if (mode === "self-hosted-missing-cli" || mode === "dependency-escape") {
 							assert.equal(boundary.status, 79, "the actual shell preflight must stop on the missing CLI or escaped dependency link")
 							assert.match(boundary.stderr, /RSI_BENCHMARK_PREFLIGHT_FAILURE/)
+							assert.match(boundary.stderr, mode === "dependency-escape" ? /RSI_BENCHMARK_PREFLIGHT_FAILURE:1/ : /RSI_BENCHMARK_PREFLIGHT_FAILURE:2/)
 							return { exitCode: 79, output: boundary.stderr }
 						}
 						assert.equal(boundary.status, 0, "an existing but corrupted CLI passes only the readability/link preflight")
@@ -164,7 +177,7 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 						assert.match(command, /headlesscode-harness-commit/)
 						return { exitCode: 79, output: "RSI_BENCHMARK_PREFLIGHT_FAILURE wrong harness image commit" }
 					}
-					assert.equal(command.split("/opt/headlesscode/src/cli.ts").length - 1, 1, "the benchmark coding worker command must execute exactly once")
+					assert.equal(command.split(" && exec ").length - 1, 1, "the benchmark coding worker command must execute exactly once after preflight")
 					if (mode === "worker-failure") return { exitCode: 1, output: "model process failed" }
 					if (mode === "source") {
 						fs.writeFileSync(path.join(guestPath, "src", "engine", "loop.ts"), "export const value = 2\n")
@@ -319,7 +332,7 @@ await run("dependency-escape")
 		execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: repo })
 		execFileSync("git", ["config", "user.name", "Test"], { cwd: repo })
 		execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: repo })
-		for (const [relative, body] of [["src/app.ts", "source\n"], ["test/app.test.ts", "visible test\n"], ["scripts/eval-suite/hidden.js", "hidden suite\n"], ["src/rsi/fitness.ts", "hidden scorer\n"], [".headlesscode/archive.json", "operator archive\n"], ["fixtures/rsi-curriculum/generalization.json", "{}\n"], ["fixtures/rsi-benchmark/confirmation.json", "private proof task\n"]]) {
+		for (const [relative, body] of [["src/app.ts", "source\n"], ["test/app.test.ts", "visible test\n"], ["scripts/eval-suite/hidden.js", "hidden suite\n"], ["src/rsi/fitness.ts", "hidden scorer\n"], [".headlesscode/archive.json", "operator archive\n"], [".headlesscode/rsi-proof/plan.json", "sealed confirmation metadata\n"], ["fixtures/rsi-curriculum/generalization.json", "{}\n"], ["fixtures/rsi-benchmark/confirmation.json", "private proof task\n"]]) {
 			const target = path.join(repo, relative)
 			fs.mkdirSync(path.dirname(target), { recursive: true })
 			fs.writeFileSync(target, body)
@@ -341,6 +354,7 @@ await run("dependency-escape")
 		assert.equal(fs.existsSync(path.join(clonePath, ".headlesscode/archive.json")), false)
 		assert.equal(fs.existsSync(path.join(clonePath, "fixtures/rsi-curriculum/generalization.json")), true, "registered curriculum fixtures remain available to evaluation guests")
 		assert.equal(fs.existsSync(path.join(clonePath, "fixtures/rsi-benchmark/confirmation.json")), false, "benchmark task and verifier data stays outside evaluation guests")
+		assert.equal(fs.existsSync(path.join(clonePath, ".headlesscode/rsi-proof/plan.json")), false, "frozen operator plan and confirmation metadata stay outside evaluation guests")
 		assert.equal(fs.lstatSync(path.join(clonePath, "test/app.test.ts")).isSymbolicLink(), false, "bundle transfer excludes harness-only dependency symlinks")
 		const mutation = createMutationSnapshotBundle(repo, head, { protectedPaths: [], repoRoot: repo } as unknown as RsiConfig)
 		const mutationBundle = path.join(unpack, "mutation.bundle")
@@ -349,12 +363,22 @@ await run("dependency-escape")
 		execFileSync("git", ["clone", "--quiet", mutationBundle, mutationClone], { cwd: unpack })
 		assert.equal(fs.existsSync(path.join(mutationClone, "fixtures/rsi-curriculum/generalization.json")), false, "mutation guests never receive evaluator-owned fixture assets")
 		assert.equal(fs.existsSync(path.join(mutationClone, "fixtures/rsi-benchmark/confirmation.json")), false, "mutation guests never receive benchmark task and verifier data")
+		assert.equal(fs.existsSync(path.join(mutationClone, ".headlesscode/rsi-proof/plan.json")), false, "mutation guests never receive the frozen proof plan")
 	} finally {
 		fs.rmSync(repo, { recursive: true, force: true })
 		fs.rmSync(unpack, { recursive: true, force: true })
 	}
 }
-console.log("RSI OpenShell isolation assertions passed")
+	const runtimeDockerfile = fs.readFileSync(path.join(process.cwd(), "docker", "OpenShell.Dockerfile"), "utf8")
+	const rsiDockerfile = fs.readFileSync(path.join(process.cwd(), "docker", "OpenShell-RSI.Dockerfile"), "utf8")
+	const dockerIgnore = fs.readFileSync(path.join(process.cwd(), ".dockerignore"), "utf8")
+	assert.match(dockerIgnore, /^scripts\/$/m, "benchmark corpus source is excluded from Docker build context")
+	assert.match(runtimeDockerfile, /COPY scripts\/spawn-parallel-worktrees\.sh scripts\/run-worker\.sh scripts\/headlesscode-answer\.sh \.\/scripts\//, "runtime image copies only the named operational scripts")
+	assert.doesNotMatch(runtimeDockerfile, /COPY (?:\.\/)?scripts\s/, "runtime image does not copy the scripts tree")
+	assert.match(runtimeDockerfile, /test ! -e \/opt\/headlesscode\/scripts\/rsi-benchmark\/task-spec\.mjs/, "runtime image build fails if task descriptions and known-good SHAs enter the image")
+	assert.match(rsiDockerfile, /test ! -e \/opt\/headlesscode\/fixtures\/rsi-benchmark/, "RSI image build fails if confirmation fixtures enter the image")
+	assert.match(rsiDockerfile, /test ! -e \/opt\/headlesscode\/\.git/, "RSI guest image cannot expose harness history containing known fixes")
+	console.log("RSI OpenShell isolation assertions passed")
 
 {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-fleet-patch-"))

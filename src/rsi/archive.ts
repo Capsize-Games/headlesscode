@@ -121,6 +121,11 @@ export async function findActiveRun(archiveDir: string, runId: string): Promise<
 	return (await readArchive(archiveDir)).activeRuns.find((run) => run.runId === runId)
 }
 
+export async function findRun(archiveDir: string, runId: string): Promise<RsiRunRecord | undefined> {
+	const archive = await readArchive(archiveDir)
+	return archive.activeRuns.find((run) => run.runId === runId) ?? archive.runs.find((run) => run.runId === runId)
+}
+
 export function archiveCandidate(archive: RsiArchive, candidate: CandidateRecord): RsiArchive {
 	const index = archive.candidates.findIndex((entry) => entry.id === candidate.id)
 	if (index >= 0) archive.candidates[index] = candidate

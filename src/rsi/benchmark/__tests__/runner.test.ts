@@ -173,8 +173,8 @@ try {
 			return {
 				validity: "agent-error", stdout: "", stderr: "", calls: 1, tokens: 10, wallTimeMs: 1, stopReason: "fake",
 				inferenceReceipt: {
-					provider: "openrouter", jobId: request.attemptId, campaignId: request.campaignId, model: "deepseek/deepseek-v4-flash-0731",
-					returnedModels: ["deepseek/deepseek-v4-flash-0731"], calls: 1, promptTokens: 5, completionTokens: 5, totalTokens: 10,
+					provider: "openrouter", endpointProvider: "deepinfra", jobId: request.attemptId, campaignId: request.campaignId, model: "deepseek/deepseek-v4-flash-0731",
+					returnedModels: ["deepseek/deepseek-v4-flash-0731"], returnedProviders: ["deepinfra"], calls: 1, promptTokens: 5, completionTokens: 5, totalTokens: 10,
 					costUsd: 0.001, accounting: "supervisor-enforced", qualified: true, callReceipts: [], denials: [],
 				},
 			}

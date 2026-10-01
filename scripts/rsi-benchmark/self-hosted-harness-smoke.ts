@@ -4,7 +4,7 @@ import { createHash } from "node:crypto"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
-import { FileOpenRouterInferenceLedger, RSI_OPENROUTER_MODEL, startOpenRouterBroker, type OpenRouterBrokerLimits } from "../../src/rsi/inference-broker.js"
+import { FileOpenRouterInferenceLedger, RSI_OPENROUTER_ENDPOINT_PROVIDER, RSI_OPENROUTER_ENDPOINT_TAG, RSI_OPENROUTER_MODEL, startOpenRouterBroker, type OpenRouterBrokerLimits } from "../../src/rsi/inference-broker.js"
 import { createMutationSnapshotBundle, runOpenShellMutation } from "../../src/rsi/openshell.js"
 import { workerHarnessSentinelDiff } from "../../src/rsi/worker-harness-sentinel.js"
 import type { CandidateRecord, RsiConfig, WorkerHarnessMode, WorkerHarnessRuntimeIdentity } from "../../src/rsi/types.js"
@@ -54,7 +54,7 @@ function mockUpstream(stage: "seed" | "bridge" | "sentinel", observed: { sentine
 	return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
 		const url = String(input)
 		if (url.endsWith(`/models/${RSI_OPENROUTER_MODEL}/endpoints`)) {
-			return new Response(JSON.stringify({ data: { endpoints: [{ provider_slug: "deepseek", pricing: { prompt: "0.000001", completion: "0.000001" } }] } }), { status: 200, headers: { "content-type": "application/json" } })
+			return new Response(JSON.stringify({ data: { endpoints: [{ provider_name: "DeepInfra", tag: RSI_OPENROUTER_ENDPOINT_TAG, quantization: "fp8", status: 0, supported_parameters: ["tools", "tool_choice", "temperature", "seed", "max_tokens"], supports_tool_choice: { auto: true, required: true, function: true }, pricing: { prompt: "0.000001", completion: "0.000001" } }] } }), { status: 200, headers: { "content-type": "application/json" } })
 		}
 		assert.equal(url, "https://openrouter.ai/api/v1/chat/completions")
 		assert.equal(new Headers(init?.headers).get("authorization"), "Bearer mock-only-not-a-provider-key")
@@ -81,6 +81,7 @@ function mockUpstream(stage: "seed" | "bridge" | "sentinel", observed: { sentine
 		return new Response(JSON.stringify({
 			id: `mock-self-hosted-${stage}-${calls}`,
 			model: RSI_OPENROUTER_MODEL,
+			openrouter_metadata: { endpoints: { available: [{ provider: RSI_OPENROUTER_ENDPOINT_PROVIDER, selected: true }] } },
 			choices: [{ message, finish_reason: "tool_calls" }],
 			usage: { prompt_tokens: 10_000, completion_tokens: 200, cost: 0.0102 },
 		}), { status: 200, headers: { "content-type": "application/json" } })

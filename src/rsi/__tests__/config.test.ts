@@ -73,6 +73,13 @@ function testAdaptivePolicyHasExplicitBudgets(): void {
 	assert.match(parseRsiArgs(["--repo", "/tmp/repo", "--compute-policy", "adaptive-independent", "--max-total-iterations", "40"]).error ?? "", /cover the initial population/)
 }
 
+function testEngineeringOnlyHarnessRequiresPairedDevelopmentRun(): void {
+	assert.match(parseRsiArgs(["--repo", "/tmp/repo", "--worker-harness-engineering-only"]).error ?? "", /requires an explicit paired campaign ID and arm/)
+	assert.match(parseRsiArgs(["--repo", "/tmp/repo", "--worker-harness-mode", "fixed-control", "--worker-harness-pair-id", "engineering", "--worker-harness-engineering-only", "--worker-harness-phase", "confirmation"]).error ?? "", /only the development phase/)
+	const parsed = parseRsiArgs(["--repo", "/tmp/repo", "--worker-harness-mode", "fixed-control", "--worker-harness-pair-id", "engineering", "--worker-harness-engineering-only"])
+	assert.equal(parsed.config?.workerHarnessEngineeringOnly, true)
+}
+
 const tests = [
 	["defaults select local Qwen", testDefaultsUseLocalQwen],
 	["dry-run and evaluation commands parse", testDryRunAndCommandsParse],
@@ -80,6 +87,7 @@ const tests = [
 	["empty regression command is rejected", testRegressionCommandCannotBeEmpty],
 	["role routing resolves configured critic models", testRoleRoutingIsProviderIndependent],
 	["adaptive trajectories require explicit bounded capacity", testAdaptivePolicyHasExplicitBudgets],
+	["engineering-only mode requires a paired development run", testEngineeringOnlyHarnessRequiresPairedDevelopmentRun],
 ] as const
 
 for (const [name, test] of tests) {

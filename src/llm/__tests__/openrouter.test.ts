@@ -34,6 +34,13 @@ async function testDeepseekReasonerAlsoPinned(): Promise<void> {
 	assert.deepEqual(body.provider, { order: ["deepseek"], allow_fallbacks: false })
 }
 
+async function testRsiProofModelUsesPinnedDeepinfraRoute(): Promise<void> {
+	const body = buildRequestBody({ ...baseRequest, reasoningEffort: "high" }, "deepseek/deepseek-v4-flash-0731")
+	assert.deepEqual(body.provider, { only: ["deepinfra"], allow_fallbacks: false })
+	assert.equal(body.include_reasoning, undefined, "the selected DeepInfra endpoint does not advertise include_reasoning")
+	assert.equal(body.reasoning, undefined, "the selected DeepInfra endpoint does not advertise reasoning effort")
+}
+
 async function testNonDeepseekModelsAreNotPinned(): Promise<void> {
 	const body = buildRequestBody(baseRequest, "anthropic/claude-3.5-sonnet")
 	assert.equal(body.provider, undefined, "pinning to the deepseek provider for a non-deepseek model would be wrong")
@@ -608,8 +615,9 @@ async function testIsRetryableOpenRouterErrorRejectsDeterministicFailures(): Pro
 const tests: Array<[string, () => Promise<void>]> = [
 	["isRetryableOpenRouterError matches network/429/5xx/no-allowed-providers shapes", testIsRetryableOpenRouterErrorMatchesTransientShapes],
 	["isRetryableOpenRouterError rejects deterministic 4xx and non-OpenRouterError values", testIsRetryableOpenRouterErrorRejectsDeterministicFailures],
-	["deepseek/* models are pinned to the official DeepSeek provider", testDeepseekModelsArePinnedToOfficialProvider],
+	["legacy deepseek/* models remain pinned to the official DeepSeek provider", testDeepseekModelsArePinnedToOfficialProvider],
 	["the pin applies to any deepseek/* model, not just one id", testDeepseekReasonerAlsoPinned],
+	["the RSI proof model uses the pinned DeepInfra endpoint and advertised parameters", testRsiProofModelUsesPinnedDeepinfraRoute],
 	["non-deepseek models are never pinned to the deepseek provider", testNonDeepseekModelsAreNotPinned],
 	["buildRequestBody emits max_tokens when set, omits it when unset", testRequestBodyEmitsMaxTokensWhenSet],
 	["deepseek/* requests include include_reasoning (load-bearing)", testDeepseekRequestIncludesReasoning],

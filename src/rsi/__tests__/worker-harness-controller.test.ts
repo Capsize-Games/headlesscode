@@ -40,6 +40,16 @@ async function main(): Promise<void> {
 			workerHarnessMode: "self-hosted",
 			workerHarnessRuntime: runtime,
 		}
+		await assert.rejects(
+			runRsi({ ...config, workerHarnessPairId: `rsi-proof-${"a".repeat(20)}`, workerHarnessRunId: `rsi-proof-${"b".repeat(20)}-self` }, { log: () => undefined }),
+			/deterministic worker harness run ID must match its paired campaign and arm/,
+			"a deterministic run identity cannot be rebound across campaign IDs",
+		)
+		await assert.rejects(
+			runRsi({ ...config, workerHarnessPairId: `rsi-proof-${"a".repeat(20)}`, workerHarnessRunId: `rsi-proof-${"a".repeat(20)}-fixed` }, { log: () => undefined }),
+			/deterministic worker harness run ID must match its paired campaign and arm/,
+			"a fixed-control run cannot use the self-hosted deterministic suffix",
+		)
 		const observed: Array<{ generation: number; mode: string; parentCommit: string; digest: string }> = []
 		const run = await runRsi(config, {
 			log: () => undefined,

@@ -634,9 +634,9 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 			mutationTask(candidate, config),
 		].map(shellQuote).join(" ")
 		const boundaryChecks = [
-			"ln -s /opt/headlesscode/node_modules /workspace/node_modules",
+			"if test -L /workspace/node_modules; then :; else test ! -e /workspace/node_modules && ln -s /opt/headlesscode/node_modules /workspace/node_modules; fi",
 			'test "$(readlink /workspace/node_modules)" = /opt/headlesscode/node_modules',
-			"test -r /workspace/src/cli.ts",
+			effectiveMode === "self-hosted" ? "test -r /workspace/src/cli.ts" : "test -r /opt/headlesscode/src/cli.ts",
 			"test -r /opt/headlesscode/tsconfig.json",
 			"test -r /opt/headlesscode/package-lock.json",
 			'test "$(git -C /workspace rev-list --count HEAD)" = 1',
@@ -654,13 +654,16 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 			"test ! -e /workspace/.headlesscode",
 			"test ! -e /opt/headlesscode/src/rsi",
 			"test ! -e /opt/headlesscode/scripts/eval-suite",
+			"test ! -e /opt/headlesscode/scripts/rsi-benchmark/task-spec.mjs",
+			"test ! -e /opt/headlesscode/fixtures/rsi-benchmark",
+			"test ! -e /opt/headlesscode/.git",
 			...(config.benchmarkHarnessCommit ? ["test -f /opt/headlesscode/.headlesscode-harness-commit", `test "$(cat /opt/headlesscode/.headlesscode-harness-commit)" = ${shellQuote(config.benchmarkHarnessCommit)}`] : []),
 			config.benchmarkHarnessCommit
 				? "test -z \"$(find /opt/headlesscode/src -type f \\( -path '*/__tests__/*' -o -name '*.test.*' -o -name '*.spec.*' \\) -print -quit)\""
 				: "test -z \"$(find /workspace /opt/headlesscode/src -type f \\( -path '*/__tests__/*' -o -name '*.test.*' -o -name '*.spec.*' \\) -print -quit)\"",
 			'test -z "${HEADLESSCODE_OPENROUTER_API_KEY:-}${OPENROUTER_API_KEY:-}${OPENAI_API_KEY:-}${ANTHROPIC_API_KEY:-}"',
 		]
-		const boundaryGuard = `${boundaryChecks.map((check) => `(${check}) || { echo RSI_BENCHMARK_PREFLIGHT_FAILURE >&2; exit 79; }`).join(" && ")} && exec ${workerCommand}`
+		const boundaryGuard = `${boundaryChecks.map((check, index) => `(${check}) || { echo RSI_BENCHMARK_PREFLIGHT_FAILURE:${index} >&2; exit 79; }`).join(" && ")} && exec ${workerCommand}`
 		const env = rsiMutationGuestEnvironment(config, candidate, inferenceBroker)
 		const isolation = await runSnapshot({
 			config,
