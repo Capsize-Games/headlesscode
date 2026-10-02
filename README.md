@@ -3,7 +3,7 @@
 [![CI](https://github.com/Capsize-Games/headlesscode/actions/workflows/ci.yml/badge.svg)](https://github.com/Capsize-Games/headlesscode/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/headlesscode?logo=npm)](https://www.npmjs.com/package/headlesscode)
 [![Node.js >=22.19](https://img.shields.io/badge/node-%3E%3D22.19-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](./LICENSE)
+[License: Capsize Proprietary](./LICENSE)
 
 `headlesscode` runs the Zoo Code agent loop from a Node.js process, without a
 VS Code window. Run one task directly, launch parallel workers in Git
@@ -342,5 +342,9 @@ This project contains Apache-2.0-licensed code derived from
 [Zoo Code](https://github.com/Zoo-Code-Org/Zoo-Code)
 (`Zoo-Code-Org/Zoo-Code`, commit `ca9b60f`), itself a Roo Code fork. Prompt
 text, tool schemas, and mode/rules loading logic are reused under the terms of
-the Apache License 2.0. See [`LICENSE`](./LICENSE) and
+the Apache License 2.0. See [`licenses/Apache-2.0.txt`](./licenses/Apache-2.0.txt) and
 [`ATTRIBUTION.md`](./ATTRIBUTION.md).
+
+## License
+
+Current headlesscode source uses the Capsize Proprietary Software License in [LICENSE](LICENSE), except for the Zoo Code-derived material listed in [ATTRIBUTION.md](ATTRIBUTION.md), which remains under Apache-2.0. Previous public npm versions retain their published Apache-2.0 terms.

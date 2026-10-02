@@ -15,7 +15,7 @@ on:
 
 jobs:
   typecheck-test-e2e:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, headlesscode-ci]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
