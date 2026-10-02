@@ -180,7 +180,11 @@ async function testSandboxNameIsStableAndDistinct(): Promise<void> {
 
 async function testAsyncOpenShellCommandReportsSafeExitAndTimeoutDetails(): Promise<void> {
 	const stdinEof = await runOpenShellCommandAsync(["-e", "require('node:fs').readFileSync(0); console.log('stdin-eof')"], 1000, process.execPath)
-	assert.equal(stdinEof.exitCode, 0, "the async command runner closes stdin so OpenShell relays can start")
+	assert.equal(
+		stdinEof.exitCode,
+		0,
+		`the async command runner closes stdin so OpenShell relays can start; output: ${stdinEof.output}`,
+	)
 	assert.match(stdinEof.output, /stdin-eof/)
 	const nonzero = await runOpenShellCommandAsync(["-e", "process.exit(7)"], undefined, process.execPath)
 	assert.equal(nonzero.exitCode, 7)

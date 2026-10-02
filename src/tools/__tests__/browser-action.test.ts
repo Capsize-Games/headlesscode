@@ -114,18 +114,32 @@ function exec(ws: string) {
 	return createHeadlessExecutor(ws)
 }
 
-/** Poll `process.kill(pid, 0)` until the process is gone (throws) or timeout. */
+/** Poll until the tracked process exits; a Linux zombie has already exited. */
 async function waitForProcessExit(pid: number, timeoutMs = 10_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs
 	while (Date.now() < deadline) {
-		try {
-			process.kill(pid, 0)
-		} catch {
-			return // gone
-		}
+		if (!(await isProcessRunning(pid))) return
 		await sleep(50)
 	}
 	throw new Error(`process ${pid} still alive after ${timeoutMs}ms`)
+}
+
+async function isProcessRunning(pid: number): Promise<boolean> {
+	try {
+		const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8")
+		const commandEnd = stat.lastIndexOf(")")
+		const state = stat[commandEnd + 2]
+		if (state === "Z" || state === "X") return false
+		return true
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false
+		try {
+			process.kill(pid, 0)
+			return true
+		} catch {
+			return false
+		}
+	}
 }
 
 // ─── (a) launch + screenshot + describe ──────────────────────────────────────
@@ -354,29 +368,32 @@ async function testDisposeKillsOpenBrowser(): Promise<void> {
 	}
 }
 
-/** Find PIDs of chromium/chrome processes owned by this test run (Linux pgrep). */
+/** Find Chromium processes descended from this test process, not other jobs. */
 async function findChromiumPids(): Promise<number[]> {
-	const { execFile } = await import("node:child_process")
 	const pids: number[] = []
-	try {
-		const { stdout } = await new Promise<{ stdout: string }>((resolve, reject) => {
-			execFile("pgrep", ["-f", "chrome-linux|headless_shell"], (err, stdout, _stderr) => {
-				if (err) {
-					// pgrep exits 1 when nothing matches
-					resolve({ stdout: "" })
-					return
-				}
-				resolve({ stdout })
-			})
-		})
-		for (const line of stdout.split("\n")) {
-			const pid = Number(line.trim())
-			if (Number.isInteger(pid) && pid > 0) {
-				pids.push(pid)
+	const pending = [process.pid]
+	const visited = new Set<number>()
+	while (pending.length > 0) {
+		const parent = pending.pop()!
+		if (visited.has(parent)) continue
+		visited.add(parent)
+		let children: string
+		try {
+			children = await fs.readFile(`/proc/${parent}/task/${parent}/children`, "utf8")
+		} catch {
+			continue
+		}
+		for (const entry of children.trim().split(/\s+/)) {
+			const pid = Number(entry)
+			if (!Number.isInteger(pid) || pid <= 0 || visited.has(pid)) continue
+			pending.push(pid)
+			try {
+				const command = await fs.readFile(`/proc/${pid}/cmdline`, "utf8")
+				if (/chrome-linux|headless_shell/.test(command)) pids.push(pid)
+			} catch {
+				// A child can exit while the process tree is being inspected.
 			}
 		}
-	} catch {
-		// pgrep unavailable — cannot assert, but the dispose path still ran.
 	}
 	return pids
 }
