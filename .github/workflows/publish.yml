@@ -23,7 +23,7 @@ permissions:
 jobs:
   npm-publish:
     name: Verify, publish to npm, attach release
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, headlesscode-ci]
     timeout-minutes: 30
     steps:
       - name: Checkout tag
