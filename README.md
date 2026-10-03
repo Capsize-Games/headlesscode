@@ -61,6 +61,35 @@ export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-...
 headlesscode --task "Fix the bug in src/index.ts" --workspace /path/to/repo
 ```
 
+### Using Meta's Model API (Muse) instead
+
+Set `HEADLESSCODE_LLM_PROVIDER=muse` to run sessions against Meta's Model
+API (`https://api.meta.ai/v1`, OpenAI-compatible) with the Muse Spark
+family instead of OpenRouter. Get a key from the
+[Model API dashboard](https://dev.meta.ai/). The default model is
+`muse-spark-1.3` (1M context); `--model` and `mode-models.json` entries
+work the same as on the OpenRouter path. `orchestrate` preflight,
+per-session cost budgets, and the local Ollama backend all apply unchanged.
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `HEADLESSCODE_LLM_PROVIDER` | No | `"openrouter"` (default) or `"muse"`. |
+| `HEADLESSCODE_MUSE_API_KEY` | For Muse calls | Meta Model API key (`MODEL_API_KEY` also works). |
+| `HEADLESSCODE_MUSE_MODEL` | No | Default model; `muse-spark-1.3`. Shadows `OPENROUTER_MODEL`. |
+| `HEADLESSCODE_MUSE_BASE_URL` | No | API base URL; `https://api.meta.ai/v1`. |
+
+```bash
+export HEADLESSCODE_LLM_PROVIDER=muse
+export HEADLESSCODE_MUSE_API_KEY='LLM|...'
+headlesscode --task "Fix the bug in src/index.ts" --workspace /path/to/repo
+```
+
+Notes: the `-contributor` model variants (`muse-spark-1.3-contributor`,
+`muse-spark-1.2-contributor`) are cheaper but grant Meta permission to
+train on the traffic — pick them explicitly, never by default. Vision
+captioning (`describe_image`, screenshots) and OpenShell sandboxed
+execution still use OpenRouter regardless of this setting.
+
 For a source checkout:
 
 ```bash
@@ -87,6 +116,20 @@ headlesscode --dry-run --mode code --workspace /path/to/repo
 Project `.roomodes`, `.roo/rules-<slug>/`, and `AGENTS.md` instructions are
 loaded by the prompt builder when applicable. The selected mode controls which
 tools are exposed. See [Architecture](#architecture) for the relevant code.
+
+### Local MCP services
+
+HeadlessCode can connect to user-configured stdio and Streamable HTTP MCP
+servers. It reads `~/.config/capsize-agent/mcp.json` by default; set
+`HEADLESSCODE_MCP_CONFIG` to use another trusted, user-owned manifest. It does
+not execute MCP commands from a workspace `.mcp.json`. Connected server tools
+are exposed to modes that allow the `mcp` tool group. Offline servers are
+reported in the session prompt/log while other servers continue to work.
+
+The MCP client does not add an approval layer around server tools. Treat each
+configured server's capabilities as available to the agent, and use HeadlessCode
+only for trusted tasks. See [MCP servers](./docs/mcp.md) for configuration,
+limits, and local setup details.
 
 ## OpenShell
 
@@ -228,7 +271,7 @@ See the [RSI design](./docs/recursive-self-improvement.md) and
 | `--task <text>` / `--task-file <path>` | One is required unless `--dry-run` | Task prompt; task file is resolved relative to the workspace. |
 | `--workspace <path>` | `HEADLESSCODE_WORKSPACE_ROOT` or current directory | Repository directory exposed to the worker. |
 | `--mode <slug>` | `code` | Built-in or project `.roomodes` mode. |
-| `--model <id>` | `OPENROUTER_MODEL` or `deepseek/deepseek-v4-flash-0731` | Model ID. |
+| `--model <id>` | `OPENROUTER_MODEL` or `deepseek/deepseek-v4-flash-0731` (`HEADLESSCODE_MUSE_MODEL` or `muse-spark-1.3` with `HEADLESSCODE_LLM_PROVIDER=muse`) | Model ID. |
 | `--max-iterations <n>` | 250 for direct CLI sessions; orchestrator workers default to 50 | Per-session loop bound. |
 | `--consecutive-error-limit <n>` | 3 (local code backend may use 6) | Consecutive tool/model errors before stopping. |
 | `--max-cost-usd <n>` / `--max-duration-ms <n>` | `HEADLESSCODE_MAX_COST_USD` / `HEADLESSCODE_MAX_DURATION_MS`; disabled if unset | Per-session budget caps. A tripped cap aborts the session. |

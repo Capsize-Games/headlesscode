@@ -48,6 +48,7 @@ import { resolveModelForMode } from "../config/mode-models.js"
 import { Logger } from "../engine/logger.js"
 import type { ChatMessage, LlmClient, LlmResponse } from "../engine/types.js"
 import { DEFAULT_MODEL } from "../llm/openrouter.js"
+import { providerDefaultModel, resolveLlmProvider } from "../llm/muse.js"
 import { DECISION_ANSWER_FILENAME, NEEDS_DECISION_FILENAME } from "../tools/executor.js"
 
 // ─── Configuration (env-var resolvable, mirroring local-explore.ts) ─────────
@@ -349,9 +350,14 @@ export function buildProxyUserPrompt(taskText: string, question: string, suggest
 }
 
 async function callProxyLlm(options: DecisionProxyOptions, taskText: string, marker: NeedsDecisionMarker): Promise<string> {
-	// Concrete model always: _decision-proxy key → mode/_default/OPENROUTER_MODEL
-	// → the client's own DEFAULT_MODEL (same final fallback as the main loop).
-	const model = options.model ?? resolveDecisionProxyModel(options.workspaceRoot, process.env) ?? DEFAULT_MODEL
+	// Concrete model always: _decision-proxy key → mode/_default/the
+	// provider's default-model env var → the provider client's own built-in
+	// default (same final fallback as the main loop).
+	const model =
+		options.model ??
+		resolveDecisionProxyModel(options.workspaceRoot, process.env) ??
+		providerDefaultModel(resolveLlmProvider()) ??
+		DEFAULT_MODEL
 	const timeoutMs = options.llmTimeoutMs ?? resolveDecisionProxyLlmTimeout(process.env)
 	const messages: ChatMessage[] = [
 		{ role: "system", content: DECISION_PROXY_SYSTEM_PROMPT },

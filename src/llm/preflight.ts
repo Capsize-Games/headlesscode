@@ -27,6 +27,15 @@ import type { PricingTable } from "../budget/cost.js"
 import { estimateCost, loadPricingTable } from "../budget/cost.js"
 import { OllamaClient, DEFAULT_OLLAMA_URL } from "./ollama.js"
 import { OpenRouterClient, OpenRouterError, OPENROUTER_BASE_URL, DEFAULT_MODEL } from "./openrouter.js"
+import {
+	MuseClient,
+	MuseError,
+	MUSE_BASE_URL,
+	MUSE_API_KEY_ENV,
+	META_MODEL_API_KEY_ENV,
+	MUSE_BASE_URL_ENV,
+	DEFAULT_MUSE_MODEL,
+} from "./muse.js"
 import type { LlmRequest } from "../engine/types.js"
 
 /**
@@ -364,4 +373,180 @@ export async function runLocalPreflight(options: LocalPreflightOptions): Promise
 			? `${model} @ ${baseUrl}: all clear — 1-token probe OK in ${latencyMs}ms (local daemon, $0)`
 			: `${model} @ ${baseUrl}: ${status === "unreachable" ? "daemon unreachable" : "probe failed"} — ${excerpt(detail)}`
 	return { status, model, baseUrl, line, latencyMs }
+}
+
+/**
+ * Meta-Model-API counterpart to `runPreflight` — the same "one cheap real
+ * completion before spawning anything" gate, but through `MuseClient` with
+ * the EXACT model a Muse worker will use. Reuses the shared
+ * `PreflightResult` shape (Muse inference is paid, so the probe/round cost
+ * estimates apply unchanged — the pricing table carries muse-spark-* list
+ * rates). Selected by orchestrateMain when HEADLESSCODE_LLM_PROVIDER=muse.
+ */
+
+export interface MusePreflightOptions {
+	/** The model id a worker would use (defaults to the client default). */
+	model?: string
+	/** API key (default: $HEADLESSCODE_MUSE_API_KEY, then $MODEL_API_KEY). */
+	apiKey?: string
+	/** Meta Model API base URL (default: $HEADLESSCODE_MUSE_BASE_URL or the built-in). */
+	baseUrl?: string
+	/**
+	 * Number of worker sessions the round will spawn — used for the round cost
+	 * estimate. Omit/0 to skip the estimate.
+	 */
+	workerSessions?: number
+	/**
+	 * Per-session cost cap ($HEADLESSCODE_MAX_COST_USD) — when set, the
+	 * preflight line also shows the round ceiling (cap × sessions).
+	 */
+	maxCostUsd?: number
+	/** Env to read key/base-url from (default: process.env). */
+	env?: NodeJS.ProcessEnv
+	signal?: AbortSignal
+}
+
+/**
+ * Classify a Muse probe failure into the shared preflight statuses.
+ * Exported for direct unit testing. Meta publishes no distinct
+ * balance-exhaustion shape, so "balance" only matches explicit
+ * credit/billing language in the body (fail-open: anything else lands on
+ * invalid-key / provider / network / other by status).
+ */
+export function classifyMuseError(err: unknown): PreflightStatus {
+	if (!(err instanceof MuseError)) {
+		return "other"
+	}
+	const haystack = `${err.message} ${err.body ?? ""}`
+	if (BALANCE_RE.test(haystack)) {
+		return "balance"
+	}
+	if (err.status === 401 || err.status === 403) {
+		return "invalid-key"
+	}
+	if (err.status === 402) {
+		return "balance"
+	}
+	if (err.status === 429 || (err.status !== undefined && err.status >= 500)) {
+		return "provider"
+	}
+	if (err.status === undefined) {
+		if (/^Network error/.test(err.message)) {
+			return "network"
+		}
+		if (PROVIDER_DOWN_RE.test(haystack)) {
+			return "provider"
+		}
+		return "other"
+	}
+	return "other"
+}
+
+function resolveMuseBaseUrl(options: MusePreflightOptions): string {
+	const env = options.env ?? process.env
+	return (options.baseUrl ?? env[MUSE_BASE_URL_ENV] ?? MUSE_BASE_URL).replace(/\/+$/, "")
+}
+
+/** Compose the single human-readable preflight line for a Muse result. */
+export function buildMusePreflightLine(
+	result: Omit<PreflightResult, "line"> & { workerSessions: number; maxCostUsd?: number },
+): string {
+	const { status, model, latencyMs, probeCostUsd, roundCostEstimateUsd, workerSessions, maxCostUsd } = result
+	const costPart =
+		roundCostEstimateUsd !== undefined
+			? `; estimated round cost ≈ $${roundCostEstimateUsd.toFixed(3)} (${workerSessions} worker session(s), order-of-magnitude)`
+			: ""
+	const ceiling = roundCostCeilingUsd(workerSessions, maxCostUsd)
+	const ceilingPart = ceiling !== undefined ? `; per-session cap $${maxCostUsd} → round ceiling $${ceiling.toFixed(3)}` : ""
+
+	switch (status) {
+		case "ok":
+			return (
+				`${model} (Meta Model API): all clear — 1-token probe OK in ${latencyMs}ms (probe ≈ $${probeCostUsd.toFixed(6)})` +
+				costPart +
+				ceilingPart
+			)
+		case "no-api-key":
+			return `${MUSE_API_KEY_ENV} (or ${META_MODEL_API_KEY_ENV}) is not set — workers cannot reach Meta's Model API`
+		case "invalid-key":
+			return `${model}: Meta API key invalid or unauthorized (HTTP 401/403) — check ${MUSE_API_KEY_ENV}`
+		case "balance":
+			return `${model}: Meta Model API billing/credit failure — check the account's credits in the dev.meta.ai dashboard before spawning workers`
+		case "provider":
+			return `${model}: Meta Model API unreachable, rate-limited, or erroring (HTTP 5xx/429) — the endpoint is not serving this model right now`
+		case "network":
+			return `network error reaching Meta Model API (${result.baseUrl}) — check connectivity`
+		default:
+			return `${model}: preflight probe failed with an unexpected error — inspect the message`
+	}
+}
+
+/**
+ * Run the Muse preflight probe. Never throws: every failure mode is folded
+ * into a `PreflightResult` with a clear status + line (the CLI aborts on any
+ * non-"ok" status).
+ */
+export async function runMusePreflight(options: MusePreflightOptions): Promise<PreflightResult> {
+	const env = options.env ?? process.env
+	const apiKey = options.apiKey ?? env[MUSE_API_KEY_ENV] ?? env[META_MODEL_API_KEY_ENV]
+	const model = (options.model?.trim() || DEFAULT_MUSE_MODEL).trim()
+	const baseUrl = resolveMuseBaseUrl(options)
+	const workerSessions = Math.max(1, options.workerSessions ?? 0)
+	const roundCostEstimateUsd =
+		options.workerSessions !== undefined && options.workerSessions > 0 ? estimateRoundCost(model, workerSessions, { env }) : undefined
+
+	if (!apiKey) {
+		const result: PreflightResult = {
+			status: "no-api-key",
+			model,
+			baseUrl,
+			line: "",
+			latencyMs: 0,
+			probeCostUsd: 0,
+			roundCostEstimateUsd,
+		}
+		result.line = buildMusePreflightLine({ ...result, workerSessions, maxCostUsd: options.maxCostUsd })
+		return result
+	}
+
+	const client = new MuseClient({ apiKey, baseUrl, defaultModel: model })
+	const startedAt = Date.now()
+	let status: PreflightStatus
+	let probeCostUsd = 0
+	let detail = ""
+	try {
+		const probeRequest: LlmRequest = {
+			model,
+			messages: [{ role: "user", content: "ping" }],
+			maxTokens: 1,
+			temperature: 0,
+			signal: options.signal,
+		}
+		const response = await client.createChatCompletion(probeRequest)
+		status = "ok"
+		const usage = response.usage
+		probeCostUsd = estimateCost({
+			model,
+			inputTokens: usage?.promptTokens ?? 0,
+			outputTokens: usage?.completionTokens ?? 0,
+			cachedTokens: usage?.cachedTokens ?? 0,
+		})
+	} catch (err) {
+		status = classifyMuseError(err)
+		detail = err instanceof Error ? err.message : String(err)
+	}
+	const latencyMs = Date.now() - startedAt
+
+	const result: PreflightResult = {
+		status,
+		model,
+		baseUrl,
+		line: "",
+		latencyMs,
+		probeCostUsd,
+		roundCostEstimateUsd,
+	}
+	const line = buildMusePreflightLine({ ...result, workerSessions, maxCostUsd: options.maxCostUsd })
+	result.line = status === "ok" ? line : `${line} — ${excerpt(detail)}`
+	return result
 }

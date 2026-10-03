@@ -62,14 +62,9 @@ extension it's ported from. Documented for prioritization, not all scheduled.
   auth as other control-plane POSTs), a read-only workspace file browser (reuses the existing
   path-traversal guard, does not add file editing), and a permissions-settings page mirroring
   the earlier mode-models settings page.
-- **Minimal MCP client — fixture/dependency only, feature incomplete.** A real stdio-transport
-  test fixture (built on the official `@modelcontextprotocol/sdk`) compiles and is merged, but
-  the actual client (`src/mcp/client.ts`), executor wiring, and session lifecycle management
-  were never built — the original implementation attempt stopped early and only a follow-up
-  fixture-compile fix landed. The fixture currently has no test importing it. Treat MCP as
-  still NOT implemented for any practical purpose; only the groundwork (a working test fixture
-  + the SDK dependency) is in place. **Deliberately deprioritized (2026-08-02)** — the project
-  owner has explicitly said this is on the backburner; not something currently in use or missed.
+- **MCP resources and prompts** — the current HeadlessCode MCP client supports tool listing and
+  tool calls over stdio and Streamable HTTP. It does not yet implement MCP resources, prompts,
+  OAuth setup, or per-tool approval. See [MCP servers](mcp.md).
 - **Recursive task decomposition (`new_task`)** — a headless-native reimplementation (NOT a
   literal port of Zoo Code's webview-coupled version, per its own plan doc's explicit design
   rationale): synchronous nested child `HeadlessSession`, a shared `BudgetTracker` between
@@ -112,8 +107,11 @@ extension it's ported from. Documented for prioritization, not all scheduled.
 
 ## Real open gaps
 
-- **The real MCP client/executor wiring** — see above; only a compiling fixture exists.
-  Deliberately backburnered, not currently blocking anything.
+- **MCP parity is partial.** HeadlessCode now connects to configured stdio and
+  Streamable HTTP servers, exposes their tools to MCP-enabled modes, and closes
+  clients at session end. It does not yet support MCP resources, prompts, OAuth
+  setup, per-tool approval, or the Zoo Code UI's enable/disable controls. See
+  [MCP servers](mcp.md).
 - **`headlesscode index`'s default embedding backend is still `openrouter`, not the free local
   `ollama` option** — the capability exists and is verified working, it's just not the default
   for local development where a GPU is available.

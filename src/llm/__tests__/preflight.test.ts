@@ -11,7 +11,9 @@
 import assert from "node:assert/strict"
 
 import { classifyError, estimateRoundCost, NOMINAL_SESSION_INPUT_TOKENS, NOMINAL_SESSION_OUTPUT_TOKENS, runPreflight } from "../preflight.js"
+import { classifyMuseError, runMusePreflight } from "../preflight.js"
 import { OpenRouterError } from "../openrouter.js"
+import { MuseError } from "../muse.js"
 
 /** Capture the request body a mocked fetch receives (for the pin assertion). */
 let lastRequestBody: Record<string, unknown> | undefined
@@ -245,6 +247,83 @@ async function testRoundCostCeiling(): Promise<void> {
 	assert.equal(roundCostCeilingUsd(2, -1), undefined, "a non-positive cap is ignored")
 }
 
+// ─── Muse probe (HEADLESSCODE_LLM_PROVIDER=muse) ───────────────────────────────
+
+async function testMuseProbeUsesExactModelAndOneToken(): Promise<void> {
+	installFetch()
+	try {
+		const result = await runMusePreflight({
+			model: "muse-spark-1.3",
+			apiKey: "k",
+			baseUrl: "http://mock",
+			workerSessions: 2,
+		})
+		assert.equal(result.status, "ok")
+		assert.equal(lastRequestBody?.model, "muse-spark-1.3", "the probe uses the exact worker model")
+		assert.equal(lastRequestBody?.max_tokens, 1, "the probe is a cheap 1token completion")
+		assert.equal(lastRequestBody?.provider, undefined, "no OpenRouter provider pin on the Muse path")
+		assert.ok(result.line.includes("Meta Model API"), `ok line names the provider: ${result.line}`)
+		assert.ok(result.line.includes("all clear"), `ok line names the all-clear: ${result.line}`)
+		assert.ok(result.line.includes("estimated round cost"), "ok line carries the round cost estimate")
+	} finally {
+		restoreFetch()
+	}
+}
+
+async function testClassifyMuseError(): Promise<void> {
+	assert.equal(classifyMuseError(new MuseError("Meta Model API returned HTTP 401: bad key", 401)), "invalid-key")
+	assert.equal(classifyMuseError(new MuseError("Meta Model API returned HTTP 403: forbidden", 403)), "invalid-key")
+	assert.equal(classifyMuseError(new MuseError("Meta Model API returned HTTP 429: slow down", 429)), "provider")
+	assert.equal(classifyMuseError(new MuseError("Meta Model API returned HTTP 503: overloaded", 503)), "provider")
+	assert.equal(classifyMuseError(new MuseError("Network error calling Meta Model API: socket hang up")), "network")
+	assert.equal(classifyMuseError(new MuseError("Meta Model API returned HTTP 402", 402)), "balance")
+	assert.equal(classifyMuseError(new OpenRouterError("foreign error", 500)), "other", "a foreign error type is never classified")
+	assert.equal(classifyMuseError(new Error("plain error")), "other")
+}
+
+async function testRunMusePreflightNoApiKey(): Promise<void> {
+	installFetch()
+	try {
+		const result = await runMusePreflight({ model: "muse-spark-1.3", baseUrl: "http://mock", env: {} })
+		assert.equal(result.status, "no-api-key")
+		assert.ok(result.line.includes("HEADLESSCODE_MUSE_API_KEY"), `line names the key var: ${result.line}`)
+	} finally {
+		restoreFetch()
+	}
+}
+
+async function testRunMusePreflightHonorsModelApiKeyFallback(): Promise<void> {
+	installFetch()
+	try {
+		// Meta's own MODEL_API_KEY variable is honored when the
+		// HEADLESSCODE_-prefixed one is absent.
+		const result = await runMusePreflight({
+			model: "muse-spark-1.3",
+			baseUrl: "http://mock",
+			env: { MODEL_API_KEY: "LLM|1|fallback" },
+		})
+		assert.equal(result.status, "ok")
+	} finally {
+		restoreFetch()
+	}
+}
+
+async function testRunMusePreflightClassifiesHttpFailures(): Promise<void> {
+	installFetch()
+	try {
+		nextResponse = { status: 401, body: { error: { message: "bad key" } } }
+		const invalid = await runMusePreflight({ model: "muse-spark-1.3", apiKey: "k", baseUrl: "http://mock" })
+		assert.equal(invalid.status, "invalid-key")
+		assert.ok(invalid.line.includes("401/403"), `line names the cause: ${invalid.line}`)
+
+		nextResponse = { status: 503, body: "overloaded" }
+		const down = await runMusePreflight({ model: "muse-spark-1.3", apiKey: "k", baseUrl: "http://mock" })
+		assert.equal(down.status, "provider")
+	} finally {
+		restoreFetch()
+	}
+}
+
 // ─── runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -260,6 +339,11 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["runPreflight ok reports probe cost from usage", testRunPreflightOkReportsProbeCostFromUsage],
 	["estimateRoundCost scales with sessions + pricing", testEstimateRoundCost],
 	["roundCostCeilingUsd honors the per-session cap", testRoundCostCeiling],
+	["muse probe uses the exact worker model + 1 token, no pin", testMuseProbeUsesExactModelAndOneToken],
+	["classifyMuseError: key/provider/network/balance/other", testClassifyMuseError],
+	["runMusePreflight: no API key", testRunMusePreflightNoApiKey],
+	["runMusePreflight honors the MODEL_API_KEY fallback", testRunMusePreflightHonorsModelApiKeyFallback],
+	["runMusePreflight classifies HTTP failures end-to-end", testRunMusePreflightClassifiesHttpFailures],
 ]
 
 let passed = 0

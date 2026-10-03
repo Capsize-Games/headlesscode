@@ -30,6 +30,7 @@ import { HeadlessSession } from "../engine/loop.js"
 import { Logger } from "../engine/logger.js"
 import { OpenRouterClient } from "../llm/openrouter.js"
 import { OllamaClient } from "../llm/ollama.js"
+import { MuseClient, providerDefaultModel, resolveLlmProvider } from "../llm/muse.js"
 import { envBoolean, resolvePerModeEnv } from "../cli.js"
 import { createReadOnlyHeadlessExecutor } from "../tools/executor.js"
 import { getNativeTools } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/index.js"
@@ -253,6 +254,11 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 			.map((s) => s.trim())
 			.filter(Boolean)
 			.includes(mode)
+	// Cloud provider for a non-local review session (openrouter default,
+	// "muse" for Meta's Model API). Throws on a typo'd
+	// HEADLESSCODE_LLM_PROVIDER — entry points validate it first for a clean
+	// exit-2; reaching here with a bad value is a programmer error.
+	const provider = resolveLlmProvider()
 	// 2026-08-27: cli.ts's own useLocalCodeBackend path learned this the hard
 	// way (see its effectiveModel doc comment) — every downstream consumer of
 	// `model` (session-start logs, cost/usage records, the `request.model`
@@ -260,8 +266,12 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 	// own defaultModel) must see the LOCAL model id when local backend is
 	// active, not the cloud one, or a local review session logs/tags itself
 	// as e.g. "deepseek/deepseek-v4-flash-0731" throughout even though it
-	// never touches OpenRouter.
-	const effectiveModel = useLocalBackend ? (resolvePerModeEnv("HEADLESSCODE_CODE_MODE_MODEL", mode) ?? model) : model
+	// never touches OpenRouter. On the Muse path the default is also
+	// resolved eagerly (see providerDefaultModel) for the same class of
+	// reason — an undefined model would fall back to an OpenRouter id.
+	const effectiveModel = useLocalBackend
+		? (resolvePerModeEnv("HEADLESSCODE_CODE_MODE_MODEL", mode) ?? model)
+		: (model ?? providerDefaultModel(provider))
 	const client =
 		llmClient ??
 		(useLocalBackend
@@ -278,7 +288,9 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 					// about it.
 					timeoutMs: useLocalBackend ? 630_000 : undefined,
 				})
-			: new OpenRouterClient({ apiKey: process.env.HEADLESSCODE_OPENROUTER_API_KEY, defaultModel: model }))
+			: provider === "muse"
+				? new MuseClient({ defaultModel: effectiveModel })
+				: new OpenRouterClient({ apiKey: process.env.HEADLESSCODE_OPENROUTER_API_KEY, defaultModel: model }))
 
 	// Mirror every log line to <worktree>/review.log — the same visibility
 	// `run-worker.sh` gives a worker via harness.log (a plain `tail -f`

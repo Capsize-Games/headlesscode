@@ -47,6 +47,8 @@ import { runTestsTool } from "../tools/run-tests.js"
 import { setIndentationTool } from "../tools/set-indentation-tool.js"
 import { CODE_INTEL_TOOLS, RENAME_SYMBOL_TOOL } from "../codeintel/tools.js"
 import type { ModeConfig } from "../vendor/zoo-code/types/index.js"
+import { McpHub } from "../vendor/zoo-code/src/services/mcp/McpHub.js"
+import { getMcpServerTools } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/mcp_server.js"
 
 import { appendStackRulesSection, loadStackRules } from "./stacks.js"
 import type { ChatTool } from "./types.js"
@@ -64,6 +66,7 @@ export interface BuildSystemPromptOptions {
 	mode: string
 	customModes?: ModeConfig[]
 	globalCustomInstructions?: string
+	mcpHub?: McpHub
 }
 
 export interface BuiltPrompt {
@@ -303,7 +306,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions): Prom
 		context,
 		workspaceRoot,
 		false, // supportsComputerUse
-		undefined, // mcpHub
+		options.mcpHub,
 		undefined, // diffStrategy
 		modeConfig.slug,
 		undefined, // customModePrompts
@@ -642,7 +645,26 @@ export async function buildLeanSystemPrompt(options: BuildSystemPromptOptions): 
 	const conventions = buildHeadlessConventions(modeConfig.slug, customModes)
 	const fullPrompt = conventions === undefined ? withStackRules : `${withStackRules}\n${conventions}`
 
-	return { prompt: fullPrompt, modeConfig, customModes }
+	const connectedMcp = appendMcpConnectionNote(fullPrompt, options.mcpHub, modeConfig)
+	return { prompt: connectedMcp, modeConfig, customModes }
+}
+
+/** Add a compact MCP note for the lean prompt, which omits the vendor capability section. */
+export function appendMcpConnectionNote(prompt: string, hub: McpHub | undefined, mode: ModeConfig): string {
+	if (!hub || !mode.groups.some((group) => getGroupName(group) === "mcp")) return prompt
+	const allowed = mode.allowedMcpServers
+	const servers = hub.getServers().filter((server) => !allowed || allowed.includes(server.name))
+	const errors = hub.getConnectionErrors()
+	if (servers.length === 0 && errors.length === 0) return prompt
+	const available = servers.length ? servers.map((server) => server.name).join(", ") : "none"
+	const unavailable = errors.length ? ` Unavailable: ${errors.join("; ")}.` : ""
+	return `${prompt}\n\nMCP services available: ${available}.${unavailable}`
+}
+
+/** MCP function schemas visible to a mode, respecting its group and server allowlist. */
+export function mcpToolsForMode(hub: McpHub | undefined, mode: ModeConfig): ChatTool[] {
+	if (!hub || !mode.groups.some((group) => getGroupName(group) === "mcp")) return []
+	return getMcpServerTools(hub, mode.allowedMcpServers) as unknown as ChatTool[]
 }
 
 /**

@@ -111,6 +111,95 @@ async function testNothingConfiguredReturnsUndefined(): Promise<void> {
 	}
 }
 
+// ─── Rule 4 provider awareness (HEADLESSCODE_LLM_PROVIDER=muse) ───────────────
+
+async function testMuseProviderReadsMuseModelEnv(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const resolved = resolveModelForMode({
+			workspaceRoot: repo,
+			mode: "code",
+			env: { HEADLESSCODE_LLM_PROVIDER: "muse", HEADLESSCODE_MUSE_MODEL: "muse-spark-1.2" },
+		})
+		assert.equal(resolved, "muse-spark-1.2", "HEADLESSCODE_MUSE_MODEL is the default-model var under provider muse")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testMuseProviderShadowsOpenRouterModel(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		// OPENROUTER_MODEL holds OpenRouter provider/model ids, never valid
+		// Meta ids — under provider muse it must not leak through.
+		const resolved = resolveModelForMode({
+			workspaceRoot: repo,
+			mode: "code",
+			env: { HEADLESSCODE_LLM_PROVIDER: "muse", OPENROUTER_MODEL: "deepseek/deepseek-v4-flash-0731" },
+		})
+		assert.equal(resolved, undefined, "OPENROUTER_MODEL is shadowed under provider muse")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testMuseModelEnvBeatsOpenRouterModel(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const resolved = resolveModelForMode({
+			workspaceRoot: repo,
+			mode: "code",
+			env: {
+				HEADLESSCODE_LLM_PROVIDER: "muse",
+				HEADLESSCODE_MUSE_MODEL: "muse-spark-1.2",
+				OPENROUTER_MODEL: "deepseek/deepseek-v4-flash-0731",
+			},
+		})
+		assert.equal(resolved, "muse-spark-1.2")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testConfigFileStillWinsUnderMuse(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		await writeConfig(repo, JSON.stringify({ code: "from-file", _default: "from-default" }))
+		const resolved = resolveModelForMode({
+			workspaceRoot: repo,
+			mode: "code",
+			explicitModel: undefined,
+			env: { HEADLESSCODE_LLM_PROVIDER: "muse", HEADLESSCODE_MUSE_MODEL: "muse-spark-1.2" },
+		})
+		assert.equal(resolved, "from-file", "rules 1-3 are untouched by the provider")
+		const explicit = resolveModelForMode({
+			workspaceRoot: repo,
+			mode: "code",
+			explicitModel: "--model-flag",
+			env: { HEADLESSCODE_LLM_PROVIDER: "muse", HEADLESSCODE_MUSE_MODEL: "muse-spark-1.2" },
+		})
+		assert.equal(explicit, "--model-flag", "an explicit --model always wins, on any provider")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testMuseModelEnvIgnoredUnderOpenRouter(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		// The Muse-specific var must not leak into OpenRouter runs when both
+		// happen to be set — OPENROUTER_MODEL keeps its meaning there.
+		const resolved = resolveModelForMode({
+			workspaceRoot: repo,
+			mode: "code",
+			env: { HEADLESSCODE_MUSE_MODEL: "muse-spark-1.2", OPENROUTER_MODEL: "from-env" },
+		})
+		assert.equal(resolved, "from-env")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 // ─── extraKeys (Phase 3 condensation model assignment) ───────────────────────
 
 async function testExtraKeyBeatsDefault(): Promise<void> {
@@ -335,6 +424,11 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["_default beats OPENROUTER_MODEL", testDefaultBeatsEnv],
 	["OPENROUTER_MODEL used when no config entry applies", testEnvBeatsUndefined],
 	["nothing configured -> undefined (caller default applies)", testNothingConfiguredReturnsUndefined],
+	["muse provider reads HEADLESSCODE_MUSE_MODEL", testMuseProviderReadsMuseModelEnv],
+	["muse provider shadows OPENROUTER_MODEL", testMuseProviderShadowsOpenRouterModel],
+	["HEADLESSCODE_MUSE_MODEL beats OPENROUTER_MODEL under muse", testMuseModelEnvBeatsOpenRouterModel],
+	["config file + explicit flag still win under muse", testConfigFileStillWinsUnderMuse],
+	["HEADLESSCODE_MUSE_MODEL ignored under openrouter", testMuseModelEnvIgnoredUnderOpenRouter],
 	["extraKeys: _condensation beats _default + env", testExtraKeyBeatsDefault],
 	["extraKeys: falls through to _default when absent", testExtraKeyFallsThroughToDefaultWhenAbsent],
 	["extraKeys: ignored unless explicitly requested", testExtraKeyWithoutExtraKeysRequestedIgnored],

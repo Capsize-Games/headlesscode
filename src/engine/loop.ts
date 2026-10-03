@@ -48,6 +48,7 @@ import { randomUUID } from "node:crypto"
 import { BudgetExceededError, BudgetTracker, type SessionBudget } from "../budget/budget.js"
 import { loadPricingTable, mergeLivePrice, type ModelPrice, type PricingTable } from "../budget/cost.js"
 import { DEFAULT_MODEL, isRetryableOpenRouterError } from "../llm/openrouter.js"
+import { isRetryableMuseError } from "../llm/muse.js"
 import { DECISION_PROXY_ANSWER_PREFIX } from "../decision-proxy/proxy.js"
 import {
 	createHeadlessExecutor,
@@ -73,6 +74,9 @@ import {
 import { writeSessionReport } from "./reports.js"
 import { Logger } from "./logger.js"
 import { extractEmbeddedToolCall, parseToolCalls } from "./parser.js"
+import { McpHub } from "../vendor/zoo-code/src/services/mcp/McpHub.js"
+import { normalizeMcpToolName } from "../vendor/zoo-code/src/utils/mcp-name.js"
+import { getMcpServerTools } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/mcp_server.js"
 import {
 	appendBrowserActionTool,
 	appendCodeIntelEditTools,
@@ -84,6 +88,7 @@ import {
 	buildSystemPrompt,
 	isLeanSystemPromptEnabled,
 	loadCustomModes,
+	mcpToolsForMode,
 	modeHasEditGroup,
 	patchEditFileToolForLocalModels,
 	selectToolsForMode,
@@ -1549,6 +1554,7 @@ export class HeadlessSession {
 	readonly state: SessionRunState
 	private readonly llmClient: LlmClient
 	private readonly executor: ToolExecutor
+	private mcpHub: McpHub | undefined
 	private readonly logger: Logger
 	/** Phase 3: memory activity for the last run (null when memory is off or recording failed). */
 	memoryStats: SessionMemoryStats | null = null
@@ -1976,6 +1982,16 @@ export class HeadlessSession {
 	 * task-level outcomes (LLM errors are returned as `status: "error"`).
 	 */
 	async run(): Promise<SessionResult> {
+		try {
+			return await this.runInner()
+		} finally {
+			// Also covers setup failures before runIterations installs its teardown.
+			await this.mcpHub?.dispose()
+			this.mcpHub = undefined
+		}
+	}
+
+	private async runInner(): Promise<SessionResult> {
 		const { workspaceRoot, mode, model } = this.config
 
 		// 1. System prompt + tool selection. customModes is stashed on the
@@ -1983,6 +1999,25 @@ export class HeadlessSession {
 		// resolution (avoid re-reading .roomodes per delegation).
 		const customModes = this.config.customModes ?? (await loadCustomModes(workspaceRoot))
 		this.customModes = customModes
+		// An explicit tools list is an allowlist (used by QA and review sessions).
+		// Those restricted sessions must not gain configured MCP capabilities.
+		if (this.config.tools === undefined) {
+			this.mcpHub = await McpHub.connect()
+			for (const error of this.mcpHub.getConnectionErrors()) {
+				this.logger.warn("[mcp] server unavailable", { error })
+			}
+			for (const tool of getMcpServerTools(this.mcpHub)) {
+				const functionName = tool.function.name
+				const handler = (args: Record<string, unknown>) =>
+					this.mcpHub?.callFunctionTool(functionName, args).then(
+						(content) => ({ content, isError: false }),
+						(error: unknown) => ({ content: `[MCP error] ${String(error)}`, isError: true }),
+					) ?? { content: "MCP connection is unavailable", isError: true }
+				this.executor.register(functionName, handler)
+				const normalizedName = normalizeMcpToolName(functionName)
+				if (normalizedName !== functionName) this.executor.register(normalizedName, handler)
+			}
+		}
 		const buildPrompt = isLeanSystemPromptEnabled() ? buildLeanSystemPrompt : buildSystemPrompt
 		const systemPrompt =
 			this.config.systemPromptOverride ??
@@ -1991,6 +2026,7 @@ export class HeadlessSession {
 				mode,
 				customModes,
 				globalCustomInstructions: this.config.globalCustomInstructions,
+				mcpHub: this.mcpHub,
 			})).prompt
 		// browser_action, describe_image and the code-intelligence tools are
 		// not part of the vendored tool set, so selectToolsForMode can't
@@ -2004,6 +2040,8 @@ export class HeadlessSession {
 		// list matches what actually works for the project (and read-only
 		// sessions don't carry a describe_image schema they'd error on).
 		let tools = this.config.tools ?? selectToolsForMode(mode, customModes)
+		const modeConfig = getModeBySlug(mode, customModes) ?? modes.find((item) => item.slug === mode) ?? modes[0]
+		if (this.config.tools === undefined) tools = [...tools, ...mcpToolsForMode(this.mcpHub, modeConfig)]
 		if (this.executor.has("browser_action")) {
 			tools = appendBrowserActionTool(tools)
 		}
@@ -2160,6 +2198,8 @@ export class HeadlessSession {
 			// applyBackgroundCondense).
 			this.sessionEnded = true
 			this.executor.dispose()
+			await this.mcpHub?.dispose()
+			this.mcpHub = undefined
 		}
 		// (S2) "Session ended" implies "aux writes flushed": drain the background
 		// chain before returning so post-run readers see the final feed/snapshot
@@ -3709,7 +3749,10 @@ export class HeadlessSession {
 				try {
 					response = await this.callMainLlm(requestMessages, iteration, repeatPenaltyOverride, excludedToolNames)
 				} catch (firstAttemptError) {
-					if (!isRetryableOpenRouterError(firstAttemptError)) {
+					// Retryable classification is per cloud provider (each
+					// client classifies its own error type; a foreign error
+					// is never retryable by the other classifier).
+					if (!isRetryableOpenRouterError(firstAttemptError) && !isRetryableMuseError(firstAttemptError)) {
 						throw firstAttemptError
 					}
 					this.logger.warn("[loop] main LLM call failed with a retryable provider error, retrying once", {
@@ -5583,6 +5626,9 @@ export class HeadlessSession {
 		// whole session, costing a full-prompt cache miss after every such
 		// switch. When the tool set differs, rebuild the prompt as before.
 		let newTools = this.config.tools ?? selectToolsForMode(modeSlug, this.customModes)
+		const targetModeConfig =
+			getModeBySlug(modeSlug, this.customModes) ?? modes.find((item) => item.slug === modeSlug) ?? modes[0]
+		if (this.config.tools === undefined) newTools = [...newTools, ...mcpToolsForMode(this.mcpHub, targetModeConfig)]
 		// Same executor.gated non-vendored appends as run() — see the comment
 		// there (T2/T3: a session never carries a schema its executor can't run).
 		if (this.executor.has("browser_action")) {
@@ -5632,6 +5678,7 @@ export class HeadlessSession {
 				mode: modeSlug,
 				customModes: this.customModes,
 				globalCustomInstructions: this.config.globalCustomInstructions,
+				mcpHub: this.mcpHub,
 			})
 			this.state.systemPrompt = built.prompt
 			// The "living" system prompt each LLM call reads (messages[0] is
