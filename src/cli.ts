@@ -13,7 +13,7 @@ import * as path from "node:path"
 
 import { LocalMemoryStore } from "./memory/local.js"
 import type { MemoryStore } from "./memory/types.js"
-import { OpenRouterClient, parseReasoningEffort } from "./llm/openrouter.js"
+import { DEFAULT_MODEL, OpenRouterClient, parseReasoningEffort } from "./llm/openrouter.js"
 import { OllamaClient } from "./llm/ollama.js"
 import {
 	DEFAULT_MUSE_MODEL,
@@ -305,7 +305,7 @@ Options:
                              the browser can open the session's event view
                              immediately; rarely needed from a terminal.
   --model <id>               Model id (default: $OPENROUTER_MODEL or
-                               deepseek/deepseek-v4-flash-0731; with
+                               meta/muse-spark-1.3-contributor; with
                                HEADLESSCODE_LLM_PROVIDER=muse: $HEADLESSCODE_MUSE_MODEL
                                or muse-spark-1.3)
   --max-iterations <n>       Loop iteration cap (default: 250 — see DEFAULT_MAX_ITERATIONS
@@ -1059,7 +1059,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 			parseReasoningEffort(dryRunEffort)
 
 			process.stdout.write(built.prompt + "\n")
-			const dryRunDefaultModel = provider === "muse" ? DEFAULT_MUSE_MODEL : "deepseek/deepseek-v4-flash-0731"
+			const dryRunDefaultModel = provider === "muse" ? DEFAULT_MUSE_MODEL : DEFAULT_MODEL
 			process.stdout.write(
 				`\n───── dry-run summary ─────\n` +
 					`mode:             ${options.mode}\n` +
@@ -1200,7 +1200,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// non-empty request.model over its own defaultModel) must see the
 	// LOCAL model id, not the OpenRouter-resolved one. Without this,
 	// local sessions were tagged and logged as
-	// e.g. "deepseek/deepseek-v4-flash-0731" throughout — cosmetic for
+	// e.g. the cloud model id throughout — cosmetic for
 	// generation itself (the local daemon ignores the model string and
 	// serves whatever GGUF is loaded) but wrong everywhere the model id
 	// is recorded or reported (verified live 2026-08-21: session_start

@@ -1010,7 +1010,7 @@ export interface HeadlessSessionConfig {
 	maxModeSwitches?: number
 	/** Mode slug, default 'code' (built-in or from .roomodes). */
 	mode?: string
-	/** Model id; default env OPENROUTER_MODEL or 'deepseek/deepseek-v4-flash-0731'. */
+	/** Model id; default env OPENROUTER_MODEL or 'meta/muse-spark-1.3-contributor'. */
 	model?: string
 	taskText: string
 	maxIterations?: number

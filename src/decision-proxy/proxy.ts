@@ -313,8 +313,8 @@ function resolveTaskTextFromOrchestratorState(workspaceRoot: string): TaskTextRe
 // ─── LLM call ───────────────────────────────────────────────────────────────
 
 /**
- * Max attempts for ONE question's LLM call. A reasoning model (e.g. the
- * default deepseek/deepseek-v4-flash-0731) sometimes returns HTTP 200 with EMPTY
+ * Max attempts for ONE question's LLM call. A reasoning model (observed with
+ * deepseek/deepseek-v4-flash-0731) sometimes returns HTTP 200 with EMPTY
  * content on the first completion (observed live in the decision-proxy pilot);
  * the retry re-issues the SAME one-shot prompt — still a single question, no
  * tools, no loop. The caller still fails open (writes nothing) if every

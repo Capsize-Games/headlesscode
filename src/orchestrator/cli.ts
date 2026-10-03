@@ -2751,7 +2751,7 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		// built-in default.
 		const previewModel = (mode: string): string =>
 			resolveModelForMode({ workspaceRoot: repo, mode, explicitModel: options.model, env: process.env }) ??
-			`${provider === "muse" ? DEFAULT_MUSE_MODEL : "deepseek/deepseek-v4-flash-0731"} (client default)`
+			`${provider === "muse" ? DEFAULT_MUSE_MODEL : DEFAULT_MODEL} (client default)`
 		// Issue #16: estimate the round's expected cost/iterations from
 		// recorded cost history, keyed by issue shape. Advisory only — a
 		// history read failure must never fail the dry-run, just omit the

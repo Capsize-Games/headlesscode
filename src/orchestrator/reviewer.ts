@@ -265,7 +265,7 @@ export async function runReview(options: ReviewOptions): Promise<ReviewResult> {
 	// OllamaClient sends, which OllamaClient.resolveModel() prefers over its
 	// own defaultModel) must see the LOCAL model id when local backend is
 	// active, not the cloud one, or a local review session logs/tags itself
-	// as e.g. "deepseek/deepseek-v4-flash-0731" throughout even though it
+	// as the cloud model id throughout even though it
 	// never touches OpenRouter. On the Muse path the default is also
 	// resolved eagerly (see providerDefaultModel) for the same class of
 	// reason — an undefined model would fall back to an OpenRouter id.

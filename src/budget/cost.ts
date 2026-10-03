@@ -57,9 +57,12 @@ export type PricingTable = Record<string, ModelPrice>
 /**
  * Default pricing table (OpenRouter list rates, USD per 1M tokens).
  *
- * - `deepseek/deepseek-v4-flash-0731` — the harness default (Phase 1/2/5
- *   workers; see `DEFAULT_MODEL` in src/llm/openrouter.ts). Priced the same
- *   as the prior default, `deepseek/deepseek-v4-flash` (kept below for
+ * - `meta/muse-spark-1.3-contributor` — the harness default. OpenRouter's
+ *   current list rate is $0.10 input / $0.20 output / $0.002 cached input
+ *   per 1M tokens. OpenRouter notes that prompts and outputs may be used to
+ *   improve Meta's products for this Contributor model.
+ * - `deepseek/deepseek-v4-flash-0731` — a prior harness default (Phase 1/2/5
+ *   workers). Priced the same as `deepseek/deepseek-v4-flash` (kept below for
  *   override compat) — same model line, dated point-release id. The rate is
  *   the OFFICIAL DeepSeek provider's own rate specifically (verified
  *   against OpenRouter's own
@@ -109,6 +112,7 @@ export type PricingTable = Record<string, ModelPrice>
  *   still counts against a cost cap.
  */
 export const DEFAULT_PRICING_TABLE: PricingTable = {
+ "meta/muse-spark-1.3-contributor": { input: 0.1, output: 0.2, cacheRead: 0.002 },
  "deepseek/deepseek-chat": { input: 0.27, output: 1.1 },
  "deepseek/deepseek-reasoner": { input: 0.55, output: 2.19 },
  "deepseek/deepseek-v4-flash-0731": { input: 0.14, output: 0.28, cacheRead: 0.0028 },

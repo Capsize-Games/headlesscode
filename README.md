@@ -51,7 +51,7 @@ For a real model call, set the OpenRouter key. `--dry-run` does not need a key.
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `HEADLESSCODE_OPENROUTER_API_KEY` | For OpenRouter calls | OpenRouter API key. |
-| `OPENROUTER_MODEL` | No | Default model; `deepseek/deepseek-v4-flash-0731`. `--model` overrides it. |
+| `OPENROUTER_MODEL` | No | Default model; `meta/muse-spark-1.3-contributor`. `--model` overrides it. |
 | `OPENROUTER_HTTP_REFERER` | No | OpenRouter application referer header. |
 | `OPENROUTER_APP_TITLE` | No | OpenRouter application title header. |
 | `HEADLESSCODE_WORKSPACE_ROOT` | No | Default workspace; otherwise the current directory. |
@@ -60,6 +60,12 @@ For a real model call, set the OpenRouter key. `--dry-run` does not need a key.
 export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-...
 headlesscode --task "Fix the bug in src/index.ts" --workspace /path/to/repo
 ```
+
+The default model is Muse Spark 1.3 Contributor through OpenRouter. OpenRouter
+lists it at $0.10/M input tokens, $0.20/M output tokens, and $0.002/M cached
+input tokens. OpenRouter notes that prompts and outputs sent to this Contributor
+model may be used to improve Meta's products. Use `OPENROUTER_MODEL` or
+`--model` to select another OpenRouter model.
 
 ### Using Meta's Model API (Muse) instead
 
@@ -271,7 +277,7 @@ See the [RSI design](./docs/recursive-self-improvement.md) and
 | `--task <text>` / `--task-file <path>` | One is required unless `--dry-run` | Task prompt; task file is resolved relative to the workspace. |
 | `--workspace <path>` | `HEADLESSCODE_WORKSPACE_ROOT` or current directory | Repository directory exposed to the worker. |
 | `--mode <slug>` | `code` | Built-in or project `.roomodes` mode. |
-| `--model <id>` | `OPENROUTER_MODEL` or `deepseek/deepseek-v4-flash-0731` (`HEADLESSCODE_MUSE_MODEL` or `muse-spark-1.3` with `HEADLESSCODE_LLM_PROVIDER=muse`) | Model ID. |
+| `--model <id>` | `OPENROUTER_MODEL` or `meta/muse-spark-1.3-contributor` (`HEADLESSCODE_MUSE_MODEL` or `muse-spark-1.3` with `HEADLESSCODE_LLM_PROVIDER=muse`) | Model ID. |
 | `--max-iterations <n>` | 250 for direct CLI sessions; orchestrator workers default to 50 | Per-session loop bound. |
 | `--consecutive-error-limit <n>` | 3 (local code backend may use 6) | Consecutive tool/model errors before stopping. |
 | `--max-cost-usd <n>` / `--max-duration-ms <n>` | `HEADLESSCODE_MAX_COST_USD` / `HEADLESSCODE_MAX_DURATION_MS`; disabled if unset | Per-session budget caps. A tripped cap aborts the session. |

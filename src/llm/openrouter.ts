@@ -14,7 +14,7 @@
  *     identifying the app and enabling higher rate limits.
  *
  * Chat model resolution order (per request): `request.model` → constructor
- * `defaultModel` → `OPENROUTER_MODEL` env var → `deepseek/deepseek-v4-flash-0731`.
+ * `defaultModel` → `OPENROUTER_MODEL` env var → `meta/muse-spark-1.3-contributor`.
  */
 
 import type {
@@ -29,7 +29,7 @@ import { parseEndpointPricing, type EndpointPricingEntry, type ModelPrice } from
 import { captureTranscript, isTranscriptCaptureEnabled } from "./transcript-capture.js"
 
 export const OPENROUTER_BASE_URL = "https://openrouter.ai"
-export const DEFAULT_MODEL = "deepseek/deepseek-v4-flash-0731"
+export const DEFAULT_MODEL = "meta/muse-spark-1.3-contributor"
 
 export interface OpenRouterClientOptions {
 	apiKey?: string
@@ -865,4 +865,3 @@ function mapUsage(raw: RawUsage | undefined): LlmResponse["usage"] {
 function excerpt(body: string): string {
 	return body.length > 500 ? `${body.slice(0, 500)}…` : body
 }
-

@@ -51,8 +51,8 @@ async function testDeepseekV4FlashPriced(): Promise<void> {
 }
 
 /**
- * The harness default model was bumped to the dated point release
- * `deepseek/deepseek-v4-flash-0731` (src/llm/openrouter.ts's DEFAULT_MODEL).
+ * The prior harness default was the dated point release
+ * `deepseek/deepseek-v4-flash-0731` (the prior DEFAULT_MODEL).
  * Same regression risk as testDeepseekV4FlashPriced: this id must have its
  * own real pricing entry, not fall through to FALLBACK_MODEL_PRICE.
  */
@@ -330,7 +330,7 @@ async function testMergeLivePriceOverridesDefaults(): Promise<void> {
 const tests: Array<[string, () => Promise<void>]> = [
 	["default pricing table covers deepseek-chat + reasoner + a general model", testDefaultTableShape],
 	["deepseek/deepseek-v4-flash is priced correctly (2026-08-01 incident regression)", testDeepseekV4FlashPriced],
-	["deepseek/deepseek-v4-flash-0731 (current default) is priced correctly", testDeepseekV4Flash0731Priced],
+	["deepseek/deepseek-v4-flash-0731 (prior default) is priced correctly", testDeepseekV4Flash0731Priced],
 	["muse-spark-1.3 (muse provider default) is priced at Meta list rates", testMuseSparkDefaultPriced],
 	["estimateCost math (per-1M input/output, mixed, zero defaults)", testEstimateCostMath],
 	["unknown model falls back to the conservative rate (never $0)", testModelFallback],
