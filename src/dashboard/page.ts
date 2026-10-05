@@ -1006,7 +1006,7 @@ function groupEvents(events) {
 // pause/resume, decisions) positioned on a real time axis. Inline vanilla-JS
 // twin of src/dashboard/timeline.ts (no build step — duplicated, not imported;
 // keep the two in sync). Pure HTML/CSS positioning — no charting library.
-const TL_READ = new Set(["read_file", "list_files", "outline", "go_to_definition", "find_references", "import_graph"]);
+const TL_READ = new Set(["read_file", "list_files", "outline", "go_to_definition", "find_references", "import_graph", "get_diagnostics", "type_at_position", "call_hierarchy", "workspace_symbol", "find_implementations"]);
 const TL_WRITE = new Set(["write_to_file", "apply_diff", "search_replace", "edit_file", "set_indentation"]);
 const TL_EXEC = new Set(["execute_command"]);
 const TL_SEARCH = new Set(["codebase_search"]);

@@ -41,6 +41,7 @@ import { getNativeTools } from "../vendor/zoo-code/src/core/prompts/tools/native
 import { getGroupName, getModeBySlug, modes, getToolsForMode } from "../vendor/zoo-code/src/shared/modes.js"
 import { TOOL_GROUPS } from "../vendor/zoo-code/src/shared/tools.js"
 import { customModesSettingsSchema } from "../vendor/zoo-code/types/index.js"
+import { batchTool } from "../tools/batch-tool.js"
 import { browserActionTool } from "../tools/browser/tool.js"
 import { describeImageTool } from "../vision/tool.js"
 import { runTestsTool } from "../tools/run-tests.js"
@@ -79,9 +80,11 @@ export interface BuiltPrompt {
  * The vendored tools the executor actually implements/registers. Used as the
  * final gate when filtering `getNativeTools()` in selectToolsForMode. Two
  * non-vendored tool sets are NOT in here because they never appear in
- * getNativeTools(): browser_action and the four code-intelligence tools
- * (outline / go_to_definition / find_references / import_graph) — callers
- * append those explicitly via appendBrowserActionTool / appendCodeIntelTools.
+ * getNativeTools(): browser_action and the nine code-intelligence tools
+ * (outline / go_to_definition / find_references / import_graph /
+ * get_diagnostics / type_at_position / call_hierarchy / workspace_symbol /
+ * find_implementations) — callers append those explicitly via
+ * appendBrowserActionTool / appendCodeIntelTools.
  */
 export const EXECUTABLE_TOOL_NAMES = new Set([
 	"read_file",
@@ -756,6 +759,21 @@ export function appendBrowserActionTool(tools: ChatTool[]): ChatTool[] {
 }
 
 /**
+ * Append the `batch` tool schema to a tool list if it isn't already
+ * present. `batch` is NEW work (see src/tools/batch.ts), so it never
+ * appears in getNativeTools() and selectToolsForMode() can't pick it up;
+ * callers append it explicitly. Safe for every mode: on a read-only
+ * executor the handler refuses edit sub-calls per-section (see
+ * refusalFor), so advertised-always matches executable-always.
+ */
+export function appendBatchTool(tools: ChatTool[]): ChatTool[] {
+	if (tools.some((t) => t.type === "function" && t.function.name === batchTool.function.name)) {
+		return tools
+	}
+	return [...tools, batchTool as unknown as ChatTool]
+}
+
+/**
  * Append the describe_image tool schema (cloud vision captioning — see
  * src/vision/) to a tool list if it isn't already present. Like
  * browser_action, it is a NEW tool with no vendored Zoo Code upstream, so
@@ -773,9 +791,11 @@ export function appendDescribeImageTool(tools: ChatTool[]): ChatTool[] {
 }
 
 /**
- * Append the four code-intelligence tool schemas (outline, go_to_definition,
- * find_references, import_graph) to a tool list if they aren't already
- * present. Like browser_action, these are NEW tools with no vendored Zoo Code
+ * Append the nine code-intelligence tool schemas (outline, go_to_definition,
+ * find_references, import_graph, get_diagnostics, type_at_position,
+ * call_hierarchy, workspace_symbol, find_implementations) to a tool list if
+ * they aren't already present. Like browser_action, these are NEW tools with
+ * no vendored Zoo Code
  * upstream (see src/codeintel/tools.ts), so selectToolsForMode can't pick
  * them up from getNativeTools(); callers that want the model to navigate
  * source code append them explicitly. Read-only, so they are appended for
@@ -795,7 +815,7 @@ export function appendCodeIntelTools(tools: ChatTool[]): ChatTool[] {
 /**
  * Append the EDIT-capable code-intelligence tool schema (`rename_symbol`) to
  * a tool list if it isn't already present. Unlike appendCodeIntelTools (the
- * four read-only tools, safe for every mode), rename_symbol WRITES files, so
+ * nine read-only tools, safe for every mode), rename_symbol WRITES files, so
  * callers must gate this on the executor actually registering it (the
  * headless executor does; the read-only reviewer/QA executors do not — see
  * src/tools/executor.ts) — otherwise a read-only session would advertise a

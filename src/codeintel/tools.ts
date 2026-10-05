@@ -1,5 +1,7 @@
 /**
- * OpenAI-format tool schemas for the four code-intelligence tools.
+ * OpenAI-format tool schemas for the original four code-intelligence tools
+ * (the five newer schemas live in their per-tool modules and are gathered
+ * into CODE_INTEL_TOOLS below).
  *
  * NEW design work, NOT a port: no code-intelligence tools exist in the
  * upstream Zoo Code sources this project vendors (the vendored
@@ -19,6 +21,12 @@
  */
 
 import type OpenAI from "openai"
+
+import { callHierarchyTool } from "./call-hierarchy.js"
+import { getDiagnosticsTool } from "./diagnostics.js"
+import { typeAtPositionTool } from "./hover.js"
+import { findImplementationsTool } from "./implementations.js"
+import { workspaceSymbolTool } from "./workspace-symbol.js"
 
 // ─── outline ─────────────────────────────────────────────────────────────────
 
@@ -260,6 +268,11 @@ export const CODE_INTEL_TOOLS: readonly OpenAI.Chat.ChatCompletionTool[] = [
 	goToDefinitionTool,
 	findReferencesTool,
 	importGraphTool,
+	getDiagnosticsTool,
+	typeAtPositionTool,
+	callHierarchyTool,
+	workspaceSymbolTool,
+	findImplementationsTool,
 ]
 
 export const CODE_INTEL_TOOL_NAMES: readonly string[] = [
@@ -267,6 +280,11 @@ export const CODE_INTEL_TOOL_NAMES: readonly string[] = [
 	goToDefinitionTool.function.name,
 	findReferencesTool.function.name,
 	importGraphTool.function.name,
+	getDiagnosticsTool.function.name,
+	typeAtPositionTool.function.name,
+	callHierarchyTool.function.name,
+	workspaceSymbolTool.function.name,
+	findImplementationsTool.function.name,
 ]
 
 /**

@@ -43,7 +43,12 @@ import { OllamaClient } from "../llm/ollama.js"
 import { OpenRouterClient } from "../llm/openrouter.js"
 import { MuseClient, providerDefaultModel, resolveLlmProvider } from "../llm/muse.js"
 import { envBoolean, resolvePerModeEnv } from "../cli.js"
-import { appendBrowserActionTool, appendCodeIntelTools, loadCustomModes } from "../engine/prompt.js"
+import {
+	appendBatchTool,
+	appendBrowserActionTool,
+	appendCodeIntelTools,
+	loadCustomModes,
+} from "../engine/prompt.js"
 import { createQaHeadlessExecutor } from "../tools/executor.js"
 import { getNativeTools } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/index.js"
 import { addCustomInstructions } from "../vendor/zoo-code/src/core/prompts/sections/custom-instructions.js"
@@ -66,7 +71,8 @@ const QA_TOOL_NAMES = new Set([
 
 /**
  * The QA-mode tool schemas (read-only + command, no write tools), plus
- * browser_action and the four code-intelligence tools — QA can boot the app,
+ * browser_action, batch, and the nine code-intelligence tools — QA can boot
+ * the app,
  * visually verify it in a headless browser (the phase4 gap "live
  * Playwright-MCP interactivity is not available headlessly" is partially
  * closed for agent-driven checks; see src/tools/browser/tool.ts), and
@@ -76,7 +82,7 @@ export function qaTools(): ChatTool[] {
 	const tools = getNativeTools().filter(
 		(t) => t.type === "function" && QA_TOOL_NAMES.has(t.function.name),
 	) as unknown as ChatTool[]
-	return appendCodeIntelTools(appendBrowserActionTool(tools))
+	return appendBatchTool(appendCodeIntelTools(appendBrowserActionTool(tools)))
 }
 
 /**

@@ -328,6 +328,12 @@ async function testOutsideRedirectRefusedBeforeSpawn(): Promise<void> {
 	const ws = await mkTmpWorkspace("hc-ec-redir-")
 	const outside = path.join(os.tmpdir(), `hc-ec-redir-outside-${process.pid}`)
 	await fs.rm(outside, { recursive: true, force: true })
+	// Fixed /tmp paths asserted absent below: pre-clean in case an
+	// interrupted earlier run left them behind (stale litter fails the
+	// "must not exist" assertions even when every refusal works).
+	await fs.rm(path.join(os.tmpdir(), "x.txt"), { force: true })
+	await fs.rm("/tmp/foo.md", { force: true })
+	await fs.rm("/tmp/err.log", { force: true })
 	const outsideTarget = path.join(outside, "foo.md")
 	const savedVar = process.env.HC_EC_TEST_OUTDIR
 	process.env.HC_EC_TEST_OUTDIR = os.tmpdir()

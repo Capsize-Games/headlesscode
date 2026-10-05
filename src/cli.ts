@@ -31,6 +31,7 @@ import { chownWorktreeWorkspace } from "./dashboard/session-launch.js"
 import { isLocalExploreEnabled } from "./engine/local-explore.js"
 import { Logger } from "./engine/logger.js"
 import {
+	appendBatchTool,
 	appendCodeIntelTools,
 	appendDescribeImageTool,
 	buildSystemPrompt,
@@ -1034,11 +1035,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 				customModes,
 			})
 			// Dry-run advertises the same non-vendored tools a real session
-			// appends (code-intelligence + describe_image; browser_action is
-			// deliberately omitted here — the loop appends it, but this
-			// listing is a prompt/config check, not a live session).
-			const tools = appendCodeIntelTools(
-				appendDescribeImageTool(selectToolsForMode(options.mode, customModes)),
+			// appends (code-intelligence + describe_image + batch;
+			// browser_action is deliberately omitted here — the loop
+			// appends it, but this listing is a prompt/config check, not a
+			// live session).
+			const tools = appendBatchTool(
+				appendCodeIntelTools(
+					appendDescribeImageTool(selectToolsForMode(options.mode, customModes)),
+				),
 			)
 			// Per-mode model assignment: dry-run resolves the model exactly
 			// like a real run (mode-models.json / _default / the provider's

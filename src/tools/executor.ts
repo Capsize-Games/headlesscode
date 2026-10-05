@@ -15,10 +15,11 @@
  *   - browser_action    { action, url?, selector?, text? } — Playwright-backed
  *     headless browser inspection (launch/screenshot/click/type/getConsoleLogs/
  *     getNetworkErrors/close); NEW work, no upstream port (see src/tools/browser/).
- *   - outline / go_to_definition / find_references / import_graph — the four
- *     code-intelligence tools (TS Compiler API backed, src/codeintel/): one
- *     cached ts.Program per workspace serves all four. NEW work, no upstream
- *     port (see src/codeintel/).
+ *   - outline / go_to_definition / find_references / import_graph /
+ *     get_diagnostics / type_at_position / call_hierarchy / workspace_symbol /
+ *     find_implementations — the nine code-intelligence tools (TS Compiler
+ *     API backed, src/codeintel/): one cached ts.Program per workspace serves
+ *     all nine. NEW work, no upstream port (see src/codeintel/).
  *
  * Every file operation resolves relative to the configured workspace root and
  * is rejected if it escapes the workspace — both lexically (`../` traversal)
@@ -87,6 +88,12 @@ import {
 	outlineHandler,
 	renameSymbolHandler,
 } from "../codeintel/handlers.js"
+import { batchHandler } from "./batch.js"
+import { callHierarchyHandler } from "../codeintel/call-hierarchy.js"
+import { getDiagnosticsHandler } from "../codeintel/diagnostics.js"
+import { typeAtPositionHandler } from "../codeintel/hover.js"
+import { findImplementationsHandler } from "../codeintel/implementations.js"
+import { workspaceSymbolHandler } from "../codeintel/workspace-symbol.js"
 import { runTestsHandler } from "./run-tests.js"
 
 import type { AuxLlmUsage, ToolContext, ToolHandler, ToolResult } from "../engine/types.js"
@@ -2609,10 +2616,16 @@ const IMPLEMENTED_TOOLS = new Set([
 	"codebase_search",
 	"browser_action",
 	"describe_image",
+	"batch",
 	"outline",
 	"go_to_definition",
 	"find_references",
 	"import_graph",
+	"get_diagnostics",
+	"type_at_position",
+	"call_hierarchy",
+	"workspace_symbol",
+	"find_implementations",
 	"update_todo_list",
 	// Recursive task decomposition: implemented by HeadlessSession itself
 	// (HeadlessSession.register registers handleNewTask on the executor —
@@ -2653,6 +2666,11 @@ function registerTypeScriptGatedTools(
 	executor.register("go_to_definition", goToDefinitionHandler)
 	executor.register("find_references", findReferencesHandler)
 	executor.register("import_graph", importGraphHandler)
+	executor.register("get_diagnostics", getDiagnosticsHandler)
+	executor.register("type_at_position", typeAtPositionHandler)
+	executor.register("call_hierarchy", callHierarchyHandler)
+	executor.register("workspace_symbol", workspaceSymbolHandler)
+	executor.register("find_implementations", findImplementationsHandler)
 	// rename_symbol EDITS files, so it is deliberately NOT registered on the
 	// read-only executors (reviewer/QA/local explore) — they must never be
 	// able to modify source, and their tool lists don't advertise it either
@@ -2685,6 +2703,7 @@ export function createHeadlessExecutor(workspaceRoot: string, options: ToolExecu
 	executor.register("codebase_search", codebaseSearchHandler)
 	executor.register("browser_action", browserActionHandler)
 	executor.register("describe_image", describeImageHandler)
+	executor.register("batch", (args, ctx) => batchHandler(executor, args, ctx))
 	registerTypeScriptGatedTools(executor, workspaceRoot, options)
 	executor.registerTodoList()
 
@@ -2724,7 +2743,8 @@ function createReadCommandExecutor(workspaceRoot: string, options: ToolExecutorO
 	executor.registerListFiles()
 	executor.register("execute_command", executeCommandHandler)
 	executor.register("browser_action", browserActionHandler)
-	// The four read-only code-intelligence tools (TS-only) follow the same
+	executor.register("batch", (args, ctx) => batchHandler(executor, args, ctx))
+	// The nine read-only code-intelligence tools (TS-only) follow the same
 	// language gate as the headless executor — a reviewer of a C++/Python
 	// workspace must not be handed ts.Program tools.
 	if (isTypeScriptWorkspace(workspaceRoot)) {
@@ -2732,6 +2752,11 @@ function createReadCommandExecutor(workspaceRoot: string, options: ToolExecutorO
 		executor.register("go_to_definition", goToDefinitionHandler)
 		executor.register("find_references", findReferencesHandler)
 		executor.register("import_graph", importGraphHandler)
+		executor.register("get_diagnostics", getDiagnosticsHandler)
+		executor.register("type_at_position", typeAtPositionHandler)
+		executor.register("call_hierarchy", callHierarchyHandler)
+		executor.register("workspace_symbol", workspaceSymbolHandler)
+		executor.register("find_implementations", findImplementationsHandler)
 	}
 
 	executor.register("attempt_completion", attemptCompletionHandler)
