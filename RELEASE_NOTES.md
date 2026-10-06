@@ -4,27 +4,50 @@ Released 2026-09-28.
 
 ## Recursive self-improvement
 
-- Added an OpenShell-backed RSI worker fleet with PostgreSQL job state,
-  resource admission, fenced leases, retries, and S3-compatible content-addressed
-  artifacts. Candidate mutation and visible evaluation run in separate guests
-  from sanitized snapshots.
-- Added bounded adaptive candidate allocation, fixture-validated curriculum
-  proposals with explicit promotion, adversarial review, and model-candidate
-  provenance.
-- Added a bounded QLoRA prototype with paired base/adapter evaluation. The
-  AirunnerDesktop Ollama-compatible worker can serve the local Qwen GGUF for
-  inference in RSI mutation. The GGUF is not supported as a QLoRA training
-  checkpoint; no live adapter training has been validated.
-- Documented local load-test results and the current limits: no live
-  multi-host qualification, trusted hidden evaluator, or signed evaluator
-  provenance.
+- Added a PostgreSQL-backed coordinator queue for RSI mutation, visible
+  evaluation, and model jobs. It persists worker registrations, admission
+  limits, idempotency keys, leases, retries, and results across restarts.
+  Lease tokens fence off stale workers, and artifact bytes are stored in a
+  shared S3-compatible, content-addressed store.
+- Added `headlesscode rsi-worker` for OpenShell execution. Workers run one guest
+  at a time; mutation and visible evaluation use separate guests and sanitized
+  snapshots. The RSI guest image omits RSI source, tests, and hidden evaluation
+  suites. Fitness, baseline comparison, archive updates, and candidate
+  selection remain in the coordinator. Hidden evaluation is disabled.
+- Added bounded adaptive search: evaluate an initial population, then allow at
+  most one evidence-driven follow-up candidate. Reports record the evidence,
+  allocation decision, and stop reason. Runtime, iteration, and queue
+  concurrency limits bound the work.
+- Added executable curriculum checks. A proposed task must pass its reference
+  fixtures, reject a known mutant, and produce matching output digests on two
+  clean-base OpenShell replays. Validation and promotion are separate;
+  operators promote accepted tasks explicitly.
+- Added an optional adversarial review role through configured Ollama or
+  OpenRouter providers. It records review and test provenance and runs bounded
+  generated checks in OpenShell guests. Failed or incomplete checks block a
+  candidate; review findings can apply a capped score penalty. This path has
+  controller tests but has not had a live provider-backed review run.
+- Added a QLoRA training prototype with a fixture-based smoke dataset and
+  paired base/adapter evaluation with model-candidate provenance.
+  AirunnerDesktop's Ollama-compatible LLM worker can serve the local Qwen GGUF
+  for inference during RSI mutation. GGUF is not a supported QLoRA training
+  checkpoint, and live adapter training has not been validated.
+- Recorded scale evidence and its limits: PostgreSQL/RustFS integration tests
+  exercised 12 simulated workers, 100 jobs, and a 20 MiB artifact; a local
+  queue load test drained 96 jobs at 215.2 jobs/s after four admission checks.
+  A bounded run observed two workers evaluating concurrently on one OpenShell
+  gateway using a temporary fixture. These results do not qualify a multi-host
+  or multi-gateway deployment or establish general RSI improvement.
+- Evaluator artifacts are content-addressed, but signed evaluator provenance
+  and a trusted hidden-evaluation service are not implemented.
 - Updated vulnerable transitive dependencies; `npm audit` reports zero
   vulnerabilities.
 
 ## Verification
 
 - `npm run typecheck`
-- `npm test`
+- `npm test` (163 test files passed; 8 optional PostgreSQL/S3 integration tests
+  require configured services)
 - `bash scripts/e2e/run.sh` (9 assertions passed)
 - `python3 -m unittest discover -s scripts/rsi-training -p 'test_*.py'`
 - OpenShell read-only checkpoint bind probe (read succeeded; write rejected by
