@@ -84,6 +84,9 @@ export class FileEvidenceCollector {
 		const storageDir = path.resolve(options.storageDir)
 		await fs.mkdir(storageDir, { recursive: true, mode: 0o700 })
 		await fs.chmod(storageDir, 0o700)
+		const sessionsDir = path.join(storageDir, "sessions")
+		await fs.mkdir(sessionsDir, { recursive: true, mode: 0o700 })
+		await fs.chmod(sessionsDir, 0o700)
 		if (Boolean(options.socketPath) === Boolean(options.http)) throw new Error("configure exactly one collector listener: Unix socket or HTTP(S)")
 		const lockPath = path.join(storageDir, ".collector.lock")
 		const lockHandle = await acquireStorageLock(lockPath)
@@ -253,6 +256,7 @@ export class FileEvidenceCollector {
 	}
 	private async loadCapabilities(): Promise<void> {
 		try {
+			await fs.chmod(this.capabilitiesPath(), 0o600)
 			const entries = JSON.parse(await fs.readFile(this.capabilitiesPath(), "utf8")) as Array<{sessionId:string;capabilityHash:string;active?:boolean;lastSequence:number;lastDigest:string|null;idempotency:Array<[string,{inputDigest:string;receipt:EvidenceReceipt}]>}>
 			for (const entry of entries) {
 				ensureSessionId(entry.sessionId)
@@ -262,6 +266,10 @@ export class FileEvidenceCollector {
 	}
 	private async loadSession(id: string): Promise<void> {
 		const state = this.sessions.get(id)!
+		await fs.chmod(this.recordsPath(id), 0o600).catch((error: NodeJS.ErrnoException) => {
+			if (error.code !== "ENOENT") throw error
+		})
+		await fs.chmod(this.headPath(id), 0o600)
 		const storedHead = JSON.parse(await fs.readFile(this.headPath(id), "utf8")) as SignedSessionHead
 		if (!verifySignedHead(storedHead, this.publicKey)) throw new Error(`stored evidence head signature is invalid for session ${id}`)
 		const recordsRaw = await fs.readFile(this.recordsPath(id), "utf8").catch((error: NodeJS.ErrnoException) => {

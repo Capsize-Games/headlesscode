@@ -24,6 +24,8 @@ async function testCollectorRestartIdempotencyAndPinnedVerification(): Promise<v
 	let collector = await FileEvidenceCollector.start(options)
 	const sessionId = "session-test"
 	const capability = await collector.authorizeSession(sessionId)
+	assert.equal((await fs.stat(path.join(storageDir, "ed25519-private.pem")).then((stat) => stat.mode & 0o777)), 0o600, "signing key is owner-only")
+	assert.equal((await fs.stat(path.join(storageDir, "sessions")).then((stat) => stat.mode & 0o777)), 0o700, "session storage is owner-only")
 	const pinnedKey = collector.publicKey
 	const client = new UnixEvidenceJournal({ socketPath, sessionId, capability, pinnedPublicKey: pinnedKey })
 	await assert.rejects(() => FileEvidenceCollector.start({ storageDir, socketPath: path.join(root, "s2") }), /locked/)
@@ -36,6 +38,7 @@ async function testCollectorRestartIdempotencyAndPinnedVerification(): Promise<v
 	const redacted = evidence(sessionId, "redaction-1", "human_intervention", { apiKey: "secret-value", text: "Authorization: Bearer abcdefghijklmnopqrstuvwxyz shh-secret" })
 	await client.append(redacted)
 	const countBeforeDuplicate = (await collector.exportBundle(sessionId)).records.length
+	assert.equal((await fs.stat(path.join(storageDir, "sessions", `${sessionId}.jsonl`)).then((stat) => stat.mode & 0o777)), 0o600, "record file is owner-only")
 	assert.deepEqual(await client.append(intent), originalReceipt, "a duplicate append returns the original receipt")
 	assert.equal((await collector.exportBundle(sessionId)).records.length, countBeforeDuplicate, "a duplicate append adds no record")
 	await assert.rejects(() => client.append(evidence(sessionId, "tool-1", "tool_intent", { tool: "write_to_file" })), /reused with different evidence/)
