@@ -96,11 +96,12 @@ export type VerificationActivity = "required-commands-passed" | "legacy-command-
 
 export function parseRequiredCommandIdentities(value = process.env.HEADLESSCODE_REQUIRED_VERIFICATION_COMMANDS_SHA256): string[] | undefined {
 	if (value === undefined || value.trim() === "") return undefined
-	const identities = value.split(",").map((item) => item.trim().toLowerCase())
+	const identities = value.split(",").map((item) => item.trim())
 	if (identities.some((identity) => !/^[a-f0-9]{64}$/.test(identity))) {
 		throw new Error("HEADLESSCODE_REQUIRED_VERIFICATION_COMMANDS_SHA256 must be a comma-separated list of SHA-256 command identities")
 	}
-	return [...new Set(identities)]
+	if (new Set(identities).size !== identities.length) throw new Error("required verification command identities must be unique")
+	return identities
 }
 
 export function commandIdentity(command: string): string {
@@ -112,6 +113,9 @@ export function assessVerificationActivity(
 	reportPath: string | undefined,
 	requiredCommandIdentities = parseRequiredCommandIdentities(),
 ): VerificationActivity {
+	if (requiredCommandIdentities !== undefined && (requiredCommandIdentities.some((identity) => !/^[a-f0-9]{64}$/.test(identity)) || new Set(requiredCommandIdentities).size !== requiredCommandIdentities.length)) {
+		throw new Error("required command identities must be unique lowercase SHA-256 digests")
+	}
 	if (!reportPath) {
 		return "unverified"
 	}
@@ -123,8 +127,10 @@ export function assessVerificationActivity(
 	} catch {
 		return "unverified"
 	}
-	const calls = new Map<string, { commandIdentity: string; order: number }>()
+	const calls = new Map<string, { commandIdentity: string; order: number; count: number }>()
 	const results: Array<{ callId: string; commandIdentity: string; successful: boolean; order: number }> = []
+	const legacySuccessfulResults = new Set<string>()
+	let malformedCorrelation = false
 	let order = 0
 	for (const line of raw.split("\n")) {
 		const trimmed = line.trim()
@@ -138,24 +144,44 @@ export function assessVerificationActivity(
 			continue
 		}
 		order++
-		if (record.tool !== "execute_command" || typeof record.callId !== "string" || !/^[a-f0-9]{64}$/.test(String(record.commandIdentity))) continue
+		if (record.tool !== "execute_command") continue
+		if (record.type === "tool_result" && record.isError === false) legacySuccessfulResults.add(typeof record.commandIdentity === "string" ? record.commandIdentity : `legacy:${order}`)
+		if (!/^[a-f0-9]{64}$/.test(String(record.commandIdentity))) {
+			if (requiredCommandIdentities !== undefined && (record.type === "tool_call" || record.type === "tool_result")) malformedCorrelation = true
+			continue
+		}
+		if (typeof record.callId !== "string" || !record.callId) {
+			if (requiredCommandIdentities !== undefined && (record.type === "tool_call" || record.type === "tool_result")) malformedCorrelation = true
+			continue
+		}
 		if (record.type === "tool_call") {
-			if (!calls.has(record.callId)) calls.set(record.callId, { commandIdentity: String(record.commandIdentity), order })
+			const previous = calls.get(record.callId)
+			if (previous) {
+				previous.count++
+				malformedCorrelation = true
+			} else calls.set(record.callId, { commandIdentity: String(record.commandIdentity), order, count: 1 })
 		} else if (record.type === "tool_result") {
 			results.push({ callId: record.callId, commandIdentity: String(record.commandIdentity), successful: record.isError === false, order })
 		}
 	}
 	const passed = new Set<string>()
+	const resultIds = new Set<string>()
 	for (const result of results) {
 		const call = calls.get(result.callId)
-		if (call && call.order < result.order && call.commandIdentity === result.commandIdentity && result.successful) passed.add(result.commandIdentity)
+		if (resultIds.has(result.callId)) malformedCorrelation = true
+		resultIds.add(result.callId)
+		if (!call || call.count !== 1 || call.order >= result.order || call.commandIdentity !== result.commandIdentity) {
+			if (requiredCommandIdentities?.includes(result.commandIdentity) || (call && requiredCommandIdentities?.includes(call.commandIdentity))) malformedCorrelation = true
+			continue
+		}
+		if (result.successful) passed.add(result.commandIdentity)
 	}
 	if (requiredCommandIdentities !== undefined) {
-		return requiredCommandIdentities.length > 0 && requiredCommandIdentities.every((identity) => passed.has(identity))
+		return !malformedCorrelation && requiredCommandIdentities.length > 0 && requiredCommandIdentities.every((identity) => passed.has(identity))
 			? "required-commands-passed"
 			: "unverified"
 	}
-	return passed.size > 0 ? "legacy-command-activity-only" : "unverified"
+	return passed.size > 0 || legacySuccessfulResults.size > 0 ? "legacy-command-activity-only" : "unverified"
 }
 
 /** Compatibility gate; callers should use assessVerificationActivity when the evidence mode matters. */
