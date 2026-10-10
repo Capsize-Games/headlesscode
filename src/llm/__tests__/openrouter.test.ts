@@ -125,6 +125,25 @@ async function testMalformedGenerationBillingIsNotReportedAsAuthoritative(): Pro
 	} finally { restore() }
 }
 
+async function testGenerationMetadataRetriesAfterDelayedVisibility(): Promise<void> {
+	const client = new OpenRouterClient({ apiKey: "k", baseUrl: "http://mock" })
+	const originalFetch = globalThis.fetch
+	let lookups = 0
+	globalThis.fetch = (async () => {
+		lookups++
+		if (lookups === 1) return new Response("not available yet", { status: 404 })
+		return new Response(JSON.stringify({ data: { id: "gen-delayed", model: "meta/muse-spark-1.3-contributor-20260902", provider_name: "Meta", total_cost: 0.0002858 } }), { status: 200 })
+	}) as typeof fetch
+	try {
+		const started = Date.now()
+		const metadata = await client.fetchGenerationMetadata("gen-delayed", AbortSignal.timeout(10_000))
+		assert.equal(lookups, 2, "the delayed generation record is retried")
+		assert.ok(Date.now() - started >= 900, "the retry waits for the first 1-second backoff before requesting again")
+		assert.equal(metadata?.model, "meta/muse-spark-1.3-contributor-20260902")
+		assert.equal(metadata?.totalCostUsd, 0.0002858)
+	} finally { globalThis.fetch = originalFetch }
+}
+
 async function testMalformedUsageCountsCannotCreateCacheDiscount(): Promise<void> {
 	const client = new OpenRouterClient({ apiKey: "k", baseUrl: "http://mock" })
 	for (const invalidCachedCount of ["-1", "1.5", "101", "1e999"]) {
@@ -725,6 +744,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["Muse qualification pins to Meta with fallbacks disabled", testMuseQualificationPinsOnlyMetaWithoutFallback],
 	["OpenRouter response usage and generation billing metadata are preserved", testOpenRouterUsageCostAndGenerationMetadataAreMapped],
 	["malformed generation cost evidence is omitted", testMalformedGenerationBillingIsNotReportedAsAuthoritative],
+	["generation metadata retries after delayed visibility", testGenerationMetadataRetriesAfterDelayedVisibility],
 	["malformed usage counts cannot create cache discounts", testMalformedUsageCountsCannotCreateCacheDiscount],
 	["deepseek/* requests include include_reasoning (load-bearing)", testDeepseekRequestIncludesReasoning],
 	["non-deepseek requests do not include include_reasoning", testNonDeepseekRequestsDoNotIncludeReasoning],

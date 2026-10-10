@@ -14,6 +14,10 @@ export const MUSE_AUDIT_MAX_OUTPUT_TOKENS = 32
 export const MUSE_AUDIT_CALL_TIMEOUT_MS = 25_000
 export const MUSE_AUDIT_TOTAL_TIMEOUT_MS = 120_000
 export const MUSE_AUDIT_SPEND_CAP_USD = 0.02
+export const MUSE_ADMITTED_MODEL_IDS = Object.freeze([
+	MUSE_CACHE_MODEL,
+	"meta/muse-spark-1.3-contributor-20260902",
+] as const)
 
 const PREFIX_ROWS = 150
 const MAX_PREFIX_CHARS = 18_000
@@ -61,8 +65,10 @@ interface SafeCallRecord {
 	ordinal: number
 	status: "ok" | "error"
 	requestedModel: string
-	returnedModel: string | null
-	providerName: string | null
+	responseModel: string | null
+	responseProviderName: string | null
+	generationModel: string | null
+	generationProviderName: string | null
 	generationId: string | null
 	latencyMs?: number
 	promptTokens?: number
@@ -73,6 +79,10 @@ interface SafeCallRecord {
 	openRouterReportedCostUsd?: number
 	billingEvidence?: OpenRouterGenerationMetadata | { status: "unavailable" }
 	errorCode?: string
+}
+
+function isAdmittedMuseModel(model: string | null | undefined): boolean {
+	return model !== undefined && model !== null && (MUSE_ADMITTED_MODEL_IDS as readonly string[]).includes(model)
 }
 
 export interface MuseAuditSummary {
@@ -177,8 +187,10 @@ export async function runMuseCacheQualification(
 				ordinal: call.ordinal,
 				status: "ok",
 				requestedModel: MUSE_CACHE_MODEL,
-				returnedModel: billing?.model ?? response.returnedModel ?? null,
-				providerName: billing?.providerName ?? response.providerName ?? null,
+				responseModel: response.returnedModel ?? null,
+				responseProviderName: response.providerName ?? null,
+				generationModel: billing?.model ?? null,
+				generationProviderName: billing?.providerName ?? null,
 				generationId: generationId ?? null,
 				latencyMs: Date.now() - startedAt,
 				...(response.usage?.promptTokens !== undefined ? { promptTokens: response.usage.promptTokens } : {}),
@@ -190,7 +202,8 @@ export async function runMuseCacheQualification(
 				billingEvidence: billing ?? { status: "unavailable" },
 			})
 			if (billing?.totalCostUsd === undefined || !Number.isFinite(billing.totalCostUsd) || billing.totalCostUsd < 0) break
-			if (billing?.model !== MUSE_CACHE_MODEL || billing.providerName?.toLowerCase() !== "meta") break
+			if (!isAdmittedMuseModel(response.returnedModel) || !isAdmittedMuseModel(billing.model)
+				|| response.providerName?.toLowerCase() !== "meta" || billing.providerName?.toLowerCase() !== "meta") break
 			const observedBilledCost = records.reduce((sum, record) => {
 				const evidence = record.billingEvidence
 				return sum + (evidence && "totalCostUsd" in evidence && typeof evidence.totalCostUsd === "number" ? evidence.totalCostUsd : 0)
@@ -201,7 +214,7 @@ export async function runMuseCacheQualification(
 			const status = error instanceof Error && "status" in error && typeof (error as { status?: unknown }).status === "number"
 				? `http-${(error as { status: number }).status}`
 				: error instanceof Error && error.name === "TimeoutError" ? "timeout" : "request-failed"
-			records.push({ ordinal: call.ordinal, status: "error", requestedModel: MUSE_CACHE_MODEL, returnedModel: null, providerName: null, generationId: null, latencyMs: Date.now() - startedAt, errorCode: status })
+			records.push({ ordinal: call.ordinal, status: "error", requestedModel: MUSE_CACHE_MODEL, responseModel: null, responseProviderName: null, generationModel: null, generationProviderName: null, generationId: null, latencyMs: Date.now() - startedAt, errorCode: status })
 			break // A failed transport may still have incurred a charge; stop at once.
 		}
 	}
@@ -215,7 +228,10 @@ export async function runMuseCacheQualification(
 	if (observedCost > MUSE_AUDIT_SPEND_CAP_USD) failures.push("authoritative generation cost crossed the $0.02 spend cap; further requests were stopped")
 	if (records.some((record) => record.status === "ok" && !("totalCostUsd" in (record.billingEvidence ?? {})))) failures.push("an authoritative generation total_cost is missing")
 	if (records.some((record) => record.status === "ok" && record.billingEvidence && "totalCostUsd" in record.billingEvidence && !Number.isFinite(record.billingEvidence.totalCostUsd))) failures.push("generation total_cost is malformed")
-	if (records.some((record) => record.status === "ok" && (record.returnedModel !== MUSE_CACHE_MODEL || record.providerName?.toLowerCase() !== "meta"))) failures.push("the returned model/provider was not the admitted Muse/Meta endpoint")
+	if (records.some((record) => record.status === "ok" && !isAdmittedMuseModel(record.responseModel))) failures.push("the response model was missing or was not an admitted Muse model")
+	if (records.some((record) => record.status === "ok" && !isAdmittedMuseModel(record.generationModel))) failures.push("the generation-record model was missing or was not an admitted Muse model")
+	if (records.some((record) => record.status === "ok" && record.responseProviderName?.toLowerCase() !== "meta")) failures.push("the response provider was missing or was not Meta")
+	if (records.some((record) => record.status === "ok" && record.generationProviderName?.toLowerCase() !== "meta")) failures.push("the generation-record provider was missing or was not Meta")
 	if (!records.some((record) => record.ordinal > 1 && (record.cachedTokens ?? 0) > 0)) failures.push("no later request reported cached prompt tokens")
 	const billedCosts = records.map((record) => record.billingEvidence && "totalCostUsd" in record.billingEvidence ? record.billingEvidence.totalCostUsd : undefined)
 	const discounts = records.map((record) => record.billingEvidence && "cacheDiscountUsd" in record.billingEvidence ? record.billingEvidence.cacheDiscountUsd : undefined)

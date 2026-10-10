@@ -413,21 +413,26 @@ export class OpenRouterClient implements LlmClient {
 	async fetchGenerationMetadata(generationId: string, signal?: AbortSignal): Promise<OpenRouterGenerationMetadata | undefined> {
 		if (!this.apiKey || !/^gen-[0-9A-Za-z-]{1,124}$/.test(generationId)) return undefined
 		let response: Response | undefined
-		for (const [attempt, delayMs] of [0, 250, 500].entries()) {
+		// Allow the generation record time to become visible. Delays are before
+		// each retry, and the caller's total-run deadline bounds the sequence.
+		for (const delayBeforeAttemptMs of [0, 1_000, 2_000, 4_000, 8_000]) {
 			if (signal?.aborted) return undefined
+			if (delayBeforeAttemptMs > 0) {
+				try { await abortableDelay(delayBeforeAttemptMs, signal) } catch { return undefined }
+			}
+			const requestSignal = signal
+				? AbortSignal.any([signal, AbortSignal.timeout(15_000)])
+				: AbortSignal.timeout(15_000)
 			try {
 				const res = await fetch(`${this.baseUrl}/api/v1/generation?id=${encodeURIComponent(generationId)}`, {
 					method: "GET",
 					headers: this.authHeaders(),
-					signal,
+					signal: requestSignal,
 				})
 				if (res.ok) { response = res; break }
 				if (!(res.status === 404 || res.status === 429 || res.status >= 500)) return undefined
 			} catch {
 				if (signal?.aborted) return undefined
-			}
-			if (attempt < 2 && delayMs > 0) {
-				try { await abortableDelay(delayMs, signal) } catch { return undefined }
 			}
 		}
 		if (!response) return undefined
