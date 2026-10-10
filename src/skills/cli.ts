@@ -25,17 +25,37 @@ export interface SkillsCliIO {
 	stderr?: (text: string) => void
 }
 
-function sanitizeTerminalText(text: string): string {
-	return text.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ")
+function stripTerminalControls(text: string, preserveLayout: boolean): string {
+	const withoutAnsi = text
+		.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+		.replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "")
+		.replace(/\u009b[0-?]*[ -/]*[@-~]/g, "")
+		.replace(/\u009d[^\u0007]*\u0007/g, "")
+	const controls = preserveLayout
+		? /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g
+		: /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g
+	return withoutAnsi.replace(/\r\n?/g, "\n").replace(controls, " ")
+}
+
+function safeField(text: string): string {
+	return stripTerminalControls(text, false)
+}
+
+function safeInstructions(text: string): string {
+	return stripTerminalControls(text, true)
 }
 
 function output(io: SkillsCliIO, text: string): void {
-	(io.stdout ?? ((value) => process.stdout.write(value)))(sanitizeTerminalText(text))
+	(io.stdout ?? ((value) => process.stdout.write(value)))(text)
 }
 
 function errorOutput(io: SkillsCliIO, text: string): void {
-	(io.stderr ?? ((value) => process.stderr.write(value)))(sanitizeTerminalText(text))
+	(io.stderr ?? ((value) => process.stderr.write(value)))(stripTerminalControls(text, true))
 }
+
+const SKILLS_USAGE =
+	"usage: headlesscode skills <command>\n" +
+	"commands: list, inspect <name>, validate [<local-path>], enable <skill-root>, import <local-skill-directory>\n"
 
 interface InspectedSkill {
 	dir: string
@@ -91,7 +111,7 @@ async function inspectInput(inputPath: string): Promise<{ skills: InspectedSkill
 async function importSkills(inputPath: string): Promise<{ names: string[]; warnings: SkillProblem[] }> {
 	const inspected = await inspectInput(inputPath)
 	const failures = inspected.problems.filter((problem) => !problem.message.includes("optional resource excluded"))
-	if (failures.length > 0) throw new Error(failures.map((problem) => `${problem.path}: ${problem.message}`).join("\n"))
+	if (failures.length > 0) throw new Error(failures.map((problem) => `${safeField(problem.path)}: ${safeField(problem.message)}`).join("\n"))
 	const incoming = inspected.skills
 	if (incoming.length === 0) throw new Error("no valid SKILL.md manifests found")
 	const destinationRoot = path.join(projectStoreRoot(), "skills")
@@ -149,24 +169,28 @@ export async function runSkillsCli(argv: string[], io: SkillsCliIO = {}): Promis
 	try {
 		if (command === "enable") {
 			const root = args[0]
-			if (!root) throw new Error("usage: headlesscode skills enable <skill-root>")
+			if (!root) throw new Error(`${SKILLS_USAGE}example: headlesscode skills enable .agents/skills`)
 			const roots = await enableSkillRoot(path.resolve(workspaceRoot, root))
-			output(io, `Enabled skill root: ${path.resolve(workspaceRoot, root)}\n${roots.length} root(s) enabled.\n`)
+			output(io, `Enabled skill root: ${safeField(path.resolve(workspaceRoot, root))}\n${roots.length} root(s) enabled.\n`)
 			return 0
 		}
 		if (command === "import") {
 			const source = args[0]
-			if (!source) throw new Error("usage: headlesscode skills import <local-skill-directory>")
+			if (!source) throw new Error(`${SKILLS_USAGE}example: headlesscode skills import ./my-skill`)
 			const imported = await importSkills(path.resolve(workspaceRoot, source))
-			for (const warning of imported.warnings) errorOutput(io, `warning: ${warning.path}: ${warning.message}\n`)
-			output(io, `Imported: ${imported.names.join(", ")}\n`)
+			for (const warning of imported.warnings) errorOutput(io, `warning: ${safeField(warning.path)}: ${safeField(warning.message)}\n`)
+			output(io, `Imported: ${imported.names.map(safeField).join(", ")}\n`)
+			return 0
+		}
+		if (!command || command === "help" || command === "--help" || command === "-h") {
+			output(io, SKILLS_USAGE)
 			return 0
 		}
 		let enabledRoots: string[] = []
 		try {
 			enabledRoots = await readEnabledSkillRoots()
 		} catch (error) {
-			errorOutput(io, `warning: enabled roots ignored: ${error instanceof Error ? error.message : String(error)}\n`)
+			errorOutput(io, `warning: enabled roots ignored: ${safeField(error instanceof Error ? error.message : String(error))}\n`)
 		}
 		const registry = await discoverSkills(workspaceRoot, {
 			enabledRoots,
@@ -174,32 +198,32 @@ export async function runSkillsCli(argv: string[], io: SkillsCliIO = {}): Promis
 			userRoot: io.userRoot,
 		})
 		if (command === "list") {
-			for (const skill of registry.skills) output(io, `${skill.name}\t${skill.description}\t${skill.source}\n`)
-			for (const problem of registry.problems) errorOutput(io, `warning: ${problem.path}: ${problem.message}\n`)
+			for (const skill of registry.skills) output(io, `${safeField(skill.name)}\t${safeField(skill.description)}\t${safeField(skill.source)}\n`)
+			for (const problem of registry.problems) errorOutput(io, `warning: ${safeField(problem.path)}: ${safeField(problem.message)}\n`)
 			return 0
 		}
 		if (command === "inspect") {
 			const name = args[0]
-			if (!name) throw new Error("usage: headlesscode skills inspect <name>")
+			if (!name) throw new Error(`${SKILLS_USAGE}example: headlesscode skills inspect code-review`)
 			const skill = registry.get(name)
-			if (!skill) throw new Error(`skill '${name}' was not found`)
-			output(io, `name: ${skill.name}\ndescription: ${skill.description}\nsource: ${skill.source}\npath: ${skill.path}\nsha256: ${skill.digest}\n\n${skill.instructions}\n`)
+			if (!skill) throw new Error(`skill '${safeField(name)}' was not found`)
+			output(io, `name: ${safeField(skill.name)}\ndescription: ${safeField(skill.description)}\nsource: ${safeField(skill.source)}\npath: ${safeField(skill.path)}\nsha256: ${skill.digest}\n\n${safeInstructions(skill.instructions)}\n`)
 			return 0
 		}
 		if (command === "validate") {
 			if (args[0]) {
 				const inspected = await inspectInput(path.resolve(workspaceRoot, args[0]))
-				for (const skill of inspected.skills) output(io, `valid\t${skill.name}\t${skill.dir}\n`)
-				for (const problem of inspected.problems) errorOutput(io, `${problem.message.includes("optional resource excluded") ? "warning" : "invalid"}: ${problem.path}: ${problem.message}\n`)
+				for (const skill of inspected.skills) output(io, `valid\t${safeField(skill.name)}\t${safeField(skill.dir)}\n`)
+				for (const problem of inspected.problems) errorOutput(io, `${problem.message.includes("optional resource excluded") ? "warning" : "invalid"}: ${safeField(problem.path)}: ${safeField(problem.message)}\n`)
 				if (inspected.skills.length === 0 && inspected.problems.length === 0) output(io, "No skills found.\n")
 				return inspected.problems.some((problem) => !problem.message.includes("optional resource excluded")) ? 1 : 0
 			}
-			for (const skill of registry.skills) output(io, `valid\t${skill.name}\t${skill.path}\n`)
-			for (const problem of registry.problems) errorOutput(io, `invalid: ${problem.path}: ${problem.message}\n`)
+			for (const skill of registry.skills) output(io, `valid\t${safeField(skill.name)}\t${safeField(skill.path)}\n`)
+			for (const problem of registry.problems) errorOutput(io, `invalid: ${safeField(problem.path)}: ${safeField(problem.message)}\n`)
 			if (registry.skills.length === 0 && registry.problems.length === 0) output(io, "No skills found.\n")
 			return registry.problems.length ? 1 : 0
 		}
-		throw new Error("usage: headlesscode skills list|inspect|validate|enable|import")
+		throw new Error(SKILLS_USAGE)
 	} catch (error) {
 		errorOutput(io, `skills: ${error instanceof Error ? error.message : String(error)}\n`)
 		return 1
