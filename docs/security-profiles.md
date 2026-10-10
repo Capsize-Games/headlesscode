@@ -32,7 +32,26 @@ externalControls: { emergencyStop: required, emergencyControllerIdentity: operat
 
 The profile policy must explicitly set `filesystem_policy.include_workdir: false`, `landlock.compatibility: hard_requirement`, and non-root `process.run_as_user` and `process.run_as_group`. Its writable paths are limited to `/tmp`, `/dev/null`, `/workspace`, `/result`, `/opt/headlesscode-data/checkpoints`, and the configured evidence socket target. It must expose the pinned evidence key and supervisor-created runtime config read-only. Worker network policy contains only the configured inference endpoint with `enforcement: enforce`; evaluation policy contains no endpoints. Unknown writable paths, wildcards, symlinked or overlapping control paths, mutable profile digests, and mismatched runtime identity fail closed.
 
-Before sandbox creation, HeadlessCode verifies the OpenShell CLI version and healthy gateway identity, then snapshots the exact reviewed policy bytes in private scratch storage. It passes a serialized resolved profile to the worker dispatcher; the dispatcher validates that immutable snapshot rather than reading the operator profile again. After creation it inspects the sandbox image and loaded effective policy before starting the task. The supervisor supplies the active emergency controller and per-session evidence capability as runtime objects. Contained launch checks the controller's actual identity and running state; profile declarations alone do not establish that external controls are active. Secrets are not copied into the task prompt or process environment.
+Before sandbox creation, HeadlessCode verifies the OpenShell CLI version and healthy gateway identity, then snapshots the exact reviewed policy bytes in private scratch storage. It passes a serialized resolved profile to the worker dispatcher; the dispatcher validates that immutable snapshot rather than reading the operator profile again. After creation it inspects the sandbox image and loaded effective policy before starting the task. Each worker host process starts an emergency controller with the reviewed identity and a separate control-state directory, then supplies its per-session evidence capability as a read-only runtime file. Contained launch checks the controller's actual identity and running state; profile declarations alone do not establish that external controls are active. Collector signing keys and storage paths remain on the host. The scoped append capability is available to the guest only through the read-only runtime file.
+
+## Provisioning supervisor services
+
+Start the external collector before contained work. Use one unique session ID per worker and keep its storage, config directory, socket parent, control-state directory, and control-socket directory outside all repositories and OpenShell scratch data:
+
+```sh
+headlesscode evidence serve-contained \
+  --storage-dir "$HOME/.local/share/headlesscode/evidence" \
+  --socket "$HOME/.local/run/headlesscode-evidence.sock" \
+  --config-dir "$HOME/.local/share/headlesscode/evidence-runtime" \
+  --session round-20261010-w1 \
+  --session round-20261010-w2
+```
+
+The command remains running as the collector supervisor. It creates owner-only signing-key storage and one read-only runtime config file per session. The config holds only that session's append capability, socket path, public key, and required-evidence setting. On orderly SIGINT or SIGTERM, the service revokes the sessions and removes those config files. Configure `HEADLESSCODE_CONTAINED_EVIDENCE_CONFIG_DIR` to the config directory, `HEADLESSCODE_CONTROL_STATE_DIR` to a separate private directory, and `HEADLESSCODE_CONTROL_SOCKET_DIR` to a separate socket directory. The socket-directory setting accepts `{session}` as a per-session path component when the operating system's Unix socket path limit requires a shorter directory.
+
+Use the generated `ed25519-public.pem` as the profile's `evidence.publicKeyPath` and its `sha256:<fingerprint>` as `evidence.publicKeyFingerprint`. The profile's `evidence.socketPath` must be the same socket passed to `serve-contained`. Start a direct task with `--security-profile contained --session-id <provisioned-id>`; the ID must match its runtime config filename. For orchestrated rounds, set `HEADLESSCODE_CONTAINED_SESSION_PREFIX` to a unique round prefix and provision `<prefix>-<worktree-name>` for each worker. The orchestrator checks every named runtime config before spawning workers. Missing, reused, or mismatched configs stop launch before OpenShell starts.
+
+Pause or stop a worker with `headlesscode control <emergencyControllerIdentity> pause --session <id> --reason "..."` or the corresponding `stop` action. After a pause, the original session's captured abort signal stays aborted. Start a fresh worker only after an operator explicitly runs `headlesscode control <emergencyControllerIdentity> resume --session <id>`; a new control session then receives a fresh signal. `headlesscode evidence verify <bundle.json> <pinned-key.json> <pinned-head.json>` runs offline evidence verification.
 
 ## Limits
 

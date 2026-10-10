@@ -34,6 +34,7 @@ import { Logger } from "../engine/logger.js"
 import { watchIssues, type SweepResult } from "./watch.js"
 import { openshellPreflight } from "../cloud/openshell-preflight.js"
 import { resolveContainedRuntimeProfile, resolveSecurityProfile, serializeResolvedContainedProfile, type SecurityProfileName } from "../security/profile.js"
+import { validateContainedSupervisorRoots } from "../security/supervisor.js"
 
 const WATCH_USAGE = `headlesscode watch — Phase 5 GitHub issue watcher
 
@@ -331,6 +332,7 @@ export async function watchMain(argv: string[]): Promise<number> {
 	if (!options.dryRun && options.securityProfile === "contained") {
 		try {
 			const resolved = resolveContainedRuntimeProfile({ repoRoot, purpose: "worker" })
+			validateContainedSupervisorRoots(resolved, repoRoot)
 			process.env.HEADLESSCODE_SECURITY_PROFILE = "contained"
 			process.env.HEADLESSCODE_OPENSHELL_POLICY = resolved.policySnapshotPath
 			process.env.HEADLESSCODE_OPENSHELL_IMAGE = resolved.image

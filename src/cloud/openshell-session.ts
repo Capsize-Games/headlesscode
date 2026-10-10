@@ -75,12 +75,14 @@ export async function openShellSessionMain(argv: string[], options: { containedP
 			"--task-file", path.join(worktree, "ORCHESTRATOR_TASK.md"),
 			"--workspace", worktree,
 			"--mode", parsed.mode ?? "code",
+			...(options.containedProfile ? ["--session-id", name] : []),
 			...(parsed.model ? ["--model", parsed.model] : []),
 		]
 		const command = `cd ${quote(OPENSHELL_HARNESS_ROOT)} && timeout --signal=TERM --kill-after=10s ${Math.ceil((parsed.timeoutMs ?? 1_800_000) / 1000)}s ./node_modules/.bin/tsx src/cli.ts ${cliArgs.map(quote).join(" ")}`
 		const result = await runOpenShellWorktreeCommand(repo, worktree, command, {
 			...(parsed.model ? { OPENROUTER_MODEL: parsed.model } : {}),
 			ORCHESTRATOR_MODE: parsed.mode ?? "code",
+			...(options.containedProfile ? { HEADLESSCODE_CONTAINED_SESSION_ID: name } : {}),
 		}, {
 			image: options.containedProfile?.image ?? parsed.image,
 			policy,

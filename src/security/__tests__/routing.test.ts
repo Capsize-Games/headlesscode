@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { parseArgs as parseCliArgs } from "../../cli.js"
+import { main, parseArgs as parseCliArgs } from "../../cli.js"
 import { parseOrchestrateArgs } from "../../orchestrator/cli.js"
 import { parseWatchArgs } from "../../watcher/cli.js"
 
@@ -24,6 +24,14 @@ try {
 } finally {
 	if (prior === undefined) delete process.env.HEADLESSCODE_SECURITY_PROFILE
 	else process.env.HEADLESSCODE_SECURITY_PROFILE = prior
+}
+
+const originalConsoleError = console.error
+console.error = () => undefined
+try {
+	assert.equal(await main(["evidence", "verify", "missing-bundle.json", "missing-key.json", "missing-head.json"]), 1, "the public evidence subcommand routes to verification and reports missing files")
+} finally {
+	console.error = originalConsoleError
 }
 
 console.log("Security profile CLI routing tests passed")

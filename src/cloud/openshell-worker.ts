@@ -6,6 +6,7 @@ import { OPENSHELL_HARNESS_ROOT, OpenShellSessionProvider } from "./openshell-pr
 import type { OpenShellSessionProviderOptions } from "./openshell-provider.js"
 import type { CloudSessionRequest, CommandResult } from "./provider.js"
 import { loadResolvedContainedProfile } from "../security/profile.js"
+import { containedEvidenceSessionId, startContainedSupervisor } from "../security/supervisor.js"
 
 const FORWARDED_ENV = [
 	"OPENROUTER_MODEL", "OPENROUTER_BASE_URL", "HEADLESSCODE_PROJECT", "HEADLESSCODE_MEMORY_DIR",
@@ -65,13 +66,22 @@ export async function runOpenShellWorktreeCommand(
 	const worktreePath = path.resolve(worktree)
 	const repoPath = path.resolve(repo)
 	const name = path.basename(worktreePath)
-	const memoryDir = env.HEADLESSCODE_MEMORY_DIR ?? process.env.HEADLESSCODE_MEMORY_DIR
+	const runtimeSessionId = containedProfile ? containedEvidenceSessionId(name, env.HEADLESSCODE_CONTAINED_SESSION_PREFIX ?? process.env.HEADLESSCODE_CONTAINED_SESSION_PREFIX, env.HEADLESSCODE_CONTAINED_SESSION_ID) : undefined
+	const memoryDir = containedProfile ? undefined : env.HEADLESSCODE_MEMORY_DIR ?? process.env.HEADLESSCODE_MEMORY_DIR
 	const memoryPath = memoryDir ? path.resolve(memoryDir) : undefined
 	if (memoryPath) fs.mkdirSync(memoryPath, { recursive: true })
+	const containedSupervisor = containedProfile && runtimeSessionId ? await startContainedSupervisor({ profile: containedProfile, sessionId: runtimeSessionId, repoRoot: repoPath, workspaceRoot: worktreePath }) : undefined
+	try {
 	const provider = new OpenShellSessionProvider({
 		...providerOptions,
 		...(containedProfile ? {
 			containedProfile,
+			...(containedSupervisor ? { evidenceRuntimeConfig: {
+				sessionId: containedSupervisor.evidenceConnection.sessionId,
+				capability: containedSupervisor.evidenceConnection.capability,
+				pinnedPublicKey: containedSupervisor.evidenceConnection.pinnedPublicKey,
+			} } : {}),
+			...(containedSupervisor ? { emergencyControl: containedSupervisor.control } : {}),
 			image: containedProfile.image,
 			cpu: containedProfile.cpu,
 			memory: containedProfile.memory,
@@ -98,6 +108,9 @@ export async function runOpenShellWorktreeCommand(
 		return await provider.runHarness(handle, command)
 	} finally {
 		if (handle) await provider.teardown(handle)
+	}
+	} finally {
+		await containedSupervisor?.close()
 	}
 }
 

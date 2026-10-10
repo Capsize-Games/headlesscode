@@ -69,7 +69,8 @@ import {
 } from "./git-sync.js"
 import { resolveModelForMode } from "../config/mode-models.js"
 import { openshellPreflight } from "../cloud/openshell-preflight.js"
-import { resolveContainedRuntimeProfile, resolveSecurityProfile, serializeResolvedContainedProfile, securityProfileDescription, type SecurityProfileName } from "../security/profile.js"
+import { resolveContainedRuntimeProfile, resolveSecurityProfile, serializeResolvedContainedProfile, securityProfileDescription, type ContainedRuntimeProfile, type SecurityProfileName } from "../security/profile.js"
+import { containedControlSocketDirectory, containedControlStateDirectory, containedEvidenceSessionId, loadContainedSupervisorRuntime, validateContainedSupervisorRoots } from "../security/supervisor.js"
 import { runPreflight, runLocalPreflight, type PreflightResult, type LocalPreflightResult } from "../llm/preflight.js"
 import { resolvePerModeEnv } from "../cli.js"
 
@@ -2575,9 +2576,12 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		process.stderr.write(`headlesscode orchestrate: not a git repo: ${repo}\n`)
 		return 2
 	}
+	let resolvedContainedProfile: ContainedRuntimeProfile | undefined
 	if (!options.dryRun && options.securityProfile === "contained") {
 		try {
 			const resolved = resolveContainedRuntimeProfile({ repoRoot: repo, purpose: "worker" })
+			validateContainedSupervisorRoots(resolved, repo)
+			resolvedContainedProfile = resolved
 			process.env.HEADLESSCODE_SECURITY_PROFILE = "contained"
 			process.env.HEADLESSCODE_OPENSHELL_POLICY = resolved.policySnapshotPath
 			process.env.HEADLESSCODE_OPENSHELL_IMAGE = resolved.image
@@ -2704,6 +2708,19 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		// No .worktrees dir yet — nothing occupied.
 	}
 	const specs = splitIssues(issues, { occupiedNames })
+	if (resolvedContainedProfile) {
+		try {
+			for (const spec of specs) {
+				const sessionId = containedEvidenceSessionId(spec.name)
+				loadContainedSupervisorRuntime({ profile: resolvedContainedProfile, sessionId, repoRoot: repo })
+				containedControlStateDirectory(resolvedContainedProfile, sessionId, repo)
+				containedControlSocketDirectory(resolvedContainedProfile, sessionId, repo)
+			}
+		} catch (error) {
+			process.stderr.write(`headlesscode orchestrate: contained per-worker supervisor preflight failed: ${error instanceof Error ? error.message : String(error)}\n`)
+			return 2
+		}
+	}
 
 	// Pre-spawn collision check: defense in depth only now that naming skips
 	// occupied slots above — this should not fire in the normal case. It
