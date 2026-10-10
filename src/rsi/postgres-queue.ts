@@ -801,12 +801,18 @@ export class PostgresRsiJobQueue {
 	}
 
 	async cancel(jobId: string, reason: string): Promise<boolean> {
-		const result = await this.pool.query(
-			`UPDATE headlesscode_rsi_jobs SET status='cancelled', error=$3, updated_at=clock_timestamp(), lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL
-			 WHERE queue_name=$1 AND job_id=$2 AND status='queued'`,
-			[this.policy.queueName, jobId, reason.slice(0, 4000)],
-		)
-		return result.rowCount === 1
+		return inTransaction(this.pool, async (client) => {
+			const result = await client.query(
+				`UPDATE headlesscode_rsi_jobs SET status='cancelled', error=$3, updated_at=clock_timestamp(), lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL
+				 WHERE queue_name=$1 AND job_id=$2 AND status IN ('queued','leased') RETURNING job_id`,
+				[this.policy.queueName, jobId, reason.slice(0, 4000)],
+			)
+			if (result.rowCount !== 1) return false
+			// A broker reservation is lease-bound. Blocking it in the same
+			// transaction closes the cancellation-to-worker-poll window.
+			await client.query("UPDATE headlesscode_rsi_inference_jobs SET blocked=true WHERE job_id=$1", [jobId])
+			return true
+		})
 	}
 
 	async close(): Promise<void> {
