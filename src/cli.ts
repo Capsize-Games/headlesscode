@@ -193,6 +193,12 @@ Usage:
   headlesscode --dry-run [options]          # build system prompt + validate config, no LLM call
 
 Subcommands:
+  headlesscode chat [--workspace <path>] [--resume <id>] [--model <id>]
+              Interactive terminal conversation with saved sessions and controls.
+  headlesscode skills <list|inspect|validate|enable|import> [arguments]
+              Discover, inspect, enable, or import local SKILL.md instructions.
+  headlesscode sessions <discover|import|list|show|export|fork> [arguments]
+              Import Claude, Codex, or Muse history and manage session archives.
   headlesscode openshell-session --repo <path> --task <text> --policy <path>
               Run one task in an OpenShell sandbox and keep its Git worktree
               for review. See \`openshell-session --help\` for options.
@@ -757,6 +763,18 @@ export interface CliRuntimeHooks {
 export async function main(argv: string[] = process.argv.slice(2), hooks?: CliRuntimeHooks): Promise<number> {
 	const stdout = hooks?.stdout ?? process.stdout
 	const stderr = hooks?.stderr ?? process.stderr
+	if (argv[0] === "skills") {
+		const { runSkillsCli } = await import("./skills/cli.js")
+		return runSkillsCli(argv.slice(1), { stdout: (text) => { stdout.write(text) }, stderr: (text) => { stderr.write(text) } })
+	}
+	if (argv[0] === "sessions") {
+		const { sessionsMain } = await import("./sessions/cli.js")
+		return sessionsMain(argv.slice(1))
+	}
+	if (argv[0] === "chat") {
+		const { terminalMain } = await import("./terminal/cli.js")
+		return terminalMain(argv.slice(1), { llmClient: hooks?.llmClient, skillRegistry: hooks?.skillRegistry, signal: hooks?.signal })
+	}
 	if (argv[0] === "evidence") return runEvidenceCli(argv.slice(1))
 	if (argv[0] === "control") {
 		const { controlMain } = await import("./control/cli.js")

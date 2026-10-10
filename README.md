@@ -89,6 +89,25 @@ To install a `headlesscode` wrapper on your `PATH`, run `scripts/install-cli.sh`
 It writes to `~/.local/bin` by default (override with `HEADLESSCODE_BIN_DIR`)
 and runs this checkout's local `tsx`. Re-run it if you move the checkout.
 
+### Terminal chat, skills, and saved sessions
+
+`headlesscode chat` starts an interactive conversation. Each turn uses the
+existing runner and saves its messages for resume or fork. `/help` lists the
+session, model, mode, skill, and import controls.
+
+```bash
+headlesscode chat --workspace /path/to/repo
+headlesscode skills import /path/to/my-skill
+headlesscode sessions import --from codex --file /path/to/rollout.jsonl --workspace /path/to/repo
+headlesscode chat --resume <session-id> --workspace /path/to/repo
+```
+
+Skills use `SKILL.md` instructions and captured text references. Session
+imports support Claude Code, Codex, and Muse history, with provenance and
+warnings. Imported tool calls stay historical context. See [terminal chat](./docs/terminal-chat.md),
+[skills](./docs/skills.md), and [sessions](./docs/sessions.md) for formats,
+discovery, and security behavior.
+
 ### Check project instructions without calling a model
 
 `--dry-run` builds the system prompt and validates project configuration. It

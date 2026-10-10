@@ -49,7 +49,7 @@ export function parseSessionsArgs(argv: string[]): { options: Options; error?: s
 	return { options }
 }
 
-function terminalSafeField(value: string): string { return value.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "").replace(/[\u0000-\u001f\u007f-\u009f]/g, " ") }
+function terminalSafeField(value: string): string { return value.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "").replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ") }
 function write(value: string): void { process.stdout.write(`${value}\n`) }
 function error(value: string): void { process.stderr.write(`${terminalSafeField(value)}\n`) }
 function usageError(value: string): void { error(value); process.stderr.write(`${usage}\n`) }
@@ -59,7 +59,8 @@ function summaryLine(value: { id: string; title: string; provider: SessionProvid
 }
 
 function renderArchive(archive: SessionArchive): string {
-	return JSON.stringify(archive, null, 2)
+	// JSON escapes C0 already; escape C1/bidi controls too without changing the data.
+	return JSON.stringify(archive, null, 2).replace(/[\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`)
 }
 
 async function exportArchive(target: string, data: string): Promise<void> {

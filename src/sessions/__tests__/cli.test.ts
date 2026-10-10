@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { SessionStore } from "../store.js"
 import * as fs from "node:fs/promises"
 import path from "node:path"
 import { sessionsMain, parseSessionsArgs } from "../cli.js"
@@ -75,11 +76,17 @@ async function testCliSanitizesTerminalControlFromPaths(): Promise<void> {
 		assert.match(result.stdout, /unsafename bad/)
 		const id = result.stdout.match(/Imported claude session as ([0-9a-f-]{36})/)?.[1]
 		assert.ok(id)
+		const store = new SessionStore(workspace)
+		const archive = await store.load(id)
+		const title = `${archive.title}\u009b2J\u202e`
+		await store.save({ ...archive, title }, archive.revision)
 		const listed = await capture(() => sessionsMain(["list", "--workspace", workspace]))
 		assert.equal(listed.stdout.trim().split("\n").length, 1)
 		assert.doesNotMatch(listed.stdout, /\u001b/)
 		const shown = await capture(() => sessionsMain(["show", id, "--workspace", workspace]))
 		assert.equal(JSON.parse(shown.stdout).id, id)
+		assert.equal(JSON.parse(shown.stdout).title, title, "escaped output preserves archive data")
+		assert.doesNotMatch(shown.stdout, /[\u007f-\u009f\u202e]/)
 	} finally {
 		if (original === undefined) delete process.env.HEADLESSCODE_DATA_DIR
 		else process.env.HEADLESSCODE_DATA_DIR = original
