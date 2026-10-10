@@ -1,0 +1,16 @@
+{
+  "export_schema_version": 1,
+  "exporter_version": { "display": "Muse Code synthetic fixture" },
+  "session_build": { "display": "Muse Code synthetic fixture" },
+  "session_terminated_abnormally": false,
+  "sessions": [{ "session_id": "synthetic-muse-1", "turn_count": 1, "step_count": 4 }],
+  "events": [
+    { "kind": "record", "envelope": { "sequence": 1, "recorded_at": "2026-01-15T12:00:00.000Z", "record_type": "session", "payload_type": null, "payload": { "kind": "run", "event": { "kind": "started", "prompt": "SYNTHETIC: list a file" } } } },
+    { "kind": "record", "envelope": { "sequence": 2, "recorded_at": "2026-01-15T12:00:01.000Z", "record_type": "session", "payload_type": null, "payload": { "kind": "run", "event": { "kind": "tool_call", "call_id": "call-3", "name": "list_files", "arguments": { "path": "." } } } } },
+    { "kind": "record", "envelope": { "sequence": 3, "recorded_at": "2026-01-15T12:00:02.000Z", "record_type": "session", "payload_type": null, "payload": { "kind": "run", "event": { "kind": "tool_result", "call_id": "call-3", "text": "SYNTHETIC: sample.txt" } } } },
+    { "kind": "record", "envelope": { "sequence": 4, "recorded_at": "2026-01-15T12:00:03.000Z", "record_type": "session", "payload_type": null, "payload": { "kind": "run", "event": { "kind": "assistant_message_committed", "text": "SYNTHETIC: done" } } } },
+    { "kind": "record", "envelope": { "sequence": 5, "recorded_at": "2026-01-15T12:00:04.000Z", "record_type": "session", "payload_type": "reasoning.encrypted", "payload": { "encrypted_content": "SYNTHETIC ENCRYPTED DATA" } } },
+    { "kind": "record", "envelope": { "sequence": 6, "recorded_at": "2026-01-15T12:00:05.000Z", "record_type": "session", "payload_type": "approval.review", "payload": { "kind": "requested", "decision": "approved" } } }
+  ],
+  "diagnostics": { "unparseable_lines": 0, "unknown_payload_kinds": 0, "gaps": 0, "omitted_live_only": 0, "duplicate_records": 0 }
+}
