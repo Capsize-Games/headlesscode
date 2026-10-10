@@ -4,6 +4,7 @@ import type { ChatMessage, LlmClient, SessionResult } from "../engine/types.js"
 import { buildHistoryContext } from "../sessions/context.js"
 import type { SessionMessage } from "../sessions/types.js"
 import type { ChatTurnRunner } from "./types.js"
+import type { SkillRegistry } from "../skills/registry.js"
 
 function archiveMessage(message: ChatMessage): SessionMessage {
 	return {
@@ -14,7 +15,7 @@ function archiveMessage(message: ChatMessage): SessionMessage {
 	}
 }
 
-export function createChatTurnRunner(options: { llmClient?: LlmClient; extraArgs?: string[] } = {}): ChatTurnRunner {
+export function createChatTurnRunner(options: { llmClient?: LlmClient; extraArgs?: string[]; skillRegistry?: SkillRegistry } = {}): ChatTurnRunner {
 	return async (request) => {
 		const history = buildHistoryContext(request.history)
 		for (const warning of history.warnings) request.onEvent("history_warning", { warning })
@@ -33,6 +34,7 @@ export function createChatTurnRunner(options: { llmClient?: LlmClient; extraArgs
 			onMessage: (message) => { if (message.role !== "system") messages.push(archiveMessage(message)) },
 			onResult: (outcome) => { result = outcome; if (outcome.budgetUsage) request.onEvent("budget", { ...outcome.budgetUsage }) },
 			stdout: sink, stderr: sink, ...(options.llmClient ? { llmClient: options.llmClient } : {}),
+			...(options.skillRegistry ? { skillRegistry: options.skillRegistry } : {}),
 		}
 		const code = await main([
 			"--workspace", request.workspaceRoot, "--mode", request.mode,

@@ -48,6 +48,7 @@ import { cleanupContainedRuntimeProfile, resolveContainedRuntimeProfile, resolve
 import { evidenceJournalFromEnv, evidenceJournalFromProtectedConfigFile, runEvidenceCli } from "./evidence/index.js"
 
 import { finishSessionEmergencyControl, startSessionEmergencyControl } from "./control/session-runtime.js"
+import type { SkillRegistry } from "./skills/registry.js"
 
 const VERSION = (JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version
 
@@ -748,6 +749,7 @@ export interface CliRuntimeHooks {
 	onMessage?: (message: ChatMessage) => void
 	onResult?: (result: SessionResult) => void
 	llmClient?: LlmClient
+	skillRegistry?: SkillRegistry
 	stdout?: { write(text: string): unknown }
 	stderr?: { write(text: string): unknown }
 }
@@ -1654,6 +1656,7 @@ export async function main(argv: string[] = process.argv.slice(2), hooks?: CliRu
 			signal: hooks?.signal && emergencyControl?.signal ? AbortSignal.any([hooks.signal, emergencyControl.signal]) : hooks?.signal ?? emergencyControl?.signal,
 			onMessage: hooks?.onMessage,
 			eventHook: hooks?.onEvent,
+			skillRegistry: hooks?.skillRegistry,
 			...(evidenceRuntime ? { sessionId: evidenceRuntime.sessionId, evidenceJournal: evidenceRuntime.evidenceJournal, evidenceRequired: evidenceRuntime.evidenceRequired } : {}),
 			// Opt-in local exploration phase (default OFF). Flag OR env var — the
 			// phase itself resolves the remaining HEADLESSCODE_LOCAL_EXPLORE_*
