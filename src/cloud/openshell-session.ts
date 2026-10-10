@@ -6,6 +6,7 @@ import { writeTaskFiles } from "../orchestrator/cli.js"
 import type { WorktreeSpec } from "../orchestrator/split.js"
 import { runOpenShellWorktreeCommand } from "./openshell-worker.js"
 import { OPENSHELL_HARNESS_ROOT } from "./openshell-provider.js"
+import type { ContainedRuntimeProfile } from "../security/profile.js"
 
 const USAGE = `headlesscode openshell-session --repo <path> --task <text> [options]
 
@@ -23,7 +24,7 @@ Options:
   --memory <quantity>  Memory limit (default: 4Gi)
 `
 
-export async function openShellSessionMain(argv: string[]): Promise<number> {
+export async function openShellSessionMain(argv: string[], options: { containedProfile?: ContainedRuntimeProfile } = {}): Promise<number> {
 	const parsed = parseArgs(argv)
 	if (parsed.help) {
 		process.stdout.write(USAGE)
@@ -44,6 +45,10 @@ export async function openShellSessionMain(argv: string[]): Promise<number> {
 		return 2
 	}
 	const providers = parsed.providerNames ?? (process.env.HEADLESSCODE_OPENSHELL_PROVIDERS ?? "headlesscode-openrouter").split(",").map((value) => value.trim()).filter(Boolean)
+	if (options.containedProfile && (policy !== options.containedProfile.policySnapshotPath || parsed.image && parsed.image !== options.containedProfile.image || parsed.providerNames && parsed.providerNames.join("\0") !== options.containedProfile.providers.join("\0"))) {
+		process.stderr.write("headlesscode openshell-session: explicit options differ from the resolved contained profile\n")
+		return 2
+	}
 	if (providers.includes("headlesscode-openrouter") && !process.env.HEADLESSCODE_OPENROUTER_API_KEY) {
 		process.stderr.write("headlesscode openshell-session: export HEADLESSCODE_OPENROUTER_API_KEY so OpenShell can store it in the headlesscode-openrouter provider\n")
 		return 2
@@ -76,7 +81,14 @@ export async function openShellSessionMain(argv: string[]): Promise<number> {
 		const result = await runOpenShellWorktreeCommand(repo, worktree, command, {
 			...(parsed.model ? { OPENROUTER_MODEL: parsed.model } : {}),
 			ORCHESTRATOR_MODE: parsed.mode ?? "code",
-		}, { image: parsed.image, policy, providers, cpu: parsed.cpu, memory: parsed.memory })
+		}, {
+			image: options.containedProfile?.image ?? parsed.image,
+			policy,
+			providers: options.containedProfile?.providers ? [...options.containedProfile.providers] : providers,
+			cpu: options.containedProfile?.cpu ?? parsed.cpu,
+			memory: options.containedProfile?.memory ?? parsed.memory,
+			...(options.containedProfile ? { containedProfile: options.containedProfile, autoProviders: false, includeProjectData: false } : {}),
+		})
 		process.stdout.write(`OpenShell task finished: ${worktree}\nExit code: ${result.exitCode}\n${result.output}\n`)
 		return result.exitCode === 0 ? 0 : 1
 	} catch (error) {
