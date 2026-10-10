@@ -51,7 +51,11 @@ function controlPaths(identity: string, stateDirectory: string, socketDirectory 
 	if (!IDENTITY_PATTERN.test(identity)) throw new Error("control identity must contain only letters, digits, dot, underscore, or hyphen")
 	const root = path.resolve(stateDirectory)
 	const socketId = createHash("sha256").update(identity).digest("hex").slice(0, 20)
-	return { state: path.join(root, `${identity}.json`), socket: path.join(path.resolve(socketDirectory), `${socketId}.sock`) }
+	const socket = path.join(path.resolve(socketDirectory), `${socketId}.sock`)
+	if (process.platform !== "win32" && Buffer.byteLength(socket) >= 108) {
+		throw new Error(`emergency-control Unix socket path is ${Buffer.byteLength(socket)} bytes; use a shorter HEADLESSCODE_CONTROL_SOCKET_DIR (maximum 107 bytes)`)
+	}
+	return { state: path.join(root, `${identity}.json`), socket }
 }
 
 function initialRecord(identity: string): EmergencyControlRecord {
@@ -116,6 +120,7 @@ export class EmergencyControl {
 	private readonly persistState: NonNullable<EmergencyControlOptions["persistState"]>
 	private mutationTail: Promise<void> = Promise.resolve()
 	private persistTail: Promise<void> = Promise.resolve()
+	private emergencySequence = 0
 	private controller = new AbortController()
 	private server?: Server
 	private record!: EmergencyControlRecord
@@ -214,7 +219,7 @@ export class EmergencyControl {
 		const finalWrite = this.persistRecord()
 		try {
 			const settled = Promise.allSettled([initialWrite, finalWrite])
-			await this.persistBounded(settled)
+			await this.persistBounded(settled, this.graceMs)
 			const results = await settled
 			const failure = results.find((entry): entry is PromiseRejectedResult => entry.status === "rejected")
 			if (failure) throw failure.reason
@@ -256,16 +261,22 @@ export class EmergencyControl {
 
 	async registerResource(resource: string | EmergencyControlResource): Promise<void> {
 		const id = resourceId(resource)!
-		const operation = this.mutationTail.then(async () => {
-			this.assertRunning()
-			if (!this.record.resources.includes(id)) {
-				this.record.resources.push(id)
-				this.record.updatedAt = new Date().toISOString()
-				await this.persistRecord()
+		this.assertRunning()
+		if (this.record.resources.includes(id)) return
+		this.record.resources.push(id)
+		this.record.updatedAt = new Date().toISOString()
+		try { await this.persistBounded(this.persistRecord(), this.graceMs) }
+		catch (error) {
+			if (this.record.state === "running") {
+				const at = new Date().toISOString()
+				this.record.state = "failed-to-stop"
+				this.record.cleanupResults.push({ name: "resource-state-persistence", ok: false, detail: message(error).slice(0, 4000), at })
+				this.record.updatedAt = at
+				this.controller.abort(new Error("emergency-control resource state could not be persisted"))
+				void this.persistRecord().catch(() => undefined)
 			}
-		})
-		this.mutationTail = operation.then(() => undefined, () => undefined)
-		await operation
+			throw error
+		}
 	}
 
 	async releaseResource(resource: string | EmergencyControlResource): Promise<void> {
@@ -273,7 +284,19 @@ export class EmergencyControl {
 		if (this.record.resources.includes(id)) {
 			this.record.resources = this.record.resources.filter((entry) => entry !== id)
 			this.record.updatedAt = new Date().toISOString()
-			await this.persistRecord()
+			try { await this.persistBounded(this.persistRecord(), this.graceMs) }
+			catch (error) {
+				if (!this.record.resources.includes(id)) this.record.resources.push(id)
+				if (this.record.state === "running") {
+					const at = new Date().toISOString()
+					this.record.state = "failed-to-stop"
+					this.record.cleanupResults.push({ name: "resource-state-persistence", ok: false, detail: message(error).slice(0, 4000), at })
+					this.record.updatedAt = at
+					this.controller.abort(new Error("emergency-control resource state could not be persisted"))
+					void this.persistRecord().catch(() => undefined)
+				}
+				throw error
+			}
 		}
 	}
 
@@ -281,14 +304,31 @@ export class EmergencyControl {
 		if (action === "status") return { accepted: true, record: this.snapshot }
 		if (!operatorId.trim()) throw new Error("operator identity is required")
 		if ((action === "pause" || action === "stop") && !reason.trim()) throw new Error("a reason is required for pause and stop")
-		const operation = this.mutationTail.then(() => action === "stop" ? this.performStop(reason, operatorId) : action === "pause" ? this.pause(reason, operatorId) : this.resume(reason, operatorId))
+		if (action === "pause") {
+			if (this.record.state === "paused") return { accepted: true, record: this.snapshot }
+			if (this.record.state !== "running") return { accepted: false, record: this.snapshot }
+			const request = this.requestPause(reason, operatorId)
+			return this.enqueueMutation(() => this.finishPause(request.sequence, request.initialWrite))
+		}
+		if (action === "stop") {
+			if (this.record.state === "stopped") return { accepted: true, record: this.snapshot }
+			const request = this.requestStop(reason, operatorId)
+			return this.enqueueMutation(() => this.finishStop(request.sequence, request.initialWrite))
+		}
+		const sequence = this.emergencySequence
+		const operation = this.mutationTail.then(() => this.resume(reason, operatorId, sequence))
 		this.mutationTail = operation.then(() => undefined, () => undefined)
 		return operation
 	}
 
-	private async pause(reason: string, operatorId: string): Promise<EmergencyControlResult> {
-		if (this.record.state === "paused") return { accepted: true, record: this.snapshot }
-		if (this.record.state !== "running") return { accepted: false, record: this.snapshot }
+	private enqueueMutation(operation: () => Promise<EmergencyControlResult>): Promise<EmergencyControlResult> {
+		const pending = this.mutationTail.then(operation)
+		this.mutationTail = pending.then(() => undefined, () => undefined)
+		return pending
+	}
+
+	private requestPause(reason: string, operatorId: string): { sequence: number; initialWrite: Promise<void> } {
+		const sequence = ++this.emergencySequence
 		this.record.state = "pause-requested"
 		this.record.epoch += 1
 		this.record.operatorId = operatorId
@@ -299,7 +339,12 @@ export class EmergencyControl {
 		const initialWrite = this.persistRecord()
 		void initialWrite.catch(() => undefined)
 		this.emitEvidence()
+		return { sequence, initialWrite }
+	}
+
+	private async finishPause(sequence: number, initialWrite: Promise<void>): Promise<EmergencyControlResult> {
 		const outcomes = await this.runCleanups()
+		if (sequence !== this.emergencySequence) return { accepted: false, record: this.snapshot }
 		this.record.state = outcomes.every((entry) => entry.ok) ? "paused" : "failed-to-stop"
 		this.record.acknowledgedAt = new Date().toISOString()
 		this.record.cleanupResults = outcomes
@@ -309,27 +354,33 @@ export class EmergencyControl {
 		return { accepted: outcomes.every((entry) => entry.ok) && persisted, record: this.snapshot }
 	}
 
-	private async performStop(reason: string, operatorId: string): Promise<EmergencyControlResult> {
-		if (this.record.state === "stopped") return { accepted: true, record: this.snapshot }
+	private requestStop(reason: string, operatorId: string): { sequence: number; initialWrite: Promise<void> } {
 		const retryingFailedStop = this.record.state === "failed-to-stop"
-		if (!retryingFailedStop) {
-			this.record.state = "stop-requested"
-			this.record.epoch += 1
+		const alreadyRequested = this.record.state === "stop-requested"
+		const sequence = ++this.emergencySequence
+		if (!retryingFailedStop && !alreadyRequested) this.record.epoch += 1
+		this.record.state = "stop-requested"
+		if (!alreadyRequested) {
 			this.record.operatorId = operatorId
 			this.record.reason = reason.slice(0, 4000)
 			this.record.requestedAt = new Date().toISOString()
-			this.record.updatedAt = this.record.requestedAt
-			this.controller.abort(new Error(`emergency stop: ${this.record.reason}`))
-			const initialWrite = this.persistRecord()
-			void initialWrite.catch(() => undefined)
-			this.emitEvidence()
-			return await this.finishStop(initialWrite)
 		}
-		return await this.finishStop(Promise.resolve())
+		this.record.updatedAt = new Date().toISOString()
+		this.controller.abort(new Error(`emergency stop: ${this.record.reason ?? reason}`))
+		const initialWrite = this.persistRecord()
+		void initialWrite.catch(() => undefined)
+		this.emitEvidence()
+		return { sequence, initialWrite }
 	}
 
-	private async finishStop(initialWrite: Promise<void>): Promise<EmergencyControlResult> {
+	private async finishStop(sequence: number, initialWrite: Promise<void>): Promise<EmergencyControlResult> {
+		if (sequence !== this.emergencySequence) return { accepted: false, record: this.snapshot }
+		return await this.completeStop(sequence, initialWrite)
+	}
+
+	private async completeStop(sequence: number, initialWrite: Promise<void>): Promise<EmergencyControlResult> {
 		const outcomes = await this.runCleanups()
+		if (sequence !== this.emergencySequence) return { accepted: false, record: this.snapshot }
 		this.record.cleanupResults = outcomes
 		this.record.state = outcomes.every((entry) => entry.ok) ? "stopped" : "failed-to-stop"
 		this.record.acknowledgedAt = new Date().toISOString()
@@ -339,7 +390,8 @@ export class EmergencyControl {
 		return { accepted: outcomes.every((entry) => entry.ok) && persisted, record: this.snapshot }
 	}
 
-	private async resume(reason: string, operatorId: string): Promise<EmergencyControlResult> {
+	private async resume(reason: string, operatorId: string, sequence: number): Promise<EmergencyControlResult> {
+		if (sequence !== this.emergencySequence) return { accepted: false, record: this.snapshot }
 		if (this.record.state === "running") return { accepted: true, record: this.snapshot }
 		if (this.record.state !== "paused") return { accepted: false, record: this.snapshot }
 		this.record.epoch += 1
@@ -349,8 +401,20 @@ export class EmergencyControl {
 		this.record.requestedAt = new Date().toISOString()
 		this.record.acknowledgedAt = this.record.requestedAt
 		this.record.updatedAt = this.record.requestedAt
-		await this.persistRecord()
 		this.controller = new AbortController()
+		try { await this.persistBounded(this.persistRecord(), this.graceMs) }
+		catch (error) {
+			if (sequence === this.emergencySequence && this.record.state === "running") {
+				const at = new Date().toISOString()
+				this.record.state = "failed-to-stop"
+				this.record.cleanupResults.push({ name: "control-state-persistence", ok: false, detail: message(error).slice(0, 4000), at })
+				this.record.updatedAt = at
+				this.controller.abort(new Error("emergency-control resume state could not be persisted"))
+				void this.persistRecord().catch(() => undefined)
+			}
+			return { accepted: false, record: this.snapshot }
+		}
+		if (sequence !== this.emergencySequence || this.record.state !== "running") return { accepted: false, record: this.snapshot }
 		this.emitEvidence()
 		return { accepted: true, record: this.snapshot }
 	}
