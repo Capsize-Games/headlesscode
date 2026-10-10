@@ -32,6 +32,9 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TMPDIR="${TMPDIR:-"$ROOT/.headlesscode/scratch"}"
+mkdir -p "$TMPDIR"
+export TMPDIR
 KEEP="${KEEP:-0}"
 
 PASS=0
@@ -186,7 +189,7 @@ git -C "$FIXTURE" add -A
 git -C "$FIXTURE" -c user.name="E2E" -c user.email="e2e@headlesscode.invalid" -c commit.gpgsign=false \
 	commit -q -m "fixture: add qa-agent mode + fake deploy script (phase 4)"
 
-BARE="$(mktemp -d /tmp/headlesscode-e2e4-bare-XXXXXX)"
+BARE="$(mktemp -d "$TMPDIR/headlesscode-e2e4-bare-XXXXXX")"
 git -C "$FIXTURE" branch -M master
 git init --bare -q "$BARE"
 git -C "$FIXTURE" remote add origin "$BARE"
@@ -196,7 +199,7 @@ echo "  fixture: $FIXTURE (origin -> $BARE)"
 
 # ── 2. Issues JSON (one group: w1-issue1) ───────────────────────────────────
 echo "== [2/10] issues-json =="
-ISSUES_JSON="$(mktemp /tmp/headlesscode-e2e4-issues-XXXXXX.json)"
+ISSUES_JSON="$(mktemp "$TMPDIR/headlesscode-e2e4-issues-XXXXXX.json")"
 cat > "$ISSUES_JSON" <<'EOF'
 [
   { "number": 1, "title": "Fix the greet bug", "body": "greet() must return 'Hello, ' + name" }
@@ -205,9 +208,9 @@ EOF
 
 # ── 3. Mock servers ──────────────────────────────────────────────────────────
 echo "== [3/10] mock OpenRouter servers =="
-AUTO_MOCK_LOG="$(mktemp /tmp/headlesscode-e2e4-auto-mock-XXXXXX.log)"
-QA_PASS_MOCK_LOG="$(mktemp /tmp/headlesscode-e2e4-qapass-mock-XXXXXX.log)"
-QA_FAIL_MOCK_LOG="$(mktemp /tmp/headlesscode-e2e4-qafail-mock-XXXXXX.log)"
+AUTO_MOCK_LOG="$(mktemp "$TMPDIR/headlesscode-e2e4-auto-mock-XXXXXX.log")"
+QA_PASS_MOCK_LOG="$(mktemp "$TMPDIR/headlesscode-e2e4-qapass-mock-XXXXXX.log")"
+QA_FAIL_MOCK_LOG="$(mktemp "$TMPDIR/headlesscode-e2e4-qafail-mock-XXXXXX.log")"
 start_mock qa-orchestrate "$AUTO_MOCK_LOG" AUTO_PORT
 start_mock qa-pass "$QA_PASS_MOCK_LOG" QA_PASS_PORT
 start_mock qa-fail "$QA_FAIL_MOCK_LOG" QA_FAIL_PORT
@@ -215,7 +218,7 @@ sleep 0.2
 
 # ── 4. Full orchestrate --qa round (worker -> review -> QA) ─────────────────
 echo "== [4/10] orchestrate --qa (full round) =="
-ORCH1_OUT="$(mktemp /tmp/headlesscode-e2e4-orch1-XXXXXX.out)"
+ORCH1_OUT="$(mktemp "$TMPDIR/headlesscode-e2e4-orch1-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
@@ -256,7 +259,7 @@ WORKTREE_NAMES="w1"
 
 # ── 5. QA tool discipline (qa-pass mock: no write_to_file ever) ─────────────
 echo "== [5/10] QA tool discipline (qa-pass invocation) =="
-QA_INVOKE_PASS_OUT="$(mktemp /tmp/headlesscode-e2e4-qapass-XXXXXX.out)"
+QA_INVOKE_PASS_OUT="$(mktemp "$TMPDIR/headlesscode-e2e4-qapass-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		OPENROUTER_BASE_URL="http://127.0.0.1:$QA_PASS_PORT" \
@@ -285,7 +288,7 @@ fi
 
 # ── 6. QA fail path (qa-fail mock) ───────────────────────────────────────────
 echo "== [6/10] QA fail path (qa-fail invocation) =="
-QA_INVOKE_FAIL_OUT="$(mktemp /tmp/headlesscode-e2e4-qafail-XXXXXX.out)"
+QA_INVOKE_FAIL_OUT="$(mktemp "$TMPDIR/headlesscode-e2e4-qafail-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		OPENROUTER_BASE_URL="http://127.0.0.1:$QA_FAIL_PORT" \
@@ -303,7 +306,7 @@ fi
 
 # ── 7. run-qa.sh wrapper ─────────────────────────────────────────────────────
 echo "== [7/10] scripts/run-qa.sh wrapper =="
-RUNQA_OUT="$(mktemp /tmp/headlesscode-e2e4-runqa-XXXXXX.out)"
+RUNQA_OUT="$(mktemp "$TMPDIR/headlesscode-e2e4-runqa-XXXXXX.out")"
 QA_PID="$(OPENROUTER_BASE_URL="http://127.0.0.1:$QA_PASS_PORT" HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
 	HEADLESSCODE_ROOT="$ROOT" \
 	bash "$ROOT/scripts/run-qa.sh" "$FIXTURE/.worktrees/w1" --mode qa-agent)"
@@ -342,7 +345,7 @@ fi
 
 # ── 8. Deploy gate standalone (temp target repo + fake deploy script) ───────
 echo "== [8/10] deploy gate standalone =="
-DEPLOY_TARGET="$(mktemp -d /tmp/headlesscode-e2e4-deploy-XXXXXX)"
+DEPLOY_TARGET="$(mktemp -d "$TMPDIR/headlesscode-e2e4-deploy-XXXXXX")"
 mkdir -p "$DEPLOY_TARGET/scripts"
 cat > "$DEPLOY_TARGET/scripts/deploy-production.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -353,7 +356,7 @@ chmod +x "$DEPLOY_TARGET/scripts/deploy-production.sh"
 printf '%s\n' "correct-token" > "$DEPLOY_TARGET/.deploy-approval"
 
 # 8a. Wrong token -> denied (exit 3), deploy script NOT called.
-GATE_DENIED_OUT="$(mktemp /tmp/headlesscode-e2e4-gate-denied-XXXXXX.out)"
+GATE_DENIED_OUT="$(mktemp "$TMPDIR/headlesscode-e2e4-gate-denied-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		DEPLOY_APPROVAL_TOKEN="wrong-token" \
@@ -379,7 +382,7 @@ else
 fi
 
 # 8b. Matching token -> approved, fake deploy script invoked with args.
-GATE_APPROVED_OUT="$(mktemp /tmp/headlesscode-e2e4-gate-approved-XXXXXX.out)"
+GATE_APPROVED_OUT="$(mktemp "$TMPDIR/headlesscode-e2e4-gate-approved-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		DEPLOY_APPROVAL_TOKEN="correct-token" \
@@ -404,7 +407,7 @@ fi
 rm -f "$DEPLOY_TARGET/.e2e-deploy-ran"
 mkdir -p "$DEPLOY_TARGET/.worktrees"
 touch "$DEPLOY_TARGET/.worktrees/.deploy-approved-e2e"
-GATE_FILE_OUT="$(mktemp /tmp/headlesscode-e2e4-gate-file-XXXXXX.out)"
+GATE_FILE_OUT="$(mktemp "$TMPDIR/headlesscode-e2e4-gate-file-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		env -u DEPLOY_APPROVAL_TOKEN \
@@ -421,7 +424,7 @@ fi
 
 # 8d. Path safety: deploy script escaping the repo root is refused.
 rm -f "$DEPLOY_TARGET/.e2e-deploy-ran"
-GATE_ESCAPE_OUT="$(mktemp /tmp/headlesscode-e2e4-gate-escape-XXXXXX.out)"
+GATE_ESCAPE_OUT="$(mktemp "$TMPDIR/headlesscode-e2e4-gate-escape-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		DEPLOY_APPROVAL_TOKEN="correct-token" \
@@ -437,7 +440,7 @@ else
 fi
 
 # 8e. Missing deploy script -> clear error, nothing runs.
-GATE_MISSING_OUT="$(mktemp /tmp/headlesscode-e2e4-gate-missing-XXXXXX.out)"
+GATE_MISSING_OUT="$(mktemp "$TMPDIR/headlesscode-e2e4-gate-missing-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		DEPLOY_APPROVAL_TOKEN="correct-token" \
@@ -467,7 +470,7 @@ git -C "$FIXTURE" worktree remove --force "$FIXTURE/.worktrees/w1" 2>/dev/null |
 git -C "$FIXTURE" branch -D "$WT1_BRANCH" 2>/dev/null || true
 
 # 9a. Round already passing + matching token -> gate approves, deploy invoked.
-ORCH2_OUT="$(mktemp /tmp/headlesscode-e2e4-orch2-XXXXXX.out)"
+ORCH2_OUT="$(mktemp "$TMPDIR/headlesscode-e2e4-orch2-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
@@ -496,7 +499,7 @@ ORCH2_MARKER_LINES="$(wc -l < "$FIXTURE/.e2e-deploy-ran" 2>/dev/null || echo 0)"
 # re-run too.
 git -C "$FIXTURE" worktree remove --force "$FIXTURE/.worktrees/w1" 2>/dev/null || true
 git -C "$FIXTURE" branch -D "$WT1_BRANCH" 2>/dev/null || true
-ORCH3_OUT="$(mktemp /tmp/headlesscode-e2e4-orch3-XXXXXX.out)"
+ORCH3_OUT="$(mktemp "$TMPDIR/headlesscode-e2e4-orch3-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
@@ -531,7 +534,7 @@ if [ -z "$FIXTURE2" ] || [ ! -d "$FIXTURE2/.git" ]; then
 	echo "  rework fixture setup failed; aborting" >&2
 	exit 1
 fi
-BARE2="$(mktemp -d /tmp/headlesscode-e2e4-rework-bare-XXXXXX)"
+BARE2="$(mktemp -d "$TMPDIR/headlesscode-e2e4-rework-bare-XXXXXX")"
 git -C "$FIXTURE2" branch -M master
 git init --bare -q "$BARE2"
 git -C "$FIXTURE2" remote add origin "$BARE2"
@@ -539,17 +542,17 @@ git -C "$FIXTURE2" -c user.name="E2E" -c user.email="e2e@headlesscode.invalid" -
 	push -q -u origin master
 echo "  rework fixture: $FIXTURE2 (origin -> $BARE2)"
 
-REWORK_ISSUES="$(mktemp /tmp/headlesscode-e2e4-rework-issues-XXXXXX.json)"
+REWORK_ISSUES="$(mktemp "$TMPDIR/headlesscode-e2e4-rework-issues-XXXXXX.json")"
 cat > "$REWORK_ISSUES" <<'EOF'
 [
   { "number": 1, "title": "Fix the greet bug", "body": "greet() must return 'Hello, ' + name" }
 ]
 EOF
-REWORK_MOCK_LOG="$(mktemp /tmp/headlesscode-e2e4-rework-mock-XXXXXX.log)"
+REWORK_MOCK_LOG="$(mktemp "$TMPDIR/headlesscode-e2e4-rework-mock-XXXXXX.log")"
 start_mock qa-orchestrate "$REWORK_MOCK_LOG" REWORK_PORT "REWORK_REVIEWS=1"
 sleep 0.2
 
-REWORK_OUT="$(mktemp /tmp/headlesscode-e2e4-rework-XXXXXX.out)"
+REWORK_OUT="$(mktemp "$TMPDIR/headlesscode-e2e4-rework-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \
@@ -641,7 +644,7 @@ EOF
 git -C "$FIXTURE3" add -A
 git -C "$FIXTURE3" -c user.name="E2E" -c user.email="e2e@headlesscode.invalid" -c commit.gpgsign=false \
 	commit -q -m "fixture: add qa-agent mode (phase 4 QA-fail rework)"
-BARE3="$(mktemp -d /tmp/headlesscode-e2e4-qarework-bare-XXXXXX)"
+BARE3="$(mktemp -d "$TMPDIR/headlesscode-e2e4-qarework-bare-XXXXXX")"
 git -C "$FIXTURE3" branch -M master
 git init --bare -q "$BARE3"
 git -C "$FIXTURE3" remote add origin "$BARE3"
@@ -649,17 +652,17 @@ git -C "$FIXTURE3" -c user.name="E2E" -c user.email="e2e@headlesscode.invalid" -
 	push -q -u origin master
 echo "  QA-fail rework fixture: $FIXTURE3 (origin -> $BARE3)"
 
-REWORK_QA_ISSUES="$(mktemp /tmp/headlesscode-e2e4-qarework-issues-XXXXXX.json)"
+REWORK_QA_ISSUES="$(mktemp "$TMPDIR/headlesscode-e2e4-qarework-issues-XXXXXX.json")"
 cat > "$REWORK_QA_ISSUES" <<'EOF'
 [
   { "number": 1, "title": "Fix the greet bug", "body": "greet() must return 'Hello, ' + name" }
 ]
 EOF
-REWORK_QA_MOCK_LOG="$(mktemp /tmp/headlesscode-e2e4-qarework-mock-XXXXXX.log)"
+REWORK_QA_MOCK_LOG="$(mktemp "$TMPDIR/headlesscode-e2e4-qarework-mock-XXXXXX.log")"
 start_mock qa-orchestrate "$REWORK_QA_MOCK_LOG" REWORK_QA_PORT "REWORK_QA=1"
 sleep 0.2
 
-REWORK_QA_OUT="$(mktemp /tmp/headlesscode-e2e4-qarework-XXXXXX.out)"
+REWORK_QA_OUT="$(mktemp "$TMPDIR/headlesscode-e2e4-qarework-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		HEADLESSCODE_OPENROUTER_API_KEY="test-key" \

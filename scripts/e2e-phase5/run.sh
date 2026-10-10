@@ -38,6 +38,9 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TMPDIR="${TMPDIR:-"$ROOT/.headlesscode/scratch"}"
+mkdir -p "$TMPDIR"
+export TMPDIR
 KEEP="${KEEP:-0}"
 
 PASS=0
@@ -117,7 +120,7 @@ fi
 # e2e — creates .worktrees/<name>/ and appends a spawn-invoked marker — but
 # never creates real git worktrees or launches workers. The watcher invokes it
 # exactly as it would the real script (bash -c, TARGET_REPO env set).
-SPAWN_STUB="$(mktemp /tmp/headlesscode-e2e5-spawn-XXXXXX.sh)"
+SPAWN_STUB="$(mktemp "$TMPDIR/headlesscode-e2e5-spawn-XXXXXX.sh")"
 cat > "$SPAWN_STUB" <<'EOF'
 #!/usr/bin/env bash
 # STUB spawner for the Phase 5 e2e — see scripts/e2e-phase5/run.sh.
@@ -142,7 +145,7 @@ echo "  stub spawner: $SPAWN_STUB"
 
 # ── 2. Scripted issue sets ───────────────────────────────────────────────────
 echo "== [2/9] scripted issues =="
-ISSUES1="$(mktemp /tmp/headlesscode-e2e5-issues1-XXXXXX.json)"
+ISSUES1="$(mktemp "$TMPDIR/headlesscode-e2e5-issues1-XXXXXX.json")"
 cat > "$ISSUES1" <<'EOF'
 [
   {
@@ -155,7 +158,7 @@ cat > "$ISSUES1" <<'EOF'
   }
 ]
 EOF
-ISSUES2="$(mktemp /tmp/headlesscode-e2e5-issues2-XXXXXX.json)"
+ISSUES2="$(mktemp "$TMPDIR/headlesscode-e2e5-issues2-XXXXXX.json")"
 cat > "$ISSUES2" <<'EOF'
 [
   {
@@ -189,13 +192,13 @@ echo "  issues2 (3-issue storm): $ISSUES2"
 
 # ── 3. Mock GitHub server (issues1) ─────────────────────────────────────────
 echo "== [3/9] mock GitHub server (issues1) =="
-MOCK1_LOG="$(mktemp /tmp/headlesscode-e2e5-mock1-XXXXXX.log)"
+MOCK1_LOG="$(mktemp "$TMPDIR/headlesscode-e2e5-mock1-XXXXXX.log")"
 start_mock "$ISSUES1" "$MOCK1_LOG" MOCK1_PORT
 sleep 0.2
 
 # ── 4. Dry-run: report plan, no spawn, no state ─────────────────────────────
 echo "== [4/9] watch --dry-run (no spawn, no state) =="
-DRYRUN_OUT="$(mktemp /tmp/headlesscode-e2e5-dryrun-XXXXXX.out)"
+DRYRUN_OUT="$(mktemp "$TMPDIR/headlesscode-e2e5-dryrun-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		GH_TOKEN="test" \
@@ -227,7 +230,7 @@ fi
 
 # ── 5. Real run 1: detect + spawn one issue ─────────────────────────────────
 echo "== [5/9] watch --run-once (1 new issue) =="
-RUN1_OUT="$(mktemp /tmp/headlesscode-e2e5-run1-XXXXXX.out)"
+RUN1_OUT="$(mktemp "$TMPDIR/headlesscode-e2e5-run1-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		GH_TOKEN="test" \
@@ -276,7 +279,7 @@ fi
 
 # ── 6. Run 2: idempotent (no duplicate spawn) ───────────────────────────────
 echo "== [6/9] watch --run-once again (idempotent) =="
-RUN2_OUT="$(mktemp /tmp/headlesscode-e2e5-run2-XXXXXX.out)"
+RUN2_OUT="$(mktemp "$TMPDIR/headlesscode-e2e5-run2-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		GH_TOKEN="test" \
@@ -303,11 +306,11 @@ fi
 # ── 7. Label storm: 3 issues, max-per-sweep 1 ───────────────────────────────
 echo "== [7/9] label storm (3 issues, max-per-sweep 1) =="
 kill_mock
-MOCK2_LOG="$(mktemp /tmp/headlesscode-e2e5-mock2-XXXXXX.log)"
+MOCK2_LOG="$(mktemp "$TMPDIR/headlesscode-e2e5-mock2-XXXXXX.log")"
 start_mock "$ISSUES2" "$MOCK2_LOG" MOCK2_PORT
 sleep 0.2
 
-STORM1_OUT="$(mktemp /tmp/headlesscode-e2e5-storm1-XXXXXX.out)"
+STORM1_OUT="$(mktemp "$TMPDIR/headlesscode-e2e5-storm1-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		GH_TOKEN="test" \
@@ -334,7 +337,7 @@ else
 	cat "$STATE_FILE" >&2
 fi
 
-STORM2_OUT="$(mktemp /tmp/headlesscode-e2e5-storm2-XXXXXX.out)"
+STORM2_OUT="$(mktemp "$TMPDIR/headlesscode-e2e5-storm2-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		GH_TOKEN="test" \
@@ -353,7 +356,7 @@ else
 	tail -n 20 "$STORM2_OUT" >&2
 fi
 
-STORM3_OUT="$(mktemp /tmp/headlesscode-e2e5-storm3-XXXXXX.out)"
+STORM3_OUT="$(mktemp "$TMPDIR/headlesscode-e2e5-storm3-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		GH_TOKEN="test" \
@@ -379,7 +382,7 @@ fi
 
 # ── 8. Missing token -> clear error ──────────────────────────────────────────
 echo "== [8/9] missing GH_TOKEN =="
-NOTOKEN_OUT="$(mktemp /tmp/headlesscode-e2e5-notoken-XXXXXX.out)"
+NOTOKEN_OUT="$(mktemp "$TMPDIR/headlesscode-e2e5-notoken-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		env -u GH_TOKEN -u GITHUB_TOKEN \

@@ -34,6 +34,9 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TMPDIR="${TMPDIR:-"$ROOT/.headlesscode/scratch"}"
+mkdir -p "$TMPDIR"
+export TMPDIR
 SCENARIO="${MOCK_SCENARIO:-success}"
 KEEP="${KEEP:-0}"
 
@@ -71,7 +74,7 @@ echo "  fixture: $FIXTURE"
 
 # ── 2. Isolated worktree (the harness works HERE, fixture stays untouched) ──
 echo "== [2/7] isolated worktree =="
-WORKTREE="$(mktemp -d /tmp/headlesscode-e2e-worktree-XXXXXX)"
+WORKTREE="$(mktemp -d "$TMPDIR/headlesscode-e2e-worktree-XXXXXX")"
 bash "$ROOT/scripts/e2e-fixture/spawn-worktree.sh" "$FIXTURE" "$WORKTREE" >/dev/null
 if ! git -C "$WORKTREE" rev-parse --git-dir >/dev/null 2>&1; then
 	echo "  worktree spawn failed; aborting" >&2
@@ -81,7 +84,7 @@ echo "  worktree: $WORKTREE"
 
 # ── 3. Mock OpenRouter server on a random port ───────────────────────────────
 echo "== [3/7] mock OpenRouter server =="
-MOCK_LOG="$(mktemp /tmp/headlesscode-e2e-mock-XXXXXX.log)"
+MOCK_LOG="$(mktemp "$TMPDIR/headlesscode-e2e-mock-XXXXXX.log")"
 PORT="${E2E_MOCK_PORT:-0}" # 0 = OS-assigned random port; actual port read back below
 (
 	cd "$ROOT" &&
@@ -113,7 +116,7 @@ sleep 0.2
 
 # ── 4. Dry-run validation (rules splicing + custom modes, no LLM) ────────────
 echo "== [4/7] dry-run validation (rules + custom modes) =="
-DRYRUN_CODE_OUT="$(mktemp /tmp/headlesscode-e2e-dryrun-code-XXXXXX.out)"
+DRYRUN_CODE_OUT="$(mktemp "$TMPDIR/headlesscode-e2e-dryrun-code-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		npx --no-install tsx src/cli.ts --dry-run --mode code --workspace "$WORKTREE"
@@ -128,7 +131,7 @@ else
 	fail "dry-run (code): expected exit 0 with MODE RULE (code) + GENERIC RULE + AGENT RULE (exit $DRYRUN_CODE_EXIT)"
 fi
 
-DRYRUN_MODE_OUT="$(mktemp /tmp/headlesscode-e2e-dryrun-mode-XXXXXX.out)"
+DRYRUN_MODE_OUT="$(mktemp "$TMPDIR/headlesscode-e2e-dryrun-mode-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		npx --no-install tsx src/cli.ts --dry-run --mode issue-fixer --workspace "$WORKTREE"
@@ -142,8 +145,8 @@ fi
 
 # ── 5. Real harness run (real CLI + real HTTP against the mock) ──────────────
 echo "== [5/7] harness run (real CLI, real HTTP, mock LLM) =="
-HARNESS_LOG="/tmp/headlesscode-e2e.log"
-HARNESS_OUT="$(mktemp /tmp/headlesscode-e2e-cli-XXXXXX.out)"
+HARNESS_LOG="$TMPDIR/headlesscode-e2e-$$.log"
+HARNESS_OUT="$(mktemp "$TMPDIR/headlesscode-e2e-cli-XXXXXX.out")"
 TASK_TEXT='fix the greet function in src/greet.js so it returns "Hello, " + name (issue #29)'
 
 (

@@ -34,6 +34,9 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TMPDIR="${TMPDIR:-"$ROOT/.headlesscode/scratch"}"
+mkdir -p "$TMPDIR"
+export TMPDIR
 KEEP="${KEEP:-0}"
 
 PASS=0
@@ -108,12 +111,12 @@ echo "  fixture: $FIXTURE"
 
 # ── 2. Part A — budget abort (mock OpenRouter, success scenario) ────────────
 echo "== [2/6] budget abort vs mock OpenRouter =="
-LLM_LOG="$(mktemp /tmp/headlesscode-e2e6-llm-XXXXXX.log)"
+LLM_LOG="$(mktemp "$TMPDIR/headlesscode-e2e6-llm-XXXXXX.log")"
 start_mock "MOCK_SCENARIO=success MOCK_FIXTURE_ROOT=$FIXTURE node scripts/e2e/mock-openrouter.mjs" "$LLM_LOG" LLM_PORT
 sleep 0.2
 
 # Control run WITHOUT a budget: the success scenario completes (exit 0).
-CONTROL_OUT="$(mktemp /tmp/headlesscode-e2e6-control-XXXXXX.out)"
+CONTROL_OUT="$(mktemp "$TMPDIR/headlesscode-e2e6-control-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		HEADLESSCODE_OPENROUTER_API_KEY="test" \
@@ -133,7 +136,7 @@ fi
 # $0.14/1M in + $0.28/1M out — see DEFAULT_MODEL in src/llm/openrouter.ts);
 # one mock call is 16 in + 24 out ≈ $0.00000896, so a $0.000005 cap means the
 # FIRST recorded call trips the budget.
-BUDGET_OUT="$(mktemp /tmp/headlesscode-e2e6-budget-XXXXXX.out)"
+BUDGET_OUT="$(mktemp "$TMPDIR/headlesscode-e2e6-budget-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		HEADLESSCODE_OPENROUTER_API_KEY="test" \
@@ -163,7 +166,7 @@ fi
 
 # ── 3. Part B — concurrency-cap sweep (fake GitHub + stubbed spawner) ───────
 echo "== [3/6] stub spawner + 3-issue storm fixture =="
-SPAWN_STUB="$(mktemp /tmp/headlesscode-e2e6-spawn-XXXXXX.sh)"
+SPAWN_STUB="$(mktemp "$TMPDIR/headlesscode-e2e6-spawn-XXXXXX.sh")"
 cat > "$SPAWN_STUB" <<'EOF'
 #!/usr/bin/env bash
 # STUB spawner for the Phase 6 e2e — see scripts/e2e-phase6/run.sh.
@@ -184,7 +187,7 @@ exit 0
 EOF
 chmod +x "$SPAWN_STUB"
 
-ISSUES_STORM="$(mktemp /tmp/headlesscode-e2e6-storm-XXXXXX.json)"
+ISSUES_STORM="$(mktemp "$TMPDIR/headlesscode-e2e6-storm-XXXXXX.json")"
 cat > "$ISSUES_STORM" <<'EOF'
 [
   {
@@ -217,11 +220,11 @@ EOF
 # ── 4. Cap sweep run: 3 issues, cap 2 -> 2 spawned, 1 pending ───────────────
 echo "== [4/6] watcher sweep with --max-concurrent-sessions 2 =="
 kill_mock
-GH_LOG="$(mktemp /tmp/headlesscode-e2e6-gh-XXXXXX.log)"
+GH_LOG="$(mktemp "$TMPDIR/headlesscode-e2e6-gh-XXXXXX.log")"
 start_mock "MOCK_ISSUES_FILE=$ISSUES_STORM node scripts/e2e-phase5/mock-github.mjs" "$GH_LOG" GH_PORT
 sleep 0.2
 
-CAP_OUT="$(mktemp /tmp/headlesscode-e2e6-cap-XXXXXX.out)"
+CAP_OUT="$(mktemp "$TMPDIR/headlesscode-e2e6-cap-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		GH_TOKEN="test" \
@@ -258,7 +261,7 @@ fi
 
 # ── 5. Missing token -> clear error (guardrail hygiene unchanged) ────────────
 echo "== [5/6] missing GH_TOKEN =="
-NOTOKEN_OUT="$(mktemp /tmp/headlesscode-e2e6-notoken-XXXXXX.out)"
+NOTOKEN_OUT="$(mktemp "$TMPDIR/headlesscode-e2e6-notoken-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		env -u GH_TOKEN -u GITHUB_TOKEN \

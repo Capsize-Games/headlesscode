@@ -26,6 +26,9 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TMPDIR="${TMPDIR:-"$ROOT/.headlesscode/scratch"}"
+mkdir -p "$TMPDIR"
+export TMPDIR
 KEEP="${KEEP:-0}"
 
 PASS=0
@@ -111,7 +114,7 @@ if [ -z "$FIXTURE" ] || [ ! -d "$FIXTURE/.git" ]; then
 	echo "  fixture setup failed; aborting" >&2
 	exit 1
 fi
-BARE="$(mktemp -d /tmp/headlesscode-e2e-bare-XXXXXX)"
+BARE="$(mktemp -d "$TMPDIR/headlesscode-e2e-bare-XXXXXX")"
 git -C "$FIXTURE" branch -M master
 git init --bare -q "$BARE"
 git -C "$FIXTURE" remote add origin "$BARE"
@@ -150,15 +153,15 @@ echo "  wrote 2 task files under $FIXTURE/plans/parallel-tasks"
 
 # ── 3. Mock OpenRouter servers (worker + reviewer, separate ports) ──────────
 echo "== [3/10] mock OpenRouter servers =="
-WORKER_MOCK_LOG="$(mktemp /tmp/headlesscode-e2e-phase2-worker-mock-XXXXXX.log)"
-REVIEW_MOCK_LOG="$(mktemp /tmp/headlesscode-e2e-phase2-review-mock-XXXXXX.log)"
+WORKER_MOCK_LOG="$(mktemp "$TMPDIR/headlesscode-e2e-phase2-worker-mock-XXXXXX.log")"
+REVIEW_MOCK_LOG="$(mktemp "$TMPDIR/headlesscode-e2e-phase2-review-mock-XXXXXX.log")"
 start_mock success "$WORKER_MOCK_LOG" WORKER_PORT
 start_mock review-clean "$REVIEW_MOCK_LOG" REVIEW_PORT
 sleep 0.2
 
 # ── 4. orchestrate --dry-run: split plan + spawn commands ───────────────────
 echo "== [4/10] orchestrate --dry-run =="
-ISSUES_JSON="$(mktemp /tmp/headlesscode-e2e-phase2-issues-XXXXXX.json)"
+ISSUES_JSON="$(mktemp "$TMPDIR/headlesscode-e2e-phase2-issues-XXXXXX.json")"
 cat > "$ISSUES_JSON" <<'EOF'
 [
   { "number": 1, "title": "Add auth token validation to the request handler", "body": "hot path: auth + request handling" },
@@ -166,7 +169,7 @@ cat > "$ISSUES_JSON" <<'EOF'
   { "number": 3, "title": "Decompose models.py into focused files", "body": "" }
 ]
 EOF
-DRYRUN_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-dryrun-XXXXXX.out)"
+DRYRUN_OUT="$(mktemp "$TMPDIR/headlesscode-e2e-phase2-dryrun-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		npx tsx src/cli.ts orchestrate --repo "$FIXTURE" --issues-json "$ISSUES_JSON" --dry-run
@@ -184,7 +187,7 @@ fi
 
 # ── 5. Real spawn (2 specs, real workers against the mock) ──────────────────
 echo "== [4.5/10] no-index guardrail: ALLOW_UNINDEXED unset => hard fail =="
-GUARD_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-guard-XXXXXX.out)"
+GUARD_OUT="$(mktemp "$TMPDIR/headlesscode-e2e-phase2-guard-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		TARGET_REPO="$FIXTURE" \
@@ -218,7 +221,7 @@ cat > "$FIXTURE/.headlesscode/mode-models.json" <<'EOF'
   "_condensation": "qwen/qwen3-8b"
 }
 EOF
-SPAWN_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-spawn-XXXXXX.out)"
+SPAWN_OUT="$(mktemp "$TMPDIR/headlesscode-e2e-phase2-spawn-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		TARGET_REPO="$FIXTURE" \
@@ -333,7 +336,7 @@ fi
 # Run the REAL watcher once: it must pick up the .harness.done markers and
 # transition both groups to done in the state file (Phase 2 completion path).
 echo "  running watchGroups (watch-invoke.ts)..."
-WATCH_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-watch-XXXXXX.out)"
+WATCH_OUT="$(mktemp "$TMPDIR/headlesscode-e2e-phase2-watch-XXXXXX.out")"
 (
 	cd "$ROOT" && npx tsx scripts/e2e-phase2/watch-invoke.ts "$FIXTURE" 200
 ) >"$WATCH_OUT" 2>&1
@@ -376,7 +379,7 @@ fi
 
 # ── 8. Review invocation (second harness run, read-only) ────────────────────
 echo "== [8/10] review invocation (mock scenario, read-only) =="
-REVIEW_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-review-XXXXXX.out)"
+REVIEW_OUT="$(mktemp "$TMPDIR/headlesscode-e2e-phase2-review-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		OPENROUTER_BASE_URL="http://127.0.0.1:$REVIEW_PORT" \
@@ -414,7 +417,7 @@ fi
 # worker on the SAME worktree twice (max-continuations 2) and then mark the
 # group needs-human.
 echo "== [9/10] iteration-exhaustion auto-continue (mock exhaustion scenario) =="
-EXHAUST_MOCK_LOG="$(mktemp /tmp/headlesscode-e2e-phase2-exhaust-mock-XXXXXX.log)"
+EXHAUST_MOCK_LOG="$(mktemp "$TMPDIR/headlesscode-e2e-phase2-exhaust-mock-XXXXXX.log")"
 start_mock exhaustion "$EXHAUST_MOCK_LOG" EXHAUST_PORT
 cat > "$FIXTURE/plans/parallel-tasks/w3-issue29.md" <<'EOF'
 ## Your assignment
@@ -428,7 +431,7 @@ Fix the bug in src/greet.js: greet() must return "Hello, " + name (issue #29).
 3. Verify with `node src/greet.test.js`.
 4. Report via attempt_completion.
 EOF
-CONT_SPAWN_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-cont-spawn-XXXXXX.out)"
+CONT_SPAWN_OUT="$(mktemp "$TMPDIR/headlesscode-e2e-phase2-cont-spawn-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		TARGET_REPO="$FIXTURE" \
@@ -467,7 +470,7 @@ else
 fi
 
 # Run the continuation watcher (max-continuations 2 -> initial + 2 re-spawns -> needs-human).
-CONT_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-cont-XXXXXX.out)"
+CONT_OUT="$(mktemp "$TMPDIR/headlesscode-e2e-phase2-cont-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		OPENROUTER_BASE_URL="http://127.0.0.1:$EXHAUST_PORT" \
@@ -510,7 +513,7 @@ Fix the bug in src/greet.js: greet() must return "Hello, " + name (issue #20).
 3. Verify with `node src/greet.test.js`.
 4. Report via attempt_completion.
 EOF
-STOP_SPAWN_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-stop-spawn-XXXXXX.out)"
+STOP_SPAWN_OUT="$(mktemp "$TMPDIR/headlesscode-e2e-phase2-stop-spawn-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		TARGET_REPO="$FIXTURE" \
@@ -555,7 +558,7 @@ else
 fi
 
 # Stop it: the WHOLE tree must die, and no completion marker may appear.
-STOP_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-stop-XXXXXX.out)"
+STOP_OUT="$(mktemp "$TMPDIR/headlesscode-e2e-phase2-stop-XXXXXX.out")"
 (
 	cd "$ROOT" && bash scripts/stop-worker.sh "$FIXTURE/.worktrees/w4"
 ) >"$STOP_OUT" 2>&1
@@ -591,7 +594,7 @@ COLLIDE_DATE="$(date +%Y-%m-%d)"
 git -C "$FIXTURE" branch "issues/w5-${COLLIDE_DATE}" master >/dev/null 2>&1 || true
 # Remote leftover: push a branch named exactly as w6's intended branch.
 git -C "$FIXTURE" push -q origin "master:refs/heads/issues/w6-${COLLIDE_DATE}" >/dev/null 2>&1 || true
-COLLIDE_SPAWN_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-collide-XXXXXX.out)"
+COLLIDE_SPAWN_OUT="$(mktemp "$TMPDIR/headlesscode-e2e-phase2-collide-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		TARGET_REPO="$FIXTURE" \
@@ -660,7 +663,7 @@ fi
 # landed in ORCHESTRATOR_TASK.md, the worker still completed + fixed the bug,
 # and the state records plan_first.status=ok.
 echo "== [9.7/10] plan-first (issue #49): architect plan session before the code worker =="
-PLAN_MOCK_LOG="$(mktemp /tmp/headlesscode-e2e-phase2-plan-mock-XXXXXX.log)"
+PLAN_MOCK_LOG="$(mktemp "$TMPDIR/headlesscode-e2e-phase2-plan-mock-XXXXXX.log")"
 start_mock plan-first "$PLAN_MOCK_LOG" PLAN_PORT
 cat > "$FIXTURE/plans/parallel-tasks/w7-issue7.md" <<'EOF'
 ## Your assignment
@@ -683,7 +686,7 @@ cat > "$FIXTURE/plans/parallel-tasks/w7-plan.md" <<'EOF'
 Produce a compact implementation plan for ORCHESTRATOR_TASK.md (issue #7) and
 write it to PLAN.md at the workspace root. DO NOT implement anything.
 EOF
-PLAN_SPAWN_OUT="$(mktemp /tmp/headlesscode-e2e-phase2-plan-spawn-XXXXXX.out)"
+PLAN_SPAWN_OUT="$(mktemp "$TMPDIR/headlesscode-e2e-phase2-plan-spawn-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		TARGET_REPO="$FIXTURE" \
