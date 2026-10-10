@@ -45,7 +45,10 @@ evidence.
 Record the timeline, affected versions and configurations, impact, containment,
 fix, user notification, and disclosure decision. Review which controls failed
 or were missing, and whether runtime behavior or configuration should change.
-Assign concrete follow-up work and verify those changes before closing it.
+Record implementation details that changed agent behavior, including prompt
+and tool changes, model routes, runtime flags, policy and image digests, and
+control configuration. Assign concrete follow-up work and verify those changes
+before closing it.
 
 ## Report template
 

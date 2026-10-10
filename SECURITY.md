@@ -10,9 +10,11 @@ privileges** and can **read and modify your files** — including `~/.ssh`,
 
 **Run it only on a machine you are willing to let an AI operate, only on
 repositories you trust, and only with untrusted content isolated from your real
-session.** This project does not sandbox agent actions, and nothing in the
-harness can be relied upon to stop a malicious or compromised model that has
-been given the ability to execute commands.
+session.** The default local profile does not sandbox agent actions. Use the
+[contained profile](./docs/security-profiles.md) to configure an external
+OpenShell boundary with pinned policy, image, evidence, and emergency controls.
+Local command permissions and process cancellation do not contain a malicious
+process with unrestricted host access.
 
 ## Default-allow command execution
 
@@ -65,9 +67,10 @@ credentials:
 - No writable access to anything you care about beyond a scratch workspace.
 - Network access limited if exfiltration is a concern.
 
-The harness itself cannot provide this isolation, and no amount of prompt
-engineering, rules files, or "trusted mode" configuration is a substitute for
-it.
+The [contained profile](./docs/security-profiles.md) configures and checks an
+external OpenShell boundary. The operator must protect its gateway, collector,
+control state, and pinned configuration outside the guest. Prompt engineering
+and rules files do not replace that boundary.
 
 ## Browser and vision cloud data flow
 
@@ -171,12 +174,13 @@ Keep credentials and user data out of reports.
 
 Coordinated disclosures are published through
 [repository security advisories](https://github.com/Capsize-Games/headlesscode/security/advisories).
+See the [incident response procedure](./docs/incident-response.md) for triage,
+containment, affected-user notification, and post-incident review.
 
 ## Supported versions
 
-Security fixes target the current `master` branch. The package version is
-1.3.0 and the repository has tagged releases, including `v1.3.0`. Older tags
-do not have a separate backport commitment.
+Security fixes target the current `master` branch. This source version is
+1.4.0. Older release tags do not have a separate backport commitment.
 
 ## Security-relevant areas
 

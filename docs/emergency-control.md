@@ -3,7 +3,8 @@
 The supervisor can expose a local emergency-control endpoint for a session or
 RSI worker. It stores state outside the candidate workspace under
 `~/.local/share/headlesscode/control` by default. Set
-`HEADLESSCODE_CONTROL_DIR` to use another supervisor-owned directory. Set
+`HEADLESSCODE_CONTROL_STATE_DIR` (or `HEADLESSCODE_CONTROL_DIR`) to use another
+supervisor-owned directory. Set
 `HEADLESSCODE_CONTROL_SOCKET_DIR` when the default control directory is too
 long for the operating system's Unix socket path limit. State and Unix socket
 files are restricted to the current operating-system user, and an exclusive
@@ -34,3 +35,11 @@ request sandbox deletion. Process-group termination does not contain arbitrary
 processes that deliberately detach from that group. In trusted local execution,
 the process runs with the invoking user's permissions; the controller does not
 claim to contain such a process.
+
+For a direct CLI task, set `HEADLESSCODE_CONTROL_ID` to a fresh identity before
+launching `headlesscode`. The CLI starts the controller before the first model
+request and routes its abort signal into model calls and shell commands. Use
+the same state/socket directory settings in a separate `headlesscode-control`
+process. Control directories must be outside the task workspace and must not
+traverse symlinks. A completed task records a terminal stop; reusing that
+identity requires an explicit operator resume.

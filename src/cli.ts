@@ -47,7 +47,9 @@ import { openShellSessionMain } from "./cloud/openshell-session.js"
 import { cleanupContainedRuntimeProfile, resolveContainedRuntimeProfile, resolveSecurityProfile, serializeResolvedContainedProfile, type SecurityProfileName } from "./security/profile.js"
 import { evidenceJournalFromEnv, evidenceJournalFromProtectedConfigFile, runEvidenceCli } from "./evidence/index.js"
 
-const VERSION = "0.1.0"
+import { startSessionEmergencyControl } from "./control/session-runtime.js"
+
+const VERSION = (JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version
 
 interface CliOptions {
 	mode: string
@@ -1583,95 +1585,108 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		process.stderr.write(`headlesscode: invalid evidence runtime configuration: ${error instanceof Error ? error.message : String(error)}\n`)
 		return 2
 	}
-	const session = new HeadlessSession({
-		workspaceRoot,
-		sessionId: options.sessionId,
-		mode: options.mode,
-		model: effectiveModel,
-		taskText,
-		maxIterations: options.maxIterations,
-		maxRecursionDepth,
-		childIterationFraction,
-		consecutiveErrorLimit,
-		windowSize: options.windowSize,
-		contextWindowTokens,
-		condenseThresholdFraction,
-		condenseEarlyFireFraction,
-		condenseModel,
-		disableLlmCondensation,
-		llmTimeoutMs,
-		stream: options.stream,
-		reasoningEffort,
-		temperature: options.temperature,
-		requireExplicitCompletion,
-		patchLocalToolSchemas,
-		verifyBeforeCompletion,
-		evidenceRequiredCompletion,
-		trackCost,
-		requireArtifactBeforeCompletion,
-		requireArtifactPathPattern: options.requireArtifactPath,
-		requireArtifactMinCitations: options.requireArtifactMinCitations,
-		requireArtifactSections: options.requireArtifactSections,
-		guardLargeOverwrites,
-		disableReadFileCache,
-		llmClient: client,
-		logger,
-		memory,
-		project,
-		budget,
-		checkpoints: !options.noCheckpoints,
-		checkpointDir: options.checkpointDir,
-		decisionTimeoutMs,
-		autoApproveModeSwitch,
-		maxModeSwitches,
-		maxTokens,
-		maxPauseMs,
-		permissions,
-		...(evidenceRuntime ? { sessionId: evidenceRuntime.sessionId, evidenceJournal: evidenceRuntime.evidenceJournal, evidenceRequired: evidenceRuntime.evidenceRequired } : {}),
-		// Opt-in local exploration phase (default OFF). Flag OR env var — the
-		// phase itself resolves the remaining HEADLESSCODE_LOCAL_EXPLORE_*
-		// defaults at call time. Any local failure fails open to cloud-only.
-		localExplore: options.localExplore || isLocalExploreEnabled(process.env),
-	})
-
-	const result = await session.run()
-
-	// A session writes into workspaceRoot throughout the run (file edits,
-	// its own .headlesscode/{events,usage,reports}, git's index as it
-	// stages things) AND, when workspaceRoot is a worktree, into the
-	// source repo's separate .git/worktrees/<name>/ admin dir — chowning
-	// only at worktree *creation* time (see session-launch.ts's
-	// ensureWorktree) misses all of this. Runs regardless of success/
-	// failure — a failed session can leave root-owned files too. No-ops
-	// when HEADLESSCODE_DASHBOARD_WORKTREE_OWNER isn't set (today's
-	// default for a non-container / non-root run).
-	chownWorktreeWorkspace(workspaceRoot)
-
-	if (session.memoryStats) {
-		process.stdout.write(
-			`[memory] project="${project}" recalled ${session.memoryStats.recalledFacts} fact(s) / ${session.memoryStats.recalledSessions} session(s); recorded ${session.memoryStats.recordedFacts} fact(s) / ${session.memoryStats.recordedSessions} session(s)\n`,
-		)
+	let emergencyControl
+	try { emergencyControl = await startSessionEmergencyControl({ workspaceRoot, evidence: evidenceRuntime }) } catch (error) {
+		process.stderr.write(`headlesscode: invalid emergency control configuration: ${error instanceof Error ? error.message : String(error)}\n`)
+		return 2
 	}
+	try {
+		const session = new HeadlessSession({
+			workspaceRoot,
+			sessionId: options.sessionId,
+			mode: options.mode,
+			model: effectiveModel,
+			taskText,
+			maxIterations: options.maxIterations,
+			maxRecursionDepth,
+			childIterationFraction,
+			consecutiveErrorLimit,
+			windowSize: options.windowSize,
+			contextWindowTokens,
+			condenseThresholdFraction,
+			condenseEarlyFireFraction,
+			condenseModel,
+			disableLlmCondensation,
+			llmTimeoutMs,
+			stream: options.stream,
+			reasoningEffort,
+			temperature: options.temperature,
+			requireExplicitCompletion,
+			patchLocalToolSchemas,
+			verifyBeforeCompletion,
+			evidenceRequiredCompletion,
+			trackCost,
+			requireArtifactBeforeCompletion,
+			requireArtifactPathPattern: options.requireArtifactPath,
+			requireArtifactMinCitations: options.requireArtifactMinCitations,
+			requireArtifactSections: options.requireArtifactSections,
+			guardLargeOverwrites,
+			disableReadFileCache,
+			llmClient: client,
+			logger,
+			memory,
+			project,
+			budget,
+			checkpoints: !options.noCheckpoints,
+			checkpointDir: options.checkpointDir,
+			decisionTimeoutMs,
+			autoApproveModeSwitch,
+			maxModeSwitches,
+			maxTokens,
+			maxPauseMs,
+			permissions,
+			signal: emergencyControl?.signal,
+			...(evidenceRuntime ? { sessionId: evidenceRuntime.sessionId, evidenceJournal: evidenceRuntime.evidenceJournal, evidenceRequired: evidenceRuntime.evidenceRequired } : {}),
+			// Opt-in local exploration phase (default OFF). Flag OR env var — the
+			// phase itself resolves the remaining HEADLESSCODE_LOCAL_EXPLORE_*
+			// defaults at call time. Any local failure fails open to cloud-only.
+			localExplore: options.localExplore || isLocalExploreEnabled(process.env),
+		})
 
-	if (result.budgetUsage) {
-		process.stdout.write(
-			`[budget] cost $${result.budgetUsage.costUsd.toFixed(6)}, elapsed ${result.budgetUsage.elapsedMs}ms, iterations ${result.budgetUsage.iterations}, model ${result.budgetUsage.model}\n`,
-		)
-	}
+		const result = await session.run()
 
-	if (result.status === "success") {
-		logger.info("session succeeded", { iterations: result.iterations, toolCalls: result.toolCalls })
-		process.stdout.write(result.result + "\n")
-		return 0
-	}
+		// A session writes into workspaceRoot throughout the run (file edits,
+		// its own .headlesscode/{events,usage,reports}, git's index as it
+		// stages things) AND, when workspaceRoot is a worktree, into the
+		// source repo's separate .git/worktrees/<name>/ admin dir — chowning
+		// only at worktree *creation* time (see session-launch.ts's
+		// ensureWorktree) misses all of this. Runs regardless of success/
+		// failure — a failed session can leave root-owned files too. No-ops
+		// when HEADLESSCODE_DASHBOARD_WORKTREE_OWNER isn't set (today's
+		// default for a non-container / non-root run).
+		chownWorktreeWorkspace(workspaceRoot)
 
-	logger.error("session failed", { error: result.error, iterations: result.iterations, reason: result.reason })
-	if (result.reason === "budget") {
-		process.stderr.write(`headlesscode: task aborted by budget: ${result.error ?? "budget exceeded"}\n`)
+		if (session.memoryStats) {
+			process.stdout.write(
+				`[memory] project="${project}" recalled ${session.memoryStats.recalledFacts} fact(s) / ${session.memoryStats.recalledSessions} session(s); recorded ${session.memoryStats.recordedFacts} fact(s) / ${session.memoryStats.recordedSessions} session(s)\n`,
+			)
+		}
+
+		if (result.budgetUsage) {
+			process.stdout.write(
+				`[budget] cost $${result.budgetUsage.costUsd.toFixed(6)}, elapsed ${result.budgetUsage.elapsedMs}ms, iterations ${result.budgetUsage.iterations}, model ${result.budgetUsage.model}\n`,
+			)
+		}
+
+		if (result.status === "success") {
+			logger.info("session succeeded", { iterations: result.iterations, toolCalls: result.toolCalls })
+			process.stdout.write(result.result + "\n")
+			return 0
+		}
+
+		logger.error("session failed", { error: result.error, iterations: result.iterations, reason: result.reason })
+		if (result.reason === "budget") {
+			process.stderr.write(`headlesscode: task aborted by budget: ${result.error ?? "budget exceeded"}\n`)
+			return 1
+		}
+		process.stderr.write(`headlesscode: task failed: ${result.error ?? "unknown error"}\n`)
 		return 1
+	} finally {
+		try {
+			if (emergencyControl?.state === "running") await emergencyControl.command("stop", "session finished")
+		} finally { await emergencyControl?.close() }
 	}
-	process.stderr.write(`headlesscode: task failed: ${result.error ?? "unknown error"}\n`)
-	return 1
+
 }
 
 /**
