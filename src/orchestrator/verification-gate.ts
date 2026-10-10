@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process"
+import { createHash } from "node:crypto"
 import * as fs from "node:fs"
 import * as path from "node:path"
 
@@ -82,30 +83,37 @@ export function hasRealWorktreeChanges(wtPath: string): boolean {
 
 /**
  * Tier 2 of the same 2026-08-28 incident's fix (see hasRealWorktreeChanges):
- * even once real work exists to review, a "clean"/"pass" verdict is only as
- * trustworthy as the verification the session actually did. Cross-checks
- * the review/QA session's OWN event-log transcript (never re-derived from
- * its summary prose, which is exactly what was fabricated) for at least one
- * REAL, non-error `execute_command` result — the one tool that actually
- * proves something was run and checked, as opposed to read_file/list_files
- * (which only prove something was looked at). A session that declares
- * "clean"/"pass" without ever running a single successful command has
- * nothing behind that verdict but its own prose, the exact gap that let
- * the fabricated 2026-08-28 review through even with a structured,
- * required-format verdict line.
- *
- * Deliberately narrow like hasRealWorktreeChanges: this checks that SOME
- * real verification activity happened at all, not that specific claimed
- * numbers (e.g. "8691 insertions") match specific tool outputs — matching
- * every claim in free-form prose against the transcript has no realistic
- * false-positive ceiling (the exact trap parseReviewResult/parseQaResult's
- * own docs already warn against for heuristic text matching). Absent or
- * unreadable event log → false (same fail-closed posture as an empty
- * diff): a verdict this codebase cannot verify at all is never trusted.
+ * A "clean"/"pass" verdict is checked against the review/QA session's own
+ * event transcript, never its summary prose. With an operator command policy,
+ * every required command must have a matching, correlated successful result.
+ * With no policy, compatibility mode establishes only that some command
+ * activity succeeded; it is explicitly labeled legacy-command-activity-only,
+ * not independent verification. Missing logs or incomplete correlations fail
+ * closed. The ordinary local event feed is writable by the session and is not
+ * a signed external-verifier result.
  */
-export function hasRealVerificationActivity(workspaceRoot: string, reportPath: string | undefined): boolean {
+export type VerificationActivity = "required-commands-passed" | "legacy-command-activity-only" | "unverified"
+
+export function parseRequiredCommandIdentities(value = process.env.HEADLESSCODE_REQUIRED_VERIFICATION_COMMANDS_SHA256): string[] | undefined {
+	if (value === undefined || value.trim() === "") return undefined
+	const identities = value.split(",").map((item) => item.trim().toLowerCase())
+	if (identities.some((identity) => !/^[a-f0-9]{64}$/.test(identity))) {
+		throw new Error("HEADLESSCODE_REQUIRED_VERIFICATION_COMMANDS_SHA256 must be a comma-separated list of SHA-256 command identities")
+	}
+	return [...new Set(identities)]
+}
+
+export function commandIdentity(command: string): string {
+	return createHash("sha256").update(command, "utf8").digest("hex")
+}
+
+export function assessVerificationActivity(
+	workspaceRoot: string,
+	reportPath: string | undefined,
+	requiredCommandIdentities = parseRequiredCommandIdentities(),
+): VerificationActivity {
 	if (!reportPath) {
-		return false
+		return "unverified"
 	}
 	const sessionId = path.basename(reportPath, ".md")
 	const eventsPath = eventsFilePath(workspaceRoot, sessionId)
@@ -113,22 +121,44 @@ export function hasRealVerificationActivity(workspaceRoot: string, reportPath: s
 	try {
 		raw = fs.readFileSync(eventsPath, "utf-8")
 	} catch {
-		return false
+		return "unverified"
 	}
+	const calls = new Map<string, { commandIdentity: string; order: number }>()
+	const results: Array<{ callId: string; commandIdentity: string; successful: boolean; order: number }> = []
+	let order = 0
 	for (const line of raw.split("\n")) {
 		const trimmed = line.trim()
 		if (!trimmed) {
 			continue
 		}
-		let record: { type?: unknown; tool?: unknown; isError?: unknown }
+		let record: { type?: unknown; tool?: unknown; isError?: unknown; callId?: unknown; commandIdentity?: unknown }
 		try {
 			record = JSON.parse(trimmed)
 		} catch {
 			continue
 		}
-		if (record.type === "tool_result" && record.tool === "execute_command" && record.isError === false) {
-			return true
+		order++
+		if (record.tool !== "execute_command" || typeof record.callId !== "string" || !/^[a-f0-9]{64}$/.test(String(record.commandIdentity))) continue
+		if (record.type === "tool_call") {
+			if (!calls.has(record.callId)) calls.set(record.callId, { commandIdentity: String(record.commandIdentity), order })
+		} else if (record.type === "tool_result") {
+			results.push({ callId: record.callId, commandIdentity: String(record.commandIdentity), successful: record.isError === false, order })
 		}
 	}
-	return false
+	const passed = new Set<string>()
+	for (const result of results) {
+		const call = calls.get(result.callId)
+		if (call && call.order < result.order && call.commandIdentity === result.commandIdentity && result.successful) passed.add(result.commandIdentity)
+	}
+	if (requiredCommandIdentities !== undefined) {
+		return requiredCommandIdentities.length > 0 && requiredCommandIdentities.every((identity) => passed.has(identity))
+			? "required-commands-passed"
+			: "unverified"
+	}
+	return passed.size > 0 ? "legacy-command-activity-only" : "unverified"
+}
+
+/** Compatibility gate; callers should use assessVerificationActivity when the evidence mode matters. */
+export function hasRealVerificationActivity(workspaceRoot: string, reportPath: string | undefined): boolean {
+	return assessVerificationActivity(workspaceRoot, reportPath) !== "unverified"
 }
