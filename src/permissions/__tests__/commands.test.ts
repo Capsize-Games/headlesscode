@@ -185,7 +185,9 @@ async function testRedirectEscapeAlwaysDenied(): Promise<void> {
 			// $HC_TEST_OUTDIR resolves through expandEnv like any $VAR — pin it
 			// to the temp dir so the escaping case is deterministic.
 			const savedVar = process.env.HC_TEST_OUTDIR
+			const savedInsideVar = process.env.HC_TEST_INDIR
 			process.env.HC_TEST_OUTDIR = os.tmpdir()
+			process.env.HC_TEST_INDIR = ws
 			try {
 				for (const cmd of escaping) {
 					// Refused even with an allow-list that would otherwise permit it…
@@ -220,7 +222,7 @@ async function testRedirectEscapeAlwaysDenied(): Promise<void> {
 					`echo hi >> ${ws}/out.log`,
 					`echo hi 2> ${ws}/err.log`,
 					`cat > "${ws}/a b.txt"`,
-					`echo hi > $TMPDIR/x 2>&1`, // 2>&1 is fd duplication, NOT a path redirect
+					`echo hi > $HC_TEST_INDIR/x 2>&1`, // 2>&1 is fd duplication, NOT a path redirect
 					`echo hi > out.txt && echo ok > out2.txt`,
 				]
 				for (const cmd of allowed) {
@@ -248,6 +250,11 @@ async function testRedirectEscapeAlwaysDenied(): Promise<void> {
 					)
 				}
 			} finally {
+				if (savedInsideVar === undefined) {
+					delete process.env.HC_TEST_INDIR
+				} else {
+					process.env.HC_TEST_INDIR = savedInsideVar
+				}
 				if (savedVar === undefined) {
 					delete process.env.HC_TEST_OUTDIR
 				} else {
@@ -264,6 +271,8 @@ async function testRedirectEscapeAlwaysDenied(): Promise<void> {
 
 async function testRedirectTargetParsing(): Promise<void> {
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-commands-redir-parse-"))
+	const savedInsideVar = process.env.HC_TEST_INDIR
+	process.env.HC_TEST_INDIR = ws
 	try {
 		// Targets are extracted with quote-stripped words.
 		assert.deepEqual(
@@ -312,7 +321,7 @@ async function testRedirectTargetParsing(): Promise<void> {
 		assert.notEqual(checkRedirectEscape(`echo hi > $HOME/x.txt`, ws), null, "$HOME escapes the workspace")
 		assert.equal(checkRedirectEscape(`echo hi > ./x.txt`, ws), null, "relative targets stay inside")
 		assert.equal(checkRedirectEscape(`echo hi > out.txt`, ws), null)
-		assert.equal(checkRedirectEscape(`echo hi > $TMPDIR/x 2>&1`, ws), null, "fd duplication is not a redirect target")
+		assert.equal(checkRedirectEscape(`echo hi > $HC_TEST_INDIR/x 2>&1`, ws), null, "fd duplication is not a redirect target")
 		// Heredoc BODY redirects are still caught (raw scan, pre-parse).
 		assert.notEqual(checkRedirectEscape(`cat <<EOF\n> /tmp/x\nEOF`, ws), null, "heredoc body redirect escapes")
 
@@ -322,6 +331,11 @@ async function testRedirectTargetParsing(): Promise<void> {
 		assert.equal(describeRedirect({ operator: "2>", word: "/tmp/err.log", index: 0 }), "2> /tmp/err.log")
 		assert.equal(describeRedirect({ operator: "&>", word: "/tmp/both.log", index: 0 }), "&>/tmp/both.log")
 	} finally {
+		if (savedInsideVar === undefined) {
+			delete process.env.HC_TEST_INDIR
+		} else {
+			process.env.HC_TEST_INDIR = savedInsideVar
+		}
 		await fs.rm(ws, { recursive: true, force: true })
 	}
 }

@@ -27,7 +27,7 @@
  *     misbehaving).
  *
  *   review-clean / review-finding — Phase 2 reviewer scenario: the model
- *     only gets read-only tools (read_file etc.) and terminates with an
+ *     gets read and command tools, runs the fixture tests, and terminates with an
  *     attempt_completion that either verifies everything clean or reopens
  *     with findings. The e2e runner asserts write_to_file never appears in
  *     the review request's tool list.
@@ -268,14 +268,13 @@ function chatResponse(model, message) {
 
 // ─── Scenario responses ─────────────────────────────────────────────────────
 
-// Reviewer scenarios: the model only has read-only tools and terminates with
+// Reviewer scenarios: the model has read and command tools and terminates with
 // an attempt_completion that is either a clean verification or a finding that
 // reopens the issue.
 function reviewCleanCompletionText() {
 	return [
 		"REVIEW CLEAN",
-		"Verified for real: re-read the full diff, re-ran the project test (all passed), ",
-		"boot check clean, no silent behavior changes. All claims in the closing report hold. ",
+		"Read src/greet.js and ran node src/greet.test.js; all 3 assertions passed.",
 		"Nothing to change.",
 	].join("\n")
 }
@@ -516,7 +515,14 @@ function buildScenarioResponse({ model, historyToolCalls, systemPrompt, toolName
 				tool_calls: [toolCall(`call_mock_review_read`, "read_file", { path: BUGGY_FILE })],
 			})
 		}
-		// b. Terminate with the verdict (clean or finding/reopen).
+		if (historyToolCalls === 1) {
+			return chatResponse(model, {
+				role: "assistant",
+				content: null,
+				tool_calls: [toolCall("call_mock_review_verify", "execute_command", { command: "node src/greet.test.js" })],
+			})
+		}
+		// Terminate with the verdict (clean or finding/reopen).
 		return chatResponse(model, {
 			role: "assistant",
 			content: null,
@@ -572,6 +578,13 @@ function buildScenarioResponse({ model, historyToolCalls, systemPrompt, toolName
 					role: "assistant",
 					content: null,
 					tool_calls: [toolCall(`call_mock_review_read`, "read_file", { path: BUGGY_FILE })],
+				})
+			}
+			if (historyToolCalls === 1) {
+				return chatResponse(model, {
+					role: "assistant",
+					content: null,
+					tool_calls: [toolCall("call_mock_review_verify", "execute_command", { command: "node src/greet.test.js" })],
 				})
 			}
 			const reworkThisReview = reviewSessionCount <= REWORK_REVIEWS
