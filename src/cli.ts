@@ -15,7 +15,7 @@ import { LocalMemoryStore } from "./memory/local.js"
 import type { MemoryStore } from "./memory/types.js"
 import { OpenRouterClient, parseReasoningEffort } from "./llm/openrouter.js"
 import { OllamaClient } from "./llm/ollama.js"
-import type { LlmClient } from "./engine/types.js"
+import type { LlmClient, ChatMessage, SessionResult } from "./engine/types.js"
 import { HeadlessSession } from "./engine/loop.js"
 import { chownWorktreeWorkspace } from "./dashboard/session-launch.js"
 import { isLocalExploreEnabled } from "./engine/local-explore.js"
@@ -48,6 +48,7 @@ import { cleanupContainedRuntimeProfile, resolveContainedRuntimeProfile, resolve
 import { evidenceJournalFromEnv, evidenceJournalFromProtectedConfigFile, runEvidenceCli } from "./evidence/index.js"
 
 import { finishSessionEmergencyControl, startSessionEmergencyControl } from "./control/session-runtime.js"
+import type { SkillRegistry } from "./skills/registry.js"
 
 const VERSION = (JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version
 
@@ -192,6 +193,12 @@ Usage:
   headlesscode --dry-run [options]          # build system prompt + validate config, no LLM call
 
 Subcommands:
+  headlesscode chat [--workspace <path>] [--resume <id>] [--model <id>]
+              Interactive terminal conversation with saved sessions and controls.
+  headlesscode skills <list|inspect|validate|enable|import> [arguments]
+              Discover, inspect, enable, or import local SKILL.md instructions.
+  headlesscode sessions <discover|import|list|show|export|fork> [arguments]
+              Import Claude, Codex, or Muse history and manage session archives.
   headlesscode openshell-session --repo <path> --task <text> --policy <path>
               Run one task in an OpenShell sandbox and keep its Git worktree
               for review. See \`openshell-session --help\` for options.
@@ -741,7 +748,33 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 	return { options }
 }
 
-export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
+export interface CliRuntimeHooks {
+	quiet?: boolean
+	signal?: AbortSignal
+	onEvent?: (type: string, fields: Record<string, unknown>) => void
+	onMessage?: (message: ChatMessage) => void
+	onResult?: (result: SessionResult) => void
+	llmClient?: LlmClient
+	skillRegistry?: SkillRegistry
+	stdout?: { write(text: string): unknown }
+	stderr?: { write(text: string): unknown }
+}
+
+export async function main(argv: string[] = process.argv.slice(2), hooks?: CliRuntimeHooks): Promise<number> {
+	const stdout = hooks?.stdout ?? process.stdout
+	const stderr = hooks?.stderr ?? process.stderr
+	if (argv[0] === "skills") {
+		const { runSkillsCli } = await import("./skills/cli.js")
+		return runSkillsCli(argv.slice(1), { stdout: (text) => { stdout.write(text) }, stderr: (text) => { stderr.write(text) } })
+	}
+	if (argv[0] === "sessions") {
+		const { sessionsMain } = await import("./sessions/cli.js")
+		return sessionsMain(argv.slice(1))
+	}
+	if (argv[0] === "chat") {
+		const { terminalMain } = await import("./terminal/cli.js")
+		return terminalMain(argv.slice(1), { llmClient: hooks?.llmClient, skillRegistry: hooks?.skillRegistry, signal: hooks?.signal })
+	}
 	if (argv[0] === "evidence") return runEvidenceCli(argv.slice(1))
 	if (argv[0] === "control") {
 		const { controlMain } = await import("./control/cli.js")
@@ -752,18 +785,18 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		try {
 			payload = JSON.parse(Buffer.from(argv[1] ?? "", "base64url").toString("utf8")) as Record<string, unknown>
 		} catch {
-			process.stderr.write("headlesscode: invalid OpenShell session payload\n")
+			stderr.write("headlesscode: invalid OpenShell session payload\n")
 			return 2
 		}
 		if (argv[0] === "openshell-review-session") {
 			const { runReview } = await import("./orchestrator/reviewer.js")
 			const result = await runReview(payload as unknown as Parameters<typeof runReview>[0])
-			process.stdout.write(`HEADLESSCODE_RESULT_JSON:${JSON.stringify(result)}\n`)
+			stdout.write(`HEADLESSCODE_RESULT_JSON:${JSON.stringify(result)}\n`)
 			return 0
 		}
 		const { runQa } = await import("./qa/qa.js")
 		const result = await runQa(payload as unknown as Parameters<typeof runQa>[0])
-		process.stdout.write(`HEADLESSCODE_RESULT_JSON:${JSON.stringify(result)}\n`)
+		stdout.write(`HEADLESSCODE_RESULT_JSON:${JSON.stringify(result)}\n`)
 		return 0
 	}
 	if (argv[0] === "openshell-worker") {
@@ -788,18 +821,18 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		const { runBoundedModelCandidate } = await import("./rsi/model-training.js")
 		const parsed = parseRsiArgs(argv.slice(1))
 		if (parsed.help) {
-			process.stdout.write("Usage: headlesscode rsi-train-model --repo <path> --archive-dir <path> --resume <run-id> --model-candidate-id <id>\nThe registered worker must use an OpenShell training image and a local Hugging Face checkpoint.\n")
+			stdout.write("Usage: headlesscode rsi-train-model --repo <path> --archive-dir <path> --resume <run-id> --model-candidate-id <id>\nThe registered worker must use an OpenShell training image and a local Hugging Face checkpoint.\n")
 			return 0
 		}
 		if (parsed.error || !parsed.config || !parsed.config.resumeRunId || !parsed.config.modelCandidateId || parsed.config.dryRun) {
-			process.stderr.write(`headlesscode rsi-train-model: ${parsed.error ?? "--resume and --model-candidate-id are required; dry-run is unsupported"}\n`)
+			stderr.write(`headlesscode rsi-train-model: ${parsed.error ?? "--resume and --model-candidate-id are required; dry-run is unsupported"}\n`)
 			return 2
 		}
 		const config = parsed.config
 		const archive = await readArchive(config.archiveDir)
 		const run = archive.activeRuns.find((entry) => entry.runId === config.resumeRunId) ?? archive.runs.find((entry) => entry.runId === config.resumeRunId)
 		if (!run) {
-			process.stderr.write(`headlesscode rsi-train-model: RSI run not found in ${config.archiveDir}\n`)
+			stderr.write(`headlesscode rsi-train-model: RSI run not found in ${config.archiveDir}\n`)
 			return 2
 		}
 		const policy = fleetQueuePolicy(process.env.HEADLESSCODE_RSI_QUEUE_NAME?.trim() || "rsi-default", config.maxConcurrent, process.env)
@@ -807,7 +840,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		try {
 			await queue.migrate()
 			const model = await runBoundedModelCandidate(config, run, queue, config.modelCandidateId!)
-			process.stdout.write(`[rsi-model] ${model.id}: ${model.status}; eligible=${model.eligibleForSelection === true}\n`)
+			stdout.write(`[rsi-model] ${model.id}: ${model.status}; eligible=${model.eligibleForSelection === true}\n`)
 			return model.eligibleForSelection ? 0 : 1
 		} finally {
 			await queue.close()
@@ -944,20 +977,20 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 
 	const { options, error } = parseArgs(argv)
 	if (error) {
-		process.stderr.write(`headlesscode: ${error}\n\n${USAGE}`)
+		stderr.write(`headlesscode: ${error}\n\n${USAGE}`)
 		return 2
 	}
 	if (options.help) {
-		process.stdout.write(USAGE)
+		stdout.write(USAGE)
 		return 0
 	}
 	if (options.version) {
-		process.stdout.write(`headlesscode ${VERSION}\n`)
+		stdout.write(`headlesscode ${VERSION}\n`)
 		return 0
 	}
 
 	const workspaceRoot = path.resolve(options.workspace ?? process.env.HEADLESSCODE_WORKSPACE_ROOT ?? process.cwd())
-	const logger = new Logger({ level: "info", filePath: options.logFile })
+	const logger = new Logger({ level: hooks?.quiet ? "silent" : "info", filePath: options.logFile })
 
 	// Silent-death observability (issue #150): live-verified 2026-08-21
 	// (twice, across two different models) that this process can disappear
@@ -972,34 +1005,36 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// SIGKILL, not SIGTERM) or a hard crash inside a native addon, but it
 	// closes every JS-level silent-exit path: an uncaught throw, a rejected
 	// promise nobody awaited, or a graceful termination request.
-	process.on("uncaughtException", (err) => {
-		logger.error("[cli] uncaughtException — process terminating", {
-			message: err instanceof Error ? err.message : String(err),
-			stack: err instanceof Error ? err.stack : undefined,
+	if (!hooks) {
+		process.on("uncaughtException", (err) => {
+			logger.error("[cli] uncaughtException — process terminating", {
+				message: err instanceof Error ? err.message : String(err),
+				stack: err instanceof Error ? err.stack : undefined,
+			})
+			process.exit(3)
 		})
-		process.exit(3)
-	})
-	process.on("unhandledRejection", (reason) => {
-		logger.error("[cli] unhandledRejection — process terminating", {
-			reason:
-				reason instanceof Error
-					? (reason.stack ?? reason.message)
-					: (() => {
-							try {
-								return JSON.stringify(reason)
-							} catch {
-								return String(reason)
-							}
-						})(),
+		process.on("unhandledRejection", (reason) => {
+			logger.error("[cli] unhandledRejection — process terminating", {
+				reason:
+					reason instanceof Error
+						? (reason.stack ?? reason.message)
+						: (() => {
+								try {
+									return JSON.stringify(reason)
+								} catch {
+									return String(reason)
+								}
+							})(),
+			})
+			process.exit(3)
 		})
-		process.exit(3)
-	})
-	process.on("SIGTERM", () => {
-		logger.warn("[cli] SIGTERM received — process terminating", {
-			rssMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+		process.on("SIGTERM", () => {
+			logger.warn("[cli] SIGTERM received — process terminating", {
+				rssMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+			})
+			process.exit(143)
 		})
-		process.exit(143)
-	})
+	}
 	// Cheap postmortem diagnostic for the #150 OOM hypothesis (unconfirmed —
 	// dmesg showed no OOM-killer entries when checked live, but access may
 	// have been permission-limited): RSS at session start costs one log
@@ -1093,8 +1128,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 			const dryRunEffort = resolveReasoningEffortForMode({ workspaceRoot, env: process.env })
 			parseReasoningEffort(dryRunEffort)
 
-			process.stdout.write(built.prompt + "\n")
-			process.stdout.write(
+			stdout.write(built.prompt + "\n")
+			stdout.write(
 				`\n───── dry-run summary ─────\n` +
 					`mode:             ${options.mode}\n` +
 					`model:            ${dryRunModel ?? "deepseek/deepseek-v4-flash-0731 (client default)"}\n` +
@@ -1107,17 +1142,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 			logger.info("dry-run complete", { mode: options.mode, workspaceRoot })
 			return 0
 		} catch (err) {
-			process.stderr.write(`headlesscode: dry-run failed: ${err instanceof Error ? err.message : String(err)}\n`)
+			stderr.write(`headlesscode: dry-run failed: ${err instanceof Error ? err.message : String(err)}\n`)
 			return 2
 		}
 	}
 
 	if (!options.task && !options.taskFile) {
-		process.stderr.write(`headlesscode: provide a task with --task <text> or --task-file <path>\n\n${USAGE}`)
+		stderr.write(`headlesscode: provide a task with --task <text> or --task-file <path>\n\n${USAGE}`)
 		return 2
 	}
 	if (options.task && options.taskFile) {
-		process.stderr.write("headlesscode: use either --task or --task-file, not both\n")
+		stderr.write("headlesscode: use either --task or --task-file, not both\n")
 		return 2
 	}
 
@@ -1127,17 +1162,18 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		try {
 			taskText = fs.readFileSync(taskFilePath, "utf-8")
 		} catch (err) {
-			process.stderr.write(
+			stderr.write(
 				`headlesscode: cannot read task file '${taskFilePath}': ${err instanceof Error ? err.message : String(err)}\n`,
 			)
 			return 2
 		}
 	}
 	if (taskText.trim() === "") {
-		process.stderr.write("headlesscode: task text is empty\n")
+		stderr.write("headlesscode: task text is empty\n")
 		return 2
 	}
 	if (options.securityProfile === "contained") {
+		if (hooks) { stderr.write("headlesscode: interactive turns require a supervisor-backed contained transport; use openshell-session\n"); return 2 }
 		try {
 			if (!options.sessionId) throw new Error("contained single-session launches require --session-id matching a provisioned per-session evidence config")
 			const profile = resolveContainedRuntimeProfile({ repoRoot: workspaceRoot, purpose: "worker" })
@@ -1161,7 +1197,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 				cleanupContainedRuntimeProfile(profile)
 			}
 		} catch (error) {
-			process.stderr.write(`headlesscode: contained security preflight failed: ${error instanceof Error ? error.message : String(error)}\n`)
+			stderr.write(`headlesscode: contained security preflight failed: ${error instanceof Error ? error.message : String(error)}\n`)
 			return 2
 		}
 	}
@@ -1175,8 +1211,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	)
 	const useLocalCodeBackend = localBackendModes.has(options.mode) && codeModeBackend === "ollama"
 	const apiKey = process.env.HEADLESSCODE_OPENROUTER_API_KEY ?? process.env.HEADLESSCODE_RSI_INFERENCE_CAPABILITY
-	if (!apiKey && !useLocalCodeBackend) {
-		process.stderr.write(
+	if (!apiKey && !useLocalCodeBackend && !hooks?.llmClient) {
+		stderr.write(
 			"headlesscode: HEADLESSCODE_OPENROUTER_API_KEY is not set.\n" +
 				"  Export it (e.g. export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-...) or use --dry-run to\n" +
 				"  validate the prompt/config without calling the LLM.\n",
@@ -1219,7 +1255,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	// requested via env var but the CURRENT mode isn't in the allow-list
 	// — was hardcoded to "code", now checks the real list.
 	if (codeModeBackend === "ollama" && !localBackendModes.has(options.mode)) {
-		process.stderr.write(
+		stderr.write(
 			`[headlesscode] NOTE: HEADLESSCODE_CODE_MODE_BACKEND=ollama is set, but --mode "${options.mode}" is not in HEADLESSCODE_LOCAL_BACKEND_MODES ("${[...localBackendModes].join(",")}") — this session will use the cloud OpenRouter model instead.\n`,
 		)
 	}
@@ -1239,7 +1275,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	const effectiveModel = useLocalCodeBackend
 		? (resolvePerModeEnv("HEADLESSCODE_CODE_MODE_MODEL", options.mode) ?? model)
 		: model
-	const client: LlmClient = useLocalCodeBackend
+	const client: LlmClient = hooks?.llmClient ?? (useLocalCodeBackend
 		? new OllamaClient({
 				defaultModel: effectiveModel,
 				// Issue #142: per-mode URL override (e.g. a review daemon on a
@@ -1261,7 +1297,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 				// that didn't explicitly pass --llm-timeout-ms.
 				timeoutMs: llmTimeoutMs,
 			})
-		: new OpenRouterClient({ apiKey, defaultModel: model })
+		: new OpenRouterClient({ apiKey, defaultModel: model }))
 	// A small local model's context is dominated by the full tool catalog
 	// (see src/engine/lazy-tools.ts) — default lazy loading ON for local
 	// sessions specifically, without touching the cloud path's prompt-cache-
@@ -1481,7 +1517,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	try {
 		parseReasoningEffort(reasoningEffort)
 	} catch (err) {
-		process.stderr.write(`headlesscode: ${err instanceof Error ? err.message : String(err)}\n`)
+		stderr.write(`headlesscode: ${err instanceof Error ? err.message : String(err)}\n`)
 		return 2
 	}
 
@@ -1570,7 +1606,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 			env: process.env,
 		})
 	} catch (err) {
-		process.stderr.write(`headlesscode: ${err instanceof Error ? err.message : String(err)}\n`)
+		stderr.write(`headlesscode: ${err instanceof Error ? err.message : String(err)}\n`)
 		return 2
 	}
 
@@ -1582,12 +1618,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 			: evidenceJournalFromEnv()
 		if (process.env.HEADLESSCODE_SECURITY_PROFILE === "contained" && (!evidenceRuntime || !evidenceRuntime.evidenceRequired)) throw new Error("contained guest runtime requires evidence and an authenticated supervisor config")
 	} catch (error) {
-		process.stderr.write(`headlesscode: invalid evidence runtime configuration: ${error instanceof Error ? error.message : String(error)}\n`)
+		stderr.write(`headlesscode: invalid evidence runtime configuration: ${error instanceof Error ? error.message : String(error)}\n`)
 		return 2
 	}
 	let emergencyControl
 	try { emergencyControl = await startSessionEmergencyControl({ workspaceRoot, evidence: evidenceRuntime }) } catch (error) {
-		process.stderr.write(`headlesscode: invalid emergency control configuration: ${error instanceof Error ? error.message : String(error)}\n`)
+		stderr.write(`headlesscode: invalid emergency control configuration: ${error instanceof Error ? error.message : String(error)}\n`)
 		return 2
 	}
 	try {
@@ -1635,7 +1671,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 			maxTokens,
 			maxPauseMs,
 			permissions,
-			signal: emergencyControl?.signal,
+			signal: hooks?.signal && emergencyControl?.signal ? AbortSignal.any([hooks.signal, emergencyControl.signal]) : hooks?.signal ?? emergencyControl?.signal,
+			onMessage: hooks?.onMessage,
+			eventHook: hooks?.onEvent,
+			skillRegistry: hooks?.skillRegistry,
 			...(evidenceRuntime ? { sessionId: evidenceRuntime.sessionId, evidenceJournal: evidenceRuntime.evidenceJournal, evidenceRequired: evidenceRuntime.evidenceRequired } : {}),
 			// Opt-in local exploration phase (default OFF). Flag OR env var — the
 			// phase itself resolves the remaining HEADLESSCODE_LOCAL_EXPLORE_*
@@ -1644,6 +1683,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		})
 
 		const result = await session.run()
+		hooks?.onResult?.(result)
 
 		// A session writes into workspaceRoot throughout the run (file edits,
 		// its own .headlesscode/{events,usage,reports}, git's index as it
@@ -1656,34 +1696,34 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		// default for a non-container / non-root run).
 		chownWorktreeWorkspace(workspaceRoot)
 
-		if (session.memoryStats) {
-			process.stdout.write(
+		if (session.memoryStats && !hooks?.quiet) {
+			stdout.write(
 				`[memory] project="${project}" recalled ${session.memoryStats.recalledFacts} fact(s) / ${session.memoryStats.recalledSessions} session(s); recorded ${session.memoryStats.recordedFacts} fact(s) / ${session.memoryStats.recordedSessions} session(s)\n`,
 			)
 		}
 
-		if (result.budgetUsage) {
-			process.stdout.write(
+		if (result.budgetUsage && !hooks?.quiet) {
+			stdout.write(
 				`[budget] cost $${result.budgetUsage.costUsd.toFixed(6)}, elapsed ${result.budgetUsage.elapsedMs}ms, iterations ${result.budgetUsage.iterations}, model ${result.budgetUsage.model}\n`,
 			)
 		}
 
 		if (result.status === "success") {
 			logger.info("session succeeded", { iterations: result.iterations, toolCalls: result.toolCalls })
-			process.stdout.write(result.result + "\n")
+			if (!hooks?.quiet) stdout.write(result.result + "\n")
 			return 0
 		}
 
 		logger.error("session failed", { error: result.error, iterations: result.iterations, reason: result.reason })
 		if (result.reason === "budget") {
-			process.stderr.write(`headlesscode: task aborted by budget: ${result.error ?? "budget exceeded"}\n`)
+			stderr.write(`headlesscode: task aborted by budget: ${result.error ?? "budget exceeded"}\n`)
 			return 1
 		}
-		process.stderr.write(`headlesscode: task failed: ${result.error ?? "unknown error"}\n`)
+		stderr.write(`headlesscode: task failed: ${result.error ?? "unknown error"}\n`)
 		return 1
 	} finally {
 		if (!await finishSessionEmergencyControl(emergencyControl)) {
-			process.stderr.write("headlesscode: emergency cleanup or durable stop failed; inspect the recorded control state\n")
+			stderr.write("headlesscode: emergency cleanup or durable stop failed; inspect the recorded control state\n")
 			return 1
 		}
 	}
