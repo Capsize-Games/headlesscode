@@ -212,3 +212,12 @@ Other adaptation notes for the next subtask:
   text), assembles 21 native (OpenAI-format) tool schemas, converts them to
   Anthropic format, and validates a `.roomodes`-style doc against
   `customModesSettingsSchema`. See `src/vendor/tests/smoke.ts`.
+
+## 6. Checkpoint dependency compatibility (2026-10-10)
+
+The checkpoint service uses the named `simpleGit` export for simple-git 4.
+Its environment filter also removes `VISUAL`, case-insensitively, before
+creating Git subprocesses. This keeps inherited editor commands out of shadow
+checkpoint operations and matches the dependency's unsafe-operation checks.
+These are local adaptations to `ShadowCheckpointService.ts`; upstream
+attribution and license notices remain in place.

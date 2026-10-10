@@ -31,6 +31,9 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TMPDIR="${TMPDIR:-"$ROOT/.headlesscode/scratch"}"
+mkdir -p "$TMPDIR"
+export TMPDIR
 KEEP="${KEEP:-0}"
 
 PASS=0
@@ -95,8 +98,8 @@ if [ -z "$FIXTURE" ] || [ ! -d "$FIXTURE/.git" ]; then
 	echo "  fixture setup failed; aborting" >&2
 	exit 1
 fi
-WT1="$(mktemp -d /tmp/headlesscode-e2e-perm-wt1-XXXXXX)"
-WT2="$(mktemp -d /tmp/headlesscode-e2e-perm-wt2-XXXXXX)"
+WT1="$(mktemp -d "$TMPDIR/headlesscode-e2e-perm-wt1-XXXXXX")"
+WT2="$(mktemp -d "$TMPDIR/headlesscode-e2e-perm-wt2-XXXXXX")"
 bash "$ROOT/scripts/e2e-fixture/spawn-worktree.sh" "$FIXTURE" "$WT1" >/dev/null
 bash "$ROOT/scripts/e2e-fixture/spawn-worktree.sh" "$FIXTURE" "$WT2" >/dev/null
 echo "  fixture: $FIXTURE"
@@ -105,14 +108,14 @@ echo "  pass 2 worktree: $WT2"
 
 # ── 2. Pass 1 — default config: both refused, CLI still exits 0 ─────────────
 echo "== [2/4] pass 1 — default config (expect both refused) =="
-MOCK1_LOG="$(mktemp /tmp/headlesscode-e2e-perm-mock1-XXXXXX.log)"
+MOCK1_LOG="$(mktemp "$TMPDIR/headlesscode-e2e-perm-mock1-XXXXXX.log")"
 start_mock "$MOCK1_LOG"
 MOCK1_PID="$MOCK_PID_OUT"
 MOCK1_PORT="$MOCK_PORT_OUT"
 echo "  mock 1 listening on 127.0.0.1:$MOCK1_PORT (pid $MOCK1_PID)"
 
-HARNESS1_LOG="$(mktemp /tmp/headlesscode-e2e-perm-harness1-XXXXXX.log)"
-OUT1="$(mktemp /tmp/headlesscode-e2e-perm-cli1-XXXXXX.out)"
+HARNESS1_LOG="$(mktemp "$TMPDIR/headlesscode-e2e-perm-harness1-XXXXXX.log")"
+OUT1="$(mktemp "$TMPDIR/headlesscode-e2e-perm-cli1-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		OPENROUTER_BASE_URL="http://127.0.0.1:$MOCK1_PORT" \
@@ -151,14 +154,14 @@ fi
 
 # ── 3. Pass 2 — --allow-protected-writes: the write now succeeds ────────────
 echo "== [3/4] pass 2 — --allow-protected-writes (expect the write to succeed) =="
-MOCK2_LOG="$(mktemp /tmp/headlesscode-e2e-perm-mock2-XXXXXX.log)"
+MOCK2_LOG="$(mktemp "$TMPDIR/headlesscode-e2e-perm-mock2-XXXXXX.log")"
 start_mock "$MOCK2_LOG"
 MOCK2_PID="$MOCK_PID_OUT"
 MOCK2_PORT="$MOCK_PORT_OUT"
 echo "  mock 2 listening on 127.0.0.1:$MOCK2_PORT (pid $MOCK2_PID)"
 
-HARNESS2_LOG="$(mktemp /tmp/headlesscode-e2e-perm-harness2-XXXXXX.log)"
-OUT2="$(mktemp /tmp/headlesscode-e2e-perm-cli2-XXXXXX.out)"
+HARNESS2_LOG="$(mktemp "$TMPDIR/headlesscode-e2e-perm-harness2-XXXXXX.log")"
+OUT2="$(mktemp "$TMPDIR/headlesscode-e2e-perm-cli2-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		OPENROUTER_BASE_URL="http://127.0.0.1:$MOCK2_PORT" \

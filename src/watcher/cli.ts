@@ -33,6 +33,8 @@ import * as path from "node:path"
 import { Logger } from "../engine/logger.js"
 import { watchIssues, type SweepResult } from "./watch.js"
 import { openshellPreflight } from "../cloud/openshell-preflight.js"
+import { resolveContainedRuntimeProfile, resolveSecurityProfile, serializeResolvedContainedProfile, type SecurityProfileName } from "../security/profile.js"
+import { validateContainedSupervisorRoots } from "../security/supervisor.js"
 
 const WATCH_USAGE = `headlesscode watch — Phase 5 GitHub issue watcher
 
@@ -63,6 +65,8 @@ Options:
   --mode <slug>          Harness mode for workers (default: code; forwarded
                          to the spawner as ORCHESTRATOR_MODE)
   --execution-provider <local|openshell> Worker runtime (default: local)
+  --security-profile <local|contained>  Trust boundary (default local: runs with host authority;
+                                       contained: OpenShell only, fails closed)
   --qa                   Pass-through: record that a QA round should follow
                          each batch (see docs/phase5-issue-watcher.md)
   --deploy               Pass-through: record that a deploy gate should follow
@@ -95,6 +99,7 @@ export interface WatchCliOptions {
 	stateFile?: string
 	mode: string
 	executionProvider: "local" | "openshell"
+	securityProfile?: SecurityProfileName
 	qa: boolean
 	deploy: boolean
 	memoryDir?: string
@@ -138,7 +143,13 @@ export function parseWatchArgs(argv: string[]): { options: WatchCliOptions; erro
 			return v
 		}
 
-		switch (flag) {
+			switch (flag) {
+			case "--security-profile": {
+				const v = next()
+				try { options.securityProfile = resolveSecurityProfile(v) }
+				catch (error) { return { options, error: error instanceof Error ? error.message : String(error) } }
+				break
+			}
 			case "--execution-provider": {
 				const v = next()
 				if (v !== "local" && v !== "openshell") return { options, error: "--execution-provider must be local or openshell" }
@@ -252,6 +263,14 @@ export function parseWatchArgs(argv: string[]): { options: WatchCliOptions; erro
 		}
 	}
 
+	if (!options.securityProfile) {
+		try { options.securityProfile = resolveSecurityProfile(process.env.HEADLESSCODE_SECURITY_PROFILE) }
+		catch (error) { return { options, error: error instanceof Error ? error.message : String(error) } }
+	}
+	if (options.securityProfile === "contained") {
+		if (options.executionProvider === "local" && argv.some((arg) => arg === "--execution-provider" || arg.startsWith("--execution-provider="))) return { options, error: "contained security profile cannot use the local execution provider" }
+		options.executionProvider = "openshell"
+	}
 	return { options }
 }
 
@@ -310,7 +329,24 @@ export async function watchMain(argv: string[]): Promise<number> {
 			return 2
 		}
 	}
-	if (!options.dryRun && options.executionProvider === "openshell") {
+	if (!options.dryRun && options.securityProfile === "contained") {
+		try {
+			const resolved = resolveContainedRuntimeProfile({ repoRoot, purpose: "worker" })
+			validateContainedSupervisorRoots(resolved, repoRoot)
+			process.env.HEADLESSCODE_SECURITY_PROFILE = "contained"
+			process.env.HEADLESSCODE_OPENSHELL_POLICY = resolved.policySnapshotPath
+			process.env.HEADLESSCODE_OPENSHELL_IMAGE = resolved.image
+			process.env.HEADLESSCODE_OPENSHELL_CPU = resolved.cpu
+			process.env.HEADLESSCODE_OPENSHELL_MEMORY = resolved.memory
+			process.env.HEADLESSCODE_OPENSHELL_PROVIDERS = resolved.providers.join(",")
+			process.env.HEADLESSCODE_CONTAINED_PROFILE_SHA256 = resolved.profileSha256
+			process.env.HEADLESSCODE_CONTAINED_POLICY_SHA256 = resolved.policySha256
+			process.env.HEADLESSCODE_CONTAINED_RUNTIME_PROFILE_JSON = serializeResolvedContainedProfile(resolved)
+		} catch (error) {
+			process.stderr.write(`headlesscode watch: contained security preflight failed: ${error instanceof Error ? error.message : String(error)}\n`)
+			return 2
+		}
+	} else if (!options.dryRun && options.executionProvider === "openshell") {
 		const issue = openshellPreflight()
 		if (issue) {
 			process.stderr.write(`headlesscode watch: OpenShell preflight failed: ${issue}\n`)

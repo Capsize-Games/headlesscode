@@ -39,12 +39,15 @@ jobs:
       - name: Test
         run: npm test
 
-      - name: Pack tarball and verify the bin launcher ships
+      - name: Pack tarball and verify both bin launchers ship
         run: |
           TARBALL=$(npm pack --pack-destination . | tail -1)
           echo "tarball=$TARBALL" >> "$GITHUB_ENV"
-          tar -tzf "$TARBALL" | grep -q "package/bin/headlesscode.mjs" \
-            || { echo "bin/headlesscode.mjs missing from tarball"; exit 1; }
+          tar -tzf "$TARBALL" > release-contents.txt
+          for launcher in headlesscode headlesscode-control; do
+            grep -Fx "package/bin/$launcher.mjs" release-contents.txt \
+              || { echo "bin/$launcher.mjs missing from tarball"; exit 1; }
+          done
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

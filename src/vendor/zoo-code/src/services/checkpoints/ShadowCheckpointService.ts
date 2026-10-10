@@ -4,7 +4,7 @@ import * as path from "path"
 import crypto from "crypto"
 import EventEmitter from "events"
 
-import simpleGit, { SimpleGit, SimpleGitOptions } from "simple-git"
+import { simpleGit, type SimpleGit, type SimpleGitOptions } from "simple-git"
 import pWaitFor from "p-wait-for"
 import * as vscode from "../../../shim/vscode"
 
@@ -52,6 +52,7 @@ export const BLOCKED_ENV_KEYS = new Set([
 	"GIT_CONFIG_COUNT",
 	"PREFIX",
 	"EDITOR",
+	"VISUAL",
 	"PAGER",
 	"SSH_ASKPASS",
 ])

@@ -14,6 +14,7 @@ import { ADVERSARIAL_RUNNER_PATH, ADVERSARIAL_TESTS_PATH } from "./adversarial.j
 import { RSI_OPENROUTER_MODEL } from "./inference-broker.js"
 import { effectiveWorkerHarnessMode, workerHarnessCliPath, validWorkerHarnessRuntimeIdentity } from "./worker-harness.js"
 import { mutationSnapshotProtectedPathViolations } from "./sandbox.js"
+import type { EmergencyControl } from "../control/emergency-controller.js"
 
 const POLICY_PATH = fileURLToPath(new URL("../../shared/openshell/headlesscode-policy.yaml", import.meta.url))
 const MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024
@@ -29,6 +30,8 @@ export interface RsiOpenShellProvider {
 	waitReady(handle: SessionHandle): Promise<void>
 	runHarness(handle: SessionHandle, command: string): Promise<CommandResult>
 	teardown(handle: SessionHandle): Promise<void>
+	stopSession?(handle: SessionHandle): Promise<void>
+	emergencyManaged?: boolean
 }
 
 export type RsiOpenShellProviderFactory = (options: OpenShellSessionProviderOptions) => RsiOpenShellProvider
@@ -50,6 +53,10 @@ export interface IsolatedRunOptions {
 	env?: Record<string, string>
 	extraFiles?: Record<string, Buffer>
 	image?: string
+	signal?: AbortSignal
+	control?: Pick<EmergencyControl, "identity" | "state" | "stateDirectoryPath" | "signal" | "assertRunning" | "registerCleanup" | "registerResource" | "releaseResource">
+	cpu?: string
+	memory?: string
 	providerFactory?: RsiOpenShellProviderFactory
 	inferenceBroker?: RsiInferenceBrokerAccess
 	expectedSnapshotTreeDigest?: string
@@ -381,7 +388,7 @@ export function inspectLocalRsiCheckpoint(configuredBase: string, mode: Isolated
 	return { path: source, files, bytes }
 }
 
-function providerOptions(config: RsiConfig, mode: IsolatedRunOptions["mode"], timeoutMs: number, imageReference?: string, inferenceBroker?: RsiInferenceBrokerAccess): OpenShellSessionProviderOptions {
+function providerOptions(config: RsiConfig, mode: IsolatedRunOptions["mode"], timeoutMs: number, imageReference?: string, inferenceBroker?: RsiInferenceBrokerAccess, signal?: AbortSignal, control?: IsolatedRunOptions["control"], cpu?: string, memory?: string): OpenShellSessionProviderOptions {
 	const policy = process.env.HEADLESSCODE_OPENSHELL_POLICY ?? POLICY_PATH
 	const configuredImage = process.env.HEADLESSCODE_OPENSHELL_IMAGE?.trim()
 	const trainingMode = mode === "training" || mode === "model-evaluation"
@@ -405,6 +412,10 @@ function providerOptions(config: RsiConfig, mode: IsolatedRunOptions["mode"], ti
 		includeProjectData: false,
 		projectIdentityRoot: "/workspace",
 		commandTimeoutMs: timeoutMs,
+		signal,
+		emergencyControl: control,
+		...(cpu ? { cpu } : {}),
+		...(memory ? { memory } : {}),
 		networkPolicy: networkRules(mode, inferenceBroker),
 		...(trainingMode ? { readOnlyMounts } : {}),
 		...(mode === "training" ? { gpu: 1 } : {}),
@@ -525,13 +536,21 @@ async function runSnapshot(options: IsolatedRunOptions & { preserveSnapshot?: bo
 		throw new Error("worker sanitized snapshot tree digest differs from the frozen fleet job identity")
 	}
 	const factory = options.providerFactory ?? ((providerConfig) => new OpenShellSessionProvider(providerConfig))
-	const provider = factory(providerOptions(options.config, options.mode, options.timeoutMs, options.image, options.inferenceBroker))
+	const provider = factory(providerOptions(options.config, options.mode, options.timeoutMs, options.image, options.inferenceBroker, options.signal, options.control, options.cpu, options.memory))
 	const request = makeRequest(options.config.repoRoot, name, options.env ?? {})
 	let handle: SessionHandle | undefined
+	let unregisterCleanup: (() => void) | undefined
 	const started = Date.now()
 	try {
+		if (options.signal?.aborted) throw options.signal.reason ?? new Error("RSI job cancelled")
 		const startedHandle = await provider.spawnExistingWorktreeSession(request, snapshot)
 		handle = startedHandle
+		if (provider.stopSession && !provider.emergencyManaged && options.control) {
+			const resource = `openshell:${startedHandle.containerId ?? name}`
+			await options.control.registerResource(resource)
+			unregisterCleanup = options.control.registerCleanup(`openshell-${name}`, async () => provider.stopSession!(startedHandle), resource)
+		}
+		if (options.signal?.aborted) throw options.signal.reason ?? new Error("RSI job cancelled")
 		await provider.waitReady(startedHandle)
 		if (options.mode === "mutation") {
 			// OpenShell 0.1.2 polls provider environment revisions about every
@@ -539,8 +558,9 @@ async function runSnapshot(options: IsolatedRunOptions & { preserveSnapshot?: bo
 			// generation and closes older in-flight tunnels, even with no attached
 			// providers. Let that initial sync settle before local inference starts.
 			const remaining = OPENSHELL_INITIAL_CONFIG_SETTLE_MS - (Date.now() - started)
-			if (remaining > 0) await delay(remaining)
+			if (remaining > 0) await delay(remaining, undefined, { signal: options.signal })
 		}
+		if (options.signal?.aborted) throw options.signal.reason ?? new Error("RSI job cancelled")
 		const command = `cd /workspace && ${options.command}`
 		const result = await provider.runHarness(startedHandle, command)
 		return {
@@ -557,9 +577,15 @@ async function runSnapshot(options: IsolatedRunOptions & { preserveSnapshot?: bo
 			snapshotTreeDigest,
 		}
 	} finally {
+		let teardownVerified = false
 		try {
 			if (handle) await provider.teardown(handle)
+			teardownVerified = !!handle
 		} finally {
+			if (teardownVerified) {
+				unregisterCleanup?.()
+				if (handle?.containerId) await options.control?.releaseResource(`openshell:${handle.containerId}`)
+			}
 			if (!options.preserveSnapshot && options.mode !== "mutation" && !fs.existsSync(path.join(snapshot, ".harness.openshell-sandbox"))) {
 				fs.rmSync(snapshot, { recursive: true, force: true })
 			}
@@ -568,7 +594,7 @@ async function runSnapshot(options: IsolatedRunOptions & { preserveSnapshot?: bo
 }
 
 /** Run the fixed QLoRA or matched-model evaluator command inside OpenShell. */
-export async function runOpenShellModelJob(candidate: CandidateRecord, config: RsiConfig, task: NonNullable<import("./postgres-queue.js").FleetJobPayload["modelTask"]>, providerFactory?: RsiOpenShellProviderFactory): Promise<{ result: Record<string, unknown>; adapterArchive?: Buffer }> {
+export async function runOpenShellModelJob(candidate: CandidateRecord, config: RsiConfig, task: NonNullable<import("./postgres-queue.js").FleetJobPayload["modelTask"]>, providerFactory?: RsiOpenShellProviderFactory, signal?: AbortSignal, control?: IsolatedRunOptions["control"]): Promise<{ result: Record<string, unknown>; adapterArchive?: Buffer }> {
 	if (task.seed !== 1337 || task.baseModelPath !== "/workspace/.rsi-base-model" || !/^[A-Za-z0-9._:@/-]{1,180}$/.test(task.baseModelId)) throw new Error("model job does not match the fixed dataset seed, base-model mount, or model identity")
 	const training = task.kind === "qlora-train"
 	if (training && (task.maxSteps !== 8 || task.adapterPath || task.modelKind)) throw new Error("training job differs from the bounded QLoRA policy")
@@ -586,6 +612,8 @@ export async function runOpenShellModelJob(candidate: CandidateRecord, config: R
 		mode: training ? "training" : "model-evaluation",
 		sessionName: `rsi-model-${candidate.id}-${randomUUID().slice(0, 8)}`,
 		providerFactory,
+		signal,
+		control,
 		preserveSnapshot: true,
 	})
 	try {
@@ -605,7 +633,7 @@ export async function runOpenShellModelJob(candidate: CandidateRecord, config: R
 	}
 }
 
-export async function runOpenShellMutation(candidate: CandidateRecord, config: RsiConfig, providerFactory?: RsiOpenShellProviderFactory, image?: string, inferenceBroker?: RsiInferenceBrokerAccess): Promise<{ ok: boolean; result?: TrialResult; error?: string; patchRejected?: boolean; calls?: number | null; tokens?: number | null; workerHarnessExecution?: WorkerHarnessExecution }> {
+export async function runOpenShellMutation(candidate: CandidateRecord, config: RsiConfig, providerFactory?: RsiOpenShellProviderFactory, image?: string, inferenceBroker?: RsiInferenceBrokerAccess, signal?: AbortSignal, control?: IsolatedRunOptions["control"]): Promise<{ ok: boolean; result?: TrialResult; error?: string; patchRejected?: boolean; calls?: number | null; tokens?: number | null; workerHarnessExecution?: WorkerHarnessExecution }> {
 	try {
 		const requestedMode = config.workerHarnessMode ?? "fixed-control"
 		const effectiveMode = effectiveWorkerHarnessMode(requestedMode, candidate.generation)
@@ -675,6 +703,8 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 			sessionName: `rsi-mutation-${candidate.id}-${randomUUID().slice(0, 6)}`,
 			env,
 			inferenceBroker,
+			signal,
+			control,
 			image: pinnedImage,
 			providerFactory,
 			expectedSnapshotTreeDigest: config.workerHarnessSnapshotTreeDigest,
@@ -785,12 +815,13 @@ export function createOpenShellCommandRunner(config: RsiConfig): CommandRunner {
 }
 
 /** Execute only visible candidate checks inside a fresh OpenShell guest. */
-export async function runOpenShellEvaluation(candidate: CandidateRecord, config: RsiConfig): Promise<{ regression: TrialResult; typecheck: TrialResult; visible: TrialResult[] }> {
+export async function runOpenShellEvaluation(candidate: CandidateRecord, config: RsiConfig, signal?: AbortSignal, control?: IsolatedRunOptions["control"]): Promise<{ regression: TrialResult; typecheck: TrialResult; visible: TrialResult[] }> {
 	if (config.hiddenEvalCommands.length > 0) throw new Error("hidden RSI evaluation is supervisor-only and cannot be submitted as a worker job")
 	const commands = [config.regressionCommand, "npm run typecheck", ...config.evalCommands]
 	const results: TrialResult[] = []
 	for (const command of commands) {
-		const isolated = await runSnapshot({ config, sourceRoot: candidate.worktree, commit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: candidate.worktree, encoding: "utf8" }).trim(), command, timeoutMs: config.commandTimeoutMs, mode: "evaluation" })
+		if (signal?.aborted) throw signal.reason ?? new Error("RSI job cancelled")
+		const isolated = await runSnapshot({ config, sourceRoot: candidate.worktree, commit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: candidate.worktree, encoding: "utf8" }).trim(), command, timeoutMs: config.commandTimeoutMs, mode: "evaluation", signal, control })
 		results.push(isolated.result)
 	}
 	return { regression: results[0]!, typecheck: results[1]!, visible: results.slice(2) }
@@ -822,4 +853,171 @@ export async function runOpenShellBenchmarkVerifier(candidate: CandidateRecord, 
 
 export function openShellMutationRunner(): typeof runOpenShellMutation {
 	return runOpenShellMutation
+}
+
+export const HIDDEN_FUNCTION_DRIVER = `import { readFile } from "node:fs/promises"
+import path from "node:path"
+import { pathToFileURL } from "node:url"
+
+const root = "/workspace"
+const spec = JSON.parse(await readFile(path.join(root, "__headlesscode_hidden__/inputs.json"), "utf8"))
+if (!spec || !Array.isArray(spec.cases) || spec.cases.length < 1 || spec.cases.length > spec.identity.limits.maxCases) throw new Error("invalid hidden-case request")
+const safeStringify = JSON.stringify.bind(JSON)
+const safeParse = JSON.parse.bind(JSON)
+const safeGetPrototypeOf = Object.getPrototypeOf
+const safeOwnKeys = Reflect.ownKeys
+const safeGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
+const safeDefineProperty = Object.defineProperty
+const safeObjectCreate = Object.create
+const safeSetPrototypeOf = Object.setPrototypeOf
+const safeIsArray = Array.isArray
+const safeIsFinite = Number.isFinite
+const safeIsSafeInteger = Number.isSafeInteger
+const SafeWeakSet = WeakSet
+const safeWeakSetHas = WeakSet.prototype.has
+const safeWeakSetAdd = WeakSet.prototype.add
+const safeWeakSetDelete = WeakSet.prototype.delete
+const safeApply = Reflect.apply
+const SafeArray = Array
+const safeNumber = Number
+const safeByteLength = Buffer.byteLength.bind(Buffer)
+const safeBufferFrom = Buffer.from.bind(Buffer)
+const safeBufferToString = Buffer.prototype.toString
+const writeStdout = process.stdout.write.bind(process.stdout)
+const safeString = String
+const isArrayIndex = RegExp.prototype.test.bind(/^(?:0|[1-9][0-9]*)$/)
+const plainObjectPrototype = Object.prototype
+const arrayPrototype = Array.prototype
+function assertJsonValue(value, active = new SafeWeakSet()) {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value
+  if (typeof value === "number" && safeIsFinite(value)) return value
+  if (typeof value !== "object") throw new Error("output contains a non-JSON value")
+  if (safeApply(safeWeakSetHas, active, [value])) throw new Error("output contains a cycle")
+  safeApply(safeWeakSetAdd, active, [value])
+  try {
+    if (safeIsArray(value)) {
+      if (safeGetPrototypeOf(value) !== arrayPrototype) throw new Error("output array has an unsupported prototype")
+      const lengthDescriptor = safeGetOwnPropertyDescriptor(value, "length")
+      const length = lengthDescriptor?.value
+      if (!safeIsSafeInteger(length) || length < 0 || length > spec.identity.limits.maxOutputBytes) throw new Error("output array exceeds JSON bounds")
+      const keys = safeOwnKeys(value)
+      if (keys.length !== length + 1) throw new Error("output array is sparse or has non-JSON properties")
+      const normalized = new SafeArray(length)
+      safeSetPrototypeOf(normalized, null)
+      for (let keyIndex = 0; keyIndex < keys.length; keyIndex++) {
+        const key = keys[keyIndex]
+        if (key === "length") continue
+        if (typeof key !== "string" || !isArrayIndex(key) || safeNumber(key) >= length) throw new Error("output array is sparse or has non-JSON properties")
+      }
+      for (let index = 0; index < length; index++) {
+        const descriptor = safeGetOwnPropertyDescriptor(value, safeString(index))
+        if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) throw new Error("output array contains a non-JSON property")
+        safeDefineProperty(normalized, safeString(index), { value: assertJsonValue(descriptor.value, active), enumerable: true, configurable: true, writable: true })
+      }
+      return normalized
+    }
+    const prototype = safeGetPrototypeOf(value)
+    if (prototype !== plainObjectPrototype && prototype !== null) throw new Error("output object is not a plain JSON object")
+    const keys = safeOwnKeys(value)
+    if (keys.length > spec.identity.limits.maxOutputBytes) throw new Error("output object exceeds JSON bounds")
+    const normalized = safeObjectCreate(null)
+    for (let keyIndex = 0; keyIndex < keys.length; keyIndex++) {
+      const key = keys[keyIndex]
+      if (typeof key !== "string") throw new Error("output contains a symbol property")
+      const descriptor = safeGetOwnPropertyDescriptor(value, key)
+      if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) throw new Error("output contains a non-JSON property")
+      safeDefineProperty(normalized, key, { value: assertJsonValue(descriptor.value, active), enumerable: true, configurable: true, writable: true })
+    }
+    return normalized
+  } finally { safeApply(safeWeakSetDelete, active, [value]) }
+}
+const outputs = []
+let outputCount = 0
+let totalBytes = 0
+for (let caseIndex = 0; caseIndex < spec.cases.length; caseIndex++) {
+  const test = spec.cases[caseIndex]
+  if (typeof test.id !== "string" || typeof test.modulePath !== "string" || !/^(?:src|lib|app)\\//.test(test.modulePath) || test.modulePath.includes("..") || test.modulePath.includes("\\\\")) throw new Error("invalid hidden-case reference")
+  if (typeof test.exportName !== "string" || !/^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/.test(test.exportName)) throw new Error("invalid hidden-case export")
+  const target = path.resolve(root, test.modulePath)
+  if (!target.startsWith(root + "/")) throw new Error("hidden-case module escaped candidate root")
+  const candidateModule = await import(pathToFileURL(target).href)
+  if (typeof candidateModule[test.exportName] !== "function") throw new Error("missing export")
+  const result = await candidateModule[test.exportName](test.input)
+  const normalized = assertJsonValue(result)
+  const encoded = safeStringify(normalized)
+  if (encoded === undefined) throw new Error("output is not JSON")
+  totalBytes += safeByteLength(encoded)
+  if (totalBytes > spec.identity.limits.maxOutputBytes) throw new Error("output limit exceeded")
+  const output = safeParse(encoded)
+  safeDefineProperty(outputs, safeString(outputCount), { value: { id: test.id, output }, enumerable: true, configurable: true, writable: true })
+  outputCount++
+}
+const encoded = safeApply(safeBufferToString, safeBufferFrom(safeStringify(assertJsonValue(outputs))), ["base64"])
+writeStdout("\\nHEADLESSCODE_HIDDEN_OUTPUTS:" + encoded + "\\n")
+`
+
+/** Execute a fixed hidden-case driver in a fresh evaluator snapshot. Only case inputs enter the guest. */
+export async function runOpenShellHiddenFunctionCases(
+	sourceRoot: string,
+	commit: string,
+	config: RsiConfig,
+	request: { identity: import("./hidden-verifier.js").HiddenVerificationIdentity; cases: import("./hidden-verifier.js").HiddenCaseInput[] },
+	providerFactory?: RsiOpenShellProviderFactory,
+	imageDigest?: string,
+): Promise<import("./hidden-verifier.js").HiddenCaseOutput[]> {
+	const limits = request.identity.limits
+	if (request.identity.protocol !== "headlesscode.hidden-functions.v1" || !/^[a-f0-9]{64}$/.test(request.identity.protocolDigest) ||
+		!/^[a-f0-9]{64}$/.test(request.identity.candidateSourceDigest) || !/^[A-Za-z0-9._:-]{1,128}$/.test(request.identity.sessionId) ||
+		!/^[A-Za-z0-9._:-]{1,128}$/.test(request.identity.jobId) || !/^[A-Za-z0-9_-]{32,128}$/.test(request.identity.nonce) ||
+		!Number.isInteger(limits.timeoutMs) || limits.timeoutMs < 50 || limits.timeoutMs > 120_000 ||
+		!Number.isInteger(limits.maxMemoryMb) || limits.maxMemoryMb < 16 || limits.maxMemoryMb > 4096 ||
+		!Number.isInteger(limits.maxInputBytes) || limits.maxInputBytes < 1 || limits.maxInputBytes > 1_000_000 ||
+		!Number.isInteger(limits.maxOutputBytes) || limits.maxOutputBytes < 1 || limits.maxOutputBytes > 1_000_000 ||
+		!Number.isInteger(limits.maxCases) || limits.maxCases < 1 || limits.maxCases > 256) {
+		throw new Error("OpenShell hidden verifier request has unsupported identity or resource limits")
+	}
+	if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(commit)) throw new Error("hidden verifier candidate commit is malformed")
+	if (!imageDigest || !/^sha256:[a-f0-9]{64}$/.test(imageDigest)) throw new Error("hidden verifier requires an approved digest-pinned evaluator image")
+	if (request.identity.evaluatorImageDigest !== imageDigest) throw new Error("hidden verifier evaluator image differs from the frozen request identity")
+	if (request.identity.candidateCommit !== commit) throw new Error("hidden verifier commit differs from the frozen request identity")
+	if (!Array.isArray(request.cases) || request.cases.length < 1 || request.cases.length > limits.maxCases) throw new Error("OpenShell hidden verifier case count is outside its frozen bound")
+	const guestIdentity = {
+		protocol: request.identity.protocol,
+		candidateSourceDigest: request.identity.candidateSourceDigest,
+		evaluatorImageDigest: request.identity.evaluatorImageDigest,
+		candidateCommit: request.identity.candidateCommit,
+		sessionId: request.identity.sessionId,
+		jobId: request.identity.jobId,
+		nonce: request.identity.nonce,
+		limits: request.identity.limits,
+	}
+	const inputs = Buffer.from(JSON.stringify({ identity: guestIdentity, cases: request.cases }), "utf8")
+	if (inputs.byteLength > request.identity.limits.maxInputBytes + 64 * 1024) throw new Error("hidden verifier request exceeds its frozen input limit")
+	const cpuSeconds = Math.max(1, Math.ceil(request.identity.limits.timeoutMs / 1000))
+	const oldSpaceMb = Math.max(8, Math.floor(request.identity.limits.maxMemoryMb / 2))
+	const isolated = await runSnapshot({
+		config,
+		sourceRoot,
+		commit,
+		command: `ulimit -t ${cpuSeconds} && test -x /opt/headlesscode/node_modules/.bin/tsx && exec /opt/headlesscode/node_modules/.bin/tsx /workspace/__headlesscode_hidden__/driver.mjs`,
+		timeoutMs: request.identity.limits.timeoutMs,
+		image: `headlesscode-openshell-rsi@${imageDigest}`,
+		cpu: "1",
+		memory: `${request.identity.limits.maxMemoryMb}Mi`,
+		env: { NODE_OPTIONS: `--max-old-space-size=${oldSpaceMb}` },
+		mode: "evaluation",
+		sessionName: `rsi-hidden-${request.identity.jobId}-${randomUUID().slice(0, 8)}`,
+		extraFiles: {
+			"__headlesscode_hidden__/inputs.json": inputs,
+			"__headlesscode_hidden__/driver.mjs": Buffer.from(HIDDEN_FUNCTION_DRIVER, "utf8"),
+		},
+		providerFactory,
+	})
+	if (!isolated.result.ok) throw new Error(`OpenShell hidden function execution failed or exceeded resource limits (exit ${isolated.result.exitCode ?? "unknown"})`)
+	const markers = [...isolated.result.stdout.matchAll(/(?:^|\n)HEADLESSCODE_HIDDEN_OUTPUTS:([A-Za-z0-9+/=]+)(?:\n|$)/g)]
+	if (markers.length !== 1) throw new Error("OpenShell hidden function runner returned a missing or ambiguous output marker")
+	let outputs: unknown
+	try { outputs = JSON.parse(Buffer.from(markers[0]![1]!, "base64").toString("utf8")) } catch { throw new Error("OpenShell hidden function runner returned malformed output JSON") }
+	if (!Array.isArray(outputs) || outputs.length !== request.cases.length) throw new Error("OpenShell hidden function runner returned a partial output set")
+	return outputs as import("./hidden-verifier.js").HiddenCaseOutput[]
 }

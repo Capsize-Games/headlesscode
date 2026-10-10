@@ -213,6 +213,8 @@ export interface AuxLlmUsage {
 
 /** Per-call context handed to tool handlers. */
 export interface ToolContext {
+	/** Supervisor cancellation; handlers must not start effects after abort. */
+	signal?: AbortSignal
 	workspaceRoot: string
 	/**
 	 * Resolved command allow/deny + protected-file permissions for this

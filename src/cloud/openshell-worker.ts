@@ -5,6 +5,8 @@ import { execFileSync } from "node:child_process"
 import { OPENSHELL_HARNESS_ROOT, OpenShellSessionProvider } from "./openshell-provider.js"
 import type { OpenShellSessionProviderOptions } from "./openshell-provider.js"
 import type { CloudSessionRequest, CommandResult } from "./provider.js"
+import { loadResolvedContainedProfile } from "../security/profile.js"
+import { containedEvidenceSessionId, startContainedSupervisor } from "../security/supervisor.js"
 
 const FORWARDED_ENV = [
 	"OPENROUTER_MODEL", "OPENROUTER_BASE_URL", "HEADLESSCODE_PROJECT", "HEADLESSCODE_MEMORY_DIR",
@@ -54,17 +56,41 @@ export async function runOpenShellWorktreeCommand(
 	env: Record<string, string> = {},
 	providerOptions: OpenShellSessionProviderOptions = {},
 ): Promise<CommandResult> {
-	const policy = providerOptions.policy ?? process.env.HEADLESSCODE_OPENSHELL_POLICY
+	const contained = process.env.HEADLESSCODE_SECURITY_PROFILE === "contained"
+	const containedProfile = providerOptions.containedProfile ?? (contained ? loadResolvedContainedProfile(process.env.HEADLESSCODE_CONTAINED_RUNTIME_PROFILE_JSON) : undefined)
+	if (contained && !containedProfile) throw new Error("contained route has no supervisor-resolved immutable profile")
+	const policy = containedProfile?.policySnapshotPath ?? providerOptions.policy ?? process.env.HEADLESSCODE_OPENSHELL_POLICY
 	if (!policy || !fs.existsSync(policy)) throw new Error("set HEADLESSCODE_OPENSHELL_POLICY to an existing base policy YAML")
-	const providers = providerOptions.providers ?? (process.env.HEADLESSCODE_OPENSHELL_PROVIDERS ?? "headlesscode-openrouter").split(",").map((value) => value.trim()).filter(Boolean)
+	const providers = containedProfile ? [...containedProfile.providers] : providerOptions.providers ?? (process.env.HEADLESSCODE_OPENSHELL_PROVIDERS ?? "headlesscode-openrouter").split(",").map((value) => value.trim()).filter(Boolean)
 	if (providers.includes("headlesscode-openrouter") && !process.env.HEADLESSCODE_OPENROUTER_API_KEY) throw new Error("set HEADLESSCODE_OPENROUTER_API_KEY so OpenShell can provide the imported credential profile")
 	const worktreePath = path.resolve(worktree)
 	const repoPath = path.resolve(repo)
 	const name = path.basename(worktreePath)
-	const memoryDir = env.HEADLESSCODE_MEMORY_DIR ?? process.env.HEADLESSCODE_MEMORY_DIR
+	const runtimeSessionId = containedProfile ? containedEvidenceSessionId(name, env.HEADLESSCODE_CONTAINED_SESSION_PREFIX ?? process.env.HEADLESSCODE_CONTAINED_SESSION_PREFIX, env.HEADLESSCODE_CONTAINED_SESSION_ID) : undefined
+	const memoryDir = containedProfile ? undefined : env.HEADLESSCODE_MEMORY_DIR ?? process.env.HEADLESSCODE_MEMORY_DIR
 	const memoryPath = memoryDir ? path.resolve(memoryDir) : undefined
 	if (memoryPath) fs.mkdirSync(memoryPath, { recursive: true })
-	const provider = new OpenShellSessionProvider({ ...providerOptions, policy, providers })
+	const containedSupervisor = containedProfile && runtimeSessionId ? await startContainedSupervisor({ profile: containedProfile, sessionId: runtimeSessionId, repoRoot: repoPath, workspaceRoot: worktreePath }) : undefined
+	try {
+	const provider = new OpenShellSessionProvider({
+		...providerOptions,
+		...(containedProfile ? {
+			containedProfile,
+			...(containedSupervisor ? { evidenceRuntimeConfig: {
+				sessionId: containedSupervisor.evidenceConnection.sessionId,
+				capability: containedSupervisor.evidenceConnection.capability,
+				pinnedPublicKey: containedSupervisor.evidenceConnection.pinnedPublicKey,
+			} } : {}),
+			...(containedSupervisor ? { emergencyControl: containedSupervisor.control } : {}),
+			image: containedProfile.image,
+			cpu: containedProfile.cpu,
+			memory: containedProfile.memory,
+			autoProviders: false,
+			includeProjectData: false,
+		} : {}),
+		policy,
+		providers,
+	})
 	const request: CloudSessionRequest = {
 		repo: repoPath,
 		issue: { number: 0, title: `HeadlessCode worker ${name}` },
@@ -82,6 +108,9 @@ export async function runOpenShellWorktreeCommand(
 		return await provider.runHarness(handle, command)
 	} finally {
 		if (handle) await provider.teardown(handle)
+	}
+	} finally {
+		await containedSupervisor?.close()
 	}
 }
 

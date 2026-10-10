@@ -1,6 +1,6 @@
 {
 	"name": "headlesscode",
-	"version": "1.3.0",
+	"version": "1.4.0",
 	"description": "Standalone headless coding-agent harness: runs the Zoo Code agent loop (prompts, tools, modes) without a VS Code UI, driven by CLI, HTTP, and parallel worktree orchestration.",
 	"license": "Apache-2.0",
 	"repository": {
@@ -20,7 +20,8 @@
 		"node": ">=22.19"
 	},
 	"bin": {
-		"headlesscode": "bin/headlesscode.mjs"
+		"headlesscode": "bin/headlesscode.mjs",
+		"headlesscode-control": "bin/headlesscode-control.mjs"
 	},
 	"files": [
 		"LICENSE",
@@ -30,6 +31,12 @@
 		"SECURITY.md",
 		"CONTRIBUTING.md",
 		"CODE_OF_CONDUCT.md",
+		"docs/security-profiles.md",
+		"docs/evidence-journal.md",
+		"docs/emergency-control.md",
+		"docs/hidden-verification.md",
+		"docs/security-verification.md",
+		"docs/incident-response.md",
 		"tsconfig.json",
 		"shared/",
 		"src/",
@@ -50,13 +57,13 @@
 	},
 	"dependencies": {
 		"@aws-sdk/client-s3": "^3.1142.0",
-		"@modelcontextprotocol/sdk": "^1.30.0",
+		"@modelcontextprotocol/sdk": "^1.32.1",
 		"@octokit/auth-app": "^8.2.0",
 		"fastest-levenshtein": "^1.0.16",
 		"p-wait-for": "^5.0.2",
 		"pg": "^8.23.0",
 		"playwright": "^1.62.1",
-		"simple-git": "^3.36.0",
+		"simple-git": "^4.0.2",
 		"tsx": "^4.19.0",
 		"typescript": "^5.6.0",
 		"undici": "^8.10.0",

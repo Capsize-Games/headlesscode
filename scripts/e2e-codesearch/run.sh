@@ -28,6 +28,9 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TMPDIR="${TMPDIR:-"$ROOT/.headlesscode/scratch"}"
+mkdir -p "$TMPDIR"
+export TMPDIR
 KEEP="${KEEP:-0}"
 
 PASS=0
@@ -62,7 +65,7 @@ echo "  fixture: $FIXTURE"
 
 # ── 2. Isolated worktree (the harness works HERE, fixture stays untouched) ──
 echo "== [2/5] isolated worktree =="
-WORKTREE="$(mktemp -d /tmp/headlesscode-e2e-codesearch-wt-XXXXXX)"
+WORKTREE="$(mktemp -d "$TMPDIR/headlesscode-e2e-codesearch-wt-XXXXXX")"
 bash "$ROOT/scripts/e2e-fixture/spawn-worktree.sh" "$FIXTURE" "$WORKTREE" >/dev/null
 if ! git -C "$WORKTREE" rev-parse --git-dir >/dev/null 2>&1; then
 	echo "  worktree spawn failed; aborting" >&2
@@ -72,7 +75,7 @@ echo "  worktree: $WORKTREE"
 
 # ── 3. Mock OpenRouter server (search-before-read scenario) ─────────────────
 echo "== [3/5] mock OpenRouter server (search-before-read) =="
-MOCK_LOG="$(mktemp /tmp/headlesscode-e2e-codesearch-mock-XXXXXX.log)"
+MOCK_LOG="$(mktemp "$TMPDIR/headlesscode-e2e-codesearch-mock-XXXXXX.log")"
 (
 	cd "$ROOT" &&
 		exec env PORT=0 MOCK_SCENARIO="search-before-read" MOCK_FIXTURE_ROOT="$FIXTURE" \
@@ -103,7 +106,7 @@ sleep 0.2
 
 # ── 4. Real harness run (real CLI + real HTTP against the mock) ──────────────
 echo "== [4/5] harness run (real CLI, real HTTP, mock LLM) =="
-HARNESS_OUT="$(mktemp /tmp/headlesscode-e2e-codesearch-cli-XXXXXX.out)"
+HARNESS_OUT="$(mktemp "$TMPDIR/headlesscode-e2e-codesearch-cli-XXXXXX.out")"
 # Orientation-style task: "where is X / how does Y work" — exactly the
 # shape of task the new code-mode guidance says to open with codebase_search.
 TASK_TEXT='Where is the greet function and how does it handle the name argument? Do not edit anything — just locate it and report back.'
@@ -148,7 +151,7 @@ fi
 # the dry-run against the headlesscode repo root ($ROOT), where the real
 # guidance lives. (The phrase in the rules file is backtick-wrapped, so
 # grep for the content between the backticks.)
-DRYRUN_OUT="$(mktemp /tmp/headlesscode-e2e-codesearch-dryrun-XXXXXX.out)"
+DRYRUN_OUT="$(mktemp "$TMPDIR/headlesscode-e2e-codesearch-dryrun-XXXXXX.out")"
 (
 	cd "$ROOT" &&
 		npx tsx src/cli.ts --dry-run --mode code --workspace "$ROOT"

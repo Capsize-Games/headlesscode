@@ -44,8 +44,12 @@ import { costHistoryCliMain } from "./orchestrator/cost-history-cli.js"
 import { resolvePermissions, type PermissionsConfig } from "./permissions/config.js"
 import { resolveModelForMode, resolveReasoningEffortForMode } from "./config/mode-models.js"
 import { openShellSessionMain } from "./cloud/openshell-session.js"
+import { cleanupContainedRuntimeProfile, resolveContainedRuntimeProfile, resolveSecurityProfile, serializeResolvedContainedProfile, type SecurityProfileName } from "./security/profile.js"
+import { evidenceJournalFromEnv, evidenceJournalFromProtectedConfigFile, runEvidenceCli } from "./evidence/index.js"
 
-const VERSION = "0.1.0"
+import { finishSessionEmergencyControl, startSessionEmergencyControl } from "./control/session-runtime.js"
+
+const VERSION = (JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version
 
 interface CliOptions {
 	mode: string
@@ -177,6 +181,7 @@ interface CliOptions {
 	 * HEADLESSCODE_REQUIRE_EVIDENCE.
 	 */
 	requireEvidence: boolean
+	securityProfile?: SecurityProfileName
 }
 
 const USAGE = `headlesscode — headless coding-agent harness (Phase 1 engine)
@@ -286,13 +291,16 @@ Subcommands:
 
 Options:
   --mode <slug>              Mode to run in (built-in or from .roomodes). Default: code
+  --security-profile <local|contained>  Trust boundary (default local: runs with host authority;
+                                       contained: OpenShell only, fails closed)
   --task <text>              The task description for the agent
   --task-file <path>         Read the task from a file (relative to workspace)
   --workspace <root>         Workspace root (default: $HEADLESSCODE_WORKSPACE_ROOT or cwd)
-  --session-id <id>          Explicit session id override (default: a fresh UUID).
-                             Used by the dashboard's session-launch endpoint so
-                             the browser can open the session's event view
-                             immediately; rarely needed from a terminal.
+  --session-id <id>          Explicit session id (default: a fresh UUID).
+                             Required for contained runs and must match a
+                             provisioned per-session evidence config. The
+                             dashboard uses this to open the session event
+                             view immediately.
   --model <id>               OpenRouter model id (default: $OPENROUTER_MODEL or deepseek/deepseek-v4-flash-0731)
   --max-iterations <n>       Loop iteration cap (default: 250 — see DEFAULT_MAX_ITERATIONS
                                in src/engine/loop.ts)
@@ -490,6 +498,12 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 		}
 
 		switch (flag) {
+			case "--security-profile": {
+				const value = next()
+				try { options.securityProfile = resolveSecurityProfile(value) }
+				catch (error) { return { options, error: error instanceof Error ? error.message : String(error) } }
+				break
+			}
 			case "--mode":
 			case "--task":
 			case "--task-file":
@@ -720,10 +734,19 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 		}
 	}
 
+	if (!options.securityProfile) {
+		try { options.securityProfile = resolveSecurityProfile(process.env.HEADLESSCODE_SECURITY_PROFILE) }
+		catch (error) { return { options, error: error instanceof Error ? error.message : String(error) } }
+	}
 	return { options }
 }
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
+	if (argv[0] === "evidence") return runEvidenceCli(argv.slice(1))
+	if (argv[0] === "control") {
+		const { controlMain } = await import("./control/cli.js")
+		return controlMain(argv.slice(1))
+	}
 	if (argv[0] === "openshell-review-session" || argv[0] === "openshell-qa-session") {
 		let payload: Record<string, unknown>
 		try {
@@ -1089,25 +1112,6 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		}
 	}
 
-	// ── real run: OpenRouter key required unless this mode is local ────────────
-	const codeModeBackend = process.env.HEADLESSCODE_CODE_MODE_BACKEND ?? "openrouter"
-	const localBackendModes = new Set(
-		(process.env.HEADLESSCODE_LOCAL_BACKEND_MODES ?? "code")
-			.split(",")
-			.map((s) => s.trim())
-			.filter(Boolean),
-	)
-	const useLocalCodeBackend = localBackendModes.has(options.mode) && codeModeBackend === "ollama"
-	const apiKey = process.env.HEADLESSCODE_OPENROUTER_API_KEY ?? process.env.HEADLESSCODE_RSI_INFERENCE_CAPABILITY
-	if (!apiKey && !useLocalCodeBackend) {
-		process.stderr.write(
-			"headlesscode: HEADLESSCODE_OPENROUTER_API_KEY is not set.\n" +
-				"  Export it (e.g. export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-...) or use --dry-run to\n" +
-				"  validate the prompt/config without calling the LLM.\n",
-		)
-		return 2
-	}
-
 	if (!options.task && !options.taskFile) {
 		process.stderr.write(`headlesscode: provide a task with --task <text> or --task-file <path>\n\n${USAGE}`)
 		return 2
@@ -1131,6 +1135,52 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	}
 	if (taskText.trim() === "") {
 		process.stderr.write("headlesscode: task text is empty\n")
+		return 2
+	}
+	if (options.securityProfile === "contained") {
+		try {
+			if (!options.sessionId) throw new Error("contained single-session launches require --session-id matching a provisioned per-session evidence config")
+			const profile = resolveContainedRuntimeProfile({ repoRoot: workspaceRoot, purpose: "worker" })
+			process.env.HEADLESSCODE_OPENSHELL_POLICY = profile.policySnapshotPath
+			process.env.HEADLESSCODE_OPENSHELL_IMAGE = profile.image
+			process.env.HEADLESSCODE_OPENSHELL_CPU = profile.cpu
+			process.env.HEADLESSCODE_OPENSHELL_MEMORY = profile.memory
+			process.env.HEADLESSCODE_OPENSHELL_PROVIDERS = profile.providers.join(",")
+			process.env.HEADLESSCODE_CONTAINED_PROFILE_SHA256 = profile.profileSha256
+			process.env.HEADLESSCODE_CONTAINED_POLICY_SHA256 = profile.policySha256
+			process.env.HEADLESSCODE_CONTAINED_RUNTIME_PROFILE_JSON = serializeResolvedContainedProfile(profile)
+			try {
+				return await openShellSessionMain([
+				"--repo", workspaceRoot,
+				"--task", taskText,
+				"--mode", options.mode,
+				"--name", options.sessionId,
+				...(options.model ? ["--model", options.model] : []),
+				], { containedProfile: profile })
+			} finally {
+				cleanupContainedRuntimeProfile(profile)
+			}
+		} catch (error) {
+			process.stderr.write(`headlesscode: contained security preflight failed: ${error instanceof Error ? error.message : String(error)}\n`)
+			return 2
+		}
+	}
+	// ── real run: OpenRouter key required unless this mode is local ────────────
+	const codeModeBackend = process.env.HEADLESSCODE_CODE_MODE_BACKEND ?? "openrouter"
+	const localBackendModes = new Set(
+		(process.env.HEADLESSCODE_LOCAL_BACKEND_MODES ?? "code")
+			.split(",")
+			.map((s) => s.trim())
+			.filter(Boolean),
+	)
+	const useLocalCodeBackend = localBackendModes.has(options.mode) && codeModeBackend === "ollama"
+	const apiKey = process.env.HEADLESSCODE_OPENROUTER_API_KEY ?? process.env.HEADLESSCODE_RSI_INFERENCE_CAPABILITY
+	if (!apiKey && !useLocalCodeBackend) {
+		process.stderr.write(
+			"headlesscode: HEADLESSCODE_OPENROUTER_API_KEY is not set.\n" +
+				"  Export it (e.g. export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-...) or use --dry-run to\n" +
+				"  validate the prompt/config without calling the LLM.\n",
+		)
 		return 2
 	}
 
@@ -1524,94 +1574,120 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		return 2
 	}
 
-	const session = new HeadlessSession({
-		workspaceRoot,
-		sessionId: options.sessionId,
-		mode: options.mode,
-		model: effectiveModel,
-		taskText,
-		maxIterations: options.maxIterations,
-		maxRecursionDepth,
-		childIterationFraction,
-		consecutiveErrorLimit,
-		windowSize: options.windowSize,
-		contextWindowTokens,
-		condenseThresholdFraction,
-		condenseEarlyFireFraction,
-		condenseModel,
-		disableLlmCondensation,
-		llmTimeoutMs,
-		stream: options.stream,
-		reasoningEffort,
-		temperature: options.temperature,
-		requireExplicitCompletion,
-		patchLocalToolSchemas,
-		verifyBeforeCompletion,
-		evidenceRequiredCompletion,
-		trackCost,
-		requireArtifactBeforeCompletion,
-		requireArtifactPathPattern: options.requireArtifactPath,
-		requireArtifactMinCitations: options.requireArtifactMinCitations,
-		requireArtifactSections: options.requireArtifactSections,
-		guardLargeOverwrites,
-		disableReadFileCache,
-		llmClient: client,
-		logger,
-		memory,
-		project,
-		budget,
-		checkpoints: !options.noCheckpoints,
-		checkpointDir: options.checkpointDir,
-		decisionTimeoutMs,
-		autoApproveModeSwitch,
-		maxModeSwitches,
-		maxTokens,
-		maxPauseMs,
-		permissions,
-		// Opt-in local exploration phase (default OFF). Flag OR env var — the
-		// phase itself resolves the remaining HEADLESSCODE_LOCAL_EXPLORE_*
-		// defaults at call time. Any local failure fails open to cloud-only.
-		localExplore: options.localExplore || isLocalExploreEnabled(process.env),
-	})
-
-	const result = await session.run()
-
-	// A session writes into workspaceRoot throughout the run (file edits,
-	// its own .headlesscode/{events,usage,reports}, git's index as it
-	// stages things) AND, when workspaceRoot is a worktree, into the
-	// source repo's separate .git/worktrees/<name>/ admin dir — chowning
-	// only at worktree *creation* time (see session-launch.ts's
-	// ensureWorktree) misses all of this. Runs regardless of success/
-	// failure — a failed session can leave root-owned files too. No-ops
-	// when HEADLESSCODE_DASHBOARD_WORKTREE_OWNER isn't set (today's
-	// default for a non-container / non-root run).
-	chownWorktreeWorkspace(workspaceRoot)
-
-	if (session.memoryStats) {
-		process.stdout.write(
-			`[memory] project="${project}" recalled ${session.memoryStats.recalledFacts} fact(s) / ${session.memoryStats.recalledSessions} session(s); recorded ${session.memoryStats.recordedFacts} fact(s) / ${session.memoryStats.recordedSessions} session(s)\n`,
-		)
+	let evidenceRuntime
+	try {
+		const evidenceConfigPath = process.env.HEADLESSCODE_EVIDENCE_CONFIG_PATH
+		evidenceRuntime = evidenceConfigPath
+			? await evidenceJournalFromProtectedConfigFile(evidenceConfigPath, { expectedSessionId: options.sessionId, forbiddenRoots: [workspaceRoot] })
+			: evidenceJournalFromEnv()
+		if (process.env.HEADLESSCODE_SECURITY_PROFILE === "contained" && (!evidenceRuntime || !evidenceRuntime.evidenceRequired)) throw new Error("contained guest runtime requires evidence and an authenticated supervisor config")
+	} catch (error) {
+		process.stderr.write(`headlesscode: invalid evidence runtime configuration: ${error instanceof Error ? error.message : String(error)}\n`)
+		return 2
 	}
-
-	if (result.budgetUsage) {
-		process.stdout.write(
-			`[budget] cost $${result.budgetUsage.costUsd.toFixed(6)}, elapsed ${result.budgetUsage.elapsedMs}ms, iterations ${result.budgetUsage.iterations}, model ${result.budgetUsage.model}\n`,
-		)
+	let emergencyControl
+	try { emergencyControl = await startSessionEmergencyControl({ workspaceRoot, evidence: evidenceRuntime }) } catch (error) {
+		process.stderr.write(`headlesscode: invalid emergency control configuration: ${error instanceof Error ? error.message : String(error)}\n`)
+		return 2
 	}
+	try {
+		const session = new HeadlessSession({
+			workspaceRoot,
+			sessionId: options.sessionId,
+			mode: options.mode,
+			model: effectiveModel,
+			taskText,
+			maxIterations: options.maxIterations,
+			maxRecursionDepth,
+			childIterationFraction,
+			consecutiveErrorLimit,
+			windowSize: options.windowSize,
+			contextWindowTokens,
+			condenseThresholdFraction,
+			condenseEarlyFireFraction,
+			condenseModel,
+			disableLlmCondensation,
+			llmTimeoutMs,
+			stream: options.stream,
+			reasoningEffort,
+			temperature: options.temperature,
+			requireExplicitCompletion,
+			patchLocalToolSchemas,
+			verifyBeforeCompletion,
+			evidenceRequiredCompletion,
+			trackCost,
+			requireArtifactBeforeCompletion,
+			requireArtifactPathPattern: options.requireArtifactPath,
+			requireArtifactMinCitations: options.requireArtifactMinCitations,
+			requireArtifactSections: options.requireArtifactSections,
+			guardLargeOverwrites,
+			disableReadFileCache,
+			llmClient: client,
+			logger,
+			memory,
+			project,
+			budget,
+			checkpoints: !options.noCheckpoints,
+			checkpointDir: options.checkpointDir,
+			decisionTimeoutMs,
+			autoApproveModeSwitch,
+			maxModeSwitches,
+			maxTokens,
+			maxPauseMs,
+			permissions,
+			signal: emergencyControl?.signal,
+			...(evidenceRuntime ? { sessionId: evidenceRuntime.sessionId, evidenceJournal: evidenceRuntime.evidenceJournal, evidenceRequired: evidenceRuntime.evidenceRequired } : {}),
+			// Opt-in local exploration phase (default OFF). Flag OR env var — the
+			// phase itself resolves the remaining HEADLESSCODE_LOCAL_EXPLORE_*
+			// defaults at call time. Any local failure fails open to cloud-only.
+			localExplore: options.localExplore || isLocalExploreEnabled(process.env),
+		})
 
-	if (result.status === "success") {
-		logger.info("session succeeded", { iterations: result.iterations, toolCalls: result.toolCalls })
-		process.stdout.write(result.result + "\n")
-		return 0
-	}
+		const result = await session.run()
 
-	logger.error("session failed", { error: result.error, iterations: result.iterations, reason: result.reason })
-	if (result.reason === "budget") {
-		process.stderr.write(`headlesscode: task aborted by budget: ${result.error ?? "budget exceeded"}\n`)
+		// A session writes into workspaceRoot throughout the run (file edits,
+		// its own .headlesscode/{events,usage,reports}, git's index as it
+		// stages things) AND, when workspaceRoot is a worktree, into the
+		// source repo's separate .git/worktrees/<name>/ admin dir — chowning
+		// only at worktree *creation* time (see session-launch.ts's
+		// ensureWorktree) misses all of this. Runs regardless of success/
+		// failure — a failed session can leave root-owned files too. No-ops
+		// when HEADLESSCODE_DASHBOARD_WORKTREE_OWNER isn't set (today's
+		// default for a non-container / non-root run).
+		chownWorktreeWorkspace(workspaceRoot)
+
+		if (session.memoryStats) {
+			process.stdout.write(
+				`[memory] project="${project}" recalled ${session.memoryStats.recalledFacts} fact(s) / ${session.memoryStats.recalledSessions} session(s); recorded ${session.memoryStats.recordedFacts} fact(s) / ${session.memoryStats.recordedSessions} session(s)\n`,
+			)
+		}
+
+		if (result.budgetUsage) {
+			process.stdout.write(
+				`[budget] cost $${result.budgetUsage.costUsd.toFixed(6)}, elapsed ${result.budgetUsage.elapsedMs}ms, iterations ${result.budgetUsage.iterations}, model ${result.budgetUsage.model}\n`,
+			)
+		}
+
+		if (result.status === "success") {
+			logger.info("session succeeded", { iterations: result.iterations, toolCalls: result.toolCalls })
+			process.stdout.write(result.result + "\n")
+			return 0
+		}
+
+		logger.error("session failed", { error: result.error, iterations: result.iterations, reason: result.reason })
+		if (result.reason === "budget") {
+			process.stderr.write(`headlesscode: task aborted by budget: ${result.error ?? "budget exceeded"}\n`)
+			return 1
+		}
+		process.stderr.write(`headlesscode: task failed: ${result.error ?? "unknown error"}\n`)
 		return 1
+	} finally {
+		if (!await finishSessionEmergencyControl(emergencyControl)) {
+			process.stderr.write("headlesscode: emergency cleanup or durable stop failed; inspect the recorded control state\n")
+			return 1
+		}
 	}
-	process.stderr.write(`headlesscode: task failed: ${result.error ?? "unknown error"}\n`)
-	return 1
+
 }
 
 /**

@@ -42,6 +42,9 @@ import { workerHarnessConfigDigest, workerHarnessRuntimeIdentityFromEnvironment,
 import { workerHarnessCliPath } from "./worker-harness.js"
 import { PostgresProofCampaign, proofCampaignManifestDigest, type ProofCampaignArmLease, type ProofCampaignManifest } from "./proof-campaign.js"
 import { runProofConfirmation } from "./proof-confirmation.js"
+import { loadHiddenVerifierConfig } from "./hidden-config.js"
+import { createOpenShellHiddenCaseRunner } from "./hidden-openshell-runner.js"
+import type { HiddenEvaluationOptions } from "./evaluator.js"
 
 function log(hooks: RsiHooks, line: string): void {
 	(hooks.log ?? ((message) => process.stdout.write(`${message}\n`)))(line)
@@ -156,7 +159,7 @@ export function createProofCampaignManifest(args: {
 			root: { maxCalls: rootCalls, maxTokens: rootTokens, maxSpendUsd: Math.min(spendAllocation, totalBudgetUsd, mutationReservationsUsd + requiredBenchmarkUsd), maxRuntimeMs },
 		},
 		acceptanceRule: { ...args.proofProtocol.rule, confirmationRetentionTaskIds: engineeringOnly ? [] : [...RSI_CONFIRMATION_RETENTION_TASK_IDS], minimumSelfHostedCampaigns: 2, requiredSuccessiveTransitions: 2, clusterConfidence: 0.9 }, runtime: { imageDigest: args.runtime.imageDigest, harnessCommit: args.runtime.harnessCommit, dependencyLockDigest: args.runtime.dependencyLockDigest },
-		analysisVersion: args.proofProtocol.schemaVersion.toString(), settings: { phaseMode: engineeringOnly ? "engineering-only" : "paired-confirmation", configDigest: workerHarnessConfigDigest(args.config, { baseCommit: args.baseCommit, model: args.model, provider: args.provider, proofProtocolDigest: args.proofProtocol.protocolDigest }), effectiveConfig: Object.fromEntries(Object.entries(args.config).filter(([key]) => !["workerHarnessMode", "workerHarnessPhase", "workerHarnessEngineeringOnly", "workerHarnessPairId", "workerHarnessRunId", "resumeRunId", "candidateIdNamespace", "workerHarnessParentCommit", "workerHarnessSnapshotTreeDigest"].includes(key))), candidateCounts, taskWallBoundMs, evaluationCells: ["regression", "typecheck", ...args.config.evalCommands.map((_, index) => `visible-${index}`)], developmentTaskIdentities: benchmarkTasks.map((task) => ({ id: task.id, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings })), confirmationTaskIdentities: engineeringOnly ? [] : confirmationTasks.map((task) => ({ id: task.id, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings })), inferenceCeilings: { maxInputTokensPerCall: benchmarkLimits.maxInputTokensPerCall, maxOutputTokensPerCall: benchmarkLimits.maxOutputTokensPerCall, maxCallsPerAttempt: benchmarkLimits.maxCalls, maxTotalTokens: benchmarkLimits.maxTotalTokens, maxCallSpendUsd: benchmarkLimits.maxCallSpendUsd, maxJobSpendUsd: benchmarkLimits.maxJobSpendUsd, maxInputPricePerMillionUsd: benchmarkLimits.maxInputPricePerMillionUsd, maxOutputPricePerMillionUsd: benchmarkLimits.maxOutputPricePerMillionUsd }, inferenceCampaignIds: { mutation: mutationCampaignId, benchmark: benchmarkCampaignId }, inferenceAllocationsUsd: { mutation: mutationLimits.maxCampaignSpendUsd, benchmark: benchmarkLimits.maxCampaignSpendUsd } },
+		analysisVersion: args.proofProtocol.schemaVersion.toString(), settings: { phaseMode: engineeringOnly ? "engineering-only" : "paired-confirmation", configDigest: workerHarnessConfigDigest(args.config, { baseCommit: args.baseCommit, model: args.model, provider: args.provider, proofProtocolDigest: args.proofProtocol.protocolDigest }), effectiveConfig: Object.fromEntries(Object.entries(args.config).filter(([key]) => !["workerHarnessMode", "workerHarnessPhase", "workerHarnessEngineeringOnly", "workerHarnessPairId", "workerHarnessRunId", "resumeRunId", "candidateIdNamespace", "workerHarnessParentCommit", "workerHarnessSnapshotTreeDigest", "hiddenSuitePath", "hiddenPublicKeyPath", "hiddenPrivateKeyPath", "hiddenNonceStorePath"].includes(key))), candidateCounts, taskWallBoundMs, evaluationCells: ["regression", "typecheck", ...args.config.evalCommands.map((_, index) => `visible-${index}`)], developmentTaskIdentities: benchmarkTasks.map((task) => ({ id: task.id, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings })), confirmationTaskIdentities: engineeringOnly ? [] : confirmationTasks.map((task) => ({ id: task.id, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings })), inferenceCeilings: { maxInputTokensPerCall: benchmarkLimits.maxInputTokensPerCall, maxOutputTokensPerCall: benchmarkLimits.maxOutputTokensPerCall, maxCallsPerAttempt: benchmarkLimits.maxCalls, maxTotalTokens: benchmarkLimits.maxTotalTokens, maxCallSpendUsd: benchmarkLimits.maxCallSpendUsd, maxJobSpendUsd: benchmarkLimits.maxJobSpendUsd, maxInputPricePerMillionUsd: benchmarkLimits.maxInputPricePerMillionUsd, maxOutputPricePerMillionUsd: benchmarkLimits.maxOutputPricePerMillionUsd }, inferenceCampaignIds: { mutation: mutationCampaignId, benchmark: benchmarkCampaignId }, inferenceAllocationsUsd: { mutation: mutationLimits.maxCampaignSpendUsd, benchmark: benchmarkLimits.maxCampaignSpendUsd } },
 	}
 }
 
@@ -647,12 +650,12 @@ async function runAdversarialStage(
 	}
 }
 
-async function evaluateBaselineLocal(config: RsiConfig, baseCommit: string, runner: RsiHooks["runCommand"]): Promise<NonNullable<RsiRunRecord["baselineEvaluation"]>> {
+async function evaluateBaselineLocal(config: RsiConfig, baseCommit: string, runner: RsiHooks["runCommand"], hidden?: (root: string, jobId: string) => HiddenEvaluationOptions | undefined): Promise<NonNullable<RsiRunRecord["baselineEvaluation"]>> {
 	const name = `rsi-baseline-${randomUUID().slice(0, 12)}`
 	const baselineRoot = path.join(config.repoRoot, ".worktrees", name)
 	execFileSync("git", ["worktree", "add", "--detach", baselineRoot, baseCommit], { cwd: config.repoRoot, stdio: "pipe" })
 	try {
-		return await evaluateCandidate(config, baselineRoot, baseCommit, runner)
+		return await evaluateCandidate(config, baselineRoot, baseCommit, runner, hidden?.(baselineRoot, "baseline"))
 	} finally {
 		execFileSync("git", ["worktree", "remove", "--force", baselineRoot], { cwd: config.repoRoot, stdio: "pipe" })
 	}
@@ -663,6 +666,7 @@ async function evaluateBaselineFleet(
 	baseCommit: string,
 	queue: PostgresRsiJobQueue,
 	runId: string,
+	hidden?: (root: string, jobId: string) => HiddenEvaluationOptions | undefined,
 ): Promise<NonNullable<RsiRunRecord["baselineEvaluation"]>> {
 	const idempotencyKey = `${runId}:baseline:evaluation`
 	const snapshot = createEvaluationSnapshotBundle(config.repoRoot, baseCommit, config)
@@ -701,7 +705,7 @@ async function evaluateBaselineFleet(
 	const baselineRoot = path.join(config.repoRoot, ".worktrees", `rsi-baseline-${randomUUID().slice(0, 12)}`)
 	execFileSync("git", ["worktree", "add", "--detach", baselineRoot, baseCommit], { cwd: config.repoRoot, stdio: "pipe" })
 	try {
-		return await evaluateCandidate(config, baselineRoot, baseCommit, async () => trials[resultIndex++] as TrialResult)
+		return await evaluateCandidate(config, baselineRoot, baseCommit, async () => trials[resultIndex++] as TrialResult, hidden?.(baselineRoot, "baseline"))
 	} finally {
 		execFileSync("git", ["worktree", "remove", "--force", baselineRoot], { cwd: config.repoRoot, stdio: "pipe" })
 	}
@@ -807,6 +811,21 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		...(config.workerHarnessPairId ? { candidateIdNamespace: run.runId.slice(-8) } : {}),
 		...(workerHarnessRuntime ? { workerHarnessRuntime } : {}),
 	}
+	const loadedHiddenVerifier = await loadHiddenVerifierConfig(runConfig)
+	if (resumed) {
+		if (JSON.stringify(resumed.hiddenVerifierIdentity) !== JSON.stringify(loadedHiddenVerifier?.identity)) throw new Error("hidden verifier suite, evaluator image, or public key differs from the frozen run identity")
+	} else if (loadedHiddenVerifier) {
+		run.hiddenVerifierIdentity = loadedHiddenVerifier.identity
+	}
+	const hiddenEvaluationFor = (candidateRoot: string, jobId: string): HiddenEvaluationOptions | undefined => loadedHiddenVerifier ? ({
+		suite: loadedHiddenVerifier.suite,
+		runner: createOpenShellHiddenCaseRunner({ candidateRoot, config: runConfig, signingKey: loadedHiddenVerifier.privateKey, imageDigest: loadedHiddenVerifier.imageDigest }),
+		nonceStore: loadedHiddenVerifier.nonceStore,
+		publicKey: loadedHiddenVerifier.publicKey,
+		evaluatorImageDigest: loadedHiddenVerifier.imageDigest,
+		sessionId: run.runId,
+		jobId,
+	}) : undefined
 	const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 	const proofFixturesRoot = path.join(packageRoot, "fixtures", "rsi-benchmark")
 	const loadedProofBenchmark = hooks.runDevelopmentBenchmark
@@ -1001,8 +1020,8 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	}
 	if (!config.dryRun && !run.baselineEvaluation) {
 		run.baselineEvaluation = fleetQueue
-			? await evaluateBaselineFleet(runConfig, baseCommit, fleetQueue, run.runId)
-			: await evaluateBaselineLocal(runConfig, baseCommit, commandRunner)
+			? await evaluateBaselineFleet(runConfig, baseCommit, fleetQueue, run.runId, hiddenEvaluationFor)
+			: await evaluateBaselineLocal(runConfig, baseCommit, commandRunner, hiddenEvaluationFor)
 		run.baselineFitness = computeFitness(run.baselineEvaluation)
 		run.baseline = run.baselineEvaluation.regression
 		log(hooks, `[rsi] baseline: ${run.baseline.ok ? "pass" : "fail"}`)
@@ -1313,9 +1332,9 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 					const visible = fleetEvaluationResult(completed.result)
 					const trials = [visible.regression, visible.typecheck, ...visible.visible]
 					let resultIndex = 0
-					evaluation = await evaluateCandidate(runConfig, candidate.worktree, candidate.baseCommit, async () => trials[resultIndex++] as Awaited<ReturnType<NonNullable<typeof hooks.runCommand>>>)
+					evaluation = await evaluateCandidate(runConfig, candidate.worktree, candidate.baseCommit, async () => trials[resultIndex++] as Awaited<ReturnType<NonNullable<typeof hooks.runCommand>>>, hiddenEvaluationFor(candidate.worktree, candidate.id))
 				} else {
-					evaluation = await evaluateCandidate(runConfig, candidate.worktree, candidate.baseCommit, commandRunner)
+					evaluation = await evaluateCandidate(runConfig, candidate.worktree, candidate.baseCommit, commandRunner, hiddenEvaluationFor(candidate.worktree, candidate.id))
 				}
 				if (runConfig.roles?.adversary) {
 					if (!fleetQueue) throw new Error("adversarial break tests require an OpenShell fleet worker")

@@ -273,6 +273,12 @@ export class ToolExecutor {
 		this.onAuxLlmUsage = options.onAuxLlmUsage
 	}
 
+	private stopSignal?: AbortSignal
+
+	setAbortSignal(signal?: AbortSignal): void {
+		this.stopSignal = signal
+	}
+
 	register(name: string, handler: ToolHandler): void {
 		this.handlers.set(name, handler)
 	}
@@ -349,6 +355,7 @@ export class ToolExecutor {
 	}
 
 	async execute(name: string, args: Record<string, unknown>): Promise<ToolResult> {
+		if (this.stopSignal?.aborted) return err("Tool execution stopped by supervisor")
 		const handler = this.handlers.get(name)
 		if (!handler) {
 			return {
@@ -358,6 +365,7 @@ export class ToolExecutor {
 		}
 		try {
 			return await handler(args, {
+				signal: this.stopSignal,
 				workspaceRoot: this.workspaceRoot,
 				permissions: this.permissions,
 				guardLargeOverwrites: this.options.guardLargeOverwrites,
@@ -1709,6 +1717,10 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 			const MAX_SPAWN_ATTEMPTS = 8
 			const SPAWN_RETRY_DELAY_MS = 500
 			const spawnAttempt = (attempt: number) => {
+				if (ctx.signal?.aborted) {
+					finish(err("execute_command: stopped by supervisor before spawn"))
+					return
+				}
 				// 2026-08-27: verified live — a failed spawn can fire BOTH the
 				// `error` event AND the `close` event for the SAME underlying
 				// failure (a known Node/libuv behavior: a child that never truly
@@ -1804,6 +1816,19 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 					)
 				}, timeoutS * 1000)
 
+				// This listener stays installed after a tool timeout so the supervisor
+				// can also stop this command's background process group.
+				const onAbort = (): void => {
+					clearTimeout(timer)
+					try {
+						if (child.pid != null && process.platform !== "win32") process.kill(-child.pid, "SIGKILL")
+						else child.kill("SIGKILL")
+					} catch { /* The process may have exited before cancellation. */ }
+					finish(err("execute_command: stopped by supervisor"))
+				}
+				ctx.signal?.addEventListener("abort", onAbort, { once: true })
+				if (ctx.signal?.aborted) onAbort()
+
 				child.stdout?.on("data", (chunk) => {
 					// After a timeout the model already got its partial output; keep
 					// draining the pipe (so the child never blocks on a full buffer)
@@ -1820,6 +1845,7 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 					}
 				})
 				child.on("error", (error) => {
+					ctx.signal?.removeEventListener("abort", onAbort)
 					if (attemptSettled) {
 						return
 					}
@@ -1836,6 +1862,7 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext):
 					finish(err(`execute_command: spawn error for '${command}': ${errorMessage(error)}`))
 				})
 				child.on("close", (code, signal) => {
+				ctx.signal?.removeEventListener("abort", onAbort)
 				if (attemptSettled) {
 					return
 				}

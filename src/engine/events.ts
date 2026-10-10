@@ -265,10 +265,12 @@ export class EventFeed {
 		})
 	}
 
-	toolCall(fields: { iteration: number; tool: string; args: string; argsTruncated: boolean }): Promise<void> {
+	toolCall(fields: { iteration: number; tool: string; args: string; argsTruncated: boolean; callId?: string; commandIdentity?: string }): Promise<void> {
 		return this.emit("tool_call", {
 			iteration: fields.iteration,
 			tool: fields.tool,
+			...(fields.callId ? { callId: fields.callId } : {}),
+			...(fields.commandIdentity ? { commandIdentity: fields.commandIdentity } : {}),
 			args: fields.args,
 			...(fields.argsTruncated ? { argsTruncated: true } : {}),
 		})
@@ -279,11 +281,15 @@ export class EventFeed {
 		tool: string
 		isError: boolean
 		result: string
+		callId?: string
+		commandIdentity?: string
 		resultTruncated: boolean
 	}): Promise<void> {
 		return this.emit("tool_result", {
 			iteration: fields.iteration,
 			tool: fields.tool,
+			...(fields.callId ? { callId: fields.callId } : {}),
+			...(fields.commandIdentity ? { commandIdentity: fields.commandIdentity } : {}),
 			isError: fields.isError,
 			result: fields.result,
 			...(fields.resultTruncated ? { resultTruncated: true } : {}),

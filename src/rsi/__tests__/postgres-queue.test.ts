@@ -384,7 +384,7 @@ test("PostgreSQL queue integration: worker loss, lease fencing and reclaim", { s
 	}
 })
 
-test("PostgreSQL queue integration: a timeout cannot release capacity from a live guest lease", { skip: !integrationReady }, async () => {
+test("PostgreSQL queue integration: active cancellation fences lease completion and inference", { skip: !integrationReady }, async () => {
 	const { queue, cleanup } = await createQueue(testPolicy(`timeout-${randomUUID().slice(0, 8)}`, { maxInFlight: 1, classCapacity: { LOCAL_GPU: 1 } }))
 	try {
 		const job = await addJob(queue, "guest-still-running")
@@ -392,11 +392,11 @@ test("PostgreSQL queue integration: a timeout cannot release capacity from a liv
 		await queue.registerWorker({ workerId: "worker-waiting", gatewayId: "gateway-waiting", hostname: "host-waiting", maxActive: 1, resourceClasses: ["LOCAL_GPU"] })
 		const lease = await queue.claim("worker-active")
 		assert.ok(lease)
-		assert.equal(await queue.cancel(job.jobId, "coordinator wait timed out"), false, "a leased OpenShell guest must retain capacity until teardown or lease expiry")
-		assert.equal((await queue.getJob(job.jobId))?.status, "leased")
-		assert.equal(await queue.claim("worker-waiting"), undefined, "capacity remains occupied while the leased guest may still run")
-		assert.equal((await queue.complete(lease, { tornDown: true })).accepted, true)
-		assert.equal((await queue.getJob(job.jobId))?.status, "completed")
+		assert.equal(await queue.cancel(job.jobId, "security stop"), true, "a leased job can be cancelled by the supervisor")
+		assert.equal((await queue.getJob(job.jobId))?.status, "cancelled")
+		assert.equal(await queue.heartbeat(lease), false, "cancelled lease cannot renew")
+		assert.equal((await queue.complete(lease, { tornDown: true })).accepted, false, "cancelled lease cannot import a stale result")
+		assert.equal(await queue.claim("worker-waiting"), undefined, "cancelled work is not reissued from the queue")
 	} finally {
 		await cleanup()
 	}
