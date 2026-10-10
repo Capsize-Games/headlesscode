@@ -2616,6 +2616,7 @@ const VENDORED_TOOL_NAMES = [
 	"read_file",
 	"run_slash_command",
 	"skill",
+	"read_skill_reference",
 	"search_replace",
 	"edit_file",
 	"edit",
@@ -2824,4 +2825,3 @@ export function createLocalExploreExecutor(workspaceRoot: string, options: ToolE
 
 	return executor
 }
-

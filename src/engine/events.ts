@@ -296,6 +296,10 @@ export class EventFeed {
 		})
 	}
 
+	skillActivated(fields: { name: string; source: string; digest: string }): Promise<void> {
+		return this.emit("skill_activated", fields)
+	}
+
 	/**
 	 * The session's final report (issue #34). Emitted when the loop accepts
 	 * completion — the one tool call that matters most for understanding a
