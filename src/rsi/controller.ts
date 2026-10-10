@@ -31,8 +31,8 @@ import {
 	resolveBaseCommit,
 } from "./workspace.js"
 import { loadBenchmark } from "./benchmark/runner.js"
-import { openRouterAllocatedEnvironment, openRouterBrokerLimitsFromEnvironment, RSI_OPENROUTER_MODEL } from "./inference-broker.js"
-import type { OpenRouterDenialSummary } from "./inference-broker.js"
+import { openRouterAllocatedEnvironment, openRouterBrokerLimitsFromEnvironment, openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID } from "./inference-broker.js"
+import type { OpenRouterDenialSummary, OpenRouterEndpointPriceSnapshot } from "./inference-broker.js"
 import { candidateProofDecision, compareDevelopmentAttempts, developmentCells, freezeDevelopmentProofProtocol } from "./development-proof.js"
 import type { DevelopmentTaskCell } from "./development-proof.js"
 import type { BenchmarkAttempt } from "./benchmark/types.js"
@@ -74,6 +74,7 @@ export function createProofCampaignManifest(args: {
 	baseCommit: string
 	model: string
 	provider: string
+	openRouterProfileId?: string
 	runtime: NonNullable<RsiRunRecord["workerHarnessRuntime"]>
 	developmentManifest: BenchmarkManifest
 	developmentManifestDigest: string
@@ -152,7 +153,7 @@ export function createProofCampaignManifest(args: {
 		schemaVersion: 1, phaseMode: engineeringOnly ? "engineering-only" : "paired-confirmation", campaignId: args.campaignId, rootCommit: args.baseCommit,
 		benchmarkDigests: { manifest: args.developmentManifestDigest, development: taskDigest(benchmarkTasks), confirmation: taskDigest(engineeringOnly ? [] : confirmationTasks) },
 		armAssignment: { fixedControl: "fixed-control", selfHosted: "self-hosted" },
-		model: { provider: args.provider, id: args.model, settings: { sampling: args.proofProtocol.model.sampling, roles: args.config.roles ?? {}, maxIterations: args.config.maxIterations, maxTokens: args.config.maxTokens ?? null } },
+		model: { provider: args.provider, id: args.model, ...(args.openRouterProfileId ? { profileId: args.openRouterProfileId } : {}), settings: { sampling: args.proofProtocol.model.sampling, roles: args.config.roles ?? {}, maxIterations: args.config.maxIterations, maxTokens: args.config.maxTokens ?? null } },
 		seed: args.config.seed, taskOrder: ["mutation", "regression", "typecheck", ...args.config.evalCommands.map((_, index) => `visible-${index}`), ...benchmarkTasks.map((task) => task.id), ...(engineeringOnly ? [] : confirmationTasks.map((task) => task.id))], schedule,
 		budgets: {
 			attempt: { maxCalls: Math.max(mutationLimits.maxCalls, benchmarkLimits.maxCalls, ...(!engineeringOnly ? [confirmationLimits.maxCalls] : [])), maxTokens: Math.max(mutationLimits.maxTotalTokens, benchmarkLimits.maxTotalTokens, ...(!engineeringOnly ? [confirmationLimits.maxTotalTokens] : [])), maxSpendUsd: Math.max(mutationLimits.maxJobSpendUsd, benchmarkLimits.maxJobSpendUsd, ...(!engineeringOnly ? [confirmationLimits.maxJobSpendUsd] : [])), maxDurationMs: Math.max(args.config.commandTimeoutMs, ...benchmarkTasks.map((task) => task.ceilings.timeoutMs), ...(!engineeringOnly ? confirmationTasks.map((task) => task.ceilings.timeoutMs) : [])) },
@@ -235,7 +236,9 @@ async function verifyFinishedConfirmationCheckpoint(run: RsiRunRecord, archiveDi
 	for (const row of [...expectedSelectedRows, ...expectedRootRows]) {
 		const attemptId = String(row.broker_job_id)
 		const attempt = artifacts.get(attemptId)
-		if (!attempt || attempt.validity !== "valid" || !attempt.proofQualified || attempt.resourceAccounting !== "supervisor-enforced" || !attempt.inferenceReceipt?.qualified || attempt.inferenceReceipt.endpointProvider !== "deepinfra" || attempt.inferenceReceipt.returnedProviders?.join(",") !== "deepinfra" || createHash("sha256").update(JSON.stringify(attempt)).digest("hex") !== String(row.result_sha256).trim()) throw new Error(`finished campaign recovery attempt ${attemptId} does not match its verified durable result`)
+		const expectedProfile = attempt ? openRouterProfileForModel(attempt.model.id, run.proofCampaign?.manifest.model.profileId) : undefined
+		const profileIdMatches = expectedProfile?.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? attempt?.inferenceReceipt?.profileId === undefined || attempt?.inferenceReceipt?.profileId === expectedProfile.id : attempt?.inferenceReceipt?.profileId === expectedProfile?.id
+		if (!attempt || attempt.validity !== "valid" || !attempt.proofQualified || attempt.resourceAccounting !== "supervisor-enforced" || !attempt.inferenceReceipt?.qualified || !profileIdMatches || attempt.inferenceReceipt.endpointProvider !== expectedProfile?.endpointProvider || attempt.inferenceReceipt.returnedProviders?.join(",") !== expectedProfile?.endpointProvider || createHash("sha256").update(JSON.stringify(attempt)).digest("hex") !== String(row.result_sha256).trim()) throw new Error(`finished campaign recovery attempt ${attemptId} does not match its verified durable result`)
 		const storedRefs = row.artifact_refs as Record<string, { sha256?: string }> | undefined
 		if (!storedRefs || Object.entries(attempt.artifactRefs).some(([name, digest]) => storedRefs[name]?.sha256 !== digest)) throw new Error(`finished campaign recovery attempt ${attemptId} has different artifact references`)
 		const candidateId = String(row.candidate_id)
@@ -359,7 +362,7 @@ async function waitForFleetJob(queue: PostgresRsiJobQueue, jobId: string, timeou
 
 function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: { content: Buffer; snapshotCommit: string; snapshotTreeDigest?: string }, options: { campaignId?: string; boundedInference?: boolean; includeWorkerHarness?: boolean; proofCampaign?: FleetJobPayload["proofCampaign"]; remainingCampaignMs?: number } = {}): FleetJobPayload {
 	const provider = config.roles?.worker?.provider === "openrouter" ? "openrouter" : "ollama"
-	if (provider === "openrouter" && candidate.model !== RSI_OPENROUTER_MODEL) throw new Error(`RSI OpenRouter worker model must be pinned to ${RSI_OPENROUTER_MODEL}`)
+	const openRouterProfile = provider === "openrouter" ? openRouterProfileForModel(candidate.model, config.roles?.worker?.openRouterProfile) : undefined
 	const inferenceLimits = provider === "openrouter" && options.boundedInference
 		? openRouterBrokerLimitsFromEnvironment(openRouterAllocatedEnvironment(process.env, "mutation"), options.campaignId ?? "", {
 			maxCalls: config.maxIterations,
@@ -378,6 +381,7 @@ function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: {
 		task: config.mutationTask,
 		model: candidate.model,
 		provider,
+		...(openRouterProfile && openRouterProfile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { openRouterProfile: openRouterProfile.id } : {}),
 		...(options.proofCampaign ? { proofCampaign: options.proofCampaign } : {}),
 		...(inferenceLimits ? { inferenceLimits } : {}),
 		maxIterations: config.maxIterations,
@@ -409,14 +413,22 @@ function recordFleetInferenceUsage(candidate: CandidateRecord, resultValue: unkn
 	if (!resultValue || typeof resultValue !== "object" || !payload.inferenceLimits) throw new Error("OpenRouter fleet mutation result is missing its broker identity")
 	const result = resultValue as { provider?: unknown; model?: unknown; inferenceReceipt?: Record<string, unknown> }
 	const receipt = result.inferenceReceipt
-	if (result.provider !== "openrouter" || result.model !== payload.model || !receipt || receipt.provider !== "openrouter" || receipt.endpointProvider !== "deepinfra" || receipt.jobId !== jobId || receipt.campaignId !== payload.inferenceLimits.campaignId || receipt.model !== payload.model || receipt.accounting !== "supervisor-enforced" || receipt.qualified !== true || !Array.isArray(receipt.returnedModels) || receipt.returnedModels.length !== 1 || receipt.returnedModels[0] !== payload.model || !Array.isArray(receipt.returnedProviders) || receipt.returnedProviders.length !== 1 || receipt.returnedProviders[0] !== "deepinfra") {
+	const profile = openRouterProfileForModel(payload.model, payload.openRouterProfile)
+	const profileIdMatches = profile.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? receipt?.profileId === undefined || receipt.profileId === profile.id : receipt?.profileId === profile.id
+	const price = receipt?.endpointPrice as OpenRouterEndpointPriceSnapshot | undefined
+	const priceMatches = profile.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID || Boolean(price && price.model === profile.model && price.provider === profile.endpointProvider && price.endpointTag === profile.endpointTag
+		&& price.quantization === profile.quantization && profile.requiredParameters.every((parameter) => price.supportedParameters.includes(parameter))
+		&& Number.isFinite(Date.parse(price.observedAt)) && /^[a-f0-9]{64}$/.test(price.responseSha256)
+		&& Number.isFinite(price.inputPricePerMillionUsd) && price.inputPricePerMillionUsd > 0 && price.inputPricePerMillionUsd <= payload.inferenceLimits.maxInputPricePerMillionUsd
+		&& Number.isFinite(price.outputPricePerMillionUsd) && price.outputPricePerMillionUsd > 0 && price.outputPricePerMillionUsd <= payload.inferenceLimits.maxOutputPricePerMillionUsd)
+	if (result.provider !== "openrouter" || result.model !== payload.model || !receipt || receipt.provider !== "openrouter" || !profileIdMatches || !priceMatches || receipt.endpointProvider !== profile.endpointProvider || receipt.jobId !== jobId || receipt.campaignId !== payload.inferenceLimits.campaignId || receipt.model !== payload.model || receipt.accounting !== "supervisor-enforced" || receipt.qualified !== true || !Array.isArray(receipt.returnedModels) || receipt.returnedModels.length !== 1 || !profile.returnedModels.includes(String(receipt.returnedModels[0])) || !Array.isArray(receipt.returnedProviders) || receipt.returnedProviders.length !== 1 || receipt.returnedProviders[0] !== profile.endpointProvider) {
 		throw new Error("OpenRouter fleet mutation result lacks a qualified receipt bound to the admitted provider, model, job and campaign")
 	}
 	const values = [receipt.calls, receipt.promptTokens, receipt.completionTokens, receipt.totalTokens, receipt.costUsd]
 	if (!values.every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0) || !Number.isSafeInteger(receipt.calls) || !Number.isSafeInteger(receipt.promptTokens) || !Number.isSafeInteger(receipt.completionTokens) || !Number.isSafeInteger(receipt.totalTokens)) throw new Error("OpenRouter fleet mutation receipt contains malformed resource totals")
 	if (!Array.isArray(receipt.denials) || !receipt.denials.every((entry) => entry && typeof entry === "object" && Number.isSafeInteger((entry as OpenRouterDenialSummary).statusCode) && (entry as OpenRouterDenialSummary).statusCode >= 400 && (entry as OpenRouterDenialSummary).statusCode <= 599 && Number.isSafeInteger((entry as OpenRouterDenialSummary).count) && (entry as OpenRouterDenialSummary).count >= 1 && /^[a-z-]+$/.test((entry as OpenRouterDenialSummary).reason))) throw new Error("OpenRouter fleet mutation receipt contains malformed denial summaries")
 	candidate.inferenceUsage = {
-		provider: "openrouter", endpointProvider: "deepinfra", model: payload.model, returnedModels: receipt.returnedModels as string[], returnedProviders: receipt.returnedProviders as string[], calls: receipt.calls as number,
+		provider: "openrouter", endpointProvider: profile.endpointProvider, ...(profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { profileId: profile.id } : {}), model: payload.model, returnedModels: receipt.returnedModels as string[], returnedProviders: receipt.returnedProviders as string[], calls: receipt.calls as number,
 		promptTokens: receipt.promptTokens as number, completionTokens: receipt.completionTokens as number, totalTokens: receipt.totalTokens as number,
 		costUsd: receipt.costUsd as number, accounting: "supervisor-enforced", qualified: true, jobId,
 		campaignId: payload.inferenceLimits.campaignId,
@@ -772,7 +784,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	const roles = resolveRoles(config.roles, process.env, config.model)
 	const workerModel = roles.worker?.model ?? config.model
 	const workerProvider = roles.worker?.provider === "openrouter" ? "openshell-openrouter" : "openshell-ollama"
-	if (workerProvider === "openshell-openrouter" && workerModel !== RSI_OPENROUTER_MODEL) throw new Error(`RSI OpenRouter worker model must be pinned to ${RSI_OPENROUTER_MODEL}`)
+	const workerOpenRouterProfile = workerProvider === "openshell-openrouter" ? openRouterProfileForModel(workerModel, roles.worker?.openRouterProfile) : undefined
 	const workerHarnessMode = config.workerHarnessMode ?? "fixed-control"
 	const workerHarnessRuntime = config.workerHarnessMode
 		? config.workerHarnessRuntime ?? workerHarnessRuntimeIdentityFromEnvironment(process.env)
@@ -786,9 +798,12 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	if (resumed && config.workerHarnessRunId && resumed.runId !== config.workerHarnessRunId) throw new Error("worker harness deterministic run identity differs from the resumed archive record")
 	const baseCommit = resumed?.baseCommit ?? (await resolveBaseCommit(config))
 	const run = resumed ?? initialRun({ ...config, model: workerModel, roles }, baseCommit, now())
+	if (resumed && resumed.model !== workerModel) throw new Error("worker model differs from the frozen run identity")
+	if (resumed?.openRouterProfileId && resumed.openRouterProfileId !== workerOpenRouterProfile?.id) throw new Error("OpenRouter profile differs from the frozen run identity")
 	const stageCount = requestedPhase === "confirmation" ? 0 : config.computePolicy === "adaptive-independent" ? 2 : config.generations
 	if (requestedPhase !== "confirmation") run.generations = stageCount
 	run.model = workerModel
+	if (workerOpenRouterProfile && workerOpenRouterProfile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID) run.openRouterProfileId = workerOpenRouterProfile.id
 	run.parentSelectionPolicy = config.parentSelectionPolicy ?? run.parentSelectionPolicy ?? "champion-specialist-novelty"
 	if (resumed && (run.workerHarnessMode ?? "fixed-control") !== workerHarnessMode) throw new Error("worker harness mode differs from the frozen run manifest")
 	if (resumed && (run.workerHarnessPairId ?? undefined) !== config.workerHarnessPairId) throw new Error("worker harness pair ID differs from the frozen run manifest")
@@ -834,7 +849,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	const proofProtocol = freezeDevelopmentProofProtocol(
 		loadedProofBenchmark.manifest,
 		loadedProofBenchmark.manifestDigest,
-		{ provider: workerProvider, id: workerModel, sampling: { temperature: 0, think: false, seed: "provider-default" } },
+		{ provider: workerProvider, id: workerModel, sampling: { temperature: 0, think: false, seed: "provider-default" }, ...(workerOpenRouterProfile && workerOpenRouterProfile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { profileId: workerOpenRouterProfile.id } : {}) },
 		config.developmentProofRule,
 	)
 	const plannedGenerations = resumed?.workerHarnessPlannedGenerations ?? stageCount
@@ -964,7 +979,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	if (config.workerHarnessPairId && !config.dryRun) {
 		if (!config.workerHarnessMode || !workerHarnessRuntime || !fleetQueue) throw new Error("restart-safe paired worker-harness campaigns require an explicit arm, frozen runtime identity, and PostgreSQL fleet queue")
 				if (config.workerHarnessEngineeringOnly && (requestedPhase !== "development" || config.resumeRunId && resumed?.proofCampaign?.manifest.phaseMode !== "engineering-only")) throw new Error("engineering-only execution cannot resume or enter a confirmation campaign")
-		const manifest = createProofCampaignManifest({ config: runConfig, campaignId: config.workerHarnessPairId, baseCommit, model: workerModel, provider: workerProvider, runtime: workerHarnessRuntime, developmentManifest: loadedProofBenchmark.manifest, developmentManifestDigest: loadedProofBenchmark.manifestDigest, plannedGenerations, proofProtocol })
+		const manifest = createProofCampaignManifest({ config: runConfig, campaignId: config.workerHarnessPairId, baseCommit, model: workerModel, provider: workerProvider, ...(workerOpenRouterProfile && workerOpenRouterProfile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { openRouterProfileId: workerOpenRouterProfile.id } : {}), runtime: workerHarnessRuntime, developmentManifest: loadedProofBenchmark.manifest, developmentManifestDigest: loadedProofBenchmark.manifestDigest, plannedGenerations, proofProtocol })
 		campaignStore = fleetQueue.proofCampaignCoordinator()
 		if (hooks.runDevelopmentBenchmark) throw new Error("paired proof campaigns cannot use an injected benchmark hook that bypasses durable campaign admission and settlement")
 		const priorSnapshot = await campaignStore.snapshotIfExists(config.workerHarnessPairId)

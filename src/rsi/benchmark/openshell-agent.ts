@@ -12,7 +12,7 @@ import type { BenchmarkAgent, BenchmarkAgentRequest, BenchmarkAgentResult, Bench
 import type { BenchmarkTask } from "./types.js"
 import { resolveBenchmarkFixturePath } from "./runner.js"
 import type { BenchmarkVerifier } from "./runner.js"
-import { FileOpenRouterInferenceLedger, openRouterAllocatedEnvironment, openRouterBrokerLimitsFromEnvironment, RSI_OPENROUTER_MODEL, startOpenRouterBroker } from "../inference-broker.js"
+import { FileOpenRouterInferenceLedger, openRouterAllocatedEnvironment, openRouterBrokerLimitsFromEnvironment, openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID, startOpenRouterBroker } from "../inference-broker.js"
 import type { OpenRouterBrokerOptions, OpenRouterBrokerReceipt, RunningOpenRouterBroker } from "../inference-broker.js"
 
 function git(cwd: string, args: string[]): string {
@@ -63,7 +63,7 @@ export class OpenShellBenchmarkAgent implements BenchmarkAgent {
 	async run(request: BenchmarkAgentRequest): Promise<BenchmarkAgentResult> {
 		if (request.model.provider !== this.provider) throw new Error("benchmark request provider does not match the configured OpenShell adapter")
 		const openRouter = this.provider === "openshell-openrouter"
-		if (openRouter && request.model.id !== RSI_OPENROUTER_MODEL) throw new Error(`OpenRouter benchmark model must be pinned to ${RSI_OPENROUTER_MODEL}`)
+		const profile = openRouter ? openRouterProfileForModel(request.model.id) : undefined
 		const checkout = git(this.harnessRoot, ["rev-parse", "HEAD"])
 		if (checkout !== request.harnessCommit) throw new Error(`benchmark harness checkout ${checkout} does not match requested commit ${request.harnessCommit}`)
 		if (this.expectedHarnessCommit && this.expectedHarnessCommit !== request.harnessCommit) throw new Error(`benchmark agent was pinned to harness ${this.expectedHarnessCommit}, not requested commit ${request.harnessCommit}`)
@@ -79,7 +79,10 @@ export class OpenShellBenchmarkAgent implements BenchmarkAgent {
 		const parsed = parseRsiArgs(["--repo", this.harnessRoot, "--model", request.model.id, "--max-iterations", String(request.ceilings.maxCalls), "--timeout-ms", String(request.ceilings.timeoutMs), "--max-tokens", String(request.ceilings.maxOutputTokensPerCall)])
 		if (!parsed.config || parsed.error) throw new Error(parsed.error ?? "could not construct OpenShell benchmark configuration")
 		parsed.config.benchmarkHarnessCommit = request.harnessCommit
-		if (openRouter) parsed.config.roles = { worker: { provider: "openrouter", model: request.model.id } }
+		if (openRouter) {
+			if (!profile) throw new Error("benchmark worker has no admitted OpenRouter profile")
+			parsed.config.roles = { worker: { provider: "openrouter", model: request.model.id, ...(profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { openRouterProfile: profile.id } : {}) } }
+		}
 		const candidate: CandidateRecord = {
 			id: request.taskId,
 			generation: 0,
@@ -100,13 +103,14 @@ export class OpenShellBenchmarkAgent implements BenchmarkAgent {
 		let broker: Awaited<ReturnType<typeof startOpenRouterBroker>> | undefined
 		try {
 			if (openRouter) {
+				if (!profile) throw new Error("benchmark worker has no admitted OpenRouter profile")
 				const apiKey = process.env.HEADLESSCODE_OPENROUTER_API_KEY?.trim()
 				const bindHost = process.env.HEADLESSCODE_RSI_BROKER_BIND_HOST?.trim()
 				if (!apiKey || !bindHost) throw new Error("OpenRouter benchmark requires the host API key and an explicit RSI broker interface address")
 				const limits = openRouterBrokerLimitsFromEnvironment(openRouterAllocatedEnvironment(process.env, "benchmark"), request.campaignId, {
 					maxCalls: request.ceilings.maxCalls, maxOutputTokensPerCall: request.ceilings.maxOutputTokensPerCall, maxDurationMs: request.ceilings.timeoutMs,
 				})
-				broker = await this.brokerFactory({ jobId: request.attemptId, leaseToken: request.attemptId, model: RSI_OPENROUTER_MODEL, limits, apiKey, bindHost, ledger: new FileOpenRouterInferenceLedger(request.brokerLedgerPath) })
+				broker = await this.brokerFactory({ jobId: request.attemptId, leaseToken: request.attemptId, model: profile.model, ...(profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { profileId: profile.id } : {}), limits, apiKey, bindHost, ledger: new FileOpenRouterInferenceLedger(request.brokerLedgerPath) })
 			}
 			const outcome = await runOpenShellMutation(candidate, parsed.config, this.providerFactory, image.digest, broker)
 			const inferenceReceipt = broker ? await broker.receipt() : undefined
@@ -124,6 +128,11 @@ export class OpenShellBenchmarkAgent implements BenchmarkAgent {
 
 	async verifyReceipt(attemptId: string, receipt: OpenRouterBrokerReceipt, brokerLedgerPath: string): Promise<boolean> {
 		if (this.provider !== "openshell-openrouter" || receipt.jobId !== attemptId) return false
+		try {
+			const profile = openRouterProfileForModel(receipt.model, receipt.profileId)
+			if (profile.endpointProvider !== receipt.endpointProvider || (profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID && receipt.profileId !== profile.id)) return false
+		}
+		catch { return false }
 		const stored = await new FileOpenRouterInferenceLedger(brokerLedgerPath).lookupReceipt(attemptId)
 		return JSON.stringify(stored) === JSON.stringify(receipt)
 	}

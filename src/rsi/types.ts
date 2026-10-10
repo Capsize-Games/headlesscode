@@ -1,7 +1,7 @@
 import type { ChildProcess } from "node:child_process"
 import type { CandidateDevelopmentProof, DevelopmentProofProtocol, DevelopmentProofRule } from "./development-proof.js"
 import type { BenchmarkAttempt } from "./benchmark/types.js"
-import type { OpenRouterDenialSummary } from "./inference-broker.js"
+import type { OpenRouterDenialSummary, RsiOpenRouterProfileId } from "./inference-broker.js"
 
 export type CandidateStatus = "planned" | "mutating" | "evaluating" | "accepted" | "rejected" | "failed"
 export type MutationKind = "corrective" | "architectural" | "search-policy" | "curriculum" | "model-adaptation"
@@ -87,6 +87,7 @@ export type ModelRole =
 export interface RoleModelConfig {
 	provider: "ollama" | "openrouter" | "command"
 	model: string
+	openRouterProfile?: RsiOpenRouterProfileId
 	baseUrl?: string
 	command?: string
 }
@@ -293,7 +294,8 @@ export interface CandidateRecord {
 	modelProvider?: string
 	inferenceUsage?: {
 		provider: "openrouter"
-		endpointProvider: "deepinfra"
+		endpointProvider: string
+		profileId?: RsiOpenRouterProfileId
 		model: string
 		returnedModels: string[]
 		returnedProviders: string[]
@@ -445,6 +447,7 @@ export interface RsiRunRecord {
 	baselineEvaluation?: EvaluationSummary
 	baselineFitness?: Fitness
 	model: string
+	openRouterProfileId?: RsiOpenRouterProfileId
 	baseRef: string
 	baseCommit: string
 	hiddenVerifierIdentity?: { protocol: string; suiteSha256: string; imageDigest: string; publicKeySha256: string }

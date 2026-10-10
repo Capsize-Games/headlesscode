@@ -1,9 +1,8 @@
 import assert from "node:assert/strict"
 import * as fs from "node:fs/promises"
-import * as os from "node:os"
 import * as path from "node:path"
 import test from "node:test"
-import { fetchPinnedOpenRouterEndpointPrice, FileOpenRouterInferenceLedger, openRouterCampaignBudgetAllocation, RSI_OPENROUTER_ENDPOINT_PROVIDER, RSI_OPENROUTER_ENDPOINT_TAG, RSI_OPENROUTER_MODEL, startOpenRouterBroker, validateOpenRouterBrokerLimits } from "../inference-broker.js"
+import { fetchOpenRouterEndpointPrice, fetchPinnedOpenRouterEndpointPrice, FileOpenRouterInferenceLedger, openRouterCampaignBudgetAllocation, openRouterProfileForModel, RSI_MUSE_OPENROUTER_BILLING_MODEL, RSI_MUSE_OPENROUTER_MODEL, RSI_OPENROUTER_ENDPOINT_PROVIDER, RSI_OPENROUTER_ENDPOINT_TAG, RSI_OPENROUTER_MODEL, startOpenRouterBroker, validateOpenRouterBrokerLimits } from "../inference-broker.js"
 import type { OpenRouterBrokerLimits } from "../inference-broker.js"
 
 function limits(campaignId: string, overrides: Partial<OpenRouterBrokerLimits> = {}): OpenRouterBrokerLimits {
@@ -13,6 +12,12 @@ function limits(campaignId: string, overrides: Partial<OpenRouterBrokerLimits> =
 		maxInputPricePerMillionUsd: 1, maxOutputPricePerMillionUsd: 1,
 		maxCallSpendUsd: 0.02, maxJobSpendUsd: 0.04, maxCampaignSpendUsd: 0.08, ...overrides,
 	}
+}
+
+async function scratch(prefix: string): Promise<string> {
+	const root = path.join(process.cwd(), ".headlesscode", "scratch")
+	await fs.mkdir(root, { recursive: true, mode: 0o700 })
+	return fs.mkdtemp(path.join(root, `${prefix}-`))
 }
 
 function fakeFetch(options: { usage?: Record<string, unknown>; model?: string; returnedProvider?: string | null } = {}) {
@@ -25,6 +30,8 @@ function fakeFetch(options: { usage?: Record<string, unknown>; model?: string; r
 		assert.equal(body.model, RSI_OPENROUTER_MODEL)
 		assert.deepEqual(body.provider, { only: [RSI_OPENROUTER_ENDPOINT_PROVIDER], allow_fallbacks: false })
 		assert.equal(body.max_tokens, 64)
+		assert.equal(Object.hasOwn(body, "session_id"), false)
+		assert.equal(Object.hasOwn(body, "prompt_cache_key"), false)
 		assert.equal((init?.headers as Record<string, string>)["X-OpenRouter-Metadata"], "enabled")
 		assert.equal((init?.headers as Record<string, string>).authorization, "Bearer host-secret")
 		const response = routedResponse({ id: "or-test-1", model: options.model ?? RSI_OPENROUTER_MODEL, choices: [], usage: options.usage ?? { prompt_tokens: 20, completion_tokens: 10, cost: 0.0002 } }, options.returnedProvider)
@@ -35,6 +42,10 @@ function fakeFetch(options: { usage?: Record<string, unknown>; model?: string; r
 
 function endpointMetadata(overrides: Record<string, unknown> = {}) {
 	return { provider_name: "DeepInfra", tag: RSI_OPENROUTER_ENDPOINT_TAG, quantization: "fp8", status: 0, pricing: { prompt: "0.00000006", completion: "0.00000018" }, supported_parameters: ["tools", "tool_choice", "temperature", "seed", "max_tokens"], supports_tool_choice: { auto: true, required: true, function: true }, ...overrides }
+}
+
+function museEndpointMetadata(overrides: Record<string, unknown> = {}) {
+	return { provider_name: "Meta", tag: "meta", quantization: "unknown", status: 0, pricing: { prompt: "0.0000001", completion: "0.0000002" }, supported_parameters: ["tools", "tool_choice", "temperature", "max_tokens"], supports_tool_choice: { auto: true, required: true, function: true }, ...overrides }
 }
 
 function routedResponse(response: Record<string, unknown>, selectedProvider: string | null = RSI_OPENROUTER_ENDPOINT_PROVIDER): Record<string, unknown> {
@@ -70,27 +81,125 @@ test("pinned endpoint pricing is a timestamped metadata GET with no inference su
 test("pinned endpoint preflight rejects unavailable, retagged, or parameter-incomplete routes", async () => {
 	for (const endpoint of [endpointMetadata({ status: -2 }), endpointMetadata({ tag: "deepinfra/other" }), endpointMetadata({ supported_parameters: ["tools"] }), endpointMetadata({ supports_tool_choice: { auto: false, required: false } })]) {
 		const fetcher = (async () => new Response(JSON.stringify({ data: { endpoints: [endpoint] } }), { status: 200 })) as typeof fetch
-		await assert.rejects(fetchPinnedOpenRouterEndpointPrice("", fetcher), /pinned DeepInfra fp8 endpoint/)
+		await assert.rejects(fetchPinnedOpenRouterEndpointPrice("", fetcher), /pinned DeepInfra endpoint with required agent parameters/)
 	}
 })
 
-async function setup(t: { after(fn: () => void | Promise<void>): void }, overrides: { usage?: Record<string, unknown>; model?: string; limits?: OpenRouterBrokerLimits; upstreamFetch?: typeof fetch } = {}) {
-	const root = await fs.mkdtemp(path.join(os.tmpdir(), "rsi-inference-broker-"))
+test("Muse endpoint admission pins current Meta metadata and rejects changed endpoint capabilities", async () => {
+	const requests: Array<{ url: string; method?: string }> = []
+	const fetcher = (async (input: string | URL, init?: RequestInit) => {
+		requests.push({ url: String(input), method: init?.method })
+		return new Response(JSON.stringify({ data: { endpoints: [museEndpointMetadata()] } }), { status: 200 })
+	}) as typeof fetch
+	const profile = openRouterProfileForModel(RSI_MUSE_OPENROUTER_MODEL, "muse-spark-contributor")
+	const price = await fetchOpenRouterEndpointPrice(profile, "metadata-test-key", fetcher, () => 1_800_000_000_000)
+	assert.equal(price.model, RSI_MUSE_OPENROUTER_MODEL)
+	assert.equal(price.provider, "meta")
+	assert.equal(price.endpointTag, "meta")
+	assert.equal(price.quantization, "unknown")
+	assert.ok(Math.abs(price.inputPricePerMillionUsd - 0.1) < 1e-12)
+	assert.ok(Math.abs(price.outputPricePerMillionUsd - 0.2) < 1e-12)
+	assert.equal(requests.length, 1)
+	assert.equal(requests[0]?.method, "GET")
+	assert.match(requests[0]?.url ?? "", /\/models\/meta\/muse-spark-1\.3-contributor\/endpoints$/)
+	for (const endpoint of [museEndpointMetadata({ provider_name: "Other" }), museEndpointMetadata({ tag: "other" }), museEndpointMetadata({ quantization: "fp8" }), museEndpointMetadata({ status: -2 }), museEndpointMetadata({ supported_parameters: ["tools"] }), museEndpointMetadata({ supports_tool_choice: { auto: false, required: false } })]) {
+		const bad = (async () => new Response(JSON.stringify({ data: { endpoints: [endpoint] } }), { status: 200 })) as typeof fetch
+		await assert.rejects(fetchOpenRouterEndpointPrice(profile, "", bad), /required agent parameters/)
+	}
+})
+
+async function setup(t: { after(fn: () => void | Promise<void>): void }, overrides: { usage?: Record<string, unknown>; model?: string; profileId?: "muse-spark-contributor"; limits?: OpenRouterBrokerLimits; upstreamFetch?: typeof fetch } = {}) {
+	const root = await scratch("rsi-inference-broker")
 	t.after(() => fs.rm(root, { recursive: true, force: true }))
 	const ledger = new FileOpenRouterInferenceLedger(path.join(root, "ledger.json"))
 	const upstream = overrides.upstreamFetch ? { fetcher: overrides.upstreamFetch, requests: [] as Array<{ url: string; init?: RequestInit }> } : fakeFetch(overrides)
 	const broker = await startOpenRouterBroker({
 		jobId: "attempt-1234567890123456", leaseToken: "lease-test", limits: overrides.limits ?? limits("campaign-test"), apiKey: "host-secret",
-		bindHost: "127.0.0.1", ledger, upstreamFetch: upstream.fetcher,
+		bindHost: "127.0.0.1", ledger, upstreamFetch: upstream.fetcher, ...(overrides.model ? { model: overrides.model } : {}), ...(overrides.profileId ? { profileId: overrides.profileId } : {}),
 	})
 	t.after(() => broker.close())
 	return { root, ledger, broker, upstream }
 }
 
+test("Muse broker overwrites both generic cache hints with a job-scoped key and receipts report cached usage", async (t) => {
+	const root = await scratch("rsi-inference-muse")
+	t.after(() => fs.rm(root, { recursive: true, force: true }))
+	const requests: Array<{ url: string; init?: RequestInit }> = []
+	const upstreamFetch = (async (input: string | URL, init?: RequestInit) => {
+		const url = String(input)
+		requests.push({ url, init })
+		if (url.includes("/models/")) return new Response(JSON.stringify({ data: { endpoints: [museEndpointMetadata()] } }), { status: 200 })
+		const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+		assert.equal(body.model, RSI_MUSE_OPENROUTER_MODEL)
+		assert.deepEqual(body.provider, { only: ["meta"], allow_fallbacks: false })
+		assert.equal(typeof body.session_id, "string")
+		assert.match(String(body.session_id), /^hc-rsi-[A-Za-z0-9_-]{32}$/)
+		assert.equal(body.prompt_cache_key, body.session_id, "OpenRouter receives one stable broker-owned cache routing key")
+		assert.notEqual(body.session_id, "guest-session-hint")
+		assert.notEqual(body.prompt_cache_key, "guest-cache-hint")
+		return new Response(JSON.stringify(routedResponse({ id: "muse-request-1", model: RSI_MUSE_OPENROUTER_MODEL, choices: [], usage: { prompt_tokens: 20, prompt_tokens_details: { cached_tokens: 12 }, completion_tokens: 10, cost: 0.0002 } }, "meta")), { status: 200, headers: { "content-type": "application/json" } })
+	}) as typeof fetch
+	const ledger = new FileOpenRouterInferenceLedger(path.join(root, "ledger.json"))
+	const broker = await startOpenRouterBroker({
+		jobId: "attempt-muse-123456789012", leaseToken: "lease-muse", limits: limits("campaign-muse"), apiKey: "host-secret",
+		bindHost: "127.0.0.1", ledger, upstreamFetch, model: RSI_MUSE_OPENROUTER_MODEL, profileId: "muse-spark-contributor",
+	})
+	t.after(() => broker.close())
+	const response = await fetch(`${broker.localBaseUrl}/api/v1/chat/completions`, {
+		method: "POST", headers: { authorization: `Bearer ${broker.capability}`, "content-type": "application/json", "x-rsi-call-id": "muse-call-123456789012" },
+		body: requestBody({ model: RSI_MUSE_OPENROUTER_MODEL, max_tokens: 64, session_id: "guest-session-hint", prompt_cache_key: "guest-cache-hint" }),
+	})
+	assert.equal(response.status, 200)
+	assert.equal(requests.filter((entry) => entry.url.endsWith("/chat/completions")).length, 1)
+	const receipt = await broker.receipt()
+	assert.equal(receipt.qualified, true)
+	assert.equal(receipt.profileId, "muse-spark-contributor")
+	assert.equal(receipt.endpointProvider, "meta")
+	assert.equal(receipt.endpointPrice?.provider, "meta")
+	assert.equal(receipt.callReceipts[0]?.cachedPromptTokens, 12)
+	assert.equal(receipt.callReceipts[0]?.costUsd, 0.0002)
+})
+
+test("Muse broker fails closed on price ceilings and mismatched returned model or provider", async (t) => {
+	const lowCeiling = limits("campaign-muse-price", { maxInputPricePerMillionUsd: 0.05, maxOutputPricePerMillionUsd: 0.05 })
+	const metadataFetch = (async () => new Response(JSON.stringify({ data: { endpoints: [museEndpointMetadata()] } }), { status: 200 })) as typeof fetch
+	const root = await scratch("rsi-inference-muse-price")
+	t.after(() => fs.rm(root, { recursive: true, force: true }))
+	const priceLedger = new FileOpenRouterInferenceLedger(path.join(root, "ledger.json"))
+	await assert.rejects(startOpenRouterBroker({ jobId: "attempt-muse-price-123", leaseToken: "lease", model: RSI_MUSE_OPENROUTER_MODEL, profileId: "muse-spark-contributor", limits: lowCeiling, apiKey: "host-secret", bindHost: "127.0.0.1", ledger: priceLedger, upstreamFetch: metadataFetch }), /price ceiling is below/)
+
+	for (const returned of [{ model: "meta/other", provider: "meta" }, { model: RSI_MUSE_OPENROUTER_MODEL, provider: "openai" }]) {
+		const upstreamFetch = (async (input: string | URL) => {
+			if (String(input).includes("/models/")) return new Response(JSON.stringify({ data: { endpoints: [museEndpointMetadata()] } }), { status: 200 })
+			return new Response(JSON.stringify(routedResponse({ id: "muse-mismatch", model: returned.model, choices: [], usage: { prompt_tokens: 12, completion_tokens: 3, cost: 0.0001 } }, returned.provider)), { status: 200, headers: { "content-type": "application/json" } })
+		}) as typeof fetch
+		const { broker } = await setup(t, { model: RSI_MUSE_OPENROUTER_MODEL, profileId: "muse-spark-contributor", upstreamFetch })
+		const response = await fetch(`${broker.localBaseUrl}/api/v1/chat/completions`, {
+			method: "POST", headers: { authorization: `Bearer ${broker.capability}`, "content-type": "application/json", "x-rsi-call-id": `muse-mismatch-${returned.provider}-123` },
+			body: requestBody({ model: RSI_MUSE_OPENROUTER_MODEL, max_tokens: 64 }),
+		})
+		assert.equal(response.status, 502)
+		assert.equal((await broker.receipt()).qualified, false)
+		await broker.close()
+	}
+	const aliasFetch = (async (input: string | URL) => {
+		if (String(input).includes("/models/")) return new Response(JSON.stringify({ data: { endpoints: [museEndpointMetadata()] } }), { status: 200 })
+		return new Response(JSON.stringify(routedResponse({ id: "muse-billing-alias", model: RSI_MUSE_OPENROUTER_BILLING_MODEL, choices: [], usage: { prompt_tokens: 12, completion_tokens: 3, cost: 0.0001 } }, "meta")), { status: 200, headers: { "content-type": "application/json" } })
+	}) as typeof fetch
+	const { broker } = await setup(t, { model: RSI_MUSE_OPENROUTER_MODEL, profileId: "muse-spark-contributor", upstreamFetch: aliasFetch })
+	const admittedAlias = await fetch(`${broker.localBaseUrl}/api/v1/chat/completions`, {
+		method: "POST", headers: { authorization: `Bearer ${broker.capability}`, "content-type": "application/json", "x-rsi-call-id": "muse-billing-alias-123" },
+		body: requestBody({ model: RSI_MUSE_OPENROUTER_MODEL, max_tokens: 64 }),
+	})
+	assert.equal(admittedAlias.status, 200)
+	assert.deepEqual((await broker.receipt()).returnedModels, [RSI_MUSE_OPENROUTER_BILLING_MODEL])
+	await broker.close()
+})
+
 test("OpenRouter broker pins model/provider, accounts usage, and survives broker restart", async (t) => {
 	const { root, ledger, broker, upstream } = await setup(t)
 	const call = () => fetch(`${broker.localBaseUrl}/api/v1/chat/completions`, {
-		method: "POST", headers: { authorization: `Bearer ${broker.capability}`, "content-type": "application/json", "x-rsi-call-id": "call-1234567890123456" }, body: requestBody(),
+		method: "POST", headers: { authorization: `Bearer ${broker.capability}`, "content-type": "application/json", "x-rsi-call-id": "call-1234567890123456" }, body: requestBody({ session_id: "guest-session-hint", prompt_cache_key: "guest-cache-hint" }),
 	})
 	const response = await call()
 	assert.equal(response.status, 200)
@@ -123,7 +232,7 @@ test("OpenRouter broker leaves missing or mismatched returned endpoint identity 
 })
 
 test("file ledger preserves the job deadline across broker restart and rejects a late response", async (t) => {
-	const root = await fs.mkdtemp(path.join(os.tmpdir(), "rsi-inference-deadline-"))
+	const root = await scratch("rsi-inference-deadline")
 	t.after(() => fs.rm(root, { recursive: true, force: true }))
 	const ledgerPath = path.join(root, "ledger.json")
 	const ledger = new FileOpenRouterInferenceLedger(ledgerPath)
@@ -212,7 +321,7 @@ test("OpenRouter broker enforces auth, endpoint allowlist, duplicate IDs, and ca
 
 test("OpenRouter broker can expose status-only access counters without request data", async (t) => {
 	const responses: Array<{ method: string; statusCode: number; requestBytes?: number }> = []
-	const root = await fs.mkdtemp(path.join(os.tmpdir(), "rsi-inference-status-"))
+	const root = await scratch("rsi-inference-status")
 	t.after(() => fs.rm(root, { recursive: true, force: true }))
 	const upstream = fakeFetch()
 	const broker = await startOpenRouterBroker({
@@ -263,7 +372,7 @@ test("OpenRouter broker parses final SSE usage when streaming is enabled", async
 })
 
 test("file ledger fails closed on a dead-process lock and rounds spend reservations upward", async (t) => {
-	const root = await fs.mkdtemp(path.join(os.tmpdir(), "rsi-ledger-recovery-"))
+	const root = await scratch("rsi-ledger-recovery")
 	t.after(() => fs.rm(root, { recursive: true, force: true }))
 	const file = path.join(root, "ledger.json")
 	await fs.writeFile(`${file}.lock`, JSON.stringify({ pid: 2_000_000_000, token: "dead", createdAt: Date.now() - 5_000 }), { mode: 0o600 })
@@ -299,7 +408,7 @@ test("mutation and benchmark budgets are disjoint partitions of the operator cam
 })
 
 test("file ledger serializes concurrent reservations against one campaign ceiling", async (t) => {
-	const root = await fs.mkdtemp(path.join(os.tmpdir(), "rsi-ledger-concurrency-"))
+	const root = await scratch("rsi-ledger-concurrency")
 	t.after(() => fs.rm(root, { recursive: true, force: true }))
 	const ledger = new FileOpenRouterInferenceLedger(path.join(root, "ledger.json"))
 	const bounded = validateOpenRouterBrokerLimits(limits("shared-cap", { maxCallSpendUsd: 0.01, maxJobSpendUsd: 0.01, maxCampaignSpendUsd: 0.01 }))
