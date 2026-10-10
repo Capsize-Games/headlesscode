@@ -48,6 +48,9 @@ try {
 				const workspace = path.join(root, name)
 				await fs.mkdir(workspace)
 				execFileSync("git", ["init", "-q"], { cwd: workspace })
+				execFileSync("git", ["config", "user.name", "Cloud smoke fixture"], { cwd: workspace })
+				execFileSync("git", ["config", "user.email", "cloud-smoke@example.invalid"], { cwd: workspace })
+				execFileSync("git", ["config", "core.hooksPath", "/dev/null"], { cwd: workspace })
 				return workspace
 			}
 			async function journal(sessionId: string): Promise<EvidenceJournal> {
@@ -69,17 +72,20 @@ try {
 				localExplore: false, llmTimeoutMs: 60_000, evidenceRequired: true,
 				budget: { maxCostUsd: 0.25, maxDurationMs: 180_000, maxIterations: 8 },
 				logger: new Logger({ level: "warn" as const }),
-				permissions: { allowedCommands: ["node --test calculator.test.mjs"], deniedCommands: [], protectedFiles: ["calculator.test.mjs"], allowProtectedWrites: false },
+				permissions: { allowedCommands: ["node --test calculator.test.mjs", "git add calculator.mjs", "git commit"], deniedCommands: [], protectedFiles: ["calculator.test.mjs"], allowProtectedWrites: false },
 			}
 			const sessionId = `cloud-fix-${randomUUID()}`
 			const workspaceRoot = await fixture("fix")
 			await fs.writeFile(path.join(workspaceRoot, "calculator.mjs"), "export function subtract(a, b) { return a + b }\n")
 			const tests = 'import assert from "node:assert/strict"; import {test} from "node:test"; import {subtract} from "./calculator.mjs"; test("subtract",()=>{assert.equal(subtract(9,4),5);assert.equal(subtract(-2,3),-5);assert.equal(subtract(2,-3),5)});\n'
 			await fs.writeFile(path.join(workspaceRoot, "calculator.test.mjs"), tests)
+			await fs.writeFile(path.join(workspaceRoot, ".gitignore"), ".headlesscode/\n")
+			execFileSync("git", ["add", "calculator.mjs", "calculator.test.mjs", ".gitignore"], { cwd: workspaceRoot })
+			execFileSync("git", ["commit", "-q", "-m", "Qualification fixture"], { cwd: workspaceRoot })
 			const evidenceJournal = await journal(sessionId)
 			await collector.appendObserved({ sessionId, requestId: randomUUID(), kind: "fixture_identity", actor: "cloud-smoke-supervisor", origin: "fixture", payload: { testSha256: sha256(tests), model, localGpu: false } })
 			const fixed = await new HeadlessSession({ ...common, workspaceRoot, sessionId, evidenceJournal,
-				taskText: "Fix subtract in calculator.mjs. Do not change calculator.test.mjs. Read the source, make the small correction, run exactly node --test calculator.test.mjs, then attempt_completion. Do not use indexing, new_task, package installs, or network access." }).run()
+				taskText: "Fix subtract in calculator.mjs. Do not change calculator.test.mjs. Read the source, make the small correction, run exactly node --test calculator.test.mjs, commit the change using git add calculator.mjs and git commit, then attempt_completion. Git identity and disabled hooks are already configured. Do not use indexing, new_task, package installs, or network access." }).run()
 			assert.equal(fixed.status, "success", fixed.error)
 			assert.equal(await fs.readFile(path.join(workspaceRoot, "calculator.test.mjs"), "utf8"), tests)
 			execFileSync(process.execPath, ["--test", "calculator.test.mjs"], { cwd: workspaceRoot, stdio: "pipe" })
