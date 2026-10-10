@@ -7,7 +7,8 @@ import { spawn, type ChildProcess } from "node:child_process"
 import { createServer } from "node:http"
 import { setTimeout as delay } from "node:timers/promises"
 import { FileEvidenceCollector, verifyEvidenceBundle } from "../../evidence/index.js"
-import { startSessionEmergencyControl } from "../../control/session-runtime.js"
+import { finishSessionEmergencyControl, startSessionEmergencyControl } from "../../control/session-runtime.js"
+import { EmergencyControl } from "../../control/emergency-controller.js"
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..")
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "rt-"))
@@ -98,7 +99,19 @@ try {
 	await fs.chmod(workspace, 0o755)
 	await assert.rejects(startSessionEmergencyControl({ workspaceRoot: workspace, env: { HEADLESSCODE_CONTROL_ID: "bad-path", HEADLESSCODE_CONTROL_STATE_DIR: workspace } }), /outside/)
 	assert.equal((await fs.stat(workspace)).mode & 0o777, 0o755, "rejected control paths preserve workspace permissions")
-	console.log("All 3 runtime CLI qualifications passed (external evidence, active stop, required outage)")
+	const dangling = path.join(root, "dangling")
+	const target = path.join(workspace, "must-not-exist")
+	await fs.symlink(target, dangling, "dir")
+	await assert.rejects(startSessionEmergencyControl({ workspaceRoot: workspace, env: { HEADLESSCODE_CONTROL_ID: "dangling", HEADLESSCODE_CONTROL_STATE_DIR: dangling } }), /symlinks/)
+	await assert.rejects(fs.stat(target), { code: "ENOENT" })
+	let writes = 0
+	const failedStop = await EmergencyControl.start({ identity: "fault", stateDirectory: path.join(root, "fault"), socketDirectory: sockets, graceMs: 50, persistState: async (file, record) => {
+		if (++writes > 1) throw new Error("injected durable stop failure")
+		await fs.writeFile(file, JSON.stringify(record), { mode: 0o600 })
+	} })
+	assert.equal(await finishSessionEmergencyControl(failedStop), false, "natural completion cannot hide a failed durable stop")
+	assert.equal(failedStop.state, "failed-to-stop")
+	console.log("All 5 runtime CLI qualifications passed (external evidence, active stop, required outage, dangling path, durable stop failure)")
 } finally {
 	for (const child of children) child.kill("SIGTERM")
 	mock.closeAllConnections()

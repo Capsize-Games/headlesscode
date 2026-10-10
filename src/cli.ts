@@ -47,7 +47,7 @@ import { openShellSessionMain } from "./cloud/openshell-session.js"
 import { cleanupContainedRuntimeProfile, resolveContainedRuntimeProfile, resolveSecurityProfile, serializeResolvedContainedProfile, type SecurityProfileName } from "./security/profile.js"
 import { evidenceJournalFromEnv, evidenceJournalFromProtectedConfigFile, runEvidenceCli } from "./evidence/index.js"
 
-import { startSessionEmergencyControl } from "./control/session-runtime.js"
+import { finishSessionEmergencyControl, startSessionEmergencyControl } from "./control/session-runtime.js"
 
 const VERSION = (JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version
 
@@ -1682,9 +1682,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		process.stderr.write(`headlesscode: task failed: ${result.error ?? "unknown error"}\n`)
 		return 1
 	} finally {
-		try {
-			if (emergencyControl?.state === "running") await emergencyControl.command("stop", "session finished")
-		} finally { await emergencyControl?.close() }
+		if (!await finishSessionEmergencyControl(emergencyControl)) {
+			process.stderr.write("headlesscode: emergency cleanup or durable stop failed; inspect the recorded control state\n")
+			return 1
+		}
 	}
 
 }
