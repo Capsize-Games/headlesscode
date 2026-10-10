@@ -148,7 +148,7 @@ relative imports resolve with no tsconfig magic:
 | `src/utils/json-schema.ts` | `zoo-code/src/utils/json-schema.ts` | Identity `normalizeToolSchema` + structural `JsonSchema`. Original drags `zod/v4`; full normalization only matters for real MCP support. **Needs adaptation when MCP lands.** |
 | `src/services/mcp/McpHub.ts` | `zoo-code/src/services/mcp/McpHub.ts` | Stub `McpHub` with an injectable server list; `getServers()`. No transports (Phase 1 has no MCP). |
 | `src/services/code-index/manager.ts` | `zoo-code/src/services/code-index/manager.ts` | Stub `CodeIndexManager.getInstance()` (prompt builder only calls the factory; result unused). |
-| `src/services/skills/SkillsManager.ts` | `zoo-code/src/services/skills/SkillsManager.ts` | Stub returning no skills from `getSkillsForMode()`. |
+| `src/services/skills/SkillsManager.ts` | `zoo-code/src/services/skills/SkillsManager.ts` | Headless adapter over an injected catalog snapshot; discovery and activation live in `src/skills/`. |
 | `src/services/search/file-search.ts` | `zoo-code/src/services/search/file-search.ts` | `executeRipgrep` implemented with pure Node fs + a small glob matcher (`**`, `*`, `!`-excludes). Originally only served `.roo` subdirectory discovery (`roo-config`); extended for the checkpoints vendoring to also serve `ShadowCheckpointService#getNestedGitRepository()`'s `**/.git/HEAD` nested-repo scan (returns `{ path, type }`, not just `path`, to match what that caller destructures). |
 | `src/i18n/index.ts` | `zoo-code/src/i18n/index.ts` | `t()` returns the key with `{param}` interpolation; original is the webview UI catalog. |
 | `types/index.ts` | the `@roo-code/types` package | Re-export barrel over the vendored `types/*` modules. Imported by relative path (`../../types`). |

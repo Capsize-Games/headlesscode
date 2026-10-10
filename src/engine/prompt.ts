@@ -36,6 +36,7 @@ import "../vendor/zoo-code/src/utils/path.js"
 import type { ExtensionContext } from "../vendor/zoo-code/shim/vscode.js"
 import { SYSTEM_PROMPT } from "../vendor/zoo-code/src/core/prompts/system.js"
 import { addCustomInstructions } from "../vendor/zoo-code/src/core/prompts/sections/custom-instructions.js"
+import { getSkillsSection } from "../vendor/zoo-code/src/core/prompts/sections/skills.js"
 import { getSystemInfoSection } from "../vendor/zoo-code/src/core/prompts/sections/system-info.js"
 import { getNativeTools } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/index.js"
 import { getGroupName, getModeBySlug, modes, getToolsForMode } from "../vendor/zoo-code/src/shared/modes.js"
@@ -50,6 +51,8 @@ import type { ModeConfig } from "../vendor/zoo-code/types/index.js"
 
 import { appendStackRulesSection, loadStackRules } from "./stacks.js"
 import type { ChatTool } from "./types.js"
+import { SkillsManager } from "../vendor/zoo-code/src/services/skills/SkillsManager.js"
+import type { SkillCatalogItem } from "../skills/registry.js"
 
 /** Opt-in gate for buildLeanSystemPrompt — see its doc comment. Default OFF. */
 export const LEAN_SYSTEM_PROMPT_ENV = "HEADLESSCODE_LEAN_SYSTEM_PROMPT"
@@ -64,6 +67,7 @@ export interface BuildSystemPromptOptions {
 	mode: string
 	customModes?: ModeConfig[]
 	globalCustomInstructions?: string
+	skills?: readonly SkillCatalogItem[]
 }
 
 export interface BuiltPrompt {
@@ -313,6 +317,9 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions): Prom
 		undefined, // language (shim default "en")
 		undefined, // rooIgnoreInstructions
 		settings,
+		undefined, // todoList
+		undefined, // modelId
+		new SkillsManager(options.skills ?? []),
 	)
 
 	// Stack-specific rules (src/engine/stacks.ts): appended as a clearly
@@ -640,7 +647,8 @@ export async function buildLeanSystemPrompt(options: BuildSystemPromptOptions): 
 		: basePrompt
 
 	const conventions = buildHeadlessConventions(modeConfig.slug, customModes)
-	const fullPrompt = conventions === undefined ? withStackRules : `${withStackRules}\n${conventions}`
+	const skillsSection = await getSkillsSection(new SkillsManager(options.skills ?? []), modeConfig.slug)
+	const fullPrompt = [withStackRules, conventions, skillsSection].filter(Boolean).join("\n")
 
 	return { prompt: fullPrompt, modeConfig, customModes }
 }
@@ -811,6 +819,16 @@ export function appendSetIndentationTool(tools: ChatTool[]): ChatTool[] {
 		return tools
 	}
 	return [...tools, setIndentationTool as unknown as ChatTool]
+}
+
+export function appendSkillTool(tools: ChatTool[]): ChatTool[] {
+	const existing = new Set(tools.filter((tool) => tool.type === "function").map((tool) => tool.function.name))
+	const additions: ChatTool[] = []
+	for (const tool of getNativeTools()) {
+		if (tool.type !== "function" || !["skill", "read_skill_reference"].includes(tool.function.name) || existing.has(tool.function.name)) continue
+		additions.push(tool as unknown as ChatTool)
+	}
+	return additions.length ? [...tools, ...additions] : tools
 }
 
 /**
