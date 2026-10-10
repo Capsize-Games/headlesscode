@@ -49,12 +49,13 @@ export function parseSessionsArgs(argv: string[]): { options: Options; error?: s
 	return { options }
 }
 
-function terminalSafe(value: string): string { return value.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "").replace(/[\u0000-\u001f\u007f-\u009f]/g, " ") }
-function write(value: string): void { process.stdout.write(`${terminalSafe(value)}\n`) }
-function error(value: string): void { process.stderr.write(`${terminalSafe(value)}\n`) }
+function terminalSafeField(value: string): string { return value.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "").replace(/[\u0000-\u001f\u007f-\u009f]/g, " ") }
+function write(value: string): void { process.stdout.write(`${value}\n`) }
+function error(value: string): void { process.stderr.write(`${terminalSafeField(value)}\n`) }
+function usageError(value: string): void { error(value); process.stderr.write(`${usage}\n`) }
 
 function summaryLine(value: { id: string; title: string; provider: SessionProvider; messageCount: number; updatedAt: string }): string {
-	return `${value.id}\t${value.provider}\t${value.updatedAt}\t${value.messageCount} messages\t${value.title}`
+	return `${value.id}\t${value.provider}\t${value.updatedAt}\t${value.messageCount} messages\t${terminalSafeField(value.title)}`
 }
 
 function renderArchive(archive: SessionArchive): string {
@@ -76,9 +77,9 @@ async function exportArchive(target: string, data: string): Promise<void> {
 export async function sessionsMain(argv: string[]): Promise<number> {
 	const { options, error: parseError } = parseSessionsArgs(argv)
 	if (options.help) { write(`headlesscode sessions\n${usage}`); return 0 }
-	if (parseError) { error(`${parseError}\n${usage}`); return 2 }
-	if (!options.command) { error(usage); return 2 }
-	if (!["discover", "import", "list", "show", "export", "fork"].includes(options.command)) { error(`Unknown sessions command: ${options.command}\n${usage}`); return 2 }
+	if (parseError) { usageError(parseError); return 2 }
+	if (!options.command) { process.stderr.write(`${usage}\n`); return 2 }
+	if (!["discover", "import", "list", "show", "export", "fork"].includes(options.command)) { usageError(`Unknown sessions command: ${options.command}`); return 2 }
 	const workspace = path.resolve(options.workspace ?? process.cwd())
 	try {
 		const store = new SessionStore(workspace)
@@ -88,15 +89,15 @@ export async function sessionsMain(argv: string[]): Promise<number> {
 				const found = await discoverImportFiles(options.provider, { workspaceRoot: workspace, ...(options.sourceRoot ? { sourceRoot: options.sourceRoot } : {}), all: options.all })
 				if (!found.length) { write("No sessions found."); return 0 }
 				write(`Found ${found.length} ${options.provider} session file(s):`)
-				for (const item of found) write(`${item.modifiedAt}\t${item.bytes} bytes\t${item.file}`)
+				for (const item of found) write(`${item.modifiedAt}\t${item.bytes} bytes\t${terminalSafeField(item.file)}`)
 				return 0
 			}
 			case "import": {
 				if (!options.provider) throw new Error("--from <claude|codex|muse> is required for import.")
 				if (!options.file) throw new Error("--file <path> is required for import.")
 				const { archive, warnings } = await importFile(options.provider, options.file, workspace)
-				write(`Imported ${options.provider} session as ${archive.id}: ${archive.title}`)
-				for (const warning of warnings) write(`Warning: ${warning}`)
+				write(`Imported ${options.provider} session as ${archive.id}: ${terminalSafeField(archive.title)}`)
+				for (const warning of warnings) write(`Warning: ${terminalSafeField(warning)}`)
 				return 0
 			}
 			case "list": {
@@ -108,14 +109,14 @@ export async function sessionsMain(argv: string[]): Promise<number> {
 			case "show": {
 				const id = options.positionals[0]
 				if (!id) throw new Error("A session ID is required.")
-				write(renderArchive(await store.load(id)))
+				process.stdout.write(`${renderArchive(await store.load(id))}\n`)
 				return 0
 			}
 			case "export": {
 				const id = options.positionals[0]
 				if (!id) throw new Error("A session ID is required.")
 				const data = `${renderArchive(await store.load(id))}\n`
-				if (options.out) { await exportArchive(options.out, data); write(`Exported ${id} to ${path.resolve(options.out)}`) }
+				if (options.out) { await exportArchive(options.out, data); write(`Exported ${id} to ${terminalSafeField(path.resolve(options.out))}`) }
 				else process.stdout.write(data)
 				return 0
 			}
@@ -123,7 +124,7 @@ export async function sessionsMain(argv: string[]): Promise<number> {
 				const id = options.positionals[0]
 				if (!id) throw new Error("A session ID is required.")
 				const archive = await store.fork(id)
-				write(`Forked ${id} as ${archive.id}: ${archive.title}`)
+				write(`Forked ${id} as ${archive.id}: ${terminalSafeField(archive.title)}`)
 				return 0
 			}
 		}
