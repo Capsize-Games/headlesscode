@@ -14,6 +14,7 @@ import { ADVERSARIAL_RUNNER_PATH, ADVERSARIAL_TESTS_PATH } from "./adversarial.j
 import { RSI_OPENROUTER_MODEL } from "./inference-broker.js"
 import { effectiveWorkerHarnessMode, workerHarnessCliPath, validWorkerHarnessRuntimeIdentity } from "./worker-harness.js"
 import { mutationSnapshotProtectedPathViolations } from "./sandbox.js"
+import type { EmergencyControl } from "../control/emergency-controller.js"
 
 const POLICY_PATH = fileURLToPath(new URL("../../shared/openshell/headlesscode-policy.yaml", import.meta.url))
 const MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024
@@ -29,6 +30,8 @@ export interface RsiOpenShellProvider {
 	waitReady(handle: SessionHandle): Promise<void>
 	runHarness(handle: SessionHandle, command: string): Promise<CommandResult>
 	teardown(handle: SessionHandle): Promise<void>
+	stopSession?(handle: SessionHandle): Promise<void>
+	emergencyManaged?: boolean
 }
 
 export type RsiOpenShellProviderFactory = (options: OpenShellSessionProviderOptions) => RsiOpenShellProvider
@@ -50,6 +53,8 @@ export interface IsolatedRunOptions {
 	env?: Record<string, string>
 	extraFiles?: Record<string, Buffer>
 	image?: string
+	signal?: AbortSignal
+	control?: Pick<EmergencyControl, "identity" | "state" | "stateDirectoryPath" | "signal" | "assertRunning" | "registerCleanup" | "registerResource" | "releaseResource">
 	providerFactory?: RsiOpenShellProviderFactory
 	inferenceBroker?: RsiInferenceBrokerAccess
 	expectedSnapshotTreeDigest?: string
@@ -381,7 +386,7 @@ export function inspectLocalRsiCheckpoint(configuredBase: string, mode: Isolated
 	return { path: source, files, bytes }
 }
 
-function providerOptions(config: RsiConfig, mode: IsolatedRunOptions["mode"], timeoutMs: number, imageReference?: string, inferenceBroker?: RsiInferenceBrokerAccess): OpenShellSessionProviderOptions {
+function providerOptions(config: RsiConfig, mode: IsolatedRunOptions["mode"], timeoutMs: number, imageReference?: string, inferenceBroker?: RsiInferenceBrokerAccess, signal?: AbortSignal, control?: IsolatedRunOptions["control"]): OpenShellSessionProviderOptions {
 	const policy = process.env.HEADLESSCODE_OPENSHELL_POLICY ?? POLICY_PATH
 	const configuredImage = process.env.HEADLESSCODE_OPENSHELL_IMAGE?.trim()
 	const trainingMode = mode === "training" || mode === "model-evaluation"
@@ -405,6 +410,8 @@ function providerOptions(config: RsiConfig, mode: IsolatedRunOptions["mode"], ti
 		includeProjectData: false,
 		projectIdentityRoot: "/workspace",
 		commandTimeoutMs: timeoutMs,
+		signal,
+		emergencyControl: control,
 		networkPolicy: networkRules(mode, inferenceBroker),
 		...(trainingMode ? { readOnlyMounts } : {}),
 		...(mode === "training" ? { gpu: 1 } : {}),
@@ -525,13 +532,21 @@ async function runSnapshot(options: IsolatedRunOptions & { preserveSnapshot?: bo
 		throw new Error("worker sanitized snapshot tree digest differs from the frozen fleet job identity")
 	}
 	const factory = options.providerFactory ?? ((providerConfig) => new OpenShellSessionProvider(providerConfig))
-	const provider = factory(providerOptions(options.config, options.mode, options.timeoutMs, options.image, options.inferenceBroker))
+	const provider = factory(providerOptions(options.config, options.mode, options.timeoutMs, options.image, options.inferenceBroker, options.signal, options.control))
 	const request = makeRequest(options.config.repoRoot, name, options.env ?? {})
 	let handle: SessionHandle | undefined
+	let unregisterCleanup: (() => void) | undefined
 	const started = Date.now()
 	try {
+		if (options.signal?.aborted) throw options.signal.reason ?? new Error("RSI job cancelled")
 		const startedHandle = await provider.spawnExistingWorktreeSession(request, snapshot)
 		handle = startedHandle
+		if (provider.stopSession && !provider.emergencyManaged && options.control) {
+			const resource = `openshell:${startedHandle.containerId ?? name}`
+			await options.control.registerResource(resource)
+			unregisterCleanup = options.control.registerCleanup(`openshell-${name}`, async () => provider.stopSession!(startedHandle), resource)
+		}
+		if (options.signal?.aborted) throw options.signal.reason ?? new Error("RSI job cancelled")
 		await provider.waitReady(startedHandle)
 		if (options.mode === "mutation") {
 			// OpenShell 0.1.2 polls provider environment revisions about every
@@ -539,8 +554,9 @@ async function runSnapshot(options: IsolatedRunOptions & { preserveSnapshot?: bo
 			// generation and closes older in-flight tunnels, even with no attached
 			// providers. Let that initial sync settle before local inference starts.
 			const remaining = OPENSHELL_INITIAL_CONFIG_SETTLE_MS - (Date.now() - started)
-			if (remaining > 0) await delay(remaining)
+			if (remaining > 0) await delay(remaining, undefined, { signal: options.signal })
 		}
+		if (options.signal?.aborted) throw options.signal.reason ?? new Error("RSI job cancelled")
 		const command = `cd /workspace && ${options.command}`
 		const result = await provider.runHarness(startedHandle, command)
 		return {
@@ -557,9 +573,15 @@ async function runSnapshot(options: IsolatedRunOptions & { preserveSnapshot?: bo
 			snapshotTreeDigest,
 		}
 	} finally {
+		let teardownVerified = false
 		try {
 			if (handle) await provider.teardown(handle)
+			teardownVerified = !!handle
 		} finally {
+			if (teardownVerified) {
+				unregisterCleanup?.()
+				if (handle?.containerId) await options.control?.releaseResource(`openshell:${handle.containerId}`)
+			}
 			if (!options.preserveSnapshot && options.mode !== "mutation" && !fs.existsSync(path.join(snapshot, ".harness.openshell-sandbox"))) {
 				fs.rmSync(snapshot, { recursive: true, force: true })
 			}
@@ -568,7 +590,7 @@ async function runSnapshot(options: IsolatedRunOptions & { preserveSnapshot?: bo
 }
 
 /** Run the fixed QLoRA or matched-model evaluator command inside OpenShell. */
-export async function runOpenShellModelJob(candidate: CandidateRecord, config: RsiConfig, task: NonNullable<import("./postgres-queue.js").FleetJobPayload["modelTask"]>, providerFactory?: RsiOpenShellProviderFactory): Promise<{ result: Record<string, unknown>; adapterArchive?: Buffer }> {
+export async function runOpenShellModelJob(candidate: CandidateRecord, config: RsiConfig, task: NonNullable<import("./postgres-queue.js").FleetJobPayload["modelTask"]>, providerFactory?: RsiOpenShellProviderFactory, signal?: AbortSignal, control?: IsolatedRunOptions["control"]): Promise<{ result: Record<string, unknown>; adapterArchive?: Buffer }> {
 	if (task.seed !== 1337 || task.baseModelPath !== "/workspace/.rsi-base-model" || !/^[A-Za-z0-9._:@/-]{1,180}$/.test(task.baseModelId)) throw new Error("model job does not match the fixed dataset seed, base-model mount, or model identity")
 	const training = task.kind === "qlora-train"
 	if (training && (task.maxSteps !== 8 || task.adapterPath || task.modelKind)) throw new Error("training job differs from the bounded QLoRA policy")
@@ -586,6 +608,8 @@ export async function runOpenShellModelJob(candidate: CandidateRecord, config: R
 		mode: training ? "training" : "model-evaluation",
 		sessionName: `rsi-model-${candidate.id}-${randomUUID().slice(0, 8)}`,
 		providerFactory,
+		signal,
+		control,
 		preserveSnapshot: true,
 	})
 	try {
@@ -605,7 +629,7 @@ export async function runOpenShellModelJob(candidate: CandidateRecord, config: R
 	}
 }
 
-export async function runOpenShellMutation(candidate: CandidateRecord, config: RsiConfig, providerFactory?: RsiOpenShellProviderFactory, image?: string, inferenceBroker?: RsiInferenceBrokerAccess): Promise<{ ok: boolean; result?: TrialResult; error?: string; patchRejected?: boolean; calls?: number | null; tokens?: number | null; workerHarnessExecution?: WorkerHarnessExecution }> {
+export async function runOpenShellMutation(candidate: CandidateRecord, config: RsiConfig, providerFactory?: RsiOpenShellProviderFactory, image?: string, inferenceBroker?: RsiInferenceBrokerAccess, signal?: AbortSignal, control?: IsolatedRunOptions["control"]): Promise<{ ok: boolean; result?: TrialResult; error?: string; patchRejected?: boolean; calls?: number | null; tokens?: number | null; workerHarnessExecution?: WorkerHarnessExecution }> {
 	try {
 		const requestedMode = config.workerHarnessMode ?? "fixed-control"
 		const effectiveMode = effectiveWorkerHarnessMode(requestedMode, candidate.generation)
@@ -675,6 +699,8 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 			sessionName: `rsi-mutation-${candidate.id}-${randomUUID().slice(0, 6)}`,
 			env,
 			inferenceBroker,
+			signal,
+			control,
 			image: pinnedImage,
 			providerFactory,
 			expectedSnapshotTreeDigest: config.workerHarnessSnapshotTreeDigest,
@@ -785,12 +811,13 @@ export function createOpenShellCommandRunner(config: RsiConfig): CommandRunner {
 }
 
 /** Execute only visible candidate checks inside a fresh OpenShell guest. */
-export async function runOpenShellEvaluation(candidate: CandidateRecord, config: RsiConfig): Promise<{ regression: TrialResult; typecheck: TrialResult; visible: TrialResult[] }> {
+export async function runOpenShellEvaluation(candidate: CandidateRecord, config: RsiConfig, signal?: AbortSignal, control?: IsolatedRunOptions["control"]): Promise<{ regression: TrialResult; typecheck: TrialResult; visible: TrialResult[] }> {
 	if (config.hiddenEvalCommands.length > 0) throw new Error("hidden RSI evaluation is supervisor-only and cannot be submitted as a worker job")
 	const commands = [config.regressionCommand, "npm run typecheck", ...config.evalCommands]
 	const results: TrialResult[] = []
 	for (const command of commands) {
-		const isolated = await runSnapshot({ config, sourceRoot: candidate.worktree, commit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: candidate.worktree, encoding: "utf8" }).trim(), command, timeoutMs: config.commandTimeoutMs, mode: "evaluation" })
+		if (signal?.aborted) throw signal.reason ?? new Error("RSI job cancelled")
+		const isolated = await runSnapshot({ config, sourceRoot: candidate.worktree, commit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: candidate.worktree, encoding: "utf8" }).trim(), command, timeoutMs: config.commandTimeoutMs, mode: "evaluation", signal, control })
 		results.push(isolated.result)
 	}
 	return { regression: results[0]!, typecheck: results[1]!, visible: results.slice(2) }

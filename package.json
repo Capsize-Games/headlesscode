@@ -20,7 +20,8 @@
 		"node": ">=22.19"
 	},
 	"bin": {
-		"headlesscode": "bin/headlesscode.mjs"
+		"headlesscode": "bin/headlesscode.mjs",
+		"headlesscode-control": "bin/headlesscode-control.mjs"
 	},
 	"files": [
 		"LICENSE",

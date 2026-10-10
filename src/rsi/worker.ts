@@ -11,6 +11,9 @@ import type { CandidateRecord, ComputePolicy, EvaluationSummary, MutationHypothe
 import { startOpenRouterBroker, RSI_OPENROUTER_MODEL, type OpenRouterBrokerReceipt, type OpenRouterBrokerOptions } from "./inference-broker.js"
 import { effectiveWorkerHarnessMode, workerHarnessCliPath, validWorkerHarnessRuntimeIdentity } from "./worker-harness.js"
 import { mutationSnapshotProtectedPathViolations } from "./sandbox.js"
+import type { EmergencyControl } from "../control/emergency-controller.js"
+import { EmergencyControl as EmergencyControlRuntime } from "../control/emergency-controller.js"
+import { OpenShellSessionProvider } from "../cloud/openshell-provider.js"
 
 const EVALUATION_PREVIEW_CHARS = 2048
 
@@ -54,6 +57,7 @@ export interface RsiWorkerOptions {
 	runEvaluation?: typeof runOpenShellEvaluation
 	runModelJob?: typeof runOpenShellModelJob
 	createInferenceBroker?: typeof startOpenRouterBroker
+	emergencyControl?: Pick<EmergencyControl, "identity" | "stateDirectoryPath" | "signal" | "state" | "assertRunning" | "waitUntilRunning" | "registerCleanup" | "registerResource" | "releaseResource">
 }
 
 function parsePositiveInteger(value: string | undefined, fallback: number, name: string): number {
@@ -165,7 +169,12 @@ export function verifyWorkerHarnessPayload(payload: FleetJobPayload, root: strin
 	if (actualTreeDigest !== identity.snapshotTreeDigest) throw new Error("fleet worker harness snapshot tree differs from the frozen job identity")
 }
 
-async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions): Promise<void> {
+async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions, signal: AbortSignal): Promise<void> {
+	const ensureActive = () => {
+		if (signal.aborted) throw signal.reason ?? new Error("fleet job cancelled")
+		options.emergencyControl?.assertRunning()
+	}
+	ensureActive()
 	const payload = lease.job.payload
 	if (payload.schemaVersion !== 1 || payload.snapshotSha256 !== lease.job.artifactSha256 || !Number.isSafeInteger(payload.snapshotBytes) || payload.snapshotBytes < 1) {
 		await options.queue.fail(lease, "malformed or unbound fleet snapshot payload")
@@ -182,6 +191,7 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions): Pr
 	let failureResult: Record<string, unknown> | undefined
 	try {
 		const bundle = await options.queue.getArtifact(payload.snapshotSha256)
+		ensureActive()
 		if (bundle.byteLength !== payload.snapshotBytes) throw new Error("fleet snapshot artifact length differed from queued metadata")
 		await fs.writeFile(bundlePath, bundle, { mode: 0o600, flag: "wx" })
 		const verifyRoot = path.join(root, "verify.git")
@@ -210,7 +220,7 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions): Pr
 					}
 					broker = await (options.createInferenceBroker ?? startOpenRouterBroker)(brokerOptions)
 				}
-				mutation = await (options.runMutation ?? runOpenShellMutation)(candidate, config, undefined, undefined, broker)
+				mutation = await (options.runMutation ?? runOpenShellMutation)(candidate, config, undefined, undefined, broker, signal, options.emergencyControl)
 				if (broker) receipt = await broker.receipt()
 			} finally {
 				if (broker && (payload.provider ?? "ollama") === "openrouter") {
@@ -234,13 +244,13 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions): Pr
 			const artifact = await options.queue.putArtifact(patch)
 			result = { ok: true, provider: payload.provider ?? "ollama", model: payload.model, ...(receipt ? { inferenceReceipt: receipt } : {}), ...(mutation.workerHarnessExecution ? { workerHarnessExecution: mutation.workerHarnessExecution } : {}), patchSha256: artifact.sha256, patchBytes: artifact.byteLength, durationMs: Date.now() - started }
 		} else if (lease.job.jobKind === "evaluation") {
-			const evaluation = await (options.runEvaluation ?? runOpenShellEvaluation)(candidate, config)
+			const evaluation = await (options.runEvaluation ?? runOpenShellEvaluation)(candidate, config, signal, options.emergencyControl)
 			const externalized = await externalizeEvaluationOutputs(options.queue, evaluation)
 			result = { ok: true, ...externalized, durationMs: Date.now() - started }
 		} else {
 			const modelTask = payload.modelTask
 			if (!modelTask || (lease.job.jobKind === "training") !== (modelTask.kind === "qlora-train")) throw new Error("fleet model job kind and payload do not match")
-			const model = await (options.runModelJob ?? runOpenShellModelJob)(candidate, config, modelTask)
+			const model = await (options.runModelJob ?? runOpenShellModelJob)(candidate, config, modelTask, undefined, signal, options.emergencyControl)
 			const outputArtifact = await options.queue.putArtifact(Buffer.from(JSON.stringify(model.result)))
 			const modelResult: Record<string, unknown> = { ...model.result, outputArtifactSha256: outputArtifact.sha256, outputArtifactBytes: outputArtifact.byteLength }
 			if (lease.job.jobKind === "training" && model.result.status === "completed") {
@@ -251,10 +261,11 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions): Pr
 			}
 			result = { ok: model.result.status === "completed", modelResult, durationMs: Date.now() - started }
 		}
+		ensureActive()
 		const completion = await options.queue.complete(lease, result)
 		if (!completion.accepted) throw new Error("OpenShell result was fenced because this worker no longer owns the lease")
 	} catch (error) {
-		await options.queue.fail(lease, error instanceof Error ? error.message : String(error), failureResult)
+		if (!signal.aborted) await options.queue.fail(lease, error instanceof Error ? error.message : String(error), failureResult)
 	} finally {
 		await fs.rm(root, { recursive: true, force: true })
 	}
@@ -275,17 +286,52 @@ export async function runRsiWorker(options: RsiWorkerOptions): Promise<void> {
 	})
 	let processed = 0
 	while (!options.signal?.aborted && (options.maxJobs === undefined || processed < options.maxJobs)) {
+		if (options.emergencyControl?.state === "paused" || options.emergencyControl?.state === "pause-requested") {
+			if (!await options.emergencyControl.waitUntilRunning(options.signal)) break
+		}
+		if (options.emergencyControl && options.emergencyControl.state !== "running") break
+		options.emergencyControl?.assertRunning()
 		await options.queue.heartbeatWorker(options.workerId)
 		const lease = await options.queue.claim(options.workerId)
 		if (!lease) {
-			await delay(options.pollMs ?? 1000, undefined, { signal: options.signal }).catch(() => undefined)
+			const idleSignals = [options.signal, options.emergencyControl?.signal].filter((value): value is AbortSignal => value !== undefined)
+			const idleSignal = idleSignals.length === 0 ? undefined : idleSignals.length === 1 ? idleSignals[0] : AbortSignal.any(idleSignals)
+			await delay(options.pollMs ?? 1000, undefined, { signal: idleSignal }).catch(() => undefined)
+			continue
+		}
+		const leaseController = new AbortController()
+		const leaseSignals = [options.signal, options.emergencyControl?.signal, leaseController.signal].filter((value): value is AbortSignal => value !== undefined)
+		const leaseSignal = leaseSignals.length === 1 ? leaseSignals[0]! : AbortSignal.any(leaseSignals)
+		const jobResource = `rsi-job:${lease.job.jobId}`
+		let unregisterCleanup: (() => void) | undefined
+		try {
+			unregisterCleanup = options.emergencyControl?.registerCleanup(`rsi-job-${lease.job.jobId}`, async () => {
+			const cancelled = await options.queue.cancel(lease.job.jobId, "supervisor emergency stop")
+			if (!cancelled) {
+				const record = await options.queue.getJob(lease.job.jobId)
+				if (record?.status !== "cancelled") throw new Error("active RSI job could not be cancelled in the queue")
+			}
+			leaseController.abort(new Error("supervisor emergency stop"))
+		}, jobResource)
+			await options.emergencyControl?.registerResource(jobResource)
+		} catch (error) {
+			await options.queue.cancel(lease.job.jobId, "worker stopped before lease execution").catch(() => false)
+			unregisterCleanup?.()
+			leaseController.abort(error instanceof Error ? error : new Error(String(error)))
 			continue
 		}
 		const heartbeat = setInterval(() => {
-			void options.queue.heartbeat(lease).catch(() => false)
+			void options.queue.heartbeat(lease).then((valid) => { if (!valid) leaseController.abort(new Error("RSI lease was cancelled or fenced")) }).catch(() => leaseController.abort(new Error("RSI lease heartbeat failed")))
 			void options.queue.heartbeatWorker(options.workerId).catch(() => false)
-		}, Math.max(1000, Math.floor(options.queue.policy.leaseMs / 3)))
-		try { await executeLease(lease, options) } finally { clearInterval(heartbeat) }
+		}, Math.max(1000, Math.min(5000, Math.floor(options.queue.policy.leaseMs / 3))))
+		try { await executeLease(lease, options, leaseSignal) } finally {
+			clearInterval(heartbeat)
+			const current = await options.queue.getJob(lease.job.jobId).catch(() => undefined)
+			if (current && ["completed", "failed", "cancelled"].includes(current.status)) {
+				unregisterCleanup?.()
+				await options.emergencyControl?.releaseResource(jobResource)
+			}
+		}
 		processed += 1
 	}
 	await options.queue.stopWorker(options.workerId)
@@ -305,10 +351,41 @@ export async function rsiWorkerMain(env: NodeJS.ProcessEnv = process.env): Promi
 	process.env.OPENSHELL_GATEWAY = gatewayId
 	const preflight = openshellPreflight({ requireOpenRouterCredential: false })
 	if (preflight) throw new Error(preflight)
+	const emergencyControl = await EmergencyControlRuntime.start({
+		identity: workerId,
+		stateDirectory: env.HEADLESSCODE_CONTROL_DIR,
+		socketDirectory: env.HEADLESSCODE_CONTROL_SOCKET_DIR,
+		operatorId: `uid:${typeof process.getuid === "function" ? process.getuid() : "unknown"}`,
+	})
+	if (emergencyControl.state === "failed-to-stop" && emergencyControl.snapshot.resources.length > 0) {
+		const recoveryProvider = new OpenShellSessionProvider({ emergencyControl })
+		for (const resource of emergencyControl.snapshot.resources) {
+			if (resource.startsWith("openshell:")) {
+				const sandbox = resource.slice("openshell:".length)
+				emergencyControl.registerCleanup(`recover-${sandbox}`, async () => { await recoveryProvider.stopSandbox(sandbox) }, resource)
+			} else if (resource.startsWith("rsi-job:")) {
+				const jobId = resource.slice("rsi-job:".length)
+				emergencyControl.registerCleanup(`recover-${jobId}`, async () => {
+					const cancelled = await queue.cancel(jobId, "restart recovery after supervisor stop")
+					const record = await queue.getJob(jobId)
+					if (!cancelled && record?.status !== "cancelled" && record?.status !== "failed" && record?.status !== "completed") {
+						throw new Error("stale RSI job could not be fenced during restart recovery")
+					}
+				}, resource)
+			}
+		}
+		await emergencyControl.command("stop", "restart recovery")
+	}
 	const controller = new AbortController()
-	const stop = () => controller.abort()
-	process.once("SIGINT", stop)
-	process.once("SIGTERM", stop)
+	let stopPromise: Promise<unknown> | undefined
+	const stop = (signal: string) => {
+		controller.abort(new Error(`received ${signal}`))
+		stopPromise ??= emergencyControl.command("stop", `received ${signal}`).catch(() => undefined)
+	}
+	const onSigint = () => stop("SIGINT")
+	const onSigterm = () => stop("SIGTERM")
+	process.once("SIGINT", onSigint)
+	process.once("SIGTERM", onSigterm)
 	try {
 		await runRsiWorker({
 			queue,
@@ -319,11 +396,16 @@ export async function rsiWorkerMain(env: NodeJS.ProcessEnv = process.env): Promi
 			scratchRoot: path.resolve(env.HEADLESSCODE_RSI_WORKER_SCRATCH_DIR ?? path.join(os.tmpdir(), "headlesscode-rsi-worker")),
 			pollMs: parsePositiveInteger(env.HEADLESSCODE_RSI_WORKER_POLL_MS, 1000, "HEADLESSCODE_RSI_WORKER_POLL_MS"),
 			signal: controller.signal,
+				emergencyControl,
 		})
+		if (stopPromise) await stopPromise
+		if (emergencyControl.state === "failed-to-stop" && emergencyControl.hasCleanupHandlers) await emergencyControl.waitForStopped()
+		if (emergencyControl.state === "running") await emergencyControl.command("stop", "RSI worker exited")
 		return 0
 	} finally {
-		process.removeListener("SIGINT", stop)
-		process.removeListener("SIGTERM", stop)
+		process.removeListener("SIGINT", onSigint)
+		process.removeListener("SIGTERM", onSigterm)
+		await emergencyControl.close()
 		await queue.close()
 	}
 }
