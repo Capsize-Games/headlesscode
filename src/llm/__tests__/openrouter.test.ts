@@ -6,6 +6,7 @@
  */
 
 import assert from "node:assert/strict"
+import { estimateCost } from "../../budget/cost.js"
 
 import { buildRequestBody, isRetryableOpenRouterError, OpenRouterClient, OpenRouterError, parseReasoningEffort } from "../openrouter.js"
 import type { LlmRequest } from "../../engine/types.js"
@@ -56,6 +57,97 @@ async function testRequestBodyEmitsMaxTokensWhenSet(): Promise<void> {
 	assert.equal(body.max_tokens, 4096, "max_tokens must be emitted when maxTokens is set")
 	const bare = buildRequestBody(baseRequest, "deepseek/deepseek-v4-flash")
 	assert.equal(bare.max_tokens, undefined, "max_tokens must be omitted when maxTokens is unset")
+}
+
+async function testOpaqueCacheRoutingKeyIsForwardedWithoutIdentityData(): Promise<void> {
+	const key = "hc-123e4567-e89b-42d3-a456-426614174000"
+	const body = buildRequestBody({ ...baseRequest, cacheRoutingKey: key }, "meta/muse-spark-1.3-contributor")
+	assert.equal(body.session_id, key)
+	assert.equal(body.prompt_cache_key, key)
+	assert.equal(JSON.stringify(body).includes("user@example.com"), false)
+	assert.throws(() => buildRequestBody({ ...baseRequest, cacheRoutingKey: "alice@example.com" }, "meta/muse-spark-1.3-contributor"), /opaque headlesscode UUID/)
+}
+
+async function testMuseQualificationPinsOnlyMetaWithoutFallback(): Promise<void> {
+	const body = buildRequestBody({ ...baseRequest, providerOnly: "meta" }, "meta/muse-spark-1.3-contributor")
+	assert.deepEqual(body.provider, { only: ["meta"], allow_fallbacks: false })
+	assert.throws(() => buildRequestBody({ ...baseRequest, providerOnly: "meta" }, "another/model"), /supported only for Meta-routed Muse/)
+}
+
+async function testOpenRouterUsageCostAndGenerationMetadataAreMapped(): Promise<void> {
+	const client = new OpenRouterClient({ apiKey: "k", baseUrl: "http://mock" })
+	const originalFetch = globalThis.fetch
+	let call = 0
+	globalThis.fetch = (async (url: string | URL | Request) => {
+		call++
+		if (String(url).includes("/api/v1/generation?")) {
+			return new Response(JSON.stringify({ data: {
+				id: "gen-abc-123", model: "meta/muse-spark-1.3-contributor", provider_name: "Meta",
+				total_cost: 0.00012, upstream_inference_cost: 0.00011, cache_discount: 0.00003,
+				tokens_prompt: 1200, tokens_completion: 8, native_tokens_reasoning: 2, native_tokens_cached: 1100, latency: 900,
+			} }), { status: 200 })
+		}
+		return new Response(JSON.stringify({
+			id: "chatcmpl-x", model: "meta/muse-spark-1.3-contributor", provider_name: "Meta",
+			choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+			usage: { prompt_tokens: 1200, completion_tokens: 8, total_tokens: 1208,
+				prompt_tokens_details: { cached_tokens: 1100, cache_write_tokens: 0 },
+				completion_tokens_details: { reasoning_tokens: 2 }, cost: 0.00012, cache_discount: 0.00003 },
+		}), { status: 200, headers: { "X-Generation-Id": "gen-abc-123" } })
+	}) as typeof fetch
+	try {
+		const response = await client.createChatCompletion({ model: "meta/muse-spark-1.3-contributor", messages: [{ role: "user", content: "synthetic" }] })
+		assert.equal(response.generationId, "gen-abc-123")
+		assert.equal(response.returnedModel, "meta/muse-spark-1.3-contributor")
+		assert.equal(response.providerName, "Meta")
+		assert.equal(response.usage?.cachedTokens, 1100)
+		assert.equal(response.usage?.cacheWriteTokens, 0)
+		assert.equal(response.usage?.reasoningTokens, 2)
+		assert.equal(response.usage?.openRouterReportedCostUsd, 0.00012)
+		assert.equal(response.usage?.cacheDiscountUsd, 0.00003)
+		const metadata = await client.fetchGenerationMetadata(response.generationId!)
+		assert.deepEqual(metadata, {
+			id: "gen-abc-123", model: "meta/muse-spark-1.3-contributor", providerName: "Meta",
+			totalCostUsd: 0.00012, upstreamInferenceCostUsd: 0.00011, cacheDiscountUsd: 0.00003,
+			tokensPrompt: 1200, tokensCompletion: 8, nativeTokensReasoning: 2, nativeTokensCached: 1100, latencyMs: 900,
+		})
+		assert.equal(call, 2)
+	} finally { globalThis.fetch = originalFetch }
+}
+
+async function testMalformedGenerationBillingIsNotReportedAsAuthoritative(): Promise<void> {
+	const client = new OpenRouterClient({ apiKey: "k", baseUrl: "http://mock" })
+	const restore = stubFetch(new Response(JSON.stringify({ data: { id: "gen-safe", total_cost: "unknown", cache_discount: "bad" } }), { status: 200 }))
+	try {
+		assert.deepEqual(await client.fetchGenerationMetadata("gen-safe"), { id: "gen-safe" })
+		assert.equal(await client.fetchGenerationMetadata("not-a-generation-id"), undefined)
+	} finally { restore() }
+}
+
+async function testMalformedUsageCountsCannotCreateCacheDiscount(): Promise<void> {
+	const client = new OpenRouterClient({ apiKey: "k", baseUrl: "http://mock" })
+	for (const invalidCachedCount of ["-1", "1.5", "101", "1e999"]) {
+		const restore = stubFetch(new Response(`{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":100,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":${invalidCachedCount}}}}`, { status: 200 }))
+		try {
+			const response = await client.createChatCompletion({ model: "meta/muse-spark-1.3-contributor", messages: [{ role: "user", content: "test" }] })
+			assert.equal(response.usage?.promptTokens, 100)
+			assert.equal(response.usage?.cachedTokens, undefined, `${invalidCachedCount} cached count must not activate discounted guardrail pricing`)
+			assert.equal(estimateCost({
+				model: "meta/muse-spark-1.3-contributor",
+				inputTokens: response.usage?.promptTokens,
+				outputTokens: response.usage?.completionTokens,
+				cachedTokens: response.usage?.cachedTokens,
+			}), 0.0000104, `${invalidCachedCount} cache count leaves every prompt token at the full guardrail rate`)
+		} finally { restore() }
+	}
+	const restore = stubFetch(new Response(JSON.stringify({
+		choices: [{ message: { role: "assistant", content: "ok" } }],
+		usage: { prompt_tokens: 100, completion_tokens: 2, prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 1.5 } },
+	}), { status: 200 }))
+	try {
+		const response = await client.createChatCompletion({ model: "meta/muse-spark-1.3-contributor", messages: [{ role: "user", content: "test" }] })
+		assert.equal(response.usage?.cacheWriteTokens, undefined, "fractional counts are not trusted as token telemetry")
+	} finally { restore() }
 }
 
 // ─── fetchModelContextWindow (Phase 3 condensation trigger) ─────────────────
@@ -416,7 +508,7 @@ async function testStreamedTextAndReasoningAssembleCorrectly(): Promise<void> {
 		{ choices: [{ delta: { content: "Hello" } }] },
 		{ choices: [{ delta: { content: " world" } }] },
 		{ choices: [{ delta: {}, finish_reason: "stop" }] },
-		{ usage: { prompt_tokens: 12, completion_tokens: 9, total_tokens: 21 } },
+		{ id: "gen-stream-1", model: "meta/muse-spark-1.3-contributor", provider_name: "Meta", usage: { prompt_tokens: 12, completion_tokens: 9, total_tokens: 21, prompt_tokens_details: { cached_tokens: 8, cache_write_tokens: 1 }, completion_tokens_details: { reasoning_tokens: 3 }, cost: 0.0001, cache_discount: 0.00001 } },
 		"[DONE]",
 	)
 	const restore = stubFetch(sseResponse(body))
@@ -443,6 +535,14 @@ async function testStreamedTextAndReasoningAssembleCorrectly(): Promise<void> {
 		assert.equal(response.usage?.promptTokens, 12)
 		assert.equal(response.usage?.completionTokens, 9)
 		assert.equal(response.usage?.totalTokens, 21)
+		assert.equal(response.generationId, "gen-stream-1")
+		assert.equal(response.returnedModel, "meta/muse-spark-1.3-contributor")
+		assert.equal(response.providerName, "Meta")
+		assert.equal(response.usage?.cachedTokens, 8)
+		assert.equal(response.usage?.cacheWriteTokens, 1)
+		assert.equal(response.usage?.reasoningTokens, 3)
+		assert.equal(response.usage?.openRouterReportedCostUsd, 0.0001)
+		assert.equal(response.usage?.cacheDiscountUsd, 0.00001)
 	} finally {
 		restore()
 	}
@@ -620,6 +720,11 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["the RSI proof model uses the pinned DeepInfra endpoint and advertised parameters", testRsiProofModelUsesPinnedDeepinfraRoute],
 	["non-deepseek models are never pinned to the deepseek provider", testNonDeepseekModelsAreNotPinned],
 	["buildRequestBody emits max_tokens when set, omits it when unset", testRequestBodyEmitsMaxTokensWhenSet],
+	["opaque cache-routing key is forwarded as session_id and prompt_cache_key", testOpaqueCacheRoutingKeyIsForwardedWithoutIdentityData],
+	["Muse qualification pins to Meta with fallbacks disabled", testMuseQualificationPinsOnlyMetaWithoutFallback],
+	["OpenRouter response usage and generation billing metadata are preserved", testOpenRouterUsageCostAndGenerationMetadataAreMapped],
+	["malformed generation cost evidence is omitted", testMalformedGenerationBillingIsNotReportedAsAuthoritative],
+	["malformed usage counts cannot create cache discounts", testMalformedUsageCountsCannotCreateCacheDiscount],
 	["deepseek/* requests include include_reasoning (load-bearing)", testDeepseekRequestIncludesReasoning],
 	["non-deepseek requests do not include include_reasoning", testNonDeepseekRequestsDoNotIncludeReasoning],
 	["deepseek/* requests send reasoning: { effort } when configured", testDeepseekRequestSendsReasoningEffort],

@@ -38,6 +38,23 @@ export interface OpenRouterClientOptions {
 	defaultModel?: string
 	httpReferer?: string
 	appTitle?: string
+	/** For synthetic diagnostics that must never write prompt-bearing transcripts. */
+	disableTranscriptCapture?: boolean
+}
+
+/** Non-content billing/route record retrieved from OpenRouter's generation API. */
+export interface OpenRouterGenerationMetadata {
+	id: string
+	model?: string
+	providerName?: string
+	totalCostUsd?: number
+	upstreamInferenceCostUsd?: number
+	cacheDiscountUsd?: number
+	tokensPrompt?: number
+	tokensCompletion?: number
+	nativeTokensReasoning?: number
+	nativeTokensCached?: number
+	latencyMs?: number
 }
 
 /** Typed error for non-2xx responses or malformed payloads. */
@@ -113,6 +130,7 @@ export class OpenRouterClient implements LlmClient {
 	private readonly defaultModel: string
 	private readonly httpReferer?: string
 	private readonly appTitle?: string
+	private readonly disableTranscriptCapture: boolean
 
 	constructor(options: OpenRouterClientOptions = {}) {
 		this.apiKey = options.apiKey ?? process.env.HEADLESSCODE_OPENROUTER_API_KEY
@@ -120,6 +138,7 @@ export class OpenRouterClient implements LlmClient {
 		this.defaultModel = options.defaultModel ?? process.env.OPENROUTER_MODEL ?? DEFAULT_MODEL
 		this.httpReferer = options.httpReferer ?? process.env.OPENROUTER_HTTP_REFERER
 		this.appTitle = options.appTitle ?? process.env.OPENROUTER_APP_TITLE
+		this.disableTranscriptCapture = options.disableTranscriptCapture ?? false
 	}
 
 	/**
@@ -294,7 +313,7 @@ export class OpenRouterClient implements LlmClient {
 	async fetchModelInfo(
 		model: string,
 		signal?: AbortSignal,
-	): Promise<{ contextWindow?: number; price?: ModelPrice } | undefined> {
+	): Promise<{ contextWindow?: number; price?: ModelPrice; endpoints?: Array<{ providerName?: string; status?: number }> } | undefined> {
 		if (!this.apiKey) {
 			return undefined
 		}
@@ -343,12 +362,14 @@ export class OpenRouterClient implements LlmClient {
 		let data:
 			| {
 					data?:
-						| Array<{ context_length?: unknown; provider_name?: unknown; pricing?: unknown }>
-						| { endpoints?: Array<{ context_length?: unknown; provider_name?: unknown; pricing?: unknown }> }
+						| Array<{ context_length?: unknown; provider_name?: unknown; pricing?: unknown; status?: unknown }>
+						| { endpoints?: Array<{ context_length?: unknown; provider_name?: unknown; pricing?: unknown; status?: unknown }> }
 			  }
 			| undefined
 		try {
-			data = JSON.parse(await response.text()) as typeof data
+			const responseText = await readBoundedResponseText(response, 256 * 1024)
+			if (responseText === undefined) return undefined
+			data = JSON.parse(responseText) as typeof data
 		} catch {
 			return undefined
 		}
@@ -370,6 +391,10 @@ export class OpenRouterClient implements LlmClient {
 		return {
 			...(contextWindow !== undefined ? { contextWindow } : {}),
 			...(price !== undefined ? { price } : {}),
+			endpoints: endpoints.map((endpoint) => ({
+				...(typeof endpoint.provider_name === "string" ? { providerName: endpoint.provider_name } : {}),
+				...(typeof endpoint.status === "number" && Number.isFinite(endpoint.status) ? { status: endpoint.status } : {}),
+			})),
 		}
 	}
 
@@ -382,6 +407,53 @@ export class OpenRouterClient implements LlmClient {
 	 */
 	async fetchModelContextWindow(model: string, signal?: AbortSignal): Promise<number | undefined> {
 		return (await this.fetchModelInfo(model, signal))?.contextWindow
+	}
+
+	/** Retrieve OpenRouter's post-generation billing record without reading stored prompt/completion content. */
+	async fetchGenerationMetadata(generationId: string, signal?: AbortSignal): Promise<OpenRouterGenerationMetadata | undefined> {
+		if (!this.apiKey || !/^gen-[0-9A-Za-z-]{1,124}$/.test(generationId)) return undefined
+		let response: Response | undefined
+		for (const [attempt, delayMs] of [0, 250, 500].entries()) {
+			if (signal?.aborted) return undefined
+			try {
+				const res = await fetch(`${this.baseUrl}/api/v1/generation?id=${encodeURIComponent(generationId)}`, {
+					method: "GET",
+					headers: this.authHeaders(),
+					signal,
+				})
+				if (res.ok) { response = res; break }
+				if (!(res.status === 404 || res.status === 429 || res.status >= 500)) return undefined
+			} catch {
+				if (signal?.aborted) return undefined
+			}
+			if (attempt < 2 && delayMs > 0) {
+				try { await abortableDelay(delayMs, signal) } catch { return undefined }
+			}
+		}
+		if (!response) return undefined
+		let raw: string | undefined
+		try { raw = await readBoundedResponseText(response, 64 * 1024) } catch { return undefined }
+		if (raw === undefined) return undefined
+		let envelope: { data?: Record<string, unknown> }
+		try { envelope = JSON.parse(raw) as typeof envelope } catch { return undefined }
+		const data = envelope?.data
+		if (!data || data.id !== generationId) return undefined
+		const number = (value: unknown): number | undefined => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined
+		const decimal = (value: unknown): number | undefined => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined
+		const signedNumber = (value: unknown): number | undefined => typeof value === "number" && Number.isFinite(value) ? value : undefined
+		return {
+			id: generationId,
+			...(typeof data.model === "string" ? { model: data.model } : {}),
+			...(typeof data.provider_name === "string" ? { providerName: data.provider_name } : {}),
+			...(decimal(data.total_cost) !== undefined ? { totalCostUsd: decimal(data.total_cost) } : {}),
+			...(decimal(data.upstream_inference_cost) !== undefined ? { upstreamInferenceCostUsd: decimal(data.upstream_inference_cost) } : {}),
+			...(signedNumber(data.cache_discount) !== undefined ? { cacheDiscountUsd: signedNumber(data.cache_discount) } : {}),
+			...(number(data.tokens_prompt) !== undefined ? { tokensPrompt: number(data.tokens_prompt) } : {}),
+			...(number(data.tokens_completion) !== undefined ? { tokensCompletion: number(data.tokens_completion) } : {}),
+			...(number(data.native_tokens_reasoning) !== undefined ? { nativeTokensReasoning: number(data.native_tokens_reasoning) } : {}),
+			...(number(data.native_tokens_cached) !== undefined ? { nativeTokensCached: number(data.native_tokens_cached) } : {}),
+			...(decimal(data.latency) !== undefined ? { latencyMs: decimal(data.latency) } : {}),
+		}
 	}
 
 	async createChatCompletion(request: LlmRequest): Promise<LlmResponse> {
@@ -410,7 +482,7 @@ export class OpenRouterClient implements LlmClient {
 		try {
 			return await this.createChatCompletionNonStreaming(request, url, headers, body, model, startedAt)
 		} catch (err) {
-			if (isTranscriptCaptureEnabled()) {
+			if (!this.disableTranscriptCapture && isTranscriptCaptureEnabled()) {
 				captureTranscript(
 					{ provider: "openrouter", model },
 					{
@@ -471,8 +543,13 @@ export class OpenRouterClient implements LlmClient {
 		const rawBody = await response.text()
 		let data:
 			| {
+					id?: string
+					model?: string
+					provider?: string
+					provider_name?: string
 					choices?: Array<{ message?: ChatMessage; finish_reason?: string }>
 					usage?: RawUsage
+					cache_discount?: number
 					error?: { message?: string; code?: unknown }
 			  }
 			| undefined
@@ -502,9 +579,12 @@ export class OpenRouterClient implements LlmClient {
 
 		const result: LlmResponse = {
 			message,
-			usage: mapUsage(data.usage),
+			usage: mapUsage(data.usage, data.cache_discount),
+			generationId: response.headers.get("X-Generation-Id") ?? (typeof data.id === "string" ? data.id : undefined),
+			returnedModel: typeof data.model === "string" ? data.model : undefined,
+			providerName: typeof data.provider_name === "string" ? data.provider_name : typeof data.provider === "string" ? data.provider : undefined,
 		}
-		if (isTranscriptCaptureEnabled()) {
+		if (!this.disableTranscriptCapture && isTranscriptCaptureEnabled()) {
 			captureTranscript(
 				{ provider: "openrouter", model },
 				{ messages: request.messages, tools: request.tools, temperature: request.temperature, response: result, durationMs: Date.now() - startedAt },
@@ -589,6 +669,10 @@ export class OpenRouterClient implements LlmClient {
 		let sawFinish = false
 		let sawUsage = false
 		let lastUsage: RawUsage | undefined
+		let lastCacheDiscount: number | undefined
+		let generationId: string | undefined = response.headers.get("X-Generation-Id") ?? undefined
+		let returnedModel: string | undefined
+		let providerName: string | undefined
 
 		const fail = (message: string): never => {
 			throw new OpenRouterError(message)
@@ -646,8 +730,13 @@ export class OpenRouterClient implements LlmClient {
 				}
 				let data:
 					| {
+							id?: string
+							model?: string
+							provider?: string
+							provider_name?: string
 							choices?: Array<{ delta?: { content?: string; reasoning?: string; tool_calls?: StreamToolCallDelta[] }; finish_reason?: string }>
 							usage?: RawUsage
+							cache_discount?: number
 							error?: { message?: string }
 					  }
 					| undefined
@@ -694,6 +783,11 @@ export class OpenRouterClient implements LlmClient {
 					sawUsage = true
 					lastUsage = data.usage
 				}
+				if (typeof data?.id === "string") generationId = data.id
+				if (typeof data?.model === "string") returnedModel = data.model
+				if (typeof data?.provider_name === "string") providerName = data.provider_name
+				else if (typeof data?.provider === "string") providerName = data.provider
+				if (typeof data?.cache_discount === "number" && Number.isFinite(data.cache_discount)) lastCacheDiscount = data.cache_discount
 			}
 		}
 
@@ -722,7 +816,10 @@ export class OpenRouterClient implements LlmClient {
 
 		return {
 			message,
-			usage: mapUsage(lastUsage),
+			usage: mapUsage(lastUsage, lastCacheDiscount),
+			generationId,
+			returnedModel,
+			providerName,
 		}
 	}
 }
@@ -779,6 +876,23 @@ export function buildRequestBody(request: LlmRequest, model: string): Record<str
 	const body: Record<string, unknown> = {
 		model,
 		messages: request.messages,
+	}
+	if (request.cacheRoutingKey !== undefined) {
+		if (!/^hc-[0-9a-f-]{36}$/i.test(request.cacheRoutingKey)) {
+			throw new Error("cacheRoutingKey must be an opaque headlesscode UUID key")
+		}
+		body.session_id = request.cacheRoutingKey
+		// OpenRouter currently treats prompt_cache_key as a sticky-routing key
+		// when session_id is absent; Meta also documents it for routing requests
+		// with a shared prefix to the same backend. The value is deliberately
+		// opaque and random per run, never a prompt, user ID, or credential.
+		body.prompt_cache_key = request.cacheRoutingKey
+	}
+	if (request.providerOnly !== undefined) {
+		if (request.providerOnly !== "meta" || model !== "meta/muse-spark-1.3-contributor") {
+			throw new Error("providerOnly is supported only for Meta-routed Muse Contributor qualification")
+		}
+		body.provider = { only: ["meta"], allow_fallbacks: false }
 	}
 	if (request.tools && request.tools.length > 0) {
 		body.tools = request.tools satisfies ChatTool[]
@@ -858,19 +972,84 @@ interface RawUsage {
 	/** OpenRouter's pass-through of the underlying provider's cache accounting. */
 	prompt_tokens_details?: {
 		cached_tokens?: number
+		cache_write_tokens?: number
 	}
+	completion_tokens_details?: { reasoning_tokens?: number }
+	cost?: number
+	cache_discount?: number
 }
 
-function mapUsage(raw: RawUsage | undefined): LlmResponse["usage"] {
+function mapUsage(raw: RawUsage | undefined, envelopeCacheDiscount?: number): LlmResponse["usage"] {
 	if (!raw) {
 		return undefined
 	}
+	const promptTokens = safeTokenCount(raw.prompt_tokens)
+	const cachedReported = safeTokenCount(raw.prompt_tokens_details?.cached_tokens)
+	const cachedTokens = promptTokens !== undefined && cachedReported !== undefined && cachedReported <= promptTokens
+		? cachedReported
+		: undefined
 	return {
-		promptTokens: raw.prompt_tokens,
-		completionTokens: raw.completion_tokens,
-		totalTokens: raw.total_tokens,
-		cachedTokens: raw.prompt_tokens_details?.cached_tokens,
+		promptTokens,
+		completionTokens: safeTokenCount(raw.completion_tokens),
+		totalTokens: safeTokenCount(raw.total_tokens),
+		cachedTokens,
+		cacheWriteTokens: safeTokenCount(raw.prompt_tokens_details?.cache_write_tokens),
+		reasoningTokens: safeTokenCount(raw.completion_tokens_details?.reasoning_tokens),
+		openRouterReportedCostUsd: finiteNonNegative(raw.cost),
+		cacheDiscountUsd: finiteSigned(raw.cache_discount) ?? finiteSigned(envelopeCacheDiscount),
 	}
+}
+
+/** Provider token counts are untrusted telemetry; accept only bounded integers. */
+function safeTokenCount(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined
+}
+
+function finiteNonNegative(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined
+}
+
+function finiteSigned(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+async function readBoundedResponseText(response: Response, limit: number): Promise<string | undefined> {
+	if (!response.body) return undefined
+	const reader = response.body.getReader()
+	const chunks: Uint8Array[] = []
+	let total = 0
+	try {
+		while (true) {
+			const { done, value } = await reader.read()
+			if (done) break
+			if (!value) continue
+			total += value.byteLength
+			if (total > limit) { await reader.cancel(); return undefined }
+			chunks.push(value)
+		}
+	} finally {
+		reader.releaseLock()
+	}
+	const joined = new Uint8Array(total)
+	let offset = 0
+	for (const chunk of chunks) { joined.set(chunk, offset); offset += chunk.byteLength }
+	return new TextDecoder().decode(joined)
+}
+
+function abortableDelay(milliseconds: number, signal?: AbortSignal): Promise<void> {
+	if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("aborted"))
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort)
+			resolve()
+		}, milliseconds)
+		const onAbort = () => {
+			clearTimeout(timer)
+			signal?.removeEventListener("abort", onAbort)
+			reject(signal?.reason ?? new Error("aborted"))
+		}
+		signal?.addEventListener("abort", onAbort, { once: true })
+	})
 }
 
 /** Truncate a raw body to a bounded excerpt for error messages. */

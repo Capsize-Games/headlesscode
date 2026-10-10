@@ -65,6 +65,15 @@ async function testDeepseekV4Flash0731Priced(): Promise<void> {
 	assert.equal(price.cacheRead, undefined, "without a verified cache price, cached input uses the full input rate")
 }
 
+async function testMuseContributorPricingUsesVerifiedCacheRate(): Promise<void> {
+	const price = DEFAULT_PRICING_TABLE["meta/muse-spark-1.3-contributor"]
+	assert.deepEqual(price, { input: 0.10, output: 0.20, cacheRead: 0.002 })
+	const allCold = estimateCost({ model: "meta/muse-spark-1.3-contributor", inputTokens: 100_000, outputTokens: 1_000 })
+	const withCache = estimateCost({ model: "meta/muse-spark-1.3-contributor", inputTokens: 100_000, cachedTokens: 80_000, outputTokens: 1_000 })
+	assert.ok(withCache < allCold, "verified cache-read rate should lower the guardrail estimate")
+	assert.ok(withCache > 0, "the guardrail stays non-zero; it is not billed-cost evidence")
+}
+
 async function testDefaultTableShape(): Promise<void> {
 	// The default table covers the models the harness uses: deepseek-chat,
 	// deepseek-reasoner and at least one general model.
@@ -307,6 +316,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["default pricing table covers deepseek-chat + reasoner + a general model", testDefaultTableShape],
 	["deepseek/deepseek-v4-flash is priced correctly (2026-08-01 incident regression)", testDeepseekV4FlashPriced],
 	["deepseek/deepseek-v4-flash-0731 (current default) is priced correctly", testDeepseekV4Flash0731Priced],
+	["Muse Contributor uses verified input/output/cache rates", testMuseContributorPricingUsesVerifiedCacheRate],
 	["estimateCost math (per-1M input/output, mixed, zero defaults)", testEstimateCostMath],
 	["unknown model falls back to the conservative rate (never $0)", testModelFallback],
 	["in-code pricing override table + per-model fallback", testPriceOverrideTable],
