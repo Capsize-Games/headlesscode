@@ -69,6 +69,7 @@ import {
 } from "./git-sync.js"
 import { resolveModelForMode } from "../config/mode-models.js"
 import { openshellPreflight } from "../cloud/openshell-preflight.js"
+import { resolveContainedRuntimeProfile, resolveSecurityProfile, serializeResolvedContainedProfile, securityProfileDescription, type SecurityProfileName } from "../security/profile.js"
 import { runPreflight, runLocalPreflight, type PreflightResult, type LocalPreflightResult } from "../llm/preflight.js"
 import { resolvePerModeEnv } from "../cli.js"
 
@@ -112,6 +113,8 @@ Options:
   --memory-dir <path>    Phase 3 memory dir for workers (passed as HEADLESSCODE_MEMORY_DIR,
                          which run-worker.sh forwards as --memory-dir to each worker CLI)
   --execution-provider <local|openshell> Worker runtime (default: local)
+  --security-profile <local|contained>  Trust boundary (default local: runs with host authority;
+                         contained: requires a pinned OpenShell profile and never falls back)
   --max-concurrent-sessions <n>  Phase 6 GLOBAL cap on concurrent sessions across
                          processes (default: $HEADLESSCODE_MAX_CONCURRENT_SESSIONS or 3).
                          When the cap is already reached this run ABORTS with a clear
@@ -198,6 +201,7 @@ interface OrchestrateOptions {
 	repo: string
 	issues: number[]
 	executionProvider: "local" | "openshell"
+	securityProfile?: SecurityProfileName
 	issuesJson?: string
 	/**
 	 * Fix 3: file a REAL GitHub issue for every synthetic --issues-json entry
@@ -344,7 +348,13 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 			return v
 		}
 
-		switch (flag) {
+			switch (flag) {
+			case "--security-profile": {
+				const v = next()
+				try { options.securityProfile = resolveSecurityProfile(v) }
+				catch (error) { return { options, error: error instanceof Error ? error.message : String(error) } }
+				break
+			}
 			case "--execution-provider": {
 				const v = next()
 				if (v !== "local" && v !== "openshell") return { options, error: "--execution-provider must be local or openshell" }
@@ -540,6 +550,14 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 		return { options, error: "--file-issues requires --issues-json (a real --issue <n> round has nothing to file)" }
 	}
 
+	if (!options.securityProfile) {
+		try { options.securityProfile = resolveSecurityProfile(process.env.HEADLESSCODE_SECURITY_PROFILE) }
+		catch (error) { return { options, error: error instanceof Error ? error.message : String(error) } }
+	}
+	if (options.securityProfile === "contained") {
+		if (options.executionProvider === "local" && argv.some((arg) => arg === "--execution-provider" || arg.startsWith("--execution-provider="))) return { options, error: "contained security profile cannot use the local execution provider" }
+		options.executionProvider = "openshell"
+	}
 	return { options }
 }
 
@@ -2557,7 +2575,24 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		process.stderr.write(`headlesscode orchestrate: not a git repo: ${repo}\n`)
 		return 2
 	}
-	if (!options.dryRun && options.executionProvider === "openshell") {
+	if (!options.dryRun && options.securityProfile === "contained") {
+		try {
+			const resolved = resolveContainedRuntimeProfile({ repoRoot: repo, purpose: "worker" })
+			process.env.HEADLESSCODE_SECURITY_PROFILE = "contained"
+			process.env.HEADLESSCODE_OPENSHELL_POLICY = resolved.policySnapshotPath
+			process.env.HEADLESSCODE_OPENSHELL_IMAGE = resolved.image
+			process.env.HEADLESSCODE_OPENSHELL_CPU = resolved.cpu
+			process.env.HEADLESSCODE_OPENSHELL_MEMORY = resolved.memory
+			process.env.HEADLESSCODE_OPENSHELL_PROVIDERS = resolved.providers.join(",")
+			process.env.HEADLESSCODE_CONTAINED_PROFILE_SHA256 = resolved.profileSha256
+			process.env.HEADLESSCODE_CONTAINED_POLICY_SHA256 = resolved.policySha256
+			process.env.HEADLESSCODE_CONTAINED_RUNTIME_PROFILE_JSON = serializeResolvedContainedProfile(resolved)
+			process.stdout.write(`[security] profile=contained (${securityProfileDescription("contained")})\n`)
+		} catch (error) {
+			process.stderr.write(`headlesscode orchestrate: contained security preflight failed: ${error instanceof Error ? error.message : String(error)}\n`)
+			return 2
+		}
+	} else if (!options.dryRun && options.executionProvider === "openshell") {
 		const issue = openshellPreflight()
 		if (issue) {
 			process.stderr.write(`headlesscode orchestrate: OpenShell preflight failed: ${issue}\n`)

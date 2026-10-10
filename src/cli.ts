@@ -44,6 +44,7 @@ import { costHistoryCliMain } from "./orchestrator/cost-history-cli.js"
 import { resolvePermissions, type PermissionsConfig } from "./permissions/config.js"
 import { resolveModelForMode, resolveReasoningEffortForMode } from "./config/mode-models.js"
 import { openShellSessionMain } from "./cloud/openshell-session.js"
+import { resolveContainedRuntimeProfile, resolveSecurityProfile, serializeResolvedContainedProfile, type SecurityProfileName } from "./security/profile.js"
 
 const VERSION = "0.1.0"
 
@@ -177,6 +178,7 @@ interface CliOptions {
 	 * HEADLESSCODE_REQUIRE_EVIDENCE.
 	 */
 	requireEvidence: boolean
+	securityProfile?: SecurityProfileName
 }
 
 const USAGE = `headlesscode — headless coding-agent harness (Phase 1 engine)
@@ -286,6 +288,8 @@ Subcommands:
 
 Options:
   --mode <slug>              Mode to run in (built-in or from .roomodes). Default: code
+  --security-profile <local|contained>  Trust boundary (default local: runs with host authority;
+                                       contained: OpenShell only, fails closed)
   --task <text>              The task description for the agent
   --task-file <path>         Read the task from a file (relative to workspace)
   --workspace <root>         Workspace root (default: $HEADLESSCODE_WORKSPACE_ROOT or cwd)
@@ -490,6 +494,12 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 		}
 
 		switch (flag) {
+			case "--security-profile": {
+				const value = next()
+				try { options.securityProfile = resolveSecurityProfile(value) }
+				catch (error) { return { options, error: error instanceof Error ? error.message : String(error) } }
+				break
+			}
 			case "--mode":
 			case "--task":
 			case "--task-file":
@@ -720,6 +730,10 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 		}
 	}
 
+	if (!options.securityProfile) {
+		try { options.securityProfile = resolveSecurityProfile(process.env.HEADLESSCODE_SECURITY_PROFILE) }
+		catch (error) { return { options, error: error instanceof Error ? error.message : String(error) } }
+	}
 	return { options }
 }
 
@@ -1089,25 +1103,6 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		}
 	}
 
-	// ── real run: OpenRouter key required unless this mode is local ────────────
-	const codeModeBackend = process.env.HEADLESSCODE_CODE_MODE_BACKEND ?? "openrouter"
-	const localBackendModes = new Set(
-		(process.env.HEADLESSCODE_LOCAL_BACKEND_MODES ?? "code")
-			.split(",")
-			.map((s) => s.trim())
-			.filter(Boolean),
-	)
-	const useLocalCodeBackend = localBackendModes.has(options.mode) && codeModeBackend === "ollama"
-	const apiKey = process.env.HEADLESSCODE_OPENROUTER_API_KEY ?? process.env.HEADLESSCODE_RSI_INFERENCE_CAPABILITY
-	if (!apiKey && !useLocalCodeBackend) {
-		process.stderr.write(
-			"headlesscode: HEADLESSCODE_OPENROUTER_API_KEY is not set.\n" +
-				"  Export it (e.g. export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-...) or use --dry-run to\n" +
-				"  validate the prompt/config without calling the LLM.\n",
-		)
-		return 2
-	}
-
 	if (!options.task && !options.taskFile) {
 		process.stderr.write(`headlesscode: provide a task with --task <text> or --task-file <path>\n\n${USAGE}`)
 		return 2
@@ -1131,6 +1126,46 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	}
 	if (taskText.trim() === "") {
 		process.stderr.write("headlesscode: task text is empty\n")
+		return 2
+	}
+	if (options.securityProfile === "contained") {
+		try {
+			const profile = resolveContainedRuntimeProfile({ repoRoot: workspaceRoot, purpose: "worker" })
+			process.env.HEADLESSCODE_OPENSHELL_POLICY = profile.policySnapshotPath
+			process.env.HEADLESSCODE_OPENSHELL_IMAGE = profile.image
+			process.env.HEADLESSCODE_OPENSHELL_CPU = profile.cpu
+			process.env.HEADLESSCODE_OPENSHELL_MEMORY = profile.memory
+			process.env.HEADLESSCODE_OPENSHELL_PROVIDERS = profile.providers.join(",")
+			process.env.HEADLESSCODE_CONTAINED_PROFILE_SHA256 = profile.profileSha256
+			process.env.HEADLESSCODE_CONTAINED_POLICY_SHA256 = profile.policySha256
+			process.env.HEADLESSCODE_CONTAINED_RUNTIME_PROFILE_JSON = serializeResolvedContainedProfile(profile)
+			return openShellSessionMain([
+				"--repo", workspaceRoot,
+				"--task", taskText,
+				"--mode", options.mode,
+				...(options.model ? ["--model", options.model] : []),
+			], { containedProfile: profile })
+		} catch (error) {
+			process.stderr.write(`headlesscode: contained security preflight failed: ${error instanceof Error ? error.message : String(error)}\n`)
+			return 2
+		}
+	}
+	// ── real run: OpenRouter key required unless this mode is local ────────────
+	const codeModeBackend = process.env.HEADLESSCODE_CODE_MODE_BACKEND ?? "openrouter"
+	const localBackendModes = new Set(
+		(process.env.HEADLESSCODE_LOCAL_BACKEND_MODES ?? "code")
+			.split(",")
+			.map((s) => s.trim())
+			.filter(Boolean),
+	)
+	const useLocalCodeBackend = localBackendModes.has(options.mode) && codeModeBackend === "ollama"
+	const apiKey = process.env.HEADLESSCODE_OPENROUTER_API_KEY ?? process.env.HEADLESSCODE_RSI_INFERENCE_CAPABILITY
+	if (!apiKey && !useLocalCodeBackend) {
+		process.stderr.write(
+			"headlesscode: HEADLESSCODE_OPENROUTER_API_KEY is not set.\n" +
+				"  Export it (e.g. export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-...) or use --dry-run to\n" +
+				"  validate the prompt/config without calling the LLM.\n",
+		)
 		return 2
 	}
 
