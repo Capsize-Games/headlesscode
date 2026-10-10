@@ -19,7 +19,13 @@ function evidence(sessionId: string, requestId: string, kind: string, payload: u
 async function testCollectorRestartIdempotencyAndPinnedVerification(): Promise<void> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hc-evidence-"))
 	const storageDir = path.join(root, "collector")
-	const socketPath = path.join(root, "s")
+	// Linux's Unix socket address has a 108-byte limit. A directory FD
+	// keeps the actual socket inside project scratch even with a long checkout.
+	const socketDirectory = await fs.open(root, "r")
+	const directSocketPath = path.join(root, "s")
+	const socketPath = process.platform === "linux" && Buffer.byteLength(directSocketPath) >= 108
+		? `/proc/self/fd/${socketDirectory.fd}/s`
+		: directSocketPath
 	const options = { storageDir, socketPath, redactSecrets: ["shh-secret"] }
 	let collector = await FileEvidenceCollector.start(options)
 	const sessionId = "session-test"
@@ -124,6 +130,7 @@ async function testCollectorRestartIdempotencyAndPinnedVerification(): Promise<v
 	await assert.rejects(() => FileEvidenceCollector.start({ ...options, expectedKeyId: `sha256:${"0".repeat(64)}` }), /pinned identity/)
 	collector = await FileEvidenceCollector.start(options)
 	await collector.close()
+	await socketDirectory.close()
 	await fs.rm(root, { recursive: true, force: true })
 }
 
@@ -201,12 +208,43 @@ async function testUnavailableStorageFailsStartup(): Promise<void> {
 	} finally { await fs.rm(root, { recursive: true, force: true }) }
 }
 
+async function testAuxiliaryRequestsAndTerminalStop(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-evidence-aux-"))
+	let calls = 0
+	const records: EvidenceInput[] = []
+	const terminalSignals: Array<boolean | undefined> = []
+	const client: LlmClient = { createChatCompletion: async () => { calls++; return { message: { role: "assistant", content: "summary" } } } }
+	const journal: EvidenceJournal = { append: async (input, options) => {
+		records.push(input)
+		if (input.kind === "session_stop") terminalSignals.push(options?.signal?.aborted)
+		return { schemaVersion: 1, sessionId: input.sessionId, requestId: input.requestId, sequence: records.length, recordDigest: "test", inputDigest: "test", keyId: "test", signature: "test" }
+	} }
+	try {
+		const session = await makeGatedSession(ws, client, journal, () => {})
+		const auxiliary = (session as unknown as { condensationClient(): LlmClient }).condensationClient()
+		await auxiliary.createChatCompletion({ model: "summary-model", messages: [{ role: "user", content: "summarize previous work" }] })
+		assert.equal(calls, 1)
+		assert.deepEqual(records.map(record => record.kind), ["condensation_request", "condensation_response"])
+		assert.equal((records[0]?.payload as { model: string }).model, "summary-model")
+		const failed = await makeGatedSession(ws, client, new FailingJournal("condensation_request"), () => {})
+		await assert.rejects(() => (failed as unknown as { condensationClient(): LlmClient }).condensationClient().createChatCompletion({ model: "summary-model", messages: [] }), /not acknowledged|persistence failed/i)
+		assert.equal(calls, 1, "missing auxiliary intent ACK prevents the model call")
+		const stop = new AbortController()
+		stop.abort(new Error("operator stop"))
+		const stopped = new HeadlessSession({ workspaceRoot: ws, mode: "code", model: "fake-model", taskText: "stop test", llmClient: client, checkpoints: false, signal: stop.signal, evidenceJournal: journal, evidenceRequired: true })
+		await stopped.run()
+		assert.equal(terminalSignals.at(-1), undefined, "terminal evidence remains writable after model/tool cancellation")
+		assert.equal(calls, 1)
+	} finally { await fs.rm(ws, { recursive: true, force: true }) }
+}
+
 async function main(): Promise<void> {
+	await testAuxiliaryRequestsAndTerminalStop()
 	await testCollectorRestartIdempotencyAndPinnedVerification()
 	await testFailedIntentAckPreventsEffect()
 	await testFailedResultAckBlocksNextEffect()
 	await testUnavailableStorageFailsStartup()
-	console.log("All 4 evidence collector tests passed")
+	console.log("All 5 evidence collector tests passed")
 }
 
 void main()

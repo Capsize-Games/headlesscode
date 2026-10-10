@@ -71,6 +71,7 @@ export class FileEvidenceCollector {
 	private readonly maxRecordBytes: number
 	private readonly secrets: readonly string[]
 	private server?: http.Server | https.Server
+	private closing = false
 	private lockHandle?: fs.FileHandle
 	private constructor(private readonly options: FileEvidenceCollectorOptions, privateKeyPem: string, publicKeyPem: string) {
 		this.privateKey = createPrivateKey(privateKeyPem)
@@ -170,10 +171,12 @@ export class FileEvidenceCollector {
 	}
 
 	async close(): Promise<void> {
-		await Promise.all([...this.queues.values()])
+		this.closing = true
 		if (!this.server) return
 		const address = this.server.address()
 		await new Promise<void>((resolve, reject) => this.server!.close((error) => error ? reject(error) : resolve()))
+		await Promise.all([...this.queues.values()])
+		await this.capabilitiesWrite
 		if (typeof address === "string") await fs.rm(address, { force: true })
 		this.server = undefined
 		await this.lockHandle?.close()
@@ -182,6 +185,7 @@ export class FileEvidenceCollector {
 	}
 
 	private async appendWithSource(input: EvidenceInput, source: EvidenceSource): Promise<EvidenceReceipt> {
+		if (this.closing) throw new Error("evidence collector is closing")
 		ensureSessionId(input.sessionId)
 		if (!ID_PATTERN.test(input.requestId)) throw new Error("requestId must contain 1-128 letters, digits, underscores, or hyphens")
 		const state = this.sessions.get(input.sessionId)

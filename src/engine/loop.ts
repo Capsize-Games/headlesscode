@@ -2782,7 +2782,7 @@ export class HeadlessSession {
 		const timer = setTimeout(() => controller.abort(), this.config.llmTimeoutMs)
 		try {
 			const condensed = await maybeCondense({
-				llmClient: this.llmClient,
+				llmClient: this.condensationClient(),
 				logger: this.logger,
 				messages,
 				model: config.model,
@@ -2975,6 +2975,7 @@ export class HeadlessSession {
 		budgetTracker: BudgetTracker,
 		contextWindowTokens: number,
 	): void {
+		if (this.evidenceRequired) return
 		const config = this.config
 		const lastPromptTokens = this.lastLlmUsage?.inputTokens ?? 0
 		const hardThreshold = Math.max(1, contextWindowTokens * config.condenseThresholdFraction)
@@ -3034,7 +3035,7 @@ export class HeadlessSession {
 		// per-LLM-call timeout instead of leaking a never-resolving call.
 		const controller = new AbortController()
 		const timer = setTimeout(() => controller.abort(), this.config.llmTimeoutMs)
-		condenseOldestTurns(this.llmClient, {
+		condenseOldestTurns(this.condensationClient(), {
 			messages: snapshot,
 			count: plan.count,
 			model: config.condenseModel,
@@ -3482,12 +3483,30 @@ export class HeadlessSession {
 		}
 	}
 
+	/** Record auxiliary model calls with the same required ACK boundary as task calls. */
+	private condensationClient(): LlmClient {
+		return {
+			createChatCompletion: async (request) => {
+				const composed = combineAbortSignals([request.signal, this.stopSignal])
+				const requestId = `${this.evidenceRunId}_condensation_${this.evidenceRequestCounter++}`
+				const { signal: _signal, onStreamChunk: _chunk, ...wireRequest } = request
+				try {
+					if (!(await this.appendEvidence({ sessionId: this.sessionId, requestId, kind: "condensation_request", actor: "headlesscode-loop", origin: "llm-client", payload: { ...wireRequest, promptSha256: sha256(canonicalJson(wireRequest.messages)) } }))) throw new Error(this.evidenceFault ?? "condensation intent not acknowledged")
+					composed.signal.throwIfAborted()
+					const response = await this.llmClient.createChatCompletion({ ...request, signal: composed.signal })
+					if (!(await this.appendEvidence({ sessionId: this.sessionId, requestId: `${requestId}_response`, kind: "condensation_response", actor: "headlesscode-loop", origin: "llm-client", payload: { requestId, model: request.model, response } }))) throw new Error(this.evidenceFault ?? "condensation result not acknowledged")
+					return response
+				} finally { composed.dispose() }
+			},
+		}
+	}
+
 	private evidenceRequestCounter = 0
 
 	private async appendEvidence(input: EvidenceInput): Promise<boolean> {
 		if (!this.evidenceJournal) return !this.evidenceRequired
 		try {
-			await this.evidenceJournal.append(input, { signal: this.stopSignal, timeoutMs: 15_000 })
+			await this.evidenceJournal.append(input, { signal: input.kind === "session_stop" ? undefined : this.stopSignal, timeoutMs: 15_000 })
 			return true
 		} catch (error) {
 			this.evidenceFault = `Evidence persistence failed: ${error instanceof Error ? error.message : String(error)}`

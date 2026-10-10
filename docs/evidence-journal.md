@@ -97,7 +97,7 @@ storage administrator.
 
 ## Completeness and redaction
 
-The loop records resolved model requests and responses, complete tool intents
+The loop records resolved task and condensation model requests and responses, complete tool intents
 and results, model prompt/toolset/runtime/policy hashes, human-injected
 messages, claim verification outcomes, and terminal session state. The
 existing workspace JSONL event feed remains a truncated dashboard preview and
@@ -115,7 +115,9 @@ secret values and the evidence retention policy with the supervisor.
 When `evidenceRequired` is enabled, the loop waits for the intent receipt before
 calling a tool. A missing intent acknowledgement prevents that call. A missing
 result acknowledgement ends the session incomplete and blocks every later
-effect. The supervisor failure callback can stop the containing job; a
+effect. Required-evidence sessions condense synchronously, so auxiliary model
+requests cannot outlive the terminal signed history. Terminal state recording
+uses a separate bounded append after cancellation. The supervisor failure callback can stop the containing job; a
 provided `AbortSignal` is composed with model request timeouts and checked
 before each effect. Without `evidenceRequired`, the collector is optional and
 local event logs are only operational diagnostics.
