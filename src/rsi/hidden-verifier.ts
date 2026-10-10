@@ -27,6 +27,7 @@ export interface HiddenFunctionSuite {
 export interface HiddenVerificationIdentity {
 	protocol: typeof HIDDEN_VERIFIER_PROTOCOL
 	protocolDigest: string
+	evaluatorImageDigest: string
 	candidateSourceDigest: string
 	candidateCommit: string
 	sessionId: string
@@ -108,7 +109,7 @@ function validLimits(limits: HiddenResourceLimits): boolean {
 		Number.isInteger(limits.maxCases) && limits.maxCases >= 1 && limits.maxCases <= 256
 }
 
-function validateSuite(suite: HiddenFunctionSuite): string {
+export function hiddenFunctionSuiteDigest(suite: HiddenFunctionSuite): string {
 	if (suite.protocol !== HIDDEN_VERIFIER_PROTOCOL || !validLimits(suite.limits)) throw new Error("unsupported or unbounded hidden verifier configuration")
 	if (!Array.isArray(suite.cases) || suite.cases.length < 1 || suite.cases.length > suite.limits.maxCases) throw new Error("hidden verifier case count is outside its frozen limit")
 	const ids = new Set<string>()
@@ -149,8 +150,8 @@ export async function verifyHiddenFunctions(
 	options: HiddenVerificationOptions,
 ): Promise<HiddenVerificationResult> {
 	const frozenSuite = cloneJson(suite)
-	const protocolDigest = validateSuite(frozenSuite)
-	if (!DIGEST_RE.test(identityInput.candidateSourceDigest) || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(identityInput.candidateCommit) ||
+	const protocolDigest = hiddenFunctionSuiteDigest(frozenSuite)
+	if (!DIGEST_RE.test(identityInput.candidateSourceDigest) || !/^sha256:[a-f0-9]{64}$/.test(identityInput.evaluatorImageDigest) || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(identityInput.candidateCommit) ||
 		!TOKEN_RE.test(identityInput.sessionId) || !TOKEN_RE.test(identityInput.jobId)) {
 		throw new Error("hidden verification requires frozen candidate digest, commit, session, and job identities")
 	}
@@ -159,6 +160,7 @@ export async function verifyHiddenFunctions(
 	const identity: HiddenVerificationIdentity = {
 		protocol: HIDDEN_VERIFIER_PROTOCOL,
 		protocolDigest,
+		evaluatorImageDigest: identityInput.evaluatorImageDigest,
 		candidateSourceDigest: identityInput.candidateSourceDigest,
 		candidateCommit: identityInput.candidateCommit,
 		sessionId: identityInput.sessionId,

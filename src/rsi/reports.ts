@@ -78,7 +78,7 @@ export function formatRunReport(run: RsiRunRecord, config: RsiConfig): string {
 		"",
 		`- Regression gate: ${config.regressionCommand}`,
 		`- Visible evaluations: ${config.evalCommands.join("; ") || "none"}`,
-		`- Hidden evaluations: ${config.hiddenEvalCommands.length || 0}`,
+		`- Hidden evaluations: ${config.hiddenSuiteSha256 ? "supervisor-owned declarative suite (" + config.hiddenSuiteSha256 + ")" : config.hiddenEvalCommands.length || 0}`,
 		`- Compute policy: ${config.computePolicy ?? "single"}`,
 		`- Protected paths: ${config.protectedPaths.join(", ")}`,
 		"",

@@ -3,7 +3,7 @@ import { execFileSync, spawnSync } from "node:child_process"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { applyFleetMutationPatch, createEvaluationSnapshotBundle, createMutationSnapshotBundle, inspectLocalRsiCheckpoint, networkRules, runOpenShellBenchmarkVerifier, runOpenShellMutation } from "../openshell.js"
+import { applyFleetMutationPatch, createEvaluationSnapshotBundle, createMutationSnapshotBundle, HIDDEN_FUNCTION_DRIVER, inspectLocalRsiCheckpoint, networkRules, runOpenShellBenchmarkVerifier, runOpenShellMutation } from "../openshell.js"
 import type { RsiOpenShellProviderFactory } from "../openshell.js"
 import type { CandidateRecord, RsiConfig } from "../types.js"
 import { parseRsiArgs } from "../config.js"
@@ -352,7 +352,8 @@ await run("dependency-escape")
 			limits: { timeoutMs: 1000, maxMemoryMb: 128, maxInputBytes: 1024, maxOutputBytes: 1024, maxCases: 1 },
 			cases: [{ id: "double", modulePath: "src/candidate.js", exportName: "double", input: { value: 4 }, expected: 8 }],
 		}
-		const providerFactory: RsiOpenShellProviderFactory = () => ({
+		let hiddenProviderOptions: Parameters<RsiOpenShellProviderFactory>[0] | undefined
+		const providerFactory: RsiOpenShellProviderFactory = (options) => { hiddenProviderOptions = options; return ({
 			async spawnExistingWorktreeSession(_request, snapshot) {
 				guest = snapshot
 				const inputs = fs.readFileSync(path.join(snapshot, "__headlesscode_hidden__", "inputs.json"), "utf8")
@@ -364,24 +365,45 @@ await run("dependency-escape")
 			},
 			async waitReady() {},
 			async runHarness(_handle, command) {
-				assert.match(command, /ulimit -v 131072 && ulimit -t 1/)
+				assert.match(command, /ulimit -t 1/)
+				assert.doesNotMatch(command, /ulimit -v/)
 				assert.match(command, /__headlesscode_hidden__\/driver\.mjs/)
 				assert.doesNotMatch(command, /expected|verify\.sh/)
 				const output = Buffer.from(JSON.stringify([{ id: "double", output: 8 }])).toString("base64")
 				return { exitCode: 0, output: `HEADLESSCODE_HIDDEN_OUTPUTS:${output}\n` }
 			},
 			async teardown() {},
-		})
-		const runner = createOpenShellHiddenCaseRunner({ candidateRoot: worktree, config: parsed.config, signingKey: keys.privateKey, providerFactory })
+		}) }
+		const runner = createOpenShellHiddenCaseRunner({ candidateRoot: worktree, config: parsed.config, signingKey: keys.privateKey, imageDigest: `sha256:${"c".repeat(64)}`, providerFactory })
 		const nonces = new Set<string>()
-		const result = await verifyHiddenFunctions(suite, { candidateSourceDigest: sourceDigest, candidateCommit: commit, sessionId: "session", jobId: "job" }, {
+		const result = await verifyHiddenFunctions(suite, { candidateSourceDigest: sourceDigest, evaluatorImageDigest: `sha256:${"c".repeat(64)}`, candidateCommit: commit, sessionId: "session", jobId: "job" }, {
 			runner,
 			nonceStore: { async consume(nonce) { if (nonces.has(nonce)) return false; nonces.add(nonce); return true } },
 			publicKey: keys.publicKey.export({ type: "spki", format: "pem" }).toString(),
 		})
 		assert.equal(result.status, "passed")
+		assert.equal(hiddenProviderOptions?.memory, "128Mi")
+		assert.equal(hiddenProviderOptions?.cpu, "1")
+		assert.equal(hiddenProviderOptions?.image, `headlesscode-openshell-rsi@sha256:${"c".repeat(64)}`)
 		assert.equal(fs.existsSync(guest), false, "the isolated evaluation snapshot is deleted after runner teardown")
 	} finally { fs.rmSync(repo, { recursive: true, force: true }) }
+}
+
+{
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "hc-hidden-driver-cpu-"))
+	try {
+		const candidateDir = path.join(root, "src")
+		fs.mkdirSync(candidateDir, { recursive: true })
+		fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ type: "module" }))
+		fs.writeFileSync(path.join(candidateDir, "candidate.js"), "export function explode() { throw new Error('candidate failure') }\n")
+		fs.writeFileSync(path.join(root, "inputs.json"), JSON.stringify({ identity: { limits: { maxCases: 1, maxOutputBytes: 100 } }, cases: [{ id: "case", modulePath: "src/candidate.js", exportName: "explode", input: null }] }))
+		const driver = path.join(root, "driver.mjs")
+		const source = HIDDEN_FUNCTION_DRIVER.replace('const root = "/workspace"', `const root = ${JSON.stringify(root)}`).replace('"__headlesscode_hidden__/inputs.json"', '"inputs.json"')
+		fs.writeFileSync(driver, source)
+		const execution = spawnSync(process.execPath, ["--max-old-space-size=64", driver], { encoding: "utf8", timeout: 5000 })
+		assert.notEqual(execution.status, 0, "candidate exception must fail the evaluator process")
+		assert.doesNotMatch(execution.stdout, /HEADLESSCODE_HIDDEN_OUTPUTS:/, "candidate exception cannot emit a normal output report")
+	} finally { fs.rmSync(root, { recursive: true, force: true }) }
 }
 
 {

@@ -66,6 +66,12 @@ Options:
   --regression <command>      paired regression gate (default: npm test)
   --eval <command>             visible command; repeat or separate with ;; 
   --hidden-eval <command>      supervisor-only hidden command
+  --hidden-suite <path>        supervisor-only JSON suite of bounded exported-function cases
+  --hidden-suite-sha256 <hex>   operator-approved SHA-256 of canonical suite JSON
+  --hidden-public-key <path>    Ed25519 public key in PEM format
+  --hidden-private-key <path>   Ed25519 signing key in PEM format (mode 0600)
+  --hidden-nonce-store <path>   durable replay store, outside the repository/archive
+  --hidden-image-digest <value> trusted evaluator image pin: sha256:<64 hex digits>
   --mutation-task <text>       improvement objective
   --archive-dir <path>         durable archive directory
   --worktree-dir <path>        candidate worktree directory
@@ -107,6 +113,12 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 	let evalCommands = [...DEFAULT_VISIBLE_EVALS]
 	let regressionCommand = "npm test"
 	let hiddenEvalCommands: string[] = []
+	let hiddenSuitePath: string | undefined
+	let hiddenSuiteSha256: string | undefined
+	let hiddenPublicKeyPath: string | undefined
+	let hiddenPrivateKeyPath: string | undefined
+	let hiddenNonceStorePath: string | undefined
+	let hiddenImageDigest: string | undefined
 	let archiveDir: string | undefined
 	let worktreeDir: string | undefined
 	let baseRef = "HEAD"
@@ -235,6 +247,24 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 					hiddenEvalCommands.push(...splitCommands(value))
 					index = next
 					break
+				}
+				case "--hidden-suite": {
+					const [value, next] = take(index, arg); hiddenSuitePath = path.resolve(value); index = next; break
+				}
+				case "--hidden-suite-sha256": {
+					const [value, next] = take(index, arg); hiddenSuiteSha256 = value; index = next; break
+				}
+				case "--hidden-public-key": {
+					const [value, next] = take(index, arg); hiddenPublicKeyPath = path.resolve(value); index = next; break
+				}
+				case "--hidden-private-key": {
+					const [value, next] = take(index, arg); hiddenPrivateKeyPath = path.resolve(value); index = next; break
+				}
+				case "--hidden-nonce-store": {
+					const [value, next] = take(index, arg); hiddenNonceStorePath = path.resolve(value); index = next; break
+				}
+				case "--hidden-image-digest": {
+					const [value, next] = take(index, arg); hiddenImageDigest = value; index = next; break
 				}
 				case "--mutation-task": {
 					const [value, next] = take(index, arg)
@@ -383,6 +413,8 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 			}
 		}
 		if (workerHarnessEngineeringOnly && (!workerHarnessMode || !workerHarnessPairId)) throw new Error("--worker-harness-engineering-only requires an explicit paired campaign ID and arm")
+		const hiddenOptions = [hiddenSuitePath, hiddenSuiteSha256, hiddenPublicKeyPath, hiddenPrivateKeyPath, hiddenNonceStorePath, hiddenImageDigest]
+		if (hiddenOptions.some((value) => value !== undefined) && hiddenOptions.some((value) => value === undefined)) throw new Error("hidden verification requires all six --hidden-suite, --hidden-suite-sha256, --hidden-public-key, --hidden-private-key, --hidden-nonce-store, and --hidden-image-digest options")
 		if (workerHarnessEngineeringOnly && workerHarnessPhase !== "development") throw new Error("engineering-only worker harness runs support only the development phase")
 		const resolvedRepo = path.resolve(repoRoot)
 		const adaptiveTrajectories = maxTrajectories ?? population + 1
@@ -409,6 +441,7 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 				computePolicy,
 				evalCommands,
 				hiddenEvalCommands,
+				...(hiddenSuitePath ? { hiddenSuitePath, hiddenSuiteSha256, hiddenPublicKeyPath, hiddenPrivateKeyPath, hiddenNonceStorePath, hiddenImageDigest } : {}),
 				archiveDir: archiveDir ?? path.join(resolvedRepo, ".headlesscode", "rsi"),
 				worktreeDir: worktreeDir ?? path.join(resolvedRepo, ".worktrees", "rsi"),
 				trajectoryDir: trajectoryDir ?? path.join(archiveDir ?? path.join(resolvedRepo, ".headlesscode", "rsi"), "trajectories"),

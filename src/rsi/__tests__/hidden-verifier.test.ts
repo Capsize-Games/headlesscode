@@ -11,7 +11,7 @@ const suite: HiddenFunctionSuite = {
 	cases: [{ id: "case-1", modulePath: "src/math.js", exportName: "double", input: { value: 3 }, expected: 6 }],
 }
 const identity = {
-	candidateSourceDigest: "a".repeat(64), candidateCommit: "b".repeat(64), sessionId: "session-1", jobId: "job-1",
+	candidateSourceDigest: "a".repeat(64), evaluatorImageDigest: `sha256:${"c".repeat(64)}`, candidateCommit: "b".repeat(64), sessionId: "session-1", jobId: "job-1",
 }
 const consumed = new Set<string>()
 const nonceStore = { async consume(nonce: string) { if (consumed.has(nonce)) return false; consumed.add(nonce); return true } }
