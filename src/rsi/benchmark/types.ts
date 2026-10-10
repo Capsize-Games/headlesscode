@@ -46,7 +46,7 @@ export interface BenchmarkAgentRequest {
 	seed: number
 	workspace: string
 	harnessCommit: string
-	model: { provider: string; id: string; sampling: Record<string, number | string | boolean> }
+	model: { provider: string; id: string; sampling: Record<string, number | string | boolean>; profileId?: string }
 	ceilings: BenchmarkResourceCeilings
 }
 
@@ -83,7 +83,7 @@ export interface BenchmarkAttempt {
 	attemptId: string
 	harnessCommit: string
 	agentImage: BenchmarkImageIdentity | null
-	model: { provider: string; id: string; sampling: Record<string, number | string | boolean> }
+	model: { provider: string; id: string; sampling: Record<string, number | string | boolean>; profileId?: string }
 	seed: number
 	family: string
 	startDigest: string

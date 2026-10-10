@@ -20,7 +20,7 @@ export interface DevelopmentProofProtocol {
 	verifierDigest: string
 	ceilings: BenchmarkTask["ceilings"]
 	}>
-	model: { provider: string; id: string; sampling: Record<string, number | string | boolean> }
+	model: { provider: string; id: string; sampling: Record<string, number | string | boolean>; profileId?: string }
 	rule: DevelopmentProofRule
 	protocolDigest: string
 }

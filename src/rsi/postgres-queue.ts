@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs"
 import { Pool, type PoolClient } from "pg"
 import type { ResourceClass, WorkerHarnessMode, WorkerHarnessRuntimeIdentity } from "./types.js"
 import { createRsiArtifactStore, type RsiArtifactReference, type RsiArtifactStore } from "./artifact-store.js"
-import { RSI_OPENROUTER_ENDPOINT_PROVIDER, type OpenRouterBrokerGrant, type OpenRouterBrokerReceipt, type OpenRouterCallReceipt, type OpenRouterCallReservation, type OpenRouterCallSettlement, type OpenRouterDenialReason, type OpenRouterInferenceLedger } from "./inference-broker.js"
+import { openRouterProfileForModel, type OpenRouterBrokerGrant, type OpenRouterBrokerReceipt, type OpenRouterCallReceipt, type OpenRouterCallReservation, type OpenRouterCallSettlement, type OpenRouterDenialReason, type OpenRouterInferenceLedger, type RsiOpenRouterProfileId } from "./inference-broker.js"
 import type { OpenRouterBrokerLimits } from "./inference-broker.js"
 import { PostgresProofCampaign, type ProofCampaignArmLease, type ProofCampaignManifest } from "./proof-campaign.js"
 
@@ -16,6 +16,7 @@ const MIGRATIONS = [
 	{ version: 6, sql: readFileSync(new URL("./migrations/006_proof_campaigns.sql", import.meta.url), "utf8") },
 	{ version: 7, sql: readFileSync(new URL("./migrations/007_proof_campaign_phases.sql", import.meta.url), "utf8") },
 	{ version: 8, sql: readFileSync(new URL("./migrations/008_openrouter_returned_provider.sql", import.meta.url), "utf8") },
+	{ version: 9, sql: readFileSync(new URL("./migrations/009_openrouter_cached_prompt_tokens.sql", import.meta.url), "utf8") },
 ]
 
 function sha256Text(value: string): string { return createHash("sha256").update(value).digest("hex") }
@@ -82,6 +83,7 @@ export interface FleetJobPayload {
 	task: string
 	model: string
 	provider?: "ollama" | "openrouter"
+	openRouterProfile?: RsiOpenRouterProfileId
 	proofCampaign?: { campaignId: string; armId: string; epoch: number; manifestSha256: string; cells: Array<{ attemptKey: string; slotId: string; attemptKind: "mutation" | "verification" }> }
 	inferenceLimits?: OpenRouterBrokerLimits
 	maxIterations: number
@@ -448,6 +450,7 @@ export class PostgresRsiJobQueue {
 	}
 
 	async register(grant: OpenRouterBrokerGrant): Promise<number> {
+		const profile = openRouterProfileForModel(grant.model, grant.profileId)
 		const campaignMicros = usdCapToMicros(grant.limits.maxCampaignSpendUsd)
 		const jobMicros = usdCapToMicros(grant.limits.maxJobSpendUsd)
 		const capabilityHash = sha256Text(grant.capability)
@@ -535,6 +538,7 @@ export class PostgresRsiJobQueue {
 	}
 
 	async settle(grant: OpenRouterBrokerGrant, settlement: OpenRouterCallSettlement & { callId: string }): Promise<void> {
+		const profile = openRouterProfileForModel(grant.model, grant.profileId)
 		const capabilityHash = sha256Text(grant.capability)
 		await inTransaction(this.pool, async (client) => {
 			const lookup = await client.query("SELECT campaign_id FROM headlesscode_rsi_inference_jobs WHERE job_id=$1", [grant.jobId])
@@ -562,11 +566,12 @@ export class PostgresRsiJobQueue {
 			const currentLease = job.queue_status === "leased" && job.current_lease_token === grant.leaseToken && job.lease_valid === true
 			const overLimit = job.duration_valid !== true || settlement.qualified === false || costMicros > Number(call.reserved_spend_microusd) || costMicros > usdCapToMicros(grant.limits.maxCallSpendUsd)
 				|| settlement.promptTokens > grant.limits.maxInputTokensPerCall || settlement.completionTokens > grant.limits.maxOutputTokensPerCall
-				|| actualTokens > Number(call.reserved_tokens) || settlement.returnedModel !== grant.model || settlement.returnedProvider !== RSI_OPENROUTER_ENDPOINT_PROVIDER || !currentLease
+				|| (settlement.cachedPromptTokens !== undefined && settlement.cachedPromptTokens > settlement.promptTokens)
+				|| actualTokens > Number(call.reserved_tokens) || !profile.returnedModels.includes(settlement.returnedModel) || settlement.returnedProvider !== profile.endpointProvider || !currentLease
 			await client.query(
-				`UPDATE headlesscode_rsi_inference_calls SET state='complete',actual_spend_microusd=$3,prompt_tokens=$4,completion_tokens=$5,
-				 returned_model=$6,returned_provider=$7,provider_request_id=$8,response_sha256=$9,completed_at=$10,qualified=$11 WHERE job_id=$1 AND call_id=$2`,
-				[grant.jobId, settlement.callId, costMicros, settlement.promptTokens, settlement.completionTokens, settlement.returnedModel, settlement.returnedProvider, settlement.providerRequestId ?? null, settlement.responseSha256, settlement.completedAt, !overLimit],
+				`UPDATE headlesscode_rsi_inference_calls SET state='complete',actual_spend_microusd=$3,prompt_tokens=$4,cached_prompt_tokens=$5,completion_tokens=$6,
+				 returned_model=$7,returned_provider=$8,provider_request_id=$9,response_sha256=$10,completed_at=$11,qualified=$12 WHERE job_id=$1 AND call_id=$2`,
+				[grant.jobId, settlement.callId, costMicros, settlement.promptTokens, settlement.cachedPromptTokens ?? null, settlement.completionTokens, settlement.returnedModel, settlement.returnedProvider, settlement.providerRequestId ?? null, settlement.responseSha256, settlement.completedAt, !overLimit],
 			)
 			await client.query(
 				`UPDATE headlesscode_rsi_inference_jobs SET reserved_spend_microusd=reserved_spend_microusd-$2,spent_microusd=spent_microusd+$3,
@@ -598,8 +603,9 @@ export class PostgresRsiJobQueue {
 			if (!match || !Number.isSafeInteger(rawCount) || Number(rawCount) < 1) throw new Error("OpenRouter job contains a malformed denial summary")
 			return { statusCode: Number(match[1]), reason: match[2] as OpenRouterDenialReason, count: Number(rawCount) }
 		})
+		const profile = openRouterProfileForModel(grant.model, grant.profileId)
 		const calls: OpenRouterCallReceipt[] = callResult.rows.map((row) => ({
-			jobId: grant.jobId, campaignId: String(job.campaign_id), model: grant.model,
+			jobId: grant.jobId, campaignId: String(job.campaign_id), model: grant.model, ...(profile.id !== "deepseek-deepinfra-fp8" ? { profileId: profile.id } : {}),
 			callId: String(row.call_id), requestSha256: String(row.request_sha256), reservedUsd: microsToUsd(row.reserved_spend_microusd),
 			reservedTokens: Number(row.reserved_tokens), startedAt: new Date(String(row.started_at)).toISOString(),
 			state: row.state as OpenRouterCallSettlement["state"],
@@ -607,11 +613,12 @@ export class PostgresRsiJobQueue {
 			...(row.returned_provider ? { returnedProvider: String(row.returned_provider) } : {}),
 			...(row.provider_request_id ? { providerRequestId: String(row.provider_request_id) } : {}),
 			...(row.prompt_tokens !== null ? { promptTokens: Number(row.prompt_tokens) } : {}),
+			...(row.cached_prompt_tokens !== null && row.cached_prompt_tokens !== undefined ? { cachedPromptTokens: Number(row.cached_prompt_tokens) } : {}),
 			...(row.completion_tokens !== null ? { completionTokens: Number(row.completion_tokens) } : {}),
 			...(row.actual_spend_microusd !== null ? { costUsd: microsToUsd(row.actual_spend_microusd) } : {}),
 			...(row.response_sha256 ? { responseSha256: String(row.response_sha256) } : {}),
 			...(row.completed_at ? { completedAt: new Date(String(row.completed_at)).toISOString() } : {}),
-			authoritative: row.state === "complete" && row.qualified === true && row.returned_model === grant.model && row.returned_provider === RSI_OPENROUTER_ENDPOINT_PROVIDER && row.prompt_tokens !== null && row.completion_tokens !== null && row.actual_spend_microusd !== null,
+			authoritative: row.state === "complete" && row.qualified === true && profile.returnedModels.includes(String(row.returned_model)) && row.returned_provider === profile.endpointProvider && row.prompt_tokens !== null && row.completion_tokens !== null && row.actual_spend_microusd !== null,
 		}))
 		const allMeasured = calls.length > 0 && calls.every((call) => call.authoritative)
 		const promptTokens = allMeasured ? calls.reduce((sum, call) => sum + (call.promptTokens ?? 0), 0) : null
@@ -624,7 +631,7 @@ export class PostgresRsiJobQueue {
 			&& Number(job.spent_microusd) <= Number(job.max_spend_microusd) && Number(job.reserved_spend_microusd) === 0
 			&& Number(job.reserved_tokens) === 0 && !job.blocked && campaignResult.rows[0]?.blocked !== true && currentLease && grantMatches
 		return {
-			provider: "openrouter", endpointProvider: RSI_OPENROUTER_ENDPOINT_PROVIDER, jobId: grant.jobId, campaignId: String(job.campaign_id), model: grant.model,
+			provider: "openrouter", endpointProvider: profile.endpointProvider, jobId: grant.jobId, campaignId: String(job.campaign_id), model: grant.model, ...(profile.id !== "deepseek-deepinfra-fp8" ? { profileId: profile.id, ...(grant.endpointPrice ? { endpointPrice: grant.endpointPrice } : {}) } : {}),
 			returnedModels: [...new Set(calls.map((call) => call.returnedModel).filter((model): model is string => Boolean(model)))],
 			returnedProviders: [...new Set(calls.map((call) => call.returnedProvider).filter((provider): provider is string => Boolean(provider)))],
 			calls: calls.length, promptTokens, completionTokens,

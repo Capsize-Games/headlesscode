@@ -8,7 +8,7 @@ import { openshellPreflight } from "../cloud/openshell-preflight.js"
 import { PostgresRsiJobQueue, fleetQueuePolicy, requiredFleetJobLeaseMs, type FleetJobLease, type FleetJobPayload } from "./postgres-queue.js"
 import { runOpenShellEvaluation, runOpenShellModelJob, runOpenShellMutation } from "./openshell.js"
 import type { CandidateRecord, ComputePolicy, EvaluationSummary, MutationHypothesis, MutationKind, RsiConfig, RsiRoleConfig, TrialResult } from "./types.js"
-import { startOpenRouterBroker, RSI_OPENROUTER_MODEL, type OpenRouterBrokerReceipt, type OpenRouterBrokerOptions } from "./inference-broker.js"
+import { startOpenRouterBroker, openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID, type OpenRouterBrokerReceipt, type OpenRouterBrokerOptions } from "./inference-broker.js"
 import { effectiveWorkerHarnessMode, workerHarnessCliPath, validWorkerHarnessRuntimeIdentity } from "./worker-harness.js"
 import { mutationSnapshotProtectedPathViolations } from "./sandbox.js"
 import type { EmergencyControl } from "../control/emergency-controller.js"
@@ -210,12 +210,14 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions, sig
 			let mutation
 			try {
 				if ((payload.provider ?? "ollama") === "openrouter") {
-					if (payload.model !== RSI_OPENROUTER_MODEL || !payload.inferenceLimits) throw new Error("OpenRouter fleet job is missing the pinned model or explicit spend and token ceilings")
+					const profile = openRouterProfileForModel(payload.model, payload.openRouterProfile)
+					if (profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID && payload.openRouterProfile !== profile.id) throw new Error("OpenRouter fleet job lacks its explicit supervisor profile identity")
+					if (!payload.inferenceLimits) throw new Error("OpenRouter fleet job is missing the explicit spend and token ceilings")
 					const apiKey = process.env.HEADLESSCODE_OPENROUTER_API_KEY?.trim()
 					const bindHost = process.env.HEADLESSCODE_RSI_BROKER_BIND_HOST?.trim()
 					if (!apiKey || !bindHost) throw new Error("OpenRouter fleet worker requires the host API key and explicit RSI broker interface address")
 					const brokerOptions: OpenRouterBrokerOptions = {
-						jobId: lease.job.jobId, leaseToken: lease.token, model: RSI_OPENROUTER_MODEL, limits: payload.inferenceLimits,
+						jobId: lease.job.jobId, leaseToken: lease.token, model: profile.model, ...(profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { profileId: profile.id } : {}), limits: payload.inferenceLimits,
 						apiKey, bindHost, ledger: options.queue,
 					}
 					broker = await (options.createInferenceBroker ?? startOpenRouterBroker)(brokerOptions)
@@ -238,7 +240,11 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions, sig
 				|| JSON.stringify(mutation.workerHarnessExecution.runtime) !== JSON.stringify(payload.workerHarness.runtime))) {
 				throw new Error("OpenShell mutation result does not match its frozen worker harness identity")
 			}
-			if ((payload.provider ?? "ollama") === "openrouter" && (!receipt?.qualified || receipt.model !== payload.model || receipt.provider !== "openrouter")) throw new Error("OpenRouter mutation did not produce a qualified, model-bound broker receipt")
+			if ((payload.provider ?? "ollama") === "openrouter") {
+				const profile = openRouterProfileForModel(payload.model, payload.openRouterProfile)
+				const profileIdMatches = profile.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? receipt?.profileId === undefined || receipt.profileId === profile.id : receipt?.profileId === profile.id
+				if (!receipt?.qualified || receipt.model !== payload.model || !profileIdMatches || receipt.endpointProvider !== profile.endpointProvider || receipt.provider !== "openrouter") throw new Error("OpenRouter mutation did not produce a qualified, profile-bound broker receipt")
+			}
 			const patch = execFileSync("git", ["diff", "--binary", "--no-ext-diff", "--no-renames", `${candidate.baseCommit}...HEAD`], { cwd: repoRoot, encoding: "buffer", maxBuffer: options.queue.policy.maxInFlight * 1024 * 1024 * 16 })
 			if (patch.byteLength === 0) throw new Error("OpenShell mutation produced no patch")
 			const artifact = await options.queue.putArtifact(patch)

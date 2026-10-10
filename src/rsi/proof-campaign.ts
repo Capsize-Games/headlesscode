@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto"
 import type { Pool, PoolClient } from "pg"
+import { openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID } from "./inference-broker.js"
 
 export type ProofCampaignState = "planned" | "running" | "evaluated" | "selected" | "rejected" | "confirmed" | "finished"
 export type ProofCampaignAttemptKind = "mutation" | "development-proof" | "verification" | "confirmation" | "fixed-control"
@@ -12,7 +13,7 @@ export interface ProofCampaignManifest {
 	rootCommit: string
 	benchmarkDigests: { manifest: string; development: string; confirmation: string }
 	armAssignment: { fixedControl: string; selfHosted: string }
-	model: { provider: string; id: string; settings: Record<string, unknown> }
+	model: { provider: string; id: string; settings: Record<string, unknown>; profileId?: string }
 	seed: string
 	taskOrder: string[]
 	schedule: Array<{ armId: string; generation: number; candidateId: string; taskId: string; seed: string; attemptKind: ProofCampaignAttemptKind; phase?: "development" | "confirmation" }>
@@ -112,6 +113,10 @@ export function validateProofCampaignManifest(manifest: ProofCampaignManifest): 
 	for (const [name, sha] of Object.entries(manifest.benchmarkDigests)) if (!/^[a-f0-9]{64}$/.test(sha)) throw new Error(`proof campaign ${name} benchmark digest is malformed`)
 	if (!manifest.armAssignment.fixedControl || !manifest.armAssignment.selfHosted || manifest.armAssignment.fixedControl === manifest.armAssignment.selfHosted) throw new Error("proof campaign must freeze distinct fixed-control and self-hosted arm assignments")
 	if (!manifest.model.provider.trim() || !manifest.model.id.trim() || !manifest.seed.trim()) throw new Error("proof campaign model and seed identity are required")
+	if (manifest.model.provider === "openshell-openrouter") {
+		const profile = openRouterProfileForModel(manifest.model.id, manifest.model.profileId)
+		if (profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID && manifest.model.profileId !== profile.id) throw new Error("proof campaign OpenRouter profile identity is missing or mismatched")
+	}
 	if (!manifest.taskOrder.length || new Set(manifest.taskOrder).size !== manifest.taskOrder.length || manifest.taskOrder.some((id) => !id.trim())) throw new Error("proof campaign task order must be nonempty and unique")
 	if (!manifest.schedule.length || manifest.schedule.some((cell) => ![manifest.armAssignment.fixedControl, manifest.armAssignment.selfHosted].includes(cell.armId) || !Number.isSafeInteger(cell.generation) || cell.generation < 0 || !cell.candidateId.trim() || !cell.taskId.trim() || !cell.seed.trim() || !["mutation", "development-proof", "verification", "confirmation", "fixed-control"].includes(cell.attemptKind) || (cell.phase !== undefined && !["development", "confirmation"].includes(cell.phase)))) throw new Error("proof campaign schedule contains an invalid task cell")
 	const scheduleKeys = manifest.schedule.map((cell) => stableJson(cell))
