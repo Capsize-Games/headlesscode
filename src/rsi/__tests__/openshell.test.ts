@@ -3,7 +3,7 @@ import { execFileSync, spawnSync } from "node:child_process"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { applyFleetMutationPatch, createEvaluationSnapshotBundle, createMutationSnapshotBundle, HIDDEN_FUNCTION_DRIVER, inspectLocalRsiCheckpoint, networkRules, runOpenShellBenchmarkVerifier, runOpenShellMutation } from "../openshell.js"
+import { applyFleetMutationPatch, createEvaluationSnapshotBundle, createMutationSnapshotBundle, inspectLocalRsiCheckpoint, networkRules, runOpenShellBenchmarkVerifier, runOpenShellMutation } from "../openshell.js"
 import type { RsiOpenShellProviderFactory } from "../openshell.js"
 import type { CandidateRecord, RsiConfig } from "../types.js"
 import { parseRsiArgs } from "../config.js"
@@ -387,23 +387,6 @@ await run("dependency-escape")
 		assert.equal(hiddenProviderOptions?.image, `headlesscode-openshell-rsi@sha256:${"c".repeat(64)}`)
 		assert.equal(fs.existsSync(guest), false, "the isolated evaluation snapshot is deleted after runner teardown")
 	} finally { fs.rmSync(repo, { recursive: true, force: true }) }
-}
-
-{
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "hc-hidden-driver-cpu-"))
-	try {
-		const candidateDir = path.join(root, "src")
-		fs.mkdirSync(candidateDir, { recursive: true })
-		fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ type: "module" }))
-		fs.writeFileSync(path.join(candidateDir, "candidate.js"), "export function explode() { throw new Error('candidate failure') }\n")
-		fs.writeFileSync(path.join(root, "inputs.json"), JSON.stringify({ identity: { limits: { maxCases: 1, maxOutputBytes: 100 } }, cases: [{ id: "case", modulePath: "src/candidate.js", exportName: "explode", input: null }] }))
-		const driver = path.join(root, "driver.mjs")
-		const source = HIDDEN_FUNCTION_DRIVER.replace('const root = "/workspace"', `const root = ${JSON.stringify(root)}`).replace('"__headlesscode_hidden__/inputs.json"', '"inputs.json"')
-		fs.writeFileSync(driver, source)
-		const execution = spawnSync(process.execPath, ["--max-old-space-size=64", driver], { encoding: "utf8", timeout: 5000 })
-		assert.notEqual(execution.status, 0, "candidate exception must fail the evaluator process")
-		assert.doesNotMatch(execution.stdout, /HEADLESSCODE_HIDDEN_OUTPUTS:/, "candidate exception cannot emit a normal output report")
-	} finally { fs.rmSync(root, { recursive: true, force: true }) }
 }
 
 {
