@@ -862,9 +862,80 @@ import { pathToFileURL } from "node:url"
 const root = "/workspace"
 const spec = JSON.parse(await readFile(path.join(root, "__headlesscode_hidden__/inputs.json"), "utf8"))
 if (!spec || !Array.isArray(spec.cases) || spec.cases.length < 1 || spec.cases.length > spec.identity.limits.maxCases) throw new Error("invalid hidden-case request")
+const safeStringify = JSON.stringify.bind(JSON)
+const safeParse = JSON.parse.bind(JSON)
+const safeGetPrototypeOf = Object.getPrototypeOf
+const safeOwnKeys = Reflect.ownKeys
+const safeGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
+const safeDefineProperty = Object.defineProperty
+const safeObjectCreate = Object.create
+const safeSetPrototypeOf = Object.setPrototypeOf
+const safeIsArray = Array.isArray
+const safeIsFinite = Number.isFinite
+const safeIsSafeInteger = Number.isSafeInteger
+const SafeWeakSet = WeakSet
+const safeWeakSetHas = WeakSet.prototype.has
+const safeWeakSetAdd = WeakSet.prototype.add
+const safeWeakSetDelete = WeakSet.prototype.delete
+const safeApply = Reflect.apply
+const SafeArray = Array
+const safeNumber = Number
+const safeByteLength = Buffer.byteLength.bind(Buffer)
+const safeBufferFrom = Buffer.from.bind(Buffer)
+const safeBufferToString = Buffer.prototype.toString
+const writeStdout = process.stdout.write.bind(process.stdout)
+const safeString = String
+const isArrayIndex = RegExp.prototype.test.bind(/^(?:0|[1-9][0-9]*)$/)
+const plainObjectPrototype = Object.prototype
+const arrayPrototype = Array.prototype
+function assertJsonValue(value, active = new SafeWeakSet()) {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value
+  if (typeof value === "number" && safeIsFinite(value)) return value
+  if (typeof value !== "object") throw new Error("output contains a non-JSON value")
+  if (safeApply(safeWeakSetHas, active, [value])) throw new Error("output contains a cycle")
+  safeApply(safeWeakSetAdd, active, [value])
+  try {
+    if (safeIsArray(value)) {
+      if (safeGetPrototypeOf(value) !== arrayPrototype) throw new Error("output array has an unsupported prototype")
+      const lengthDescriptor = safeGetOwnPropertyDescriptor(value, "length")
+      const length = lengthDescriptor?.value
+      if (!safeIsSafeInteger(length) || length < 0 || length > spec.identity.limits.maxOutputBytes) throw new Error("output array exceeds JSON bounds")
+      const keys = safeOwnKeys(value)
+      if (keys.length !== length + 1) throw new Error("output array is sparse or has non-JSON properties")
+      const normalized = new SafeArray(length)
+      safeSetPrototypeOf(normalized, null)
+      for (let keyIndex = 0; keyIndex < keys.length; keyIndex++) {
+        const key = keys[keyIndex]
+        if (key === "length") continue
+        if (typeof key !== "string" || !isArrayIndex(key) || safeNumber(key) >= length) throw new Error("output array is sparse or has non-JSON properties")
+      }
+      for (let index = 0; index < length; index++) {
+        const descriptor = safeGetOwnPropertyDescriptor(value, safeString(index))
+        if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) throw new Error("output array contains a non-JSON property")
+        safeDefineProperty(normalized, safeString(index), { value: assertJsonValue(descriptor.value, active), enumerable: true, configurable: true, writable: true })
+      }
+      return normalized
+    }
+    const prototype = safeGetPrototypeOf(value)
+    if (prototype !== plainObjectPrototype && prototype !== null) throw new Error("output object is not a plain JSON object")
+    const keys = safeOwnKeys(value)
+    if (keys.length > spec.identity.limits.maxOutputBytes) throw new Error("output object exceeds JSON bounds")
+    const normalized = safeObjectCreate(null)
+    for (let keyIndex = 0; keyIndex < keys.length; keyIndex++) {
+      const key = keys[keyIndex]
+      if (typeof key !== "string") throw new Error("output contains a symbol property")
+      const descriptor = safeGetOwnPropertyDescriptor(value, key)
+      if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) throw new Error("output contains a non-JSON property")
+      safeDefineProperty(normalized, key, { value: assertJsonValue(descriptor.value, active), enumerable: true, configurable: true, writable: true })
+    }
+    return normalized
+  } finally { safeApply(safeWeakSetDelete, active, [value]) }
+}
 const outputs = []
+let outputCount = 0
 let totalBytes = 0
-for (const test of spec.cases) {
+for (let caseIndex = 0; caseIndex < spec.cases.length; caseIndex++) {
+  const test = spec.cases[caseIndex]
   if (typeof test.id !== "string" || typeof test.modulePath !== "string" || !/^(?:src|lib|app)\\//.test(test.modulePath) || test.modulePath.includes("..") || test.modulePath.includes("\\\\")) throw new Error("invalid hidden-case reference")
   if (typeof test.exportName !== "string" || !/^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/.test(test.exportName)) throw new Error("invalid hidden-case export")
   const target = path.resolve(root, test.modulePath)
@@ -872,15 +943,17 @@ for (const test of spec.cases) {
   const candidateModule = await import(pathToFileURL(target).href)
   if (typeof candidateModule[test.exportName] !== "function") throw new Error("missing export")
   const result = await candidateModule[test.exportName](test.input)
-  const encoded = JSON.stringify(result)
+  const normalized = assertJsonValue(result)
+  const encoded = safeStringify(normalized)
   if (encoded === undefined) throw new Error("output is not JSON")
-  totalBytes += Buffer.byteLength(encoded)
+  totalBytes += safeByteLength(encoded)
   if (totalBytes > spec.identity.limits.maxOutputBytes) throw new Error("output limit exceeded")
-  const output = JSON.parse(encoded)
-  outputs.push({ id: test.id, output })
+  const output = safeParse(encoded)
+  safeDefineProperty(outputs, safeString(outputCount), { value: { id: test.id, output }, enumerable: true, configurable: true, writable: true })
+  outputCount++
 }
-const encoded = Buffer.from(JSON.stringify(outputs)).toString("base64")
-process.stdout.write("\\nHEADLESSCODE_HIDDEN_OUTPUTS:" + encoded + "\\n")
+const encoded = safeApply(safeBufferToString, safeBufferFrom(safeStringify(assertJsonValue(outputs))), ["base64"])
+writeStdout("\\nHEADLESSCODE_HIDDEN_OUTPUTS:" + encoded + "\\n")
 `
 
 /** Execute a fixed hidden-case driver in a fresh evaluator snapshot. Only case inputs enter the guest. */
