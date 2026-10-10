@@ -128,7 +128,7 @@ export class SessionStore {
 	constructor(workspaceRoot: string, options: { directory?: string; onWarning?: (message: string) => void } = {}) {
 		this.workspaceRoot = path.resolve(workspaceRoot)
 		this.directory = options.directory ? path.resolve(options.directory) : path.join(projectStoreRoot(), "projects", projectKeyFor(resolveProjectIdentity(workspaceRoot).keySource), "sessions")
-		this.onWarning = options.onWarning
+		this.onWarning = options.onWarning ?? ((message) => process.stderr.write(`${message}\n`))
 	}
 
 	async create(input: CreateSessionInput = {}): Promise<SessionArchive> {
@@ -151,9 +151,16 @@ export class SessionStore {
 		try {
 			const stat = await handle.stat()
 			if (!stat.isFile() || stat.nlink !== 1 || stat.size > MAX_ARCHIVE_BYTES) fail("unsafe or oversized record")
-			const bytes = await handle.readFile()
-			if (bytes.length > MAX_ARCHIVE_BYTES) fail("record exceeds 16 MiB")
-			const archive: unknown = JSON.parse(bytes.toString("utf8"))
+			const buffer = Buffer.alloc(stat.size + 1)
+			let count = 0
+			while (count < buffer.length) {
+				const read = await handle.read(buffer, count, buffer.length - count, count)
+				if (read.bytesRead === 0) break
+				count += read.bytesRead
+			}
+			const after = await handle.stat()
+			if (count !== stat.size || after.size !== stat.size || after.mtimeMs !== stat.mtimeMs) fail("record changed during read; retry")
+			const archive: unknown = JSON.parse(buffer.subarray(0, count).toString("utf8"))
 			validateArchive(archive)
 			if (archive.id !== id) fail("record ID does not match filename")
 			return archive
@@ -219,10 +226,7 @@ export class SessionStore {
 		const temporary = path.join(this.directory, `.${id}.${randomUUID()}.part`)
 		const handle = await fsp.open(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600)
 		try {
-			await handle.writeFile(json, "utf8")
-			await handle.sync()
-		} finally { await handle.close() }
-		try {
+			try { await handle.writeFile(json, "utf8"); await handle.sync() } finally { await handle.close() }
 			await fsp.rename(temporary, target)
 			const directory = await fsp.open(this.directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW)
 			try { await directory.sync() } finally { await directory.close() }

@@ -16,7 +16,15 @@ export function buildHistoryContext(messages: SessionMessage[], maxChars = 64_00
 		const message = eligible[index]
 		const line = JSON.stringify({ role: message.role, content: message.content, ...(message.toolCalls ? { historicalToolCalls: message.toolCalls } : {}), ...(message.toolCallId ? { historicalToolCallId: message.toolCallId } : {}) })
 		if (line.length + 1 > remaining) {
-			if (lines.length === 0) lines.unshift(JSON.stringify({ role: message.role, content: (message.content ?? "").slice(-Math.floor(remaining / 2)), truncated: true }))
+			if (lines.length === 0) {
+				let length = Math.floor(remaining / 2)
+				let tail = ""
+				do {
+					tail = JSON.stringify({ role: message.role, content: (message.content ?? "").slice(-length), truncated: true })
+					length = Math.floor(length / 2)
+				} while (tail.length > remaining && length > 0)
+				if (tail.length <= remaining) lines.unshift(tail)
+			}
 			warnings.push("Historical context was truncated to fit the continuation limit; the full archive is unchanged.")
 			break
 		}
