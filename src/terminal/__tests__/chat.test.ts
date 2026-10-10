@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { spawn, spawnSync } from "node:child_process"
 import { PassThrough } from "node:stream"
 import type { ChatTurnRunner } from "../types.js"
 import { chatMain, parseChatArgs, parseSlashCommand } from "../chat.js"
@@ -115,7 +116,7 @@ async function testResumeUsesSelectedWorktree(): Promise<void> {
 
 async function testCommandsSkillsAndImportAreArchiveSwitch(): Promise<void> {
 	const store = new MemoryStore()
-	const pipes = streams('/model test/model\n/mode ask\n/skill review\n/import codex "export.json"\n/unknown\n//help\n')
+	const pipes = streams('/model test/model\n/mode ask\n/skill review\n/import headlesscode native.json\n/import codex "export.json"\n/unknown\n//help\n')
 	const prompts: string[] = []
 	const selectedModels: Array<string | undefined> = []
 	let importedHistory: SessionMessage[] = []
@@ -161,6 +162,7 @@ async function testCommandsSkillsAndImportAreArchiveSwitch(): Promise<void> {
 	assert.ok(importedHistory.some((message) => message.role === "system" && message.content === "historical system directive"))
 	assert.ok(importedHistory.some((message) => message.opaque?.[0].value === "ciphertext"))
 	assert.match(pipes.read(), /Unknown command '\/unknown'/)
+	assert.match(pipes.read(), /Unsupported import provider 'headlesscode'/)
 }
 
 async function testFailureAndSupervisorAbort(): Promise<void> {
@@ -265,6 +267,13 @@ async function testInputAndRendererBounds(): Promise<void> {
 	assert.deepEqual(await readComposedInput(oversizedInput, false), { kind: "message", text: "after" })
 	oversizedInput.close()
 
+	const queuedStream = new PassThrough()
+	const queuedInput = new TerminalInput({ input: queuedStream, output, terminal: false, maxQueuedLines: 2, maxQueuedChars: 100 })
+	queuedStream.write("one\ntwo\nthree\n")
+	assert.deepEqual(await queuedInput.readLine(""), { kind: "overflow" })
+	assert.deepEqual(await queuedInput.readLine(""), { kind: "eof" })
+	queuedInput.close()
+
 	const widthOutput = new PassThrough() as PassThrough & { columns?: number }
 	widthOutput.columns = 8
 	let rendered = ""
@@ -291,6 +300,57 @@ async function testInputAndRendererBounds(): Promise<void> {
 	for (let i = 0; i < 20; i++) bounded.renderEvent("llm_stream_chunk", { kind: "text", chunk: "x".repeat(16 * 1024) })
 	assert.ok(boundedText.length < 270 * 1024)
 	assert.match(boundedText, /display limit reached/)
+
+	const streamedOutput = new PassThrough()
+	let streamed = ""
+	streamedOutput.on("data", (chunk) => { streamed += chunk.toString() })
+	const streamingRenderer = new TerminalRenderer({ output: streamedOutput, color: false })
+	streamingRenderer.startTurn()
+	for (let i = 0; i < 1_101; i++) streamingRenderer.renderEvent("llm_stream_chunk", { kind: "text", chunk: "a" })
+	streamingRenderer.finishTurn(`${"a".repeat(1_101)}rest`, "success")
+	streamingRenderer.renderEvent("history_warning", { warning: "Context shortened to fit." })
+	assert.ok(streamed.includes(`${"a".repeat(1_101)}rest`))
+	assert.match(streamed, /Context shortened to fit\./)
+
+	const partialOutput = new PassThrough()
+	let partial = ""
+	partialOutput.on("data", (chunk) => { partial += chunk.toString() })
+	const partialRenderer = new TerminalRenderer({ output: partialOutput, color: false })
+	partialRenderer.startTurn()
+	partialRenderer.renderEvent("llm_stream_chunk", { kind: "text", chunk: "partial " })
+	partialRenderer.finishTurn("partial final response", "success")
+	assert.ok(partial.includes("partial final response"))
+}
+
+async function testReadlineCtrlCInPseudoTerminal(): Promise<void> {
+	if (process.platform !== "linux") return
+	const probe = spawnSync("script", ["--version"], { encoding: "utf8" })
+	if (probe.error) {
+		console.warn("terminal chat PTY test skipped: util-linux script command is unavailable")
+		return
+	}
+	const program = `import { TerminalInput } from "./src/terminal/input.ts"; const input = new TerminalInput({ input: process.stdin, output: process.stdout, terminal: true }); console.log("PTY_READY"); input.readLine("> ").then((result) => { console.log("PTY_RESULT:" + result.kind); input.close(); });`
+	const quotedProgram = `'${program.replace(/'/g, "'\\''")}'`
+	const child = spawn("script", ["-qfec", `${process.execPath} --import tsx --input-type=module -e ${quotedProgram}`, "/dev/null"], {
+		cwd: process.cwd(), env: process.env, stdio: ["pipe", "pipe", "pipe"],
+	})
+	let output = ""
+	let sentInterrupt = false
+	const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+		const timeout = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("PTY Ctrl-C test timed out")) }, 5_000)
+		child.stdout.on("data", (chunk) => {
+			output += chunk.toString()
+			if (!sentInterrupt && output.includes("PTY_READY")) {
+				sentInterrupt = true
+				child.stdin.write("\u0003")
+			}
+		})
+		child.stderr.on("data", (chunk) => { output += chunk.toString() })
+		child.on("error", (error) => { clearTimeout(timeout); reject(error) })
+		child.on("close", (code) => { clearTimeout(timeout); resolve({ code, output }) })
+	})
+	assert.equal(result.code, 0, result.output)
+	assert.match(result.output, /PTY_RESULT:interrupt/)
 }
 
 async function main(): Promise<void> {
@@ -302,6 +362,7 @@ async function main(): Promise<void> {
 	await testRevisionConflictRequiresRetryAndCtrlCAborts()
 	await testSaveFailureCanBeRetried()
 	await testInputAndRendererBounds()
+	await testReadlineCtrlCInPseudoTerminal()
 	console.log("terminal chat tests passed")
 }
 
