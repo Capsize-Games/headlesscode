@@ -167,9 +167,13 @@ async function testMalformedEnabledRootsAreDiagnosedAndTerminalTextIsSanitized()
 	const root = await fixtureRoot()
 	try {
 		const managed = path.join(root, "data", "skills")
-		const skillDir = await writeSkill(managed, "terminal-copy", "terminal-copy", "instructions")
-		await fs.writeFile(path.join(skillDir, "SKILL.md"), `---\nname: terminal-copy\ndescription: ${JSON.stringify("Hello \u001b[2Jworld\nnext line")}\n---\ninstructions\n`)
+		const skillDir = await writeSkill(managed, "terminal-copy", "terminal-copy", "line one\n\u001b[31mline two\u001b[0m\nline three")
+		await fs.writeFile(path.join(skillDir, "SKILL.md"), `---\nname: terminal-copy\ndescription: ${JSON.stringify("Hello \u001b[2Jworld\nnext line")}\n---\nline one\n\u001b[31mline two\u001b[0m\nline three\n`)
+		await writeSkill(managed, "second-skill", "second-skill", "Second instructions")
 		await fs.writeFile(path.join(root, "data", "skills-enabled.json"), "{ malformed")
+		const help: string[] = []
+		assert.equal(await runSkillsCli(["--help"], { stdout: (text) => help.push(text) }), 0)
+		assert.equal(help.join("").split("\n").length, 3, "help retains its intentional line structure")
 		const output: string[] = []
 		const status = await runSkillsCli(["list"], {
 			workspaceRoot: root,
@@ -179,8 +183,17 @@ async function testMalformedEnabledRootsAreDiagnosedAndTerminalTextIsSanitized()
 		})
 		assert.equal(status, 0, "a malformed optional enabled-root file does not prevent listing default roots")
 		assert.match(output.join(""), /warning: enabled roots ignored: could not read enabled skill roots/)
-		assert.match(output.join(""), /Hello  \[2Jworld next line/)
-		assert.ok(!output.join("").includes("\u001b"), "terminal escape sequences are stripped from CLI output")
+		assert.match(output.join(""), /Hello world next line/)
+		assert.equal(output.filter((line) => line.startsWith("terminal-copy\t") || line.startsWith("second-skill\t")).length, 2, "list keeps one skill per line")
+		const inspected: string[] = []
+		assert.equal(await runSkillsCli(["inspect", "terminal-copy"], {
+			workspaceRoot: root,
+			includeUserRoots: false,
+			stdout: (text) => inspected.push(text),
+			stderr: (text) => inspected.push(text),
+		}), 0)
+		assert.match(inspected.join(""), /line one\nline two\nline three\n$/)
+		assert.ok(![...output, ...inspected].join("").includes("\u001b"), "terminal escape sequences are stripped from CLI output")
 	} finally {
 		await fs.rm(root, { recursive: true, force: true })
 	}
@@ -216,7 +229,7 @@ async function testEnablePersistsAnExplicitRoot(): Promise<void> {
 		const io = { workspaceRoot: root, stdout: (text: string) => output.push(text), stderr: (text: string) => output.push(text) }
 		assert.equal(await runSkillsCli(["enable", external], io), 0)
 		assert.equal(await runSkillsCli(["list"], { ...io, includeUserRoots: false }), 0)
-		assert.match(output.join(""), /operator-skill Instructions for operator-skill enabled/)
+		assert.match(output.join(""), /operator-skill\tInstructions for operator-skill\tenabled/)
 	} finally {
 		await fs.rm(root, { recursive: true, force: true })
 	}
