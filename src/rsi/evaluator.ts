@@ -2,14 +2,28 @@ import type { CommandRunner, EvaluationSummary, RsiConfig, TrialResult } from ".
 import { changedFiles, candidateCommits, gitOutput } from "./workspace.js"
 import { protectedPathViolations } from "./sandbox.js"
 import { createOpenShellCommandRunner } from "./openshell.js"
+import { createHash } from "node:crypto"
+import { execFileSync } from "node:child_process"
+import { verifyHiddenFunctions } from "./hidden-verifier.js"
+import type { HiddenFunctionSuite, HiddenNonceStore, IsolatedHiddenCaseRunner } from "./hidden-verifier.js"
+
+export interface HiddenEvaluationOptions {
+	suite: HiddenFunctionSuite
+	runner: IsolatedHiddenCaseRunner
+	nonceStore: HiddenNonceStore
+	publicKey: string | Buffer
+	sessionId: string
+	jobId: string
+}
 
 export async function evaluateCandidate(
 	config: RsiConfig,
 	candidateRoot: string,
 	baseCommit: string,
 	runner?: CommandRunner,
+	hiddenEvaluation?: HiddenEvaluationOptions,
 ): Promise<EvaluationSummary> {
-	if (config.hiddenEvalCommands.length > 0) throw new Error("RSI hidden evaluations require a supervisor-only evaluator service; refusing to run hidden commands in a candidate guest")
+	if (config.hiddenEvalCommands.length > 0) throw new Error("RSI hidden evaluations require bounded exported-function cases; refusing to run hidden commands in a candidate guest")
 	const isolatedRunner = runner ?? createOpenShellCommandRunner(config)
 	const files = await changedFiles(candidateRoot, baseCommit)
 	const commits = await candidateCommits(candidateRoot, baseCommit)
@@ -46,6 +60,24 @@ export async function evaluateCandidate(
 		visible.push(await isolatedRunner(command, candidateRoot, config.commandTimeoutMs))
 	}
 	const hidden: TrialResult[] = []
+	if (hiddenEvaluation) {
+		const candidateCommit = await gitOutput(candidateRoot, ["rev-parse", "HEAD"])
+		const sourceTree = execFileSync("git", ["ls-tree", "-r", "-z", "--full-tree", "HEAD"], { cwd: candidateRoot, maxBuffer: 32 * 1024 * 1024 })
+		const result = await verifyHiddenFunctions(hiddenEvaluation.suite, {
+			candidateSourceDigest: createHash("sha256").update(sourceTree).digest("hex"),
+			candidateCommit,
+			sessionId: hiddenEvaluation.sessionId,
+			jobId: hiddenEvaluation.jobId,
+		}, hiddenEvaluation)
+		hidden.push({
+			ok: result.status === "passed",
+			command: "supervisor-hidden-function-cases",
+			exitCode: result.status === "passed" ? 0 : 1,
+			durationMs: 0,
+			stdout: `${result.caseResults.filter((item) => item.passed).length}/${result.caseResults.length} hidden function cases passed; protocol=${result.protocolDigest}`,
+			stderr: result.reason ?? "",
+		})
+	}
 	return {
 		regression,
 		visible,

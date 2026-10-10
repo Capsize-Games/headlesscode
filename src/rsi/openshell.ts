@@ -850,3 +850,94 @@ export async function runOpenShellBenchmarkVerifier(candidate: CandidateRecord, 
 export function openShellMutationRunner(): typeof runOpenShellMutation {
 	return runOpenShellMutation
 }
+
+const HIDDEN_FUNCTION_DRIVER = `import { readFile } from "node:fs/promises"
+import path from "node:path"
+import { pathToFileURL } from "node:url"
+
+const root = "/workspace"
+const spec = JSON.parse(await readFile(path.join(root, "__headlesscode_hidden__/inputs.json"), "utf8"))
+if (!spec || !Array.isArray(spec.cases) || spec.cases.length < 1 || spec.cases.length > spec.identity.limits.maxCases) throw new Error("invalid hidden-case request")
+const outputs = []
+let totalBytes = 0
+for (const test of spec.cases) {
+  if (typeof test.id !== "string" || typeof test.modulePath !== "string" || !/^(?:src|lib|app)\\//.test(test.modulePath) || test.modulePath.includes("..") || test.modulePath.includes("\\\\")) throw new Error("invalid hidden-case reference")
+  if (typeof test.exportName !== "string" || !/^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/.test(test.exportName)) throw new Error("invalid hidden-case export")
+  const target = path.resolve(root, test.modulePath)
+  if (!target.startsWith(root + "/")) throw new Error("hidden-case module escaped candidate root")
+  let output
+  try {
+    const candidateModule = await import(pathToFileURL(target).href)
+    if (typeof candidateModule[test.exportName] !== "function") throw new Error("missing export")
+    output = await candidateModule[test.exportName](test.input)
+    const encoded = JSON.stringify(output)
+    if (encoded === undefined) throw new Error("output is not JSON")
+    totalBytes += Buffer.byteLength(encoded)
+    if (totalBytes > spec.identity.limits.maxOutputBytes) throw new Error("output limit exceeded")
+    output = JSON.parse(encoded)
+  } catch {
+    output = { __headlesscode_hidden_case_error__: true }
+  }
+  outputs.push({ id: test.id, output })
+}
+const encoded = Buffer.from(JSON.stringify(outputs)).toString("base64")
+process.stdout.write("\\nHEADLESSCODE_HIDDEN_OUTPUTS:" + encoded + "\\n")
+`
+
+/** Execute a fixed hidden-case driver in a fresh evaluator snapshot. Only case inputs enter the guest. */
+export async function runOpenShellHiddenFunctionCases(
+	sourceRoot: string,
+	commit: string,
+	config: RsiConfig,
+	request: { identity: import("./hidden-verifier.js").HiddenVerificationIdentity; cases: import("./hidden-verifier.js").HiddenCaseInput[] },
+	providerFactory?: RsiOpenShellProviderFactory,
+): Promise<import("./hidden-verifier.js").HiddenCaseOutput[]> {
+	const limits = request.identity.limits
+	if (request.identity.protocol !== "headlesscode.hidden-functions.v1" || !/^[a-f0-9]{64}$/.test(request.identity.protocolDigest) ||
+		!/^[a-f0-9]{64}$/.test(request.identity.candidateSourceDigest) || !/^[A-Za-z0-9._:-]{1,128}$/.test(request.identity.sessionId) ||
+		!/^[A-Za-z0-9._:-]{1,128}$/.test(request.identity.jobId) || !/^[A-Za-z0-9_-]{32,128}$/.test(request.identity.nonce) ||
+		!Number.isInteger(limits.timeoutMs) || limits.timeoutMs < 50 || limits.timeoutMs > 120_000 ||
+		!Number.isInteger(limits.maxMemoryMb) || limits.maxMemoryMb < 16 || limits.maxMemoryMb > 4096 ||
+		!Number.isInteger(limits.maxInputBytes) || limits.maxInputBytes < 1 || limits.maxInputBytes > 1_000_000 ||
+		!Number.isInteger(limits.maxOutputBytes) || limits.maxOutputBytes < 1 || limits.maxOutputBytes > 1_000_000 ||
+		!Number.isInteger(limits.maxCases) || limits.maxCases < 1 || limits.maxCases > 256) {
+		throw new Error("OpenShell hidden verifier request has unsupported identity or resource limits")
+	}
+	if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(commit)) throw new Error("hidden verifier candidate commit is malformed")
+	if (request.identity.candidateCommit !== commit) throw new Error("hidden verifier commit differs from the frozen request identity")
+	if (!Array.isArray(request.cases) || request.cases.length < 1 || request.cases.length > limits.maxCases) throw new Error("OpenShell hidden verifier case count is outside its frozen bound")
+	const guestIdentity = {
+		protocol: request.identity.protocol,
+		candidateSourceDigest: request.identity.candidateSourceDigest,
+		candidateCommit: request.identity.candidateCommit,
+		sessionId: request.identity.sessionId,
+		jobId: request.identity.jobId,
+		nonce: request.identity.nonce,
+		limits: request.identity.limits,
+	}
+	const inputs = Buffer.from(JSON.stringify({ identity: guestIdentity, cases: request.cases }), "utf8")
+	if (inputs.byteLength > request.identity.limits.maxInputBytes + 64 * 1024) throw new Error("hidden verifier request exceeds its frozen input limit")
+	const memoryKb = request.identity.limits.maxMemoryMb * 1024
+	const cpuSeconds = Math.max(1, Math.ceil(request.identity.limits.timeoutMs / 1000))
+	const isolated = await runSnapshot({
+		config,
+		sourceRoot,
+		commit,
+		command: `ulimit -v ${memoryKb} && ulimit -t ${cpuSeconds} && test -x /opt/headlesscode/node_modules/.bin/tsx && /opt/headlesscode/node_modules/.bin/tsx /workspace/__headlesscode_hidden__/driver.mjs`,
+		timeoutMs: request.identity.limits.timeoutMs,
+		mode: "evaluation",
+		sessionName: `rsi-hidden-${request.identity.jobId}-${randomUUID().slice(0, 8)}`,
+		extraFiles: {
+			"__headlesscode_hidden__/inputs.json": inputs,
+			"__headlesscode_hidden__/driver.mjs": Buffer.from(HIDDEN_FUNCTION_DRIVER, "utf8"),
+		},
+		providerFactory,
+	})
+	if (!isolated.result.ok) throw new Error(`OpenShell hidden function execution failed or exceeded resource limits (exit ${isolated.result.exitCode ?? "unknown"})`)
+	const markers = [...isolated.result.stdout.matchAll(/(?:^|\n)HEADLESSCODE_HIDDEN_OUTPUTS:([A-Za-z0-9+/=]+)(?:\n|$)/g)]
+	if (markers.length !== 1) throw new Error("OpenShell hidden function runner returned a missing or ambiguous output marker")
+	let outputs: unknown
+	try { outputs = JSON.parse(Buffer.from(markers[0]![1]!, "base64").toString("utf8")) } catch { throw new Error("OpenShell hidden function runner returned malformed output JSON") }
+	if (!Array.isArray(outputs) || outputs.length !== request.cases.length) throw new Error("OpenShell hidden function runner returned a partial output set")
+	return outputs as import("./hidden-verifier.js").HiddenCaseOutput[]
+}
