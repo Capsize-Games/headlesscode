@@ -164,17 +164,19 @@ the project's own audit process rather than silently left implicit.
 
 ## Reporting vulnerabilities
 
-This project is pre-1.0 and has no private disclosure channel yet. For now,
-report security findings by opening a GitHub issue on
-[Capsize-Games/headlesscode](https://github.com/Capsize-Games/headlesscode)
-tagged `security`, or a pull request with a fix. See the docs in `docs/` for
-the overall design.
+Use GitHub's [private vulnerability reporting](https://github.com/Capsize-Games/headlesscode/security/advisories/new)
+to report suspected vulnerabilities confidentially. Include the affected
+commit or version, reproduction steps, impact, and relevant redacted evidence.
+Keep credentials and user data out of reports.
+
+Coordinated disclosures are published through
+[repository security advisories](https://github.com/Capsize-Games/headlesscode/security/advisories).
 
 ## Supported versions
 
-Only the current `master` branch is supported. The project has not cut
-releases yet (no tags, `version: 0.1.0`); patches land on `master` and are
-expected to be forward-only.
+Security fixes target the current `master` branch. The package version is
+1.3.0 and the repository has tagged releases, including `v1.3.0`. Older tags
+do not have a separate backport commitment.
 
 ## Security-relevant areas
 

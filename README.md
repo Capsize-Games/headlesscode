@@ -9,6 +9,21 @@
 VS Code window. Run one task directly, launch parallel workers in Git
 worktrees, or use the NVIDIA OpenShell provider for sandboxed sessions.
 
+## Security controls
+
+HeadlessCode's controls map to the seven principles in Satya Nadella's
+[Models as Insider Risks in the Super Intelligence Era](https://snscratchpad.com/posts/models-as-insider-risks/).
+
+| Principle | HeadlessCode implementation |
+| --- | --- |
+| **Model diversity** | Operators assign models by mode and RSI role, including review and adversarial roles. Programmatic gates determine candidate eligibility. See [model assignment](./src/config/mode-models.ts) and [RSI roles](./src/rsi/roles.ts). |
+| **Observe everything** | Session event feeds record model and tool activity and retain completion reports. RSI stores content-addressed artifacts and model-bound inference receipts. See [session events](./src/engine/events.ts), [artifact storage](./src/rsi/artifact-store.ts), and [inference broker](./src/rsi/inference-broker.ts). |
+| **Verifiability** | CI runs typechecking, the full automated test suite, and mock end-to-end workflows. RSI applies regression, typecheck, visible evaluation, and frozen development-proof gates. See [CI](./.github/workflows/ci.yml), [evaluator](./src/rsi/evaluator.ts), and [development proof](./src/rsi/development-proof.ts). |
+| **Independent controls** | Operators configure command and file permissions, OpenShell policies, credential providers, and bounded resource and inference budgets. See [permissions](./src/permissions/config.ts) and [OpenShell configuration](./docs/openshell-integration.md). |
+| **Independent auditability** | The RSI supervisor owns evaluator and scoring inputs, checks protected paths and artifact identities, and validates parent/child proof before selection. See [RSI architecture](./docs/recursive-self-improvement.md) and [parent selection](./src/rsi/controller.ts). |
+| **Containment** | OpenShell sessions run in disposable independent clones. Worker stop controls terminate the scoped process group and remove sandboxes; result import requires confirmed sandbox deletion. See [OpenShell lifecycle](./src/cloud/openshell-provider.ts) and [worker stop](./scripts/stop-worker.sh). |
+| **Incident disclosure** | GitHub private vulnerability reporting provides a confidential intake channel, and repository security advisories provide the publication channel for coordinated disclosures. [Report a vulnerability](https://github.com/Capsize-Games/headlesscode/security/advisories/new) or [read advisories](https://github.com/Capsize-Games/headlesscode/security/advisories). |
+
 | Use it for | What it does |
 | --- | --- |
 | One repository task | Reads project modes and instructions, edits files, runs commands, and reports a result. |
