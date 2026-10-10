@@ -234,6 +234,12 @@ export interface RsiConfig {
 	regressionCommand: string
 	evalCommands: string[]
 	hiddenEvalCommands: string[]
+	hiddenSuitePath?: string
+	hiddenSuiteSha256?: string
+	hiddenPublicKeyPath?: string
+	hiddenPrivateKeyPath?: string
+	hiddenNonceStorePath?: string
+	hiddenImageDigest?: string
 	archiveDir: string
 	worktreeDir: string
 	baseRef: string
@@ -441,6 +447,7 @@ export interface RsiRunRecord {
 	model: string
 	baseRef: string
 	baseCommit: string
+	hiddenVerifierIdentity?: { protocol: string; suiteSha256: string; imageDigest: string; publicKeySha256: string }
 	generations: number
 	selected?: string
 	selectedCandidates?: string[]

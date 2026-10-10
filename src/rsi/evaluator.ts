@@ -12,6 +12,7 @@ export interface HiddenEvaluationOptions {
 	runner: IsolatedHiddenCaseRunner
 	nonceStore: HiddenNonceStore
 	publicKey: string | Buffer
+	evaluatorImageDigest: string
 	sessionId: string
 	jobId: string
 }
@@ -23,7 +24,7 @@ export async function evaluateCandidate(
 	runner?: CommandRunner,
 	hiddenEvaluation?: HiddenEvaluationOptions,
 ): Promise<EvaluationSummary> {
-	if (config.hiddenEvalCommands.length > 0) throw new Error("RSI hidden evaluations require bounded exported-function cases; refusing to run hidden commands in a candidate guest")
+	if (config.hiddenEvalCommands.length > 0) throw new Error("RSI hidden evaluations require a supervisor-only evaluator service with bounded exported-function cases; candidate guest shell commands are refused")
 	const isolatedRunner = runner ?? createOpenShellCommandRunner(config)
 	const files = await changedFiles(candidateRoot, baseCommit)
 	const commits = await candidateCommits(candidateRoot, baseCommit)
@@ -65,6 +66,7 @@ export async function evaluateCandidate(
 		const sourceTree = execFileSync("git", ["ls-tree", "-r", "-z", "--full-tree", "HEAD"], { cwd: candidateRoot, maxBuffer: 32 * 1024 * 1024 })
 		const result = await verifyHiddenFunctions(hiddenEvaluation.suite, {
 			candidateSourceDigest: createHash("sha256").update(sourceTree).digest("hex"),
+			evaluatorImageDigest: hiddenEvaluation.evaluatorImageDigest,
 			candidateCommit,
 			sessionId: hiddenEvaluation.sessionId,
 			jobId: hiddenEvaluation.jobId,

@@ -55,6 +55,8 @@ export interface IsolatedRunOptions {
 	image?: string
 	signal?: AbortSignal
 	control?: Pick<EmergencyControl, "identity" | "state" | "stateDirectoryPath" | "signal" | "assertRunning" | "registerCleanup" | "registerResource" | "releaseResource">
+	cpu?: string
+	memory?: string
 	providerFactory?: RsiOpenShellProviderFactory
 	inferenceBroker?: RsiInferenceBrokerAccess
 	expectedSnapshotTreeDigest?: string
@@ -386,7 +388,7 @@ export function inspectLocalRsiCheckpoint(configuredBase: string, mode: Isolated
 	return { path: source, files, bytes }
 }
 
-function providerOptions(config: RsiConfig, mode: IsolatedRunOptions["mode"], timeoutMs: number, imageReference?: string, inferenceBroker?: RsiInferenceBrokerAccess, signal?: AbortSignal, control?: IsolatedRunOptions["control"]): OpenShellSessionProviderOptions {
+function providerOptions(config: RsiConfig, mode: IsolatedRunOptions["mode"], timeoutMs: number, imageReference?: string, inferenceBroker?: RsiInferenceBrokerAccess, signal?: AbortSignal, control?: IsolatedRunOptions["control"], cpu?: string, memory?: string): OpenShellSessionProviderOptions {
 	const policy = process.env.HEADLESSCODE_OPENSHELL_POLICY ?? POLICY_PATH
 	const configuredImage = process.env.HEADLESSCODE_OPENSHELL_IMAGE?.trim()
 	const trainingMode = mode === "training" || mode === "model-evaluation"
@@ -412,6 +414,8 @@ function providerOptions(config: RsiConfig, mode: IsolatedRunOptions["mode"], ti
 		commandTimeoutMs: timeoutMs,
 		signal,
 		emergencyControl: control,
+		...(cpu ? { cpu } : {}),
+		...(memory ? { memory } : {}),
 		networkPolicy: networkRules(mode, inferenceBroker),
 		...(trainingMode ? { readOnlyMounts } : {}),
 		...(mode === "training" ? { gpu: 1 } : {}),
@@ -532,7 +536,7 @@ async function runSnapshot(options: IsolatedRunOptions & { preserveSnapshot?: bo
 		throw new Error("worker sanitized snapshot tree digest differs from the frozen fleet job identity")
 	}
 	const factory = options.providerFactory ?? ((providerConfig) => new OpenShellSessionProvider(providerConfig))
-	const provider = factory(providerOptions(options.config, options.mode, options.timeoutMs, options.image, options.inferenceBroker, options.signal, options.control))
+	const provider = factory(providerOptions(options.config, options.mode, options.timeoutMs, options.image, options.inferenceBroker, options.signal, options.control, options.cpu, options.memory))
 	const request = makeRequest(options.config.repoRoot, name, options.env ?? {})
 	let handle: SessionHandle | undefined
 	let unregisterCleanup: (() => void) | undefined
@@ -851,7 +855,7 @@ export function openShellMutationRunner(): typeof runOpenShellMutation {
 	return runOpenShellMutation
 }
 
-const HIDDEN_FUNCTION_DRIVER = `import { readFile } from "node:fs/promises"
+export const HIDDEN_FUNCTION_DRIVER = `import { readFile } from "node:fs/promises"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 
@@ -865,19 +869,14 @@ for (const test of spec.cases) {
   if (typeof test.exportName !== "string" || !/^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/.test(test.exportName)) throw new Error("invalid hidden-case export")
   const target = path.resolve(root, test.modulePath)
   if (!target.startsWith(root + "/")) throw new Error("hidden-case module escaped candidate root")
-  let output
-  try {
-    const candidateModule = await import(pathToFileURL(target).href)
-    if (typeof candidateModule[test.exportName] !== "function") throw new Error("missing export")
-    output = await candidateModule[test.exportName](test.input)
-    const encoded = JSON.stringify(output)
-    if (encoded === undefined) throw new Error("output is not JSON")
-    totalBytes += Buffer.byteLength(encoded)
-    if (totalBytes > spec.identity.limits.maxOutputBytes) throw new Error("output limit exceeded")
-    output = JSON.parse(encoded)
-  } catch {
-    output = { __headlesscode_hidden_case_error__: true }
-  }
+  const candidateModule = await import(pathToFileURL(target).href)
+  if (typeof candidateModule[test.exportName] !== "function") throw new Error("missing export")
+  const result = await candidateModule[test.exportName](test.input)
+  const encoded = JSON.stringify(result)
+  if (encoded === undefined) throw new Error("output is not JSON")
+  totalBytes += Buffer.byteLength(encoded)
+  if (totalBytes > spec.identity.limits.maxOutputBytes) throw new Error("output limit exceeded")
+  const output = JSON.parse(encoded)
   outputs.push({ id: test.id, output })
 }
 const encoded = Buffer.from(JSON.stringify(outputs)).toString("base64")
@@ -891,6 +890,7 @@ export async function runOpenShellHiddenFunctionCases(
 	config: RsiConfig,
 	request: { identity: import("./hidden-verifier.js").HiddenVerificationIdentity; cases: import("./hidden-verifier.js").HiddenCaseInput[] },
 	providerFactory?: RsiOpenShellProviderFactory,
+	imageDigest?: string,
 ): Promise<import("./hidden-verifier.js").HiddenCaseOutput[]> {
 	const limits = request.identity.limits
 	if (request.identity.protocol !== "headlesscode.hidden-functions.v1" || !/^[a-f0-9]{64}$/.test(request.identity.protocolDigest) ||
@@ -904,11 +904,14 @@ export async function runOpenShellHiddenFunctionCases(
 		throw new Error("OpenShell hidden verifier request has unsupported identity or resource limits")
 	}
 	if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(commit)) throw new Error("hidden verifier candidate commit is malformed")
+	if (!imageDigest || !/^sha256:[a-f0-9]{64}$/.test(imageDigest)) throw new Error("hidden verifier requires an approved digest-pinned evaluator image")
+	if (request.identity.evaluatorImageDigest !== imageDigest) throw new Error("hidden verifier evaluator image differs from the frozen request identity")
 	if (request.identity.candidateCommit !== commit) throw new Error("hidden verifier commit differs from the frozen request identity")
 	if (!Array.isArray(request.cases) || request.cases.length < 1 || request.cases.length > limits.maxCases) throw new Error("OpenShell hidden verifier case count is outside its frozen bound")
 	const guestIdentity = {
 		protocol: request.identity.protocol,
 		candidateSourceDigest: request.identity.candidateSourceDigest,
+		evaluatorImageDigest: request.identity.evaluatorImageDigest,
 		candidateCommit: request.identity.candidateCommit,
 		sessionId: request.identity.sessionId,
 		jobId: request.identity.jobId,
@@ -917,14 +920,18 @@ export async function runOpenShellHiddenFunctionCases(
 	}
 	const inputs = Buffer.from(JSON.stringify({ identity: guestIdentity, cases: request.cases }), "utf8")
 	if (inputs.byteLength > request.identity.limits.maxInputBytes + 64 * 1024) throw new Error("hidden verifier request exceeds its frozen input limit")
-	const memoryKb = request.identity.limits.maxMemoryMb * 1024
 	const cpuSeconds = Math.max(1, Math.ceil(request.identity.limits.timeoutMs / 1000))
+	const oldSpaceMb = Math.max(8, Math.floor(request.identity.limits.maxMemoryMb / 2))
 	const isolated = await runSnapshot({
 		config,
 		sourceRoot,
 		commit,
-		command: `ulimit -v ${memoryKb} && ulimit -t ${cpuSeconds} && test -x /opt/headlesscode/node_modules/.bin/tsx && /opt/headlesscode/node_modules/.bin/tsx /workspace/__headlesscode_hidden__/driver.mjs`,
+		command: `ulimit -t ${cpuSeconds} && test -x /opt/headlesscode/node_modules/.bin/tsx && exec /opt/headlesscode/node_modules/.bin/tsx /workspace/__headlesscode_hidden__/driver.mjs`,
 		timeoutMs: request.identity.limits.timeoutMs,
+		image: `headlesscode-openshell-rsi@${imageDigest}`,
+		cpu: "1",
+		memory: `${request.identity.limits.maxMemoryMb}Mi`,
+		env: { NODE_OPTIONS: `--max-old-space-size=${oldSpaceMb}` },
 		mode: "evaluation",
 		sessionName: `rsi-hidden-${request.identity.jobId}-${randomUUID().slice(0, 8)}`,
 		extraFiles: {
