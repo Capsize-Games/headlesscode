@@ -8,6 +8,10 @@ import type { RsiOpenShellProviderFactory } from "../openshell.js"
 import type { CandidateRecord, RsiConfig } from "../types.js"
 import { parseRsiArgs } from "../config.js"
 import { transformSync } from "esbuild"
+import { createHash, generateKeyPairSync } from "node:crypto"
+import { createOpenShellHiddenCaseRunner } from "../hidden-openshell-runner.js"
+import { verifyHiddenFunctions } from "../hidden-verifier.js"
+import type { HiddenFunctionSuite } from "../hidden-verifier.js"
 
 async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker-failure" | "snapshot-mismatch" | "protected-package" | "self-hosted-missing-cli" | "self-hosted-corrupt-cli" | "dependency-escape"): Promise<void> {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-openshell-"))
@@ -322,6 +326,61 @@ await run("dependency-escape")
 			async spawnExistingWorktreeSession(_request, snapshot) { verifierGuest = snapshot; return { id: "missing-marker", provider: "mock-openshell", address: snapshot } },
 			async waitReady() {}, async runHarness() { return { exitCode: 1, output: "sandbox transport failed" } }, async teardown() { tornDown = true },
 		})), /did not return its completion marker/)
+	} finally { fs.rmSync(repo, { recursive: true, force: true }) }
+}
+
+{
+	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-hidden-verifier-"))
+	const worktree = path.join(repo, ".worktrees", "hidden")
+	let guest = ""
+	try {
+		fs.mkdirSync(path.join(worktree, "src"), { recursive: true })
+		fs.writeFileSync(path.join(worktree, "src", "candidate.js"), "export const double = ({ value }) => value * 2\n")
+		execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: worktree })
+		execFileSync("git", ["config", "user.name", "Test"], { cwd: worktree })
+		execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: worktree })
+		execFileSync("git", ["add", "--all"], { cwd: worktree })
+		execFileSync("git", ["-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "candidate"], { cwd: worktree })
+		const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: worktree, encoding: "utf8" }).trim()
+		const tree = execFileSync("git", ["ls-tree", "-r", "-z", "--full-tree", commit], { cwd: worktree, encoding: "buffer" })
+		const sourceDigest = createHash("sha256").update(tree).digest("hex")
+		const parsed = parseRsiArgs(["--repo", repo, "--regression", "true", "--max-runtime-ms", "5000"])
+		assert.ok(parsed.config)
+		const keys = generateKeyPairSync("ed25519")
+		const suite: HiddenFunctionSuite = {
+			protocol: "headlesscode.hidden-functions.v1",
+			limits: { timeoutMs: 1000, maxMemoryMb: 128, maxInputBytes: 1024, maxOutputBytes: 1024, maxCases: 1 },
+			cases: [{ id: "double", modulePath: "src/candidate.js", exportName: "double", input: { value: 4 }, expected: 8 }],
+		}
+		const providerFactory: RsiOpenShellProviderFactory = () => ({
+			async spawnExistingWorktreeSession(_request, snapshot) {
+				guest = snapshot
+				const inputs = fs.readFileSync(path.join(snapshot, "__headlesscode_hidden__", "inputs.json"), "utf8")
+				assert.match(inputs, /"value":4/, "guest receives case inputs")
+				assert.doesNotMatch(inputs, /"expected"|"value":8|protocolDigest/, "expected answers and full protocol digest stay on the host")
+				assert.equal(fs.existsSync(path.join(snapshot, "__headlesscode_hidden__", "driver.mjs")), true)
+				assert.equal(fs.readFileSync(path.join(snapshot, "src", "candidate.js"), "utf8"), "export const double = ({ value }) => value * 2\n")
+				return { id: "hidden", provider: "mock-openshell", address: snapshot }
+			},
+			async waitReady() {},
+			async runHarness(_handle, command) {
+				assert.match(command, /ulimit -v 131072 && ulimit -t 1/)
+				assert.match(command, /__headlesscode_hidden__\/driver\.mjs/)
+				assert.doesNotMatch(command, /expected|verify\.sh/)
+				const output = Buffer.from(JSON.stringify([{ id: "double", output: 8 }])).toString("base64")
+				return { exitCode: 0, output: `HEADLESSCODE_HIDDEN_OUTPUTS:${output}\n` }
+			},
+			async teardown() {},
+		})
+		const runner = createOpenShellHiddenCaseRunner({ candidateRoot: worktree, config: parsed.config, signingKey: keys.privateKey, providerFactory })
+		const nonces = new Set<string>()
+		const result = await verifyHiddenFunctions(suite, { candidateSourceDigest: sourceDigest, candidateCommit: commit, sessionId: "session", jobId: "job" }, {
+			runner,
+			nonceStore: { async consume(nonce) { if (nonces.has(nonce)) return false; nonces.add(nonce); return true } },
+			publicKey: keys.publicKey.export({ type: "spki", format: "pem" }).toString(),
+		})
+		assert.equal(result.status, "passed")
+		assert.equal(fs.existsSync(guest), false, "the isolated evaluation snapshot is deleted after runner teardown")
 	} finally { fs.rmSync(repo, { recursive: true, force: true }) }
 }
 
