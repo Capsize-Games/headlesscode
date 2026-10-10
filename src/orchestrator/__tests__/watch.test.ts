@@ -26,6 +26,7 @@ import {
 import {
 	defaultState,
 	loadStateSync,
+	patchGroup,
 	saveStateSync,
 	updateGroup,
 	type OrchestratorGroup,
@@ -490,25 +491,20 @@ async function testWatchGroupsRunsReviewForMultipleGroupsConcurrently(): Promise
 						await new Promise((r) => setTimeout(r, 10))
 					}
 					assert.equal(w2Finished, true, "w2 must finish while w1's callback is still blocked")
-					saveStateSync(
-						statePath,
-						updateGroup(loadStateSync(statePath), "w1", {
-							review_verdict: "clean",
-							pending_review_findings: [],
-							reviewed_at: new Date().toISOString(),
-						}),
-					)
-					return undefined
-				}
-				await w1Started
-				saveStateSync(
-					statePath,
-					updateGroup(loadStateSync(statePath), "w2", {
+					// Use the production callback's lock so cost writes cannot erase a verdict.
+					await patchGroup(statePath, "w1", {
 						review_verdict: "clean",
 						pending_review_findings: [],
 						reviewed_at: new Date().toISOString(),
-					}),
-				)
+					})
+					return undefined
+				}
+				await w1Started
+				await patchGroup(statePath, "w2", {
+					review_verdict: "clean",
+					pending_review_findings: [],
+					reviewed_at: new Date().toISOString(),
+				})
 				w2Finished = true
 				return undefined
 			},
