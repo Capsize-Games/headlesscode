@@ -33,9 +33,10 @@ async function testSessionsCliArchiveCommands(): Promise<void> {
 		const listed = await capture(() => sessionsMain(["list", "--workspace", workspace]))
 		assert.equal(listed.code, 0)
 		assert.match(listed.stdout, new RegExp(id))
+		assert.equal(listed.stdout.trim().split("\n").length, 1)
 		const shown = await capture(() => sessionsMain(["show", id, "--workspace", workspace]))
 		assert.equal(shown.code, 0)
-		assert.match(shown.stdout, /"provider": "claude"/)
+		assert.equal(JSON.parse(shown.stdout).id, id)
 		const exported = await capture(() => sessionsMain(["export", id, "--workspace", workspace, "--out", out]))
 		assert.equal(exported.code, 0)
 		assert.equal(JSON.parse(await fs.readFile(out, "utf8")).id, id)
@@ -44,6 +45,8 @@ async function testSessionsCliArchiveCommands(): Promise<void> {
 		const repeatedExport = await capture(() => sessionsMain(["export", id, "--workspace", workspace, "--out", out]))
 		assert.equal(repeatedExport.code, 2)
 		assert.deepEqual(await fs.readFile(out), existingBytes)
+		const exportStdout = await capture(() => sessionsMain(["export", id, "--workspace", workspace]))
+		assert.equal(JSON.parse(exportStdout.stdout).id, id)
 		const forked = await capture(() => sessionsMain(["fork", id, "--workspace", workspace]))
 		assert.equal(forked.code, 0)
 		assert.match(forked.stdout, /Forked/)
@@ -59,7 +62,7 @@ async function testCliSanitizesTerminalControlFromPaths(): Promise<void> {
 	await fs.mkdir(scratchRoot, { recursive: true })
 	const directory = await fs.mkdtemp(path.join(scratchRoot, "sessions-cli-terminal-"))
 	const workspace = path.join(directory, "workspace")
-	const source = path.join(directory, "unsafe\u001b[31mname.jsonl")
+	const source = path.join(directory, "unsafe\u001b[31mname\nbad.jsonl")
 	const original = process.env.HEADLESSCODE_DATA_DIR
 	try {
 		await fs.mkdir(workspace, { recursive: true })
@@ -68,7 +71,15 @@ async function testCliSanitizesTerminalControlFromPaths(): Promise<void> {
 		const result = await capture(() => sessionsMain(["import", "--from", "claude", "--file", source, "--workspace", workspace]))
 		assert.equal(result.code, 0)
 		assert.doesNotMatch(result.stdout, /\u001b/)
-		assert.match(result.stdout, /unsafename/)
+		assert.equal(result.stdout.trim().split("\n").length, 3)
+		assert.match(result.stdout, /unsafename bad/)
+		const id = result.stdout.match(/Imported claude session as ([0-9a-f-]{36})/)?.[1]
+		assert.ok(id)
+		const listed = await capture(() => sessionsMain(["list", "--workspace", workspace]))
+		assert.equal(listed.stdout.trim().split("\n").length, 1)
+		assert.doesNotMatch(listed.stdout, /\u001b/)
+		const shown = await capture(() => sessionsMain(["show", id, "--workspace", workspace]))
+		assert.equal(JSON.parse(shown.stdout).id, id)
 	} finally {
 		if (original === undefined) delete process.env.HEADLESSCODE_DATA_DIR
 		else process.env.HEADLESSCODE_DATA_DIR = original
@@ -85,6 +96,7 @@ async function testSessionsCliUsageErrorsAreActionable(): Promise<void> {
 	const help = await capture(() => sessionsMain(["--help"]))
 	assert.equal(help.code, 0)
 	assert.match(help.stdout, /headlesscode sessions/)
+	assert.ok(help.stdout.includes("\n  headlesscode sessions discover"), "help retains its multiline command layout")
 	const museDiscovery = await capture(() => sessionsMain(["discover", "--from", "muse"]))
 	assert.equal(museDiscovery.code, 2)
 	assert.match(museDiscovery.stderr, /workspace metadata discovery is not supported/)
