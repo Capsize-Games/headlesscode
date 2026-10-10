@@ -49,4 +49,5 @@ A verbatim copy of the Apache License 2.0 is provided in
 excluded files is in
 [`src/vendor/zoo-code/VENDOR-NOTES.md`](./src/vendor/zoo-code/VENDOR-NOTES.md).
 
-The Apache license applies to the Zoo Code-derived material identified above.
+HeadlessCode source is licensed under Apache-2.0. The Zoo Code-derived material
+identified above retains its original copyright and attribution.
