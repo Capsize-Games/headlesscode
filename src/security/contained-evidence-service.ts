@@ -20,14 +20,23 @@ export async function startContainedEvidenceService(options: {
 	const sessions = [...new Set(options.sessionIds)]
 	if (!sessions.length || sessions.length !== options.sessionIds.length) throw new Error("provide one or more unique per-worker session IDs")
 	for (const sessionId of sessions) if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) throw new Error(`invalid evidence session ID: ${sessionId}`)
+	const storagePath = path.resolve(options.storageDir)
+	const configPath = path.resolve(options.configDirectory)
+	const socketPath = path.resolve(options.socketPath)
+	const repoPath = options.repoRoot ? fs.realpathSync(path.resolve(options.repoRoot)) : undefined
+	assertNoSymlinkAncestors(storagePath)
+	assertNoSymlinkAncestors(configPath)
+	assertNoSymlinkAncestors(path.dirname(socketPath))
+	const requestedRoots = [storagePath, configPath, socketPath, ...(repoPath ? [repoPath] : [])]
+	for (let i = 0; i < requestedRoots.length; i++) {
+		for (let j = i + 1; j < requestedRoots.length; j++) if (overlaps(requestedRoots[i]!, requestedRoots[j]!)) throw new Error("evidence storage, config, socket, and repository paths must be separate")
+	}
 	const storageDir = preparePrivateDirectory(options.storageDir)
 	const configDirectory = preparePrivateDirectory(options.configDirectory)
-	const socketPath = path.resolve(options.socketPath)
 	if (Buffer.byteLength(socketPath) > 100) throw new Error("Unix evidence socket path is too long for the local runtime; choose a shorter protected path")
 	assertNoSymlinkAncestors(path.dirname(socketPath))
 	if (fs.existsSync(socketPath)) throw new Error("refusing to replace an existing evidence socket path")
-	const roots = [storageDir, configDirectory, socketPath]
-	if (options.repoRoot) roots.push(fs.realpathSync(path.resolve(options.repoRoot)))
+	const roots = [storageDir, configDirectory, socketPath, ...(repoPath ? [repoPath] : [])]
 	for (let i = 0; i < roots.length; i++) {
 		for (let j = i + 1; j < roots.length; j++) if (overlaps(roots[i]!, roots[j]!)) throw new Error("evidence storage, config, socket, and repository paths must be separate")
 	}
