@@ -303,7 +303,7 @@ export async function chatMain(argv: string[], deps: ChatCliDependencies): Promi
 			case "import": {
 				if (args.length !== 2) { renderer.writeError("Usage: /import <provider> <file>"); return true }
 				const provider = args[0] as SessionProvider
-				if (!["headlesscode", "claude", "codex", "muse"].includes(provider)) { renderer.writeError(`Unsupported import provider '${args[0]}'.`); return true }
+				if (!["claude", "codex", "muse"].includes(provider)) { renderer.writeError(`Unsupported import provider '${args[0]}'.`); return true }
 				await handleImport(provider, args[1]); return true
 			}
 			default: renderer.writeError(`Unknown command '/${name}'. Use /help to see supported commands.`); return true
@@ -332,6 +332,12 @@ export async function chatMain(argv: string[], deps: ChatCliDependencies): Promi
 		while (!exitRequested) {
 			const next = await readComposedInput(input, terminal)
 			if (next.kind === "eof") { exitRequested = true; break }
+			if (next.kind === "overflow") {
+				renderer.writeError("Input backlog exceeded its safety limit. Buffered input was discarded; restart chat and send fewer lines at once.")
+				exitRequested = true
+				exitCode = 1
+				break
+			}
 			if (next.kind === "interrupt") { renderer.writeNotice("Input cancelled."); continue }
 			if (next.kind === "too-long") { renderer.writeError("Message exceeds the 50,000-character limit and was discarded."); continue }
 			const prompt = next.text

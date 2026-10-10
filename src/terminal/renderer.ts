@@ -1,6 +1,5 @@
 import type { Writable } from "node:stream"
 
-const MAX_EVENT_CHARS = 16 * 1024
 const MAX_STATUS_CHARS = 2 * 1024
 const MAX_TURN_RENDERED_CHARS = 256 * 1024
 const MAX_TURN_STATUS_EVENTS = 1_000
@@ -14,6 +13,7 @@ export interface TerminalRendererOptions {
 /** Plain-text terminal renderer. Untrusted event values are stripped of controls before output. */
 export class TerminalRenderer {
 	private streamedText = ""
+	private turnRenderedChars = 0
 	private currentTextLineOpen = false
 	private streamTruncated = false
 	private statusEventCount = 0
@@ -37,6 +37,7 @@ export class TerminalRenderer {
 
 	startTurn(): void {
 		this.streamedText = ""
+		this.turnRenderedChars = 0
 		this.currentTextLineOpen = false
 		this.streamTruncated = false
 		this.statusEventCount = 0
@@ -44,33 +45,22 @@ export class TerminalRenderer {
 	}
 
 	renderEvent(type: string, fields: Record<string, unknown>): void {
-		if (this.statusEventCount >= MAX_TURN_STATUS_EVENTS) {
+		const normalized = type.toLowerCase()
+		const isTextDelta = normalized === "llm_stream_chunk" || normalized === "text_delta" || normalized === "assistant_delta" || normalized === "stream_text"
+		if (!isTextDelta && this.statusEventCount >= MAX_TURN_STATUS_EVENTS) {
 			if (!this.statusEventsTruncated) {
 				this.statusEventsTruncated = true
 				this.writeStatus("Turn activity display limit reached; additional status events were omitted.", "yellow")
 			}
 			return
 		}
-		this.statusEventCount++
-		const normalized = type.toLowerCase()
+		if (!isTextDelta) this.statusEventCount++
 		if (normalized === "llm_stream_chunk" || normalized === "text_delta" || normalized === "assistant_delta" || normalized === "stream_text") {
 			const kind = typeof fields.kind === "string" ? fields.kind : "text"
 			if (kind !== "text") return
 			const chunk = asString(fields.chunk ?? fields.text ?? fields.delta)
 			if (!chunk) return
-			const safe = sanitizeTerminalText(chunk).slice(0, MAX_EVENT_CHARS)
-			const remaining = MAX_TURN_RENDERED_CHARS - this.streamedText.length
-			const visible = safe.slice(0, Math.max(0, remaining))
-			if (visible) {
-				this.options.output.write(visible)
-				this.streamedText += visible
-				this.currentTextLineOpen = !visible.endsWith("\n")
-			}
-			if (visible.length < safe.length && !this.streamTruncated) {
-				this.streamTruncated = true
-				this.endStreamLine()
-				this.writeStatus("Turn output display limit reached; remaining text was not rendered.", "yellow")
-			}
+			this.streamedText += this.writeTurnText(chunk)
 			return
 		}
 		if (normalized === "tool_call" || normalized === "tool_start" || normalized === "tool_status") {
@@ -96,7 +86,7 @@ export class TerminalRenderer {
 		}
 		if (normalized === "history_warning" || normalized === "history_truncated") {
 			this.endStreamLine()
-			this.writeNotice(asString(fields.message) || "Some prior history was truncated before this turn.")
+			this.writeNotice(asString(fields.warning ?? fields.message) || "Some prior history was truncated before this turn.")
 			return
 		}
 		if (normalized === "iteration" || normalized === "iteration_start" || normalized === "status") {
@@ -121,10 +111,16 @@ export class TerminalRenderer {
 	}
 
 	finishTurn(resultText: string, status: "success" | "error", cancelled = false): void {
+		const safeResult = sanitizeTerminalText(resultText)
+		if (safeResult && this.streamedText && safeResult.startsWith(this.streamedText)) {
+			this.streamedText += this.writeTurnText(safeResult.slice(this.streamedText.length))
+		} else if (safeResult && !this.streamedText) {
+			this.streamedText += this.writeTurnText(safeResult)
+		} else if (safeResult) {
+			this.endStreamLine()
+			this.streamedText += this.writeTurnText(`Final response:\n${safeResult}`)
+		}
 		this.endStreamLine()
-		const safeResult = sanitizeTerminalText(resultText).slice(0, MAX_EVENT_CHARS)
-		if (safeResult && !this.streamedText) this.writeBlock(safeResult)
-		else if (safeResult && !safeResult.startsWith(this.streamedText)) this.writeBlock(`Final response:\n${safeResult}`)
 		this.writeStatus(cancelled ? "Turn cancelled." : `Turn ${status}.`, cancelled ? "yellow" : status === "success" ? "green" : "red")
 	}
 
@@ -133,8 +129,23 @@ export class TerminalRenderer {
 		this.currentTextLineOpen = false
 	}
 
-	private writeBlock(text: string): void {
-		for (const line of text.split("\n")) this.writeWrapped(line)
+	private writeTurnText(text: string): string {
+		const remaining = Math.max(0, MAX_TURN_RENDERED_CHARS - this.turnRenderedChars)
+		const inputLimit = remaining + 1
+		const sourceTruncated = text.length > inputLimit
+		const safe = sanitizeTerminalText(text.slice(0, inputLimit))
+		const visible = safe.slice(0, remaining)
+		if (visible) {
+			this.options.output.write(visible)
+			this.turnRenderedChars += visible.length
+			this.currentTextLineOpen = !visible.endsWith("\n")
+		}
+		if ((sourceTruncated || visible.length < safe.length) && !this.streamTruncated) {
+			this.streamTruncated = true
+			this.endStreamLine()
+			this.writeStatus("Turn output display limit reached; remaining text was not rendered.", "yellow")
+		}
+		return visible
 	}
 
 	writeStatus(text: string, color?: "red" | "green" | "yellow" | "blue" | "cyan"): void {
@@ -142,16 +153,6 @@ export class TerminalRenderer {
 		const width = this.columns()
 		const lines = width && width > 0 ? wrapPlainText(safe, Math.max(1, width)) : [safe]
 		for (const line of lines) this.options.output.write(`${this.paint(line, color)}\n`)
-	}
-
-	private writeWrapped(text: string): void {
-		const width = this.columns()
-		if (!width || width < 1) {
-			this.options.output.write(`${text}\n`)
-			return
-		}
-		const lines = wrapPlainText(text, Math.max(1, width))
-		this.options.output.write(`${lines.join("\n")}\n`)
 	}
 
 	private paint(text: string, color?: "red" | "green" | "yellow" | "blue" | "cyan"): string {
