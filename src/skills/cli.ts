@@ -11,22 +11,30 @@ import {
 	parseSkillManifest,
 	skillFilesDigest,
 	snapshotSkillFiles,
+	type DiscoverSkillOptions,
 	type SkillProblem,
 } from "./registry.js"
 import { enableSkillRoot, readEnabledSkillRoots } from "./store.js"
 
 export interface SkillsCliIO {
 	workspaceRoot?: string
+	/** Discovery overrides for isolated tests and embedding providers. */
+	includeUserRoots?: DiscoverSkillOptions["includeUserRoots"]
+	userRoot?: DiscoverSkillOptions["userRoot"]
 	stdout?: (text: string) => void
 	stderr?: (text: string) => void
 }
 
+function sanitizeTerminalText(text: string): string {
+	return text.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ")
+}
+
 function output(io: SkillsCliIO, text: string): void {
-	(io.stdout ?? ((value) => process.stdout.write(value)))(text)
+	(io.stdout ?? ((value) => process.stdout.write(value)))(sanitizeTerminalText(text))
 }
 
 function errorOutput(io: SkillsCliIO, text: string): void {
-	(io.stderr ?? ((value) => process.stderr.write(value)))(text)
+	(io.stderr ?? ((value) => process.stderr.write(value)))(sanitizeTerminalText(text))
 }
 
 interface InspectedSkill {
@@ -154,7 +162,17 @@ export async function runSkillsCli(argv: string[], io: SkillsCliIO = {}): Promis
 			output(io, `Imported: ${imported.names.join(", ")}\n`)
 			return 0
 		}
-		const registry = await discoverSkills(workspaceRoot, { enabledRoots: await readEnabledSkillRoots() })
+		let enabledRoots: string[] = []
+		try {
+			enabledRoots = await readEnabledSkillRoots()
+		} catch (error) {
+			errorOutput(io, `warning: enabled roots ignored: ${error instanceof Error ? error.message : String(error)}\n`)
+		}
+		const registry = await discoverSkills(workspaceRoot, {
+			enabledRoots,
+			includeUserRoots: io.includeUserRoots,
+			userRoot: io.userRoot,
+		})
 		if (command === "list") {
 			for (const skill of registry.skills) output(io, `${skill.name}\t${skill.description}\t${skill.source}\n`)
 			for (const problem of registry.problems) errorOutput(io, `warning: ${problem.path}: ${problem.message}\n`)

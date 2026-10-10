@@ -14,10 +14,6 @@ const scratch = path.join(process.cwd(), ".headlesscode", "scratch")
 async function fixtureRoot(): Promise<string> {
 	await fs.mkdir(scratch, { recursive: true })
 	const root = await fs.mkdtemp(path.join(scratch, `skills-${process.pid}-`))
-	const home = path.join(root, "home")
-	await fs.mkdir(home, { recursive: true })
-	process.env.HOME = home
-	process.env.USERPROFILE = home
 	process.env.HEADLESSCODE_DATA_DIR = path.join(root, "data")
 	return root
 }
@@ -60,7 +56,7 @@ async function testValidInvalidManifestAndBoundedReference(): Promise<void> {
 		const binaryDir = await writeSkill(skills, "binary-skill", "binary-skill", "Binary assets are optional.")
 		await fs.mkdir(path.join(binaryDir, "references"), { recursive: true })
 		await fs.writeFile(path.join(binaryDir, "references", "image.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00]))
-		const registry = await discoverSkills(root, { enabledRoots: [skills] })
+		const registry = await discoverSkills(root, { enabledRoots: [skills], includeUserRoots: false })
 		assert.equal(registry.skills.length, 3)
 		assert.equal(registry.get("valid-skill")?.instructions, "Follow these steps.")
 		assert.ok(registry.get("oversized-skill"), "an oversized optional resource does not invalidate its manifest")
@@ -87,7 +83,7 @@ async function testDuplicatePrecedenceAndEnabledRoots(): Promise<void> {
 		const managed = path.join(root, "data", "skills")
 		await writeSkill(enabled, "same-name", "same-name", "enabled copy")
 		await writeSkill(managed, "same-name", "same-name", "managed copy")
-		const registry = await discoverSkills(root, { enabledRoots: [enabled] })
+		const registry = await discoverSkills(root, { enabledRoots: [enabled], includeUserRoots: false })
 		assert.equal(registry.get("same-name")?.source, "enabled")
 		assert.equal(registry.get("same-name")?.instructions, "enabled copy")
 		assert.ok(registry.problems.some((problem) => problem.message.includes("duplicate skill 'same-name'")))
@@ -105,7 +101,7 @@ async function testSymlinksAreReported(): Promise<void> {
 		const actual = await writeSkill(root, "linked-skill", "linked-skill", "Do not follow symlinks")
 		await fs.mkdir(skills, { recursive: true })
 		await fs.symlink(actual, path.join(skills, "linked"), "dir")
-		const registry = await discoverSkills(root, { enabledRoots: [skills] })
+		const registry = await discoverSkills(root, { enabledRoots: [skills], includeUserRoots: false })
 		assert.equal(registry.skills.length, 0)
 		assert.ok(registry.problems.some((problem) => problem.message.includes("symlink")))
 	} finally {
@@ -121,7 +117,7 @@ async function testSymlinkedParentAndExplicitValidatePath(): Promise<void> {
 		await writeSkill(actualSkills, "valid", "valid", "valid")
 		const linked = path.join(root, "linked")
 		await fs.symlink(actual, linked, "dir")
-		const registry = await discoverSkills(root, { enabledRoots: [path.join(linked, "skills")] })
+		const registry = await discoverSkills(root, { enabledRoots: [path.join(linked, "skills")], includeUserRoots: false })
 		assert.equal(registry.skills.length, 0)
 		assert.ok(registry.problems.some((problem) => problem.message.includes("symlink path component")))
 
@@ -133,6 +129,7 @@ async function testSymlinkedParentAndExplicitValidatePath(): Promise<void> {
 			workspaceRoot: root,
 			stdout: (text) => output.push(text),
 			stderr: (text) => output.push(text),
+			includeUserRoots: false,
 		})
 		assert.equal(status, 1)
 		assert.match(output.join(""), /invalid:.*frontmatter/)
@@ -144,17 +141,46 @@ async function testSymlinkedParentAndExplicitValidatePath(): Promise<void> {
 async function testDefaultRootsAndProjectOptIn(): Promise<void> {
 	const root = await fixtureRoot()
 	try {
-		const userSkills = path.join(process.env.HOME!, ".agents", "skills")
+		const userSkills = path.join(root, "operator", "skills")
 		const projectSkills = path.join(root, ".agents", "skills")
+		const managedSkills = path.join(root, "data", "skills")
 		await writeSkill(userSkills, "user-skill", "user-skill", "User skill")
 		await writeSkill(projectSkills, "project-skill", "project-skill", "Project skill")
-		let registry = await discoverSkills(root)
+		await writeSkill(managedSkills, "managed-skill", "managed-skill", "Managed skill")
+		let registry = await discoverSkills(root, { userRoot: userSkills })
 		assert.ok(registry.get("user-skill"))
+		assert.ok(registry.get("managed-skill"), "managed roots remain enabled when user roots are included")
 		assert.equal(registry.get("project-skill"), undefined, "project skill roots need explicit enablement")
+		registry = await discoverSkills(root, { userRoot: userSkills, includeUserRoots: false })
+		assert.equal(registry.get("user-skill"), undefined, "isolated discovery does not scan the actual or injected user root")
+		assert.ok(registry.get("managed-skill"), "disabling user roots retains the managed root")
 		const output: string[] = []
 		assert.equal(await runSkillsCli(["enable", projectSkills], { workspaceRoot: root, stdout: (value) => output.push(value) }), 0)
-		registry = await discoverSkills(root, { enabledRoots: await readEnabledSkillRoots() })
+		registry = await discoverSkills(root, { enabledRoots: await readEnabledSkillRoots(), includeUserRoots: false })
 		assert.ok(registry.get("project-skill"))
+	} finally {
+		await fs.rm(root, { recursive: true, force: true })
+	}
+}
+
+async function testMalformedEnabledRootsAreDiagnosedAndTerminalTextIsSanitized(): Promise<void> {
+	const root = await fixtureRoot()
+	try {
+		const managed = path.join(root, "data", "skills")
+		const skillDir = await writeSkill(managed, "terminal-copy", "terminal-copy", "instructions")
+		await fs.writeFile(path.join(skillDir, "SKILL.md"), `---\nname: terminal-copy\ndescription: ${JSON.stringify("Hello \u001b[2Jworld\nnext line")}\n---\ninstructions\n`)
+		await fs.writeFile(path.join(root, "data", "skills-enabled.json"), "{ malformed")
+		const output: string[] = []
+		const status = await runSkillsCli(["list"], {
+			workspaceRoot: root,
+			includeUserRoots: false,
+			stdout: (text) => output.push(text),
+			stderr: (text) => output.push(text),
+		})
+		assert.equal(status, 0, "a malformed optional enabled-root file does not prevent listing default roots")
+		assert.match(output.join(""), /warning: enabled roots ignored: could not read enabled skill roots/)
+		assert.match(output.join(""), /Hello  \[2Jworld next line/)
+		assert.ok(!output.join("").includes("\u001b"), "terminal escape sequences are stripped from CLI output")
 	} finally {
 		await fs.rm(root, { recursive: true, force: true })
 	}
@@ -189,8 +215,8 @@ async function testEnablePersistsAnExplicitRoot(): Promise<void> {
 		const output: string[] = []
 		const io = { workspaceRoot: root, stdout: (text: string) => output.push(text), stderr: (text: string) => output.push(text) }
 		assert.equal(await runSkillsCli(["enable", external], io), 0)
-		assert.equal(await runSkillsCli(["list"], io), 0)
-		assert.match(output.join(""), /operator-skill\tInstructions for operator-skill\tenabled/)
+		assert.equal(await runSkillsCli(["list"], { ...io, includeUserRoots: false }), 0)
+		assert.match(output.join(""), /operator-skill Instructions for operator-skill enabled/)
 	} finally {
 		await fs.rm(root, { recursive: true, force: true })
 	}
@@ -225,7 +251,7 @@ async function testMockSessionActivatesCapturedSkillWithinMode(): Promise<void> 
 	try {
 		const skillRoot = path.join(root, "enabled")
 		await writeSkill(skillRoot, "guide", "guide", "Use the project read-only workflow.")
-		const registry = await discoverSkills(root, { enabledRoots: [skillRoot] })
+		const registry = await discoverSkills(root, { enabledRoots: [skillRoot], includeUserRoots: false })
 		const client = new ScriptedClient([
 			(request) => {
 				assert.ok(request.tools?.some((tool) => tool.type === "function" && tool.function.name === "skill"))
@@ -274,6 +300,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["symlinked skills are reported", testSymlinksAreReported],
 	["symlink parents are rejected and validate accepts a local path", testSymlinkedParentAndExplicitValidatePath],
 	["default user skills and project opt-in", testDefaultRootsAndProjectOptIn],
+	["malformed enabled-root config is diagnosed and terminal output is sanitized", testMalformedEnabledRootsAreDiagnosedAndTerminalTextIsSanitized],
 	["local imports are offline and idempotent", testImportIsOfflineAndIdempotent],
 	["enable records a root for discovery", testEnablePersistsAnExplicitRoot],
 	["mocked session activates a captured skill without widening mode tools", testMockSessionActivatesCapturedSkillWithinMode],

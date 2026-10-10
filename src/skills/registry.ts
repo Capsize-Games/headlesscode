@@ -45,6 +45,9 @@ export interface SkillRegistry {
 export interface DiscoverSkillOptions {
 	enabledRoots?: readonly string[]
 	includeProjectRoot?: boolean
+	/** Include `~/.agents/skills` unless disabled. Tests can inject a safe root. */
+	includeUserRoots?: boolean
+	userRoot?: string
 }
 
 interface RootSpec {
@@ -239,7 +242,9 @@ export function defaultSkillRoots(workspaceRoot: string, options: DiscoverSkillO
 	if (options.includeProjectRoot) roots.push({ path: path.join(workspaceRoot, ".agents", "skills"), source: "enabled" })
 	for (const root of options.enabledRoots ?? []) roots.push({ path: path.resolve(root), source: "enabled" })
 	roots.push({ path: path.join(projectStoreRoot(), "skills"), source: "headlesscode" })
-	roots.push({ path: path.join(os.homedir(), ".agents", "skills"), source: "agents" })
+	if (options.includeUserRoots !== false) {
+		roots.push({ path: options.userRoot ?? path.join(os.homedir(), ".agents", "skills"), source: "agents" })
+	}
 	return roots
 }
 

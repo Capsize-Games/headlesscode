@@ -2035,9 +2035,14 @@ export class HeadlessSession {
 	async run(): Promise<SessionResult> {
 		const { workspaceRoot, mode, model } = this.config
 		if (!this.skillRegistry) {
+			let enabledRoots: string[] = []
 			try {
-				const enabledRoots = await readEnabledSkillRoots()
-				const includeProjectRoot = enabledRoots.includes(path.resolve(workspaceRoot, ".agents", "skills"))
+				enabledRoots = await readEnabledSkillRoots()
+			} catch (error) {
+				this.logger.warn("[skills] enabled roots unavailable; continuing with default roots", { error: String(error) })
+			}
+			const includeProjectRoot = enabledRoots.includes(path.resolve(workspaceRoot, ".agents", "skills"))
+			try {
 				this.skillRegistry = await discoverSkills(workspaceRoot, { enabledRoots, includeProjectRoot })
 				for (const problem of this.skillRegistry.problems) this.logger.warn("[skills] discovery issue", problem)
 			} catch (error) {
