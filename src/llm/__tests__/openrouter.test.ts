@@ -105,7 +105,8 @@ async function testOpenRouterUsageCostAndGenerationMetadataAreMapped(): Promise<
 		assert.equal(response.usage?.reasoningTokens, 2)
 		assert.equal(response.usage?.openRouterReportedCostUsd, 0.00012)
 		assert.equal(response.usage?.cacheDiscountUsd, 0.00003)
-		const metadata = await client.fetchGenerationMetadata(response.generationId!)
+		assert.ok(response.generationId)
+		const metadata = await client.fetchGenerationMetadata(response.generationId)
 		assert.deepEqual(metadata, {
 			id: "gen-abc-123", model: "meta/muse-spark-1.3-contributor", providerName: "Meta",
 			totalCostUsd: 0.00012, upstreamInferenceCostUsd: 0.00011, cacheDiscountUsd: 0.00003,
