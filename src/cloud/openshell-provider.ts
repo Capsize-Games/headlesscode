@@ -447,6 +447,7 @@ export class OpenShellSessionProvider implements CloudProvider {
 				socketPath: profile.evidenceGuestPath,
 				capability: this.evidenceRuntimeConfig.capability,
 				pinnedPublicKey: this.evidenceRuntimeConfig.pinnedPublicKey,
+				evidenceRequired: true,
 			}), { flag: "wx", mode: 0o400 })
 			fs.chmodSync(evidenceRuntimePath, 0o400)
 			mounts.push({ type: "bind", source: profile.evidenceSocketPath, target: profile.evidenceGuestPath, read_only: false })

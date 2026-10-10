@@ -4,7 +4,7 @@ import * as fs from "node:fs"
 import * as net from "node:net"
 import * as os from "node:os"
 import * as path from "node:path"
-import { assertEffectiveOpenShellPolicy, containedGuestEnvironment, resolveContainedRuntimeProfile, verifyContainedPrerequisites } from "../profile.js"
+import { assertEffectiveOpenShellPolicy, cleanupContainedRuntimeProfile, containedGuestEnvironment, loadResolvedContainedProfile, resolveContainedRuntimeProfile, serializeResolvedContainedProfile, verifyContainedPrerequisites } from "../profile.js"
 import type { OpenShellProbe, OpenShellProbeResult } from "../profile.js"
 
 const scratchRoot = path.join(process.cwd(), ".headlesscode", "scratch")
@@ -123,7 +123,14 @@ const tests: Array<[string, () => Promise<void>]> = [
 			assert.equal(resolved.cpu, "2")
 			assert.equal(resolved.memory, "4Gi")
 			assert.equal(resolved.evidenceRequired, true)
-			fs.rmSync(resolved.policySnapshotDir, { recursive: true, force: true })
+			const transferred = loadResolvedContainedProfile(serializeResolvedContainedProfile(resolved))
+			assert.deepEqual(transferred.providers, resolved.providers)
+			assert.ok(Object.isFrozen(transferred.providers) && Object.isFrozen(transferred.allowedGuestEnv), "deserialized arrays are immutable")
+			const malformed = JSON.parse(serializeResolvedContainedProfile(resolved)) as Record<string, unknown>
+			malformed.allowedGuestEnv = ["HEADLESSCODE_OPENROUTER_API_KEY"]
+			assert.throws(() => loadResolvedContainedProfile(JSON.stringify(malformed)), /allowlist/)
+			cleanupContainedRuntimeProfile(resolved)
+			assert.equal(fs.existsSync(resolved.policySnapshotDir), false)
 		} finally { await f.close() }
 	}],
 	["rejects profile and policy tampering", async () => {

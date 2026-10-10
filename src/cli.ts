@@ -44,7 +44,8 @@ import { costHistoryCliMain } from "./orchestrator/cost-history-cli.js"
 import { resolvePermissions, type PermissionsConfig } from "./permissions/config.js"
 import { resolveModelForMode, resolveReasoningEffortForMode } from "./config/mode-models.js"
 import { openShellSessionMain } from "./cloud/openshell-session.js"
-import { resolveContainedRuntimeProfile, resolveSecurityProfile, serializeResolvedContainedProfile, type SecurityProfileName } from "./security/profile.js"
+import { cleanupContainedRuntimeProfile, resolveContainedRuntimeProfile, resolveSecurityProfile, serializeResolvedContainedProfile, type SecurityProfileName } from "./security/profile.js"
+import { evidenceJournalFromEnv, evidenceJournalFromProtectedConfigFile, runEvidenceCli } from "./evidence/index.js"
 
 const VERSION = "0.1.0"
 
@@ -293,10 +294,11 @@ Options:
   --task <text>              The task description for the agent
   --task-file <path>         Read the task from a file (relative to workspace)
   --workspace <root>         Workspace root (default: $HEADLESSCODE_WORKSPACE_ROOT or cwd)
-  --session-id <id>          Explicit session id override (default: a fresh UUID).
-                             Used by the dashboard's session-launch endpoint so
-                             the browser can open the session's event view
-                             immediately; rarely needed from a terminal.
+  --session-id <id>          Explicit session id (default: a fresh UUID).
+                             Required for contained runs and must match a
+                             provisioned per-session evidence config. The
+                             dashboard uses this to open the session event
+                             view immediately.
   --model <id>               OpenRouter model id (default: $OPENROUTER_MODEL or deepseek/deepseek-v4-flash-0731)
   --max-iterations <n>       Loop iteration cap (default: 250 — see DEFAULT_MAX_ITERATIONS
                                in src/engine/loop.ts)
@@ -738,6 +740,11 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 }
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
+	if (argv[0] === "evidence") return runEvidenceCli(argv.slice(1))
+	if (argv[0] === "control") {
+		const { controlMain } = await import("./control/cli.js")
+		return controlMain(argv.slice(1))
+	}
 	if (argv[0] === "openshell-review-session" || argv[0] === "openshell-qa-session") {
 		let payload: Record<string, unknown>
 		try {
@@ -1130,6 +1137,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 	}
 	if (options.securityProfile === "contained") {
 		try {
+			if (!options.sessionId) throw new Error("contained single-session launches require --session-id matching a provisioned per-session evidence config")
 			const profile = resolveContainedRuntimeProfile({ repoRoot: workspaceRoot, purpose: "worker" })
 			process.env.HEADLESSCODE_OPENSHELL_POLICY = profile.policySnapshotPath
 			process.env.HEADLESSCODE_OPENSHELL_IMAGE = profile.image
@@ -1139,12 +1147,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 			process.env.HEADLESSCODE_CONTAINED_PROFILE_SHA256 = profile.profileSha256
 			process.env.HEADLESSCODE_CONTAINED_POLICY_SHA256 = profile.policySha256
 			process.env.HEADLESSCODE_CONTAINED_RUNTIME_PROFILE_JSON = serializeResolvedContainedProfile(profile)
-			return openShellSessionMain([
+			try {
+				return await openShellSessionMain([
 				"--repo", workspaceRoot,
 				"--task", taskText,
 				"--mode", options.mode,
+				"--name", options.sessionId,
 				...(options.model ? ["--model", options.model] : []),
-			], { containedProfile: profile })
+				], { containedProfile: profile })
+			} finally {
+				cleanupContainedRuntimeProfile(profile)
+			}
 		} catch (error) {
 			process.stderr.write(`headlesscode: contained security preflight failed: ${error instanceof Error ? error.message : String(error)}\n`)
 			return 2
@@ -1559,6 +1572,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		return 2
 	}
 
+	let evidenceRuntime
+	try {
+		const evidenceConfigPath = process.env.HEADLESSCODE_EVIDENCE_CONFIG_PATH
+		evidenceRuntime = evidenceConfigPath
+			? await evidenceJournalFromProtectedConfigFile(evidenceConfigPath, { expectedSessionId: options.sessionId, forbiddenRoots: [workspaceRoot] })
+			: evidenceJournalFromEnv()
+		if (process.env.HEADLESSCODE_SECURITY_PROFILE === "contained" && (!evidenceRuntime || !evidenceRuntime.evidenceRequired)) throw new Error("contained guest runtime requires evidence and an authenticated supervisor config")
+	} catch (error) {
+		process.stderr.write(`headlesscode: invalid evidence runtime configuration: ${error instanceof Error ? error.message : String(error)}\n`)
+		return 2
+	}
 	const session = new HeadlessSession({
 		workspaceRoot,
 		sessionId: options.sessionId,
@@ -1603,6 +1627,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 		maxTokens,
 		maxPauseMs,
 		permissions,
+		...(evidenceRuntime ? { sessionId: evidenceRuntime.sessionId, evidenceJournal: evidenceRuntime.evidenceJournal, evidenceRequired: evidenceRuntime.evidenceRequired } : {}),
 		// Opt-in local exploration phase (default OFF). Flag OR env var — the
 		// phase itself resolves the remaining HEADLESSCODE_LOCAL_EXPLORE_*
 		// defaults at call time. Any local failure fails open to cloud-only.

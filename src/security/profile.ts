@@ -261,6 +261,7 @@ export function containedGuestEnvironment(
 		if (value !== undefined) result[name] = value
 	}
 	if (profile.purpose === "worker") result.HEADLESSCODE_CODE_MODE_BACKEND = "openrouter"
+	result.HEADLESSCODE_SECURITY_PROFILE = "contained"
 	result.HEADLESSCODE_EVIDENCE_CONFIG_PATH = CONTAINED_EVIDENCE_RUNTIME_PATH
 	for (const name of ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"]) {
 		const value = identity[name]
@@ -355,16 +356,78 @@ export function loadResolvedContainedProfile(serialized: string | undefined): Co
 	if (!serialized) throw new Error("contained execution requires the supervisor's resolved immutable profile identity")
 	let value: unknown
 	try { value = JSON.parse(serialized) as unknown } catch { throw new Error("resolved contained profile identity is invalid JSON") }
-	if (!isRecord(value) || value.name !== "contained" || value.version !== 1 || typeof value.policySnapshotPath !== "string" || typeof value.policySha256 !== "string" || typeof value.profileSha256 !== "string") {
+	if (!isRecord(value) || value.name !== "contained" || value.version !== 1 || typeof value.policySnapshotPath !== "string" || typeof value.policySha256 !== "string" || !HASH.test(value.policySha256) || typeof value.profileSha256 !== "string" || !HASH.test(value.profileSha256)) {
 		throw new Error("resolved contained profile identity is incomplete")
 	}
+	const allowedFields = new Set(["name", "purpose", "version", "profileSha256", "runtimeVersion", "gatewayIdentity", "expectedGatewayIdentity", "expectedEmergencyControllerIdentity", "policySha256", "policySnapshotPath", "image", "cpu", "memory", "providers", "inferenceEndpoint", "evidenceRequired", "evidenceSocketPath", "evidenceGuestPath", "evidencePublicKeyPath", "evidenceGuestPublicKeyPath", "evidencePublicKeyFingerprint", "allowedGuestEnv", "policySnapshotDir"])
+	if (Object.keys(value).some((field) => !allowedFields.has(field))) throw new Error("resolved contained profile contains unrecognized fields")
+	if (value.purpose !== "worker" && value.purpose !== "evaluation") throw new Error("resolved contained profile purpose is invalid")
+	for (const field of ["runtimeVersion", "gatewayIdentity", "expectedGatewayIdentity", "expectedEmergencyControllerIdentity", "image", "cpu", "memory", "evidenceSocketPath", "evidenceGuestPath", "evidencePublicKeyPath", "evidenceGuestPublicKeyPath", "evidencePublicKeyFingerprint", "policySnapshotDir"]) {
+		if (typeof value[field] !== "string" || !value[field]) throw new Error(`resolved contained profile ${field} is invalid`)
+	}
+	if (value.gatewayIdentity !== value.expectedGatewayIdentity || !IMAGE.test(value.image as string) || !/^sha256:[a-f0-9]{64}$/i.test(value.evidencePublicKeyFingerprint as string)) throw new Error("resolved contained profile identities are invalid")
+	if (value.evidenceRequired !== true || !Array.isArray(value.providers) || value.providers.some((item) => typeof item !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(item))) throw new Error("resolved contained profile requirements are invalid")
+	if (!Array.isArray(value.allowedGuestEnv) || value.allowedGuestEnv.some((item) => typeof item !== "string" || !GUEST_ENV.has(item))) throw new Error("resolved contained profile guest environment allowlist is invalid")
+	const endpoint = parseInferenceEndpoint(value.inferenceEndpoint, value.purpose)
+	if (value.inferenceEndpoint !== undefined && !endpoint) throw new Error("resolved contained profile inference endpoint is invalid")
+	const runtimeVersion = value.runtimeVersion as string
+	const gatewayIdentity = value.gatewayIdentity as string
+	const expectedGatewayIdentity = value.expectedGatewayIdentity as string
+	const expectedEmergencyControllerIdentity = value.expectedEmergencyControllerIdentity as string
+	const image = value.image as string
+	const cpu = value.cpu as string
+	const memory = value.memory as string
+	const evidenceSocketPath = value.evidenceSocketPath as string
+	const evidenceGuestPath = value.evidenceGuestPath as string
+	const evidencePublicKeyPath = value.evidencePublicKeyPath as string
+	const evidenceGuestPublicKeyPath = value.evidenceGuestPublicKeyPath as string
+	const evidencePublicKeyFingerprint = value.evidencePublicKeyFingerprint as string
+	const policySnapshotDir = value.policySnapshotDir as string
+	if (gatewayIdentity !== expectedGatewayIdentity || !IMAGE.test(image) || !isPositiveQuantity(cpu) || !isPositiveQuantity(memory) || !/^sha256:[a-f0-9]{64}$/i.test(evidencePublicKeyFingerprint)) throw new Error("resolved contained profile identities or limits are invalid")
+	for (const guestPath of [evidenceGuestPath, evidenceGuestPublicKeyPath]) validateGuestPath(guestPath, "resolved contained profile guest path")
+	for (const hostPath of [evidenceSocketPath, evidencePublicKeyPath, policySnapshotDir]) if (!path.isAbsolute(hostPath)) throw new Error("resolved contained profile host paths must be absolute")
+	if (path.dirname(path.resolve(value.policySnapshotPath)) !== path.resolve(policySnapshotDir)) throw new Error("resolved contained profile snapshot path and directory disagree")
 	const snapshot = safeControlFile(value.policySnapshotPath, "/__contained_no_repo__", "frozen policy")
 	if (sha256(fs.readFileSync(snapshot)) !== value.policySha256) throw new Error("frozen contained policy snapshot changed after approval")
-	return Object.freeze({ ...value, policySnapshotPath: snapshot }) as unknown as ContainedRuntimeProfile
+	const publicKeyPath = safeControlFile(evidencePublicKeyPath, "/__contained_no_repo__", "evidence public key")
+	const publicKey = createPublicKey(fs.readFileSync(publicKeyPath))
+	if (`sha256:${sha256(publicKey.export({ type: "spki", format: "der" }))}` !== evidencePublicKeyFingerprint.toLowerCase()) throw new Error("resolved contained profile evidence key no longer matches its fingerprint")
+	const socketPath = safeSocket(evidenceSocketPath, "/__contained_no_repo__")
+	return Object.freeze({
+		name: "contained",
+		purpose: value.purpose,
+		version: 1,
+		profileSha256: value.profileSha256.toLowerCase(),
+		runtimeVersion,
+		gatewayIdentity,
+		expectedGatewayIdentity,
+		expectedEmergencyControllerIdentity,
+		policySha256: value.policySha256.toLowerCase(),
+		policySnapshotPath: snapshot,
+		image,
+		cpu,
+		memory,
+		providers: Object.freeze([...(value.providers as string[])]),
+		...(endpoint ? { inferenceEndpoint: Object.freeze(endpoint) } : {}),
+		evidenceRequired: true,
+		evidenceSocketPath: socketPath,
+		evidenceGuestPath,
+		evidencePublicKeyPath: publicKeyPath,
+		evidenceGuestPublicKeyPath,
+		evidencePublicKeyFingerprint: evidencePublicKeyFingerprint.toLowerCase(),
+		allowedGuestEnv: Object.freeze([...(value.allowedGuestEnv as string[])]),
+		policySnapshotDir,
+	})
 }
 
 export function serializeResolvedContainedProfile(profile: ContainedRuntimeProfile): string {
 	return JSON.stringify(profile)
+}
+
+export function cleanupContainedRuntimeProfile(profile: ContainedRuntimeProfile): void {
+	const snapshotDir = path.resolve(profile.policySnapshotDir)
+	if (path.dirname(path.resolve(profile.policySnapshotPath)) !== snapshotDir || path.basename(profile.policySnapshotPath) !== "policy.yaml") throw new Error("refusing to remove an unexpected contained policy snapshot")
+	fs.rmSync(snapshotDir, { recursive: true, force: true })
 }
 
 function parseInferenceEndpoint(value: unknown, purpose: ContainedPurpose): { host: string; port: number } | undefined {
