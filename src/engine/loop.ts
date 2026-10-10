@@ -1952,6 +1952,7 @@ export class HeadlessSession {
 		this.evidenceRequired = config.evidenceRequired ?? false
 		this.createChildEvidenceJournal = config.createChildEvidenceJournal
 		this.stopSignal = config.signal
+		this.executor.setAbortSignal(config.signal)
 		this.evidenceFailureHandler = config.evidenceFailureHandler
 		if (this.evidenceRequired && !this.evidenceJournal) throw new Error("evidenceRequired needs an EvidenceJournal")
 		this.eventFeed = new EventFeed(config.workspaceRoot, this.sessionId, (eventType, error) => {
@@ -4822,7 +4823,7 @@ export class HeadlessSession {
 			// the path for file tools, the command for execute_command — never
 			// full content), so the ordering guard keeps them ahead of the
 			// tool_result events. Non-fatal.
-			for (const call of calls) {
+			for (const [callIndex, call] of calls.entries()) {
 				const argSummary = summarizeToolArg(call.name, call.args) ?? ""
 				const truncated = argSummary.length > EVENT_TRUNCATE_CHARS
 				this.scheduleAux(() =>
@@ -4832,6 +4833,8 @@ export class HeadlessSession {
 							this.eventFeed.toolCall({
 								iteration,
 								tool: call.name,
+								callId: `${this.evidenceRunId}:${iteration}:${callIndex}`,
+								commandIdentity: call.name === "execute_command" && typeof call.args.command === "string" ? sha256(call.args.command) : undefined,
 								args: truncated ? argSummary.slice(0, EVENT_TRUNCATE_CHARS) : argSummary,
 								argsTruncated: truncated,
 							}),
@@ -5088,6 +5091,8 @@ export class HeadlessSession {
 							return this.eventFeed.toolResult({
 								iteration,
 								tool: call.name,
+								callId: `${this.evidenceRunId}:${iteration}:${i}`,
+								commandIdentity: call.name === "execute_command" && typeof call.args.command === "string" ? sha256(call.args.command) : undefined,
 								isError,
 								result: preview.text,
 								resultTruncated: preview.truncated,
