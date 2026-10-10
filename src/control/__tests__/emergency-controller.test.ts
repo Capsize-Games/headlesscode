@@ -164,6 +164,87 @@ async function testPersistenceFailureDoesNotPreventEmergencyAbortOrCleanup(): Pr
 	}
 }
 
+async function testStopBypassesStalledResourceRegistration(): Promise<void> {
+	const root = await fs.mkdtemp(path.join(process.cwd(), ".headlesscode", "scratch", "control-test-"))
+	let holdWrites = false
+	let releaseRegistrationWrite!: () => void
+	let registrationWriteStarted!: () => void
+	const heldWrite = new Promise<void>((resolve) => { releaseRegistrationWrite = resolve })
+	const writeStarted = new Promise<void>((resolve) => { registrationWriteStarted = resolve })
+	const control = await EmergencyControl.start({
+		identity: "stalled-resource", stateDirectory: root, socketDirectory, graceMs: 40,
+		persistState: async (file, record) => {
+			if (holdWrites) { registrationWriteStarted(); await heldWrite; return }
+			await fs.writeFile(file, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 })
+		},
+	})
+	let cleanupObservedAbort = false
+	control.registerCleanup("model-request", async ({ signal }) => { cleanupObservedAbort = signal.aborted }, "worker:model-request")
+	try {
+		holdWrites = true
+		const registration = control.registerResource("worker:model-request").catch((error: unknown) => error)
+		await writeStarted
+		const stopping = control.command("stop", "operator emergency stop", "operator:test")
+		assert.equal(control.signal.aborted, true, "stop aborts at request receipt even while resource persistence is held")
+		const started = Date.now()
+		const result = await stopping
+		assert.ok(Date.now() - started < 500, "stop cleanup and persistence failure remain bounded")
+		assert.equal(cleanupObservedAbort, true, "registered model work sees cancellation immediately")
+		assert.equal(result.accepted, false)
+		assert.equal(result.record.state, "failed-to-stop", "the controller does not claim durable teardown when writes stall")
+		assert.equal(result.record.cleanupResults.at(-1)?.name, "control-state-persistence")
+		await registration
+	} finally {
+		releaseRegistrationWrite()
+		await control.close()
+		await fs.rm(root, { recursive: true, force: true })
+	}
+}
+
+async function testLongUnixSocketPathFailsBeforeListen(): Promise<void> {
+	if (process.platform === "win32") return
+	const root = await fs.mkdtemp(path.join(process.cwd(), ".headlesscode", "scratch", "control-test-"))
+	const tooLongSocketDirectory = path.join(root, "x".repeat(120))
+	try {
+		await assert.rejects(
+			EmergencyControl.start({ identity: "long-socket", stateDirectory: root, socketDirectory: tooLongSocketDirectory }),
+			/emergency-control Unix socket path.*shorter HEADLESSCODE_CONTROL_SOCKET_DIR/,
+		)
+	} finally { await fs.rm(root, { recursive: true, force: true }) }
+}
+
+async function testQueuedResumeCannotUndoLaterStop(): Promise<void> {
+	const root = await fs.mkdtemp(path.join(process.cwd(), ".headlesscode", "scratch", "control-test-"))
+	const control = await EmergencyControl.start({ identity: "resume-fence", stateDirectory: root, socketDirectory, graceMs: 100 })
+	let releasePauseCleanup!: () => void
+	let pauseCleanupStarted!: () => void
+	const cleanupGate = new Promise<void>((resolve) => { releasePauseCleanup = resolve })
+	const cleanupStarted = new Promise<void>((resolve) => { pauseCleanupStarted = resolve })
+	let calls = 0
+	control.registerCleanup("slow-pause", async () => {
+		calls += 1
+		if (calls === 1) { pauseCleanupStarted(); await cleanupGate }
+	})
+	try {
+		const pause = control.command("pause", "maintenance", "operator:test")
+		await cleanupStarted
+		const resume = control.command("resume", "resume queued during pause", "operator:test")
+		const stop = control.command("stop", "emergency stop supersedes resume", "operator:test")
+		assert.equal(control.signal.aborted, true, "stop aborts before waiting for the pause cleanup")
+		releasePauseCleanup()
+		const [paused, resumed, stopped] = await Promise.all([pause, resume, stop])
+		assert.equal(paused.accepted, false, "superseded pause does not publish a stale paused result")
+		assert.equal(resumed.accepted, false, "queued resume is fenced by the later stop request")
+		assert.equal(stopped.record.state, "stopped")
+		assert.equal(stopped.record.epoch, 3)
+		assert.equal(control.signal.aborted, true)
+	} finally {
+		releasePauseCleanup()
+		await control.close()
+		await fs.rm(root, { recursive: true, force: true })
+	}
+}
+
 await testPauseRequiresExplicitResumeAndAdvancesEpoch()
 await testStopIsIdempotentAndFailedTeardownRetainsResource()
 await testRestartKeepsPausedStateAndClosedSocketRecovers()
@@ -171,7 +252,10 @@ await testHungCleanupIsBoundedAndRestartOfStoppedControlIsAborted()
 await testStalledEvidenceDoesNotDelayStopAndSecondControllerCannotUnlinkSocket()
 await testRestartWithPersistedResourcesRequiresRecovery()
 await testPersistenceFailureDoesNotPreventEmergencyAbortOrCleanup()
-process.stdout.write("All 7 emergency-control tests passed\n")
+await testStopBypassesStalledResourceRegistration()
+await testLongUnixSocketPathFailsBeforeListen()
+await testQueuedResumeCannotUndoLaterStop()
+process.stdout.write("All 10 emergency-control tests passed\n")
 
 await socketDirectoryHandle.close()
 await fs.rm(actualSocketDirectory, { recursive: true, force: true })
