@@ -82,7 +82,7 @@ async function testMockedLiveAuditPinsMuseAndRequiresBilledWarmCacheEvidence(): 
 			const id = new URL(address).searchParams.get("id")
 			const ordinal = Number(id?.match(/-(\d+)$/)?.[1])
 			return new Response(JSON.stringify({ data: {
-				id, model: "meta/muse-spark-1.3-contributor", provider_name: "Meta", total_cost: 0.0001,
+				id, model: "meta/muse-spark-1.3-contributor-20260902", provider_name: "Meta", total_cost: 0.0001,
 				tokens_prompt: 1800, tokens_completion: 1, native_tokens_reasoning: 0,
 				native_tokens_cached: ordinal === 1 ? 0 : 900, latency: 300,
 			} }), { status: 200 })
@@ -93,6 +93,10 @@ async function testMockedLiveAuditPinsMuseAndRequiresBilledWarmCacheEvidence(): 
 		const summary = await runMuseCacheQualification(["--confirm-live"], { HEADLESSCODE_OPENROUTER_API_KEY: "synthetic-key" }, (text) => output.push(text))
 		assert.equal(summary?.result, "qualified")
 		assert.equal(summary?.totalBilledCostUsd, 0.0004, "total is aggregated from authoritative generation records")
+		assert.equal(summary?.calls[0]?.responseModel, "meta/muse-spark-1.3-contributor", "stream response keeps its own model identity")
+		assert.equal(summary?.calls[0]?.generationModel, "meta/muse-spark-1.3-contributor-20260902", "canonical generation model is retained separately")
+		assert.equal(summary?.calls[0]?.responseProviderName, "Meta")
+		assert.equal(summary?.calls[0]?.generationProviderName, "Meta")
 		assert.equal(requests.length, MUSE_AUDIT_MAX_CALLS)
 		assert.equal(generationLookups, MUSE_AUDIT_MAX_CALLS)
 		assert.ok(requests.every((body) => body.stream === true && body.max_tokens === MUSE_AUDIT_MAX_OUTPUT_TOKENS))
@@ -106,6 +110,57 @@ async function testMockedLiveAuditPinsMuseAndRequiresBilledWarmCacheEvidence(): 
 	} finally {
 		globalThis.fetch = originalFetch
 		process.exitCode = oldExitCode
+	}
+}
+
+async function testMockedAuditRejectsUnknownModelAndMissingCost(): Promise<void> {
+	const originalFetch = globalThis.fetch
+	const oldExitCode = process.exitCode
+	for (const scenario of ["unknown-model", "missing-cost"] as const) {
+		globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+			const address = String(url)
+			if (address.includes("/api/v1/models/meta/muse-spark-1.3-contributor/endpoints")) {
+				return new Response(JSON.stringify({ data: { endpoints: [{ provider_name: "Meta", status: 0, pricing: { prompt: "0.0000001", completion: "0.0000002" } }] } }), { status: 200 })
+			}
+			if (address.endsWith("/api/v1/chat/completions")) {
+				return testSseResponse([
+					{ id: "gen-audit-edge", model: "meta/muse-spark-1.3-contributor", provider_name: "Meta", choices: [{ delta: { content: "ok" } }] },
+					{ choices: [{ delta: {}, finish_reason: "stop" }] },
+					{ usage: { prompt_tokens: 100, completion_tokens: 1, prompt_tokens_details: { cached_tokens: 0 } } },
+					"[DONE]",
+				])
+			}
+			if (address.includes("/api/v1/generation?id=")) {
+				const id = new URL(address).searchParams.get("id")
+				const data: Record<string, unknown> = {
+					id,
+					model: scenario === "unknown-model" ? "meta/muse-spark-1.3-contributor-unknown" : "meta/muse-spark-1.3-contributor-20260902",
+					provider_name: "Meta",
+				}
+				if (scenario === "unknown-model") data.total_cost = 0.0001
+				return new Response(JSON.stringify({ data }), { status: 200 })
+			}
+			throw new Error("unexpected mock URL")
+		}) as typeof fetch
+		try {
+			process.exitCode = oldExitCode
+			const output: string[] = []
+			const summary = await runMuseCacheQualification(["--confirm-live"], { HEADLESSCODE_OPENROUTER_API_KEY: "synthetic-key" }, (text) => output.push(text))
+			assert.equal(summary?.result, "not-qualified")
+			if (scenario === "unknown-model") {
+				assert.equal(summary?.calls[0]?.responseModel, "meta/muse-spark-1.3-contributor")
+				assert.equal(summary?.calls[0]?.generationModel, "meta/muse-spark-1.3-contributor-unknown")
+				assert.match(summary?.failureReasons?.join(" ") ?? "", /generation-record model was missing or was not an admitted Muse model/)
+			} else {
+				assert.equal(summary?.calls[0]?.generationModel, "meta/muse-spark-1.3-contributor-20260902", "the exact dated canonical alias is admitted")
+				assert.match(summary?.failureReasons?.join(" ") ?? "", /authoritative generation total_cost is missing/)
+			}
+			assert.match(output.join(""), /not-qualified/)
+			assert.equal(process.exitCode, 1)
+		} finally {
+			globalThis.fetch = originalFetch
+			process.exitCode = oldExitCode
+		}
 	}
 }
 
@@ -155,6 +210,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["Muse qualification is inert without explicit live flag", testLiveAuditRequiresExplicitFlagAndDoesNotFetch],
 	["Muse qualification rejects transcript capture before network access", testTranscriptCaptureBlocksLiveAuditBeforeFetch],
 	["mocked Muse qualification uses pinned streamed client and requires billing/cache evidence", testMockedLiveAuditPinsMuseAndRequiresBilledWarmCacheEvidence],
+	["mocked Muse qualification admits one canonical alias and rejects unknown model/missing cost", testMockedAuditRejectsUnknownModelAndMissingCost],
 	["mocked Muse qualification fails when no later request reports cached tokens", testMockedAuditFailsWithoutLaterCacheHit],
 ]
 
