@@ -1,0 +1,7 @@
+{"type":"session_meta","payload":{"id":"synthetic-codex-1","cwd":"/synthetic/workspace","timestamp":"2026-01-15T12:00:00.000Z","cli_version":"0.99.0"}}
+{"type":"response_item","timestamp":"2026-01-15T12:00:01.000Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"SYNTHETIC: calculate 2 + 2"},{"type":"input_image","id":"synthetic-image-1","mime_type":"image/png","width":32,"height":32,"url":"https://private.invalid/signed"}]}}
+{"type":"event_msg","payload":{"type":"user_message","message":"SYNTHETIC: calculate 2 + 2"}}
+{"type":"response_item","timestamp":"2026-01-15T12:00:02.000Z","payload":{"type":"custom_tool_call","call_id":"call-2","name":"calculator","input":{"expression":"2+2"}}}
+{"type":"response_item","timestamp":"2026-01-15T12:00:03.000Z","payload":{"type":"function_call_output","call_id":"call-2","output":"4"}}
+{"type":"response_item","timestamp":"2026-01-15T12:00:04.000Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"SYNTHETIC: 4"}]}}
+{"type":"response_item","timestamp":"2026-01-15T12:00:05.000Z","payload":{"type":"reasoning","encrypted_content":"SYNTHETIC CODEX ENCRYPTED DATA"}}
