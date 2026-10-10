@@ -12,13 +12,20 @@ on:
   push:
     branches: ["**"]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   typecheck-test-e2e:
-    runs-on: [self-hosted, Linux, X64, headlesscode-ci]
+    if: github.event.repository.private == false
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:

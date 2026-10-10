@@ -1,9 +1,5 @@
-# Build a release package on version tags and attach it to the private GitHub
-# Release. Earlier public npm versions retain their published Apache-2.0 terms.
-#
-# The versioned package is attached to this private repository's GitHub
-# Release. Earlier public npm versions remain available under their published
-# Apache-2.0 terms; future proprietary source is not uploaded to npm.
+# Build a release package on version tags and attach it to the GitHub Release.
+# This workflow does not publish packages to npm.
 #
 # The tag's version in package.json must match the pushed v* tag.
 name: publish
@@ -18,12 +14,15 @@ permissions:
 
 jobs:
   npm-publish:
-    name: Verify and attach private release artifact
-    runs-on: [self-hosted, Linux, X64, headlesscode-ci]
+    name: Verify and attach release artifact
+    if: github.event.repository.private == false
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout tag
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -47,7 +46,7 @@ jobs:
           tar -tzf "$TARBALL" | grep -q "package/bin/headlesscode.mjs" \
             || { echo "bin/headlesscode.mjs missing from tarball"; exit 1; }
 
-      - name: Create private GitHub Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
