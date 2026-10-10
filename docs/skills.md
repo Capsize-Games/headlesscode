@@ -58,7 +58,9 @@ ordinary tool executor.
 - `headlesscode skills inspect <name>` prints captured instructions and their
   digest.
 - `headlesscode skills validate` reports invalid manifests and duplicate
-  names in the discovered roots.
+  names in the discovered roots. `headlesscode skills validate <local-path>`
+  validates one skill directory or each immediate skill subdirectory at that
+  path.
 - `headlesscode skills enable <skill-root>` explicitly trusts a local root for
   future sessions.
 - `headlesscode skills import <local-skill-directory>` copies one skill or
