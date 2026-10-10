@@ -52,7 +52,9 @@ test("emergency stop cancels an active lease and aborts its OpenShell operation"
 	const repo = path.join(root, "repo")
 	const snapshotPath = path.join(root, "snapshot.bundle")
 	const stateDirectory = path.join(root, "control")
-	const socketDirectory = path.join(process.cwd(), ".headlesscode", "c")
+	const socketDirectoryFd = fs.openSync(root, "r")
+	const socketDirectory = process.platform === "linux" && Buffer.byteLength(path.join(root, `${"x".repeat(20)}.sock`)) >= 108
+		? `/proc/self/fd/${socketDirectoryFd}` : root
 	const id = "worker-stop-candidate"
 	const control = await EmergencyControl.start({ identity: "worker-stop-test", stateDirectory, socketDirectory, graceMs: 2_000 })
 	const createDir = (directory: string) => fs.mkdirSync(directory, { recursive: true })
@@ -122,6 +124,7 @@ test("emergency stop cancels an active lease and aborts its OpenShell operation"
 		assert.deepEqual(result.record.resources, [])
 	} finally {
 		await control.close()
+		fs.closeSync(socketDirectoryFd)
 		fs.rmSync(root, { recursive: true, force: true })
 	}
 })

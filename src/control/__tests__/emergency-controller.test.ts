@@ -3,7 +3,11 @@ import * as fs from "node:fs/promises"
 import * as path from "node:path"
 import { EmergencyControl, requestEmergencyControl } from "../emergency-controller.js"
 
-const socketDirectory = path.join(process.cwd(), ".headlesscode", "c")
+const actualSocketDirectory = await fs.mkdtemp(path.join(process.cwd(), ".headlesscode", "scratch", "control-sockets-"))
+const socketDirectoryHandle = await fs.open(actualSocketDirectory, "r")
+const socketDirectory = process.platform === "linux" && Buffer.byteLength(path.join(actualSocketDirectory, `${"x".repeat(20)}.sock`)) >= 108
+	? `/proc/self/fd/${socketDirectoryHandle.fd}`
+	: actualSocketDirectory
 
 async function testPauseRequiresExplicitResumeAndAdvancesEpoch(): Promise<void> {
 	const root = await fs.mkdtemp(path.join(process.cwd(), ".headlesscode", "scratch", "control-test-"))
@@ -168,3 +172,6 @@ await testStalledEvidenceDoesNotDelayStopAndSecondControllerCannotUnlinkSocket()
 await testRestartWithPersistedResourcesRequiresRecovery()
 await testPersistenceFailureDoesNotPreventEmergencyAbortOrCleanup()
 process.stdout.write("All 7 emergency-control tests passed\n")
+
+await socketDirectoryHandle.close()
+await fs.rm(actualSocketDirectory, { recursive: true, force: true })

@@ -8,6 +8,11 @@ import { OpenShellSessionProvider, runOpenShellCommandAsync, validateReadOnlyMou
 import type { CloudSessionRequest } from "../provider.js"
 import { EmergencyControl } from "../../control/emergency-controller.js"
 
+const actualControlSockets = fs.mkdtempSync(path.join(os.tmpdir(), "provider-sockets-"))
+const controlSocketFd = fs.openSync(actualControlSockets, "r")
+const controlSocketDirectory = process.platform === "linux" && Buffer.byteLength(path.join(actualControlSockets, `${"x".repeat(20)}.sock`)) >= 108
+	? `/proc/self/fd/${controlSocketFd}` : actualControlSockets
+
 async function createMinimalOpenShellFixture(prefix: string): Promise<{ root: string; repo: string; workspace: string; policy: string; request: CloudSessionRequest }> {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix))
 	const repo = path.join(root, "repo")
@@ -249,7 +254,7 @@ async function testCreateStopRaceWaitsForCreationAndDeletesLateSandbox(): Promis
 	const sandboxes = new Set<string>()
 	const createCalled = deferred()
 	const root = path.join(fixture.root, "scratch")
-	const control = await EmergencyControl.start({ identity: "create-race", stateDirectory: path.join(fixture.root, "control"), socketDirectory: path.join(process.cwd(), ".headlesscode", "c"), graceMs: 2_000 })
+	const control = await EmergencyControl.start({ identity: "create-race", stateDirectory: path.join(fixture.root, "control"), socketDirectory: controlSocketDirectory, graceMs: 2_000 })
 	const provider = new OpenShellSessionProvider({
 		policy: fixture.policy, autoProviders: false, providers: [], includeProjectData: false, scratchRoot: root, emergencyControl: control,
 		run: () => ({ exitCode: 0, output: "" }), listSandboxes: () => [...sandboxes],
@@ -284,7 +289,7 @@ async function testFailedSandboxDeletionRetainsResourceAndRetryCanVerifyAbsence(
 	const fixture = await createMinimalOpenShellFixture("headlesscode-openshell-delete-failure-")
 	const sandboxes = new Set<string>()
 	let failDelete = true
-	const control = await EmergencyControl.start({ identity: "delete-failure", stateDirectory: path.join(fixture.root, "control"), socketDirectory: path.join(process.cwd(), ".headlesscode", "c"), graceMs: 1_000 })
+	const control = await EmergencyControl.start({ identity: "delete-failure", stateDirectory: path.join(fixture.root, "control"), socketDirectory: controlSocketDirectory, graceMs: 1_000 })
 	const provider = new OpenShellSessionProvider({
 		policy: fixture.policy, autoProviders: false, providers: [], includeProjectData: false, scratchRoot: path.join(fixture.root, "scratch"), deleteVerifyTimeoutMs: 10, emergencyControl: control,
 		run: () => ({ exitCode: 0, output: "" }), listSandboxes: () => [...sandboxes],
@@ -363,4 +368,4 @@ async function main(): Promise<void> {
 	console.log("  ok   OpenShell fenced teardown never imports sandbox results")
 }
 
-void main().catch((error) => { console.error(error); process.exitCode = 1 })
+void main().catch((error) => { console.error(error); process.exitCode = 1 }).finally(() => { fs.closeSync(controlSocketFd); fs.rmSync(actualControlSockets, { recursive: true, force: true }) })

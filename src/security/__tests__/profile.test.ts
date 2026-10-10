@@ -38,10 +38,14 @@ async function fixture(overrides: { profile?: Record<string, unknown>; policy?: 
 	fs.writeFileSync(key, publicKey.export({ type: "spki", format: "pem" }), { mode: 0o600 })
 	const fingerprint = `sha256:${createHash("sha256").update(publicKey.export({ type: "spki", format: "der" })).digest("hex")}`
 	fs.rmSync(socket, { force: true })
+	const socketDirectoryFd = fs.openSync(root, "r")
+	const bindPath = process.platform === "linux" && Buffer.byteLength(socket) >= 108
+		? `/proc/self/fd/${socketDirectoryFd}/e.sock`
+		: socket
 	const server = net.createServer((connection) => connection.end("ok"))
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject)
-		server.listen({ path: socket }, resolve)
+		server.listen({ path: bindPath }, resolve)
 	})
 	assert.ok(fs.existsSync(socket), `fixture evidence socket did not bind: ${socket}; address=${JSON.stringify(server.address())}`)
 	const policyValue: Record<string, unknown> = {
@@ -89,6 +93,7 @@ async function fixture(overrides: { profile?: Record<string, unknown>; policy?: 
 		refreshProfile: writeProfile,
 		close: async () => {
 			await new Promise<void>((resolve) => server.close(() => resolve()))
+			fs.closeSync(socketDirectoryFd)
 			fs.rmSync(root, { recursive: true, force: true })
 			fs.rmSync(socket, { force: true })
 		},
