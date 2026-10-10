@@ -36,6 +36,7 @@ export interface ChatCliDependencies {
 	initialModel?: string
 	initialMode?: string
 	signal?: AbortSignal
+	validateMode?: (mode: string) => boolean | Promise<boolean>
 	skills?: ChatSkillService
 	imports?: ChatImportService
 }
@@ -86,12 +87,16 @@ export async function chatMain(argv: string[], deps: ChatCliDependencies): Promi
 		errorOutput.write("chat requires the supervisor-provided turn runner and session store\n")
 		return 2
 	}
+	if (deps.signal?.aborted) {
+		errorOutput.write("The supervisor has stopped this session.\n")
+		return 1
+	}
 
 	const inputStream = deps.input ?? process.stdin
 	const terminal = deps.terminal ?? Boolean(isTTY(inputStream) && isTTY(output))
 	const input = new TerminalInput({ input: inputStream, output, terminal })
 	const activeWorkspaceRoot = options.workspaceRoot
-	let store = deps.createStore(activeWorkspaceRoot)
+	let store: TerminalSessionStore
 	let archive: SessionArchive
 	let model = options.model ?? deps.initialModel
 	let mode = options.mode ?? deps.initialMode ?? DEFAULT_MODE
@@ -102,17 +107,35 @@ export async function chatMain(argv: string[], deps: ChatCliDependencies): Promi
 	let pendingWarnings: string[] = []
 	let conflictPending = false
 
-	try {
+	let rejectStartup: (error: Error) => void = () => {}
+	const startupAborted = new Promise<never>((_resolve, reject) => { rejectStartup = reject })
+	const onStartupAbort = (): void => {
+		input.close()
+		rejectStartup(new Error("The supervisor stopped this session during startup."))
+	}
+	deps.signal?.addEventListener("abort", onStartupAbort, { once: true })
+	const startup = (async (): Promise<SessionArchive> => {
+		if (deps.validateMode && !(await deps.validateMode(mode))) throw new Error(`Unknown or unavailable mode '${mode}'.`)
+		if (deps.signal?.aborted) throw new Error("The supervisor stopped this session during startup.")
+		store = deps.createStore(activeWorkspaceRoot)
 		if (options.resumeId) {
 			const loaded = await store.load(options.resumeId)
 			if (!loaded) throw new Error(`No session '${options.resumeId}' exists in ${options.workspaceRoot}`)
-			archive = loaded
-		} else archive = await store.create({ title: "Terminal chat" })
+			return loaded
+		}
+		return await store.create({ title: "Terminal chat" })
+	})()
+	try {
+		archive = await Promise.race([startup, startupAborted])
+		if (deps.signal?.aborted) throw new Error("The supervisor stopped this session during startup.")
 	} catch (error) {
+		void startup.catch(() => {})
+		deps.signal?.removeEventListener("abort", onStartupAbort)
 		errorOutput.write(`${sanitizeTerminalText(error instanceof Error ? error.message : String(error))}\n`)
 		input.close()
 		return 1
 	}
+	deps.signal?.removeEventListener("abort", onStartupAbort)
 
 	const setCurrent = (next: SessionArchive, nextStore = store): void => {
 		archive = next
@@ -286,7 +309,16 @@ export async function chatMain(argv: string[], deps: ChatCliDependencies): Promi
 				return true
 			case "mode":
 				if (!args.length) renderer.writeNotice(`Mode: ${mode}`)
-				else { mode = args.join(" "); renderer.writeNotice(`Mode set to ${mode}.`); renderer.writeHeader(archive.id, activeWorkspaceRoot, model ?? "mode default", mode) }
+				else {
+					const nextMode = args.join(" ")
+					if (deps.validateMode && !(await deps.validateMode(nextMode))) {
+						renderer.writeError(`Unknown or unavailable mode '${nextMode}'; current mode remains '${mode}'.`)
+						return true
+					}
+					mode = nextMode
+					renderer.writeNotice(`Mode set to ${mode}.`)
+					renderer.writeHeader(archive.id, activeWorkspaceRoot, model ?? "mode default", mode)
+				}
 				return true
 			case "skills": {
 				if (args.length) { renderer.writeError("Usage: /skills"); return true }

@@ -114,6 +114,97 @@ async function testResumeUsesSelectedWorktree(): Promise<void> {
 	assert.match(pipes.read(), /\/workspace\/worktree/)
 }
 
+async function testModeValidation(): Promise<void> {
+	const invalidStore = new MemoryStore()
+	const invalidPipes = streams("")
+	let storeFactoryCalls = 0
+	let runnerCalls = 0
+	const invalidRunner: ChatTurnRunner = async () => {
+		runnerCalls++
+		return { status: "success", result: "unexpected", messages: [] }
+	}
+	const invalidDeps = dependencies(invalidStore, invalidRunner, invalidPipes.input, invalidPipes.output, {
+		createStore: () => { storeFactoryCalls++; return invalidStore },
+		validateMode: (mode) => mode === "code",
+	})
+	assert.equal(await chatMain(["--mode", "missing"], invalidDeps), 1)
+	assert.equal(storeFactoryCalls, 0)
+	assert.equal(runnerCalls, 0)
+
+	const modeStore = new MemoryStore()
+	const modePipes = streams("/mode missing\ncontinue\n")
+	let observedMode = ""
+	const modeRunner: ChatTurnRunner = async (request) => {
+		observedMode = request.mode
+		return { status: "success", result: "done", messages: [{ role: "user", content: request.prompt }] }
+	}
+	const modeDeps = dependencies(modeStore, modeRunner, modePipes.input, modePipes.output, {
+		validateMode: (mode) => mode === "code",
+	})
+	assert.equal(await chatMain([], modeDeps), 0)
+	assert.equal(observedMode, "code")
+	assert.match(modePipes.read(), /current mode remains 'code'/)
+}
+
+async function testPreAbortedAndStartupAbort(): Promise<void> {
+	const preAbortedInput = new PassThrough()
+	const preAbortedOutput = new PassThrough()
+	const preAbortedStore = new MemoryStore()
+	const preAbortedController = new AbortController()
+	preAbortedController.abort(new Error("already stopped"))
+	let createCalls = 0
+	let runCalls = 0
+	const preAbortedDeps = dependencies(preAbortedStore, async () => {
+		runCalls++
+		return { status: "success", result: "unexpected", messages: [] }
+	}, preAbortedInput, preAbortedOutput, {
+		signal: preAbortedController.signal,
+		createStore: () => { createCalls++; return preAbortedStore },
+	})
+	assert.equal(await chatMain([], preAbortedDeps), 1)
+	assert.equal(createCalls, 0)
+	assert.equal(runCalls, 0)
+	assert.equal(preAbortedInput.listenerCount("data"), 0)
+
+	const startupInput = new PassThrough()
+	const startupOutput = new PassThrough()
+	const startupStore = new MemoryStore()
+	const startupController = new AbortController()
+	let announceStarted: (() => void) | undefined
+	let releaseStartup: (() => void) | undefined
+	let startupStoreCalls = 0
+	let startupRunnerCalls = 0
+	const started = new Promise<void>((resolve) => { announceStarted = resolve })
+	const startupDeps = dependencies(startupStore, async () => {
+		startupRunnerCalls++
+		return { status: "success", result: "unexpected", messages: [] }
+	}, startupInput, startupOutput, {
+		signal: startupController.signal,
+		createStore: () => {
+			startupStoreCalls++
+			return {
+				load: (id) => startupStore.load(id),
+				list: () => startupStore.list(),
+				save: (record, expectedRevision) => startupStore.save(record, expectedRevision),
+				fork: (id) => startupStore.fork(id),
+				create: async () => await new Promise<SessionArchive>((resolve) => {
+					announceStarted?.()
+					releaseStartup = () => resolve(makeArchive())
+				}),
+			}
+		},
+	})
+	const pending = chatMain([], startupDeps)
+	await started
+	startupController.abort(new Error("stopped during startup"))
+	const exit = await Promise.race([pending, new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("chat waited on startup after abort")), 250))])
+	assert.equal(exit, 1)
+	assert.equal(startupStoreCalls, 1)
+	assert.equal(startupRunnerCalls, 0)
+	assert.equal(startupInput.listenerCount("data"), 0)
+	releaseStartup?.()
+}
+
 async function testCommandsSkillsAndImportAreArchiveSwitch(): Promise<void> {
 	const store = new MemoryStore()
 	const pipes = streams('/model test/model\n/mode ask\n/skill review\n/import headlesscode native.json\n/import codex "export.json"\n/unknown\n//help\n')
@@ -357,6 +448,8 @@ async function main(): Promise<void> {
 	await testArgsAndSlashParsing()
 	await testTurnsPersistAndResume()
 	await testResumeUsesSelectedWorktree()
+	await testModeValidation()
+	await testPreAbortedAndStartupAbort()
 	await testCommandsSkillsAndImportAreArchiveSwitch()
 	await testFailureAndSupervisorAbort()
 	await testRevisionConflictRequiresRetryAndCtrlCAborts()
