@@ -78,6 +78,6 @@ export async function importFile(provider: Exclude<SessionProvider, "headlesscod
 		},
 	}
 	const store = new SessionStore(absoluteWorkspace)
-	const archive = await store.create(input)
+	const archive = await store.create(input, signal)
 	return { archive, warnings: archive.warnings }
 }

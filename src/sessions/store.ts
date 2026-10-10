@@ -131,15 +131,22 @@ export class SessionStore {
 		this.onWarning = options.onWarning ?? ((message) => process.stderr.write(`${message}\n`))
 	}
 
-	async create(input: CreateSessionInput = {}): Promise<SessionArchive> {
+	async create(input: CreateSessionInput = {}, signal?: AbortSignal): Promise<SessionArchive> {
+		signal?.throwIfAborted()
 		const now = new Date().toISOString()
 		const archive: SessionArchive = { version: 1, id: randomUUID(), revision: 0, workspaceRoot: this.workspaceRoot, title: input.title ?? "New session", createdAt: now, updatedAt: now, messages: input.messages ?? [], warnings: input.warnings ?? [], ...(input.provenance ? { provenance: input.provenance } : {}) }
 		const json = encoded(archive)
 		await this.withLock(archive.id, async () => {
+			signal?.throwIfAborted()
 			try { await fsp.lstat(this.file(archive.id)); fail("session already exists") } catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
 			}
 			await this.replace(archive.id, json)
+			if (signal?.aborted) {
+				// This fresh ID is still unpublished and its writer lock is held.
+				await fsp.unlink(this.file(archive.id))
+				signal.throwIfAborted()
+			}
 		})
 		return JSON.parse(json) as SessionArchive
 	}
@@ -197,9 +204,9 @@ export class SessionStore {
 		})
 	}
 
-	async fork(id: string): Promise<SessionArchive> {
+	async fork(id: string, signal?: AbortSignal): Promise<SessionArchive> {
 		const previous = await this.load(id)
-		return this.create({ title: previous.title, messages: previous.messages, warnings: previous.warnings, provenance: { ...(previous.provenance ?? { provider: "headlesscode" as const }), parentSessionId: id } })
+		return this.create({ title: previous.title, messages: previous.messages, warnings: previous.warnings, provenance: { ...(previous.provenance ?? { provider: "headlesscode" as const }), parentSessionId: id } }, signal)
 	}
 
 	private file(id: string): string { validId(id); return path.join(this.directory, `${id}.json`) }

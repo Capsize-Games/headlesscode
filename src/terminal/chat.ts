@@ -6,11 +6,11 @@ import { TerminalInput, readComposedInput } from "./input.js"
 import { TerminalRenderer, sanitizeTerminalText } from "./renderer.js"
 
 export interface TerminalSessionStore {
-	create(input?: CreateSessionInput): Promise<SessionArchive>
+	create(input?: CreateSessionInput, signal?: AbortSignal): Promise<SessionArchive>
 	load(id: string): Promise<SessionArchive | undefined>
 	list(): Promise<SessionSummary[]>
 	save(record: SessionArchive, expectedRevision: number): Promise<SessionArchive>
-	fork(id: string): Promise<SessionArchive>
+	fork(id: string, signal?: AbortSignal): Promise<SessionArchive>
 }
 
 export interface ChatSkillSummary { name: string; description: string; source?: string; digest?: string }
@@ -123,7 +123,7 @@ export async function chatMain(argv: string[], deps: ChatCliDependencies): Promi
 			if (!loaded) throw new Error(`No session '${options.resumeId}' exists in ${options.workspaceRoot}`)
 			return loaded
 		}
-		return await store.create({ title: "Terminal chat" })
+		return await store.create({ title: "Terminal chat" }, deps.signal)
 	})()
 	try {
 		archive = await Promise.race([startup, startupAborted])
@@ -268,7 +268,7 @@ export async function chatMain(argv: string[], deps: ChatCliDependencies): Promi
 			case "new": {
 				if (args.length) { renderer.writeError("Usage: /new"); return true }
 				if (!(await savePending())) return true
-				setCurrent(await store.create({ title: "Terminal chat" }))
+				setCurrent(await store.create({ title: "Terminal chat" }, deps.signal))
 				renderer.writeNotice(`Started session ${archive.id}.`)
 				renderer.writeHeader(archive.id, activeWorkspaceRoot, model ?? "mode default", mode)
 				return true
@@ -276,7 +276,7 @@ export async function chatMain(argv: string[], deps: ChatCliDependencies): Promi
 			case "fork": {
 				if (args.length) { renderer.writeError("Usage: /fork"); return true }
 				if (!(await savePending())) return true
-				setCurrent(await store.fork(archive.id))
+				setCurrent(await store.fork(archive.id, deps.signal))
 				renderer.writeNotice(`Forked session as ${archive.id}.`)
 				renderer.writeHeader(archive.id, activeWorkspaceRoot, model ?? "mode default", mode)
 				return true

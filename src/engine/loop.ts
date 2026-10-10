@@ -2139,6 +2139,7 @@ export class HeadlessSession {
 			const localResult = await this.runLocalExplore()
 			if (localResult?.handoffMessage) {
 				messages.splice(2, 0, localResult.handoffMessage)
+				this.observeMessage(localResult.handoffMessage)
 				this.logger.info("[loop] folded local exploration phase into cloud context", {
 					iterations: localResult.iterations,
 					terminatedBy: localResult.terminatedBy,
@@ -2367,12 +2368,14 @@ export class HeadlessSession {
 	 */
 	private appendMessage(messages: ChatMessage[], ...added: ChatMessage[]): number {
 		const length = messages.push(...added)
-		for (const message of added) {
-			try { this.onMessage?.(JSON.parse(JSON.stringify(message)) as ChatMessage) } catch (error) {
-				this.logger.warn("conversation observer failed", { error: String(error) })
-			}
-		}
+		for (const message of added) this.observeMessage(message)
 		return length
+	}
+
+	private observeMessage(message: ChatMessage): void {
+		try { this.onMessage?.(JSON.parse(JSON.stringify(message)) as ChatMessage) } catch (error) {
+			this.logger.warn("conversation observer failed", { error: String(error) })
+		}
 	}
 
 	private async emitEvent(

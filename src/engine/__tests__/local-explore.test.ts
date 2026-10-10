@@ -158,6 +158,7 @@ async function makeSession(options: {
 	client: LlmClient
 	task: string
 	localExplore?: boolean | LocalExploreOptions
+	onMessage?: (message: ChatMessage) => void
 }) {
 	const session = new HeadlessSession({
 		workspaceRoot: options.workspaceRoot,
@@ -170,6 +171,7 @@ async function makeSession(options: {
 		windowSize: 40,
 		checkpoints: false,
 		localExplore: options.localExplore,
+		onMessage: options.onMessage,
 	})
 	return session
 }
@@ -336,12 +338,14 @@ test("a successful local phase folds a labeled handoff into the cloud's first re
 	const ws = await makeTmpWorkspace({ "src/index.ts": "export const x = 1\n" })
 	const localClient = new FakeLocalClient([localToolCall("attempt_completion", { result: "Found src/index.ts." })])
 	const cloudClient = new FakeLlmClient([cloudTextReply("Done.")])
+	const archived: ChatMessage[] = []
 
 	const session = await makeSession({
 		workspaceRoot: ws,
 		task: "Where is the entry point?",
 		client: cloudClient,
 		localExplore: { workspaceRoot: ws, client: localClient },
+		onMessage: (message) => archived.push(message),
 	})
 	const result = await session.run()
 
@@ -360,6 +364,7 @@ test("a successful local phase folds a labeled handoff into the cloud's first re
 	assert.ok(handoff.content!.includes("=== LOCAL EXPLORATION TRANSCRIPT ==="))
 	assert.ok(handoff.content!.includes("This is NOT your own prior work"))
 	assert.ok(handoff.content!.includes("Found src/index.ts."))
+	assert.ok(archived.some((message) => message.role === "user" && message.content === handoff.content), "the same local handoff is captured for terminal resume")
 })
 
 // 10. Handoff label test (standalone): distinguishability from cloud history.
