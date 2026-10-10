@@ -78,6 +78,7 @@ async function testRecordsSessionAndFactsAfterCompletion(): Promise<void> {
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-memw-"))
 	const memDir = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-memw-mem-"))
 	try {
+		await fs.writeFile(path.join(ws, "package.json"), JSON.stringify({ scripts: { test: 'node -e "process.exit(0)"' } }))
 		const store = new LocalMemoryStore({ dir: memDir })
 		const client = new FakeLlmClient([
 			() => toolCall("write_to_file", { path: "notes.txt", content: "always run tests before committing" }),
