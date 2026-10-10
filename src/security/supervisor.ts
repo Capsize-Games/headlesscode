@@ -23,6 +23,17 @@ export function validateContainedSupervisorRoots(profile: ContainedRuntimeProfil
 	const socketValue = env[CONTROL_SOCKET_DIR_ENV] ?? stateValue
 	if (!configValue || !stateValue || !socketValue) throw new Error("contained execution requires protected evidence-config, emergency-state, and emergency-socket directories")
 	const socketProbeValue = socketValue.includes("{session}") ? socketValue.replaceAll("{session}", "__headlesscode_preflight__") : socketValue
+	const repo = fs.realpathSync(path.resolve(repoRoot))
+	const scratch = env.HEADLESSCODE_OPENSHELL_SCRATCH_ROOT ? path.resolve(env.HEADLESSCODE_OPENSHELL_SCRATCH_ROOT) : profile.policySnapshotDir
+	const protectedPaths = [repo, profile.policySnapshotDir, profile.evidenceSocketPath, profile.evidencePublicKeyPath, scratch]
+	const requestedDirectories = [configValue, stateValue, socketProbeValue].map((value) => path.resolve(value))
+	for (const directory of requestedDirectories) {
+		for (const protectedPath of protectedPaths) if (overlaps(directory, protectedPath)) throw new Error("contained supervisor directories overlap guest-writable or protected runtime data")
+	}
+	if (overlaps(requestedDirectories[0]!, requestedDirectories[1]!) || overlaps(requestedDirectories[0]!, requestedDirectories[2]!) || overlaps(requestedDirectories[1]!, requestedDirectories[2]!)) {
+		throw new Error("contained evidence and emergency-control directories must be separate")
+	}
+	for (const directory of requestedDirectories) assertNoSymlinkAncestors(directory)
 	for (const value of [stateValue, socketProbeValue]) {
 		assertNoSymlinkAncestors(path.resolve(value))
 		fs.mkdirSync(path.resolve(value), { recursive: true, mode: 0o700 })
@@ -31,13 +42,7 @@ export function validateContainedSupervisorRoots(profile: ContainedRuntimeProfil
 	const configDir = safeDirectory(configValue)
 	const stateDir = safeDirectory(stateValue)
 	const socketDir = safeDirectory(socketProbeValue)
-	const repo = fs.realpathSync(path.resolve(repoRoot))
-	const scratch = env.HEADLESSCODE_OPENSHELL_SCRATCH_ROOT ? path.resolve(env.HEADLESSCODE_OPENSHELL_SCRATCH_ROOT) : profile.policySnapshotDir
-	const protectedPaths = [repo, profile.policySnapshotDir, profile.evidenceSocketPath, profile.evidencePublicKeyPath, scratch]
-	for (const dir of [configDir, stateDir, socketDir]) {
-		for (const protectedPath of protectedPaths) if (overlaps(dir, protectedPath)) throw new Error("contained supervisor directories overlap guest-writable or protected runtime data")
-	}
-	if (overlaps(configDir, stateDir) || overlaps(configDir, socketDir) || (stateDir !== socketDir && overlaps(stateDir, socketDir))) throw new Error("contained evidence and emergency-control directories must be separate")
+	if (configDir !== requestedDirectories[0] || stateDir !== requestedDirectories[1] || socketDir !== requestedDirectories[2]) throw new Error("contained supervisor directories must resolve to their configured private paths")
 }
 
 /** Load one operator-provisioned, per-session handoff. It contains a scoped append capability, never collector key material. */
@@ -88,17 +93,18 @@ export function loadContainedSupervisorRuntime(options: {
 export function containedControlStateDirectory(profile: ContainedRuntimeProfile, sessionId: string, repoRoot: string, env: NodeJS.ProcessEnv = process.env): string {
 	const base = env[CONTROL_STATE_DIR_ENV]
 	if (!base) throw new Error(`${CONTROL_STATE_DIR_ENV} must point to a protected supervisor state directory`)
-	assertNoSymlinkAncestors(path.resolve(base))
-	fs.mkdirSync(path.resolve(base), { recursive: true, mode: 0o700 })
-	fs.chmodSync(path.resolve(base), 0o700)
-	const root = safeDirectory(base)
+	const basePath = path.resolve(base)
 	const repo = fs.realpathSync(path.resolve(repoRoot))
 	const runtimeConfigDir = env[CONTAINED_EVIDENCE_CONFIG_DIR_ENV] ? path.resolve(env[CONTAINED_EVIDENCE_CONFIG_DIR_ENV]) : undefined
 	const scratchRoot = env.HEADLESSCODE_OPENSHELL_SCRATCH_ROOT ? path.resolve(env.HEADLESSCODE_OPENSHELL_SCRATCH_ROOT) : undefined
-	for (const protectedPath of [repo, profile.policySnapshotDir, profile.evidenceSocketPath, profile.evidencePublicKeyPath, ...(runtimeConfigDir ? [runtimeConfigDir] : []), ...(scratchRoot ? [scratchRoot] : [])]) {
-		if (overlaps(root, protectedPath)) throw new Error("emergency control state directory overlaps guest or evidence data")
-	}
+	for (const protectedRoot of [runtimeConfigDir, scratchRoot].filter((value): value is string => Boolean(value))) assertNoSymlinkAncestors(protectedRoot)
+	assertNoOverlap(basePath, [repo, profile.policySnapshotDir, profile.policySnapshotPath, profile.evidenceSocketPath, profile.evidencePublicKeyPath, ...(runtimeConfigDir ? [runtimeConfigDir] : []), ...(scratchRoot ? [scratchRoot] : [])], "emergency control state directory overlaps guest or evidence data")
+	assertNoSymlinkAncestors(basePath)
+	fs.mkdirSync(basePath, { recursive: true, mode: 0o700 })
+	fs.chmodSync(basePath, 0o700)
+	const root = safeDirectory(basePath)
 	const sessionDir = path.join(root, validateSessionId(sessionId))
+	assertNoOverlap(sessionDir, [repo, profile.policySnapshotDir, profile.policySnapshotPath, profile.evidenceSocketPath, profile.evidencePublicKeyPath, ...(runtimeConfigDir ? [runtimeConfigDir] : []), ...(scratchRoot ? [scratchRoot] : [])], "emergency control session directory overlaps guest or evidence data")
 	fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 })
 	fs.chmodSync(sessionDir, 0o700)
 	if (fs.realpathSync(sessionDir) !== sessionDir || overlaps(sessionDir, repo)) throw new Error("emergency control session directory is unsafe")
@@ -110,16 +116,15 @@ export function containedControlSocketDirectory(profile: ContainedRuntimeProfile
 	if (!value) throw new Error(`${CONTROL_STATE_DIR_ENV} must point to a protected supervisor state directory`)
 	const baseDirectory = path.resolve(value.replaceAll("{session}", validateSessionId(sessionId)))
 	const socketDirectory = value.includes("{session}") ? baseDirectory : path.join(baseDirectory, validateSessionId(sessionId))
+	const repo = fs.realpathSync(path.resolve(repoRoot))
+	const runtimeConfigDir = env[CONTAINED_EVIDENCE_CONFIG_DIR_ENV] ? path.resolve(env[CONTAINED_EVIDENCE_CONFIG_DIR_ENV]) : undefined
+	const scratchRoot = env.HEADLESSCODE_OPENSHELL_SCRATCH_ROOT ? path.resolve(env.HEADLESSCODE_OPENSHELL_SCRATCH_ROOT) : undefined
+	for (const protectedRoot of [runtimeConfigDir, scratchRoot].filter((candidate): candidate is string => Boolean(candidate))) assertNoSymlinkAncestors(protectedRoot)
+	assertNoOverlap(socketDirectory, [repo, profile.policySnapshotDir, profile.policySnapshotPath, profile.evidenceSocketPath, profile.evidencePublicKeyPath, ...(runtimeConfigDir ? [runtimeConfigDir] : []), ...(scratchRoot ? [scratchRoot] : [])], "emergency control socket directory overlaps guest or evidence data")
 	assertNoSymlinkAncestors(path.resolve(path.dirname(socketDirectory)))
 	fs.mkdirSync(socketDirectory, { recursive: true, mode: 0o700 })
 	fs.chmodSync(socketDirectory, 0o700)
 	const root = safeDirectory(socketDirectory)
-	const repo = fs.realpathSync(path.resolve(repoRoot))
-	const runtimeConfigDir = env[CONTAINED_EVIDENCE_CONFIG_DIR_ENV] ? path.resolve(env[CONTAINED_EVIDENCE_CONFIG_DIR_ENV]) : undefined
-	const scratchRoot = env.HEADLESSCODE_OPENSHELL_SCRATCH_ROOT ? path.resolve(env.HEADLESSCODE_OPENSHELL_SCRATCH_ROOT) : undefined
-	for (const protectedPath of [repo, profile.policySnapshotDir, profile.evidenceSocketPath, profile.evidencePublicKeyPath, ...(runtimeConfigDir ? [runtimeConfigDir] : []), ...(scratchRoot ? [scratchRoot] : [])]) {
-		if (overlaps(root, protectedPath)) throw new Error("emergency control socket directory overlaps guest or evidence data")
-	}
 	if (fs.realpathSync(root) !== root || overlaps(root, repo)) throw new Error("emergency control socket directory is unsafe")
 	return root
 }
@@ -208,6 +213,10 @@ function overlaps(a: string, b: string): boolean {
 	const left = path.resolve(a)
 	const right = path.resolve(b)
 	return left === right || left.startsWith(`${right}${path.sep}`) || right.startsWith(`${left}${path.sep}`)
+}
+
+function assertNoOverlap(candidate: string, protectedPaths: string[], message: string): void {
+	for (const protectedPath of protectedPaths) if (overlaps(candidate, protectedPath)) throw new Error(message)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value) }

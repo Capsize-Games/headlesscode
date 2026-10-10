@@ -6,7 +6,7 @@ import * as path from "node:path"
 
 import { UnixEvidenceJournal } from "../../evidence/collector.js"
 import { evidenceJournalFromProtectedConfigFile } from "../../evidence/index.js"
-import { loadContainedSupervisorRuntime } from "../supervisor.js"
+import { containedControlSocketDirectory, containedControlStateDirectory, loadContainedSupervisorRuntime, validateContainedSupervisorRoots } from "../supervisor.js"
 import { startContainedEvidenceService } from "../contained-evidence-service.js"
 import { startContainedSupervisor } from "../supervisor.js"
 import { controlMain } from "../../control/cli.js"
@@ -40,6 +40,22 @@ async function testProtectedPerSessionHandoffIsBoundAndRequired(): Promise<void>
 		evidenceGuestPublicKeyPath: "/etc/headlesscode/collector.pem", evidencePublicKeyFingerprint: fingerprint,
 		allowedGuestEnv: [], policySnapshotDir: path.join(root, "policy"),
 	} as unknown as ContainedRuntimeProfile
+	const protectedRepo = path.join(root, "protected-repo")
+	fs.mkdirSync(protectedRepo, { mode: 0o755 })
+	const protectedMarker = path.join(protectedRepo, "keep.txt")
+	fs.writeFileSync(protectedMarker, "preserve this file")
+	fs.chmodSync(protectedRepo, 0o755)
+	const originalRepoMode = fs.statSync(protectedRepo).mode & 0o777
+	const originalMarker = fs.readFileSync(protectedMarker, "utf8")
+	assert.throws(() => containedControlStateDirectory(profile, "s", protectedRepo, { HEADLESSCODE_CONTROL_STATE_DIR: protectedRepo }), /overlap/)
+	assert.throws(() => containedControlSocketDirectory(profile, "s", protectedRepo, { HEADLESSCODE_CONTROL_SOCKET_DIR: protectedRepo }), /overlap/)
+	assert.throws(() => validateContainedSupervisorRoots(profile, protectedRepo, {
+		HEADLESSCODE_CONTAINED_EVIDENCE_CONFIG_DIR: configDir,
+		HEADLESSCODE_CONTROL_STATE_DIR: protectedRepo,
+		HEADLESSCODE_CONTROL_SOCKET_DIR: socketDirectory,
+	}), /overlap/)
+	assert.equal(fs.statSync(protectedRepo).mode & 0o777, originalRepoMode, "rejected supervisor paths never change repository permissions")
+	assert.equal(fs.readFileSync(protectedMarker, "utf8"), originalMarker, "rejected supervisor paths preserve repository data")
 	const configPath = path.join(configDir, "s.json")
 	fs.writeFileSync(configPath, JSON.stringify({ sessionId: "s", socketPath, capability: "A".repeat(43), pinnedPublicKey: { keyId: fingerprint, publicKeyPem: publicPem } }), { mode: 0o400 })
 	const loaded = loadContainedSupervisorRuntime({ profile, sessionId: "s", repoRoot: repo, workspaceRoot: repo, env: { HEADLESSCODE_CONTAINED_EVIDENCE_CONFIG_DIR: configDir } })
@@ -95,6 +111,13 @@ async function testContainedEvidenceServiceProvisionsDistinctWorkerCapabilities(
 	const socketPath = path.join(scratch, "es.sock")
 	fs.rmSync(socketPath, { force: true })
 	fs.mkdirSync(repo, { mode: 0o700 })
+	const marker = path.join(repo, "keep.txt")
+	fs.writeFileSync(marker, "preserve this repository")
+	fs.chmodSync(repo, 0o755)
+	const originalMode = fs.statSync(repo).mode & 0o777
+	await assert.rejects(() => startContainedEvidenceService({ storageDir: repo, configDirectory, socketPath, sessionIds: ["rejected"], repoRoot: repo }), /separate/)
+	assert.equal(fs.statSync(repo).mode & 0o777, originalMode, "rejected collector paths never change repository permissions")
+	assert.equal(fs.readFileSync(marker, "utf8"), "preserve this repository", "rejected collector paths preserve repository data")
 	const service = await startContainedEvidenceService({ storageDir, configDirectory, socketPath, sessionIds: ["worker-a", "worker-b"], repoRoot: repo })
 	try {
 		assert.deepEqual(service.sessions, ["worker-a", "worker-b"])
