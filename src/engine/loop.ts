@@ -122,6 +122,24 @@ import {
 	skipOrphanedToolMessages,
 } from "./condense.js"
 import { writeHandoffSummary } from "./handoff.js"
+import type { EvidenceInput, EvidenceJournal } from "../evidence/types.js"
+import { canonicalJson, sha256 } from "../evidence/canonical.js"
+
+function combineAbortSignals(signals: readonly (AbortSignal | undefined)[]): { signal: AbortSignal; dispose: () => void } {
+	const controller = new AbortController()
+	const listeners: Array<{ signal: AbortSignal; listener: () => void }> = []
+	for (const signal of signals) {
+		if (!signal) continue
+		if (signal.aborted) {
+			controller.abort(signal.reason)
+			break
+		}
+		const listener = (): void => controller.abort(signal.reason)
+		signal.addEventListener("abort", listener, { once: true })
+		listeners.push({ signal, listener })
+	}
+	return { signal: controller.signal, dispose: () => listeners.forEach(({ signal, listener }) => signal.removeEventListener("abort", listener)) }
+}
 import {
 	isLazyToolCatalogEnabled,
 	LIST_TOOLS_NAME,
@@ -1368,6 +1386,16 @@ export interface HeadlessSessionConfig {
 	 * pattern as the live-usage-snapshot tests).
 	 */
 	eventHook?: (eventType: string, fields: Record<string, unknown>) => void
+	/** Authenticated external journal supplied by a supervisor integration. */
+	evidenceJournal?: EvidenceJournal
+	/** Require durable evidence ACKs before model/tool actions; default false. */
+	evidenceRequired?: boolean
+	/** Supervisor provisioner for a new append capability when new_task starts a child session. */
+	createChildEvidenceJournal?: (sessionId: string) => Promise<EvidenceJournal | undefined>
+	/** Supervisor stop signal, composed with each model-call timeout. */
+	signal?: AbortSignal
+	/** Optional supervisor callback invoked after required evidence storage fails. */
+	evidenceFailureHandler?: (error: unknown) => Promise<void>
 	/** Optional awaited monitor invoked between complete iterations. */
 	iterationBoundaryHook?: IterationBoundaryHook
 	/** Fail-closed timeout for the optional iteration-boundary monitor. */
@@ -1567,6 +1595,13 @@ export class HeadlessSession {
 	private readonly eventFeed: EventFeed
 	/** The hook fired for every event (tests inject it; undefined in prod). */
 	private readonly eventHook?: (eventType: string, fields: Record<string, unknown>) => void
+	private readonly evidenceJournal?: EvidenceJournal
+	private readonly evidenceRequired: boolean
+	private readonly createChildEvidenceJournal?: (sessionId: string) => Promise<EvidenceJournal | undefined>
+	private readonly stopSignal?: AbortSignal
+	private readonly evidenceFailureHandler?: (error: unknown) => Promise<void>
+	private evidenceFault: string | null = null
+	private readonly evidenceRunId = randomUUID()
 	/** The most recent LLM call's token usage (for the llm_response event). */
 	private lastLlmUsage: { inputTokens: number; outputTokens: number; cachedTokens: number } | null = null
 	/** The condensation call's token usage, stashed by recordCondensationUsage for the `condensed` event. */
@@ -1913,6 +1948,12 @@ export class HeadlessSession {
 			? `${this.config.checkpointLineagePrefix ?? this.parentSessionId}/${this.sessionId}`
 			: this.sessionId
 		this.eventHook = config.eventHook
+		this.evidenceJournal = config.evidenceJournal
+		this.evidenceRequired = config.evidenceRequired ?? false
+		this.createChildEvidenceJournal = config.createChildEvidenceJournal
+		this.stopSignal = config.signal
+		this.evidenceFailureHandler = config.evidenceFailureHandler
+		if (this.evidenceRequired && !this.evidenceJournal) throw new Error("evidenceRequired needs an EvidenceJournal")
 		this.eventFeed = new EventFeed(config.workspaceRoot, this.sessionId, (eventType, error) => {
 			this.logger.warn(`[events] failed to record '${eventType}' (non-fatal; dashboard misses this event)`, {
 				error: error instanceof Error ? error.message : String(error),
@@ -2166,6 +2207,10 @@ export class HeadlessSession {
 		// state, and recordUsage's live-snapshot removal below never races a
 		// still-in-flight write from the last iteration.
 		await this.drainAuxWrites()
+		if (this.evidenceJournal) {
+			const stopped = await this.appendEvidence({ sessionId: this.sessionId, requestId: `${this.evidenceRunId}_session_stop`, kind: "session_stop", actor: "headlesscode-loop", origin: "session-lifecycle", payload: { status: result.status, reason: result.reason, error: result.error, iterations: result.iterations, toolCalls: result.toolCalls } })
+			if (!stopped && this.evidenceRequired) result = { ...result, status: "error", reason: "evidence", error: `${this.evidenceFault}; session outcome could not be durably recorded` }
+		}
 		await this.recordMemory(result)
 		// Surface the budget/usage accounting on every result now (previously
 		// only present when a budget was configured).
@@ -2615,10 +2660,13 @@ export class HeadlessSession {
 			return
 		}
 
-		// Consume the marker BEFORE appending: if the removal fails, no message
-		// is injected this iteration and the marker is simply retried next
-		// iteration — a failure between push and delete would otherwise
-		// re-inject the same message on the next iteration.
+		// Persist an acknowledged intervention before applying it. The stable
+		// request id makes a retry idempotent if marker removal fails.
+		const interventionRequestId = `${this.evidenceRunId}_human_intervention_${sha256(raw).slice(0, 32)}`
+		if (!(await this.appendEvidence({ sessionId: this.sessionId, requestId: interventionRequestId, kind: "human_intervention", actor: "supervisor-injected-message", origin: "harness.inject-message", payload: { text } })) && this.evidenceRequired) return
+
+		// Consume the marker before mutating history so a failed removal does not
+		// inject the same message more than once.
 		try {
 			await fsp.rm(markerPath, { force: true })
 		} catch (error) {
@@ -3378,23 +3426,26 @@ export class HeadlessSession {
 		repeatPenaltyOverride?: number,
 		excludedToolNames?: string[],
 	): Promise<LlmResponse> {
+		if (this.stopSignal?.aborted) throw new Error("session stopped by supervisor")
 		const controller = new AbortController()
 		const timer = setTimeout(() => controller.abort(), this.config.llmTimeoutMs)
+		const composedSignal = combineAbortSignals([controller.signal, this.stopSignal])
+		const signal = composedSignal.signal
 		const excluded = new Set((excludedToolNames ?? []).filter((name) => name !== "attempt_completion"))
 		const tools =
 			excluded.size > 0 ? this.state.tools.filter((tool) => !excluded.has(tool.function.name)) : this.state.tools
 		try {
-			return await this.llmClient.createChatCompletion({
+			const request = {
 				model: this.config.model,
 				messages: requestMessages,
 				tools,
 				temperature: this.config.temperature,
 				maxTokens: this.config.maxTokens,
-				signal: controller.signal,
+				signal,
 				stream: this.config.stream,
 				reasoningEffort: this.config.reasoningEffort,
 				...(repeatPenaltyOverride !== undefined ? { repeatPenalty: repeatPenaltyOverride } : {}),
-				onStreamChunk: (kind, chunk) => {
+				onStreamChunk: (kind: "text" | "reasoning" | "tool", chunk: string) => {
 					// Dashboard live-typing: forward each chunk to the event feed
 					// (truncated like other large fields). Non-fatal — a feed
 					// write failure must never abort the LLM call.
@@ -3404,9 +3455,50 @@ export class HeadlessSession {
 						{ iteration },
 					)
 				},
-			})
+			}
+			const requestId = `${this.evidenceRunId}_model_request_${iteration}_${this.evidenceRequestCounter++}`
+			if (this.evidenceJournal) {
+				const { signal: _signal, onStreamChunk: _onStreamChunk, ...wireRequest } = request
+				const runtime = { node: process.version, platform: process.platform, arch: process.arch }
+				const hashes = {
+					prompt: sha256(canonicalJson(request.messages)),
+					toolset: sha256(canonicalJson(request.tools ?? [])),
+					runtime: sha256(canonicalJson(runtime)),
+					policy: sha256(canonicalJson({ mode: this.config.mode, permissions: this.executor.permissions })),
+				}
+				if (!(await this.appendEvidence({ sessionId: this.sessionId, requestId, iteration, kind: "model_request", actor: "headlesscode-loop", origin: "llm-client", payload: { ...wireRequest, runtime, hashes } }))) {
+					throw new Error(this.evidenceFault ?? "required evidence request was not acknowledged")
+				}
+			}
+			const response = await this.llmClient.createChatCompletion(request)
+			if (this.evidenceJournal && !(await this.appendEvidence({ sessionId: this.sessionId, requestId: `${this.evidenceRunId}_model_response_${iteration}_${this.evidenceRequestCounter++}`, iteration, kind: "model_response", actor: "headlesscode-loop", origin: "llm-client", payload: { model: this.config.model, requestId, response } }))) {
+				throw new Error(this.evidenceFault ?? "required evidence response was not acknowledged")
+			}
+			return response
 		} finally {
+			composedSignal.dispose()
 			clearTimeout(timer)
+		}
+	}
+
+	private evidenceRequestCounter = 0
+
+	private async appendEvidence(input: EvidenceInput): Promise<boolean> {
+		if (!this.evidenceJournal) return !this.evidenceRequired
+		try {
+			await this.evidenceJournal.append(input, { signal: this.stopSignal, timeoutMs: 15_000 })
+			return true
+		} catch (error) {
+			this.evidenceFault = `Evidence persistence failed: ${error instanceof Error ? error.message : String(error)}`
+			this.logger.error("[evidence] journal append failed", { kind: input.kind, error: this.evidenceFault })
+			if (this.evidenceRequired) {
+				try { await this.evidenceFailureHandler?.(error) } catch (handlerError) {
+					this.logger.error("[evidence] supervisor failure handler failed", { error: handlerError instanceof Error ? handlerError.message : String(handlerError) })
+				}
+				return false
+			}
+			this.logger.warn("[evidence] non-authoritative local run continues after journal failure")
+			return true
 		}
 	}
 
@@ -3609,6 +3701,9 @@ export class HeadlessSession {
 			// now, so a user-role message inserted here can never split an
 			// assistant→tool adjacency (see checkInjectedMessage).
 			await this.checkInjectedMessage()
+			if (this.evidenceFault && this.evidenceRequired) {
+				return { status: "error", reason: "evidence", error: `${this.evidenceFault}; session ended incomplete`, iterations: iteration, toolCalls }
+			}
 
 			// Budget check BEFORE this LLM call: elapsed time, iteration count
 			// and accumulated cost are all re-checked here so no further spend
@@ -3793,6 +3888,7 @@ export class HeadlessSession {
 				this.logger.error("[loop] LLM request failed", { iteration, error: message })
 				return {
 					status: "error",
+					...(this.evidenceRequired && this.evidenceFault ? { reason: "evidence" } : {}),
 					error: `LLM request failed on iteration ${iteration}: ${message}`,
 					iterations: iteration,
 					toolCalls,
@@ -4326,6 +4422,9 @@ export class HeadlessSession {
 							claimsPassed: verification.filter((v) => v.verified).length,
 							claimsUnverified: verification.filter((v) => !v.verified).length,
 						}
+						if (!(await this.appendEvidence({ sessionId: this.sessionId, requestId: `${this.evidenceRunId}_verification_${iteration}_${this.evidenceRequestCounter++}`, iteration, kind: "verification", actor: "headlesscode-loop", origin: "claim-verifier", payload: { claims: claims.map(claimLabel), results: verification } })) && this.evidenceRequired) {
+							return { status: "error", reason: "evidence", error: `${this.evidenceFault}; verification result was not acknowledged`, iterations: iteration, toolCalls }
+						}
 						if (!allClaimsVerified(verification)) {
 							// Identical-call guardrail reset — the same live
 							// failure the verifyBeforeCompletion deferral above
@@ -4581,6 +4680,9 @@ export class HeadlessSession {
 									claimsPassed: verification.filter((v) => v.verified).length,
 									claimsUnverified: verification.filter((v) => !v.verified).length,
 								}
+								if (!(await this.appendEvidence({ sessionId: this.sessionId, requestId: `${this.evidenceRunId}_text_verification_${iteration}_${this.evidenceRequestCounter++}`, iteration, kind: "verification", actor: "headlesscode-loop", origin: "claim-verifier", payload: { claims: claims.map(claimLabel), results: verification } })) && this.evidenceRequired) {
+									return { status: "error", reason: "evidence", error: `${this.evidenceFault}; verification result was not acknowledged`, iterations: iteration, toolCalls }
+								}
 								if (!allClaimsVerified(verification)) {
 									// Same identical-call guardrail reset as the
 									// attempt_completion deferral above — a text-only
@@ -4746,7 +4848,27 @@ export class HeadlessSession {
 			const runCall = async (call: ParsedToolCall, index: number): Promise<void> => {
 				let resultContent: string
 				let isError: boolean
-				if (call.parseError) {
+				const actionId = call.id || `action_${iteration}_${index}`
+				const intentAcknowledged = await this.appendEvidence({
+					sessionId: this.sessionId,
+					requestId: `${this.evidenceRunId}_tool_intent_${iteration}_${index}`,
+					actionId,
+					iteration,
+					kind: "tool_intent",
+					actor: "headlesscode-loop",
+					origin: "model-tool-call",
+					payload: { id: call.id, name: call.name, arguments: call.args, rawArguments: call.rawArguments, parseError: call.parseError },
+				})
+				if (!intentAcknowledged) {
+					resultContent = `[Error] ${this.evidenceFault ?? "required evidence intent was not acknowledged"}; tool was not executed.`
+					isError = true
+				} else if (this.stopSignal?.aborted) {
+					resultContent = "[Error] Session stopped by supervisor before tool execution."
+					isError = true
+				} else if (this.evidenceFault && this.evidenceRequired) {
+					resultContent = `[Error] ${this.evidenceFault}; later tool effects were blocked.`
+					isError = true
+				} else if (call.parseError) {
 					resultContent = `[Error] Failed to parse arguments for tool '${call.name}': ${call.parseError}. Raw arguments: ${call.rawArguments}`
 					isError = true
 				} else if (refusedNewTaskIds.has(call.id)) {
@@ -4779,15 +4901,29 @@ export class HeadlessSession {
 					resultContent = result.content
 					isError = result.isError
 				}
+				if (intentAcknowledged && !(await this.appendEvidence({
+					sessionId: this.sessionId,
+					requestId: `${this.evidenceRunId}_tool_result_${iteration}_${index}`,
+					actionId,
+					iteration,
+					kind: "tool_result",
+					actor: "headlesscode-loop",
+					origin: "tool-executor",
+					payload: { tool: call.name, isError, result: resultContent },
+				}))) {
+					resultContent = `${resultContent}\n[Evidence error] ${this.evidenceFault}; later tool effects were blocked.`
+					isError = true
+				}
 				executed.set(index, { resultContent, isError })
 			}
 
 			// Parallel wave: the turn's independent read-only/exploration calls
-			// run concurrently (the S3 win — reads share no mutable state).
+			// run concurrently unless required evidence is enabled. Required mode
+			// serializes every action so a missing result ACK blocks the next one.
 			// Serial calls still execute at their exact submission position in
 			// the post-pass below, so an early mistake-limit abort never runs an
 			// edit the serial loop would have skipped.
-			await Promise.all(parallelGroup.map(({ call, index }) => runCall(call, index)))
+			if (!this.evidenceRequired) await Promise.all(parallelGroup.map(({ call, index }) => runCall(call, index)))
 
 			// Feed results back + bookkeeping in ORIGINAL tool_calls order: the
 			// assistant→tool adjacency contract, same-file diagnosis,
@@ -5020,6 +5156,9 @@ export class HeadlessSession {
 				}
 			}
 			previousIterationTools = Object.freeze(boundaryTools.map((record) => Object.freeze(record)))
+			if (this.evidenceFault && this.evidenceRequired) {
+				return { status: "error", reason: "evidence", error: `${this.evidenceFault}; session ended incomplete`, iterations: iteration, toolCalls }
+			}
 
 			// Blind tree-walking guardrail (P1.6): after N consecutive
 			// iterations whose every tool call is a plain read/exploration
@@ -5357,6 +5496,15 @@ export class HeadlessSession {
 			1,
 			Math.min(remaining, Math.max(this.config.minChildIterations, Math.floor(remaining * fraction))),
 		)
+		const childSessionId = randomUUID()
+		let childEvidenceJournal: EvidenceJournal | undefined
+		if (this.evidenceRequired) {
+			if (!this.createChildEvidenceJournal) return { content: "[Error] evidence-required child session has no supervisor capability provisioner; child was not started.", isError: true }
+			try { childEvidenceJournal = await this.createChildEvidenceJournal(childSessionId) } catch (error) {
+				return { content: `[Error] evidence-required child capability provisioning failed: ${error instanceof Error ? error.message : String(error)}; child was not started.`, isError: true }
+			}
+			if (!childEvidenceJournal) return { content: "[Error] evidence-required child session received no append capability; child was not started.", isError: true }
+		}
 
 		this.logger.info("[new_task] delegating to child session", {
 			childMode: mode,
@@ -5368,6 +5516,7 @@ export class HeadlessSession {
 
 		const child = new HeadlessSession({
 			workspaceRoot: this.config.workspaceRoot,
+			sessionId: childSessionId,
 			// Lineage: the child is one level deeper and knows its parent.
 			parentSessionId: this.sessionId,
 			recursionDepth: this.recursionDepth + 1,
@@ -5423,6 +5572,11 @@ export class HeadlessSession {
 			maxPauseMs: this.config.maxPauseMs,
 			pausePollIntervalMs: this.config.pausePollIntervalMs,
 			eventHook: this.config.eventHook,
+			evidenceJournal: childEvidenceJournal,
+			evidenceRequired: this.evidenceRequired,
+			createChildEvidenceJournal: this.createChildEvidenceJournal,
+			signal: this.stopSignal,
+			evidenceFailureHandler: this.evidenceFailureHandler,
 			customModes: this.customModes,
 			localExplore: this.config.localExplore,
 			// Internal plumbing: the shared budget tracker IS the containment
