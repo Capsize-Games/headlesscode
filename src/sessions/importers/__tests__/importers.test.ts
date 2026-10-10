@@ -98,7 +98,7 @@ async function testOpaqueOversizeFilteringAndSymlinkSource(): Promise<void> {
 	try {
 		await fs.writeFile(target, "{}\n")
 		await fs.symlink(target, link)
-		await assert.rejects(readBoundedFile(link), /must not be a symlink/)
+		await assert.rejects(readBoundedFile(link), /contains a symlink/)
 	} finally { await fs.rm(directory, { recursive: true, force: true }) }
 }
 
@@ -183,6 +183,55 @@ async function testDiscoverySkipsSymlinksAndDoesNotPrintBodies(): Promise<void> 
 	} finally { await fs.rm(directory, { recursive: true, force: true }) }
 }
 
+async function testExplicitClaudeRootScopesWorkspaceUnlessAll(): Promise<void> {
+	await fs.mkdir(scratchRoot, { recursive: true })
+	const directory = await fs.mkdtemp(path.join(scratchRoot, "claude-discovery-scope-"))
+	const workspace = path.join(directory, "workspace-a")
+	const otherWorkspace = path.join(directory, "workspace-b")
+	const providerRoot = path.join(directory, "claude-projects")
+	try {
+		await fs.mkdir(workspace, { recursive: true })
+		await fs.mkdir(otherWorkspace, { recursive: true })
+		await fs.mkdir(providerRoot, { recursive: true })
+		const a = path.join(providerRoot, "project-a.jsonl")
+		const b = path.join(providerRoot, "nested", "project-b.jsonl")
+		await fs.mkdir(path.dirname(b), { recursive: true })
+		await fs.writeFile(a, `${JSON.stringify({ type: "user", sessionId: "synthetic-a", cwd: workspace, message: { role: "user", content: "SYNTHETIC A" } })}\n`)
+		await fs.writeFile(b, `${JSON.stringify({ type: "user", sessionId: "synthetic-b", cwd: otherWorkspace, message: { role: "user", content: "SYNTHETIC B" } })}\n`)
+		const scoped = await discoverImportFiles("claude", { workspaceRoot: workspace, sourceRoot: providerRoot })
+		assert.deepEqual(scoped.map(item => item.file), [a])
+		const all = await discoverImportFiles("claude", { workspaceRoot: workspace, sourceRoot: providerRoot, all: true })
+		assert.deepEqual(new Set(all.map(item => item.file)), new Set([a, b]))
+	} finally { await fs.rm(directory, { recursive: true, force: true }) }
+}
+
+async function testDiscoveryRejectsSymlinkedRootAncestorsAndIgnoresMuseToolCwd(): Promise<void> {
+	await fs.mkdir(scratchRoot, { recursive: true })
+	const directory = await fs.mkdtemp(path.join(scratchRoot, "discovery-ancestors-"))
+	const workspace = path.join(directory, "workspace")
+	const actualRoot = path.join(directory, "actual-root")
+	const symlinkParent = path.join(directory, "linked-parent")
+	const linkedRoot = path.join(symlinkParent, "sessions")
+	try {
+		await fs.mkdir(workspace, { recursive: true })
+		await fs.mkdir(path.join(actualRoot, "2026", "01", "01"), { recursive: true })
+		await fs.symlink(actualRoot, symlinkParent)
+		await assert.rejects(discoverImportFiles("codex", { workspaceRoot: workspace, sourceRoot: linkedRoot }), /contains a symlink/)
+
+		const museFile = path.join(actualRoot, "2026", "01", "01", "session.jsonl")
+		await fs.writeFile(museFile, `${JSON.stringify({
+			sequence: 1,
+			recorded_at: "2026-01-01T00:00:00.000Z",
+			payload_type: "synthetic.tool.output",
+			payload: { cwd: workspace, task: { workspace_root: workspace, command: "SYNTHETIC" } },
+		})}\n`)
+		await assert.rejects(discoverImportFiles("muse", { workspaceRoot: workspace, sourceRoot: actualRoot }), /workspace metadata discovery is not supported/)
+		await assert.rejects(discoverImportFiles("muse", { workspaceRoot: workspace, all: true }), /requires an explicit --source-root/)
+		const allMuse = await discoverImportFiles("muse", { workspaceRoot: workspace, sourceRoot: actualRoot, all: true })
+		assert.deepEqual(allMuse.map(item => item.file), [museFile])
+	} finally { await fs.rm(directory, { recursive: true, force: true }) }
+}
+
 const tests: [string, () => Promise<void>][] = [
 	["Claude fixture maps messages and tool pairs", testClaudeFixtureMapsMessagesAndToolPairs],
 	["Codex fixture uses canonical records only", testCodexFixtureUsesCanonicalRecordsOnly],
@@ -194,6 +243,8 @@ const tests: [string, () => Promise<void>][] = [
 	["Line count limit stops parsing", testLineCountLimitStopsParsing],
 	["Bounded read rejects oversized source", testBoundedReadRejectsOversize],
 	["Discovery skips symlinks and hides bodies", testDiscoverySkipsSymlinksAndDoesNotPrintBodies],
+	["Explicit Claude root scopes to workspace unless all is requested", testExplicitClaudeRootScopesWorkspaceUnlessAll],
+	["Discovery rejects symlink ancestors and ignores arbitrary Muse cwd fields", testDiscoveryRejectsSymlinkedRootAncestorsAndIgnoresMuseToolCwd],
 ]
 
 for (const [name, test] of tests) {

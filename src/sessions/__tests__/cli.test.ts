@@ -85,6 +85,9 @@ async function testSessionsCliUsageErrorsAreActionable(): Promise<void> {
 	const help = await capture(() => sessionsMain(["--help"]))
 	assert.equal(help.code, 0)
 	assert.match(help.stdout, /headlesscode sessions/)
+	const museDiscovery = await capture(() => sessionsMain(["discover", "--from", "muse"]))
+	assert.equal(museDiscovery.code, 2)
+	assert.match(museDiscovery.stderr, /workspace metadata discovery is not supported/)
 }
 
 for (const [name, test] of [

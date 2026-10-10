@@ -70,12 +70,49 @@ export function hashSource(bytes: Buffer): string {
 	return createHash("sha256").update(bytes).digest("hex")
 }
 
+export async function assertNoSymlinkPath(filePath: string): Promise<void> {
+	const absolute = path.resolve(filePath)
+	const parsed = path.parse(absolute)
+	let current = parsed.root
+	for (const part of absolute.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+		current = path.join(current, part)
+		let info: Awaited<ReturnType<typeof fs.lstat>>
+		try { info = await fs.lstat(current) } catch (cause) {
+			if ((cause as NodeJS.ErrnoException).code === "ENOENT" || (cause as NodeJS.ErrnoException).code === "ENOTDIR") return
+			throw cause
+		}
+		if (info.isSymbolicLink()) throw new Error(`Import path contains a symlink: ${current}`)
+	}
+}
+
+export async function readBoundedPrefix(filePath: string, maxBytes: number, signal?: AbortSignal): Promise<Buffer> {
+	signal?.throwIfAborted()
+	const absolute = path.resolve(filePath)
+	await assertNoSymlinkPath(absolute)
+	const noFollow = typeof fs.constants?.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0
+	const handle = await fs.open(absolute, fs.constants.O_RDONLY | noFollow)
+	try {
+		const before = await handle.stat()
+		if (!before.isFile()) throw new Error(`Import metadata source is not a regular file: ${filePath}`)
+		const buffer = Buffer.alloc(maxBytes)
+		let offset = 0
+		while (offset < maxBytes) {
+			signal?.throwIfAborted()
+			const { bytesRead } = await handle.read(buffer, offset, maxBytes - offset, offset)
+			if (bytesRead === 0) break
+			offset += bytesRead
+		}
+		const after = await handle.stat()
+		const current = await fs.lstat(absolute)
+		if (current.isSymbolicLink() || current.dev !== before.dev || current.ino !== before.ino || after.dev !== before.dev || after.ino !== before.ino) throw new Error("Import metadata source changed while being read; retry discovery.")
+		return buffer.subarray(0, offset)
+	} finally { await handle.close() }
+}
+
 export async function readBoundedFile(filePath: string, signal?: AbortSignal): Promise<{ bytes: Buffer; warnings: string[] }> {
 	signal?.throwIfAborted()
 	const absolute = path.resolve(filePath)
-	const parent = path.dirname(absolute)
-	const realParent = await fs.realpath(parent)
-	if (realParent !== parent) throw new Error(`Import source has a symlinked parent path: ${filePath}`)
+	await assertNoSymlinkPath(absolute)
 	const beforePath = await fs.lstat(absolute)
 	if (beforePath.isSymbolicLink()) throw new Error(`Import source must not be a symlink: ${filePath}`)
 	const noFollow = typeof fs.constants?.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0
