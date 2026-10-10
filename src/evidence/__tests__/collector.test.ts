@@ -10,6 +10,7 @@ import type { EvidenceInput, EvidenceJournal, EvidenceReceipt } from "../types.j
 import { HeadlessSession } from "../../engine/loop.js"
 import { ToolExecutor } from "../../tools/executor.js"
 import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } from "../../engine/types.js"
+import { canonicalJson, sha256 } from "../canonical.js"
 
 function evidence(sessionId: string, requestId: string, kind: string, payload: unknown): EvidenceInput {
 	return { sessionId, requestId, kind, actor: "test", origin: "fixture", payload }
@@ -93,10 +94,28 @@ async function testCollectorRestartIdempotencyAndPinnedVerification(): Promise<v
 	assert.equal(verifyEvidenceBundle(deleted, pinnedKey, bundle.head).valid, false, "deleted records are detected")
 	const invalidHead = { ...bundle.head, signature: "AA==" }
 	assert.equal(verifyEvidenceBundle(bundle, pinnedKey, invalidHead).valid, false, "invalid head signature is detected")
+	await collector.close()
+	const unackedTailInput = evidence(sessionId, "unacked-tail", "tool_intent", { tool: "write_to_file" })
+	const unackedBody = {
+		...unackedTailInput,
+		schemaVersion: 1,
+		sequence: 4,
+		previousDigest: bundle.records.at(-1)?.digest ?? null,
+		requestDigest: sha256(canonicalJson(unackedTailInput)),
+		occurredAt: "2026-10-10T00:00:00.000Z",
+		recordedAt: "2026-10-10T00:00:00.000Z",
+		source: "worker-reported",
+	}
+	const unackedRecord = { ...unackedBody, digest: sha256(canonicalJson(unackedBody)) }
+	await fs.appendFile(path.join(storageDir, "sessions", `${sessionId}.jsonl`), `${canonicalJson(unackedRecord)}\n{"sequence":`)
+	collector = await FileEvidenceCollector.start(options)
+	const recoveredClient = new UnixEvidenceJournal({ socketPath, sessionId, capability, pinnedPublicKey: pinnedKey })
+	const recoveredReceipt = await recoveredClient.append(unackedTailInput)
+	assert.equal(recoveredReceipt.sequence, 4, "retry after discarding a crash tail receives a new ACK")
+	assert.equal((await collector.exportBundle(sessionId)).records.length, 4, "retry appends the discarded request instead of returning a stale ACK")
 	await collector.revokeSession(sessionId)
-	assert.equal((await collector.exportBundle(sessionId)).records.length, 3, "revoked sessions remain exportable")
-	await assert.rejects(() => restartedClient.append(evidence(sessionId, "after-revoke", "tool_intent", {})), /403/)
-
+	assert.equal((await collector.exportBundle(sessionId)).records.length, 4, "revoked sessions remain exportable")
+	await assert.rejects(() => recoveredClient.append(evidence(sessionId, "after-revoke", "tool_intent", {})), /403/)
 	await collector.close()
 	await assert.rejects(() => restartedClient.append(evidence(sessionId, "offline", "tool_intent", {})), /collector|connect|ENOENT|ECONNREFUSED/i)
 	await assert.rejects(() => FileEvidenceCollector.start({ ...options, expectedKeyId: `sha256:${"0".repeat(64)}` }), /pinned identity/)

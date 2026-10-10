@@ -3457,19 +3457,21 @@ export class HeadlessSession {
 				},
 			}
 			const requestId = `${this.evidenceRunId}_model_request_${iteration}_${this.evidenceRequestCounter++}`
-			const { signal: _signal, onStreamChunk: _onStreamChunk, ...wireRequest } = request
-			const runtime = { node: process.version, platform: process.platform, arch: process.arch }
-			const hashes = {
-				prompt: sha256(canonicalJson(request.messages)),
-				toolset: sha256(canonicalJson(request.tools ?? [])),
-				runtime: sha256(canonicalJson(runtime)),
-				policy: sha256(canonicalJson({ mode: this.config.mode, permissions: this.executor.permissions })),
-			}
-			if (!(await this.appendEvidence({ sessionId: this.sessionId, requestId, iteration, kind: "model_request", actor: "headlesscode-loop", origin: "llm-client", payload: { ...wireRequest, runtime, hashes } }))) {
-				throw new Error(this.evidenceFault ?? "required evidence request was not acknowledged")
+			if (this.evidenceJournal) {
+				const { signal: _signal, onStreamChunk: _onStreamChunk, ...wireRequest } = request
+				const runtime = { node: process.version, platform: process.platform, arch: process.arch }
+				const hashes = {
+					prompt: sha256(canonicalJson(request.messages)),
+					toolset: sha256(canonicalJson(request.tools ?? [])),
+					runtime: sha256(canonicalJson(runtime)),
+					policy: sha256(canonicalJson({ mode: this.config.mode, permissions: this.executor.permissions })),
+				}
+				if (!(await this.appendEvidence({ sessionId: this.sessionId, requestId, iteration, kind: "model_request", actor: "headlesscode-loop", origin: "llm-client", payload: { ...wireRequest, runtime, hashes } }))) {
+					throw new Error(this.evidenceFault ?? "required evidence request was not acknowledged")
+				}
 			}
 			const response = await this.llmClient.createChatCompletion(request)
-			if (!(await this.appendEvidence({ sessionId: this.sessionId, requestId: `${this.evidenceRunId}_model_response_${iteration}_${this.evidenceRequestCounter++}`, iteration, kind: "model_response", actor: "headlesscode-loop", origin: "llm-client", payload: { model: this.config.model, requestId, response } }))) {
+			if (this.evidenceJournal && !(await this.appendEvidence({ sessionId: this.sessionId, requestId: `${this.evidenceRunId}_model_response_${iteration}_${this.evidenceRequestCounter++}`, iteration, kind: "model_response", actor: "headlesscode-loop", origin: "llm-client", payload: { model: this.config.model, requestId, response } }))) {
 				throw new Error(this.evidenceFault ?? "required evidence response was not acknowledged")
 			}
 			return response

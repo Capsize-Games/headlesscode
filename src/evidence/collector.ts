@@ -64,6 +64,7 @@ async function writeAtomic(file: string, contents: string, mode = 0o600): Promis
 export class FileEvidenceCollector {
 	private readonly sessions = new Map<string, SessionState>()
 	private readonly queues = new Map<string, Promise<void>>()
+	private capabilitiesWrite: Promise<void> = Promise.resolve()
 	private readonly privateKey: ReturnType<typeof createPrivateKey>
 	private readonly publicKeyPem: string
 	private readonly keyId: string
@@ -131,15 +132,26 @@ export class FileEvidenceCollector {
 		const capability = randomBytes(32).toString("base64url")
 		const state: SessionState = { capabilityHash: sha256(capability), active: true, lastSequence: 0, lastDigest: null, idempotency: new Map() }
 		this.sessions.set(sessionId, state)
-		await this.persistCapabilities()
 		await this.persistHead(sessionId, this.signHead(sessionId, 0, null))
+		await this.persistCapabilities()
 		return capability
 	}
 
 	async revokeSession(sessionId: string): Promise<void> {
-		const session = this.sessions.get(sessionId)
-		if (session) session.active = false
-		await this.persistCapabilities()
+		const prior = this.queues.get(sessionId) ?? Promise.resolve()
+		let release!: () => void
+		const gate = new Promise<void>((resolve) => { release = resolve })
+		const queued = prior.then(() => gate)
+		this.queues.set(sessionId, queued)
+		await prior
+		try {
+			const session = this.sessions.get(sessionId)
+			if (session) session.active = false
+			await this.persistCapabilities()
+		} finally {
+			release()
+			if (this.queues.get(sessionId) === queued) this.queues.delete(sessionId)
+		}
 	}
 
 	/** Supervisor-only append path. HTTP clients are always classified as worker-reported. */
@@ -178,6 +190,7 @@ export class FileEvidenceCollector {
 		this.queues.set(input.sessionId, queued)
 		await prior
 		try {
+			if (!state.active) throw new Error(`unknown or revoked session '${input.sessionId}'`)
 			const rawInputJson = boundedCanonicalJson(input, this.maxRecordBytes)
 			const submittedDigest = sha256(rawInputJson)
 			const safeInput = { ...input, payload: redactEvidenceValue(input.payload, this.secrets) }
@@ -207,10 +220,10 @@ export class FileEvidenceCollector {
 			const handle = await fs.open(file, "a", 0o600)
 			try { await handle.writeFile(line, "utf8"); await handle.sync() } finally { await handle.close() }
 			const receipt = createReceipt(input.sessionId, input.requestId, sequence, digest, submittedDigest, this.keyId, this.privateKey)
+			await this.persistHead(input.sessionId, this.signHead(input.sessionId, sequence, digest))
 			state.lastSequence = sequence
 			state.lastDigest = digest
 			state.idempotency.set(input.requestId, { inputDigest, receipt })
-			await this.persistHead(input.sessionId, this.signHead(input.sessionId, sequence, digest))
 			await this.persistCapabilities()
 			return receipt
 		} finally {
@@ -230,9 +243,13 @@ export class FileEvidenceCollector {
 		await fs.mkdir(path.dirname(this.headPath(id)), { recursive: true, mode: 0o700 })
 		await writeAtomic(this.headPath(id), `${canonicalJson(head)}\n`)
 	}
-	private async persistCapabilities(): Promise<void> {
-		const entries = [...this.sessions].map(([sessionId, state]) => ({ sessionId, capabilityHash: state.capabilityHash, active: state.active, lastSequence: state.lastSequence, lastDigest: state.lastDigest, idempotency: [...state.idempotency] }))
-		await writeAtomic(this.capabilitiesPath(), `${canonicalJson(entries)}\n`)
+	private persistCapabilities(): Promise<void> {
+		const write = this.capabilitiesWrite.then(async () => {
+			const entries = [...this.sessions].map(([sessionId, state]) => ({ sessionId, capabilityHash: state.capabilityHash, active: state.active, lastSequence: state.lastSequence, lastDigest: state.lastDigest, idempotency: [...state.idempotency] }))
+			await writeAtomic(this.capabilitiesPath(), `${canonicalJson(entries)}\n`)
+		})
+		this.capabilitiesWrite = write.catch(() => {})
+		return write
 	}
 	private async loadCapabilities(): Promise<void> {
 		try {
@@ -244,15 +261,22 @@ export class FileEvidenceCollector {
 		} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error }
 	}
 	private async loadSession(id: string): Promise<void> {
-		let records = await this.readRecords(id)
 		const state = this.sessions.get(id)!
 		const storedHead = JSON.parse(await fs.readFile(this.headPath(id), "utf8")) as SignedSessionHead
 		if (!verifySignedHead(storedHead, this.publicKey)) throw new Error(`stored evidence head signature is invalid for session ${id}`)
+		const recordsRaw = await fs.readFile(this.recordsPath(id), "utf8").catch((error: NodeJS.ErrnoException) => {
+			if (error.code === "ENOENT") return ""
+			throw error
+		})
+		const completeEnd = recordsRaw.lastIndexOf("\n") + 1
+		const completeLines = recordsRaw.slice(0, completeEnd).split("\n").filter(Boolean)
+		if (completeLines.length < storedHead.sequence) throw new Error(`evidence records or signed head were deleted for session ${id}`)
+		const records = completeLines.slice(0, storedHead.sequence).map((line) => JSON.parse(line) as CanonicalEvidenceRecord)
 		let last = 0
 		let digest: string | null = null
 		const committedSequence = state.lastSequence
 		const committedDigest = state.lastDigest
-		if (records.length < storedHead.sequence || committedSequence > storedHead.sequence) throw new Error(`evidence records or signed head were deleted for session ${id}`)
+		if (committedSequence > storedHead.sequence) throw new Error(`evidence records or signed head were deleted for session ${id}`)
 		for (const record of records) {
 			if (record.sequence !== last + 1 || record.previousDigest !== digest) throw new Error(`evidence chain corrupt for session ${id}`)
 			const { digest: claimed, ...body } = record
@@ -267,12 +291,16 @@ export class FileEvidenceCollector {
 			last = record.sequence; digest = claimed
 		}
 		if (storedHead.sequence === 0 && storedHead.digest !== null) throw new Error(`empty signed head has a digest for session ${id}`)
-		if (records.length > storedHead.sequence) {
-			records = records.slice(0, storedHead.sequence)
-			const trimmed = `${records.map((record) => canonicalJson(record)).join("\n")}${records.length ? "\n" : ""}`
+		const committedRecords = records
+		const committedBytes = committedRecords.length ? `${committedRecords.map((record) => canonicalJson(record)).join("\n")}\n` : ""
+		if (completeLines.length > storedHead.sequence || completeEnd !== recordsRaw.length || recordsRaw !== committedBytes) {
 			const handle = await fs.open(this.recordsPath(id), "w", 0o600)
-			try { await handle.writeFile(trimmed, "utf8"); await handle.sync() } finally { await handle.close() }
+			try { await handle.writeFile(committedBytes, "utf8"); await handle.sync() } finally { await handle.close() }
 		}
+		state.idempotency = new Map(committedRecords.map((record) => [record.requestId, {
+			inputDigest: sha256(boundedCanonicalJson({ source: record.source, submittedDigest: record.requestDigest }, this.maxRecordBytes)),
+			receipt: createReceipt(id, record.requestId, record.sequence, record.digest, record.requestDigest, this.keyId, this.privateKey),
+		}]))
 		state.lastSequence = storedHead.sequence
 		state.lastDigest = storedHead.digest
 		await this.persistCapabilities()
