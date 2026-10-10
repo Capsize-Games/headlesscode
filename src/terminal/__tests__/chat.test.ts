@@ -456,7 +456,7 @@ async function main(): Promise<void> {
 	await testSaveFailureCanBeRetried()
 	await testInputAndRendererBounds()
 	await testReadlineCtrlCInPseudoTerminal()
-	console.log("terminal chat tests passed")
+	console.log("All 11 terminal chat tests passed")
 }
 
 main().catch((error) => { console.error(error); process.exitCode = 1 })
