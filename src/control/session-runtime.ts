@@ -36,11 +36,12 @@ export async function startSessionEmergencyControl(options: {
 
 export async function finishSessionEmergencyControl(control?: EmergencyControl): Promise<boolean> {
 	if (!control) return true
+	let accepted = true
 	try {
 		if (control.state === "running") {
 			const stopped = await control.command("stop", "session finished")
-			return stopped.accepted && stopped.record.state === "stopped"
+			accepted = stopped.accepted && stopped.record.state === "stopped"
 		}
-		return control.state !== "failed-to-stop"
 	} finally { await control.close() }
+	return accepted && (control.state === "stopped" || control.state === "paused")
 }
