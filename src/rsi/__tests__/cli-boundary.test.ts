@@ -42,12 +42,22 @@ test("a real evaluation snapshot typechecks with all protected RSI implementatio
 	fs.mkdirSync(scratch, { recursive: true, mode: 0o700 })
 	const root = fs.mkdtempSync(path.join(scratch, "rsi-cli-boundary-typecheck-"))
 	const previousTmpDir = process.env.TMPDIR
-	process.env.TMPDIR = scratch
+	const previousGitConfigGlobal = process.env.GIT_CONFIG_GLOBAL
+	const previousGitTrace2Event = process.env.GIT_TRACE2_EVENT
+	const gitConfig = path.join(root, "forced-git-maintenance.config")
+	const gitTrace = path.join(root, "git-trace2.json")
 	try {
+		fs.writeFileSync(gitConfig, "[gc]\n\tauto = 1\n\tautoDetach = true\n[maintenance]\n\tauto = true\n", { mode: 0o600, flag: "wx" })
+		process.env.TMPDIR = scratch
+		process.env.GIT_CONFIG_GLOBAL = gitConfig
+		process.env.GIT_TRACE2_EVENT = gitTrace
 		const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoRoot, encoding: "utf8" }).trim()
 		const parsedConfig = parseRsiArgs(["--repo", repoRoot])
 		if (!parsedConfig.config || parsedConfig.error) throw new Error(parsedConfig.error ?? "could not make evaluation snapshot config")
 		const snapshot = createEvaluationSnapshotBundle(repoRoot, commit, parsedConfig.config)
+		const gitEvents = fs.readFileSync(gitTrace, "utf8")
+		assert.doesNotMatch(gitEvents, /"argv":\["git","maintenance","run","--auto"/, "snapshot Git commit must not detach background maintenance")
+		assert.doesNotMatch(gitEvents, /"argv":\["git","gc","--auto"/, "snapshot Git commit must not detach background garbage collection")
 		const bundlePath = path.join(root, "evaluation.bundle")
 		const clone = path.join(root, "candidate")
 		fs.writeFileSync(bundlePath, snapshot.content, { mode: 0o600, flag: "wx" })
@@ -61,6 +71,10 @@ test("a real evaluation snapshot typechecks with all protected RSI implementatio
 	} finally {
 		if (previousTmpDir === undefined) delete process.env.TMPDIR
 		else process.env.TMPDIR = previousTmpDir
+		if (previousGitConfigGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL
+		else process.env.GIT_CONFIG_GLOBAL = previousGitConfigGlobal
+		if (previousGitTrace2Event === undefined) delete process.env.GIT_TRACE2_EVENT
+		else process.env.GIT_TRACE2_EVENT = previousGitTrace2Event
 		fs.rmSync(root, { recursive: true, force: true })
 	}
 })
