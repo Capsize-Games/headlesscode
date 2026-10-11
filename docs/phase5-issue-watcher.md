@@ -36,7 +36,8 @@ built as a server — see [Webhook upgrade path](#webhook-upgrade-path-spec-54).
 │        b. writeTaskFiles(...) → plans/parallel-tasks/<taskFile>          │
 │        c. spawn: bash scripts/spawn-parallel-worktrees.sh <triples>      │
 │           (the existing bash spawner — no worktree creation in TS)       │
-│        d. state entry → {status: "done"} or {status: "failed", error}    │
+│        d. ordinary issue: state entry → done/failed                      │
+│           headlesscode-job: remain spawned/running until a later sweep   │
 │                                                                          │
 │  5. log the sweep: found / new / skipped / spawned / deferred / failed   │
 └──────────────────────────────────────────────────────────────────────────┘
@@ -46,7 +47,8 @@ The watcher lives in [`src/watcher/`](../src/watcher/index.ts):
 
 - [`src/watcher/github.ts`](../src/watcher/github.ts) — the GitHub REST client
   (native `fetch`): `ghApi()`, `listIssues()` (label filter, PR filtering,
-  pagination, `maxTotal` cap), `getIssue()`, `addLabel()`, `createGhClient()`.
+  pagination, `maxTotal` cap), `getIssue()`, lifecycle label/comment/close
+  operations, pull request lookup by head branch, `createGhClient()`.
   Auth via `GH_TOKEN` / `GITHUB_TOKEN`; base URL override via
   `GITHUB_API_BASE_URL` (tests/mocks). The token is **never logged** and never
   written to state.
@@ -95,7 +97,10 @@ The watcher closes it by persisting **before** spawning:
 1. `markProcessed(state, { …, status: "spawned", groups, spawnedAt })` +
    `saveWatcherState()` — durable **before** the spawn command runs;
 2. spawn;
-3. `markProcessed(state, { …, status: "done" | "failed", error? })` + save.
+3. For ordinary issues, record the spawn result. For `headlesscode-job`, a
+   successful spawn remains `spawned`; a later poll records `done` or `failed`
+   only after every worktree has both `.harness.done/` and a valid
+   `.harness.exit` value.
 
 Consequences:
 
@@ -105,6 +110,39 @@ Consequences:
   (the process died before the spawn). This is the safe failure direction
   (never duplicate work); the orphaned entry is visible in the state file
   for manual inspection and can be re-run by deleting the entry.
+
+### UwUChat job intake
+
+An issue carrying both the configured watcher label and `headlesscode-job` uses
+the body sections `Task`, `Executor`, and `Submitted-by`. `Executor` must be a
+single line containing `muse` or `loop`; `loop` selects the built-in HeadlessCode
+executor. Only the `Task` section is sent to the worker. The other sections are
+metadata; `Submitted-by` is recorded as unverified text and does not identify
+or authenticate the person or service that created the issue. Intake rejects
+missing, duplicate, oversized, or unsupported sections. An executor that
+conflicts with an executor label or watcher-wide default is rejected before
+dispatch.
+
+After detached dispatch, the watcher keeps a `headlesscode:running` label and
+reserves the worktrees against its concurrency limit. A later continuous poll
+checks each worktree's completion markers. When all exit codes are zero, it
+posts one bounded result summary, links only pull requests found for the exact
+generated branches in the same repository, applies `headlesscode:done`, and
+closes the issue. If no matching pull request exists, the result comment says
+so; when branch metadata is unavailable, the comment says lookup could not be
+performed and includes no PR link. A nonzero worker exit applies
+`headlesscode:failed`, posts a summary, and leaves the issue open. Missing or
+malformed markers leave it running. Result
+comments carry an idempotency marker so a restart can retry GitHub updates
+without posting the same result again.
+
+`--run-once` only performs one poll. A successful launch therefore leaves a
+job issue running; completion labels, result comments, and automatic closing
+require a later poll. Keep the watcher running continuously for those updates.
+In runner-pool mode, terminal issue reporting does not release the permanent
+runner claim. That claim remains quarantined and reserves capacity until an
+operator independently confirms worker and guest teardown through the existing
+claim recovery procedure.
 
 ### Restart safety
 
@@ -161,6 +199,13 @@ Environment:
   HEADLESSCODE_SPAWN_SCRIPT   Override the spawner script (e2e stubbing)
 ```
 
+The ordinary watcher needs Issues: read permission. A watcher processing
+`headlesscode-job` issues also needs Issues: write permission for lifecycle
+labels, comments, and closing successful jobs, plus Pull requests: read
+permission to find pull requests for generated branches. Create the repository
+labels `headlesscode:running`, `headlesscode:done`, and `headlesscode:failed`
+before enabling this intake.
+
 `--mode` and `--memory-dir` reach the spawner env (`ORCHESTRATOR_MODE`,
 `HEADLESSCODE_MEMORY_DIR`), exactly as in `orchestrate`. Workers inherit the
 Phase 6 per-session budget env vars (`HEADLESSCODE_MAX_COST_USD` /
@@ -177,6 +222,10 @@ with `--muse-model <native-id>` when the watcher default is Muse, or with one
 `muse-model:<native-id>` issue label alongside `executor:muse`. Conflicting,
 duplicate, or unknown executor labels fail that issue's intake; the selection
 is stored with its spawned groups and retained for failed-spawn retries.
+
+For `headlesscode-job` issues, the `Executor` body section also selects the
+executor (`loop` maps to `builtin`, `muse` maps to Muse). Body selection must
+agree with any executor label and configured watcher default.
 
 For Muse jobs, install the Muse CLI on the worker machine and finish `muse login`
 for the Meta account there. The worker invokes native `muse exec` with
@@ -197,7 +246,7 @@ npx tsx src/cli.ts orchestrate --repo <path> --issue 42 --qa --deploy
 ### One-shot (cron / CI)
 
 ```bash
-export GH_TOKEN=ghp_...                      # scoped, read-only-ish (issues:read)
+export GH_TOKEN=ghp_...                      # scoped to the issue operations this watcher uses
 npx tsx src/cli.ts watch \
   --owner my-org --repo ~/Projects/my-repo \
   --label needs-agent --run-once --max-per-sweep 3
@@ -361,6 +410,9 @@ this phase deliberately **does not build a server**; the design is:
 
 - Unit: [`src/watcher/__tests__/github.test.ts`](../src/watcher/__tests__/github.test.ts)
   (URL/auth/PR-filter/pagination/errors with an injected fetch),
+  [`src/watcher/__tests__/headlesscode-job.test.ts`](../src/watcher/__tests__/headlesscode-job.test.ts)
+  (intake parsing, executor conflicts, running/terminal lifecycle, bounded
+  comments, and same-repository PR lookup),
   [`src/watcher/__tests__/state.test.ts`](../src/watcher/__tests__/state.test.ts)
   (round-trip, isProcessed semantics, write-ahead ordering, label-removed,
   restart), [`src/watcher/__tests__/watch.test.ts`](../src/watcher/__tests__/watch.test.ts)
