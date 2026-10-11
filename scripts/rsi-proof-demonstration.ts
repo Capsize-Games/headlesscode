@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 import { loadBenchmark } from "../src/rsi/benchmark/runner.js"
 import { readArchive } from "../src/rsi/archive.js"
 import { parseRsiArgs } from "../src/rsi/config.js"
+import { loadEvaluatorIntegrityTrust } from "../src/rsi/evaluation-integrity.js"
 import { createProofCampaignManifest, RSI_CONFIRMATION_RETENTION_TASK_IDS, runRsi } from "../src/rsi/controller.js"
 import { fetchPinnedOpenRouterEndpointPrice, openRouterAllocatedEnvironment, openRouterBrokerLimitsFromEnvironment, RSI_OPENROUTER_MODEL } from "../src/rsi/inference-broker.js"
 import { freezeProofDemonstrationManifest, frozenProofConfigDigest, verifyFrozenProofDemonstrationManifest, type FrozenProofDemonstrationManifest } from "../src/rsi/proof-demonstration-manifest.js"
@@ -27,6 +28,15 @@ interface Options {
 	seeds: string[]
 	mutationTask: string
 	engineeringEvidencePath?: string
+	evaluatorSigningKeyPath?: string
+	evaluatorTrustedPublicKeyPath?: string
+	evaluatorTrustedKeySha256?: string
+}
+
+export interface EvaluatorIntegrityOptions {
+	evaluatorSigningKeyPath?: string
+	evaluatorTrustedPublicKeyPath?: string
+	evaluatorTrustedKeySha256?: string
 }
 
 type ProofPlanPreview = Omit<Parameters<typeof freezeProofDemonstrationManifest>[0], "operatorCapUsd" | "engineeringEvidence"> & { plan: ReturnType<typeof planProofDemonstration> }
@@ -44,14 +54,15 @@ interface EngineeringEvidenceRecord {
 function usage(): string {
 	return `Usage:
   npx tsx scripts/rsi-proof-demonstration.ts estimate --seed <engineering> --campaign-seed <seed> --campaign-seed <seed> --campaign-seed <seed> [--repo <path>]
-  npx tsx scripts/rsi-proof-demonstration.ts engineering --seed <engineering> --operator-cap-usd <USD> [--execute] [--repo <path>] [--out <evidence.json>]
-  npx tsx scripts/rsi-proof-demonstration.ts plan --engineering-evidence <path> --operator-cap-usd <USD> --seed <engineering> --campaign-seed <seed> --campaign-seed <seed> --campaign-seed <seed> [--out <path>] [--repo <path>]
-  npx tsx scripts/rsi-proof-demonstration.ts execute --plan <path> --operator-cap-usd <USD> --execute
+  npx tsx scripts/rsi-proof-demonstration.ts engineering --seed <engineering> --operator-cap-usd <USD> [--execute --evaluator-signing-key <path> --evaluator-trusted-public-key <path> --evaluator-trusted-key-sha256 <pin>] [--repo <path>] [--out <evidence.json>]
+  npx tsx scripts/rsi-proof-demonstration.ts plan --engineering-evidence <path> --operator-cap-usd <USD> --seed <engineering> --campaign-seed <seed> --campaign-seed <seed> --campaign-seed <seed> --evaluator-signing-key <path> --evaluator-trusted-public-key <path> --evaluator-trusted-key-sha256 <pin> [--out <path>] [--repo <path>]
+  npx tsx scripts/rsi-proof-demonstration.ts execute --plan <path> --operator-cap-usd <USD> --evaluator-signing-key <path> --evaluator-trusted-public-key <path> --evaluator-trusted-key-sha256 <pin> --execute
   npx tsx scripts/rsi-proof-demonstration.ts verify --plan <path>
   npx tsx scripts/rsi-proof-demonstration.ts analyze --plan <path> --archive <directory> [--out <path>]
 
 Estimate, engineering estimates, plan, and verify perform pricing metadata GETs only; they do not submit model inference.
-Engineering prints a bounded estimate unless --execute is supplied. Paid execution requires an
+Engineering prints a bounded estimate unless --execute is supplied. Estimates do not require evaluator keys. Paid engineering and campaign execution require a protected signing key, independently trusted public key, and matching SHA-256 pin. Only the pin is frozen into the published plan; key paths are supplied again at execution.
+Paid execution requires an
 explicit operator cap, broker/PostgreSQL/OpenShell configuration, and a clean checkout. Its
 development-only manifest contains no confirmation cells. Final plan requires passing
 engineering evidence and freezes the three confirmation campaigns afterward. Execute resumes
@@ -59,7 +70,7 @@ the frozen campaigns; analyze independently checks their archive and artifacts.
 `
 }
 
-function parse(argv: string[]): Options {
+export function parseProofDemonstrationArgs(argv: string[]): Options {
 	const command = argv[0]
 	if (command !== "estimate" && command !== "plan" && command !== "verify" && command !== "analyze" && command !== "engineering" && command !== "execute") throw new Error("expected estimate, engineering, plan, execute, verify or analyze")
 	const defaultOutput = command === "analyze" ? ".headlesscode/rsi-proof/report.json" : command === "engineering" ? ".headlesscode/rsi-proof/engineering-evidence.json" : ".headlesscode/rsi-proof/plan.json"
@@ -74,6 +85,9 @@ function parse(argv: string[]): Options {
 		else if (arg === "--plan") options.planPath = path.resolve(value)
 		else if (arg === "--archive") options.archiveDir = path.resolve(value)
 		else if (arg === "--engineering-evidence") options.engineeringEvidencePath = path.resolve(value)
+		else if (arg === "--evaluator-signing-key") options.evaluatorSigningKeyPath = path.resolve(value)
+		else if (arg === "--evaluator-trusted-public-key") options.evaluatorTrustedPublicKeyPath = path.resolve(value)
+		else if (arg === "--evaluator-trusted-key-sha256") options.evaluatorTrustedKeySha256 = value
 		else if (arg === "--repo") options.repo = path.resolve(value)
 		else if (arg === "--operator-cap-usd") options.operatorCapUsd = Number(value)
 		else if (arg === "--seed" || arg === "--campaign-seed") options.seeds.push(value)
@@ -81,7 +95,39 @@ function parse(argv: string[]): Options {
 		else throw new Error(`unknown option ${arg}`)
 		index++
 	}
+	const trustOptions = [options.evaluatorSigningKeyPath, options.evaluatorTrustedPublicKeyPath, options.evaluatorTrustedKeySha256]
+	if (trustOptions.some((value) => value !== undefined) && trustOptions.some((value) => value === undefined)) throw new Error("evaluator integrity requires --evaluator-signing-key, --evaluator-trusted-public-key, and --evaluator-trusted-key-sha256")
 	return options
+}
+
+function requireEvaluatorIntegrityOptions(options: EvaluatorIntegrityOptions): Required<EvaluatorIntegrityOptions> {
+	if (!options.evaluatorSigningKeyPath || !options.evaluatorTrustedPublicKeyPath || !options.evaluatorTrustedKeySha256) throw new Error("attested proof execution requires --evaluator-signing-key, --evaluator-trusted-public-key, and --evaluator-trusted-key-sha256")
+	return {
+		evaluatorSigningKeyPath: options.evaluatorSigningKeyPath,
+		evaluatorTrustedPublicKeyPath: options.evaluatorTrustedPublicKeyPath,
+		evaluatorTrustedKeySha256: options.evaluatorTrustedKeySha256,
+	}
+}
+
+function withEvaluatorIntegrityPin(config: RsiConfig, pin: string | undefined): RsiConfig {
+	return pin ? { ...config, evaluatorTrustedKeySha256: pin } : config
+}
+
+function withRuntimeEvaluatorIntegrity(config: RsiConfig, options: EvaluatorIntegrityOptions): RsiConfig {
+	const trust = requireEvaluatorIntegrityOptions(options)
+	if (config.evaluatorTrustedKeySha256 && config.evaluatorTrustedKeySha256 !== trust.evaluatorTrustedKeySha256) throw new Error("evaluator trust pin differs from the frozen proof configuration")
+	return {
+		...config,
+		evaluatorSigningKeyPath: trust.evaluatorSigningKeyPath,
+		evaluatorTrustedPublicKeyPath: trust.evaluatorTrustedPublicKeyPath,
+		evaluatorTrustedKeySha256: trust.evaluatorTrustedKeySha256,
+	}
+}
+
+export async function validateRuntimeEvaluatorIntegrity(config: RsiConfig, options: EvaluatorIntegrityOptions): Promise<RsiConfig> {
+	const runtimeConfig = withRuntimeEvaluatorIntegrity(config, options)
+	await loadEvaluatorIntegrityTrust(runtimeConfig)
+	return runtimeConfig
 }
 
 export async function assertSupervisorOnlyPlanPath(repoRoot: string, output: string): Promise<string> {
@@ -268,7 +314,7 @@ export async function buildProofPlanPreview(options: Options, env: NodeJS.Proces
 	catch { throw new Error("fixed-control runtime harness commit must be present in the root repository") }
 	const parsed = parseRsiArgs(["--repo", repo, "--population", "2", "--generations", "3", "--seed", seeds[0]!, "--base-ref", rootCommit, "--max-runtime-ms", String(72 * 60 * 60_000), "--mutation-task", options.mutationTask])
 	if (!parsed.config) throw new Error(parsed.error ?? "could not construct proof configuration")
-	const baseConfig = { ...parsed.config, archiveDir: options.archiveDir ?? parsed.config.archiveDir, model: RSI_OPENROUTER_MODEL, roles: { worker: { provider: "openrouter" as const, model: RSI_OPENROUTER_MODEL } }, mutationTask: options.mutationTask, workerHarnessRuntime: runtime }
+	const baseConfig = withEvaluatorIntegrityPin({ ...parsed.config, archiveDir: options.archiveDir ?? parsed.config.archiveDir, model: RSI_OPENROUTER_MODEL, roles: { worker: { provider: "openrouter" as const, model: RSI_OPENROUTER_MODEL } }, mutationTask: options.mutationTask, workerHarnessRuntime: runtime }, options.evaluatorTrustedKeySha256)
 	const configs = seeds.map((seed, index) => ({ ...baseConfig, generations: index === 0 ? 2 : 3, seed })) as [typeof baseConfig, typeof baseConfig, typeof baseConfig, typeof baseConfig]
 	const config = configs[0]
 	const loaded = await loadBenchmark(path.join(repo, "fixtures/rsi-benchmark"), repo)
@@ -318,6 +364,7 @@ export async function runEngineeringArm(config: RsiConfig, campaign: string, arm
 
 export async function executeEngineeringPair(options: Options, env: NodeJS.ProcessEnv = process.env, runner: typeof runRsi = runRsi): Promise<EngineeringEvidenceRecord | undefined> {
 	if (options.command !== "engineering") throw new Error("engineering command is required")
+	if (options.execute) requireEvaluatorIntegrityOptions(options)
 	const preview = await buildProofPlanPreview(options, env)
 	const required = preview.plan.engineering.rootSpendCeilingUsd
 	if (!options.execute) {
@@ -332,8 +379,8 @@ export async function executeEngineeringPair(options: Options, env: NodeJS.Proce
 	const benchmarkAllocation = preview.execution.inferenceLimits.benchmark.maxCampaignSpendUsd
 	if (mutationAllocation + benchmarkAllocation > cap + 1e-9 || mutationAllocation + benchmarkAllocation + 1e-9 < required) throw new Error("configured mutation and benchmark allocations must fit the operator cap and fund the engineering-only root reservation")
 	if (await ensureCleanRoot(options.repo) !== preview.rootCommit) throw new Error("engineering execution root changed after its estimate")
+	const config = await validateRuntimeEvaluatorIntegrity(preview.execution.configs[0], options)
 	const campaign = campaignId(preview.seeds.engineering)
-	const config = preview.execution.configs[0]
 	const runs: RsiRunRecord[] = []
 	for (const arm of ["fixed-control", "self-hosted"] as const) {
 		runs.push(await runEngineeringArm(config, campaign, arm, preview.rootCommit, preview.seeds.engineering, preview.runtime, runner))
@@ -401,9 +448,11 @@ export async function executeEngineeringPair(options: Options, env: NodeJS.Proce
 
 export async function buildFrozenProofPlan(options: Options, env: NodeJS.ProcessEnv = process.env, fetcher: typeof fetch = fetch): Promise<ReturnType<typeof freezeProofDemonstrationManifest>> {
 	if (options.command !== "plan") throw new Error("plan options are required")
+	requireEvaluatorIntegrityOptions(options)
 	const operatorCapUsd = parseUsd(options.operatorCapUsd)
 	if (!options.engineeringEvidencePath) throw new Error("final campaign plan requires --engineering-evidence from a completed development-only engineering pair")
 	const preview = await buildProofPlanPreview(options, env, fetcher)
+	await validateRuntimeEvaluatorIntegrity(preview.execution.configs[0], options)
 	if (operatorCapUsd < preview.plan.campaignRootsSpendCeilingUsd) throw new Error(`operator cap $${operatorCapUsd.toFixed(6)} is below required three-campaign root reservations $${preview.plan.campaignRootsSpendCeilingUsd.toFixed(6)}`)
 	const evidence = await verifyEngineeringEvidenceFile(options.engineeringEvidencePath, options.repo, preview.rootCommit)
 	if (evidence.record.campaignId !== preview.campaignIds.engineering) throw new Error("engineering evidence seed/campaign identity differs from the final plan")
@@ -436,6 +485,7 @@ export async function runFrozenCampaignArm(
 	arm: "fixed-control" | "self-hosted",
 	phase: "development" | "confirmation",
 	runner: typeof runRsi = runRsi,
+	evaluatorIntegrityOptions?: EvaluatorIntegrityOptions,
 ): Promise<RsiRunRecord> {
 	const campaign = manifest.campaignIds.campaigns[campaignIndex]
 	const config = manifest.execution.configs[campaignIndex + 1]
@@ -458,8 +508,9 @@ export async function runFrozenCampaignArm(
 	if (phase === "development" && existing && armRow?.phase === "confirmation" && ["evaluated", "finished"].includes(existing.proofCampaign?.state ?? "")) return existing
 	if (phase === "confirmation" && existing && isFullyConfirmedRun(existing, arm)) return existing
 	if (existing && archive.runs.some((entry) => entry.runId === existing.runId) && phase === "development" && armRow?.phase !== "confirmation") throw new Error(`campaign ${campaign}/${arm} is archived before development completion; refusing duplicate execution`)
+	const runtimeConfig = evaluatorIntegrityOptions ? withRuntimeEvaluatorIntegrity(config, evaluatorIntegrityOptions) : config
 	const result = await runner({
-		...config, dryRun: false, workerHarnessRunId: runId,
+		...runtimeConfig, dryRun: false, workerHarnessRunId: runId,
 		...(existing ? { resumeRunId: existing.runId } : {}),
 		workerHarnessMode: arm, workerHarnessPhase: phase, workerHarnessPairId: campaign,
 		workerHarnessRuntime: manifest.runtime,
@@ -511,15 +562,20 @@ export function isFullyConfirmedRun(run: RsiRunRecord, armId: "fixed-control" | 
 export async function executeFrozenCampaigns(options: Options, env: NodeJS.ProcessEnv = process.env, runner: typeof runRsi = runRsi): Promise<void> {
 	if (options.command !== "execute" || !options.execute) throw new Error("campaign execution requires execute command and explicit --execute")
 	if (env !== process.env || runner !== runRsi) throw new Error("paid campaign execution only accepts the validated process environment and production runner")
+	const trustOptions = requireEvaluatorIntegrityOptions(options)
 	if (!options.planPath) throw new Error("--plan is required for campaign execution")
 	const safePath = await assertSupervisorOnlyPlanPath(options.repo, options.planPath)
 	const manifest = verifyFrozenProofDemonstrationManifest(JSON.parse(await fs.readFile(safePath, "utf8")) as unknown)
+	const frozenPin = manifest.execution.configs[0]?.evaluatorTrustedKeySha256
+	if (!frozenPin || manifest.execution.configs.some((config) => config.evaluatorTrustedKeySha256 !== frozenPin)) throw new Error("frozen proof plan does not contain one consistent evaluator trust pin")
+	if (trustOptions.evaluatorTrustedKeySha256 !== frozenPin) throw new Error("execution evaluator trust pin differs from the frozen proof plan")
+	await validateRuntimeEvaluatorIntegrity(manifest.execution.configs[0]!, trustOptions)
 	const cap = parseUsd(options.operatorCapUsd)
 	if (Math.abs(cap - manifest.operatorCapUsd) > 0.000001) throw new Error("execution operator cap must exactly match the frozen plan cap")
 	await verifyLiveFrozenProofPlan(manifest, env)
 	for (let campaignIndex = 0; campaignIndex < 3; campaignIndex++) {
-		for (const arm of ["fixed-control", "self-hosted"] as const) await runFrozenCampaignArm(manifest, campaignIndex, arm, "development")
-		for (const arm of ["fixed-control", "self-hosted"] as const) await runFrozenCampaignArm(manifest, campaignIndex, arm, "confirmation")
+		for (const arm of ["fixed-control", "self-hosted"] as const) await runFrozenCampaignArm(manifest, campaignIndex, arm, "development", runRsi, trustOptions)
+		for (const arm of ["fixed-control", "self-hosted"] as const) await runFrozenCampaignArm(manifest, campaignIndex, arm, "confirmation", runRsi, trustOptions)
 	}
 	process.stdout.write(`All three frozen paired campaigns reached terminal confirmation state. No analysis verdict has been issued; run analyze against the frozen plan and archive.\n`)
 }
@@ -527,7 +583,7 @@ export async function executeFrozenCampaigns(options: Options, env: NodeJS.Proce
 export async function proofDemonstrationPlanMain(argv = process.argv.slice(2)): Promise<number> {
 	if (argv.includes("--help") || argv.includes("-h")) { process.stdout.write(usage()); return 0 }
 	try {
-		const options = parse(argv)
+		const options = parseProofDemonstrationArgs(argv)
 		if (options.command === "estimate") {
 			process.stdout.write(`${formatPlan(await buildProofPlanPreview(options))}\n`)
 			return 0

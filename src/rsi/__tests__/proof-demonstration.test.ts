@@ -16,7 +16,7 @@ import { formatAnalysisReport } from "../../../scripts/rsi-proof-demonstration.j
 const sha256 = (value: Buffer | string) => createHash("sha256").update(value).digest("hex")
 
 function frozenPlan(): FrozenProofDemonstrationManifest {
-	const configs = ["engineering", "campaign-a", "campaign-b", "campaign-c"].map((seed) => ({ repoRoot: "/work", seed, mutationTask: "fixed task", protectedPaths: ["src/rsi"] } as RsiConfig)) as unknown as [RsiConfig, RsiConfig, RsiConfig, RsiConfig]
+	const configs = ["engineering", "campaign-a", "campaign-b", "campaign-c"].map((seed) => ({ repoRoot: "/work", seed, mutationTask: "fixed task", protectedPaths: ["src/rsi"], evaluatorTrustedKeySha256: `sha256:${"9".repeat(64)}` } as RsiConfig)) as unknown as [RsiConfig, RsiConfig, RsiConfig, RsiConfig]
 	const runtime: WorkerHarnessRuntimeIdentity = { imageName: "headlesscode-openshell-rsi:fixed", imageDigest: `sha256:${"a".repeat(64)}`, harnessCommit: "b".repeat(40), dependencyLockDigest: "c".repeat(64) }
 	const tasks = ["dev-task", "confirm-task"].map((id, index) => ({ id, split: index ? "confirmation" : "development", family: "engine", seed: index + 1, startDigest: "d".repeat(64), verifierDigest: "e".repeat(64), knownGoodDigest: "f".repeat(64), knownBadDigest: "1".repeat(64), ceilings: { timeoutMs: 1000, maxCalls: 1, maxOutputTokensPerCall: 100, maxPatchBytes: 1000 } }))
 	const limits = { campaignId: "test", maxCalls: 1, maxInputTokensPerCall: 100, maxOutputTokensPerCall: 100, maxTotalTokens: 200, maxDurationMs: 1000, maxRequestBytes: 1000, maxResponseBytes: 1000, maxInputPricePerMillionUsd: 1, maxOutputPricePerMillionUsd: 1, maxCallSpendUsd: 0.01, maxJobSpendUsd: 0.02, maxCampaignSpendUsd: 1 }
