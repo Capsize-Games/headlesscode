@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
+import { createHash, generateKeyPairSync } from "node:crypto"
 import { execFileSync } from "node:child_process"
 import * as fs from "node:fs/promises"
-import * as os from "node:os"
 import * as path from "node:path"
 import { checkpointRun } from "../archive.js"
 import { runRsi } from "../controller.js"
@@ -9,15 +9,20 @@ import { createMutationSnapshotIdentity } from "../openshell.js"
 import { effectiveWorkerHarnessMode, workerHarnessCliPath } from "../worker-harness.js"
 import type { CandidateRecord, RsiConfig, RsiRunRecord, TrialResult, WorkerHarnessRuntimeIdentity } from "../types.js"
 import { fakeDevelopmentBenchmarkHook } from "./development-proof-fixture.js"
+import { withSyntheticEvaluatorPolicy } from "./synthetic-evaluator-runtime.js"
 import { validateCandidateParent } from "../controller.js"
 
 function ok(command: string): TrialResult {
 	return { ok: true, command, exitCode: 0, durationMs: 1, stdout: "", stderr: "" }
 }
 
-async function main(): Promise<void> {
-	const repo = await fs.mkdtemp(path.join(os.tmpdir(), "hc-rsi-worker-harness-controller-"))
+async function runControllerFixture(): Promise<void> {
+	const scratch = path.resolve(".headlesscode/scratch")
+	await fs.mkdir(scratch, { recursive: true, mode: 0o700 })
+	const root = await fs.mkdtemp(path.join(scratch, "hc-rsi-worker-harness-controller-"))
+	const repo = path.join(root, "repo")
 	try {
+		await fs.mkdir(repo, { recursive: true })
 		execFileSync("git", ["init", "-q"], { cwd: repo })
 		execFileSync("git", ["config", "user.email", "rsi@example.invalid"], { cwd: repo })
 		execFileSync("git", ["config", "user.name", "RSI Test"], { cwd: repo })
@@ -32,6 +37,14 @@ async function main(): Promise<void> {
 			harnessCommit: "e".repeat(40),
 			dependencyLockDigest: "f".repeat(64),
 		}
+		const keys = path.join(root, "operator-keys")
+		await fs.mkdir(keys, { mode: 0o700 })
+		const keyPair = generateKeyPairSync("ed25519")
+		const signingKey = path.join(keys, "signing.pem")
+		const trustedKey = path.join(keys, "trusted.pem")
+		await fs.writeFile(signingKey, keyPair.privateKey.export({ format: "pem", type: "pkcs8" }), { mode: 0o600 })
+		await fs.writeFile(trustedKey, keyPair.publicKey.export({ format: "pem", type: "spki" }), { mode: 0o600 })
+		const trustedPin = `sha256:${createHash("sha256").update(keyPair.publicKey.export({ format: "der", type: "spki" })).digest("hex")}`
 		const config: RsiConfig = {
 			repoRoot: repo, model: "proof-model", population: 1, generations: 2, maxConcurrent: 1,
 			mutationTask: "add a small incremental improvement", regressionCommand: "npm test", evalCommands: ["visible"], hiddenEvalCommands: [],
@@ -39,6 +52,9 @@ async function main(): Promise<void> {
 			dryRun: false, keepWorktrees: false, maxIterations: 2, maxTokens: 256, protectedPaths: [".env", "docker/", ".dockerignore"], commandTimeoutMs: 1000,
 			workerHarnessMode: "self-hosted",
 			workerHarnessRuntime: runtime,
+			evaluatorSigningKeyPath: signingKey,
+			evaluatorTrustedPublicKeyPath: trustedKey,
+			evaluatorTrustedKeySha256: trustedPin,
 		}
 		await assert.rejects(
 			runRsi({ ...config, workerHarnessPairId: `rsi-proof-${"a".repeat(20)}`, workerHarnessRunId: `rsi-proof-${"b".repeat(20)}-self` }, { log: () => undefined }),
@@ -52,6 +68,7 @@ async function main(): Promise<void> {
 		)
 		const observed: Array<{ generation: number; mode: string; parentCommit: string; digest: string }> = []
 		const run = await runRsi(config, {
+			syntheticRuntimeIdentity: true,
 			log: () => undefined,
 			runCommand: async (command) => ok(command),
 			runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook([], {
@@ -76,6 +93,10 @@ async function main(): Promise<void> {
 		})
 		const parent = run.candidates.find((candidate) => candidate.generation === 0)!
 		const child = run.candidates.find((candidate) => candidate.generation === 1)!
+		const integrityManifest = JSON.parse(await fs.readFile(path.join(config.archiveDir, run.evaluatorIntegrity!.manifestPath!), "utf8")) as { payload: { input: { imageIdentity: { identitySource: string; pinnedImageDigest: string | null; workerHarnessRuntime: { imageDigest: string } | null } } } }
+		assert.equal(integrityManifest.payload.input.imageIdentity.identitySource, "synthetic-test-hooks")
+		assert.equal(integrityManifest.payload.input.imageIdentity.pinnedImageDigest, `sha256:${"0".repeat(64)}`)
+		assert.equal(integrityManifest.payload.input.imageIdentity.workerHarnessRuntime?.imageDigest, runtime.imageDigest, "the worker runtime pin remains distinct from the evaluator image")
 		assert.equal(parent.status, "accepted")
 		assert.equal(parent.workerHarnessExecution?.mode, "fixed-control")
 		assert.equal(child.parent, parent.id)
@@ -88,13 +109,13 @@ async function main(): Promise<void> {
 		assert.ok(observed.every((entry) => /^[a-f0-9]{64}$/.test(entry.digest)))
 		await checkpointRun(config.archiveDir, { ...run, workerHarnessConfigDigest: undefined })
 		await assert.rejects(
-			runRsi({ ...config, resumeRunId: run.runId }, { log: () => undefined, runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook() }),
+			runRsi({ ...config, resumeRunId: run.runId }, { syntheticRuntimeIdentity: true, log: () => undefined, runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook() }),
 			/frozen run manifest/,
 			"explicit harness resume must reject a missing frozen config digest",
 		)
 		await checkpointRun(config.archiveDir, run)
 		await assert.rejects(
-			runRsi({ ...config, generations: 3, resumeRunId: run.runId }, { log: () => undefined, runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook() }),
+			runRsi({ ...config, generations: 3, resumeRunId: run.runId }, { syntheticRuntimeIdentity: true, log: () => undefined, runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook() }),
 			/planned generation count/,
 			"explicit harness resume must reject a changed paired generation count",
 		)
@@ -124,11 +145,11 @@ async function main(): Promise<void> {
 		)
 		console.log("Controller selected-parent worker harness assertions passed")
 	} finally {
-		await fs.rm(repo, { recursive: true, force: true })
+		await fs.rm(root, { recursive: true, force: true })
 	}
 }
 
-main().catch((error) => {
+withSyntheticEvaluatorPolicy(runControllerFixture).catch((error) => {
 	console.error(error)
 	process.exit(1)
 })

@@ -146,6 +146,8 @@ npx tsx src/cli.ts watch --owner <o> --repo <path> --label <target-label> [optio
   --state-file <path>    Durable idempotency state (default:
                          <repo>/.worktrees/.watcher-state.json)
   --mode <slug>          Harness mode for workers (default: code)
+  --executor <builtin|muse> Default worker implementation (default: builtin)
+  --muse-model <id>      Native Muse Meta model id (requires --executor muse)
   --qa / --deploy        Pass-through: recorded on each batch's state entry for
                          the follow-up orchestrate completion run (see below)
   --memory-dir <path>    Memory dir for workers (forwarded to the spawner)
@@ -167,6 +169,21 @@ forwards them as `--max-cost-usd` / `--max-duration-ms` (see
 [`docs/phase6-cloud.md`](./phase6-cloud.md) §2). `--qa` / `--deploy`
 are **pass-through**: the watcher's job is intake (detect → split → spawn);
 completion watching / review / QA / deploy remains the orchestrator's job.
+
+The built-in HeadlessCode worker is the default. `--executor builtin|muse`
+selects a watcher-wide default, and an issue can select its own executor with
+one `executor:builtin` or `executor:muse` label. A Muse model can be pinned
+with `--muse-model <native-id>` when the watcher default is Muse, or with one
+`muse-model:<native-id>` issue label alongside `executor:muse`. Conflicting,
+duplicate, or unknown executor labels fail that issue's intake; the selection
+is stored with its spawned groups and retained for failed-spawn retries.
+
+For Muse jobs, install the Muse CLI on the worker machine and finish `muse login`
+for the Meta account there. The worker invokes native `muse exec` with
+provider `meta`; model ids are not translated from OpenRouter ids. Muse jobs
+require local execution and mode `code`. They cannot run through the contained
+OpenShell profile. See [Phase 2 orchestration](./phase2-orchestration.md) for
+login, safety, and model-selection details.
 Each batch's state entry records the issue, groups, batch id and spawnedAt,
 so the follow-up is a normal `orchestrate` round:
 
@@ -201,7 +218,8 @@ After=network-online.target
 
 [Service]
 Type=simple
-Environment=GH_TOKEN=ghp_your_token_here
+User=headlesscode
+EnvironmentFile=/etc/headlesscode/runner.env
 WorkingDirectory=/opt/headlesscode
 ExecStart=/usr/bin/npx --prefix /opt/headlesscode tsx /opt/headlesscode/src/cli.ts watch --owner my-org --repo /opt/my-repo --label needs-agent --poll-interval-ms 60000
 Restart=on-failure
@@ -213,10 +231,91 @@ WantedBy=multi-user.target
 Continuous mode logs every sweep and shuts down cleanly on SIGINT/SIGTERM
 (state saved via `AbortSignal`).
 
+### Claim-based runner pool (two or more machines)
+
+Run one continuous watcher on each machine, using the same GitHub owner,
+repository, and label, but a different stable `--runner-id` for each machine.
+The `--max-concurrent-sessions` setting is the capacity limit for that
+machine. `--runner-assignee` is the GitHub login displayed on issues while a
+claim is active; it must be configured with `--runner-id`.
+
+Claims are authoritative records on permanent Git refs named
+`headlesscode-claims/issue-N`. Initial claims use GitHub's atomic ref creation;
+renewals and releases are commits advanced with non-forced fast-forward
+updates. A runner checks the current claim before dispatch and records its
+unique nonce and epoch in local watcher state. Issue assignees are a visible
+indicator only. Do not delete claim refs: a released ref remains in place so
+the next acquisition increments the epoch and cannot reuse an old claim.
+
+Runner-pool mode requires continuous operation; `--run-once` is rejected
+because it cannot renew leases. The default lease is 120 seconds and the
+default poll interval is 60 seconds. The watcher rejects a poll interval above
+half the configured lease so a renewal is scheduled with time remaining.
+When GitHub cannot confirm a renewal, the watcher stops local worker process
+groups where possible and keeps the claim active. Claims for dispatched
+workers are never released from PID, PGID, completion, or sandbox markers:
+those markers live in worker-writable worktrees and cannot prove that a
+detached process or guest is absent. Completed or failed dispatched claims
+remain quarantined and count against capacity until the lease expires and an
+operator independently confirms teardown through `recoverExpired()`.
+Expiration does not stop a detached process or permit automatic takeover. Do
+not recover an expired claim or remove its ref while the old worker or guest
+may still run.
+
+Each machine needs its own continuously running watcher, a local clone of the
+same repository, Node.js 22.19 or newer, Git, and the repository dependencies
+installed with `npm ci`. Install Node.js using the machine's approved
+unprivileged version manager. `gh` is needed by worker workflows that invoke
+the GitHub CLI; the watcher itself uses the GitHub REST API. Configure a
+separate fine-grained GitHub token on each machine with repository Contents
+read/write and Issues read/write access, then make it available as `GH_TOKEN`
+or `GITHUB_TOKEN`. For a systemd service, put the variable in an environment
+file owned by the service account with mode `0600`; do not
+put the token directly in the unit file, command line, or logs. Do not copy a
+machine's model-provider credential to another machine; provision credentials
+for each runner through the deployment's approved secret mechanism.
+
+In runner-pool mode, the watcher removes GitHub token and GitHub App signing
+environment variables from the spawned worker environment. This is credential
+environment filtering, not an operating-system isolation boundary: a local
+worker runs as the same user and may still read files, `gh` CLI authentication,
+or other credentials available to that account. Keep supervisor credentials
+out of worker-readable locations, or run workers under an account or contained
+profile that does not have access to them.
+
+For example, after cloning and installing dependencies on a node, configure
+the service to use a distinct id and assignee:
+
+```ini
+ExecStart=/usr/bin/npx --prefix /opt/headlesscode tsx /opt/headlesscode/src/cli.ts watch --owner my-org --repo /opt/my-repo --label needs-agent --runner-id home-node --runner-assignee runner-bot --max-concurrent-sessions 1
+```
+
+Set `HEADLESSCODE_RUNNER_ID` and `HEADLESSCODE_RUNNER_ASSIGNEE` instead of the
+two flags if those values belong in the protected environment file. Give the
+workstation a different runner id. Keep one runner-pool watcher per machine;
+the per-machine cap cannot be coordinated by two local watcher processes with
+different runner ids. The watcher takes an exclusive lock under
+`$XDG_STATE_HOME/headlesscode` (or
+`~/.local/state/headlesscode`) and refuses to remove a stale lock
+automatically. If a claim expires, first verify the old process groups are
+absent on the original machine. If the machine cannot be inspected, leave the
+claim quarantined; do not infer teardown from lease expiry alone. After
+out-of-band confirmation that the old host's worker groups and guest resources
+are gone, an authorized operator can call
+`GitHubIssueClaimStore.recoverExpired()` from `src/watcher/claims.ts` with the
+current ref tip, runner id, nonce, and epoch. The method rejects an unexpired
+lease or a changed tip and records the operator login and supplied evidence in
+the released claim commit. That API records the operator's declaration; it
+cannot independently inspect or prove remote teardown. Never use it when the
+old host or guest state is uncertain.
+
 ### Dry-run (CI / no-token validation)
 
+After making `GH_TOKEN` available through the shell's protected environment,
+run:
+
 ```bash
-GH_TOKEN=ghp_... npx tsx src/cli.ts watch --owner my-org --repo ~/Projects/my-repo \
+npx tsx src/cli.ts watch --owner my-org --repo ~/Projects/my-repo \
   --label needs-agent --dry-run --run-once
 ```
 

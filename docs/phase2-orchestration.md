@@ -191,6 +191,52 @@ npx tsx src/cli.ts orchestrate --repo <path> --issue 27 --issue 29 --issue 38 \
     [--no-review] [--dry-run]
 ```
 
+### Choosing the worker executor
+
+Workers use the built-in HeadlessCode agent by default. A round can select the
+native Muse CLI for its worker sessions with `--executor muse`; this changes
+the worker implementation while leaving worktree creation, watcher markers,
+review, QA, and result state in the existing orchestration pipeline.
+
+```sh
+npx tsx src/cli.ts orchestrate --repo <path> --issue 27 \
+  --executor muse --no-preflight --no-review --no-issue-size-check --no-auto-split
+# Optionally pin a model identifier understood by Muse's native Meta provider:
+npx tsx src/cli.ts orchestrate --repo <path> --issue 27 \
+  --executor muse --muse-model <native-model-id> --no-preflight --no-review \
+  --no-issue-size-check --no-auto-split
+```
+
+On the machine that launches workers, install the Muse CLI, put `muse` on
+`PATH`, and complete `muse login` for the Meta account that should run sessions.
+The installed CLI's help describes browser approval for login and says
+`META_API_KEY` takes precedence over account login. The model passed through
+`--muse-model` is a native Muse model identifier; HeadlessCode does not translate
+OpenRouter model names or switch providers. Without it, Muse uses its own Meta
+provider default. Script callers can set `HEADLESSCODE_NATIVE_MUSE_MODEL`;
+`HEADLESSCODE_MUSE_MODEL` selects the built-in direct Meta API model. Do not pass `--model` to select a Muse worker; `--model`
+continues to select HeadlessCode/OpenRouter models used by built-in workers and
+the optional reviewer/QA agents.
+
+The Muse worker uses `muse exec --provider meta --json` with the task file and
+worktree, closes stdin, and records the returned session id under the ignored
+`.headlesscode/scratch/muse-session-id` path. Inline prompts are held in the
+same ignored scratch directory and removed after the run. The shared
+`harness.log` contains its JSONL output;
+orchestration accepts success only when the process exits zero and JSONL has a
+`run.terminal.completed` record. The CLI's approval and sandbox defaults remain
+enabled; HeadlessCode does not request `--yolo`, trust the workspace, or disable
+those controls. Muse currently requires local execution and the `code` mode;
+OpenShell/contained-profile dispatch, HeadlessCode mode files, `--plan-first`,
+and the OpenRouter preflight are not part of that executor. Set `--no-preflight`
+explicitly. Auxiliary review, QA, or issue auto-splitting can still use the
+configured HeadlessCode/OpenRouter path, so disable those stages or configure
+their credentials when they are not wanted. The HeadlessCode memory directory,
+per-session cost and duration limits, decision timeout, context window size,
+and custom log-file option are not supported by this executor; selection fails
+if those unsupported settings are configured. `--max-iterations` maps to Muse's
+`--max-model-steps` option.
+
 - Reads issues from `gh issue view --json number,title,body`
   when `gh` is available, else from `--issues-json <file>`.
 - Calls `splitIssues`, writes task files to

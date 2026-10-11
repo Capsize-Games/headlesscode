@@ -199,7 +199,7 @@ test("fleet mutation failure stores output before lease-fenced failure and keeps
 				async receipt() { return receipt }, async close() {},
 			}),
 			runMutation: async () => {
-				if (mutationFailureMode === "unexpected") throw new Error("synthetic OpenShell setup failure")
+				if (mutationFailureMode === "unexpected") return { ok: false, error: "synthetic OpenShell setup failure" }
 				if (mutationFailureMode === "ordinary") {
 					return {
 						ok: false,
@@ -430,6 +430,7 @@ test("emergency stop cancels an active lease and aborts its OpenShell operation"
 	let startedResolve!: () => void
 	const started = new Promise<void>((resolve) => { startedResolve = resolve })
 	let queueStatus: "leased" | "cancelled" = "leased"
+	let cancelRequestedAt: string | undefined
 	let completeCalls = 0
 	let failCalls = 0
 	let failReason = ""
@@ -440,9 +441,10 @@ test("emergency stop cancels an active lease and aborts its OpenShell operation"
 		async migrate() {}, async registerWorker() {}, async heartbeatWorker() {}, async stopWorker() {}, async close() {},
 		async claim() { if (claimed) return undefined; claimed = true; return lease },
 		async getArtifact() { return snapshot },
-		async cancel(jobId: string) { assert.equal(jobId, job.jobId); queueStatus = "cancelled"; return true },
-		async getJob() { return { ...job, status: queueStatus } },
-		async heartbeat() { return queueStatus === "leased" },
+		async cancel(jobId: string) { assert.equal(jobId, job.jobId); cancelRequestedAt = new Date().toISOString(); return true },
+		async acknowledgeCancellation() { queueStatus = "cancelled"; return true },
+		async getJob() { return { ...job, status: queueStatus, ...(cancelRequestedAt ? { cancelRequestedAt } : {}) } },
+		async heartbeat() { return queueStatus === "leased" && !cancelRequestedAt },
 		async complete() { completeCalls += 1; return { accepted: false } },
 		async fail(_lease: unknown, reason: string) { failCalls += 1; failReason = reason; return true },
 	} as unknown as RsiWorkerOptions["queue"]
@@ -473,6 +475,70 @@ test("emergency stop cancels an active lease and aborts its OpenShell operation"
 		assert.equal(completeCalls, 0, "a cancelled worker never completes its lease")
 		assert.equal(failCalls, 0, "abort is not rewritten as an ordinary task failure")
 		assert.deepEqual(result.record.resources, [])
+	} finally {
+		await control.close()
+		fs.closeSync(socketDirectoryFd)
+		fs.rmSync(root, { recursive: true, force: true })
+	}
+})
+
+test("worker teardown failure leaves the cancelled lease capacity-reserved", async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "headlesscode-worker-unconfirmed-stop-test-"))
+	const repo = path.join(root, "repo")
+	const snapshotPath = path.join(root, "snapshot.bundle")
+	const socketDirectoryFd = fs.openSync(root, "r")
+	const socketDirectory = process.platform === "linux" && Buffer.byteLength(path.join(root, `${"x".repeat(20)}.sock`)) >= 108 ? `/proc/self/fd/${socketDirectoryFd}` : root
+	const control = await EmergencyControl.start({ identity: "worker-unconfirmed-stop-test", stateDirectory: path.join(root, "control"), socketDirectory, graceMs: 2_000 })
+	let queueStatus: "leased" | "cancelled" = "leased"
+	let cancelRequestedAt: string | undefined
+	let acknowledgeCalls = 0
+	let startedResolve!: () => void
+	const started = new Promise<void>((resolve) => { startedResolve = resolve })
+	try {
+		fs.mkdirSync(repo, { recursive: true })
+		execFileSync("git", ["init", "-q", "-b", "main", repo])
+		execFileSync("git", ["-C", repo, "config", "user.name", "Test"])
+		execFileSync("git", ["-C", repo, "config", "user.email", "test@example.invalid"])
+		fs.writeFileSync(path.join(repo, "src.ts"), "export const value = 1\n")
+		execFileSync("git", ["-C", repo, "add", "src.ts"])
+		execFileSync("git", ["-C", repo, "commit", "-qm", "snapshot"])
+		const commit = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim()
+		execFileSync("git", ["-C", repo, "bundle", "create", snapshotPath, "HEAD"])
+		const snapshot = fs.readFileSync(snapshotPath)
+		const snapshotSha256 = createHash("sha256").update(snapshot).digest("hex")
+		const payload: FleetJobPayload = { schemaVersion: 1, snapshotSha256, snapshotBytes: snapshot.byteLength, snapshotCommit: commit, task: "modify one value", model: "mock/model", maxIterations: 1, timeoutMs: 100, protectedPaths: [], candidate: { id: "unconfirmed", generation: 0 } }
+		const job = { jobId: "unconfirmed-job", idempotencyKey: "unconfirmed-key", runId: "run", candidateId: "unconfirmed", jobKind: "mutation" as const, resourceClass: "CPU" as const, artifactSha256: snapshotSha256, payload, status: "leased" as const, attempts: 1, maxAttempts: 1, leaseOwner: "worker-unconfirmed", leaseToken: "lease-token", leaseExpiresAt: new Date(Date.now() + 300_000).toISOString(), leaseDurationMs: 300_000, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
+		const lease = { job, token: "lease-token", workerId: "worker-unconfirmed", attempt: 1 } as FleetJobLease
+		const queue = {
+			artifactBackend: "s3", policy: { queueName: "unconfirmed-test", maxInFlight: 1, leaseMs: 60_000 },
+			async migrate() {}, async registerWorker() {}, async heartbeatWorker() {}, async stopWorker() {}, async close() {},
+			async claim() { return lease }, async getArtifact() { return snapshot },
+			async cancel() { cancelRequestedAt = new Date().toISOString(); return true },
+			async acknowledgeCancellation() { acknowledgeCalls += 1; queueStatus = "cancelled"; return true },
+			async getJob() { return { ...job, status: queueStatus, ...(cancelRequestedAt ? { cancelRequestedAt } : {}) } },
+			async heartbeat() { return queueStatus === "leased" && !cancelRequestedAt },
+			async complete() { return { accepted: false } }, async fail() { return false },
+		} as unknown as RsiWorkerOptions["queue"]
+		const worker = runRsiWorker({
+			queue, workerId: "worker-unconfirmed", gatewayId: "gateway-test", maxActive: 1, resourceClasses: ["CPU"], scratchRoot: path.join(root, "worker-scratch"), pollMs: 5, maxJobs: 1,
+			emergencyControl: control,
+			runMutation: async (...args: Parameters<NonNullable<RsiWorkerOptions["runMutation"]>>) => {
+				await control.registerResource("openshell:unconfirmed-sandbox")
+				startedResolve()
+				const signal = args[5]
+				if (!signal) throw new Error("missing abort signal")
+				await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }))
+				throw new Error("sandbox deletion was not confirmed")
+			},
+		})
+		const workerRejected = assert.rejects(worker, /unconfirmed guest teardown/)
+		await started
+		await control.command("stop", "fixture leaves sandbox running")
+		await workerRejected
+		assert.ok(cancelRequestedAt)
+		assert.equal(queueStatus, "leased", "the lease remains active until an independent teardown acknowledgment")
+		assert.equal(acknowledgeCalls, 0, "worker must not acknowledge failed teardown")
+		assert.ok(control.snapshot.resources.includes("openshell:unconfirmed-sandbox"), "the undeleted sandbox resource remains registered for recovery")
 	} finally {
 		await control.close()
 		fs.closeSync(socketDirectoryFd)

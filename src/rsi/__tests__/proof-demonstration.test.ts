@@ -7,7 +7,7 @@ import test from "node:test"
 import { analyzeProofDemonstration, verifyProofDemonstrationArtifactBytes } from "../proof-demonstration.js"
 import { freezeProofDemonstrationManifest, frozenProofConfigDigest } from "../proof-demonstration-manifest.js"
 import { proofCampaignManifestDigest, type ProofCampaignManifest } from "../proof-campaign.js"
-import { RSI_OPENROUTER_MODEL } from "../inference-broker.js"
+import { RSI_MUSE_OPENROUTER_MODEL, RSI_OPENROUTER_MODEL } from "../inference-broker.js"
 import type { BenchmarkAttempt } from "../benchmark/types.js"
 import type { FrozenProofDemonstrationManifest } from "../proof-demonstration-manifest.js"
 import type { CandidateRecord, RsiConfig, RsiRunRecord, WorkerHarnessRuntimeIdentity } from "../types.js"
@@ -16,7 +16,7 @@ import { formatAnalysisReport } from "../../../scripts/rsi-proof-demonstration.j
 const sha256 = (value: Buffer | string) => createHash("sha256").update(value).digest("hex")
 
 function frozenPlan(): FrozenProofDemonstrationManifest {
-	const configs = ["engineering", "campaign-a", "campaign-b", "campaign-c"].map((seed) => ({ repoRoot: "/work", seed, mutationTask: "fixed task", protectedPaths: ["src/rsi"] } as RsiConfig)) as unknown as [RsiConfig, RsiConfig, RsiConfig, RsiConfig]
+	const configs = ["engineering", "campaign-a", "campaign-b", "campaign-c"].map((seed) => ({ repoRoot: "/work", seed, mutationTask: "fixed task", protectedPaths: ["src/rsi"], evaluatorTrustedKeySha256: `sha256:${"9".repeat(64)}` } as RsiConfig)) as unknown as [RsiConfig, RsiConfig, RsiConfig, RsiConfig]
 	const runtime: WorkerHarnessRuntimeIdentity = { imageName: "headlesscode-openshell-rsi:fixed", imageDigest: `sha256:${"a".repeat(64)}`, harnessCommit: "b".repeat(40), dependencyLockDigest: "c".repeat(64) }
 	const tasks = ["dev-task", "confirm-task"].map((id, index) => ({ id, split: index ? "confirmation" : "development", family: "engine", seed: index + 1, startDigest: "d".repeat(64), verifierDigest: "e".repeat(64), knownGoodDigest: "f".repeat(64), knownBadDigest: "1".repeat(64), ceilings: { timeoutMs: 1000, maxCalls: 1, maxOutputTokensPerCall: 100, maxPatchBytes: 1000 } }))
 	const limits = { campaignId: "test", maxCalls: 1, maxInputTokensPerCall: 100, maxOutputTokensPerCall: 100, maxTotalTokens: 200, maxDurationMs: 1000, maxRequestBytes: 1000, maxResponseBytes: 1000, maxInputPricePerMillionUsd: 1, maxOutputPricePerMillionUsd: 1, maxCallSpendUsd: 0.01, maxJobSpendUsd: 0.02, maxCampaignSpendUsd: 1 }
@@ -33,6 +33,18 @@ function frozenPlan(): FrozenProofDemonstrationManifest {
 		analysis: { bootstrapSeed: "fixed-bootstrap", bootstrapReplicates: 100, confirmationRetentionTaskIds: ["confirm-task"] },
 	}
 	return freezeProofDemonstrationManifest(args)
+}
+
+function musePlan(): FrozenProofDemonstrationManifest {
+	const base = frozenPlan()
+	const { schemaVersion: _schemaVersion, digestSha256: _digestSha256, ...body } = base
+	const configs = base.execution.configs.map((config) => ({ ...config, model: RSI_MUSE_OPENROUTER_MODEL, roles: { worker: { provider: "openrouter" as const, model: RSI_MUSE_OPENROUTER_MODEL, openRouterProfile: "muse-spark-contributor" as const } } })) as unknown as typeof base.execution.configs
+	return freezeProofDemonstrationManifest({
+		...body,
+		model: { ...base.model, requestedId: RSI_MUSE_OPENROUTER_MODEL, profileId: "muse-spark-contributor" },
+		endpointPrice: { ...base.endpointPrice, model: RSI_MUSE_OPENROUTER_MODEL, provider: "meta", endpointTag: "meta", quantization: "unknown" },
+		execution: { ...base.execution, configs, configSha256: frozenProofConfigDigest(configs) },
+	})
 }
 
 test("analysis is inconclusive for missing campaign records and duplicate arm runs", () => {
@@ -73,7 +85,7 @@ function qualifyingRuns(plan: FrozenProofDemonstrationManifest): RsiRunRecord[] 
 				schemaVersion: 1, campaignId, rootCommit: plan.rootCommit,
 				benchmarkDigests: { manifest: plan.benchmarkManifestSha256, development: "6".repeat(64), confirmation: "7".repeat(64) },
 				armAssignment: { fixedControl: "fixed-control", selfHosted: "self-hosted" },
-				model: { provider: plan.model.provider, id: plan.model.requestedId, settings: { sampling: plan.model.sampling } }, seed,
+			model: { provider: plan.model.provider, id: plan.model.requestedId, ...(plan.model.profileId ? { profileId: plan.model.profileId } : {}), settings: { sampling: plan.model.sampling } }, seed,
 				taskOrder: [task.id], schedule, budgets: { attempt: { maxCalls: 1, maxTokens: 200, maxSpendUsd: 0.02, maxDurationMs: 1000 }, root: { maxCalls: 100, maxTokens: 10000, maxSpendUsd: 1, maxRuntimeMs: 10_000_000 } },
 				acceptanceRule: { confirmationRetentionTaskIds: [task.id] }, runtime: { imageDigest: plan.runtime.imageDigest, harnessCommit: plan.runtime.harnessCommit, dependencyLockDigest: plan.runtime.dependencyLockDigest }, analysisVersion: "task-cluster-bootstrap-90-v1",
 				phaseMode: "paired-confirmation", settings: { effectiveConfig: plan.execution.configs[index + 1], confirmationTaskIdentities: [{ id: task.id, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings }], candidateCounts: [1, 1, 1], inferenceCeilings: { maxInputTokensPerCall: 100, maxTotalTokens: 200, maxJobSpendUsd: 0.02 } },
@@ -87,10 +99,10 @@ function qualifyingRuns(plan: FrozenProofDemonstrationManifest): RsiRunRecord[] 
 			const finalAttemptId = `${campaignId}-${armId}-final`
 			const rootAttemptId = `${campaignId}-${armId}-root`
 			const makeAttempt = (attemptId: string, candidateId: string, kind: string, commit: string, success: boolean) => ({
-				attemptId, taskId: task.id, split: "confirmation", harnessCommit: commit, model: { provider: plan.model.provider, id: plan.model.requestedId, sampling: plan.model.sampling }, seed: task.seed,
+				attemptId, taskId: task.id, split: "confirmation", harnessCommit: commit, model: { provider: plan.model.provider, id: plan.model.requestedId, ...(plan.model.profileId ? { profileId: plan.model.profileId } : {}), sampling: plan.model.sampling }, seed: task.seed,
 				startDigest: task.startDigest, evaluatorDigest: task.verifierDigest, ceilings: task.ceilings, validity: "valid", proofQualified: true, resourceAccounting: "supervisor-enforced", verifiedSuccess: success,
 				calls: 1, tokens: 20, wallTimeMs: 10, patchDigest: "8".repeat(64), artifactRefs: {}, stopReason: "completed",
-				inferenceReceipt: { qualified: true, model: plan.model.requestedId, returnedModels: [plan.model.requestedId], endpointProvider: "deepinfra", returnedProviders: ["deepinfra"], calls: 1, totalTokens: 20, costUsd: 0.001 },
+				inferenceReceipt: { qualified: true, model: plan.model.requestedId, returnedModels: [plan.model.requestedId], endpointProvider: plan.endpointPrice.provider, returnedProviders: [plan.endpointPrice.provider], calls: 1, totalTokens: 20, costUsd: 0.001 },
 			})
 			const finalAttempt = makeAttempt(finalAttemptId, armId === "self-hosted" ? "g2-candidate-0" : "g2-candidate-0", "confirmation", selectedCommit, armId === "self-hosted") as unknown as BenchmarkAttempt
 			const rootAttempt = makeAttempt(rootAttemptId, "root-control", "fixed-control", plan.rootCommit, false) as unknown as BenchmarkAttempt
@@ -148,6 +160,19 @@ test("a complete synthetic paired record can demonstrate, while provider, config
 	const wrongLineage = structuredClone(records)
 	for (const run of wrongLineage.filter((entry) => entry.workerHarnessMode === "self-hosted")) run.candidates.find((candidate) => candidate.generation === 1)!.parentCommit = "f".repeat(40)
 	assert.notEqual(analyzeProofDemonstration(wrongLineage, { frozenPlan: plan }).verdict, "demonstrated")
+})
+
+test("analysis accepts exact admitted Muse profile/provider receipts and rejects DeepInfra receipts", () => {
+	const plan = musePlan()
+	const records = qualifyingRuns(plan)
+	const report = analyzeProofDemonstration(records, { frozenPlan: plan })
+	assert.equal(report.verdict, "demonstrated", `${report.verdictReasons.join("; ")} missing=${report.denominators.missingCells.join(",")} excluded=${report.denominators.excludedAttempts.join(",")}`)
+	const wrongRoute = structuredClone(records)
+	wrongRoute[0]!.confirmationAttempts![0]!.inferenceReceipt!.returnedProviders = ["deepinfra"]
+	assert.notEqual(analyzeProofDemonstration(wrongRoute, { frozenPlan: plan }).verdict, "demonstrated")
+	const unadmittedAlias = structuredClone(records)
+	unadmittedAlias[0]!.confirmationAttempts![0]!.inferenceReceipt!.returnedModels = ["meta/unadmitted-alias"]
+	assert.notEqual(analyzeProofDemonstration(unadmittedAlias, { frozenPlan: plan }).verdict, "demonstrated")
 })
 
 test("confirmation analysis artifact verifier checks referenced bytes and rejects changed files", async () => {

@@ -55,6 +55,9 @@ export interface OpenRouterGenerationMetadata {
 	cacheDiscountUsd?: number
 	tokensPrompt?: number
 	tokensCompletion?: number
+	/** Provider-native token counts; OpenRouter's normalized tokens_* may differ. */
+	nativeTokensPrompt?: number
+	nativeTokensCompletion?: number
 	nativeTokensReasoning?: number
 	nativeTokensCached?: number
 	latencyMs?: number
@@ -461,6 +464,8 @@ export class OpenRouterClient implements LlmClient {
 			...(signedNumber(data.cache_discount) !== undefined ? { cacheDiscountUsd: signedNumber(data.cache_discount) } : {}),
 			...(number(data.tokens_prompt) !== undefined ? { tokensPrompt: number(data.tokens_prompt) } : {}),
 			...(number(data.tokens_completion) !== undefined ? { tokensCompletion: number(data.tokens_completion) } : {}),
+			...(number(data.native_tokens_prompt) !== undefined ? { nativeTokensPrompt: number(data.native_tokens_prompt) } : {}),
+			...(number(data.native_tokens_completion) !== undefined ? { nativeTokensCompletion: number(data.native_tokens_completion) } : {}),
 			...(number(data.native_tokens_reasoning) !== undefined ? { nativeTokensReasoning: number(data.native_tokens_reasoning) } : {}),
 			...(number(data.native_tokens_cached) !== undefined ? { nativeTokensCached: number(data.native_tokens_cached) } : {}),
 			...(decimal(data.latency) !== undefined ? { latencyMs: decimal(data.latency) } : {}),

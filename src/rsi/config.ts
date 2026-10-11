@@ -63,6 +63,7 @@ Options:
   --max-trajectories <n>       maximum independent trajectories (adaptive default: population + 1)
   --max-total-iterations <n>   aggregate model-iteration budget (adaptive default: max-iterations * trajectories)
   --max-runtime-ms <n>         wall-clock admission budget for adaptive follow-ups (default: 3600000)
+  evaluator guests require HEADLESSCODE_RSI_EVALUATOR_IMAGE_DIGEST=sha256:<64 lowercase hex>
   --regression <command>      paired regression gate (default: npm test)
   --eval <command>             visible command; repeat or separate with ;; 
   --hidden-eval <command>      supervisor-only hidden command
@@ -72,6 +73,9 @@ Options:
   --hidden-private-key <path>   Ed25519 signing key in PEM format (mode 0600)
   --hidden-nonce-store <path>   durable replay store, outside the repository/archive
   --hidden-image-digest <value> trusted evaluator image pin: sha256:<64 hex digits>
+  --evaluator-signing-key <path> protected Ed25519 key for signed evaluator manifests
+  --evaluator-trusted-public-key <path> independently pinned operator trust key
+  --evaluator-trusted-key-sha256 <pin> trusted key pin: sha256:<64 lowercase hex digits>
   --mutation-task <text>       improvement objective
   --archive-dir <path>         durable archive directory
   --worktree-dir <path>        candidate worktree directory
@@ -119,6 +123,9 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 	let hiddenPrivateKeyPath: string | undefined
 	let hiddenNonceStorePath: string | undefined
 	let hiddenImageDigest: string | undefined
+	let evaluatorSigningKeyPath: string | undefined
+	let evaluatorTrustedPublicKeyPath: string | undefined
+	let evaluatorTrustedKeySha256: string | undefined
 	let archiveDir: string | undefined
 	let worktreeDir: string | undefined
 	let baseRef = "HEAD"
@@ -265,6 +272,15 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 				}
 				case "--hidden-image-digest": {
 					const [value, next] = take(index, arg); hiddenImageDigest = value; index = next; break
+				}
+				case "--evaluator-signing-key": {
+					const [value, next] = take(index, arg); evaluatorSigningKeyPath = path.resolve(value); index = next; break
+				}
+				case "--evaluator-trusted-public-key": {
+					const [value, next] = take(index, arg); evaluatorTrustedPublicKeyPath = path.resolve(value); index = next; break
+				}
+				case "--evaluator-trusted-key-sha256": {
+					const [value, next] = take(index, arg); evaluatorTrustedKeySha256 = value; index = next; break
 				}
 				case "--mutation-task": {
 					const [value, next] = take(index, arg)
@@ -415,6 +431,8 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 		if (workerHarnessEngineeringOnly && (!workerHarnessMode || !workerHarnessPairId)) throw new Error("--worker-harness-engineering-only requires an explicit paired campaign ID and arm")
 		const hiddenOptions = [hiddenSuitePath, hiddenSuiteSha256, hiddenPublicKeyPath, hiddenPrivateKeyPath, hiddenNonceStorePath, hiddenImageDigest]
 		if (hiddenOptions.some((value) => value !== undefined) && hiddenOptions.some((value) => value === undefined)) throw new Error("hidden verification requires all six --hidden-suite, --hidden-suite-sha256, --hidden-public-key, --hidden-private-key, --hidden-nonce-store, and --hidden-image-digest options")
+		const evaluatorIntegrityOptions = [evaluatorSigningKeyPath, evaluatorTrustedPublicKeyPath, evaluatorTrustedKeySha256]
+		if (evaluatorIntegrityOptions.some((value) => value !== undefined) && evaluatorIntegrityOptions.some((value) => value === undefined)) throw new Error("evaluator integrity requires all three --evaluator-signing-key, --evaluator-trusted-public-key, and --evaluator-trusted-key-sha256 options")
 		if (workerHarnessEngineeringOnly && workerHarnessPhase !== "development") throw new Error("engineering-only worker harness runs support only the development phase")
 		const resolvedRepo = path.resolve(repoRoot)
 		const adaptiveTrajectories = maxTrajectories ?? population + 1
@@ -442,6 +460,7 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 				evalCommands,
 				hiddenEvalCommands,
 				...(hiddenSuitePath ? { hiddenSuitePath, hiddenSuiteSha256, hiddenPublicKeyPath, hiddenPrivateKeyPath, hiddenNonceStorePath, hiddenImageDigest } : {}),
+				...(evaluatorSigningKeyPath ? { evaluatorSigningKeyPath, evaluatorTrustedPublicKeyPath, evaluatorTrustedKeySha256 } : {}),
 				archiveDir: archiveDir ?? path.join(resolvedRepo, ".headlesscode", "rsi"),
 				worktreeDir: worktreeDir ?? path.join(resolvedRepo, ".worktrees", "rsi"),
 				trajectoryDir: trajectoryDir ?? path.join(archiveDir ?? path.join(resolvedRepo, ".headlesscode", "rsi"), "trajectories"),

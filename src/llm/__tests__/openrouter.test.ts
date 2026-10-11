@@ -388,7 +388,8 @@ async function testOpenRouterUsageCostAndGenerationMetadataAreMapped(): Promise<
 			return new Response(JSON.stringify({ data: {
 				id: "gen-abc-123", model: "meta/muse-spark-1.3-contributor", provider_name: "Meta",
 				total_cost: 0.00012, upstream_inference_cost: 0.00011, cache_discount: 0.00003,
-				tokens_prompt: 1200, tokens_completion: 8, native_tokens_reasoning: 2, native_tokens_cached: 1100, latency: 900,
+				tokens_prompt: 411, tokens_completion: 24, native_tokens_prompt: 1200, native_tokens_completion: 8,
+				native_tokens_reasoning: 2, native_tokens_cached: 1100, latency: 900,
 			} }), { status: 200 })
 		}
 		return new Response(JSON.stringify({
@@ -414,7 +415,8 @@ async function testOpenRouterUsageCostAndGenerationMetadataAreMapped(): Promise<
 		assert.deepEqual(metadata, {
 			id: "gen-abc-123", model: "meta/muse-spark-1.3-contributor", providerName: "Meta",
 			totalCostUsd: 0.00012, upstreamInferenceCostUsd: 0.00011, cacheDiscountUsd: 0.00003,
-			tokensPrompt: 1200, tokensCompletion: 8, nativeTokensReasoning: 2, nativeTokensCached: 1100, latencyMs: 900,
+			tokensPrompt: 411, tokensCompletion: 24, nativeTokensPrompt: 1200, nativeTokensCompletion: 8,
+			nativeTokensReasoning: 2, nativeTokensCached: 1100, latencyMs: 900,
 		})
 		assert.equal(call, 2)
 	} finally { globalThis.fetch = originalFetch }

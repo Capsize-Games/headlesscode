@@ -1,10 +1,10 @@
 import assert from "node:assert/strict"
-import { createHash, randomUUID } from "node:crypto"
+import { createHash, generateKeyPairSync, randomUUID } from "node:crypto"
 import { execFileSync } from "node:child_process"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
-import test from "node:test"
+import test, { after, before } from "node:test"
 import { checkpointRun } from "../archive.js"
 import { runRsi as runRsiImplementation } from "../controller.js"
 import { createMutationSnapshotBundle } from "../openshell.js"
@@ -14,8 +14,25 @@ import type { CandidateRecord, RsiConfig, RsiRunRecord, RsiHooks, TrialResult } 
 import { fakeDevelopmentBenchmarkHook } from "./development-proof-fixture.js"
 import { fixtureDevelopmentProofProtocol } from "./development-proof-fixture.js"
 
+const originalPolicyPath = process.env.HEADLESSCODE_OPENSHELL_POLICY
+let syntheticPolicyDirectory: string | undefined
+before(async () => {
+	const scratch = path.resolve(".headlesscode/scratch")
+	await fs.mkdir(scratch, { recursive: true, mode: 0o700 })
+	syntheticPolicyDirectory = await fs.mkdtemp(path.join(scratch, "synthetic-fleet-policy-"))
+	const policyPath = path.join(syntheticPolicyDirectory, "policy.yaml")
+	await fs.writeFile(policyPath, "sandbox:\n  network: disabled\n", { mode: 0o600 })
+	await fs.chmod(policyPath, 0o600)
+	process.env.HEADLESSCODE_OPENSHELL_POLICY = policyPath
+})
+after(async () => {
+	if (originalPolicyPath === undefined) delete process.env.HEADLESSCODE_OPENSHELL_POLICY
+	else process.env.HEADLESSCODE_OPENSHELL_POLICY = originalPolicyPath
+	if (syntheticPolicyDirectory) await fs.rm(syntheticPolicyDirectory, { recursive: true, force: true })
+})
+
 function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queue?: PostgresRsiJobQueue): Promise<RsiRunRecord> {
-	return runRsiImplementation(config, { runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook(), ...hooks }, queue)
+	return runRsiImplementation(config, { syntheticRuntimeIdentity: true, runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook(), ...hooks }, queue)
 }
 
 class FakeFleetQueue {
@@ -115,6 +132,7 @@ class FakeFleetQueue {
 		const jobId = randomUUID()
 		let result: Record<string, unknown>
 		if (input.jobKind === "mutation") {
+			assert.equal(input.payload.evaluatorRuntime, undefined, "mutation jobs do not receive evaluator-only runtime identity")
 			this.mutationJobCount += 1
 			const bundle = this.artifacts.get(input.artifactSha256)
 			assert.ok(bundle)
@@ -136,6 +154,8 @@ class FakeFleetQueue {
 				await fs.rm(temp, { recursive: true, force: true })
 			}
 		} else {
+			assert.equal(input.payload.evaluatorRuntime?.imageDigest, `sha256:${"0".repeat(64)}`, "synthetic evaluation hooks carry an explicit non-production image identity")
+			assert.match(input.payload.evaluatorRuntime?.policySha256 ?? "", /^[a-f0-9]{64}$/, "evaluation payload freezes the effective policy bytes")
 			const adversarial = input.candidateId.endsWith("-adversarial")
 			if (adversarial) {
 				this.adversarialEvaluationJobCount += 1
@@ -222,6 +242,20 @@ async function setup(): Promise<{ root: string; config: RsiConfig }> {
 		commandTimeoutMs: 1000,
 	} satisfies RsiConfig
 	return { root, config }
+}
+
+async function syntheticEvaluatorTrust(config: RsiConfig): Promise<{ config: RsiConfig; cleanup: () => Promise<void> }> {
+	const root = await fs.mkdtemp(path.join("/var/tmp", "hc-rsi-fleet-test-trust-"))
+	const pair = generateKeyPairSync("ed25519")
+	const signingKeyPath = path.join(root, "signing.pem")
+	const trustedPublicKeyPath = path.join(root, "trusted-public.pem")
+	await fs.writeFile(signingKeyPath, pair.privateKey.export({ format: "pem", type: "pkcs8" }), { mode: 0o600 })
+	await fs.writeFile(trustedPublicKeyPath, pair.publicKey.export({ format: "pem", type: "spki" }), { mode: 0o600 })
+	const trustedKeySha256 = `sha256:${createHash("sha256").update(pair.publicKey.export({ format: "der", type: "spki" })).digest("hex")}`
+	return {
+		config: { ...config, evaluatorSigningKeyPath: signingKeyPath, evaluatorTrustedPublicKeyPath: trustedPublicKeyPath, evaluatorTrustedKeySha256: trustedKeySha256 },
+		cleanup: () => fs.rm(root, { recursive: true, force: true }),
+	}
 }
 
 test("fleet controller queues baseline and all candidate evaluations before waiting", async () => {
@@ -319,10 +353,11 @@ function adversarialResponse(findings: Array<{ severity: "major" | "minor"; mess
 
 test("fleet adversarial replay failure rejects candidate and closes the adversarial hard gate", async () => {
 	const { root, config } = await setup()
+	const trusted = await syntheticEvaluatorTrust(config)
 	const queue = new FakeFleetQueue(2, false, false, false, false, false, true)
 	try {
 		const run = await runRsi({
-			...config,
+			...trusted.config,
 			roles: { worker: { provider: "ollama", model: "worker-model" }, adversary: { provider: "openrouter", model: "review-model" } },
 		}, { log: () => undefined, runAdversary: async () => adversarialResponse() }, queue as unknown as PostgresRsiJobQueue)
 		assert.ok(run.candidates.every((candidate) => candidate.status === "rejected"), JSON.stringify(run.candidates.map(({ id, status, failure }) => ({ id, status, failure }))))
@@ -332,15 +367,17 @@ test("fleet adversarial replay failure rejects candidate and closes the adversar
 		assert.equal(queue.adversarialEvaluationJobCount, 2)
 	} finally {
 		await fs.rm(root, { recursive: true, force: true })
+		await trusted.cleanup()
 	}
 })
 
 test("fleet adversarial major finding records a bounded penalty when its OpenShell test passes", async () => {
 	const { root, config } = await setup()
+	const trusted = await syntheticEvaluatorTrust(config)
 	const queue = new FakeFleetQueue(2)
 	try {
 		const run = await runRsi({
-			...config,
+			...trusted.config,
 			roles: { worker: { provider: "ollama", model: "worker-model" }, adversary: { provider: "openrouter", model: "review-model" } },
 		}, { log: () => undefined, runAdversary: async () => adversarialResponse([{ severity: "major", message: "A boundary case may be mishandled.", testId: "adversary-case" }]) }, queue as unknown as PostgresRsiJobQueue)
 		assert.ok(run.candidates.every((candidate) => candidate.status === "rejected"), JSON.stringify(run.candidates.map(({ id, status, failure }) => ({ id, status, failure }))))
@@ -357,16 +394,18 @@ test("fleet adversarial major finding records a bounded penalty when its OpenShe
 		assert.match(report, /penalty=5/)
 	} finally {
 		await fs.rm(root, { recursive: true, force: true })
+		await trusted.cleanup()
 	}
 })
 
 test("adversarial role with same model name on a different provider is not cross-model supervision", async () => {
 	const { root, config } = await setup()
+	const trusted = await syntheticEvaluatorTrust(config)
 	const queue = new FakeFleetQueue(2)
 	let reviewerCalled = false
 	try {
 		const run = await runRsi({
-			...config,
+			...trusted.config,
 			roles: { worker: { provider: "ollama", model: "shared-model-name" }, adversary: { provider: "openrouter", model: "shared-model-name" } },
 		}, { log: () => undefined, runAdversary: async () => { reviewerCalled = true; return adversarialResponse() } }, queue as unknown as PostgresRsiJobQueue)
 		assert.equal(reviewerCalled, false)
@@ -375,16 +414,18 @@ test("adversarial role with same model name on a different provider is not cross
 		assert.equal(queue.adversarialEvaluationJobCount, 0)
 	} finally {
 		await fs.rm(root, { recursive: true, force: true })
+		await trusted.cleanup()
 	}
 })
 
 test("malformed adversary response preserves provider result provenance separately from parse error", async () => {
 	const { root, config } = await setup()
+	const trusted = await syntheticEvaluatorTrust(config)
 	const queue = new FakeFleetQueue(2)
 	const rawResponse = "{not-json"
 	try {
 		const run = await runRsi({
-			...config,
+			...trusted.config,
 			roles: { worker: { provider: "ollama", model: "worker-model" }, adversary: { provider: "openrouter", model: "review-model" } },
 		}, { log: () => undefined, runAdversary: async () => rawResponse }, queue as unknown as PostgresRsiJobQueue)
 		assert.ok(run.adversarialReviews?.every((review) => review.status === "error" && review.resultArtifactSha256 && review.resultSha256 && review.errorArtifactSha256 && review.errorSha256))
@@ -394,6 +435,7 @@ test("malformed adversary response preserves provider result provenance separate
 		}
 	} finally {
 		await fs.rm(root, { recursive: true, force: true })
+		await trusted.cleanup()
 	}
 })
 

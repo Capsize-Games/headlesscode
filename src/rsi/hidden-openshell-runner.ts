@@ -12,6 +12,7 @@ export interface OpenShellHiddenRunnerOptions {
 	config: RsiConfig
 	signingKey: string | Buffer | KeyObject
 	imageDigest: string
+	evaluatorPolicySha256: string
 	providerFactory?: RsiOpenShellProviderFactory
 }
 
@@ -30,7 +31,7 @@ export function createOpenShellHiddenCaseRunner(options: OpenShellHiddenRunnerOp
 			const sourceTree = execFileSync("git", ["ls-tree", "-r", "-z", "--full-tree", actualCommit], { cwd: candidateRoot, maxBuffer: 32 * 1024 * 1024 })
 			const sourceDigest = createHash("sha256").update(sourceTree).digest("hex")
 			if (sourceDigest !== request.identity.candidateSourceDigest) throw new Error("candidate source digest changed after hidden verification identity was frozen")
-			const outputs = await runOpenShellHiddenFunctionCases(candidateRoot, actualCommit, options.config, request, options.providerFactory, options.imageDigest)
+			const outputs = await runOpenShellHiddenFunctionCases(candidateRoot, actualCommit, options.config, request, options.providerFactory, options.imageDigest, options.evaluatorPolicySha256)
 			return signHiddenVerificationReport(
 				{ identity: request.identity, outputs },
 				(payload) => sign(null, payload, signingKey),

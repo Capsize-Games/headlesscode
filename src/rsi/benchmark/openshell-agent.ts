@@ -143,8 +143,9 @@ export class OpenShellBenchmarkVerifier implements BenchmarkVerifier {
 	private readonly harnessRoot: string
 	private readonly providerFactory?: RsiOpenShellProviderFactory
 	private readonly imageName: string
+	private readonly evaluatorPolicySha256?: string
 	private cachedImageIdentity?: BenchmarkImageIdentity
-	constructor(harnessRoot = process.cwd(), providerFactory?: RsiOpenShellProviderFactory, imageName = "headlesscode-openshell-rsi:local") { this.harnessRoot = path.resolve(harnessRoot); this.providerFactory = providerFactory; this.imageName = imageName }
+	constructor(harnessRoot = process.cwd(), providerFactory?: RsiOpenShellProviderFactory, imageName = "headlesscode-openshell-rsi:local", evaluatorPolicySha256?: string) { this.harnessRoot = path.resolve(harnessRoot); this.providerFactory = providerFactory; this.imageName = imageName; this.evaluatorPolicySha256 = evaluatorPolicySha256 }
 
 	async imageIdentity(harnessCommit: string): Promise<BenchmarkImageIdentity> {
 		const name = this.imageName
@@ -173,7 +174,7 @@ export class OpenShellBenchmarkVerifier implements BenchmarkVerifier {
 			worktree: workspace, baseCommit, status: "evaluating", model: "supervisor-verifier", mutation: task.task,
 			createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), commits: [], changedFiles: [], protectedPathViolations: [],
 		}
-		const result = await runOpenShellBenchmarkVerifier(candidate, parsed.config, verifier, task.id, this.providerFactory, image.digest)
+		const result = await runOpenShellBenchmarkVerifier(candidate, parsed.config, verifier, task.id, this.providerFactory, image.digest, this.evaluatorPolicySha256)
 		if (result.exitCode === 125) throw new Error(`OpenShell benchmark verifier reported child infrastructure failure: ${result.stdout || result.stderr}`)
 		return { success: result.ok, output: `${result.stdout}${result.stderr}`.slice(0, 16_384) }
 	}

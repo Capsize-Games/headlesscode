@@ -11,6 +11,54 @@ selection. Full visible-test output is content-addressed in the object store;
 PostgreSQL keeps bounded previews and artifact references. Hidden evaluation
 remains disabled.
 
+## Candidate guest isolation check
+
+RSI evaluation workers receive a one-commit sanitized snapshot at `/workspace`
+and a separate writable `/result` export directory. The RSI evaluation profile
+does not add project-data, shared-data, checkpoint, memory, or arbitrary
+read-only mounts. Its network policy is empty. Candidate mutation and
+evaluation processes run in separate disposable guests; candidate mutation
+snapshots omit RSI policy, evaluator and scoring files, tests, and operator
+data. Evaluation guests receive only the configured visible evaluation inputs
+and fixed verifier files needed for that evaluation. The coordinator keeps the
+archive, host worktree, process-control state, evaluator configuration, and
+scoring logic on the host. A candidate can change its own snapshot and its
+Git metadata; returned changes are checked before host import.
+
+Run `npm run rsi:security-canary` from the repository root to qualify synthetic
+host-path and snapshot behavior against the selected OpenShell gateway and the
+RSI image enforced by the provider. The command creates a disposable synthetic
+repository, starts an evaluation guest without model inference, attempts reads
+and writes against synthetic host, control, evaluator, scoring, archive, and
+Git metadata canaries, checks that those host canaries remain absent or
+unchanged from the guest's attempted writes, checks an intended `/workspace`
+write, and records paths plus guest error codes under `.headlesscode/scratch/`.
+The guest may also have other writable locations such as `/tmp`; this check
+does not claim that `/workspace` is its only writable location. A pass is
+specific to the gateway and image used for that run; mocked provider tests are
+not a substitute for this guest check.
+
+## Evaluator integrity seals
+
+Paired worker-harness, hidden-evaluator, and adversarial qualification runs
+require an Ed25519 evaluator signing key, an independently configured trusted
+public key, and its `sha256:<hex>` DER-SPKI pin. Pass them with
+`--evaluator-signing-key`, `--evaluator-trusted-public-key`, and
+`--evaluator-trusted-key-sha256`. Both key files must be regular files with
+mode `0600` or stricter and remain outside the repository, RSI archive, and
+candidate worktree. The public key and pin must come from the operator's trust
+configuration; the run does not establish its own trust.
+
+The seal binds the evaluator source and runtime inputs, base tree, effective
+commands and settings, evaluation output identities, and generation decisions.
+The manifest is signed before each archive checkpoint that updates this state.
+Resume verifies the independent pin and sealed archive state before dispatching
+more work or accepting a selection. A changed source, trust key, output, or
+selection fails closed. Historical records without a seal remain explicitly
+unsealed; they cannot be retroactively sealed, and attested runs cannot resume
+from an unsealed record. Ordinary runs without configured trust are reported
+as unsealed.
+
 ## Earlier bounded runs (historical)
 
 Before the fail-closed mutation runner was added, RSI ran bounded local Qwen
@@ -342,11 +390,16 @@ campaigns. Engineering-only manifests contain no confirmation task IDs or
 confirmation schedule cells.
 
 Use the staged commands below from a clean checkout with the exact fixed and
-self-hosted harness image identities configured. Estimate and plan fetch only
-the pinned endpoint's read-only price metadata. Execution requires PostgreSQL,
-OpenShell, the broker, the model key on the supervisor, finite per-role
-allocations, and a separately reviewed operator cap. No production inference
-has been run as part of this implementation.
+self-hosted harness image identities configured. The launcher retains the
+historical DeepSeek V4 Flash / DeepInfra profile when `--openrouter-profile` is
+omitted. To select Muse Spark Contributor, pass
+`--openrouter-profile muse-spark-contributor` to both engineering and plan;
+the development evidence and final plan must use the same admitted profile.
+The frozen manifest records its profile, model, and endpoint-price metadata.
+Estimate and plan fetch only the selected endpoint's read-only price metadata.
+Execution requires PostgreSQL, OpenShell, the broker, the model key on the
+supervisor, finite per-role allocations, and a separately reviewed operator
+cap. No production inference has been run as part of this implementation.
 
 ```sh
 # Review the engineering-only schedule and live price before choosing a cap.

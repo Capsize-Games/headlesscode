@@ -241,6 +241,9 @@ export interface RsiConfig {
 	hiddenPrivateKeyPath?: string
 	hiddenNonceStorePath?: string
 	hiddenImageDigest?: string
+	evaluatorSigningKeyPath?: string
+	evaluatorTrustedPublicKeyPath?: string
+	evaluatorTrustedKeySha256?: string
 	archiveDir: string
 	worktreeDir: string
 	baseRef: string
@@ -450,6 +453,17 @@ export interface RsiRunRecord {
 	openRouterProfileId?: RsiOpenRouterProfileId
 	baseRef: string
 	baseCommit: string
+	evaluatorIntegrity?: {
+		status: "sealed" | "unsealed"
+		inputSha256?: string
+		archiveStateSha256?: string
+		manifestSha256?: string
+		manifestPath?: string
+		keyId?: string
+		selectedCandidateId?: string
+		outputs: Array<{ candidateId: string; taskId: string; outputSha256: string; artifactSha256?: string; artifactBytes?: number }>
+		generations: Array<{ generation: number; selectedCandidateIds: string[]; selectedCandidateId?: string; decisionsSha256: string }>
+	}
 	hiddenVerifierIdentity?: { protocol: string; suiteSha256: string; imageDigest: string; publicKeySha256: string }
 	generations: number
 	selected?: string
@@ -518,6 +532,8 @@ export interface RsiHooks {
 	runDevelopmentBenchmark?: (request: { harnessCommit: string; model: string; outputRoot: string; protocol: DevelopmentProofProtocol }) => Promise<BenchmarkAttempt[]>
 	now?: () => string
 	log?: (line: string) => void
+	/** Marks test-only injected runtimes so integrity records do not imply a production image identity. */
+	syntheticRuntimeIdentity?: true
 }
 
 export type SpawnedProcess = ChildProcess

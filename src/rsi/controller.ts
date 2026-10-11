@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises"
 import * as path from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
 import { fileURLToPath } from "node:url"
-import { appendRun, checkpointRun, findActiveRun, findRun, readArchive } from "./archive.js"
+import { appendRun, checkpointRun as archiveCheckpointRun, findActiveRun, findRun, readArchive } from "./archive.js"
 import { parseRsiArgs, rsiHelp } from "./config.js"
 import { generateCurriculumProposals, validateCurriculumProposals, writeCurriculumProposals } from "./curriculum.js"
 import { evaluateCandidate } from "./evaluator.js"
@@ -17,11 +17,12 @@ import { resolveRoles } from "./roles.js"
 import { newExperimentJob, paretoFront, selectParentChoices, transitionJob } from "./selection.js"
 import { captureCandidateTrajectory, exportTrajectoryDatasets } from "./trajectory.js"
 import { decideAdaptiveContinuation } from "./adaptive.js"
-import { createOpenShellCommandRunner } from "./openshell.js"
+import { createOpenShellCommandRunner, resolveRsiEvaluatorRuntimeIdentity } from "./openshell.js"
+import type { EvaluatorRuntimeIdentity } from "./evaluator-runtime.js"
 import { createAdversarialEvaluationSnapshotBundle, createEvaluationSnapshotBundle, createMutationSnapshotBundle, createMutationSnapshotIdentity, applyFleetMutationPatch } from "./openshell.js"
 import { ADVERSARIAL_COMMAND, ADVERSARIAL_PROMPT_VERSION, ADVERSARIAL_TESTS_PATH, buildAdversarialPrompt, parseAdversarialReview, requestAdversarialReview, sha256 } from "./adversarial.js"
 import { fleetJobMatches, fleetPayloadDigest, PostgresRsiJobQueue, fleetQueuePolicy, requiredFleetJobLeaseMs, type FleetJob, type FleetJobIdentity, type FleetJobPayload } from "./postgres-queue.js"
-import type { AdversarialReviewRecord, CandidateRecord, ExperimentJob, RsiArchive, RsiConfig, RsiHooks, RsiRunRecord, TrajectoryRecord, TrialResult, WorkerHarnessExecution } from "./types.js"
+import type { AdversarialReviewRecord, CandidateRecord, EvaluationSummary, ExperimentJob, RsiArchive, RsiConfig, RsiHooks, RsiRunRecord, TrajectoryRecord, TrialResult, WorkerHarnessExecution } from "./types.js"
 import {
 	candidateCommits,
 	changedFiles,
@@ -45,9 +46,179 @@ import { runProofConfirmation } from "./proof-confirmation.js"
 import { loadHiddenVerifierConfig } from "./hidden-config.js"
 import { createOpenShellHiddenCaseRunner } from "./hidden-openshell-runner.js"
 import type { HiddenEvaluationOptions } from "./evaluator.js"
+import { canonicalJson, evaluatorBaseTreeIdentity, evaluatorGenerationDecisionDigest, evaluatorIntegrityDigest, evaluatorSourceIdentity, hasEvaluatorIntegrityManifests, loadEvaluatorIntegrityTrust, readEvaluatorIntegrityManifest, signEvaluatorIntegrity, verifyEvaluatorIntegrity, writeEvaluatorIntegrityManifest } from "./evaluation-integrity.js"
+import type { EvaluatorIntegrityPayload, EvaluatorIntegrityTrust } from "./evaluation-integrity.js"
 
 function log(hooks: RsiHooks, line: string): void {
 	(hooks.log ?? ((message) => process.stdout.write(`${message}\n`)))(line)
+}
+
+type IntegrityOutput = NonNullable<RsiRunRecord["evaluatorIntegrity"]>["outputs"][number]
+
+function trialOutputRecords(candidateId: string, taskId: string, trial: TrialResult): IntegrityOutput[] {
+	return [{
+		candidateId,
+		taskId,
+		outputSha256: evaluatorIntegrityDigest({ command: trial.command, exitCode: trial.exitCode, stdout: trial.stdout, stderr: trial.stderr, timedOut: trial.timedOut ?? false }),
+		...(trial.outputArtifactSha256 ? { artifactSha256: trial.outputArtifactSha256, artifactBytes: trial.outputArtifactBytes } : {}),
+	}]
+}
+
+function evaluationOutputRecords(candidateId: string, evaluation: EvaluationSummary): IntegrityOutput[] {
+	const trials: Array<{ taskId: string; trial: TrialResult }> = [
+		{ taskId: "regression", trial: evaluation.regression },
+		...(evaluation.typecheck ? [{ taskId: "typecheck", trial: evaluation.typecheck }] : []),
+		...evaluation.visible.map((trial, index) => ({ taskId: `visible-${index}`, trial })),
+		...evaluation.hidden.map((trial, index) => ({ taskId: `hidden-${index}`, trial })),
+	]
+	return trials.flatMap(({ taskId, trial }) => trialOutputRecords(candidateId, taskId, trial))
+}
+
+function adversarialOutputRecords(review: AdversarialReviewRecord): IntegrityOutput[] {
+	const refs: Array<[string, string | undefined]> = [
+		["prompt", review.promptArtifactSha256], ["result", review.resultArtifactSha256],
+		["error", review.errorArtifactSha256], ["tests", review.testArtifactSha256],
+		["snapshot", review.snapshotArtifactSha256],
+		...review.testResults.map((test, index): [string, string | undefined] => [`test-output-${index}`, test.outputArtifactSha256]),
+	]
+	return refs.filter((entry): entry is [string, string] => !!entry[1]).map(([taskId, artifactSha256]) => ({
+		candidateId: review.candidateId,
+		taskId: `adversarial-${taskId}`,
+		outputSha256: artifactSha256,
+		artifactSha256,
+	}))
+}
+
+function verifyArchivedIntegrityOutputs(run: RsiRunRecord, signedOutputs: IntegrityOutput[]): void {
+	const expected: IntegrityOutput[] = []
+	if (run.baselineEvaluation) expected.push(...evaluationOutputRecords("baseline", run.baselineEvaluation))
+	for (const candidate of run.candidates) {
+		if (candidate.result) expected.push(...trialOutputRecords(candidate.id, "regression", candidate.result))
+	}
+	for (const review of run.adversarialReviews ?? []) expected.push(...adversarialOutputRecords(review))
+	const signed = new Map(signedOutputs.map((entry) => [`${entry.candidateId}\0${entry.taskId}`, entry]))
+	for (const output of expected) {
+		const recorded = signed.get(`${output.candidateId}\0${output.taskId}`)
+		if (!recorded || canonicalJson(recorded) !== canonicalJson(output)) throw new Error(`archived evaluator output differs from signed identity: ${output.candidateId}/${output.taskId}`)
+	}
+	for (const output of signedOutputs) {
+		if (output.candidateId === "baseline" && !run.baselineEvaluation) throw new Error("signed baseline evaluator outputs are missing from the RSI archive")
+		if (output.candidateId !== "baseline" && output.taskId === "regression" && !run.candidates.some((candidate) => candidate.id === output.candidateId && candidate.result)) {
+			throw new Error(`signed regression output is missing from the RSI archive: ${output.candidateId}`)
+		}
+	}
+}
+
+function mergeIntegrityOutputs(record: NonNullable<RsiRunRecord["evaluatorIntegrity"]>, outputs: IntegrityOutput[]): void {
+	const byTask = new Map(record.outputs.map((entry) => [`${entry.candidateId}\0${entry.taskId}`, entry]))
+	for (const output of outputs) {
+		const key = `${output.candidateId}\0${output.taskId}`
+		const existing = byTask.get(key)
+		if (existing && canonicalJson(existing) !== canonicalJson(output)) throw new Error(`evaluator output identity changed for ${output.candidateId}/${output.taskId}`)
+		byTask.set(key, output)
+	}
+	record.outputs = [...byTask.values()].sort((left, right) => left.candidateId.localeCompare(right.candidateId) || left.taskId.localeCompare(right.taskId))
+}
+
+function evaluatorArchiveStateDigest(run: RsiRunRecord): string {
+	const state = JSON.parse(JSON.stringify({
+		baselineEvaluation: run.baselineEvaluation ?? null,
+		baselineFitness: run.baselineFitness ?? null,
+		candidates: run.candidates,
+		adversarialReviews: run.adversarialReviews ?? [],
+		selected: run.selected ?? null,
+		selectedCandidates: run.selectedCandidates ?? [],
+	})) as Record<string, unknown>
+	return evaluatorIntegrityDigest(state)
+}
+
+async function verifyIntegrityArtifacts(queue: PostgresRsiJobQueue | undefined, outputs: IntegrityOutput[]): Promise<void> {
+	const references = outputs.filter((entry) => entry.artifactSha256)
+	if (references.length > 0 && !queue) throw new Error("evaluator integrity artifact verification requires the configured RSI artifact store")
+	for (const reference of references) {
+		const bytes = await queue!.getArtifact(reference.artifactSha256!)
+		if (createHash("sha256").update(bytes).digest("hex") !== reference.artifactSha256 || reference.artifactBytes !== undefined && bytes.byteLength !== reference.artifactBytes) {
+			throw new Error(`evaluator output artifact differs from its signed identity: ${reference.candidateId}/${reference.taskId}`)
+		}
+	}
+}
+
+async function persistEvaluatorIntegrity(
+	config: RsiConfig,
+	run: RsiRunRecord,
+	trust: EvaluatorIntegrityTrust | undefined,
+	input: Record<string, unknown>,
+): Promise<void> {
+	const record = run.evaluatorIntegrity
+	if (!record) throw new Error("evaluator integrity record was not initialized")
+	if (!trust) {
+		record.status = "unsealed"
+		return
+	}
+	const payload: EvaluatorIntegrityPayload = {
+		schemaVersion: 1,
+		runId: run.runId,
+		input,
+		inputSha256: evaluatorIntegrityDigest(input),
+		archiveStateSha256: evaluatorArchiveStateDigest(run),
+		outputs: record.outputs,
+		generations: record.generations,
+		...(record.selectedCandidateId ? { selectedCandidateId: record.selectedCandidateId } : {}),
+	}
+	const saved = await writeEvaluatorIntegrityManifest(config.archiveDir, run.runId, signEvaluatorIntegrity(trust, payload))
+	record.status = "sealed"
+	record.keyId = trust.keyId
+	record.inputSha256 = payload.inputSha256
+	record.archiveStateSha256 = payload.archiveStateSha256
+	record.manifestPath = saved.path
+	record.manifestSha256 = saved.sha256
+}
+
+async function verifyResumedEvaluatorIntegrity(
+	config: RsiConfig,
+	run: RsiRunRecord,
+	trust: EvaluatorIntegrityTrust | undefined,
+	input: Record<string, unknown>,
+	attested: boolean,
+): Promise<void> {
+	const existing = run.evaluatorIntegrity
+	const hasSealArtifacts = await hasEvaluatorIntegrityManifests(config.archiveDir, run.runId)
+	if ((!existing || existing.status !== "sealed") && hasSealArtifacts) throw new Error("evaluator integrity seal artifacts exist but archive metadata is missing or downgraded; refusing unsealed resume")
+	if (!existing) {
+		if (attested) throw new Error("attested RSI resume requires a signed evaluator integrity manifest; this historical run is unsealed")
+		if (trust) throw new Error("cannot retroactively seal a historical RSI run; start a new run with evaluator integrity trust configured")
+		return
+	}
+	const currentInputSha256 = evaluatorIntegrityDigest(input)
+	if (existing.status === "sealed") {
+		if (!trust) throw new Error("sealed RSI run cannot resume without its independently pinned evaluator integrity trust")
+		if (!existing.manifestSha256 || existing.manifestPath !== path.posix.join("evaluator-integrity", `${run.runId}.${existing.manifestSha256}.json`)) throw new Error("evaluator integrity manifest pointer is malformed")
+		const saved = await readEvaluatorIntegrityManifest(config.archiveDir, run.runId, existing.manifestSha256)
+		if (saved.sha256 !== existing.manifestSha256) throw new Error("evaluator integrity manifest bytes changed since the run was checkpointed")
+		const envelope = verifyEvaluatorIntegrity(trust, saved.envelope)
+		const payload = envelope.payload as Partial<EvaluatorIntegrityPayload>
+		if (payload.schemaVersion !== 1 || payload.runId !== run.runId || payload.inputSha256 !== currentInputSha256 || canonicalJson(payload.input) !== canonicalJson(input)) throw new Error("evaluator source, base tree, configuration, commands, or inputs changed since the signed RSI snapshot")
+		if (payload.archiveStateSha256 !== evaluatorArchiveStateDigest(run) || existing.archiveStateSha256 !== payload.archiveStateSha256) throw new Error("archived evaluator state changed since its last signed checkpoint")
+		if (canonicalJson(payload.outputs) !== canonicalJson(existing.outputs) || canonicalJson(payload.generations) !== canonicalJson(existing.generations) || payload.selectedCandidateId !== existing.selectedCandidateId) throw new Error("signed evaluator outputs or selection differ from the RSI archive checkpoint")
+		if (existing.keyId !== trust.keyId || existing.inputSha256 !== currentInputSha256) throw new Error("evaluator integrity trust or manifest identity differs from the frozen run identity")
+		verifyArchivedIntegrityOutputs(run, existing.outputs)
+		for (const generation of existing.generations) {
+			const generationCandidates = run.candidates.filter((candidate) => candidate.generation === generation.generation)
+			const accepted = generationCandidates.filter((candidate) => candidate.status === "accepted")
+			const expectedSelectedIds = paretoFront(accepted).map((candidate) => candidate.id)
+			const expectedSelected = [...accepted].sort((left, right) => compareFitness(right.fitness, left.fitness))[0]?.id
+			const reviews = (run.adversarialReviews ?? []).filter((review) => generationCandidates.some((candidate) => candidate.id === review.candidateId))
+			if (canonicalJson(generation.selectedCandidateIds) !== canonicalJson(expectedSelectedIds) || generation.selectedCandidateId !== expectedSelected ||
+				generation.decisionsSha256 !== evaluatorGenerationDecisionDigest(generationCandidates, reviews, expectedSelected)) {
+				throw new Error(`archived evaluator decisions differ from the signed selection for generation ${generation.generation}`)
+			}
+		}
+		const latestGeneration = existing.generations.at(-1)
+		if ((latestGeneration && canonicalJson(latestGeneration.selectedCandidateIds) !== canonicalJson(run.selectedCandidates ?? [])) || existing.selectedCandidateId !== run.selected) throw new Error("selected candidates differ from the signed evaluator selection")
+		return
+	}
+	if (trust) throw new Error("cannot retroactively seal an unsealed RSI run; start a new run with evaluator integrity trust configured")
+	if (attested) throw new Error("attested RSI resume requires an independently signed evaluator integrity manifest")
 }
 
 function isTerminal(candidate: CandidateRecord): boolean {
@@ -160,7 +331,7 @@ export function createProofCampaignManifest(args: {
 			root: { maxCalls: rootCalls, maxTokens: rootTokens, maxSpendUsd: Math.min(spendAllocation, totalBudgetUsd, mutationReservationsUsd + requiredBenchmarkUsd), maxRuntimeMs },
 		},
 		acceptanceRule: { ...args.proofProtocol.rule, confirmationRetentionTaskIds: engineeringOnly ? [] : [...RSI_CONFIRMATION_RETENTION_TASK_IDS], minimumSelfHostedCampaigns: 2, requiredSuccessiveTransitions: 2, clusterConfidence: 0.9 }, runtime: { imageDigest: args.runtime.imageDigest, harnessCommit: args.runtime.harnessCommit, dependencyLockDigest: args.runtime.dependencyLockDigest },
-		analysisVersion: args.proofProtocol.schemaVersion.toString(), settings: { phaseMode: engineeringOnly ? "engineering-only" : "paired-confirmation", configDigest: workerHarnessConfigDigest(args.config, { baseCommit: args.baseCommit, model: args.model, provider: args.provider, proofProtocolDigest: args.proofProtocol.protocolDigest }), effectiveConfig: Object.fromEntries(Object.entries(args.config).filter(([key]) => !["workerHarnessMode", "workerHarnessPhase", "workerHarnessEngineeringOnly", "workerHarnessPairId", "workerHarnessRunId", "resumeRunId", "candidateIdNamespace", "workerHarnessParentCommit", "workerHarnessSnapshotTreeDigest", "hiddenSuitePath", "hiddenPublicKeyPath", "hiddenPrivateKeyPath", "hiddenNonceStorePath"].includes(key))), candidateCounts, taskWallBoundMs, evaluationCells: ["regression", "typecheck", ...args.config.evalCommands.map((_, index) => `visible-${index}`)], developmentTaskIdentities: benchmarkTasks.map((task) => ({ id: task.id, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings })), confirmationTaskIdentities: engineeringOnly ? [] : confirmationTasks.map((task) => ({ id: task.id, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings })), inferenceCeilings: { maxInputTokensPerCall: benchmarkLimits.maxInputTokensPerCall, maxOutputTokensPerCall: benchmarkLimits.maxOutputTokensPerCall, maxCallsPerAttempt: benchmarkLimits.maxCalls, maxTotalTokens: benchmarkLimits.maxTotalTokens, maxCallSpendUsd: benchmarkLimits.maxCallSpendUsd, maxJobSpendUsd: benchmarkLimits.maxJobSpendUsd, maxInputPricePerMillionUsd: benchmarkLimits.maxInputPricePerMillionUsd, maxOutputPricePerMillionUsd: benchmarkLimits.maxOutputPricePerMillionUsd }, inferenceCampaignIds: { mutation: mutationCampaignId, benchmark: benchmarkCampaignId }, inferenceAllocationsUsd: { mutation: mutationLimits.maxCampaignSpendUsd, benchmark: benchmarkLimits.maxCampaignSpendUsd } },
+		analysisVersion: args.proofProtocol.schemaVersion.toString(), settings: { phaseMode: engineeringOnly ? "engineering-only" : "paired-confirmation", configDigest: workerHarnessConfigDigest(args.config, { baseCommit: args.baseCommit, model: args.model, provider: args.provider, proofProtocolDigest: args.proofProtocol.protocolDigest }), effectiveConfig: Object.fromEntries(Object.entries(args.config).filter(([key]) => !["workerHarnessMode", "workerHarnessPhase", "workerHarnessEngineeringOnly", "workerHarnessPairId", "workerHarnessRunId", "resumeRunId", "candidateIdNamespace", "workerHarnessParentCommit", "workerHarnessSnapshotTreeDigest", "hiddenSuitePath", "hiddenPublicKeyPath", "hiddenPrivateKeyPath", "hiddenNonceStorePath", "evaluatorSigningKeyPath", "evaluatorTrustedPublicKeyPath"].includes(key))), candidateCounts, taskWallBoundMs, evaluationCells: ["regression", "typecheck", ...args.config.evalCommands.map((_, index) => `visible-${index}`)], developmentTaskIdentities: benchmarkTasks.map((task) => ({ id: task.id, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings })), confirmationTaskIdentities: engineeringOnly ? [] : confirmationTasks.map((task) => ({ id: task.id, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings })), inferenceCeilings: { maxInputTokensPerCall: benchmarkLimits.maxInputTokensPerCall, maxOutputTokensPerCall: benchmarkLimits.maxOutputTokensPerCall, maxCallsPerAttempt: benchmarkLimits.maxCalls, maxTotalTokens: benchmarkLimits.maxTotalTokens, maxCallSpendUsd: benchmarkLimits.maxCallSpendUsd, maxJobSpendUsd: benchmarkLimits.maxJobSpendUsd, maxInputPricePerMillionUsd: benchmarkLimits.maxInputPricePerMillionUsd, maxOutputPricePerMillionUsd: benchmarkLimits.maxOutputPricePerMillionUsd }, inferenceCampaignIds: { mutation: mutationCampaignId, benchmark: benchmarkCampaignId }, inferenceAllocationsUsd: { mutation: mutationLimits.maxCampaignSpendUsd, benchmark: benchmarkLimits.maxCampaignSpendUsd } },
 	}
 }
 
@@ -348,19 +519,115 @@ function initialRun(config: RsiConfig, baseCommit: string, now: string): RsiRunR
 	}
 }
 
-async function waitForFleetJob(queue: PostgresRsiJobQueue, jobId: string, timeoutMs: number): Promise<FleetJob> {
-	const deadline = Date.now() + timeoutMs
-	while (Date.now() < deadline) {
+async function buildEvaluatorIntegrityInput(args: {
+	config: RsiConfig
+	run: RsiRunRecord
+	packageRoot: string
+	roles: RsiConfig["roles"]
+	workerModel: string
+	workerProvider: string
+	workerOpenRouterProfile?: string
+	proofProtocol: ReturnType<typeof freezeDevelopmentProofProtocol>
+	benchmarkManifestSha256: string
+	evaluatorRuntime?: EvaluatorRuntimeIdentity
+	hiddenVerifierIdentity?: RsiRunRecord["hiddenVerifierIdentity"]
+	syntheticRuntimeIdentity?: boolean
+}): Promise<Record<string, unknown>> {
+	const source = await evaluatorSourceIdentity(args.packageRoot)
+	const baseTreeSha256 = evaluatorBaseTreeIdentity(args.config.repoRoot, args.run.baseCommit)
+	const config = args.config
+	return {
+		schemaVersion: 1,
+		runId: args.run.runId,
+		baseCommit: args.run.baseCommit,
+		baseTreeSha256,
+		evaluatorSource: source,
+		imageIdentity: {
+			requestedImage: args.evaluatorRuntime ? `headlesscode-openshell-rsi@${args.evaluatorRuntime.imageDigest}` : null,
+			pinnedImageDigest: args.evaluatorRuntime?.imageDigest ?? null,
+			identitySource: args.evaluatorRuntime?.identitySource ?? "not-executed-dry-run",
+			workerHarnessRuntime: args.run.workerHarnessRuntime ?? null,
+			gatewayAlias: process.env.OPENSHELL_GATEWAY ?? null,
+		},
+		evaluatorIsolationPolicy: args.evaluatorRuntime ? { source: args.evaluatorRuntime.policySource, sha256: args.evaluatorRuntime.policySha256 } : null,
+		storageAndWorkspace: {
+			repository: path.resolve(config.repoRoot),
+			archive: path.resolve(config.archiveDir),
+			worktrees: path.resolve(config.worktreeDir),
+			trajectoryOutput: path.resolve(config.trajectoryDir ?? path.join(config.archiveDir, "trajectories")),
+			curriculumOutput: path.resolve(config.curriculumDir ?? path.join(config.archiveDir, "curriculum")),
+		},
+		commands: {
+			regression: config.regressionCommand,
+			visible: [...config.evalCommands],
+			hidden: [...config.hiddenEvalCommands],
+		},
+		effectiveArguments: {
+			baseRef: config.baseRef,
+			model: args.workerModel,
+			provider: args.workerProvider,
+			openRouterProfile: args.workerOpenRouterProfile ?? null,
+			roles: args.roles ?? null,
+			population: config.population,
+			generations: args.run.generations,
+			maxConcurrent: config.maxConcurrent,
+			maxIterations: config.maxIterations,
+			maxTokens: config.maxTokens ?? null,
+			commandTimeoutMs: config.commandTimeoutMs,
+			computePolicy: config.computePolicy ?? "single",
+			maxTrajectories: config.maxTrajectories ?? null,
+			maxTotalIterations: config.maxTotalIterations ?? null,
+			maxRuntimeMs: config.maxRuntimeMs ?? null,
+			seed: config.seed,
+			mutationTask: config.mutationTask,
+			mutationKind: config.mutationKind ?? "corrective",
+			hypothesis: config.hypothesis ?? null,
+			protectedPaths: [...config.protectedPaths].sort(),
+			parentSelectionPolicy: config.parentSelectionPolicy ?? "champion-specialist-novelty",
+			developmentProofRule: config.developmentProofRule ?? null,
+			developmentProofProtocolSha256: args.proofProtocol.protocolDigest,
+			workerHarness: {
+				mode: args.run.workerHarnessMode ?? "fixed-control",
+				pairId: args.run.workerHarnessPairId ?? null,
+				configDigest: args.run.workerHarnessConfigDigest ?? null,
+				plannedGenerations: args.run.workerHarnessPlannedGenerations ?? null,
+				phase: config.workerHarnessPhase ?? null,
+				engineeringOnly: config.workerHarnessEngineeringOnly ?? false,
+			},
+		},
+		inputArtifacts: [
+			{ id: "development-benchmark-manifest", sha256: args.benchmarkManifestSha256 },
+			...(args.hiddenVerifierIdentity ? [{ id: "hidden-verifier-suite", sha256: args.hiddenVerifierIdentity.suiteSha256 }, { id: "hidden-verifier-public-key", sha256: args.hiddenVerifierIdentity.publicKeySha256 }, { id: "hidden-verifier-image", sha256: args.hiddenVerifierIdentity.imageDigest }] : []),
+		],
+	}
+}
+
+async function waitForFleetJob(queue: PostgresRsiJobQueue, jobId: string, timeoutMs: number, runtimeDeadlineMs?: number): Promise<FleetJob> {
+	const deadline = Math.min(Date.now() + timeoutMs, runtimeDeadlineMs ?? Number.POSITIVE_INFINITY)
+	for (;;) {
 		const job = await queue.getJob(jobId)
 		if (!job) throw new Error(`fleet job ${jobId} disappeared`)
 		if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") return job
+		if (Date.now() >= deadline) break
 		await delay(500)
 	}
-	await queue.cancel(jobId, "coordinator wait timeout")
-	throw new Error(`fleet job ${jobId} exceeded coordinator timeout`)
+	const reason = runtimeDeadlineMs !== undefined && Date.now() >= runtimeDeadlineMs ? "RSI run runtime ceiling" : "coordinator wait timeout"
+	await queue.cancel(jobId, reason)
+	const teardownDeadline = Date.now() + 60_000
+	while (Date.now() < teardownDeadline) {
+		const job = await queue.getJob(jobId)
+		if (!job) throw new Error(`fleet job ${jobId} disappeared during cancellation`)
+		if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") return job
+		await delay(200)
+	}
+	throw new Error(`fleet job ${jobId} exceeded ${reason}; cancellation is pending worker teardown and its lease remains capacity-reserved`)
 }
 
-function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: { content: Buffer; snapshotCommit: string; snapshotTreeDigest?: string }, options: { campaignId?: string; boundedInference?: boolean; includeWorkerHarness?: boolean; proofCampaign?: FleetJobPayload["proofCampaign"]; remainingCampaignMs?: number } = {}): FleetJobPayload {
+function fleetRuntimeDeadlineMs(config: RsiConfig, run: RsiRunRecord): number | undefined {
+	return config.maxRuntimeMs === undefined ? undefined : Date.parse(run.startedAt) + config.maxRuntimeMs
+}
+
+function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: { content: Buffer; snapshotCommit: string; snapshotTreeDigest?: string }, options: { campaignId?: string; boundedInference?: boolean; includeWorkerHarness?: boolean; proofCampaign?: FleetJobPayload["proofCampaign"]; remainingCampaignMs?: number; evaluatorRuntime?: Pick<EvaluatorRuntimeIdentity, "imageDigest" | "policySha256"> } = {}): FleetJobPayload {
 	const provider = config.roles?.worker?.provider === "openrouter" ? "openrouter" : "ollama"
 	const openRouterProfile = provider === "openrouter" ? openRouterProfileForModel(candidate.model, config.roles?.worker?.openRouterProfile) : undefined
 	const inferenceLimits = provider === "openrouter" && options.boundedInference
@@ -384,6 +651,7 @@ function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: {
 		...(openRouterProfile && openRouterProfile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { openRouterProfile: openRouterProfile.id } : {}),
 		...(options.proofCampaign ? { proofCampaign: options.proofCampaign } : {}),
 		...(inferenceLimits ? { inferenceLimits } : {}),
+		...(options.evaluatorRuntime ? { evaluatorRuntime: { ...options.evaluatorRuntime } } : {}),
 		maxIterations: config.maxIterations,
 		timeoutMs: config.commandTimeoutMs,
 		protectedPaths: config.protectedPaths,
@@ -498,6 +766,7 @@ async function validateCurriculumOnFleet(
 	run: RsiRunRecord,
 	queue: PostgresRsiJobQueue,
 	now: () => string,
+	evaluatorRuntime: Pick<EvaluatorRuntimeIdentity, "imageDigest" | "policySha256">,
 ): Promise<NonNullable<RsiRunRecord["curriculumTasks"]>> {
 	if (!tasks?.length) return []
 	return validateCurriculumProposals(tasks, run.baseCommit, async (task, attempt, replayKey) => {
@@ -520,7 +789,7 @@ async function validateCurriculumOnFleet(
 		const idempotencyKey = `${run.runId}:${replayKey}`
 		const snapshot = createEvaluationSnapshotBundle(config.repoRoot, run.baseCommit, config)
 		const artifact = await queue.putArtifact(snapshot.content)
-		const payload = fleetPayload(config, replayCandidate, snapshot)
+		const payload = fleetPayload(config, replayCandidate, snapshot, { evaluatorRuntime })
 		payload.snapshotSha256 = artifact.sha256
 		payload.task = `Replay registered curriculum fixture ${task.fixtureId}`
 		payload.regressionCommand = "true"
@@ -549,7 +818,7 @@ async function validateCurriculumOnFleet(
 			})
 		}
 		if (!fleetJobMatches(job, expected)) return { ok: false, exitCode: null, failure: "idempotent curriculum replay key refers to a stale or mismatched fleet job payload" }
-		const completed = await waitForFleetJob(queue, job.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, 1) + 60_000)
+		const completed = await waitForFleetJob(queue, job.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, 1) + 60_000, fleetRuntimeDeadlineMs(config, run))
 		if (completed.status !== "completed" || !completed.result || typeof completed.result !== "object") return { ok: false, exitCode: null, failure: completed.error ?? `OpenShell curriculum replay ended ${completed.status}` }
 		try {
 			const evaluation = fleetEvaluationResult(completed.result)
@@ -575,6 +844,7 @@ async function runAdversarialStage(
 	queue: PostgresRsiJobQueue,
 	hooks: RsiHooks,
 	now: () => string,
+	evaluatorRuntime: Pick<EvaluatorRuntimeIdentity, "imageDigest" | "policySha256">,
 ): Promise<AdversarialReviewRecord> {
 	const role = config.roles?.adversary
 	if (!role) throw new Error("adversary role is not configured")
@@ -616,7 +886,7 @@ async function runAdversarialStage(
 		run.jobs ??= []
 		run.jobs.push(internalJob)
 		const candidateId = candidate.id + "-adversarial"
-		const payload = fleetPayload(config, { ...candidate, id: candidateId, baseCommit: snapshot.snapshotCommit }, snapshot)
+		const payload = fleetPayload(config, { ...candidate, id: candidateId, baseCommit: snapshot.snapshotCommit }, snapshot, { evaluatorRuntime })
 		payload.snapshotSha256 = snapshotArtifact.sha256
 		payload.task = "Run supervisor-generated adversarial checks for " + candidate.id
 		payload.regressionCommand = "true"
@@ -630,7 +900,7 @@ async function runAdversarialStage(
 		let job = await queue.getJobByIdempotencyKey(idempotencyKey)
 		if (!job) job = await queue.enqueue({ ...expected, payload })
 		if (!fleetJobMatches(job, expected)) throw new Error("existing adversarial evaluation idempotency key has mismatched test artifact or execution payload")
-		const completed = await waitForFleetJob(queue, job.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, 1) + 60_000)
+		const completed = await waitForFleetJob(queue, job.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, 1) + 60_000, fleetRuntimeDeadlineMs(config, run))
 		if (completed.status !== "completed" || !completed.result || typeof completed.result !== "object") throw new Error(completed.error ?? "OpenShell adversarial tests ended " + completed.status)
 		const result = fleetEvaluationResult(completed.result)
 		const trial = result.visible[0]
@@ -679,6 +949,8 @@ async function evaluateBaselineFleet(
 	queue: PostgresRsiJobQueue,
 	runId: string,
 	hidden?: (root: string, jobId: string) => HiddenEvaluationOptions | undefined,
+	runtimeDeadlineMs?: number,
+	evaluatorRuntime?: Pick<EvaluatorRuntimeIdentity, "imageDigest" | "policySha256">,
 ): Promise<NonNullable<RsiRunRecord["baselineEvaluation"]>> {
 	const idempotencyKey = `${runId}:baseline:evaluation`
 	const snapshot = createEvaluationSnapshotBundle(config.repoRoot, baseCommit, config)
@@ -699,7 +971,8 @@ async function evaluateBaselineFleet(
 			changedFiles: [],
 			protectedPathViolations: [],
 		}
-	const payload = fleetPayload(config, baseline, snapshot)
+	if (!evaluatorRuntime) throw new Error("fleet baseline evaluation requires its frozen evaluator image and policy identity")
+	const payload = fleetPayload(config, baseline, snapshot, { evaluatorRuntime })
 	payload.snapshotSha256 = artifact.sha256
 	const expected: FleetJobIdentity = {
 		idempotencyKey, runId, candidateId: "baseline", jobKind: "evaluation",
@@ -709,7 +982,7 @@ async function evaluateBaselineFleet(
 	const job = existing ?? await queue.enqueue(expected)
 	if (!fleetJobMatches(job, expected)) throw new Error("existing baseline evaluation idempotency key has mismatched execution identity or payload")
 
-	const completed = await waitForFleetJob(queue, job.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, config.evalCommands.length + 2) + 60_000)
+	const completed = await waitForFleetJob(queue, job.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, config.evalCommands.length + 2) + 60_000, runtimeDeadlineMs)
 	if (completed.status !== "completed" || !completed.result || typeof completed.result !== "object") throw new Error(completed.error ?? `fleet baseline evaluation ended ${completed.status}`)
 	const evaluation = fleetEvaluationResult(completed.result)
 	const trials = [evaluation.regression, evaluation.typecheck, ...evaluation.visible]
@@ -798,6 +1071,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	if (resumed && config.workerHarnessRunId && resumed.runId !== config.workerHarnessRunId) throw new Error("worker harness deterministic run identity differs from the resumed archive record")
 	const baseCommit = resumed?.baseCommit ?? (await resolveBaseCommit(config))
 	const run = resumed ?? initialRun({ ...config, model: workerModel, roles }, baseCommit, now())
+	if (!resumed && await hasEvaluatorIntegrityManifests(config.archiveDir, run.runId)) throw new Error("evaluator integrity seal artifacts already exist for this run ID without archive metadata; refusing to overwrite the prior seal")
 	if (resumed && resumed.model !== workerModel) throw new Error("worker model differs from the frozen run identity")
 	if (resumed?.openRouterProfileId && resumed.openRouterProfileId !== workerOpenRouterProfile?.id) throw new Error("OpenRouter profile differs from the frozen run identity")
 	const stageCount = requestedPhase === "confirmation" ? 0 : config.computePolicy === "adaptive-independent" ? 2 : config.generations
@@ -832,16 +1106,19 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	} else if (loadedHiddenVerifier) {
 		run.hiddenVerifierIdentity = loadedHiddenVerifier.identity
 	}
+	const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
+	const evaluatorRuntime = config.dryRun
+		? undefined
+		: await resolveRsiEvaluatorRuntimeIdentity(process.env, hooks.syntheticRuntimeIdentity === true)
 	const hiddenEvaluationFor = (candidateRoot: string, jobId: string): HiddenEvaluationOptions | undefined => loadedHiddenVerifier ? ({
 		suite: loadedHiddenVerifier.suite,
-		runner: createOpenShellHiddenCaseRunner({ candidateRoot, config: runConfig, signingKey: loadedHiddenVerifier.privateKey, imageDigest: loadedHiddenVerifier.imageDigest }),
+		runner: createOpenShellHiddenCaseRunner({ candidateRoot, config: runConfig, signingKey: loadedHiddenVerifier.privateKey, imageDigest: loadedHiddenVerifier.imageDigest, evaluatorPolicySha256: evaluatorRuntime?.policySha256 ?? "" }),
 		nonceStore: loadedHiddenVerifier.nonceStore,
 		publicKey: loadedHiddenVerifier.publicKey,
 		evaluatorImageDigest: loadedHiddenVerifier.imageDigest,
 		sessionId: run.runId,
 		jobId,
 	}) : undefined
-	const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 	const proofFixturesRoot = path.join(packageRoot, "fixtures", "rsi-benchmark")
 	const loadedProofBenchmark = hooks.runDevelopmentBenchmark
 		? await fs.readFile(path.join(proofFixturesRoot, "manifest.json"), "utf8").then((rawManifest) => ({ manifest: JSON.parse(rawManifest) as BenchmarkManifest, manifestDigest: createHash("sha256").update(rawManifest).digest("hex") }))
@@ -888,6 +1165,33 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	if (resumed && !resumed.developmentProofProtocol) throw new Error("cannot resume an RSI run without its frozen development proof protocol")
 	if (resumed && resumed.developmentProofProtocol?.protocolDigest !== proofProtocol.protocolDigest) throw new Error("development proof protocol differs from the frozen protocol on this run")
 	run.developmentProofProtocol ??= proofProtocol
+	const integrityTrust = await loadEvaluatorIntegrityTrust(runConfig)
+	const attestedRun = !config.dryRun && !!(config.workerHarnessPairId || config.workerHarnessMode || config.workerHarnessEngineeringOnly || config.hiddenSuitePath || config.hiddenEvalCommands.length || roles?.adversary)
+	if (attestedRun && !integrityTrust) throw new Error("paired proof, hidden-evaluator, and adversarial qualification runs require independently pinned evaluator integrity trust")
+	const integrityInput = await buildEvaluatorIntegrityInput({
+		config: runConfig, run, packageRoot, roles, workerModel, workerProvider,
+		...(workerOpenRouterProfile ? { workerOpenRouterProfile: workerOpenRouterProfile.id } : {}),
+		proofProtocol, benchmarkManifestSha256: loadedProofBenchmark.manifestDigest,
+		...(evaluatorRuntime ? { evaluatorRuntime } : {}),
+		...(loadedHiddenVerifier ? { hiddenVerifierIdentity: loadedHiddenVerifier.identity } : {}),
+		syntheticRuntimeIdentity: hooks.syntheticRuntimeIdentity === true,
+	})
+	const checkpointWithEvaluatorIntegrity = async (): Promise<void> => {
+		await persistEvaluatorIntegrity(runConfig, run, integrityTrust, integrityInput)
+		await archiveCheckpointRun(config.archiveDir, run)
+	}
+	if (resumed) {
+		await verifyResumedEvaluatorIntegrity(runConfig, run, integrityTrust, integrityInput, attestedRun)
+		if (!run.evaluatorIntegrity) run.evaluatorIntegrity = { status: "unsealed", outputs: [], generations: [] }
+	} else {
+		run.evaluatorIntegrity = {
+			status: integrityTrust ? "sealed" : "unsealed",
+			inputSha256: evaluatorIntegrityDigest(integrityInput),
+			outputs: [],
+			generations: [],
+		}
+		if (integrityTrust) await persistEvaluatorIntegrity(runConfig, run, integrityTrust, integrityInput)
+	}
 	if (requestedPhase !== "confirmation") run.confirmationEvidence = "unmeasured"
 	run.confirmationAttempts ??= []
 	const proofAttemptCache = new Map<string, Promise<BenchmarkAttempt[]>>()
@@ -907,6 +1211,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 			? hooks.runDevelopmentBenchmark({ harnessCommit, model: workerModel, outputRoot, protocol: proofProtocol })
 			: runDevelopmentBenchmarkForCommit({
 				repoRoot: config.repoRoot, fixturesRoot: proofFixturesRoot, outputRoot, harnessCommit, model: workerModel, provider: workerProvider,
+				evaluatorPolicySha256: evaluatorRuntime?.policySha256,
 			campaignId: campaignLease ? proofBrokerCampaignId(campaignLease.campaignId, "benchmark") : `proof-${evidenceRunId}-${proofProtocol.protocolDigest.slice(0, 16)}`,
 			...(campaignLease ? {
 				attemptNamespace: `${slotId}:${proofRole}`,
@@ -953,9 +1258,10 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	const fleetQueue = !config.dryRun && (queueOverride !== undefined || !hooks.runMutation)
 		? queueOverride ?? PostgresRsiJobQueue.fromEnvironment(fleetQueuePolicy(process.env.HEADLESSCODE_RSI_QUEUE_NAME?.trim() || "rsi-default", config.maxConcurrent, process.env), process.env)
 		: undefined
+	if (resumed?.evaluatorIntegrity) await verifyIntegrityArtifacts(fleetQueue, resumed.evaluatorIntegrity.outputs)
 	if (!config.dryRun && workerProvider === "openshell-openrouter" && !fleetQueue) throw new Error("RSI OpenRouter inference requires the supervised fleet broker path")
 	if (!config.dryRun && config.roles?.adversary && !fleetQueue) throw new Error("RSI adversarial break tests require the OpenShell fleet evaluation path")
-	const commandRunner = hooks.runCommand ?? (fleetQueue ? undefined : createOpenShellCommandRunner(runConfig))
+	const commandRunner = hooks.runCommand ?? (fleetQueue ? undefined : createOpenShellCommandRunner(runConfig, evaluatorRuntime))
 	let campaignStore: PostgresProofCampaign | undefined
 	let campaignLease: ProofCampaignArmLease | undefined
 	let campaignHeartbeat: NodeJS.Timeout | undefined
@@ -1001,7 +1307,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 			}).catch((error) => { campaignLeaseFailure = error instanceof Error ? error : new Error(String(error)) }).finally(() => { heartbeatInFlight = false })
 		}, 5_000)
 		campaignHeartbeat.unref()
-		await checkpointRun(config.archiveDir, run)
+		await checkpointWithEvaluatorIntegrity()
 	}
 	if (resumed && !fleetQueue) recoverInterruptedCandidates(run, now())
 	if (requestedPhase === "confirmation") {
@@ -1021,7 +1327,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		// finishArm but before appendRun, recovery can rebuild from this
 		// checkpoint and the durable campaign snapshot without paid replay.
 		run.proofCampaign = { ...run.proofCampaign!, state: "running", ledgerSnapshot: await campaignStore.snapshot(campaignLease.campaignId) }
-		await checkpointRun(config.archiveDir, run)
+		await checkpointWithEvaluatorIntegrity()
 		await assertCampaignLease()
 		await campaignStore.finishArm(campaignLease, [confirmation.selectedCandidateId])
 		run.proofCampaign = { ...run.proofCampaign!, state: "finished", ledgerSnapshot: await campaignStore.snapshot(campaignLease.campaignId) }
@@ -1034,13 +1340,16 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		return run
 	}
 	if (!config.dryRun && !run.baselineEvaluation) {
-		run.baselineEvaluation = fleetQueue
-			? await evaluateBaselineFleet(runConfig, baseCommit, fleetQueue, run.runId, hiddenEvaluationFor)
+			run.baselineEvaluation = fleetQueue
+			? await evaluateBaselineFleet(runConfig, baseCommit, fleetQueue, run.runId, hiddenEvaluationFor, fleetRuntimeDeadlineMs(runConfig, run), evaluatorRuntime)
 			: await evaluateBaselineLocal(runConfig, baseCommit, commandRunner, hiddenEvaluationFor)
 		run.baselineFitness = computeFitness(run.baselineEvaluation)
 		run.baseline = run.baselineEvaluation.regression
+		mergeIntegrityOutputs(run.evaluatorIntegrity!, evaluationOutputRecords("baseline", run.baselineEvaluation))
+		await verifyIntegrityArtifacts(fleetQueue, run.evaluatorIntegrity!.outputs)
+		await persistEvaluatorIntegrity(runConfig, run, integrityTrust, integrityInput)
 		log(hooks, `[rsi] baseline: ${run.baseline.ok ? "pass" : "fail"}`)
-		await checkpointRun(config.archiveDir, run)
+		await checkpointWithEvaluatorIntegrity()
 	}
 
 	for (let generation = 0; generation < stageCount; generation++) {
@@ -1058,7 +1367,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 				})
 				run.adaptiveSearch ??= []
 				run.adaptiveSearch.push(previousDecision)
-				await checkpointRun(config.archiveDir, run)
+				await checkpointWithEvaluatorIntegrity()
 			}
 			if (previousDecision.decision !== "continue") break
 		}
@@ -1109,7 +1418,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 			})
 			run.candidates.push(...candidates)
 			log(hooks, `[rsi] generation ${generation}: planning ${candidates.length} candidate(s) with policy ${run.parentSelectionPolicy}`)
-			if (!config.dryRun) await checkpointRun(config.archiveDir, run)
+			if (!config.dryRun) await checkpointWithEvaluatorIntegrity()
 		} else {
 			log(hooks, `[rsi] generation ${generation}: resuming ${candidates.length} persisted candidate(s)`)
 		}
@@ -1124,7 +1433,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 				log(hooks, `[rsi] ${candidate.id}: rejected before mutation: ${candidate.failure}`)
 			}
 		}
-		await checkpointRun(config.archiveDir, run)
+		await checkpointWithEvaluatorIntegrity()
 
 		const mutationJobs = new Map<string, FleetJob>()
 		const evaluationJobs = new Map<string, FleetJob>()
@@ -1196,7 +1505,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 						candidate.commits = await candidateCommits(candidate.worktree, candidate.baseCommit)
 						candidate.protectedPathViolations = protectedPathViolations(candidate.changedFiles, config.protectedPaths)
 						candidate.updatedAt = now()
-						await checkpointRun(config.archiveDir, run)
+						await checkpointWithEvaluatorIntegrity()
 						continue
 					}
 					const job = existing ?? await fleetQueue.enqueue(expected)
@@ -1230,11 +1539,11 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 					candidate.updatedAt = now()
 					if (job.status !== "running") job = transitionJob(job, "running", now())
 					replaceJob(run, job)
-					await checkpointRun(config.archiveDir, run)
+					await checkpointWithEvaluatorIntegrity()
 					if (fleetQueue) {
 						const submitted = mutationJobs.get(candidate.id)
 						if (!submitted) throw new Error("candidate mutation was not admitted to the RSI fleet queue")
-						const completed = await waitForFleetJob(fleetQueue, submitted.jobId, config.commandTimeoutMs * 4 + 180_000)
+						const completed = await waitForFleetJob(fleetQueue, submitted.jobId, config.commandTimeoutMs * 4 + 180_000, fleetRuntimeDeadlineMs(config, run))
 						if (completed.status !== "completed" || !completed.result || typeof completed.result !== "object") {
 							recordFleetInferenceDenials(candidate, completed.result, submitted.payload, completed.jobId)
 							throw new Error(completed.error ?? `fleet mutation ended ${completed.status}`)
@@ -1268,7 +1577,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 			candidate.commits = await candidateCommits(candidate.worktree, candidate.baseCommit)
 			candidate.protectedPathViolations = protectedPathViolations(candidate.changedFiles, config.protectedPaths)
 			candidate.updatedAt = now()
-			await checkpointRun(config.archiveDir, run)
+			await checkpointWithEvaluatorIntegrity()
 		} catch (error) {
 			candidate.status = "failed"
 			candidate.failure = error instanceof Error ? error.message : String(error)
@@ -1278,9 +1587,9 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 			await captureCandidate(candidate, runConfig, run, trajectories, now(), hooks)
 			log(hooks, `[rsi] ${candidate.id}: mutation failed: ${candidate.failure}`)
 			if (!config.keepWorktrees && managedWorktrees.has(candidate.id)) await removeCandidateWorktree(runConfig, candidate).catch(() => undefined)
-			await checkpointRun(config.archiveDir, run)
+			await checkpointWithEvaluatorIntegrity()
 		}
-		await checkpointRun(config.archiveDir, run)
+		await checkpointWithEvaluatorIntegrity()
 		}
 
 		if (fleetQueue) {
@@ -1293,7 +1602,9 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 					const slotId = proofCandidateSlot(candidate.generation, candidates.indexOf(candidate))
 					const verificationTaskIds = ["regression", "typecheck", ...config.evalCommands.map((_, index) => `visible-${index}`)]
 					const attemptKeys = verificationTaskIds.map((taskId) => `${run.runId}:${candidate.id}:evaluation:${taskId}`)
+					if (!evaluatorRuntime) throw new Error("fleet candidate evaluation requires its frozen evaluator image and policy identity")
 					const payload = fleetPayload(runConfig, candidate, snapshot, {
+						evaluatorRuntime,
 						...(campaignLease ? { proofCampaign: {
 							campaignId: campaignLease.campaignId, armId: campaignLease.armId, epoch: campaignLease.epoch, manifestSha256: campaignLease.manifestSha256,
 							cells: verificationTaskIds.map((taskId, index) => ({ attemptKey: attemptKeys[index]!, slotId, attemptKind: "verification" as const })),
@@ -1330,7 +1641,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 					candidate.updatedAt = now()
 					log(hooks, `[rsi] ${candidate.id}: evaluation admission failed: ${candidate.failure}`)
 					if (!config.keepWorktrees && managedWorktrees.has(candidate.id)) await removeCandidateWorktree(runConfig, candidate).catch(() => undefined)
-					await checkpointRun(config.archiveDir, run)
+					await checkpointWithEvaluatorIntegrity()
 				}
 			}
 		}
@@ -1342,7 +1653,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 				if (fleetQueue) {
 					const submitted = evaluationJobs.get(candidate.id) ?? await fleetQueue.getJobByIdempotencyKey(`${run.runId}:${candidate.id}:evaluation`)
 					if (!submitted) throw new Error("candidate evaluation was not admitted to the RSI fleet queue")
-					const completed = await waitForFleetJob(fleetQueue, submitted.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, config.evalCommands.length + 2) + 60_000)
+					const completed = await waitForFleetJob(fleetQueue, submitted.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, config.evalCommands.length + 2) + 60_000, fleetRuntimeDeadlineMs(config, run))
 					if (completed.status !== "completed" || !completed.result || typeof completed.result !== "object") throw new Error(completed.error ?? `fleet evaluation ended ${completed.status}`)
 					const visible = fleetEvaluationResult(completed.result)
 					const trials = [visible.regression, visible.typecheck, ...visible.visible]
@@ -1351,14 +1662,19 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 				} else {
 					evaluation = await evaluateCandidate(runConfig, candidate.worktree, candidate.baseCommit, commandRunner, hiddenEvaluationFor(candidate.worktree, candidate.id))
 				}
+				mergeIntegrityOutputs(run.evaluatorIntegrity!, evaluationOutputRecords(candidate.id, evaluation))
+				await verifyIntegrityArtifacts(fleetQueue, run.evaluatorIntegrity!.outputs)
 				if (runConfig.roles?.adversary) {
 					if (!fleetQueue) throw new Error("adversarial break tests require an OpenShell fleet worker")
-					const review = await runAdversarialStage(candidate, evaluation, runConfig, run, fleetQueue, hooks, now)
+					if (!evaluatorRuntime) throw new Error("fleet adversarial evaluation requires its frozen evaluator image and policy identity")
+					const review = await runAdversarialStage(candidate, evaluation, runConfig, run, fleetQueue, hooks, now, evaluatorRuntime)
 					run.adversarialReviews ??= []
 					run.adversarialReviews.push(review)
+					mergeIntegrityOutputs(run.evaluatorIntegrity!, adversarialOutputRecords(review))
+					await verifyIntegrityArtifacts(fleetQueue, run.evaluatorIntegrity!.outputs)
 					evaluation.adversarialPass = review.status === "passed" && review.testResults.length > 0 && review.testResults.every((entry) => entry.passed)
 					evaluation.adversarialPenalty = review.penaltyPoints
-					await checkpointRun(config.archiveDir, run)
+					await checkpointWithEvaluatorIntegrity()
 				}
 				candidate.changedFiles = evaluation.changedFiles
 				candidate.commits = candidate.commits.length > 0 ? candidate.commits : await candidateCommits(candidate.worktree, candidate.baseCommit)
@@ -1444,7 +1760,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 				if (!config.keepWorktrees && managedWorktrees.has(candidate.id)) {
 					await removeCandidateWorktree(runConfig, candidate).catch((error) => log(hooks, `[rsi] ${candidate.id}: worktree cleanup failed: ${String(error)}`))
 				}
-				await checkpointRun(config.archiveDir, run)
+				await checkpointWithEvaluatorIntegrity()
 			}
 		}
 
@@ -1496,13 +1812,28 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		const accepted = candidates.filter((candidate) => candidate.status === "accepted")
 		const front = paretoFront(accepted)
 		const ranked = [...accepted].sort((a, b) => compareFitness(b.fitness, a.fitness))
+		run.selectedCandidates = front.map((candidate) => candidate.id)
+		if (ranked[0]) run.selected = ranked[0].id
+		const generationSelection = {
+			generation,
+			selectedCandidateIds: [...run.selectedCandidates],
+			...(ranked[0] ? { selectedCandidateId: ranked[0].id } : {}),
+			decisionsSha256: evaluatorGenerationDecisionDigest(candidates, run.adversarialReviews ?? [], ranked[0]?.id),
+		}
+		const integrityRecord = run.evaluatorIntegrity!
+		const previousGeneration = integrityRecord.generations.find((entry) => entry.generation === generation)
+		if (previousGeneration && canonicalJson(previousGeneration) !== canonicalJson(generationSelection)) throw new Error(`evaluator selection changed for already sealed generation ${generation}`)
+		if (!previousGeneration) integrityRecord.generations.push(generationSelection)
+		if (run.selected) integrityRecord.selectedCandidateId = run.selected
+		else delete integrityRecord.selectedCandidateId
+		await verifyIntegrityArtifacts(fleetQueue, integrityRecord.outputs)
+		await persistEvaluatorIntegrity(runConfig, run, integrityTrust, integrityInput)
+		await checkpointWithEvaluatorIntegrity()
 		if (campaignStore && campaignLease) {
 			await assertCampaignLease()
 			const selectedSlots = front.map((candidate) => proofCandidateSlot(candidate.generation, candidates.indexOf(candidate)))
 			await campaignStore.selectGeneration(campaignLease, generation, selectedSlots)
 		}
-		run.selectedCandidates = front.map((candidate) => candidate.id)
-		if (ranked[0]) run.selected = ranked[0].id
 		if (config.computePolicy === "adaptive-independent") {
 			run.adaptiveSearch ??= []
 			const decision = decideAdaptiveContinuation({
@@ -1518,15 +1849,16 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 			else run.adaptiveSearch.push(decision)
 			log(hooks, `[rsi] adaptive search: ${decision.decision} after generation ${generation} (${decision.reason})`)
 		}
-		await checkpointRun(config.archiveDir, run)
+		await checkpointWithEvaluatorIntegrity()
 	}
 
 	const merged = combinedArchive(archive, run)
 	let curriculum = generateCurriculumProposals(merged, now())
 	if (fleetQueue && !config.dryRun && curriculum.length > 0) {
-		curriculum = await validateCurriculumOnFleet(curriculum, runConfig, run, fleetQueue, now)
+		if (!evaluatorRuntime) throw new Error("fleet curriculum evaluation requires its frozen evaluator image and policy identity")
+		curriculum = await validateCurriculumOnFleet(curriculum, runConfig, run, fleetQueue, now, evaluatorRuntime)
 		run.curriculumTasks = curriculum
-		await checkpointRun(config.archiveDir, run)
+		await checkpointWithEvaluatorIntegrity()
 	} else {
 		run.curriculumTasks = curriculum
 	}

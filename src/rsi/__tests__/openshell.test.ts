@@ -3,7 +3,7 @@ import { execFileSync, spawnSync } from "node:child_process"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { applyFleetMutationPatch, createEvaluationSnapshotBundle, createMutationSnapshotBundle, inspectLocalRsiCheckpoint, networkRules, OpenShellMutationPreflightError, runOpenShellBenchmarkVerifier, runOpenShellMutation } from "../openshell.js"
+import { applyFleetMutationPatch, createEvaluationSnapshotBundle, createMutationSnapshotBundle, inspectLocalRsiCheckpoint, networkRules, OpenShellMutationPreflightError, runOpenShellBenchmarkVerifier, runOpenShellEvaluation, runOpenShellMutation } from "../openshell.js"
 import type { RsiOpenShellProviderFactory } from "../openshell.js"
 import type { CandidateRecord, RsiConfig } from "../types.js"
 import { parseRsiArgs } from "../config.js"
@@ -336,9 +336,15 @@ await run("dependency-escape")
 {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-benchmark-verifier-"))
 	const worktree = path.join(repo, ".worktrees", "task")
+	const policyPath = path.join(repo, "operator-policy.yaml")
+	const originalPolicyPath = process.env.HEADLESSCODE_OPENSHELL_POLICY
+	const policyBytes = Buffer.from("sandbox:\n  network: disabled\n")
 	let verifierGuest = ""
 	let tornDown = false
 	try {
+		fs.writeFileSync(policyPath, policyBytes, { mode: 0o600 })
+		fs.chmodSync(policyPath, 0o600)
+		process.env.HEADLESSCODE_OPENSHELL_POLICY = policyPath
 		fs.mkdirSync(path.join(worktree, "src"), { recursive: true })
 		fs.writeFileSync(path.join(worktree, "src", "candidate.js"), "export const value = 1\n")
 		execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: worktree })
@@ -349,7 +355,10 @@ await run("dependency-escape")
 		const parsed = parseRsiArgs(["--repo", repo, "--regression", "true", "--max-runtime-ms", "5000"])
 		assert.ok(parsed.config)
 		const candidate: CandidateRecord = { id: "multi-01", generation: 0, parent: "test", branch: "main", worktree, baseCommit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: worktree, encoding: "utf8" }).trim(), status: "evaluating", model: "test", mutation: "test", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), commits: [], changedFiles: [], protectedPathViolations: [] }
-		const factory: RsiOpenShellProviderFactory = () => ({
+		let verifierProviderImage = ""
+		const factory: RsiOpenShellProviderFactory = (options) => {
+			verifierProviderImage = options.image ?? ""
+			return ({
 			async spawnExistingWorktreeSession(_request, snapshot) {
 				verifierGuest = snapshot
 				assert.equal(fs.existsSync(path.join(snapshot, "fixtures", "rsi-benchmark")), false, "confirmation and corpus fixtures must not enter the verifier task snapshot")
@@ -367,27 +376,104 @@ await run("dependency-escape")
 				return { exitCode: 1, output: "AssertionError: known-bad candidate\nRSI_BENCHMARK_VERIFIER_COMPLETED:1\n" }
 			},
 			async teardown() { tornDown = true },
-		})
-		const result = await runOpenShellBenchmarkVerifier(candidate, parsed.config, Buffer.from("assert.fail('known-bad candidate')\n"), "multi-01", factory)
+			})
+		}
+		const verifierImageDigest = `sha256:${"b".repeat(64)}`
+		await assert.rejects(runOpenShellBenchmarkVerifier(candidate, parsed.config, Buffer.from("true\n"), "multi-01"), /requires a Docker-inspected immutable evaluator image digest/)
+		const result = await runOpenShellBenchmarkVerifier(candidate, parsed.config, Buffer.from("assert.fail('known-bad candidate')\n"), "multi-01", factory, verifierImageDigest)
 		assert.equal(result.exitCode, 1, "completed verifier assertion failure is a task rejection, not infrastructure failure")
+		assert.equal(verifierProviderImage, `headlesscode-openshell-rsi@${verifierImageDigest}`, "verifier guest uses the inspected immutable image ID")
 		assert.equal(tornDown, true)
 		assert.equal(fs.existsSync(verifierGuest), false, "verifier guest snapshot is removed after teardown")
 		await assert.rejects(runOpenShellBenchmarkVerifier(candidate, parsed.config, Buffer.from("true\n"), "multi-01", () => ({
 			async spawnExistingWorktreeSession(_request, snapshot) { verifierGuest = snapshot; return { id: "timeout-marker", provider: "mock-openshell", address: snapshot } },
 			async waitReady() {}, async runHarness() { return { exitCode: 125, output: "RSI_BENCHMARK_VERIFIER_INFRA_FAILURE:ETIMEDOUT\nRSI_BENCHMARK_VERIFIER_COMPLETED:125\n" } }, async teardown() { tornDown = true },
-		})), /child reported infrastructure failure/)
+		}), verifierImageDigest), /child reported infrastructure failure/)
 		await assert.rejects(runOpenShellBenchmarkVerifier(candidate, parsed.config, Buffer.from("true\n"), "multi-01", () => ({
 			async spawnExistingWorktreeSession(_request, snapshot) { verifierGuest = snapshot; return { id: "missing-marker", provider: "mock-openshell", address: snapshot } },
 			async waitReady() {}, async runHarness() { return { exitCode: 1, output: "sandbox transport failed" } }, async teardown() { tornDown = true },
-		})), /did not return its completion marker/)
-	} finally { fs.rmSync(repo, { recursive: true, force: true }) }
+		}), verifierImageDigest), /did not return its completion marker/)
+	} finally {
+		if (originalPolicyPath === undefined) delete process.env.HEADLESSCODE_OPENSHELL_POLICY
+		else process.env.HEADLESSCODE_OPENSHELL_POLICY = originalPolicyPath
+		fs.rmSync(repo, { recursive: true, force: true })
+	}
+}
+
+{
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-pinned-evaluator-"))
+	const repo = path.join(root, "repo")
+	const worktree = path.join(repo, ".worktrees", "candidate")
+	const policyPath = path.join(root, "operator-policy.yaml")
+	const originalPolicy = process.env.HEADLESSCODE_OPENSHELL_POLICY
+	const imageDigest = `sha256:${"b".repeat(64)}`
+	const policyBytes = Buffer.from("sandbox:\n  network: disabled\n")
+	let guestCount = 0
+	const policySnapshots = new Set<string>()
+	try {
+		fs.mkdirSync(path.join(worktree, "src"), { recursive: true })
+		fs.writeFileSync(path.join(worktree, "src", "candidate.js"), "export const value = 1\n")
+		fs.writeFileSync(policyPath, policyBytes, { mode: 0o400 })
+		execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: worktree })
+		execFileSync("git", ["config", "user.name", "Test"], { cwd: worktree })
+		execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: worktree })
+		execFileSync("git", ["add", "--all"], { cwd: worktree })
+		execFileSync("git", ["-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "candidate"], { cwd: worktree })
+		const parsed = parseRsiArgs(["--repo", repo, "--regression", "true", "--eval", "visible"])
+		assert.ok(parsed.config)
+		const candidate: CandidateRecord = { id: "pinned-evaluator", generation: 0, parent: "test", branch: "main", worktree, baseCommit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: worktree, encoding: "utf8" }).trim(), status: "evaluating", model: "test", mutation: "test", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), commits: [], changedFiles: [], protectedPathViolations: [] }
+		process.env.HEADLESSCODE_OPENSHELL_POLICY = policyPath
+		const factory: RsiOpenShellProviderFactory = (options) => {
+			assert.equal(options.image, `headlesscode-openshell-rsi@${imageDigest}`)
+			assert.ok(options.policy)
+			assert.notEqual(options.policy, policyPath, "provider receives a private immutable policy snapshot, not the mutable source path")
+			policySnapshots.add(options.policy)
+			assert.deepEqual(fs.readFileSync(options.policy), policyBytes)
+			assert.equal(fs.statSync(options.policy).mode & 0o777, 0o400)
+			return {
+				async spawnExistingWorktreeSession() { guestCount += 1; return { id: `pinned-${guestCount}`, provider: "mock-openshell", address: repo } },
+				async waitReady() {},
+				async runHarness() { return { exitCode: 0, output: "ok" } },
+				async teardown() {},
+			}
+		}
+		const runtime = { imageDigest, policySha256: createHash("sha256").update(policyBytes).digest("hex") }
+		const result = await runOpenShellEvaluation(candidate, parsed.config, undefined, undefined, runtime, factory)
+		assert.equal(guestCount, 3)
+		assert.equal(result.regression.ok, true)
+		assert.equal(result.typecheck.ok, true)
+		assert.equal(result.visible[0]?.ok, true)
+		assert.equal(policySnapshots.size, 3)
+		assert.ok([...policySnapshots].every((snapshot) => !fs.existsSync(snapshot)), "private policy snapshots are deleted after guest teardown")
+		const inGuestPolicy = path.join(worktree, "operator-policy.yaml")
+		fs.writeFileSync(inGuestPolicy, policyBytes, { mode: 0o400 })
+		process.env.HEADLESSCODE_OPENSHELL_POLICY = inGuestPolicy
+		await assert.rejects(runOpenShellEvaluation(candidate, parsed.config, undefined, undefined, runtime, factory), /must remain outside the guest source snapshot/)
+		assert.equal(guestCount, 3, "an in-snapshot operator policy path is rejected before guest creation")
+		process.env.HEADLESSCODE_OPENSHELL_POLICY = policyPath
+		fs.chmodSync(policyPath, 0o600)
+		fs.writeFileSync(policyPath, "sandbox:\n  network: enabled\n")
+		fs.chmodSync(policyPath, 0o400)
+		await assert.rejects(runOpenShellEvaluation(candidate, parsed.config, undefined, undefined, runtime, factory), /differ from the frozen evaluator identity/)
+		assert.equal(guestCount, 3, "policy drift is rejected before any guest is created")
+	} finally {
+		if (originalPolicy === undefined) delete process.env.HEADLESSCODE_OPENSHELL_POLICY
+		else process.env.HEADLESSCODE_OPENSHELL_POLICY = originalPolicy
+		fs.rmSync(root, { recursive: true, force: true })
+	}
 }
 
 {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-hidden-verifier-"))
 	const worktree = path.join(repo, ".worktrees", "hidden")
+	const policyPath = path.join(repo, "operator-policy.yaml")
+	const originalPolicyPath = process.env.HEADLESSCODE_OPENSHELL_POLICY
+	const policyBytes = Buffer.from("sandbox:\n  network: disabled\n")
 	let guest = ""
 	try {
+		fs.writeFileSync(policyPath, policyBytes, { mode: 0o600 })
+		fs.chmodSync(policyPath, 0o600)
+		process.env.HEADLESSCODE_OPENSHELL_POLICY = policyPath
 		fs.mkdirSync(path.join(worktree, "src"), { recursive: true })
 		fs.writeFileSync(path.join(worktree, "src", "candidate.js"), "export const double = ({ value }) => value * 2\n")
 		execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: worktree })
@@ -428,7 +514,8 @@ await run("dependency-escape")
 			},
 			async teardown() {},
 		}) }
-		const runner = createOpenShellHiddenCaseRunner({ candidateRoot: worktree, config: parsed.config, signingKey: keys.privateKey, imageDigest: `sha256:${"c".repeat(64)}`, providerFactory })
+		const policySha256 = createHash("sha256").update(policyBytes).digest("hex")
+		const runner = createOpenShellHiddenCaseRunner({ candidateRoot: worktree, config: parsed.config, signingKey: keys.privateKey, imageDigest: `sha256:${"c".repeat(64)}`, evaluatorPolicySha256: policySha256, providerFactory })
 		const nonces = new Set<string>()
 		const result = await verifyHiddenFunctions(suite, { candidateSourceDigest: sourceDigest, evaluatorImageDigest: `sha256:${"c".repeat(64)}`, candidateCommit: commit, sessionId: "session", jobId: "job" }, {
 			runner,
@@ -439,8 +526,14 @@ await run("dependency-escape")
 		assert.equal(hiddenProviderOptions?.memory, "128Mi")
 		assert.equal(hiddenProviderOptions?.cpu, "1")
 		assert.equal(hiddenProviderOptions?.image, `headlesscode-openshell-rsi@sha256:${"c".repeat(64)}`)
+		assert.notEqual(hiddenProviderOptions?.policy, policyPath, "hidden verifier uses its frozen private policy snapshot")
+		assert.equal(fs.existsSync(hiddenProviderOptions?.policy ?? ""), false, "private evaluator policy snapshot is removed after teardown")
 		assert.equal(fs.existsSync(guest), false, "the isolated evaluation snapshot is deleted after runner teardown")
-	} finally { fs.rmSync(repo, { recursive: true, force: true }) }
+	} finally {
+		if (originalPolicyPath === undefined) delete process.env.HEADLESSCODE_OPENSHELL_POLICY
+		else process.env.HEADLESSCODE_OPENSHELL_POLICY = originalPolicyPath
+		fs.rmSync(repo, { recursive: true, force: true })
+	}
 }
 
 {
@@ -450,7 +543,7 @@ await run("dependency-escape")
 		execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: repo })
 		execFileSync("git", ["config", "user.name", "Test"], { cwd: repo })
 		execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: repo })
-		for (const [relative, body] of [["src/app.ts", "source\n"], ["test/app.test.ts", "visible test\n"], ["scripts/eval-suite/hidden.js", "hidden suite\n"], ["src/rsi/fitness.ts", "hidden scorer\n"], [".headlesscode/archive.json", "operator archive\n"], [".headlesscode/rsi-proof/plan.json", "sealed confirmation metadata\n"], ["fixtures/rsi-curriculum/generalization.json", "{}\n"], ["fixtures/rsi-benchmark/confirmation.json", "private proof task\n"], ["fixtures/sessions/imported-session.json", "synthetic imported session fixture\n"], ["fixtures/arbitrary/sample.json", "synthetic unrelated fixture\n"]]) {
+		for (const [relative, body] of [["src/app.ts", "source\n"], ["test/app.test.ts", "visible test\n"], ["scripts/eval-suite/hidden.js", "hidden suite\n"], ["src/rsi/fitness.ts", "hidden scorer\n"], ["shared/openshell/headlesscode-policy.yaml", "supervisor policy\n"], [".headlesscode/archive.json", "operator archive\n"], [".headlesscode/rsi-proof/plan.json", "sealed confirmation metadata\n"], ["fixtures/rsi-curriculum/generalization.json", "{}\n"], ["fixtures/rsi-benchmark/confirmation.json", "private proof task\n"], ["fixtures/sessions/imported-session.json", "synthetic imported session fixture\n"], ["fixtures/arbitrary/sample.json", "synthetic unrelated fixture\n"]]) {
 			const target = path.join(repo, relative)
 			fs.mkdirSync(path.dirname(target), { recursive: true })
 			fs.writeFileSync(target, body)
@@ -469,6 +562,7 @@ await run("dependency-escape")
 		assert.equal(fs.existsSync(path.join(clonePath, "test/app.test.ts")), true, "visible tests remain available for evaluation jobs")
 		assert.equal(fs.existsSync(path.join(clonePath, "scripts/eval-suite/hidden.js")), false)
 		assert.equal(fs.existsSync(path.join(clonePath, "src/rsi/fitness.ts")), false)
+		assert.equal(fs.existsSync(path.join(clonePath, "shared/openshell/headlesscode-policy.yaml")), false, "supervisor policy bytes stay outside evaluator and mutation snapshots")
 		assert.equal(fs.existsSync(path.join(clonePath, ".headlesscode/archive.json")), false)
 		assert.equal(fs.existsSync(path.join(clonePath, "fixtures/rsi-curriculum/generalization.json")), true, "registered curriculum fixtures remain available to evaluation guests")
 		assert.equal(fs.existsSync(path.join(clonePath, "fixtures/rsi-benchmark/confirmation.json")), false, "benchmark task and verifier data stays outside evaluation guests")

@@ -81,7 +81,7 @@ test("PostgreSQL migrations upgrade an earlier artifact and lease schema", { ski
 		assert.ok(artifactColumns.rows.some((row) => row.column_name === "byte_length"))
 		assert.equal(artifactColumns.rows.some((row) => row.column_name === "content"), false, "empty legacy NOT NULL PostgreSQL blob column is removed")
 		assert.ok(jobColumns.rows.some((row) => row.column_name === "lease_duration_ms"))
-		assert.equal((await scopedPool.query("SELECT version FROM headlesscode_rsi_schema_migrations ORDER BY version")).rowCount, 10)
+		assert.equal((await scopedPool.query("SELECT version FROM headlesscode_rsi_schema_migrations ORDER BY version")).rowCount, 11)
 		const campaignColumns = await scopedPool.query("SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name='headlesscode_rsi_inference_campaigns'", [schema])
 		assert.ok(campaignColumns.rows.some((row) => row.column_name === "blocked"), "migration 004 adds the campaign block state used by admission and settlement")
 		const inferenceJobColumns = await scopedPool.query("SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name='headlesscode_rsi_inference_jobs'", [schema])
@@ -315,13 +315,13 @@ function testPolicy(queueName: string, overrides: Partial<FleetQueuePolicy> = {}
 	}
 }
 
-async function createQueue(policy = testPolicy(`test-${randomUUID().slice(0, 8)}`)) {
+async function createQueue(policy = testPolicy(`test-${randomUUID().slice(0, 8)}`), existingBucket?: string) {
 	if (!databaseUrl || !endpoint || !accessKeyId || !secretAccessKey) throw new Error("queue integration services unavailable")
 	const pool = new Pool({ connectionString: databaseUrl, max: 16 })
 	const s3 = new S3Client({ endpoint, region: "us-east-1", forcePathStyle: true, credentials: { accessKeyId, secretAccessKey } })
-	const bucket = `rsi-test-${randomUUID().replaceAll("-", "").slice(0, 20)}`
+	const bucket = existingBucket ?? `rsi-test-${randomUUID().replaceAll("-", "").slice(0, 20)}`
 	const storageId = `s3:${new URL(endpoint).origin}:us-east-1:${bucket}:rsi-test`
-	await s3.send(new CreateBucketCommand({ Bucket: bucket }))
+	if (!existingBucket) await s3.send(new CreateBucketCommand({ Bucket: bucket }))
 	const artifacts = new S3RsiArtifactStore({ bucket, endpoint, region: "us-east-1", forcePathStyle: true, prefix: "rsi-test", maxBytes: 32 * 1024 * 1024, client: s3 })
 	const queue = new PostgresRsiJobQueue(pool, policy, artifacts)
 	await queue.migrate()
@@ -344,10 +344,10 @@ async function createQueue(policy = testPolicy(`test-${randomUUID().slice(0, 8)}
 		await queue.close().catch(() => undefined)
 		s3.destroy()
 	}
-	return { queue, pool, s3, cleanup, cleanupBucket, destroyClient: () => s3.destroy() }
+	return { queue, pool, s3, bucket, cleanup, cleanupBucket, destroyClient: () => s3.destroy() }
 }
 
-async function addJob(queue: PostgresRsiJobQueue, key: string, resourceClass: "LOCAL_GPU" | "CPU" = "LOCAL_GPU", concurrencyKey = "ollama") {
+async function addJob(queue: PostgresRsiJobQueue, key: string, resourceClass: "LOCAL_GPU" | "CPU" = "LOCAL_GPU", concurrencyKey = "ollama", runId = "integration-run") {
 	const artifact = await queue.putArtifact(Buffer.from(`${queue.policy.queueName}:${key}:sanitized-snapshot`))
 	const payload: FleetJobPayload = {
 		schemaVersion: 1,
@@ -363,7 +363,7 @@ async function addJob(queue: PostgresRsiJobQueue, key: string, resourceClass: "L
 	}
 	return queue.enqueue({
 		idempotencyKey: key,
-		runId: "integration-run",
+		runId,
 		candidateId: `candidate-${key}`,
 		jobKind: "mutation",
 		resourceClass,
@@ -468,15 +468,21 @@ test("PostgreSQL queue integration: active cancellation fences lease completion 
 	const { queue, cleanup } = await createQueue(testPolicy(`timeout-${randomUUID().slice(0, 8)}`, { maxInFlight: 1, classCapacity: { LOCAL_GPU: 1 } }))
 	try {
 		const job = await addJob(queue, "guest-still-running")
+		const waitingJob = await addJob(queue, "waiting-for-teardown")
 		await queue.registerWorker({ workerId: "worker-active", gatewayId: "gateway-active", hostname: "host-active", maxActive: 1, resourceClasses: ["LOCAL_GPU"] })
 		await queue.registerWorker({ workerId: "worker-waiting", gatewayId: "gateway-waiting", hostname: "host-waiting", maxActive: 1, resourceClasses: ["LOCAL_GPU"] })
 		const lease = await queue.claim("worker-active")
 		assert.ok(lease)
 		assert.equal(await queue.cancel(job.jobId, "security stop"), true, "a leased job can be cancelled by the supervisor")
-		assert.equal((await queue.getJob(job.jobId))?.status, "cancelled")
+		assert.equal((await queue.getJob(job.jobId))?.status, "leased", "cancellation keeps the active lease and its resource slot until teardown is acknowledged")
+		assert.ok((await queue.getJob(job.jobId))?.cancelRequestedAt)
 		assert.equal(await queue.heartbeat(lease), false, "cancelled lease cannot renew")
 		assert.equal((await queue.complete(lease, { tornDown: true })).accepted, false, "cancelled lease cannot import a stale result")
-		assert.equal(await queue.claim("worker-waiting"), undefined, "cancelled work is not reissued from the queue")
+		assert.equal(await queue.claim("worker-waiting"), undefined, "a cancellation request holds capacity and cannot be reissued before teardown")
+		assert.equal(await queue.acknowledgeCancellation(lease), true, "worker confirms sandbox teardown before capacity is released")
+		assert.equal((await queue.getJob(job.jobId))?.status, "cancelled")
+		const replacement = await queue.claim("worker-waiting")
+		assert.equal(replacement?.job.jobId, waitingJob.jobId, "capacity becomes available after teardown acknowledgment")
 	} finally {
 		await cleanup()
 	}
@@ -502,6 +508,141 @@ test("PostgreSQL queue integration: idempotency survives process restart and con
 		assert.equal((await restarted.queue.getJob(jobId))?.status, "queued")
 	} finally {
 		await restarted.cleanup()
+	}
+})
+
+	test("PostgreSQL and S3 restart preserves every job state and retry diagnostics", { skip: !integrationReady }, async () => {
+	const policy = testPolicy(`restart-states-${randomUUID().slice(0, 8)}`, {
+		maxInFlight: 4, leaseMs: 60_000, maxAttempts: 2,
+		classCapacity: { CPU: 4 }, concurrencyKeyCapacity: { "restart-state": 4 },
+	})
+	const first = await createQueue(policy)
+	let second: Awaited<ReturnType<typeof createQueue>> | undefined
+	let third: Awaited<ReturnType<typeof createQueue>> | undefined
+	try {
+		const runningJob = await addJob(first.queue, "state-running", "CPU", "restart-state", "run-running")
+		const completedJob = await addJob(first.queue, "state-completed", "CPU", "restart-state", "run-completed")
+		const retryJob = await addJob(first.queue, "state-retry", "CPU", "restart-state", "run-retry")
+		const retrySuccessJob = await addJob(first.queue, "state-retry-success", "CPU", "restart-state", "run-retry-success")
+		const cancelledJob = await addJob(first.queue, "state-cancelled", "CPU", "restart-state", "run-cancelled")
+		const queuedJob = await addJob(first.queue, "state-queued", "CPU", "restart-state", "run-queued")
+		await first.queue.registerWorker({ workerId: "restart-worker-before", gatewayId: "restart-gateway-before", hostname: "synthetic-host-before", maxActive: 4, resourceClasses: ["CPU"] })
+		const runningLease = await first.queue.claim("restart-worker-before")
+		const completedLease = await first.queue.claim("restart-worker-before")
+		const retryLease = await first.queue.claim("restart-worker-before")
+		const retrySuccessLease = await first.queue.claim("restart-worker-before")
+		assert.equal(runningLease?.job.jobId, runningJob.jobId)
+		assert.equal(completedLease?.job.jobId, completedJob.jobId)
+		assert.equal(retryLease?.job.jobId, retryJob.jobId)
+		assert.equal(retrySuccessLease?.job.jobId, retrySuccessJob.jobId)
+		assert.equal((await first.queue.complete(completedLease!, { result: "completed before restart" })).accepted, true)
+		const firstDiagnostic = Buffer.from("failed attempt one: synthetic stdout/stderr")
+		const firstArtifact = await first.queue.putArtifact(firstDiagnostic)
+		assert.equal(await first.queue.fail(retryLease!, "first attempt diagnostic", { failureOutputArtifact: { sha256: firstArtifact.sha256, bytes: firstDiagnostic.byteLength } }), true)
+		const retrySuccessDiagnostic = Buffer.from("retry later succeeds: preserved initial output")
+		const retrySuccessArtifact = await first.queue.putArtifact(retrySuccessDiagnostic)
+		assert.equal(await first.queue.fail(retrySuccessLease!, "retryable failure before restart", { failureOutputArtifact: { sha256: retrySuccessArtifact.sha256, bytes: retrySuccessDiagnostic.byteLength } }), true)
+		const terminalRetryLease = await first.queue.claim("restart-worker-before")
+		assert.equal(terminalRetryLease?.job.jobId, retryJob.jobId)
+		const secondDiagnostic = Buffer.from("failed attempt two: final synthetic diagnostic")
+		const secondArtifact = await first.queue.putArtifact(secondDiagnostic)
+		assert.equal(await first.queue.fail(terminalRetryLease!, "second attempt diagnostic", { failureOutputArtifact: { sha256: secondArtifact.sha256, bytes: secondDiagnostic.byteLength } }), true)
+		assert.equal(await first.queue.cancel(cancelledJob.jobId, "cancelled before restart"), true)
+		assert.equal((await first.queue.getJob(queuedJob.jobId))?.status, "queued")
+		await first.queue.close()
+		first.destroyClient()
+
+		second = await createQueue(policy, first.bucket)
+		assert.equal((await second.queue.getJob(runningJob.jobId))?.status, "leased")
+		assert.equal((await second.queue.getJob(completedJob.jobId))?.status, "completed")
+		assert.equal((await second.queue.getJob(cancelledJob.jobId))?.status, "cancelled")
+		assert.equal((await second.queue.getJob(queuedJob.jobId))?.status, "queued")
+		const retryAfterRestart = await second.queue.getJob(retryJob.jobId)
+		assert.equal(retryAfterRestart?.status, "failed")
+		const retrySuccessAfterRestart = await second.queue.getJob(retrySuccessJob.jobId)
+		assert.equal(retrySuccessAfterRestart?.status, "queued")
+		assert.equal((retrySuccessAfterRestart?.result as { failureHistory?: Array<{ attempt: number; error: string }> } | undefined)?.failureHistory?.[0]?.attempt, 1)
+		assert.deepEqual(await second.queue.getArtifact(firstArtifact.sha256), firstDiagnostic)
+		assert.deepEqual(await second.queue.getArtifact(secondArtifact.sha256), secondDiagnostic)
+		assert.deepEqual(await second.queue.getArtifact(retrySuccessArtifact.sha256), retrySuccessDiagnostic)
+
+		await second.queue.registerWorker({ workerId: "restart-worker-after", gatewayId: "restart-gateway-after", hostname: "synthetic-host-after", maxActive: 4, resourceClasses: ["CPU"] })
+		const retrySuccessLeaseAfterRestart = await second.queue.claim("restart-worker-after")
+		assert.equal(retrySuccessLeaseAfterRestart?.job.jobId, retrySuccessJob.jobId)
+		assert.equal(retrySuccessLeaseAfterRestart?.job.attempts, 2)
+		assert.equal((await second.queue.complete(retrySuccessLeaseAfterRestart!, { result: "completed after one failed attempt" })).accepted, true)
+		await second.queue.close()
+		second.destroyClient()
+
+		third = await createQueue(policy, first.bucket)
+		assert.equal((await third.queue.getJob(retryJob.jobId))?.status, "failed", "terminal failed state survives another coordinator restart")
+		const failedAfterRestart = await third.queue.getJob(retryJob.jobId)
+		assert.deepEqual((failedAfterRestart?.result as { failureHistory?: Array<{ attempt: number; error: string }> } | undefined)?.failureHistory?.map(({ attempt, error }) => ({ attempt, error })), [
+			{ attempt: 1, error: "first attempt diagnostic" },
+			{ attempt: 2, error: "second attempt diagnostic" },
+		])
+		const successfulRetryAfterRestart = await third.queue.getJob(retrySuccessJob.jobId)
+		assert.equal(successfulRetryAfterRestart?.status, "completed")
+		assert.deepEqual((successfulRetryAfterRestart?.result as { failureHistory?: Array<{ attempt: number; error: string }> } | undefined)?.failureHistory?.map(({ attempt, error }) => ({ attempt, error })), [
+			{ attempt: 1, error: "retryable failure before restart" },
+		])
+		assert.deepEqual(await third.queue.getArtifact(retrySuccessArtifact.sha256), retrySuccessDiagnostic, "failed-attempt output remains retrievable after retry success and coordinator restart")
+		assert.equal((await third.queue.getJob(completedJob.jobId))?.status, "completed", "completed work is not reset for replay after restart")
+		await third.queue.registerWorker({ workerId: "restart-worker-third", gatewayId: "restart-gateway-third", hostname: "synthetic-host-third", maxActive: 4, resourceClasses: ["CPU"] })
+		assert.equal(await third.queue.claim("restart-worker-third").then((lease) => lease?.job.jobId), queuedJob.jobId, "only unfinished queued work is eligible after restart")
+		assert.equal((await third.queue.complete(runningLease!, { result: "running lease completed after coordinator restart" })).accepted, true)
+		assert.deepEqual((await third.queue.getJob(completedJob.jobId))?.result, { result: "completed before restart" })
+	} finally {
+		if (third) {
+			await first.queue.close().catch(() => undefined)
+			first.destroyClient()
+			await second?.queue.close().catch(() => undefined)
+			second?.destroyClient()
+			await third.cleanup()
+		}
+		else if (second) {
+			await first.queue.close().catch(() => undefined)
+			first.destroyClient()
+			await second.cleanup()
+		}
+		else {
+			await first.cleanupBucket().catch(() => undefined)
+			await first.queue.close().catch(() => undefined)
+			first.destroyClient()
+		}
+	}
+})
+
+test("PostgreSQL admission cap is shared by independent coordinators and concurrent run IDs", { skip: !integrationReady }, async () => {
+	const policy = testPolicy(`concurrent-runs-${randomUUID().slice(0, 8)}`, {
+		maxInFlight: 1, leaseMs: 60_000, classCapacity: { CPU: 1 }, concurrencyKeyCapacity: { "shared-run-cap": 1 },
+	})
+	const first = await createQueue(policy)
+	let second: Awaited<ReturnType<typeof createQueue>> | undefined
+	try {
+		const firstJob = await addJob(first.queue, "independent-run-one", "CPU", "shared-run-cap", "run-one")
+		const secondJob = await addJob(first.queue, "independent-run-two", "CPU", "shared-run-cap", "run-two")
+		await first.queue.registerWorker({ workerId: "independent-worker-one", gatewayId: "gateway-one", hostname: "host-one", maxActive: 1, resourceClasses: ["CPU"] })
+		const firstLease = await first.queue.claim("independent-worker-one")
+		assert.equal(firstLease?.job.jobId, firstJob.jobId)
+		second = await createQueue(policy, first.bucket)
+		await second.queue.registerWorker({ workerId: "independent-worker-two", gatewayId: "gateway-two", hostname: "host-two", maxActive: 1, resourceClasses: ["CPU"] })
+		assert.equal(await second.queue.claim("independent-worker-two"), undefined, "a second coordinator cannot exceed the shared queue/resource cap")
+		assert.equal((await second.queue.complete(firstLease!, { completed: true })).accepted, true)
+		const nextLease = await second.queue.claim("independent-worker-two")
+		assert.equal(nextLease?.job.jobId, secondJob.jobId)
+		assert.equal((await second.queue.complete(nextLease!, { completed: true })).accepted, true)
+	} finally {
+		if (second) {
+			await first.queue.close().catch(() => undefined)
+			first.destroyClient()
+			await second.cleanup()
+		}
+		else {
+			await first.cleanupBucket().catch(() => undefined)
+			await first.queue.close().catch(() => undefined)
+			first.destroyClient()
+		}
 	}
 })
 

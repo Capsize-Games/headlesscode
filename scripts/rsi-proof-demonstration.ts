@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto"
+import { constants as fsConstants } from "node:fs"
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
 import { execFileSync } from "node:child_process"
@@ -6,13 +7,15 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 import { loadBenchmark } from "../src/rsi/benchmark/runner.js"
 import { readArchive } from "../src/rsi/archive.js"
 import { parseRsiArgs } from "../src/rsi/config.js"
+import { loadEvaluatorIntegrityTrust } from "../src/rsi/evaluation-integrity.js"
 import { createProofCampaignManifest, RSI_CONFIRMATION_RETENTION_TASK_IDS, runRsi } from "../src/rsi/controller.js"
-import { fetchPinnedOpenRouterEndpointPrice, openRouterAllocatedEnvironment, openRouterBrokerLimitsFromEnvironment, RSI_OPENROUTER_MODEL } from "../src/rsi/inference-broker.js"
+import { fetchOpenRouterEndpointPrice, openRouterAllocatedEnvironment, openRouterBrokerLimitsFromEnvironment, openRouterProfileById, openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID, type RsiOpenRouterProfileId } from "../src/rsi/inference-broker.js"
 import { freezeProofDemonstrationManifest, frozenProofConfigDigest, verifyFrozenProofDemonstrationManifest, type FrozenProofDemonstrationManifest } from "../src/rsi/proof-demonstration-manifest.js"
 import { assertFrozenProofDemonstrationPlanMatches, planProofDemonstration } from "../src/rsi/proof-demonstration-plan.js"
 import { analyzeProofDemonstration, verifyProofDemonstrationArtifactBytes } from "../src/rsi/proof-demonstration.js"
 import { workerHarnessRuntimeIdentityFromEnvironment } from "../src/rsi/worker-harness.js"
 import { proofCampaignManifestDigest } from "../src/rsi/proof-campaign.js"
+import { resolveRoles } from "../src/rsi/roles.js"
 import type { CandidateRecord, RsiConfig, RsiRunRecord } from "../src/rsi/types.js"
 
 interface Options {
@@ -26,7 +29,17 @@ interface Options {
 	operatorCapUsd?: number
 	seeds: string[]
 	mutationTask: string
+	openRouterProfile?: RsiOpenRouterProfileId
 	engineeringEvidencePath?: string
+	evaluatorSigningKeyPath?: string
+	evaluatorTrustedPublicKeyPath?: string
+	evaluatorTrustedKeySha256?: string
+}
+
+export interface EvaluatorIntegrityOptions {
+	evaluatorSigningKeyPath?: string
+	evaluatorTrustedPublicKeyPath?: string
+	evaluatorTrustedKeySha256?: string
 }
 
 type ProofPlanPreview = Omit<Parameters<typeof freezeProofDemonstrationManifest>[0], "operatorCapUsd" | "engineeringEvidence"> & { plan: ReturnType<typeof planProofDemonstration> }
@@ -38,20 +51,28 @@ interface EngineeringEvidenceRecord {
 	snapshotSha256: string
 	archiveDir: string
 	arms: Array<{ runId: string; armId: "fixed-control" | "self-hosted"; runSha256: string; selectedCommit: string }>
+	model?: { requestedId: string; profileId?: RsiOpenRouterProfileId }
 	digestSha256: string
+}
+
+export const PROOF_VISIBLE_EVAL_COMMANDS = Object.freeze(["npm test -- --filter engine"])
+
+export function configureProofVisibleEvaluations(config: RsiConfig): RsiConfig {
+	return { ...config, evalCommands: [...PROOF_VISIBLE_EVAL_COMMANDS] }
 }
 
 function usage(): string {
 	return `Usage:
-  npx tsx scripts/rsi-proof-demonstration.ts estimate --seed <engineering> --campaign-seed <seed> --campaign-seed <seed> --campaign-seed <seed> [--repo <path>]
-  npx tsx scripts/rsi-proof-demonstration.ts engineering --seed <engineering> --operator-cap-usd <USD> [--execute] [--repo <path>] [--out <evidence.json>]
-  npx tsx scripts/rsi-proof-demonstration.ts plan --engineering-evidence <path> --operator-cap-usd <USD> --seed <engineering> --campaign-seed <seed> --campaign-seed <seed> --campaign-seed <seed> [--out <path>] [--repo <path>]
-  npx tsx scripts/rsi-proof-demonstration.ts execute --plan <path> --operator-cap-usd <USD> --execute
+  npx tsx scripts/rsi-proof-demonstration.ts estimate --seed <engineering> --campaign-seed <seed> --campaign-seed <seed> --campaign-seed <seed> [--openrouter-profile <admitted-id>] [--repo <path>]
+  npx tsx scripts/rsi-proof-demonstration.ts engineering --seed <engineering> --operator-cap-usd <USD> [--execute --evaluator-signing-key <path> --evaluator-trusted-public-key <path> --evaluator-trusted-key-sha256 <pin>] [--openrouter-profile <admitted-id>] [--repo <path>] [--out <evidence.json>]
+  npx tsx scripts/rsi-proof-demonstration.ts plan --engineering-evidence <path> --operator-cap-usd <USD> --seed <engineering> --campaign-seed <seed> --campaign-seed <seed> --campaign-seed <seed> --evaluator-signing-key <path> --evaluator-trusted-public-key <path> --evaluator-trusted-key-sha256 <pin> [--openrouter-profile <admitted-id>] [--out <path>] [--repo <path>]
+  npx tsx scripts/rsi-proof-demonstration.ts execute --plan <path> --operator-cap-usd <USD> --evaluator-signing-key <path> --evaluator-trusted-public-key <path> --evaluator-trusted-key-sha256 <pin> --execute
   npx tsx scripts/rsi-proof-demonstration.ts verify --plan <path>
   npx tsx scripts/rsi-proof-demonstration.ts analyze --plan <path> --archive <directory> [--out <path>]
 
 Estimate, engineering estimates, plan, and verify perform pricing metadata GETs only; they do not submit model inference.
-Engineering prints a bounded estimate unless --execute is supplied. Paid execution requires an
+Engineering prints a bounded estimate unless --execute is supplied. Estimates do not require evaluator keys. Paid engineering and campaign execution require a protected signing key, independently trusted public key, and matching SHA-256 pin. Only the pin is frozen into the published plan; key paths are supplied again at execution.
+Paid execution requires an
 explicit operator cap, broker/PostgreSQL/OpenShell configuration, and a clean checkout. Its
 development-only manifest contains no confirmation cells. Final plan requires passing
 engineering evidence and freezes the three confirmation campaigns afterward. Execute resumes
@@ -59,7 +80,7 @@ the frozen campaigns; analyze independently checks their archive and artifacts.
 `
 }
 
-function parse(argv: string[]): Options {
+export function parseProofDemonstrationArgs(argv: string[]): Options {
 	const command = argv[0]
 	if (command !== "estimate" && command !== "plan" && command !== "verify" && command !== "analyze" && command !== "engineering" && command !== "execute") throw new Error("expected estimate, engineering, plan, execute, verify or analyze")
 	const defaultOutput = command === "analyze" ? ".headlesscode/rsi-proof/report.json" : command === "engineering" ? ".headlesscode/rsi-proof/engineering-evidence.json" : ".headlesscode/rsi-proof/plan.json"
@@ -74,14 +95,51 @@ function parse(argv: string[]): Options {
 		else if (arg === "--plan") options.planPath = path.resolve(value)
 		else if (arg === "--archive") options.archiveDir = path.resolve(value)
 		else if (arg === "--engineering-evidence") options.engineeringEvidencePath = path.resolve(value)
+		else if (arg === "--evaluator-signing-key") options.evaluatorSigningKeyPath = path.resolve(value)
+		else if (arg === "--evaluator-trusted-public-key") options.evaluatorTrustedPublicKeyPath = path.resolve(value)
+		else if (arg === "--evaluator-trusted-key-sha256") options.evaluatorTrustedKeySha256 = value
 		else if (arg === "--repo") options.repo = path.resolve(value)
 		else if (arg === "--operator-cap-usd") options.operatorCapUsd = Number(value)
+		else if (arg === "--openrouter-profile") options.openRouterProfile = openRouterProfileById(value).id
 		else if (arg === "--seed" || arg === "--campaign-seed") options.seeds.push(value)
 		else if (arg === "--mutation-task") options.mutationTask = value
 		else throw new Error(`unknown option ${arg}`)
 		index++
 	}
+	if (options.openRouterProfile && !["estimate", "engineering", "plan"].includes(command)) throw new Error("--openrouter-profile is only valid for estimate, engineering, or plan; verify, execute, and analyze use the frozen plan identity")
+	const trustOptions = [options.evaluatorSigningKeyPath, options.evaluatorTrustedPublicKeyPath, options.evaluatorTrustedKeySha256]
+	if (trustOptions.some((value) => value !== undefined) && trustOptions.some((value) => value === undefined)) throw new Error("evaluator integrity requires --evaluator-signing-key, --evaluator-trusted-public-key, and --evaluator-trusted-key-sha256")
 	return options
+}
+
+function requireEvaluatorIntegrityOptions(options: EvaluatorIntegrityOptions): Required<EvaluatorIntegrityOptions> {
+	if (!options.evaluatorSigningKeyPath || !options.evaluatorTrustedPublicKeyPath || !options.evaluatorTrustedKeySha256) throw new Error("attested proof execution requires --evaluator-signing-key, --evaluator-trusted-public-key, and --evaluator-trusted-key-sha256")
+	return {
+		evaluatorSigningKeyPath: options.evaluatorSigningKeyPath,
+		evaluatorTrustedPublicKeyPath: options.evaluatorTrustedPublicKeyPath,
+		evaluatorTrustedKeySha256: options.evaluatorTrustedKeySha256,
+	}
+}
+
+function withEvaluatorIntegrityPin(config: RsiConfig, pin: string | undefined): RsiConfig {
+	return pin ? { ...config, evaluatorTrustedKeySha256: pin } : config
+}
+
+function withRuntimeEvaluatorIntegrity(config: RsiConfig, options: EvaluatorIntegrityOptions): RsiConfig {
+	const trust = requireEvaluatorIntegrityOptions(options)
+	if (config.evaluatorTrustedKeySha256 && config.evaluatorTrustedKeySha256 !== trust.evaluatorTrustedKeySha256) throw new Error("evaluator trust pin differs from the frozen proof configuration")
+	return {
+		...config,
+		evaluatorSigningKeyPath: trust.evaluatorSigningKeyPath,
+		evaluatorTrustedPublicKeyPath: trust.evaluatorTrustedPublicKeyPath,
+		evaluatorTrustedKeySha256: trust.evaluatorTrustedKeySha256,
+	}
+}
+
+export async function validateRuntimeEvaluatorIntegrity(config: RsiConfig, options: EvaluatorIntegrityOptions): Promise<RsiConfig> {
+	const runtimeConfig = withRuntimeEvaluatorIntegrity(config, options)
+	await loadEvaluatorIntegrityTrust(runtimeConfig)
+	return runtimeConfig
 }
 
 export async function assertSupervisorOnlyPlanPath(repoRoot: string, output: string): Promise<string> {
@@ -101,6 +159,51 @@ export async function assertSupervisorOnlyPlanPath(repoRoot: string, output: str
 		catch { throw new Error("frozen plan path is not Git-ignored") }
 	}
 	return absolute
+}
+
+const MAX_PROOF_INPUT_BYTES = 2 * 1024 * 1024
+
+/** Read a frozen plan/evidence input without following its leaf or trusting ambient permissions. */
+export async function readProtectedProofInput(repoRoot: string, input: string, maxBytes = MAX_PROOF_INPUT_BYTES): Promise<Buffer> {
+	if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_PROOF_INPUT_BYTES) throw new Error("proof input size limit is invalid")
+	const absolute = await assertSupervisorOnlyPlanPath(repoRoot, input)
+	const currentUid = process.geteuid?.() ?? process.getuid?.()
+	let cursor = path.dirname(absolute)
+	while (true) {
+		const parent = await fs.lstat(cursor)
+		if (parent.isSymbolicLink() || !parent.isDirectory()) throw new Error("proof input parent path must contain only real directories")
+		if (currentUid !== undefined && parent.uid !== 0 && parent.uid !== currentUid) throw new Error("proof input parent directory must be owned by root or the current user")
+		const next = path.dirname(cursor)
+		if (next === cursor) break
+		cursor = next
+	}
+	const leaf = await fs.lstat(absolute)
+	if (leaf.isSymbolicLink()) throw new Error("proof input must not be a symlink")
+	if (!leaf.isFile()) throw new Error("proof input must be a regular file")
+	if (!Number.isInteger(fsConstants.O_NOFOLLOW) || fsConstants.O_NOFOLLOW === 0) throw new Error("proof input reads require platform O_NOFOLLOW support")
+	const handle = await fs.open(absolute, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | (fsConstants.O_NONBLOCK ?? 0))
+	try {
+		const before = await handle.stat({ bigint: true })
+		if (!before.isFile() || before.nlink !== 1n) throw new Error("proof input must be a single-link regular file")
+		if (currentUid !== undefined && before.uid !== 0n && before.uid !== BigInt(currentUid)) throw new Error("proof input file must be owned by root or the current user")
+		if ((before.mode & 0o077n) !== 0n) throw new Error("proof input file must not be accessible to group or other users")
+		if (before.size < 1n || before.size > BigInt(maxBytes)) throw new Error(`proof input must be between 1 byte and ${maxBytes} bytes`)
+		const chunks: Buffer[] = []
+		let total = 0
+		while (total <= maxBytes) {
+			const chunk = Buffer.alloc(Math.min(64 * 1024, maxBytes + 1 - total))
+			const { bytesRead } = await handle.read(chunk, 0, chunk.byteLength, total)
+			if (bytesRead === 0) break
+			chunks.push(chunk.subarray(0, bytesRead))
+			total += bytesRead
+		}
+		if (total > maxBytes) throw new Error(`proof input exceeds ${maxBytes} bytes`)
+		const after = await handle.stat({ bigint: true })
+		if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size || after.mtimeNs !== before.mtimeNs || after.ctimeNs !== before.ctimeNs || BigInt(total) !== before.size) throw new Error("proof input changed while it was being read")
+		return Buffer.concat(chunks, total)
+	} finally {
+		await handle.close()
+	}
 }
 
 function sha256(value: string | Buffer): string { return createHash("sha256").update(value).digest("hex") }
@@ -143,10 +246,16 @@ export function assertEngineeringTransition(fixed: RsiRunRecord, self: RsiRunRec
 }
 
 async function verifyEngineeringEvidenceFile(evidencePath: string, repo: string, expectedRoot?: string): Promise<{ record: EngineeringEvidenceRecord; fileSha256: string }> {
-	const safePath = await assertSupervisorOnlyPlanPath(repo, evidencePath)
-	const bytes = await fs.readFile(safePath)
+	const bytes = await readProtectedProofInput(repo, evidencePath)
 	const record = JSON.parse(bytes.toString("utf8")) as EngineeringEvidenceRecord
 	if (!record || record.schemaVersion !== 1 || !Array.isArray(record.arms) || record.arms.length !== 2) throw new Error("engineering evidence record is malformed")
+	if (record.model) {
+		const profile = openRouterProfileForModel(record.model.requestedId, record.model.profileId)
+		if (profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID && record.model.profileId !== profile.id) throw new Error("engineering evidence has a missing explicit profile identity")
+	}
+	const evidenceProfile = record.model
+		? openRouterProfileForModel(record.model.requestedId, record.model.profileId)
+		: openRouterProfileById(RSI_DEFAULT_OPENROUTER_PROFILE_ID)
 	const { digestSha256, ...body } = record
 	if (!/^[a-f0-9]{64}$/.test(digestSha256) || canonicalHash(body) !== digestSha256) throw new Error("engineering evidence digest mismatch")
 	if (expectedRoot && record.rootCommit !== expectedRoot) throw new Error("engineering evidence belongs to a different clean root commit")
@@ -166,6 +275,7 @@ async function verifyEngineeringEvidenceFile(evidencePath: string, repo: string,
 		uniqueArms.add(armRef.armId)
 		const run = archive.runs.concat(archive.activeRuns).find((entry) => entry.runId === armRef.runId)
 		if (!run || canonicalHash(run) !== armRef.runSha256 || run.baseCommit !== record.rootCommit || run.finishedAt === undefined || run.workerHarnessPairId !== record.campaignId || run.workerHarnessMode !== armRef.armId || !run.proofCampaign || run.proofCampaign.manifest.phaseMode !== "engineering-only" || run.proofCampaign.manifestSha256 !== record.manifestSha256 || proofCampaignManifestDigest(run.proofCampaign.manifest) !== record.manifestSha256 || run.proofCampaign.state !== "finished" || run.proofConfirmation || (run.confirmationAttempts?.length ?? 0) > 0 || run.proofCampaign.manifest.schedule.some((cell) => cell.phase === "confirmation") || (run.proofCampaign.manifest.settings.confirmationTaskIdentities as unknown[] | undefined)?.length) throw new Error(`engineering evidence run ${armRef.runId} is incomplete or includes confirmation inputs`)
+		assertEngineeringRunProfile(run, evidenceProfile)
 		if (run.candidates.some((candidate) => !["accepted", "rejected", "failed"].includes(candidate.status))) throw new Error(`engineering evidence run ${armRef.runId} has incomplete candidate outcomes`)
 		if (armRef.armId === "self-hosted" && (!run.selected || !run.candidates.some((candidate) => candidate.id === run.selected && candidate.status === "accepted" && candidate.developmentProof?.accepted === true && candidate.commits.length > 0 && candidate.commits[0] === armRef.selectedCommit))) throw new Error("engineering self-hosted arm did not select an accepted development-proof candidate")
 		if (armRef.armId === "fixed-control" && armRef.selectedCommit !== run.baseCommit && !run.candidates.some((candidate) => candidate.id === run.selected && candidate.commits[0] === armRef.selectedCommit)) throw new Error("engineering fixed-control selected commit is not in its recorded run")
@@ -177,6 +287,38 @@ async function verifyEngineeringEvidenceFile(evidencePath: string, repo: string,
 	if (fixedRun.workerHarnessConfigDigest !== selfRun.workerHarnessConfigDigest || fixedRun.workerHarnessSamplingSeed !== selfRun.workerHarnessSamplingSeed || fixedRun.workerHarnessRuntime?.harnessCommit !== selfRun.workerHarnessRuntime?.harnessCommit) throw new Error("engineering pair has mismatched frozen configuration, seed, or runtime")
 	assertEngineeringTransition(fixedRun, selfRun)
 	return { record, fileSha256: sha256(bytes) }
+}
+
+function assertEngineeringRunProfile(run: RsiRunRecord, expected: ReturnType<typeof openRouterProfileById>): void {
+	const expectedProfileId = expected.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? undefined : expected.id
+	const campaignModel = run.proofCampaign?.manifest.model
+	const protocolModel = run.developmentProofProtocol?.model
+	const configuredRoles = campaignModel?.settings?.roles
+	const configuredWorker = configuredRoles && typeof configuredRoles === "object"
+		? (configuredRoles as Record<string, unknown>).worker as Record<string, unknown> | undefined
+		: undefined
+	if (run.model !== expected.model || run.openRouterProfileId !== expectedProfileId || campaignModel?.provider !== "openshell-openrouter" || campaignModel.id !== expected.model || campaignModel.profileId !== expectedProfileId || configuredWorker?.provider !== "openrouter" || configuredWorker.model !== expected.model || configuredWorker.openRouterProfile !== expectedProfileId || (protocolModel && (protocolModel.provider !== "openrouter" || protocolModel.id !== expected.model || protocolModel.profileId !== expectedProfileId))) {
+		throw new Error(`engineering run ${run.runId} model/profile differs from the frozen proof identity`)
+	}
+}
+
+export function assertProofWorkerProfile(config: RsiConfig, expected: ReturnType<typeof openRouterProfileById>, env: NodeJS.ProcessEnv = process.env): void {
+	const roles = resolveRoles(config.roles, env, config.model)
+	const worker = roles.worker
+	const expectedProfileId = expected.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? undefined : expected.id
+	const actualProfile = worker?.provider === "openrouter" ? openRouterProfileForModel(worker.model, worker.openRouterProfile) : undefined
+	if (!worker || worker.provider !== "openrouter" || worker.model !== expected.model || actualProfile?.id !== expected.id || (expectedProfileId !== undefined && worker.openRouterProfile !== expectedProfileId) || (worker.command !== undefined) || (worker.baseUrl !== undefined)) {
+		throw new Error(`effective RSI worker role must match frozen OpenRouter profile ${expected.id} / ${expected.model}`)
+	}
+}
+
+function assertEngineeringProfile(record: EngineeringEvidenceRecord, model: FrozenProofDemonstrationManifest["model"]): void {
+	const profile = openRouterProfileForModel(model.requestedId, model.profileId)
+	if (profile.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID) {
+		if (record.model && (record.model.requestedId !== model.requestedId || record.model.profileId !== model.profileId)) throw new Error("engineering evidence model/profile differs from the frozen DeepSeek plan")
+		return
+	}
+	if (record.model?.requestedId !== model.requestedId || record.model.profileId !== profile.id) throw new Error("engineering evidence was not produced with the exact frozen OpenRouter profile/model")
 }
 
 async function analysisDigest(repo: string): Promise<string> {
@@ -207,7 +349,7 @@ function formatPlan(preview: ProofPlanPreview, operatorCapUsd?: number, digestSh
 		`${digestSha256 ? `Frozen proof plan ${digestSha256}` : "Read-only proof plan estimate (not frozen)"}`,
 		`Root commit: ${preview.rootCommit}`,
 		`Benchmark manifest: ${preview.benchmarkManifestSha256}`,
-		`Model: ${preview.model.requestedId} (endpoint: ${preview.endpointPrice.provider})`,
+		`Model: ${preview.model.profileId ?? RSI_DEFAULT_OPENROUTER_PROFILE_ID} / ${preview.model.requestedId} (endpoint: ${preview.endpointPrice.provider})`,
 		`Endpoint rate observed ${preview.endpointPrice.observedAt}: input $${preview.endpointPrice.inputPricePerMillionUsd}/M, output $${preview.endpointPrice.outputPricePerMillionUsd}/M`,
 		`Configured maximum price ceilings: input $${preview.priceCeilingsPerMillionUsd.input}/M, output $${preview.priceCeilingsPerMillionUsd.output}/M`,
 		`Broker hard spend reservations: engineering root $${plan.engineering.rootSpendCeilingUsd.toFixed(6)}; three future campaign roots $${plan.campaignRootsSpendCeilingUsd.toFixed(6)} total ($${plan.campaign.rootSpendCeilingUsd.toFixed(6)} each)`,
@@ -268,12 +410,22 @@ export async function buildProofPlanPreview(options: Options, env: NodeJS.Proces
 	catch { throw new Error("fixed-control runtime harness commit must be present in the root repository") }
 	const parsed = parseRsiArgs(["--repo", repo, "--population", "2", "--generations", "3", "--seed", seeds[0]!, "--base-ref", rootCommit, "--max-runtime-ms", String(72 * 60 * 60_000), "--mutation-task", options.mutationTask])
 	if (!parsed.config) throw new Error(parsed.error ?? "could not construct proof configuration")
-	const baseConfig = { ...parsed.config, archiveDir: options.archiveDir ?? parsed.config.archiveDir, model: RSI_OPENROUTER_MODEL, roles: { worker: { provider: "openrouter" as const, model: RSI_OPENROUTER_MODEL } }, mutationTask: options.mutationTask, workerHarnessRuntime: runtime }
+	const proofConfig = configureProofVisibleEvaluations(parsed.config)
+	const profile = openRouterProfileById(options.openRouterProfile ?? RSI_DEFAULT_OPENROUTER_PROFILE_ID)
+	const baseConfig = withEvaluatorIntegrityPin({
+		...proofConfig,
+		archiveDir: options.archiveDir ?? proofConfig.archiveDir,
+		model: profile.model,
+		roles: { worker: { provider: "openrouter" as const, model: profile.model, ...(profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { openRouterProfile: profile.id } : {}) } },
+		mutationTask: options.mutationTask,
+		workerHarnessRuntime: runtime,
+	}, options.evaluatorTrustedKeySha256)
+	assertProofWorkerProfile(baseConfig, profile, env)
 	const configs = seeds.map((seed, index) => ({ ...baseConfig, generations: index === 0 ? 2 : 3, seed })) as [typeof baseConfig, typeof baseConfig, typeof baseConfig, typeof baseConfig]
 	const config = configs[0]
 	const loaded = await loadBenchmark(path.join(repo, "fixtures/rsi-benchmark"), repo)
 	const modelKey = env.HEADLESSCODE_OPENROUTER_API_KEY?.trim() ?? ""
-	const price = await fetchPinnedOpenRouterEndpointPrice(modelKey, fetcher)
+	const price = await fetchOpenRouterEndpointPrice(profile, modelKey, fetcher)
 	const mutationEnv = openRouterAllocatedEnvironment(env, "mutation")
 	const benchmarkEnv = openRouterAllocatedEnvironment(env, "benchmark")
 	const mutationLimits = openRouterBrokerLimitsFromEnvironment(mutationEnv, "plan-mutation", { maxCalls: config.maxIterations, maxDurationMs: config.commandTimeoutMs })
@@ -282,7 +434,7 @@ export async function buildProofPlanPreview(options: Options, env: NodeJS.Proces
 	const plan = planProofDemonstration({ config, manifest: loaded.manifest, mutationLimits, benchmarkLimits })
 	return {
 		createdAt: new Date().toISOString(), rootCommit, benchmarkManifestSha256: loaded.manifestDigest,
-		model: { provider: "openshell-openrouter", requestedId: RSI_OPENROUTER_MODEL, sampling: { temperature: 0, think: false, seed: "provider-default" } },
+		model: { provider: "openshell-openrouter", requestedId: profile.model, ...(profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { profileId: profile.id } : {}), sampling: { temperature: 0, think: false, seed: "provider-default" } },
 		endpointPrice: price,
 		priceCeilingsPerMillionUsd: { input: benchmarkLimits.maxInputPricePerMillionUsd, output: benchmarkLimits.maxOutputPricePerMillionUsd },
 		runtime,
@@ -298,14 +450,17 @@ export async function buildProofPlanPreview(options: Options, env: NodeJS.Proces
 	}
 }
 
-export async function runEngineeringArm(config: RsiConfig, campaign: string, arm: "fixed-control" | "self-hosted", rootCommit: string, seed: string, runtime: NonNullable<RsiConfig["workerHarnessRuntime"]>, runner: typeof runRsi = runRsi): Promise<RsiRunRecord> {
+export async function runEngineeringArm(config: RsiConfig, campaign: string, arm: "fixed-control" | "self-hosted", rootCommit: string, seed: string, runtime: NonNullable<RsiConfig["workerHarnessRuntime"]>, runner: typeof runRsi = runRsi, env: NodeJS.ProcessEnv = process.env): Promise<RsiRunRecord> {
+	const expectedProfile = openRouterProfileForModel(config.model, config.roles?.worker?.openRouterProfile)
+	assertProofWorkerProfile(config, expectedProfile, env)
 	const before = await readArchive(config.archiveDir)
 	const prior = before.runs.concat(before.activeRuns).filter((entry) => entry.workerHarnessPairId === campaign && entry.workerHarnessMode === arm)
 	if (prior.length > 1) throw new Error(`engineering replay found duplicate archived ${arm} runs`)
 	const existing = prior[0]
 	const plannedRunId = engineeringRunId(campaign, arm)
 	if (existing) {
-		if (existing.runId !== plannedRunId || existing.baseCommit !== rootCommit || existing.workerHarnessSamplingSeed !== seed || JSON.stringify(existing.workerHarnessRuntime) !== JSON.stringify(runtime) || existing.proofCampaign?.manifest.phaseMode !== "engineering-only") throw new Error(`engineering replay found a ${arm} run with changed frozen identity`)
+		if (existing.runId !== plannedRunId || existing.baseCommit !== rootCommit || existing.workerHarnessSamplingSeed !== seed || existing.model !== config.model || existing.openRouterProfileId !== (expectedProfile.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? undefined : expectedProfile.id) || JSON.stringify(existing.workerHarnessRuntime) !== JSON.stringify(runtime) || existing.proofCampaign?.manifest.phaseMode !== "engineering-only") throw new Error(`engineering replay found a ${arm} run with changed frozen identity`)
+		assertEngineeringRunProfile(existing, expectedProfile)
 		if (existing.finishedAt && existing.proofCampaign.state === "finished") {
 			const arms = existing.proofCampaign.ledgerSnapshot?.arms as Array<Record<string, unknown>> | undefined
 			if (!arms?.some((entry) => entry.arm_id === arm && entry.state === "finished") || existing.proofCampaign.manifest.schedule.some((cell) => cell.phase === "confirmation")) throw new Error(`engineering replay found an invalid terminal ${arm} checkpoint`)
@@ -318,6 +473,7 @@ export async function runEngineeringArm(config: RsiConfig, campaign: string, arm
 
 export async function executeEngineeringPair(options: Options, env: NodeJS.ProcessEnv = process.env, runner: typeof runRsi = runRsi): Promise<EngineeringEvidenceRecord | undefined> {
 	if (options.command !== "engineering") throw new Error("engineering command is required")
+	if (options.execute) requireEvaluatorIntegrityOptions(options)
 	const preview = await buildProofPlanPreview(options, env)
 	const required = preview.plan.engineering.rootSpendCeilingUsd
 	if (!options.execute) {
@@ -332,8 +488,9 @@ export async function executeEngineeringPair(options: Options, env: NodeJS.Proce
 	const benchmarkAllocation = preview.execution.inferenceLimits.benchmark.maxCampaignSpendUsd
 	if (mutationAllocation + benchmarkAllocation > cap + 1e-9 || mutationAllocation + benchmarkAllocation + 1e-9 < required) throw new Error("configured mutation and benchmark allocations must fit the operator cap and fund the engineering-only root reservation")
 	if (await ensureCleanRoot(options.repo) !== preview.rootCommit) throw new Error("engineering execution root changed after its estimate")
+	const config = await validateRuntimeEvaluatorIntegrity(preview.execution.configs[0], options)
+	assertProofWorkerProfile(config, openRouterProfileById(preview.model.profileId ?? RSI_DEFAULT_OPENROUTER_PROFILE_ID), process.env)
 	const campaign = campaignId(preview.seeds.engineering)
-	const config = preview.execution.configs[0]
 	const runs: RsiRunRecord[] = []
 	for (const arm of ["fixed-control", "self-hosted"] as const) {
 		runs.push(await runEngineeringArm(config, campaign, arm, preview.rootCommit, preview.seeds.engineering, preview.runtime, runner))
@@ -384,12 +541,13 @@ export async function executeEngineeringPair(options: Options, env: NodeJS.Proce
 		schemaVersion: 1 as const, campaignId: campaign, rootCommit: preview.rootCommit,
 		manifestSha256: self.proofCampaign.manifestSha256, snapshotSha256: canonicalHash(snapshot), archiveDir: config.archiveDir,
 		arms: ([fixed, self] as const).map((run) => ({ runId: run.runId, armId: run.workerHarnessMode!, runSha256: canonicalHash(run), selectedCommit: run.workerHarnessMode === "self-hosted" ? selectedSelf.commits[0]! : run.candidates.find((candidate) => candidate.id === run.selected)?.commits[0] ?? run.baseCommit })),
+		...(preview.model.profileId ? { model: { requestedId: preview.model.requestedId, profileId: preview.model.profileId } } : {}),
 	}
 	const evidence: EngineeringEvidenceRecord = { ...body, digestSha256: canonicalHash(body) }
 	const outputPath = await assertSupervisorOnlyPlanPath(options.repo, options.output)
 	await fs.mkdir(path.dirname(outputPath), { recursive: true, mode: 0o700 })
 	try {
-		const existing = JSON.parse(await fs.readFile(outputPath, "utf8")) as EngineeringEvidenceRecord
+		const existing = JSON.parse((await readProtectedProofInput(options.repo, outputPath)).toString("utf8")) as EngineeringEvidenceRecord
 		const { digestSha256, ...existingBody } = existing
 		if (digestSha256 !== evidence.digestSha256 || canonicalHash(existingBody) !== evidence.digestSha256) throw new Error("existing engineering evidence differs from the verified completed pair")
 	} catch (error) {
@@ -401,12 +559,15 @@ export async function executeEngineeringPair(options: Options, env: NodeJS.Proce
 
 export async function buildFrozenProofPlan(options: Options, env: NodeJS.ProcessEnv = process.env, fetcher: typeof fetch = fetch): Promise<ReturnType<typeof freezeProofDemonstrationManifest>> {
 	if (options.command !== "plan") throw new Error("plan options are required")
+	requireEvaluatorIntegrityOptions(options)
 	const operatorCapUsd = parseUsd(options.operatorCapUsd)
 	if (!options.engineeringEvidencePath) throw new Error("final campaign plan requires --engineering-evidence from a completed development-only engineering pair")
 	const preview = await buildProofPlanPreview(options, env, fetcher)
+	await validateRuntimeEvaluatorIntegrity(preview.execution.configs[0], options)
 	if (operatorCapUsd < preview.plan.campaignRootsSpendCeilingUsd) throw new Error(`operator cap $${operatorCapUsd.toFixed(6)} is below required three-campaign root reservations $${preview.plan.campaignRootsSpendCeilingUsd.toFixed(6)}`)
 	const evidence = await verifyEngineeringEvidenceFile(options.engineeringEvidencePath, options.repo, preview.rootCommit)
 	if (evidence.record.campaignId !== preview.campaignIds.engineering) throw new Error("engineering evidence seed/campaign identity differs from the final plan")
+	assertEngineeringProfile(evidence.record, preview.model)
 	return freezeProofDemonstrationManifest({ ...preview, engineeringEvidence: { path: options.engineeringEvidencePath, sha256: evidence.fileSha256, campaignId: evidence.record.campaignId, rootCommit: evidence.record.rootCommit, manifestSha256: evidence.record.manifestSha256, snapshotSha256: evidence.record.snapshotSha256 }, operatorCapUsd })
 }
 
@@ -417,6 +578,7 @@ export async function verifyLiveFrozenProofPlan(manifest: ReturnType<typeof veri
 	if (loaded.manifestDigest !== manifest.benchmarkManifestSha256) throw new Error("benchmark manifest differs from the frozen plan")
 	const engineering = await verifyEngineeringEvidenceFile(manifest.engineeringEvidence.path, repo, manifest.rootCommit)
 	if (engineering.fileSha256 !== manifest.engineeringEvidence.sha256 || engineering.record.campaignId !== manifest.engineeringEvidence.campaignId || engineering.record.manifestSha256 !== manifest.engineeringEvidence.manifestSha256 || engineering.record.snapshotSha256 !== manifest.engineeringEvidence.snapshotSha256) throw new Error("engineering evidence bytes or ledger identity differ from the frozen final plan")
+	assertEngineeringProfile(engineering.record, manifest.model)
 	if (canonicalHash(await analysisDigest(repo)) !== canonicalHash(manifest.execution.analysisSourceSha256)) throw new Error("analysis or launcher source differs from the frozen plan")
 	const runtime = workerHarnessRuntimeIdentityFromEnvironment(env)
 	if (JSON.stringify(runtime) !== JSON.stringify(manifest.runtime)) throw new Error("fixed-control runtime identity differs from the frozen plan")
@@ -426,8 +588,10 @@ export async function verifyLiveFrozenProofPlan(manifest: ReturnType<typeof veri
 	if (canonicalHash(mutation) !== canonicalHash(manifest.execution.inferenceLimits.mutation) || canonicalHash(benchmark) !== canonicalHash(manifest.execution.inferenceLimits.benchmark)) throw new Error("broker limits or allocations differ from the frozen plan")
 	assertFrozenProofDemonstrationPlanMatches(manifest.plan, { config, manifest: loaded.manifest, mutationLimits: mutation, benchmarkLimits: benchmark })
 	const key = env.HEADLESSCODE_OPENROUTER_API_KEY?.trim() ?? ""
-	const price = await fetchPinnedOpenRouterEndpointPrice(key, fetcher)
-	if (price.model !== manifest.model.requestedId || price.provider !== manifest.endpointPrice.provider || price.inputPricePerMillionUsd > manifest.priceCeilingsPerMillionUsd.input || price.outputPricePerMillionUsd > manifest.priceCeilingsPerMillionUsd.output) throw new Error("live pinned endpoint price exceeds or differs from frozen plan ceilings")
+	const profile = openRouterProfileForModel(manifest.model.requestedId, manifest.model.profileId)
+	assertProofWorkerProfile(config, profile, env)
+	const price = await fetchOpenRouterEndpointPrice(profile, key, fetcher)
+	if (price.model !== manifest.model.requestedId || price.provider !== manifest.endpointPrice.provider || price.endpointTag !== manifest.endpointPrice.endpointTag || price.quantization !== manifest.endpointPrice.quantization || price.inputPricePerMillionUsd > manifest.priceCeilingsPerMillionUsd.input || price.outputPricePerMillionUsd > manifest.priceCeilingsPerMillionUsd.output) throw new Error("live pinned endpoint price exceeds or differs from frozen plan ceilings")
 }
 
 export async function runFrozenCampaignArm(
@@ -436,6 +600,7 @@ export async function runFrozenCampaignArm(
 	arm: "fixed-control" | "self-hosted",
 	phase: "development" | "confirmation",
 	runner: typeof runRsi = runRsi,
+	evaluatorIntegrityOptions?: EvaluatorIntegrityOptions,
 ): Promise<RsiRunRecord> {
 	const campaign = manifest.campaignIds.campaigns[campaignIndex]
 	const config = manifest.execution.configs[campaignIndex + 1]
@@ -446,20 +611,21 @@ export async function runFrozenCampaignArm(
 	if (matches.length > 1) throw new Error(`campaign ${campaign} has duplicate ${arm} archive identities`)
 	const existing = matches[0]
 	if (existing && (existing.runId !== runId || existing.baseCommit !== manifest.rootCommit || existing.workerHarnessSamplingSeed !== config.seed || existing.workerHarnessConfigDigest === undefined || existing.workerHarnessRuntime?.harnessCommit !== manifest.runtime.harnessCommit)) throw new Error(`campaign ${campaign}/${arm} differs from its frozen run identity`)
-	if (existing && (existing.workerHarnessPlannedGenerations !== config.generations || existing.model !== config.model || JSON.stringify(existing.workerHarnessRuntime) !== JSON.stringify(manifest.runtime))) throw new Error(`campaign ${campaign}/${arm} runtime, model, or generation count differs from the frozen plan`)
+	if (existing && (existing.workerHarnessPlannedGenerations !== config.generations || existing.model !== config.model || existing.openRouterProfileId !== manifest.model.profileId || JSON.stringify(existing.workerHarnessRuntime) !== JSON.stringify(manifest.runtime))) throw new Error(`campaign ${campaign}/${arm} runtime, model, or generation count differs from the frozen plan`)
 	if (existing) {
 		const frozen = existing.proofCampaign?.manifest
 		const expectedRuntime = { imageDigest: manifest.runtime.imageDigest, harnessCommit: manifest.runtime.harnessCommit, dependencyLockDigest: manifest.runtime.dependencyLockDigest }
 		const internal = new Set(["workerHarnessMode", "workerHarnessPhase", "workerHarnessEngineeringOnly", "workerHarnessPairId", "workerHarnessRunId", "resumeRunId", "candidateIdNamespace", "workerHarnessParentCommit", "workerHarnessSnapshotTreeDigest"])
 		const expectedConfig = Object.fromEntries(Object.entries(config).filter(([key]) => !internal.has(key)))
-		if (!frozen || frozen.phaseMode !== "paired-confirmation" || frozen.campaignId !== campaign || frozen.seed !== config.seed || frozen.rootCommit !== manifest.rootCommit || frozen.benchmarkDigests.manifest !== manifest.benchmarkManifestSha256 || existing.proofCampaign?.manifestSha256 !== proofCampaignManifestDigest(frozen) || JSON.stringify(frozen.runtime) !== JSON.stringify(expectedRuntime) || canonicalHash(frozen.settings.effectiveConfig) !== canonicalHash(expectedConfig) || frozen.model.id !== manifest.model.requestedId || frozen.model.provider !== manifest.model.provider) throw new Error(`campaign ${campaign}/${arm} frozen ledger manifest differs from the plan`)
+		if (!frozen || frozen.phaseMode !== "paired-confirmation" || frozen.campaignId !== campaign || frozen.seed !== config.seed || frozen.rootCommit !== manifest.rootCommit || frozen.benchmarkDigests.manifest !== manifest.benchmarkManifestSha256 || existing.proofCampaign?.manifestSha256 !== proofCampaignManifestDigest(frozen) || JSON.stringify(frozen.runtime) !== JSON.stringify(expectedRuntime) || canonicalHash(frozen.settings.effectiveConfig) !== canonicalHash(expectedConfig) || frozen.model.id !== manifest.model.requestedId || frozen.model.provider !== manifest.model.provider || frozen.model.profileId !== manifest.model.profileId) throw new Error(`campaign ${campaign}/${arm} frozen ledger manifest differs from the plan`)
 	}
 	const armRow = (existing?.proofCampaign?.ledgerSnapshot?.arms as Array<Record<string, unknown>> | undefined)?.find((row) => row.arm_id === arm)
 	if (phase === "development" && existing && armRow?.phase === "confirmation" && ["evaluated", "finished"].includes(existing.proofCampaign?.state ?? "")) return existing
 	if (phase === "confirmation" && existing && isFullyConfirmedRun(existing, arm)) return existing
 	if (existing && archive.runs.some((entry) => entry.runId === existing.runId) && phase === "development" && armRow?.phase !== "confirmation") throw new Error(`campaign ${campaign}/${arm} is archived before development completion; refusing duplicate execution`)
+	const runtimeConfig = evaluatorIntegrityOptions ? withRuntimeEvaluatorIntegrity(config, evaluatorIntegrityOptions) : config
 	const result = await runner({
-		...config, dryRun: false, workerHarnessRunId: runId,
+		...runtimeConfig, dryRun: false, workerHarnessRunId: runId,
 		...(existing ? { resumeRunId: existing.runId } : {}),
 		workerHarnessMode: arm, workerHarnessPhase: phase, workerHarnessPairId: campaign,
 		workerHarnessRuntime: manifest.runtime,
@@ -475,6 +641,9 @@ export function isFullyConfirmedRun(run: RsiRunRecord, armId: "fixed-control" | 
 	const campaign = run.proofCampaign
 	const snapshot = campaign?.ledgerSnapshot
 	const manifest = campaign?.manifest
+	let expectedProfile
+	try { expectedProfile = manifest?.model ? openRouterProfileForModel(manifest.model.id, manifest.model.profileId) : openRouterProfileById(RSI_DEFAULT_OPENROUTER_PROFILE_ID) }
+	catch { return false }
 	const arm = (snapshot?.arms as Array<Record<string, unknown>> | undefined)?.find((entry) => entry.arm_id === armId)
 	const campaignRow = snapshot?.campaign as Record<string, unknown> | undefined
 	const scheduled = manifest?.schedule.filter((cell) => cell.armId === armId && cell.phase === "confirmation") ?? []
@@ -493,7 +662,7 @@ export function isFullyConfirmedRun(run: RsiRunRecord, armId: "fixed-control" | 
 			if (matching.length !== 1 || rows[0]?.result_sha256 !== sha256(JSON.stringify(matching[0]))) return false
 			const attempt = matching[0]!
 			const expectedCommit = cell.candidateId === "root-control" ? run.proofConfirmation.rootHarness.commit : selected.commit
-			if (attempt.taskId !== cell.taskId || attempt.seed !== Number(cell.seed) || attempt.harnessCommit !== expectedCommit || attempt.validity !== "valid" || attempt.proofQualified !== true || attempt.resourceAccounting !== "supervisor-enforced" || attempt.inferenceReceipt?.qualified !== true || attempt.inferenceReceipt.endpointProvider !== "deepinfra" || attempt.inferenceReceipt.returnedProviders?.length !== 1 || attempt.inferenceReceipt.returnedProviders[0] !== "deepinfra") return false
+			if (attempt.taskId !== cell.taskId || attempt.seed !== Number(cell.seed) || attempt.harnessCommit !== expectedCommit || attempt.validity !== "valid" || attempt.proofQualified !== true || attempt.resourceAccounting !== "supervisor-enforced" || attempt.inferenceReceipt?.qualified !== true || attempt.inferenceReceipt.model !== expectedProfile.model || attempt.inferenceReceipt.returnedModels.length !== 1 || !expectedProfile.returnedModels.includes(attempt.inferenceReceipt.returnedModels[0]!) || attempt.inferenceReceipt.endpointProvider !== expectedProfile.endpointProvider || attempt.inferenceReceipt.returnedProviders?.length !== 1 || attempt.inferenceReceipt.returnedProviders[0] !== expectedProfile.endpointProvider) return false
 			const savedRefs = rows[0]?.artifact_refs as Record<string, { sha256?: string }> | undefined
 			if (!savedRefs || Object.entries(attempt.artifactRefs).some(([name, digest]) => savedRefs[name]?.sha256 !== digest)) return false
 		}
@@ -504,22 +673,26 @@ export function isFullyConfirmedRun(run: RsiRunRecord, armId: "fixed-control" | 
 	const artifacts = new Map(run.confirmationAttempts.map((attempt) => [attempt.attemptId, attempt]))
 	return requiredIds.every((id) => {
 		const attempt = artifacts.get(id)
-		return attempt?.validity === "valid" && attempt.proofQualified === true && attempt.inferenceReceipt?.qualified === true && attempt.inferenceReceipt.returnedProviders?.every((provider) => provider === "deepinfra") === true
+		return attempt?.validity === "valid" && attempt.proofQualified === true && attempt.inferenceReceipt?.qualified === true && attempt.inferenceReceipt.model === expectedProfile.model && attempt.inferenceReceipt.returnedModels.length === 1 && expectedProfile.returnedModels.includes(attempt.inferenceReceipt.returnedModels[0]!) && attempt.inferenceReceipt.endpointProvider === expectedProfile.endpointProvider && attempt.inferenceReceipt.returnedProviders?.every((provider) => provider === expectedProfile.endpointProvider) === true
 	})
 }
 
 export async function executeFrozenCampaigns(options: Options, env: NodeJS.ProcessEnv = process.env, runner: typeof runRsi = runRsi): Promise<void> {
 	if (options.command !== "execute" || !options.execute) throw new Error("campaign execution requires execute command and explicit --execute")
 	if (env !== process.env || runner !== runRsi) throw new Error("paid campaign execution only accepts the validated process environment and production runner")
+	const trustOptions = requireEvaluatorIntegrityOptions(options)
 	if (!options.planPath) throw new Error("--plan is required for campaign execution")
-	const safePath = await assertSupervisorOnlyPlanPath(options.repo, options.planPath)
-	const manifest = verifyFrozenProofDemonstrationManifest(JSON.parse(await fs.readFile(safePath, "utf8")) as unknown)
+	const manifest = verifyFrozenProofDemonstrationManifest(JSON.parse((await readProtectedProofInput(options.repo, options.planPath)).toString("utf8")) as unknown)
+	const frozenPin = manifest.execution.configs[0]?.evaluatorTrustedKeySha256
+	if (!frozenPin || manifest.execution.configs.some((config) => config.evaluatorTrustedKeySha256 !== frozenPin)) throw new Error("frozen proof plan does not contain one consistent evaluator trust pin")
+	if (trustOptions.evaluatorTrustedKeySha256 !== frozenPin) throw new Error("execution evaluator trust pin differs from the frozen proof plan")
+	await validateRuntimeEvaluatorIntegrity(manifest.execution.configs[0]!, trustOptions)
 	const cap = parseUsd(options.operatorCapUsd)
 	if (Math.abs(cap - manifest.operatorCapUsd) > 0.000001) throw new Error("execution operator cap must exactly match the frozen plan cap")
 	await verifyLiveFrozenProofPlan(manifest, env)
 	for (let campaignIndex = 0; campaignIndex < 3; campaignIndex++) {
-		for (const arm of ["fixed-control", "self-hosted"] as const) await runFrozenCampaignArm(manifest, campaignIndex, arm, "development")
-		for (const arm of ["fixed-control", "self-hosted"] as const) await runFrozenCampaignArm(manifest, campaignIndex, arm, "confirmation")
+		for (const arm of ["fixed-control", "self-hosted"] as const) await runFrozenCampaignArm(manifest, campaignIndex, arm, "development", runRsi, trustOptions)
+		for (const arm of ["fixed-control", "self-hosted"] as const) await runFrozenCampaignArm(manifest, campaignIndex, arm, "confirmation", runRsi, trustOptions)
 	}
 	process.stdout.write(`All three frozen paired campaigns reached terminal confirmation state. No analysis verdict has been issued; run analyze against the frozen plan and archive.\n`)
 }
@@ -527,7 +700,7 @@ export async function executeFrozenCampaigns(options: Options, env: NodeJS.Proce
 export async function proofDemonstrationPlanMain(argv = process.argv.slice(2)): Promise<number> {
 	if (argv.includes("--help") || argv.includes("-h")) { process.stdout.write(usage()); return 0 }
 	try {
-		const options = parse(argv)
+		const options = parseProofDemonstrationArgs(argv)
 		if (options.command === "estimate") {
 			process.stdout.write(`${formatPlan(await buildProofPlanPreview(options))}\n`)
 			return 0
@@ -544,8 +717,7 @@ export async function proofDemonstrationPlanMain(argv = process.argv.slice(2)): 
 		if (options.command === "verify" || options.command === "analyze") {
 			const requestedPlanPath = options.planPath ?? (options.command === "verify" ? options.output : undefined)
 			if (!requestedPlanPath) throw new Error("--plan is required")
-			const safePath = await assertSupervisorOnlyPlanPath(options.repo, requestedPlanPath)
-			const parsed = JSON.parse(await fs.readFile(safePath, "utf8")) as unknown
+			const parsed = JSON.parse((await readProtectedProofInput(options.repo, requestedPlanPath)).toString("utf8")) as unknown
 			const manifest = verifyFrozenProofDemonstrationManifest(parsed)
 			if (options.command === "verify") {
 				await verifyLiveFrozenProofPlan(manifest)
@@ -555,6 +727,7 @@ export async function proofDemonstrationPlanMain(argv = process.argv.slice(2)): 
 			if (!options.archiveDir) throw new Error("--archive is required")
 			const engineering = await verifyEngineeringEvidenceFile(manifest.engineeringEvidence.path, options.repo, manifest.rootCommit)
 			if (engineering.fileSha256 !== manifest.engineeringEvidence.sha256 || engineering.record.campaignId !== manifest.engineeringEvidence.campaignId || engineering.record.manifestSha256 !== manifest.engineeringEvidence.manifestSha256 || engineering.record.snapshotSha256 !== manifest.engineeringEvidence.snapshotSha256) throw new Error("engineering gate evidence no longer matches the frozen final plan")
+			assertEngineeringProfile(engineering.record, manifest.model)
 			if (canonicalHash(await analysisDigest(options.repo)) !== canonicalHash(manifest.execution.analysisSourceSha256)) throw new Error("analysis source differs from the frozen manifest")
 			const archive = await readArchive(options.archiveDir)
 			const campaignIds = new Set(manifest.campaignIds.campaigns)

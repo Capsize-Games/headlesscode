@@ -81,6 +81,7 @@ import { resolveContainedRuntimeProfile, resolveSecurityProfile, serializeResolv
 import { containedControlSocketDirectory, containedControlStateDirectory, containedEvidenceSessionId, loadContainedSupervisorRuntime, validateContainedSupervisorRoots } from "../security/supervisor.js"
 import { runPreflight, runLocalPreflight, runMusePreflight, type PreflightResult, type LocalPreflightResult } from "../llm/preflight.js"
 import { resolvePerModeEnv } from "../cli.js"
+import { isMuseModelIdentifier, museUnsupportedSettingsReason, type AgentExecutor } from "../agent-executor.js"
 
 const ORCHESTRATE_USAGE = `headlesscode orchestrate — Phase 2 parallel round
 
@@ -99,9 +100,12 @@ Options:
                          write to GitHub — opt-in, never automatic.
                          Requires --issues-json (nothing to file otherwise)
   --mode <slug>          Harness mode for workers (default: code)
-  --model <id>           Explicit model override for workers + reviewer + QA
-                         (beats .headlesscode/mode-models.json entries). Without
-                         it, each role resolves its OWN model from the file:
+  --executor <builtin|muse>  Agent implementation for each worker (default: builtin)
+  --muse-model <id>      Native Muse Meta model id (requires --executor muse)
+  --model <id>           Explicit HeadlessCode model override for built-in workers
+                         + reviewer + QA (beats mode-models.json). With --executor
+                         muse, this applies only to reviewer/QA. Without it,
+                         built-in roles resolve their OWN model from the file:
                          worker mode / --review-mode / --qa-mode
                          (default: $OPENROUTER_MODEL or the client default;
                          $HEADLESSCODE_MUSE_MODEL under HEADLESSCODE_LLM_PROVIDER=muse)
@@ -220,6 +224,8 @@ interface OrchestrateOptions {
 	 */
 	fileIssues: boolean
 	mode: string
+	executor?: AgentExecutor
+	museModel?: string
 	model?: string
 	batch?: string
 	reviewMode: string
@@ -320,6 +326,8 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 		issues: [],
 		executionProvider: process.env.HEADLESSCODE_EXECUTION_PROVIDER === "openshell" ? "openshell" : "local",
 		mode: process.env.ORCHESTRATOR_MODE ?? "code",
+		executor: undefined,
+		museModel: undefined,
 		reviewMode: "deepseek-reviewer",
 		review: true,
 		qa: false,
@@ -359,6 +367,18 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 		}
 
 			switch (flag) {
+			case "--executor": {
+				const v = next()
+				if (v !== "builtin" && v !== "muse") return { options, error: "--executor must be builtin or muse" }
+				options.executor = v
+				break
+			}
+			case "--muse-model": {
+				const v = next()
+				if (v === undefined || !isMuseModelIdentifier(v)) return { options, error: "--muse-model requires a valid native Muse model identifier" }
+				options.museModel = v
+				break
+			}
 			case "--security-profile": {
 				const v = next()
 				try { options.securityProfile = resolveSecurityProfile(v) }
@@ -563,6 +583,17 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 	if (!options.securityProfile) {
 		try { options.securityProfile = resolveSecurityProfile(process.env.HEADLESSCODE_SECURITY_PROFILE) }
 		catch (error) { return { options, error: error instanceof Error ? error.message : String(error) } }
+	}
+	if (options.executor === "muse") {
+		if (options.executionProvider !== "local") return { options, error: "Muse executor requires --execution-provider local" }
+		if (options.securityProfile === "contained") return { options, error: "Muse executor cannot run under the contained OpenShell security profile" }
+		if (options.mode !== "code") return { options, error: "Muse executor does not implement HeadlessCode modes; use --mode code" }
+		if (options.planFirst) return { options, error: "Muse executor cannot be combined with --plan-first" }
+		if (options.preflight) return { options, error: "Muse executor cannot use the OpenRouter preflight; pass --no-preflight explicitly" }
+		const unsupported = museUnsupportedSettingsReason(options.memoryDir)
+		if (unsupported) return { options, error: unsupported }
+	} else if (options.museModel) {
+		return { options, error: "--muse-model requires --executor muse" }
 	}
 	if (options.securityProfile === "contained") {
 		if (options.executionProvider === "local" && argv.some((arg) => arg === "--execution-provider" || arg.startsWith("--execution-provider="))) return { options, error: "contained security profile cannot use the local execution provider" }
@@ -1285,6 +1316,19 @@ export interface ReworkDecision {
 	spawnCommand?: string
 }
 
+function quoteShellArg(value: string): string {
+	return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+/** Re-spawns take executor selection from durable group state, never current defaults. */
+function workerSelectionArgs(group: OrchestratorGroup): string {
+	const executor = group.executor ?? "builtin"
+	if (executor !== "builtin" && executor !== "muse") throw new Error(`group ${group.name} has unknown executor '${String(executor)}'`)
+	if (group.museModel && !isMuseModelIdentifier(group.museModel)) throw new Error(`group ${group.name} has an invalid persisted Muse model`)
+	if (group.museModel && executor !== "muse") throw new Error(`group ${group.name} has a Muse model but executor '${executor}'`)
+	return ` --executor ${quoteShellArg(executor)}` + (group.museModel ? ` --muse-model ${quoteShellArg(group.museModel)}` : "")
+}
+
 /**
  * Decide what to do after a review "finding" verdict, and build the pieces the
  * caller needs (state patch, task file, spawn command). Extracted from the
@@ -1318,9 +1362,10 @@ export function handleReviewVerdict(
 		const worktreePath = groupWorktreePath(repo, group)
 		const spawnCommand =
 			`bash ${path.join(HARNESS_ROOT_TS, "scripts", "run-worker.sh")} ` +
-			`"${worktreePath}" "${taskFilePath}" --mode "${mode}"` +
-			(model ? ` --model "${model}"` : "") +
-			(maxIterations !== undefined ? ` --max-iterations "${maxIterations}"` : "")
+			`${quoteShellArg(worktreePath)} ${quoteShellArg(taskFilePath)} --mode ${quoteShellArg(mode)}` +
+			workerSelectionArgs(group) +
+			(model ? ` --model ${quoteShellArg(model)}` : "") +
+			(maxIterations !== undefined ? ` --max-iterations ${quoteShellArg(String(maxIterations))}` : "")
 		return {
 			shouldSpawn: true,
 			newReworkCount,
@@ -1408,9 +1453,10 @@ export function handleQaVerdict(
 		const worktreePath = groupWorktreePath(repo, group)
 		const spawnCommand =
 			`bash ${path.join(HARNESS_ROOT_TS, "scripts", "run-worker.sh")} ` +
-			`"${worktreePath}" "${taskFilePath}" --mode "${mode}"` +
-			(model ? ` --model "${model}"` : "") +
-			(maxIterations !== undefined ? ` --max-iterations "${maxIterations}"` : "")
+			`${quoteShellArg(worktreePath)} ${quoteShellArg(taskFilePath)} --mode ${quoteShellArg(mode)}` +
+			workerSelectionArgs(group) +
+			(model ? ` --model ${quoteShellArg(model)}` : "") +
+			(maxIterations !== undefined ? ` --max-iterations ${quoteShellArg(String(maxIterations))}` : "")
 		return {
 			shouldSpawn: true,
 			newReworkCount,
@@ -1591,9 +1637,10 @@ export function handleIterationExhaustion(
 		const taskContent = buildContinuationTaskFileContent(group, newContinuationCount, group.issueBodies, handoffSummary)
 		const spawnCommand =
 			`bash ${path.join(HARNESS_ROOT_TS, "scripts", "run-worker.sh")} ` +
-			`"${worktreePath}" "${taskFilePath}" --mode "${mode}"` +
-			(model ? ` --model "${model}"` : "") +
-			(maxIterations !== undefined ? ` --max-iterations "${maxIterations}"` : "")
+			`${quoteShellArg(worktreePath)} ${quoteShellArg(taskFilePath)} --mode ${quoteShellArg(mode)}` +
+			workerSelectionArgs(group) +
+			(model ? ` --model ${quoteShellArg(model)}` : "") +
+			(maxIterations !== undefined ? ` --max-iterations ${quoteShellArg(String(maxIterations))}` : "")
 		return {
 			shouldSpawn: true,
 			newContinuationCount,
@@ -1652,6 +1699,8 @@ export interface BuildSpawnEnvOptions {
 	repo: string
 	/** Harness mode for the workers (e.g. "code"). */
 	mode: string
+	executor?: AgentExecutor
+	museModel?: string
 	executionProvider?: "local" | "openshell"
 	/** An explicit --model flag value, if the caller passed one — always wins (resolveModelForMode rule 1). */
 	explicitModel?: string
@@ -1678,7 +1727,8 @@ export interface BuildSpawnEnvOptions {
  * returned workerModel is the SAME const the rework loop reuses later.
  */
 export function buildSpawnEnv(options: BuildSpawnEnvOptions): { env: NodeJS.ProcessEnv; workerModel: string | undefined } {
-	const workerModel = resolveModelForMode({
+	const executor = options.executor ?? "builtin"
+	const workerModel = executor === "muse" ? undefined : resolveModelForMode({
 		workspaceRoot: options.repo,
 		mode: options.mode,
 		explicitModel: options.explicitModel,
@@ -1689,12 +1739,14 @@ export function buildSpawnEnv(options: BuildSpawnEnvOptions): { env: NodeJS.Proc
 		...(options.env ?? process.env),
 		TARGET_REPO: options.repo,
 		ORCHESTRATOR_MODE: options.mode,
+		HEADLESSCODE_AGENT_EXECUTOR: executor,
 		HEADLESSCODE_EXECUTION_PROVIDER: options.executionProvider ?? process.env.HEADLESSCODE_EXECUTION_PROVIDER ?? "local",
 		// The resolved worker model must reach the spawner (and the workers it
 		// launches) — same pattern as HEADLESSCODE_PROJECT below. Exported to
 		// the PROVIDER's default-model var: the spawn script re-resolves via
 		// resolveModelForMode (whose rule 4 shadows OPENROUTER_MODEL under
 		// "muse"), so exporting a muse id as OPENROUTER_MODEL would strand it.
+		HEADLESSCODE_NATIVE_MUSE_MODEL: executor === "muse" ? options.museModel ?? "" : "",
 		...(workerModel ? (provider === "muse" ? { [MUSE_MODEL_ENV]: workerModel } : { OPENROUTER_MODEL: workerModel }) : {}),
 		// Phase 3: workers scope memory to the REPO (not the worktree) and
 		// share one memory dir. HEADLESSCODE_PROJECT flows to the worker CLI
@@ -1764,6 +1816,8 @@ function printPlan(
 	estimateSection?: string[],
 	/** Issue #49: plan-first session info to surface on the dry-run plan. */
 	planFirst?: { mode: string; maxIterations: number },
+	executor: AgentExecutor = "builtin",
+	museModel?: string,
 ): void {
 	// Shape labels come from split.ts's issueShape (the SAME taxonomy the
 	// split and the cost estimate use) — a single source of truth instead of
@@ -1779,6 +1833,7 @@ function printPlan(
 	process.stdout.write("── Orchestrate plan (dry run) ─────────────────────────────\n")
 	process.stdout.write(`  repo:     ${repo}\n`)
 	process.stdout.write(`  mode:     ${mode}\n`)
+	process.stdout.write(`  executor: ${executor}${executor === "muse" ? ` (native Meta model ${museModel ?? "<Muse default>"})` : ""}\n`)
 	if (planFirst) {
 		process.stdout.write(
 			`  plan-first: mode ${planFirst.mode}, max ${planFirst.maxIterations} iterations per worktree ` +
@@ -2816,18 +2871,21 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		}
 		const estimateSection = buildEstimateSection(estimateGroups(historyRecords, specs, issues), historyRecords.length)
 		printPlan(repo, options.mode, specs, issues, {
-			worker: previewModel(options.mode),
+			worker: options.executor === "muse" ? `Muse Meta (${options.museModel ?? "CLI default"})` : previewModel(options.mode),
 			reviewer: previewModel(options.reviewMode),
 			qa: previewModel(options.qaMode),
 		}, options.maxIterations, estimateSection,
 			options.planFirst
 				? { mode: options.planFirstMode, maxIterations: options.planFirstMaxIterations }
 				: undefined,
+			options.executor ?? "builtin",
+			options.museModel,
 		)
 		return 0
 	}
 
-	if (!process.env.HEADLESSCODE_OPENROUTER_API_KEY) {
+	const needsOpenRouter = options.executor !== "muse" || options.review || options.qa || (options.issueSizeCheck && options.autoSplit)
+	if (needsOpenRouter && !process.env.HEADLESSCODE_OPENROUTER_API_KEY) {
 		process.stderr.write(
 			"headlesscode orchestrate: HEADLESSCODE_OPENROUTER_API_KEY is not set (workers + reviewer need it).\n" +
 				"  Use --dry-run to preview the plan without an API key.\n",
@@ -2960,6 +3018,8 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	const { env: spawnEnv, workerModel } = buildSpawnEnv({
 		repo,
 		mode: options.mode,
+		executor: options.executor,
+		museModel: options.museModel,
 		executionProvider: options.executionProvider,
 		explicitModel: options.model,
 		memoryDir: options.memoryDir,
@@ -3142,6 +3202,8 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 						env: {
 							...process.env,
 							HEADLESSCODE_EXECUTION_PROVIDER: options.executionProvider,
+							HEADLESSCODE_AGENT_EXECUTOR: group.executor ?? "builtin",
+							HEADLESSCODE_NATIVE_MUSE_MODEL: group.executor === "muse" ? group.museModel ?? "" : "",
 							HEADLESSCODE_ROOT: HARNESS_ROOT_TS,
 							...(options.memoryDir ? { HEADLESSCODE_MEMORY_DIR: path.resolve(options.memoryDir) } : {}),
 						},
@@ -3332,6 +3394,8 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 							env: {
 								...process.env,
 								HEADLESSCODE_EXECUTION_PROVIDER: options.executionProvider,
+								HEADLESSCODE_AGENT_EXECUTOR: group.executor ?? "builtin",
+								HEADLESSCODE_NATIVE_MUSE_MODEL: group.executor === "muse" ? group.museModel ?? "" : "",
 								HEADLESSCODE_ROOT: HARNESS_ROOT_TS,
 								...(options.memoryDir ? { HEADLESSCODE_MEMORY_DIR: path.resolve(options.memoryDir) } : {}),
 							},
@@ -3488,6 +3552,8 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 							env: {
 								...process.env,
 								HEADLESSCODE_EXECUTION_PROVIDER: options.executionProvider,
+								HEADLESSCODE_AGENT_EXECUTOR: group.executor ?? "builtin",
+								HEADLESSCODE_NATIVE_MUSE_MODEL: group.executor === "muse" ? group.museModel ?? "" : "",
 								HEADLESSCODE_ROOT: HARNESS_ROOT_TS,
 								...(options.memoryDir ? { HEADLESSCODE_MEMORY_DIR: path.resolve(options.memoryDir) } : {}),
 							},

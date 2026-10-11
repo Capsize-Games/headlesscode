@@ -15,16 +15,25 @@ import { openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID } from "./
 import { effectiveWorkerHarnessMode, workerHarnessCliPath, validWorkerHarnessRuntimeIdentity } from "./worker-harness.js"
 import { mutationSnapshotProtectedPathViolations } from "./sandbox.js"
 import type { EmergencyControl } from "../control/emergency-controller.js"
+import { evaluatorImageReference, resolveEvaluatorPolicySha256, resolveEvaluatorRuntimeIdentity, snapshotEvaluatorPolicy, type EvaluatorRuntimeIdentity } from "./evaluator-runtime.js"
 
 const POLICY_PATH = fileURLToPath(new URL("../../shared/openshell/headlesscode-policy.yaml", import.meta.url))
 const MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024
 const MAX_BUNDLE_BYTES = 2 * 1024 * 1024 * 1024
 const IMAGE_DEPENDENCIES_LINK = "node_modules"
-const RSI_OPENSHELL_IMAGE = "headlesscode-openshell-rsi:local"
+export const RSI_OPENSHELL_IMAGE = "headlesscode-openshell-rsi:local"
 const RSI_TRAINING_OPENSHELL_IMAGE = "headlesscode-openshell-rsi-training:local"
 export const RSI_CPU_MODEL_EVALUATION_MAX_CHECKPOINT_BYTES = 2 * 1024 * 1024 * 1024
 const OPENSHELL_INITIAL_CONFIG_SETTLE_MS = 15_000
 const MUTATION_FAILURE_DIAGNOSTIC_CHARS = 3000
+
+export function resolveRsiEvaluatorRuntimeIdentity(env: NodeJS.ProcessEnv = process.env, synthetic = false): Promise<EvaluatorRuntimeIdentity> {
+	return resolveEvaluatorRuntimeIdentity({ defaultPolicyPath: POLICY_PATH, env, synthetic })
+}
+
+export function resolveRsiEvaluatorPolicySha256(env: NodeJS.ProcessEnv = process.env): Promise<string> {
+	return resolveEvaluatorPolicySha256(POLICY_PATH, env)
+}
 
 function mutationFailureDiagnostic(detail: string): string {
 	if (detail.length <= MUTATION_FAILURE_DIAGNOSTIC_CHARS) return detail
@@ -78,6 +87,7 @@ export interface IsolatedRunOptions {
 	providerFactory?: RsiOpenShellProviderFactory
 	inferenceBroker?: RsiInferenceBrokerAccess
 	expectedSnapshotTreeDigest?: string
+	evaluatorPolicySha256?: string
 }
 
 function execFileBuffer(command: string, args: string[], options: { cwd?: string; input?: Buffer | string } = {}): Buffer {
@@ -96,7 +106,7 @@ function pathIsSafe(relativePath: string): boolean {
 
 function alwaysOmit(relativePath: string): boolean {
 	const normalized = relativePath.replaceAll("\\", "/")
-	return normalized.startsWith("__headlesscode_rsi_adversarial__/") || findMatchingPattern(normalized, [...DEFAULT_PROTECTED_FILES, ".headlesscode/", ".worktrees/", "node_modules/", "src/rsi/", "scripts/eval-suite/", "fixtures/rsi-benchmark/", "__rsi_benchmark_verifier__/"]) !== null
+	return normalized.startsWith("__headlesscode_rsi_adversarial__/") || findMatchingPattern(normalized, [...DEFAULT_PROTECTED_FILES, "shared/openshell/headlesscode-policy.yaml", ".headlesscode/", ".worktrees/", "node_modules/", "src/rsi/", "scripts/eval-suite/", "fixtures/rsi-benchmark/", "__rsi_benchmark_verifier__/"]) !== null
 }
 
 function shouldInclude(relativePath: string, mode: IsolatedRunOptions["mode"], config: RsiConfig): boolean {
@@ -416,7 +426,7 @@ export function inspectLocalRsiCheckpoint(configuredBase: string, mode: Isolated
 	return { path: source, files, bytes }
 }
 
-function providerOptions(config: RsiConfig, mode: IsolatedRunOptions["mode"], timeoutMs: number, imageReference?: string, inferenceBroker?: RsiInferenceBrokerAccess, signal?: AbortSignal, control?: IsolatedRunOptions["control"], cpu?: string, memory?: string): OpenShellSessionProviderOptions {
+function providerOptions(config: RsiConfig, mode: IsolatedRunOptions["mode"], timeoutMs: number, imageReference?: string, inferenceBroker?: RsiInferenceBrokerAccess, signal?: AbortSignal, control?: IsolatedRunOptions["control"], cpu?: string, memory?: string, policySnapshotPath?: string): OpenShellSessionProviderOptions {
 	const policy = process.env.HEADLESSCODE_OPENSHELL_POLICY ?? POLICY_PATH
 	const configuredImage = process.env.HEADLESSCODE_OPENSHELL_IMAGE?.trim()
 	const trainingMode = mode === "training" || mode === "model-evaluation"
@@ -433,7 +443,7 @@ function providerOptions(config: RsiConfig, mode: IsolatedRunOptions["mode"], ti
 	}
 	return {
 		image: imageReference ?? defaultImage,
-		policy,
+		policy: policySnapshotPath ?? policy,
 		providers: [],
 		autoProviders: false,
 		importResults: true,
@@ -546,9 +556,18 @@ async function runSnapshot(options: IsolatedRunOptions & { preserveSnapshot?: bo
 		throw new Error("RSI evaluation command refers to supervisor-only evaluation material")
 	}
 	const name = options.sessionName ?? `rsi-${options.mode}-${randomUUID().slice(0, 12)}`
+	if (options.evaluatorPolicySha256) {
+		const policySource = path.resolve(process.env.HEADLESSCODE_OPENSHELL_POLICY?.trim() || POLICY_PATH)
+		const sourceRoot = path.resolve(options.sourceRoot)
+		if (policySource !== path.resolve(POLICY_PATH) && (policySource === sourceRoot || policySource.startsWith(sourceRoot + path.sep))) {
+			throw new Error("effective evaluator policy must remain outside the guest source snapshot")
+		}
+	}
 	const snapshot = path.join(options.config.repoRoot, ".worktrees", name)
 	fs.mkdirSync(path.dirname(snapshot), { recursive: true })
+	let snapshotCreated = false
 	const snapshotBase = initializeSnapshot(options.sourceRoot, options.commit, snapshot, options.mode, options.config)
+	snapshotCreated = true
 	if (options.extraFiles && Object.keys(options.extraFiles).length > 0) {
 		for (const [relativePath, content] of Object.entries(options.extraFiles)) {
 			if (!pathIsSafe(relativePath)) throw new Error(`OpenShell evaluation input has an unsafe path: ${relativePath}`)
@@ -563,8 +582,23 @@ async function runSnapshot(options: IsolatedRunOptions & { preserveSnapshot?: bo
 	if (options.expectedSnapshotTreeDigest && snapshotTreeDigest !== options.expectedSnapshotTreeDigest) {
 		throw new Error("worker sanitized snapshot tree digest differs from the frozen fleet job identity")
 	}
-	const factory = options.providerFactory ?? ((providerConfig) => new OpenShellSessionProvider(providerConfig))
-	const provider = factory(providerOptions(options.config, options.mode, options.timeoutMs, options.image, options.inferenceBroker, options.signal, options.control, options.cpu, options.memory))
+	let policySnapshotDirectory: string | undefined
+	let provider: ReturnType<RsiOpenShellProviderFactory>
+	try {
+		let policySnapshotPath: string | undefined
+		if (options.evaluatorPolicySha256) {
+			const policy = await snapshotEvaluatorPolicy(options.evaluatorPolicySha256, POLICY_PATH)
+			policySnapshotDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "headlesscode-rsi-evaluator-policy-"))
+			policySnapshotPath = path.join(policySnapshotDirectory, "policy.yaml")
+			fs.writeFileSync(policySnapshotPath, policy, { mode: 0o400, flag: "wx" })
+		}
+		const factory = options.providerFactory ?? ((providerConfig) => new OpenShellSessionProvider(providerConfig))
+		provider = factory(providerOptions(options.config, options.mode, options.timeoutMs, options.image, options.inferenceBroker, options.signal, options.control, options.cpu, options.memory, policySnapshotPath))
+	} catch (error) {
+		if (policySnapshotDirectory) fs.rmSync(policySnapshotDirectory, { recursive: true, force: true })
+		if (snapshotCreated && !options.preserveSnapshot && options.mode !== "mutation" && !fs.existsSync(path.join(snapshot, ".harness.openshell-sandbox"))) fs.rmSync(snapshot, { recursive: true, force: true })
+		throw error
+	}
 	const request = makeRequest(options.config.repoRoot, name, options.env ?? {})
 	let handle: SessionHandle | undefined
 	let unregisterCleanup: (() => void) | undefined
@@ -610,6 +644,7 @@ async function runSnapshot(options: IsolatedRunOptions & { preserveSnapshot?: bo
 			if (handle) await provider.teardown(handle)
 			teardownVerified = !!handle
 		} finally {
+			if (policySnapshotDirectory) fs.rmSync(policySnapshotDirectory, { recursive: true, force: true })
 			if (teardownVerified) {
 				unregisterCleanup?.()
 				if (handle?.containerId) await options.control?.releaseResource(`openshell:${handle.containerId}`)
@@ -830,13 +865,16 @@ function mutationTask(candidate: CandidateRecord, config: RsiConfig): string {
 	].filter(Boolean).join("\n\n")
 }
 
-export function createOpenShellCommandRunner(config: RsiConfig): CommandRunner {
+export function createOpenShellCommandRunner(config: RsiConfig, evaluatorRuntime?: EvaluatorRuntimeIdentity): CommandRunner {
 	return async (command, cwd, timeoutMs, env) => {
 		const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim()
 		const safeEnv: Record<string, string> = {}
 		if (env?.HEADLESSCODE_RSI_CANDIDATE_ROOT) safeEnv.HEADLESSCODE_RSI_CANDIDATE_ROOT = "/workspace"
 		try {
-			const isolated = await runSnapshot({ config, sourceRoot: cwd, commit, command, timeoutMs, mode: "evaluation", env: safeEnv })
+			const isolated = await runSnapshot({
+				config, sourceRoot: cwd, commit, command, timeoutMs, mode: "evaluation", env: safeEnv,
+				...(evaluatorRuntime ? { image: evaluatorImageReference(evaluatorRuntime.imageDigest), evaluatorPolicySha256: evaluatorRuntime.policySha256 } : {}),
+			})
 			return isolated.result
 		} catch (error) {
 			return { ok: false, command, exitCode: null, durationMs: 0, stdout: "", stderr: error instanceof Error ? error.message : String(error) }
@@ -845,23 +883,26 @@ export function createOpenShellCommandRunner(config: RsiConfig): CommandRunner {
 }
 
 /** Execute only visible candidate checks inside a fresh OpenShell guest. */
-export async function runOpenShellEvaluation(candidate: CandidateRecord, config: RsiConfig, signal?: AbortSignal, control?: IsolatedRunOptions["control"]): Promise<{ regression: TrialResult; typecheck: TrialResult; visible: TrialResult[] }> {
+export async function runOpenShellEvaluation(candidate: CandidateRecord, config: RsiConfig, signal?: AbortSignal, control?: IsolatedRunOptions["control"], evaluatorRuntime?: Pick<EvaluatorRuntimeIdentity, "imageDigest" | "policySha256">, providerFactory?: RsiOpenShellProviderFactory): Promise<{ regression: TrialResult; typecheck: TrialResult; visible: TrialResult[] }> {
 	if (config.hiddenEvalCommands.length > 0) throw new Error("hidden RSI evaluation is supervisor-only and cannot be submitted as a worker job")
+	if (!evaluatorRuntime || !/^sha256:[a-f0-9]{64}$/.test(evaluatorRuntime.imageDigest) || !/^[a-f0-9]{64}$/.test(evaluatorRuntime.policySha256)) throw new Error("OpenShell evaluation job lacks its frozen evaluator image and policy identity")
 	const commands = [config.regressionCommand, "npm run typecheck", ...config.evalCommands]
 	const results: TrialResult[] = []
 	for (const command of commands) {
 		if (signal?.aborted) throw signal.reason ?? new Error("RSI job cancelled")
-		const isolated = await runSnapshot({ config, sourceRoot: candidate.worktree, commit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: candidate.worktree, encoding: "utf8" }).trim(), command, timeoutMs: config.commandTimeoutMs, mode: "evaluation", signal, control })
+		const isolated = await runSnapshot({ config, sourceRoot: candidate.worktree, commit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: candidate.worktree, encoding: "utf8" }).trim(), command, timeoutMs: config.commandTimeoutMs, mode: "evaluation", signal, control, image: evaluatorImageReference(evaluatorRuntime.imageDigest), evaluatorPolicySha256: evaluatorRuntime.policySha256, providerFactory })
 		results.push(isolated.result)
 	}
 	return { regression: results[0]!, typecheck: results[1]!, visible: results.slice(2) }
 }
 
 /** Run one supervisor-supplied benchmark verifier after the coding guest has been torn down. */
-export async function runOpenShellBenchmarkVerifier(candidate: CandidateRecord, config: RsiConfig, verifier: Buffer, taskId: string, providerFactory?: RsiOpenShellProviderFactory, image?: string): Promise<TrialResult> {
+export async function runOpenShellBenchmarkVerifier(candidate: CandidateRecord, config: RsiConfig, verifier: Buffer, taskId: string, providerFactory?: RsiOpenShellProviderFactory, image?: string, evaluatorPolicySha256?: string): Promise<TrialResult> {
 	if (verifier.byteLength < 1 || verifier.byteLength > 1024 * 1024) throw new Error("benchmark verifier must be between 1 byte and 1 MiB")
 	if (!/^[a-z0-9][a-z0-9-]{1,63}$/.test(taskId)) throw new Error("benchmark verifier task id is malformed")
+	if (!image || !/^sha256:[a-f0-9]{64}$/.test(image)) throw new Error("benchmark verifier requires a Docker-inspected immutable evaluator image digest")
 	const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: candidate.worktree, encoding: "utf8" }).trim()
+	const policySha256 = evaluatorPolicySha256 ?? await resolveRsiEvaluatorPolicySha256()
 	const isolated = await runSnapshot({
 		config,
 		sourceRoot: candidate.worktree,
@@ -871,7 +912,8 @@ export async function runOpenShellBenchmarkVerifier(candidate: CandidateRecord, 
 		mode: "evaluation",
 		sessionName: `rsi-benchmark-verifier-${candidate.id}-${randomUUID().slice(0, 8)}`,
 		extraFiles: { "__rsi_benchmark_verifier__/verify.mjs": verifier },
-		image,
+		image: evaluatorImageReference(image),
+		evaluatorPolicySha256: policySha256,
 		providerFactory,
 	})
 	const marker = /(?:^|\n)RSI_BENCHMARK_VERIFIER_COMPLETED:(\d+)(?:\n|$)/.exec(isolated.result.stdout + isolated.result.stderr)
@@ -994,6 +1036,7 @@ export async function runOpenShellHiddenFunctionCases(
 	request: { identity: import("./hidden-verifier.js").HiddenVerificationIdentity; cases: import("./hidden-verifier.js").HiddenCaseInput[] },
 	providerFactory?: RsiOpenShellProviderFactory,
 	imageDigest?: string,
+	evaluatorPolicySha256?: string,
 ): Promise<import("./hidden-verifier.js").HiddenCaseOutput[]> {
 	const limits = request.identity.limits
 	if (request.identity.protocol !== "headlesscode.hidden-functions.v1" || !/^[a-f0-9]{64}$/.test(request.identity.protocolDigest) ||
@@ -1008,6 +1051,7 @@ export async function runOpenShellHiddenFunctionCases(
 	}
 	if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(commit)) throw new Error("hidden verifier candidate commit is malformed")
 	if (!imageDigest || !/^sha256:[a-f0-9]{64}$/.test(imageDigest)) throw new Error("hidden verifier requires an approved digest-pinned evaluator image")
+	if (!evaluatorPolicySha256 || !/^[a-f0-9]{64}$/.test(evaluatorPolicySha256)) throw new Error("hidden verifier requires its frozen evaluator policy identity")
 	if (request.identity.evaluatorImageDigest !== imageDigest) throw new Error("hidden verifier evaluator image differs from the frozen request identity")
 	if (request.identity.candidateCommit !== commit) throw new Error("hidden verifier commit differs from the frozen request identity")
 	if (!Array.isArray(request.cases) || request.cases.length < 1 || request.cases.length > limits.maxCases) throw new Error("OpenShell hidden verifier case count is outside its frozen bound")
@@ -1032,6 +1076,7 @@ export async function runOpenShellHiddenFunctionCases(
 		command: `ulimit -t ${cpuSeconds} && test -x /opt/headlesscode/node_modules/.bin/tsx && exec /opt/headlesscode/node_modules/.bin/tsx /workspace/__headlesscode_hidden__/driver.mjs`,
 		timeoutMs: request.identity.limits.timeoutMs,
 		image: `headlesscode-openshell-rsi@${imageDigest}`,
+		evaluatorPolicySha256,
 		cpu: "1",
 		memory: `${request.identity.limits.maxMemoryMb}Mi`,
 		env: { NODE_OPTIONS: `--max-old-space-size=${oldSpaceMb}` },
