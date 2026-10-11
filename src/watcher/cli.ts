@@ -28,6 +28,8 @@
  */
 
 import { execFileSync } from "node:child_process"
+import * as fs from "node:fs/promises"
+import * as os from "node:os"
 import * as path from "node:path"
 
 import { Logger } from "../engine/logger.js"
@@ -55,12 +57,17 @@ Options:
   --max-per-sweep <n>    Max NEW issues spawned per sweep (default: 5); the
                          rest stay in state as 'pending' and are picked up
                          next sweep (bounds label storms)
-  --max-concurrent-sessions <n>  Phase 6 GLOBAL cap on concurrent sessions
-                         across processes (default: $HEADLESSCODE_MAX_
-                         CONCURRENT_SESSIONS or 3). Interplay: maxPerSweep
-                         bounds one sweep's burst; this bounds the total
-                         running/spawned fleet — issues beyond it stay
+  --max-concurrent-sessions <n>  Concurrent-session cap (default: $HEADLESSCODE_MAX_
+                         CONCURRENT_SESSIONS or 3); in runner-pool mode this
+                         is the per-machine cap. Interplay: maxPerSweep
+                         bounds one sweep's burst; this bounds running/spawned
+                         sessions on this machine — issues beyond it stay
                          'pending' until slots free up
+  --runner-id <id>       Enable claim-based multi-machine dispatch. Use a
+                         stable unique id per machine; requires continuous
+                         mode and GitHub Contents read/write + Issues read/write.
+  --runner-assignee <login>  GitHub account shown as assignee while a claim
+                         is active (required with --runner-id)
   --state-file <path>    Durable idempotency state (default:
                          <repo>/.worktrees/.watcher-state.json)
   --mode <slug>          Harness mode for workers (default: code; forwarded
@@ -87,7 +94,9 @@ Environment:
   GH_TOKEN               GitHub token (or GITHUB_TOKEN) — required; never logged
   GITHUB_API_BASE_URL    API base URL override (tests/mocks)
   HEADLESSCODE_SPAWN_SCRIPT  Override the spawner script path (e2e stubbing)
-  HEADLESSCODE_MAX_CONCURRENT_SESSIONS  Global concurrency cap (default 3)
+  HEADLESSCODE_MAX_CONCURRENT_SESSIONS  Session cap (default 3; per-machine in pool mode)
+  HEADLESSCODE_RUNNER_ID / HEADLESSCODE_RUNNER_ASSIGNEE
+                         Enable claim-based multi-machine runner mode
 `
 
 export interface WatchCliOptions {
@@ -100,6 +109,8 @@ export interface WatchCliOptions {
 	maxPerSweep: number
 	/** Phase 6: global concurrent-session cap (default env or 3). */
 	maxConcurrentSessions: number
+	runnerId?: string
+	runnerAssignee?: string
 	stateFile?: string
 	mode: string
 	executionProvider: "local" | "openshell"
@@ -123,6 +134,8 @@ export function parseWatchArgs(argv: string[]): { options: WatchCliOptions; erro
 		runOnce: false,
 		maxPerSweep: 5,
 		maxConcurrentSessions: 3,
+		...(process.env.HEADLESSCODE_RUNNER_ID ? { runnerId: process.env.HEADLESSCODE_RUNNER_ID } : {}),
+		...(process.env.HEADLESSCODE_RUNNER_ASSIGNEE ? { runnerAssignee: process.env.HEADLESSCODE_RUNNER_ASSIGNEE } : {}),
 		mode: "code",
 		executionProvider: process.env.HEADLESSCODE_EXECUTION_PROVIDER === "openshell" ? "openshell" : "local",
 		qa: false,
@@ -150,6 +163,18 @@ export function parseWatchArgs(argv: string[]): { options: WatchCliOptions; erro
 		}
 
 			switch (flag) {
+			case "--runner-assignee": {
+				const v = next()
+				if (v === undefined || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(v)) return { options, error: "--runner-assignee requires a GitHub login" }
+				options.runnerAssignee = v
+				break
+			}
+			case "--runner-id": {
+				const v = next()
+				if (v === undefined || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(v)) return { options, error: "--runner-id requires a safe stable machine identifier" }
+				options.runnerId = v
+				break
+			}
 			case "--security-profile": {
 				const v = next()
 				try { options.securityProfile = resolveSecurityProfile(v) }
@@ -285,6 +310,9 @@ export function parseWatchArgs(argv: string[]): { options: WatchCliOptions; erro
 		try { options.securityProfile = resolveSecurityProfile(process.env.HEADLESSCODE_SECURITY_PROFILE) }
 		catch (error) { return { options, error: error instanceof Error ? error.message : String(error) } }
 	}
+	if (options.runnerId && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(options.runnerId)) return { options, error: "HEADLESSCODE_RUNNER_ID must be a safe stable machine identifier" }
+	if (!!options.runnerId !== !!options.runnerAssignee) return { options, error: "--runner-id and --runner-assignee must be set together" }
+	if (options.runnerId && options.runOnce) return { options, error: "claim-based runner pool requires continuous mode; --run-once cannot maintain leases" }
 	if (options.securityProfile === "contained") {
 		if (options.executionProvider === "local" && argv.some((arg) => arg === "--execution-provider" || arg.startsWith("--execution-provider="))) return { options, error: "contained security profile cannot use the local execution provider" }
 		options.executionProvider = "openshell"
@@ -399,7 +427,22 @@ export async function watchMain(argv: string[]): Promise<number> {
 	process.on("SIGTERM", onSignal)
 
 	let result
+	let lockPath: string | undefined
 	try {
+		if (options.runnerId) {
+			const stateHome = path.resolve(process.env.XDG_STATE_HOME ?? path.join(os.homedir(), ".local", "state"))
+			const lockDir = path.join(stateHome, "headlesscode")
+			await fs.mkdir(lockDir, { recursive: true, mode: 0o700 })
+			lockPath = path.join(lockDir, `runner-${options.runnerId}.lock`)
+			try {
+				const lock = await fs.open(lockPath, "wx", 0o600)
+				await lock.writeFile(`${JSON.stringify({ pid: process.pid, runnerId: options.runnerId, startedAt: new Date().toISOString() })}\n`)
+				await lock.close()
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`runner ${options.runnerId} already has a watcher lock at ${lockPath}; verify its process before removing a stale lock`)
+				throw error
+			}
+		}
 		result = await watchIssues({
 			owner: options.owner,
 			repo: ghRepo,
@@ -412,6 +455,8 @@ export async function watchMain(argv: string[]): Promise<number> {
 			runOnce: options.runOnce,
 			maxPerSweep: options.maxPerSweep,
 			maxConcurrentSessions: options.maxConcurrentSessions,
+			runnerId: options.runnerId,
+			runnerAssignee: options.runnerAssignee,
 			retryFailed: options.retryFailed,
 			dryRun: options.dryRun,
 			mode: options.mode,
@@ -424,9 +469,13 @@ export async function watchMain(argv: string[]): Promise<number> {
 			logger,
 			signal: controller.signal,
 		})
+	} catch (error) {
+		process.stderr.write(`headlesscode watch: ${error instanceof Error ? error.message : String(error)}\n`)
+		return 2
 	} finally {
 		process.off("SIGINT", onSignal)
 		process.off("SIGTERM", onSignal)
+		if (lockPath) await fs.rm(lockPath, { force: true })
 	}
 
 	for (const sweep of result.sweeps) {
