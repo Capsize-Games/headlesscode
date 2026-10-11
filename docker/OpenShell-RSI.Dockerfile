@@ -10,9 +10,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # GNU make 4.4.1 is pinned as the upstream release. Its configure option
-# disables posix_spawn so recipe processes use the fork/exec path supported by
-# the OpenShell guest seccomp policy. The SHA-256 pin was computed from the
-# official GNU archive; it matches the MD5 published in the GNU release notice:
+# disables posix_spawn. Its normal fallback calls vfork, so the Autoconf cache
+# override makes GNU Make compile that call as fork instead. The SHA-256 pin
+# was computed from the official GNU archive; it matches the MD5 published in
+# the GNU release notice:
 # https://lists.gnu.org/archive/html/info-gnu/2023-02/msg00011.html
 RUN set -eux; \
     curl --fail --location --silent --show-error \
@@ -23,8 +24,10 @@ RUN set -eux; \
         /tmp/make-4.4.1.tar.gz | sha256sum --check --status; \
     tar -xzf /tmp/make-4.4.1.tar.gz -C /tmp; \
     cd /tmp/make-4.4.1; \
-    ./configure --prefix=/usr/local --disable-nls --disable-posix-spawn; \
+    ac_cv_func_vfork=no ./configure --prefix=/usr/local --disable-nls --disable-posix-spawn; \
     ! grep -q '^#define USE_POSIX_SPAWN 1' src/config.h; \
+    grep -q '^#define vfork fork' src/config.h; \
+    ! grep -q '^#define HAVE_VFORK 1' src/config.h; \
     make -j"$(nproc)"; \
     make install
 
@@ -61,7 +64,7 @@ RUN mkdir -p /usr/share/doc/headlesscode \
         'GNU Make 4.4.1 source: https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz' \
         'Source SHA-256: dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3' \
         'GNU release notice publishes MD5 c8469a3713cbbe04d955d4ae4be23eeb: https://lists.gnu.org/archive/html/info-gnu/2023-02/msg00011.html' \
-        'Configured with --disable-posix-spawn; corresponding source archive and COPYING are in gnu-make-4.4.1.tar.gz.' \
+        'Configured with --disable-posix-spawn and ac_cv_func_vfork=no; corresponding source archive and COPYING are in gnu-make-4.4.1.tar.gz.' \
         > /usr/share/doc/headlesscode/gnu-make-build.txt
 
 USER sandbox
