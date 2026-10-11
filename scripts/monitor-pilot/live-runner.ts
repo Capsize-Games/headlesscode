@@ -35,6 +35,38 @@ export const LIVE_DEVELOPMENT_SLOTS = Object.freeze(PILOT_FIXTURES
 	.flatMap((fixture) => LIVE_SEEDS.map((seed) => ({ fixture, seed, slotKey: `development:${fixture.id}:${seed}` }))))
 
 const MAX_COMPLETION_TOKENS = 512
+type DeterministicFailureCode =
+	| "billing-record-missing-or-mismatched"
+	| "response-model-not-admitted"
+	| "billing-model-not-admitted"
+	| "provider-identity-not-admitted"
+	| "authoritative-cost-missing"
+	| "response-usage-missing"
+	| "billing-token-usage-missing"
+	| "response-and-billing-token-usage-mismatch"
+	| "cached-token-usage-invalid"
+	| "billing-cache-usage-invalid"
+	| "per-run-token-bound-before-request"
+	| "serialized-prompt-exceeds-token-cap"
+	| "authoritative-billing-record-unavailable"
+	| "completion-exceeded-request-cap"
+	| "measured-token-cap-exceeded"
+	| "per-run-wall-bound-exceeded"
+
+type AbortFailureCode = DeterministicFailureCode | "operator-cancelled" | "provider-or-unclassified-error"
+
+class LivePilotGuardError extends Error {
+	constructor(readonly failureCode: DeterministicFailureCode) {
+		super(failureCode)
+		this.name = "LivePilotGuardError"
+	}
+}
+
+function abortFailureCode(error: unknown, operatorCancelled: boolean): AbortFailureCode {
+	if (error instanceof LivePilotGuardError) return error.failureCode
+	return operatorCancelled ? "operator-cancelled" : "provider-or-unclassified-error"
+}
+
 const MAX_MANIFEST_SOURCE_BYTES = 5 * 1024 * 1024
 const MAX_MANIFEST_TOTAL_BYTES = 32 * 1024 * 1024
 const MANIFEST_SOURCE_FILES = Object.freeze([
@@ -204,28 +236,28 @@ function serializeOperation(call: PilotToolCall): RestrictedOperation {
 }
 
 function assertPinnedIdentity(response: LlmResponse, metadata: OpenRouterGenerationMetadata): void {
-	if (!response.generationId || metadata.id !== response.generationId) throw new Error("billing-record-missing-or-mismatched")
-	if (!LIVE_MODEL_ALIASES.includes(response.returnedModel as (typeof LIVE_MODEL_ALIASES)[number])) throw new Error("response-model-not-admitted")
-	if (!LIVE_MODEL_ALIASES.includes(metadata.model as (typeof LIVE_MODEL_ALIASES)[number])) throw new Error("billing-model-not-admitted")
+	if (!response.generationId || metadata.id !== response.generationId) throw new LivePilotGuardError("billing-record-missing-or-mismatched")
+	if (!LIVE_MODEL_ALIASES.includes(response.returnedModel as (typeof LIVE_MODEL_ALIASES)[number])) throw new LivePilotGuardError("response-model-not-admitted")
+	if (!LIVE_MODEL_ALIASES.includes(metadata.model as (typeof LIVE_MODEL_ALIASES)[number])) throw new LivePilotGuardError("billing-model-not-admitted")
 	if (response.providerName?.toLocaleLowerCase() !== LIVE_PROVIDER.toLocaleLowerCase() || metadata.providerName?.toLocaleLowerCase() !== LIVE_PROVIDER.toLocaleLowerCase()) {
-		throw new Error("provider-identity-not-admitted")
+		throw new LivePilotGuardError("provider-identity-not-admitted")
 	}
-	if (typeof metadata.totalCostUsd !== "number" || !Number.isFinite(metadata.totalCostUsd) || metadata.totalCostUsd < 0) throw new Error("authoritative-cost-missing")
+	if (typeof metadata.totalCostUsd !== "number" || !Number.isFinite(metadata.totalCostUsd) || metadata.totalCostUsd < 0) throw new LivePilotGuardError("authoritative-cost-missing")
 }
 
 function assertUsage(response: LlmResponse, metadata: OpenRouterGenerationMetadata): { prompt: number; completion: number; cached: number | null; costUsd: number } {
 	const usage = response.usage
-	if (!usage || !isSafeInteger(usage.promptTokens) || !isSafeInteger(usage.completionTokens)) throw new Error("response-usage-missing")
+	if (!usage || !isSafeInteger(usage.promptTokens) || !isSafeInteger(usage.completionTokens)) throw new LivePilotGuardError("response-usage-missing")
 	const prompt = metadata.nativeTokensPrompt ?? metadata.tokensPrompt
 	const completion = metadata.nativeTokensCompletion ?? metadata.tokensCompletion
-	if (!isSafeInteger(prompt) || !isSafeInteger(completion)) throw new Error("billing-token-usage-missing")
-	if (usage.promptTokens !== prompt || usage.completionTokens !== completion) throw new Error("response-and-billing-token-usage-mismatch")
+	if (!isSafeInteger(prompt) || !isSafeInteger(completion)) throw new LivePilotGuardError("billing-token-usage-missing")
+	if (usage.promptTokens !== prompt || usage.completionTokens !== completion) throw new LivePilotGuardError("response-and-billing-token-usage-mismatch")
 	let cached: number | null = null
 	if (usage.cachedTokens !== undefined) {
-		if (!isSafeInteger(usage.cachedTokens) || usage.cachedTokens > prompt) throw new Error("cached-token-usage-invalid")
+		if (!isSafeInteger(usage.cachedTokens) || usage.cachedTokens > prompt) throw new LivePilotGuardError("cached-token-usage-invalid")
 		cached = usage.cachedTokens
 	}
-	if (metadata.nativeTokensCached !== undefined && (!isSafeInteger(metadata.nativeTokensCached) || metadata.nativeTokensCached > prompt)) throw new Error("billing-cache-usage-invalid")
+	if (metadata.nativeTokensCached !== undefined && (!isSafeInteger(metadata.nativeTokensCached) || metadata.nativeTokensCached > prompt)) throw new LivePilotGuardError("billing-cache-usage-invalid")
 	return { prompt, completion, cached: metadata.nativeTokensCached ?? cached, costUsd: metadata.totalCostUsd! }
 }
 
@@ -388,8 +420,8 @@ async function runLiveTrajectory(options: LiveTrajectoryOptions): Promise<{
 			signal: AbortSignal.any([options.signal, AbortSignal.timeout(Math.max(1, deadline - Date.now()))]),
 		}
 		const reservedRequestTokens = safeJsonBytes(buildRequestBody(request, LIVE_MODEL)) + request.maxTokens!
-		if (reservedRequestTokens > LIVE_BUDGET.maxTokens - inputTokens - outputTokens) throw new Error("per-run-token-bound-before-request")
-		if (safeJsonBytes(buildRequestBody(request, LIVE_MODEL)) > LIVE_BUDGET.maxTokens) throw new Error("serialized-prompt-exceeds-token-cap")
+		if (reservedRequestTokens > LIVE_BUDGET.maxTokens - inputTokens - outputTokens) throw new LivePilotGuardError("per-run-token-bound-before-request")
+		if (safeJsonBytes(buildRequestBody(request, LIVE_MODEL)) > LIVE_BUDGET.maxTokens) throw new LivePilotGuardError("serialized-prompt-exceeds-token-cap")
 		await options.journal.append("llm_request_admitted", options.experimentId, {
 			iteration, model: LIVE_MODEL, providerOnly: "meta", allowFallbacks: false,
 			cacheRoutingKeyHash: sha256(cacheRoutingKey), stream: true, maxTokens: request.maxTokens,
@@ -404,11 +436,11 @@ async function runLiveTrajectory(options: LiveTrajectoryOptions): Promise<{
 		}, { runId: options.runId, attemptId: options.attemptId, epoch: options.epoch })
 		const metadata = response.generationId ? await options.client.fetchGenerationMetadata(response.generationId, request.signal) : undefined
 		await options.journal.append("llm_billing_metadata_received", options.experimentId, { iteration, generationId: response.generationId ?? null, billingMetadata: metadata ?? null }, { runId: options.runId, attemptId: options.attemptId, epoch: options.epoch })
-		if (!metadata) throw new Error("authoritative-billing-record-unavailable")
+		if (!metadata) throw new LivePilotGuardError("authoritative-billing-record-unavailable")
 		assertPinnedIdentity(response, metadata)
 		const usage = assertUsage(response, metadata)
-		if (usage.completion > request.maxTokens!) throw new Error("completion-exceeded-request-cap")
-		if (inputTokens + outputTokens + usage.prompt + usage.completion > LIVE_BUDGET.maxTokens) throw new Error("measured-token-cap-exceeded")
+		if (usage.completion > request.maxTokens!) throw new LivePilotGuardError("completion-exceeded-request-cap")
+		if (inputTokens + outputTokens + usage.prompt + usage.completion > LIVE_BUDGET.maxTokens) throw new LivePilotGuardError("measured-token-cap-exceeded")
 		inputTokens += usage.prompt
 		outputTokens += usage.completion
 		actualCostUsd += usage.costUsd
@@ -535,7 +567,7 @@ async function runLiveTrajectory(options: LiveTrajectoryOptions): Promise<{
 		}
 	}
 	const oracle = options.fixture.oracle(simulator.virtualFiles)
-	if (Date.now() - startedAt > LIVE_BUDGET.maxWallMs) throw new Error("per-run-wall-bound-exceeded")
+	if (Date.now() - startedAt > LIVE_BUDGET.maxWallMs) throw new LivePilotGuardError("per-run-wall-bound-exceeded")
 	const finalArtifactHash = sha256(simulator.virtualFiles)
 	const oracleHash = sha256(oracle)
 	const detectionLabels = boundaries.map((boundary) => boundaryLabel(boundary, turns, interventions))
@@ -854,7 +886,11 @@ export async function collectLiveDevelopment(options: LiveRunnerOptions = {}): P
 				if (result.outcome.valid) allRows.push(...result.rows)
 				completedRuns++
 			} catch (error) {
-				await journal.append("attempt_aborted", LIVE_EXPERIMENT_ID, { slotKey: slot.slotKey, reason: options.signal?.aborted ? "operator-cancelled; request outcome may be uncertain" : "model, billing, or budget outcome uncertain", errorName: error instanceof Error ? error.name : "unknown" }, { runId, attemptId, epoch })
+				await journal.append("attempt_aborted", LIVE_EXPERIMENT_ID, {
+					slotKey: slot.slotKey,
+					reason: options.signal?.aborted ? "operator-cancelled; request outcome may be uncertain" : "model, billing, or budget outcome uncertain",
+					failureCode: abortFailureCode(error, !!options.signal?.aborted),
+				}, { runId, attemptId, epoch })
 				stopReason = options.signal?.aborted ? "STOP: development collection was cancelled; the active reservation remains charged." : "STOP: model, billing, or budget result is uncertain; inspect the private journal before retrying."
 				break
 			}
@@ -1084,7 +1120,11 @@ export async function collectLiveHeldout(options: LiveRunnerOptions = {}): Promi
 				await journal.append("attempt_completed", LIVE_EXPERIMENT_ID, { slotKey: slot.slotKey, outcome: result.outcome, rows: result.rows }, { runId, attemptId, epoch })
 				await global.append("budget_settled", LIVE_EXPERIMENT_ID, { attemptId, actualTokens: result.actualTokens, actualWallMs: result.actualWallMs }, { runId, attemptId, epoch })
 			} catch (error) {
-				await journal.append("attempt_aborted", LIVE_EXPERIMENT_ID, { slotKey: slot.slotKey, reason: options.signal?.aborted ? "operator-cancelled; request outcome may be uncertain" : "model, billing, or budget outcome uncertain", errorName: error instanceof Error ? error.name : "unknown" }, { runId, attemptId, epoch })
+				await journal.append("attempt_aborted", LIVE_EXPERIMENT_ID, {
+					slotKey: slot.slotKey,
+					reason: options.signal?.aborted ? "operator-cancelled; request outcome may be uncertain" : "model, billing, or budget outcome uncertain",
+					failureCode: abortFailureCode(error, !!options.signal?.aborted),
+				}, { runId, attemptId, epoch })
 				stopReason = options.signal?.aborted ? "STOP: held-out collection was cancelled; the active reservation remains charged." : "STOP: model, billing, or budget result is uncertain; inspect the private journal before retrying."
 				break
 			}

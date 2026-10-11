@@ -273,6 +273,47 @@ async function testAdmittedRequestWithoutResponseIsShownAsUnresolved(): Promise<
 		assert.equal(summary.billing.responsesReceived, 0)
 		assert.equal(summary.billing.unresolvedRequests, 1, "a timed-out or failed admitted request remains visibly charge-uncertain")
 		assert.equal(summary.billing.unbilledResponses, 0)
+		const journal = new PilotJournal(summary.journalPath)
+		await journal.open()
+		const aborted = journal.list().find((record) => record.type === "attempt_aborted")!
+		assert.equal(aborted.payload.failureCode, "provider-or-unclassified-error")
+		assert.equal(JSON.stringify(aborted.payload).includes("synthetic response transport failure"), false, "raw provider errors are not persisted")
+	} finally { await fs.rm(directory, { recursive: true, force: true }) }
+}
+
+async function testCompletionOverrunIsJournaledBeforeAnyToolDispatch(): Promise<void> {
+	const directory = await scratch()
+	try {
+		const client = new MockBillingClient([{ name: "attempt_completion", args: JSON.stringify({ result: "must not dispatch" }) }], LIVE_MODEL, "Meta", {
+			responseUsage: { promptTokens: 100, completionTokens: 519, totalTokens: 619, cachedTokens: 20 },
+			metadata: { totalCostUsd: 0.0000994, tokensPrompt: 100, tokensCompletion: 519, nativeTokensPrompt: 100, nativeTokensCompletion: 519, nativeTokensCached: 20 },
+		})
+		const summary = await collectLiveDevelopment({ outputDir: directory, client })
+		assert.equal(summary.abortedAttempts, 1)
+		assert.equal(summary.completedRuns, 0)
+		assert.equal(summary.unstartedSlots, LIVE_DEVELOPMENT_SLOTS.length - 1)
+		assert.equal(client.requests.length, 1)
+		assert.equal(client.requests[0]?.maxTokens, 512)
+		assert.equal(summary.billing.responsesReceived, 1)
+		assert.equal(summary.billing.generationRecords, 1)
+		assert.equal(summary.billing.acceptedBillingRecords, 0)
+		assert.equal(summary.billing.unacceptedBillingRecords, 1)
+		assert.equal(summary.billing.unbilledResponses, 0)
+		assert.equal(summary.billing.completionTokens, 519)
+		assert.equal(summary.billing.totalBilledCostUsd, 0.0000994)
+		const journal = new PilotJournal(summary.journalPath)
+		await journal.open()
+		const records = journal.list()
+		assert.equal(records.some((record) => record.type === "virtual_turn"), false, "over-cap response is rejected before tool dispatch")
+		assert.equal(records.some((record) => record.type === "llm_response_received"), true)
+		assert.equal(records.some((record) => record.type === "llm_billing_metadata_received"), true)
+		assert.equal(records.some((record) => record.type === "llm_response_billed"), false)
+		const aborted = records.find((record) => record.type === "attempt_aborted")!
+		assert.equal(aborted.payload.failureCode, "completion-exceeded-request-cap")
+		const global = new PilotJournal(path.join(directory, "global-budget.jsonl"))
+		await global.open()
+		assert.equal(global.list().filter((record) => record.type === "budget_reserved").length, 1)
+		assert.equal(global.list().filter((record) => record.type === "budget_settled").length, 0, "full reservation remains charged after the rejected paid response")
 	} finally { await fs.rm(directory, { recursive: true, force: true }) }
 }
 
@@ -313,6 +354,7 @@ await testFiniteBillingIsCountedWhenAdmissionAborts()
 await testAdmittedRequestWithoutResponseIsShownAsUnresolved()
 await testResponseWithoutFiniteGenerationCostIsUnbilled()
 await testUncertainRequestIsNotAutomaticallyReplayed()
+await testCompletionOverrunIsJournaledBeforeAnyToolDispatch()
 await testHeldoutCannotStartWithoutQualifiedDevelopment()
 await testStorageRootSymlinkIsRejectedBeforeInference()
 console.log("live monitor pilot tests passed (synthetic billing; no network inference)")
