@@ -114,6 +114,7 @@ import { findMatchingPattern } from "../permissions/protected-files.js"
 import { resolvePermissions, type PermissionsConfig } from "../permissions/config.js"
 import { createEmbedder, EMBEDDING_BACKEND_ENV, resolveEmbeddingBackend } from "../codesearch/embedder.js"
 import { indexFilePath, loadIndexMetadata } from "../codesearch/index.js"
+import { lexicalSearch } from "../codesearch/lexical.js"
 import { formatSearchResults, searchIndex } from "../codesearch/search.js"
 
 /**
@@ -2431,17 +2432,23 @@ async function codebaseSearchHandler(args: Record<string, unknown>, ctx: ToolCon
 	const pathPrefix = typeof args.path === "string" && args.path.trim() !== "" ? args.path : undefined
 
 	return (async () => {
-		// No index → actionable error, not a silent empty result.
+		// No index → bounded lexical fallback, not a silent empty result.
+		// Only a genuine ENOENT (missing index file) takes this path; any
+		// other access error still surfaces as a tool error below.
 		const indexFile = indexFilePath(ctx.workspaceRoot)
 		try {
 			await fsp.access(indexFile)
-		} catch {
-			return err(
-				`codebase_search: no codebase index found at '${indexFile}'. ` +
-					`The codebase has not been indexed yet. Ask a human to run ` +
-					`'headlesscode index --workspace ${ctx.workspaceRoot}' first (this builds the semantic index ` +
-					`and costs a small amount of embedding API money).`,
-			)
+		} catch (error) {
+			if (
+				!(error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT")
+			) {
+				return err(`codebase_search: cannot read codebase index at '${indexFile}': ${errorMessage(error)}`)
+			}
+			try {
+				return ok(await lexicalSearch(ctx.workspaceRoot, query, pathPrefix, (rel) => safeTarget(ctx, rel)))
+			} catch (fallbackError) {
+				return err(`codebase_search: lexical fallback failed: ${errorMessage(fallbackError)}`)
+			}
 		}
 
 		// The query embedder must match the backend the index was built with.
