@@ -77,8 +77,24 @@ export function bestEffortPartialJson(input: string): Record<string, unknown> | 
 	const firstBrace = input.indexOf("{")
 	if (firstBrace !== -1) {
 		let depth = 0
+		let inString = false
+		let escaped = false
 		for (let i = firstBrace; i < input.length; i++) {
 			const ch = input[i]
+			if (inString) {
+				if (escaped) {
+					escaped = false
+				} else if (ch === "\\") {
+					escaped = true
+				} else if (ch === '"') {
+					inString = false
+				}
+				continue
+			}
+			if (ch === '"') {
+				inString = true
+				continue
+			}
 			if (ch === "{") {
 				depth++
 			} else if (ch === "}") {
