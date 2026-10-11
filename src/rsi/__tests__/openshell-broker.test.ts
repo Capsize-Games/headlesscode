@@ -3,7 +3,7 @@ import test from "node:test"
 import { parseRsiArgs } from "../config.js"
 import { networkRules, rsiMutationGuestEnvironment } from "../openshell.js"
 import type { CandidateRecord, RsiConfig } from "../types.js"
-import { RSI_OPENROUTER_MODEL } from "../inference-broker.js"
+import { RSI_MUSE_OPENROUTER_MODEL, RSI_OPENROUTER_MODEL } from "../inference-broker.js"
 
 const parsed = parseRsiArgs(["--repo", process.cwd(), "--max-iterations", "3", "--timeout-ms", "5000"])
 if (!parsed.config || parsed.error) throw new Error(parsed.error ?? "could not create test RSI config")
@@ -26,6 +26,17 @@ test("OpenRouter guest gets only its job capability and the single broker networ
 
 test("OpenRouter mutation guest refuses missing broker, wrong model, and malformed endpoint", () => {
 	assert.throws(() => rsiMutationGuestEnvironment(config, candidate), /requires a host broker/)
-	assert.throws(() => rsiMutationGuestEnvironment({ ...config, roles: { worker: { provider: "openrouter", model: "deepseek/other" } } }, candidate, broker), /pinned model/)
+	assert.throws(() => rsiMutationGuestEnvironment({ ...config, roles: { worker: { provider: "openrouter", model: "deepseek/other" } } }, candidate, broker), /profile\/model identity is not admitted/)
 	assert.throws(() => rsiMutationGuestEnvironment(config, candidate, { ...broker, guestBaseUrl: "https://openrouter.ai" }), /endpoint is malformed/)
+})
+
+test("Muse mutation guest requires the explicit profile and receives only its broker capability", () => {
+	const museCandidate = { ...candidate, model: RSI_MUSE_OPENROUTER_MODEL }
+	const museConfig: RsiConfig = { ...config, roles: { worker: { provider: "openrouter", model: RSI_MUSE_OPENROUTER_MODEL, openRouterProfile: "muse-spark-contributor" } } }
+	const env = rsiMutationGuestEnvironment(museConfig, museCandidate, broker)
+	assert.equal(env.HEADLESSCODE_CODE_MODE_MODEL, RSI_MUSE_OPENROUTER_MODEL)
+	assert.equal(env.OPENROUTER_BASE_URL, broker.guestBaseUrl)
+	assert.equal(env.HEADLESSCODE_RSI_INFERENCE_CAPABILITY, broker.capability)
+	assert.equal(Object.keys(env).some((key) => /(?:API_KEY|SECRET|TOKEN)$/i.test(key)), false)
+	assert.throws(() => rsiMutationGuestEnvironment({ ...museConfig, roles: { worker: { provider: "openrouter", model: RSI_MUSE_OPENROUTER_MODEL } } }, museCandidate, broker), /explicit profile identity/)
 })
