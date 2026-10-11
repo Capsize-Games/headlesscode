@@ -6,6 +6,12 @@ import { RSI_OPENSHELL_IMAGE, runOpenShellBenchmarkVerifier } from "../src/rsi/o
 import { parseRsiArgs } from "../src/rsi/config.js"
 import type { CandidateRecord } from "../src/rsi/types.js"
 
+if (process.argv.slice(2).some((arg) => arg === "--help" || arg === "-h")) {
+	process.stdout.write("Usage: npm run rsi:security-canary\nRuns a disposable CPU-only OpenShell isolation probe without model inference.\nConfigure the operator gateway before running; reports are saved under .headlesscode/scratch.\n")
+	process.exit(0)
+}
+if (process.argv.length > 2) throw new Error("rsi:security-canary accepts only --help or no arguments")
+
 const scratchRoot = path.resolve(".headlesscode/scratch")
 await fs.mkdir(scratchRoot, { recursive: true, mode: 0o700 })
 process.env.TMPDIR = scratchRoot
@@ -130,5 +136,6 @@ try {
 	process.exitCode = 1
 } finally {
 	await fs.writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 })
-	await fs.rm(runRoot, { recursive: true, force: true })
+	if (report.providerTeardownCompleted === true) await fs.rm(runRoot, { recursive: true, force: true })
+	else process.stderr.write(`Unverified teardown: synthetic fixture retained at ${runRoot}\n`)
 }
