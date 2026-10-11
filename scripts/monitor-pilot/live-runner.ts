@@ -142,7 +142,15 @@ export interface LiveHeldoutSummary {
 export interface LiveBillingTotals {
 	readonly admittedRequests: number
 	readonly responsesReceived: number
+	/** Admitted requests that ended without any response event; outcome may be chargeable. */
+	readonly unresolvedRequests: number
+	/** Generation metadata objects observed, whether or not route/usage admission succeeded. */
 	readonly generationRecords: number
+	/** Generation records that passed identity, cost, and usage admission before tool dispatch. */
+	readonly acceptedBillingRecords: number
+	/** Received generation records with a finite cost, but rejected by admission checks. */
+	readonly unacceptedBillingRecords: number
+	/** Responses with no matching generation record carrying a finite authoritative cost. */
 	readonly unbilledResponses: number
 	readonly promptTokens: number
 	readonly completionTokens: number
@@ -208,15 +216,17 @@ function assertPinnedIdentity(response: LlmResponse, metadata: OpenRouterGenerat
 function assertUsage(response: LlmResponse, metadata: OpenRouterGenerationMetadata): { prompt: number; completion: number; cached: number | null; costUsd: number } {
 	const usage = response.usage
 	if (!usage || !isSafeInteger(usage.promptTokens) || !isSafeInteger(usage.completionTokens)) throw new Error("response-usage-missing")
-	if (!isSafeInteger(metadata.tokensPrompt) || !isSafeInteger(metadata.tokensCompletion)) throw new Error("billing-token-usage-missing")
-	if (usage.promptTokens !== metadata.tokensPrompt || usage.completionTokens !== metadata.tokensCompletion) throw new Error("response-and-billing-token-usage-mismatch")
+	const prompt = metadata.nativeTokensPrompt ?? metadata.tokensPrompt
+	const completion = metadata.nativeTokensCompletion ?? metadata.tokensCompletion
+	if (!isSafeInteger(prompt) || !isSafeInteger(completion)) throw new Error("billing-token-usage-missing")
+	if (usage.promptTokens !== prompt || usage.completionTokens !== completion) throw new Error("response-and-billing-token-usage-mismatch")
 	let cached: number | null = null
 	if (usage.cachedTokens !== undefined) {
-		if (!isSafeInteger(usage.cachedTokens) || usage.cachedTokens > usage.promptTokens) throw new Error("cached-token-usage-invalid")
+		if (!isSafeInteger(usage.cachedTokens) || usage.cachedTokens > prompt) throw new Error("cached-token-usage-invalid")
 		cached = usage.cachedTokens
 	}
-	if (metadata.nativeTokensCached !== undefined && (!isSafeInteger(metadata.nativeTokensCached) || metadata.nativeTokensCached > usage.promptTokens)) throw new Error("billing-cache-usage-invalid")
-	return { prompt: usage.promptTokens, completion: usage.completionTokens, cached: metadata.nativeTokensCached ?? cached, costUsd: metadata.totalCostUsd! }
+	if (metadata.nativeTokensCached !== undefined && (!isSafeInteger(metadata.nativeTokensCached) || metadata.nativeTokensCached > prompt)) throw new Error("billing-cache-usage-invalid")
+	return { prompt, completion, cached: metadata.nativeTokensCached ?? cached, costUsd: metadata.totalCostUsd! }
 }
 
 function parseArgs(call: { readonly id: string; readonly function: { readonly name: string; readonly arguments: string } }, attemptId: string, iteration: number, index: number): PilotToolCall | undefined {
@@ -393,7 +403,7 @@ async function runLiveTrajectory(options: LiveTrajectoryOptions): Promise<{
 			assistantMessage: response.message,
 		}, { runId: options.runId, attemptId: options.attemptId, epoch: options.epoch })
 		const metadata = response.generationId ? await options.client.fetchGenerationMetadata(response.generationId, request.signal) : undefined
-		await options.journal.append("llm_billing_metadata_received", options.experimentId, { generationId: response.generationId ?? null, billingMetadata: metadata ?? null }, { runId: options.runId, attemptId: options.attemptId, epoch: options.epoch })
+		await options.journal.append("llm_billing_metadata_received", options.experimentId, { iteration, generationId: response.generationId ?? null, billingMetadata: metadata ?? null }, { runId: options.runId, attemptId: options.attemptId, epoch: options.epoch })
 		if (!metadata) throw new Error("authoritative-billing-record-unavailable")
 		assertPinnedIdentity(response, metadata)
 		const usage = assertUsage(response, metadata)
@@ -406,9 +416,11 @@ async function runLiveTrajectory(options: LiveTrajectoryOptions): Promise<{
 			iteration, responseModel: response.returnedModel, responseProvider: response.providerName,
 			generationId: response.generationId, billingModel: metadata.model, billingProvider: metadata.providerName,
 			usage: { promptTokens: usage.prompt, completionTokens: usage.completion, cachedTokens: usage.cached,
+				normalizedPromptTokens: metadata.tokensPrompt, normalizedCompletionTokens: metadata.tokensCompletion,
 				cacheWriteTokens: response.usage?.cacheWriteTokens ?? null, reasoningTokens: response.usage?.reasoningTokens ?? null },
 			billing: { totalCostUsd: usage.costUsd, cacheDiscountUsd: metadata.cacheDiscountUsd ?? null,
 				upstreamInferenceCostUsd: metadata.upstreamInferenceCostUsd ?? null,
+				nativeTokensPrompt: metadata.nativeTokensPrompt ?? null, nativeTokensCompletion: metadata.nativeTokensCompletion ?? null,
 				nativeTokensCached: metadata.nativeTokensCached ?? null, nativeTokensReasoning: metadata.nativeTokensReasoning ?? null },
 			assistantMessage: response.message,
 		}, { runId: options.runId, attemptId: options.attemptId, epoch: options.epoch })
@@ -723,26 +735,55 @@ function completedRecords(journal: PilotJournal): Map<string, JournalRecord> {
 
 function billingTotals(journal: PilotJournal): LiveBillingTotals {
 	const records = journal.list()
-	const billed = records.filter((record) => record.type === "llm_response_billed")
+	const accepted = records.filter((record) => record.type === "llm_response_billed")
+	const responseEvents = records.filter((record) => record.type === "llm_response_received")
+	const admittedEvents = records.filter((record) => record.type === "llm_request_admitted")
+	const generationEvents = records.filter((record) => record.type === "llm_billing_metadata_received" && record.payload.billingMetadata !== null && typeof record.payload.billingMetadata === "object")
+	const acceptedIds = new Set(accepted.map((record) => record.payload.generationId).filter((value): value is string => typeof value === "string"))
 	let promptTokens = 0
 	let completionTokens = 0
 	let cachedPromptTokens = 0
 	let cachedTokenReports = 0
 	let totalBilledCostUsd = 0
 	let totalCacheDiscountUsd = 0
-	for (const record of billed) {
-		const usage = record.payload.usage as { promptTokens?: unknown; completionTokens?: unknown; cachedTokens?: unknown }
-		const billing = record.payload.billing as { totalCostUsd?: unknown; cacheDiscountUsd?: unknown }
-		if (!isSafeInteger(usage.promptTokens) || !isSafeInteger(usage.completionTokens) || typeof billing.totalCostUsd !== "number" || !Number.isFinite(billing.totalCostUsd) || billing.totalCostUsd < 0) throw new JournalCorruptionError("invalid authoritative billing summary record")
-		promptTokens += usage.promptTokens
-		completionTokens += usage.completionTokens
-		totalBilledCostUsd += billing.totalCostUsd
-		if (isSafeInteger(usage.cachedTokens)) { cachedPromptTokens += usage.cachedTokens; cachedTokenReports++ }
+	const billableGenerationIds = new Set<string>()
+	for (const record of generationEvents) {
+		const expectedId = record.payload.generationId
+		const billing = record.payload.billingMetadata as OpenRouterGenerationMetadata
+		if (typeof expectedId !== "string" || billing.id !== expectedId) continue
+		if (typeof billing.totalCostUsd === "number" && Number.isFinite(billing.totalCostUsd) && billing.totalCostUsd >= 0) {
+			billableGenerationIds.add(expectedId)
+			totalBilledCostUsd += billing.totalCostUsd
+		}
+		const prompt = billing.nativeTokensPrompt ?? billing.tokensPrompt
+		const completion = billing.nativeTokensCompletion ?? billing.tokensCompletion
+		if (isSafeInteger(prompt) && isSafeInteger(completion)) {
+			promptTokens += prompt
+			completionTokens += completion
+		}
+		const cached = billing.nativeTokensCached
+		if (isSafeInteger(cached) && (!isSafeInteger(prompt) || cached <= prompt)) { cachedPromptTokens += cached; cachedTokenReports++ }
 		if (typeof billing.cacheDiscountUsd === "number" && Number.isFinite(billing.cacheDiscountUsd)) totalCacheDiscountUsd += billing.cacheDiscountUsd
 	}
 	if (![promptTokens, completionTokens, cachedPromptTokens, totalBilledCostUsd, totalCacheDiscountUsd].every(Number.isFinite)) throw new JournalCorruptionError("billing totals overflowed")
-	const responses = records.filter((record) => record.type === "llm_response_received").length
-	return { admittedRequests: records.filter((record) => record.type === "llm_request_admitted").length, responsesReceived: responses, generationRecords: billed.length, unbilledResponses: Math.max(0, responses - billed.length), promptTokens, completionTokens, cachedPromptTokens, cachedTokenReports, totalBilledCostUsd, totalCacheDiscountUsd }
+	const billableByAttemptIteration = new Set(generationEvents.filter((record) => {
+		const billing = record.payload.billingMetadata as OpenRouterGenerationMetadata
+		return typeof record.payload.generationId === "string" && billing.id === record.payload.generationId && typeof billing.totalCostUsd === "number" && Number.isFinite(billing.totalCostUsd) && billing.totalCostUsd >= 0
+	}).map((record) => `${record.attemptId ?? ""}\0${String(record.payload.iteration ?? "")}\0${record.payload.generationId}`))
+	const unbilledResponses = responseEvents.filter((record) => typeof record.payload.generationId !== "string" || !billableByAttemptIteration.has(`${record.attemptId ?? ""}\0${String(record.payload.iteration ?? "")}\0${record.payload.generationId}`)).length
+	const responseAttemptIterations = new Set(responseEvents.map((record) => `${record.attemptId ?? ""}\0${String(record.payload.iteration ?? "")}`))
+	const unresolvedRequests = admittedEvents.filter((record) => !responseAttemptIterations.has(`${record.attemptId ?? ""}\0${String(record.payload.iteration ?? "")}`)).length
+	const unacceptedBillingRecords = [...billableGenerationIds].filter((id) => !acceptedIds.has(id)).length
+	return {
+		admittedRequests: admittedEvents.length,
+		responsesReceived: responseEvents.length,
+		unresolvedRequests,
+		generationRecords: generationEvents.length,
+		acceptedBillingRecords: accepted.length,
+		unacceptedBillingRecords,
+		unbilledResponses,
+		promptTokens, completionTokens, cachedPromptTokens, cachedTokenReports, totalBilledCostUsd, totalCacheDiscountUsd,
+	}
 }
 
 async function createProductionClient(): Promise<BillingClient> {

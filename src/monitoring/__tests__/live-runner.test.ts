@@ -4,6 +4,7 @@ import * as path from "node:path"
 import { randomUUID } from "node:crypto"
 
 import type { LlmRequest, LlmResponse } from "../../engine/types.js"
+import type { OpenRouterGenerationMetadata } from "../../llm/openrouter.js"
 import { MONITOR_FEATURE_ORDER, type FrozenPredictorArtifact } from "../types.js"
 import { sha256 } from "../features.js"
 import { DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD, identicalCallNudgeMessage } from "../guardrails.js"
@@ -11,22 +12,30 @@ import { PilotJournal } from "../../../scripts/monitor-pilot/journal.js"
 import { collectLiveDevelopment, collectLiveHeldout, deriveCalibrationRandomSchedule, LIVE_DEVELOPMENT_SLOTS, LIVE_GUARDRAILS_HASH, LIVE_GUARDRAILS_MANIFEST, LIVE_MODEL, LIVE_TOOLS } from "../../../scripts/monitor-pilot/live-runner.js"
 
 type Reply = { readonly name: string; readonly args?: string; readonly content?: string }
+type MockBillingOverrides = {
+	readonly responseUsage?: LlmResponse["usage"]
+	readonly metadata?: Partial<OpenRouterGenerationMetadata>
+	readonly failBeforeResponse?: boolean
+}
 
 class MockBillingClient {
 	readonly requests: LlmRequest[] = []
 	readonly replies: Reply[]
 	readonly responseModel: string
 	readonly provider: string
+	readonly overrides: MockBillingOverrides
 	private sequence = 0
 
-	constructor(replies: readonly Reply[], responseModel = LIVE_MODEL, provider = "Meta") {
+	constructor(replies: readonly Reply[], responseModel = LIVE_MODEL, provider = "Meta", overrides: MockBillingOverrides = {}) {
 		this.replies = [...replies]
 		this.responseModel = responseModel
 		this.provider = provider
+		this.overrides = overrides
 	}
 
 	async createChatCompletion(request: LlmRequest): Promise<LlmResponse> {
 		this.requests.push(request)
+		if (this.overrides.failBeforeResponse) throw new Error("synthetic response transport failure")
 		assert.equal(request.model, LIVE_MODEL)
 		assert.equal(request.providerOnly, "meta")
 		assert.equal(request.stream, true)
@@ -39,7 +48,7 @@ class MockBillingClient {
 				content: reply.content ?? null,
 				tool_calls: [{ id: `provider-tool-${id}`, type: "function", function: { name: reply.name, arguments: reply.args ?? "{}" } }],
 			},
-			usage: { promptTokens: 100, completionTokens: 5, totalTokens: 105, cachedTokens: 20 },
+			usage: this.overrides.responseUsage ?? { promptTokens: 100, completionTokens: 5, totalTokens: 105, cachedTokens: 20 },
 			generationId: id,
 			returnedModel: this.responseModel,
 			providerName: this.provider,
@@ -47,7 +56,7 @@ class MockBillingClient {
 	}
 
 	async fetchGenerationMetadata(id: string) {
-		return { id, model: LIVE_MODEL, providerName: "Meta", totalCostUsd: 0.000001, tokensPrompt: 100, tokensCompletion: 5, nativeTokensCached: 20, cacheDiscountUsd: 0 }
+		return { id, model: LIVE_MODEL, providerName: "Meta", totalCostUsd: 0.000001, tokensPrompt: 100, tokensCompletion: 5, nativeTokensPrompt: 100, nativeTokensCompletion: 5, nativeTokensCached: 20, cacheDiscountUsd: 0, ...this.overrides.metadata }
 	}
 }
 
@@ -130,7 +139,10 @@ async function testDevelopmentScheduleUsesSyntheticBillingOnly(): Promise<void> 
 		assert.deepEqual({ ...summary.billing, totalBilledCostUsd: 0 }, {
 			admittedRequests: LIVE_DEVELOPMENT_SLOTS.length,
 			responsesReceived: LIVE_DEVELOPMENT_SLOTS.length,
+			unresolvedRequests: 0,
 			generationRecords: LIVE_DEVELOPMENT_SLOTS.length,
+			acceptedBillingRecords: LIVE_DEVELOPMENT_SLOTS.length,
+			unacceptedBillingRecords: 0,
 			unbilledResponses: 0,
 			promptTokens: LIVE_DEVELOPMENT_SLOTS.length * 100,
 			completionTokens: LIVE_DEVELOPMENT_SLOTS.length * 5,
@@ -165,6 +177,49 @@ async function testDevelopmentScheduleUsesSyntheticBillingOnly(): Promise<void> 
 	} finally { await fs.rm(directory, { recursive: true, force: true }) }
 }
 
+async function testNativeGenerationTokensOverrideNormalizedAccounting(): Promise<void> {
+	const directory = await scratch()
+	try {
+		const client = new MockBillingClient([{ name: "attempt_completion", args: JSON.stringify({ result: "done" }) }], LIVE_MODEL, "Meta", {
+			responseUsage: { promptTokens: 862, completionTokens: 66, totalTokens: 928, cachedTokens: 20 },
+			metadata: { tokensPrompt: 411, tokensCompletion: 24, nativeTokensPrompt: 862, nativeTokensCompletion: 66 },
+		})
+		const summary = await collectLiveDevelopment({ outputDir: directory, client })
+		assert.equal(summary.completedRuns, 32)
+		assert.equal(summary.billing.promptTokens, 32 * 862)
+		assert.equal(summary.billing.completionTokens, 32 * 66)
+		assert.equal(summary.billing.acceptedBillingRecords, 32)
+		const journal = new PilotJournal(summary.journalPath)
+		await journal.open()
+		const first = journal.list().find((record) => record.type === "llm_response_billed")!
+		assert.deepEqual(first.payload.usage && {
+			promptTokens: (first.payload.usage as { promptTokens: number }).promptTokens,
+			normalizedPromptTokens: (first.payload.usage as { normalizedPromptTokens: number }).normalizedPromptTokens,
+			normalizedCompletionTokens: (first.payload.usage as { normalizedCompletionTokens: number }).normalizedCompletionTokens,
+		}, { promptTokens: 862, normalizedPromptTokens: 411, normalizedCompletionTokens: 24 })
+	} finally { await fs.rm(directory, { recursive: true, force: true }) }
+}
+
+async function testFiniteBillingIsCountedWhenAdmissionAborts(): Promise<void> {
+	const directory = await scratch()
+	try {
+		const client = new MockBillingClient([{ name: "attempt_completion" }], "unapproved/model", "Meta", {
+			responseUsage: { promptTokens: 862, completionTokens: 66 },
+			metadata: { totalCostUsd: 0.0000994, tokensPrompt: 411, tokensCompletion: 24, nativeTokensPrompt: 862, nativeTokensCompletion: 66 },
+		})
+		const summary = await collectLiveDevelopment({ outputDir: directory, client })
+		assert.equal(summary.abortedAttempts, 1)
+		assert.equal(summary.billing.responsesReceived, 1)
+		assert.equal(summary.billing.generationRecords, 1)
+		assert.equal(summary.billing.acceptedBillingRecords, 0, "route identity failure remains unaccepted")
+		assert.equal(summary.billing.unacceptedBillingRecords, 1)
+		assert.equal(summary.billing.unbilledResponses, 0, "a finite matched generation record is not called unbilled just because admission aborted")
+		assert.equal(summary.billing.promptTokens, 862)
+		assert.equal(summary.billing.completionTokens, 66)
+		assert.equal(summary.billing.totalBilledCostUsd, 0.0000994, "the received provider charge remains in totals after admission failure")
+	} finally { await fs.rm(directory, { recursive: true, force: true }) }
+}
+
 async function testUncertainRequestIsNotAutomaticallyReplayed(): Promise<void> {
 	const directory = await scratch()
 	try {
@@ -176,7 +231,11 @@ async function testUncertainRequestIsNotAutomaticallyReplayed(): Promise<void> {
 		assert.equal(first.unstartedSlots, LIVE_DEVELOPMENT_SLOTS.length - 1)
 		assert.equal(first.billing.admittedRequests, 1)
 		assert.equal(first.billing.responsesReceived, 1)
-		assert.equal(first.billing.unbilledResponses, 1)
+		assert.equal(first.billing.unresolvedRequests, 0)
+		assert.equal(first.billing.generationRecords, 1)
+		assert.equal(first.billing.acceptedBillingRecords, 0)
+		assert.equal(first.billing.unacceptedBillingRecords, 1)
+		assert.equal(first.billing.unbilledResponses, 0, "finite generation billing remains counted despite an unadmitted response identity")
 		assert.equal(badClient.requests.length, 1)
 		const goodClient = new MockBillingClient([{ name: "attempt_completion", args: JSON.stringify({ result: "done" }) }])
 		const resumed = await collectLiveDevelopment({ outputDir: directory, client: goodClient })
@@ -187,6 +246,33 @@ async function testUncertainRequestIsNotAutomaticallyReplayed(): Promise<void> {
 		await global.open()
 		assert.equal(global.list().filter((record) => record.type === "budget_reserved").length, 1)
 		assert.equal(global.list().filter((record) => record.type === "budget_settled").length, 0, "unresolved reservation remains fully charged")
+	} finally { await fs.rm(directory, { recursive: true, force: true }) }
+}
+
+async function testResponseWithoutFiniteGenerationCostIsUnbilled(): Promise<void> {
+	const directory = await scratch()
+	try {
+		const client = new MockBillingClient([{ name: "attempt_completion" }], LIVE_MODEL, "Meta", { metadata: { totalCostUsd: undefined } })
+		const summary = await collectLiveDevelopment({ outputDir: directory, client })
+		assert.equal(summary.billing.responsesReceived, 1)
+		assert.equal(summary.billing.generationRecords, 1)
+		assert.equal(summary.billing.acceptedBillingRecords, 0)
+		assert.equal(summary.billing.unacceptedBillingRecords, 0)
+		assert.equal(summary.billing.unbilledResponses, 1, "a generation record without finite cost is not billed evidence")
+		assert.equal(summary.billing.totalBilledCostUsd, 0)
+	} finally { await fs.rm(directory, { recursive: true, force: true }) }
+}
+
+async function testAdmittedRequestWithoutResponseIsShownAsUnresolved(): Promise<void> {
+	const directory = await scratch()
+	try {
+		const client = new MockBillingClient([{ name: "attempt_completion" }], LIVE_MODEL, "Meta", { failBeforeResponse: true })
+		const summary = await collectLiveDevelopment({ outputDir: directory, client })
+		assert.equal(summary.abortedAttempts, 1)
+		assert.equal(summary.billing.admittedRequests, 1)
+		assert.equal(summary.billing.responsesReceived, 0)
+		assert.equal(summary.billing.unresolvedRequests, 1, "a timed-out or failed admitted request remains visibly charge-uncertain")
+		assert.equal(summary.billing.unbilledResponses, 0)
 	} finally { await fs.rm(directory, { recursive: true, force: true }) }
 }
 
@@ -222,6 +308,10 @@ await testBillingIdentityPrecedesVirtualEffects()
 await testForbiddenToolHasZeroEffectsAndIsRecorded()
 await testShortLabelWindowsAreMasked()
 await testDevelopmentScheduleUsesSyntheticBillingOnly()
+await testNativeGenerationTokensOverrideNormalizedAccounting()
+await testFiniteBillingIsCountedWhenAdmissionAborts()
+await testAdmittedRequestWithoutResponseIsShownAsUnresolved()
+await testResponseWithoutFiniteGenerationCostIsUnbilled()
 await testUncertainRequestIsNotAutomaticallyReplayed()
 await testHeldoutCannotStartWithoutQualifiedDevelopment()
 await testStorageRootSymlinkIsRejectedBeforeInference()
