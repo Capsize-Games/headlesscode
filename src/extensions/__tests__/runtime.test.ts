@@ -5,7 +5,7 @@ import { setTimeout as delay } from "node:timers/promises"
 
 import { createExtension, loadExtension, type ExtensionBundle, type ExtensionRevision } from "../registry.js"
 import { extensionRuntimeTestHooks, SessionExtensionRuntime } from "../runtime.js"
-import { ownedChildProcessTestHooks } from "../bounded-stdio-transport.js"
+import { OwnedChildProcess, ownedChildProcessTestHooks } from "../bounded-stdio-transport.js"
 import type { ToolContext } from "../../engine/types.js"
 
 const scratchRoot = path.join(process.cwd(), ".headlesscode", "scratch")
@@ -137,6 +137,32 @@ async function testHardTimeoutAndDescendantTeardown(workspaceRoot: string): Prom
 		assert.match(childPidText, /^\d+$/)
 		assert.equal(await processIsGone(Number(childPidText)), true, "timeout tears down descendants in the owned process group")
 	} finally { await runtime.dispose() }
+}
+
+async function testImmediateAbortWaitsForSpawnBeforeCleanup(workspaceRoot: string): Promise<void> {
+	for (const abortAfterConstruction of [false, true]) {
+		const controller = new AbortController()
+		if (!abortAfterConstruction) controller.abort()
+		const child = new OwnedChildProcess({
+			command: process.execPath,
+			args: ["-e", "setInterval(() => {}, 1000)"],
+			cwd: workspaceRoot,
+			env: { PATH: process.env.PATH ?? "" },
+			stdio: ["ignore", "ignore", "ignore"],
+		}, {
+			signal: controller.signal,
+			timeoutMs: 2_000,
+			maxProtocolBytes: 1024,
+			maxStderrBytes: 1024,
+			onProtocol: () => undefined,
+		})
+		if (abortAfterConstruction) controller.abort()
+		await child.waitForSpawn()
+		const pid = child.pid
+		assert.ok(pid && pid > 0, "fixture child spawned before cleanup completes")
+		await child.stop()
+		assert.equal(await processIsGone(pid), true, "abort before or immediately after spawn still waits for identity capture and reaps the child")
+	}
 }
 
 async function testLeaderExitStillReapsOwnedDescendants(workspaceRoot: string): Promise<void> {
@@ -428,6 +454,7 @@ const workspaceRoot = await fs.mkdtemp(path.join(scratchRoot, "extension-runtime
 try {
 	await testNativeHelperBoundsPermissionsAndCapturedRevision(workspaceRoot)
 	await testHardTimeoutAndDescendantTeardown(workspaceRoot)
+	await testImmediateAbortWaitsForSpawnBeforeCleanup(workspaceRoot)
 	await testLeaderExitStillReapsOwnedDescendants(workspaceRoot)
 	await testContainedProcessGroupTeardownUsesVerifiedMembers(workspaceRoot)
 	await testContainedTeardownFailureIsPropagated(workspaceRoot)

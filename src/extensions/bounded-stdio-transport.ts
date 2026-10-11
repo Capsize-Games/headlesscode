@@ -247,8 +247,14 @@ export class OwnedChildProcess {
 		if (this.settled) return Promise.resolve()
 		this.settled = true
 		this.cleanupListeners()
-		const pid = this.child.pid
 		this.stopPromise = (async () => {
+			// Abort and timeout can arrive before Node emits `spawn`, while pid and
+			// the Linux process identity are still unavailable. Wait for the spawn
+			// outcome before deciding there is no child to clean up.
+			await this.spawned.catch((error: unknown) => {
+				if (this.child.pid) throw error
+			})
+			const pid = this.child.pid
 			if (!pid) return
 			const signalled = await this.signalTree(pid, "SIGTERM")
 			if (!signalled) return
