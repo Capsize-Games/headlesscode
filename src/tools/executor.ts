@@ -1965,9 +1965,9 @@ type ListFilesCallEntry = {
 	/** The condensation generation this key was last (really) listed at. */
 	generation: number
 	/**
-	 * Exact identity of the bounded visible listing last stored for this key:
+	 * SHA-256 identity of the bounded visible listing last stored for this key:
 	 * JSON of the sorted dirs-first entries plus the truncation flag. A repeat
-	 * call is only a cache hit when the fresh walk serializes identically.
+	 * call is only a cache hit when the fresh walk has the same identity.
 	 */
 	signature: string
 	/**
@@ -2040,10 +2040,8 @@ function listFilesHandler(
 			return a.rel.localeCompare(b.rel)
 		})
 
-		// Exact bounded identity: sorted [rel, isDir] pairs plus truncation.
-		// SHA-256 over the unambiguous JSON serialization — no weak 32-bit
-		// hash, so distinct visible filenames can never collide into a false
-		// cache hit.
+		// Hash the unambiguous bounded [rel, isDir] pairs plus truncation.
+		// SHA-256 avoids the false hits reproduced with the 32-bit signature.
 		const signature = createHash("sha256")
 			.update(JSON.stringify([collected.entries.map((e) => [e.rel, e.isDir]), collected.truncated]))
 			.digest("hex")
