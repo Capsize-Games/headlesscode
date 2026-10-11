@@ -312,7 +312,7 @@ export function parseWatchArgs(argv: string[]): { options: WatchCliOptions; erro
 	}
 	if (options.runnerId && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(options.runnerId)) return { options, error: "HEADLESSCODE_RUNNER_ID must be a safe stable machine identifier" }
 	if (!!options.runnerId !== !!options.runnerAssignee) return { options, error: "--runner-id and --runner-assignee must be set together" }
-	if (options.runnerId && options.runOnce) return { options, error: "claim-based runner pool requires continuous mode; --run-once cannot maintain leases" }
+	if (options.runnerId && options.runOnce && !options.dryRun) return { options, error: "claim-based runner pool requires continuous mode; --run-once cannot maintain leases" }
 	if (options.securityProfile === "contained") {
 		if (options.executionProvider === "local" && argv.some((arg) => arg === "--execution-provider" || arg.startsWith("--execution-provider="))) return { options, error: "contained security profile cannot use the local execution provider" }
 		options.executionProvider = "openshell"

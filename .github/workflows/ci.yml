@@ -10,7 +10,7 @@ name: ci
 
 on:
   push:
-    branches: ["**"]
+    branches: ["**", "!headlesscode-claims/**"]
   pull_request:
   workflow_dispatch:
 

@@ -27,6 +27,7 @@ try {
 	assert.equal(runnerPool.options.maxConcurrentSessions, 2)
 	assert.match(parseWatchArgs(["--runner-id", "node-1"]).error ?? "", /must be set together/)
 	assert.match(parseWatchArgs(["--runner-id", "node-1", "--runner-assignee", "runner-bot", "--run-once"]).error ?? "", /continuous mode/)
+	assert.equal(parseWatchArgs(["--runner-id", "node-1", "--runner-assignee", "runner-bot", "--dry-run", "--run-once"]).error, undefined, "dry-run does not need to maintain a claim lease")
 	assert.match(parseWatchArgs(["--runner-id", "unsafe/name", "--runner-assignee", "runner-bot"]).error ?? "", /safe stable machine identifier/)
 } finally {
 	if (prior === undefined) delete process.env.HEADLESSCODE_SECURITY_PROFILE
