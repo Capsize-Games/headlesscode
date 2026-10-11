@@ -4,6 +4,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 
 import { HeadlessSession } from "../loop.js"
+import { createHeadlessExecutor } from "../../tools/executor.js"
 import { eventsDir, eventsFilePath, readEventsFile } from "../events.js"
 import type { ChatMessage, IterationBoundaryHook, IterationBoundaryIntervention, LlmClient, LlmRequest, LlmResponse } from "../types.js"
 
@@ -225,10 +226,53 @@ async function testNoHookPreservesWireAndEvents() {
 	} finally { await fs.rm(workspaceRoot, { recursive: true, force: true }) }
 }
 
+async function testNestedBatchObservationOrderAndImmutability() {
+	const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "hc-boundary-batch-"))
+	try {
+		const executor = createHeadlessExecutor(workspaceRoot)
+		let releaseSlow!: () => void
+		const fastFinished = new Promise<void>((resolve) => { releaseSlow = resolve })
+		const finished: string[] = []
+		executor.register("read_file", async (args) => {
+			if (args.path === "slow.txt") {
+				await fastFinished
+				await new Promise<void>((resolve) => setImmediate(resolve))
+			} else releaseSlow()
+			finished.push(String(args.path))
+			return { content: String(args.path), isError: false }
+		})
+		const observations: Array<{ names: string[]; paths: unknown[]; immutable: boolean }> = []
+		let requests = 0
+		const client: LlmClient = { async createChatCompletion() {
+			requests++
+			return { message: requests === 1 ? tool("batch", { calls: [
+				{ tool: "read_file", args: { path: "slow.txt", extra: { values: ["first"] } } },
+				{ tool: "read_file", args: { path: "fast.txt", extra: { values: ["second"] } } },
+			] }, "batch-1") : tool("attempt_completion", { result: "done" }, "complete") }
+		} }
+		const result = await new HeadlessSession({ workspaceRoot, mode: "code", taskText: "read the files", model: "fake", llmClient: client,
+			executor, checkpoints: false, maxIterations: 2, iterationBoundaryHook: (snapshot) => {
+				observations.push({ names: snapshot.toolCalls.map((call) => call.name), paths: snapshot.toolCalls.map((call) => call.arguments.path),
+					immutable: snapshot.toolCalls.every((call) => {
+						if (call.name === "batch") {
+							const calls = call.arguments.calls as Array<{ args: { extra: { values: string[] } } }>
+							return Object.isFrozen(calls) && Object.isFrozen(calls[0].args.extra.values)
+						}
+						const extra = call.arguments.extra as { values: string[] }
+						return Object.isFrozen(extra) && Object.isFrozen(extra.values)
+					}) })
+			} }).run()
+		assert.equal(result.status, "success")
+		assert.deepEqual(finished, ["fast.txt", "slow.txt"], "reads actually finished out of submission order")
+		assert.deepEqual(observations, [{ names: ["read_file", "read_file", "batch"], paths: ["slow.txt", "fast.txt", undefined], immutable: true }])
+	} finally { await fs.rm(workspaceRoot, { recursive: true, force: true }) }
+}
+
 await testBoundaryHook()
 await testMalformedAndDuplicateInterventionsAbstain()
 await testTimeoutCannotApplyAfterCompletion()
 await testImmutableObservationAndFixedAuthority()
+await testNestedBatchObservationOrderAndImmutability()
 await testInterventionCannotExtendBudget()
 await testNonFiniteMalformedAndThrowingMonitor()
 await testNoHookPreservesWireAndEvents()
