@@ -135,9 +135,9 @@ async function testClaimLifecycleAndExpiredQuarantine(): Promise<void> {
 
 	await assert.rejects(runnerA.release(41, first.claim, { kind: "never-spawned", observedAt: "not-a-date" }))
 	const released = await runnerA.release(41, first.claim, {
-		kind: "process-groups-absent",
+		kind: "never-spawned",
 		observedAt: now.toISOString(),
-	}, "completed")
+	})
 	assert.equal(released.phase, "released")
 	const next = await runnerB.acquire(41, { worktreeNames: ["w2"] })
 	assert.equal(next.acquired, true)
@@ -146,8 +146,13 @@ async function testClaimLifecycleAndExpiredQuarantine(): Promise<void> {
 	await assert.rejects(runnerB.release(41, running, { kind: "never-spawned", observedAt: now.toISOString() }))
 	assert.ok(api.refs.has("heads/headlesscode-claims/issue-41"), "claim refs remain; release never deletes a ref")
 
-	now = new Date("2026-10-11T12:00:32.000Z")
-	const afterRelease = await runnerB.release(41, running, { kind: "process-groups-absent", observedAt: now.toISOString() }, "completed")
+	now = new Date("2026-10-11T12:01:02.000Z")
+	const runningTip = (await runnerB.read(41))!.commitSha
+	const afterRelease = await runnerB.recoverExpired(41, { ...running, tip: runningTip }, {
+		operator: "owner",
+		evidence: "Worker and guest resources independently checked and absent.",
+		terminalStateConfirmed: true,
+	})
 	assert.equal(afterRelease.phase, "released")
 	const third = await runnerB.acquire(41, { worktreeNames: ["w2"] })
 	assert.equal(third.acquired, true)
@@ -233,12 +238,21 @@ async function testWatcherClaimSurvivesUntilConfirmedCompletion(): Promise<void>
 	const repoRoot = await fs.mkdtemp(path.join(scratch, "repo-"))
 	const stateFile = path.join(repoRoot, ".worktrees", ".watcher-state.json")
 	const issue: GitHubIssue = { number: 74, title: "synthetic claim integration", labels: ["needs-agent"] }
+	const listActive = claims.listActiveClaims.bind(claims)
+	let claimReads = 0
+	claims.listActiveClaims = async () => {
+		claimReads++
+		// Sweep 1 sees no claim; sweep 2 reconciles the spawned claim. Skip the
+		// shutdown stop-script path so this test cannot contact OpenShell.
+		return claimReads === 2 ? listActive() : []
+	}
+	let issueLists = 0
 	const result = await watchIssues({
 		owner: "owner", repo: "repo", targetLabel: "needs-agent", token: "test-token",
 		repoRoot, stateFile, runOnce: false, pollIntervalMs: 10, maxConcurrentSessions: 1,
 		runnerId: "workstation", runnerAssignee: "synthetic-bot", claimStore: claims,
 		gh: {
-			listIssues: async () => [issue],
+			listIssues: async () => ++issueLists === 1 ? [issue] : (controller.abort(), []),
 			getIssue: async () => issue,
 			addLabel: async () => undefined,
 		},
@@ -249,6 +263,7 @@ async function testWatcherClaimSurvivesUntilConfirmedCompletion(): Promise<void>
 				const absentPgid = 2_147_483_647
 				assert.throws(() => process.kill(-absentPgid, 0), (error: NodeJS.ErrnoException) => error.code === "ESRCH")
 				await fs.writeFile(path.join(worktree, ".harness.pgid"), `${absentPgid}\n`)
+				await fs.writeFile(path.join(worktree, ".harness.openshell-sandbox"), "stale-sandbox-id\n")
 			}
 			return { ok: true, status: 0 }
 		},
@@ -258,8 +273,8 @@ async function testWatcherClaimSurvivesUntilConfirmedCompletion(): Promise<void>
 	})
 	assert.equal(result.spawned, 1)
 	const finalClaim = await claims.read(issue.number)
-	assert.equal(finalClaim?.claim.phase, "released", "completion releases only after marker and process-group absence are confirmed")
-	assert.equal((await claims.listActiveClaims("workstation")).length, 0)
+	assert.equal(finalClaim?.claim.phase, "active", "forged/dead PID markers and stale sandbox markers never release a dispatched claim")
+	assert.equal((await listActive()).length, 1, "the claim remains quarantined until independent operator recovery")
 	await fs.rm(repoRoot, { recursive: true, force: true })
 }
 
@@ -317,6 +332,85 @@ async function testMarkerOnlyClaimStaysQuarantinedAndCountsEveryWorktree(): Prom
 	await fs.rm(repoRoot, { recursive: true, force: true })
 }
 
+async function testRunnerPoolCapacityUnionsLocalAndClaimedSessions(): Promise<void> {
+	const api = claimApi()
+	const now = () => new Date("2026-10-11T12:00:00.000Z")
+	const claims = store(api, "workstation", now, "nonce-union-capacity-0123")
+	const acquired = await claims.acquire(78, { worktreeNames: ["claimed-a", "claimed-b"] })
+	assert.equal(acquired.acquired, true)
+	if (!acquired.acquired) throw new Error("expected active claims")
+	await claims.markRunning(78, acquired.claim)
+
+	const scratch = path.join(process.cwd(), ".headlesscode", "scratch", "node-pool-32-claims-test")
+	await fs.mkdir(scratch, { recursive: true, mode: 0o700 })
+	const repoRoot = await fs.mkdtemp(path.join(scratch, "union-capacity-"))
+	await fs.mkdir(path.join(repoRoot, ".worktrees"), { recursive: true })
+	await fs.writeFile(path.join(repoRoot, ".worktrees", ".orchestrator-state.json"), JSON.stringify({
+		groups: [{ name: "unrelated-local-session", status: "running" }],
+	}))
+
+	const controller = new AbortController()
+	const listActive = claims.listActiveClaims.bind(claims)
+	let claimReads = 0
+	claims.listActiveClaims = async () => ++claimReads === 1 ? listActive() : []
+	const issue: GitHubIssue = { number: 79, title: "synthetic capacity issue", labels: ["needs-agent"] }
+	const result = await watchIssues({
+		owner: "owner", repo: "repo", targetLabel: "needs-agent", token: "test-token",
+		repoRoot, stateFile: path.join(repoRoot, ".worktrees", ".watcher-state.json"),
+		runOnce: false, pollIntervalMs: 1, maxConcurrentSessions: 2,
+		runnerId: "workstation", runnerAssignee: "synthetic-bot", claimStore: claims,
+		gh: {
+			listIssues: async () => { controller.abort(); return [issue] },
+			getIssue: async () => issue,
+			addLabel: async () => undefined,
+		},
+		spawn: async () => { throw new Error("capacity should defer before spawn") },
+		signal: controller.signal,
+		logger: new Logger({ level: "silent" }),
+	})
+	assert.equal(result.spawned, 0, "two claimed worktrees plus one unrelated local session exceed cap two")
+	assert.equal(result.sweeps[0]?.deferred, 1)
+	await fs.rm(repoRoot, { recursive: true, force: true })
+}
+
+async function testRunnerPoolRequiresRenewalMargin(): Promise<void> {
+	const api = claimApi()
+	const claims = store(api, "workstation", () => new Date("2026-10-11T12:00:00.000Z"), "nonce-poll-margin-012345")
+	await assert.rejects(watchIssues({
+		owner: "owner", repo: "repo", targetLabel: "needs-agent", token: "test-token",
+		repoRoot: process.cwd(), runOnce: false, pollIntervalMs: 15_001,
+		runnerId: "workstation", runnerAssignee: "synthetic-bot", claimStore: claims,
+		gh: { listIssues: async () => [], getIssue: async () => ({ number: 1, title: "", labels: [] }), addLabel: async () => undefined },
+	}), /at most half the claim lease/)
+}
+
+async function testUncertainSpawnExceptionKeepsClaimQuarantined(): Promise<void> {
+	const api = claimApi()
+	const claims = store(api, "workstation", () => new Date("2026-10-11T12:00:00.000Z"), "nonce-uncertain-spawn-0123")
+	const listActive = claims.listActiveClaims.bind(claims)
+	claims.listActiveClaims = async () => [] // avoid invoking the external stop script during shutdown
+	const scratch = path.join(process.cwd(), ".headlesscode", "scratch", "node-pool-32-claims-test")
+	await fs.mkdir(scratch, { recursive: true, mode: 0o700 })
+	const repoRoot = await fs.mkdtemp(path.join(scratch, "uncertain-spawn-"))
+	const controller = new AbortController()
+	const issue: GitHubIssue = { number: 80, title: "synthetic uncertain spawn", labels: ["needs-agent"] }
+	const result = await watchIssues({
+		owner: "owner", repo: "repo", targetLabel: "needs-agent", token: "test-token",
+		repoRoot,
+		stateFile: path.join(repoRoot, ".worktrees", ".watcher-state.json"),
+		runOnce: false, pollIntervalMs: 1,
+		runnerId: "workstation", runnerAssignee: "synthetic-bot", claimStore: claims,
+		gh: { listIssues: async () => { controller.abort(); return [issue] }, getIssue: async () => issue, addLabel: async () => undefined },
+		spawn: async () => { throw new Error("synthetic exception after dispatch began") },
+		onBatch: () => controller.abort(), signal: controller.signal,
+		logger: new Logger({ level: "silent" }),
+	})
+	assert.equal(result.spawned, 0)
+	assert.equal((await claims.read(issue.number))?.claim.phase, "active", "an exception with uncertain dispatch must never release as never-spawned")
+	assert.equal((await listActive()).length, 1)
+	await fs.rm(repoRoot, { recursive: true, force: true })
+}
+
 await testClaimLifecycleAndExpiredQuarantine()
 await testAssignmentFailureDoesNotLeaveUnownedActiveClaim()
 await testExpiredClaimNeedsExplicitFencedOperatorRecovery()
@@ -324,4 +418,7 @@ await testInitialClaimsRaceWithOnlyOneWinner()
 await testRefUpdateUsesParentAndNoForce()
 await testWatcherClaimSurvivesUntilConfirmedCompletion()
 await testMarkerOnlyClaimStaysQuarantinedAndCountsEveryWorktree()
+await testRunnerPoolCapacityUnionsLocalAndClaimedSessions()
+await testRunnerPoolRequiresRenewalMargin()
+await testUncertainSpawnExceptionKeepsClaimQuarantined()
 process.stdout.write("watcher claims tests passed\n")

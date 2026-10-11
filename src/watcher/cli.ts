@@ -51,7 +51,8 @@ Options:
                          repo name defaults to the directory basename.
   --gh-repo <name>       GitHub repo name override (default: basename of --repo)
   --label <name>         The label that triggers processing, e.g. needs-agent
-  --poll-interval-ms <n> Sweep interval in continuous mode (default: 60000)
+  --poll-interval-ms <n> Sweep interval in continuous mode (default: 60000);
+                         runner-pool mode requires at most half the claim lease
   --run-once             One sweep then exit 0 (or 1 if any spawn failed);
                          the cron/CI form of the watcher
   --max-per-sweep <n>    Max NEW issues spawned per sweep (default: 5); the

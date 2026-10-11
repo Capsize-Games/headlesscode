@@ -74,6 +74,8 @@ export interface SpawnResult {
 	ok: boolean
 	/** The exact bash command that was (or would be) run. */
 	command?: string
+	/** True when spawn threw after dispatch may have begun and outcome is uncertain. */
+	mayHaveDispatched?: boolean
 	/** spawnSync exit status (null = spawn failed to launch). */
 	status?: number | null
 	error?: string
@@ -207,6 +209,9 @@ export async function watchIssues(config: WatcherConfig): Promise<WatchResult> {
 		...(config.ghBaseUrl ? { baseUrl: config.ghBaseUrl } : {}),
 		...(config.claimLeaseMs ? { leaseMs: config.claimLeaseMs } : {}),
 	}) : undefined)
+	if (config.runnerId && claimStore && pollIntervalMs > Math.floor(claimStore.leaseDurationMs / 2)) {
+		throw new Error(`watcher runner pool poll interval (${pollIntervalMs}ms) must be at most half the claim lease (${claimStore.leaseDurationMs}ms) so claims can be renewed before expiry`)
+	}
 	const limiter = new ConcurrencyLimiter(maxConcurrentSessions)
 	const gh = config.gh ?? createGhClient({ token, baseUrl: config.ghBaseUrl })
 	const logger = config.logger ?? new Logger({ level: "info" })
@@ -265,7 +270,7 @@ export async function watchIssues(config: WatcherConfig): Promise<WatchResult> {
 		await sleepOrAbort(pollIntervalMs, config.signal)
 	}
 	if (config.signal?.aborted && claimStore && config.runnerId) {
-		state = await stopAndReleaseRunnerClaims(state, claimStore, config.runnerId, repoRoot, logger)
+		state = await stopRunnerClaims(state, claimStore, config.runnerId, repoRoot, logger)
 	}
 
 	// Final save so lastSweep is durable even after a clean abort.
@@ -373,8 +378,9 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 	// A claim is per issue, but an issue may fan out into several worktrees.
 	// Capacity is per worker session, so count every assigned worktree (including
 	// quarantined claims retained by reconciliation).
-	const claimedSessions = activeRunnerClaims.reduce((total, entry) => total + entry.claim.worktreeNames.length, 0)
-	const active = input.claimStore && input.runnerId ? Math.max(localActive, claimedSessions) : localActive
+	const active = input.claimStore && input.runnerId
+		? countRunnerPoolSessions(orchState, state, activeRunnerClaims)
+		: localActive
 	const available = Math.max(0, maxConcurrentSessions - active)
 	const toSpawn = newIssues.slice(0, Math.min(maxPerSweep, available))
 	const deferred = newIssues.slice(toSpawn.length)
@@ -569,7 +575,7 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 			try {
 				result = await spawn(batchInfo)
 			} catch (err) {
-				result = { ok: false, error: err instanceof Error ? err.message : String(err) }
+				result = { ok: false, mayHaveDispatched: true, error: err instanceof Error ? err.message : String(err) }
 			}
 
 			if (result.ok) {
@@ -578,9 +584,8 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 						ownedClaim = await input.claimStore.markRunning(issue.number, ownedClaim)
 					} catch (err) {
 						logger.error(`watcher: could not mark issue #${issue.number} claim running; stopping its workers: ${err instanceof Error ? err.message : String(err)}`)
-						if (await stopAndVerifyWorkerGroups(repoRoot, ownedClaim.worktreeNames, logger)) {
-							if (await releaseAfterStop(input.claimStore, ownedClaim, logger, "spawn-failed")) ownedClaim = undefined
-						}
+						await stopWorkerGroupsBestEffort(repoRoot, ownedClaim.worktreeNames, logger)
+						logger.warn(`watcher: issue #${issue.number} claim remains quarantined after claim-stage failure; worker markers cannot authorize release`)
 					}
 				}
 				state = markProcessed(state, { ...entry, status: "done", updatedAt: new Date().toISOString() })
@@ -595,11 +600,12 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 				const error = result.error ?? `spawn exited ${result.status ?? "unknown"}`
 				let claimReferenceStillActive = !!ownedClaim
 				if (ownedClaim && input.claimStore) {
-					if (!result.command) {
+					if (!result.command && !result.mayHaveDispatched) {
 						await releaseClaimIfNoWorkers(input.claimStore, ownedClaim, logger, "spawn-failed")
 						claimReferenceStillActive = false
-					} else if (await stopAndVerifyWorkerGroups(repoRoot, ownedClaim.worktreeNames, logger)) {
-						claimReferenceStillActive = !(await releaseAfterStop(input.claimStore, ownedClaim, logger, "spawn-failed"))
+					} else {
+						if (result.command) await stopWorkerGroupsBestEffort(repoRoot, ownedClaim.worktreeNames, logger)
+						logger.warn(`watcher: issue #${issue.number} ${result.mayHaveDispatched ? "spawn outcome is uncertain" : "spawn failed after dispatch"}; claim remains quarantined for operator recovery`)
 					}
 				}
 				state = markProcessed(state, { ...entry, status: "failed", error, updatedAt: new Date().toISOString(), ...(claimReferenceStillActive && ownedClaim ? { claim: claimReference(ownedClaim) } : { claim: undefined }) })
@@ -673,16 +679,14 @@ async function reconcileRunnerClaims(
 		const claim = snapshot.claim
 		const inspection = inspectWorkerGroups(repoRoot, claim.worktreeNames)
 		if (inspection === "stopped") {
-			try {
-				await store.release(claim.issue, claim, { kind: "process-groups-absent", observedAt: new Date().toISOString() }, "completed")
-				state = clearClaimHandle(state, claim.issue, claim.leaseNonce)
-				logger.info(`watcher: released issue #${claim.issue} claim after worker teardown`, { runner: claim.runnerId, epoch: claim.epoch })
-				continue
-			} catch (error) {
-				logger.warn(`watcher: issue #${claim.issue} is stopped locally but its claim could not be released; capacity remains reserved: ${error instanceof Error ? error.message : String(error)}`)
-				retained.push(snapshot)
-				continue
-			}
+			// PID/PGID/done/sandbox markers are inside a worker-writable worktree.
+			// Even a dead PID or a missing marker cannot establish that a detached
+			// process on another machine (or an OpenShell guest) is absent. Stop
+			// renewing so the lease can expire into the existing operator-recovery
+			// path, but keep the claim active and capacity reserved.
+			logger.warn(`watcher: issue #${claim.issue} worker markers indicate completion, but claim remains quarantined until an operator independently confirms teardown`)
+			retained.push(snapshot)
+			continue
 		}
 
 		try {
@@ -697,28 +701,14 @@ async function reconcileRunnerClaims(
 					state = updateClaimHandle(state, running)
 				} catch (error) {
 					logger.warn(`watcher: issue #${claim.issue} claim stage could not be verified; stopping its workers: ${error instanceof Error ? error.message : String(error)}`)
-					if (await stopAndVerifyWorkerGroups(repoRoot, claim.worktreeNames, logger)) {
-						try {
-							await store.release(claim.issue, renewed, { kind: "process-groups-absent", observedAt: new Date().toISOString() }, "completed")
-							retained.pop()
-							state = clearClaimHandle(state, claim.issue, claim.leaseNonce)
-						} catch (releaseError) {
-							logger.warn(`watcher: issue #${claim.issue} teardown was confirmed but release failed; claim remains quarantined: ${releaseError instanceof Error ? releaseError.message : String(releaseError)}`)
-						}
-					}
+					await stopWorkerGroupsBestEffort(repoRoot, claim.worktreeNames, logger)
+					logger.warn(`watcher: issue #${claim.issue} claim remains quarantined after claim-stage failure; worker markers cannot authorize release`)
 				}
 			}
 		} catch (error) {
 			logger.error(`watcher: issue #${claim.issue} claim renewal failed; stopping its workers: ${error instanceof Error ? error.message : String(error)}`)
-			if (await stopAndVerifyWorkerGroups(repoRoot, claim.worktreeNames, logger)) {
-				try {
-					await store.release(claim.issue, claim, { kind: "process-groups-absent", observedAt: new Date().toISOString() }, "completed")
-					state = clearClaimHandle(state, claim.issue, claim.leaseNonce)
-					continue
-				} catch (releaseError) {
-					logger.warn(`watcher: issue #${claim.issue} stopped but release could not be verified; claim remains quarantined: ${releaseError instanceof Error ? releaseError.message : String(releaseError)}`)
-				}
-			}
+			await stopWorkerGroupsBestEffort(repoRoot, claim.worktreeNames, logger)
+			logger.warn(`watcher: issue #${claim.issue} claim remains quarantined after renewal failure; worker markers cannot authorize release`)
 			retained.push(snapshot)
 		}
 	}
@@ -727,12 +717,12 @@ async function reconcileRunnerClaims(
 
 async function stopLocalClaimsOnUncertainty(state: WatcherState, repoRoot: string, logger: Logger): Promise<WatcherState> {
 	for (const entry of Object.values(state.processed)) {
-		if (entry.claim) await stopAndVerifyWorkerGroups(repoRoot, entry.claim.worktreeNames, logger)
+		if (entry.claim) await stopWorkerGroupsBestEffort(repoRoot, entry.claim.worktreeNames, logger)
 	}
 	return state
 }
 
-async function stopAndReleaseRunnerClaims(
+async function stopRunnerClaims(
 	initialState: WatcherState,
 	store: GitHubIssueClaimStore,
 	runnerId: string,
@@ -743,13 +733,8 @@ async function stopAndReleaseRunnerClaims(
 	try {
 		const claims = await store.listActiveClaims(runnerId)
 		for (const { claim } of claims) {
-			if (!await stopAndVerifyWorkerGroups(repoRoot, claim.worktreeNames, logger)) continue
-			try {
-				await store.release(claim.issue, claim, { kind: "process-groups-absent", observedAt: new Date().toISOString() }, "completed")
-				state = clearClaimHandle(state, claim.issue, claim.leaseNonce)
-			} catch (error) {
-				logger.error(`watcher shutdown: issue #${claim.issue} stopped but claim release is unverified and remains quarantined: ${error instanceof Error ? error.message : String(error)}`)
-			}
+			await stopWorkerGroupsBestEffort(repoRoot, claim.worktreeNames, logger)
+			logger.warn(`watcher shutdown: issue #${claim.issue} remains quarantined; an operator must independently confirm worker and guest teardown before recovery`)
 		}
 	} catch (error) {
 		state = await stopLocalClaimsOnUncertainty(state, repoRoot, logger)
@@ -768,21 +753,6 @@ async function releaseClaimIfNoWorkers(
 		await store.release(claim.issue, claim, { kind: "never-spawned", observedAt: new Date().toISOString() }, reason)
 	} catch (error) {
 		logger.warn(`watcher: issue #${claim.issue} claim could not be released and remains quarantined: ${error instanceof Error ? error.message : String(error)}`)
-	}
-}
-
-async function releaseAfterStop(
-	store: GitHubIssueClaimStore,
-	claim: RunnerClaim,
-	logger: Logger,
-	reason: RunnerClaim["releaseReason"],
-): Promise<boolean> {
-	try {
-		await store.release(claim.issue, claim, { kind: "process-groups-absent", observedAt: new Date().toISOString() }, reason)
-		return true
-	} catch (error) {
-		logger.warn(`watcher: issue #${claim.issue} teardown was confirmed but claim could not be released; capacity remains reserved: ${error instanceof Error ? error.message : String(error)}`)
-		return false
 	}
 }
 
@@ -820,26 +790,26 @@ function inspectWorkerTree(worktree: string, label: "harness" | "qa"): "running"
 			if ((error as NodeJS.ErrnoException).code !== "ESRCH") return "unknown"
 		}
 	}
-	// A completion marker says the wrapper finished; it cannot prove that a
-	// detached process is absent. Only a recorded PID/PGID with an ESRCH result
-	// establishes teardown. Marker-only evidence stays quarantined.
+	// PID/PGID/done markers provide only a local liveness hint for lease renewal.
+	// They are worker-writable and never authorize release of a dispatched claim.
 	if (hadEvidence) return "stopped"
 	if (fs.existsSync(markerPath)) return "unknown"
 	return "absent"
 }
 
-async function stopAndVerifyWorkerGroups(repoRoot: string, names: string[], logger: Logger): Promise<boolean> {
+async function stopWorkerGroupsBestEffort(repoRoot: string, names: string[], logger: Logger): Promise<void> {
 	const stopScript = path.join(HARNESS_ROOT, "scripts", "stop-worker.sh")
 	for (const name of names) {
 		const worktree = path.join(repoRoot, ".worktrees", name)
-		if (!fs.existsSync(worktree)) return false
+		if (!fs.existsSync(worktree)) {
+			logger.warn(`watcher: cannot attempt worker stop for missing worktree ${name}`)
+			continue
+		}
 		const result = spawnSync("bash", [stopScript, worktree, "--grace-ms", "5000"], { stdio: "ignore", timeout: 15_000 })
 		if (result.status !== 0 || result.error) {
 			logger.error(`watcher: could not confirm stop-worker teardown for ${name}`)
-			return false
 		}
 	}
-	return inspectWorkerGroups(repoRoot, names) === "stopped"
 }
 
 function claimReference(claim: RunnerClaim): NonNullable<WatcherIssueEntry["claim"]> {
@@ -857,10 +827,26 @@ function updateClaimHandle(state: WatcherState, claim: RunnerClaim): WatcherStat
 	return markProcessed(state, { ...prior, claim: claimReference(claim) })
 }
 
-function clearClaimHandle(state: WatcherState, issue: number, leaseNonce: string): WatcherState {
-	const prior = state.processed[String(issue)]
-	if (!prior || prior.claim?.leaseNonce !== leaseNonce) return state
-	return markProcessed(state, { ...prior, claim: undefined })
+/** Count the union of local durable sessions and this runner's claimed worktrees. */
+function countRunnerPoolSessions(
+	orchState: ReturnType<typeof loadStateSync>,
+	watcherState: WatcherState,
+	claims: readonly ClaimSnapshot[],
+): number {
+	const sessions = new Set<string>()
+	for (const group of orchState?.groups ?? []) {
+		if (group.status === "spawned" || group.status === "running") sessions.add(`worktree:${group.name}`)
+	}
+	for (const entry of Object.values(watcherState.processed)) {
+		if (entry.status !== "spawned") continue
+		const names = entry.claim?.worktreeNames ?? entry.groups?.map((group) => group.name) ?? []
+		if (names.length === 0) sessions.add(`watcher-issue:${entry.number}`)
+		else for (const name of names) sessions.add(`worktree:${name}`)
+	}
+	for (const snapshot of claims) {
+		for (const name of snapshot.claim.worktreeNames) sessions.add(`worktree:${name}`)
+	}
+	return sessions.size
 }
 
 function batchId(): string {
