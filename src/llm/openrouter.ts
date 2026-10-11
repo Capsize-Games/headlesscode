@@ -28,6 +28,7 @@ import type {
 import { randomUUID } from "node:crypto"
 import { parseEndpointPricing, type EndpointPricingEntry, type ModelPrice } from "../budget/cost.js"
 import { captureTranscript, isTranscriptCaptureEnabled } from "./transcript-capture.js"
+import { packRequestBody, PromptByteBudgetError, resolvePromptByteBudget } from "./request-budget.js"
 
 export const OPENROUTER_BASE_URL = "https://openrouter.ai"
 export const DEFAULT_MODEL = "deepseek/deepseek-v4-flash-0731"
@@ -40,6 +41,8 @@ export interface OpenRouterClientOptions {
 	appTitle?: string
 	/** For synthetic diagnostics that must never write prompt-bearing transcripts. */
 	disableTranscriptCapture?: boolean
+	/** Maximum exact serialized chat request size in UTF-8 bytes; env: HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES. */
+	maxPromptBytes?: number
 }
 
 /** Non-content billing/route record retrieved from OpenRouter's generation API. */
@@ -92,6 +95,7 @@ export class OpenRouterError extends Error {
  * are deterministic and retrying would just fail the same way again.
  */
 export function isRetryableOpenRouterError(error: unknown): boolean {
+	if (error instanceof PromptByteBudgetError) return false
 	if (!(error instanceof OpenRouterError)) {
 		return false
 	}
@@ -131,6 +135,7 @@ export class OpenRouterClient implements LlmClient {
 	private readonly httpReferer?: string
 	private readonly appTitle?: string
 	private readonly disableTranscriptCapture: boolean
+	private readonly maxPromptBytes: number | undefined
 
 	constructor(options: OpenRouterClientOptions = {}) {
 		this.apiKey = options.apiKey ?? process.env.HEADLESSCODE_OPENROUTER_API_KEY
@@ -139,6 +144,7 @@ export class OpenRouterClient implements LlmClient {
 		this.httpReferer = options.httpReferer ?? process.env.OPENROUTER_HTTP_REFERER
 		this.appTitle = options.appTitle ?? process.env.OPENROUTER_APP_TITLE
 		this.disableTranscriptCapture = options.disableTranscriptCapture ?? false
+		this.maxPromptBytes = resolvePromptByteBudget(options.maxPromptBytes)
 	}
 
 	/**
@@ -474,26 +480,45 @@ export class OpenRouterClient implements LlmClient {
 
 		const headers = this.authHeaders()
 
-		const body = buildRequestBody(request, model)
+		const builtBody = buildRequestBody(request, model)
+		const packed = this.maxPromptBytes === undefined
+			? (() => {
+				const json = JSON.stringify(builtBody)
+				return { body: builtBody, json, bytes: Buffer.byteLength(json, "utf8"), evictedGroups: 0, truncatedToolResults: 0 }
+			})()
+			: packRequestBody(builtBody, this.maxPromptBytes)
+		const body = packed.body
 
 		// Opt-in SSE streaming (streaming-and-reasoning). When `request.stream`
 		// is true the response is parsed incrementally from the `data:` lines and
 		// the final message is assembled from the deltas; otherwise the legacy
 		// single blocking fetch path below runs unchanged (the default).
 		if (request.stream) {
-			return this.streamChatCompletion(request, url, headers, body)
+			try {
+				return await this.streamChatCompletion(request, url, headers, body, packed.json, model, startedAt)
+			} catch (err) {
+				if (!this.disableTranscriptCapture && isTranscriptCaptureEnabled()) {
+					captureTranscript(
+						{ provider: "openrouter", model },
+						{ messages: body.messages as ChatMessage[], originalMessages: request.messages, tools: request.tools, temperature: request.temperature, wireRequest: body, error: err instanceof Error ? err.message : String(err), durationMs: Date.now() - startedAt },
+					)
+				}
+				throw err
+			}
 		}
 
 		try {
-			return await this.createChatCompletionNonStreaming(request, url, headers, body, model, startedAt)
+			return await this.createChatCompletionNonStreaming(request, url, headers, body, packed.json, model, startedAt)
 		} catch (err) {
 			if (!this.disableTranscriptCapture && isTranscriptCaptureEnabled()) {
 				captureTranscript(
 					{ provider: "openrouter", model },
 					{
-						messages: request.messages,
+						messages: body.messages as ChatMessage[],
+						originalMessages: request.messages,
 						tools: request.tools,
 						temperature: request.temperature,
+						wireRequest: body,
 						error: err instanceof Error ? err.message : String(err),
 						durationMs: Date.now() - startedAt,
 					},
@@ -508,6 +533,7 @@ export class OpenRouterClient implements LlmClient {
 		url: string,
 		headers: Record<string, string>,
 		body: Record<string, unknown>,
+		wireJson: string,
 		model: string,
 		startedAt: number,
 	): Promise<LlmResponse> {
@@ -516,7 +542,7 @@ export class OpenRouterClient implements LlmClient {
 			response = await fetch(url, {
 				method: "POST",
 				headers,
-				body: JSON.stringify(body),
+				body: wireJson,
 				signal: request.signal,
 			})
 		} catch (err) {
@@ -592,7 +618,7 @@ export class OpenRouterClient implements LlmClient {
 		if (!this.disableTranscriptCapture && isTranscriptCaptureEnabled()) {
 			captureTranscript(
 				{ provider: "openrouter", model },
-				{ messages: request.messages, tools: request.tools, temperature: request.temperature, response: result, durationMs: Date.now() - startedAt },
+				{ messages: body.messages as ChatMessage[], originalMessages: request.messages, tools: request.tools, temperature: request.temperature, wireRequest: body, response: result, durationMs: Date.now() - startedAt },
 			)
 		}
 		return result
@@ -624,17 +650,16 @@ export class OpenRouterClient implements LlmClient {
 		url: string,
 		headers: Record<string, string>,
 		body: Record<string, unknown>,
+		wireJson: string,
+		model: string,
+		startedAt: number,
 	): Promise<LlmResponse> {
-		const streamBody: Record<string, unknown> = {
-			...body,
-		}
-
 		let response: Response
 		try {
 			response = await fetch(url, {
 				method: "POST",
 				headers,
-				body: JSON.stringify(streamBody),
+				body: wireJson,
 				signal: request.signal,
 			})
 		} catch (err) {
@@ -819,13 +844,20 @@ export class OpenRouterClient implements LlmClient {
 			fail("OpenRouter stream ended with no content, reasoning, tool calls or usage")
 		}
 
-		return {
+		const result: LlmResponse = {
 			message,
 			usage: mapUsage(lastUsage, lastCacheDiscount),
 			generationId,
 			returnedModel,
 			providerName,
 		}
+		if (!this.disableTranscriptCapture && isTranscriptCaptureEnabled()) {
+			captureTranscript(
+				{ provider: "openrouter", model },
+				{ messages: body.messages as ChatMessage[], originalMessages: request.messages, tools: request.tools, temperature: request.temperature, wireRequest: body, response: result, durationMs: Date.now() - startedAt },
+			)
+		}
+		return result
 	}
 }
 
