@@ -3737,31 +3737,29 @@ async function testVerifyBeforeCompletionRefusesUnsupportedMeasurementClaim(): P
 }
 
 async function testVerifyBeforeCompletionMatchesTerminalDecimalExactly(): Promise<void> {
-	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc-terminal-decimal-"))
-	try {
-		const client = new FakeLlmClient([
-			() => toolCall("execute_command", { command: "echo 42" }),
-			() => toolCall("attempt_completion", { result: "Measured 205.9." }),
-			() => toolCall("execute_command", { command: "echo 205" }),
-			() => toolCall("attempt_completion", { result: "Measured 205.9." }),
-			() => toolCall("execute_command", { command: "echo 205.90" }),
-			() => toolCall("attempt_completion", { result: "Measured 205.9." }),
-			() => toolCall("execute_command", { command: "echo 205.9" }),
-			() => toolCall("attempt_completion", { result: "Measured 205.9." }),
-		])
-		const session = await makeSession({
-			task: "measure the benchmark",
-			client,
-			workspaceRoot: ws,
-			verifyBeforeCompletion: true,
-		})
-		const result = await session.run()
+	for (const unrelatedOutput of ["echo 42", "echo 205", "echo 205.90"]) {
+		const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc-terminal-decimal-"))
+		try {
+			const client = new FakeLlmClient([
+				() => toolCall("execute_command", { command: unrelatedOutput }),
+				() => toolCall("attempt_completion", { result: "Measured 205.9." }),
+				() => toolCall("execute_command", { command: "echo 205.9" }),
+				() => toolCall("attempt_completion", { result: "Measured 205.9." }),
+			])
+			const session = await makeSession({
+				task: "measure the benchmark",
+				client,
+				workspaceRoot: ws,
+				verifyBeforeCompletion: true,
+			})
+			const result = await session.run()
 
-		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
-		assert.equal(result.result, "Measured 205.9.")
-		assert.equal(client.requests.length, 8, "unrelated and partial decimal output must not support the claim")
-	} finally {
-		await fs.rm(ws, { recursive: true, force: true })
+			assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+			assert.equal(result.result, "Measured 205.9.")
+			assert.equal(client.requests.length, 4, `${unrelatedOutput} must not support the claim`)
+		} finally {
+			await fs.rm(ws, { recursive: true, force: true })
+		}
 	}
 }
 
