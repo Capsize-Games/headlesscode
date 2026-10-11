@@ -25,17 +25,9 @@ import { scriptKindFromFileName, type CodeIntel } from "./program.js"
 export const MAX_DIAGNOSTICS = 50
 
 /**
- * Runtime-only surface: every SourceFile carries its own parse
- * diagnostics at runtime, but the public typings don't declare them.
- */
-interface ParsedFile extends ts.SourceFile {
-	parseDiagnostics: readonly ts.Diagnostic[]
-}
-
-/**
  * Syntactic + semantic diagnostics for `sourceFile`, sorted by file
- * position. Files outside the program (created after load) only have
- * their own parse diagnostics — no checker state exists for them.
+ * position. Files created after load are checked through the language service using
+ * the same compiler options and their current disk contents.
  */
 export function collectDiagnostics(
 	intel: CodeIntel,
@@ -44,7 +36,11 @@ export function collectDiagnostics(
 	const inProgram =
 		intel.program.getSourceFile(sourceFile.fileName) !== undefined
 	if (!inProgram) {
-		return [...(sourceFile as ParsedFile).parseDiagnostics]
+		intel.includeExtraFile(sourceFile.fileName)
+		return [
+			...intel.languageService.getSyntacticDiagnostics(sourceFile.fileName),
+			...intel.languageService.getSemanticDiagnostics(sourceFile.fileName),
+		].sort((a, b) => (a.start ?? 0) - (b.start ?? 0))
 	}
 	const all = [
 		...intel.program.getSyntacticDiagnostics(sourceFile),
