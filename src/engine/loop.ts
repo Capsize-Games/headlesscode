@@ -4126,18 +4126,25 @@ export class HeadlessSession {
 						// A digit anywhere in successful shell output is not measurement
 						// evidence: stderr is intentionally included in tool content, and
 						// environment warnings such as `en_US.UTF-8` contain digits. For
-						// quantified claims, require the claimed value itself in command
-						// output instead of accepting unrelated diagnostic numbers.
+						// quantified claims, require every claimed value in command output
+						// instead of accepting unrelated diagnostic numbers. The tokenizer
+						// accepts attached units (20ms) and excludes digits inside identifiers
+						// such as UTF-8.
 						const numericTokens = (value: string): string[] =>
-							[...value.matchAll(/(?<![\w.])\d+(?:\.\d+)?(?![\w.])/g)].map((match) => match[0])
+							[...value.matchAll(/(?<![\w.-])\d+(?:\.\d+)?(?=(?:tokens?\/sec|t\/s|%|ms|seconds?)\b|[^\w.-]|$)/gi)].map(
+								(match) => match[0],
+							)
 						const claimedValues = numericTokens(result)
 						const commandOutputs = messages
 							.filter((m) => m.role === "tool" && m.name === "execute_command")
 							.map((m) => String(m.content ?? ""))
 						return claimedValues.length > 0
-							? claimedValues.some((value) => {
+							? claimedValues.every((value) => {
 								const escapedValue = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-								const exactValue = new RegExp(`(?<![\\w.])${escapedValue}(?![\\w.])`)
+								const exactValue = new RegExp(
+									`(?<![\\w.-])${escapedValue}(?=(?:tokens?\\/sec|t\\/s|%|ms|seconds?)\\b|[^\\w.-]|$)`,
+									"i",
+								)
 								return commandOutputs.some((output) => exactValue.test(output))
 							})
 							: commandOutputs.some((output) => numericTokens(output).length > 0)
