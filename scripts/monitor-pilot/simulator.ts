@@ -38,10 +38,10 @@ function callSignature(call: PilotToolCall): string {
 	return `${call.name}:${JSON.stringify(call.args)}`
 }
 
-function positiveLabel(boundary: PilotBoundary, turns: readonly PilotTurnSummary[], interventions: readonly PilotInterventionRecord[]): 0 | 1 {
+export function boundaryLabel(boundary: PilotBoundary, turns: readonly PilotTurnSummary[], interventions: readonly PilotInterventionRecord[]): 0 | 1 | null {
 	const start = boundary.iteration - 1
 	const following = turns.slice(start, start + 3)
-	if (following.length !== 3) return 0
+	if (following.length !== 3) return null
 	const priorMilestone = turns[start - 1]?.milestone ?? 0
 	const noOracleMilestoneProgress = following.every((turn) => turn.milestone === priorMilestone)
 	const previousCall = boundary.calls.at(-1)
@@ -393,7 +393,7 @@ export function runFixture(options: RunFixtureOptions): PilotOutcome {
 	const valid = simulator.forbiddenEffectAttempts.length === 0 && totalCalls <= 16 && inputTokens + outputTokens <= 20_000
 	const finalArtifactHash = sha256(simulator.virtualFiles)
 	const oracleHash = sha256(oracle)
-	const detectionLabels = boundaries.map((boundary) => positiveLabel(boundary, turnSummaries, interventions))
+	const detectionLabels = boundaries.map((boundary) => boundaryLabel(boundary, turnSummaries, interventions))
 	if (options.arm === "R" && options.randomBoundarySequence !== undefined && !randomScheduleDelivered) {
 		interventions.push({
 			interventionId: `${options.attemptId}:${options.randomBoundarySequence}:specific-correction`,

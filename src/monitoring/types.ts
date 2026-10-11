@@ -188,5 +188,5 @@ export interface PilotOutcome {
 	readonly scheduledIntervention: boolean
 	readonly scheduledBoundarySequence?: number
 	/** Labels are retained only in the outcome analysis, never passed to prediction. */
-	readonly detectionLabels: readonly (0 | 1)[]
+	readonly detectionLabels: readonly (0 | 1 | null)[]
 }

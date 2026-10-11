@@ -73,6 +73,27 @@ import {
 } from "./claims.js"
 import { writeSessionReport } from "./reports.js"
 import { Logger } from "./logger.js"
+import {
+	DEFAULT_CONSECUTIVE_ERROR_LIMIT,
+	DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD,
+	DEFAULT_IDENTICAL_CALL_STALL_LIMIT,
+	DEFAULT_READ_ONLY_NUDGE_THRESHOLD,
+	DEFAULT_READ_ONLY_STALL_LIMIT,
+	DEFAULT_TOOL_FAILURE_NUDGE_THRESHOLD,
+	firstPendingTodoLine,
+	identicalCallNudgeMessage,
+	READ_ONLY_NUDGE_MESSAGE,
+	READ_ONLY_PROGRESS_NUDGE_MESSAGE,
+	toolFailureNudgeMessage,
+} from "../monitoring/guardrails.js"
+export {
+	DEFAULT_CONSECUTIVE_ERROR_LIMIT,
+	DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD,
+	DEFAULT_IDENTICAL_CALL_STALL_LIMIT,
+	DEFAULT_READ_ONLY_NUDGE_THRESHOLD,
+	DEFAULT_READ_ONLY_STALL_LIMIT,
+	DEFAULT_TOOL_FAILURE_NUDGE_THRESHOLD,
+} from "../monitoring/guardrails.js"
 import { discoverSkills } from "../skills/registry.js"
 import type { SkillRegistry } from "../skills/registry.js"
 import { readEnabledSkillRoots } from "../skills/store.js"
@@ -222,7 +243,6 @@ const DEFAULT_ITERATION_BOUNDARY_TIMEOUT_MS = 250
  * not spend.
  */
 export const DEFAULT_MAX_ITERATIONS = 250
-export const DEFAULT_CONSECUTIVE_ERROR_LIMIT = 3
 /**
  * Recursive task decomposition (`new_task`): hard cap on recursion depth.
  * Depth 0 is the root session; a session at depth `max` may NOT delegate
@@ -317,7 +337,6 @@ export const DEFAULT_MAX_TOKENS = 32_768
  * codebase-search index (blind walking is then the only option). Overridable
  * via $HEADLESSCODE_READ_ONLY_NUDGE_THRESHOLD.
  */
-export const DEFAULT_READ_ONLY_NUDGE_THRESHOLD = 8
 /**
  * Hard cap on consecutive all-read-only iterations (env
  * $HEADLESSCODE_READ_ONLY_STALL_LIMIT). A session doing this many pure
@@ -329,7 +348,6 @@ export const DEFAULT_READ_ONLY_NUDGE_THRESHOLD = 8
  * so a legitimately read-heavy task only trips this if it never produces
  * anything for a very long time.
  */
-export const DEFAULT_READ_ONLY_STALL_LIMIT = 75
 /** Tool names that count as "blind tree-walking" for the guardrail above. */
 const READ_ONLY_TOOL_NAMES = new Set(["list_files", "read_file", "search_files"])
 
@@ -351,8 +369,6 @@ const READ_ONLY_TOOL_NAMES = new Set(["list_files", "read_file", "search_files"]
  * unlike the read-only stall limit's 75, there is no legitimate reason for
  * this specific pattern to run long before intervening.
  */
-export const DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD = 2
-export const DEFAULT_IDENTICAL_CALL_STALL_LIMIT = 4
 /**
  * Sampling-level companion to the text nudge above (see
  * LlmRequest.repeatPenalty's doc comment): once the streak reaches the
@@ -398,7 +414,6 @@ export const DEFAULT_IDENTICAL_CALL_TOOL_COOLDOWN_TURNS = 4
  * attempt — giving the model one genuinely-informed try before the
  * generic hard stop would otherwise end the session on an uninformed one.
  */
-export const DEFAULT_TOOL_FAILURE_NUDGE_THRESHOLD = 2
 /**
  * Artifact-gate rejection guardrail (issue #152): requireArtifactMinCitations
  * and requireArtifactSections check PRESENCE (a citation-shaped regex match
@@ -421,13 +436,6 @@ export const DEFAULT_TOOL_FAILURE_NUDGE_THRESHOLD = 2
  * that a different value is warranted.
  */
 export const DEFAULT_ARTIFACT_REJECTION_NUDGE_THRESHOLD = 2
-/** The injected nudge (user-role, seen by the model on its next turn), indexed workspaces. */
-const READ_ONLY_NUDGE_MESSAGE =
-	"You've made several read/exploration calls without using `codebase_search`. If the workspace has an index (it lives in the central project store — see `~/.local/share/headlesscode/projects/`), try `codebase_search` for targeted semantic search instead of blind tree-walking."
-/** The injected nudge for unindexed workspaces — no index to point at, so lead with progress. */
-const READ_ONLY_PROGRESS_NUDGE_MESSAGE =
-	"You've made several read/exploration calls without progress. If the next step in your todo list is verification, `run_tests` answers it in one shot — prefer running the project's test suite over more manual greps/reads. Take a progress action now (edit, test run, or completion) instead of further read-only exploration."
-
 /**
  * The local daemon's own synthetic fallback text (its
  * `fallback_response_for_empty_result`) when the underlying generation
@@ -451,127 +459,6 @@ const DAEMON_EMPTY_REPLY_FALLBACK_TEXTS = [
 	"The model attempted a tool-based response but did not produce a final reply. No changes were applied.",
 ]
 
-/**
- * Extract the first not-done line from a todo checklist (`[ ]` pending or
- * `[-]` in-progress — never `[x]` done), for identicalCallNudgeMessage.
- * Best-effort: any list shape it doesn't recognize just yields undefined,
- * which the nudge message handles by omitting the concrete suggestion
- * rather than guessing.
- */
-function firstPendingTodoLine(todos: string | undefined): string | undefined {
-	if (!todos) {
-		return undefined
-	}
-	for (const line of todos.split("\n")) {
-		const trimmed = line.trim()
-		if (trimmed.startsWith("[ ]") || trimmed.startsWith("[-]")) {
-			return trimmed
-		}
-	}
-	return undefined
-}
-
-/**
- * The injected nudge when the SAME call repeats back-to-back — see
- * DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD. Verified live 2026-08-21: a
- * generic version of this message ("try something different") did not
- * change the model's next action across several trials — it called
- * list_files a 3rd and 4th time anyway, right past the nudge. When a todo
- * list exists, naming the concrete next pending step explicitly is a much
- * more specific, harder-to-ignore instruction than "do something else."
- */
-function identicalCallNudgeMessage(signature: string, streak: number, nextTodo: string | undefined): string {
-	const concreteNextStep = nextTodo
-		? ` Your own todo list's next unfinished step is: ${nextTodo} — do THAT now, not another ${signature} call.`
-		: ""
-	return (
-		`You have called ${signature} ${streak} times in a row with IDENTICAL arguments. Repeating the exact same call ` +
-		`will not produce a different result. The information from your earlier call is still visible above in this ` +
-		`conversation — re-read it there instead of calling again.${concreteNextStep} If you are stuck on a ` +
-		`persistent error, address that error specifically instead of resubmitting the same call or looking around ` +
-		`the workspace again.`
-	)
-}
-
-/**
- * The injected nudge when the SAME TOOL NAME fails repeatedly with VARIED
- * arguments (issue #146) — see DEFAULT_TOOL_FAILURE_NUDGE_THRESHOLD's doc
- * comment for why this is distinct from identicalCallNudgeMessage above.
- * Directive, not generic: names the exact re-diagnosis step (re-read the
- * CURRENT real content, quote the exact text to match) rather than a vague
- * "try something different" — the same lesson identicalCallNudgeMessage's
- * own doc comment already draws from a prior failed generic-nudge attempt.
- *
- * `readFileAvailable`/`retryToolAvailable` (issue #153): live-verified
- * 2026-08-21 (scripts/eval-suite/scenario-146-repeated-tool-failure.sh,
- * two separate live runs) that this nudge's own advice — "use read_file"
- * and "retry `toolName`" — can each independently collide with the
- * SEPARATE identical-call guardrail's tool-exclusion cooldown
- * (excludedToolCooldowns in runIterations): first observed with
- * `read_file` on cooldown (fixed below), then on a second live run with
- * `toolName` itself (e.g. `edit_file`) on cooldown from its own identical
- * repeat. A model told to do something it cannot currently do has no good
- * move — in both observed trials it fabricated a fake `<tool_call>` text
- * block for the unavailable tool rather than a real one, which the harness
- * correctly refuses to execute (see the excludedThisTurn check around
- * `extractEmbeddedToolCall`'s call site) but still counts as a mistake.
- * This message checks BOTH tools independently and adapts to whichever
- * combination is actually true, rather than assuming either is available.
- *
- * Known remaining gap, not fixed here: `excludedToolCooldowns` is only
- * populated at the START of the NEXT iteration's request prep (reading
- * identicalCallStreak's value as of the end of THIS one) — so if
- * identicalCallStreak and this guardrail's own streak both cross their
- * threshold on the exact same call, this nudge (fired in that same turn)
- * still sees the about-to-be-excluded tool as available one turn early.
- * Narrow (requires both guardrails tripping simultaneously) and not
- * reproduced in the 2026-08-21 live re-verification after this fix — left
- * as a documented limitation rather than adding cross-guardrail lookahead.
- */
-function toolFailureNudgeMessage(
-	toolName: string,
-	streak: number,
-	targetLabel: string | undefined,
-	readFileAvailable: boolean,
-	retryToolAvailable: boolean,
-): string {
-	const targetHint = targetLabel ? ` on '${targetLabel}'` : ""
-	const base =
-		`Your last ${streak} attempts to use ${toolName}${targetHint} all failed, even though the arguments were ` +
-		`different each time. Varying the arguments and hoping is not working. `
-	if (readFileAvailable && retryToolAvailable) {
-		return (
-			base +
-			`Before trying again: use read_file to see the file's CURRENT exact content around your target, quote the ` +
-			`exact text you intend to match, and only THEN retry ${toolName} — do not just adjust the arguments again ` +
-			`without first confirming what the file actually contains right now.`
-		)
-	}
-	if (!readFileAvailable && retryToolAvailable) {
-		return (
-			base +
-			`read_file is temporarily unavailable right now (cooldown from a recent repeat) — instead, carefully ` +
-			`re-derive the exact current content from what you already read earlier in this conversation, quote the ` +
-			`exact text you intend to match, and only THEN retry ${toolName} — do not just adjust the arguments ` +
-			`again without first confirming what the file actually contains right now.`
-		)
-	}
-	if (readFileAvailable && !retryToolAvailable) {
-		return (
-			base +
-			`${toolName} is temporarily unavailable right now (cooldown from a recent repeat), so retrying it this ` +
-			`turn will not work no matter what arguments you use. Use read_file now to see the file's CURRENT exact ` +
-			`content and carefully work out the exact text you'll need to match — you'll be able to retry ${toolName} ` +
-			`again in a few turns, and having the exact match ready will make that attempt count.`
-		)
-	}
-	return (
-		base +
-		`Both read_file and ${toolName} are temporarily unavailable right now (cooldown from recent repeats). Do not ` +
-		`fabricate a call to either — call a genuinely different tool, or give a plain text status update, and wait ` +
-		`for them to become available again before retrying.`
-	)
-}
 
 /**
  * Artifact-gate rejection guardrail (issue #152) — see
