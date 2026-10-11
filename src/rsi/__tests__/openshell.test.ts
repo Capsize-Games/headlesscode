@@ -336,9 +336,15 @@ await run("dependency-escape")
 {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-benchmark-verifier-"))
 	const worktree = path.join(repo, ".worktrees", "task")
+	const policyPath = path.join(repo, "operator-policy.yaml")
+	const originalPolicyPath = process.env.HEADLESSCODE_OPENSHELL_POLICY
+	const policyBytes = Buffer.from("sandbox:\n  network: disabled\n")
 	let verifierGuest = ""
 	let tornDown = false
 	try {
+		fs.writeFileSync(policyPath, policyBytes, { mode: 0o600 })
+		fs.chmodSync(policyPath, 0o600)
+		process.env.HEADLESSCODE_OPENSHELL_POLICY = policyPath
 		fs.mkdirSync(path.join(worktree, "src"), { recursive: true })
 		fs.writeFileSync(path.join(worktree, "src", "candidate.js"), "export const value = 1\n")
 		execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: worktree })
@@ -387,7 +393,11 @@ await run("dependency-escape")
 			async spawnExistingWorktreeSession(_request, snapshot) { verifierGuest = snapshot; return { id: "missing-marker", provider: "mock-openshell", address: snapshot } },
 			async waitReady() {}, async runHarness() { return { exitCode: 1, output: "sandbox transport failed" } }, async teardown() { tornDown = true },
 		}), verifierImageDigest), /did not return its completion marker/)
-	} finally { fs.rmSync(repo, { recursive: true, force: true }) }
+	} finally {
+		if (originalPolicyPath === undefined) delete process.env.HEADLESSCODE_OPENSHELL_POLICY
+		else process.env.HEADLESSCODE_OPENSHELL_POLICY = originalPolicyPath
+		fs.rmSync(repo, { recursive: true, force: true })
+	}
 }
 
 {
@@ -456,8 +466,14 @@ await run("dependency-escape")
 {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-hidden-verifier-"))
 	const worktree = path.join(repo, ".worktrees", "hidden")
+	const policyPath = path.join(repo, "operator-policy.yaml")
+	const originalPolicyPath = process.env.HEADLESSCODE_OPENSHELL_POLICY
+	const policyBytes = Buffer.from("sandbox:\n  network: disabled\n")
 	let guest = ""
 	try {
+		fs.writeFileSync(policyPath, policyBytes, { mode: 0o600 })
+		fs.chmodSync(policyPath, 0o600)
+		process.env.HEADLESSCODE_OPENSHELL_POLICY = policyPath
 		fs.mkdirSync(path.join(worktree, "src"), { recursive: true })
 		fs.writeFileSync(path.join(worktree, "src", "candidate.js"), "export const double = ({ value }) => value * 2\n")
 		execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: worktree })
@@ -498,8 +514,7 @@ await run("dependency-escape")
 			},
 			async teardown() {},
 		}) }
-		const policyPath = path.resolve("shared/openshell/headlesscode-policy.yaml")
-		const policySha256 = createHash("sha256").update(fs.readFileSync(policyPath)).digest("hex")
+		const policySha256 = createHash("sha256").update(policyBytes).digest("hex")
 		const runner = createOpenShellHiddenCaseRunner({ candidateRoot: worktree, config: parsed.config, signingKey: keys.privateKey, imageDigest: `sha256:${"c".repeat(64)}`, evaluatorPolicySha256: policySha256, providerFactory })
 		const nonces = new Set<string>()
 		const result = await verifyHiddenFunctions(suite, { candidateSourceDigest: sourceDigest, evaluatorImageDigest: `sha256:${"c".repeat(64)}`, candidateCommit: commit, sessionId: "session", jobId: "job" }, {
@@ -514,7 +529,11 @@ await run("dependency-escape")
 		assert.notEqual(hiddenProviderOptions?.policy, policyPath, "hidden verifier uses its frozen private policy snapshot")
 		assert.equal(fs.existsSync(hiddenProviderOptions?.policy ?? ""), false, "private evaluator policy snapshot is removed after teardown")
 		assert.equal(fs.existsSync(guest), false, "the isolated evaluation snapshot is deleted after runner teardown")
-	} finally { fs.rmSync(repo, { recursive: true, force: true }) }
+	} finally {
+		if (originalPolicyPath === undefined) delete process.env.HEADLESSCODE_OPENSHELL_POLICY
+		else process.env.HEADLESSCODE_OPENSHELL_POLICY = originalPolicyPath
+		fs.rmSync(repo, { recursive: true, force: true })
+	}
 }
 
 {
