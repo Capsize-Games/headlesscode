@@ -3736,6 +3736,35 @@ async function testVerifyBeforeCompletionRefusesUnsupportedMeasurementClaim(): P
 	}
 }
 
+async function testVerifyBeforeCompletionMatchesTerminalDecimalExactly(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc-terminal-decimal-"))
+	try {
+		const client = new FakeLlmClient([
+			() => toolCall("execute_command", { command: "echo 42" }),
+			() => toolCall("attempt_completion", { result: "Measured 205.9." }),
+			() => toolCall("execute_command", { command: "echo 205" }),
+			() => toolCall("attempt_completion", { result: "Measured 205.9." }),
+			() => toolCall("execute_command", { command: "echo 205.90" }),
+			() => toolCall("attempt_completion", { result: "Measured 205.9." }),
+			() => toolCall("execute_command", { command: "echo 205.9" }),
+			() => toolCall("attempt_completion", { result: "Measured 205.9." }),
+		])
+		const session = await makeSession({
+			task: "measure the benchmark",
+			client,
+			workspaceRoot: ws,
+			verifyBeforeCompletion: true,
+		})
+		const result = await session.run()
+
+		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, "Measured 205.9.")
+		assert.equal(client.requests.length, 8, "unrelated and partial decimal output must not support the claim")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Evidence-gated completion (fabrication fix, 2026-09-01) ─────────────────
 //
 // The FINAL_REPORT's central finding (§4): a real session reported "all three
@@ -4103,6 +4132,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	[
 		"verifyBeforeCompletion: refuses an unsupported measurement/benchmark claim (#136)",
 		testVerifyBeforeCompletionRefusesUnsupportedMeasurementClaim,
+	],
+	[
+		"verifyBeforeCompletion: matches terminal decimal measurement values exactly",
+		testVerifyBeforeCompletionMatchesTerminalDecimalExactly,
 	],
 	[
 		"evidence-gated completion: refuses a fabricated gate claim when the claimed target doesn't exist",
