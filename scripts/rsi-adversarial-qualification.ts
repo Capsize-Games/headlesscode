@@ -8,13 +8,18 @@ import { fileURLToPath } from "node:url"
 
 import { OpenRouterClient, type OpenRouterGenerationMetadata } from "../src/llm/openrouter.js"
 import { DEFAULT_PROTECTED_PATHS } from "../src/rsi/config.js"
-import { requestAdversarialReview } from "../src/rsi/adversarial.js"
+import { ADVERSARIAL_COMMAND, requestAdversarialReview } from "../src/rsi/adversarial.js"
 import { RSI_MUSE_OPENROUTER_MODEL, RSI_OPENROUTER_PROFILES } from "../src/rsi/inference-broker.js"
 import { PostgresRsiJobQueue, fleetQueuePolicy, type FleetJob, type FleetJobIdentity, type FleetJobPayload } from "../src/rsi/postgres-queue.js"
 import { runRsi } from "../src/rsi/controller.js"
 import type { RsiConfig, RsiRunRecord, RoleModelConfig } from "../src/rsi/types.js"
 
-const MAX_REVIEW_OUTPUT_TOKENS = 1_024
+export const REVIEWER_QUALIFICATION_LIMITS = Object.freeze({
+	protocol: "headlesscode.rsi-adversarial-qualification.v2",
+	requestedOutputTokens: 4_096,
+	admittedOutputTokens: 6_144,
+})
+const MAX_REVIEW_OUTPUT_TOKENS = REVIEWER_QUALIFICATION_LIMITS.admittedOutputTokens
 const MAX_REVIEW_PROMPT_BYTES = 16 * 1024
 const MAX_REVIEW_COST_USD = 0.005
 const MAX_REVIEW_HTTP_DURATION_MS = 120_000
@@ -139,6 +144,26 @@ async function writePrivateFile(root: string, relative: string, content: Buffer 
 	return { path: relative, sha256: sha256(bytes), bytes: bytes.byteLength }
 }
 
+/** Preserve charged exchanges before any identity, usage, or controller gate can reject them. */
+export async function captureReviewerExchange(
+	root: string,
+	identity: Record<string, unknown>,
+	response: string | undefined,
+	lookupBilling: (generationId: string) => Promise<OpenRouterGenerationMetadata | undefined>,
+): Promise<OpenRouterGenerationMetadata | undefined> {
+	await writePrivateFile(root, "reviewer-response-identity.json", JSON.stringify(identity, null, 2) + "\n")
+	if (response !== undefined) await writePrivateFile(root, "reviewer-response.txt", response)
+	try {
+		if (typeof identity.generationId !== "string" || !identity.generationId || identity.generationId.length > 512) throw new Error("OpenRouter did not return a bounded generation ID for billing identity")
+		const billing = await lookupBilling(identity.generationId)
+		await writePrivateFile(root, "reviewer-generation-billing.json", JSON.stringify({ generationId: identity.generationId, billing: billing ?? null }, null, 2) + "\n")
+		return billing
+	} catch (error) {
+		await writePrivateFile(root, "reviewer-billing-failure.json", JSON.stringify({ generationId: identity.generationId ?? null, error: error instanceof Error ? error.message.slice(0, 512) : "billing lookup failed" }, null, 2) + "\n")
+		throw error
+	}
+}
+
 export async function ensurePrivateDirectory(directory: string): Promise<void> {
 	const resolved = path.resolve(directory)
 	let cursor = path.parse(resolved).root
@@ -223,6 +248,19 @@ export function verifyControllerGate(run: RsiRunRecord, reviewStatus: string, te
 	return { gateMatched, selectionMatched, expectedAdversarialPass }
 }
 
+/** A rejected candidate alone cannot qualify a broken evaluator as a counterexample. */
+export function assertControlledCounterexample(output: Buffer): void {
+	const records: unknown = JSON.parse(output.toString("utf8"))
+	if (!Array.isArray(records)) throw new Error("controlled evaluator output must be an array")
+	const matches = records.filter((record) => record && typeof record === "object" && record.command === ADVERSARIAL_COMMAND)
+	if (matches.length !== 1) throw new Error("controlled evaluator output lacks one exact adversarial command")
+	const record = matches[0] as { stdout?: unknown; stderr?: unknown }
+	const text = [record.stdout, record.stderr].filter((value): value is string => typeof value === "string").join("\n")
+	if (!text.includes("AssertionError") || !text.includes("ERR_ASSERTION") || /ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND|SyntaxError|ReferenceError/.test(text)) {
+		throw new Error("controlled candidate did not produce an executed assertion counterexample")
+	}
+}
+
 function helpText(): string {
 	return [
 		"Usage: npx tsx scripts/rsi-adversarial-qualification.ts --receipt-signing-key <mode-0600-ed25519-key> --receipt-public-key-sha256 <sha256> --evaluator-trusted-public-key <mode-0600-public-key>",
@@ -293,7 +331,7 @@ export async function runAdversarialQualification(options: Required<Pick<Options
 							model: profile.model,
 							messages: request.messages,
 							temperature: 0.1,
-							max_tokens: MAX_REVIEW_OUTPUT_TOKENS,
+							max_tokens: REVIEWER_QUALIFICATION_LIMITS.requestedOutputTokens,
 							provider: { only: ["meta"], allow_fallbacks: false },
 						}), "utf8")
 						if (requestBytes > MAX_REVIEW_PROMPT_BYTES) throw new Error("serialized reviewer request exceeds the 16 KiB qualification bound")
@@ -302,29 +340,32 @@ export async function runAdversarialQualification(options: Required<Pick<Options
 						const response = await client.createChatCompletion({
 							...request,
 							model: profile.model,
-							maxTokens: MAX_REVIEW_OUTPUT_TOKENS,
+							maxTokens: REVIEWER_QUALIFICATION_LIMITS.requestedOutputTokens,
 							providerOnly: "meta",
 							signal: reviewSignal,
 						})
 						const returnedModel = response.returnedModel
 						const providerName = response.providerName
-						if (!returnedModel || !profile.returnedModels.includes(returnedModel) || providerName?.toLowerCase() !== "meta") throw new Error("OpenRouter reviewer response did not match the admitted Muse model and Meta provider")
-						if (response.usage?.promptTokens !== undefined && response.usage.promptTokens > promptBytes) throw new Error("reported reviewer input tokens exceeded the conservative byte bound")
-						if (response.usage?.completionTokens !== undefined && response.usage.completionTokens > MAX_REVIEW_OUTPUT_TOKENS) throw new Error("reviewer output exceeded its token cap")
 						responseIdentity = {
 							requestedModel: profile.model, returnedModel, providerName,
 							generationId: response.generationId,
 							usage: response.usage ?? {},
 							promptBytes, requestBytes, maxOutputTokens: MAX_REVIEW_OUTPUT_TOKENS,
+							requestedOutputTokens: REVIEWER_QUALIFICATION_LIMITS.requestedOutputTokens,
 							worstCaseCostUsd: requestCostCeiling,
 						}
 						responseText = typeof response.message.content === "string" ? response.message.content : undefined
+						const billing = await captureReviewerExchange(artifactsDir, responseIdentity, responseText, (id) => client.fetchGenerationMetadata(id, reviewSignal))
+						generationBilling = billing as unknown as Record<string, unknown> | undefined
+						if (!returnedModel || !profile.returnedModels.includes(returnedModel) || providerName?.toLowerCase() !== "meta") throw new Error("OpenRouter reviewer response did not match the admitted Muse model and Meta provider")
+						if (response.usage?.promptTokens !== undefined && response.usage.promptTokens > promptBytes) throw new Error("reported reviewer input tokens exceeded the conservative byte bound")
+						if (response.usage?.completionTokens !== undefined && response.usage.completionTokens > MAX_REVIEW_OUTPUT_TOKENS) throw new Error("reviewer output exceeded its token cap")
 						return response
 					},
 				})
 				if (!responseText || raw !== responseText.trim()) throw new Error("review response content capture did not match the controller response")
 				if (!responseIdentity?.generationId || typeof responseIdentity.generationId !== "string") throw new Error("OpenRouter did not return a generation ID for billing identity")
-				const billing = await client.fetchGenerationMetadata(responseIdentity.generationId as string, reviewSignal)
+				const billing = generationBilling as OpenRouterGenerationMetadata | undefined
 				if (!billing || billing.providerName?.toLowerCase() !== "meta" || !billing.model || !profile.returnedModels.includes(billing.model)) throw new Error("OpenRouter billing record is unavailable or does not match the admitted Muse/Meta identity")
 				if (billing.id !== responseIdentity.generationId || typeof billing.totalCostUsd !== "number" || !Number.isFinite(billing.totalCostUsd) || billing.totalCostUsd < 0 || billing.totalCostUsd > MAX_REVIEW_COST_USD) throw new Error("OpenRouter billing record is unavailable or exceeds the $0.005 qualification cap")
 				const usage = responseIdentity.usage as { promptTokens?: number; completionTokens?: number }
@@ -366,16 +407,17 @@ export async function runAdversarialQualification(options: Required<Pick<Options
 	artifactRefs["controller-run.json"] = await writePrivateFile(artifactsDir, "controller-run.json", JSON.stringify(run, null, 2) + "\n")
 	const archiveBytes = await fs.readFile(path.join(config.archiveDir, "archive.json"))
 	artifactRefs["controller-archive.json"] = await writePrivateFile(artifactsDir, "controller-archive.json", archiveBytes)
+	assertControlledCounterexample(openShellOutput)
 	const candidateGate = candidate.fitness?.hardGates.adversarialPass
 	const payload: Record<string, unknown> = {
-		protocol: "headlesscode.rsi-adversarial-qualification.v1",
+		protocol: REVIEWER_QUALIFICATION_LIMITS.protocol,
 		createdAt: new Date().toISOString(),
 		fixture: { kind: "synthetic-controlled-candidate", mutationInferenceCalls: 0, sourcePatchSha256: source.sourcePatchSha256, changedFiles: candidate.changedFiles },
 		reviewer: {
 			role: "adversary", requested: profile.model, providerOnly: "meta", ...responseIdentity, billing: generationBilling,
 			endpointAdmission: { pricePerMillion: metadata.price, endpoints: metadata.endpoints, contextWindow: metadata.contextWindow },
 		},
-		limits: { reviewerCalls: 1, maxOutputTokens: MAX_REVIEW_OUTPUT_TOKENS, maxPromptBytes: MAX_REVIEW_PROMPT_BYTES, maxCallCostUsd: MAX_REVIEW_COST_USD },
+		limits: { reviewerCalls: 1, maxOutputTokens: MAX_REVIEW_OUTPUT_TOKENS, requestedOutputTokens: REVIEWER_QUALIFICATION_LIMITS.requestedOutputTokens, maxPromptBytes: MAX_REVIEW_PROMPT_BYTES, maxCallCostUsd: MAX_REVIEW_COST_USD },
 		controllerReview: { status: review.status, provider: review.provider, model: review.model, promptVersion: review.promptVersion, promptSha256: review.promptSha256, resultSha256: review.resultSha256, testSha256: review.testArtifactSha256, snapshotSha256: review.snapshotArtifactSha256, findings: review.findings, testResults: review.testResults, penaltyPoints: review.penaltyPoints, evaluationJobId: review.jobId },
 		openShell: { queueName: queueBase.policy.queueName, jobId: evaluationJob.jobId, jobKind: evaluationJob.jobKind, status: evaluationJob.status, snapshotSha256: evaluationJob.artifactSha256, outputSha256: outputSha, workerResult: result?.evaluation?.visible?.[0] ?? result?.outputArtifact },
 		independentDecision: { expectedAdversarialPass: qualification.expectedAdversarialPass, controllerAdversarialPass: candidateGate, gateMatched: qualification.gateMatched, candidateStatus: candidate.status, selected: run.selected ?? null, selectedCandidates: run.selectedCandidates ?? [], selectionMatched: qualification.selectionMatched, developmentProof: candidate.developmentProof?.accepted === true ? "completed" : "not-qualified-by-this-one-review command" },

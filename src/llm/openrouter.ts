@@ -102,6 +102,31 @@ export function isRetryableOpenRouterError(error: unknown): boolean {
 	if (!(error instanceof OpenRouterError)) {
 		return false
 	}
+	// Deterministic broker admission denials: surfaced as HTTP 429 but never
+	// succeed on retry, so fail fast instead of retrying. The denial text may
+	// appear either as the error message or in the raw broker body envelope
+	// ({ error: { message } }).
+	const brokerDenials = new Set([
+		"OpenRouter job call ceiling exhausted",
+		"OpenRouter job token ceiling exhausted",
+		"OpenRouter job spend ceiling exhausted",
+		"OpenRouter campaign spend ceiling exhausted",
+		"OpenRouter request denied: lease is stale, fenced, expired or blocked",
+		"OpenRouter job duration limit exhausted",
+		"OpenRouter file ledger budget exhausted",
+	])
+	const candidates: string[] = []
+	if (typeof error.message === "string") candidates.push(error.message.trim())
+	if (typeof error.body === "string" && error.body.length > 0) {
+		try {
+			const parsed = JSON.parse(error.body) as { error?: { message?: unknown } }
+			const nested = parsed?.error?.message
+			if (typeof nested === "string") candidates.push(nested.trim())
+		} catch {
+			// Non-JSON body: fall through to generic status handling.
+		}
+	}
+	if (candidates.some((candidate) => brokerDenials.has(candidate))) return false
 	if (error.status === undefined) {
 		return true // network/transport failure — see the catch in createChatCompletion
 	}

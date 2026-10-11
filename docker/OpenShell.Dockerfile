@@ -17,7 +17,7 @@ COPY package.json package-lock.json tsconfig.json ./
 RUN npm ci --no-audit --no-fund
 COPY src ./src
 COPY shared ./shared
-COPY scripts/spawn-parallel-worktrees.sh scripts/run-worker.sh scripts/headlesscode-answer.sh ./scripts/
+COPY scripts/spawn-parallel-worktrees.sh scripts/run-worker.sh scripts/supervise-job-worker.mjs scripts/headlesscode-answer.sh ./scripts/
 RUN chmod -R a+rX /opt/headlesscode/src /opt/headlesscode/shared /opt/headlesscode/scripts
 RUN test ! -e /opt/headlesscode/scripts/rsi-benchmark/task-spec.mjs \
     && test ! -e /opt/headlesscode/scripts/rsi-benchmark/manual-tests \
@@ -25,7 +25,7 @@ RUN test ! -e /opt/headlesscode/scripts/rsi-benchmark/task-spec.mjs \
     && test ! -e /opt/headlesscode/.git
 RUN printf '%s\n' "$HEADLESSCODE_HARNESS_COMMIT" > /opt/headlesscode/.headlesscode-harness-commit
 LABEL org.capsize.headlesscode.harness-commit="$HEADLESSCODE_HARNESS_COMMIT"
-RUN chmod +x scripts/spawn-parallel-worktrees.sh scripts/run-worker.sh scripts/headlesscode-answer.sh
+RUN chmod +x scripts/spawn-parallel-worktrees.sh scripts/run-worker.sh scripts/supervise-job-worker.mjs scripts/headlesscode-answer.sh
 RUN mkdir -p /opt/headlesscode-session /opt/headlesscode-data/projects /opt/headlesscode-data/shared /opt/headlesscode-data/checkpoints /sandbox \
     && chmod 0755 /opt/headlesscode-session \
     && chown -R sandbox:sandbox /opt/headlesscode-data /sandbox

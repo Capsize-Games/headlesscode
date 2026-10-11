@@ -10,6 +10,7 @@ import {
 	GhApiError,
 	addLabel,
 	buildGhUrl,
+	createGhClient,
 	ghApi,
 	getIssue,
 	listIssues,
@@ -225,6 +226,41 @@ async function testAddLabelPosts(): Promise<void> {
 	assert.equal(captured!.url, "https://api.github.com/repos/o/r/issues/3/labels")
 }
 
+async function testHeadlessCodeJobLifecycleApi(): Promise<void> {
+	const calls: Array<{ url: string; method: string; body?: unknown }> = []
+	const fetchImpl = fakeFetchImpl((url, init) => {
+		calls.push({ url, method: init.method ?? "GET", ...(init.body ? { body: JSON.parse(init.body) } : {}) })
+		if (url.includes("/pulls?")) {
+			return { status: 200, body: [{
+				number: 68,
+				html_url: "https://github.com/o/r/pull/68",
+				base: { repo: { full_name: "o/r" } },
+				head: { ref: "issues/w1-issue68-2026-10-11", repo: { full_name: "o/r" } },
+			}] }
+		}
+		if (url.includes("/comments") && init.method !== "POST") return { status: 200, body: [{ body: "previous result marker" }] }
+		return { status: 200, body: [] }
+	})
+	const gh = createGhClient({ token: "synthetic-token", baseUrl: "https://api.github.com", fetchImpl })
+	await gh.addLabel("o", "r", 68, "headlesscode:running")
+	await gh.removeLabel!("o", "r", 68, "headlesscode:failed")
+	await gh.createIssueComment!("o", "r", 68, "synthetic result")
+	assert.deepEqual(await gh.listIssueComments!("o", "r", 68), ["previous result marker"])
+	assert.deepEqual(await gh.listPullRequestsForHead!("o", "r", "issues/w1-issue68-2026-10-11"), [{
+		number: 68,
+		url: "https://github.com/o/r/pull/68",
+		branch: "issues/w1-issue68-2026-10-11",
+		baseRepository: "o/r",
+		headRepository: "o/r",
+	}])
+	await gh.closeIssue!("o", "r", 68)
+	assert.deepEqual(calls.map((call) => call.method), ["POST", "DELETE", "POST", "GET", "GET", "PATCH"])
+	assert.deepEqual(calls[0]?.body, { labels: ["headlesscode:running"] })
+	assert.equal(calls[1]?.url, "https://api.github.com/repos/o/r/issues/68/labels/headlesscode%3Afailed")
+	assert.ok(calls[4]?.url.includes("head=o%3Aissues%2Fw1-issue68-2026-10-11"))
+	assert.deepEqual(calls[5]?.body, { state: "closed" })
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -239,6 +275,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["listIssues respects maxTotal cap", testListIssuesRespectsMaxTotalCap],
 	["getIssue returns a normalized issue", testGetIssue],
 	["addLabel POSTs { labels: [...] } to the labels endpoint", testAddLabelPosts],
+	["headlesscode-job lifecycle operations use the expected GitHub API", testHeadlessCodeJobLifecycleApi],
 ]
 
 async function main(): Promise<void> {

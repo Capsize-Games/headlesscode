@@ -10,7 +10,7 @@ import { OpenShellSessionProvider, OPENSHELL_HARNESS_ROOT } from "../cloud/opens
 import type { OpenShellSessionProviderOptions } from "../cloud/openshell-provider.js"
 import type { CloudSessionRequest, CommandResult, SessionHandle } from "../cloud/provider.js"
 import type { CandidateRecord, CommandRunner, RsiConfig, TrialResult, WorkerHarnessExecution, WorkerHarnessRuntimeIdentity } from "./types.js"
-import { ADVERSARIAL_RUNNER_PATH, ADVERSARIAL_TESTS_PATH } from "./adversarial.js"
+import { ADVERSARIAL_COMMAND, ADVERSARIAL_RUNNER_PATH, ADVERSARIAL_TESTS_PATH } from "./adversarial.js"
 import { openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID } from "./inference-broker.js"
 import { effectiveWorkerHarnessMode, workerHarnessCliPath, validWorkerHarnessRuntimeIdentity } from "./worker-harness.js"
 import { mutationSnapshotProtectedPathViolations } from "./sandbox.js"
@@ -88,6 +88,7 @@ export interface IsolatedRunOptions {
 	inferenceBroker?: RsiInferenceBrokerAccess
 	expectedSnapshotTreeDigest?: string
 	evaluatorPolicySha256?: string
+	adversarialEvaluationArtifacts?: { tests: Buffer; runner: Buffer }
 }
 
 function execFileBuffer(command: string, args: string[], options: { cwd?: string; input?: Buffer | string } = {}): Buffer {
@@ -108,6 +109,8 @@ function alwaysOmit(relativePath: string): boolean {
 	const normalized = relativePath.replaceAll("\\", "/")
 	return normalized.startsWith("__headlesscode_rsi_adversarial__/") || findMatchingPattern(normalized, [...DEFAULT_PROTECTED_FILES, "shared/openshell/headlesscode-policy.yaml", ".headlesscode/", ".worktrees/", "node_modules/", "src/rsi/", "scripts/eval-suite/", "fixtures/rsi-benchmark/", "__rsi_benchmark_verifier__/"]) !== null
 }
+
+function sha256Buffer(value: Buffer): string { return createHash("sha256").update(value).digest("hex") }
 
 function shouldInclude(relativePath: string, mode: IsolatedRunOptions["mode"], config: RsiConfig): boolean {
 	if (alwaysOmit(relativePath)) return false
@@ -313,6 +316,23 @@ for (const test of spec.tests) {
 	process.stdout.write("PASS " + test.id + "\\n")
 }
 `
+
+export function adversarialEvaluationArtifactIdentity(tests: Buffer): { testsSha256: string; runnerSha256: string } {
+	if (tests.byteLength < 2 || tests.byteLength > 64 * 1024) throw new Error("adversarial test artifact must be between 2 bytes and 64 KiB")
+	return { testsSha256: sha256Buffer(tests), runnerSha256: sha256Buffer(Buffer.from(ADVERSARIAL_RUNNER_SOURCE)) }
+}
+
+export function adversarialEvaluationRunner(): Buffer { return Buffer.from(ADVERSARIAL_RUNNER_SOURCE) }
+
+export function readVerifiedAdversarialEvaluationArtifacts(root: string, identity: { testsSha256: string; runnerSha256: string }): { tests: Buffer; runner: Buffer } {
+	if (!/^[a-f0-9]{64}$/.test(identity.testsSha256) || !/^[a-f0-9]{64}$/.test(identity.runnerSha256)) throw new Error("adversarial evaluator artifact identity is malformed")
+	const tests = fs.readFileSync(path.join(root, ADVERSARIAL_TESTS_PATH))
+	const runner = fs.readFileSync(path.join(root, ADVERSARIAL_RUNNER_PATH))
+	if (tests.byteLength < 2 || tests.byteLength > 64 * 1024 || sha256Buffer(tests) !== identity.testsSha256 || sha256Buffer(runner) !== identity.runnerSha256 || runner.toString("utf8") !== ADVERSARIAL_RUNNER_SOURCE) {
+		throw new Error("adversarial evaluator artifacts do not match their supervisor identity")
+	}
+	return { tests, runner }
+}
 
 /** Bundle a candidate commit with a bounded declarative test manifest and fixed runner. */
 export function createAdversarialEvaluationSnapshotBundle(sourceRoot: string, commit: string, config: RsiConfig, tests: Buffer): { content: Buffer; snapshotCommit: string } {
@@ -549,6 +569,11 @@ function stagedSnapshotChanges(snapshot: string): Array<{ path: string; mode: st
 }
 
 async function runSnapshot(options: IsolatedRunOptions & { preserveSnapshot?: boolean }): Promise<{ result: TrialResult; snapshot: string; snapshotBase: string; snapshotTreeDigest: string }> {
+	if (options.adversarialEvaluationArtifacts && options.mode !== "evaluation") throw new Error("adversarial evaluator artifacts are restricted to evaluation guests")
+	if (options.adversarialEvaluationArtifacts) {
+		const identity = adversarialEvaluationArtifactIdentity(options.adversarialEvaluationArtifacts.tests)
+		if (identity.runnerSha256 !== sha256Buffer(options.adversarialEvaluationArtifacts.runner) || options.adversarialEvaluationArtifacts.runner.toString("utf8") !== ADVERSARIAL_RUNNER_SOURCE) throw new Error("adversarial evaluator runner is not the fixed supervisor-authored runner")
+	}
 	if (options.config.hiddenEvalCommands.length > 0) {
 		throw new Error("RSI hidden evaluations are disabled until an evaluator service can keep test inputs outside candidate execution")
 	}
@@ -571,6 +596,15 @@ async function runSnapshot(options: IsolatedRunOptions & { preserveSnapshot?: bo
 	if (options.extraFiles && Object.keys(options.extraFiles).length > 0) {
 		for (const [relativePath, content] of Object.entries(options.extraFiles)) {
 			if (!pathIsSafe(relativePath)) throw new Error(`OpenShell evaluation input has an unsafe path: ${relativePath}`)
+			const target = path.join(snapshot, relativePath)
+			fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
+			fs.writeFileSync(target, content, { mode: 0o600, flag: "wx" })
+		}
+		execFileSync("git", ["add", "--all"], { cwd: snapshot })
+		execFileSync("git", ["-c", "core.hooksPath=/dev/null", "commit", "--amend", "--quiet", "--no-edit"], { cwd: snapshot, env: snapshotCommitEnvironment() })
+	}
+	if (options.adversarialEvaluationArtifacts) {
+		for (const [relativePath, content] of [[ADVERSARIAL_TESTS_PATH, options.adversarialEvaluationArtifacts.tests], [ADVERSARIAL_RUNNER_PATH, options.adversarialEvaluationArtifacts.runner]] as const) {
 			const target = path.join(snapshot, relativePath)
 			fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
 			fs.writeFileSync(target, content, { mode: 0o600, flag: "wx" })
@@ -883,14 +917,14 @@ export function createOpenShellCommandRunner(config: RsiConfig, evaluatorRuntime
 }
 
 /** Execute only visible candidate checks inside a fresh OpenShell guest. */
-export async function runOpenShellEvaluation(candidate: CandidateRecord, config: RsiConfig, signal?: AbortSignal, control?: IsolatedRunOptions["control"], evaluatorRuntime?: Pick<EvaluatorRuntimeIdentity, "imageDigest" | "policySha256">, providerFactory?: RsiOpenShellProviderFactory): Promise<{ regression: TrialResult; typecheck: TrialResult; visible: TrialResult[] }> {
+export async function runOpenShellEvaluation(candidate: CandidateRecord, config: RsiConfig, signal?: AbortSignal, control?: IsolatedRunOptions["control"], evaluatorRuntime?: Pick<EvaluatorRuntimeIdentity, "imageDigest" | "policySha256">, providerFactory?: RsiOpenShellProviderFactory, adversarialEvaluationArtifacts?: { tests: Buffer; runner: Buffer }): Promise<{ regression: TrialResult; typecheck: TrialResult; visible: TrialResult[] }> {
 	if (config.hiddenEvalCommands.length > 0) throw new Error("hidden RSI evaluation is supervisor-only and cannot be submitted as a worker job")
 	if (!evaluatorRuntime || !/^sha256:[a-f0-9]{64}$/.test(evaluatorRuntime.imageDigest) || !/^[a-f0-9]{64}$/.test(evaluatorRuntime.policySha256)) throw new Error("OpenShell evaluation job lacks its frozen evaluator image and policy identity")
 	const commands = [config.regressionCommand, "npm run typecheck", ...config.evalCommands]
 	const results: TrialResult[] = []
 	for (const command of commands) {
 		if (signal?.aborted) throw signal.reason ?? new Error("RSI job cancelled")
-		const isolated = await runSnapshot({ config, sourceRoot: candidate.worktree, commit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: candidate.worktree, encoding: "utf8" }).trim(), command, timeoutMs: config.commandTimeoutMs, mode: "evaluation", signal, control, image: evaluatorImageReference(evaluatorRuntime.imageDigest), evaluatorPolicySha256: evaluatorRuntime.policySha256, providerFactory })
+		const isolated = await runSnapshot({ config, sourceRoot: candidate.worktree, commit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: candidate.worktree, encoding: "utf8" }).trim(), command, timeoutMs: config.commandTimeoutMs, mode: "evaluation", signal, control, image: evaluatorImageReference(evaluatorRuntime.imageDigest), evaluatorPolicySha256: evaluatorRuntime.policySha256, providerFactory, ...(command === ADVERSARIAL_COMMAND && adversarialEvaluationArtifacts ? { adversarialEvaluationArtifacts } : {}) })
 		results.push(isolated.result)
 	}
 	return { regression: results[0]!, typecheck: results[1]!, visible: results.slice(2) }

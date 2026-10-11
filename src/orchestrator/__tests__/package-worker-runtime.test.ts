@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
-import { execFileSync, spawnSync } from "node:child_process"
+import { execFileSync, spawn, spawnSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { setTimeout as delay } from "node:timers/promises"
 
@@ -38,6 +38,24 @@ async function waitForWorker(workspace: string): Promise<string> {
 	throw new Error(`packed worker did not finish: ${workspace}`)
 }
 
+async function waitForJobReceipt(receiptDir: string, group: string): Promise<Record<string, unknown>> {
+	const deadline = Date.now() + 10_000
+	while (Date.now() < deadline) {
+		try { return JSON.parse(await fs.readFile(path.join(receiptDir, `${group}.complete`), "utf8")) as Record<string, unknown> }
+		catch { await delay(20) }
+	}
+	throw new Error(`packed supervisor did not write a completion receipt for ${group}`)
+}
+
+async function waitForJobLaunch(receiptDir: string, group: string): Promise<Record<string, unknown>> {
+	const deadline = Date.now() + 5_000
+	while (Date.now() < deadline) {
+		try { return JSON.parse(await fs.readFile(path.join(receiptDir, `${group}.launch`), "utf8")) as Record<string, unknown> }
+		catch { await delay(10) }
+	}
+	throw new Error(`packed supervisor did not write a launch receipt for ${group}`)
+}
+
 try {
 	const packed = path.join(scratch, "packed")
 	const extracted = path.join(scratch, "unpacked")
@@ -53,6 +71,7 @@ try {
 	const requiredScripts = [
 		"scripts/spawn-parallel-worktrees.sh",
 		"scripts/run-worker.sh",
+		"scripts/supervise-job-worker.mjs",
 		"scripts/run-muse-worker.sh",
 		"scripts/stop-worker.sh",
 		"scripts/headlesscode-answer.sh",
@@ -62,6 +81,26 @@ try {
 	assert.equal(files.some((file) => file.startsWith("scripts/") && !requiredScripts.includes(file) && file !== "scripts/deploy-gate.sh"), false, "packaging does not include unrelated scripts")
 	execFileSync("tar", ["-xzf", path.join(packed, packResult[0]!.filename), "-C", extracted])
 	const unpackedPackage = path.join(extracted, "package")
+	const unpackedSupervisor = path.join(unpackedPackage, "scripts/supervise-job-worker.mjs")
+	const hiddenSupervisor = `${unpackedSupervisor}.hidden`
+	const brokenWorkspace = path.join(scratch, "broken-job-workspace")
+	const brokenReceipts = path.join(scratch, "broken-job-receipts")
+	await fs.mkdir(brokenWorkspace)
+	await fs.mkdir(brokenReceipts, { mode: 0o700 })
+	await fs.writeFile(path.join(brokenWorkspace, ".harness.pid"), "424242")
+	await fs.rename(unpackedSupervisor, hiddenSupervisor)
+	try {
+		const missingHelper = spawnSync("bash", [path.join(unpackedPackage, "scripts/run-worker.sh"), brokenWorkspace, "CPU mock task", "--executor", "builtin"], {
+			cwd: scratch,
+			encoding: "utf8",
+			env: { ...scrubbedEnv, HEADLESSCODE_ROOT: unpackedPackage, HEADLESSCODE_CLI: path.join(scratch, "missing-cli"), HEADLESSCODE_JOB_ATTEMPT: "523e4567-e89b-12d3-a456-426614174000", HEADLESSCODE_JOB_RECEIPT_DIR: brokenReceipts },
+		})
+		assert.notEqual(missingHelper.status, 0, "a missing packaged supervisor must fail startup")
+		await assert.rejects(fs.access(path.join(brokenWorkspace, ".harness.pid")), "a stale PID cannot make a new attempt look launched")
+		assert.equal((await fs.readdir(brokenReceipts)).some((name) => name.endsWith(".launch")), false, "failed helper startup creates no attempt receipt")
+	} finally {
+		await fs.rename(hiddenSupervisor, unpackedSupervisor)
+	}
 
 	const fakeCli = path.join(scratch, "headlesscode-cli")
 	const builtinCapture = path.join(scratch, "builtin-cli-args")
@@ -79,6 +118,67 @@ try {
 	const builtinArgs = await fs.readFile(builtinCapture, "utf8")
 	assert.match(builtinArgs, /--task /)
 	assert.match(builtinArgs, /--workspace /)
+
+	const timeoutWorkspace = path.join(scratch, "job-timeout-workspace")
+	const timeoutReceipts = path.join(scratch, "job-timeout-receipts")
+	const timeoutWrapper = path.join(scratch, "job-timeout-wrapper.sh")
+	const timeoutStarted = path.join(scratch, "job-timeout-started")
+	await fs.mkdir(timeoutWorkspace)
+	await fs.mkdir(timeoutReceipts, { mode: 0o700 })
+	await writeExecutable(timeoutWrapper, `#!/bin/bash\nread -r _ <&3 || exit 125\nprintf started > "${timeoutStarted}"\n`)
+	const timeoutAttempt = "723e4567-e89b-12d3-a456-426614174000"
+	const unacknowledged = spawn(process.execPath, [unpackedSupervisor, timeoutWorkspace, timeoutReceipts, timeoutAttempt, "timeout-group", timeoutWrapper], {
+		cwd: scratch,
+		stdio: "ignore",
+		timeout: 10_000,
+		env: scrubbedEnv,
+	})
+	const timeoutLaunch = await waitForJobLaunch(timeoutReceipts, "timeout-group")
+	await fs.writeFile(path.join(timeoutReceipts, "timeout-group.ack"), JSON.stringify({
+		...timeoutLaunch,
+		pid: Number(timeoutLaunch.pid) + 1,
+		pgid: Number(timeoutLaunch.pgid) + 1,
+	}), { mode: 0o600 })
+	const unacknowledgedStatus = await new Promise<number | null>((resolve, reject) => {
+		unacknowledged.once("error", reject)
+		unacknowledged.once("close", (code) => resolve(code))
+	})
+	assert.equal(unacknowledgedStatus, 2, "a mismatched dispatcher acknowledgment fails closed")
+	const timeoutCompletion = JSON.parse(await fs.readFile(path.join(timeoutReceipts, "timeout-group.complete"), "utf8")) as Record<string, unknown>
+	assert.equal(timeoutCompletion.attemptId, timeoutAttempt)
+	assert.equal(timeoutCompletion.exitCode, 125, "acknowledgment timeout is recorded as a startup failure after teardown")
+	const timeoutPgid = Number(timeoutCompletion.pgid)
+	assert.ok(Number.isSafeInteger(timeoutPgid) && timeoutPgid > 1)
+	assert.throws(() => process.kill(-timeoutPgid, 0), { code: "ESRCH" }, "the gated process group is gone before timeout completion is recorded")
+	await assert.rejects(fs.access(timeoutStarted), "the worker wrapper remains gated until a matching acknowledgment is received")
+
+	const jobWorkspace = path.join(scratch, "job-workspace")
+	const jobReceipts = path.join(scratch, "job-receipts")
+	await fs.mkdir(jobWorkspace)
+	await fs.mkdir(jobReceipts, { mode: 0o700 })
+	const jobCli = path.join(scratch, "job-cli")
+	await writeExecutable(jobCli, "#!/bin/sh\nexit 7\n")
+	const jobAttempt = "623e4567-e89b-12d3-a456-426614174000"
+	const jobSpawn = spawnSync("bash", [path.join(unpackedPackage, "scripts/run-worker.sh"), jobWorkspace, "CPU mock task", "--executor", "builtin"], {
+		cwd: scratch,
+		encoding: "utf8",
+		env: { ...scrubbedEnv, HEADLESSCODE_ROOT: unpackedPackage, HEADLESSCODE_CLI: jobCli, HEADLESSCODE_JOB_ATTEMPT: jobAttempt, HEADLESSCODE_JOB_RECEIPT_DIR: jobReceipts },
+	})
+	assert.equal(jobSpawn.status, 0, jobSpawn.stderr)
+	assert.match(jobSpawn.stdout.trim(), /^\d+$/, "job dispatch returns the captured worker PID")
+	const jobCompletion = await waitForJobReceipt(jobReceipts, "job-workspace")
+	const jobLaunch = JSON.parse(await fs.readFile(path.join(jobReceipts, "job-workspace.launch"), "utf8")) as Record<string, unknown>
+	assert.equal(jobCompletion.attemptId, jobAttempt)
+	assert.equal(jobCompletion.pid, jobLaunch.pid)
+	assert.equal(jobCompletion.startTicks, jobLaunch.startTicks)
+	assert.equal(jobCompletion.exitCode, 7, "supervisor records actual child exit status")
+	const duplicateAttempt = spawnSync("bash", [path.join(unpackedPackage, "scripts/run-worker.sh"), jobWorkspace, "CPU mock task", "--executor", "builtin"], {
+		cwd: scratch,
+		encoding: "utf8",
+		env: { ...scrubbedEnv, HEADLESSCODE_ROOT: unpackedPackage, HEADLESSCODE_CLI: jobCli, HEADLESSCODE_JOB_ATTEMPT: jobAttempt, HEADLESSCODE_JOB_RECEIPT_DIR: jobReceipts },
+	})
+	assert.notEqual(duplicateAttempt.status, 0, "a second launch cannot reuse an attempt receipt and acknowledgment")
+	assert.equal((await fs.readdir(jobReceipts)).filter((name) => name === "job-workspace.launch").length, 1)
 
 	const fakeBin = path.join(scratch, "fake-bin")
 	await fs.mkdir(fakeBin)

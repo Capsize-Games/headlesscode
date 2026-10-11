@@ -483,6 +483,8 @@ export interface RsiRunRecord {
 	workerHarnessPlannedGenerations?: number
 	workerHarnessSamplingSeed?: string
 	workerHarnessRuntime?: WorkerHarnessRuntimeIdentity
+	/** Physical candidate/worktree suffix derived from this durable run ID; absent on legacy ordinary runs. */
+	candidateIdNamespace?: string
 	confirmationEvidence?: "unmeasured" | "complete" | "incomplete"
 	confirmationAttempts?: BenchmarkAttempt[]
 	proofConfirmation?: {

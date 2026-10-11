@@ -4,7 +4,8 @@ import * as fs from "node:fs/promises"
 import { execFileSync } from "node:child_process"
 import * as path from "node:path"
 
-import { ADVERSARIAL_QUALIFICATION_MAX_RUNTIME_MS, assertReviewerBillingTokens, createQualificationHttpDeadlines, createSyntheticWorkspace, ensurePrivateDirectory, parseQualificationArgs, signReceipt, verifyControllerGate, verifyReceipt } from "../../../scripts/rsi-adversarial-qualification.js"
+import { ADVERSARIAL_QUALIFICATION_MAX_RUNTIME_MS, REVIEWER_QUALIFICATION_LIMITS, assertControlledCounterexample, assertReviewerBillingTokens, captureReviewerExchange, createQualificationHttpDeadlines, createSyntheticWorkspace, ensurePrivateDirectory, parseQualificationArgs, signReceipt, verifyControllerGate, verifyReceipt } from "../../../scripts/rsi-adversarial-qualification.js"
+import { ADVERSARIAL_COMMAND } from "../adversarial.js"
 import type { RsiRunRecord } from "../types.js"
 
 function pin(publicKey: ReturnType<typeof createPublicKey>): string {
@@ -17,6 +18,9 @@ assert.match(parseQualificationArgs(["--receipt-signing-key", "key.pem", "--eval
 assert.match(parseQualificationArgs(["--unexpected"]).error ?? "", /unknown argument/)
 
 assert.equal(ADVERSARIAL_QUALIFICATION_MAX_RUNTIME_MS, 10 * 60_000, "CPU qualification has a declared ten-minute overall runtime bound")
+assert.equal(REVIEWER_QUALIFICATION_LIMITS.protocol, "headlesscode.rsi-adversarial-qualification.v2", "new request/admission limits must not silently reuse the failed v1 protocol")
+assert.ok(REVIEWER_QUALIFICATION_LIMITS.requestedOutputTokens < REVIEWER_QUALIFICATION_LIMITS.admittedOutputTokens, "reserve output headroom before dispatch while retaining a hard billed-output admission cap")
+assert.ok((16 * 1024 * 0.1 + REVIEWER_QUALIFICATION_LIMITS.admittedOutputTokens * 0.2) / 1_000_000 < 0.005, "the declared worst-case input/output still fits the existing qualification cost cap")
 let phaseStartedAt = 0
 const requestedDeadlines: Array<{ durationMs: number; startedAt: number }> = []
 const deadlines = createQualificationHttpDeadlines((durationMs) => {
@@ -41,6 +45,14 @@ assert.doesNotThrow(() => assertReviewerBillingTokens(nativeUsage, nativeBilling
 assert.throws(() => assertReviewerBillingTokens(nativeUsage, { ...nativeBilling, nativeTokensPrompt: 863 }), /do not match/)
 assert.throws(() => assertReviewerBillingTokens({ completionTokens: 66 }, nativeBilling), /do not match/)
 assert.doesNotThrow(() => assertReviewerBillingTokens(nativeUsage, { id: "legacy", tokensPrompt: 862, tokensCompletion: 66 }))
+
+const evaluatorOutput = (stdout: string) => Buffer.from(JSON.stringify([{ command: ADVERSARIAL_COMMAND, stdout, stderr: "" }]))
+assert.doesNotThrow(() => assertControlledCounterexample(evaluatorOutput("AssertionError [ERR_ASSERTION]: 150 !== 100\nexitCode=1")))
+assert.throws(() => assertControlledCounterexample(evaluatorOutput("Error [ERR_MODULE_NOT_FOUND]: Cannot find runner\nexitCode=1")), /executed assertion/)
+assert.throws(() => assertControlledCounterexample(evaluatorOutput("SyntaxError: invalid runner\nexitCode=1")), /executed assertion/)
+assert.throws(() => assertControlledCounterexample(evaluatorOutput("all tests passed")), /executed assertion/)
+assert.throws(() => assertControlledCounterexample(Buffer.from("[]")), /exact adversarial command/)
+assert.throws(() => assertControlledCounterexample(Buffer.from(JSON.stringify([{ command: ADVERSARIAL_COMMAND, stdout: "AssertionError ERR_ASSERTION" }, { command: ADVERSARIAL_COMMAND, stdout: "AssertionError ERR_ASSERTION" }]))), /exact adversarial command/)
 
 const pair = generateKeyPairSync("ed25519")
 const privateKey = createPrivateKey(pair.privateKey.export({ type: "pkcs8", format: "pem" }))
@@ -72,6 +84,23 @@ assert.deepEqual(verifyControllerGate(passingReviewButUnqualifiedProof, "passed"
 
 const scratch = path.join(process.cwd(), ".headlesscode", "scratch", "adversarial-qualification-fixture-test")
 await fs.mkdir(scratch, { recursive: true, mode: 0o700 })
+const exchangeDir = path.join(scratch, "exchange")
+await fs.mkdir(exchangeDir, { mode: 0o700 })
+const rejectedIdentity = { generationId: "charged-over-limit", returnedModel: "unexpected-model", usage: { promptTokens: 90, completionTokens: 1025 } }
+const capturedBilling = await captureReviewerExchange(exchangeDir, rejectedIdentity, "rejected response", async (id) => {
+	assert.deepEqual(JSON.parse(await fs.readFile(path.join(exchangeDir, "reviewer-response-identity.json"), "utf8")), rejectedIdentity, "identity must be durable before billing lookup or acceptance checks")
+	assert.equal(await fs.readFile(path.join(exchangeDir, "reviewer-response.txt"), "utf8"), "rejected response")
+	return { id, totalCostUsd: 0.0003, nativeTokensPrompt: 90, nativeTokensCompletion: 1025 }
+})
+assert.equal(capturedBilling?.totalCostUsd, 0.0003)
+assert.equal(JSON.parse(await fs.readFile(path.join(exchangeDir, "reviewer-generation-billing.json"), "utf8")).billing.id, rejectedIdentity.generationId)
+assert.equal((await fs.stat(path.join(exchangeDir, "reviewer-response-identity.json"))).mode & 0o077, 0)
+await assert.rejects(captureReviewerExchange(exchangeDir, rejectedIdentity, "overwrite", async () => undefined), /EEXIST/, "a later attempt cannot overwrite the charged exchange")
+const failedBillingDir = path.join(scratch, "failed-billing")
+await fs.mkdir(failedBillingDir, { mode: 0o700 })
+await assert.rejects(captureReviewerExchange(failedBillingDir, rejectedIdentity, "response", async () => { throw new Error("billing unavailable") }), /billing unavailable/)
+assert.equal(JSON.parse(await fs.readFile(path.join(failedBillingDir, "reviewer-response-identity.json"), "utf8")).generationId, rejectedIdentity.generationId)
+assert.match(await fs.readFile(path.join(failedBillingDir, "reviewer-billing-failure.json"), "utf8"), /billing unavailable/)
 const symlinkTarget = path.join(scratch, "target")
 await fs.mkdir(symlinkTarget, { mode: 0o700 })
 const symlinkAncestor = path.join(scratch, "linked")

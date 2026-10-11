@@ -280,6 +280,63 @@ export async function addLabel(
 	})
 }
 
+export async function removeLabel(owner: string, repo: string, number: number, label: string, options: GhRequestOptions): Promise<void> {
+	try {
+		await ghApi(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${number}/labels/${encodeURIComponent(label)}`, { ...options, method: "DELETE" })
+	} catch (error) {
+		if (!(error instanceof GhApiError) || error.status !== 404) throw error
+	}
+}
+
+export async function closeIssue(owner: string, repo: string, number: number, options: GhRequestOptions): Promise<void> {
+	await ghApi(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${number}`, { ...options, method: "PATCH", body: { state: "closed" } })
+}
+
+export async function createIssueComment(owner: string, repo: string, number: number, body: string, options: GhRequestOptions): Promise<void> {
+	await ghApi(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${number}/comments`, { ...options, method: "POST", body: { body } })
+}
+
+export async function listIssueComments(owner: string, repo: string, number: number, options: GhRequestOptions): Promise<string[]> {
+	const comments: string[] = []
+	for (let page = 1; page <= 10; page++) {
+		const result = await ghApi(buildGhUrl(options.baseUrl ?? process.env.GITHUB_API_BASE_URL ?? DEFAULT_GH_BASE_URL, `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${number}/comments`, {
+			per_page: 100, page, sort: "created", direction: "desc",
+		}), options)
+		if (!Array.isArray(result)) break
+		for (const entry of result.slice(0, 100)) {
+			if (entry === null || typeof entry !== "object") continue
+			const body = (entry as { body?: unknown }).body
+			if (typeof body === "string") comments.push(body.slice(0, 16 * 1024))
+		}
+		if (result.length < 100) break
+	}
+	return comments
+}
+
+export interface GitHubPullRequestSummary {
+	number: number
+	url: string
+	branch: string
+	baseRepository: string
+	headRepository: string
+}
+
+export async function listPullRequestsForHead(owner: string, repo: string, branch: string, options: GhRequestOptions): Promise<GitHubPullRequestSummary[]> {
+	const result = await ghApi(buildGhUrl(options.baseUrl ?? process.env.GITHUB_API_BASE_URL ?? DEFAULT_GH_BASE_URL, `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls`, {
+		state: "all", head: `${owner}:${branch}`, per_page: 100, page: 1,
+	}), options)
+	if (!Array.isArray(result)) return []
+	return result.slice(0, 100).flatMap((entry) => {
+		if (entry === null || typeof entry !== "object") return []
+		const raw = entry as { number?: unknown; html_url?: unknown; base?: { repo?: { full_name?: unknown } }; head?: { ref?: unknown; repo?: { full_name?: unknown } } }
+		const number = Number(raw.number)
+		const baseRepository = raw.base?.repo?.full_name
+		const headRepository = raw.head?.repo?.full_name
+		if (!Number.isSafeInteger(number) || number <= 0 || typeof raw.html_url !== "string" || typeof raw.head?.ref !== "string" || typeof baseRepository !== "string" || typeof headRepository !== "string") return []
+		return [{ number, url: raw.html_url, branch: raw.head.ref, baseRepository, headRepository }]
+	})
+}
+
 export interface GhClientOptions {
 	token: string
 	baseUrl?: string
@@ -291,6 +348,11 @@ export interface GhClient {
 	listIssues(options: { owner: string; repo: string; label?: string; state?: string }): Promise<GitHubIssue[]>
 	getIssue(owner: string, repo: string, number: number): Promise<GitHubIssue>
 	addLabel(owner: string, repo: string, number: number, label: string): Promise<void>
+	removeLabel?(owner: string, repo: string, number: number, label: string): Promise<void>
+	closeIssue?(owner: string, repo: string, number: number): Promise<void>
+	createIssueComment?(owner: string, repo: string, number: number, body: string): Promise<void>
+	listIssueComments?(owner: string, repo: string, number: number): Promise<string[]>
+	listPullRequestsForHead?(owner: string, repo: string, branch: string): Promise<GitHubPullRequestSummary[]>
 }
 
 /** Build a GhClient bound to a token/base URL (or injectable fetch). */
@@ -300,5 +362,10 @@ export function createGhClient(options: GhClientOptions): GhClient {
 		listIssues: (o) => listIssues({ ...o, token, baseUrl, fetchImpl }),
 		getIssue: (owner, repo, number) => getIssue(owner, repo, number, { token, baseUrl, fetchImpl }),
 		addLabel: (owner, repo, number, label) => addLabel(owner, repo, number, label, { token, baseUrl, fetchImpl }),
+		removeLabel: (owner, repo, number, label) => removeLabel(owner, repo, number, label, { token, baseUrl, fetchImpl }),
+		closeIssue: (owner, repo, number) => closeIssue(owner, repo, number, { token, baseUrl, fetchImpl }),
+		createIssueComment: (owner, repo, number, body) => createIssueComment(owner, repo, number, body, { token, baseUrl, fetchImpl }),
+		listIssueComments: (owner, repo, number) => listIssueComments(owner, repo, number, { token, baseUrl, fetchImpl }),
+		listPullRequestsForHead: (owner, repo, branch) => listPullRequestsForHead(owner, repo, branch, { token, baseUrl, fetchImpl }),
 	}
 }

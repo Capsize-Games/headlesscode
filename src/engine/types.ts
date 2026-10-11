@@ -171,6 +171,8 @@ export interface LlmClient {
 export interface ToolResult {
 	content: string
 	isError: boolean
+	/** Stable capsule identity for extension_manage/extension_call evidence events. */
+	extension?: { kind: "skill" | "tool" | "mcp"; id: string; digest: string }
 }
 
 /** Fixed corrections available to an iteration-boundary monitor. */

@@ -222,6 +222,24 @@ if [ -z "$WT_PATH" ] || [ ! -d "$WT_PATH" ]; then
     exit 2
 fi
 
+# HeadlessCode job completion evidence is written outside the worker tree and
+# is bound to this launch attempt and worktree. Worktree markers remain useful
+# for local diagnostics, but the watcher never treats them as authority.
+JOB_ATTEMPT="${HEADLESSCODE_JOB_ATTEMPT:-}"
+JOB_RECEIPT_DIR="${HEADLESSCODE_JOB_RECEIPT_DIR:-}"
+JOB_GROUP=""
+if [ -n "${HEADLESSCODE_JOB_ATTEMPT:-}" ] || [ -n "${HEADLESSCODE_JOB_RECEIPT_DIR:-}" ]; then
+    if [[ ! "${HEADLESSCODE_JOB_ATTEMPT:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || [ -z "${HEADLESSCODE_JOB_RECEIPT_DIR:-}" ]; then
+        echo "run-worker: invalid headlesscode-job receipt configuration" >&2
+        exit 2
+    fi
+    JOB_GROUP="$(basename "$WT_PATH")"
+    if [[ ! "$JOB_GROUP" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+        echo "run-worker: invalid headlesscode-job worktree name" >&2
+        exit 2
+    fi
+fi
+
 # ── Task: file vs inline text ───────────────────────────────────────────────
 # Resolution order for a task that looks like a file: absolute path, then
 # relative to the worktree, then relative to the harness repo.
@@ -387,10 +405,71 @@ printf '\n===== headlesscode run start: %s =====\n' "$(date -u +%Y-%m-%dT%H:%M:%
 SETSID_OK=0
 if command -v setsid >/dev/null 2>&1; then
     SETSID_OK=1
-    WRAPPER="printf '%s' \"\$\$\" > '$WT_PATH/.harness.pgid'
-$WRAPPER"
 else
     echo "run-worker: warning: setsid not found — worker will share the caller's process group; stopping it can only kill the wrapper PID (issue #20)" >&2
+fi
+if [ "$SETSID_OK" -eq 1 ] && [ -z "$JOB_ATTEMPT" ]; then
+    WRAPPER="printf '%s' \"\$\$\" > '$WT_PATH/.harness.pgid'
+$WRAPPER"
+fi
+
+if [ -n "$JOB_ATTEMPT" ]; then
+    if [ "$(uname -s)" != "Linux" ] || [ "$SETSID_OK" -ne 1 ] || ! command -v node >/dev/null 2>&1; then
+        echo "run-worker: headlesscode-job requires Linux, setsid, and Node.js process identity checks" >&2
+        exit 2
+    fi
+    LAUNCH_RECEIPT="$JOB_RECEIPT_DIR/$JOB_GROUP.launch"
+    ACK_RECEIPT="$JOB_RECEIPT_DIR/$JOB_GROUP.ack"
+    COMPLETE_RECEIPT="$JOB_RECEIPT_DIR/$JOB_GROUP.complete"
+    STARTUP_LOCK="$JOB_RECEIPT_DIR/$JOB_GROUP.startup-lock"
+    umask 077
+    if ! mkdir "$STARTUP_LOCK" 2>/dev/null; then
+        echo "run-worker: another or earlier supervisor owns this attempt; refusing duplicate launch" >&2
+        exit 2
+    fi
+    if [ -e "$LAUNCH_RECEIPT" ] || [ -e "$ACK_RECEIPT" ] || [ -e "$COMPLETE_RECEIPT" ]; then
+        echo "run-worker: supervisor receipts already exist for this attempt; refusing duplicate launch" >&2
+        exit 2
+    fi
+    WRAPPER="printf '%s' \"\$\$\" > '$WT_PATH/.harness.pgid'
+read -r _ <&3 || exit 125
+$WRAPPER"
+    WRAPPER_PATH="$JOB_RECEIPT_DIR/$JOB_GROUP.wrapper.$$.sh"
+    rm -f -- "$WT_PATH/.harness.pid" "$WT_PATH/.harness.supervisor.pid"
+    printf '%s' "$WRAPPER" > "$WRAPPER_PATH"
+    chmod 600 "$WRAPPER_PATH"
+    nohup setsid node "$HARNESS_ROOT/scripts/supervise-job-worker.mjs" \
+        "$WT_PATH" "$JOB_RECEIPT_DIR" "$JOB_ATTEMPT" "$JOB_GROUP" "$WRAPPER_PATH" \
+        >>"$WT_PATH/harness.log" 2>&1 </dev/null &
+    SUPERVISOR_PID=$!
+    printf '%s' "$SUPERVISOR_PID" > "$WT_PATH/.harness.supervisor.pid"
+    for _ in $(seq 1 100); do
+        [ -s "$LAUNCH_RECEIPT" ] && break
+        kill -0 "$SUPERVISOR_PID" 2>/dev/null || break
+        sleep 0.01
+    done
+    if [ ! -s "$LAUNCH_RECEIPT" ]; then
+        echo "run-worker: detached supervisor did not capture worker identity" >&2
+        exit 2
+    fi
+    WORKER_PID="$(node -e 'const fs=require("node:fs"); try { const r=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); if(r.version!==1||r.attemptId!==process.argv[2]||r.group!==process.argv[3]||!Number.isSafeInteger(r.pid)||r.pid<2||r.pgid!==r.pid||typeof r.startTicks!=="string"||!/^[0-9]{1,24}$/.test(r.startTicks)) process.exit(2); process.stdout.write(String(r.pid)); } catch { process.exit(2); }' "$LAUNCH_RECEIPT" "$JOB_ATTEMPT" "$JOB_GROUP")" || {
+        echo "run-worker: detached supervisor wrote an invalid worker identity receipt" >&2
+        exit 2
+    }
+    if ! kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
+        echo "run-worker: detached supervisor exited during worker startup" >&2
+        exit 2
+    fi
+    if [[ ! "$WORKER_PID" =~ ^[1-9][0-9]{0,9}$ ]] || [ "$(cat "$WT_PATH/.harness.pid" 2>/dev/null || true)" != "$WORKER_PID" ]; then
+        echo "run-worker: worker identity does not match the attempt-bound supervisor receipt" >&2
+        exit 2
+    fi
+    if ! node -e 'const fs=require("node:fs"); try { const [launchFile,ackFile,attempt,group]=process.argv.slice(1); const r=JSON.parse(fs.readFileSync(launchFile,"utf8")); if(r.version!==1||r.attemptId!==attempt||r.group!==group||!Number.isSafeInteger(r.pid)||r.pid<2||r.pgid!==r.pid||typeof r.startTicks!=="string"||!/^[0-9]{1,24}$/.test(r.startTicks)||fs.existsSync(ackFile)) process.exit(2); const temp=`${ackFile}.${process.pid}.tmp`; fs.writeFileSync(temp,JSON.stringify(r)+"\n",{flag:"wx",mode:0o600}); try { fs.linkSync(temp,ackFile); } finally { fs.unlinkSync(temp); } } catch { process.exit(2); }' "$LAUNCH_RECEIPT" "$ACK_RECEIPT" "$JOB_ATTEMPT" "$JOB_GROUP"; then
+        echo "run-worker: could not acknowledge the attempt-bound worker identity" >&2
+        exit 2
+    fi
+    printf '%s' "$WORKER_PID"
+    exit 0
 fi
 
 if [ "$SETSID_OK" -eq 1 ]; then

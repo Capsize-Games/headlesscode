@@ -143,6 +143,13 @@ warnings. Imported tool calls stay historical context. See [terminal chat](./doc
 [skills](./docs/skills.md), and [sessions](./docs/sessions.md) for formats,
 discovery, and security behavior.
 
+Coding sessions can also create and use reusable skills, Node tools, and local
+stdio MCP servers through `extension_manage` and `extension_call`. Each call
+pins an immutable revision and uses the session's existing permissions. The
+fixed interfaces keep extension contents out of the system prompt and tool
+catalog. See [workspace extensions](./docs/extensions.md) for the bundle format
+and runtime limits.
+
 ### Check project instructions without calling a model
 
 `--dry-run` builds the system prompt and validates project configuration. It

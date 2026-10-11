@@ -17,7 +17,9 @@
  *        c. writeTaskFiles(...) + spawn via
  *           scripts/spawn-parallel-worktrees.sh (bash -c — the bash script
  *           remains the ACTUAL spawner; no worktree creation in TS)
- *        d. markProcessed(status "done" | "failed") + save
+ *        d. ordinary issues: markProcessed(status "done" | "failed") + save;
+ *           headlesscode-job issues stay "spawned" until a later poll checks
+ *           their completion markers and updates GitHub lifecycle state
  *   5. Log the sweep (issues found / new / skipped / spawned / deferred).
  *
  * The state file is the idempotency source of truth: a restart loads it and
@@ -26,6 +28,7 @@
  */
 
 import { spawnSync } from "node:child_process"
+import { createHash, randomUUID } from "node:crypto"
 import * as fs from "node:fs"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
@@ -36,11 +39,11 @@ import {
 	maxConcurrentSessionsFromEnv,
 } from "../budget/concurrency.js"
 import { Logger } from "../engine/logger.js"
-import { museUnsupportedSettingsReason, resolveAgentExecutorSelection, type AgentExecutor, type AgentExecutorSelection } from "../agent-executor.js"
+import { museUnsupportedSettingsReason, parseHeadlessCodeJobBody, resolveAgentExecutorSelection, type AgentExecutor, type AgentExecutorSelection } from "../agent-executor.js"
 import { splitIssues, type SplitIssue, type WorktreeSpec } from "../orchestrator/split.js"
 import { loadStateSync } from "../orchestrator/state.js"
 import { writeTaskFiles } from "../orchestrator/cli.js"
-import { createGhClient, type GhClient, type GitHubIssue } from "./github.js"
+import { createGhClient, DEFAULT_GH_BASE_URL, type GhClient, type GitHubIssue, type GitHubPullRequestSummary } from "./github.js"
 import { GitHubIssueClaimStore, type ClaimSnapshot, type RunnerClaim } from "./claims.js"
 import {
 	isProcessed,
@@ -57,6 +60,7 @@ const HARNESS_ROOT = fileURLToPath(new URL("../..", import.meta.url))
 
 export const DEFAULT_POLL_INTERVAL_MS = 60_000
 export const DEFAULT_MAX_PER_SWEEP = 5
+export const HEADLESSCODE_JOB_LABEL = "headlesscode-job"
 
 export interface SpawnBatch {
 	issue: GitHubIssue
@@ -66,6 +70,8 @@ export interface SpawnBatch {
 	repoRoot: string
 	/** Batch id (watcher-<date>). */
 	batch: string
+	/** Random dispatch identity for headlesscode-job supervisor receipts. */
+	jobAttempt?: string
 	executor: AgentExecutor
 	museModel?: string
 }
@@ -86,7 +92,7 @@ export interface WatcherBatchInfo {
 	specs: WorktreeSpec[]
 	batch: string
 	statePath: string
-	/** Final recorded status after the batch processed: done | failed. */
+	/** Recorded status: headlesscode-job remains spawned after detached launch. */
 	status: WatcherIssueStatus
 }
 
@@ -231,6 +237,7 @@ export async function watchIssues(config: WatcherConfig): Promise<WatchResult> {
 
 		const sweep = await sweepOnce({
 			gh,
+			ghBaseUrl: config.ghBaseUrl,
 			owner,
 			repo,
 			targetLabel,
@@ -283,6 +290,7 @@ export async function watchIssues(config: WatcherConfig): Promise<WatchResult> {
 
 interface SweepInput {
 	gh: GhClient
+	ghBaseUrl?: string
 	owner: string
 	repo: string
 	targetLabel: string
@@ -360,6 +368,20 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 
 	// Deterministic processing order (ascending issue number).
 	issues = [...issues].sort((a, b) => a.number - b.number)
+	const reconciledJobs = await reconcileHeadlessCodeJobs({
+		state,
+		issues,
+		gh,
+		owner,
+		repo,
+		repoRoot,
+		ghBaseUrl: input.ghBaseUrl,
+		claims: activeRunnerClaims,
+		claimStore: input.claimStore,
+		dryRun,
+		logger,
+	})
+	state = reconciledJobs.state
 
 	const newIssues = issues.filter((i) => !isProcessedForSweep(state, i.number, retryFailed))
 	const skipped = issues.length - newIssues.length
@@ -392,7 +414,7 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 
 	const dryRunPlan: SweepResult["dryRunPlan"] = dryRun ? [] : undefined
 	let spawned = 0
-	let failures = 0
+	let failures = reconciledJobs.failures
 
 	// Naming collision avoidance (mirrors orchestrator/cli.ts's orchestrate
 	// path): seed from whatever `.worktrees/wN` dirs already exist — a
@@ -423,17 +445,44 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 	for (const issue of toSpawn) {
 		const prior = state.processed[String(issue.number)]
 		const retryingFailed = retryFailed && prior?.status === "failed"
+		const isHeadlessCodeJob = issue.labels.includes(HEADLESSCODE_JOB_LABEL)
+		const parsedJob = isHeadlessCodeJob ? parseHeadlessCodeJobBody(issue.body) : undefined
+		if (parsedJob && !parsedJob.submission) {
+			const message = `watcher: issue #${issue.number} has invalid headlesscode-job intake: ${parsedJob.error}`
+			logger.error(message, { issue: issue.number })
+			failures++
+			if (!dryRun) {
+				state = markProcessed(state, {
+					number: issue.number,
+					title: issue.title,
+					label: targetLabel,
+					...(isHeadlessCodeJob ? { jobContract: true } : {}),
+					status: "failed",
+					updatedAt: new Date().toISOString(),
+					error: message,
+				})
+				await saveWatcherState(statePath, state)
+				if (isHeadlessCodeJob) await reportJobIntakeFailure(gh, owner, repo, issue.number, message, logger)
+			}
+			continue
+		}
+		const dispatchIssue = parsedJob?.submission ? { ...issue, body: parsedJob.submission.task } : issue
 		const retryModelLabels = issue.labels.filter((label) => /^muse-model(?::|$)/i.test(label))
 		if (retryingFailed && prior?.executor && (retryModelLabels.length > 1 || (retryModelLabels.length === 1 && retryModelLabels[0]!.slice(retryModelLabels[0]!.indexOf(":") + 1) !== (prior.museModel ?? "")))) {
 			const message = `watcher: issue #${issue.number} Muse model label changed since its failed spawn; restore the recorded selection before retrying`
 			logger.error(message, { issue: issue.number })
 			failures++
+			if (isHeadlessCodeJob && !dryRun) {
+				state = markProcessed(state, { ...prior!, jobContract: true, status: "failed", error: message, updatedAt: new Date().toISOString() })
+				await saveWatcherState(statePath, state)
+				await reportJobIntakeFailure(gh, owner, repo, issue.number, message, logger)
+			}
 			continue
 		}
 		const selectionDefaults = retryingFailed && prior?.executor
 			? { executor: prior.executor, museModel: prior.museModel }
 			: { executor: input.executor, museModel: input.museModel }
-		const resolvedSelection = resolveAgentExecutorSelection(issue.labels, selectionDefaults)
+		const resolvedSelection = resolveAgentExecutorSelection(issue.labels, selectionDefaults, parsedJob?.submission?.executor)
 		if (!resolvedSelection.selection) {
 			const message = `watcher: issue #${issue.number} has invalid agent selection: ${resolvedSelection.error}`
 			logger.error(message, { issue: issue.number })
@@ -444,11 +493,13 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 					number: issue.number,
 					title: issue.title,
 					label: targetLabel,
+					...(isHeadlessCodeJob ? { jobContract: true } : {}),
 					status: "failed",
 					updatedAt: failedAt,
 					error: message,
 				})
 				await saveWatcherState(statePath, state)
+				if (isHeadlessCodeJob) await reportJobIntakeFailure(gh, owner, repo, issue.number, message, logger)
 			}
 			continue
 		}
@@ -463,6 +514,7 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 					number: issue.number,
 					title: issue.title,
 					label: targetLabel,
+					...(isHeadlessCodeJob ? { jobContract: true } : {}),
 					status: "failed",
 					updatedAt: failedAt,
 					error: message,
@@ -470,6 +522,7 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 					...(selection.museModel ? { museModel: selection.museModel } : {}),
 				})
 				await saveWatcherState(statePath, state)
+				if (isHeadlessCodeJob) await reportJobIntakeFailure(gh, owner, repo, issue.number, message, logger)
 			}
 			continue
 		}
@@ -485,6 +538,7 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 						number: issue.number,
 						title: issue.title,
 						label: targetLabel,
+						...(isHeadlessCodeJob ? { jobContract: true } : {}),
 						status: "failed",
 						updatedAt: failedAt,
 						error: message,
@@ -492,16 +546,17 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 						...(selection.museModel ? { museModel: selection.museModel } : {}),
 					})
 					await saveWatcherState(statePath, state)
+					if (isHeadlessCodeJob) await reportJobIntakeFailure(gh, owner, repo, issue.number, message, logger)
 				}
 				continue
 			}
 		}
-		const specs = splitIssues([issue], { occupiedNames })
+		const specs = splitIssues([dispatchIssue], { occupiedNames })
 		for (const spec of specs) {
 			occupiedNames.add(spec.name)
 		}
 		if (dryRun) {
-			dryRunPlan!.push({ issue, specs, selection })
+			dryRunPlan!.push({ issue: dispatchIssue, specs, selection })
 			continue
 		}
 
@@ -540,6 +595,7 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 			// ── Write-ahead: durable "spawned" entry BEFORE the spawn ──
 			const batch = batchId()
 			const spawnedAt = new Date().toISOString()
+			const jobAttempt = isHeadlessCodeJob ? randomUUID() : undefined
 			const entry: WatcherIssueEntry = {
 				number: issue.number,
 				title: issue.title,
@@ -549,6 +605,9 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 				spawnedAt,
 				status: "spawned",
 				updatedAt: spawnedAt,
+				...(isHeadlessCodeJob ? { jobContract: true } : {}),
+				...(jobAttempt ? { jobAttempt } : {}),
+				...(parsedJob?.submission ? { submittedBy: parsedJob.submission.submittedBy } : {}),
 				...(input.qa ? { qa: true } : {}),
 				...(input.deploy ? { deploy: true } : {}),
 				executor: selection.executor,
@@ -557,6 +616,18 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 			}
 			state = markProcessed(state, entry)
 			await saveWatcherState(statePath, state)
+			if (jobAttempt) {
+				try {
+					const dir = jobReceiptDirectory(repoRoot, jobAttempt)
+					fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+					fs.chmodSync(dir, 0o700)
+				} catch (error) {
+					state = markProcessed(state, { ...entry, status: "failed", error: `could not prepare private supervisor receipt directory: ${safeError(error)}` })
+					await saveWatcherState(statePath, state)
+					failures++
+					continue
+				}
+			}
 
 			if (ownedClaim && input.claimStore) {
 				try {
@@ -570,7 +641,7 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 				}
 			}
 
-			const batchInfo = { issue, specs, repoRoot, batch, ...selection }
+			const batchInfo = { issue: dispatchIssue, specs, repoRoot, batch, ...(jobAttempt ? { jobAttempt } : {}), ...selection }
 			let result: SpawnResult
 			try {
 				result = await spawn(batchInfo)
@@ -579,25 +650,44 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 			}
 
 			if (result.ok) {
+				let claimCurrentForLifecycle = true
 				if (ownedClaim && input.claimStore) {
 					try {
 						ownedClaim = await input.claimStore.markRunning(issue.number, ownedClaim)
 					} catch (err) {
+						claimCurrentForLifecycle = false
 						logger.error(`watcher: could not mark issue #${issue.number} claim running; stopping its workers: ${err instanceof Error ? err.message : String(err)}`)
 						await stopWorkerGroupsBestEffort(repoRoot, ownedClaim.worktreeNames, logger)
 						logger.warn(`watcher: issue #${issue.number} claim remains quarantined after claim-stage failure; worker markers cannot authorize release`)
 					}
 				}
-				state = markProcessed(state, { ...entry, status: "done", updatedAt: new Date().toISOString() })
-				if (entry.claim && ownedClaim) state = markProcessed(state, { ...entry, status: "done", claim: claimReference(ownedClaim) })
-				if (entry.claim && !ownedClaim) state = markProcessed(state, { ...entry, status: "done", claim: undefined })
+				if (entry.jobContract) {
+					state = markProcessed(state, {
+						...entry,
+						status: "spawned",
+						updatedAt: new Date().toISOString(),
+						...(ownedClaim ? { claim: claimReference(ownedClaim) } : {}),
+					})
+					try {
+						if (!claimCurrentForLifecycle) throw new Error("claim no longer verified after dispatch")
+						await setIssueLifecycle(gh, owner, repo, issue.number, "running")
+					} catch (error) {
+						failures++
+						logger.warn(`watcher: issue #${issue.number} launched, but its running label could not be applied; it remains active in local state: ${safeError(error)}`)
+					}
+				} else {
+					state = markProcessed(state, { ...entry, status: "done", updatedAt: new Date().toISOString() })
+					if (entry.claim && ownedClaim) state = markProcessed(state, { ...entry, status: "done", claim: claimReference(ownedClaim) })
+					if (entry.claim && !ownedClaim) state = markProcessed(state, { ...entry, status: "done", claim: undefined })
+				}
 				spawned++
-				logger.info(`watcher: spawned issue #${issue.number} (${specs.map((s) => s.name).join(", ")})`, {
+				logger.info(`watcher: ${entry.jobContract ? "launched" : "spawned"} issue #${issue.number} (${specs.map((s) => s.name).join(", ")})`, {
 					batch,
 					groups: specs.map((s) => s.taskFile),
 				})
 			} else {
 				const error = result.error ?? `spawn exited ${result.status ?? "unknown"}`
+				const uncertainJobDispatch = !!entry.jobContract && (!!result.command || !!result.mayHaveDispatched)
 				let claimReferenceStillActive = !!ownedClaim
 				if (ownedClaim && input.claimStore) {
 					if (!result.command && !result.mayHaveDispatched) {
@@ -608,14 +698,28 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 						logger.warn(`watcher: issue #${issue.number} ${result.mayHaveDispatched ? "spawn outcome is uncertain" : "spawn failed after dispatch"}; claim remains quarantined for operator recovery`)
 					}
 				}
-				state = markProcessed(state, { ...entry, status: "failed", error, updatedAt: new Date().toISOString(), ...(claimReferenceStillActive && ownedClaim ? { claim: claimReference(ownedClaim) } : { claim: undefined }) })
+				state = markProcessed(state, {
+					...entry,
+					status: uncertainJobDispatch ? "spawned" : "failed",
+					error,
+					updatedAt: new Date().toISOString(),
+					...(claimReferenceStillActive && ownedClaim ? { claim: claimReference(ownedClaim) } : { claim: undefined }),
+				})
+				if (entry.jobContract) {
+					try {
+						if (uncertainJobDispatch) await setIssueLifecycle(gh, owner, repo, issue.number, "running")
+						else await setIssueLifecycle(gh, owner, repo, issue.number, "failed")
+					} catch (lifecycleError) {
+						logger.warn(`watcher: issue #${issue.number} spawn failure status could not be reflected in GitHub labels: ${safeError(lifecycleError)}`)
+					}
+				}
 				failures++
 				// Loud by design: a failed spawn is NOT silently retried (default).
 				// Re-run with --retry-failed to force a retry next sweep.
 				logger.error(`watcher: spawn FAILED for issue #${issue.number} — ${error}`, { batch })
 			}
 			await saveWatcherState(statePath, state)
-			await input.onBatch?.({ issue, specs, batch, statePath, status: result.ok ? "done" : "failed" })
+			await input.onBatch?.({ issue, specs, batch, statePath, status: state.processed[String(issue.number)]?.status ?? "failed" })
 		} finally {
 			limiter.release()
 		}
@@ -663,6 +767,387 @@ function pendingEntry(issue: GitHubIssue, label: string): WatcherIssueEntry {
 		status: "pending",
 		updatedAt: new Date().toISOString(),
 	}
+}
+
+const JOB_LIFECYCLE_LABELS = ["headlesscode:running", "headlesscode:done", "headlesscode:failed"] as const
+type JobLifecycle = (typeof JOB_LIFECYCLE_LABELS)[number] extends `headlesscode:${infer S}` ? S : never
+
+interface JobReconcileInput {
+	state: WatcherState
+	issues: GitHubIssue[]
+	gh: GhClient
+	owner: string
+	repo: string
+	repoRoot: string
+	ghBaseUrl?: string
+	claims: ClaimSnapshot[]
+	claimStore?: GitHubIssueClaimStore
+	dryRun?: boolean
+	logger: Logger
+}
+
+/**
+ * A successful spawner exit only means detached workers were launched. A
+ * headlesscode-job stays in the active "spawned" state until every assigned
+ * worktree publishes both of run-worker.sh's terminal markers. This pass is
+ * intentionally a later-poll reconciliation; one-shot runs return while the
+ * issue is still labelled running.
+ */
+async function reconcileHeadlessCodeJobs(input: JobReconcileInput): Promise<{ state: WatcherState; failures: number }> {
+	let state = input.state
+	let failures = 0
+	const currentIssues = new Map(input.issues.map((issue) => [issue.number, issue]))
+	for (const entry of Object.values(state.processed)) {
+		if (!entry.jobContract) continue
+		if (entry.status === "failed") {
+			if (input.dryRun || !await verifyJobClaim(entry, input.claims, input.claimStore)) continue
+			try {
+				await setIssueLifecycle(input.gh, input.owner, input.repo, entry.number, "failed")
+				const marker = jobFailureMarker(entry)
+				const comments = await requireComments(input.gh, input.owner, input.repo, entry.number)
+				if (!comments.some((body) => body.includes(marker))) {
+					const completion = readJobCompletion(input.repoRoot, entry.groups ?? [], entry.jobAttempt)
+					const summary = completion.terminal
+						? completion.exitCodes.map((code, index) => `${entry.groups?.[index]?.name ?? `worker-${index + 1}`}: exit ${code}`).join("; ")
+						: safeError(entry.error ?? "job did not start")
+					const logSummary = completion.terminal ? completion.logs.filter(Boolean).join("\n\n").slice(-8000) : ""
+					await requireCommentWriter(input.gh)(input.owner, input.repo, entry.number,
+						`HeadlessCode job failed (${summary}). The watcher does not close failed job issues; review the worker summary before retrying.\n\n${logSummary ? `Bounded worker log summary:\n\n\`\`\`text\n${logSummary}\n\`\`\`\n\n` : ""}${marker}`)
+				}
+			} catch (error) {
+				failures++
+				input.logger.warn(`watcher: issue #${entry.number} failure result could not be reflected in GitHub; it will retry on a later poll: ${safeError(error)}`)
+			}
+			continue
+		}
+		if (entry.status !== "spawned") continue
+		const completion = readJobCompletion(input.repoRoot, entry.groups ?? [], entry.jobAttempt)
+		if (!completion.terminal) {
+			const issue = currentIssues.get(entry.number)
+			const lifecycleOutOfSync = !!issue && (!issue.labels.includes("headlesscode:running") || JOB_LIFECYCLE_LABELS.some((label) => label !== "headlesscode:running" && issue.labels.includes(label)))
+			if (issue && lifecycleOutOfSync && !input.dryRun && await verifyJobClaim(entry, input.claims, input.claimStore)) {
+				try { await setIssueLifecycle(input.gh, input.owner, input.repo, entry.number, "running") }
+				catch (error) { failures++; input.logger.warn(`watcher: issue #${entry.number} is still running, but its lifecycle label could not be refreshed: ${safeError(error)}`) }
+			}
+			continue
+		}
+		if (!await verifyJobClaim(entry, input.claims, input.claimStore)) {
+			input.logger.warn(`watcher: issue #${entry.number} completion found, but its runner claim could not be verified; leaving lifecycle unchanged`)
+			continue
+		}
+		if (input.dryRun) continue
+		const terminal: "done" | "failed" = completion.exitCodes.every((code) => code === 0) ? "done" : "failed"
+		const summary = completion.exitCodes.map((code, index) => `${entry.groups?.[index]?.name ?? `worker-${index + 1}`}: exit ${code}`).join("; ")
+		try {
+			await setIssueLifecycle(input.gh, input.owner, input.repo, entry.number, terminal)
+			const commentMarker = terminal === "failed" ? jobFailureMarker({ ...entry, error: summary }) : jobCommentMarker(entry)
+			const priorComments = await requireComments(input.gh, input.owner, input.repo, entry.number)
+			if (!priorComments.some((body) => body.includes(commentMarker))) {
+				const logSummary = completion.logs.filter(Boolean).join("\n\n").slice(-8000)
+				if (terminal === "done") {
+					const lookup = await findVerifiedJobPullRequests(input, entry)
+					const prText = lookup.pullRequests.length > 0
+						? lookup.pullRequests.map((pr) => `- [#${pr.number}](${pr.url})`).join("\n")
+						: lookup.branchesChecked > 0
+							? "No pull request was found for the generated worker branches."
+							: "Pull request lookup was unavailable because no generated worker branch could be verified; no PR link is included."
+					await requireCommentWriter(input.gh)(input.owner, input.repo, entry.number,
+						`HeadlessCode job finished successfully (${summary}).\n\n${logSummary ? `Bounded worker log summary:\n\n\`\`\`text\n${logSummary}\n\`\`\`\n\n` : ""}Pull request lookup:\n${prText}\n\n${commentMarker}`)
+				} else {
+					await requireCommentWriter(input.gh)(input.owner, input.repo, entry.number,
+						`HeadlessCode job failed (${summary}). The watcher does not close failed job issues; review the worker summary before retrying.\n\n${logSummary ? `Bounded worker log summary:\n\n\`\`\`text\n${logSummary}\n\`\`\`\n\n` : ""}${commentMarker}`)
+				}
+			}
+			if (terminal === "done") await requireIssueCloser(input.gh)(input.owner, input.repo, entry.number)
+			state = markProcessed(state, { ...entry, status: terminal, updatedAt: new Date().toISOString(), ...(terminal === "failed" ? { error: summary } : { error: undefined }) })
+		} catch (error) {
+			failures++
+			input.logger.warn(`watcher: issue #${entry.number} reached ${terminal}, but GitHub lifecycle update did not finish; it will retry on a later poll: ${safeError(error)}`)
+		}
+	}
+	return { state, failures }
+}
+
+async function verifyJobClaim(
+	entry: WatcherIssueEntry,
+	claims: readonly ClaimSnapshot[],
+	store: GitHubIssueClaimStore | undefined,
+): Promise<boolean> {
+	if (!entry.claim) return true
+	if (!store) return false
+	const snapshot = claims.find(({ claim }) => claim.issue === entry.number &&
+		claim.runnerId === entry.claim!.runnerId && claim.leaseNonce === entry.claim!.leaseNonce &&
+		claim.epoch === entry.claim!.epoch && sameStringArray(claim.worktreeNames, entry.claim!.worktreeNames))
+	if (!snapshot) return false
+	try {
+		const current = await store.read(entry.number)
+		return !!current && current.claim.phase === "active" &&
+			current.claim.runnerId === snapshot.claim.runnerId && current.claim.leaseNonce === snapshot.claim.leaseNonce &&
+			current.claim.epoch === snapshot.claim.epoch && sameStringArray(current.claim.worktreeNames, snapshot.claim.worktreeNames)
+	} catch {
+		return false
+	}
+}
+
+function sameStringArray(left: readonly string[], right: readonly string[]): boolean {
+	return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
+async function setIssueLifecycle(gh: GhClient, owner: string, repo: string, number: number, lifecycle: JobLifecycle): Promise<void> {
+	const selected = `headlesscode:${lifecycle}`
+	if (!gh.removeLabel) throw new Error("GitHub client cannot remove stale job lifecycle labels")
+	await gh.addLabel(owner, repo, number, selected)
+	for (const label of JOB_LIFECYCLE_LABELS) if (label !== selected) await gh.removeLabel(owner, repo, number, label)
+}
+
+function requireComments(gh: GhClient, owner: string, repo: string, number: number): Promise<string[]> {
+	if (!gh.listIssueComments) throw new Error("GitHub client cannot check existing job result comments")
+	return gh.listIssueComments(owner, repo, number)
+}
+
+function requireCommentWriter(gh: GhClient): NonNullable<GhClient["createIssueComment"]> {
+	if (!gh.createIssueComment) throw new Error("GitHub client cannot post job result comments")
+	return gh.createIssueComment.bind(gh)
+}
+
+function requireIssueCloser(gh: GhClient): NonNullable<GhClient["closeIssue"]> {
+	if (!gh.closeIssue) throw new Error("GitHub client cannot close completed job issues")
+	return gh.closeIssue.bind(gh)
+}
+
+async function reportJobIntakeFailure(gh: GhClient, owner: string, repo: string, number: number, message: string, logger: Logger): Promise<void> {
+	const marker = jobFailureMarker({ number, error: message })
+	try {
+		await setIssueLifecycle(gh, owner, repo, number, "failed")
+		const comments = await requireComments(gh, owner, repo, number)
+		if (!comments.some((body) => body.includes(marker))) {
+			await requireCommentWriter(gh)(owner, repo, number, `HeadlessCode could not dispatch this job: ${safeError(message)}\n\n${marker}`)
+		}
+	} catch (error) {
+		logger.warn(`watcher: issue #${number} intake failure could not be reflected in GitHub: ${safeError(error)}`)
+	}
+}
+
+function jobCommentMarker(entry: WatcherIssueEntry): string {
+	const key = createHash("sha256").update(`${entry.number}\0${entry.spawnedAt ?? ""}`).digest("hex").slice(0, 24)
+	return `<!-- headlesscode-job-result:${key} -->`
+}
+
+function jobFailureMarker(entry: Pick<WatcherIssueEntry, "number"> & Partial<Pick<WatcherIssueEntry, "spawnedAt" | "error">>): string {
+	const key = createHash("sha256").update(`${entry.number}\0${entry.spawnedAt ?? ""}\0${entry.error ?? ""}`).digest("hex").slice(0, 24)
+	return `<!-- headlesscode-job-failure:${key} -->`
+}
+
+interface JobCompletion {
+	terminal: boolean
+	exitCodes: number[]
+	logs: string[]
+}
+
+function readJobCompletion(repoRoot: string, groups: readonly WorktreeSpec[], attemptId?: string): JobCompletion {
+	if (!attemptId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(attemptId) || groups.length === 0 || groups.length > 16) return { terminal: false, exitCodes: [], logs: [] }
+	const exitCodes: number[] = []
+	const logs: string[] = []
+	for (const group of groups) {
+		if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(group.name)) return { terminal: false, exitCodes: [], logs: [] }
+		const worktree = path.join(repoRoot, ".worktrees", group.name)
+		try {
+			const rootStat = fs.lstatSync(path.join(repoRoot, ".worktrees"))
+			const worktreeStat = fs.lstatSync(worktree)
+			if (rootStat.isSymbolicLink() || !rootStat.isDirectory() || worktreeStat.isSymbolicLink() || !worktreeStat.isDirectory()) return { terminal: false, exitCodes: [], logs: [] }
+		} catch {
+			return { terminal: false, exitCodes: [], logs: [] }
+		}
+		// The OpenShell provider leaves this host-side marker in place when
+		// sandbox deletion cannot be verified. Its presence vetoes completion;
+		// the worker cannot turn a failed guest teardown into a terminal issue.
+		try {
+			fs.lstatSync(path.join(worktree, ".harness.openshell-sandbox"))
+			return { terminal: false, exitCodes: [], logs: [] }
+		} catch (error) {
+			if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) return { terminal: false, exitCodes: [], logs: [] }
+		}
+		// Worktree markers are useful diagnostics only. Terminal status requires
+		// an attempt-bound receipt written outside the worker-controlled tree and
+		// proof that its recorded process group is no longer executing.
+		const receiptDir = jobReceiptDirectory(repoRoot, attemptId)
+		try {
+			const parent = fs.lstatSync(path.dirname(receiptDir))
+			const receipts = fs.lstatSync(receiptDir)
+			if (parent.isSymbolicLink() || !parent.isDirectory() || receipts.isSymbolicLink() || !receipts.isDirectory() || (receipts.mode & 0o077) !== 0) return { terminal: false, exitCodes: [], logs: [] }
+		} catch { return { terminal: false, exitCodes: [], logs: [] } }
+		const identity = readJobReceipt(`${receiptDir}/${group.name}.launch`)
+		const completion = readJobReceipt(`${receiptDir}/${group.name}.complete`)
+		if (!validWorkerIdentity(identity, attemptId, group.name) || !validWorkerCompletion(completion, attemptId, group.name)) return { terminal: false, exitCodes: [], logs: [] }
+		if (completion.pid !== identity.pid || completion.pgid !== identity.pgid || completion.startTicks !== identity.startTicks) return { terminal: false, exitCodes: [], logs: [] }
+		if (workerGroupLiveness(identity) !== "absent") return { terminal: false, exitCodes: [], logs: [] }
+		const exitCode = completion.exitCode
+		exitCodes.push(exitCode)
+		logs.push(readBoundedLogTail(path.join(worktree, "harness.log")))
+	}
+	return { terminal: true, exitCodes, logs }
+}
+
+interface WorkerLaunchReceipt { version: 1; attemptId: string; group: string; pid: number; pgid: number; startTicks: string }
+interface WorkerCompletionReceipt extends WorkerLaunchReceipt { exitCode: number }
+
+function jobReceiptDirectory(repoRoot: string, attemptId: string): string {
+	return path.join(repoRoot, ".worktrees", ".headlesscode-job-runs", attemptId)
+}
+
+function readJobReceipt(filePath: string): unknown {
+	try {
+		const stat = fs.lstatSync(filePath)
+		if (stat.isSymbolicLink() || !stat.isFile() || (typeof process.getuid === "function" && stat.uid !== process.getuid())) return undefined
+	} catch { return undefined }
+	const raw = readSmallRegularFile(filePath, 2048)
+	if (!raw) return undefined
+	try { return JSON.parse(raw) as unknown } catch { return undefined }
+}
+
+function validWorkerIdentity(value: unknown, attemptId: string, group: string): value is WorkerLaunchReceipt {
+	if (!value || typeof value !== "object") return false
+	const receipt = value as Partial<WorkerLaunchReceipt>
+	return receipt.version === 1 && receipt.attemptId === attemptId && receipt.group === group &&
+		Number.isSafeInteger(receipt.pid) && Number(receipt.pid) > 1 && receipt.pgid === receipt.pid &&
+		typeof receipt.startTicks === "string" && /^[0-9]{1,24}$/.test(receipt.startTicks)
+}
+
+function validWorkerCompletion(value: unknown, attemptId: string, group: string): value is WorkerCompletionReceipt {
+	if (!value || typeof value !== "object") return false
+	const receipt = value as Partial<WorkerCompletionReceipt>
+	return receipt.version === 1 && receipt.attemptId === attemptId && receipt.group === group &&
+		Number.isSafeInteger(receipt.pid) && Number(receipt.pid) > 1 && receipt.pgid === receipt.pid &&
+		typeof receipt.startTicks === "string" && /^[0-9]{1,24}$/.test(receipt.startTicks) &&
+		Number.isInteger(receipt.exitCode) && Number(receipt.exitCode) >= 0 && Number(receipt.exitCode) <= 255
+}
+
+type WorkerLiveness = "active" | "absent" | "unknown"
+
+function parseProcStat(raw: string): { state: string; pgrp: number; session: number; startTicks: string } | undefined {
+	const close = raw.lastIndexOf(")")
+	if (close < 0) return undefined
+	const fields = raw.slice(close + 1).trim().split(/\s+/)
+	const pgrp = Number(fields[2])
+	const session = Number(fields[3])
+	const startTicks = fields[19]
+	if (!fields[0] || !Number.isSafeInteger(pgrp) || !Number.isSafeInteger(session) || !startTicks || !/^\d+$/.test(startTicks)) return undefined
+	return { state: fields[0], pgrp, session, startTicks }
+}
+
+function workerGroupLiveness(identity: WorkerLaunchReceipt): WorkerLiveness {
+	if (process.platform !== "linux") return "unknown"
+	let names: string[]
+	try { names = fs.readdirSync("/proc") } catch { return "unknown" }
+	let found = false
+	for (const name of names) {
+		if (!/^\d+$/.test(name)) continue
+		let stat: { state: string; pgrp: number; session: number; startTicks: string } | undefined
+		try { stat = parseProcStat(fs.readFileSync(`/proc/${name}/stat`, "utf8")) }
+		catch (error) {
+			const code = (error as NodeJS.ErrnoException).code
+			if (code !== "ENOENT" && code !== "ESRCH") return "unknown"
+			continue
+		}
+		if (!stat) return "unknown"
+		if (Number(name) === identity.pid && stat.startTicks !== identity.startTicks) return "unknown" // PID reuse makes the old group identity unverifiable.
+		if (stat.pgrp === identity.pgid && stat.session === identity.pgid && stat.state !== "Z" && stat.state !== "X") found = true
+	}
+	return found ? "active" : "absent"
+}
+
+
+function readSmallRegularFile(filePath: string, maxBytes: number): string | undefined {
+	let fd: number | undefined
+	try {
+		fd = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0))
+		const stat = fs.fstatSync(fd)
+		if (!stat.isFile() || stat.size > maxBytes) return undefined
+		const buffer = Buffer.alloc(maxBytes + 1)
+		const length = fs.readSync(fd, buffer, 0, buffer.length, 0)
+		if (length > maxBytes) return undefined
+		return new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, length))
+	} catch {
+		return undefined
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd)
+	}
+}
+
+function readBoundedLogTail(filePath: string): string {
+	const maxBytes = 16 * 1024
+	let fd: number | undefined
+	try {
+		fd = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0))
+		const stat = fs.fstatSync(fd)
+		if (!stat.isFile()) return ""
+		const size = Math.min(stat.size, maxBytes)
+		const buffer = Buffer.alloc(size)
+		fs.readSync(fd, buffer, 0, size, Math.max(0, stat.size - size))
+		const text = new TextDecoder("utf-8", { fatal: false }).decode(buffer)
+		return sanitizeJobSummary(text.split(/\r?\n/).slice(-20).join("\n"))
+	} catch {
+		return ""
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd)
+	}
+}
+
+function sanitizeJobSummary(value: string): string {
+	return value
+		.replace(/\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001b\\))/g, "")
+		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ")
+		.replace(/```/g, "'''" )
+		.replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{12,}|sk-or-v1-[A-Za-z0-9_-]{16,})\b/g, "[redacted credential]")
+		.replace(/\bBearer\s+\S+/gi, "Bearer [redacted]")
+		.replace(/\b(?:api[_-]?key|token|secret|password)\s*[:=]\s*\S+/gi, "[redacted secret field]")
+		.replace(/https?:\/\/\S+/gi, "[URL redacted]")
+		.replace(/@/g, "@\u200b")
+		.slice(-4000)
+}
+
+async function findVerifiedJobPullRequests(input: JobReconcileInput, entry: WatcherIssueEntry): Promise<{ pullRequests: GitHubPullRequestSummary[]; branchesChecked: number }> {
+	if (!input.gh.listPullRequestsForHead) return { pullRequests: [], branchesChecked: 0 }
+	const state = loadStateSync(path.join(input.repoRoot, ".worktrees", ".orchestrator-state.json"))
+	const verified: GitHubPullRequestSummary[] = []
+	let branchesChecked = 0
+	for (const group of entry.groups ?? []) {
+		if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(group.name)) continue
+		const generated = state?.groups?.find((candidate) => candidate.name === group.name)
+		const branch = generated?.branch
+		if (typeof branch !== "string" || !new RegExp(`^issues/${escapeRegExp(group.name)}-\\d{4}-\\d{2}-\\d{2}(?:-\\d+)?$`).test(branch)) continue
+		branchesChecked++
+		const pullRequests = await input.gh.listPullRequestsForHead(input.owner, input.repo, branch)
+		for (const pr of pullRequests) {
+			if (pr.branch !== branch || pr.baseRepository.toLowerCase() !== `${input.owner}/${input.repo}`.toLowerCase() || pr.headRepository.toLowerCase() !== `${input.owner}/${input.repo}`.toLowerCase()) continue
+			if (!isVerifiedPullRequestUrl(pr.url, pr.number, input.owner, input.repo, input.ghBaseUrl)) continue
+			verified.push(pr)
+		}
+	}
+	return { pullRequests: [...new Map(verified.map((pr) => [pr.number, pr])).values()].sort((a, b) => a.number - b.number), branchesChecked }
+}
+
+function isVerifiedPullRequestUrl(value: string, expectedNumber: number, owner: string, repo: string, apiBaseUrl?: string): boolean {
+	try {
+		const url = new URL(value)
+		if (url.protocol !== "https:" || url.username || url.password || url.port || url.search || url.hash) return false
+		const match = new RegExp(`^/${escapeRegExp(owner)}/${escapeRegExp(repo)}/pull/([1-9][0-9]*)$`, "i").exec(url.pathname)
+		if (!match || Number(match[1]) !== expectedNumber) return false
+		const apiBase = apiBaseUrl ?? process.env.GITHUB_API_BASE_URL ?? DEFAULT_GH_BASE_URL
+		const apiHost = new URL(apiBase).hostname
+		const expectedHost = apiHost === "api.github.com" ? "github.com" : apiHost
+		return url.hostname === expectedHost
+	} catch {
+		return false
+	}
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function safeError(error: unknown): string {
+	return sanitizeJobSummary(error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 300)
 }
 
 /** Renew this runner's active claims and release only verified stopped workers. */
@@ -937,6 +1422,10 @@ export function buildWorkerSpawnEnvironment(
 		HEADLESSCODE_AGENT_EXECUTOR: batch.executor,
 		HEADLESSCODE_NATIVE_MUSE_MODEL: batch.museModel ?? "",
 		HEADLESSCODE_PROJECT: path.basename(batch.repoRoot),
+		...(batch.jobAttempt ? {
+			HEADLESSCODE_JOB_ATTEMPT: batch.jobAttempt,
+			HEADLESSCODE_JOB_RECEIPT_DIR: jobReceiptDirectory(batch.repoRoot, batch.jobAttempt),
+		} : {}),
 		...(config.memoryDir ? { HEADLESSCODE_MEMORY_DIR: path.resolve(config.memoryDir) } : {}),
 	}
 }
