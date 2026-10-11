@@ -8,6 +8,7 @@ import { runRsi } from "../controller.js"
 import { newCandidate, resolveBaseCommit } from "../workspace.js"
 import type { RsiConfig, RsiRunRecord, TrialResult } from "../types.js"
 import { fakeDevelopmentBenchmarkHook, fixtureDevelopmentProofProtocol } from "./development-proof-fixture.js"
+import { withSyntheticEvaluatorPolicy } from "./synthetic-evaluator-runtime.js"
 
 function ok(command: string, durationMs = 1): TrialResult {
 	return { ok: true, command, exitCode: 0, durationMs, stdout: "", stderr: "" }
@@ -58,7 +59,8 @@ async function main(): Promise<void> {
 			reports: [],
 		}
 		await checkpointRun(config.archiveDir, interrupted)
-		const resumed = await runRsi({ ...config, resumeRunId: "resume-fixture" }, {
+		const resumed = await withSyntheticEvaluatorPolicy(() => runRsi({ ...config, resumeRunId: "resume-fixture" }, {
+			syntheticRuntimeIdentity: true,
 			log: () => undefined,
 			runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook(),
 			runCommand: async (command, cwd) => ok(command, path.basename(cwd).startsWith("rsi-baseline-") ? 100 : 1),
@@ -68,7 +70,7 @@ async function main(): Promise<void> {
 				execFileSync("git", ["commit", "-qm", "resume"], { cwd: entry.worktree })
 				return { ok: true, result: ok("mutation") }
 			},
-		})
+		}))
 		assert.equal(resumed.runId, "resume-fixture")
 		assert.equal(resumed.candidates[0].status, "rejected")
 		assert.equal(resumed.candidates[0].developmentProof?.accepted, false)
@@ -134,12 +136,13 @@ async function testRejectedParentCannotLaunchMutation(): Promise<void> {
 			}
 			await checkpointRun(config.archiveDir, interrupted)
 			const caseConfig = { ...config, protectedPaths: parentKind === "protected" ? [".env"] : [], resumeRunId: runId }
-			const result = await runRsi(caseConfig, {
+			const result = await withSyntheticEvaluatorPolicy(() => runRsi(caseConfig, {
+				syntheticRuntimeIdentity: true,
 				log: () => undefined,
 				runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook(),
 				runCommand: async (command) => ok(command),
 				runMutation: async () => { mutationCalls++; return { ok: true } },
-			})
+			}))
 			const rejected = result.candidates.find((entry) => entry.id === candidateId)
 			assert.equal(rejected?.status, "rejected")
 			assert.match(rejected?.failure ?? "", /parent|commit/)

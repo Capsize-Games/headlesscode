@@ -8,6 +8,7 @@ import { checkpointRun, readArchive } from "../archive.js"
 import { runRsi } from "../controller.js"
 import type { CandidateRecord, RsiConfig, TrialResult } from "../types.js"
 import { fakeDevelopmentBenchmarkHook } from "./development-proof-fixture.js"
+import { withSyntheticEvaluatorPolicy } from "./synthetic-evaluator-runtime.js"
 
 function ok(command: string, durationMs = 1): TrialResult {
 	return { ok: true, command, exitCode: 0, durationMs, stdout: "", stderr: "" }
@@ -46,7 +47,8 @@ async function main(): Promise<void> {
 			commandTimeoutMs: 1000,
 		} satisfies RsiConfig
 		const proofCalls: Array<{ harnessCommit: string; outputRoot: string }> = []
-		const run = await runRsi(config, {
+		const run = await withSyntheticEvaluatorPolicy(() => runRsi(config, {
+			syntheticRuntimeIdentity: true,
 			now: (() => {
 				let tick = 0
 				return () => `2026-09-20T00:00:${String(tick++).padStart(2, "0")}.000Z`
@@ -61,7 +63,7 @@ async function main(): Promise<void> {
 				execFileSync("git", ["commit", "-qm", `candidate ${candidate.id}`], { cwd: candidate.worktree })
 				return { ok: true, result: ok("mutation") }
 			},
-		})
+		}))
 		assert.equal(run.candidates.length, 4)
 		assert.ok(run.candidates.filter((candidate) => candidate.generation === 1).every((candidate) => candidate.parent === "baseline"), "unqualified parent evidence must keep later candidates on the run base")
 		assert.equal(run.combinations?.length, 4)
@@ -80,8 +82,8 @@ async function main(): Promise<void> {
 		await fs.rm(repo, { recursive: true, force: true })
 	}
 	console.log("All 7 RSI controller assertions passed")
-	await testAuthoritativeDevelopmentProofControlsParentSelection()
-	await testSealedEvaluatorResumeRejectsDrift()
+	await withSyntheticEvaluatorPolicy(() => testAuthoritativeDevelopmentProofControlsParentSelection())
+	await withSyntheticEvaluatorPolicy(() => testSealedEvaluatorResumeRejectsDrift())
 }
 
 async function testSealedEvaluatorResumeRejectsDrift(): Promise<void> {
@@ -177,6 +179,7 @@ async function testAuthoritativeDevelopmentProofControlsParentSelection(): Promi
 		const [firstNonRetention, secondNonRetention] = manifest.tasks.filter((task) => !retention.has(task.id)).map((task) => task.id)
 		let acceptedCommit: string | undefined
 		const run = await runRsi(config, {
+			syntheticRuntimeIdentity: true,
 			log: () => undefined,
 			runCommand: async (command) => ok(command),
 			runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook([], {
@@ -218,6 +221,7 @@ async function testAuthoritativeDevelopmentProofControlsParentSelection(): Promi
 			await checkpointRun(config.archiveDir, interrupted)
 			const replayCalls: Array<{ harnessCommit: string; outputRoot: string }> = []
 			const replayed = await runRsi({ ...config, generations: 3, dryRun: true, resumeRunId: run.runId }, {
+				syntheticRuntimeIdentity: true,
 				log: () => undefined,
 				runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook(replayCalls, { proofQualified: true }),
 			})

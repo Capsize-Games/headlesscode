@@ -9,13 +9,14 @@ import { createMutationSnapshotIdentity } from "../openshell.js"
 import { effectiveWorkerHarnessMode, workerHarnessCliPath } from "../worker-harness.js"
 import type { CandidateRecord, RsiConfig, RsiRunRecord, TrialResult, WorkerHarnessRuntimeIdentity } from "../types.js"
 import { fakeDevelopmentBenchmarkHook } from "./development-proof-fixture.js"
+import { withSyntheticEvaluatorPolicy } from "./synthetic-evaluator-runtime.js"
 import { validateCandidateParent } from "../controller.js"
 
 function ok(command: string): TrialResult {
 	return { ok: true, command, exitCode: 0, durationMs: 1, stdout: "", stderr: "" }
 }
 
-async function main(): Promise<void> {
+async function runControllerFixture(): Promise<void> {
 	const scratch = path.resolve(".headlesscode/scratch")
 	await fs.mkdir(scratch, { recursive: true, mode: 0o700 })
 	const root = await fs.mkdtemp(path.join(scratch, "hc-rsi-worker-harness-controller-"))
@@ -148,7 +149,7 @@ async function main(): Promise<void> {
 	}
 }
 
-main().catch((error) => {
+withSyntheticEvaluatorPolicy(runControllerFixture).catch((error) => {
 	console.error(error)
 	process.exit(1)
 })

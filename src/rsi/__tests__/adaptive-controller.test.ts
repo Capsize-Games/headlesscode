@@ -7,9 +7,10 @@ import test from "node:test"
 import { runRsi as runRsiImplementation } from "../controller.js"
 import type { RsiConfig, RsiHooks, RsiRunRecord, TrialResult } from "../types.js"
 import { fakeDevelopmentBenchmarkHook } from "./development-proof-fixture.js"
+import { withSyntheticEvaluatorPolicy } from "./synthetic-evaluator-runtime.js"
 
 function runRsi(config: RsiConfig, hooks: RsiHooks = {}): Promise<RsiRunRecord> {
-	return runRsiImplementation(config, { runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook(), ...hooks })
+	return withSyntheticEvaluatorPolicy(() => runRsiImplementation(config, { syntheticRuntimeIdentity: true, runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook(), ...hooks }))
 }
 
 function trial(command: string, ok: boolean): TrialResult {
