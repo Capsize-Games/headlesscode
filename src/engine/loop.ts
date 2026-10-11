@@ -176,6 +176,20 @@ import { getModeBySlug, modes } from "../vendor/zoo-code/src/shared/modes.js"
 export const DEFAULT_MAX_PAUSE_MS = 2 * 60 * 60 * 1000
 /** Default pause marker poll interval, ms (same cadence as decision escalation). */
 export const DEFAULT_PAUSE_POLL_INTERVAL_MS = 5_000
+
+/** Monitor observations cannot mutate nested tool arguments or share their references. */
+function immutableBoundaryArguments(args: Record<string, unknown>): Readonly<Record<string, unknown>> {
+	const copy = structuredClone(args)
+	const pending: unknown[] = [copy]
+	while (pending.length > 0) {
+		const value = pending.pop()
+		if (value === null || typeof value !== "object") continue
+		for (const child of Object.values(value)) pending.push(child)
+		Object.freeze(value)
+	}
+	return copy
+}
+
 /** Marker basenames, relative to the workspace root (see src/tools/executor.ts's marker idiom). */
 const PAUSE_REQUESTED_FILENAME = ".harness.pause-requested"
 const PAUSED_FILENAME = ".harness.paused"
@@ -2269,11 +2283,12 @@ export class HeadlessSession {
 		messages: ChatMessage[],
 	): Promise<void> {
 		const hook = this.config.iterationBoundaryHook
-		if (hook === undefined || this.sessionEnded) {
+		if (hook === undefined || this.sessionEnded || this.stopSignal?.aborted) {
 			return
 		}
 		let timedOut = false
 		let timer: ReturnType<typeof setTimeout> | undefined
+		let stopListener: (() => void) | undefined
 		try {
 			const result = await Promise.race([
 				Promise.resolve().then(() => hook(snapshot)),
@@ -2283,12 +2298,18 @@ export class HeadlessSession {
 						resolve(undefined)
 					}, this.config.iterationBoundaryTimeoutMs)
 				}),
+				new Promise<undefined>((resolve) => {
+					if (!this.stopSignal) return
+					stopListener = () => resolve(undefined)
+					this.stopSignal.addEventListener("abort", stopListener, { once: true })
+					if (this.stopSignal.aborted) resolve(undefined)
+				}),
 			])
-			if (timedOut || result === undefined) {
+			if (this.sessionEnded || this.stopSignal?.aborted || timedOut || result === undefined) {
 				await this.emitEvent("iteration_intervention_abstained", () =>
 					this.eventFeed.emit("iteration_intervention_abstained", {
 						iteration: snapshot.iteration,
-						reason: timedOut ? "timeout" : "missing",
+						reason: this.sessionEnded || this.stopSignal?.aborted ? "session-ended" : timedOut ? "timeout" : "missing",
 					}), { iteration: snapshot.iteration })
 				return
 			}
@@ -2316,12 +2337,12 @@ export class HeadlessSession {
 					interventionId: id,
 					templateId,
 				}), { iteration: snapshot.iteration })
-			if (this.sessionEnded || this.appliedIterationInterventionIds.has(id)) {
+			if (this.sessionEnded || this.stopSignal?.aborted || this.appliedIterationInterventionIds.has(id)) {
 				await this.emitEvent("iteration_intervention_abstained", () =>
 					this.eventFeed.emit("iteration_intervention_abstained", {
 						iteration: snapshot.iteration,
 						interventionId: id,
-						reason: this.sessionEnded ? "session-ended" : "duplicate",
+						reason: this.sessionEnded || this.stopSignal?.aborted ? "session-ended" : "duplicate",
 					}), { iteration: snapshot.iteration })
 				return
 			}
@@ -2345,6 +2366,7 @@ export class HeadlessSession {
 			})
 		} finally {
 			if (timer !== undefined) clearTimeout(timer)
+			if (stopListener) this.stopSignal?.removeEventListener("abort", stopListener)
 		}
 	}
 
@@ -5139,7 +5161,7 @@ export class HeadlessSession {
 				boundaryTools.push({
 					id: call.id,
 					name: call.name,
-					arguments: Object.freeze({ ...call.args }),
+					arguments: this.config.iterationBoundaryHook === undefined ? Object.freeze({ ...call.args }) : immutableBoundaryArguments(call.args),
 					isError,
 					result: resultContent,
 					...(isError ? { normalizedError: resultContent.split("\n", 1)[0]?.slice(0, 200) ?? "tool_error" } : {}),
