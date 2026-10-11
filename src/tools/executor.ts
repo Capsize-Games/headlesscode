@@ -2421,11 +2421,13 @@ function stubHandler(name: string, implemented: readonly string[] = ["read_file"
  * vendored CodebaseSearchTool's output shape (src/vendor/zoo-code/src/core/
  * tools/CodebaseSearchTool.ts).
  *
- * If no index exists yet, returns a clear ACTIONABLE error telling the model
- * to ask a human to run `headlesscode index` — deliberately NOT a silent
+ * If no index exists yet (genuine ENOENT), falls back to a bounded literal
+ * lexical scan (src/codesearch/lexical.ts) — deliberately NOT a silent
  * empty result ("no matches" would look like a legitimately empty search).
  * The index is built by a separate, explicit CLI step and is never
  * auto-triggered mid-session (it costs real money and takes real time).
+ * A non-regular index path (e.g. a directory at index.jsonl) is a tool
+ * error with zero embedding fetches.
  */
 async function codebaseSearchHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
 	const query = requireString(args, "query")
@@ -2434,10 +2436,15 @@ async function codebaseSearchHandler(args: Record<string, unknown>, ctx: ToolCon
 	return (async () => {
 		// No index → bounded lexical fallback, not a silent empty result.
 		// Only a genuine ENOENT (missing index file) takes this path; any
-		// other access error still surfaces as a tool error below.
+		// other access error still surfaces as a tool error below. A
+		// non-regular index (e.g. a directory at index.jsonl) is rejected
+		// here, before any embedding fetch.
 		const indexFile = indexFilePath(ctx.workspaceRoot)
 		try {
-			await fsp.access(indexFile)
+			const indexStat = await fsp.stat(indexFile)
+			if (!indexStat.isFile()) {
+				return err(`codebase_search: cannot read codebase index at '${indexFile}': not a regular file`)
+			}
 		} catch (error) {
 			if (
 				!(error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT")
