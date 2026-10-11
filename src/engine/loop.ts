@@ -4122,9 +4122,26 @@ export class HeadlessSession {
 				// tool calls back.
 				const unsupportedMeasurementClaim =
 					/\d+(\.\d+)?\s*(tokens?\/sec|t\/s|%|ms|seconds?)\b|measured|benchmark/i.test(result) &&
-					!messages.some(
-						(m) => m.role === "tool" && m.name === "execute_command" && /\d/.test(String(m.content ?? "")),
-					)
+					!(() => {
+						// A digit anywhere in successful shell output is not measurement
+						// evidence: stderr is intentionally included in tool content, and
+						// environment warnings such as `en_US.UTF-8` contain digits. For
+						// quantified claims, require the claimed value itself in command
+						// output instead of accepting unrelated diagnostic numbers.
+						const numericTokens = (value: string): string[] =>
+							[...value.matchAll(/(?<![\w.])\d+(?:\.\d+)?(?![\w.])/g)].map((match) => match[0])
+						const claimedValues = numericTokens(result)
+						const commandOutputs = messages
+							.filter((m) => m.role === "tool" && m.name === "execute_command")
+							.map((m) => String(m.content ?? ""))
+						return claimedValues.length > 0
+							? claimedValues.some((value) => {
+								const escapedValue = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+								const exactValue = new RegExp(`(?<![\\w.])${escapedValue}(?![\\w.])`)
+								return commandOutputs.some((output) => exactValue.test(output))
+							})
+							: commandOutputs.some((output) => numericTokens(output).length > 0)
+					})()
 				// staleReReadEditClaim: a failed write was cleared by a re-read
 				// ONLY (never a real successful write since — see
 				// writeFailedClearedByReReadOnly's doc), yet this completion's prose
