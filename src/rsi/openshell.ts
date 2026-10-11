@@ -158,6 +158,11 @@ function initializeSnapshot(sourceRoot: string, commit: string, destination: str
 	execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: destination })
 	execFileSync("git", ["config", "user.name", "HeadlessCode RSI Snapshot"], { cwd: destination })
 	execFileSync("git", ["config", "user.email", "rsi-snapshot@invalid.example"], { cwd: destination })
+	// These repositories are throwaway snapshots. Disable background maintenance
+	// before staging so a detached gc/maintenance process cannot outlive the
+	// snapshot's synchronous cleanup (or race bundle creation).
+	execFileSync("git", ["config", "gc.auto", "0"], { cwd: destination })
+	execFileSync("git", ["config", "maintenance.auto", "false"], { cwd: destination })
 	execFileSync("git", ["add", "--all"], { cwd: destination })
 	if (mode === "evaluation" && includeHarnessDependencies) execFileSync("git", ["add", "--force", "--", IMAGE_DEPENDENCIES_LINK], { cwd: destination })
 	execFileSync("git", ["-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", `RSI ${mode} snapshot ${commit}`], { cwd: destination, env: snapshotCommitEnvironment() })
