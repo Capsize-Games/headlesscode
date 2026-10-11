@@ -68,7 +68,7 @@ function parsePositiveInteger(value: string | undefined, fallback: number, name:
 }
 
 function taskConfig(payload: FleetJobPayload, root: string, queue: PostgresRsiJobQueue): RsiConfig {
-	const roles: RsiRoleConfig = { worker: { provider: payload.provider ?? "ollama", model: payload.model } }
+	const roles: RsiRoleConfig = { worker: { provider: payload.provider ?? "ollama", model: payload.model, ...(payload.openRouterProfile ? { openRouterProfile: payload.openRouterProfile } : {}) } }
 	return {
 		repoRoot: root,
 		model: payload.model,
