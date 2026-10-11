@@ -43,6 +43,33 @@ interface MessageGroup {
 	toolCallGroup: boolean
 }
 
+function clippedExcerpt(points: string[], keep: number): string {
+	const headCount = Math.ceil(keep / 2)
+	const tailCount = keep - headCount
+	return `${points.slice(0, headCount).join("")}${TOOL_RESULT_BUDGET_NOTICE}${tailCount > 0 ? points.slice(-tailCount).join("") : ""}`
+}
+
+function maxRetainedCodePoints(points: string[], original: string): number | undefined {
+	// A notice must never make a small tool result larger. Bound each result
+	// independently by its original JSON-escaped byte cost so every candidate
+	// in the global search is no larger than the corresponding original.
+	const originalBytes = Buffer.byteLength(JSON.stringify(original), "utf8")
+	let low = 0
+	let high = points.length - 1
+	let best = -1
+	while (low <= high) {
+		const middle = Math.floor((low + high) / 2)
+		const excerptBytes = Buffer.byteLength(JSON.stringify(clippedExcerpt(points, middle)), "utf8")
+		if (excerptBytes <= originalBytes) {
+			best = middle
+			low = middle + 1
+		} else {
+			high = middle - 1
+		}
+	}
+	return best < 0 ? undefined : best
+}
+
 function messageGroups(messages: ChatMessage[], start: number): MessageGroup[] {
 	const groups: MessageGroup[] = []
 	let index = start
@@ -144,18 +171,14 @@ export function packRequestBody(body: Record<string, unknown>, maxBytes: number)
 
 	const originals = toolIndexes.map((index) => keptMessages[index]!.content ?? "")
 	const codePoints = originals.map((text) => Array.from(text))
+	const retainedCaps = codePoints.map((points, index) => maxRetainedCodePoints(points, originals[index]!))
 	const candidateAt = (fraction: number) => {
 		const packed = keptMessages.map((message) => ({ ...message }))
 		for (let i = 0; i < toolIndexes.length; i++) {
 			const index = toolIndexes[i]!
-			const originalText = originals[i]!
 			const points = codePoints[i]!
-			const keep = Math.floor(points.length * fraction)
-			if (keep < points.length) {
-				const headCount = Math.ceil(keep / 2)
-				const tailCount = keep - headCount
-				packed[index]!.content = `${points.slice(0, headCount).join("")}${TOOL_RESULT_BUDGET_NOTICE}${tailCount > 0 ? points.slice(-tailCount).join("") : ""}`
-			}
+			const cap = retainedCaps[i]
+			if (cap !== undefined) packed[index]!.content = clippedExcerpt(points, Math.floor(cap * fraction))
 		}
 		return serializedCandidate(body, [...prefix, ...packed.slice(prefix.length)])
 	}

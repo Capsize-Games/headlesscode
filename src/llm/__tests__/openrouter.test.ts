@@ -11,7 +11,7 @@ import * as path from "node:path"
 import { estimateCost } from "../../budget/cost.js"
 
 import { buildRequestBody, isRetryableOpenRouterError, OpenRouterClient, OpenRouterError, parseReasoningEffort } from "../openrouter.js"
-import { PromptByteBudgetError } from "../request-budget.js"
+import { PromptByteBudgetError, TOOL_RESULT_BUDGET_NOTICE } from "../request-budget.js"
 import type { LlmRequest } from "../../engine/types.js"
 
 const baseRequest: LlmRequest = {
@@ -164,6 +164,37 @@ async function testOversizedLatestToolGroupIsClippedWithoutMutatingEvidence(): P
 	assert.ok(packedResults.every((message: { content: string }) => message.content.includes("\\\"\n")), "dense escaped quotes, backslashes, and newlines survive in the excerpts")
 	assert.equal(result.body.prompt_cache_key, cacheRoutingKey, "cache routing key remains stable")
 	assert.deepEqual(result.body.tools, tools, "tool schemas remain verbatim")
+}
+
+async function testClippingKeepsTinyToolResultsWhenPackingMixedSizes(): Promise<void> {
+	const calls = [
+		{ id: "large-result", type: "function" as const, function: { name: "read_file", arguments: JSON.stringify({ path: "large.log" }) } },
+		{ id: "tiny-result", type: "function" as const, function: { name: "read_file", arguments: JSON.stringify({ path: "status.txt" }) } },
+	]
+	const largeContent = `${["é", "🙂", "\\", "\"", "\n"].join("").repeat(3_000)}\nFINAL-STATUS: all checks passed\n`
+	const tinyContent = "ok"
+	const messages: LlmRequest["messages"] = [
+		{ role: "system", content: "system" },
+		{ role: "user", content: "task" },
+		{ role: "assistant", content: null, tool_calls: calls },
+		{ role: "tool", tool_call_id: calls[0]!.id, name: "read_file", content: largeContent },
+		{ role: "tool", tool_call_id: calls[1]!.id, name: "read_file", content: tinyContent },
+	]
+	const request: LlmRequest = { model: "meta/muse-spark-1.3-contributor", messages }
+	const original = JSON.stringify(messages)
+	const baseBody = buildRequestBody(request, request.model)
+	const floorMessages = messages.map((message) => message.role === "tool" && message.tool_call_id === calls[0]!.id
+		? { ...message, content: TOOL_RESULT_BUDGET_NOTICE }
+		: message)
+	const floorJson = JSON.stringify({ ...baseBody, messages: floorMessages })
+	const maxPromptBytes = Buffer.byteLength(floorJson, "utf8") + 1_600
+	const result = await captureChatRequest(new OpenRouterClient({ apiKey: "synthetic", baseUrl: "http://mock", maxPromptBytes }), request)
+	assert.ok(Buffer.byteLength(result.json, "utf8") <= maxPromptBytes, "the mixed-size group fits under its exact serialized byte cap")
+	assert.equal(JSON.stringify(messages), original, "clipping never alters original tool evidence")
+	assert.deepEqual(result.body.messages[2].tool_calls, calls, "tool IDs and arguments remain unchanged")
+	assert.equal(result.body.messages[3].content.includes("middle omitted"), true, "the oversized result is clipped with a visible omission notice")
+	assert.equal(result.body.messages[3].content.endsWith("\nFINAL-STATUS: all checks passed\n"), true, "the oversized result retains its diagnostic tail")
+	assert.equal(result.body.messages[4].content, tinyContent, "a tiny tool result stays intact instead of growing to the notice")
 }
 
 function isWellFormedUnicode(value: string): boolean {
@@ -1017,6 +1048,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["Muse qualification pins to Meta with fallbacks disabled", testMuseQualificationPinsOnlyMetaWithoutFallback],
 	["exact UTF-8 request boundary is enforced for streaming and non-streaming JSON", testExactUtf8WireBoundaryForStreamAndNonStream],
 	["oversized latest tool-call group is clipped without mutating original evidence", testOversizedLatestToolGroupIsClippedWithoutMutatingEvidence],
+	["mixed-size tool results preserve tiny results while clipping oversized results", testClippingKeepsTinyToolResultsWhenPackingMixedSizes],
 	["role-aware prefixes preserve user-only and multiple-system histories", testRoleAwarePrefixKeepsUserOnlyAndMultipleSystemHistories],
 	["impossible prefixes and invalid byte budgets fail locally", testImpossiblePrefixAndInvalidBudgetsFailBeforeNetwork],
 	["transcripts preserve packed wire messages and original local history separately", testTranscriptSeparatesPackedWireMessagesFromOriginalHistory],
