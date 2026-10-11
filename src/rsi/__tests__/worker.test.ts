@@ -130,7 +130,7 @@ test("fleet Muse mutation forwards its profile into the real guest environment g
 				capturedEnvironment = rsiMutationGuestEnvironment(config, candidate, broker)
 				fs.writeFileSync(path.join(candidate.worktree, "app.ts"), "export const value = 2\n")
 				execFileSync("git", ["add", "app.ts"], { cwd: candidate.worktree })
-				execFileSync("git", ["commit", "--quiet", "-m", "synthetic mutation"], { cwd: candidate.worktree })
+				execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--quiet", "-m", "synthetic mutation"], { cwd: candidate.worktree })
 				return { ok: true }
 			},
 		})
