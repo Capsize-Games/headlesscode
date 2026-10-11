@@ -13,6 +13,7 @@ const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "rsi-openshell-integrat
 const originalPath = process.env.PATH
 const originalHome = process.env.HOME
 const originalHarnessCommit = process.env.HEADLESSCODE_RSI_BENCHMARK_HARNESS_COMMIT
+const originalPolicyPath = process.env.HEADLESSCODE_OPENSHELL_POLICY
 const brokerEnvNames = [
 	"HEADLESSCODE_OPENROUTER_API_KEY", "HEADLESSCODE_RSI_BROKER_BIND_HOST",
 	"HEADLESSCODE_RSI_OPENROUTER_MAX_INPUT_TOKENS_PER_CALL",
@@ -71,6 +72,10 @@ try {
 
 	const fixtureRoot = path.join(tempRoot, "supervisor-fixtures")
 	await fs.mkdir(path.join(fixtureRoot, "verifiers"), { recursive: true })
+	const policyPath = path.join(tempRoot, "operator-policy.yaml")
+	const policyBytes = Buffer.from("sandbox:\n  network: disabled\n")
+	await fs.writeFile(policyPath, policyBytes, { mode: 0o600 })
+	process.env.HEADLESSCODE_OPENSHELL_POLICY = policyPath
 	const verifierBytes = Buffer.from("independent verifier bytes\n")
 	await fs.writeFile(path.join(fixtureRoot, "verifiers", "task.mjs"), verifierBytes)
 	const task: BenchmarkTask = {
@@ -186,7 +191,7 @@ try {
 	git(taskWorkspace, ["add", "--all"])
 	git(taskWorkspace, ["commit", "--quiet", "-m", "import candidate result"])
 	phase = "verifier"
-	const verifier = new OpenShellBenchmarkVerifier(harnessRoot, providerFactory)
+	const verifier = new OpenShellBenchmarkVerifier(harnessRoot, providerFactory, "headlesscode-openshell-rsi:local", createHash("sha256").update(policyBytes).digest("hex"))
 	const verdict = await verifier.run(task, fixtureRoot, taskWorkspace)
 	assert.equal(verdict.success, true)
 	assert.deepEqual(events.filter((event) => event.endsWith("spawn") || event.endsWith("teardown")), ["agent-spawn", "agent-teardown", "verifier-spawn", "verifier-teardown"])
@@ -199,6 +204,8 @@ try {
 	else process.env.HOME = originalHome
 	if (originalHarnessCommit === undefined) delete process.env.HEADLESSCODE_RSI_BENCHMARK_HARNESS_COMMIT
 	else process.env.HEADLESSCODE_RSI_BENCHMARK_HARNESS_COMMIT = originalHarnessCommit
+	if (originalPolicyPath === undefined) delete process.env.HEADLESSCODE_OPENSHELL_POLICY
+	else process.env.HEADLESSCODE_OPENSHELL_POLICY = originalPolicyPath
 	delete process.env.RSI_TEST_IMAGE_DIGEST
 	delete process.env.RSI_TEST_HARNESS_COMMIT
 	for (const name of brokerEnvNames) {
