@@ -55,6 +55,12 @@ interface EngineeringEvidenceRecord {
 	digestSha256: string
 }
 
+export const PROOF_VISIBLE_EVAL_COMMANDS = Object.freeze(["npm test -- --filter engine"])
+
+export function configureProofVisibleEvaluations(config: RsiConfig): RsiConfig {
+	return { ...config, evalCommands: [...PROOF_VISIBLE_EVAL_COMMANDS] }
+}
+
 function usage(): string {
 	return `Usage:
   npx tsx scripts/rsi-proof-demonstration.ts estimate --seed <engineering> --campaign-seed <seed> --campaign-seed <seed> --campaign-seed <seed> [--openrouter-profile <admitted-id>] [--repo <path>]
@@ -404,10 +410,11 @@ export async function buildProofPlanPreview(options: Options, env: NodeJS.Proces
 	catch { throw new Error("fixed-control runtime harness commit must be present in the root repository") }
 	const parsed = parseRsiArgs(["--repo", repo, "--population", "2", "--generations", "3", "--seed", seeds[0]!, "--base-ref", rootCommit, "--max-runtime-ms", String(72 * 60 * 60_000), "--mutation-task", options.mutationTask])
 	if (!parsed.config) throw new Error(parsed.error ?? "could not construct proof configuration")
+	const proofConfig = configureProofVisibleEvaluations(parsed.config)
 	const profile = openRouterProfileById(options.openRouterProfile ?? RSI_DEFAULT_OPENROUTER_PROFILE_ID)
 	const baseConfig = withEvaluatorIntegrityPin({
-		...parsed.config,
-		archiveDir: options.archiveDir ?? parsed.config.archiveDir,
+		...proofConfig,
+		archiveDir: options.archiveDir ?? proofConfig.archiveDir,
 		model: profile.model,
 		roles: { worker: { provider: "openrouter" as const, model: profile.model, ...(profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { openRouterProfile: profile.id } : {}) } },
 		mutationTask: options.mutationTask,

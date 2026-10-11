@@ -6,7 +6,7 @@ import test from "node:test"
 import { createHash, generateKeyPairSync } from "node:crypto"
 import { appendRun } from "../archive.js"
 import type { RsiConfig, RsiRunRecord, WorkerHarnessRuntimeIdentity } from "../types.js"
-import { assertEngineeringTransition, assertProofWorkerProfile, isFullyConfirmedRun, parseProofDemonstrationArgs, runEngineeringArm, runFrozenCampaignArm, validateRuntimeEvaluatorIntegrity } from "../../../scripts/rsi-proof-demonstration.js"
+import { assertEngineeringTransition, assertProofWorkerProfile, configureProofVisibleEvaluations, isFullyConfirmedRun, parseProofDemonstrationArgs, PROOF_VISIBLE_EVAL_COMMANDS, runEngineeringArm, runFrozenCampaignArm, validateRuntimeEvaluatorIntegrity } from "../../../scripts/rsi-proof-demonstration.js"
 import type { FrozenProofDemonstrationManifest } from "../proof-demonstration-manifest.js"
 import { proofCampaignManifestDigest, type ProofCampaignManifest } from "../proof-campaign.js"
 import { RSI_MUSE_OPENROUTER_MODEL, RSI_OPENROUTER_MODEL } from "../inference-broker.js"
@@ -81,6 +81,30 @@ test("proof CLI admits explicit Muse selection while keeping legacy DeepSeek as 
 	assert.equal(parseProofDemonstrationArgs(["engineering", "--openrouter-profile", "muse-spark-contributor"]).openRouterProfile, "muse-spark-contributor")
 	assert.throws(() => parseProofDemonstrationArgs(["plan", "--openrouter-profile", "unlisted-model"]), /profile is not admitted/)
 	assert.throws(() => parseProofDemonstrationArgs(["execute", "--openrouter-profile", "muse-spark-contributor"]), /only valid for estimate, engineering, or plan/)
+})
+
+test("proof preview selects a nonempty visible test set outside withheld RSI sources", async () => {
+	const parsed = parseProofDemonstrationArgs(["engineering", "--seed", "preview-seed"])
+	const defaultConfig = (await import("../config.js")).parseRsiArgs(["--repo", process.cwd()]).config!
+	assert.deepEqual(defaultConfig.evalCommands, ["npm test -- --filter rsi"])
+	const previewConfig = configureProofVisibleEvaluations(defaultConfig)
+	assert.equal(previewConfig.regressionCommand, "npm test", "retain the full regression command")
+	assert.deepEqual(previewConfig.evalCommands, [...PROOF_VISIBLE_EVAL_COMMANDS])
+	const visibleCommand = previewConfig.evalCommands[0]!
+	assert.match(visibleCommand, /--filter engine/)
+	const selected: string[] = []
+	const visit = async (directory: string): Promise<void> => {
+		for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+			const target = path.join(directory, entry.name)
+			if (entry.isDirectory()) await visit(target)
+			else if (entry.isFile() && entry.name.endsWith(".test.ts") && path.relative(process.cwd(), target).includes("engine")) selected.push(path.relative(process.cwd(), target))
+		}
+	}
+	await visit(path.join(process.cwd(), "src"))
+	assert.ok(selected.length > 0, "the npm test runner's path filter finds visible test files")
+	assert.ok(selected.includes("src/engine/__tests__/iteration-boundary.test.ts"), "the engine regression test is available to the evaluator snapshot")
+	assert.ok(selected.every((file) => !file.startsWith("src/rsi/")), "selected tests do not require omitted protected RSI files")
+	assert.equal(parsed.command, "engineering")
 })
 
 test("proof worker profile validation rejects environment role overrides before dispatch", () => {
