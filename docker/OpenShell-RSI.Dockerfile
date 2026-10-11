@@ -6,7 +6,7 @@ FROM ${HEADLESSCODE_BASE_IMAGE}
 
 USER root
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 \
+    && apt-get install -y --no-install-recommends make python3 \
     && rm -rf /var/lib/apt/lists/* \
     && rm -rf /opt/headlesscode/src/rsi \
     && find /opt/headlesscode/src -type d -name __tests__ -prune -exec rm -rf {} + \
@@ -16,7 +16,9 @@ RUN apt-get update \
     && rm -rf /opt/headlesscode/fixtures/rsi-benchmark \
     && test ! -e /opt/headlesscode/src/rsi
 
-RUN test ! -e /opt/headlesscode/scripts/rsi-benchmark/task-spec.mjs \
+RUN command -v make >/dev/null \
+    && make --version \
+    && test ! -e /opt/headlesscode/scripts/rsi-benchmark/task-spec.mjs \
     && test ! -e /opt/headlesscode/fixtures/rsi-benchmark \
     && test ! -e /opt/headlesscode/.git
 
