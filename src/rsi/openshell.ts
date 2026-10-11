@@ -31,6 +31,17 @@ function mutationFailureDiagnostic(detail: string): string {
 	return `[earlier output omitted; showing final ${MUTATION_FAILURE_DIAGNOSTIC_CHARS} characters]\n${detail.slice(-MUTATION_FAILURE_DIAGNOSTIC_CHARS)}`
 }
 
+/** A failed benchmark preflight must abort ordinary callers but retain its guest output for fleet failure evidence. */
+export class OpenShellMutationPreflightError extends Error {
+	readonly result: TrialResult
+
+	constructor(result: TrialResult, detail: string) {
+		super(`OpenShell benchmark preflight failed: ${mutationFailureDiagnostic(detail)}`)
+		this.name = "OpenShellMutationPreflightError"
+		this.result = result
+	}
+}
+
 export interface RsiOpenShellProvider {
 	spawnExistingWorktreeSession(request: CloudSessionRequest, worktreePath: string): Promise<SessionHandle>
 	waitReady(handle: SessionHandle): Promise<void>
@@ -739,7 +750,9 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 		}
 		if (!isolation.result.ok) {
 			const detail = [isolation.result.stderr, isolation.result.stdout].filter(Boolean).join("\n")
-			if (isolation.result.exitCode === 79 && detail.includes("RSI_BENCHMARK_PREFLIGHT_FAILURE")) throw new Error(`OpenShell benchmark preflight failed: ${detail.slice(0, 3000)}`)
+			if (isolation.result.exitCode === 79 && detail.includes("RSI_BENCHMARK_PREFLIGHT_FAILURE")) {
+				throw new OpenShellMutationPreflightError(isolation.result, detail)
+			}
 			return { ok: false, result: isolation.result, error: `OpenShell mutation worker failed (exit ${isolation.result.exitCode ?? "unknown"})${detail ? `: ${mutationFailureDiagnostic(detail)}` : ""}`, ...(workerHarnessExecution ? { workerHarnessExecution } : {}) }
 		}
 		const usage = readMutationTranscriptUsage(isolation.snapshot)
