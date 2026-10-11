@@ -4,7 +4,7 @@ import * as path from "node:path"
 import type { BenchmarkAttempt } from "./benchmark/types.js"
 import type { RsiRunRecord } from "./types.js"
 import { proofCampaignManifestDigest } from "./proof-campaign.js"
-import { RSI_OPENROUTER_MODEL } from "./inference-broker.js"
+import { openRouterProfileForModel } from "./inference-broker.js"
 import { frozenProofConfigDigest, verifyFrozenProofDemonstrationManifest, type FrozenProofDemonstrationManifest } from "./proof-demonstration-manifest.js"
 
 export type ProofDemonstrationVerdict = "demonstrated" | "inconclusive" | "not-demonstrated"
@@ -187,7 +187,9 @@ function validateAttempt(run: RsiRunRecord, attempt: BenchmarkAttempt, expectedC
 	const label = run.runId + "/" + expectedTaskId
 	if (!expectedTask || attempt.taskId !== expectedTaskId || attempt.harnessCommit !== expectedCommit || attempt.split !== "confirmation" || attempt.seed !== expectedTask.seed || attempt.startDigest !== expectedTask.startDigest || attempt.evaluatorDigest !== expectedTask.verifierDigest || JSON.stringify(attempt.ceilings) !== JSON.stringify(expectedTask.ceilings)) { missing.push(label + ":identity"); return false }
 	const expectedModel = run.proofCampaign?.manifest.model
-	if (!expectedModel || attempt.model.provider !== expectedModel.provider || attempt.model.id !== expectedModel.id || JSON.stringify(attempt.model.sampling) !== JSON.stringify(expectedModel.settings.sampling) || attempt.inferenceReceipt?.model !== expectedModel.id || attempt.inferenceReceipt.returnedModels.length !== 1 || attempt.inferenceReceipt.returnedModels[0] !== expectedModel.id || attempt.inferenceReceipt.endpointProvider !== "deepinfra" || attempt.inferenceReceipt.returnedProviders.length !== 1 || attempt.inferenceReceipt.returnedProviders[0] !== "deepinfra") { missing.push(label + ":model-or-provider-identity"); return false }
+	let expectedProfile
+	try { expectedProfile = expectedModel ? openRouterProfileForModel(expectedModel.id, expectedModel.profileId) : undefined } catch { expectedProfile = undefined }
+	if (!expectedModel || !expectedProfile || attempt.model.provider !== expectedModel.provider || attempt.model.id !== expectedModel.id || attempt.model.profileId !== expectedModel.profileId || JSON.stringify(attempt.model.sampling) !== JSON.stringify(expectedModel.settings.sampling) || attempt.inferenceReceipt?.model !== expectedModel.id || attempt.inferenceReceipt.returnedModels.length !== 1 || !expectedProfile.returnedModels.includes(attempt.inferenceReceipt.returnedModels[0]!) || attempt.inferenceReceipt.endpointProvider !== expectedProfile.endpointProvider || attempt.inferenceReceipt.returnedProviders.length !== 1 || attempt.inferenceReceipt.returnedProviders[0] !== expectedProfile.endpointProvider) { missing.push(label + ":model-or-provider-identity"); return false }
 	const limits = run.proofCampaign?.manifest.settings.inferenceCeilings as { maxInputTokensPerCall?: unknown; maxTotalTokens?: unknown; maxJobSpendUsd?: unknown } | undefined
 	const maxTokens = Math.min(Number(limits?.maxTotalTokens), expectedTask.ceilings.maxCalls * (Number(limits?.maxInputTokensPerCall) + expectedTask.ceilings.maxOutputTokensPerCall))
 	if (!Number.isSafeInteger(maxTokens) || attempt.wallTimeMs > expectedTask.ceilings.timeoutMs || attempt.calls === null || attempt.calls > expectedTask.ceilings.maxCalls || attempt.tokens === null || attempt.tokens > maxTokens || attempt.inferenceReceipt?.costUsd === null || attempt.inferenceReceipt?.costUsd === undefined || attempt.inferenceReceipt.costUsd > Number(limits?.maxJobSpendUsd) || attempt.inferenceReceipt.calls !== attempt.calls || attempt.inferenceReceipt.totalTokens !== attempt.tokens) { missing.push(label + ":resource-ceiling"); return false }
@@ -349,7 +351,7 @@ export function analyzeProofDemonstration(runs: RsiRunRecord[], options: { froze
   }
   if (benchmarkManifestDigests.size !== 1) missing.push("paired:benchmark-manifest-digest-mismatch")
   if (providerModels.size !== 1) missing.push("paired:provider-model-mismatch")
-  if (providerModels.size === 1 && !providerModels.has("openshell-openrouter/" + RSI_OPENROUTER_MODEL)) missing.push("paired:model-is-not-the-pinned-OpenRouter-endpoint")
+	if (providerModels.size === 1 && !providerModels.has(frozenPlan.model.provider + "/" + frozenPlan.model.requestedId)) missing.push("paired:model-is-not-the-pinned-OpenRouter-endpoint")
   if (protocolIdentities.size !== 1) missing.push("paired:frozen-protocol-runtime-budget-or-selection-mismatch")
   if (campaignSeeds.size !== 3) missing.push("paired:campaign-seeds-are-not-three-independent-values")
   const taskIds = sorted([...new Set(paired.map((entry) => entry.taskId))])
