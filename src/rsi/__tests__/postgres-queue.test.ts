@@ -167,12 +167,20 @@ test("PostgreSQL OpenRouter admission persists reservations, blocks overspend, a
 		const expiredReceipt = await queue.receipt(expiredGrant)
 		assert.deepEqual(expiredReceipt.denials, [{ statusCode: 429, reason: "job-deadline", count: 1 }])
 		await queue.pool.query("UPDATE headlesscode_rsi_jobs SET attempts=max_attempts WHERE job_id=$1", [expiredJob.jobId])
-		assert.equal(await queue.fail(expiredLease, "OpenRouter job duration limit exhausted", {
+		const failedOutput = Buffer.from(JSON.stringify({ schemaVersion: 1, result: { ok: false, command: "synthetic worker", exitCode: 1, durationMs: 12, stdout: "progress\\nFINAL_FAILURE_REASON", stderr: "" } }))
+		const failedOutputArtifact = await queue.putArtifact(failedOutput)
+		const failureResult = {
 			ok: false, provider: "openrouter", model: expiredGrant.model,
 			inferenceAudit: { accounting: "incomplete", jobId: expiredJob.jobId, denials: expiredReceipt.denials },
-		}), true)
+			failureOutputArtifact: { sha256: failedOutputArtifact.sha256, bytes: failedOutputArtifact.byteLength },
+		}
+		assert.equal(await queue.fail(expiredLease, "OpenRouter job duration limit exhausted", failureResult), true)
 		const failedMutation = await queue.getJob(expiredJob.jobId)
-		assert.deepEqual((failedMutation?.result as { inferenceAudit?: unknown } | undefined)?.inferenceAudit, { accounting: "incomplete", jobId: expiredJob.jobId, denials: [{ statusCode: 429, reason: "job-deadline", count: 1 }] }, "retry/failure record retains only the bounded denial summary")
+		assert.deepEqual((failedMutation?.result as { inferenceAudit?: unknown } | undefined)?.inferenceAudit, { accounting: "incomplete", jobId: expiredJob.jobId, denials: [{ statusCode: 429, reason: "job-deadline", count: 1 }] }, "failure record retains its inference audit")
+		assert.deepEqual((failedMutation?.result as { failureOutputArtifact?: unknown } | undefined)?.failureOutputArtifact, { sha256: failedOutputArtifact.sha256, bytes: failedOutput.byteLength }, "failed mutation result binds the diagnostic artifact digest and byte length")
+		assert.deepEqual(await queue.getArtifact(failedOutputArtifact.sha256), failedOutput, "failed mutation output remains retrievable by content digest")
+		assert.equal(await queue.fail(expiredLease, "late stale retry", failureResult), false, "stale lease cannot overwrite the persisted failure result")
+		await assert.rejects(queue.fail(expiredLease, "bad failure artifact", { failureOutputArtifact: { sha256: failedOutputArtifact.sha256, bytes: failedOutput.byteLength + 1 } }), /artifact bytes do not match/)
 
 		const lateJob = await addJob(queue, "broker-late-settlement", "LOCAL_GPU", "openrouter:late")
 		const lateLease = await queue.claim("broker-worker")

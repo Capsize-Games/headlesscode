@@ -24,6 +24,12 @@ const RSI_OPENSHELL_IMAGE = "headlesscode-openshell-rsi:local"
 const RSI_TRAINING_OPENSHELL_IMAGE = "headlesscode-openshell-rsi-training:local"
 export const RSI_CPU_MODEL_EVALUATION_MAX_CHECKPOINT_BYTES = 2 * 1024 * 1024 * 1024
 const OPENSHELL_INITIAL_CONFIG_SETTLE_MS = 15_000
+const MUTATION_FAILURE_DIAGNOSTIC_CHARS = 3000
+
+function mutationFailureDiagnostic(detail: string): string {
+	if (detail.length <= MUTATION_FAILURE_DIAGNOSTIC_CHARS) return detail
+	return `[earlier output omitted; showing final ${MUTATION_FAILURE_DIAGNOSTIC_CHARS} characters]\n${detail.slice(-MUTATION_FAILURE_DIAGNOSTIC_CHARS)}`
+}
 
 export interface RsiOpenShellProvider {
 	spawnExistingWorktreeSession(request: CloudSessionRequest, worktreePath: string): Promise<SessionHandle>
@@ -732,9 +738,9 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 			throw new Error("worker sanitized snapshot tree digest differs from the frozen fleet job identity")
 		}
 		if (!isolation.result.ok) {
-			const detail = isolation.result.stderr || isolation.result.stdout
+			const detail = [isolation.result.stderr, isolation.result.stdout].filter(Boolean).join("\n")
 			if (isolation.result.exitCode === 79 && detail.includes("RSI_BENCHMARK_PREFLIGHT_FAILURE")) throw new Error(`OpenShell benchmark preflight failed: ${detail.slice(0, 3000)}`)
-			return { ok: false, result: isolation.result, error: `OpenShell mutation worker failed (exit ${isolation.result.exitCode ?? "unknown"})${detail ? `: ${detail.slice(0, 3000)}` : ""}`, ...(workerHarnessExecution ? { workerHarnessExecution } : {}) }
+			return { ok: false, result: isolation.result, error: `OpenShell mutation worker failed (exit ${isolation.result.exitCode ?? "unknown"})${detail ? `: ${mutationFailureDiagnostic(detail)}` : ""}`, ...(workerHarnessExecution ? { workerHarnessExecution } : {}) }
 		}
 		const usage = readMutationTranscriptUsage(isolation.snapshot)
 		let changedFiles: string[]
