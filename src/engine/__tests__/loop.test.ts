@@ -3737,12 +3737,18 @@ async function testVerifyBeforeCompletionRefusesUnsupportedMeasurementClaim(): P
 }
 
 async function testVerifyBeforeCompletionMatchesTerminalDecimalExactly(): Promise<void> {
-	for (const unrelatedOutput of ["echo 42", "echo 205", "echo 205.90"]) {
+	for (const [unrelatedOutput, unsupportedClaim] of [
+		["echo 42", "Measured 205.9."],
+		["echo 205", "Measured 205.9."],
+		["echo 205.90", "Measured 205.9."],
+		["echo 2", "Benchmark 2 measured 1e3."],
+		["echo 2", "Benchmark 2 measured -205.9."],
+	]) {
 		const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc-terminal-decimal-"))
 		try {
 			const client = new FakeLlmClient([
 				() => toolCall("execute_command", { command: unrelatedOutput }),
-				() => toolCall("attempt_completion", { result: "Measured 205.9." }),
+				() => toolCall("attempt_completion", { result: unsupportedClaim }),
 				() => toolCall("execute_command", { command: "echo 205.9" }),
 				() => toolCall("attempt_completion", { result: "Measured 205.9." }),
 			])
@@ -3760,6 +3766,25 @@ async function testVerifyBeforeCompletionMatchesTerminalDecimalExactly(): Promis
 		} finally {
 			await fs.rm(ws, { recursive: true, force: true })
 		}
+	}
+}
+
+
+async function testVerifyBeforeCompletionIgnoresIdentifierDigits(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc-identifier-"))
+	try {
+		const claim = "Benchmark uses UTF-8; measured 205.9 tokens/sec."
+		const client = new FakeLlmClient([
+			() => toolCall("execute_command", { command: "echo 205.9" }),
+			() => toolCall("attempt_completion", { result: claim }),
+		])
+		const session = await makeSession({ task: "measure", client, workspaceRoot: ws, verifyBeforeCompletion: true })
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected verified measurement, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, claim)
+		assert.equal(client.requests.length, 2, "identifier digits must not become extra measurement claims")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
 	}
 }
 
@@ -4135,6 +4160,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 		"verifyBeforeCompletion: matches terminal decimal measurement values exactly",
 		testVerifyBeforeCompletionMatchesTerminalDecimalExactly,
 	],
+	["verifyBeforeCompletion: ignores identifier digits in an evidenced measurement", testVerifyBeforeCompletionIgnoresIdentifierDigits],
 	[
 		"evidence-gated completion: refuses a fabricated gate claim when the claimed target doesn't exist",
 		testEvidenceRequiredRefusesNonexistentGateTarget,

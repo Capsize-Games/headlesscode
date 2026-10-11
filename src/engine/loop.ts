@@ -4136,12 +4136,13 @@ export class HeadlessSession {
 								(match) => match[0],
 							)
 						const claimedValues = numericTokens(result)
+						const allClaimNumbersParsed = claimedValues.length === (result.match(/(?<![\w.-])[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?/g)?.length ?? 0)
 						const commandOutputs = messages
 							.filter((m) => m.role === "tool" && m.name === "execute_command")
 							.map((m) => String(m.content ?? ""))
 						const outputValues = commandOutputs.flatMap(numericTokens)
 						if (/\d/.test(result)) {
-							return claimedValues.length > 0 && claimedValues.every((value) => outputValues.includes(value))
+							return claimedValues.length > 0 && allClaimNumbersParsed && claimedValues.every((value) => outputValues.includes(value))
 						}
 						return outputValues.length > 0
 					})()
@@ -4223,7 +4224,7 @@ export class HeadlessSession {
 							content: staleReReadEditClaim
 								? "[System: not executed — attempt_completion was deferred because your result claims an edit was made, but the edit_file/write_to_file call for it failed and you have only re-read the file since (never landed a successful write); re-issue this call if still needed.]"
 								: unsupportedMeasurementClaim
-								? "[System: not executed — attempt_completion was deferred because it makes a specific measurement/benchmark claim with no execute_command output in this session's history containing any supporting number; re-issue this call if still needed.]"
+								? "[System: not executed — attempt_completion was deferred because it makes a specific measurement/benchmark claim with no execute_command output in this session's history containing every claimed numeric value; re-issue this call if still needed.]"
 								: lastExecuteCommandFailed
 									? "[System: not executed — attempt_completion was deferred because the last command you ran ended in an error; re-issue this call if still needed.]"
 									: "[System: not executed — attempt_completion was deferred because your last edit_file/write_to_file call failed; re-issue this call if still needed.]",
@@ -4238,7 +4239,7 @@ export class HeadlessSession {
 								`${reReadClearedWriteSummary ?? "(edit output no longer available)"}\n` +
 								"Either actually make the edit succeed and re-issue attempt_completion, or, if no edit was truly needed, restate the result to say so plainly (e.g. \"no change was required\") without claiming an edit you did not land.]"
 							: unsupportedMeasurementClaim
-							? "[System: attempt_completion was NOT accepted. Your result claims a specific measurement/benchmark, but no execute_command output anywhere in this session contains a supporting number. Either run the real command that produces this evidence and re-issue attempt_completion, or restate the result without the unsupported claim.]"
+							? "[System: attempt_completion was NOT accepted. Your result claims a specific measurement/benchmark, but no execute_command output anywhere in this session contains every claimed numeric value. Either run the real command that produces this evidence and re-issue attempt_completion, or restate the result without the unsupported claim.]"
 							: lastExecuteCommandFailed
 								? "[System: attempt_completion was NOT accepted. The most recent command you ran ended in an error, and you have not run a command since that succeeded:\n" +
 									`${lastExecuteCommandSummary ?? "(command output no longer available)"}\n` +
