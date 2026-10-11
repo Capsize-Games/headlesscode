@@ -249,14 +249,18 @@ the next acquisition increments the epoch and cannot reuse an old claim.
 
 Runner-pool mode requires continuous operation; `--run-once` is rejected
 because it cannot renew leases. The default lease is 120 seconds and the
-default poll interval is 60 seconds. When GitHub cannot confirm a renewal, the
-watcher stops local worker process groups and keeps the claim active unless it
-can verify that teardown completed. A crashed or unreachable machine may leave
-an active claim past its expiry. Expiry does not stop a detached process and
-does not permit automatic takeover: the claim remains quarantined until the
-original worker is confirmed stopped. This favors avoiding duplicate jobs
-over automatic recovery. Do not clear an expired claim or remove its ref while
-the old worker may still run.
+default poll interval is 60 seconds. The watcher rejects a poll interval above
+half the configured lease so a renewal is scheduled with time remaining.
+When GitHub cannot confirm a renewal, the watcher stops local worker process
+groups where possible and keeps the claim active. Claims for dispatched
+workers are never released from PID, PGID, completion, or sandbox markers:
+those markers live in worker-writable worktrees and cannot prove that a
+detached process or guest is absent. Completed or failed dispatched claims
+remain quarantined and count against capacity until the lease expires and an
+operator independently confirms teardown through `recoverExpired()`.
+Expiration does not stop a detached process or permit automatic takeover. Do
+not recover an expired claim or remove its ref while the old worker or guest
+may still run.
 
 Each machine needs its own continuously running watcher, a local clone of the
 same repository, Node.js 22.19 or newer, Git, and the repository dependencies

@@ -8,11 +8,12 @@
  * deleted: deleting and recreating one would create an ABA window.
  *
  * Expired active claims are quarantined, not automatically reassigned. A
- * GitHub lease cannot prove that an unreachable host stopped its worker. A
- * runner may publish `released` only after it has confirmed local teardown;
- * an operator may release a quarantined claim only after independently
- * confirming that its old worker is stopped. This trades availability for
- * preventing duplicate work when a runner is partitioned.
+ * GitHub lease cannot prove that an unreachable host stopped its worker, and
+ * markers in a worker-writable worktree cannot prove local teardown either.
+ * A runner may release only a reservation that never dispatched. Dispatched
+ * claims require an operator to independently confirm that the old worker and
+ * guest are stopped before recovery. This trades availability for preventing
+ * duplicate work when a runner is partitioned.
  */
 
 import { randomUUID } from "node:crypto"
@@ -56,7 +57,7 @@ export type ClaimAcquireResult =
 	| { acquired: false; reason: "held" | "expired-quarantined"; claim: RunnerClaim }
 
 export interface ClaimTeardownProof {
-	kind: "never-spawned" | "process-groups-absent"
+	kind: "never-spawned"
 	observedAt: string
 }
 
@@ -105,6 +106,11 @@ export class GitHubIssueClaimStore {
 	private readonly leaseMs: number
 	private readonly now: () => Date
 	private readonly newNonce: () => string
+
+	/** Configured lease duration, used by the watcher to bound its renewal interval. */
+	get leaseDurationMs(): number {
+		return this.leaseMs
+	}
 
 	constructor(options: ClaimStoreOptions) {
 		if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(options.owner)) throw new Error("claim store: invalid GitHub owner")
@@ -265,18 +271,19 @@ export class GitHubIssueClaimStore {
 	}
 
 	/**
-	 * Release only after the caller proves there is no worker process left.
-	 * Network/API failure leaves the claim active and therefore quarantined.
+	 * Release only a reservation that never dispatched a worker. Once a worker
+	 * could have started, worktree markers are not trustworthy teardown proof;
+	 * the claim must expire and use recoverExpired() with operator evidence.
 	 */
 	async release(
 		issue: number,
 		expected: Pick<RunnerClaim, "runnerId" | "leaseNonce" | "epoch">,
 		proof: ClaimTeardownProof,
-		reason: RunnerClaim["releaseReason"] = "completed",
+		reason: "spawn-failed" = "spawn-failed",
 	): Promise<RunnerClaim> {
 		const current = await this.requireOwnedActive(issue, expected)
-		if (!isTeardownProof(proof) || (proof.kind === "never-spawned" && current.claim.stage !== "reserved")) {
-			throw new Error("claim release requires confirmed worker teardown")
+		if (!isTeardownProof(proof) || current.claim.stage !== "reserved") {
+			throw new Error("claim release is allowed only for a reserved claim that never spawned a worker")
 		}
 		const now = this.now()
 		const claim = this.makeClaim(issue, current.claim.epoch, now, "released", current.claim.leaseNonce, current.claim.worktreeNames, current.claim.stage)
@@ -508,7 +515,7 @@ function parseClaimRecord(commit: unknown, issue: number): RunnerClaim {
 }
 
 function isTeardownProof(proof: ClaimTeardownProof): boolean {
-	return !!proof && (proof.kind === "never-spawned" || proof.kind === "process-groups-absent") &&
+	return !!proof && proof.kind === "never-spawned" &&
 		typeof proof.observedAt === "string" && Number.isFinite(Date.parse(proof.observedAt))
 }
 
