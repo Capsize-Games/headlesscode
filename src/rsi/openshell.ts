@@ -89,7 +89,7 @@ function shouldInclude(relativePath: string, mode: IsolatedRunOptions["mode"], c
 		// their exclusion even when a caller supplies an incomplete protectedPaths list.
 		const segments = relativePath.split("/")
 		if (segments.includes("__tests__") || /(?:^|\/)(?:test|spec)\.[^/]+$/.test(relativePath) || /\.(?:test|spec)\.[^/]+$/.test(relativePath)) return false
-		if (findMatchingPattern(relativePath, ["src/rsi/", "tests/", "test/", "scripts/", "fixtures/rsi-curriculum/", "fixtures/rsi-benchmark/"]) !== null) return false
+		if (findMatchingPattern(relativePath, ["src/rsi/", "tests/", "test/", "scripts/", "fixtures/"]) !== null) return false
 		if (findMatchingPattern(relativePath, config.protectedPaths) !== null) return false
 	}
 	return true
