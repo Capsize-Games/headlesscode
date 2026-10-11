@@ -11,6 +11,7 @@ import { parseWatchArgs } from "../../watcher/cli.js"
 import { defaultSpawn } from "../../watcher/watch.js"
 import { watchIssues, type SpawnBatch } from "../../watcher/watch.js"
 import { loadState, saveState } from "../state.js"
+import { runReworkStep } from "../resume.js"
 import { defaultWatcherState, loadWatcherState, saveWatcherState } from "../../watcher/state.js"
 
 const repoRoot = path.resolve(fileURLToPath(new URL("../../..", import.meta.url)))
@@ -419,8 +420,38 @@ async function testBuiltinMuseApiModelDoesNotSelectNativeExecutor(): Promise<voi
 	} finally { await fs.rm(fake.root, { recursive: true, force: true }) }
 }
 
+async function testNativeReworkPreservesBothModelNamespaces(): Promise<void> {
+	const fake = await setupFakeMuse()
+	const selectedNames = ["PATH", "FAKE_MUSE_ARGS", "HEADLESSCODE_MUSE_MODEL", "HEADLESSCODE_NATIVE_MUSE_MODEL"] as const
+	const previous = Object.fromEntries(selectedNames.map((name) => [name, process.env[name]]))
+	try {
+		process.env.PATH = `${fake.bin}:${process.env.PATH ?? ""}`
+		process.env.FAKE_MUSE_ARGS = fake.argsFile
+		process.env.HEADLESSCODE_MUSE_MODEL = "muse-spark-1.3"
+		delete process.env.HEADLESSCODE_NATIVE_MUSE_MODEL
+		const fakeMuse = path.join(fake.bin, "muse")
+		const envCapture = path.join(fake.root, "rework-model-env.txt")
+		const source = await fs.readFile(fakeMuse, "utf8")
+		assert.ok(source.includes('set -eu\n'), "fake Muse script must expose its strict-mode insertion point")
+		await fs.writeFile(fakeMuse, source.replace('set -eu\n', `set -eu\nprintf '%s\\n' "$HEADLESSCODE_NATIVE_MUSE_MODEL" "$HEADLESSCODE_MUSE_MODEL" > '${envCapture.replaceAll("'", "'\\''")}'\n`))
+		const group = { name: "w-rework", worktree: fake.workspace, status: "done" as const, executor: "muse" as const, museModel: "meta/pinned-native", issues: [42] }
+		const statePath = path.join(fake.root, "rework-state.json")
+		await saveState(statePath, { groups: [group] })
+		const result = await runReworkStep({ repo: fake.root, statePath, group, mode: "code", maxReworkCycles: 2, findings: ["fix synthetic issue"], dryRun: false, write: () => undefined })
+		assert.equal(result.outcome, "spawned")
+		await waitForMarker(path.join(fake.workspace, ".harness.done"))
+		assert.equal(await fs.readFile(envCapture, "utf8"), "meta/pinned-native\nmuse-spark-1.3\n")
+		assert.match(await fs.readFile(fake.argsFile, "utf8"), /--model\nmeta\/pinned-native/)
+		assert.equal((await loadState(statePath)).groups[0]?.museModel, "meta/pinned-native")
+	} finally {
+		for (const name of selectedNames) { if (previous[name] === undefined) delete process.env[name]; else process.env[name] = previous[name] }
+		await fs.rm(fake.root, { recursive: true, force: true })
+	}
+}
+
 const tests: Array<[string, () => Promise<void>]> = [
 	["issue executor labels resolve per job and reject conflicts", testIssueSelectionLabels],
+	["native rework preserves persisted native selector and direct API model", testNativeReworkPreservesBothModelNamespaces],
 	["builtin Muse API model stays separate from the native executor selector", testBuiltinMuseApiModelDoesNotSelectNativeExecutor],
 	["CLI, watcher intake, and rework retain explicit Muse executor/model selection", testOrchestrateAndWatcherSelectionPersistsThroughSpawn],
 	["per-job Muse executor and model survive orchestrator and watcher state reloads", testExecutorAndModelSurviveDurableStateRoundTrip],
