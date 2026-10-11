@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises"
 import { execFileSync } from "node:child_process"
 import * as path from "node:path"
 
-import { ADVERSARIAL_QUALIFICATION_MAX_RUNTIME_MS, assertReviewerBillingTokens, captureReviewerExchange, createQualificationHttpDeadlines, createSyntheticWorkspace, ensurePrivateDirectory, parseQualificationArgs, signReceipt, verifyControllerGate, verifyReceipt } from "../../../scripts/rsi-adversarial-qualification.js"
+import { ADVERSARIAL_QUALIFICATION_MAX_RUNTIME_MS, REVIEWER_QUALIFICATION_LIMITS, assertReviewerBillingTokens, captureReviewerExchange, createQualificationHttpDeadlines, createSyntheticWorkspace, ensurePrivateDirectory, parseQualificationArgs, signReceipt, verifyControllerGate, verifyReceipt } from "../../../scripts/rsi-adversarial-qualification.js"
 import type { RsiRunRecord } from "../types.js"
 
 function pin(publicKey: ReturnType<typeof createPublicKey>): string {
@@ -17,6 +17,9 @@ assert.match(parseQualificationArgs(["--receipt-signing-key", "key.pem", "--eval
 assert.match(parseQualificationArgs(["--unexpected"]).error ?? "", /unknown argument/)
 
 assert.equal(ADVERSARIAL_QUALIFICATION_MAX_RUNTIME_MS, 10 * 60_000, "CPU qualification has a declared ten-minute overall runtime bound")
+assert.equal(REVIEWER_QUALIFICATION_LIMITS.protocol, "headlesscode.rsi-adversarial-qualification.v2", "new request/admission limits must not silently reuse the failed v1 protocol")
+assert.ok(REVIEWER_QUALIFICATION_LIMITS.requestedOutputTokens < REVIEWER_QUALIFICATION_LIMITS.admittedOutputTokens, "reserve output headroom before dispatch while retaining a hard billed-output admission cap")
+assert.ok((16 * 1024 * 0.1 + REVIEWER_QUALIFICATION_LIMITS.admittedOutputTokens * 0.2) / 1_000_000 < 0.005, "the declared worst-case input/output still fits the existing qualification cost cap")
 let phaseStartedAt = 0
 const requestedDeadlines: Array<{ durationMs: number; startedAt: number }> = []
 const deadlines = createQualificationHttpDeadlines((durationMs) => {

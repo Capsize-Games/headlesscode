@@ -14,7 +14,12 @@ import { PostgresRsiJobQueue, fleetQueuePolicy, type FleetJob, type FleetJobIden
 import { runRsi } from "../src/rsi/controller.js"
 import type { RsiConfig, RsiRunRecord, RoleModelConfig } from "../src/rsi/types.js"
 
-const MAX_REVIEW_OUTPUT_TOKENS = 1_024
+export const REVIEWER_QUALIFICATION_LIMITS = Object.freeze({
+	protocol: "headlesscode.rsi-adversarial-qualification.v2",
+	requestedOutputTokens: 4_096,
+	admittedOutputTokens: 6_144,
+})
+const MAX_REVIEW_OUTPUT_TOKENS = REVIEWER_QUALIFICATION_LIMITS.admittedOutputTokens
 const MAX_REVIEW_PROMPT_BYTES = 16 * 1024
 const MAX_REVIEW_COST_USD = 0.005
 const MAX_REVIEW_HTTP_DURATION_MS = 120_000
@@ -313,7 +318,7 @@ export async function runAdversarialQualification(options: Required<Pick<Options
 							model: profile.model,
 							messages: request.messages,
 							temperature: 0.1,
-							max_tokens: MAX_REVIEW_OUTPUT_TOKENS,
+							max_tokens: REVIEWER_QUALIFICATION_LIMITS.requestedOutputTokens,
 							provider: { only: ["meta"], allow_fallbacks: false },
 						}), "utf8")
 						if (requestBytes > MAX_REVIEW_PROMPT_BYTES) throw new Error("serialized reviewer request exceeds the 16 KiB qualification bound")
@@ -322,7 +327,7 @@ export async function runAdversarialQualification(options: Required<Pick<Options
 						const response = await client.createChatCompletion({
 							...request,
 							model: profile.model,
-							maxTokens: MAX_REVIEW_OUTPUT_TOKENS,
+							maxTokens: REVIEWER_QUALIFICATION_LIMITS.requestedOutputTokens,
 							providerOnly: "meta",
 							signal: reviewSignal,
 						})
@@ -333,6 +338,7 @@ export async function runAdversarialQualification(options: Required<Pick<Options
 							generationId: response.generationId,
 							usage: response.usage ?? {},
 							promptBytes, requestBytes, maxOutputTokens: MAX_REVIEW_OUTPUT_TOKENS,
+							requestedOutputTokens: REVIEWER_QUALIFICATION_LIMITS.requestedOutputTokens,
 							worstCaseCostUsd: requestCostCeiling,
 						}
 						responseText = typeof response.message.content === "string" ? response.message.content : undefined
@@ -390,14 +396,14 @@ export async function runAdversarialQualification(options: Required<Pick<Options
 	artifactRefs["controller-archive.json"] = await writePrivateFile(artifactsDir, "controller-archive.json", archiveBytes)
 	const candidateGate = candidate.fitness?.hardGates.adversarialPass
 	const payload: Record<string, unknown> = {
-		protocol: "headlesscode.rsi-adversarial-qualification.v1",
+		protocol: REVIEWER_QUALIFICATION_LIMITS.protocol,
 		createdAt: new Date().toISOString(),
 		fixture: { kind: "synthetic-controlled-candidate", mutationInferenceCalls: 0, sourcePatchSha256: source.sourcePatchSha256, changedFiles: candidate.changedFiles },
 		reviewer: {
 			role: "adversary", requested: profile.model, providerOnly: "meta", ...responseIdentity, billing: generationBilling,
 			endpointAdmission: { pricePerMillion: metadata.price, endpoints: metadata.endpoints, contextWindow: metadata.contextWindow },
 		},
-		limits: { reviewerCalls: 1, maxOutputTokens: MAX_REVIEW_OUTPUT_TOKENS, maxPromptBytes: MAX_REVIEW_PROMPT_BYTES, maxCallCostUsd: MAX_REVIEW_COST_USD },
+		limits: { reviewerCalls: 1, maxOutputTokens: MAX_REVIEW_OUTPUT_TOKENS, requestedOutputTokens: REVIEWER_QUALIFICATION_LIMITS.requestedOutputTokens, maxPromptBytes: MAX_REVIEW_PROMPT_BYTES, maxCallCostUsd: MAX_REVIEW_COST_USD },
 		controllerReview: { status: review.status, provider: review.provider, model: review.model, promptVersion: review.promptVersion, promptSha256: review.promptSha256, resultSha256: review.resultSha256, testSha256: review.testArtifactSha256, snapshotSha256: review.snapshotArtifactSha256, findings: review.findings, testResults: review.testResults, penaltyPoints: review.penaltyPoints, evaluationJobId: review.jobId },
 		openShell: { queueName: queueBase.policy.queueName, jobId: evaluationJob.jobId, jobKind: evaluationJob.jobKind, status: evaluationJob.status, snapshotSha256: evaluationJob.artifactSha256, outputSha256: outputSha, workerResult: result?.evaluation?.visible?.[0] ?? result?.outputArtifact },
 		independentDecision: { expectedAdversarialPass: qualification.expectedAdversarialPass, controllerAdversarialPass: candidateGate, gateMatched: qualification.gateMatched, candidateStatus: candidate.status, selected: run.selected ?? null, selectedCandidates: run.selectedCandidates ?? [], selectionMatched: qualification.selectionMatched, developmentProof: candidate.developmentProof?.accepted === true ? "completed" : "not-qualified-by-this-one-review command" },
