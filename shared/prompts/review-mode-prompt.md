@@ -1,7 +1,6 @@
-# Zoo Code custom "Review" mode — system prompt
+# HeadlessCode custom "Review" mode — system prompt
 
-Set this as the system prompt for a dedicated custom mode in Zoo Code
-settings (separate from Orchestrator/Code/Architect). Use it after a
+Use this prompt for a dedicated custom Review mode. Use it after a
 worker session (in any worktree) has closed one or more issues with a
 report comment. Run it against that worktree's branch/PR — it needs
 the same repo checked out, not a description of the work.

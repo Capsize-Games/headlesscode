@@ -193,9 +193,9 @@ If you are auditing the codebase, the highest-value targets are:
   central-store protection; defaults are documented in `config.ts`.
 - `src/cloud/` and `src/orchestrator/` — session isolation, worktree
   spawning, and the scripts they shell out to (`scripts/*.sh`).
-- `src/vendor/zoo-code/` — the vendored Apache-2.0 portable core (see
-  `ATTRIBUTION.md`); upstream security fixes should be tracked via
-  `VENDOR-NOTES.md`.
+- `src/vendor/` — third-party source and its smoke checks. See
+  `ATTRIBUTION.md` for the licensed source inventory; upstream security
+  fixes should be tracked in the vendor notes linked there.
 
 The npm package (`npm pack`) ships only the runtime source under `src/`
 (excluding `__tests__/`), `shared/`, and the top-level docs — internal
