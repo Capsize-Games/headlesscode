@@ -1901,8 +1901,8 @@ export class HeadlessSession {
 			}
 			for (const tool of getMcpServerTools(this.mcpHub)) {
 				const functionName = tool.function.name
-				const handler = (args: Record<string, unknown>) =>
-					this.mcpHub?.callFunctionTool(functionName, args).then(
+				const handler = (args: Record<string, unknown>, ctx: ToolContext) =>
+					this.mcpHub?.callFunctionTool(functionName, args, ctx.signal).then(
 						(content) => ({ content, isError: false }),
 						(error: unknown) => ({ content: `[MCP error] ${String(error)}`, isError: true }),
 					) ?? { content: "MCP connection is unavailable", isError: true }
@@ -4801,6 +4801,138 @@ export class HeadlessSession {
 			// mistake accounting — in assistant.tool_calls order regardless of
 			// execution order.
 			const executed = new Map<number, { resultContent: string; isError: boolean }>()
+			const recordNestedBatchTool = async (
+				name: string,
+				args: Record<string, unknown>,
+				resultContent: string,
+				isError: boolean,
+				outerIndex: number,
+				subIndex: number,
+			): Promise<void> => {
+				const syntheticCall: ParsedToolCall = {
+					id: `batch_${iteration}_${outerIndex}_${subIndex}`,
+					name,
+					args,
+					rawArguments: JSON.stringify(args),
+				}
+				toolCalls++
+				if (
+					name === "execute_command" || name === "write_to_file" ||
+					name === "edit_file" || name === "set_indentation"
+				) hasCalledArtifactTool = true
+				if (name === "execute_command") {
+					lastExecuteCommandFailed = isError
+					if (isError) {
+						const command = summarizeToolArg(name, args) ?? "(unknown command)"
+						lastExecuteCommandSummary = `${command}\n${resultContent.slice(0, 500)}`
+					} else lastExecuteCommandSummary = undefined
+				}
+				if (name === "edit_file" || name === "write_to_file" || name === "set_indentation") {
+					lastWriteToolFailed = isError
+					if (isError) {
+						const target = summarizeToolArg(name, args) ?? "(unknown target)"
+						lastWriteToolSummary = `${name} ${target}\n${resultContent.slice(0, 500)}`
+						lastWriteToolFailedTarget = toolCallPathArg(this.config.workspaceRoot, syntheticCall)
+					} else {
+						lastWriteToolSummary = undefined
+						lastWriteToolFailedTarget = undefined
+						writeFailedClearedByReReadOnly = false
+						reReadClearedWriteSummary = undefined
+					}
+				}
+				if (name === "read_file" && !isError && lastWriteToolFailed) {
+					const readTarget = toolCallPathArg(this.config.workspaceRoot, syntheticCall)
+					if (readTarget !== undefined && readTarget === lastWriteToolFailedTarget) {
+						lastWriteToolFailed = false
+						reReadClearedWriteSummary = lastWriteToolSummary
+						lastWriteToolSummary = undefined
+						lastWriteToolFailedTarget = undefined
+						writeFailedClearedByReReadOnly = true
+					}
+				}
+				const targetPath = editToolTargetPath(this.config.workspaceRoot, syntheticCall)
+				if (!isError && targetPath !== undefined) {
+					batchEditedPaths.set(targetPath, name)
+					this.sessionWrittenPaths.add(targetPath)
+				}
+				boundaryTools.push({
+					id: syntheticCall.id,
+					name,
+					arguments: Object.freeze({ ...args }),
+					isError,
+					result: resultContent,
+					...(isError ? { normalizedError: resultContent.split("\n", 1)[0]?.slice(0, 200) ?? "tool_error" } : {}),
+				})
+				await this.checkPauseRequested(budgetTracker)
+			}
+			const dispatchBatchSubcall = async (
+				name: string,
+				args: Record<string, unknown>,
+				subIndex: number,
+				outerIndex: number,
+			): Promise<ToolResult> => {
+				const actionId = `batch_${iteration}_${outerIndex}_${subIndex}`
+				const actionIndex = `${iteration}_${outerIndex}_${subIndex}`
+				const acknowledged = await this.appendEvidence({
+					sessionId: this.sessionId,
+					requestId: `${this.evidenceRunId}_tool_intent_${actionIndex}`,
+					actionId,
+					iteration,
+					kind: "tool_intent",
+					actor: "headlesscode-loop",
+					origin: "batch-tool-call",
+					payload: { name, arguments: args, parentTool: "batch", parentIndex: outerIndex, subIndex },
+				})
+				let result: ToolResult
+				if (!acknowledged) {
+					result = { content: `[Error] ${this.evidenceFault ?? "required evidence intent was not acknowledged"}; tool was not executed.`, isError: true }
+				} else if (this.stopSignal?.aborted) {
+					result = { content: "[Error] Session stopped by supervisor before tool execution.", isError: true }
+				} else if (this.evidenceFault && this.evidenceRequired) {
+					result = { content: `[Error] ${this.evidenceFault}; later tool effects were blocked.`, isError: true }
+				} else {
+					const summary = summarizeToolArg(name, args) ?? ""
+					const truncated = summary.length > EVENT_TRUNCATE_CHARS
+					this.scheduleAux(() => this.emitEvent("tool_call", () => this.eventFeed.toolCall({
+						iteration,
+						tool: name,
+						callId: `${this.evidenceRunId}:${iteration}:${outerIndex}:batch:${subIndex}`,
+						commandIdentity: name === "execute_command" && typeof args.command === "string" ? sha256(args.command) : undefined,
+						args: truncated ? summary.slice(0, EVENT_TRUNCATE_CHARS) : summary,
+						argsTruncated: truncated,
+					}), { iteration, tool: name }))
+					result = await this.executor.execute(name, args)
+				}
+				let content = result.content
+				let isError = result.isError
+				if (acknowledged && !(await this.appendEvidence({
+					sessionId: this.sessionId,
+					requestId: `${this.evidenceRunId}_tool_result_${actionIndex}`,
+					actionId,
+					iteration,
+					kind: "tool_result",
+					actor: "headlesscode-loop",
+					origin: "tool-executor",
+					payload: { tool: name, isError, result: content, parentTool: "batch", parentIndex: outerIndex, subIndex },
+				}))) {
+					content = `${content}\n[Evidence error] ${this.evidenceFault}; later tool effects were blocked.`
+					isError = true
+				}
+				await recordNestedBatchTool(name, args, content, isError, outerIndex, subIndex)
+				this.scheduleAux(() => this.emitEvent("tool_result", () => {
+					const preview = truncateField(content)
+					return this.eventFeed.toolResult({
+						iteration,
+						tool: name,
+						callId: `${this.evidenceRunId}:${iteration}:${outerIndex}:batch:${subIndex}`,
+						commandIdentity: name === "execute_command" && typeof args.command === "string" ? sha256(args.command) : undefined,
+						isError,
+						result: preview.text,
+						resultTruncated: preview.truncated,
+					})
+				}, { iteration, tool: name, isError }))
+				return { content, isError }
+			}
 			const runCall = async (call: ParsedToolCall, index: number): Promise<void> => {
 				let resultContent: string
 				let isError: boolean
@@ -4853,7 +4985,16 @@ export class HeadlessSession {
 						"[Error] attempt_completion was not accepted: it was called alongside other tool calls in the same turn, so it was refused and your other calls ran for real instead — check their results below (including any errors) before deciding the task is actually done. Re-issue attempt_completion ALONE, as the only tool call in its own turn, once you've verified the real outcome."
 					isError = true
 				} else {
-					const result = await this.executor.execute(call.name, call.args)
+					const result = await this.executor.execute(
+						call.name,
+						call.args,
+						call.name === "batch"
+							? {
+								dispatchBatchSubcall: (name, args, subIndex) => dispatchBatchSubcall(name, args, subIndex, index),
+								serializeBatchSubcalls: this.evidenceRequired,
+							}
+							: undefined,
+					)
 					resultContent = result.content
 					isError = result.isError
 				}

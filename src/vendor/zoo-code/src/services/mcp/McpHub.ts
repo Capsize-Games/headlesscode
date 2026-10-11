@@ -153,12 +153,27 @@ export class McpHub {
 		return [...this.errors]
 	}
 
-	async callTool(serverName: string, toolName: string, args: Record<string, unknown>): Promise<string> {
+	async callTool(serverName: string, toolName: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
 		const server = this.servers.find((candidate) => candidate.name === serverName)
 		if (!server || !server.toolNames.has(toolName)) {
 			throw new Error(`MCP tool is unavailable: ${serverName}/${toolName}`)
 		}
-		const result = await server.client.callTool({ name: toolName, arguments: args })
+		if (this.closed) throw new Error("MCP connection is unavailable")
+		if (signal?.aborted) throw new Error("MCP tool call aborted")
+		let result
+		try {
+			result = await server.client.callTool(
+				{ name: toolName, arguments: args },
+				undefined,
+				{ signal },
+			)
+		} finally {
+			// Let the SDK send notifications/cancelled while the transport is
+			// still open, then close owned clients to stop a server that ignores
+			// cancellation. Disposing directly from an earlier abort listener
+			// could close stdio before the SDK sends that notification.
+			if (signal?.aborted) await this.dispose()
+		}
 		const content: unknown = result.content
 		const text = Array.isArray(content)
 			? content.map((item: unknown) => {
@@ -174,12 +189,12 @@ export class McpHub {
 		return text || "MCP tool returned no text"
 	}
 
-	async callFunctionTool(functionName: string, args: Record<string, unknown>): Promise<string> {
+	async callFunctionTool(functionName: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
 		const normalized = normalizeMcpToolName(functionName)
 		for (const server of this.servers) {
 			for (const toolName of server.toolNames) {
 				if (toolNamesMatch(buildMcpToolName(server.name, toolName), normalized)) {
-					return this.callTool(server.name, toolName, args)
+					return this.callTool(server.name, toolName, args, signal)
 				}
 			}
 		}

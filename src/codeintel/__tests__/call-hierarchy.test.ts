@@ -42,6 +42,11 @@ export function shaky(): unknown {
 }
 `
 
+const FIXTURE_TSCONFIG = JSON.stringify({
+	compilerOptions: { target: "ES2022", module: "ESNext", moduleResolution: "bundler", strict: true },
+	include: ["src"],
+}, null, 2)
+
 function ctxFor(ws: string): ToolContext {
 	return { workspaceRoot: ws } as unknown as ToolContext
 }
@@ -49,6 +54,7 @@ function ctxFor(ws: string): ToolContext {
 async function mkFixtureWorkspace(): Promise<string> {
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-ci-ch-"))
 	await fs.mkdir(path.join(ws, "src"), { recursive: true })
+	await fs.writeFile(path.join(ws, "tsconfig.json"), FIXTURE_TSCONFIG)
 	await fs.writeFile(path.join(ws, "src", "main.ts"), FIXTURE_MAIN)
 	resetCodeIntelCaches()
 	return ws
@@ -98,6 +104,21 @@ async function testDirectCalleesFound(): Promise<void> {
 		assert.equal(result.isError, false)
 		assert.match(result.content, /src\/main\.ts:6 mid -> src\/main\.ts:1 leaf/)
 		assert.match(result.content, /src\/main\.ts:7 mid -> src\/main\.ts:1 leaf/)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testCalleesFromCallSiteStartAtSelectedCallee(): Promise<void> {
+	const ws = await mkFixtureWorkspace()
+	try {
+		const result = callHierarchyHandler(
+			{ path: "src/main.ts", line: 11, symbol: "mid", direction: "callees" },
+			ctxFor(ws),
+		)
+		assert.equal(result.isError, false)
+		assert.match(result.content, /src\/main\.ts:6 mid -> src\/main\.ts:1 leaf/)
+		assert.doesNotMatch(result.content, /top -> src\/main\.ts:5 mid/)
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -186,6 +207,7 @@ async function main(): Promise<void> {
 		["direct caller found from a definition", testDirectCallerFound],
 		["caller lookup works from a call site", testCallerViaCallSite],
 		["direct callees found", testDirectCalleesFound],
+		["callee lookup from a call site starts at the selected callee", testCalleesFromCallSiteStartAtSelectedCallee],
 		["default direction returns both sides", testBothDirectionsDefault],
 		["max_depth=1 excludes depth-2 edges", testMaxDepthPrunesDeeperEdges],
 		["any-typed call is tolerated", testAnyTypedCallTolerated],

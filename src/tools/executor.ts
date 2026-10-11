@@ -361,7 +361,11 @@ export class ToolExecutor {
 		return this.todoList.snapshot()
 	}
 
-	async execute(name: string, args: Record<string, unknown>): Promise<ToolResult> {
+	async execute(
+		name: string,
+		args: Record<string, unknown>,
+		batchContext?: Pick<ToolContext, "dispatchBatchSubcall" | "serializeBatchSubcalls">,
+	): Promise<ToolResult> {
 		if (this.stopSignal?.aborted) return err("Tool execution stopped by supervisor")
 		const handler = this.handlers.get(name)
 		if (!handler) {
@@ -373,6 +377,8 @@ export class ToolExecutor {
 		try {
 			return await handler(args, {
 				signal: this.stopSignal,
+				dispatchBatchSubcall: batchContext?.dispatchBatchSubcall,
+				serializeBatchSubcalls: batchContext?.serializeBatchSubcalls,
 				workspaceRoot: this.workspaceRoot,
 				permissions: this.permissions,
 				guardLargeOverwrites: this.options.guardLargeOverwrites,

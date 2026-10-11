@@ -56,6 +56,11 @@ export function helper(value: number): number {
 }
 `
 
+const FIXTURE_TSCONFIG = JSON.stringify({
+	compilerOptions: { target: "ES2022", module: "ESNext", moduleResolution: "bundler", strict: true },
+	include: ["src"],
+}, null, 2)
+
 function fakeCtx(workspaceRoot: string): ToolContext {
 	return { workspaceRoot } as unknown as ToolContext
 }
@@ -63,6 +68,7 @@ function fakeCtx(workspaceRoot: string): ToolContext {
 async function mkFixtureWorkspace(): Promise<string> {
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-ci-impl-"))
 	await fs.mkdir(path.join(ws, "src"), { recursive: true })
+	await fs.writeFile(path.join(ws, "tsconfig.json"), FIXTURE_TSCONFIG)
 	await fs.writeFile(path.join(ws, "src", "shapes.ts"), FIXTURE_SHAPES)
 	return ws
 }

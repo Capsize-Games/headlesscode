@@ -104,6 +104,8 @@ function refusalFor(
 async function runSubCall(
 	executor: ToolExecutor,
 	sub: BatchSubCall,
+	index: number,
+	ctx: ToolContext,
 ): Promise<BatchSection> {
 	const refused = refusalFor(executor, sub)
 	if (refused !== undefined) {
@@ -114,7 +116,9 @@ async function runSubCall(
 			content: `[Error] ${refused}`,
 		}
 	}
-	const result = await executor.execute(sub.tool, sub.args)
+	const result = ctx.dispatchBatchSubcall
+		? await ctx.dispatchBatchSubcall(sub.tool, sub.args, index)
+		: await executor.execute(sub.tool, sub.args)
 	return {
 		tool: sub.tool,
 		ok: !result.isError,
@@ -164,12 +168,23 @@ async function executeBatch(
 	executor: ToolExecutor,
 	workspaceRoot: string,
 	request: BatchRequest,
+	ctx: ToolContext,
 ): Promise<BatchSection[]> {
 	const groups = partitionBatch(workspaceRoot, request.calls)
 	const sections = new Map<number, BatchSection>()
+	if (ctx.serializeBatchSubcalls) {
+		for (let index = 0; index < request.calls.length; index++) {
+			if (request.stopOnError && hasFailure(sections)) {
+				sections.set(index, skippedSection(request.calls[index]!))
+				continue
+			}
+			sections.set(index, await runSubCall(executor, request.calls[index]!, index, ctx))
+		}
+		return orderedSections(request.calls.length, sections)
+	}
 	await Promise.all(
 		groups.parallel.map(async (index) => {
-			sections.set(index, await runSubCall(executor, request.calls[index]))
+			sections.set(index, await runSubCall(executor, request.calls[index]!, index, ctx))
 		}),
 	)
 	for (const index of groups.serial) {
@@ -177,7 +192,7 @@ async function executeBatch(
 			sections.set(index, skippedSection(request.calls[index]))
 			continue
 		}
-		sections.set(index, await runSubCall(executor, request.calls[index]))
+		sections.set(index, await runSubCall(executor, request.calls[index]!, index, ctx))
 	}
 	return orderedSections(request.calls.length, sections)
 }
@@ -217,7 +232,7 @@ export async function batchHandler(
 	ctx: ToolContext,
 ): Promise<ToolResult> {
 	const request = parseBatchArgs(args, "batch")
-	const sections = await executeBatch(executor, ctx.workspaceRoot, request)
+	const sections = await executeBatch(executor, ctx.workspaceRoot, request, ctx)
 	const body = assembleSections(request.calls.length, sections)
 	const summary = formatSummary(request.calls.length, sections)
 	const succeeded = sections.some((s) => s.ok)

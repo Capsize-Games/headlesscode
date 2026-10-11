@@ -237,6 +237,10 @@ export interface AuxLlmUsage {
 export interface ToolContext {
 	/** Supervisor cancellation; handlers must not start effects after abort. */
 	signal?: AbortSignal
+	/** Session dispatcher for batch children; preserves per-action evidence and guards. */
+	dispatchBatchSubcall?: (name: string, args: Record<string, unknown>, index: number) => Promise<ToolResult>
+	/** Required-evidence sessions serialize batch children so each ACK gates the next effect. */
+	serializeBatchSubcalls?: boolean
 	workspaceRoot: string
 	/**
 	 * Resolved command allow/deny + protected-file permissions for this

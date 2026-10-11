@@ -28,12 +28,18 @@ const broken = (
 const FIXTURE_CLEAN = `export const ok = 1
 `
 
+const FIXTURE_TSCONFIG = JSON.stringify({
+	compilerOptions: { target: "ES2022", module: "ESNext", moduleResolution: "bundler", strict: true },
+	include: ["**/*.ts"],
+}, null, 2)
+
 function fakeContext(workspaceRoot: string): ToolContext {
 	return { workspaceRoot } as ToolContext
 }
 
 async function mkFixtureWorkspace(): Promise<string> {
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-ci-diag-"))
+	await fs.writeFile(path.join(ws, "tsconfig.json"), FIXTURE_TSCONFIG)
 	await fs.writeFile(path.join(ws, "bad.ts"), FIXTURE_BAD)
 	await fs.writeFile(path.join(ws, "clean.ts"), FIXTURE_CLEAN)
 	await fs.writeFile(path.join(ws, "notes.md"), "# hi\n")

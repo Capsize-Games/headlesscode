@@ -8,7 +8,6 @@ import * as ts from "typescript"
 
 import {
 	collectCallEdges,
-	enclosingFunction,
 	MAX_HIERARCHY_DEPTH,
 	MAX_HIERARCHY_EDGES,
 	nodeKey,
@@ -24,7 +23,6 @@ export interface HierarchyTarget {
 	file: string
 	line: number
 	declKeys: string[]
-	callerKey: string
 }
 
 /** Symbol at a location, with alias imports resolved to their target. */
@@ -67,16 +65,11 @@ export function resolveHierarchyTarget(
 	if (sym?.declarations === undefined || sym.declarations.length === 0) {
 		return undefined
 	}
-	const enclosing = enclosingFunction(identifier)
-	const callerKey = enclosing === undefined
-		? `top:${file}`
-		: nodeKey(enclosing)
 	return {
 		name: identifier.text,
 		file,
 		line,
 		declKeys: sym.declarations.map(nodeKey),
-		callerKey,
 	}
 }
 
@@ -168,7 +161,7 @@ export function findCallHierarchy(
 		: walkSide(edges, target.declKeys, depth, false)
 	const callees = direction === "callers"
 		? []
-		: walkSide(edges, [target.callerKey], depth, true)
+		: walkSide(edges, target.declKeys, depth, true)
 	return { callers, callees }
 }
 
