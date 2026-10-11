@@ -38,6 +38,15 @@ async function waitForWorker(workspace: string): Promise<string> {
 	throw new Error(`packed worker did not finish: ${workspace}`)
 }
 
+async function waitForJobReceipt(receiptDir: string, group: string): Promise<Record<string, unknown>> {
+	const deadline = Date.now() + 10_000
+	while (Date.now() < deadline) {
+		try { return JSON.parse(await fs.readFile(path.join(receiptDir, `${group}.complete`), "utf8")) as Record<string, unknown> }
+		catch { await delay(20) }
+	}
+	throw new Error(`packed supervisor did not write a completion receipt for ${group}`)
+}
+
 try {
 	const packed = path.join(scratch, "packed")
 	const extracted = path.join(scratch, "unpacked")
@@ -53,6 +62,7 @@ try {
 	const requiredScripts = [
 		"scripts/spawn-parallel-worktrees.sh",
 		"scripts/run-worker.sh",
+		"scripts/supervise-job-worker.mjs",
 		"scripts/run-muse-worker.sh",
 		"scripts/stop-worker.sh",
 		"scripts/headlesscode-answer.sh",
@@ -62,6 +72,26 @@ try {
 	assert.equal(files.some((file) => file.startsWith("scripts/") && !requiredScripts.includes(file) && file !== "scripts/deploy-gate.sh"), false, "packaging does not include unrelated scripts")
 	execFileSync("tar", ["-xzf", path.join(packed, packResult[0]!.filename), "-C", extracted])
 	const unpackedPackage = path.join(extracted, "package")
+	const unpackedSupervisor = path.join(unpackedPackage, "scripts/supervise-job-worker.mjs")
+	const hiddenSupervisor = `${unpackedSupervisor}.hidden`
+	const brokenWorkspace = path.join(scratch, "broken-job-workspace")
+	const brokenReceipts = path.join(scratch, "broken-job-receipts")
+	await fs.mkdir(brokenWorkspace)
+	await fs.mkdir(brokenReceipts, { mode: 0o700 })
+	await fs.writeFile(path.join(brokenWorkspace, ".harness.pid"), "424242")
+	await fs.rename(unpackedSupervisor, hiddenSupervisor)
+	try {
+		const missingHelper = spawnSync("bash", [path.join(unpackedPackage, "scripts/run-worker.sh"), brokenWorkspace, "CPU mock task", "--executor", "builtin"], {
+			cwd: scratch,
+			encoding: "utf8",
+			env: { ...scrubbedEnv, HEADLESSCODE_ROOT: unpackedPackage, HEADLESSCODE_CLI: path.join(scratch, "missing-cli"), HEADLESSCODE_JOB_ATTEMPT: "523e4567-e89b-12d3-a456-426614174000", HEADLESSCODE_JOB_RECEIPT_DIR: brokenReceipts },
+		})
+		assert.notEqual(missingHelper.status, 0, "a missing packaged supervisor must fail startup")
+		await assert.rejects(fs.access(path.join(brokenWorkspace, ".harness.pid")), "a stale PID cannot make a new attempt look launched")
+		assert.equal((await fs.readdir(brokenReceipts)).some((name) => name.endsWith(".launch")), false, "failed helper startup creates no attempt receipt")
+	} finally {
+		await fs.rename(hiddenSupervisor, unpackedSupervisor)
+	}
 
 	const fakeCli = path.join(scratch, "headlesscode-cli")
 	const builtinCapture = path.join(scratch, "builtin-cli-args")
@@ -79,6 +109,27 @@ try {
 	const builtinArgs = await fs.readFile(builtinCapture, "utf8")
 	assert.match(builtinArgs, /--task /)
 	assert.match(builtinArgs, /--workspace /)
+
+	const jobWorkspace = path.join(scratch, "job-workspace")
+	const jobReceipts = path.join(scratch, "job-receipts")
+	await fs.mkdir(jobWorkspace)
+	await fs.mkdir(jobReceipts, { mode: 0o700 })
+	const jobCli = path.join(scratch, "job-cli")
+	await writeExecutable(jobCli, "#!/bin/sh\nexit 7\n")
+	const jobAttempt = "623e4567-e89b-12d3-a456-426614174000"
+	const jobSpawn = spawnSync("bash", [path.join(unpackedPackage, "scripts/run-worker.sh"), jobWorkspace, "CPU mock task", "--executor", "builtin"], {
+		cwd: scratch,
+		encoding: "utf8",
+		env: { ...scrubbedEnv, HEADLESSCODE_ROOT: unpackedPackage, HEADLESSCODE_CLI: jobCli, HEADLESSCODE_JOB_ATTEMPT: jobAttempt, HEADLESSCODE_JOB_RECEIPT_DIR: jobReceipts },
+	})
+	assert.equal(jobSpawn.status, 0, jobSpawn.stderr)
+	assert.match(jobSpawn.stdout.trim(), /^\d+$/, "job dispatch returns the captured worker PID")
+	const jobCompletion = await waitForJobReceipt(jobReceipts, "job-workspace")
+	const jobLaunch = JSON.parse(await fs.readFile(path.join(jobReceipts, "job-workspace.launch"), "utf8")) as Record<string, unknown>
+	assert.equal(jobCompletion.attemptId, jobAttempt)
+	assert.equal(jobCompletion.pid, jobLaunch.pid)
+	assert.equal(jobCompletion.startTicks, jobLaunch.startTicks)
+	assert.equal(jobCompletion.exitCode, 7, "supervisor records actual child exit status")
 
 	const fakeBin = path.join(scratch, "fake-bin")
 	await fs.mkdir(fakeBin)

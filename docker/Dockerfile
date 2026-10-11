@@ -71,12 +71,13 @@ COPY shared ./shared
 # Runtime orchestration scripts: the non-dry-run orchestrate path shells out
 # to scripts/spawn-parallel-worktrees.sh, which in turn launches each worker
 # via scripts/run-worker.sh; headlesscode-answer.sh answers decision-escalation
-# prompts a blocked worker (scripts' HARNESS_ROOT resolves to /opt/headlesscode
+# prompts a blocked worker, and supervises queued job workers (scripts'
+# HARNESS_ROOT resolves to /opt/headlesscode
 # from BASH_SOURCE, so they find src/cli.ts + node_modules here). The rest of
 # scripts/ is dev/deploy tooling (GUI injection, phone-home, QA runs) that has
 # no business in the image.
-COPY scripts/spawn-parallel-worktrees.sh scripts/run-worker.sh scripts/headlesscode-answer.sh ./scripts/
-RUN chmod +x scripts/spawn-parallel-worktrees.sh scripts/run-worker.sh scripts/headlesscode-answer.sh
+COPY scripts/spawn-parallel-worktrees.sh scripts/run-worker.sh scripts/supervise-job-worker.mjs scripts/headlesscode-answer.sh ./scripts/
+RUN chmod +x scripts/spawn-parallel-worktrees.sh scripts/run-worker.sh scripts/supervise-job-worker.mjs scripts/headlesscode-answer.sh
 
 # Bundled shared content (per-stack rules.md, …). Copied into the image and
 # seeded into the container's $HOME at every start by entrypoint.sh — the

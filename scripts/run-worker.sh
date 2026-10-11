@@ -423,6 +423,7 @@ read -r _ <&3 || exit 125
 $WRAPPER"
     WRAPPER_PATH="$JOB_RECEIPT_DIR/$JOB_GROUP.wrapper.$$.sh"
     umask 077
+    rm -f -- "$WT_PATH/.harness.pid" "$WT_PATH/.harness.supervisor.pid"
     printf '%s' "$WRAPPER" > "$WRAPPER_PATH"
     chmod 600 "$WRAPPER_PATH"
     nohup setsid node "$HARNESS_ROOT/scripts/supervise-job-worker.mjs" \
@@ -430,16 +431,26 @@ $WRAPPER"
         >>"$WT_PATH/harness.log" 2>&1 </dev/null &
     SUPERVISOR_PID=$!
     printf '%s' "$SUPERVISOR_PID" > "$WT_PATH/.harness.supervisor.pid"
-    WORKER_PID=""
+    LAUNCH_RECEIPT="$JOB_RECEIPT_DIR/$JOB_GROUP.launch"
     for _ in $(seq 1 100); do
-        if [ -s "$WT_PATH/.harness.pid" ]; then
-            WORKER_PID="$(cat "$WT_PATH/.harness.pid")"
-            break
-        fi
+        [ -s "$LAUNCH_RECEIPT" ] && break
+        kill -0 "$SUPERVISOR_PID" 2>/dev/null || break
         sleep 0.01
     done
-    if [[ ! "$WORKER_PID" =~ ^[1-9][0-9]{0,9}$ ]]; then
+    if [ ! -s "$LAUNCH_RECEIPT" ]; then
         echo "run-worker: detached supervisor did not capture worker identity" >&2
+        exit 2
+    fi
+    WORKER_PID="$(node -e 'const fs=require("node:fs"); try { const r=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); if(r.version!==1||r.attemptId!==process.argv[2]||r.group!==process.argv[3]||!Number.isSafeInteger(r.pid)||r.pid<2||r.pgid!==r.pid||typeof r.startTicks!=="string"||!/^[0-9]{1,24}$/.test(r.startTicks)) process.exit(2); process.stdout.write(String(r.pid)); } catch { process.exit(2); }' "$LAUNCH_RECEIPT" "$JOB_ATTEMPT" "$JOB_GROUP")" || {
+        echo "run-worker: detached supervisor wrote an invalid worker identity receipt" >&2
+        exit 2
+    }
+    if ! kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
+        echo "run-worker: detached supervisor exited during worker startup" >&2
+        exit 2
+    fi
+    if [[ ! "$WORKER_PID" =~ ^[1-9][0-9]{0,9}$ ]] || [ "$(cat "$WT_PATH/.harness.pid" 2>/dev/null || true)" != "$WORKER_PID" ]; then
+        echo "run-worker: worker identity does not match the attempt-bound supervisor receipt" >&2
         exit 2
     fi
     printf '%s' "$WORKER_PID"
