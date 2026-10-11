@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises"
 import { execFileSync } from "node:child_process"
 import * as path from "node:path"
 
-import { ADVERSARIAL_QUALIFICATION_MAX_RUNTIME_MS, assertReviewerBillingTokens, createQualificationHttpDeadlines, createSyntheticWorkspace, ensurePrivateDirectory, parseQualificationArgs, signReceipt, verifyControllerGate, verifyReceipt } from "../../../scripts/rsi-adversarial-qualification.js"
+import { ADVERSARIAL_QUALIFICATION_MAX_RUNTIME_MS, assertReviewerBillingTokens, captureReviewerExchange, createQualificationHttpDeadlines, createSyntheticWorkspace, ensurePrivateDirectory, parseQualificationArgs, signReceipt, verifyControllerGate, verifyReceipt } from "../../../scripts/rsi-adversarial-qualification.js"
 import type { RsiRunRecord } from "../types.js"
 
 function pin(publicKey: ReturnType<typeof createPublicKey>): string {
@@ -72,6 +72,23 @@ assert.deepEqual(verifyControllerGate(passingReviewButUnqualifiedProof, "passed"
 
 const scratch = path.join(process.cwd(), ".headlesscode", "scratch", "adversarial-qualification-fixture-test")
 await fs.mkdir(scratch, { recursive: true, mode: 0o700 })
+const exchangeDir = path.join(scratch, "exchange")
+await fs.mkdir(exchangeDir, { mode: 0o700 })
+const rejectedIdentity = { generationId: "charged-over-limit", returnedModel: "unexpected-model", usage: { promptTokens: 90, completionTokens: 1025 } }
+const capturedBilling = await captureReviewerExchange(exchangeDir, rejectedIdentity, "rejected response", async (id) => {
+	assert.deepEqual(JSON.parse(await fs.readFile(path.join(exchangeDir, "reviewer-response-identity.json"), "utf8")), rejectedIdentity, "identity must be durable before billing lookup or acceptance checks")
+	assert.equal(await fs.readFile(path.join(exchangeDir, "reviewer-response.txt"), "utf8"), "rejected response")
+	return { id, totalCostUsd: 0.0003, nativeTokensPrompt: 90, nativeTokensCompletion: 1025 }
+})
+assert.equal(capturedBilling?.totalCostUsd, 0.0003)
+assert.equal(JSON.parse(await fs.readFile(path.join(exchangeDir, "reviewer-generation-billing.json"), "utf8")).billing.id, rejectedIdentity.generationId)
+assert.equal((await fs.stat(path.join(exchangeDir, "reviewer-response-identity.json"))).mode & 0o077, 0)
+await assert.rejects(captureReviewerExchange(exchangeDir, rejectedIdentity, "overwrite", async () => undefined), /EEXIST/, "a later attempt cannot overwrite the charged exchange")
+const failedBillingDir = path.join(scratch, "failed-billing")
+await fs.mkdir(failedBillingDir, { mode: 0o700 })
+await assert.rejects(captureReviewerExchange(failedBillingDir, rejectedIdentity, "response", async () => { throw new Error("billing unavailable") }), /billing unavailable/)
+assert.equal(JSON.parse(await fs.readFile(path.join(failedBillingDir, "reviewer-response-identity.json"), "utf8")).generationId, rejectedIdentity.generationId)
+assert.match(await fs.readFile(path.join(failedBillingDir, "reviewer-billing-failure.json"), "utf8"), /billing unavailable/)
 const symlinkTarget = path.join(scratch, "target")
 await fs.mkdir(symlinkTarget, { mode: 0o700 })
 const symlinkAncestor = path.join(scratch, "linked")

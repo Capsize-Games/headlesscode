@@ -139,6 +139,26 @@ async function writePrivateFile(root: string, relative: string, content: Buffer 
 	return { path: relative, sha256: sha256(bytes), bytes: bytes.byteLength }
 }
 
+/** Preserve charged exchanges before any identity, usage, or controller gate can reject them. */
+export async function captureReviewerExchange(
+	root: string,
+	identity: Record<string, unknown>,
+	response: string | undefined,
+	lookupBilling: (generationId: string) => Promise<OpenRouterGenerationMetadata | undefined>,
+): Promise<OpenRouterGenerationMetadata | undefined> {
+	await writePrivateFile(root, "reviewer-response-identity.json", JSON.stringify(identity, null, 2) + "\n")
+	if (response !== undefined) await writePrivateFile(root, "reviewer-response.txt", response)
+	try {
+		if (typeof identity.generationId !== "string" || !identity.generationId || identity.generationId.length > 512) throw new Error("OpenRouter did not return a bounded generation ID for billing identity")
+		const billing = await lookupBilling(identity.generationId)
+		await writePrivateFile(root, "reviewer-generation-billing.json", JSON.stringify({ generationId: identity.generationId, billing: billing ?? null }, null, 2) + "\n")
+		return billing
+	} catch (error) {
+		await writePrivateFile(root, "reviewer-billing-failure.json", JSON.stringify({ generationId: identity.generationId ?? null, error: error instanceof Error ? error.message.slice(0, 512) : "billing lookup failed" }, null, 2) + "\n")
+		throw error
+	}
+}
+
 export async function ensurePrivateDirectory(directory: string): Promise<void> {
 	const resolved = path.resolve(directory)
 	let cursor = path.parse(resolved).root
@@ -308,9 +328,6 @@ export async function runAdversarialQualification(options: Required<Pick<Options
 						})
 						const returnedModel = response.returnedModel
 						const providerName = response.providerName
-						if (!returnedModel || !profile.returnedModels.includes(returnedModel) || providerName?.toLowerCase() !== "meta") throw new Error("OpenRouter reviewer response did not match the admitted Muse model and Meta provider")
-						if (response.usage?.promptTokens !== undefined && response.usage.promptTokens > promptBytes) throw new Error("reported reviewer input tokens exceeded the conservative byte bound")
-						if (response.usage?.completionTokens !== undefined && response.usage.completionTokens > MAX_REVIEW_OUTPUT_TOKENS) throw new Error("reviewer output exceeded its token cap")
 						responseIdentity = {
 							requestedModel: profile.model, returnedModel, providerName,
 							generationId: response.generationId,
@@ -319,12 +336,17 @@ export async function runAdversarialQualification(options: Required<Pick<Options
 							worstCaseCostUsd: requestCostCeiling,
 						}
 						responseText = typeof response.message.content === "string" ? response.message.content : undefined
+						const billing = await captureReviewerExchange(artifactsDir, responseIdentity, responseText, (id) => client.fetchGenerationMetadata(id, reviewSignal))
+						generationBilling = billing as unknown as Record<string, unknown> | undefined
+						if (!returnedModel || !profile.returnedModels.includes(returnedModel) || providerName?.toLowerCase() !== "meta") throw new Error("OpenRouter reviewer response did not match the admitted Muse model and Meta provider")
+						if (response.usage?.promptTokens !== undefined && response.usage.promptTokens > promptBytes) throw new Error("reported reviewer input tokens exceeded the conservative byte bound")
+						if (response.usage?.completionTokens !== undefined && response.usage.completionTokens > MAX_REVIEW_OUTPUT_TOKENS) throw new Error("reviewer output exceeded its token cap")
 						return response
 					},
 				})
 				if (!responseText || raw !== responseText.trim()) throw new Error("review response content capture did not match the controller response")
 				if (!responseIdentity?.generationId || typeof responseIdentity.generationId !== "string") throw new Error("OpenRouter did not return a generation ID for billing identity")
-				const billing = await client.fetchGenerationMetadata(responseIdentity.generationId as string, reviewSignal)
+				const billing = generationBilling as OpenRouterGenerationMetadata | undefined
 				if (!billing || billing.providerName?.toLowerCase() !== "meta" || !billing.model || !profile.returnedModels.includes(billing.model)) throw new Error("OpenRouter billing record is unavailable or does not match the admitted Muse/Meta identity")
 				if (billing.id !== responseIdentity.generationId || typeof billing.totalCostUsd !== "number" || !Number.isFinite(billing.totalCostUsd) || billing.totalCostUsd < 0 || billing.totalCostUsd > MAX_REVIEW_COST_USD) throw new Error("OpenRouter billing record is unavailable or exceeds the $0.005 qualification cap")
 				const usage = responseIdentity.usage as { promptTokens?: number; completionTokens?: number }
