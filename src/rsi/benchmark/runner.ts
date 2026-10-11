@@ -199,7 +199,8 @@ export interface BenchmarkVerifier {
 
 async function copyStartSnapshot(task: BenchmarkTask, loaded: LoadedBenchmark, workspace: string): Promise<void> {
 	if (task.startCommit) {
-		await fs.rmdir(workspace)
+		// runBenchmark clears the destination before preparation. Keep the same
+		// missing-destination contract as directory snapshots and the materializer.
 		await materializeBenchmarkSnapshot(task, loaded.repoRoot, workspace)
 	}
 	else {

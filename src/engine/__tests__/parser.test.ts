@@ -147,6 +147,22 @@ function testBalancedBraceRecoveryPicksOutermostObject(): void {
 	})
 }
 
+function testBalancedBraceRecoveryIgnoresBracesInsideNestedStrings(): void {
+	assert.deepEqual(bestEffortPartialJson('{"payload":{"literal":"}"},"tail":1} trailing'), {
+		payload: { literal: "}" },
+		tail: 1,
+	})
+}
+
+function testBalancedBraceRecoveryHandlesEscapesAndTrailingJunk(): void {
+	const text = "close } then open { then close }, quote: \" and slash \\\\"
+	const input = JSON.stringify({ payload: { text, count: 2 }, tail: { ok: true } }) + " trailing junk"
+	assert.deepEqual(bestEffortPartialJson(input), {
+		payload: { text, count: 2 },
+		tail: { ok: true },
+	})
+}
+
 function testScavengingHandlesStringsNumbersBooleansNull(): void {
 	const result = bestEffortPartialJson('"s": "hi", "n": 42, "neg": -3.5, "t": true, "f": false, "nil": null, trunc')
 	assert.deepEqual(result, { s: "hi", n: 42, neg: -3.5, t: true, f: false, nil: null })
@@ -213,6 +229,8 @@ const tests: Array<[string, () => void]> = [
 	["parseToolCall: truncated JSON recovers via scavenging", testTruncatedJsonRecoversViaScavenging],
 	["parseToolCall: unrecoverable JSON -> parseError", testUnrecoverableJsonSetsParseError],
 	["bestEffortPartialJson: balanced-brace picks outermost object", testBalancedBraceRecoveryPicksOutermostObject],
+	["bestEffortPartialJson: braces inside nested strings do not end recovery", testBalancedBraceRecoveryIgnoresBracesInsideNestedStrings],
+	["bestEffortPartialJson: escaped strings and trailing junk recover whole object", testBalancedBraceRecoveryHandlesEscapesAndTrailingJunk],
 	["bestEffortPartialJson: scavenging handles all value types", testScavengingHandlesStringsNumbersBooleansNull],
 	["bestEffortPartialJson: scavenging unescapes string values", testScavengingUnescapesStringValues],
 	["bestEffortPartialJson: no recoverable pairs -> undefined", testNoRecoverablePairsReturnsUndefined],
