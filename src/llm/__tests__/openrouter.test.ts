@@ -130,13 +130,14 @@ async function testOversizedLatestToolGroupIsClippedWithoutMutatingEvidence(): P
 	const cacheRoutingKey = "hc-123e4567-e89b-42d3-a456-426614174000"
 	const tools = [{ type: "function" as const, function: { name: "read_file", parameters: { type: "object", properties: { path: { type: "string" } } } } }]
 	const latestCalls = Array.from({ length: 4 }, (_, index) => ({ id: `new-${index}`, type: "function" as const, function: { name: "read_file", arguments: JSON.stringify({ path: `file-${index}.ts`, retained: `arg-${index}` }) } }))
+	const denseChunk = ["é", "🙂", "\\", "\"", "\n"].join("")
 	const messages: LlmRequest["messages"] = [
 		{ role: "system", content: "stable system prefix" },
 		{ role: "user", content: "stable first task" },
 		{ role: "assistant", content: null, tool_calls: [{ id: "old-call", type: "function", function: { name: "read_file", arguments: "{\"path\":\"old\"}" } }] },
 		{ role: "tool", tool_call_id: "old-call", name: "read_file", content: "old result" },
 		{ role: "assistant", content: null, tool_calls: latestCalls },
-		...latestCalls.map((call, index) => ({ role: "tool" as const, tool_call_id: call.id, name: "read_file", content: `${"x".repeat(29_990)}-${index}-é🙂-\\\"newline\n` })),
+		...latestCalls.map((call, index) => ({ role: "tool" as const, tool_call_id: call.id, name: "read_file", content: `${denseChunk.repeat(5_000)}-${index}` })),
 	]
 	const request: LlmRequest = { model: "meta/muse-spark-1.3-contributor", messages, tools, cacheRoutingKey }
 	const original = JSON.stringify(messages)
@@ -146,6 +147,7 @@ async function testOversizedLatestToolGroupIsClippedWithoutMutatingEvidence(): P
 	assert.equal(JSON.stringify(messages), original, "packing never mutates engine messages or original tool evidence")
 	assert.deepEqual(result.body.messages.slice(0, 2), messages.slice(0, 2), "system and first-user prefix stay verbatim")
 	assert.equal(result.body.messages.some((message: { tool_call_id?: string }) => message.tool_call_id === "old-call"), false, "an older complete tool-call group is evicted as a unit")
+	assert.equal(result.body.messages.some((message: { tool_calls?: typeof latestCalls }) => message.tool_calls?.some((call) => call.id === "old-call")), false, "evicting an older result also removes its assistant call")
 	const packedAssistant = result.body.messages.find((message: { role: string; tool_calls?: typeof latestCalls }) => message.role === "assistant" && message.tool_calls?.some((call) => call.id === "new-0"))
 	assert.ok(packedAssistant, "newest tool-call group remains")
 	assert.deepEqual(packedAssistant.tool_calls, latestCalls, "all tool IDs and arguments are unchanged")
@@ -153,8 +155,58 @@ async function testOversizedLatestToolGroupIsClippedWithoutMutatingEvidence(): P
 	assert.deepEqual(packedResults.map((message: { tool_call_id: string }) => message.tool_call_id), latestCalls.map((call) => call.id), "every retained call has exactly its matching result")
 	assert.ok(packedResults.every((message: { content: string }) => message.content.includes("shortened to fit the request byte budget")), "each shortened excerpt carries an explicit notice")
 	assert.ok(packedResults.every((message: { content: string }, index: number) => message.content.length < messages[index + 5]!.content!.length), "only transmitted tool-result copies are shortened")
+	assert.ok(packedResults.every((message: { content: string }) => isWellFormedUnicode(message.content)), "excerpt clipping never leaves a lone UTF-16 surrogate")
 	assert.equal(result.body.prompt_cache_key, cacheRoutingKey, "cache routing key remains stable")
 	assert.deepEqual(result.body.tools, tools, "tool schemas remain verbatim")
+}
+
+function isWellFormedUnicode(value: string): boolean {
+	for (let index = 0; index < value.length; index++) {
+		const code = value.charCodeAt(index)
+		if (code >= 0xd800 && code <= 0xdbff) {
+			const next = value.charCodeAt(index + 1)
+			if (!(next >= 0xdc00 && next <= 0xdfff)) return false
+			index++
+		} else if (code >= 0xdc00 && code <= 0xdfff) {
+			return false
+		}
+	}
+	return true
+}
+
+async function testRoleAwarePrefixKeepsUserOnlyAndMultipleSystemHistories(): Promise<void> {
+	const userOnly: LlmRequest["messages"] = [
+		{ role: "user", content: "initial user task without a system message" },
+		{ role: "assistant", content: null, tool_calls: [{ id: "user-only-call", type: "function", function: { name: "read_file", arguments: "{\"path\":\"large.txt\"}" } }] },
+		{ role: "tool", tool_call_id: "user-only-call", name: "read_file", content: "é🙂\\\"\n".repeat(1_500) },
+	]
+	const userOnlyResult = await captureChatRequest(
+		new OpenRouterClient({ apiKey: "synthetic", baseUrl: "http://mock", maxPromptBytes: 1_100 }),
+		{ model: "meta/muse-spark-1.3-contributor", messages: userOnly },
+	)
+	assert.deepEqual(userOnlyResult.body.messages[0], userOnly[0], "user-only history preserves its first task verbatim")
+	assert.equal(userOnlyResult.body.messages[1].tool_calls[0].id, "user-only-call", "user-only history keeps its assistant tool call")
+	assert.equal(userOnlyResult.body.messages[2].tool_call_id, "user-only-call", "user-only history keeps the corresponding result")
+	assert.ok(userOnlyResult.body.messages[2].content.includes("shortened to fit the request byte budget"), "the user-only result is clipped rather than split from its call")
+	assert.ok(isWellFormedUnicode(userOnlyResult.body.messages[2].content), "user-only Unicode excerpt remains well formed")
+
+	const multipleSystems: LlmRequest["messages"] = [
+		{ role: "system", content: "first system" },
+		{ role: "system", content: "second system with 🙂" },
+		{ role: "user", content: "first user task" },
+		{ role: "assistant", content: "older assistant turn" },
+		{ role: "assistant", content: null, tool_calls: [{ id: "latest-call", type: "function", function: { name: "read_file", arguments: "{\"path\":\"latest\"}" } }] },
+		{ role: "tool", tool_call_id: "latest-call", name: "read_file", content: "latest result" },
+	]
+	const multiSystemRequest: LlmRequest = { model: "meta/muse-spark-1.3-contributor", messages: multipleSystems }
+	const multiSystemBody = buildRequestBody(multiSystemRequest, multiSystemRequest.model)
+	const multiSystemLimit = Math.max(600, Buffer.byteLength(JSON.stringify({ ...multiSystemBody, messages: multipleSystems.slice(0, 4) }), "utf8"))
+	const multiSystemResult = await captureChatRequest(
+		new OpenRouterClient({ apiKey: "synthetic", baseUrl: "http://mock", maxPromptBytes: multiSystemLimit }),
+		multiSystemRequest,
+	)
+	assert.deepEqual(multiSystemResult.body.messages.slice(0, 3), multipleSystems.slice(0, 3), "all leading systems and the initial user stay verbatim")
+	assert.ok(multiSystemResult.body.messages.some((message: { tool_calls?: Array<{ id: string }> }) => message.tool_calls?.some((call) => call.id === "latest-call")), "latest complete group is retained when old history is removed")
 }
 
 async function testImpossiblePrefixAndInvalidBudgetsFailBeforeNetwork(): Promise<void> {
@@ -195,6 +247,20 @@ async function testImpossiblePrefixAndInvalidBudgetsFailBeforeNetwork(): Promise
 			return true
 		})
 		assert.equal(calls, 0, "an impossible required prefix makes no network request")
+		const incomplete: LlmRequest = {
+			model: "meta/muse-spark-1.3-contributor",
+			messages: [
+				{ role: "system", content: "system" },
+				{ role: "user", content: "task" },
+				{ role: "assistant", content: null, tool_calls: [
+					{ id: "partial-a", type: "function", function: { name: "read_file", arguments: "{}" } },
+					{ id: "missing-b", type: "function", function: { name: "read_file", arguments: "{}" } },
+				] },
+				{ role: "tool", tool_call_id: "partial-a", name: "read_file", content: "result-".repeat(500) },
+			],
+		}
+		await assert.rejects(new OpenRouterClient({ apiKey: "synthetic", maxPromptBytes: 900 }).createChatCompletion(incomplete), /incomplete/)
+		assert.equal(calls, 0, "an over-budget incomplete call/result group is rejected instead of orphaning a tool")
 		assert.equal(isRetryableOpenRouterError(new OpenRouterError("transport", undefined)), true, "ordinary transport failures remain retryable")
 	} finally { globalThis.fetch = originalFetch }
 }
@@ -213,13 +279,19 @@ async function testTranscriptSeparatesPackedWireMessagesFromOriginalHistory(): P
 	]
 	const original = JSON.stringify(messages)
 	try {
-		await captureChatRequest(new OpenRouterClient({ apiKey: "synthetic", baseUrl: "http://mock", maxPromptBytes: 900 }), { model: "meta/muse-spark-1.3-contributor", messages })
+		for (const stream of [false, true]) {
+			await captureChatRequest(new OpenRouterClient({ apiKey: "synthetic", baseUrl: "http://mock", maxPromptBytes: 900 }), { model: "meta/muse-spark-1.3-contributor", messages, stream })
+		}
 		const file = fs.readdirSync(scratch).find((entry) => entry.startsWith("openrouter-"))
 		assert.ok(file, "transcript was captured")
-		const record = JSON.parse(fs.readFileSync(path.join(scratch, file!), "utf8").trim())
-		assert.deepEqual(record.messages, record.wireRequest.messages, "transcript messages are the actual packed request view")
-		assert.deepEqual(record.originalMessages, messages, "the complete original engine history remains recorded")
-		assert.notEqual(JSON.stringify(record.messages), original, "packed transcript is distinguishable from full local evidence")
+		const records = fs.readFileSync(path.join(scratch, file!), "utf8").trim().split("\n").map((line) => JSON.parse(line))
+		assert.equal(records.length, 2, "streaming and non-streaming calls are both transcribed")
+		for (const record of records) {
+			assert.deepEqual(record.messages, record.wireRequest.messages, "transcript messages are the actual packed request view")
+			assert.deepEqual(record.originalMessages, messages, "the complete original engine history remains recorded")
+			assert.notEqual(JSON.stringify(record.messages), original, "packed transcript is distinguishable from full local evidence")
+		}
+		assert.equal(records.find((record) => record.wireRequest.stream === true)?.wireRequest.stream_options.include_usage, true, "stream transcript records the actual measured stream options")
 	} finally {
 		if (previous === undefined) delete process.env.HEADLESSCODE_CAPTURE_TRANSCRIPT_DIR
 		else process.env.HEADLESSCODE_CAPTURE_TRANSCRIPT_DIR = previous
@@ -897,6 +969,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["Muse qualification pins to Meta with fallbacks disabled", testMuseQualificationPinsOnlyMetaWithoutFallback],
 	["exact UTF-8 request boundary is enforced for streaming and non-streaming JSON", testExactUtf8WireBoundaryForStreamAndNonStream],
 	["oversized latest tool-call group is clipped without mutating original evidence", testOversizedLatestToolGroupIsClippedWithoutMutatingEvidence],
+	["role-aware prefixes preserve user-only and multiple-system histories", testRoleAwarePrefixKeepsUserOnlyAndMultipleSystemHistories],
 	["impossible prefixes and invalid byte budgets fail locally", testImpossiblePrefixAndInvalidBudgetsFailBeforeNetwork],
 	["transcripts preserve packed wire messages and original local history separately", testTranscriptSeparatesPackedWireMessagesFromOriginalHistory],
 	["OpenRouter response usage and generation billing metadata are preserved", testOpenRouterUsageCostAndGenerationMetadataAreMapped],

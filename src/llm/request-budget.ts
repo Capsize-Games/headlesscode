@@ -38,6 +38,7 @@ function validatePromptByteBudget(value: number, source: string): number {
 
 interface MessageGroup {
 	start: number
+	end: number
 	complete: boolean
 	toolCallGroup: boolean
 }
@@ -57,14 +58,26 @@ function messageGroups(messages: ChatMessage[], start: number): MessageGroup[] {
 				cursor++
 			}
 			if (expected.size > 0) complete = false
-			groups.push({ start: index, complete, toolCallGroup: true })
+			groups.push({ start: index, end: cursor, complete, toolCallGroup: true })
 			index = cursor
 			continue
 		}
-		groups.push({ start: index, complete: message.role !== "tool", toolCallGroup: false })
+		groups.push({ start: index, end: index + 1, complete: message.role !== "tool", toolCallGroup: false })
 		index++
 	}
 	return groups
+}
+
+function requiredPrefixLength(messages: ChatMessage[]): number {
+	let leadingSystems = 0
+	while (messages[leadingSystems]?.role === "system") leadingSystems++
+	const initialUser = messages.findIndex((message, index) => index >= leadingSystems && message.role === "user")
+	if (initialUser >= 0) {
+		const prefixEnd = initialUser + 1
+		const crossingGroup = messageGroups(messages, leadingSystems).find((group) => group.start < prefixEnd && group.end > prefixEnd)
+		return crossingGroup?.end ?? prefixEnd
+	}
+	return leadingSystems
 }
 
 function serializedCandidate(body: Record<string, unknown>, messages: ChatMessage[]): { body: Record<string, unknown>; json: string; bytes: number } {
@@ -87,7 +100,7 @@ export function packRequestBody(body: Record<string, unknown>, maxBytes: number)
 	const original = serializedCandidate(body, sourceMessages)
 	if (original.bytes <= maxBytes) return { ...original, evictedGroups: 0, truncatedToolResults: 0 }
 
-	const prefix = sourceMessages.slice(0, Math.min(2, sourceMessages.length))
+	const prefix = sourceMessages.slice(0, requiredPrefixLength(sourceMessages))
 	const prefixRequest = serializedCandidate(body, prefix)
 	if (prefixRequest.bytes > maxBytes) {
 		throw new PromptByteBudgetError(`OpenRouter required prompt, tools, and routing fields need ${prefixRequest.bytes} bytes, exceeding the ${maxBytes}-byte request budget`)
@@ -110,7 +123,13 @@ export function packRequestBody(body: Record<string, unknown>, maxBytes: number)
 		throw new PromptByteBudgetError(`OpenRouter required prompt and tools need ${original.bytes} bytes, exceeding the ${maxBytes}-byte request budget`)
 	}
 	const newest = groups[groups.length - 1]!
-	if (firstKeptGroup !== groups.length - 1 || !newest.complete || !newest.toolCallGroup) {
+	if (firstKeptGroup !== groups.length - 1) {
+		throw new PromptByteBudgetError(`OpenRouter newest complete conversation group cannot fit the ${maxBytes}-byte request budget without truncating non-tool content`)
+	}
+	if (!newest.complete) {
+		throw new PromptByteBudgetError("OpenRouter latest tool-call group is incomplete; refusing to repack a partial tool result group")
+	}
+	if (!newest.toolCallGroup) {
 		throw new PromptByteBudgetError(`OpenRouter newest complete conversation group cannot fit the ${maxBytes}-byte request budget without truncating non-tool content`)
 	}
 	const keptMessages = [...prefix, ...sourceMessages.slice(newest.start)]
