@@ -513,11 +513,12 @@ test("local-phase executor exposes read_file / list_files / codebase_search / at
 	const complete = await executor.execute("attempt_completion", { result: "done" })
 	assert.equal(complete.isError, false)
 	assert.ok(complete.content.includes("done"))
-	// codebase_search is registered (no index in the fixture → the actionable
-	// no-index error, NOT the "not implemented" stub).
+	// The same registered search handler offers a labeled lexical fallback
+	// when this fixture has no semantic index.
 	const search = await executor.execute("codebase_search", { query: "hello" })
-	assert.equal(search.isError, true)
-	assert.ok(search.content.includes("no codebase index found"), search.content)
+	assert.equal(search.isError, false, search.content)
+	assert.match(search.content, /lexical/i)
+	assert.match(search.content, /a\.txt/)
 
 	// Everything else is a stub — genuinely unavailable.
 	const unavailable = ["execute_command", "write_to_file", "apply_diff", "search_replace", "edit_file", "ask_followup_question"]
