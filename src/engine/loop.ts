@@ -48,6 +48,7 @@ import { randomUUID } from "node:crypto"
 import { BudgetExceededError, BudgetTracker, type SessionBudget } from "../budget/budget.js"
 import { loadPricingTable, mergeLivePrice, type ModelPrice, type PricingTable } from "../budget/cost.js"
 import { DEFAULT_MODEL, isRetryableOpenRouterError } from "../llm/openrouter.js"
+import { isRetryableMuseError } from "../llm/muse.js"
 import { DECISION_PROXY_ANSWER_PREFIX } from "../decision-proxy/proxy.js"
 import {
 	createHeadlessExecutor,
@@ -76,7 +77,19 @@ import { discoverSkills } from "../skills/registry.js"
 import type { SkillRegistry } from "../skills/registry.js"
 import { readEnabledSkillRoots } from "../skills/store.js"
 import { extractEmbeddedToolCall, parseToolCalls } from "./parser.js"
+import { McpHub } from "../vendor/zoo-code/src/services/mcp/McpHub.js"
 import {
+	editToolTargetPath,
+	isParallelReadOnlyCall,
+	isReadOnlyEquivalentShellCommand,
+	toolCallPathArg,
+} from "./tool-classes.js"
+// Re-exported: engine tests import the shell classifier from loop.js.
+export { isReadOnlyEquivalentShellCommand }
+import { normalizeMcpToolName } from "../vendor/zoo-code/src/utils/mcp-name.js"
+import { getMcpServerTools } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/mcp_server.js"
+import {
+	appendBatchTool,
 	appendBrowserActionTool,
 	appendCodeIntelEditTools,
 	appendCodeIntelTools,
@@ -88,6 +101,7 @@ import {
 	buildSystemPrompt,
 	isLeanSystemPromptEnabled,
 	loadCustomModes,
+	mcpToolsForMode,
 	modeHasEditGroup,
 	patchEditFileToolForLocalModels,
 	selectToolsForMode,
@@ -576,168 +590,13 @@ function artifactRejectionNudgeMessage(streak: number, relativePath: string): st
 	)
 }
 
+
 /**
- * Leading command names treated as read-only-equivalent by
- * isReadOnlyEquivalentShellCommand — every one of these inspects the
- * workspace without changing it. Deliberately an ALLOW-list (default "not
- * read-only" for anything unrecognized) rather than a deny-list of mutating
- * commands: a shell one-liner is too open-ended to safely enumerate every
- * way it could mutate something, so the safe default is to under-count
- * (miss a real read-only command occasionally) rather than over-count (wrongly
- * treat a mutation as exploration and never nudge). Low stakes either way —
- * this only feeds a SOFT, reversible nudge, never a block.
+ * Tool-call classification (S3 partition, edit-target extraction, the
+ * read-only shell classifier) lives in ./tool-classes.ts — shared with
+ * the `batch` meta-tool, which cannot import it from here without an
+ * import cycle back into the engine.
  */
-const READ_ONLY_SHELL_LEADING_COMMANDS = new Set([
-	"grep",
-	"egrep",
-	"fgrep",
-	"rg",
-	"ag",
-	"find",
-	"ls",
-	"cat",
-	"head",
-	"tail",
-	"wc",
-	"tree",
-	"pwd",
-	"echo",
-	"printf",
-	"stat",
-	"file",
-	"du",
-	"basename",
-	"dirname",
-	"realpath",
-	// A no-op — common as a `git status || true`-style fallback to suppress a
-	// read-only command's non-zero exit (e.g. `git log` in a fresh repo).
-	"true",
-])
-/** git/docker subcommands that only inspect state (vs. `git commit`, `docker up`, ...). */
-const READ_ONLY_GIT_SUBCOMMANDS = new Set(["log", "diff", "status", "show", "blame", "branch", "rev-parse", "remote"])
-const READ_ONLY_DOCKER_SUBCOMMANDS = new Set(["ps", "images", "logs", "inspect"])
-
-/**
- * Measured on a live round (issue: harness slowness investigation, 2026-08-08):
- * `execute_command` — NOT `read_file`/`list_files` — was the dominant
- * exploration tool by a wide margin (e.g. 37-48 execute_command calls per
- * session vs. 0-1 codebase_search calls), almost entirely ad hoc
- * grep/ls/sed/find one-liners doing the exact job `codebase_search` exists to
- * shortcut. The blind-tree-walking guardrail above never saw any of this
- * because `execute_command` wasn't in READ_ONLY_TOOL_NAMES — a long streak of
- * pure shell-grep exploration could run the entire session without ever
- * tripping the nudge. This classifier closes that gap: a `sed -n`/`cat`/`git
- * log`/`docker ps`-style command reads exactly like `read_file`/`list_files`
- * for this guardrail's purposes and should count the same way. Compound
- * commands (`&&`/`;`/`|`/newline-joined) count only if EVERY segment is
- * read-only — one mutating segment (a `git commit`, `docker compose up`, a
- * bare `>` redirect, `sed -i`) marks the whole command as NOT read-only.
- */
-export function isReadOnlyEquivalentShellCommand(command: string): boolean {
-	// `\|\|` MUST be tried before the bare `\|` alternative below it, or a
-	// `cmd || true` fallback splits into a stray `true` segment (not on the
-	// allow-list) and the whole command wrongly reads as mutating.
-	const segments = command.split(/\|\||&&|;|\||\n/).map((s) => s.trim())
-	if (segments.length === 0 || segments.every((s) => s === "")) {
-		return false
-	}
-	for (const segment of segments) {
-		if (segment === "") {
-			continue
-		}
-		// A bare `>`/`>>` writes a file; `2>&1`/`>&2` (fd-to-fd redirects) don't.
-		if (/(?<!\d)>>?(?!&)/.test(segment)) {
-			return false
-		}
-		const words = segment.split(/\s+/).filter(Boolean)
-		const head = words[0]
-		if (head === "cd") {
-			continue // a leading `cd x &&` is just a working-dir change, not itself an inspection
-		}
-		if (head === "sed") {
-			// `sed -n '...'` (print-only) is read-only; anything with `-i` is not.
-			if (words.includes("-i") || words.some((w) => w.startsWith("-i"))) {
-				return false
-			}
-			continue
-		}
-		if (head === "git") {
-			if (READ_ONLY_GIT_SUBCOMMANDS.has(words[1] ?? "")) {
-				continue
-			}
-			return false
-		}
-		if (head === "docker") {
-			// `docker compose ps/logs` vs. `docker compose up/down/build`.
-			const sub = words[1] === "compose" ? words[2] : words[1]
-			if (READ_ONLY_DOCKER_SUBCOMMANDS.has(sub ?? "")) {
-				continue
-			}
-			return false
-		}
-		if (READ_ONLY_SHELL_LEADING_COMMANDS.has(head ?? "")) {
-			continue
-		}
-		return false
-	}
-	return true
-}
-
-/**
-	* (S3) Tool names that are safe to run CONCURRENTLY with their siblings in a
-	* single turn: plain read/exploration tools with no shared mutable state.
-	* `execute_command` is additionally gated per-call by
-	* isReadOnlyEquivalentShellCommand (see isParallelReadOnlyCall).
-	*/
-const PARALLEL_READ_ONLY_TOOL_NAMES = new Set([
-	"read_file",
-	"list_files",
-	"search_files",
-	// TS code-intelligence reads (src/codeintel/) — read-only, executor-side.
-	"outline",
-	"go_to_definition",
-	"find_references",
-	"import_graph",
-])
-
-/**
-	* (S3) Whether a call may run concurrently with the turn's other read-only
-	* calls. Only pure reads qualify: the tools above, plus an execute_command
-	* whose shell command is read-only-equivalent. Everything else — any
-	* edit-capable call, switch_mode / ask_followup_question / new_task (the
-	* single decision-marker protocol), or anything ambiguous — is serial.
-	* A read_file whose path collides with a file an edit call in this turn
-	* modifies is ALSO serial: the model composed that read against the file's
-	* state at its position in the turn, so submission order must be preserved
-	* (a read-then-edit must see pre-edit content; an edit-then-read must see
-	* post-edit content).
-	*/
-function isParallelReadOnlyCall(
-	workspaceRoot: string,
-	call: { name: string; args: Record<string, unknown> },
-	editedPaths: ReadonlySet<string>,
-): boolean {
-	if (call.name === "execute_command") {
-		return typeof call.args.command === "string" && isReadOnlyEquivalentShellCommand(call.args.command)
-	}
-	if (!PARALLEL_READ_ONLY_TOOL_NAMES.has(call.name)) {
-		return false
-	}
-	if (call.name === "read_file") {
-		const raw = typeof call.args.path === "string" && call.args.path.trim() !== "" ? call.args.path : undefined
-		if (raw !== undefined) {
-			try {
-				if (editedPaths.has(path.resolve(workspaceRoot, raw))) {
-					return false
-				}
-			} catch {
-				// Unresolvable path: fall through — a parallel read is harmless.
-			}
-		}
-	}
-	return true
-}
-
 /**
 	* Same-file multi-edit diagnosis (see the tool-execution loop): when the
  * model submits several edit calls to the SAME file in ONE turn, the later
@@ -749,9 +608,6 @@ function isParallelReadOnlyCall(
  */
 const SAME_FILE_BATCH_DIAGNOSIS =
 	"\n\n<diagnosis>this file was already edited by an earlier tool call in this same turn — your SEARCH text may have been composed against the file's content BEFORE that edit. Re-read the file to get its current state, or next time include both changes as separate SEARCH/REPLACE blocks in ONE apply_diff call.</diagnosis>"
-
-/** Edit tools whose args name a target file (for the same-file batch diagnosis). */
-const BATCH_EDIT_TOOL_NAMES = new Set(["apply_diff", "search_replace", "edit_file", "write_to_file", "set_indentation"])
 
 /**
  * Best-effort extraction of the file path an edit tool call targets, for the
@@ -783,38 +639,6 @@ export function stripSupersededReasoning(messages: ChatMessage[]): void {
 			messages[i].reasoning = undefined
 		}
 	}
-}
-
-/**
- * Best-effort absolute path for ANY tool call's `path`/`file_path` arg —
- * factored out of editToolTargetPath (below) so the repeated-tool-failure
- * guardrail (issue #146) can recognize a `read_file` call as re-diagnosis
- * of the SAME target a different, currently-failing tool is acting on
- * (read_file isn't in BATCH_EDIT_TOOL_NAMES, so editToolTargetPath alone
- * never resolves it).
- */
-function toolCallPathArg(workspaceRoot: string, call: { args: Record<string, unknown> }): string | undefined {
-	const raw =
-		typeof call.args.path === "string" && call.args.path.trim() !== ""
-			? call.args.path
-			: typeof call.args.file_path === "string" && call.args.file_path.trim() !== ""
-				? call.args.file_path
-				: undefined
-	if (raw === undefined) {
-		return undefined
-	}
-	try {
-		return path.resolve(workspaceRoot, raw)
-	} catch {
-		return undefined
-	}
-}
-
-function editToolTargetPath(workspaceRoot: string, call: { name: string; args: Record<string, unknown> }): string | undefined {
-	if (!BATCH_EDIT_TOOL_NAMES.has(call.name)) {
-		return undefined
-	}
-	return toolCallPathArg(workspaceRoot, call)
 }
 
 /**
@@ -1043,7 +867,7 @@ export interface HeadlessSessionConfig {
 	maxModeSwitches?: number
 	/** Mode slug, default 'code' (built-in or from .roomodes). */
 	mode?: string
-	/** Model id; default env OPENROUTER_MODEL or 'deepseek/deepseek-v4-flash-0731'. */
+	/** Model id; default env OPENROUTER_MODEL or 'meta/muse-spark-1.3-contributor'. */
 	model?: string
 	taskText: string
 	maxIterations?: number
@@ -1600,6 +1424,7 @@ export class HeadlessSession {
 	private readonly onMessage?: (message: ChatMessage) => void
 	private readonly llmClient: LlmClient
 	private readonly executor: ToolExecutor
+	private mcpHub: McpHub | undefined
 	private readonly logger: Logger
 	private skillRegistry: SkillRegistry | undefined
 	private readonly activatedSkills = new Set<string>()
@@ -2049,6 +1874,16 @@ export class HeadlessSession {
 	 * task-level outcomes (LLM errors are returned as `status: "error"`).
 	 */
 	async run(): Promise<SessionResult> {
+		try {
+			return await this.runInner()
+		} finally {
+			// Also covers setup failures before runIterations installs its teardown.
+			await this.mcpHub?.dispose()
+			this.mcpHub = undefined
+		}
+	}
+
+	private async runInner(): Promise<SessionResult> {
 		const { workspaceRoot, mode, model } = this.config
 		if (!this.skillRegistry) {
 			let enabledRoots: string[] = []
@@ -2071,6 +1906,25 @@ export class HeadlessSession {
 		// resolution (avoid re-reading .roomodes per delegation).
 		const customModes = this.config.customModes ?? (await loadCustomModes(workspaceRoot))
 		this.customModes = customModes
+		// An explicit tools list is an allowlist (used by QA and review sessions).
+		// Those restricted sessions must not gain configured MCP capabilities.
+		if (this.config.tools === undefined) {
+			this.mcpHub = await McpHub.connect()
+			for (const error of this.mcpHub.getConnectionErrors()) {
+				this.logger.warn("[mcp] server unavailable", { error })
+			}
+			for (const tool of getMcpServerTools(this.mcpHub)) {
+				const functionName = tool.function.name
+				const handler = (args: Record<string, unknown>, ctx: ToolContext) =>
+					this.mcpHub?.callFunctionTool(functionName, args, ctx.signal).then(
+						(content) => ({ content, isError: false }),
+						(error: unknown) => ({ content: `[MCP error] ${String(error)}`, isError: true }),
+					) ?? { content: "MCP connection is unavailable", isError: true }
+				this.executor.register(functionName, handler)
+				const normalizedName = normalizeMcpToolName(functionName)
+				if (normalizedName !== functionName) this.executor.register(normalizedName, handler)
+			}
+		}
 		const buildPrompt = isLeanSystemPromptEnabled() ? buildLeanSystemPrompt : buildSystemPrompt
 		const systemPrompt =
 			this.config.systemPromptOverride ??
@@ -2079,6 +1933,7 @@ export class HeadlessSession {
 				mode,
 				customModes,
 				globalCustomInstructions: this.config.globalCustomInstructions,
+				mcpHub: this.mcpHub,
 				skills: this.skillRegistry?.skills,
 			})).prompt
 		// browser_action, describe_image and the code-intelligence tools are
@@ -2093,6 +1948,8 @@ export class HeadlessSession {
 		// list matches what actually works for the project (and read-only
 		// sessions don't carry a describe_image schema they'd error on).
 		let tools = this.config.tools ?? selectToolsForMode(mode, customModes)
+		const modeConfig = getModeBySlug(mode, customModes) ?? modes.find((item) => item.slug === mode) ?? modes[0]
+		if (this.config.tools === undefined) tools = [...tools, ...mcpToolsForMode(this.mcpHub, modeConfig)]
 		if (this.executor.has("browser_action")) {
 			tools = appendBrowserActionTool(tools)
 		}
@@ -2110,6 +1967,9 @@ export class HeadlessSession {
 		}
 		if (this.executor.has("set_indentation")) {
 			tools = appendSetIndentationTool(tools)
+		}
+		if (this.executor.has("batch")) {
+			tools = appendBatchTool(tools)
 		}
 		if ((this.skillRegistry?.skills.length ?? 0) > 0) tools = appendSkillTool(tools)
 		if (this.config.patchLocalToolSchemas) {
@@ -2251,6 +2111,8 @@ export class HeadlessSession {
 			// applyBackgroundCondense).
 			this.sessionEnded = true
 			this.executor.dispose()
+			await this.mcpHub?.dispose()
+			this.mcpHub = undefined
 		}
 		// (S2) "Session ended" implies "aux writes flushed": drain the background
 		// chain before returning so post-run readers see the final feed/snapshot
@@ -3894,7 +3756,10 @@ export class HeadlessSession {
 				try {
 					response = await this.callMainLlm(requestMessages, iteration, repeatPenaltyOverride, excludedToolNames)
 				} catch (firstAttemptError) {
-					if (!isRetryableOpenRouterError(firstAttemptError)) {
+					// Retryable classification is per cloud provider (each
+					// client classifies its own error type; a foreign error
+					// is never retryable by the other classifier).
+					if (!isRetryableOpenRouterError(firstAttemptError) && !isRetryableMuseError(firstAttemptError)) {
 						throw firstAttemptError
 					}
 					this.logger.warn("[loop] main LLM call failed with a retryable provider error, retrying once", {
@@ -4958,6 +4823,138 @@ export class HeadlessSession {
 			// mistake accounting — in assistant.tool_calls order regardless of
 			// execution order.
 			const executed = new Map<number, { resultContent: string; isError: boolean }>()
+			const recordNestedBatchTool = async (
+				name: string,
+				args: Record<string, unknown>,
+				resultContent: string,
+				isError: boolean,
+				outerIndex: number,
+				subIndex: number,
+			): Promise<void> => {
+				const syntheticCall: ParsedToolCall = {
+					id: `batch_${iteration}_${outerIndex}_${subIndex}`,
+					name,
+					args,
+					rawArguments: JSON.stringify(args),
+				}
+				toolCalls++
+				if (
+					name === "execute_command" || name === "write_to_file" ||
+					name === "edit_file" || name === "set_indentation"
+				) hasCalledArtifactTool = true
+				if (name === "execute_command") {
+					lastExecuteCommandFailed = isError
+					if (isError) {
+						const command = summarizeToolArg(name, args) ?? "(unknown command)"
+						lastExecuteCommandSummary = `${command}\n${resultContent.slice(0, 500)}`
+					} else lastExecuteCommandSummary = undefined
+				}
+				if (name === "edit_file" || name === "write_to_file" || name === "set_indentation") {
+					lastWriteToolFailed = isError
+					if (isError) {
+						const target = summarizeToolArg(name, args) ?? "(unknown target)"
+						lastWriteToolSummary = `${name} ${target}\n${resultContent.slice(0, 500)}`
+						lastWriteToolFailedTarget = toolCallPathArg(this.config.workspaceRoot, syntheticCall)
+					} else {
+						lastWriteToolSummary = undefined
+						lastWriteToolFailedTarget = undefined
+						writeFailedClearedByReReadOnly = false
+						reReadClearedWriteSummary = undefined
+					}
+				}
+				if (name === "read_file" && !isError && lastWriteToolFailed) {
+					const readTarget = toolCallPathArg(this.config.workspaceRoot, syntheticCall)
+					if (readTarget !== undefined && readTarget === lastWriteToolFailedTarget) {
+						lastWriteToolFailed = false
+						reReadClearedWriteSummary = lastWriteToolSummary
+						lastWriteToolSummary = undefined
+						lastWriteToolFailedTarget = undefined
+						writeFailedClearedByReReadOnly = true
+					}
+				}
+				const targetPath = editToolTargetPath(this.config.workspaceRoot, syntheticCall)
+				if (!isError && targetPath !== undefined) {
+					batchEditedPaths.set(targetPath, name)
+					this.sessionWrittenPaths.add(targetPath)
+				}
+				boundaryTools.push({
+					id: syntheticCall.id,
+					name,
+					arguments: Object.freeze({ ...args }),
+					isError,
+					result: resultContent,
+					...(isError ? { normalizedError: resultContent.split("\n", 1)[0]?.slice(0, 200) ?? "tool_error" } : {}),
+				})
+				await this.checkPauseRequested(budgetTracker)
+			}
+			const dispatchBatchSubcall = async (
+				name: string,
+				args: Record<string, unknown>,
+				subIndex: number,
+				outerIndex: number,
+			): Promise<ToolResult> => {
+				const actionId = `batch_${iteration}_${outerIndex}_${subIndex}`
+				const actionIndex = `${iteration}_${outerIndex}_${subIndex}`
+				const acknowledged = await this.appendEvidence({
+					sessionId: this.sessionId,
+					requestId: `${this.evidenceRunId}_tool_intent_${actionIndex}`,
+					actionId,
+					iteration,
+					kind: "tool_intent",
+					actor: "headlesscode-loop",
+					origin: "batch-tool-call",
+					payload: { name, arguments: args, parentTool: "batch", parentIndex: outerIndex, subIndex },
+				})
+				let result: ToolResult
+				if (!acknowledged) {
+					result = { content: `[Error] ${this.evidenceFault ?? "required evidence intent was not acknowledged"}; tool was not executed.`, isError: true }
+				} else if (this.stopSignal?.aborted) {
+					result = { content: "[Error] Session stopped by supervisor before tool execution.", isError: true }
+				} else if (this.evidenceFault && this.evidenceRequired) {
+					result = { content: `[Error] ${this.evidenceFault}; later tool effects were blocked.`, isError: true }
+				} else {
+					const summary = summarizeToolArg(name, args) ?? ""
+					const truncated = summary.length > EVENT_TRUNCATE_CHARS
+					this.scheduleAux(() => this.emitEvent("tool_call", () => this.eventFeed.toolCall({
+						iteration,
+						tool: name,
+						callId: `${this.evidenceRunId}:${iteration}:${outerIndex}:batch:${subIndex}`,
+						commandIdentity: name === "execute_command" && typeof args.command === "string" ? sha256(args.command) : undefined,
+						args: truncated ? summary.slice(0, EVENT_TRUNCATE_CHARS) : summary,
+						argsTruncated: truncated,
+					}), { iteration, tool: name }))
+					result = await this.executor.execute(name, args)
+				}
+				let content = result.content
+				let isError = result.isError
+				if (acknowledged && !(await this.appendEvidence({
+					sessionId: this.sessionId,
+					requestId: `${this.evidenceRunId}_tool_result_${actionIndex}`,
+					actionId,
+					iteration,
+					kind: "tool_result",
+					actor: "headlesscode-loop",
+					origin: "tool-executor",
+					payload: { tool: name, isError, result: content, parentTool: "batch", parentIndex: outerIndex, subIndex },
+				}))) {
+					content = `${content}\n[Evidence error] ${this.evidenceFault}; later tool effects were blocked.`
+					isError = true
+				}
+				await recordNestedBatchTool(name, args, content, isError, outerIndex, subIndex)
+				this.scheduleAux(() => this.emitEvent("tool_result", () => {
+					const preview = truncateField(content)
+					return this.eventFeed.toolResult({
+						iteration,
+						tool: name,
+						callId: `${this.evidenceRunId}:${iteration}:${outerIndex}:batch:${subIndex}`,
+						commandIdentity: name === "execute_command" && typeof args.command === "string" ? sha256(args.command) : undefined,
+						isError,
+						result: preview.text,
+						resultTruncated: preview.truncated,
+					})
+				}, { iteration, tool: name, isError }))
+				return { content, isError }
+			}
 			const runCall = async (call: ParsedToolCall, index: number): Promise<void> => {
 				let resultContent: string
 				let isError: boolean
@@ -5010,7 +5007,16 @@ export class HeadlessSession {
 						"[Error] attempt_completion was not accepted: it was called alongside other tool calls in the same turn, so it was refused and your other calls ran for real instead — check their results below (including any errors) before deciding the task is actually done. Re-issue attempt_completion ALONE, as the only tool call in its own turn, once you've verified the real outcome."
 					isError = true
 				} else {
-					const result = await this.executor.execute(call.name, call.args)
+					const result = await this.executor.execute(
+						call.name,
+						call.args,
+						call.name === "batch"
+							? {
+								dispatchBatchSubcall: (name, args, subIndex) => dispatchBatchSubcall(name, args, subIndex, index),
+								serializeBatchSubcalls: this.evidenceRequired,
+							}
+							: undefined,
+					)
 					resultContent = result.content
 					isError = result.isError
 				}
@@ -5852,6 +5858,9 @@ export class HeadlessSession {
 		// whole session, costing a full-prompt cache miss after every such
 		// switch. When the tool set differs, rebuild the prompt as before.
 		let newTools = this.config.tools ?? selectToolsForMode(modeSlug, this.customModes)
+		const targetModeConfig =
+			getModeBySlug(modeSlug, this.customModes) ?? modes.find((item) => item.slug === modeSlug) ?? modes[0]
+		if (this.config.tools === undefined) newTools = [...newTools, ...mcpToolsForMode(this.mcpHub, targetModeConfig)]
 		// Same executor.gated non-vendored appends as run() — see the comment
 		// there (T2/T3: a session never carries a schema its executor can't run).
 		if (this.executor.has("browser_action")) {
@@ -5871,6 +5880,9 @@ export class HeadlessSession {
 		}
 		if (this.executor.has("set_indentation")) {
 			newTools = appendSetIndentationTool(newTools)
+		}
+		if (this.executor.has("batch")) {
+			newTools = appendBatchTool(newTools)
 		}
 		if ((this.skillRegistry?.skills.length ?? 0) > 0) newTools = appendSkillTool(newTools)
 		if (this.config.patchLocalToolSchemas) {
@@ -5902,6 +5914,7 @@ export class HeadlessSession {
 				mode: modeSlug,
 				customModes: this.customModes,
 				globalCustomInstructions: this.config.globalCustomInstructions,
+				mcpHub: this.mcpHub,
 				skills: this.skillRegistry?.skills,
 			})
 			this.state.systemPrompt = built.prompt

@@ -40,6 +40,7 @@ import {
 } from "./cli.js"
 import { recordAllSessionCosts, recordGroupCost } from "./cost-history.js"
 import { resolveModelForMode } from "../config/mode-models.js"
+import { resolveLlmProviderOrReport } from "../llm/muse.js"
 import { runQaWithRetries } from "../qa/qa.js"
 import { HARNESS_ROOT, parseReviewResult, runReviewWithRetries, type ReviewResult } from "./reviewer.js"
 import { loadStateSync, patchGroup, type OrchestratorGroup, type OrchestratorState } from "./state.js"
@@ -1632,6 +1633,11 @@ export async function reviewMain(argv: string[], io: ResumeIo = {}): Promise<num
 		writeOut(REVIEW_USAGE)
 		return 0
 	}
+	// Fail loudly on a typo'd HEADLESSCODE_LLM_PROVIDER before any review
+	// session constructs its client (which would otherwise throw mid-run).
+	if (resolveLlmProviderOrReport(writeErr) === undefined) {
+		return 2
+	}
 	if (!options.repo) {
 		writeErr(`headlesscode orchestrate review: --repo <path> is required\n\n${REVIEW_USAGE}`)
 		return 2
@@ -1757,6 +1763,11 @@ export async function reworkMain(argv: string[], io: ResumeIo = {}): Promise<num
 		writeOut(REWORK_USAGE)
 		return 0
 	}
+	// Fail loudly on a typo'd HEADLESSCODE_LLM_PROVIDER before any rework
+	// session constructs its client (which would otherwise throw mid-run).
+	if (resolveLlmProviderOrReport(writeErr) === undefined) {
+		return 2
+	}
 	if (!options.repo) {
 		writeErr(`headlesscode orchestrate rework: --repo <path> is required\n\n${REWORK_USAGE}`)
 		return 2
@@ -1845,6 +1856,11 @@ export async function resumeMain(argv: string[], io: ResumeIo = {}): Promise<num
 	if (options.help) {
 		writeOut(RESUME_USAGE)
 		return 0
+	}
+	// Fail loudly on a typo'd HEADLESSCODE_LLM_PROVIDER before any resumed
+	// session constructs its client (which would otherwise throw mid-run).
+	if (resolveLlmProviderOrReport(writeErr) === undefined) {
+		return 2
 	}
 	if (!options.repo) {
 		writeErr(`headlesscode orchestrate resume: --repo <path> is required\n\n${RESUME_USAGE}`)

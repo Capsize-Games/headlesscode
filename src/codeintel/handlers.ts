@@ -1,10 +1,15 @@
 /**
- * Tool handlers for the four code-intelligence tools (`outline`,
- * `go_to_definition`, `find_references`, `import_graph`).
+ * Tool handlers for the original four code-intelligence tools (`outline`,
+ * `go_to_definition`, `find_references`, `import_graph`) — plus the shared
+ * handler helpers (`ok`, `err`, the arg parsers, `resolveTarget`,
+ * `intelFor`, `readStandalone`) imported by the newer per-tool modules
+ * (`get_diagnostics`, `type_at_position`, `call_hierarchy`,
+ * `workspace_symbol`, `find_implementations`), which keep their analyzer,
+ * handler, and schema together as one vertical slice each.
  *
  * Thin layer over the shared analysis module (src/codeintel/program.ts +
  * the per-tool analyzers): argument parsing, path safety, the "not supported
- * for this file type" honesty rule, and result formatting. All four share ONE
+ * for this file type" honesty rule, and result formatting. All nine share ONE
  * cached `ts.Program` per workspace root — see program.ts for the caching +
  * mtime-invalidation contract.
  *
@@ -27,15 +32,15 @@ import { findReferences, formatReferences } from "./find-references.js"
 import { formatImportGraph, getImportGraph } from "./import-graph.js"
 import { formatRenameResult, renameSymbol } from "./rename-symbol.js"
 
-function ok(content: string): ToolResult {
+export function ok(content: string): ToolResult {
 	return { content, isError: false }
 }
 
-function err(content: string): ToolResult {
+export function err(content: string): ToolResult {
 	return { content: `[Error] ${content}`, isError: true }
 }
 
-function requireStringArg(args: Record<string, unknown>, key: string, tool: string): string {
+export function requireStringArg(args: Record<string, unknown>, key: string, tool: string): string {
 	const v = args[key]
 	if (typeof v !== "string" || v.trim() === "") {
 		throw new Error(`${tool}: missing or invalid string argument '${key}' (got ${JSON.stringify(v)})`)
@@ -43,7 +48,7 @@ function requireStringArg(args: Record<string, unknown>, key: string, tool: stri
 	return v
 }
 
-function optionalStringArg(args: Record<string, unknown>, key: string): string | undefined {
+export function optionalStringArg(args: Record<string, unknown>, key: string): string | undefined {
 	const v = args[key]
 	if (v === undefined || v === null) {
 		return undefined
@@ -55,7 +60,7 @@ function optionalStringArg(args: Record<string, unknown>, key: string): string |
 }
 
 /** Parse a 1-based line (required) or column (optional); invalid → throw/undefined. */
-function lineArg(args: Record<string, unknown>, tool: string): number {
+export function lineArg(args: Record<string, unknown>, tool: string): number {
 	const v = args["line"]
 	const n = typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN
 	if (!Number.isInteger(n) || n < 1) {
@@ -64,7 +69,7 @@ function lineArg(args: Record<string, unknown>, tool: string): number {
 	return n
 }
 
-function optionalCharacterArg(args: Record<string, unknown>): number | undefined {
+export function optionalCharacterArg(args: Record<string, unknown>): number | undefined {
 	const v = args["character"]
 	const n = typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN
 	if (Number.isInteger(n) && n >= 1) {
@@ -74,7 +79,7 @@ function optionalCharacterArg(args: Record<string, unknown>): number | undefined
 }
 
 /** Path-safety-checked absolute target + existence/type/support validation. */
-function resolveTarget(ctx: ToolContext, tool: string, p: string): string {
+export function resolveTarget(ctx: ToolContext, tool: string, p: string): string {
 	const target = resolveWithinWorkspace(ctx.workspaceRoot, p)
 	const rel = path.relative(ctx.workspaceRoot, target).split(path.sep).join("/") || path.basename(target)
 
@@ -96,7 +101,7 @@ function resolveTarget(ctx: ToolContext, tool: string, p: string): string {
 }
 
 /** The cached program intel for a workspace (load-or-reuse). */
-function intelFor(ctx: ToolContext) {
+export function intelFor(ctx: ToolContext) {
 	return getCodeIntelCache(ctx.workspaceRoot).get()
 }
 
@@ -181,7 +186,7 @@ export function importGraphHandler(args: Record<string, unknown>, ctx: ToolConte
 }
 
 /** Parse a source file standalone (for files created after program load). */
-function readStandalone(file: string): ts.SourceFile | undefined {
+export function readStandalone(file: string): ts.SourceFile | undefined {
 	const text = ts.sys.readFile(file)
 	if (text === undefined) {
 		return undefined

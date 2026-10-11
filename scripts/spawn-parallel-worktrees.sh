@@ -55,7 +55,9 @@
 #                        project store's mode-models.json
 #                        (~/.local/share/headlesscode/projects/<key>/ — see
 #                        src/project-store.ts) via src/config/mode-models.ts,
-#                        falling back to $OPENROUTER_MODEL which then flows
+#                        falling back to the provider default-model var
+#                        ($OPENROUTER_MODEL, or $HEADLESSCODE_MUSE_MODEL under
+#                        HEADLESSCODE_LLM_PROVIDER=muse) which then flows
 #                        to run-worker.sh)
 #   PLAN_FIRST           when set (e.g. PLAN_FIRST=1), run a SHORT
 #                        architect-mode planning session in each worktree
@@ -222,12 +224,13 @@ merge_state() {
 }
 
 # ── Per-mode model resolution ────────────────────────────────────────────────
-# Resolve the OpenRouter model id for a worktree's harness mode via the REAL
+# Resolve the model id for a worktree's harness mode via the REAL
 # TypeScript logic (src/config/mode-models.ts, resolveModelForMode) — never a
 # bash reimplementation. Precedence (documented in mode-models.ts): an
 # explicit SPAWN_MODEL override -> the CENTRAL project store's
-# mode-models.json[mode] -> ...["_default"] -> $OPENROUTER_MODEL -> empty (the
-# CLI's own default).
+# mode-models.json[mode] -> ...["_default"] -> the provider default-model
+# env var ($OPENROUTER_MODEL, or $HEADLESSCODE_MUSE_MODEL under
+# HEADLESSCODE_LLM_PROVIDER=muse) -> empty (the CLI's own default).
 #
 # The config lives in the central store keyed by $REPO_ROOT's git-common-dir
 # (src/project-store.ts) — resolved from $REPO_ROOT, and every worktree of the

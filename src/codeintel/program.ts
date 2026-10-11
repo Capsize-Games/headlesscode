@@ -1,6 +1,8 @@
 /**
  * Shared TypeScript program loading for the code-intelligence tools
- * (`outline`, `go_to_definition`, `find_references`, `import_graph`).
+ * (`outline`, `go_to_definition`, `find_references`, `import_graph`,
+ * `get_diagnostics`, `type_at_position`, `call_hierarchy`,
+ * `workspace_symbol`, `find_implementations`).
  *
  * All four tools need the same foundational capability — parse the target
  * workspace's real TypeScript source respecting its actual `tsconfig.json`

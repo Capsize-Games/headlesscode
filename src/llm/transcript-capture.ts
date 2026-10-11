@@ -34,8 +34,8 @@ export function isTranscriptCaptureEnabled(env: NodeJS.ProcessEnv = process.env)
 }
 
 export interface TranscriptContext {
-	/** "ollama" | "openrouter" — which client made this call. */
-	provider: "ollama" | "openrouter"
+	/** "ollama" | "openrouter" | "muse" — which client made this call. */
+	provider: "ollama" | "openrouter" | "muse"
 	/** Resolved model id actually used for the call. */
 	model: string
 	/** Session/task identifiers, when the caller has them, purely for later

@@ -72,8 +72,8 @@ history is reconstructable after the fact.
   `{"answer": "..."}` or `{"uncertain": true}`. Anything else parses as
   malformed → errored.
 - **Transient-failure resilience**: retry the same one-shot prompt once
-  (`MAX_PROXY_LLM_ATTEMPTS = 2`) and cap output at 4096 tokens. A reasoning
-  model (the default `deepseek/deepseek-v4-flash-0731`) can return HTTP 200 with
+  (`MAX_PROXY_LLM_ATTEMPTS = 2`) and cap output at 4096 tokens. The reasoning
+  model tested (`deepseek/deepseek-v4-flash-0731`) can return HTTP 200 with
   empty final content when its reasoning eats the output budget — measured
   2/5 live calls empty at 400 tokens, 0/4 at 4096. Empty errors carry a
   reasoning-vs-no-content diagnostic.

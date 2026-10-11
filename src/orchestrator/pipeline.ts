@@ -36,6 +36,7 @@ import { HeadlessSession } from "../engine/loop.js"
 import { Logger } from "../engine/logger.js"
 import { OpenRouterClient } from "../llm/openrouter.js"
 import { OllamaClient } from "../llm/ollama.js"
+import { MuseClient, providerDefaultModel, resolveLlmProvider } from "../llm/muse.js"
 import { loadCustomModes, selectToolsForMode } from "../engine/prompt.js"
 import { createHeadlessExecutor } from "../tools/executor.js"
 import { resolvePerModeEnv } from "../cli.js"
@@ -120,9 +121,13 @@ export interface FilingStageResult {
 
 // ─── LLM client resolution (mirrors reviewer.ts) ─────────────────────────────
 
-function resolveStageClient(mode: string, model?: string, llmClient?: LlmClient): LlmClient {
+function resolveStageClient(
+	mode: string,
+	model?: string,
+	llmClient?: LlmClient,
+): { client: LlmClient; model: string | undefined } {
 	if (llmClient) {
-		return llmClient
+		return { client: llmClient, model }
 	}
 	const useLocalBackend =
 		process.env.HEADLESSCODE_CODE_MODE_BACKEND === "ollama" &&
@@ -132,18 +137,34 @@ function resolveStageClient(mode: string, model?: string, llmClient?: LlmClient)
 			.filter(Boolean)
 			.includes(mode)
 	if (useLocalBackend) {
-		return new OllamaClient({
-			baseUrl: resolvePerModeEnv("HEADLESSCODE_OLLAMA_URL", mode),
-			defaultModel: resolvePerModeEnv("HEADLESSCODE_CODE_MODE_MODEL", mode) ?? model,
-			// OllamaClient has its own independent abort timer (ollama.ts's
-			// DEFAULT_OLLAMA_TIMEOUT_MS, 300s) — see cli.ts's
-			// LOCAL_LLM_TIMEOUT_MS doc comment (verified live 2026-08-28)
-			// for why local sessions need this raised past the shim's own
-			// 600s upstream patience.
-			timeoutMs: 630_000,
-		})
+		const localModel = resolvePerModeEnv("HEADLESSCODE_CODE_MODE_MODEL", mode) ?? model
+		return {
+			client: new OllamaClient({
+				baseUrl: resolvePerModeEnv("HEADLESSCODE_OLLAMA_URL", mode),
+				defaultModel: localModel,
+				// OllamaClient has its own independent abort timer (ollama.ts's
+				// DEFAULT_OLLAMA_TIMEOUT_MS, 300s) — see cli.ts's
+				// LOCAL_LLM_TIMEOUT_MS doc comment (verified live 2026-08-28)
+				// for why local sessions need this raised past the shim's own
+				// 600s upstream patience.
+				timeoutMs: 630_000,
+			}),
+			model: localModel,
+		}
 	}
-	return new OpenRouterClient({ apiKey: process.env.HEADLESSCODE_OPENROUTER_API_KEY, defaultModel: model })
+	// Cloud provider for this stage (openrouter default, "muse" for Meta's
+	// Model API). The Muse default is resolved eagerly (see
+	// providerDefaultModel) — an undefined model would fall back to an
+	// OpenRouter id inside HeadlessSession.
+	const provider = resolveLlmProvider()
+	const cloudModel = model ?? providerDefaultModel(provider)
+	return {
+		client:
+			provider === "muse"
+				? new MuseClient({ defaultModel: cloudModel })
+				: new OpenRouterClient({ apiKey: process.env.HEADLESSCODE_OPENROUTER_API_KEY, defaultModel: model }),
+		model: cloudModel,
+	}
 }
 
 function buildLogger(workspaceRoot: string, label: string): Logger {
@@ -204,16 +225,17 @@ export async function runResearchStage(options: ResearchStageOptions): Promise<R
 	// can actually be created.
 	const executor = createHeadlessExecutor(workspaceRoot)
 
+	const stageClient = resolveStageClient(mode, model, llmClient)
 	const session = new HeadlessSession({
 		workspaceRoot,
 		mode,
-		model,
+		model: stageClient.model,
 		taskText: options.taskText ?? defaultResearchTaskText(workspaceRoot, artifactPathPattern),
 		maxIterations,
 		tools,
 		executor,
 		customModes,
-		llmClient: resolveStageClient(mode, model, llmClient),
+		llmClient: stageClient.client,
 		logger: buildLogger(workspaceRoot, "research"),
 		// Structural guarantee: the research stage REQUIRES a real artifact
 		// on disk before attempt_completion is accepted.
@@ -302,16 +324,17 @@ export async function runFilingStage(options: FilingStageOptions): Promise<Filin
 	const tools = selectToolsForMode(mode, customModes)
 	const executor = createHeadlessExecutor(workspaceRoot)
 
+	const stageClient = resolveStageClient(mode, model, llmClient)
 	const session = new HeadlessSession({
 		workspaceRoot,
 		mode,
-		model,
+		model: stageClient.model,
 		taskText,
 		maxIterations,
 		tools,
 		executor,
 		customModes,
-		llmClient: resolveStageClient(mode, model, llmClient),
+		llmClient: stageClient.client,
 		logger: buildLogger(workspaceRoot, "filer"),
 	})
 

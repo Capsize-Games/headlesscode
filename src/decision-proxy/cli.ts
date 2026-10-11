@@ -18,6 +18,13 @@ import * as fsp from "node:fs/promises"
 import * as path from "node:path"
 
 import { OpenRouterClient } from "../llm/openrouter.js"
+import {
+	META_MODEL_API_KEY_ENV,
+	MUSE_API_KEY_ENV,
+	MuseClient,
+	providerDefaultModel,
+	resolveLlmProviderOrReport,
+} from "../llm/muse.js"
 import { Logger } from "../engine/logger.js"
 import {
 	DECISION_PROXY_LOG_FILE,
@@ -51,10 +58,11 @@ Options:
                         task_file (read from .worktrees/.orchestrator-state.json)
   --task-file <path>    Read the original task from this file (relative to
                         --workspace), verbatim
-  --model <id>          OpenRouter model id for answers (default: the
+  --model <id>          Model id for answers (default: the
                         _decision-proxy key in
                         <workspace>/.headlesscode/mode-models.json, else
-                        mode/_default/OPENROUTER_MODEL/client default)
+                        mode/_default/the provider default-model env var /
+                        client default)
   --poll-interval-ms <n>  Marker poll interval (default:
                         $HEADLESSCODE_DECISION_PROXY_POLL_INTERVAL_MS or 5000)
   --llm-timeout-ms <n>  Per-answer LLM abort timeout, ms (default:
@@ -67,6 +75,9 @@ Environment:
   HEADLESSCODE_DECISION_PROXY       Required: "1"/"true" enables the proxy
   HEADLESSCODE_OPENROUTER_API_KEY   Required (real LLM answers)
   OPENROUTER_MODEL                  Default model id
+  HEADLESSCODE_LLM_PROVIDER         Cloud provider: "openrouter" (default) or "muse" (Meta Model API)
+  HEADLESSCODE_MUSE_API_KEY         Meta Model API key (MODEL_API_KEY also honored); required with provider "muse"
+  HEADLESSCODE_MUSE_MODEL           Default model id with provider "muse" (default muse-spark-1.3)
   HEADLESSCODE_DECISION_PROXY_POLL_INTERVAL_MS  Poll interval, ms (default 5000)
   HEADLESSCODE_DECISION_PROXY_LLM_TIMEOUT_MS    Per-answer timeout, ms (default 60000)
 
@@ -209,19 +220,35 @@ export async function decisionProxyMain(argv: string[]): Promise<number> {
 		return 2
 	}
 
-	const apiKey = process.env.HEADLESSCODE_OPENROUTER_API_KEY
+	// Cloud provider for the proxy's LLM (openrouter default, "muse" for
+	// Meta's Model API). Validated before the key gate so a typo'd
+	// HEADLESSCODE_LLM_PROVIDER exits 2 here, not as a throw mid-run.
+	const provider = resolveLlmProviderOrReport()
+	if (provider === undefined) {
+		return 2
+	}
+
+	const apiKey =
+		provider === "muse"
+			? (process.env[MUSE_API_KEY_ENV] ?? process.env[META_MODEL_API_KEY_ENV])
+			: process.env.HEADLESSCODE_OPENROUTER_API_KEY
 	if (!apiKey) {
 		process.stderr.write(
-			"decision-proxy: HEADLESSCODE_OPENROUTER_API_KEY is not set — the proxy needs a real LLM to answer questions.\n",
+			provider === "muse"
+				? `decision-proxy: ${MUSE_API_KEY_ENV} (or ${META_MODEL_API_KEY_ENV}) is not set — the proxy needs a real LLM to answer questions.\n`
+				: "decision-proxy: HEADLESSCODE_OPENROUTER_API_KEY is not set — the proxy needs a real LLM to answer questions.\n",
 		)
 		return 2
 	}
 
 	// Model resolution: an explicit --model always wins; otherwise the
 	// `_decision-proxy` key in mode-models.json (consulted first, like
-	// `_condensation`), then mode/_default/OPENROUTER_MODEL/client default.
+	// `_condensation`), then mode/_default/the provider's default-model env
+	// var/client default (rule 4 is provider-aware inside
+	// resolveModelForMode). The Muse default is resolved eagerly (see
+	// providerDefaultModel).
 	const model =
-		options.model ?? resolveDecisionProxyModel(workspaceRoot, process.env) ?? undefined
+		options.model ?? resolveDecisionProxyModel(workspaceRoot, process.env) ?? providerDefaultModel(provider)
 
 	const logFile = options.logFile ? path.resolve(options.logFile) : path.join(workspaceRoot, DECISION_PROXY_LOG_FILE)
 	try {
@@ -231,7 +258,10 @@ export async function decisionProxyMain(argv: string[]): Promise<number> {
 	}
 	const logger = new Logger({ level: "info", filePath: logFile })
 
-	const client = new OpenRouterClient({ apiKey, defaultModel: model })
+	const client =
+		provider === "muse"
+			? new MuseClient({ apiKey, defaultModel: model })
+			: new OpenRouterClient({ apiKey, defaultModel: model })
 
 	const proxyOptions: DecisionProxyOptions = {
 		workspaceRoot,

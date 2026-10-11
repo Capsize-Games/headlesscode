@@ -34,6 +34,8 @@ import { createCheckpointService } from "../../checkpoints/service.js"
 import { parseToolCall } from "../parser.js"
 import { readUsageFile } from "../usage.js"
 import { reportFilePath } from "../reports.js"
+import type { EvidenceInput, EvidenceJournal, EvidenceReceipt } from "../../evidence/types.js"
+import type { ToolExecutor } from "../../tools/executor.js"
 import type { SessionBudget } from "../../budget/budget.js"
 import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } from "../types.js"
 
@@ -210,6 +212,9 @@ async function makeSession(options: {
 	requireArtifactPathPattern?: string
 	requireArtifactMinCitations?: number
 	requireArtifactSections?: string[]
+	evidenceJournal?: EvidenceJournal
+	evidenceRequired?: boolean
+	executor?: ToolExecutor
 	maxModeSwitches?: number
 	autoApproveModeSwitch?: boolean
 	recursionDepth?: number
@@ -221,6 +226,7 @@ async function makeSession(options: {
 		model: "fake-model",
 		taskText: options.task,
 		llmClient: options.client,
+		executor: options.executor,
 		maxIterations: options.maxIterations ?? 10,
 		consecutiveErrorLimit: options.consecutiveErrorLimit ?? 3,
 		windowSize: options.windowSize ?? 40,
@@ -234,6 +240,8 @@ async function makeSession(options: {
 		requireArtifactPathPattern: options.requireArtifactPathPattern,
 		requireArtifactMinCitations: options.requireArtifactMinCitations,
 		requireArtifactSections: options.requireArtifactSections,
+		evidenceJournal: options.evidenceJournal,
+		evidenceRequired: options.evidenceRequired,
 		maxModeSwitches: options.maxModeSwitches,
 		autoApproveModeSwitch: options.autoApproveModeSwitch,
 		recursionDepth: options.recursionDepth,
@@ -627,6 +635,85 @@ async function testVerifyBeforeCompletionRefusesAfterFailedCommand(): Promise<vo
 			(m) => m.role === "tool" && (m.content ?? "").includes("was NOT accepted"),
 		)
 		assert.ok(nudge, "expected a nudge telling the model its last command failed")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testNestedBatchFailureStillBlocksCompletion(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc-batch-"))
+	try {
+		await fs.writeFile(path.join(ws, "notes.txt"), "verified read\n", "utf-8")
+		const client = new FakeLlmClient([
+			() => toolCall("batch", { calls: [
+				{ tool: "execute_command", args: { command: "exit 1" } },
+				{ tool: "read_file", args: { path: "notes.txt" } },
+			] }),
+			() => toolCall("attempt_completion", { result: "Done (but the nested command failed)." }),
+			() => toolCall("execute_command", { command: "true" }),
+			() => toolCall("attempt_completion", { result: "Done for real." }),
+		])
+		const session = await makeSession({
+			task: "verify batch failures",
+			client,
+			workspaceRoot: ws,
+			verifyBeforeCompletion: true,
+			executor: createHeadlessExecutor(ws),
+		})
+		const result = await session.run()
+		assert.equal(result.status, "success")
+		assert.equal(result.result, "Done for real.")
+		assert.equal(client.requests.length, 4, "completion after a failed nested command must be refused")
+		assert.ok(session.state.messages.some((message) => message.role === "tool" && (message.content ?? "").includes("most recent command you ran ended in an error")))
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testNestedBatchResultAckFailureStopsLaterEffects(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-evidence-batch-"))
+	const journal: EvidenceJournal = {
+		append: async (record: EvidenceInput): Promise<EvidenceReceipt> => {
+			const payload = typeof record.payload === "object" && record.payload !== null
+				? record.payload as Record<string, unknown>
+				: {}
+			if (record.kind === "tool_result" && payload.tool === "write_to_file") {
+				throw new Error("nested result ACK unavailable")
+			}
+			return {
+				schemaVersion: 1,
+				sessionId: record.sessionId,
+				requestId: record.requestId,
+				sequence: 1,
+				recordDigest: "0".repeat(64),
+				inputDigest: "test",
+				keyId: "test",
+				signature: "test",
+			}
+		},
+	}
+	try {
+		const client = new FakeLlmClient([
+			() => toolCall("batch", {
+				stop_on_error: true,
+				calls: [
+					{ tool: "write_to_file", args: { path: "first.txt", content: "first" } },
+					{ tool: "write_to_file", args: { path: "second.txt", content: "second" } },
+				],
+			}),
+		])
+		const session = await makeSession({
+			task: "exercise nested action ACKs",
+			client,
+			workspaceRoot: ws,
+			evidenceJournal: journal,
+			evidenceRequired: true,
+			executor: createHeadlessExecutor(ws),
+		})
+		const result = await session.run()
+		assert.equal(result.status, "error")
+		assert.equal(await fs.readFile(path.join(ws, "first.txt"), "utf-8"), "first")
+		await assert.rejects(fs.access(path.join(ws, "second.txt")), { code: "ENOENT" })
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -4087,6 +4174,14 @@ const tests: Array<[string, () => Promise<void>]> = [
 	[
 		"verifyBeforeCompletion: attempt_completion is refused when the last execute_command failed",
 		testVerifyBeforeCompletionRefusesAfterFailedCommand,
+	],
+	[
+		"verifyBeforeCompletion: a failed nested command remains visible after a successful nested read",
+		testNestedBatchFailureStillBlocksCompletion,
+	],
+	[
+		"required evidence: a missing nested batch result ACK blocks later batch effects",
+		testNestedBatchResultAckFailureStopsLaterEffects,
 	],
 	[
 		"verifyBeforeCompletion: attempt_completion is accepted right away after a successful execute_command",

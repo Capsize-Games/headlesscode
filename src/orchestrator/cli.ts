@@ -48,6 +48,14 @@ import { clearHandoffSummary, readHandoffSummary } from "../engine/handoff.js"
 import { autoSplitOversizedIssues, proposeSemanticSplit } from "./auto-split.js"
 import { DEFAULT_MODEL, OpenRouterClient } from "../llm/openrouter.js"
 import {
+	DEFAULT_MUSE_MODEL,
+	MUSE_MODEL_ENV,
+	MuseClient,
+	providerDefaultModel,
+	resolveLlmProvider,
+	resolveLlmProviderOrReport,
+} from "../llm/muse.js"
+import {
 	buildStatusSummary,
 	formatStatusText,
 	isTerminalStatus,
@@ -71,7 +79,7 @@ import { resolveModelForMode } from "../config/mode-models.js"
 import { openshellPreflight } from "../cloud/openshell-preflight.js"
 import { resolveContainedRuntimeProfile, resolveSecurityProfile, serializeResolvedContainedProfile, securityProfileDescription, type ContainedRuntimeProfile, type SecurityProfileName } from "../security/profile.js"
 import { containedControlSocketDirectory, containedControlStateDirectory, containedEvidenceSessionId, loadContainedSupervisorRuntime, validateContainedSupervisorRoots } from "../security/supervisor.js"
-import { runPreflight, runLocalPreflight, type PreflightResult, type LocalPreflightResult } from "../llm/preflight.js"
+import { runPreflight, runLocalPreflight, runMusePreflight, type PreflightResult, type LocalPreflightResult } from "../llm/preflight.js"
 import { resolvePerModeEnv } from "../cli.js"
 
 const ORCHESTRATE_USAGE = `headlesscode orchestrate — Phase 2 parallel round
@@ -95,7 +103,8 @@ Options:
                          (beats .headlesscode/mode-models.json entries). Without
                          it, each role resolves its OWN model from the file:
                          worker mode / --review-mode / --qa-mode
-                         (default: $OPENROUTER_MODEL or the client default)
+                         (default: $OPENROUTER_MODEL or the client default;
+                         $HEADLESSCODE_MUSE_MODEL under HEADLESSCODE_LLM_PROVIDER=muse)
   --batch <name>         Batch id recorded in the state file (default: round-<date>)
   --review-mode <slug>   Mode slug used for review sessions (default: deepseek-reviewer)
   --no-review            Spawn + watch only; do not run the reviewer
@@ -1655,7 +1664,7 @@ export interface BuildSpawnEnvOptions {
 	planFirstMode?: string
 	/** Iteration cap for the plan-first session (default: 15). */
 	planFirstMaxIterations?: number
-	/** Env to read OPENROUTER_MODEL from (default: process.env). */
+	/** Env to read the provider + default-model var from (default: process.env). */
 	env?: NodeJS.ProcessEnv
 }
 
@@ -1663,10 +1672,10 @@ export interface BuildSpawnEnvOptions {
  * Resolve the worker's model and build the env for the initial spawnSync
  * (step 2 of orchestrateMain). Exported for tests: this is the fix for
  * "mode-models.json ignored on a worker's FIRST spawn" — the resolved model
- * is threaded into the spawn env as OPENROUTER_MODEL (which the spawner
- * script and run-worker.sh inherit), instead of only applying on rework
- * re-spawns. The returned workerModel is the SAME const the rework loop
- * reuses later.
+ * is threaded into the spawn env as OPENROUTER_MODEL (HEADLESSCODE_MUSE_MODEL
+ * under HEADLESSCODE_LLM_PROVIDER=muse), which the spawner script and
+ * run-worker.sh inherit, instead of only applying on rework re-spawns. The
+ * returned workerModel is the SAME const the rework loop reuses later.
  */
 export function buildSpawnEnv(options: BuildSpawnEnvOptions): { env: NodeJS.ProcessEnv; workerModel: string | undefined } {
 	const workerModel = resolveModelForMode({
@@ -1675,14 +1684,18 @@ export function buildSpawnEnv(options: BuildSpawnEnvOptions): { env: NodeJS.Proc
 		explicitModel: options.explicitModel,
 		env: options.env ?? process.env,
 	})
+	const provider = resolveLlmProvider(options.env ?? process.env)
 	const env: NodeJS.ProcessEnv = {
 		...(options.env ?? process.env),
 		TARGET_REPO: options.repo,
 		ORCHESTRATOR_MODE: options.mode,
 		HEADLESSCODE_EXECUTION_PROVIDER: options.executionProvider ?? process.env.HEADLESSCODE_EXECUTION_PROVIDER ?? "local",
 		// The resolved worker model must reach the spawner (and the workers it
-		// launches) — same pattern as HEADLESSCODE_PROJECT below.
-		...(workerModel ? { OPENROUTER_MODEL: workerModel } : {}),
+		// launches) — same pattern as HEADLESSCODE_PROJECT below. Exported to
+		// the PROVIDER's default-model var: the spawn script re-resolves via
+		// resolveModelForMode (whose rule 4 shadows OPENROUTER_MODEL under
+		// "muse"), so exporting a muse id as OPENROUTER_MODEL would strand it.
+		...(workerModel ? (provider === "muse" ? { [MUSE_MODEL_ENV]: workerModel } : { OPENROUTER_MODEL: workerModel }) : {}),
 		// Phase 3: workers scope memory to the REPO (not the worktree) and
 		// share one memory dir. HEADLESSCODE_PROJECT flows to the worker CLI
 		// which passes it as the session `project`; the env var is inherited
@@ -2481,6 +2494,11 @@ export async function pipelineMain(argv: string[]): Promise<number> {
 		process.stderr.write(`headlesscode pipeline: --workspace <path> is required\n\n${PIPELINE_USAGE}`)
 		return 2
 	}
+	// Fail loudly on a typo'd HEADLESSCODE_LLM_PROVIDER before burning any
+	// stage work (stage clients would otherwise throw mid-round).
+	if (resolveLlmProviderOrReport() === undefined) {
+		return 2
+	}
 
 	const workspaceRoot = path.resolve(options.workspace)
 	process.stdout.write(`headlesscode pipeline: running research stage (mode researcher, artifact gate ON)...\n`)
@@ -2566,6 +2584,16 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	}
 	if (!options.repo) {
 		process.stderr.write(`headlesscode orchestrate: --repo <path> is required\n\n${ORCHESTRATE_USAGE}`)
+		return 2
+	}
+	// Cloud provider for this round (openrouter default, "muse" for Meta's
+	// Model API). Validated once here so a typo'd HEADLESSCODE_LLM_PROVIDER
+	// exits 2 before any preflight/spawn work; reused below for the
+	// auto-split client, dry-run preview, and preflight selection. Workers
+	// inherit the provider through the spawn env and validate it again in
+	// their own CLI entry.
+	const provider = resolveLlmProviderOrReport()
+	if (provider === undefined) {
 		return 2
 	}
 
@@ -2657,8 +2685,11 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 		const warnings = issueSizeWarnings(issues)
 		const ownerRepo = options.autoSplit && !options.issuesJson && !options.dryRun ? originOwnerRepo(repo) : undefined
 		if (warnings.length > 0 && ownerRepo) {
-			const model = options.model ?? DEFAULT_MODEL
-			const llmClient = new OpenRouterClient({ apiKey: process.env.HEADLESSCODE_OPENROUTER_API_KEY })
+			const model = options.model ?? providerDefaultModel(provider) ?? DEFAULT_MODEL
+			const llmClient =
+				provider === "muse"
+					? new MuseClient()
+					: new OpenRouterClient({ apiKey: process.env.HEADLESSCODE_OPENROUTER_API_KEY })
 			const { issues: split, outcomes } = await autoSplitOversizedIssues(issues, warnings, {
 				proposeSplit: (issue) => proposeSemanticSplit(issue, llmClient, model),
 				createIssue: (issue) => createGhIssue(repo, ownerRepo, issue),
@@ -2767,11 +2798,12 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 	if (options.dryRun) {
 		// Per-mode model assignment: resolve each role's model exactly like a
 		// real round so the dry-run preview shows the effective model per role
-		// (mode-models.json / _default / OPENROUTER_MODEL; explicit --model
-		// always wins). undefined -> the OpenRouter client's built-in default.
+		// (mode-models.json / _default / the provider's default-model env var;
+		// explicit --model always wins). undefined -> the provider client's
+		// built-in default.
 		const previewModel = (mode: string): string =>
 			resolveModelForMode({ workspaceRoot: repo, mode, explicitModel: options.model, env: process.env }) ??
-			"deepseek/deepseek-v4-flash-0731 (client default)"
+			`${provider === "muse" ? DEFAULT_MUSE_MODEL : DEFAULT_MODEL} (client default)`
 		// Issue #16: estimate the round's expected cost/iterations from
 		// recorded cost history, keyed by issue shape. Advisory only — a
 		// history read failure must never fail the dry-run, just omit the
@@ -2886,11 +2918,15 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 				})
 				const maxCostRaw = process.env.HEADLESSCODE_MAX_COST_USD
 				const maxCostUsd = maxCostRaw !== undefined && maxCostRaw !== "" ? Number(maxCostRaw) : undefined
-				preflightProbe = await runPreflight({
-					model: workerModelForProbe,
+				const probeOptions = {
+					model: workerModelForProbe ?? providerDefaultModel(provider),
 					workerSessions: specs.length,
 					maxCostUsd: maxCostUsd !== undefined && Number.isFinite(maxCostUsd) && maxCostUsd > 0 ? maxCostUsd : undefined,
-				})
+				}
+				// Probe whichever cloud provider the workers will actually use
+				// — a Muse round must not gate on an OpenRouter key it will
+				// never touch (same lesson as the local-backend branch above).
+				preflightProbe = provider === "muse" ? await runMusePreflight(probeOptions) : await runPreflight(probeOptions)
 			}
 		} catch (err) {
 			// Neither probe throws by contract, but if either ever does the
@@ -2916,11 +2952,11 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 
 	// 1c. Per-mode model assignment for the WORKER'S FIRST SPAWN. This must
 	// resolve BEFORE step 2's spawnSync: the spawner script (and through it
-	// run-worker.sh) inherits OPENROUTER_MODEL from the environment, so a
-	// mode-models.json entry for the worker's mode would otherwise be silently
-	// ignored on the first attempt (it only kicked in on rework re-spawns).
-	// resolveModelForMode's own precedence holds here: an explicit --model
-	// flag beats the config file, which beats OPENROUTER_MODEL.
+	// run-worker.sh) inherits the provider's default-model var from the
+	// environment, so a mode-models.json entry for the worker's mode would
+	// otherwise be silently ignored on the first attempt (it only kicked in
+	// on rework re-spawns). resolveModelForMode's own precedence holds here:
+	// an explicit --model flag beats the config file, which beats the env var.
 	const { env: spawnEnv, workerModel } = buildSpawnEnv({
 		repo,
 		mode: options.mode,

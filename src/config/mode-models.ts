@@ -15,10 +15,18 @@
  *      deliberate manual override.
  *   2. `mode-models.json[mode]`.
  *   3. `mode-models.json["_default"]`.
- *   4. `env.OPENROUTER_MODEL`.
- *   5. `undefined` — the caller's OpenRouter client then falls back to its
- *      own built-in default (`DEFAULT_MODEL` in src/llm/openrouter.ts),
- *      which stays the single source of truth for the ultimate default.
+ *   4. The provider's default-model env var: `env.OPENROUTER_MODEL`, except
+ *      under `HEADLESSCODE_LLM_PROVIDER=muse`, where it is
+ *      `env.HEADLESSCODE_MUSE_MODEL` and `OPENROUTER_MODEL` is shadowed
+ *      (it holds OpenRouter `provider/model` ids, which are never valid
+ *      Meta Model API ids — letting one leak through would fail every call
+ *      with a provider-side 404).
+ *   5. `undefined` — the caller's client then falls back to its own
+ *      built-in default (`DEFAULT_MODEL` in src/llm/openrouter.ts, or
+ *      `DEFAULT_MUSE_MODEL` in src/llm/muse.ts), which stays the single
+ *      source of truth for the ultimate fallback. (Session entry points
+ *      resolve the Muse default eagerly instead — see providerDefaultModel
+ *      in src/llm/muse.ts for why `undefined` can't flow through there.)
  *
  * Non-model `_`-prefixed keys extend the same file: `_condensation` assigns
  * a cheaper model for the context-condensation call (consulted via extraKeys
@@ -36,6 +44,7 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 
 import { resolveProjectDataDir } from "../project-store.js"
+import { LLM_PROVIDER_ENV, MUSE_MODEL_ENV } from "../llm/muse.js"
 
 /** Config file basename inside the central project data dir. */
 export const MODE_MODELS_CONFIG_FILE = "mode-models.json"
@@ -57,7 +66,7 @@ export interface ResolveModelOptions {
 	mode: string
 	/** An explicit `--model` flag value, if the caller passed one. Always wins. */
 	explicitModel?: string
-	/** Env to read OPENROUTER_MODEL from (default: process.env). */
+	/** Env to read HEADLESSCODE_LLM_PROVIDER + the default-model var from (default: process.env). */
 	env?: NodeJS.ProcessEnv
 	/**
 	 * Optional EXTRA config keys consulted BEFORE the mode entry (e.g.
@@ -134,9 +143,8 @@ export function loadModeModelsFile(workspaceRoot: string): ModeModelsFile | null
 /**
  * Resolve the model id to use for one session, per the precedence rules in
  * the file header. Returns `undefined` when nothing more specific is
- * configured — the caller's OpenRouter client then applies its own built-in
- * default, keeping `DEFAULT_MODEL` in src/llm/openrouter.ts the single
- * source of truth for the ultimate fallback.
+ * configured — the caller's client then applies its own built-in default,
+ * keeping that default the single source of truth for the ultimate fallback.
  */
 export function resolveModelForMode(options: ResolveModelOptions): string | undefined {
 	const { workspaceRoot, mode, explicitModel, extraKeys, env = process.env } = options
@@ -160,7 +168,13 @@ export function resolveModelForMode(options: ResolveModelOptions): string | unde
 		}
 	}
 
-	const envModel = env.OPENROUTER_MODEL
+	// Rule 4 is provider-aware (see the header): under "muse" the
+	// default-model slot reads HEADLESSCODE_MUSE_MODEL and OPENROUTER_MODEL
+	// is shadowed. A typo'd HEADLESSCODE_LLM_PROVIDER fails loudly at
+	// session start (resolveLlmProvider in src/llm/muse.ts); here any
+	// non-"muse" value simply takes the OpenRouter branch.
+	const provider = (env[LLM_PROVIDER_ENV] ?? "").trim().toLowerCase()
+	const envModel = provider === "muse" ? env[MUSE_MODEL_ENV] : env.OPENROUTER_MODEL
 	return envModel === undefined || envModel === "" ? undefined : envModel
 }
 
