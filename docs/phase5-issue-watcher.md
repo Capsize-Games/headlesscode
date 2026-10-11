@@ -275,6 +275,14 @@ put the token directly in the unit file, command line, or logs. Do not copy a
 machine's model-provider credential to another machine; provision credentials
 for each runner through the deployment's approved secret mechanism.
 
+In runner-pool mode, the watcher removes GitHub token and GitHub App signing
+environment variables from the spawned worker environment. This is credential
+environment filtering, not an operating-system isolation boundary: a local
+worker runs as the same user and may still read files, `gh` CLI authentication,
+or other credentials available to that account. Keep supervisor credentials
+out of worker-readable locations, or run workers under an account or contained
+profile that does not have access to them.
+
 For example, after cloning and installing dependencies on a node, configure
 the service to use a distinct id and assignee:
 
@@ -284,8 +292,10 @@ ExecStart=/usr/bin/npx --prefix /opt/headlesscode tsx /opt/headlesscode/src/cli.
 
 Set `HEADLESSCODE_RUNNER_ID` and `HEADLESSCODE_RUNNER_ASSIGNEE` instead of the
 two flags if those values belong in the protected environment file. Give the
-workstation a different runner id. Keep one watcher process per runner id;
-the watcher takes an exclusive lock under `$XDG_STATE_HOME/headlesscode` (or
+workstation a different runner id. Keep one runner-pool watcher per machine;
+the per-machine cap cannot be coordinated by two local watcher processes with
+different runner ids. The watcher takes an exclusive lock under
+`$XDG_STATE_HOME/headlesscode` (or
 `~/.local/state/headlesscode`) and refuses to remove a stale lock
 automatically. If a claim expires, first verify the old process groups are
 absent on the original machine. If the machine cannot be inspected, leave the

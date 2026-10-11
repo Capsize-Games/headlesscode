@@ -885,25 +885,9 @@ export function defaultSpawn(batch: SpawnBatch, config: Pick<WatcherConfig, "mod
 	// `bash -c <command>` (NOT spawnSync("bash", [command], { shell: true }),
 	// which would run `bash bash <script> …` and die — same gotcha the
 	// orchestrator CLI documents).
-	const childEnv = { ...process.env }
-	if (config.runnerId) {
-		// Claim credentials belong to the watcher supervisor. Agent prompts and
-		// tools must not inherit the token that can move the shared claim refs.
-		delete childEnv.GH_TOKEN
-		delete childEnv.GITHUB_TOKEN
-	}
 	const result = spawnSync("bash", ["-c", command], {
 		cwd: batch.repoRoot,
-		env: {
-			...childEnv,
-			TARGET_REPO: batch.repoRoot,
-			ORCHESTRATOR_MODE: config.mode ?? "code",
-			HEADLESSCODE_EXECUTION_PROVIDER: config.executionProvider ?? process.env.HEADLESSCODE_EXECUTION_PROVIDER ?? "local",
-			HEADLESSCODE_AGENT_EXECUTOR: batch.executor,
-			HEADLESSCODE_NATIVE_MUSE_MODEL: batch.museModel ?? "",
-			HEADLESSCODE_PROJECT: path.basename(batch.repoRoot),
-			...(config.memoryDir ? { HEADLESSCODE_MEMORY_DIR: path.resolve(config.memoryDir) } : {}),
-		},
+		env: buildWorkerSpawnEnvironment(batch, config),
 		stdio: "inherit",
 	})
 
@@ -918,6 +902,42 @@ export function defaultSpawn(batch: SpawnBatch, config: Pick<WatcherConfig, "mod
 			result.error !== undefined
 				? `spawn script failed to launch: ${result.error.message}`
 				: `spawn script exited ${result.status}`,
+	}
+}
+
+const GITHUB_AUTH_ENV = [
+	"GH_TOKEN",
+	"GITHUB_TOKEN",
+	"GH_ENTERPRISE_TOKEN",
+	"GITHUB_ENTERPRISE_TOKEN",
+	"GITHUB_APP_ID",
+	"GITHUB_APP_PRIVATE_KEY",
+	"GITHUB_APP_PRIVATE_KEY_PATH",
+	"GITHUB_APP_INSTALLATION_ID",
+] as const
+
+/** Construct the exact inherited environment passed to the worker spawner. */
+export function buildWorkerSpawnEnvironment(
+	batch: SpawnBatch,
+	config: Pick<WatcherConfig, "mode" | "memoryDir" | "executionProvider" | "runnerId">,
+	baseEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+	const childEnv: NodeJS.ProcessEnv = { ...baseEnv }
+	if (config.runnerId) {
+		// The pool's GitHub credentials belong to the watcher. The worker must
+		// not inherit either token environment variables or App signing material
+		// that could mint an equivalent installation token.
+		for (const name of GITHUB_AUTH_ENV) delete childEnv[name]
+	}
+	return {
+		...childEnv,
+		TARGET_REPO: batch.repoRoot,
+		ORCHESTRATOR_MODE: config.mode ?? "code",
+		HEADLESSCODE_EXECUTION_PROVIDER: config.executionProvider ?? baseEnv.HEADLESSCODE_EXECUTION_PROVIDER ?? "local",
+		HEADLESSCODE_AGENT_EXECUTOR: batch.executor,
+		HEADLESSCODE_NATIVE_MUSE_MODEL: batch.museModel ?? "",
+		HEADLESSCODE_PROJECT: path.basename(batch.repoRoot),
+		...(config.memoryDir ? { HEADLESSCODE_MEMORY_DIR: path.resolve(config.memoryDir) } : {}),
 	}
 }
 

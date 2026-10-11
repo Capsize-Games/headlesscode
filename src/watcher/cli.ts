@@ -432,17 +432,7 @@ export async function watchMain(argv: string[]): Promise<number> {
 	try {
 		if (options.runnerId) {
 			const stateHome = path.resolve(process.env.XDG_STATE_HOME ?? path.join(os.homedir(), ".local", "state"))
-			const lockDir = path.join(stateHome, "headlesscode")
-			await fs.mkdir(lockDir, { recursive: true, mode: 0o700 })
-			lockPath = path.join(lockDir, `runner-${options.runnerId}.lock`)
-			try {
-				const lock = await fs.open(lockPath, "wx", 0o600)
-				await lock.writeFile(`${JSON.stringify({ pid: process.pid, runnerId: options.runnerId, startedAt: new Date().toISOString() })}\n`)
-				await lock.close()
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`runner ${options.runnerId} already has a watcher lock at ${lockPath}; verify its process before removing a stale lock`)
-				throw error
-			}
+			lockPath = await acquireRunnerPoolLock(stateHome, options.runnerId)
 		}
 		result = await watchIssues({
 			owner: options.owner,
@@ -506,4 +496,29 @@ export async function watchMain(argv: string[]): Promise<number> {
 	}
 	process.stdout.write(`[watch] done: ${result.spawned} batch(es) spawned\n`)
 	return 0
+}
+
+/**
+ * Enforce one pool watcher per local state home. Capacity is machine-scoped,
+ * so locking only by runnerId would let two IDs on one host each consume the
+ * full cap independently.
+ */
+export async function acquireRunnerPoolLock(stateHome: string, runnerId: string): Promise<string> {
+	const lockDir = path.join(path.resolve(stateHome), "headlesscode")
+	await fs.mkdir(lockDir, { recursive: true, mode: 0o700 })
+	const lockPath = path.join(lockDir, "runner-pool.lock")
+	let lock: Awaited<ReturnType<typeof fs.open>> | undefined
+	try {
+		lock = await fs.open(lockPath, "wx", 0o600)
+		await lock.writeFile(`${JSON.stringify({ pid: process.pid, runnerId, startedAt: new Date().toISOString() })}\n`)
+		await lock.close()
+		return lockPath
+	} catch (error) {
+		await lock?.close().catch(() => undefined)
+		if (lock && (error as NodeJS.ErrnoException).code !== "EEXIST") await fs.rm(lockPath, { force: true }).catch(() => undefined)
+		if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+			throw new Error(`a runner-pool watcher already has a lock at ${lockPath}; verify its process before removing a stale lock`)
+		}
+		throw error
+	}
 }

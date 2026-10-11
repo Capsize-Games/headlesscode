@@ -16,7 +16,7 @@ import type { GitHubIssue } from "../github.js"
 interface FakeInit { method?: string; body?: string }
 interface FakeCommit { sha: string; message: string; tree: { sha: string }; parents: Array<{ sha: string }> }
 
-function claimApi(): { fetch: typeof fetch; commits: Map<string, FakeCommit>; refs: Map<string, string>; failAssignment: { value: boolean } } {
+function claimApi(): { fetch: typeof fetch; commits: Map<string, FakeCommit>; refs: Map<string, string>; failAssignment: { value: boolean }; commitReads: { value: number } } {
 	const defaultSha = "a".repeat(40)
 	const treeSha = "b".repeat(40)
 	const commits = new Map<string, FakeCommit>([[defaultSha, {
@@ -25,6 +25,7 @@ function claimApi(): { fetch: typeof fetch; commits: Map<string, FakeCommit>; re
 	const refs = new Map<string, string>([["heads/main", defaultSha]])
 	let serial = 0
 	const failAssignment = { value: false }
+	const commitReads = { value: 0 }
 	const fake = async (input: unknown, init?: unknown): Promise<Response> => {
 		const url = new URL(typeof input === "string" ? input : String((input as { url?: unknown }).url ?? ""))
 		const method = (init as FakeInit | undefined)?.method ?? "GET"
@@ -46,6 +47,7 @@ function claimApi(): { fetch: typeof fetch; commits: Map<string, FakeCommit>; re
 			return sha ? reply(200, { object: { sha, type: "commit" } }) : reply(404, { message: "Not Found" })
 		}
 		if (method === "GET" && route.startsWith("git/commits/")) {
+			commitReads.value++
 			const commit = commits.get(route.slice("git/commits/".length))
 			return commit ? reply(200, commit) : reply(404, { message: "Not Found" })
 		}
@@ -83,7 +85,7 @@ function claimApi(): { fetch: typeof fetch; commits: Map<string, FakeCommit>; re
 		}
 		return reply(404, { message: `Unexpected fake route ${method} ${route}` })
 	}
-	return { fetch: fake as typeof fetch, commits, refs, failAssignment }
+	return { fetch: fake as typeof fetch, commits, refs, failAssignment, commitReads }
 }
 
 function store(
@@ -157,6 +159,71 @@ async function testClaimLifecycleAndExpiredQuarantine(): Promise<void> {
 	const third = await runnerB.acquire(41, { worktreeNames: ["w2"] })
 	assert.equal(third.acquired, true)
 	if (third.acquired) assert.equal(third.claim.epoch, 3)
+}
+
+async function testPermanentClaimHistoryIsCachedByExactRefSha(): Promise<void> {
+	const api = claimApi()
+	const claims = store(api, "workstation", () => new Date("2026-10-11T12:00:00.000Z"), "nonce-cache-history-012345")
+	for (let issue = 1; issue <= 64; issue++) {
+		const sha = issue.toString(16).padStart(40, "0")
+		api.commits.set(sha, {
+			sha,
+			message: `headlesscode-runner-claim-v1\n${JSON.stringify({
+				version: 1, issue, epoch: 1, phase: "released", stage: "reserved",
+				runnerId: "workstation", leaseNonce: `nonce-history-${String(issue).padStart(8, "0")}`,
+				worktreeNames: [`w${issue}`], updatedAt: "2026-10-11T11:00:00.000Z",
+				leaseExpiresAt: "2026-10-11T11:00:00.000Z", releaseReason: "spawn-failed",
+			})}`,
+			tree: { sha: "b".repeat(40) },
+			parents: [],
+		})
+		api.refs.set(`heads/headlesscode-claims/issue-${issue}`, sha)
+	}
+
+	assert.equal((await claims.listActiveClaims()).length, 0)
+	const firstSweepCommitReads = api.commitReads.value
+	assert.equal(firstSweepCommitReads, 64, "each uncached permanent record is fetched once")
+	assert.equal((await claims.listActiveClaims()).length, 0)
+	assert.equal(api.commitReads.value, firstSweepCommitReads, "unchanged released history reuses metadata cached under the exact ref SHA")
+}
+
+async function testClaimCacheRefreshesChangedShaAndFailsClosedOnMalformedRef(): Promise<void> {
+	const api = claimApi()
+	const claims = store(api, "workstation", () => new Date("2026-10-11T12:00:00.000Z"), "nonce-cache-changed-0123")
+	const acquired = await claims.acquire(92, { worktreeNames: ["w1"] })
+	assert.equal(acquired.acquired, true)
+	if (!acquired.acquired) throw new Error("expected acquired claim")
+	assert.equal((await claims.listActiveClaims()).length, 1)
+	const firstTip = (await claims.read(92))!.commitSha
+
+	const running = await claims.markRunning(92, acquired.claim)
+	const runningTip = (await claims.read(92))!.commitSha
+	assert.notEqual(runningTip, firstTip)
+	const readsBeforeChangedShaList = api.commitReads.value
+	const refreshed = await claims.listActiveClaims()
+	assert.equal(refreshed.length, 1)
+	assert.equal(refreshed[0]?.claim.stage, "running", "the changed tip yields fresh metadata instead of the reserved cached claim")
+	assert.equal(api.commitReads.value, readsBeforeChangedShaList + 1, "a changed ref SHA forces a fresh commit read")
+
+	api.refs.set(`heads/headlesscode-claims/issue-92`, "malformed-sha")
+	await assert.rejects(claims.listActiveClaims(), /malformed object SHA/)
+	assert.equal(running.leaseNonce, acquired.claim.leaseNonce, "mutation identity remains stable while its commit tip changes")
+}
+
+async function testMalformedClaimCommitIsNotCached(): Promise<void> {
+	const api = claimApi()
+	const claims = store(api, "workstation", () => new Date("2026-10-11T12:00:00.000Z"), "nonce-cache-malformed-0123")
+	const acquired = await claims.acquire(93, { worktreeNames: ["w1"] })
+	assert.equal(acquired.acquired, true)
+	if (!acquired.acquired) throw new Error("expected acquired claim")
+	const snapshot = await claims.read(93)
+	assert.ok(snapshot)
+	const current = api.commits.get(snapshot.commitSha)!
+	const validMessage = current.message
+	current.message = "unsupported claim record"
+	await assert.rejects(claims.listActiveClaims(), /unsupported metadata/)
+	current.message = validMessage
+	assert.equal((await claims.listActiveClaims()).length, 1, "a failed parse is not retained as cached metadata")
 }
 
 async function testAssignmentFailureDoesNotLeaveUnownedActiveClaim(): Promise<void> {
@@ -412,6 +479,9 @@ async function testUncertainSpawnExceptionKeepsClaimQuarantined(): Promise<void>
 }
 
 await testClaimLifecycleAndExpiredQuarantine()
+await testPermanentClaimHistoryIsCachedByExactRefSha()
+await testClaimCacheRefreshesChangedShaAndFailsClosedOnMalformedRef()
+await testMalformedClaimCommitIsNotCached()
 await testAssignmentFailureDoesNotLeaveUnownedActiveClaim()
 await testExpiredClaimNeedsExplicitFencedOperatorRecovery()
 await testInitialClaimsRaceWithOnlyOneWinner()

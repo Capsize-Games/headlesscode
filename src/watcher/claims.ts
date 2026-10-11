@@ -23,6 +23,7 @@ import { GhApiError, ghApi, type GhRequestOptions } from "./github.js"
 const RECORD_PREFIX = "headlesscode-runner-claim-v1\n"
 const CLAIM_TTL_MIN_MS = 30_000
 const CLAIM_TTL_MAX_MS = 15 * 60_000
+const MAX_CACHED_CLAIMS = 1000
 
 export interface RunnerClaim {
 	version: 1
@@ -106,6 +107,8 @@ export class GitHubIssueClaimStore {
 	private readonly leaseMs: number
 	private readonly now: () => Date
 	private readonly newNonce: () => string
+	/** Claim payloads keyed by the exact commit SHA advertised by matching-refs. */
+	private readonly claimBySha = new Map<string, RunnerClaim>()
 
 	/** Configured lease duration, used by the watcher to bound its renewal interval. */
 	get leaseDurationMs(): number {
@@ -157,19 +160,40 @@ export class GitHubIssueClaimStore {
 		if (runnerId !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(runnerId)) throw new Error("claim store: invalid runnerId")
 		const response = await ghApi(`${this.repoPath}/git/matching-refs/heads/headlesscode-claims/issue-`, this.apiOptions)
 		if (!Array.isArray(response) || response.length > 1000) throw new Error("claim store: malformed or over-limit matching-refs response")
-		const issueNumbers = new Set<number>()
+		const refs = new Map<number, string>()
 		for (const entry of response) {
 			if (!entry || typeof entry !== "object" || typeof (entry as { ref?: unknown }).ref !== "string") {
 				throw new Error("claim store: malformed matching ref")
 			}
 			const match = /^refs\/heads\/headlesscode-claims\/issue-([1-9][0-9]{0,14})$/.exec((entry as { ref: string }).ref)
 			if (!match) throw new Error("claim store: unsupported ref under claim prefix")
-			issueNumbers.add(Number(match[1]))
+			const issue = Number(match[1])
+			if (!Number.isSafeInteger(issue)) throw new Error("claim store: matching ref contains an unsafe issue number")
+			const sha = nestedSha(entry, "object", "claim matching ref")
+			if (refs.has(issue)) throw new Error("claim store: duplicate issue matching ref")
+			refs.set(issue, sha)
 		}
+		const currentShas = new Set(refs.values())
+		for (const sha of this.claimBySha.keys()) if (!currentShas.has(sha)) this.claimBySha.delete(sha)
 		const snapshots: ClaimSnapshot[] = []
-		for (const issue of issueNumbers) {
-			const snapshot = await this.read(issue)
-			if (snapshot?.claim.phase === "active" && (runnerId === undefined || snapshot.claim.runnerId === runnerId)) snapshots.push(snapshot)
+		for (const [issue, sha] of refs) {
+			let claim = this.claimBySha.get(sha)
+			if (!claim) {
+				// A changed ref SHA must resolve to a valid current commit record;
+				// errors never fall back to metadata cached for a prior tip.
+				const commit = await ghApi(`${this.repoPath}/git/commits/${encodeURIComponent(sha)}`, this.apiOptions)
+				claim = freezeClaim(parseClaimRecord(commit, issue))
+				this.claimBySha.set(sha, claim)
+				while (this.claimBySha.size > MAX_CACHED_CLAIMS) {
+					const oldest = this.claimBySha.keys().next().value as string | undefined
+					if (oldest === undefined) break
+					this.claimBySha.delete(oldest)
+				}
+			}
+			if (claim.issue !== issue) throw new Error("claim store: cached commit metadata does not match its issue ref")
+			if (claim.phase === "active" && (runnerId === undefined || claim.runnerId === runnerId)) {
+				snapshots.push({ claim, commitSha: sha })
+			}
 		}
 		return snapshots
 	}
@@ -512,6 +536,12 @@ function parseClaimRecord(commit: unknown, issue: number): RunnerClaim {
 		throw new Error("claim store: operator-recovered claim is missing its audit evidence")
 	}
 	return value as unknown as RunnerClaim
+}
+
+function freezeClaim(claim: RunnerClaim): RunnerClaim {
+	Object.freeze(claim.worktreeNames)
+	if (claim.operatorRecovery) Object.freeze(claim.operatorRecovery)
+	return Object.freeze(claim)
 }
 
 function isTeardownProof(proof: ClaimTeardownProof): boolean {
