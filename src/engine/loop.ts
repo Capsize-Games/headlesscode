@@ -97,6 +97,11 @@ export {
 import { discoverSkills } from "../skills/registry.js"
 import type { SkillRegistry } from "../skills/registry.js"
 import { readEnabledSkillRoots } from "../skills/store.js"
+import { findMatchingPattern } from "../permissions/protected-files.js"
+import { createExtension, extensionBundleDigest, listExtensions, loadExtension, validateExtensionBundle } from "../extensions/registry.js"
+import type { ExtensionRevision, ExtensionSummary } from "../extensions/registry.js"
+import { isExtensionToolName, appendExtensionTools } from "../extensions/tools.js"
+import { SessionExtensionRuntime } from "../extensions/runtime.js"
 import { extractEmbeddedToolCall, parseToolCalls } from "./parser.js"
 import { McpHub } from "../vendor/zoo-code/src/services/mcp/McpHub.js"
 import {
@@ -1312,6 +1317,7 @@ export class HeadlessSession {
 	private readonly llmClient: LlmClient
 	private readonly executor: ToolExecutor
 	private mcpHub: McpHub | undefined
+	private extensionRuntime: SessionExtensionRuntime | undefined
 	private readonly logger: Logger
 	private skillRegistry: SkillRegistry | undefined
 	private readonly activatedSkills = new Set<string>()
@@ -1723,6 +1729,11 @@ export class HeadlessSession {
 		}
 		this.executor.register("skill", (args) => this.handleActivateSkill(args))
 		this.executor.register("read_skill_reference", (args) => this.handleReadSkillReference(args))
+		const hasExtensionWorkspaceAuthority = this.executor.has("execute_command") && hasExecutorWorkspaceWriteTool(this.executor)
+		if (hasExtensionWorkspaceAuthority) {
+			this.executor.register("extension_manage", (args, ctx) => this.handleExtensionManage(args, ctx))
+			this.executor.register("extension_call", (args, ctx) => this.handleExtensionCall(args, ctx))
+		}
 		// Lazy tool catalog (src/engine/lazy-tools.ts): list_tools/request_tool
 		// are pure session-state operations, registered the same session-bound
 		// way as new_task/switch_mode regardless of executor capabilities —
@@ -1767,6 +1778,8 @@ export class HeadlessSession {
 			// Also covers setup failures before runIterations installs its teardown.
 			await this.mcpHub?.dispose()
 			this.mcpHub = undefined
+			await this.extensionRuntime?.dispose()
+			this.extensionRuntime = undefined
 		}
 	}
 
@@ -1862,11 +1875,20 @@ export class HeadlessSession {
 		if (this.config.patchLocalToolSchemas) {
 			tools = patchEditFileToolForLocalModels(tools)
 		}
+		const extensionCanWrite = hasWorkspaceWriteTool(tools) && hasExecutorWorkspaceWriteTool(this.executor)
+		const extensionCanExecute = this.executor.has("execute_command") && tools.some((tool) => tool.type === "function" && tool.function.name === "execute_command")
 		if (isLazyToolCatalogEnabled()) {
 			const split = splitCoreAndLazyTools(tools)
 			this.lazyToolsByName = split.lazyByName
 			tools = split.core
 		}
+		tools = appendExtensionTools(tools, {
+			codingMode: mode === "code",
+			canWrite: extensionCanWrite,
+			canExecute: extensionCanExecute,
+			explicitAllowlist: this.config.tools !== undefined,
+			explicitToolNames: this.config.tools?.map((tool) => tool.function.name),
+		})
 
 		this.state.systemPrompt = systemPrompt
 		this.state.tools = tools
@@ -4710,7 +4732,7 @@ export class HeadlessSession {
 			// post-pass below feeds results back — tool messages, diagnosis,
 			// mistake accounting — in assistant.tool_calls order regardless of
 			// execution order.
-			const executed = new Map<number, { resultContent: string; isError: boolean }>()
+			const executed = new Map<number, { resultContent: string; isError: boolean; extension?: ToolResult["extension"] }>()
 			const recordNestedBatchTool = async (
 				name: string,
 				args: Record<string, unknown>,
@@ -4848,6 +4870,7 @@ export class HeadlessSession {
 			const runCall = async (call: ParsedToolCall, index: number): Promise<void> => {
 				let resultContent: string
 				let isError: boolean
+				let extension: ToolResult["extension"]
 				const actionId = call.id || `action_${iteration}_${index}`
 				const intentAcknowledged = await this.appendEvidence({
 					sessionId: this.sessionId,
@@ -4909,6 +4932,7 @@ export class HeadlessSession {
 					)
 					resultContent = result.content
 					isError = result.isError
+					extension = result.extension
 				}
 				if (intentAcknowledged && !(await this.appendEvidence({
 					sessionId: this.sessionId,
@@ -4923,7 +4947,7 @@ export class HeadlessSession {
 					resultContent = `${resultContent}\n[Evidence error] ${this.evidenceFault}; later tool effects were blocked.`
 					isError = true
 				}
-				executed.set(index, { resultContent, isError })
+				executed.set(index, { resultContent, isError, ...(extension ? { extension } : {}) })
 			}
 
 			// Parallel wave: the turn's independent read-only/exploration calls
@@ -4950,7 +4974,7 @@ export class HeadlessSession {
 					// Unreachable: runCall always records its outcome before resolving.
 					throw new Error(`[loop] internal: no execution outcome for '${call.name}'`)
 				}
-				let { resultContent, isError } = outcome
+				let { resultContent, isError, extension } = outcome
 				if (
 					call.name === "execute_command" ||
 					call.name === "write_to_file" ||
@@ -5107,6 +5131,7 @@ export class HeadlessSession {
 								isError,
 								result: preview.text,
 								resultTruncated: preview.truncated,
+								extension,
 							})
 						},
 						{ iteration, tool: call.name, isError },
@@ -5465,6 +5490,89 @@ export class HeadlessSession {
 		* REMAINING iterations, so recursive delegation can never silently blow
 		* past the parent's own budget/iteration caps.
 		*/
+	private extensionToolAvailable(name: string): boolean {
+		const availableTools = [...this.state.tools, ...this.lazyToolsByName.values()]
+		return (
+			isExtensionToolName(name) &&
+			this.state.mode === "code" &&
+			this.executor.has(name) &&
+			this.state.tools.some((tool) => tool.type === "function" && tool.function.name === name) &&
+			hasWorkspaceWriteTool(availableTools) &&
+			this.executor.has("execute_command") &&
+			availableTools.some((tool) => tool.type === "function" && tool.function.name === "execute_command")
+		)
+	}
+
+	private getExtensionRuntime(ctx: ToolContext): SessionExtensionRuntime {
+		if (!this.extensionRuntime) {
+			this.extensionRuntime = new SessionExtensionRuntime({ workspaceRoot: ctx.workspaceRoot, permissions: ctx.permissions })
+		}
+		return this.extensionRuntime
+	}
+
+	private async handleExtensionManage(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+		if (!this.extensionToolAvailable("extension_manage")) {
+			return { content: "[Error] Extension management is available only in a coding session with workspace write and command execution tools.", isError: true }
+		}
+		if (ctx.signal?.aborted) return { content: "[Error] Extension management stopped by supervisor.", isError: true }
+		if (Buffer.byteLength(JSON.stringify(args), "utf8") > 300 * 1024) {
+			return { content: "[Error] Extension management input exceeds the 300 KiB request limit.", isError: true }
+		}
+		const action = args.action
+		if (action === "list") {
+			const summaries = await listExtensions(ctx.workspaceRoot)
+			return { content: boundedExtensionJson({ extensions: summaries.map(extensionSummaryData) }), isError: false }
+		}
+		if (action === "create" || action === "validate") {
+			const bundle = validateExtensionBundle({ manifest: args.manifest, files: args.files })
+			const digest = extensionBundleDigest(bundle)
+			if (action === "validate") {
+				const identity = { kind: bundle.manifest.kind, id: bundle.manifest.id, digest }
+				return { content: boundedExtensionJson({ extension: identity, valid: true }), isError: false, extension: identity }
+			}
+			const created = await createExtension(ctx.workspaceRoot, bundle, {
+				authorizeWrite: async (destination) => {
+					if (ctx.signal?.aborted) return false
+					const relative = path.relative(path.resolve(ctx.workspaceRoot), path.resolve(destination))
+					if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return false
+					if (ctx.permissions.allowProtectedWrites) return true
+					return findMatchingPattern(relative.split(path.sep).join("/"), ctx.permissions.protectedFiles) === null
+				},
+			})
+			const identity = { kind: created.manifest.kind, id: created.manifest.id, digest: created.digest }
+			return { content: boundedExtensionJson({ extension: identity, created: true }), isError: false, extension: identity }
+		}
+		if (action === "inspect") {
+			if (typeof args.id !== "string" || typeof args.digest !== "string") throw new Error("inspect requires an exact extension id and digest")
+			const revision = await loadExtension(ctx.workspaceRoot, args.id, args.digest)
+			const description = await this.getExtensionRuntime(ctx).describe(revision)
+			const identity = extensionIdentity(revision)
+			return { content: boundedExtensionJson({ extension: identity, description }), isError: false, extension: identity }
+		}
+		throw new Error("action must be create, list, inspect, or validate")
+	}
+
+	private async handleExtensionCall(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+		if (!this.extensionToolAvailable("extension_call")) {
+			return { content: "[Error] Extension calls are available only in a coding session with workspace write and command execution tools.", isError: true }
+		}
+		if (ctx.signal?.aborted) return { content: "[Error] Extension call stopped by supervisor.", isError: true }
+		if (Buffer.byteLength(JSON.stringify(args), "utf8") > 300 * 1024) {
+			return { content: "[Error] Extension call input exceeds the 300 KiB request limit.", isError: true }
+		}
+		if (typeof args.id !== "string" || typeof args.digest !== "string") throw new Error("extension_call requires an exact extension id and digest")
+		if (!args.input || typeof args.input !== "object" || Array.isArray(args.input)) throw new Error("extension_call input must be a JSON object")
+		if (args.tool_name !== undefined && args.tool_name !== null && typeof args.tool_name !== "string") throw new Error("tool_name must be a string or null")
+		const revision = await loadExtension(ctx.workspaceRoot, args.id, args.digest)
+		const result = await this.getExtensionRuntime(ctx).call(revision, args.input, {
+			permissions: ctx.permissions,
+			signal: ctx.signal,
+			...(typeof args.tool_name === "string" ? { toolName: args.tool_name } : {}),
+		})
+		const identity = extensionIdentity(revision)
+		return { content: boundedExtensionJson({ extension: identity, result }), isError: false, extension: identity }
+	}
+
 	private async handleNewTask(args: Record<string, unknown>): Promise<ToolResult> {
 		const mode = typeof args.mode === "string" ? args.mode.trim() : ""
 		const message = typeof args.message === "string" ? args.message.trim() : ""
@@ -5783,11 +5891,20 @@ export class HeadlessSession {
 		if (this.config.patchLocalToolSchemas) {
 			newTools = patchEditFileToolForLocalModels(newTools)
 		}
+		const extensionCanWrite = hasWorkspaceWriteTool(newTools) && hasExecutorWorkspaceWriteTool(this.executor)
+		const extensionCanExecute = this.executor.has("execute_command") && newTools.some((tool) => tool.type === "function" && tool.function.name === "execute_command")
 		if (isLazyToolCatalogEnabled()) {
 			const split = splitCoreAndLazyTools(newTools)
 			this.lazyToolsByName = split.lazyByName
 			newTools = split.core
 		}
+		newTools = appendExtensionTools(newTools, {
+			codingMode: modeSlug === "code",
+			canWrite: extensionCanWrite,
+			canExecute: extensionCanExecute,
+			explicitAllowlist: this.config.tools !== undefined,
+			explicitToolNames: this.config.tools?.map((tool) => tool.function.name),
+		})
 		const toolSetUnchanged = sameToolNames(this.state.tools, newTools)
 		this.state.mode = modeSlug
 		this.state.tools = newTools
@@ -6157,6 +6274,31 @@ export const TRUNCATION_BATCH_SIZE = 10
  * system prompt / messages[0] are left untouched so the provider's cached
  * prompt prefix survives the switch.
  */
+function hasWorkspaceWriteTool(tools: readonly ChatTool[]): boolean {
+	const writers = new Set(["write_to_file", "apply_diff", "search_replace", "edit_file", "set_indentation"])
+	return tools.some((tool) => tool.type === "function" && writers.has(tool.function.name))
+}
+
+function hasExecutorWorkspaceWriteTool(executor: ToolExecutor): boolean {
+	return ["write_to_file", "apply_diff", "search_replace", "edit_file", "set_indentation"].some((name) => executor.has(name))
+}
+
+function extensionIdentity(revision: ExtensionRevision): { kind: "skill" | "tool" | "mcp"; id: string; digest: string } {
+	return { kind: revision.manifest.kind, id: revision.manifest.id, digest: revision.digest }
+}
+
+function extensionSummaryData(summary: ExtensionSummary): { manifest: ExtensionSummary["manifest"]; digest: string } {
+	return { manifest: summary.manifest, digest: summary.digest }
+}
+
+function boundedExtensionJson(value: unknown): string {
+	const serialized = JSON.stringify(value)
+	if (typeof serialized !== "string" || Buffer.byteLength(serialized, "utf8") > 512 * 1024) {
+		throw new Error("extension result exceeds the 512 KiB session result limit")
+	}
+	return serialized
+}
+
 function sameToolNames(a: ChatTool[], b: ChatTool[]): boolean {
 	const names = (tools: ChatTool[]): string[] =>
 		tools
