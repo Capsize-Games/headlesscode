@@ -3,8 +3,8 @@ import { execFileSync } from "node:child_process"
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
 
-import { createMutationSnapshotBundle } from "../rsi/openshell.js"
-import type { RsiConfig } from "../rsi/types.js"
+import { createMutationSnapshotBundle } from "../openshell.js"
+import type { RsiConfig } from "../types.js"
 
 const scratch = path.join(process.cwd(), ".headlesscode", "scratch")
 
