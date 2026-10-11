@@ -2,7 +2,8 @@ import { createHash, randomUUID } from "node:crypto"
 import { execFileSync } from "node:child_process"
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
-import { RSI_OPENSHELL_IMAGE, runOpenShellBenchmarkVerifier } from "../src/rsi/openshell.js"
+import { runOpenShellBenchmarkVerifier, resolveRsiEvaluatorRuntimeIdentity } from "../src/rsi/openshell.js"
+import { evaluatorImageReference } from "../src/rsi/evaluator-runtime.js"
 import { parseRsiArgs } from "../src/rsi/config.js"
 import type { CandidateRecord } from "../src/rsi/types.js"
 
@@ -30,8 +31,9 @@ let report: Record<string, unknown> = {
 	providerTeardownCompleted: false,
 	modelInference: "none",
 	runtimeProfile: {
-		image: RSI_OPENSHELL_IMAGE,
-		imageSource: "RSI provider enforced default image",
+		evaluatorImageReference: null,
+		evaluatorImageSource: "not resolved",
+		evaluatorPolicySha256: null,
 		gatewayAlias: process.env.OPENSHELL_GATEWAY ?? null,
 		gatewayIdentitySource: process.env.OPENSHELL_GATEWAY ? "configured provider gateway alias; remote endpoint identity is not exposed" : "not exposed",
 		controlProfileIdentity: null,
@@ -40,6 +42,12 @@ let report: Record<string, unknown> = {
 }
 
 async function main(): Promise<void> {
+	const evaluatorRuntime = await resolveRsiEvaluatorRuntimeIdentity()
+	Object.assign(report.runtimeProfile as Record<string, unknown>, {
+		evaluatorImageReference: evaluatorImageReference(evaluatorRuntime.imageDigest),
+		evaluatorImageSource: evaluatorRuntime.identitySource,
+		evaluatorPolicySha256: evaluatorRuntime.policySha256,
+	})
 	await fs.mkdir(path.join(repoRoot, "src", "rsi"), { recursive: true })
 	await fs.mkdir(path.join(repoRoot, "scripts", "eval-suite"), { recursive: true })
 	await fs.mkdir(archiveDir, { recursive: true, mode: 0o700 })
@@ -90,7 +98,7 @@ async function main(): Promise<void> {
 		`let workspaceWritable = false; try { fs.writeFileSync('/workspace/.rsi-security-canary', 'workspace-only\\n', { flag: 'wx' }); workspaceWritable = true; } catch {}\n` +
 		`const protectedSnapshotOmitted = { evaluator: !fs.existsSync('/workspace/src/rsi/evaluator-canary.ts'), scoring: !fs.existsSync('/workspace/scripts/eval-suite/score-canary.ts'), archive: !fs.existsSync('/workspace/.headlesscode/rsi-archive/archive-canary.json') };\n` +
 		`console.log('HEADLESSCODE_RSI_CONTAINMENT_PROBE:' + JSON.stringify({ workspaceWritable, results, protectedSnapshotOmitted }));\n`
-	const result = await runOpenShellBenchmarkVerifier(candidate, parsed.config, Buffer.from(probeScript), "security-canary")
+	const result = await runOpenShellBenchmarkVerifier(candidate, parsed.config, Buffer.from(probeScript), "security-canary", undefined, evaluatorRuntime.imageDigest, evaluatorRuntime.policySha256)
 	report.providerTeardownCompleted = true
 	const marker = /(?:^|\n)HEADLESSCODE_RSI_CONTAINMENT_PROBE:(\{[^\n]+\})(?:\n|$)/.exec(result.stdout + result.stderr)
 	if (!marker) throw new Error("OpenShell guest did not return a containment probe report")
