@@ -111,7 +111,7 @@ export function isRetryableOpenRouterError(error: unknown): boolean {
 		"OpenRouter job token ceiling exhausted",
 		"OpenRouter job spend ceiling exhausted",
 		"OpenRouter campaign spend ceiling exhausted",
-		"OpenRouter job lease is stale, fenced, or expired",
+		"OpenRouter request denied: lease is stale, fenced, expired or blocked",
 		"OpenRouter job duration limit exhausted",
 		"OpenRouter file ledger budget exhausted",
 	])
