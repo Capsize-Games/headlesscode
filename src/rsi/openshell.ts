@@ -40,6 +40,7 @@ export interface RsiInferenceBrokerAccess {
 	guestBaseUrl: string
 	capability: string
 	port: number
+	readonly maxPromptBytes: number
 }
 
 export interface IsolatedRunOptions {
@@ -324,12 +325,14 @@ export function rsiMutationGuestEnvironment(config: RsiConfig, candidate: Candid
 		const profile = openRouterProfileForModel(worker.model, worker.openRouterProfile)
 		if (profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID && worker.openRouterProfile !== profile.id) throw new Error("RSI OpenRouter Muse worker requires its explicit profile identity")
 		if (!/^http:\/\/host\.openshell\.internal:\d+$/.test(inferenceBroker.guestBaseUrl) || !Number.isInteger(inferenceBroker.port) || inferenceBroker.port < 1 || inferenceBroker.port > 65535) throw new Error("RSI OpenRouter broker endpoint is malformed")
+		if (!Number.isSafeInteger(inferenceBroker.maxPromptBytes) || inferenceBroker.maxPromptBytes <= 0) throw new Error("RSI OpenRouter broker prompt byte budget is malformed")
 		return {
 			HEADLESSCODE_CODE_MODE_BACKEND: "openrouter",
 			HEADLESSCODE_CODE_MODE_MODEL: profile.model,
 			OPENROUTER_MODEL: profile.model,
 			OPENROUTER_BASE_URL: inferenceBroker.guestBaseUrl,
 			HEADLESSCODE_RSI_INFERENCE_CAPABILITY: inferenceBroker.capability,
+			HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES: String(inferenceBroker.maxPromptBytes),
 			HEADLESSCODE_CAPTURE_TRANSCRIPT_DIR: path.join("/workspace", ".headlesscode", "rsi-transcripts"),
 			HEADLESSCODE_MAX_ITERATIONS: String(config.maxIterations),
 			HEADLESSCODE_MAX_DURATION_MS: String(config.commandTimeoutMs),
