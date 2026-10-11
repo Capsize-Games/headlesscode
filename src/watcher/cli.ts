@@ -31,6 +31,7 @@ import { execFileSync } from "node:child_process"
 import * as path from "node:path"
 
 import { Logger } from "../engine/logger.js"
+import { isMuseModelIdentifier, museUnsupportedSettingsReason, type AgentExecutor } from "../agent-executor.js"
 import { watchIssues, type SweepResult } from "./watch.js"
 import { openshellPreflight } from "../cloud/openshell-preflight.js"
 import { resolveContainedRuntimeProfile, resolveSecurityProfile, serializeResolvedContainedProfile, type SecurityProfileName } from "../security/profile.js"
@@ -64,6 +65,9 @@ Options:
                          <repo>/.worktrees/.watcher-state.json)
   --mode <slug>          Harness mode for workers (default: code; forwarded
                          to the spawner as ORCHESTRATOR_MODE)
+  --executor <builtin|muse>  Default worker implementation; issue labels may
+                         select per-job with executor:builtin or executor:muse
+  --muse-model <id>      Native Muse Meta model id (requires --executor muse)
   --execution-provider <local|openshell> Worker runtime (default: local)
   --security-profile <local|contained>  Trust boundary (default local: runs with host authority;
                                        contained: OpenShell only, fails closed)
@@ -99,6 +103,8 @@ export interface WatchCliOptions {
 	stateFile?: string
 	mode: string
 	executionProvider: "local" | "openshell"
+	executor?: AgentExecutor
+	museModel?: string
 	securityProfile?: SecurityProfileName
 	qa: boolean
 	deploy: boolean
@@ -154,6 +160,18 @@ export function parseWatchArgs(argv: string[]): { options: WatchCliOptions; erro
 				const v = next()
 				if (v !== "local" && v !== "openshell") return { options, error: "--execution-provider must be local or openshell" }
 				options.executionProvider = v
+				break
+			}
+			case "--executor": {
+				const v = next()
+				if (v !== "builtin" && v !== "muse") return { options, error: "--executor must be builtin or muse" }
+				options.executor = v
+				break
+			}
+			case "--muse-model": {
+				const v = next()
+				if (v === undefined || !isMuseModelIdentifier(v)) return { options, error: "--muse-model requires a valid native Muse model identifier" }
+				options.museModel = v
 				break
 			}
 			case "--owner": {
@@ -271,6 +289,19 @@ export function parseWatchArgs(argv: string[]): { options: WatchCliOptions; erro
 		if (options.executionProvider === "local" && argv.some((arg) => arg === "--execution-provider" || arg.startsWith("--execution-provider="))) return { options, error: "contained security profile cannot use the local execution provider" }
 		options.executionProvider = "openshell"
 	}
+	if (options.museModel && options.executor !== "muse") {
+		return { options, error: "--muse-model requires --executor muse" }
+	}
+	if (options.executor === "muse" && (options.executionProvider !== "local" || options.mode !== "code")) {
+		return { options, error: "Muse executor requires local execution and --mode code" }
+	}
+	if (options.executor === "muse" && options.securityProfile === "contained") {
+		return { options, error: "Muse executor cannot run under the contained OpenShell security profile" }
+	}
+	if (options.executor === "muse") {
+		const unsupported = museUnsupportedSettingsReason(options.memoryDir)
+		if (unsupported) return { options, error: unsupported }
+	}
 	return { options }
 }
 
@@ -281,6 +312,9 @@ function printDryRunPlan(sweeps: SweepResult[]): void {
 		for (const plan of sweep.dryRunPlan ?? []) {
 			const { issue, specs } = plan
 			process.stdout.write(`  issue #${issue.number}: ${issue.title}\n`)
+			if (plan.selection) {
+				process.stdout.write(`    executor: ${plan.selection.executor}${plan.selection.museModel ? ` (native Muse model ${plan.selection.museModel})` : ""}\n`)
+			}
 			for (const spec of specs) {
 				process.stdout.write(
 					`    -> ${spec.name} issues [${spec.issues.join(", ")}] plans/parallel-tasks/${spec.taskFile}\n`,
@@ -382,6 +416,8 @@ export async function watchMain(argv: string[]): Promise<number> {
 			dryRun: options.dryRun,
 			mode: options.mode,
 			executionProvider: options.executionProvider,
+			executor: options.executor,
+			museModel: options.museModel,
 			memoryDir: options.memoryDir,
 			qa: options.qa,
 			deploy: options.deploy,

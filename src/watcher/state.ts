@@ -50,6 +50,7 @@ import * as fsp from "node:fs/promises"
 import * as path from "node:path"
 
 import type { WorktreeSpec } from "../orchestrator/split.js"
+import type { AgentExecutor } from "../agent-executor.js"
 
 export type WatcherIssueStatus = "spawned" | "done" | "failed" | "skipped" | "pending"
 
@@ -63,6 +64,9 @@ export interface WatcherIssueEntry {
 	batch?: string
 	/** Worktree groups produced by splitIssues([issue]). */
 	groups?: WorktreeSpec[]
+	/** Selection pinned for this issue, including failed-spawn retries. */
+	executor?: AgentExecutor
+	museModel?: string
 	spawnedAt?: string
 	status: WatcherIssueStatus
 	updatedAt: string
@@ -110,6 +114,8 @@ function sanitize(raw: unknown): WatcherState {
 				if (typeof e.batch === "string") {
 					entry.batch = e.batch
 				}
+				if (e.executor === "builtin" || e.executor === "muse") entry.executor = e.executor
+				if (typeof e.museModel === "string") entry.museModel = e.museModel
 				if (Array.isArray(e.groups)) {
 					entry.groups = e.groups as WorktreeSpec[]
 				}
