@@ -5,6 +5,7 @@ import * as path from "node:path"
 import {
 	createExtension,
 	extensionBundleDigest,
+	extensionRegistryTestHooks,
 	extensionRoot,
 	listExtensions,
 	loadExtension,
@@ -128,6 +129,39 @@ async function validationFailsBeforeAnyWrite(): Promise<void> {
 	}
 }
 
+async function cancellationPreventsPublicationAndCleansOwnedStage(): Promise<void> {
+	await fs.mkdir(scratchRoot, { recursive: true, mode: 0o700 })
+	const root = await fs.mkdtemp(path.join(scratchRoot, "extension-registry-cancel-"))
+	try {
+		const bundle = toolBundle("cancelled-create")
+		const preAborted = new AbortController()
+		preAborted.abort()
+		let authorizationCalls = 0
+		await assert.rejects(createExtension(root, bundle, { authorizeWrite: () => { authorizationCalls++; return true }, signal: preAborted.signal }), /cancelled/)
+		assert.equal(authorizationCalls, 0, "an already-stopped create performs no authorization or filesystem effects")
+		assert.equal(await fs.lstat(path.join(root, ".agents")).then(() => true, () => false), false)
+
+		let reachedStage: () => void = () => undefined
+		let releaseStage: () => void = () => undefined
+		const stageReady = new Promise<void>((resolve) => { reachedStage = resolve })
+		const stageGate = new Promise<void>((resolve) => { releaseStage = resolve })
+		extensionRegistryTestHooks.setCreateStageBarrierForTests(async () => { reachedStage(); await stageGate })
+		const controller = new AbortController()
+		const pending = createExtension(root, bundle, { authorizeWrite: () => true, signal: controller.signal })
+		await stageReady
+		const idDirectory = path.join(root, ".agents", "headlesscode", "extensions", bundle.manifest.id)
+		assert.deepEqual((await fs.readdir(idDirectory)).filter((name) => name.startsWith(".staging-")).length, 1, "the controlled operation has entered its owned staging directory")
+		controller.abort()
+		releaseStage()
+		await assert.rejects(pending, /cancelled/)
+		assert.equal(await fs.lstat(path.join(idDirectory, extensionBundleDigest(bundle))).then(() => true, () => false), false, "an aborted staging operation does not publish its revision")
+		assert.deepEqual((await fs.readdir(idDirectory)).filter((name) => name.startsWith(".staging-")), [], "cancellation removes only the operation's owned staging directory")
+	} finally {
+		extensionRegistryTestHooks.setCreateStageBarrierForTests(undefined)
+		await fs.rm(root, { recursive: true, force: true })
+	}
+}
+
 async function concurrentPublicationAndIncompleteRevision(): Promise<void> {
 	await fs.mkdir(scratchRoot, { recursive: true, mode: 0o700 })
 	const root = await fs.mkdtemp(path.join(scratchRoot, "extension-registry-publish-"))
@@ -183,6 +217,7 @@ async function symlinkAndChangedDigestFailClosed(): Promise<void> {
 
 await validKindsRoundTripAndListMetadataOnly()
 await validationFailsBeforeAnyWrite()
+await cancellationPreventsPublicationAndCleansOwnedStage()
 await symlinkAndChangedDigestFailClosed()
 await concurrentPublicationAndIncompleteRevision()
 console.log("All extension registry tests passed")

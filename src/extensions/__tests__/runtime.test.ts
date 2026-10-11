@@ -162,6 +162,37 @@ async function testMcpHandshakeSchemaAndCall(workspaceRoot: string): Promise<voi
 	} finally { await runtime.dispose() }
 }
 
+async function testMcpDescribeUsesCurrentPermissions(workspaceRoot: string): Promise<void> {
+	const marker = path.join(workspaceRoot, "mcp-inspect-must-not-start")
+	const source = `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "started");\n${MCP_SERVER_SOURCE}`
+	const revision = await createFixture(workspaceRoot, mcpBundle("mcp-current-permissions", source))
+	const runtime = new SessionExtensionRuntime({ workspaceRoot, permissions: permissions(), limits: { callTimeoutMs: 2_000 } })
+	try {
+		await assert.rejects(runtime.describe(revision, { permissions: permissions(["node"]) }), /denied by command permissions/)
+		assert.equal(await fs.stat(marker).then(() => true, () => false), false, "inspect uses the invocation's current deny policy before spawning MCP")
+	} finally { await runtime.dispose() }
+}
+
+async function testMcpDescribeAbortTearsDownInspectProcess(workspaceRoot: string): Promise<void> {
+	const pidFile = path.join(workspaceRoot, "mcp-inspect.pid")
+	const hangingList = MCP_SERVER_SOURCE
+		.replace('import { Server }', 'import { writeFileSync } from "node:fs";\nimport { Server }')
+		.replace('server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [{ name: "echo", description: "Echo text", inputSchema: { type: "object", properties: { text: { type: "string", minLength: 2 } }, required: ["text"], additionalProperties: false }, outputSchema: { type: "object", properties: { echo: { type: "string" } }, required: ["echo"], additionalProperties: false } }] }));', 'server.setRequestHandler(ListToolsRequestSchema, async () => await new Promise(() => {}));')
+	const source = `writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\n${hangingList}`
+	const revision = await createFixture(workspaceRoot, mcpBundle("mcp-inspect-abort", source))
+	const runtime = new SessionExtensionRuntime({ workspaceRoot, permissions: permissions(), limits: { callTimeoutMs: 10_000 } })
+	const controller = new AbortController()
+	try {
+		const inspection = runtime.describe(revision, { permissions: permissions(), signal: controller.signal })
+		await waitForFile(pidFile, 2_000)
+		controller.abort()
+		await assert.rejects(inspection, /cancel|closed|transport|abort/i)
+		const pid = Number(await fs.readFile(pidFile, "utf8"))
+		assert.ok(Number.isSafeInteger(pid) && pid > 0)
+		assert.equal(await processIsGone(pid), true, "stopping inspect tears down its owned MCP process")
+	} finally { await runtime.dispose() }
+}
+
 async function testMcpDuplicateNamesAndMalformedOversizedFrames(workspaceRoot: string): Promise<void> {
 	const duplicate = MCP_SERVER_SOURCE.replace('tools: [{ name: "echo", description:', 'tools: [{ name: "echo", inputSchema: { type: "object" } }, { name: "echo", description:')
 	const duplicateRevision = await createFixture(workspaceRoot, mcpBundle("mcp-duplicate", duplicate))
@@ -227,6 +258,8 @@ try {
 	await testNativeHelperBoundsPermissionsAndCapturedRevision(workspaceRoot)
 	await testHardTimeoutAndDescendantTeardown(workspaceRoot)
 	await testMcpHandshakeSchemaAndCall(workspaceRoot)
+	await testMcpDescribeUsesCurrentPermissions(workspaceRoot)
+	await testMcpDescribeAbortTearsDownInspectProcess(workspaceRoot)
 	await testMcpDuplicateNamesAndMalformedOversizedFrames(workspaceRoot)
 	await testMcpCallTimeoutAndDisposal(workspaceRoot)
 	await testDisposeDuringStagingPreventsExecution(workspaceRoot)
