@@ -6,7 +6,7 @@ import * as path from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
 import { openshellPreflight } from "../cloud/openshell-preflight.js"
 import { PostgresRsiJobQueue, fleetQueuePolicy, requiredFleetJobLeaseMs, type FleetJobLease, type FleetJobPayload } from "./postgres-queue.js"
-import { OpenShellMutationPreflightError, runOpenShellEvaluation, runOpenShellModelJob, runOpenShellMutation } from "./openshell.js"
+import { OpenShellMutationPreflightError, readVerifiedAdversarialEvaluationArtifacts, runOpenShellEvaluation, runOpenShellModelJob, runOpenShellMutation } from "./openshell.js"
 import type { CandidateRecord, ComputePolicy, EvaluationSummary, MutationHypothesis, MutationKind, RsiConfig, RsiRoleConfig, TrialResult } from "./types.js"
 import { startOpenRouterBroker, openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID, type OpenRouterBrokerReceipt, type OpenRouterBrokerOptions } from "./inference-broker.js"
 import { effectiveWorkerHarnessMode, workerHarnessCliPath, validWorkerHarnessRuntimeIdentity } from "./worker-harness.js"
@@ -208,12 +208,18 @@ function candidateFromPayload(payload: FleetJobPayload, root: string): Candidate
 	}
 }
 
-function verifySanitizedBundle(root: string, expectedCommit: string, jobKind: FleetJobLease["job"]["jobKind"], protectedPaths: string[] = []): void {
+function verifySanitizedBundle(root: string, expectedCommit: string, jobKind: FleetJobLease["job"]["jobKind"], protectedPaths: string[] = [], adversarialEvaluation?: FleetJobPayload["adversarialEvaluation"]): void {
 	const actual = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim()
 	if (actual !== expectedCommit) throw new Error("fleet snapshot commit did not match the queued digest-bound commit")
 	const count = execFileSync("git", ["rev-list", "--count", "--all"], { cwd: root, encoding: "utf8" }).trim()
 	if (count !== "1") throw new Error("fleet snapshot must contain exactly one commit")
 	const entries = execFileSync("git", ["ls-tree", "-r", "-z", "--full-tree", "HEAD"], { cwd: root, encoding: "buffer" }).toString("utf8").split("\0").filter(Boolean)
+	const adversarialPaths = entries.map((entry) => entry.slice(entry.indexOf("\t") + 1).replaceAll("\\", "/")).filter((relativePath) => relativePath.startsWith("__headlesscode_rsi_adversarial__/"))
+	if (adversarialPaths.length > 0 || adversarialEvaluation) {
+		if (jobKind !== "evaluation" || !adversarialEvaluation || adversarialPaths.length !== 2
+			|| !adversarialPaths.includes("__headlesscode_rsi_adversarial__/tests.json")
+			|| !adversarialPaths.includes("__headlesscode_rsi_adversarial__/runner.mjs")) throw new Error("fleet snapshot contains unbound adversarial evaluator material")
+	}
 	for (const entry of entries) {
 		const tab = entry.indexOf("\t")
 		if (tab < 0) throw new Error("fleet snapshot contains malformed Git tree metadata")
@@ -230,6 +236,7 @@ function verifySanitizedBundle(root: string, expectedCommit: string, jobKind: Fl
 			if (/^(?:\.rsi-base-model|\.headlesscode-rsi-model-output)(?:\/|$)/.test(relativePath)) throw new Error("model job snapshot contains a local model or prior result artifact")
 		}
 	}
+	if (adversarialEvaluation) readVerifiedAdversarialEvaluationArtifacts(root, adversarialEvaluation)
 }
 
 export function verifyWorkerHarnessPayload(payload: FleetJobPayload, root: string): void {
@@ -286,7 +293,7 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions, sig
 		execFileSync("git", ["init", "--bare", "--quiet", verifyRoot], { cwd: root, stdio: "pipe" })
 		execFileSync("git", ["bundle", "verify", bundlePath], { cwd: verifyRoot, stdio: "pipe" })
 		execFileSync("git", ["clone", "--quiet", "--no-hardlinks", bundlePath, repoRoot], { cwd: root, stdio: "pipe" })
-		verifySanitizedBundle(repoRoot, payload.snapshotCommit, lease.job.jobKind, payload.protectedPaths)
+		verifySanitizedBundle(repoRoot, payload.snapshotCommit, lease.job.jobKind, payload.protectedPaths, payload.adversarialEvaluation)
 		if (lease.job.jobKind === "mutation") verifyWorkerHarnessPayload(payload, repoRoot)
 		const candidate = candidateFromPayload(payload, repoRoot)
 		const config = taskConfig(payload, repoRoot, options.queue)
@@ -361,7 +368,9 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions, sig
 		} else if (lease.job.jobKind === "evaluation") {
 			teardown.guestExecutionStarted = true
 			teardown.guestTeardownConfirmed = false
-			const evaluation = await (options.runEvaluation ?? runOpenShellEvaluation)(candidate, config, signal, options.emergencyControl, payload.evaluatorRuntime)
+			const adversarialArtifacts = payload.adversarialEvaluation ? readVerifiedAdversarialEvaluationArtifacts(repoRoot, payload.adversarialEvaluation) : undefined
+			if (payload.adversarialEvaluation && (payload.evalCommands?.length !== 1 || payload.evalCommands[0] !== "node --import tsx __headlesscode_rsi_adversarial__/runner.mjs" || payload.regressionCommand !== "true")) throw new Error("adversarial evaluator artifacts require the fixed supervisor command set")
+			const evaluation = await (options.runEvaluation ?? runOpenShellEvaluation)(candidate, config, signal, options.emergencyControl, payload.evaluatorRuntime, undefined, adversarialArtifacts)
 			teardown.guestTeardownConfirmed = true
 			const externalized = await externalizeEvaluationOutputs(options.queue, evaluation)
 			result = { ok: true, ...externalized, durationMs: Date.now() - started }

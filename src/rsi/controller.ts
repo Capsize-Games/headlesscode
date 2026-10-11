@@ -19,7 +19,7 @@ import { captureCandidateTrajectory, exportTrajectoryDatasets } from "./trajecto
 import { decideAdaptiveContinuation } from "./adaptive.js"
 import { createOpenShellCommandRunner, resolveRsiEvaluatorRuntimeIdentity } from "./openshell.js"
 import type { EvaluatorRuntimeIdentity } from "./evaluator-runtime.js"
-import { createAdversarialEvaluationSnapshotBundle, createEvaluationSnapshotBundle, createMutationSnapshotBundle, createMutationSnapshotIdentity, applyFleetMutationPatch } from "./openshell.js"
+import { adversarialEvaluationArtifactIdentity, createAdversarialEvaluationSnapshotBundle, createEvaluationSnapshotBundle, createMutationSnapshotBundle, createMutationSnapshotIdentity, applyFleetMutationPatch } from "./openshell.js"
 import { ADVERSARIAL_COMMAND, ADVERSARIAL_PROMPT_VERSION, ADVERSARIAL_TESTS_PATH, buildAdversarialPrompt, parseAdversarialReview, requestAdversarialReview, sha256 } from "./adversarial.js"
 import { fleetJobMatches, fleetPayloadDigest, PostgresRsiJobQueue, fleetQueuePolicy, requiredFleetJobLeaseMs, type FleetJob, type FleetJobIdentity, type FleetJobPayload } from "./postgres-queue.js"
 import type { AdversarialReviewRecord, CandidateRecord, EvaluationSummary, ExperimentJob, RsiArchive, RsiConfig, RsiHooks, RsiRunRecord, TrajectoryRecord, TrialResult, WorkerHarnessExecution } from "./types.js"
@@ -891,6 +891,7 @@ async function runAdversarialStage(
 		payload.task = "Run supervisor-generated adversarial checks for " + candidate.id
 		payload.regressionCommand = "true"
 		payload.evalCommands = [ADVERSARIAL_COMMAND]
+		payload.adversarialEvaluation = adversarialEvaluationArtifactIdentity(tests)
 		const idempotencyKey = run.runId + ":" + candidate.id + ":adversarial:" + testsArtifact.sha256
 		const expected = {
 			idempotencyKey, runId: run.runId, candidateId, jobKind: "evaluation" as const,
