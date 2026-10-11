@@ -4,7 +4,7 @@ import * as path from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
 
 import { createExtension, loadExtension, type ExtensionBundle, type ExtensionRevision } from "../registry.js"
-import { SessionExtensionRuntime } from "../runtime.js"
+import { extensionRuntimeTestHooks, SessionExtensionRuntime } from "../runtime.js"
 import type { ToolContext } from "../../engine/types.js"
 
 const scratchRoot = path.join(process.cwd(), ".headlesscode", "scratch")
@@ -185,9 +185,40 @@ async function testMcpCallTimeoutAndDisposal(workspaceRoot: string): Promise<voi
 		const inFlight = runtime.call(revision, { text: "hello" }, { permissions: permissions(), toolName: "echo" })
 		await delay(100)
 		await runtime.dispose()
-		await assert.rejects(inFlight, /cancel|closed|transport|disposed/i)
+		await assert.rejects(inFlight, /cancel|closed|transport|disposed|abort/i)
 		await assert.rejects(runtime.call(revision, { text: "hello" }, { permissions: permissions(), toolName: "echo" }), /disposed/)
 	} finally { await runtime.dispose() }
+}
+
+async function testDisposeDuringStagingPreventsExecution(workspaceRoot: string): Promise<void> {
+	const marker = path.join(workspaceRoot, "must-not-run-after-dispose")
+	const revision = await createFixture(workspaceRoot, toolBundle("dispose-stage-race", `import { writeFileSync } from "node:fs"; export function run() { writeFileSync(${JSON.stringify(marker)}, "ran"); return null }`))
+	const runtime = new SessionExtensionRuntime({ workspaceRoot, permissions: permissions() })
+	let reachedStaging: () => void = () => undefined
+	let continueStaging: () => void = () => undefined
+	const stagingReached = new Promise<void>((resolve) => { reachedStaging = resolve })
+	const stagingGate = new Promise<void>((resolve) => { continueStaging = resolve })
+	extensionRuntimeTestHooks.setStageRevisionBarrierForTests(async () => { reachedStaging(); await stagingGate })
+	try {
+		const pending = runtime.call(revision, { mode: "marker" }, { permissions: permissions() })
+		await stagingReached
+		const disposal = runtime.dispose()
+		assert.equal(runtime.dispose(), disposal, "concurrent dispose calls wait for the same cleanup operation")
+		continueStaging()
+		await assert.rejects(pending, /cancelled/)
+		await disposal
+		assert.equal(await fs.stat(marker).then(() => true, () => false), false, "dispose aborts a call paused after staging begins before it can spawn its extension")
+		const extensionRoot = path.join(workspaceRoot, ".agents", "headlesscode", "extensions")
+		assert.deepEqual((await fs.readdir(extensionRoot)).filter((name) => name.startsWith(".runtime-")), [], "dispose waits for staged-file cleanup")
+	} finally {
+		extensionRuntimeTestHooks.setStageRevisionBarrierForTests(undefined)
+		await runtime.dispose()
+	}
+}
+
+async function testWindowsFailsClosedForExecutableExtensions(): Promise<void> {
+	assert.throws(() => extensionRuntimeTestHooks.assertOwnedProcessGroupSupported("win32"), /unavailable on Windows.*teardown/)
+	assert.doesNotThrow(() => extensionRuntimeTestHooks.assertOwnedProcessGroupSupported("linux"))
 }
 
 await fs.mkdir(scratchRoot, { recursive: true, mode: 0o700 })
@@ -198,6 +229,8 @@ try {
 	await testMcpHandshakeSchemaAndCall(workspaceRoot)
 	await testMcpDuplicateNamesAndMalformedOversizedFrames(workspaceRoot)
 	await testMcpCallTimeoutAndDisposal(workspaceRoot)
+	await testDisposeDuringStagingPreventsExecution(workspaceRoot)
+	await testWindowsFailsClosedForExecutableExtensions()
 	process.stdout.write("Extension child runtime and bounded MCP transport tests passed\n")
 } finally {
 	await fs.rm(workspaceRoot, { recursive: true, force: true })
