@@ -6,7 +6,6 @@ import { parseRsiArgs } from "../config.js"
 import { networkRules, rsiMutationGuestEnvironment } from "../openshell.js"
 import type { CandidateRecord, RsiConfig } from "../types.js"
 import { RSI_MUSE_OPENROUTER_MODEL, RSI_OPENROUTER_MODEL } from "../inference-broker.js"
-import { DEFAULT_MODEL } from "../../llm/openrouter.js"
 import { resolveModelForMode } from "../../config/mode-models.js"
 
 const parsed = parseRsiArgs(["--repo", process.cwd(), "--max-iterations", "3", "--timeout-ms", "5000"])
@@ -38,7 +37,7 @@ test("OpenRouter guest gets only its job capability and the single broker networ
 	assert.deepEqual((rules.rsi_openrouter_broker as { endpoints: unknown[] }).endpoints, [{ host: "host.openshell.internal", port: 43123, protocol: "tcp" }])
 })
 
-test("OpenRouter guest model resolution honors Muse while retaining the DeepSeek default", () => {
+test("OpenRouter guest model resolution honors the explicit Muse and historical DeepSeek profiles", () => {
 	const scratch = path.join(process.cwd(), ".headlesscode", "scratch")
 	fs.mkdirSync(scratch, { recursive: true, mode: 0o700 })
 	const root = fs.mkdtempSync(path.join(scratch, "rsi-openrouter-model-resolution-"))
@@ -58,8 +57,8 @@ test("OpenRouter guest model resolution honors Muse while retaining the DeepSeek
 		assert.equal(Object.keys(museEnv).some((key) => /(?:API_KEY|SECRET|TOKEN)$/i.test(key)), false)
 
 		const deepseekEnv = rsiMutationGuestEnvironment(config, candidate, broker)
-		assert.equal(deepseekEnv.OPENROUTER_MODEL, DEFAULT_MODEL)
-		assert.equal(resolveModelForMode({ workspaceRoot, mode: "code", env: deepseekEnv }), DEFAULT_MODEL)
+		assert.equal(deepseekEnv.OPENROUTER_MODEL, RSI_OPENROUTER_MODEL)
+		assert.equal(resolveModelForMode({ workspaceRoot, mode: "code", env: deepseekEnv }), RSI_OPENROUTER_MODEL)
 		const ollamaEnv = rsiMutationGuestEnvironment({ ...config, roles: { worker: { provider: "ollama", model: "local-model" } } }, candidate)
 		assert.equal(Object.hasOwn(ollamaEnv, "HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES"), false, "local inference keeps its existing environment path")
 	} finally {
