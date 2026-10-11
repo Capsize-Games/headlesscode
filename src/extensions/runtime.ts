@@ -62,6 +62,7 @@ const NODE_ADAPTER_PATH = fileURLToPath(new URL("./node-adapter.mjs", import.met
 const deferMcpSchemaValidation = {
 	getValidator: () => (input: unknown) => ({ valid: true, data: input, errorMessage: undefined }),
 } as unknown as jsonSchemaValidator
+let stageRevisionBarrierForTests: (() => Promise<void>) | undefined
 
 interface StagedRevision {
 	directory: string
@@ -156,6 +157,14 @@ function callSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSi
 	return signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs)
 }
 
+function assertOwnedProcessGroupSupported(platform: NodeJS.Platform): void {
+	if (platform === "win32") throw new Error("executable extensions are unavailable on Windows because descendant process-tree teardown cannot be guaranteed")
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+	if (signal.aborted) throw new Error("extension operation was cancelled")
+}
+
 function safeRelativePath(value: string): boolean {
 	return value.length > 0 && !path.posix.isAbsolute(value) && !value.includes("\\") && !value.includes("\0") && value.split("/").every((part) => part !== "" && part !== "." && part !== ".." && !part.startsWith("."))
 }
@@ -169,14 +178,17 @@ function validateRevision(revision: ExtensionRevision, workspaceRoot: string): v
 	if (computedDigest !== revision.digest) throw new Error("extension revision digest does not match its captured file map")
 }
 
-async function stageRevision(revision: ExtensionRevision, workspaceRoot: string): Promise<StagedRevision> {
+async function stageRevision(revision: ExtensionRevision, workspaceRoot: string, signal?: AbortSignal): Promise<StagedRevision> {
 	validateRevision(revision, workspaceRoot)
 	const extensionRoot = path.resolve(workspaceRoot, ".agents", "headlesscode", "extensions")
 	if (await fs.realpath(extensionRoot) !== extensionRoot) throw new Error("extension staging root traverses a symlink")
 	const stage = await fs.mkdtemp(path.join(extensionRoot, ".runtime-"))
 	const directories = new Set<string>([stage])
 	try {
+		if (stageRevisionBarrierForTests) await stageRevisionBarrierForTests()
+		if (signal) throwIfAborted(signal)
 		for (const [relative, content] of Object.entries(revision.files)) {
+			if (signal) throwIfAborted(signal)
 			if (!safeRelativePath(relative)) throw new Error("extension bundle contains an unsafe file path")
 			const destination = path.resolve(stage, relative)
 			if (!destination.startsWith(`${stage}${path.sep}`)) throw new Error("extension file escaped its staging directory")
@@ -215,8 +227,10 @@ async function stageRevision(revision: ExtensionRevision, workspaceRoot: string)
 
 /**
  * Executes pinned extensions out of process with bounded JSON and an owned
- * process group. This is a same-user host process boundary, not OS isolation;
- * RSI callers must use the already-contained worker guest.
+ * process group on supported POSIX hosts. This is a same-user host process
+ * boundary, not OS isolation; RSI callers must use the already-contained
+ * worker guest. Executable extensions fail closed on Windows because this
+ * runtime cannot guarantee descendant process-tree teardown there.
  */
 export class SessionExtensionRuntime {
 	readonly workspaceRoot: string
@@ -224,7 +238,9 @@ export class SessionExtensionRuntime {
 	private readonly permissions: ToolContext["permissions"]
 	private readonly children = new Set<OwnedChildProcess>()
 	private readonly transports = new Set<BoundedStdioTransport>()
+	private readonly operations = new Map<AbortController, Promise<unknown>>()
 	private disposed = false
+	private disposalPromise: Promise<void> | undefined
 
 	constructor(options: SessionExtensionRuntimeOptions) {
 		this.workspaceRoot = path.resolve(options.workspaceRoot)
@@ -232,57 +248,70 @@ export class SessionExtensionRuntime {
 		this.limits = boundedLimits(options.limits)
 	}
 
-	async describe(revision: ExtensionRevision): Promise<ExtensionDescription> {
-		this.assertOpen()
-		validateRevision(revision, this.workspaceRoot)
-		const base: ExtensionDescription = {
-			id: revision.manifest.id,
-			kind: revision.manifest.kind,
-			revision: revision.digest,
-			description: revision.manifest.description,
-			...(revision.manifest.inputSchema ? { inputSchema: revision.manifest.inputSchema } : {}),
-		}
-		if (revision.manifest.kind !== "mcp") return base
-		const staged = await stageRevision(revision, this.workspaceRoot)
-		try {
-			if (!staged.entrypoint) throw new Error("MCP extension has no entrypoint")
-			const info = await this.connectMcp(staged.entrypoint, callSignal(undefined, this.limits.callTimeoutMs), this.permissions)
-			try {
-				const tools = await info.client.listTools({}, this.requestOptions(info.signal))
-				return { ...base, tools: this.validateMcpTools(tools.tools) }
-			} finally { await this.closeMcp(info) }
-		} finally { await staged.cleanup() }
-	}
-
-	async call(revision: ExtensionRevision, input: unknown, options: ExtensionCallOptions): Promise<unknown> {
-		this.assertOpen()
-		if (options.signal?.aborted) throw new Error("extension call was cancelled")
-		const signal = callSignal(options.signal, this.limits.callTimeoutMs)
-		const scopedOptions = { ...options, signal }
-		jsonBytes(input, this.limits.maxInputBytes, "extension input")
-		validateRevision(revision, this.workspaceRoot)
-		if (revision.manifest.kind === "skill") return this.callSkill(revision, input)
-		const staged = await stageRevision(revision, this.workspaceRoot)
-		try {
-			if (!staged.entrypoint) throw new Error("extension revision has no executable entrypoint")
-			if (revision.manifest.kind === "tool") return await this.callTool(staged.entrypoint, input, revision.manifest.inputSchema, scopedOptions.permissions, signal)
-			if (revision.manifest.kind === "mcp") {
-				if (!options.toolName) throw new Error("MCP extension call requires an advertised tool name")
-				return await this.callMcp(staged.entrypoint, input, options.toolName, scopedOptions.permissions, signal)
+	describe(revision: ExtensionRevision): Promise<ExtensionDescription> {
+		return this.runOperation(undefined, async (operationSignal) => {
+			validateRevision(revision, this.workspaceRoot)
+			const base: ExtensionDescription = {
+				id: revision.manifest.id,
+				kind: revision.manifest.kind,
+				revision: revision.digest,
+				description: revision.manifest.description,
+				...(revision.manifest.inputSchema ? { inputSchema: revision.manifest.inputSchema } : {}),
 			}
-			throw new Error("extension kind is unsupported")
-		} finally { await staged.cleanup() }
+			if (revision.manifest.kind !== "mcp") return base
+			assertOwnedProcessGroupSupported(process.platform)
+			const staged = await stageRevision(revision, this.workspaceRoot, operationSignal)
+			try {
+				throwIfAborted(operationSignal)
+				if (!staged.entrypoint) throw new Error("MCP extension has no entrypoint")
+				const signal = callSignal(operationSignal, this.limits.callTimeoutMs)
+				const info = await this.connectMcp(staged.entrypoint, signal, this.permissions)
+				try {
+					const tools = await info.client.listTools({}, this.requestOptions(info.signal))
+					return { ...base, tools: this.validateMcpTools(tools.tools) }
+				} finally { await this.closeMcp(info) }
+			} finally { await staged.cleanup() }
+		})
 	}
 
-	async dispose(): Promise<void> {
-		if (this.disposed) return
+	call(revision: ExtensionRevision, input: unknown, options: ExtensionCallOptions): Promise<unknown> {
+		return this.runOperation(options.signal, async (operationSignal) => {
+			const signal = callSignal(operationSignal, this.limits.callTimeoutMs)
+			const scopedOptions = { ...options, signal }
+			jsonBytes(input, this.limits.maxInputBytes, "extension input")
+			validateRevision(revision, this.workspaceRoot)
+			if (revision.manifest.kind === "skill") return this.callSkill(revision, input)
+			assertOwnedProcessGroupSupported(process.platform)
+			const staged = await stageRevision(revision, this.workspaceRoot, operationSignal)
+			try {
+				throwIfAborted(operationSignal)
+				if (!staged.entrypoint) throw new Error("extension revision has no executable entrypoint")
+				if (revision.manifest.kind === "tool") return await this.callTool(staged.entrypoint, input, revision.manifest.inputSchema, scopedOptions.permissions, signal)
+				if (revision.manifest.kind === "mcp") {
+					if (!options.toolName) throw new Error("MCP extension call requires an advertised tool name")
+					return await this.callMcp(staged.entrypoint, input, options.toolName, scopedOptions.permissions, signal)
+				}
+				throw new Error("extension kind is unsupported")
+			} finally { await staged.cleanup() }
+		})
+	}
+
+	dispose(): Promise<void> {
+		if (this.disposalPromise) return this.disposalPromise
 		this.disposed = true
-		await Promise.all([
-			...Array.from(this.transports, (transport) => transport.close()),
-			...Array.from(this.children, (child) => child.stop()),
-		])
-		this.transports.clear()
-		this.children.clear()
+		const controllers = Array.from(this.operations.keys())
+		const operations = Array.from(this.operations.values())
+		this.disposalPromise = Promise.resolve().then(async () => {
+			for (const controller of controllers) controller.abort()
+			await Promise.allSettled(operations)
+			await Promise.all([
+				...Array.from(this.transports, (transport) => transport.close()),
+				...Array.from(this.children, (child) => child.stop()),
+			])
+			this.transports.clear()
+			this.children.clear()
+		})
+		return this.disposalPromise
 	}
 
 	private async callSkill(revision: ExtensionRevision, input: unknown): Promise<unknown> {
@@ -428,7 +457,30 @@ export class SessionExtensionRuntime {
 		}
 	}
 
-	private assertOpen(): void { if (this.disposed) throw new Error("extension runtime has been disposed") }
+	private runOperation<T>(signal: AbortSignal | undefined, operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+		if (this.disposed) return Promise.reject(new Error("extension runtime has been disposed"))
+		const controller = new AbortController()
+		const abort = () => controller.abort()
+		if (signal?.aborted) controller.abort()
+		else signal?.addEventListener("abort", abort, { once: true })
+		const task = Promise.resolve().then(() => {
+			throwIfAborted(controller.signal)
+			return operation(controller.signal)
+		})
+		const tracked = task.finally(() => {
+			this.operations.delete(controller)
+			signal?.removeEventListener("abort", abort)
+		})
+		this.operations.set(controller, tracked)
+		return tracked
+	}
 }
 
-export const extensionRuntimeTestHooks = Object.freeze({ validateRevision, fixedCommand, childEnvironment, stageRevision })
+export const extensionRuntimeTestHooks = Object.freeze({
+	validateRevision,
+	fixedCommand,
+	childEnvironment,
+	stageRevision,
+	assertOwnedProcessGroupSupported,
+	setStageRevisionBarrierForTests: (barrier?: () => Promise<void>) => { stageRevisionBarrierForTests = barrier },
+})
