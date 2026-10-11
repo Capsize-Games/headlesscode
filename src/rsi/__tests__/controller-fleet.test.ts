@@ -160,6 +160,8 @@ class FakeFleetQueue {
 			if (adversarial) {
 				this.adversarialEvaluationJobCount += 1
 				assert.deepEqual(input.payload.evalCommands, ["node --import tsx __headlesscode_rsi_adversarial__/runner.mjs"])
+				assert.match(input.payload.adversarialEvaluation?.testsSha256 ?? "", /^[a-f0-9]{64}$/, "queued adversarial payload pins the supervisor-authored test bytes")
+				assert.match(input.payload.adversarialEvaluation?.runnerSha256 ?? "", /^[a-f0-9]{64}$/, "queued adversarial payload pins the fixed supervisor runner")
 				const bundle = this.artifacts.get(input.artifactSha256)
 				assert.ok(bundle)
 			} else this.evaluationJobCount += input.candidateId === "baseline" ? 0 : 1

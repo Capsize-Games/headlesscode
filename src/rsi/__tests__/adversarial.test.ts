@@ -7,8 +7,8 @@ import test from "node:test"
 import { OpenRouterClient } from "../../llm/openrouter.js"
 import { OllamaClient } from "../../llm/ollama.js"
 import { createAdversarialRoleClient, parseAdversarialReview, requestAdversarialReview } from "../adversarial.js"
-import { ADVERSARIAL_COMMAND } from "../adversarial.js"
-import { createAdversarialEvaluationSnapshotBundle } from "../openshell.js"
+import { ADVERSARIAL_COMMAND, ADVERSARIAL_RUNNER_PATH, ADVERSARIAL_TESTS_PATH } from "../adversarial.js"
+import { adversarialEvaluationArtifactIdentity, createAdversarialEvaluationSnapshotBundle, readVerifiedAdversarialEvaluationArtifacts } from "../openshell.js"
 import type { CandidateRecord, RsiConfig } from "../types.js"
 import type { LlmClient, LlmRequest, LlmResponse } from "../../engine/types.js"
 
@@ -56,13 +56,17 @@ test("bounded generated test artifact runs only through the fixed isolated evalu
 		fs.mkdirSync(path.join(repo, "src"), { recursive: true })
 		fs.mkdirSync(path.join(repo, "scripts", "eval-suite"), { recursive: true })
 		fs.mkdirSync(path.join(repo, "src", "rsi"), { recursive: true })
+		fs.mkdirSync(path.join(repo, "__headlesscode_rsi_adversarial__"), { recursive: true })
 		fs.writeFileSync(path.join(repo, "src", "behavior.mjs"), "export function classify(value) { return value === null ? 'zero' : 'other' }\n")
+		fs.writeFileSync(path.join(repo, ADVERSARIAL_TESTS_PATH), "candidate-authored evaluator input\n")
+		fs.writeFileSync(path.join(repo, ADVERSARIAL_RUNNER_PATH), "candidate-authored runner\n")
 		fs.writeFileSync(path.join(repo, "scripts", "eval-suite", "hidden.js"), "secret\n")
 		fs.writeFileSync(path.join(repo, "src", "rsi", "fitness.ts"), "hidden scoring\n")
 		execFileSync("git", ["add", "--all"], { cwd: repo })
 		execFileSync("git", ["commit", "--quiet", "-m", "candidate"], { cwd: repo })
 		const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim()
 		const tests = Buffer.from(JSON.stringify({ schemaVersion: 1, tests: validDraft.tests }))
+		const identity = adversarialEvaluationArtifactIdentity(tests)
 		const bundle = createAdversarialEvaluationSnapshotBundle(repo, head, { protectedPaths: [], repoRoot: repo } as unknown as RsiConfig, tests)
 		const bundlePath = path.join(unpack, "snapshot.bundle")
 		const clone = path.join(unpack, "repo")
@@ -73,6 +77,7 @@ test("bounded generated test artifact runs only through the fixed isolated evalu
 		assert.equal(fs.existsSync(path.join(clone, "src", "rsi", "fitness.ts")), false)
 		assert.equal(fs.existsSync(path.join(clone, "__headlesscode_rsi_adversarial__", "tests.json")), true)
 		assert.equal(fs.existsSync(path.join(clone, "__headlesscode_rsi_adversarial__", "runner.mjs")), true)
+		assert.deepEqual(readVerifiedAdversarialEvaluationArtifacts(clone, identity).tests, tests, "source-authored reserved files are replaced with the exact supervisor artifact")
 		assert.equal(ADVERSARIAL_COMMAND, "node --import tsx __headlesscode_rsi_adversarial__/runner.mjs")
 		fs.symlinkSync(path.join(process.cwd(), "node_modules"), path.join(clone, "node_modules"), "dir")
 		assert.equal(execFileSync("node", ["--import", "tsx", "__headlesscode_rsi_adversarial__/runner.mjs"], { cwd: clone, encoding: "utf8" }).trim(), "PASS null-sign")
