@@ -76,8 +76,7 @@ export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-...
 headlesscode --task "Fix the bug in src/index.ts" --workspace /path/to/repo
 ```
 
-The default model is Muse Spark 1.3 Contributor through OpenRouter. OpenRouter
-lists it at $0.10/M input tokens, $0.20/M output tokens, and $0.002/M cached
+The default model is Muse Spark 1.3 Contributor through OpenRouter. [OpenRouter lists it](https://openrouter.ai/meta/muse-spark-1.3-contributor) at $0.10/M input tokens, $0.20/M output tokens, and $0.002/M cached
 input tokens. OpenRouter notes that prompts and outputs sent to this Contributor
 model may be used to improve Meta's products. Use `OPENROUTER_MODEL` or
 `--model` to select another OpenRouter model.
@@ -106,8 +105,9 @@ headlesscode --task "Fix the bug in src/index.ts" --workspace /path/to/repo
 ```
 
 Notes: the `-contributor` model variants (`muse-spark-1.3-contributor`,
-`muse-spark-1.2-contributor`) are cheaper but grant Meta permission to
-train on the traffic — pick them explicitly, never by default. Vision
+`muse-spark-1.2-contributor`) use the [Contributor pricing tier](https://dev.meta.ai/docs/pricing-rate-limits)
+and permit Meta to train on the traffic. Select them explicitly when using the
+direct Meta API; its default is the Standard model. Vision
 captioning (`describe_image`, screenshots) and OpenShell sandboxed
 execution still use OpenRouter regardless of this setting.
 
