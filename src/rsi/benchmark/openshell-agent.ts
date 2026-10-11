@@ -78,6 +78,7 @@ export class OpenShellBenchmarkAgent implements BenchmarkAgent {
 		const baseCommit = git(privateWorkspace, ["rev-parse", "HEAD"])
 		const parsed = parseRsiArgs(["--repo", this.harnessRoot, "--model", request.model.id, "--max-iterations", String(request.ceilings.maxCalls), "--timeout-ms", String(request.ceilings.timeoutMs), "--max-tokens", String(request.ceilings.maxOutputTokensPerCall)])
 		if (!parsed.config || parsed.error) throw new Error(parsed.error ?? "could not construct OpenShell benchmark configuration")
+		parsed.config.mutationTask = request.task
 		parsed.config.benchmarkHarnessCommit = request.harnessCommit
 		if (openRouter) {
 			if (!profile) throw new Error("benchmark worker has no admitted OpenRouter profile")
