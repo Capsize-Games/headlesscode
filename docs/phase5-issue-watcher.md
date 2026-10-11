@@ -99,8 +99,8 @@ The watcher closes it by persisting **before** spawning:
 2. spawn;
 3. For ordinary issues, record the spawn result. For `headlesscode-job`, a
    successful spawn remains `spawned`; a later poll records `done` or `failed`
-   only after every worktree has both `.harness.done/` and a valid
-   `.harness.exit` value.
+   only after every worker has an attempt-bound supervisor receipt, a
+   verified-absent process group, and verified OpenShell cleanup when used.
 
 Consequences:
 
@@ -127,7 +127,10 @@ After detached dispatch, the watcher keeps a `headlesscode:running` label and
 reserves the worktrees against its concurrency limit. Each dispatch receives a
 random attempt ID. On Linux, a detached supervisor starts the worker wrapper
 behind a pipe gate, records its process group and `/proc` start time in a
-private receipt directory outside the worktrees, and then releases the worker.
+private receipt directory outside the worktrees. The launcher validates that
+identity and writes a matching acknowledgment before the supervisor releases
+the worker. A missing or mismatched acknowledgment leaves the task gated while
+the supervisor kills and verifies removal of its process group.
 The supervisor waits for the wrapper's actual child exit status and for the
 process group to disappear before writing an attempt-bound completion receipt.
 A later continuous poll requires matching receipts and a verified-absent
