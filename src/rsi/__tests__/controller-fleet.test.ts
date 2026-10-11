@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
-import test from "node:test"
+import test, { after, before } from "node:test"
 import { checkpointRun } from "../archive.js"
 import { runRsi as runRsiImplementation } from "../controller.js"
 import { createMutationSnapshotBundle } from "../openshell.js"
@@ -13,6 +13,23 @@ import { newCandidate } from "../workspace.js"
 import type { CandidateRecord, RsiConfig, RsiRunRecord, RsiHooks, TrialResult } from "../types.js"
 import { fakeDevelopmentBenchmarkHook } from "./development-proof-fixture.js"
 import { fixtureDevelopmentProofProtocol } from "./development-proof-fixture.js"
+
+const originalPolicyPath = process.env.HEADLESSCODE_OPENSHELL_POLICY
+let syntheticPolicyDirectory: string | undefined
+before(async () => {
+	const scratch = path.resolve(".headlesscode/scratch")
+	await fs.mkdir(scratch, { recursive: true, mode: 0o700 })
+	syntheticPolicyDirectory = await fs.mkdtemp(path.join(scratch, "synthetic-fleet-policy-"))
+	const policyPath = path.join(syntheticPolicyDirectory, "policy.yaml")
+	await fs.writeFile(policyPath, "sandbox:\n  network: disabled\n", { mode: 0o600 })
+	await fs.chmod(policyPath, 0o600)
+	process.env.HEADLESSCODE_OPENSHELL_POLICY = policyPath
+})
+after(async () => {
+	if (originalPolicyPath === undefined) delete process.env.HEADLESSCODE_OPENSHELL_POLICY
+	else process.env.HEADLESSCODE_OPENSHELL_POLICY = originalPolicyPath
+	if (syntheticPolicyDirectory) await fs.rm(syntheticPolicyDirectory, { recursive: true, force: true })
+})
 
 function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queue?: PostgresRsiJobQueue): Promise<RsiRunRecord> {
 	return runRsiImplementation(config, { syntheticRuntimeIdentity: true, runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook(), ...hooks }, queue)
