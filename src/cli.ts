@@ -49,6 +49,7 @@ import { evidenceJournalFromEnv, evidenceJournalFromProtectedConfigFile, runEvid
 
 import { finishSessionEmergencyControl, startSessionEmergencyControl } from "./control/session-runtime.js"
 import type { SkillRegistry } from "./skills/registry.js"
+import type { RsiCliEntrypoint } from "./rsi-cli-contract.js"
 
 const VERSION = (JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version
 
@@ -806,52 +807,16 @@ export async function main(argv: string[] = process.argv.slice(2), hooks?: CliRu
 	if (argv[0] === "openshell-session") {
 		return openShellSessionMain(argv.slice(1))
 	}
-	if (argv[0] === "rsi-worker") {
-		const { rsiWorkerMain } = await import("./rsi/worker.js")
-		return rsiWorkerMain()
-	}
-	if (argv[0] === "rsi-benchmark") {
-		const { benchmarkMain } = await import("./rsi/benchmark/cli.js")
-		return benchmarkMain(argv.slice(1))
-	}
-	if (argv[0] === "rsi-train-model") {
-		const { parseRsiArgs } = await import("./rsi/config.js")
-		const { readArchive } = await import("./rsi/archive.js")
-		const { PostgresRsiJobQueue, fleetQueuePolicy } = await import("./rsi/postgres-queue.js")
-		const { runBoundedModelCandidate } = await import("./rsi/model-training.js")
-		const parsed = parseRsiArgs(argv.slice(1))
-		if (parsed.help) {
-			stdout.write("Usage: headlesscode rsi-train-model --repo <path> --archive-dir <path> --resume <run-id> --model-candidate-id <id>\nThe registered worker must use an OpenShell training image and a local Hugging Face checkpoint.\n")
-			return 0
-		}
-		if (parsed.error || !parsed.config || !parsed.config.resumeRunId || !parsed.config.modelCandidateId || parsed.config.dryRun) {
-			stderr.write(`headlesscode rsi-train-model: ${parsed.error ?? "--resume and --model-candidate-id are required; dry-run is unsupported"}\n`)
-			return 2
-		}
-		const config = parsed.config
-		const archive = await readArchive(config.archiveDir)
-		const run = archive.activeRuns.find((entry) => entry.runId === config.resumeRunId) ?? archive.runs.find((entry) => entry.runId === config.resumeRunId)
-		if (!run) {
-			stderr.write(`headlesscode rsi-train-model: RSI run not found in ${config.archiveDir}\n`)
-			return 2
-		}
-		const policy = fleetQueuePolicy(process.env.HEADLESSCODE_RSI_QUEUE_NAME?.trim() || "rsi-default", config.maxConcurrent, process.env)
-		const queue = PostgresRsiJobQueue.fromEnvironment(policy, process.env)
-		try {
-			await queue.migrate()
-			const model = await runBoundedModelCandidate(config, run, queue, config.modelCandidateId!)
-			stdout.write(`[rsi-model] ${model.id}: ${model.status}; eligible=${model.eligibleForSelection === true}\n`)
-			return model.eligibleForSelection ? 0 : 1
-		} finally {
-			await queue.close()
-		}
-	}
-	// Bounded recursive self-improvement: the supervisor owns the evaluator,
-	// archive, and selection logic while each candidate runs in its own
-	// worktree. See docs/recursive-self-improvement.md.
-	if (argv[0] === "improve") {
-		const { improveMain } = await import("./rsi/controller.js")
-		return improveMain(argv.slice(1))
+	if (["rsi-worker", "rsi-benchmark", "rsi-train-model", "improve"].includes(argv[0] ?? "")) {
+		// Keep the protected RSI implementation outside candidate snapshots while
+		// preserving one typed, host-checked CLI boundary. A variable module URL
+		// prevents TypeScript from resolving the deliberately withheld source.
+		const moduleUrl = new URL("./rsi/cli.js", import.meta.url).href
+		const module = await import(moduleUrl) as { rsiCliMain?: unknown }
+		if (typeof module.rsiCliMain !== "function") throw new Error("protected RSI CLI entrypoint is unavailable")
+		const code = await (module.rsiCliMain as RsiCliEntrypoint)(argv, { stdout, stderr })
+		if (!Number.isInteger(code) || code < 0 || code > 255) throw new Error("protected RSI CLI returned an invalid exit code")
+		return code
 	}
 
 	// Phase 2 subcommand: `headlesscode orchestrate ...` — delegates to the
