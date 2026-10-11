@@ -11,6 +11,7 @@ import type { CandidateRecord, RsiConfig, RsiRunRecord, TrialResult, WorkerHarne
 import { fakeDevelopmentBenchmarkHook } from "./development-proof-fixture.js"
 import { withSyntheticEvaluatorPolicy } from "./synthetic-evaluator-runtime.js"
 import { validateCandidateParent } from "../controller.js"
+import { candidateId } from "../workspace.js"
 
 function ok(command: string): TrialResult {
 	return { ok: true, command, exitCode: 0, durationMs: 1, stdout: "", stderr: "" }
@@ -93,6 +94,9 @@ async function runControllerFixture(): Promise<void> {
 		})
 		const parent = run.candidates.find((candidate) => candidate.generation === 0)!
 		const child = run.candidates.find((candidate) => candidate.generation === 1)!
+		assert.equal(run.candidateIdNamespace, run.runId.slice(-8))
+		assert.equal(parent.id, candidateId(0, 0, config.seed, run.runId.slice(-8)), "paired proof candidate identity keeps its established run-derived suffix")
+		assert.equal(child.id, candidateId(1, 0, config.seed, run.runId.slice(-8)), "paired generation slot identity remains unchanged")
 		const integrityManifest = JSON.parse(await fs.readFile(path.join(config.archiveDir, run.evaluatorIntegrity!.manifestPath!), "utf8")) as { payload: { input: { imageIdentity: { identitySource: string; pinnedImageDigest: string | null; workerHarnessRuntime: { imageDigest: string } | null } } } }
 		assert.equal(integrityManifest.payload.input.imageIdentity.identitySource, "synthetic-test-hooks")
 		assert.equal(integrityManifest.payload.input.imageIdentity.pinnedImageDigest, `sha256:${"0".repeat(64)}`)
