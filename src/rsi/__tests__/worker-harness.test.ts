@@ -121,7 +121,9 @@ async function testSentinelDiffEditsOnlyTheCodeModePromptReturn(): Promise<void>
 		const changed = await fs.readFile(path.join(workspace, "prompt.ts"), "utf8")
 		assert.equal(changed.split(marker).length - 1, 1, "the marker should appear once in the intended prompt function")
 		assert.equal(changed.split("return { prompt: fullPromptWithSentinel, modeConfig, customModes }").length - 1, 1)
-	assert.equal(changed.split("return { prompt: fullPrompt, modeConfig, customModes }").length - 1, 1, "the separate lean-prompt implementation should remain unchanged")
+		const leanFunctionStart = source.indexOf("export async function buildLeanSystemPrompt(")
+		assert.ok(leanFunctionStart > 0)
+		assert.equal(changed.slice(changed.indexOf("export async function buildLeanSystemPrompt(")), source.slice(leanFunctionStart), "the complete separate lean-prompt implementation must remain unchanged")
 	} finally {
 		await fs.rm(workspace, { recursive: true, force: true })
 	}
