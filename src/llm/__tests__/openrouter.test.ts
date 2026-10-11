@@ -131,13 +131,14 @@ async function testOversizedLatestToolGroupIsClippedWithoutMutatingEvidence(): P
 	const tools = [{ type: "function" as const, function: { name: "read_file", parameters: { type: "object", properties: { path: { type: "string" } } } } }]
 	const latestCalls = Array.from({ length: 4 }, (_, index) => ({ id: `new-${index}`, type: "function" as const, function: { name: "read_file", arguments: JSON.stringify({ path: `file-${index}.ts`, retained: `arg-${index}` }) } }))
 	const denseChunk = ["é", "🙂", "\\", "\"", "\n"].join("")
+	const diagnosticSuffix = (index: number) => `\nTEST-STATUS-${index}: assertion failed at end of file\n`
 	const messages: LlmRequest["messages"] = [
 		{ role: "system", content: "stable system prefix" },
 		{ role: "user", content: "stable first task" },
 		{ role: "assistant", content: null, tool_calls: [{ id: "old-call", type: "function", function: { name: "read_file", arguments: "{\"path\":\"old\"}" } }] },
 		{ role: "tool", tool_call_id: "old-call", name: "read_file", content: "old result" },
 		{ role: "assistant", content: null, tool_calls: latestCalls },
-		...latestCalls.map((call, index) => ({ role: "tool" as const, tool_call_id: call.id, name: "read_file", content: `${denseChunk.repeat(5_000)}-${index}` })),
+		...latestCalls.map((call, index) => ({ role: "tool" as const, tool_call_id: call.id, name: "read_file", content: `${denseChunk.repeat(5_000)}${diagnosticSuffix(index)}` })),
 	]
 	const request: LlmRequest = { model: "meta/muse-spark-1.3-contributor", messages, tools, cacheRoutingKey }
 	const original = JSON.stringify(messages)
@@ -154,8 +155,13 @@ async function testOversizedLatestToolGroupIsClippedWithoutMutatingEvidence(): P
 	const packedResults = result.body.messages.filter((message: { role: string; tool_call_id?: string }) => message.role === "tool")
 	assert.deepEqual(packedResults.map((message: { tool_call_id: string }) => message.tool_call_id), latestCalls.map((call) => call.id), "every retained call has exactly its matching result")
 	assert.ok(packedResults.every((message: { content: string }) => message.content.includes("shortened to fit the request byte budget")), "each shortened excerpt carries an explicit notice")
-	assert.ok(packedResults.every((message: { content: string }, index: number) => message.content.length < messages[index + 5]!.content!.length), "only transmitted tool-result copies are shortened")
+	assert.ok(packedResults.every((message: { content: string }) => message.content.includes("middle omitted")), "the notice identifies the omitted middle")
+	assert.ok(packedResults.every((message: { content: string }, index: number) => {
+		const originalContent = messages[index + 5]!.content!
+		return message.content.length < originalContent.length && message.content.startsWith(denseChunk.slice(0, 4)) && message.content.endsWith(diagnosticSuffix(index))
+	}), "each transmitted copy retains a meaningful head and its diagnostic tail")
 	assert.ok(packedResults.every((message: { content: string }) => isWellFormedUnicode(message.content)), "excerpt clipping never leaves a lone UTF-16 surrogate")
+	assert.ok(packedResults.every((message: { content: string }) => message.content.includes("\\\"\n")), "dense escaped quotes, backslashes, and newlines survive in the excerpts")
 	assert.equal(result.body.prompt_cache_key, cacheRoutingKey, "cache routing key remains stable")
 	assert.deepEqual(result.body.tools, tools, "tool schemas remain verbatim")
 }
@@ -293,6 +299,48 @@ async function testTranscriptSeparatesPackedWireMessagesFromOriginalHistory(): P
 		}
 		assert.equal(records.find((record) => record.wireRequest.stream === true)?.wireRequest.stream_options.include_usage, true, "stream transcript records the actual measured stream options")
 	} finally {
+		if (previous === undefined) delete process.env.HEADLESSCODE_CAPTURE_TRANSCRIPT_DIR
+		else process.env.HEADLESSCODE_CAPTURE_TRANSCRIPT_DIR = previous
+		fs.rmSync(scratch, { recursive: true, force: true })
+	}
+}
+
+async function testStreamingUpstreamErrorTranscriptUsesPackedWireView(): Promise<void> {
+	const scratch = path.resolve(".headlesscode/scratch/openrouter-byte-budget-stream-error")
+	fs.rmSync(scratch, { recursive: true, force: true })
+	fs.mkdirSync(scratch, { recursive: true })
+	const previous = process.env.HEADLESSCODE_CAPTURE_TRANSCRIPT_DIR
+	process.env.HEADLESSCODE_CAPTURE_TRANSCRIPT_DIR = scratch
+	const messages: LlmRequest["messages"] = [
+		{ role: "system", content: "system" },
+		{ role: "user", content: "task" },
+		{ role: "assistant", content: null, tool_calls: [{ id: "stream-error-tc", type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: "source.ts" }) } }] },
+		{ role: "tool", tool_call_id: "stream-error-tc", name: "read_file", content: "evidence-🙂\\\"\n".repeat(500) },
+	]
+	const original = JSON.stringify(messages)
+	const request: LlmRequest = { model: "meta/muse-spark-1.3-contributor", messages, stream: true }
+	const previousFetch = globalThis.fetch
+	try {
+		globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+			assert.equal(JSON.parse(String(init?.body)).stream, true, "the failed request is sent as a stream")
+			return new Response("synthetic upstream failure", { status: 502 })
+		}) as typeof fetch
+		const client = new OpenRouterClient({ apiKey: "synthetic", baseUrl: "http://mock", maxPromptBytes: 900 })
+		await assert.rejects(client.createChatCompletion(request), /HTTP 502/)
+		const file = fs.readdirSync(scratch).find((entry) => entry.startsWith("openrouter-"))
+		assert.ok(file, "a failed streamed request is transcribed")
+		const records = fs.readFileSync(path.join(scratch, file!), "utf8").trim().split("\n").map((line) => JSON.parse(line))
+		assert.equal(records.length, 1)
+		const [record] = records
+		assert.equal(record.error.includes("HTTP 502"), true, "the upstream failure is recorded")
+		assert.equal(record.wireRequest.stream, true)
+		assert.equal(record.wireRequest.stream_options.include_usage, true)
+		assert.deepEqual(record.messages, record.wireRequest.messages, "error transcript messages match the actual packed wire view")
+		assert.deepEqual(record.originalMessages, messages, "full local evidence stays intact on a streaming error")
+		assert.equal(JSON.stringify(record.originalMessages), original)
+		assert.ok(record.messages[3].content.includes("middle omitted"), "the packed error transcript contains the clipped view")
+	} finally {
+		globalThis.fetch = previousFetch
 		if (previous === undefined) delete process.env.HEADLESSCODE_CAPTURE_TRANSCRIPT_DIR
 		else process.env.HEADLESSCODE_CAPTURE_TRANSCRIPT_DIR = previous
 		fs.rmSync(scratch, { recursive: true, force: true })
@@ -972,6 +1020,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["role-aware prefixes preserve user-only and multiple-system histories", testRoleAwarePrefixKeepsUserOnlyAndMultipleSystemHistories],
 	["impossible prefixes and invalid byte budgets fail locally", testImpossiblePrefixAndInvalidBudgetsFailBeforeNetwork],
 	["transcripts preserve packed wire messages and original local history separately", testTranscriptSeparatesPackedWireMessagesFromOriginalHistory],
+	["streaming upstream errors capture packed wire messages and unchanged original history", testStreamingUpstreamErrorTranscriptUsesPackedWireView],
 	["OpenRouter response usage and generation billing metadata are preserved", testOpenRouterUsageCostAndGenerationMetadataAreMapped],
 	["malformed generation cost evidence is omitted", testMalformedGenerationBillingIsNotReportedAsAuthoritative],
 	["generation metadata retries after delayed visibility", testGenerationMetadataRetriesAfterDelayedVisibility],

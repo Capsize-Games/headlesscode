@@ -1,7 +1,7 @@
 import type { ChatMessage } from "../engine/types.js"
 
 export const OPENROUTER_MAX_PROMPT_BYTES_ENV = "HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES"
-export const TOOL_RESULT_BUDGET_NOTICE = "\n\n[tool result excerpt shortened to fit the request byte budget; the full result remains in local session history]"
+export const TOOL_RESULT_BUDGET_NOTICE = "\n\n[... middle omitted; tool result shortened to fit the request byte budget; full result remains in local session history ...]\n\n"
 
 export class PromptByteBudgetError extends Error {
 	constructor(message: string) {
@@ -151,7 +151,11 @@ export function packRequestBody(body: Record<string, unknown>, maxBytes: number)
 			const originalText = originals[i]!
 			const points = codePoints[i]!
 			const keep = Math.floor(points.length * fraction)
-			if (keep < points.length) packed[index]!.content = `${points.slice(0, keep).join("")}${TOOL_RESULT_BUDGET_NOTICE}`
+			if (keep < points.length) {
+				const headCount = Math.ceil(keep / 2)
+				const tailCount = keep - headCount
+				packed[index]!.content = `${points.slice(0, headCount).join("")}${TOOL_RESULT_BUDGET_NOTICE}${tailCount > 0 ? points.slice(-tailCount).join("") : ""}`
+			}
 		}
 		return serializedCandidate(body, [...prefix, ...packed.slice(prefix.length)])
 	}
