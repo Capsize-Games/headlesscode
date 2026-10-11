@@ -322,6 +322,7 @@ export function rsiMutationGuestEnvironment(config: RsiConfig, candidate: Candid
 		return {
 			HEADLESSCODE_CODE_MODE_BACKEND: "openrouter",
 			HEADLESSCODE_CODE_MODE_MODEL: profile.model,
+			OPENROUTER_MODEL: profile.model,
 			OPENROUTER_BASE_URL: inferenceBroker.guestBaseUrl,
 			HEADLESSCODE_RSI_INFERENCE_CAPABILITY: inferenceBroker.capability,
 			HEADLESSCODE_CAPTURE_TRANSCRIPT_DIR: path.join("/workspace", ".headlesscode", "rsi-transcripts"),
