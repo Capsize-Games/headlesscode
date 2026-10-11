@@ -1965,6 +1965,12 @@ type ListFilesCallEntry = {
 	/** The condensation generation this key was last (really) listed at. */
 	generation: number
 	/**
+	 * Exact identity of the bounded visible listing last stored for this key:
+	 * JSON of the sorted dirs-first entries plus the truncation flag. A repeat
+	 * call is only a cache hit when the fresh walk serializes identically.
+	 */
+	signature: string
+	/**
 	 * Whether the LAST identical call already got the short cache-hit
 	 * message instead of a real listing. When true, the next identical
 	 * call gets a real listing again — mirrors read_file's toldUnchanged
@@ -2009,18 +2015,44 @@ function listFilesHandler(
 		const rel = path.relative(ctx.workspaceRoot, target).toPosix() || path.basename(target) || "."
 		const key = `${target} ${recursive}`
 		const entry = calls?.get(key)
-
-		// See readFileHandler's disableReadFileCache comment for the full
-		// rationale (same short-circuit shape, same local-backend risk).
-		if (
+		const guardEligible =
 			!ctx.disableReadFileCache &&
 			calls !== undefined &&
 			generation !== undefined &&
 			entry !== undefined &&
 			entry.generation === generation
-		) {
-			if (!entry.toldUnchanged) {
-				entry.toldUnchanged = true
+
+		// Fresh bounded walk before deciding unchanged: the visible tree may
+		// have changed (write_to_file additions, renames) since the last
+		// listing, so a repeat (path, recursive) alone is never a cache hit.
+		let collected: { entries: Array<{ rel: string; isDir: boolean }>; truncated: boolean }
+		try {
+			collected = await collectEntries(target, ctx.workspaceRoot, recursive)
+		} catch (error) {
+			return err(`list_files: cannot list '${rel}': ${errorMessage(error)}`)
+		}
+
+		// Sort dirs first, then alphabetically (over the collected subset).
+		collected.entries.sort((a, b) => {
+			if (a.isDir !== b.isDir) {
+				return a.isDir ? -1 : 1
+			}
+			return a.rel.localeCompare(b.rel)
+		})
+
+		// Exact bounded identity: sorted [rel, isDir] pairs plus truncation.
+		// SHA-256 over the unambiguous JSON serialization — no weak 32-bit
+		// hash, so distinct visible filenames can never collide into a false
+		// cache hit.
+		const signature = createHash("sha256")
+			.update(JSON.stringify([collected.entries.map((e) => [e.rel, e.isDir]), collected.truncated]))
+			.digest("hex")
+
+		// See readFileHandler's disableReadFileCache comment for the full
+		// rationale (same short-circuit shape, same local-backend risk).
+		if (guardEligible && signature === (entry as ListFilesCallEntry).signature) {
+			if (!(entry as ListFilesCallEntry).toldUnchanged) {
+				;(entry as ListFilesCallEntry).toldUnchanged = true
 				return ok(
 					`[cache] '${rel}' (recursive=${recursive}) was already listed earlier this session and nothing has been ` +
 						`condensed since — reuse the earlier result above instead of re-listing. Re-listing again will re-run ` +
@@ -2032,27 +2064,13 @@ function listFilesHandler(
 			// refusing again would just repeat the same unproductive exchange.
 		}
 
-		let collected: { entries: Array<{ rel: string; isDir: boolean }>; truncated: boolean }
-		try {
-			collected = await collectEntries(target, ctx.workspaceRoot, recursive)
-		} catch (error) {
-			return err(`list_files: cannot list '${rel}': ${errorMessage(error)}`)
-		}
-
 		// Only recorded on SUCCESS: a failed listing (e.g. bad path) should
 		// remain retryable with the real error, never masked by the cache-hit
-		// notice above.
+		// notice above. A changed tree stores its fresh signature with a reset
+		// one-notice cadence.
 		if (calls !== undefined && generation !== undefined) {
-			calls.set(key, { generation, toldUnchanged: false })
+			calls.set(key, { generation, signature, toldUnchanged: false })
 		}
-
-		// Sort dirs first, then alphabetically (over the collected subset).
-		collected.entries.sort((a, b) => {
-			if (a.isDir !== b.isDir) {
-				return a.isDir ? -1 : 1
-			}
-			return a.rel.localeCompare(b.rel)
-		})
 
 		const lines = collected.entries.slice(0, MAX_LIST_FILES).map((e) => (e.isDir ? `${e.rel}/` : e.rel))
 		// Once the walk was capped the true total is unknown, so the trailer
