@@ -11,7 +11,8 @@
  * - optional file/directory scope is honored; traversal is rejected by the
  *   workspace resolver callback (resolveWithinWorkspace in
  *   src/tools/executor.ts) applied to the scope AND to every candidate;
- * - symlinks whose real location escapes the workspace are skipped;
+ * - ALL symlinks are skipped, so a source alias cannot reveal excluded
+ *   credentials or generated files;
  * - credential-looking files are skipped;
  * - hard bounds on files searched, bytes per file, total bytes, returned
  *   matches, and snippet length keep the fallback cheap and the model
@@ -153,10 +154,15 @@ export async function lexicalSearch(
 		} catch {
 			continue
 		}
-		if (!st.isFile() && !st.isSymbolicLink()) {
+		// Skip ALL symlinks: a source alias must not reveal excluded
+		// credentials.json or dist/generated.ts via lexical search.
+		if (st.isSymbolicLink()) {
 			continue
 		}
-		// Skip symlinks escaping the workspace.
+		if (!st.isFile()) {
+			continue
+		}
+		// Skip files whose real location escapes the workspace.
 		try {
 			const real = await fsp.realpath(abs)
 			if (real !== rootReal && !real.startsWith(rootReal + path.sep)) {
@@ -171,10 +177,8 @@ export async function lexicalSearch(
 				continue
 			}
 		} catch {
-			// Dangling/unresolvable symlink — skip.
-			if (st.isSymbolicLink()) {
-				continue
-			}
+			// Unresolvable path (file disappeared between lstat and read) —
+			// fall back to the lstat size bound.
 			if (st.size > LEXICAL_MAX_BYTES_PER_FILE) {
 				filesSearched++
 				continue
