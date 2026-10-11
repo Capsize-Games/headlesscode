@@ -146,6 +146,8 @@ npx tsx src/cli.ts watch --owner <o> --repo <path> --label <target-label> [optio
   --state-file <path>    Durable idempotency state (default:
                          <repo>/.worktrees/.watcher-state.json)
   --mode <slug>          Harness mode for workers (default: code)
+  --executor <builtin|muse> Default worker implementation (default: builtin)
+  --muse-model <id>      Native Muse Meta model id (requires --executor muse)
   --qa / --deploy        Pass-through: recorded on each batch's state entry for
                          the follow-up orchestrate completion run (see below)
   --memory-dir <path>    Memory dir for workers (forwarded to the spawner)
@@ -167,6 +169,21 @@ forwards them as `--max-cost-usd` / `--max-duration-ms` (see
 [`docs/phase6-cloud.md`](./phase6-cloud.md) §2). `--qa` / `--deploy`
 are **pass-through**: the watcher's job is intake (detect → split → spawn);
 completion watching / review / QA / deploy remains the orchestrator's job.
+
+The built-in HeadlessCode worker is the default. `--executor builtin|muse`
+selects a watcher-wide default, and an issue can select its own executor with
+one `executor:builtin` or `executor:muse` label. A Muse model can be pinned
+with `--muse-model <native-id>` when the watcher default is Muse, or with one
+`muse-model:<native-id>` issue label alongside `executor:muse`. Conflicting,
+duplicate, or unknown executor labels fail that issue's intake; the selection
+is stored with its spawned groups and retained for failed-spawn retries.
+
+For Muse jobs, install the Muse CLI on the worker machine and finish `muse login`
+for the Meta account there. The worker invokes native `muse exec` with
+provider `meta`; model ids are not translated from OpenRouter ids. Muse jobs
+require local execution and mode `code`. They cannot run through the contained
+OpenShell profile. See [Phase 2 orchestration](./phase2-orchestration.md) for
+login, safety, and model-selection details.
 Each batch's state entry records the issue, groups, batch id and spawnedAt,
 so the follow-up is a normal `orchestrate` round:
 

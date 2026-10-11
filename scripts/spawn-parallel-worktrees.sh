@@ -48,7 +48,7 @@
 #                        --max-iterations (mirrors how ORCHESTRATOR_MODE is
 #                        passed explicitly). The orchestrator's --max-iterations
 #                        sets this in the spawn env.
-#   SPAWN_MODEL          explicit model override for EVERY worker (like an
+#   SPAWN_MODEL          explicit OpenRouter model override for builtin workers (like an
 #                        --model flag: beats the central store's
 #                        mode-models.json entries; default: unset, each
 #                        worker's mode resolves its own model from the CENTRAL
@@ -59,6 +59,9 @@
 #                        ($OPENROUTER_MODEL, or $HEADLESSCODE_MUSE_MODEL under
 #                        HEADLESSCODE_LLM_PROVIDER=muse) which then flows
 #                        to run-worker.sh)
+#   HEADLESSCODE_AGENT_EXECUTOR  worker implementation: builtin (default)
+#                        or muse; native Meta model selection is separate via
+#                        HEADLESSCODE_MUSE_MODEL and is recorded per group
 #   PLAN_FIRST           when set (e.g. PLAN_FIRST=1), run a SHORT
 #                        architect-mode planning session in each worktree
 #                        BEFORE launching its code worker (issue #49). The
@@ -160,6 +163,48 @@ WORKTREE_PARENT="$REPO_ROOT/.worktrees"
 DATE_TAG="$(date +%Y-%m-%d)"
 STATE_FILE="$WORKTREE_PARENT/.orchestrator-state.json"
 ORCH_MODE="${ORCHESTRATOR_MODE:-code}"
+AGENT_EXECUTOR="${HEADLESSCODE_AGENT_EXECUTOR:-builtin}"
+MUSE_MODEL="${HEADLESSCODE_MUSE_MODEL:-}"
+
+if [ "$AGENT_EXECUTOR" != "builtin" ] && [ "$AGENT_EXECUTOR" != "muse" ]; then
+    echo "spawn-parallel-worktrees: unsupported HEADLESSCODE_AGENT_EXECUTOR='$AGENT_EXECUTOR' (expected builtin or muse)" >&2
+    exit 2
+fi
+if [ -n "$MUSE_MODEL" ] && ! [[ "$MUSE_MODEL" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$ ]]; then
+    echo "spawn-parallel-worktrees: invalid HEADLESSCODE_MUSE_MODEL" >&2
+    exit 2
+fi
+if [ "$AGENT_EXECUTOR" = "muse" ]; then
+    if [ -n "${SPAWN_MODEL:-}" ]; then
+        echo "spawn-parallel-worktrees: SPAWN_MODEL is an OpenRouter model; use HEADLESSCODE_MUSE_MODEL for Muse" >&2
+        exit 2
+    fi
+    if [ "$ORCH_MODE" != "code" ]; then
+        echo "spawn-parallel-worktrees: Muse executor does not implement HeadlessCode modes; expected ORCHESTRATOR_MODE=code" >&2
+        exit 2
+    fi
+    if [ -n "${PLAN_FIRST:-}" ]; then
+        echo "spawn-parallel-worktrees: Muse executor cannot be combined with PLAN_FIRST" >&2
+        exit 2
+    fi
+    if [ "${HEADLESSCODE_EXECUTION_PROVIDER:-local}" != "local" ]; then
+        echo "spawn-parallel-worktrees: Muse executor requires local execution; OpenShell dispatch is unsupported" >&2
+        exit 2
+    fi
+    if ! command -v muse >/dev/null 2>&1; then
+        echo "spawn-parallel-worktrees: Muse executor selected but 'muse' is not installed or not on PATH" >&2
+        exit 2
+    fi
+    for unsupported in HEADLESSCODE_MEMORY_DIR HEADLESSCODE_MAX_COST_USD HEADLESSCODE_MAX_DURATION_MS HEADLESSCODE_DECISION_TIMEOUT_MS HEADLESSCODE_WINDOW_SIZE; do
+        if [ -n "${!unsupported:-}" ]; then
+            echo "spawn-parallel-worktrees: $unsupported is not supported by Muse executor" >&2
+            exit 2
+        fi
+    done
+elif [ -n "$MUSE_MODEL" ]; then
+    echo "spawn-parallel-worktrees: HEADLESSCODE_MUSE_MODEL requires HEADLESSCODE_AGENT_EXECUTOR=muse" >&2
+    exit 2
+fi
 
 # Issue #49 plan-first experiment: OPT-IN, off unless PLAN_FIRST is set. The
 # orchestrator sets these via buildSpawnEnv when --plan-first is passed; a
@@ -559,18 +604,29 @@ EOF
     # worktree may or may not inherit, and an empty resolution adds no flag at
     # all (the worker CLI then applies its own default).
     echo "  Launching headless harness worker for '$name' (mode $ORCH_MODE)..."
-    WORKER_MODEL="$(resolve_mode_model "$ORCH_MODE" "$REPO_ROOT")"
+    WORKER_MODEL=""
+    if [ "$AGENT_EXECUTOR" = "builtin" ]; then
+        WORKER_MODEL="$(resolve_mode_model "$ORCH_MODE" "$REPO_ROOT")"
+    fi
     MODEL_ARGS=()
     if [ -n "$WORKER_MODEL" ]; then
         MODEL_ARGS=(--model "$WORKER_MODEL")
+    fi
+    MUSE_MODEL_PATCH=""
+    if [ -n "$MUSE_MODEL" ]; then
+        MUSE_MODEL_PATCH="      \"museModel\": \"$MUSE_MODEL\","
     fi
     MAX_ITER_ARGS=()
     if [ -n "${HEADLESSCODE_MAX_ITERATIONS:-}" ]; then
         MAX_ITER_ARGS=(--max-iterations "$HEADLESSCODE_MAX_ITERATIONS")
     fi
-    WORKER_PID="$(ORCHESTRATOR_MODE="$ORCH_MODE" bash "$HARNESS_ROOT/scripts/run-worker.sh" \
-        "$wt_path" "ORCHESTRATOR_TASK.md" --mode "$ORCH_MODE" "${MODEL_ARGS[@]}" "${MAX_ITER_ARGS[@]}")"
-    echo "  Worker pid: $WORKER_PID (model: ${WORKER_MODEL:-<unset — CLI default>}, log: $wt_path/harness.log)"
+    EXECUTOR_ARGS=(--executor "$AGENT_EXECUTOR")
+    [ -n "$MUSE_MODEL" ] && EXECUTOR_ARGS+=(--muse-model "$MUSE_MODEL")
+    WORKER_PID="$(ORCHESTRATOR_MODE="$ORCH_MODE" HEADLESSCODE_AGENT_EXECUTOR="$AGENT_EXECUTOR" HEADLESSCODE_MUSE_MODEL="$MUSE_MODEL" bash "$HARNESS_ROOT/scripts/run-worker.sh" \
+        "$wt_path" "ORCHESTRATOR_TASK.md" --mode "$ORCH_MODE" "${EXECUTOR_ARGS[@]}" "${MODEL_ARGS[@]}" "${MAX_ITER_ARGS[@]}")"
+    WORKER_MODEL_LABEL="${WORKER_MODEL:-<unset — CLI default>}"
+    [ "$AGENT_EXECUTOR" = "muse" ] && WORKER_MODEL_LABEL="${MUSE_MODEL:-<Muse Meta default>}"
+    echo "  Worker pid: $WORKER_PID (executor: $AGENT_EXECUTOR, model: $WORKER_MODEL_LABEL, log: $wt_path/harness.log)"
 
     # ── Record "running" now that the worker is up ──────────────────────────
     # plan_first is only recorded when the plan-first phase was actually
@@ -590,6 +646,8 @@ EOF
     {
       "name": "$name",
       "status": "running",
+      "executor": "$AGENT_EXECUTOR",
+$MUSE_MODEL_PATCH
 $PLAN_FIRST_PATCH
       "last_activity": { "note": "harness worker launched (pid $WORKER_PID, mode $ORCH_MODE)" }
     }

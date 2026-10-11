@@ -296,7 +296,7 @@ async function testFindingBelowCapSpawnsAndResetsState(): Promise<void> {
 	)
 	assert.ok(decision.taskContent && decision.taskContent.includes("finding one"), "findings embedded in the task")
 	assert.ok(decision.spawnCommand && decision.spawnCommand.includes("run-worker.sh"), "spawn command calls run-worker.sh directly")
-	assert.ok(decision.spawnCommand?.includes(`--mode "code"`), "spawn command forwards the worker mode")
+	assert.match(decision.spawnCommand ?? "", /--mode ['"]code['"]/, "spawn command forwards the worker mode")
 	assert.ok(decision.spawnCommand?.includes(".worktrees/w1"), "spawn command targets the SAME worktree (no new worktree)")
 
 	// State reset: status back to running, review/QA cleared, count incremented.
@@ -375,7 +375,7 @@ async function testQaFailBelowCapSpawnsAndResetsState(): Promise<void> {
 	)
 	assert.ok(decision.taskContent && decision.taskContent.includes("test suite fails"), "QA evidence embedded in the task")
 	assert.ok(decision.spawnCommand && decision.spawnCommand.includes("run-worker.sh"), "spawn command calls run-worker.sh directly")
-	assert.ok(decision.spawnCommand?.includes(`--mode "code"`), "spawn command forwards the worker mode")
+	assert.match(decision.spawnCommand ?? "", /--mode ['"]code['"]/, "spawn command forwards the worker mode")
 	assert.ok(decision.spawnCommand?.includes(".worktrees/w1"), "spawn command targets the SAME worktree (no new worktree)")
 
 	// State reset: status back to running, review/QA/cost cleared, count incremented.
@@ -1238,7 +1238,7 @@ async function testExhaustionBelowCapSpawnsAndResetsState(): Promise<void> {
 	)
 	assert.ok(decision.taskContent && decision.taskContent.includes("Continuation cycle 1"), "cycle number embedded in the task")
 	assert.ok(decision.spawnCommand && decision.spawnCommand.includes("run-worker.sh"), "spawn command calls run-worker.sh directly")
-	assert.ok(decision.spawnCommand?.includes(`--mode "code"`), "spawn command forwards the worker mode")
+	assert.match(decision.spawnCommand ?? "", /--mode ['"]code['"]/, "spawn command forwards the worker mode")
 	assert.ok(decision.spawnCommand?.includes(".worktrees/w1"), "spawn command targets the SAME worktree (no new worktree)")
 
 	// State reset: status back to running, completion artifacts cleared, count incremented.
@@ -1317,7 +1317,7 @@ async function testExhaustionSpawnForwardsMaxIterations(): Promise<void> {
 	const group = exhaustedGroup()
 	const withCap = handleIterationExhaustion(group, "/tmp/repo", 3, "code", undefined, 7)
 	assert.ok(
-		withCap.spawnCommand?.includes('--max-iterations "7"'),
+		/--max-iterations ['"]7['"]/.test(withCap.spawnCommand ?? ""),
 		"continuation spawn forwards the round-level iteration cap, got " + withCap.spawnCommand,
 	)
 	const withoutCap = handleIterationExhaustion(group, "/tmp/repo", 3, "code")

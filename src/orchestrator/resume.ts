@@ -997,6 +997,8 @@ export async function runReworkStep(opts: ReworkStepOptions): Promise<ReworkStep
 		env: {
 			...process.env,
 			HEADLESSCODE_ROOT: HARNESS_ROOT,
+			HEADLESSCODE_AGENT_EXECUTOR: group.executor ?? "builtin",
+			HEADLESSCODE_MUSE_MODEL: group.museModel ?? "",
 			...(memoryDir ? { HEADLESSCODE_MEMORY_DIR: path.resolve(memoryDir) } : {}),
 		},
 		stdio: "inherit",
@@ -1243,6 +1245,7 @@ async function needsHumanOutcome(
 export async function resumeGroup(opts: ResumeGroupOptions): Promise<ResumeGroupResult> {
 	const { repo, statePath, reviewEnabled, qaEnabled, dryRun, write } = opts
 	let group = opts.group
+	const workerModel = group.executor === "muse" ? undefined : opts.workerModel
 	const wtPath = groupWorktreePath(repo, group)
 
 	// Cost recording is part of the pipeline but never runs in dry-run —
@@ -1345,7 +1348,7 @@ export async function resumeGroup(opts: ResumeGroupOptions): Promise<ResumeGroup
 				repo,
 				opts.maxContinuations,
 				opts.mode,
-				opts.workerModel,
+				workerModel,
 				opts.maxIterations,
 			)
 			if (decision.shouldSpawn && decision.taskFilePath && decision.taskContent && decision.spawnCommand) {
@@ -1361,6 +1364,8 @@ export async function resumeGroup(opts: ResumeGroupOptions): Promise<ResumeGroup
 					env: {
 						...process.env,
 						HEADLESSCODE_ROOT: HARNESS_ROOT,
+						HEADLESSCODE_AGENT_EXECUTOR: group.executor ?? "builtin",
+						HEADLESSCODE_MUSE_MODEL: group.museModel ?? "",
 						...(opts.memoryDir ? { HEADLESSCODE_MEMORY_DIR: path.resolve(opts.memoryDir) } : {}),
 					},
 					stdio: "inherit",
@@ -1411,7 +1416,7 @@ export async function resumeGroup(opts: ResumeGroupOptions): Promise<ResumeGroup
 				statePath,
 				group: g,
 				mode: opts.mode,
-				model: opts.workerModel,
+				model: workerModel,
 				maxReworkCycles: opts.maxReworkCycles,
 				maxIterations: opts.maxIterations,
 				memoryDir: opts.memoryDir,
@@ -1452,7 +1457,7 @@ export async function resumeGroup(opts: ResumeGroupOptions): Promise<ResumeGroup
 					statePath,
 					group: current,
 					mode: opts.mode,
-					model: opts.workerModel,
+					model: workerModel,
 					maxReworkCycles: opts.maxReworkCycles,
 					maxIterations: opts.maxIterations,
 					memoryDir: opts.memoryDir,
@@ -1485,7 +1490,7 @@ export async function resumeGroup(opts: ResumeGroupOptions): Promise<ResumeGroup
 					statePath,
 					group: current,
 					mode: opts.mode,
-					model: opts.workerModel,
+					model: workerModel,
 					maxReworkCycles: opts.maxReworkCycles,
 					maxIterations: opts.maxIterations,
 					memoryDir: opts.memoryDir,
@@ -1817,7 +1822,7 @@ export async function reworkMain(argv: string[], io: ResumeIo = {}): Promise<num
 				`no-findings fallback; the worker will re-audit the previous diff\n`,
 		)
 	}
-	const workerModel = resolveModelForMode({
+	const workerModel = group.executor === "muse" ? undefined : resolveModelForMode({
 		workspaceRoot: repo,
 		mode: options.mode,
 		explicitModel: options.model,

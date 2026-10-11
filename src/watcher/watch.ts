@@ -36,6 +36,7 @@ import {
 	maxConcurrentSessionsFromEnv,
 } from "../budget/concurrency.js"
 import { Logger } from "../engine/logger.js"
+import { museUnsupportedSettingsReason, resolveAgentExecutorSelection, type AgentExecutor, type AgentExecutorSelection } from "../agent-executor.js"
 import { splitIssues, type SplitIssue, type WorktreeSpec } from "../orchestrator/split.js"
 import { loadStateSync } from "../orchestrator/state.js"
 import { writeTaskFiles } from "../orchestrator/cli.js"
@@ -64,6 +65,8 @@ export interface SpawnBatch {
 	repoRoot: string
 	/** Batch id (watcher-<date>). */
 	batch: string
+	executor: AgentExecutor
+	museModel?: string
 }
 
 export interface SpawnResult {
@@ -130,6 +133,9 @@ export interface WatcherConfig {
 	/** Harness mode for workers (forwarded to the spawner as ORCHESTRATOR_MODE). */
 	mode?: string
 	executionProvider?: "local" | "openshell"
+	/** Default worker executor; issue labels can select per-job overrides. */
+	executor?: AgentExecutor
+	museModel?: string
 	/** Memory dir for workers (forwarded to the spawner as HEADLESSCODE_MEMORY_DIR). */
 	memoryDir?: string
 	/** Phase 4 pass-through: recorded on the batch entry (see docs). */
@@ -148,7 +154,7 @@ export interface SweepResult {
 	failures: number
 	state: WatcherState
 	/** Dry-run only: what WOULD be spawned per new issue. */
-	dryRunPlan?: Array<{ issue: GitHubIssue; specs: WorktreeSpec[] }>
+	dryRunPlan?: Array<{ issue: GitHubIssue; specs: WorktreeSpec[]; selection?: AgentExecutorSelection }>
 	error?: string
 }
 
@@ -213,6 +219,11 @@ export async function watchIssues(config: WatcherConfig): Promise<WatchResult> {
 			repoRoot,
 			maxPerSweep,
 			maxConcurrentSessions,
+			executor: config.executor,
+			museModel: config.museModel,
+			mode: config.mode ?? "code",
+			executionProvider: config.executionProvider ?? "local",
+			memoryDir: config.memoryDir,
 			limiter,
 			retryFailed: config.retryFailed,
 			dryRun: config.dryRun,
@@ -256,6 +267,11 @@ interface SweepInput {
 	maxPerSweep: number
 	/** Phase 6: global concurrent-session cap (see WatcherConfig). */
 	maxConcurrentSessions: number
+	executor?: AgentExecutor
+	museModel?: string
+	mode: string
+	executionProvider: "local" | "openshell"
+	memoryDir?: string
 	/** Phase 6: in-process limiter guarding the sweep spawn loop. */
 	limiter: ConcurrencyLimiter
 	retryFailed?: boolean
@@ -357,12 +373,87 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 	}
 
 	for (const issue of toSpawn) {
+		const prior = input.state.processed[String(issue.number)]
+		const retryingFailed = retryFailed && prior?.status === "failed"
+		const retryModelLabels = issue.labels.filter((label) => /^muse-model(?::|$)/i.test(label))
+		if (retryingFailed && prior?.executor && (retryModelLabels.length > 1 || (retryModelLabels.length === 1 && retryModelLabels[0]!.slice(retryModelLabels[0]!.indexOf(":") + 1) !== (prior.museModel ?? "")))) {
+			const message = `watcher: issue #${issue.number} Muse model label changed since its failed spawn; restore the recorded selection before retrying`
+			logger.error(message, { issue: issue.number })
+			failures++
+			continue
+		}
+		const selectionDefaults = retryingFailed && prior?.executor
+			? { executor: prior.executor, museModel: prior.museModel }
+			: { executor: input.executor, museModel: input.museModel }
+		const resolvedSelection = resolveAgentExecutorSelection(issue.labels, selectionDefaults)
+		if (!resolvedSelection.selection) {
+			const message = `watcher: issue #${issue.number} has invalid agent selection: ${resolvedSelection.error}`
+			logger.error(message, { issue: issue.number })
+			failures++
+			if (!dryRun) {
+				const failedAt = new Date().toISOString()
+				state = markProcessed(state, {
+					number: issue.number,
+					title: issue.title,
+					label: targetLabel,
+					status: "failed",
+					updatedAt: failedAt,
+					error: message,
+				})
+				await saveWatcherState(statePath, state)
+			}
+			continue
+		}
+		const selection = resolvedSelection.selection
+		if (selection.executor === "muse" && (input.mode !== "code" || input.executionProvider !== "local")) {
+			const message = `watcher: issue #${issue.number} selects Muse, which requires local execution and mode code`
+			logger.error(message, { issue: issue.number })
+			failures++
+			if (!dryRun) {
+				const failedAt = new Date().toISOString()
+				state = markProcessed(state, {
+					number: issue.number,
+					title: issue.title,
+					label: targetLabel,
+					status: "failed",
+					updatedAt: failedAt,
+					error: message,
+					executor: selection.executor,
+					...(selection.museModel ? { museModel: selection.museModel } : {}),
+				})
+				await saveWatcherState(statePath, state)
+			}
+			continue
+		}
+		if (selection.executor === "muse") {
+			const unsupported = museUnsupportedSettingsReason(input.memoryDir)
+			if (unsupported) {
+				const message = `watcher: issue #${issue.number} selects Muse, but ${unsupported}`
+				logger.error(message, { issue: issue.number })
+				failures++
+				if (!dryRun) {
+					const failedAt = new Date().toISOString()
+					state = markProcessed(state, {
+						number: issue.number,
+						title: issue.title,
+						label: targetLabel,
+						status: "failed",
+						updatedAt: failedAt,
+						error: message,
+						executor: selection.executor,
+						...(selection.museModel ? { museModel: selection.museModel } : {}),
+					})
+					await saveWatcherState(statePath, state)
+				}
+				continue
+			}
+		}
 		const specs = splitIssues([issue], { occupiedNames })
 		for (const spec of specs) {
 			occupiedNames.add(spec.name)
 		}
 		if (dryRun) {
-			dryRunPlan!.push({ issue, specs })
+			dryRunPlan!.push({ issue, specs, selection })
 			continue
 		}
 
@@ -392,11 +483,13 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 				updatedAt: spawnedAt,
 				...(input.qa ? { qa: true } : {}),
 				...(input.deploy ? { deploy: true } : {}),
+				executor: selection.executor,
+				...(selection.museModel ? { museModel: selection.museModel } : {}),
 			}
 			state = markProcessed(state, entry)
 			await saveWatcherState(statePath, state)
 
-			const batchInfo = { issue, specs, repoRoot, batch }
+			const batchInfo = { issue, specs, repoRoot, batch, ...selection }
 			let result: SpawnResult
 			try {
 				result = await spawn(batchInfo)
@@ -513,6 +606,8 @@ export function defaultSpawn(batch: SpawnBatch, config: Pick<WatcherConfig, "mod
 			TARGET_REPO: batch.repoRoot,
 			ORCHESTRATOR_MODE: config.mode ?? "code",
 			HEADLESSCODE_EXECUTION_PROVIDER: config.executionProvider ?? process.env.HEADLESSCODE_EXECUTION_PROVIDER ?? "local",
+			HEADLESSCODE_AGENT_EXECUTOR: batch.executor,
+			HEADLESSCODE_MUSE_MODEL: batch.museModel ?? "",
 			HEADLESSCODE_PROJECT: path.basename(batch.repoRoot),
 			...(config.memoryDir ? { HEADLESSCODE_MEMORY_DIR: path.resolve(config.memoryDir) } : {}),
 		},
