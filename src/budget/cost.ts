@@ -57,24 +57,13 @@ export type PricingTable = Record<string, ModelPrice>
 /**
  * Default pricing table (OpenRouter list rates, USD per 1M tokens).
  *
- * - `meta/muse-spark-1.3-contributor` — the harness default. OpenRouter's
- *   current list rate is $0.10 input / $0.20 output / $0.002 cached input
- *   per 1M tokens. OpenRouter notes that prompts and outputs may be used to
- *   improve Meta's products for this Contributor model.
- * - `deepseek/deepseek-v4-flash-0731` — a prior harness default (Phase 1/2/5
- *   workers). Priced the same as `deepseek/deepseek-v4-flash` (kept below for
- *   override compat) — same model line, dated point-release id. The rate is
- *   the OFFICIAL DeepSeek provider's own rate specifically (verified
- *   against OpenRouter's own
- *   `/api/v1/models/deepseek/deepseek-v4-flash/endpoints` on 2026-08-01,
- *   cross-checked against OpenRouter's own pricing UI). This price is only
- *   actually correct because `src/llm/openrouter.ts` pins routing to this
- *   exact provider (`provider: { order: ["deepseek"], allow_fallbacks:
- *   false }`) for deepseek/* models — OTHER routed endpoints behind the
- *   same model id (DeepInfra, Baidu, Mancer, ...) have meaningfully
- *   different prices, especially for cache reads, so this number would be
- *   wrong/unverifiable without that pin. If the pin is ever removed, this
- *   price must be revisited, not left as a stale guess.
+ * - `deepseek/deepseek-v4-flash-0731` — the RSI proof model. It is routed
+ *   exclusively to OpenRouter's available DeepInfra fp8 endpoint by
+ *   `src/llm/openrouter.ts`. The 2026-09 endpoint metadata reports
+ *   $0.06/1M input and $0.18/1M output tokens; cached input is conservatively
+ *   charged at the full input rate because this endpoint metadata provides
+ *   no verified cache-read rate. The RSI broker independently fetches and
+ *   pins endpoint pricing before admitting work.
  *   Missing entirely from this table before was the actual root cause of a
  *   real incident: sessions silently fell through to `FALLBACK_MODEL_PRICE`
  *   (7x+ this model's real input rate), producing wildly inflated internal
@@ -112,16 +101,19 @@ export type PricingTable = Record<string, ModelPrice>
  *   still counts against a cost cap.
  */
 export const DEFAULT_PRICING_TABLE: PricingTable = {
- "meta/muse-spark-1.3-contributor": { input: 0.1, output: 0.2, cacheRead: 0.002 },
  "deepseek/deepseek-chat": { input: 0.27, output: 1.1 },
  "deepseek/deepseek-reasoner": { input: 0.55, output: 2.19 },
- "deepseek/deepseek-v4-flash-0731": { input: 0.14, output: 0.28, cacheRead: 0.0028 },
+ "deepseek/deepseek-v4-flash-0731": { input: 0.06, output: 0.18 },
  "deepseek/deepseek-v4-flash": { input: 0.14, output: 0.28, cacheRead: 0.0028 },
- "muse-spark-1.3": { input: 1.25, output: 4.25, cacheRead: 0.15 },
- "muse-spark-1.2": { input: 1.25, output: 4.25, cacheRead: 0.15 },
- "muse-spark-1.1": { input: 1.25, output: 4.25, cacheRead: 0.15 },
- "muse-spark-1.3-contributor": { input: 0.1, output: 0.2, cacheRead: 0.002 },
- "muse-spark-1.2-contributor": { input: 0.1, output: 0.2, cacheRead: 0.002 },
+	// Meta Muse Spark 1.3 Contributor, OpenRouter endpoint/pricing metadata
+	// observed 2026-10-10. This remains a guardrail estimate; the generation
+	// record is the source for actual billed cost and cache discount.
+	"meta/muse-spark-1.3-contributor": { input: 0.10, output: 0.20, cacheRead: 0.002 },
+	// Meta Model API list rates for Muse Spark standard and Contributor tiers.
+	"muse-spark-1.3": { input: 1.25, output: 4.25, cacheRead: 0.15 },
+	"muse-spark-1.2": { input: 1.25, output: 4.25, cacheRead: 0.15 },
+	"muse-spark-1.1": { input: 1.25, output: 4.25, cacheRead: 0.15 },
+	"muse-spark-1.2-contributor": { input: 0.1, output: 0.2, cacheRead: 0.002 },
  "anthropic/claude-3.5-sonnet": { input: 3.0, output: 15.0 },
  "qwen/qwen3-embedding-4b": { input: 0.15, output: 0.15 },
  "qwen/qwen3-embedding-8b": { input: 0.3, output: 0.3 },

@@ -160,9 +160,36 @@ async function testDiffReportsChangedFile(): Promise<void> {
 	assert.equal(entry?.content.after, "after\n")
 }
 
+async function testVisualEnvironmentIsIsolated(): Promise<void> {
+	const workspaceRoot = await mkTmpWorkspace("hc-ckpt-visual-")
+	const checkpointDir = await mkTmpCheckpointDir()
+	const originalVisual = process.env.VISUAL
+	const originalMixedCase = process.env.Visual
+	try {
+		process.env.VISUAL = "checkpoint-test-editor --unsafe-argument"
+		process.env.Visual = "checkpoint-test-mixed-case-editor"
+		await fs.writeFile(path.join(workspaceRoot, "a.txt"), "before\n")
+		const svc = createCheckpointService({ taskId: "task-visual", workspaceRoot, checkpointDir })
+		await svc.init()
+		await fs.writeFile(path.join(workspaceRoot, "a.txt"), "after\n")
+		const saved = await svc.save("save with inherited editor variables")
+		assert.ok(saved?.commit, "sanitized checkpoints should succeed with VISUAL set")
+		assert.equal(process.env.VISUAL, "checkpoint-test-editor --unsafe-argument", "parent environment is preserved")
+		assert.equal(process.env.Visual, "checkpoint-test-mixed-case-editor")
+	} finally {
+		if (originalVisual === undefined) delete process.env.VISUAL
+		else process.env.VISUAL = originalVisual
+		if (originalMixedCase === undefined) delete process.env.Visual
+		else process.env.Visual = originalMixedCase
+		await fs.rm(workspaceRoot, { recursive: true, force: true })
+		await fs.rm(checkpointDir, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
+	["environment: strips inherited VISUAL without modifying the parent", testVisualEnvironmentIsIsolated],
 	["init: creates the shadow repo at the RepoPerTask layout", testInitCreatesShadowRepo],
 	["save: creates a checkpoint commit for changed files", testSaveCreatesCheckpoint],
 	["save: a second save after a further change creates a distinct checkpoint", testSecondSaveAfterChangeCreatesNewCheckpoint],

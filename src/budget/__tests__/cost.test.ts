@@ -60,8 +60,18 @@ async function testDeepseekV4Flash0731Priced(): Promise<void> {
 	const price = DEFAULT_PRICING_TABLE["deepseek/deepseek-v4-flash-0731"]
 	assert.ok(price, "deepseek/deepseek-v4-flash-0731 must be a real entry, not fall through to the fallback")
 	assert.notDeepEqual(price, FALLBACK_MODEL_PRICE, "must not accidentally equal the unknown-model fallback price")
-	assert.ok(price.input < 1, `input price should be well under $1/1M (real rate is ~$0.14), got $${price.input}`)
-	assert.ok(price.cacheRead !== undefined && price.cacheRead < price.input, "cacheRead must be a real discount, not left unset")
+	assert.equal(price.input, 0.06, "the pinned DeepInfra fp8 endpoint metadata reports $0.06/1M input")
+	assert.equal(price.output, 0.18, "the pinned DeepInfra fp8 endpoint metadata reports $0.18/1M output")
+	assert.equal(price.cacheRead, undefined, "without a verified cache price, cached input uses the full input rate")
+}
+
+async function testMuseContributorPricingUsesVerifiedCacheRate(): Promise<void> {
+	const price = DEFAULT_PRICING_TABLE["meta/muse-spark-1.3-contributor"]
+	assert.deepEqual(price, { input: 0.10, output: 0.20, cacheRead: 0.002 })
+	const allCold = estimateCost({ model: "meta/muse-spark-1.3-contributor", inputTokens: 100_000, outputTokens: 1_000 })
+	const withCache = estimateCost({ model: "meta/muse-spark-1.3-contributor", inputTokens: 100_000, cachedTokens: 80_000, outputTokens: 1_000 })
+	assert.ok(withCache < allCold, "verified cache-read rate should lower the guardrail estimate")
+	assert.ok(withCache > 0, "the guardrail stays non-zero; it is not billed-cost evidence")
 }
 
 /**
@@ -330,8 +340,9 @@ async function testMergeLivePriceOverridesDefaults(): Promise<void> {
 const tests: Array<[string, () => Promise<void>]> = [
 	["default pricing table covers deepseek-chat + reasoner + a general model", testDefaultTableShape],
 	["deepseek/deepseek-v4-flash is priced correctly (2026-08-01 incident regression)", testDeepseekV4FlashPriced],
-	["deepseek/deepseek-v4-flash-0731 (prior default) is priced correctly", testDeepseekV4Flash0731Priced],
-	["muse-spark-1.3 (muse provider default) is priced at Meta list rates", testMuseSparkDefaultPriced],
+	["deepseek/deepseek-v4-flash-0731 (current default) is priced correctly", testDeepseekV4Flash0731Priced],
+	["Muse Contributor uses verified input/output/cache rates", testMuseContributorPricingUsesVerifiedCacheRate],
+	["muse-spark-1.3 (Muse provider default) is priced at Meta list rates", testMuseSparkDefaultPriced],
 	["estimateCost math (per-1M input/output, mixed, zero defaults)", testEstimateCostMath],
 	["unknown model falls back to the conservative rate (never $0)", testModelFallback],
 	["in-code pricing override table + per-model fallback", testPriceOverrideTable],

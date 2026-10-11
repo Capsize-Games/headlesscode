@@ -8,9 +8,10 @@ import type { ParentChoice } from "./selection.js"
 
 const execFile = promisify(execFileCallback)
 
-export function candidateId(generation: number, index: number, seed: string): string {
+export function candidateId(generation: number, index: number, seed: string, namespace?: string): string {
 	const cleanSeed = seed.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "run"
-	return `g${generation}-c${String(index + 1).padStart(2, "0")}-${cleanSeed.slice(0, 20)}`
+	const cleanNamespace = namespace?.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 12)
+	return `g${generation}-c${String(index + 1).padStart(2, "0")}-${cleanSeed.slice(0, 20)}${cleanNamespace ? `-${cleanNamespace}` : ""}`
 }
 
 export function candidateBranch(id: string): string {
@@ -38,12 +39,12 @@ export function newCandidate(
 	now: string,
 	parentChoice?: ParentChoice,
 ): CandidateRecord {
-	const id = candidateId(generation, index, config.seed)
+	const id = candidateId(generation, index, config.seed, config.candidateIdNamespace)
 	const modelCandidateId = config.modelCandidateId ?? "model-base"
 	return {
 		id,
 		generation,
-		parent: parentChoice?.candidateId ?? (generation === 0 ? "baseline" : "champion"),
+		parent: parentChoice?.candidateId ?? "baseline",
 		branch: candidateBranch(id),
 		worktree: candidateWorktree(config, id),
 		baseCommit,
@@ -81,11 +82,22 @@ export async function removeCandidateWorktree(config: RsiConfig, candidate: Cand
 
 export async function changedFiles(repoRoot: string, baseCommit: string): Promise<string[]> {
 	const output = await gitOutput(repoRoot, ["diff", "--name-only", `${baseCommit}...HEAD`])
-	const status = await gitOutput(repoRoot, ["status", "--short"])
 	const files = new Set(output.split("\n").map((file) => file.trim()).filter(Boolean))
-	for (const line of status.split("\n")) {
-		const file = line.slice(3).trim()
+	const status = await execFile("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], {
+		cwd: repoRoot,
+		encoding: "utf8",
+		maxBuffer: 4 * 1024 * 1024,
+	})
+	const entries = status.stdout.split("\0")
+	for (let index = 0; index < entries.length; index++) {
+		const entry = entries[index]
+		if (!entry) continue
+		const file = entry.slice(3)
 		if (file) files.add(file)
+		if (/[RC]/.test(entry.slice(0, 2))) {
+			const original = entries[++index]
+			if (original) files.add(original)
+		}
 	}
 	return [...files].sort()
 }

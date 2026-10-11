@@ -3,12 +3,13 @@ import { execFileSync } from "node:child_process"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
-import { readArchive } from "../archive.js"
+import { checkpointRun, readArchive } from "../archive.js"
 import { runRsi } from "../controller.js"
 import type { RsiConfig, TrialResult } from "../types.js"
+import { fakeDevelopmentBenchmarkHook } from "./development-proof-fixture.js"
 
-function ok(command: string): TrialResult {
-	return { ok: true, command, exitCode: 0, durationMs: 1, stdout: "", stderr: "" }
+function ok(command: string, durationMs = 1): TrialResult {
+	return { ok: true, command, exitCode: 0, durationMs, stdout: "", stderr: "" }
 }
 
 async function main(): Promise<void> {
@@ -28,8 +29,9 @@ async function main(): Promise<void> {
 			generations: 2,
 			maxConcurrent: 1,
 			mutationTask: "fixture evolution",
+			regressionCommand: "npm test",
 			evalCommands: ["visible"],
-			hiddenEvalCommands: ["hidden"],
+			hiddenEvalCommands: [],
 			archiveDir: path.join(repo, ".rsi-archive"),
 			worktreeDir: path.join(repo, ".rsi-worktrees"),
 			trajectoryDir: path.join(repo, ".rsi-trajectories"),
@@ -42,13 +44,15 @@ async function main(): Promise<void> {
 			protectedPaths: [".env", ".rsi-archive/", ".rsi-worktrees/"],
 			commandTimeoutMs: 1000,
 		} satisfies RsiConfig
+		const proofCalls: Array<{ harnessCommit: string; outputRoot: string }> = []
 		const run = await runRsi(config, {
 			now: (() => {
 				let tick = 0
 				return () => `2026-09-20T00:00:${String(tick++).padStart(2, "0")}.000Z`
 			})(),
 			log: () => undefined,
-			runCommand: async (command) => ok(command),
+			runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook(proofCalls),
+			runCommand: async (command, cwd) => ok(command, path.basename(cwd).startsWith("rsi-baseline-") ? 100 : 1),
 			runMutation: async (candidate) => {
 				const file = path.join(candidate.worktree, "src", `${candidate.id}.ts`)
 				await fs.writeFile(file, `export const candidate = ${JSON.stringify(candidate.id)}\n`)
@@ -58,18 +62,100 @@ async function main(): Promise<void> {
 			},
 		})
 		assert.equal(run.candidates.length, 4)
-		assert.ok(run.candidates.filter((candidate) => candidate.generation === 1).every((candidate) => candidate.parent !== "baseline"))
+		assert.ok(run.candidates.filter((candidate) => candidate.generation === 1).every((candidate) => candidate.parent === "baseline"), "unqualified parent evidence must keep later candidates on the run base")
 		assert.equal(run.combinations?.length, 4)
 		assert.equal(run.jobs?.filter((job) => job.status === "completed").length, 4)
-		assert.ok(run.selected)
+		assert.equal(run.selected, undefined, "guest-reported resource counts cannot qualify a candidate")
+		assert.equal(run.candidates.every((candidate) => candidate.developmentProof?.accepted === false), true)
+		assert.ok(proofCalls.some((entry) => entry.harnessCommit === run.baseCommit), "controller must obtain the original-base benchmark cell")
+		assert.ok(run.candidates.every((candidate) => candidate.developmentProof?.immediateParent.referenceCommit === candidate.parentCommit), "each candidate compares against its exact immediate parent")
 		const archive = await readArchive(config.archiveDir)
 		assert.equal(archive.activeRuns.length, 0)
 		assert.equal(archive.runs.length, 1)
 		assert.equal(archive.candidates.length, 4)
+		assert.equal(archive.runs[0]?.developmentProofProtocol?.protocolDigest, run.developmentProofProtocol?.protocolDigest)
+		assert.equal(archive.candidates[0]?.developmentProof?.immediateParent.outcomes.length, run.developmentProofProtocol?.taskIds.length, "archive retains the full paired task outcomes")
 	} finally {
 		await fs.rm(repo, { recursive: true, force: true })
 	}
 	console.log("All 7 RSI controller assertions passed")
+	await testAuthoritativeDevelopmentProofControlsParentSelection()
+}
+
+async function testAuthoritativeDevelopmentProofControlsParentSelection(): Promise<void> {
+	const repo = await fs.mkdtemp(path.join(os.tmpdir(), "hc-rsi-authoritative-proof-"))
+	try {
+		execFileSync("git", ["init", "-q"], { cwd: repo })
+		execFileSync("git", ["config", "user.email", "rsi@example.invalid"], { cwd: repo })
+		execFileSync("git", ["config", "user.name", "RSI Test"], { cwd: repo })
+		await fs.mkdir(path.join(repo, "src"), { recursive: true })
+		await fs.writeFile(path.join(repo, "src", "agent.ts"), "export const baseline = true\n")
+		execFileSync("git", ["add", "."], { cwd: repo })
+		execFileSync("git", ["commit", "-qm", "baseline"], { cwd: repo })
+		const rootCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim()
+		const config = {
+			repoRoot: repo, model: "proof-model", population: 1, generations: 2, maxConcurrent: 1,
+			mutationTask: "write an incremental change", regressionCommand: "npm test", evalCommands: ["visible"], hiddenEvalCommands: [],
+			archiveDir: path.join(repo, "archive"), worktreeDir: path.join(repo, "worktrees"), baseRef: "HEAD", seed: "proof-controller",
+			dryRun: false, keepWorktrees: false, maxIterations: 2, protectedPaths: [".env", "docker/", ".dockerignore"], commandTimeoutMs: 1000,
+		} satisfies RsiConfig
+		const manifest = JSON.parse(await fs.readFile(path.resolve("fixtures/rsi-benchmark/manifest.json"), "utf8")) as { tasks: Array<{ id: string }> }
+		const retention = new Set(["tool-symlink-escape", "malformed-child-completion", "ollama-request-timeout", "watch-abort-callbacks"])
+		const retentionWin = manifest.tasks.find((task) => retention.has(task.id))!.id
+		const [firstNonRetention, secondNonRetention] = manifest.tasks.filter((task) => !retention.has(task.id)).map((task) => task.id)
+		let acceptedCommit: string | undefined
+		const run = await runRsi(config, {
+			log: () => undefined,
+			runCommand: async (command) => ok(command),
+			runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook([], {
+				proofQualified: true,
+				succeeds: (harnessCommit, taskId) => {
+					if (harnessCommit === rootCommit) return false
+					if (!acceptedCommit) acceptedCommit = harnessCommit
+				return harnessCommit === acceptedCommit ? taskId === retentionWin || taskId === firstNonRetention : taskId === secondNonRetention
+				},
+			}),
+			runMutation: async (candidate) => {
+				await fs.writeFile(path.join(candidate.worktree, "src", `${candidate.id}.ts`), "export const incremental = true\n")
+				execFileSync("git", ["add", "."], { cwd: candidate.worktree })
+				execFileSync("git", ["commit", "-qm", `candidate ${candidate.id}`], { cwd: candidate.worktree })
+				return { ok: true, result: ok("mutation") }
+			},
+		})
+		const first = run.candidates.find((candidate) => candidate.generation === 0)!
+		const second = run.candidates.find((candidate) => candidate.generation === 1)!
+		assert.equal(first.status, "accepted", "authoritative qualified benchmark evidence can accept a net development win")
+		assert.equal(first.pairedComparison?.improved, false, "the legacy original-base command comparison is diagnostic, not an acceptance veto")
+		assert.equal(second.parent, first.id)
+		assert.equal(second.baseCommit, first.commits[0])
+		assert.equal(second.developmentProof?.immediateParent.referenceCommit, first.commits[0])
+		assert.equal(second.status, "rejected", "a child that beats root but loses the retention task to its parent must be rejected")
+		assert.equal(second.developmentProof?.originalBase.eligible, true, "the root comparison remains a separate diagnostic anchor")
+		assert.equal(second.developmentProof?.immediateParent.eligible, false)
+		const acceptedSnapshot = structuredClone(first)
+		const tamperCases = [
+			(proof: NonNullable<typeof first.developmentProof>) => { proof.immediateParent.childCommit = rootCommit },
+			(proof: NonNullable<typeof first.developmentProof>) => { proof.immediateParent.referenceCommit = first.commits[0]! },
+			(proof: NonNullable<typeof first.developmentProof>) => { proof.originalBase.childCommit = rootCommit },
+			(proof: NonNullable<typeof first.developmentProof>) => { proof.originalBase.referenceCommit = first.commits[0]! },
+		]
+		for (const tamper of tamperCases) {
+			Object.assign(first, structuredClone(acceptedSnapshot))
+			tamper(first.developmentProof!)
+			const interrupted = { ...run, generations: 3 }
+			await checkpointRun(config.archiveDir, interrupted)
+			const replayCalls: Array<{ harnessCommit: string; outputRoot: string }> = []
+			const replayed = await runRsi({ ...config, generations: 3, dryRun: true, resumeRunId: run.runId }, {
+				log: () => undefined,
+				runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook(replayCalls, { proofQualified: true }),
+			})
+			assert.equal(replayed.candidates.find((candidate) => candidate.id === first.id)?.status, "rejected")
+			assert.equal(replayCalls.length, 0, "tampered comparison references must fail before artifact replay")
+		}
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+	console.log("Authoritative development proof controls selection against the exact immediate parent")
 }
 
 main().catch((error) => {

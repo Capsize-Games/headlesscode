@@ -546,9 +546,54 @@ async function testNoDiagnosticsOnNormalClose(): Promise<void> {
 	}
 }
 
+async function testSupervisorCancellationIsScoped(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-command-abort-")
+	const stopped = createHeadlessExecutor(ws)
+	const unaffected = createHeadlessExecutor(ws)
+	const controller = new AbortController()
+	stopped.setAbortSignal(controller.signal)
+	try {
+		const pending = stopped.execute("execute_command", { command: "sleep 2; touch forbidden.txt", timeout: 10 })
+		await sleep(150)
+		controller.abort()
+		const result = await pending
+		assert.equal(result.isError, true)
+		assert.match(result.content, /stopped by supervisor/)
+		const other = await unaffected.execute("execute_command", { command: "printf allowed", timeout: 2 })
+		assert.equal(other.isError, false, "another executor is unaffected")
+		assert.equal((await stopped.execute("write_to_file", { path: "later.txt", content: "blocked" })).isError, true)
+		await sleep(2100)
+		assert.equal(await exists(path.join(ws, "forbidden.txt")), false, "active process group cannot finish its delayed effect")
+		assert.equal(await exists(path.join(ws, "later.txt")), false)
+	} finally {
+		stopped.dispose()
+		unaffected.dispose()
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testSupervisorCancellationStopsBackgroundCommand(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-command-background-abort-")
+	const executor = createHeadlessExecutor(ws)
+	const controller = new AbortController()
+	executor.setAbortSignal(controller.signal)
+	try {
+		const result = await executor.execute("execute_command", { command: "sleep 3; touch forbidden.txt", timeout: 1 })
+		assert.equal(result.isError, false, "ordinary tool timeout keeps its existing semantics")
+		controller.abort()
+		await sleep(2200)
+		assert.equal(await exists(path.join(ws, "forbidden.txt")), false, "supervisor abort stops the retained process group")
+	} finally {
+		executor.dispose()
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
+	["supervisor cancellation: stops active process group and later effects without stopping another executor", testSupervisorCancellationIsScoped],
+	["supervisor cancellation: stops a previously timed-out background command", testSupervisorCancellationStopsBackgroundCommand],
 	["execute_command: command finishes within timeout -> normal non-error result with full output", testNormalCompletionWithinTimeout],
 	["execute_command: a nonexistent cwd is refused before spawn with a clear error, not a misleading bash ENOENT", testNonexistentCwdRefusedBeforeSpawnWithClearError],
 	["execute_command: cwd \"null\"/\"None\" (the confirmed real bug's exact shape) is treated as unset", testStringNullCwdTreatedAsUnset],

@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "tool-efficiency",
+  "capability": "tool-efficiency",
+  "description": "Executable reference and known-mutant checks for eliminating duplicate requests.",
+  "task": "Implement uniqueRequests(keys) so repeated requests are issued only once, in first-seen order.",
+  "cases": [
+    {
+      "name": "deduplicate requests",
+      "input": [
+        [
+          "repo",
+          "tests",
+          "repo",
+          "status"
+        ]
+      ],
+      "expected": [
+        "repo",
+        "tests",
+        "status"
+      ]
+    }
+  ]
+}

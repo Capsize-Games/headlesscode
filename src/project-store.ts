@@ -99,7 +99,10 @@ export function resolveProjectIdentity(workspaceRoot: string): ProjectIdentity {
 	// expose host repository metadata. Preserve the original project's store key
 	// without mounting or reading the original repository path in the sandbox.
 	const identityRoot = process.env.HEADLESSCODE_PROJECT_IDENTITY_ROOT?.trim()
-	if (identityRoot && path.isAbsolute(identityRoot)) return { keySource: path.resolve(identityRoot), kind: "git" }
+	const targetRepo = process.env.TARGET_REPO?.trim()
+	if (identityRoot && path.isAbsolute(identityRoot) && targetRepo && root === path.resolve(targetRepo)) {
+		return { keySource: path.resolve(identityRoot), kind: "git" }
+	}
 	// Sandboxed workers may set these to a private Git directory so ordinary
 	// commits cannot touch shared host metadata. Project identity must still
 	// resolve through the workspace's real .git pointer and shared common dir.

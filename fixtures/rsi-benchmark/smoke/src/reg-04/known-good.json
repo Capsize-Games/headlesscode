@@ -1,0 +1,5 @@
+{
+  "files": {
+    "src/solution.js": "export function solve(n,r){return r==null?Math.min(1000*2**n,30000):Math.max(0,Number(r)*1000)\n"
+  }
+}

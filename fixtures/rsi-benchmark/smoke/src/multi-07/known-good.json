@@ -1,0 +1,6 @@
+{
+  "files": {
+    "src/solution.js": "import {cm} from \"./helper.js\";export function solve(x){return cm(x.w,x.u)*cm(x.h,x.u)*cm(x.d,x.u)}\n",
+    "src/helper.js": "export function cm(n,u){return u===\"in\"?n*2.54:n}\n"
+  }
+}

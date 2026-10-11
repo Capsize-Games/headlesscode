@@ -7,10 +7,11 @@ Copyright 2026 Zoo Code.
 - Upstream clone: `~/Projects/zoo-code` (also at `./zoo-code` inside
   this workspace while vendoring is in progress).
 - Inspected commit: `ca9b60fbc7b72a27352b0e2084271c28f2419f94`.
-- License: `LICENSE` at repo root is the verbatim Apache 2.0 text from
+- License: `licenses/Apache-2.0.txt` is the verbatim Apache 2.0 text from
   upstream. `ATTRIBUTION.md` at repo root covers attribution. The upstream
   files do not carry per-file license headers (verified while copying), so the
-  repo-root LICENSE + ATTRIBUTION is the only header bookkeeping required.
+  scoped license file + attribution inventory are the license records for this
+  vendored material.
 
 **Vendoring rule applied:** files under `src/` and `types/` are copied verbatim
 (`cp`), byte-for-byte, with their original relative structure so their internal
@@ -147,7 +148,7 @@ relative imports resolve with no tsconfig magic:
 | `src/utils/json-schema.ts` | `zoo-code/src/utils/json-schema.ts` | Identity `normalizeToolSchema` + structural `JsonSchema`. Original drags `zod/v4`; full normalization only matters for real MCP support. **Needs adaptation when MCP lands.** |
 | `src/services/mcp/McpHub.ts` | `zoo-code/src/services/mcp/McpHub.ts` | Stub `McpHub` with an injectable server list; `getServers()`. No transports (Phase 1 has no MCP). |
 | `src/services/code-index/manager.ts` | `zoo-code/src/services/code-index/manager.ts` | Stub `CodeIndexManager.getInstance()` (prompt builder only calls the factory; result unused). |
-| `src/services/skills/SkillsManager.ts` | `zoo-code/src/services/skills/SkillsManager.ts` | Stub returning no skills from `getSkillsForMode()`. |
+| `src/services/skills/SkillsManager.ts` | `zoo-code/src/services/skills/SkillsManager.ts` | Headless adapter over an injected catalog snapshot; discovery and activation live in `src/skills/`. |
 | `src/services/search/file-search.ts` | `zoo-code/src/services/search/file-search.ts` | `executeRipgrep` implemented with pure Node fs + a small glob matcher (`**`, `*`, `!`-excludes). Originally only served `.roo` subdirectory discovery (`roo-config`); extended for the checkpoints vendoring to also serve `ShadowCheckpointService#getNestedGitRepository()`'s `**/.git/HEAD` nested-repo scan (returns `{ path, type }`, not just `path`, to match what that caller destructures). |
 | `src/i18n/index.ts` | `zoo-code/src/i18n/index.ts` | `t()` returns the key with `{param}` interpolation; original is the webview UI catalog. |
 | `types/index.ts` | the `@roo-code/types` package | Re-export barrel over the vendored `types/*` modules. Imported by relative path (`../../types`). |
@@ -211,3 +212,12 @@ Other adaptation notes for the next subtask:
   text), assembles 21 native (OpenAI-format) tool schemas, converts them to
   Anthropic format, and validates a `.roomodes`-style doc against
   `customModesSettingsSchema`. See `src/vendor/tests/smoke.ts`.
+
+## 6. Checkpoint dependency compatibility (2026-10-10)
+
+The checkpoint service uses the named `simpleGit` export for simple-git 4.
+Its environment filter also removes `VISUAL`, case-insensitively, before
+creating Git subprocesses. This keeps inherited editor commands out of shadow
+checkpoint operations and matches the dependency's unsafe-operation checks.
+These are local adaptations to `ShadowCheckpointService.ts`; upstream
+attribution and license notices remain in place.

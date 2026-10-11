@@ -34,6 +34,7 @@ import {
 	type ResumeTarget,
 } from "../resume.js"
 import { defaultState, loadStateSync, saveStateSync, type OrchestratorGroup, type OrchestratorState } from "../state.js"
+import { assessVerificationActivity, commandIdentity, parseRequiredCommandIdentities } from "../verification-gate.js"
 
 async function tmpRepo(): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-resume-"))
@@ -647,15 +648,64 @@ async function testHasRealVerificationActivityTrueWithOneRealSuccessfulCommand()
 	try {
 		// Reproduces the 2026-08-28 incident's own transcript shape: mostly
 		// spawn-failure noise, but ONE real successful execute_command.
+		const required = commandIdentity("npm test")
 		const reportPath = await writeSessionEventsFixture(repo, "s3", [
-			{ ts: "t", sessionId: "s3", type: "tool_result", iteration: 1, tool: "execute_command", isError: true },
-			{ ts: "t", sessionId: "s3", type: "tool_result", iteration: 2, tool: "read_file", isError: false },
-			{ ts: "t", sessionId: "s3", type: "tool_result", iteration: 3, tool: "execute_command", isError: false },
+			{ ts: "t", sessionId: "s3", type: "tool_call", iteration: 1, tool: "execute_command", callId: "failed", commandIdentity: commandIdentity("npm test") },
+			{ ts: "t", sessionId: "s3", type: "tool_result", iteration: 1, tool: "execute_command", callId: "failed", commandIdentity: commandIdentity("npm test"), isError: true },
+			{ ts: "t", sessionId: "s3", type: "tool_call", iteration: 2, tool: "execute_command", callId: "unrelated", commandIdentity: commandIdentity("echo unrelated") },
+			{ ts: "t", sessionId: "s3", type: "tool_result", iteration: 2, tool: "execute_command", callId: "unrelated", commandIdentity: commandIdentity("echo unrelated"), isError: false },
+			{ ts: "t", sessionId: "s3", type: "tool_call", iteration: 3, tool: "execute_command", callId: "passed", commandIdentity: required },
+			{ ts: "t", sessionId: "s3", type: "tool_result", iteration: 3, tool: "execute_command", callId: "passed", commandIdentity: required, isError: false },
 		])
 		assert.equal(hasRealVerificationActivity(repo, reportPath), true)
+		assert.equal(assessVerificationActivity(repo, reportPath, [required]), "required-commands-passed")
+		assert.equal(assessVerificationActivity(repo, reportPath, [commandIdentity("npm run typecheck")]), "unverified", "an unrelated command cannot satisfy operator policy")
+		assert.equal(assessVerificationActivity(repo, reportPath, []), "unverified", "an empty explicit policy does not claim independent verification")
 	} finally {
 		await fs.rm(repo, { recursive: true, force: true })
 	}
+}
+
+async function testVerificationPolicyRejectsUncorrelatedAndMismatchedResults(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const expected = commandIdentity("npm test")
+		const reportPath = await writeSessionEventsFixture(repo, "s4", [
+			{ ts: "t", sessionId: "s4", type: "tool_call", tool: "execute_command", callId: "c1", commandIdentity: expected },
+			{ ts: "t", sessionId: "s4", type: "tool_result", tool: "execute_command", callId: "c2", commandIdentity: expected, isError: false },
+			{ ts: "t", sessionId: "s4", type: "tool_call", tool: "execute_command", callId: "c3", commandIdentity: expected },
+			{ ts: "t", sessionId: "s4", type: "tool_result", tool: "execute_command", callId: "c3", commandIdentity: commandIdentity("npm run nope"), isError: false },
+		])
+		assert.equal(assessVerificationActivity(repo, reportPath, [expected]), "unverified")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testVerificationPolicyRejectsDuplicateCorrelationsButKeepsLegacyLogsActivityOnly(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const expected = commandIdentity("npm test")
+		const duplicateCall = await writeSessionEventsFixture(repo, "s5", [
+			{ ts: "t", sessionId: "s5", type: "tool_call", tool: "execute_command", callId: "dup", commandIdentity: expected },
+			{ ts: "t", sessionId: "s5", type: "tool_call", tool: "execute_command", callId: "dup", commandIdentity: expected },
+			{ ts: "t", sessionId: "s5", type: "tool_result", tool: "execute_command", callId: "dup", commandIdentity: expected, isError: false },
+		])
+		assert.equal(assessVerificationActivity(repo, duplicateCall, [expected]), "unverified")
+		const replayedResult = await writeSessionEventsFixture(repo, "s6", [
+			{ ts: "t", sessionId: "s6", type: "tool_call", tool: "execute_command", callId: "once", commandIdentity: expected },
+			{ ts: "t", sessionId: "s6", type: "tool_result", tool: "execute_command", callId: "once", commandIdentity: expected, isError: false },
+			{ ts: "t", sessionId: "s6", type: "tool_result", tool: "execute_command", callId: "once", commandIdentity: expected, isError: false },
+		])
+		assert.equal(assessVerificationActivity(repo, replayedResult, [expected]), "unverified")
+		const legacy = await writeSessionEventsFixture(repo, "s7", [
+			{ ts: "t", sessionId: "s7", type: "tool_result", tool: "execute_command", isError: false },
+		])
+		assert.equal(assessVerificationActivity(repo, legacy), "legacy-command-activity-only")
+		assert.equal(assessVerificationActivity(repo, legacy, [expected]), "unverified")
+		assert.throws(() => assessVerificationActivity(repo, legacy, ["not-a-digest"]), /unique lowercase SHA-256/)
+		assert.throws(() => parseRequiredCommandIdentities(`${expected},${expected}`), /must be unique/)
+	} finally { await fs.rm(repo, { recursive: true, force: true }) }
 }
 
 // ─── reviewMain (dry-run: no LLM, no state mutation) ─────────────────────────
@@ -1189,6 +1239,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["hasRealVerificationActivity: false with only reads, no execute_command", testHasRealVerificationActivityFalseWithOnlyReadsNoExecuteCommand],
 	["hasRealVerificationActivity: false when every execute_command failed", testHasRealVerificationActivityFalseWhenAllExecuteCommandsFailed],
 	["hasRealVerificationActivity: true with one real successful command (issue #26 incident shape)", testHasRealVerificationActivityTrueWithOneRealSuccessfulCommand],
+	["verification policy requires every configured command identity to have a correlated successful result", testVerificationPolicyRejectsUncorrelatedAndMismatchedResults],
+	["verification policy rejects duplicates and labels old result-only logs as legacy", testVerificationPolicyRejectsDuplicateCorrelationsButKeepsLegacyLogsActivityOnly],
 	["reviewMain --dry-run on a done group exits 0, changes nothing", testReviewMainDryRunOnDoneGroup],
 	["reviewMain rebuilds a stale running group before reviewing (dry-run)", testReviewMainRebuildsStaleRunningGroup],
 	["reviewMain without a target is a usage error", testReviewMainRequiresTarget],

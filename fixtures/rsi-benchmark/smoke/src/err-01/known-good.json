@@ -1,0 +1,5 @@
+{
+  "files": {
+    "src/solution.js": "export function solve(e){if(e.status!==429)return 0;let n=Number(e.retryAfter);return Number.isFinite(n)&&n>=0?n*1000:1000}\n"
+  }
+}

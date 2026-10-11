@@ -45,9 +45,9 @@ License: **Apache-2.0** · Copyright **2026 Zoo Code**.
 Inspection commit: `ca9b60fbc7b72a27352b0e2084271c28f2419f94`.
 
 A verbatim copy of the Apache License 2.0 is provided in
-[`LICENSE`](./LICENSE). The full inventory of vendored files, local shims, and
+[`licenses/Apache-2.0.txt`](./licenses/Apache-2.0.txt). The full inventory of vendored files, local shims, and
 excluded files is in
 [`src/vendor/zoo-code/VENDOR-NOTES.md`](./src/vendor/zoo-code/VENDOR-NOTES.md).
 
-This notice is provided in addition to — and does not modify — the terms of the
-Apache License 2.0.
+HeadlessCode source is licensed under Apache-2.0. The Zoo Code-derived material
+identified above retains its original copyright and attribution.

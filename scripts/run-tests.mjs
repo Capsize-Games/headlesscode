@@ -21,6 +21,13 @@ import * as path from "node:path"
 import { fileURLToPath } from "node:url"
 
 const repoRoot = path.resolve(fileURLToPath(import.meta.url), "..", "..")
+const scratchRoot = path.join(repoRoot, ".headlesscode", "scratch")
+fs.mkdirSync(scratchRoot, { recursive: true })
+process.env.TMPDIR ??= scratchRoot
+// Plain fixtures inside scratch must not inherit the harness repository identity.
+const gitCeilings = (process.env.GIT_CEILING_DIRECTORIES ?? "").split(path.delimiter).filter(Boolean)
+gitCeilings.push(fs.realpathSync(process.env.TMPDIR))
+process.env.GIT_CEILING_DIRECTORIES = [...new Set(gitCeilings)].join(path.delimiter)
 
 /**
  * Non-test-suffixed scripts that ran as part of the old chain. Includes

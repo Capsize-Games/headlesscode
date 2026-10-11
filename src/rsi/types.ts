@@ -1,9 +1,44 @@
 import type { ChildProcess } from "node:child_process"
+import type { CandidateDevelopmentProof, DevelopmentProofProtocol, DevelopmentProofRule } from "./development-proof.js"
+import type { BenchmarkAttempt } from "./benchmark/types.js"
+import type { OpenRouterDenialSummary, RsiOpenRouterProfileId } from "./inference-broker.js"
 
 export type CandidateStatus = "planned" | "mutating" | "evaluating" | "accepted" | "rejected" | "failed"
 export type MutationKind = "corrective" | "architectural" | "search-policy" | "curriculum" | "model-adaptation"
 export type ParentSelectionPolicy = "champion-specialist-novelty" | "pareto-front" | "all-eligible"
-export type ComputePolicy = "single" | "independent" | "planner-executors" | "critic-retry"
+export type WorkerHarnessMode = "fixed-control" | "self-hosted"
+export type WorkerHarnessPhase = "development" | "confirmation"
+
+export interface WorkerHarnessRuntimeIdentity {
+	imageName: string
+	imageDigest: string
+	harnessCommit: string
+	dependencyLockDigest: string
+}
+
+export interface WorkerHarnessExecution {
+	mode: WorkerHarnessMode
+	parentCommit: string
+	snapshotCommit: string
+	snapshotTreeDigest: string
+	runtime: WorkerHarnessRuntimeIdentity
+	executedCliPath: string
+}
+export type ComputePolicy = "single" | "independent" | "adaptive-independent" | "planner-executors" | "critic-retry"
+
+export interface AdaptiveSearchDecision {
+	generation: number
+	decision: "continue" | "stop"
+	reason: "mixed-evidence" | "consistent-evidence" | "trajectory-cap" | "iteration-cap" | "runtime-cap" | "generation-cap" | "insufficient-results"
+	candidateIds: string[]
+	evidence: Array<{ candidateId: string; status: CandidateStatus; visiblePassRate?: number }>
+	allocatedTrajectories: number
+	remainingTrajectories: number
+	allocatedIterations: number
+	remainingIterations: number
+	elapsedMs: number
+	decidedAt: string
+}
 
 export interface MutationHypothesis {
 	statement: string
@@ -15,8 +50,8 @@ export interface MutationHypothesis {
 export interface MetricVector {
 	correctness: number
 	reliability: number
-	generalization: number
-	hidden: number
+	generalization: number | null
+	hidden: number | null
 	efficiency: number
 	latency: number
 	tokenUse: number
@@ -52,6 +87,7 @@ export type ModelRole =
 export interface RoleModelConfig {
 	provider: "ollama" | "openrouter" | "command"
 	model: string
+	openRouterProfile?: RsiOpenRouterProfileId
 	baseUrl?: string
 	command?: string
 }
@@ -73,8 +109,30 @@ export interface ModelCandidate {
 	trainingConfig: TrainingConfig
 	artifactPath?: string
 	artifactHash?: string
-	status: "base" | "prepared" | "trained" | "evaluated" | "accepted" | "rejected"
+	status: "base" | "prepared" | "trained" | "evaluated" | "accepted" | "rejected" | "failed" | "partial"
 	createdAt: string
+	eligibleForSelection?: boolean
+	trainingResult?: {
+		status: "completed" | "failed" | "partial"
+		datasetVersion: string
+		datasetSha256: string
+		baseModelSha256: string
+		artifactSha256?: string
+		artifactBytes?: number
+		stepsCompleted: number
+		maxSteps: number
+		error?: string
+	}
+	pairedEvaluation?: {
+		cellSetSha256: string
+		baseResultSha256: string
+		adapterResultSha256?: string
+		baseMetric: number
+		adapterMetric?: number
+		completedCellCount: number
+		expectedCellCount: number
+		seed: number
+	}
 	provenance?: Record<string, string>
 }
 
@@ -123,7 +181,8 @@ export interface TrajectoryRecord {
 	id: string
 	task: string
 	environment: { repoRoot: string; baseCommit: string; generation: number }
-	model: { id: string; provider?: string; candidateId?: string }
+	model: { id: string; provider?: string; candidateId?: string; returnedModels?: string[] }
+	inferenceUsage?: CandidateRecord["inferenceUsage"]
 	harnessVersion: string
 	promptConfig: Record<string, unknown>
 	messages: TrajectoryMessage[]
@@ -151,8 +210,19 @@ export interface CurriculumTask {
 	difficulty: 1 | 2 | 3 | 4 | 5
 	capability: string
 	groundTruthCommand: string
+	fixtureId: string
+	fixtureDescription: string
 	provenance: { sourceCandidateIds: string[]; failureClass: string; generatedAt: string }
 	validated: boolean
+	validation?: {
+		baseCommit: string
+		command: string
+		validatedAt: string
+		replays: Array<{ idempotencyKey: string; ok: boolean; exitCode: number | null; outputSha256?: string; failure?: string }>
+		reproducible: boolean
+		reason: string
+	}
+	promotedAt?: string
 }
 
 export interface RsiConfig {
@@ -162,8 +232,15 @@ export interface RsiConfig {
 	generations: number
 	maxConcurrent: number
 	mutationTask: string
+	regressionCommand: string
 	evalCommands: string[]
 	hiddenEvalCommands: string[]
+	hiddenSuitePath?: string
+	hiddenSuiteSha256?: string
+	hiddenPublicKeyPath?: string
+	hiddenPrivateKeyPath?: string
+	hiddenNonceStorePath?: string
+	hiddenImageDigest?: string
 	archiveDir: string
 	worktreeDir: string
 	baseRef: string
@@ -171,7 +248,24 @@ export interface RsiConfig {
 	dryRun: boolean
 	keepWorktrees: boolean
 	maxIterations: number
+	maxTokens?: number
+	benchmarkHarnessCommit?: string
+	workerHarnessMode?: WorkerHarnessMode
+	workerHarnessPhase?: WorkerHarnessPhase
+	/** Terminal, development-only paired run used to qualify the engineering chain before holdout freeze. */
+	workerHarnessEngineeringOnly?: boolean
+	workerHarnessPairId?: string
+	/** Deterministic supervisor-owned run ID for restart-safe paired campaign admission. */
+	workerHarnessRunId?: string
+	workerHarnessRuntime?: WorkerHarnessRuntimeIdentity
+	workerHarnessParentCommit?: string
+	workerHarnessSnapshotTreeDigest?: string
+	candidateIdNamespace?: string
+	maxTrajectories?: number
+	maxTotalIterations?: number
+	maxRuntimeMs?: number
 	protectedPaths: string[]
+	developmentProofRule?: DevelopmentProofRule
 	commandTimeoutMs: number
 	parentSelectionPolicy?: ParentSelectionPolicy
 	eliteCount?: number
@@ -197,6 +291,26 @@ export interface CandidateRecord {
 	baseCommit: string
 	status: CandidateStatus
 	model: string
+	modelProvider?: string
+	inferenceUsage?: {
+		provider: "openrouter"
+		endpointProvider: string
+		profileId?: RsiOpenRouterProfileId
+		model: string
+		returnedModels: string[]
+		returnedProviders: string[]
+		calls: number
+		promptTokens: number
+		completionTokens: number
+		totalTokens: number
+		costUsd: number
+		accounting: "supervisor-enforced"
+		qualified: true
+		jobId: string
+		campaignId: string
+		denials: OpenRouterDenialSummary[]
+	}
+	inferenceDenials?: OpenRouterDenialSummary[]
 	mutation: string
 	createdAt: string
 	updatedAt: string
@@ -212,7 +326,21 @@ export interface CandidateRecord {
 	failure?: string
 	result?: TrialResult
 	fitness?: Fitness
+	pairedComparison?: PairedComparison
+	developmentProof?: CandidateDevelopmentProof
+	workerHarnessExecution?: WorkerHarnessExecution
 	trajectory?: TrajectorySummary
+}
+
+export interface PairedComparison {
+	baselinePasses: number
+	candidatePasses: number
+	trialCount: number
+	baselineDurationMs: number
+	candidateDurationMs: number
+	durationRatio: number
+	improved: boolean
+	reason: string
 }
 
 export interface TrialResult {
@@ -223,10 +351,13 @@ export interface TrialResult {
 	stdout: string
 	stderr: string
 	timedOut?: boolean
+	outputArtifactSha256?: string
+	outputArtifactBytes?: number
 }
 
 export interface EvaluationSummary {
 	regression: TrialResult
+	typecheck?: TrialResult
 	visible: TrialResult[]
 	hidden: TrialResult[]
 	completed: boolean
@@ -236,12 +367,16 @@ export interface EvaluationSummary {
 	committed?: boolean
 	complexity?: ComplexityMetrics
 	failureClassification?: string
+	adversarialPass?: boolean
+	adversarialPenalty?: number
 }
 
 export interface HardGates {
 	regressionPass: boolean
+	typecheckPass: boolean
 	visibleEvalPass: boolean
-	hiddenEvalPass: boolean
+	hiddenEvalPass: boolean | null
+	adversarialPass: boolean
 	noProtectedPathViolation: boolean
 	completed: boolean
 	noCrash: boolean
@@ -252,8 +387,8 @@ export interface Fitness {
 	score: number
 	components: {
 	regression: number
-	visible: number
-		hidden: number
+		visible: number | null
+		hidden: number | null
 		efficiency: number
 		recovery: number
 	}
@@ -262,6 +397,46 @@ export interface Fitness {
 	paretoRank?: number
 	hardGates: HardGates
 	reason: string
+	adversarialPenalty?: number
+}
+
+export interface AdversarialTestCase {
+	id: string
+	modulePath: string
+	exportName: string
+	args: unknown[]
+	expected: unknown
+	reason: string
+}
+
+export interface AdversarialFinding {
+	severity: "major" | "minor"
+	message: string
+	testId?: string
+}
+
+export interface AdversarialReviewRecord {
+	candidateId: string
+	role: "adversary"
+	provider: RoleModelConfig["provider"]
+	model: string
+	promptVersion: string
+	promptSha256: string
+	promptArtifactSha256: string
+	summary?: string
+	resultSha256?: string
+	resultArtifactSha256?: string
+	errorSha256?: string
+	errorArtifactSha256?: string
+	testArtifactSha256?: string
+	snapshotArtifactSha256?: string
+	createdAt: string
+	status: "passed" | "failed" | "error"
+	findings: AdversarialFinding[]
+	testResults: Array<{ id: string; passed: boolean; outputArtifactSha256?: string; failure?: string }>
+	penaltyPoints: number
+	jobId?: string
+	error?: string
 }
 
 export interface RsiRunRecord {
@@ -269,9 +444,13 @@ export interface RsiRunRecord {
 	startedAt: string
 	finishedAt?: string
 	baseline?: TrialResult
+	baselineEvaluation?: EvaluationSummary
+	baselineFitness?: Fitness
 	model: string
+	openRouterProfileId?: RsiOpenRouterProfileId
 	baseRef: string
 	baseCommit: string
+	hiddenVerifierIdentity?: { protocol: string; suiteSha256: string; imageDigest: string; publicKeySha256: string }
 	generations: number
 	selected?: string
 	selectedCandidates?: string[]
@@ -281,7 +460,32 @@ export interface RsiRunRecord {
 	combinations?: HarnessModelCombination[]
 	jobs?: ExperimentJob[]
 	trajectoryRefs?: string[]
+	adaptiveSearch?: AdaptiveSearchDecision[]
 	curriculumTasks?: CurriculumTask[]
+	developmentProofProtocol?: DevelopmentProofProtocol
+	workerHarnessMode?: WorkerHarnessMode
+	workerHarnessPairId?: string
+	workerHarnessConfigDigest?: string
+	workerHarnessPlannedGenerations?: number
+	workerHarnessSamplingSeed?: string
+	workerHarnessRuntime?: WorkerHarnessRuntimeIdentity
+	confirmationEvidence?: "unmeasured" | "complete" | "incomplete"
+	confirmationAttempts?: BenchmarkAttempt[]
+	proofConfirmation?: {
+		selectedHarness: { candidateId: string; slotId: string; generation: number; commit: string; attemptIds: string[] }
+		rootHarness: { commit: string; attemptIds: string[] }
+	}
+	proofCampaign?: {
+		manifest: import("./proof-campaign.js").ProofCampaignManifest
+		manifestSha256: string
+		campaignId: string
+		armId: string
+		epoch: number
+		sequence?: number
+		ledgerSnapshot?: Record<string, unknown>
+		state: "running" | "evaluated" | "selected" | "rejected" | "finished"
+	}
+	adversarialReviews?: AdversarialReviewRecord[]
 	candidates: CandidateRecord[]
 	reports: string[]
 }
@@ -304,12 +508,14 @@ export interface CommandRunner {
 }
 
 export interface MutationRunner {
-	(candidate: CandidateRecord, config: RsiConfig): Promise<{ ok: boolean; result?: TrialResult; error?: string }>
+	(candidate: CandidateRecord, config: RsiConfig): Promise<{ ok: boolean; result?: TrialResult; error?: string; workerHarnessExecution?: WorkerHarnessExecution }>
 }
 
 export interface RsiHooks {
 	runCommand?: CommandRunner
 	runMutation?: MutationRunner
+	runAdversary?: (request: { role: RoleModelConfig; prompt: string }) => Promise<string>
+	runDevelopmentBenchmark?: (request: { harnessCommit: string; model: string; outputRoot: string; protocol: DevelopmentProofProtocol }) => Promise<BenchmarkAttempt[]>
 	now?: () => string
 	log?: (line: string) => void
 }

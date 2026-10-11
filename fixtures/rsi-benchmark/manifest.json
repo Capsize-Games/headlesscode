@@ -1,0 +1,1006 @@
+{
+  "schemaVersion": 1,
+  "runnerVersion": "1.0.0",
+  "createdFromCommit": "16c61c6425737c89ab8d8a2212f19193e00954d4",
+  "tasks": [
+    {
+      "id": "tool-symlink-escape",
+      "family": "tool-security",
+      "split": "development",
+      "task": "Harden workspace file path resolution against symlinks that point outside the workspace. Keep internal symlinks and writes to new in-workspace files usable.",
+      "startCommit": "ad073689c48a65089915e21fdabe771f71df599d",
+      "startDigest": "cecd99e4accce2ff693b5e047c8c079f0535b091b60ff4e6c6174d832ed08749",
+      "verifierPath": "verifiers/tool-symlink-escape.mjs",
+      "verifierDigest": "47add5da9b6f8a517fa35c1de589a35238a81e6d83d5b8ee196272971b735666",
+      "knownGoodCommit": "aa472e4c500ffd32fac2950c5d09df0ade0ebfe4",
+      "knownGoodDigest": "34be75e40838da2acbed4be44389af2cb8d2a2ca2a0fb744e486e2057b6f7029",
+      "knownBadCommit": "ad073689c48a65089915e21fdabe771f71df599d",
+      "knownBadDigest": "cecd99e4accce2ff693b5e047c8c079f0535b091b60ff4e6c6174d832ed08749",
+      "seed": 178272907,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "aa472e4c500ffd32fac2950c5d09df0ade0ebfe4",
+        "startCommit": "ad073689c48a65089915e21fdabe771f71df599d",
+        "subject": "fix(security): refuse symlink escapes in file-tool path resolution (fixes #64)",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "aa472e4c500ffd32fac2950c5d09df0ade0ebfe4",
+        "verifierPaths": [
+          "src/tools/__tests__/path-safety.test.ts"
+        ]
+      }
+    },
+    {
+      "id": "tool-test-argv",
+      "family": "tool-security",
+      "split": "development",
+      "task": "Make run_tests execute a requested test path as one literal argument. Paths with spaces must work and shell metacharacters in a path must not execute.",
+      "startCommit": "574cb952f1a728f57025b7e9c1d4d422eee02dec",
+      "startDigest": "f54eeca1e881da54cf44dc4b4a81ec200124044c99dac3ad807968dd18e378af",
+      "verifierPath": "verifiers/tool-test-argv.mjs",
+      "verifierDigest": "a2b1c6ef19ad67fd8b5a2b24e64c86127fe422694ad403920336991610510ed4",
+      "knownGoodCommit": "267f3cc4ebe9364422270980860434ff0a1670d2",
+      "knownGoodDigest": "8212d35b3ec766644fab02ce87566182b90a19bdf594c4156f30728d3684231f",
+      "knownBadCommit": "574cb952f1a728f57025b7e9c1d4d422eee02dec",
+      "knownBadDigest": "f54eeca1e881da54cf44dc4b4a81ec200124044c99dac3ad807968dd18e378af",
+      "seed": 884816408,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "267f3cc4ebe9364422270980860434ff0a1670d2",
+        "startCommit": "574cb952f1a728f57025b7e9c1d4d422eee02dec",
+        "subject": "fix(tools): run_tests passes test paths as argv, not shell strings (fixes #62)",
+        "verifierSource": "supervisor-authored-behavior-probe",
+        "verifierPaths": [
+          "scripts/rsi-benchmark/manual-tests/tool-test-argv.mjs"
+        ]
+      }
+    },
+    {
+      "id": "tool-protected-write",
+      "family": "tool-security",
+      "split": "development",
+      "task": "Apply the configured protected-files policy consistently to every file-editing tool, including surgical edits and replacements.",
+      "startCommit": "ad073689c48a65089915e21fdabe771f71df599d",
+      "startDigest": "cecd99e4accce2ff693b5e047c8c079f0535b091b60ff4e6c6174d832ed08749",
+      "verifierPath": "verifiers/tool-protected-write.mjs",
+      "verifierDigest": "1094fd0bbd214bbaa8396a70b4a4fd23da2e9fc87fab2b2984550abd87baef21",
+      "knownGoodCommit": "ad60e871806ebfdd412f8afe5ec9614f6bdc9a5c",
+      "knownGoodDigest": "ae2e33f7453953729c38d1577275e7e37ecf0bcafdf5fda3dff624a729b68aa7",
+      "knownBadCommit": "ad073689c48a65089915e21fdabe771f71df599d",
+      "knownBadDigest": "cecd99e4accce2ff693b5e047c8c079f0535b091b60ff4e6c6174d832ed08749",
+      "seed": 2139462128,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "ad60e871806ebfdd412f8afe5ec9614f6bdc9a5c",
+        "startCommit": "ad073689c48a65089915e21fdabe771f71df599d",
+        "subject": "fix(security): enforce protected-files guard on all write tools (fixes #63)",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "ad60e871806ebfdd412f8afe5ec9614f6bdc9a5c",
+        "verifierPaths": [
+          "src/tools/__tests__/apply_diff.test.ts",
+          "src/tools/__tests__/edit_file.test.ts",
+          "src/tools/__tests__/search_replace.test.ts"
+        ]
+      }
+    },
+    {
+      "id": "store-delete-guard",
+      "family": "tool-security",
+      "split": "development",
+      "task": "Prevent recursive shell deletion of the shared project store and its parent while preserving unrelated workspace cleanup.",
+      "startCommit": "09286934dc6c1d8433528b746eb72a3eb237ddc6",
+      "startDigest": "2abc017ef7d84e240b7615962668b00e76a42f4bdc1ab01e5e87766f35735093",
+      "verifierPath": "verifiers/store-delete-guard.mjs",
+      "verifierDigest": "f42e4733154958d3cb7b70347831c7947375999e430942641cdae18842bb090f",
+      "knownGoodCommit": "7f002e0e454a525009e1c536ec904ab93b848e70",
+      "knownGoodDigest": "305eb98d315b74f362b9864c2ea7890ecf068125d13be62790db668a7e467605",
+      "knownBadCommit": "09286934dc6c1d8433528b746eb72a3eb237ddc6",
+      "knownBadDigest": "2abc017ef7d84e240b7615962668b00e76a42f4bdc1ab01e5e87766f35735093",
+      "seed": 2779333770,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "7f002e0e454a525009e1c536ec904ab93b848e70",
+        "startCommit": "09286934dc6c1d8433528b746eb72a3eb237ddc6",
+        "subject": "feat(permissions): protect the shared central store from rm -rf via execute_command",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "b78a8fad12312585811c5deb6866ba74a7c51b66",
+        "verifierPaths": [
+          "src/permissions/__tests__/store-protection.test.ts"
+        ]
+      }
+    },
+    {
+      "id": "redirect-escape",
+      "family": "tool-security",
+      "split": "confirmation",
+      "task": "Reject shell redirections that write outside the workspace, including quoted and compound-command targets, while allowing in-workspace redirects.",
+      "startCommit": "b20f01be92e68c9db9cdfd8eaf1150f9dc4b65bc",
+      "startDigest": "2ffb4765797d4ceb69f3a41c165b63a45537af190e44353565b8d4b12a2368d3",
+      "verifierPath": "verifiers/redirect-escape.mjs",
+      "verifierDigest": "8f4664d6241f376c289ed18efc460dc692cd03e61d330418590ead3cdeacd204",
+      "knownGoodCommit": "578f1a524bbf5a22854489da820ddcca1d57e89b",
+      "knownGoodDigest": "ec52c7d2a4115c306096f56300b0e2f1c49d49c2393b0fd84db04d947d7c609a",
+      "knownBadCommit": "b20f01be92e68c9db9cdfd8eaf1150f9dc4b65bc",
+      "knownBadDigest": "2ffb4765797d4ceb69f3a41c165b63a45537af190e44353565b8d4b12a2368d3",
+      "seed": 1362890664,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "578f1a524bbf5a22854489da820ddcca1d57e89b",
+        "startCommit": "b20f01be92e68c9db9cdfd8eaf1150f9dc4b65bc",
+        "subject": "ENH-4 reviewer CI-runner checklist item (#121) + execute_command outside-workspace redirect guard (#122) (#129)",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "578f1a524bbf5a22854489da820ddcca1d57e89b",
+        "verifierPaths": [
+          "src/cloud/__tests__/docker-provider.test.ts",
+          "src/permissions/__tests__/commands.test.ts",
+          "src/tools/__tests__/execute_command.test.ts",
+          "src/tools/__tests__/path-safety.test.ts"
+        ]
+      }
+    },
+    {
+      "id": "codesearch-empty-chunks",
+      "family": "tool-security",
+      "split": "confirmation",
+      "task": "Skip empty source chunks before embedding and keep indexing valid files when a file produces no usable chunks.",
+      "startCommit": "10d2dcd3309cfbbbb9ac56b6239bf26416ff3c06",
+      "startDigest": "97ff8f3a3f7412cd63488a256caf5f3f75eb0d10d90bba5f5280a8ec4284f8f2",
+      "verifierPath": "verifiers/codesearch-empty-chunks.mjs",
+      "verifierDigest": "5eb3bdb5ef4a781be5fe1e177c4a2b54ef8061b2d02a58058131b0cf11f00ec1",
+      "knownGoodCommit": "7d08a0bd62a08c56d3d0fedffdfb26927d885826",
+      "knownGoodDigest": "65474c21e255f7fb12e2bffb2cb613ae3016dc2af9434a77cda25e2610a45739",
+      "knownBadCommit": "10d2dcd3309cfbbbb9ac56b6239bf26416ff3c06",
+      "knownBadDigest": "97ff8f3a3f7412cd63488a256caf5f3f75eb0d10d90bba5f5280a8ec4284f8f2",
+      "seed": 3273281982,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "7d08a0bd62a08c56d3d0fedffdfb26927d885826",
+        "startCommit": "10d2dcd3309cfbbbb9ac56b6239bf26416ff3c06",
+        "subject": "fix(codesearch): skip empty chunks before embedding, and show embedding progress",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "7d08a0bd62a08c56d3d0fedffdfb26927d885826",
+        "verifierPaths": [
+          "src/codesearch/__tests__/index.test.ts"
+        ]
+      }
+    },
+    {
+      "id": "codesearch-generated",
+      "family": "tool-security",
+      "split": "confirmation",
+      "task": "Exclude generated artifacts from code search even when Git tracks them, while retaining ordinary source files.",
+      "startCommit": "1bf9b841520ab35bd3a2649422e36e49ab986eea",
+      "startDigest": "e3a6e53893ad5c8c7cecdce51498044e5f60482f402bf3c42226603d93a15920",
+      "verifierPath": "verifiers/codesearch-generated.mjs",
+      "verifierDigest": "1859b590046210e1939d129c8b0238220a9174fb56c06bc624aab4d7f4dcfcac",
+      "knownGoodCommit": "41105114a71d85e47d45585e17fabbe874beca47",
+      "knownGoodDigest": "7b09745e3ea32ef366d584d321aad185f00ec3b7ab0e21bcb3e0b2b5ca65d39b",
+      "knownBadCommit": "1bf9b841520ab35bd3a2649422e36e49ab986eea",
+      "knownBadDigest": "e3a6e53893ad5c8c7cecdce51498044e5f60482f402bf3c42226603d93a15920",
+      "seed": 3316462365,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "41105114a71d85e47d45585e17fabbe874beca47",
+        "startCommit": "1bf9b841520ab35bd3a2649422e36e49ab986eea",
+        "subject": "fix(codesearch): exclude generated artifacts from indexing even when git-tracked",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "41105114a71d85e47d45585e17fabbe874beca47",
+        "verifierPaths": [
+          "src/codesearch/__tests__/files.test.ts"
+        ]
+      }
+    },
+    {
+      "id": "edit-insertion-guard",
+      "family": "tool-security",
+      "split": "confirmation",
+      "task": "Refuse a large insertion applied to several matching sites when the requested replacement is unsafe, and leave the original file unchanged.",
+      "startCommit": "a6157a8cf5a7b3244cb476226fbb5be5380bb840",
+      "startDigest": "8c2108e7c6c26ed3f0ee36a1fad857bd2130947bdb97446951c45c883841f03a",
+      "verifierPath": "verifiers/edit-insertion-guard.mjs",
+      "verifierDigest": "e167079598ecbb3737f262d4386e19bb837b0c19fcb9fd423252150704fc5529",
+      "knownGoodCommit": "c9d6a4876c7e8ea5ed17fe9b347289c6793e5856",
+      "knownGoodDigest": "8ed9f1cd4dd912633b5fe529691d069343ef28aea7c04888eef1ca5142255266",
+      "knownBadCommit": "a6157a8cf5a7b3244cb476226fbb5be5380bb840",
+      "knownBadDigest": "8c2108e7c6c26ed3f0ee36a1fad857bd2130947bdb97446951c45c883841f03a",
+      "seed": 2545860813,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "c9d6a4876c7e8ea5ed17fe9b347289c6793e5856",
+        "startCommit": "a6157a8cf5a7b3244cb476226fbb5be5380bb840",
+        "subject": "fix(tools): edit_file refuses a large insertion applied to multiple sites",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "c9d6a4876c7e8ea5ed17fe9b347289c6793e5856",
+        "verifierPaths": [
+          "src/tools/__tests__/edit_file.test.ts"
+        ]
+      }
+    },
+    {
+      "id": "malformed-child-completion",
+      "family": "agent-completion",
+      "split": "development",
+      "task": "Fail closed when a child session returns an absent, non-string, or blank completion result instead of reporting the malformed completion as success.",
+      "startCommit": "be2ddc65cc0f4cb48adebc46d0498a313b152ffa",
+      "startDigest": "c3d8c01281ae86a72d8f1d365c21bcca46de38e859b85f3239dbfcd6012d16a0",
+      "verifierPath": "verifiers/malformed-child-completion.mjs",
+      "verifierDigest": "2e2d6c9a20c9b352a2833f6f9c702b27f160dabda4ee5d3a31acf8ad68e46c8e",
+      "knownGoodCommit": "afc1701c439e3527cc9649e4d3f9d0277abdcae3",
+      "knownGoodDigest": "56ec7e9bad1be3a11ddd84fdda83f856648a98ed6bf73feaf05f3edaa0671506",
+      "knownBadCommit": "be2ddc65cc0f4cb48adebc46d0498a313b152ffa",
+      "knownBadDigest": "c3d8c01281ae86a72d8f1d365c21bcca46de38e859b85f3239dbfcd6012d16a0",
+      "seed": 1979810597,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "afc1701c439e3527cc9649e4d3f9d0277abdcae3",
+        "startCommit": "be2ddc65cc0f4cb48adebc46d0498a313b152ffa",
+        "subject": "fix: fail closed on malformed child completions",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "afc1701c439e3527cc9649e4d3f9d0277abdcae3",
+        "verifierPaths": [
+          "src/engine/__tests__/new-task.test.ts"
+        ]
+      }
+    },
+    {
+      "id": "artifact-deferral-bound",
+      "family": "agent-completion",
+      "split": "development",
+      "task": "Bound repeated completion attempts that never produce an artifact so the session stops after the configured consecutive-error limit.",
+      "startCommit": "ead221f618716fa2f8f80b7452e9df110fda4c3a",
+      "startDigest": "005795f61b3258bbd398c5217ebc070156019c557c0f337798c3b6bee03a8774",
+      "verifierPath": "verifiers/artifact-deferral-bound.mjs",
+      "verifierDigest": "9860a582dbe500b1edc9bb519e2b4df9628a783f5fee5e6e9392d56682faa536",
+      "knownGoodCommit": "e16326082be85e64f1b8ba833c9bd6f5bb1b5501",
+      "knownGoodDigest": "edf14e4ff1b5ebc32fc9a6ce994cdd38a895408bd15fd23db72eb002e42d51d2",
+      "knownBadCommit": "ead221f618716fa2f8f80b7452e9df110fda4c3a",
+      "knownBadDigest": "005795f61b3258bbd398c5217ebc070156019c557c0f337798c3b6bee03a8774",
+      "seed": 1104290334,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "e16326082be85e64f1b8ba833c9bd6f5bb1b5501",
+        "startCommit": "ead221f618716fa2f8f80b7452e9df110fda4c3a",
+        "subject": "loop: bounded-failure kill-switch for the requireArtifactBeforeCompletion deferral",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "e16326082be85e64f1b8ba833c9bd6f5bb1b5501",
+        "verifierPaths": [
+          "src/engine/__tests__/loop.test.ts"
+        ],
+        "verifierTestName": "requireArtifactBeforeCompletion: repeated attempt_completion with no real tool call ends in bounded failure",
+        "verifierSelectionRationale": "Run the fix-added bounded-deferral regression directly; the rest of loop.test.ts is unrelated and exceeds the task verifier runtime ceiling."
+      }
+    },
+    {
+      "id": "cwd-enoent-report",
+      "family": "agent-completion",
+      "split": "development",
+      "task": "Validate a requested command working directory before spawning and report a missing directory as a task-path error, not a shell installation failure.",
+      "startCommit": "c7170727d32aa63cef7b9ad5cb49b170c85a5477",
+      "startDigest": "8fdd850966e1a26cbf980e9fe33a93c93393ee33d7c2cd9caed49319f5659d7d",
+      "verifierPath": "verifiers/cwd-enoent-report.mjs",
+      "verifierDigest": "fc5c7bb57061cd24b23ac3774211e912426c3e9c266598e060e2e3994bfd4129",
+      "knownGoodCommit": "46559ae3d59c5095c12e5cf62109ace0efe52b9d",
+      "knownGoodDigest": "775cc150fb63d6419be21f49f700bff2765699986f994db0122651ec35b92880",
+      "knownBadCommit": "c7170727d32aa63cef7b9ad5cb49b170c85a5477",
+      "knownBadDigest": "8fdd850966e1a26cbf980e9fe33a93c93393ee33d7c2cd9caed49319f5659d7d",
+      "seed": 1713038610,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "46559ae3d59c5095c12e5cf62109ace0efe52b9d",
+        "startCommit": "c7170727d32aa63cef7b9ad5cb49b170c85a5477",
+        "subject": "Fix cwd-ENOENT misattribution and permanent stale-write-failure lock",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "46559ae3d59c5095c12e5cf62109ace0efe52b9d",
+        "verifierPaths": [
+          "src/tools/__tests__/execute_command.test.ts"
+        ],
+        "verifierTestName": "execute_command: a nonexistent cwd is refused before spawn with a clear error, not a misleading bash ENOENT",
+        "verifierSelectionRationale": "Run the fix-added missing-cwd regression from the tool test file; the same commit's loop tests cover a separate stale-write issue."
+      }
+    },
+    {
+      "id": "bare-result-recovery",
+      "family": "agent-completion",
+      "split": "development",
+      "task": "Recover a bare JSON result object from a model reply as an attempt_completion tool call without accepting malformed JSON.",
+      "startCommit": "abf0d6c8f724362858848d461008335fece87af6",
+      "startDigest": "6054f624d24b232ed278c435c7444d24db2575bba27d63f1bdd72126281b1a79",
+      "verifierPath": "verifiers/bare-result-recovery.mjs",
+      "verifierDigest": "d56fdf428544fc0db6e43804a26397a7f38e6633ec084527db01081a5a6264b5",
+      "knownGoodCommit": "eed2c86a4edbcae3d65d654a58794348a2024dc7",
+      "knownGoodDigest": "7aa8611c5c0d2e43aa74ed83e93439affc47da7dee84ea72b5289c82d600f3e5",
+      "knownBadCommit": "abf0d6c8f724362858848d461008335fece87af6",
+      "knownBadDigest": "6054f624d24b232ed278c435c7444d24db2575bba27d63f1bdd72126281b1a79",
+      "seed": 2085933722,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "eed2c86a4edbcae3d65d654a58794348a2024dc7",
+        "startCommit": "abf0d6c8f724362858848d461008335fece87af6",
+        "subject": "parser: recover a bare {\"result\": \"...\"} reply as attempt_completion",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "eed2c86a4edbcae3d65d654a58794348a2024dc7",
+        "verifierPaths": [
+          "src/engine/__tests__/parser.test.ts"
+        ]
+      }
+    },
+    {
+      "id": "qa-pass-marker",
+      "family": "agent-completion",
+      "split": "confirmation",
+      "task": "Recognize a QA PASS marker only when it begins a line; a marker embedded in prose must not pass the review.",
+      "startCommit": "af4195913d858e0a8db8fd9626a7f836a0cc74f3",
+      "startDigest": "d38a6c4017161366019668807cd4b352425099708689473ea785fec24bae9348",
+      "verifierPath": "verifiers/qa-pass-marker.mjs",
+      "verifierDigest": "239a0782682f7819426c5bf85664958f995d9c2ebfb2e5a12378cbe3cd68343f",
+      "knownGoodCommit": "eaef3393794751ac3c8574d46a6898268a4bbad4",
+      "knownGoodDigest": "71d12aa06105a3591e47c01de2e7d19240adb08cec15dabc8a70ca39735c5a86",
+      "knownBadCommit": "af4195913d858e0a8db8fd9626a7f836a0cc74f3",
+      "knownBadDigest": "d38a6c4017161366019668807cd4b352425099708689473ea785fec24bae9348",
+      "seed": 2730202144,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "eaef3393794751ac3c8574d46a6898268a4bbad4",
+        "startCommit": "af4195913d858e0a8db8fd9626a7f836a0cc74f3",
+        "subject": "qa: parseQaResult's PASS marker must lead a line, not match anywhere",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "eaef3393794751ac3c8574d46a6898268a4bbad4",
+        "verifierPaths": [
+          "src/qa/__tests__/qa.test.ts"
+        ]
+      }
+    },
+    {
+      "id": "qa-baseline-counts",
+      "family": "agent-completion",
+      "split": "confirmation",
+      "task": "Avoid classifying ordinary baseline test counts as a QA failure while still rejecting explicit failure statements.",
+      "startCommit": "7535f1fc3f887309b25e796a731b1cb344d82a56",
+      "startDigest": "a0f3a1c9535d37c45f342cf06a38fe5b2768b83b279d1352c8213837519417cd",
+      "verifierPath": "verifiers/qa-baseline-counts.mjs",
+      "verifierDigest": "11debda65b4d2cfedf10dea8b2f40f1e020733c7136e1eea6f544566eabf27a1",
+      "knownGoodCommit": "fd5f499b4e1cb167f496cf5466626de4da665224",
+      "knownGoodDigest": "b4698805a569387803073c904ac2ec0d64adb28f5aaa3993fa953a25813b260c",
+      "knownBadCommit": "7535f1fc3f887309b25e796a731b1cb344d82a56",
+      "knownBadDigest": "a0f3a1c9535d37c45f342cf06a38fe5b2768b83b279d1352c8213837519417cd",
+      "seed": 1964666673,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "fd5f499b4e1cb167f496cf5466626de4da665224",
+        "startCommit": "7535f1fc3f887309b25e796a731b1cb344d82a56",
+        "subject": "fix(qa): remove bare-word false positives from fail-marker detection",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "fd5f499b4e1cb167f496cf5466626de4da665224",
+        "verifierPaths": [
+          "src/qa/__tests__/qa.test.ts"
+        ]
+      }
+    },
+    {
+      "id": "review-baseline-counts",
+      "family": "agent-completion",
+      "split": "confirmation",
+      "task": "Avoid treating incidental words in test output as review findings; retain genuine reopened-issue findings.",
+      "startCommit": "96760f8a35ea423f8f0f4d80c9ee4f86349d0880",
+      "startDigest": "e28f77ced280f408a7092e35f0af9f781b4ba1ae545ae810a74dd414a9dd0d6e",
+      "verifierPath": "verifiers/review-baseline-counts.mjs",
+      "verifierDigest": "921fe09f15c050d9ed8499d9bc4a973f315528c5cead0d93674b704530692aea",
+      "knownGoodCommit": "7535f1fc3f887309b25e796a731b1cb344d82a56",
+      "knownGoodDigest": "a0f3a1c9535d37c45f342cf06a38fe5b2768b83b279d1352c8213837519417cd",
+      "knownBadCommit": "96760f8a35ea423f8f0f4d80c9ee4f86349d0880",
+      "knownBadDigest": "e28f77ced280f408a7092e35f0af9f781b4ba1ae545ae810a74dd414a9dd0d6e",
+      "seed": 1874562166,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "7535f1fc3f887309b25e796a731b1cb344d82a56",
+        "startCommit": "96760f8a35ea423f8f0f4d80c9ee4f86349d0880",
+        "subject": "fix(reviewer): remove bare-word false positives from finding-marker detection",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "7535f1fc3f887309b25e796a731b1cb344d82a56",
+        "verifierPaths": [
+          "src/orchestrator/__tests__/reviewer.test.ts"
+        ]
+      }
+    },
+    {
+      "id": "structured-review-verdict",
+      "family": "agent-completion",
+      "split": "confirmation",
+      "task": "Require a structured verdict line in review and QA output so prose cannot create a false clean result.",
+      "startCommit": "93457ba7b7275ea371d70a090c315986484655d7",
+      "startDigest": "fa81bd791e16bb83f26beb9535ee3a27bef0f9f43f473c495e80f01a5f22afe7",
+      "verifierPath": "verifiers/structured-review-verdict.mjs",
+      "verifierDigest": "070bca458ee5cf587aa337d9d5fd8685c4c9a3688e7db0214abe1053fcfc4afc",
+      "knownGoodCommit": "c802d6361ffe5f8fd422fe40c019574ec9dacd49",
+      "knownGoodDigest": "cd0d02bfc0a983623f0e3ac07bbaa5e7a00f36818fe291e276952a42085444aa",
+      "knownBadCommit": "93457ba7b7275ea371d70a090c315986484655d7",
+      "knownBadDigest": "fa81bd791e16bb83f26beb9535ee3a27bef0f9f43f473c495e80f01a5f22afe7",
+      "seed": 1349765658,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "c802d6361ffe5f8fd422fe40c019574ec9dacd49",
+        "startCommit": "93457ba7b7275ea371d70a090c315986484655d7",
+        "subject": "fix(reviewer,qa): require a structured verdict line, closes #19",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "c802d6361ffe5f8fd422fe40c019574ec9dacd49",
+        "verifierPaths": [
+          "src/orchestrator/__tests__/reviewer.test.ts",
+          "src/qa/__tests__/qa.test.ts"
+        ]
+      }
+    },
+    {
+      "id": "ollama-request-timeout",
+      "family": "provider-runtime",
+      "split": "development",
+      "task": "Set the local Ollama timeout defaults above the local proxy timeout for code, review, and QA model calls.",
+      "startCommit": "8b7dab60990deb1715c6d4da367133a43795348d",
+      "startDigest": "fe502e81a3878a13170e7a45637d428206b3f4e484e6fd709a3ee82fec0a5b20",
+      "verifierPath": "verifiers/ollama-request-timeout.mjs",
+      "verifierDigest": "bc5127fb54e647b9933a6ff508b1b004aaa30c80597299ef0ad43b15ad747d0f",
+      "knownGoodCommit": "9bc8a356175d9ea10e5a8d75bb00467df575c0a1",
+      "knownGoodDigest": "70b51038b9f14800e9a382983b2edac812ce64597ab23dd70a3aafdcace06ab3",
+      "knownBadCommit": "8b7dab60990deb1715c6d4da367133a43795348d",
+      "knownBadDigest": "fe502e81a3878a13170e7a45637d428206b3f4e484e6fd709a3ee82fec0a5b20",
+      "seed": 3805823124,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "9bc8a356175d9ea10e5a8d75bb00467df575c0a1",
+        "startCommit": "8b7dab60990deb1715c6d4da367133a43795348d",
+        "subject": "fix OllamaClient's own independent timeout, not just loop.ts's",
+        "verifierSource": "supervisor-authored-behavior-probe",
+        "verifierPaths": [
+          "scripts/rsi-benchmark/manual-tests/ollama-request-timeout.mjs"
+        ]
+      }
+    },
+    {
+      "id": "ollama-fetch-timeout",
+      "family": "provider-runtime",
+      "split": "development",
+      "task": "Ensure the Ollama HTTP client honors its own timeout even when the underlying fetch implementation has a longer default.",
+      "startCommit": "9bc8a356175d9ea10e5a8d75bb00467df575c0a1",
+      "startDigest": "70b51038b9f14800e9a382983b2edac812ce64597ab23dd70a3aafdcace06ab3",
+      "verifierPath": "verifiers/ollama-fetch-timeout.mjs",
+      "verifierDigest": "3fa715c438bf13617dbaf3b2525b169746fe8583f0c07d801a189b16f264eaae",
+      "knownGoodCommit": "af4195913d858e0a8db8fd9626a7f836a0cc74f3",
+      "knownGoodDigest": "d38a6c4017161366019668807cd4b352425099708689473ea785fec24bae9348",
+      "knownBadCommit": "9bc8a356175d9ea10e5a8d75bb00467df575c0a1",
+      "knownBadDigest": "70b51038b9f14800e9a382983b2edac812ce64597ab23dd70a3aafdcace06ab3",
+      "seed": 491233895,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "af4195913d858e0a8db8fd9626a7f836a0cc74f3",
+        "startCommit": "9bc8a356175d9ea10e5a8d75bb00467df575c0a1",
+        "subject": "ollama: fix real timeout — undici's own default, not just ours",
+        "verifierSource": "supervisor-authored-behavior-probe",
+        "verifierPaths": [
+          "scripts/rsi-benchmark/manual-tests/ollama-fetch-timeout.mjs"
+        ]
+      }
+    },
+    {
+      "id": "cli-ollama-timeout",
+      "family": "provider-runtime",
+      "split": "development",
+      "task": "Pass the CLI LLM timeout setting through to the local Ollama backend instead of silently using its default.",
+      "startCommit": "ab381a38a23f7fb43ce535c1f85c2f8f50dd7cb2",
+      "startDigest": "02114f983576f0c797e3d0d3941289be952ca6d08a82777f532685daea1f330b",
+      "verifierPath": "verifiers/cli-ollama-timeout.mjs",
+      "verifierDigest": "741b180429de062455cd0ae2468ae53f46a2007721ec28c6de035eb1843e7471",
+      "knownGoodCommit": "13f1a9fb8ab20fe5df44d38edbbe9a9f9e6d45cd",
+      "knownGoodDigest": "1063aad9ae0c7863eb2ae1409c0b6fbf311b2cc939c7b0dfedff94bb84ec89e6",
+      "knownBadCommit": "ab381a38a23f7fb43ce535c1f85c2f8f50dd7cb2",
+      "knownBadDigest": "02114f983576f0c797e3d0d3941289be952ca6d08a82777f532685daea1f330b",
+      "seed": 968521319,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "13f1a9fb8ab20fe5df44d38edbbe9a9f9e6d45cd",
+        "startCommit": "ab381a38a23f7fb43ce535c1f85c2f8f50dd7cb2",
+        "subject": "fix(cli): --llm-timeout-ms was silently ignored for the Ollama backend",
+        "verifierSource": "supervisor-authored-behavior-probe",
+        "verifierPaths": [
+          "scripts/rsi-benchmark/manual-tests/cli-ollama-timeout.mjs"
+        ]
+      }
+    },
+    {
+      "id": "cli-max-tokens",
+      "family": "provider-runtime",
+      "split": "development",
+      "task": "Add a validated CLI max-tokens option and carry it into the model request configuration.",
+      "startCommit": "c879fc0e145c69b103b0308123574bb0276b3221",
+      "startDigest": "6d411cb4c205b3da6a8f54833ca24709dcc8e6d802a9f2d7f03749e2231c6740",
+      "verifierPath": "verifiers/cli-max-tokens.mjs",
+      "verifierDigest": "78b086f001d7f49372c0eb35c14b4162b5b443ffd0bacb97aacca0ec704d5799",
+      "knownGoodCommit": "90f835462d1ef90252b0a3379b97d417388cfac1",
+      "knownGoodDigest": "59ef68c83eafaea023162802b6e823b97201a9046ed445127c541cbe2fdb62b8",
+      "knownBadCommit": "c879fc0e145c69b103b0308123574bb0276b3221",
+      "knownBadDigest": "6d411cb4c205b3da6a8f54833ca24709dcc8e6d802a9f2d7f03749e2231c6740",
+      "seed": 1530853157,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "90f835462d1ef90252b0a3379b97d417388cfac1",
+        "startCommit": "c879fc0e145c69b103b0308123574bb0276b3221",
+        "subject": "feat(cli): add --max-tokens flag (issue #151)",
+        "verifierSource": "supervisor-authored-behavior-probe",
+        "verifierPaths": [
+          "scripts/rsi-benchmark/manual-tests/cli-max-tokens.mjs"
+        ]
+      }
+    },
+    {
+      "id": "local-output-cap",
+      "family": "provider-runtime",
+      "split": "confirmation",
+      "task": "Cap per-turn local-model output tokens to a supported value rather than sending the oversized default that the backend rejects.",
+      "startCommit": "5c7d7b20a5e688b2d39544d565bd968314aa8643",
+      "startDigest": "d70606321f56036c28313c0c8bded209dd7e93b6aac6288d29f9e493ba13e690",
+      "verifierPath": "verifiers/local-output-cap.mjs",
+      "verifierDigest": "626d56c5ecbcc094dfde3fd61655fa24dc031b7e82e80ac5816f03a604049468",
+      "knownGoodCommit": "b64ed98e5472c29de5db2f804dffaa5bf52b8854",
+      "knownGoodDigest": "35375eb8d18c4fdeae370d614119832135f2493fe9d87a8a0f67b563ce9879e7",
+      "knownBadCommit": "5c7d7b20a5e688b2d39544d565bd968314aa8643",
+      "knownBadDigest": "d70606321f56036c28313c0c8bded209dd7e93b6aac6288d29f9e493ba13e690",
+      "seed": 3893455570,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "b64ed98e5472c29de5db2f804dffaa5bf52b8854",
+        "startCommit": "5c7d7b20a5e688b2d39544d565bd968314aa8643",
+        "subject": "local backend: cap per-turn output tokens — DEFAULT_MAX_TOKENS (32768) crashed a real session",
+        "verifierSource": "supervisor-authored-behavior-probe",
+        "verifierPaths": [
+          "scripts/rsi-benchmark/manual-tests/local-output-cap.mjs"
+        ]
+      }
+    },
+    {
+      "id": "reasoning-token-sizing",
+      "family": "provider-runtime",
+      "split": "confirmation",
+      "task": "Include reasoning tokens in context-size decisions but exclude them from the summary text sent back to the model.",
+      "startCommit": "f7e78e62dd39d960c4dbfb03e04ea1f678ec94bd",
+      "startDigest": "9ecbaf0ecac2dbfe0081aba4c2b81a91a704bb90f6768233a6d24155e9e98fcc",
+      "verifierPath": "verifiers/reasoning-token-sizing.mjs",
+      "verifierDigest": "0739e2d76f556f4d49787f87bea7cc69e736f01cfdaaf2655f3fa051feecc0be",
+      "knownGoodCommit": "b0e2cf65e4d700dc8977ef7d611b4a6adbf65b91",
+      "knownGoodDigest": "2abec14e7d21cfb08bddc2b69505ad7b57180859d6ea54f1ac384d35bc9a7696",
+      "knownBadCommit": "f7e78e62dd39d960c4dbfb03e04ea1f678ec94bd",
+      "knownBadDigest": "9ecbaf0ecac2dbfe0081aba4c2b81a91a704bb90f6768233a6d24155e9e98fcc",
+      "seed": 625304507,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "b0e2cf65e4d700dc8977ef7d611b4a6adbf65b91",
+        "startCommit": "f7e78e62dd39d960c4dbfb03e04ea1f678ec94bd",
+        "subject": "fix(engine): count reasoning in condensation sizing; keep it out of the summary prompt",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "b0e2cf65e4d700dc8977ef7d611b4a6adbf65b91",
+        "verifierPaths": [
+          "src/engine/__tests__/condense.test.ts"
+        ]
+      }
+    },
+    {
+      "id": "truncate-tool-groups",
+      "family": "provider-runtime",
+      "split": "confirmation",
+      "task": "Trim conversation history without separating assistant tool calls from their matching tool responses.",
+      "startCommit": "f70dcdcedb91cfd3deb935f5be55c06dafa5c20c",
+      "startDigest": "1ae17870c50718b7c39bd2c9a21cb5f80ab2efad239773ee7b5e078aa79635e8",
+      "verifierPath": "verifiers/truncate-tool-groups.mjs",
+      "verifierDigest": "8aa3daf19c94ac17b8a16e97a3b8b8c3a2895b09e50ef2d81bdac32c437f1a21",
+      "knownGoodCommit": "19d186c19303f53ad3bed15ccd6a246402d8348c",
+      "knownGoodDigest": "ae52eb144cb379e7adca89cd0bbf604fd5507dc65197469f64cc07e9d4f9eea0",
+      "knownBadCommit": "f70dcdcedb91cfd3deb935f5be55c06dafa5c20c",
+      "knownBadDigest": "1ae17870c50718b7c39bd2c9a21cb5f80ab2efad239773ee7b5e078aa79635e8",
+      "seed": 4124180750,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "19d186c19303f53ad3bed15ccd6a246402d8348c",
+        "startCommit": "f70dcdcedb91cfd3deb935f5be55c06dafa5c20c",
+        "subject": "Fix truncateHistory splitting tool_calls/tool response groups",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "19d186c19303f53ad3bed15ccd6a246402d8348c",
+        "verifierPaths": [
+          "src/engine/__tests__/loop.test.ts"
+        ],
+        "verifierTestName": "truncateHistory: never splits an assistant tool_calls / tool response group",
+        "verifierSelectionRationale": "Run the fix-added variable-call-count group-integrity regression directly; the rest of loop.test.ts is unrelated to history truncation."
+      }
+    },
+    {
+      "id": "strict-tool-schema",
+      "family": "provider-runtime",
+      "split": "confirmation",
+      "task": "Correct the strict-mode function schemas for code-intelligence tools so every declared object satisfies the API schema rules.",
+      "startCommit": "518b40f1e4b327867549ce6dda29363253ab296a",
+      "startDigest": "271f47019b9b5c429459d5025bdad7974256ba31f59c77f3cdafe55414faa50e",
+      "verifierPath": "verifiers/strict-tool-schema.mjs",
+      "verifierDigest": "099dc7f29501d668ab41135512dab7d1c99797e54b980662f0db5e22024b73af",
+      "knownGoodCommit": "56ab99d3dd8159ef0c415a10d95c4beba0a6671f",
+      "knownGoodDigest": "882f84cac33267a2aa5c69554946b80528793cbbcc029443ba6e3574dca244f0",
+      "knownBadCommit": "518b40f1e4b327867549ce6dda29363253ab296a",
+      "knownBadDigest": "271f47019b9b5c429459d5025bdad7974256ba31f59c77f3cdafe55414faa50e",
+      "seed": 3312514669,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "56ab99d3dd8159ef0c415a10d95c4beba0a6671f",
+        "startCommit": "518b40f1e4b327867549ce6dda29363253ab296a",
+        "subject": "Fix strict-mode schema violation in go_to_definition/find_references",
+        "verifierSource": "supervisor-authored-behavior-probe",
+        "verifierPaths": [
+          "scripts/rsi-benchmark/manual-tests/strict-tool-schema.mjs"
+        ]
+      }
+    },
+    {
+      "id": "watch-abort-callbacks",
+      "family": "orchestration",
+      "split": "development",
+      "task": "Wait for already-started watcher callbacks to settle before returning from an aborted watch operation.",
+      "startCommit": "4871fa0ca958f270902dc6947c75739ac2380c28",
+      "startDigest": "c760666461e50d890483cb1b494a4a51be75ba007a8366fe15902c9883dfd407",
+      "verifierPath": "verifiers/watch-abort-callbacks.mjs",
+      "verifierDigest": "b3cd4925cd5ee3b8dfb2aa7e56f114a0e9eda6ba05d9fc4be6f0efe8e2a8907b",
+      "knownGoodCommit": "5f08b81f696f54484c156aeab5d0067b34804c8f",
+      "knownGoodDigest": "1c2aac17e7a54588dbd32278e5a94920f736e37dbe3515413e8a6eeb5b6271c2",
+      "knownBadCommit": "4871fa0ca958f270902dc6947c75739ac2380c28",
+      "knownBadDigest": "c760666461e50d890483cb1b494a4a51be75ba007a8366fe15902c9883dfd407",
+      "seed": 3703712975,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "5f08b81f696f54484c156aeab5d0067b34804c8f",
+        "startCommit": "4871fa0ca958f270902dc6947c75739ac2380c28",
+        "subject": "fix(orchestrator): await in-flight callbacks before watchGroups returns on abort (#135)",
+        "verifierSource": "supervisor-authored-behavior-probe",
+        "verifierPaths": [
+          "scripts/rsi-benchmark/manual-tests/watch-abort-callbacks.mjs"
+        ]
+      }
+    },
+    {
+      "id": "status-wait-preemption",
+      "family": "orchestration",
+      "split": "development",
+      "task": "Make status --wait observe terminal state without pre-empting the active watcher or changing its state.",
+      "startCommit": "578f1a524bbf5a22854489da820ddcca1d57e89b",
+      "startDigest": "ec52c7d2a4115c306096f56300b0e2f1c49d49c2393b0fd84db04d947d7c609a",
+      "verifierPath": "verifiers/status-wait-preemption.mjs",
+      "verifierDigest": "99695bf467dc84e48bf9a778e130fed4815fd54f6387000a00d80280a2fa236a",
+      "knownGoodCommit": "0d441dc4e2aa561d030557d689ce5ce7825ec411",
+      "knownGoodDigest": "0c0191ee31f66f194f1f2ca740de94d672a2dcd0c8cd2e83e20642145d1e73e4",
+      "knownBadCommit": "578f1a524bbf5a22854489da820ddcca1d57e89b",
+      "knownBadDigest": "ec52c7d2a4115c306096f56300b0e2f1c49d49c2393b0fd84db04d947d7c609a",
+      "seed": 3722890514,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "0d441dc4e2aa561d030557d689ce5ce7825ec411",
+        "startCommit": "578f1a524bbf5a22854489da820ddcca1d57e89b",
+        "subject": "fix: status --wait no longer pre-empts the watcher; preflight CI-bound + low-confidence flags (#116 #125 #126) (#130)",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "0d441dc4e2aa561d030557d689ce5ce7825ec411",
+        "verifierPaths": [
+          "src/orchestrator/__tests__/cost-estimate.test.ts",
+          "src/orchestrator/__tests__/status-cli.test.ts",
+          "src/orchestrator/__tests__/watch.test.ts"
+        ]
+      }
+    },
+    {
+      "id": "watch-stalled-worker",
+      "family": "orchestration",
+      "split": "development",
+      "task": "Prevent watchGroups from busy-looping when a worker is dead but its state remains unresolved.",
+      "startCommit": "826a28aaf9ef71b341e304110fb4dd24c19b6d89",
+      "startDigest": "21d29bf637e0cdf7f3f3c23726b58e836e0e2fb0ca8047dd2dc5c2697a00d126",
+      "verifierPath": "verifiers/watch-stalled-worker.mjs",
+      "verifierDigest": "964137e8b642590ef47394deedb44ca7369758040fde7d64fb61b0b3bf6bd585",
+      "knownGoodCommit": "a92f95aa57f4dfb0150f35236551fa8d91cfc1d4",
+      "knownGoodDigest": "a57fb1f5c6c2ca49d0053c82cea35b01693d447e1a65eea345a1680e4c69e622",
+      "knownBadCommit": "826a28aaf9ef71b341e304110fb4dd24c19b6d89",
+      "knownBadDigest": "21d29bf637e0cdf7f3f3c23726b58e836e0e2fb0ca8047dd2dc5c2697a00d126",
+      "seed": 1844309598,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "a92f95aa57f4dfb0150f35236551fa8d91cfc1d4",
+        "startCommit": "826a28aaf9ef71b341e304110fb4dd24c19b6d89",
+        "subject": "Fix watchGroups busy-loop: a dead-but-unresolved stalled worker spun the poll loop at 100% CPU for 11+ hours",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "a92f95aa57f4dfb0150f35236551fa8d91cfc1d4",
+        "verifierPaths": [
+          "src/orchestrator/__tests__/watch.test.ts"
+        ]
+      }
+    },
+    {
+      "id": "preserve-harness-log",
+      "family": "orchestration",
+      "split": "development",
+      "task": "Preserve the existing harness log when a worker resumes or reworks instead of truncating earlier execution evidence.",
+      "startCommit": "1de05704162011196e8e05285192a328852f6dc1",
+      "startDigest": "e713000b76d6b8d4484fb45f873d6caa3349d431bc11cb537a630c6bd5d04311",
+      "verifierPath": "verifiers/preserve-harness-log.mjs",
+      "verifierDigest": "feacddc1d6eed0bca22b569d6e21d5de51990ed1109da4545f85417a0903c1f5",
+      "knownGoodCommit": "c977258142838296c71e2185ffb391f4e6f26097",
+      "knownGoodDigest": "f15d6c26e6affffa9e3fa34bc5f36edec5880d03e58befd364dd8464797b5231",
+      "knownBadCommit": "1de05704162011196e8e05285192a328852f6dc1",
+      "knownBadDigest": "e713000b76d6b8d4484fb45f873d6caa3349d431bc11cb537a630c6bd5d04311",
+      "seed": 2894791451,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "c977258142838296c71e2185ffb391f4e6f26097",
+        "startCommit": "1de05704162011196e8e05285192a328852f6dc1",
+        "subject": "fix(orchestrate): stop truncating harness.log on continuation/rework respawn",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "c977258142838296c71e2185ffb391f4e6f26097",
+        "verifierPaths": [
+          "src/orchestrator/__tests__/watch.test.ts"
+        ]
+      }
+    },
+    {
+      "id": "captured-summary-final-outcome",
+      "family": "orchestration",
+      "split": "confirmation",
+      "task": "Preserve the final outcome in the watcher summary when earlier log output nearly fills the summary limit.",
+      "startCommit": "63d68b1e8f4614175a16c58655e34f2efd39d56a",
+      "startDigest": "ec915a626b7857df91066d35a60acb337c7ab7792fcc3b2fdedb0ed985a896df",
+      "verifierPath": "verifiers/captured-summary-final-outcome.mjs",
+      "verifierDigest": "f10b2d996d8732ae1c3db9999abb3d00069f69ba8b1141f247f4a4d7bf9e59a3",
+      "knownGoodCommit": "40aa1d6209c820df2eed057f0b039e87838f38f5",
+      "knownGoodDigest": "5da8a51ab150e111a81e5986c414b43b0b349b2889a8598da5e6507f67caaea5",
+      "knownBadCommit": "63d68b1e8f4614175a16c58655e34f2efd39d56a",
+      "knownBadDigest": "ec915a626b7857df91066d35a60acb337c7ab7792fcc3b2fdedb0ed985a896df",
+      "seed": 362708819,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "40aa1d6209c820df2eed057f0b039e87838f38f5",
+        "startCommit": "63d68b1e8f4614175a16c58655e34f2efd39d56a",
+        "subject": "fix(orchestrator): captured summary was truncating away the actual final outcome",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "40aa1d6209c820df2eed057f0b039e87838f38f5",
+        "verifierPaths": [
+          "src/orchestrator/__tests__/watch.test.ts"
+        ]
+      }
+    },
+    {
+      "id": "cost-history-order",
+      "family": "orchestration",
+      "split": "confirmation",
+      "task": "Record orchestration cost only after review and QA usage has been collected, so the persisted total includes both phases.",
+      "startCommit": "10b8616d19d7baf37b0ed7035505f16dfc993dd3",
+      "startDigest": "ff621f62517dda2967986dffdf3baa9b4173f99d5fa0d8d7aec346b5daef7305",
+      "verifierPath": "verifiers/cost-history-order.mjs",
+      "verifierDigest": "890ae9247d7f764190f8f3b4c4ce142144ead2f039094c4a4815eec27bd75d2a",
+      "knownGoodCommit": "11696e552d918cb93c10713ef9d6b3211afcf4b8",
+      "knownGoodDigest": "d47979f9747f9911a528ef71fa4954748ef7b3852d7b6e1beeb30a929c523fed",
+      "knownBadCommit": "10b8616d19d7baf37b0ed7035505f16dfc993dd3",
+      "knownBadDigest": "ff621f62517dda2967986dffdf3baa9b4173f99d5fa0d8d7aec346b5daef7305",
+      "seed": 1460835954,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "11696e552d918cb93c10713ef9d6b3211afcf4b8",
+        "startCommit": "10b8616d19d7baf37b0ed7035505f16dfc993dd3",
+        "subject": "fix(orchestrator): cost-history recording fired before review/QA cost existed",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "11696e552d918cb93c10713ef9d6b3211afcf4b8",
+        "verifierPaths": [
+          "src/orchestrator/__tests__/watch.test.ts"
+        ]
+      }
+    },
+    {
+      "id": "qa-failure-rework",
+      "family": "orchestration",
+      "split": "confirmation",
+      "task": "Route a real QA failure into the rework cycle instead of marking the group settled as done.",
+      "startCommit": "b1c682514df4f834080afb9ea9cde8fbb754ebd4",
+      "startDigest": "62da7d12c701973be2dfa928a8791d9f7894d525a240c8dd25c3b7de3e5272fa",
+      "verifierPath": "verifiers/qa-failure-rework.mjs",
+      "verifierDigest": "dcacba9ac85a8347af28b67032e34cabbe3f8f228d9df2fa665d0e96a43007e7",
+      "knownGoodCommit": "27c86aa136d467ef3a597ae56d38a9fc55b824da",
+      "knownGoodDigest": "e920ff5a88cd170f11fa8c0f38f3c5d080bdf3a244aae265be086510231af1cf",
+      "knownBadCommit": "b1c682514df4f834080afb9ea9cde8fbb754ebd4",
+      "knownBadDigest": "62da7d12c701973be2dfa928a8791d9f7894d525a240c8dd25c3b7de3e5272fa",
+      "seed": 3657412056,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "27c86aa136d467ef3a597ae56d38a9fc55b824da",
+        "startCommit": "b1c682514df4f834080afb9ea9cde8fbb754ebd4",
+        "subject": "fix(orchestrator): auto-rework on real QA fail instead of silently settling (#52) (#55)",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "27c86aa136d467ef3a597ae56d38a9fc55b824da",
+        "verifierPaths": [
+          "src/orchestrator/__tests__/cli.test.ts",
+          "src/orchestrator/__tests__/resume.test.ts"
+        ]
+      }
+    },
+    {
+      "id": "dashboard-git-owner-api",
+      "family": "orchestration",
+      "split": "confirmation",
+      "task": "Expose the configured Git owner name in the dashboard project API while preserving existing project fields.",
+      "startCommit": "bb8f38c7bdc028e29a0ae3cdfb2924aac7c7e959",
+      "startDigest": "4a4da590673fa2e6e55c7a3f7a3a0d58d35186dff70ce1dabf4dc7bafd2e9f9b",
+      "verifierPath": "verifiers/dashboard-git-owner-api.mjs",
+      "verifierDigest": "ec7d70174cb3b55517ca60ef420c4145b011431705db193002a3c9fdc206b508",
+      "knownGoodCommit": "6372a39a29232a36980d8dcb9b30f8d7b74b5b21",
+      "knownGoodDigest": "770fc0056bfd4bffeb05238207b8cb825a8c9a62ec25452fcd3f60bfa5cec46f",
+      "knownBadCommit": "bb8f38c7bdc028e29a0ae3cdfb2924aac7c7e959",
+      "knownBadDigest": "4a4da590673fa2e6e55c7a3f7a3a0d58d35186dff70ce1dabf4dc7bafd2e9f9b",
+      "seed": 157064908,
+      "ceilings": {
+        "timeoutMs": 180000,
+        "maxCalls": 30,
+        "maxOutputTokensPerCall": 2048,
+        "maxPatchBytes": 262144
+      },
+      "provenance": {
+        "fixCommit": "6372a39a29232a36980d8dcb9b30f8d7b74b5b21",
+        "startCommit": "bb8f38c7bdc028e29a0ae3cdfb2924aac7c7e959",
+        "subject": "feat(dashboard): expose gitOwnerName in GET /api/projects",
+        "verifierSource": "historical-regression-test",
+        "verifierCommit": "6372a39a29232a36980d8dcb9b30f8d7b74b5b21",
+        "verifierPaths": [
+          "src/dashboard/__tests__/projects-routes.test.ts"
+        ]
+      }
+    }
+  ]
+}

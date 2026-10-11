@@ -25,8 +25,10 @@ import type {
 	ChatTool,
 	ChatToolCall,
 } from "../engine/types.js"
+import { randomUUID } from "node:crypto"
 import { parseEndpointPricing, type EndpointPricingEntry, type ModelPrice } from "../budget/cost.js"
 import { captureTranscript, isTranscriptCaptureEnabled } from "./transcript-capture.js"
+import { packRequestBody, PromptByteBudgetError, resolvePromptByteBudget } from "./request-budget.js"
 
 export const OPENROUTER_BASE_URL = "https://openrouter.ai"
 export const DEFAULT_MODEL = "meta/muse-spark-1.3-contributor"
@@ -37,6 +39,25 @@ export interface OpenRouterClientOptions {
 	defaultModel?: string
 	httpReferer?: string
 	appTitle?: string
+	/** For synthetic diagnostics that must never write prompt-bearing transcripts. */
+	disableTranscriptCapture?: boolean
+	/** Maximum exact serialized chat request size in UTF-8 bytes; env: HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES. */
+	maxPromptBytes?: number
+}
+
+/** Non-content billing/route record retrieved from OpenRouter's generation API. */
+export interface OpenRouterGenerationMetadata {
+	id: string
+	model?: string
+	providerName?: string
+	totalCostUsd?: number
+	upstreamInferenceCostUsd?: number
+	cacheDiscountUsd?: number
+	tokensPrompt?: number
+	tokensCompletion?: number
+	nativeTokensReasoning?: number
+	nativeTokensCached?: number
+	latencyMs?: number
 }
 
 /** Typed error for non-2xx responses or malformed payloads. */
@@ -74,6 +95,7 @@ export class OpenRouterError extends Error {
  * are deterministic and retrying would just fail the same way again.
  */
 export function isRetryableOpenRouterError(error: unknown): boolean {
+	if (error instanceof PromptByteBudgetError) return false
 	if (!(error instanceof OpenRouterError)) {
 		return false
 	}
@@ -112,6 +134,8 @@ export class OpenRouterClient implements LlmClient {
 	private readonly defaultModel: string
 	private readonly httpReferer?: string
 	private readonly appTitle?: string
+	private readonly disableTranscriptCapture: boolean
+	private readonly maxPromptBytes: number | undefined
 
 	constructor(options: OpenRouterClientOptions = {}) {
 		this.apiKey = options.apiKey ?? process.env.HEADLESSCODE_OPENROUTER_API_KEY
@@ -119,6 +143,8 @@ export class OpenRouterClient implements LlmClient {
 		this.defaultModel = options.defaultModel ?? process.env.OPENROUTER_MODEL ?? DEFAULT_MODEL
 		this.httpReferer = options.httpReferer ?? process.env.OPENROUTER_HTTP_REFERER
 		this.appTitle = options.appTitle ?? process.env.OPENROUTER_APP_TITLE
+		this.disableTranscriptCapture = options.disableTranscriptCapture ?? false
+		this.maxPromptBytes = resolvePromptByteBudget(options.maxPromptBytes)
 	}
 
 	/**
@@ -141,6 +167,7 @@ export class OpenRouterClient implements LlmClient {
 		if (this.appTitle) {
 			headers["X-Title"] = this.appTitle
 		}
+		if (process.env.HEADLESSCODE_RSI_INFERENCE_CAPABILITY) headers["X-RSI-Call-ID"] = randomUUID()
 		return headers
 	}
 
@@ -292,7 +319,7 @@ export class OpenRouterClient implements LlmClient {
 	async fetchModelInfo(
 		model: string,
 		signal?: AbortSignal,
-	): Promise<{ contextWindow?: number; price?: ModelPrice } | undefined> {
+	): Promise<{ contextWindow?: number; price?: ModelPrice; endpoints?: Array<{ providerName?: string; status?: number }> } | undefined> {
 		if (!this.apiKey) {
 			return undefined
 		}
@@ -341,12 +368,14 @@ export class OpenRouterClient implements LlmClient {
 		let data:
 			| {
 					data?:
-						| Array<{ context_length?: unknown; provider_name?: unknown; pricing?: unknown }>
-						| { endpoints?: Array<{ context_length?: unknown; provider_name?: unknown; pricing?: unknown }> }
+						| Array<{ context_length?: unknown; provider_name?: unknown; pricing?: unknown; status?: unknown }>
+						| { endpoints?: Array<{ context_length?: unknown; provider_name?: unknown; pricing?: unknown; status?: unknown }> }
 			  }
 			| undefined
 		try {
-			data = JSON.parse(await response.text()) as typeof data
+			const responseText = await readBoundedResponseText(response, 256 * 1024)
+			if (responseText === undefined) return undefined
+			data = JSON.parse(responseText) as typeof data
 		} catch {
 			return undefined
 		}
@@ -368,6 +397,10 @@ export class OpenRouterClient implements LlmClient {
 		return {
 			...(contextWindow !== undefined ? { contextWindow } : {}),
 			...(price !== undefined ? { price } : {}),
+			endpoints: endpoints.map((endpoint) => ({
+				...(typeof endpoint.provider_name === "string" ? { providerName: endpoint.provider_name } : {}),
+				...(typeof endpoint.status === "number" && Number.isFinite(endpoint.status) ? { status: endpoint.status } : {}),
+			})),
 		}
 	}
 
@@ -380,6 +413,58 @@ export class OpenRouterClient implements LlmClient {
 	 */
 	async fetchModelContextWindow(model: string, signal?: AbortSignal): Promise<number | undefined> {
 		return (await this.fetchModelInfo(model, signal))?.contextWindow
+	}
+
+	/** Retrieve OpenRouter's post-generation billing record without reading stored prompt/completion content. */
+	async fetchGenerationMetadata(generationId: string, signal?: AbortSignal): Promise<OpenRouterGenerationMetadata | undefined> {
+		if (!this.apiKey || !/^gen-[0-9A-Za-z-]{1,124}$/.test(generationId)) return undefined
+		let response: Response | undefined
+		// Allow the generation record time to become visible. Delays are before
+		// each retry, and the caller's total-run deadline bounds the sequence.
+		for (const delayBeforeAttemptMs of [0, 1_000, 2_000, 4_000, 8_000]) {
+			if (signal?.aborted) return undefined
+			if (delayBeforeAttemptMs > 0) {
+				try { await abortableDelay(delayBeforeAttemptMs, signal) } catch { return undefined }
+			}
+			const requestSignal = signal
+				? AbortSignal.any([signal, AbortSignal.timeout(15_000)])
+				: AbortSignal.timeout(15_000)
+			try {
+				const res = await fetch(`${this.baseUrl}/api/v1/generation?id=${encodeURIComponent(generationId)}`, {
+					method: "GET",
+					headers: this.authHeaders(),
+					signal: requestSignal,
+				})
+				if (res.ok) { response = res; break }
+				if (!(res.status === 404 || res.status === 429 || res.status >= 500)) return undefined
+			} catch {
+				if (signal?.aborted) return undefined
+			}
+		}
+		if (!response) return undefined
+		let raw: string | undefined
+		try { raw = await readBoundedResponseText(response, 64 * 1024) } catch { return undefined }
+		if (raw === undefined) return undefined
+		let envelope: { data?: Record<string, unknown> }
+		try { envelope = JSON.parse(raw) as typeof envelope } catch { return undefined }
+		const data = envelope?.data
+		if (!data || data.id !== generationId) return undefined
+		const number = (value: unknown): number | undefined => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined
+		const decimal = (value: unknown): number | undefined => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined
+		const signedNumber = (value: unknown): number | undefined => typeof value === "number" && Number.isFinite(value) ? value : undefined
+		return {
+			id: generationId,
+			...(typeof data.model === "string" ? { model: data.model } : {}),
+			...(typeof data.provider_name === "string" ? { providerName: data.provider_name } : {}),
+			...(decimal(data.total_cost) !== undefined ? { totalCostUsd: decimal(data.total_cost) } : {}),
+			...(decimal(data.upstream_inference_cost) !== undefined ? { upstreamInferenceCostUsd: decimal(data.upstream_inference_cost) } : {}),
+			...(signedNumber(data.cache_discount) !== undefined ? { cacheDiscountUsd: signedNumber(data.cache_discount) } : {}),
+			...(number(data.tokens_prompt) !== undefined ? { tokensPrompt: number(data.tokens_prompt) } : {}),
+			...(number(data.tokens_completion) !== undefined ? { tokensCompletion: number(data.tokens_completion) } : {}),
+			...(number(data.native_tokens_reasoning) !== undefined ? { nativeTokensReasoning: number(data.native_tokens_reasoning) } : {}),
+			...(number(data.native_tokens_cached) !== undefined ? { nativeTokensCached: number(data.native_tokens_cached) } : {}),
+			...(decimal(data.latency) !== undefined ? { latencyMs: decimal(data.latency) } : {}),
+		}
 	}
 
 	async createChatCompletion(request: LlmRequest): Promise<LlmResponse> {
@@ -395,26 +480,45 @@ export class OpenRouterClient implements LlmClient {
 
 		const headers = this.authHeaders()
 
-		const body = buildRequestBody(request, model)
+		const builtBody = buildRequestBody(request, model)
+		const packed = this.maxPromptBytes === undefined
+			? (() => {
+				const json = JSON.stringify(builtBody)
+				return { body: builtBody, json, bytes: Buffer.byteLength(json, "utf8"), evictedGroups: 0, truncatedToolResults: 0 }
+			})()
+			: packRequestBody(builtBody, this.maxPromptBytes)
+		const body = packed.body
 
 		// Opt-in SSE streaming (streaming-and-reasoning). When `request.stream`
 		// is true the response is parsed incrementally from the `data:` lines and
 		// the final message is assembled from the deltas; otherwise the legacy
 		// single blocking fetch path below runs unchanged (the default).
 		if (request.stream) {
-			return this.streamChatCompletion(request, url, headers, body)
+			try {
+				return await this.streamChatCompletion(request, url, headers, body, packed.json, model, startedAt)
+			} catch (err) {
+				if (!this.disableTranscriptCapture && isTranscriptCaptureEnabled()) {
+					captureTranscript(
+						{ provider: "openrouter", model },
+						{ messages: body.messages as ChatMessage[], originalMessages: request.messages, tools: request.tools, temperature: request.temperature, wireRequest: body, error: err instanceof Error ? err.message : String(err), durationMs: Date.now() - startedAt },
+					)
+				}
+				throw err
+			}
 		}
 
 		try {
-			return await this.createChatCompletionNonStreaming(request, url, headers, body, model, startedAt)
+			return await this.createChatCompletionNonStreaming(request, url, headers, body, packed.json, model, startedAt)
 		} catch (err) {
-			if (isTranscriptCaptureEnabled()) {
+			if (!this.disableTranscriptCapture && isTranscriptCaptureEnabled()) {
 				captureTranscript(
 					{ provider: "openrouter", model },
 					{
-						messages: request.messages,
+						messages: body.messages as ChatMessage[],
+						originalMessages: request.messages,
 						tools: request.tools,
 						temperature: request.temperature,
+						wireRequest: body,
 						error: err instanceof Error ? err.message : String(err),
 						durationMs: Date.now() - startedAt,
 					},
@@ -429,6 +533,7 @@ export class OpenRouterClient implements LlmClient {
 		url: string,
 		headers: Record<string, string>,
 		body: Record<string, unknown>,
+		wireJson: string,
 		model: string,
 		startedAt: number,
 	): Promise<LlmResponse> {
@@ -437,7 +542,7 @@ export class OpenRouterClient implements LlmClient {
 			response = await fetch(url, {
 				method: "POST",
 				headers,
-				body: JSON.stringify(body),
+				body: wireJson,
 				signal: request.signal,
 			})
 		} catch (err) {
@@ -469,8 +574,13 @@ export class OpenRouterClient implements LlmClient {
 		const rawBody = await response.text()
 		let data:
 			| {
+					id?: string
+					model?: string
+					provider?: string
+					provider_name?: string
 					choices?: Array<{ message?: ChatMessage; finish_reason?: string }>
 					usage?: RawUsage
+					cache_discount?: number
 					error?: { message?: string; code?: unknown }
 			  }
 			| undefined
@@ -500,12 +610,15 @@ export class OpenRouterClient implements LlmClient {
 
 		const result: LlmResponse = {
 			message,
-			usage: mapUsage(data.usage),
+			usage: mapUsage(data.usage, data.cache_discount),
+			generationId: response.headers.get("X-Generation-Id") ?? (typeof data.id === "string" ? data.id : undefined),
+			returnedModel: typeof data.model === "string" ? data.model : undefined,
+			providerName: typeof data.provider_name === "string" ? data.provider_name : typeof data.provider === "string" ? data.provider : undefined,
 		}
-		if (isTranscriptCaptureEnabled()) {
+		if (!this.disableTranscriptCapture && isTranscriptCaptureEnabled()) {
 			captureTranscript(
 				{ provider: "openrouter", model },
-				{ messages: request.messages, tools: request.tools, temperature: request.temperature, response: result, durationMs: Date.now() - startedAt },
+				{ messages: body.messages as ChatMessage[], originalMessages: request.messages, tools: request.tools, temperature: request.temperature, wireRequest: body, response: result, durationMs: Date.now() - startedAt },
 			)
 		}
 		return result
@@ -537,17 +650,16 @@ export class OpenRouterClient implements LlmClient {
 		url: string,
 		headers: Record<string, string>,
 		body: Record<string, unknown>,
+		wireJson: string,
+		model: string,
+		startedAt: number,
 	): Promise<LlmResponse> {
-		const streamBody: Record<string, unknown> = {
-			...body,
-		}
-
 		let response: Response
 		try {
 			response = await fetch(url, {
 				method: "POST",
 				headers,
-				body: JSON.stringify(streamBody),
+				body: wireJson,
 				signal: request.signal,
 			})
 		} catch (err) {
@@ -587,6 +699,10 @@ export class OpenRouterClient implements LlmClient {
 		let sawFinish = false
 		let sawUsage = false
 		let lastUsage: RawUsage | undefined
+		let lastCacheDiscount: number | undefined
+		let generationId: string | undefined = response.headers.get("X-Generation-Id") ?? undefined
+		let returnedModel: string | undefined
+		let providerName: string | undefined
 
 		const fail = (message: string): never => {
 			throw new OpenRouterError(message)
@@ -644,8 +760,13 @@ export class OpenRouterClient implements LlmClient {
 				}
 				let data:
 					| {
+							id?: string
+							model?: string
+							provider?: string
+							provider_name?: string
 							choices?: Array<{ delta?: { content?: string; reasoning?: string; tool_calls?: StreamToolCallDelta[] }; finish_reason?: string }>
 							usage?: RawUsage
+							cache_discount?: number
 							error?: { message?: string }
 					  }
 					| undefined
@@ -692,6 +813,11 @@ export class OpenRouterClient implements LlmClient {
 					sawUsage = true
 					lastUsage = data.usage
 				}
+				if (typeof data?.id === "string") generationId = data.id
+				if (typeof data?.model === "string") returnedModel = data.model
+				if (typeof data?.provider_name === "string") providerName = data.provider_name
+				else if (typeof data?.provider === "string") providerName = data.provider
+				if (typeof data?.cache_discount === "number" && Number.isFinite(data.cache_discount)) lastCacheDiscount = data.cache_discount
 			}
 		}
 
@@ -718,10 +844,20 @@ export class OpenRouterClient implements LlmClient {
 			fail("OpenRouter stream ended with no content, reasoning, tool calls or usage")
 		}
 
-		return {
+		const result: LlmResponse = {
 			message,
-			usage: mapUsage(lastUsage),
+			usage: mapUsage(lastUsage, lastCacheDiscount),
+			generationId,
+			returnedModel,
+			providerName,
 		}
+		if (!this.disableTranscriptCapture && isTranscriptCaptureEnabled()) {
+			captureTranscript(
+				{ provider: "openrouter", model },
+				{ messages: body.messages as ChatMessage[], originalMessages: request.messages, tools: request.tools, temperature: request.temperature, wireRequest: body, response: result, durationMs: Date.now() - startedAt },
+			)
+		}
+		return result
 	}
 }
 
@@ -778,6 +914,23 @@ export function buildRequestBody(request: LlmRequest, model: string): Record<str
 		model,
 		messages: request.messages,
 	}
+	if (request.cacheRoutingKey !== undefined) {
+		if (!/^hc-[0-9a-f-]{36}$/i.test(request.cacheRoutingKey)) {
+			throw new Error("cacheRoutingKey must be an opaque headlesscode UUID key")
+		}
+		body.session_id = request.cacheRoutingKey
+		// OpenRouter currently treats prompt_cache_key as a sticky-routing key
+		// when session_id is absent; Meta also documents it for routing requests
+		// with a shared prefix to the same backend. The value is deliberately
+		// opaque and random per run, never a prompt, user ID, or credential.
+		body.prompt_cache_key = request.cacheRoutingKey
+	}
+	if (request.providerOnly !== undefined) {
+		if (request.providerOnly !== "meta" || model !== "meta/muse-spark-1.3-contributor") {
+			throw new Error("providerOnly is supported only for Meta-routed Muse Contributor qualification")
+		}
+		body.provider = { only: ["meta"], allow_fallbacks: false }
+	}
 	if (request.tools && request.tools.length > 0) {
 		body.tools = request.tools satisfies ChatTool[]
 	}
@@ -798,7 +951,7 @@ export function buildRequestBody(request: LlmRequest, model: string): Record<str
 		body.stream = true
 		body.stream_options = { include_usage: true }
 	}
-	// Pin routing to DeepSeek's own official endpoint for deepseek/* models,
+	// Pin routing to DeepSeek's own official endpoint for most deepseek/* models,
 	// not whichever third-party host (DeepInfra, Baidu, Mancer, ...) OpenRouter's
 	// automatic price-based routing might otherwise pick behind the same model
 	// id. This matters beyond preference: those endpoints have meaningfully
@@ -810,7 +963,13 @@ export function buildRequestBody(request: LlmRequest, model: string): Record<str
 	// endpoint is down, rather than silently routing elsewhere at a different
 	// (unpriced-by-us) rate.
 	if (model.startsWith("deepseek/")) {
-		body.provider = { order: ["deepseek"], allow_fallbacks: false }
+		// The RSI proof protocol uses a separately price- and capability-pinned
+		// DeepInfra endpoint for the dated V4 Flash model. Keep this exact route
+		// aligned with the broker's provider.only policy; other DeepSeek models
+		// retain the established official-provider route below.
+		body.provider = model === "deepseek/deepseek-v4-flash-0731"
+			? { only: ["deepinfra"], allow_fallbacks: false }
+			: { order: ["deepseek"], allow_fallbacks: false }
 		// Reasoning content (streaming-and-reasoning): request it explicitly for
 		// the only model family this harness pins. Verified live 2026-08-01 on
 		// deepseek/deepseek-v4-flash: `include_reasoning: true` is in every
@@ -823,16 +982,20 @@ export function buildRequestBody(request: LlmRequest, model: string): Record<str
 		// 404s seen were account/data-policy endpoint availability, not the
 		// param). Kept to the deepseek/ prefix rather than unconditional to match
 		// the existing pin boundary.
-		body.include_reasoning = true
-		// Graded reasoning effort (issue #30): DeepSeek's native low/medium/
-		// high/max is normalized by OpenRouter to `reasoning: { effort: "high" |
-		// "xhigh" }` ("xhigh" = max). Unset = send nothing = the endpoint's
-		// undeclared default, exactly as before. Same deepseek/ boundary as
-		// include_reasoning.
-		if (request.reasoningEffort !== undefined) {
-			const effort = parseReasoningEffort(request.reasoningEffort)
-			if (effort !== undefined) {
-				body.reasoning = { effort }
+		// The pinned DeepInfra endpoint does not advertise these reasoning
+		// parameters. Do not send undocumented options to the RSI proof model.
+		if (model !== "deepseek/deepseek-v4-flash-0731") {
+			body.include_reasoning = true
+			// Graded reasoning effort (issue #30): DeepSeek's native low/medium/
+			// high/max is normalized by OpenRouter to `reasoning: { effort: "high" |
+			// "xhigh" } ("xhigh" = max). Unset = send nothing = the endpoint's
+			// undeclared default, exactly as before. Same deepseek/ boundary as
+			// include_reasoning.
+			if (request.reasoningEffort !== undefined) {
+				const effort = parseReasoningEffort(request.reasoningEffort)
+				if (effort !== undefined) {
+					body.reasoning = { effort }
+				}
 			}
 		}
 	}
@@ -846,19 +1009,84 @@ interface RawUsage {
 	/** OpenRouter's pass-through of the underlying provider's cache accounting. */
 	prompt_tokens_details?: {
 		cached_tokens?: number
+		cache_write_tokens?: number
 	}
+	completion_tokens_details?: { reasoning_tokens?: number }
+	cost?: number
+	cache_discount?: number
 }
 
-function mapUsage(raw: RawUsage | undefined): LlmResponse["usage"] {
+function mapUsage(raw: RawUsage | undefined, envelopeCacheDiscount?: number): LlmResponse["usage"] {
 	if (!raw) {
 		return undefined
 	}
+	const promptTokens = safeTokenCount(raw.prompt_tokens)
+	const cachedReported = safeTokenCount(raw.prompt_tokens_details?.cached_tokens)
+	const cachedTokens = promptTokens !== undefined && cachedReported !== undefined && cachedReported <= promptTokens
+		? cachedReported
+		: undefined
 	return {
-		promptTokens: raw.prompt_tokens,
-		completionTokens: raw.completion_tokens,
-		totalTokens: raw.total_tokens,
-		cachedTokens: raw.prompt_tokens_details?.cached_tokens,
+		promptTokens,
+		completionTokens: safeTokenCount(raw.completion_tokens),
+		totalTokens: safeTokenCount(raw.total_tokens),
+		cachedTokens,
+		cacheWriteTokens: safeTokenCount(raw.prompt_tokens_details?.cache_write_tokens),
+		reasoningTokens: safeTokenCount(raw.completion_tokens_details?.reasoning_tokens),
+		openRouterReportedCostUsd: finiteNonNegative(raw.cost),
+		cacheDiscountUsd: finiteSigned(raw.cache_discount) ?? finiteSigned(envelopeCacheDiscount),
 	}
+}
+
+/** Provider token counts are untrusted telemetry; accept only bounded integers. */
+function safeTokenCount(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined
+}
+
+function finiteNonNegative(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined
+}
+
+function finiteSigned(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+async function readBoundedResponseText(response: Response, limit: number): Promise<string | undefined> {
+	if (!response.body) return undefined
+	const reader = response.body.getReader()
+	const chunks: Uint8Array[] = []
+	let total = 0
+	try {
+		while (true) {
+			const { done, value } = await reader.read()
+			if (done) break
+			if (!value) continue
+			total += value.byteLength
+			if (total > limit) { await reader.cancel(); return undefined }
+			chunks.push(value)
+		}
+	} finally {
+		reader.releaseLock()
+	}
+	const joined = new Uint8Array(total)
+	let offset = 0
+	for (const chunk of chunks) { joined.set(chunk, offset); offset += chunk.byteLength }
+	return new TextDecoder().decode(joined)
+}
+
+function abortableDelay(milliseconds: number, signal?: AbortSignal): Promise<void> {
+	if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("aborted"))
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort)
+			resolve()
+		}, milliseconds)
+		const onAbort = () => {
+			clearTimeout(timer)
+			signal?.removeEventListener("abort", onAbort)
+			reject(signal?.reason ?? new Error("aborted"))
+		}
+		signal?.addEventListener("abort", onAbort, { once: true })
+	})
 }
 
 /** Truncate a raw body to a bounded excerpt for error messages. */

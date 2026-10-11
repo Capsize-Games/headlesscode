@@ -59,12 +59,13 @@ export async function captureCandidateTrajectory(
 	const messages = calls.flatMap((call) => call.messages ?? [])
 	const toolCalls = calls.reduce((count, call) => count + (call.response?.message?.tool_calls?.length ?? 0), 0)
 	const outcome = trajectoryOutcome(candidate)
-	const trusted = outcome === "success" && candidate.fitness?.hardGates.noProtectedPathViolation === true
+	const trusted = outcome === "success" && candidate.fitness !== undefined && Object.values(candidate.fitness.hardGates).every(Boolean)
 	const record: TrajectoryRecord = {
 		id: `trajectory-${candidate.id}`,
 		task: candidate.mutation,
 		environment: { repoRoot: config.repoRoot, baseCommit: candidate.baseCommit, generation: candidate.generation },
-		model: { id: candidate.model, candidateId: candidate.modelCandidateId },
+		model: { id: candidate.model, provider: candidate.modelProvider, candidateId: candidate.modelCandidateId, returnedModels: candidate.inferenceUsage?.returnedModels },
+		...(candidate.inferenceUsage ? { inferenceUsage: candidate.inferenceUsage } : {}),
 		harnessVersion: candidate.parentCommit ?? candidate.baseCommit,
 		promptConfig: {
 			mutationKind: candidate.mutationKind,

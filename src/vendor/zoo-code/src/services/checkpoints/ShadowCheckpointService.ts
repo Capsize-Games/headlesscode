@@ -4,7 +4,7 @@ import * as path from "path"
 import crypto from "crypto"
 import EventEmitter from "events"
 
-import simpleGit, { SimpleGit, SimpleGitOptions } from "simple-git"
+import { simpleGit, type SimpleGit, type SimpleGitOptions } from "simple-git"
 import pWaitFor from "p-wait-for"
 import * as vscode from "../../../shim/vscode"
 
@@ -52,6 +52,7 @@ export const BLOCKED_ENV_KEYS = new Set([
 	"GIT_CONFIG_COUNT",
 	"PREFIX",
 	"EDITOR",
+	"VISUAL",
 	"PAGER",
 	"SSH_ASKPASS",
 ])
@@ -73,6 +74,12 @@ function createSanitizedGit(baseDir: string): SimpleGit {
 	const removedKeys: string[] = []
 
 	for (const [key, value] of Object.entries(process.env)) {
+		if (key.toLowerCase() === "git_config_nosystem") {
+			if (key === "GIT_CONFIG_NOSYSTEM" && value === "1") sanitizedEnv[key] = value
+			else removedKeys.push(key)
+			continue
+		}
+
 		if (BLOCKED_ENV_KEYS_LOWER.has(key.toLowerCase())) {
 			removedKeys.push(key)
 			continue
@@ -93,6 +100,9 @@ function createSanitizedGit(baseDir: string): SimpleGit {
 	const options: Partial<SimpleGitOptions> = {
 		baseDir,
 		config: [],
+		// These are limited to TLS trust configuration and disabling system Git config.
+		// GIT_CONFIG_NOSYSTEM is passed only with its canonical value "1" above.
+		allowEnvironment: ["GIT_SSL_CAINFO", "GIT_CONFIG_NOSYSTEM"],
 		// --template="" stops git copying hooks/templates into the shadow repo (axis 1).
 		// GIT_TEMPLATE_DIR is stripped from the env above to block the env-var path (axis 2).
 		// allowUnsafeTemplateDir opts out of simple-git ≥3.36's blockUnsafeOperationsPlugin

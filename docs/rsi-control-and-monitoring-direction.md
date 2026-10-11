@@ -1,5 +1,15 @@
 # RSI control and monitoring direction
 
+> **Status update (2026-09-28):** The decision below records an engineering
+> judgment from 2026-09-22, based on the commit and static inspection identified
+> in its original scope. Since then, RSI gained a PostgreSQL-backed job queue,
+> S3-compatible artifact references, and OpenShell-only mutation and visible
+> evaluation workers. Local integration tests cover queue contention and
+> fencing, but no live multi-gateway run or candidate improvement has been
+> established. The historical recommendation to pause autonomous research is
+> still the applicable deployment decision; the implementation update does not
+> validate the monitor hypothesis or authorize unattended runs.
+
 ## 1. Decision
 
 **MONITOR FIRST — moderate confidence (0.70, engineering judgment).** Build one bounded, actions-only stall monitor experiment. Keep autonomous RSI expansion and broad SNN/worker-learning research paused. No parallel control-plane project; integration with RSI requires a later decision.

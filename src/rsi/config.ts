@@ -1,6 +1,7 @@
 import * as path from "node:path"
 import { DEFAULT_PROTECTED_FILES } from "../permissions/protected-files.js"
-import type { ComputePolicy, MutationHypothesis, MutationKind, ParentSelectionPolicy, RsiConfig } from "./types.js"
+import type { ComputePolicy, MutationHypothesis, MutationKind, ParentSelectionPolicy, RsiConfig, WorkerHarnessMode } from "./types.js"
+import { DEFAULT_DEVELOPMENT_PROOF_RULE } from "./development-proof.js"
 
 export const DEFAULT_RSI_MODEL = "wxrq-qwen3.5-9b:latest"
 export const DEFAULT_VISIBLE_EVALS = ["npm test -- --filter rsi"]
@@ -13,6 +14,10 @@ export const DEFAULT_PROTECTED_PATHS = [
 	"package-lock.json",
 	".gitignore",
 	"scripts/eval-suite/",
+	"fixtures/rsi-curriculum/",
+	"fixtures/rsi-benchmark/",
+	"docker/",
+	".dockerignore",
 	".headlesscode/",
 	".worktrees/",
 ]
@@ -47,15 +52,26 @@ Usage:
 Options:
   --model <id>                 worker model (default: ${DEFAULT_RSI_MODEL})
   --population <n>             candidates per generation (default: 2)
-  --generations <n>            bounded generations (default: 1)
+  --generations <n>            bounded generations (default: 1; adaptive policy uses this as follow-up stages)
   --parent-policy <name>      champion-specialist-novelty | pareto-front | all-eligible
   --mutation-kind <name>      corrective | architectural | search-policy | curriculum | model-adaptation
   --hypothesis <text>         recorded reason for the mutation
   --expected-effect <text>    measurable benefit to test
   --potential-downside <text> recorded cost or regression risk
   --compute-policy <name>     single | independent | planner-executors | critic-retry
+                              adaptive-independent enables bounded adaptive trajectories
+  --max-trajectories <n>       maximum independent trajectories (adaptive default: population + 1)
+  --max-total-iterations <n>   aggregate model-iteration budget (adaptive default: max-iterations * trajectories)
+  --max-runtime-ms <n>         wall-clock admission budget for adaptive follow-ups (default: 3600000)
+  --regression <command>      paired regression gate (default: npm test)
   --eval <command>             visible command; repeat or separate with ;; 
   --hidden-eval <command>      supervisor-only hidden command
+  --hidden-suite <path>        supervisor-only JSON suite of bounded exported-function cases
+  --hidden-suite-sha256 <hex>   operator-approved SHA-256 of canonical suite JSON
+  --hidden-public-key <path>    Ed25519 public key in PEM format
+  --hidden-private-key <path>   Ed25519 signing key in PEM format (mode 0600)
+  --hidden-nonce-store <path>   durable replay store, outside the repository/archive
+  --hidden-image-digest <value> trusted evaluator image pin: sha256:<64 hex digits>
   --mutation-task <text>       improvement objective
   --archive-dir <path>         durable archive directory
   --worktree-dir <path>        candidate worktree directory
@@ -63,9 +79,15 @@ Options:
   --curriculum-dir <path>      generated curriculum proposal directory
   --resume <run-id>            resume a checkpointed active run
   --model-candidate-id <id>    model identity used for combination tracking
+  --worker-harness-mode <mode> fixed-control | self-hosted (generation zero is always fixed-control)
+  --worker-harness-pair-id <id> shared identifier for matching fixed-control and self-hosted runs
+  --worker-harness-phase <phase> development | confirmation (default: development)
   --base-ref <ref>             git ref to branch from (default: HEAD)
   --dry-run                    print the planned loop without changing files
   --keep-worktrees              retain candidate worktrees after evaluation
+  --proof-min-net-wins <n>      required verified task wins over the immediate parent (default: 1)
+  --proof-retention-task <id>   development task that must not regress; repeat to set the frozen subset
+  --proof-max-mean-token-increase <ratio>  maximum child/parent mean tokens (default: 1.1)
   --help                       show this help
 
 The evaluator and scoring code are protected from candidates. The first run
@@ -89,7 +111,14 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 	}
 	let computePolicy: ComputePolicy = "single"
 	let evalCommands = [...DEFAULT_VISIBLE_EVALS]
+	let regressionCommand = "npm test"
 	let hiddenEvalCommands: string[] = []
+	let hiddenSuitePath: string | undefined
+	let hiddenSuiteSha256: string | undefined
+	let hiddenPublicKeyPath: string | undefined
+	let hiddenPrivateKeyPath: string | undefined
+	let hiddenNonceStorePath: string | undefined
+	let hiddenImageDigest: string | undefined
 	let archiveDir: string | undefined
 	let worktreeDir: string | undefined
 	let baseRef = "HEAD"
@@ -97,11 +126,23 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 	let dryRun = false
 	let keepWorktrees = false
 	let maxIterations = 40
+	let maxTokens: number | undefined
+	let maxTrajectories: number | undefined
+	let maxTotalIterations: number | undefined
+	let maxRuntimeMs: number | undefined
 	let commandTimeoutMs = 15 * 60_000
 	let trajectoryDir: string | undefined
 	let curriculumDir: string | undefined
 	let resumeRunId: string | undefined
 	let modelCandidateId: string | undefined
+	let workerHarnessMode: WorkerHarnessMode | undefined
+	let workerHarnessPhase: "development" | "confirmation" = "development"
+	let workerHarnessPairId: string | undefined
+	let workerHarnessEngineeringOnly = false
+	let proofMinimumNetWins = DEFAULT_DEVELOPMENT_PROOF_RULE.minimumNetWins
+	let proofRetentionTaskIds = [...DEFAULT_DEVELOPMENT_PROOF_RULE.retentionTaskIds]
+	let proofRetentionWasConfigured = false
+	let proofMaximumMeanTokenIncreaseRatio = DEFAULT_DEVELOPMENT_PROOF_RULE.maximumMeanTokenIncreaseRatio
 
 	const take = (index: number, name: string): [string, number] => {
 		const value = argv[index + 1]
@@ -177,7 +218,7 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 				}
 				case "--compute-policy": {
 					const [value, next] = take(index, arg)
-					if (!["single", "independent", "planner-executors", "critic-retry"].includes(value)) throw new Error(`${arg} has an invalid policy`)
+					if (!["single", "independent", "adaptive-independent", "planner-executors", "critic-retry"].includes(value)) throw new Error(`${arg} has an invalid policy`)
 					computePolicy = value as ComputePolicy
 					index = next
 					break
@@ -194,11 +235,36 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 					index = next
 					break
 				}
+				case "--regression": {
+					const [value, next] = take(index, arg)
+					if (!value.trim()) throw new Error("--regression must not be empty")
+					regressionCommand = value.trim()
+					index = next
+					break
+				}
 				case "--hidden-eval": {
 					const [value, next] = take(index, arg)
 					hiddenEvalCommands.push(...splitCommands(value))
 					index = next
 					break
+				}
+				case "--hidden-suite": {
+					const [value, next] = take(index, arg); hiddenSuitePath = path.resolve(value); index = next; break
+				}
+				case "--hidden-suite-sha256": {
+					const [value, next] = take(index, arg); hiddenSuiteSha256 = value; index = next; break
+				}
+				case "--hidden-public-key": {
+					const [value, next] = take(index, arg); hiddenPublicKeyPath = path.resolve(value); index = next; break
+				}
+				case "--hidden-private-key": {
+					const [value, next] = take(index, arg); hiddenPrivateKeyPath = path.resolve(value); index = next; break
+				}
+				case "--hidden-nonce-store": {
+					const [value, next] = take(index, arg); hiddenNonceStorePath = path.resolve(value); index = next; break
+				}
+				case "--hidden-image-digest": {
+					const [value, next] = take(index, arg); hiddenImageDigest = value; index = next; break
 				}
 				case "--mutation-task": {
 					const [value, next] = take(index, arg)
@@ -242,6 +308,52 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 					index = next
 					break
 				}
+				case "--worker-harness-mode": {
+					const [value, next] = take(index, arg)
+					if (value !== "fixed-control" && value !== "self-hosted") throw new Error(`${arg} must be fixed-control or self-hosted`)
+					workerHarnessMode = value
+					index = next
+					break
+				}
+				case "--worker-harness-pair-id": {
+					const [value, next] = take(index, arg)
+					if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value)) throw new Error(`${arg} must be a 1-64 character identifier`)
+					workerHarnessPairId = value
+					index = next
+					break
+				}
+				case "--worker-harness-phase": {
+					const [value, next] = take(index, arg)
+					if (value !== "development" && value !== "confirmation") throw new Error(`${arg} must be development or confirmation`)
+					workerHarnessPhase = value
+					index = next
+					break
+				}
+				case "--worker-harness-engineering-only":
+					workerHarnessEngineeringOnly = true
+					break
+				case "--proof-min-net-wins": {
+					const [value, next] = take(index, arg)
+					proofMinimumNetWins = positiveInteger(value, arg)
+					index = next
+					break
+				}
+				case "--proof-retention-task": {
+					const [value, next] = take(index, arg)
+					if (!/^[a-z0-9][a-z0-9-]{1,63}$/.test(value)) throw new Error(`${arg} has an invalid task ID`)
+					if (!proofRetentionWasConfigured) proofRetentionTaskIds = []
+					proofRetentionWasConfigured = true
+					proofRetentionTaskIds.push(value)
+					index = next
+					break
+				}
+				case "--proof-max-mean-token-increase": {
+					const [value, next] = take(index, arg)
+					proofMaximumMeanTokenIncreaseRatio = Number(value)
+					if (!Number.isFinite(proofMaximumMeanTokenIncreaseRatio) || proofMaximumMeanTokenIncreaseRatio < 1) throw new Error(`${arg} must be a finite ratio of at least 1`)
+					index = next
+					break
+				}
 				case "--base-ref": {
 					const [value, next] = take(index, arg)
 					baseRef = value
@@ -260,9 +372,33 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 					index = next
 					break
 				}
+				case "--max-tokens": {
+					const [value, next] = take(index, arg)
+					maxTokens = positiveInteger(value, arg)
+					index = next
+					break
+				}
 				case "--timeout-ms": {
 					const [value, next] = take(index, arg)
 					commandTimeoutMs = positiveInteger(value, arg)
+					index = next
+					break
+				}
+				case "--max-trajectories": {
+					const [value, next] = take(index, arg)
+					maxTrajectories = positiveInteger(value, arg)
+					index = next
+					break
+				}
+				case "--max-total-iterations": {
+					const [value, next] = take(index, arg)
+					maxTotalIterations = positiveInteger(value, arg)
+					index = next
+					break
+				}
+				case "--max-runtime-ms": {
+					const [value, next] = take(index, arg)
+					maxRuntimeMs = positiveInteger(value, arg)
 					index = next
 					break
 				}
@@ -276,7 +412,20 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 					throw new Error(`unknown improve argument: ${arg}`)
 			}
 		}
+		if (workerHarnessEngineeringOnly && (!workerHarnessMode || !workerHarnessPairId)) throw new Error("--worker-harness-engineering-only requires an explicit paired campaign ID and arm")
+		const hiddenOptions = [hiddenSuitePath, hiddenSuiteSha256, hiddenPublicKeyPath, hiddenPrivateKeyPath, hiddenNonceStorePath, hiddenImageDigest]
+		if (hiddenOptions.some((value) => value !== undefined) && hiddenOptions.some((value) => value === undefined)) throw new Error("hidden verification requires all six --hidden-suite, --hidden-suite-sha256, --hidden-public-key, --hidden-private-key, --hidden-nonce-store, and --hidden-image-digest options")
+		if (workerHarnessEngineeringOnly && workerHarnessPhase !== "development") throw new Error("engineering-only worker harness runs support only the development phase")
 		const resolvedRepo = path.resolve(repoRoot)
+		const adaptiveTrajectories = maxTrajectories ?? population + 1
+		const adaptiveIterations = maxTotalIterations ?? maxIterations * adaptiveTrajectories
+		const adaptiveRuntime = maxRuntimeMs ?? 60 * 60_000
+		if (computePolicy === "adaptive-independent" && population < 2) throw new Error("adaptive-independent requires --population of at least 2")
+		if (computePolicy === "adaptive-independent" && generations !== 1) throw new Error("adaptive-independent currently supports exactly one follow-up generation")
+		if (computePolicy === "adaptive-independent" && adaptiveTrajectories < population) throw new Error("adaptive-independent --max-trajectories must cover the initial --population")
+		if (computePolicy === "adaptive-independent" && adaptiveTrajectories > population + 1) throw new Error("adaptive-independent supports at most one follow-up trajectory beyond --population")
+		if (computePolicy === "adaptive-independent" && adaptiveIterations < maxIterations * population) throw new Error("adaptive-independent --max-total-iterations must cover the initial population at --max-iterations each")
+		if (computePolicy === "adaptive-independent" && adaptiveIterations > maxIterations * adaptiveTrajectories) throw new Error("adaptive-independent --max-total-iterations cannot exceed max-iterations times max-trajectories")
 		return {
 			config: {
 				repoRoot: resolvedRepo,
@@ -285,12 +434,14 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 				generations,
 				maxConcurrent,
 				mutationTask,
+				regressionCommand,
 				parentSelectionPolicy,
 				mutationKind,
 				hypothesis: { ...hypothesis },
 				computePolicy,
 				evalCommands,
 				hiddenEvalCommands,
+				...(hiddenSuitePath ? { hiddenSuitePath, hiddenSuiteSha256, hiddenPublicKeyPath, hiddenPrivateKeyPath, hiddenNonceStorePath, hiddenImageDigest } : {}),
 				archiveDir: archiveDir ?? path.join(resolvedRepo, ".headlesscode", "rsi"),
 				worktreeDir: worktreeDir ?? path.join(resolvedRepo, ".worktrees", "rsi"),
 				trajectoryDir: trajectoryDir ?? path.join(archiveDir ?? path.join(resolvedRepo, ".headlesscode", "rsi"), "trajectories"),
@@ -300,10 +451,23 @@ export function parseRsiArgs(argv: string[], cwd = process.cwd()): ParsedRsiArgs
 				dryRun,
 				keepWorktrees,
 				maxIterations,
+				...(maxTokens !== undefined ? { maxTokens } : {}),
+				maxTrajectories: adaptiveTrajectories,
+				maxTotalIterations: adaptiveIterations,
+				maxRuntimeMs: adaptiveRuntime,
 				protectedPaths: [...DEFAULT_PROTECTED_PATHS],
+				developmentProofRule: {
+					minimumNetWins: proofMinimumNetWins,
+					retentionTaskIds: proofRetentionTaskIds,
+					maximumMeanTokenIncreaseRatio: proofMaximumMeanTokenIncreaseRatio,
+				},
 				commandTimeoutMs,
 				resumeRunId,
 				modelCandidateId,
+				...(workerHarnessMode ? { workerHarnessMode } : {}),
+				...(workerHarnessMode ? { workerHarnessPhase } : {}),
+				...(workerHarnessPairId ? { workerHarnessPairId } : {}),
+				...(workerHarnessPairId && workerHarnessEngineeringOnly ? { workerHarnessEngineeringOnly: true } : {}),
 			},
 		}
 	} catch (error) {

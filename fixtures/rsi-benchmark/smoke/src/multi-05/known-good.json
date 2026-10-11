@@ -1,0 +1,6 @@
+{
+  "files": {
+    "src/solution.js": "import {merge} from \"./helper.js\";export function solve(x){return merge({server:{host:\"localhost\",port:80},retry:{count:2}},x)}\n",
+    "src/helper.js": "export function merge(a,b){let o={...a};for(let [k,v] of Object.entries(b))o[k]=v&&typeof v===\"object\"?merge(a[k]||{},v):v;return o}\n"
+  }
+}

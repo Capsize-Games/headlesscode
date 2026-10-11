@@ -28,7 +28,7 @@ npm test             # full suite (see "Test conventions" below)
 npm run typecheck    # npx tsc --noEmit
 ```
 
-`node >= 18` is required (see `engines` in `package.json`).
+`node >= 22.19` is required (see `engines` in `package.json`).
 
 **Optional: the `browser_action` tool's tests.** `src/tools/__tests__/browser-action.test.ts`
 launches a real headless Chromium via Playwright. `npm install` only installs

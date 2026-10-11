@@ -87,6 +87,14 @@ function envThinkEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
 	return v !== undefined && v !== "" && v !== "0" && v.toLowerCase() !== "false"
 }
 
+function isOpenShellHost(baseUrl: string): boolean {
+	try {
+		return new URL(baseUrl).hostname === "host.openshell.internal"
+	} catch {
+		return false
+	}
+}
+
 export class OllamaClient implements LlmClient {
 	private readonly baseUrl: string
 	private readonly defaultModel: string
@@ -108,26 +116,21 @@ export class OllamaClient implements LlmClient {
 	 * real prefill+generation call against a 9B local model at deep prompt
 	 * lengths can legitimately take longer than undici's default assumes.
 	 *
-	 * Overriding this requires a per-instance `Agent` with both timeouts
-	 * derived from `this.timeoutMs` (comfortable margin above it) — but
-	 * passing an `Agent` built from the standalone `undici` npm package as
-	 * Node's GLOBAL `fetch`'s `dispatcher` does not reliably work: verified
-	 * live, this threw `InvalidArgumentError: invalid onRequestStart
-	 * method` (code UND_ERR_INVALID_ARG) — Node's global fetch runs on its
-	 * OWN internal, bundled copy of undici (`node:internal/deps/undici`),
-	 * whose Dispatcher/Handler interface isn't guaranteed to match whatever
-	 * version the standalone package resolves to. The fix is to use
-	 * undici's own `fetch` (imported below as `undiciFetch`) together with
-	 * its own `Agent`, so both come from the SAME package/version and the
-	 * interface always matches — never Node's global `fetch` plus an
-	 * externally-built dispatcher.
+	 * For direct localhost and remote daemon endpoints, use the standalone
+	 * undici fetch and a matching Agent so these timeouts are configurable.
+	 * OpenShell's host relay must use Node's global fetch: a standalone undici
+	 * Agent bypasses OpenShell's transparent network path and the relay closes
+	 * the connection for larger chat requests. The OpenShell worker has an
+	 * outer command timeout, while global fetch retains its conservative
+	 * built-in header/body timeouts.
 	 */
-	private readonly dispatcher: Agent
+	private readonly dispatcher?: Agent
 
 	constructor(options: OllamaClientOptions = {}) {
 		this.baseUrl = (options.baseUrl ?? process.env[OLLAMA_URL_ENV] ?? DEFAULT_OLLAMA_URL).replace(/\/+$/, "")
 		this.defaultModel = options.defaultModel ?? ""
 		this.timeoutMs = options.timeoutMs ?? DEFAULT_OLLAMA_TIMEOUT_MS
+		const usesOpenShellHost = isOpenShellHost(this.baseUrl)
 		// Default to undici's OWN fetch, not Node's global one — see
 		// `dispatcher`'s doc comment for why: only undici's own fetch is
 		// guaranteed interface-compatible with an Agent built from the same
@@ -135,13 +138,16 @@ export class OllamaClient implements LlmClient {
 		// (structurally close enough for test fakes to satisfy); the cast
 		// here just reconciles undici's own Response/RequestInit types
 		// against the DOM-lib ones the public field declares.
-		const defaultFetchImpl: unknown = (url: unknown, init: unknown) =>
-			undiciFetch(url as Parameters<typeof undiciFetch>[0], init as Parameters<typeof undiciFetch>[1])
+		const defaultFetchImpl: unknown = usesOpenShellHost
+			? globalThis.fetch
+			: (url: unknown, init: unknown) => undiciFetch(url as Parameters<typeof undiciFetch>[0], init as Parameters<typeof undiciFetch>[1])
 		this.fetchImpl = options.fetchImpl ?? (defaultFetchImpl as typeof fetch)
 		this.think = options.think ?? envThinkEnabled()
 		this.nodeId = options.nodeId ?? randomUUID()
-		const undiciTimeoutMs = this.timeoutMs + 60_000
-		this.dispatcher = new Agent({ headersTimeout: undiciTimeoutMs, bodyTimeout: undiciTimeoutMs })
+		if (!usesOpenShellHost) {
+			const undiciTimeoutMs = this.timeoutMs + 60_000
+			this.dispatcher = new Agent({ headersTimeout: undiciTimeoutMs, bodyTimeout: undiciTimeoutMs })
+		}
 	}
 
 	resolveModel(requestModel?: string): string {
@@ -173,7 +179,7 @@ export class OllamaClient implements LlmClient {
 				// against the DOM-lib `RequestInit` type this call site is
 				// statically typed against. A fake fetchImpl injected in
 				// tests simply ignores this extra field.
-				dispatcher: this.dispatcher as unknown as RequestInit["dispatcher"],
+				...(this.dispatcher ? { dispatcher: this.dispatcher as unknown as RequestInit["dispatcher"] } : {}),
 				body: JSON.stringify({
 					model,
 					node_id: this.nodeId,

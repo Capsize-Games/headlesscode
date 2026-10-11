@@ -1,0 +1,5 @@
+{
+  "files": {
+    "src/solution.js": "export function solve(s){let o={};for(let [k,v] of new URLSearchParams(s))(o[k]??=[]).push(v);return Object.fromEntries(Object.entries(o).map(([k,v])=>[k,v.length===1?v[0]:v]))}\n"
+  }
+}

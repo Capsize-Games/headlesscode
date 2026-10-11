@@ -26,9 +26,14 @@
 
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TMPDIR="${TMPDIR:-"$ROOT/.headlesscode/scratch"}"
+mkdir -p "$TMPDIR"
+export TMPDIR
+
 log() { printf '%s\n' "$*" >&2; }
 
-FIXTURE="$(mktemp -d /tmp/headlesscode-e2e-fixture-XXXXXX)"
+FIXTURE="$(mktemp -d "$TMPDIR/headlesscode-e2e-fixture-XXXXXX")"
 log "fixture repo: $FIXTURE"
 
 # `git init -b main` needs git >= 2.28; fall back to the default branch name

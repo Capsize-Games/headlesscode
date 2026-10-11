@@ -2,12 +2,27 @@
 
 [![CI](https://github.com/Capsize-Games/headlesscode/actions/workflows/ci.yml/badge.svg)](https://github.com/Capsize-Games/headlesscode/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/headlesscode?logo=npm)](https://www.npmjs.com/package/headlesscode)
-[![Node.js >=18](https://img.shields.io/badge/node-%3E%3D18-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](./LICENSE)
+[![Node.js >=22.19](https://img.shields.io/badge/node-%3E%3D22.19-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[License: Apache-2.0](./LICENSE)
 
 `headlesscode` runs the Zoo Code agent loop from a Node.js process, without a
 VS Code window. Run one task directly, launch parallel workers in Git
 worktrees, or use the NVIDIA OpenShell provider for sandboxed sessions.
+
+## Security controls
+
+HeadlessCode's controls map to the seven principles in Satya Nadella's
+[Models as Insider Risks in the Super Intelligence Era](https://snscratchpad.com/posts/models-as-insider-risks/).
+
+| Principle | HeadlessCode implementation |
+| --- | --- |
+| **Model diversity** | Operators assign models by mode and RSI role, including review and adversarial roles. Programmatic gates determine candidate eligibility. See [model assignment](./src/config/mode-models.ts) and [RSI roles](./src/rsi/roles.ts). |
+| **Observe everything** | Evidence-required sessions wait for an external collector's authenticated acknowledgement before model calls and tool actions. The collector signs a hash-linked journal and session head; an offline verifier produces a readable history and distinguishes worker reports from supervisor observations. See [evidence journal](./docs/evidence-journal.md). |
+| **Verifiability** | CI runs typechecking, the full automated suite, and mock workflows. Tests exercise missing evidence acknowledgements, tampering, replay, stop races, and cleanup failures. RSI applies regression and frozen proof gates; configured hidden verification checks bounded function cases against supervisor-held answers. See [CI](./.github/workflows/ci.yml) and [hidden verification](./docs/security-verification.md). |
+| **Independent controls** | Operators configure command and file permissions, resource and inference budgets, and a contained profile that pins the OpenShell policy, image, gateway, evidence key, and emergency controller. Launch preflight checks those identities and the sandbox's effective policy. See [permissions](./src/permissions/config.ts) and [security profiles](./docs/security-profiles.md). |
+| **Independent auditability** | The external collector owns evidence signing keys and storage. The hidden verifier keeps expected answers and signing keys in the supervisor, binds reports to the candidate source, session, job, limits, and one-time nonce, and compares outputs outside the candidate guest. See [evidence boundaries](./docs/evidence-journal.md#trust-and-deployment-boundary) and [hidden verification](./docs/security-verification.md). |
+| **Containment** | OpenShell runs sessions in disposable independent clones. The host emergency controller can pause or stop active work, abort model calls, terminate scoped command groups, and delete sandboxes. Result import requires confirmed sandbox deletion. See [emergency controls](./docs/emergency-control.md) and [OpenShell lifecycle](./src/cloud/openshell-provider.ts). |
+| **Incident disclosure** | GitHub private vulnerability reporting provides confidential intake. The incident procedure covers containment, evidence preservation, fixes, affected-user notification, coordinated advisories, and review of failed controls and runtime configuration changes. See [incident response](./docs/incident-response.md), [report a vulnerability](https://github.com/Capsize-Games/headlesscode/security/advisories/new), and [advisories](https://github.com/Capsize-Games/headlesscode/security/advisories). |
 
 | Use it for | What it does |
 | --- | --- |
@@ -38,7 +53,7 @@ monitoring.
 
 ## Quick start
 
-Requires Node.js 18 or newer. Install globally or run with `npx`:
+Requires Node.js 22.19 or newer. Install globally or run with `npx`:
 
 ```bash
 npm install -g headlesscode
@@ -108,6 +123,25 @@ node bin/headlesscode.mjs --task "Fix the bug in src/index.ts" --workspace /path
 To install a `headlesscode` wrapper on your `PATH`, run `scripts/install-cli.sh`.
 It writes to `~/.local/bin` by default (override with `HEADLESSCODE_BIN_DIR`)
 and runs this checkout's local `tsx`. Re-run it if you move the checkout.
+
+### Terminal chat, skills, and saved sessions
+
+`headlesscode chat` starts an interactive conversation. Each turn uses the
+existing runner and saves its messages for resume or fork. `/help` lists the
+session, model, mode, skill, and import controls.
+
+```bash
+headlesscode chat --workspace /path/to/repo
+headlesscode skills import /path/to/my-skill
+headlesscode sessions import --from codex --file /path/to/rollout.jsonl --workspace /path/to/repo
+headlesscode chat --resume <session-id> --workspace /path/to/repo
+```
+
+Skills use `SKILL.md` instructions and captured text references. Session
+imports support Claude Code, Codex, and Muse history, with provenance and
+warnings. Imported tool calls stay historical context. See [terminal chat](./docs/terminal-chat.md),
+[skills](./docs/skills.md), and [sessions](./docs/sessions.md) for formats,
+discovery, and security behavior.
 
 ### Check project instructions without calling a model
 
@@ -243,29 +277,59 @@ and each subcommand's `--help` for complete usage.
 
 ## Recursive self-improvement
 
-`headlesscode improve` runs a bounded experiment against an external evaluator.
-The supervisor creates candidate worktrees, asks the local Ollama worker to
-make focused changes, runs regression and visible/hidden evaluations, and
-keeps selection state outside candidate worktrees. Each generation produces a
-report for human review.
+`headlesscode improve --dry-run` resolves the base commit and prints planned
+candidate worktrees. A real run requires PostgreSQL, a shared S3-compatible
+artifact store, and at least one registered `headlesscode rsi-worker`. The
+coordinator queues sanitized mutation snapshots and visible evaluation jobs;
+workers run each in a fresh OpenShell guest. Fitness, paired baseline
+comparison, archives, and selection stay in the coordinator. Hidden evaluation
+remains disabled. A 2026-09-29 bounded run used two workers on the same local
+OpenShell gateway; both candidate evaluation jobs were leased concurrently.
+The run used a temporary `clamp.js` fixture and does not establish general
+headlesscode improvement or multi-gateway operation. An earlier bounded run
+passed visible checks but made no source change and was rejected.
 
 ```bash
 npx tsx src/cli.ts improve --repo . --dry-run
 npx tsx src/cli.ts improve --repo . --population 2 --generations 1
 ```
 
-This loop does not yet train adapters, schedule multiple trajectories, or
-provide OS-level candidate isolation. Follow-up work is tracked as:
+Before starting workers, build the standard and RSI guest images on each
+OpenShell gateway host that will run RSI jobs. Build the larger training image
+only on gateways whose workers will accept model-training or paired
+model-evaluation jobs:
+
+```bash
+docker build -f docker/OpenShell.Dockerfile -t headlesscode-openshell:local .
+docker build -f docker/OpenShell-RSI.Dockerfile -t headlesscode-openshell-rsi:local .
+docker build -f docker/OpenShell-RSI-Training.Dockerfile -t headlesscode-openshell-rsi-training:local .
+```
+
+The RSI Dockerfile extends `headlesscode-openshell:local` and removes the RSI
+source, test files, and hidden evaluation suite from the guest image. See the [RSI design](./docs/recursive-self-improvement.md)
+for worker and queue configuration.
+
+The queue stores job state, worker registrations, leases, retries, and admission
+policy in PostgreSQL; artifact bytes remain in object storage. Local integration
+tests used 12 simulated workers and 100 queued jobs, including a 20 MiB artifact. Each
+worker process currently runs one guest at a time and must be configured with a
+unique worker ID and OpenShell gateway ID. The two-worker run observed 4.008
+seconds of concurrent evaluation leases on one gateway. A local PostgreSQL/
+RustFS test drained the remaining 96 jobs with 12 simulated workers in 446 ms
+(215.2 jobs/s), after the initial four jobs were claimed and completed to
+verify admission limits;
+claims still serialize on a queue-policy row, and neither result qualifies a
+multi-host deployment. Remaining work is:
 
 | Issue | Work |
 | --- | --- |
-| [#3](https://github.com/Capsize-Games/headlesscode/issues/3) | OS-level candidate sandbox |
-| [#4](https://github.com/Capsize-Games/headlesscode/issues/4) | Cryptographically verifiable evaluator and artifacts |
-| [#5](https://github.com/Capsize-Games/headlesscode/issues/5) | Resource-aware resumable scheduler |
-| [#6](https://github.com/Capsize-Games/headlesscode/issues/6) | Adaptive multi-trajectory search |
-| [#7](https://github.com/Capsize-Games/headlesscode/issues/7) | Validated curriculum fixtures |
-| [#8](https://github.com/Capsize-Games/headlesscode/issues/8) | Adversarial evaluation and cross-model supervision |
-| [#9](https://github.com/Capsize-Games/headlesscode/issues/9) | Real LoRA or QLoRA backend |
+| [#3](https://github.com/Capsize-Games/headlesscode/issues/3) | OpenShell candidate isolation is implemented; live multi-gateway qualification remains. |
+| [#4](https://github.com/Capsize-Games/headlesscode/issues/4) | Content-addressed artifacts are implemented; signed evaluator provenance and hidden evaluation remain. |
+| [#5](https://github.com/Capsize-Games/headlesscode/issues/5) | PostgreSQL queue, leases, retries, admission, and configured workers are implemented; live fleet qualification remains. |
+| [#6](https://github.com/Capsize-Games/headlesscode/issues/6) | Bounded adaptive independent search supports an initial population plus one evidence-driven follow-up; repeated stages remain out of scope. |
+| [#7](https://github.com/Capsize-Games/headlesscode/issues/7) | Fixture-backed curriculum replay and explicit promotion are implemented; wording-to-capability measurement remains unproven. |
+| [#8](https://github.com/Capsize-Games/headlesscode/issues/8) | Adversarial review and bounded OpenShell break tests are implemented; live provider-backed review is unvalidated. |
+| [#9](https://github.com/Capsize-Games/headlesscode/issues/9) | An OpenShell QLoRA prototype is covered by mocked job tests; the supplied GGUF is rejected before enqueue, and no live training is validated. |
 
 See the [RSI design](./docs/recursive-self-improvement.md) and
 [run progress](./docs/rsi-progress.md).
@@ -361,5 +425,9 @@ This project contains Apache-2.0-licensed code derived from
 [Zoo Code](https://github.com/Zoo-Code-Org/Zoo-Code)
 (`Zoo-Code-Org/Zoo-Code`, commit `ca9b60f`), itself a Roo Code fork. Prompt
 text, tool schemas, and mode/rules loading logic are reused under the terms of
-the Apache License 2.0. See [`LICENSE`](./LICENSE) and
+the Apache License 2.0. See [`licenses/Apache-2.0.txt`](./licenses/Apache-2.0.txt) and
 [`ATTRIBUTION.md`](./ATTRIBUTION.md).
+
+## License
+
+HeadlessCode is licensed under Apache-2.0. See [LICENSE](LICENSE) and the Zoo Code attribution in [ATTRIBUTION.md](ATTRIBUTION.md). Previous public npm versions retain their published Apache-2.0 terms.

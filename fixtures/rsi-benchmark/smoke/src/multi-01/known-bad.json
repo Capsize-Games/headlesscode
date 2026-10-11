@@ -1,0 +1,6 @@
+{
+  "files": {
+    "src/solution.js": "import {clean} from \"./helper.js\";export function solve(x){return `${x.name} <${x.email}>`}\n",
+    "src/helper.js": "export function clean(s){return s.trim()}\n"
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "files": {
+    "src/solution.js": "export function solve(p,e){return {items:p.flatMap(x=>x.items??[]),retryCursor:e?.cursor??null,complete:!e}}\n"
+  }
+}

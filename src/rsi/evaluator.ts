@@ -1,36 +1,31 @@
-import { exec as execCallback } from "node:child_process"
-import { promisify } from "node:util"
 import type { CommandRunner, EvaluationSummary, RsiConfig, TrialResult } from "./types.js"
 import { changedFiles, candidateCommits, gitOutput } from "./workspace.js"
 import { protectedPathViolations } from "./sandbox.js"
+import { createOpenShellCommandRunner } from "./openshell.js"
+import { createHash } from "node:crypto"
+import { execFileSync } from "node:child_process"
+import { verifyHiddenFunctions } from "./hidden-verifier.js"
+import type { HiddenFunctionSuite, HiddenNonceStore, IsolatedHiddenCaseRunner } from "./hidden-verifier.js"
 
-const exec = promisify(execCallback)
-
-export const runCommand: CommandRunner = async (command, cwd, timeoutMs, env) => {
-	const started = Date.now()
-	try {
-		const result = await exec(command, { cwd, env, timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 })
-		return { ok: true, command, exitCode: 0, durationMs: Date.now() - started, stdout: result.stdout, stderr: result.stderr }
-	} catch (error) {
-		const failure = error as { code?: number | string; killed?: boolean; stdout?: string; stderr?: string }
-		return {
-			ok: false,
-			command,
-			exitCode: typeof failure.code === "number" ? failure.code : null,
-			durationMs: Date.now() - started,
-			stdout: failure.stdout ?? "",
-			stderr: failure.stderr ?? String(error),
-			timedOut: failure.killed === true,
-		}
-	}
+export interface HiddenEvaluationOptions {
+	suite: HiddenFunctionSuite
+	runner: IsolatedHiddenCaseRunner
+	nonceStore: HiddenNonceStore
+	publicKey: string | Buffer
+	evaluatorImageDigest: string
+	sessionId: string
+	jobId: string
 }
 
 export async function evaluateCandidate(
 	config: RsiConfig,
 	candidateRoot: string,
 	baseCommit: string,
-	runner: CommandRunner = runCommand,
+	runner?: CommandRunner,
+	hiddenEvaluation?: HiddenEvaluationOptions,
 ): Promise<EvaluationSummary> {
+	if (config.hiddenEvalCommands.length > 0) throw new Error("RSI hidden evaluations require a supervisor-only evaluator service with bounded exported-function cases; candidate guest shell commands are refused")
+	const isolatedRunner = runner ?? createOpenShellCommandRunner(config)
 	const files = await changedFiles(candidateRoot, baseCommit)
 	const commits = await candidateCommits(candidateRoot, baseCommit)
 	const complexity = await complexityMetrics(candidateRoot, baseCommit, files)
@@ -59,34 +54,44 @@ export async function evaluateCandidate(
 			failureClassification: "protected-path-violation",
 		}
 	}
-	const regression = await runner("npm test", candidateRoot, config.commandTimeoutMs)
+	const regression = await isolatedRunner(config.regressionCommand, candidateRoot, config.commandTimeoutMs)
+	const typecheck = await isolatedRunner("npm run typecheck", candidateRoot, config.commandTimeoutMs)
 	const visible: TrialResult[] = []
 	for (const command of config.evalCommands) {
-		visible.push(await runner(command, candidateRoot, config.commandTimeoutMs))
+		visible.push(await isolatedRunner(command, candidateRoot, config.commandTimeoutMs))
 	}
 	const hidden: TrialResult[] = []
-	for (const command of config.hiddenEvalCommands) {
-		// Hidden commands belong to the supervisor checkout. They receive the
-		// candidate path explicitly so a candidate cannot replace the evaluator
-		// script or package metadata in the process that scores it.
-		hidden.push(
-			await runner(command, config.repoRoot, config.commandTimeoutMs, {
-				...process.env,
-				HEADLESSCODE_RSI_CANDIDATE_ROOT: candidateRoot,
-			}),
-		)
+	if (hiddenEvaluation) {
+		const candidateCommit = await gitOutput(candidateRoot, ["rev-parse", "HEAD"])
+		const sourceTree = execFileSync("git", ["ls-tree", "-r", "-z", "--full-tree", "HEAD"], { cwd: candidateRoot, maxBuffer: 32 * 1024 * 1024 })
+		const result = await verifyHiddenFunctions(hiddenEvaluation.suite, {
+			candidateSourceDigest: createHash("sha256").update(sourceTree).digest("hex"),
+			evaluatorImageDigest: hiddenEvaluation.evaluatorImageDigest,
+			candidateCommit,
+			sessionId: hiddenEvaluation.sessionId,
+			jobId: hiddenEvaluation.jobId,
+		}, hiddenEvaluation)
+		hidden.push({
+			ok: result.status === "passed",
+			command: "supervisor-hidden-function-cases",
+			exitCode: result.status === "passed" ? 0 : 1,
+			durationMs: 0,
+			stdout: `${result.caseResults.filter((item) => item.passed).length}/${result.caseResults.length} hidden function cases passed; protocol=${result.protocolDigest}`,
+			stderr: result.reason ?? "",
+		})
 	}
 	return {
 		regression,
 		visible,
 		hidden,
-		completed: regression.ok && visible.every((trial) => trial.ok) && hidden.every((trial) => trial.ok),
-		crashed: [regression, ...visible, ...hidden].some((trial) => trial.exitCode === null && !trial.timedOut),
+		completed: regression.ok && typecheck.ok && visible.every((trial) => trial.ok) && hidden.every((trial) => trial.ok),
+		crashed: [regression, typecheck, ...visible, ...hidden].some((trial) => trial.exitCode === null && !trial.timedOut),
 		protectedPathViolation: false,
 		changedFiles: files,
 		committed: commits.length > 0,
 		complexity,
-		failureClassification: [regression, ...visible, ...hidden].some((trial) => !trial.ok) ? "evaluation-failure" : undefined,
+		typecheck,
+		failureClassification: [regression, typecheck, ...visible, ...hidden].some((trial) => !trial.ok) ? "evaluation-failure" : undefined,
 	}
 }
 

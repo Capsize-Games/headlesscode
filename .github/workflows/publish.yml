@@ -1,15 +1,7 @@
-# Publish headlesscode to the npm registry on every version tag (v*).
+# Build a release package on version tags and attach it to the GitHub Release.
+# This workflow does not publish packages to npm.
 #
-# GitHub-hosted runners only — this is a public repo, so no self-hosted
-# worker is needed. The full verification bar (typecheck + test suite) must
-# pass before the package is allowed to reach the registry; the publish uses
-# the NPM_ACCESS_TOKEN repository secret (an automation token with publish
-# rights, configured in the repo Settings > Secrets and variables > Actions).
-#
-# Publishes under the tag's version: package.json and package-lock.json are
-# bumped to the tagged version before the tag is cut (npm version), so a tag
-# push to vX.Y.Z publishes headlesscode@X.Y.Z. Also creates a GitHub Release
-# with the published tarball for visibility.
+# The tag's version in package.json must match the pushed v* tag.
 name: publish
 
 on:
@@ -22,18 +14,20 @@ permissions:
 
 jobs:
   npm-publish:
-    name: Verify, publish to npm, attach release
+    name: Verify and attach release artifact
+    if: github.event.repository.private == false
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout tag
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: "https://registry.npmjs.org"
           cache: npm
 
       - name: Install dependencies
@@ -45,17 +39,15 @@ jobs:
       - name: Test
         run: npm test
 
-      - name: Pack tarball and verify the bin launcher ships
+      - name: Pack tarball and verify both bin launchers ship
         run: |
           TARBALL=$(npm pack --pack-destination . | tail -1)
           echo "tarball=$TARBALL" >> "$GITHUB_ENV"
-          tar -tzf "$TARBALL" | grep -q "package/bin/headlesscode.mjs" \
-            || { echo "bin/headlesscode.mjs missing from tarball"; exit 1; }
-
-      - name: Publish to npm
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}
+          tar -tzf "$TARBALL" > release-contents.txt
+          for launcher in headlesscode headlesscode-control; do
+            grep -Fx "package/bin/$launcher.mjs" release-contents.txt \
+              || { echo "bin/$launcher.mjs missing from tarball"; exit 1; }
+          done
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

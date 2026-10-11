@@ -1,0 +1,6 @@
+{
+  "files": {
+    "src/solution.js": "import {has} from \"./helper.js\";export function solve(x){return has(x.roles,x.role,x.permission)}\n",
+    "src/helper.js": "export function has(r,n,p){let seen=new Set;while(n&&!seen.has(n)){seen.add(n);let x=r[n];if(!x)return false;if(x.permissions?.includes(p))return true;n=x.parent}return false}\n"
+  }
+}
