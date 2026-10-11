@@ -13,14 +13,25 @@ import * as path from "node:path"
 
 import { LocalMemoryStore } from "./memory/local.js"
 import type { MemoryStore } from "./memory/types.js"
-import { OpenRouterClient, parseReasoningEffort } from "./llm/openrouter.js"
+import { DEFAULT_MODEL, OpenRouterClient, parseReasoningEffort } from "./llm/openrouter.js"
 import { OllamaClient } from "./llm/ollama.js"
+import {
+	DEFAULT_MUSE_MODEL,
+	LLM_PROVIDER_ENV,
+	META_MODEL_API_KEY_ENV,
+	MUSE_API_KEY_ENV,
+	MUSE_MODEL_ENV,
+	MuseClient,
+	providerDefaultModel,
+	resolveLlmProviderOrReport,
+} from "./llm/muse.js"
 import type { LlmClient, ChatMessage, SessionResult } from "./engine/types.js"
 import { HeadlessSession } from "./engine/loop.js"
 import { chownWorktreeWorkspace } from "./dashboard/session-launch.js"
 import { isLocalExploreEnabled } from "./engine/local-explore.js"
 import { Logger } from "./engine/logger.js"
 import {
+	appendBatchTool,
 	appendCodeIntelTools,
 	appendDescribeImageTool,
 	buildSystemPrompt,
@@ -309,7 +320,10 @@ Options:
                              provisioned per-session evidence config. The
                              dashboard uses this to open the session event
                              view immediately.
-  --model <id>               OpenRouter model id (default: $OPENROUTER_MODEL or deepseek/deepseek-v4-flash-0731)
+  --model <id>               Model id (OpenRouter default: $OPENROUTER_MODEL or
+                               deepseek/deepseek-v4-flash-0731; with
+                               HEADLESSCODE_LLM_PROVIDER=muse: $HEADLESSCODE_MUSE_MODEL
+                               or muse-spark-1.3)
   --max-iterations <n>       Loop iteration cap (default: 250 — see DEFAULT_MAX_ITERATIONS
                                in src/engine/loop.ts)
   --max-recursion-depth <n>  Recursive task decomposition (new_task): hard cap
@@ -445,6 +459,10 @@ Environment:
   OPENROUTER_MODEL           Default model id
   OPENROUTER_HTTP_REFERER    Optional HTTP-Referer header
   OPENROUTER_APP_TITLE       Optional X-Title header
+  HEADLESSCODE_LLM_PROVIDER  Cloud provider: "openrouter" (default) or "muse" (Meta Model API)
+  HEADLESSCODE_MUSE_API_KEY  Meta Model API key (MODEL_API_KEY also honored); required with provider "muse"
+  HEADLESSCODE_MUSE_MODEL    Default model id with provider "muse" (default muse-spark-1.3)
+  HEADLESSCODE_MUSE_BASE_URL Meta Model API base URL (default https://api.meta.ai/v1)
   HEADLESSCODE_WORKSPACE_ROOT  Default workspace root
   HEADLESSCODE_MEMORY_DIR    Default memory dir (memory enabled when set)
   HEADLESSCODE_PROJECT       Project scope for memory (default: workspace basename)
@@ -954,6 +972,16 @@ export async function main(argv: string[] = process.argv.slice(2), hooks?: CliRu
 		return 0
 	}
 
+	// Cloud provider for this session (openrouter default, "muse" for Meta's
+	// Model API). Resolved here — before dry-run — so --dry-run previews the
+	// right default model and a typo'd HEADLESSCODE_LLM_PROVIDER fails loudly
+	// instead of silently running on the wrong provider/account. The local
+	// Ollama backend (resolved below) still overrides this per mode.
+	const provider = resolveLlmProviderOrReport()
+	if (provider === undefined) {
+		return 2
+	}
+
 	const workspaceRoot = path.resolve(options.workspace ?? process.env.HEADLESSCODE_WORKSPACE_ROOT ?? process.cwd())
 	const logger = new Logger({ level: hooks?.quiet ? "silent" : "info", filePath: options.logFile })
 
@@ -1070,16 +1098,20 @@ export async function main(argv: string[] = process.argv.slice(2), hooks?: CliRu
 				customModes,
 			})
 			// Dry-run advertises the same non-vendored tools a real session
-			// appends (code-intelligence + describe_image; browser_action is
-			// deliberately omitted here — the loop appends it, but this
-			// listing is a prompt/config check, not a live session).
-			const tools = appendCodeIntelTools(
-				appendDescribeImageTool(selectToolsForMode(options.mode, customModes)),
+			// appends (code-intelligence + describe_image + batch;
+			// browser_action is deliberately omitted here — the loop
+			// appends it, but this listing is a prompt/config check, not a
+			// live session).
+			const tools = appendBatchTool(
+				appendCodeIntelTools(
+					appendDescribeImageTool(selectToolsForMode(options.mode, customModes)),
+				),
 			)
 			// Per-mode model assignment: dry-run resolves the model exactly
-			// like a real run (mode-models.json / _default / OPENROUTER_MODEL,
-			// with an explicit --model always winning) so the effective model
-			// is visible without an LLM call. undefined -> the client default.
+			// like a real run (mode-models.json / _default / the provider's
+			// default-model env var, with an explicit --model always winning)
+			// so the effective model is visible without an LLM call.
+			// undefined -> the provider client's own built-in default.
 			const dryRunModel = resolveModelForMode({
 				workspaceRoot,
 				mode: options.mode,
@@ -1093,11 +1125,13 @@ export async function main(argv: string[] = process.argv.slice(2), hooks?: CliRu
 			const dryRunEffort = resolveReasoningEffortForMode({ workspaceRoot, env: process.env })
 			parseReasoningEffort(dryRunEffort)
 
+			const dryRunDefaultModel = provider === "muse" ? DEFAULT_MUSE_MODEL : DEFAULT_MODEL
 			stdout.write(built.prompt + "\n")
 			stdout.write(
 				`\n───── dry-run summary ─────\n` +
 					`mode:             ${options.mode}\n` +
-					`model:            ${dryRunModel ?? "deepseek/deepseek-v4-flash-0731 (client default)"}\n` +
+					`provider:         ${provider}\n` +
+					`model:            ${dryRunModel ?? `${dryRunDefaultModel} (client default)`}\n` +
 					`reasoning effort: ${dryRunEffort ?? "(unset — endpoint default)"}\n` +
 					`workspace:        ${workspaceRoot}\n` +
 					`custom modes:     ${customModes.length ? customModes.map((m) => m.slug).join(", ") : "(none, using built-ins)"}\n` +
@@ -1175,27 +1209,47 @@ export async function main(argv: string[] = process.argv.slice(2), hooks?: CliRu
 			.filter(Boolean),
 	)
 	const useLocalCodeBackend = localBackendModes.has(options.mode) && codeModeBackend === "ollama"
-	const apiKey = process.env.HEADLESSCODE_OPENROUTER_API_KEY ?? process.env.HEADLESSCODE_RSI_INFERENCE_CAPABILITY
+	const apiKey = provider === "muse"
+		? process.env[MUSE_API_KEY_ENV] ?? process.env[META_MODEL_API_KEY_ENV]
+		: process.env.HEADLESSCODE_OPENROUTER_API_KEY ?? process.env.HEADLESSCODE_RSI_INFERENCE_CAPABILITY
 	if (!apiKey && !useLocalCodeBackend && !hooks?.llmClient) {
-		stderr.write(
-			"headlesscode: HEADLESSCODE_OPENROUTER_API_KEY is not set.\n" +
+		stderr.write(provider === "muse"
+			? `headlesscode: ${MUSE_API_KEY_ENV} is not set.\n` +
+				`  Export it (a Meta Model API key; ${META_MODEL_API_KEY_ENV} is also honored) or use --dry-run to\n` +
+				"  validate the prompt/config without calling the LLM.\n"
+			: "headlesscode: HEADLESSCODE_OPENROUTER_API_KEY is not set.\n" +
 				"  Export it (e.g. export HEADLESSCODE_OPENROUTER_API_KEY=sk-or-...) or use --dry-run to\n" +
-				"  validate the prompt/config without calling the LLM.\n",
-		)
+				"  validate the prompt/config without calling the LLM.\n")
 		return 2
 	}
 
 	// Per-mode model assignment (plans/mode-model-assignment.md): the
-	// resolved mode's config entry / _default / OPENROUTER_MODEL apply only
-	// when no explicit --model flag was given (an explicit flag always wins).
-	// `undefined` is passed through so the OpenRouter client's own built-in
-	// default stays the single source of truth for the ultimate fallback.
-	const model = resolveModelForMode({
-		workspaceRoot,
-		mode: options.mode,
-		explicitModel: options.model,
-		env: process.env,
-	})
+	// resolved mode's config entry / _default / the provider's default-model
+	// env var (rule 4 is provider-aware inside resolveModelForMode — under
+	// "muse", OPENROUTER_MODEL is shadowed by HEADLESSCODE_MUSE_MODEL)
+	// apply only when no explicit --model flag was given (an explicit flag
+	// always wins). `undefined` is passed through on the OpenRouter path so
+	// that client's own built-in default stays the single source of truth
+	// for the ultimate fallback; on the Muse path the default is resolved
+	// EAGERLY here instead (see providerDefaultModel).
+	const model =
+		resolveModelForMode({
+			workspaceRoot,
+			mode: options.mode,
+			explicitModel: options.model,
+			env: process.env,
+		}) ?? providerDefaultModel(provider)
+	if (
+		provider === "muse" &&
+		process.env.OPENROUTER_MODEL &&
+		!process.env[MUSE_MODEL_ENV] &&
+		!options.model
+	) {
+		stderr.write(
+			`[headlesscode] NOTE: ${LLM_PROVIDER_ENV}=muse is set, so OPENROUTER_MODEL ("${process.env.OPENROUTER_MODEL}") is ignored ` +
+				`(it holds OpenRouter ids, never valid Meta ids) — using model "${model}". Set ${MUSE_MODEL_ENV} to override.\n`,
+		)
+	}
 
 	// The local daemon's own proxy (ollama_shim.py) deliberately runs a 600s
 	// upstream request timeout — its own comment documents why: a shorter
@@ -1221,7 +1275,7 @@ export async function main(argv: string[] = process.argv.slice(2), hooks?: CliRu
 	// — was hardcoded to "code", now checks the real list.
 	if (codeModeBackend === "ollama" && !localBackendModes.has(options.mode)) {
 		stderr.write(
-			`[headlesscode] NOTE: HEADLESSCODE_CODE_MODE_BACKEND=ollama is set, but --mode "${options.mode}" is not in HEADLESSCODE_LOCAL_BACKEND_MODES ("${[...localBackendModes].join(",")}") — this session will use the cloud OpenRouter model instead.\n`,
+			`[headlesscode] NOTE: HEADLESSCODE_CODE_MODE_BACKEND=ollama is set, but --mode "${options.mode}" is not in HEADLESSCODE_LOCAL_BACKEND_MODES ("${[...localBackendModes].join(",")}") — this session will use the cloud ${provider} model instead.\n`,
 		)
 	}
 	// When the local backend is selected, every downstream consumer of
@@ -1231,7 +1285,7 @@ export async function main(argv: string[] = process.argv.slice(2), hooks?: CliRu
 	// non-empty request.model over its own defaultModel) must see the
 	// LOCAL model id, not the OpenRouter-resolved one. Without this,
 	// local sessions were tagged and logged as
-	// e.g. "deepseek/deepseek-v4-flash-0731" throughout — cosmetic for
+	// e.g. the cloud model id throughout — cosmetic for
 	// generation itself (the local daemon ignores the model string and
 	// serves whatever GGUF is loaded) but wrong everywhere the model id
 	// is recorded or reported (verified live 2026-08-21: session_start
@@ -1262,7 +1316,9 @@ export async function main(argv: string[] = process.argv.slice(2), hooks?: CliRu
 				// that didn't explicitly pass --llm-timeout-ms.
 				timeoutMs: llmTimeoutMs,
 			})
-		: new OpenRouterClient({ apiKey, defaultModel: model }))
+		: provider === "muse"
+			? new MuseClient({ apiKey, defaultModel: model })
+			: new OpenRouterClient({ apiKey, defaultModel: model }))
 	// A small local model's context is dominated by the full tool catalog
 	// (see src/engine/lazy-tools.ts) — default lazy loading ON for local
 	// sessions specifically, without touching the cloud path's prompt-cache-

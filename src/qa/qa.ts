@@ -6,9 +6,9 @@
  * → correlate with the server log → diagnose → fix → verify) is driven entirely
  * by read + execute_command (+ edit for remediation) tools. The Playwright MCP
  * server referenced in the mode's customInstructions is OPTIONAL enrichment
- * ("you can also use Playwright MCP tools directly") — the harness cannot serve
- * MCP (the vendored McpHub is a stub and MCP tools are excluded from
- * `selectToolsForMode`), so browser interaction is done via the repo's own
+ * ("you can also use Playwright MCP tools directly"). QA passes an explicit
+ * restricted tool allowlist, so configured MCP tools are intentionally omitted;
+ * browser interaction is done via the repo's own
  * Playwright CLI (`qa/runner.js`, `npx playwright ...`) through
  * `execute_command`. That is choice (b)-via-CLI from the Phase 4 spec.
  *
@@ -41,8 +41,14 @@ import { HeadlessSession } from "../engine/loop.js"
 import { Logger } from "../engine/logger.js"
 import { OllamaClient } from "../llm/ollama.js"
 import { OpenRouterClient } from "../llm/openrouter.js"
+import { MuseClient, providerDefaultModel, resolveLlmProvider } from "../llm/muse.js"
 import { envBoolean, resolvePerModeEnv } from "../cli.js"
-import { appendBrowserActionTool, appendCodeIntelTools, loadCustomModes } from "../engine/prompt.js"
+import {
+	appendBatchTool,
+	appendBrowserActionTool,
+	appendCodeIntelTools,
+	loadCustomModes,
+} from "../engine/prompt.js"
 import { createQaHeadlessExecutor } from "../tools/executor.js"
 import { getNativeTools } from "../vendor/zoo-code/src/core/prompts/tools/native-tools/index.js"
 import { addCustomInstructions } from "../vendor/zoo-code/src/core/prompts/sections/custom-instructions.js"
@@ -65,7 +71,8 @@ const QA_TOOL_NAMES = new Set([
 
 /**
  * The QA-mode tool schemas (read-only + command, no write tools), plus
- * browser_action and the four code-intelligence tools — QA can boot the app,
+ * browser_action, batch, and the nine code-intelligence tools — QA can boot
+ * the app,
  * visually verify it in a headless browser (the phase4 gap "live
  * Playwright-MCP interactivity is not available headlessly" is partially
  * closed for agent-driven checks; see src/tools/browser/tool.ts), and
@@ -75,7 +82,7 @@ export function qaTools(): ChatTool[] {
 	const tools = getNativeTools().filter(
 		(t) => t.type === "function" && QA_TOOL_NAMES.has(t.function.name),
 	) as unknown as ChatTool[]
-	return appendCodeIntelTools(appendBrowserActionTool(tools))
+	return appendBatchTool(appendCodeIntelTools(appendBrowserActionTool(tools)))
 }
 
 /**
@@ -292,12 +299,22 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
 			.map((s) => s.trim())
 			.filter(Boolean)
 			.includes(mode)
+	// Cloud provider for a non-local QA session (openrouter default,
+	// "muse" for Meta's Model API). Throws on a typo'd
+	// HEADLESSCODE_LLM_PROVIDER — entry points validate it first for a clean
+	// exit-2; reaching here with a bad value is a programmer error.
+	const provider = resolveLlmProvider()
 	// Same fix as reviewer.ts's effectiveModel (2026-08-27): downstream
 	// consumers of `model` (session-start logs, cost records, the
 	// `request.model` OllamaClient sends) must see the LOCAL model id when
 	// local backend is active, or a local QA session logs itself as the
-	// cloud model throughout even though it never touches OpenRouter.
-	const effectiveModel = useLocalBackend ? (resolvePerModeEnv("HEADLESSCODE_CODE_MODE_MODEL", mode) ?? model) : model
+	// cloud model throughout even though it never touches OpenRouter. On
+	// the Muse path the default is also resolved eagerly (see
+	// providerDefaultModel) — an undefined model would fall back to an
+	// OpenRouter id.
+	const effectiveModel = useLocalBackend
+		? (resolvePerModeEnv("HEADLESSCODE_CODE_MODE_MODEL", mode) ?? model)
+		: (model ?? providerDefaultModel(provider))
 	const client =
 		llmClient ??
 		(useLocalBackend
@@ -314,7 +331,12 @@ export async function runQa(options: RunQaOptions): Promise<QaResult> {
 					// about it.
 					timeoutMs: useLocalBackend ? 630_000 : undefined,
 				})
-			: new OpenRouterClient({ apiKey: process.env.HEADLESSCODE_OPENROUTER_API_KEY, defaultModel: model, baseUrl }))
+			: provider === "muse"
+				// NOTE: the injected `baseUrl` is an OpenRouter base URL — it
+				// is NOT forwarded here (wrong host AND wrong path shape for
+				// api.meta.ai). MuseClient resolves HEADLESSCODE_MUSE_BASE_URL.
+				? new MuseClient({ defaultModel: effectiveModel })
+				: new OpenRouterClient({ apiKey: process.env.HEADLESSCODE_OPENROUTER_API_KEY, defaultModel: model, baseUrl }))
 
 	// Mirror every log line to <worktree>/qa.log — see reviewer.ts's runReview
 	// for the full rationale (same fix, same incident: review/QA run

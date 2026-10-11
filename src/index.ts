@@ -19,6 +19,18 @@ main()
 export * from "./cli.js"
 export * from "./memory/index.js"
 export { OpenRouterClient, OpenRouterError, DEFAULT_MODEL } from "./llm/openrouter.js"
+export {
+	MuseClient,
+	MuseError,
+	DEFAULT_MUSE_MODEL,
+	MUSE_BASE_URL,
+	MUSE_CONTEXT_WINDOW_TOKENS,
+	resolveLlmProvider,
+	resolveLlmProviderOrReport,
+	providerDefaultModel,
+	isRetryableMuseError,
+	type LlmProvider,
+} from "./llm/muse.js"
 export { HeadlessSession, truncateHistory, DEFAULT_MAX_TOKENS } from "./engine/loop.js"
 export {
 	maybeCondense,

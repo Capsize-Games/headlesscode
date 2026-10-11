@@ -3,8 +3,9 @@
  * only work for specific languages (Part D of the central-store round):
  *
  * - The `ts.Program`-based code-intelligence tools (outline, go_to_definition,
- *   find_references, import_graph, rename_symbol — src/codeintel/) only scan
- *   TS/JS files, and
+ *   find_references, import_graph, get_diagnostics, type_at_position,
+ *   call_hierarchy, workspace_symbol, find_implementations, rename_symbol —
+ *   src/codeintel/) only scan TS/JS files, and
  * - `run_tests`'s direct-match discovery + `tsx` invocation are TS-specific.
  *
  * On a real target project like a C++ or Python repo these tools are dead

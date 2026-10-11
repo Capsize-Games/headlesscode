@@ -2,14 +2,16 @@
  * Phase 6 — model pricing + LLM cost estimation (the numeric heart of the
  * per-session cost budget).
  *
- * The harness pays OpenRouter per token (input + output). To enforce a
+ * The harness pays its cloud provider per token (input + output) — OpenRouter
+ * or Meta's Model API, depending on HEADLESSCODE_LLM_PROVIDER. To enforce a
  * per-session cost cap without post-hoc reconciliation we estimate the USD
  * cost of every LLM call from the `usage` object the provider returns
  * (prompt/completion tokens) × the model's price.
  *
  * Pricing table: USD per 1M tokens, keyed by model id. Defaults cover the
- * models this project actually uses (DeepSeek family via OpenRouter) plus one
- * general model as a sanity reference. The table is overridable:
+ * models this project actually uses (DeepSeek family via OpenRouter, Muse
+ * Spark family via Meta) plus one general model as a sanity reference. The
+ * table is overridable:
  *
  *   - in-code: pass a `PricingTable` to `estimateCost` / `accumulateCost` /
  *     `BudgetTracker` (the constructor option);
@@ -74,6 +76,16 @@ export type PricingTable = Record<string, ModelPrice>
  *   explicit `OPENROUTER_MODEL=deepseek/deepseek-chat` override accounts
  *   correctly.
  * - `deepseek/deepseek-reasoner` — the reasoning variant used for review/QA.
+ * - `muse-spark-1.3` / `muse-spark-1.2` / `muse-spark-1.1` — Meta Model API
+ *   list rates (Standard tier: $1.25 input / $4.25 output / $0.15 cached
+ *   input per 1M; 1.3 is the Muse provider default). Verified against
+ *   Meta's published pricing (dev.meta.ai/docs/pricing-rate-limits) as
+ *   reported 2026-09-22/26 and cross-checked across multiple independent
+ *   integrations; Meta charges no long-context premium. The cached-input
+ *   rate is the documented prompt-cache discount (~88% off input).
+ * - `muse-spark-1.3-contributor` / `muse-spark-1.2-contributor` — the
+ *   Contributor tier ($0.10 / $0.20 / $0.002 cached per 1M), which grants
+ *   Meta permission to train on the traffic. Same verification as above.
  * - `anthropic/claude-3.5-sonnet` — a general-purpose reference model.
  * - `qwen/qwen3-embedding-4b` / `qwen/qwen3-embedding-8b` — the codebase-index
  *   embedding models (src/codesearch/embedder.ts; 8b is the default since
@@ -97,6 +109,12 @@ export const DEFAULT_PRICING_TABLE: PricingTable = {
 	// observed 2026-10-10. This remains a guardrail estimate; the generation
 	// record is the source for actual billed cost and cache discount.
 	"meta/muse-spark-1.3-contributor": { input: 0.10, output: 0.20, cacheRead: 0.002 },
+	// Meta Model API list rates for Muse Spark standard and Contributor tiers.
+	"muse-spark-1.3": { input: 1.25, output: 4.25, cacheRead: 0.15 },
+	"muse-spark-1.2": { input: 1.25, output: 4.25, cacheRead: 0.15 },
+	"muse-spark-1.1": { input: 1.25, output: 4.25, cacheRead: 0.15 },
+	"muse-spark-1.3-contributor": { input: 0.1, output: 0.2, cacheRead: 0.002 },
+	"muse-spark-1.2-contributor": { input: 0.1, output: 0.2, cacheRead: 0.002 },
  "anthropic/claude-3.5-sonnet": { input: 3.0, output: 15.0 },
  "qwen/qwen3-embedding-4b": { input: 0.15, output: 0.15 },
  "qwen/qwen3-embedding-8b": { input: 0.3, output: 0.3 },

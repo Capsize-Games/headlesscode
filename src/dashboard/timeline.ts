@@ -34,6 +34,11 @@ const READ_TOOLS = new Set([
 	"go_to_definition",
 	"find_references",
 	"import_graph",
+	"get_diagnostics",
+	"type_at_position",
+	"call_hierarchy",
+	"workspace_symbol",
+	"find_implementations",
 ])
 const WRITE_TOOLS = new Set(["write_to_file", "apply_diff", "search_replace", "edit_file", "set_indentation"])
 const EXEC_TOOLS = new Set(["execute_command"])
