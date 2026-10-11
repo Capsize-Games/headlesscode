@@ -19,8 +19,9 @@ function receiptMatchesProfile(receipt: NonNullable<BenchmarkAttempt["inferenceR
 	try {
 		const profile = openRouterProfileForModel(modelId, receipt.profileId)
 		const profileIdMatches = profile.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? receipt.profileId === undefined || receipt.profileId === profile.id : receipt.profileId === profile.id
+		const returnedModel = receipt.returnedModels.length === 1 ? receipt.returnedModels[0] : undefined
 		return receipt.provider === "openrouter" && profileIdMatches && receipt.endpointProvider === profile.endpointProvider
-			&& receipt.model === modelId && receipt.returnedModels.length === 1 && profile.returnedModels.includes(receipt.returnedModels[0]!)
+			&& receipt.model === modelId && returnedModel !== undefined && profile.returnedModels.includes(returnedModel)
 			&& receipt.returnedProviders.length === 1 && receipt.returnedProviders[0] === profile.endpointProvider
 	} catch { return false }
 }
