@@ -3697,15 +3697,19 @@ async function testVerifyBeforeCompletionRefusesUnsupportedMeasurementClaim(): P
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc-measure-"))
 	try {
 		const client = new FakeLlmClient([
-			// Successful execute_command output includes stderr. A locale warning
-			// can contain digits (`en_US.UTF-8`) without measuring anything.
+			// Successful execute_command output includes stderr. Incidental process
+			// metadata and a locale warning contain numbers, but no benchmark result.
 			() =>
 				toolCall("execute_command", {
-					command: "echo ready; echo 'bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8)' >&2",
+					command:
+						"echo 'worker 2 ready'; echo 'bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8); exit status 0' >&2",
 				}),
-			() => toolCall("attempt_completion", { result: "Benchmark complete: 205.9 tokens/sec measured." }),
-			() => toolCall("execute_command", { command: "echo real-result 205.9" }),
-			() => toolCall("attempt_completion", { result: "Ran the real benchmark: 205.9 tokens/sec." }),
+			() =>
+				toolCall("attempt_completion", {
+					result: "Benchmark 2 complete: 205.9 tokens/sec at 20ms measured.",
+				}),
+			() => toolCall("execute_command", { command: "echo 'worker 2 result 205.9 tokens/sec 20ms'" }),
+			() => toolCall("attempt_completion", { result: "Ran benchmark 2: 205.9 tokens/sec at 20ms." }),
 		])
 		const session = await makeSession({
 			task: "benchmark something",
@@ -3716,7 +3720,7 @@ async function testVerifyBeforeCompletionRefusesUnsupportedMeasurementClaim(): P
 		const result = await session.run()
 
 		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
-		assert.equal(result.result, "Ran the real benchmark: 205.9 tokens/sec.")
+		assert.equal(result.result, "Ran benchmark 2: 205.9 tokens/sec at 20ms.")
 		assert.equal(client.requests.length, 4, "the unsupported claim must not end the session early")
 		const nudge = session.state.messages.find(
 			(m) => m.role === "tool" && (m.content ?? "").includes("was NOT accepted"),
