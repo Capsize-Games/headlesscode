@@ -5,8 +5,8 @@ import { execFileSync } from "node:child_process"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { externalizeEvaluationOutputs, runRsiWorker, type RsiWorkerOptions } from "../worker.js"
-import { rsiMutationGuestEnvironment } from "../openshell.js"
+import { externalizeEvaluationOutputs, externalizeMutationFailureOutput, runRsiWorker, type RsiWorkerOptions } from "../worker.js"
+import { OpenShellMutationPreflightError, rsiMutationGuestEnvironment } from "../openshell.js"
 import { RSI_MUSE_OPENROUTER_MODEL, type OpenRouterBrokerLimits, type OpenRouterBrokerReceipt } from "../inference-broker.js"
 import { EmergencyControl } from "../../control/emergency-controller.js"
 import type { FleetJobLease, FleetJobPayload } from "../postgres-queue.js"
@@ -47,6 +47,241 @@ test("worker keeps large visible-test output in a content-addressed artifact", a
 	const unpacked = JSON.parse(uploaded.toString("utf8")) as Array<{ stdout: string; stderr: string }>
 	assert.equal(unpacked[0].stdout, full)
 	assert.equal(unpacked[0].stderr, full)
+})
+
+test("failed mutation output artifact preserves full bounded result, tail preview, and inference audit", async () => {
+	const stdout = `control-and-unicode:\u0000\u001f\"\uD800\uD83D\uDE00\n${"routine progress\n".repeat(500)}FINAL_FAILURE_DIAGNOSTIC`
+	const stderr = "guest stderr detail"
+	const trial = { ok: false, command: "tsx src/cli.ts --mode code", exitCode: 1, durationMs: 1234, timedOut: false, stdout, stderr }
+	let uploaded: Buffer | undefined
+	const queue = {
+		async putArtifact(content: Buffer) {
+			uploaded = Buffer.from(content)
+			return { sha256: createHash("sha256").update(content).digest("hex"), byteLength: content.byteLength }
+		},
+	} as unknown as Parameters<typeof externalizeMutationFailureOutput>[0]
+	const audit = { accounting: "incomplete", jobId: "synthetic-failed-job", denials: [{ statusCode: 429, reason: "job-deadline", count: 1 }] }
+	const result = await externalizeMutationFailureOutput(queue, trial, { ok: false, inferenceAudit: audit })
+	assert.ok(uploaded)
+	const digest = createHash("sha256").update(uploaded).digest("hex")
+	assert.equal((result.failureOutputArtifact as { sha256: string }).sha256, digest)
+	assert.equal((result.failureOutputArtifact as { bytes: number }).bytes, uploaded.byteLength)
+	assert.deepEqual(result.inferenceAudit, audit, "externalizing output must retain the durable inference audit")
+	const artifact = JSON.parse(uploaded.toString("utf8")) as { schemaVersion: number; result: typeof trial & { stdoutTruncated: boolean; stderrTruncated: boolean } }
+	assert.equal(artifact.schemaVersion, 1)
+	assert.equal(artifact.result.exitCode, 1)
+	assert.equal(artifact.result.durationMs, 1234)
+	assert.equal(artifact.result.timedOut, false)
+	assert.equal(artifact.result.stdout, stdout, "output below the artifact budget remains complete")
+	assert.equal(artifact.result.stderr, stderr)
+	const summary = result.mutationResult as { stdout: string; stderr: string; exitCode: number; outputArtifactSha256: string; outputArtifactBytes: number }
+	assert.ok(summary.stdout.endsWith("FINAL_FAILURE_DIAGNOSTIC"), "bounded queue preview keeps the diagnostic tail")
+	assert.equal(summary.stderr, stderr)
+	assert.equal(summary.exitCode, 1)
+	assert.equal(summary.outputArtifactSha256, digest)
+	assert.equal(summary.outputArtifactBytes, uploaded.byteLength)
+	assert.ok(JSON.stringify(result).length < 10_000, "queue result remains bounded")
+
+	let timedOutArtifact: Buffer | undefined
+	const timeoutQueue = {
+		async putArtifact(content: Buffer) {
+			timedOutArtifact = Buffer.from(content)
+			return { sha256: createHash("sha256").update(content).digest("hex"), byteLength: content.byteLength }
+		},
+	} as unknown as Parameters<typeof externalizeMutationFailureOutput>[0]
+	await externalizeMutationFailureOutput(timeoutQueue, { ok: false, command: "worker", exitCode: null, durationMs: 5000, timedOut: true, stdout: "timeout detail", stderr: "" })
+	assert.ok(timedOutArtifact)
+	assert.deepEqual((JSON.parse(timedOutArtifact.toString("utf8")) as { result: { exitCode: number | null; timedOut: boolean } }).result, { ok: false, command: "worker", exitCode: null, durationMs: 5000, timedOut: true, stdout: "timeout detail", stderr: "" })
+})
+
+test("artifact store size rejection is visible without clipping the full mutation result", async () => {
+	const stdout = `${"\u0000".repeat(1024 * 1024)}FINAL_ARTIFACT_TAIL`
+	let attempted: Buffer | undefined
+	const queue = {
+		async putArtifact(content: Buffer) {
+			attempted = Buffer.from(content)
+			throw new Error("RSI artifact exceeds configured 1024 byte limit")
+		},
+	} as unknown as Parameters<typeof externalizeMutationFailureOutput>[0]
+	await assert.rejects(externalizeMutationFailureOutput(queue, { ok: false, command: "worker", exitCode: 1, durationMs: 1, stdout, stderr: "" }), /exceeds configured 1024 byte limit/)
+	assert.ok(attempted)
+	const storedCandidate = JSON.parse(attempted.toString("utf8")) as { result: { stdout: string } }
+	assert.equal(storedCandidate.result.stdout, stdout, "the worker sends the full trial output to the existing store cap check")
+})
+
+test("failed mutation output artifact storage errors remain visible", async () => {
+	const queue = {
+		async putArtifact() { throw new Error("synthetic artifact store unavailable") },
+	} as unknown as Parameters<typeof externalizeMutationFailureOutput>[0]
+	await assert.rejects(externalizeMutationFailureOutput(queue, { ok: false, command: "worker", exitCode: null, durationMs: 1, stdout: "timeout", stderr: "" }), /synthetic artifact store unavailable/)
+})
+
+test("fleet mutation failure stores output before lease-fenced failure and keeps broker audit", async () => {
+	const root = fs.mkdtempSync(path.join(process.cwd(), ".headlesscode", "scratch", "rsi-failure-worker-"))
+	const previousApiKey = process.env.HEADLESSCODE_OPENROUTER_API_KEY
+	const previousBindHost = process.env.HEADLESSCODE_RSI_BROKER_BIND_HOST
+	process.env.HEADLESSCODE_OPENROUTER_API_KEY = "synthetic-test-key"
+	process.env.HEADLESSCODE_RSI_BROKER_BIND_HOST = "127.0.0.1"
+	const repo = path.join(root, "snapshot")
+	const snapshotPath = path.join(root, "snapshot.bundle")
+	const workerScratch = path.join(root, "worker-scratch")
+	const artifacts = new Map<string, Buffer>()
+	const digest = (content: Buffer) => createHash("sha256").update(content).digest("hex")
+	const auditDenial = { statusCode: 429, reason: "job-deadline", count: 1 } as const
+	const durableFailure: { value?: Record<string, unknown> } = {}
+	let failureReason = ""
+	let queueStatus: "leased" | "failed" | "cancelled" = "leased"
+	let claimed = false
+	let artifactStoreFails = false
+	let mutationFailureMode: "preflight" | "ordinary" | "unexpected" = "preflight"
+	try {
+		fs.mkdirSync(repo)
+		execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: repo })
+		execFileSync("git", ["config", "user.name", "Synthetic Test"], { cwd: repo })
+		execFileSync("git", ["config", "user.email", "synthetic@example.invalid"], { cwd: repo })
+		fs.writeFileSync(path.join(repo, "app.ts"), "export const value = 1\n")
+		execFileSync("git", ["add", "app.ts"], { cwd: repo })
+		execFileSync("git", ["commit", "--quiet", "-m", "synthetic sanitized snapshot"], { cwd: repo })
+		const snapshotCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim()
+		execFileSync("git", ["bundle", "create", snapshotPath, "HEAD"], { cwd: repo })
+		const snapshot = fs.readFileSync(snapshotPath)
+		const snapshotSha256 = digest(snapshot)
+		artifacts.set(snapshotSha256, snapshot)
+		const limits: OpenRouterBrokerLimits = {
+			campaignId: "synthetic-failure-campaign", maxCalls: 1, maxInputTokensPerCall: 1_000, maxOutputTokensPerCall: 100,
+			maxTotalTokens: 1_100, maxDurationMs: 60_000, maxRequestBytes: 16_384, maxResponseBytes: 16_384,
+			maxInputPricePerMillionUsd: 1, maxOutputPricePerMillionUsd: 1, maxCallSpendUsd: 0.01, maxJobSpendUsd: 0.01, maxCampaignSpendUsd: 0.01,
+		}
+		const payload: FleetJobPayload = {
+			schemaVersion: 1, snapshotSha256, snapshotBytes: snapshot.byteLength, snapshotCommit,
+			task: "make a synthetic one-line change", model: RSI_MUSE_OPENROUTER_MODEL, provider: "openrouter", openRouterProfile: "muse-spark-contributor",
+			inferenceLimits: limits, maxIterations: 1, timeoutMs: 1_000, protectedPaths: [],
+			candidate: { id: "muse-failed-worker-test", generation: 0 },
+		}
+		const job = {
+			jobId: "worker-muse-failed-job", idempotencyKey: "muse-failure-test", runId: "synthetic-run", candidateId: "muse-failed-worker-test",
+			jobKind: "mutation" as const, resourceClass: "CPU" as const, concurrencyKey: "openrouter:muse", artifactSha256: snapshotSha256,
+			payload, status: "leased" as const, attempts: 1, maxAttempts: 1, leaseDurationMs: 300_000,
+			createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+		}
+		const lease = { job, token: "synthetic-lease", workerId: "muse-failure-test-worker" } as FleetJobLease
+		const receipt: OpenRouterBrokerReceipt = {
+			provider: "openrouter", endpointProvider: "meta", jobId: job.jobId, campaignId: limits.campaignId,
+			model: RSI_MUSE_OPENROUTER_MODEL, profileId: "muse-spark-contributor", returnedModels: [], returnedProviders: [],
+			calls: 1, promptTokens: null, completionTokens: null, totalTokens: null, costUsd: null, accounting: "incomplete",
+			qualified: false, callReceipts: [], denials: [auditDenial],
+		}
+		const queue = {
+			artifactBackend: "s3", policy: { queueName: "synthetic-muse", maxInFlight: 1, leaseMs: 60_000 },
+			async migrate() {}, async registerWorker() {}, async heartbeatWorker() {}, async stopWorker() {}, async close() {},
+			async claim() { if (claimed) return undefined; claimed = true; return lease },
+			async getArtifact(sha256: string) { const value = artifacts.get(sha256); if (!value) throw new Error("missing fake artifact"); return value },
+			async putArtifact(content: Buffer) {
+				if (artifactStoreFails) throw new Error("synthetic artifact store unavailable")
+				const sha256 = digest(content); artifacts.set(sha256, Buffer.from(content)); return { sha256, byteLength: content.byteLength }
+			},
+			async heartbeat() { return queueStatus === "leased" },
+			async getJob() { return { ...job, status: queueStatus } },
+			async complete() { throw new Error("failed mutation must not complete") },
+			async fail(_lease: unknown, reason: string, result?: Record<string, unknown>) {
+				failureReason = reason
+				if (queueStatus !== "leased") return false
+				queueStatus = "failed"
+				durableFailure.value = result
+				return true
+			},
+		} as unknown as RsiWorkerOptions["queue"]
+		const workerOptions: RsiWorkerOptions = {
+			queue, workerId: "muse-failure-test-worker", gatewayId: "muse-failure-test-gateway", maxActive: 1,
+			resourceClasses: ["CPU"], scratchRoot: workerScratch, maxJobs: 1,
+			createInferenceBroker: async () => ({
+				localBaseUrl: "http://127.0.0.1:43123", guestBaseUrl: "http://host.openshell.internal:43123", capability: "opaque-synthetic-capability", port: 43123, maxPromptBytes: 872,
+				async receipt() { return receipt }, async close() {},
+			}),
+			runMutation: async () => {
+				if (mutationFailureMode === "unexpected") throw new Error("synthetic OpenShell setup failure")
+				if (mutationFailureMode === "ordinary") {
+					return {
+						ok: false,
+						result: { ok: false, command: "tsx src/cli.ts --mode code", exitCode: 1, durationMs: 12_345, stdout: `ordinary progress\n${"routine output\n".repeat(400)}FINAL_ORDINARY_FAILURE_REASON`, stderr: "" },
+						error: "OpenShell mutation worker failed (exit 1): FINAL_ORDINARY_FAILURE_REASON",
+					}
+				}
+				const result = { ok: false, command: "tsx src/cli.ts --mode code", exitCode: 79, durationMs: 12_345, stdout: `RSI_BENCHMARK_PREFLIGHT_FAILURE ${"routine progress\n".repeat(400)}FINAL_PREFLIGHT_FAILURE_REASON`, stderr: "" }
+				throw new OpenShellMutationPreflightError(result, `${result.stdout}\n${result.stderr}`)
+			},
+		}
+		await runRsiWorker(workerOptions)
+		assert.equal(queueStatus, "failed")
+		assert.match(failureReason, /OpenShell benchmark preflight failed/)
+		assert.match(failureReason, /FINAL_PREFLIGHT_FAILURE_REASON/)
+		assert.ok(durableFailure.value)
+		assert.deepEqual((durableFailure.value.inferenceAudit as { denials: unknown[] }).denials, [auditDenial])
+		const reference = durableFailure.value.failureOutputArtifact as { sha256: string; bytes: number }
+		assert.ok(reference)
+		const bytes = artifacts.get(reference.sha256)
+		assert.ok(bytes)
+		assert.equal(bytes.byteLength, reference.bytes)
+		assert.equal(digest(bytes), reference.sha256)
+		const output = JSON.parse(bytes.toString("utf8")) as { result: { exitCode: number; stdout: string } }
+		assert.equal(output.result.exitCode, 79)
+		assert.ok(output.result.stdout.endsWith("FINAL_PREFLIGHT_FAILURE_REASON"))
+		const persistedFailure = durableFailure.value
+		assert.equal(await queue.fail(lease, "late stale worker failure", { ok: false }), false, "the queue lease fence rejects a stale result write")
+		assert.equal(durableFailure.value, persistedFailure, "a stale result cannot replace the durable failure result")
+
+		queueStatus = "leased"
+		claimed = false
+		delete durableFailure.value
+		failureReason = ""
+		mutationFailureMode = "ordinary"
+		await runRsiWorker(workerOptions)
+		assert.equal(queueStatus, "failed")
+		assert.match(failureReason, /OpenShell mutation worker failed \(exit 1\)/)
+		assert.match(failureReason, /FINAL_ORDINARY_FAILURE_REASON/)
+		const ordinaryFailure = (durableFailure as { value?: Record<string, unknown> }).value
+		assert.ok(ordinaryFailure)
+		assert.deepEqual((ordinaryFailure.inferenceAudit as { denials: unknown[] }).denials, [auditDenial])
+		const ordinaryReference = ordinaryFailure.failureOutputArtifact as { sha256: string; bytes: number }
+		assert.ok(ordinaryReference, "ordinary failed guest results remain artifactized")
+		const ordinaryBytes = artifacts.get(ordinaryReference.sha256)
+		assert.ok(ordinaryBytes)
+		const ordinaryOutput = JSON.parse(ordinaryBytes.toString("utf8")) as { result: { exitCode: number; stdout: string } }
+		assert.equal(ordinaryOutput.result.exitCode, 1)
+		assert.ok(ordinaryOutput.result.stdout.endsWith("FINAL_ORDINARY_FAILURE_REASON"))
+
+		queueStatus = "leased"
+		claimed = false
+		delete durableFailure.value
+		failureReason = ""
+		mutationFailureMode = "unexpected"
+		await runRsiWorker(workerOptions)
+		assert.equal(queueStatus, "failed")
+		assert.match(failureReason, /synthetic OpenShell setup failure/)
+		const unexpectedFailure = (durableFailure as { value?: Record<string, unknown> }).value
+		assert.ok(unexpectedFailure)
+		assert.deepEqual((unexpectedFailure.inferenceAudit as { denials: unknown[] }).denials, [auditDenial])
+		assert.equal(unexpectedFailure.failureOutputArtifact, undefined, "an exception without a guest TrialResult must not invent an output artifact")
+
+		queueStatus = "leased"
+		claimed = false
+		delete durableFailure.value
+		failureReason = ""
+		mutationFailureMode = "preflight"
+		artifactStoreFails = true
+		await runRsiWorker(workerOptions)
+		assert.match(failureReason, /synthetic artifact store unavailable/, "artifact persistence failures are visible in the queue error")
+		assert.match(failureReason, /FINAL_PREFLIGHT_FAILURE_REASON/, "the original preflight diagnostic tail survives an artifact store failure")
+		const artifactFailureResult = (durableFailure as { value?: Record<string, unknown> }).value
+		assert.deepEqual((artifactFailureResult?.inferenceAudit as { denials: unknown[] }).denials, [auditDenial], "artifact failure does not discard inference audit")
+		assert.equal(artifactFailureResult?.failureOutputArtifact, undefined, "a failed artifact write is never advertised as persisted")
+	} finally {
+		if (previousApiKey === undefined) delete process.env.HEADLESSCODE_OPENROUTER_API_KEY
+		else process.env.HEADLESSCODE_OPENROUTER_API_KEY = previousApiKey
+		if (previousBindHost === undefined) delete process.env.HEADLESSCODE_RSI_BROKER_BIND_HOST
+		else process.env.HEADLESSCODE_RSI_BROKER_BIND_HOST = previousBindHost
+		fs.rmSync(root, { recursive: true, force: true })
+	}
 })
 
 test("fleet Muse mutation forwards its profile into the real guest environment gate", async () => {
