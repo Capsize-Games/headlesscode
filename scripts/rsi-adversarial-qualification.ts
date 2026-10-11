@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url"
 
 import { OpenRouterClient, type OpenRouterGenerationMetadata } from "../src/llm/openrouter.js"
 import { DEFAULT_PROTECTED_PATHS } from "../src/rsi/config.js"
-import { requestAdversarialReview } from "../src/rsi/adversarial.js"
+import { ADVERSARIAL_COMMAND, requestAdversarialReview } from "../src/rsi/adversarial.js"
 import { RSI_MUSE_OPENROUTER_MODEL, RSI_OPENROUTER_PROFILES } from "../src/rsi/inference-broker.js"
 import { PostgresRsiJobQueue, fleetQueuePolicy, type FleetJob, type FleetJobIdentity, type FleetJobPayload } from "../src/rsi/postgres-queue.js"
 import { runRsi } from "../src/rsi/controller.js"
@@ -248,6 +248,19 @@ export function verifyControllerGate(run: RsiRunRecord, reviewStatus: string, te
 	return { gateMatched, selectionMatched, expectedAdversarialPass }
 }
 
+/** A rejected candidate alone cannot qualify a broken evaluator as a counterexample. */
+export function assertControlledCounterexample(output: Buffer): void {
+	const records: unknown = JSON.parse(output.toString("utf8"))
+	if (!Array.isArray(records)) throw new Error("controlled evaluator output must be an array")
+	const matches = records.filter((record) => record && typeof record === "object" && record.command === ADVERSARIAL_COMMAND)
+	if (matches.length !== 1) throw new Error("controlled evaluator output lacks one exact adversarial command")
+	const record = matches[0] as { stdout?: unknown; stderr?: unknown }
+	const text = [record.stdout, record.stderr].filter((value): value is string => typeof value === "string").join("\n")
+	if (!text.includes("AssertionError") || !text.includes("ERR_ASSERTION") || /ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND|SyntaxError|ReferenceError/.test(text)) {
+		throw new Error("controlled candidate did not produce an executed assertion counterexample")
+	}
+}
+
 function helpText(): string {
 	return [
 		"Usage: npx tsx scripts/rsi-adversarial-qualification.ts --receipt-signing-key <mode-0600-ed25519-key> --receipt-public-key-sha256 <sha256> --evaluator-trusted-public-key <mode-0600-public-key>",
@@ -394,6 +407,7 @@ export async function runAdversarialQualification(options: Required<Pick<Options
 	artifactRefs["controller-run.json"] = await writePrivateFile(artifactsDir, "controller-run.json", JSON.stringify(run, null, 2) + "\n")
 	const archiveBytes = await fs.readFile(path.join(config.archiveDir, "archive.json"))
 	artifactRefs["controller-archive.json"] = await writePrivateFile(artifactsDir, "controller-archive.json", archiveBytes)
+	assertControlledCounterexample(openShellOutput)
 	const candidateGate = candidate.fitness?.hardGates.adversarialPass
 	const payload: Record<string, unknown> = {
 		protocol: REVIEWER_QUALIFICATION_LIMITS.protocol,

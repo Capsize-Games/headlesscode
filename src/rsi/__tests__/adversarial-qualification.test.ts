@@ -4,7 +4,8 @@ import * as fs from "node:fs/promises"
 import { execFileSync } from "node:child_process"
 import * as path from "node:path"
 
-import { ADVERSARIAL_QUALIFICATION_MAX_RUNTIME_MS, REVIEWER_QUALIFICATION_LIMITS, assertReviewerBillingTokens, captureReviewerExchange, createQualificationHttpDeadlines, createSyntheticWorkspace, ensurePrivateDirectory, parseQualificationArgs, signReceipt, verifyControllerGate, verifyReceipt } from "../../../scripts/rsi-adversarial-qualification.js"
+import { ADVERSARIAL_QUALIFICATION_MAX_RUNTIME_MS, REVIEWER_QUALIFICATION_LIMITS, assertControlledCounterexample, assertReviewerBillingTokens, captureReviewerExchange, createQualificationHttpDeadlines, createSyntheticWorkspace, ensurePrivateDirectory, parseQualificationArgs, signReceipt, verifyControllerGate, verifyReceipt } from "../../../scripts/rsi-adversarial-qualification.js"
+import { ADVERSARIAL_COMMAND } from "../adversarial.js"
 import type { RsiRunRecord } from "../types.js"
 
 function pin(publicKey: ReturnType<typeof createPublicKey>): string {
@@ -44,6 +45,14 @@ assert.doesNotThrow(() => assertReviewerBillingTokens(nativeUsage, nativeBilling
 assert.throws(() => assertReviewerBillingTokens(nativeUsage, { ...nativeBilling, nativeTokensPrompt: 863 }), /do not match/)
 assert.throws(() => assertReviewerBillingTokens({ completionTokens: 66 }, nativeBilling), /do not match/)
 assert.doesNotThrow(() => assertReviewerBillingTokens(nativeUsage, { id: "legacy", tokensPrompt: 862, tokensCompletion: 66 }))
+
+const evaluatorOutput = (stdout: string) => Buffer.from(JSON.stringify([{ command: ADVERSARIAL_COMMAND, stdout, stderr: "" }]))
+assert.doesNotThrow(() => assertControlledCounterexample(evaluatorOutput("AssertionError [ERR_ASSERTION]: 150 !== 100\nexitCode=1")))
+assert.throws(() => assertControlledCounterexample(evaluatorOutput("Error [ERR_MODULE_NOT_FOUND]: Cannot find runner\nexitCode=1")), /executed assertion/)
+assert.throws(() => assertControlledCounterexample(evaluatorOutput("SyntaxError: invalid runner\nexitCode=1")), /executed assertion/)
+assert.throws(() => assertControlledCounterexample(evaluatorOutput("all tests passed")), /executed assertion/)
+assert.throws(() => assertControlledCounterexample(Buffer.from("[]")), /exact adversarial command/)
+assert.throws(() => assertControlledCounterexample(Buffer.from(JSON.stringify([{ command: ADVERSARIAL_COMMAND, stdout: "AssertionError ERR_ASSERTION" }, { command: ADVERSARIAL_COMMAND, stdout: "AssertionError ERR_ASSERTION" }]))), /exact adversarial command/)
 
 const pair = generateKeyPairSync("ed25519")
 const privateKey = createPrivateKey(pair.privateKey.export({ type: "pkcs8", format: "pem" }))
