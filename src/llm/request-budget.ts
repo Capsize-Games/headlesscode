@@ -200,5 +200,5 @@ export function packRequestBody(body: Record<string, unknown>, maxBytes: number)
 			high = middle
 		}
 	}
-	return { ...best, evictedGroups, truncatedToolResults: toolIndexes.length }
+	return { ...best, evictedGroups, truncatedToolResults: retainedCaps.filter((cap) => cap !== undefined).length }
 }
