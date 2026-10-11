@@ -76,11 +76,43 @@ try {
 	process.exit(2)
 }
 
-// The wrapper blocks on this private pipe until its exact OS identity has been
-// persisted. User task code cannot run before that boundary is established.
+// The wrapper remains blocked on this private pipe until run-worker has
+// verified the launch receipt and written a matching acknowledgment. This
+// keeps the supervisor alive across very fast CLI exits and prevents task code
+// from running before the dispatcher accepts the captured identity.
 const closed = new Promise((resolve) => {
 	child.once("close", (code, signal) => resolve({ code, signal }))
 })
+const acknowledgementPath = path.join(receiptDir, `${group}.ack`)
+function readMatchingAcknowledgement() {
+	try {
+		const stat = fs.lstatSync(acknowledgementPath)
+		if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 2048 || (stat.mode & 0o077) !== 0 || (typeof process.getuid === "function" && stat.uid !== process.getuid())) return false
+		const value = JSON.parse(fs.readFileSync(acknowledgementPath, "utf8"))
+		return value.version === identity.version && value.attemptId === identity.attemptId && value.group === identity.group &&
+			value.pid === identity.pid && value.pgid === identity.pgid && value.startTicks === identity.startTicks
+	} catch { return false }
+}
+let acknowledged = false
+const acknowledgementDeadline = Date.now() + 3_000
+while (Date.now() < acknowledgementDeadline) {
+	if (readMatchingAcknowledgement()) { acknowledged = true; break }
+	await new Promise((resolve) => setTimeout(resolve, 10))
+}
+if (!acknowledged) {
+	try { process.kill(-identity.pgid, "SIGKILL") } catch { /* gated child may already be gone */ }
+	child.stdio[3].destroy()
+	const status = await closed
+	let teardown = "unknown"
+	while (teardown !== "absent") {
+		try { teardown = groupState(identity.pgid, identity.startTicks) } catch { teardown = "unknown" }
+		if (teardown !== "absent") await new Promise((resolve) => setTimeout(resolve, 100))
+	}
+	atomicReceipt(path.join(receiptDir, `${group}.complete`), { ...identity, exitCode: 125 })
+	try { fs.unlinkSync(wrapperPath) } catch { /* timeout receipt remains authoritative */ }
+	fs.closeSync(logFd)
+	process.exit(2)
+}
 child.stdio[3].end("go\n")
 const status = await closed
 let teardown = "unknown"

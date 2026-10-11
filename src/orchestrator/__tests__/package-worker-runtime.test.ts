@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
-import { execFileSync, spawnSync } from "node:child_process"
+import { execFileSync, spawn, spawnSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { setTimeout as delay } from "node:timers/promises"
 
@@ -45,6 +45,15 @@ async function waitForJobReceipt(receiptDir: string, group: string): Promise<Rec
 		catch { await delay(20) }
 	}
 	throw new Error(`packed supervisor did not write a completion receipt for ${group}`)
+}
+
+async function waitForJobLaunch(receiptDir: string, group: string): Promise<Record<string, unknown>> {
+	const deadline = Date.now() + 5_000
+	while (Date.now() < deadline) {
+		try { return JSON.parse(await fs.readFile(path.join(receiptDir, `${group}.launch`), "utf8")) as Record<string, unknown> }
+		catch { await delay(10) }
+	}
+	throw new Error(`packed supervisor did not write a launch receipt for ${group}`)
 }
 
 try {
@@ -110,6 +119,39 @@ try {
 	assert.match(builtinArgs, /--task /)
 	assert.match(builtinArgs, /--workspace /)
 
+	const timeoutWorkspace = path.join(scratch, "job-timeout-workspace")
+	const timeoutReceipts = path.join(scratch, "job-timeout-receipts")
+	const timeoutWrapper = path.join(scratch, "job-timeout-wrapper.sh")
+	const timeoutStarted = path.join(scratch, "job-timeout-started")
+	await fs.mkdir(timeoutWorkspace)
+	await fs.mkdir(timeoutReceipts, { mode: 0o700 })
+	await writeExecutable(timeoutWrapper, `#!/bin/bash\nread -r _ <&3 || exit 125\nprintf started > "${timeoutStarted}"\n`)
+	const timeoutAttempt = "723e4567-e89b-12d3-a456-426614174000"
+	const unacknowledged = spawn(process.execPath, [unpackedSupervisor, timeoutWorkspace, timeoutReceipts, timeoutAttempt, "timeout-group", timeoutWrapper], {
+		cwd: scratch,
+		stdio: "ignore",
+		timeout: 10_000,
+		env: scrubbedEnv,
+	})
+	const timeoutLaunch = await waitForJobLaunch(timeoutReceipts, "timeout-group")
+	await fs.writeFile(path.join(timeoutReceipts, "timeout-group.ack"), JSON.stringify({
+		...timeoutLaunch,
+		pid: Number(timeoutLaunch.pid) + 1,
+		pgid: Number(timeoutLaunch.pgid) + 1,
+	}), { mode: 0o600 })
+	const unacknowledgedStatus = await new Promise<number | null>((resolve, reject) => {
+		unacknowledged.once("error", reject)
+		unacknowledged.once("close", (code) => resolve(code))
+	})
+	assert.equal(unacknowledgedStatus, 2, "a mismatched dispatcher acknowledgment fails closed")
+	const timeoutCompletion = JSON.parse(await fs.readFile(path.join(timeoutReceipts, "timeout-group.complete"), "utf8")) as Record<string, unknown>
+	assert.equal(timeoutCompletion.attemptId, timeoutAttempt)
+	assert.equal(timeoutCompletion.exitCode, 125, "acknowledgment timeout is recorded as a startup failure after teardown")
+	const timeoutPgid = Number(timeoutCompletion.pgid)
+	assert.ok(Number.isSafeInteger(timeoutPgid) && timeoutPgid > 1)
+	assert.throws(() => process.kill(-timeoutPgid, 0), { code: "ESRCH" }, "the gated process group is gone before timeout completion is recorded")
+	await assert.rejects(fs.access(timeoutStarted), "the worker wrapper remains gated until a matching acknowledgment is received")
+
 	const jobWorkspace = path.join(scratch, "job-workspace")
 	const jobReceipts = path.join(scratch, "job-receipts")
 	await fs.mkdir(jobWorkspace)
@@ -130,6 +172,13 @@ try {
 	assert.equal(jobCompletion.pid, jobLaunch.pid)
 	assert.equal(jobCompletion.startTicks, jobLaunch.startTicks)
 	assert.equal(jobCompletion.exitCode, 7, "supervisor records actual child exit status")
+	const duplicateAttempt = spawnSync("bash", [path.join(unpackedPackage, "scripts/run-worker.sh"), jobWorkspace, "CPU mock task", "--executor", "builtin"], {
+		cwd: scratch,
+		encoding: "utf8",
+		env: { ...scrubbedEnv, HEADLESSCODE_ROOT: unpackedPackage, HEADLESSCODE_CLI: jobCli, HEADLESSCODE_JOB_ATTEMPT: jobAttempt, HEADLESSCODE_JOB_RECEIPT_DIR: jobReceipts },
+	})
+	assert.notEqual(duplicateAttempt.status, 0, "a second launch cannot reuse an attempt receipt and acknowledgment")
+	assert.equal((await fs.readdir(jobReceipts)).filter((name) => name === "job-workspace.launch").length, 1)
 
 	const fakeBin = path.join(scratch, "fake-bin")
 	await fs.mkdir(fakeBin)
