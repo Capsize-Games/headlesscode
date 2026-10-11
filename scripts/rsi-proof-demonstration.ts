@@ -173,7 +173,7 @@ export async function readProtectedProofInput(repoRoot: string, input: string, m
 	const leaf = await fs.lstat(absolute)
 	if (leaf.isSymbolicLink()) throw new Error("proof input must not be a symlink")
 	if (!leaf.isFile()) throw new Error("proof input must be a regular file")
-	if (typeof fsConstants.O_NOFOLLOW !== "number") throw new Error("proof input reads require platform O_NOFOLLOW support")
+	if (!Number.isInteger(fsConstants.O_NOFOLLOW) || fsConstants.O_NOFOLLOW === 0) throw new Error("proof input reads require platform O_NOFOLLOW support")
 	const handle = await fs.open(absolute, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | (fsConstants.O_NONBLOCK ?? 0))
 	try {
 		const before = await handle.stat({ bigint: true })

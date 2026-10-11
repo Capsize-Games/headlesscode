@@ -46,7 +46,7 @@ async function assertNoSymlinkPath(target: string): Promise<void> {
 
 async function readProtectedPolicy(target: string): Promise<Buffer> {
 	await assertNoSymlinkPath(target)
-	if (typeof constants.O_NOFOLLOW !== "number") throw new Error("OpenShell policy reads require platform O_NOFOLLOW support")
+	if (!Number.isInteger(constants.O_NOFOLLOW) || constants.O_NOFOLLOW === 0) throw new Error("OpenShell policy reads require platform O_NOFOLLOW support")
 	const flags = constants.O_RDONLY | constants.O_NOFOLLOW | (constants.O_NONBLOCK ?? 0)
 	const handle = await fs.open(target, flags)
 	try {
