@@ -27,6 +27,7 @@ export function formatRunReport(run: RsiRunRecord, config: RsiConfig): string {
 		"",
 		`- Model: ${run.model}`,
 		`- Base commit: ${run.baseCommit}`,
+		`- Evaluator integrity: ${run.evaluatorIntegrity?.status ?? "unsealed historical record"}${run.evaluatorIntegrity?.status === "sealed" ? `; key=${run.evaluatorIntegrity.keyId}; input=${run.evaluatorIntegrity.inputSha256}; manifest=${run.evaluatorIntegrity.manifestSha256}` : "; no independently signed integrity seal"}`,
 		`- Worker harness: mode=${run.workerHarnessMode ?? "fixed-control"}; pair=${run.workerHarnessPairId ?? "unpaired"}; plannedGenerations=${run.workerHarnessPlannedGenerations ?? run.generations}; configDigest=${run.workerHarnessConfigDigest ?? "unavailable"}; samplingSeed=${run.workerHarnessSamplingSeed ?? "unavailable"}${run.workerHarnessRuntime ? `; image=${run.workerHarnessRuntime.imageDigest}; harnessCommit=${run.workerHarnessRuntime.harnessCommit}; dependencyLock=${run.workerHarnessRuntime.dependencyLockDigest}` : ""}`,
 		`- Development proof: ${run.developmentProofProtocol ? `frozen protocol ${run.developmentProofProtocol.protocolDigest}; ${run.developmentProofProtocol.taskIds.length} development tasks; minimum net wins ${run.developmentProofProtocol.rule.minimumNetWins}; retention tasks ${run.developmentProofProtocol.rule.retentionTaskIds.join(", ")}; maximum mean-token increase ratio ${run.developmentProofProtocol.rule.maximumMeanTokenIncreaseRatio}` : "unavailable"}`,
 		`- Confirmation evidence: ${run.confirmationEvidence ?? "unmeasured"}`,

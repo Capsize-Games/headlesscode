@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
+import { createHash, generateKeyPairSync } from "node:crypto"
 import { execFileSync } from "node:child_process"
 import * as fs from "node:fs/promises"
-import * as os from "node:os"
 import * as path from "node:path"
 import { checkpointRun } from "../archive.js"
 import { runRsi } from "../controller.js"
@@ -16,8 +16,12 @@ function ok(command: string): TrialResult {
 }
 
 async function main(): Promise<void> {
-	const repo = await fs.mkdtemp(path.join(os.tmpdir(), "hc-rsi-worker-harness-controller-"))
+	const scratch = path.resolve(".headlesscode/scratch")
+	await fs.mkdir(scratch, { recursive: true, mode: 0o700 })
+	const root = await fs.mkdtemp(path.join(scratch, "hc-rsi-worker-harness-controller-"))
+	const repo = path.join(root, "repo")
 	try {
+		await fs.mkdir(repo, { recursive: true })
 		execFileSync("git", ["init", "-q"], { cwd: repo })
 		execFileSync("git", ["config", "user.email", "rsi@example.invalid"], { cwd: repo })
 		execFileSync("git", ["config", "user.name", "RSI Test"], { cwd: repo })
@@ -32,6 +36,14 @@ async function main(): Promise<void> {
 			harnessCommit: "e".repeat(40),
 			dependencyLockDigest: "f".repeat(64),
 		}
+		const keys = path.join(root, "operator-keys")
+		await fs.mkdir(keys, { mode: 0o700 })
+		const keyPair = generateKeyPairSync("ed25519")
+		const signingKey = path.join(keys, "signing.pem")
+		const trustedKey = path.join(keys, "trusted.pem")
+		await fs.writeFile(signingKey, keyPair.privateKey.export({ format: "pem", type: "pkcs8" }), { mode: 0o600 })
+		await fs.writeFile(trustedKey, keyPair.publicKey.export({ format: "pem", type: "spki" }), { mode: 0o600 })
+		const trustedPin = `sha256:${createHash("sha256").update(keyPair.publicKey.export({ format: "der", type: "spki" })).digest("hex")}`
 		const config: RsiConfig = {
 			repoRoot: repo, model: "proof-model", population: 1, generations: 2, maxConcurrent: 1,
 			mutationTask: "add a small incremental improvement", regressionCommand: "npm test", evalCommands: ["visible"], hiddenEvalCommands: [],
@@ -39,6 +51,9 @@ async function main(): Promise<void> {
 			dryRun: false, keepWorktrees: false, maxIterations: 2, maxTokens: 256, protectedPaths: [".env", "docker/", ".dockerignore"], commandTimeoutMs: 1000,
 			workerHarnessMode: "self-hosted",
 			workerHarnessRuntime: runtime,
+			evaluatorSigningKeyPath: signingKey,
+			evaluatorTrustedPublicKeyPath: trustedKey,
+			evaluatorTrustedKeySha256: trustedPin,
 		}
 		await assert.rejects(
 			runRsi({ ...config, workerHarnessPairId: `rsi-proof-${"a".repeat(20)}`, workerHarnessRunId: `rsi-proof-${"b".repeat(20)}-self` }, { log: () => undefined }),
@@ -124,7 +139,7 @@ async function main(): Promise<void> {
 		)
 		console.log("Controller selected-parent worker harness assertions passed")
 	} finally {
-		await fs.rm(repo, { recursive: true, force: true })
+		await fs.rm(root, { recursive: true, force: true })
 	}
 }
 

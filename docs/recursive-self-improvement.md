@@ -38,6 +38,27 @@ does not claim that `/workspace` is its only writable location. A pass is
 specific to the gateway and image used for that run; mocked provider tests are
 not a substitute for this guest check.
 
+## Evaluator integrity seals
+
+Paired worker-harness, hidden-evaluator, and adversarial qualification runs
+require an Ed25519 evaluator signing key, an independently configured trusted
+public key, and its `sha256:<hex>` DER-SPKI pin. Pass them with
+`--evaluator-signing-key`, `--evaluator-trusted-public-key`, and
+`--evaluator-trusted-key-sha256`. Both key files must be regular files with
+mode `0600` or stricter and remain outside the repository, RSI archive, and
+candidate worktree. The public key and pin must come from the operator's trust
+configuration; the run does not establish its own trust.
+
+The seal binds the evaluator source and runtime inputs, base tree, effective
+commands and settings, evaluation output identities, and generation decisions.
+The manifest is signed before each archive checkpoint that updates this state.
+Resume verifies the independent pin and sealed archive state before dispatching
+more work or accepting a selection. A changed source, trust key, output, or
+selection fails closed. Historical records without a seal remain explicitly
+unsealed; they cannot be retroactively sealed, and attested runs cannot resume
+from an unsealed record. Ordinary runs without configured trust are reported
+as unsealed.
+
 ## Earlier bounded runs (historical)
 
 Before the fail-closed mutation runner was added, RSI ran bounded local Qwen

@@ -1,11 +1,12 @@
 import assert from "node:assert/strict"
+import { createHash, generateKeyPairSync } from "node:crypto"
 import { execFileSync } from "node:child_process"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 import { checkpointRun, readArchive } from "../archive.js"
 import { runRsi } from "../controller.js"
-import type { RsiConfig, TrialResult } from "../types.js"
+import type { CandidateRecord, RsiConfig, TrialResult } from "../types.js"
 import { fakeDevelopmentBenchmarkHook } from "./development-proof-fixture.js"
 
 function ok(command: string, durationMs = 1): TrialResult {
@@ -80,6 +81,70 @@ async function main(): Promise<void> {
 	}
 	console.log("All 7 RSI controller assertions passed")
 	await testAuthoritativeDevelopmentProofControlsParentSelection()
+	await testSealedEvaluatorResumeRejectsDrift()
+}
+
+async function testSealedEvaluatorResumeRejectsDrift(): Promise<void> {
+	const scratch = path.resolve(".headlesscode/scratch")
+	await fs.mkdir(scratch, { recursive: true, mode: 0o700 })
+	const root = await fs.mkdtemp(path.join(scratch, "hc-rsi-sealed-resume-"))
+	try {
+		const repo = path.join(root, "repo")
+		const archiveDir = path.join(repo, ".rsi-archive")
+		const worktreeDir = path.join(repo, ".rsi-worktrees")
+		const keys = path.join(root, "operator-keys")
+		await fs.mkdir(path.join(repo, "src"), { recursive: true })
+		await fs.mkdir(keys, { mode: 0o700 })
+		execFileSync("git", ["init", "-q"], { cwd: repo })
+		execFileSync("git", ["config", "user.email", "rsi@example.invalid"], { cwd: repo })
+		execFileSync("git", ["config", "user.name", "RSI Test"], { cwd: repo })
+		await fs.writeFile(path.join(repo, "src", "agent.ts"), "export const baseline = true\n")
+		execFileSync("git", ["add", "."], { cwd: repo })
+		execFileSync("git", ["commit", "-qm", "baseline"], { cwd: repo })
+		const keyPair = generateKeyPairSync("ed25519")
+		const signingKey = path.join(keys, "signing.pem")
+		const trustedKey = path.join(keys, "trusted.pem")
+		const trustedPem = keyPair.publicKey.export({ format: "pem", type: "spki" })
+		await fs.writeFile(signingKey, keyPair.privateKey.export({ format: "pem", type: "pkcs8" }), { mode: 0o600 })
+		await fs.writeFile(trustedKey, trustedPem, { mode: 0o600 })
+		const trustedPin = `sha256:${createHash("sha256").update(keyPair.publicKey.export({ format: "der", type: "spki" })).digest("hex")}`
+		const config = {
+			repoRoot: repo, model: "fixture-model", population: 1, generations: 1, maxConcurrent: 1,
+			mutationTask: "fixture mutation", regressionCommand: "npm test", evalCommands: ["visible"], hiddenEvalCommands: [],
+			archiveDir, worktreeDir, baseRef: "HEAD", seed: "sealed-resume-test", dryRun: false, keepWorktrees: false,
+			maxIterations: 1, protectedPaths: [".env", ".rsi-archive/", ".rsi-worktrees/"], commandTimeoutMs: 1_000,
+			evaluatorSigningKeyPath: signingKey, evaluatorTrustedPublicKeyPath: trustedKey, evaluatorTrustedKeySha256: trustedPin,
+		} satisfies RsiConfig
+		const hooks = {
+			log: () => undefined,
+			runCommand: async (command: string) => ok(command),
+			runMutation: async (candidate: CandidateRecord) => {
+				await fs.writeFile(path.join(candidate.worktree, "src", "candidate.ts"), "export const changed = true\n")
+				execFileSync("git", ["add", "."], { cwd: candidate.worktree })
+				execFileSync("git", ["commit", "-qm", "candidate"], { cwd: candidate.worktree })
+				return { ok: true, result: ok("mutation") }
+			},
+			runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook(),
+		}
+		const run = await runRsi(config, hooks)
+		assert.equal(run.evaluatorIntegrity?.status, "sealed")
+		assert.ok(run.evaluatorIntegrity?.manifestPath)
+		const archivePath = path.join(archiveDir, "archive.json")
+		const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as { runs: typeof run[]; activeRuns: typeof run[] }
+		archive.runs = []
+		archive.activeRuns = [structuredClone(run)]
+		await fs.writeFile(archivePath, `${JSON.stringify(archive, null, 2)}\n`)
+		await assert.rejects(() => runRsi({ ...config, evaluatorSigningKeyPath: undefined, evaluatorTrustedPublicKeyPath: undefined, evaluatorTrustedKeySha256: undefined, resumeRunId: run.runId }, hooks), /sealed RSI run cannot resume without its independently pinned evaluator integrity trust/)
+
+		const active = structuredClone(archive.activeRuns[0]!)
+		active.candidates[0]!.fitness!.score += 1
+		archive.activeRuns = [active]
+		await fs.writeFile(archivePath, `${JSON.stringify(archive, null, 2)}\n`)
+		await assert.rejects(() => runRsi({ ...config, resumeRunId: run.runId }, hooks), /archived evaluator state changed since its last signed checkpoint/)
+		console.log("Sealed RSI resume rejects missing independent trust and changed archived evaluation state")
+	} finally {
+		await fs.rm(root, { recursive: true, force: true })
+	}
 }
 
 async function testAuthoritativeDevelopmentProofControlsParentSelection(): Promise<void> {
