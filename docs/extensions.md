@@ -13,11 +13,11 @@ and result path, applies the session's protected-file policy to every write,
 and stores a content-addressed revision. Inspecting an MCP extension starts
 its entrypoint to read its advertised tool names and schemas.
 
-For example, ask a coding session: "Create a reusable Node tool that counts
-the entries in a JSON object, then call it on this input." The agent creates
-a manifest and text files with `extension_manage`, reads the returned digest,
-and uses that exact digest with `extension_call`. No dependency installation
-is part of extension creation.
+For example, ask a session with workspace write and command execution tools:
+"Create a reusable Node tool that counts the entries in a JSON object, then
+call it on this input." The agent creates a manifest and text files with
+`extension_manage`, reads the returned digest, and uses that exact digest with
+`extension_call`. No dependency installation is part of extension creation.
 
 A minimal Node tool bundle has this shape:
 

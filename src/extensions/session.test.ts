@@ -94,7 +94,7 @@ async function testCodingSessionCreatesAndUsesPinnedSkillToolAndMcp(): Promise<v
 		const executor = createHeadlessExecutor(workspaceRoot, {
 			permissions: { allowedCommands: [], deniedCommands: [], protectedFiles: [".env", "*.key", "*.pem"], allowProtectedWrites: false },
 		})
-		const codeTools = appendExtensionTools(selectToolsForMode("code", []), { codingMode: true, canWrite: true, canExecute: true, explicitAllowlist: false })
+		const codeTools = appendExtensionTools(selectToolsForMode("code", []), { canWrite: true, canExecute: true, explicitAllowlist: false })
 		const result = await new HeadlessSession({
 			workspaceRoot,
 			mode: "code",
@@ -152,7 +152,7 @@ async function testRestrictedSessionDoesNotAdvertiseOrRegisterExtensionTools(): 
 		assert.equal(result.status, "success")
 		assert.equal(client.requests[0]?.tools?.some((entry) => entry.function.name.startsWith("extension_")), false)
 		const callResult = client.requests[1]?.messages.find((message) => message.role === "tool")
-		assert.match(callResult?.content ?? "", /available only in a coding session/)
+		assert.match(callResult?.content ?? "", /requires workspace write and command execution tools/)
 	} finally {
 		await fs.rm(workspaceRoot, { recursive: true, force: true })
 	}
@@ -182,7 +182,7 @@ async function testSessionStopReapsMcpDescendant(): Promise<void> {
 		const client = new ScriptedClient([
 			tool("extension_call", { id: revision.manifest.id, digest: revision.digest, input: {}, tool_name: "wait" }, "wait-call"),
 		])
-		const codeTools = appendExtensionTools(selectToolsForMode("code", []), { codingMode: true, canWrite: true, canExecute: true, explicitAllowlist: false })
+		const codeTools = appendExtensionTools(selectToolsForMode("code", []), { canWrite: true, canExecute: true, explicitAllowlist: false })
 		running = new HeadlessSession({
 			workspaceRoot,
 			mode: "code",

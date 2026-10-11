@@ -68,9 +68,9 @@ const extensionToolNames = new Set(["extension_manage", "extension_call"])
  */
 export function appendExtensionTools(
 	tools: ChatTool[],
-	options: { codingMode: boolean; canWrite: boolean; canExecute: boolean; explicitAllowlist: boolean; explicitToolNames?: readonly string[] },
+	options: { canWrite: boolean; canExecute: boolean; explicitAllowlist: boolean; explicitToolNames?: readonly string[] },
 ): ChatTool[] {
-	if (!options.codingMode || !options.canWrite || !options.canExecute) return tools
+	if (!options.canWrite || !options.canExecute) return tools
 	const byName = new Map(tools.filter((tool) => tool.type === "function").map((tool) => [tool.function.name, tool]))
 	const explicitNames = new Set(options.explicitToolNames ?? [])
 	const additions: ChatTool[] = []
