@@ -59,9 +59,9 @@ const SCREENSHOTS_SUBDIR = ".headlesscode/browser-screenshots"
  * object passed via ToolContext.browserSessionOwner) keeps independent
  * executors isolated even when they share a workspace root — a root-keyed map
  * let two executors replace one another's page and let an unrelated
- * executor's dispose close another executor's browser. A WeakMap gives
- * owning-session cleanup for free when an executor is dropped without
- * dispose(). Contexts without an owner (bare/direct handler calls) fall back
+ * executor's dispose close another executor's browser. Weak keys avoid
+ * retaining executor identities; browser process cleanup still requires
+ * explicit disposal or process teardown. Contexts without an owner fall back
  * to the legacy workspace-root map.
  */
 const browserSessions = new WeakMap<object, BrowserSession>()
