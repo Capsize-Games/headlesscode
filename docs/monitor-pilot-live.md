@@ -33,6 +33,8 @@ Summaries distinguish assigned slots that never started, completed runs that fai
 
 The automated tests inject synthetic clients and exercise only local fixtures. They make no network requests and are not evidence of model performance, provider billing, or cache reuse. A successful development threshold permits preparing the separately frozen four-arm held-out schedule; it does not itself authorize transfer claims or expand model authority.
 
+The random arm uses the fraction of assigned calibration trajectories with a learned trigger and the distribution of their first trigger boundaries. A trajectory with no trigger remains in that denominator. Memory reporting measures peak RSS of the whole runner process, including model messages and journals; it does not isolate predictor memory.
+
 After review of a `QUALIFIED` development artifact, the held-out runner verifies the journaled rows, refits the frozen learner deterministically, and freezes all 64 test assignments before the first request. The manifest records byte counts and SHA-256 digests for the live runner, simulator, feature and predictor logic, guardrails, analysis, journal, fixture definitions, engine message types, and OpenRouter request/budget shaping code. Resume and held-out collection require those source identities, fixture hashes, guardrail hash, and predictor digest to remain unchanged. The held-out command is:
 
 ```sh

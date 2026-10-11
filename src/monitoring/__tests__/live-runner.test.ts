@@ -4,10 +4,11 @@ import * as path from "node:path"
 import { randomUUID } from "node:crypto"
 
 import type { LlmRequest, LlmResponse } from "../../engine/types.js"
+import { MONITOR_FEATURE_ORDER, type FrozenPredictorArtifact } from "../types.js"
 import { sha256 } from "../features.js"
 import { DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD, identicalCallNudgeMessage } from "../guardrails.js"
 import { PilotJournal } from "../../../scripts/monitor-pilot/journal.js"
-import { collectLiveDevelopment, collectLiveHeldout, LIVE_DEVELOPMENT_SLOTS, LIVE_GUARDRAILS_HASH, LIVE_GUARDRAILS_MANIFEST, LIVE_MODEL, LIVE_TOOLS } from "../../../scripts/monitor-pilot/live-runner.js"
+import { collectLiveDevelopment, collectLiveHeldout, deriveCalibrationRandomSchedule, LIVE_DEVELOPMENT_SLOTS, LIVE_GUARDRAILS_HASH, LIVE_GUARDRAILS_MANIFEST, LIVE_MODEL, LIVE_TOOLS } from "../../../scripts/monitor-pilot/live-runner.js"
 
 type Reply = { readonly name: string; readonly args?: string; readonly content?: string }
 
@@ -102,9 +103,13 @@ async function testShortLabelWindowsAreMasked(): Promise<void> {
 		const journal = new PilotJournal(summary.journalPath)
 		await journal.open()
 		const first = journal.list().find((record) => record.type === "attempt_completed")!
-		const outcome = first.payload.outcome as { detectionLabels: readonly (0 | 1 | null)[]; stopReason: string }
+		const outcome = first.payload.outcome as { detectionLabels: readonly (0 | 1 | null)[]; stopReason: string; redundantCalls: number }
 		assert.deepEqual(outcome.detectionLabels, [1, null, null], "windows without three later uncorrected turns are masked, not negative")
 		assert.equal(outcome.stopReason, "identical-call-stop")
+		assert.equal(outcome.redundantCalls, 3)
+		const turns = journal.list().filter((record) => record.type === "virtual_turn" && record.attemptId === first.attemptId)
+		const ids = turns.flatMap((turn) => (turn.payload.calls as { id: string }[]).map((call) => call.id))
+		assert.equal(new Set(ids).size, ids.length, "tool evidence IDs remain unique across model turns")
 	} finally { await fs.rm(directory, { recursive: true, force: true }) }
 }
 
@@ -221,3 +226,18 @@ await testUncertainRequestIsNotAutomaticallyReplayed()
 await testHeldoutCannotStartWithoutQualifiedDevelopment()
 await testStorageRootSymlinkIsRejectedBeforeInference()
 console.log("live monitor pilot tests passed (synthetic billing; no network inference)")
+
+const featureValues = { identicalCallStreak: 0, sameToolErrorStreak: 0, readOnlyStreak: 0, uniqueCallFraction4: 0, errorFraction4: 0, turnsSinceSuccessfulVirtualWrite: 0, repeatedResultFraction4: 0, iterationBudgetFraction: 0 }
+const firstTriggerPredictor: FrozenPredictorArtifact = {
+	schemaVersion: 1, featureOrder: MONITOR_FEATURE_ORDER, coefficients: featureValues,
+	intercept: 2, standardization: { mean: featureValues, scale: { identicalCallStreak: 1, sameToolErrorStreak: 1, readOnlyStreak: 1, uniqueCallFraction4: 1, errorFraction4: 1, turnsSinceSuccessfulVirtualWrite: 1, repeatedResultFraction4: 1, iterationBudgetFraction: 1 } },
+	calibration: { intercept: 0, slope: 1 }, threshold: 0.5, l2: 1, modelDigest: "synthetic", templatesHash: "synthetic", artifactHash: "synthetic",
+}
+const firstTriggerSchedule = deriveCalibrationRandomSchedule([
+	{ features: featureValues, trajectoryId: "one", boundarySequence: 7 },
+	{ features: featureValues, trajectoryId: "one", boundarySequence: 2 },
+	{ features: featureValues, trajectoryId: "one", boundarySequence: 4 },
+	{ features: featureValues, trajectoryId: "two", boundarySequence: 5 },
+], firstTriggerPredictor, ["one", "two", "no-eligible-window", "no-trigger"])
+assert.deepEqual(firstTriggerSchedule, { probability: 0.5, distribution: [{ boundarySequence: 2, weight: 1 }, { boundarySequence: 5, weight: 1 }] }, "random timing matches first M triggers per assigned calibration trajectory, not the fraction of windows above threshold")
+console.log("live monitor calibration first-trigger tests passed")
