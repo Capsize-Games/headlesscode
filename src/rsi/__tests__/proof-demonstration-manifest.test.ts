@@ -4,7 +4,7 @@ import { freezeProofDemonstrationManifest, frozenProofConfigDigest, verifyFrozen
 import type { ProofDemonstrationPlan } from "../proof-demonstration-plan.js"
 import type { RsiConfig, WorkerHarnessRuntimeIdentity } from "../types.js"
 
-const config = { repoRoot: "/work", seed: "eng-seed", protectedPaths: ["src/rsi/"], mutationTask: "fixed objective" } as RsiConfig
+const config = { repoRoot: "/work", seed: "eng-seed", protectedPaths: ["src/rsi/"], mutationTask: "fixed objective", evaluatorTrustedKeySha256: `sha256:${"9".repeat(64)}` } as RsiConfig
 const plan = { totalRootSpendCeilingUsd: 9, engineeringRootSpendCeilingUsd: 1, campaignRootsSpendCeilingUsd: 8, totalCalls: 10, totalTokens: 100, totalTaskWallMs: 1000 } as ProofDemonstrationPlan
 const runtime: WorkerHarnessRuntimeIdentity = { imageName: "headlesscode-openshell-rsi:release", imageDigest: `sha256:${"a".repeat(64)}`, harnessCommit: "b".repeat(40), dependencyLockDigest: "c".repeat(64) }
 const limits = { campaignId: "plan-test", maxCalls: 2, maxInputTokensPerCall: 100, maxOutputTokensPerCall: 50, maxTotalTokens: 300, maxDurationMs: 1000, maxRequestBytes: 1000, maxResponseBytes: 1000, maxInputPricePerMillionUsd: 0.2, maxOutputPricePerMillionUsd: 0.3, maxCallSpendUsd: 0.01, maxJobSpendUsd: 0.02, maxCampaignSpendUsd: 1 }
@@ -36,4 +36,14 @@ test("frozen demonstration manifest verifies exact config, schedule, endpoint pr
 test("frozen plan rejects a cap below reservations and price ceilings below observed endpoint rates", () => {
 	assert.throws(() => frozen(7), /below the three frozen campaign roots reservation/)
 	assert.throws(() => frozen(9, { input: 0.01, output: 0.01 }), /price ceilings do not cover/)
+})
+
+test("frozen plan pins one evaluator key without publishing operator key paths", () => {
+	const valid = frozen()
+	assert.equal(valid.execution.configs[0]!.evaluatorTrustedKeySha256, config.evaluatorTrustedKeySha256)
+	assert.equal("evaluatorSigningKeyPath" in valid.execution.configs[0]!, false)
+	assert.equal("evaluatorTrustedPublicKeyPath" in valid.execution.configs[0]!, false)
+	const { schemaVersion: _schemaVersion, digestSha256: _digestSha256, ...body } = valid
+	const configs = valid.execution.configs.map((entry) => ({ ...entry, evaluatorSigningKeyPath: "/private/operator/key.pem" })) as unknown as typeof valid.execution.configs
+	assert.throws(() => freezeProofDemonstrationManifest({ ...body, execution: { ...valid.execution, configs, configSha256: frozenProofConfigDigest(configs) } }), /must not freeze evaluator key paths/)
 })

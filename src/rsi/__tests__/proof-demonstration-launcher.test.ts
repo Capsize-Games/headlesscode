@@ -3,15 +3,78 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 import test from "node:test"
-import { createHash } from "node:crypto"
+import { createHash, generateKeyPairSync } from "node:crypto"
 import { appendRun } from "../archive.js"
 import type { RsiConfig, RsiRunRecord, WorkerHarnessRuntimeIdentity } from "../types.js"
-import { assertEngineeringTransition, isFullyConfirmedRun, runEngineeringArm, runFrozenCampaignArm } from "../../../scripts/rsi-proof-demonstration.js"
+import { assertEngineeringTransition, isFullyConfirmedRun, parseProofDemonstrationArgs, runEngineeringArm, runFrozenCampaignArm, validateRuntimeEvaluatorIntegrity } from "../../../scripts/rsi-proof-demonstration.js"
 import type { FrozenProofDemonstrationManifest } from "../proof-demonstration-manifest.js"
 import { proofCampaignManifestDigest, type ProofCampaignManifest } from "../proof-campaign.js"
 import { RSI_OPENROUTER_MODEL } from "../inference-broker.js"
 
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex")
+
+test("proof engineering estimates need no evaluator keys; attested CLI options are parsed as protected paths and pin", () => {
+	const estimate = parseProofDemonstrationArgs(["engineering", "--seed", "estimate-seed"])
+	assert.equal(estimate.evaluatorSigningKeyPath, undefined, "inference-free estimates do not need dummy trust material")
+	const production = parseProofDemonstrationArgs([
+		"engineering", "--seed", "prod-seed", "--execute",
+		"--evaluator-signing-key", "/operator/private/evaluator.pem",
+		"--evaluator-trusted-public-key", "/operator/trust/evaluator.pub.pem",
+		"--evaluator-trusted-key-sha256", `sha256:${"a".repeat(64)}`,
+	])
+	assert.equal(production.evaluatorSigningKeyPath, path.resolve("/operator/private/evaluator.pem"))
+	assert.equal(production.evaluatorTrustedPublicKeyPath, path.resolve("/operator/trust/evaluator.pub.pem"))
+	assert.equal(production.evaluatorTrustedKeySha256, `sha256:${"a".repeat(64)}`)
+	assert.throws(() => parseProofDemonstrationArgs(["execute", "--plan", "/plan.json", "--execute", "--evaluator-trusted-key-sha256", `sha256:${"a".repeat(64)}`]), /requires --evaluator-signing-key/)
+})
+
+test("runtime trust forwarding verifies the pinned public key and rejects a changed pin locally", async () => {
+	const root = await fs.mkdtemp(path.join("/var/tmp", "rsi-proof-runtime-trust-"))
+	try {
+		const keyPair = generateKeyPairSync("ed25519")
+		const privatePath = path.join(root, "signing.pem")
+		const publicPath = path.join(root, "trusted.pem")
+		await fs.writeFile(privatePath, keyPair.privateKey.export({ format: "pem", type: "pkcs8" }), { mode: 0o600 })
+		await fs.writeFile(publicPath, keyPair.publicKey.export({ format: "pem", type: "spki" }), { mode: 0o600 })
+		const pin = `sha256:${createHash("sha256").update(keyPair.publicKey.export({ format: "der", type: "spki" })).digest("hex")}`
+		const config = { repoRoot: process.cwd(), archiveDir: path.join(process.cwd(), ".headlesscode", "scratch", "proof-trust-archive"), worktreeDir: path.join(process.cwd(), ".headlesscode", "scratch", "proof-trust-worktrees") } as RsiConfig
+		const options = { evaluatorSigningKeyPath: privatePath, evaluatorTrustedPublicKeyPath: publicPath, evaluatorTrustedKeySha256: pin }
+		const runtimeConfig = await validateRuntimeEvaluatorIntegrity(config, options)
+		assert.equal(runtimeConfig.evaluatorTrustedKeySha256, pin)
+		assert.equal(runtimeConfig.evaluatorSigningKeyPath, privatePath)
+		await assert.rejects(() => validateRuntimeEvaluatorIntegrity(config, { ...options, evaluatorTrustedKeySha256: `sha256:${"0".repeat(64)}` }), /does not match its independently configured pin/)
+	} finally {
+		await fs.rm(root, { recursive: true, force: true })
+	}
+})
+
+test("frozen campaign execution forwards key paths at runtime while its manifest contains only the pin", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "rsi-proof-trust-forwarding-"))
+	try {
+		const pin = `sha256:${"a".repeat(64)}`
+		const config = { archiveDir: root, seed: "campaign-seed", evaluatorTrustedKeySha256: pin } as RsiConfig
+		const runtime: WorkerHarnessRuntimeIdentity = { imageName: "image", imageDigest: `sha256:${"b".repeat(64)}`, harnessCommit: "c".repeat(40), dependencyLockDigest: "d".repeat(64) }
+		const manifest = {
+			campaignIds: { campaigns: [`rsi-proof-${"d".repeat(20)}`] },
+			execution: { configs: [config, config, config, config] }, rootCommit: "e".repeat(40), runtime,
+		} as unknown as FrozenProofDemonstrationManifest
+		const trustPaths = { evaluatorSigningKeyPath: "/operator/private/signing.pem", evaluatorTrustedPublicKeyPath: "/operator/trust/public.pem", evaluatorTrustedKeySha256: pin }
+		let received: RsiConfig | undefined
+		await runFrozenCampaignArm(manifest, 0, "fixed-control", "development", async (runtimeConfig) => {
+			received = runtimeConfig
+			const run = { runId: runtimeConfig.workerHarnessRunId, candidates: [], reports: [] } as unknown as RsiRunRecord
+			await appendRun(root, run)
+			return run
+		}, trustPaths)
+		assert.equal(received?.evaluatorSigningKeyPath, trustPaths.evaluatorSigningKeyPath)
+		assert.equal(received?.evaluatorTrustedPublicKeyPath, trustPaths.evaluatorTrustedPublicKeyPath)
+		assert.equal(received?.evaluatorTrustedKeySha256, pin)
+		assert.equal(config.evaluatorSigningKeyPath, undefined)
+		assert.equal(config.evaluatorTrustedPublicKeyPath, undefined)
+	} finally {
+		await fs.rm(root, { recursive: true, force: true })
+	}
+})
 
 test("engineering verifier requires a terminal fixed-control generation-one decision", () => {
 	const parentCommit = "1".repeat(40)
