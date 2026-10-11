@@ -6,9 +6,12 @@
  */
 
 import assert from "node:assert/strict"
+import * as fs from "node:fs"
+import * as path from "node:path"
 import { estimateCost } from "../../budget/cost.js"
 
 import { buildRequestBody, isRetryableOpenRouterError, OpenRouterClient, OpenRouterError, parseReasoningEffort } from "../openrouter.js"
+import { PromptByteBudgetError } from "../request-budget.js"
 import type { LlmRequest } from "../../engine/types.js"
 
 const baseRequest: LlmRequest = {
@@ -72,6 +75,156 @@ async function testMuseQualificationPinsOnlyMetaWithoutFallback(): Promise<void>
 	const body = buildRequestBody({ ...baseRequest, providerOnly: "meta" }, "meta/muse-spark-1.3-contributor")
 	assert.deepEqual(body.provider, { only: ["meta"], allow_fallbacks: false })
 	assert.throws(() => buildRequestBody({ ...baseRequest, providerOnly: "meta" }, "another/model"), /supported only for Meta-routed Muse/)
+}
+
+function captureChatRequest(client: OpenRouterClient, request: LlmRequest): Promise<{ body: Record<string, any>; json: string; calls: number }> {
+	const originalFetch = globalThis.fetch
+	let body: Record<string, any> | undefined
+	let json = ""
+	let calls = 0
+	globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+		calls++
+		json = String(init?.body ?? "")
+		body = JSON.parse(json)
+		if (request.stream) {
+			return new Response('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', { status: 200, headers: { "content-type": "text/event-stream" } })
+		}
+		return new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content: "ok" } }] }), { status: 200 })
+	}) as typeof fetch
+	return client.createChatCompletion(request).then(() => ({ body: body!, json, calls })).finally(() => { globalThis.fetch = originalFetch })
+}
+
+async function testExactUtf8WireBoundaryForStreamAndNonStream(): Promise<void> {
+	const cacheRoutingKey = "hc-123e4567-e89b-42d3-a456-426614174000"
+	const tools = [{ type: "function" as const, function: { name: "read_file", description: "read \"quoted\" paths", parameters: { type: "object", properties: { path: { type: "string" } } } } }]
+	for (const stream of [false, true]) {
+		const request: LlmRequest = {
+			model: "meta/muse-spark-1.3-contributor",
+			messages: [
+				{ role: "system", content: "Keep 🙂, quotes \" and backslash \\ verbatim." },
+				{ role: "user", content: "Initial task\nDo not rewrite this prefix." },
+			],
+			tools,
+			cacheRoutingKey,
+			stream,
+		}
+		const expectedJson = JSON.stringify(buildRequestBody(request, request.model))
+		const exactBytes = Buffer.byteLength(expectedJson, "utf8")
+		const success = await captureChatRequest(new OpenRouterClient({ apiKey: "synthetic", baseUrl: "http://mock", maxPromptBytes: exactBytes }), request)
+		assert.equal(success.json, expectedJson, `${stream ? "stream" : "non-stream"} sends the exact measured JSON at the boundary`)
+		assert.equal(Buffer.byteLength(success.json, "utf8"), exactBytes)
+		assert.equal(success.body.prompt_cache_key, cacheRoutingKey)
+		assert.deepEqual(success.body.tools, tools, "tool schemas are not rewritten")
+		let calls = 0
+		const originalFetch = globalThis.fetch
+		globalThis.fetch = (async () => { calls++; return new Response("{}", { status: 200 }) }) as typeof fetch
+		try {
+			const client = new OpenRouterClient({ apiKey: "synthetic", baseUrl: "http://mock", maxPromptBytes: exactBytes - 1 })
+			await assert.rejects(client.createChatCompletion(request), /budget/)
+			assert.equal(calls, 0, "one byte below the mandatory request fails before transport")
+		} finally { globalThis.fetch = originalFetch }
+	}
+}
+
+async function testOversizedLatestToolGroupIsClippedWithoutMutatingEvidence(): Promise<void> {
+	const cacheRoutingKey = "hc-123e4567-e89b-42d3-a456-426614174000"
+	const tools = [{ type: "function" as const, function: { name: "read_file", parameters: { type: "object", properties: { path: { type: "string" } } } } }]
+	const latestCalls = Array.from({ length: 4 }, (_, index) => ({ id: `new-${index}`, type: "function" as const, function: { name: "read_file", arguments: JSON.stringify({ path: `file-${index}.ts`, retained: `arg-${index}` }) } }))
+	const messages: LlmRequest["messages"] = [
+		{ role: "system", content: "stable system prefix" },
+		{ role: "user", content: "stable first task" },
+		{ role: "assistant", content: null, tool_calls: [{ id: "old-call", type: "function", function: { name: "read_file", arguments: "{\"path\":\"old\"}" } }] },
+		{ role: "tool", tool_call_id: "old-call", name: "read_file", content: "old result" },
+		{ role: "assistant", content: null, tool_calls: latestCalls },
+		...latestCalls.map((call, index) => ({ role: "tool" as const, tool_call_id: call.id, name: "read_file", content: `${"x".repeat(29_990)}-${index}-é🙂-\\\"newline\n` })),
+	]
+	const request: LlmRequest = { model: "meta/muse-spark-1.3-contributor", messages, tools, cacheRoutingKey }
+	const original = JSON.stringify(messages)
+	const maxPromptBytes = 55_000
+	const result = await captureChatRequest(new OpenRouterClient({ apiKey: "synthetic", baseUrl: "http://mock", maxPromptBytes }), request)
+	assert.ok(Buffer.byteLength(result.json, "utf8") <= maxPromptBytes, "four large UTF-8 results fit the exact request budget")
+	assert.equal(JSON.stringify(messages), original, "packing never mutates engine messages or original tool evidence")
+	assert.deepEqual(result.body.messages.slice(0, 2), messages.slice(0, 2), "system and first-user prefix stay verbatim")
+	assert.equal(result.body.messages.some((message: { tool_call_id?: string }) => message.tool_call_id === "old-call"), false, "an older complete tool-call group is evicted as a unit")
+	const packedAssistant = result.body.messages.find((message: { role: string; tool_calls?: typeof latestCalls }) => message.role === "assistant" && message.tool_calls?.some((call) => call.id === "new-0"))
+	assert.ok(packedAssistant, "newest tool-call group remains")
+	assert.deepEqual(packedAssistant.tool_calls, latestCalls, "all tool IDs and arguments are unchanged")
+	const packedResults = result.body.messages.filter((message: { role: string; tool_call_id?: string }) => message.role === "tool")
+	assert.deepEqual(packedResults.map((message: { tool_call_id: string }) => message.tool_call_id), latestCalls.map((call) => call.id), "every retained call has exactly its matching result")
+	assert.ok(packedResults.every((message: { content: string }) => message.content.includes("shortened to fit the request byte budget")), "each shortened excerpt carries an explicit notice")
+	assert.ok(packedResults.every((message: { content: string }, index: number) => message.content.length < messages[index + 5]!.content!.length), "only transmitted tool-result copies are shortened")
+	assert.equal(result.body.prompt_cache_key, cacheRoutingKey, "cache routing key remains stable")
+	assert.deepEqual(result.body.tools, tools, "tool schemas remain verbatim")
+}
+
+async function testImpossiblePrefixAndInvalidBudgetsFailBeforeNetwork(): Promise<void> {
+	const request: LlmRequest = { model: "meta/muse-spark-1.3-contributor", messages: [{ role: "system", content: "mandatory system" }, { role: "user", content: "mandatory task" }] }
+	for (const maxPromptBytes of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+		assert.throws(() => new OpenRouterClient({ maxPromptBytes }), /positive safe integer/)
+	}
+	const previous = process.env.HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES
+	try {
+		process.env.HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES = "bad"
+		assert.throws(() => new OpenRouterClient(), /HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES/)
+		process.env.HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES = "0"
+		assert.throws(() => new OpenRouterClient(), /positive safe integer/)
+		delete process.env.HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES
+	} finally {
+		if (previous === undefined) delete process.env.HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES
+		else process.env.HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES = previous
+	}
+	let calls = 0
+	const originalFetch = globalThis.fetch
+	globalThis.fetch = (async () => { calls++; return new Response("{}", { status: 200 }) }) as typeof fetch
+	try {
+		const requiredBytes = Buffer.byteLength(JSON.stringify(buildRequestBody(request, request.model)), "utf8")
+		process.env.HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES = String(requiredBytes - 1)
+		try {
+			const envConfigured = new OpenRouterClient({ apiKey: "synthetic" })
+			await assert.rejects(envConfigured.createChatCompletion(request), /budget/)
+			assert.equal(calls, 0, "the byte limit is read from the documented environment variable")
+		} finally {
+			if (previous === undefined) delete process.env.HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES
+			else process.env.HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES = previous
+		}
+		const client = new OpenRouterClient({ apiKey: "synthetic", maxPromptBytes: 8 })
+		await assert.rejects(client.createChatCompletion(request), (error: unknown) => {
+			assert.ok(error instanceof PromptByteBudgetError, "budget preflight uses a distinct local error")
+			assert.equal(isRetryableOpenRouterError(error), false, "budget errors are not classified as retryable transport failures")
+			assert.match(error.message, /required prompt.*exceeding/)
+			return true
+		})
+		assert.equal(calls, 0, "an impossible required prefix makes no network request")
+		assert.equal(isRetryableOpenRouterError(new OpenRouterError("transport", undefined)), true, "ordinary transport failures remain retryable")
+	} finally { globalThis.fetch = originalFetch }
+}
+
+async function testTranscriptSeparatesPackedWireMessagesFromOriginalHistory(): Promise<void> {
+	const scratch = path.resolve(".headlesscode/scratch/openrouter-byte-budget-transcript")
+	fs.rmSync(scratch, { recursive: true, force: true })
+	fs.mkdirSync(scratch, { recursive: true })
+	const previous = process.env.HEADLESSCODE_CAPTURE_TRANSCRIPT_DIR
+	process.env.HEADLESSCODE_CAPTURE_TRANSCRIPT_DIR = scratch
+	const messages: LlmRequest["messages"] = [
+		{ role: "system", content: "system" },
+		{ role: "user", content: "task" },
+		{ role: "assistant", content: null, tool_calls: [{ id: "tc", type: "function", function: { name: "read_file", arguments: "{}" } }] },
+		{ role: "tool", tool_call_id: "tc", name: "read_file", content: "evidence-".repeat(500) },
+	]
+	const original = JSON.stringify(messages)
+	try {
+		await captureChatRequest(new OpenRouterClient({ apiKey: "synthetic", baseUrl: "http://mock", maxPromptBytes: 900 }), { model: "meta/muse-spark-1.3-contributor", messages })
+		const file = fs.readdirSync(scratch).find((entry) => entry.startsWith("openrouter-"))
+		assert.ok(file, "transcript was captured")
+		const record = JSON.parse(fs.readFileSync(path.join(scratch, file!), "utf8").trim())
+		assert.deepEqual(record.messages, record.wireRequest.messages, "transcript messages are the actual packed request view")
+		assert.deepEqual(record.originalMessages, messages, "the complete original engine history remains recorded")
+		assert.notEqual(JSON.stringify(record.messages), original, "packed transcript is distinguishable from full local evidence")
+	} finally {
+		if (previous === undefined) delete process.env.HEADLESSCODE_CAPTURE_TRANSCRIPT_DIR
+		else process.env.HEADLESSCODE_CAPTURE_TRANSCRIPT_DIR = previous
+		fs.rmSync(scratch, { recursive: true, force: true })
+	}
 }
 
 async function testOpenRouterUsageCostAndGenerationMetadataAreMapped(): Promise<void> {
@@ -742,6 +895,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["buildRequestBody emits max_tokens when set, omits it when unset", testRequestBodyEmitsMaxTokensWhenSet],
 	["opaque cache-routing key is forwarded as session_id and prompt_cache_key", testOpaqueCacheRoutingKeyIsForwardedWithoutIdentityData],
 	["Muse qualification pins to Meta with fallbacks disabled", testMuseQualificationPinsOnlyMetaWithoutFallback],
+	["exact UTF-8 request boundary is enforced for streaming and non-streaming JSON", testExactUtf8WireBoundaryForStreamAndNonStream],
+	["oversized latest tool-call group is clipped without mutating original evidence", testOversizedLatestToolGroupIsClippedWithoutMutatingEvidence],
+	["impossible prefixes and invalid byte budgets fail locally", testImpossiblePrefixAndInvalidBudgetsFailBeforeNetwork],
+	["transcripts preserve packed wire messages and original local history separately", testTranscriptSeparatesPackedWireMessagesFromOriginalHistory],
 	["OpenRouter response usage and generation billing metadata are preserved", testOpenRouterUsageCostAndGenerationMetadataAreMapped],
 	["malformed generation cost evidence is omitted", testMalformedGenerationBillingIsNotReportedAsAuthoritative],
 	["generation metadata retries after delayed visibility", testGenerationMetadataRetriesAfterDelayedVisibility],

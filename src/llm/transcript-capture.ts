@@ -8,11 +8,12 @@
  * file path, never the content the model actually generated. It answers
  * "what happened" (which is all it was ever built for) but not "what did
  * the model actually write" — the second one is what imitation-based
- * fine-tuning needs. This module captures the real thing: the exact
- * `LlmRequest.messages` sent and the exact `LlmResponse` received, for
- * every call, from both providers (OllamaClient and OpenRouterClient) —
- * so a DeepSeek session's successful trajectory and a Qwen session's
- * failing one on the same task become directly comparable training pairs.
+ * fine-tuning needs. This module captures the provider request view and exact
+ * `LlmResponse` received, for every call, from both providers (OllamaClient
+ * and OpenRouterClient). OpenRouter records packed wire messages separately
+ * from original engine history when byte-budget packing applies — so a DeepSeek
+ * session's successful trajectory and a Qwen session's failing one on the same
+ * task become directly comparable training pairs.
  *
  * Off by default (matches this project's convention for every experimental
  * feature — see e.g. HEADLESSCODE_LOCAL_EXPLORE's own doc comment). Opt in
@@ -45,10 +46,12 @@ export interface TranscriptContext {
 }
 
 export interface TranscriptOutcome {
-	/** Full engine-level request messages, exactly as sent (post-condensation,
-	 *  pre-wire-format-translation — the same shape fed back into the next
-	 *  turn, which is what a training example needs to reproduce). */
+	/** Captured request messages; OpenRouter uses the exact wire view. */
 	messages: ChatMessage[]
+	/** Original engine history before provider-side packing; never mutated. */
+	originalMessages?: ChatMessage[]
+	/** Exact request object serialized for fetch, including packed messages. */
+	wireRequest?: Record<string, unknown>
 	tools?: ChatTool[]
 	temperature?: number
 	/** Present on success. */
