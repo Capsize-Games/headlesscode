@@ -55,6 +55,7 @@
 		"cli": "tsx src/cli.ts",
 		"monitor:pilot": "tsx scripts/monitor-pilot/run.ts",
 		"rsi:promote-curriculum": "tsx src/rsi/promote-curriculum.ts",
+		"rsi:security-canary": "tsx scripts/rsi-security-canary.ts",
 		"rsi:proof-demonstration": "tsx scripts/rsi-proof-demonstration.ts",
 		"test": "node scripts/run-tests.mjs",
 		"prepublishOnly": "npm ci && npm test"
