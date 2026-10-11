@@ -4129,25 +4129,21 @@ export class HeadlessSession {
 						// quantified claims, require every claimed value in command output
 						// instead of accepting unrelated diagnostic numbers. The tokenizer
 						// accepts attached units (20ms) and excludes digits inside identifiers
-						// such as UTF-8.
+						// such as UTF-8. A prose period after a number is allowed only when
+						// it is not the start of another decimal component.
 						const numericTokens = (value: string): string[] =>
-							[...value.matchAll(/(?<![\w.-])\d+(?:\.\d+)?(?=(?:tokens?\/sec|t\/s|%|ms|seconds?)\b|[^\w.-]|$)/gi)].map(
+							[...value.matchAll(/(?<![\w.-])\d+(?:\.\d+)?(?=(?:tokens?\/sec|t\/s|%|ms|seconds?)\b|[^\w.-]|\.(?!\d)|$)/gi)].map(
 								(match) => match[0],
 							)
 						const claimedValues = numericTokens(result)
 						const commandOutputs = messages
 							.filter((m) => m.role === "tool" && m.name === "execute_command")
 							.map((m) => String(m.content ?? ""))
-						return claimedValues.length > 0
-							? claimedValues.every((value) => {
-								const escapedValue = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-								const exactValue = new RegExp(
-									`(?<![\\w.-])${escapedValue}(?=(?:tokens?\\/sec|t\\/s|%|ms|seconds?)\\b|[^\\w.-]|$)`,
-									"i",
-								)
-								return commandOutputs.some((output) => exactValue.test(output))
-							})
-							: commandOutputs.some((output) => numericTokens(output).length > 0)
+						const outputValues = commandOutputs.flatMap(numericTokens)
+						if (/\d/.test(result)) {
+							return claimedValues.length > 0 && claimedValues.every((value) => outputValues.includes(value))
+						}
+						return outputValues.length > 0
 					})()
 				// staleReReadEditClaim: a failed write was cleared by a re-read
 				// ONLY (never a real successful write since — see
