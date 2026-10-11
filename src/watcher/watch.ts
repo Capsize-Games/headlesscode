@@ -195,7 +195,7 @@ export async function watchIssues(config: WatcherConfig): Promise<WatchResult> {
 	// One in-process limiter per watchIssues run guards the sweep spawn loop;
 	// durable state and (in runner-pool mode) claims guard machine capacity.
 	const maxConcurrentSessions = config.maxConcurrentSessions ?? maxConcurrentSessionsFromEnv()
-	if (config.runnerId && config.runOnce) throw new Error("watcher runner pool requires continuous mode; --run-once cannot maintain claim leases")
+	if (config.runnerId && config.runOnce && !config.dryRun) throw new Error("watcher runner pool requires continuous mode; --run-once cannot maintain claim leases")
 	if (config.runnerId && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(config.runnerId)) throw new Error("watcher: runnerId must be a stable safe identifier")
 	if (config.runnerId && !config.runnerAssignee) throw new Error("watcher runner pool requires runnerAssignee so the GitHub issue shows its current claimant")
 	const claimStore = config.claimStore ?? (config.runnerId ? new GitHubIssueClaimStore({
@@ -370,7 +370,11 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 	const orchPath = path.join(repoRoot, ".worktrees", ".orchestrator-state.json")
 	const orchState = loadStateSync(orchPath)
 	const localActive = activeSessionCount(orchState, state)
-	const active = input.claimStore && input.runnerId ? Math.max(localActive, activeRunnerClaims.length) : localActive
+	// A claim is per issue, but an issue may fan out into several worktrees.
+	// Capacity is per worker session, so count every assigned worktree (including
+	// quarantined claims retained by reconciliation).
+	const claimedSessions = activeRunnerClaims.reduce((total, entry) => total + entry.claim.worktreeNames.length, 0)
+	const active = input.claimStore && input.runnerId ? Math.max(localActive, claimedSessions) : localActive
 	const available = Math.max(0, maxConcurrentSessions - active)
 	const toSpawn = newIssues.slice(0, Math.min(maxPerSweep, available))
 	const deferred = newIssues.slice(toSpawn.length)
@@ -816,7 +820,11 @@ function inspectWorkerTree(worktree: string, label: "harness" | "qa"): "running"
 			if ((error as NodeJS.ErrnoException).code !== "ESRCH") return "unknown"
 		}
 	}
-	if (hadEvidence || fs.existsSync(markerPath)) return "stopped"
+	// A completion marker says the wrapper finished; it cannot prove that a
+	// detached process is absent. Only a recorded PID/PGID with an ESRCH result
+	// establishes teardown. Marker-only evidence stays quarantined.
+	if (hadEvidence) return "stopped"
+	if (fs.existsSync(markerPath)) return "unknown"
 	return "absent"
 }
 

@@ -246,6 +246,9 @@ async function testWatcherClaimSurvivesUntilConfirmedCompletion(): Promise<void>
 			for (const spec of batch.specs) {
 				const worktree = path.join(repoRoot, ".worktrees", spec.name)
 				await fs.mkdir(path.join(worktree, ".harness.done"), { recursive: true })
+				const absentPgid = 2_147_483_647
+				assert.throws(() => process.kill(-absentPgid, 0), (error: NodeJS.ErrnoException) => error.code === "ESRCH")
+				await fs.writeFile(path.join(worktree, ".harness.pgid"), `${absentPgid}\n`)
 			}
 			return { ok: true, status: 0 }
 		},
@@ -260,10 +263,65 @@ async function testWatcherClaimSurvivesUntilConfirmedCompletion(): Promise<void>
 	await fs.rm(repoRoot, { recursive: true, force: true })
 }
 
+async function testMarkerOnlyClaimStaysQuarantinedAndCountsEveryWorktree(): Promise<void> {
+	const api = claimApi()
+	const now = () => new Date("2026-10-11T12:00:00.000Z")
+	const claims = store(api, "workstation", now, "nonce-capacity-0123456789")
+	const fanout = await claims.acquire(75, { worktreeNames: ["w1", "w2"] })
+	assert.equal(fanout.acquired, true)
+	if (!fanout.acquired) throw new Error("expected fan-out claim")
+	await claims.markRunning(75, fanout.claim)
+	const markerOnly = await claims.acquire(76, { worktreeNames: ["w3"] })
+	assert.equal(markerOnly.acquired, true)
+	if (!markerOnly.acquired) throw new Error("expected marker-only claim")
+	await claims.markRunning(76, markerOnly.claim)
+
+	const scratch = path.join(process.cwd(), ".headlesscode", "scratch", "node-pool-32-claims-test")
+	await fs.mkdir(scratch, { recursive: true, mode: 0o700 })
+	const repoRoot = await fs.mkdtemp(path.join(scratch, "capacity-"))
+	for (const name of ["w1", "w2"]) {
+		const worktree = path.join(repoRoot, ".worktrees", name)
+		await fs.mkdir(worktree, { recursive: true })
+		// The test process itself is a harmless live-PID sentinel. Teardown is
+		// bypassed below after the single sweep so no signal is sent to it.
+		await fs.writeFile(path.join(worktree, ".harness.pid"), `${process.pid}\n`)
+	}
+	const markerWorktree = path.join(repoRoot, ".worktrees", "w3")
+	await fs.mkdir(path.join(markerWorktree, ".harness.done"), { recursive: true })
+
+	const controller = new AbortController()
+	const listActive = claims.listActiveClaims.bind(claims)
+	let claimReads = 0
+	claims.listActiveClaims = async () => ++claimReads === 1 ? listActive() : []
+	let spawnCalls = 0
+	const issue: GitHubIssue = { number: 77, title: "synthetic capacity issue", labels: ["needs-agent"] }
+	const result = await watchIssues({
+		owner: "owner", repo: "repo", targetLabel: "needs-agent", token: "test-token",
+		repoRoot,
+		stateFile: path.join(repoRoot, ".worktrees", ".watcher-state.json"),
+		runOnce: false, pollIntervalMs: 1, maxConcurrentSessions: 3,
+		runnerId: "workstation", runnerAssignee: "synthetic-bot", claimStore: claims,
+		gh: {
+			listIssues: async () => { controller.abort(); return [issue] },
+			getIssue: async () => issue,
+			addLabel: async () => undefined,
+		},
+		spawn: async () => { spawnCalls++; return { ok: true, status: 0 } },
+		signal: controller.signal,
+		logger: new Logger({ level: "silent" }),
+	})
+	assert.equal(result.spawned, 0, "three active worktrees fill capacity even though they belong to two issue claims")
+	assert.equal(spawnCalls, 0)
+	assert.equal(result.sweeps[0]?.deferred, 1)
+	assert.equal((await claims.read(76))?.claim.phase, "active", "a done marker without PID/PGID absence proof remains held")
+	await fs.rm(repoRoot, { recursive: true, force: true })
+}
+
 await testClaimLifecycleAndExpiredQuarantine()
 await testAssignmentFailureDoesNotLeaveUnownedActiveClaim()
 await testExpiredClaimNeedsExplicitFencedOperatorRecovery()
 await testInitialClaimsRaceWithOnlyOneWinner()
 await testRefUpdateUsesParentAndNoForce()
 await testWatcherClaimSurvivesUntilConfirmedCompletion()
+await testMarkerOnlyClaimStaysQuarantinedAndCountsEveryWorktree()
 process.stdout.write("watcher claims tests passed\n")
