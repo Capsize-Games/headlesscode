@@ -19,3 +19,16 @@ This opt-in command sends at most four streamed requests through HeadlessCode's 
 The fixed synthetic prefix is repeated exactly within one run and includes an opaque per-run nonce to prevent an earlier audit's prefix from warming the first request. Each request changes only a short synthetic question. The script never prints prompt text or the API key. It refuses to run when transcript capture is enabled, and stops issuing requests after a failed call or missing authoritative billing record because a timed-out request could still have incurred a charge. It reports per-call model/provider identifiers, streamed token usage, cache tokens, generation IDs, latency, the response-reported cost, and the separate OpenRouter generation-record billing fields. A generation metadata lookup retries briefly if OpenRouter has not made the billing record available yet. Missing or malformed billing evidence is never replaced by the guardrail estimate.
 
 The output is JSON on stdout. Save it only to a location approved for synthetic service metadata; it contains no prompt body. Response/stream identity and generation-record identity are captured in separate fields. Both must match an explicit allowlist containing the requested Muse slug and OpenRouter's dated canonical alias `meta/muse-spark-1.3-contributor-20260902`; the audit does not accept arbitrary model-name prefixes. It exits nonzero unless all four calls have a finite generation-record `total_cost`, both identities report Meta, and at least one later request reports cached prompt tokens. Generation-record lookups retry with increasing delays because that record can appear after the streamed response. Cache hits are provider- and timing-dependent, so a zero cached-token count is a failed qualification observation rather than proof that caching is unsupported.
+
+## Observed qualification
+
+The live audit passed on 2026-10-10. All four responses identified Meta and the requested Muse Contributor model; the corresponding OpenRouter generation records identified Meta and the allowlisted dated model. Each request used the same synthetic prefix and allowed 32 output tokens.
+
+| Request | Prompt tokens | Cached prompt tokens | OpenRouter generation-record cost (USD) |
+| --- | ---: | ---: | ---: |
+| Cold | 2,798 | 0 | 0.000286200 |
+| Warm 1 | 2,797 | 2,673 | 0.000024146 |
+| Warm 2 | 2,798 | 2,673 | 0.000024246 |
+| Warm 3 | 2,797 | 2,673 | 0.000024146 |
+
+The four calls cost $0.000358738 in total. The warm requests reused about 96% of their input tokens. These observations qualify repeated-prefix caching through the client; cache reuse in a different workload must be checked from that workload's usage and billing records.
