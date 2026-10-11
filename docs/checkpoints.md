@@ -1,7 +1,6 @@
 # Checkpoints — shadow-git undo layer
 
-Checkpoints port Zoo Code's auto-commit undo mechanism into the headless
-harness. Every edit-capable session snapshots the workspace into a hidden
+HeadlessCode checkpoints snapshot the workspace into a hidden
 **shadow git repository** — separate from any real git repo the workspace
 happens to have — so a bad edit (or a whole bad run) can be reverted without
 touching the user's own commits, branches, or index.
@@ -19,10 +18,9 @@ at the real workspace. Two things fall out of that:
   which — because `core.worktree` is the real workspace — checks that
   commit's file contents out onto the real files.
 
-This is the same mechanism Zoo Code uses in VS Code
-(`RepoPerTaskCheckpointService` / `ShadowCheckpointService`, vendored at
-`src/vendor/zoo-code/src/services/checkpoints/`), adapted for a
-non-interactive process (no toast notifications, no webview).
+`RepoPerTaskCheckpointService` and `ShadowCheckpointService` implement this
+mechanism for non-interactive sessions. See the source inventory in
+[ATTRIBUTION.md](../ATTRIBUTION.md).
 
 ### Storage location — outside the workspace, always
 
@@ -38,8 +36,7 @@ inside `workspaceRoot`.
 This is a deliberate deviation from a workspace-local
 `<workspaceRoot>/.headlesscode/checkpoints` default. Two of the vendored
 git operations only work correctly when the shadow dir is outside the
-worktree they track (this mirrors how Zoo Code itself always stores shadow
-repos outside any workspace, under VS Code's `globalStorageUri`):
+worktree they track:
 
 - `stageAll()` (used by init/save/diff) runs `git add` with `cwd` set to the
   shadow dir itself. If the shadow dir is nested inside the workspace, the
@@ -70,11 +67,9 @@ e.g. a shared cache volume in a container.
 
 Checkpoints are **on by default** for a normal (edit-capable) session:
 
-- A **baseline checkpoint** is saved before iteration 1 (mirrors Zoo Code's
-  `Task.ts` behavior at session start).
+- A **baseline checkpoint** is saved before iteration 1.
 - A checkpoint is saved **after every loop iteration that executed at least
-  one tool call** (mirrors Zoo Code's per-turn `checkpointSave(true)` in
-  `presentAssistantMessage.ts` — granularity is per-turn, not per-file-write).
+  one tool call**. Granularity is per-turn, not per-file-write.
 
 Checkpoints are **skipped entirely** for read-only sessions (the reviewer and
 QA modes use executors with no `write_to_file` registered — there's nothing

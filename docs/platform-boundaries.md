@@ -13,7 +13,7 @@ cadence, and product interfaces. No dependency migration is proposed.
 | TypeScript execution | Locked TypeScript 5.9.3 and tsx 4.23.1; source runs directly through tsx | Retain; no frontend build tuple to converge |
 | Dashboard | `src/dashboard/server.ts` uses Node HTTP and `src/dashboard/page.ts` renders the page | Retain the current runtime and product routes |
 | React / React DOM / Vite | None in the root manifest or resolved lockfile | React 18/19 and Vite compatibility are not applicable to this package |
-| Vendored prompt/tool code | Portable Zoo Code source under `src/vendor/`; its smoke check runs in `npm test` | Preserve its imports and upstream notices |
+| Vendored prompt/tool code | Third-party source under `src/vendor/`; its smoke check runs in `npm test` | Preserve its imports and upstream notices |
 | Benchmark fixtures | Nested fixture manifests under `src/rsi/benchmark-fixtures/` | Test inputs, not independently released frontend clients or a workspace family |
 | Distribution | Root CLI entry points and source tarball; repository CI and tag publishing | Keep the harness and its dashboard on the same release |
 

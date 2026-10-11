@@ -1,7 +1,8 @@
-# Gap audit — headlesscode vs Zoo Code (VS Code)
+# HeadlessCode development audit
 
-Snapshot of known behavioral gaps between the headless harness and the interactive VS Code
-extension it's ported from. Documented for prioritization, not all scheduled.
+Historical development snapshot of HeadlessCode features and outstanding work.
+This record is for prioritization; consult the current subsystem guides and
+GitHub issues for present behavior and status.
 
 ## Built
 
@@ -10,16 +11,16 @@ extension it's ported from. Documented for prioritization, not all scheduled.
   see [`docs/checkpoints.md`](checkpoints.md) and this doc's own git history for context.
 - **`execute_command` timeout** now actually backgrounds the process (matching the vendored
   tool's own documented contract) instead of `SIGKILL`ing it.
-- **Diff-based editing** — `apply_diff`/`search_replace`/`edit_file`, backed by a verbatim
-  vendored port of Zoo Code's diff-matching logic
-  (`src/vendor/zoo-code/src/core/diff/strategies/multi-search-replace.ts`). Checkpoints snapshot
+- **Diff-based editing** — `apply_diff`/`search_replace`/`edit_file`, backed by
+  the multi-search-replace diff strategy. Its source inventory is in
+  [ATTRIBUTION.md](../ATTRIBUTION.md). Checkpoints snapshot
   after any iteration using any edit tool, not just `write_to_file`.
 - **Settings/permissions parity** — `src/permissions/commands.ts` +
   `src/permissions/protected-files.ts`, enforced in `src/tools/executor.ts` before a command
   runs or a file is written, not just requested via the system prompt. Covered by
   `scripts/e2e-permissions/run.sh`. Not ported: `alwaysAllowWriteOutsideWorkspace`/
   `alwaysAllowReadOnlyOutsideWorkspace` (moot — the workspace-boundary guard is already a hard
-  deny, stricter than Zoo Code's default toggle).
+  deny).
 - **Real-time worker monitoring + pause/resume** — `src/engine/events.ts`'s per-session JSONL
   event feed, dashboard live session detail view, pause/resume control (the dashboard's first
   write path — bearer-token gated, see `src/dashboard/server.ts`'s header comment).
@@ -53,9 +54,8 @@ extension it's ported from. Documented for prioritization, not all scheduled.
   previously fully absent. Verified to work correctly alongside context condensation in the
   same session (a combined test was added specifically because the two features were merged
   sequentially, both touching `src/engine/loop.ts`'s core request path).
-- **A real browser-automation tool** (`browser_action`, Playwright-backed) — this was NOT a
-  port (confirmed: no such tool exists anywhere in the Zoo Code reference clone), genuinely new
-  work. Session-end cleanup verified to actually kill a still-open browser process; hung actions
+- **Browser automation** (`browser_action`, Playwright-backed).
+  Session-end cleanup verified to actually kill a still-open browser process; hung actions
   time out rather than hanging the session.
 - **Dashboard browser parity** — chat-thread session view (not just a flat event log),
   checkpoint list/diff/restore from the browser (restore gated behind the same bearer-token
@@ -65,9 +65,8 @@ extension it's ported from. Documented for prioritization, not all scheduled.
 - **MCP resources and prompts** — the current HeadlessCode MCP client supports tool listing and
   tool calls over stdio and Streamable HTTP. It does not yet implement MCP resources, prompts,
   OAuth setup, or per-tool approval. See [MCP servers](mcp.md).
-- **Recursive task decomposition (`new_task`)** — a headless-native reimplementation (NOT a
-  literal port of Zoo Code's webview-coupled version, per its own plan doc's explicit design
-  rationale): synchronous nested child `HeadlessSession`, a shared `BudgetTracker` between
+- **Recursive task decomposition (`new_task`)** — synchronous nested child
+  `HeadlessSession`, a shared `BudgetTracker` between
   parent/child (independently reviewed and confirmed a child-only spend trips the shared cap —
   the real risk this design existed to prevent), a recursion-depth cap, child checkpoints
   tagged into the same shadow-git lineage as the parent, and event-feed parent/child lineage
@@ -110,7 +109,7 @@ extension it's ported from. Documented for prioritization, not all scheduled.
 - **MCP parity is partial.** HeadlessCode now connects to configured stdio and
   Streamable HTTP servers, exposes their tools to MCP-enabled modes, and closes
   clients at session end. It does not yet support MCP resources, prompts, OAuth
-  setup, per-tool approval, or the Zoo Code UI's enable/disable controls. See
+  setup or per-tool approval. See
   [MCP servers](mcp.md).
 - **`headlesscode index`'s default embedding backend is still `openrouter`, not the free local
   `ollama` option** — the capability exists and is verified working, it's just not the default

@@ -5,11 +5,11 @@ to run the verification bar, and what a merge-ready change looks like.
 
 ## What this project is
 
-`headlesscode` is a standalone Node/TypeScript CLI that runs a headless
-coding-agent loop, ported from a VS Code extension (vendored verbatim under
-`src/vendor/zoo-code/`, Apache-2.0 — see `ATTRIBUTION.md`). There is **no
-build step**: everything runs directly via `tsx`. Read the docs in `docs/`
-before diving into a subsystem.
+HeadlessCode is a Node/TypeScript coding-agent harness with CLI and HTTP
+interfaces, parallel workers, and bounded recursive self-improvement (RSI).
+There is **no build step**: everything runs directly via `tsx`. Read the docs
+in `docs/` before diving into a subsystem. Third-party source attribution is
+recorded in `ATTRIBUTION.md`.
 
 ## Security first
 
@@ -73,12 +73,11 @@ suite detects the missing binary, prints a clear skip message, and exits 0
   wrap in try/catch, log a warning via the session's logger, and never let a
   failure in an auxiliary subsystem abort or corrupt the coding session.
   Match that pattern when adding a new auxiliary write path.
-- **Vendoring convention.** Code ported from the upstream VS Code extension
-  lives under `src/vendor/zoo-code/`, copied verbatim wherever practical,
-  with a corresponding entry in `ATTRIBUTION.md`. VS Code API calls the
-  vendored code makes are satisfied by no-op shims under
-  `src/vendor/zoo-code/shim/`, wired via `tsconfig.json`'s `paths` — check
-  there before assuming something needs a new shim.
+- **Vendoring convention.** Third-party source lives under `src/vendor/`,
+  with corresponding entries in `ATTRIBUTION.md`. Preserve its notices and
+  record local changes in the vendor inventory. Compatibility shims satisfy
+  editor API imports through relative paths; consult the inventory linked
+  from `ATTRIBUTION.md` before adding a shim.
 - **Comments are minimal.** Only when the WHY is genuinely non-obvious.
 - **Docs vs. plans.** `docs/*.md` describes how a shipped subsystem works.
   `plans/*.md` are standalone work orders for an external agent to execute —

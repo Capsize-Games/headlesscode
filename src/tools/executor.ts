@@ -238,6 +238,14 @@ export interface ToolExecutorOptions {
 
 export class ToolExecutor {
 	private readonly handlers = new Map<string, ToolHandler>()
+	/**
+	 * Executor-owned registry of execute_command children that timed out and
+	 * were left running in the background. Per-instance (one executor serves
+	 * one session) so dispose() only tears down this session's processes.
+	 */
+	readonly backgroundCommands = new Set<ChildProcess>()
+	/** Executor-owned browser session identity (see browserSessionOwner in ToolContext). */
+	private readonly browserSessionOwner: object = {}
 	private pauseBudgetClock: (() => void) | undefined
 	private resumeBudgetClock: (() => void) | undefined
 	private onAuxLlmUsage: ((usage: AuxLlmUsage) => void) | undefined
@@ -380,6 +388,7 @@ export class ToolExecutor {
 				dispatchBatchSubcall: batchContext?.dispatchBatchSubcall,
 				serializeBatchSubcalls: batchContext?.serializeBatchSubcalls,
 				workspaceRoot: this.workspaceRoot,
+				browserSessionOwner: this.browserSessionOwner,
 				permissions: this.permissions,
 				guardLargeOverwrites: this.options.guardLargeOverwrites,
 				disableReadFileCache: this.options.disableReadFileCache,
@@ -413,8 +422,8 @@ export class ToolExecutor {
 		* true session end does, so nothing is orphaned past its session.
 		*/
 	dispose(): void {
-		killBackgroundCommands()
-		disposeBrowserSessions()
+		killBackgroundCommands(this.backgroundCommands)
+		disposeBrowserSessions(this.browserSessionOwner)
 	}
 }
 
@@ -746,6 +755,8 @@ type ReadFileCacheKey = {
 	limit: number
 	/** Effective indentation-mode max_lines (default 60); undefined in slice mode. */
 	windowLines?: number
+	/** Effective indentation-mode anchor (1-based); undefined in slice mode. */
+	anchor?: number
 }
 
 /** One cache entry: content identity (hash + size + mtime) + streak state. */
@@ -816,8 +827,9 @@ function readFileHandler(
 		const limit = toNonNegativeInt(args.limit, readLimitFromEnv())
 		const indentation = args.indentation as Record<string, unknown> | undefined
 		const windowLines = mode === "indentation" ? toNonNegativeInt(indentation?.["max_lines"], DEFAULT_INDENTATION_WINDOW_LINES) : undefined
+		const anchor = mode === "indentation" ? Math.max(1, toNonNegativeInt(indentation?.["anchor_line"], offset)) : undefined
 
-		const key = makeReadFileCacheKey({ target, mode, offset, limit, windowLines })
+		const key = makeReadFileCacheKey({ target, mode, offset, limit, windowLines, anchor })
 
 		// Trust model: unchanged size AND mtime ⇒ identical content, so the
 		// cached hash can be reused without re-reading the file; any mismatch
@@ -879,8 +891,7 @@ function readFileHandler(
 		if (mode === "indentation") {
 			// Phase 1 minimal: indentation mode falls back to a window around the
 			// anchor line (anchor_line 1-based), which is good enough for the loop.
-			const anchor = toNonNegativeInt(indentation?.["anchor_line"], offset)
-			result = ok(formatFileSlice(rel, allLines, Math.max(1, anchor), windowLines ?? DEFAULT_INDENTATION_WINDOW_LINES))
+			result = ok(formatFileSlice(rel, allLines, anchor ?? 1, windowLines ?? DEFAULT_INDENTATION_WINDOW_LINES))
 		} else {
 			result = ok(formatFileSlice(rel, allLines, Math.max(1, offset), limit))
 		}
@@ -908,7 +919,9 @@ function readFileKey(args: Record<string, unknown>, ctx: ToolContext): string {
 	const indentation = args.indentation as Record<string, unknown> | undefined
 	const windowLines =
 		mode === "indentation" ? toNonNegativeInt(indentation?.["max_lines"], DEFAULT_INDENTATION_WINDOW_LINES) : undefined
-	return makeReadFileCacheKey({ target, mode, offset, limit, windowLines })
+	const anchor =
+		mode === "indentation" ? Math.max(1, toNonNegativeInt(indentation?.["anchor_line"], offset)) : undefined
+	return makeReadFileCacheKey({ target, mode, offset, limit, windowLines, anchor })
 }
 
 function formatFileSlice(rel: string, allLines: string[], offset: number, limit: number): string {
@@ -1045,7 +1058,7 @@ function writeToFileHandler(args: Record<string, unknown>, ctx: ToolContext): Pr
  * works unchanged — the model targets the process by port/name/pattern, same
  * as a human would.
  */
-const backgroundCommands = new Set<ChildProcess>()
+ // Background-command registry is executor-owned (see ToolExecutor.backgroundCommands); no module-global set.
 
 /** Best-effort unref of a stdio pipe so it can't keep the event loop alive. */
 function unrefStream(stream: NodeJS.ReadableStream | null): void {
@@ -1067,7 +1080,7 @@ function unrefStream(stream: NodeJS.ReadableStream | null): void {
  * call times out mid-session — that is the whole point of the background
  * semantics (see the vendored execute_command tool's timeout contract).
  */
-function killBackgroundCommands(): void {
+function killBackgroundCommands(backgroundCommands: Set<ChildProcess>): void {
 	for (const child of backgroundCommands) {
 		try {
 			if (child.exitCode === null && child.signalCode === null) {
@@ -1609,7 +1622,7 @@ async function setIndentationHandler(args: Record<string, unknown>, ctx: ToolCon
  * for via the `timeout` arg, so it must not count toward the loop's
  * consecutive-mistake bounded-failure limit.
  */
-function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext, backgroundCommands: Set<ChildProcess>): Promise<ToolResult> {
 	const command = requireString(args, "command")
 	const timeoutS = toNonNegativeInt(args.timeout, DEFAULT_COMMAND_TIMEOUT_S) || DEFAULT_COMMAND_TIMEOUT_S
 
@@ -1952,6 +1965,12 @@ type ListFilesCallEntry = {
 	/** The condensation generation this key was last (really) listed at. */
 	generation: number
 	/**
+	 * SHA-256 identity of the bounded visible listing last stored for this key:
+	 * JSON of the sorted dirs-first entries plus the truncation flag. A repeat
+	 * call is only a cache hit when the fresh walk has the same identity.
+	 */
+	signature: string
+	/**
 	 * Whether the LAST identical call already got the short cache-hit
 	 * message instead of a real listing. When true, the next identical
 	 * call gets a real listing again — mirrors read_file's toldUnchanged
@@ -1996,18 +2015,42 @@ function listFilesHandler(
 		const rel = path.relative(ctx.workspaceRoot, target).toPosix() || path.basename(target) || "."
 		const key = `${target} ${recursive}`
 		const entry = calls?.get(key)
-
-		// See readFileHandler's disableReadFileCache comment for the full
-		// rationale (same short-circuit shape, same local-backend risk).
-		if (
+		const guardEligible =
 			!ctx.disableReadFileCache &&
 			calls !== undefined &&
 			generation !== undefined &&
 			entry !== undefined &&
 			entry.generation === generation
-		) {
-			if (!entry.toldUnchanged) {
-				entry.toldUnchanged = true
+
+		// Fresh bounded walk before deciding unchanged: the visible tree may
+		// have changed (write_to_file additions, renames) since the last
+		// listing, so a repeat (path, recursive) alone is never a cache hit.
+		let collected: { entries: Array<{ rel: string; isDir: boolean }>; truncated: boolean }
+		try {
+			collected = await collectEntries(target, ctx.workspaceRoot, recursive)
+		} catch (error) {
+			return err(`list_files: cannot list '${rel}': ${errorMessage(error)}`)
+		}
+
+		// Sort dirs first, then alphabetically (over the collected subset).
+		collected.entries.sort((a, b) => {
+			if (a.isDir !== b.isDir) {
+				return a.isDir ? -1 : 1
+			}
+			return a.rel.localeCompare(b.rel)
+		})
+
+		// Hash the unambiguous bounded [rel, isDir] pairs plus truncation.
+		// SHA-256 avoids the false hits reproduced with the 32-bit signature.
+		const signature = createHash("sha256")
+			.update(JSON.stringify([collected.entries.map((e) => [e.rel, e.isDir]), collected.truncated]))
+			.digest("hex")
+
+		// See readFileHandler's disableReadFileCache comment for the full
+		// rationale (same short-circuit shape, same local-backend risk).
+		if (guardEligible && signature === (entry as ListFilesCallEntry).signature) {
+			if (!(entry as ListFilesCallEntry).toldUnchanged) {
+				;(entry as ListFilesCallEntry).toldUnchanged = true
 				return ok(
 					`[cache] '${rel}' (recursive=${recursive}) was already listed earlier this session and nothing has been ` +
 						`condensed since — reuse the earlier result above instead of re-listing. Re-listing again will re-run ` +
@@ -2019,27 +2062,13 @@ function listFilesHandler(
 			// refusing again would just repeat the same unproductive exchange.
 		}
 
-		let collected: { entries: Array<{ rel: string; isDir: boolean }>; truncated: boolean }
-		try {
-			collected = await collectEntries(target, ctx.workspaceRoot, recursive)
-		} catch (error) {
-			return err(`list_files: cannot list '${rel}': ${errorMessage(error)}`)
-		}
-
 		// Only recorded on SUCCESS: a failed listing (e.g. bad path) should
 		// remain retryable with the real error, never masked by the cache-hit
-		// notice above.
+		// notice above. A changed tree stores its fresh signature with a reset
+		// one-notice cadence.
 		if (calls !== undefined && generation !== undefined) {
-			calls.set(key, { generation, toldUnchanged: false })
+			calls.set(key, { generation, signature, toldUnchanged: false })
 		}
-
-		// Sort dirs first, then alphabetically (over the collected subset).
-		collected.entries.sort((a, b) => {
-			if (a.isDir !== b.isDir) {
-				return a.isDir ? -1 : 1
-			}
-			return a.rel.localeCompare(b.rel)
-		})
 
 		const lines = collected.entries.slice(0, MAX_LIST_FILES).map((e) => (e.isDir ? `${e.rel}/` : e.rel))
 		// Once the walk was capped the true total is unknown, so the trailer
@@ -2732,7 +2761,7 @@ export function createHeadlessExecutor(workspaceRoot: string, options: ToolExecu
 	executor.register("search_replace", searchReplaceHandler)
 	executor.register("edit_file", editFileHandler)
 	executor.register("set_indentation", setIndentationHandler)
-	executor.register("execute_command", executeCommandHandler)
+	executor.register("execute_command", (args, ctx) => executeCommandHandler(args, ctx, executor.backgroundCommands))
 	executor.registerListFiles()
 	executor.register("codebase_search", codebaseSearchHandler)
 	executor.register("browser_action", browserActionHandler)
@@ -2775,7 +2804,7 @@ function createReadCommandExecutor(workspaceRoot: string, options: ToolExecutorO
 
 	executor.registerReadFile()
 	executor.registerListFiles()
-	executor.register("execute_command", executeCommandHandler)
+	executor.register("execute_command", (args, ctx) => executeCommandHandler(args, ctx, executor.backgroundCommands))
 	executor.register("browser_action", browserActionHandler)
 	executor.register("batch", (args, ctx) => batchHandler(executor, args, ctx))
 	// The nine read-only code-intelligence tools (TS-only) follow the same

@@ -245,6 +245,14 @@ export interface ToolContext {
 	serializeBatchSubcalls?: boolean
 	workspaceRoot: string
 	/**
+	 * Executor-owned browser session identity (see
+	 * src/tools/browser/handler.ts). The executor passes its own identity
+	 * here so browser sessions are scoped per executor/session instead of
+	 * being shared by workspace root. Absent for bare/direct handler calls,
+	 * which fall back to the legacy workspace-root lookup.
+	 */
+	browserSessionOwner?: object
+	/**
 	 * Resolved command allow/deny + protected-file permissions for this
 	 * executor/session (see src/permissions/). Always present — the executor
 	 * resolves built-in defaults when nothing is configured — so handlers can

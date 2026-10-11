@@ -51,35 +51,68 @@ const SCREENSHOTS_SUBDIR = ".headlesscode/browser-screenshots"
 // ─── Session registry ────────────────────────────────────────────────────────
 
 /**
- * Active browser sessions, keyed by workspace root. One ToolExecutor serves
- * one session, and the browser may outlive a single tool call (that is the
- * point — an interactive inspection spans multiple browser_action calls), so
- * the session lives at module scope and ToolExecutor.dispose() tears it down
- * at true session end. Keying by workspace root keeps independent sessions
- * (e.g. a QA executor in the same process) from sharing a browser.
+ * Active browser sessions, keyed by owning executor identity. One ToolExecutor
+ * serves one session, and the browser may outlive a single tool call (that is
+ * the point — an interactive inspection spans multiple browser_action calls),
+ * so the session lives at module scope and ToolExecutor.dispose() tears it
+ * down at true session end. Keying by executor-owned identity (a per-executor
+ * object passed via ToolContext.browserSessionOwner) keeps independent
+ * executors isolated even when they share a workspace root — a root-keyed map
+ * let two executors replace one another's page and let an unrelated
+ * executor's dispose close another executor's browser. Weak keys avoid
+ * retaining executor identities; browser process cleanup still requires
+ * explicit disposal or process teardown. Contexts without an owner fall back
+ * to the legacy workspace-root map.
  */
-const browserSessions = new Map<string, BrowserSession>()
+const browserSessions = new WeakMap<object, BrowserSession>()
+const legacyBrowserSessions = new Map<string, BrowserSession>()
 
 function sessionFor(ctx: ToolContext): BrowserSession {
-	let session = browserSessions.get(ctx.workspaceRoot)
+	const owner = ctx.browserSessionOwner
+	if (owner !== undefined) {
+		let session = browserSessions.get(owner)
+		if (session === undefined) {
+			session = new BrowserSession()
+			browserSessions.set(owner, session)
+		}
+		return session
+	}
+	let session = legacyBrowserSessions.get(ctx.workspaceRoot)
 	if (session === undefined) {
 		session = new BrowserSession()
-		browserSessions.set(ctx.workspaceRoot, session)
+		legacyBrowserSessions.set(ctx.workspaceRoot, session)
 	}
 	return session
 }
 
+function peekSession(ctx: ToolContext): BrowserSession | undefined {
+	const owner = ctx.browserSessionOwner
+	if (owner !== undefined) {
+		return browserSessions.get(owner)
+	}
+	return legacyBrowserSessions.get(ctx.workspaceRoot)
+}
+
 /**
- * Session teardown for every known browser session: hard-close the browser
- * AND kill the residual Chromium process group (see BrowserSession.dispose).
- * Called from ToolExecutor.dispose(), so a launched browser never survives
- * its session even when the model never calls close().
+ * Session teardown for one owning executor's browser session: hard-close the
+ * browser AND kill the residual Chromium process group (see
+ * BrowserSession.dispose). Called from ToolExecutor.dispose(), so a launched
+ * browser never survives its session even when the model never calls close().
+ * Disposing one executor never touches another executor's session.
  */
-export function disposeBrowserSessions(): void {
-	for (const session of browserSessions.values()) {
+export function disposeBrowserSessions(owner?: object): void {
+	if (owner !== undefined) {
+		const session = browserSessions.get(owner)
+		if (session !== undefined) {
+			browserSessions.delete(owner)
+			void session.dispose()
+		}
+		return
+	}
+	for (const session of legacyBrowserSessions.values()) {
 		void session.dispose()
 	}
-	browserSessions.clear()
+	legacyBrowserSessions.clear()
 }
 
 // ─── Arg validation ──────────────────────────────────────────────────────────
@@ -217,7 +250,7 @@ export async function browserActionHandler(
 	// "explicitly cleaned up" state, so a model that calls close() then
 	// re-launches gets a clean result, not an error that counts as a mistake.
 	if (action !== "launch") {
-		const session = browserSessions.get(ctx.workspaceRoot)
+		const session = peekSession(ctx)
 		if (session === undefined || !session.isLaunched) {
 			return ok("browser: no browser is open — call launch(url) first to start one")
 		}
@@ -333,7 +366,7 @@ export async function browserActionHandler(
 		// deterministic closed state) so the model can recover with a fresh
 		// launch.
 		try {
-			await browserSessions.get(ctx.workspaceRoot)?.dispose()
+			await peekSession(ctx)?.dispose()
 		} catch {
 			// Best-effort teardown — the original error is the one to report.
 		}

@@ -5,9 +5,11 @@
 [![Node.js >=22.19](https://img.shields.io/badge/node-%3E%3D22.19-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [License: Apache-2.0](./LICENSE)
 
-`headlesscode` runs the Zoo Code agent loop from a Node.js process, without a
-VS Code window. Run one task directly, launch parallel workers in Git
-worktrees, or use the NVIDIA OpenShell provider for sandboxed sessions.
+HeadlessCode is a coding-agent harness with a CLI, HTTP interfaces, and
+recursive self-improvement (RSI). Run one task directly, launch parallel
+workers in Git worktrees, or use the NVIDIA OpenShell provider for sandboxed
+sessions. The bounded RSI harness can inspect and improve a target project,
+including HeadlessCode itself, with independent evaluation of candidate changes.
 
 ## Security controls
 
@@ -415,7 +417,7 @@ for the current clone-and-import boundary and its validation.
 
 | Area | Status | Details |
 | --- | --- | --- |
-| Runtime engine | Implemented | Portable Zoo Code core, model client, tool executor, parser, CLI, and tests. |
+| Runtime engine | Implemented | Agent loop, model client, tool executor, parser, CLI, and tests. |
 | Orchestration | Implemented | Parallel worktrees, issue splitting, status tracking, review, and recovery. See [guide](./docs/phase2-orchestration.md). |
 | Memory | Implemented | Opt-in per-project facts and session summaries with a local store; remote store remains a stub. |
 | QA and deploy approval | Implemented | Read-only QA plus a fail-closed human-approval deploy gate. See [orchestration guide](./docs/phase2-orchestration.md) and [deploy gate](./docs/phase4-deploy-gate.md). |
@@ -428,13 +430,9 @@ for the current clone-and-import boundary and its validation.
 
 ## Attribution
 
-This project contains Apache-2.0-licensed code derived from
-[Zoo Code](https://github.com/Zoo-Code-Org/Zoo-Code)
-(`Zoo-Code-Org/Zoo-Code`, commit `ca9b60f`), itself a Roo Code fork. Prompt
-text, tool schemas, and mode/rules loading logic are reused under the terms of
-the Apache License 2.0. See [`licenses/Apache-2.0.txt`](./licenses/Apache-2.0.txt) and
+Third-party source attribution and retained notices are documented in
 [`ATTRIBUTION.md`](./ATTRIBUTION.md).
 
 ## License
 
-HeadlessCode is licensed under Apache-2.0. See [LICENSE](LICENSE) and the Zoo Code attribution in [ATTRIBUTION.md](ATTRIBUTION.md). Previous public npm versions retain their published Apache-2.0 terms.
+HeadlessCode is licensed under Apache-2.0. See [LICENSE](LICENSE) and [ATTRIBUTION.md](ATTRIBUTION.md). Previous public npm versions retain their published Apache-2.0 terms.
