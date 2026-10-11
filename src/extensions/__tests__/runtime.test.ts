@@ -141,6 +141,8 @@ async function testExecutableModuleScopeIgnoresWorkspacePackageType(workspaceRoo
 	const moduleWorkspace = path.join(fixtureRoot, "type-module-scope")
 	await fs.mkdir(commonJsWorkspace, { recursive: true })
 	await fs.mkdir(moduleWorkspace, { recursive: true })
+	// Clear this repository's inherited module scope for the default-scope case.
+	await fs.writeFile(path.join(fixtureRoot, "package.json"), "{}\n")
 	await fs.writeFile(path.join(moduleWorkspace, "package.json"), '{"type":"module"}\n')
 	const cases = [
 		{ id: "scope-js", entrypoint: "index.js", source: 'exports.run = (input) => ({ module: "commonjs", value: input.value })', expectedModule: "commonjs" },

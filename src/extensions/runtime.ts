@@ -197,7 +197,7 @@ async function stageRevision(revision: ExtensionRevision, workspaceRoot: string,
 			const packageScope = path.join(stage, "package.json")
 			await fs.writeFile(packageScope, RUNTIME_PACKAGE_SCOPE, { encoding: "utf8", mode: 0o400, flag: "wx" })
 			await fs.chmod(packageScope, 0o400)
-			const packageInfo = await fs.stat(packageScope)
+			const packageInfo = await fs.lstat(packageScope)
 			if (!packageInfo.isFile() || (packageInfo.mode & 0o777) !== 0o400 || await fs.readFile(packageScope, "utf8") !== RUNTIME_PACKAGE_SCOPE) {
 				throw new Error("runtime package scope differs from its fixed readonly metadata")
 			}
