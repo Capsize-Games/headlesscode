@@ -532,6 +532,8 @@ export interface RsiHooks {
 	runDevelopmentBenchmark?: (request: { harnessCommit: string; model: string; outputRoot: string; protocol: DevelopmentProofProtocol }) => Promise<BenchmarkAttempt[]>
 	now?: () => string
 	log?: (line: string) => void
+	/** Marks test-only injected runtimes so integrity records do not imply a production image identity. */
+	syntheticRuntimeIdentity?: true
 }
 
 export type SpawnedProcess = ChildProcess
