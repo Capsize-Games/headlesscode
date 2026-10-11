@@ -77,7 +77,7 @@ try {
 	// These synthetic metadata and usage rates exercise the route without describing live pricing.
 	const inputPricePerMillionUsd = museProfile ? 0.5 : 1
 	const cachedInputPricePerMillionUsd = museProfile ? 0.05 : inputPricePerMillionUsd
-	const outputPricePerMillionUsd = museProfile ? 1.5 : 1
+	const outputPricePerMillionUsd = museProfile ? 0.75 : 1
 	const cachedPromptTokens = museProfile ? 320 : 0
 	egressSentinel = createServer((_request, response) => { egressSentinelHits += 1; response.writeHead(204); response.end() })
 	await new Promise<void>((resolve, reject) => { egressSentinel!.once("error", reject); egressSentinel!.listen(0, bindHost, resolve) })
