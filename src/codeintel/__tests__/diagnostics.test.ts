@@ -103,6 +103,21 @@ async function testNonTsFile(): Promise<void> {
 	}
 }
 
+async function testNewFileAndEditedExtraFileSemanticDiagnostics(): Promise<void> {
+	const ws = await mkFixtureWorkspace()
+	try {
+		resetCodeIntelCaches()
+		const ctx = fakeContext(ws)
+		getDiagnosticsHandler({ path: "clean.ts" }, ctx)
+		await fs.writeFile(path.join(ws, "created.ts"), 'export const created: number = "wrong"\n')
+		assert.match(getDiagnosticsHandler({ path: "created.ts" }, ctx).content, /created\.ts:1:\d+ TS2322/,
+			"a file created after cache load still receives semantic checks")
+		await fs.writeFile(path.join(ws, "created.ts"), 'export const created: number = 42\n')
+		assert.match(getDiagnosticsHandler({ path: "created.ts" }, ctx).content, /0 error\(s\) in created\.ts/,
+			"editing the extra file updates the checked contents")
+	} finally { await fs.rm(ws, { recursive: true, force: true }) }
+}
+
 /** Log one test failure with its stack (or string form). */
 function reportFailure(name: string, error: unknown): void {
 	const detail = error instanceof Error
@@ -136,6 +151,7 @@ async function main(): Promise<void> {
 	const tests: Array<[string, () => Promise<void>]> = [
 		["type + syntax errors report codes and lines", testTypeAndSyntaxErrors],
 		["clean file reports 0 errors", testCleanFile],
+		["new and edited files receive semantic diagnostics", testNewFileAndEditedExtraFileSemanticDiagnostics],
 		["missing file throws cannot-stat", testMissingFile],
 		["non-TS file throws not-supported", testNonTsFile],
 	]
