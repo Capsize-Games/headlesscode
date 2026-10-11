@@ -63,6 +63,7 @@ const HARD_LIMITS: ExtensionRuntimeLimits = Object.freeze({
 })
 const MAX_SCHEMA_BYTES = 64 * 1024
 const MAX_SKILL_REFERENCE_BYTES = 128 * 1024
+const RUNTIME_PACKAGE_SCOPE = '{"type":"commonjs"}\n'
 const NODE_ADAPTER_PATH = fileURLToPath(new URL("./node-adapter.mjs", import.meta.url))
 const deferMcpSchemaValidation = {
 	getValidator: () => (input: unknown) => ({ valid: true, data: input, errorMessage: undefined }),
@@ -192,6 +193,15 @@ async function stageRevision(revision: ExtensionRevision, workspaceRoot: string,
 	try {
 		if (stageRevisionBarrierForTests) await stageRevisionBarrierForTests()
 		if (signal) throwIfAborted(signal)
+		if (revision.manifest.entrypoint) {
+			const packageScope = path.join(stage, "package.json")
+			await fs.writeFile(packageScope, RUNTIME_PACKAGE_SCOPE, { encoding: "utf8", mode: 0o400, flag: "wx" })
+			await fs.chmod(packageScope, 0o400)
+			const packageInfo = await fs.stat(packageScope)
+			if (!packageInfo.isFile() || (packageInfo.mode & 0o777) !== 0o400 || await fs.readFile(packageScope, "utf8") !== RUNTIME_PACKAGE_SCOPE) {
+				throw new Error("runtime package scope differs from its fixed readonly metadata")
+			}
+		}
 		for (const [relative, content] of Object.entries(revision.files)) {
 			if (signal) throwIfAborted(signal)
 			if (!safeRelativePath(relative)) throw new Error("extension bundle contains an unsafe file path")

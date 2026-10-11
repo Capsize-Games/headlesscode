@@ -45,6 +45,12 @@ its advertised tools with `tool_name`. Extension contents never change the
 session's tool schemas or system prompt, and discovering a bundle does not
 execute it.
 
+Executable entrypoints use a runtime-owned CommonJS package scope, so `.js`
+and `.cjs` files run as CommonJS even when the workspace declares
+`"type": "module"`. `.mjs` files remain ES modules. The runtime-generated
+package metadata is checked separately from the extension digest; bundles
+cannot provide `package.json` or install dependencies.
+
 Node and MCP entrypoints are staged from the pinned file snapshot and run as
 owned child processes on supported POSIX hosts, with bounded input, output,
 protocol data, and time. Executable extensions are unavailable on Windows
