@@ -34,6 +34,11 @@ export interface ExtensionCallOptions {
 	toolName?: string
 }
 
+export interface ExtensionDescribeOptions {
+	permissions?: ToolContext["permissions"]
+	signal?: AbortSignal
+}
+
 export interface SessionExtensionRuntimeOptions {
 	workspaceRoot: string
 	permissions: ToolContext["permissions"]
@@ -248,8 +253,8 @@ export class SessionExtensionRuntime {
 		this.limits = boundedLimits(options.limits)
 	}
 
-	describe(revision: ExtensionRevision): Promise<ExtensionDescription> {
-		return this.runOperation(undefined, async (operationSignal) => {
+	describe(revision: ExtensionRevision, options: ExtensionDescribeOptions = {}): Promise<ExtensionDescription> {
+		return this.runOperation(options.signal, async (operationSignal) => {
 			validateRevision(revision, this.workspaceRoot)
 			const base: ExtensionDescription = {
 				id: revision.manifest.id,
@@ -265,7 +270,7 @@ export class SessionExtensionRuntime {
 				throwIfAborted(operationSignal)
 				if (!staged.entrypoint) throw new Error("MCP extension has no entrypoint")
 				const signal = callSignal(operationSignal, this.limits.callTimeoutMs)
-				const info = await this.connectMcp(staged.entrypoint, signal, this.permissions)
+				const info = await this.connectMcp(staged.entrypoint, signal, options.permissions ?? this.permissions)
 				try {
 					const tools = await info.client.listTools({}, this.requestOptions(info.signal))
 					return { ...base, tools: this.validateMcpTools(tools.tools) }

@@ -5531,6 +5531,7 @@ export class HeadlessSession {
 				return { content: boundedExtensionJson({ extension: identity, valid: true }), isError: false, extension: identity }
 			}
 			const created = await createExtension(ctx.workspaceRoot, bundle, {
+				signal: ctx.signal,
 				authorizeWrite: async (destination) => {
 					if (ctx.signal?.aborted) return false
 					const relative = path.relative(path.resolve(ctx.workspaceRoot), path.resolve(destination))
@@ -5545,7 +5546,10 @@ export class HeadlessSession {
 		if (action === "inspect") {
 			if (typeof args.id !== "string" || typeof args.digest !== "string") throw new Error("inspect requires an exact extension id and digest")
 			const revision = await loadExtension(ctx.workspaceRoot, args.id, args.digest)
-			const description = await this.getExtensionRuntime(ctx).describe(revision)
+			const description = await this.getExtensionRuntime(ctx).describe(revision, {
+				permissions: ctx.permissions,
+				signal: ctx.signal,
+			})
 			const identity = extensionIdentity(revision)
 			return { content: boundedExtensionJson({ extension: identity, description }), isError: false, extension: identity }
 		}

@@ -44,10 +44,12 @@ export interface ExtensionSummary {
 
 export interface CreateExtensionOptions {
 	authorizeWrite(destination: string): boolean | Promise<boolean>
+	signal?: AbortSignal
 }
 
 const EXTENSION_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/
 const SHA256 = /^[a-f0-9]{64}$/
+let createStageBarrierForTests: (() => Promise<void>) | undefined
 const MANIFEST_KEYS = new Set(["schemaVersion", "id", "kind", "description", "entrypoint", "inputSchema"])
 const SCHEMA_KEYS = new Set([
 	"$schema", "$id", "$ref", "$defs", "definitions", "type", "title", "description", "default", "examples",
@@ -396,6 +398,7 @@ export async function listExtensions(workspaceRoot: string): Promise<ExtensionSu
 
 export async function createExtension(workspaceRoot: string, rawBundle: unknown, options: CreateExtensionOptions): Promise<ExtensionRevision> {
 	if (!options || typeof options.authorizeWrite !== "function") throw new Error("createExtension requires an authorization callback")
+	throwIfAborted(options.signal)
 	const bundle = validateExtensionBundle(rawBundle)
 	const root = extensionRoot(workspaceRoot)
 	const idDirectory = path.join(root, bundle.manifest.id)
@@ -414,35 +417,69 @@ export async function createExtension(workspaceRoot: string, rawBundle: unknown,
 	}
 	const uniqueDestinations = [...new Set(destinations)]
 	for (const destination of uniqueDestinations) {
-		if (!await options.authorizeWrite(destination)) throw new Error(`extension write authorization denied for ${destination}`)
+		throwIfAborted(options.signal)
+		const allowed = await options.authorizeWrite(destination)
+		throwIfAborted(options.signal)
+		if (!allowed) throw new Error(`extension write authorization denied for ${destination}`)
 	}
+	throwIfAborted(options.signal)
 	await assertNoSymlinkAncestors(root)
+	throwIfAborted(options.signal)
 	await fs.mkdir(root, { recursive: true, mode: 0o700 })
+	throwIfAborted(options.signal)
 	await assertNoSymlinkAncestors(idDirectory)
+	throwIfAborted(options.signal)
 	await fs.mkdir(idDirectory, { recursive: true, mode: 0o700 })
+	throwIfAborted(options.signal)
 	let exists = false
 	try { await fs.lstat(finalDirectory); exists = true } catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
 	}
-	if (exists) return loadDirectory(workspaceRoot, bundle.manifest.id, digest)
+	if (exists) {
+		throwIfAborted(options.signal)
+		const revision = await loadDirectory(workspaceRoot, bundle.manifest.id, digest)
+		throwIfAborted(options.signal)
+		return revision
+	}
 	await assertNoSymlinkAncestors(idDirectory)
-	await fs.mkdir(stageDirectory, { mode: 0o700 })
+	throwIfAborted(options.signal)
+	let ownsStage = false
 	try {
+		await fs.mkdir(stageDirectory, { mode: 0o700 })
+		ownsStage = true
+		if (createStageBarrierForTests) await createStageBarrierForTests()
+		throwIfAborted(options.signal)
 		await fs.writeFile(path.join(stageDirectory, "manifest.json"), `${canonical(bundle.manifest)}\n`, { flag: "wx", mode: 0o600 })
+		throwIfAborted(options.signal)
 		for (const [file, contents] of Object.entries(bundle.files)) {
 			const destination = path.join(stageDirectory, ...file.split("/"))
 			await fs.mkdir(path.dirname(destination), { recursive: true, mode: 0o700 })
+			throwIfAborted(options.signal)
 			await fs.writeFile(destination, contents, { flag: "wx", mode: 0o600 })
+			throwIfAborted(options.signal)
 		}
 		await assertNoSymlinkAncestors(stageDirectory)
+		throwIfAborted(options.signal)
 		try {
 			await fs.rename(stageDirectory, finalDirectory)
+			ownsStage = false
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST" && (error as NodeJS.ErrnoException).code !== "ENOTEMPTY") throw error
-			return await loadDirectory(workspaceRoot, bundle.manifest.id, digest)
+			throwIfAborted(options.signal)
+			const revision = await loadDirectory(workspaceRoot, bundle.manifest.id, digest)
+			throwIfAborted(options.signal)
+			return revision
 		}
 	} finally {
-		await fs.rm(stageDirectory, { recursive: true, force: true }).catch(() => undefined)
+		if (ownsStage) await fs.rm(stageDirectory, { recursive: true, force: true }).catch(() => undefined)
 	}
 	return loadDirectory(workspaceRoot, bundle.manifest.id, digest)
 }
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw new Error("extension creation was cancelled")
+}
+
+export const extensionRegistryTestHooks = Object.freeze({
+	setCreateStageBarrierForTests: (barrier?: () => Promise<void>) => { createStageBarrierForTests = barrier },
+})
