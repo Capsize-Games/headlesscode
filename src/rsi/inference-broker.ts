@@ -400,6 +400,7 @@ export interface RunningOpenRouterBroker {
 	readonly guestBaseUrl: string
 	readonly localBaseUrl: string
 	readonly port: number
+	readonly maxPromptBytes: number
 	close(): Promise<void>
 	receipt(): Promise<OpenRouterBrokerReceipt>
 }
@@ -689,6 +690,8 @@ export async function startOpenRouterBroker(options: OpenRouterBrokerOptions): P
 	if (!options.apiKey.trim()) throw new Error("host OpenRouter credential is required to start the RSI broker")
 	if (!/^[A-Za-z0-9._:-]{1,160}$/.test(options.jobId) || !options.leaseToken) throw new Error("OpenRouter broker requires a job id and active lease token")
 	const limits = validateOpenRouterBrokerLimits(options.limits)
+	const maxPromptBytes = Math.min(limits.maxInputTokensPerCall, limits.maxRequestBytes) - 128
+	if (!Number.isSafeInteger(maxPromptBytes) || maxPromptBytes <= 0) throw new Error("OpenRouter broker limits are too small to provide a positive prompt byte budget")
 	const capability = randomBytes(32).toString("base64url")
 	const cacheRoutingKey = `hc-rsi-${randomBytes(24).toString("base64url")}`
 	const upstreamFetch = options.upstreamFetch ?? fetch
@@ -813,6 +816,7 @@ export async function startOpenRouterBroker(options: OpenRouterBrokerOptions): P
 		guestBaseUrl: `http://host.openshell.internal:${address.port}`,
 		localBaseUrl: `http://${options.bindHost}:${address.port}`,
 		port: address.port,
+		maxPromptBytes,
 		async close() {
 			if (closed) return
 			closed = true

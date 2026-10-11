@@ -14,15 +14,24 @@ if (!parsed.config || parsed.error) throw new Error(parsed.error ?? "could not c
 const config = parsed.config as RsiConfig
 config.roles = { worker: { provider: "openrouter", model: RSI_OPENROUTER_MODEL } }
 const candidate = { id: "broker-test", model: RSI_OPENROUTER_MODEL } as CandidateRecord
-const broker = { guestBaseUrl: "http://host.openshell.internal:43123", capability: "opaque-attempt-capability", port: 43123 }
+const broker = { guestBaseUrl: "http://host.openshell.internal:43123", capability: "opaque-attempt-capability", port: 43123, maxPromptBytes: 8_192 }
 
 test("OpenRouter guest gets only its job capability and the single broker network endpoint", () => {
-	const env = rsiMutationGuestEnvironment(config, candidate, broker)
+	const env = (() => {
+		const previousPromptBudget = process.env.HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES
+		process.env.HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES = "1"
+		try { return rsiMutationGuestEnvironment(config, candidate, broker) }
+		finally {
+			if (previousPromptBudget === undefined) delete process.env.HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES
+			else process.env.HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES = previousPromptBudget
+		}
+	})()
 	assert.equal(env.HEADLESSCODE_CODE_MODE_BACKEND, "openrouter")
 	assert.equal(env.HEADLESSCODE_CODE_MODE_MODEL, RSI_OPENROUTER_MODEL)
 	assert.equal(env.OPENROUTER_MODEL, RSI_OPENROUTER_MODEL)
 	assert.equal(env.OPENROUTER_BASE_URL, broker.guestBaseUrl)
 	assert.equal(env.HEADLESSCODE_RSI_INFERENCE_CAPABILITY, broker.capability)
+	assert.equal(env.HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES, String(broker.maxPromptBytes))
 	assert.equal(Object.keys(env).some((key) => /(?:API_KEY|SECRET|TOKEN)$/i.test(key)), false, "host provider credentials must not enter guest env")
 	const rules = networkRules("mutation", broker)
 	assert.deepEqual(Object.keys(rules), ["rsi_openrouter_broker"])
@@ -51,6 +60,8 @@ test("OpenRouter guest model resolution honors Muse while retaining the DeepSeek
 		const deepseekEnv = rsiMutationGuestEnvironment(config, candidate, broker)
 		assert.equal(deepseekEnv.OPENROUTER_MODEL, DEFAULT_MODEL)
 		assert.equal(resolveModelForMode({ workspaceRoot, mode: "code", env: deepseekEnv }), DEFAULT_MODEL)
+		const ollamaEnv = rsiMutationGuestEnvironment({ ...config, roles: { worker: { provider: "ollama", model: "local-model" } } }, candidate)
+		assert.equal(Object.hasOwn(ollamaEnv, "HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES"), false, "local inference keeps its existing environment path")
 	} finally {
 		if (previousDataDir === undefined) delete process.env.HEADLESSCODE_DATA_DIR
 		else process.env.HEADLESSCODE_DATA_DIR = previousDataDir
@@ -62,6 +73,10 @@ test("OpenRouter mutation guest refuses missing broker, wrong model, and malform
 	assert.throws(() => rsiMutationGuestEnvironment(config, candidate), /requires a host broker/)
 	assert.throws(() => rsiMutationGuestEnvironment({ ...config, roles: { worker: { provider: "openrouter", model: "deepseek/other" } } }, candidate, broker), /profile\/model identity is not admitted/)
 	assert.throws(() => rsiMutationGuestEnvironment(config, candidate, { ...broker, guestBaseUrl: "https://openrouter.ai" }), /endpoint is malformed/)
+	assert.throws(() => rsiMutationGuestEnvironment(config, candidate, { ...broker, maxPromptBytes: 0 }), /prompt byte budget is malformed/)
+	assert.throws(() => rsiMutationGuestEnvironment(config, candidate, { ...broker, maxPromptBytes: Number.NaN }), /prompt byte budget is malformed/)
+	const legacyBroker = { guestBaseUrl: broker.guestBaseUrl, capability: broker.capability, port: broker.port } as Parameters<typeof rsiMutationGuestEnvironment>[2]
+	assert.throws(() => rsiMutationGuestEnvironment(config, candidate, legacyBroker), /prompt byte budget is malformed/)
 })
 
 test("Muse mutation guest requires the explicit profile and receives only its broker capability", () => {
@@ -71,6 +86,7 @@ test("Muse mutation guest requires the explicit profile and receives only its br
 	assert.equal(env.HEADLESSCODE_CODE_MODE_MODEL, RSI_MUSE_OPENROUTER_MODEL)
 	assert.equal(env.OPENROUTER_BASE_URL, broker.guestBaseUrl)
 	assert.equal(env.HEADLESSCODE_RSI_INFERENCE_CAPABILITY, broker.capability)
+	assert.equal(env.HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES, String(broker.maxPromptBytes))
 	assert.equal(Object.keys(env).some((key) => /(?:API_KEY|SECRET|TOKEN)$/i.test(key)), false)
 	assert.throws(() => rsiMutationGuestEnvironment({ ...museConfig, roles: { worker: { provider: "openrouter", model: RSI_MUSE_OPENROUTER_MODEL } } }, museCandidate, broker), /explicit profile identity/)
 })

@@ -122,6 +122,34 @@ async function setup(t: { after(fn: () => void | Promise<void>): void }, overrid
 	return { root, ledger, broker, upstream }
 }
 
+test("broker prompt byte budget is derived from the tighter admitted input or request ceiling", async (t) => {
+	const tokenBounded = await setup(t, { limits: limits("token-budget", { maxInputTokensPerCall: 4_096, maxRequestBytes: 16_384 }) })
+	assert.equal(tokenBounded.broker.maxPromptBytes, 4_096 - 128)
+	const requestBounded = await setup(t, { limits: limits("request-budget", { maxInputTokensPerCall: 8_000, maxRequestBytes: 2_048 }) })
+	assert.equal(requestBounded.broker.maxPromptBytes, 2_048 - 128)
+})
+
+test("broker rejects limits that cannot provide a positive guest prompt budget before metadata admission", async (t) => {
+	const root = await scratch("rsi-inference-small-prompt-budget")
+	t.after(() => fs.rm(root, { recursive: true, force: true }))
+	let upstreamCalls = 0
+	const upstreamFetch = (async () => {
+		upstreamCalls += 1
+		return new Response(JSON.stringify({ data: { endpoints: [endpointMetadata()] } }), { status: 200 })
+	}) as typeof fetch
+	for (const [campaignId, overrides] of [
+		["small-input-budget", { maxInputTokensPerCall: 128 }],
+		["small-request-budget", { maxRequestBytes: 128 }],
+	] as const) {
+		const ledger = new FileOpenRouterInferenceLedger(path.join(root, `${campaignId}.json`))
+		await assert.rejects(startOpenRouterBroker({
+			jobId: `attempt-${campaignId}`, leaseToken: "lease-small", limits: limits(campaignId, overrides),
+			apiKey: "host-secret", bindHost: "127.0.0.1", ledger, upstreamFetch,
+		}), /too small to provide a positive prompt byte budget/)
+	}
+	assert.equal(upstreamCalls, 0, "an impossible guest prompt budget is rejected before endpoint metadata traffic")
+})
+
 test("Muse broker overwrites both generic cache hints with a job-scoped key and receipts report cached usage", async (t) => {
 	const root = await scratch("rsi-inference-muse")
 	t.after(() => fs.rm(root, { recursive: true, force: true }))
