@@ -5,7 +5,7 @@ import { createServer } from "node:http"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
-import { chromium, type Browser } from "playwright"
+import { chromium, type Browser, type BrowserServer } from "playwright"
 import type { ToolContext } from "../../engine/types.js"
 import { BrowserSession } from "../browser/service.js"
 import { browserActionHandler } from "../browser/handler.js"
@@ -15,7 +15,7 @@ type BrowserSessionState = { browser: Browser | null; server: import("playwright
 type LaunchOptions = { args?: string[]; [key: string]: unknown }
 type BrowserTypeWithServer = {
 	launch: (options?: LaunchOptions) => Promise<Browser>
-	launchServer: (options?: LaunchOptions) => Promise<{ process: () => import("node:child_process").ChildProcess; close: () => Promise<void> }>
+	launchServer: (options?: LaunchOptions) => Promise<BrowserServer>
 	connect: (wsEndpoint: string, options?: Record<string, unknown>) => Promise<Browser>
 }
 
