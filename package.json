@@ -48,6 +48,7 @@
 		"!src/**/*.test.ts",
 		"scripts/spawn-parallel-worktrees.sh",
 		"scripts/run-worker.sh",
+		"scripts/supervise-job-worker.mjs",
 		"scripts/run-muse-worker.sh",
 		"scripts/stop-worker.sh",
 		"scripts/headlesscode-answer.sh",

@@ -143,9 +143,11 @@ generated branches in the same repository, applies `headlesscode:done`, and
 closes the issue. If no matching pull request exists, the result comment says
 so; when branch metadata is unavailable, the comment says lookup could not be
 performed and includes no PR link. A nonzero worker exit applies
-`headlesscode:failed`, posts a summary, and leaves the issue open. Missing or
-malformed markers leave it running. Result
-comments carry an idempotency marker so a restart can retry GitHub updates
+`headlesscode:failed`, posts a summary, and leaves the issue open. For
+OpenShell jobs, a sandbox marker left after an unverified deletion keeps the
+issue running without a terminal summary until the provider verifies sandbox
+absence and removes the marker. Missing or malformed markers leave it running.
+Result comments carry an idempotency marker so a restart can retry GitHub updates
 without posting the same result again.
 
 These receipts prevent ordinary worker-tree files from authorizing completion;

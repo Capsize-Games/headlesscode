@@ -57,11 +57,19 @@ if (!child.pid || !child.stdio[3]) process.exit(2)
 const pid = child.pid
 let identity
 try {
-	const stat = procStat(pid)
-	if (stat.pgrp !== pid || stat.session !== pid || stat.state === "Z" || stat.state === "X") throw new Error("worker was not its process-group leader")
+	let stat
+	for (let attempt = 0; attempt < 50; attempt++) {
+		try { stat = procStat(pid) } catch { await new Promise((resolve) => setTimeout(resolve, 10)); continue }
+		if (stat.pgrp === pid && stat.session === pid && stat.state !== "Z" && stat.state !== "X") break
+		stat = undefined
+		await new Promise((resolve) => setTimeout(resolve, 10))
+	}
+	if (!stat || stat.pgrp !== pid || stat.session !== pid || stat.state === "Z" || stat.state === "X") throw new Error("worker was not its process-group leader")
 	identity = { version: 1, attemptId, group, pid, pgid: pid, startTicks: stat.startTicks }
-	atomicReceipt(path.join(receiptDir, `${group}.launch`), identity)
 	atomicText(path.join(worktree, ".harness.pid"), String(pid))
+	// Publish the attempt-bound receipt last. run-worker treats its appearance
+	// as the startup barrier and immediately checks the matching PID marker.
+	atomicReceipt(path.join(receiptDir, `${group}.launch`), identity)
 } catch {
 	try { process.kill(-pid, "SIGKILL") } catch { /* best effort before any task code is released */ }
 	child.stdio[3].destroy()

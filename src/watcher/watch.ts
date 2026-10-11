@@ -958,6 +958,15 @@ function readJobCompletion(repoRoot: string, groups: readonly WorktreeSpec[], at
 		} catch {
 			return { terminal: false, exitCodes: [], logs: [] }
 		}
+		// The OpenShell provider leaves this host-side marker in place when
+		// sandbox deletion cannot be verified. Its presence vetoes completion;
+		// the worker cannot turn a failed guest teardown into a terminal issue.
+		try {
+			fs.lstatSync(path.join(worktree, ".harness.openshell-sandbox"))
+			return { terminal: false, exitCodes: [], logs: [] }
+		} catch (error) {
+			if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) return { terminal: false, exitCodes: [], logs: [] }
+		}
 		// Worktree markers are useful diagnostics only. Terminal status requires
 		// an attempt-bound receipt written outside the worker-controlled tree and
 		// proof that its recorded process group is no longer executing.

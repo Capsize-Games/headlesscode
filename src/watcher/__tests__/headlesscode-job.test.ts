@@ -145,6 +145,25 @@ async function testForgedWorktreeMarkersCannotFinishLiveWorker(): Promise<void> 
 	assert.equal((await loadWatcherState(h.stateFile)).processed[String(h.issue.number)]?.status, "done", "valid attempt receipt completes only after group teardown")
 }
 
+async function testOpenShellTeardownMarkerKeepsFailedJobActive(): Promise<void> {
+	const h = await harness()
+	await run(h)
+	const groupName = await markGroupComplete(h, 1, "OpenShell teardown failed\n")
+	const worktree = path.join(h.repoRoot, ".worktrees", groupName)
+	const marker = path.join(worktree, ".harness.openshell-sandbox")
+	await fs.writeFile(marker, "synthetic-unverified-sandbox\n")
+	await run(h)
+	const quarantined = await loadWatcherState(h.stateFile)
+	assert.equal(quarantined.processed[String(h.issue.number)]?.status, "spawned", "failed guest deletion remains active while its teardown marker exists")
+	assert.ok(h.issue.labels.includes("headlesscode:running"), "watcher does not publish a terminal failed label before guest absence is verified")
+	assert.equal(h.comments.length, 0, "no terminal failure summary is posted while the sandbox marker remains")
+	await fs.rm(marker)
+	await run(h)
+	assert.equal((await loadWatcherState(h.stateFile)).processed[String(h.issue.number)]?.status, "failed", "verified provider cleanup permits the supervisor's captured failure status")
+	assert.ok(h.issue.labels.includes("headlesscode:failed"))
+	assert.match(h.comments[0] ?? "", /exit 1/)
+}
+
 async function testStaleAttemptAndUnknownIdentityStayRunning(): Promise<void> {
 	const h = await harness()
 	await run(h)
@@ -320,6 +339,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["headlesscode-job: failed marker leaves issue open", testFailedMarkerLeavesIssueOpen],
 	["headlesscode-job: no PR is reported explicitly", testSuccessfulCompletionExplicitlyReportsNoPullRequest],
 	["headlesscode-job: worker-tree markers are diagnostic only", testWorktreeMarkersAreDiagnosticOnly],
+	["headlesscode-job: OpenShell teardown marker keeps failed job active", testOpenShellTeardownMarkerKeepsFailedJobActive],
 	["headlesscode-job: forged worktree markers cannot finish a live process group", testForgedWorktreeMarkersCannotFinishLiveWorker],
 	["headlesscode-job: stale attempt and unknown identity remain active", testStaleAttemptAndUnknownIdentityStayRunning],
 ]

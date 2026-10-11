@@ -32,7 +32,7 @@ build/
 /zoo-code/
 
 # Repo docs/plans are not needed at runtime; scripts/ is mostly dev/deploy
-# tooling too, EXCEPT the three the orchestration path shells out to at
+# tooling too, EXCEPT the runtime scripts the orchestration path uses at
 # runtime (spawn/worker/answer) — re-included explicitly below.
 docs/
 plans/
@@ -40,6 +40,7 @@ recon/
 scripts/
 !scripts/spawn-parallel-worktrees.sh
 !scripts/run-worker.sh
+!scripts/supervise-job-worker.mjs
 !scripts/headlesscode-answer.sh
 !scripts/rsi-training/
 !scripts/rsi-training/*.py
