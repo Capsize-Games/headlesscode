@@ -5,9 +5,10 @@
 # counterpart of "open a VS Code window, paste the task, press Enter".
 #
 # Worker lifecycle:
-#   1. Runs `$HEADLESSCODE_CLI --task-file <task> --workspace <worktree>
-#      --mode <mode>` (or `--task <text>` when given text) as a detached
-#      background process (nohup + setsid + & — no GUI, no X server needed).
+#   1. Runs the selected executor as a detached background process: the
+#      built-in HeadlessCode CLI by default, or native `muse exec` when
+#      `--executor muse` / HEADLESSCODE_AGENT_EXECUTOR=muse is selected.
+#      (nohup + setsid + & — no GUI, no X server needed).
 #      setsid puts the wrapper in its OWN session/process group so a stop
 #      command can kill the whole tree with one negative-PID signal (issue
 #      #20: killing only the wrapper PID used to leave the real child running
@@ -26,6 +27,10 @@
 # Env overrides:
 #   HEADLESSCODE_CLI   command that runs the harness CLI (default
 #                      "npx tsx src/cli.ts", resolved from this repo root)
+#   HEADLESSCODE_AGENT_EXECUTOR  worker implementation (default builtin;
+#                      supported values builtin or muse)
+#   HEADLESSCODE_MUSE_MODEL  optional native Muse Meta model id, separate
+#                      from OPENROUTER_MODEL
 #   HEADLESSCODE_ROOT  repo root containing src/cli.ts (default: this repo)
 #   HEADLESSCODE_MEMORY_DIR  when set, forwarded to the CLI as --memory-dir
 #                      (Phase 3 memory; enables recall+recording for the worker)
@@ -70,7 +75,7 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 <worktree-path> <task-file-or-text> [--mode <slug>] [--model <id>] [--log-file <path>] [--max-iterations <n>]" >&2
+    echo "Usage: $0 <worktree-path> <task-file-or-text> [--executor <builtin|muse>] [--mode <slug>] [--model <id>] [--muse-model <id>] [--log-file <path>] [--max-iterations <n>]" >&2
     exit 2
 }
 
@@ -87,9 +92,23 @@ MODE="code"
 MODEL=""
 LOG_FILE=""
 MAX_ITERATIONS=""
+EXECUTOR="${HEADLESSCODE_AGENT_EXECUTOR:-builtin}"
+MUSE_MODEL="${HEADLESSCODE_MUSE_MODEL:-}"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
+        --executor)
+            if [ "$#" -lt 2 ] || [[ "$2" == --* ]]; then
+                echo "run-worker: --executor requires builtin or muse" >&2
+                exit 2
+            fi
+            EXECUTOR="${2:-}"
+            shift 2
+            ;;
+        --executor=*)
+            EXECUTOR="${1#--executor=}"
+            shift
+            ;;
         --mode)
             MODE="${2:-code}"
             shift 2
@@ -104,6 +123,18 @@ while [ "$#" -gt 0 ]; do
             ;;
         --model=*)
             MODEL="${1#--model=}"
+            shift
+            ;;
+        --muse-model)
+            if [ "$#" -lt 2 ] || [[ "$2" == --* ]]; then
+                echo "run-worker: --muse-model requires a native Muse model id" >&2
+                exit 2
+            fi
+            MUSE_MODEL="${2:-}"
+            shift 2
+            ;;
+        --muse-model=*)
+            MUSE_MODEL="${1#--muse-model=}"
             shift
             ;;
         --log-file)
@@ -128,6 +159,54 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+case "$EXECUTOR" in
+    builtin|muse) ;;
+    *) echo "run-worker: unsupported agent executor '$EXECUTOR' (expected builtin or muse)" >&2; exit 2 ;;
+esac
+if [ -n "$MUSE_MODEL" ] && ! [[ "$MUSE_MODEL" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$ ]]; then
+    echo "run-worker: invalid Muse model identifier" >&2
+    exit 2
+fi
+if [ "$EXECUTOR" = "muse" ]; then
+    if [ -n "$MODEL" ]; then
+        echo "run-worker: --model is a HeadlessCode/OpenRouter model; use --muse-model for the native Muse Meta provider" >&2
+        exit 2
+    fi
+    if [ "$MODE" != "code" ]; then
+        echo "run-worker: Muse executor does not implement HeadlessCode modes; expected --mode code" >&2
+        exit 2
+    fi
+    if [ -n "$LOG_FILE" ]; then
+        echo "run-worker: --log-file is not supported by Muse executor (logs use harness.log)" >&2
+        exit 2
+    fi
+    for unsupported in HEADLESSCODE_MEMORY_DIR HEADLESSCODE_MAX_COST_USD HEADLESSCODE_MAX_DURATION_MS HEADLESSCODE_DECISION_TIMEOUT_MS HEADLESSCODE_WINDOW_SIZE; do
+        if [ -n "${!unsupported:-}" ]; then
+            echo "run-worker: $unsupported is not supported by Muse executor" >&2
+            exit 2
+        fi
+    done
+    if [ -n "${PLAN_FIRST:-}" ]; then
+        echo "run-worker: Muse executor cannot be combined with PLAN_FIRST" >&2
+        exit 2
+    fi
+    if [ "${HEADLESSCODE_EXECUTION_PROVIDER:-local}" != "local" ]; then
+        echo "run-worker: Muse executor requires the local execution provider; OpenShell dispatch is not supported" >&2
+        exit 2
+    fi
+    if [ "${HEADLESSCODE_SECURITY_PROFILE:-}" = "contained" ]; then
+        echo "run-worker: Muse executor cannot run under the contained OpenShell security profile" >&2
+        exit 2
+    fi
+    if ! command -v muse >/dev/null 2>&1; then
+        echo "run-worker: Muse executor selected but 'muse' is not installed or not on PATH" >&2
+        exit 2
+    fi
+elif [ -n "$MUSE_MODEL" ]; then
+    echo "run-worker: --muse-model requires --executor muse" >&2
+    exit 2
+fi
 
 # ── Resolve the harness root + CLI ──────────────────────────────────────────
 HARNESS_ROOT="${HEADLESSCODE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -224,9 +303,36 @@ mkdir '$WT_PATH/.harness.done' 2>/dev/null
 exit \$CODE
 "
 
+if [ "$EXECUTOR" = "muse" ]; then
+    PROMPT_CLEANUP=""
+    mkdir -p "$WT_PATH/.headlesscode/scratch"
+    if [ "$TASK_FLAG" = "--task-file" ]; then
+        MUSE_PROMPT_FILE="$TASK_PATH"
+    else
+        MUSE_PROMPT_FILE="$(mktemp "$WT_PATH/.headlesscode/scratch/muse-prompt.XXXXXXXX")"
+        printf '%s' "$TASK_PATH" > "$MUSE_PROMPT_FILE"
+        PROMPT_CLEANUP="$MUSE_PROMPT_FILE"
+    fi
+    MAX_MODEL_STEPS_VALUE="${MAX_ITERATIONS:-${HEADLESSCODE_MAX_ITERATIONS:-}}"
+    WRAPPER="cd $(printf '%q' "$HARNESS_ROOT")
+bash $(printf '%q' "$HARNESS_ROOT/scripts/run-muse-worker.sh") \
+  $(printf '%q' "$WT_PATH") $(printf '%q' "$MUSE_PROMPT_FILE") \
+  $(printf '%q' "$MUSE_MODEL") $(printf '%q' "$MAX_MODEL_STEPS_VALUE")
+CODE=\$?
+if [ -n $(printf '%q' "$PROMPT_CLEANUP") ]; then rm -f -- $(printf '%q' "$PROMPT_CLEANUP"); fi
+printf '%s' \"\$CODE\" > $(printf '%q' "$WT_PATH/.harness.exit")
+mkdir $(printf '%q' "$WT_PATH/.harness.done") 2>/dev/null
+exit \$CODE
+"
+fi
+
 if [ "${HEADLESSCODE_EXECUTION_PROVIDER:-local}" = "openshell" ]; then
     if [ -z "${HEADLESSCODE_OPENSHELL_POLICY:-}" ] || [ ! -f "$HEADLESSCODE_OPENSHELL_POLICY" ]; then
         echo "run-worker: set HEADLESSCODE_OPENSHELL_POLICY to an existing policy file when using OpenShell" >&2
+        exit 2
+    fi
+    if [ "$EXECUTOR" = "muse" ]; then
+        echo "run-worker: Muse executor requires the local execution provider; OpenShell dispatch is not supported" >&2
         exit 2
     fi
     REPO_ROOT="${TARGET_REPO:-$(git -C "$WT_PATH" rev-parse --show-toplevel)}"

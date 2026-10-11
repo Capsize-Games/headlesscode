@@ -119,7 +119,7 @@ async function testReworkSpawnCarriesResolvedWorkerModel(): Promise<void> {
 	// handleReviewVerdict receives the RESOLVED worker model (what the
 	// orchestrator now passes instead of the raw --model flag).
 	const decision = handleReviewVerdict(group, result, "/tmp/repo", 3, "code", "deepseek/deepseek-chat")
-	assert.ok(decision.spawnCommand?.includes('--model "deepseek/deepseek-chat"'), "rework spawn carries the resolved worker model")
+	assert.match(decision.spawnCommand ?? "", /--model ['"]deepseek\/deepseek-chat['"]/, "rework spawn carries the resolved worker model")
 
 	// No model resolved (no flag, no config) -> no --model arg, the worker's
 	// own default applies — same as the pre-feature behavior.

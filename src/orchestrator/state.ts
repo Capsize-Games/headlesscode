@@ -42,6 +42,10 @@ export interface OrchestratorGroup {
 	worktree?: string
 	branch?: string
 	issues?: number[]
+	/** Agent implementation pinned when this group was spawned. */
+	executor?: "builtin" | "muse"
+	/** Native Muse Meta model id; distinct from the HeadlessCode/OpenRouter model. */
+	museModel?: string
 	/**
 	 * The per-issue shape of this group's work (split.ts's issueShape: hot /
 	 * split / coverage / test / docs / refactor / generic), one entry per
