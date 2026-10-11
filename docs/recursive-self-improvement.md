@@ -25,14 +25,18 @@ archive, host worktree, process-control state, evaluator configuration, and
 scoring logic on the host. A candidate can change its own snapshot and its
 Git metadata; returned changes are checked before host import.
 
-Run `npm run rsi:security-canary` from the repository root to qualify these
-mount and snapshot boundaries against the selected OpenShell gateway and the
-verified RSI image. The command creates a disposable synthetic repository,
-starts an evaluation guest without model inference, attempts reads and writes
-against synthetic host, control, evaluator, scoring, archive, and Git metadata
-canaries, checks the intended workspace write, and records the result under
-`.headlesscode/scratch/`. A pass is specific to the gateway and image used for
-that run; mocked provider tests are not a substitute for this guest check.
+Run `npm run rsi:security-canary` from the repository root to qualify synthetic
+host-path and snapshot behavior against the selected OpenShell gateway and the
+RSI image enforced by the provider. The command creates a disposable synthetic
+repository, starts an evaluation guest without model inference, attempts reads
+and writes against synthetic host, control, evaluator, scoring, archive, and
+Git metadata canaries, checks that those host canaries remain absent or
+unchanged from the guest's attempted writes, checks an intended `/workspace`
+write, and records paths plus guest error codes under `.headlesscode/scratch/`.
+The guest may also have other writable locations such as `/tmp`; this check
+does not claim that `/workspace` is its only writable location. A pass is
+specific to the gateway and image used for that run; mocked provider tests are
+not a substitute for this guest check.
 
 ## Earlier bounded runs (historical)
 
