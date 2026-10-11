@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs"
 import { Pool, type PoolClient } from "pg"
 import type { ResourceClass, WorkerHarnessMode, WorkerHarnessRuntimeIdentity } from "./types.js"
 import { createRsiArtifactStore, type RsiArtifactReference, type RsiArtifactStore } from "./artifact-store.js"
-import { openRouterProfileForModel, type OpenRouterBrokerGrant, type OpenRouterBrokerReceipt, type OpenRouterCallReceipt, type OpenRouterCallReservation, type OpenRouterCallSettlement, type OpenRouterDenialReason, type OpenRouterInferenceLedger, type RsiOpenRouterProfileId } from "./inference-broker.js"
+import { endpointPriceIdentity, openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID, type OpenRouterBrokerGrant, type OpenRouterBrokerReceipt, type OpenRouterCallReceipt, type OpenRouterCallReservation, type OpenRouterCallSettlement, type OpenRouterDenialReason, type OpenRouterEndpointPriceSnapshot, type OpenRouterInferenceLedger, type RsiOpenRouterProfileId } from "./inference-broker.js"
 import type { OpenRouterBrokerLimits } from "./inference-broker.js"
 import { PostgresProofCampaign, type ProofCampaignArmLease, type ProofCampaignManifest } from "./proof-campaign.js"
 
@@ -17,6 +17,7 @@ const MIGRATIONS = [
 	{ version: 7, sql: readFileSync(new URL("./migrations/007_proof_campaign_phases.sql", import.meta.url), "utf8") },
 	{ version: 8, sql: readFileSync(new URL("./migrations/008_openrouter_returned_provider.sql", import.meta.url), "utf8") },
 	{ version: 9, sql: readFileSync(new URL("./migrations/009_openrouter_cached_prompt_tokens.sql", import.meta.url), "utf8") },
+	{ version: 10, sql: readFileSync(new URL("./migrations/010_openrouter_endpoint_price_snapshot.sql", import.meta.url), "utf8") },
 ]
 
 function sha256Text(value: string): string { return createHash("sha256").update(value).digest("hex") }
@@ -31,6 +32,21 @@ function usdCapToMicros(value: number): number {
 	return result
 }
 function microsToUsd(value: unknown): number { return Number(value ?? 0) / 1_000_000 }
+function persistedEndpointPrice(value: unknown): OpenRouterEndpointPriceSnapshot | undefined {
+	let candidate = value
+	if (typeof candidate === "string") {
+		try { candidate = JSON.parse(candidate) } catch { throw new Error("OpenRouter job contains malformed durable endpoint-price evidence") }
+	}
+	if (candidate === null || candidate === undefined) return undefined
+	if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) throw new Error("OpenRouter job contains malformed durable endpoint-price evidence")
+	const price = candidate as Partial<OpenRouterEndpointPriceSnapshot>
+	if (typeof price.model !== "string" || typeof price.provider !== "string" || typeof price.endpointTag !== "string"
+		|| (price.quantization !== undefined && typeof price.quantization !== "string")
+		|| !Array.isArray(price.supportedParameters) || !price.supportedParameters.every((item) => typeof item === "string")
+		|| !Number.isFinite(price.inputPricePerMillionUsd) || !Number.isFinite(price.outputPricePerMillionUsd)
+		|| typeof price.observedAt !== "string" || typeof price.responseSha256 !== "string") throw new Error("OpenRouter job contains malformed durable endpoint-price evidence")
+	return price as OpenRouterEndpointPriceSnapshot
+}
 
 export interface FleetQueuePolicy {
 	queueName: string
@@ -451,6 +467,8 @@ export class PostgresRsiJobQueue {
 
 	async register(grant: OpenRouterBrokerGrant): Promise<number> {
 		const profile = openRouterProfileForModel(grant.model, grant.profileId)
+		const endpointPrice = profile.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? undefined : grant.endpointPrice
+		if (profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID && !endpointPrice) throw new Error("Muse OpenRouter grant is missing its admitted endpoint-price snapshot")
 		const campaignMicros = usdCapToMicros(grant.limits.maxCampaignSpendUsd)
 		const jobMicros = usdCapToMicros(grant.limits.maxJobSpendUsd)
 		const capabilityHash = sha256Text(grant.capability)
@@ -470,18 +488,21 @@ export class PostgresRsiJobQueue {
 			if (leaseLock.rowCount !== 1) throw new Error("OpenRouter broker grant is stale or fenced")
 			const limitsJson = JSON.stringify(grant.limits)
 			await client.query(
-				`INSERT INTO headlesscode_rsi_inference_jobs(job_id,campaign_id,provider,model,limits,lease_token_sha256,capability_sha256,max_spend_microusd,max_calls,max_tokens,max_duration_ms)
-				 VALUES($1,$2,'openrouter',$3,$4::jsonb,$5,$6,$7,$8,$9,$10)
-				 ON CONFLICT(job_id) DO UPDATE SET lease_token_sha256=EXCLUDED.lease_token_sha256, capability_sha256=EXCLUDED.capability_sha256
-				 WHERE headlesscode_rsi_inference_jobs.campaign_id=EXCLUDED.campaign_id
-				 AND headlesscode_rsi_inference_jobs.provider=EXCLUDED.provider
-				 AND headlesscode_rsi_inference_jobs.model=EXCLUDED.model
-				 AND headlesscode_rsi_inference_jobs.limits=EXCLUDED.limits`,
-				[grant.jobId, grant.limits.campaignId, grant.model, limitsJson, leaseHash, capabilityHash, jobMicros, grant.limits.maxCalls, grant.limits.maxTotalTokens, grant.limits.maxDurationMs],
+				`INSERT INTO headlesscode_rsi_inference_jobs(job_id,campaign_id,provider,model,limits,lease_token_sha256,capability_sha256,max_spend_microusd,max_calls,max_tokens,max_duration_ms,endpoint_price)
+				 VALUES($1,$2,'openrouter',$3,$4::jsonb,$5,$6,$7,$8,$9,$10,$11::jsonb)
+				 ON CONFLICT(job_id) DO NOTHING`,
+				[grant.jobId, grant.limits.campaignId, grant.model, limitsJson, leaseHash, capabilityHash, jobMicros, grant.limits.maxCalls, grant.limits.maxTotalTokens, grant.limits.maxDurationMs, endpointPrice ? JSON.stringify(endpointPrice) : null],
 			)
-			const job = await client.query("SELECT lease_token_sha256,capability_sha256,campaign_id,model,limits,started_at FROM headlesscode_rsi_inference_jobs WHERE job_id=$1 FOR UPDATE", [grant.jobId])
+			const job = await client.query("SELECT lease_token_sha256,capability_sha256,campaign_id,provider,model,limits,started_at,endpoint_price FROM headlesscode_rsi_inference_jobs WHERE job_id=$1 FOR UPDATE", [grant.jobId])
 			const row = job.rows[0]
-			if (!row || row.lease_token_sha256 !== leaseHash || row.capability_sha256 !== capabilityHash || row.campaign_id !== grant.limits.campaignId || row.model !== grant.model || stableJson(row.limits) !== stableJson(grant.limits)) throw new Error("OpenRouter job grant conflicts with existing accounting identity")
+			if (!row || row.campaign_id !== grant.limits.campaignId || row.provider !== "openrouter" || row.model !== grant.model || stableJson(row.limits) !== stableJson(grant.limits)) throw new Error("OpenRouter job grant conflicts with existing accounting identity")
+			const persistedPrice = persistedEndpointPrice(row.endpoint_price)
+			const priceMatches = endpointPrice === undefined
+				? persistedPrice === undefined
+				: persistedPrice !== undefined && stableJson(endpointPriceIdentity(persistedPrice)) === stableJson(endpointPriceIdentity(endpointPrice))
+			if (!priceMatches) throw new Error("OpenRouter job grant conflicts with existing endpoint-price identity")
+			// Preserve the first complete snapshot while allowing fresh metadata timestamps/hashes on restart.
+			await client.query("UPDATE headlesscode_rsi_inference_jobs SET lease_token_sha256=$2,capability_sha256=$3 WHERE job_id=$1", [grant.jobId, leaseHash, capabilityHash])
 			const startedAtMs = Date.parse(String(row.started_at))
 			if (!Number.isFinite(startedAtMs)) throw new Error("OpenRouter job has an invalid durable start time")
 			return startedAtMs + grant.limits.maxDurationMs
@@ -604,6 +625,14 @@ export class PostgresRsiJobQueue {
 			return { statusCode: Number(match[1]), reason: match[2] as OpenRouterDenialReason, count: Number(rawCount) }
 		})
 		const profile = openRouterProfileForModel(grant.model, grant.profileId)
+		const endpointPrice = persistedEndpointPrice(job.endpoint_price)
+		if (profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID) {
+			if (!endpointPrice || !grant.endpointPrice || stableJson(endpointPriceIdentity(endpointPrice)) !== stableJson(endpointPriceIdentity(grant.endpointPrice))) {
+				throw new Error("OpenRouter Muse receipt is missing matching durable endpoint-price evidence")
+			}
+		} else if (endpointPrice) {
+			throw new Error("legacy DeepSeek OpenRouter receipt unexpectedly contains endpoint-price evidence")
+		}
 		const calls: OpenRouterCallReceipt[] = callResult.rows.map((row) => ({
 			jobId: grant.jobId, campaignId: String(job.campaign_id), model: grant.model, ...(profile.id !== "deepseek-deepinfra-fp8" ? { profileId: profile.id } : {}),
 			callId: String(row.call_id), requestSha256: String(row.request_sha256), reservedUsd: microsToUsd(row.reserved_spend_microusd),
@@ -631,7 +660,7 @@ export class PostgresRsiJobQueue {
 			&& Number(job.spent_microusd) <= Number(job.max_spend_microusd) && Number(job.reserved_spend_microusd) === 0
 			&& Number(job.reserved_tokens) === 0 && !job.blocked && campaignResult.rows[0]?.blocked !== true && currentLease && grantMatches
 		return {
-			provider: "openrouter", endpointProvider: profile.endpointProvider, jobId: grant.jobId, campaignId: String(job.campaign_id), model: grant.model, ...(profile.id !== "deepseek-deepinfra-fp8" ? { profileId: profile.id, ...(grant.endpointPrice ? { endpointPrice: grant.endpointPrice } : {}) } : {}),
+			provider: "openrouter", endpointProvider: profile.endpointProvider, jobId: grant.jobId, campaignId: String(job.campaign_id), model: grant.model, ...(profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { profileId: profile.id, ...(endpointPrice ? { endpointPrice } : {}) } : {}),
 			returnedModels: [...new Set(calls.map((call) => call.returnedModel).filter((model): model is string => Boolean(model)))],
 			returnedProviders: [...new Set(calls.map((call) => call.returnedProvider).filter((provider): provider is string => Boolean(provider)))],
 			calls: calls.length, promptTokens, completionTokens,

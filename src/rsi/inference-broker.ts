@@ -172,7 +172,7 @@ function profileReceiptIdentity(profile: RsiOpenRouterProfile): { profileId?: Rs
 	return profile.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? {} : { profileId: profile.id }
 }
 
-function endpointPriceIdentity(price: OpenRouterEndpointPriceSnapshot): Pick<OpenRouterEndpointPriceSnapshot, "model" | "provider" | "endpointTag" | "quantization" | "supportedParameters" | "inputPricePerMillionUsd" | "outputPricePerMillionUsd"> {
+export function endpointPriceIdentity(price: OpenRouterEndpointPriceSnapshot): Pick<OpenRouterEndpointPriceSnapshot, "model" | "provider" | "endpointTag" | "quantization" | "supportedParameters" | "inputPricePerMillionUsd" | "outputPricePerMillionUsd"> {
 	return {
 		model: price.model,
 		provider: price.provider,
