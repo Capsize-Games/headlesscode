@@ -113,6 +113,7 @@ export const DEFAULT_PRICING_TABLE: PricingTable = {
 	"muse-spark-1.3": { input: 1.25, output: 4.25, cacheRead: 0.15 },
 	"muse-spark-1.2": { input: 1.25, output: 4.25, cacheRead: 0.15 },
 	"muse-spark-1.1": { input: 1.25, output: 4.25, cacheRead: 0.15 },
+	"muse-spark-1.3-contributor": { input: 0.1, output: 0.2, cacheRead: 0.002 },
 	"muse-spark-1.2-contributor": { input: 0.1, output: 0.2, cacheRead: 0.002 },
  "anthropic/claude-3.5-sonnet": { input: 3.0, output: 15.0 },
  "qwen/qwen3-embedding-4b": { input: 0.15, output: 0.15 },
