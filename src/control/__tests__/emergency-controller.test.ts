@@ -215,7 +215,7 @@ async function testLongUnixSocketPathFailsBeforeListen(): Promise<void> {
 
 async function testQueuedResumeCannotUndoLaterStop(): Promise<void> {
 	const root = await fs.mkdtemp(path.join(process.cwd(), ".headlesscode", "scratch", "control-test-"))
-	const control = await EmergencyControl.start({ identity: "resume-fence", stateDirectory: root, socketDirectory, graceMs: 100 })
+	const control = await EmergencyControl.start({ identity: "resume-fence", stateDirectory: root, socketDirectory, graceMs: 1_000 })
 	let releasePauseCleanup!: () => void
 	let pauseCleanupStarted!: () => void
 	const cleanupGate = new Promise<void>((resolve) => { releasePauseCleanup = resolve })
