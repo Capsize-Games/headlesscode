@@ -309,10 +309,12 @@ export class SessionExtensionRuntime {
 		this.disposalPromise = Promise.resolve().then(async () => {
 			for (const controller of controllers) controller.abort()
 			await Promise.allSettled(operations)
-			await Promise.all([
+			const teardownResults = await Promise.allSettled([
 				...Array.from(this.transports, (transport) => transport.close()),
 				...Array.from(this.children, (child) => child.stop()),
 			])
+			const teardownErrors = teardownResults.flatMap((result) => result.status === "rejected" ? [result.reason] : [])
+			if (teardownErrors.length > 0) throw new AggregateError(teardownErrors, "extension runtime could not verify teardown of every owned process")
 			this.transports.clear()
 			this.children.clear()
 		})

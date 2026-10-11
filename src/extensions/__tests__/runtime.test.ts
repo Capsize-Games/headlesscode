@@ -5,6 +5,7 @@ import { setTimeout as delay } from "node:timers/promises"
 
 import { createExtension, loadExtension, type ExtensionBundle, type ExtensionRevision } from "../registry.js"
 import { extensionRuntimeTestHooks, SessionExtensionRuntime } from "../runtime.js"
+import { ownedChildProcessTestHooks } from "../bounded-stdio-transport.js"
 import type { ToolContext } from "../../engine/types.js"
 
 const scratchRoot = path.join(process.cwd(), ".headlesscode", "scratch")
@@ -138,6 +139,89 @@ async function testHardTimeoutAndDescendantTeardown(workspaceRoot: string): Prom
 	} finally { await runtime.dispose() }
 }
 
+async function testContainedProcessGroupTeardownUsesVerifiedMembers(workspaceRoot: string): Promise<void> {
+	const pidFile = path.join(workspaceRoot, "epperm-fallback-child.pid")
+	const revision = await createFixture(workspaceRoot, toolBundle("epperm-fallback", `import { writeFileSync } from "node:fs"; export async function run(input) { const { spawn } = await import("node:child_process"); const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" }); writeFileSync(input.pidFile, String(child.pid)); await new Promise(() => {}); }`))
+	const runtime = new SessionExtensionRuntime({ workspaceRoot, permissions: permissions(), limits: { callTimeoutMs: 500 } })
+	const originalKill = process.kill.bind(process)
+	const processRef = process as NodeJS.Process & { kill: typeof process.kill }
+	let groupSignalAttempts = 0
+	const directSignals: number[] = []
+	processRef.kill = ((pid: number, signal?: NodeJS.Signals | 0) => {
+		if (pid < 0 && signal !== 0) {
+			groupSignalAttempts++
+			const error = new Error("contained process-group signal denied") as NodeJS.ErrnoException
+			error.code = "EPERM"
+			throw error
+		}
+		if (pid > 0 && signal !== 0) directSignals.push(pid)
+		return originalKill(pid, signal)
+	}) as typeof process.kill
+	try {
+		await assert.rejects(runtime.call(revision, { mode: "descendant", pidFile }, { permissions: permissions() }), /cancel|deadline/i)
+		const descendantPid = Number(await fs.readFile(pidFile, "utf8"))
+		assert.ok(Number.isSafeInteger(descendantPid) && descendantPid > 0)
+		assert.equal(await processIsGone(descendantPid), true, "verified per-member termination removes the descendant")
+		assert.equal(groupSignalAttempts, 0, "Linux avoids the EPERM-prone negative-PGID syscall instead of silently falling back after it")
+		assert.ok(directSignals.includes(descendantPid), "each descendant PID is signaled only after group/session/start-time verification")
+		await runtime.dispose()
+	} finally {
+		processRef.kill = originalKill
+		await runtime.dispose()
+	}
+}
+
+async function testContainedTeardownFailureIsPropagated(workspaceRoot: string): Promise<void> {
+	const pidFile = path.join(workspaceRoot, "epperm-failure-child.pid")
+	const revision = await createFixture(workspaceRoot, toolBundle("epperm-failure", `import { writeFileSync } from "node:fs"; export async function run(input) { writeFileSync(input.pidFile, String(process.pid)); setInterval(() => {}, 1000); await new Promise(() => {}); }`))
+	const runtime = new SessionExtensionRuntime({ workspaceRoot, permissions: permissions(), limits: { callTimeoutMs: 500 } })
+	const originalKill = process.kill.bind(process)
+	const processRef = process as NodeJS.Process & { kill: typeof process.kill }
+	let ownedPid = 0
+	const unhandled: unknown[] = []
+	const onUnhandled = (error: unknown) => { unhandled.push(error) }
+	process.on("unhandledRejection", onUnhandled)
+	processRef.kill = ((pid: number, signal?: NodeJS.Signals | 0) => {
+		if (pid < 0 && signal !== 0) {
+			const error = new Error("contained process-group signal denied") as NodeJS.ErrnoException
+			error.code = "EPERM"
+			throw error
+		}
+		if (pid > 0 && signal !== 0) {
+			const error = new Error("contained owned-process signal denied") as NodeJS.ErrnoException
+			error.code = "EPERM"
+			throw error
+		}
+		return originalKill(pid, signal)
+	}) as typeof process.kill
+	try {
+		const call = runtime.call(revision, { mode: "hang", pidFile }, { permissions: permissions() })
+		await waitForFile(pidFile, 2_000)
+		ownedPid = Number(await fs.readFile(pidFile, "utf8"))
+		await assert.rejects(call, (error: unknown) => error instanceof AggregateError || (error instanceof Error && error.name === "OwnedProcessTeardownError"), "cleanup denial must fail the operation instead of claiming the child was stopped")
+		await new Promise<void>((resolve) => setTimeout(resolve, 50))
+		assert.deepEqual(unhandled, [], "background close/timeout cleanup failures are handled and reported without an unhandled rejection")
+	} finally {
+		processRef.kill = originalKill
+		if (ownedPid > 0) {
+			try { originalKill(ownedPid, "SIGKILL") } catch { /* fixture process may already be gone */ }
+			assert.equal(await processIsGone(ownedPid), true, "test reaps the fixture process after restoring the real signal path")
+		}
+		process.off("unhandledRejection", onUnhandled)
+		await runtime.dispose().catch(() => undefined)
+	}
+}
+
+function testOwnedProcessIdentityRejectsReuseAndMalformedStat(): void {
+	const fields = ["R", "11", "42", "42", "0", "-1", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "987654"]
+	const identity = ownedChildProcessTestHooks.parseLinuxProcessStat(42, `42 (node ) worker) ${fields.join(" ")}`)
+	assert.deepEqual(identity, { pid: 42, state: "R", processGroupId: 42, sessionId: 42, startTime: "987654" }, "stat parsing handles parenthesized command names and captures the process start time")
+	assert.equal(ownedChildProcessTestHooks.matchesOwnedProcessIdentity(identity, identity), true)
+	assert.equal(ownedChildProcessTestHooks.matchesOwnedProcessIdentity({ ...identity, startTime: "987655" }, identity), false, "a reused PID with a different start time is not an owned process")
+	assert.equal(ownedChildProcessTestHooks.matchesOwnedProcessIdentity({ ...identity, sessionId: 99 }, identity), false, "a process from another session cannot be signaled as a group member")
+	assert.throws(() => ownedChildProcessTestHooks.parseLinuxProcessStat(42, "42 (short) R 1"), /could not verify an owned process identity/)
+}
+
 const MCP_SERVER_SOURCE = `import { Server } from "@modelcontextprotocol/sdk/server";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -257,6 +341,9 @@ const workspaceRoot = await fs.mkdtemp(path.join(scratchRoot, "extension-runtime
 try {
 	await testNativeHelperBoundsPermissionsAndCapturedRevision(workspaceRoot)
 	await testHardTimeoutAndDescendantTeardown(workspaceRoot)
+	await testContainedProcessGroupTeardownUsesVerifiedMembers(workspaceRoot)
+	await testContainedTeardownFailureIsPropagated(workspaceRoot)
+	testOwnedProcessIdentityRejectsReuseAndMalformedStat()
 	await testMcpHandshakeSchemaAndCall(workspaceRoot)
 	await testMcpDescribeUsesCurrentPermissions(workspaceRoot)
 	await testMcpDescribeAbortTearsDownInspectProcess(workspaceRoot)
