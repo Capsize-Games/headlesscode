@@ -45,6 +45,12 @@
 		"src/",
 		"!src/**/__tests__/",
 		"!src/**/*.test.ts",
+		"scripts/spawn-parallel-worktrees.sh",
+		"scripts/run-worker.sh",
+		"scripts/run-muse-worker.sh",
+		"scripts/stop-worker.sh",
+		"scripts/headlesscode-answer.sh",
+		"scripts/deploy-gate.sh",
 		"docs/muse-cache-qualification.md"
 	],
 	"scripts": {
