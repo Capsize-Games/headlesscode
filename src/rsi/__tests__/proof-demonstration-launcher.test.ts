@@ -6,7 +6,7 @@ import test from "node:test"
 import { createHash, generateKeyPairSync } from "node:crypto"
 import { appendRun } from "../archive.js"
 import type { RsiConfig, RsiRunRecord, WorkerHarnessRuntimeIdentity } from "../types.js"
-import { assertEngineeringTransition, isFullyConfirmedRun, parseProofDemonstrationArgs, runEngineeringArm, runFrozenCampaignArm, validateRuntimeEvaluatorIntegrity } from "../../../scripts/rsi-proof-demonstration.js"
+import { assertEngineeringTransition, assertProofWorkerProfile, isFullyConfirmedRun, parseProofDemonstrationArgs, runEngineeringArm, runFrozenCampaignArm, validateRuntimeEvaluatorIntegrity } from "../../../scripts/rsi-proof-demonstration.js"
 import type { FrozenProofDemonstrationManifest } from "../proof-demonstration-manifest.js"
 import { proofCampaignManifestDigest, type ProofCampaignManifest } from "../proof-campaign.js"
 import { RSI_MUSE_OPENROUTER_MODEL, RSI_OPENROUTER_MODEL } from "../inference-broker.js"
@@ -83,6 +83,33 @@ test("proof CLI admits explicit Muse selection while keeping legacy DeepSeek as 
 	assert.throws(() => parseProofDemonstrationArgs(["execute", "--openrouter-profile", "muse-spark-contributor"]), /only valid for estimate, engineering, or plan/)
 })
 
+test("proof worker profile validation rejects environment role overrides before dispatch", () => {
+	const muse = { provider: "openrouter", model: RSI_MUSE_OPENROUTER_MODEL, openRouterProfile: "muse-spark-contributor" } as const
+	const config = { model: RSI_MUSE_OPENROUTER_MODEL, roles: { worker: muse } } as RsiConfig
+	assert.doesNotThrow(() => assertProofWorkerProfile(config, { id: "muse-spark-contributor", model: RSI_MUSE_OPENROUTER_MODEL } as never, {}))
+	assert.throws(() => assertProofWorkerProfile(config, { id: "muse-spark-contributor", model: RSI_MUSE_OPENROUTER_MODEL } as never, {
+		HEADLESSCODE_RSI_ROLE_WORKER_PROVIDER: "openrouter",
+		HEADLESSCODE_RSI_ROLE_WORKER_MODEL: RSI_OPENROUTER_MODEL,
+		HEADLESSCODE_RSI_ROLE_WORKER_OPENROUTER_PROFILE: "deepseek-deepinfra-fp8",
+	}), /must match frozen OpenRouter profile/)
+	const legacy = { model: RSI_OPENROUTER_MODEL, roles: { worker: { provider: "openrouter", model: RSI_OPENROUTER_MODEL } } } as RsiConfig
+	assert.doesNotThrow(() => assertProofWorkerProfile(legacy, { id: "deepseek-deepinfra-fp8", model: RSI_OPENROUTER_MODEL } as never, {}), "legacy DeepSeek profile remains implicit")
+})
+
+test("engineering launcher refuses a matched alternate profile environment before invoking the runner", async () => {
+	const scratch = path.join(process.cwd(), ".headlesscode", "scratch")
+	const archiveDir = path.join(scratch, "proof-profile-before-dispatch")
+	const runtime: WorkerHarnessRuntimeIdentity = { imageName: "image", imageDigest: `sha256:${"b".repeat(64)}`, harnessCommit: "c".repeat(40), dependencyLockDigest: "d".repeat(64) }
+	const config = { archiveDir, model: RSI_MUSE_OPENROUTER_MODEL, roles: { worker: { provider: "openrouter", model: RSI_MUSE_OPENROUTER_MODEL, openRouterProfile: "muse-spark-contributor" } } } as RsiConfig
+	let dispatched = false
+	await assert.rejects(() => runEngineeringArm(config, `rsi-proof-${"a".repeat(20)}`, "fixed-control", "e".repeat(40), "seed", runtime, async () => { dispatched = true; throw new Error("must fail before dispatch") }, {
+		HEADLESSCODE_RSI_ROLE_WORKER_PROVIDER: "openrouter",
+		HEADLESSCODE_RSI_ROLE_WORKER_MODEL: RSI_OPENROUTER_MODEL,
+		HEADLESSCODE_RSI_ROLE_WORKER_OPENROUTER_PROFILE: "deepseek-deepinfra-fp8",
+	}), /must match frozen OpenRouter profile/)
+	assert.equal(dispatched, false)
+})
+
 test("engineering verifier requires a terminal fixed-control generation-one decision", () => {
 	const parentCommit = "1".repeat(40)
 	const childCommit = "2".repeat(40)
@@ -120,13 +147,13 @@ test("engineering replay reuses a finished fixed arm after a crash before self-h
 		const campaign = `rsi-proof-${"a".repeat(20)}`
 		const arm = "fixed-control" as const
 		const runtime: WorkerHarnessRuntimeIdentity = { imageName: "image", imageDigest: `sha256:${"b".repeat(64)}`, harnessCommit: "c".repeat(40), dependencyLockDigest: "d".repeat(64) }
-		const config = { archiveDir: root, model: RSI_OPENROUTER_MODEL, generations: 2, seed: "engineering-seed" } as RsiConfig
+		const config = { archiveDir: root, model: RSI_OPENROUTER_MODEL, roles: { worker: { provider: "openrouter", model: RSI_OPENROUTER_MODEL } }, generations: 2, seed: "engineering-seed" } as RsiConfig
 		const finished = {
 			runId: `${campaign}-fixed`, startedAt: "2026-09-30T00:00:00Z", finishedAt: "2026-09-30T00:01:00Z",
 			model: RSI_OPENROUTER_MODEL, baseRef: "main", baseCommit: "e".repeat(40), generations: 2, candidates: [], reports: [],
 			workerHarnessPairId: campaign, workerHarnessMode: arm, workerHarnessSamplingSeed: "engineering-seed", workerHarnessRuntime: runtime,
 			proofCampaign: {
-				manifest: { phaseMode: "engineering-only", schedule: [] }, manifestSha256: "f".repeat(64), campaignId: campaign, armId: arm, epoch: 1,
+				manifest: { phaseMode: "engineering-only", schedule: [], model: { provider: "openshell-openrouter", id: RSI_OPENROUTER_MODEL, settings: { roles: { worker: { provider: "openrouter", model: RSI_OPENROUTER_MODEL } } } } }, manifestSha256: "f".repeat(64), campaignId: campaign, armId: arm, epoch: 1,
 				ledgerSnapshot: { arms: [{ arm_id: arm, state: "finished" }] }, state: "finished",
 			},
 		} as unknown as RsiRunRecord
@@ -138,6 +165,29 @@ test("engineering replay reuses a finished fixed arm after a crash before self-h
 		})
 		assert.equal(resumed.runId, finished.runId)
 		assert.equal(runnerCalls, 0)
+	} finally {
+		await fs.rm(root, { recursive: true, force: true })
+	}
+})
+
+test("engineering replay rejects persisted run whose nested campaign profile differs from its run identity", async () => {
+	const scratch = path.join(process.cwd(), ".headlesscode", "scratch")
+	await fs.mkdir(scratch, { recursive: true, mode: 0o700 })
+	const root = await fs.mkdtemp(path.join(scratch, "proof-profile-replay-"))
+	try {
+		const campaign = `rsi-proof-${"a".repeat(20)}`
+		const runtime: WorkerHarnessRuntimeIdentity = { imageName: "image", imageDigest: `sha256:${"b".repeat(64)}`, harnessCommit: "c".repeat(40), dependencyLockDigest: "d".repeat(64) }
+		const config = { archiveDir: root, model: RSI_MUSE_OPENROUTER_MODEL, roles: { worker: { provider: "openrouter", model: RSI_MUSE_OPENROUTER_MODEL, openRouterProfile: "muse-spark-contributor" } }, generations: 2, seed: "engineering-seed" } as RsiConfig
+		const mismatched = {
+			runId: `${campaign}-fixed`, startedAt: "2026-09-30T00:00:00Z", finishedAt: "2026-09-30T00:01:00Z",
+			model: RSI_MUSE_OPENROUTER_MODEL, openRouterProfileId: "muse-spark-contributor", baseRef: "main", baseCommit: "e".repeat(40), generations: 2, candidates: [], reports: [],
+			workerHarnessPairId: campaign, workerHarnessMode: "fixed-control", workerHarnessSamplingSeed: "engineering-seed", workerHarnessRuntime: runtime,
+			proofCampaign: { manifest: { phaseMode: "engineering-only", schedule: [], model: { provider: "openshell-openrouter", id: RSI_OPENROUTER_MODEL } }, manifestSha256: "f".repeat(64), campaignId: campaign, armId: "fixed-control", epoch: 1, state: "finished", ledgerSnapshot: { arms: [{ arm_id: "fixed-control", state: "finished" }] } },
+		} as unknown as RsiRunRecord
+		await appendRun(root, mismatched)
+		let dispatched = false
+		await assert.rejects(() => runEngineeringArm(config, campaign, "fixed-control", mismatched.baseCommit, "engineering-seed", runtime, async () => { dispatched = true; throw new Error("should not dispatch") }, {}), /model\/profile differs/)
+		assert.equal(dispatched, false)
 	} finally {
 		await fs.rm(root, { recursive: true, force: true })
 	}
