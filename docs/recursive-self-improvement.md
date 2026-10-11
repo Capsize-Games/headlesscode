@@ -390,11 +390,16 @@ campaigns. Engineering-only manifests contain no confirmation task IDs or
 confirmation schedule cells.
 
 Use the staged commands below from a clean checkout with the exact fixed and
-self-hosted harness image identities configured. Estimate and plan fetch only
-the pinned endpoint's read-only price metadata. Execution requires PostgreSQL,
-OpenShell, the broker, the model key on the supervisor, finite per-role
-allocations, and a separately reviewed operator cap. No production inference
-has been run as part of this implementation.
+self-hosted harness image identities configured. The launcher retains the
+historical DeepSeek V4 Flash / DeepInfra profile when `--openrouter-profile` is
+omitted. To select Muse Spark Contributor, pass
+`--openrouter-profile muse-spark-contributor` to both engineering and plan;
+the development evidence and final plan must use the same admitted profile.
+The frozen manifest records its profile, model, and endpoint-price metadata.
+Estimate and plan fetch only the selected endpoint's read-only price metadata.
+Execution requires PostgreSQL, OpenShell, the broker, the model key on the
+supervisor, finite per-role allocations, and a separately reviewed operator
+cap. No production inference has been run as part of this implementation.
 
 ```sh
 # Review the engineering-only schedule and live price before choosing a cap.

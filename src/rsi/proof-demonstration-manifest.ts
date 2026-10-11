@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto"
-import { RSI_OPENROUTER_ENDPOINT_PROVIDER, RSI_OPENROUTER_ENDPOINT_QUANTIZATION, RSI_OPENROUTER_ENDPOINT_TAG, type OpenRouterEndpointPriceSnapshot } from "./inference-broker.js"
+import { openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID, type OpenRouterEndpointPriceSnapshot, type RsiOpenRouterProfileId } from "./inference-broker.js"
 import type { OpenRouterBrokerLimits } from "./inference-broker.js"
 import type { ProofDemonstrationPlan } from "./proof-demonstration-plan.js"
 import type { RsiConfig } from "./types.js"
@@ -10,7 +10,7 @@ export interface FrozenProofDemonstrationManifest {
 	createdAt: string
 	rootCommit: string
 	benchmarkManifestSha256: string
-	model: { provider: "openshell-openrouter"; requestedId: string; sampling: { temperature: 0; think: false; seed: "provider-default" } }
+	model: { provider: "openshell-openrouter"; requestedId: string; profileId?: RsiOpenRouterProfileId; sampling: { temperature: 0; think: false; seed: "provider-default" } }
 	endpointPrice: OpenRouterEndpointPriceSnapshot
 	priceCeilingsPerMillionUsd: { input: number; output: number }
 	runtime: WorkerHarnessRuntimeIdentity
@@ -49,12 +49,18 @@ export function frozenProofConfigDigest(config: unknown): string {
 	return createHash("sha256").update(JSON.stringify(canonical(config))).digest("hex")
 }
 
+function verifyEndpointProfile(model: FrozenProofDemonstrationManifest["model"], endpointPrice: OpenRouterEndpointPriceSnapshot): void {
+	const profile = openRouterProfileForModel(model.requestedId, model.profileId)
+	if (profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID && model.profileId !== profile.id) throw new Error("non-default proof demonstration profile identity must be explicit")
+	if (endpointPrice.model !== model.requestedId || endpointPrice.provider !== profile.endpointProvider || endpointPrice.endpointTag !== profile.endpointTag || endpointPrice.quantization !== profile.quantization || !profile.requiredParameters.every((parameter) => endpointPrice.supportedParameters.includes(parameter))) throw new Error(`endpoint price identity differs from the admitted ${profile.id} route`)
+}
+
 export function freezeProofDemonstrationManifest(args: Omit<FrozenProofDemonstrationManifest, "schemaVersion" | "digestSha256">): FrozenProofDemonstrationManifest {
 	if (!/^[a-f0-9]{40}$/.test(args.rootCommit)) throw new Error("proof demonstration root commit must be a full commit SHA")
 	if (!/^[a-f0-9]{64}$/.test(args.benchmarkManifestSha256)) throw new Error("proof demonstration benchmark manifest digest is malformed")
 	if (!Number.isFinite(args.operatorCapUsd) || args.operatorCapUsd <= 0) throw new Error("proof demonstration requires a positive finite operator cap")
 	if (new Set([args.seeds.engineering, ...args.seeds.campaigns]).size !== 4 || [args.seeds.engineering, ...args.seeds.campaigns].some((seed) => !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(seed))) throw new Error("proof demonstration requires four distinct explicit seeds")
-	if (args.endpointPrice.model !== args.model.requestedId || args.endpointPrice.provider !== RSI_OPENROUTER_ENDPOINT_PROVIDER || args.endpointPrice.endpointTag !== RSI_OPENROUTER_ENDPOINT_TAG || args.endpointPrice.quantization !== RSI_OPENROUTER_ENDPOINT_QUANTIZATION) throw new Error("endpoint price identity differs from the frozen DeepInfra fp8 model route")
+	verifyEndpointProfile(args.model, args.endpointPrice)
 	if (![args.priceCeilingsPerMillionUsd.input, args.priceCeilingsPerMillionUsd.output].every((value) => Number.isFinite(value) && value > 0) || args.priceCeilingsPerMillionUsd.input < args.endpointPrice.inputPricePerMillionUsd || args.priceCeilingsPerMillionUsd.output < args.endpointPrice.outputPricePerMillionUsd) throw new Error("configured price ceilings do not cover the observed endpoint rates")
 	if (!/^[a-f0-9]{64}$/.test(args.execution.configSha256) || args.execution.configSha256 !== frozenProofConfigDigest(args.execution.configs) || !/^[a-f0-9]{64}$/.test(args.execution.analysisSourceSha256)) throw new Error("proof demonstration config or analysis-source digest is malformed")
 	const evaluatorPins = args.execution.configs.map((config) => config.evaluatorTrustedKeySha256)
@@ -75,7 +81,7 @@ export function verifyFrozenProofDemonstrationManifest(value: unknown): FrozenPr
 	if (manifest.schemaVersion !== 1 || !/^[a-f0-9]{64}$/.test(manifest.digestSha256)) throw new Error("frozen proof demonstration manifest schema or digest is malformed")
 	const { digestSha256, ...body } = manifest
 	if (frozenProofDemonstrationDigest(body) !== digestSha256) throw new Error("frozen proof demonstration manifest digest mismatch")
-	if (manifest.endpointPrice.model !== manifest.model.requestedId || manifest.endpointPrice.provider !== RSI_OPENROUTER_ENDPOINT_PROVIDER || manifest.endpointPrice.endpointTag !== RSI_OPENROUTER_ENDPOINT_TAG || manifest.endpointPrice.quantization !== RSI_OPENROUTER_ENDPOINT_QUANTIZATION || !["max_tokens", "temperature", "tools", "tool_choice"].every((parameter) => manifest.endpointPrice.supportedParameters.includes(parameter))) throw new Error("frozen proof demonstration endpoint is not the pinned DeepInfra fp8 route with required parameters")
+	verifyEndpointProfile(manifest.model, manifest.endpointPrice)
 	if (manifest.operatorCapUsd + 1e-9 < manifest.plan.campaignRootsSpendCeilingUsd) throw new Error("frozen proof demonstration operator cap is below the three campaign root reservations")
 	if (!manifest.engineeringEvidence || !manifest.engineeringEvidence.path || !/^[a-f0-9]{64}$/.test(manifest.engineeringEvidence.sha256) || manifest.engineeringEvidence.rootCommit !== manifest.rootCommit || !/^[a-f0-9]{64}$/.test(manifest.engineeringEvidence.manifestSha256) || !/^[a-f0-9]{64}$/.test(manifest.engineeringEvidence.snapshotSha256)) throw new Error("frozen engineering evidence reference is missing or malformed")
 	if (frozenProofConfigDigest(manifest.execution.configs) !== manifest.execution.configSha256) throw new Error("frozen proof demonstration config digest mismatch")
