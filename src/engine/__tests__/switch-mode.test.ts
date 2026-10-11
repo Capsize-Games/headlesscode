@@ -24,8 +24,11 @@ import { setTimeout as sleep } from "node:timers/promises"
 
 import { HeadlessSession } from "../loop.js"
 import { eventsDir, readEventsFile, type EventRecord } from "../events.js"
+import { selectToolsForMode } from "../prompt.js"
+import { appendExtensionTools } from "../../extensions/tools.js"
+import type { SkillRegistry } from "../../skills/registry.js"
 import { createReadOnlyHeadlessExecutor } from "../../tools/executor.js"
-import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } from "../types.js"
+import type { ChatMessage, ChatTool, ChatToolCall, LlmClient, LlmRequest, LlmResponse } from "../types.js"
 
 const NEEDS_DECISION = ".harness.needs-decision"
 const DECISION_ANSWER = ".harness.decision-answer"
@@ -102,6 +105,9 @@ async function makeSession(options: {
 	/** Decision-escalation timeout/poll overrides (short in tests). */
 	decisionTimeoutMs?: number
 	decisionPollIntervalMs?: number
+	/** Stable test allowlist avoids host MCP and skill discovery. */
+	tools?: ChatTool[]
+	skillRegistry?: SkillRegistry
 }) {
 	const session = new HeadlessSession({
 		workspaceRoot: options.workspaceRoot,
@@ -109,6 +115,8 @@ async function makeSession(options: {
 		model: "fake-model",
 		taskText: options.task,
 		llmClient: options.client,
+		...(options.tools ? { tools: options.tools } : {}),
+		...(options.skillRegistry ? { skillRegistry: options.skillRegistry } : {}),
 		maxIterations: options.maxIterations ?? 10,
 		consecutiveErrorLimit: options.consecutiveErrorLimit ?? 3,
 		windowSize: 40,
@@ -549,29 +557,57 @@ function makeSnapshotClient(
 async function testToolSetUnchangedSkipsPromptRebuild(): Promise<void> {
 	const ws = await mkTmpWorkspace("hc-switchmode-sametools-")
 	try {
-		// code and debug share the same groups (read/edit/command/mcp), so the
-		// target mode's tool set equals the current one. The system prompt must
-		// NOT be rebuilt and messages[0] must NOT be replaced — rewriting it
-		// would invalidate the provider's cached prompt prefix for the whole
-		// session. Asserted on what the client actually received across the
-		// switch boundary, not just internal state.
+		// Use a frozen common allowlist so this test isolates the cache-preserving
+		// branch from host MCP and user-skill discovery while retaining extension
+		// tools for a mode with workspace write and command capabilities.
+		// With identical advertised tools, the system prompt must NOT be rebuilt
+		// and messages[0] must NOT be replaced — rewriting it would invalidate
+		// the provider's cached prompt prefix for the whole session. Asserted on
+		// what the client actually received across the switch boundary.
+		const emptySkillRegistry: SkillRegistry = {
+			skills: [],
+			problems: [],
+			get: () => undefined,
+			activate: () => undefined,
+			readReference: () => { throw new Error("empty skill fixture has no references") },
+		}
 		const { client, snapshots } = makeSnapshotClient(
 			[
 				{ message: toolCall("switch_mode", { mode_slug: "debug", reason: "same groups as code" }) },
+				{ message: toolCall("extension_manage", { action: "list", id: null, digest: null, manifest: null, files: null }) },
 				{ message: toolCall("attempt_completion", { result: "done" }) },
 			],
-			2,
+			3,
 		)
+		const sharedTools = appendExtensionTools(selectToolsForMode("code"), {
+			canWrite: true,
+			canExecute: true,
+			explicitAllowlist: false,
+		})
 		const session = await makeSession({
 			task: "switch to debug",
 			client,
 			workspaceRoot: ws,
 			autoApproveModeSwitch: true,
+			tools: sharedTools,
+			skillRegistry: emptySkillRegistry,
 		})
 		const result = await session.run()
 
 		assert.equal(result.status, "success", `expected success, got ${JSON.stringify(result)}`)
 		assert.equal(session.state.mode, "debug", "state.mode must be the new mode")
+		assert.deepEqual(
+			client.requests[1].tools?.map((tool) => tool.function.name).filter((name) => name.startsWith("extension_")),
+			["extension_manage", "extension_call"],
+			"a writable debug mode retains the fixed extension interfaces",
+		)
+		const extensionManageCall = session.state.messages
+			.flatMap((message) => message.role === "assistant" ? message.tool_calls ?? [] : [])
+			.find((call) => call.function.name === "extension_manage")
+		assert.ok(
+			extensionManageCall && findToolResult(session.state.messages, extensionManageCall.id),
+			"extension handler should remain executable after the switch",
+		)
 		assert.equal(
 			snapshots[1],
 			snapshots[0],

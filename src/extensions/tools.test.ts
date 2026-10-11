@@ -13,28 +13,27 @@ function names(tools: ChatTool[]): string[] {
 	return tools.map((tool) => tool.function.name)
 }
 
-function testCodingCatalogAddsOnlyFixedSchemas(): void {
-	const result = appendExtensionTools(ordinaryTools, { codingMode: true, canWrite: true, canExecute: true, explicitAllowlist: false })
+function testWritableCommandCatalogAddsOnlyFixedSchemas(): void {
+	const result = appendExtensionTools(ordinaryTools, { canWrite: true, canExecute: true, explicitAllowlist: false })
 	assert.deepEqual(names(result), [...names(ordinaryTools), "extension_manage", "extension_call"])
 	assert.equal(result.at(-2), EXTENSION_MANAGE_TOOL)
 	assert.equal(result.at(-1), EXTENSION_CALL_TOOL)
 	const snapshot = JSON.stringify(result.filter((tool) => tool.function.name.startsWith("extension_")))
-	const repeated = appendExtensionTools(ordinaryTools, { codingMode: true, canWrite: true, canExecute: true, explicitAllowlist: false })
+	const repeated = appendExtensionTools(ordinaryTools, { canWrite: true, canExecute: true, explicitAllowlist: false })
 	assert.equal(JSON.stringify(repeated.filter((tool) => tool.function.name.startsWith("extension_"))), snapshot)
 }
 
 function testRestrictedCatalogsNeverGainExtensionTools(): void {
 	for (const options of [
-		{ codingMode: true, canWrite: false, canExecute: true, explicitAllowlist: false },
-		{ codingMode: true, canWrite: true, canExecute: false, explicitAllowlist: false },
-		{ codingMode: false, canWrite: true, canExecute: true, explicitAllowlist: false },
-		{ codingMode: true, canWrite: true, canExecute: true, explicitAllowlist: true },
+		{ canWrite: false, canExecute: true, explicitAllowlist: false },
+		{ canWrite: true, canExecute: false, explicitAllowlist: false },
+		{ canWrite: true, canExecute: true, explicitAllowlist: true },
 	]) {
 		assert.deepEqual(appendExtensionTools(ordinaryTools, options), ordinaryTools)
 	}
 	const explicitlyAllowed = appendExtensionTools(
 		[...ordinaryTools, { type: "function", function: { name: "extension_call" } }],
-		{ codingMode: true, canWrite: true, canExecute: true, explicitAllowlist: true, explicitToolNames: ["extension_call"] },
+		{ canWrite: true, canExecute: true, explicitAllowlist: true, explicitToolNames: ["extension_call"] },
 	)
 	assert.deepEqual(names(explicitlyAllowed), [...names(ordinaryTools), "extension_call"])
 	assert.equal(explicitlyAllowed.at(-1), EXTENSION_CALL_TOOL)
@@ -48,7 +47,7 @@ function testManifestSchemaAllowsOptionalKindSpecificFields(): void {
 	assert.equal(manifest.required.includes("inputSchema"), false)
 }
 
-testCodingCatalogAddsOnlyFixedSchemas()
+testWritableCommandCatalogAddsOnlyFixedSchemas()
 testRestrictedCatalogsNeverGainExtensionTools()
 testManifestSchemaAllowsOptionalKindSpecificFields()
 console.log("All extension tool schema tests passed")

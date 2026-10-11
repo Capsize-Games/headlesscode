@@ -1883,7 +1883,6 @@ export class HeadlessSession {
 			tools = split.core
 		}
 		tools = appendExtensionTools(tools, {
-			codingMode: mode === "code",
 			canWrite: extensionCanWrite,
 			canExecute: extensionCanExecute,
 			explicitAllowlist: this.config.tools !== undefined,
@@ -5494,7 +5493,6 @@ export class HeadlessSession {
 		const availableTools = [...this.state.tools, ...this.lazyToolsByName.values()]
 		return (
 			isExtensionToolName(name) &&
-			this.state.mode === "code" &&
 			this.executor.has(name) &&
 			this.state.tools.some((tool) => tool.type === "function" && tool.function.name === name) &&
 			hasWorkspaceWriteTool(availableTools) &&
@@ -5512,7 +5510,7 @@ export class HeadlessSession {
 
 	private async handleExtensionManage(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
 		if (!this.extensionToolAvailable("extension_manage")) {
-			return { content: "[Error] Extension management is available only in a coding session with workspace write and command execution tools.", isError: true }
+			return { content: "[Error] Extension management requires workspace write and command execution tools.", isError: true }
 		}
 		if (ctx.signal?.aborted) return { content: "[Error] Extension management stopped by supervisor.", isError: true }
 		if (Buffer.byteLength(JSON.stringify(args), "utf8") > 300 * 1024) {
@@ -5558,7 +5556,7 @@ export class HeadlessSession {
 
 	private async handleExtensionCall(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
 		if (!this.extensionToolAvailable("extension_call")) {
-			return { content: "[Error] Extension calls are available only in a coding session with workspace write and command execution tools.", isError: true }
+			return { content: "[Error] Extension calls require workspace write and command execution tools.", isError: true }
 		}
 		if (ctx.signal?.aborted) return { content: "[Error] Extension call stopped by supervisor.", isError: true }
 		if (Buffer.byteLength(JSON.stringify(args), "utf8") > 300 * 1024) {
@@ -5903,7 +5901,6 @@ export class HeadlessSession {
 			newTools = split.core
 		}
 		newTools = appendExtensionTools(newTools, {
-			codingMode: modeSlug === "code",
 			canWrite: extensionCanWrite,
 			canExecute: extensionCanExecute,
 			explicitAllowlist: this.config.tools !== undefined,
