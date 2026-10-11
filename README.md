@@ -33,6 +33,7 @@ HeadlessCode's controls map to the seven principles in Satya Nadella's
 | Intake automation | Watches a GitHub label and starts bounded batches of work. |
 | OpenShell sessions | Runs worker and review sessions in disposable clones, then validates and imports results after sandbox deletion. |
 | Harness experiments | Runs a bounded recursive self-improvement loop against an external evaluator. |
+| Project work with harness repair | A [host work loop](./docs/work-loop.md) runs tasks, independently checks observed harness problems, and retries with verified repairs. |
 
 ## Security
 

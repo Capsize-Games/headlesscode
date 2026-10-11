@@ -214,6 +214,9 @@ Subcommands:
   headlesscode openshell-session --repo <path> --task <text> --policy <path>
               Run one task in an OpenShell sandbox and keep its Git worktree
               for review. See \`openshell-session --help\` for options.
+  headlesscode work-loop --config <json> --driver <module>
+              Run project tasks with evidence-triggered, independently verified
+              harness repairs using a trusted host driver.
   headlesscode improve --repo <path> [--model <id>] [--population <n>] [--dry-run]
               Run a bounded recursive self-improvement generation. Candidates
               use isolated git worktrees; evaluator/scoring paths are protected.
@@ -825,7 +828,7 @@ export async function main(argv: string[] = process.argv.slice(2), hooks?: CliRu
 	if (argv[0] === "openshell-session") {
 		return openShellSessionMain(argv.slice(1))
 	}
-	if (["rsi-worker", "rsi-benchmark", "rsi-train-model", "improve"].includes(argv[0] ?? "")) {
+	if (["rsi-worker", "rsi-benchmark", "rsi-train-model", "improve", "work-loop"].includes(argv[0] ?? "")) {
 		// Keep the protected RSI implementation outside candidate snapshots while
 		// preserving one typed, host-checked CLI boundary. A variable module URL
 		// prevents TypeScript from resolving the deliberately withheld source.

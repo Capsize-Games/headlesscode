@@ -57,7 +57,8 @@
 		"scripts/stop-worker.sh",
 		"scripts/headlesscode-answer.sh",
 		"scripts/deploy-gate.sh",
-		"docs/muse-cache-qualification.md"
+		"docs/muse-cache-qualification.md",
+		"docs/work-loop.md"
 	],
 	"scripts": {
 		"typecheck": "tsc --noEmit",
