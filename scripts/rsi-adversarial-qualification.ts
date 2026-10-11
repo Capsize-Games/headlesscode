@@ -18,7 +18,19 @@ const MAX_REVIEW_OUTPUT_TOKENS = 1_024
 const MAX_REVIEW_PROMPT_BYTES = 16 * 1024
 const MAX_REVIEW_COST_USD = 0.005
 const MAX_REVIEW_HTTP_DURATION_MS = 120_000
+const MAX_METADATA_HTTP_DURATION_MS = 120_000
+export const ADVERSARIAL_QUALIFICATION_MAX_RUNTIME_MS = 10 * 60_000
 const QUALIFICATION_MUTATION = "Deterministic qualification fixture patch; no mutation model or provider inference is used. The patch intentionally removes the upper clamp so the adversarial reviewer can test a changed source export."
+
+export function createQualificationHttpDeadlines(timeout: (milliseconds: number) => AbortSignal = AbortSignal.timeout): {
+	metadata: AbortSignal
+	review(): AbortSignal
+} {
+	return {
+		metadata: timeout(MAX_METADATA_HTTP_DURATION_MS),
+		review: () => timeout(MAX_REVIEW_HTTP_DURATION_MS),
+	}
+}
 
 interface Options {
 	artifactsDir?: string
@@ -240,8 +252,8 @@ export async function runAdversarialQualification(options: Required<Pick<Options
 	const role: RoleModelConfig = { provider: "openrouter", model: RSI_MUSE_OPENROUTER_MODEL }
 	const profile = RSI_OPENROUTER_PROFILES["muse-spark-contributor"]
 	const client = new OpenRouterClient({ defaultModel: profile.model, disableTranscriptCapture: true })
-	const requestSignal = AbortSignal.timeout(MAX_REVIEW_HTTP_DURATION_MS)
-	const metadata = await client.fetchModelInfo(profile.model, requestSignal)
+	const httpDeadlines = createQualificationHttpDeadlines()
+	const metadata = await client.fetchModelInfo(profile.model, httpDeadlines.metadata)
 	if (!metadata?.price || !(metadata.endpoints ?? []).some((endpoint) => endpoint.providerName?.toLowerCase() === "meta")) throw new Error("OpenRouter Muse endpoint metadata is unavailable or does not advertise Meta")
 	const { input: inputPrice, output: outputPrice } = metadata.price
 	if (!Number.isFinite(inputPrice) || !Number.isFinite(outputPrice) || inputPrice <= 0 || outputPrice <= 0 || inputPrice > 0.10 || outputPrice > 0.20) throw new Error("Muse endpoint prices are unavailable or exceed the qualification ceiling ($0.10/M input, $0.20/M output)")
@@ -260,7 +272,7 @@ export async function runAdversarialQualification(options: Required<Pick<Options
 		evalCommands: ["node --input-type=module -e \"import { clampPercent } from './src/subject.mjs'; if (clampPercent(25) !== 25) process.exit(1)\""],
 		hiddenEvalCommands: [], archiveDir: path.join(outputDir, "archive"), worktreeDir: path.join(source.repoRoot, ".worktrees"),
 		baseRef: "main", seed: runId, dryRun: false, keepWorktrees: false, maxIterations: 1, maxTokens: 32,
-		maxTrajectories: 1, maxTotalIterations: 1, maxRuntimeMs: 120_000, protectedPaths: [...DEFAULT_PROTECTED_PATHS],
+		maxTrajectories: 1, maxTotalIterations: 1, maxRuntimeMs: ADVERSARIAL_QUALIFICATION_MAX_RUNTIME_MS, protectedPaths: [...DEFAULT_PROTECTED_PATHS],
 		commandTimeoutMs: 60_000, evaluatorSigningKeyPath: options.signingKeyPath, evaluatorTrustedPublicKeyPath: options.trustedPublicKeyPath, evaluatorTrustedKeySha256: `sha256:${options.publicKeySha256}`, roles: { worker: { provider: "ollama", model: "qualification-fixture-worker" }, adversary: role },
 	}
 	try {
@@ -269,6 +281,7 @@ export async function runAdversarialQualification(options: Required<Pick<Options
 			runAdversary: async ({ role: actualRole, prompt }) => {
 				reviewerCalls++
 				if (reviewerCalls !== 1 || actualRole.provider !== "openrouter" || actualRole.model !== profile.model) throw new Error("qualification attempted an unexpected reviewer identity or more than one call")
+				const reviewSignal = httpDeadlines.review()
 				promptText = prompt
 				const promptBytes = Buffer.byteLength(prompt, "utf8")
 				if (promptBytes > MAX_REVIEW_PROMPT_BYTES) throw new Error("review prompt exceeds the 16 KiB qualification bound")
@@ -291,7 +304,7 @@ export async function runAdversarialQualification(options: Required<Pick<Options
 							model: profile.model,
 							maxTokens: MAX_REVIEW_OUTPUT_TOKENS,
 							providerOnly: "meta",
-							signal: requestSignal,
+							signal: reviewSignal,
 						})
 						const returnedModel = response.returnedModel
 						const providerName = response.providerName
@@ -311,7 +324,7 @@ export async function runAdversarialQualification(options: Required<Pick<Options
 				})
 				if (!responseText || raw !== responseText.trim()) throw new Error("review response content capture did not match the controller response")
 				if (!responseIdentity?.generationId || typeof responseIdentity.generationId !== "string") throw new Error("OpenRouter did not return a generation ID for billing identity")
-				const billing = await client.fetchGenerationMetadata(responseIdentity.generationId as string, requestSignal)
+				const billing = await client.fetchGenerationMetadata(responseIdentity.generationId as string, reviewSignal)
 				if (!billing || billing.providerName?.toLowerCase() !== "meta" || !billing.model || !profile.returnedModels.includes(billing.model)) throw new Error("OpenRouter billing record is unavailable or does not match the admitted Muse/Meta identity")
 				if (billing.id !== responseIdentity.generationId || typeof billing.totalCostUsd !== "number" || !Number.isFinite(billing.totalCostUsd) || billing.totalCostUsd < 0 || billing.totalCostUsd > MAX_REVIEW_COST_USD) throw new Error("OpenRouter billing record is unavailable or exceeds the $0.005 qualification cap")
 				const usage = responseIdentity.usage as { promptTokens?: number; completionTokens?: number }

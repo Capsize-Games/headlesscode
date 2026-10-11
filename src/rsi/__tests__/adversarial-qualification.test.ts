@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises"
 import { execFileSync } from "node:child_process"
 import * as path from "node:path"
 
-import { assertReviewerBillingTokens, createSyntheticWorkspace, ensurePrivateDirectory, parseQualificationArgs, signReceipt, verifyControllerGate, verifyReceipt } from "../../../scripts/rsi-adversarial-qualification.js"
+import { ADVERSARIAL_QUALIFICATION_MAX_RUNTIME_MS, assertReviewerBillingTokens, createQualificationHttpDeadlines, createSyntheticWorkspace, ensurePrivateDirectory, parseQualificationArgs, signReceipt, verifyControllerGate, verifyReceipt } from "../../../scripts/rsi-adversarial-qualification.js"
 import type { RsiRunRecord } from "../types.js"
 
 function pin(publicKey: ReturnType<typeof createPublicKey>): string {
@@ -15,6 +15,25 @@ assert.match(parseQualificationArgs([]).error ?? "", /signing-key/)
 assert.equal(parseQualificationArgs(["--receipt-signing-key", "key.pem", "--evaluator-trusted-public-key", "public.pem", "--receipt-public-key-sha256", "a".repeat(64)]).error, undefined)
 assert.match(parseQualificationArgs(["--receipt-signing-key", "key.pem", "--evaluator-trusted-public-key", "public.pem", "--receipt-public-key-sha256", "not-a-pin"]).error ?? "", /SHA-256/)
 assert.match(parseQualificationArgs(["--unexpected"]).error ?? "", /unknown argument/)
+
+assert.equal(ADVERSARIAL_QUALIFICATION_MAX_RUNTIME_MS, 10 * 60_000, "CPU qualification has a declared ten-minute overall runtime bound")
+let phaseStartedAt = 0
+const requestedDeadlines: Array<{ durationMs: number; startedAt: number }> = []
+const deadlines = createQualificationHttpDeadlines((durationMs) => {
+	requestedDeadlines.push({ durationMs, startedAt: phaseStartedAt })
+	return new AbortController().signal
+})
+assert.deepEqual(requestedDeadlines, [{ durationMs: 120_000, startedAt: 0 }], "metadata gets its own bounded request signal")
+phaseStartedAt = 74_750
+const reviewSignal = deadlines.review()
+assert.ok(reviewSignal instanceof AbortSignal)
+assert.deepEqual(requestedDeadlines, [
+	{ durationMs: 120_000, startedAt: 0 },
+	{ durationMs: 120_000, startedAt: 74_750 },
+], "review deadline starts lazily when review is invoked, after baseline work")
+const reviewDeadline = requestedDeadlines[1]
+assert.ok(reviewDeadline)
+assert.ok(phaseStartedAt + reviewDeadline.durationMs < ADVERSARIAL_QUALIFICATION_MAX_RUNTIME_MS, "the overall cap leaves time for a full review request after the observed baseline duration")
 
 const nativeUsage = { promptTokens: 862, completionTokens: 66 }
 const nativeBilling = { id: "generation", tokensPrompt: 411, tokensCompletion: 24, nativeTokensPrompt: 862, nativeTokensCompletion: 66 }
