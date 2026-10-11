@@ -219,11 +219,11 @@ function assertUsage(response: LlmResponse, metadata: OpenRouterGenerationMetada
 	return { prompt: usage.promptTokens, completion: usage.completionTokens, cached: metadata.nativeTokensCached ?? cached, costUsd: metadata.totalCostUsd! }
 }
 
-function parseArgs(call: { readonly id: string; readonly function: { readonly name: string; readonly arguments: string } }, attemptId: string, index: number): PilotToolCall | undefined {
+function parseArgs(call: { readonly id: string; readonly function: { readonly name: string; readonly arguments: string } }, attemptId: string, iteration: number, index: number): PilotToolCall | undefined {
 	try {
 		const parsed: unknown = JSON.parse(call.function.arguments)
 		if (parsed === null || Array.isArray(parsed) || typeof parsed !== "object") return undefined
-		return { id: `${attemptId}:tool:${index + 1}`, name: call.function.name, args: parsed as Readonly<Record<string, unknown>> }
+		return { id: `${attemptId}:turn:${iteration}:tool:${index + 1}`, name: call.function.name, args: parsed as Readonly<Record<string, unknown>> }
 	} catch {
 		return undefined
 	}
@@ -423,9 +423,9 @@ async function runLiveTrajectory(options: LiveTrajectoryOptions): Promise<{
 		}
 		for (let index = 0; index < toolCallValues.length; index++) {
 			const rawCall = toolCallValues[index]
-			const parsed = parseArgs(rawCall, options.attemptId, index)
+			const parsed = parseArgs(rawCall, options.attemptId, iteration, index)
 			if (!(LIVE_TOOLS as readonly ChatTool[]).some((tool) => tool.function.name === rawCall.function.name)) {
-				const invalid: PilotToolCall = { id: `${options.attemptId}:tool:${index + 1}`, name: rawCall.function.name, args: parsed?.args ?? {} }
+				const invalid: PilotToolCall = { id: `${options.attemptId}:turn:${iteration}:tool:${index + 1}`, name: rawCall.function.name, args: parsed?.args ?? {} }
 				calls.push(invalid)
 				const forbidden = recordError(invalid, `operation '${invalid.name}' is not available in the restricted pilot`, true)
 				results.push(forbidden.result)
@@ -438,7 +438,7 @@ async function runLiveTrajectory(options: LiveTrajectoryOptions): Promise<{
 				break
 			}
 			if (!parsed) {
-				const invalid: PilotToolCall = { id: `${options.attemptId}:tool:${index + 1}`, name: rawCall.function.name, args: {} }
+				const invalid: PilotToolCall = { id: `${options.attemptId}:turn:${iteration}:tool:${index + 1}`, name: rawCall.function.name, args: {} }
 				calls.push(invalid)
 				const failed = recordError(invalid, "tool arguments must be a JSON object", false)
 				results.push(failed.result)
@@ -478,6 +478,7 @@ async function runLiveTrajectory(options: LiveTrajectoryOptions): Promise<{
 		const signature = stableCallBatchSignature(calls)
 		if (signature !== previousBatchSignature) identicalNudgeSent = false
 		identicalCallStreak = signature === previousBatchSignature ? identicalCallStreak + 1 : 1
+		if (signature === previousBatchSignature) redundantCalls += calls.length
 		previousBatchSignature = signature
 		if (identicalCallStreak >= DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD && !identicalNudgeSent) {
 			identicalNudgeSent = true
@@ -887,7 +888,7 @@ function heldoutSlots(): readonly HeldoutSlot[] {
 	))
 }
 
-async function requireQualifiedDevelopment(outputDir: string): Promise<{ predictor: FrozenPredictorArtifact; rows: LabeledWindow[]; outcomes: PilotOutcome[]; manifestHash: string }> {
+async function requireQualifiedDevelopment(outputDir: string): Promise<{ predictor: FrozenPredictorArtifact; rows: LabeledWindow[]; outcomes: PilotOutcome[]; calibrationBoundaries: Pick<LabeledWindow, "features" | "trajectoryId" | "boundarySequence">[]; manifestHash: string }> {
 	const developmentDir = path.join(outputDir, "development")
 	for (const file of ["development-summary.json", "predictor.json", "manifest.json", "journal.jsonl"]) await assertRegularFileNoSymlink(path.join(developmentDir, file))
 	const summary = JSON.parse(await fs.readFile(path.join(developmentDir, "development-summary.json"), "utf8")) as LiveRunSummary
@@ -943,7 +944,13 @@ async function requireQualifiedDevelopment(outputDir: string): Promise<{ predict
 	}
 	const recomputed = fitFrozenPredictor(train, calibration, { modelDigest: LIVE_MODEL_DIGEST, templatesHash: sha256(TEMPLATE_TEXT) })
 	if (recomputed.artifactHash !== predictor.artifactHash) throw new JournalCorruptionError("frozen predictor does not match the journaled development rows")
-	return { predictor, rows: calibration, outcomes, manifestHash: sha256(manifest) }
+	const validCalibrationRuns = new Set(outcomes.filter((outcome) => outcome.valid && outcome.split === "calibration").map((outcome) => outcome.runId))
+	const calibrationBoundaries = journal.list().filter((event) => event.type === "boundary" && validCalibrationRuns.has(event.runId ?? ""))
+		.map((event) => {
+			const boundary = event.payload.boundary as PilotBoundary
+			return { features: extractMonitorFeatures(boundary), trajectoryId: boundary.runId, boundarySequence: boundary.sequence }
+		})
+	return { predictor, rows: calibration, outcomes, calibrationBoundaries, manifestHash: sha256(manifest) }
 }
 
 async function loadOrWriteHeldoutManifest(directory: string, expected: Record<string, unknown>): Promise<string> {
@@ -972,7 +979,7 @@ export async function collectLiveHeldout(options: LiveRunnerOptions = {}): Promi
 	await lock.acquire()
 	try {
 		const development = await requireQualifiedDevelopment(outputDir)
-		const randomSchedule = deriveCalibrationRandomSchedule(development.rows, development.predictor)
+		const randomSchedule = deriveCalibrationRandomSchedule(development.calibrationBoundaries, development.predictor)
 		const slots = heldoutSlots()
 		if (slots.length !== 64) throw new JournalCorruptionError(`held-out plan changed: expected 64 runs, got ${slots.length}`)
 		const heldoutDir = path.join(outputDir, "heldout")
@@ -1058,12 +1065,22 @@ export async function collectLiveHeldout(options: LiveRunnerOptions = {}): Promi
 }
 
 /** Derive the R arm's fixed random schedule only from frozen-predictor triggers on calibration rows. */
-export function deriveCalibrationRandomSchedule(rows: readonly LabeledWindow[], predictor: FrozenPredictorArtifact): { probability: number; distribution: readonly { boundarySequence: number; weight: number }[] } {
-	const triggered = rows.filter((row) => predictedIntervention(predictor, predictFromFeatures(predictor, row.features)))
+export function deriveCalibrationRandomSchedule(
+	rows: readonly Pick<LabeledWindow, "features" | "trajectoryId" | "boundarySequence">[],
+	predictor: FrozenPredictorArtifact,
+	trajectoryIds: readonly string[] = LIVE_DEVELOPMENT_SLOTS.filter((slot) => slot.fixture.split === "calibration").map((slot) => slot.slotKey),
+): { probability: number; distribution: readonly { boundarySequence: number; weight: number }[] } {
+	const scheduled = new Set(trajectoryIds)
+	const firstTrigger = new Map<string, number>()
+	for (const row of rows) {
+		if (!scheduled.has(row.trajectoryId) || row.boundarySequence === undefined || !predictedIntervention(predictor, predictFromFeatures(predictor, row.features))) continue
+		const prior = firstTrigger.get(row.trajectoryId)
+		if (prior === undefined || row.boundarySequence < prior) firstTrigger.set(row.trajectoryId, row.boundarySequence)
+	}
 	const counts = new Map<number, number>()
-	for (const row of triggered) if (row.boundarySequence !== undefined) counts.set(row.boundarySequence, (counts.get(row.boundarySequence) ?? 0) + 1)
+	for (const boundary of firstTrigger.values()) counts.set(boundary, (counts.get(boundary) ?? 0) + 1)
 	return {
-		probability: rows.length === 0 ? 0 : triggered.length / rows.length,
+		probability: scheduled.size === 0 ? 0 : firstTrigger.size / scheduled.size,
 		distribution: [...counts.entries()].sort(([a], [b]) => a - b).map(([boundarySequence, weight]) => ({ boundarySequence, weight })),
 	}
 }

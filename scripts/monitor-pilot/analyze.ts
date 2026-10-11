@@ -34,6 +34,7 @@ export interface PilotAnalysis {
 	readonly p50PredictorLatencyMs: number
 	readonly p95PredictorLatencyMs: number
 	readonly peakMonitorMemoryBytes: number
+	readonly memoryMeasurementScope: "runner-process-peak-rss"
 	readonly energy: "unmeasured"
 	readonly normalizedGrid: Readonly<Record<PilotArm, Readonly<Record<string, number | null>>>>
 	readonly gates: Readonly<Record<string, boolean>>
@@ -129,17 +130,26 @@ function detection(outcomes: readonly PilotOutcome[], predictor: FrozenPredictor
 	const selected = pairs.filter((pair) => pair.score >= predictor.threshold)
 	const truePositive = selected.filter((pair) => pair.label === 1).length
 	const positives = pairs.filter((pair) => pair.label === 1).length
-	const precision = selected.length ? truePositive / selected.length : 1
-	const recall = positives ? truePositive / positives : 0
+	const precision = selected.length ? truePositive / selected.length : null
+	const recall = positives ? truePositive / positives : null
 	const brier = mean(pairs.map((pair) => (pair.score - pair.label) ** 2))
 	const sorted = [...pairs].sort((a, b) => b.score - a.score)
 	let area = 0
-	let previousRecall = 0
-	for (const pair of sorted) {
-		if (pair.label === 1) previousRecall += 1 / Math.max(1, positives)
-		area += pair.label === 1 ? previousRecall / Math.max(1, sorted.length) : 0
+	let seen = 0
+	let seenPositive = 0
+	for (let index = 0; index < sorted.length;) {
+		const score = sorted[index].score
+		let groupPositive = 0
+		while (index < sorted.length && sorted[index].score === score) {
+			groupPositive += sorted[index].label === 1 ? 1 : 0
+			seen++
+			index++
+		}
+		seenPositive += groupPositive
+		// Stepwise precision-recall area; equal scores form one threshold group.
+		if (positives > 0) area += (groupPositive / positives) * (seenPositive / seen)
 	}
-	return { precision, recall, aucpr: area, brier, windows: pairs.length }
+	return { precision, recall, aucpr: positives ? area : null, brier, windows: pairs.length }
 }
 
 function pairedHarmRate(outcomes: readonly PilotOutcome[], arm: PilotArm): number | null {
@@ -178,20 +188,19 @@ export function analyzePilot(
 	modelDescription = "This is a deterministic restricted simulator with a scripted model substitute; it cannot establish transfer to real repositories or an external model.",
 ): PilotAnalysis {
 	const heldout = outcomes.filter((outcome) => outcome.split === "test")
+	const scheduled = new Set(scheduledPairKeys())
+	const observed = new Set<string>()
+	for (const outcome of heldout) {
+		const key = `${pairKey(outcome)}:${outcome.arm}`
+		if (!scheduled.has(pairKey(outcome)) || observed.has(key)) throw new Error("held-out outcome is foreign or duplicates a frozen assignment")
+		if (outcome.success && !outcome.valid) throw new Error("invalid held-out outcome cannot claim success")
+		observed.add(key)
+	}
 	const arms = summaries(heldout)
 	const p95Latency = [...heldout.flatMap((outcome) => outcome.predictionRecords.map((prediction) => prediction.latencyNs / 1_000_000))].sort((a, b) => a - b)
 	const p95PredictorLatencyMs = p95Latency[Math.max(0, Math.ceil(p95Latency.length * 0.95) - 1)] ?? 0
 	const p50PredictorLatencyMs = p95Latency[Math.max(0, Math.ceil(p95Latency.length * 0.5) - 1)] ?? 0
-	const pairs = new Map<string, Partial<Record<PilotArm, boolean>>>()
-	for (const outcome of heldout) {
-		const key = pairKey(outcome)
-		const entry = pairs.get(key) ?? {}
-		entry[outcome.arm] = outcome.success
-		pairs.set(key, entry)
-	}
-	const harmed = [...pairs.values()].filter((entry) => entry.B === true).filter((entry) => entry.M === false).length
-	const bSuccess = [...pairs.values()].filter((entry) => entry.B === true).length
-	const harmedPairRate = bSuccess ? harmed / bSuccess : null
+	const harmedPairRate = pairedHarmRate(heldout, "M")
 	const detectionMetrics = detection(heldout, predictor)
 	const lowerBound = bootstrapLowerBound(heldout)
 	const gates = {
@@ -220,7 +229,8 @@ export function analyzePilot(
 		harmedPairRate,
 		p50PredictorLatencyMs,
 		p95PredictorLatencyMs,
-		peakMonitorMemoryBytes: process.memoryUsage().rss,
+		peakMonitorMemoryBytes: process.resourceUsage().maxRSS * 1024,
+		memoryMeasurementScope: "runner-process-peak-rss",
 		energy: "unmeasured",
 		normalizedGrid: grid(arms, detectionMetrics.precision, p95PredictorLatencyMs, heldout),
 		gates,

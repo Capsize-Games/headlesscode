@@ -74,4 +74,17 @@ assert.equal(partial.arms.B.successRate, 1 / 16, "aborted and unstarted assigned
 assert.equal(partial.arms.M.scheduled, 16)
 assert.equal(partial.arms.M.completed, 0)
 assert.equal(partial.gates.completeSchedule, false)
+assert.equal(partial.harmedPairRate, 1, "an assigned M run missing after a B success remains a harmed ITT pair")
+assert.throws(() => analyzePilot([...development, heldout[0], heldout[0]], predictor, 0.5), /duplicates a frozen assignment/)
+assert.throws(() => analyzePilot([{ ...heldout[0], fixtureId: "foreign" }], predictor, 0.5), /foreign/)
+
+function detectionExample(scores: number[], labels: (0 | 1)[]) {
+	const base = heldout[0]
+	return analyzePilot([{ ...base, predictionRecords: scores.map((probability) => ({ ...base.predictionRecords[0], probability })), detectionLabels: labels }], predictor, 0.5).detectionOnB
+}
+assert.equal(detectionExample([0.9, 0.1], [1, 0]).aucpr, 1, "perfect ranking has unit precision-recall area")
+assert.equal(detectionExample([0.9, 0.1], [0, 1]).aucpr, 0.5, "a positive ranked after one negative contributes precision one-half")
+assert.equal(detectionExample([0.7, 0.7], [1, 0]).aucpr, 0.5, "tied scores form one threshold group")
+assert.equal(detectionExample([0.1], [1]).precision, null, "zero alerts do not establish perfect precision")
+assert.equal(detectionExample([0.9], [0]).aucpr, null, "a sample without positive labels cannot estimate AUCPR")
 console.log("monitor pilot held-out analysis tests passed")
