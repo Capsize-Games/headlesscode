@@ -46,15 +46,28 @@ async function assertNoSymlinkPath(target: string): Promise<void> {
 
 async function readProtectedPolicy(target: string): Promise<Buffer> {
 	await assertNoSymlinkPath(target)
-	const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)
+	if (typeof constants.O_NOFOLLOW !== "number") throw new Error("OpenShell policy reads require platform O_NOFOLLOW support")
+	const flags = constants.O_RDONLY | constants.O_NOFOLLOW | (constants.O_NONBLOCK ?? 0)
 	const handle = await fs.open(target, flags)
 	try {
-		const stat = await handle.stat()
-		if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o002) !== 0) throw new Error("OpenShell policy must be a protected regular file with no additional hard links")
-		if (stat.size < 1 || stat.size > MAX_POLICY_BYTES) throw new Error("OpenShell evaluator policy must be between 1 byte and 1 MiB")
-		const bytes = await handle.readFile()
-		if (bytes.byteLength < 1 || bytes.byteLength > MAX_POLICY_BYTES) throw new Error("OpenShell evaluator policy must be between 1 byte and 1 MiB")
-		return bytes
+		const before = await handle.stat({ bigint: true })
+		const currentUid = process.geteuid?.() ?? process.getuid?.()
+		if (!before.isFile() || before.nlink !== 1n || (before.mode & 0o022n) !== 0n) throw new Error("OpenShell policy must be a protected regular file with no additional hard links or group/other write access")
+		if (currentUid !== undefined && before.uid !== 0n && before.uid !== BigInt(currentUid)) throw new Error("OpenShell policy must be owned by root or the current user")
+		if (before.size < 1n || before.size > BigInt(MAX_POLICY_BYTES)) throw new Error("OpenShell evaluator policy must be between 1 byte and 1 MiB")
+		const chunks: Buffer[] = []
+		let total = 0
+		while (total <= MAX_POLICY_BYTES) {
+			const chunk = Buffer.alloc(Math.min(64 * 1024, MAX_POLICY_BYTES + 1 - total))
+			const { bytesRead } = await handle.read(chunk, 0, chunk.byteLength, total)
+			if (bytesRead === 0) break
+			chunks.push(chunk.subarray(0, bytesRead))
+			total += bytesRead
+		}
+		if (total < 1 || total > MAX_POLICY_BYTES) throw new Error("OpenShell evaluator policy must be between 1 byte and 1 MiB")
+		const after = await handle.stat({ bigint: true })
+		if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size || after.mtimeNs !== before.mtimeNs || after.ctimeNs !== before.ctimeNs || BigInt(total) !== before.size) throw new Error("OpenShell policy changed while it was being read")
+		return Buffer.concat(chunks, total)
 	} finally {
 		await handle.close()
 	}

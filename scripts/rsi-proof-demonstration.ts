@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto"
+import { constants as fsConstants } from "node:fs"
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
 import { execFileSync } from "node:child_process"
@@ -153,6 +154,51 @@ export async function assertSupervisorOnlyPlanPath(repoRoot: string, output: str
 	return absolute
 }
 
+const MAX_PROOF_INPUT_BYTES = 2 * 1024 * 1024
+
+/** Read a frozen plan/evidence input without following its leaf or trusting ambient permissions. */
+export async function readProtectedProofInput(repoRoot: string, input: string, maxBytes = MAX_PROOF_INPUT_BYTES): Promise<Buffer> {
+	if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_PROOF_INPUT_BYTES) throw new Error("proof input size limit is invalid")
+	const absolute = await assertSupervisorOnlyPlanPath(repoRoot, input)
+	const currentUid = process.geteuid?.() ?? process.getuid?.()
+	let cursor = path.dirname(absolute)
+	while (true) {
+		const parent = await fs.lstat(cursor)
+		if (parent.isSymbolicLink() || !parent.isDirectory()) throw new Error("proof input parent path must contain only real directories")
+		if (currentUid !== undefined && parent.uid !== 0 && parent.uid !== currentUid) throw new Error("proof input parent directory must be owned by root or the current user")
+		const next = path.dirname(cursor)
+		if (next === cursor) break
+		cursor = next
+	}
+	const leaf = await fs.lstat(absolute)
+	if (leaf.isSymbolicLink()) throw new Error("proof input must not be a symlink")
+	if (!leaf.isFile()) throw new Error("proof input must be a regular file")
+	if (typeof fsConstants.O_NOFOLLOW !== "number") throw new Error("proof input reads require platform O_NOFOLLOW support")
+	const handle = await fs.open(absolute, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | (fsConstants.O_NONBLOCK ?? 0))
+	try {
+		const before = await handle.stat({ bigint: true })
+		if (!before.isFile() || before.nlink !== 1n) throw new Error("proof input must be a single-link regular file")
+		if (currentUid !== undefined && before.uid !== 0n && before.uid !== BigInt(currentUid)) throw new Error("proof input file must be owned by root or the current user")
+		if ((before.mode & 0o077n) !== 0n) throw new Error("proof input file must not be accessible to group or other users")
+		if (before.size < 1n || before.size > BigInt(maxBytes)) throw new Error(`proof input must be between 1 byte and ${maxBytes} bytes`)
+		const chunks: Buffer[] = []
+		let total = 0
+		while (total <= maxBytes) {
+			const chunk = Buffer.alloc(Math.min(64 * 1024, maxBytes + 1 - total))
+			const { bytesRead } = await handle.read(chunk, 0, chunk.byteLength, total)
+			if (bytesRead === 0) break
+			chunks.push(chunk.subarray(0, bytesRead))
+			total += bytesRead
+		}
+		if (total > maxBytes) throw new Error(`proof input exceeds ${maxBytes} bytes`)
+		const after = await handle.stat({ bigint: true })
+		if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size || after.mtimeNs !== before.mtimeNs || after.ctimeNs !== before.ctimeNs || BigInt(total) !== before.size) throw new Error("proof input changed while it was being read")
+		return Buffer.concat(chunks, total)
+	} finally {
+		await handle.close()
+	}
+}
+
 function sha256(value: string | Buffer): string { return createHash("sha256").update(value).digest("hex") }
 function canonicalHash(value: unknown): string { return sha256(JSON.stringify(value)) }
 
@@ -193,8 +239,7 @@ export function assertEngineeringTransition(fixed: RsiRunRecord, self: RsiRunRec
 }
 
 async function verifyEngineeringEvidenceFile(evidencePath: string, repo: string, expectedRoot?: string): Promise<{ record: EngineeringEvidenceRecord; fileSha256: string }> {
-	const safePath = await assertSupervisorOnlyPlanPath(repo, evidencePath)
-	const bytes = await fs.readFile(safePath)
+	const bytes = await readProtectedProofInput(repo, evidencePath)
 	const record = JSON.parse(bytes.toString("utf8")) as EngineeringEvidenceRecord
 	if (!record || record.schemaVersion !== 1 || !Array.isArray(record.arms) || record.arms.length !== 2) throw new Error("engineering evidence record is malformed")
 	if (record.model) {
@@ -462,7 +507,7 @@ export async function executeEngineeringPair(options: Options, env: NodeJS.Proce
 	const outputPath = await assertSupervisorOnlyPlanPath(options.repo, options.output)
 	await fs.mkdir(path.dirname(outputPath), { recursive: true, mode: 0o700 })
 	try {
-		const existing = JSON.parse(await fs.readFile(outputPath, "utf8")) as EngineeringEvidenceRecord
+		const existing = JSON.parse((await readProtectedProofInput(options.repo, outputPath)).toString("utf8")) as EngineeringEvidenceRecord
 		const { digestSha256, ...existingBody } = existing
 		if (digestSha256 !== evidence.digestSha256 || canonicalHash(existingBody) !== evidence.digestSha256) throw new Error("existing engineering evidence differs from the verified completed pair")
 	} catch (error) {
@@ -596,8 +641,7 @@ export async function executeFrozenCampaigns(options: Options, env: NodeJS.Proce
 	if (env !== process.env || runner !== runRsi) throw new Error("paid campaign execution only accepts the validated process environment and production runner")
 	const trustOptions = requireEvaluatorIntegrityOptions(options)
 	if (!options.planPath) throw new Error("--plan is required for campaign execution")
-	const safePath = await assertSupervisorOnlyPlanPath(options.repo, options.planPath)
-	const manifest = verifyFrozenProofDemonstrationManifest(JSON.parse(await fs.readFile(safePath, "utf8")) as unknown)
+	const manifest = verifyFrozenProofDemonstrationManifest(JSON.parse((await readProtectedProofInput(options.repo, options.planPath)).toString("utf8")) as unknown)
 	const frozenPin = manifest.execution.configs[0]?.evaluatorTrustedKeySha256
 	if (!frozenPin || manifest.execution.configs.some((config) => config.evaluatorTrustedKeySha256 !== frozenPin)) throw new Error("frozen proof plan does not contain one consistent evaluator trust pin")
 	if (trustOptions.evaluatorTrustedKeySha256 !== frozenPin) throw new Error("execution evaluator trust pin differs from the frozen proof plan")
@@ -632,8 +676,7 @@ export async function proofDemonstrationPlanMain(argv = process.argv.slice(2)): 
 		if (options.command === "verify" || options.command === "analyze") {
 			const requestedPlanPath = options.planPath ?? (options.command === "verify" ? options.output : undefined)
 			if (!requestedPlanPath) throw new Error("--plan is required")
-			const safePath = await assertSupervisorOnlyPlanPath(options.repo, requestedPlanPath)
-			const parsed = JSON.parse(await fs.readFile(safePath, "utf8")) as unknown
+			const parsed = JSON.parse((await readProtectedProofInput(options.repo, requestedPlanPath)).toString("utf8")) as unknown
 			const manifest = verifyFrozenProofDemonstrationManifest(parsed)
 			if (options.command === "verify") {
 				await verifyLiveFrozenProofPlan(manifest)
