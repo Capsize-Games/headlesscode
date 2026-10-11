@@ -54,6 +54,13 @@ import type { AgentExecutor } from "../agent-executor.js"
 
 export type WatcherIssueStatus = "spawned" | "done" | "failed" | "skipped" | "pending"
 
+export interface WatcherClaimReference {
+	runnerId: string
+	leaseNonce: string
+	epoch: number
+	worktreeNames: string[]
+}
+
 /** One issue's processing record in the watcher state file. */
 export interface WatcherIssueEntry {
 	number: number
@@ -76,6 +83,8 @@ export interface WatcherIssueEntry {
 	qa?: boolean
 	/** Phase 4 pass-through: a deploy gate should follow this batch. */
 	deploy?: boolean
+	/** Local handle for a permanent GitHub claim ref; does not contain credentials. */
+	claim?: WatcherClaimReference
 }
 
 /** The watcher state file document. */
@@ -130,6 +139,23 @@ function sanitize(raw: unknown): WatcherState {
 				}
 				if (typeof e.deploy === "boolean") {
 					entry.deploy = e.deploy
+				}
+				if (e.claim !== null && typeof e.claim === "object" && !Array.isArray(e.claim)) {
+					const claim = e.claim as Record<string, unknown>
+					if (
+						typeof claim.runnerId === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(claim.runnerId) &&
+						typeof claim.leaseNonce === "string" && /^[A-Za-z0-9-]{16,64}$/.test(claim.leaseNonce) &&
+						Number.isSafeInteger(claim.epoch) && Number(claim.epoch) > 0 &&
+						Array.isArray(claim.worktreeNames) && claim.worktreeNames.length > 0 && claim.worktreeNames.length <= 16 &&
+						claim.worktreeNames.every((name) => typeof name === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name))
+					) {
+						entry.claim = {
+							runnerId: claim.runnerId,
+							leaseNonce: claim.leaseNonce,
+							epoch: Number(claim.epoch),
+							worktreeNames: claim.worktreeNames as string[],
+						}
+					}
 				}
 				processed[key] = entry
 			}

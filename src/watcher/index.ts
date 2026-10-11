@@ -31,6 +31,8 @@ export {
 	isProcessed,
 	defaultWatcherState,
 } from "./state.js"
+export { ClaimConflictError, ClaimLeaseExpiredError, GitHubIssueClaimStore } from "./claims.js"
+export type { ClaimAcquireResult, ClaimSnapshot, ClaimStoreOptions, ClaimTeardownProof, OperatorRecoveryEvidence, RunnerClaim } from "./claims.js"
 export type { WatcherIssueEntry, WatcherIssueStatus, WatcherState } from "./state.js"
 
 export {

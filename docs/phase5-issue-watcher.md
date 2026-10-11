@@ -218,7 +218,8 @@ After=network-online.target
 
 [Service]
 Type=simple
-Environment=GH_TOKEN=ghp_your_token_here
+User=headlesscode
+EnvironmentFile=/etc/headlesscode/runner.env
 WorkingDirectory=/opt/headlesscode
 ExecStart=/usr/bin/npx --prefix /opt/headlesscode tsx /opt/headlesscode/src/cli.ts watch --owner my-org --repo /opt/my-repo --label needs-agent --poll-interval-ms 60000
 Restart=on-failure
@@ -230,10 +231,77 @@ WantedBy=multi-user.target
 Continuous mode logs every sweep and shuts down cleanly on SIGINT/SIGTERM
 (state saved via `AbortSignal`).
 
+### Claim-based runner pool (two or more machines)
+
+Run one continuous watcher on each machine, using the same GitHub owner,
+repository, and label, but a different stable `--runner-id` for each machine.
+The `--max-concurrent-sessions` setting is the capacity limit for that
+machine. `--runner-assignee` is the GitHub login displayed on issues while a
+claim is active; it must be configured with `--runner-id`.
+
+Claims are authoritative records on permanent Git refs named
+`headlesscode-claims/issue-N`. Initial claims use GitHub's atomic ref creation;
+renewals and releases are commits advanced with non-forced fast-forward
+updates. A runner checks the current claim before dispatch and records its
+unique nonce and epoch in local watcher state. Issue assignees are a visible
+indicator only. Do not delete claim refs: a released ref remains in place so
+the next acquisition increments the epoch and cannot reuse an old claim.
+
+Runner-pool mode requires continuous operation; `--run-once` is rejected
+because it cannot renew leases. The default lease is 120 seconds and the
+default poll interval is 60 seconds. When GitHub cannot confirm a renewal, the
+watcher stops local worker process groups and keeps the claim active unless it
+can verify that teardown completed. A crashed or unreachable machine may leave
+an active claim past its expiry. Expiry does not stop a detached process and
+does not permit automatic takeover: the claim remains quarantined until the
+original worker is confirmed stopped. This favors avoiding duplicate jobs
+over automatic recovery. Do not clear an expired claim or remove its ref while
+the old worker may still run.
+
+Each machine needs its own continuously running watcher, a local clone of the
+same repository, Node.js 22.19 or newer, Git, and the repository dependencies
+installed with `npm ci`. Install Node.js using the machine's approved
+unprivileged version manager. `gh` is needed by worker workflows that invoke
+the GitHub CLI; the watcher itself uses the GitHub REST API. Configure a
+separate fine-grained GitHub token on each machine with repository Contents
+read/write and Issues read/write access, then make it available as `GH_TOKEN`
+or `GITHUB_TOKEN`. For a systemd service, put the variable in an environment
+file owned by the service account with mode `0600`; do not
+put the token directly in the unit file, command line, or logs. Do not copy a
+machine's model-provider credential to another machine; provision credentials
+for each runner through the deployment's approved secret mechanism.
+
+For example, after cloning and installing dependencies on a node, configure
+the service to use a distinct id and assignee:
+
+```ini
+ExecStart=/usr/bin/npx --prefix /opt/headlesscode tsx /opt/headlesscode/src/cli.ts watch --owner my-org --repo /opt/my-repo --label needs-agent --runner-id home-node --runner-assignee runner-bot --max-concurrent-sessions 1
+```
+
+Set `HEADLESSCODE_RUNNER_ID` and `HEADLESSCODE_RUNNER_ASSIGNEE` instead of the
+two flags if those values belong in the protected environment file. Give the
+workstation a different runner id. Keep one watcher process per runner id;
+the watcher takes an exclusive lock under `$XDG_STATE_HOME/headlesscode` (or
+`~/.local/state/headlesscode`) and refuses to remove a stale lock
+automatically. If a claim expires, first verify the old process groups are
+absent on the original machine. If the machine cannot be inspected, leave the
+claim quarantined; do not infer teardown from lease expiry alone. After
+out-of-band confirmation that the old host's worker groups and guest resources
+are gone, an authorized operator can call
+`GitHubIssueClaimStore.recoverExpired()` from `src/watcher/claims.ts` with the
+current ref tip, runner id, nonce, and epoch. The method rejects an unexpired
+lease or a changed tip and records the operator login and supplied evidence in
+the released claim commit. That API records the operator's declaration; it
+cannot independently inspect or prove remote teardown. Never use it when the
+old host or guest state is uncertain.
+
 ### Dry-run (CI / no-token validation)
 
+After making `GH_TOKEN` available through the shell's protected environment,
+run:
+
 ```bash
-GH_TOKEN=ghp_... npx tsx src/cli.ts watch --owner my-org --repo ~/Projects/my-repo \
+npx tsx src/cli.ts watch --owner my-org --repo ~/Projects/my-repo \
   --label needs-agent --dry-run --run-once
 ```
 
