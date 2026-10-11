@@ -9,6 +9,7 @@ The output directory must be private (mode `0700`). Supply an Ed25519 receipt ke
 ```sh
 TMPDIR="$PWD/.headlesscode/scratch/tmp" npx tsx scripts/rsi-adversarial-qualification.ts \
   --receipt-signing-key "$QUALIFICATION_SIGNING_KEY" \
+  --evaluator-trusted-public-key "$QUALIFICATION_PUBLIC_KEY" \
   --receipt-public-key-sha256 "$QUALIFICATION_PUBLIC_KEY_SHA256" \
   --artifacts-dir "$PWD/.headlesscode/scratch/rsi-adversarial-qualification/run-1"
 ```
@@ -16,3 +17,5 @@ TMPDIR="$PWD/.headlesscode/scratch/tmp" npx tsx scripts/rsi-adversarial-qualific
 The command writes the controller prompt, raw response, generated tests, OpenShell output, controller run and archive, and a signed `qualification-receipt.json`. The receipt binds artifact hashes to reviewer and billing identities, the independently reconstructed adversarial gate and selection decision, and the synthetic fixture mutation provenance. Verify its Ed25519 signature against the public key whose digest matches the receipt pin.
 
 This is a one-review qualification run, not a mutation campaign or a benchmark proof. Development benchmarks are deliberately not admitted by this command, so an adversarial pass alone cannot select the candidate. If the reviewer finds a defect and its generated test fails, the controller should close the adversarial hard gate and reject the candidate. If the tests pass, the command records that result without claiming final selection eligibility.
+
+The evaluator seal uses the same external protected Ed25519 key pair and independently supplied public-key digest as the qualification receipt. The public key file must remain outside the synthetic repository, archive, and candidate worktrees. Reviewer billing requires matching generation identity and token counts before the returned review reaches the controller.

@@ -6,7 +6,7 @@ import { execFileSync } from "node:child_process"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
 
-import { OpenRouterClient } from "../src/llm/openrouter.js"
+import { OpenRouterClient, type OpenRouterGenerationMetadata } from "../src/llm/openrouter.js"
 import { DEFAULT_PROTECTED_PATHS } from "../src/rsi/config.js"
 import { requestAdversarialReview } from "../src/rsi/adversarial.js"
 import { RSI_MUSE_OPENROUTER_MODEL, RSI_OPENROUTER_PROFILES } from "../src/rsi/inference-broker.js"
@@ -23,6 +23,7 @@ const QUALIFICATION_MUTATION = "Deterministic qualification fixture patch; no mu
 interface Options {
 	artifactsDir?: string
 	signingKeyPath?: string
+	trustedPublicKeyPath?: string
 	publicKeySha256?: string
 	help?: boolean
 }
@@ -37,6 +38,12 @@ interface ReceiptEnvelope {
 
 function sha256(value: string | Buffer): string {
 	return createHash("sha256").update(value).digest("hex")
+}
+
+export function assertReviewerBillingTokens(usage: { promptTokens?: number; completionTokens?: number }, billing: OpenRouterGenerationMetadata): void {
+	const billedPromptTokens = billing.nativeTokensPrompt ?? billing.tokensPrompt
+	const billedCompletionTokens = billing.nativeTokensCompletion ?? billing.tokensCompletion
+	if (!Number.isSafeInteger(usage.promptTokens) || !Number.isSafeInteger(usage.completionTokens) || usage.promptTokens! < 0 || usage.completionTokens! < 0 || billedPromptTokens !== usage.promptTokens || billedCompletionTokens !== usage.completionTokens) throw new Error("reviewer response and authoritative billing token counts do not match")
 }
 
 function canonicalJson(value: unknown): string {
@@ -55,16 +62,17 @@ export function parseQualificationArgs(argv: string[]): { options?: Options; err
 	for (let index = 0; index < argv.length; index++) {
 		const arg = argv[index]
 		if (arg === "--help" || arg === "-h") { options.help = true; continue }
-		if (arg !== "--artifacts-dir" && arg !== "--receipt-signing-key" && arg !== "--receipt-public-key-sha256") return { error: `unknown argument: ${arg}` }
+		if (arg !== "--artifacts-dir" && arg !== "--receipt-signing-key" && arg !== "--receipt-public-key-sha256" && arg !== "--evaluator-trusted-public-key") return { error: `unknown argument: ${arg}` }
 		const value = argv[index + 1]
 		if (!value || value.startsWith("--")) return { error: `${arg} requires a value` }
 		index++
 		if (arg === "--artifacts-dir") options.artifactsDir = path.resolve(value)
 		else if (arg === "--receipt-signing-key") options.signingKeyPath = path.resolve(value)
+		else if (arg === "--evaluator-trusted-public-key") options.trustedPublicKeyPath = path.resolve(value)
 		else options.publicKeySha256 = value.toLowerCase()
 	}
 	if (options.help) return { options }
-	if (!options.signingKeyPath || !options.publicKeySha256) return { error: "--receipt-signing-key and --receipt-public-key-sha256 are required" }
+	if (!options.signingKeyPath || !options.trustedPublicKeyPath || !options.publicKeySha256) return { error: "--receipt-signing-key, --evaluator-trusted-public-key, and --receipt-public-key-sha256 are required" }
 	if (!/^[a-f0-9]{64}$/.test(options.publicKeySha256)) return { error: "--receipt-public-key-sha256 must be a SHA-256 hex digest" }
 	return { options }
 }
@@ -113,10 +121,28 @@ async function writePrivateFile(root: string, relative: string, content: Buffer 
 	const destination = path.resolve(root, relative)
 	if (!destination.startsWith(`${path.resolve(root)}${path.sep}`)) throw new Error("artifact path escaped the qualification output directory")
 	const bytes = Buffer.isBuffer(content) ? content : Buffer.from(content)
-	await fs.mkdir(path.dirname(destination), { recursive: true, mode: 0o700 })
+	await ensurePrivateDirectory(path.dirname(destination))
 	const handle = await fs.open(destination, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600)
 	try { await handle.writeFile(bytes); await handle.sync() } finally { await handle.close() }
 	return { path: relative, sha256: sha256(bytes), bytes: bytes.byteLength }
+}
+
+export async function ensurePrivateDirectory(directory: string): Promise<void> {
+	const resolved = path.resolve(directory)
+	let cursor = path.parse(resolved).root
+	const parts = resolved.slice(cursor.length).split(path.sep).filter(Boolean)
+	for (const part of parts) {
+		cursor = path.join(cursor, part)
+		try {
+			const stat = await fs.lstat(cursor)
+			if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("private qualification path contains a symlink or non-directory component")
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+			await fs.mkdir(cursor, { mode: 0o700 })
+		}
+	}
+	const stat = await fs.lstat(resolved)
+	if ((stat.mode & 0o077) !== 0 || await fs.realpath(resolved) !== resolved) throw new Error("qualification directory must be private and must not traverse symlinks")
 }
 
 function git(cwd: string, args: string[]): string {
@@ -187,23 +213,23 @@ export function verifyControllerGate(run: RsiRunRecord, reviewStatus: string, te
 
 function helpText(): string {
 	return [
-		"Usage: npx tsx scripts/rsi-adversarial-qualification.ts --receipt-signing-key <mode-0600-ed25519-key> --receipt-public-key-sha256 <sha256>",
+		"Usage: npx tsx scripts/rsi-adversarial-qualification.ts --receipt-signing-key <mode-0600-ed25519-key> --receipt-public-key-sha256 <sha256> --evaluator-trusted-public-key <mode-0600-public-key>",
 		"       [--artifacts-dir <private-output-directory>]",
 		"Runs a synthetic controlled candidate through one Meta-routed OpenRouter Muse Contributor review and a separate OpenShell CPU evaluation guest.",
 		"The fixture mutation is scripted, not model-generated. Requires the configured RSI PostgreSQL/S3 queue, an active CPU OpenShell worker, and HEADLESSCODE_OPENROUTER_API_KEY.",
 	].join("\n") + "\n"
 }
 
-export async function runAdversarialQualification(options: Required<Pick<Options, "signingKeyPath" | "publicKeySha256">> & Pick<Options, "artifactsDir">): Promise<{ outputDir: string; qualification: Record<string, unknown> }> {
+export async function runAdversarialQualification(options: Required<Pick<Options, "signingKeyPath" | "trustedPublicKeyPath" | "publicKeySha256">> & Pick<Options, "artifactsDir">): Promise<{ outputDir: string; qualification: Record<string, unknown> }> {
 	if (!process.env.HEADLESSCODE_OPENROUTER_API_KEY?.trim()) throw new Error("HEADLESSCODE_OPENROUTER_API_KEY is required for the single live reviewer call")
 	const scratchRoot = path.resolve(process.cwd(), ".headlesscode", "scratch")
 	const tempRoot = process.env.TMPDIR ? path.resolve(process.env.TMPDIR) : ""
 	if (!tempRoot || !tempRoot.startsWith(`${scratchRoot}${path.sep}`)) throw new Error(`TMPDIR must point inside ${scratchRoot}; refusing system temporary directories`)
-	await fs.mkdir(tempRoot, { recursive: true, mode: 0o700 })
+	await ensurePrivateDirectory(tempRoot)
 	const tempStat = await fs.lstat(tempRoot)
 	if (tempStat.isSymbolicLink() || !tempStat.isDirectory() || (tempStat.mode & 0o077) !== 0) throw new Error("TMPDIR must be a non-symlink private directory with mode 0700 or stricter")
 	const outputDir = path.resolve(options.artifactsDir ?? path.join(process.cwd(), ".headlesscode", "scratch", "rsi-adversarial-qualification", new Date().toISOString().replace(/[:.]/g, "-")))
-	await fs.mkdir(outputDir, { recursive: true, mode: 0o700 })
+	await ensurePrivateDirectory(outputDir)
 	const outputStat = await fs.lstat(outputDir)
 	if (outputStat.isSymbolicLink() || !outputStat.isDirectory() || (outputStat.mode & 0o077) !== 0) throw new Error("artifact directory must be a non-symlink directory with mode 0700 or stricter")
 	const keys = await loadSigningKeys(options.signingKeyPath, options.publicKeySha256)
@@ -235,7 +261,7 @@ export async function runAdversarialQualification(options: Required<Pick<Options
 		hiddenEvalCommands: [], archiveDir: path.join(outputDir, "archive"), worktreeDir: path.join(source.repoRoot, ".worktrees"),
 		baseRef: "main", seed: runId, dryRun: false, keepWorktrees: false, maxIterations: 1, maxTokens: 32,
 		maxTrajectories: 1, maxTotalIterations: 1, maxRuntimeMs: 120_000, protectedPaths: [...DEFAULT_PROTECTED_PATHS],
-		commandTimeoutMs: 60_000, roles: { worker: { provider: "ollama", model: "qualification-fixture-worker" }, adversary: role },
+		commandTimeoutMs: 60_000, evaluatorSigningKeyPath: options.signingKeyPath, evaluatorTrustedPublicKeyPath: options.trustedPublicKeyPath, evaluatorTrustedKeySha256: `sha256:${options.publicKeySha256}`, roles: { worker: { provider: "ollama", model: "qualification-fixture-worker" }, adversary: role },
 	}
 	try {
 		run = await runRsi(config, {
@@ -287,7 +313,9 @@ export async function runAdversarialQualification(options: Required<Pick<Options
 				if (!responseIdentity?.generationId || typeof responseIdentity.generationId !== "string") throw new Error("OpenRouter did not return a generation ID for billing identity")
 				const billing = await client.fetchGenerationMetadata(responseIdentity.generationId as string, requestSignal)
 				if (!billing || billing.providerName?.toLowerCase() !== "meta" || !billing.model || !profile.returnedModels.includes(billing.model)) throw new Error("OpenRouter billing record is unavailable or does not match the admitted Muse/Meta identity")
-				if (billing.totalCostUsd === undefined || billing.totalCostUsd > MAX_REVIEW_COST_USD) throw new Error("OpenRouter billing record is unavailable or exceeds the $0.005 qualification cap")
+				if (billing.id !== responseIdentity.generationId || typeof billing.totalCostUsd !== "number" || !Number.isFinite(billing.totalCostUsd) || billing.totalCostUsd < 0 || billing.totalCostUsd > MAX_REVIEW_COST_USD) throw new Error("OpenRouter billing record is unavailable or exceeds the $0.005 qualification cap")
+				const usage = responseIdentity.usage as { promptTokens?: number; completionTokens?: number }
+				assertReviewerBillingTokens(usage, billing)
 				generationBilling = billing as unknown as Record<string, unknown>
 				return raw
 			},
@@ -358,7 +386,7 @@ if (isMain) {
 		process.exitCode = 2
 	} else {
 		try {
-			const result = await runAdversarialQualification(parsed.options as Required<Pick<Options, "signingKeyPath" | "publicKeySha256">> & Pick<Options, "artifactsDir">)
+			const result = await runAdversarialQualification(parsed.options as Required<Pick<Options, "signingKeyPath" | "trustedPublicKeyPath" | "publicKeySha256">> & Pick<Options, "artifactsDir">)
 			process.stdout.write(JSON.stringify(result.qualification) + `\nArtifacts: ${result.outputDir}\n`)
 		} catch (error) {
 			process.stderr.write(`rsi-adversarial-qualification: ${error instanceof Error ? error.message : String(error)}\n`)

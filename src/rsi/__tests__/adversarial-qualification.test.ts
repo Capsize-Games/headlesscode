@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises"
 import { execFileSync } from "node:child_process"
 import * as path from "node:path"
 
-import { createSyntheticWorkspace, parseQualificationArgs, signReceipt, verifyControllerGate, verifyReceipt } from "../../../scripts/rsi-adversarial-qualification.js"
+import { assertReviewerBillingTokens, createSyntheticWorkspace, ensurePrivateDirectory, parseQualificationArgs, signReceipt, verifyControllerGate, verifyReceipt } from "../../../scripts/rsi-adversarial-qualification.js"
 import type { RsiRunRecord } from "../types.js"
 
 function pin(publicKey: ReturnType<typeof createPublicKey>): string {
@@ -12,9 +12,16 @@ function pin(publicKey: ReturnType<typeof createPublicKey>): string {
 }
 
 assert.match(parseQualificationArgs([]).error ?? "", /signing-key/)
-assert.equal(parseQualificationArgs(["--receipt-signing-key", "key.pem", "--receipt-public-key-sha256", "a".repeat(64)]).error, undefined)
-assert.match(parseQualificationArgs(["--receipt-signing-key", "key.pem", "--receipt-public-key-sha256", "not-a-pin"]).error ?? "", /SHA-256/)
+assert.equal(parseQualificationArgs(["--receipt-signing-key", "key.pem", "--evaluator-trusted-public-key", "public.pem", "--receipt-public-key-sha256", "a".repeat(64)]).error, undefined)
+assert.match(parseQualificationArgs(["--receipt-signing-key", "key.pem", "--evaluator-trusted-public-key", "public.pem", "--receipt-public-key-sha256", "not-a-pin"]).error ?? "", /SHA-256/)
 assert.match(parseQualificationArgs(["--unexpected"]).error ?? "", /unknown argument/)
+
+const nativeUsage = { promptTokens: 862, completionTokens: 66 }
+const nativeBilling = { id: "generation", tokensPrompt: 411, tokensCompletion: 24, nativeTokensPrompt: 862, nativeTokensCompletion: 66 }
+assert.doesNotThrow(() => assertReviewerBillingTokens(nativeUsage, nativeBilling), "normalized token counts must not invalidate matching provider-native usage")
+assert.throws(() => assertReviewerBillingTokens(nativeUsage, { ...nativeBilling, nativeTokensPrompt: 863 }), /do not match/)
+assert.throws(() => assertReviewerBillingTokens({ completionTokens: 66 }, nativeBilling), /do not match/)
+assert.doesNotThrow(() => assertReviewerBillingTokens(nativeUsage, { id: "legacy", tokensPrompt: 862, tokensCompletion: 66 }))
 
 const pair = generateKeyPairSync("ed25519")
 const privateKey = createPrivateKey(pair.privateKey.export({ type: "pkcs8", format: "pem" }))
@@ -46,6 +53,14 @@ assert.deepEqual(verifyControllerGate(passingReviewButUnqualifiedProof, "passed"
 
 const scratch = path.join(process.cwd(), ".headlesscode", "scratch", "adversarial-qualification-fixture-test")
 await fs.mkdir(scratch, { recursive: true, mode: 0o700 })
+const symlinkTarget = path.join(scratch, "target")
+await fs.mkdir(symlinkTarget, { mode: 0o700 })
+const symlinkAncestor = path.join(scratch, "linked")
+await fs.symlink(symlinkTarget, symlinkAncestor)
+await assert.rejects(ensurePrivateDirectory(path.join(symlinkAncestor, "nested")), /symlink/)
+await assert.rejects(fs.stat(path.join(symlinkTarget, "nested")), /ENOENT/, "refusing an ancestor symlink must have zero writes behind it")
+await fs.unlink(symlinkAncestor)
+await fs.rmdir(symlinkTarget)
 const fixture = await createSyntheticWorkspace(scratch)
 assert.equal(fixture.sourcePatchSha256, createHash("sha256").update(fixture.mutationPatch).digest("hex"))
 assert.match(fixture.mutationPatch.toString("utf8"), /return Math\.max\(0, Math\.trunc\(value\)\)/)
