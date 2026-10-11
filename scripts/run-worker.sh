@@ -29,7 +29,7 @@
 #                      "npx tsx src/cli.ts", resolved from this repo root)
 #   HEADLESSCODE_AGENT_EXECUTOR  worker implementation (default builtin;
 #                      supported values builtin or muse)
-#   HEADLESSCODE_MUSE_MODEL  optional native Muse Meta model id, separate
+#   HEADLESSCODE_NATIVE_MUSE_MODEL  optional native Muse Meta model id, separate
 #                      from OPENROUTER_MODEL
 #   HEADLESSCODE_ROOT  repo root containing src/cli.ts (default: this repo)
 #   HEADLESSCODE_MEMORY_DIR  when set, forwarded to the CLI as --memory-dir
@@ -93,7 +93,7 @@ MODEL=""
 LOG_FILE=""
 MAX_ITERATIONS=""
 EXECUTOR="${HEADLESSCODE_AGENT_EXECUTOR:-builtin}"
-MUSE_MODEL="${HEADLESSCODE_MUSE_MODEL:-}"
+MUSE_MODEL="${HEADLESSCODE_NATIVE_MUSE_MODEL:-}"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in

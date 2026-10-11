@@ -1740,13 +1740,13 @@ export function buildSpawnEnv(options: BuildSpawnEnvOptions): { env: NodeJS.Proc
 		TARGET_REPO: options.repo,
 		ORCHESTRATOR_MODE: options.mode,
 		HEADLESSCODE_AGENT_EXECUTOR: executor,
-		HEADLESSCODE_MUSE_MODEL: executor === "muse" ? options.museModel ?? "" : "",
 		HEADLESSCODE_EXECUTION_PROVIDER: options.executionProvider ?? process.env.HEADLESSCODE_EXECUTION_PROVIDER ?? "local",
 		// The resolved worker model must reach the spawner (and the workers it
 		// launches) — same pattern as HEADLESSCODE_PROJECT below. Exported to
 		// the PROVIDER's default-model var: the spawn script re-resolves via
 		// resolveModelForMode (whose rule 4 shadows OPENROUTER_MODEL under
 		// "muse"), so exporting a muse id as OPENROUTER_MODEL would strand it.
+		HEADLESSCODE_NATIVE_MUSE_MODEL: executor === "muse" ? options.museModel ?? "" : "",
 		...(workerModel ? (provider === "muse" ? { [MUSE_MODEL_ENV]: workerModel } : { OPENROUTER_MODEL: workerModel }) : {}),
 		// Phase 3: workers scope memory to the REPO (not the worktree) and
 		// share one memory dir. HEADLESSCODE_PROJECT flows to the worker CLI

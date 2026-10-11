@@ -72,7 +72,7 @@ function launch(workspace: string, bin: string, argsFile: string, extraEnv: Node
 			PATH: `${bin}:${process.env.PATH ?? ""}`,
 			HEADLESSCODE_ROOT: repoRoot,
 			HEADLESSCODE_AGENT_EXECUTOR: "builtin",
-			HEADLESSCODE_MUSE_MODEL: "",
+			HEADLESSCODE_NATIVE_MUSE_MODEL: "",
 			FAKE_MUSE_ARGS: argsFile,
 			...extraEnv,
 		},
@@ -113,7 +113,7 @@ async function testOrchestrateAndWatcherSelectionPersistsThroughSpawn(): Promise
 	const env = buildSpawnEnv({ repo: "/synthetic/repo", mode: "code", executor: "muse", museModel: "meta/test-model", env: { OPENROUTER_MODEL: "deepseek/deepseek-v4-flash", OPENROUTER_API_KEY: "synthetic-secret", HEADLESSCODE_OPENROUTER_API_KEY: "synthetic-secret" } })
 	assert.equal(env.workerModel, undefined, "Muse selection does not resolve or inherit an OpenRouter worker model")
 	assert.equal(env.env.HEADLESSCODE_AGENT_EXECUTOR, "muse")
-	assert.equal(env.env.HEADLESSCODE_MUSE_MODEL, "meta/test-model")
+	assert.equal(env.env.HEADLESSCODE_NATIVE_MUSE_MODEL, "meta/test-model")
 	assert.equal(env.env.OPENROUTER_MODEL, "deepseek/deepseek-v4-flash", "selection keeps orchestrator-side auxiliary model config separate")
 	assert.equal(env.env.OPENROUTER_API_KEY, "synthetic-secret")
 	assert.equal(env.env.HEADLESSCODE_OPENROUTER_API_KEY, "synthetic-secret")
@@ -121,7 +121,7 @@ async function testOrchestrateAndWatcherSelectionPersistsThroughSpawn(): Promise
 	const fake = await setupFakeMuse()
 	const capture = path.join(fake.root, "spawn-env.txt")
 	const spawnStub = path.join(fake.root, "spawn-stub.sh")
-	await fs.writeFile(spawnStub, `#!/usr/bin/env bash\nprintf '%s\\n' "$HEADLESSCODE_AGENT_EXECUTOR" "$HEADLESSCODE_MUSE_MODEL" "$OPENROUTER_MODEL" "$OPENROUTER_API_KEY" "$HEADLESSCODE_OPENROUTER_API_KEY" > ${JSON.stringify(capture)}\n`, "utf8")
+	await fs.writeFile(spawnStub, `#!/usr/bin/env bash\nprintf '%s\\n' "$HEADLESSCODE_AGENT_EXECUTOR" "$HEADLESSCODE_NATIVE_MUSE_MODEL" "$OPENROUTER_MODEL" "$OPENROUTER_API_KEY" "$HEADLESSCODE_OPENROUTER_API_KEY" > ${JSON.stringify(capture)}\n`, "utf8")
 	await fs.chmod(spawnStub, 0o755)
 	const previous = process.env.HEADLESSCODE_SPAWN_SCRIPT
 	const previousModel = process.env.OPENROUTER_MODEL
@@ -397,8 +397,31 @@ async function testInvalidExecutorAndModelCombinationFailBeforeLaunch(): Promise
 	}
 }
 
+async function testBuiltinMuseApiModelDoesNotSelectNativeExecutor(): Promise<void> {
+	const fake = await setupFakeMuse()
+	try {
+		const selection = buildSpawnEnv({ repo: fake.workspace, mode: "code", executor: "builtin", explicitModel: "muse-spark-1.3-contributor",
+			env: { HEADLESSCODE_LLM_PROVIDER: "muse", HEADLESSCODE_MUSE_MODEL: "muse-spark-1.3" } })
+		assert.equal(selection.env.HEADLESSCODE_MUSE_MODEL, "muse-spark-1.3-contributor")
+		assert.equal(selection.env.HEADLESSCODE_NATIVE_MUSE_MODEL, "")
+		const capture = path.join(fake.root, "direct-model.txt")
+		await fs.writeFile(path.join(fake.bin, "headless-test-cli"), '#!/usr/bin/env bash\nprintf "%s" "$HEADLESSCODE_MUSE_MODEL" > "$DIRECT_MODEL_CAPTURE"\n')
+		await fs.chmod(path.join(fake.bin, "headless-test-cli"), 0o755)
+		const launched = spawnSync("bash", [path.join(repoRoot, "scripts", "run-worker.sh"), fake.workspace, "task.md", "--executor", "builtin"], {
+			cwd: repoRoot, encoding: "utf8", env: { ...process.env, ...selection.env, HEADLESSCODE_ROOT: repoRoot,
+				HEADLESSCODE_CLI: "headless-test-cli", PATH: `${fake.bin}:${process.env.PATH ?? ""}`, DIRECT_MODEL_CAPTURE: capture },
+		})
+		assert.equal(launched.status, 0, launched.stderr)
+		await waitForMarker(path.join(fake.workspace, ".harness.done"))
+		assert.equal(await fs.readFile(path.join(fake.workspace, ".harness.exit"), "utf8"), "0")
+		assert.equal(await fs.readFile(capture, "utf8"), "muse-spark-1.3-contributor")
+		await assert.rejects(fs.access(fake.argsFile), "builtin API route must not invoke native Muse")
+	} finally { await fs.rm(fake.root, { recursive: true, force: true }) }
+}
+
 const tests: Array<[string, () => Promise<void>]> = [
 	["issue executor labels resolve per job and reject conflicts", testIssueSelectionLabels],
+	["builtin Muse API model stays separate from the native executor selector", testBuiltinMuseApiModelDoesNotSelectNativeExecutor],
 	["CLI, watcher intake, and rework retain explicit Muse executor/model selection", testOrchestrateAndWatcherSelectionPersistsThroughSpawn],
 	["per-job Muse executor and model survive orchestrator and watcher state reloads", testExecutorAndModelSurviveDurableStateRoundTrip],
 	["failed watcher retries retain the executor/model saved before restart", testWatcherRetryUsesRecordedSelectionAfterRestart],

@@ -261,6 +261,7 @@ async function testNestedBatchObservationOrderAndImmutability() {
 						const extra = call.arguments.extra as { values: string[] }
 						return Object.isFrozen(extra) && Object.isFrozen(extra.values)
 					}) })
+				return undefined
 			} }).run()
 		assert.equal(result.status, "success")
 		assert.deepEqual(finished, ["fast.txt", "slow.txt"], "reads actually finished out of submission order")

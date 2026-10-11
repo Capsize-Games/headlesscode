@@ -56,12 +56,12 @@
 #                        (~/.local/share/headlesscode/projects/<key>/ — see
 #                        src/project-store.ts) via src/config/mode-models.ts,
 #                        falling back to the provider default-model var
-#                        ($OPENROUTER_MODEL, or $HEADLESSCODE_MUSE_MODEL under
+#                        ($OPENROUTER_MODEL, or $HEADLESSCODE_NATIVE_MUSE_MODEL under
 #                        HEADLESSCODE_LLM_PROVIDER=muse) which then flows
 #                        to run-worker.sh)
 #   HEADLESSCODE_AGENT_EXECUTOR  worker implementation: builtin (default)
 #                        or muse; native Meta model selection is separate via
-#                        HEADLESSCODE_MUSE_MODEL and is recorded per group
+#                        HEADLESSCODE_NATIVE_MUSE_MODEL and is recorded per group
 #   PLAN_FIRST           when set (e.g. PLAN_FIRST=1), run a SHORT
 #                        architect-mode planning session in each worktree
 #                        BEFORE launching its code worker (issue #49). The
@@ -164,19 +164,19 @@ DATE_TAG="$(date +%Y-%m-%d)"
 STATE_FILE="$WORKTREE_PARENT/.orchestrator-state.json"
 ORCH_MODE="${ORCHESTRATOR_MODE:-code}"
 AGENT_EXECUTOR="${HEADLESSCODE_AGENT_EXECUTOR:-builtin}"
-MUSE_MODEL="${HEADLESSCODE_MUSE_MODEL:-}"
+MUSE_MODEL="${HEADLESSCODE_NATIVE_MUSE_MODEL:-}"
 
 if [ "$AGENT_EXECUTOR" != "builtin" ] && [ "$AGENT_EXECUTOR" != "muse" ]; then
     echo "spawn-parallel-worktrees: unsupported HEADLESSCODE_AGENT_EXECUTOR='$AGENT_EXECUTOR' (expected builtin or muse)" >&2
     exit 2
 fi
 if [ -n "$MUSE_MODEL" ] && ! [[ "$MUSE_MODEL" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$ ]]; then
-    echo "spawn-parallel-worktrees: invalid HEADLESSCODE_MUSE_MODEL" >&2
+    echo "spawn-parallel-worktrees: invalid HEADLESSCODE_NATIVE_MUSE_MODEL" >&2
     exit 2
 fi
 if [ "$AGENT_EXECUTOR" = "muse" ]; then
     if [ -n "${SPAWN_MODEL:-}" ]; then
-        echo "spawn-parallel-worktrees: SPAWN_MODEL is an OpenRouter model; use HEADLESSCODE_MUSE_MODEL for Muse" >&2
+        echo "spawn-parallel-worktrees: SPAWN_MODEL is an OpenRouter model; use HEADLESSCODE_NATIVE_MUSE_MODEL for Muse" >&2
         exit 2
     fi
     if [ "$ORCH_MODE" != "code" ]; then
@@ -202,7 +202,7 @@ if [ "$AGENT_EXECUTOR" = "muse" ]; then
         fi
     done
 elif [ -n "$MUSE_MODEL" ]; then
-    echo "spawn-parallel-worktrees: HEADLESSCODE_MUSE_MODEL requires HEADLESSCODE_AGENT_EXECUTOR=muse" >&2
+    echo "spawn-parallel-worktrees: HEADLESSCODE_NATIVE_MUSE_MODEL requires HEADLESSCODE_AGENT_EXECUTOR=muse" >&2
     exit 2
 fi
 
@@ -274,7 +274,7 @@ merge_state() {
 # bash reimplementation. Precedence (documented in mode-models.ts): an
 # explicit SPAWN_MODEL override -> the CENTRAL project store's
 # mode-models.json[mode] -> ...["_default"] -> the provider default-model
-# env var ($OPENROUTER_MODEL, or $HEADLESSCODE_MUSE_MODEL under
+# env var ($OPENROUTER_MODEL, or $HEADLESSCODE_NATIVE_MUSE_MODEL under
 # HEADLESSCODE_LLM_PROVIDER=muse) -> empty (the CLI's own default).
 #
 # The config lives in the central store keyed by $REPO_ROOT's git-common-dir
@@ -622,7 +622,7 @@ EOF
     fi
     EXECUTOR_ARGS=(--executor "$AGENT_EXECUTOR")
     [ -n "$MUSE_MODEL" ] && EXECUTOR_ARGS+=(--muse-model "$MUSE_MODEL")
-    WORKER_PID="$(ORCHESTRATOR_MODE="$ORCH_MODE" HEADLESSCODE_AGENT_EXECUTOR="$AGENT_EXECUTOR" HEADLESSCODE_MUSE_MODEL="$MUSE_MODEL" bash "$HARNESS_ROOT/scripts/run-worker.sh" \
+    WORKER_PID="$(ORCHESTRATOR_MODE="$ORCH_MODE" HEADLESSCODE_AGENT_EXECUTOR="$AGENT_EXECUTOR" HEADLESSCODE_NATIVE_MUSE_MODEL="$MUSE_MODEL" bash "$HARNESS_ROOT/scripts/run-worker.sh" \
         "$wt_path" "ORCHESTRATOR_TASK.md" --mode "$ORCH_MODE" "${EXECUTOR_ARGS[@]}" "${MODEL_ARGS[@]}" "${MAX_ITER_ARGS[@]}")"
     WORKER_MODEL_LABEL="${WORKER_MODEL:-<unset — CLI default>}"
     [ "$AGENT_EXECUTOR" = "muse" ] && WORKER_MODEL_LABEL="${MUSE_MODEL:-<Muse Meta default>}"

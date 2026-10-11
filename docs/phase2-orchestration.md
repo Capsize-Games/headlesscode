@@ -213,7 +213,8 @@ The installed CLI's help describes browser approval for login and says
 `META_API_KEY` takes precedence over account login. The model passed through
 `--muse-model` is a native Muse model identifier; HeadlessCode does not translate
 OpenRouter model names or switch providers. Without it, Muse uses its own Meta
-provider default. Do not pass `--model` to select a Muse worker; `--model`
+provider default. Script callers can set `HEADLESSCODE_NATIVE_MUSE_MODEL`;
+`HEADLESSCODE_MUSE_MODEL` selects the built-in direct Meta API model. Do not pass `--model` to select a Muse worker; `--model`
 continues to select HeadlessCode/OpenRouter models used by built-in workers and
 the optional reviewer/QA agents.
 

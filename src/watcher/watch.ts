@@ -607,7 +607,7 @@ export function defaultSpawn(batch: SpawnBatch, config: Pick<WatcherConfig, "mod
 			ORCHESTRATOR_MODE: config.mode ?? "code",
 			HEADLESSCODE_EXECUTION_PROVIDER: config.executionProvider ?? process.env.HEADLESSCODE_EXECUTION_PROVIDER ?? "local",
 			HEADLESSCODE_AGENT_EXECUTOR: batch.executor,
-			HEADLESSCODE_MUSE_MODEL: batch.museModel ?? "",
+			HEADLESSCODE_NATIVE_MUSE_MODEL: batch.museModel ?? "",
 			HEADLESSCODE_PROJECT: path.basename(batch.repoRoot),
 			...(config.memoryDir ? { HEADLESSCODE_MEMORY_DIR: path.resolve(config.memoryDir) } : {}),
 		},
