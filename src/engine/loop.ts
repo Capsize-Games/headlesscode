@@ -1594,6 +1594,8 @@ export class HeadlessSession {
 	private recallInfo: { recalledFacts: number; recalledSessions: number } | null = null
 	/** Session id used as the checkpoint service's taskId. */
 	private readonly sessionId: string
+	/** Opaque per-run key for provider cache affinity; deliberately unrelated to the session/user id. */
+	private readonly cacheRoutingKey = `hc-${randomUUID()}`
 	private checkpointService: CheckpointService | null = null
 	/** Whether checkpoints actually run this session: config on AND the executor is edit-capable. */
 	private readonly checkpointsActive: boolean
@@ -3485,6 +3487,7 @@ export class HeadlessSession {
 			const request = {
 				model: this.config.model,
 				messages: requestMessages,
+				cacheRoutingKey: this.cacheRoutingKey,
 				tools,
 				temperature: this.config.temperature,
 				maxTokens: this.config.maxTokens,
@@ -3538,7 +3541,7 @@ export class HeadlessSession {
 				try {
 					if (!(await this.appendEvidence({ sessionId: this.sessionId, requestId, kind: "condensation_request", actor: "headlesscode-loop", origin: "llm-client", payload: { ...wireRequest, promptSha256: sha256(canonicalJson(wireRequest.messages)) } }))) throw new Error(this.evidenceFault ?? "condensation intent not acknowledged")
 					composed.signal.throwIfAborted()
-					const response = await this.llmClient.createChatCompletion({ ...request, signal: composed.signal })
+					const response = await this.llmClient.createChatCompletion({ ...request, cacheRoutingKey: this.cacheRoutingKey, signal: composed.signal })
 					if (!(await this.appendEvidence({ sessionId: this.sessionId, requestId: `${requestId}_response`, kind: "condensation_response", actor: "headlesscode-loop", origin: "llm-client", payload: { requestId, model: request.model, response } }))) throw new Error(this.evidenceFault ?? "condensation result not acknowledged")
 					return response
 				} finally { composed.dispose() }

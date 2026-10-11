@@ -250,6 +250,23 @@ is routed through OpenRouter's available DeepInfra fp8 endpoint
 (`deepinfra/fp8`) with fallback routing disabled. The broker checks endpoint
 metadata and requires the returned selected-provider metadata to identify
 DeepInfra before qualifying usage.
+
+The worker can instead use the supervisor-owned Muse Spark Contributor profile
+by setting `HEADLESSCODE_RSI_ROLE_WORKER_PROVIDER=openrouter`,
+`HEADLESSCODE_RSI_ROLE_WORKER_MODEL=meta/muse-spark-1.3-contributor`, and
+`HEADLESSCODE_RSI_ROLE_WORKER_OPENROUTER_PROFILE=muse-spark-contributor`.
+That profile admits the Meta `meta` endpoint with the advertised `unknown`
+quantization and disables fallback routing. Before dispatch, the broker fetches
+current endpoint metadata and rejects unavailable endpoints, missing tool
+parameters, or rates above the configured input and output price ceilings.
+The worker must report the exact admitted model and Meta provider identity,
+measured usage, and cost for a qualified receipt. The broker sets the same
+random, job-scoped opaque value as OpenRouter's `session_id` and
+`prompt_cache_key` on each call in the job; guest-supplied cache hints are
+ignored. This lets repeated calls in a job use provider prompt caching without
+using campaign or job identifiers as cache keys. This configuration describes
+broker admission and accounting; it does not establish a live RSI result.
+
 Include `REMOTE_API` in `HEADLESSCODE_RSI_WORKER_RESOURCE_CLASSES` for workers
 that claim brokered calls; Ollama workers continue to claim `LOCAL_GPU`.
 Workers need the host-side `HEADLESSCODE_OPENROUTER_API_KEY` and

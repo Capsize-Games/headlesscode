@@ -11,7 +11,7 @@ import type { OpenShellSessionProviderOptions } from "../cloud/openshell-provide
 import type { CloudSessionRequest, CommandResult, SessionHandle } from "../cloud/provider.js"
 import type { CandidateRecord, CommandRunner, RsiConfig, TrialResult, WorkerHarnessExecution, WorkerHarnessRuntimeIdentity } from "./types.js"
 import { ADVERSARIAL_RUNNER_PATH, ADVERSARIAL_TESTS_PATH } from "./adversarial.js"
-import { RSI_OPENROUTER_MODEL } from "./inference-broker.js"
+import { openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID } from "./inference-broker.js"
 import { effectiveWorkerHarnessMode, workerHarnessCliPath, validWorkerHarnessRuntimeIdentity } from "./worker-harness.js"
 import { mutationSnapshotProtectedPathViolations } from "./sandbox.js"
 import type { EmergencyControl } from "../control/emergency-controller.js"
@@ -315,11 +315,14 @@ export function rsiMutationGuestEnvironment(config: RsiConfig, candidate: Candid
 	const worker = config.roles?.worker
 	const provider = worker?.provider ?? "ollama"
 	if (provider === "openrouter") {
-		if (!inferenceBroker || worker?.model !== RSI_OPENROUTER_MODEL) throw new Error(`RSI OpenRouter requires a host broker and pinned model ${RSI_OPENROUTER_MODEL}`)
+		if (!worker || !inferenceBroker) throw new Error("RSI OpenRouter requires a host broker and an admitted profile-bound worker")
+		const profile = openRouterProfileForModel(worker.model, worker.openRouterProfile)
+		if (profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID && worker.openRouterProfile !== profile.id) throw new Error("RSI OpenRouter Muse worker requires its explicit profile identity")
 		if (!/^http:\/\/host\.openshell\.internal:\d+$/.test(inferenceBroker.guestBaseUrl) || !Number.isInteger(inferenceBroker.port) || inferenceBroker.port < 1 || inferenceBroker.port > 65535) throw new Error("RSI OpenRouter broker endpoint is malformed")
 		return {
 			HEADLESSCODE_CODE_MODE_BACKEND: "openrouter",
-			HEADLESSCODE_CODE_MODE_MODEL: worker.model,
+			HEADLESSCODE_CODE_MODE_MODEL: profile.model,
+			OPENROUTER_MODEL: profile.model,
 			OPENROUTER_BASE_URL: inferenceBroker.guestBaseUrl,
 			HEADLESSCODE_RSI_INFERENCE_CAPABILITY: inferenceBroker.capability,
 			HEADLESSCODE_CAPTURE_TRANSCRIPT_DIR: path.join("/workspace", ".headlesscode", "rsi-transcripts"),

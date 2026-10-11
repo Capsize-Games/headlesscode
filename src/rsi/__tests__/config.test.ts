@@ -57,6 +57,22 @@ function testRoleRoutingIsProviderIndependent(): void {
 	assert.equal(roles.adversary?.baseUrl, "https://router.example.invalid")
 }
 
+function testMuseWorkerRequiresItsExplicitPinnedOpenRouterProfile(): void {
+	const muse = resolveRoles(undefined, {
+		HEADLESSCODE_RSI_ROLE_WORKER_PROVIDER: "openrouter",
+		HEADLESSCODE_RSI_ROLE_WORKER_MODEL: "meta/muse-spark-1.3-contributor",
+		HEADLESSCODE_RSI_ROLE_WORKER_OPENROUTER_PROFILE: "muse-spark-contributor",
+	}, DEFAULT_RSI_MODEL)
+	assert.equal(muse.worker?.provider, "openrouter")
+	assert.equal(muse.worker?.model, "meta/muse-spark-1.3-contributor")
+	assert.equal(muse.worker?.openRouterProfile, "muse-spark-contributor")
+	assert.throws(() => resolveRoles(undefined, {
+		HEADLESSCODE_RSI_ROLE_WORKER_PROVIDER: "openrouter",
+		HEADLESSCODE_RSI_ROLE_WORKER_MODEL: "meta/muse-spark-1.3-contributor",
+		HEADLESSCODE_RSI_ROLE_WORKER_OPENROUTER_PROFILE: "deepseek-deepinfra-fp8",
+	}, DEFAULT_RSI_MODEL), /profile\/model identity is not admitted/)
+}
+
 function testAdaptivePolicyHasExplicitBudgets(): void {
 	const defaults = parseRsiArgs(["--repo", "/tmp/repo", "--compute-policy", "adaptive-independent"])
 	assert.equal(defaults.config?.generations, 1, "one configured adaptive generation permits one follow-up stage")
@@ -86,6 +102,7 @@ const tests = [
 	["unknown flags return usage errors", testUnknownFlagIsUsageError],
 	["empty regression command is rejected", testRegressionCommandCannotBeEmpty],
 	["role routing resolves configured critic models", testRoleRoutingIsProviderIndependent],
+	["Muse worker routing requires its pinned profile", testMuseWorkerRequiresItsExplicitPinnedOpenRouterProfile],
 	["adaptive trajectories require explicit bounded capacity", testAdaptivePolicyHasExplicitBudgets],
 	["engineering-only mode requires a paired development run", testEngineeringOnlyHarnessRequiresPairedDevelopmentRun],
 ] as const

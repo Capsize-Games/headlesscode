@@ -9,7 +9,7 @@ import test from "node:test"
 import { FileRsiArtifactStore } from "../artifact-store.js"
 import { fleetJobMatches, fleetPayloadDigest, PostgresRsiJobQueue, type FleetJobIdentity } from "../postgres-queue.js"
 import { PostgresProofCampaign, proofCampaignManifestDigest, type ProofCampaignManifest } from "../proof-campaign.js"
-import { openRouterAllocatedEnvironment, openRouterBrokerLimitsFromEnvironment, RSI_OPENROUTER_MODEL, type OpenRouterBrokerGrant, type OpenRouterBrokerLimits } from "../inference-broker.js"
+import { openRouterAllocatedEnvironment, openRouterBrokerLimitsFromEnvironment, openRouterProfileForModel, RSI_OPENROUTER_MODEL, type OpenRouterBrokerGrant, type OpenRouterBrokerLimits } from "../inference-broker.js"
 import { readArchive, writeArchive } from "../archive.js"
 import { createProofCampaignManifest, proofBrokerCampaignId, reconcileProofCampaignJob, rebuildEvaluatedProofCampaignArchive, rebuildFinishedProofCampaignArchive, RSI_CONFIRMATION_RETENTION_TASK_IDS } from "../controller.js"
 import { loadBenchmark, runBenchmark, type BenchmarkVerifier } from "../benchmark/runner.js"
@@ -71,6 +71,19 @@ test("proof campaign retains uncertain dispatched spend and enforces one key per
 		assert.equal(Number((snapshot.campaign as Record<string, unknown>).used_calls), 0)
 		assert.equal((await pool.query("SELECT count(*)::int AS count FROM headlesscode_rsi_proof_campaign_attempts WHERE campaign_id=$1", [frozen.campaignId])).rows[0]?.count, 1)
 	})
+})
+
+test("pre-profile DeepSeek campaign manifests retain their frozen digest and default receipt identity", () => {
+	const legacy = manifest("legacy-deepseek", [{ armId: "fixed", generation: 0, candidateId: "root-control", taskId: "task-0", seed: "seed-0", attemptKind: "fixed-control" }])
+	legacy.model = { provider: "openshell-openrouter", id: RSI_OPENROUTER_MODEL, settings: { temperature: 0 } }
+	assert.equal(Object.hasOwn(legacy.model, "profileId"), false)
+	assert.equal(proofCampaignManifestDigest(legacy), "4e172b0dcbd889f951ed6454a4e8cf737c688e7ce782e95a7dae09e75395a941")
+	const historicalReceipt = {
+		provider: "openrouter", endpointProvider: "deepinfra", jobId: "legacy-job", campaignId: "legacy-deepseek", model: RSI_OPENROUTER_MODEL,
+		returnedModels: [RSI_OPENROUTER_MODEL], returnedProviders: ["deepinfra"], qualified: true,
+	}
+	assert.equal(Object.hasOwn(historicalReceipt, "profileId"), false)
+	assert.equal(openRouterProfileForModel(historicalReceipt.model).id, "deepseek-deepinfra-fp8", "a pre-profile receipt resolves to the frozen DeepSeek default")
 })
 
 test("engineering-only proof pair finishes after development and freezes no confirmation cells", { skip: !databaseUrl }, async () => {
@@ -490,6 +503,7 @@ test("runner replays a saved benchmark file through settlement after a crash and
 		const task = loaded.manifest.tasks.find((entry) => entry.id === "multi-01")!
 		const cell = { armId: "fixed", generation: 0, candidateId: "g0-candidate-0:child", taskId: task.id, seed: String(task.seed), attemptKind }
 		const frozen = manifest(`campaign-${randomUUID()}`, [cell])
+		frozen.model = { provider: "openshell-openrouter", id: RSI_OPENROUTER_MODEL, settings: {} }
 		frozen.budgets.attempt = { maxCalls: task.ceilings.maxCalls, maxTokens: 100, maxSpendUsd: 0.1, maxDurationMs: task.ceilings.timeoutMs }
 		frozen.budgets.root = { maxCalls: 100, maxTokens: 10_000, maxSpendUsd: 1, maxRuntimeMs: 60_000 }
 		const lease = await campaign.acquire(frozen, "fixed", "run-fixed", "coordinator-1")
@@ -498,7 +512,7 @@ test("runner replays a saved benchmark file through settlement after a crash and
 		let agentRuns = 0
 		let simulateCrash = true
 		const harnessCommit = "e".repeat(40)
-		const modelId = "deepseek/deepseek-chat"
+		const modelId = RSI_OPENROUTER_MODEL
 		const sampling: Record<string, number | string | boolean> = { temperature: 0, think: false, seed: "provider-default" }
 		const agent: BenchmarkAgent = {
 			provider: "openshell-openrouter",
@@ -522,7 +536,7 @@ test("runner replays a saved benchmark file through settlement after a crash and
 					const patch = execFileSync("git", ["diff", "--binary", "--no-ext-diff", `${base}...HEAD`], { cwd: candidate, encoding: "buffer" })
 				return {
 					validity: "valid", patch, stdout: "bounded mock response", stderr: "", calls: 1, tokens: 22, wallTimeMs: 10, stopReason: "mock-complete",
-				inferenceReceipt: { provider: "openrouter", endpointProvider: "deepinfra", jobId: request.attemptId, campaignId: frozen.campaignId, model: request.model.id, returnedModels: [request.model.id], returnedProviders: ["deepinfra"], calls: 1, promptTokens: 10, completionTokens: 12, totalTokens: 22, costUsd: 0.001, accounting: "supervisor-enforced", qualified: true, callReceipts: [], denials: [] },
+				inferenceReceipt: { provider: "openrouter", endpointProvider: "deepinfra", profileId: "deepseek-deepinfra-fp8", jobId: request.attemptId, campaignId: frozen.campaignId, model: request.model.id, returnedModels: [request.model.id], returnedProviders: ["deepinfra"], calls: 1, promptTokens: 10, completionTokens: 12, totalTokens: 22, costUsd: 0.001, accounting: "supervisor-enforced", qualified: true, callReceipts: [], denials: [] },
 			}
 				} finally { await fs.rm(candidate, { recursive: true, force: true }) }
 			},
@@ -583,7 +597,7 @@ test("runner refuses to redispatch a dispatched benchmark cell when its local at
 		frozen.budgets.root.maxCalls = 100
 		const lease = await campaign.acquire(frozen, "fixed", "run-fixed", "coordinator-1")
 		const harnessCommit = "e".repeat(40)
-		const modelId = "deepseek/deepseek-chat"
+		const modelId = RSI_OPENROUTER_MODEL
 		const sampling: Record<string, number | string | boolean> = { temperature: 0, think: false, seed: "provider-default" }
 		let agentRuns = 0
 		const agent: BenchmarkAgent = { provider: "fake-model", async run() { agentRuns++; throw new Error("must not run") } }
@@ -652,12 +666,13 @@ test("finished ledger rebuilds the final report from a reloaded active-run check
 			{ armId: "fixed", generation: 0, candidateId: "root-control", taskId: "confirm", seed: "seed-0", attemptKind: "fixed-control", phase: "confirmation" },
 		]
 		const frozen = manifest("finished-campaign", confirmationSchedule)
+		frozen.model = { provider: "openshell-openrouter", id: RSI_OPENROUTER_MODEL, settings: {} }
 		const makeAttempt = (attemptId: string, candidateId: string, kind: "confirmation" | "fixed-control", commit: string): BenchmarkAttempt => ({
 			schemaVersion: 1, manifestDigest: "d".repeat(64), taskId: "confirm", split: "confirmation", attemptId, harnessCommit: commit,
-			agentImage: null, model: { provider: "mock", id: "test/model", sampling: {} }, seed: 1, family: "confirmation",
+			agentImage: null, model: { provider: "openshell-openrouter", id: RSI_OPENROUTER_MODEL, sampling: {} }, seed: 1, family: "confirmation",
 			startDigest: "e".repeat(64), ceilings: { timeoutMs: 1000, maxCalls: 1, maxOutputTokensPerCall: 10, maxPatchBytes: 1000 },
 			verifiedSuccess: true, proofQualified: true, resourceAccounting: "supervisor-enforced", proofRequestSha256: "f".repeat(64),
-			inferenceReceipt: { provider: "openrouter", endpointProvider: "deepinfra", jobId: attemptId, campaignId: "finished-campaign:benchmark", model: "deepseek/deepseek-v4-flash-0731", returnedModels: ["deepseek/deepseek-v4-flash-0731"], returnedProviders: ["deepinfra"], calls: 1, promptTokens: 1, completionTokens: 1, totalTokens: 2, costUsd: 0.0001, accounting: "supervisor-enforced", qualified: true, callReceipts: [], denials: [] },
+			inferenceReceipt: { provider: "openrouter", endpointProvider: "deepinfra", jobId: attemptId, campaignId: "finished-campaign:benchmark", model: RSI_OPENROUTER_MODEL, returnedModels: [RSI_OPENROUTER_MODEL], returnedProviders: ["deepinfra"], calls: 1, promptTokens: 1, completionTokens: 1, totalTokens: 2, costUsd: 0.0001, accounting: "supervisor-enforced", qualified: true, callReceipts: [], denials: [] },
 			validity: "valid", calls: 1, tokens: 2, wallTimeMs: 10, stopReason: "completed", patchDigest: null,
 			evaluatorDigest: "a".repeat(64), artifactRefs: { stdout: createHash("sha256").update(attemptId + " stdout").digest("hex"), stderr: createHash("sha256").update(attemptId + " stderr").digest("hex") },
 		})

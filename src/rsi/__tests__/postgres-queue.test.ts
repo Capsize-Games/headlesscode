@@ -5,7 +5,7 @@ import { Pool } from "pg"
 import test from "node:test"
 import { S3RsiArtifactStore } from "../artifact-store.js"
 import { FileRsiArtifactStore } from "../artifact-store.js"
-import type { OpenRouterBrokerGrant, OpenRouterCallReservation, OpenRouterBrokerLimits } from "../inference-broker.js"
+import type { OpenRouterBrokerGrant, OpenRouterCallReservation, OpenRouterBrokerLimits, OpenRouterEndpointPriceSnapshot } from "../inference-broker.js"
 import { fleetJobMatches, fleetQueuePolicy, PostgresRsiJobQueue, requiredFleetJobLeaseMs, type FleetJob, type FleetJobIdentity, type FleetJobPayload, type FleetQueuePolicy } from "../postgres-queue.js"
 
 test("fleet job replay identity rejects stale snapshots, tasks, base commits, evaluation config, and routing", () => {
@@ -81,11 +81,12 @@ test("PostgreSQL migrations upgrade an earlier artifact and lease schema", { ski
 		assert.ok(artifactColumns.rows.some((row) => row.column_name === "byte_length"))
 		assert.equal(artifactColumns.rows.some((row) => row.column_name === "content"), false, "empty legacy NOT NULL PostgreSQL blob column is removed")
 		assert.ok(jobColumns.rows.some((row) => row.column_name === "lease_duration_ms"))
-		assert.equal((await scopedPool.query("SELECT version FROM headlesscode_rsi_schema_migrations ORDER BY version")).rowCount, 8)
+		assert.equal((await scopedPool.query("SELECT version FROM headlesscode_rsi_schema_migrations ORDER BY version")).rowCount, 10)
 		const campaignColumns = await scopedPool.query("SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name='headlesscode_rsi_inference_campaigns'", [schema])
 		assert.ok(campaignColumns.rows.some((row) => row.column_name === "blocked"), "migration 004 adds the campaign block state used by admission and settlement")
 		const inferenceJobColumns = await scopedPool.query("SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name='headlesscode_rsi_inference_jobs'", [schema])
 		assert.ok(inferenceJobColumns.rows.some((row) => row.column_name === "denials"), "migration 005 persists authenticated broker-denial summaries")
+		assert.ok(inferenceJobColumns.rows.some((row) => row.column_name === "endpoint_price"), "migration 010 preserves the first admitted OpenRouter endpoint-price snapshot")
 		const phaseColumns = await scopedPool.query("SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name='headlesscode_rsi_proof_campaign_arms'", [schema])
 		assert.ok(phaseColumns.rows.some((row) => row.column_name === "phase"), "migration 007 persists the development/confirmation phase gate")
 		const proofAttemptColumns = await scopedPool.query("SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name='headlesscode_rsi_proof_campaign_attempts'", [schema])
@@ -137,6 +138,9 @@ test("PostgreSQL OpenRouter admission persists reservations, blocks overspend, a
 		const receipt = await queue.receipt(grant)
 		assert.equal(receipt.qualified, true)
 		assert.equal(receipt.totalTokens, 20)
+		assert.equal(Object.hasOwn(receipt, "profileId"), false, "legacy DeepSeek receipt serialization remains unchanged")
+		assert.equal(Object.hasOwn(receipt, "endpointPrice"), false, "legacy DeepSeek receipts do not gain endpoint metadata")
+		assert.equal((await queue.pool.query("SELECT endpoint_price FROM headlesscode_rsi_inference_jobs WHERE job_id=$1", [job.jobId])).rows[0]?.endpoint_price, null, "legacy DeepSeek durable identity remains NULL for endpoint price")
 		assert.deepEqual(receipt.denials, [{ statusCode: 429, reason: "budget-or-fence", count: 1 }])
 		await queue.pool.query("UPDATE headlesscode_rsi_jobs SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE job_id=$1", [job.jobId])
 		assert.equal((await queue.receipt(grant)).qualified, false, "expired lease invalidates an otherwise measured receipt before publication")
@@ -186,6 +190,74 @@ test("PostgreSQL OpenRouter admission persists reservations, blocks overspend, a
 		await admin.query(`DROP SCHEMA ${schema} CASCADE`)
 		await admin.end()
 		await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true }))
+	}
+})
+
+test("PostgreSQL Muse admission preserves first endpoint pricing across restart and rejects rate drift", { skip: !databaseUrl }, async () => {
+	const schema = `rsi_muse_price_${randomUUID().replaceAll("-", "")}`
+	const { mkdir, mkdtemp, rm } = await import("node:fs/promises")
+	const scratchBase = `${process.cwd()}/.headlesscode/scratch`
+	await mkdir(scratchBase, { recursive: true })
+	const scratchRoot = await mkdtemp(`${scratchBase}/rsi-muse-price-`)
+	const admin = new Pool({ connectionString: databaseUrl })
+	await admin.query(`CREATE SCHEMA ${schema}`)
+	const connection = { connectionString: databaseUrl, options: `-c search_path=${schema}` }
+	const policy = testPolicy(`muse-price-${randomUUID().slice(0, 8)}`)
+	let queue = new PostgresRsiJobQueue(new Pool(connection), policy, new FileRsiArtifactStore(scratchRoot))
+	const initialPrice: OpenRouterEndpointPriceSnapshot = {
+		model: "meta/muse-spark-1.3-contributor", provider: "meta", endpointTag: "meta", quantization: "unknown",
+		supportedParameters: ["max_tokens", "temperature", "tools", "tool_choice"],
+		inputPricePerMillionUsd: 0.1, outputPricePerMillionUsd: 0.2,
+		observedAt: "2026-10-10T10:00:00.000Z", responseSha256: "a".repeat(64),
+	}
+	try {
+		await queue.migrate()
+		const job = await addJob(queue, "muse-first-price", "CPU", "openrouter:muse")
+		await queue.registerWorker({ workerId: "muse-worker", gatewayId: "muse-gateway", hostname: "synthetic-test-host", maxActive: 1, resourceClasses: ["CPU"] })
+		const lease = await queue.claim("muse-worker")
+		assert.ok(lease)
+		const limits: OpenRouterBrokerLimits = {
+			campaignId: `muse-campaign-${randomUUID()}`, maxCalls: 1, maxInputTokensPerCall: 500, maxOutputTokensPerCall: 500,
+			maxTotalTokens: 1_000, maxDurationMs: 60_000, maxRequestBytes: 16_384, maxResponseBytes: 16_384,
+			maxInputPricePerMillionUsd: 1, maxOutputPricePerMillionUsd: 1, maxCallSpendUsd: 0.01, maxJobSpendUsd: 0.01, maxCampaignSpendUsd: 0.01,
+		}
+		const grant: OpenRouterBrokerGrant = {
+			jobId: job.jobId, leaseToken: lease.token, capability: randomUUID(), model: initialPrice.model,
+			profileId: "muse-spark-contributor", endpointPrice: initialPrice, limits,
+		}
+		const originalDeadline = await queue.register(grant)
+		const saved = await queue.pool.query("SELECT endpoint_price FROM headlesscode_rsi_inference_jobs WHERE job_id=$1", [job.jobId])
+		assert.deepEqual(saved.rows[0]?.endpoint_price, initialPrice, "first admitted snapshot is stored in PostgreSQL")
+		const reservation: OpenRouterCallReservation = {
+			callId: "muse-cache-call-0001", requestSha256: "b".repeat(64), reservedUsd: 0.01,
+			reservedTokens: 100, startedAt: new Date().toISOString(),
+		}
+		await queue.reserve(grant, reservation)
+		await queue.settle(grant, {
+			callId: reservation.callId, state: "complete", qualified: true, returnedModel: initialPrice.model, returnedProvider: "meta",
+			promptTokens: 10, cachedPromptTokens: 4, completionTokens: 5, costUsd: 0.00001,
+			responseSha256: "c".repeat(64), completedAt: new Date().toISOString(),
+		})
+		await queue.close()
+		queue = new PostgresRsiJobQueue(new Pool(connection), policy, new FileRsiArtifactStore(scratchRoot))
+		const refreshedPrice: OpenRouterEndpointPriceSnapshot = {
+			...initialPrice, observedAt: "2026-10-10T10:05:00.000Z", responseSha256: "d".repeat(64),
+		}
+		const restartedGrant: OpenRouterBrokerGrant = { ...grant, capability: randomUUID(), endpointPrice: refreshedPrice }
+		assert.equal(await queue.register(restartedGrant), originalDeadline, "restart preserves durable job deadline")
+		const receipt = await queue.receipt(restartedGrant)
+		assert.equal(receipt.qualified, true, "persisted cached-token accounting remains authoritative after restart")
+		assert.equal(receipt.callReceipts[0]?.cachedPromptTokens, 4)
+		assert.deepEqual(receipt.endpointPrice, initialPrice, "receipt retains the original full snapshot, not the later observation")
+		const driftedPrice = { ...refreshedPrice, inputPricePerMillionUsd: 0.11 }
+		await assert.rejects(queue.register({ ...restartedGrant, capability: randomUUID(), endpointPrice: driftedPrice }), /endpoint-price identity/)
+		assert.equal((await queue.receipt(restartedGrant)).qualified, true, "rejected drift does not mutate grant fencing or call accounting")
+		assert.deepEqual((await queue.receipt(restartedGrant)).endpointPrice, initialPrice)
+	} finally {
+		await queue.close().catch(() => undefined)
+		await admin.query(`DROP SCHEMA ${schema} CASCADE`)
+		await admin.end()
+		await rm(scratchRoot, { recursive: true, force: true })
 	}
 })
 

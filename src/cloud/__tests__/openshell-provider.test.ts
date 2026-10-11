@@ -236,17 +236,34 @@ async function testAbortEscalatesItsLauncherGroupAndRemovesGrandchild(): Promise
 	const scratch = path.join(process.cwd(), ".headlesscode", "scratch")
 	fs.mkdirSync(scratch, { recursive: true })
 	const pidFile = path.join(scratch, `openshell-grandchild-${process.pid}.pid`)
-	const childSource = `const fs=require('node:fs');const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{stdio:'ignore'});fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid));process.on('SIGTERM',()=>{});setInterval(()=>{},1000)`
+	const temporaryPidFile = `${pidFile}.tmp`
+	fs.rmSync(pidFile, { force: true })
+	fs.rmSync(temporaryPidFile, { force: true })
+	const childSource = `const fs=require('node:fs');const {spawn}=require('node:child_process');process.on('SIGTERM',()=>{});const child=spawn(process.execPath,['-e',${JSON.stringify("process.on('SIGTERM',()=>{});if(process.send)process.send('ready');setInterval(()=>{},1000)")}],{stdio:['ignore','ignore','ignore','ipc']});child.once('message',(message)=>{if(message==='ready'){fs.writeFileSync(${JSON.stringify(temporaryPidFile)},String(child.pid)+'\\n',{flag:'wx'});fs.renameSync(${JSON.stringify(temporaryPidFile)},${JSON.stringify(pidFile)})}});setInterval(()=>{},1000)`
 	const controller = new AbortController()
 	const pending = runOpenShellCommandAsync(["-e", childSource], 10_000, process.execPath, controller.signal, 100)
 	const deadline = Date.now() + 3_000
-	while (!fs.existsSync(pidFile) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20))
-	assert.ok(fs.existsSync(pidFile), "fixture starts a controlled grandchild")
-	const grandchildPid = Number(fs.readFileSync(pidFile, "utf8"))
-	controller.abort(new Error("controlled stop"))
-	await assert.rejects(pending, /controlled stop|aborted/)
-	assert.throws(() => process.kill(grandchildPid, 0), (error: NodeJS.ErrnoException) => error.code === "ESRCH", "the grandchild in the owned process group is gone")
-	fs.rmSync(pidFile, { force: true })
+	let grandchildPid = 0
+	let aborted = false
+	try {
+		while (Date.now() < deadline) {
+			try {
+				const candidate = Number(fs.readFileSync(pidFile, "utf8"))
+				if (Number.isSafeInteger(candidate) && candidate > 0) { grandchildPid = candidate; break }
+			} catch { /* the child has not atomically published its ready PID yet */ }
+			await new Promise((resolve) => setTimeout(resolve, 10))
+		}
+		assert.ok(grandchildPid > 0, "fixture publishes a positive grandchild PID only after its SIGTERM handler is installed")
+		controller.abort(new Error("controlled stop"))
+		aborted = true
+		await assert.rejects(pending, /controlled stop|aborted/)
+		assert.throws(() => process.kill(grandchildPid, 0), (error: NodeJS.ErrnoException) => error.code === "ESRCH", "the grandchild in the owned process group is gone")
+	} finally {
+		if (!aborted) controller.abort(new Error("fixture cleanup"))
+		await pending.catch(() => undefined)
+		fs.rmSync(pidFile, { force: true })
+		fs.rmSync(temporaryPidFile, { force: true })
+	}
 }
 
 async function testCreateStopRaceWaitsForCreationAndDeletesLateSandbox(): Promise<void> {

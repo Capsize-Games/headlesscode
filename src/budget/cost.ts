@@ -93,6 +93,10 @@ export const DEFAULT_PRICING_TABLE: PricingTable = {
  "deepseek/deepseek-reasoner": { input: 0.55, output: 2.19 },
  "deepseek/deepseek-v4-flash-0731": { input: 0.06, output: 0.18 },
  "deepseek/deepseek-v4-flash": { input: 0.14, output: 0.28, cacheRead: 0.0028 },
+	// Meta Muse Spark 1.3 Contributor, OpenRouter endpoint/pricing metadata
+	// observed 2026-10-10. This remains a guardrail estimate; the generation
+	// record is the source for actual billed cost and cache discount.
+	"meta/muse-spark-1.3-contributor": { input: 0.10, output: 0.20, cacheRead: 0.002 },
  "anthropic/claude-3.5-sonnet": { input: 3.0, output: 15.0 },
  "qwen/qwen3-embedding-4b": { input: 0.15, output: 0.15 },
  "qwen/qwen3-embedding-8b": { input: 0.3, output: 0.3 },

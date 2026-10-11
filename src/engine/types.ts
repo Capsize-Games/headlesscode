@@ -114,6 +114,14 @@ export interface LlmRequest {
 	 * clients/backends that don't support it.
 	 */
 	toolChoice?: "auto" | "none" | "required"
+	/**
+	 * Opaque, random-per-session value used as OpenRouter's sticky-routing key.
+	 * It must not contain prompt text, a user identifier, or credentials. When
+	 * unset, OpenRouter falls back to its own conversation fingerprinting.
+	 */
+	cacheRoutingKey?: string
+	/** Audit-only route restriction; the client currently permits Meta for Muse only. */
+	providerOnly?: "meta"
 }
 
 /** Response shape returned by an LlmClient. */
@@ -131,7 +139,21 @@ export interface LlmResponse {
 		 * tokens are billed at a steep discount; see src/budget/cost.ts.
 		 */
 		cachedTokens?: number
+		/** Prompt tokens written to the provider cache, when reported. */
+		cacheWriteTokens?: number
+		/** Reasoning tokens included in completion tokens, when reported. */
+		reasoningTokens?: number
+		/** OpenRouter response's cost field; telemetry only, never budget authority. */
+		openRouterReportedCostUsd?: number
+		/** OpenRouter response's cache_discount field; may be negative on writes. */
+		cacheDiscountUsd?: number
 	}
+	/** OpenRouter's generation record identifier, when returned. */
+	generationId?: string
+	/** Model slug echoed by OpenRouter, when returned. */
+	returnedModel?: string
+	/** Provider label echoed by OpenRouter, when returned. */
+	providerName?: string
 }
 
 /**

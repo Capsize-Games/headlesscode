@@ -5,7 +5,7 @@ import * as path from "node:path"
 import { execFileSync, spawn } from "node:child_process"
 import { FileRsiArtifactStore } from "../artifact-store.js"
 import type { BenchmarkAgent, BenchmarkAgentResult, BenchmarkAttempt, BenchmarkImageIdentity, BenchmarkManifest, BenchmarkResourceCeilings, BenchmarkSplit, BenchmarkTask } from "./types.js"
-import { RSI_OPENROUTER_MODEL } from "../inference-broker.js"
+import { openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID } from "../inference-broker.js"
 
 export const RSI_BENCHMARK_RUNNER_VERSION = "1.0.0"
 const DEFAULT_FIXTURE_ROOT = path.resolve("fixtures/rsi-benchmark")
@@ -13,6 +13,23 @@ const DEFAULT_OUTPUT_ROOT = path.resolve(".headlesscode/rsi-benchmark")
 
 function sha256(bytes: Buffer | string): string {
 	return createHash("sha256").update(bytes).digest("hex")
+}
+
+function receiptMatchesProfile(receipt: NonNullable<BenchmarkAttempt["inferenceReceipt"]>, modelId: string): boolean {
+	try {
+		const profile = openRouterProfileForModel(modelId, receipt.profileId)
+		const profileIdMatches = profile.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? receipt.profileId === undefined || receipt.profileId === profile.id : receipt.profileId === profile.id
+		const returnedModel = receipt.returnedModels.length === 1 ? receipt.returnedModels[0] : undefined
+		return receipt.provider === "openrouter" && profileIdMatches && receipt.endpointProvider === profile.endpointProvider
+			&& receipt.model === modelId && returnedModel !== undefined && profile.returnedModels.includes(returnedModel)
+			&& receipt.returnedProviders.length === 1 && receipt.returnedProviders[0] === profile.endpointProvider
+	} catch { return false }
+}
+
+function modelProfileIdentity(agent: BenchmarkAgent, modelId: string): { profileId?: string } {
+	if (agent.provider !== "openshell-openrouter") return {}
+	const profile = openRouterProfileForModel(modelId)
+	return profile.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? {} : { profileId: profile.id }
 }
 
 function safeRelative(value: string): boolean {
@@ -316,7 +333,7 @@ async function validateExistingAttempt(existing: BenchmarkAttempt, task: Benchma
 		attemptId,
 		harnessCommit: options.harnessCommit,
 		agentImage,
-		model: { provider: options.agent.provider, id: options.modelId, sampling },
+		model: { provider: options.agent.provider, id: options.modelId, sampling, ...modelProfileIdentity(options.agent, options.modelId) },
 		seed: task.seed,
 		family: task.family,
 		startDigest: task.startDigest,
@@ -330,7 +347,7 @@ async function validateExistingAttempt(existing: BenchmarkAttempt, task: Benchma
 	if (![existing.calls, existing.tokens].every((count) => count === null || (Number.isSafeInteger(count) && count >= 0))) throw new Error("existing benchmark attempt has invalid resource counters")
 	const receipt = existing.inferenceReceipt
 	if (receipt) {
-		if (receipt.provider !== "openrouter" || receipt.jobId !== attemptId || receipt.campaignId !== campaignId || receipt.model !== options.modelId || receipt.returnedModels.length !== 1 || receipt.returnedModels[0] !== options.modelId) throw new Error("existing benchmark attempt inference receipt identity mismatch")
+		if (!receiptMatchesProfile(receipt, options.modelId) || receipt.jobId !== attemptId || receipt.campaignId !== campaignId) throw new Error("existing benchmark attempt inference receipt identity mismatch")
 		if (existing.calls !== receipt.calls || existing.tokens !== receipt.totalTokens || existing.resourceAccounting !== (receipt.qualified ? "supervisor-enforced" : "incomplete") || existing.proofQualified !== receipt.qualified) throw new Error("existing benchmark attempt inference receipt accounting mismatch")
 		if (!options.agent.verifyReceipt || !(await options.agent.verifyReceipt(attemptId, receipt, ledgerPath))) throw new Error("existing benchmark inference receipt cannot be reverified against its ledger")
 	} else {
@@ -417,11 +434,11 @@ export async function runBenchmark(options: RunBenchmarkOptions & { replayFile?:
 			if (proofRequestSha256 !== undefined && !/^[a-f0-9]{64}$/.test(proofRequestSha256)) throw new Error("attempt lifecycle returned a malformed proof request digest")
 			result = options.replayFile ? await loadReplayResult(options.replayFile) : await options.agent.run({
 				taskId: task.id, attemptId, campaignId, brokerLedgerPath: ledgerPath, task: task.task, seed: task.seed, workspace, harnessCommit: options.harnessCommit,
-				model: { provider: options.agent.provider, id: options.modelId, sampling }, ceilings: task.ceilings,
+				model: { provider: options.agent.provider, id: options.modelId, sampling, ...modelProfileIdentity(options.agent, options.modelId) }, ceilings: task.ceilings,
 			})
 			if (result.inferenceReceipt) {
 				const receipt = result.inferenceReceipt
-				if (options.agent.provider !== "openshell-openrouter" || receipt.provider !== "openrouter" || receipt.jobId !== attemptId || receipt.campaignId !== campaignId || receipt.model !== options.modelId || receipt.returnedModels.length !== 1 || receipt.returnedModels[0] !== options.modelId) throw new Error("agent returned an inference receipt with mismatched provider, attempt, campaign or model identity")
+				if (options.agent.provider !== "openshell-openrouter" || !receiptMatchesProfile(receipt, options.modelId) || receipt.jobId !== attemptId || receipt.campaignId !== campaignId) throw new Error("agent returned an inference receipt with mismatched provider, attempt, campaign or model identity")
 				if (!options.agent.verifyReceipt || !(await options.agent.verifyReceipt(attemptId, receipt, ledgerPath))) throw new Error("agent inference receipt is not present in the trusted supervisor ledger")
 			}
 			if (!Number.isSafeInteger(result.wallTimeMs) || result.wallTimeMs < 0 || result.wallTimeMs > task.ceilings.timeoutMs || ![result.calls, result.tokens].every((count) => count === null || (Number.isSafeInteger(count) && count >= 0))) throw new Error("agent result contained invalid or over-limit resource observations")
@@ -448,10 +465,10 @@ export async function runBenchmark(options: RunBenchmarkOptions & { replayFile?:
 			if (patchRef) patchArtifact = patchRef.sha256
 			const attempt: BenchmarkAttempt = {
 				schemaVersion: 1, manifestDigest: options.loaded.manifestDigest, taskId: task.id, split, attemptId,
-				harnessCommit: options.harnessCommit, agentImage, model: { provider: options.agent.provider, id: options.modelId, sampling }, seed: task.seed,
+				harnessCommit: options.harnessCommit, agentImage, model: { provider: options.agent.provider, id: options.modelId, sampling, ...modelProfileIdentity(options.agent, options.modelId) }, seed: task.seed,
 				family: task.family, startDigest: task.startDigest, ceilings: task.ceilings,
 				verifiedSuccess,
-				proofQualified: Boolean(result.inferenceReceipt?.qualified && result.inferenceReceipt.provider === "openrouter" && result.inferenceReceipt.endpointProvider === "deepinfra" && result.inferenceReceipt.jobId === attemptId && result.inferenceReceipt.campaignId === campaignId && result.inferenceReceipt.model === options.modelId && result.inferenceReceipt.returnedModels.length === 1 && result.inferenceReceipt.returnedModels[0] === options.modelId),
+				proofQualified: Boolean(result.inferenceReceipt?.qualified && receiptMatchesProfile(result.inferenceReceipt, options.modelId) && result.inferenceReceipt.jobId === attemptId && result.inferenceReceipt.campaignId === campaignId),
 				resourceAccounting: result.inferenceReceipt?.qualified ? "supervisor-enforced" : result.inferenceReceipt ? "incomplete" : result.calls !== null && result.tokens !== null ? "guest-reported" : "incomplete",
 				...(proofRequestSha256 ? { proofRequestSha256 } : {}),
 				...(result.inferenceReceipt ? { inferenceReceipt: result.inferenceReceipt } : {}),
@@ -467,7 +484,7 @@ export async function runBenchmark(options: RunBenchmarkOptions & { replayFile?:
 	}
 	const report = {
 		schemaVersion: 1, runnerVersion: options.loaded.manifest.runnerVersion, manifestDigest: options.loaded.manifestDigest,
-		split, harnessCommit: options.harnessCommit, agentImage, model: { provider: options.agent.provider, id: options.modelId, sampling },
+		split, harnessCommit: options.harnessCommit, agentImage, model: { provider: options.agent.provider, id: options.modelId, sampling, ...modelProfileIdentity(options.agent, options.modelId) },
 		denominator: attempts.length, successes: attempts.filter((attempt) => attempt.verifiedSuccess).length,
 		proofQualified: attempts.filter((attempt) => attempt.proofQualified).length,
 		aggregateTokenEnforcement: "unavailable; guest-reported totals are observational only",

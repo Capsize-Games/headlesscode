@@ -8,7 +8,50 @@ export const RSI_OPENROUTER_MODEL = "deepseek/deepseek-v4-flash-0731"
 export const RSI_OPENROUTER_ENDPOINT_PROVIDER = "deepinfra"
 export const RSI_OPENROUTER_ENDPOINT_TAG = "deepinfra/fp8"
 export const RSI_OPENROUTER_ENDPOINT_QUANTIZATION = "fp8"
-const REQUIRED_ENDPOINT_PARAMETERS = ["max_tokens", "temperature", "tools", "tool_choice"] as const
+export const RSI_MUSE_OPENROUTER_MODEL = "meta/muse-spark-1.3-contributor"
+export const RSI_MUSE_OPENROUTER_BILLING_MODEL = "meta/muse-spark-1.3-contributor-20260902"
+export const RSI_OPENROUTER_PROFILE_IDS = ["deepseek-deepinfra-fp8", "muse-spark-contributor"] as const
+export type RsiOpenRouterProfileId = typeof RSI_OPENROUTER_PROFILE_IDS[number]
+export const RSI_DEFAULT_OPENROUTER_PROFILE_ID: RsiOpenRouterProfileId = "deepseek-deepinfra-fp8"
+
+export interface RsiOpenRouterProfile {
+	id: RsiOpenRouterProfileId
+	model: string
+	returnedModels: readonly string[]
+	endpointProvider: string
+	endpointProviderName: string
+	endpointTag: string
+	quantization?: string
+	requiredParameters: readonly string[]
+	allowFallbacks: false
+	cacheRouting?: "opaque-job-key"
+}
+
+export const RSI_OPENROUTER_PROFILES: Readonly<Record<RsiOpenRouterProfileId, RsiOpenRouterProfile>> = Object.freeze({
+	"deepseek-deepinfra-fp8": Object.freeze({
+		id: "deepseek-deepinfra-fp8", model: RSI_OPENROUTER_MODEL, returnedModels: Object.freeze([RSI_OPENROUTER_MODEL]),
+		endpointProvider: RSI_OPENROUTER_ENDPOINT_PROVIDER, endpointProviderName: "DeepInfra", endpointTag: RSI_OPENROUTER_ENDPOINT_TAG,
+		quantization: RSI_OPENROUTER_ENDPOINT_QUANTIZATION, requiredParameters: Object.freeze(["max_tokens", "temperature", "tools", "tool_choice"]), allowFallbacks: false,
+	}),
+	"muse-spark-contributor": Object.freeze({
+		id: "muse-spark-contributor", model: RSI_MUSE_OPENROUTER_MODEL, returnedModels: Object.freeze([RSI_MUSE_OPENROUTER_MODEL, RSI_MUSE_OPENROUTER_BILLING_MODEL]),
+		endpointProvider: "meta", endpointProviderName: "Meta", endpointTag: "meta", quantization: "unknown",
+		requiredParameters: Object.freeze(["max_tokens", "temperature", "tools", "tool_choice"]), allowFallbacks: false, cacheRouting: "opaque-job-key",
+	}),
+})
+
+export function openRouterProfileById(id: unknown): RsiOpenRouterProfile {
+	if (typeof id !== "string" || !Object.hasOwn(RSI_OPENROUTER_PROFILES, id)) throw new Error("RSI OpenRouter profile is not admitted")
+	return RSI_OPENROUTER_PROFILES[id as RsiOpenRouterProfileId]
+}
+
+export function openRouterProfileForModel(model: string, profileId?: unknown): RsiOpenRouterProfile {
+	const profile = profileId === undefined
+		? Object.values(RSI_OPENROUTER_PROFILES).find((candidate) => candidate.model === model)
+		: openRouterProfileById(profileId)
+	if (!profile || profile.model !== model) throw new Error("RSI OpenRouter profile/model identity is not admitted")
+	return profile
+}
 
 export interface OpenRouterBrokerLimits {
 	campaignId: string
@@ -30,7 +73,9 @@ export interface OpenRouterBrokerGrant {
 	jobId: string
 	leaseToken: string
 	capability: string
-	model: typeof RSI_OPENROUTER_MODEL
+	model: string
+	profileId?: RsiOpenRouterProfileId
+	endpointPrice?: OpenRouterEndpointPriceSnapshot
 	limits: OpenRouterBrokerLimits
 	/** Local start instant; durable ledgers preserve the first registration across restarts. */
 	issuedAtMs?: number
@@ -51,6 +96,7 @@ export interface OpenRouterCallSettlement {
 	returnedProvider?: string
 	providerRequestId?: string
 	promptTokens?: number
+	cachedPromptTokens?: number
 	completionTokens?: number
 	costUsd?: number
 	responseSha256?: string
@@ -61,6 +107,7 @@ export interface OpenRouterCallReceipt extends OpenRouterCallReservation, Omit<O
 	jobId: string
 	campaignId: string
 	model: string
+	profileId?: RsiOpenRouterProfileId
 	state: "reserved" | OpenRouterCallSettlement["state"]
 	completedAt?: string
 	authoritative: boolean
@@ -72,10 +119,12 @@ export interface OpenRouterDenialSummary { statusCode: number; reason: OpenRoute
 
 export interface OpenRouterBrokerReceipt {
 	provider: "openrouter"
-	endpointProvider: typeof RSI_OPENROUTER_ENDPOINT_PROVIDER
+	endpointProvider: string
 	jobId: string
 	campaignId: string
 	model: string
+	profileId?: RsiOpenRouterProfileId
+	endpointPrice?: OpenRouterEndpointPriceSnapshot
 	returnedModels: string[]
 	returnedProviders: string[]
 	calls: number
@@ -113,6 +162,26 @@ function denialSummaries(denials: Record<string, number> | undefined): OpenRoute
 		if (!match) throw new Error("OpenRouter ledger contains a malformed denial summary")
 		return { statusCode: Number(match[1]), reason: match[2] as OpenRouterDenialReason, count }
 	})
+}
+
+function grantProfile(grant: OpenRouterBrokerGrant): RsiOpenRouterProfile {
+	return openRouterProfileForModel(grant.model, grant.profileId)
+}
+
+function profileReceiptIdentity(profile: RsiOpenRouterProfile): { profileId?: RsiOpenRouterProfileId } {
+	return profile.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? {} : { profileId: profile.id }
+}
+
+export function endpointPriceIdentity(price: OpenRouterEndpointPriceSnapshot): Pick<OpenRouterEndpointPriceSnapshot, "model" | "provider" | "endpointTag" | "quantization" | "supportedParameters" | "inputPricePerMillionUsd" | "outputPricePerMillionUsd"> {
+	return {
+		model: price.model,
+		provider: price.provider,
+		endpointTag: price.endpointTag,
+		...(price.quantization === undefined ? {} : { quantization: price.quantization }),
+		supportedParameters: [...new Set(price.supportedParameters)].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b))),
+		inputPricePerMillionUsd: price.inputPricePerMillionUsd,
+		outputPricePerMillionUsd: price.outputPricePerMillionUsd,
+	}
 }
 
 interface PersistedBrokerState {
@@ -184,16 +253,27 @@ export class FileOpenRouterInferenceLedger implements OpenRouterInferenceLedger 
 	}
 
 	async register(grant: OpenRouterBrokerGrant): Promise<number> {
-		const fingerprint = { campaignId: grant.limits.campaignId, model: grant.model, limits: grant.limits }
+		const profile = grantProfile(grant)
+		const priceIdentity = profile.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? undefined : grant.endpointPrice && endpointPriceIdentity(grant.endpointPrice)
+		if (profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID && !priceIdentity) throw new Error("Muse OpenRouter grant is missing its admitted endpoint-price snapshot")
+		const fingerprint = { campaignId: grant.limits.campaignId, model: grant.model, ...profileReceiptIdentity(profile), ...(priceIdentity ? { endpointPrice: priceIdentity } : {}), limits: grant.limits }
 		return this.locked((state) => {
 			const current = state.jobs[grant.jobId]
-			if (current && JSON.stringify(current.grant) !== JSON.stringify(fingerprint)) throw new Error("OpenRouter file ledger job identity conflicts with prior accounting")
+			const currentFingerprint = current && {
+				campaignId: current.grant.limits.campaignId,
+				model: current.grant.model,
+				...(current.grant.profileId ? { profileId: current.grant.profileId } : {}),
+				...(current.grant.endpointPrice ? { endpointPrice: endpointPriceIdentity(current.grant.endpointPrice) } : {}),
+				limits: current.grant.limits,
+			}
+			if (currentFingerprint && JSON.stringify(currentFingerprint) !== JSON.stringify(fingerprint)) throw new Error("OpenRouter file ledger job identity conflicts with prior accounting")
 			if (current && (!Number.isSafeInteger(current.deadlineAtMs) || current.deadlineAtMs <= 0)) throw new Error("OpenRouter file ledger is missing a durable job deadline; refusing restart")
 			const campaign = state.campaigns[grant.limits.campaignId]
 			if (campaign && campaign.maxSpendUsd !== grant.limits.maxCampaignSpendUsd) throw new Error("OpenRouter file ledger campaign cap differs from prior accounting")
 			state.campaigns[grant.limits.campaignId] ??= { maxSpendUsd: grant.limits.maxCampaignSpendUsd, spentUsd: 0, reservedUsd: 0, blocked: false }
 			const deadlineAtMs = current?.deadlineAtMs ?? (grant.issuedAtMs ?? Date.now()) + grant.limits.maxDurationMs
-			state.jobs[grant.jobId] = current ?? { grant: fingerprint, capabilitySha256: sha256(grant.capability), leaseSha256: sha256(grant.leaseToken), blocked: false, deadlineAtMs, reservations: [] }
+			const persistedGrant = current?.grant ?? { campaignId: grant.limits.campaignId, model: grant.model, ...profileReceiptIdentity(profile), ...(grant.endpointPrice ? { endpointPrice: grant.endpointPrice } : {}), limits: grant.limits }
+			state.jobs[grant.jobId] = current ?? { grant: persistedGrant, capabilitySha256: sha256(grant.capability), leaseSha256: sha256(grant.leaseToken), blocked: false, deadlineAtMs, reservations: [] }
 			if (current) {
 				current.capabilitySha256 = sha256(grant.capability)
 				current.leaseSha256 = sha256(grant.leaseToken)
@@ -215,7 +295,7 @@ export class FileOpenRouterInferenceLedger implements OpenRouterInferenceLedger 
 			const reservedUsd = Math.ceil(reservation.reservedUsd * 1_000_000) / 1_000_000
 			if (reservedCalls >= grant.limits.maxCalls || reservedUsd > grant.limits.maxCallSpendUsd || tokens + reservation.reservedTokens > grant.limits.maxTotalTokens || spend + reservedUsd > grant.limits.maxJobSpendUsd || campaign.spentUsd + campaign.reservedUsd + reservedUsd > campaign.maxSpendUsd) throw new Error("OpenRouter file ledger budget exhausted")
 			campaign.reservedUsd = Math.ceil((campaign.reservedUsd + reservedUsd) * 1_000_000) / 1_000_000
-			job.reservations.push({ ...reservation, reservedUsd, jobId: grant.jobId, campaignId: grant.limits.campaignId, model: grant.model, state: "reserved", authoritative: false })
+			job.reservations.push({ ...reservation, reservedUsd, jobId: grant.jobId, campaignId: grant.limits.campaignId, model: grant.model, ...profileReceiptIdentity(grantProfile(grant)), state: "reserved", authoritative: false })
 		})
 	}
 
@@ -245,8 +325,9 @@ export class FileOpenRouterInferenceLedger implements OpenRouterInferenceLedger 
 				job.blocked = true
 				return
 			}
-			call.authoritative = settlement.qualified !== false && settlement.returnedModel === grant.model && settlement.returnedProvider === RSI_OPENROUTER_ENDPOINT_PROVIDER
+			call.authoritative = settlement.qualified !== false && grantProfile(grant).returnedModels.includes(settlement.returnedModel ?? "") && settlement.returnedProvider === grantProfile(grant).endpointProvider
 				&& settlement.promptTokens !== undefined && settlement.promptTokens <= grant.limits.maxInputTokensPerCall
+				&& (settlement.cachedPromptTokens === undefined || settlement.cachedPromptTokens <= settlement.promptTokens)
 				&& settlement.completionTokens !== undefined && settlement.completionTokens <= grant.limits.maxOutputTokensPerCall
 				&& settlement.costUsd !== undefined && settlement.costUsd <= call.reservedUsd
 				&& settlement.promptTokens + settlement.completionTokens <= call.reservedTokens && settlement.responseSha256 !== undefined
@@ -267,7 +348,8 @@ export class FileOpenRouterInferenceLedger implements OpenRouterInferenceLedger 
 			const promptTokens = qualified ? calls.reduce((sum, call) => sum + call.promptTokens!, 0) : null
 			const completionTokens = qualified ? calls.reduce((sum, call) => sum + call.completionTokens!, 0) : null
 			const costUsd = qualified ? calls.reduce((sum, call) => sum + call.costUsd!, 0) : null
-			return { provider: "openrouter", endpointProvider: RSI_OPENROUTER_ENDPOINT_PROVIDER, jobId: grant.jobId, campaignId: grant.limits.campaignId, model: grant.model,
+			const profile = grantProfile(grant)
+			return { provider: "openrouter", endpointProvider: profile.endpointProvider, jobId: grant.jobId, campaignId: grant.limits.campaignId, model: grant.model, ...profileReceiptIdentity(profile), ...(job.grant.endpointPrice ? { endpointPrice: job.grant.endpointPrice } : {}),
 				returnedModels: [...new Set(calls.map((call) => call.returnedModel).filter((model): model is string => Boolean(model)))],
 				returnedProviders: [...new Set(calls.map((call) => call.returnedProvider).filter((provider): provider is string => Boolean(provider)))],
 				calls: calls.length, promptTokens, completionTokens, totalTokens: promptTokens === null || completionTokens === null ? null : promptTokens + completionTokens,
@@ -287,7 +369,8 @@ export class FileOpenRouterInferenceLedger implements OpenRouterInferenceLedger 
 			const promptTokens = qualified ? calls.reduce((sum, call) => sum + call.promptTokens!, 0) : null
 			const completionTokens = qualified ? calls.reduce((sum, call) => sum + call.completionTokens!, 0) : null
 			const costUsd = qualified ? calls.reduce((sum, call) => sum + call.costUsd!, 0) : null
-			return { provider: "openrouter", endpointProvider: RSI_OPENROUTER_ENDPOINT_PROVIDER, jobId, campaignId, model: job.grant.model,
+			const profile = grantProfile(job.grant as OpenRouterBrokerGrant)
+			return { provider: "openrouter", endpointProvider: profile.endpointProvider, jobId, campaignId, model: job.grant.model, ...profileReceiptIdentity(profile), ...(job.grant.endpointPrice ? { endpointPrice: job.grant.endpointPrice } : {}),
 				returnedModels: [...new Set(calls.map((call) => call.returnedModel).filter((model): model is string => Boolean(model)))],
 				returnedProviders: [...new Set(calls.map((call) => call.returnedProvider).filter((provider): provider is string => Boolean(provider)))],
 				calls: calls.length, promptTokens, completionTokens, totalTokens: promptTokens === null || completionTokens === null ? null : promptTokens + completionTokens,
@@ -300,6 +383,7 @@ export interface OpenRouterBrokerOptions {
 	jobId: string
 	leaseToken: string
 	model?: string
+	profileId?: RsiOpenRouterProfileId
 	limits: OpenRouterBrokerLimits
 	apiKey: string
 	ledger: OpenRouterInferenceLedger
@@ -436,7 +520,7 @@ async function readResponse(response: Response, maximumBytes: number): Promise<B
 	return Buffer.concat(chunks, size)
 }
 
-function parseUsage(body: Buffer, contentType: string): { model?: string; provider?: string; id?: string; promptTokens?: number; completionTokens?: number; costUsd?: number } {
+function parseUsage(body: Buffer, contentType: string): { model?: string; provider?: string; id?: string; promptTokens?: number; cachedPromptTokens?: number; completionTokens?: number; costUsd?: number } {
 	let values: Array<Record<string, unknown>> = []
 	if (contentType.includes("text/event-stream")) {
 		for (const line of body.toString("utf8").split(/\r?\n/)) {
@@ -452,6 +536,7 @@ function parseUsage(body: Buffer, contentType: string): { model?: string; provid
 	let provider: string | undefined
 	let id: string | undefined
 	let promptTokens: number | undefined
+	let cachedPromptTokens: number | undefined
 	let completionTokens: number | undefined
 	let costUsd: number | undefined
 	for (const item of values) {
@@ -470,10 +555,15 @@ function parseUsage(body: Buffer, contentType: string): { model?: string; provid
 		if (!usage || typeof usage !== "object") continue
 		const row = usage as Record<string, unknown>
 		if (Number.isSafeInteger(row.prompt_tokens) && Number(row.prompt_tokens) >= 0) promptTokens = Number(row.prompt_tokens)
+		const promptDetails = row.prompt_tokens_details
+		if (promptDetails && typeof promptDetails === "object" && !Array.isArray(promptDetails)) {
+			const cached = (promptDetails as Record<string, unknown>).cached_tokens
+			if (Number.isSafeInteger(cached) && Number(cached) >= 0) cachedPromptTokens = Number(cached)
+		}
 		if (Number.isSafeInteger(row.completion_tokens) && Number(row.completion_tokens) >= 0) completionTokens = Number(row.completion_tokens)
 		if (typeof row.cost === "number" && Number.isFinite(row.cost) && row.cost >= 0) costUsd = row.cost
 	}
-	return { ...(model ? { model } : {}), ...(provider ? { provider } : {}), ...(id ? { id } : {}), ...(promptTokens !== undefined ? { promptTokens } : {}), ...(completionTokens !== undefined ? { completionTokens } : {}), ...(costUsd !== undefined ? { costUsd } : {}) }
+	return { ...(model ? { model } : {}), ...(provider ? { provider } : {}), ...(id ? { id } : {}), ...(promptTokens !== undefined ? { promptTokens } : {}), ...(cachedPromptTokens !== undefined ? { cachedPromptTokens } : {}), ...(completionTokens !== undefined ? { completionTokens } : {}), ...(costUsd !== undefined ? { costUsd } : {}) }
 }
 
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
@@ -490,14 +580,14 @@ function capabilityMatches(header: string | undefined, capability: string): bool
 	return timingSafeEqual(actual, expected)
 }
 
-function validateRequestBody(body: Buffer, limits: OpenRouterBrokerLimits, model: string): { encodedBody: Buffer; outputLimit: number } {
+function validateRequestBody(body: Buffer, limits: OpenRouterBrokerLimits, profile: RsiOpenRouterProfile, cacheRoutingKey: string): { encodedBody: Buffer; outputLimit: number } {
 	let parsed: unknown
 	try { parsed = JSON.parse(body.toString("utf8")) } catch { throw new Error("request JSON is malformed") }
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("request must be a JSON object")
 	const value = parsed as Record<string, unknown>
-	const allowed = new Set(["model", "messages", "tools", "tool_choice", "temperature", "max_tokens", "max_completion_tokens", "stream", "stream_options", "provider", "include_reasoning", "reasoning"])
+	const allowed = new Set(["model", "messages", "tools", "tool_choice", "temperature", "max_tokens", "max_completion_tokens", "stream", "stream_options", "provider", "include_reasoning", "reasoning", "session_id", "prompt_cache_key"])
 	for (const key of Object.keys(value)) if (!allowed.has(key)) throw new Error(`request field is not admitted: ${key}`)
-	if (value.model !== model) throw new Error("request model is not admitted for this job")
+	if (value.model !== profile.model) throw new Error("request model is not admitted for this job")
 	if (!Array.isArray(value.messages) || value.messages.length < 1) throw new Error("request messages are malformed")
 	for (const message of value.messages) {
 		if (!message || typeof message !== "object" || Array.isArray(message)) throw new Error("request message is malformed")
@@ -513,15 +603,22 @@ function validateRequestBody(body: Buffer, limits: OpenRouterBrokerLimits, model
 	if (value.provider !== undefined) {
 		if (!value.provider || typeof value.provider !== "object" || Array.isArray(value.provider)) throw new Error("request provider routing is malformed")
 		const provider = value.provider as Record<string, unknown>
-		if (provider.only && JSON.stringify(provider.only) !== JSON.stringify([RSI_OPENROUTER_ENDPOINT_PROVIDER])) throw new Error("request provider routing does not match the pinned endpoint provider")
-		if (provider.allow_fallbacks !== undefined && provider.allow_fallbacks !== false) throw new Error("request provider fallbacks are disabled")
+		if (provider.only && JSON.stringify(provider.only) !== JSON.stringify([profile.endpointProvider])) throw new Error("request provider routing does not match the pinned endpoint provider")
+		if (provider.allow_fallbacks !== undefined && provider.allow_fallbacks !== profile.allowFallbacks) throw new Error("request provider fallbacks are disabled")
 		for (const key of Object.keys(provider)) if (!["only", "allow_fallbacks"].includes(key)) throw new Error(`request provider field is not admitted: ${key}`)
 	}
 	if (value.stream_options !== undefined) {
 		if (!value.stream_options || typeof value.stream_options !== "object" || Array.isArray(value.stream_options)) throw new Error("request stream options are malformed")
 		for (const key of Object.keys(value.stream_options as Record<string, unknown>)) if (key !== "include_usage") throw new Error(`request stream option is not admitted: ${key}`)
 	}
-	value.provider = { only: [RSI_OPENROUTER_ENDPOINT_PROVIDER], allow_fallbacks: false }
+	value.provider = { only: [profile.endpointProvider], allow_fallbacks: profile.allowFallbacks }
+	if (profile.cacheRouting === "opaque-job-key") {
+		value.session_id = cacheRoutingKey
+		value.prompt_cache_key = cacheRoutingKey
+	} else {
+		delete value.session_id
+		delete value.prompt_cache_key
+	}
 	delete value.max_tokens
 	value.max_tokens = outputLimit
 	value.stream_options = { ...(value.stream_options && typeof value.stream_options === "object" ? value.stream_options as Record<string, unknown> : {}), include_usage: true }
@@ -532,9 +629,9 @@ function validateRequestBody(body: Buffer, limits: OpenRouterBrokerLimits, model
 
 export interface OpenRouterEndpointPriceSnapshot {
 	model: string
-	provider: typeof RSI_OPENROUTER_ENDPOINT_PROVIDER
+	provider: string
 	endpointTag: string
-	quantization: typeof RSI_OPENROUTER_ENDPOINT_QUANTIZATION
+	quantization?: string
 	supportedParameters: string[]
 	inputPricePerMillionUsd: number
 	outputPricePerMillionUsd: number
@@ -543,22 +640,24 @@ export interface OpenRouterEndpointPriceSnapshot {
 }
 
 /** Read current pinned endpoint pricing. This is a metadata GET; it does not submit inference. */
-export async function fetchPinnedOpenRouterEndpointPrice(apiKey: string, fetcher: typeof fetch = fetch, now: () => number = Date.now): Promise<OpenRouterEndpointPriceSnapshot> {
-	const url = `https://openrouter.ai/api/v1/models/${RSI_OPENROUTER_MODEL}/endpoints`
+export async function fetchOpenRouterEndpointPrice(profile: RsiOpenRouterProfile, apiKey: string, fetcher: typeof fetch = fetch, now: () => number = Date.now): Promise<OpenRouterEndpointPriceSnapshot> {
+	const url = `https://openrouter.ai/api/v1/models/${profile.model}/endpoints`
 	const response = await fetcher(url, { method: "GET", redirect: "error", signal: AbortSignal.timeout(15_000), headers: apiKey.trim() ? { authorization: `Bearer ${apiKey}` } : {} })
 	if (!response.ok) throw new Error(`OpenRouter price preflight failed with HTTP ${response.status}`)
 	const bytes = await readResponse(response, 1024 * 1024)
 	let data: { data?: { endpoints?: Array<{ provider_name?: unknown; provider_slug?: unknown; tag?: unknown; quantization?: unknown; status?: unknown; supported_parameters?: unknown; supports_tool_choice?: unknown; pricing?: { prompt?: unknown; completion?: unknown } }> } }
 	try { data = JSON.parse(bytes.toString("utf8")) as typeof data } catch { throw new Error("OpenRouter price preflight returned malformed JSON") }
 	const rows = data.data?.endpoints ?? []
-	const endpoint = rows.find((row) => row.provider_name === "DeepInfra" && row.tag === RSI_OPENROUTER_ENDPOINT_TAG && row.quantization === RSI_OPENROUTER_ENDPOINT_QUANTIZATION)
+	const endpoint = rows.find((row) => row.provider_name === profile.endpointProviderName && row.tag === profile.endpointTag
+		&& (profile.quantization === undefined ? row.quantization === undefined || row.quantization === null : row.quantization === profile.quantization))
 	const prompt = Number(endpoint?.pricing?.prompt)
 	const completion = Number(endpoint?.pricing?.completion)
 	const supportedParameters = Array.isArray(endpoint?.supported_parameters) ? endpoint.supported_parameters.filter((parameter): parameter is string => typeof parameter === "string") : []
 	const supportsToolChoice = endpoint?.supports_tool_choice && typeof endpoint.supports_tool_choice === "object" ? endpoint.supports_tool_choice as Record<string, unknown> : {}
-	if (!Number.isFinite(prompt) || prompt <= 0 || !Number.isFinite(completion) || completion <= 0 || endpoint?.status !== 0 || !REQUIRED_ENDPOINT_PARAMETERS.every((parameter) => supportedParameters.includes(parameter)) || supportsToolChoice.auto !== true || supportsToolChoice.required !== true) throw new Error("OpenRouter price preflight did not return the available pinned DeepInfra fp8 endpoint with required agent parameters")
+	if (!Number.isFinite(prompt) || prompt <= 0 || !Number.isFinite(completion) || completion <= 0 || endpoint?.status !== 0 || !profile.requiredParameters.every((parameter) => supportedParameters.includes(parameter)) || supportsToolChoice.auto !== true || supportsToolChoice.required !== true) throw new Error(`OpenRouter price preflight did not return the available pinned ${profile.endpointProviderName} endpoint with required agent parameters`)
 	return {
-		model: RSI_OPENROUTER_MODEL, provider: RSI_OPENROUTER_ENDPOINT_PROVIDER, endpointTag: RSI_OPENROUTER_ENDPOINT_TAG, quantization: RSI_OPENROUTER_ENDPOINT_QUANTIZATION, supportedParameters,
+		model: profile.model, provider: profile.endpointProvider, endpointTag: profile.endpointTag,
+		...(profile.quantization ? { quantization: profile.quantization } : {}), supportedParameters,
 		inputPricePerMillionUsd: prompt * 1_000_000,
 		outputPricePerMillionUsd: completion * 1_000_000,
 		observedAt: new Date(now()).toISOString(),
@@ -566,13 +665,18 @@ export async function fetchPinnedOpenRouterEndpointPrice(apiKey: string, fetcher
 	}
 }
 
-async function verifyPinnedPriceCeiling(fetcher: typeof fetch, apiKey: string, limits: OpenRouterBrokerLimits): Promise<void> {
-	const price = await fetchPinnedOpenRouterEndpointPrice(apiKey, fetcher)
+export async function fetchPinnedOpenRouterEndpointPrice(apiKey: string, fetcher: typeof fetch = fetch, now: () => number = Date.now): Promise<OpenRouterEndpointPriceSnapshot> {
+	return fetchOpenRouterEndpointPrice(RSI_OPENROUTER_PROFILES["deepseek-deepinfra-fp8"], apiKey, fetcher, now)
+}
+
+async function verifyPinnedPriceCeiling(fetcher: typeof fetch, apiKey: string, limits: OpenRouterBrokerLimits, profile: RsiOpenRouterProfile): Promise<OpenRouterEndpointPriceSnapshot> {
+	const price = await fetchOpenRouterEndpointPrice(profile, apiKey, fetcher)
 	const inputPricePerMillion = price.inputPricePerMillionUsd
 	const outputPricePerMillion = price.outputPricePerMillionUsd
 	if (limits.maxInputPricePerMillionUsd < inputPricePerMillion || limits.maxOutputPricePerMillionUsd < outputPricePerMillion) throw new Error("configured OpenRouter price ceiling is below the current pinned endpoint rate")
 	const worstCase = (limits.maxInputTokensPerCall * limits.maxInputPricePerMillionUsd + limits.maxOutputTokensPerCall * limits.maxOutputPricePerMillionUsd) / 1_000_000
 	if (limits.maxCallSpendUsd + 0.000001 < worstCase) throw new Error("per-call spend reservation is below the configured worst-case token cost")
+	return price
 }
 
 function isHostInterfaceAddress(address: string): boolean {
@@ -581,17 +685,18 @@ function isHostInterfaceAddress(address: string): boolean {
 
 export async function startOpenRouterBroker(options: OpenRouterBrokerOptions): Promise<RunningOpenRouterBroker> {
 	const model = options.model ?? RSI_OPENROUTER_MODEL
-	if (model !== RSI_OPENROUTER_MODEL) throw new Error(`RSI OpenRouter broker only admits ${RSI_OPENROUTER_MODEL}`)
+	const profile = openRouterProfileForModel(model, options.profileId)
 	if (!options.apiKey.trim()) throw new Error("host OpenRouter credential is required to start the RSI broker")
 	if (!/^[A-Za-z0-9._:-]{1,160}$/.test(options.jobId) || !options.leaseToken) throw new Error("OpenRouter broker requires a job id and active lease token")
 	const limits = validateOpenRouterBrokerLimits(options.limits)
 	const capability = randomBytes(32).toString("base64url")
+	const cacheRoutingKey = `hc-rsi-${randomBytes(24).toString("base64url")}`
 	const upstreamFetch = options.upstreamFetch ?? fetch
 	const now = options.now ?? Date.now
-	await verifyPinnedPriceCeiling(upstreamFetch, options.apiKey, limits)
+	const endpointPrice = await verifyPinnedPriceCeiling(upstreamFetch, options.apiKey, limits, profile)
 	if (!options.bindHost || options.bindHost === "0.0.0.0" || options.bindHost === "::" || !isHostInterfaceAddress(options.bindHost)) throw new Error("OpenRouter broker requires an address assigned to a host interface; wildcard or non-local listeners are disabled")
 	const issuedAtMs = now()
-	const grant: OpenRouterBrokerGrant = { jobId: options.jobId, leaseToken: options.leaseToken, capability, model, limits, issuedAtMs }
+	const grant: OpenRouterBrokerGrant = { jobId: options.jobId, leaseToken: options.leaseToken, capability, model, ...profileReceiptIdentity(profile), ...(profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { endpointPrice } : {}), limits, issuedAtMs }
 	const jobDeadlineAtMs = await options.ledger.register(grant)
 	if (!Number.isFinite(jobDeadlineAtMs) || jobDeadlineAtMs <= now()) throw new Error("OpenRouter job duration limit exhausted")
 	const server: Server = createServer((request, response) => {
@@ -622,7 +727,7 @@ export async function startOpenRouterBroker(options: OpenRouterBrokerOptions): P
 			try {
 				rawBody = await readBody(request, limits.maxRequestBytes)
 				requestBytes = rawBody.byteLength
-				checked = validateRequestBody(rawBody, limits, model)
+				checked = validateRequestBody(rawBody, limits, profile, cacheRoutingKey)
 			} catch (error) {
 				const message = error instanceof Error ? error.message : "invalid request"
 				const limited = /exceeds|too large|byte bound/i.test(message)
@@ -663,24 +768,24 @@ export async function startOpenRouterBroker(options: OpenRouterBrokerOptions): P
 			}
 			const contentType = upstream.headers.get("content-type") ?? "application/json"
 			const usage = upstream.ok ? parseUsage(upstreamBody, contentType) : {}
-			const measurable = usage.promptTokens !== undefined && usage.completionTokens !== undefined && usage.costUsd !== undefined && usage.provider !== undefined
+			const measurable = usage.promptTokens !== undefined && usage.completionTokens !== undefined && usage.costUsd !== undefined && usage.provider !== undefined && (usage.cachedPromptTokens === undefined || usage.cachedPromptTokens <= usage.promptTokens)
 			if (!upstream.ok || !measurable) {
-				await options.ledger.settle(grant, { callId, state: "unmeasured", ...(usage.model ? { returnedModel: usage.model } : {}), ...(usage.provider ? { returnedProvider: usage.provider } : {}), ...(usage.id ? { providerRequestId: usage.id } : {}), ...(usage.promptTokens !== undefined ? { promptTokens: usage.promptTokens } : {}), ...(usage.completionTokens !== undefined ? { completionTokens: usage.completionTokens } : {}), ...(usage.costUsd !== undefined ? { costUsd: usage.costUsd } : {}), responseSha256: sha256(upstreamBody), completedAt: new Date(now()).toISOString() }).catch(() => undefined)
+				await options.ledger.settle(grant, { callId, state: "unmeasured", ...(usage.model ? { returnedModel: usage.model } : {}), ...(usage.provider ? { returnedProvider: usage.provider } : {}), ...(usage.id ? { providerRequestId: usage.id } : {}), ...(usage.promptTokens !== undefined ? { promptTokens: usage.promptTokens } : {}), ...(usage.cachedPromptTokens !== undefined ? { cachedPromptTokens: usage.cachedPromptTokens } : {}), ...(usage.completionTokens !== undefined ? { completionTokens: usage.completionTokens } : {}), ...(usage.costUsd !== undefined ? { costUsd: usage.costUsd } : {}), responseSha256: sha256(upstreamBody), completedAt: new Date(now()).toISOString() }).catch(() => undefined)
 				await deny(502, "usage-unverifiable", "upstream response lacks verifiable usage or selected endpoint metadata; request is unqualified"); return
 			}
 			const promptTokens = usage.promptTokens!
 			const completionTokens = usage.completionTokens!
 			const costUsd = usage.costUsd!
 			const usageWithinBounds = promptTokens <= limits.maxInputTokensPerCall && completionTokens <= checked.outputLimit && costUsd <= limits.maxCallSpendUsd
-			if (usage.model !== model || usage.provider !== RSI_OPENROUTER_ENDPOINT_PROVIDER || !usageWithinBounds) {
-				await options.ledger.settle(grant, { callId, state: "complete", qualified: false, returnedModel: usage.model ?? "", returnedProvider: usage.provider, ...(usage.id ? { providerRequestId: usage.id } : {}), promptTokens: usage.promptTokens, completionTokens: usage.completionTokens, costUsd: usage.costUsd, responseSha256: sha256(upstreamBody), completedAt: new Date(now()).toISOString() }).catch(() => undefined)
-				const message = usage.model !== model ? "upstream returned a different model" : usage.provider !== RSI_OPENROUTER_ENDPOINT_PROVIDER ? "upstream selected an endpoint outside the pinned provider" : "upstream usage exceeded admitted broker limits"
+			if (!profile.returnedModels.includes(usage.model ?? "") || usage.provider !== profile.endpointProvider || !usageWithinBounds) {
+				await options.ledger.settle(grant, { callId, state: "complete", qualified: false, returnedModel: usage.model ?? "", returnedProvider: usage.provider, ...(usage.id ? { providerRequestId: usage.id } : {}), promptTokens: usage.promptTokens, ...(usage.cachedPromptTokens !== undefined ? { cachedPromptTokens: usage.cachedPromptTokens } : {}), completionTokens: usage.completionTokens, costUsd: usage.costUsd, responseSha256: sha256(upstreamBody), completedAt: new Date(now()).toISOString() }).catch(() => undefined)
+				const message = !profile.returnedModels.includes(usage.model ?? "") ? "upstream returned a different model" : usage.provider !== profile.endpointProvider ? "upstream selected an endpoint outside the pinned provider" : "upstream usage exceeded admitted broker limits"
 				await deny(502, "usage-out-of-bounds", `${message}; request is unqualified`); return
 			}
 			try {
 				await options.ledger.settle(grant, {
 					callId, state: "complete", qualified: true, returnedModel: usage.model, returnedProvider: usage.provider, providerRequestId: usage.id,
-					promptTokens: usage.promptTokens, completionTokens: usage.completionTokens, costUsd: usage.costUsd,
+					promptTokens: usage.promptTokens, ...(usage.cachedPromptTokens !== undefined ? { cachedPromptTokens: usage.cachedPromptTokens } : {}), completionTokens: usage.completionTokens, costUsd: usage.costUsd,
 					responseSha256: sha256(upstreamBody), completedAt: new Date(now()).toISOString(),
 				})
 			} catch {
@@ -714,6 +819,6 @@ export async function startOpenRouterBroker(options: OpenRouterBrokerOptions): P
 			if (!server.listening) return
 			await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
 		},
-		receipt: () => options.ledger.receipt(grant),
+		receipt: async () => await options.ledger.receipt(grant),
 	}
 }
