@@ -172,6 +172,18 @@ function profileReceiptIdentity(profile: RsiOpenRouterProfile): { profileId?: Rs
 	return profile.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? {} : { profileId: profile.id }
 }
 
+function endpointPriceIdentity(price: OpenRouterEndpointPriceSnapshot): Pick<OpenRouterEndpointPriceSnapshot, "model" | "provider" | "endpointTag" | "quantization" | "supportedParameters" | "inputPricePerMillionUsd" | "outputPricePerMillionUsd"> {
+	return {
+		model: price.model,
+		provider: price.provider,
+		endpointTag: price.endpointTag,
+		...(price.quantization === undefined ? {} : { quantization: price.quantization }),
+		supportedParameters: [...new Set(price.supportedParameters)].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b))),
+		inputPricePerMillionUsd: price.inputPricePerMillionUsd,
+		outputPricePerMillionUsd: price.outputPricePerMillionUsd,
+	}
+}
+
 interface PersistedBrokerState {
 	jobs: Record<string, PersistedBrokerJob>
 	campaigns: Record<string, { maxSpendUsd: number; spentUsd: number; reservedUsd: number; blocked: boolean }>
@@ -242,16 +254,26 @@ export class FileOpenRouterInferenceLedger implements OpenRouterInferenceLedger 
 
 	async register(grant: OpenRouterBrokerGrant): Promise<number> {
 		const profile = grantProfile(grant)
-		const fingerprint = { campaignId: grant.limits.campaignId, model: grant.model, ...profileReceiptIdentity(profile), limits: grant.limits }
+		const priceIdentity = profile.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? undefined : grant.endpointPrice && endpointPriceIdentity(grant.endpointPrice)
+		if (profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID && !priceIdentity) throw new Error("Muse OpenRouter grant is missing its admitted endpoint-price snapshot")
+		const fingerprint = { campaignId: grant.limits.campaignId, model: grant.model, ...profileReceiptIdentity(profile), ...(priceIdentity ? { endpointPrice: priceIdentity } : {}), limits: grant.limits }
 		return this.locked((state) => {
 			const current = state.jobs[grant.jobId]
-			if (current && JSON.stringify(current.grant) !== JSON.stringify(fingerprint)) throw new Error("OpenRouter file ledger job identity conflicts with prior accounting")
+			const currentFingerprint = current && {
+				campaignId: current.grant.limits.campaignId,
+				model: current.grant.model,
+				...(current.grant.profileId ? { profileId: current.grant.profileId } : {}),
+				...(current.grant.endpointPrice ? { endpointPrice: endpointPriceIdentity(current.grant.endpointPrice) } : {}),
+				limits: current.grant.limits,
+			}
+			if (currentFingerprint && JSON.stringify(currentFingerprint) !== JSON.stringify(fingerprint)) throw new Error("OpenRouter file ledger job identity conflicts with prior accounting")
 			if (current && (!Number.isSafeInteger(current.deadlineAtMs) || current.deadlineAtMs <= 0)) throw new Error("OpenRouter file ledger is missing a durable job deadline; refusing restart")
 			const campaign = state.campaigns[grant.limits.campaignId]
 			if (campaign && campaign.maxSpendUsd !== grant.limits.maxCampaignSpendUsd) throw new Error("OpenRouter file ledger campaign cap differs from prior accounting")
 			state.campaigns[grant.limits.campaignId] ??= { maxSpendUsd: grant.limits.maxCampaignSpendUsd, spentUsd: 0, reservedUsd: 0, blocked: false }
 			const deadlineAtMs = current?.deadlineAtMs ?? (grant.issuedAtMs ?? Date.now()) + grant.limits.maxDurationMs
-			state.jobs[grant.jobId] = current ?? { grant: fingerprint, capabilitySha256: sha256(grant.capability), leaseSha256: sha256(grant.leaseToken), blocked: false, deadlineAtMs, reservations: [] }
+			const persistedGrant = current?.grant ?? { campaignId: grant.limits.campaignId, model: grant.model, ...profileReceiptIdentity(profile), ...(grant.endpointPrice ? { endpointPrice: grant.endpointPrice } : {}), limits: grant.limits }
+			state.jobs[grant.jobId] = current ?? { grant: persistedGrant, capabilitySha256: sha256(grant.capability), leaseSha256: sha256(grant.leaseToken), blocked: false, deadlineAtMs, reservations: [] }
 			if (current) {
 				current.capabilitySha256 = sha256(grant.capability)
 				current.leaseSha256 = sha256(grant.leaseToken)
@@ -327,7 +349,7 @@ export class FileOpenRouterInferenceLedger implements OpenRouterInferenceLedger 
 			const completionTokens = qualified ? calls.reduce((sum, call) => sum + call.completionTokens!, 0) : null
 			const costUsd = qualified ? calls.reduce((sum, call) => sum + call.costUsd!, 0) : null
 			const profile = grantProfile(grant)
-			return { provider: "openrouter", endpointProvider: profile.endpointProvider, jobId: grant.jobId, campaignId: grant.limits.campaignId, model: grant.model, ...profileReceiptIdentity(profile),
+			return { provider: "openrouter", endpointProvider: profile.endpointProvider, jobId: grant.jobId, campaignId: grant.limits.campaignId, model: grant.model, ...profileReceiptIdentity(profile), ...(job.grant.endpointPrice ? { endpointPrice: job.grant.endpointPrice } : {}),
 				returnedModels: [...new Set(calls.map((call) => call.returnedModel).filter((model): model is string => Boolean(model)))],
 				returnedProviders: [...new Set(calls.map((call) => call.returnedProvider).filter((provider): provider is string => Boolean(provider)))],
 				calls: calls.length, promptTokens, completionTokens, totalTokens: promptTokens === null || completionTokens === null ? null : promptTokens + completionTokens,
@@ -797,6 +819,6 @@ export async function startOpenRouterBroker(options: OpenRouterBrokerOptions): P
 			if (!server.listening) return
 			await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
 		},
-		receipt: async () => ({ ...(await options.ledger.receipt(grant)), ...(grant.endpointPrice ? { endpointPrice: grant.endpointPrice } : {}) }),
+		receipt: async () => await options.ledger.receipt(grant),
 	}
 }

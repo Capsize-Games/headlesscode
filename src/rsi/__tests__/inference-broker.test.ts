@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
 import test from "node:test"
+import { OpenShellBenchmarkAgent } from "../benchmark/openshell-agent.js"
 import { fetchOpenRouterEndpointPrice, fetchPinnedOpenRouterEndpointPrice, FileOpenRouterInferenceLedger, openRouterCampaignBudgetAllocation, openRouterProfileForModel, RSI_MUSE_OPENROUTER_BILLING_MODEL, RSI_MUSE_OPENROUTER_MODEL, RSI_OPENROUTER_ENDPOINT_PROVIDER, RSI_OPENROUTER_ENDPOINT_TAG, RSI_OPENROUTER_MODEL, startOpenRouterBroker, validateOpenRouterBrokerLimits } from "../inference-broker.js"
 import type { OpenRouterBrokerLimits } from "../inference-broker.js"
 
@@ -158,6 +159,34 @@ test("Muse broker overwrites both generic cache hints with a job-scoped key and 
 	assert.equal(receipt.endpointPrice?.provider, "meta")
 	assert.equal(receipt.callReceipts[0]?.cachedPromptTokens, 12)
 	assert.equal(receipt.callReceipts[0]?.costUsd, 0.0002)
+	const originalPrice = receipt.endpointPrice
+	assert.ok(originalPrice)
+	assert.equal(JSON.stringify(receipt), JSON.stringify(await ledger.lookupReceipt("attempt-muse-123456789012")), "benchmark receipt verification requires byte-order-identical durable ledger output")
+	const benchmarkAgent = new OpenShellBenchmarkAgent(process.cwd(), undefined, "synthetic-image", undefined, undefined, "openshell-openrouter")
+	assert.equal(await benchmarkAgent.verifyReceipt("attempt-muse-123456789012", receipt, path.join(root, "ledger.json")), true, "the actual OpenShell benchmark verifier accepts its Muse ledger receipt")
+	await broker.close()
+	const restartedFetch = (async (input: string | URL) => {
+		if (String(input).includes("/models/")) return new Response(JSON.stringify({ data: { endpoints: [museEndpointMetadata({ metadata_revision: "new-observation" })] } }), { status: 200 })
+		throw new Error("completed synthetic Muse call must not be dispatched again")
+	}) as typeof fetch
+	const restarted = await startOpenRouterBroker({
+		jobId: "attempt-muse-123456789012", leaseToken: "lease-muse", limits: limits("campaign-muse"), apiKey: "host-secret",
+		bindHost: "127.0.0.1", ledger, upstreamFetch: restartedFetch, model: RSI_MUSE_OPENROUTER_MODEL, profileId: "muse-spark-contributor",
+	})
+	t.after(() => restarted.close())
+	const freshObservation = await fetchOpenRouterEndpointPrice(openRouterProfileForModel(RSI_MUSE_OPENROUTER_MODEL, "muse-spark-contributor"), "", restartedFetch, () => Date.parse("2030-01-01T00:00:00.000Z"))
+	assert.notEqual(freshObservation.responseSha256, originalPrice.responseSha256)
+	assert.notEqual(freshObservation.observedAt, originalPrice.observedAt)
+	const recoveredReceipt = await restarted.receipt()
+	assert.equal(JSON.stringify(recoveredReceipt), JSON.stringify(await ledger.lookupReceipt("attempt-muse-123456789012")), "restarted broker receipt remains identical to its persisted lookup")
+	assert.equal(await benchmarkAgent.verifyReceipt("attempt-muse-123456789012", recoveredReceipt, path.join(root, "ledger.json")), true, "receipt verification still passes after a broker restart")
+	assert.deepEqual(recoveredReceipt.endpointPrice, originalPrice, "restart preserves the original endpoint evidence while ignoring changing observation timestamp/hash")
+	await restarted.close()
+	const changedPriceFetch = (async () => new Response(JSON.stringify({ data: { endpoints: [museEndpointMetadata({ pricing: { prompt: "0.0000002", completion: "0.0000002" } })] } }), { status: 200 })) as typeof fetch
+	await assert.rejects(startOpenRouterBroker({
+		jobId: "attempt-muse-123456789012", leaseToken: "lease-muse", limits: limits("campaign-muse"), apiKey: "host-secret",
+		bindHost: "127.0.0.1", ledger, upstreamFetch: changedPriceFetch, model: RSI_MUSE_OPENROUTER_MODEL, profileId: "muse-spark-contributor",
+	}), /job identity conflicts/)
 })
 
 test("Muse broker fails closed on price ceilings and mismatched returned model or provider", async (t) => {
