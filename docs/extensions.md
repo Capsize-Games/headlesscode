@@ -13,6 +13,30 @@ and result path, applies the session's protected-file policy to every write,
 and stores a content-addressed revision. Inspecting an MCP extension starts
 its entrypoint to read its advertised tool names and schemas.
 
+For example, ask a coding session: "Create a reusable Node tool that counts
+the entries in a JSON object, then call it on this input." The agent creates
+a manifest and text files with `extension_manage`, reads the returned digest,
+and uses that exact digest with `extension_call`. No dependency installation
+is part of extension creation.
+
+A minimal Node tool bundle has this shape:
+
+```json
+{
+  "manifest": {
+    "schemaVersion": 1,
+    "id": "count-entries",
+    "kind": "tool",
+    "description": "Counts the entries in a JSON object",
+    "entrypoint": "index.mjs",
+    "inputSchema": { "type": "object" }
+  },
+  "files": {
+    "index.mjs": "export function run(input) { return { count: Object.keys(input).length } }"
+  }
+}
+```
+
 Use `extension_call` with an ID and exact digest to use an extension. A skill
 returns its captured `SKILL.md` and text references as tool data. A Node tool
 entrypoint exports `run(input)` or a default function and returns finite JSON.

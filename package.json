@@ -38,6 +38,7 @@
 		"docs/security-verification.md",
 		"docs/incident-response.md",
 		"docs/skills.md",
+		"docs/extensions.md",
 		"docs/sessions.md",
 		"docs/terminal-chat.md",
 		"tsconfig.json",
