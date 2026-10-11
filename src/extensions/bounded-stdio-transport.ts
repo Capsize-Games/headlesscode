@@ -29,7 +29,9 @@ function parseLinuxProcessStat(pid: number, stat: string): LinuxProcessRecord {
 	if (close < 0) throw cleanupError("could not verify an owned process identity")
 	const fields = stat.slice(close + 2).split(" ")
 	// /proc/<pid>/stat fields after comm start with state (field 3). starttime
-	// is field 22, at offset 19 in this tail. It prevents signaling a reused PID.
+	// is field 22, at offset 19 in this tail. It lets cleanup reject a changed
+	// PID identity when it rechecks procfs; reading procfs and signaling are not
+	// atomic, so this narrows rather than eliminates PID-reuse races.
 	const processGroupId = Number(fields[2])
 	const sessionId = Number(fields[3])
 	const startTime = fields[19]
@@ -70,6 +72,7 @@ async function listOwnedProcessGroup(identity: LinuxProcessIdentity): Promise<Li
 			throw cleanupError("could not inspect every process while verifying owned teardown", error)
 		}
 		const record = parseLinuxProcessStat(pid, stat)
+		if (record.pid === identity.pid) assertCapturedLeaderIdentity(record, identity)
 		if (record.processGroupId === identity.processGroupId && record.sessionId === identity.sessionId && record.state !== "Z" && record.state !== "X") {
 			records.push(record)
 		}
@@ -79,6 +82,12 @@ async function listOwnedProcessGroup(identity: LinuxProcessIdentity): Promise<Li
 
 function matchesOwnedProcessIdentity(record: LinuxProcessIdentity, expected: LinuxProcessIdentity): boolean {
 	return record.pid === expected.pid && record.processGroupId === expected.processGroupId && record.sessionId === expected.sessionId && record.startTime === expected.startTime
+}
+
+function assertCapturedLeaderIdentity(record: LinuxProcessIdentity, expected: LinuxProcessIdentity): void {
+	if (record.pid === expected.pid && !matchesOwnedProcessIdentity(record, expected)) {
+		throw cleanupError("captured process-group leader PID was reused; teardown stopped")
+	}
 }
 
 async function verifyProcessRecordCurrent(record: LinuxProcessRecord): Promise<boolean> {
@@ -94,6 +103,7 @@ async function verifyProcessRecordCurrent(record: LinuxProcessRecord): Promise<b
 export const ownedChildProcessTestHooks = Object.freeze({
 	parseLinuxProcessStat,
 	matchesOwnedProcessIdentity,
+	assertCapturedLeaderIdentity,
 })
 
 export interface OwnedProcessOptions {
@@ -400,6 +410,7 @@ export class BoundedStdioTransport implements Transport {
 	private receivedBytes = 0
 	private sentBytes = 0
 	private closed = false
+	private closePromise: Promise<void> | undefined
 
 	constructor(options: OwnedProcessOptions, config: { maxBufferBytes: number; timeoutMs: number; signal?: AbortSignal; maxStderrBytes?: number }) {
 		this.processOptions = options
@@ -436,10 +447,13 @@ export class BoundedStdioTransport implements Transport {
 		await this.child.sendProtocol(framed)
 	}
 
-	async close(): Promise<void> {
-		if (this.closed) return
+	close(): Promise<void> {
+		if (this.closePromise) return this.closePromise
 		this.closed = true
-		await this.child?.stop()
-		this.onclose?.()
+		this.closePromise = (async () => {
+			await this.child?.stop()
+			this.onclose?.()
+		})()
+		return this.closePromise
 	}
 }

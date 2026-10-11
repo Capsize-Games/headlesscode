@@ -139,6 +139,18 @@ async function testHardTimeoutAndDescendantTeardown(workspaceRoot: string): Prom
 	} finally { await runtime.dispose() }
 }
 
+async function testLeaderExitStillReapsOwnedDescendants(workspaceRoot: string): Promise<void> {
+	const pidFile = path.join(workspaceRoot, "leader-exit-descendant.pid")
+	const revision = await createFixture(workspaceRoot, toolBundle("leader-exit-descendant", `import { writeFileSync } from "node:fs"; import { spawn } from "node:child_process"; export function run(input) { const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" }); writeFileSync(input.pidFile, String(child.pid)); process.exit(1); }`))
+	const runtime = new SessionExtensionRuntime({ workspaceRoot, permissions: permissions(), limits: { callTimeoutMs: 2_000 } })
+	try {
+		await assert.rejects(runtime.call(revision, { mode: "echo", pidFile }, { permissions: permissions() }), /exited unsuccessfully|no result|before completion/i)
+		const descendantPid = Number(await fs.readFile(pidFile, "utf8"))
+		assert.ok(Number.isSafeInteger(descendantPid) && descendantPid > 0)
+		assert.equal(await processIsGone(descendantPid), true, "the captured group is still cleaned up when its original leader exits first")
+	} finally { await runtime.dispose() }
+}
+
 async function testContainedProcessGroupTeardownUsesVerifiedMembers(workspaceRoot: string): Promise<void> {
 	const pidFile = path.join(workspaceRoot, "epperm-fallback-child.pid")
 	const revision = await createFixture(workspaceRoot, toolBundle("epperm-fallback", `import { writeFileSync } from "node:fs"; export async function run(input) { const { spawn } = await import("node:child_process"); const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" }); writeFileSync(input.pidFile, String(child.pid)); await new Promise(() => {}); }`))
@@ -212,6 +224,76 @@ async function testContainedTeardownFailureIsPropagated(workspaceRoot: string): 
 	}
 }
 
+async function testDisposeReportsCleanupFailureAfterLeaderExit(workspaceRoot: string): Promise<void> {
+	const pidFile = path.join(workspaceRoot, "dispose-cleanup-failure-descendant.pid")
+	const revision = await createFixture(workspaceRoot, toolBundle("dispose-cleanup-failure", `import { writeFileSync } from "node:fs"; import { spawn } from "node:child_process"; export function run(input) { const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" }); child.unref(); writeFileSync(input.pidFile, String(child.pid)); return { completed: true }; }`))
+	const runtime = new SessionExtensionRuntime({ workspaceRoot, permissions: permissions(), limits: { callTimeoutMs: 2_000 } })
+	const originalKill = process.kill.bind(process)
+	const processRef = process as NodeJS.Process & { kill: typeof process.kill }
+	let descendantPid = 0
+	processRef.kill = ((pid: number, signal?: NodeJS.Signals | 0) => {
+		if (pid !== 0 && signal !== 0) {
+			const error = new Error("contained owned-process signal denied") as NodeJS.ErrnoException
+			error.code = "EPERM"
+			throw error
+		}
+		return originalKill(pid, signal)
+	}) as typeof process.kill
+	try {
+		const call = runtime.call(revision, { mode: "echo", pidFile }, { permissions: permissions() })
+		await waitForFile(pidFile, 2_000)
+		descendantPid = Number(await fs.readFile(pidFile, "utf8"))
+		await assert.rejects(call, /could not signal every verified member/i)
+		await assert.rejects(runtime.dispose(), /teardown|signal/i, "dispose retains and reports a failed child teardown after the leader exits")
+	} finally {
+		processRef.kill = originalKill
+		if (descendantPid > 0) {
+			try { originalKill(descendantPid, "SIGKILL") } catch { /* fixture process may already be gone */ }
+			assert.equal(await processIsGone(descendantPid), true, "test reaps the descendant after restoring real signals")
+		}
+		await runtime.dispose().catch(() => undefined)
+	}
+}
+
+async function testMcpCloseRetainsFailedTransportForDispose(workspaceRoot: string): Promise<void> {
+	const pidFile = path.join(workspaceRoot, "mcp-close-cleanup-failure-descendant.pid")
+	const serverPidFile = path.join(workspaceRoot, "mcp-close-cleanup-failure-server.pid")
+	const source = `import { writeFileSync } from "node:fs"; import { spawn } from "node:child_process";\n${MCP_SERVER_SOURCE.replace("await server.connect(new StdioServerTransport());", `writeFileSync(${JSON.stringify(serverPidFile)}, String(process.pid)); const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" }); child.unref(); writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));\nawait server.connect(new StdioServerTransport());`)}`
+	const revision = await createFixture(workspaceRoot, mcpBundle("mcp-close-cleanup-failure", source))
+	const runtime = new SessionExtensionRuntime({ workspaceRoot, permissions: permissions(), limits: { callTimeoutMs: 2_000 } })
+	const originalKill = process.kill.bind(process)
+	const processRef = process as NodeJS.Process & { kill: typeof process.kill }
+	let descendantPid = 0
+	let serverPid = 0
+	processRef.kill = ((pid: number, signal?: NodeJS.Signals | 0) => {
+		if (pid !== 0 && signal !== 0) {
+			const error = new Error("contained owned-process signal denied") as NodeJS.ErrnoException
+			error.code = "EPERM"
+			throw error
+		}
+		return originalKill(pid, signal)
+	}) as typeof process.kill
+	try {
+		const call = runtime.call(revision, { text: "hello" }, { permissions: permissions(), toolName: "echo" })
+		await waitForFile(pidFile, 2_000)
+		descendantPid = Number(await fs.readFile(pidFile, "utf8"))
+		serverPid = Number(await fs.readFile(serverPidFile, "utf8"))
+		await assert.rejects(call, /could not signal every verified member/i)
+		await assert.rejects(runtime.dispose(), /teardown|signal/i, "dispose reports failed MCP teardown even after SDK close and runtime close both run")
+	} finally {
+		processRef.kill = originalKill
+		if (serverPid > 0) {
+			try { originalKill(-serverPid, "SIGKILL") } catch { /* fixture process group may already be gone */ }
+			assert.equal(await processIsGone(serverPid), true, "test reaps the MCP server after restoring real signals")
+		}
+		if (descendantPid > 0) {
+			try { originalKill(descendantPid, "SIGKILL") } catch { /* fixture process may already be gone */ }
+			assert.equal(await processIsGone(descendantPid), true, "test reaps the descendant after restoring real signals")
+		}
+		await runtime.dispose().catch(() => undefined)
+	}
+}
+
 function testOwnedProcessIdentityRejectsReuseAndMalformedStat(): void {
 	const fields = ["R", "11", "42", "42", "0", "-1", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "987654"]
 	const identity = ownedChildProcessTestHooks.parseLinuxProcessStat(42, `42 (node ) worker) ${fields.join(" ")}`)
@@ -219,6 +301,11 @@ function testOwnedProcessIdentityRejectsReuseAndMalformedStat(): void {
 	assert.equal(ownedChildProcessTestHooks.matchesOwnedProcessIdentity(identity, identity), true)
 	assert.equal(ownedChildProcessTestHooks.matchesOwnedProcessIdentity({ ...identity, startTime: "987655" }, identity), false, "a reused PID with a different start time is not an owned process")
 	assert.equal(ownedChildProcessTestHooks.matchesOwnedProcessIdentity({ ...identity, sessionId: 99 }, identity), false, "a process from another session cannot be signaled as a group member")
+	assert.throws(
+		() => ownedChildProcessTestHooks.assertCapturedLeaderIdentity({ ...identity, startTime: "987655" }, identity),
+		/captured process-group leader PID was reused/,
+		"a new session reusing the captured group leader PID is rejected before any member signal",
+	)
 	assert.throws(() => ownedChildProcessTestHooks.parseLinuxProcessStat(42, "42 (short) R 1"), /could not verify an owned process identity/)
 }
 
@@ -341,8 +428,11 @@ const workspaceRoot = await fs.mkdtemp(path.join(scratchRoot, "extension-runtime
 try {
 	await testNativeHelperBoundsPermissionsAndCapturedRevision(workspaceRoot)
 	await testHardTimeoutAndDescendantTeardown(workspaceRoot)
+	await testLeaderExitStillReapsOwnedDescendants(workspaceRoot)
 	await testContainedProcessGroupTeardownUsesVerifiedMembers(workspaceRoot)
 	await testContainedTeardownFailureIsPropagated(workspaceRoot)
+	await testDisposeReportsCleanupFailureAfterLeaderExit(workspaceRoot)
+	await testMcpCloseRetainsFailedTransportForDispose(workspaceRoot)
 	testOwnedProcessIdentityRejectsReuseAndMalformedStat()
 	await testMcpHandshakeSchemaAndCall(workspaceRoot)
 	await testMcpDescribeUsesCurrentPermissions(workspaceRoot)
