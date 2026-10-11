@@ -63,6 +63,7 @@ Options:
   --max-trajectories <n>       maximum independent trajectories (adaptive default: population + 1)
   --max-total-iterations <n>   aggregate model-iteration budget (adaptive default: max-iterations * trajectories)
   --max-runtime-ms <n>         wall-clock admission budget for adaptive follow-ups (default: 3600000)
+  evaluator guests require HEADLESSCODE_RSI_EVALUATOR_IMAGE_DIGEST=sha256:<64 lowercase hex>
   --regression <command>      paired regression gate (default: npm test)
   --eval <command>             visible command; repeat or separate with ;; 
   --hidden-eval <command>      supervisor-only hidden command

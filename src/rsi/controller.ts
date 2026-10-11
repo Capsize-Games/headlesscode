@@ -17,7 +17,8 @@ import { resolveRoles } from "./roles.js"
 import { newExperimentJob, paretoFront, selectParentChoices, transitionJob } from "./selection.js"
 import { captureCandidateTrajectory, exportTrajectoryDatasets } from "./trajectory.js"
 import { decideAdaptiveContinuation } from "./adaptive.js"
-import { createOpenShellCommandRunner, RSI_OPENSHELL_IMAGE } from "./openshell.js"
+import { createOpenShellCommandRunner, resolveRsiEvaluatorRuntimeIdentity } from "./openshell.js"
+import type { EvaluatorRuntimeIdentity } from "./evaluator-runtime.js"
 import { createAdversarialEvaluationSnapshotBundle, createEvaluationSnapshotBundle, createMutationSnapshotBundle, createMutationSnapshotIdentity, applyFleetMutationPatch } from "./openshell.js"
 import { ADVERSARIAL_COMMAND, ADVERSARIAL_PROMPT_VERSION, ADVERSARIAL_TESTS_PATH, buildAdversarialPrompt, parseAdversarialReview, requestAdversarialReview, sha256 } from "./adversarial.js"
 import { fleetJobMatches, fleetPayloadDigest, PostgresRsiJobQueue, fleetQueuePolicy, requiredFleetJobLeaseMs, type FleetJob, type FleetJobIdentity, type FleetJobPayload } from "./postgres-queue.js"
@@ -528,6 +529,7 @@ async function buildEvaluatorIntegrityInput(args: {
 	workerOpenRouterProfile?: string
 	proofProtocol: ReturnType<typeof freezeDevelopmentProofProtocol>
 	benchmarkManifestSha256: string
+	evaluatorRuntime?: EvaluatorRuntimeIdentity
 	hiddenVerifierIdentity?: RsiRunRecord["hiddenVerifierIdentity"]
 	syntheticRuntimeIdentity?: boolean
 }): Promise<Record<string, unknown>> {
@@ -541,12 +543,13 @@ async function buildEvaluatorIntegrityInput(args: {
 		baseTreeSha256,
 		evaluatorSource: source,
 		imageIdentity: {
-			requestedImage: process.env.HEADLESSCODE_OPENSHELL_IMAGE?.trim() || RSI_OPENSHELL_IMAGE,
-			verifiedImageDigest: args.run.workerHarnessRuntime?.imageDigest ?? args.hiddenVerifierIdentity?.imageDigest ?? null,
-			identitySource: args.syntheticRuntimeIdentity ? "synthetic-test-hooks" : args.run.workerHarnessRuntime ? "pinned-worker-harness-runtime" : args.hiddenVerifierIdentity ? "pinned-hidden-evaluator-image" : "requested-image-tag-only",
+			requestedImage: args.evaluatorRuntime ? `headlesscode-openshell-rsi@${args.evaluatorRuntime.imageDigest}` : null,
+			pinnedImageDigest: args.evaluatorRuntime?.imageDigest ?? null,
+			identitySource: args.evaluatorRuntime?.identitySource ?? "not-executed-dry-run",
 			workerHarnessRuntime: args.run.workerHarnessRuntime ?? null,
 			gatewayAlias: process.env.OPENSHELL_GATEWAY ?? null,
 		},
+		evaluatorIsolationPolicy: args.evaluatorRuntime ? { source: args.evaluatorRuntime.policySource, sha256: args.evaluatorRuntime.policySha256 } : null,
 		storageAndWorkspace: {
 			repository: path.resolve(config.repoRoot),
 			archive: path.resolve(config.archiveDir),
@@ -624,7 +627,7 @@ function fleetRuntimeDeadlineMs(config: RsiConfig, run: RsiRunRecord): number | 
 	return config.maxRuntimeMs === undefined ? undefined : Date.parse(run.startedAt) + config.maxRuntimeMs
 }
 
-function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: { content: Buffer; snapshotCommit: string; snapshotTreeDigest?: string }, options: { campaignId?: string; boundedInference?: boolean; includeWorkerHarness?: boolean; proofCampaign?: FleetJobPayload["proofCampaign"]; remainingCampaignMs?: number } = {}): FleetJobPayload {
+function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: { content: Buffer; snapshotCommit: string; snapshotTreeDigest?: string }, options: { campaignId?: string; boundedInference?: boolean; includeWorkerHarness?: boolean; proofCampaign?: FleetJobPayload["proofCampaign"]; remainingCampaignMs?: number; evaluatorRuntime?: Pick<EvaluatorRuntimeIdentity, "imageDigest" | "policySha256"> } = {}): FleetJobPayload {
 	const provider = config.roles?.worker?.provider === "openrouter" ? "openrouter" : "ollama"
 	const openRouterProfile = provider === "openrouter" ? openRouterProfileForModel(candidate.model, config.roles?.worker?.openRouterProfile) : undefined
 	const inferenceLimits = provider === "openrouter" && options.boundedInference
@@ -648,6 +651,7 @@ function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: {
 		...(openRouterProfile && openRouterProfile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { openRouterProfile: openRouterProfile.id } : {}),
 		...(options.proofCampaign ? { proofCampaign: options.proofCampaign } : {}),
 		...(inferenceLimits ? { inferenceLimits } : {}),
+		...(options.evaluatorRuntime ? { evaluatorRuntime: { ...options.evaluatorRuntime } } : {}),
 		maxIterations: config.maxIterations,
 		timeoutMs: config.commandTimeoutMs,
 		protectedPaths: config.protectedPaths,
@@ -762,6 +766,7 @@ async function validateCurriculumOnFleet(
 	run: RsiRunRecord,
 	queue: PostgresRsiJobQueue,
 	now: () => string,
+	evaluatorRuntime: Pick<EvaluatorRuntimeIdentity, "imageDigest" | "policySha256">,
 ): Promise<NonNullable<RsiRunRecord["curriculumTasks"]>> {
 	if (!tasks?.length) return []
 	return validateCurriculumProposals(tasks, run.baseCommit, async (task, attempt, replayKey) => {
@@ -784,7 +789,7 @@ async function validateCurriculumOnFleet(
 		const idempotencyKey = `${run.runId}:${replayKey}`
 		const snapshot = createEvaluationSnapshotBundle(config.repoRoot, run.baseCommit, config)
 		const artifact = await queue.putArtifact(snapshot.content)
-		const payload = fleetPayload(config, replayCandidate, snapshot)
+		const payload = fleetPayload(config, replayCandidate, snapshot, { evaluatorRuntime })
 		payload.snapshotSha256 = artifact.sha256
 		payload.task = `Replay registered curriculum fixture ${task.fixtureId}`
 		payload.regressionCommand = "true"
@@ -839,6 +844,7 @@ async function runAdversarialStage(
 	queue: PostgresRsiJobQueue,
 	hooks: RsiHooks,
 	now: () => string,
+	evaluatorRuntime: Pick<EvaluatorRuntimeIdentity, "imageDigest" | "policySha256">,
 ): Promise<AdversarialReviewRecord> {
 	const role = config.roles?.adversary
 	if (!role) throw new Error("adversary role is not configured")
@@ -880,7 +886,7 @@ async function runAdversarialStage(
 		run.jobs ??= []
 		run.jobs.push(internalJob)
 		const candidateId = candidate.id + "-adversarial"
-		const payload = fleetPayload(config, { ...candidate, id: candidateId, baseCommit: snapshot.snapshotCommit }, snapshot)
+		const payload = fleetPayload(config, { ...candidate, id: candidateId, baseCommit: snapshot.snapshotCommit }, snapshot, { evaluatorRuntime })
 		payload.snapshotSha256 = snapshotArtifact.sha256
 		payload.task = "Run supervisor-generated adversarial checks for " + candidate.id
 		payload.regressionCommand = "true"
@@ -944,6 +950,7 @@ async function evaluateBaselineFleet(
 	runId: string,
 	hidden?: (root: string, jobId: string) => HiddenEvaluationOptions | undefined,
 	runtimeDeadlineMs?: number,
+	evaluatorRuntime?: Pick<EvaluatorRuntimeIdentity, "imageDigest" | "policySha256">,
 ): Promise<NonNullable<RsiRunRecord["baselineEvaluation"]>> {
 	const idempotencyKey = `${runId}:baseline:evaluation`
 	const snapshot = createEvaluationSnapshotBundle(config.repoRoot, baseCommit, config)
@@ -964,7 +971,8 @@ async function evaluateBaselineFleet(
 			changedFiles: [],
 			protectedPathViolations: [],
 		}
-	const payload = fleetPayload(config, baseline, snapshot)
+	if (!evaluatorRuntime) throw new Error("fleet baseline evaluation requires its frozen evaluator image and policy identity")
+	const payload = fleetPayload(config, baseline, snapshot, { evaluatorRuntime })
 	payload.snapshotSha256 = artifact.sha256
 	const expected: FleetJobIdentity = {
 		idempotencyKey, runId, candidateId: "baseline", jobKind: "evaluation",
@@ -1098,16 +1106,19 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	} else if (loadedHiddenVerifier) {
 		run.hiddenVerifierIdentity = loadedHiddenVerifier.identity
 	}
+	const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
+	const evaluatorRuntime = config.dryRun
+		? undefined
+		: await resolveRsiEvaluatorRuntimeIdentity(process.env, hooks.syntheticRuntimeIdentity === true)
 	const hiddenEvaluationFor = (candidateRoot: string, jobId: string): HiddenEvaluationOptions | undefined => loadedHiddenVerifier ? ({
 		suite: loadedHiddenVerifier.suite,
-		runner: createOpenShellHiddenCaseRunner({ candidateRoot, config: runConfig, signingKey: loadedHiddenVerifier.privateKey, imageDigest: loadedHiddenVerifier.imageDigest }),
+		runner: createOpenShellHiddenCaseRunner({ candidateRoot, config: runConfig, signingKey: loadedHiddenVerifier.privateKey, imageDigest: loadedHiddenVerifier.imageDigest, evaluatorPolicySha256: evaluatorRuntime?.policySha256 ?? "" }),
 		nonceStore: loadedHiddenVerifier.nonceStore,
 		publicKey: loadedHiddenVerifier.publicKey,
 		evaluatorImageDigest: loadedHiddenVerifier.imageDigest,
 		sessionId: run.runId,
 		jobId,
 	}) : undefined
-	const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 	const proofFixturesRoot = path.join(packageRoot, "fixtures", "rsi-benchmark")
 	const loadedProofBenchmark = hooks.runDevelopmentBenchmark
 		? await fs.readFile(path.join(proofFixturesRoot, "manifest.json"), "utf8").then((rawManifest) => ({ manifest: JSON.parse(rawManifest) as BenchmarkManifest, manifestDigest: createHash("sha256").update(rawManifest).digest("hex") }))
@@ -1161,6 +1172,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		config: runConfig, run, packageRoot, roles, workerModel, workerProvider,
 		...(workerOpenRouterProfile ? { workerOpenRouterProfile: workerOpenRouterProfile.id } : {}),
 		proofProtocol, benchmarkManifestSha256: loadedProofBenchmark.manifestDigest,
+		...(evaluatorRuntime ? { evaluatorRuntime } : {}),
 		...(loadedHiddenVerifier ? { hiddenVerifierIdentity: loadedHiddenVerifier.identity } : {}),
 		syntheticRuntimeIdentity: hooks.syntheticRuntimeIdentity === true,
 	})
@@ -1199,6 +1211,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 			? hooks.runDevelopmentBenchmark({ harnessCommit, model: workerModel, outputRoot, protocol: proofProtocol })
 			: runDevelopmentBenchmarkForCommit({
 				repoRoot: config.repoRoot, fixturesRoot: proofFixturesRoot, outputRoot, harnessCommit, model: workerModel, provider: workerProvider,
+				evaluatorPolicySha256: evaluatorRuntime?.policySha256,
 			campaignId: campaignLease ? proofBrokerCampaignId(campaignLease.campaignId, "benchmark") : `proof-${evidenceRunId}-${proofProtocol.protocolDigest.slice(0, 16)}`,
 			...(campaignLease ? {
 				attemptNamespace: `${slotId}:${proofRole}`,
@@ -1248,7 +1261,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	if (resumed?.evaluatorIntegrity) await verifyIntegrityArtifacts(fleetQueue, resumed.evaluatorIntegrity.outputs)
 	if (!config.dryRun && workerProvider === "openshell-openrouter" && !fleetQueue) throw new Error("RSI OpenRouter inference requires the supervised fleet broker path")
 	if (!config.dryRun && config.roles?.adversary && !fleetQueue) throw new Error("RSI adversarial break tests require the OpenShell fleet evaluation path")
-	const commandRunner = hooks.runCommand ?? (fleetQueue ? undefined : createOpenShellCommandRunner(runConfig))
+	const commandRunner = hooks.runCommand ?? (fleetQueue ? undefined : createOpenShellCommandRunner(runConfig, evaluatorRuntime))
 	let campaignStore: PostgresProofCampaign | undefined
 	let campaignLease: ProofCampaignArmLease | undefined
 	let campaignHeartbeat: NodeJS.Timeout | undefined
@@ -1328,7 +1341,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	}
 	if (!config.dryRun && !run.baselineEvaluation) {
 			run.baselineEvaluation = fleetQueue
-				? await evaluateBaselineFleet(runConfig, baseCommit, fleetQueue, run.runId, hiddenEvaluationFor, fleetRuntimeDeadlineMs(runConfig, run))
+			? await evaluateBaselineFleet(runConfig, baseCommit, fleetQueue, run.runId, hiddenEvaluationFor, fleetRuntimeDeadlineMs(runConfig, run), evaluatorRuntime)
 			: await evaluateBaselineLocal(runConfig, baseCommit, commandRunner, hiddenEvaluationFor)
 		run.baselineFitness = computeFitness(run.baselineEvaluation)
 		run.baseline = run.baselineEvaluation.regression
@@ -1589,7 +1602,9 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 					const slotId = proofCandidateSlot(candidate.generation, candidates.indexOf(candidate))
 					const verificationTaskIds = ["regression", "typecheck", ...config.evalCommands.map((_, index) => `visible-${index}`)]
 					const attemptKeys = verificationTaskIds.map((taskId) => `${run.runId}:${candidate.id}:evaluation:${taskId}`)
+					if (!evaluatorRuntime) throw new Error("fleet candidate evaluation requires its frozen evaluator image and policy identity")
 					const payload = fleetPayload(runConfig, candidate, snapshot, {
+						evaluatorRuntime,
 						...(campaignLease ? { proofCampaign: {
 							campaignId: campaignLease.campaignId, armId: campaignLease.armId, epoch: campaignLease.epoch, manifestSha256: campaignLease.manifestSha256,
 							cells: verificationTaskIds.map((taskId, index) => ({ attemptKey: attemptKeys[index]!, slotId, attemptKind: "verification" as const })),
@@ -1651,7 +1666,8 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 				await verifyIntegrityArtifacts(fleetQueue, run.evaluatorIntegrity!.outputs)
 				if (runConfig.roles?.adversary) {
 					if (!fleetQueue) throw new Error("adversarial break tests require an OpenShell fleet worker")
-					const review = await runAdversarialStage(candidate, evaluation, runConfig, run, fleetQueue, hooks, now)
+					if (!evaluatorRuntime) throw new Error("fleet adversarial evaluation requires its frozen evaluator image and policy identity")
+					const review = await runAdversarialStage(candidate, evaluation, runConfig, run, fleetQueue, hooks, now, evaluatorRuntime)
 					run.adversarialReviews ??= []
 					run.adversarialReviews.push(review)
 					mergeIntegrityOutputs(run.evaluatorIntegrity!, adversarialOutputRecords(review))
@@ -1839,7 +1855,8 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	const merged = combinedArchive(archive, run)
 	let curriculum = generateCurriculumProposals(merged, now())
 	if (fleetQueue && !config.dryRun && curriculum.length > 0) {
-		curriculum = await validateCurriculumOnFleet(curriculum, runConfig, run, fleetQueue, now)
+		if (!evaluatorRuntime) throw new Error("fleet curriculum evaluation requires its frozen evaluator image and policy identity")
+		curriculum = await validateCurriculumOnFleet(curriculum, runConfig, run, fleetQueue, now, evaluatorRuntime)
 		run.curriculumTasks = curriculum
 		await checkpointWithEvaluatorIntegrity()
 	} else {

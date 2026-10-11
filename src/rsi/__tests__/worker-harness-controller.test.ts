@@ -92,9 +92,10 @@ async function main(): Promise<void> {
 		})
 		const parent = run.candidates.find((candidate) => candidate.generation === 0)!
 		const child = run.candidates.find((candidate) => candidate.generation === 1)!
-		const integrityManifest = JSON.parse(await fs.readFile(path.join(config.archiveDir, run.evaluatorIntegrity!.manifestPath!), "utf8")) as { payload: { input: { imageIdentity: { identitySource: string; verifiedImageDigest: string | null } } } }
+		const integrityManifest = JSON.parse(await fs.readFile(path.join(config.archiveDir, run.evaluatorIntegrity!.manifestPath!), "utf8")) as { payload: { input: { imageIdentity: { identitySource: string; pinnedImageDigest: string | null; workerHarnessRuntime: { imageDigest: string } | null } } } }
 		assert.equal(integrityManifest.payload.input.imageIdentity.identitySource, "synthetic-test-hooks")
-		assert.equal(integrityManifest.payload.input.imageIdentity.verifiedImageDigest, runtime.imageDigest)
+		assert.equal(integrityManifest.payload.input.imageIdentity.pinnedImageDigest, `sha256:${"0".repeat(64)}`)
+		assert.equal(integrityManifest.payload.input.imageIdentity.workerHarnessRuntime?.imageDigest, runtime.imageDigest, "the worker runtime pin remains distinct from the evaluator image")
 		assert.equal(parent.status, "accepted")
 		assert.equal(parent.workerHarnessExecution?.mode, "fixed-control")
 		assert.equal(child.parent, parent.id)
