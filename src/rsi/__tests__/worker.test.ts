@@ -80,8 +80,8 @@ test("fleet Muse mutation forwards its profile into the real guest environment g
 		const snapshot = fs.readFileSync(snapshotPath)
 		const snapshotSha256 = digest(snapshot)
 		const limits: OpenRouterBrokerLimits = {
-			campaignId: "synthetic-muse-campaign", maxCalls: 1, maxInputTokensPerCall: 100, maxOutputTokensPerCall: 100,
-			maxTotalTokens: 200, maxDurationMs: 60_000, maxRequestBytes: 16_384, maxResponseBytes: 16_384,
+			campaignId: "synthetic-muse-campaign", maxCalls: 1, maxInputTokensPerCall: 1_000, maxOutputTokensPerCall: 100,
+			maxTotalTokens: 1_100, maxDurationMs: 60_000, maxRequestBytes: 16_384, maxResponseBytes: 16_384,
 			maxInputPricePerMillionUsd: 1, maxOutputPricePerMillionUsd: 1, maxCallSpendUsd: 0.01, maxJobSpendUsd: 0.01, maxCampaignSpendUsd: 0.01,
 		}
 		const payload: FleetJobPayload = {
@@ -120,8 +120,9 @@ test("fleet Muse mutation forwards its profile into the real guest environment g
 			createInferenceBroker: async (options) => {
 				capturedProfile = options.profileId
 				assert.equal(options.model, RSI_MUSE_OPENROUTER_MODEL)
+				assert.equal(Math.min(options.limits.maxInputTokensPerCall, options.limits.maxRequestBytes) - 128, 872)
 				return {
-					localBaseUrl: "http://127.0.0.1:43123", guestBaseUrl: "http://host.openshell.internal:43123", capability: "opaque-synthetic-capability", port: 43123,
+					localBaseUrl: "http://127.0.0.1:43123", guestBaseUrl: "http://host.openshell.internal:43123", capability: "opaque-synthetic-capability", port: 43123, maxPromptBytes: 872,
 					async receipt() { return brokerReceipt }, async close() {},
 				}
 			},
@@ -141,6 +142,7 @@ test("fleet Muse mutation forwards its profile into the real guest environment g
 		assert.equal(capturedEnvironment?.HEADLESSCODE_CODE_MODE_BACKEND, "openrouter")
 		assert.equal(capturedEnvironment?.HEADLESSCODE_CODE_MODE_MODEL, RSI_MUSE_OPENROUTER_MODEL)
 		assert.equal(capturedEnvironment?.HEADLESSCODE_RSI_INFERENCE_CAPABILITY, "opaque-synthetic-capability")
+		assert.equal(capturedEnvironment?.HEADLESSCODE_OPENROUTER_MAX_PROMPT_BYTES, "872")
 		const receipt = completeResult?.inferenceReceipt as OpenRouterBrokerReceipt | undefined
 		assert.equal(receipt?.profileId, "muse-spark-contributor", "worker publishes the profile-bound receipt")
 		assert.ok(capturedEnvironment)
@@ -149,7 +151,7 @@ test("fleet Muse mutation forwards its profile into the real guest environment g
 			repoRoot: root, model: RSI_MUSE_OPENROUTER_MODEL, maxIterations: 1, commandTimeoutMs: 1_000,
 			roles: { worker: { provider: "openrouter" as const, model: RSI_MUSE_OPENROUTER_MODEL, openRouterProfile: "muse-spark-contributor" as const } },
 		} as Parameters<typeof rsiMutationGuestEnvironment>[0]
-		const brokerAccess = { guestBaseUrl: "http://host.openshell.internal:43123", capability: "opaque", port: 43123 }
+		const brokerAccess = { guestBaseUrl: "http://host.openshell.internal:43123", capability: "opaque", port: 43123, maxPromptBytes: 872 }
 		assert.throws(() => rsiMutationGuestEnvironment({ ...validConfig, roles: { worker: { provider: "openrouter", model: RSI_MUSE_OPENROUTER_MODEL } } }, candidate, brokerAccess), /explicit profile identity/)
 		assert.throws(() => rsiMutationGuestEnvironment({ ...validConfig, roles: { worker: { provider: "openrouter", model: RSI_MUSE_OPENROUTER_MODEL, openRouterProfile: "deepseek-deepinfra-fp8" } } }, candidate, brokerAccess), /identity is not admitted/)
 	} finally {
