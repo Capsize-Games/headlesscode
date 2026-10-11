@@ -176,10 +176,10 @@ function validateJsonData(value: unknown, context: { nodes: number }, depth = 0)
 }
 
 function validRelativeFile(file: string): boolean {
-	if (file.length === 0 || file.length > 512 || file.includes("\\") || file.includes("\0") || file.startsWith("/")) return false
+	if (file.length === 0 || file.length > 512 || file.includes("\\") || /[\u0000-\u001f\u007f]/.test(file) || !isWellFormedUnicode(file) || file.startsWith("/")) return false
 	if (file.startsWith("~") || /^[A-Za-z]:/.test(file)) return false
 	const parts = file.split("/")
-	return parts.every((part) => part !== "" && part !== "." && part !== ".." && !part.startsWith(".")) && file !== "manifest.json"
+	return parts.length <= 9 && parts.every((part) => part !== "" && part !== "." && part !== ".." && !part.startsWith(".")) && file !== "manifest.json"
 }
 
 function validateManifest(raw: unknown): ExtensionManifest {
@@ -233,9 +233,11 @@ export function validateExtensionBundle(bundle: unknown): ExtensionBundle {
 		if (content.includes("\0") || !isWellFormedUnicode(content)) fail(`file ${JSON.stringify(name)} contains unsupported text characters`)
 		files[name] = content
 	}
-	const sortedNames = Object.keys(files).sort(compareText)
-	for (let index = 1; index < sortedNames.length; index++) {
-		if (sortedNames[index]?.startsWith(`${sortedNames[index - 1]}/`)) fail("a file path cannot also be a directory path")
+	for (const name of Object.keys(files)) {
+		const parts = name.split("/")
+		for (let index = 1; index < parts.length; index++) {
+			if (Object.hasOwn(files, parts.slice(0, index).join("/"))) fail("a file path cannot also be a directory path")
+		}
 	}
 	if (manifest.entrypoint && !Object.hasOwn(files, manifest.entrypoint)) fail("entrypoint must exist in files")
 	if (manifest.kind === "skill") {
@@ -338,7 +340,7 @@ async function loadDirectory(workspaceRoot: string, id: string, digest: string):
 		if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) throw new Error("extension revision contains an unsupported directory")
 		const entries = await fs.opendir(current)
 		for await (const entry of entries) {
-			if (++seen > EXTENSION_MAX_FILES + 16) throw new Error("extension revision has too many directory entries")
+			if (++seen > EXTENSION_MAX_FILES * 9 + 1) throw new Error("extension revision has too many directory entries")
 			if (relative === "" && entry.name === "manifest.json") continue
 			const rel = relative === "" ? entry.name : `${relative}/${entry.name}`
 			const fullPath = path.join(current, entry.name)
@@ -418,15 +420,11 @@ export async function createExtension(workspaceRoot: string, rawBundle: unknown,
 	await fs.mkdir(root, { recursive: true, mode: 0o700 })
 	await assertNoSymlinkAncestors(idDirectory)
 	await fs.mkdir(idDirectory, { recursive: true, mode: 0o700 })
-	try {
-		return await loadDirectory(workspaceRoot, bundle.manifest.id, digest)
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-			try { await fs.lstat(finalDirectory); throw new Error("existing extension revision is invalid and will not be replaced") } catch (statError) {
-				if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError
-			}
-		}
+	let exists = false
+	try { await fs.lstat(finalDirectory); exists = true } catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
 	}
+	if (exists) return loadDirectory(workspaceRoot, bundle.manifest.id, digest)
 	await assertNoSymlinkAncestors(idDirectory)
 	await fs.mkdir(stageDirectory, { mode: 0o700 })
 	try {
@@ -443,9 +441,8 @@ export async function createExtension(workspaceRoot: string, rawBundle: unknown,
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST" && (error as NodeJS.ErrnoException).code !== "ENOTEMPTY") throw error
 			return await loadDirectory(workspaceRoot, bundle.manifest.id, digest)
 		}
-	} catch (error) {
+	} finally {
 		await fs.rm(stageDirectory, { recursive: true, force: true }).catch(() => undefined)
-		throw error
 	}
 	return loadDirectory(workspaceRoot, bundle.manifest.id, digest)
 }

@@ -100,6 +100,9 @@ async function validationFailsBeforeAnyWrite(): Promise<void> {
 		invalid.push({ ...toolBundle(), files: { "src/index.mjs": "export const broken = '\ud800'" } })
 		invalid.push({ ...toolBundle(), files: { "src/index.mjs": "a".repeat(64 * 1024), "ref.md": "b".repeat(192 * 1024) } })
 		invalid.push({ ...toolBundle(), files: { "src/index.mjs": "file", "src/index.mjs/child.txt": "child" } })
+		invalid.push({ ...toolBundle(), files: { "src/index.mjs": "file", "a": "file", "a-b": "middle", "a/child.txt": "child" } })
+		invalid.push({ ...toolBundle(), files: { "src/index.mjs": "file", "bad\nname": "file" } })
+		invalid.push({ ...toolBundle(), files: { "src/index.mjs": "file", ["a/".repeat(9) + "deep.txt"]: "file" } })
 		for (const bundle of invalid) await rejects(() => createExtension(root, bundle, { authorizeWrite: allow }), /Invalid extension bundle/)
 		const accessorBundle = Object.defineProperties({}, {
 			manifest: { enumerable: true, get: () => toolBundle().manifest },
@@ -120,6 +123,28 @@ async function validationFailsBeforeAnyWrite(): Promise<void> {
 		} }), /authorization denied/)
 		assert.ok(authorizations > 5 && deniedSourceFile, "nested destinations are individually authorized before writes")
 		assert.equal(await fs.lstat(path.join(root, ".agents")).then(() => true, () => false), false, "denied writes leave no partial publication")
+	} finally {
+		await fs.rm(root, { recursive: true, force: true })
+	}
+}
+
+async function concurrentPublicationAndIncompleteRevision(): Promise<void> {
+	await fs.mkdir(scratchRoot, { recursive: true, mode: 0o700 })
+	const root = await fs.mkdtemp(path.join(scratchRoot, "extension-registry-publish-"))
+	try {
+		const bundle = toolBundle()
+		const revisions = await Promise.all(Array.from({ length: 4 }, () => createExtension(root, bundle, { authorizeWrite: allow })))
+		assert.equal(new Set(revisions.map((revision) => revision.digest)).size, 1)
+		assert.deepEqual(await fs.readdir(path.dirname(revisions[0]!.directory)), [revisions[0]!.digest], "concurrent idempotent publication cleans every owned staging directory")
+		const incompleteBundle = toolBundle("incomplete")
+		const incomplete = path.join(extensionRoot(root), "incomplete", extensionBundleDigest(incompleteBundle))
+		await fs.mkdir(incomplete, { recursive: true })
+		await assert.rejects(createExtension(root, incompleteBundle, { authorizeWrite: allow }), /ENOENT/, "an incomplete existing revision must never be silently replaced")
+		assert.deepEqual(await fs.readdir(incomplete), [])
+		const nestedFiles: Record<string, string> = { "src/index.mjs": bundle.files["src/index.mjs"]! }
+		for (let index = 0; index < 31; index++) nestedFiles[`ref${index}/a/b/c/d/e/f/g/file.txt`] = "reference"
+		const nested = await createExtension(root, { ...bundle, manifest: { ...bundle.manifest, id: "nested" }, files: nestedFiles }, { authorizeWrite: allow })
+		assert.equal(Object.keys((await loadExtension(root, "nested", nested.digest)).files).length, 32, "all admitted directory layouts must remain loadable")
 	} finally {
 		await fs.rm(root, { recursive: true, force: true })
 	}
@@ -159,4 +184,5 @@ async function symlinkAndChangedDigestFailClosed(): Promise<void> {
 await validKindsRoundTripAndListMetadataOnly()
 await validationFailsBeforeAnyWrite()
 await symlinkAndChangedDigestFailClosed()
+await concurrentPublicationAndIncompleteRevision()
 console.log("All extension registry tests passed")
