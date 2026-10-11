@@ -4766,6 +4766,7 @@ export class HeadlessSession {
 			// mechanism is stale SEARCH text, not a stale executor).
 			const batchEditedPaths = new Map<string, string>()
 			const boundaryTools: IterationBoundaryToolRecord[] = []
+			const nestedBoundaryTools = new Map<number, Map<number, IterationBoundaryToolRecord>>()
 
 			// (S3) Partition this turn's calls: pure read-only/exploration calls
 			// (read_file/list_files/search_files, the TS code-intel reads, and a
@@ -4877,14 +4878,16 @@ export class HeadlessSession {
 					batchEditedPaths.set(targetPath, name)
 					this.sessionWrittenPaths.add(targetPath)
 				}
-				boundaryTools.push({
+				const nestedRecords = nestedBoundaryTools.get(outerIndex) ?? new Map<number, IterationBoundaryToolRecord>()
+				nestedRecords.set(subIndex, {
 					id: syntheticCall.id,
 					name,
-					arguments: Object.freeze({ ...args }),
+					arguments: this.config.iterationBoundaryHook === undefined ? Object.freeze({ ...args }) : immutableBoundaryArguments(args),
 					isError,
 					result: resultContent,
 					...(isError ? { normalizedError: resultContent.split("\n", 1)[0]?.slice(0, 200) ?? "tool_error" } : {}),
 				})
+				nestedBoundaryTools.set(outerIndex, nestedRecords)
 				await this.checkPauseRequested(budgetTracker)
 			}
 			const dispatchBatchSubcall = async (
@@ -5158,6 +5161,11 @@ export class HeadlessSession {
 					name: call.name,
 					content: resultContent,
 				})
+				// Monitor observations retain submission order even when nested
+				// read-only calls finish in a different order.
+				for (const [, record] of [...(nestedBoundaryTools.get(i) ?? new Map<number, IterationBoundaryToolRecord>()).entries()].sort(([left], [right]) => left - right)) {
+					boundaryTools.push(record)
+				}
 				boundaryTools.push({
 					id: call.id,
 					name: call.name,
