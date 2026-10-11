@@ -124,8 +124,20 @@ conflicts with an executor label or watcher-wide default is rejected before
 dispatch.
 
 After detached dispatch, the watcher keeps a `headlesscode:running` label and
-reserves the worktrees against its concurrency limit. A later continuous poll
-checks each worktree's completion markers. When all exit codes are zero, it
+reserves the worktrees against its concurrency limit. Each dispatch receives a
+random attempt ID. On Linux, a detached supervisor starts the worker wrapper
+behind a pipe gate, records its process group and `/proc` start time in a
+private receipt directory outside the worktrees, and then releases the worker.
+The supervisor waits for the wrapper's actual child exit status and for the
+process group to disappear before writing an attempt-bound completion receipt.
+A later continuous poll requires matching receipts and a verified-absent
+process group before it reports a terminal result. Worktree
+`.harness.done` and `.harness.exit` files are diagnostics only. Missing,
+malformed, stale, or unverifiable identity evidence leaves the job running.
+On systems without the required process identity checks, jobs remain running
+for operator investigation rather than being closed from marker files.
+
+When all exit codes are zero, the watcher
 posts one bounded result summary, links only pull requests found for the exact
 generated branches in the same repository, applies `headlesscode:done`, and
 closes the issue. If no matching pull request exists, the result comment says
@@ -135,6 +147,12 @@ performed and includes no PR link. A nonzero worker exit applies
 malformed markers leave it running. Result
 comments carry an idempotency marker so a restart can retry GitHub updates
 without posting the same result again.
+
+These receipts prevent ordinary worker-tree files from authorizing completion;
+they are not an operating-system isolation boundary against arbitrary code
+running as the same host user. Operators must treat the host account and its
+processes as trusted, and investigate detached or unverifiable processes before
+recovering a job.
 
 `--run-once` only performs one poll. A successful launch therefore leaves a
 job issue running; completion labels, result comments, and automatic closing

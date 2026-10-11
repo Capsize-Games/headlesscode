@@ -79,6 +79,8 @@ export interface WatcherIssueEntry {
 	museModel?: string
 	/** Uses the headlesscode-job Task/Executor/Submitted-by body contract. */
 	jobContract?: true
+	/** Random attempt identity used to bind supervisor worker receipts. */
+	jobAttempt?: string
 	/** Unverified attribution text supplied by the queued issue's body. */
 	submittedBy?: string
 	spawnedAt?: string
@@ -133,6 +135,7 @@ function sanitize(raw: unknown): WatcherState {
 				if (e.executor === "builtin" || e.executor === "muse") entry.executor = e.executor
 				if (typeof e.museModel === "string") entry.museModel = e.museModel
 				if (e.jobContract === true) entry.jobContract = true
+				if (typeof e.jobAttempt === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(e.jobAttempt)) entry.jobAttempt = e.jobAttempt
 				if (typeof e.submittedBy === "string" && e.submittedBy.length <= 256 && !/[\u0000-\u001f\u007f]/.test(e.submittedBy)) entry.submittedBy = e.submittedBy
 				if (Array.isArray(e.groups)) {
 					entry.groups = e.groups as WorktreeSpec[]
