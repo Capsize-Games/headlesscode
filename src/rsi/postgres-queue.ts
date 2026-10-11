@@ -776,14 +776,36 @@ export class PostgresRsiJobQueue {
 			const bytes = await this.getArtifact(reference.sha256)
 			if (createHash("sha256").update(bytes).digest("hex") !== reference.sha256 || bytes.byteLength !== reference.bytes) throw new Error("fleet failure output artifact bytes do not match its declared digest and length")
 		}
-		const failureJson = failureResult === undefined ? null : JSON.stringify(failureResult)
-		const result = await this.pool.query(
-			`UPDATE headlesscode_rsi_jobs SET status=CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'queued' END, error=$4,result=$6::jsonb,
-			 updated_at=clock_timestamp(), lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL
-			 WHERE job_id=$1 AND queue_name=$5 AND lease_owner=$2 AND lease_token=$3 AND status='leased' AND lease_expires_at > clock_timestamp()`,
-			[lease.job.jobId, lease.workerId, lease.token, error.slice(0, 4000), this.policy.queueName, failureJson],
-		)
-		return result.rowCount === 1
+		return inTransaction(this.pool, async (client) => {
+			const current = await client.query(
+				`SELECT attempts,error,result FROM headlesscode_rsi_jobs
+				 WHERE job_id=$1 AND queue_name=$4 AND lease_owner=$2 AND lease_token=$3 AND status='leased' AND lease_expires_at > clock_timestamp()
+				 FOR UPDATE`,
+				[lease.job.jobId, lease.workerId, lease.token, this.policy.queueName],
+			)
+			const row = current.rows[0]
+			if (!row) return false
+			const previousResult = row.result && typeof row.result === "object" && !Array.isArray(row.result) ? row.result as Record<string, unknown> : undefined
+			const previousHistory = Array.isArray(previousResult?.failureHistory)
+				? previousResult.failureHistory
+				: previousResult
+					? [{ attempt: Math.max(1, Number(row.attempts) - 1), error: row.error ?? "previous attempt failed", result: previousResult }]
+					: []
+			const currentFailure = failureResult ? { ...failureResult } : undefined
+			if (currentFailure) delete currentFailure.failureHistory
+			const failureRecord = { attempt: Number(row.attempts), error: error.slice(0, 4000), result: currentFailure ?? null }
+			const storedResult = {
+				...(currentFailure ?? {}),
+				failureHistory: [...previousHistory, failureRecord],
+			}
+			const result = await client.query(
+				`UPDATE headlesscode_rsi_jobs SET status=CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'queued' END, error=$4,result=$6::jsonb,
+				 updated_at=clock_timestamp(), lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL
+				 WHERE job_id=$1 AND queue_name=$5 AND lease_owner=$2 AND lease_token=$3 AND status='leased' AND lease_expires_at > clock_timestamp()`,
+				[lease.job.jobId, lease.workerId, lease.token, error.slice(0, 4000), this.policy.queueName, JSON.stringify(storedResult)],
+			)
+			return result.rowCount === 1
+		})
 	}
 
 	async getJob(jobId: string): Promise<FleetJob | undefined> {
