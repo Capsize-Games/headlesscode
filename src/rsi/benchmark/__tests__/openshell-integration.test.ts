@@ -85,6 +85,7 @@ try {
 	let verifierSnapshot = ""
 	let phase: "agent" | "verifier" = "agent"
 	let guestEnvironment: Record<string, string> = {}
+	let guestWorkerCommand = ""
 	let brokerBaseUrl = ""
 	let upstreamCalls = 0
 	let guestNetworkPolicy: Record<string, unknown> = {}
@@ -113,6 +114,7 @@ try {
 		async runHarness(_handle, command) {
 			if (phase === "agent") {
 				events.push("agent-command")
+				guestWorkerCommand = command
 				const workerCommand = command.split(" && exec ")[1] ?? ""
 				assert.equal(command.split(" && exec ").length - 1, 1, "coding worker command should execute once after preflight")
 				assert.equal(workerCommand.split("/opt/headlesscode/src/cli.ts").length - 1, 1, "fixed-control must execute the pinned release CLI exactly once")
@@ -148,7 +150,7 @@ try {
 	}
 
 	const request: BenchmarkAgentRequest = {
-		taskId: task.id, attemptId: `attempt-${task.id}`, campaignId: "campaign-test", brokerLedgerPath: path.join(tempRoot, "inference-ledger.json"), task: task.task, seed: task.seed, workspace: taskWorkspace, harnessCommit,
+		taskId: task.id, attemptId: `attempt-${task.id}`, campaignId: "campaign-test", brokerLedgerPath: path.join(tempRoot, "inference-ledger.json"), task: 'Change app answer to 2.\nPreserve the literal text "answer" and edit only src/app.js.', seed: task.seed, workspace: taskWorkspace, harnessCommit,
 		model: { provider: "openshell-openrouter", id: RSI_OPENROUTER_MODEL, sampling: {} }, ceilings: task.ceilings,
 	}
 	let lastCapability = ""
@@ -167,6 +169,8 @@ try {
 	const agent = new OpenShellBenchmarkAgent(harnessRoot, providerFactory, "headlesscode-openshell-rsi:local", harnessCommit, undefined, "openshell-openrouter", brokerFactory)
 	const agentResult = await agent.run(request)
 	assert.equal(agentResult.validity, "valid")
+	assert.ok(guestWorkerCommand.includes(`Objective: ${request.task}`), "mocked guest dispatch must receive the exact multiline benchmark objective")
+	assert.equal(guestWorkerCommand.includes("Improve the headlesscode agent loop while preserving all existing behavior and tests."), false, "benchmark dispatch must not retain the generic RSI objective")
 	assert.ok(agentResult.patch)
 	assert.equal(upstreamCalls, 1, "the guest path must complete one brokered provider request")
 	assert.equal(agentResult.inferenceReceipt?.qualified, true)
