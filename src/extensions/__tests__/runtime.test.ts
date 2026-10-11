@@ -35,6 +35,16 @@ function toolBundle(id: string, source: string): ExtensionBundle {
 	}
 }
 
+function toolBundleWithEntrypoint(id: string, entrypoint: string, source: string): ExtensionBundle {
+	return {
+		manifest: {
+			schemaVersion: 1, id, kind: "tool", description: "Module scope fixture", entrypoint,
+			inputSchema: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false },
+		},
+		files: { [entrypoint]: source },
+	}
+}
+
 function mcpBundle(id: string, source: string): ExtensionBundle {
 	return { manifest: { schemaVersion: 1, id, kind: "mcp", description: "Fixture MCP server", entrypoint: "server.mjs" }, files: { "server.mjs": source } }
 }
@@ -121,6 +131,43 @@ export async function run(input) {
 		for (const [key, value] of originalEnvironment) {
 			if (value === undefined) delete process.env[key]
 			else process.env[key] = value
+		}
+	}
+}
+
+async function testExecutableModuleScopeIgnoresWorkspacePackageType(workspaceRoot: string): Promise<void> {
+	const fixtureRoot = path.join(workspaceRoot, "module-scope-fixtures")
+	const commonJsWorkspace = path.join(fixtureRoot, "without-package-scope")
+	const moduleWorkspace = path.join(fixtureRoot, "type-module-scope")
+	await fs.mkdir(commonJsWorkspace, { recursive: true })
+	await fs.mkdir(moduleWorkspace, { recursive: true })
+	await fs.writeFile(path.join(moduleWorkspace, "package.json"), '{"type":"module"}\n')
+	const cases = [
+		{ id: "scope-js", entrypoint: "index.js", source: 'exports.run = (input) => ({ module: "commonjs", value: input.value })', expectedModule: "commonjs" },
+		{ id: "scope-cjs", entrypoint: "index.cjs", source: 'exports.run = (input) => ({ module: "commonjs", value: input.value })', expectedModule: "commonjs" },
+		{ id: "scope-mjs", entrypoint: "index.mjs", source: 'export function run(input) { return { module: "module", value: input.value } }', expectedModule: "module" },
+	]
+	for (const item of cases) {
+		const bundle = toolBundleWithEntrypoint(item.id, item.entrypoint, item.source)
+		const revisions = await Promise.all([
+			createFixture(commonJsWorkspace, bundle),
+			createFixture(moduleWorkspace, bundle),
+		])
+		assert.equal(revisions[0]?.digest, revisions[1]?.digest, `${item.entrypoint} snapshots have the same pinned digest across workspace package scopes`)
+		for (const revision of revisions) {
+			const staged = await extensionRuntimeTestHooks.stageRevision(revision, revision.workspaceRoot)
+			try {
+				const packageScopePath = path.join(staged.directory, "package.json")
+				assert.equal(await fs.readFile(packageScopePath, "utf8"), '{"type":"commonjs"}\n', "runtime package scope has fixed metadata")
+				assert.equal((await fs.stat(packageScopePath)).mode & 0o777, 0o400, "runtime package scope is owner-readonly")
+				assert.equal(Object.hasOwn(revision.files, "package.json"), false, "runtime metadata is outside the authored revision file map")
+			} finally { await staged.cleanup() }
+			const runtime = new SessionExtensionRuntime({ workspaceRoot: revision.workspaceRoot, permissions: permissions(), limits: { callTimeoutMs: 3_000 } })
+			try {
+				assert.deepEqual(await runtime.call(revision, { value: "same capsule" }, { permissions: permissions() }), {
+					module: item.expectedModule, value: "same capsule",
+				}, `${item.entrypoint} executes according to its explicit suffix regardless of workspace package type`)
+			} finally { await runtime.dispose() }
 		}
 	}
 }
@@ -453,6 +500,7 @@ await fs.mkdir(scratchRoot, { recursive: true, mode: 0o700 })
 const workspaceRoot = await fs.mkdtemp(path.join(scratchRoot, "extension-runtime-test-"))
 try {
 	await testNativeHelperBoundsPermissionsAndCapturedRevision(workspaceRoot)
+	await testExecutableModuleScopeIgnoresWorkspacePackageType(workspaceRoot)
 	await testHardTimeoutAndDescendantTeardown(workspaceRoot)
 	await testImmediateAbortWaitsForSpawnBeforeCleanup(workspaceRoot)
 	await testLeaderExitStillReapsOwnedDescendants(workspaceRoot)
