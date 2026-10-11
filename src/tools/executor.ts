@@ -1968,6 +1968,44 @@ type ListFilesCallEntry = {
 	 * never loops forever.
 	 */
 	toldUnchanged: boolean
+	/**
+	 * Small signature of the bounded collected/rendered entries (including
+	 * truncation) from the last real listing. The repeat-call notice is
+	 * only returned when a fresh bounded walk still matches this — a file
+	 * created by any tool/command/external change (including nested paths
+	 * under a recursive listing) changes the signature and forces a real
+	 * listing instead of a stale notice.
+	 */
+	signature: string
+}
+
+/**
+ * Small signature over the visible bounded listing: sorted dirs-first,
+ * capped at MAX_LIST_FILES, plus the truncation flag. Covers nested
+ * entries for recursive listings, so top-level mtime alone is never
+ * relied on.
+ */
+function listEntriesSignature(
+	collected: { entries: Array<{ rel: string; isDir: boolean }>; truncated: boolean },
+): string {
+	const sorted = [...collected.entries].sort((a, b) => {
+		if (a.isDir !== b.isDir) {
+			return a.isDir ? -1 : 1
+		}
+		return a.rel.localeCompare(b.rel)
+	})
+	const rendered = sorted
+		.slice(0, MAX_LIST_FILES)
+		.map((e) => (e.isDir ? `${e.rel}/` : e.rel))
+		.join("\n")
+	// FNV-1a over the rendered text plus the truncation flag.
+	let hash = 0x811c9dc5
+	const text = `${rendered}\n${collected.truncated ? "truncated" : "full"}`
+	for (let i = 0; i < text.length; i++) {
+		hash ^= text.charCodeAt(i)
+		hash = Math.imul(hash, 0x01000193)
+	}
+	return `${sorted.slice(0, MAX_LIST_FILES).length}:${collected.truncated ? 1 : 0}:${(hash >>> 0).toString(16)}`
 }
 
 /**
@@ -2006,14 +2044,36 @@ function listFilesHandler(
 		const key = `${target} ${recursive}`
 		const entry = calls?.get(key)
 
+		let collected: { entries: Array<{ rel: string; isDir: boolean }>; truncated: boolean }
+		try {
+			collected = await collectEntries(target, ctx.workspaceRoot, recursive)
+		} catch (error) {
+			return err(`list_files: cannot list '${rel}': ${errorMessage(error)}`)
+		}
+
+		// Sort dirs first, then alphabetically (over the collected subset).
+		collected.entries.sort((a, b) => {
+			if (a.isDir !== b.isDir) {
+				return a.isDir ? -1 : 1
+			}
+			return a.rel.localeCompare(b.rel)
+		})
+
+		const signature = listEntriesSignature(collected)
+
 		// See readFileHandler's disableReadFileCache comment for the full
 		// rationale (same short-circuit shape, same local-backend risk).
+		// The notice fires only when the fresh bounded walk still matches
+		// the prior real listing — any tool/command/external change
+		// (including nested changes under a recursive listing) alters the
+		// signature and falls through to a real listing below.
 		if (
 			!ctx.disableReadFileCache &&
 			calls !== undefined &&
 			generation !== undefined &&
 			entry !== undefined &&
-			entry.generation === generation
+			entry.generation === generation &&
+			entry.signature === signature
 		) {
 			if (!entry.toldUnchanged) {
 				entry.toldUnchanged = true
@@ -2028,27 +2088,12 @@ function listFilesHandler(
 			// refusing again would just repeat the same unproductive exchange.
 		}
 
-		let collected: { entries: Array<{ rel: string; isDir: boolean }>; truncated: boolean }
-		try {
-			collected = await collectEntries(target, ctx.workspaceRoot, recursive)
-		} catch (error) {
-			return err(`list_files: cannot list '${rel}': ${errorMessage(error)}`)
-		}
-
 		// Only recorded on SUCCESS: a failed listing (e.g. bad path) should
 		// remain retryable with the real error, never masked by the cache-hit
 		// notice above.
 		if (calls !== undefined && generation !== undefined) {
-			calls.set(key, { generation, toldUnchanged: false })
+			calls.set(key, { generation, toldUnchanged: false, signature })
 		}
-
-		// Sort dirs first, then alphabetically (over the collected subset).
-		collected.entries.sort((a, b) => {
-			if (a.isDir !== b.isDir) {
-				return a.isDir ? -1 : 1
-			}
-			return a.rel.localeCompare(b.rel)
-		})
 
 		const lines = collected.entries.slice(0, MAX_LIST_FILES).map((e) => (e.isDir ? `${e.rel}/` : e.rel))
 		// Once the walk was capped the true total is unknown, so the trailer
