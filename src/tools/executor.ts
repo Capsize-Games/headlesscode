@@ -244,6 +244,8 @@ export class ToolExecutor {
 	 * one session) so dispose() only tears down this session's processes.
 	 */
 	readonly backgroundCommands = new Set<ChildProcess>()
+	/** Executor-owned browser session identity (see browserSessionOwner in ToolContext). */
+	private readonly browserSessionOwner: object = {}
 	private pauseBudgetClock: (() => void) | undefined
 	private resumeBudgetClock: (() => void) | undefined
 	private onAuxLlmUsage: ((usage: AuxLlmUsage) => void) | undefined
@@ -386,6 +388,7 @@ export class ToolExecutor {
 				dispatchBatchSubcall: batchContext?.dispatchBatchSubcall,
 				serializeBatchSubcalls: batchContext?.serializeBatchSubcalls,
 				workspaceRoot: this.workspaceRoot,
+				browserSessionOwner: this.browserSessionOwner,
 				permissions: this.permissions,
 				guardLargeOverwrites: this.options.guardLargeOverwrites,
 				disableReadFileCache: this.options.disableReadFileCache,
@@ -420,7 +423,7 @@ export class ToolExecutor {
 		*/
 	dispose(): void {
 		killBackgroundCommands(this.backgroundCommands)
-		disposeBrowserSessions()
+		disposeBrowserSessions(this.browserSessionOwner)
 	}
 }
 
