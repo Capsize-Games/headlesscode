@@ -238,6 +238,12 @@ export interface ToolExecutorOptions {
 
 export class ToolExecutor {
 	private readonly handlers = new Map<string, ToolHandler>()
+	/**
+	 * Executor-owned registry of execute_command children that timed out and
+	 * were left running in the background. Per-instance (one executor serves
+	 * one session) so dispose() only tears down this session's processes.
+	 */
+	readonly backgroundCommands = new Set<ChildProcess>()
 	private pauseBudgetClock: (() => void) | undefined
 	private resumeBudgetClock: (() => void) | undefined
 	private onAuxLlmUsage: ((usage: AuxLlmUsage) => void) | undefined
@@ -413,7 +419,7 @@ export class ToolExecutor {
 		* true session end does, so nothing is orphaned past its session.
 		*/
 	dispose(): void {
-		killBackgroundCommands()
+		killBackgroundCommands(this.backgroundCommands)
 		disposeBrowserSessions()
 	}
 }
@@ -1045,7 +1051,7 @@ function writeToFileHandler(args: Record<string, unknown>, ctx: ToolContext): Pr
  * works unchanged — the model targets the process by port/name/pattern, same
  * as a human would.
  */
-const backgroundCommands = new Set<ChildProcess>()
+ // Background-command registry is executor-owned (see ToolExecutor.backgroundCommands); no module-global set.
 
 /** Best-effort unref of a stdio pipe so it can't keep the event loop alive. */
 function unrefStream(stream: NodeJS.ReadableStream | null): void {
@@ -1067,7 +1073,7 @@ function unrefStream(stream: NodeJS.ReadableStream | null): void {
  * call times out mid-session — that is the whole point of the background
  * semantics (see the vendored execute_command tool's timeout contract).
  */
-function killBackgroundCommands(): void {
+function killBackgroundCommands(backgroundCommands: Set<ChildProcess>): void {
 	for (const child of backgroundCommands) {
 		try {
 			if (child.exitCode === null && child.signalCode === null) {
@@ -1609,7 +1615,7 @@ async function setIndentationHandler(args: Record<string, unknown>, ctx: ToolCon
  * for via the `timeout` arg, so it must not count toward the loop's
  * consecutive-mistake bounded-failure limit.
  */
-function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext, backgroundCommands: Set<ChildProcess>): Promise<ToolResult> {
 	const command = requireString(args, "command")
 	const timeoutS = toNonNegativeInt(args.timeout, DEFAULT_COMMAND_TIMEOUT_S) || DEFAULT_COMMAND_TIMEOUT_S
 
@@ -2732,7 +2738,7 @@ export function createHeadlessExecutor(workspaceRoot: string, options: ToolExecu
 	executor.register("search_replace", searchReplaceHandler)
 	executor.register("edit_file", editFileHandler)
 	executor.register("set_indentation", setIndentationHandler)
-	executor.register("execute_command", executeCommandHandler)
+	executor.register("execute_command", (args, ctx) => executeCommandHandler(args, ctx, executor.backgroundCommands))
 	executor.registerListFiles()
 	executor.register("codebase_search", codebaseSearchHandler)
 	executor.register("browser_action", browserActionHandler)
@@ -2775,7 +2781,7 @@ function createReadCommandExecutor(workspaceRoot: string, options: ToolExecutorO
 
 	executor.registerReadFile()
 	executor.registerListFiles()
-	executor.register("execute_command", executeCommandHandler)
+	executor.register("execute_command", (args, ctx) => executeCommandHandler(args, ctx, executor.backgroundCommands))
 	executor.register("browser_action", browserActionHandler)
 	executor.register("batch", (args, ctx) => batchHandler(executor, args, ctx))
 	// The nine read-only code-intelligence tools (TS-only) follow the same
