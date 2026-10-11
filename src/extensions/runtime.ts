@@ -387,7 +387,6 @@ export class SessionExtensionRuntime {
 				maxStderrBytes: this.limits.maxStderrBytes,
 				protocolFd: 3,
 				onFailure: reject,
-				onExit: () => { if (child) this.children.delete(child) },
 				onProtocol: (line) => {
 					responseCount++
 					if (responseCount !== 1) throw new Error("extension adapter returned duplicate protocol results")
