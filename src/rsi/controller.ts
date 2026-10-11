@@ -45,7 +45,7 @@ import { runProofConfirmation } from "./proof-confirmation.js"
 import { loadHiddenVerifierConfig } from "./hidden-config.js"
 import { createOpenShellHiddenCaseRunner } from "./hidden-openshell-runner.js"
 import type { HiddenEvaluationOptions } from "./evaluator.js"
-import { canonicalJson, evaluatorBaseTreeIdentity, evaluatorGenerationDecisionDigest, evaluatorIntegrityDigest, evaluatorSourceIdentity, loadEvaluatorIntegrityTrust, readEvaluatorIntegrityManifest, signEvaluatorIntegrity, verifyEvaluatorIntegrity, writeEvaluatorIntegrityManifest } from "./evaluation-integrity.js"
+import { canonicalJson, evaluatorBaseTreeIdentity, evaluatorGenerationDecisionDigest, evaluatorIntegrityDigest, evaluatorSourceIdentity, hasEvaluatorIntegrityManifests, loadEvaluatorIntegrityTrust, readEvaluatorIntegrityManifest, signEvaluatorIntegrity, verifyEvaluatorIntegrity, writeEvaluatorIntegrityManifest } from "./evaluation-integrity.js"
 import type { EvaluatorIntegrityPayload, EvaluatorIntegrityTrust } from "./evaluation-integrity.js"
 
 function log(hooks: RsiHooks, line: string): void {
@@ -181,6 +181,8 @@ async function verifyResumedEvaluatorIntegrity(
 	attested: boolean,
 ): Promise<void> {
 	const existing = run.evaluatorIntegrity
+	const hasSealArtifacts = await hasEvaluatorIntegrityManifests(config.archiveDir, run.runId)
+	if ((!existing || existing.status !== "sealed") && hasSealArtifacts) throw new Error("evaluator integrity seal artifacts exist but archive metadata is missing or downgraded; refusing unsealed resume")
 	if (!existing) {
 		if (attested) throw new Error("attested RSI resume requires a signed evaluator integrity manifest; this historical run is unsealed")
 		if (trust) throw new Error("cannot retroactively seal a historical RSI run; start a new run with evaluator integrity trust configured")
@@ -527,6 +529,7 @@ async function buildEvaluatorIntegrityInput(args: {
 	proofProtocol: ReturnType<typeof freezeDevelopmentProofProtocol>
 	benchmarkManifestSha256: string
 	hiddenVerifierIdentity?: RsiRunRecord["hiddenVerifierIdentity"]
+	syntheticRuntimeIdentity?: boolean
 }): Promise<Record<string, unknown>> {
 	const source = await evaluatorSourceIdentity(args.packageRoot)
 	const baseTreeSha256 = evaluatorBaseTreeIdentity(args.config.repoRoot, args.run.baseCommit)
@@ -539,6 +542,8 @@ async function buildEvaluatorIntegrityInput(args: {
 		evaluatorSource: source,
 		imageIdentity: {
 			requestedImage: process.env.HEADLESSCODE_OPENSHELL_IMAGE?.trim() || RSI_OPENSHELL_IMAGE,
+			verifiedImageDigest: args.run.workerHarnessRuntime?.imageDigest ?? args.hiddenVerifierIdentity?.imageDigest ?? null,
+			identitySource: args.syntheticRuntimeIdentity ? "synthetic-test-hooks" : args.run.workerHarnessRuntime ? "pinned-worker-harness-runtime" : args.hiddenVerifierIdentity ? "pinned-hidden-evaluator-image" : "requested-image-tag-only",
 			workerHarnessRuntime: args.run.workerHarnessRuntime ?? null,
 			gatewayAlias: process.env.OPENSHELL_GATEWAY ?? null,
 		},
@@ -1044,6 +1049,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	if (resumed && config.workerHarnessRunId && resumed.runId !== config.workerHarnessRunId) throw new Error("worker harness deterministic run identity differs from the resumed archive record")
 	const baseCommit = resumed?.baseCommit ?? (await resolveBaseCommit(config))
 	const run = resumed ?? initialRun({ ...config, model: workerModel, roles }, baseCommit, now())
+	if (!resumed && await hasEvaluatorIntegrityManifests(config.archiveDir, run.runId)) throw new Error("evaluator integrity seal artifacts already exist for this run ID without archive metadata; refusing to overwrite the prior seal")
 	if (resumed && resumed.model !== workerModel) throw new Error("worker model differs from the frozen run identity")
 	if (resumed?.openRouterProfileId && resumed.openRouterProfileId !== workerOpenRouterProfile?.id) throw new Error("OpenRouter profile differs from the frozen run identity")
 	const stageCount = requestedPhase === "confirmation" ? 0 : config.computePolicy === "adaptive-independent" ? 2 : config.generations
@@ -1142,6 +1148,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		...(workerOpenRouterProfile ? { workerOpenRouterProfile: workerOpenRouterProfile.id } : {}),
 		proofProtocol, benchmarkManifestSha256: loadedProofBenchmark.manifestDigest,
 		...(loadedHiddenVerifier ? { hiddenVerifierIdentity: loadedHiddenVerifier.identity } : {}),
+		syntheticRuntimeIdentity: hooks.syntheticRuntimeIdentity === true,
 	})
 	const checkpointWithEvaluatorIntegrity = async (): Promise<void> => {
 		await persistEvaluatorIntegrity(runConfig, run, integrityTrust, integrityInput)

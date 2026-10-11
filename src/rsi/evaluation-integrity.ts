@@ -217,6 +217,22 @@ function manifestRelativePath(runId: string, sha256: string): string {
 	return path.posix.join("evaluator-integrity", `${runId}.${sha256}.json`)
 }
 
+export async function hasEvaluatorIntegrityManifests(archiveDir: string, runId: string): Promise<boolean> {
+	if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/.test(runId)) throw new Error("evaluator integrity run ID is malformed")
+	const directory = path.join(path.resolve(archiveDir), "evaluator-integrity")
+	await rejectSymlinkAncestors(directory)
+	let entries: import("node:fs").Dirent[]
+	try { entries = await fs.readdir(directory, { withFileTypes: true }) }
+	catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error }
+	const prefix = `${runId}.`
+	for (const entry of entries) {
+		if (!entry.name.startsWith(prefix) || !/^[a-f0-9]{64}\.json$/.test(entry.name.slice(prefix.length))) continue
+		if (!entry.isFile() || entry.isSymbolicLink()) throw new Error("evaluator integrity artifact path contains a symlink or non-file")
+		return true
+	}
+	return false
+}
+
 export async function writeEvaluatorIntegrityManifest(archiveDir: string, runId: string, envelope: EvaluatorIntegrityEnvelope): Promise<{ path: string; sha256: string }> {
 	const bytes = Buffer.from(`${canonicalJson(envelope)}\n`)
 	const digest = createHash("sha256").update(bytes).digest("hex")
