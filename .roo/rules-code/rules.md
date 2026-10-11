@@ -42,6 +42,13 @@ next to it — reach for the specific tool, not the general one:
   `import_graph` over manually reading imports and cross-referencing by
   hand.
 
+## Reuse workspace extensions by pinned revision
+
+- For reusable workspace-specific guidance or a workspace helper, use
+  `extension_manage` to validate/create it and `extension_call` with the exact
+  returned digest; do not rely on a moving latest revision or copy the same
+  instructions into every task.
+
 ## Verify targeted tests, not the full suite, while iterating
 
 - After editing a file, run the SPECIFIC test file(s) for what you changed

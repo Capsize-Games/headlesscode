@@ -284,12 +284,14 @@ export class EventFeed {
 		callId?: string
 		commandIdentity?: string
 		resultTruncated: boolean
+		extension?: { kind: "skill" | "tool" | "mcp"; id: string; digest: string }
 	}): Promise<void> {
 		return this.emit("tool_result", {
 			iteration: fields.iteration,
 			tool: fields.tool,
 			...(fields.callId ? { callId: fields.callId } : {}),
 			...(fields.commandIdentity ? { commandIdentity: fields.commandIdentity } : {}),
+			...(fields.extension ? { extension: fields.extension } : {}),
 			isError: fields.isError,
 			result: fields.result,
 			...(fields.resultTruncated ? { resultTruncated: true } : {}),
