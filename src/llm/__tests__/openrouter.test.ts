@@ -1018,6 +1018,11 @@ async function testIsRetryableOpenRouterErrorMatchesTransientShapes(): Promise<v
 		"no status at all (a transport failure) must be retryable",
 	)
 	assert.equal(isRetryableOpenRouterError(new OpenRouterError("rate limited", 429)), true, "429 must be retryable")
+	assert.equal(
+		isRetryableOpenRouterError(new OpenRouterError('OpenRouter returned HTTP 429: {"error":{"message":"Rate limit exceeded"}}', 429, '{"error":{"message":"Rate limit exceeded"}}')),
+		true,
+		"an upstream rate-limit 429 remains retryable",
+	)
 	assert.equal(isRetryableOpenRouterError(new OpenRouterError("provider returned error", 520)), true, "5xx must be retryable")
 	assert.equal(isRetryableOpenRouterError(new OpenRouterError("bad gateway", 502)), true, "any 5xx must be retryable")
 	assert.equal(
@@ -1025,6 +1030,28 @@ async function testIsRetryableOpenRouterErrorMatchesTransientShapes(): Promise<v
 		true,
 		"the specific 'no allowed providers' 404 is an availability signal despite the 4xx status",
 	)
+}
+
+async function testIsRetryableOpenRouterErrorRejectsDeterministicBroker429s(): Promise<void> {
+	const brokerMessages = [
+		"OpenRouter job call ceiling exhausted",
+		"OpenRouter job token ceiling exhausted",
+		"OpenRouter job spend ceiling exhausted",
+		"OpenRouter campaign spend ceiling exhausted",
+		"OpenRouter request denied: lease is stale, fenced, expired or blocked",
+		"OpenRouter job duration limit exhausted",
+		"OpenRouter file ledger budget exhausted",
+	]
+	for (const message of brokerMessages) {
+		const body = JSON.stringify({ error: { message } })
+		const error = new OpenRouterError(`OpenRouter returned HTTP 429: ${body}`, 429, body)
+		assert.equal(isRetryableOpenRouterError(error), false, `broker admission denial must not retry: ${message}`)
+		assert.equal(
+			isRetryableOpenRouterError(new OpenRouterError(message, 429)),
+			false,
+			`broker admission denial remains deterministic when surfaced without an envelope: ${message}`,
+		)
+	}
 }
 
 async function testIsRetryableOpenRouterErrorRejectsDeterministicFailures(): Promise<void> {
@@ -1040,6 +1067,7 @@ async function testIsRetryableOpenRouterErrorRejectsDeterministicFailures(): Pro
 
 const tests: Array<[string, () => Promise<void>]> = [
 	["isRetryableOpenRouterError matches network/429/5xx/no-allowed-providers shapes", testIsRetryableOpenRouterErrorMatchesTransientShapes],
+	["isRetryableOpenRouterError rejects deterministic broker admission, fencing and deadline 429s", testIsRetryableOpenRouterErrorRejectsDeterministicBroker429s],
 	["isRetryableOpenRouterError rejects deterministic 4xx and non-OpenRouterError values", testIsRetryableOpenRouterErrorRejectsDeterministicFailures],
 	["legacy deepseek/* models remain pinned to the official DeepSeek provider", testDeepseekModelsArePinnedToOfficialProvider],
 	["the pin applies to any deepseek/* model, not just one id", testDeepseekReasonerAlsoPinned],
