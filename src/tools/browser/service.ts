@@ -29,7 +29,8 @@
  *   hang the session.
  */
 
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright"
+import { chromium, type Browser, type BrowserContext, type BrowserServer, type Page } from "playwright"
+import type { ChildProcess } from "node:child_process"
 
 /** Cap on the number of console/network entries returned per call. */
 export const MAX_BROWSER_EVENT_ENTRIES = 200
@@ -75,6 +76,8 @@ export interface NavigationEntry {
  */
 export class BrowserSession {
 	private browser: Browser | null = null
+	private server: BrowserServer | null = null
+	private serverProcess: ChildProcess | null = null
 	private context: BrowserContext | null = null
 	private page: Page | null = null
 	private consoleEntries: ConsoleEntry[] = []
@@ -111,12 +114,47 @@ export class BrowserSession {
 	async launch(url: string): Promise<void> {
 		// Fresh browser: reset the closed flag (close()/dispose() set it, and a
 		// re-launch must be able to open a new page).
+		await this.close()
 		this.pageClosed = false
-		this.browser = await chromium.launch({ headless: true })
-		this.context = await this.browser.newContext()
-		this.page = await this.context.newPage()
-		this.attachListeners()
-		await this.goto(url)
+		let server: BrowserServer | null = null
+		let browser: Browser | null = null
+		try {
+			server = await chromium.launchServer({ headless: true, host: "127.0.0.1" })
+			browser = await chromium.connect(server.wsEndpoint())
+			this.server = server
+			this.browser = browser
+			const proc = server.process()
+			this.serverProcess = proc ?? null
+			if (proc) {
+				registerBrowserProcess(proc)
+				server.on("close", () => unregisterBrowserProcess(proc))
+			}
+			this.context = await this.browser.newContext()
+			this.page = await this.context.newPage()
+			this.attachListeners()
+			await this.goto(url)
+		} catch (error) {
+			if (browser !== null) {
+				try { await browser.close() } catch { /* best-effort */ }
+			}
+			if (server !== null) {
+				try { await server.close() } catch { /* best-effort */ }
+				try { server.kill() } catch { /* best-effort */ }
+			}
+			this.browser = null
+			this.server = null
+			const proc = this.serverProcess
+			this.serverProcess = null
+			this.context = null
+			this.page = null
+			if (proc) {
+				unregisterBrowserProcess(proc)
+				if (proc.exitCode === null && proc.signalCode === null) {
+					try { proc.kill("SIGKILL") } catch { /* already gone */ }
+				}
+			}
+			throw error
+		}
 	}
 
 	/** Navigate to `url` and wait for the page to load (default 30s). */
@@ -237,17 +275,22 @@ export class BrowserSession {
 	}
 
 	/**
-	 * Hard-close the browser (the model's explicit cleanup). Playwright's
-	 * browser.close() kills the child processes; any residual process-group
-	 * member is killed too (see killBrowserProcessGroup). Idempotent.
+	 * Hard-close the browser (the model's explicit cleanup). Graceful
+	 * browser/server close runs under a short timeout, then only this
+	 * session's own server process is force-killed. Idempotent; never
+	 * touches other sessions' processes.
 	 *
 	 * browser.close() can itself hang if the browser process is wedged, so it
 	 * runs under a short timeout — teardown must never block the session
-	 * (killBrowserProcessGroup() is the guaranteed kill after it).
+	 * (the owned-server kill below is the guaranteed kill after it).
 	 */
 	async close(): Promise<void> {
 		const browser = this.browser
+		const server = this.server
+		const proc = this.serverProcess
 		this.browser = null
+		this.server = null
+		this.serverProcess = null
 		this.context = null
 		this.page = null
 		this.pageClosed = true
@@ -255,30 +298,56 @@ export class BrowserSession {
 		this.networkErrors = []
 		this.navigations = []
 		if (browser !== null) {
-			let timer: NodeJS.Timeout | undefined
-			const timeout = new Promise<never>((_, reject) => {
-				timer = setTimeout(() => reject(new Error("browser.close() timed out — forcing process kill")), 5_000)
-			})
 			try {
-				await Promise.race([browser.close(), timeout])
+				await BrowserSession.closeWithTimeout(() => browser.close(), 5_000)
 			} catch {
-				// Browser already gone, or close hung — the process-group kill
-				// (dispose) is the backstop; close() alone is best-effort.
-			} finally {
-				clearTimeout(timer)
+				// Browser already gone, or close hung — the owned-server
+				// teardown below is the backstop; this stays best-effort.
+			}
+		}
+		if (server !== null) {
+			try {
+				await BrowserSession.closeWithTimeout(() => server.close(), 5_000)
+			} catch {
+				// Owned server did not shut down gracefully — force it below.
+			}
+			try {
+				server.kill()
+			} catch {
+				// Already gone — nothing to clean up.
+			}
+		}
+		if (proc !== null) {
+			unregisterBrowserProcess(proc)
+			if (proc.exitCode === null && proc.signalCode === null) {
+				try {
+					proc.kill("SIGKILL")
+				} catch {
+					// Already gone — nothing to clean up.
+				}
 			}
 		}
 	}
 
+	private static async closeWithTimeout(task: () => Promise<void>, ms: number): Promise<void> {
+		let timer: NodeJS.Timeout | undefined
+		const timeout = new Promise<never>((_, reject) => {
+			timer = setTimeout(() => reject(new Error("browser teardown timed out — forcing process kill")), ms)
+		})
+		try {
+			await Promise.race([task(), timeout])
+		} finally {
+			clearTimeout(timer)
+		}
+	}
+
 	/**
-	 * Session-end teardown: close the browser AND hard-kill the Chromium
-	 * process group (the executable is spawned as a detached group leader —
-	 * see killBrowserProcessGroup), so nothing survives the session. This is
-	 * the mirror of ToolExecutor.dispose()'s background-command reaping.
+	 * Session-end teardown: close the connected browser and its owning
+	 * server, force-killing only this session's own Chromium process so
+	 * nothing it owns survives the session. Never sweeps other sessions.
 	 */
 	async dispose(): Promise<void> {
 		await this.close()
-		killBrowserProcessGroup()
 	}
 
 	/** Run `fn` against the live page, rejecting cleanly when none is open. */
@@ -347,60 +416,78 @@ export class BrowserSession {
 
 /**
  * Chromium PIDs spawned by this module, tracked so session teardown can
- * hard-kill the whole process group (negative pid) even if the browser
- * process itself already exited. This mirrors the execute_command background
- * child registry (see src/tools/executor.ts) — the one place this module
- * deliberately reaches outside the BrowserSession abstraction, because the
- * browser's own close() must never be the ONLY cleanup path.
+ * sweep only still-live handles this harness registered, so an exited
+ * handle can never resolve to a recycled pid owned by someone else. This
+ * mirrors the execute_command background child registry (see
+ * src/tools/executor.ts) — the one place this module deliberately reaches
+ * outside the BrowserSession abstraction, because the browser's own close()
+ * must never be the ONLY cleanup path.
  */
-const browserProcessPids = new Set<number>()
+const browserProcesses = new Set<ChildProcess>()
 
-/** Record a spawned Chromium process for group-kill cleanup (see above). */
-export function trackBrowserProcess(pid: number): void {
-	browserProcessPids.add(pid)
+/** Register this harness's own live Chromium handle for exit-time sweep. */
+function registerBrowserProcess(proc: ChildProcess): void {
+	browserProcesses.add(proc)
 }
 
-/** Unregister a Chromium pid that exited on its own. */
-export function untrackBrowserProcess(pid: number): void {
-	browserProcessPids.delete(pid)
+/** Unregister a Chromium handle that exited or was torn down by its owner. */
+function unregisterBrowserProcess(proc: ChildProcess): void {
+	browserProcesses.delete(proc)
 }
 
 /**
- * SIGKILL every tracked Chromium process group. Detached groups are killed
- * with `process.kill(-pid)` so grandchildren (renderer/GPU/network processes)
- * are reaped too, falling back to the direct pid where group signals are
- * unsupported — exactly the dispose() pattern in src/tools/executor.ts.
+ * @deprecated No longer used — owner-scoped teardown (BrowserSession.close)
+ * kills only its own server process. Kept as a no-op for compatibility.
  */
-export function killBrowserProcessGroup(): void {
-	for (const pid of browserProcessPids) {
-		try {
-			process.kill(-pid, "SIGKILL")
-		} catch {
-			try {
-				process.kill(pid, "SIGKILL")
-			} catch {
-				// Already gone — nothing to clean up.
-			}
-		}
-	}
-	browserProcessPids.clear()
+export function trackBrowserProcess(_pid: number): void {
 }
 
-// ─── Module-level idempotent hook: register the process-group kill ───────────
+/**
+ * @deprecated No longer used — owner-scoped teardown unregisters its own
+ * live ChildProcess handle. Kept as a no-op for compatibility.
+ */
+export function untrackBrowserProcess(_pid: number): void {
+}
+
+/**
+ * @deprecated No longer used — close()/dispose() tear down only the owning
+ * session's server process, and the exit hook sweeps only live registered
+ * handles. Kept as a no-op for compatibility.
+ */
+export function killBrowserProcessGroup(): void {
+}
+
+/** SIGKILL every still-live registered Chromium handle owned by this harness. */
+function killLiveBrowserProcesses(): void {
+	for (const proc of browserProcesses) {
+		try {
+			if (proc.exitCode === null && proc.signalCode === null) {
+				proc.kill("SIGKILL")
+			}
+		} catch {
+			// Already gone — nothing to clean up.
+		}
+	}
+	browserProcesses.clear()
+}
+
+// ─── Module-level idempotent hook: sweep only this harness's live handles ───
 
 let disposeHookInstalled = false
 
 /**
- * Idempotently register `killBrowserProcessGroup` as a process exit hook so
+ * Idempotently register `killLiveBrowserProcesses` as a process exit hook so
  * the browser never outlives the harness process, even when a session is torn
  * down by a path that skips ToolExecutor.dispose() (e.g. process.exit during
- * startup). The per-session dispose() path above is the primary cleanup; this
- * is a belt-and-suspenders guarantee.
+ * startup). Only still-live handles registered by this harness are swept —
+ * handles carry liveness (exitCode/signalCode), so no stale bare pid can be
+ * reused to signal an unrelated process. The per-session dispose() path above
+ * is the primary cleanup; this is a belt-and-suspenders guarantee.
  */
 export function installBrowserDisposeHook(): void {
 	if (disposeHookInstalled) {
 		return
 	}
 	disposeHookInstalled = true
-	process.on("exit", killBrowserProcessGroup)
+	process.on("exit", killLiveBrowserProcesses)
 }
