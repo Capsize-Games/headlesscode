@@ -11,6 +11,29 @@ selection. Full visible-test output is content-addressed in the object store;
 PostgreSQL keeps bounded previews and artifact references. Hidden evaluation
 remains disabled.
 
+## Candidate guest isolation check
+
+RSI evaluation workers receive a one-commit sanitized snapshot at `/workspace`
+and a separate writable `/result` export directory. The RSI evaluation profile
+does not add project-data, shared-data, checkpoint, memory, or arbitrary
+read-only mounts. Its network policy is empty. Candidate mutation and
+evaluation processes run in separate disposable guests; candidate mutation
+snapshots omit RSI policy, evaluator and scoring files, tests, and operator
+data. Evaluation guests receive only the configured visible evaluation inputs
+and fixed verifier files needed for that evaluation. The coordinator keeps the
+archive, host worktree, process-control state, evaluator configuration, and
+scoring logic on the host. A candidate can change its own snapshot and its
+Git metadata; returned changes are checked before host import.
+
+Run `npm run rsi:security-canary` from the repository root to qualify these
+mount and snapshot boundaries against the selected OpenShell gateway and the
+verified RSI image. The command creates a disposable synthetic repository,
+starts an evaluation guest without model inference, attempts reads and writes
+against synthetic host, control, evaluator, scoring, archive, and Git metadata
+canaries, checks the intended workspace write, and records the result under
+`.headlesscode/scratch/`. A pass is specific to the gateway and image used for
+that run; mocked provider tests are not a substitute for this guest check.
+
 ## Earlier bounded runs (historical)
 
 Before the fail-closed mutation runner was added, RSI ran bounded local Qwen
