@@ -14,8 +14,88 @@ import { mutationSnapshotProtectedPathViolations } from "./sandbox.js"
 import type { EmergencyControl } from "../control/emergency-controller.js"
 import { EmergencyControl as EmergencyControlRuntime } from "../control/emergency-controller.js"
 import { OpenShellSessionProvider } from "../cloud/openshell-provider.js"
+import { DEFAULT_RSI_ARTIFACT_LIMIT } from "./artifact-store.js"
 
 const EVALUATION_PREVIEW_CHARS = 2048
+const MUTATION_FAILURE_ARTIFACT_MAX_BYTES = DEFAULT_RSI_ARTIFACT_LIMIT
+const MUTATION_FAILURE_PREVIEW_CHARS = 2048
+
+function diagnosticTailPreview(value: string): { text: string; truncated: boolean } {
+	if (value.length <= MUTATION_FAILURE_PREVIEW_CHARS) return { text: value, truncated: false }
+	return {
+		text: `[earlier output omitted; showing final ${MUTATION_FAILURE_PREVIEW_CHARS} characters]\n${value.slice(-MUTATION_FAILURE_PREVIEW_CHARS)}`,
+		truncated: true,
+	}
+}
+
+function jsonStringByteLength(value: string): number {
+	let bytes = 2 // surrounding quotes
+	for (let index = 0; index < value.length; index += 1) {
+		const code = value.charCodeAt(index)
+		if (code === 0x22 || code === 0x5c) bytes += 2
+		else if (code <= 0x1f) bytes += code === 0x08 || code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d ? 2 : 6
+		else if (code >= 0xd800 && code <= 0xdbff) {
+			const next = value.charCodeAt(index + 1)
+			if (next >= 0xdc00 && next <= 0xdfff) { bytes += 4; index += 1 }
+			else bytes += 6
+		} else if (code >= 0xdc00 && code <= 0xdfff) bytes += 6
+		else if (code <= 0x7f) bytes += 1
+		else if (code <= 0x7ff) bytes += 2
+		else bytes += 3
+	}
+	return bytes
+}
+
+function mutationFailureArtifact(trial: TrialResult): Buffer {
+	const result = {
+		ok: trial.ok,
+		command: "",
+		exitCode: trial.exitCode,
+		durationMs: trial.durationMs,
+		...(trial.timedOut !== undefined ? { timedOut: trial.timedOut } : {}),
+		...(trial.outputArtifactSha256 !== undefined ? { outputArtifactSha256: trial.outputArtifactSha256 } : {}),
+		...(trial.outputArtifactBytes !== undefined ? { outputArtifactBytes: trial.outputArtifactBytes } : {}),
+		stdout: "",
+		stderr: "",
+	}
+	const emptyOutputBytes = Buffer.byteLength(JSON.stringify({ schemaVersion: 1, result }))
+	const serializedBytes = emptyOutputBytes - 6 + jsonStringByteLength(trial.command) + jsonStringByteLength(trial.stdout) + jsonStringByteLength(trial.stderr)
+	if (serializedBytes > MUTATION_FAILURE_ARTIFACT_MAX_BYTES) throw new Error(`failed OpenShell mutation output exceeds the ${MUTATION_FAILURE_ARTIFACT_MAX_BYTES} byte artifact limit`)
+	const bytes = Buffer.from(JSON.stringify({ schemaVersion: 1, result: { ...result, command: trial.command, stdout: trial.stdout, stderr: trial.stderr } }))
+	if (bytes.byteLength > MUTATION_FAILURE_ARTIFACT_MAX_BYTES) throw new Error(`failed OpenShell mutation output exceeds the ${MUTATION_FAILURE_ARTIFACT_MAX_BYTES} byte artifact limit`)
+	return bytes
+}
+
+/** Persist a bounded failed guest result and return its content-addressed identity. */
+export async function externalizeMutationFailureOutput(
+	queue: PostgresRsiJobQueue,
+	trial: TrialResult,
+	failureResult: Record<string, unknown> = {},
+): Promise<Record<string, unknown>> {
+	const bytes = mutationFailureArtifact(trial)
+	const artifact = await queue.putArtifact(bytes)
+	const stdoutPreview = diagnosticTailPreview(trial.stdout)
+	const stderrPreview = diagnosticTailPreview(trial.stderr)
+	return {
+		...failureResult,
+		mutationResult: {
+			ok: trial.ok,
+			command: trial.command.slice(0, 512),
+			exitCode: trial.exitCode,
+			durationMs: trial.durationMs,
+			...(trial.timedOut !== undefined ? { timedOut: trial.timedOut } : {}),
+			stdout: stdoutPreview.text,
+			stderr: stderrPreview.text,
+			stdoutPreviewTruncated: stdoutPreview.truncated,
+			stderrPreviewTruncated: stderrPreview.truncated,
+			stdoutTruncated: stdoutPreview.truncated,
+			stderrTruncated: stderrPreview.truncated,
+			outputArtifactSha256: artifact.sha256,
+			outputArtifactBytes: artifact.byteLength,
+		},
+		failureOutputArtifact: { sha256: artifact.sha256, bytes: artifact.byteLength },
+	}
+}
 
 export async function externalizeEvaluationOutputs(
 	queue: PostgresRsiJobQueue,
@@ -231,7 +311,18 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions, sig
 				}
 				await broker?.close().catch(() => undefined)
 			}
-			if (!mutation.ok) throw new Error(mutation.error ?? mutation.result?.stderr ?? "OpenShell mutation failed")
+			if (!mutation.ok) {
+				const diagnostic = mutation.error ?? mutation.result?.stderr ?? "OpenShell mutation failed"
+				if (mutation.result) {
+					try {
+						failureResult = await externalizeMutationFailureOutput(options.queue, mutation.result, failureResult)
+					} catch (error) {
+						const persistenceError = error instanceof Error ? error.message : String(error)
+						throw new Error(`${diagnostic}\nFailed to persist full OpenShell mutation output: ${persistenceError}`)
+					}
+				}
+				throw new Error(diagnostic)
+			}
 			if (payload.workerHarness && (!mutation.workerHarnessExecution
 				|| mutation.workerHarnessExecution.mode !== payload.workerHarness.mode
 				|| mutation.workerHarnessExecution.parentCommit !== payload.workerHarness.parentCommit

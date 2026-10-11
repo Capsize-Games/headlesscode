@@ -768,6 +768,14 @@ export class PostgresRsiJobQueue {
 	}
 
 	async fail(lease: FleetJobLease, error: string, failureResult?: Record<string, unknown>): Promise<boolean> {
+		const outputArtifact = failureResult?.failureOutputArtifact
+		if (outputArtifact !== undefined) {
+			if (!outputArtifact || typeof outputArtifact !== "object" || Array.isArray(outputArtifact)) throw new Error("fleet failure output artifact reference is malformed")
+			const reference = outputArtifact as { sha256?: unknown; bytes?: unknown }
+			if (typeof reference.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(reference.sha256) || !Number.isSafeInteger(reference.bytes) || Number(reference.bytes) < 0) throw new Error("fleet failure output artifact digest or length is malformed")
+			const bytes = await this.getArtifact(reference.sha256)
+			if (createHash("sha256").update(bytes).digest("hex") !== reference.sha256 || bytes.byteLength !== reference.bytes) throw new Error("fleet failure output artifact bytes do not match its declared digest and length")
+		}
 		const failureJson = failureResult === undefined ? null : JSON.stringify(failureResult)
 		const result = await this.pool.query(
 			`UPDATE headlesscode_rsi_jobs SET status=CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'queued' END, error=$4,result=$6::jsonb,

@@ -13,7 +13,7 @@ import { createOpenShellHiddenCaseRunner } from "../hidden-openshell-runner.js"
 import { verifyHiddenFunctions } from "../hidden-verifier.js"
 import type { HiddenFunctionSuite } from "../hidden-verifier.js"
 
-async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker-failure" | "snapshot-mismatch" | "protected-package" | "fixture-escape" | "self-hosted-missing-cli" | "self-hosted-corrupt-cli" | "dependency-escape"): Promise<void> {
+async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker-failure" | "long-worker-failure" | "snapshot-mismatch" | "protected-package" | "fixture-escape" | "self-hosted-missing-cli" | "self-hosted-corrupt-cli" | "dependency-escape"): Promise<void> {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-openshell-"))
 	const worktree = path.join(repo, ".worktrees", "rsi", `candidate-${mode}`)
 	const originalPath = process.env.PATH
@@ -184,6 +184,7 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 					}
 					assert.equal(command.split(" && exec ").length - 1, 1, "the benchmark coding worker command must execute exactly once after preflight")
 					if (mode === "worker-failure") return { exitCode: 1, output: "model process failed" }
+					if (mode === "long-worker-failure") return { exitCode: 1, output: `${"routine progress\n".repeat(400)}FINAL_MUTATION_FAILURE_REASON` }
 					if (mode === "source") {
 						fs.writeFileSync(path.join(guestPath, "src", "engine", "loop.ts"), "export const value = 2\n")
 					} else if (mode === "escape") {
@@ -257,6 +258,14 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 			assert.equal(workerInvocations, 1)
 			return
 		}
+		if (mode === "long-worker-failure") {
+			const result = await runOpenShellMutation(candidate, config, providerFactory)
+			assert.equal(result.ok, false)
+			assert.match(result.error ?? "", /earlier output omitted; showing final/)
+			assert.match(result.error ?? "", /FINAL_MUTATION_FAILURE_REASON/, "the bounded failure summary keeps the diagnostic tail")
+			assert.equal(result.result?.exitCode, 1)
+			return
+		}
 		const imageRef = mode === "source" ? `sha256:${"a".repeat(64)}` : undefined
 		const result = await runOpenShellMutation(candidate, config, providerFactory, imageRef)
 		assert.equal(factoryOptions?.includeProjectData, false)
@@ -287,6 +296,7 @@ await run("escape")
 await run("symlink")
 await run("preflight")
 await run("worker-failure")
+await run("long-worker-failure")
 await run("snapshot-mismatch")
 await run("protected-package")
 await run("fixture-escape")
