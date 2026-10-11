@@ -222,6 +222,24 @@ if [ -z "$WT_PATH" ] || [ ! -d "$WT_PATH" ]; then
     exit 2
 fi
 
+# HeadlessCode job completion evidence is written outside the worker tree and
+# is bound to this launch attempt and worktree. Worktree markers remain useful
+# for local diagnostics, but the watcher never treats them as authority.
+JOB_ATTEMPT="${HEADLESSCODE_JOB_ATTEMPT:-}"
+JOB_RECEIPT_DIR="${HEADLESSCODE_JOB_RECEIPT_DIR:-}"
+JOB_GROUP=""
+if [ -n "${HEADLESSCODE_JOB_ATTEMPT:-}" ] || [ -n "${HEADLESSCODE_JOB_RECEIPT_DIR:-}" ]; then
+    if [[ ! "${HEADLESSCODE_JOB_ATTEMPT:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || [ -z "${HEADLESSCODE_JOB_RECEIPT_DIR:-}" ]; then
+        echo "run-worker: invalid headlesscode-job receipt configuration" >&2
+        exit 2
+    fi
+    JOB_GROUP="$(basename "$WT_PATH")"
+    if [[ ! "$JOB_GROUP" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+        echo "run-worker: invalid headlesscode-job worktree name" >&2
+        exit 2
+    fi
+fi
+
 # ── Task: file vs inline text ───────────────────────────────────────────────
 # Resolution order for a task that looks like a file: absolute path, then
 # relative to the worktree, then relative to the harness repo.
@@ -387,10 +405,45 @@ printf '\n===== headlesscode run start: %s =====\n' "$(date -u +%Y-%m-%dT%H:%M:%
 SETSID_OK=0
 if command -v setsid >/dev/null 2>&1; then
     SETSID_OK=1
-    WRAPPER="printf '%s' \"\$\$\" > '$WT_PATH/.harness.pgid'
-$WRAPPER"
 else
     echo "run-worker: warning: setsid not found — worker will share the caller's process group; stopping it can only kill the wrapper PID (issue #20)" >&2
+fi
+if [ "$SETSID_OK" -eq 1 ] && [ -z "$JOB_ATTEMPT" ]; then
+    WRAPPER="printf '%s' \"\$\$\" > '$WT_PATH/.harness.pgid'
+$WRAPPER"
+fi
+
+if [ -n "$JOB_ATTEMPT" ]; then
+    if [ "$(uname -s)" != "Linux" ] || [ "$SETSID_OK" -ne 1 ] || ! command -v node >/dev/null 2>&1; then
+        echo "run-worker: headlesscode-job requires Linux, setsid, and Node.js process identity checks" >&2
+        exit 2
+    fi
+    WRAPPER="printf '%s' \"\$\$\" > '$WT_PATH/.harness.pgid'
+read -r _ <&3 || exit 125
+$WRAPPER"
+    WRAPPER_PATH="$JOB_RECEIPT_DIR/$JOB_GROUP.wrapper.$$.sh"
+    umask 077
+    printf '%s' "$WRAPPER" > "$WRAPPER_PATH"
+    chmod 600 "$WRAPPER_PATH"
+    nohup setsid node "$HARNESS_ROOT/scripts/supervise-job-worker.mjs" \
+        "$WT_PATH" "$JOB_RECEIPT_DIR" "$JOB_ATTEMPT" "$JOB_GROUP" "$WRAPPER_PATH" \
+        >>"$WT_PATH/harness.log" 2>&1 </dev/null &
+    SUPERVISOR_PID=$!
+    printf '%s' "$SUPERVISOR_PID" > "$WT_PATH/.harness.supervisor.pid"
+    WORKER_PID=""
+    for _ in $(seq 1 100); do
+        if [ -s "$WT_PATH/.harness.pid" ]; then
+            WORKER_PID="$(cat "$WT_PATH/.harness.pid")"
+            break
+        fi
+        sleep 0.01
+    done
+    if [[ ! "$WORKER_PID" =~ ^[1-9][0-9]{0,9}$ ]]; then
+        echo "run-worker: detached supervisor did not capture worker identity" >&2
+        exit 2
+    fi
+    printf '%s' "$WORKER_PID"
+    exit 0
 fi
 
 if [ "$SETSID_OK" -eq 1 ]; then

@@ -28,7 +28,7 @@
  */
 
 import { spawnSync } from "node:child_process"
-import { createHash } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import * as fs from "node:fs"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
@@ -70,6 +70,8 @@ export interface SpawnBatch {
 	repoRoot: string
 	/** Batch id (watcher-<date>). */
 	batch: string
+	/** Random dispatch identity for headlesscode-job supervisor receipts. */
+	jobAttempt?: string
 	executor: AgentExecutor
 	museModel?: string
 }
@@ -593,6 +595,7 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 			// ── Write-ahead: durable "spawned" entry BEFORE the spawn ──
 			const batch = batchId()
 			const spawnedAt = new Date().toISOString()
+			const jobAttempt = isHeadlessCodeJob ? randomUUID() : undefined
 			const entry: WatcherIssueEntry = {
 				number: issue.number,
 				title: issue.title,
@@ -603,6 +606,7 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 				status: "spawned",
 				updatedAt: spawnedAt,
 				...(isHeadlessCodeJob ? { jobContract: true } : {}),
+				...(jobAttempt ? { jobAttempt } : {}),
 				...(parsedJob?.submission ? { submittedBy: parsedJob.submission.submittedBy } : {}),
 				...(input.qa ? { qa: true } : {}),
 				...(input.deploy ? { deploy: true } : {}),
@@ -612,6 +616,18 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 			}
 			state = markProcessed(state, entry)
 			await saveWatcherState(statePath, state)
+			if (jobAttempt) {
+				try {
+					const dir = jobReceiptDirectory(repoRoot, jobAttempt)
+					fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+					fs.chmodSync(dir, 0o700)
+				} catch (error) {
+					state = markProcessed(state, { ...entry, status: "failed", error: `could not prepare private supervisor receipt directory: ${safeError(error)}` })
+					await saveWatcherState(statePath, state)
+					failures++
+					continue
+				}
+			}
 
 			if (ownedClaim && input.claimStore) {
 				try {
@@ -625,7 +641,7 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 				}
 			}
 
-			const batchInfo = { issue: dispatchIssue, specs, repoRoot, batch, ...selection }
+			const batchInfo = { issue: dispatchIssue, specs, repoRoot, batch, ...(jobAttempt ? { jobAttempt } : {}), ...selection }
 			let result: SpawnResult
 			try {
 				result = await spawn(batchInfo)
@@ -790,7 +806,7 @@ async function reconcileHeadlessCodeJobs(input: JobReconcileInput): Promise<{ st
 				const marker = jobFailureMarker(entry)
 				const comments = await requireComments(input.gh, input.owner, input.repo, entry.number)
 				if (!comments.some((body) => body.includes(marker))) {
-					const completion = readJobCompletion(input.repoRoot, entry.groups ?? [])
+					const completion = readJobCompletion(input.repoRoot, entry.groups ?? [], entry.jobAttempt)
 					const summary = completion.terminal
 						? completion.exitCodes.map((code, index) => `${entry.groups?.[index]?.name ?? `worker-${index + 1}`}: exit ${code}`).join("; ")
 						: safeError(entry.error ?? "job did not start")
@@ -805,7 +821,7 @@ async function reconcileHeadlessCodeJobs(input: JobReconcileInput): Promise<{ st
 			continue
 		}
 		if (entry.status !== "spawned") continue
-		const completion = readJobCompletion(input.repoRoot, entry.groups ?? [])
+		const completion = readJobCompletion(input.repoRoot, entry.groups ?? [], entry.jobAttempt)
 		if (!completion.terminal) {
 			const issue = currentIssues.get(entry.number)
 			const lifecycleOutOfSync = !!issue && (!issue.labels.includes("headlesscode:running") || JOB_LIFECYCLE_LABELS.some((label) => label !== "headlesscode:running" && issue.labels.includes(label)))
@@ -928,8 +944,8 @@ interface JobCompletion {
 	logs: string[]
 }
 
-function readJobCompletion(repoRoot: string, groups: readonly WorktreeSpec[]): JobCompletion {
-	if (groups.length === 0 || groups.length > 16) return { terminal: false, exitCodes: [], logs: [] }
+function readJobCompletion(repoRoot: string, groups: readonly WorktreeSpec[], attemptId?: string): JobCompletion {
+	if (!attemptId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(attemptId) || groups.length === 0 || groups.length > 16) return { terminal: false, exitCodes: [], logs: [] }
 	const exitCodes: number[] = []
 	const logs: string[] = []
 	for (const group of groups) {
@@ -938,20 +954,99 @@ function readJobCompletion(repoRoot: string, groups: readonly WorktreeSpec[]): J
 		try {
 			const rootStat = fs.lstatSync(path.join(repoRoot, ".worktrees"))
 			const worktreeStat = fs.lstatSync(worktree)
-			const doneStat = fs.lstatSync(path.join(worktree, ".harness.done"))
-			if (rootStat.isSymbolicLink() || !rootStat.isDirectory() || worktreeStat.isSymbolicLink() || !worktreeStat.isDirectory() || doneStat.isSymbolicLink() || !doneStat.isDirectory()) return { terminal: false, exitCodes: [], logs: [] }
+			if (rootStat.isSymbolicLink() || !rootStat.isDirectory() || worktreeStat.isSymbolicLink() || !worktreeStat.isDirectory()) return { terminal: false, exitCodes: [], logs: [] }
 		} catch {
 			return { terminal: false, exitCodes: [], logs: [] }
 		}
-		const rawExit = readSmallRegularFile(path.join(worktree, ".harness.exit"), 32)
-		if (rawExit === undefined || !/^(?:0|[1-9][0-9]{0,2})\n?$/.test(rawExit)) return { terminal: false, exitCodes: [], logs: [] }
-		const exitCode = Number(rawExit.trim())
-		if (exitCode > 255) return { terminal: false, exitCodes: [], logs: [] }
+		// Worktree markers are useful diagnostics only. Terminal status requires
+		// an attempt-bound receipt written outside the worker-controlled tree and
+		// proof that its recorded process group is no longer executing.
+		const receiptDir = jobReceiptDirectory(repoRoot, attemptId)
+		try {
+			const parent = fs.lstatSync(path.dirname(receiptDir))
+			const receipts = fs.lstatSync(receiptDir)
+			if (parent.isSymbolicLink() || !parent.isDirectory() || receipts.isSymbolicLink() || !receipts.isDirectory() || (receipts.mode & 0o077) !== 0) return { terminal: false, exitCodes: [], logs: [] }
+		} catch { return { terminal: false, exitCodes: [], logs: [] } }
+		const identity = readJobReceipt(`${receiptDir}/${group.name}.launch`)
+		const completion = readJobReceipt(`${receiptDir}/${group.name}.complete`)
+		if (!validWorkerIdentity(identity, attemptId, group.name) || !validWorkerCompletion(completion, attemptId, group.name)) return { terminal: false, exitCodes: [], logs: [] }
+		if (completion.pid !== identity.pid || completion.pgid !== identity.pgid || completion.startTicks !== identity.startTicks) return { terminal: false, exitCodes: [], logs: [] }
+		if (workerGroupLiveness(identity) !== "absent") return { terminal: false, exitCodes: [], logs: [] }
+		const exitCode = completion.exitCode
 		exitCodes.push(exitCode)
 		logs.push(readBoundedLogTail(path.join(worktree, "harness.log")))
 	}
 	return { terminal: true, exitCodes, logs }
 }
+
+interface WorkerLaunchReceipt { version: 1; attemptId: string; group: string; pid: number; pgid: number; startTicks: string }
+interface WorkerCompletionReceipt extends WorkerLaunchReceipt { exitCode: number }
+
+function jobReceiptDirectory(repoRoot: string, attemptId: string): string {
+	return path.join(repoRoot, ".worktrees", ".headlesscode-job-runs", attemptId)
+}
+
+function readJobReceipt(filePath: string): unknown {
+	try {
+		const stat = fs.lstatSync(filePath)
+		if (stat.isSymbolicLink() || !stat.isFile() || (typeof process.getuid === "function" && stat.uid !== process.getuid())) return undefined
+	} catch { return undefined }
+	const raw = readSmallRegularFile(filePath, 2048)
+	if (!raw) return undefined
+	try { return JSON.parse(raw) as unknown } catch { return undefined }
+}
+
+function validWorkerIdentity(value: unknown, attemptId: string, group: string): value is WorkerLaunchReceipt {
+	if (!value || typeof value !== "object") return false
+	const receipt = value as Partial<WorkerLaunchReceipt>
+	return receipt.version === 1 && receipt.attemptId === attemptId && receipt.group === group &&
+		Number.isSafeInteger(receipt.pid) && Number(receipt.pid) > 1 && receipt.pgid === receipt.pid &&
+		typeof receipt.startTicks === "string" && /^[0-9]{1,24}$/.test(receipt.startTicks)
+}
+
+function validWorkerCompletion(value: unknown, attemptId: string, group: string): value is WorkerCompletionReceipt {
+	if (!value || typeof value !== "object") return false
+	const receipt = value as Partial<WorkerCompletionReceipt>
+	return receipt.version === 1 && receipt.attemptId === attemptId && receipt.group === group &&
+		Number.isSafeInteger(receipt.pid) && Number(receipt.pid) > 1 && receipt.pgid === receipt.pid &&
+		typeof receipt.startTicks === "string" && /^[0-9]{1,24}$/.test(receipt.startTicks) &&
+		Number.isInteger(receipt.exitCode) && Number(receipt.exitCode) >= 0 && Number(receipt.exitCode) <= 255
+}
+
+type WorkerLiveness = "active" | "absent" | "unknown"
+
+function parseProcStat(raw: string): { state: string; pgrp: number; session: number; startTicks: string } | undefined {
+	const close = raw.lastIndexOf(")")
+	if (close < 0) return undefined
+	const fields = raw.slice(close + 1).trim().split(/\s+/)
+	const pgrp = Number(fields[2])
+	const session = Number(fields[3])
+	const startTicks = fields[19]
+	if (!fields[0] || !Number.isSafeInteger(pgrp) || !Number.isSafeInteger(session) || !startTicks || !/^\d+$/.test(startTicks)) return undefined
+	return { state: fields[0], pgrp, session, startTicks }
+}
+
+function workerGroupLiveness(identity: WorkerLaunchReceipt): WorkerLiveness {
+	if (process.platform !== "linux") return "unknown"
+	let names: string[]
+	try { names = fs.readdirSync("/proc") } catch { return "unknown" }
+	let found = false
+	for (const name of names) {
+		if (!/^\d+$/.test(name)) continue
+		let stat: { state: string; pgrp: number; session: number; startTicks: string } | undefined
+		try { stat = parseProcStat(fs.readFileSync(`/proc/${name}/stat`, "utf8")) }
+		catch (error) {
+			const code = (error as NodeJS.ErrnoException).code
+			if (code !== "ENOENT" && code !== "ESRCH") return "unknown"
+			continue
+		}
+		if (!stat) return "unknown"
+		if (Number(name) === identity.pid && stat.startTicks !== identity.startTicks) return "unknown" // PID reuse makes the old group identity unverifiable.
+		if (stat.pgrp === identity.pgid && stat.session === identity.pgid && stat.state !== "Z" && stat.state !== "X") found = true
+	}
+	return found ? "active" : "absent"
+}
+
 
 function readSmallRegularFile(filePath: string, maxBytes: number): string | undefined {
 	let fd: number | undefined
@@ -1318,6 +1413,10 @@ export function buildWorkerSpawnEnvironment(
 		HEADLESSCODE_AGENT_EXECUTOR: batch.executor,
 		HEADLESSCODE_NATIVE_MUSE_MODEL: batch.museModel ?? "",
 		HEADLESSCODE_PROJECT: path.basename(batch.repoRoot),
+		...(batch.jobAttempt ? {
+			HEADLESSCODE_JOB_ATTEMPT: batch.jobAttempt,
+			HEADLESSCODE_JOB_RECEIPT_DIR: jobReceiptDirectory(batch.repoRoot, batch.jobAttempt),
+		} : {}),
 		...(config.memoryDir ? { HEADLESSCODE_MEMORY_DIR: path.resolve(config.memoryDir) } : {}),
 	}
 }
