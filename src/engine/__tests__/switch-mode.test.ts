@@ -608,6 +608,11 @@ async function testToolSetUnchangedSkipsPromptRebuild(): Promise<void> {
 			extensionManageCall && findToolResult(session.state.messages, extensionManageCall.id),
 			"extension handler should remain executable after the switch",
 		)
+		assert.deepEqual(
+			JSON.parse(findToolResult(session.state.messages, extensionManageCall!.id)!.content ?? "null"),
+			{ extensions: [] },
+			"extension list succeeds after the writable mode switch",
+		)
 		assert.equal(
 			snapshots[1],
 			snapshots[0],
