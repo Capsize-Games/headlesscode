@@ -503,6 +503,7 @@ test("runner replays a saved benchmark file through settlement after a crash and
 		const task = loaded.manifest.tasks.find((entry) => entry.id === "multi-01")!
 		const cell = { armId: "fixed", generation: 0, candidateId: "g0-candidate-0:child", taskId: task.id, seed: String(task.seed), attemptKind }
 		const frozen = manifest(`campaign-${randomUUID()}`, [cell])
+		frozen.model = { provider: "openshell-openrouter", id: RSI_OPENROUTER_MODEL, settings: {} }
 		frozen.budgets.attempt = { maxCalls: task.ceilings.maxCalls, maxTokens: 100, maxSpendUsd: 0.1, maxDurationMs: task.ceilings.timeoutMs }
 		frozen.budgets.root = { maxCalls: 100, maxTokens: 10_000, maxSpendUsd: 1, maxRuntimeMs: 60_000 }
 		const lease = await campaign.acquire(frozen, "fixed", "run-fixed", "coordinator-1")
@@ -511,7 +512,7 @@ test("runner replays a saved benchmark file through settlement after a crash and
 		let agentRuns = 0
 		let simulateCrash = true
 		const harnessCommit = "e".repeat(40)
-		const modelId = "deepseek/deepseek-chat"
+		const modelId = RSI_OPENROUTER_MODEL
 		const sampling: Record<string, number | string | boolean> = { temperature: 0, think: false, seed: "provider-default" }
 		const agent: BenchmarkAgent = {
 			provider: "openshell-openrouter",
