@@ -1,0 +1,1 @@
+{"description":"Live node sum check","entrypoint":"index.js","id":"extensions-live-node","inputSchema":{"properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"],"type":"object"},"kind":"tool","schemaVersion":1}
