@@ -155,6 +155,8 @@ export interface FleetJob {
 	error?: string
 	createdAt: string
 	updatedAt: string
+	cancelRequestedAt?: string
+	cancelReason?: string
 }
 
 export interface FleetJobLease { job: FleetJob; token: string; workerId: string }
@@ -234,9 +236,24 @@ function rowToJob(row: Record<string, unknown>): FleetJob {
 		...(row.lease_expires_at ? { leaseExpiresAt: new Date(String(row.lease_expires_at)).toISOString() } : {}),
 		...(row.result !== null && row.result !== undefined ? { result: row.result } : {}),
 		...(typeof row.error === "string" ? { error: row.error } : {}),
+		...(row.cancel_requested_at ? { cancelRequestedAt: new Date(String(row.cancel_requested_at)).toISOString() } : {}),
+		...(typeof row.cancel_reason === "string" ? { cancelReason: row.cancel_reason } : {}),
 		createdAt: new Date(String(row.created_at)).toISOString(),
 		updatedAt: new Date(String(row.updated_at)).toISOString(),
 	}
+}
+
+function completionResultWithFailureHistory(resultValue: unknown, previousResult: unknown): unknown {
+	const prior = previousResult && typeof previousResult === "object" && !Array.isArray(previousResult)
+		? (previousResult as Record<string, unknown>).failureHistory
+		: undefined
+	const failureHistory = Array.isArray(prior) ? prior : []
+	const result = resultValue && typeof resultValue === "object" && !Array.isArray(resultValue)
+		? { ...(resultValue as Record<string, unknown>) }
+		: failureHistory.length > 0 ? { value: resultValue } : resultValue
+	if (!result || typeof result !== "object" || Array.isArray(result)) return result
+	delete (result as Record<string, unknown>).failureHistory
+	return failureHistory.length > 0 ? { ...(result as Record<string, unknown>), failureHistory } : result
 }
 
 /** Worst-case synchronous OpenShell CLI budget, including setup and teardown. */
@@ -670,8 +687,6 @@ export class PostgresRsiJobQueue {
 	}
 
 	async complete(lease: FleetJobLease, resultValue: unknown): Promise<QueueMutationResult> {
-		const resultJson = JSON.stringify(resultValue)
-		const resultDigest = sha256Text(stableJson(resultValue))
 		const resultArtifactRefs: Record<string, RsiArtifactReference> = {}
 		const resultObject = resultValue && typeof resultValue === "object" ? resultValue as Record<string, unknown> : {}
 		const declaredArtifacts: Array<{ key: string; sha256: unknown; bytes?: unknown }> = []
@@ -723,7 +738,10 @@ export class PostgresRsiJobQueue {
 			}
 			const currentResult = await client.query("SELECT * FROM headlesscode_rsi_jobs WHERE job_id=$1 AND queue_name=$2 FOR UPDATE", [lease.job.jobId, this.policy.queueName])
 			const current = currentResult.rows[0]
-			if (current?.status === "completed" && stableJson(current.result) === stableJson(resultValue)) return { accepted: true, duplicate: true, job: rowToJob(current) }
+			const completionValue = completionResultWithFailureHistory(resultValue, current?.result)
+			const resultJson = JSON.stringify(completionValue)
+			const resultDigest = sha256Text(stableJson(completionValue))
+			if (current?.status === "completed" && stableJson(current.result) === stableJson(completionValue)) return { accepted: true, duplicate: true, job: rowToJob(current) }
 			if (!current || stableJson(current.payload?.proofCampaign) !== stableJson(binding) || current.status !== "leased" || current.lease_owner !== lease.workerId || current.lease_token !== lease.token || new Date(String(current.lease_expires_at)).getTime() <= Date.now()) return { accepted: false, duplicate: false, ...(current ? { job: rowToJob(current) } : {}) }
 			if (binding) {
 				const attempts = proofAttemptRows
