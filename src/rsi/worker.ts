@@ -137,7 +137,7 @@ export interface RsiWorkerOptions {
 	runEvaluation?: typeof runOpenShellEvaluation
 	runModelJob?: typeof runOpenShellModelJob
 	createInferenceBroker?: typeof startOpenRouterBroker
-	emergencyControl?: Pick<EmergencyControl, "identity" | "stateDirectoryPath" | "signal" | "state" | "assertRunning" | "waitUntilRunning" | "registerCleanup" | "registerResource" | "releaseResource">
+	emergencyControl?: Pick<EmergencyControl, "identity" | "stateDirectoryPath" | "signal" | "state" | "snapshot" | "assertRunning" | "waitUntilRunning" | "registerCleanup" | "registerResource" | "releaseResource">
 }
 
 function parsePositiveInteger(value: string | undefined, fallback: number, name: string): number {
@@ -249,7 +249,15 @@ export function verifyWorkerHarnessPayload(payload: FleetJobPayload, root: strin
 	if (actualTreeDigest !== identity.snapshotTreeDigest) throw new Error("fleet worker harness snapshot tree differs from the frozen job identity")
 }
 
-async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions, signal: AbortSignal): Promise<void> {
+interface LeaseTeardownState { guestExecutionStarted: boolean; guestTeardownConfirmed: boolean }
+
+function hasUnconfirmedOpenShellResource(options: RsiWorkerOptions): boolean {
+	if (!options.emergencyControl) return true
+	const control = options.emergencyControl
+	return control.state === "failed-to-stop" || control.snapshot.resources.some((resource) => resource.startsWith("openshell:"))
+}
+
+async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions, signal: AbortSignal, teardown: LeaseTeardownState): Promise<void> {
 	const ensureActive = () => {
 		if (signal.aborted) throw signal.reason ?? new Error("fleet job cancelled")
 		options.emergencyControl?.assertRunning()
@@ -303,9 +311,14 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions, sig
 					broker = await (options.createInferenceBroker ?? startOpenRouterBroker)(brokerOptions)
 				}
 				try {
+					teardown.guestExecutionStarted = true
+					teardown.guestTeardownConfirmed = false
 					mutation = await (options.runMutation ?? runOpenShellMutation)(candidate, config, undefined, undefined, broker, signal, options.emergencyControl)
+					teardown.guestTeardownConfirmed = true
 				} catch (error) {
 					if (!(error instanceof OpenShellMutationPreflightError)) throw error
+					teardown.guestExecutionStarted = false
+					teardown.guestTeardownConfirmed = true
 					mutation = { ok: false, result: error.result, error: error.message }
 				}
 				if (broker) receipt = await broker.receipt()
@@ -346,13 +359,19 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions, sig
 			const artifact = await options.queue.putArtifact(patch)
 			result = { ok: true, provider: payload.provider ?? "ollama", model: payload.model, ...(receipt ? { inferenceReceipt: receipt } : {}), ...(mutation.workerHarnessExecution ? { workerHarnessExecution: mutation.workerHarnessExecution } : {}), patchSha256: artifact.sha256, patchBytes: artifact.byteLength, durationMs: Date.now() - started }
 		} else if (lease.job.jobKind === "evaluation") {
+			teardown.guestExecutionStarted = true
+			teardown.guestTeardownConfirmed = false
 			const evaluation = await (options.runEvaluation ?? runOpenShellEvaluation)(candidate, config, signal, options.emergencyControl)
+			teardown.guestTeardownConfirmed = true
 			const externalized = await externalizeEvaluationOutputs(options.queue, evaluation)
 			result = { ok: true, ...externalized, durationMs: Date.now() - started }
 		} else {
 			const modelTask = payload.modelTask
 			if (!modelTask || (lease.job.jobKind === "training") !== (modelTask.kind === "qlora-train")) throw new Error("fleet model job kind and payload do not match")
+			teardown.guestExecutionStarted = true
+			teardown.guestTeardownConfirmed = false
 			const model = await (options.runModelJob ?? runOpenShellModelJob)(candidate, config, modelTask, undefined, signal, options.emergencyControl)
+			teardown.guestTeardownConfirmed = true
 			const outputArtifact = await options.queue.putArtifact(Buffer.from(JSON.stringify(model.result)))
 			const modelResult: Record<string, unknown> = { ...model.result, outputArtifactSha256: outputArtifact.sha256, outputArtifactBytes: outputArtifact.byteLength }
 			if (lease.job.jobKind === "training" && model.result.status === "completed") {
@@ -367,7 +386,18 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions, sig
 		const completion = await options.queue.complete(lease, result)
 		if (!completion.accepted) throw new Error("OpenShell result was fenced because this worker no longer owns the lease")
 	} catch (error) {
-		if (!signal.aborted) await options.queue.fail(lease, error instanceof Error ? error.message : String(error), failureResult)
+		if (teardown.guestExecutionStarted && !teardown.guestTeardownConfirmed && !hasUnconfirmedOpenShellResource(options)) teardown.guestTeardownConfirmed = true
+		if (teardown.guestExecutionStarted && !teardown.guestTeardownConfirmed) {
+			const reason = `OpenShell teardown was not confirmed after worker failure: ${error instanceof Error ? error.message : String(error)}`
+			while (true) {
+				await options.queue.cancel(lease.job.jobId, reason).catch(() => false)
+				try {
+					const current = await options.queue.getJob(lease.job.jobId)
+					if (!current || current.cancelRequestedAt || current.status === "cancelled" || current.status === "completed" || current.status === "failed") break
+				} catch { /* Keep heartbeating while retrying the durable cancellation fence. */ }
+				await delay(500)
+			}
+		} else if (!signal.aborted) await options.queue.fail(lease, error instanceof Error ? error.message : String(error), failureResult)
 	} finally {
 		await fs.rm(root, { recursive: true, force: true })
 	}
@@ -407,17 +437,25 @@ export async function runRsiWorker(options: RsiWorkerOptions): Promise<void> {
 		const jobResource = `rsi-job:${lease.job.jobId}`
 		let unregisterCleanup: (() => void) | undefined
 		try {
-			unregisterCleanup = options.emergencyControl?.registerCleanup(`rsi-job-${lease.job.jobId}`, async () => {
+			unregisterCleanup = options.emergencyControl?.registerCleanup(`rsi-job-${lease.job.jobId}`, async ({ graceMs }) => {
 			const cancelled = await options.queue.cancel(lease.job.jobId, "supervisor emergency stop")
 			if (!cancelled) {
 				const record = await options.queue.getJob(lease.job.jobId)
-				if (record?.status !== "cancelled") throw new Error("active RSI job could not be cancelled in the queue")
+				if (!record || !["cancelled", "completed", "failed"].includes(record.status)) throw new Error("active RSI job could not be cancelled in the queue")
 			}
 			leaseController.abort(new Error("supervisor emergency stop"))
+			const deadline = Date.now() + graceMs
+			while (Date.now() < deadline) {
+				const record = await options.queue.getJob(lease.job.jobId)
+				if (record && ["cancelled", "completed", "failed"].includes(record.status)) return
+				await delay(50)
+			}
+			throw new Error("active RSI job teardown was not acknowledged before the emergency-control grace period")
 		}, jobResource)
 			await options.emergencyControl?.registerResource(jobResource)
 		} catch (error) {
-			await options.queue.cancel(lease.job.jobId, "worker stopped before lease execution").catch(() => false)
+			const cancelled = await options.queue.cancel(lease.job.jobId, "worker stopped before lease execution").catch(() => false)
+			if (cancelled) await options.queue.acknowledgeCancellation(lease).catch(() => false)
 			unregisterCleanup?.()
 			leaseController.abort(error instanceof Error ? error : new Error(String(error)))
 			continue
@@ -426,10 +464,21 @@ export async function runRsiWorker(options: RsiWorkerOptions): Promise<void> {
 			void options.queue.heartbeat(lease).then((valid) => { if (!valid) leaseController.abort(new Error("RSI lease was cancelled or fenced")) }).catch(() => leaseController.abort(new Error("RSI lease heartbeat failed")))
 			void options.queue.heartbeatWorker(options.workerId).catch(() => false)
 		}, Math.max(1000, Math.min(5000, Math.floor(options.queue.policy.leaseMs / 3))))
-		try { await executeLease(lease, options, leaseSignal) } finally {
+		const teardown: LeaseTeardownState = { guestExecutionStarted: false, guestTeardownConfirmed: true }
+		try { await executeLease(lease, options, leaseSignal, teardown) }
+		catch (error) {
+			if (!leaseSignal.aborted) await options.queue.fail(lease, error instanceof Error ? error.message : String(error)).catch(() => false)
+		}
+		finally {
 			clearInterval(heartbeat)
-			const current = await options.queue.getJob(lease.job.jobId).catch(() => undefined)
-			if (current && ["completed", "failed", "cancelled"].includes(current.status)) {
+			let current = await options.queue.getJob(lease.job.jobId).catch(() => undefined)
+			if (!teardown.guestTeardownConfirmed) throw new Error("RSI worker is exiting with unconfirmed guest teardown; any persisted cancellation keeps capacity reserved")
+			if (current?.cancelRequestedAt) {
+				const acknowledged = await options.queue.acknowledgeCancellation(lease)
+				current = await options.queue.getJob(lease.job.jobId).catch(() => current)
+				if (!acknowledged && current?.status !== "cancelled") throw new Error("cancelled RSI job remains capacity-reserved because worker teardown acknowledgment failed")
+			}
+			if (teardown.guestTeardownConfirmed) {
 				unregisterCleanup?.()
 				await options.emergencyControl?.releaseResource(jobResource)
 			}
@@ -461,7 +510,8 @@ export async function rsiWorkerMain(env: NodeJS.ProcessEnv = process.env): Promi
 	})
 	if (emergencyControl.state === "failed-to-stop" && emergencyControl.snapshot.resources.length > 0) {
 		const recoveryProvider = new OpenShellSessionProvider({ emergencyControl })
-		for (const resource of emergencyControl.snapshot.resources) {
+		const recoveryResources = [...emergencyControl.snapshot.resources]
+		for (const resource of recoveryResources) {
 			if (resource.startsWith("openshell:")) {
 				const sandbox = resource.slice("openshell:".length)
 				emergencyControl.registerCleanup(`recover-${sandbox}`, async () => { await recoveryProvider.stopSandbox(sandbox) }, resource)
@@ -473,10 +523,20 @@ export async function rsiWorkerMain(env: NodeJS.ProcessEnv = process.env): Promi
 					if (!cancelled && record?.status !== "cancelled" && record?.status !== "failed" && record?.status !== "completed") {
 						throw new Error("stale RSI job could not be fenced during restart recovery")
 					}
-				}, resource)
+				})
 			}
 		}
 		await emergencyControl.command("stop", "restart recovery")
+		for (const resource of recoveryResources) {
+			if (!resource.startsWith("rsi-job:")) continue
+			const job = await queue.getJob(resource.slice("rsi-job:".length))
+			if (job?.status === "leased" && job.cancelRequestedAt && job.leaseOwner && job.leaseToken) {
+				if (!await queue.acknowledgeCancellation({ job, workerId: job.leaseOwner, token: job.leaseToken })) throw new Error(`restart recovery could not acknowledge cancellation for ${job.jobId}`)
+			}
+			const recoveredJob = await queue.getJob(resource.slice("rsi-job:".length))
+			if (!recoveredJob || !["cancelled", "completed", "failed"].includes(recoveredJob.status)) throw new Error(`restart recovery left RSI job ${resource.slice("rsi-job:".length)} without verified terminal cleanup`)
+			await emergencyControl.releaseResource(resource)
+		}
 	}
 	const controller = new AbortController()
 	let stopPromise: Promise<unknown> | undefined

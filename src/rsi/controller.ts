@@ -599,16 +599,29 @@ async function buildEvaluatorIntegrityInput(args: {
 	}
 }
 
-async function waitForFleetJob(queue: PostgresRsiJobQueue, jobId: string, timeoutMs: number): Promise<FleetJob> {
-	const deadline = Date.now() + timeoutMs
-	while (Date.now() < deadline) {
+async function waitForFleetJob(queue: PostgresRsiJobQueue, jobId: string, timeoutMs: number, runtimeDeadlineMs?: number): Promise<FleetJob> {
+	const deadline = Math.min(Date.now() + timeoutMs, runtimeDeadlineMs ?? Number.POSITIVE_INFINITY)
+	for (;;) {
 		const job = await queue.getJob(jobId)
 		if (!job) throw new Error(`fleet job ${jobId} disappeared`)
 		if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") return job
+		if (Date.now() >= deadline) break
 		await delay(500)
 	}
-	await queue.cancel(jobId, "coordinator wait timeout")
-	throw new Error(`fleet job ${jobId} exceeded coordinator timeout`)
+	const reason = runtimeDeadlineMs !== undefined && Date.now() >= runtimeDeadlineMs ? "RSI run runtime ceiling" : "coordinator wait timeout"
+	await queue.cancel(jobId, reason)
+	const teardownDeadline = Date.now() + 60_000
+	while (Date.now() < teardownDeadline) {
+		const job = await queue.getJob(jobId)
+		if (!job) throw new Error(`fleet job ${jobId} disappeared during cancellation`)
+		if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") return job
+		await delay(200)
+	}
+	throw new Error(`fleet job ${jobId} exceeded ${reason}; cancellation is pending worker teardown and its lease remains capacity-reserved`)
+}
+
+function fleetRuntimeDeadlineMs(config: RsiConfig, run: RsiRunRecord): number | undefined {
+	return config.maxRuntimeMs === undefined ? undefined : Date.parse(run.startedAt) + config.maxRuntimeMs
 }
 
 function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: { content: Buffer; snapshotCommit: string; snapshotTreeDigest?: string }, options: { campaignId?: string; boundedInference?: boolean; includeWorkerHarness?: boolean; proofCampaign?: FleetJobPayload["proofCampaign"]; remainingCampaignMs?: number } = {}): FleetJobPayload {
@@ -800,7 +813,7 @@ async function validateCurriculumOnFleet(
 			})
 		}
 		if (!fleetJobMatches(job, expected)) return { ok: false, exitCode: null, failure: "idempotent curriculum replay key refers to a stale or mismatched fleet job payload" }
-		const completed = await waitForFleetJob(queue, job.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, 1) + 60_000)
+		const completed = await waitForFleetJob(queue, job.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, 1) + 60_000, fleetRuntimeDeadlineMs(config, run))
 		if (completed.status !== "completed" || !completed.result || typeof completed.result !== "object") return { ok: false, exitCode: null, failure: completed.error ?? `OpenShell curriculum replay ended ${completed.status}` }
 		try {
 			const evaluation = fleetEvaluationResult(completed.result)
@@ -881,7 +894,7 @@ async function runAdversarialStage(
 		let job = await queue.getJobByIdempotencyKey(idempotencyKey)
 		if (!job) job = await queue.enqueue({ ...expected, payload })
 		if (!fleetJobMatches(job, expected)) throw new Error("existing adversarial evaluation idempotency key has mismatched test artifact or execution payload")
-		const completed = await waitForFleetJob(queue, job.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, 1) + 60_000)
+		const completed = await waitForFleetJob(queue, job.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, 1) + 60_000, fleetRuntimeDeadlineMs(config, run))
 		if (completed.status !== "completed" || !completed.result || typeof completed.result !== "object") throw new Error(completed.error ?? "OpenShell adversarial tests ended " + completed.status)
 		const result = fleetEvaluationResult(completed.result)
 		const trial = result.visible[0]
@@ -930,6 +943,7 @@ async function evaluateBaselineFleet(
 	queue: PostgresRsiJobQueue,
 	runId: string,
 	hidden?: (root: string, jobId: string) => HiddenEvaluationOptions | undefined,
+	runtimeDeadlineMs?: number,
 ): Promise<NonNullable<RsiRunRecord["baselineEvaluation"]>> {
 	const idempotencyKey = `${runId}:baseline:evaluation`
 	const snapshot = createEvaluationSnapshotBundle(config.repoRoot, baseCommit, config)
@@ -960,7 +974,7 @@ async function evaluateBaselineFleet(
 	const job = existing ?? await queue.enqueue(expected)
 	if (!fleetJobMatches(job, expected)) throw new Error("existing baseline evaluation idempotency key has mismatched execution identity or payload")
 
-	const completed = await waitForFleetJob(queue, job.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, config.evalCommands.length + 2) + 60_000)
+	const completed = await waitForFleetJob(queue, job.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, config.evalCommands.length + 2) + 60_000, runtimeDeadlineMs)
 	if (completed.status !== "completed" || !completed.result || typeof completed.result !== "object") throw new Error(completed.error ?? `fleet baseline evaluation ended ${completed.status}`)
 	const evaluation = fleetEvaluationResult(completed.result)
 	const trials = [evaluation.regression, evaluation.typecheck, ...evaluation.visible]
@@ -1313,8 +1327,8 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		return run
 	}
 	if (!config.dryRun && !run.baselineEvaluation) {
-		run.baselineEvaluation = fleetQueue
-			? await evaluateBaselineFleet(runConfig, baseCommit, fleetQueue, run.runId, hiddenEvaluationFor)
+			run.baselineEvaluation = fleetQueue
+				? await evaluateBaselineFleet(runConfig, baseCommit, fleetQueue, run.runId, hiddenEvaluationFor, fleetRuntimeDeadlineMs(runConfig, run))
 			: await evaluateBaselineLocal(runConfig, baseCommit, commandRunner, hiddenEvaluationFor)
 		run.baselineFitness = computeFitness(run.baselineEvaluation)
 		run.baseline = run.baselineEvaluation.regression
@@ -1516,7 +1530,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 					if (fleetQueue) {
 						const submitted = mutationJobs.get(candidate.id)
 						if (!submitted) throw new Error("candidate mutation was not admitted to the RSI fleet queue")
-						const completed = await waitForFleetJob(fleetQueue, submitted.jobId, config.commandTimeoutMs * 4 + 180_000)
+						const completed = await waitForFleetJob(fleetQueue, submitted.jobId, config.commandTimeoutMs * 4 + 180_000, fleetRuntimeDeadlineMs(config, run))
 						if (completed.status !== "completed" || !completed.result || typeof completed.result !== "object") {
 							recordFleetInferenceDenials(candidate, completed.result, submitted.payload, completed.jobId)
 							throw new Error(completed.error ?? `fleet mutation ended ${completed.status}`)
@@ -1624,7 +1638,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 				if (fleetQueue) {
 					const submitted = evaluationJobs.get(candidate.id) ?? await fleetQueue.getJobByIdempotencyKey(`${run.runId}:${candidate.id}:evaluation`)
 					if (!submitted) throw new Error("candidate evaluation was not admitted to the RSI fleet queue")
-					const completed = await waitForFleetJob(fleetQueue, submitted.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, config.evalCommands.length + 2) + 60_000)
+					const completed = await waitForFleetJob(fleetQueue, submitted.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, config.evalCommands.length + 2) + 60_000, fleetRuntimeDeadlineMs(config, run))
 					if (completed.status !== "completed" || !completed.result || typeof completed.result !== "object") throw new Error(completed.error ?? `fleet evaluation ended ${completed.status}`)
 					const visible = fleetEvaluationResult(completed.result)
 					const trials = [visible.regression, visible.typecheck, ...visible.visible]

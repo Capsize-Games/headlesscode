@@ -18,6 +18,7 @@ const MIGRATIONS = [
 	{ version: 8, sql: readFileSync(new URL("./migrations/008_openrouter_returned_provider.sql", import.meta.url), "utf8") },
 	{ version: 9, sql: readFileSync(new URL("./migrations/009_openrouter_cached_prompt_tokens.sql", import.meta.url), "utf8") },
 	{ version: 10, sql: readFileSync(new URL("./migrations/010_openrouter_endpoint_price_snapshot.sql", import.meta.url), "utf8") },
+	{ version: 11, sql: readFileSync(new URL("./migrations/011_fleet_cancellation_requests.sql", import.meta.url), "utf8") },
 ]
 
 function sha256Text(value: string): string { return createHash("sha256").update(value).digest("hex") }
@@ -431,7 +432,7 @@ export class PostgresRsiJobQueue {
 
 			await client.query(
 				`WITH expired AS (
-				 SELECT job_id FROM headlesscode_rsi_jobs WHERE queue_name=$1 AND status='leased' AND lease_expires_at <= clock_timestamp()
+				 SELECT job_id FROM headlesscode_rsi_jobs WHERE queue_name=$1 AND status='leased' AND cancel_requested_at IS NULL AND lease_expires_at <= clock_timestamp()
 				 ORDER BY lease_expires_at LIMIT 100 FOR UPDATE SKIP LOCKED
 				)
 				UPDATE headlesscode_rsi_jobs AS jobs SET status=CASE WHEN jobs.attempts >= jobs.max_attempts THEN 'failed' ELSE 'queued' END,
@@ -442,7 +443,7 @@ export class PostgresRsiJobQueue {
 			const capacities = await client.query(
 				`SELECT count(*)::int AS total,
 				 count(*) FILTER (WHERE lease_owner=$1)::int AS worker_total
-				 FROM headlesscode_rsi_jobs WHERE queue_name=$2 AND status='leased' AND lease_expires_at > clock_timestamp()`,
+				 FROM headlesscode_rsi_jobs WHERE queue_name=$2 AND status='leased' AND (lease_expires_at > clock_timestamp() OR cancel_requested_at IS NOT NULL)`,
 				[workerId, this.policy.queueName],
 			)
 			const active = capacities.rows[0]
@@ -454,9 +455,9 @@ export class PostgresRsiJobQueue {
 				 WHERE job.queue_name=$1 AND job.status='queued' AND job.available_at <= clock_timestamp()
 				 AND job.resource_class = ANY($2::text[])
 				 AND (COALESCE((policy.class_capacity->>job.resource_class)::int, policy.max_in_flight) >
-					(SELECT count(*) FROM headlesscode_rsi_jobs AS active WHERE active.queue_name=$1 AND active.status='leased' AND active.lease_expires_at > clock_timestamp() AND active.resource_class=job.resource_class))
+					(SELECT count(*) FROM headlesscode_rsi_jobs AS active WHERE active.queue_name=$1 AND active.status='leased' AND (active.lease_expires_at > clock_timestamp() OR active.cancel_requested_at IS NOT NULL) AND active.resource_class=job.resource_class))
 				 AND (job.concurrency_key IS NULL OR COALESCE((policy.key_capacity->>job.concurrency_key)::int, policy.max_in_flight) >
-					(SELECT count(*) FROM headlesscode_rsi_jobs AS active WHERE active.queue_name=$1 AND active.status='leased' AND active.lease_expires_at > clock_timestamp() AND active.concurrency_key=job.concurrency_key))
+					(SELECT count(*) FROM headlesscode_rsi_jobs AS active WHERE active.queue_name=$1 AND active.status='leased' AND (active.lease_expires_at > clock_timestamp() OR active.cancel_requested_at IS NOT NULL) AND active.concurrency_key=job.concurrency_key))
 				 ORDER BY job.created_at, job.job_id LIMIT 1 FOR UPDATE OF job SKIP LOCKED`,
 				[this.policy.queueName, allowedClasses],
 			)
@@ -476,7 +477,7 @@ export class PostgresRsiJobQueue {
 	async heartbeat(lease: FleetJobLease): Promise<boolean> {
 		const result = await this.pool.query(
 			`UPDATE headlesscode_rsi_jobs SET lease_expires_at=clock_timestamp()+(lease_duration_ms::text || ' milliseconds')::interval, updated_at=clock_timestamp()
-			 WHERE job_id=$1 AND queue_name=$4 AND lease_owner=$2 AND lease_token=$3 AND status='leased' AND lease_expires_at > clock_timestamp()`,
+			 WHERE job_id=$1 AND queue_name=$4 AND lease_owner=$2 AND lease_token=$3 AND status='leased' AND cancel_requested_at IS NULL AND lease_expires_at > clock_timestamp()`,
 			[lease.job.jobId, lease.workerId, lease.token, this.policy.queueName],
 		)
 		return result.rowCount === 1
@@ -491,7 +492,7 @@ export class PostgresRsiJobQueue {
 		const capabilityHash = sha256Text(grant.capability)
 		const leaseHash = sha256Text(grant.leaseToken)
 		return inTransaction(this.pool, async (client) => {
-			const leased = await client.query("SELECT 1 FROM headlesscode_rsi_jobs WHERE job_id=$1 AND queue_name=$2 AND status='leased' AND lease_token=$3 AND lease_expires_at > clock_timestamp()", [grant.jobId, this.policy.queueName, grant.leaseToken])
+			const leased = await client.query("SELECT 1 FROM headlesscode_rsi_jobs WHERE job_id=$1 AND queue_name=$2 AND status='leased' AND cancel_requested_at IS NULL AND lease_token=$3 AND lease_expires_at > clock_timestamp()", [grant.jobId, this.policy.queueName, grant.leaseToken])
 			if (leased.rowCount !== 1) throw new Error("OpenRouter broker grant is stale or fenced")
 			await client.query(
 				`INSERT INTO headlesscode_rsi_inference_campaigns(campaign_id,provider,model,max_spend_microusd)
@@ -501,7 +502,7 @@ export class PostgresRsiJobQueue {
 			const campaign = await client.query("SELECT provider,model,max_spend_microusd,blocked FROM headlesscode_rsi_inference_campaigns WHERE campaign_id=$1 FOR UPDATE", [grant.limits.campaignId])
 			const campaignRow = campaign.rows[0]
 			if (!campaignRow || campaignRow.provider !== "openrouter" || campaignRow.model !== grant.model || Number(campaignRow.max_spend_microusd) !== campaignMicros || campaignRow.blocked) throw new Error("OpenRouter campaign already exists with a different model, cap or blocked status")
-			const leaseLock = await client.query("SELECT 1 FROM headlesscode_rsi_jobs WHERE job_id=$1 AND queue_name=$2 AND status='leased' AND lease_token=$3 AND lease_expires_at > clock_timestamp() FOR UPDATE", [grant.jobId, this.policy.queueName, grant.leaseToken])
+			const leaseLock = await client.query("SELECT 1 FROM headlesscode_rsi_jobs WHERE job_id=$1 AND queue_name=$2 AND status='leased' AND cancel_requested_at IS NULL AND lease_token=$3 AND lease_expires_at > clock_timestamp() FOR UPDATE", [grant.jobId, this.policy.queueName, grant.leaseToken])
 			if (leaseLock.rowCount !== 1) throw new Error("OpenRouter broker grant is stale or fenced")
 			const limitsJson = JSON.stringify(grant.limits)
 			await client.query(
@@ -742,7 +743,7 @@ export class PostgresRsiJobQueue {
 			const resultJson = JSON.stringify(completionValue)
 			const resultDigest = sha256Text(stableJson(completionValue))
 			if (current?.status === "completed" && stableJson(current.result) === stableJson(completionValue)) return { accepted: true, duplicate: true, job: rowToJob(current) }
-			if (!current || stableJson(current.payload?.proofCampaign) !== stableJson(binding) || current.status !== "leased" || current.lease_owner !== lease.workerId || current.lease_token !== lease.token || new Date(String(current.lease_expires_at)).getTime() <= Date.now()) return { accepted: false, duplicate: false, ...(current ? { job: rowToJob(current) } : {}) }
+			if (!current || stableJson(current.payload?.proofCampaign) !== stableJson(binding) || current.status !== "leased" || current.cancel_requested_at || current.lease_owner !== lease.workerId || current.lease_token !== lease.token || new Date(String(current.lease_expires_at)).getTime() <= Date.now()) return { accepted: false, duplicate: false, ...(current ? { job: rowToJob(current) } : {}) }
 			if (binding) {
 				const attempts = proofAttemptRows
 				if (attempts.some((attempt) => attempt.status !== "dispatched" || attempt.job_id !== current.job_id)) throw new Error("proof campaign attempts do not reference the current fenced queue job")
@@ -777,7 +778,7 @@ export class PostgresRsiJobQueue {
 			const updated = await client.query(
 				`UPDATE headlesscode_rsi_jobs SET status='completed', result=$4::jsonb, completed_at=clock_timestamp(), updated_at=clock_timestamp(),
 				 lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL
-				 WHERE job_id=$1 AND queue_name=$5 AND lease_owner=$2 AND lease_token=$3 AND status='leased' AND lease_expires_at > clock_timestamp() RETURNING *`,
+				 WHERE job_id=$1 AND queue_name=$5 AND lease_owner=$2 AND lease_token=$3 AND status='leased' AND cancel_requested_at IS NULL AND lease_expires_at > clock_timestamp() RETURNING *`,
 				[lease.job.jobId, lease.workerId, lease.token, resultJson, this.policy.queueName],
 			)
 			if (updated.rowCount === 1) return { accepted: true, duplicate: false, job: rowToJob(updated.rows[0]) }
@@ -797,7 +798,7 @@ export class PostgresRsiJobQueue {
 		return inTransaction(this.pool, async (client) => {
 			const current = await client.query(
 				`SELECT attempts,error,result FROM headlesscode_rsi_jobs
-				 WHERE job_id=$1 AND queue_name=$4 AND lease_owner=$2 AND lease_token=$3 AND status='leased' AND lease_expires_at > clock_timestamp()
+				 WHERE job_id=$1 AND queue_name=$4 AND lease_owner=$2 AND lease_token=$3 AND status='leased' AND cancel_requested_at IS NULL AND lease_expires_at > clock_timestamp()
 				 FOR UPDATE`,
 				[lease.job.jobId, lease.workerId, lease.token, this.policy.queueName],
 			)
@@ -819,7 +820,7 @@ export class PostgresRsiJobQueue {
 			const result = await client.query(
 				`UPDATE headlesscode_rsi_jobs SET status=CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'queued' END, error=$4,result=$6::jsonb,
 				 updated_at=clock_timestamp(), lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL
-				 WHERE job_id=$1 AND queue_name=$5 AND lease_owner=$2 AND lease_token=$3 AND status='leased' AND lease_expires_at > clock_timestamp()`,
+				 WHERE job_id=$1 AND queue_name=$5 AND lease_owner=$2 AND lease_token=$3 AND status='leased' AND cancel_requested_at IS NULL AND lease_expires_at > clock_timestamp()`,
 				[lease.job.jobId, lease.workerId, lease.token, error.slice(0, 4000), this.policy.queueName, JSON.stringify(storedResult)],
 			)
 			return result.rowCount === 1
@@ -886,17 +887,37 @@ export class PostgresRsiJobQueue {
 
 	async cancel(jobId: string, reason: string): Promise<boolean> {
 		return inTransaction(this.pool, async (client) => {
-			const result = await client.query(
-				`UPDATE headlesscode_rsi_jobs SET status='cancelled', error=$3, updated_at=clock_timestamp(), lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL
-				 WHERE queue_name=$1 AND job_id=$2 AND status IN ('queued','leased') RETURNING job_id`,
-				[this.policy.queueName, jobId, reason.slice(0, 4000)],
+			const boundedReason = reason.slice(0, 4000)
+			const queued = await client.query(
+				`UPDATE headlesscode_rsi_jobs SET status='cancelled', error=$3, updated_at=clock_timestamp()
+				 WHERE queue_name=$1 AND job_id=$2 AND status='queued' RETURNING job_id`,
+				[this.policy.queueName, jobId, boundedReason],
 			)
-			if (result.rowCount !== 1) return false
+			if (queued.rowCount === 1) {
+				await client.query("UPDATE headlesscode_rsi_inference_jobs SET blocked=true WHERE job_id=$1", [jobId])
+				return true
+			}
+			const leased = await client.query(
+				`UPDATE headlesscode_rsi_jobs SET cancel_requested_at=COALESCE(cancel_requested_at,clock_timestamp()), cancel_reason=COALESCE(cancel_reason,$3), updated_at=clock_timestamp()
+				 WHERE queue_name=$1 AND job_id=$2 AND status='leased' RETURNING job_id`,
+				[this.policy.queueName, jobId, boundedReason],
+			)
+			if (leased.rowCount !== 1) return false
 			// A broker reservation is lease-bound. Blocking it in the same
-			// transaction closes the cancellation-to-worker-poll window.
+			// transaction closes the cancellation-to-worker-poll window. The
+			// lease remains capacity-reserved until the worker confirms teardown.
 			await client.query("UPDATE headlesscode_rsi_inference_jobs SET blocked=true WHERE job_id=$1", [jobId])
 			return true
 		})
+	}
+
+	async acknowledgeCancellation(lease: FleetJobLease): Promise<boolean> {
+		const result = await this.pool.query(
+			`UPDATE headlesscode_rsi_jobs SET status='cancelled', error=cancel_reason, updated_at=clock_timestamp(), lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL
+			 WHERE job_id=$1 AND queue_name=$4 AND lease_owner=$2 AND lease_token=$3 AND status='leased' AND cancel_requested_at IS NOT NULL`,
+			[lease.job.jobId, lease.workerId, lease.token, this.policy.queueName],
+		)
+		return result.rowCount === 1
 	}
 
 	async close(): Promise<void> {
