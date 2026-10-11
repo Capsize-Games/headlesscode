@@ -9,6 +9,7 @@ import type { RsiConfig, RsiRunRecord, WorkerHarnessRuntimeIdentity } from "../t
 import { assertEngineeringTransition, isFullyConfirmedRun, runEngineeringArm, runFrozenCampaignArm } from "../../../scripts/rsi-proof-demonstration.js"
 import type { FrozenProofDemonstrationManifest } from "../proof-demonstration-manifest.js"
 import { proofCampaignManifestDigest, type ProofCampaignManifest } from "../proof-campaign.js"
+import { RSI_OPENROUTER_MODEL } from "../inference-broker.js"
 
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex")
 
@@ -49,10 +50,10 @@ test("engineering replay reuses a finished fixed arm after a crash before self-h
 		const campaign = `rsi-proof-${"a".repeat(20)}`
 		const arm = "fixed-control" as const
 		const runtime: WorkerHarnessRuntimeIdentity = { imageName: "image", imageDigest: `sha256:${"b".repeat(64)}`, harnessCommit: "c".repeat(40), dependencyLockDigest: "d".repeat(64) }
-		const config = { archiveDir: root, model: "model", generations: 2, seed: "engineering-seed" } as RsiConfig
+		const config = { archiveDir: root, model: RSI_OPENROUTER_MODEL, generations: 2, seed: "engineering-seed" } as RsiConfig
 		const finished = {
 			runId: `${campaign}-fixed`, startedAt: "2026-09-30T00:00:00Z", finishedAt: "2026-09-30T00:01:00Z",
-			model: "model", baseRef: "main", baseCommit: "e".repeat(40), generations: 2, candidates: [], reports: [],
+			model: RSI_OPENROUTER_MODEL, baseRef: "main", baseCommit: "e".repeat(40), generations: 2, candidates: [], reports: [],
 			workerHarnessPairId: campaign, workerHarnessMode: arm, workerHarnessSamplingSeed: "engineering-seed", workerHarnessRuntime: runtime,
 			proofCampaign: {
 				manifest: { phaseMode: "engineering-only", schedule: [] }, manifestSha256: "f".repeat(64), campaignId: campaign, armId: arm, epoch: 1,
@@ -78,7 +79,7 @@ test("campaign executor reuses a finished first arm without dispatching it again
 		const campaign = `rsi-proof-${"a".repeat(20)}`
 		const armId = "fixed-control" as const
 		const runtime: WorkerHarnessRuntimeIdentity = { imageName: "image", imageDigest: `sha256:${"b".repeat(64)}`, harnessCommit: "c".repeat(40), dependencyLockDigest: "d".repeat(64) }
-		const config = { archiveDir: root, seed: "campaign-seed", generations: 3, model: "model" } as RsiConfig
+		const config = { archiveDir: root, seed: "campaign-seed", generations: 3, model: RSI_OPENROUTER_MODEL } as RsiConfig
 		const schedule = [
 			{ armId, generation: 2, candidateId: "candidate-2-0", taskId: "holdout", seed: "17", attemptKind: "confirmation" as const, phase: "confirmation" as const },
 			{ armId, generation: 2, candidateId: "root-control", taskId: "holdout", seed: "17", attemptKind: "fixed-control" as const, phase: "confirmation" as const },
@@ -91,14 +92,14 @@ test("campaign executor reuses a finished first arm without dispatching it again
 			schemaVersion: 1, phaseMode: "paired-confirmation", campaignId: campaign, rootCommit: "e".repeat(40),
 			benchmarkDigests: { manifest: "3".repeat(64), development: "4".repeat(64), confirmation: "5".repeat(64) },
 			armAssignment: { fixedControl: "fixed-control", selfHosted: "self-hosted" },
-			model: { provider: "openshell-openrouter", id: "model", settings: { sampling: { temperature: 0 } } }, seed: "campaign-seed", taskOrder: ["holdout"], schedule,
+			model: { provider: "openshell-openrouter", id: RSI_OPENROUTER_MODEL, settings: { sampling: { temperature: 0 } } }, seed: "campaign-seed", taskOrder: ["holdout"], schedule,
 			budgets: { attempt: { maxCalls: 1, maxTokens: 10, maxSpendUsd: 0.1, maxDurationMs: 1000 }, root: { maxCalls: 10, maxTokens: 100, maxSpendUsd: 1, maxRuntimeMs: 10000 } },
 			acceptanceRule: {}, runtime: { imageDigest: runtime.imageDigest, harnessCommit: runtime.harnessCommit, dependencyLockDigest: runtime.dependencyLockDigest }, analysisVersion: "test",
 			settings: { effectiveConfig: config },
 		} as unknown as ProofCampaignManifest
 		const run = {
 			runId: `${campaign}-fixed`, startedAt: "2026-09-30T00:00:00Z", finishedAt: "2026-09-30T00:01:00Z",
-			model: "model", baseRef: "main", baseCommit: "e".repeat(40), generations: 3, candidates: [], reports: [],
+			model: RSI_OPENROUTER_MODEL, baseRef: "main", baseCommit: "e".repeat(40), generations: 3, candidates: [], reports: [],
 			workerHarnessPairId: campaign, workerHarnessMode: armId, workerHarnessSamplingSeed: "campaign-seed", workerHarnessConfigDigest: "f".repeat(64), workerHarnessPlannedGenerations: 3, workerHarnessRuntime: runtime,
 			confirmationEvidence: "complete", confirmationAttempts: attempts,
 			proofConfirmation: { selectedHarness: { candidateId: "candidate-id", slotId: "candidate-2-0", generation: 2, commit: "1".repeat(40), attemptIds: ["final-attempt"] }, rootHarness: { commit: "e".repeat(40), attemptIds: ["root-attempt"] } },
@@ -106,7 +107,7 @@ test("campaign executor reuses a finished first arm without dispatching it again
 		} as unknown as RsiRunRecord
 		assert.equal(isFullyConfirmedRun(run, armId), true)
 		await appendRun(root, run)
-		const plan = { campaignIds: { campaigns: [campaign] }, execution: { configs: [config, config, config, config] }, benchmarkManifestSha256: "3".repeat(64), model: { provider: "openshell-openrouter", requestedId: "model" }, rootCommit: run.baseCommit, runtime } as unknown as FrozenProofDemonstrationManifest
+		const plan = { campaignIds: { campaigns: [campaign] }, execution: { configs: [config, config, config, config] }, benchmarkManifestSha256: "3".repeat(64), model: { provider: "openshell-openrouter", requestedId: RSI_OPENROUTER_MODEL }, rootCommit: run.baseCommit, runtime } as unknown as FrozenProofDemonstrationManifest
 		let calls = 0
 		const reused = await runFrozenCampaignArm(plan, 0, armId, "confirmation", async () => { calls++; throw new Error("finished arm must not replay inference") })
 		assert.equal(reused.runId, run.runId)

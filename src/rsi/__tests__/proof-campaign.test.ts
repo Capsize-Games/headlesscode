@@ -597,7 +597,7 @@ test("runner refuses to redispatch a dispatched benchmark cell when its local at
 		frozen.budgets.root.maxCalls = 100
 		const lease = await campaign.acquire(frozen, "fixed", "run-fixed", "coordinator-1")
 		const harnessCommit = "e".repeat(40)
-		const modelId = "deepseek/deepseek-chat"
+		const modelId = RSI_OPENROUTER_MODEL
 		const sampling: Record<string, number | string | boolean> = { temperature: 0, think: false, seed: "provider-default" }
 		let agentRuns = 0
 		const agent: BenchmarkAgent = { provider: "fake-model", async run() { agentRuns++; throw new Error("must not run") } }
