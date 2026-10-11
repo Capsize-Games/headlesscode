@@ -88,6 +88,20 @@ function delay(ms: number): Promise<void> {
 	return new Promise((r) => setTimeout(r, ms))
 }
 
+async function settleWithDeadline(op: Promise<unknown>, ms: number): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined
+	try {
+		const deadline = new Promise<void>((resolve) => {
+			timer = setTimeout(resolve, ms)
+		})
+		await Promise.race([op, deadline])
+	} finally {
+		if (timer !== undefined) {
+			clearTimeout(timer)
+		}
+	}
+}
+
 function procAlive(proc: ChildProcess | null): boolean {
 	if (proc === null) {
 		return false
@@ -161,21 +175,21 @@ async function teardownOwned(
 		}
 	}
 	try {
-		await Promise.race([Promise.all(graceful), delay(BROWSER_GRACE_CLOSE_MS)])
+		await settleWithDeadline(Promise.all(graceful), BROWSER_GRACE_CLOSE_MS)
 	} catch {
 		// Graceful path is fully observed above; a timeout simply moves to force.
 	}
 	if (server !== null) {
 		try {
-			await Promise.race([
+			await settleWithDeadline(
 				Promise.resolve()
 					.then(() => server.kill())
 					.then(
 						() => undefined,
 						() => undefined,
 					),
-				delay(BROWSER_FORCE_KILL_MS),
-			])
+				BROWSER_FORCE_KILL_MS,
+			)
 		} catch {
 			// server.kill rejection is observed above; force falls back to proc.
 		}
