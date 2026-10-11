@@ -3,7 +3,7 @@ import { execFileSync, spawnSync } from "node:child_process"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { applyFleetMutationPatch, createEvaluationSnapshotBundle, createMutationSnapshotBundle, inspectLocalRsiCheckpoint, networkRules, runOpenShellBenchmarkVerifier, runOpenShellMutation } from "../openshell.js"
+import { applyFleetMutationPatch, createEvaluationSnapshotBundle, createMutationSnapshotBundle, inspectLocalRsiCheckpoint, networkRules, OpenShellMutationPreflightError, runOpenShellBenchmarkVerifier, runOpenShellMutation } from "../openshell.js"
 import type { RsiOpenShellProviderFactory } from "../openshell.js"
 import type { CandidateRecord, RsiConfig } from "../types.js"
 import { parseRsiArgs } from "../config.js"
@@ -13,7 +13,7 @@ import { createOpenShellHiddenCaseRunner } from "../hidden-openshell-runner.js"
 import { verifyHiddenFunctions } from "../hidden-verifier.js"
 import type { HiddenFunctionSuite } from "../hidden-verifier.js"
 
-async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker-failure" | "long-worker-failure" | "snapshot-mismatch" | "protected-package" | "fixture-escape" | "self-hosted-missing-cli" | "self-hosted-corrupt-cli" | "dependency-escape"): Promise<void> {
+async function run(mode: "source" | "escape" | "symlink" | "preflight" | "long-preflight" | "worker-failure" | "long-worker-failure" | "snapshot-mismatch" | "protected-package" | "fixture-escape" | "self-hosted-missing-cli" | "self-hosted-corrupt-cli" | "dependency-escape"): Promise<void> {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-openshell-"))
 	const worktree = path.join(repo, ".worktrees", "rsi", `candidate-${mode}`)
 	const originalPath = process.env.PATH
@@ -107,7 +107,7 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 			// Deliberately incomplete: supervisor-only paths must still be omitted.
 			protectedPaths: [],
 			commandTimeoutMs: 10_000,
-			...(mode === "preflight" ? { benchmarkHarnessCommit: "f".repeat(40) } : {}),
+			...(["preflight", "long-preflight"].includes(mode) ? { benchmarkHarnessCommit: "f".repeat(40) } : {}),
 			...(mode === "snapshot-mismatch" ? { workerHarnessSnapshotTreeDigest: "f".repeat(64) } : {}),
 			...(["self-hosted-missing-cli", "self-hosted-corrupt-cli", "dependency-escape"].includes(mode) ? {
 				workerHarnessMode: "self-hosted" as const,
@@ -182,6 +182,10 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 						assert.match(command, /headlesscode-harness-commit/)
 						return { exitCode: 79, output: "RSI_BENCHMARK_PREFLIGHT_FAILURE wrong harness image commit" }
 					}
+					if (mode === "long-preflight") {
+						assert.match(command, /headlesscode-harness-commit/)
+						return { exitCode: 79, output: `RSI_BENCHMARK_PREFLIGHT_FAILURE ${"preflight progress\n".repeat(400)}FINAL_PREFLIGHT_FAILURE_REASON` }
+					}
 					assert.equal(command.split(" && exec ").length - 1, 1, "the benchmark coding worker command must execute exactly once after preflight")
 					if (mode === "worker-failure") return { exitCode: 1, output: "model process failed" }
 					if (mode === "long-worker-failure") return { exitCode: 1, output: `${"routine progress\n".repeat(400)}FINAL_MUTATION_FAILURE_REASON` }
@@ -210,12 +214,36 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 			}
 		}
 		if (mode === "preflight") {
-			await assert.rejects(runOpenShellMutation(candidate, config, providerFactory), /OpenShell benchmark preflight failed/)
+			await assert.rejects(runOpenShellMutation(candidate, config, providerFactory), (error: unknown) => {
+				assert.ok(error instanceof OpenShellMutationPreflightError)
+				assert.match(error.message, /OpenShell benchmark preflight failed/)
+				assert.equal(error.result.exitCode, 79)
+				assert.match(error.result.stdout, /RSI_BENCHMARK_PREFLIGHT_FAILURE/)
+				return true
+			})
 			assert.equal(fs.readFileSync(path.join(worktree, "src", "engine", "loop.ts"), "utf8"), "export const value = 1\n", "wrong harness image must abort before task code runs")
 			return
 		}
+		if (mode === "long-preflight") {
+			await assert.rejects(runOpenShellMutation(candidate, config, providerFactory), (error: unknown) => {
+				assert.ok(error instanceof OpenShellMutationPreflightError)
+				assert.equal(error.result.exitCode, 79, "preflight failure status remains attached to the error")
+				assert.ok(error.result.stdout.startsWith("RSI_BENCHMARK_PREFLIGHT_FAILURE"), "raw guest output remains available for fleet artifactization")
+				assert.match(error.message, /OpenShell benchmark preflight failed/)
+				assert.match(error.message, /earlier output omitted; showing final/)
+				assert.match(error.message, /FINAL_PREFLIGHT_FAILURE_REASON/, "preflight summary keeps its diagnostic tail")
+				return true
+			})
+			return
+		}
 		if (mode === "self-hosted-missing-cli" || mode === "dependency-escape") {
-			await assert.rejects(runOpenShellMutation(candidate, config, providerFactory), /OpenShell benchmark preflight failed/)
+			await assert.rejects(runOpenShellMutation(candidate, config, providerFactory), (error: unknown) => {
+				assert.ok(error instanceof OpenShellMutationPreflightError)
+				assert.equal(error.result.exitCode, 79, "preflight failures retain the coordinator's exit status")
+				assert.match(error.result.stdout, /RSI_BENCHMARK_PREFLIGHT_FAILURE/, "raw preflight output remains available for artifactization")
+				assert.match(error.message, /OpenShell benchmark preflight failed/)
+				return true
+			})
 			assert.equal(workerInvocations, 1, "one boundary-check command should report the failing preflight")
 			assert.equal(candidateCliInvocations, 0, "the failing preflight must stop before the candidate CLI is executed")
 			assert.equal(fs.readFileSync(path.join(worktree, "src", "cli.ts"), "utf8"), "export const workerCli = true\n")
@@ -295,6 +323,7 @@ await run("source")
 await run("escape")
 await run("symlink")
 await run("preflight")
+await run("long-preflight")
 await run("worker-failure")
 await run("long-worker-failure")
 await run("snapshot-mismatch")

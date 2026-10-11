@@ -6,7 +6,7 @@ import * as path from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
 import { openshellPreflight } from "../cloud/openshell-preflight.js"
 import { PostgresRsiJobQueue, fleetQueuePolicy, requiredFleetJobLeaseMs, type FleetJobLease, type FleetJobPayload } from "./postgres-queue.js"
-import { runOpenShellEvaluation, runOpenShellModelJob, runOpenShellMutation } from "./openshell.js"
+import { OpenShellMutationPreflightError, runOpenShellEvaluation, runOpenShellModelJob, runOpenShellMutation } from "./openshell.js"
 import type { CandidateRecord, ComputePolicy, EvaluationSummary, MutationHypothesis, MutationKind, RsiConfig, RsiRoleConfig, TrialResult } from "./types.js"
 import { startOpenRouterBroker, openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID, type OpenRouterBrokerReceipt, type OpenRouterBrokerOptions } from "./inference-broker.js"
 import { effectiveWorkerHarnessMode, workerHarnessCliPath, validWorkerHarnessRuntimeIdentity } from "./worker-harness.js"
@@ -302,7 +302,12 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions, sig
 					}
 					broker = await (options.createInferenceBroker ?? startOpenRouterBroker)(brokerOptions)
 				}
-				mutation = await (options.runMutation ?? runOpenShellMutation)(candidate, config, undefined, undefined, broker, signal, options.emergencyControl)
+				try {
+					mutation = await (options.runMutation ?? runOpenShellMutation)(candidate, config, undefined, undefined, broker, signal, options.emergencyControl)
+				} catch (error) {
+					if (!(error instanceof OpenShellMutationPreflightError)) throw error
+					mutation = { ok: false, result: error.result, error: error.message }
+				}
 				if (broker) receipt = await broker.receipt()
 			} finally {
 				if (broker && (payload.provider ?? "ollama") === "openrouter") {
