@@ -755,6 +755,8 @@ type ReadFileCacheKey = {
 	limit: number
 	/** Effective indentation-mode max_lines (default 60); undefined in slice mode. */
 	windowLines?: number
+	/** Effective indentation-mode anchor (1-based); undefined in slice mode. */
+	anchor?: number
 }
 
 /** One cache entry: content identity (hash + size + mtime) + streak state. */
@@ -825,8 +827,9 @@ function readFileHandler(
 		const limit = toNonNegativeInt(args.limit, readLimitFromEnv())
 		const indentation = args.indentation as Record<string, unknown> | undefined
 		const windowLines = mode === "indentation" ? toNonNegativeInt(indentation?.["max_lines"], DEFAULT_INDENTATION_WINDOW_LINES) : undefined
+		const anchor = mode === "indentation" ? Math.max(1, toNonNegativeInt(indentation?.["anchor_line"], offset)) : undefined
 
-		const key = makeReadFileCacheKey({ target, mode, offset, limit, windowLines })
+		const key = makeReadFileCacheKey({ target, mode, offset, limit, windowLines, anchor })
 
 		// Trust model: unchanged size AND mtime ⇒ identical content, so the
 		// cached hash can be reused without re-reading the file; any mismatch
@@ -888,8 +891,7 @@ function readFileHandler(
 		if (mode === "indentation") {
 			// Phase 1 minimal: indentation mode falls back to a window around the
 			// anchor line (anchor_line 1-based), which is good enough for the loop.
-			const anchor = toNonNegativeInt(indentation?.["anchor_line"], offset)
-			result = ok(formatFileSlice(rel, allLines, Math.max(1, anchor), windowLines ?? DEFAULT_INDENTATION_WINDOW_LINES))
+			result = ok(formatFileSlice(rel, allLines, anchor ?? 1, windowLines ?? DEFAULT_INDENTATION_WINDOW_LINES))
 		} else {
 			result = ok(formatFileSlice(rel, allLines, Math.max(1, offset), limit))
 		}
@@ -917,7 +919,9 @@ function readFileKey(args: Record<string, unknown>, ctx: ToolContext): string {
 	const indentation = args.indentation as Record<string, unknown> | undefined
 	const windowLines =
 		mode === "indentation" ? toNonNegativeInt(indentation?.["max_lines"], DEFAULT_INDENTATION_WINDOW_LINES) : undefined
-	return makeReadFileCacheKey({ target, mode, offset, limit, windowLines })
+	const anchor =
+		mode === "indentation" ? Math.max(1, toNonNegativeInt(indentation?.["anchor_line"], offset)) : undefined
+	return makeReadFileCacheKey({ target, mode, offset, limit, windowLines, anchor })
 }
 
 function formatFileSlice(rel: string, allLines: string[], offset: number, limit: number): string {
