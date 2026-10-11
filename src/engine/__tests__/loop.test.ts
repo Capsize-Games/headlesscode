@@ -3697,7 +3697,12 @@ async function testVerifyBeforeCompletionRefusesUnsupportedMeasurementClaim(): P
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc-measure-"))
 	try {
 		const client = new FakeLlmClient([
-			() => toolCall("execute_command", { command: "echo ready" }),
+			// Successful execute_command output includes stderr. A locale warning
+			// can contain digits (`en_US.UTF-8`) without measuring anything.
+			() =>
+				toolCall("execute_command", {
+					command: "echo ready; echo 'bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8)' >&2",
+				}),
 			() => toolCall("attempt_completion", { result: "Benchmark complete: 205.9 tokens/sec measured." }),
 			() => toolCall("execute_command", { command: "echo real-result 205.9" }),
 			() => toolCall("attempt_completion", { result: "Ran the real benchmark: 205.9 tokens/sec." }),
