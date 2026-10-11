@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto"
 import { execFileSync } from "node:child_process"
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
-import { runOpenShellBenchmarkVerifier } from "../src/rsi/openshell.js"
+import { RSI_OPENSHELL_IMAGE, runOpenShellBenchmarkVerifier } from "../src/rsi/openshell.js"
 import { parseRsiArgs } from "../src/rsi/config.js"
 import type { CandidateRecord } from "../src/rsi/types.js"
 
@@ -23,6 +23,14 @@ let report: Record<string, unknown> = {
 	qualification: "synthetic-openshell-candidate-isolation",
 	providerTeardownCompleted: false,
 	modelInference: "none",
+	runtimeProfile: {
+		image: RSI_OPENSHELL_IMAGE,
+		imageSource: "RSI provider enforced default image",
+		gatewayAlias: process.env.OPENSHELL_GATEWAY ?? null,
+		gatewayIdentitySource: process.env.OPENSHELL_GATEWAY ? "configured provider gateway alias; remote endpoint identity is not exposed" : "not exposed",
+		controlProfileIdentity: null,
+		controlIdentitySource: "no emergency-control profile is configured by the RSI canary provider path",
+	},
 }
 
 async function main(): Promise<void> {
@@ -71,7 +79,8 @@ async function main(): Promise<void> {
 	const protectedFileDigests = new Map(await Promise.all(probePaths.map(async (file) => [file, sha256(await fs.readFile(file))] as const)))
 	const probeScript = `import fs from 'node:fs';\n` +
 		`const paths = ${JSON.stringify(probePaths)};\n` +
-		`const results = paths.map((file) => { let readable = false, writable = false; try { fs.readFileSync(file); readable = true; } catch {} try { fs.appendFileSync(file, 'tampered-by-disposable-canary\\n'); writable = true; } catch {} return { path: file, readDenied: !readable, writeDenied: !writable }; });\n` +
+		`const errorCode = (error) => typeof error?.code === 'string' ? error.code : (error?.name ?? 'unknown');\n` +
+		`const results = paths.map((file) => { let readError = null, writeError = null; try { fs.readFileSync(file); } catch (error) { readError = errorCode(error); } try { fs.appendFileSync(file, 'tampered-by-disposable-canary\\n'); } catch (error) { writeError = errorCode(error); } return { path: file, readDenied: readError !== null, readError, writeDenied: writeError !== null, writeError }; });\n` +
 		`let workspaceWritable = false; try { fs.writeFileSync('/workspace/.rsi-security-canary', 'workspace-only\\n', { flag: 'wx' }); workspaceWritable = true; } catch {}\n` +
 		`const protectedSnapshotOmitted = { evaluator: !fs.existsSync('/workspace/src/rsi/evaluator-canary.ts'), scoring: !fs.existsSync('/workspace/scripts/eval-suite/score-canary.ts'), archive: !fs.existsSync('/workspace/.headlesscode/rsi-archive/archive-canary.json') };\n` +
 		`console.log('HEADLESSCODE_RSI_CONTAINMENT_PROBE:' + JSON.stringify({ workspaceWritable, results, protectedSnapshotOmitted }));\n`
@@ -79,22 +88,35 @@ async function main(): Promise<void> {
 	report.providerTeardownCompleted = true
 	const marker = /(?:^|\n)HEADLESSCODE_RSI_CONTAINMENT_PROBE:(\{[^\n]+\})(?:\n|$)/.exec(result.stdout + result.stderr)
 	if (!marker) throw new Error("OpenShell guest did not return a containment probe report")
-	const probe = JSON.parse(marker[1]!) as { workspaceWritable: boolean; results: Array<{ path: string; readDenied: boolean; writeDenied: boolean }>; protectedSnapshotOmitted: Record<string, boolean> }
+	const probe = JSON.parse(marker[1]!) as { workspaceWritable: boolean; results: Array<{ path: string; readDenied: boolean; readError: string | null; writeDenied: boolean; writeError: string | null }>; protectedSnapshotOmitted: Record<string, boolean> }
 	const protectedCanariesUnchanged = await Promise.all([...protectedFileDigests].map(async ([file, digest]) => sha256(await fs.readFile(file)) === digest))
-	const guestSnapshotsRemoved = (await fs.readdir(path.join(repoRoot, ".worktrees")).catch(() => [])).length === 0
+	let remainingSnapshots: string[] = []
+	try {
+		remainingSnapshots = await fs.readdir(path.join(repoRoot, ".worktrees"))
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+	}
+	const guestSnapshotsRemoved = remainingSnapshots.length === 0
+	const exactProbePaths = probe.results.length === probePaths.length && probe.results.every((entry, index) => entry.path === probePaths[index])
+	const strictDeniedResults = probe.results.every((entry) =>
+		entry.readDenied === true && typeof entry.readError === "string" &&
+		entry.writeDenied === true && typeof entry.writeError === "string")
+	const exactSnapshotOmissions = Object.keys(probe.protectedSnapshotOmitted).sort().join(",") === "archive,evaluator,scoring" &&
+		probe.protectedSnapshotOmitted.archive === true && probe.protectedSnapshotOmitted.evaluator === true && probe.protectedSnapshotOmitted.scoring === true
 	report = {
 		...report,
 		guestExitCode: result.exitCode,
 		guestDurationMs: result.durationMs,
 		workspaceWritable: probe.workspaceWritable,
 		protectedPaths: probe.results,
+		probePathsMatchExpected: exactProbePaths,
 		protectedCanariesUnchanged: protectedCanariesUnchanged.every(Boolean),
 		protectedSnapshotOmitted: probe.protectedSnapshotOmitted,
+		protectedSnapshotOmissionsMatchExpected: exactSnapshotOmissions,
 		guestSnapshotsRemoved,
 	}
-	const passed = result.exitCode === 0 && probe.workspaceWritable && report.protectedCanariesUnchanged &&
-		probe.results.length === probePaths.length && probe.results.every((entry) => entry.readDenied && entry.writeDenied) &&
-		Object.values(probe.protectedSnapshotOmitted).every(Boolean) && guestSnapshotsRemoved
+	const passed = result.exitCode === 0 && probe.workspaceWritable === true && report.protectedCanariesUnchanged === true &&
+		exactProbePaths && strictDeniedResults && exactSnapshotOmissions && guestSnapshotsRemoved
 	Object.assign(report, { passed, reportPath })
 	process.stdout.write(`${JSON.stringify(report, null, 2)}\n`)
 	if (!passed) process.exitCode = 1
