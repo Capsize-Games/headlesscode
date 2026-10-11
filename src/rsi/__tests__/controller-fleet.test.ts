@@ -115,6 +115,7 @@ class FakeFleetQueue {
 		const jobId = randomUUID()
 		let result: Record<string, unknown>
 		if (input.jobKind === "mutation") {
+			assert.equal(input.payload.evaluatorRuntime, undefined, "mutation jobs do not receive evaluator-only runtime identity")
 			this.mutationJobCount += 1
 			const bundle = this.artifacts.get(input.artifactSha256)
 			assert.ok(bundle)
@@ -136,6 +137,8 @@ class FakeFleetQueue {
 				await fs.rm(temp, { recursive: true, force: true })
 			}
 		} else {
+			assert.equal(input.payload.evaluatorRuntime?.imageDigest, `sha256:${"0".repeat(64)}`, "synthetic evaluation hooks carry an explicit non-production image identity")
+			assert.match(input.payload.evaluatorRuntime?.policySha256 ?? "", /^[a-f0-9]{64}$/, "evaluation payload freezes the effective policy bytes")
 			const adversarial = input.candidateId.endsWith("-adversarial")
 			if (adversarial) {
 				this.adversarialEvaluationJobCount += 1

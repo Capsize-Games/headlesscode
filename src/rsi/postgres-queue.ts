@@ -102,6 +102,7 @@ export interface FleetJobPayload {
 	provider?: "ollama" | "openrouter"
 	openRouterProfile?: RsiOpenRouterProfileId
 	proofCampaign?: { campaignId: string; armId: string; epoch: number; manifestSha256: string; cells: Array<{ attemptKey: string; slotId: string; attemptKind: "mutation" | "verification" }> }
+	evaluatorRuntime?: { imageDigest: string; policySha256: string }
 	inferenceLimits?: OpenRouterBrokerLimits
 	maxIterations: number
 	timeoutMs: number

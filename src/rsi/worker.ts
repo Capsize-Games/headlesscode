@@ -361,7 +361,7 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions, sig
 		} else if (lease.job.jobKind === "evaluation") {
 			teardown.guestExecutionStarted = true
 			teardown.guestTeardownConfirmed = false
-			const evaluation = await (options.runEvaluation ?? runOpenShellEvaluation)(candidate, config, signal, options.emergencyControl)
+			const evaluation = await (options.runEvaluation ?? runOpenShellEvaluation)(candidate, config, signal, options.emergencyControl, payload.evaluatorRuntime)
 			teardown.guestTeardownConfirmed = true
 			const externalized = await externalizeEvaluationOutputs(options.queue, evaluation)
 			result = { ok: true, ...externalized, durationMs: Date.now() - started }

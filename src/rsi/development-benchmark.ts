@@ -4,6 +4,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
 import { OpenShellBenchmarkAgent, OpenShellBenchmarkVerifier } from "./benchmark/openshell-agent.js"
+import { resolveRsiEvaluatorPolicySha256 } from "./openshell.js"
 import { freezeBenchmarkProtocol, loadBenchmark, runBenchmark } from "./benchmark/runner.js"
 import type { BenchmarkAttempt, BenchmarkImageIdentity, BenchmarkSplit } from "./benchmark/types.js"
 import type { RunBenchmarkOptions } from "./benchmark/runner.js"
@@ -60,6 +61,7 @@ export async function runDevelopmentBenchmarkForCommit(args: {
 	campaignId?: string
 	inferenceLedgerPath?: string
 	attemptNamespace?: string
+	evaluatorPolicySha256?: string
 	split?: BenchmarkSplit
 	attemptLifecycle?: RunBenchmarkOptions["attemptLifecycle"]
 }): Promise<BenchmarkAttempt[]> {
@@ -70,7 +72,8 @@ export async function runDevelopmentBenchmarkForCommit(args: {
 	const verifierImage = buildCommitImage(repoRoot, verifierCommit)
 	return await withCommitWorktree(repoRoot, args.harnessCommit, async (harnessRoot) => {
 		const agent = new OpenShellBenchmarkAgent(harnessRoot, undefined, agentImage.name, args.harnessCommit, undefined, args.provider ?? "openshell-ollama")
-		const verifier = new OpenShellBenchmarkVerifier(repoRoot, undefined, verifierImage.name)
+		const evaluatorPolicySha256 = args.evaluatorPolicySha256 ?? await resolveRsiEvaluatorPolicySha256()
+		const verifier = new OpenShellBenchmarkVerifier(repoRoot, undefined, verifierImage.name, evaluatorPolicySha256)
 		const split = args.split ?? "development"
 		const outputRoot = path.join(args.outputRoot, "harness", args.harnessCommit)
 		if (split === "confirmation") {
