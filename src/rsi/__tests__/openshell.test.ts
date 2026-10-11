@@ -13,7 +13,7 @@ import { createOpenShellHiddenCaseRunner } from "../hidden-openshell-runner.js"
 import { verifyHiddenFunctions } from "../hidden-verifier.js"
 import type { HiddenFunctionSuite } from "../hidden-verifier.js"
 
-async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker-failure" | "snapshot-mismatch" | "protected-package" | "self-hosted-missing-cli" | "self-hosted-corrupt-cli" | "dependency-escape"): Promise<void> {
+async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker-failure" | "snapshot-mismatch" | "protected-package" | "fixture-escape" | "self-hosted-missing-cli" | "self-hosted-corrupt-cli" | "dependency-escape"): Promise<void> {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "hc-rsi-openshell-"))
 	const worktree = path.join(repo, ".worktrees", "rsi", `candidate-${mode}`)
 	const originalPath = process.env.PATH
@@ -151,6 +151,7 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 						assert.match(command, /test -r \/opt\/headlesscode\/src\/cli\.ts/, "fixed-control preflight checks the pinned release CLI")
 					}
 					assert.match(command, /readlink \/workspace\/node_modules/)
+					assert.match(command, /test \! -e \/workspace\/fixtures/)
 					assert.match(command, /test \! -e \/workspace\/__rsi_benchmark_verifier__/)
 					assert.match(command, /test \! -e \/opt\/headlesscode\/scripts\/rsi-benchmark\/task-spec\.mjs/)
 					assert.match(command, /test \! -e \/opt\/headlesscode\/fixtures\/rsi-benchmark/)
@@ -190,6 +191,11 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 						fs.writeFileSync(path.join(guestPath, "scripts", "eval-suite", "injected.sh"), "secret\n")
 					} else if (mode === "protected-package") {
 						fs.writeFileSync(path.join(guestPath, "package.json"), "{\"scripts\":{\"preinstall\":\"touch /tmp/pwned\"}}\n")
+					} else if (mode === "fixture-escape") {
+						fs.mkdirSync(path.join(guestPath, "fixtures", "sessions"), { recursive: true })
+						fs.mkdirSync(path.join(guestPath, "fixtures", "arbitrary"), { recursive: true })
+						fs.writeFileSync(path.join(guestPath, "fixtures", "sessions", "imported-session.json"), "synthetic session fixture\n")
+						fs.writeFileSync(path.join(guestPath, "fixtures", "arbitrary", "sample.json"), "synthetic arbitrary fixture\n")
 					} else {
 						fs.symlinkSync("/etc/passwd", path.join(guestPath, "src", "engine", "external"))
 					}
@@ -235,6 +241,14 @@ async function run(mode: "source" | "escape" | "symlink" | "preflight" | "worker
 			assert.equal(fs.readFileSync(path.join(worktree, "package.json"), "utf8"), "{\"name\":\"fixture\"}\n", "candidate package metadata must not be imported")
 			return
 		}
+		if (mode === "fixture-escape") {
+			const result = await runOpenShellMutation(candidate, config, providerFactory)
+			assert.equal(result.ok, false)
+			assert.match(result.error ?? "", /protected paths/)
+			assert.equal(fs.existsSync(path.join(worktree, "fixtures", "sessions", "imported-session.json")), false, "session fixture writes must be rejected before patch import")
+			assert.equal(fs.existsSync(path.join(worktree, "fixtures", "arbitrary", "sample.json")), false, "arbitrary fixture writes must be rejected before patch import")
+			return
+		}
 		if (mode === "worker-failure") {
 			const result = await runOpenShellMutation(candidate, config, providerFactory)
 			assert.equal(result.ok, false)
@@ -275,6 +289,7 @@ await run("preflight")
 await run("worker-failure")
 await run("snapshot-mismatch")
 await run("protected-package")
+await run("fixture-escape")
 await run("self-hosted-missing-cli")
 await run("self-hosted-corrupt-cli")
 await run("dependency-escape")
@@ -396,7 +411,7 @@ await run("dependency-escape")
 		execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: repo })
 		execFileSync("git", ["config", "user.name", "Test"], { cwd: repo })
 		execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: repo })
-		for (const [relative, body] of [["src/app.ts", "source\n"], ["test/app.test.ts", "visible test\n"], ["scripts/eval-suite/hidden.js", "hidden suite\n"], ["src/rsi/fitness.ts", "hidden scorer\n"], [".headlesscode/archive.json", "operator archive\n"], [".headlesscode/rsi-proof/plan.json", "sealed confirmation metadata\n"], ["fixtures/rsi-curriculum/generalization.json", "{}\n"], ["fixtures/rsi-benchmark/confirmation.json", "private proof task\n"]]) {
+		for (const [relative, body] of [["src/app.ts", "source\n"], ["test/app.test.ts", "visible test\n"], ["scripts/eval-suite/hidden.js", "hidden suite\n"], ["src/rsi/fitness.ts", "hidden scorer\n"], [".headlesscode/archive.json", "operator archive\n"], [".headlesscode/rsi-proof/plan.json", "sealed confirmation metadata\n"], ["fixtures/rsi-curriculum/generalization.json", "{}\n"], ["fixtures/rsi-benchmark/confirmation.json", "private proof task\n"], ["fixtures/sessions/imported-session.json", "synthetic imported session fixture\n"], ["fixtures/arbitrary/sample.json", "synthetic unrelated fixture\n"]]) {
 			const target = path.join(repo, relative)
 			fs.mkdirSync(path.dirname(target), { recursive: true })
 			fs.writeFileSync(target, body)
@@ -418,6 +433,8 @@ await run("dependency-escape")
 		assert.equal(fs.existsSync(path.join(clonePath, ".headlesscode/archive.json")), false)
 		assert.equal(fs.existsSync(path.join(clonePath, "fixtures/rsi-curriculum/generalization.json")), true, "registered curriculum fixtures remain available to evaluation guests")
 		assert.equal(fs.existsSync(path.join(clonePath, "fixtures/rsi-benchmark/confirmation.json")), false, "benchmark task and verifier data stays outside evaluation guests")
+		assert.equal(fs.existsSync(path.join(clonePath, "fixtures/sessions/imported-session.json")), true, "evaluation snapshots retain non-benchmark session fixtures")
+		assert.equal(fs.existsSync(path.join(clonePath, "fixtures/arbitrary/sample.json")), true, "evaluation snapshots retain ordinary fixture assets")
 		assert.equal(fs.existsSync(path.join(clonePath, ".headlesscode/rsi-proof/plan.json")), false, "frozen operator plan and confirmation metadata stay outside evaluation guests")
 		assert.equal(fs.lstatSync(path.join(clonePath, "test/app.test.ts")).isSymbolicLink(), false, "bundle transfer excludes harness-only dependency symlinks")
 		const mutation = createMutationSnapshotBundle(repo, head, { protectedPaths: [], repoRoot: repo } as unknown as RsiConfig)
@@ -427,6 +444,8 @@ await run("dependency-escape")
 		execFileSync("git", ["clone", "--quiet", mutationBundle, mutationClone], { cwd: unpack })
 		assert.equal(fs.existsSync(path.join(mutationClone, "fixtures/rsi-curriculum/generalization.json")), false, "mutation guests never receive evaluator-owned fixture assets")
 		assert.equal(fs.existsSync(path.join(mutationClone, "fixtures/rsi-benchmark/confirmation.json")), false, "mutation guests never receive benchmark task and verifier data")
+		assert.equal(fs.existsSync(path.join(mutationClone, "fixtures/sessions/imported-session.json")), false, "mutation guests never receive imported-session fixtures")
+		assert.equal(fs.existsSync(path.join(mutationClone, "fixtures/arbitrary/sample.json")), false, "mutation guests never receive arbitrary fixture data")
 		assert.equal(fs.existsSync(path.join(mutationClone, ".headlesscode/rsi-proof/plan.json")), false, "mutation guests never receive the frozen proof plan")
 	} finally {
 		fs.rmSync(repo, { recursive: true, force: true })

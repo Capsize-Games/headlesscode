@@ -4122,9 +4122,30 @@ export class HeadlessSession {
 				// tool calls back.
 				const unsupportedMeasurementClaim =
 					/\d+(\.\d+)?\s*(tokens?\/sec|t\/s|%|ms|seconds?)\b|measured|benchmark/i.test(result) &&
-					!messages.some(
-						(m) => m.role === "tool" && m.name === "execute_command" && /\d/.test(String(m.content ?? "")),
-					)
+					!(() => {
+						// A digit anywhere in successful shell output is not measurement
+						// evidence: stderr is intentionally included in tool content, and
+						// environment warnings such as `en_US.UTF-8` contain digits. For
+						// quantified claims, require every claimed value in command output
+						// instead of accepting unrelated diagnostic numbers. The tokenizer
+						// accepts attached units (20ms) and excludes digits inside identifiers
+						// such as UTF-8. A prose period after a number is allowed only when
+						// it is not the start of another decimal component.
+						const numericTokens = (value: string): string[] =>
+							[...value.matchAll(/(?<![\w.-])\d+(?:\.\d+)?(?=(?:tokens?\/sec|t\/s|%|ms|seconds?)\b|[^\w.-]|\.(?!\d)|$)/gi)].map(
+								(match) => match[0],
+							)
+						const claimedValues = numericTokens(result)
+						const allClaimNumbersParsed = claimedValues.length === (result.match(/(?<![\w.-])[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?/g)?.length ?? 0)
+						const commandOutputs = messages
+							.filter((m) => m.role === "tool" && m.name === "execute_command")
+							.map((m) => String(m.content ?? ""))
+						const outputValues = commandOutputs.flatMap(numericTokens)
+						if (/\d/.test(result)) {
+							return claimedValues.length > 0 && allClaimNumbersParsed && claimedValues.every((value) => outputValues.includes(value))
+						}
+						return outputValues.length > 0
+					})()
 				// staleReReadEditClaim: a failed write was cleared by a re-read
 				// ONLY (never a real successful write since — see
 				// writeFailedClearedByReReadOnly's doc), yet this completion's prose
@@ -4203,7 +4224,7 @@ export class HeadlessSession {
 							content: staleReReadEditClaim
 								? "[System: not executed — attempt_completion was deferred because your result claims an edit was made, but the edit_file/write_to_file call for it failed and you have only re-read the file since (never landed a successful write); re-issue this call if still needed.]"
 								: unsupportedMeasurementClaim
-								? "[System: not executed — attempt_completion was deferred because it makes a specific measurement/benchmark claim with no execute_command output in this session's history containing any supporting number; re-issue this call if still needed.]"
+								? "[System: not executed — attempt_completion was deferred because it makes a specific measurement/benchmark claim with no execute_command output in this session's history containing every claimed numeric value; re-issue this call if still needed.]"
 								: lastExecuteCommandFailed
 									? "[System: not executed — attempt_completion was deferred because the last command you ran ended in an error; re-issue this call if still needed.]"
 									: "[System: not executed — attempt_completion was deferred because your last edit_file/write_to_file call failed; re-issue this call if still needed.]",
@@ -4218,7 +4239,7 @@ export class HeadlessSession {
 								`${reReadClearedWriteSummary ?? "(edit output no longer available)"}\n` +
 								"Either actually make the edit succeed and re-issue attempt_completion, or, if no edit was truly needed, restate the result to say so plainly (e.g. \"no change was required\") without claiming an edit you did not land.]"
 							: unsupportedMeasurementClaim
-							? "[System: attempt_completion was NOT accepted. Your result claims a specific measurement/benchmark, but no execute_command output anywhere in this session contains a supporting number. Either run the real command that produces this evidence and re-issue attempt_completion, or restate the result without the unsupported claim.]"
+							? "[System: attempt_completion was NOT accepted. Your result claims a specific measurement/benchmark, but no execute_command output anywhere in this session contains every claimed numeric value. Either run the real command that produces this evidence and re-issue attempt_completion, or restate the result without the unsupported claim.]"
 							: lastExecuteCommandFailed
 								? "[System: attempt_completion was NOT accepted. The most recent command you ran ended in an error, and you have not run a command since that succeeded:\n" +
 									`${lastExecuteCommandSummary ?? "(command output no longer available)"}\n` +

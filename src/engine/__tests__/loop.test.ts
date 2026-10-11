@@ -3697,10 +3697,19 @@ async function testVerifyBeforeCompletionRefusesUnsupportedMeasurementClaim(): P
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc-measure-"))
 	try {
 		const client = new FakeLlmClient([
-			() => toolCall("execute_command", { command: "echo ready" }),
-			() => toolCall("attempt_completion", { result: "Benchmark complete: 205.9 tokens/sec measured." }),
-			() => toolCall("execute_command", { command: "echo real-result 205.9" }),
-			() => toolCall("attempt_completion", { result: "Ran the real benchmark: 205.9 tokens/sec." }),
+			// Successful execute_command output includes stderr. Incidental process
+			// metadata and a locale warning contain numbers, but no benchmark result.
+			() =>
+				toolCall("execute_command", {
+					command:
+						"echo 'worker 2 ready'; echo 'bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8); exit status 0' >&2",
+				}),
+			() =>
+				toolCall("attempt_completion", {
+					result: "Benchmark 2 complete: 205.9 tokens/sec at 20ms measured.",
+				}),
+			() => toolCall("execute_command", { command: "echo 'worker 2 result 205.9 tokens/sec 20ms'" }),
+			() => toolCall("attempt_completion", { result: "Ran benchmark 2: 205.9 tokens/sec at 20ms." }),
 		])
 		const session = await makeSession({
 			task: "benchmark something",
@@ -3711,7 +3720,7 @@ async function testVerifyBeforeCompletionRefusesUnsupportedMeasurementClaim(): P
 		const result = await session.run()
 
 		assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
-		assert.equal(result.result, "Ran the real benchmark: 205.9 tokens/sec.")
+		assert.equal(result.result, "Ran benchmark 2: 205.9 tokens/sec at 20ms.")
 		assert.equal(client.requests.length, 4, "the unsupported claim must not end the session early")
 		const nudge = session.state.messages.find(
 			(m) => m.role === "tool" && (m.content ?? "").includes("was NOT accepted"),
@@ -3722,6 +3731,58 @@ async function testVerifyBeforeCompletionRefusesUnsupportedMeasurementClaim(): P
 			/measurement\/benchmark/,
 			"the nudge names the unsupported-measurement reason, not the failed-command reason",
 		)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testVerifyBeforeCompletionMatchesTerminalDecimalExactly(): Promise<void> {
+	for (const [unrelatedOutput, unsupportedClaim] of [
+		["echo 42", "Measured 205.9."],
+		["echo 205", "Measured 205.9."],
+		["echo 205.90", "Measured 205.9."],
+		["echo 2", "Benchmark 2 measured 1e3."],
+		["echo 2", "Benchmark 2 measured -205.9."],
+	]) {
+		const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc-terminal-decimal-"))
+		try {
+			const client = new FakeLlmClient([
+				() => toolCall("execute_command", { command: unrelatedOutput }),
+				() => toolCall("attempt_completion", { result: unsupportedClaim }),
+				() => toolCall("execute_command", { command: "echo 205.9" }),
+				() => toolCall("attempt_completion", { result: "Measured 205.9." }),
+			])
+			const session = await makeSession({
+				task: "measure the benchmark",
+				client,
+				workspaceRoot: ws,
+				verifyBeforeCompletion: true,
+			})
+			const result = await session.run()
+
+			assert.equal(result.status, "success", `expected eventual success, got ${JSON.stringify(result)}`)
+			assert.equal(result.result, "Measured 205.9.")
+			assert.equal(client.requests.length, 4, `${unrelatedOutput} must not support the claim`)
+		} finally {
+			await fs.rm(ws, { recursive: true, force: true })
+		}
+	}
+}
+
+
+async function testVerifyBeforeCompletionIgnoresIdentifierDigits(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-vbc-identifier-"))
+	try {
+		const claim = "Benchmark uses UTF-8; measured 205.9 tokens/sec."
+		const client = new FakeLlmClient([
+			() => toolCall("execute_command", { command: "echo 205.9" }),
+			() => toolCall("attempt_completion", { result: claim }),
+		])
+		const session = await makeSession({ task: "measure", client, workspaceRoot: ws, verifyBeforeCompletion: true })
+		const result = await session.run()
+		assert.equal(result.status, "success", `expected verified measurement, got ${JSON.stringify(result)}`)
+		assert.equal(result.result, claim)
+		assert.equal(client.requests.length, 2, "identifier digits must not become extra measurement claims")
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -4095,6 +4156,11 @@ const tests: Array<[string, () => Promise<void>]> = [
 		"verifyBeforeCompletion: refuses an unsupported measurement/benchmark claim (#136)",
 		testVerifyBeforeCompletionRefusesUnsupportedMeasurementClaim,
 	],
+	[
+		"verifyBeforeCompletion: matches terminal decimal measurement values exactly",
+		testVerifyBeforeCompletionMatchesTerminalDecimalExactly,
+	],
+	["verifyBeforeCompletion: ignores identifier digits in an evidenced measurement", testVerifyBeforeCompletionIgnoresIdentifierDigits],
 	[
 		"evidence-gated completion: refuses a fabricated gate claim when the claimed target doesn't exist",
 		testEvidenceRequiredRefusesNonexistentGateTarget,
