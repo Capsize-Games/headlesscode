@@ -15,6 +15,7 @@ import { assertFrozenProofDemonstrationPlanMatches, planProofDemonstration } fro
 import { analyzeProofDemonstration, verifyProofDemonstrationArtifactBytes } from "../src/rsi/proof-demonstration.js"
 import { workerHarnessRuntimeIdentityFromEnvironment } from "../src/rsi/worker-harness.js"
 import { proofCampaignManifestDigest } from "../src/rsi/proof-campaign.js"
+import { resolveRoles } from "../src/rsi/roles.js"
 import type { CandidateRecord, RsiConfig, RsiRunRecord } from "../src/rsi/types.js"
 
 interface Options {
@@ -246,6 +247,9 @@ async function verifyEngineeringEvidenceFile(evidencePath: string, repo: string,
 		const profile = openRouterProfileForModel(record.model.requestedId, record.model.profileId)
 		if (profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID && record.model.profileId !== profile.id) throw new Error("engineering evidence has a missing explicit profile identity")
 	}
+	const evidenceProfile = record.model
+		? openRouterProfileForModel(record.model.requestedId, record.model.profileId)
+		: openRouterProfileById(RSI_DEFAULT_OPENROUTER_PROFILE_ID)
 	const { digestSha256, ...body } = record
 	if (!/^[a-f0-9]{64}$/.test(digestSha256) || canonicalHash(body) !== digestSha256) throw new Error("engineering evidence digest mismatch")
 	if (expectedRoot && record.rootCommit !== expectedRoot) throw new Error("engineering evidence belongs to a different clean root commit")
@@ -265,6 +269,7 @@ async function verifyEngineeringEvidenceFile(evidencePath: string, repo: string,
 		uniqueArms.add(armRef.armId)
 		const run = archive.runs.concat(archive.activeRuns).find((entry) => entry.runId === armRef.runId)
 		if (!run || canonicalHash(run) !== armRef.runSha256 || run.baseCommit !== record.rootCommit || run.finishedAt === undefined || run.workerHarnessPairId !== record.campaignId || run.workerHarnessMode !== armRef.armId || !run.proofCampaign || run.proofCampaign.manifest.phaseMode !== "engineering-only" || run.proofCampaign.manifestSha256 !== record.manifestSha256 || proofCampaignManifestDigest(run.proofCampaign.manifest) !== record.manifestSha256 || run.proofCampaign.state !== "finished" || run.proofConfirmation || (run.confirmationAttempts?.length ?? 0) > 0 || run.proofCampaign.manifest.schedule.some((cell) => cell.phase === "confirmation") || (run.proofCampaign.manifest.settings.confirmationTaskIdentities as unknown[] | undefined)?.length) throw new Error(`engineering evidence run ${armRef.runId} is incomplete or includes confirmation inputs`)
+		assertEngineeringRunProfile(run, evidenceProfile)
 		if (run.candidates.some((candidate) => !["accepted", "rejected", "failed"].includes(candidate.status))) throw new Error(`engineering evidence run ${armRef.runId} has incomplete candidate outcomes`)
 		if (armRef.armId === "self-hosted" && (!run.selected || !run.candidates.some((candidate) => candidate.id === run.selected && candidate.status === "accepted" && candidate.developmentProof?.accepted === true && candidate.commits.length > 0 && candidate.commits[0] === armRef.selectedCommit))) throw new Error("engineering self-hosted arm did not select an accepted development-proof candidate")
 		if (armRef.armId === "fixed-control" && armRef.selectedCommit !== run.baseCommit && !run.candidates.some((candidate) => candidate.id === run.selected && candidate.commits[0] === armRef.selectedCommit)) throw new Error("engineering fixed-control selected commit is not in its recorded run")
@@ -276,6 +281,29 @@ async function verifyEngineeringEvidenceFile(evidencePath: string, repo: string,
 	if (fixedRun.workerHarnessConfigDigest !== selfRun.workerHarnessConfigDigest || fixedRun.workerHarnessSamplingSeed !== selfRun.workerHarnessSamplingSeed || fixedRun.workerHarnessRuntime?.harnessCommit !== selfRun.workerHarnessRuntime?.harnessCommit) throw new Error("engineering pair has mismatched frozen configuration, seed, or runtime")
 	assertEngineeringTransition(fixedRun, selfRun)
 	return { record, fileSha256: sha256(bytes) }
+}
+
+function assertEngineeringRunProfile(run: RsiRunRecord, expected: ReturnType<typeof openRouterProfileById>): void {
+	const expectedProfileId = expected.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? undefined : expected.id
+	const campaignModel = run.proofCampaign?.manifest.model
+	const protocolModel = run.developmentProofProtocol?.model
+	const configuredRoles = campaignModel?.settings?.roles
+	const configuredWorker = configuredRoles && typeof configuredRoles === "object"
+		? (configuredRoles as Record<string, unknown>).worker as Record<string, unknown> | undefined
+		: undefined
+	if (run.model !== expected.model || run.openRouterProfileId !== expectedProfileId || campaignModel?.provider !== "openshell-openrouter" || campaignModel.id !== expected.model || campaignModel.profileId !== expectedProfileId || configuredWorker?.provider !== "openrouter" || configuredWorker.model !== expected.model || configuredWorker.openRouterProfile !== expectedProfileId || (protocolModel && (protocolModel.provider !== "openrouter" || protocolModel.id !== expected.model || protocolModel.profileId !== expectedProfileId))) {
+		throw new Error(`engineering run ${run.runId} model/profile differs from the frozen proof identity`)
+	}
+}
+
+export function assertProofWorkerProfile(config: RsiConfig, expected: ReturnType<typeof openRouterProfileById>, env: NodeJS.ProcessEnv = process.env): void {
+	const roles = resolveRoles(config.roles, env, config.model)
+	const worker = roles.worker
+	const expectedProfileId = expected.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? undefined : expected.id
+	const actualProfile = worker?.provider === "openrouter" ? openRouterProfileForModel(worker.model, worker.openRouterProfile) : undefined
+	if (!worker || worker.provider !== "openrouter" || worker.model !== expected.model || actualProfile?.id !== expected.id || (expectedProfileId !== undefined && worker.openRouterProfile !== expectedProfileId) || (worker.command !== undefined) || (worker.baseUrl !== undefined)) {
+		throw new Error(`effective RSI worker role must match frozen OpenRouter profile ${expected.id} / ${expected.model}`)
+	}
 }
 
 function assertEngineeringProfile(record: EngineeringEvidenceRecord, model: FrozenProofDemonstrationManifest["model"]): void {
@@ -385,6 +413,7 @@ export async function buildProofPlanPreview(options: Options, env: NodeJS.Proces
 		mutationTask: options.mutationTask,
 		workerHarnessRuntime: runtime,
 	}, options.evaluatorTrustedKeySha256)
+	assertProofWorkerProfile(baseConfig, profile, env)
 	const configs = seeds.map((seed, index) => ({ ...baseConfig, generations: index === 0 ? 2 : 3, seed })) as [typeof baseConfig, typeof baseConfig, typeof baseConfig, typeof baseConfig]
 	const config = configs[0]
 	const loaded = await loadBenchmark(path.join(repo, "fixtures/rsi-benchmark"), repo)
@@ -414,14 +443,17 @@ export async function buildProofPlanPreview(options: Options, env: NodeJS.Proces
 	}
 }
 
-export async function runEngineeringArm(config: RsiConfig, campaign: string, arm: "fixed-control" | "self-hosted", rootCommit: string, seed: string, runtime: NonNullable<RsiConfig["workerHarnessRuntime"]>, runner: typeof runRsi = runRsi): Promise<RsiRunRecord> {
+export async function runEngineeringArm(config: RsiConfig, campaign: string, arm: "fixed-control" | "self-hosted", rootCommit: string, seed: string, runtime: NonNullable<RsiConfig["workerHarnessRuntime"]>, runner: typeof runRsi = runRsi, env: NodeJS.ProcessEnv = process.env): Promise<RsiRunRecord> {
+	const expectedProfile = openRouterProfileForModel(config.model, config.roles?.worker?.openRouterProfile)
+	assertProofWorkerProfile(config, expectedProfile, env)
 	const before = await readArchive(config.archiveDir)
 	const prior = before.runs.concat(before.activeRuns).filter((entry) => entry.workerHarnessPairId === campaign && entry.workerHarnessMode === arm)
 	if (prior.length > 1) throw new Error(`engineering replay found duplicate archived ${arm} runs`)
 	const existing = prior[0]
 	const plannedRunId = engineeringRunId(campaign, arm)
 	if (existing) {
-		if (existing.runId !== plannedRunId || existing.baseCommit !== rootCommit || existing.workerHarnessSamplingSeed !== seed || existing.model !== config.model || existing.openRouterProfileId !== config.roles?.worker?.openRouterProfile || JSON.stringify(existing.workerHarnessRuntime) !== JSON.stringify(runtime) || existing.proofCampaign?.manifest.phaseMode !== "engineering-only") throw new Error(`engineering replay found a ${arm} run with changed frozen identity`)
+		if (existing.runId !== plannedRunId || existing.baseCommit !== rootCommit || existing.workerHarnessSamplingSeed !== seed || existing.model !== config.model || existing.openRouterProfileId !== (expectedProfile.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? undefined : expectedProfile.id) || JSON.stringify(existing.workerHarnessRuntime) !== JSON.stringify(runtime) || existing.proofCampaign?.manifest.phaseMode !== "engineering-only") throw new Error(`engineering replay found a ${arm} run with changed frozen identity`)
+		assertEngineeringRunProfile(existing, expectedProfile)
 		if (existing.finishedAt && existing.proofCampaign.state === "finished") {
 			const arms = existing.proofCampaign.ledgerSnapshot?.arms as Array<Record<string, unknown>> | undefined
 			if (!arms?.some((entry) => entry.arm_id === arm && entry.state === "finished") || existing.proofCampaign.manifest.schedule.some((cell) => cell.phase === "confirmation")) throw new Error(`engineering replay found an invalid terminal ${arm} checkpoint`)
@@ -450,6 +482,7 @@ export async function executeEngineeringPair(options: Options, env: NodeJS.Proce
 	if (mutationAllocation + benchmarkAllocation > cap + 1e-9 || mutationAllocation + benchmarkAllocation + 1e-9 < required) throw new Error("configured mutation and benchmark allocations must fit the operator cap and fund the engineering-only root reservation")
 	if (await ensureCleanRoot(options.repo) !== preview.rootCommit) throw new Error("engineering execution root changed after its estimate")
 	const config = await validateRuntimeEvaluatorIntegrity(preview.execution.configs[0], options)
+	assertProofWorkerProfile(config, openRouterProfileById(preview.model.profileId ?? RSI_DEFAULT_OPENROUTER_PROFILE_ID), process.env)
 	const campaign = campaignId(preview.seeds.engineering)
 	const runs: RsiRunRecord[] = []
 	for (const arm of ["fixed-control", "self-hosted"] as const) {
@@ -549,6 +582,7 @@ export async function verifyLiveFrozenProofPlan(manifest: ReturnType<typeof veri
 	assertFrozenProofDemonstrationPlanMatches(manifest.plan, { config, manifest: loaded.manifest, mutationLimits: mutation, benchmarkLimits: benchmark })
 	const key = env.HEADLESSCODE_OPENROUTER_API_KEY?.trim() ?? ""
 	const profile = openRouterProfileForModel(manifest.model.requestedId, manifest.model.profileId)
+	assertProofWorkerProfile(config, profile, env)
 	const price = await fetchOpenRouterEndpointPrice(profile, key, fetcher)
 	if (price.model !== manifest.model.requestedId || price.provider !== manifest.endpointPrice.provider || price.endpointTag !== manifest.endpointPrice.endpointTag || price.quantization !== manifest.endpointPrice.quantization || price.inputPricePerMillionUsd > manifest.priceCeilingsPerMillionUsd.input || price.outputPricePerMillionUsd > manifest.priceCeilingsPerMillionUsd.output) throw new Error("live pinned endpoint price exceeds or differs from frozen plan ceilings")
 }
