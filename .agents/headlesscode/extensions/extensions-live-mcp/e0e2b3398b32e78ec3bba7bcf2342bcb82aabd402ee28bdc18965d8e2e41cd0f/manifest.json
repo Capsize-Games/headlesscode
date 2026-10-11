@@ -1,0 +1,1 @@
+{"description":"Live MCP check server.","entrypoint":"server.mjs","id":"extensions-live-mcp","kind":"mcp","schemaVersion":1}
