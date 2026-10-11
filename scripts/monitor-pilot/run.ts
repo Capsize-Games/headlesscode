@@ -118,13 +118,16 @@ async function collectDevelopment(experimentId: string, journal: PilotJournal): 
 					boundaries.push(boundary)
 				},
 			})
-			const rows: LabeledWindow[] = boundaries.map((boundary, index) => ({
-				features: extractMonitorFeatures(boundary),
-				label: outcome.detectionLabels[index] ?? 0,
-				trajectoryId: runId,
-				boundarySequence: boundary.sequence,
-			}))
-			await appendOutcome(journal, outcome, boundaries, rows.map((row) => row.label))
+			const rows: LabeledWindow[] = boundaries.flatMap((boundary, index) => {
+				const label = outcome.detectionLabels[index]
+				return label === null || label === undefined ? [] : [{
+					features: extractMonitorFeatures(boundary),
+					label,
+					trajectoryId: runId,
+					boundarySequence: boundary.sequence,
+				}]
+			})
+			await appendOutcome(journal, outcome, boundaries, outcome.detectionLabels)
 			outcomes.push(outcome)
 			if (fixture.split === "train") trainRows.push(...rows)
 			else {
