@@ -67,6 +67,7 @@ async function main(): Promise<void> {
 		)
 		const observed: Array<{ generation: number; mode: string; parentCommit: string; digest: string }> = []
 		const run = await runRsi(config, {
+			syntheticRuntimeIdentity: true,
 			log: () => undefined,
 			runCommand: async (command) => ok(command),
 			runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook([], {
@@ -91,6 +92,9 @@ async function main(): Promise<void> {
 		})
 		const parent = run.candidates.find((candidate) => candidate.generation === 0)!
 		const child = run.candidates.find((candidate) => candidate.generation === 1)!
+		const integrityManifest = JSON.parse(await fs.readFile(path.join(config.archiveDir, run.evaluatorIntegrity!.manifestPath!), "utf8")) as { payload: { input: { imageIdentity: { identitySource: string; verifiedImageDigest: string | null } } } }
+		assert.equal(integrityManifest.payload.input.imageIdentity.identitySource, "synthetic-test-hooks")
+		assert.equal(integrityManifest.payload.input.imageIdentity.verifiedImageDigest, runtime.imageDigest)
 		assert.equal(parent.status, "accepted")
 		assert.equal(parent.workerHarnessExecution?.mode, "fixed-control")
 		assert.equal(child.parent, parent.id)
@@ -103,13 +107,13 @@ async function main(): Promise<void> {
 		assert.ok(observed.every((entry) => /^[a-f0-9]{64}$/.test(entry.digest)))
 		await checkpointRun(config.archiveDir, { ...run, workerHarnessConfigDigest: undefined })
 		await assert.rejects(
-			runRsi({ ...config, resumeRunId: run.runId }, { log: () => undefined, runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook() }),
+			runRsi({ ...config, resumeRunId: run.runId }, { syntheticRuntimeIdentity: true, log: () => undefined, runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook() }),
 			/frozen run manifest/,
 			"explicit harness resume must reject a missing frozen config digest",
 		)
 		await checkpointRun(config.archiveDir, run)
 		await assert.rejects(
-			runRsi({ ...config, generations: 3, resumeRunId: run.runId }, { log: () => undefined, runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook() }),
+			runRsi({ ...config, generations: 3, resumeRunId: run.runId }, { syntheticRuntimeIdentity: true, log: () => undefined, runDevelopmentBenchmark: fakeDevelopmentBenchmarkHook() }),
 			/planned generation count/,
 			"explicit harness resume must reject a changed paired generation count",
 		)

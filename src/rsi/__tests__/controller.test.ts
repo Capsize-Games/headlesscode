@@ -116,6 +116,7 @@ async function testSealedEvaluatorResumeRejectsDrift(): Promise<void> {
 			evaluatorSigningKeyPath: signingKey, evaluatorTrustedPublicKeyPath: trustedKey, evaluatorTrustedKeySha256: trustedPin,
 		} satisfies RsiConfig
 		const hooks = {
+			syntheticRuntimeIdentity: true as const,
 			log: () => undefined,
 			runCommand: async (command: string) => ok(command),
 			runMutation: async (candidate: CandidateRecord) => {
@@ -136,7 +137,13 @@ async function testSealedEvaluatorResumeRejectsDrift(): Promise<void> {
 		await fs.writeFile(archivePath, `${JSON.stringify(archive, null, 2)}\n`)
 		await assert.rejects(() => runRsi({ ...config, evaluatorSigningKeyPath: undefined, evaluatorTrustedPublicKeyPath: undefined, evaluatorTrustedKeySha256: undefined, resumeRunId: run.runId }, hooks), /sealed RSI run cannot resume without its independently pinned evaluator integrity trust/)
 
-		const active = structuredClone(archive.activeRuns[0]!)
+		const downgraded = structuredClone(run)
+		downgraded.evaluatorIntegrity = { status: "unsealed", outputs: [], generations: [] }
+		archive.activeRuns = [downgraded]
+		await fs.writeFile(archivePath, `${JSON.stringify(archive, null, 2)}\n`)
+		await assert.rejects(() => runRsi({ ...config, evaluatorSigningKeyPath: undefined, evaluatorTrustedPublicKeyPath: undefined, evaluatorTrustedKeySha256: undefined, resumeRunId: run.runId }, hooks), /seal artifacts exist but archive metadata is missing or downgraded/)
+
+		const active = structuredClone(run)
 		active.candidates[0]!.fitness!.score += 1
 		archive.activeRuns = [active]
 		await fs.writeFile(archivePath, `${JSON.stringify(archive, null, 2)}\n`)

@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { createHash, generateKeyPairSync } from "node:crypto"
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
-import { evaluatorGenerationDecisionDigest, evaluatorSourceIdentity, loadEvaluatorIntegrityTrust, readEvaluatorIntegrityManifest, signEvaluatorIntegrity, verifyEvaluatorIntegrity, writeEvaluatorIntegrityManifest } from "../evaluation-integrity.js"
+import { evaluatorGenerationDecisionDigest, evaluatorSourceIdentity, hasEvaluatorIntegrityManifests, loadEvaluatorIntegrityTrust, readEvaluatorIntegrityManifest, signEvaluatorIntegrity, verifyEvaluatorIntegrity, writeEvaluatorIntegrityManifest } from "../evaluation-integrity.js"
 import type { RsiConfig } from "../types.js"
 
 async function main(): Promise<void> {
@@ -41,6 +41,8 @@ async function main(): Promise<void> {
 		const envelope = signEvaluatorIntegrity(trust, payload)
 		assert.deepEqual(verifyEvaluatorIntegrity(trust, envelope).payload, payload)
 		const manifest = await writeEvaluatorIntegrityManifest(archive, payload.runId, envelope)
+		assert.equal(await hasEvaluatorIntegrityManifests(archive, payload.runId), true)
+		assert.equal(await hasEvaluatorIntegrityManifests(archive, "no-seal-for-this-run"), false)
 		const saved = await readEvaluatorIntegrityManifest(archive, payload.runId, manifest.sha256)
 		assert.equal(manifest.path, path.posix.join("evaluator-integrity", `${payload.runId}.${manifest.sha256}.json`))
 		assert.deepEqual(verifyEvaluatorIntegrity(trust, saved.envelope).payload, payload)
