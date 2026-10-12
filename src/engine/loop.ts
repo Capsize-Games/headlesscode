@@ -110,6 +110,7 @@ import {
 	isReadOnlyEquivalentShellCommand,
 	toolCallPathArg,
 } from "./tool-classes.js"
+import { MAX_BATCH_CALLS } from "../tools/batch.js"
 // Re-exported: engine tests import the shell classifier from loop.js.
 export { isReadOnlyEquivalentShellCommand }
 import { normalizeMcpToolName } from "../vendor/zoo-code/src/utils/mcp-name.js"
@@ -355,6 +356,56 @@ export const DEFAULT_MAX_TOKENS = 32_768
  */
 /** Tool names that count as "blind tree-walking" for the guardrail above. */
 const READ_ONLY_TOOL_NAMES = new Set(["list_files", "read_file", "search_files"])
+
+/** Direct-call read-only test shared by top-level calls and batch children. */
+function isReadOnlyDirectCall(call: { name: string; args: Record<string, unknown> }): boolean {
+	return (
+		READ_ONLY_TOOL_NAMES.has(call.name) ||
+		(call.name === "execute_command" &&
+			typeof call.args.command === "string" &&
+			isReadOnlyEquivalentShellCommand(call.args.command))
+	)
+}
+
+/**
+ * Whether one top-level turn call counts as read-only for the blind
+ * tree-walking guardrail. A `batch` turn counts iff its inner `calls` list
+ * is a non-empty, well-formed, non-nested batch within the MAX_BATCH_CALLS
+ * cap whose every child passes
+ * the same direct-call test above (including read-only-equivalent shell
+ * commands). Empty, malformed, oversized, or nested batches — and batches mixing in
+ * any productive child — count as productive so they reset the streak.
+ */
+function isReadOnlyTurnCall(call: { name: string; args: Record<string, unknown> }): boolean {
+	if (call.name !== "batch") {
+		return isReadOnlyDirectCall(call)
+	}
+	const raw = call.args.calls
+	if (!Array.isArray(raw) || raw.length === 0 || raw.length > MAX_BATCH_CALLS) {
+		return false
+	}
+	for (const item of raw) {
+		if (typeof item !== "object" || item === null || Array.isArray(item)) {
+			return false
+		}
+		const record = item as Record<string, unknown>
+		const tool = record["tool"]
+		if (typeof tool !== "string" || tool.trim() === "") {
+			return false
+		}
+		if (tool === "batch") {
+			return false
+		}
+		const subArgs = record["args"] ?? {}
+		if (typeof subArgs !== "object" || subArgs === null || Array.isArray(subArgs)) {
+			return false
+		}
+		if (!isReadOnlyDirectCall({ name: tool, args: subArgs as Record<string, unknown> })) {
+			return false
+		}
+	}
+	return true
+}
 
 /**
  * Identical-consecutive-call guardrail: a local model was repeatedly
@@ -5221,17 +5272,12 @@ export class HeadlessSession {
 			// the stall termination is the only hard stop.
 			// Whether every call in this turn is a plain read/exploration call
 			// (list_files / read_file / search_files, or a read-only-equivalent
-			// execute_command). Shared by the blind-tree-walking nudge above and
+			// execute_command — including the same calls wrapped in a batch).
+			// Shared by the blind-tree-walking nudge above and
 			// the read-only checkpoint skip below.
 			const allReadOnly =
 				calls.length > 0 &&
-				calls.every(
-					(call) =>
-						READ_ONLY_TOOL_NAMES.has(call.name) ||
-						(call.name === "execute_command" &&
-							typeof call.args.command === "string" &&
-							isReadOnlyEquivalentShellCommand(call.args.command)),
-				)
+				calls.every((call) => isReadOnlyTurnCall(call))
 			if (calls.length > 0) {
 				if (allReadOnly) {
 					readOnlyStreak++
