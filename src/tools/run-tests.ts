@@ -151,7 +151,7 @@ interface OneFileResult {
  * <workspaceRoot>/node_modules/.bin/tsx.
  */
 async function resolveTestRunner(workspaceRoot: string): Promise<{ runner: string } | { error: string }> {
-	const configured = (process.env.HEADLESSCODE_TEST_TSX_PATH ?? "").trim()
+	const configured = process.env.HEADLESSCODE_TEST_TSX_PATH ?? ""
 	if (configured !== "") {
 		if (!path.isAbsolute(configured)) {
 			return { error: `tsx runner not usable: HEADLESSCODE_TEST_TSX_PATH must be an absolute path (got ${JSON.stringify(configured)})` }
