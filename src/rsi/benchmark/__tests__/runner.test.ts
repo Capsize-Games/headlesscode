@@ -102,6 +102,18 @@ async function assertFixtureCleanupContract(): Promise<void> {
 	assert.equal(ownedFakeAgentFixtures.has(persistent), true, "failed cleanup retains ownership for final teardown")
 	await removeOwnedFakeAgentFixture(persistent)
 
+	const unexpected = await createOwnedFakeAgentFixture()
+	attempts = 0
+	await assert.rejects(removeOwnedFakeAgentFixture(unexpected, {
+		remove: async () => {
+			attempts += 1
+			throw Object.assign(new Error("simulated unexpected cleanup failure"), { code: "EACCES" })
+		},
+		wait: async () => undefined,
+	}), (error: NodeJS.ErrnoException) => error.code === "EACCES")
+	assert.equal(attempts, 1, "non-ENOTEMPTY cleanup errors are not retried")
+	await removeOwnedFakeAgentFixture(unexpected)
+
 	let removedUnowned = false
 	await assert.rejects(removeOwnedFakeAgentFixture(path.join(tempRoot, "not-owned"), {
 		remove: async () => { removedUnowned = true },
