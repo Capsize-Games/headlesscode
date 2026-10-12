@@ -104,6 +104,7 @@ try {
 	const loaded = await loadBenchmark(fixtureRoot, emptyRepo)
 	assert.ok(loaded.snapshotPackage, "new runner loads its explicitly pinned local package")
 	assert.equal(loaded.snapshotPackage.digest, descriptor.digest)
+	assert.ok(loaded.snapshotPackage.blobContents.size > 0, "package loading retains the exact bytes whose hashes and Git object identities were validated")
 	const fixtureBinding = (await loadProofBenchmarkFixtures(fixtureRoot, emptyRepo)).binding
 	assert.deepEqual(fixtureBinding.snapshotPackage, { path: "snapshots", digest: descriptor.digest })
 	assert.equal((await loadBoundProofBenchmarkFixtures(fixtureBinding, emptyRepo)).snapshotPackage?.digest, descriptor.digest, "external manifest and package index match the frozen supervisor binding")
@@ -124,6 +125,15 @@ try {
 	assert.equal(await fs.access(path.join(candidateRoot, "verifiers")).then(() => true).catch(() => false), false, "package extraction contains only the requested source tree")
 	assert.equal(await fs.access(path.join(candidateRoot, "snapshots")).then(() => true).catch(() => false), false, "operator package files are not copied into the candidate")
 	await fs.rm(candidateRoot, { recursive: true, force: true })
+	const mutatedBlob = path.join(packagePath, "blobs", firstBlob)
+	const pinnedBlob = await fs.readFile(mutatedBlob)
+	await fs.writeFile(mutatedBlob, Buffer.concat([pinnedBlob, Buffer.from("changed after this invocation loaded the package")]))
+	await assert.rejects(loadBenchmark(fixtureRoot, emptyRepo), /blob digest mismatch/, "a new loading invocation rejects changed package bytes")
+	const cachedCandidate = path.join(tempRoot, "candidate-pinned-cache")
+	await materializeBenchmarkSnapshot(tasks[0]!, emptyRepo, cachedCandidate, loaded.snapshotPackage)
+	assert.equal(await fs.readFile(path.join(cachedCandidate, "value.txt"), "utf8"), "one\n", "materialization uses only the already-verified invocation-local bytes")
+	await fs.rm(cachedCandidate, { recursive: true, force: true })
+	await fs.writeFile(mutatedBlob, pinnedBlob)
 
 	const blobPath = path.join(packagePath, "blobs", firstBlob)
 	const originalBlob = await fs.readFile(blobPath)

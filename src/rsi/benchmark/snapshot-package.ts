@@ -43,6 +43,8 @@ export interface LoadedSnapshotPackage {
 	path: string
 	digest: string
 	snapshots: Map<string, SnapshotPackageTree>
+	/** Exact blob bytes verified while loading this package invocation. */
+	blobContents: ReadonlyMap<string, Buffer>
 }
 
 export interface BuiltSnapshotPackage {
@@ -194,6 +196,7 @@ export async function loadSnapshotPackage(root: string, descriptor: BenchmarkSna
 	let priorCommit = ""
 	const blobSizes = new Map<string, number>()
 	const blobGitOids = new Map<string, Set<string>>()
+	const blobContents = new Map<string, Buffer>()
 	for (const snapshot of index.snapshots) {
 		if (!snapshot || !/^[a-f0-9]{40}$/.test(snapshot.commit) || snapshot.commit <= priorCommit || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(snapshot.gitTreeOid) || !/^[a-f0-9]{64}$/.test(snapshot.treeDigest) || !Array.isArray(snapshot.entries) || snapshot.entries.length > MAX_TREE_ENTRIES) throw new Error("snapshot package contains malformed or unordered snapshot metadata")
 		if (!hasExactlyKeys(snapshot, ["commit", "gitTreeOid", "treeDigest", "entries"])) throw new Error("snapshot package snapshot has unexpected fields")
@@ -235,8 +238,9 @@ export async function loadSnapshotPackage(root: string, descriptor: BenchmarkSna
 		const content = await readRegularFile(fixtureRoot, `${descriptor.path}/blobs/${digest}`, MAX_BLOB_BYTES)
 		if (content.length !== size || sha256(content) !== digest) throw new Error(`snapshot package blob digest mismatch: ${digest}`)
 		if ([...(blobGitOids.get(digest) ?? [])].some((oid) => gitBlobOid(content, oid.length) !== oid)) throw new Error(`snapshot package blob identity mismatch: ${digest}`)
+		blobContents.set(digest, content)
 	}
-	return { root: fixtureRoot, path: descriptor.path, digest: descriptor.digest, snapshots }
+	return { root: fixtureRoot, path: descriptor.path, digest: descriptor.digest, snapshots, blobContents }
 }
 
 export async function materializePackagedSnapshot(snapshotPackage: LoadedSnapshotPackage, commit: string, destination: string): Promise<void> {
@@ -247,8 +251,8 @@ export async function materializePackagedSnapshot(snapshotPackage: LoadedSnapsho
 	const digestEntries: Array<{ path: string; mode: 0o644 | 0o755; content: Buffer }> = []
 	for (const entry of snapshot.entries) {
 		if ((totalBytes += entry.size) > MAX_TREE_BYTES) throw new Error(`snapshot package snapshot exceeds materialization limits: ${commit}`)
-		const content = await readRegularFile(snapshotPackage.root, `${snapshotPackage.path}/blobs/${entry.blobSha256}`, MAX_BLOB_BYTES)
-		if (content.length !== entry.size || sha256(content) !== entry.blobSha256 || gitBlobOid(content, entry.gitBlobOid.length) !== entry.gitBlobOid) throw new Error(`snapshot package blob identity mismatch: ${commit}`)
+		const content = snapshotPackage.blobContents.get(entry.blobSha256)
+		if (!content || content.length !== entry.size || sha256(content) !== entry.blobSha256 || gitBlobOid(content, entry.gitBlobOid.length) !== entry.gitBlobOid) throw new Error(`snapshot package blob identity mismatch: ${commit}`)
 		const target = path.resolve(destination, entry.path)
 		if (!target.startsWith(destination + path.sep)) throw new Error(`snapshot package path escaped workspace: ${entry.path}`)
 		await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 })
