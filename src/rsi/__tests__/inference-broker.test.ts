@@ -480,8 +480,8 @@ test("file ledger serializes concurrent reservations against one campaign ceilin
 
 for (const outcome of ["measured", "unmeasured", "out-of-bounds", "upstream-error"] as const) {
 	test(`closing drains a disconnected request before returning its ${outcome} receipt`, async (t) => {
-		let entered!: () => void
-		let release!: () => void
+		let entered: () => void = () => undefined
+		let release: () => void = () => undefined
 		const dispatched = new Promise<void>((resolve) => { entered = resolve })
 		const barrier = new Promise<void>((resolve) => { release = resolve })
 		t.after(() => release())
@@ -514,10 +514,12 @@ for (const outcome of ["measured", "unmeasured", "out-of-bounds", "upstream-erro
 		const receipt = await broker.receipt()
 		assert.deepEqual(before, { firstClosed: false, secondClosed: false }, "both close callers must await the upstream settlement even after the guest socket disconnects")
 		assert.equal(receipt.calls, 1)
-		assert.equal(receipt.callReceipts[0]!.state, outcome === "unmeasured" || outcome === "upstream-error" ? "unmeasured" : "complete")
+		const call = receipt.callReceipts[0]
+		assert.ok(call)
+		assert.equal(call.state, outcome === "unmeasured" || outcome === "upstream-error" ? "unmeasured" : "complete")
 		assert.equal(receipt.qualified, outcome === "measured")
 		assert.equal(receipt.costUsd, outcome === "measured" ? 0.0002 : null)
-		assert.equal(receipt.callReceipts[0]!.authoritative, outcome === "measured")
+		assert.equal(call.authoritative, outcome === "measured")
 		await assert.rejects(fetch(`${broker.localBaseUrl}/api/v1/chat/completions`, { method: "POST", body: requestBody() }), /fetch failed|ECONNREFUSED/)
 	})
 }
