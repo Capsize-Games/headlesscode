@@ -1,6 +1,6 @@
 {
 	"name": "headlesscode",
-	"version": "1.8.1",
+	"version": "1.9.0",
 	"description": "Coding-agent harness with CLI and HTTP interfaces, parallel Git worktree orchestration, and bounded recursive self-improvement (RSI).",
 	"license": "Apache-2.0",
 	"repository": {
@@ -57,7 +57,8 @@
 		"scripts/stop-worker.sh",
 		"scripts/headlesscode-answer.sh",
 		"scripts/deploy-gate.sh",
-		"docs/muse-cache-qualification.md"
+		"docs/muse-cache-qualification.md",
+		"docs/work-loop.md"
 	],
 	"scripts": {
 		"typecheck": "tsc --noEmit",

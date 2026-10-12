@@ -6,6 +6,10 @@ import type { RsiCliEntrypoint } from "../rsi-cli-contract.js"
 
 /** Host-only RSI command router; candidate snapshots intentionally omit this module. */
 export const rsiCliMain: RsiCliEntrypoint = async (argv, io) => {
+	if (argv[0] === "work-loop") {
+		const { workLoopMain } = await import("./work-loop-cli.js")
+		return workLoopMain(argv.slice(1), io)
+	}
 	if (argv[0] === "rsi-worker") {
 		const { rsiWorkerMain } = await import("./worker.js")
 		return rsiWorkerMain()

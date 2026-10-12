@@ -8,7 +8,7 @@
  * a deterministic fake embedder through the same buildIndex path the CLI
  * uses). The one real network call the handler makes — embedding the query —
  * is avoided by testing only the paths that don't reach the network: the
- * no-index-yet error, and (via a hand-written fixture index) the load/search/
+ * no-index lexical fallback, and (via a hand-written fixture index) the load/search/
  * format pipeline with an injected query embedding through searchIndex
  * directly. A live-embedding path would need a network mock; the search
  * ordering itself is covered deterministically in src/codesearch/__tests__/
@@ -36,17 +36,18 @@ async function exists(p: string): Promise<boolean> {
 	}
 }
 
-async function testNoIndexReturnsActionableError(): Promise<void> {
+async function testNoIndexReturnsLabeledLexicalResult(): Promise<void> {
 	const ws = await mkTmpWorkspace("hc-cs-noindex-")
+	const executor = createHeadlessExecutor(ws)
 	try {
-		const executor = createHeadlessExecutor(ws)
 		const result = await executor.execute("codebase_search", { query: "password hashing", path: null })
 
-		assert.equal(result.isError, true, "no index must be an error, not an empty result")
-		assert.match(result.content, /no codebase index/i, "error names the missing index")
-		assert.match(result.content, /headlesscode index/, "error tells the model to run the index command")
-		assert.doesNotMatch(result.content, /No relevant code snippets/, "must NOT look like an empty search result")
+		assert.equal(result.isError, false, result.content)
+		assert.match(result.content, /lexical/i, "unindexed results identify their search method")
+		assert.match(result.content, /no .*matches/i, "an empty source tree has no literal matches")
+		assert.doesNotMatch(result.content, /Ask a human|embedding API money/)
 	} finally {
+		await executor.dispose()
 		await fs.rm(ws, { recursive: true, force: true })
 	}
 }
@@ -117,7 +118,7 @@ async function testChunkHashStable(): Promise<void> {
 }
 
 const tests: Array<[string, () => Promise<void>]> = [
-	["no index yet → clear actionable error, not empty results", testNoIndexReturnsActionableError],
+	["no index yet → explicitly labeled lexical result", testNoIndexReturnsLabeledLexicalResult],
 	["handler pipeline reads an existing index and ranks correctly", testHandlerReadsExistingIndex],
 	["chunk hash is deterministic (the dedupe key)", testChunkHashStable],
 ]
