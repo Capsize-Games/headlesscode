@@ -536,6 +536,21 @@ export interface MutationRunner {
 	(candidate: CandidateRecord, config: RsiConfig): Promise<{ ok: boolean; result?: TrialResult; error?: string; workerHarnessExecution?: WorkerHarnessExecution }>
 }
 
+export interface RsiPreparationReceipt {
+	schemaVersion: 1
+	kind: "rsi-preparation"
+	phase: "proof-plan-preview" | "pricing-admission" | "evaluator-admission" | "fixture-validation" | "proof-protocol" | "campaign-manifest" | "campaign-acquire"
+	state: "started" | "completed" | "failed"
+	sourceCommit: string
+	seedSha256: string
+	campaignId: string
+	manifestSha256?: string
+	phaseElapsedMs: number
+	elapsedSinceStartMs: number
+	readiness: "preparing" | "campaign-acquired"
+	inferenceAdmittedByReceipt: false
+}
+
 export interface RsiHooks {
 	runCommand?: CommandRunner
 	runMutation?: MutationRunner
@@ -543,6 +558,8 @@ export interface RsiHooks {
 	runDevelopmentBenchmark?: (request: { harnessCommit: string; model: string; outputRoot: string; protocol: DevelopmentProofProtocol }) => Promise<BenchmarkAttempt[]>
 	now?: () => string
 	log?: (line: string) => void
+	/** Bounded diagnostics only; the receipt never authorizes evaluator or inference work. */
+	onPreparationReceipt?: (receipt: RsiPreparationReceipt) => void | Promise<void>
 	/** Marks test-only injected runtimes so integrity records do not imply a production image identity. */
 	syntheticRuntimeIdentity?: true
 }

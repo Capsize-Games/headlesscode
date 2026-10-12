@@ -12,7 +12,7 @@ import { FileRsiArtifactStore } from "../artifact-store.js"
 import { PostgresProofCampaign } from "../proof-campaign.js"
 import { PostgresRsiJobQueue, type FleetJob, type FleetJobPayload } from "../postgres-queue.js"
 import { newCandidate } from "../workspace.js"
-import type { CandidateRecord, RsiConfig, RsiRunRecord, RsiHooks, TrialResult } from "../types.js"
+import type { CandidateRecord, RsiConfig, RsiPreparationReceipt, RsiRunRecord, RsiHooks, TrialResult } from "../types.js"
 import { fakeDevelopmentBenchmarkHook } from "./development-proof-fixture.js"
 import { fixtureDevelopmentProofProtocol } from "./development-proof-fixture.js"
 
@@ -313,6 +313,69 @@ async function syntheticEvaluatorTrust(config: RsiConfig): Promise<{ config: Rsi
 		cleanup: () => fs.rm(root, { recursive: true, force: true }),
 	}
 }
+
+test("paired startup reports slow preparation and stops before admission when startup cannot proceed", async () => {
+	const { root, config: baseConfig } = await setup()
+	const { config: trustedConfig, cleanup } = await syntheticEvaluatorTrust(baseConfig)
+	const budgetNames = [
+		"HEADLESSCODE_RSI_OPENROUTER_MAX_INPUT_PRICE_PER_MILLION_USD", "HEADLESSCODE_RSI_OPENROUTER_MAX_OUTPUT_PRICE_PER_MILLION_USD",
+		"HEADLESSCODE_RSI_OPENROUTER_MAX_CALLS", "HEADLESSCODE_RSI_OPENROUTER_MAX_INPUT_TOKENS_PER_CALL", "HEADLESSCODE_RSI_OPENROUTER_MAX_OUTPUT_TOKENS_PER_CALL", "HEADLESSCODE_RSI_OPENROUTER_MAX_TOTAL_TOKENS",
+		"HEADLESSCODE_RSI_OPENROUTER_MAX_CALL_SPEND_USD", "HEADLESSCODE_RSI_OPENROUTER_MAX_JOB_SPEND_USD", "HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD",
+		"HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD", "HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD",
+		"HEADLESSCODE_RSI_OPENROUTER_MUTATION_MAX_TOTAL_TOKENS", "HEADLESSCODE_RSI_OPENROUTER_MUTATION_MAX_JOB_SPEND_USD",
+		"HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_MAX_TOTAL_TOKENS", "HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_MAX_JOB_SPEND_USD",
+	]
+	const saved = Object.fromEntries(budgetNames.map((name) => [name, process.env[name]]))
+	const values = {
+		HEADLESSCODE_RSI_OPENROUTER_MAX_INPUT_PRICE_PER_MILLION_USD: "0.1", HEADLESSCODE_RSI_OPENROUTER_MAX_OUTPUT_PRICE_PER_MILLION_USD: "0.2",
+		HEADLESSCODE_RSI_OPENROUTER_MAX_CALLS: "40", HEADLESSCODE_RSI_OPENROUTER_MAX_INPUT_TOKENS_PER_CALL: "148000", HEADLESSCODE_RSI_OPENROUTER_MAX_OUTPUT_TOKENS_PER_CALL: "7000", HEADLESSCODE_RSI_OPENROUTER_MAX_TOTAL_TOKENS: "8000000",
+		HEADLESSCODE_RSI_OPENROUTER_MAX_CALL_SPEND_USD: "0.031", HEADLESSCODE_RSI_OPENROUTER_MAX_JOB_SPEND_USD: "0.694", HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD: "19.291206",
+		HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD: "5.28", HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD: "13.44",
+		HEADLESSCODE_RSI_OPENROUTER_MUTATION_MAX_TOTAL_TOKENS: "3300000", HEADLESSCODE_RSI_OPENROUTER_MUTATION_MAX_JOB_SPEND_USD: "0.66",
+		HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_MAX_TOTAL_TOKENS: "170000", HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_MAX_JOB_SPEND_USD: "0.034",
+	}
+	Object.assign(process.env, values)
+	const campaign = `rsi-proof-${randomUUID().replaceAll("-", "").slice(0, 20)}`
+	const runtime = { imageName: "synthetic-test-image", imageDigest: `sha256:${"0".repeat(64)}`, harnessCommit: "1".repeat(40), dependencyLockDigest: "2".repeat(64) }
+	const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim()
+	const receipts: RsiPreparationReceipt[] = []
+	let inferenceCalls = 0
+	const fakeQueue = {
+		artifactBackend: "s3",
+		async migrate() {}, async assertResourceClassCoverage() {}, async close() {},
+		proofCampaignCoordinator() { return {} },
+		async enqueue() { inferenceCalls++; throw new Error("inference must not run before acquisition") },
+	}
+	try {
+		const model = "meta/muse-spark-1.3-contributor"
+		const candidateConfig: RsiConfig = {
+			...trustedConfig, model, roles: { worker: { provider: "openrouter", model, openRouterProfile: "muse-spark-contributor" } },
+			population: 1, generations: 2, maxIterations: 1, maxTokens: 7000, maxRuntimeMs: 48 * 60 * 60_000,
+			workerHarnessPairId: campaign, workerHarnessRunId: `${campaign}-fixed`, workerHarnessMode: "fixed-control", workerHarnessPhase: "development", workerHarnessEngineeringOnly: true, workerHarnessRuntime: runtime,
+		}
+		await assert.rejects(() => runRsiImplementation(candidateConfig, {
+			syntheticRuntimeIdentity: true, log: () => undefined,
+			async runDevelopmentBenchmark() { return [] },
+			async onPreparationReceipt(receipt) {
+				receipts.push(receipt)
+				if (receipt.phase === "fixture-validation" && receipt.state === "started") await new Promise((resolve) => setTimeout(resolve, 20))
+			},
+		}, fakeQueue as unknown as PostgresRsiJobQueue), /paired proof campaigns cannot use an injected benchmark hook/)
+		assert.equal(inferenceCalls, 0, "no inference enqueue occurs before successful durable acquisition")
+		assert.deepEqual(receipts.map(({ phase, state }) => `${phase}:${state}`), [
+			"fixture-validation:started", "fixture-validation:completed", "proof-protocol:started", "proof-protocol:completed",
+			"campaign-manifest:started", "campaign-manifest:completed",
+		])
+		assert.ok(receipts.every((receipt) => receipt.sourceCommit === sourceCommit && receipt.seedSha256.length === 64 && receipt.campaignId === campaign))
+		assert.ok(receipts.slice(1).every((receipt) => /^[a-f0-9]{64}$/.test(receipt.manifestSha256 ?? "")))
+		assert.ok(receipts.every((receipt) => receipt.inferenceAdmittedByReceipt === false && receipt.readiness === "preparing" && receipt.elapsedSinceStartMs >= 0 && receipt.phaseElapsedMs >= 0))
+		assert.ok((receipts[1]?.phaseElapsedMs ?? 0) >= 15, "slow startup work is visible in the completed phase receipt")
+	} finally {
+		for (const [name, value] of Object.entries(saved)) if (value === undefined) delete process.env[name]; else process.env[name] = value
+		await cleanup()
+		await fs.rm(root, { recursive: true, force: true })
+	}
+})
 
 test("fleet controller queues baseline and all candidate evaluations before waiting", async () => {
 	const { root, config } = await setup()

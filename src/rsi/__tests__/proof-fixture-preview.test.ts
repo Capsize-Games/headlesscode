@@ -10,6 +10,7 @@ import { runRsi } from "../controller.js"
 import { benchmarkTreeDigest, materializeBenchmarkSnapshot } from "../benchmark/runner.js"
 import { buildSnapshotPackage } from "../benchmark/snapshot-package.js"
 import type { BenchmarkTask } from "../benchmark/types.js"
+import type { RsiPreparationReceipt } from "../types.js"
 
 const sha256 = (value: Buffer | string) => createHash("sha256").update(value).digest("hex")
 const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] })
@@ -122,8 +123,16 @@ test("proof preview binds an external package root and rejects missing fixtures 
 			}] } }), { status: 200 })
 		}) as typeof fetch
 
-		const preview = await buildProofPlanPreview(options, env, fetcher)
+		const previewReceipts: RsiPreparationReceipt[] = []
+		const preview = await buildProofPlanPreview(options, env, fetcher, (receipt) => { previewReceipts.push(receipt) })
 		assert.equal(metadataRequests, 1, "valid synthetic preview performs only the mocked pricing metadata GET")
+		assert.deepEqual(previewReceipts.map(({ phase, state }) => `${phase}:${state}`), [
+			"proof-plan-preview:started", "fixture-validation:started", "fixture-validation:completed",
+			"pricing-admission:started", "pricing-admission:completed", "proof-plan-preview:completed",
+		])
+		assert.ok(previewReceipts.every((receipt) => receipt.sourceCommit === rootCommit && receipt.seedSha256 === sha256("synthetic-eng") && receipt.inferenceAdmittedByReceipt === false && receipt.readiness === "preparing"))
+		const previewManifestSha256 = sha256(await fs.readFile(manifestPath))
+		assert.ok(previewReceipts.slice(2).every((receipt) => receipt.manifestSha256 === previewManifestSha256))
 		assert.deepEqual(preview.benchmarkFixtures, { root: await fs.realpath(fixtures), manifestSha256: sha256(await fs.readFile(manifestPath)), snapshotPackage: { path: "snapshots", digest: indexDigest } })
 		assert.deepEqual(preview.execution.configs.map((config) => config.proofBenchmarkFixtures), Array(4).fill(preview.benchmarkFixtures))
 		assert.equal(preview.benchmarkManifestSha256, preview.benchmarkFixtures.manifestSha256)
@@ -133,8 +142,10 @@ test("proof preview binds an external package root and rejects missing fixtures 
 		const originalIndex = await fs.readFile(indexPath)
 		await fs.writeFile(indexPath, Buffer.concat([originalIndex, Buffer.from(" ")]))
 		metadataRequests = 0
-		await assert.rejects(buildProofPlanPreview(options, env, fetcher), /pinned snapshot package digest mismatch/)
+		const tamperedReceipts: RsiPreparationReceipt[] = []
+		await assert.rejects(buildProofPlanPreview(options, env, fetcher, (receipt) => { tamperedReceipts.push(receipt) }), /pinned snapshot package digest mismatch/)
 		assert.equal(metadataRequests, 0, "changed package bytes fail before metadata pricing fetch")
+		assert.deepEqual(tamperedReceipts.map(({ phase, state }) => `${phase}:${state}`), ["proof-plan-preview:started", "fixture-validation:started", "fixture-validation:failed", "proof-plan-preview:failed"])
 		const controllerConfig = {
 			...proofConfigFromOptions({ repo, seeds: ["synthetic-eng"], mutationTask: "synthetic objective" }, rootCommit, preview.benchmarkFixtures),
 			archiveDir: path.join(root, "controller-archive"), worktreeDir: path.join(root, "controller-worktrees"), dryRun: true,
