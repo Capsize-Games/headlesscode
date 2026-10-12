@@ -4,7 +4,7 @@ import { createHash } from "node:crypto"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
-import { benchmarkTreeDigest, runBenchmark } from "../runner.js"
+import { benchmarkTreeDigest, materializeBenchmarkSnapshot, runBenchmark } from "../runner.js"
 import type { BenchmarkVerifier, LoadedBenchmark } from "../runner.js"
 import type { BenchmarkAgent, BenchmarkAgentRequest, BenchmarkTask } from "../types.js"
 
@@ -26,16 +26,25 @@ try {
 	git(repoRoot, ["add", "--all"])
 	git(repoRoot, ["-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "synthetic start snapshot"])
 	const startCommit = gitText(repoRoot, ["rev-parse", "HEAD"])
-	const startDigest = await benchmarkTreeDigest(repoRoot)
 	const verifierPath = path.join(fixtureRoot, "verifiers", "task.mjs")
 	await fs.writeFile(verifierPath, "// synthetic verifier marker\n")
 	const verifierDigest = sha256(await fs.readFile(verifierPath, "utf8"))
 	const task: BenchmarkTask = {
 		id: "commit-task", family: "workspace", split: "development", task: "Set answer to two",
-		startCommit, startDigest, verifierPath: "verifiers/task.mjs", verifierDigest,
+		startCommit, startDigest: "0".repeat(64), verifierPath: "verifiers/task.mjs", verifierDigest,
 		knownGoodDigest: "a".repeat(64), knownBadDigest: "b".repeat(64), seed: 7,
 		ceilings: { timeoutMs: 30_000, maxCalls: 1, maxOutputTokensPerCall: 32, maxPatchBytes: 4096 },
 	}
+	// Hash the immutable source tree, not the live .git object database. Git's
+	// automatic housekeeping may remove loose object directories at any time.
+	const startSnapshot = path.join(tempRoot, "start-snapshot")
+	await materializeBenchmarkSnapshot(task, repoRoot, startSnapshot)
+	task.startDigest = await benchmarkTreeDigest(startSnapshot)
+	await assert.rejects(fs.access(path.join(startSnapshot, ".git")), { code: "ENOENT" })
+	git(repoRoot, ["-c", "gc.autoDetach=false", "gc", "--quiet"])
+	const repackedSnapshot = path.join(tempRoot, "repacked-snapshot")
+	await materializeBenchmarkSnapshot(task, repoRoot, repackedSnapshot)
+	assert.equal(await benchmarkTreeDigest(repackedSnapshot), task.startDigest, "Git object repacking does not change the frozen source digest")
 	const manifest = { schemaVersion: 1 as const, runnerVersion: "1.0.0", createdFromCommit: startCommit, tasks: [task] }
 	const rawManifest = `${JSON.stringify(manifest)}\n`
 	const loaded: LoadedBenchmark = { manifest, manifestDigest: sha256(rawManifest), fixtureRoot, repoRoot, rawManifest }
