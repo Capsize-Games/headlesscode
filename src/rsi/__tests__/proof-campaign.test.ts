@@ -1108,10 +1108,16 @@ test("FileArtifactStore PostgreSQL proof-bound mutation imports only matching du
 		const callMicrousd = [2116, 90, 371, 932, 137, 865, 117, 192, 229, 210, 623, 133, 146, 186, 1497, 2939, 390, 122]
 		const totalMicrousd = callMicrousd.reduce((sum, amount) => sum + amount, 0)
 		assert.equal(totalMicrousd, 11_295)
+		const promptTokens = callMicrousd.map(() => 30_000)
+		const completionTokens = callMicrousd.map((_, index) => index === 0 ? 630 : 632)
+		const totalTokens = promptTokens.reduce((sum, amount, index) => sum + amount + completionTokens[index]!, 0)
+		assert.equal(totalTokens, 551_374)
+		frozen.budgets.attempt = { ...frozen.budgets.attempt, maxCalls: callMicrousd.length, maxTokens: totalTokens, maxSpendUsd: 0.36 }
+		frozen.budgets.root = { ...frozen.budgets.root, maxCalls: callMicrousd.length, maxTokens: totalTokens, maxSpendUsd: 1 }
 		const limits: OpenRouterBrokerLimits = {
-			campaignId: `${frozen.campaignId}:mutation`, maxCalls: callMicrousd.length, maxInputTokensPerCall: 100, maxOutputTokensPerCall: 100,
-			maxTotalTokens: callMicrousd.length * 100, maxDurationMs: 60_000, maxRequestBytes: 16_384, maxResponseBytes: 16_384,
-			maxInputPricePerMillionUsd: 1, maxOutputPricePerMillionUsd: 1, maxCallSpendUsd: 0.01, maxJobSpendUsd: 0.2, maxCampaignSpendUsd: 1,
+			campaignId: `${frozen.campaignId}:mutation`, maxCalls: callMicrousd.length, maxInputTokensPerCall: 150_000, maxOutputTokensPerCall: 7_000,
+			maxTotalTokens: totalTokens, maxDurationMs: 60_000, maxRequestBytes: 16_384, maxResponseBytes: 16_384,
+			maxInputPricePerMillionUsd: 0.1, maxOutputPricePerMillionUsd: 0.2, maxCallSpendUsd: 0.02, maxJobSpendUsd: 0.36, maxCampaignSpendUsd: 0.36,
 		}
 		await campaign.admit(lease, {
 			attemptKey, kind: "mutation",
@@ -1135,8 +1141,9 @@ test("FileArtifactStore PostgreSQL proof-bound mutation imports only matching du
 		await queue.register(grant)
 		for (const [index, microusd] of callMicrousd.entries()) {
 			const callId = `mock-call-${String(index + 1).padStart(6, "0")}`
-			await queue.reserve(grant, { callId, requestSha256: String(index + 2).repeat(64).slice(0, 64), reservedUsd: 0.01, reservedTokens: 100, startedAt: new Date().toISOString() })
-			await queue.settle(grant, { callId, state: "complete", qualified: true, returnedModel: RSI_OPENROUTER_MODEL, returnedProvider: "deepinfra", promptTokens: 10, completionTokens: 20, costUsd: microusd / 1_000_000, responseSha256: String(index + 3).repeat(64).slice(0, 64), completedAt: new Date().toISOString() })
+			const tokens = promptTokens[index]! + completionTokens[index]!
+			await queue.reserve(grant, { callId, requestSha256: String(index + 2).repeat(64).slice(0, 64), reservedUsd: 0.02, reservedTokens: tokens, startedAt: new Date().toISOString() })
+			await queue.settle(grant, { callId, state: "complete", qualified: true, returnedModel: RSI_OPENROUTER_MODEL, returnedProvider: "deepinfra", promptTokens: promptTokens[index]!, completionTokens: completionTokens[index]!, costUsd: microusd / 1_000_000, responseSha256: String(index + 3).repeat(64).slice(0, 64), completedAt: new Date().toISOString() })
 		}
 		const receipt = await queue.receipt(grant)
 		assert.equal(receipt.qualified, true)
@@ -1147,7 +1154,9 @@ test("FileArtifactStore PostgreSQL proof-bound mutation imports only matching du
 		assert.equal(receipt.model, RSI_OPENROUTER_MODEL)
 		assert.equal(receipt.endpointProvider, "deepinfra")
 		assert.equal(receipt.calls, callMicrousd.length)
-		assert.equal(receipt.totalTokens, callMicrousd.length * 30)
+		assert.equal(receipt.promptTokens, 540_000)
+		assert.equal(receipt.completionTokens, 11_374)
+		assert.equal(receipt.totalTokens, totalTokens)
 		assert.equal(receipt.costUsd, totalMicrousd / 1_000_000)
 		assert.equal(receipt.callReceipts.length, callMicrousd.length)
 		assert.deepEqual(receipt.returnedProviders, ["deepinfra"])
@@ -1182,7 +1191,7 @@ test("FileArtifactStore PostgreSQL proof-bound mutation imports only matching du
 		const imported = (view.attempts as Array<Record<string, unknown>>).find((attempt) => attempt.attempt_key === attemptKey)!
 		assert.equal(imported.status, "completed")
 		assert.equal(Number(imported.actual_calls), callMicrousd.length)
-		assert.equal(Number(imported.actual_tokens), callMicrousd.length * 30)
+		assert.equal(Number(imported.actual_tokens), totalTokens)
 		assert.equal(Number(imported.actual_spend_microusd), totalMicrousd)
 		assert.equal((imported.artifact_refs as Record<string, { sha256: string }>).patch?.sha256, patch.sha256)
 		const conflictingReplay = await queue.complete(jobLease, { ...result, inferenceReceipt: { ...receipt, totalTokens: 31 } })
