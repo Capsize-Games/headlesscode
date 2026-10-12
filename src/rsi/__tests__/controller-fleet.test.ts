@@ -6,7 +6,7 @@ import * as path from "node:path"
 import { Pool } from "pg"
 import test, { after, before } from "node:test"
 import { checkpointRun } from "../archive.js"
-import { runRsi as runRsiImplementation } from "../controller.js"
+import { improveRunOutcome, runRsi as runRsiImplementation } from "../controller.js"
 import { createMutationSnapshotBundle } from "../openshell.js"
 import { FileRsiArtifactStore } from "../artifact-store.js"
 import { PostgresProofCampaign } from "../proof-campaign.js"
@@ -284,6 +284,15 @@ async function setup(): Promise<{ root: string; config: RsiConfig }> {
 	return { root, config }
 }
 
+async function installFrozenBenchmarkHistory(repoRoot: string): Promise<void> {
+	const manifestPath = path.resolve("fixtures", "rsi-benchmark", "manifest.json")
+	const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as { tasks: Array<{ startCommit?: string; knownGoodCommit?: string; knownBadCommit?: string }> }
+	const commits = [...new Set(manifest.tasks.flatMap((task) => [task.startCommit, task.knownGoodCommit, task.knownBadCommit].filter((commit): commit is string => Boolean(commit))))]
+	if (!commits.length) throw new Error("controller integration fixture has no frozen benchmark commits")
+	execFileSync("git", ["fetch", "--quiet", "--no-tags", process.cwd(), ...commits], { cwd: repoRoot })
+	for (const commit of commits) execFileSync("git", ["cat-file", "-e", `${commit}^{tree}`], { cwd: repoRoot, stdio: "ignore" })
+}
+
 async function syntheticEvaluatorTrust(config: RsiConfig): Promise<{ config: RsiConfig; cleanup: () => Promise<void> }> {
 	const scratch = path.resolve(".headlesscode/scratch")
 	await fs.mkdir(scratch, { recursive: true, mode: 0o700 })
@@ -312,6 +321,28 @@ test("fleet controller queues baseline and all candidate evaluations before wait
 	} finally {
 		await fs.rm(root, { recursive: true, force: true })
 	}
+})
+
+test("synthetic controller repository materializes the exact frozen benchmark history", async () => {
+	const { root } = await setup()
+	try {
+		await installFrozenBenchmarkHistory(root)
+		const manifest = JSON.parse(await fs.readFile(path.resolve("fixtures", "rsi-benchmark", "manifest.json"), "utf8")) as { tasks: Array<{ startCommit?: string }> }
+		for (const commit of [...new Set(manifest.tasks.map((task) => task.startCommit).filter((value): value is string => Boolean(value)))]) {
+			const tree = execFileSync("git", ["ls-tree", "-rz", "-r", "--full-tree", commit], { cwd: root })
+			assert.ok(tree.byteLength > 0, `frozen benchmark tree ${commit} is available to the loader`)
+		}
+	} finally {
+		await fs.rm(root, { recursive: true, force: true })
+	}
+})
+
+test("improve reports an incomplete campaign as failure despite a historical selected candidate", () => {
+	const outcome = improveRunOutcome({ runId: "run-incomplete", selected: "candidate-from-earlier-generation", proofCampaign: { state: "incomplete" } }, false)
+	assert.equal(outcome.exitCode, 1)
+	assert.match(outcome.output, /^\[rsi\] incomplete: run-incomplete;/)
+	assert.match(outcome.output, /historical-selected=candidate-from-earlier-generation/)
+	assert.doesNotMatch(outcome.output, /^\[rsi\] complete:/)
 })
 
 const proofDatabaseUrl = process.env.HEADLESSCODE_RSI_TEST_DATABASE_URL
@@ -350,6 +381,7 @@ test("controller checkpoints an unresolved mutation in a real PostgreSQL campaig
 		fakeQueue.setProofCampaign(campaignStore)
 		fakeQueue.failMutationUncertain = true
 		const { config: baseConfig, root: repoRoot } = await setup()
+		await installFrozenBenchmarkHistory(repoRoot)
 		const trusted = await syntheticEvaluatorTrust(baseConfig)
 		try {
 			const model = "deepseek/deepseek-v4-flash-0731"

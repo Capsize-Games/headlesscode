@@ -1973,6 +1973,19 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	}
 }
 
+export function improveRunOutcome(run: Pick<RsiRunRecord, "runId" | "selected"> & { proofCampaign?: Pick<NonNullable<RsiRunRecord["proofCampaign"]>, "state"> }, dryRun: boolean): { output: string; exitCode: number } {
+	if (run.proofCampaign?.state === "incomplete") {
+		return {
+			output: `[rsi] incomplete: ${run.runId}; historical-selected=${run.selected ?? "none"}\n`,
+			exitCode: 1,
+		}
+	}
+	return {
+		output: `[rsi] complete: ${run.runId}; selected=${run.selected ?? "none"}\n`,
+		exitCode: run.selected || dryRun ? 0 : 1,
+	}
+}
+
 export async function improveMain(argv: string[]): Promise<number> {
 	const parsed = parseRsiArgs(argv)
 	if (parsed.help) {
@@ -1985,8 +1998,9 @@ export async function improveMain(argv: string[]): Promise<number> {
 	}
 	try {
 		const run = await runRsi(parsed.config)
-		process.stdout.write(`[rsi] complete: ${run.runId}; selected=${run.selected ?? "none"}\n`)
-		return run.selected || parsed.config.dryRun ? 0 : 1
+		const outcome = improveRunOutcome(run, parsed.config.dryRun)
+		process.stdout.write(outcome.output)
+		return outcome.exitCode
 	} catch (error) {
 		process.stderr.write(`headlesscode improve: ${error instanceof Error ? error.message : String(error)}\n`)
 		return 1
