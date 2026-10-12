@@ -280,6 +280,27 @@ async function testUncertainRequestIsNotAutomaticallyReplayed(): Promise<void> {
 	} finally { await fs.rm(directory, { recursive: true, force: true }) }
 }
 
+async function testCopiedGlobalLedgerEpochsDoNotBlockResume(): Promise<void> {
+	const directory = await scratch()
+	try {
+		const firstSlot = LIVE_DEVELOPMENT_SLOTS[0]!
+		const global = new PilotJournal(path.join(directory, "global-budget.jsonl"))
+		await global.open()
+		for (const epoch of [1, 2]) {
+			const attemptId = `prior-attempt-${epoch}`
+			await global.append("budget_reserved", LIVE_EXPERIMENT_ID, { attemptId, runId: firstSlot.slotKey, maxTokens: 20000, maxWallMs: 300000 }, { runId: firstSlot.slotKey, attemptId, epoch })
+			await global.append("budget_settled", LIVE_EXPERIMENT_ID, { attemptId, actualTokens: 100, actualWallMs: 100 }, { runId: firstSlot.slotKey, attemptId, epoch })
+		}
+		const client = new MockBillingClient([{ name: "attempt_completion", args: JSON.stringify({ result: "done" }) }])
+		const summary = await collectLiveDevelopment({ outputDir: directory, client })
+		assert.equal(summary.completedRuns, 32)
+		const journal = new PilotJournal(summary.journalPath)
+		await journal.open()
+		const first = journal.list().find((record) => record.type === "attempt_started" && record.payload.slotKey === firstSlot.slotKey)!
+		assert.equal(first.epoch, 3, "resume advances past epochs already recorded in the copied shared ledger")
+	} finally { await fs.rm(directory, { recursive: true, force: true }) }
+}
+
 async function testKnownPerRunAdmissionStopCompletesAndSettlesTrajectory(): Promise<void> {
 	const directory = await scratch()
 	try {
@@ -485,6 +506,7 @@ await testFiniteBillingIsCountedWhenAdmissionAborts()
 await testAdmittedRequestWithoutResponseIsShownAsUnresolved()
 await testResponseWithoutFiniteGenerationCostIsUnbilled()
 await testUncertainRequestIsNotAutomaticallyReplayed()
+await testCopiedGlobalLedgerEpochsDoNotBlockResume()
 await testKnownPerRunAdmissionStopCompletesAndSettlesTrajectory()
 await testCompletionOverrunIsJournaledBeforeAnyToolDispatch()
 await testHeldoutCannotStartWithoutQualifiedDevelopment()

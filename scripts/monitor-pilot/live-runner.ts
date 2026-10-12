@@ -779,6 +779,16 @@ function completedRecords(journal: PilotJournal): Map<string, JournalRecord> {
 	return done
 }
 
+function latestEpochByRun(journal: PilotJournal): Map<string, number> {
+	const epochs = new Map<string, number>()
+	for (const record of journal.list()) {
+		if (record.runId !== undefined && record.epoch !== undefined) {
+			epochs.set(record.runId, Math.max(epochs.get(record.runId) ?? record.epoch, record.epoch))
+		}
+	}
+	return epochs
+}
+
 function billingTotals(journal: PilotJournal): LiveBillingTotals {
 	const records = journal.list()
 	const accepted = records.filter((record) => record.type === "llm_response_billed")
@@ -862,6 +872,8 @@ export async function collectLiveDevelopment(options: LiveRunnerOptions = {}): P
 		await fs.chmod(global.filePath, 0o600).catch(async (error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error })
 		const client = options.client ?? await createProductionClient()
 		const done = completedRecords(journal)
+		const globalEpochByRun = latestEpochByRun(global)
+		const localEpochByRun = latestEpochByRun(journal)
 		const allRows: LabeledWindow[] = []
 		let completedRuns = 0
 		let stopReason: string | undefined
@@ -880,8 +892,8 @@ export async function collectLiveDevelopment(options: LiveRunnerOptions = {}): P
 				stopReason = `STOP: ${slot.slotKey} has an aborted/uncertain attempt; explicit retry is required.`
 				break
 			}
-			const epoch = priorAttempts.length + 1
 			const runId = slot.slotKey
+			const epoch = Math.max(priorAttempts.length, globalEpochByRun.get(runId) ?? 0, localEpochByRun.get(runId) ?? 0) + 1
 			const attemptId = randomUUID()
 			const reservation: BudgetReservation = { attemptId, runId, maxTokens: LIVE_BUDGET.maxTokens, maxWallMs: LIVE_BUDGET.maxWallMs }
 			const used = globalBudgetUsage(global)
@@ -1097,6 +1109,8 @@ export async function collectLiveHeldout(options: LiveRunnerOptions = {}): Promi
 		await assertRegularFileNoSymlink(global.filePath)
 		await global.open()
 		const done = completedRecords(journal)
+		const globalEpochByRun = latestEpochByRun(global)
+		const localEpochByRun = latestEpochByRun(journal)
 		const outstanding = slots.filter((slot) => !done.has(slot.slotKey)).length
 		const used = globalBudgetUsage(global)
 		let stopReason: string | undefined
@@ -1117,8 +1131,8 @@ export async function collectLiveHeldout(options: LiveRunnerOptions = {}): Promi
 				stopReason = `STOP: held-out slot ${slot.slotKey} has an aborted/uncertain attempt; explicit retry is required.`
 				break
 			}
-			const epoch = priorAttempts.length + 1
 			const runId = `heldout-${slot.fixture.id}-${slot.seed}-${slot.arm}`
+			const epoch = Math.max(priorAttempts.length, globalEpochByRun.get(runId) ?? 0, localEpochByRun.get(runId) ?? 0) + 1
 			const attemptId = randomUUID()
 			const reservation: BudgetReservation = { attemptId, runId, maxTokens: LIVE_BUDGET.maxTokens, maxWallMs: LIVE_BUDGET.maxWallMs }
 			const current = globalBudgetUsage(global)
