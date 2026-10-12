@@ -67,9 +67,23 @@ const boundedManifest = {
 		{ ...manifest.tasks[2]!, id: "confirmation-placeholder", split: "confirmation" as const },
 	],
 } as unknown as BenchmarkManifest
-const boundedPlan = planProofDemonstration({ config: corpusConfig, manifest: boundedManifest, mutationLimits: boundedMutationLimits, benchmarkLimits: boundedBenchmarkLimits })
-assert.equal(boundedPlan.engineering.mutationJobs, 8)
-assert.equal(boundedPlan.engineering.developmentProofCells, 384)
-assert.equal(boundedPlan.engineering.rootSpendCeilingUsd, 18.72, "scoped mutation and benchmark job caps fit the $20 engineering ceiling")
-assert.equal(boundedPlan.engineering.priceDerivedSpendCeilingUsd, 17.207296, "40 mutation calls and 30-call development tasks fit their scoped price ceilings")
+assert.throws(() => planProofDemonstration({ config: corpusConfig, manifest: boundedManifest, mutationLimits: boundedMutationLimits, benchmarkLimits: boundedBenchmarkLimits }), /mutation per-call spend cap is below the conservative runtime admission ceiling/)
+
+const runtimeFeasibleMutationLimits = { ...boundedMutationLimits, maxCallSpendUsd: 0.031401, maxJobSpendUsd: 1.256001, maxCampaignSpendUsd: 10.0481 }
+assert.throws(() => planProofDemonstration({
+	config: corpusConfig, manifest: boundedManifest, mutationLimits: { ...runtimeFeasibleMutationLimits, maxJobSpendUsd: 0.66 }, benchmarkLimits: boundedBenchmarkLimits,
+}), /mutation per-job spend cap is below the conservative runtime admission ceiling/)
+assert.throws(() => planProofDemonstration({
+	config: corpusConfig, manifest: boundedManifest, mutationLimits: runtimeFeasibleMutationLimits,
+	benchmarkLimits: { ...boundedBenchmarkLimits, maxCallSpendUsd: 0.030411 },
+}), /benchmark task bounded-dev-0 per-job spend cap is below the conservative runtime admission ceiling/)
+
+const directionalEstimatePlan = planProofDemonstration({
+	config: corpusConfig, manifest: boundedManifest, mutationLimits: runtimeFeasibleMutationLimits,
+	benchmarkLimits: { ...boundedBenchmarkLimits, maxCallSpendUsd: 0.030411, maxJobSpendUsd: 0.050001, maxCampaignSpendUsd: 19.2 },
+})
+assert.equal(directionalEstimatePlan.engineering.mutationJobs, 8)
+assert.equal(directionalEstimatePlan.engineering.developmentProofCells, 384)
+assert.equal(directionalEstimatePlan.engineering.rootSpendCeilingUsd, 29.248392, "runtime reservation ceilings are reported separately from directional price estimates")
+assert.equal(directionalEstimatePlan.engineering.priceDerivedSpendCeilingUsd, 17.207296, "directional estimate prices input and output tokens at their separate rates")
 console.log("RSI proof demonstration schedule and ceiling assertions passed")

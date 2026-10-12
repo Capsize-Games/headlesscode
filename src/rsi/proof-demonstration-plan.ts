@@ -66,10 +66,14 @@ function worstJobPriceMicros(maxCalls: number, maxOutputTokens: number, limits: 
 }
 
 function assertPriceFeasible(label: string, calls: number, outputTokens: number, limits: ProofRoleLimits): number {
-	const perCall = worstJobPriceMicros(1, outputTokens, limits)
 	const perJob = worstJobPriceMicros(calls, outputTokens, limits)
-	if (perCall > microsCeil(limits.maxCallSpendUsd)) throw new Error(`${label} per-call spend cap is below the frozen price/token ceiling`)
-	if (perJob > microsCeil(limits.maxJobSpendUsd)) throw new Error(`${label} per-job spend cap is below the frozen price/token ceiling`)
+	const runtimeUnitPrice = Math.max(limits.maxInputPricePerMillionUsd, limits.maxOutputPricePerMillionUsd)
+	const runtimePerCallTokens = Math.min(limits.maxTotalTokens, limits.maxInputTokensPerCall + outputTokens)
+	const runtimeJobTokens = Math.min(limits.maxTotalTokens, calls * (limits.maxInputTokensPerCall + outputTokens))
+	const runtimePerCall = Math.ceil(runtimePerCallTokens * runtimeUnitPrice)
+	const runtimePerJob = Math.ceil(runtimeJobTokens * runtimeUnitPrice)
+	if (runtimePerCall > limits.maxCallSpendUsd * 1_000_000) throw new Error(`${label} per-call spend cap is below the conservative runtime admission ceiling`)
+	if (runtimePerJob / 1_000_000 > limits.maxJobSpendUsd) throw new Error(`${label} per-job spend cap is below the conservative runtime admission ceiling`)
 	return perJob
 }
 
