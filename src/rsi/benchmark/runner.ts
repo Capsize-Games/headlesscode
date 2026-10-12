@@ -6,8 +6,11 @@ import { execFileSync, spawn } from "node:child_process"
 import { FileRsiArtifactStore } from "../artifact-store.js"
 import type { BenchmarkAgent, BenchmarkAgentResult, BenchmarkAttempt, BenchmarkImageIdentity, BenchmarkManifest, BenchmarkResourceCeilings, BenchmarkSplit, BenchmarkTask } from "./types.js"
 import { openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID } from "../inference-broker.js"
+import { loadSnapshotPackage, materializePackagedSnapshot } from "./snapshot-package.js"
+import type { LoadedSnapshotPackage } from "./snapshot-package.js"
 
-export const RSI_BENCHMARK_RUNNER_VERSION = "1.0.0"
+export const RSI_BENCHMARK_RUNNER_VERSION = "1.1.0"
+const LEGACY_RSI_BENCHMARK_RUNNER_VERSION = "1.0.0"
 const DEFAULT_FIXTURE_ROOT = path.resolve("fixtures/rsi-benchmark")
 const DEFAULT_OUTPUT_ROOT = path.resolve(".headlesscode/rsi-benchmark")
 
@@ -93,7 +96,9 @@ async function assertNoSymlinkComponents(root: string, relative: string): Promis
 
 function parseManifest(raw: string): BenchmarkManifest {
 	const manifest = JSON.parse(raw) as BenchmarkManifest
-	if (manifest.schemaVersion !== 1 || manifest.runnerVersion !== RSI_BENCHMARK_RUNNER_VERSION || !Array.isArray(manifest.tasks)) throw new Error("unsupported RSI benchmark manifest")
+	if (manifest.schemaVersion !== 1 || ![LEGACY_RSI_BENCHMARK_RUNNER_VERSION, RSI_BENCHMARK_RUNNER_VERSION].includes(manifest.runnerVersion) || !Array.isArray(manifest.tasks)) throw new Error("unsupported RSI benchmark manifest")
+	if (manifest.runnerVersion === RSI_BENCHMARK_RUNNER_VERSION && !manifest.snapshotPackage) throw new Error("pinned snapshot package is required by this benchmark runner version")
+	if (manifest.runnerVersion === LEGACY_RSI_BENCHMARK_RUNNER_VERSION && manifest.snapshotPackage) throw new Error("snapshot package bindings require the package-aware benchmark runner version")
 	const ids = new Set<string>()
 	for (const task of manifest.tasks) {
 		if (!/^[a-z0-9][a-z0-9-]{1,63}$/.test(task.id) || ids.has(task.id)) throw new Error(`invalid or duplicate benchmark task id: ${task.id}`)
@@ -123,10 +128,12 @@ export interface LoadedBenchmark {
 	fixtureRoot: string
 	repoRoot: string
 	rawManifest: string
+	snapshotPackage?: LoadedSnapshotPackage
 }
 
-export async function materializeBenchmarkSnapshot(task: BenchmarkTask, repoRoot: string, destination: string): Promise<void> {
+export async function materializeBenchmarkSnapshot(task: BenchmarkTask, repoRoot: string, destination: string, snapshotPackage?: LoadedSnapshotPackage): Promise<void> {
 	if (!task.startCommit) throw new Error(`benchmark task ${task.id} has no immutable source commit`)
+	if (snapshotPackage) return await materializePackagedSnapshot(snapshotPackage, task.startCommit, destination)
 	await fs.mkdir(destination, { recursive: false, mode: 0o700 })
 	const tree = execFileSync("git", ["ls-tree", "-rz", "-r", "--full-tree", task.startCommit], { cwd: repoRoot, encoding: "buffer", maxBuffer: 16 * 1024 * 1024 }) as Buffer
 	const records = tree.toString("utf8").split("\0")
@@ -166,6 +173,7 @@ export async function loadBenchmark(fixtureRoot = DEFAULT_FIXTURE_ROOT, repoRoot
 	const manifestPath = path.join(root, "manifest.json")
 	const rawManifest = await fs.readFile(manifestPath, "utf8")
 	const manifest = parseManifest(rawManifest)
+	const snapshotPackage = manifest.snapshotPackage ? await loadSnapshotPackage(root, manifest.snapshotPackage, manifest.tasks) : undefined
 	for (const task of manifest.tasks) {
 		const verifier = await resolveBenchmarkFixturePath(root, task.verifierPath)
 		const knownGood = task.knownGoodPath ? await resolveBenchmarkFixturePath(root, task.knownGoodPath) : undefined
@@ -174,7 +182,7 @@ export async function loadBenchmark(fixtureRoot = DEFAULT_FIXTURE_ROOT, repoRoot
 		try {
 			if (task.startCommit) {
 				await fs.rmdir(snapshot)
-				await materializeBenchmarkSnapshot(task, repository, snapshot)
+				await materializeBenchmarkSnapshot(task, repository, snapshot, snapshotPackage)
 			} else {
 				const start = await resolveStartDirectory(root, task.startPath!)
 				await fs.cp(start, snapshot, { recursive: true, force: false, dereference: false })
@@ -185,12 +193,12 @@ export async function loadBenchmark(fixtureRoot = DEFAULT_FIXTURE_ROOT, repoRoot
 		for (const [commit, filePath, expected, name] of [[task.knownGoodCommit, knownGood, task.knownGoodDigest, "known-good"], [task.knownBadCommit, knownBad, task.knownBadDigest, "known-bad"]] as const) {
 			if (commit) {
 				const oracle = await fs.mkdtemp(path.join(os.tmpdir(), `headlesscode-benchmark-${name}-${task.id}-`))
-				try { await fs.rmdir(oracle); await materializeBenchmarkSnapshot({ ...task, startCommit: commit }, repository, oracle); if (await benchmarkTreeDigest(oracle) !== expected) throw new Error(`benchmark ${name} tree digest mismatch for ${task.id}`) }
+				try { await fs.rmdir(oracle); await materializeBenchmarkSnapshot({ ...task, startCommit: commit }, repository, oracle, snapshotPackage); if (await benchmarkTreeDigest(oracle) !== expected) throw new Error(`benchmark ${name} tree digest mismatch for ${task.id}`) }
 				finally { await fs.rm(oracle, { recursive: true, force: true }) }
 			} else if (!filePath || sha256(await fs.readFile(filePath)) !== expected) throw new Error(`benchmark ${name} oracle digest mismatch for ${task.id}`)
 		}
 	}
-	return { manifest, manifestDigest: sha256(rawManifest), fixtureRoot: root, repoRoot: repository, rawManifest }
+	return { manifest, manifestDigest: sha256(rawManifest), fixtureRoot: root, repoRoot: repository, rawManifest, snapshotPackage }
 }
 
 export interface BenchmarkVerifier {
@@ -201,7 +209,7 @@ async function copyStartSnapshot(task: BenchmarkTask, loaded: LoadedBenchmark, w
 	if (task.startCommit) {
 		// runBenchmark clears the destination before preparation. Keep the same
 		// missing-destination contract as directory snapshots and the materializer.
-		await materializeBenchmarkSnapshot(task, loaded.repoRoot, workspace)
+		await materializeBenchmarkSnapshot(task, loaded.repoRoot, workspace, loaded.snapshotPackage)
 	}
 	else {
 		const start = await resolveStartDirectory(loaded.fixtureRoot, task.startPath!)

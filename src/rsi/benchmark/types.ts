@@ -30,10 +30,17 @@ export interface BenchmarkTask {
 	provenance?: { fixCommit: string; startCommit: string; subject: string; verifierSource?: string; verifierCommit?: string; verifierPaths?: string[] }
 }
 
+export interface BenchmarkSnapshotPackageDescriptor {
+	formatVersion: 1
+	path: string
+	digest: string
+}
+
 export interface BenchmarkManifest {
 	schemaVersion: 1
 	runnerVersion: string
 	createdFromCommit: string
+	snapshotPackage?: BenchmarkSnapshotPackageDescriptor
 	tasks: BenchmarkTask[]
 }
 
