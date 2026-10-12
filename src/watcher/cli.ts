@@ -69,6 +69,10 @@ Options:
                          mode and GitHub Contents read/write + Issues read/write.
   --runner-assignee <login>  GitHub account shown as assignee while a claim
                          is active (required with --runner-id)
+  --claim-lease-ms <n>   Claim lease duration in runner-pool mode (default:
+                         120000; valid range 30000..900000). The poll
+                         interval must be at most half the lease so claims
+                         renew before expiry
   --state-file <path>    Durable idempotency state (default:
                          <repo>/.worktrees/.watcher-state.json)
   --mode <slug>          Harness mode for workers (default: code; forwarded
@@ -98,6 +102,8 @@ Environment:
   HEADLESSCODE_MAX_CONCURRENT_SESSIONS  Session cap (default 3; per-machine in pool mode)
   HEADLESSCODE_RUNNER_ID / HEADLESSCODE_RUNNER_ASSIGNEE
                          Enable claim-based multi-machine runner mode
+  HEADLESSCODE_CLAIM_LEASE_MS  Claim lease duration in ms (default 120000;
+                         valid range 30000..900000)
 `
 
 export interface WatchCliOptions {
@@ -112,6 +118,8 @@ export interface WatchCliOptions {
 	maxConcurrentSessions: number
 	runnerId?: string
 	runnerAssignee?: string
+	/** Claim lease duration in runner-pool mode (default 120000; valid 30000..900000). */
+	claimLeaseMs?: number
 	stateFile?: string
 	mode: string
 	executionProvider: "local" | "openshell"
@@ -137,6 +145,7 @@ export function parseWatchArgs(argv: string[]): { options: WatchCliOptions; erro
 		maxConcurrentSessions: 3,
 		...(process.env.HEADLESSCODE_RUNNER_ID ? { runnerId: process.env.HEADLESSCODE_RUNNER_ID } : {}),
 		...(process.env.HEADLESSCODE_RUNNER_ASSIGNEE ? { runnerAssignee: process.env.HEADLESSCODE_RUNNER_ASSIGNEE } : {}),
+		...(process.env.HEADLESSCODE_CLAIM_LEASE_MS ? { claimLeaseMs: Number(process.env.HEADLESSCODE_CLAIM_LEASE_MS) } : {}),
 		mode: "code",
 		executionProvider: process.env.HEADLESSCODE_EXECUTION_PROVIDER === "openshell" ? "openshell" : "local",
 		qa: false,
@@ -174,6 +183,15 @@ export function parseWatchArgs(argv: string[]): { options: WatchCliOptions; erro
 				const v = next()
 				if (v === undefined || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(v)) return { options, error: "--runner-id requires a safe stable machine identifier" }
 				options.runnerId = v
+				break
+			}
+			case "--claim-lease-ms": {
+				const v = next()
+				const n = v === undefined ? Number.NaN : Number(v)
+				if (!Number.isInteger(n) || n < 30_000 || n > 900_000) {
+					return { options, error: "--claim-lease-ms requires an integer in 30000..900000" }
+				}
+				options.claimLeaseMs = n
 				break
 			}
 			case "--security-profile": {
@@ -312,6 +330,7 @@ export function parseWatchArgs(argv: string[]): { options: WatchCliOptions; erro
 		catch (error) { return { options, error: error instanceof Error ? error.message : String(error) } }
 	}
 	if (options.runnerId && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(options.runnerId)) return { options, error: "HEADLESSCODE_RUNNER_ID must be a safe stable machine identifier" }
+	if (options.claimLeaseMs !== undefined && (!Number.isInteger(options.claimLeaseMs) || options.claimLeaseMs < 30_000 || options.claimLeaseMs > 900_000)) return { options, error: "HEADLESSCODE_CLAIM_LEASE_MS must be an integer in 30000..900000" }
 	if (!!options.runnerId !== !!options.runnerAssignee) return { options, error: "--runner-id and --runner-assignee must be set together" }
 	if (options.runnerId && options.runOnce && !options.dryRun) return { options, error: "claim-based runner pool requires continuous mode; --run-once cannot maintain leases" }
 	if (options.securityProfile === "contained") {
@@ -448,6 +467,7 @@ export async function watchMain(argv: string[]): Promise<number> {
 			maxConcurrentSessions: options.maxConcurrentSessions,
 			runnerId: options.runnerId,
 			runnerAssignee: options.runnerAssignee,
+			...(options.claimLeaseMs !== undefined ? { claimLeaseMs: options.claimLeaseMs } : {}),
 			retryFailed: options.retryFailed,
 			dryRun: options.dryRun,
 			mode: options.mode,

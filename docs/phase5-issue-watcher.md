@@ -307,6 +307,9 @@ Continuous mode logs every sweep and shuts down cleanly on SIGINT/SIGTERM
 
 Run one continuous watcher on each machine, using the same GitHub owner,
 repository, and label, but a different stable `--runner-id` for each machine.
+Full install/runbook (node prerequisites, credentials, systemd unit, capacity
+sizing, claim discipline, stale-claim recovery): see
+[`docs/runner-pool-node.md`](./runner-pool-node.md).
 The `--max-concurrent-sessions` setting is the capacity limit for that
 machine. `--runner-assignee` is the GitHub login displayed on issues while a
 claim is active; it must be configured with `--runner-id`.
