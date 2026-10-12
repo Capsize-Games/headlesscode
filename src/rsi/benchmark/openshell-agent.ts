@@ -114,6 +114,7 @@ export class OpenShellBenchmarkAgent implements BenchmarkAgent {
 				broker = await this.brokerFactory({ jobId: request.attemptId, leaseToken: request.attemptId, model: profile.model, ...(profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { profileId: profile.id } : {}), limits, apiKey, bindHost, ledger: new FileOpenRouterInferenceLedger(request.brokerLedgerPath) })
 			}
 			const outcome = await runOpenShellMutation(candidate, parsed.config, this.providerFactory, image.digest, broker)
+			await broker?.close()
 			const inferenceReceipt = broker ? await broker.receipt() : undefined
 			const elapsed = Date.now() - started
 			if (!outcome.ok) {
