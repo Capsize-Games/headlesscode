@@ -36,13 +36,49 @@ import {
 	type OrchestratorState,
 } from "../state.js"
 
+const ownedFixtureDirectories = new Set<string>()
+const FIXTURE_REMOVE_ATTEMPTS = 5
+
+async function makeTempFixture(prefix: string): Promise<string> {
+	const dir = await fsp.mkdtemp(path.join(os.tmpdir(), prefix))
+	ownedFixtureDirectories.add(path.resolve(dir))
+	return dir
+}
+
+function disableFixtureGitMaintenance(repo: string): void {
+	// Fixture repositories are short-lived; automatic Git maintenance can outlive a test.
+	git(repo, ["config", "maintenance.auto", "false"])
+	git(repo, ["config", "gc.auto", "0"])
+}
+
+async function removeFixtureDir(
+	dir: string,
+	remove: typeof fsp.rm = fsp.rm,
+	wait: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+): Promise<void> {
+	const ownedPath = path.resolve(dir)
+	if (!ownedFixtureDirectories.has(ownedPath)) throw new Error(`refusing to remove unowned test fixture: ${dir}`)
+	for (let attempt = 1; ; attempt++) {
+		try {
+			await remove(dir, { recursive: true, force: true })
+			ownedFixtureDirectories.delete(ownedPath)
+			return
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code
+			if (code !== "ENOTEMPTY" || attempt >= FIXTURE_REMOVE_ATTEMPTS) throw error
+			await wait(10 * attempt)
+		}
+	}
+}
+
 function git(repo: string, args: string[]): string {
 	return execFileSync("git", ["-C", repo, ...args], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim()
 }
 
 async function makeRepoBase(): Promise<string> {
-	const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "headlesscode-cleanup-"))
+	const dir = await makeTempFixture("headlesscode-cleanup-")
 	execFileSync("git", ["init", "-q", "-b", "main", dir], { stdio: "ignore" })
+	disableFixtureGitMaintenance(dir)
 	git(dir, ["config", "user.email", "test@headlesscode.invalid"])
 	git(dir, ["config", "user.name", "Cleanup Test"])
 	git(dir, ["config", "commit.gpgsign", "false"])
@@ -98,10 +134,12 @@ async function makeMergedFixture(): Promise<Fixture> {
 
 /** Repo with a bare `origin` (origin/main pushed) — for the sync-on-apply test. */
 async function makeOriginRepo(): Promise<{ repo: string; remote: string }> {
-	const remote = await fsp.mkdtemp(path.join(os.tmpdir(), "headlesscode-cleanup-remote-"))
+	const remote = await makeTempFixture("headlesscode-cleanup-remote-")
 	execFileSync("git", ["init", "-q", "--bare", remote], { stdio: "ignore" })
-	const repo = await fsp.mkdtemp(path.join(os.tmpdir(), "headlesscode-cleanup-remote-local-"))
+	disableFixtureGitMaintenance(remote)
+	const repo = await makeTempFixture("headlesscode-cleanup-remote-local-")
 	execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" })
+	disableFixtureGitMaintenance(repo)
 	git(repo, ["config", "user.email", "test@headlesscode.invalid"])
 	git(repo, ["config", "user.name", "Cleanup Test"])
 	git(repo, ["config", "commit.gpgsign", "false"])
@@ -157,6 +195,35 @@ const PR_MERGED = (): { status: number; body: unknown } => ({ status: 200, body:
 const PR_OPEN = (): { status: number; body: unknown } => ({ status: 200, body: { number: 42, state: "open", merged: false } })
 const PR_404 = (): { status: number; body: unknown } => ({ status: 404, body: { message: "Not Found" } })
 
+async function testFixtureRemovalRetriesOwnedDirectoryWithinBound(): Promise<void> {
+	const dir = await makeTempFixture("headlesscode-cleanup-race-")
+	let calls = 0
+	const waits: number[] = []
+	await removeFixtureDir(dir, async (target, options) => {
+		calls++
+		if (calls < 3) throw Object.assign(new Error("directory recreated during removal"), { code: "ENOTEMPTY" })
+		await fsp.rm(target, options)
+	}, async (ms) => { waits.push(ms) })
+	assert.equal(calls, 3, "transient ENOTEMPTY retries until removal succeeds")
+	assert.deepEqual(waits, [10, 20], "retry delay is bounded and increases between attempts")
+	assert.equal(fs.existsSync(dir), false)
+
+	const stubborn = await makeTempFixture("headlesscode-cleanup-stubborn-")
+	let stubbornCalls = 0
+	await assert.rejects(removeFixtureDir(stubborn, async () => {
+		stubbornCalls++
+		throw Object.assign(new Error("still non-empty"), { code: "ENOTEMPTY" })
+	}, async () => {}), /still non-empty/)
+	assert.equal(stubbornCalls, FIXTURE_REMOVE_ATTEMPTS, "persistent races fail after the fixed retry bound")
+	await removeFixtureDir(stubborn)
+
+	let foreignRemovalCalls = 0
+	await assert.rejects(removeFixtureDir(path.join(os.tmpdir(), "not-an-owned-fixture"), async () => {
+		foreignRemovalCalls++
+	}), /unowned test fixture/)
+	assert.equal(foreignRemovalCalls, 0, "unowned directories never reach the remover")
+}
+
 // ─── parseCleanupArgs ────────────────────────────────────────────────────────
 
 async function testParseCleanupArgs(): Promise<void> {
@@ -204,7 +271,7 @@ async function testApplyAndDryRunAreMutuallyExclusive(): Promise<void> {
 		assert.ok(cap.err.join("").includes("mutually exclusive"))
 		assert.ok(fs.existsSync(f.wtPath), "nothing removed on a usage error")
 	} finally {
-		await fsp.rm(f.repo, { recursive: true, force: true })
+		await removeFixtureDir(f.repo)
 	}
 }
 
@@ -227,7 +294,7 @@ async function testDryRunPrintsPlanAndMutatesNothing(): Promise<void> {
 		const state = loadStateSync(f.statePath)
 		assert.equal(state.groups[0].cleaned_at, undefined, "dry-run must not patch the state")
 	} finally {
-		await fsp.rm(f.repo, { recursive: true, force: true })
+		await removeFixtureDir(f.repo)
 	}
 }
 
@@ -240,7 +307,7 @@ async function testDefaultIsDryRun(): Promise<void> {
 		assert.ok(cap.out.join("").includes("Dry run"), "output labels the dry run")
 		assert.ok(fs.existsSync(f.wtPath), "default run must not remove anything")
 	} finally {
-		await fsp.rm(f.repo, { recursive: true, force: true })
+		await removeFixtureDir(f.repo)
 	}
 }
 
@@ -263,7 +330,7 @@ async function testApplyRemovesWorktreeBranchAndPatchesState(): Promise<void> {
 		assert.ok(actions.some((a) => a.startsWith("worktree removed (merged via local-ancestor)")), "removal recorded in actions_taken")
 		assert.ok(actions.includes("branch feat deleted"), "branch deletion recorded in actions_taken")
 	} finally {
-		await fsp.rm(f.repo, { recursive: true, force: true })
+		await removeFixtureDir(f.repo)
 	}
 }
 
@@ -281,7 +348,7 @@ async function testApplyTwiceIsIdempotentNoop(): Promise<void> {
 		assert.equal(loadStateSync(f.statePath).groups[0].cleaned_at, before, "state is not rewritten")
 		assert.equal(cap.err.join(""), "")
 	} finally {
-		await fsp.rm(f.repo, { recursive: true, force: true })
+		await removeFixtureDir(f.repo)
 	}
 }
 
@@ -306,8 +373,8 @@ async function testApplySyncsMainToOrigin(): Promise<void> {
 		assert.equal(git(remote, ["rev-parse", "main"]), git(repo, ["rev-parse", "main"]), "cleanup --apply pushed local main to origin")
 		assert.ok(cap.err.join("").includes("[sync]"), "the sync outcome is reported on stderr, got: " + cap.err.join(""))
 	} finally {
-		await fsp.rm(repo, { recursive: true, force: true })
-		await fsp.rm(remote, { recursive: true, force: true })
+		await removeFixtureDir(repo)
+		await removeFixtureDir(remote)
 	}
 }
 
@@ -332,7 +399,7 @@ async function testDirtyGateBlocksCleanup(): Promise<void> {
 		assert.notEqual(git(f.repo, ["branch", "--list", f.branch]), "", "dirty group's branch must NOT be deleted")
 		assert.equal(loadStateSync(f.statePath).groups[0].cleaned_at, undefined, "dirty group's state must NOT be patched")
 	} finally {
-		await fsp.rm(f.repo, { recursive: true, force: true })
+		await removeFixtureDir(f.repo)
 	}
 }
 
@@ -358,7 +425,7 @@ async function testHarnessArtifactsDoNotBlockAndAreRemoved(): Promise<void> {
 		assert.ok(!fs.existsSync(f.wtPath), "worktree removed even with harness artifacts present")
 		assert.equal(git(f.repo, ["branch", "--list", f.branch]), "", "branch deleted")
 	} finally {
-		await fsp.rm(f.repo, { recursive: true, force: true })
+		await removeFixtureDir(f.repo)
 	}
 }
 
@@ -407,7 +474,7 @@ async function testKnownSafeResidueDoesNotBlockAndIsRemoved(): Promise<void> {
 		assert.equal(git(f.repo, ["branch", "--list", f.branch]), "", "branch deleted")
 		assert.ok(fs.existsSync(symlinkTarget), "the node_modules symlink TARGET survives (only the link is removed)")
 	} finally {
-		await fsp.rm(f.repo, { recursive: true, force: true })
+		await removeFixtureDir(f.repo)
 	}
 }
 
@@ -441,7 +508,7 @@ async function testRemoveKnownSafeArtifactsNeverTouchesTrackedFiles(): Promise<v
 		assert.equal(code, 0)
 		assert.ok(!fs.existsSync(f.wtPath), "worktree removed after known-safe residue cleanup")
 	} finally {
-		await fsp.rm(f.repo, { recursive: true, force: true })
+		await removeFixtureDir(f.repo)
 	}
 }
 
@@ -461,7 +528,7 @@ async function testLiveProcessGateBlocksCleanup(): Promise<void> {
 		assert.ok(fs.existsSync(f.wtPath), "a worktree with a live worker must NOT be removed")
 		assert.equal(loadStateSync(f.statePath).groups[0].cleaned_at, undefined)
 	} finally {
-		await fsp.rm(f.repo, { recursive: true, force: true })
+		await removeFixtureDir(f.repo)
 	}
 }
 
@@ -479,7 +546,7 @@ async function testNonTerminalStatusBlocksCleanup(): Promise<void> {
 		assert.equal(code, 0)
 		assert.ok(fs.existsSync(f.wtPath), "a running group's worktree must NOT be removed")
 	} finally {
-		await fsp.rm(f.repo, { recursive: true, force: true })
+		await removeFixtureDir(f.repo)
 	}
 }
 
@@ -497,7 +564,7 @@ async function testNotMergedBlocksCleanup(): Promise<void> {
 		assert.notEqual(git(f.repo, ["branch", "--list", f.branch]), "", "unmerged branch must NOT be deleted")
 		assert.equal(loadStateSync(f.statePath).groups[0].cleaned_at, undefined)
 	} finally {
-		await fsp.rm(f.repo, { recursive: true, force: true })
+		await removeFixtureDir(f.repo)
 	}
 }
 
@@ -522,7 +589,7 @@ async function testDisagreementFailsClosed(): Promise<void> {
 		assert.ok(fs.existsSync(f.wtPath))
 		assert.equal(loadStateSync(f.statePath).groups[0].cleaned_at, undefined)
 	} finally {
-		await fsp.rm(f.repo, { recursive: true, force: true })
+		await removeFixtureDir(f.repo)
 	}
 }
 
@@ -555,7 +622,7 @@ async function testGitHubSquashMergeIsEligible(): Promise<void> {
 			"the branch-delete refusal is recorded in actions_taken",
 		)
 	} finally {
-		await fsp.rm(f.repo, { recursive: true, force: true })
+		await removeFixtureDir(f.repo)
 	}
 }
 
@@ -575,7 +642,7 @@ async function testApiErrorFailsClosedWhenLocalCannotRescue(): Promise<void> {
 		const result = await applyCleanup(f.repo, f.statePath, { baseBranch: "main", gh })
 		assert.equal(result.removed.length, 0)
 	} finally {
-		await fsp.rm(f.repo, { recursive: true, force: true })
+		await removeFixtureDir(f.repo)
 	}
 }
 
@@ -593,7 +660,7 @@ async function testApiErrorFallsBackToLocalAncestorWhenItSaysMerged(): Promise<v
 		assert.equal(plan.groups[0].status.status, "eligible")
 		assert.equal(plan.groups[0].status.via, "local-ancestor")
 	} finally {
-		await fsp.rm(f.repo, { recursive: true, force: true })
+		await removeFixtureDir(f.repo)
 	}
 }
 
@@ -626,7 +693,7 @@ async function testWorktreeRemoveFailureSkipsBranchAndStatePatch(): Promise<void
 		assert.notEqual(git(f.repo, ["branch", "--list", f.branch]), "")
 		assert.equal(loadStateSync(f.statePath).groups[0].cleaned_at, undefined)
 	} finally {
-		await fsp.rm(f.repo, { recursive: true, force: true })
+		await removeFixtureDir(f.repo)
 	}
 }
 
@@ -635,7 +702,7 @@ async function testWorktreePathEscapeIsRefused(): Promise<void> {
 	try {
 		// A hostile/rotten state file pointing the worktree OUTSIDE .worktrees/
 		// must be refused even if every gate passes (gates injected to pass).
-		const evil = await fsp.mkdtemp(path.join(os.tmpdir(), "headlesscode-evil-"))
+		const evil = await makeTempFixture("headlesscode-evil-")
 		let state = stateWithGroup(f)
 		state = updateGroup(state, "w1", { worktree: path.relative(f.repo, evil) })
 		saveStateSync(f.statePath, state)
@@ -648,9 +715,9 @@ async function testWorktreePathEscapeIsRefused(): Promise<void> {
 		assert.equal(result.failed.length, 1)
 		assert.match(result.failed[0].error, /escapes/)
 		assert.ok(fs.existsSync(evil), "the outside directory is never touched")
-		await fsp.rm(evil, { recursive: true, force: true })
+		await removeFixtureDir(evil)
 	} finally {
-		await fsp.rm(f.repo, { recursive: true, force: true })
+		await removeFixtureDir(f.repo)
 	}
 }
 
@@ -673,13 +740,14 @@ async function testStatusShowsCleanupColumn(): Promise<void> {
 		assert.ok(parsed.cleanup, "--json carries the cleanup map")
 		assert.equal(parsed.cleanup["w1"].status, "eligible")
 	} finally {
-		await fsp.rm(f.repo, { recursive: true, force: true })
+		await removeFixtureDir(f.repo)
 	}
 }
 
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
+	["fixture teardown retries ENOTEMPTY only for owned directories and fails at its bound", testFixtureRemovalRetriesOwnedDirectoryWithinBound],
 	["parseCleanupArgs parses flags and rejects unknown/missing values", testParseCleanupArgs],
 	["--apply and --dry-run are mutually exclusive (usage error)", testApplyAndDryRunAreMutuallyExclusive],
 	["dry-run prints the plan and mutates NOTHING", testDryRunPrintsPlanAndMutatesNothing],
