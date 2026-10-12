@@ -15,6 +15,7 @@ RUN apt-get update \
 WORKDIR /opt/headlesscode
 COPY package.json package-lock.json tsconfig.json ./
 RUN npm ci --no-audit --no-fund
+RUN chmod 0644 /opt/headlesscode/package.json /opt/headlesscode/package-lock.json /opt/headlesscode/tsconfig.json
 COPY src ./src
 COPY shared ./shared
 COPY scripts/spawn-parallel-worktrees.sh scripts/run-worker.sh scripts/supervise-job-worker.mjs scripts/headlesscode-answer.sh ./scripts/
@@ -33,6 +34,12 @@ ENV HEADLESSCODE_ROOT=/opt/headlesscode
 WORKDIR /sandbox
 USER sandbox
 RUN test -r /opt/headlesscode/src/cli.ts \
+    && test -r /opt/headlesscode/package.json \
+    && test -r /opt/headlesscode/package-lock.json \
+    && test -r /opt/headlesscode/tsconfig.json \
+    && test ! -w /opt/headlesscode/package.json \
+    && test ! -w /opt/headlesscode/package-lock.json \
+    && test ! -w /opt/headlesscode/tsconfig.json \
     && test -r /opt/headlesscode/src/memory/local.ts \
     && test -x /opt/headlesscode/src/memory \
     && test ! -w /opt/headlesscode/src/memory

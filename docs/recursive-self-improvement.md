@@ -213,7 +213,49 @@ Airunner worker, not GGUF fine-tuning.
 ```sh
 npx tsx src/cli.ts improve --repo . --dry-run
 npx tsx src/cli.ts improve --repo . --population 2 --generations 1
+npx tsx src/cli.ts rsi-status --campaign <campaign-id>
+npx tsx src/cli.ts rsi-monitor --campaign <campaign-id>
 ```
+
+`rsi-status` reads a repeatable, read-only PostgreSQL snapshot for one explicit
+queue and proof campaign. It reports registered worker heartbeats, bounded
+queued and leased job metadata, expired leases, pending cancellation teardown,
+campaign and arm progress, and root and inference spend in integer microUSD.
+The query does not select job payloads, proof manifests, prompts, capabilities,
+or fixture and evaluator data. It does not run migrations or change queue,
+campaign, lease, or budget state. Set `HEADLESSCODE_RSI_DATABASE_URL` and, when
+needed, `HEADLESSCODE_RSI_QUEUE_NAME`; `--queue` overrides the queue name.
+
+`rsi-monitor` polls the same status and writes private `status.json`,
+`heartbeat.json`, and bounded `state.json` files under its state directory
+(default: `$XDG_STATE_HOME/headlesscode/rsi-monitor`, or
+`~/.local/state/headlesscode/rsi-monitor`). Use a separate directory for each
+queue and campaign. The directory must be absolute, owned by the current user,
+and private. State, heartbeat, and process locks carry the queue and campaign
+identity; reuse for another scope stops startup. Heartbeats also record the
+monitor PID, Linux process start time, and boot identity for an external
+watchdog to verify ownership. Standard output contains a compact operational
+summary; `status.json` holds the bounded worker and active-job details.
+
+The monitor takes an exclusive process lock. A separate exclusive bootstrap
+lock serializes startup and stale-lock recovery. After an ordinary process
+crash, a stale process lock can be reclaimed only when Linux process start
+time and boot identity prove that the recorded owner is gone. If startup is
+interrupted while the bootstrap lock exists, the monitor stops for operator
+inspection; it does not remove that lock automatically. Malformed or
+unverifiable state also stops startup for operator inspection. Poll, query,
+stall, and process runtime limits are bounded by the command options. Unknown
+database or record state stays `unknown`; pending work without a live worker,
+expired leases, pending teardown, unmeasured spend, a stalled workload, or
+budget violations are reported as unhealthy. A healthy operational status
+does not mean the campaign produced a useful result or passed its evaluator.
+
+The monitor never starts or restarts workers, claims jobs, resumes campaigns,
+changes reservations or limits, or dispatches model calls. It exits after its
+configured runtime; an external supervisor can restart this monitor process
+under a bounded policy, but must not use that action to resume a campaign or
+restart proof work. The commands do not install or configure a host service
+manager.
 
 ### Build the RSI guest image
 

@@ -14,6 +14,10 @@ export const rsiCliMain: RsiCliEntrypoint = async (argv, io) => {
 		const { rsiWorkerMain } = await import("./worker.js")
 		return rsiWorkerMain()
 	}
+	if (argv[0] === "rsi-status" || argv[0] === "rsi-monitor") {
+		const { rsiOperationsCliMain } = await import("./monitor-cli.js")
+		return rsiOperationsCliMain(argv.slice(1), argv[0] === "rsi-status" ? "status" : "monitor", io)
+	}
 	if (argv[0] === "rsi-benchmark") {
 		const { benchmarkMain } = await import("./benchmark/cli.js")
 		return benchmarkMain(argv.slice(1))
