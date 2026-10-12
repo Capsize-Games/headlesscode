@@ -24,6 +24,9 @@
  */
 
 import { execFileSync, spawn } from "node:child_process"
+import { constants as fsConstants } from "node:fs"
+import { access } from "node:fs/promises"
+import path from "node:path"
 import type OpenAI from "openai"
 
 import type { ToolContext, ToolResult } from "../engine/types.js"
@@ -143,14 +146,47 @@ interface OneFileResult {
 }
 
 /**
- * Run one test file via `npx --no-install tsx <file>` (the npm-test
- * invocation). The test path is treated as UNTRUSTED input (it comes from a
- * workspace's file names): it is passed as a separate argv element with
- * `shell: false`, so no shell metacharacter in it — `$()`, backticks, `;`,
- * `&`, spaces, quotes — can ever be interpreted (issue #62). `npx
- * --no-install` avoids any network fetch if the local tsx is missing.
+ * Resolve the tsx runner without touching the npm registry: the absolute
+ * HEADLESSCODE_TEST_TSX_PATH override when set, otherwise
+ * <workspaceRoot>/node_modules/.bin/tsx.
  */
-export function runOneTestFile(workspaceRoot: string, rel: string, timeoutS: number): Promise<OneFileResult> {
+async function resolveTestRunner(workspaceRoot: string): Promise<{ runner: string } | { error: string }> {
+	const configured = process.env.HEADLESSCODE_TEST_TSX_PATH ?? ""
+	if (configured !== "") {
+		if (!path.isAbsolute(configured)) {
+			return { error: `tsx runner not usable: HEADLESSCODE_TEST_TSX_PATH must be an absolute path (got ${JSON.stringify(configured)})` }
+		}
+		try {
+			await access(configured, fsConstants.X_OK)
+		} catch {
+			return { error: `tsx runner not usable: ${configured} is missing or not executable` }
+		}
+		return { runner: configured }
+	}
+	const local = path.join(workspaceRoot, "node_modules", ".bin", "tsx")
+	try {
+		await access(local, fsConstants.X_OK)
+	} catch {
+		return { error: `tsx runner not usable: ${local} is missing or not executable — install workspace dependencies or set absolute HEADLESSCODE_TEST_TSX_PATH to an existing executable (run_tests never fetches from the npm registry)` }
+	}
+	return { runner: local }
+}
+
+/**
+ * Run one test file via the local tsx executable (`<runner> <file>`, the
+ * npm-test invocation without npm resolution). The test path is treated as
+ * UNTRUSTED input (it comes from a workspace's file names): it is passed as
+ * a separate argv element with `shell: false`, so no shell metacharacter in
+ * it — `$()`, backticks, `;`, `&`, spaces, quotes — can ever be interpreted
+ * (issue #62). A missing/unusable runner is reported as a prompt error; no
+ * registry access is attempted.
+ */
+export async function runOneTestFile(workspaceRoot: string, rel: string, timeoutS: number): Promise<OneFileResult> {
+	const resolved = await resolveTestRunner(workspaceRoot)
+	if ("error" in resolved) {
+		return { rel, exitCode: null, output: `spawn error: ${resolved.error}`, timedOut: false }
+	}
+	const runner = resolved.runner
 	return new Promise((resolve) => {
 		let stdout = ""
 		let stderr = ""
@@ -166,7 +202,7 @@ export function runOneTestFile(workspaceRoot: string, rel: string, timeoutS: num
 
 		let child
 		try {
-			child = spawn("npx", ["--no-install", "tsx", rel], {
+			child = spawn(runner, [rel], {
 				cwd: workspaceRoot,
 				// `shell: false` (default) — argv is passed verbatim, never
 				// re-parsed by a shell. This is the actual security boundary.
