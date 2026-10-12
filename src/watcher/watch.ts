@@ -341,6 +341,7 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 	let state = input.state
 	let activeRunnerClaims: ClaimSnapshot[] = []
 	const foreignRunnerClaimIssues = new Set<number>()
+	const runnerPoolClaimConflictIssues = new Set<number>()
 	if (input.claimStore && input.runnerId && !dryRun) {
 		try {
 			const all = await input.claimStore.listActiveClaims()
@@ -421,8 +422,8 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 
 	// Accounting for the sweep log: how much of the deferral was maxPerSweep
 	// vs the global cap (both ≥ 0).
-	const maxPerSweepDeferred = newIssues.length - Math.min(newIssues.length, maxPerSweep)
-	const globalCapDeferred = deferred.length - maxPerSweepDeferred
+	let maxPerSweepDeferred = newIssues.length - Math.min(newIssues.length, maxPerSweep)
+	let globalCapDeferred = deferred.length - maxPerSweepDeferred
 
 	const dryRunPlan: SweepResult["dryRunPlan"] = dryRun ? [] : undefined
 	let spawned = 0
@@ -602,7 +603,10 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 				if (!acquired.acquired) {
 					state = markProcessed(state, pendingEntry(issue, targetLabel))
 					logger.info(`watcher: issue #${issue.number} deferred; claim ${acquired.reason} on runner ${acquired.claim.runnerId}`)
-					if (runnerPoolMode) runnerPoolCandidatesConsidered--
+					if (runnerPoolMode) {
+						runnerPoolCandidatesConsidered--
+						runnerPoolClaimConflictIssues.add(issue.number)
+					}
 					continue
 				}
 				ownedClaim = acquired.claim
@@ -744,6 +748,12 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 	state.lastSweep = new Date().toISOString()
 	if (runnerPoolMode) {
 		deferred = newIssues.filter((issue) => state.processed[String(issue.number)]?.status === "pending")
+		const eligibleIssues = newIssues.filter((issue) =>
+			!foreignRunnerClaimIssues.has(issue.number) && !runnerPoolClaimConflictIssues.has(issue.number),
+		).length
+		const withinPerSweepLimit = Math.min(eligibleIssues, maxPerSweep)
+		maxPerSweepDeferred = eligibleIssues - withinPerSweepLimit
+		globalCapDeferred = withinPerSweepLimit - Math.min(withinPerSweepLimit, available)
 	}
 	if (!dryRun) {
 		await saveWatcherState(statePath, state)
