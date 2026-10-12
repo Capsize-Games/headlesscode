@@ -21,6 +21,20 @@ export HEADLESSCODE_OPENROUTER_API_KEY='…'
 npx tsx scripts/monitor-pilot/live.ts collect-development
 ```
 
+Set a different request output cap and private artifact directory before the first run with `--max-output-tokens` and `--output-dir`. The cap must be an integer from 1 to 4096; the default is 512. The selected cap and resolved output directory are frozen in the manifest, so resume and held-out collection must use the same values:
+
+```sh
+npx tsx scripts/monitor-pilot/live.ts collect-development --max-output-tokens 2048 --output-dir "$HOME/.headlesscode/monitor-pilot-v3"
+npx tsx scripts/monitor-pilot/live.ts collect-heldout --max-output-tokens 2048 --output-dir "$HOME/.headlesscode/monitor-pilot-v3"
+```
+
+When starting a new frozen protocol in a new directory, preserve the shared allowance by copying the previous `global-budget.jsonl` before the first run. Stop the previous runner first, keep its ledger intact, and make a regular file copy with owner-only permissions; do not link, truncate, or recreate the ledger. On opening it, the runner checks the journal sequence and hashes and charges every unsettled reservation at its full token and wall-time reservation:
+
+```sh
+install -d -m 700 "$HOME/.headlesscode/monitor-pilot-v3"
+install -m 600 "$HOME/.headlesscode/monitor-pilot-v2/global-budget.jsonl" "$HOME/.headlesscode/monitor-pilot-v3/global-budget.jsonl"
+```
+
 If an earlier attempt is recorded as aborted or uncertain, inspect the private journal before choosing whether to retry:
 
 ```sh
