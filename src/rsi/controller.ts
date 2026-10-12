@@ -1329,7 +1329,8 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	if (fleetQueue) {
 		if (fleetQueue.artifactBackend !== "s3") throw new Error("RSI production runs require a shared S3-compatible artifact store")
 		await fleetQueue.migrate()
-		if (await fleetQueue.activeWorkerCount() < 1) throw new Error("no live OpenShell RSI worker is registered for the configured queue")
+		const requiredResourceClasses = ["CPU", workerProvider === "openshell-openrouter" ? "REMOTE_API" : "LOCAL_GPU"] as const
+		await fleetQueue.assertResourceClassCoverage(requiredResourceClasses)
 	}
 	if (config.workerHarnessPairId && !config.dryRun) {
 		if (!config.workerHarnessMode || !workerHarnessRuntime || !fleetQueue) throw new Error("restart-safe paired worker-harness campaigns require an explicit arm, frozen runtime identity, and PostgreSQL fleet queue")

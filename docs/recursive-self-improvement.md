@@ -1,15 +1,20 @@
 # Recursive Self-Improvement
 
 `headlesscode improve --dry-run` plans candidate worktrees. A real run requires
-a PostgreSQL queue, a shared S3-compatible artifact store, and at least one
-registered `headlesscode rsi-worker` connected to an OpenShell gateway. The
-coordinator queues a sanitized baseline visible evaluation, candidate mutation
+a PostgreSQL queue, a shared S3-compatible artifact store, and fresh worker
+registrations connected to OpenShell gateways that cover the run's mutation and
+evaluation resource classes. The coordinator queues a sanitized baseline visible
+evaluation, candidate mutation
 snapshots, and candidate visible evaluations; workers run each job in a fresh
 OpenShell guest. The coordinator applies returned patches, calculates fitness,
 compares results with the baseline, and owns the archive and candidate
 selection. Full visible-test output is content-addressed in the object store;
 PostgreSQL keeps bounded previews and artifact references. Hidden evaluation
-remains disabled.
+remains disabled. Before baseline work or campaign admission, the coordinator
+requires fresh worker registrations for every resource class used by the run.
+OpenRouter mutation and proof calls require `REMOTE_API`; baseline and candidate
+evaluation require `CPU`. A single worker may register both classes, or separate
+workers may provide them. A cloud mutation worker alone is insufficient.
 
 ## Candidate guest isolation check
 
@@ -329,6 +334,35 @@ queue must use the same queue policy and artifact-store identity.
 | `HEADLESSCODE_OPENSHELL_POLICY` | Required | Base OpenShell policy YAML. |
 | `HEADLESSCODE_OPENSHELL_IMAGE` | `headlesscode-openshell-rsi:local` | RSI guest image; custom images are rejected. |
 | `HEADLESSCODE_RSI_OLLAMA_HOST` | `host.openshell.internal` | Local Ollama host permitted by the RSI mutation policy. |
+
+Use the same queue name, maximum in-flight value, lease, retry, class-capacity,
+and key-capacity settings on the coordinator and every worker. `fleetQueuePolicy`
+builds this shared policy for both sides, and startup rejects a persisted policy
+that differs from the requested settings. For example, this explicit two-slot
+OpenRouter setup reserves one admission slot for each required class:
+
+```sh
+export HEADLESSCODE_RSI_QUEUE_NAME=rsi-cloud
+export HEADLESSCODE_RSI_MAX_IN_FLIGHT=2
+export HEADLESSCODE_RSI_CLASS_CAPACITY='{"REMOTE_API":1,"CPU":1}'
+export HEADLESSCODE_RSI_ROLE_WORKER_PROVIDER=openrouter
+export HEADLESSCODE_RSI_ROLE_WORKER_MODEL=meta/muse-spark-1.3-contributor
+export HEADLESSCODE_RSI_ROLE_WORKER_OPENROUTER_PROFILE=muse-spark-contributor
+
+# Start each in its own process with the remaining shared database, artifact,
+# gateway, and credential settings configured for that host.
+HEADLESSCODE_RSI_WORKER_ID=mutation-1 HEADLESSCODE_RSI_WORKER_RESOURCE_CLASSES=REMOTE_API headlesscode rsi-worker
+HEADLESSCODE_RSI_WORKER_ID=evaluation-1 HEADLESSCODE_RSI_WORKER_RESOURCE_CLASSES=CPU headlesscode rsi-worker
+
+# Run the coordinator with a matching in-flight cap.
+headlesscode improve --repo . --max-concurrent 2
+```
+
+The `CPU` class here runs regression, typecheck, and visible evaluation
+commands; it does not select a local language model. A worker with a stale
+heartbeat is not eligible. Missing class coverage produces an admission error
+that identifies the class and worker setting to configure, before baseline jobs,
+campaign admission, or inference reservations are created.
 
 ### OpenRouter mutation and development-proof jobs
 

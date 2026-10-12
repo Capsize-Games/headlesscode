@@ -85,6 +85,19 @@ export function fleetQueuePolicy(queueName: string, maxInFlight: number, env: No
 	})
 }
 
+/** Return required classes that have no live registered worker capacity under this queue policy. */
+export function missingFleetResourceClasses(
+	required: readonly ResourceClass[],
+	eligibleWorkerSlots: Partial<Record<ResourceClass, number>>,
+	policy: FleetQueuePolicy,
+): ResourceClass[] {
+	return [...new Set(required)].filter((resourceClass) => {
+		const slots = eligibleWorkerSlots[resourceClass] ?? 0
+		const classCapacity = policy.classCapacity?.[resourceClass] ?? policy.maxInFlight
+		return !Number.isSafeInteger(slots) || slots < 1 || classCapacity < 1
+	})
+}
+
 export interface FleetWorkerRegistration {
 	workerId: string
 	gatewayId: string
@@ -353,6 +366,29 @@ export class PostgresRsiJobQueue {
 			[this.policy.queueName, this.policy.leaseMs * 2, resourceClass ?? null],
 		)
 		return Number(result.rows[0]?.count ?? 0)
+	}
+
+	async assertResourceClassCoverage(required: readonly ResourceClass[]): Promise<void> {
+		const classes = [...new Set(required)]
+		if (classes.length === 0) return
+		const result = await this.pool.query(
+			`SELECT required.resource_class,
+				COALESCE(SUM(worker.max_active), 0)::int AS worker_slots
+			 FROM unnest($2::text[]) AS required(resource_class)
+			 LEFT JOIN headlesscode_rsi_workers AS worker
+				ON worker.queue_name=$1 AND worker.active=true
+				AND worker.heartbeat_at > clock_timestamp()-($3::text || ' milliseconds')::interval
+				AND worker.resource_classes @> jsonb_build_array(required.resource_class)
+			 GROUP BY required.resource_class`,
+			[this.policy.queueName, classes, this.policy.leaseMs * 2],
+		)
+		const eligibleWorkerSlots: Partial<Record<ResourceClass, number>> = {}
+		for (const row of result.rows) eligibleWorkerSlots[row.resource_class as ResourceClass] = Number(row.worker_slots)
+		const missing = missingFleetResourceClasses(classes, eligibleWorkerSlots, this.policy)
+		if (missing.length > 0) {
+			const details = missing.map((resourceClass) => `${resourceClass} (no fresh worker slot or queue capacity)`).join(", ")
+			throw new Error(`RSI fleet admission requires live worker capacity for ${details}; start a worker registered with HEADLESSCODE_RSI_WORKER_RESOURCE_CLASSES including each missing class and verify its shared queue policy`)
+		}
 	}
 
 	async stopWorker(workerId: string): Promise<void> {

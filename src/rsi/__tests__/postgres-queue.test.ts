@@ -6,7 +6,7 @@ import test from "node:test"
 import { S3RsiArtifactStore } from "../artifact-store.js"
 import { FileRsiArtifactStore } from "../artifact-store.js"
 import type { OpenRouterBrokerGrant, OpenRouterCallReservation, OpenRouterBrokerLimits, OpenRouterEndpointPriceSnapshot } from "../inference-broker.js"
-import { fleetJobMatches, fleetQueuePolicy, PostgresRsiJobQueue, requiredFleetJobLeaseMs, type FleetJob, type FleetJobIdentity, type FleetJobPayload, type FleetQueuePolicy } from "../postgres-queue.js"
+import { fleetJobMatches, fleetQueuePolicy, missingFleetResourceClasses, PostgresRsiJobQueue, requiredFleetJobLeaseMs, type FleetJob, type FleetJobIdentity, type FleetJobPayload, type FleetQueuePolicy } from "../postgres-queue.js"
 
 test("fleet job replay identity rejects stale snapshots, tasks, base commits, evaluation config, and routing", () => {
 	const expected: FleetJobIdentity = {
@@ -60,6 +60,38 @@ test("evaluation lease budget scales with every configured visible command", () 
 	assert.equal(oneCommand, 2 * (timeoutMs * 3 + 180_000))
 	assert.equal(threeCommands, 4 * (timeoutMs * 3 + 180_000))
 	assert.ok(threeCommands > oneCommand)
+})
+
+test("fleet resource coverage requires every fresh worker class under the persisted capacity policy", () => {
+	const policy = fleetQueuePolicy("rsi-default", 2, { HEADLESSCODE_RSI_CLASS_CAPACITY: '{"CPU":1,"REMOTE_API":1}' })
+	assert.deepEqual(missingFleetResourceClasses(["REMOTE_API", "CPU"], { REMOTE_API: 1, CPU: 1 }, policy), [], "separate or combined live workers cover the two required classes")
+	assert.deepEqual(missingFleetResourceClasses(["REMOTE_API", "CPU"], { REMOTE_API: 1 }, policy), ["CPU"], "a stale CPU worker is absent from live eligible capacity")
+	assert.deepEqual(missingFleetResourceClasses(["REMOTE_API", "CPU"], { REMOTE_API: 1, CPU: 1 }, { ...policy, classCapacity: { CPU: 0, REMOTE_API: 1 } }), ["CPU"], "a persisted class policy with no available capacity fails closed")
+})
+
+test("PostgreSQL worker coverage accepts separate or combined workers and ignores stale registrations", { skip: !databaseUrl }, async () => {
+	const schema = `rsi_coverage_${randomUUID().replaceAll("-", "")}`
+	const root = await import("node:fs/promises").then(({ mkdtemp }) => mkdtemp(`${process.env.TMPDIR ?? "/tmp"}/rsi-coverage-test-`))
+	const admin = new Pool({ connectionString: databaseUrl })
+	await admin.query(`CREATE SCHEMA ${schema}`)
+	const pool = new Pool({ connectionString: databaseUrl, options: `-c search_path=${schema}` })
+	const policy = testPolicy(`coverage-${randomUUID().slice(0, 8)}`, { maxInFlight: 2, classCapacity: { REMOTE_API: 1, CPU: 1 } })
+	const queue = new PostgresRsiJobQueue(pool, policy, new FileRsiArtifactStore(root))
+	try {
+		await queue.migrate()
+		await queue.registerWorker({ workerId: "remote", gatewayId: "remote-gateway", hostname: "remote-host", maxActive: 1, resourceClasses: ["REMOTE_API"] })
+		await queue.registerWorker({ workerId: "eval", gatewayId: "eval-gateway", hostname: "eval-host", maxActive: 1, resourceClasses: ["CPU"] })
+		await queue.assertResourceClassCoverage(["REMOTE_API", "CPU"])
+		await pool.query("UPDATE headlesscode_rsi_workers SET heartbeat_at=clock_timestamp()-interval '5 minutes' WHERE worker_id='eval'")
+		await assert.rejects(queue.assertResourceClassCoverage(["REMOTE_API", "CPU"]), /CPU/)
+		await queue.registerWorker({ workerId: "combined", gatewayId: "combined-gateway", hostname: "combined-host", maxActive: 1, resourceClasses: ["REMOTE_API", "CPU"] })
+		await queue.assertResourceClassCoverage(["REMOTE_API", "CPU"])
+	} finally {
+		await queue.close().catch(() => undefined)
+		await admin.query(`DROP SCHEMA ${schema} CASCADE`)
+		await admin.end()
+		await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true }))
+	}
 })
 
 test("PostgreSQL migrations upgrade an earlier artifact and lease schema", { skip: !databaseUrl }, async () => {

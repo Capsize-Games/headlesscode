@@ -1,6 +1,6 @@
 {
 	"name": "headlesscode",
-	"version": "1.9.8",
+	"version": "1.9.9",
 	"description": "Coding-agent harness with CLI and HTTP interfaces, parallel Git worktree orchestration, and bounded recursive self-improvement (RSI).",
 	"license": "Apache-2.0",
 	"repository": {
