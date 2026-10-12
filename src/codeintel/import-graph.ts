@@ -165,7 +165,7 @@ export function formatImportGraph(
 	if (importers.length === 0) {
 		out.push("  (none)")
 	}
-	for (const importer of importers.sort()) {
+	for (const importer of [...importers].sort()) {
 		out.push(`  ${displayPath(workspaceRoot, importer)}`)
 	}
 
