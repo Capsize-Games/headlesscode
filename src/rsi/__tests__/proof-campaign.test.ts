@@ -138,6 +138,12 @@ test("controller freezes paired broker allocations as separate campaigns under o
 		const campaignId = `paired-controller-${randomUUID()}`
 		const oldEnv = { ...process.env }
 		try {
+			for (const key of [
+				"HEADLESSCODE_RSI_OPENROUTER_MUTATION_MAX_TOTAL_TOKENS",
+				"HEADLESSCODE_RSI_OPENROUTER_MUTATION_MAX_JOB_SPEND_USD",
+				"HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_MAX_TOTAL_TOKENS",
+				"HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_MAX_JOB_SPEND_USD",
+			]) delete process.env[key]
 			Object.assign(process.env, {
 				HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD: "0.32",
 				HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD: "0.04",
