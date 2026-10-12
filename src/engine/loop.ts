@@ -3529,6 +3529,13 @@ export class HeadlessSession {
 		const readOnlyStallLimit = envReadOnlyStallLimit()
 		let readOnlyStreak = 0
 		let readOnlyNudgeInjected = false
+		// Opt-in bound for read/search churn after a landed edit (issue #90).
+		const postEditLimitRaw = process.env.HEADLESSCODE_POST_EDIT_READ_ONLY_LIMIT ?? "0"
+		const postEditLimit = /^\d+$/.test(postEditLimitRaw) && Number.isSafeInteger(Number(postEditLimitRaw))
+			? Number(postEditLimitRaw) : 0
+		let postEditArmed = false
+		let postEditReadStreak = 0
+		let postEditWarned = false
 		// Identical-consecutive-call guardrail (see
 		// DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD's doc comment): tracks the
 		// canonical signature of the LAST turn's tool call batch and how many
@@ -5249,6 +5256,37 @@ export class HeadlessSession {
 			previousIterationTools = Object.freeze(boundaryTools.map((record) => Object.freeze(record)))
 			if (this.evidenceFault && this.evidenceRequired) {
 				return { status: "error", reason: "evidence", error: `${this.evidenceFault}; session ended incomplete`, iterations: iteration, toolCalls }
+			}
+
+			if (postEditLimit > 0) {
+				// Child records carry actual batch outcomes; the aggregate batch
+				// result must not turn a failed/skipped write into progress.
+				const leaves = boundaryTools.filter(record => record.name !== "batch")
+				const isExploration = (record: IterationBoundaryToolRecord) =>
+					record.name === "codebase_search" || isParallelReadOnlyCall(
+						this.config.workspaceRoot, { name: record.name, args: record.arguments }, new Set(),
+					)
+				const successfulEdit = leaves.some(record => !record.isError && editToolTargetPath(
+					this.config.workspaceRoot, { name: record.name, args: record.arguments },
+				) !== undefined)
+				if (successfulEdit) postEditArmed = true
+				const productive = leaves.some(record => !record.isError && !isExploration(record))
+				if (productive) {
+					postEditReadStreak = 0
+					postEditWarned = false
+				} else if (postEditArmed && leaves.length > 0 && leaves.every(isExploration)) {
+					postEditReadStreak++
+					if (!postEditWarned && postEditReadStreak >= Math.ceil(postEditLimit / 2)) {
+						postEditWarned = true
+						this.logger.warn("[loop] post-edit exploration warning", { postEditReadStreak, postEditLimit })
+						this.appendMessage(messages, { role: "user", content:
+							"[System: an edit has landed, but subsequent turns only read/search. Run the relevant tests, commit, and call attempt_completion. Continued exploration will stop for independent supervisor qualification.]" })
+					}
+					if (postEditReadStreak >= postEditLimit) {
+						await this.saveIterationCheckpoint(iteration)
+						return this.boundedFailure("post-edit exploration stagnation", iteration, toolCalls, postEditReadStreak, postEditLimit)
+					}
+				}
 			}
 
 			// Blind tree-walking guardrail (P1.6): after N consecutive
