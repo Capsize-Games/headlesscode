@@ -20,7 +20,7 @@ const campaign = {
 	deadline_expired: false, max_spend_microusd: "1000000", reserved_spend_microusd: "100", used_spend_microusd: "50",
 }
 
-function fixturePool(options: { malformedWorker?: boolean; throwOnQuery?: boolean; queueRows?: Array<Record<string, unknown>>; invalidReceipt?: boolean; finishedPastDeadline?: boolean; idleActiveCampaign?: boolean; armEpoch?: string; armState?: string; armPhase?: string; attemptRows?: Array<Record<string, unknown>>; delayMs?: number } = {}) {
+function fixturePool(options: { malformedWorker?: boolean; throwOnQuery?: boolean; queueRows?: Array<Record<string, unknown>>; invalidReceipt?: boolean; finishedPastDeadline?: boolean; idleActiveCampaign?: boolean; armEpoch?: string; armState?: string; armPhase?: string; armIds?: string[]; attemptRows?: Array<Record<string, unknown>>; delayMs?: number } = {}) {
 	const statements: Array<{ sql: string; values?: unknown[] }> = []
 	let released = 0
 	const client = {
@@ -36,7 +36,7 @@ function fixturePool(options: { malformedWorker?: boolean; throwOnQuery?: boolea
 				: sql.includes("FROM headlesscode_rsi_jobs") && sql.includes("GROUP BY status") ? options.queueRows ?? (options.idleActiveCampaign ? [] : [{ status: "queued", count: "1", expired_leases: "0", pending_teardown: "0", attempts_total: "0" }])
 				: sql.includes("FROM headlesscode_rsi_jobs") ? []
 				: sql.includes("FROM headlesscode_rsi_proof_campaigns") ? [{ ...campaign, state: options.finishedPastDeadline ? "finished" : campaign.state, deadline_expired: options.finishedPastDeadline ?? false, deadline_at: options.finishedPastDeadline ? new Date(Date.now() - 60_000) : campaign.deadline_at, reserved_spend_microusd: options.finishedPastDeadline || options.idleActiveCampaign ? "0" : campaign.reserved_spend_microusd, used_spend_microusd: options.finishedPastDeadline ? "100" : options.idleActiveCampaign ? "50" : campaign.used_spend_microusd }]
-				: sql.includes("FROM headlesscode_rsi_proof_campaign_arms") ? ["arm-a", "arm-b"].map((arm_id) => ({ arm_id, epoch: options.armEpoch ?? "1", state: options.finishedPastDeadline ? "finished" : options.armState ?? "running", phase: options.armPhase ?? "development", coordinator_id: null, lease_expires_at: new Date(Date.now() + 30_000), lease_fresh: true }))
+				: sql.includes("FROM headlesscode_rsi_proof_campaign_arms") ? (options.armIds ?? ["fixed-control", "self-hosted"]).map((arm_id) => ({ arm_id, epoch: options.armEpoch ?? "1", state: options.finishedPastDeadline ? "finished" : options.armState ?? "running", phase: options.armPhase ?? "development", coordinator_id: null, lease_expires_at: new Date(Date.now() + 30_000), lease_fresh: true }))
 				: sql.includes("FROM headlesscode_rsi_proof_campaign_attempts") ? options.finishedPastDeadline || options.idleActiveCampaign ? [] : options.attemptRows ?? [{ status: "dispatched", count: "1" }]
 				: sql.includes("FROM headlesscode_rsi_inference_campaigns AS campaigns") ? [options.invalidReceipt
 					? { campaign_id: "campaign-test:mutation", state: "complete", count: "1", reserved_count: "0", unmeasured_count: "0", invalid_receipts: "1", reserved_microusd: "100" }
@@ -68,6 +68,8 @@ test("status reads bounded operational metadata in one read-only snapshot withou
 	assert.equal(fixture.released, 1)
 	assert.ok(fixture.statements.every(({ sql }) => !/\b(payload|manifest|prompt|capability_sha256|artifact_refs|proof)\b/i.test(sql)), "monitor SQL must not read payload or proof contents")
 	assert.ok(fixture.statements.some(({ sql, values }) => sql.includes("heartbeat_at > clock_timestamp()") && values?.[1] === 10_000), "freshness uses twice the persisted lease interval")
+	assert.deepEqual(fixture.statements.find(({ sql }) => sql.includes("FROM headlesscode_rsi_proof_campaign_arms"))?.values, ["campaign-test"])
+	assert.deepEqual(result.campaign.arms.map((arm) => [arm.armId, arm.registered]), [["fixed-control", true], ["self-hosted", true]])
 	const baseFingerprint = await readRsiOperationsStatus(fixturePool({ idleActiveCampaign: true }).pool, statusOptions)
 	const changedEpoch = await readRsiOperationsStatus(fixturePool({ idleActiveCampaign: true, armEpoch: "2" }).pool, statusOptions)
 	const changedPhase = await readRsiOperationsStatus(fixturePool({ idleActiveCampaign: true, armPhase: "confirmation" }).pool, statusOptions)
@@ -120,6 +122,39 @@ test("monitor stalls active work between admissions but leaves settled terminal 
 	const uncertainCampaign = uncertain.campaign as Record<string, unknown>
 	assert.equal(uncertainQueue.expiredLeases, 1, "stall reporting preserves the expired-lease count")
 	assert.equal(uncertainCampaign.unsettledAttempts, 1, "stall reporting preserves uncertain campaign attempts")
+})
+
+test("monitor reports zero, sequential one, and both supported arm registrations explicitly", async () => {
+	const stages: Array<{ label: string; armIds: string[]; registered: boolean[] }> = [
+		{ label: "before first arm registration", armIds: [], registered: [false, false] },
+		{ label: "fixed-control registered first", armIds: ["fixed-control"], registered: [true, false] },
+		{ label: "self-hosted registered second", armIds: ["fixed-control", "self-hosted"], registered: [true, true] },
+	]
+	for (const stage of stages) {
+		const status = await readRsiOperationsStatus(fixturePool({ armIds: stage.armIds }).pool, statusOptions)
+		assert.notEqual(status.health, "unknown", stage.label)
+		assert.deepEqual(status.campaign.arms.map((arm) => [arm.armId, arm.registered]), [
+			["fixed-control", stage.registered[0]], ["self-hosted", stage.registered[1]],
+		], stage.label)
+		assert.equal(status.campaign.terminal, false, "nonterminal registration status does not imply completion or acceptance")
+		assert.equal(status.queue.jobCounts.queued, 1, "queue status remains available while arms register sequentially")
+		assert.equal(status.campaign.rootBudgetMicrousd.reserved, 100, "budget accounting remains available while arms register sequentially")
+		if (stage.label === "fixed-control registered first") assert.deepEqual(status.campaign.arms[1], {
+			registered: false, armId: "self-hosted", epoch: null, state: "unregistered", phase: null,
+			coordinatorId: null, leaseExpiresAt: null, leaseFresh: null,
+		}, "the absent paired arm is explicit rather than silently omitted")
+	}
+	const unknownArm = await readRsiOperationsStatus(fixturePool({ armIds: ["fixed-control", "unexpected"] }).pool, statusOptions)
+	assert.equal(unknownArm.health, "unknown", "an unsupported arm ID is not treated as an absent supported arm")
+	const duplicateArm = await readRsiOperationsStatus(fixturePool({ armIds: ["fixed-control", "fixed-control"] }).pool, statusOptions)
+	assert.equal(duplicateArm.health, "unknown", "duplicate arm registrations fail closed")
+	assert.equal((await readRsiOperationsStatus(fixturePool({ armState: "mystery" }).pool, statusOptions)).health, "unknown", "unknown registered arm states fail closed")
+	assert.equal((await readRsiOperationsStatus(fixturePool({ armPhase: "unknown" }).pool, statusOptions)).health, "unknown", "unknown registered arm phases fail closed")
+	assert.equal((await readRsiOperationsStatus(fixturePool({ armEpoch: "9007199254740992" }).pool, statusOptions)).health, "unknown", "unsafe arm epochs fail closed")
+	const terminalMissingArm = await readRsiOperationsStatus(fixturePool({ finishedPastDeadline: true, armIds: ["fixed-control"] }).pool, statusOptions)
+	assert.equal(terminalMissingArm.health, "unhealthy", "a terminal campaign missing a paired arm cannot be healthy")
+	assert.equal(terminalMissingArm.condition, "terminal-campaign-arm-state-mismatch")
+	assert.equal(terminalMissingArm.campaign.terminal, false)
 })
 
 test("database outage and malformed operational rows produce unknown, never healthy", async () => {

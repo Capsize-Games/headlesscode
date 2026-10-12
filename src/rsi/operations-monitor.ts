@@ -13,6 +13,7 @@ const MAX_QUERY_TIMEOUT_MS = 30_000
 const MAX_POLL_MS = 60_000
 const MAX_MONITOR_RUNTIME_MS = 86_400_000
 const MAX_STALL_MS = 604_800_000
+const SUPPORTED_PROOF_ARMS = ["fixed-control", "self-hosted"] as const
 const REQUIRED_TABLES = [
 	"headlesscode_rsi_queue_policy",
 	"headlesscode_rsi_workers",
@@ -291,16 +292,22 @@ export async function readRsiOperationsStatus(pool: RsiMonitorPool, options: Rsi
 		const rootCeiling = safeInteger(campaign.max_spend_microusd, "root budget")
 		const rootReserved = safeInteger(campaign.reserved_spend_microusd, "root reserved budget")
 		const rootSpent = safeInteger(campaign.used_spend_microusd, "root spent budget")
-		if (armResult.rows.length !== 2) throw new Error("campaign must have exactly two arms for a trustworthy status")
-		const arms = armResult.rows.map((row) => {
+		const registeredArms = new Map<string, Record<string, unknown>>()
+		for (const row of armResult.rows) {
+			const armId = safeEnum(row.arm_id, SUPPORTED_PROOF_ARMS, "proof arm")
+			if (registeredArms.has(armId)) throw new Error("duplicate proof arm registration")
 			if (typeof row.lease_fresh !== "boolean") throw new Error("invalid arm lease state")
-			return {
-				armId: identifier(row.arm_id), epoch: safeInteger(row.epoch, "arm epoch"),
+			registeredArms.set(armId, {
+				registered: true, armId, epoch: safeInteger(row.epoch, "arm epoch"),
 				state: safeEnum(row.state, ["planned", "running", "evaluated", "selected", "rejected", "confirmed", "finished"] as const, "arm state"),
 				phase: safeEnum(row.phase, ["development", "confirmation"] as const, "arm phase"),
 				coordinatorId: row.coordinator_id === null ? null : identifier(row.coordinator_id),
 				leaseExpiresAt: row.lease_expires_at === null ? null : iso(row.lease_expires_at, "arm lease expiry"), leaseFresh: row.lease_fresh,
-			}
+			})
+		}
+		const arms = SUPPORTED_PROOF_ARMS.map((armId) => registeredArms.get(armId) ?? {
+			registered: false, armId, epoch: null, state: "unregistered", phase: null,
+			coordinatorId: null, leaseExpiresAt: null, leaseFresh: null,
 		})
 		const attemptCounts = countRows(attemptResult.rows, "status", "campaign attempt", ["admitted", "dispatched", "completed", "uncertain", "failed", "incomplete", "skipped-after-hard-gate", "not-selected"])
 		const unsettledAttempts = safeSum(["admitted", "dispatched", "uncertain", "incomplete"].map((key) => attemptCounts[key] ?? 0), "unsettled attempt count")
@@ -320,7 +327,7 @@ export async function readRsiOperationsStatus(pool: RsiMonitorPool, options: Rsi
 			return { role, recorded: true, ceiling, spent, reserved, unsettled: reserved, blocked: row.blocked, calls }
 		})
 		const brokerReserved = safeSum(inferenceBudgetsMicrousd.map((budget) => budget.reserved ?? 0), "inference reserved budget sum")
-		const armsFinished = arms.length === 2 && arms.every((arm) => arm.state === "finished")
+		const armsFinished = SUPPORTED_PROOF_ARMS.every((armId) => registeredArms.get(armId)?.state === "finished")
 		const terminal = campaignState === "finished" && armsFinished
 		const armLeaseExpired = arms.some((arm) => arm.state === "running" && arm.leaseFresh === false)
 		const assessment = healthCondition({
@@ -334,7 +341,7 @@ export async function readRsiOperationsStatus(pool: RsiMonitorPool, options: Rsi
 		}
 		const progressFingerprint = createHash("sha256").update(JSON.stringify({
 			jobCounts, attemptsTotal, campaignState, sequence, attemptCounts, rootCeiling, rootSpent, rootReserved,
-			arms: arms.map((arm) => ({ armId: arm.armId, epoch: arm.epoch, state: arm.state, phase: arm.phase })),
+			arms: arms.map((arm) => ({ registered: arm.registered, armId: arm.armId, epoch: arm.epoch, state: arm.state, phase: arm.phase })),
 				inference: inferenceBudgetsMicrousd.map(({ role, recorded, ceiling, spent, reserved, calls }) => ({ role, recorded, ceiling, spent, reserved, calls })),
 		})).digest("hex")
 		await client.query("COMMIT")
