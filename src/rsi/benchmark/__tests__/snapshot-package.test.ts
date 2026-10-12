@@ -4,6 +4,7 @@ import { createHash } from "node:crypto"
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
 import { benchmarkTreeDigest, loadBenchmark, materializeBenchmarkSnapshot } from "../runner.js"
+import { loadBoundProofBenchmarkFixtures, loadProofBenchmarkFixtures } from "../proof-fixtures.js"
 import { buildSnapshotPackage, MAX_SNAPSHOT_PACKAGE_BLOB_BYTES } from "../snapshot-package.js"
 import type { BenchmarkSnapshotPackageDescriptor, BenchmarkTask } from "../types.js"
 
@@ -103,6 +104,20 @@ try {
 	const loaded = await loadBenchmark(fixtureRoot, emptyRepo)
 	assert.ok(loaded.snapshotPackage, "new runner loads its explicitly pinned local package")
 	assert.equal(loaded.snapshotPackage.digest, descriptor.digest)
+	const fixtureBinding = (await loadProofBenchmarkFixtures(fixtureRoot, emptyRepo)).binding
+	assert.deepEqual(fixtureBinding.snapshotPackage, { path: "snapshots", digest: descriptor.digest })
+	assert.equal((await loadBoundProofBenchmarkFixtures(fixtureBinding, emptyRepo)).snapshotPackage?.digest, descriptor.digest, "external manifest and package index match the frozen supervisor binding")
+	const originalManifest = await fs.readFile(path.join(fixtureRoot, "manifest.json"))
+	const changedManifest = JSON.parse(originalManifest.toString("utf8")) as { tasks: Array<{ task: string }> }
+	changedManifest.tasks[0]!.task += " changed after admission"
+	await fs.writeFile(path.join(fixtureRoot, "manifest.json"), `${JSON.stringify(changedManifest, null, 2)}\n`)
+	await assert.rejects(loadBoundProofBenchmarkFixtures(fixtureBinding, emptyRepo), /proof benchmark manifest differs from its frozen binding/)
+	await fs.writeFile(path.join(fixtureRoot, "manifest.json"), originalManifest)
+	const verifierFile = path.join(fixtureRoot, verifierPath)
+	const originalVerifier = await fs.readFile(verifierFile)
+	await fs.writeFile(verifierFile, Buffer.concat([originalVerifier, Buffer.from("changed after admission")]))
+	await assert.rejects(loadBoundProofBenchmarkFixtures(fixtureBinding, emptyRepo), /verifier digest mismatch/)
+	await fs.writeFile(verifierFile, originalVerifier)
 	const candidateRoot = path.join(tempRoot, "candidate-start")
 	await materializeBenchmarkSnapshot(tasks[0]!, emptyRepo, candidateRoot, loaded.snapshotPackage)
 	assert.equal(await fs.readFile(path.join(candidateRoot, "value.txt"), "utf8"), "one\n")
@@ -118,6 +133,7 @@ try {
 
 	await fs.writeFile(path.join(packagePath, "index.json"), Buffer.concat([originalIndex, Buffer.from(" ")]))
 	await assert.rejects(loadBenchmark(fixtureRoot, emptyRepo), /pinned snapshot package digest mismatch/)
+	await assert.rejects(loadBoundProofBenchmarkFixtures(fixtureBinding, emptyRepo), /pinned snapshot package digest mismatch/, "execution validation rejects changed index bytes")
 	await fs.writeFile(path.join(packagePath, "index.json"), originalIndex)
 
 	const wrongBlobIdentity = JSON.parse(originalIndex.toString("utf8")) as typeof index

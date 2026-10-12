@@ -39,6 +39,7 @@ import type { DevelopmentTaskCell } from "./development-proof.js"
 import type { BenchmarkAttempt } from "./benchmark/types.js"
 import type { BenchmarkManifest } from "./benchmark/types.js"
 import { runDevelopmentBenchmarkForCommit } from "./development-benchmark.js"
+import { loadBoundProofBenchmarkFixtures } from "./benchmark/proof-fixtures.js"
 import { workerHarnessConfigDigest, workerHarnessRuntimeIdentityFromEnvironment, validWorkerHarnessRuntimeIdentity, effectiveWorkerHarnessMode } from "./worker-harness.js"
 import { workerHarnessCliPath } from "./worker-harness.js"
 import { PostgresProofCampaign, proofCampaignManifestDigest, type ProofCampaignArmLease, type ProofCampaignManifest } from "./proof-campaign.js"
@@ -366,7 +367,7 @@ export function createProofCampaignManifest(args: {
 			root: { maxCalls: rootCalls, maxTokens: rootTokens, maxSpendUsd: Math.min(campaignBudget.totalUsd, reservations.total / 1_000_000), maxRuntimeMs },
 		},
 		acceptanceRule: { ...args.proofProtocol.rule, confirmationRetentionTaskIds: engineeringOnly ? [] : [...RSI_CONFIRMATION_RETENTION_TASK_IDS], minimumSelfHostedCampaigns: 2, requiredSuccessiveTransitions: 2, clusterConfidence: 0.9 }, runtime: { imageDigest: args.runtime.imageDigest, harnessCommit: args.runtime.harnessCommit, dependencyLockDigest: args.runtime.dependencyLockDigest },
-		analysisVersion: args.proofProtocol.schemaVersion.toString(), settings: { phaseMode: engineeringOnly ? "engineering-only" : "paired-confirmation", configDigest: workerHarnessConfigDigest(args.config, { baseCommit: args.baseCommit, model: args.model, provider: args.provider, proofProtocolDigest: args.proofProtocol.protocolDigest }), effectiveConfig: Object.fromEntries(Object.entries(args.config).filter(([key]) => !["workerHarnessMode", "workerHarnessPhase", "workerHarnessEngineeringOnly", "workerHarnessPairId", "workerHarnessRunId", "resumeRunId", "candidateIdNamespace", "workerHarnessParentCommit", "workerHarnessSnapshotTreeDigest", "hiddenSuitePath", "hiddenPublicKeyPath", "hiddenPrivateKeyPath", "hiddenNonceStorePath", "evaluatorSigningKeyPath", "evaluatorTrustedPublicKeyPath"].includes(key))), candidateCounts, taskWallBoundMs, evaluationCells: ["regression", "typecheck", ...args.config.evalCommands.map((_, index) => `visible-${index}`)], developmentTaskIdentities: benchmarkTasks.map((task) => ({ id: task.id, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings })), confirmationTaskIdentities: engineeringOnly ? [] : confirmationTasks.map((task) => ({ id: task.id, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings })), inferenceCeilings: { maxInputTokensPerCall: benchmarkLimits.maxInputTokensPerCall, maxOutputTokensPerCall: benchmarkLimits.maxOutputTokensPerCall, maxCallsPerAttempt: benchmarkLimits.maxCalls, maxTotalTokens: benchmarkLimits.maxTotalTokens, maxCallSpendUsd: benchmarkLimits.maxCallSpendUsd, maxJobSpendUsd: benchmarkLimits.maxJobSpendUsd, maxInputPricePerMillionUsd: benchmarkLimits.maxInputPricePerMillionUsd, maxOutputPricePerMillionUsd: benchmarkLimits.maxOutputPricePerMillionUsd }, inferenceCampaignIds: { mutation: mutationCampaignId, benchmark: benchmarkCampaignId }, inferenceAllocationsUsd: { mutation: mutationLimits.maxCampaignSpendUsd, benchmark: benchmarkLimits.maxCampaignSpendUsd } },
+		analysisVersion: args.proofProtocol.schemaVersion.toString(), settings: { phaseMode: engineeringOnly ? "engineering-only" : "paired-confirmation", configDigest: workerHarnessConfigDigest(args.config, { baseCommit: args.baseCommit, model: args.model, provider: args.provider, proofProtocolDigest: args.proofProtocol.protocolDigest }), effectiveConfig: Object.fromEntries(Object.entries(args.config).filter(([key]) => !["workerHarnessMode", "workerHarnessPhase", "workerHarnessEngineeringOnly", "workerHarnessPairId", "workerHarnessRunId", "resumeRunId", "candidateIdNamespace", "workerHarnessParentCommit", "workerHarnessSnapshotTreeDigest", "hiddenSuitePath", "hiddenPublicKeyPath", "hiddenPrivateKeyPath", "hiddenNonceStorePath", "evaluatorSigningKeyPath", "evaluatorTrustedPublicKeyPath", "proofBenchmarkFixtures"].includes(key))), candidateCounts, taskWallBoundMs, evaluationCells: ["regression", "typecheck", ...args.config.evalCommands.map((_, index) => `visible-${index}`)], developmentTaskIdentities: benchmarkTasks.map((task) => ({ id: task.id, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings })), confirmationTaskIdentities: engineeringOnly ? [] : confirmationTasks.map((task) => ({ id: task.id, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings })), inferenceCeilings: { maxInputTokensPerCall: benchmarkLimits.maxInputTokensPerCall, maxOutputTokensPerCall: benchmarkLimits.maxOutputTokensPerCall, maxCallsPerAttempt: benchmarkLimits.maxCalls, maxTotalTokens: benchmarkLimits.maxTotalTokens, maxCallSpendUsd: benchmarkLimits.maxCallSpendUsd, maxJobSpendUsd: benchmarkLimits.maxJobSpendUsd, maxInputPricePerMillionUsd: benchmarkLimits.maxInputPricePerMillionUsd, maxOutputPricePerMillionUsd: benchmarkLimits.maxOutputPricePerMillionUsd }, inferenceCampaignIds: { mutation: mutationCampaignId, benchmark: benchmarkCampaignId }, inferenceAllocationsUsd: { mutation: mutationLimits.maxCampaignSpendUsd, benchmark: benchmarkLimits.maxCampaignSpendUsd } },
 	}
 }
 
@@ -662,7 +663,7 @@ function fleetRuntimeDeadlineMs(config: RsiConfig, run: RsiRunRecord): number | 
 	return config.maxRuntimeMs === undefined ? undefined : Date.parse(run.startedAt) + config.maxRuntimeMs
 }
 
-function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: { content: Buffer; snapshotCommit: string; snapshotTreeDigest?: string }, options: { campaignId?: string; boundedInference?: boolean; includeWorkerHarness?: boolean; proofCampaign?: FleetJobPayload["proofCampaign"]; remainingCampaignMs?: number; evaluatorRuntime?: Pick<EvaluatorRuntimeIdentity, "imageDigest" | "policySha256"> } = {}): FleetJobPayload {
+export function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: { content: Buffer; snapshotCommit: string; snapshotTreeDigest?: string }, options: { campaignId?: string; boundedInference?: boolean; includeWorkerHarness?: boolean; proofCampaign?: FleetJobPayload["proofCampaign"]; remainingCampaignMs?: number; evaluatorRuntime?: Pick<EvaluatorRuntimeIdentity, "imageDigest" | "policySha256"> } = {}): FleetJobPayload {
 	const provider = config.roles?.worker?.provider === "openrouter" ? "openrouter" : "ollama"
 	const openRouterProfile = provider === "openrouter" ? openRouterProfileForModel(candidate.model, config.roles?.worker?.openRouterProfile) : undefined
 	const inferenceLimits = provider === "openrouter" && options.boundedInference
@@ -1165,10 +1166,12 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		sessionId: run.runId,
 		jobId,
 	}) : undefined
-	const proofFixturesRoot = path.join(packageRoot, "fixtures", "rsi-benchmark")
-	const loadedProofBenchmark = hooks.runDevelopmentBenchmark
-		? await fs.readFile(path.join(proofFixturesRoot, "manifest.json"), "utf8").then((rawManifest) => ({ manifest: JSON.parse(rawManifest) as BenchmarkManifest, manifestDigest: createHash("sha256").update(rawManifest).digest("hex") }))
-		: await loadBenchmark(proofFixturesRoot, config.repoRoot)
+	const proofFixturesRoot = config.proofBenchmarkFixtures?.root ?? path.join(packageRoot, "fixtures", "rsi-benchmark")
+	const loadedProofBenchmark = config.proofBenchmarkFixtures
+		? await loadBoundProofBenchmarkFixtures(config.proofBenchmarkFixtures, config.repoRoot)
+		: hooks.runDevelopmentBenchmark
+			? await fs.readFile(path.join(proofFixturesRoot, "manifest.json"), "utf8").then((rawManifest) => ({ manifest: JSON.parse(rawManifest) as BenchmarkManifest, manifestDigest: createHash("sha256").update(rawManifest).digest("hex") }))
+			: await loadBenchmark(proofFixturesRoot, config.repoRoot)
 	const proofProtocol = freezeDevelopmentProofProtocol(
 		loadedProofBenchmark.manifest,
 		loadedProofBenchmark.manifestDigest,

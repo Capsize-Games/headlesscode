@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises"
 import * as path from "node:path"
 import { execFileSync } from "node:child_process"
 import { fileURLToPath, pathToFileURL } from "node:url"
-import { loadBenchmark } from "../src/rsi/benchmark/runner.js"
+import { loadBoundProofBenchmarkFixtures, loadProofBenchmarkFixtures } from "../src/rsi/benchmark/proof-fixtures.js"
 import { readArchive } from "../src/rsi/archive.js"
 import { parseRsiArgs } from "../src/rsi/config.js"
 import { loadEvaluatorIntegrityTrust } from "../src/rsi/evaluation-integrity.js"
@@ -16,7 +16,7 @@ import { analyzeProofDemonstration, verifyProofDemonstrationArtifactBytes } from
 import { workerHarnessRuntimeIdentityFromEnvironment } from "../src/rsi/worker-harness.js"
 import { proofCampaignManifestDigest } from "../src/rsi/proof-campaign.js"
 import { resolveRoles } from "../src/rsi/roles.js"
-import type { CandidateRecord, RsiConfig, RsiRunRecord } from "../src/rsi/types.js"
+import type { CandidateRecord, ProofBenchmarkFixtureBinding, RsiConfig, RsiRunRecord } from "../src/rsi/types.js"
 
 interface Options {
 	command: "estimate" | "plan" | "verify" | "analyze" | "engineering" | "execute"
@@ -35,6 +35,7 @@ interface Options {
 	evaluatorSigningKeyPath?: string
 	evaluatorTrustedPublicKeyPath?: string
 	evaluatorTrustedKeySha256?: string
+	benchmarkFixturesRoot?: string
 }
 
 export interface EvaluatorIntegrityOptions {
@@ -62,21 +63,21 @@ export function configureProofVisibleEvaluations(config: RsiConfig): RsiConfig {
 	return { ...config, evalCommands: [...PROOF_VISIBLE_EVAL_COMMANDS] }
 }
 
-export function proofConfigFromOptions(options: Pick<Options, "repo" | "seeds" | "mutationTask" | "maxTokens">, baseRef = "HEAD"): RsiConfig {
+export function proofConfigFromOptions(options: Pick<Options, "repo" | "seeds" | "mutationTask" | "maxTokens">, baseRef = "HEAD", benchmarkFixtures?: ProofBenchmarkFixtureBinding): RsiConfig {
 	const seed = options.seeds[0]
 	if (!seed) throw new Error("proof configuration requires an explicit engineering seed")
 	const args = ["--repo", options.repo, "--population", "2", "--generations", "3", "--seed", seed, "--base-ref", baseRef, "--max-runtime-ms", String(72 * 60 * 60_000), "--mutation-task", options.mutationTask]
 	if (options.maxTokens !== undefined) args.push("--max-tokens", String(options.maxTokens))
 	const parsed = parseRsiArgs(args)
 	if (!parsed.config) throw new Error(parsed.error ?? "could not construct proof configuration")
-	return configureProofVisibleEvaluations(parsed.config)
+	return configureProofVisibleEvaluations({ ...parsed.config, ...(benchmarkFixtures ? { proofBenchmarkFixtures: benchmarkFixtures } : {}) })
 }
 
 function usage(): string {
 	return `Usage:
-  npx tsx scripts/rsi-proof-demonstration.ts estimate --seed <engineering> --campaign-seed <seed> --campaign-seed <seed> --campaign-seed <seed> [--max-tokens <n>] [--openrouter-profile <admitted-id>] [--repo <path>]
-  npx tsx scripts/rsi-proof-demonstration.ts engineering --seed <engineering> --operator-cap-usd <USD> [--max-tokens <n>] [--execute --evaluator-signing-key <path> --evaluator-trusted-public-key <path> --evaluator-trusted-key-sha256 <pin>] [--openrouter-profile <admitted-id>] [--repo <path>] [--out <evidence.json>]
-  npx tsx scripts/rsi-proof-demonstration.ts plan --engineering-evidence <path> --operator-cap-usd <USD> --seed <engineering> --campaign-seed <seed> --campaign-seed <seed> --campaign-seed <seed> [--max-tokens <n>] --evaluator-signing-key <path> --evaluator-trusted-public-key <path> --evaluator-trusted-key-sha256 <pin> [--openrouter-profile <admitted-id>] [--out <path>] [--repo <path>]
+  npx tsx scripts/rsi-proof-demonstration.ts estimate --seed <engineering> --campaign-seed <seed> --campaign-seed <seed> --campaign-seed <seed> [--max-tokens <n>] [--benchmark-fixtures-root <path>] [--openrouter-profile <admitted-id>] [--repo <path>]
+  npx tsx scripts/rsi-proof-demonstration.ts engineering --seed <engineering> --operator-cap-usd <USD> [--max-tokens <n>] [--benchmark-fixtures-root <path>] [--execute --evaluator-signing-key <path> --evaluator-trusted-public-key <path> --evaluator-trusted-key-sha256 <pin>] [--openrouter-profile <admitted-id>] [--repo <path>] [--out <evidence.json>]
+  npx tsx scripts/rsi-proof-demonstration.ts plan --engineering-evidence <path> --operator-cap-usd <USD> --seed <engineering> --campaign-seed <seed> --campaign-seed <seed> --campaign-seed <seed> [--max-tokens <n>] [--benchmark-fixtures-root <path>] --evaluator-signing-key <path> --evaluator-trusted-public-key <path> --evaluator-trusted-key-sha256 <pin> [--openrouter-profile <admitted-id>] [--out <path>] [--repo <path>]
   npx tsx scripts/rsi-proof-demonstration.ts execute --plan <path> --operator-cap-usd <USD> --evaluator-signing-key <path> --evaluator-trusted-public-key <path> --evaluator-trusted-key-sha256 <pin> --execute
   npx tsx scripts/rsi-proof-demonstration.ts verify --plan <path>
   npx tsx scripts/rsi-proof-demonstration.ts analyze --plan <path> --archive <directory> [--out <path>]
@@ -111,6 +112,7 @@ export function parseProofDemonstrationArgs(argv: string[]): Options {
 		else if (arg === "--evaluator-trusted-public-key") options.evaluatorTrustedPublicKeyPath = path.resolve(value)
 		else if (arg === "--evaluator-trusted-key-sha256") options.evaluatorTrustedKeySha256 = value
 		else if (arg === "--repo") options.repo = path.resolve(value)
+		else if (arg === "--benchmark-fixtures-root") options.benchmarkFixturesRoot = path.resolve(value)
 		else if (arg === "--operator-cap-usd") options.operatorCapUsd = Number(value)
 		else if (arg === "--max-tokens") {
 			const maxTokens = Number(value)
@@ -125,6 +127,7 @@ export function parseProofDemonstrationArgs(argv: string[]): Options {
 	}
 	if (options.openRouterProfile && !["estimate", "engineering", "plan"].includes(command)) throw new Error("--openrouter-profile is only valid for estimate, engineering, or plan; verify, execute, and analyze use the frozen plan identity")
 	if (options.maxTokens !== undefined && !["estimate", "engineering", "plan"].includes(command)) throw new Error("--max-tokens is only valid for estimate, engineering, or plan; verify, execute, and analyze use the frozen plan identity")
+	if (options.benchmarkFixturesRoot !== undefined && !["estimate", "engineering", "plan"].includes(command)) throw new Error("--benchmark-fixtures-root is only valid for estimate, engineering, or plan; verify, execute, and analyze use the frozen plan identity")
 	const trustOptions = [options.evaluatorSigningKeyPath, options.evaluatorTrustedPublicKeyPath, options.evaluatorTrustedKeySha256]
 	if (trustOptions.some((value) => value !== undefined) && trustOptions.some((value) => value === undefined)) throw new Error("evaluator integrity requires --evaluator-signing-key, --evaluator-trusted-public-key, and --evaluator-trusted-key-sha256")
 	return options
@@ -448,7 +451,9 @@ export async function buildProofPlanPreview(options: Options, env: NodeJS.Proces
 	const runtime = workerHarnessRuntimeIdentityFromEnvironment(env)
 	try { execFileSync("git", ["cat-file", "-e", `${runtime.harnessCommit}^{commit}`], { cwd: repo, stdio: "ignore" }) }
 	catch { throw new Error("fixed-control runtime harness commit must be present in the root repository") }
-	const proofConfig = proofConfigFromOptions({ ...options, repo, seeds }, rootCommit)
+	const fixtureRoot = options.benchmarkFixturesRoot ?? path.join(repo, "fixtures", "rsi-benchmark")
+	const { binding: benchmarkFixtures, loaded } = await loadProofBenchmarkFixtures(fixtureRoot, repo)
+	const proofConfig = proofConfigFromOptions({ ...options, repo, seeds }, rootCommit, benchmarkFixtures)
 	const profile = openRouterProfileById(options.openRouterProfile ?? RSI_DEFAULT_OPENROUTER_PROFILE_ID)
 	const baseConfig = withEvaluatorIntegrityPin({
 		...proofConfig,
@@ -461,7 +466,6 @@ export async function buildProofPlanPreview(options: Options, env: NodeJS.Proces
 	assertProofWorkerProfile(baseConfig, profile, env)
 	const configs = seeds.map((seed, index) => ({ ...baseConfig, generations: index === 0 ? 2 : 3, seed })) as [typeof baseConfig, typeof baseConfig, typeof baseConfig, typeof baseConfig]
 	const config = configs[0]
-	const loaded = await loadBenchmark(path.join(repo, "fixtures/rsi-benchmark"), repo)
 	const modelKey = env.HEADLESSCODE_OPENROUTER_API_KEY?.trim() ?? ""
 	const price = await fetchOpenRouterEndpointPrice(profile, modelKey, fetcher)
 	const mutationEnv = openRouterAllocatedEnvironment(env, "mutation")
@@ -471,7 +475,7 @@ export async function buildProofPlanPreview(options: Options, env: NodeJS.Proces
 	if (mutationLimits.maxInputPricePerMillionUsd < price.inputPricePerMillionUsd || mutationLimits.maxOutputPricePerMillionUsd < price.outputPricePerMillionUsd || benchmarkLimits.maxInputPricePerMillionUsd < price.inputPricePerMillionUsd || benchmarkLimits.maxOutputPricePerMillionUsd < price.outputPricePerMillionUsd) throw new Error("configured broker price ceiling is below the live pinned endpoint rate")
 	const plan = planProofDemonstration({ config, manifest: loaded.manifest, mutationLimits, benchmarkLimits })
 	return {
-		createdAt: new Date().toISOString(), rootCommit, benchmarkManifestSha256: loaded.manifestDigest,
+		createdAt: new Date().toISOString(), rootCommit, benchmarkFixtures, benchmarkManifestSha256: loaded.manifestDigest,
 		model: { provider: "openshell-openrouter", requestedId: profile.model, ...(profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { profileId: profile.id } : {}), sampling: { temperature: 0, think: false, seed: "provider-default" } },
 		endpointPrice: price,
 		priceCeilingsPerMillionUsd: { input: benchmarkLimits.maxInputPricePerMillionUsd, output: benchmarkLimits.maxOutputPricePerMillionUsd },
@@ -681,7 +685,9 @@ export async function buildFrozenProofPlan(options: Options, env: NodeJS.Process
 export async function verifyLiveFrozenProofPlan(manifest: ReturnType<typeof verifyFrozenProofDemonstrationManifest>, env: NodeJS.ProcessEnv = process.env, fetcher: typeof fetch = fetch): Promise<void> {
 	const repo = path.resolve(manifest.execution.configs[0].repoRoot)
 	if (await ensureCleanRoot(repo) !== manifest.rootCommit) throw new Error("plan root commit or working tree differs from the frozen plan")
-	const loaded = await loadBenchmark(path.join(repo, "fixtures/rsi-benchmark"), repo)
+	const loaded = manifest.benchmarkFixtures
+		? await loadBoundProofBenchmarkFixtures(manifest.benchmarkFixtures, repo)
+		: (await loadProofBenchmarkFixtures(path.join(repo, "fixtures", "rsi-benchmark"), repo)).loaded
 	if (loaded.manifestDigest !== manifest.benchmarkManifestSha256) throw new Error("benchmark manifest differs from the frozen plan")
 	const engineering = await verifyEngineeringEvidenceFile(manifest.engineeringEvidence.path, repo, manifest.rootCommit)
 	if (engineering.fileSha256 !== manifest.engineeringEvidence.sha256 || engineering.record.campaignId !== manifest.engineeringEvidence.campaignId || engineering.record.manifestSha256 !== manifest.engineeringEvidence.manifestSha256 || engineering.record.snapshotSha256 !== manifest.engineeringEvidence.snapshotSha256) throw new Error("engineering evidence bytes or ledger identity differ from the frozen final plan")
@@ -712,6 +718,9 @@ export async function runFrozenCampaignArm(
 	const campaign = manifest.campaignIds.campaigns[campaignIndex]
 	const config = manifest.execution.configs[campaignIndex + 1]
 	if (!campaign || !config) throw new Error("frozen campaign index is outside the three-campaign plan")
+	if (manifest.benchmarkFixtures
+		? canonicalHash(config.proofBenchmarkFixtures) !== canonicalHash(manifest.benchmarkFixtures)
+		: config.proofBenchmarkFixtures !== undefined) throw new Error("campaign config benchmark fixtures differ from the frozen plan binding")
 	const runId = engineeringRunId(campaign, arm)
 	const archive = await readArchive(config.archiveDir)
 	const matches = archive.runs.concat(archive.activeRuns).filter((entry) => entry.workerHarnessPairId === campaign && entry.workerHarnessMode === arm)
@@ -722,7 +731,7 @@ export async function runFrozenCampaignArm(
 	if (existing) {
 		const frozen = existing.proofCampaign?.manifest
 		const expectedRuntime = { imageDigest: manifest.runtime.imageDigest, harnessCommit: manifest.runtime.harnessCommit, dependencyLockDigest: manifest.runtime.dependencyLockDigest }
-		const internal = new Set(["workerHarnessMode", "workerHarnessPhase", "workerHarnessEngineeringOnly", "workerHarnessPairId", "workerHarnessRunId", "resumeRunId", "candidateIdNamespace", "workerHarnessParentCommit", "workerHarnessSnapshotTreeDigest"])
+		const internal = new Set(["workerHarnessMode", "workerHarnessPhase", "workerHarnessEngineeringOnly", "workerHarnessPairId", "workerHarnessRunId", "resumeRunId", "candidateIdNamespace", "workerHarnessParentCommit", "workerHarnessSnapshotTreeDigest", "proofBenchmarkFixtures"])
 		const expectedConfig = Object.fromEntries(Object.entries(config).filter(([key]) => !internal.has(key)))
 		if (!frozen || frozen.phaseMode !== "paired-confirmation" || frozen.campaignId !== campaign || frozen.seed !== config.seed || frozen.rootCommit !== manifest.rootCommit || frozen.benchmarkDigests.manifest !== manifest.benchmarkManifestSha256 || existing.proofCampaign?.manifestSha256 !== proofCampaignManifestDigest(frozen) || JSON.stringify(frozen.runtime) !== JSON.stringify(expectedRuntime) || canonicalHash(frozen.settings.effectiveConfig) !== canonicalHash(expectedConfig) || frozen.model.id !== manifest.model.requestedId || frozen.model.provider !== manifest.model.provider || frozen.model.profileId !== manifest.model.profileId) throw new Error(`campaign ${campaign}/${arm} frozen ledger manifest differs from the plan`)
 	}

@@ -53,10 +53,11 @@ test("frozen campaign execution forwards key paths at runtime while its manifest
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "rsi-proof-trust-forwarding-"))
 	try {
 		const pin = `sha256:${"a".repeat(64)}`
-		const config = { archiveDir: root, seed: "campaign-seed", evaluatorTrustedKeySha256: pin } as RsiConfig
+		const benchmarkFixtures = { root: "/work/benchmark-fixtures", manifestSha256: "3".repeat(64), snapshotPackage: { path: "snapshots", digest: "b".repeat(64) } }
+		const config = { archiveDir: root, seed: "campaign-seed", evaluatorTrustedKeySha256: pin, proofBenchmarkFixtures: benchmarkFixtures } as RsiConfig
 		const runtime: WorkerHarnessRuntimeIdentity = { imageName: "image", imageDigest: `sha256:${"b".repeat(64)}`, harnessCommit: "c".repeat(40), dependencyLockDigest: "d".repeat(64) }
 		const manifest = {
-			campaignIds: { campaigns: [`rsi-proof-${"d".repeat(20)}`] },
+			campaignIds: { campaigns: [`rsi-proof-${"d".repeat(20)}`] }, benchmarkFixtures,
 			execution: { configs: [config, config, config, config] }, rootCommit: "e".repeat(40), runtime,
 		} as unknown as FrozenProofDemonstrationManifest
 		const trustPaths = { evaluatorSigningKeyPath: "/operator/private/signing.pem", evaluatorTrustedPublicKeyPath: "/operator/trust/public.pem", evaluatorTrustedKeySha256: pin }
@@ -82,6 +83,17 @@ test("proof CLI admits explicit Muse selection while keeping legacy DeepSeek as 
 	assert.equal(parseProofDemonstrationArgs(["engineering", "--openrouter-profile", "muse-spark-contributor"]).openRouterProfile, "muse-spark-contributor")
 	assert.throws(() => parseProofDemonstrationArgs(["plan", "--openrouter-profile", "unlisted-model"]), /profile is not admitted/)
 	assert.throws(() => parseProofDemonstrationArgs(["execute", "--openrouter-profile", "muse-spark-contributor"]), /only valid for estimate, engineering, or plan/)
+})
+
+test("proof fixture root is optional for compatibility, bound into supervisor configs, and rejected for frozen commands", () => {
+	assert.equal(parseProofDemonstrationArgs(["engineering", "--seed", "fixture-seed"]).benchmarkFixturesRoot, undefined)
+	const root = path.resolve("/operator/benchmark-package")
+	const options = parseProofDemonstrationArgs(["engineering", "--seed", "fixture-seed", "--benchmark-fixtures-root", root])
+	assert.equal(options.benchmarkFixturesRoot, root)
+	const binding = { root, manifestSha256: "a".repeat(64), snapshotPackage: { path: "snapshots", digest: "b".repeat(64) } }
+	const config = proofConfigFromOptions(options, "c".repeat(40), binding)
+	assert.deepEqual(config.proofBenchmarkFixtures, binding)
+	assert.throws(() => parseProofDemonstrationArgs(["execute", "--plan", "/frozen.json", "--benchmark-fixtures-root", root]), /only valid for estimate, engineering, or plan/)
 })
 
 test("proof CLI parses a positive safe max-token limit and passes it into frozen mutation config", () => {
@@ -387,7 +399,9 @@ test("campaign executor reuses a finished first arm without dispatching it again
 		unknownProfile.proofCampaign!.manifest.model.profileId = "unadmitted-profile" as never
 		assert.equal(isFullyConfirmedRun(unknownProfile, armId), false, "malformed persisted profile identity fails closed without interrupting archive inspection")
 		await appendRun(root, run)
-		const plan = { campaignIds: { campaigns: [campaign] }, execution: { configs: [config, config, config, config] }, benchmarkManifestSha256: "3".repeat(64), model: { provider: "openshell-openrouter", requestedId: RSI_OPENROUTER_MODEL }, rootCommit: run.baseCommit, runtime } as unknown as FrozenProofDemonstrationManifest
+		const benchmarkFixtures = { root: "/work/benchmark-fixtures", manifestSha256: "3".repeat(64), snapshotPackage: { path: "snapshots", digest: "b".repeat(64) } }
+		const frozenConfig = { ...config, proofBenchmarkFixtures: benchmarkFixtures }
+		const plan = { campaignIds: { campaigns: [campaign] }, benchmarkFixtures, execution: { configs: [frozenConfig, frozenConfig, frozenConfig, frozenConfig] }, benchmarkManifestSha256: "3".repeat(64), model: { provider: "openshell-openrouter", requestedId: RSI_OPENROUTER_MODEL }, rootCommit: run.baseCommit, runtime } as unknown as FrozenProofDemonstrationManifest
 		let calls = 0
 		const reused = await runFrozenCampaignArm(plan, 0, armId, "confirmation", async () => { calls++; throw new Error("finished arm must not replay inference") })
 		assert.equal(reused.runId, run.runId)
