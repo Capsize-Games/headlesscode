@@ -1,6 +1,5 @@
 import assert from "node:assert/strict"
 import * as fs from "node:fs/promises"
-import * as os from "node:os"
 import * as path from "node:path"
 
 import { TEMPLATE_TEXT } from "../controller.js"
@@ -101,8 +100,136 @@ async function testPredictorDeterminismAndNegativeControl() {
 	assert.equal(scheduledButUnreached.interventions.at(-1)?.delivered, false)
 }
 
+async function scratchDirectory(prefix: string): Promise<string> {
+	const scratch = path.resolve(".headlesscode/scratch")
+	await fs.mkdir(scratch, { recursive: true, mode: 0o700 })
+	return fs.mkdtemp(path.join(scratch, prefix))
+}
+
+async function withPatchedFileHandleMethod<T>(
+	filePath: string,
+	method: "writeFile" | "sync",
+	replacement: (original: Function) => Function,
+	work: () => Promise<T>,
+): Promise<T> {
+	const probe = await fs.open(filePath, "a")
+	const prototype = Object.getPrototypeOf(probe) as object
+	await probe.close()
+	const descriptor = Object.getOwnPropertyDescriptor(prototype, method)
+	assert.ok(descriptor && typeof descriptor.value === "function", `FileHandle.${method} is patchable for the failure test`)
+	Object.defineProperty(prototype, method, { ...descriptor, value: replacement(descriptor.value) })
+	try {
+		return await work()
+	} finally {
+		Object.defineProperty(prototype, method, descriptor)
+	}
+}
+
+async function testJournalPersistedRepresentationAndFailureAtomicity() {
+	const root = await scratchDirectory("hc-monitor-journal-json-")
+	try {
+		const journalPath = path.join(root, "journal.jsonl")
+		const journal = new PilotJournal(journalPath)
+		await journal.open()
+		const response = {
+			role: "assistant",
+			content: null,
+			refusal: undefined,
+			tool_calls: [{ id: "call-1", function: { name: "read_file", arguments: "{}", optional: undefined } }],
+		}
+		const sparse: unknown[] = []
+		sparse.length = 3
+		sparse[1] = { optional: undefined, retained: true }
+		await journal.append("llm_response_received", "experiment", {
+			assistantMessage: response,
+			optional: undefined,
+			nested: { optional: undefined, retained: true },
+			array: [undefined, sparse, { optional: undefined, retained: true }, null],
+		})
+		const persisted = JSON.parse(await fs.readFile(journalPath, "utf8")) as { payload: Record<string, unknown> }
+		assert.deepEqual(persisted.payload, {
+			assistantMessage: { role: "assistant", content: null, tool_calls: [{ id: "call-1", function: { name: "read_file", arguments: "{}" } }] },
+			nested: { retained: true },
+			array: [null, [null, { retained: true }, null], { retained: true }, null],
+		})
+		const reopened = new PilotJournal(journalPath)
+		await reopened.open()
+		assert.deepEqual(reopened.list(), [persisted])
+
+		const corrupted = { ...persisted, payload: { ...persisted.payload, nested: { retained: false } } }
+		await fs.writeFile(journalPath, `${JSON.stringify(corrupted)}\n`)
+		await assert.rejects(() => new PilotJournal(journalPath).open(), JournalCorruptionError)
+
+		const unsupportedPath = path.join(root, "unsupported.jsonl")
+		const unsupported = new PilotJournal(unsupportedPath)
+		await unsupported.open()
+		const cyclic: Record<string, unknown> = {}
+		cyclic.self = cyclic
+		let accessorInvoked = false
+		const accessor = Object.defineProperty({}, "value", { enumerable: true, get: () => { accessorInvoked = true; return "unsupported" } })
+		for (const value of [1n, () => undefined, Symbol("unsupported"), Number.POSITIVE_INFINITY, new Date(), cyclic, accessor]) {
+			await assert.rejects(() => unsupported.append("invalid", "experiment", { value }), JournalCorruptionError)
+		}
+		assert.equal(accessorInvoked, false, "unsupported accessors are rejected without evaluating them")
+		assert.equal(unsupported.list().length, 0)
+		await assert.rejects(() => fs.stat(unsupportedPath), { code: "ENOENT" })
+		const firstValid = await unsupported.append("valid", "experiment", { ok: true })
+		assert.equal(firstValid.sequence, 1, "unsupported values do not advance journal sequence")
+
+		const failureDirectory = path.join(root, "write-failure")
+		await fs.mkdir(failureDirectory)
+		const failurePath = path.join(failureDirectory, "journal.jsonl")
+		const failedWrite = new PilotJournal(failurePath)
+		await failedWrite.open()
+		await fs.rm(failureDirectory, { recursive: true })
+		await assert.rejects(() => failedWrite.append("unwritten", "experiment", { ok: true }))
+		assert.equal(failedWrite.list().length, 0)
+		await fs.mkdir(failureDirectory)
+		const afterFailure = await failedWrite.append("written", "experiment", { ok: true })
+		assert.equal(afterFailure.sequence, 1, "failed writes do not advance journal sequence")
+		const verified = new PilotJournal(failurePath)
+		await verified.open()
+		assert.equal(verified.list().length, 1)
+
+		const partialPath = path.join(root, "partial-write.jsonl")
+		const partialJournal = new PilotJournal(partialPath)
+		await partialJournal.open()
+		await withPatchedFileHandleMethod(partialPath, "writeFile", (original) => async function(this: fs.FileHandle, data: string | Uint8Array) {
+			const text = typeof data === "string" ? data : Buffer.from(data).toString("utf8")
+			await original.call(this, text.slice(0, Math.max(1, Math.floor(text.length / 2))))
+			throw new Error("simulated failure after a partial append")
+		}, async () => {
+			await assert.rejects(() => partialJournal.append("uncertain", "experiment", { ok: true }), /partial append/)
+		})
+		assert.equal(partialJournal.list().length, 0, "a partial write does not advance in-memory journal state")
+		const partialBytes = await fs.readFile(partialPath, "utf8")
+		assert.ok(partialBytes.length > 0 && !partialBytes.endsWith("\n"), "the injected failure leaves a torn record on disk")
+		await assert.rejects(() => partialJournal.append("duplicate", "experiment", { ok: true }), /outcome is uncertain/)
+		assert.equal(await fs.readFile(partialPath, "utf8"), partialBytes, "a poisoned instance cannot append a duplicate sequence")
+		await assert.rejects(() => new PilotJournal(partialPath).open(), JournalCorruptionError, "reopen verifies and rejects the torn persisted record")
+
+		const syncPath = path.join(root, "sync-failure.jsonl")
+		const syncJournal = new PilotJournal(syncPath)
+		await syncJournal.open()
+		await withPatchedFileHandleMethod(syncPath, "sync", () => async function() {
+			throw new Error("simulated sync failure after write")
+		}, async () => {
+			await assert.rejects(() => syncJournal.append("written-not-synced", "experiment", { ok: true }), /sync failure/)
+		})
+		assert.equal(syncJournal.list().length, 0, "sync failure does not advance in-memory journal state")
+		await assert.rejects(() => syncJournal.append("duplicate", "experiment", { ok: true }), /outcome is uncertain/)
+		const syncReopened = new PilotJournal(syncPath)
+		await syncReopened.open()
+		assert.equal(syncReopened.list().length, 1, "a fresh instance verifies the complete record before resuming")
+		const nextAfterReopen = await syncReopened.append("after-reopen", "experiment", { ok: true })
+		assert.equal(nextAfterReopen.sequence, 2, "reopen resumes after the verified durable record")
+	} finally {
+		await fs.rm(root, { recursive: true, force: true })
+	}
+}
+
 async function testJournalIntegrityAndExclusiveLock() {
-	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hc-monitor-journal-"))
+	const root = await scratchDirectory("hc-monitor-journal-")
 	try {
 		const journalPath = path.join(root, "journal.jsonl")
 		const journal = new PilotJournal(journalPath)
@@ -139,6 +266,7 @@ async function testJournalIntegrityAndExclusiveLock() {
 
 await testFixtureSplitAndAuthorityBoundary()
 await testPredictorDeterminismAndNegativeControl()
+await testJournalPersistedRepresentationAndFailureAtomicity()
 await testJournalIntegrityAndExclusiveLock()
 assert.notEqual(fixtureHash(), splitHash())
 console.log("monitoring pilot tests passed")
