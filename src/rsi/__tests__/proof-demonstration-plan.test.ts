@@ -29,6 +29,9 @@ assert.equal(plan.campaign.maximumCalls, 204)
 assert.equal(plan.totalReservedSpendUsd, plan.engineering.reservedSpendUsd + 3 * plan.campaign.reservedSpendUsd)
 assert.equal(plan.totalCalls, plan.engineering.maximumCalls + 3 * plan.campaign.maximumCalls)
 assert.throws(() => planProofDemonstration({ config, manifest, mutationLimits: { ...limits("mutation"), maxCallSpendUsd: 0.00001 }, benchmarkLimits: limits("benchmark") }), /per-call spend cap is below/)
+const equalRateLimits = { ...limits("mutation"), maxOutputPricePerMillionUsd: 0.1, maxCallSpendUsd: 0.00011 }
+assert.doesNotThrow(() => planProofDemonstration({ config, manifest, mutationLimits: equalRateLimits, benchmarkLimits: limits("benchmark") }))
+assert.throws(() => planProofDemonstration({ config, manifest, mutationLimits: { ...equalRateLimits, maxCallSpendUsd: 0.0001 }, benchmarkLimits: limits("benchmark") }), /per-call spend cap is below/)
 assert.doesNotThrow(() => assertFrozenProofDemonstrationPlanMatches(plan, { config, manifest, mutationLimits: limits("mutation"), benchmarkLimits: limits("benchmark") }))
 assert.throws(() => assertFrozenProofDemonstrationPlanMatches({ ...plan, campaignRootsSpendCeilingUsd: 0.000001, totalRootSpendCeilingUsd: 0.000001 }, { config, manifest, mutationLimits: limits("mutation"), benchmarkLimits: limits("benchmark") }), /frozen proof budget plan differs/)
 assert.throws(() => assertFrozenProofDemonstrationPlanMatches(plan, { config: { ...config, evalCommands: ["npm test"] }, manifest, mutationLimits: limits("mutation"), benchmarkLimits: limits("benchmark") }), /frozen proof budget plan differs/)
@@ -86,4 +89,11 @@ assert.equal(directionalEstimatePlan.engineering.mutationJobs, 8)
 assert.equal(directionalEstimatePlan.engineering.developmentProofCells, 384)
 assert.equal(directionalEstimatePlan.engineering.rootSpendCeilingUsd, 29.248392, "runtime reservation ceilings are reported separately from directional price estimates")
 assert.equal(directionalEstimatePlan.engineering.priceDerivedSpendCeilingUsd, 17.207296, "directional estimate prices input and output tokens at their separate rates")
+const tightenedGrantPlan = planProofDemonstration({
+	config: corpusConfig, manifest: boundedManifest,
+	mutationLimits: { ...boundedMutationLimits, maxInputTokensPerCall: 148_000, maxTotalTokens: 3_300_000, maxCallSpendUsd: 0.031 },
+	benchmarkLimits: { ...boundedBenchmarkLimits, maxInputTokensPerCall: 148_000, maxTotalTokens: 175_000, maxCallSpendUsd: 0.031 },
+})
+assert.equal(tightenedGrantPlan.engineering.rootSpendCeilingUsd, 18.72, "tighter token grants fit the existing engineering spend caps")
+assert.equal(tightenedGrantPlan.engineering.priceDerivedSpendCeilingUsd, 11.943296)
 console.log("RSI proof demonstration schedule and ceiling assertions passed")
