@@ -479,7 +479,8 @@ export class PostgresProofCampaign {
 				)
 				if (selectedParent.rowCount !== 1) throw new Error("candidate failure parent is not a previously accepted campaign lineage commit")
 			}
-			const schedule = await Promise.all(cells.map(async (cell) => {
+			const schedule: Array<Record<string, unknown>> = []
+			for (const cell of cells) {
 				const attempt = await client.query(
 					`SELECT attempt_key,status,reserved_calls,reserved_tokens,reserved_spend_microusd,actual_calls,actual_tokens,actual_spend_microusd,error
 					 FROM headlesscode_rsi_proof_campaign_attempts WHERE campaign_id=$1 AND arm_id=$2 AND generation=$3 AND candidate_id=$4 AND task_id=$5 AND seed=$6 AND attempt_kind=$7 FOR UPDATE`,
@@ -487,13 +488,13 @@ export class PostgresProofCampaign {
 				)
 				if (attempt.rows.length > 1) throw new Error("candidate failure found duplicate rows for a frozen campaign cell")
 				const row = attempt.rows[0]
-				return {
+				schedule.push({
 					...cell,
 					attemptKey: row ? String(row.attempt_key) : null,
 					status: row ? String(row.status) : "missing",
 					...(row ? { reservedCalls: Number(row.reserved_calls), reservedTokens: Number(row.reserved_tokens), reservedSpendMicrousd: Number(row.reserved_spend_microusd), actualCalls: row.actual_calls === null ? null : Number(row.actual_calls), actualTokens: row.actual_tokens === null ? null : Number(row.actual_tokens), actualSpendMicrousd: row.actual_spend_microusd === null ? null : Number(row.actual_spend_microusd), ...(row.error ? { attemptError: String(row.error) } : {}) } : {}),
-				}
-			}))
+				})
+			}
 			const payload = { generation: failure.generation, candidateId: failure.candidateId, parentId: failure.parentId, parentCommit: failure.parentCommit, outcome: "incomplete", reason: failure.reason.slice(0, 512), cells: schedule }
 			const existing = await client.query("SELECT payload FROM headlesscode_rsi_proof_campaign_events WHERE campaign_id=$1 AND arm_id=$2 AND event_type='candidate-incomplete' FOR UPDATE", [lease.campaignId, lease.armId])
 			const matching = existing.rows.filter((row) => row.payload?.candidateId === failure.candidateId && Number(row.payload?.generation) === failure.generation)
