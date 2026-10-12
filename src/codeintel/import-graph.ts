@@ -78,6 +78,15 @@ export function getImportGraph(intel: CodeIntel): ImportGraph {
 	}
 
 	for (const sourceFile of intel.program.getSourceFiles()) {
+		// Skip declaration files (lib .d.ts, @types, node_modules types):
+		// they dominate getSourceFiles() by count, never import a workspace
+		// file, and nobody queries their forward edges. Their only observable
+		// contribution would be reverse edges *from* a .d.ts, which reverse
+		// lookups of workspace sources never need. Skipping them keeps the
+		// first (uncached) graph build proportional to project size.
+		if (sourceFile.isDeclarationFile) {
+			continue
+		}
 		const fileImports: ImportEdge[] = []
 
 		const collect = (node: ts.Node): void => {
