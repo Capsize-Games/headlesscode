@@ -471,17 +471,23 @@ export function openRouterBrokerLimitsFromEnvironment(
 export interface OpenRouterCampaignBudgetAllocation { totalUsd: number; mutationUsd: number; benchmarkUsd: number }
 
 export function openRouterCampaignBudgetAllocation(env: NodeJS.ProcessEnv): OpenRouterCampaignBudgetAllocation {
-	const read = (name: string, round: "down" | "up"): number => {
+	const readMicroUsd = (name: string, round: "down" | "up"): number => {
 		const raw = env[name]
 		const value = raw === undefined || raw.trim() === "" ? Number.NaN : Number(raw)
 		if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} is required as a positive finite USD ceiling`)
-		return (round === "up" ? Math.ceil(value * 1_000_000) : Math.floor(value * 1_000_000)) / 1_000_000
+		const microUsd = value * 1_000_000
+		if (!Number.isFinite(microUsd) || microUsd > Number.MAX_SAFE_INTEGER) throw new Error(`${name} exceeds the safe integer micro-USD range`)
+		const rounded = round === "up" ? Math.ceil(microUsd) : Math.floor(microUsd)
+		if (!Number.isSafeInteger(rounded)) throw new Error(`${name} exceeds the safe integer micro-USD range`)
+		return rounded
 	}
-	const totalUsd = read("HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD", "down")
-	const mutationUsd = read("HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD", "up")
-	const benchmarkUsd = read("HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD", "up")
-	if (mutationUsd + benchmarkUsd > totalUsd) throw new Error("OpenRouter mutation and benchmark allocations exceed the operator campaign spend ceiling")
-	return { totalUsd, mutationUsd, benchmarkUsd }
+	const totalMicroUsd = readMicroUsd("HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD", "down")
+	const mutationMicroUsd = readMicroUsd("HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD", "up")
+	const benchmarkMicroUsd = readMicroUsd("HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD", "up")
+	const allocatedMicroUsd = mutationMicroUsd + benchmarkMicroUsd
+	if (!Number.isSafeInteger(allocatedMicroUsd)) throw new Error("OpenRouter mutation and benchmark allocation sum exceeds the safe integer micro-USD range")
+	if (allocatedMicroUsd > totalMicroUsd) throw new Error("OpenRouter mutation and benchmark allocations exceed the operator campaign spend ceiling")
+	return { totalUsd: totalMicroUsd / 1_000_000, mutationUsd: mutationMicroUsd / 1_000_000, benchmarkUsd: benchmarkMicroUsd / 1_000_000 }
 }
 
 export function openRouterAllocatedEnvironment(env: NodeJS.ProcessEnv, allocation: "mutation" | "benchmark"): NodeJS.ProcessEnv {

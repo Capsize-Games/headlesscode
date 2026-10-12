@@ -464,6 +464,37 @@ test("mutation and benchmark budgets are disjoint partitions of the operator cam
 	}), /allocations exceed/, "ceil allocated spend and floor the total at micro-USD precision")
 })
 
+test("campaign budget partitions compare exact safe micro-USD values", () => {
+	const exact = {
+		HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD: "0.694",
+		HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD: "0.66",
+		HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD: "0.034",
+	} as NodeJS.ProcessEnv
+	assert.deepEqual(openRouterCampaignBudgetAllocation(exact), { totalUsd: 0.694, mutationUsd: 0.66, benchmarkUsd: 0.034 })
+	assert.throws(() => openRouterCampaignBudgetAllocation({
+		...exact,
+		HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD: "0.660001",
+	}), /allocations exceed/, "one micro-USD over the aggregate remains rejected")
+
+	const fractional = {
+		...exact,
+		HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD: "0.6940009",
+		HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD: "0.6599991",
+		HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD: "0.0339991",
+	} as NodeJS.ProcessEnv
+	assert.deepEqual(openRouterCampaignBudgetAllocation(fractional), { totalUsd: 0.694, mutationUsd: 0.66, benchmarkUsd: 0.034 }, "allocated roles round up and aggregate ceiling rounds down to micro-USD")
+
+	assert.throws(() => openRouterCampaignBudgetAllocation({
+		...exact,
+		HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD: "9007199254.741",
+	}), /MAX_CAMPAIGN_SPEND_USD exceeds the safe integer micro-USD range/, "unsafe aggregate amounts fail with the offending setting identified")
+	assert.throws(() => openRouterCampaignBudgetAllocation({
+		HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD: "9000000000",
+		HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD: "5000000000",
+		HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD: "5000000000",
+	}), /allocation sum exceeds the safe integer micro-USD range/, "a sum of individually safe role limits cannot overflow micro-USD arithmetic")
+})
+
 test("mutation and benchmark broker caps are independently scoped with shared fallback", () => {
 	const base = {
 		HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD: "20",

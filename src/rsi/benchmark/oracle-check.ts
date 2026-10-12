@@ -11,7 +11,7 @@ import type { BenchmarkTask } from "./types.js"
 async function installOracle(loaded: LoadedBenchmark, task: BenchmarkTask, workspace: string, oraclePath?: string, oracleCommit?: string): Promise<void> {
 	if (oracleCommit) {
 		await fs.rm(workspace, { recursive: true, force: true })
-		await materializeBenchmarkSnapshot({ ...task, startCommit: oracleCommit }, loaded.repoRoot, workspace)
+		await materializeBenchmarkSnapshot({ ...task, startCommit: oracleCommit }, loaded.repoRoot, workspace, loaded.snapshotPackage)
 		await initializeTaskRepository(workspace)
 		return
 	}
@@ -43,7 +43,7 @@ export async function verifyBenchmarkOracles(loaded: LoadedBenchmark, verifier: 
 			try {
 				await fs.rm(workspace, { recursive: true, force: true })
 				if (task.startCommit) {
-					await materializeBenchmarkSnapshot(task, loaded.repoRoot, workspace)
+					await materializeBenchmarkSnapshot(task, loaded.repoRoot, workspace, loaded.snapshotPackage)
 				} else {
 					const startPath = path.resolve(loaded.fixtureRoot, task.startPath!)
 					await fs.cp(startPath, workspace, { recursive: true, errorOnExist: true, force: false, dereference: false })
