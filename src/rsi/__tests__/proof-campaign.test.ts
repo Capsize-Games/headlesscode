@@ -11,7 +11,7 @@ import { fleetJobMatches, fleetPayloadDigest, PostgresRsiJobQueue, type FleetJob
 import { PostgresProofCampaign, proofCampaignManifestDigest, type ProofCampaignManifest } from "../proof-campaign.js"
 import { openRouterAllocatedEnvironment, openRouterBrokerLimitsFromEnvironment, openRouterProfileForModel, RSI_OPENROUTER_MODEL, type OpenRouterBrokerGrant, type OpenRouterBrokerLimits } from "../inference-broker.js"
 import { readArchive, writeArchive } from "../archive.js"
-import { createProofCampaignManifest, proofBrokerCampaignId, reconcileProofCampaignJob, rebuildEvaluatedProofCampaignArchive, rebuildFinishedProofCampaignArchive, RSI_CONFIRMATION_RETENTION_TASK_IDS } from "../controller.js"
+import { createProofCampaignManifest, proofBrokerCampaignId, proofCampaignSpendReservationMicros, reconcileProofCampaignJob, rebuildEvaluatedProofCampaignArchive, rebuildFinishedProofCampaignArchive, RSI_CONFIRMATION_RETENTION_TASK_IDS } from "../controller.js"
 import { loadBenchmark, runBenchmark, type BenchmarkVerifier } from "../benchmark/runner.js"
 import type { BenchmarkAgent, BenchmarkAttempt, BenchmarkImageIdentity, BenchmarkTask } from "../benchmark/types.js"
 import type { CandidateRecord, RsiConfig, RsiRunRecord } from "../types.js"
@@ -86,6 +86,20 @@ test("pre-profile DeepSeek campaign manifests retain their frozen digest and def
 	assert.equal(openRouterProfileForModel(historicalReceipt.model).id, "deepseek-deepinfra-fp8", "a pre-profile receipt resolves to the frozen DeepSeek default")
 })
 
+test("proof campaign reservations use integer microUSD for role and root funding", () => {
+	const allocation = {
+		mutationJobs: 8, mutationMaxJobSpendUsd: 0.66, mutationAllocationUsd: 5.28,
+		benchmarkJobs: 384, benchmarkMaxJobSpendUsd: 0.035, benchmarkAllocationUsd: 13.44,
+		totalAllocationUsd: 20, benchmarkShortfallMessage: "benchmark reservation shortfall",
+	}
+	assert.deepEqual(proofCampaignSpendReservationMicros(allocation), { mutation: 5_280_000, benchmark: 13_440_000, total: 18_720_000 }, "exact $13.44 funding for 384 $0.035 reservations fits within the $20 root allocation")
+	assert.equal(proofCampaignSpendReservationMicros({ ...allocation, totalAllocationUsd: 18.72 }).total, 18_720_000, "exact root funding is sufficient")
+	assert.throws(() => proofCampaignSpendReservationMicros({ ...allocation, mutationAllocationUsd: 5.279999 }), /mutation broker campaign allocation is below/, "one microUSD below mutation reservations is rejected")
+	assert.throws(() => proofCampaignSpendReservationMicros({ ...allocation, benchmarkAllocationUsd: 13.439999 }), /benchmark reservation shortfall/, "one microUSD below the benchmark reservations is rejected")
+	assert.throws(() => proofCampaignSpendReservationMicros({ ...allocation, benchmarkMaxJobSpendUsd: 0.0350001 }), /benchmark reservation shortfall/, "fractional microUSD job reservations round upward")
+	assert.throws(() => proofCampaignSpendReservationMicros({ ...allocation, totalAllocationUsd: 18.719999 }), /total allocation is below/, "one microUSD below the combined root reservations is rejected")
+})
+
 test("engineering-only proof pair finishes after development and freezes no confirmation cells", { skip: !databaseUrl }, async () => {
 	await withCampaign(async (campaign) => {
 		const campaignId = `engineering-${randomUUID()}`
@@ -138,6 +152,7 @@ test("controller freezes paired broker allocations as separate campaigns under o
 		const campaignId = `paired-controller-${randomUUID()}`
 		const oldEnv = { ...process.env }
 		try {
+			for (const key of Object.keys(process.env)) if (key.startsWith("HEADLESSCODE_RSI_OPENROUTER_")) delete process.env[key]
 			Object.assign(process.env, {
 				HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD: "0.32",
 				HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD: "0.04",

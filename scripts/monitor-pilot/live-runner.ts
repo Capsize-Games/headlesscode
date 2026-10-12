@@ -430,7 +430,10 @@ async function runLiveTrajectory(options: LiveTrajectoryOptions): Promise<{
 			signal: AbortSignal.any([options.signal, AbortSignal.timeout(Math.max(1, deadline - Date.now()))]),
 		}
 		const reservedRequestTokens = safeJsonBytes(buildRequestBody(request, LIVE_MODEL)) + request.maxTokens!
-		if (reservedRequestTokens > LIVE_BUDGET.maxTokens - inputTokens - outputTokens) throw new LivePilotGuardError("per-run-token-bound-before-request")
+		if (reservedRequestTokens > LIVE_BUDGET.maxTokens - inputTokens - outputTokens) {
+			stopReason = "per-run-token-budget-exhausted"
+			break
+		}
 		if (safeJsonBytes(buildRequestBody(request, LIVE_MODEL)) > LIVE_BUDGET.maxTokens) throw new LivePilotGuardError("serialized-prompt-exceeds-token-cap")
 		await options.journal.append("llm_request_admitted", options.experimentId, {
 			iteration, model: LIVE_MODEL, providerOnly: "meta", allowFallbacks: false,

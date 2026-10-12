@@ -16,9 +16,10 @@ import { TEMPLATE_TEXT } from "../controller.js"
 
 type Reply = { readonly name: string; readonly args?: string; readonly content?: string }
 type MockBillingOverrides = {
-	readonly responseUsage?: LlmResponse["usage"]
-	readonly metadata?: Partial<OpenRouterGenerationMetadata>
+	readonly responseUsage?: LlmResponse["usage"] | ((requestIndex: number) => LlmResponse["usage"])
+	readonly metadata?: Partial<OpenRouterGenerationMetadata> | ((requestIndex: number) => Partial<OpenRouterGenerationMetadata>)
 	readonly failBeforeResponse?: boolean
+	readonly repeatReplies?: boolean
 }
 
 class MockBillingClient {
@@ -43,15 +44,17 @@ class MockBillingClient {
 		assert.equal(request.providerOnly, "meta")
 		assert.equal(request.stream, true)
 		assert.deepEqual((request.tools ?? []).map((tool) => tool.function.name), LIVE_TOOLS.map((tool) => tool.function.name))
-		const reply = this.replies[Math.min(this.sequence, this.replies.length - 1)]
-		const id = `gen-${this.sequence++}`
+		const requestIndex = this.sequence++
+		const reply = this.replies[this.overrides.repeatReplies ? requestIndex % this.replies.length : Math.min(requestIndex, this.replies.length - 1)]
+		const id = `gen-${requestIndex}`
+		const responseUsage = this.overrides.responseUsage
 		return {
 			message: {
 				role: "assistant",
 				content: reply.content ?? null,
 				tool_calls: [{ id: `provider-tool-${id}`, type: "function", function: { name: reply.name, arguments: reply.args ?? "{}" } }],
 			},
-			usage: this.overrides.responseUsage ?? { promptTokens: 100, completionTokens: 5, totalTokens: 105, cachedTokens: 20 },
+			usage: typeof responseUsage === "function" ? responseUsage(requestIndex) : responseUsage ?? { promptTokens: 100, completionTokens: 5, totalTokens: 105, cachedTokens: 20 },
 			generationId: id,
 			returnedModel: this.responseModel,
 			providerName: this.provider,
@@ -59,7 +62,9 @@ class MockBillingClient {
 	}
 
 	async fetchGenerationMetadata(id: string) {
-		return { id, model: LIVE_MODEL, providerName: "Meta", totalCostUsd: 0.000001, tokensPrompt: 100, tokensCompletion: 5, nativeTokensPrompt: 100, nativeTokensCompletion: 5, nativeTokensCached: 20, cacheDiscountUsd: 0, ...this.overrides.metadata }
+		const metadata = this.overrides.metadata
+		const override = typeof metadata === "function" ? metadata(Number(id.slice(4))) : metadata
+		return { id, model: LIVE_MODEL, providerName: "Meta", totalCostUsd: 0.000001, tokensPrompt: 100, tokensCompletion: 5, nativeTokensPrompt: 100, nativeTokensCompletion: 5, nativeTokensCached: 20, cacheDiscountUsd: 0, ...override }
 	}
 }
 
@@ -275,6 +280,66 @@ async function testUncertainRequestIsNotAutomaticallyReplayed(): Promise<void> {
 	} finally { await fs.rm(directory, { recursive: true, force: true }) }
 }
 
+async function testKnownPerRunAdmissionStopCompletesAndSettlesTrajectory(): Promise<void> {
+	const directory = await scratch()
+	try {
+		const replies: Reply[] = [
+			{ name: "list_files" },
+			{ name: "apply_diff", args: JSON.stringify({ path: "missing-1", content: "changed" }) },
+			{ name: "list_files" },
+			{ name: "apply_diff", args: JSON.stringify({ path: "missing-2", content: "changed" }) },
+			{ name: "list_files" },
+			{ name: "apply_diff", args: JSON.stringify({ path: "missing-3", content: "changed" }) },
+			{ name: "list_files" },
+			{ name: "apply_diff", args: JSON.stringify({ path: "missing-4", content: "changed" }) },
+		]
+		const usageAt = (requestIndex: number) => ({
+			promptTokens: requestIndex % replies.length === replies.length - 1 ? 12_500 : 1_000,
+			completionTokens: 5,
+			totalTokens: (requestIndex % replies.length === replies.length - 1 ? 12_500 : 1_000) + 5,
+			cachedTokens: 0,
+		})
+		const client = new MockBillingClient(replies, LIVE_MODEL, "Meta", {
+			responseUsage: usageAt,
+			metadata: (requestIndex) => {
+				const usage = usageAt(requestIndex)
+				return { tokensPrompt: usage.promptTokens, tokensCompletion: usage.completionTokens, nativeTokensPrompt: usage.promptTokens, nativeTokensCompletion: usage.completionTokens, nativeTokensCached: 0 }
+			},
+			repeatReplies: true,
+		})
+		const summary = await collectLiveDevelopment({ outputDir: directory, client, maxOutputTokens: 2048 })
+		assert.equal(summary.scheduledRuns, LIVE_DEVELOPMENT_SLOTS.length)
+		assert.equal(summary.completedRuns, LIVE_DEVELOPMENT_SLOTS.length, "a known pre-request budget stop is a completed bounded trajectory")
+		assert.equal(summary.abortedAttempts, 0)
+		assert.equal(summary.unstartedSlots, 0, "later frozen development slots still run")
+		assert.equal(summary.billing.admittedRequests, LIVE_DEVELOPMENT_SLOTS.length * replies.length, "only the first eight requests per slot were admitted")
+		assert.equal(summary.billing.responsesReceived, LIVE_DEVELOPMENT_SLOTS.length * replies.length)
+		assert.equal(summary.billing.unresolvedRequests, 0)
+		assert.equal(summary.billing.acceptedBillingRecords, LIVE_DEVELOPMENT_SLOTS.length * replies.length)
+		const promptTokensPerRun = 7 * 1_000 + 12_500
+		const tokensPerRun = promptTokensPerRun + replies.length * 5
+		assert.equal(summary.billing.promptTokens, LIVE_DEVELOPMENT_SLOTS.length * promptTokensPerRun)
+		assert.equal(summary.billing.completionTokens, LIVE_DEVELOPMENT_SLOTS.length * replies.length * 5)
+		assert.ok(Math.abs(summary.billing.totalBilledCostUsd - LIVE_DEVELOPMENT_SLOTS.length * replies.length * 0.000001) < 1e-15)
+		assert.equal(client.requests.length, LIVE_DEVELOPMENT_SLOTS.length * replies.length, "the rejected ninth request never reaches the fake provider")
+		assert.equal(client.requests.every((request) => request.maxTokens === 2048), true, "the frozen output cap remains in force")
+		const journal = new PilotJournal(summary.journalPath)
+		await journal.open()
+		const records = journal.list()
+		const outcomes = records.filter((record) => record.type === "attempt_completed").map((record) => record.payload.outcome as { stopReason: string; detectionLabels: readonly (0 | 1 | null)[] })
+		assert.equal(outcomes.length, LIVE_DEVELOPMENT_SLOTS.length)
+		assert.equal(outcomes.every((outcome) => outcome.stopReason === "per-run-token-budget-exhausted"), true)
+		assert.equal(outcomes.every((outcome) => outcome.detectionLabels.length === replies.length && outcome.detectionLabels.slice(-3).every((label) => label === null)), true, "the final three windows without complete lookahead stay masked")
+		assert.equal(records.filter((record) => record.type === "attempt_aborted").length, 0)
+		assert.equal(records.filter((record) => record.type === "trajectory_finished").length, LIVE_DEVELOPMENT_SLOTS.length)
+		const global = new PilotJournal(path.join(directory, "global-budget.jsonl"))
+		await global.open()
+		const settlements = global.list().filter((record) => record.type === "budget_settled")
+		assert.equal(settlements.length, LIVE_DEVELOPMENT_SLOTS.length)
+		assert.equal(settlements.every((record) => record.payload.actualTokens === tokensPerRun), true, "each reservation settles with its accepted provider usage")
+	} finally { await fs.rm(directory, { recursive: true, force: true }) }
+}
+
 async function testResponseWithoutFiniteGenerationCostIsUnbilled(): Promise<void> {
 	const directory = await scratch()
 	try {
@@ -420,6 +485,7 @@ await testFiniteBillingIsCountedWhenAdmissionAborts()
 await testAdmittedRequestWithoutResponseIsShownAsUnresolved()
 await testResponseWithoutFiniteGenerationCostIsUnbilled()
 await testUncertainRequestIsNotAutomaticallyReplayed()
+await testKnownPerRunAdmissionStopCompletesAndSettlesTrajectory()
 await testCompletionOverrunIsJournaledBeforeAnyToolDispatch()
 await testHeldoutCannotStartWithoutQualifiedDevelopment()
 await testHeldoutRejectsDifferentFrozenOutputCapBeforeInference()
