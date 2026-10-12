@@ -473,8 +473,8 @@ async function acquireMonitorLock(directory: string, scope: { queueName: string;
 	const lockPath = path.join(directory, "monitor.lock")
 	const bootstrapPath = path.join(directory, "monitor.lock.bootstrap")
 	const identity = await monitorProcessIdentity()
-	const contents = `${JSON.stringify({ schemaVersion: 1, ...identity, ...scope, startedAt: new Date().toISOString() })}\n`
-	const bootstrapContents = `${JSON.stringify({ schemaVersion: 1, ...identity, ...scope, nonce: randomUUID() })}\n`
+	const contents = `${JSON.stringify({ schemaVersion: 1, pid: identity.pid, startTicks: identity.startTicks, bootId: identity.bootId, queueName: scope.queueName, campaignId: scope.campaignId, startedAt: new Date().toISOString() })}\n`
+	const bootstrapContents = `${JSON.stringify({ schemaVersion: 1, pid: identity.pid, startTicks: identity.startTicks, bootId: identity.bootId, queueName: scope.queueName, campaignId: scope.campaignId, nonce: randomUUID() })}\n`
 	let bootstrap
 	try { bootstrap = await fs.open(bootstrapPath, "wx", 0o600) }
 	catch (error) {

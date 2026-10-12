@@ -1,5 +1,7 @@
 import assert from "node:assert/strict"
 import { EventEmitter } from "node:events"
+import { syncBuiltinESMExports } from "node:module"
+import fsPromises from "node:fs/promises"
 import test from "node:test"
 import { spawn, type ChildProcess } from "node:child_process"
 import * as fs from "node:fs/promises"
@@ -202,6 +204,62 @@ test("monitor writes an atomic heartbeat and refuses a concurrent process lock",
 	assert.equal(await fs.stat(path.join(stateDirectory, "status.json")).then((info) => info.mode & 0o777), 0o600)
 	await assert.rejects(runRsiMonitor({ ...options, campaignId: "different-campaign", signal: undefined }), /state is malformed/)
 	await fs.rm(stateDirectory, { recursive: true, force: true })
+})
+
+test("monitor lock files project only process identity and scope fields", async () => {
+	const stateDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-rsi-monitor-lock-projection-"))
+	await fs.chmod(stateDirectory, 0o700)
+	const fixture = fixturePool()
+	const sentinel = "postgres://monitor-lock-secret:sentinel-password@127.0.0.1/private?token=sentinel-token"
+	Object.assign(fixture.pool, { connectionString: sentinel, privatePoolOption: "must-not-serialize" })
+	const injectedOptions = Object.assign({
+		...statusOptions, pool: fixture.pool, stateDirectory, pollMs: 1000, stallMs: 2000, maxRuntimeMs: 10_000,
+	}, { connectionString: sentinel, additionalRuntimeOption: "must-not-serialize" }) as RsiMonitorOptions
+	const originalOpen = fsPromises.open
+	const captured: Record<string, string> = {}
+	const patchedOpen: typeof fsPromises.open = async (...args) => {
+		const handle = await originalOpen(...args)
+		const filename = String(args[0])
+		if (!filename.endsWith("/monitor.lock") && !filename.endsWith("/monitor.lock.bootstrap")) return handle
+		return new Proxy(handle, {
+			get(target, property) {
+				if (property === "writeFile") return async (...writeArgs: Parameters<typeof handle.writeFile>) => {
+					await Reflect.apply(handle.writeFile.bind(handle), handle, writeArgs)
+					captured[path.basename(filename)] = await fs.readFile(filename, "utf8")
+					return undefined
+				}
+				const value = Reflect.get(target, property, target)
+				return typeof value === "function" ? value.bind(target) : value
+			},
+		})
+	}
+	const controller = new AbortController()
+	try {
+		fsPromises.open = patchedOpen
+		syncBuiltinESMExports()
+		const exitCode = await runRsiMonitor({ ...injectedOptions, signal: controller.signal, stdout: () => controller.abort() })
+		assert.equal(exitCode, 0)
+		const persistent = JSON.parse(captured["monitor.lock"] ?? "null") as Record<string, unknown> | null
+		const bootstrap = JSON.parse(captured["monitor.lock.bootstrap"] ?? "null") as Record<string, unknown> | null
+		assert.ok(persistent, "read the persistent lock bytes after the file write")
+		assert.ok(bootstrap, "capture the bootstrap lock bytes during its write")
+		const allowedPersistent = ["schemaVersion", "pid", "startTicks", "bootId", "queueName", "campaignId", "startedAt"]
+		const allowedBootstrap = ["schemaVersion", "pid", "startTicks", "bootId", "queueName", "campaignId", "nonce"]
+		assert.deepEqual(Object.keys(persistent).sort(), allowedPersistent.sort())
+		assert.deepEqual(Object.keys(bootstrap).sort(), allowedBootstrap.sort())
+		assert.equal(persistent.queueName, statusOptions.queueName)
+		assert.equal(persistent.campaignId, statusOptions.campaignId)
+		assert.equal(bootstrap.queueName, statusOptions.queueName)
+		assert.equal(bootstrap.campaignId, statusOptions.campaignId)
+		assert.ok(!captured["monitor.lock"].includes(sentinel))
+		assert.ok(!captured["monitor.lock.bootstrap"].includes(sentinel))
+		assert.ok(!captured["monitor.lock"].includes("must-not-serialize"))
+		assert.ok(!captured["monitor.lock.bootstrap"].includes("must-not-serialize"))
+	} finally {
+		fsPromises.open = originalOpen
+		syncBuiltinESMExports()
+		await fs.rm(stateDirectory, { recursive: true, force: true })
+	}
 })
 
 test("monitor rejects a pre-existing lock and malformed history instead of taking ownership", async () => {
