@@ -3,8 +3,8 @@
 `headlesscode improve --dry-run` plans candidate worktrees. A real run requires
 a PostgreSQL queue, a shared S3-compatible artifact store, and fresh worker
 registrations connected to OpenShell gateways that cover the run's mutation and
-evaluation resource classes. The
-coordinator queues a sanitized baseline visible evaluation, candidate mutation
+evaluation resource classes. The coordinator queues a sanitized baseline visible
+evaluation, candidate mutation
 snapshots, and candidate visible evaluations; workers run each job in a fresh
 OpenShell guest. The coordinator applies returned patches, calculates fitness,
 compares results with the baseline, and owns the archive and candidate
