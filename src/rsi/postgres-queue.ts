@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs"
 import { Pool, type PoolClient } from "pg"
 import type { ResourceClass, WorkerHarnessMode, WorkerHarnessRuntimeIdentity } from "./types.js"
 import { createRsiArtifactStore, type RsiArtifactReference, type RsiArtifactStore } from "./artifact-store.js"
+import { sumMicrousd, sumMicrousdAsUsd, usdEqualsMicrousd } from "./microusd.js"
 import { endpointPriceIdentity, openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID, type OpenRouterBrokerGrant, type OpenRouterBrokerReceipt, type OpenRouterCallReceipt, type OpenRouterCallReservation, type OpenRouterCallSettlement, type OpenRouterDenialReason, type OpenRouterEndpointPriceSnapshot, type OpenRouterInferenceLedger, type RsiOpenRouterProfileId } from "./inference-broker.js"
 import type { OpenRouterBrokerLimits } from "./inference-broker.js"
 import { PostgresProofCampaign, type ProofCampaignArmLease, type ProofCampaignManifest } from "./proof-campaign.js"
@@ -673,7 +674,7 @@ export class PostgresRsiJobQueue {
 		const allMeasured = calls.length > 0 && calls.every((call) => call.authoritative)
 		const promptTokens = allMeasured ? calls.reduce((sum, call) => sum + (call.promptTokens ?? 0), 0) : null
 		const completionTokens = allMeasured ? calls.reduce((sum, call) => sum + (call.completionTokens ?? 0), 0) : null
-		const costUsd = allMeasured ? calls.reduce((sum, call) => sum + (call.costUsd ?? 0), 0) : null
+		const costUsd = allMeasured ? sumMicrousdAsUsd(callResult.rows.map((row) => row.actual_spend_microusd)) : null
 		const grantMatches = job.lease_token_sha256 === sha256Text(grant.leaseToken) && job.capability_sha256 === sha256Text(grant.capability)
 		const currentLease = (job.queue_status === "leased" && job.current_lease_token === grant.leaseToken && job.lease_valid === true)
 			|| (job.queue_status === "completed" && grantMatches)
@@ -764,9 +765,9 @@ export class PostgresRsiJobQueue {
 					if (!calls.rowCount || calls.rows.some((call) => call.state !== "complete" || call.qualified !== true || call.returned_model !== inferenceJob.model || call.prompt_tokens === null || call.completion_tokens === null || call.actual_spend_microusd === null)) throw new Error("proof campaign mutation result has an incomplete or unqualified broker call")
 					actualCalls = calls.rowCount
 					actualTokens = calls.rows.reduce((sum, call) => sum + Number(call.prompt_tokens) + Number(call.completion_tokens), 0)
-					actualSpend = calls.rows.reduce((sum, call) => sum + Number(call.actual_spend_microusd), 0)
+					actualSpend = sumMicrousd(calls.rows.map((call) => call.actual_spend_microusd))
 					const reported = resultObject.inferenceReceipt as Record<string, unknown> | undefined
-					if (!reported || reported.provider !== "openrouter" || reported.jobId !== current.job_id || reported.campaignId !== mutationBrokerCampaignId || reported.model !== inferenceJob.model || reported.qualified !== true || reported.calls !== actualCalls || reported.totalTokens !== actualTokens || typeof reported.costUsd !== "number" || Math.ceil(reported.costUsd * 1_000_000) !== actualSpend) throw new Error("proof campaign result receipt does not match durable broker call accounting")
+					if (!reported || reported.provider !== "openrouter" || reported.jobId !== current.job_id || reported.campaignId !== mutationBrokerCampaignId || reported.model !== inferenceJob.model || reported.qualified !== true || reported.calls !== actualCalls || reported.totalTokens !== actualTokens || !usdEqualsMicrousd(reported.costUsd, actualSpend)) throw new Error("proof campaign result receipt does not match durable broker call accounting")
 				} else if (current.job_kind !== "evaluation" || binding.cells.some((cell) => cell.attemptKind !== "verification") || !resultArtifactRefs["evaluation-output"]) throw new Error("proof campaign verification result is missing its independently produced output artifact")
 				for (const cell of binding.cells) {
 					const attempt = attempts.find((row) => row.attempt_key === cell.attemptKey)!
