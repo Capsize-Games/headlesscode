@@ -2,13 +2,15 @@ import assert from "node:assert/strict"
 import { createHash, generateKeyPairSync, randomUUID } from "node:crypto"
 import { execFileSync } from "node:child_process"
 import * as fs from "node:fs/promises"
-import * as os from "node:os"
 import * as path from "node:path"
+import { Pool } from "pg"
 import test, { after, before } from "node:test"
 import { checkpointRun } from "../archive.js"
-import { runRsi as runRsiImplementation } from "../controller.js"
+import { improveRunOutcome, runRsi as runRsiImplementation } from "../controller.js"
 import { createMutationSnapshotBundle } from "../openshell.js"
-import type { FleetJob, FleetJobPayload, PostgresRsiJobQueue } from "../postgres-queue.js"
+import { FileRsiArtifactStore } from "../artifact-store.js"
+import { PostgresProofCampaign } from "../proof-campaign.js"
+import { PostgresRsiJobQueue, type FleetJob, type FleetJobPayload } from "../postgres-queue.js"
 import { newCandidate } from "../workspace.js"
 import type { CandidateRecord, RsiConfig, RsiRunRecord, RsiHooks, TrialResult } from "../types.js"
 import { fakeDevelopmentBenchmarkHook } from "./development-proof-fixture.js"
@@ -54,6 +56,11 @@ class FakeFleetQueue {
 	readonly failAdversarial: boolean
 	staleFastPath?: "baseline" | "mutation" | "evaluation"
 	adversarialEvaluationJobCount = 0
+	proofCampaign?: PostgresProofCampaign
+	proofCampaignProxy?: PostgresProofCampaign
+	proofLease?: Awaited<ReturnType<PostgresProofCampaign["acquire"]>>
+	failMutationUncertain = false
+	mutationFailureSettled = false
 
 	constructor(expectedCandidateEvaluations: number, failAfterFirstArtifact = false, invalidCandidateTrial = false, adaptiveMixed = false, failRegressionForCandidates = false, staleCurriculumReplayKey = false, failAdversarial = false) {
 		this.expectedCandidateEvaluations = expectedCandidateEvaluations
@@ -68,6 +75,24 @@ class FakeFleetQueue {
 	async migrate(): Promise<void> {}
 	async activeWorkerCount(): Promise<number> { return 2 }
 	async close(): Promise<void> { this.closeCount += 1 }
+	setProofCampaign(campaign: PostgresProofCampaign): void {
+		this.proofCampaign = campaign
+		this.proofCampaignProxy = new Proxy(campaign, {
+			get: (target, property) => {
+				if (property === "acquire") return async (...args: Parameters<PostgresProofCampaign["acquire"]>) => {
+					const lease = await target.acquire(...args)
+					this.proofLease = lease
+					return lease
+				}
+				const value = Reflect.get(target, property, target) as unknown
+				return typeof value === "function" ? value.bind(target) : value
+			},
+		})
+	}
+	proofCampaignCoordinator(): PostgresProofCampaign {
+		if (!this.proofCampaignProxy) throw new Error("test proof campaign coordinator was not configured")
+		return this.proofCampaignProxy
+	}
 
 	async putArtifact(content: Buffer): Promise<{ sha256: string; byteLength: number }> {
 		if (this.failAfterFirstArtifact && this.artifacts.size > 0) throw new Error("simulated artifact-store failure")
@@ -119,6 +144,11 @@ class FakeFleetQueue {
 
 	async getJob(jobId: string): Promise<FleetJob | undefined> {
 		const job = this.jobs.get(jobId)
+		if (job?.jobKind === "mutation" && job.status === "failed" && this.failMutationUncertain && !this.mutationFailureSettled) {
+			if (!this.proofCampaign || !this.proofLease) throw new Error("uncertain mutation test has no real campaign lease")
+			await this.proofCampaign.settle(this.proofLease, job.idempotencyKey, { status: "failed", error: job.error ?? "synthetic unresolved mutation accounting" })
+			this.mutationFailureSettled = true
+		}
 		if (job?.jobKind === "evaluation" && job.candidateId !== "baseline" && !this.firstCandidateEvaluationObserved) {
 			assert.equal(this.evaluationJobCount, this.expectedCandidateEvaluations, "all candidate evaluation jobs must be queued before the coordinator waits")
 			this.firstCandidateEvaluationObserved = true
@@ -134,24 +164,29 @@ class FakeFleetQueue {
 		if (input.jobKind === "mutation") {
 			assert.equal(input.payload.evaluatorRuntime, undefined, "mutation jobs do not receive evaluator-only runtime identity")
 			this.mutationJobCount += 1
-			const bundle = this.artifacts.get(input.artifactSha256)
-			assert.ok(bundle)
-			const temp = await fs.mkdtemp(path.join(os.tmpdir(), "rsi-fake-fleet-mutation-"))
-			try {
-				const bundlePath = path.join(temp, "snapshot.bundle")
-				const repo = path.join(temp, "repo")
-				await fs.writeFile(bundlePath, bundle)
-				execFileSync("git", ["clone", "--quiet", bundlePath, repo], { cwd: temp })
-				execFileSync("git", ["config", "user.name", "Test"], { cwd: repo })
-				execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: repo })
-				await fs.writeFile(path.join(repo, "src", "agent.ts"), `// ${input.candidateId}\nexport function candidateBehavior(value) { return value }\n`)
-				execFileSync("git", ["add", "--all"], { cwd: repo })
-				execFileSync("git", ["commit", "--quiet", "-m", "fake worker candidate"], { cwd: repo })
-				const patch = execFileSync("git", ["diff", "--binary", "--no-renames", `${input.payload.snapshotCommit}...HEAD`], { cwd: repo })
-				const artifact = await this.putArtifact(patch)
-				result = { ok: true, patchSha256: artifact.sha256, patchBytes: artifact.byteLength }
-			} finally {
-				await fs.rm(temp, { recursive: true, force: true })
+			if (this.failMutationUncertain) result = { ok: false, error: "synthetic worker lost mutation accounting after dispatch" }
+			else {
+				const bundle = this.artifacts.get(input.artifactSha256)
+				assert.ok(bundle)
+				const scratch = path.resolve(".headlesscode/scratch")
+				await fs.mkdir(scratch, { recursive: true, mode: 0o700 })
+				const temp = await fs.mkdtemp(path.join(scratch, "rsi-fake-fleet-mutation-"))
+				try {
+					const bundlePath = path.join(temp, "snapshot.bundle")
+					const repo = path.join(temp, "repo")
+					await fs.writeFile(bundlePath, bundle)
+					execFileSync("git", ["clone", "--quiet", bundlePath, repo], { cwd: temp })
+					execFileSync("git", ["config", "user.name", "Test"], { cwd: repo })
+					execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: repo })
+					await fs.writeFile(path.join(repo, "src", "agent.ts"), `// ${input.candidateId}\nexport function candidateBehavior(value) { return value }\n`)
+					execFileSync("git", ["add", "--all"], { cwd: repo })
+					execFileSync("git", ["commit", "--quiet", "-m", "fake worker candidate"], { cwd: repo })
+					const patch = execFileSync("git", ["diff", "--binary", "--no-renames", `${input.payload.snapshotCommit}...HEAD`], { cwd: repo })
+					const artifact = await this.putArtifact(patch)
+					result = { ok: true, patchSha256: artifact.sha256, patchBytes: artifact.byteLength }
+				} finally {
+					await fs.rm(temp, { recursive: true, force: true })
+				}
 			}
 		} else {
 			assert.equal(input.payload.evaluatorRuntime?.imageDigest, `sha256:${"0".repeat(64)}`, "synthetic evaluation hooks carry an explicit non-production image identity")
@@ -199,11 +234,12 @@ class FakeFleetQueue {
 			...(input.concurrencyKey ? { concurrencyKey: input.concurrencyKey } : {}),
 			artifactSha256: input.artifactSha256,
 			payload: input.payload,
-			status: "completed",
+			status: input.jobKind === "mutation" && this.failMutationUncertain ? "failed" : "completed",
 			attempts: 1,
 			maxAttempts: 2,
 			leaseDurationMs: 60_000,
 			result,
+			...(input.jobKind === "mutation" && this.failMutationUncertain ? { error: "synthetic worker lost mutation accounting after dispatch" } : {}),
 			createdAt: new Date().toISOString(),
 			updatedAt: new Date().toISOString(),
 		}
@@ -214,7 +250,9 @@ class FakeFleetQueue {
 }
 
 async function setup(): Promise<{ root: string; config: RsiConfig }> {
-	const root = await fs.mkdtemp(path.join(os.tmpdir(), "rsi-controller-fleet-"))
+	const scratch = path.resolve(".headlesscode/scratch")
+	await fs.mkdir(scratch, { recursive: true, mode: 0o700 })
+	const root = await fs.mkdtemp(path.join(scratch, "rsi-controller-fleet-"))
 	execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: root })
 	execFileSync("git", ["config", "user.name", "Test"], { cwd: root })
 	execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: root })
@@ -246,8 +284,19 @@ async function setup(): Promise<{ root: string; config: RsiConfig }> {
 	return { root, config }
 }
 
+async function installFrozenBenchmarkHistory(repoRoot: string): Promise<void> {
+	const manifestPath = path.resolve("fixtures", "rsi-benchmark", "manifest.json")
+	const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as { tasks: Array<{ startCommit?: string; knownGoodCommit?: string; knownBadCommit?: string }> }
+	const commits = [...new Set(manifest.tasks.flatMap((task) => [task.startCommit, task.knownGoodCommit, task.knownBadCommit].filter((commit): commit is string => Boolean(commit))))]
+	if (!commits.length) throw new Error("controller integration fixture has no frozen benchmark commits")
+	execFileSync("git", ["fetch", "--quiet", "--no-tags", process.cwd(), ...commits], { cwd: repoRoot })
+	for (const commit of commits) execFileSync("git", ["cat-file", "-e", `${commit}^{tree}`], { cwd: repoRoot, stdio: "ignore" })
+}
+
 async function syntheticEvaluatorTrust(config: RsiConfig): Promise<{ config: RsiConfig; cleanup: () => Promise<void> }> {
-	const root = await fs.mkdtemp(path.join("/var/tmp", "hc-rsi-fleet-test-trust-"))
+	const scratch = path.resolve(".headlesscode/scratch")
+	await fs.mkdir(scratch, { recursive: true, mode: 0o700 })
+	const root = await fs.mkdtemp(path.join(scratch, "hc-rsi-fleet-test-trust-"))
 	const pair = generateKeyPairSync("ed25519")
 	const signingKeyPath = path.join(root, "signing.pem")
 	const trustedPublicKeyPath = path.join(root, "trusted-public.pem")
@@ -270,6 +319,103 @@ test("fleet controller queues baseline and all candidate evaluations before wait
 		assert.equal(queue.firstCandidateEvaluationObserved, true)
 		assert.equal(queue.closeCount, 1)
 	} finally {
+		await fs.rm(root, { recursive: true, force: true })
+	}
+})
+
+test("improve reports an incomplete campaign as failure despite a historical selected candidate", () => {
+	const outcome = improveRunOutcome({ runId: "run-incomplete", selected: "candidate-from-earlier-generation", proofCampaign: { state: "incomplete" } }, false)
+	assert.equal(outcome.exitCode, 1)
+	assert.match(outcome.output, /^\[rsi\] incomplete: run-incomplete;/)
+	assert.match(outcome.output, /historical-selected=candidate-from-earlier-generation/)
+	assert.doesNotMatch(outcome.output, /^\[rsi\] complete:/)
+})
+
+const proofDatabaseUrl = process.env.HEADLESSCODE_RSI_TEST_DATABASE_URL
+
+test("controller checkpoints an unresolved mutation in a real PostgreSQL campaign ledger without selection or reservation release", { skip: !proofDatabaseUrl }, async () => {
+	const scratch = path.resolve(".headlesscode/scratch")
+	await fs.mkdir(scratch, { recursive: true, mode: 0o700 })
+	const schema = `rsi_controller_${randomUUID().replaceAll("-", "")}`
+	const root = await fs.mkdtemp(path.join(scratch, "rsi-controller-incomplete-pg-"))
+	const admin = new Pool({ connectionString: proofDatabaseUrl })
+	let pool: Pool | undefined
+	let queueMigrator: PostgresRsiJobQueue | undefined
+	const budgetNames = [
+		"HEADLESSCODE_RSI_OPENROUTER_MAX_INPUT_PRICE_PER_MILLION_USD", "HEADLESSCODE_RSI_OPENROUTER_MAX_OUTPUT_PRICE_PER_MILLION_USD",
+		"HEADLESSCODE_RSI_OPENROUTER_MAX_CALL_SPEND_USD", "HEADLESSCODE_RSI_OPENROUTER_MAX_JOB_SPEND_USD", "HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD",
+		"HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD", "HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD",
+	]
+	const saved = Object.fromEntries(budgetNames.map((name) => [name, process.env[name]]))
+	try {
+		Object.assign(process.env, {
+			HEADLESSCODE_RSI_OPENROUTER_MAX_INPUT_PRICE_PER_MILLION_USD: "0.001",
+			HEADLESSCODE_RSI_OPENROUTER_MAX_OUTPUT_PRICE_PER_MILLION_USD: "0.001",
+			HEADLESSCODE_RSI_OPENROUTER_MAX_CALL_SPEND_USD: "0.05",
+			HEADLESSCODE_RSI_OPENROUTER_MAX_JOB_SPEND_USD: "0.05",
+			HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD: "20",
+			HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD: "5",
+			HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD: "15",
+		})
+		await admin.query(`CREATE SCHEMA ${schema}`)
+		pool = new Pool({ connectionString: proofDatabaseUrl, options: `-c search_path=${schema}` })
+		const artifactRoot = path.join(root, "artifacts")
+		queueMigrator = new PostgresRsiJobQueue(pool, { queueName: `proof-${randomUUID().slice(0, 8)}`, maxInFlight: 1, leaseMs: 60_000, maxAttempts: 1 }, new FileRsiArtifactStore(artifactRoot))
+		await queueMigrator.migrate()
+		const campaignStore = queueMigrator.proofCampaignCoordinator()
+		const fakeQueue = new FakeFleetQueue(0)
+		fakeQueue.setProofCampaign(campaignStore)
+		fakeQueue.failMutationUncertain = true
+		const { config: baseConfig, root: repoRoot } = await setup()
+		await installFrozenBenchmarkHistory(repoRoot)
+		const trusted = await syntheticEvaluatorTrust(baseConfig)
+		try {
+			const model = "deepseek/deepseek-v4-flash-0731"
+			const campaign = `rsi-proof-${randomUUID().replaceAll("-", "").slice(0, 20)}`
+			const runtime = { imageName: "synthetic-test-image", imageDigest: `sha256:${"0".repeat(64)}`, harnessCommit: "1".repeat(40), dependencyLockDigest: "2".repeat(64) }
+			const config: RsiConfig = {
+				...trusted.config, model, roles: { worker: { provider: "openrouter", model } }, population: 1, generations: 2, maxIterations: 1, maxTokens: 256, maxRuntimeMs: 48 * 60 * 60_000,
+				workerHarnessPairId: campaign, workerHarnessRunId: `${campaign}-fixed`, workerHarnessMode: "fixed-control", workerHarnessPhase: "development", workerHarnessEngineeringOnly: true, workerHarnessRuntime: runtime,
+			}
+			const run = await runRsiImplementation(config, { syntheticRuntimeIdentity: true, log: () => undefined }, fakeQueue as unknown as PostgresRsiJobQueue)
+			assert.equal(fakeQueue.mutationJobCount, 1)
+			assert.equal(fakeQueue.mutationFailureSettled, true)
+			assert.equal(run.candidates[0]?.status, "failed")
+			assert.equal(run.proofCampaign?.state, "incomplete")
+			assert.ok(run.finishedAt, "incomplete run is terminally reported")
+			const snapshot = await campaignStore.snapshot(campaign)
+			const persistedCampaign = snapshot.campaign as Record<string, unknown>
+			const arm = (snapshot.arms as Array<Record<string, unknown>>).find((entry) => entry.arm_id === "fixed-control")
+			const attempts = snapshot.attempts as Array<Record<string, unknown>>
+			const mutation = attempts.find((attempt) => attempt.attempt_kind === "mutation")
+			assert.equal(persistedCampaign.state, "running", "campaign state remains nonterminal")
+			assert.equal(arm?.state, "running", "arm is not marked evaluated or finished")
+			assert.equal(mutation?.status, "uncertain", "dispatched failure remains unresolved")
+			assert.ok(Number(mutation?.reserved_tokens) > 0)
+			assert.equal(mutation?.actual_tokens, null)
+			assert.ok(Number(persistedCampaign.reserved_calls) > 0, "unsettled reservation is retained")
+			assert.equal(Number(persistedCampaign.used_calls), 0)
+			const events = snapshot.events as Array<Record<string, unknown>>
+			assert.equal(events.filter((event) => event.event_type === "candidate-incomplete").length, 1)
+			assert.equal(events.some((event) => event.event_type === "generation-selected" || event.event_type === "engineering-development-finished"), false, "selection and finish gates remain closed")
+			assert.equal((snapshot.decisions as Array<Record<string, unknown>>).length, 0, "unsettled mutation is never recorded as evaluated")
+			const incompleteEvent = events.find((event) => event.event_type === "candidate-incomplete")!
+			const eventPayload = incompleteEvent.payload as { cells: Array<Record<string, unknown>> }
+			const frozenCells = run.proofCampaign!.manifest.schedule.filter((cell) => cell.armId === "fixed-control" && cell.generation === 0)
+			assert.deepEqual(eventPayload.cells.map((cell) => [cell.armId, cell.generation, cell.candidateId, cell.taskId, cell.seed, cell.attemptKind]), frozenCells.map((cell) => [cell.armId, cell.generation, cell.candidateId, cell.taskId, cell.seed, cell.attemptKind]), "checkpoint includes the exact full frozen slot schedule")
+			assert.ok(run.reports.some((report) => report.endsWith(".md")))
+		} finally {
+			await trusted.cleanup()
+			await fs.rm(repoRoot, { recursive: true, force: true })
+		}
+	} finally {
+		for (const [name, value] of Object.entries(saved)) {
+			if (value === undefined) delete process.env[name]
+			else process.env[name] = value
+		}
+		await pool?.end()
+		await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`)
+		await admin.end()
 		await fs.rm(root, { recursive: true, force: true })
 	}
 })

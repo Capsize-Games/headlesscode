@@ -232,7 +232,16 @@ async function testAsyncOpenShellCommandReportsSafeExitAndTimeoutDetails(): Prom
 	assert.match(timeout.output, /signal=SIGTERM/)
 }
 
-async function testAbortEscalatesItsLauncherGroupAndRemovesGrandchild(): Promise<void> {
+async function testImmediateAbortWaitsForLauncherIdentityAndCleansUp(): Promise<void> {
+	const controller = new AbortController()
+	const pending = runOpenShellCommandAsync(["-e", "setInterval(()=>{},1000)"], 10_000, process.execPath, controller.signal, 100)
+	const startedAt = Date.now()
+	controller.abort(new Error("immediate stop"))
+	await assert.rejects(pending, /immediate stop/)
+	assert.ok(Date.now() - startedAt < 6_000, "immediate abort completes after bounded process identity capture and teardown")
+}
+
+async function testHostAbortEscalatesItsLauncherGroupAndRemovesGrandchild(): Promise<void> {
 	const scratch = path.join(process.cwd(), ".headlesscode", "scratch")
 	fs.mkdirSync(scratch, { recursive: true })
 	const pidFile = path.join(scratch, `openshell-grandchild-${process.pid}.pid`)
@@ -242,8 +251,11 @@ async function testAbortEscalatesItsLauncherGroupAndRemovesGrandchild(): Promise
 	const childSource = `const fs=require('node:fs');const {spawn}=require('node:child_process');process.on('SIGTERM',()=>{});const child=spawn(process.execPath,['-e',${JSON.stringify("process.on('SIGTERM',()=>{});if(process.send)process.send('ready');setInterval(()=>{},1000)")}],{stdio:['ignore','ignore','ignore','ipc']});child.once('message',(message)=>{if(message==='ready'){fs.writeFileSync(${JSON.stringify(temporaryPidFile)},String(child.pid)+'\\n',{flag:'wx'});fs.renameSync(${JSON.stringify(temporaryPidFile)},${JSON.stringify(pidFile)})}});setInterval(()=>{},1000)`
 	const controller = new AbortController()
 	const pending = runOpenShellCommandAsync(["-e", childSource], 10_000, process.execPath, controller.signal, 100)
+	const originalKill = process.kill.bind(process)
+	const processRef = process as NodeJS.Process & { kill: typeof process.kill }
 	const deadline = Date.now() + 3_000
 	let grandchildPid = 0
+	let groupSignalDenied = false
 	let aborted = false
 	try {
 		while (Date.now() < deadline) {
@@ -254,15 +266,411 @@ async function testAbortEscalatesItsLauncherGroupAndRemovesGrandchild(): Promise
 			await new Promise((resolve) => setTimeout(resolve, 10))
 		}
 		assert.ok(grandchildPid > 0, "fixture publishes a positive grandchild PID only after its SIGTERM handler is installed")
+		const originalIdentity = readTestProcessIdentity(grandchildPid)
+		assert.ok(originalIdentity && originalIdentity.processGroupId === originalIdentity.sessionId, "capture the original descendant group/session/starttime before abort")
+		processRef.kill = ((pid: number, signal?: NodeJS.Signals | 0) => {
+			try { return originalKill(pid, signal as NodeJS.Signals | 0) }
+			catch (error) {
+				if (pid < 0 && (error as NodeJS.ErrnoException).code === "EPERM") groupSignalDenied = true
+				throw error
+			}
+		}) as typeof process.kill
 		controller.abort(new Error("controlled stop"))
 		aborted = true
 		await assert.rejects(pending, /controlled stop|aborted/)
-		assert.throws(() => process.kill(grandchildPid, 0), (error: NodeJS.ErrnoException) => error.code === "ESRCH", "the grandchild in the owned process group is gone")
+		if (groupSignalDenied) assertLinuxProcessTerminal(grandchildPid, "contained fallback stopped the original descendant; a zombie is not claimed reaped", originalIdentity)
+		else assert.throws(() => originalKill(grandchildPid, 0), (error: NodeJS.ErrnoException) => error.code === "ESRCH", "when primary group signaling is available, the launcher reaps its grandchild")
 	} finally {
+		processRef.kill = originalKill
 		if (!aborted) controller.abort(new Error("fixture cleanup"))
 		await pending.catch(() => undefined)
 		fs.rmSync(pidFile, { force: true })
 		fs.rmSync(temporaryPidFile, { force: true })
+	}
+}
+
+async function testContainedAbortFallsBackForDeniedGroupSignals(): Promise<void> {
+	if (process.platform !== "linux") return
+	const scratch = path.join(process.cwd(), ".headlesscode", "scratch")
+	fs.mkdirSync(scratch, { recursive: true })
+	const pidFile = path.join(scratch, `openshell-fallback-grandchild-${process.pid}.pid`)
+	const temporaryPidFile = `${pidFile}.tmp`
+	fs.rmSync(pidFile, { force: true })
+	fs.rmSync(temporaryPidFile, { force: true })
+	const childSource = `const fs=require('node:fs');const {spawn}=require('node:child_process');process.on('SIGTERM',()=>{});const child=spawn(process.execPath,['-e',${JSON.stringify("process.on('SIGTERM',()=>{});if(process.send)process.send('ready');setInterval(()=>{},1000)")}],{stdio:['ignore','ignore','ignore','ipc']});child.once('message',(message)=>{if(message==='ready'){fs.writeFileSync(${JSON.stringify(temporaryPidFile)},String(child.pid)+'\\n',{flag:'wx'});fs.renameSync(${JSON.stringify(temporaryPidFile)},${JSON.stringify(pidFile)})}});setInterval(()=>{},1000)`
+	const controller = new AbortController()
+	const pending = runOpenShellCommandAsync(["-e", childSource], 10_000, process.execPath, controller.signal, 100)
+	const originalKill = process.kill.bind(process)
+	const processRef = process as NodeJS.Process & { kill: typeof process.kill }
+	const unrelated = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { detached: true, stdio: "ignore" })
+	let groupSignalAttempts = 0
+	const deadline = Date.now() + 3_000
+	let grandchildPid = 0
+	let unrelatedIdentity: TestProcessIdentity | null = null
+	let aborted = false
+	try {
+		while (Date.now() < deadline) {
+			try { grandchildPid = Number(fs.readFileSync(pidFile, "utf8")); if (Number.isSafeInteger(grandchildPid) && grandchildPid > 0) break }
+			catch { /* await atomic ready-PID publication */ }
+			await new Promise((resolve) => setTimeout(resolve, 10))
+		}
+		assert.ok(grandchildPid > 0, "fixture publishes the grandchild PID after its SIGTERM handler is installed")
+		await new Promise<void>((resolve, reject) => { if (unrelated.pid) resolve(); else unrelated.once("spawn", resolve).once("error", reject) })
+		const grandchildIdentity = readTestProcessIdentity(grandchildPid)
+		unrelatedIdentity = unrelated.pid ? readTestProcessIdentity(unrelated.pid) : null
+		assert.ok(grandchildIdentity && unrelatedIdentity, "both fixture and unrelated process identities are readable")
+		assert.equal(grandchildIdentity.processGroupId, grandchildIdentity.sessionId, "owned fixture is the leader of its detached process group/session")
+		assert.equal(unrelatedIdentity.effectiveUid, grandchildIdentity.effectiveUid, "unrelated control uses the same effective UID")
+		assert.ok(unrelatedIdentity.processGroupId !== grandchildIdentity.processGroupId && unrelatedIdentity.sessionId !== grandchildIdentity.sessionId, "unrelated control has a distinct group and session")
+		processRef.kill = ((pid: number, name?: NodeJS.Signals | 0) => {
+			if (pid < 0) {
+				groupSignalAttempts += 1
+				const error = new Error("contained process-group signal denied") as NodeJS.ErrnoException
+				error.code = "EPERM"
+				throw error
+			}
+			return originalKill(pid, name)
+		}) as typeof process.kill
+		controller.abort(new Error("controlled stop"))
+		aborted = true
+		await assert.rejects(pending, /controlled stop|aborted/)
+		assert.ok(groupSignalAttempts >= 1, "group signaling remains primary; EPERM selects verified per-PID fallback")
+		assertLinuxProcessTerminal(grandchildPid, "the fallback stopped execution; a verified zombie is terminal but is not claimed reaped", grandchildIdentity)
+		assert.equal(unrelated.pid && processIsAlive(unrelated.pid), true, "an unrelated same-UID process in a different session/group survives")
+	} finally {
+		processRef.kill = originalKill
+		if (!aborted) controller.abort(new Error("fixture cleanup"))
+		await pending.catch(() => undefined)
+		if (unrelatedIdentity) signalCapturedTestProcessForCleanup(unrelatedIdentity, originalKill)
+		if (unrelatedIdentity) await waitForCapturedTestProcessTerminal(unrelatedIdentity)
+		if (unrelated.exitCode === null && unrelated.signalCode === null) {
+			await new Promise<void>((resolve) => { const timer = setTimeout(resolve, 1_000); unrelated.once("close", () => { clearTimeout(timer); resolve() }) })
+		}
+		fs.rmSync(pidFile, { force: true })
+		fs.rmSync(temporaryPidFile, { force: true })
+	}
+}
+
+async function testTimeoutEscalatesAfterLauncherExitsAndVerifiesGrandchild(): Promise<void> {
+	if (process.platform !== "linux") return
+	const scratch = path.join(process.cwd(), ".headlesscode", "scratch")
+	fs.mkdirSync(scratch, { recursive: true })
+	const pidFile = path.join(scratch, `openshell-timeout-grandchild-${process.pid}.pid`)
+	fs.rmSync(pidFile, { force: true })
+	const childSource = `const fs=require('node:fs');const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e',${JSON.stringify("process.on('SIGTERM',()=>{});if(process.send)process.send('ready');setInterval(()=>{},1000)")}],{stdio:['ignore','ignore','ignore','ipc']});child.once('message',(message)=>{if(message==='ready')fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid))});setInterval(()=>{},1000)`
+	const pending = runOpenShellCommandAsync(["-e", childSource], 400, process.execPath, undefined, 100)
+	const deadline = Date.now() + 3_000
+	let grandchildPid = 0
+	let grandchildIdentity: TestProcessIdentity | undefined
+	let launcherIdentity: TestProcessIdentity | undefined
+	try {
+		while (Date.now() < deadline) {
+			try { grandchildPid = Number(fs.readFileSync(pidFile, "utf8")); if (Number.isSafeInteger(grandchildPid) && grandchildPid > 0) break }
+			catch { /* wait for child to publish the descendant PID */ }
+			await new Promise((resolve) => setTimeout(resolve, 10))
+		}
+		assert.ok(grandchildPid > 0, "fixture publishes the SIGTERM-ignoring descendant PID")
+		grandchildIdentity = readTestProcessIdentity(grandchildPid) ?? undefined
+		assert.ok(grandchildIdentity && grandchildIdentity.processGroupId === grandchildIdentity.sessionId, "capture the original group/session/starttime before timeout")
+		launcherIdentity = readTestProcessIdentity(grandchildIdentity.processGroupId) ?? undefined
+		assert.ok(launcherIdentity, "capture launcher identity before timeout")
+		const result = await pending
+		assert.equal(result.exitCode, 1)
+		assert.match(result.output, /timeout=true/)
+		assert.match(result.output, /signal=SIGTERM/)
+		assertLinuxProcessTerminal(grandchildPid, "timeout cleanup stopped execution; a verified zombie is terminal but not claimed reaped", grandchildIdentity)
+	} finally {
+		if (grandchildIdentity) signalCapturedTestProcessForCleanup(grandchildIdentity, process.kill.bind(process))
+		if (launcherIdentity) signalCapturedTestProcessForCleanup(launcherIdentity, process.kill.bind(process))
+		if (grandchildIdentity) await waitForCapturedTestProcessTerminal(grandchildIdentity)
+		if (launcherIdentity) await waitForCapturedTestProcessTerminal(launcherIdentity)
+		fs.rmSync(pidFile, { force: true })
+	}
+}
+
+function processIsAlive(pid: number): boolean {
+	try { process.kill(pid, 0); return true }
+	catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; throw error }
+}
+
+interface TestProcessIdentity { pid: number; state: string; processGroupId: number; sessionId: number; startTime: string; effectiveUid: number }
+
+function readTestProcessIdentity(pid: number): TestProcessIdentity | null {
+	try {
+		const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8")
+		const close = stat.lastIndexOf(")")
+		assert.ok(close >= 0, "process stat has a command terminator")
+		const fields = stat.slice(close + 2).split(/\s+/)
+		const status = fs.readFileSync(`/proc/${pid}/status`, "utf8")
+		const uidLine = status.split("\n").find((line) => line.startsWith("Uid:"))
+		const effectiveUid = Number(uidLine?.trim().split(/\s+/)[2])
+		return { pid, state: fields[0]!, processGroupId: Number(fields[2]), sessionId: Number(fields[3]), startTime: fields[19]!, effectiveUid }
+	} catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ESRCH") return null; throw error }
+}
+
+function assertLinuxProcessTerminal(pid: number, message: string, expected?: TestProcessIdentity): void {
+	try { process.kill(pid, 0) }
+	catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return; throw error }
+	assert.equal(process.platform, "linux", "only Linux procfs can distinguish a non-running zombie from a live process")
+	const current = readTestProcessIdentity(pid)
+	assert.ok(current, `${message} (process stat remains readable)`)
+	if (expected) assert.deepEqual({ ...current, state: expected.state }, { ...expected, state: expected.state }, "a remaining terminal PID is the exact captured process identity")
+	assert.ok(current.state === "Z" || current.state === "X", `${message} (observed state ${current.state})`)
+}
+
+function sameTestProcessIdentity(current: TestProcessIdentity | null, expected: TestProcessIdentity): boolean {
+	return Boolean(current && current.pid === expected.pid && current.processGroupId === expected.processGroupId && current.sessionId === expected.sessionId && current.startTime === expected.startTime && current.effectiveUid === expected.effectiveUid)
+}
+
+function signalCapturedTestProcessForCleanup(identity: TestProcessIdentity, originalKill: typeof process.kill): void {
+	const current = readTestProcessIdentity(identity.pid)
+	if (!sameTestProcessIdentity(current, identity) || current!.state === "Z" || current!.state === "X") return
+	originalKill(identity.pid, "SIGKILL")
+}
+
+async function waitForCapturedTestProcessTerminal(identity: TestProcessIdentity): Promise<void> {
+	const deadline = Date.now() + 1_500
+	while (Date.now() < deadline) {
+		const current = readTestProcessIdentity(identity.pid)
+		if (!current) return
+		assert.ok(sameTestProcessIdentity(current, identity), `PID ${identity.pid} was reused during fixture cleanup`)
+		if (current.state === "Z" || current.state === "X") return
+		await new Promise((resolve) => setTimeout(resolve, 20))
+	}
+	const current = readTestProcessIdentity(identity.pid)
+	assert.ok(!current || (sameTestProcessIdentity(current, identity) && (current.state === "Z" || current.state === "X")), `owned synthetic PID ${identity.pid} remains live after bounded fixture cleanup`)
+}
+
+async function testAbortFailsClosedWhenVerifiedMemberCannotBeSignaled(): Promise<void> {
+	if (process.platform !== "linux") return
+	const scratch = path.join(process.cwd(), ".headlesscode", "scratch")
+	fs.mkdirSync(scratch, { recursive: true })
+	const pidFile = path.join(scratch, `openshell-denied-grandchild-${process.pid}.pid`)
+	const childSource = `const fs=require('node:fs');const {spawn}=require('node:child_process');process.on('SIGTERM',()=>{});const child=spawn(process.execPath,['-e',${JSON.stringify("process.on('SIGTERM',()=>{});if(process.send)process.send('ready');setInterval(()=>{},1000)")}],{stdio:['ignore','ignore','ignore','ipc']});child.once('message',(message)=>{if(message==='ready')fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid))});setInterval(()=>{},1000)`
+	const controller = new AbortController()
+	const pending = runOpenShellCommandAsync(["-e", childSource], 10_000, process.execPath, controller.signal, 100)
+	const originalKill = process.kill.bind(process)
+	const processRef = process as NodeJS.Process & { kill: typeof process.kill }
+	const deadline = Date.now() + 3_000
+	let grandchildPid = 0
+	let aborted = false
+	let originalIdentity: TestProcessIdentity | undefined
+	let originalGroupLeader: TestProcessIdentity | undefined
+	try {
+		while (Date.now() < deadline) {
+			try { grandchildPid = Number(fs.readFileSync(pidFile, "utf8")); if (Number.isSafeInteger(grandchildPid) && grandchildPid > 0) break }
+			catch { /* wait for the fixture child to publish its PID */ }
+			await new Promise((resolve) => setTimeout(resolve, 10))
+		}
+		assert.ok(grandchildPid > 0, "fixture publishes the descendant PID")
+		originalIdentity = readTestProcessIdentity(grandchildPid) ?? undefined
+		assert.ok(originalIdentity && originalIdentity.processGroupId === originalIdentity.sessionId, "capture the original descendant group/session/starttime before injected denial")
+		originalGroupLeader = readTestProcessIdentity(originalIdentity.processGroupId) ?? undefined
+		assert.ok(originalGroupLeader && originalGroupLeader.pid === originalGroupLeader.processGroupId && originalGroupLeader.sessionId === originalGroupLeader.processGroupId, "capture the launcher that owns the detached group")
+		processRef.kill = ((pid: number, name?: NodeJS.Signals | 0) => {
+			if (pid < 0 || (pid > 0 && name !== 0)) {
+				const error = new Error("injected signal denial") as NodeJS.ErrnoException
+				error.code = "EPERM"
+				throw error
+			}
+			return originalKill(pid, name)
+		}) as typeof process.kill
+		controller.abort(new Error("controlled stop"))
+		aborted = true
+		await assert.rejects(pending, /could not signal a verified OpenShell process-group member/)
+		assert.equal(processIsAlive(grandchildPid), true, "signal denial leaves the descendant running and is not misreported as successful teardown")
+		assert.deepEqual(readTestProcessIdentity(grandchildPid), originalIdentity, "the denied PID is still the exact captured process, not a reused PID")
+	} finally {
+		processRef.kill = originalKill
+		if (!aborted) controller.abort(new Error("fixture cleanup"))
+		await pending.catch(() => undefined)
+		if (originalIdentity) signalCapturedTestProcessForCleanup(originalIdentity, originalKill)
+		if (originalGroupLeader) signalCapturedTestProcessForCleanup(originalGroupLeader, originalKill)
+		if (originalIdentity) await waitForCapturedTestProcessTerminal(originalIdentity)
+		if (originalGroupLeader) await waitForCapturedTestProcessTerminal(originalGroupLeader)
+		fs.rmSync(pidFile, { force: true })
+	}
+}
+
+async function testAbortFailsClosedWhenProcfsIsUnreadable(): Promise<void> {
+	if (process.platform !== "linux") return
+	const scratch = path.join(process.cwd(), ".headlesscode", "scratch")
+	fs.mkdirSync(scratch, { recursive: true })
+	const pidFile = path.join(scratch, `openshell-unreadable-grandchild-${process.pid}.pid`)
+	const childSource = `const fs=require('node:fs');const {spawn}=require('node:child_process');process.on('SIGTERM',()=>{});const child=spawn(process.execPath,['-e',${JSON.stringify("process.on('SIGTERM',()=>{});if(process.send)process.send('ready');setInterval(()=>{},1000)")}],{stdio:['ignore','ignore','ignore','ipc']});child.once('message',(message)=>{if(message==='ready')fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid))});setInterval(()=>{},1000)`
+	const controller = new AbortController()
+	const pending = runOpenShellCommandAsync(["-e", childSource], 10_000, process.execPath, controller.signal, 100)
+	const originalKill = process.kill.bind(process)
+	const processRef = process as NodeJS.Process & { kill: typeof process.kill }
+	const originalReadFile = fs.promises.readFile.bind(fs.promises)
+	const promisesRef = fs.promises as typeof fs.promises & { readFile: typeof fs.promises.readFile }
+	const deadline = Date.now() + 3_000
+	let grandchildPid = 0
+	let aborted = false
+	let originalIdentity: TestProcessIdentity | undefined
+	let originalGroupLeader: TestProcessIdentity | undefined
+	try {
+		while (Date.now() < deadline) {
+			try { grandchildPid = Number(fs.readFileSync(pidFile, "utf8")); if (Number.isSafeInteger(grandchildPid) && grandchildPid > 0) break }
+			catch { /* wait for the fixture child to publish its PID */ }
+			await new Promise((resolve) => setTimeout(resolve, 10))
+		}
+		assert.ok(grandchildPid > 0, "fixture publishes the descendant PID")
+		originalIdentity = readTestProcessIdentity(grandchildPid) ?? undefined
+		assert.ok(originalIdentity && originalIdentity.processGroupId === originalIdentity.sessionId, "capture the original descendant identity before hiding procfs")
+		originalGroupLeader = readTestProcessIdentity(originalIdentity.processGroupId) ?? undefined
+		assert.ok(originalGroupLeader && originalGroupLeader.pid === originalGroupLeader.processGroupId && originalGroupLeader.sessionId === originalGroupLeader.processGroupId, "capture launcher identity before hiding procfs")
+		processRef.kill = ((pid: number, name?: NodeJS.Signals | 0) => {
+			if (pid < 0) {
+				const error = new Error("injected process-group signal denial") as NodeJS.ErrnoException
+				error.code = "EPERM"
+				throw error
+			}
+			return originalKill(pid, name)
+		}) as typeof process.kill
+		promisesRef.readFile = ((target: Parameters<typeof fs.promises.readFile>[0], ...args: unknown[]) => {
+			if (String(target) === `/proc/${grandchildPid}/status`) {
+				const error = new Error("injected hidden proc status") as NodeJS.ErrnoException
+				error.code = "EACCES"
+				return Promise.reject(error)
+			}
+			return (originalReadFile as (...values: unknown[]) => Promise<Buffer | string>)(target, ...args)
+		}) as typeof fs.promises.readFile
+		controller.abort(new Error("controlled stop"))
+		aborted = true
+		await assert.rejects(pending, /could not inspect every process while verifying OpenShell teardown/)
+		assert.equal(processIsAlive(grandchildPid), true, "unreadable procfs leaves the descendant unverified and teardown rejects")
+		assert.deepEqual(readTestProcessIdentity(grandchildPid), originalIdentity, "the process remaining under denied visibility is the exact original PID identity")
+	} finally {
+		processRef.kill = originalKill
+		promisesRef.readFile = originalReadFile
+		if (!aborted) controller.abort(new Error("fixture cleanup"))
+		await pending.catch(() => undefined)
+		if (originalIdentity) signalCapturedTestProcessForCleanup(originalIdentity, originalKill)
+		if (originalGroupLeader) signalCapturedTestProcessForCleanup(originalGroupLeader, originalKill)
+		if (originalIdentity) await waitForCapturedTestProcessTerminal(originalIdentity)
+		if (originalGroupLeader) await waitForCapturedTestProcessTerminal(originalGroupLeader)
+		fs.rmSync(pidFile, { force: true })
+	}
+}
+
+async function testAbortFailsClosedWhenProcfsShowsReusedLeaderPid(): Promise<void> {
+	if (process.platform !== "linux") return
+	const scratch = path.join(process.cwd(), ".headlesscode", "scratch")
+	fs.mkdirSync(scratch, { recursive: true })
+	const pidFile = path.join(scratch, `openshell-reused-grandchild-${process.pid}.pid`)
+	const childSource = `const fs=require('node:fs');const {spawn}=require('node:child_process');process.on('SIGTERM',()=>{});const child=spawn(process.execPath,['-e',${JSON.stringify("process.on('SIGTERM',()=>{});if(process.send)process.send('ready');setInterval(()=>{},1000)")}],{stdio:['ignore','ignore','ignore','ipc']});child.once('message',(message)=>{if(message==='ready')fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid))});setInterval(()=>{},1000)`
+	const controller = new AbortController()
+	const pending = runOpenShellCommandAsync(["-e", childSource], 10_000, process.execPath, controller.signal, 100)
+	const originalReadFile = fs.promises.readFile.bind(fs.promises)
+	const promisesRef = fs.promises as typeof fs.promises & { readFile: typeof fs.promises.readFile }
+	const originalKill = process.kill.bind(process)
+	const deadline = Date.now() + 3_000
+	let grandchildPid = 0
+	let expected: TestProcessIdentity | undefined
+	let launcher: TestProcessIdentity | undefined
+	let patched = false
+	try {
+		while (Date.now() < deadline) {
+			try { grandchildPid = Number(fs.readFileSync(pidFile, "utf8")); if (Number.isSafeInteger(grandchildPid) && grandchildPid > 0) break }
+			catch { /* wait for fixture PID */ }
+			await new Promise((resolve) => setTimeout(resolve, 10))
+		}
+		assert.ok(grandchildPid > 0, "fixture publishes the descendant PID")
+		expected = readTestProcessIdentity(grandchildPid) ?? undefined
+		assert.ok(expected, "capture descendant identity before simulating a leader PID reuse")
+		launcher = readTestProcessIdentity(expected.processGroupId) ?? undefined
+		assert.ok(launcher && launcher.pid === launcher.processGroupId && launcher.sessionId === launcher.processGroupId, "capture detached launcher identity")
+		await new Promise((resolve) => setTimeout(resolve, 50))
+		promisesRef.readFile = (async (target: Parameters<typeof fs.promises.readFile>[0], ...args: unknown[]) => {
+			const result = await (originalReadFile as (...values: unknown[]) => Promise<Buffer | string>)(target, ...args)
+			if (String(target) !== `/proc/${launcher!.pid}/stat` || typeof result !== "string") return result
+			const close = result.lastIndexOf(")")
+			const fields = result.slice(close + 2).split(/\s+/)
+			fields[19] = (BigInt(fields[19]!) + 1n).toString()
+			return `${result.slice(0, close + 2)}${fields.join(" ")}`
+		}) as typeof fs.promises.readFile
+		patched = true
+		controller.abort(new Error("controlled stop"))
+		await assert.rejects(pending, /could not inspect every process while verifying OpenShell teardown|PID was reused/)
+		assert.equal(processIsAlive(grandchildPid), true, "reused leader identity causes fail-closed rejection instead of signaling the unverified group")
+		assert.deepEqual(readTestProcessIdentity(grandchildPid), expected, "the live descendant remains the exact captured identity")
+	} finally {
+		promisesRef.readFile = originalReadFile
+		if (patched) await pending.catch(() => undefined)
+		const currentLauncher = launcher ? readTestProcessIdentity(launcher.pid) : null
+		if (expected) signalCapturedTestProcessForCleanup(expected, originalKill)
+		if (launcher && currentLauncher) signalCapturedTestProcessForCleanup(launcher, originalKill)
+		if (expected) await waitForCapturedTestProcessTerminal(expected)
+		if (launcher && currentLauncher) await waitForCapturedTestProcessTerminal(launcher)
+		fs.rmSync(pidFile, { force: true })
+	}
+}
+
+async function testAbortDoesNotSignalAfterBoundedTeardownFinalization(): Promise<void> {
+	if (process.platform !== "linux") return
+	const scratch = path.join(process.cwd(), ".headlesscode", "scratch")
+	fs.mkdirSync(scratch, { recursive: true })
+	const pidFile = path.join(scratch, `openshell-deadline-grandchild-${process.pid}.pid`)
+	fs.rmSync(pidFile, { force: true })
+	const childSource = `const fs=require('node:fs');const {spawn}=require('node:child_process');process.on('SIGTERM',()=>{});const child=spawn(process.execPath,['-e',${JSON.stringify("process.on('SIGTERM',()=>{});if(process.send)process.send('ready');setInterval(()=>{},1000)")}],{stdio:['ignore','ignore','ignore','ipc']});child.once('message',(message)=>{if(message==='ready')fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid))});setInterval(()=>{},1000)`
+	const controller = new AbortController()
+	const pending = runOpenShellCommandAsync(["-e", childSource], 10_000, process.execPath, controller.signal, 100)
+	const originalKill = process.kill.bind(process)
+	const processRef = process as NodeJS.Process & { kill: typeof process.kill }
+	const originalReadFile = fs.promises.readFile.bind(fs.promises)
+	const promisesRef = fs.promises as typeof fs.promises & { readFile: typeof fs.promises.readFile }
+	const deadline = Date.now() + 3_000
+	let grandchildPid = 0
+	let launcher: TestProcessIdentity | undefined
+	let originalGrandchild: TestProcessIdentity | undefined
+	let settled = false
+	let lateSignalCalls = 0
+	let delayedReadStarted = false
+	let releaseDelayedRead!: () => void
+	const delayedReadFinished = new Promise<void>((resolve) => { releaseDelayedRead = resolve })
+	let patched = false
+	try {
+		while (Date.now() < deadline) {
+			try { grandchildPid = Number(fs.readFileSync(pidFile, "utf8")); if (Number.isSafeInteger(grandchildPid) && grandchildPid > 0) break }
+			catch { /* wait for fixture PID */ }
+			await new Promise((resolve) => setTimeout(resolve, 10))
+		}
+		assert.ok(grandchildPid > 0, "fixture publishes the descendant PID")
+		originalGrandchild = readTestProcessIdentity(grandchildPid) ?? undefined
+		assert.ok(originalGrandchild, "capture the exact descendant before delaying procfs")
+		launcher = readTestProcessIdentity(originalGrandchild.processGroupId) ?? undefined
+		assert.ok(launcher && launcher.pid === launcher.processGroupId && launcher.sessionId === launcher.processGroupId, "capture the owned process-group leader")
+		processRef.kill = ((pid: number, name?: NodeJS.Signals | 0) => {
+			if (settled && name !== 0) lateSignalCalls += 1
+			return originalKill(pid, name as NodeJS.Signals | 0)
+		}) as typeof process.kill
+		promisesRef.readFile = (async (target: Parameters<typeof fs.promises.readFile>[0], ...args: unknown[]) => {
+			const result = await (originalReadFile as (...values: unknown[]) => Promise<Buffer | string>)(target, ...args)
+			if (String(target) === `/proc/${grandchildPid}/stat` && !delayedReadStarted) {
+				delayedReadStarted = true
+				await new Promise<void>((resolve) => setTimeout(resolve, 5_700))
+				releaseDelayedRead()
+			}
+			return result
+		}) as typeof fs.promises.readFile
+		patched = true
+		controller.abort(new Error("controlled stop"))
+		await assert.rejects(pending, /OpenShell process teardown did not finalize before its bounded deadline/)
+		settled = true
+		assert.equal(delayedReadStarted, true, "the teardown scan is still waiting on the injected procfs read when its public deadline expires")
+		await delayedReadFinished
+		await new Promise((resolve) => setTimeout(resolve, 30))
+		assert.equal(lateSignalCalls, 0, "no process signal runs after bounded finalization, even when a procfs read completes late")
+	} finally {
+		processRef.kill = originalKill
+		promisesRef.readFile = originalReadFile
+		if (!settled) { controller.abort(new Error("fixture cleanup")); await pending.catch(() => undefined) }
+		if (originalGrandchild) signalCapturedTestProcessForCleanup(originalGrandchild, originalKill)
+		if (launcher) signalCapturedTestProcessForCleanup(launcher, originalKill)
+		if (originalGrandchild) await waitForCapturedTestProcessTerminal(originalGrandchild)
+		if (launcher) await waitForCapturedTestProcessTerminal(launcher)
+		fs.rmSync(pidFile, { force: true })
 	}
 }
 
@@ -375,8 +783,22 @@ async function main(): Promise<void> {
 	console.log("  ok   OpenShell read-only mount targets are safe and non-overlapping")
 	await testAsyncOpenShellCommandReportsSafeExitAndTimeoutDetails()
 	console.log("  ok   OpenShell async command errors report safe exit and timeout details")
-	await testAbortEscalatesItsLauncherGroupAndRemovesGrandchild()
-	console.log("  ok   OpenShell abort terminates its launcher group through bounded escalation")
+	await testImmediateAbortWaitsForLauncherIdentityAndCleansUp()
+	console.log("  ok   OpenShell immediate abort waits for identity capture and cleans up")
+	await testHostAbortEscalatesItsLauncherGroupAndRemovesGrandchild()
+	console.log("  ok   OpenShell host-native abort retains the ESRCH grandchild assertion")
+	await testContainedAbortFallsBackForDeniedGroupSignals()
+	console.log("  ok   OpenShell contained abort uses verified member signals when group signals return EPERM")
+	await testTimeoutEscalatesAfterLauncherExitsAndVerifiesGrandchild()
+	console.log("  ok   OpenShell timeout verifies descendants after the launcher exits")
+	await testAbortFailsClosedWhenVerifiedMemberCannotBeSignaled()
+	console.log("  ok   OpenShell abort rejects when a verified group member cannot be signaled")
+	await testAbortFailsClosedWhenProcfsIsUnreadable()
+	console.log("  ok   OpenShell abort rejects when procfs cannot verify every group member")
+	await testAbortFailsClosedWhenProcfsShowsReusedLeaderPid()
+	console.log("  ok   OpenShell abort rejects when procfs shows a reused launcher PID")
+	await testAbortDoesNotSignalAfterBoundedTeardownFinalization()
+	console.log("  ok   OpenShell abort does not signal after bounded teardown finalization")
 	await testCreateStopRaceWaitsForCreationAndDeletesLateSandbox()
 	console.log("  ok   OpenShell create/stop race waits for and deletes late sandboxes")
 	await testFailedSandboxDeletionRetainsResourceAndRetryCanVerifyAbsence()

@@ -2,11 +2,12 @@ import assert from "node:assert/strict"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
+import { execFileSync } from "node:child_process"
 import test from "node:test"
 import { createHash, generateKeyPairSync } from "node:crypto"
 import { appendRun } from "../archive.js"
 import type { RsiConfig, RsiRunRecord, WorkerHarnessRuntimeIdentity } from "../types.js"
-import { assertEngineeringTransition, assertProofWorkerProfile, configureProofVisibleEvaluations, isFullyConfirmedRun, parseProofDemonstrationArgs, proofConfigFromOptions, PROOF_VISIBLE_EVAL_COMMANDS, runEngineeringArm, runFrozenCampaignArm, validateRuntimeEvaluatorIntegrity } from "../../../scripts/rsi-proof-demonstration.js"
+import { assertEngineeringTransition, assertProofWorkerProfile, configureProofVisibleEvaluations, isFullyConfirmedRun, parseProofDemonstrationArgs, proofConfigFromOptions, PROOF_VISIBLE_EVAL_COMMANDS, runEngineeringArm, runEngineeringArms, runFrozenCampaignArm, validateRuntimeEvaluatorIntegrity, writeEngineeringStopReport, writePriorIncompleteEngineeringStopReport } from "../../../scripts/rsi-proof-demonstration.js"
 import { frozenProofConfigDigest, type FrozenProofDemonstrationManifest } from "../proof-demonstration-manifest.js"
 import { proofCampaignManifestDigest, type ProofCampaignManifest } from "../proof-campaign.js"
 import { RSI_MUSE_OPENROUTER_MODEL, RSI_OPENROUTER_MODEL } from "../inference-broker.js"
@@ -150,6 +151,98 @@ test("engineering launcher refuses a matched alternate profile environment befor
 		HEADLESSCODE_RSI_ROLE_WORKER_OPENROUTER_PROFILE: "deepseek-deepinfra-fp8",
 	}), /must match frozen OpenRouter profile/)
 	assert.equal(dispatched, false)
+})
+
+test("incomplete engineering stops before the paired arm and writes a separate report with unresolved accounting", async () => {
+	const scratch = path.join(process.cwd(), ".headlesscode", "scratch")
+	await fs.mkdir(scratch, { recursive: true })
+	const work = await fs.mkdtemp(path.join(scratch, "engineering-incomplete-stop-"))
+	const output = path.join(process.cwd(), ".headlesscode", "rsi-proof", `engineering-${path.basename(work)}.json`)
+	const stopPath = `${output}.stop.json`
+	const reportPath = path.join(work, "run.md")
+	const campaign = `rsi-proof-${"a".repeat(20)}`
+	const rootCommit = "e".repeat(40)
+	const runtime: WorkerHarnessRuntimeIdentity = { imageName: "image", imageDigest: `sha256:${"b".repeat(64)}`, harnessCommit: "c".repeat(40), dependencyLockDigest: "d".repeat(64) }
+	const config = { archiveDir: work, model: RSI_MUSE_OPENROUTER_MODEL, maxTokens: 2048, roles: { worker: { provider: "openrouter", model: RSI_MUSE_OPENROUTER_MODEL, openRouterProfile: "muse-spark-contributor" } } } as RsiConfig
+	const scheduleCell = { armId: "fixed-control", generation: 1, candidateId: "g1-candidate-0", taskId: "mutation", seed: "seed-0", attemptKind: "mutation" }
+	const failureEvent = { arm_id: "fixed-control", event_type: "candidate-incomplete", payload: { generation: 1, candidateId: "g1-candidate-0", parentId: "g0-candidate-0", parentCommit: "f".repeat(40), outcome: "incomplete", reason: "unreconciled attempt", cells: [{ ...scheduleCell, attemptKey: "attempt-1", status: "uncertain", reservedCalls: 1, reservedTokens: 256, reservedSpendMicrousd: 1000, actualCalls: null, actualTokens: null, actualSpendMicrousd: null }] } }
+	const run = {
+		runId: "engineering-stop-run", baseCommit: rootCommit, workerHarnessPairId: campaign, workerHarnessMode: "fixed-control", finishedAt: new Date(0).toISOString(), reports: [reportPath], candidates: [],
+		proofCampaign: { manifest: { phaseMode: "engineering-only", schedule: [scheduleCell] }, manifestSha256: "1".repeat(64), campaignId: campaign, armId: "fixed-control", epoch: 1, state: "incomplete", incompleteReason: "unresolved attempt", ledgerSnapshot: { campaign: { state: "running", reserved_calls: 1, used_calls: 0 }, attempts: [{ ...failureEvent.payload.cells[0], arm_id: "fixed-control" }], decisions: [], events: [failureEvent] } },
+	} as unknown as RsiRunRecord
+	try {
+		await fs.mkdir(path.dirname(output), { recursive: true })
+		await fs.writeFile(output, "previous-qualified-evidence\n", { flag: "wx" })
+		let armsStarted: string[] = []
+		const stopped = await runEngineeringArms(config, campaign, rootCommit, "seed-0", runtime, async (runtimeConfig) => {
+			armsStarted.push(runtimeConfig.workerHarnessMode ?? "missing")
+			return run
+		})
+		assert.equal(stopped.length, 1)
+		assert.deepEqual(armsStarted, ["fixed-control"], "an incomplete first arm must not dispatch its paired arm")
+		const pathWritten = await writeEngineeringStopReport({ command: "engineering", output, repo: process.cwd(), seeds: ["seed-0"], mutationTask: "", execute: true }, run)
+		assert.equal(pathWritten, stopPath)
+		const stop = JSON.parse(await fs.readFile(stopPath, "utf8")) as Record<string, unknown>
+		assert.equal(stop.outcome, "incomplete")
+		assert.equal(stop.qualifiedEvidencePath, output)
+		assert.equal((stop.ledgerSnapshot as { campaign: { reserved_calls: number } }).campaign.reserved_calls, 1, "unsettled reservation is retained")
+		assert.equal((((stop.candidateFailureEvents as Array<{ payload: { cells: Array<{ status: string; reservedTokens: number }> } }>)[0]!.payload.cells)[0]!.status), "uncertain")
+		assert.equal((await fs.readFile(output, "utf8")), "previous-qualified-evidence\n", "incomplete results never overwrite qualified engineering evidence")
+		assert.equal(Object.hasOwn(failureEvent.payload, "childCommit"), false, "failure event does not invent a child commit")
+	} finally {
+		await fs.rm(work, { recursive: true, force: true })
+		await fs.rm(output, { force: true })
+		await fs.rm(stopPath, { force: true })
+	}
+})
+
+test("prior incomplete engineering identity is validated before writing a stop report", async () => {
+	const scratch = path.join(process.cwd(), ".headlesscode", "scratch")
+	await fs.mkdir(scratch, { recursive: true, mode: 0o700 })
+	const root = await fs.mkdtemp(path.join(scratch, "proof-prior-incomplete-identity-"))
+	const repo = path.join(root, "repo")
+	await fs.mkdir(repo, { recursive: true })
+	execFileSync("git", ["init", "--quiet"], { cwd: repo })
+	await fs.writeFile(path.join(repo, ".gitignore"), ".headlesscode/\n")
+	const campaign = `rsi-proof-${"b".repeat(20)}`
+	const rootCommit = "e".repeat(40)
+	const runtime: WorkerHarnessRuntimeIdentity = { imageName: "image", imageDigest: `sha256:${"b".repeat(64)}`, harnessCommit: "c".repeat(40), dependencyLockDigest: "d".repeat(64) }
+	const config = { archiveDir: root, model: RSI_MUSE_OPENROUTER_MODEL, maxTokens: 2048, roles: { worker: { provider: "openrouter", model: RSI_MUSE_OPENROUTER_MODEL, openRouterProfile: "muse-spark-contributor" } } } as RsiConfig
+	const scheduleCell = { armId: "fixed-control", generation: 0, candidateId: "g0-candidate-0", taskId: "mutation", seed: "seed-0", attemptKind: "mutation" }
+	const event = { arm_id: "fixed-control", event_type: "candidate-incomplete", payload: { outcome: "incomplete", cells: [{ ...scheduleCell, status: "uncertain", reservedTokens: 10, actualTokens: null }] } }
+	const run = {
+		runId: `${campaign}-fixed`, model: RSI_MUSE_OPENROUTER_MODEL, openRouterProfileId: "muse-spark-contributor", baseCommit: rootCommit,
+		workerHarnessPairId: campaign, workerHarnessMode: "fixed-control", workerHarnessSamplingSeed: "seed-0", workerHarnessRuntime: runtime, candidates: [], reports: [],
+		proofCampaign: {
+			manifest: { phaseMode: "engineering-only", schedule: [scheduleCell], model: { provider: "openshell-openrouter", id: RSI_MUSE_OPENROUTER_MODEL, profileId: "muse-spark-contributor", settings: { roles: { worker: { provider: "openrouter", model: RSI_MUSE_OPENROUTER_MODEL, openRouterProfile: "muse-spark-contributor" } } } }, settings: { effectiveConfig: { maxTokens: 2048 } } },
+			manifestSha256: "1".repeat(64), campaignId: campaign, armId: "fixed-control", epoch: 1, state: "incomplete",
+			ledgerSnapshot: { events: [event], campaign: { reserved_calls: 1, used_calls: 0 }, attempts: [], decisions: [] },
+		},
+	} as unknown as RsiRunRecord
+	try {
+		await appendRun(root, run)
+		const options = { command: "engineering" as const, output: path.join(repo, ".headlesscode", "rsi-proof", "qualified.json"), repo, seeds: ["seed-0"], mutationTask: "", execute: true }
+		const changedIdentities: Array<{ config: RsiConfig; rootCommit: string; runtime: WorkerHarnessRuntimeIdentity }> = [
+			{ config, rootCommit: "f".repeat(40), runtime },
+			{ config, rootCommit, runtime: { ...runtime, harnessCommit: "d".repeat(40) } },
+			{ config: { ...config, maxTokens: 1024 }, rootCommit, runtime },
+			{ config: { ...config, model: RSI_OPENROUTER_MODEL, roles: { worker: { provider: "openrouter", model: RSI_OPENROUTER_MODEL } } }, rootCommit, runtime },
+			{ config: { ...config, roles: { worker: { provider: "openrouter", model: RSI_MUSE_OPENROUTER_MODEL, openRouterProfile: "deepseek-deepinfra-fp8" } } }, rootCommit, runtime },
+		]
+		for (const changed of changedIdentities) {
+			let runnerCalls = 0
+			await assert.rejects(() => writePriorIncompleteEngineeringStopReport(options, changed.config, campaign, changed.rootCommit, "seed-0", changed.runtime))
+			await assert.rejects(() => runEngineeringArm(changed.config, campaign, "fixed-control", changed.rootCommit, "seed-0", changed.runtime, async () => {
+				runnerCalls += 1
+				throw new Error("changed replay identity must fail before dispatch")
+			}, {}))
+			assert.equal(runnerCalls, 0, "changed replay identity never dispatches another runner")
+			assert.equal(await fs.access(`${options.output}.stop.json`).then(() => true, () => false), false, "changed identity is rejected before stop-report output")
+		}
+		assert.equal((await writePriorIncompleteEngineeringStopReport(options, config, campaign, rootCommit, "seed-0", runtime))?.stopPath, `${options.output}.stop.json`)
+	} finally {
+		await fs.rm(root, { recursive: true, force: true })
+	}
 })
 
 test("engineering verifier requires a terminal fixed-control generation-one decision", () => {

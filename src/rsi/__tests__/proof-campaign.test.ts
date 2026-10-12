@@ -19,6 +19,61 @@ import type { CandidateRecord, RsiConfig, RsiRunRecord } from "../types.js"
 const databaseUrl = process.env.HEADLESSCODE_RSI_TEST_DATABASE_URL
 const attemptKind = "development-proof" as const
 
+test("incomplete candidate event records the exact frozen cells without evaluating or settling the candidate", async () => {
+	const candidateCells: ProofCampaignManifest["schedule"] = [
+		{ armId: "fixed", generation: 1, candidateId: "candidate-a", taskId: "mutation", seed: "seed-0", attemptKind: "mutation" },
+		{ armId: "fixed", generation: 1, candidateId: "candidate-a:child", taskId: "task-a", seed: "seed-0", attemptKind: "development-proof" },
+	]
+	const frozen = manifest("incomplete-event-test", [
+		{ armId: "fixed", generation: 0, candidateId: "parent-a", taskId: "mutation", seed: "seed-0", attemptKind: "mutation" },
+		...candidateCells,
+	])
+	const lease = { campaignId: frozen.campaignId, armId: "fixed", runId: "run-fixed", epoch: 3, coordinatorId: "controller", token: "token", manifestSha256: "d".repeat(64), deadlineAt: new Date(Date.now() + 60_000).toISOString(), phase: "development" } as const
+	const leaseTokenHash = createHash("sha256").update(lease.token).digest("hex")
+	const durableEvents: Array<{ payload: unknown }> = []
+	const queries: Array<{ sql: string; parameters?: unknown[] }> = []
+	let sequence = 0
+	const client = {
+		query: async (sql: string, parameters?: unknown[]) => {
+			queries.push({ sql, parameters })
+			if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [], rowCount: 0 }
+			if (sql.includes("SELECT campaign.*,arm.epoch")) return { rows: [{ state: "running", arm_epoch: 3, arm_phase: "development", run_id: "run-fixed", lease_token_sha256: leaseTokenHash, manifest_sha256: lease.manifestSha256, arm_lease_valid: true, deadline_valid: true }], rowCount: 1 }
+			if (sql.startsWith("SELECT manifest FROM headlesscode_rsi_proof_campaigns")) return { rows: [{ manifest: frozen }], rowCount: 1 }
+			if (sql.includes("SELECT 1 FROM headlesscode_rsi_proof_campaign_decisions AS parent")) return { rows: [{ one: 1 }], rowCount: 1 }
+			if (sql.includes("FROM headlesscode_rsi_proof_campaign_attempts WHERE campaign_id=$1 AND arm_id=$2 AND generation=$3")) {
+				const taskId = parameters?.[4]
+				const row = taskId === "mutation"
+					? { attempt_key: "mutation-uncertain", status: "uncertain", reserved_calls: 1, reserved_tokens: 700, reserved_spend_microusd: 550_000, actual_calls: null, actual_tokens: null, actual_spend_microusd: null, error: "dispatch result not reconciled" }
+					: { attempt_key: "child-skipped", status: "skipped-after-hard-gate", reserved_calls: 0, reserved_tokens: 0, reserved_spend_microusd: 0, actual_calls: 0, actual_tokens: 0, actual_spend_microusd: 0, error: null }
+				return { rows: [row], rowCount: 1 }
+			}
+			if (sql.includes("SELECT payload FROM headlesscode_rsi_proof_campaign_events WHERE campaign_id=$1 AND arm_id=$2 AND event_type='candidate-incomplete'")) return { rows: durableEvents, rowCount: durableEvents.length }
+			if (sql.startsWith("UPDATE headlesscode_rsi_proof_campaigns SET sequence=sequence+1")) return { rows: [{ sequence: ++sequence }], rowCount: 1 }
+			if (sql.startsWith("INSERT INTO headlesscode_rsi_proof_campaign_events")) {
+				durableEvents.push({ payload: JSON.parse(String(parameters?.[5])) })
+				return { rows: [], rowCount: 1 }
+			}
+			throw new Error(`unexpected SQL in synthetic campaign pool: ${sql}`)
+		},
+		release: () => undefined,
+	}
+	const pool = { connect: async () => client } as unknown as Pool
+	const campaign = new PostgresProofCampaign(pool)
+	const failure = { generation: 1, candidateId: "candidate-a", parentId: "parent-a", parentCommit: "b".repeat(40), reason: "candidate mutation ended with unreconciled accounting" }
+	await campaign.recordIncompleteCandidate(lease, failure)
+	await campaign.recordIncompleteCandidate(lease, failure)
+	assert.equal(durableEvents.length, 1, "same incomplete checkpoint is idempotent")
+	const payload = durableEvents[0]!.payload as { outcome: string; childCommit?: string; parentId: string; parentCommit: string; cells: Array<Record<string, unknown>> }
+	assert.equal(payload.outcome, "incomplete")
+	assert.equal(payload.parentId, "parent-a")
+	assert.equal(payload.parentCommit, "b".repeat(40))
+	assert.equal(Object.hasOwn(payload, "childCommit"), false, "failure bookkeeping never invents a child commit")
+	assert.deepEqual(payload.cells.map((cell) => [cell.taskId, cell.status]), [["mutation", "uncertain"], ["task-a", "skipped-after-hard-gate"]])
+	assert.equal(payload.cells[0]?.reservedTokens, 700)
+	assert.equal(payload.cells[0]?.actualTokens, null, "unknown actual use stays unknown")
+	assert.equal(queries.some(({ sql }) => /SET state='evaluated'/.test(sql) || sql.includes("INSERT INTO headlesscode_rsi_proof_campaign_decisions")), false, "incomplete event never transitions the arm or creates an evaluated decision")
+})
+
 function manifest(campaignId: string, schedule: ProofCampaignManifest["schedule"]): ProofCampaignManifest {
 	return {
 		schemaVersion: 1, campaignId, rootCommit: "a".repeat(40), benchmarkDigests: { manifest: "d".repeat(64), development: "b".repeat(64), confirmation: "c".repeat(64) },
@@ -1046,14 +1101,23 @@ test("FileArtifactStore PostgreSQL proof-bound mutation imports only matching du
 		]
 		const frozen = manifest(`campaign-${randomUUID()}`, schedule)
 		frozen.settings = { inferenceCampaignIds: { mutation: `${frozen.campaignId}:mutation` } }
+		const callMicrousd = [2116, 90, 371, 932, 137, 865, 117, 192, 229, 210, 623, 133, 146, 186, 1497, 2939, 390, 122]
+		const totalMicrousd = callMicrousd.reduce((sum, amount) => sum + amount, 0)
+		assert.equal(totalMicrousd, 11_295)
+		const promptTokens = callMicrousd.map(() => 30_000)
+		const completionTokens = callMicrousd.map((_, index) => index === 0 ? 630 : 632)
+		const totalTokens = promptTokens.reduce((sum, amount, index) => sum + amount + completionTokens[index]!, 0)
+		assert.equal(totalTokens, 551_374)
+		frozen.budgets.attempt = { ...frozen.budgets.attempt, maxCalls: callMicrousd.length, maxTokens: totalTokens, maxSpendUsd: 0.36 }
+		frozen.budgets.root = { ...frozen.budgets.root, maxCalls: callMicrousd.length, maxTokens: totalTokens, maxSpendUsd: 1 }
 		const lease = await campaign.acquire(frozen, "fixed", "run-fixed", "coordinator-1")
 		const cell = schedule[0]!
 		const attemptKey = "mutation-cell"
 		const actualCandidateId = "actual-candidate-id"
 		const limits: OpenRouterBrokerLimits = {
-			campaignId: `${frozen.campaignId}:mutation`, maxCalls: 1, maxInputTokensPerCall: 100, maxOutputTokensPerCall: 100,
-			maxTotalTokens: 100, maxDurationMs: 60_000, maxRequestBytes: 16_384, maxResponseBytes: 16_384,
-			maxInputPricePerMillionUsd: 1, maxOutputPricePerMillionUsd: 1, maxCallSpendUsd: 0.1, maxJobSpendUsd: 0.1, maxCampaignSpendUsd: 1,
+			campaignId: `${frozen.campaignId}:mutation`, maxCalls: callMicrousd.length, maxInputTokensPerCall: 150_000, maxOutputTokensPerCall: 7_000,
+			maxTotalTokens: totalTokens, maxDurationMs: 60_000, maxRequestBytes: 16_384, maxResponseBytes: 16_384,
+			maxInputPricePerMillionUsd: 0.1, maxOutputPricePerMillionUsd: 0.2, maxCallSpendUsd: 0.02, maxJobSpendUsd: 0.36, maxCampaignSpendUsd: 0.36,
 		}
 		await campaign.admit(lease, {
 			attemptKey, kind: "mutation",
@@ -1075,20 +1139,60 @@ test("FileArtifactStore PostgreSQL proof-bound mutation imports only matching du
 		assert.equal(jobLease.job.jobId, job.jobId)
 		const grant: OpenRouterBrokerGrant = { jobId: job.jobId, leaseToken: jobLease.token, capability: randomUUID(), model: RSI_OPENROUTER_MODEL, limits }
 		await queue.register(grant)
-		await queue.reserve(grant, { callId: "mock-call-000001", requestSha256: "2".repeat(64), reservedUsd: 0.01, reservedTokens: 100, startedAt: new Date().toISOString() })
-		await queue.settle(grant, { callId: "mock-call-000001", state: "complete", qualified: true, returnedModel: RSI_OPENROUTER_MODEL, returnedProvider: "deepinfra", promptTokens: 10, completionTokens: 20, costUsd: 0.001, responseSha256: "3".repeat(64), completedAt: new Date().toISOString() })
+		for (const [index, microusd] of callMicrousd.entries()) {
+			const callId = `mock-call-${String(index + 1).padStart(6, "0")}`
+			const tokens = promptTokens[index]! + completionTokens[index]!
+			await queue.reserve(grant, { callId, requestSha256: String(index + 2).repeat(64).slice(0, 64), reservedUsd: 0.02, reservedTokens: tokens, startedAt: new Date().toISOString() })
+			await queue.settle(grant, { callId, state: "complete", qualified: true, returnedModel: RSI_OPENROUTER_MODEL, returnedProvider: "deepinfra", promptTokens: promptTokens[index]!, completionTokens: completionTokens[index]!, costUsd: microusd / 1_000_000, responseSha256: String(index + 3).repeat(64).slice(0, 64), completedAt: new Date().toISOString() })
+		}
 		const receipt = await queue.receipt(grant)
 		assert.equal(receipt.qualified, true)
+		assert.equal(receipt.accounting, "supervisor-enforced")
+		assert.equal(receipt.provider, "openrouter")
+		assert.equal(receipt.jobId, job.jobId)
+		assert.equal(receipt.campaignId, limits.campaignId)
+		assert.equal(receipt.model, RSI_OPENROUTER_MODEL)
+		assert.equal(receipt.endpointProvider, "deepinfra")
+		assert.equal(receipt.calls, callMicrousd.length)
+		assert.equal(receipt.promptTokens, 540_000)
+		assert.equal(receipt.completionTokens, 11_374)
+		assert.equal(receipt.totalTokens, totalTokens)
+		assert.equal(receipt.costUsd, totalMicrousd / 1_000_000)
+		assert.equal(receipt.callReceipts.length, callMicrousd.length)
 		assert.deepEqual(receipt.returnedProviders, ["deepinfra"])
 		const patch = await queue.putArtifact(Buffer.from("verified candidate patch bytes"))
 		const result = { patchSha256: patch.sha256, patchBytes: patch.byteLength, inferenceReceipt: receipt }
+		const incompleteReceipts: Array<[string, Record<string, unknown>]> = [
+			["missing receipt", {}],
+			["wrong provider", { ...receipt, provider: "other" }],
+			["wrong job", { ...receipt, jobId: "other-job" }],
+			["wrong campaign", { ...receipt, campaignId: "other-campaign" }],
+			["wrong model", { ...receipt, model: "other/model" }],
+			["unqualified receipt", { ...receipt, qualified: false }],
+			["wrong call count", { ...receipt, calls: receipt.calls - 1 }],
+			["wrong token count", { ...receipt, totalTokens: receipt.totalTokens! - 1 }],
+		]
+		for (const [label, invalidReceipt] of incompleteReceipts) {
+			await assert.rejects(
+				() => queue.complete(jobLease, { ...result, inferenceReceipt: invalidReceipt }),
+				/proof campaign result receipt does not match durable broker call accounting/,
+				`${label} must remain rejected`,
+			)
+		}
+		for (const delta of [-1, 1]) {
+			await assert.rejects(
+				() => queue.complete(jobLease, { ...result, inferenceReceipt: { ...receipt, costUsd: (totalMicrousd + delta) / 1_000_000 } }),
+				/proof campaign result receipt does not match durable broker call accounting/,
+				`a receipt differing by ${delta} microUSD must be rejected`,
+			)
+		}
 		assert.equal((await queue.complete(jobLease, result)).accepted, true)
 		const view = await campaign.snapshot(frozen.campaignId)
 		const imported = (view.attempts as Array<Record<string, unknown>>).find((attempt) => attempt.attempt_key === attemptKey)!
 		assert.equal(imported.status, "completed")
-		assert.equal(Number(imported.actual_calls), 1)
-		assert.equal(Number(imported.actual_tokens), 30)
-		assert.equal(Number(imported.actual_spend_microusd), 1_000)
+		assert.equal(Number(imported.actual_calls), callMicrousd.length)
+		assert.equal(Number(imported.actual_tokens), totalTokens)
+		assert.equal(Number(imported.actual_spend_microusd), totalMicrousd)
 		assert.equal((imported.artifact_refs as Record<string, { sha256: string }>).patch?.sha256, patch.sha256)
 		const conflictingReplay = await queue.complete(jobLease, { ...result, inferenceReceipt: { ...receipt, totalTokens: 31 } })
 		assert.equal(conflictingReplay.accepted, false, "a duplicate import with a receipt that differs from durable call accounting is not accepted")

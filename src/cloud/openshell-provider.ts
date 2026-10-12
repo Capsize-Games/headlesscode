@@ -24,6 +24,100 @@ export const OPENSHELL_HARNESS_ROOT = "/opt/headlesscode"
 
 export const OPENSHELL_WORKSPACE_TARGET = "/workspace"
 
+interface LinuxProcessIdentity {
+	pid: number
+	processGroupId: number
+	sessionId: number
+	startTime: string
+	effectiveUid: number
+}
+
+interface LinuxProcessRecord extends LinuxProcessIdentity { state: string }
+
+const MAX_PROC_ENTRIES = 65_536
+
+function parseLinuxProcessStat(pid: number, stat: string): Omit<LinuxProcessRecord, "effectiveUid"> {
+	const close = stat.lastIndexOf(")")
+	if (close < 0) throw new Error("could not verify an OpenShell launcher process identity")
+	const fields = stat.slice(close + 2).split(/\s+/)
+	const processGroupId = Number(fields[2])
+	const sessionId = Number(fields[3])
+	const startTime = fields[19]
+	const state = fields[0]
+	if (!Number.isSafeInteger(processGroupId) || processGroupId < 0 || !Number.isSafeInteger(sessionId) || sessionId < 0 || !startTime || !/^\d+$/.test(startTime) || !state || state.length !== 1) {
+		throw new Error("could not verify an OpenShell launcher process identity")
+	}
+	return { pid, processGroupId, sessionId, startTime, state }
+}
+
+async function readLinuxProcessRecord(pid: number): Promise<LinuxProcessRecord> {
+	try {
+		const [stat, effectiveUid] = await Promise.all([fs.promises.readFile(`/proc/${pid}/stat`, "utf8"), readLinuxEffectiveUid(pid)])
+		const identity = parseLinuxProcessStat(pid, stat)
+		return { ...identity, effectiveUid }
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ESRCH") {
+			const missing = new Error("OpenShell process exited before its identity could be verified", { cause: error }) as NodeJS.ErrnoException
+			missing.code = "ESRCH"
+			throw missing
+		}
+		throw new Error("could not read an OpenShell process identity from procfs", { cause: error })
+	}
+}
+
+async function readLinuxEffectiveUid(pid: number): Promise<number> {
+	const status = await fs.promises.readFile(`/proc/${pid}/status`, "utf8")
+	const uidLine = status.split("\n").find((line) => line.startsWith("Uid:"))
+	const effectiveUid = Number(uidLine?.trim().split(/\s+/)[2])
+	if (!Number.isSafeInteger(effectiveUid) || effectiveUid < 0) throw new Error("could not verify an OpenShell launcher effective UID")
+	return effectiveUid
+}
+
+function matchesLinuxProcessIdentity(record: LinuxProcessIdentity, expected: LinuxProcessIdentity): boolean {
+	return record.pid === expected.pid && record.processGroupId === expected.processGroupId && record.sessionId === expected.sessionId && record.startTime === expected.startTime && record.effectiveUid === expected.effectiveUid
+}
+
+function assertLinuxLauncherIdentity(record: LinuxProcessIdentity, expected: LinuxProcessIdentity): void {
+	if (record.pid === expected.pid && !matchesLinuxProcessIdentity(record, expected)) throw new Error("OpenShell launcher PID was reused; teardown stopped")
+}
+
+async function listLinuxOpenShellGroup(identity: LinuxProcessIdentity, deadline = Number.POSITIVE_INFINITY): Promise<LinuxProcessRecord[]> {
+	let entries: string[]
+	try { entries = await fs.promises.readdir("/proc") }
+	catch (error) { throw new Error("could not inspect procfs to verify OpenShell process teardown", { cause: error }) }
+	if (Date.now() >= deadline) throw new Error("OpenShell process teardown exceeded its bounded deadline")
+	if (entries.length > MAX_PROC_ENTRIES) throw new Error("procfs process count exceeded the OpenShell teardown inspection bound")
+	const records: LinuxProcessRecord[] = []
+	for (const entry of entries) {
+		if (Date.now() >= deadline) throw new Error("OpenShell process teardown exceeded its bounded deadline")
+		if (!/^\d+$/.test(entry)) continue
+		const pid = Number(entry)
+		if (!Number.isSafeInteger(pid) || pid < 1) continue
+		let identityRecord: Omit<LinuxProcessRecord, "effectiveUid">
+		try { identityRecord = parseLinuxProcessStat(pid, await fs.promises.readFile(`/proc/${pid}/stat`, "utf8")) }
+		catch (error) {
+			const code = (error as NodeJS.ErrnoException).code
+			if (code === "ENOENT" || code === "ESRCH") continue
+			throw new Error("could not inspect every process while verifying OpenShell teardown", { cause: error })
+		}
+		if (identityRecord.pid === identity.pid || (identityRecord.processGroupId === identity.processGroupId && identityRecord.sessionId === identity.sessionId)) {
+			let record: LinuxProcessRecord
+			try { record = { ...identityRecord, effectiveUid: await readLinuxEffectiveUid(pid) } }
+			catch (error) {
+				const code = (error as NodeJS.ErrnoException).code
+				if (code === "ENOENT" || code === "ESRCH") continue
+				throw new Error("could not inspect every process while verifying OpenShell teardown", { cause: error })
+			}
+			if (record.pid === identity.pid) assertLinuxLauncherIdentity(record, identity)
+			if (record.processGroupId !== identity.processGroupId || record.sessionId !== identity.sessionId) continue
+			if (record.effectiveUid !== identity.effectiveUid) throw new Error("OpenShell process-group member changed effective UID; teardown stopped")
+			if (record.state !== "Z" && record.state !== "X") records.push(record)
+		}
+	}
+	if (Date.now() >= deadline) throw new Error("OpenShell process teardown exceeded its bounded deadline")
+	return records
+}
+
 interface OpenShellWorkspaceState {
 	hostWorkspace: string
 	sandboxWorkspace: string
@@ -101,68 +195,198 @@ export function runOpenShellCommandAsync(args: string[], timeoutMs?: number, exe
 		let stdout = ""
 		let stderr = ""
 		let timer: NodeJS.Timeout | undefined
-		let escalation: NodeJS.Timeout | undefined
+		let finalizationTimer: NodeJS.Timeout | undefined
 		let aborted = false
 		let timedOut = false
 		let finished = false
+		let processIdentity: LinuxProcessIdentity | undefined
+		let processIdentityFailure: unknown
+		let markProcessIdentityReady!: () => void
+		const processIdentityReady = new Promise<void>((resolveReady) => { markProcessIdentityReady = resolveReady })
+		let terminationPromise: Promise<void> | undefined
+		let terminationFailure: unknown
+		const boundedGraceMs = Math.min(5_000, Math.max(1, graceMs))
+		// Procfs enumeration is sequential and can involve thousands of entries on
+		// a busy host; leave it a bounded verification window after the TERM grace.
+		const terminationBoundMs = boundedGraceMs + 5_000
 		const append = (current: string, chunk: Buffer) => `${current}${chunk.toString("utf8")}`.slice(-64 * 1024 * 1024)
 		child.stdout.on("data", (chunk: Buffer) => { stdout = append(stdout, chunk) })
 		child.stderr.on("data", (chunk: Buffer) => { stderr = append(stderr, chunk) })
-		const send = (name: NodeJS.Signals) => {
-			if (!child.pid) return
-			try { process.kill(process.platform === "win32" ? child.pid : -child.pid, name) } catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error
-			}
-		}
-		const terminate = () => {
-			if (!child.pid) return
-			try { send("SIGTERM") } catch { child.kill("SIGTERM") }
-			escalation = setTimeout(() => {
-				try { send("SIGKILL") } catch { child.kill("SIGKILL") }
-			}, Math.max(1, graceMs))
-		}
-		const onAbort = () => { aborted = true; terminate() }
 		const cleanup = () => {
 			if (timer) clearTimeout(timer)
-			if (escalation) clearTimeout(escalation)
+			if (finalizationTimer) clearTimeout(finalizationTimer)
 			signal?.removeEventListener("abort", onAbort)
+			child.stdout.destroy()
+			child.stderr.destroy()
 		}
-		if (timeoutMs !== undefined) timer = setTimeout(() => { timedOut = true; terminate() }, timeoutMs)
-		signal?.addEventListener("abort", onAbort, { once: true })
-		child.once("error", (error) => {
+		const settleFailure = (error: unknown) => {
 			if (finished) return
 			finished = true
 			cleanup()
-			reject((error as NodeJS.ErrnoException).code === "ENOENT" ? new Error("OpenShell CLI executable was not found") : error)
+			reject(error)
+		}
+		const settleResult = (code: number | null, childSignal: NodeJS.Signals | null) => {
+			if (finished) return
+			finished = true
+			cleanup()
+			const details = [timedOut ? `timeout=true (after ${timeoutMs}ms)` : undefined, code !== 0 ? `exitCode=${code ?? 1}` : undefined, childSignal ? `signal=${childSignal}` : undefined].filter(Boolean).join(" ")
+			resolve({ exitCode: code ?? 1, output: [stdout, stderr, details].filter(Boolean).join("\n").trim() })
+		}
+		const signalIndividuallyAfterGroupEperm = async (name: NodeJS.Signals, deadline: number) => {
+			if (process.platform !== "linux" || !child.pid) throw new Error("OpenShell process-group signal was denied and verified Linux fallback is unavailable")
+			await processIdentityReady
+			if (processIdentityFailure) throw new Error("OpenShell launcher process-group identity could not be verified; teardown stopped", { cause: processIdentityFailure })
+			const identity = processIdentity
+			if (!identity || identity.pid !== child.pid || identity.processGroupId !== child.pid || identity.sessionId !== child.pid) throw new Error("OpenShell launcher process-group identity is unavailable; teardown stopped")
+			const members = await listLinuxOpenShellGroup(identity, deadline)
+			for (const member of members.sort((left, right) => Number(left.pid === identity.pid) - Number(right.pid === identity.pid))) {
+				if (Date.now() >= deadline) throw new Error("OpenShell process teardown exceeded its bounded deadline")
+				let current: LinuxProcessRecord
+				try { current = await readLinuxProcessRecord(member.pid) }
+				catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "ESRCH") continue
+					throw error
+				}
+				assertLinuxLauncherIdentity(current, identity)
+				if (!matchesLinuxProcessIdentity(current, member)) throw new Error("OpenShell process PID was reused before teardown; teardown stopped")
+				if (current.state === "Z" || current.state === "X") continue
+				if (Date.now() >= deadline) throw new Error("OpenShell process teardown exceeded its bounded deadline")
+				try { process.kill(current.pid, name) }
+				catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw new Error("could not signal a verified OpenShell process-group member", { cause: error })
+				}
+			}
+		}
+		const send = async (name: NodeJS.Signals, deadline: number) => {
+			if (!child.pid) return
+			if (process.platform === "linux") {
+				await processIdentityReady
+				if (processIdentityFailure) throw new Error("OpenShell launcher process-group identity could not be verified; teardown stopped", { cause: processIdentityFailure })
+				if (!processIdentity) throw new Error("OpenShell launcher process-group identity is unavailable; teardown stopped")
+				if (Date.now() >= deadline) throw new Error("OpenShell process teardown exceeded its bounded deadline")
+				// Verify that the captured group/session still has an owned live member
+				// immediately before the primary group signal, rejecting a reused PGID.
+				if ((await listLinuxOpenShellGroup(processIdentity, deadline)).length === 0) return
+			}
+			if (Date.now() >= deadline) throw new Error("OpenShell process teardown exceeded its bounded deadline")
+			try { process.kill(process.platform === "win32" ? child.pid : -child.pid, name) }
+			catch (error) {
+				const code = (error as NodeJS.ErrnoException).code
+				if (code === "ESRCH") return
+				if (code !== "EPERM" || process.platform !== "linux") throw error
+				await signalIndividuallyAfterGroupEperm(name, deadline)
+			}
+		}
+		const wait = async (ms: number, deadline: number) => {
+			const remaining = deadline - Date.now()
+			if (remaining > 0) await new Promise<void>((done) => setTimeout(done, Math.min(ms, remaining)))
+		}
+		const groupIsTerminal = async (deadline: number): Promise<boolean> => {
+			if (!child.pid) return true
+			if (process.platform === "win32") return child.exitCode !== null || child.signalCode !== null
+			if (process.platform === "linux") {
+				await processIdentityReady
+				if (processIdentityFailure) throw new Error("OpenShell launcher process-group identity could not be verified; teardown stopped", { cause: processIdentityFailure })
+				if (!processIdentity) throw new Error("OpenShell launcher process-group identity is unavailable; teardown stopped")
+				if (Date.now() >= deadline) throw new Error("OpenShell process teardown exceeded its bounded deadline")
+				return (await listLinuxOpenShellGroup(processIdentity, deadline)).length === 0
+			}
+			try { process.kill(-child.pid, 0); return false }
+			catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return true; throw error }
+		}
+		const signalOwnedLauncher = async (name: NodeJS.Signals, deadline: number) => {
+			if (!child.pid) return
+			if (process.platform === "linux") {
+				await processIdentityReady
+				if (processIdentityFailure) throw new Error("OpenShell launcher process-group identity could not be verified; teardown stopped", { cause: processIdentityFailure })
+				const identity = processIdentity
+				if (!identity || identity.pid !== child.pid) throw new Error("OpenShell launcher identity is unavailable; teardown stopped")
+				const current = await readLinuxProcessRecord(identity.pid)
+				assertLinuxLauncherIdentity(current, identity)
+				if (!matchesLinuxProcessIdentity(current, identity)) throw new Error("OpenShell launcher PID was reused before teardown; teardown stopped")
+				if (current.state === "Z" || current.state === "X") return
+				if (Date.now() >= deadline) throw new Error("OpenShell process teardown exceeded its bounded deadline")
+				try { process.kill(current.pid, name) }
+				catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error }
+				return
+			}
+			if (Date.now() >= deadline) throw new Error("OpenShell process teardown exceeded its bounded deadline")
+			try { child.kill(name) } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error }
+		}
+		const terminateOwnedProcesses = async (deadline: number): Promise<void> => {
+			let firstFailure: unknown
+			const attempt = async (name: NodeJS.Signals) => {
+				try { await send(name, deadline) }
+				catch (error) {
+					if (firstFailure === undefined) firstFailure = error
+					try { await signalOwnedLauncher(name, deadline) } catch { /* the failure remains recorded and verification continues */ }
+				}
+			}
+			await attempt("SIGTERM")
+			const graceDeadline = Math.min(deadline, Date.now() + boundedGraceMs)
+			while (Date.now() < graceDeadline) {
+				try { if (await groupIsTerminal(deadline)) break }
+				catch (error) { if (firstFailure === undefined) firstFailure = error }
+				await wait(25, graceDeadline)
+			}
+			await attempt("SIGKILL")
+			while (Date.now() < deadline) {
+				try {
+					if (await groupIsTerminal(deadline)) {
+						if (firstFailure !== undefined) throw firstFailure
+						return
+					}
+				} catch (error) { if (firstFailure === undefined) firstFailure = error }
+				await wait(20, deadline)
+			}
+			if (firstFailure !== undefined) throw firstFailure
+			throw new Error("OpenShell launcher process group remains after bounded SIGKILL teardown")
+		}
+		const startTermination = () => {
+			if (!child.pid || terminationPromise || finished) return
+			const deadline = Date.now() + terminationBoundMs
+			terminationPromise = terminateOwnedProcesses(deadline)
+			void terminationPromise.then(
+				() => { if (aborted) settleFailure(signal?.reason ?? new Error("OpenShell command aborted")); else settleResult(child.exitCode, child.signalCode) },
+				(error: unknown) => { terminationFailure = error; settleFailure(error) },
+			)
+			finalizationTimer = setTimeout(() => {
+				settleFailure(terminationFailure ?? new Error("OpenShell process teardown did not finalize before its bounded deadline"))
+			}, terminationBoundMs + 250)
+		}
+		const onAbort = () => { aborted = true; startTermination() }
+		if (timeoutMs !== undefined) timer = setTimeout(() => { timedOut = true; startTermination() }, timeoutMs)
+		signal?.addEventListener("abort", onAbort, { once: true })
+		child.once("spawn", () => {
+			if (process.platform === "linux" && child.pid) {
+				const pid = child.pid
+				void readLinuxProcessRecord(pid).then((record) => {
+					if (record.pid !== pid || record.processGroupId !== pid || record.sessionId !== pid) throw new Error("OpenShell launcher is not the leader of its detached process group")
+					processIdentity = record
+			}).catch((error: unknown) => { processIdentityFailure = error }).finally(markProcessIdentityReady)
+			} else {
+				markProcessIdentityReady()
+			}
+			if (aborted || timedOut) startTermination()
+		})
+		child.once("error", (error) => {
+			markProcessIdentityReady()
+			settleFailure((error as NodeJS.ErrnoException).code === "ENOENT" ? new Error("OpenShell CLI executable was not found") : error)
 		})
 		child.once("close", (code, childSignal) => {
-			if (finished) return
-			finished = true
-			cleanup()
-			void (async () => {
-				if (aborted) {
-					if (process.platform !== "win32" && child.pid) {
-						try { send("SIGKILL") } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error }
-						const deadline = Date.now() + Math.max(500, graceMs)
-						while (Date.now() < deadline) {
-							try { process.kill(-child.pid, 0) } catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") break; throw error }
-							await new Promise((done) => setTimeout(done, 25))
-						}
-						try { process.kill(-child.pid, 0); throw new Error(`OpenShell launcher process group ${child.pid} remains after SIGKILL`) } catch (error) {
-							if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error
-						}
-					}
-					reject(signal?.reason ?? new Error("OpenShell command aborted"))
-					return
-				}
-				const details = [timedOut ? `timeout=true (after ${timeoutMs}ms)` : undefined, code !== 0 ? `exitCode=${code ?? 1}` : undefined, childSignal ? `signal=${childSignal}` : undefined].filter(Boolean).join(" ")
-				resolve({ exitCode: code ?? 1, output: [stdout, stderr, details].filter(Boolean).join("\n").trim() })
-			})().catch(reject)
+			if (aborted || timedOut) {
+				if (!terminationPromise) startTermination()
+				void terminationPromise?.then(() => {
+					if (aborted) settleFailure(signal?.reason ?? new Error("OpenShell command aborted"))
+					else settleResult(code, childSignal)
+				}, settleFailure)
+				return
+			}
+			settleResult(code, childSignal)
 		})
 		child.stdin.end()
 	})
 }
-
 export class OpenShellSessionProvider implements CloudProvider {
 	readonly name = "openshell"
 	readonly emergencyManaged = true

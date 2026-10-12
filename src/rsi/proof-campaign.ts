@@ -453,6 +453,60 @@ export class PostgresProofCampaign {
 		})
 	}
 
+	async recordIncompleteCandidate(lease: ProofCampaignArmLease, failure: { generation: number; candidateId: string; parentId: string; parentCommit: string; reason: string }): Promise<void> {
+		await transaction(this.pool, async (client) => {
+			const leaseState = await this.lockLease(client, lease)
+			if (lease.phase !== "development" || leaseState.arm_phase !== "development") throw new Error("candidate failure events are closed after the development phase")
+			const manifestResult = await client.query("SELECT manifest FROM headlesscode_rsi_proof_campaigns WHERE campaign_id=$1", [lease.campaignId])
+			const manifest = manifestResult.rows[0]?.manifest as ProofCampaignManifest | undefined
+			if (!manifest) throw new Error("proof campaign manifest is unavailable for candidate failure")
+			const cells = manifest.schedule.filter((cell) => cell.armId === lease.armId && cell.generation === failure.generation && (cell.phase ?? "development") === "development" && (cell.attemptKind === "development-proof" ? cell.candidateId.replace(/:(child|parent|base)$/, "") : cell.candidateId) === failure.candidateId)
+			if (!cells.some((cell) => cell.attemptKind === "mutation" && cell.candidateId === failure.candidateId)) throw new Error("candidate failure is outside the frozen campaign schedule")
+			if (failure.generation === 0) {
+				if (failure.parentId !== "baseline" || failure.parentCommit !== manifest.rootCommit) throw new Error("root-generation candidate failure does not reference the frozen campaign base commit")
+			} else if (failure.parentId === "baseline" && failure.parentCommit === manifest.rootCommit) {
+				const priorSelection = await client.query("SELECT payload FROM headlesscode_rsi_proof_campaign_events WHERE campaign_id=$1 AND arm_id=$2 AND event_type='generation-selected' AND payload->>'generation'=$3 FOR UPDATE", [lease.campaignId, lease.armId, String(failure.generation - 1)])
+				const priorAccepted = await client.query("SELECT 1 FROM headlesscode_rsi_proof_campaign_decisions WHERE campaign_id=$1 AND arm_id=$2 AND generation=$3 AND decision='accepted' FOR UPDATE", [lease.campaignId, lease.armId, failure.generation - 1])
+				const selected = priorSelection.rows[0]?.payload?.selectedCandidateIds
+				if (priorSelection.rowCount !== 1 || !Array.isArray(selected) || selected.length !== 0 || priorAccepted.rowCount !== 0) throw new Error("root restart failure requires an empty immediately preceding generation with no accepted candidate")
+			} else {
+				const selectedParent = await client.query(
+					`SELECT 1 FROM headlesscode_rsi_proof_campaign_decisions AS parent
+					 JOIN headlesscode_rsi_proof_campaign_events AS selection ON selection.campaign_id=parent.campaign_id AND selection.arm_id=parent.arm_id AND selection.event_type='generation-selected'
+					 AND (selection.payload->>'generation')::int=parent.generation AND selection.payload->'selectedCandidateIds' ? parent.candidate_id
+					 WHERE parent.campaign_id=$1 AND parent.arm_id=$2 AND parent.candidate_id=$3 AND parent.decision='accepted' AND parent.child_commit=$4 AND parent.generation<$5 LIMIT 1 FOR UPDATE OF parent`,
+					[lease.campaignId, lease.armId, failure.parentId, failure.parentCommit, failure.generation],
+				)
+				if (selectedParent.rowCount !== 1) throw new Error("candidate failure parent is not a previously accepted campaign lineage commit")
+			}
+			const schedule: Array<Record<string, unknown>> = []
+			for (const cell of cells) {
+				const attempt = await client.query(
+					`SELECT attempt_key,status,reserved_calls,reserved_tokens,reserved_spend_microusd,actual_calls,actual_tokens,actual_spend_microusd,error
+					 FROM headlesscode_rsi_proof_campaign_attempts WHERE campaign_id=$1 AND arm_id=$2 AND generation=$3 AND candidate_id=$4 AND task_id=$5 AND seed=$6 AND attempt_kind=$7 FOR UPDATE`,
+					[lease.campaignId, lease.armId, cell.generation, cell.candidateId, cell.taskId, cell.seed, cell.attemptKind],
+				)
+				if (attempt.rows.length > 1) throw new Error("candidate failure found duplicate rows for a frozen campaign cell")
+				const row = attempt.rows[0]
+				schedule.push({
+					...cell,
+					attemptKey: row ? String(row.attempt_key) : null,
+					status: row ? String(row.status) : "missing",
+					...(row ? { reservedCalls: Number(row.reserved_calls), reservedTokens: Number(row.reserved_tokens), reservedSpendMicrousd: Number(row.reserved_spend_microusd), actualCalls: row.actual_calls === null ? null : Number(row.actual_calls), actualTokens: row.actual_tokens === null ? null : Number(row.actual_tokens), actualSpendMicrousd: row.actual_spend_microusd === null ? null : Number(row.actual_spend_microusd), ...(row.error ? { attemptError: String(row.error) } : {}) } : {}),
+				})
+			}
+			const payload = { generation: failure.generation, candidateId: failure.candidateId, parentId: failure.parentId, parentCommit: failure.parentCommit, outcome: "incomplete", reason: failure.reason.slice(0, 512), cells: schedule }
+			const existing = await client.query("SELECT payload FROM headlesscode_rsi_proof_campaign_events WHERE campaign_id=$1 AND arm_id=$2 AND event_type='candidate-incomplete' FOR UPDATE", [lease.campaignId, lease.armId])
+			const matching = existing.rows.filter((row) => row.payload?.candidateId === failure.candidateId && Number(row.payload?.generation) === failure.generation)
+			if (matching.length > 1) throw new Error("proof campaign has duplicate candidate-incomplete events")
+			if (matching.length === 1) {
+				if (stableJson(matching[0]!.payload) !== stableJson(payload)) throw new Error("candidate-incomplete event conflicts with an earlier checkpoint")
+				return
+			}
+			await this.appendEvent(client, lease.campaignId, lease.armId, lease.epoch, "candidate-incomplete", payload)
+		})
+	}
+
 	async selectGeneration(lease: ProofCampaignArmLease, generation: number, selectedCandidateIds: string[]): Promise<void> {
 		await transaction(this.pool, async (client) => {
 			const leaseState = await this.lockLease(client, lease)
