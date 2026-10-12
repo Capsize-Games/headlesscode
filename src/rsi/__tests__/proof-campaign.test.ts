@@ -1050,10 +1050,13 @@ test("FileArtifactStore PostgreSQL proof-bound mutation imports only matching du
 		const cell = schedule[0]!
 		const attemptKey = "mutation-cell"
 		const actualCandidateId = "actual-candidate-id"
+		const callMicrousd = [2116, 90, 371, 932, 137, 865, 117, 192, 229, 210, 623, 133, 146, 186, 1497, 2939, 390, 122]
+		const totalMicrousd = callMicrousd.reduce((sum, amount) => sum + amount, 0)
+		assert.equal(totalMicrousd, 11_295)
 		const limits: OpenRouterBrokerLimits = {
-			campaignId: `${frozen.campaignId}:mutation`, maxCalls: 1, maxInputTokensPerCall: 100, maxOutputTokensPerCall: 100,
-			maxTotalTokens: 100, maxDurationMs: 60_000, maxRequestBytes: 16_384, maxResponseBytes: 16_384,
-			maxInputPricePerMillionUsd: 1, maxOutputPricePerMillionUsd: 1, maxCallSpendUsd: 0.1, maxJobSpendUsd: 0.1, maxCampaignSpendUsd: 1,
+			campaignId: `${frozen.campaignId}:mutation`, maxCalls: callMicrousd.length, maxInputTokensPerCall: 100, maxOutputTokensPerCall: 100,
+			maxTotalTokens: callMicrousd.length * 100, maxDurationMs: 60_000, maxRequestBytes: 16_384, maxResponseBytes: 16_384,
+			maxInputPricePerMillionUsd: 1, maxOutputPricePerMillionUsd: 1, maxCallSpendUsd: 0.01, maxJobSpendUsd: 0.2, maxCampaignSpendUsd: 1,
 		}
 		await campaign.admit(lease, {
 			attemptKey, kind: "mutation",
@@ -1075,20 +1078,57 @@ test("FileArtifactStore PostgreSQL proof-bound mutation imports only matching du
 		assert.equal(jobLease.job.jobId, job.jobId)
 		const grant: OpenRouterBrokerGrant = { jobId: job.jobId, leaseToken: jobLease.token, capability: randomUUID(), model: RSI_OPENROUTER_MODEL, limits }
 		await queue.register(grant)
-		await queue.reserve(grant, { callId: "mock-call-000001", requestSha256: "2".repeat(64), reservedUsd: 0.01, reservedTokens: 100, startedAt: new Date().toISOString() })
-		await queue.settle(grant, { callId: "mock-call-000001", state: "complete", qualified: true, returnedModel: RSI_OPENROUTER_MODEL, returnedProvider: "deepinfra", promptTokens: 10, completionTokens: 20, costUsd: 0.001, responseSha256: "3".repeat(64), completedAt: new Date().toISOString() })
+		for (const [index, microusd] of callMicrousd.entries()) {
+			const callId = `mock-call-${String(index + 1).padStart(6, "0")}`
+			await queue.reserve(grant, { callId, requestSha256: String(index + 2).repeat(64).slice(0, 64), reservedUsd: 0.01, reservedTokens: 100, startedAt: new Date().toISOString() })
+			await queue.settle(grant, { callId, state: "complete", qualified: true, returnedModel: RSI_OPENROUTER_MODEL, returnedProvider: "deepinfra", promptTokens: 10, completionTokens: 20, costUsd: microusd / 1_000_000, responseSha256: String(index + 3).repeat(64).slice(0, 64), completedAt: new Date().toISOString() })
+		}
 		const receipt = await queue.receipt(grant)
 		assert.equal(receipt.qualified, true)
+		assert.equal(receipt.accounting, "supervisor-enforced")
+		assert.equal(receipt.provider, "openrouter")
+		assert.equal(receipt.jobId, job.jobId)
+		assert.equal(receipt.campaignId, limits.campaignId)
+		assert.equal(receipt.model, RSI_OPENROUTER_MODEL)
+		assert.equal(receipt.endpointProvider, "deepinfra")
+		assert.equal(receipt.calls, callMicrousd.length)
+		assert.equal(receipt.totalTokens, callMicrousd.length * 30)
+		assert.equal(receipt.costUsd, totalMicrousd / 1_000_000)
+		assert.equal(receipt.callReceipts.length, callMicrousd.length)
 		assert.deepEqual(receipt.returnedProviders, ["deepinfra"])
 		const patch = await queue.putArtifact(Buffer.from("verified candidate patch bytes"))
 		const result = { patchSha256: patch.sha256, patchBytes: patch.byteLength, inferenceReceipt: receipt }
+		const incompleteReceipts: Array<[string, Record<string, unknown>]> = [
+			["missing receipt", {}],
+			["wrong provider", { ...receipt, provider: "other" }],
+			["wrong job", { ...receipt, jobId: "other-job" }],
+			["wrong campaign", { ...receipt, campaignId: "other-campaign" }],
+			["wrong model", { ...receipt, model: "other/model" }],
+			["unqualified receipt", { ...receipt, qualified: false }],
+			["wrong call count", { ...receipt, calls: receipt.calls - 1 }],
+			["wrong token count", { ...receipt, totalTokens: receipt.totalTokens! - 1 }],
+		]
+		for (const [label, invalidReceipt] of incompleteReceipts) {
+			await assert.rejects(
+				() => queue.complete(jobLease, { ...result, inferenceReceipt: invalidReceipt }),
+				/proof campaign result receipt does not match durable broker call accounting/,
+				`${label} must remain rejected`,
+			)
+		}
+		for (const delta of [-1, 1]) {
+			await assert.rejects(
+				() => queue.complete(jobLease, { ...result, inferenceReceipt: { ...receipt, costUsd: (totalMicrousd + delta) / 1_000_000 } }),
+				/proof campaign result receipt does not match durable broker call accounting/,
+				`a receipt differing by ${delta} microUSD must be rejected`,
+			)
+		}
 		assert.equal((await queue.complete(jobLease, result)).accepted, true)
 		const view = await campaign.snapshot(frozen.campaignId)
 		const imported = (view.attempts as Array<Record<string, unknown>>).find((attempt) => attempt.attempt_key === attemptKey)!
 		assert.equal(imported.status, "completed")
-		assert.equal(Number(imported.actual_calls), 1)
-		assert.equal(Number(imported.actual_tokens), 30)
-		assert.equal(Number(imported.actual_spend_microusd), 1_000)
+		assert.equal(Number(imported.actual_calls), callMicrousd.length)
+		assert.equal(Number(imported.actual_tokens), callMicrousd.length * 30)
+		assert.equal(Number(imported.actual_spend_microusd), totalMicrousd)
 		assert.equal((imported.artifact_refs as Record<string, { sha256: string }>).patch?.sha256, patch.sha256)
 		const conflictingReplay = await queue.complete(jobLease, { ...result, inferenceReceipt: { ...receipt, totalTokens: 31 } })
 		assert.equal(conflictingReplay.accepted, false, "a duplicate import with a receipt that differs from durable call accounting is not accepted")

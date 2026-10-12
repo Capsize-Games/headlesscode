@@ -15,5 +15,8 @@ test("PostgreSQL receipts aggregate rounded call costs as integer microUSD", () 
 test("microUSD receipt aggregation rejects invalid or unsafe amounts", () => {
 	assert.throws(() => sumMicrousdAsUsd([1, -1]), /non-negative safe integer/)
 	assert.throws(() => sumMicrousdAsUsd([Number.MAX_SAFE_INTEGER, 1]), /non-negative safe integer/)
+	for (const value of [null, true, "", "01", "1.0", "-1", "9007199254740992"]) {
+		assert.throws(() => sumMicrousdAsUsd([value]), /non-negative safe integer/, `reject noncanonical amount ${String(value)}`)
+	}
 	assert.equal(usdEqualsMicrousd(Number.NaN, 1), false)
 })
