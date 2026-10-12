@@ -1186,6 +1186,9 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		if (hooks.onPreparationReceipt) await hooks.onPreparationReceipt(receipt)
 		else log(hooks, `RSI_PREPARATION_RECEIPT ${JSON.stringify(receipt)}`)
 	}
+	const emitFailureReceipt = async (phase: RsiPreparationReceipt["phase"], manifestSha256?: string): Promise<void> => {
+		try { await emitPreparationReceipt(phase, "failed", manifestSha256) } catch { /* preserve the original preparation error */ }
+	}
 	await emitPreparationReceipt("fixture-validation", "started")
 	let loadedProofBenchmark: { manifest: BenchmarkManifest; manifestDigest: string }
 	try {
@@ -1195,7 +1198,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 				? await fs.readFile(path.join(proofFixturesRoot, "manifest.json"), "utf8").then((rawManifest) => ({ manifest: JSON.parse(rawManifest) as BenchmarkManifest, manifestDigest: createHash("sha256").update(rawManifest).digest("hex") }))
 				: await loadBenchmark(proofFixturesRoot, config.repoRoot)
 	} catch (error) {
-		await emitPreparationReceipt("fixture-validation", "failed")
+		await emitFailureReceipt("fixture-validation")
 		throw error
 	}
 	await emitPreparationReceipt("fixture-validation", "completed", loadedProofBenchmark.manifestDigest)
@@ -1367,9 +1370,17 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		await emitPreparationReceipt("campaign-manifest", "started", loadedProofBenchmark.manifestDigest)
 		const manifest = createProofCampaignManifest({ config: runConfig, campaignId: config.workerHarnessPairId, baseCommit, model: workerModel, provider: workerProvider, ...(workerOpenRouterProfile && workerOpenRouterProfile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { openRouterProfileId: workerOpenRouterProfile.id } : {}), runtime: workerHarnessRuntime, developmentManifest: loadedProofBenchmark.manifest, developmentManifestDigest: loadedProofBenchmark.manifestDigest, plannedGenerations, proofProtocol })
 		await emitPreparationReceipt("campaign-manifest", "completed", loadedProofBenchmark.manifestDigest)
-		campaignStore = fleetQueue.proofCampaignCoordinator()
+		await emitPreparationReceipt("campaign-observation", "started", loadedProofBenchmark.manifestDigest)
+		let priorSnapshot: Record<string, unknown> | undefined
+		try {
+			campaignStore = fleetQueue.proofCampaignCoordinator()
+			priorSnapshot = await campaignStore.snapshotIfExists(config.workerHarnessPairId)
+		} catch (error) {
+			await emitFailureReceipt("campaign-observation", loadedProofBenchmark.manifestDigest)
+			throw error
+		}
+		await emitPreparationReceipt("campaign-observation", "completed", loadedProofBenchmark.manifestDigest)
 		if (hooks.runDevelopmentBenchmark) throw new Error("paired proof campaigns cannot use an injected benchmark hook that bypasses durable campaign admission and settlement")
-		const priorSnapshot = await campaignStore.snapshotIfExists(config.workerHarnessPairId)
 		const priorArm = (priorSnapshot?.arms as Array<Record<string, unknown>> | undefined)?.find((entry) => entry.arm_id === workerHarnessMode)
 		if (priorArm?.state === "finished") {
 			return rebuildFinishedProofCampaignArchive({ run, config, snapshot: priorSnapshot!, manifest, armId: workerHarnessMode, now })

@@ -343,7 +343,7 @@ test("paired startup reports slow preparation and stops before admission when st
 	const fakeQueue = {
 		artifactBackend: "s3",
 		async migrate() {}, async assertResourceClassCoverage() {}, async close() {},
-		proofCampaignCoordinator() { return {} },
+		proofCampaignCoordinator() { return { async snapshotIfExists() { await new Promise((resolve) => setTimeout(resolve, 20)); return undefined } } },
 		async enqueue() { inferenceCalls++; throw new Error("inference must not run before acquisition") },
 	}
 	try {
@@ -364,12 +364,13 @@ test("paired startup reports slow preparation and stops before admission when st
 		assert.equal(inferenceCalls, 0, "no inference enqueue occurs before successful durable acquisition")
 		assert.deepEqual(receipts.map(({ phase, state }) => `${phase}:${state}`), [
 			"fixture-validation:started", "fixture-validation:completed", "proof-protocol:started", "proof-protocol:completed",
-			"campaign-manifest:started", "campaign-manifest:completed",
+			"campaign-manifest:started", "campaign-manifest:completed", "campaign-observation:started", "campaign-observation:completed",
 		])
 		assert.ok(receipts.every((receipt) => receipt.sourceCommit === sourceCommit && receipt.seedSha256.length === 64 && receipt.campaignId === campaign))
 		assert.ok(receipts.slice(1).every((receipt) => /^[a-f0-9]{64}$/.test(receipt.manifestSha256 ?? "")))
 		assert.ok(receipts.every((receipt) => receipt.inferenceAdmittedByReceipt === false && receipt.readiness === "preparing" && receipt.elapsedSinceStartMs >= 0 && receipt.phaseElapsedMs >= 0))
 		assert.ok((receipts[1]?.phaseElapsedMs ?? 0) >= 15, "slow startup work is visible in the completed phase receipt")
+		assert.ok((receipts.at(-1)?.phaseElapsedMs ?? 0) >= 15, "slow campaign snapshot observation is visible before the rejected test hook reaches admission")
 	} finally {
 		for (const [name, value] of Object.entries(saved)) if (value === undefined) delete process.env[name]; else process.env[name] = value
 		await cleanup()

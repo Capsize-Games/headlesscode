@@ -539,7 +539,7 @@ export interface MutationRunner {
 export interface RsiPreparationReceipt {
 	schemaVersion: 1
 	kind: "rsi-preparation"
-	phase: "proof-plan-preview" | "pricing-admission" | "evaluator-admission" | "fixture-validation" | "proof-protocol" | "campaign-manifest" | "campaign-acquire"
+	phase: "proof-plan-preview" | "pricing-admission" | "evaluator-admission" | "fixture-validation" | "proof-protocol" | "campaign-manifest" | "campaign-observation" | "campaign-acquire"
 	state: "started" | "completed" | "failed"
 	sourceCommit: string
 	seedSha256: string

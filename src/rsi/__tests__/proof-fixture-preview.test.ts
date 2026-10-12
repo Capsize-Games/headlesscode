@@ -138,6 +138,33 @@ test("proof preview binds an external package root and rejects missing fixtures 
 		assert.equal(preview.benchmarkManifestSha256, preview.benchmarkFixtures.manifestSha256)
 		assert.equal(gitText(repo, ["status", "--porcelain=v1", "--untracked-files=all"]), "", "preview leaves the synthetic source root clean")
 
+		const runtimeFailureReceipts: RsiPreparationReceipt[] = []
+		const invalidRuntimeEnv = { ...env }
+		delete invalidRuntimeEnv.HEADLESSCODE_RSI_RUNTIME_IMAGE_DIGEST
+		await assert.rejects(buildProofPlanPreview(options, invalidRuntimeEnv, fetcher, (receipt) => { runtimeFailureReceipts.push(receipt) }), /HEADLESSCODE_RSI_RUNTIME_IMAGE_DIGEST/)
+		assert.deepEqual(runtimeFailureReceipts.map(({ phase, state }) => `${phase}:${state}`), ["proof-plan-preview:started", "proof-plan-preview:failed"])
+
+		const priceCeilingFailureReceipts: RsiPreparationReceipt[] = []
+		await assert.rejects(buildProofPlanPreview(options, {
+			...env, HEADLESSCODE_RSI_OPENROUTER_MAX_INPUT_PRICE_PER_MILLION_USD: "0.00000001",
+		}, fetcher, (receipt) => { priceCeilingFailureReceipts.push(receipt) }), /price ceiling is below the live pinned endpoint rate/)
+		assert.deepEqual(priceCeilingFailureReceipts.map(({ phase, state }) => `${phase}:${state}`), [
+			"proof-plan-preview:started", "fixture-validation:started", "fixture-validation:completed",
+			"pricing-admission:started", "pricing-admission:completed", "proof-plan-preview:failed",
+		])
+
+		const plannerFailureReceipts: RsiPreparationReceipt[] = []
+		await assert.rejects(buildProofPlanPreview(options, {
+			...env,
+			HEADLESSCODE_RSI_OPENROUTER_MAX_CALL_SPEND_USD: "0.000001",
+			HEADLESSCODE_RSI_OPENROUTER_MAX_JOB_SPEND_USD: "0.000002",
+			HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD: "0.000003",
+			HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD: "0.000003",
+		}, fetcher, (receipt) => { plannerFailureReceipts.push(receipt) }), /per-call spend cap is below the conservative runtime admission ceiling/)
+		assert.equal(plannerFailureReceipts.at(-1)?.phase, "proof-plan-preview")
+		assert.equal(plannerFailureReceipts.at(-1)?.state, "failed", "planner rejection terminates the preview receipt instead of leaving a stale started state")
+		assert.ok(plannerFailureReceipts.every((receipt) => receipt.inferenceAdmittedByReceipt === false && receipt.readiness === "preparing"))
+
 		const indexPath = path.join(packagePath, "index.json")
 		const originalIndex = await fs.readFile(indexPath)
 		await fs.writeFile(indexPath, Buffer.concat([originalIndex, Buffer.from(" ")]))
