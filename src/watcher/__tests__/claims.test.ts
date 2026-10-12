@@ -440,6 +440,64 @@ async function testRunnerPoolCapacityUnionsLocalAndClaimedSessions(): Promise<vo
 	await fs.rm(repoRoot, { recursive: true, force: true })
 }
 
+async function testRunnerPoolSkipsForeignClaimWithoutExceedingLocalCap(): Promise<void> {
+	const api = claimApi()
+	const now = () => new Date("2026-10-11T12:00:00.000Z")
+	const workstation = store(api, "workstation", now, "nonce-foreign-owner-012345")
+	const node = store(api, "node", now, "nonce-pool-skip-held-012345")
+	const held = await workstation.acquire(95, { worktreeNames: ["w1"] })
+	assert.equal(held.acquired, true)
+	if (!held.acquired) throw new Error("expected foreign runner's claim")
+
+	const scratch = path.join(process.cwd(), ".headlesscode", "scratch", "node-pool-32-claims-test")
+	await fs.mkdir(scratch, { recursive: true, mode: 0o700 })
+	const repoRoot = await fs.mkdtemp(path.join(scratch, "skip-foreign-claim-"))
+	const controller = new AbortController()
+	const issue = (number: number): GitHubIssue => ({
+		number,
+		title: `synthetic pool issue ${number}`,
+		labels: ["needs-agent"],
+	})
+	const listActive = node.listActiveClaims.bind(node)
+	let suppressShutdownLookup = false
+	let initialLookup = true
+	node.listActiveClaims = async (runnerId?: string) => {
+		if (suppressShutdownLookup) return []
+		if (initialLookup) {
+			initialLookup = false
+			return []
+		}
+		return listActive(runnerId)
+	}
+	const spawnedIssues: number[] = []
+	const result = await watchIssues({
+		owner: "owner", repo: "repo", targetLabel: "needs-agent", token: "test-token",
+		repoRoot, stateFile: path.join(repoRoot, ".worktrees", ".watcher-state.json"),
+		runOnce: false, pollIntervalMs: 1, maxConcurrentSessions: 1, maxPerSweep: 5,
+		runnerId: "node", runnerAssignee: "synthetic-bot", claimStore: node,
+		gh: {
+			listIssues: async () => [issue(95), issue(96), issue(97)],
+			getIssue: async () => issue(95),
+			addLabel: async () => undefined,
+		},
+		spawn: async (batch) => {
+			spawnedIssues.push(batch.issue.number)
+			return { ok: true, status: 0 }
+		},
+		onBatch: () => { suppressShutdownLookup = true; controller.abort() },
+		signal: controller.signal,
+		logger: new Logger({ level: "silent" }),
+	})
+	assert.equal(result.spawned, 1, "the free issue after a foreign claim should dispatch once")
+	assert.deepEqual(spawnedIssues, [96], "a held lowest issue must not starve later work")
+	assert.equal(result.sweeps[0]?.deferred, 2, "the held and over-cap issues remain pending")
+	assert.equal(result.sweeps[0]?.state.processed["95"]?.status, "pending")
+	assert.equal(result.sweeps[0]?.state.processed["97"]?.status, "pending")
+	assert.equal((await node.read(96))?.claim.phase, "active", "the dispatched claim remains held")
+	assert.equal((await workstation.read(95))?.claim.runnerId, "workstation", "the foreign claim remains untouched")
+	await fs.rm(repoRoot, { recursive: true, force: true })
+}
+
 async function testRunnerPoolRequiresRenewalMargin(): Promise<void> {
 	const api = claimApi()
 	const claims = store(api, "workstation", () => new Date("2026-10-11T12:00:00.000Z"), "nonce-poll-margin-012345")
@@ -489,6 +547,7 @@ await testRefUpdateUsesParentAndNoForce()
 await testWatcherClaimSurvivesUntilConfirmedCompletion()
 await testMarkerOnlyClaimStaysQuarantinedAndCountsEveryWorktree()
 await testRunnerPoolCapacityUnionsLocalAndClaimedSessions()
+await testRunnerPoolSkipsForeignClaimWithoutExceedingLocalCap()
 await testRunnerPoolRequiresRenewalMargin()
 await testUncertainSpawnExceptionKeepsClaimQuarantined()
 process.stdout.write("watcher claims tests passed\n")

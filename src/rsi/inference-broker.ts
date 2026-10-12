@@ -486,7 +486,23 @@ export function openRouterCampaignBudgetAllocation(env: NodeJS.ProcessEnv): Open
 
 export function openRouterAllocatedEnvironment(env: NodeJS.ProcessEnv, allocation: "mutation" | "benchmark"): NodeJS.ProcessEnv {
 	const budgets = openRouterCampaignBudgetAllocation(env)
-	return { ...env, HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD: String(allocation === "mutation" ? budgets.mutationUsd : budgets.benchmarkUsd) }
+	const rolePrefix = `HEADLESSCODE_RSI_OPENROUTER_${allocation.toUpperCase()}_`
+	const scopedTotalTokens = env[`${rolePrefix}MAX_TOTAL_TOKENS`]?.trim()
+	const scopedJobSpendUsd = env[`${rolePrefix}MAX_JOB_SPEND_USD`]?.trim()
+	if (scopedTotalTokens) {
+		const value = Number(scopedTotalTokens)
+		if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${rolePrefix}MAX_TOTAL_TOKENS must be a positive integer`)
+	}
+	if (scopedJobSpendUsd) {
+		const value = Number(scopedJobSpendUsd)
+		if (!Number.isFinite(value) || value <= 0) throw new Error(`${rolePrefix}MAX_JOB_SPEND_USD must be a positive finite USD amount`)
+	}
+	return {
+		...env,
+		HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD: String(allocation === "mutation" ? budgets.mutationUsd : budgets.benchmarkUsd),
+		...(scopedTotalTokens ? { HEADLESSCODE_RSI_OPENROUTER_MAX_TOTAL_TOKENS: scopedTotalTokens } : {}),
+		...(scopedJobSpendUsd ? { HEADLESSCODE_RSI_OPENROUTER_MAX_JOB_SPEND_USD: scopedJobSpendUsd } : {}),
+	}
 }
 
 function sha256(value: Buffer | string): string { return createHash("sha256").update(value).digest("hex") }

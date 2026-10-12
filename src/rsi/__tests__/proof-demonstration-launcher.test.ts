@@ -6,8 +6,8 @@ import test from "node:test"
 import { createHash, generateKeyPairSync } from "node:crypto"
 import { appendRun } from "../archive.js"
 import type { RsiConfig, RsiRunRecord, WorkerHarnessRuntimeIdentity } from "../types.js"
-import { assertEngineeringTransition, assertProofWorkerProfile, configureProofVisibleEvaluations, isFullyConfirmedRun, parseProofDemonstrationArgs, PROOF_VISIBLE_EVAL_COMMANDS, runEngineeringArm, runFrozenCampaignArm, validateRuntimeEvaluatorIntegrity } from "../../../scripts/rsi-proof-demonstration.js"
-import type { FrozenProofDemonstrationManifest } from "../proof-demonstration-manifest.js"
+import { assertEngineeringTransition, assertProofWorkerProfile, configureProofVisibleEvaluations, isFullyConfirmedRun, parseProofDemonstrationArgs, proofConfigFromOptions, PROOF_VISIBLE_EVAL_COMMANDS, runEngineeringArm, runFrozenCampaignArm, validateRuntimeEvaluatorIntegrity } from "../../../scripts/rsi-proof-demonstration.js"
+import { frozenProofConfigDigest, type FrozenProofDemonstrationManifest } from "../proof-demonstration-manifest.js"
 import { proofCampaignManifestDigest, type ProofCampaignManifest } from "../proof-campaign.js"
 import { RSI_MUSE_OPENROUTER_MODEL, RSI_OPENROUTER_MODEL } from "../inference-broker.js"
 
@@ -81,6 +81,24 @@ test("proof CLI admits explicit Muse selection while keeping legacy DeepSeek as 
 	assert.equal(parseProofDemonstrationArgs(["engineering", "--openrouter-profile", "muse-spark-contributor"]).openRouterProfile, "muse-spark-contributor")
 	assert.throws(() => parseProofDemonstrationArgs(["plan", "--openrouter-profile", "unlisted-model"]), /profile is not admitted/)
 	assert.throws(() => parseProofDemonstrationArgs(["execute", "--openrouter-profile", "muse-spark-contributor"]), /only valid for estimate, engineering, or plan/)
+})
+
+test("proof CLI parses a positive safe max-token limit and passes it into frozen mutation config", () => {
+	const options = parseProofDemonstrationArgs(["engineering", "--seed", "token-seed", "--max-tokens", "7000"])
+	assert.equal(options.maxTokens, 7000)
+	const config = proofConfigFromOptions(options, "a".repeat(40))
+	assert.equal(config.maxTokens, 7000)
+	assert.equal(config.generations, 3, "the helper config supports all paired-run generations; engineering later freezes two")
+	const defaultConfig = proofConfigFromOptions({ ...options, maxTokens: undefined }, "a".repeat(40))
+	assert.notEqual(frozenProofConfigDigest([config]), frozenProofConfigDigest([defaultConfig]), "the frozen config digest binds maxTokens")
+})
+
+test("proof max-token option rejects invalid values and commands governed by a frozen plan", () => {
+	for (const value of ["0", "-1", "1.5", "NaN", "9007199254740992"]) {
+		assert.throws(() => parseProofDemonstrationArgs(["engineering", "--seed", "token-seed", "--max-tokens", value]), /must be a positive integer/)
+	}
+	assert.throws(() => parseProofDemonstrationArgs(["engineering", "--seed", "token-seed", "--max-tokens"]), /requires a value/)
+	assert.throws(() => parseProofDemonstrationArgs(["execute", "--plan", "/plan.json", "--max-tokens", "7000"]), /only valid for estimate, engineering, or plan/)
 })
 
 test("proof preview selects a nonempty visible test set outside withheld RSI sources", async () => {
@@ -177,7 +195,7 @@ test("engineering replay reuses a finished fixed arm after a crash before self-h
 			model: RSI_OPENROUTER_MODEL, baseRef: "main", baseCommit: "e".repeat(40), generations: 2, candidates: [], reports: [],
 			workerHarnessPairId: campaign, workerHarnessMode: arm, workerHarnessSamplingSeed: "engineering-seed", workerHarnessRuntime: runtime,
 			proofCampaign: {
-				manifest: { phaseMode: "engineering-only", schedule: [], model: { provider: "openshell-openrouter", id: RSI_OPENROUTER_MODEL, settings: { roles: { worker: { provider: "openrouter", model: RSI_OPENROUTER_MODEL } } } } }, manifestSha256: "f".repeat(64), campaignId: campaign, armId: arm, epoch: 1,
+				manifest: { phaseMode: "engineering-only", schedule: [], settings: { effectiveConfig: {} }, model: { provider: "openshell-openrouter", id: RSI_OPENROUTER_MODEL, settings: { roles: { worker: { provider: "openrouter", model: RSI_OPENROUTER_MODEL } } } } }, manifestSha256: "f".repeat(64), campaignId: campaign, armId: arm, epoch: 1,
 				ledgerSnapshot: { arms: [{ arm_id: arm, state: "finished" }] }, state: "finished",
 			},
 		} as unknown as RsiRunRecord
@@ -189,6 +207,11 @@ test("engineering replay reuses a finished fixed arm after a crash before self-h
 		})
 		assert.equal(resumed.runId, finished.runId)
 		assert.equal(runnerCalls, 0)
+		await assert.rejects(() => runEngineeringArm({ ...config, maxTokens: 7000 }, campaign, arm, finished.baseCommit, "engineering-seed", runtime, async () => {
+			runnerCalls++
+			throw new Error("a changed output-token limit must fail before replay or dispatch")
+		}), /changed frozen output-token limit/)
+		assert.equal(runnerCalls, 0, "a finished arm is not replayed under a changed token cap")
 	} finally {
 		await fs.rm(root, { recursive: true, force: true })
 	}
@@ -206,7 +229,7 @@ test("engineering replay rejects persisted run whose nested campaign profile dif
 			runId: `${campaign}-fixed`, startedAt: "2026-09-30T00:00:00Z", finishedAt: "2026-09-30T00:01:00Z",
 			model: RSI_MUSE_OPENROUTER_MODEL, openRouterProfileId: "muse-spark-contributor", baseRef: "main", baseCommit: "e".repeat(40), generations: 2, candidates: [], reports: [],
 			workerHarnessPairId: campaign, workerHarnessMode: "fixed-control", workerHarnessSamplingSeed: "engineering-seed", workerHarnessRuntime: runtime,
-			proofCampaign: { manifest: { phaseMode: "engineering-only", schedule: [], model: { provider: "openshell-openrouter", id: RSI_OPENROUTER_MODEL } }, manifestSha256: "f".repeat(64), campaignId: campaign, armId: "fixed-control", epoch: 1, state: "finished", ledgerSnapshot: { arms: [{ arm_id: "fixed-control", state: "finished" }] } },
+			proofCampaign: { manifest: { phaseMode: "engineering-only", schedule: [], settings: { effectiveConfig: {} }, model: { provider: "openshell-openrouter", id: RSI_OPENROUTER_MODEL } }, manifestSha256: "f".repeat(64), campaignId: campaign, armId: "fixed-control", epoch: 1, state: "finished", ledgerSnapshot: { arms: [{ arm_id: "fixed-control", state: "finished" }] } },
 		} as unknown as RsiRunRecord
 		await appendRun(root, mismatched)
 		let dispatched = false

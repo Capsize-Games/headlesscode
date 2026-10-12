@@ -34,7 +34,8 @@ export const LIVE_DEVELOPMENT_SLOTS = Object.freeze(PILOT_FIXTURES
 	.filter((fixture) => fixture.split === "train" || fixture.split === "calibration")
 	.flatMap((fixture) => LIVE_SEEDS.map((seed) => ({ fixture, seed, slotKey: `development:${fixture.id}:${seed}` }))))
 
-const MAX_COMPLETION_TOKENS = 512
+export const DEFAULT_MAX_OUTPUT_TOKENS = 512
+export const MAX_CONFIGURED_OUTPUT_TOKENS = 4096
 type DeterministicFailureCode =
 	| "billing-record-missing-or-mismatched"
 	| "response-model-not-admitted"
@@ -134,6 +135,7 @@ interface BillingClient extends LlmClient {
 
 export interface LiveRunnerOptions {
 	readonly outputDir?: string
+	readonly maxOutputTokens?: number
 	readonly client?: BillingClient
 	readonly signal?: AbortSignal
 	readonly retryAborted?: boolean
@@ -209,6 +211,7 @@ interface LiveTrajectoryOptions {
 	readonly runId: string
 	readonly attemptId: string
 	readonly epoch: number
+	readonly maxOutputTokens: number
 	readonly fixture: (typeof PILOT_FIXTURES)[number]
 	readonly seed: number
 	readonly arm: "B" | "M" | "R" | "G"
@@ -221,6 +224,13 @@ interface LiveTrajectoryOptions {
 
 function isSafeInteger(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+}
+
+export function validateMaxOutputTokens(value: unknown): number {
+	if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > MAX_CONFIGURED_OUTPUT_TOKENS) {
+		throw new RangeError(`max output tokens must be an integer from 1 to ${MAX_CONFIGURED_OUTPUT_TOKENS}`)
+	}
+	return value as number
 }
 
 function recordError(call: PilotToolCall, text: string, forbidden: boolean): { result: PilotToolResult; forbidden: boolean } {
@@ -413,7 +423,7 @@ async function runLiveTrajectory(options: LiveTrajectoryOptions): Promise<{
 			messages,
 			tools: LIVE_TOOLS as ChatTool[],
 			temperature: 0,
-			maxTokens: Math.min(MAX_COMPLETION_TOKENS, LIVE_BUDGET.maxTokens - inputTokens - outputTokens),
+			maxTokens: Math.min(options.maxOutputTokens, LIVE_BUDGET.maxTokens - inputTokens - outputTokens),
 			stream: true,
 			cacheRoutingKey,
 			providerOnly: "meta",
@@ -641,15 +651,16 @@ async function sourceIdentityManifest(): Promise<{ files: readonly { path: strin
 	return { files, sha256: sha256(files) }
 }
 
-async function manifestBase(): Promise<Record<string, unknown>> {
+async function manifestBase(outputDir: string, maxOutputTokens: number): Promise<Record<string, unknown>> {
 	const sourceIdentity = await sourceIdentityManifest()
 	return {
 		schemaVersion: 3,
 		experimentId: LIVE_EXPERIMENT_ID,
 		createdAt: new Date().toISOString(),
 		kind: "restricted-virtual-task-loop",
+		outputDirectory: outputDir,
 		model: { requested: LIVE_MODEL, providerOnly: LIVE_PROVIDER, allowFallbacks: false, admittedReturnedModelAliases: LIVE_MODEL_ALIASES },
-		modelSettings: { temperature: 0, maxOutputTokens: MAX_COMPLETION_TOKENS, stream: true, samplingSeedSupported: false },
+		modelSettings: { temperature: 0, maxOutputTokens, stream: true, samplingSeedSupported: false },
 		randomization: { armOrder: "Fisher-Yates seeded from the first 32 bits of SHA-256(fixtureId:repetitionSeed)", randomTiming: "SHA-256(fixtureId:repetitionSeed:random-arm); calibration-only trigger distribution", providerSamplingSeed: "unsupported and not sent" },
 		fixturesHash: fixtureHash(), splitHash: splitHash(),
 		sourceIdentity,
@@ -708,8 +719,8 @@ async function writePrivateJsonAtomic(filePath: string, value: unknown): Promise
 	}
 }
 
-async function loadOrWriteManifest(experimentDir: string): Promise<{ manifest: Record<string, unknown>; hash: string }> {
-	const expected = await manifestBase()
+async function loadOrWriteManifest(experimentDir: string, outputDir: string, maxOutputTokens: number): Promise<{ manifest: Record<string, unknown>; hash: string }> {
+	const expected = await manifestBase(outputDir, maxOutputTokens)
 	const manifestPath = path.join(experimentDir, "manifest.json")
 	await assertRegularFileNoSymlink(manifestPath)
 	try {
@@ -828,13 +839,14 @@ async function createProductionClient(): Promise<BillingClient> {
 export async function collectLiveDevelopment(options: LiveRunnerOptions = {}): Promise<LiveRunSummary> {
 	validateFixtureSplits()
 	const outputDir = path.resolve(options.outputDir ?? ".headlesscode/monitor-pilot-live")
+	const maxOutputTokens = validateMaxOutputTokens(options.maxOutputTokens === undefined ? DEFAULT_MAX_OUTPUT_TOKENS : options.maxOutputTokens)
 	await ensurePrivateDir(outputDir)
 	const lock = new ExclusiveRunnerLock(path.join(outputDir, "runner.lock"))
 	await lock.acquire()
 	try {
 		const experimentDir = path.join(outputDir, "development")
 		await ensurePrivateDir(experimentDir)
-		const { manifest, hash: manifestHash } = await loadOrWriteManifest(experimentDir)
+		const { manifest, hash: manifestHash } = await loadOrWriteManifest(experimentDir, outputDir, maxOutputTokens)
 		const journal = new PilotJournal(path.join(experimentDir, "journal.jsonl"))
 		await assertRegularFileNoSymlink(journal.filePath)
 		await journal.open()
@@ -880,7 +892,7 @@ export async function collectLiveDevelopment(options: LiveRunnerOptions = {}): P
 			await fs.chmod(journal.filePath, 0o600)
 			const signal = options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(LIVE_BUDGET.maxWallMs)]) : AbortSignal.timeout(LIVE_BUDGET.maxWallMs)
 			try {
-				const result = await runLiveTrajectory({ experimentId: LIVE_EXPERIMENT_ID, runId, attemptId, epoch, fixture: slot.fixture, seed: slot.seed, arm: "B", client, signal, journal })
+				const result = await runLiveTrajectory({ experimentId: LIVE_EXPERIMENT_ID, runId, attemptId, epoch, maxOutputTokens, fixture: slot.fixture, seed: slot.seed, arm: "B", client, signal, journal })
 				await journal.append("attempt_completed", LIVE_EXPERIMENT_ID, { slotKey: slot.slotKey, outcome: result.outcome, rows: result.rows }, { runId, attemptId, epoch })
 				await global.append("budget_settled", LIVE_EXPERIMENT_ID, { attemptId, actualTokens: result.actualTokens, actualWallMs: result.actualWallMs }, { runId, attemptId, epoch })
 				if (result.outcome.valid) allRows.push(...result.rows)
@@ -965,7 +977,7 @@ function heldoutSlots(): readonly HeldoutSlot[] {
 	))
 }
 
-async function requireQualifiedDevelopment(outputDir: string): Promise<{ predictor: FrozenPredictorArtifact; rows: LabeledWindow[]; outcomes: PilotOutcome[]; calibrationBoundaries: Pick<LabeledWindow, "features" | "trajectoryId" | "boundarySequence">[]; manifestHash: string }> {
+async function requireQualifiedDevelopment(outputDir: string, maxOutputTokens: number): Promise<{ predictor: FrozenPredictorArtifact; rows: LabeledWindow[]; outcomes: PilotOutcome[]; calibrationBoundaries: Pick<LabeledWindow, "features" | "trajectoryId" | "boundarySequence">[]; manifestHash: string }> {
 	const developmentDir = path.join(outputDir, "development")
 	for (const file of ["development-summary.json", "predictor.json", "manifest.json", "journal.jsonl"]) await assertRegularFileNoSymlink(path.join(developmentDir, file))
 	const summary = JSON.parse(await fs.readFile(path.join(developmentDir, "development-summary.json"), "utf8")) as LiveRunSummary
@@ -978,7 +990,7 @@ async function requireQualifiedDevelopment(outputDir: string): Promise<{ predict
 	}
 	const manifest = JSON.parse(await fs.readFile(path.join(developmentDir, "manifest.json"), "utf8")) as Record<string, unknown>
 	const currentSourceIdentity = await sourceIdentityManifest()
-	if (manifest.experimentId !== LIVE_EXPERIMENT_ID || manifest.fixturesHash !== fixtureHash() || manifest.splitHash !== splitHash() || manifest.guardrailsHash !== LIVE_GUARDRAILS_HASH || manifest.templatesHash !== sha256(TEMPLATE_TEXT)) {
+	if (manifest.experimentId !== LIVE_EXPERIMENT_ID || manifest.outputDirectory !== outputDir || (manifest.modelSettings as { maxOutputTokens?: unknown } | undefined)?.maxOutputTokens !== maxOutputTokens || manifest.fixturesHash !== fixtureHash() || manifest.splitHash !== splitHash() || manifest.guardrailsHash !== LIVE_GUARDRAILS_HASH || manifest.templatesHash !== sha256(TEMPLATE_TEXT)) {
 		throw new JournalCorruptionError("development manifest no longer matches the frozen live-pilot contract")
 	}
 	if (sha256(manifest.sourceIdentity) !== sha256(currentSourceIdentity)) throw new JournalCorruptionError("development source identities changed; held-out collection is not admitted")
@@ -1051,18 +1063,19 @@ async function loadOrWriteHeldoutManifest(directory: string, expected: Record<st
 export async function collectLiveHeldout(options: LiveRunnerOptions = {}): Promise<LiveHeldoutSummary> {
 	validateFixtureSplits()
 	const outputDir = path.resolve(options.outputDir ?? ".headlesscode/monitor-pilot-live")
+	const maxOutputTokens = validateMaxOutputTokens(options.maxOutputTokens === undefined ? DEFAULT_MAX_OUTPUT_TOKENS : options.maxOutputTokens)
 	await ensurePrivateDir(outputDir)
 	const lock = new ExclusiveRunnerLock(path.join(outputDir, "runner.lock"))
 	await lock.acquire()
 	try {
-		const development = await requireQualifiedDevelopment(outputDir)
+		const development = await requireQualifiedDevelopment(outputDir, maxOutputTokens)
 		const randomSchedule = deriveCalibrationRandomSchedule(development.calibrationBoundaries, development.predictor)
 		const slots = heldoutSlots()
 		if (slots.length !== 64) throw new JournalCorruptionError(`held-out plan changed: expected 64 runs, got ${slots.length}`)
 		const heldoutDir = path.join(outputDir, "heldout")
 		await ensurePrivateDir(heldoutDir)
 		const expectedManifest = {
-			...await manifestBase(),
+			...await manifestBase(outputDir, maxOutputTokens),
 			createdAt: new Date().toISOString(),
 			kind: "restricted-virtual-task-loop-heldout",
 			developmentManifestHash: development.manifestHash,
@@ -1116,7 +1129,7 @@ export async function collectLiveHeldout(options: LiveRunnerOptions = {}): Promi
 			await fs.chmod(journal.filePath, 0o600)
 			const signal = options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(LIVE_BUDGET.maxWallMs)]) : AbortSignal.timeout(LIVE_BUDGET.maxWallMs)
 			try {
-				const result = await runLiveTrajectory({ experimentId: LIVE_EXPERIMENT_ID, runId, attemptId, epoch, fixture: slot.fixture, seed: slot.seed, arm: slot.arm, client: client!, signal, journal, predictor: development.predictor, randomSchedule })
+				const result = await runLiveTrajectory({ experimentId: LIVE_EXPERIMENT_ID, runId, attemptId, epoch, maxOutputTokens, fixture: slot.fixture, seed: slot.seed, arm: slot.arm, client: client!, signal, journal, predictor: development.predictor, randomSchedule })
 				await journal.append("attempt_completed", LIVE_EXPERIMENT_ID, { slotKey: slot.slotKey, outcome: result.outcome, rows: result.rows }, { runId, attemptId, epoch })
 				await global.append("budget_settled", LIVE_EXPERIMENT_ID, { attemptId, actualTokens: result.actualTokens, actualWallMs: result.actualWallMs }, { runId, attemptId, epoch })
 			} catch (error) {

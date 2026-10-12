@@ -51,4 +51,25 @@ assert.equal(corpusPlan.campaign.maximumCalls, 19_680)
 assert.equal(corpusPlan.totalCalls, 70_880)
 assert.equal(corpusPlan.totalReservedSpendUsd, 93.92)
 assert.equal(corpusPlan.totalRootSpendCeilingUsd, 93.92, "engineering root cap is reported separately from the three campaign roots")
+
+const boundedMutationLimits = {
+	...corpusMutationLimits, maxInputTokensPerCall: 150_000, maxOutputTokensPerCall: 7_000, maxTotalTokens: 6_280_000,
+	maxInputPricePerMillionUsd: 0.1, maxOutputPricePerMillionUsd: 0.2, maxCallSpendUsd: 0.0164, maxJobSpendUsd: 0.66, maxCampaignSpendUsd: 5.28,
+}
+const boundedBenchmarkLimits = {
+	...corpusBenchmarkLimits, maxInputTokensPerCall: 150_000, maxOutputTokensPerCall: 2048, maxTotalTokens: 250_000,
+	maxInputPricePerMillionUsd: 0.1, maxOutputPricePerMillionUsd: 0.2, maxCallSpendUsd: 0.0164, maxJobSpendUsd: 0.035, maxCampaignSpendUsd: 13.44,
+}
+const boundedManifest = {
+	...manifest,
+	tasks: [
+		...Array.from({ length: 16 }, (_, index) => ({ ...manifest.tasks[0]!, id: `bounded-dev-${index}`, seed: index + 1, ceilings: { ...manifest.tasks[0]!.ceilings, maxCalls: 30, maxOutputTokensPerCall: 2048 } })),
+		{ ...manifest.tasks[2]!, id: "confirmation-placeholder", split: "confirmation" as const },
+	],
+} as unknown as BenchmarkManifest
+const boundedPlan = planProofDemonstration({ config: corpusConfig, manifest: boundedManifest, mutationLimits: boundedMutationLimits, benchmarkLimits: boundedBenchmarkLimits })
+assert.equal(boundedPlan.engineering.mutationJobs, 8)
+assert.equal(boundedPlan.engineering.developmentProofCells, 384)
+assert.equal(boundedPlan.engineering.rootSpendCeilingUsd, 18.72, "scoped mutation and benchmark job caps fit the $20 engineering ceiling")
+assert.equal(boundedPlan.engineering.priceDerivedSpendCeilingUsd, 17.207296, "40 mutation calls and 30-call development tasks fit their scoped price ceilings")
 console.log("RSI proof demonstration schedule and ceiling assertions passed")

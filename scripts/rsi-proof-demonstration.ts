@@ -29,6 +29,7 @@ interface Options {
 	operatorCapUsd?: number
 	seeds: string[]
 	mutationTask: string
+	maxTokens?: number
 	openRouterProfile?: RsiOpenRouterProfileId
 	engineeringEvidencePath?: string
 	evaluatorSigningKeyPath?: string
@@ -61,17 +62,28 @@ export function configureProofVisibleEvaluations(config: RsiConfig): RsiConfig {
 	return { ...config, evalCommands: [...PROOF_VISIBLE_EVAL_COMMANDS] }
 }
 
+export function proofConfigFromOptions(options: Pick<Options, "repo" | "seeds" | "mutationTask" | "maxTokens">, baseRef = "HEAD"): RsiConfig {
+	const seed = options.seeds[0]
+	if (!seed) throw new Error("proof configuration requires an explicit engineering seed")
+	const args = ["--repo", options.repo, "--population", "2", "--generations", "3", "--seed", seed, "--base-ref", baseRef, "--max-runtime-ms", String(72 * 60 * 60_000), "--mutation-task", options.mutationTask]
+	if (options.maxTokens !== undefined) args.push("--max-tokens", String(options.maxTokens))
+	const parsed = parseRsiArgs(args)
+	if (!parsed.config) throw new Error(parsed.error ?? "could not construct proof configuration")
+	return configureProofVisibleEvaluations(parsed.config)
+}
+
 function usage(): string {
 	return `Usage:
-  npx tsx scripts/rsi-proof-demonstration.ts estimate --seed <engineering> --campaign-seed <seed> --campaign-seed <seed> --campaign-seed <seed> [--openrouter-profile <admitted-id>] [--repo <path>]
-  npx tsx scripts/rsi-proof-demonstration.ts engineering --seed <engineering> --operator-cap-usd <USD> [--execute --evaluator-signing-key <path> --evaluator-trusted-public-key <path> --evaluator-trusted-key-sha256 <pin>] [--openrouter-profile <admitted-id>] [--repo <path>] [--out <evidence.json>]
-  npx tsx scripts/rsi-proof-demonstration.ts plan --engineering-evidence <path> --operator-cap-usd <USD> --seed <engineering> --campaign-seed <seed> --campaign-seed <seed> --campaign-seed <seed> --evaluator-signing-key <path> --evaluator-trusted-public-key <path> --evaluator-trusted-key-sha256 <pin> [--openrouter-profile <admitted-id>] [--out <path>] [--repo <path>]
+  npx tsx scripts/rsi-proof-demonstration.ts estimate --seed <engineering> --campaign-seed <seed> --campaign-seed <seed> --campaign-seed <seed> [--max-tokens <n>] [--openrouter-profile <admitted-id>] [--repo <path>]
+  npx tsx scripts/rsi-proof-demonstration.ts engineering --seed <engineering> --operator-cap-usd <USD> [--max-tokens <n>] [--execute --evaluator-signing-key <path> --evaluator-trusted-public-key <path> --evaluator-trusted-key-sha256 <pin>] [--openrouter-profile <admitted-id>] [--repo <path>] [--out <evidence.json>]
+  npx tsx scripts/rsi-proof-demonstration.ts plan --engineering-evidence <path> --operator-cap-usd <USD> --seed <engineering> --campaign-seed <seed> --campaign-seed <seed> --campaign-seed <seed> [--max-tokens <n>] --evaluator-signing-key <path> --evaluator-trusted-public-key <path> --evaluator-trusted-key-sha256 <pin> [--openrouter-profile <admitted-id>] [--out <path>] [--repo <path>]
   npx tsx scripts/rsi-proof-demonstration.ts execute --plan <path> --operator-cap-usd <USD> --evaluator-signing-key <path> --evaluator-trusted-public-key <path> --evaluator-trusted-key-sha256 <pin> --execute
   npx tsx scripts/rsi-proof-demonstration.ts verify --plan <path>
   npx tsx scripts/rsi-proof-demonstration.ts analyze --plan <path> --archive <directory> [--out <path>]
 
 Estimate, engineering estimates, plan, and verify perform pricing metadata GETs only; they do not submit model inference.
 Engineering prints a bounded estimate unless --execute is supplied. Estimates do not require evaluator keys. Paid engineering and campaign execution require a protected signing key, independently trusted public key, and matching SHA-256 pin. Only the pin is frozen into the published plan; key paths are supplied again at execution.
+--max-tokens sets the mutation request's positive safe-integer output-token limit. Use it when estimating or creating an engineering/final plan; execution uses the value in the frozen plan.
 Paid execution requires an
 explicit operator cap, broker/PostgreSQL/OpenShell configuration, and a clean checkout. Its
 development-only manifest contains no confirmation cells. Final plan requires passing
@@ -100,6 +112,11 @@ export function parseProofDemonstrationArgs(argv: string[]): Options {
 		else if (arg === "--evaluator-trusted-key-sha256") options.evaluatorTrustedKeySha256 = value
 		else if (arg === "--repo") options.repo = path.resolve(value)
 		else if (arg === "--operator-cap-usd") options.operatorCapUsd = Number(value)
+		else if (arg === "--max-tokens") {
+			const maxTokens = Number(value)
+			if (!Number.isSafeInteger(maxTokens) || maxTokens < 1) throw new Error(`${arg} must be a positive integer`)
+			options.maxTokens = maxTokens
+		}
 		else if (arg === "--openrouter-profile") options.openRouterProfile = openRouterProfileById(value).id
 		else if (arg === "--seed" || arg === "--campaign-seed") options.seeds.push(value)
 		else if (arg === "--mutation-task") options.mutationTask = value
@@ -107,6 +124,7 @@ export function parseProofDemonstrationArgs(argv: string[]): Options {
 		index++
 	}
 	if (options.openRouterProfile && !["estimate", "engineering", "plan"].includes(command)) throw new Error("--openrouter-profile is only valid for estimate, engineering, or plan; verify, execute, and analyze use the frozen plan identity")
+	if (options.maxTokens !== undefined && !["estimate", "engineering", "plan"].includes(command)) throw new Error("--max-tokens is only valid for estimate, engineering, or plan; verify, execute, and analyze use the frozen plan identity")
 	const trustOptions = [options.evaluatorSigningKeyPath, options.evaluatorTrustedPublicKeyPath, options.evaluatorTrustedKeySha256]
 	if (trustOptions.some((value) => value !== undefined) && trustOptions.some((value) => value === undefined)) throw new Error("evaluator integrity requires --evaluator-signing-key, --evaluator-trusted-public-key, and --evaluator-trusted-key-sha256")
 	return options
@@ -408,9 +426,7 @@ export async function buildProofPlanPreview(options: Options, env: NodeJS.Proces
 	const runtime = workerHarnessRuntimeIdentityFromEnvironment(env)
 	try { execFileSync("git", ["cat-file", "-e", `${runtime.harnessCommit}^{commit}`], { cwd: repo, stdio: "ignore" }) }
 	catch { throw new Error("fixed-control runtime harness commit must be present in the root repository") }
-	const parsed = parseRsiArgs(["--repo", repo, "--population", "2", "--generations", "3", "--seed", seeds[0]!, "--base-ref", rootCommit, "--max-runtime-ms", String(72 * 60 * 60_000), "--mutation-task", options.mutationTask])
-	if (!parsed.config) throw new Error(parsed.error ?? "could not construct proof configuration")
-	const proofConfig = configureProofVisibleEvaluations(parsed.config)
+	const proofConfig = proofConfigFromOptions({ ...options, repo, seeds }, rootCommit)
 	const profile = openRouterProfileById(options.openRouterProfile ?? RSI_DEFAULT_OPENROUTER_PROFILE_ID)
 	const baseConfig = withEvaluatorIntegrityPin({
 		...proofConfig,
@@ -428,7 +444,7 @@ export async function buildProofPlanPreview(options: Options, env: NodeJS.Proces
 	const price = await fetchOpenRouterEndpointPrice(profile, modelKey, fetcher)
 	const mutationEnv = openRouterAllocatedEnvironment(env, "mutation")
 	const benchmarkEnv = openRouterAllocatedEnvironment(env, "benchmark")
-	const mutationLimits = openRouterBrokerLimitsFromEnvironment(mutationEnv, "plan-mutation", { maxCalls: config.maxIterations, maxDurationMs: config.commandTimeoutMs })
+	const mutationLimits = openRouterBrokerLimitsFromEnvironment(mutationEnv, "plan-mutation", { maxCalls: config.maxIterations, ...(config.maxTokens ? { maxOutputTokensPerCall: config.maxTokens } : {}), maxDurationMs: config.commandTimeoutMs })
 	const benchmarkLimits = openRouterBrokerLimitsFromEnvironment(benchmarkEnv, "plan-benchmark")
 	if (mutationLimits.maxInputPricePerMillionUsd < price.inputPricePerMillionUsd || mutationLimits.maxOutputPricePerMillionUsd < price.outputPricePerMillionUsd || benchmarkLimits.maxInputPricePerMillionUsd < price.inputPricePerMillionUsd || benchmarkLimits.maxOutputPricePerMillionUsd < price.outputPricePerMillionUsd) throw new Error("configured broker price ceiling is below the live pinned endpoint rate")
 	const plan = planProofDemonstration({ config, manifest: loaded.manifest, mutationLimits, benchmarkLimits })
@@ -460,6 +476,8 @@ export async function runEngineeringArm(config: RsiConfig, campaign: string, arm
 	const plannedRunId = engineeringRunId(campaign, arm)
 	if (existing) {
 		if (existing.runId !== plannedRunId || existing.baseCommit !== rootCommit || existing.workerHarnessSamplingSeed !== seed || existing.model !== config.model || existing.openRouterProfileId !== (expectedProfile.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? undefined : expectedProfile.id) || JSON.stringify(existing.workerHarnessRuntime) !== JSON.stringify(runtime) || existing.proofCampaign?.manifest.phaseMode !== "engineering-only") throw new Error(`engineering replay found a ${arm} run with changed frozen identity`)
+		const frozenConfig = existing.proofCampaign.manifest.settings?.effectiveConfig
+		if (!frozenConfig || typeof frozenConfig !== "object" || Array.isArray(frozenConfig) || (frozenConfig as Record<string, unknown>).maxTokens !== config.maxTokens) throw new Error(`engineering replay found a ${arm} run with a changed frozen output-token limit`)
 		assertEngineeringRunProfile(existing, expectedProfile)
 		if (existing.finishedAt && existing.proofCampaign.state === "finished") {
 			const arms = existing.proofCampaign.ledgerSnapshot?.arms as Array<Record<string, unknown>> | undefined
