@@ -9,7 +9,10 @@ import { MONITOR_FEATURE_ORDER, type FrozenPredictorArtifact } from "../types.js
 import { sha256 } from "../features.js"
 import { DEFAULT_IDENTICAL_CALL_NUDGE_THRESHOLD, identicalCallNudgeMessage } from "../guardrails.js"
 import { PilotJournal } from "../../../scripts/monitor-pilot/journal.js"
-import { collectLiveDevelopment, collectLiveHeldout, deriveCalibrationRandomSchedule, LIVE_DEVELOPMENT_SLOTS, LIVE_GUARDRAILS_HASH, LIVE_GUARDRAILS_MANIFEST, LIVE_MODEL, LIVE_TOOLS } from "../../../scripts/monitor-pilot/live-runner.js"
+import { collectLiveDevelopment, collectLiveHeldout, DEFAULT_MAX_OUTPUT_TOKENS, deriveCalibrationRandomSchedule, LIVE_DEVELOPMENT_SLOTS, LIVE_EXPERIMENT_ID, LIVE_GUARDRAILS_HASH, LIVE_GUARDRAILS_MANIFEST, LIVE_MODEL, LIVE_MODEL_DIGEST, LIVE_TOOLS } from "../../../scripts/monitor-pilot/live-runner.js"
+import { fixtureHash, splitHash } from "../../../scripts/monitor-pilot/fixtures.js"
+import { main as liveCliMain } from "../../../scripts/monitor-pilot/live.js"
+import { TEMPLATE_TEXT } from "../controller.js"
 
 type Reply = { readonly name: string; readonly args?: string; readonly content?: string }
 type MockBillingOverrides = {
@@ -81,6 +84,29 @@ async function testBillingIdentityPrecedesVirtualEffects(): Promise<void> {
 		assert.equal(records.some((record) => record.type === "llm_response_received"), true, "unadmitted identities remain in the private append-only audit")
 		assert.equal(records.some((record) => record.type === "virtual_turn"), false, "unverified billing identity must block all tool dispatch")
 		assert.equal(records.some((record) => record.type === "trajectory_finished"), false)
+		assert.equal(client.requests[0]?.maxTokens, DEFAULT_MAX_OUTPUT_TOKENS)
+		const manifest = JSON.parse(await fs.readFile(path.join(directory, "development", "manifest.json"), "utf8")) as { modelSettings: { maxOutputTokens: number }; outputDirectory: string }
+		assert.equal(manifest.modelSettings.maxOutputTokens, 512, "the frozen default remains 512 tokens")
+		assert.equal(manifest.outputDirectory, path.resolve(directory))
+	} finally { await fs.rm(directory, { recursive: true, force: true }) }
+}
+
+async function testOutputCapValidationAndFrozenResumeConfiguration(): Promise<void> {
+	const directory = await scratch()
+	try {
+		const invalidClient = new MockBillingClient([{ name: "attempt_completion" }])
+		await assert.rejects(() => collectLiveDevelopment({ outputDir: directory, client: invalidClient, maxOutputTokens: 0 }), /max output tokens must be an integer/)
+		assert.equal(invalidClient.requests.length, 0, "an invalid cap fails before any request")
+		assert.equal(await liveCliMain(["collect-development", "--max-output-tokens", "4097"]), 2, "CLI rejects a cap above its configured bound")
+		const configuredClient = new MockBillingClient([{ name: "attempt_completion", args: JSON.stringify({ result: "done" }) }])
+		const configured = await collectLiveDevelopment({ outputDir: directory, client: configuredClient, maxOutputTokens: 2048 })
+		assert.equal(configuredClient.requests[0]?.maxTokens, 2048)
+		const manifest = JSON.parse(await fs.readFile(path.join(directory, "development", "manifest.json"), "utf8")) as { modelSettings: { maxOutputTokens: number }; outputDirectory: string }
+		assert.equal(manifest.modelSettings.maxOutputTokens, 2048)
+		assert.equal(manifest.outputDirectory, path.resolve(directory))
+		const changedClient = new MockBillingClient([{ name: "attempt_completion" }])
+		await assert.rejects(() => collectLiveDevelopment({ outputDir: directory, client: changedClient, maxOutputTokens: 1024 }), /manifest changed; refusing resume/)
+		assert.equal(changedClient.requests.length, 0, "resume rejects a changed cap before inference")
 	} finally { await fs.rm(directory, { recursive: true, force: true }) }
 }
 
@@ -285,21 +311,21 @@ async function testCompletionOverrunIsJournaledBeforeAnyToolDispatch(): Promise<
 	const directory = await scratch()
 	try {
 		const client = new MockBillingClient([{ name: "attempt_completion", args: JSON.stringify({ result: "must not dispatch" }) }], LIVE_MODEL, "Meta", {
-			responseUsage: { promptTokens: 100, completionTokens: 519, totalTokens: 619, cachedTokens: 20 },
-			metadata: { totalCostUsd: 0.0000994, tokensPrompt: 100, tokensCompletion: 519, nativeTokensPrompt: 100, nativeTokensCompletion: 519, nativeTokensCached: 20 },
+			responseUsage: { promptTokens: 100, completionTokens: 2049, totalTokens: 2149, cachedTokens: 20 },
+			metadata: { totalCostUsd: 0.0000994, tokensPrompt: 100, tokensCompletion: 2049, nativeTokensPrompt: 100, nativeTokensCompletion: 2049, nativeTokensCached: 20 },
 		})
-		const summary = await collectLiveDevelopment({ outputDir: directory, client })
+		const summary = await collectLiveDevelopment({ outputDir: directory, client, maxOutputTokens: 2048 })
 		assert.equal(summary.abortedAttempts, 1)
 		assert.equal(summary.completedRuns, 0)
 		assert.equal(summary.unstartedSlots, LIVE_DEVELOPMENT_SLOTS.length - 1)
 		assert.equal(client.requests.length, 1)
-		assert.equal(client.requests[0]?.maxTokens, 512)
+		assert.equal(client.requests[0]?.maxTokens, 2048)
 		assert.equal(summary.billing.responsesReceived, 1)
 		assert.equal(summary.billing.generationRecords, 1)
 		assert.equal(summary.billing.acceptedBillingRecords, 0)
 		assert.equal(summary.billing.unacceptedBillingRecords, 1)
 		assert.equal(summary.billing.unbilledResponses, 0)
-		assert.equal(summary.billing.completionTokens, 519)
+		assert.equal(summary.billing.completionTokens, 2049)
 		assert.equal(summary.billing.totalBilledCostUsd, 0.0000994)
 		const journal = new PilotJournal(summary.journalPath)
 		await journal.open()
@@ -326,6 +352,45 @@ async function testHeldoutCannotStartWithoutQualifiedDevelopment(): Promise<void
 	} finally { await fs.rm(directory, { recursive: true, force: true }) }
 }
 
+async function testHeldoutRejectsDifferentFrozenOutputCapBeforeInference(): Promise<void> {
+	const directory = await scratch()
+	try {
+		const developmentDir = path.join(directory, "development")
+		await fs.mkdir(developmentDir, { mode: 0o700 })
+		const values = Object.fromEntries(MONITOR_FEATURE_ORDER.map((name) => [name, 0])) as FrozenPredictorArtifact["coefficients"]
+		const predictorBase = {
+			schemaVersion: 1 as const,
+			featureOrder: MONITOR_FEATURE_ORDER,
+			coefficients: values,
+			intercept: 0,
+			standardization: { mean: values, scale: Object.fromEntries(MONITOR_FEATURE_ORDER.map((name) => [name, 1])) as FrozenPredictorArtifact["coefficients"] },
+			calibration: { intercept: 0, slope: 1 },
+			threshold: 0.5,
+			l2: 1 as const,
+			modelDigest: LIVE_MODEL_DIGEST,
+			templatesHash: sha256(TEMPLATE_TEXT),
+		}
+		const predictor: FrozenPredictorArtifact = { ...predictorBase, artifactHash: sha256(predictorBase) }
+		const manifest = {
+			experimentId: LIVE_EXPERIMENT_ID,
+			outputDirectory: path.resolve(directory),
+			modelSettings: { maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS },
+			fixturesHash: fixtureHash(),
+			splitHash: splitHash(),
+			guardrailsHash: LIVE_GUARDRAILS_HASH,
+			templatesHash: sha256(TEMPLATE_TEXT),
+			sourceIdentity: {},
+		}
+		await fs.writeFile(path.join(developmentDir, "development-summary.json"), JSON.stringify({ predictorStatus: "QUALIFIED", predictor, completedRuns: LIVE_DEVELOPMENT_SLOTS.length, manifestHash: "synthetic" }))
+		await fs.writeFile(path.join(developmentDir, "predictor.json"), JSON.stringify(predictor))
+		await fs.writeFile(path.join(developmentDir, "manifest.json"), JSON.stringify(manifest))
+		await fs.writeFile(path.join(developmentDir, "journal.jsonl"), "")
+		const client = new MockBillingClient([{ name: "attempt_completion" }])
+		await assert.rejects(() => collectLiveHeldout({ outputDir: directory, client, maxOutputTokens: 2048 }), /development manifest no longer matches/)
+		assert.equal(client.requests.length, 0, "held-out collection rejects a changed frozen cap before any model request")
+	} finally { await fs.rm(directory, { recursive: true, force: true }) }
+}
+
 async function testStorageRootSymlinkIsRejectedBeforeInference(): Promise<void> {
 	const directory = await scratch()
 	try {
@@ -346,6 +411,7 @@ assert.match(identicalCallNudgeMessage("read_file", 2), /IDENTICAL arguments/)
 assert.equal(LIVE_DEVELOPMENT_SLOTS.length, 32)
 
 await testBillingIdentityPrecedesVirtualEffects()
+await testOutputCapValidationAndFrozenResumeConfiguration()
 await testForbiddenToolHasZeroEffectsAndIsRecorded()
 await testShortLabelWindowsAreMasked()
 await testDevelopmentScheduleUsesSyntheticBillingOnly()
@@ -356,6 +422,7 @@ await testResponseWithoutFiniteGenerationCostIsUnbilled()
 await testUncertainRequestIsNotAutomaticallyReplayed()
 await testCompletionOverrunIsJournaledBeforeAnyToolDispatch()
 await testHeldoutCannotStartWithoutQualifiedDevelopment()
+await testHeldoutRejectsDifferentFrozenOutputCapBeforeInference()
 await testStorageRootSymlinkIsRejectedBeforeInference()
 console.log("live monitor pilot tests passed (synthetic billing; no network inference)")
 
