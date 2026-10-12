@@ -217,6 +217,12 @@ Subcommands:
   headlesscode work-loop --config <json> --driver <module>
               Run project tasks with evidence-triggered, independently verified
               harness repairs using a trusted host driver.
+  headlesscode rsi-status --campaign <id> [--queue <name>]
+              Read bounded RSI worker, job, lease, progress, cancellation and
+              campaign accounting metadata. Does not dispatch work.
+  headlesscode rsi-monitor --campaign <id> [--state-dir <absolute-path>]
+              Poll RSI operational status into a private heartbeat and bounded
+              history. It does not restart workers or resume a campaign.
   headlesscode improve --repo <path> [--model <id>] [--population <n>] [--dry-run]
               Run a bounded recursive self-improvement generation. Candidates
               use isolated git worktrees; evaluator/scoring paths are protected.
@@ -828,7 +834,7 @@ export async function main(argv: string[] = process.argv.slice(2), hooks?: CliRu
 	if (argv[0] === "openshell-session") {
 		return openShellSessionMain(argv.slice(1))
 	}
-	if (["rsi-worker", "rsi-benchmark", "rsi-train-model", "improve", "work-loop"].includes(argv[0] ?? "")) {
+	if (["rsi-worker", "rsi-benchmark", "rsi-train-model", "rsi-status", "rsi-monitor", "improve", "work-loop"].includes(argv[0] ?? "")) {
 		// Keep the protected RSI implementation outside candidate snapshots while
 		// preserving one typed, host-checked CLI boundary. A variable module URL
 		// prevents TypeScript from resolving the deliberately withheld source.
