@@ -476,6 +476,8 @@ export async function runEngineeringArm(config: RsiConfig, campaign: string, arm
 	const plannedRunId = engineeringRunId(campaign, arm)
 	if (existing) {
 		if (existing.runId !== plannedRunId || existing.baseCommit !== rootCommit || existing.workerHarnessSamplingSeed !== seed || existing.model !== config.model || existing.openRouterProfileId !== (expectedProfile.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? undefined : expectedProfile.id) || JSON.stringify(existing.workerHarnessRuntime) !== JSON.stringify(runtime) || existing.proofCampaign?.manifest.phaseMode !== "engineering-only") throw new Error(`engineering replay found a ${arm} run with changed frozen identity`)
+		const frozenConfig = existing.proofCampaign.manifest.settings?.effectiveConfig
+		if (!frozenConfig || typeof frozenConfig !== "object" || Array.isArray(frozenConfig) || (frozenConfig as Record<string, unknown>).maxTokens !== config.maxTokens) throw new Error(`engineering replay found a ${arm} run with a changed frozen output-token limit`)
 		assertEngineeringRunProfile(existing, expectedProfile)
 		if (existing.finishedAt && existing.proofCampaign.state === "finished") {
 			const arms = existing.proofCampaign.ledgerSnapshot?.arms as Array<Record<string, unknown>> | undefined
