@@ -489,6 +489,50 @@ export async function runEngineeringArm(config: RsiConfig, campaign: string, arm
 	return runner({ ...config, dryRun: false, workerHarnessRunId: plannedRunId, ...(existing ? { resumeRunId: existing.runId } : {}), workerHarnessMode: arm, workerHarnessPhase: "development", workerHarnessPairId: campaign, workerHarnessEngineeringOnly: true, workerHarnessRuntime: runtime })
 }
 
+export async function runEngineeringArms(config: RsiConfig, campaign: string, rootCommit: string, seed: string, runtime: NonNullable<RsiConfig["workerHarnessRuntime"]>, runner: typeof runRsi = runRsi): Promise<RsiRunRecord[]> {
+	const runs: RsiRunRecord[] = []
+	for (const arm of ["fixed-control", "self-hosted"] as const) {
+		const run = await runEngineeringArm(config, campaign, arm, rootCommit, seed, runtime, runner)
+		runs.push(run)
+		if (run.proofCampaign?.state === "incomplete") break
+	}
+	return runs
+}
+
+export async function writeEngineeringStopReport(options: Options, run: RsiRunRecord): Promise<string> {
+	if (run.proofCampaign?.state !== "incomplete" || !run.proofCampaign.ledgerSnapshot) throw new Error("engineering stop report requires a durable incomplete campaign checkpoint")
+	const armId = run.proofCampaign.armId
+	const events = (run.proofCampaign.ledgerSnapshot.events as Array<Record<string, unknown>> | undefined) ?? []
+	const failureEvents = events.filter((event) => event.arm_id === armId && event.event_type === "candidate-incomplete")
+	if (failureEvents.length === 0) throw new Error("engineering stop report has no durable candidate-incomplete event")
+	const body = {
+		schemaVersion: 1 as const,
+		outcome: "incomplete" as const,
+		campaignId: run.proofCampaign.campaignId,
+		manifestSha256: run.proofCampaign.manifestSha256,
+		rootCommit: run.baseCommit,
+		runId: run.runId,
+		armId,
+		reason: run.proofCampaign.incompleteReason ?? "candidate proof attempt remains unresolved",
+		runReportPaths: run.reports,
+		candidateFailureEvents: failureEvents,
+		ledgerSnapshot: run.proofCampaign.ledgerSnapshot,
+		ledgerSnapshotSha256: canonicalHash(run.proofCampaign.ledgerSnapshot),
+		qualifiedEvidencePath: options.output,
+	}
+	const stopReport = { ...body, digestSha256: canonicalHash(body) }
+	const stopPath = await assertSupervisorOnlyPlanPath(options.repo, `${options.output}.stop.json`)
+	await fs.mkdir(path.dirname(stopPath), { recursive: true, mode: 0o700 })
+	try {
+		const existing = JSON.parse((await readProtectedProofInput(options.repo, stopPath)).toString("utf8")) as { digestSha256?: string }
+		if (existing.digestSha256 !== stopReport.digestSha256 || canonicalHash(Object.fromEntries(Object.entries(existing).filter(([key]) => key !== "digestSha256"))) !== stopReport.digestSha256) throw new Error("existing engineering stop report differs from the incomplete campaign checkpoint")
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+		await fs.writeFile(stopPath, `${JSON.stringify(stopReport, null, 2)}\n`, { mode: 0o600, flag: "wx" })
+	}
+	return stopPath
+}
+
 export async function executeEngineeringPair(options: Options, env: NodeJS.ProcessEnv = process.env, runner: typeof runRsi = runRsi): Promise<EngineeringEvidenceRecord | undefined> {
 	if (options.command !== "engineering") throw new Error("engineering command is required")
 	if (options.execute) requireEvaluatorIntegrityOptions(options)
@@ -509,9 +553,17 @@ export async function executeEngineeringPair(options: Options, env: NodeJS.Proce
 	const config = await validateRuntimeEvaluatorIntegrity(preview.execution.configs[0], options)
 	assertProofWorkerProfile(config, openRouterProfileById(preview.model.profileId ?? RSI_DEFAULT_OPENROUTER_PROFILE_ID), process.env)
 	const campaign = campaignId(preview.seeds.engineering)
-	const runs: RsiRunRecord[] = []
-	for (const arm of ["fixed-control", "self-hosted"] as const) {
-		runs.push(await runEngineeringArm(config, campaign, arm, preview.rootCommit, preview.seeds.engineering, preview.runtime, runner))
+	const priorArchive = await readArchive(config.archiveDir)
+	const priorIncomplete = [...priorArchive.runs, ...priorArchive.activeRuns].find((run) => run.workerHarnessPairId === campaign && run.proofCampaign?.state === "incomplete")
+	if (priorIncomplete) {
+		const stopPath = await writeEngineeringStopReport(options, priorIncomplete)
+		throw new Error(`engineering campaign already has an incomplete terminal run ${priorIncomplete.runId}; stop report: ${stopPath}; a new run identity is required`)
+	}
+	const runs = await runEngineeringArms(config, campaign, preview.rootCommit, preview.seeds.engineering, preview.runtime, runner)
+	const incompleteRun = runs.find((run) => run.proofCampaign?.state === "incomplete")
+	if (incompleteRun) {
+		const stopPath = await writeEngineeringStopReport(options, incompleteRun)
+		throw new Error(`engineering stopped with unresolved proof accounting in ${incompleteRun.workerHarnessMode ?? "unknown"}; stop report: ${stopPath}; no paired arm or qualified engineering evidence was written`)
 	}
 	const archive = await readArchive(config.archiveDir)
 	const savedRuns = runs.map((run) => archive.runs.concat(archive.activeRuns).filter((entry) => entry.runId === run.runId))

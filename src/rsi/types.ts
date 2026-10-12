@@ -499,7 +499,8 @@ export interface RsiRunRecord {
 		epoch: number
 		sequence?: number
 		ledgerSnapshot?: Record<string, unknown>
-		state: "running" | "evaluated" | "selected" | "rejected" | "finished"
+		incompleteReason?: string
+		state: "running" | "evaluated" | "selected" | "rejected" | "incomplete" | "finished"
 	}
 	adversarialReviews?: AdversarialReviewRecord[]
 	candidates: CandidateRecord[]

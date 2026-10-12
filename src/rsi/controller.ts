@@ -1814,6 +1814,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 			const snapshot = await campaignStore.snapshot(campaignLease.campaignId)
 			const attempts = snapshot.attempts as Array<Record<string, unknown>>
 			const decisions = snapshot.decisions as Array<Record<string, unknown>>
+			let incompleteReason: string | undefined
 			for (const candidate of candidates.filter((entry) => entry.status === "rejected" || entry.status === "failed")) {
 				const slotId = proofCandidateSlot(candidate.generation, candidates.indexOf(candidate))
 				if (decisions.some((decision) => decision.arm_id === campaignLease!.armId && decision.candidate_id === slotId)) continue
@@ -1851,7 +1852,30 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 						childCommit, parentCommit: candidate.parentCommit ?? candidate.baseCommit,
 						proof: { failure: candidate.failure ?? "candidate hard gate rejected before task dispatch", status: candidate.status, attemptKeys: keys }, attemptKeys: keys,
 					})
+				} else if (!allSettled && scheduled.length > 0) {
+					const parentCommit = candidate.parentCommit ?? candidate.baseCommit
+					const parentCandidate = candidate.parent ? run.candidates.find((entry) => entry.id === candidate.parent) : undefined
+					if (candidate.parent && candidate.parent !== "baseline" && !parentCandidate) throw new Error(`candidate ${candidate.id} has no durable parent record for proof lineage`)
+					const campaignParentId = parentCandidate
+						? proofCandidateSlot(parentCandidate.generation, run.candidates.filter((entry) => entry.generation === parentCandidate.generation).indexOf(parentCandidate))
+						: "baseline"
+					await campaignStore.recordIncompleteCandidate(campaignLease, {
+						generation: candidate.generation, candidateId: slotId, parentId: campaignParentId, parentCommit,
+						reason: candidate.failure ?? "candidate has an unresolved scheduled proof attempt",
+					})
+					incompleteReason ??= `${slotId} has an unresolved scheduled campaign attempt; generation selection and arm finish were withheld`
 				}
+			}
+			if (incompleteReason) {
+				const ledgerSnapshot = await campaignStore.snapshot(campaignLease.campaignId)
+				run.proofCampaign = { ...run.proofCampaign!, state: "incomplete", incompleteReason, ledgerSnapshot }
+				run.finishedAt = now()
+				const reportPath = `${config.archiveDir}/${run.runId}.md`
+				await fs.mkdir(config.archiveDir, { recursive: true })
+				await fs.writeFile(reportPath, formatRunReport(run, config), "utf8")
+				run.reports = [...new Set([...run.reports, reportPath])]
+				await appendRun(config.archiveDir, run)
+				return run
 			}
 		}
 

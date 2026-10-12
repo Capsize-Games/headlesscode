@@ -19,6 +19,61 @@ import type { CandidateRecord, RsiConfig, RsiRunRecord } from "../types.js"
 const databaseUrl = process.env.HEADLESSCODE_RSI_TEST_DATABASE_URL
 const attemptKind = "development-proof" as const
 
+test("incomplete candidate event records the exact frozen cells without evaluating or settling the candidate", async () => {
+	const candidateCells: ProofCampaignManifest["schedule"] = [
+		{ armId: "fixed", generation: 1, candidateId: "candidate-a", taskId: "mutation", seed: "seed-0", attemptKind: "mutation" },
+		{ armId: "fixed", generation: 1, candidateId: "candidate-a:child", taskId: "task-a", seed: "seed-0", attemptKind: "development-proof" },
+	]
+	const frozen = manifest("incomplete-event-test", [
+		{ armId: "fixed", generation: 0, candidateId: "parent-a", taskId: "mutation", seed: "seed-0", attemptKind: "mutation" },
+		...candidateCells,
+	])
+	const lease = { campaignId: frozen.campaignId, armId: "fixed", runId: "run-fixed", epoch: 3, coordinatorId: "controller", token: "token", manifestSha256: "d".repeat(64), deadlineAt: new Date(Date.now() + 60_000).toISOString(), phase: "development" } as const
+	const leaseTokenHash = createHash("sha256").update(lease.token).digest("hex")
+	const durableEvents: Array<{ payload: unknown }> = []
+	const queries: Array<{ sql: string; parameters?: unknown[] }> = []
+	let sequence = 0
+	const client = {
+		query: async (sql: string, parameters?: unknown[]) => {
+			queries.push({ sql, parameters })
+			if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [], rowCount: 0 }
+			if (sql.includes("SELECT campaign.*,arm.epoch")) return { rows: [{ state: "running", arm_epoch: 3, arm_phase: "development", run_id: "run-fixed", lease_token_sha256: leaseTokenHash, manifest_sha256: lease.manifestSha256, arm_lease_valid: true, deadline_valid: true }], rowCount: 1 }
+			if (sql.startsWith("SELECT manifest FROM headlesscode_rsi_proof_campaigns")) return { rows: [{ manifest: frozen }], rowCount: 1 }
+			if (sql.includes("SELECT 1 FROM headlesscode_rsi_proof_campaign_decisions AS parent")) return { rows: [{ one: 1 }], rowCount: 1 }
+			if (sql.includes("FROM headlesscode_rsi_proof_campaign_attempts WHERE campaign_id=$1 AND arm_id=$2 AND generation=$3")) {
+				const taskId = parameters?.[4]
+				const row = taskId === "mutation"
+					? { attempt_key: "mutation-uncertain", status: "uncertain", reserved_calls: 1, reserved_tokens: 700, reserved_spend_microusd: 550_000, actual_calls: null, actual_tokens: null, actual_spend_microusd: null, error: "dispatch result not reconciled" }
+					: { attempt_key: "child-skipped", status: "skipped-after-hard-gate", reserved_calls: 0, reserved_tokens: 0, reserved_spend_microusd: 0, actual_calls: 0, actual_tokens: 0, actual_spend_microusd: 0, error: null }
+				return { rows: [row], rowCount: 1 }
+			}
+			if (sql.includes("SELECT payload FROM headlesscode_rsi_proof_campaign_events WHERE campaign_id=$1 AND arm_id=$2 AND event_type='candidate-incomplete'")) return { rows: durableEvents, rowCount: durableEvents.length }
+			if (sql.startsWith("UPDATE headlesscode_rsi_proof_campaigns SET sequence=sequence+1")) return { rows: [{ sequence: ++sequence }], rowCount: 1 }
+			if (sql.startsWith("INSERT INTO headlesscode_rsi_proof_campaign_events")) {
+				durableEvents.push({ payload: JSON.parse(String(parameters?.[5])) })
+				return { rows: [], rowCount: 1 }
+			}
+			throw new Error(`unexpected SQL in synthetic campaign pool: ${sql}`)
+		},
+		release: () => undefined,
+	}
+	const pool = { connect: async () => client } as unknown as Pool
+	const campaign = new PostgresProofCampaign(pool)
+	const failure = { generation: 1, candidateId: "candidate-a", parentId: "parent-a", parentCommit: "b".repeat(40), reason: "candidate mutation ended with unreconciled accounting" }
+	await campaign.recordIncompleteCandidate(lease, failure)
+	await campaign.recordIncompleteCandidate(lease, failure)
+	assert.equal(durableEvents.length, 1, "same incomplete checkpoint is idempotent")
+	const payload = durableEvents[0]!.payload as { outcome: string; childCommit?: string; parentId: string; parentCommit: string; cells: Array<Record<string, unknown>> }
+	assert.equal(payload.outcome, "incomplete")
+	assert.equal(payload.parentId, "parent-a")
+	assert.equal(payload.parentCommit, "b".repeat(40))
+	assert.equal(Object.hasOwn(payload, "childCommit"), false, "failure bookkeeping never invents a child commit")
+	assert.deepEqual(payload.cells.map((cell) => [cell.taskId, cell.status]), [["mutation", "uncertain"], ["task-a", "skipped-after-hard-gate"]])
+	assert.equal(payload.cells[0]?.reservedTokens, 700)
+	assert.equal(payload.cells[0]?.actualTokens, null, "unknown actual use stays unknown")
+	assert.equal(queries.some(({ sql }) => /SET state='evaluated'/.test(sql) || sql.includes("INSERT INTO headlesscode_rsi_proof_campaign_decisions")), false, "incomplete event never transitions the arm or creates an evaluated decision")
+})
+
 function manifest(campaignId: string, schedule: ProofCampaignManifest["schedule"]): ProofCampaignManifest {
 	return {
 		schemaVersion: 1, campaignId, rootCommit: "a".repeat(40), benchmarkDigests: { manifest: "d".repeat(64), development: "b".repeat(64), confirmation: "c".repeat(64) },
