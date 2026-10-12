@@ -54,6 +54,7 @@ class FakeFleetQueue {
 	readonly failRegressionForCandidates: boolean
 	readonly staleCurriculumReplayKey: boolean
 	readonly failAdversarial: boolean
+	workerResourceClasses = new Set(["CPU", "LOCAL_GPU", "REMOTE_API"])
 	staleFastPath?: "baseline" | "mutation" | "evaluation"
 	adversarialEvaluationJobCount = 0
 	proofCampaign?: PostgresProofCampaign
@@ -74,6 +75,10 @@ class FakeFleetQueue {
 
 	async migrate(): Promise<void> {}
 	async activeWorkerCount(): Promise<number> { return 2 }
+	async assertResourceClassCoverage(required: readonly string[]): Promise<void> {
+		const missing = required.filter((resourceClass) => !this.workerResourceClasses.has(resourceClass))
+		if (missing.length) throw new Error(`RSI fleet admission requires live worker capacity for ${missing.join(", ")}`)
+	}
 	async close(): Promise<void> { this.closeCount += 1 }
 	setProofCampaign(campaign: PostgresProofCampaign): void {
 		this.proofCampaign = campaign
@@ -318,6 +323,23 @@ test("fleet controller queues baseline and all candidate evaluations before wait
 		assert.equal(queue.evaluationJobCount, 2)
 		assert.equal(queue.firstCandidateEvaluationObserved, true)
 		assert.equal(queue.closeCount, 1)
+	} finally {
+		await fs.rm(root, { recursive: true, force: true })
+	}
+})
+
+test("fleet admission rejects a cloud-only worker before baseline work or campaign admission", async () => {
+	const { root, config } = await setup()
+	const queue = new FakeFleetQueue(2)
+	queue.workerResourceClasses = new Set(["REMOTE_API"])
+	try {
+		await assert.rejects(
+			runRsi({ ...config, roles: { worker: { provider: "openrouter", model: "meta/muse-spark-1.3-contributor", openRouterProfile: "muse-spark-contributor" } } }, { log: () => undefined }, queue as unknown as PostgresRsiJobQueue),
+			/live worker capacity for CPU/,
+		)
+		assert.equal(queue.artifacts.size, 0, "missing evaluator capacity is detected before artifacts or baseline jobs are created")
+		assert.equal(queue.evaluationJobCount, 0)
+		assert.equal(queue.mutationJobCount, 0, "no inference mutation is admitted without all required worker classes")
 	} finally {
 		await fs.rm(root, { recursive: true, force: true })
 	}
