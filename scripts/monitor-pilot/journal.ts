@@ -20,6 +20,60 @@ export interface JournalRecord {
 export class JournalCorruptionError extends Error {}
 export class RunnerLockError extends Error {}
 
+// Hash only the JSON shape that survives a journal write/read round trip.
+function persistedJsonValue(value: unknown, ancestors = new Set<object>()): unknown {
+	if (value === null || typeof value === "string" || typeof value === "boolean") return value
+	if (typeof value === "number") {
+		if (!Number.isFinite(value)) throw new JournalCorruptionError("journal payload contains a non-finite number")
+		return value
+	}
+	if (typeof value === "undefined") return null
+	if (typeof value !== "object") throw new JournalCorruptionError("journal payload contains an unsupported JSON value")
+	if (ancestors.has(value)) throw new JournalCorruptionError("journal payload contains a circular reference")
+	ancestors.add(value)
+	try {
+		if (Array.isArray(value)) {
+			if (Object.getPrototypeOf(value) !== Array.prototype || Object.getOwnPropertySymbols(value).length > 0) {
+				throw new JournalCorruptionError("journal payload contains an unsupported JSON value")
+			}
+			const keys = Object.keys(value)
+			if (keys.some((key) => !/^(0|[1-9]\d*)$/.test(key) || Number(key) >= value.length)) {
+				throw new JournalCorruptionError("journal payload contains an unsupported JSON value")
+			}
+			const items: unknown[] = []
+			for (let index = 0; index < value.length; index++) {
+				const descriptor = Object.getOwnPropertyDescriptor(value, String(index))
+				if (!descriptor) {
+					items.push(null)
+					continue
+				}
+				if (!("value" in descriptor)) throw new JournalCorruptionError("journal payload contains an accessor")
+				items.push(persistedJsonValue(descriptor.value, ancestors))
+			}
+			return items
+		}
+		const prototype = Object.getPrototypeOf(value)
+		if ((prototype !== Object.prototype && prototype !== null) || Object.getOwnPropertySymbols(value).length > 0) {
+			throw new JournalCorruptionError("journal payload contains an unsupported JSON value")
+		}
+		const result: Record<string, unknown> = Object.create(null) as Record<string, unknown>
+		for (const key of Object.keys(value)) {
+			const descriptor = Object.getOwnPropertyDescriptor(value, key)
+			if (!descriptor || !("value" in descriptor)) throw new JournalCorruptionError("journal payload contains an accessor")
+			if (descriptor.value === undefined) continue
+			Object.defineProperty(result, key, {
+				value: persistedJsonValue(descriptor.value, ancestors),
+				enumerable: true,
+				configurable: true,
+				writable: true,
+			})
+		}
+		return result
+	} finally {
+		ancestors.delete(value)
+	}
+}
+
 export class ExclusiveRunnerLock {
 	private handle: fs.FileHandle | undefined
 	constructor(readonly lockPath: string) {}
@@ -50,6 +104,7 @@ export class PilotJournal {
 	private lastHash = "GENESIS"
 	private records: JournalRecord[] = []
 	private readonly latestEpochByRun = new Map<string, number>()
+	private appendOutcomeUncertain = false
 
 	constructor(readonly filePath: string) {}
 
@@ -77,12 +132,15 @@ export class PilotJournal {
 	}
 
 	async append(type: string, experimentId: string, payload: Record<string, unknown>, ids: Partial<Pick<JournalRecord, "runId" | "attemptId" | "epoch">> = {}): Promise<JournalRecord> {
+		if (this.appendOutcomeUncertain) {
+			throw new JournalCorruptionError("journal append outcome is uncertain; reopen the journal before appending")
+		}
 		if (ids.runId !== undefined && ids.epoch !== undefined) {
 			const latestEpoch = this.latestEpochByRun.get(ids.runId)
 			if (latestEpoch !== undefined && ids.epoch < latestEpoch) throw new JournalCorruptionError(`stale attempt epoch for run ${ids.runId}`)
 		}
 		const sequence = this.lastSequence + 1
-		const withoutHash = {
+		const withoutHash = persistedJsonValue({
 			schemaVersion: 1 as const,
 			sequence,
 			type,
@@ -90,14 +148,22 @@ export class PilotJournal {
 			...ids,
 			payload,
 			previousHash: this.lastHash,
-		}
+		}) as Omit<JournalRecord, "recordHash">
 		const record: JournalRecord = { ...withoutHash, recordHash: createHash("sha256").update(stableJson(withoutHash)).digest("hex") }
 		const handle = await fs.open(this.filePath, "a")
 		try {
 			await handle.writeFile(`${JSON.stringify(record)}\n`)
 			await handle.sync()
-		} finally {
+		} catch (error) {
+			this.appendOutcomeUncertain = true
+			await handle.close().catch(() => undefined)
+			throw error
+		}
+		try {
 			await handle.close()
+		} catch (error) {
+			this.appendOutcomeUncertain = true
+			throw error
 		}
 		this.records.push(record)
 		this.lastSequence = sequence
