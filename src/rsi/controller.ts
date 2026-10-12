@@ -32,7 +32,7 @@ import {
 	resolveBaseCommit,
 } from "./workspace.js"
 import { loadBenchmark } from "./benchmark/runner.js"
-import { openRouterAllocatedEnvironment, openRouterBrokerLimitsFromEnvironment, openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID } from "./inference-broker.js"
+import { openRouterAllocatedEnvironment, openRouterBrokerLimitsFromEnvironment, openRouterCampaignBudgetAllocation, openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID } from "./inference-broker.js"
 import type { OpenRouterDenialSummary, OpenRouterEndpointPriceSnapshot } from "./inference-broker.js"
 import { candidateProofDecision, compareDevelopmentAttempts, developmentCells, freezeDevelopmentProofProtocol } from "./development-proof.js"
 import type { DevelopmentTaskCell } from "./development-proof.js"
@@ -239,6 +239,43 @@ export function proofCampaignTaskWallBoundMs(config: RsiConfig, plannedGeneratio
 	return bound
 }
 
+export interface ProofCampaignSpendReservationMicros {
+	mutation: number
+	benchmark: number
+	total: number
+}
+
+export function proofCampaignSpendReservationMicros(args: {
+	mutationJobs: number
+	mutationMaxJobSpendUsd: number
+	mutationAllocationUsd: number
+	benchmarkJobs: number
+	benchmarkMaxJobSpendUsd: number
+	benchmarkAllocationUsd: number
+	totalAllocationUsd: number
+	benchmarkShortfallMessage: string
+}): ProofCampaignSpendReservationMicros {
+	const floorMicros = (usd: number): number => {
+		const micros = Math.floor(usd * 1_000_000)
+		if (!Number.isSafeInteger(micros) || micros < 0) throw new Error("proof campaign spend allocation exceeds safe microUSD accounting")
+		return micros
+	}
+	const reservationMicros = (jobs: number, perJobUsd: number): number => {
+		const perJobMicros = Math.ceil(perJobUsd * 1_000_000)
+		const totalMicros = jobs * perJobMicros
+		if (!Number.isSafeInteger(jobs) || jobs < 0 || !Number.isSafeInteger(perJobMicros) || perJobMicros < 0 || !Number.isSafeInteger(totalMicros)) throw new Error("proof campaign job reservations exceed safe microUSD accounting")
+		return totalMicros
+	}
+	const mutation = reservationMicros(args.mutationJobs, args.mutationMaxJobSpendUsd)
+	const benchmark = reservationMicros(args.benchmarkJobs, args.benchmarkMaxJobSpendUsd)
+	if (floorMicros(args.mutationAllocationUsd) < mutation) throw new Error("mutation broker campaign allocation is below the sum of frozen mutation job reservations")
+	if (floorMicros(args.benchmarkAllocationUsd) < benchmark) throw new Error(args.benchmarkShortfallMessage)
+	const total = mutation + benchmark
+	if (!Number.isSafeInteger(total)) throw new Error("proof campaign job reservations exceed safe microUSD accounting")
+	if (floorMicros(args.totalAllocationUsd) < total) throw new Error("proof campaign total allocation is below the sum of frozen job reservations")
+	return { mutation, benchmark, total }
+}
+
 export function createProofCampaignManifest(args: {
 	config: RsiConfig
 	campaignId: string
@@ -305,18 +342,16 @@ export function createProofCampaignManifest(args: {
 	const mutationTokens = Math.min(mutationLimits.maxTotalTokens, mutationLimits.maxCalls * (mutationLimits.maxInputTokensPerCall + mutationLimits.maxOutputTokensPerCall))
 	const rootTokens = 2 * candidateCounts.reduce((sum, count) => sum + count * (mutationTokens + 3 * developmentTokensPerProofRole), 0) + (engineeringOnly ? 0 : 4 * confirmationTokensPerHarness)
 	if (!Number.isSafeInteger(rootCalls) || !Number.isSafeInteger(rootTokens)) throw new Error("proof campaign root call or token ceiling exceeds safe integer accounting")
-	const spendAllocation = Number(process.env.HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD)
-	if (!Number.isFinite(spendAllocation) || spendAllocation <= 0) throw new Error("HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD is required for a bounded proof campaign")
-	const totalBudgetUsd = Number(process.env.HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD) + Number(process.env.HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD)
-	if (!Number.isFinite(totalBudgetUsd) || totalBudgetUsd <= 0 || totalBudgetUsd > spendAllocation) throw new Error("proof campaign mutation and benchmark allocations must fit the operator spend ceiling")
+	const campaignBudget = openRouterCampaignBudgetAllocation(process.env)
 	const slotsPerArm = candidateCounts.reduce((sum, count) => sum + count, 0)
-	const mutationReservationsUsd = 2 * slotsPerArm * mutationLimits.maxJobSpendUsd
-	const developmentReservationsUsd = 2 * slotsPerArm * 3 * benchmarkTasks.length * benchmarkLimits.maxJobSpendUsd
-	const confirmationReservationsUsd = engineeringOnly ? 0 : 4 * confirmationTasks.length * confirmationLimits.maxJobSpendUsd
-	const requiredBenchmarkUsd = developmentReservationsUsd + confirmationReservationsUsd
-	if (openRouterBrokerLimitsFromEnvironment(openRouterAllocatedEnvironment(process.env, "mutation"), mutationCampaignId).maxCampaignSpendUsd < mutationReservationsUsd) throw new Error("mutation broker campaign allocation is below the sum of frozen mutation job reservations")
-	if (benchmarkLimits.maxCampaignSpendUsd < requiredBenchmarkUsd) throw new Error(engineeringOnly ? "benchmark broker campaign allocation is below development proof job reservations" : "benchmark broker campaign allocation is below development plus selected-final/root confirmation job reservations")
-	if (totalBudgetUsd < mutationReservationsUsd + requiredBenchmarkUsd) throw new Error("proof campaign role allocations cannot fund every frozen provider job reservation")
+	const mutationBudgetLimits = openRouterBrokerLimitsFromEnvironment(openRouterAllocatedEnvironment(process.env, "mutation"), mutationCampaignId)
+	const benchmarkJobCount = 2 * slotsPerArm * 3 * benchmarkTasks.length + (engineeringOnly ? 0 : 4 * confirmationTasks.length)
+	const reservations = proofCampaignSpendReservationMicros({
+		mutationJobs: 2 * slotsPerArm, mutationMaxJobSpendUsd: mutationLimits.maxJobSpendUsd, mutationAllocationUsd: mutationBudgetLimits.maxCampaignSpendUsd,
+		benchmarkJobs: benchmarkJobCount, benchmarkMaxJobSpendUsd: benchmarkLimits.maxJobSpendUsd, benchmarkAllocationUsd: benchmarkLimits.maxCampaignSpendUsd,
+		totalAllocationUsd: campaignBudget.totalUsd,
+		benchmarkShortfallMessage: engineeringOnly ? "benchmark broker campaign allocation is below development proof job reservations" : "benchmark broker campaign allocation is below development plus selected-final/root confirmation job reservations",
+	})
 	const taskWallBoundMs = proofCampaignTaskWallBoundMs(args.config, args.plannedGenerations, benchmarkTasks, confirmationTasks, !engineeringOnly)
 	const maxRuntimeMs = args.config.maxRuntimeMs ?? 60 * 60_000
 	if (maxRuntimeMs < taskWallBoundMs) throw new Error(`proof campaign runtime ceiling ${maxRuntimeMs}ms is below the summed frozen task-time ceiling ${taskWallBoundMs}ms`)
@@ -328,7 +363,7 @@ export function createProofCampaignManifest(args: {
 		seed: args.config.seed, taskOrder: ["mutation", "regression", "typecheck", ...args.config.evalCommands.map((_, index) => `visible-${index}`), ...benchmarkTasks.map((task) => task.id), ...(engineeringOnly ? [] : confirmationTasks.map((task) => task.id))], schedule,
 		budgets: {
 			attempt: { maxCalls: Math.max(mutationLimits.maxCalls, benchmarkLimits.maxCalls, ...(!engineeringOnly ? [confirmationLimits.maxCalls] : [])), maxTokens: Math.max(mutationLimits.maxTotalTokens, benchmarkLimits.maxTotalTokens, ...(!engineeringOnly ? [confirmationLimits.maxTotalTokens] : [])), maxSpendUsd: Math.max(mutationLimits.maxJobSpendUsd, benchmarkLimits.maxJobSpendUsd, ...(!engineeringOnly ? [confirmationLimits.maxJobSpendUsd] : [])), maxDurationMs: Math.max(args.config.commandTimeoutMs, ...benchmarkTasks.map((task) => task.ceilings.timeoutMs), ...(!engineeringOnly ? confirmationTasks.map((task) => task.ceilings.timeoutMs) : [])) },
-			root: { maxCalls: rootCalls, maxTokens: rootTokens, maxSpendUsd: Math.min(spendAllocation, totalBudgetUsd, mutationReservationsUsd + requiredBenchmarkUsd), maxRuntimeMs },
+			root: { maxCalls: rootCalls, maxTokens: rootTokens, maxSpendUsd: Math.min(campaignBudget.totalUsd, reservations.total / 1_000_000), maxRuntimeMs },
 		},
 		acceptanceRule: { ...args.proofProtocol.rule, confirmationRetentionTaskIds: engineeringOnly ? [] : [...RSI_CONFIRMATION_RETENTION_TASK_IDS], minimumSelfHostedCampaigns: 2, requiredSuccessiveTransitions: 2, clusterConfidence: 0.9 }, runtime: { imageDigest: args.runtime.imageDigest, harnessCommit: args.runtime.harnessCommit, dependencyLockDigest: args.runtime.dependencyLockDigest },
 		analysisVersion: args.proofProtocol.schemaVersion.toString(), settings: { phaseMode: engineeringOnly ? "engineering-only" : "paired-confirmation", configDigest: workerHarnessConfigDigest(args.config, { baseCommit: args.baseCommit, model: args.model, provider: args.provider, proofProtocolDigest: args.proofProtocol.protocolDigest }), effectiveConfig: Object.fromEntries(Object.entries(args.config).filter(([key]) => !["workerHarnessMode", "workerHarnessPhase", "workerHarnessEngineeringOnly", "workerHarnessPairId", "workerHarnessRunId", "resumeRunId", "candidateIdNamespace", "workerHarnessParentCommit", "workerHarnessSnapshotTreeDigest", "hiddenSuitePath", "hiddenPublicKeyPath", "hiddenPrivateKeyPath", "hiddenNonceStorePath", "evaluatorSigningKeyPath", "evaluatorTrustedPublicKeyPath"].includes(key))), candidateCounts, taskWallBoundMs, evaluationCells: ["regression", "typecheck", ...args.config.evalCommands.map((_, index) => `visible-${index}`)], developmentTaskIdentities: benchmarkTasks.map((task) => ({ id: task.id, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings })), confirmationTaskIdentities: engineeringOnly ? [] : confirmationTasks.map((task) => ({ id: task.id, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings })), inferenceCeilings: { maxInputTokensPerCall: benchmarkLimits.maxInputTokensPerCall, maxOutputTokensPerCall: benchmarkLimits.maxOutputTokensPerCall, maxCallsPerAttempt: benchmarkLimits.maxCalls, maxTotalTokens: benchmarkLimits.maxTotalTokens, maxCallSpendUsd: benchmarkLimits.maxCallSpendUsd, maxJobSpendUsd: benchmarkLimits.maxJobSpendUsd, maxInputPricePerMillionUsd: benchmarkLimits.maxInputPricePerMillionUsd, maxOutputPricePerMillionUsd: benchmarkLimits.maxOutputPricePerMillionUsd }, inferenceCampaignIds: { mutation: mutationCampaignId, benchmark: benchmarkCampaignId }, inferenceAllocationsUsd: { mutation: mutationLimits.maxCampaignSpendUsd, benchmark: benchmarkLimits.maxCampaignSpendUsd } },
