@@ -1,6 +1,5 @@
 import assert from "node:assert/strict"
 import * as fs from "node:fs/promises"
-import * as os from "node:os"
 import * as path from "node:path"
 import { randomUUID } from "node:crypto"
 
@@ -75,13 +74,6 @@ async function scratch(): Promise<string> {
 	const child = path.join(root, randomUUID())
 	await fs.mkdir(child, { mode: 0o700 })
 	return child
-}
-
-async function fastScratch(): Promise<string> {
-	const root = process.platform === "linux" && await fs.stat("/dev/shm").then(() => true, () => false) ? "/dev/shm" : os.tmpdir()
-	const directory = await fs.mkdtemp(path.join(root, "hc-monitor-live-test-"))
-	await fs.chmod(directory, 0o700)
-	return directory
 }
 
 async function testBillingIdentityPrecedesVirtualEffects(): Promise<void> {
@@ -289,7 +281,7 @@ async function testUncertainRequestIsNotAutomaticallyReplayed(): Promise<void> {
 }
 
 async function testKnownPerRunAdmissionStopCompletesAndSettlesTrajectory(): Promise<void> {
-	const directory = await fastScratch()
+	const directory = await scratch()
 	try {
 		const replies: Reply[] = [
 			{ name: "list_files" },
