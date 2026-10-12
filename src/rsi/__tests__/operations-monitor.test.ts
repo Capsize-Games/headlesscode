@@ -1,11 +1,12 @@
 import assert from "node:assert/strict"
+import { EventEmitter } from "node:events"
 import test from "node:test"
 import { spawn, type ChildProcess } from "node:child_process"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 import { rsiOperationsCliMain } from "../monitor-cli.js"
-import { readRsiOperationsStatus, runRsiMonitor, type RsiMonitorPool, type RsiMonitorOptions } from "../operations-monitor.js"
+import { guardRsiMonitorPoolIdleErrors, readRsiOperationsStatus, runRsiMonitor, type RsiMonitorPool, type RsiMonitorOptions } from "../operations-monitor.js"
 
 const tables = [
 	"headlesscode_rsi_queue_policy", "headlesscode_rsi_workers", "headlesscode_rsi_jobs",
@@ -17,7 +18,7 @@ const campaign = {
 	deadline_expired: false, max_spend_microusd: "1000000", reserved_spend_microusd: "100", used_spend_microusd: "50",
 }
 
-function fixturePool(options: { malformedWorker?: boolean; throwOnQuery?: boolean; queueRows?: Array<Record<string, unknown>>; invalidReceipt?: boolean; finishedPastDeadline?: boolean; delayMs?: number } = {}) {
+function fixturePool(options: { malformedWorker?: boolean; throwOnQuery?: boolean; queueRows?: Array<Record<string, unknown>>; invalidReceipt?: boolean; finishedPastDeadline?: boolean; idleActiveCampaign?: boolean; armEpoch?: string; armState?: string; armPhase?: string; attemptRows?: Array<Record<string, unknown>>; delayMs?: number } = {}) {
 	const statements: Array<{ sql: string; values?: unknown[] }> = []
 	let released = 0
 	const client = {
@@ -30,16 +31,17 @@ function fixturePool(options: { malformedWorker?: boolean; throwOnQuery?: boolea
 				: sql.startsWith("SELECT max_in_flight") ? [{ max_in_flight: 2, lease_ms: 5000, max_attempts: 3 }]
 				: sql.includes("FROM headlesscode_rsi_workers") && sql.includes("count(*)") ? [{ count: "1" }]
 				: sql.includes("FROM headlesscode_rsi_workers") ? [{ worker_id: "worker-a", active: true, resource_classes: options.malformedWorker ? ["ALIEN"] : ["CPU"], registered_at: new Date(), heartbeat_at: new Date(), heartbeat_age_ms: "2", heartbeat_fresh: true }]
-				: sql.includes("FROM headlesscode_rsi_jobs") && sql.includes("GROUP BY status") ? options.queueRows ?? [{ status: "queued", count: "1", expired_leases: "0", pending_teardown: "0", attempts_total: "0" }]
+				: sql.includes("FROM headlesscode_rsi_jobs") && sql.includes("GROUP BY status") ? options.queueRows ?? (options.idleActiveCampaign ? [] : [{ status: "queued", count: "1", expired_leases: "0", pending_teardown: "0", attempts_total: "0" }])
 				: sql.includes("FROM headlesscode_rsi_jobs") ? []
-				: sql.includes("FROM headlesscode_rsi_proof_campaigns") ? [{ ...campaign, state: options.finishedPastDeadline ? "finished" : campaign.state, deadline_expired: options.finishedPastDeadline ?? false, deadline_at: options.finishedPastDeadline ? new Date(Date.now() - 60_000) : campaign.deadline_at, reserved_spend_microusd: options.finishedPastDeadline ? "0" : campaign.reserved_spend_microusd, used_spend_microusd: options.finishedPastDeadline ? "100" : campaign.used_spend_microusd }]
-				: sql.includes("FROM headlesscode_rsi_proof_campaign_arms") ? ["arm-a", "arm-b"].map((arm_id) => ({ arm_id, epoch: "1", state: options.finishedPastDeadline ? "finished" : "running", phase: "development", coordinator_id: null, lease_expires_at: new Date(Date.now() + 30_000), lease_fresh: true }))
-				: sql.includes("FROM headlesscode_rsi_proof_campaign_attempts") ? options.finishedPastDeadline ? [] : [{ status: "dispatched", count: "1" }]
+				: sql.includes("FROM headlesscode_rsi_proof_campaigns") ? [{ ...campaign, state: options.finishedPastDeadline ? "finished" : campaign.state, deadline_expired: options.finishedPastDeadline ?? false, deadline_at: options.finishedPastDeadline ? new Date(Date.now() - 60_000) : campaign.deadline_at, reserved_spend_microusd: options.finishedPastDeadline || options.idleActiveCampaign ? "0" : campaign.reserved_spend_microusd, used_spend_microusd: options.finishedPastDeadline ? "100" : options.idleActiveCampaign ? "50" : campaign.used_spend_microusd }]
+				: sql.includes("FROM headlesscode_rsi_proof_campaign_arms") ? ["arm-a", "arm-b"].map((arm_id) => ({ arm_id, epoch: options.armEpoch ?? "1", state: options.finishedPastDeadline ? "finished" : options.armState ?? "running", phase: options.armPhase ?? "development", coordinator_id: null, lease_expires_at: new Date(Date.now() + 30_000), lease_fresh: true }))
+				: sql.includes("FROM headlesscode_rsi_proof_campaign_attempts") ? options.finishedPastDeadline || options.idleActiveCampaign ? [] : options.attemptRows ?? [{ status: "dispatched", count: "1" }]
 				: sql.includes("FROM headlesscode_rsi_inference_campaigns AS campaigns") ? [options.invalidReceipt
 					? { campaign_id: "campaign-test:mutation", state: "complete", count: "1", reserved_count: "0", unmeasured_count: "0", invalid_receipts: "1", reserved_microusd: "100" }
+					: options.idleActiveCampaign ? { campaign_id: "campaign-test:mutation", state: "complete", count: "0", reserved_count: "0", unmeasured_count: "0", invalid_receipts: "0", reserved_microusd: "0" }
 					: options.finishedPastDeadline ? { campaign_id: "campaign-test:mutation", state: "complete", count: "1", reserved_count: "0", unmeasured_count: "0", invalid_receipts: "0", reserved_microusd: "0" }
 					: { campaign_id: "campaign-test:mutation", state: "reserved", count: "1", reserved_count: "1", unmeasured_count: "0", invalid_receipts: "0", reserved_microusd: "10" }]
-				: sql.includes("FROM headlesscode_rsi_inference_campaigns") ? ["mutation", "benchmark"].map((role) => ({ campaign_id: `campaign-test:${role}`, max_spend_microusd: "500000", reserved_spend_microusd: options.finishedPastDeadline ? "0" : "10", spent_microusd: "20", blocked: false }))
+				: sql.includes("FROM headlesscode_rsi_inference_campaigns") ? ["mutation", "benchmark"].map((role) => ({ campaign_id: `campaign-test:${role}`, max_spend_microusd: "500000", reserved_spend_microusd: options.finishedPastDeadline || options.idleActiveCampaign ? "0" : "10", spent_microusd: "20", blocked: false }))
 				: []
 			return { rows, rowCount: rows.length }
 		},
@@ -64,6 +66,58 @@ test("status reads bounded operational metadata in one read-only snapshot withou
 	assert.equal(fixture.released, 1)
 	assert.ok(fixture.statements.every(({ sql }) => !/\b(payload|manifest|prompt|capability_sha256|artifact_refs|proof)\b/i.test(sql)), "monitor SQL must not read payload or proof contents")
 	assert.ok(fixture.statements.some(({ sql, values }) => sql.includes("heartbeat_at > clock_timestamp()") && values?.[1] === 10_000), "freshness uses twice the persisted lease interval")
+	const baseFingerprint = await readRsiOperationsStatus(fixturePool({ idleActiveCampaign: true }).pool, statusOptions)
+	const changedEpoch = await readRsiOperationsStatus(fixturePool({ idleActiveCampaign: true, armEpoch: "2" }).pool, statusOptions)
+	const changedPhase = await readRsiOperationsStatus(fixturePool({ idleActiveCampaign: true, armPhase: "confirmation" }).pool, statusOptions)
+	const changedArmState = await readRsiOperationsStatus(fixturePool({ idleActiveCampaign: true, armState: "planned" }).pool, statusOptions)
+	assert.notEqual(baseFingerprint.progressFingerprint, changedEpoch.progressFingerprint, "arm epoch changes count as progress")
+	assert.notEqual(baseFingerprint.progressFingerprint, changedPhase.progressFingerprint, "arm phase changes count as progress")
+	assert.notEqual(baseFingerprint.progressFingerprint, changedArmState.progressFingerprint, "arm state changes count as progress")
+})
+
+test("monitor stalls active work between admissions but leaves settled terminal campaigns unstalled", async () => {
+	async function sample(pool: RsiMonitorPool) {
+		const stateDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-rsi-monitor-stall-"))
+		await fs.chmod(stateDirectory, 0o700)
+		const status = await readRsiOperationsStatus(pool, statusOptions)
+		await fs.writeFile(path.join(stateDirectory, "state.json"), `${JSON.stringify({
+			schemaVersion: 1, queueName: statusOptions.queueName, campaignId: statusOptions.campaignId,
+			lastProgressFingerprint: status.progressFingerprint,
+			lastProgressAt: new Date(Date.now() - 5000).toISOString(), history: [],
+		})}\n`, { mode: 0o600 })
+		const controller = new AbortController()
+		let report: Record<string, unknown> | undefined
+		const result = await runRsiMonitor({
+			...statusOptions, pool, stateDirectory, pollMs: 1000, stallMs: 2000, maxRuntimeMs: 10_000,
+			signal: controller.signal,
+			stdout(line) { report = JSON.parse(line) as Record<string, unknown>; controller.abort() },
+		})
+		assert.equal(result, 0)
+		assert.ok(report)
+		await fs.rm(stateDirectory, { recursive: true, force: true })
+		return report as Record<string, unknown>
+	}
+
+	const activePool = fixturePool({ idleActiveCampaign: true })
+	const active = await sample(activePool.pool)
+	assert.equal(active.progressStalled, true, "planned/running campaign arms make an idle admission gap eligible for stall detection")
+	const activeCampaign = active.campaign as Record<string, unknown>
+	assert.equal(activeCampaign.state, "running")
+	assert.equal(active.progressUnderlyingCondition, "campaign-active-no-pending-accounting")
+	const terminal = await sample(fixturePool({ finishedPastDeadline: true }).pool)
+	assert.equal(terminal.progressStalled, false, "a finished terminal campaign does not stall after it goes idle")
+	assert.equal((terminal.campaign as Record<string, unknown>).state, "finished")
+
+	const uncertain = await sample(fixturePool({
+		queueRows: [{ status: "leased", count: "1", expired_leases: "1", pending_teardown: "0", attempts_total: "1" }],
+		attemptRows: [{ status: "uncertain", count: "1" }],
+	}).pool)
+	assert.equal(uncertain.progressStalled, true)
+	assert.equal(uncertain.progressUnderlyingCondition, "expired-job-leases")
+	const uncertainQueue = uncertain.queue as Record<string, unknown>
+	const uncertainCampaign = uncertain.campaign as Record<string, unknown>
+	assert.equal(uncertainQueue.expiredLeases, 1, "stall reporting preserves the expired-lease count")
+	assert.equal(uncertainCampaign.unsettledAttempts, 1, "stall reporting preserves uncertain campaign attempts")
 })
 
 test("database outage and malformed operational rows produce unknown, never healthy", async () => {
@@ -86,6 +140,25 @@ test("database outage and malformed operational rows produce unknown, never heal
 	assert.equal(completedAfterDeadline.condition, "campaign-terminal-accounting-settled")
 	const slow = fixturePool({ delayMs: 30 })
 	assert.equal((await readRsiOperationsStatus(slow.pool, { ...statusOptions, queryTimeoutMs: 250 })).health, "unknown", "total status-read budget is bounded")
+})
+
+test("idle pool socket errors are handled and a later bounded status read can reconnect", async () => {
+	const emitter = new EventEmitter()
+	guardRsiMonitorPoolIdleErrors(emitter as unknown as Parameters<typeof guardRsiMonitorPoolIdleErrors>[0])
+	assert.doesNotThrow(() => emitter.emit("error", new Error("synthetic idle socket failure")))
+	const recovered = fixturePool()
+	let connects = 0
+	const pool: RsiMonitorPool = {
+		async connect() {
+			connects++
+			if (connects === 1) throw new Error("synthetic connection outage")
+			return await recovered.pool.connect()
+		},
+		async end() {},
+	}
+	assert.equal((await readRsiOperationsStatus(pool, statusOptions)).health, "unknown")
+	assert.equal((await readRsiOperationsStatus(pool, statusOptions)).health, "degraded")
+	assert.equal(connects, 2)
 })
 
 test("status CLI reports missing database configuration as structured unknown and exit 2", async () => {

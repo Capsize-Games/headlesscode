@@ -74,6 +74,7 @@ export interface RsiOperationsStatus {
 	progressObservedAt?: string
 	progressStalled?: boolean
 	progressAgeMs?: number
+	progressUnderlyingCondition?: string
 }
 
 export interface RsiStatusOptions {
@@ -333,6 +334,7 @@ export async function readRsiOperationsStatus(pool: RsiMonitorPool, options: Rsi
 		}
 		const progressFingerprint = createHash("sha256").update(JSON.stringify({
 			jobCounts, attemptsTotal, campaignState, sequence, attemptCounts, rootCeiling, rootSpent, rootReserved,
+			arms: arms.map((arm) => ({ armId: arm.armId, epoch: arm.epoch, state: arm.state, phase: arm.phase })),
 				inference: inferenceBudgetsMicrousd.map(({ role, recorded, ceiling, spent, reserved, calls }) => ({ role, recorded, ceiling, spent, reserved, calls })),
 		})).digest("hex")
 		await client.query("COMMIT")
@@ -368,13 +370,23 @@ export function createRsiMonitorPool(env: NodeJS.ProcessEnv = process.env, query
 	const connectionString = env.HEADLESSCODE_RSI_DATABASE_URL?.trim()
 	if (!connectionString) throw new Error("HEADLESSCODE_RSI_DATABASE_URL is required")
 	if (!Number.isSafeInteger(queryTimeoutMs) || queryTimeoutMs < 250 || queryTimeoutMs > MAX_QUERY_TIMEOUT_MS) throw new Error("query timeout must be between 250 and 30000 milliseconds")
-	return new Pool({
+	const pool = new Pool({
 		connectionString,
 		max: 1,
 		connectionTimeoutMillis: queryTimeoutMs,
 		query_timeout: queryTimeoutMs,
 		statement_timeout: queryTimeoutMs,
 		application_name: "headlesscode-rsi-monitor",
+	})
+	guardRsiMonitorPoolIdleErrors(pool)
+	return pool
+}
+
+export function guardRsiMonitorPoolIdleErrors(pool: Pick<Pool, "on">): void {
+	pool.on("error", () => {
+		// Idle-client failures are observed by the next bounded snapshot. Handling
+		// this event prevents pg's otherwise-unhandled pool error from killing the
+		// monitor outside its read-only query boundary.
 	})
 }
 
@@ -544,6 +556,7 @@ function monitorReport(status: RsiOperationsStatus): Record<string, unknown> {
 		},
 		progressStalled: status.progressStalled ?? false,
 		progressAgeMs: status.progressAgeMs ?? null,
+		progressUnderlyingCondition: status.progressUnderlyingCondition ?? null,
 	}
 }
 
@@ -580,8 +593,11 @@ export async function runRsiMonitor(options: RsiMonitorOptions): Promise<number>
 				observed.progressObservedAt = state.lastProgressAt
 				observed.progressAgeMs = Math.max(0, now.getTime() - Date.parse(state.lastProgressAt))
 				const pending = safeSum([observed.queue.jobCounts.queued, observed.queue.jobCounts.leased, observed.campaign.unsettledAttempts], "monitor pending count")
-				observed.progressStalled = !observed.campaign.terminal && pending > 0 && observed.progressAgeMs >= options.stallMs
+				const activeCampaignOrArm = observed.campaign.state === "planned" || observed.campaign.state === "running"
+					|| observed.campaign.arms.some((arm) => arm.state === "planned" || arm.state === "running")
+				observed.progressStalled = !observed.campaign.terminal && (pending > 0 || activeCampaignOrArm) && observed.progressAgeMs >= options.stallMs
 				if (observed.progressStalled && observed.health !== "unknown") {
+					observed.progressUnderlyingCondition = observed.condition
 					observed.health = "unhealthy"
 					observed.condition = "operational-progress-stalled"
 				}
