@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises"
 import * as path from "node:path"
 import test from "node:test"
 import { OpenShellBenchmarkAgent } from "../benchmark/openshell-agent.js"
-import { fetchOpenRouterEndpointPrice, fetchPinnedOpenRouterEndpointPrice, FileOpenRouterInferenceLedger, openRouterCampaignBudgetAllocation, openRouterProfileForModel, RSI_MUSE_OPENROUTER_BILLING_MODEL, RSI_MUSE_OPENROUTER_MODEL, RSI_OPENROUTER_ENDPOINT_PROVIDER, RSI_OPENROUTER_ENDPOINT_TAG, RSI_OPENROUTER_MODEL, startOpenRouterBroker, validateOpenRouterBrokerLimits } from "../inference-broker.js"
+import { fetchOpenRouterEndpointPrice, fetchPinnedOpenRouterEndpointPrice, FileOpenRouterInferenceLedger, openRouterAllocatedEnvironment, openRouterBrokerLimitsFromEnvironment, openRouterCampaignBudgetAllocation, openRouterProfileForModel, RSI_MUSE_OPENROUTER_BILLING_MODEL, RSI_MUSE_OPENROUTER_MODEL, RSI_OPENROUTER_ENDPOINT_PROVIDER, RSI_OPENROUTER_ENDPOINT_TAG, RSI_OPENROUTER_MODEL, startOpenRouterBroker, validateOpenRouterBrokerLimits } from "../inference-broker.js"
 import type { OpenRouterBrokerLimits } from "../inference-broker.js"
 
 function limits(campaignId: string, overrides: Partial<OpenRouterBrokerLimits> = {}): OpenRouterBrokerLimits {
@@ -462,6 +462,63 @@ test("mutation and benchmark budgets are disjoint partitions of the operator cam
 		HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD: "0.5000001",
 		HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD: "0.5000001",
 	}), /allocations exceed/, "ceil allocated spend and floor the total at micro-USD precision")
+})
+
+test("mutation and benchmark broker caps are independently scoped with shared fallback", () => {
+	const base = {
+		HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD: "20",
+		HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD: "6",
+		HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD: "14",
+		HEADLESSCODE_RSI_OPENROUTER_MAX_TOTAL_TOKENS: "200000",
+		HEADLESSCODE_RSI_OPENROUTER_MAX_INPUT_TOKENS_PER_CALL: "150000",
+		HEADLESSCODE_RSI_OPENROUTER_MAX_OUTPUT_TOKENS_PER_CALL: "4096",
+		HEADLESSCODE_RSI_OPENROUTER_MAX_INPUT_PRICE_PER_MILLION_USD: "0.1",
+		HEADLESSCODE_RSI_OPENROUTER_MAX_OUTPUT_PRICE_PER_MILLION_USD: "0.2",
+		HEADLESSCODE_RSI_OPENROUTER_MAX_CALL_SPEND_USD: "0.0164",
+		HEADLESSCODE_RSI_OPENROUTER_MAX_JOB_SPEND_USD: "0.2",
+	} as NodeJS.ProcessEnv
+	const sharedMutation = openRouterAllocatedEnvironment(base, "mutation")
+	const sharedBenchmark = openRouterAllocatedEnvironment(base, "benchmark")
+	assert.equal(sharedMutation.HEADLESSCODE_RSI_OPENROUTER_MAX_TOTAL_TOKENS, "200000")
+	assert.equal(sharedBenchmark.HEADLESSCODE_RSI_OPENROUTER_MAX_TOTAL_TOKENS, "200000")
+	assert.equal(sharedMutation.HEADLESSCODE_RSI_OPENROUTER_MAX_JOB_SPEND_USD, "0.2")
+	assert.equal(sharedBenchmark.HEADLESSCODE_RSI_OPENROUTER_MAX_JOB_SPEND_USD, "0.2")
+
+	const scoped = {
+		...base,
+		HEADLESSCODE_RSI_OPENROUTER_MUTATION_MAX_TOTAL_TOKENS: "6280000",
+		HEADLESSCODE_RSI_OPENROUTER_MUTATION_MAX_JOB_SPEND_USD: "0.66",
+		HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_MAX_TOTAL_TOKENS: "250000",
+		HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_MAX_JOB_SPEND_USD: "0.035",
+	}
+	const mutation = openRouterAllocatedEnvironment(scoped, "mutation")
+	const benchmark = openRouterAllocatedEnvironment(scoped, "benchmark")
+	assert.equal(mutation.HEADLESSCODE_RSI_OPENROUTER_MAX_TOTAL_TOKENS, "6280000")
+	assert.equal(mutation.HEADLESSCODE_RSI_OPENROUTER_MAX_JOB_SPEND_USD, "0.66")
+	assert.equal(benchmark.HEADLESSCODE_RSI_OPENROUTER_MAX_TOTAL_TOKENS, "250000")
+	assert.equal(benchmark.HEADLESSCODE_RSI_OPENROUTER_MAX_JOB_SPEND_USD, "0.035")
+	const mutationLimits = openRouterBrokerLimitsFromEnvironment(mutation, "mutation", { maxCalls: 40, maxOutputTokensPerCall: 7000 })
+	const benchmarkLimits = openRouterBrokerLimitsFromEnvironment(benchmark, "benchmark", { maxCalls: 30, maxOutputTokensPerCall: 2048 })
+	assert.equal(mutationLimits.maxTotalTokens, 6_280_000)
+	assert.equal(mutationLimits.maxJobSpendUsd, 0.66)
+	assert.equal(benchmarkLimits.maxTotalTokens, 250_000)
+	assert.equal(benchmarkLimits.maxJobSpendUsd, 0.035)
+	const overAllocation = openRouterAllocatedEnvironment({ ...base, HEADLESSCODE_RSI_OPENROUTER_MUTATION_MAX_JOB_SPEND_USD: "7" }, "mutation")
+	assert.throws(() => openRouterBrokerLimitsFromEnvironment(overAllocation, "mutation", { maxCalls: 40, maxOutputTokensPerCall: 7000 }), /spend ceilings must satisfy/)
+})
+
+test("role-scoped broker caps reject malformed values", () => {
+	const base = {
+		HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD: "1",
+		HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD: "0.4",
+		HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD: "0.5",
+	} as NodeJS.ProcessEnv
+	for (const value of ["0", "1.5", "9007199254740992", "bad"]) {
+		assert.throws(() => openRouterAllocatedEnvironment({ ...base, HEADLESSCODE_RSI_OPENROUTER_MUTATION_MAX_TOTAL_TOKENS: value }, "mutation"), /MUTATION_MAX_TOTAL_TOKENS must be a positive integer/)
+	}
+	for (const value of ["0", "-0.1", "Infinity", "bad"]) {
+		assert.throws(() => openRouterAllocatedEnvironment({ ...base, HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_MAX_JOB_SPEND_USD: value }, "benchmark"), /BENCHMARK_MAX_JOB_SPEND_USD must be a positive finite USD amount/)
+	}
 })
 
 test("file ledger serializes concurrent reservations against one campaign ceiling", async (t) => {

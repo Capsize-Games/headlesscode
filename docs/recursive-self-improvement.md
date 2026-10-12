@@ -337,14 +337,20 @@ Set explicit price and spend ceilings on the coordinator and workers:
 | `HEADLESSCODE_RSI_OPENROUTER_MAX_OUTPUT_PRICE_PER_MILLION_USD` | Maximum admitted output-token price. |
 | `HEADLESSCODE_RSI_OPENROUTER_MAX_CALL_SPEND_USD` | Worst-case reservation for one call; must cover the configured per-call token ceilings at the price ceilings. |
 | `HEADLESSCODE_RSI_OPENROUTER_MAX_JOB_SPEND_USD` | Maximum reserved and settled spend for one job. |
+| `HEADLESSCODE_RSI_OPENROUTER_MUTATION_MAX_JOB_SPEND_USD` | Optional mutation-job spend limit; overrides the shared job limit for mutation jobs. |
+| `HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_MAX_JOB_SPEND_USD` | Optional benchmark-job spend limit; overrides the shared job limit for benchmark jobs. |
+| `HEADLESSCODE_RSI_OPENROUTER_MUTATION_MAX_TOTAL_TOKENS` | Optional total-token limit per mutation job; overrides the shared total-token limit. |
+| `HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_MAX_TOTAL_TOKENS` | Optional total-token limit per benchmark job; overrides the shared total-token limit. |
 | `HEADLESSCODE_RSI_OPENROUTER_MAX_CAMPAIGN_SPEND_USD` | Operator's total inference ceiling for mutation and benchmark work. |
 | `HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD` | Portion allocated to mutation jobs. |
 | `HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD` | Portion allocated to development benchmark jobs. |
 
 The mutation and benchmark allocations are rounded conservatively and must
 sum to no more than the total campaign ceiling. Keep all three values fixed
-for a run. Configure the job spend ceiling no higher than either allocation;
-the broker rejects a job cap that exceeds its branch's campaign allocation.
+for a run. If a role-scoped job spend limit is unset, the shared job limit
+applies. Each effective job limit must fit its role's campaign allocation;
+the broker rejects a job cap that exceeds that allocation. If a role-scoped
+total-token limit is unset, the shared total-token limit applies.
 The broker also accepts finite call, input-token, output-token,
 total-token, duration, and request/response-byte limits through the
 `HEADLESSCODE_RSI_OPENROUTER_MAX_*` variables. The duration deadline starts
