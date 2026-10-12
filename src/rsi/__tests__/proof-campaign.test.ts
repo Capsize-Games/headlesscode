@@ -1101,10 +1101,6 @@ test("FileArtifactStore PostgreSQL proof-bound mutation imports only matching du
 		]
 		const frozen = manifest(`campaign-${randomUUID()}`, schedule)
 		frozen.settings = { inferenceCampaignIds: { mutation: `${frozen.campaignId}:mutation` } }
-		const lease = await campaign.acquire(frozen, "fixed", "run-fixed", "coordinator-1")
-		const cell = schedule[0]!
-		const attemptKey = "mutation-cell"
-		const actualCandidateId = "actual-candidate-id"
 		const callMicrousd = [2116, 90, 371, 932, 137, 865, 117, 192, 229, 210, 623, 133, 146, 186, 1497, 2939, 390, 122]
 		const totalMicrousd = callMicrousd.reduce((sum, amount) => sum + amount, 0)
 		assert.equal(totalMicrousd, 11_295)
@@ -1114,6 +1110,10 @@ test("FileArtifactStore PostgreSQL proof-bound mutation imports only matching du
 		assert.equal(totalTokens, 551_374)
 		frozen.budgets.attempt = { ...frozen.budgets.attempt, maxCalls: callMicrousd.length, maxTokens: totalTokens, maxSpendUsd: 0.36 }
 		frozen.budgets.root = { ...frozen.budgets.root, maxCalls: callMicrousd.length, maxTokens: totalTokens, maxSpendUsd: 1 }
+		const lease = await campaign.acquire(frozen, "fixed", "run-fixed", "coordinator-1")
+		const cell = schedule[0]!
+		const attemptKey = "mutation-cell"
+		const actualCandidateId = "actual-candidate-id"
 		const limits: OpenRouterBrokerLimits = {
 			campaignId: `${frozen.campaignId}:mutation`, maxCalls: callMicrousd.length, maxInputTokensPerCall: 150_000, maxOutputTokensPerCall: 7_000,
 			maxTotalTokens: totalTokens, maxDurationMs: 60_000, maxRequestBytes: 16_384, maxResponseBytes: 16_384,
