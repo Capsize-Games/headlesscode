@@ -93,7 +93,10 @@ test("proof campaign reservations use integer microUSD for role and root funding
 		totalAllocationUsd: 20, benchmarkShortfallMessage: "benchmark reservation shortfall",
 	}
 	assert.deepEqual(proofCampaignSpendReservationMicros(allocation), { mutation: 5_280_000, benchmark: 13_440_000, total: 18_720_000 }, "exact $13.44 funding for 384 $0.035 reservations fits within the $20 root allocation")
+	assert.equal(proofCampaignSpendReservationMicros({ ...allocation, totalAllocationUsd: 18.72 }).total, 18_720_000, "exact root funding is sufficient")
+	assert.throws(() => proofCampaignSpendReservationMicros({ ...allocation, mutationAllocationUsd: 5.279999 }), /mutation broker campaign allocation is below/, "one microUSD below mutation reservations is rejected")
 	assert.throws(() => proofCampaignSpendReservationMicros({ ...allocation, benchmarkAllocationUsd: 13.439999 }), /benchmark reservation shortfall/, "one microUSD below the benchmark reservations is rejected")
+	assert.throws(() => proofCampaignSpendReservationMicros({ ...allocation, benchmarkMaxJobSpendUsd: 0.0350001 }), /benchmark reservation shortfall/, "fractional microUSD job reservations round upward")
 	assert.throws(() => proofCampaignSpendReservationMicros({ ...allocation, totalAllocationUsd: 18.719999 }), /total allocation is below/, "one microUSD below the combined root reservations is rejected")
 })
 
