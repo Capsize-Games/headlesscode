@@ -195,7 +195,7 @@ test("engineering replay reuses a finished fixed arm after a crash before self-h
 			model: RSI_OPENROUTER_MODEL, baseRef: "main", baseCommit: "e".repeat(40), generations: 2, candidates: [], reports: [],
 			workerHarnessPairId: campaign, workerHarnessMode: arm, workerHarnessSamplingSeed: "engineering-seed", workerHarnessRuntime: runtime,
 			proofCampaign: {
-				manifest: { phaseMode: "engineering-only", schedule: [], model: { provider: "openshell-openrouter", id: RSI_OPENROUTER_MODEL, settings: { roles: { worker: { provider: "openrouter", model: RSI_OPENROUTER_MODEL } } } } }, manifestSha256: "f".repeat(64), campaignId: campaign, armId: arm, epoch: 1,
+				manifest: { phaseMode: "engineering-only", schedule: [], settings: { effectiveConfig: {} }, model: { provider: "openshell-openrouter", id: RSI_OPENROUTER_MODEL, settings: { roles: { worker: { provider: "openrouter", model: RSI_OPENROUTER_MODEL } } } } }, manifestSha256: "f".repeat(64), campaignId: campaign, armId: arm, epoch: 1,
 				ledgerSnapshot: { arms: [{ arm_id: arm, state: "finished" }] }, state: "finished",
 			},
 		} as unknown as RsiRunRecord
@@ -207,6 +207,11 @@ test("engineering replay reuses a finished fixed arm after a crash before self-h
 		})
 		assert.equal(resumed.runId, finished.runId)
 		assert.equal(runnerCalls, 0)
+		await assert.rejects(() => runEngineeringArm({ ...config, maxTokens: 7000 }, campaign, arm, finished.baseCommit, "engineering-seed", runtime, async () => {
+			runnerCalls++
+			throw new Error("a changed output-token limit must fail before replay or dispatch")
+		}), /changed frozen output-token limit/)
+		assert.equal(runnerCalls, 0, "a finished arm is not replayed under a changed token cap")
 	} finally {
 		await fs.rm(root, { recursive: true, force: true })
 	}
@@ -224,7 +229,7 @@ test("engineering replay rejects persisted run whose nested campaign profile dif
 			runId: `${campaign}-fixed`, startedAt: "2026-09-30T00:00:00Z", finishedAt: "2026-09-30T00:01:00Z",
 			model: RSI_MUSE_OPENROUTER_MODEL, openRouterProfileId: "muse-spark-contributor", baseRef: "main", baseCommit: "e".repeat(40), generations: 2, candidates: [], reports: [],
 			workerHarnessPairId: campaign, workerHarnessMode: "fixed-control", workerHarnessSamplingSeed: "engineering-seed", workerHarnessRuntime: runtime,
-			proofCampaign: { manifest: { phaseMode: "engineering-only", schedule: [], model: { provider: "openshell-openrouter", id: RSI_OPENROUTER_MODEL } }, manifestSha256: "f".repeat(64), campaignId: campaign, armId: "fixed-control", epoch: 1, state: "finished", ledgerSnapshot: { arms: [{ arm_id: "fixed-control", state: "finished" }] } },
+			proofCampaign: { manifest: { phaseMode: "engineering-only", schedule: [], settings: { effectiveConfig: {} }, model: { provider: "openshell-openrouter", id: RSI_OPENROUTER_MODEL } }, manifestSha256: "f".repeat(64), campaignId: campaign, armId: "fixed-control", epoch: 1, state: "finished", ledgerSnapshot: { arms: [{ arm_id: "fixed-control", state: "finished" }] } },
 		} as unknown as RsiRunRecord
 		await appendRun(root, mismatched)
 		let dispatched = false
