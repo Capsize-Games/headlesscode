@@ -2,7 +2,8 @@
 export function sumMicrousd(values: Iterable<unknown>): number {
 	let totalMicrousd = 0
 	for (const value of values) {
-		const microusd = Number(value)
+		const canonicalIntegerString = typeof value === "string" && /^(0|[1-9]\d*)$/.test(value)
+		const microusd = typeof value === "number" ? value : canonicalIntegerString ? Number(value) : Number.NaN
 		if (!Number.isSafeInteger(microusd) || microusd < 0 || !Number.isSafeInteger(totalMicrousd + microusd)) {
 			throw new Error("microUSD amount is not a non-negative safe integer")
 		}
