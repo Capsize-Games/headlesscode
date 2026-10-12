@@ -165,6 +165,7 @@ test("fleet mutation failure stores output before lease-fenced failure and keeps
 			createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
 		}
 		const lease = { job, token: "synthetic-lease", workerId: "muse-failure-test-worker" } as FleetJobLease
+		let brokerClosed = false
 		const receipt: OpenRouterBrokerReceipt = {
 			provider: "openrouter", endpointProvider: "meta", jobId: job.jobId, campaignId: limits.campaignId,
 			model: RSI_MUSE_OPENROUTER_MODEL, profileId: "muse-spark-contributor", returnedModels: [], returnedProviders: [],
@@ -196,7 +197,7 @@ test("fleet mutation failure stores output before lease-fenced failure and keeps
 			resourceClasses: ["CPU"], scratchRoot: workerScratch, maxJobs: 1,
 			createInferenceBroker: async () => ({
 				localBaseUrl: "http://127.0.0.1:43123", guestBaseUrl: "http://host.openshell.internal:43123", capability: "opaque-synthetic-capability", port: 43123, maxPromptBytes: 872,
-				async receipt() { return receipt }, async close() {},
+				async receipt() { assert.equal(brokerClosed, true, "failure receipts must follow broker drain"); return receipt }, async close() { brokerClosed = true },
 			}),
 			runMutation: async () => {
 				if (mutationFailureMode === "unexpected") return { ok: false, error: "synthetic OpenShell setup failure" }
@@ -343,6 +344,7 @@ test("fleet Muse mutation forwards its profile into the real guest environment g
 			async complete(_lease: unknown, result: Record<string, unknown>) { completeResult = result; queueStatus = "completed"; return { accepted: true } },
 			async fail(_lease: unknown, reason: string) { failReason = reason; queueStatus = "failed"; return true },
 		} as unknown as RsiWorkerOptions["queue"]
+		let brokerClosed = false
 		const brokerReceipt: OpenRouterBrokerReceipt = {
 			provider: "openrouter", endpointProvider: "meta", jobId: job.jobId, campaignId: limits.campaignId,
 			model: RSI_MUSE_OPENROUTER_MODEL, profileId: "muse-spark-contributor", returnedModels: [], returnedProviders: [],
@@ -358,7 +360,7 @@ test("fleet Muse mutation forwards its profile into the real guest environment g
 				assert.equal(Math.min(options.limits.maxInputTokensPerCall, options.limits.maxRequestBytes) - 128, 872)
 				return {
 					localBaseUrl: "http://127.0.0.1:43123", guestBaseUrl: "http://host.openshell.internal:43123", capability: "opaque-synthetic-capability", port: 43123, maxPromptBytes: 872,
-					async receipt() { return brokerReceipt }, async close() {},
+					async receipt() { assert.equal(brokerClosed, true, "success receipts must follow broker drain"); return brokerReceipt }, async close() { brokerClosed = true },
 				}
 			},
 			runMutation: async (candidate, config, _provider, _image, broker) => {

@@ -477,3 +477,64 @@ test("file ledger serializes concurrent reservations against one campaign ceilin
 	assert.equal(outcomes.filter((entry) => entry.status === "fulfilled").length, 1, "the shared cap admits one reservation only")
 	assert.equal(outcomes.filter((entry) => entry.status === "rejected").length, 1)
 })
+
+for (const outcome of ["measured", "unmeasured", "out-of-bounds", "upstream-error"] as const) {
+	test(`closing drains a disconnected request before returning its ${outcome} receipt`, async (t) => {
+		let entered!: () => void
+		let release!: () => void
+		const dispatched = new Promise<void>((resolve) => { entered = resolve })
+		const barrier = new Promise<void>((resolve) => { release = resolve })
+		t.after(() => release())
+		const upstreamFetch = (async (input: string | URL) => {
+			if (String(input).includes("/models/")) return new Response(JSON.stringify({ data: { endpoints: [endpointMetadata()] } }))
+			entered()
+			await barrier
+			if (outcome === "upstream-error") throw new Error("synthetic upstream failure")
+			const usage = outcome === "unmeasured" ? {} : { prompt_tokens: 20, completion_tokens: outcome === "out-of-bounds" ? 65 : 10, cost: 0.0002 }
+			return new Response(JSON.stringify(routedResponse({ id: "or-drained-request", model: RSI_OPENROUTER_MODEL, choices: [], usage })), { headers: { "content-type": "application/json" } })
+		}) as typeof fetch
+		const { broker } = await setup(t, { upstreamFetch })
+		const controller = new AbortController()
+		const request = fetch(`${broker.localBaseUrl}/api/v1/chat/completions`, {
+			method: "POST", headers: { authorization: `Bearer ${broker.capability}`, "content-type": "application/json", "x-rsi-call-id": "disconnected-call-12345678" },
+			body: requestBody(), signal: controller.signal,
+		}).catch(() => undefined)
+		await dispatched
+		controller.abort()
+		await request
+		await new Promise((resolve) => setTimeout(resolve, 20))
+		let firstClosed = false
+		let secondClosed = false
+		const first = broker.close().then(() => { firstClosed = true })
+		const second = broker.close().then(() => { secondClosed = true })
+		await new Promise((resolve) => setTimeout(resolve, 30))
+		const before = { firstClosed, secondClosed }
+		release()
+		await Promise.all([first, second])
+		const receipt = await broker.receipt()
+		assert.deepEqual(before, { firstClosed: false, secondClosed: false }, "both close callers must await the upstream settlement even after the guest socket disconnects")
+		assert.equal(receipt.calls, 1)
+		assert.equal(receipt.callReceipts[0]!.state, outcome === "unmeasured" || outcome === "upstream-error" ? "unmeasured" : "complete")
+		assert.equal(receipt.qualified, outcome === "measured")
+		assert.equal(receipt.costUsd, outcome === "measured" ? 0.0002 : null)
+		assert.equal(receipt.callReceipts[0]!.authoritative, outcome === "measured")
+		await assert.rejects(fetch(`${broker.localBaseUrl}/api/v1/chat/completions`, { method: "POST", body: requestBody() }), /fetch failed|ECONNREFUSED/)
+	})
+}
+
+test("closing destroys an incomplete guest request without admitting inference", async (t) => {
+	const { request } = await import("node:http")
+	const { broker, upstream } = await setup(t)
+	const guest = request(`${broker.localBaseUrl}/api/v1/chat/completions`, {
+		method: "POST", headers: { authorization: `Bearer ${broker.capability}`, "content-type": "application/json", "content-length": "100", "x-rsi-call-id": "partial-request-1234567890" },
+	})
+	guest.on("error", () => undefined)
+	t.after(() => guest.destroy())
+	guest.write('{"model":')
+	await new Promise((resolve) => setTimeout(resolve, 30))
+	await broker.close()
+	const receipt = await broker.receipt()
+	assert.equal(receipt.calls, 0)
+	assert.equal(receipt.qualified, false)
+	assert.equal(upstream.requests.filter((entry) => entry.url.endsWith("/chat/completions")).length, 0)
+})

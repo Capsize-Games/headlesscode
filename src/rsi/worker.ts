@@ -328,13 +328,16 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions, sig
 					teardown.guestTeardownConfirmed = true
 					mutation = { ok: false, result: error.result, error: error.message }
 				}
-				if (broker) receipt = await broker.receipt()
+				if (broker) {
+					await broker.close()
+					receipt = await broker.receipt()
+				}
 			} finally {
+				await broker?.close().catch(() => undefined)
 				if (broker && (payload.provider ?? "ollama") === "openrouter") {
 					const receipt = await broker.receipt().catch(() => undefined)
 					if (receipt) failureResult = { ok: false, provider: "openrouter", model: payload.model, inferenceAudit: { accounting: "incomplete", jobId: lease.job.jobId, denials: receipt.denials } }
 				}
-				await broker?.close().catch(() => undefined)
 			}
 			if (!mutation.ok) {
 				const diagnostic = mutation.error ?? mutation.result?.stderr ?? "OpenShell mutation failed"
