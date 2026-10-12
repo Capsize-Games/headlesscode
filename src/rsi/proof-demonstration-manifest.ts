@@ -1,14 +1,17 @@
 import { createHash } from "node:crypto"
+import * as path from "node:path"
 import { openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID, type OpenRouterEndpointPriceSnapshot, type RsiOpenRouterProfileId } from "./inference-broker.js"
 import type { OpenRouterBrokerLimits } from "./inference-broker.js"
 import type { ProofDemonstrationPlan } from "./proof-demonstration-plan.js"
 import type { RsiConfig } from "./types.js"
 import type { WorkerHarnessRuntimeIdentity } from "./types.js"
+import type { ProofBenchmarkFixtureBinding } from "./types.js"
 
 export interface FrozenProofDemonstrationManifest {
 	schemaVersion: 1
 	createdAt: string
 	rootCommit: string
+	benchmarkFixtures?: ProofBenchmarkFixtureBinding
 	benchmarkManifestSha256: string
 	model: { provider: "openshell-openrouter"; requestedId: string; profileId?: RsiOpenRouterProfileId; sampling: { temperature: 0; think: false; seed: "provider-default" } }
 	endpointPrice: OpenRouterEndpointPriceSnapshot
@@ -58,6 +61,7 @@ function verifyEndpointProfile(model: FrozenProofDemonstrationManifest["model"],
 export function freezeProofDemonstrationManifest(args: Omit<FrozenProofDemonstrationManifest, "schemaVersion" | "digestSha256">): FrozenProofDemonstrationManifest {
 	if (!/^[a-f0-9]{40}$/.test(args.rootCommit)) throw new Error("proof demonstration root commit must be a full commit SHA")
 	if (!/^[a-f0-9]{64}$/.test(args.benchmarkManifestSha256)) throw new Error("proof demonstration benchmark manifest digest is malformed")
+	validateBenchmarkFixtureBinding(args.benchmarkFixtures, args.benchmarkManifestSha256, args.execution.configs)
 	if (!Number.isFinite(args.operatorCapUsd) || args.operatorCapUsd <= 0) throw new Error("proof demonstration requires a positive finite operator cap")
 	if (new Set([args.seeds.engineering, ...args.seeds.campaigns]).size !== 4 || [args.seeds.engineering, ...args.seeds.campaigns].some((seed) => !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(seed))) throw new Error("proof demonstration requires four distinct explicit seeds")
 	verifyEndpointProfile(args.model, args.endpointPrice)
@@ -82,6 +86,8 @@ export function verifyFrozenProofDemonstrationManifest(value: unknown): FrozenPr
 	const { digestSha256, ...body } = manifest
 	if (frozenProofDemonstrationDigest(body) !== digestSha256) throw new Error("frozen proof demonstration manifest digest mismatch")
 	verifyEndpointProfile(manifest.model, manifest.endpointPrice)
+	if (!/^[a-f0-9]{64}$/.test(manifest.benchmarkManifestSha256)) throw new Error("frozen proof benchmark manifest digest is malformed")
+	validateBenchmarkFixtureBinding(manifest.benchmarkFixtures, manifest.benchmarkManifestSha256, manifest.execution.configs)
 	if (manifest.operatorCapUsd + 1e-9 < manifest.plan.campaignRootsSpendCeilingUsd) throw new Error("frozen proof demonstration operator cap is below the three campaign root reservations")
 	if (!manifest.engineeringEvidence || !manifest.engineeringEvidence.path || !/^[a-f0-9]{64}$/.test(manifest.engineeringEvidence.sha256) || manifest.engineeringEvidence.rootCommit !== manifest.rootCommit || !/^[a-f0-9]{64}$/.test(manifest.engineeringEvidence.manifestSha256) || !/^[a-f0-9]{64}$/.test(manifest.engineeringEvidence.snapshotSha256)) throw new Error("frozen engineering evidence reference is missing or malformed")
 	if (frozenProofConfigDigest(manifest.execution.configs) !== manifest.execution.configSha256) throw new Error("frozen proof demonstration config digest mismatch")
@@ -91,4 +97,19 @@ export function verifyFrozenProofDemonstrationManifest(value: unknown): FrozenPr
 	const confirmationIds = new Set(manifest.execution.taskIdentities.filter((task) => task.split === "confirmation").map((task) => task.id))
 	if (!manifest.analysis.bootstrapSeed.trim() || !Number.isSafeInteger(manifest.analysis.bootstrapReplicates) || manifest.analysis.bootstrapReplicates < 1 || !manifest.analysis.confirmationRetentionTaskIds.length || new Set(manifest.analysis.confirmationRetentionTaskIds).size !== manifest.analysis.confirmationRetentionTaskIds.length || manifest.analysis.confirmationRetentionTaskIds.some((id) => !confirmationIds.has(id))) throw new Error("frozen proof demonstration analysis settings or confirmation retention set is invalid")
 	return manifest
+}
+
+
+function validateBenchmarkFixtureBinding(binding: ProofBenchmarkFixtureBinding | undefined, manifestSha256: string, configs: RsiConfig[]): void {
+	if (!binding) {
+		if (configs.some((config) => config.proofBenchmarkFixtures !== undefined)) throw new Error("proof configs contain a fixture binding absent from the frozen manifest")
+		return
+	}
+	if (!binding || typeof binding.root !== "string" || !path.isAbsolute(binding.root) || path.resolve(binding.root) !== binding.root
+		|| !/^[a-f0-9]{64}$/.test(binding.manifestSha256) || binding.manifestSha256 !== manifestSha256) throw new Error("proof benchmark fixture root or manifest binding is malformed")
+	const bindingKeys = Object.keys(binding).sort()
+	const expectedBindingKeys = binding.snapshotPackage ? ["manifestSha256", "root", "snapshotPackage"] : ["manifestSha256", "root"]
+	if (bindingKeys.length !== expectedBindingKeys.length || bindingKeys.some((key, index) => key !== expectedBindingKeys[index])) throw new Error("proof benchmark fixture binding has unexpected fields")
+	if (binding.snapshotPackage !== undefined && (Object.keys(binding.snapshotPackage).sort().join(",") !== "digest,path" || typeof binding.snapshotPackage.path !== "string" || !binding.snapshotPackage.path || !/^[a-f0-9]{64}$/.test(binding.snapshotPackage.digest))) throw new Error("proof benchmark snapshot package binding is malformed")
+	if (configs.some((config) => JSON.stringify(config.proofBenchmarkFixtures) !== JSON.stringify(binding))) throw new Error("proof configs do not share the frozen benchmark fixture binding")
 }

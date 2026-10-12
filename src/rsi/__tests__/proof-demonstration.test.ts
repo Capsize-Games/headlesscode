@@ -16,13 +16,14 @@ import { formatAnalysisReport } from "../../../scripts/rsi-proof-demonstration.j
 const sha256 = (value: Buffer | string) => createHash("sha256").update(value).digest("hex")
 
 function frozenPlan(): FrozenProofDemonstrationManifest {
-	const configs = ["engineering", "campaign-a", "campaign-b", "campaign-c"].map((seed) => ({ repoRoot: "/work", seed, mutationTask: "fixed task", protectedPaths: ["src/rsi"], evaluatorTrustedKeySha256: `sha256:${"9".repeat(64)}` } as RsiConfig)) as unknown as [RsiConfig, RsiConfig, RsiConfig, RsiConfig]
+	const benchmarkFixtures = { root: "/work/benchmark-fixtures", manifestSha256: "3".repeat(64), snapshotPackage: { path: "snapshots", digest: "a".repeat(64) } }
+	const configs = ["engineering", "campaign-a", "campaign-b", "campaign-c"].map((seed) => ({ repoRoot: "/work", seed, mutationTask: "fixed task", protectedPaths: ["src/rsi"], evaluatorTrustedKeySha256: `sha256:${"9".repeat(64)}`, proofBenchmarkFixtures: benchmarkFixtures } as RsiConfig)) as unknown as [RsiConfig, RsiConfig, RsiConfig, RsiConfig]
 	const runtime: WorkerHarnessRuntimeIdentity = { imageName: "headlesscode-openshell-rsi:fixed", imageDigest: `sha256:${"a".repeat(64)}`, harnessCommit: "b".repeat(40), dependencyLockDigest: "c".repeat(64) }
 	const tasks = ["dev-task", "confirm-task"].map((id, index) => ({ id, split: index ? "confirmation" : "development", family: "engine", seed: index + 1, startDigest: "d".repeat(64), verifierDigest: "e".repeat(64), knownGoodDigest: "f".repeat(64), knownBadDigest: "1".repeat(64), ceilings: { timeoutMs: 1000, maxCalls: 1, maxOutputTokensPerCall: 100, maxPatchBytes: 1000 } }))
 	const limits = { campaignId: "test", maxCalls: 1, maxInputTokensPerCall: 100, maxOutputTokensPerCall: 100, maxTotalTokens: 200, maxDurationMs: 1000, maxRequestBytes: 1000, maxResponseBytes: 1000, maxInputPricePerMillionUsd: 1, maxOutputPricePerMillionUsd: 1, maxCallSpendUsd: 0.01, maxJobSpendUsd: 0.02, maxCampaignSpendUsd: 1 }
 	const plan = { totalRootSpendCeilingUsd: 1, engineeringRootSpendCeilingUsd: 0.25, campaignRootsSpendCeilingUsd: 0.75, totalCalls: 1, totalTokens: 1, totalTaskWallMs: 1000 } as never
 	const args = {
-		createdAt: new Date(0).toISOString(), rootCommit: "2".repeat(40), benchmarkManifestSha256: "3".repeat(64),
+		createdAt: new Date(0).toISOString(), rootCommit: "2".repeat(40), benchmarkFixtures, benchmarkManifestSha256: "3".repeat(64),
 		model: { provider: "openshell-openrouter" as const, requestedId: RSI_OPENROUTER_MODEL, sampling: { temperature: 0 as const, think: false as const, seed: "provider-default" as const } },
 		endpointPrice: { model: RSI_OPENROUTER_MODEL, provider: "deepinfra" as const, endpointTag: "deepinfra/fp8" as const, quantization: "fp8" as const, supportedParameters: ["max_tokens", "temperature", "tools", "tool_choice"], inputPricePerMillionUsd: 0.06, outputPricePerMillionUsd: 0.18, observedAt: new Date(0).toISOString(), responseSha256: "4".repeat(64) },
 		priceCeilingsPerMillionUsd: { input: 1, output: 1 }, runtime,

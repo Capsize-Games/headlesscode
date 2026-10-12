@@ -16,6 +16,12 @@ export interface WorkerHarnessRuntimeIdentity {
 	dependencyLockDigest: string
 }
 
+export interface ProofBenchmarkFixtureBinding {
+	root: string
+	manifestSha256: string
+	snapshotPackage?: { path: string; digest: string }
+}
+
 export interface WorkerHarnessExecution {
 	mode: WorkerHarnessMode
 	parentCommit: string
@@ -227,6 +233,8 @@ export interface CurriculumTask {
 
 export interface RsiConfig {
 	repoRoot: string
+	/** Supervisor-only benchmark fixtures. This identity is never placed in a candidate job payload. */
+	proofBenchmarkFixtures?: ProofBenchmarkFixtureBinding
 	model: string
 	population: number
 	generations: number

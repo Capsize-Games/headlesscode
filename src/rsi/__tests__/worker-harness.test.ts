@@ -49,6 +49,7 @@ function testPairedArmDigestIgnoresOnlyTheHarnessArm(): void {
 	const fixed = workerHarnessConfigDigest({ ...config, workerHarnessMode: "fixed-control", workerHarnessPairId: "pair-a" }, identity)
 	const selfHosted = workerHarnessConfigDigest({ ...config, workerHarnessMode: "self-hosted", workerHarnessPairId: "pair-a" }, identity)
 	assert.equal(fixed, selfHosted)
+	assert.equal(workerHarnessConfigDigest({ ...config, proofBenchmarkFixtures: { root: "/private/fixtures-a", manifestSha256: "a".repeat(64) } }, identity), fixed, "operator-local fixture paths do not enter candidate worker config identity")
 	const differingSettings: Array<Partial<RsiConfig>> = [
 		{ mutationTask: "different task" },
 		{ seed: "different seed" },
