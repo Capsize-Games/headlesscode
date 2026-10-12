@@ -829,7 +829,7 @@ export class OpenRouterClient implements LlmClient {
 								entry.id = tc.id
 							}
 							if (typeof tc.function?.name === "string" && tc.function.name) {
-								entry.name = tc.function.name
+								entry.name += tc.function.name
 							}
 							if (typeof tc.function?.arguments === "string" && tc.function.arguments) {
 								entry.args.push(tc.function.arguments)
