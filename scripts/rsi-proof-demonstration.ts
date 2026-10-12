@@ -16,7 +16,7 @@ import { analyzeProofDemonstration, verifyProofDemonstrationArtifactBytes } from
 import { workerHarnessRuntimeIdentityFromEnvironment } from "../src/rsi/worker-harness.js"
 import { proofCampaignManifestDigest } from "../src/rsi/proof-campaign.js"
 import { resolveRoles } from "../src/rsi/roles.js"
-import type { CandidateRecord, ProofBenchmarkFixtureBinding, RsiConfig, RsiRunRecord } from "../src/rsi/types.js"
+import type { CandidateRecord, ProofBenchmarkFixtureBinding, RsiConfig, RsiPreparationReceipt, RsiRunRecord } from "../src/rsi/types.js"
 
 interface Options {
 	command: "estimate" | "plan" | "verify" | "analyze" | "engineering" | "execute"
@@ -440,7 +440,7 @@ export function formatAnalysisReport(report: ReturnType<typeof analyzeProofDemon
 	return lines.join("\n")
 }
 
-export async function buildProofPlanPreview(options: Options, env: NodeJS.ProcessEnv = process.env, fetcher: typeof fetch = fetch): Promise<ProofPlanPreview> {
+export async function buildProofPlanPreview(options: Options, env: NodeJS.ProcessEnv = process.env, fetcher: typeof fetch = fetch, onPreparationReceipt?: (receipt: RsiPreparationReceipt) => void | Promise<void>): Promise<ProofPlanPreview> {
 	if (options.command !== "estimate" && options.command !== "plan" && options.command !== "engineering") throw new Error("plan options are required")
 	if (options.command === "engineering" && options.seeds.length !== 1) throw new Error("engineering requires exactly one explicit --seed")
 	if (options.command !== "engineering" && options.seeds.length !== 4) throw new Error("provide one --seed for engineering and exactly three --campaign-seed values")
@@ -448,47 +448,91 @@ export async function buildProofPlanPreview(options: Options, env: NodeJS.Proces
 	if (new Set(seeds).size !== 4) throw new Error("engineering and campaign seeds must be distinct")
 	const repo = path.resolve(options.repo)
 	const rootCommit = await ensureCleanRoot(repo)
-	const runtime = workerHarnessRuntimeIdentityFromEnvironment(env)
-	try { execFileSync("git", ["cat-file", "-e", `${runtime.harnessCommit}^{commit}`], { cwd: repo, stdio: "ignore" }) }
-	catch { throw new Error("fixed-control runtime harness commit must be present in the root repository") }
-	const fixtureRoot = options.benchmarkFixturesRoot ?? path.join(repo, "fixtures", "rsi-benchmark")
-	const { binding: benchmarkFixtures, loaded } = await loadProofBenchmarkFixtures(fixtureRoot, repo)
-	const proofConfig = proofConfigFromOptions({ ...options, repo, seeds }, rootCommit, benchmarkFixtures)
-	const profile = openRouterProfileById(options.openRouterProfile ?? RSI_DEFAULT_OPENROUTER_PROFILE_ID)
-	const baseConfig = withEvaluatorIntegrityPin({
-		...proofConfig,
-		archiveDir: options.archiveDir ?? proofConfig.archiveDir,
-		model: profile.model,
-		roles: { worker: { provider: "openrouter" as const, model: profile.model, ...(profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { openRouterProfile: profile.id } : {}) } },
-		mutationTask: options.mutationTask,
-		workerHarnessRuntime: runtime,
-	}, options.evaluatorTrustedKeySha256)
-	assertProofWorkerProfile(baseConfig, profile, env)
-	const configs = seeds.map((seed, index) => ({ ...baseConfig, generations: index === 0 ? 2 : 3, seed })) as [typeof baseConfig, typeof baseConfig, typeof baseConfig, typeof baseConfig]
-	const config = configs[0]
-	const modelKey = env.HEADLESSCODE_OPENROUTER_API_KEY?.trim() ?? ""
-	const price = await fetchOpenRouterEndpointPrice(profile, modelKey, fetcher)
-	const mutationEnv = openRouterAllocatedEnvironment(env, "mutation")
-	const benchmarkEnv = openRouterAllocatedEnvironment(env, "benchmark")
-	const mutationLimits = openRouterBrokerLimitsFromEnvironment(mutationEnv, "plan-mutation", { maxCalls: config.maxIterations, ...(config.maxTokens ? { maxOutputTokensPerCall: config.maxTokens } : {}), maxDurationMs: config.commandTimeoutMs })
-	const benchmarkLimits = openRouterBrokerLimitsFromEnvironment(benchmarkEnv, "plan-benchmark")
-	if (mutationLimits.maxInputPricePerMillionUsd < price.inputPricePerMillionUsd || mutationLimits.maxOutputPricePerMillionUsd < price.outputPricePerMillionUsd || benchmarkLimits.maxInputPricePerMillionUsd < price.inputPricePerMillionUsd || benchmarkLimits.maxOutputPricePerMillionUsd < price.outputPricePerMillionUsd) throw new Error("configured broker price ceiling is below the live pinned endpoint rate")
-	const plan = planProofDemonstration({ config, manifest: loaded.manifest, mutationLimits, benchmarkLimits })
-	return {
-		createdAt: new Date().toISOString(), rootCommit, benchmarkFixtures, benchmarkManifestSha256: loaded.manifestDigest,
-		model: { provider: "openshell-openrouter", requestedId: profile.model, ...(profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { profileId: profile.id } : {}), sampling: { temperature: 0, think: false, seed: "provider-default" } },
-		endpointPrice: price,
-		priceCeilingsPerMillionUsd: { input: benchmarkLimits.maxInputPricePerMillionUsd, output: benchmarkLimits.maxOutputPricePerMillionUsd },
-		runtime,
-		execution: {
-			configs, configSha256: frozenProofConfigDigest(configs), analysisSourceSha256: await analysisDigest(repo),
-			inferenceLimits: { mutation: mutationLimits, benchmark: benchmarkLimits },
-			taskIdentities: loaded.manifest.tasks.map((task) => ({ id: task.id, split: task.split, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, knownGoodDigest: task.knownGoodDigest, knownBadDigest: task.knownBadDigest, ceilings: task.ceilings })),
-		},
-		seeds: { engineering: seeds[0]!, campaigns: [seeds[1]!, seeds[2]!, seeds[3]!] },
-		campaignIds: { engineering: campaignId(seeds[0]!), campaigns: [campaignId(seeds[1]!), campaignId(seeds[2]!), campaignId(seeds[3]!)] },
-		analysis: { bootstrapSeed: "rsi-proof-task-cluster-bootstrap-v1", bootstrapReplicates: 10_000, confirmationRetentionTaskIds: [...RSI_CONFIRMATION_RETENTION_TASK_IDS] },
-		plan,
+	const preparationStartedAt = process.hrtime.bigint()
+	const preparationPhaseStartedAt = new Map<RsiPreparationReceipt["phase"], bigint>()
+	let previewFinalStateEmitted = false
+	let previewManifestSha256: string | undefined
+	const emitPreparationReceipt = async (phase: RsiPreparationReceipt["phase"], state: RsiPreparationReceipt["state"], manifestSha256?: string): Promise<void> => {
+		if (!onPreparationReceipt) return
+		const timestamp = process.hrtime.bigint()
+		if (state === "started") preparationPhaseStartedAt.set(phase, timestamp)
+		const phaseStart = preparationPhaseStartedAt.get(phase) ?? timestamp
+		const elapsedMs = (value: bigint) => Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.round(Number(value) / 1_000_000)))
+		const receipt: RsiPreparationReceipt = {
+			schemaVersion: 1, kind: "rsi-preparation", phase, state, sourceCommit: rootCommit,
+			seedSha256: sha256(options.seeds[0]!), campaignId: campaignId(options.seeds[0]!),
+			...(manifestSha256 ? { manifestSha256 } : {}), phaseElapsedMs: state === "started" ? 0 : elapsedMs(timestamp - phaseStart),
+			elapsedSinceStartMs: elapsedMs(timestamp - preparationStartedAt), readiness: "preparing", inferenceAdmittedByReceipt: false,
+		}
+		await onPreparationReceipt(receipt)
+		if (phase === "proof-plan-preview" && (state === "completed" || state === "failed")) previewFinalStateEmitted = true
+	}
+	await emitPreparationReceipt("proof-plan-preview", "started")
+	try {
+		const runtime = workerHarnessRuntimeIdentityFromEnvironment(env)
+		try { execFileSync("git", ["cat-file", "-e", `${runtime.harnessCommit}^{commit}`], { cwd: repo, stdio: "ignore" }) }
+		catch { throw new Error("fixed-control runtime harness commit must be present in the root repository") }
+		const fixtureRoot = options.benchmarkFixturesRoot ?? path.join(repo, "fixtures", "rsi-benchmark")
+		await emitPreparationReceipt("fixture-validation", "started")
+		let fixtureLoad: Awaited<ReturnType<typeof loadProofBenchmarkFixtures>>
+		try { fixtureLoad = await loadProofBenchmarkFixtures(fixtureRoot, repo) }
+		catch (error) {
+			try { await emitPreparationReceipt("fixture-validation", "failed") } catch { /* preserve the original validation error */ }
+			throw error
+		}
+		const { binding: benchmarkFixtures, loaded } = fixtureLoad
+		previewManifestSha256 = loaded.manifestDigest
+		await emitPreparationReceipt("fixture-validation", "completed", loaded.manifestDigest)
+		const proofConfig = proofConfigFromOptions({ ...options, repo, seeds }, rootCommit, benchmarkFixtures)
+		const profile = openRouterProfileById(options.openRouterProfile ?? RSI_DEFAULT_OPENROUTER_PROFILE_ID)
+		const baseConfig = withEvaluatorIntegrityPin({
+			...proofConfig,
+			archiveDir: options.archiveDir ?? proofConfig.archiveDir,
+			model: profile.model,
+			roles: { worker: { provider: "openrouter" as const, model: profile.model, ...(profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { openRouterProfile: profile.id } : {}) } },
+			mutationTask: options.mutationTask,
+			workerHarnessRuntime: runtime,
+		}, options.evaluatorTrustedKeySha256)
+		assertProofWorkerProfile(baseConfig, profile, env)
+		const configs = seeds.map((seed, index) => ({ ...baseConfig, generations: index === 0 ? 2 : 3, seed })) as [typeof baseConfig, typeof baseConfig, typeof baseConfig, typeof baseConfig]
+		const config = configs[0]
+		const modelKey = env.HEADLESSCODE_OPENROUTER_API_KEY?.trim() ?? ""
+		await emitPreparationReceipt("pricing-admission", "started", loaded.manifestDigest)
+		let price: Awaited<ReturnType<typeof fetchOpenRouterEndpointPrice>>
+		try { price = await fetchOpenRouterEndpointPrice(profile, modelKey, fetcher) }
+		catch (error) {
+			try { await emitPreparationReceipt("pricing-admission", "failed", loaded.manifestDigest) } catch { /* preserve the original pricing error */ }
+			throw error
+		}
+		await emitPreparationReceipt("pricing-admission", "completed", loaded.manifestDigest)
+		const mutationEnv = openRouterAllocatedEnvironment(env, "mutation")
+		const benchmarkEnv = openRouterAllocatedEnvironment(env, "benchmark")
+		const mutationLimits = openRouterBrokerLimitsFromEnvironment(mutationEnv, "plan-mutation", { maxCalls: config.maxIterations, ...(config.maxTokens ? { maxOutputTokensPerCall: config.maxTokens } : {}), maxDurationMs: config.commandTimeoutMs })
+		const benchmarkLimits = openRouterBrokerLimitsFromEnvironment(benchmarkEnv, "plan-benchmark")
+		if (mutationLimits.maxInputPricePerMillionUsd < price.inputPricePerMillionUsd || mutationLimits.maxOutputPricePerMillionUsd < price.outputPricePerMillionUsd || benchmarkLimits.maxInputPricePerMillionUsd < price.inputPricePerMillionUsd || benchmarkLimits.maxOutputPricePerMillionUsd < price.outputPricePerMillionUsd) throw new Error("configured broker price ceiling is below the live pinned endpoint rate")
+		const plan = planProofDemonstration({ config, manifest: loaded.manifest, mutationLimits, benchmarkLimits })
+		await emitPreparationReceipt("proof-plan-preview", "completed", loaded.manifestDigest)
+		return {
+			createdAt: new Date().toISOString(), rootCommit, benchmarkFixtures, benchmarkManifestSha256: loaded.manifestDigest,
+			model: { provider: "openshell-openrouter", requestedId: profile.model, ...(profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { profileId: profile.id } : {}), sampling: { temperature: 0, think: false, seed: "provider-default" } },
+			endpointPrice: price,
+			priceCeilingsPerMillionUsd: { input: benchmarkLimits.maxInputPricePerMillionUsd, output: benchmarkLimits.maxOutputPricePerMillionUsd },
+			runtime,
+			execution: {
+				configs, configSha256: frozenProofConfigDigest(configs), analysisSourceSha256: await analysisDigest(repo),
+				inferenceLimits: { mutation: mutationLimits, benchmark: benchmarkLimits },
+				taskIdentities: loaded.manifest.tasks.map((task) => ({ id: task.id, split: task.split, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, knownGoodDigest: task.knownGoodDigest, knownBadDigest: task.knownBadDigest, ceilings: task.ceilings })),
+			},
+			seeds: { engineering: seeds[0]!, campaigns: [seeds[1]!, seeds[2]!, seeds[3]!] },
+			campaignIds: { engineering: campaignId(seeds[0]!), campaigns: [campaignId(seeds[1]!), campaignId(seeds[2]!), campaignId(seeds[3]!)] },
+			analysis: { bootstrapSeed: "rsi-proof-task-cluster-bootstrap-v1", bootstrapReplicates: 10_000, confirmationRetentionTaskIds: [...RSI_CONFIRMATION_RETENTION_TASK_IDS] },
+			plan,
+		}
+	} catch (error) {
+		if (!previewFinalStateEmitted) {
+			try { await emitPreparationReceipt("proof-plan-preview", "failed", previewManifestSha256) } catch { /* progress reporting must not replace the original preparation error */ }
+		}
+		throw error
 	}
 }
 
@@ -579,7 +623,8 @@ export async function writePriorIncompleteEngineeringStopReport(
 export async function executeEngineeringPair(options: Options, env: NodeJS.ProcessEnv = process.env, runner: typeof runRsi = runRsi): Promise<EngineeringEvidenceRecord | undefined> {
 	if (options.command !== "engineering") throw new Error("engineering command is required")
 	if (options.execute) requireEvaluatorIntegrityOptions(options)
-	const preview = await buildProofPlanPreview(options, env)
+	const receiptSink = (receipt: RsiPreparationReceipt): void => { process.stdout.write(`RSI_PREPARATION_RECEIPT ${JSON.stringify(receipt)}\n`) }
+	const preview = await buildProofPlanPreview(options, env, fetch, receiptSink)
 	const required = preview.plan.engineering.rootSpendCeilingUsd
 	if (!options.execute) {
 		if (options.operatorCapUsd !== undefined && parseUsd(options.operatorCapUsd) + 1e-9 < required) throw new Error(`operator cap $${options.operatorCapUsd.toFixed(6)} is below engineering-only root reservation $${required.toFixed(6)}`)
@@ -593,7 +638,21 @@ export async function executeEngineeringPair(options: Options, env: NodeJS.Proce
 	const benchmarkAllocation = preview.execution.inferenceLimits.benchmark.maxCampaignSpendUsd
 	if (mutationAllocation + benchmarkAllocation > cap + 1e-9 || mutationAllocation + benchmarkAllocation + 1e-9 < required) throw new Error("configured mutation and benchmark allocations must fit the operator cap and fund the engineering-only root reservation")
 	if (await ensureCleanRoot(options.repo) !== preview.rootCommit) throw new Error("engineering execution root changed after its estimate")
-	const config = await validateRuntimeEvaluatorIntegrity(preview.execution.configs[0], options)
+	const evaluatorStartedAt = process.hrtime.bigint()
+	const evaluatorReceipt = (state: RsiPreparationReceipt["state"]): RsiPreparationReceipt => {
+		const elapsed = Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.round(Number(process.hrtime.bigint() - evaluatorStartedAt) / 1_000_000)))
+		return {
+			schemaVersion: 1, kind: "rsi-preparation", phase: "evaluator-admission", state,
+			sourceCommit: preview.rootCommit, seedSha256: sha256(preview.seeds.engineering), campaignId: preview.campaignIds.engineering,
+			manifestSha256: preview.benchmarkManifestSha256, phaseElapsedMs: state === "started" ? 0 : elapsed,
+			elapsedSinceStartMs: elapsed, readiness: "preparing", inferenceAdmittedByReceipt: false,
+		}
+	}
+	receiptSink(evaluatorReceipt("started"))
+	let config: RsiConfig
+	try { config = await validateRuntimeEvaluatorIntegrity(preview.execution.configs[0], options) }
+	catch (error) { receiptSink(evaluatorReceipt("failed")); throw error }
+	receiptSink(evaluatorReceipt("completed"))
 	assertProofWorkerProfile(config, openRouterProfileById(preview.model.profileId ?? RSI_DEFAULT_OPENROUTER_PROFILE_ID), process.env)
 	const campaign = campaignId(preview.seeds.engineering)
 	const priorIncomplete = await writePriorIncompleteEngineeringStopReport(options, config, campaign, preview.rootCommit, preview.seeds.engineering, preview.runtime)

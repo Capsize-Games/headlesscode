@@ -22,7 +22,7 @@ import type { EvaluatorRuntimeIdentity } from "./evaluator-runtime.js"
 import { adversarialEvaluationArtifactIdentity, createAdversarialEvaluationSnapshotBundle, createEvaluationSnapshotBundle, createMutationSnapshotBundle, createMutationSnapshotIdentity, applyFleetMutationPatch } from "./openshell.js"
 import { ADVERSARIAL_COMMAND, ADVERSARIAL_PROMPT_VERSION, ADVERSARIAL_TESTS_PATH, buildAdversarialPrompt, parseAdversarialReview, requestAdversarialReview, sha256 } from "./adversarial.js"
 import { fleetJobMatches, fleetPayloadDigest, PostgresRsiJobQueue, fleetQueuePolicy, requiredFleetJobLeaseMs, type FleetJob, type FleetJobIdentity, type FleetJobPayload } from "./postgres-queue.js"
-import type { AdversarialReviewRecord, CandidateRecord, EvaluationSummary, ExperimentJob, RsiArchive, RsiConfig, RsiHooks, RsiRunRecord, TrajectoryRecord, TrialResult, WorkerHarnessExecution } from "./types.js"
+import type { AdversarialReviewRecord, CandidateRecord, EvaluationSummary, ExperimentJob, RsiArchive, RsiConfig, RsiHooks, RsiPreparationReceipt, RsiRunRecord, TrajectoryRecord, TrialResult, WorkerHarnessExecution } from "./types.js"
 import {
 	candidateCommits,
 	changedFiles,
@@ -1167,17 +1167,49 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		jobId,
 	}) : undefined
 	const proofFixturesRoot = config.proofBenchmarkFixtures?.root ?? path.join(packageRoot, "fixtures", "rsi-benchmark")
-	const loadedProofBenchmark = config.proofBenchmarkFixtures
-		? await loadBoundProofBenchmarkFixtures(config.proofBenchmarkFixtures, config.repoRoot)
-		: hooks.runDevelopmentBenchmark
-			? await fs.readFile(path.join(proofFixturesRoot, "manifest.json"), "utf8").then((rawManifest) => ({ manifest: JSON.parse(rawManifest) as BenchmarkManifest, manifestDigest: createHash("sha256").update(rawManifest).digest("hex") }))
-			: await loadBenchmark(proofFixturesRoot, config.repoRoot)
+	const preparationStartedAt = process.hrtime.bigint()
+	const preparationPhaseStartedAt = new Map<RsiPreparationReceipt["phase"], bigint>()
+	const emitPreparationReceipt = async (phase: RsiPreparationReceipt["phase"], state: RsiPreparationReceipt["state"], manifestSha256?: string): Promise<void> => {
+		if (!config.workerHarnessPairId) return
+		const timestamp = process.hrtime.bigint()
+		if (state === "started") preparationPhaseStartedAt.set(phase, timestamp)
+		const phaseStart = preparationPhaseStartedAt.get(phase) ?? timestamp
+		const elapsedMs = (value: bigint) => Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.round(Number(value) / 1_000_000)))
+		const receipt: RsiPreparationReceipt = {
+			schemaVersion: 1, kind: "rsi-preparation", phase, state, sourceCommit: baseCommit,
+			seedSha256: createHash("sha256").update(config.seed).digest("hex"), campaignId: config.workerHarnessPairId,
+			...((manifestSha256 ?? config.proofBenchmarkFixtures?.manifestSha256) ? { manifestSha256: manifestSha256 ?? config.proofBenchmarkFixtures!.manifestSha256 } : {}), phaseElapsedMs: state === "started" ? 0 : elapsedMs(timestamp - phaseStart),
+			elapsedSinceStartMs: elapsedMs(timestamp - preparationStartedAt),
+			readiness: phase === "campaign-acquire" && state === "completed" ? "campaign-acquired" : "preparing",
+			inferenceAdmittedByReceipt: false,
+		}
+		if (hooks.onPreparationReceipt) await hooks.onPreparationReceipt(receipt)
+		else log(hooks, `RSI_PREPARATION_RECEIPT ${JSON.stringify(receipt)}`)
+	}
+	const emitFailureReceipt = async (phase: RsiPreparationReceipt["phase"], manifestSha256?: string): Promise<void> => {
+		try { await emitPreparationReceipt(phase, "failed", manifestSha256) } catch { /* preserve the original preparation error */ }
+	}
+	await emitPreparationReceipt("fixture-validation", "started")
+	let loadedProofBenchmark: { manifest: BenchmarkManifest; manifestDigest: string }
+	try {
+		loadedProofBenchmark = config.proofBenchmarkFixtures
+			? await loadBoundProofBenchmarkFixtures(config.proofBenchmarkFixtures, config.repoRoot)
+			: hooks.runDevelopmentBenchmark
+				? await fs.readFile(path.join(proofFixturesRoot, "manifest.json"), "utf8").then((rawManifest) => ({ manifest: JSON.parse(rawManifest) as BenchmarkManifest, manifestDigest: createHash("sha256").update(rawManifest).digest("hex") }))
+				: await loadBenchmark(proofFixturesRoot, config.repoRoot)
+	} catch (error) {
+		await emitFailureReceipt("fixture-validation")
+		throw error
+	}
+	await emitPreparationReceipt("fixture-validation", "completed", loadedProofBenchmark.manifestDigest)
+	await emitPreparationReceipt("proof-protocol", "started", loadedProofBenchmark.manifestDigest)
 	const proofProtocol = freezeDevelopmentProofProtocol(
 		loadedProofBenchmark.manifest,
 		loadedProofBenchmark.manifestDigest,
 		{ provider: workerProvider, id: workerModel, sampling: { temperature: 0, think: false, seed: "provider-default" }, ...(workerOpenRouterProfile && workerOpenRouterProfile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { profileId: workerOpenRouterProfile.id } : {}) },
 		config.developmentProofRule,
 	)
+	await emitPreparationReceipt("proof-protocol", "completed", loadedProofBenchmark.manifestDigest)
 	const plannedGenerations = resumed?.workerHarnessPlannedGenerations ?? stageCount
 	if (resumed && (config.workerHarnessMode !== undefined || run.workerHarnessPairId !== undefined) && stageCount !== plannedGenerations) {
 		throw new Error("worker harness planned generation count differs from the frozen paired experiment")
@@ -1335,10 +1367,20 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	if (config.workerHarnessPairId && !config.dryRun) {
 		if (!config.workerHarnessMode || !workerHarnessRuntime || !fleetQueue) throw new Error("restart-safe paired worker-harness campaigns require an explicit arm, frozen runtime identity, and PostgreSQL fleet queue")
 				if (config.workerHarnessEngineeringOnly && (requestedPhase !== "development" || config.resumeRunId && resumed?.proofCampaign?.manifest.phaseMode !== "engineering-only")) throw new Error("engineering-only execution cannot resume or enter a confirmation campaign")
+		await emitPreparationReceipt("campaign-manifest", "started", loadedProofBenchmark.manifestDigest)
 		const manifest = createProofCampaignManifest({ config: runConfig, campaignId: config.workerHarnessPairId, baseCommit, model: workerModel, provider: workerProvider, ...(workerOpenRouterProfile && workerOpenRouterProfile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { openRouterProfileId: workerOpenRouterProfile.id } : {}), runtime: workerHarnessRuntime, developmentManifest: loadedProofBenchmark.manifest, developmentManifestDigest: loadedProofBenchmark.manifestDigest, plannedGenerations, proofProtocol })
-		campaignStore = fleetQueue.proofCampaignCoordinator()
+		await emitPreparationReceipt("campaign-manifest", "completed", loadedProofBenchmark.manifestDigest)
+		await emitPreparationReceipt("campaign-observation", "started", loadedProofBenchmark.manifestDigest)
+		let priorSnapshot: Record<string, unknown> | undefined
+		try {
+			campaignStore = fleetQueue.proofCampaignCoordinator()
+			priorSnapshot = await campaignStore.snapshotIfExists(config.workerHarnessPairId)
+		} catch (error) {
+			await emitFailureReceipt("campaign-observation", loadedProofBenchmark.manifestDigest)
+			throw error
+		}
+		await emitPreparationReceipt("campaign-observation", "completed", loadedProofBenchmark.manifestDigest)
 		if (hooks.runDevelopmentBenchmark) throw new Error("paired proof campaigns cannot use an injected benchmark hook that bypasses durable campaign admission and settlement")
-		const priorSnapshot = await campaignStore.snapshotIfExists(config.workerHarnessPairId)
 		const priorArm = (priorSnapshot?.arms as Array<Record<string, unknown>> | undefined)?.find((entry) => entry.arm_id === workerHarnessMode)
 		if (priorArm?.state === "finished") {
 			return rebuildFinishedProofCampaignArchive({ run, config, snapshot: priorSnapshot!, manifest, armId: workerHarnessMode, now })
@@ -1346,7 +1388,14 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		if (priorArm?.phase === "confirmation" && requestedPhase !== "confirmation") {
 			return rebuildEvaluatedProofCampaignArchive({ run, config, snapshot: priorSnapshot!, manifest, armId: workerHarnessMode, now })
 		}
-		campaignLease = await campaignStore.acquire(manifest, workerHarnessMode, run.runId, `${process.pid}:${randomUUID()}`)
+		await emitPreparationReceipt("campaign-acquire", "started", loadedProofBenchmark.manifestDigest)
+		try {
+			campaignLease = await campaignStore.acquire(manifest, workerHarnessMode, run.runId, `${process.pid}:${randomUUID()}`)
+		} catch (error) {
+			await emitPreparationReceipt("campaign-acquire", "failed", loadedProofBenchmark.manifestDigest)
+			throw error
+		}
+		await emitPreparationReceipt("campaign-acquire", "completed", loadedProofBenchmark.manifestDigest)
 		if (campaignLease.phase !== requestedPhase) throw new Error(`proof campaign lease is in ${campaignLease.phase}; requested ${requestedPhase}`)
 		run.proofCampaign = { manifest, manifestSha256: campaignLease.manifestSha256, campaignId: campaignLease.campaignId, armId: campaignLease.armId, epoch: campaignLease.epoch, state: "running" }
 		campaignHeartbeat = setInterval(() => {

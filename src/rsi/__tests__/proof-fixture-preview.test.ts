@@ -10,6 +10,7 @@ import { runRsi } from "../controller.js"
 import { benchmarkTreeDigest, materializeBenchmarkSnapshot } from "../benchmark/runner.js"
 import { buildSnapshotPackage } from "../benchmark/snapshot-package.js"
 import type { BenchmarkTask } from "../benchmark/types.js"
+import type { RsiPreparationReceipt } from "../types.js"
 
 const sha256 = (value: Buffer | string) => createHash("sha256").update(value).digest("hex")
 const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] })
@@ -122,19 +123,56 @@ test("proof preview binds an external package root and rejects missing fixtures 
 			}] } }), { status: 200 })
 		}) as typeof fetch
 
-		const preview = await buildProofPlanPreview(options, env, fetcher)
+		const previewReceipts: RsiPreparationReceipt[] = []
+		const preview = await buildProofPlanPreview(options, env, fetcher, (receipt) => { previewReceipts.push(receipt) })
 		assert.equal(metadataRequests, 1, "valid synthetic preview performs only the mocked pricing metadata GET")
+		assert.deepEqual(previewReceipts.map(({ phase, state }) => `${phase}:${state}`), [
+			"proof-plan-preview:started", "fixture-validation:started", "fixture-validation:completed",
+			"pricing-admission:started", "pricing-admission:completed", "proof-plan-preview:completed",
+		])
+		assert.ok(previewReceipts.every((receipt) => receipt.sourceCommit === rootCommit && receipt.seedSha256 === sha256("synthetic-eng") && receipt.inferenceAdmittedByReceipt === false && receipt.readiness === "preparing"))
+		const previewManifestSha256 = sha256(await fs.readFile(manifestPath))
+		assert.ok(previewReceipts.slice(2).every((receipt) => receipt.manifestSha256 === previewManifestSha256))
 		assert.deepEqual(preview.benchmarkFixtures, { root: await fs.realpath(fixtures), manifestSha256: sha256(await fs.readFile(manifestPath)), snapshotPackage: { path: "snapshots", digest: indexDigest } })
 		assert.deepEqual(preview.execution.configs.map((config) => config.proofBenchmarkFixtures), Array(4).fill(preview.benchmarkFixtures))
 		assert.equal(preview.benchmarkManifestSha256, preview.benchmarkFixtures.manifestSha256)
 		assert.equal(gitText(repo, ["status", "--porcelain=v1", "--untracked-files=all"]), "", "preview leaves the synthetic source root clean")
 
+		const runtimeFailureReceipts: RsiPreparationReceipt[] = []
+		const invalidRuntimeEnv = { ...env }
+		delete invalidRuntimeEnv.HEADLESSCODE_RSI_RUNTIME_IMAGE_DIGEST
+		await assert.rejects(buildProofPlanPreview(options, invalidRuntimeEnv, fetcher, (receipt) => { runtimeFailureReceipts.push(receipt) }), /HEADLESSCODE_RSI_RUNTIME_IMAGE_DIGEST/)
+		assert.deepEqual(runtimeFailureReceipts.map(({ phase, state }) => `${phase}:${state}`), ["proof-plan-preview:started", "proof-plan-preview:failed"])
+
+		const priceCeilingFailureReceipts: RsiPreparationReceipt[] = []
+		await assert.rejects(buildProofPlanPreview(options, {
+			...env, HEADLESSCODE_RSI_OPENROUTER_MAX_INPUT_PRICE_PER_MILLION_USD: "0.00000001",
+		}, fetcher, (receipt) => { priceCeilingFailureReceipts.push(receipt) }), /price ceiling is below the live pinned endpoint rate/)
+		assert.deepEqual(priceCeilingFailureReceipts.map(({ phase, state }) => `${phase}:${state}`), [
+			"proof-plan-preview:started", "fixture-validation:started", "fixture-validation:completed",
+			"pricing-admission:started", "pricing-admission:completed", "proof-plan-preview:failed",
+		])
+
+		const plannerFailureReceipts: RsiPreparationReceipt[] = []
+		await assert.rejects(buildProofPlanPreview(options, {
+			...env,
+			HEADLESSCODE_RSI_OPENROUTER_MAX_CALL_SPEND_USD: "0.000001",
+			HEADLESSCODE_RSI_OPENROUTER_MAX_JOB_SPEND_USD: "0.000002",
+			HEADLESSCODE_RSI_OPENROUTER_MUTATION_BUDGET_USD: "0.000003",
+			HEADLESSCODE_RSI_OPENROUTER_BENCHMARK_BUDGET_USD: "0.000003",
+		}, fetcher, (receipt) => { plannerFailureReceipts.push(receipt) }), /per-call spend cap is below the conservative runtime admission ceiling/)
+		assert.equal(plannerFailureReceipts.at(-1)?.phase, "proof-plan-preview")
+		assert.equal(plannerFailureReceipts.at(-1)?.state, "failed", "planner rejection terminates the preview receipt instead of leaving a stale started state")
+		assert.ok(plannerFailureReceipts.every((receipt) => receipt.inferenceAdmittedByReceipt === false && receipt.readiness === "preparing"))
+
 		const indexPath = path.join(packagePath, "index.json")
 		const originalIndex = await fs.readFile(indexPath)
 		await fs.writeFile(indexPath, Buffer.concat([originalIndex, Buffer.from(" ")]))
 		metadataRequests = 0
-		await assert.rejects(buildProofPlanPreview(options, env, fetcher), /pinned snapshot package digest mismatch/)
+		const tamperedReceipts: RsiPreparationReceipt[] = []
+		await assert.rejects(buildProofPlanPreview(options, env, fetcher, (receipt) => { tamperedReceipts.push(receipt) }), /pinned snapshot package digest mismatch/)
 		assert.equal(metadataRequests, 0, "changed package bytes fail before metadata pricing fetch")
+		assert.deepEqual(tamperedReceipts.map(({ phase, state }) => `${phase}:${state}`), ["proof-plan-preview:started", "fixture-validation:started", "fixture-validation:failed", "proof-plan-preview:failed"])
 		const controllerConfig = {
 			...proofConfigFromOptions({ repo, seeds: ["synthetic-eng"], mutationTask: "synthetic objective" }, rootCommit, preview.benchmarkFixtures),
 			archiveDir: path.join(root, "controller-archive"), worktreeDir: path.join(root, "controller-worktrees"), dryRun: true,

@@ -20,7 +20,7 @@ const campaign = {
 	deadline_expired: false, max_spend_microusd: "1000000", reserved_spend_microusd: "100", used_spend_microusd: "50",
 }
 
-function fixturePool(options: { malformedWorker?: boolean; throwOnQuery?: boolean; queueRows?: Array<Record<string, unknown>>; invalidReceipt?: boolean; finishedPastDeadline?: boolean; idleActiveCampaign?: boolean; armEpoch?: string; armState?: string; armPhase?: string; armIds?: string[]; attemptRows?: Array<Record<string, unknown>>; delayMs?: number } = {}) {
+function fixturePool(options: { malformedWorker?: boolean; throwOnQuery?: boolean; missingCampaign?: boolean; queueRows?: Array<Record<string, unknown>>; invalidReceipt?: boolean; finishedPastDeadline?: boolean; idleActiveCampaign?: boolean; armEpoch?: string; armState?: string; armPhase?: string; armIds?: string[]; attemptRows?: Array<Record<string, unknown>>; delayMs?: number } = {}) {
 	const statements: Array<{ sql: string; values?: unknown[] }> = []
 	let released = 0
 	const client = {
@@ -35,7 +35,7 @@ function fixturePool(options: { malformedWorker?: boolean; throwOnQuery?: boolea
 				: sql.includes("FROM headlesscode_rsi_workers") ? [{ worker_id: "worker-a", active: true, resource_classes: options.malformedWorker ? ["ALIEN"] : ["CPU"], registered_at: new Date(), heartbeat_at: new Date(), heartbeat_age_ms: "2", heartbeat_fresh: true }]
 				: sql.includes("FROM headlesscode_rsi_jobs") && sql.includes("GROUP BY status") ? options.queueRows ?? (options.idleActiveCampaign ? [] : [{ status: "queued", count: "1", expired_leases: "0", pending_teardown: "0", attempts_total: "0" }])
 				: sql.includes("FROM headlesscode_rsi_jobs") ? []
-				: sql.includes("FROM headlesscode_rsi_proof_campaigns") ? [{ ...campaign, state: options.finishedPastDeadline ? "finished" : campaign.state, deadline_expired: options.finishedPastDeadline ?? false, deadline_at: options.finishedPastDeadline ? new Date(Date.now() - 60_000) : campaign.deadline_at, reserved_spend_microusd: options.finishedPastDeadline || options.idleActiveCampaign ? "0" : campaign.reserved_spend_microusd, used_spend_microusd: options.finishedPastDeadline ? "100" : options.idleActiveCampaign ? "50" : campaign.used_spend_microusd }]
+				: sql.includes("FROM headlesscode_rsi_proof_campaigns") ? options.missingCampaign ? [] : [{ ...campaign, state: options.finishedPastDeadline ? "finished" : campaign.state, deadline_expired: options.finishedPastDeadline ?? false, deadline_at: options.finishedPastDeadline ? new Date(Date.now() - 60_000) : campaign.deadline_at, reserved_spend_microusd: options.finishedPastDeadline || options.idleActiveCampaign ? "0" : campaign.reserved_spend_microusd, used_spend_microusd: options.finishedPastDeadline ? "100" : options.idleActiveCampaign ? "50" : campaign.used_spend_microusd }]
 				: sql.includes("FROM headlesscode_rsi_proof_campaign_arms") ? (options.armIds ?? ["fixed-control", "self-hosted"]).map((arm_id) => ({ arm_id, epoch: options.armEpoch ?? "1", state: options.finishedPastDeadline ? "finished" : options.armState ?? "running", phase: options.armPhase ?? "development", coordinator_id: null, lease_expires_at: new Date(Date.now() + 30_000), lease_fresh: true }))
 				: sql.includes("FROM headlesscode_rsi_proof_campaign_attempts") ? options.finishedPastDeadline || options.idleActiveCampaign ? [] : options.attemptRows ?? [{ status: "dispatched", count: "1" }]
 				: sql.includes("FROM headlesscode_rsi_inference_campaigns AS campaigns") ? [options.invalidReceipt
@@ -158,6 +158,9 @@ test("monitor reports zero, sequential one, and both supported arm registrations
 })
 
 test("database outage and malformed operational rows produce unknown, never healthy", async () => {
+	const campaignPending = await readRsiOperationsStatus(fixturePool({ missingCampaign: true }).pool, statusOptions)
+	assert.equal(campaignPending.health, "unknown", "preparation progress cannot substitute for a durable campaign observation")
+	assert.equal(campaignPending.condition, "campaign-not-found")
 	const outage = fixturePool({ throwOnQuery: true })
 	assert.equal((await readRsiOperationsStatus(outage.pool, statusOptions)).health, "unknown")
 	const malformed = fixturePool({ malformedWorker: true })
