@@ -1,3 +1,18 @@
+# headlesscode v1.9.2
+
+- Selective tests use an installed `tsx` runner without a registry download.
+- An opt-in post-edit read-only limit stops repeated exploration after a source
+  edit while preserving the edit for review.
+- The inference broker waits for admitted requests to settle during shutdown;
+  workers and benchmarks capture their final billing receipt after shutdown.
+- Streamed tool-name fragments are assembled instead of overwritten.
+
+The final combined implementation passed typecheck, all 242 test files with
+PostgreSQL and RustFS enabled (zero skips, no exclusions), and nine mock CLI
+workflows. A contained Muse Contributor cloud run exercised the streaming CLI
+and selective test runner; all seven requests settled and matched independent
+OpenRouter generation billing. No local inference or GPU testing was performed.
+
 # headlesscode v1.3.0
 
 Released 2026-09-28.

@@ -179,8 +179,8 @@ containment, affected-user notification, and post-incident review.
 
 ## Supported versions
 
-Security fixes target the current `master` branch. This source version is
-1.4.0. Older release tags do not have a separate backport commitment.
+Security fixes target the current `master` branch. Older release tags do not
+have a separate backport commitment.
 
 ## Security-relevant areas
 
