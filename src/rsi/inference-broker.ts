@@ -702,6 +702,8 @@ export async function startOpenRouterBroker(options: OpenRouterBrokerOptions): P
 	const grant: OpenRouterBrokerGrant = { jobId: options.jobId, leaseToken: options.leaseToken, capability, model, ...profileReceiptIdentity(profile), ...(profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { endpointPrice } : {}), limits, issuedAtMs }
 	const jobDeadlineAtMs = await options.ledger.register(grant)
 	if (!Number.isFinite(jobDeadlineAtMs) || jobDeadlineAtMs <= now()) throw new Error("OpenRouter job duration limit exhausted")
+	let closing = false
+	const pendingHandlers = new Set<Promise<void>>()
 	const server: Server = createServer((request, response) => {
 		let requestBytes = Number(request.headers["content-length"] ?? 0)
 		if (!Number.isSafeInteger(requestBytes) || requestBytes < 0) requestBytes = 0
@@ -709,7 +711,8 @@ export async function startOpenRouterBroker(options: OpenRouterBrokerOptions): P
 			try { options.onHttpResponse?.({ method: request.method ?? "UNKNOWN", statusCode: response.statusCode, requestBytes }) } catch { /* diagnostics must not affect request handling */ }
 		})
 		let authenticated = false
-		void (async () => {
+		const handler = (async () => {
+			if (closing) { sendJson(response, 503, { error: { message: "broker is closing" } }); return }
 			const deny = async (status: number, reason: OpenRouterDenialReason, message: string): Promise<void> => {
 				try { await options.ledger.recordDenial(grant, status, reason) }
 				catch { sendJson(response, 500, { error: { message: "broker could not durably record request denial" } }); return }
@@ -803,6 +806,8 @@ export async function startOpenRouterBroker(options: OpenRouterBrokerOptions): P
 			if (authenticated) await options.ledger.recordDenial(grant, 500, "request-failed").catch(() => undefined)
 			if (!response.headersSent) sendJson(response, 500, { error: { message: "broker request failed closed" } }); else response.destroy()
 		})
+		pendingHandlers.add(handler)
+		void handler.then(() => pendingHandlers.delete(handler), () => pendingHandlers.delete(handler))
 	})
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject)
@@ -810,7 +815,7 @@ export async function startOpenRouterBroker(options: OpenRouterBrokerOptions): P
 	})
 	const address = server.address()
 	if (!address || typeof address === "string") { await new Promise<void>((resolve) => server.close(() => resolve())); throw new Error("OpenRouter broker did not bind a TCP port") }
-	let closed = false
+	let closePromise: Promise<void> | undefined
 	return {
 		capability,
 		guestBaseUrl: `http://host.openshell.internal:${address.port}`,
@@ -818,10 +823,21 @@ export async function startOpenRouterBroker(options: OpenRouterBrokerOptions): P
 		port: address.port,
 		maxPromptBytes,
 		async close() {
-			if (closed) return
-			closed = true
-			if (!server.listening) return
-			await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+			if (!closePromise) {
+				closing = true
+				const httpClosed = server.listening
+					? new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+					: Promise.resolve()
+				// Guest connections are no longer needed, including partial request bodies.
+				server.closeAllConnections()
+				// A disconnected guest socket does not cancel its paid upstream call.
+				// Retain the existing upstream deadline and await durable settlement.
+				const drained = (async () => {
+					while (pendingHandlers.size > 0) await Promise.allSettled([...pendingHandlers])
+				})()
+				closePromise = Promise.all([httpClosed, drained]).then(() => undefined)
+			}
+			await closePromise
 		},
 		receipt: async () => await options.ledger.receipt(grant),
 	}

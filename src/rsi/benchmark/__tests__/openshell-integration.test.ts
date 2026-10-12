@@ -169,7 +169,12 @@ try {
 		} })
 		brokerBaseUrl = broker.localBaseUrl
 		lastCapability = broker.capability
-		return broker
+		let closed = false
+		return {
+			...broker,
+			async close() { await broker.close(); closed = true },
+			async receipt() { assert.equal(closed, true, "benchmark final receipt must follow broker drain"); return broker.receipt() },
+		}
 	}
 	const agent = new OpenShellBenchmarkAgent(harnessRoot, providerFactory, "headlesscode-openshell-rsi:local", harnessCommit, undefined, "openshell-openrouter", brokerFactory)
 	const agentResult = await agent.run(request)
