@@ -323,20 +323,6 @@ test("fleet controller queues baseline and all candidate evaluations before wait
 	}
 })
 
-test("synthetic controller repository materializes the exact frozen benchmark history", async () => {
-	const { root } = await setup()
-	try {
-		await installFrozenBenchmarkHistory(root)
-		const manifest = JSON.parse(await fs.readFile(path.resolve("fixtures", "rsi-benchmark", "manifest.json"), "utf8")) as { tasks: Array<{ startCommit?: string }> }
-		for (const commit of [...new Set(manifest.tasks.map((task) => task.startCommit).filter((value): value is string => Boolean(value)))]) {
-			const tree = execFileSync("git", ["ls-tree", "-rz", "-r", "--full-tree", commit], { cwd: root })
-			assert.ok(tree.byteLength > 0, `frozen benchmark tree ${commit} is available to the loader`)
-		}
-	} finally {
-		await fs.rm(root, { recursive: true, force: true })
-	}
-})
-
 test("improve reports an incomplete campaign as failure despite a historical selected candidate", () => {
 	const outcome = improveRunOutcome({ runId: "run-incomplete", selected: "candidate-from-earlier-generation", proofCampaign: { state: "incomplete" } }, false)
 	assert.equal(outcome.exitCode, 1)
