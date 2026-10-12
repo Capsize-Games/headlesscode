@@ -340,9 +340,13 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 
 	let state = input.state
 	let activeRunnerClaims: ClaimSnapshot[] = []
+	const foreignRunnerClaimIssues = new Set<number>()
 	if (input.claimStore && input.runnerId && !dryRun) {
 		try {
 			const all = await input.claimStore.listActiveClaims()
+			for (const snapshot of all) {
+				if (snapshot.claim.runnerId !== input.runnerId) foreignRunnerClaimIssues.add(snapshot.claim.issue)
+			}
 			activeRunnerClaims = all.filter((entry) => entry.claim.runnerId === input.runnerId)
 			const reconciled = await reconcileRunnerClaims(state, activeRunnerClaims, input.claimStore, repoRoot, logger)
 			state = reconciled.state
@@ -404,8 +408,16 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 		? countRunnerPoolSessions(orchState, state, activeRunnerClaims)
 		: localActive
 	const available = Math.max(0, maxConcurrentSessions - active)
-	const toSpawn = newIssues.slice(0, Math.min(maxPerSweep, available))
-	const deferred = newIssues.slice(toSpawn.length)
+	const runnerPoolMode = !!input.claimStore && !!input.runnerId && !dryRun
+	// A different runner may own an earlier issue in the sorted list. In pool
+	// mode, scan past claim conflicts until this machine fills its available
+	// slots; otherwise a held lowest-numbered issue can starve every later one.
+	const toSpawn = runnerPoolMode
+		? newIssues
+		: newIssues.slice(0, Math.min(maxPerSweep, available))
+	let deferred = runnerPoolMode ? newIssues : newIssues.slice(toSpawn.length)
+	const runnerPoolIssueLimit = Math.min(maxPerSweep, available)
+	let runnerPoolCandidatesConsidered = 0
 
 	// Accounting for the sweep log: how much of the deferral was maxPerSweep
 	// vs the global cap (both ≥ 0).
@@ -443,6 +455,9 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 	}
 
 	for (const issue of toSpawn) {
+		if (runnerPoolMode && runnerPoolCandidatesConsidered >= runnerPoolIssueLimit) break
+		if (runnerPoolMode && foreignRunnerClaimIssues.has(issue.number)) continue
+		if (runnerPoolMode) runnerPoolCandidatesConsidered++
 		const prior = state.processed[String(issue.number)]
 		const retryingFailed = retryFailed && prior?.status === "failed"
 		const isHeadlessCodeJob = issue.labels.includes(HEADLESSCODE_JOB_LABEL)
@@ -587,6 +602,7 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 				if (!acquired.acquired) {
 					state = markProcessed(state, pendingEntry(issue, targetLabel))
 					logger.info(`watcher: issue #${issue.number} deferred; claim ${acquired.reason} on runner ${acquired.claim.runnerId}`)
+					if (runnerPoolMode) runnerPoolCandidatesConsidered--
 					continue
 				}
 				ownedClaim = acquired.claim
@@ -726,6 +742,9 @@ async function sweepOnce(input: SweepInput): Promise<SweepResult> {
 	}
 
 	state.lastSweep = new Date().toISOString()
+	if (runnerPoolMode) {
+		deferred = newIssues.filter((issue) => state.processed[String(issue.number)]?.status === "pending")
+	}
 	if (!dryRun) {
 		await saveWatcherState(statePath, state)
 	}
