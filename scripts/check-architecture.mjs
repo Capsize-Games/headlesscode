@@ -51,7 +51,8 @@ function checkCycles(workspaceRoot) {
 	const visit = (file) => {
 		if (stack.includes(file)) {
 			const cycle = [...stack.slice(stack.indexOf(file)), file]
-			const key = `cycle ${[...cycle].sort().join("<")}`
+			const relKey = [...new Set(cycle)].map((f) => path.relative(workspaceRoot, f)).sort()
+			const key = `cycle ${relKey.join("<")}`
 			if (!seen.has(key)) {
 				seen.add(key)
 				const rel = cycle.map((f) => path.relative(workspaceRoot, f))

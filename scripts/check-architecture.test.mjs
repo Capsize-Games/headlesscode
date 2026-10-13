@@ -61,6 +61,19 @@ try {
 		const cycles = run([diamond, "--workspace", diamond, "--no-baseline"]).out.split("\n").filter((l) => l.startsWith("cycle")).sort()
 		const want = ["cycle a.ts -> t.ts -> s.ts -> a.ts", "cycle t.ts -> s.ts -> b.ts -> t.ts"].sort()
 		if (JSON.stringify(cycles) !== JSON.stringify(want)) fail(`diamond cycles ${JSON.stringify(cycles)}, want ${JSON.stringify(want)}`)
+		const dbl = path.join(diamond, "baseline.json")
+		if (run([diamond, "--workspace", diamond, "--baseline", dbl, "--write-baseline"]).status !== 0) fail("diamond baseline write failed")
+		const moved = fs.mkdtempSync(path.join(os.tmpdir(), "headlesscode-moved-"))
+		try {
+			for (const name of fs.readdirSync(diamond)) {
+				if (name === "baseline.json") continue
+				fs.copyFileSync(path.join(diamond, name), path.join(moved, name))
+			}
+			const again = run([moved, "--workspace", moved, "--baseline", dbl]).out
+			if (/new: cycle/.test(again)) fail("cycle keys are not checkout-portable")
+		} finally {
+			fs.rmSync(moved, { recursive: true, force: true })
+		}
 	} finally {
 		fs.rmSync(diamond, { recursive: true, force: true })
 	}
