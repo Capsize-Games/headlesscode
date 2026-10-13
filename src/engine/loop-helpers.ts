@@ -13,23 +13,33 @@ import type {
 } from "../extensions/registry.js"
 import { MAX_BATCH_CALLS } from "../tools/batch.js"
 
+type AbortListenerEntry = { signal: AbortSignal; listener: () => void }
+
+function attachAbortSignal(
+	controller: AbortController,
+	signal: AbortSignal,
+	listeners: AbortListenerEntry[],
+): boolean {
+	if (signal.aborted) {
+		controller.abort(signal.reason)
+		return false
+	}
+	const listener = (): void => {
+		controller.abort(signal.reason)
+	}
+	signal.addEventListener("abort", listener, { once: true })
+	listeners.push({ signal, listener })
+	return true
+}
+
 export function combineAbortSignals(
 	signals: readonly (AbortSignal | undefined)[],
 ): { signal: AbortSignal; dispose: () => void } {
 	const controller = new AbortController()
-	type Entry = { signal: AbortSignal; listener: () => void }
-	const listeners: Entry[] = []
+	const listeners: AbortListenerEntry[] = []
 	for (const signal of signals) {
 		if (!signal) continue
-		if (signal.aborted) {
-			controller.abort(signal.reason)
-			break
-		}
-		const listener = (): void => {
-			controller.abort(signal.reason)
-		}
-		signal.addEventListener("abort", listener, { once: true })
-		listeners.push({ signal, listener })
+		if (!attachAbortSignal(controller, signal, listeners)) break
 	}
 	const dispose = (): void => {
 		for (const e of listeners) {
