@@ -16,10 +16,14 @@ import * as path from "node:path"
 
 import { orchestrateMain } from "../cli.js"
 import {
+	describeTarget,
 	findingsFromCommentBodies,
+	hasExactlyOneTarget,
+	parseIntFlag,
 	parseResumeArgs,
 	parseReviewArgs,
 	parseReworkArgs,
+	parseTargetArgs,
 	rebuildPatchFromMarkers,
 	recheckoutWorktree,
 	resumeGroup,
@@ -1212,6 +1216,53 @@ async function testOrchestrateMainDispatchesResumeHelp(): Promise<void> {
 	assert.ok(stdout.includes("orchestrate resume"), `resume help dispatched, got: ${stdout.slice(0, 80)}`)
 }
 
+// ─── hasExactlyOneTarget / parseTargetArgs / describeTarget / parseIntFlag ─
+
+async function testHasExactlyOneTarget(): Promise<void> {
+	assert.equal(hasExactlyOneTarget({ issue: 1 }), true)
+	assert.equal(hasExactlyOneTarget({ pr: 2 }), true)
+	assert.equal(hasExactlyOneTarget({ group: "w1" }), true)
+	assert.equal(hasExactlyOneTarget({}), false, "no target set")
+	assert.equal(hasExactlyOneTarget({ issue: 1, pr: 2 }), false, "two targets set")
+	assert.equal(hasExactlyOneTarget({ issue: 1, group: "w1" }), false, "two targets set")
+}
+
+async function testParseTargetArgs(): Promise<void> {
+	const issueOnly = parseTargetArgs(["--issue", "14", "--dry-run"])
+	assert.equal(issueOnly.error, undefined)
+	assert.deepEqual(issueOnly.target, { issue: 14 })
+	assert.deepEqual(issueOnly.rest, ["--dry-run"])
+	const eqForm = parseTargetArgs(["--group=w2"])
+	assert.equal(eqForm.error, undefined)
+	assert.deepEqual(eqForm.target, { group: "w2" })
+	const bad = parseTargetArgs(["--pr", "abc"])
+	assert.ok(bad.error && bad.error.includes("positive integer"))
+	const conflict = parseTargetArgs(["--issue", "1", "--group", "w1"])
+	assert.ok(conflict.error && conflict.error.includes("exactly one"))
+}
+
+async function testDescribeTarget(): Promise<void> {
+	assert.equal(describeTarget({ issue: 7 }), "issue #7")
+	assert.equal(describeTarget({ pr: 3 }), "PR #3")
+	assert.equal(describeTarget({ group: "w1" }), 'group "w1"')
+	assert.equal(describeTarget({}), "(none)")
+}
+
+async function testParseIntFlag(): Promise<void> {
+	const spaced = parseIntFlag(["--max-rework-cycles", "5"], 0, "--max-rework-cycles")
+	assert.equal(spaced.error, undefined)
+	assert.equal(spaced.value, 5)
+	assert.equal(spaced.consumed, 1)
+	const inline = parseIntFlag(["--max-rework-cycles=4"], 0, "--max-rework-cycles")
+	assert.equal(inline.error, undefined)
+	assert.equal(inline.value, 4)
+	assert.equal(inline.consumed, 0)
+	const missing = parseIntFlag(["--max-rework-cycles"], 0, "--max-rework-cycles")
+	assert.ok(missing.error && missing.error.includes("Missing value"))
+	const zero = parseIntFlag(["--max-rework-cycles", "0"], 0, "--max-rework-cycles")
+	assert.ok(zero.error && zero.error.includes("positive integer"))
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -1260,6 +1311,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["orchestrateMain dispatches review --help", testOrchestrateMainDispatchesReviewHelp],
 	["orchestrateMain dispatches rework --help", testOrchestrateMainDispatchesReworkHelp],
 	["orchestrateMain dispatches resume --help", testOrchestrateMainDispatchesResumeHelp],
+	["hasExactlyOneTarget accepts exactly one target", testHasExactlyOneTarget],
+	["parseTargetArgs extracts --issue/--pr/--group", testParseTargetArgs],
+	["describeTarget formats each target kind", testDescribeTarget],
+	["parseIntFlag handles spaced/inline/missing/invalid values", testParseIntFlag],
 ]
 
 async function main(): Promise<void> {

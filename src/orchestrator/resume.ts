@@ -63,14 +63,14 @@ export interface ResumeTarget {
 }
 
 /** One of --issue/--pr/--group is set (never more than one). */
-function hasExactlyOneTarget(target: ResumeTarget): boolean {
+export function hasExactlyOneTarget(target: ResumeTarget): boolean {
 	const set = (t: ResumeTarget): number =>
 		(t.issue !== undefined ? 1 : 0) + (t.pr !== undefined ? 1 : 0) + (t.group !== undefined ? 1 : 0)
 	return set(target) === 1
 }
 
 /** Extract --issue/--pr/--group from an argv list; the rest is returned untouched. */
-function parseTargetArgs(argv: string[]): { rest: string[]; target: ResumeTarget; error?: string } {
+export function parseTargetArgs(argv: string[]): { rest: string[]; target: ResumeTarget; error?: string } {
 	const target: ResumeTarget = {}
 	let error: string | undefined
 	const rest: string[] = []
@@ -1557,7 +1557,7 @@ function isGitRepo(repo: string): boolean {
 	}
 }
 
-function describeTarget(target: ResumeTarget): string {
+export function describeTarget(target: ResumeTarget): string {
 	if (target.issue !== undefined) {
 		return `issue #${target.issue}`
 	}
@@ -1945,7 +1945,7 @@ export async function resumeMain(argv: string[], io: ResumeIo = {}): Promise<num
 }
 
 /** Read a positive integer flag value via the argv cursor (shared by the parsers). */
-function parseIntFlag(argv: string[], i: number, flag: string): { value: number | undefined; error?: string; consumed: number } {
+export function parseIntFlag(argv: string[], i: number, flag: string): { value: number | undefined; error?: string; consumed: number } {
 	const eq = argv[i].indexOf("=")
 	const inlineValue = eq === -1 ? undefined : argv[i].slice(eq + 1)
 	const v = inlineValue ?? argv[i + 1]
