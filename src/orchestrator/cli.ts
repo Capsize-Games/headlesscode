@@ -24,6 +24,7 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
 
+import { createArgCursor } from "./arg-cursor.js"
 import { activeSessionCountForRepo, maxConcurrentSessionsFromEnv } from "../budget/concurrency.js"
 import { issueShape, issueSizeWarnings, splitIssues, type IssueSizeWarning, type SplitIssue, type WorktreeSpec } from "./split.js"
 import { readCostHistory } from "./cost-history.js"
@@ -350,21 +351,9 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 	}
 
 	for (let i = 0; i < argv.length; i++) {
-		const arg = argv[i]
-		const eq = arg.indexOf("=")
-		const flag = eq === -1 ? arg : arg.slice(0, eq)
-		const inlineValue = eq === -1 ? undefined : arg.slice(eq + 1)
-		const next = (): string | undefined => {
-			if (inlineValue !== undefined) {
-				return inlineValue
-			}
-			const v = argv[i + 1]
-			if (v === undefined || v.startsWith("--")) {
-				return undefined
-			}
+		const { arg, flag, next, nextRaw } = createArgCursor(argv, i, () => {
 			i++
-			return v
-		}
+		})
 
 			switch (flag) {
 			case "--executor": {
@@ -544,11 +533,10 @@ export function parseOrchestrateArgs(argv: string[]): { options: OrchestrateOpti
 			case "--deploy-args": {
 				// Deploy args legitimately start with "--" (e.g. --local), so
 				// bypass next()'s "--"-rejecting value reader.
-				const v = inlineValue ?? argv[i + 1]
+				const v = nextRaw()
 				if (v === undefined) {
 					return { options, error: "Missing value for --deploy-args" }
 				}
-				i++
 				options.deployArgs = v
 				break
 			}
@@ -1405,21 +1393,9 @@ export function parseStatusArgs(argv: string[]): { options: StatusOptions; error
 		help: false,
 	}
 	for (let i = 0; i < argv.length; i++) {
-		const arg = argv[i]
-		const eq = arg.indexOf("=")
-		const flag = eq === -1 ? arg : arg.slice(0, eq)
-		const inlineValue = eq === -1 ? undefined : arg.slice(eq + 1)
-		const next = (): string | undefined => {
-			if (inlineValue !== undefined) {
-				return inlineValue
-			}
-			const v = argv[i + 1]
-			if (v === undefined || v.startsWith("--")) {
-				return undefined
-			}
+		const { arg, flag, next } = createArgCursor(argv, i, () => {
 			i++
-			return v
-		}
+		})
 		switch (flag) {
 			case "--repo": {
 				const v = next()
@@ -1711,21 +1687,9 @@ export interface StopOptions {
 export function parseStopArgs(argv: string[]): { options: StopOptions; error?: string } {
 	const options: StopOptions = { repo: "", groups: [], graceMs: 5000, json: false, help: false }
 	for (let i = 0; i < argv.length; i++) {
-		const arg = argv[i]
-		const eq = arg.indexOf("=")
-		const flag = eq === -1 ? arg : arg.slice(0, eq)
-		const inlineValue = eq === -1 ? undefined : arg.slice(eq + 1)
-		const next = (): string | undefined => {
-			if (inlineValue !== undefined) {
-				return inlineValue
-			}
-			const v = argv[i + 1]
-			if (v === undefined || v.startsWith("--")) {
-				return undefined
-			}
+		const { arg, flag, next } = createArgCursor(argv, i, () => {
 			i++
-			return v
-		}
+		})
 		switch (flag) {
 			case "--repo": {
 				const v = next()
@@ -1938,21 +1902,9 @@ interface PipelineCliOptions {
 export function parsePipelineArgs(argv: string[]): { options: PipelineCliOptions; error?: string } {
 	const options: PipelineCliOptions = { skipFiling: false, help: false }
 	for (let i = 0; i < argv.length; i++) {
-		const arg = argv[i]
-		const eq = arg.indexOf("=")
-		const flag = eq === -1 ? arg : arg.slice(0, eq)
-		const inlineValue = eq === -1 ? undefined : arg.slice(eq + 1)
-		const next = (): string | undefined => {
-			if (inlineValue !== undefined) {
-				return inlineValue
-			}
-			const v = argv[i + 1]
-			if (v === undefined || v.startsWith("--")) {
-				return undefined
-			}
+		const { arg, flag, next } = createArgCursor(argv, i, () => {
 			i++
-			return v
-		}
+		})
 		switch (flag) {
 			case "--workspace":
 			case "--research-task":

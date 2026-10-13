@@ -4,6 +4,7 @@ import * as path from "node:path"
 import { execFileSync, spawn, spawnSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { setTimeout as delay } from "node:timers/promises"
+import { processGroupGone } from "../../testing/process-groups.js"
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..")
 const scratchRoot = path.join(packageRoot, ".headlesscode", "scratch")
@@ -149,7 +150,10 @@ try {
 	assert.equal(timeoutCompletion.exitCode, 125, "acknowledgment timeout is recorded as a startup failure after teardown")
 	const timeoutPgid = Number(timeoutCompletion.pgid)
 	assert.ok(Number.isSafeInteger(timeoutPgid) && timeoutPgid > 1)
-	assert.throws(() => process.kill(-timeoutPgid, 0), { code: "ESRCH" }, "the gated process group is gone before timeout completion is recorded")
+	// Procfs-based: the eval sandbox denies group-signal probes
+	// (killpg EPERM), so an ESRCH assert cannot observe absence there.
+	const goneNote = "gated group gone before completion is recorded"
+	assert.ok(processGroupGone(timeoutPgid), goneNote)
 	await assert.rejects(fs.access(timeoutStarted), "the worker wrapper remains gated until a matching acknowledgment is received")
 
 	const jobWorkspace = path.join(scratch, "job-workspace")

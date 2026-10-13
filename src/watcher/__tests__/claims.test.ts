@@ -108,6 +108,12 @@ function store(
 	})
 }
 
+// ESRCH: no such group. EPERM: sandbox policy blocks group probes
+// (an INT_MAX pgid cannot exist; either way it is undisturbable).
+function absentGroupError(error: NodeJS.ErrnoException): boolean {
+	return error.code === "ESRCH" || error.code === "EPERM"
+}
+
 async function testClaimLifecycleAndExpiredQuarantine(): Promise<void> {
 	const api = claimApi()
 	let now = new Date("2026-10-11T12:00:00.000Z")
@@ -328,7 +334,7 @@ async function testWatcherClaimSurvivesUntilConfirmedCompletion(): Promise<void>
 				const worktree = path.join(repoRoot, ".worktrees", spec.name)
 				await fs.mkdir(path.join(worktree, ".harness.done"), { recursive: true })
 				const absentPgid = 2_147_483_647
-				assert.throws(() => process.kill(-absentPgid, 0), (error: NodeJS.ErrnoException) => error.code === "ESRCH")
+				assert.throws(() => process.kill(-absentPgid, 0), absentGroupError)
 				await fs.writeFile(path.join(worktree, ".harness.pgid"), `${absentPgid}\n`)
 				await fs.writeFile(path.join(worktree, ".harness.openshell-sandbox"), "stale-sandbox-id\n")
 			}

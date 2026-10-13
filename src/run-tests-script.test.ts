@@ -11,6 +11,7 @@
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
 import * as fs from "node:fs"
+import * as os from "node:os"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -33,19 +34,56 @@ function run(args: string[]): string {
  * `git worktree` nested under `.worktrees/` (matching this repo's own
  * convention) with zero node_modules of its own.
  */
+// Hermetic fixture: a throwaway parent repo (git init) with a stub test
+// plus a real run-tests.mjs, and an UNTRACKED node_modules symlink the
+// child checkout never inherits. The bare child then resolves tsx by
+// walking up to the parent — the exact worktree scenario — without
+// needing the ambient checkout to be a git repo (RSI eval snapshots
+// extract files without .git) and without mutating its worktree list.
+function git(cwd: string, args: string[]): void {
+	execFileSync("git", args, { cwd })
+}
+
+function initWalkUpFixtureParent(): string {
+	const parent = fs.mkdtempSync(path.join(os.tmpdir(), "nm-parent-"))
+	git(parent, ["init", "-q", "--initial-branch=main"])
+	git(parent, ["config", "user.email", "fixture@invalid.example"])
+	git(parent, ["config", "user.name", "fixture"])
+	const dir = path.join(parent, "src", "fixture")
+	fs.mkdirSync(dir, { recursive: true })
+	const stub = path.join(dir, "spawn-state-reset.test.ts")
+	fs.writeFileSync(stub, "console.log(\"ok\")\n", "utf8")
+	fs.mkdirSync(path.join(parent, "scripts"), { recursive: true })
+	const runner = path.join(REPO_ROOT, "scripts", "run-tests.mjs")
+	fs.copyFileSync(runner, path.join(parent, "scripts", "run-tests.mjs"))
+	git(parent, ["add", "-A"])
+	git(parent, ["commit", "-qm", "fixture"])
+	const libs = path.join(REPO_ROOT, "node_modules")
+	fs.symlinkSync(libs, path.join(parent, "node_modules"))
+	return parent
+}
+
+function runFixtureRunner(wtPath: string): string {
+	const runner = path.join(wtPath, "scripts", "run-tests.mjs")
+	const opts = { cwd: wtPath, encoding: "utf-8" } as const
+	return execFileSync("node", [runner, "reset"], opts)
+}
+
 async function testResolvesTsxViaWalkUpInABareWorktree(): Promise<void> {
-	const wtName = `run-tests-nm-check-${Date.now()}`
-	const wtPath = path.join(REPO_ROOT, ".worktrees", wtName)
-	execFileSync("git", ["worktree", "add", "-q", wtPath, "HEAD", "--detach"], { cwd: REPO_ROOT })
+	const parent = initWalkUpFixtureParent()
 	try {
-		assert.ok(!fs.existsSync(path.join(wtPath, "node_modules")), "fixture worktree must have no node_modules of its own")
-		const out = execFileSync("node", [path.join(wtPath, "scripts", "run-tests.mjs"), "spawn-state-reset"], {
-			cwd: wtPath,
-			encoding: "utf-8",
-		})
-		assert.match(out, /all 1 file\(s\) passed/, `expected the test to run via walk-up resolution, got:\n${out}`)
+		const wtPath = path.join(parent, ".worktrees", "wt")
+		git(parent, ["worktree", "add", "-q", wtPath, "HEAD", "--detach"])
+		try {
+			const wtLibs = path.join(wtPath, "node_modules")
+			assert.ok(!fs.existsSync(wtLibs), "worktree has no libs")
+			const out = runFixtureRunner(wtPath)
+			assert.match(out, /all 1 file\(s\) passed/, `walk-up fail:\n${out}`)
+		} finally {
+			git(parent, ["worktree", "remove", "--force", wtPath])
+		}
 	} finally {
-		execFileSync("git", ["worktree", "remove", "--force", wtPath], { cwd: REPO_ROOT })
+		fs.rmSync(parent, { recursive: true, force: true })
 	}
 }
 
