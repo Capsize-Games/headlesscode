@@ -1760,20 +1760,9 @@ export async function main(argv: string[] = process.argv.slice(2), hooks?: CliRu
 
 }
 
-/**
- * Per-mode env var lookup for issue #142: `HEADLESSCODE_<BASE>__<MODE>`
- * (mode slug uppercased, "-" -> "_") wins if set, else the plain global
- * `HEADLESSCODE_<BASE>`, else undefined. Shared by both the per-mode
- * Ollama URL and model lookups so they resolve identically.
- */
-export function resolvePerModeEnv(
-	baseName: string,
-	mode: string,
-	env: NodeJS.ProcessEnv = process.env,
-): string | undefined {
-	const modeKey = mode.toUpperCase().replace(/-/g, "_")
-	return env[`${baseName}__${modeKey}`] ?? env[baseName]
-}
+import { envBoolean, envBooleanValue, resolvePerModeEnv } from "./cli-env.js"
+
+export { envBoolean, envBooleanValue, resolvePerModeEnv }
 
 /** Parse a positive finite number from env (undefined when unset/invalid). */
 function envNumber(name: string): number | undefined {
@@ -1783,20 +1772,6 @@ function envNumber(name: string): number | undefined {
 	}
 	const n = Number(raw)
 	return Number.isFinite(n) && n > 0 ? n : undefined
-}
-
-/** Pure env-boolean parse: "1"/"true"/"yes"/"on" → true; anything else (incl. unset) → false. */
-export function envBooleanValue(name: string, env: NodeJS.ProcessEnv): boolean {
-	const raw = env[name]
-	if (raw === undefined || raw === "") {
-		return false
-	}
-	return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase())
-}
-
-/** Parse an env boolean opt-in from process.env: "1"/"true"/"yes"/"on" → true; anything else (incl. unset) → false. */
-export function envBoolean(name: string): boolean {
-	return envBooleanValue(name, process.env)
 }
 
 /**

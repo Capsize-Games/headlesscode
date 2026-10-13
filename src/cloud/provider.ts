@@ -21,7 +21,7 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
 
-import { writeTaskFiles } from "../orchestrator/cli.js"
+import { writeTaskFiles } from "../orchestrator/task-files.js"
 import type { WorktreeSpec } from "../orchestrator/split.js"
 
 /** The worktree/issue spec a provider turns into an isolated session. */

@@ -3,7 +3,7 @@
  * budgets, plus the `N sub-calls: X ok, Y error(s)` counts line.
  */
 
-import type { BatchSection } from "./batch.js"
+import type { BatchSection } from "./batch-types.js"
 
 /** Per-section body cap (chars); the section keeps a truncation marker. */
 export const MAX_BATCH_SECTION_CHARS = 20000

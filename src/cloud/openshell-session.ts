@@ -2,7 +2,7 @@
 import * as fs from "node:fs"
 import * as path from "node:path"
 import { spawnSync } from "node:child_process"
-import { writeTaskFiles } from "../orchestrator/cli.js"
+import { writeTaskFiles } from "../orchestrator/task-files.js"
 import type { WorktreeSpec } from "../orchestrator/split.js"
 import { runOpenShellWorktreeCommand } from "./openshell-worker.js"
 import { OPENSHELL_HARNESS_ROOT } from "./openshell-provider.js"

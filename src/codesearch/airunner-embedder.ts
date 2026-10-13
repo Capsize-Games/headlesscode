@@ -37,7 +37,7 @@
  * does for the other backends.
  */
 
-import type { EmbedResult } from "./embedder.js"
+import type { EmbedResult } from "./embedder-types.js"
 
 /** Default AIRunner server base URL (AIRunner's standard local port). */
 export const DEFAULT_AIRUNNER_URL = "http://localhost:8080"

@@ -39,7 +39,7 @@ import { OllamaClient } from "../llm/ollama.js"
 import { MuseClient, providerDefaultModel, resolveLlmProvider } from "../llm/muse.js"
 import { loadCustomModes, selectToolsForMode } from "../engine/prompt.js"
 import { createHeadlessExecutor } from "../tools/executor.js"
-import { resolvePerModeEnv } from "../cli.js"
+import { resolvePerModeEnv } from "../cli-env.js"
 import type { LlmClient, SessionResult } from "../engine/types.js"
 
 /** Default path pattern for a research stage's artifact (relative to workspace). */

@@ -12,7 +12,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { parse, stringify } from "yaml"
 
-import { writeTaskFiles } from "../orchestrator/cli.js"
+import { writeTaskFiles } from "../orchestrator/task-files.js"
 import { projectStoreRoot, resolveProjectDataDir } from "../project-store.js"
 import type { CloudProvider, CloudSessionRequest, CommandResult, SessionHandle } from "./provider.js"
 import { CONTAINED_EVIDENCE_RUNTIME_PATH, containedGuestEnvironment, verifyContainedSandboxIdentity } from "../security/profile.js"

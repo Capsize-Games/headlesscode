@@ -64,6 +64,7 @@
 
 import { OpenRouterClient } from "../llm/openrouter.js"
 import { loadCentralSettings, type CentralSettings } from "../project-store.js"
+import type { Embedder, EmbedResult } from "./embedder-types.js"
 import { AirunnerEmbedder, resolveAirunnerEmbeddingModel, resolveAirunnerUrl } from "./airunner-embedder.js"
 import {
 	DEFAULT_OLLAMA_EMBEDDING_MODEL,
@@ -177,26 +178,10 @@ export function resolveEmbeddingProvider(settings: CentralSettings = loadCentral
 	}
 }
 
-/** The embedder interface the index build + tool handler depend on. */
-export interface Embedder {
-	/** Model id used for embedding (for pricing/usage accounting). */
-	readonly model: string
-	/**
-	 * Embed a batch of text chunks. Returns one vector per input, in order,
-	 * plus the real token usage (for budget accounting).
-	 */
-	embedBatch(texts: string[]): Promise<{ embeddings: number[][]; promptTokens: number; totalTokens: number }>
-}
+/** Embedder contracts live in the leaf; backends share them cycle-free. */
+export type { Embedder, EmbedResult } from "./embedder-types.js"
 
-/** Result of one embedder batch, including model + cost info for accounting. */
-export interface EmbedResult {
-	embeddings: number[][]
-	model: string
-	promptTokens: number
-	totalTokens: number
-}
-
-/** Name of the backend field on the index metadata block (shared with index.ts/types.ts). */
+/** Backend field name on the index metadata block (shared types). */
 export const METADATA_BACKEND_KEY = "backend" as const
 
 /** Name of the model field on the index metadata block (shared with index.ts/types.ts). */

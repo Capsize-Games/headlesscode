@@ -42,7 +42,7 @@ import { Logger } from "../engine/logger.js"
 import { OllamaClient } from "../llm/ollama.js"
 import { OpenRouterClient } from "../llm/openrouter.js"
 import { MuseClient, providerDefaultModel, resolveLlmProvider } from "../llm/muse.js"
-import { envBoolean, resolvePerModeEnv } from "../cli.js"
+import { envBoolean, resolvePerModeEnv } from "../cli-env.js"
 import {
 	appendBatchTool,
 	appendBrowserActionTool,

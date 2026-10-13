@@ -1,4 +1,4 @@
-import { verifyEvidenceFiles } from "./index.js"
+import { verifyEvidenceFiles } from "./verify.js"
 import { startContainedEvidenceService } from "../security/contained-evidence-service.js"
 
 /** Small parent-wirable CLI entry point; it never starts a collector implicitly. */
