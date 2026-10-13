@@ -196,11 +196,23 @@ async function testSec6DescendantsSymlinksCdChains(): Promise<void> {
 		assert.ok(symlinkRefusal !== null, "rm -rf through a symlink to the store must be refused")
 		assert.equal(symlinkRefusal?.kind, "protected_store")
 
-		// cd-chain: a relative target resolves against the post-cd cwd, not the
-		// pre-cd workspaceRoot.
-		const cdChainRefusal = checkCommand(`cd ${tmp} && rm -rf central-store`, [], [], { workspaceRoot: workspace })
-		assert.ok(cdChainRefusal !== null, "cd <tmp> && rm -rf central-store must resolve against the post-cd cwd")
-		assert.equal(cdChainRefusal?.kind, "protected_store")
+		// cd-chain outside the workspace refuses AT the cd (cd_escape precedes
+		// the store check — the cd itself already violates confinement, so the
+		// rm is never reached). Same blocking outcome, earlier + more precise.
+		const outsideCd = `cd ${tmp} && rm -rf central-store`
+		const decided = { workspaceRoot: workspace }
+		const cdChainRefusal = checkCommand(outsideCd, [], [], decided)
+		assert.ok(cdChainRefusal !== null, "outside cd must be refused at the cd")
+		assert.equal(cdChainRefusal?.kind, "cd_escape")
+
+		// Inside-only cd chains still resolve later targets against the
+		// post-cd cwd: a relative climb from the workspace to the store is
+		// caught by the store check, not the cd check.
+		const relToStore = path.relative(workspace, storeRoot)
+		const climb = `cd ${workspace} && rm -rf ${relToStore}`
+		const trackedRefusal = checkCommand(climb, [], [], decided)
+		assert.ok(trackedRefusal !== null, "relative climb must resolve post-cd")
+		assert.equal(trackedRefusal?.kind, "protected_store")
 
 		// cd-chain into an unrelated dir does not false-positive.
 		const cdChainAllowed = checkCommand(`cd ${workspace} && rm -rf ./scratch`, [], [], { workspaceRoot: workspace })
@@ -328,11 +340,13 @@ async function testWordSplittingAndPathResolution(): Promise<void> {
 	assert.equal(resolveCommandTarget("./scratch", "/ws"), path.resolve("/ws", "./scratch"))
 	assert.equal(resolveCommandTarget("~/x", "/ws"), path.join(os.homedir(), "x"))
 	assert.equal(resolveCommandTarget("/abs/x", "/ws"), "/abs/x", "absolute targets ignore the workspace root")
-	// With the store override UNSET, $HEADLESSCODE_DATA_DIR stays literal (an
-	// unset var is not expanded). `npm test` sets the var at the suite level,
-	// so clear it explicitly for this deterministic assertion.
+	// With the store override UNSET, $HEADLESSCODE_DATA_DIR strips to empty
+	// (exactly what the shell expands it to — bare `$U` then errors, safe).
+	// `npm test` sets the var at the suite level, so clear it explicitly for
+	// this deterministic assertion.
 	await withEnv("HEADLESSCODE_DATA_DIR", undefined, () => {
-		assert.equal(resolveCommandTarget("$HEADLESSCODE_DATA_DIR", "/ws"), path.resolve("/ws", "$HEADLESSCODE_DATA_DIR"))
+		const stripped = resolveCommandTarget("$HEADLESSCODE_DATA_DIR", "/ws")
+		assert.equal(stripped, path.resolve("/ws"))
 	})
 
 	// Containment edges (no filesystem access — pure path comparison).

@@ -383,6 +383,51 @@ async function testOutsideRedirectRefusedBeforeSpawn(): Promise<void> {
 	}
 }
 
+type HeadlessTestExecutor = ReturnType<typeof createHeadlessExecutor>
+
+async function assertConfinedDenied(
+	executor: HeadlessTestExecutor,
+	cmd: string,
+	phrase: RegExp,
+): Promise<void> {
+	const result = await executor.execute("execute_command", { command: cmd, timeout: 10 })
+	assert.equal(result.isError, true, `'${cmd}' must be refused`)
+	assert.match(result.content, /outside the workspace/)
+	assert.match(result.content, phrase)
+}
+
+async function assertOutsideRefused(
+	executor: HeadlessTestExecutor,
+	marker: string,
+): Promise<void> {
+	const touchEscape = `cd /tmp && touch ${marker}`
+	await assertConfinedDenied(executor, touchEscape, /changes directory/)
+	await assertConfinedDenied(executor, `cd ..`, /changes directory/)
+	await assertConfinedDenied(executor, `cp a ${marker}`, /writes outside/)
+	await assertConfinedDenied(executor, `git -C /tmp status`, /writes outside/)
+	assert.equal(await exists(marker), false, "refused commands must never spawn")
+}
+
+async function testOutsideCdAndOperandsRefusedBeforeSpawn(): Promise<void> {
+	const ws = await mkTmpWorkspace("hc-ec-confine-")
+	const marker = path.join(os.tmpdir(), `hc-ec-confine-${process.pid}`)
+	await fs.rm(marker, { force: true })
+	try {
+		await fs.mkdir(path.join(ws, "sub"))
+		const executor = createHeadlessExecutor(ws)
+		await assertOutsideRefused(executor, marker)
+		const inside = await executor.execute("execute_command", {
+			command: "cd sub && echo hello > out.txt && cp out.txt copy.txt",
+			timeout: 10,
+		})
+		assert.equal(inside.isError, false, "inside cd/cp must run")
+		assert.equal(await exists(path.join(ws, "sub", "copy.txt")), true)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+		await fs.rm(marker, { force: true })
+	}
+}
+
 /**
  * CI safety net for issue #35's fix: `BASH_PATH` must resolve to a REAL
  * bash binary on whatever machine runs this test, not silently fall back to
@@ -604,6 +649,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["execute_command: rm -rf of workspace scratch still runs (not the store)", testWorkspaceScratchCleanupStillAllowed],
 	["execute_command: non-destructive store access (echo) is allowed", testNonDestructiveStoreAccessAllowed],
 	["execute_command: outside-workspace redirect (/tmp, $VAR, compound) refused before spawn; inside redirect runs", testOutsideRedirectRefusedBeforeSpawn],
+	["confined cd/operands gate", testOutsideCdAndOperandsRefusedBeforeSpawn],
 	["execute_command: bash-only syntax (${PIPESTATUS[0]}) does not falsely fail the command", testBashOnlySyntaxDoesNotFalselyFailTheCommand],
 	["execute_command: BASH_PATH resolves to a real binary (CI safety net for issue #35)", testBashPathResolvesToARealBinary],
 	["execute_command: oversized stdout bounded at the cap, pipe drains, truncation trailer present", testOversizedOutputIsBoundedAtCap],

@@ -312,11 +312,18 @@ if [ -n "${HEADLESSCODE_WINDOW_SIZE:-}" ]; then
     BUDGET_ARG="$BUDGET_ARG --window-size '$HEADLESSCODE_WINDOW_SIZE'"
 fi
 
+# Issue #136 Part B: after the worker exits, diff the MAIN checkout against
+# the pre-launch snapshot (taken below) — a worker that wrote outside its
+# worktree trips the wire (marker file + loud harness.log lines). Runs
+# before mkdir .done, so a present .done marker implies the check ran.
+TRIPWIRE_CHECK="bash '$HARNESS_ROOT/scripts/check-main-tree-clean.sh' worker check '$WT_PATH' || echo 'TRIPWIRE-FAILED: main-tree check did not run — confinement unverified for this run'"
+
 WRAPPER="
 cd '$HARNESS_ROOT'
 $CLI $TASK_FLAG '$TASK_PATH' --workspace '$WT_PATH' --mode '$MODE' $MODEL_ARG $LOG_FILE_ARG $MEMORY_DIR_ARG $BUDGET_ARG
 CODE=\$?
 printf '%s' \"\$CODE\" > '$WT_PATH/.harness.exit'
+$TRIPWIRE_CHECK
 mkdir '$WT_PATH/.harness.done' 2>/dev/null
 exit \$CODE
 "
@@ -332,6 +339,7 @@ if [ "$EXECUTOR" = "muse" ]; then
         PROMPT_CLEANUP="$MUSE_PROMPT_FILE"
     fi
     MAX_MODEL_STEPS_VALUE="${MAX_ITERATIONS:-${HEADLESSCODE_MAX_ITERATIONS:-}}"
+    TRIPWIRE_CHECK_Q="bash $(printf '%q' "$HARNESS_ROOT/scripts/check-main-tree-clean.sh") worker check $(printf '%q' "$WT_PATH") || echo $(printf '%q' "TRIPWIRE-FAILED: main-tree check did not run — confinement unverified for this run")"
     WRAPPER="cd $(printf '%q' "$HARNESS_ROOT")
 bash $(printf '%q' "$HARNESS_ROOT/scripts/run-muse-worker.sh") \
   $(printf '%q' "$WT_PATH") $(printf '%q' "$MUSE_PROMPT_FILE") \
@@ -339,6 +347,7 @@ bash $(printf '%q' "$HARNESS_ROOT/scripts/run-muse-worker.sh") \
 CODE=\$?
 if [ -n $(printf '%q' "$PROMPT_CLEANUP") ]; then rm -f -- $(printf '%q' "$PROMPT_CLEANUP"); fi
 printf '%s' \"\$CODE\" > $(printf '%q' "$WT_PATH/.harness.exit")
+$TRIPWIRE_CHECK_Q
 mkdir $(printf '%q' "$WT_PATH/.harness.done") 2>/dev/null
 exit \$CODE
 "
@@ -369,6 +378,7 @@ cd '$HARNESS_ROOT'
 $CLI${SANDBOX_ARGS_QUOTED}
 CODE=\$?
 printf '%s' \"\$CODE\" > '$WT_PATH/.harness.exit'
+$TRIPWIRE_CHECK
 mkdir '$WT_PATH/.harness.done' 2>/dev/null
 exit \$CODE
 "
@@ -380,6 +390,9 @@ fi
 # ── Launch detached + record pid + pgid ─────────────────────────────────────
 rm -f "$WT_PATH/.harness.exit"
 rm -rf "$WT_PATH/.harness.done"
+# Issue #136 Part B: snapshot the MAIN checkout BEFORE the worker starts;
+# the wrapper diffs against this right after the worker exits.
+bash "$HARNESS_ROOT/scripts/check-main-tree-clean.sh" worker snapshot "$WT_PATH" || echo "run-worker: warning: main-tree tripwire snapshot failed" >&2
 # A worktree is reused across continuation/rework respawns, so harness.log
 # must be APPENDED to, never truncated — a worker that hits the iteration cap
 # or gets a review rework cycle keeps its full log history (and the orchestrator

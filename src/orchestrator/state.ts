@@ -110,6 +110,13 @@ export interface OrchestratorGroup {
 	pending_review_findings?: string[]
 	/** Worker exit code (written by run-worker.sh; recorded by the watcher). */
 	exit_code?: number
+	/**
+	 * Issue #136 Part B: main-checkout entries that appeared during this
+	 * group's run window — the worker wrote outside its worktree.
+	 * Persisted from <wt>/.harness.main-tree-dirty at completion; absent
+	 * means a clean run (or a group that finished before the tripwire).
+	 */
+	main_tree_dirty?: string[]
 	/** harness.log tail captured when the group completed. */
 	summary?: string
 	/** Set by the watcher's stall guard. */

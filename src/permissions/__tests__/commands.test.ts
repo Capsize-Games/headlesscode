@@ -15,11 +15,15 @@ import * as os from "node:os"
 import * as path from "node:path"
 
 import {
+	checkCdEscape,
 	checkCommand,
 	checkRedirectEscape,
+	checkWriteOperandEscape,
 	containsDangerousSubstitution,
 	decideCommand,
+	describeCdEscape,
 	describeRedirect,
+	describeWriteEscape,
 	findLongestPrefixMatch,
 	getCommandDecision,
 	isOutsideWorkspace,
@@ -352,6 +356,199 @@ async function testRedirectEscapeNotOverridableByAllowList(): Promise<void> {
 	}
 }
 
+// ─── cd-escape + write-operand confinement (issue #136) ─────────────────────
+
+function assertCdRefused(cmd: string, ws: string): void {
+	assert.notEqual(checkCdEscape(cmd, ws), null, `cd refuses: ${cmd}`)
+	assert.equal(decideCommand(cmd, [], [], { workspaceRoot: ws }), "deny")
+}
+
+function assertCdAllowed(cmd: string, ws: string): void {
+	assert.equal(checkCdEscape(cmd, ws), null, `cd allows: ${cmd}`)
+}
+
+function assertOperandRefused(cmd: string, ws: string): void {
+	const hit = checkWriteOperandEscape(cmd, ws)
+	assert.notEqual(hit, null, `operands refuse: ${cmd}`)
+	assert.equal(decideCommand(cmd, [], [], { workspaceRoot: ws }), "deny")
+}
+
+function assertOperandAllowed(cmd: string, ws: string): void {
+	const hit = checkWriteOperandEscape(cmd, ws)
+	assert.equal(hit, null, `operands allow: ${cmd}`)
+}
+
+function assertDecided(cmd: string, ws: string, verdict: string): void {
+	assert.equal(decideCommand(cmd, [], [], { workspaceRoot: ws }), verdict, cmd)
+}
+
+function assertRefusedAs(cmd: string, ws: string, kind: string): void {
+	const refusal = checkCommand(cmd, [], [], { workspaceRoot: ws })
+	assert.ok(refusal !== null && refusal.kind === kind, `${cmd} -> ${kind}`)
+}
+
+async function withTempWs(
+	label: string,
+	fn: (ws: string) => void,
+): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), `hc-cmd-${label}-`))
+	try {
+		fn(ws)
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+const CD_REFUSED_CASES = [
+	`cd /tmp`, `cd /`, `cd ..`, `cd ../..`, `cd ~/x`, `cd ~`, `cd`, `cd ""`,
+	`cd /tmp && echo hi`, `(cd /tmp)`, `(cd /tmp && make)`, `{ cd /tmp; }`,
+	`pushd /tmp`, `cd -- /tmp`, `FOO=1 cd /tmp`, `env FOO=1 cd /tmp`,
+	`command cd /tmp`, `builtin cd /tmp`, `time cd /tmp`, `! cd /tmp`,
+	`if cd /tmp; then x; fi`, `cd $HOME`, `cd $HC_UNSET_XYZ`,
+	`cd $HC_UNSET_XYZ/sub`, `bash -c 'cd /tmp'`, `bash -c "cd /tmp"`,
+	`sh -c 'cd /tmp'`, `eval "cd /tmp"`, `echo $(cd /tmp)`,
+	"echo `cd /tmp`", `echo $(echo hi && cd /tmp)`, `timeout 5 cd /tmp`,
+	`nice cd /tmp`, `nohup cd /tmp`, `until cd /tmp; do x; done`,
+	`env -i cd sub`, `env -u HOME cd ~`,
+]
+
+const CD_ALLOWED_CASES = [
+	`cd sub`, `cd .`, `cd ./sub`, `cd sub/dir`, `cd -`, `popd`, `pushd`,
+	`pushd +1`, `pushd -0`, `pushd sub`, `popd +1`,
+	`cd sub && echo hi > x`, `(cd sub && make)`, `{ cd sub; }`,
+	`FOO=1 cd sub`, `env FOO=1 cd sub`, `command cd sub`,
+	`cd $HC_TEST_SUBDIR`, `export D=sub && cd $D`, `D=sub && cd $D`,
+	`bash -c 'cd sub'`, `eval "cd sub"`, `echo $(pwd)`, `echo cd /tmp`,
+	`echo "cd /tmp"`, `cat <<EOF\ncd /tmp\nEOF`, `timeout 5 cd sub`,
+	`GIT_DIR=sub/.git git status`, `git status`,
+]
+
+const OP_REFUSED_CASES = [
+	`cp a /tmp/b`, `cp a b /tmp/`, `cp -r a /tmp/b`,
+	`cp --target-directory=/tmp a`, `cp --target-directory /tmp a`,
+	`cp -t /tmp a b`, `mv a /tmp/b`, `mv -t /tmp a`,
+	`ln -s a /tmp/l`, `ln /etc/hostname linkname`,
+	`install a /tmp/b`, `rsync -a a/ /tmp/b/`, `scp a /tmp/b`,
+	`echo hi | tee /tmp/a`, `tee /tmp/a /tmp/b`,
+	`git -C /tmp status`, `git --git-dir=/a/b status`,
+	`git --work-tree /tmp status`, `tar -xf a.tar -C /tmp`,
+	`tar -cf /tmp/a.tar files`, `tar -xPf a.tar`,
+	`sed -i 's/a/b/' /tmp/f`, `sed -i.bak s/a/b/ /tmp/f`,
+	`perl -pi -e 's/a/b/' /tmp/f`, `curl -o /tmp/f http://e`,
+	`curl --output-dir /tmp -O http://e/x`,
+	`wget -O /tmp/f http://e`, `wget -P /tmp http://e/x`,
+	`bash /tmp/s.sh`, `sh -c 'cp a /tmp/b'`,
+	`bash -s < script.sh`, `env -i bash -c echo`,
+	`cp a $HC_UNSET_XYZ/b`, `GIT_DIR=/elsewhere/.git git status`,
+	`GIT_WORK_TREE=/elsewhere git status`,
+	`export GIT_DIR=/elsewhere/.git && git status`,
+]
+
+const OP_ALLOWED_CASES = [
+	`cp a b`, `cp a b sub/`, `cp -t sub a`, `mv a sub/`,
+	`ln -s /etc/hostname link`, `ln -s a b`, `ln a b`,
+	`install a sub/b`, `rsync -a a/ sub/`, `scp a h:/x`,
+	`tee out.log`, `echo hi | tee a b`, `git status`,
+	`git -C sub status`, `tar -xzf a.tar`, `tar -C sub -xf a.tar`,
+	`sed 's/a/b' f`, `sed -i 's/a/b' f`, `sed -i.bak s/a/b/ f`,
+	`perl -pe 's/a/b' f`, `curl -o f http://e`, `curl -O http://e/f`,
+	`wget http://e/f`, `wget -P sub u`, `bash script.sh`,
+	`bash -c 'echo hi'`, `cat /etc/hostname`, `echo cp a /tmp/b`,
+	`sudo true`,
+]
+
+const CHAIN_ALLOW_CASES = [
+	`export O=d && echo hi > $O/f`, `O=d && echo hi > $O/f`,
+	`export A=1 B=sub && cd $B`, `export O=sub && cp a $O/b`,
+	`echo hi > \${HC_UNSET_XYZ:-sub}/f`,
+	`echo hi > $HC_UNSET_XYZ`, `rm -rf $HC_UNSET_XYZ`,
+]
+
+const CHAIN_DENY_CASES: Array<[string, string]> = [
+	[`export O=/tmp && echo hi > $O/f`, "redirect_escape"],
+	[`F=$(mktemp -d) && echo hi > $F/x`, "redirect_escape"],
+	["F=`mktemp` && cp a $F", "write_escape"],
+	[`export D=/tmp && cd $D`, "cd_escape"],
+	[`echo hi > \${HC_UNSET_XYZ:-/tmp/x}`, "redirect_escape"],
+	[`echo hi > $HC_UNSET_XYZ/x`, "redirect_escape"],
+	[`rm -rf $HC_UNSET_XYZ/`, "protected_store"],
+]
+
+async function testCdEscapeRefused(): Promise<void> {
+	await withTempWs("cd", (ws) => {
+		for (const cmd of CD_REFUSED_CASES) assertCdRefused(cmd, ws)
+	})
+}
+
+async function testCdEscapeAllowed(): Promise<void> {
+	const saved = process.env.HC_TEST_SUBDIR
+	process.env.HC_TEST_SUBDIR = "sub/dir"
+	try {
+		await withTempWs("cd-ok", (ws) => {
+			for (const cmd of CD_ALLOWED_CASES) assertCdAllowed(cmd, ws)
+		})
+	} finally {
+		if (saved === undefined) delete process.env.HC_TEST_SUBDIR
+		else process.env.HC_TEST_SUBDIR = saved
+	}
+}
+
+async function testCdEscapeCdpath(): Promise<void> {
+	const saved = process.env.CDPATH
+	try {
+		await withTempWs("cdpath", (ws) => {
+			delete process.env.CDPATH
+			assertCdAllowed(`cd foo`, ws)
+			process.env.CDPATH = "/tmp"
+			assertCdRefused(`cd foo`, ws)
+			assertCdAllowed(`cd ./foo`, ws)
+			assertCdAllowed(`cd sub/foo`, ws)
+		})
+	} finally {
+		if (saved === undefined) delete process.env.CDPATH
+		else process.env.CDPATH = saved
+	}
+}
+
+async function testWriteOperandRefused(): Promise<void> {
+	await withTempWs("op", (ws) => {
+		for (const cmd of OP_REFUSED_CASES) assertOperandRefused(cmd, ws)
+	})
+}
+
+async function testWriteOperandAllowed(): Promise<void> {
+	await withTempWs("op-ok", (ws) => {
+		for (const cmd of OP_ALLOWED_CASES) assertOperandAllowed(cmd, ws)
+	})
+}
+
+async function testChainExportOverlay(): Promise<void> {
+	await withTempWs("chain", (ws) => {
+		for (const cmd of CHAIN_ALLOW_CASES) assertDecided(cmd, ws, "allow")
+		for (const [cmd, kind] of CHAIN_DENY_CASES) assertRefusedAs(cmd, ws, kind)
+	})
+}
+
+async function testCdRefusalPrecedesRedirect(): Promise<void> {
+	await withTempWs("order", (ws) => {
+		const cdFirst = [
+			`cd /tmp && echo hi > x`, `(cd /tmp && echo hi > x)`, `cd && echo hi > x`,
+		]
+		for (const cmd of cdFirst) assertRefusedAs(cmd, ws, "cd_escape")
+		const probe = `cd /tmp && echo hi > x`
+		const refusal = checkCommand(probe, [], [], { workspaceRoot: ws })
+		assert.ok(refusal !== null && refusal.cd !== undefined)
+		assertDecided(`cd sub && echo hi > x`, ws, "allow")
+		const target = { subCommand: "cd /tmp", directory: "/tmp" }
+		assert.equal(describeCdEscape(target), "cd /tmp")
+		const wrote = checkWriteOperandEscape(`cp a /tmp/b`, ws)
+		assert.ok(wrote !== null && wrote.command === "cp")
+		assert.ok(wrote !== null && wrote.operand === "/tmp/b")
+		const operand = { subCommand: "x", command: "cp", operand: "/tmp/b" }
+		assert.equal(describeWriteEscape(operand), "cp writes /tmp/b")
+	})
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -364,6 +561,13 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["redirect-escape guard (issue #122): >/>>/2>/&> outside the workspace always denied, inside allowed", testRedirectEscapeAlwaysDenied],
 	["redirect target extraction + resolution + describeRedirect", testRedirectTargetParsing],
 	["redirect-escape guard is NOT overridable by an allow-everything config", testRedirectEscapeNotOverridableByAllowList],
+	["cd outside the workspace is refused (#136)", testCdEscapeRefused],
+	["cd inside the workspace is allowed", testCdEscapeAllowed],
+	["cd with CDPATH fails closed on slashless operands", testCdEscapeCdpath],
+	["write operands outside the workspace are refused", testWriteOperandRefused],
+	["write operands inside the workspace are allowed", testWriteOperandAllowed],
+	["chain exports overlay; unknown vars fail closed", testChainExportOverlay],
+	["cd refusal precedes redirect; describes", testCdRefusalPrecedesRedirect],
 ]
 
 async function main(): Promise<void> {

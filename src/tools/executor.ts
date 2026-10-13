@@ -98,9 +98,12 @@ import { runTestsHandler } from "./run-tests.js"
 
 import type { AuxLlmUsage, ToolContext, ToolHandler, ToolResult } from "../engine/types.js"
 import {
+	checkCdEscape,
 	checkCommand,
 	checkRedirectEscape,
+	describeCdEscape,
 	describeRedirect,
+	describeWriteEscape,
 	type CommandRefusal,
 	type RedirectTarget,
 } from "../permissions/commands.js"
@@ -503,7 +506,51 @@ function refusalMessage(command: string, refusal: CommandRefusal): ToolResult {
 					`Write scratch files under <workspaceRoot>/.headlesscode/scratch/ instead.`,
 			)
 		}
+		default:
+			return confinementRefusal(command, refusal)
 	}
+}
+
+function confinementRefusal(
+	command: string,
+	refusal: CommandRefusal,
+): ToolResult {
+	if (refusal.kind === "cd_escape") {
+		return cdEscapeRefusal(command, refusal)
+	}
+	if (refusal.kind === "write_escape") {
+		return writeEscapeRefusal(command, refusal)
+	}
+	throw new Error(`unhandled refusal kind: ${refusal.kind}`)
+}
+
+function cdEscapeRefusal(command: string, refusal: CommandRefusal): ToolResult {
+	const cd = refusal.cd
+	const shown = cd === undefined ? "a directory change" : describeCdEscape(cd)
+	return err(
+		`execute_command: refusing to run '${command}': it changes directory ` +
+			`outside the workspace root ('${shown}') — every later relative ` +
+			`path would resolve outside the workspace. Stay inside the ` +
+			`workspace (cd to a workspace-relative directory). This cannot ` +
+			`be overridden via --allowed-commands or permissions.json.`,
+	)
+}
+
+function writeEscapeRefusal(
+	command: string,
+	refusal: CommandRefusal,
+): ToolResult {
+	const operand = refusal.writeOperand
+	const fallback = "a file write"
+	const shown = operand === undefined ? fallback : describeWriteEscape(operand)
+	return err(
+		`execute_command: refusing to run '${command}': it writes outside ` +
+			`the workspace root ('${shown}') — the resolved path is outside ` +
+			`the workspace and cannot be written from a harness session. ` +
+			`This is the same boundary every file tool enforces and cannot ` +
+			`be overridden via --allowed-commands or permissions.json. ` +
+			`Write inside the workspace instead.`,
+	)
 }
 
 function truncate(content: string): string {
@@ -1552,22 +1599,29 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext, 
 		}
 
 		// Permissions gate (command allow/deny + dangerous substitution +
-		// central-store protection + redirect-escape): refuse BEFORE spawning
-		// so nothing is ever executed. Compound commands are checked per
-		// sub-command (parseCommand splits on &&/||/;/|/&) — a denied or
-		// unallow-listed sub-command blocks the whole chain. This applies to
-		// every executor built on this handler, including the read-only
-		// reviewer/QA executors (they share it), which also run unattended and
-		// could otherwise run arbitrary commands. A refusal is a real tool
-		// error (isError: true) and therefore counts toward the loop's
-		// consecutive-mistake bound, same as any tool error. The command's
-		// resolved `cwd` anchors relative targets for the central-store and
-		// redirect-escape checks (see src/permissions/store-protection.ts and
+		// central-store protection + redirect/cd/write-operand escapes):
+		// refuse BEFORE spawning so nothing is ever executed. Compound
+		// commands are checked per sub-command (parseCommand splits on
+		// &&/||/;/|/&) — a denied or unallow-listed sub-command blocks the
+		// whole chain. This applies to every executor built on this handler,
+		// including the read-only reviewer/QA executors (they share it),
+		// which also run unattended and could otherwise run arbitrary
+		// commands. A refusal is a real tool error (isError: true) and
+		// therefore counts toward the loop's consecutive-mistake bound, same
+		// as any tool error. The command's resolved `cwd` anchors relative
+		// targets for the central-store, redirect, cd, and write-operand
+		// checks (see src/permissions/store-protection.ts and
 		// src/permissions/commands.ts). The redirect-escape scan runs against
 		// the RAW command before checkCommand parses it (a redirect embedded
 		// in an unparseable fragment — e.g. a heredoc body's `> /tmp` line —
 		// would otherwise be swallowed by the malformed-command path).
 		const redirectRoot = cwd
+		const cdEscape = checkCdEscape(command, redirectRoot)
+		if (cdEscape !== null) {
+			return refusalMessage(command, {
+				kind: "cd_escape", subCommand: command, cd: cdEscape,
+			})
+		}
 		const redirectEscape = checkRedirectEscape(command, redirectRoot)
 		if (redirectEscape !== null) {
 			return refusalMessage(command, { kind: "redirect_escape", subCommand: command, redirect: redirectEscape })
