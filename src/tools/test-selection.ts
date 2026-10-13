@@ -104,10 +104,12 @@ export interface TestSelectionResult {
  * Select the test file(s) to run for a set of changed workspace-relative
  * files. Returns an empty `tests` list (with a note) when nothing matches —
  * the caller must report the fail-safe "no specific tests matched" instead
- * of pretending zero tests ran.
+ * of pretending zero tests ran. `intel` may be undefined when the caller
+ * already knows every file matches directly; the reverse-dependency tier is
+ * then skipped (review gates, #137).
  */
 export function selectTestsForChangedFiles(
-	intel: CodeIntel,
+	intel: CodeIntel | undefined,
 	workspaceRoot: string,
 	changedFiles: string[],
 ): TestSelectionResult {
@@ -136,7 +138,9 @@ export function selectTestsForChangedFiles(
 			continue
 		}
 		const abs = path.resolve(workspaceRoot, normalized)
-		const reverse = reverseDependencyTests(intel, workspaceRoot, abs)
+		const reverse = intel === undefined
+			? []
+			: reverseDependencyTests(intel, workspaceRoot, abs)
 		if (reverse.length > 0) {
 			for (const t of reverse) {
 				tests.add(t)

@@ -40,6 +40,7 @@ import {
 	type OrchestratorState,
 } from "./state.js"
 import { runReviewWithRetries, type ReviewResult } from "./reviewer.js"
+import { runReviewGates } from "./review-gates.js"
 import { hasRealVerificationActivity, hasRealWorktreeChanges } from "./verification-gate.js"
 import { runFilingStage, runResearchStage } from "./pipeline.js"
 import { analyzeWorktreeSessions } from "./log-analysis.js"
@@ -2733,6 +2734,28 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 					process.stdout.write(
 						`[orchestrate] AUTOMATIC FAIL: ${group.name}'s worktree has no real changes — skipping the review session (a "clean" verdict is structurally impossible with an empty diff)\n`,
 					)
+					return true
+				}
+				// Tier 3 (#137): deterministic quality gates for the worktree
+				// diff run BEFORE the LLM review session. Red gates make a
+				// "clean" verdict impossible (Tier 1 precedent) — skip the
+				// session and hand the gate output to rework as findings.
+				const gates = runReviewGates(reviewWtPath)
+				if (!gates.ok) {
+					const detail = "Review quality gates failed"
+						+ ` in the worktree:\n${gates.summary}\n\n${gates.output}`
+					const skipNote = "review skipped: quality gates"
+						+ " red (automatic fail)"
+					await patchGroup(statePath, group.name, {
+						review_verdict: "finding",
+						pending_review_findings: [detail],
+						reviewed_at: new Date().toISOString(),
+						last_activity: { note: skipNote },
+					})
+					const autoFail = "[orchestrate] AUTOMATIC FAIL:"
+						+ ` ${group.name}'s worktree failed the review`
+						+ " quality gates — skipping the review session\n"
+					process.stdout.write(autoFail)
 					return true
 				}
 				const rawResult = await runReviewWithRetries({

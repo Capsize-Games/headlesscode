@@ -38,7 +38,10 @@ export const HARNESS_ARTIFACT_RE =
  * happened and must never count as "changed something".
  */
 export function hasRealWorktreeChanges(wtPath: string): boolean {
-	let upstream = "origin/master"
+	return worktreeChangedFiles(wtPath).length > 0
+}
+
+function upstreamRef(wtPath: string): string {
 	try {
 		const tracked = execFileSync(
 			"git",
@@ -46,39 +49,73 @@ export function hasRealWorktreeChanges(wtPath: string): boolean {
 			{ encoding: "utf-8", timeout: 5000 },
 		).trim()
 		if (tracked) {
-			upstream = tracked
+			return tracked
 		}
 	} catch {
 		// No tracked upstream configured — fall back to origin/master.
 	}
+	return "origin/master"
+}
+
+function committedChangedFiles(wtPath: string, upstream: string): string[] {
 	try {
-		const diffStat = execFileSync("git", ["-C", wtPath, "diff", `${upstream}...HEAD`, "--stat"], {
-			encoding: "utf-8",
-			timeout: 10_000,
-		}).trim()
-		if (diffStat.length > 0) {
-			return true
-		}
+		const names = execFileSync(
+			"git",
+			["-C", wtPath, "diff", `${upstream}...HEAD`, "--name-only"],
+			{ encoding: "utf-8", timeout: 10_000 },
+		)
+		return names.split("\n").map((n) => n.trim()).filter((n) => n !== "")
 	} catch {
-		// A failed diff isn't proof of "no changes" — fall through to the
-		// working-tree check below rather than assume real work happened.
+		// A failed diff isn't proof of "no changes" — the caller still
+		// checks the working tree rather than assume real work happened.
+		return []
 	}
+}
+
+function porcelainStatus(wtPath: string): string {
+	// -uall: list untracked files individually. The default collapses a
+	// new directory to "dir/", which downstream file filters (testable
+	// sources for the Tier 3 review gates) would silently drop.
+	const args = ["-C", wtPath, "status", "--porcelain", "-uall"]
+	return execFileSync("git", args, { encoding: "utf-8", timeout: 10_000 })
+}
+
+function uncommittedChangedFiles(wtPath: string): string[] {
 	try {
-		const status = execFileSync("git", ["-C", wtPath, "status", "--porcelain"], {
-			encoding: "utf-8",
-			timeout: 10_000,
-		})
+		const status = porcelainStatus(wtPath)
+		const files: string[] = []
 		for (const line of status.split("\n")) {
 			const filePath = line.slice(3).trim()
 			if (filePath && !HARNESS_ARTIFACT_RE.test(filePath)) {
-				return true
+				files.push(filePath)
 			}
 		}
+		return files
 	} catch {
-		// Can't determine either way — err toward NOT trusting an
-		// unverifiable "clean" (return false, same as "no changes found").
+		// Can't determine — the caller errs toward NOT trusting an
+		// unverifiable "clean" (same as "no changes found").
+		return []
 	}
-	return false
+}
+
+/**
+ * Workspace-relative paths changed in this worktree: committed changes vs
+ * the tracked upstream plus uncommitted working-tree changes, minus the
+ * harness's own bookkeeping files. hasRealWorktreeChanges is exactly
+ * "this list is non-empty"; the Tier 3 review gates (#137) scope test
+ * selection to this list.
+ */
+export function worktreeChangedFiles(wtPath: string): string[] {
+	const upstream = upstreamRef(wtPath)
+	const seen = new Set<string>()
+	const committed = committedChangedFiles(wtPath, upstream)
+	const uncommitted = uncommittedChangedFiles(wtPath)
+	for (const file of [...committed, ...uncommitted]) {
+		if (!HARNESS_ARTIFACT_RE.test(file)) {
+			seen.add(file)
+		}
+	}
+	return [...seen].sort()
 }
 
 /**
