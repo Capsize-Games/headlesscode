@@ -44,6 +44,12 @@ jobs:
       - name: Typecheck
         run: npx tsc --noEmit
 
+      - name: Code standards (no new violations vs baseline)
+        run: npm run check-standards
+
+      - name: Architecture (no new findings vs baseline)
+        run: npm run check-architecture
+
       - name: Full test suite
         run: npm test
 

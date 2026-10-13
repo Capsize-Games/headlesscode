@@ -71,6 +71,9 @@
 		"rsi:security-canary": "tsx scripts/rsi-security-canary.ts",
 		"rsi:proof-demonstration": "tsx scripts/rsi-proof-demonstration.ts",
 		"test": "node scripts/run-tests.mjs",
+		"coverage": "node scripts/coverage.mjs",
+		"check-standards": "node scripts/check-code-standards.mjs",
+		"check-architecture": "tsx scripts/check-architecture.mjs",
 		"prepublishOnly": "npm ci && npm test"
 	},
 	"dependencies": {
@@ -90,6 +93,7 @@
 	},
 	"devDependencies": {
 		"@types/node": "^22.10.0",
-		"@types/pg": "^8.23.1"
+		"@types/pg": "^8.23.1",
+		"c8": "^12.0.0"
 	}
 }

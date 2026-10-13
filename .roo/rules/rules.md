@@ -21,6 +21,12 @@ Before considering any change to `src/` done:
   re-run the relevant suites under `scripts/e2e*/run.sh` — these exercise
   real spawn/watch/review flows against a local mock LLM server, not just
   unit-level logic.
+- `npm run check-standards` and `npm run check-architecture` must pass —
+  both are content-anchored baseline ratchets (see
+  `docs/typescript-standards.md`): no new violations. Regenerate the
+  baselines in the same change when you fix a file, never by hand.
+- Refactors are tests-first: cover the target with tests before reshaping
+  it, and keep `npm run coverage -- --min <floor>` from regressing.
 
 ## Established conventions
 
