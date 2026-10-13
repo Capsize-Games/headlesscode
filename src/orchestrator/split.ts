@@ -42,6 +42,14 @@ export interface WorktreeSpec {
 	name: string
 	/** Issue numbers assigned to this worktree, ascending. */
 	issues: number[]
+	/**
+	 * Indices into the splitIssues() input array, parallel to `issues`.
+	 * Present when the spec came from splitIssues(); absent for hand-built
+	 * specs (cloud/watcher single-issue requests). Renderers match entries
+	 * by this position so same-numbered --issues-json slices each resolve
+	 * their own body instead of colliding on one number (#144).
+	 */
+	entries?: number[]
 	/** Task file name under plans/parallel-tasks/ (conventional naming). */
 	taskFile: string
 }
@@ -182,16 +190,21 @@ function capFor(shape: string): number {
 /** Internal group shape used while deciding; not part of the public spec. */
 interface InternalGroup {
 	shape: string
-	issues: number[]
+	/** Indices into the splitIssues() input array (never bare numbers: two
+	 * entries may share one --issues-json number, #144). */
+	entries: number[]
 }
 
-/** Sort issue-number lists ascending (stable, deterministic). */
-function sortedIssues(numbers: number[]): number[] {
-	return [...numbers].sort((a, b) => a - b)
+/** Sort entry indices by issue number ascending, index ascending on ties. */
+function sortedEntries(entries: number[], issues: SplitIssue[]): number[] {
+	const byNumberThenIndex = (a: number, b: number): number =>
+		issues[a].number - issues[b].number || a - b
+	return [...entries].sort(byNumberThenIndex)
 }
 
-function minIssue(group: InternalGroup): number {
-	return group.issues.length > 0 ? Math.min(...group.issues) : Number.MAX_SAFE_INTEGER
+function minIssue(group: InternalGroup, issues: SplitIssue[]): number {
+	if (group.entries.length === 0) return Number.MAX_SAFE_INTEGER
+	return Math.min(...group.entries.map((e) => issues[e].number))
 }
 
 /**
@@ -204,7 +217,9 @@ function minIssue(group: InternalGroup): number {
  *   merged (same-shape pairs first, then the smallest remaining) until the
  *   round fits in 2-4 worktrees (heuristic 4).
  *
- * @param issues issues to split (order-independent; output is sorted)
+ * @param issues issues to split (grouping is order-independent and output
+ * is sorted; each spec's `entries` records its input positions so
+ * same-numbered slices resolve their own bodies, #144)
  * @param opts.occupiedNames worktree names already in use in the TARGET repo
  *        (e.g. a still-running round's `.worktrees/w1`) — naming skips over
  *        these instead of colliding, so a second `orchestrate` invocation
@@ -222,53 +237,59 @@ export function splitIssues(
 		return []
 	}
 
-	const hot: SplitIssue[] = []
-	const rest: SplitIssue[] = []
-	for (const issue of issues) {
-		;(isHotPath(issue) ? hot : rest).push(issue)
+	const hot: Array<{ issue: SplitIssue; index: number }> = []
+	const rest: Array<{ issue: SplitIssue; index: number }> = []
+	for (const [index, issue] of issues.entries()) {
+		;(isHotPath(issue) ? hot : rest).push({ issue, index })
 	}
-	hot.sort((a, b) => a.number - b.number)
-	rest.sort((a, b) => a.number - b.number)
+	hot.sort((a, b) => a.issue.number - b.issue.number)
+	rest.sort((a, b) => a.issue.number - b.issue.number)
 
 	// Heuristic 1: each hot-path issue alone.
-	const groups: InternalGroup[] = hot.map((issue) => ({ shape: "hot", issues: [issue.number] }))
+	const groups: InternalGroup[] = hot.map((d) => ({
+		shape: "hot",
+		entries: [d.index],
+	}))
 
 	// Heuristics 2 + 3: batch same-shape work, cap non-same-shape at ~2.
 	const buckets = new Map<string, InternalGroup[]>()
-	for (const issue of rest) {
-		const shape = shapeOf(issue)
+	for (const d of rest) {
+		const shape = shapeOf(d.issue)
 		const list = buckets.get(shape) ?? []
 		let bucket = list[list.length - 1]
-		if (!bucket || bucket.issues.length >= capFor(shape)) {
-			bucket = { shape, issues: [] }
+		if (!bucket || bucket.entries.length >= capFor(shape)) {
+			bucket = { shape, entries: [] }
 			list.push(bucket)
 			buckets.set(shape, list)
 		}
-		bucket.issues.push(issue.number)
+		bucket.entries.push(d.index)
 	}
 	for (const list of buckets.values()) {
 		groups.push(...list)
 	}
 
 	// Deterministic group ordering by smallest issue number.
-	groups.sort((a, b) => minIssue(a) - minIssue(b))
+	groups.sort((a, b) => minIssue(a, issues) - minIssue(b, issues))
 
 	// Heuristic 4: never exceed MAX_GROUPS. Merge smallest groups, preferring
 	// same-shape pairs so merged work still shares one review checklist.
 	while (groups.length > MAX_GROUPS) {
 		groups.sort((a, b) => {
-			const bySize = a.issues.length - b.issues.length
+			const bySize = a.entries.length - b.entries.length
 			if (bySize !== 0) {
 				return bySize
 			}
-			return minIssue(a) - minIssue(b)
+			return minIssue(a, issues) - minIssue(b, issues)
 		})
 		const smallest = groups[0]
 		const sameShape = groups
 			.slice(1)
 			.find((g) => g.shape === smallest.shape && g.shape !== "hot")
 		const target = sameShape ?? groups[1]
-		target.issues = sortedIssues([...target.issues, ...smallest.issues])
+		target.entries = sortedEntries(
+			[...target.entries, ...smallest.entries],
+			issues,
+		)
 		groups.splice(0, 1)
 	}
 
@@ -276,7 +297,7 @@ export function splitIssues(
 	// over any name already reserved via opts.occupiedNames (a still-running
 	// round in the same repo) — reserves each assigned name as it goes so two
 	// groups from THIS call never double-book the same slot either.
-	groups.sort((a, b) => minIssue(a) - minIssue(b))
+	groups.sort((a, b) => minIssue(a, issues) - minIssue(b, issues))
 	const reserved = new Set(opts.occupiedNames ?? [])
 	let nextSlot = 1
 	return groups.map((group) => {
@@ -286,11 +307,13 @@ export function splitIssues(
 		const name = `w${nextSlot}`
 		reserved.add(name)
 		nextSlot++
-		const issues = sortedIssues(group.issues)
+		const entries = sortedEntries(group.entries, issues)
+		const numbers = entries.map((e) => issues[e].number)
 		return {
 			name,
-			issues,
-			taskFile: `${name}-issue${issues.join("-")}.md`,
+			issues: numbers,
+			entries,
+			taskFile: `${name}-issue${numbers.join("-")}.md`,
 		}
 	})
 }

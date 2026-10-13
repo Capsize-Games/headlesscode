@@ -41,6 +41,69 @@ const RULES_SPLICED_NOTE = [
 export type IssueBodies = Record<string, { title: string; body?: string }>
 
 /**
+ * The persisted-group fields the rework/QA/continuation builders need:
+ * assigned numbers, positional entry indices (#144), and persisted bodies.
+ */
+export interface PersistedGroup {
+	name: string
+	issues?: number[]
+	entries?: number[]
+	issueBodies?: IssueBodies
+}
+
+/**
+ * One assigned issue number plus its resolved title/body (undefined when no
+ * entry could be resolved for this position).
+ */
+interface ResolvedIssue {
+	number: number
+	entry: { title: string; body?: string } | undefined
+}
+
+/**
+ * Resolve each assigned number against the in-hand issues array: by
+ * spec.entries position when present and aligned, else first-match by
+ * number (hand-built specs and old callers, #144).
+ */
+function resolveArrayEntries(
+	spec: { issues: number[]; entries?: number[] },
+	issues: SplitIssue[],
+): ResolvedIssue[] {
+	const entries = spec.entries
+	const positional = entries !== undefined
+		&& entries.length === spec.issues.length
+		&& entries.every((e) => Number.isInteger(e) && e >= 0 && e < issues.length)
+	return spec.issues.map((n, i) => ({
+		number: n,
+		entry: positional && entries !== undefined
+			? issues[entries[i]]
+			: issues.find((x) => x.number === n),
+	}))
+}
+
+/**
+ * Resolve each assigned number against persisted bodies: by entry index
+ * when the group carries entries (#144), else by number (state written
+ * before entries were persisted, plus the explicit fallback source).
+ */
+function resolvePersistedEntries(
+	group: PersistedGroup,
+	fallback?: IssueBodies,
+): ResolvedIssue[] {
+	const entries = group.entries
+	return (group.issues ?? []).map((n, i) => {
+		const aligned = entries !== undefined && i < entries.length
+		const index = aligned && entries !== undefined ? entries[i] : undefined
+		return {
+			number: n,
+			entry: (index !== undefined ? group.issueBodies?.[String(index)] : undefined)
+				?? group.issueBodies?.[String(n)]
+				?? fallback?.[String(n)],
+		}
+	})
+}
+
+/**
  * Render each assigned issue as an inline markdown block
  * ("### Issue #<n>: <title>\n\n<body>") for a task file — the issue title/body
  * is already in hand, so nothing needs fetching at session start. An issue
@@ -49,35 +112,29 @@ export type IssueBodies = Record<string, { title: string; body?: string }>
  * only (state written before bodies were persisted — never silently produce an
  * empty assignment section).
  */
-function issueBodyBlocks(
-	numbers: number[],
-	lookup: (n: number) => { title: string; body?: string } | undefined,
-): string[] {
-	const blocks: string[] = []
-	for (const n of numbers) {
-		const entry = lookup(n)
-		if (entry === undefined) {
-			blocks.push(
-				`### Issue #${n}`,
-				"",
-				`No issue body recorded — fetch it yourself: \`gh issue view ${n}\`.`,
-			)
-		} else {
-			blocks.push(
-				`### Issue #${n}: ${entry.title}`,
-				"",
-				entry.body && entry.body.trim() !== ""
-					? entry.body
-					: "(no issue body recorded — inspect the codebase and git history for context)",
-			)
-		}
+function issueBlockLines(resolved: ResolvedIssue): string[] {
+	const { number: n, entry } = resolved
+	if (entry === undefined) {
+		return [
+			`### Issue #${n}`,
+			"",
+			`No issue body recorded — fetch it yourself: \`gh issue view ${n}\`.`,
+		]
 	}
-	return blocks
+	const body = entry.body && entry.body.trim() !== ""
+		? entry.body
+		: "(no issue body recorded — inspect the codebase and git history"
+			+ " for context)"
+	return [`### Issue #${n}: ${entry.title}`, "", body]
+}
+
+function issueBodyBlocks(resolved: ResolvedIssue[]): string[] {
+	return resolved.flatMap(issueBlockLines)
 }
 
 export function buildTaskFileContent(spec: WorktreeSpec, issues: SplitIssue[]): string {
 	const assigned = spec.issues.map((n) => `#${n}`).join(", ")
-	const issueBlocks = issueBodyBlocks(spec.issues, (n) => issues.find((i) => i.number === n))
+	const issueBlocks = issueBodyBlocks(resolveArrayEntries(spec, issues))
 	return [
 		...RULES_SPLICED_NOTE,
 		"",
@@ -160,13 +217,19 @@ export function buildTaskFileContent(spec: WorktreeSpec, issues: SplitIssue[]): 
  * preamble, scope line).
  */
 export function buildPlanFirstTaskFileContent(
-	group: { name: string; issues?: number[] },
+	group: { name: string; issues?: number[]; entries?: number[] },
 	/** The in-hand issues (their title/body is embedded inline). Optional for
 	 * backward compatibility with callers that only have persisted state. */
 	issues?: SplitIssue[],
 ): string {
 	const assigned = (group.issues ?? []).map((n) => `#${n}`).join(", ") || "this worktree"
-	const issueBlocks = issueBodyBlocks(group.issues ?? [], (n) => issues?.find((i) => i.number === n))
+	const resolved = issues === undefined
+		? (group.issues ?? []).map((n) => ({ number: n, entry: undefined }))
+		: resolveArrayEntries(
+			{ issues: group.issues ?? [], entries: group.entries },
+			issues,
+		)
+	const issueBlocks = issueBodyBlocks(resolved)
 	return [
 		...RULES_SPLICED_NOTE,
 		"",
@@ -246,7 +309,7 @@ export function writeTaskFiles(
  * closing-report template — same contract as the first attempt.
  */
 export function buildReworkTaskFileContent(
-	group: { name: string; issues?: number[]; issueBodies?: IssueBodies },
+	group: PersistedGroup,
 	findings: string[],
 	reworkCount: number,
 	/** Persisted issue title/body captured at dispatch time (see
@@ -255,7 +318,9 @@ export function buildReworkTaskFileContent(
 	issueBodies?: IssueBodies,
 ): string {
 	const assigned = (group.issues ?? []).map((n) => `#${n}`).join(", ") || "this worktree"
-	const issueBlocks = issueBodyBlocks(group.issues ?? [], (n) => group.issueBodies?.[String(n)] ?? issueBodies?.[String(n)])
+	const issueBlocks = issueBodyBlocks(
+		resolvePersistedEntries(group, issueBodies),
+	)
 	const findingsList = findings.length > 0 ? findings.map((f, i) => `${i + 1}. ${f}`).join("\n") : ""
 	return [
 		...RULES_SPLICED_NOTE,
@@ -345,7 +410,7 @@ export function buildReworkTaskFileContent(
 	* the closing-report template — same contract as the first attempt.
 	*/
 export function buildQaReworkTaskFileContent(
-	group: { name: string; issues?: number[]; issueBodies?: IssueBodies },
+	group: PersistedGroup,
 	evidence: string,
 	reworkCount: number,
 	reportPath?: string,
@@ -355,7 +420,9 @@ export function buildQaReworkTaskFileContent(
 	issueBodies?: IssueBodies,
 ): string {
 	const assigned = (group.issues ?? []).map((n) => `#${n}`).join(", ") || "this worktree"
-	const issueBlocks = issueBodyBlocks(group.issues ?? [], (n) => group.issueBodies?.[String(n)] ?? issueBodies?.[String(n)])
+	const issueBlocks = issueBodyBlocks(
+		resolvePersistedEntries(group, issueBodies),
+	)
 	// Issue #34-style: point at the QA session's COMPLETE final report so the
 	// full reasoning is one file-read away (evidence is only a 4000-char slice).
 	const reportLines = reportPath
@@ -458,7 +525,7 @@ export function buildQaReworkTaskFileContent(
 	* issues.
 	*/
 export function buildContinuationTaskFileContent(
-	group: { name: string; issues?: number[]; issueBodies?: IssueBodies },
+	group: PersistedGroup,
 	continuationCount: number,
 	/** Persisted issue title/body captured at dispatch time (see
 	 * OrchestratorGroup.issueBodies). Absent for state written before the
@@ -473,7 +540,9 @@ export function buildContinuationTaskFileContent(
 	handoffSummary?: string,
 ): string {
 	const assigned = (group.issues ?? []).map((n) => `#${n}`).join(", ") || "this worktree"
-	const issueBlocks = issueBodyBlocks(group.issues ?? [], (n) => group.issueBodies?.[String(n)] ?? issueBodies?.[String(n)])
+	const issueBlocks = issueBodyBlocks(
+		resolvePersistedEntries(group, issueBodies),
+	)
 	return [
 		...RULES_SPLICED_NOTE,
 		"",

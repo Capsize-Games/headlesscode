@@ -2489,26 +2489,35 @@ export async function orchestrateMain(argv: string[]): Promise<number> {
 			// need them to embed each issue's real title/body inline instead of a
 			// runtime `gh issue view` (which fails for synthetic --issues-json
 			// numbers).
-			const shapeByNumber = new Map<number, string>()
-			const issueBodiesByNumber = new Map<number, { title: string; body?: string }>()
-			for (const issue of issues) {
-				shapeByNumber.set(issue.number, issueShape(issue))
-				issueBodiesByNumber.set(issue.number, { title: issue.title, body: issue.body })
+			// Resolve per spec.entries position (#144): same-numbered
+			// --issues-json slices each keep their own shape/body, keyed by
+			// entry index. Specs without entries (never from splitIssues)
+			// fall back to first-match by number.
+			const entryAt = (spec: WorktreeSpec, position: number): number => {
+				const index = spec.entries?.[position]
+				if (index !== undefined && issues[index] !== undefined) return index
+				return issues.findIndex((i) => i.number === spec.issues[position])
 			}
 			const groupNamesOnDisk = new Set(state.groups.map((g) => g.name))
 			for (const spec of specs) {
 				if (!groupNamesOnDisk.has(spec.name)) {
 					continue
 				}
-				const shapes = spec.issues.map((n) => shapeByNumber.get(n) ?? "generic")
+				const shapes: string[] = []
 				const issueBodies: IssueBodies = {}
-				for (const n of spec.issues) {
-					const entry = issueBodiesByNumber.get(n)
-					if (entry) {
-						issueBodies[String(n)] = entry
+				const entries: number[] = []
+				spec.issues.forEach((n, position) => {
+					const index = entryAt(spec, position)
+					entries.push(index)
+					if (index < 0) {
+						shapes.push("generic")
+						return
 					}
-				}
-				state = updateGroup(state, spec.name, { shapes, issueBodies })
+					const issue = issues[index]
+					shapes.push(issueShape(issue))
+					issueBodies[String(index)] = { title: issue.title, body: issue.body }
+				})
+				state = updateGroup(state, spec.name, { shapes, issueBodies, entries })
 			}
 			// Issue #13: persist the preflight probe so the dashboard can surface the
 			// preflight line on the round view (see aggregate.ts RoundSummary.preflight).

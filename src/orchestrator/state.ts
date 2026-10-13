@@ -58,15 +58,24 @@ export interface OrchestratorGroup {
 	 */
 	shapes?: string[]
 	/**
-	 * Per-issue {title, body}, keyed by issue number as a string (JSON object
-	 * keys are always strings), captured at dispatch time and persisted in the
-	 * state file so the rework/QA/continuation task files — generated LATER
-	 * from state alone, when the original issue objects are no longer in hand
-	 * — can embed each issue's real title/body inline instead of telling the
-	 * worker to run `gh issue view <n>` (which fails outright for synthetic
-	 * --issues-json numbers). Written by orchestrate at dispatch time
-	 * alongside `shapes`; absent for groups spawned directly via
-	 * spawn-parallel-worktrees.sh.
+	 * Entry indices into the round's issue list, parallel to `issues`.
+	 * Persisted at dispatch so rework/QA/continuation files can match each
+	 * same-numbered --issues-json slice to its own body by position (#144).
+	 * Absent for state written before entries, and for groups spawned
+	 * directly via spawn-parallel-worktrees.sh.
+	 */
+	entries?: number[]
+	/**
+	 * Per-issue {title, body}, keyed by entry index as a string (JSON object
+	 * keys are always strings), captured at dispatch time and persisted in
+	 * the state file so the rework/QA/continuation task files — generated
+	 * LATER from state alone, when the original issue objects are no longer
+	 * in hand — can embed each issue's real title/body inline instead of
+	 * telling the worker to run `gh issue view <n>` (which fails outright
+	 * for synthetic --issues-json numbers). Written by orchestrate at
+	 * dispatch time alongside `shapes`; absent for groups spawned directly
+	 * via spawn-parallel-worktrees.sh. Readers fall back to issue-number
+	 * keys for state written before #144.
 	 */
 	issueBodies?: Record<string, { title: string; body?: string }>
 	task_file?: string
