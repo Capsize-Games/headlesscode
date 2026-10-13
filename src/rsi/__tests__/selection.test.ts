@@ -1,52 +1,7 @@
 import assert from "node:assert/strict"
 import { newExperimentJob, paretoFront, selectParentChoices, transitionJob } from "../selection.js"
-import type { CandidateRecord, Fitness, MetricVector, RsiArchive } from "../types.js"
-
-function metrics(overrides: Partial<MetricVector>): MetricVector {
-	return {
-		correctness: 0.8,
-		reliability: 0.8,
-		generalization: 0.8,
-		hidden: 0.8,
-		efficiency: 0.8,
-		latency: 100,
-		tokenUse: 100,
-		recovery: 0.8,
-		fabricationRate: 0.1,
-		complexityPenalty: 0.1,
-		...overrides,
-	}
-}
-
-function candidate(id: string, vector: MetricVector, score: number): CandidateRecord {
-	const fitness: Fitness = {
-		score,
-		components: { regression: 1, visible: vector.generalization, hidden: vector.hidden, efficiency: vector.efficiency, recovery: vector.recovery },
-		metrics: vector,
-		complexity: { diffLines: 10, changedFiles: 1, newDependencies: 0, additionalModelCalls: 0, runtimeOverheadMs: 0 },
-		hardGates: { regressionPass: true, typecheckPass: true, visibleEvalPass: true, hiddenEvalPass: true, adversarialPass: true, noProtectedPathViolation: true, completed: true, noCrash: true, committed: true },
-		reason: "all hard gates passed",
-	}
-	return {
-		id,
-		generation: 0,
-		parent: "baseline",
-		branch: `rsi/${id}`,
-		worktree: `/tmp/${id}`,
-		baseCommit: "base",
-		status: "accepted",
-		model: "qwen",
-		mutation: id,
-		createdAt: "now",
-		updatedAt: "now",
-		commits: [`commit-${id}`],
-		changedFiles: ["src/engine/loop.ts"],
-		protectedPathViolations: [],
-		fitness,
-		developmentProof: { accepted: true } as NonNullable<CandidateRecord["developmentProof"]>,
-		pairedComparison: { baselinePasses: 1, candidatePasses: 1, trialCount: 1, baselineDurationMs: 100, candidateDurationMs: 50, durationRatio: 0.5, improved: true, reason: "test fixture" },
-	}
-}
+import type { CandidateRecord, RsiArchive } from "../types.js"
+import { candidate, metrics } from "./fixtures.js"
 
 function archive(candidates: CandidateRecord[]): RsiArchive {
 	return { schemaVersion: 2, updatedAt: "now", runs: [], activeRuns: [], candidates, modelCandidates: [], combinations: [], jobs: [], trajectoryRefs: [], curriculumTasks: [] }
