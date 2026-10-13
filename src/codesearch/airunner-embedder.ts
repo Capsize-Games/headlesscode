@@ -37,7 +37,7 @@
  * does for the other backends.
  */
 
-import type { EmbedResult } from "./embedder-types.js"
+import { excerpt, type EmbedResult } from "./embedder-types.js"
 
 /** Default AIRunner server base URL (AIRunner's standard local port). */
 export const DEFAULT_AIRUNNER_URL = "http://localhost:8080"
@@ -177,9 +177,4 @@ export class AirunnerEmbedder {
 		// NaN/undefined.
 		return { embeddings, model: this.model, promptTokens, totalTokens: promptTokens }
 	}
-}
-
-/** Truncate a raw body to a bounded excerpt for error messages. */
-function excerpt(body: string): string {
-	return body.length > 500 ? `${body.slice(0, 500)}…` : body
 }

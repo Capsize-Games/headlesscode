@@ -46,7 +46,7 @@
  * does for the cloud path.
  */
 
-import type { EmbedResult } from "./embedder-types.js"
+import { excerpt, type EmbedResult } from "./embedder-types.js"
 
 /** Default Ollama server base URL (Ollama's standard local port). */
 export const DEFAULT_OLLAMA_URL = "http://localhost:11434"
@@ -197,9 +197,4 @@ export class OllamaEmbedder {
 		// NaN/undefined.
 		return { embeddings, model: this.model, promptTokens, totalTokens: promptTokens }
 	}
-}
-
-/** Truncate a raw body to a bounded excerpt for error messages. */
-function excerpt(body: string): string {
-	return body.length > 500 ? `${body.slice(0, 500)}…` : body
 }
