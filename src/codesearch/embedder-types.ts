@@ -30,3 +30,33 @@ export interface EmbedResult {
 	promptTokens: number
 	totalTokens: number
 }
+
+/** Truncate a raw body to a bounded excerpt for error messages. */
+export function excerpt(body: string): string {
+	return body.length > 500 ? `${body.slice(0, 500)}…` : body
+}
+
+/**
+ * Validate a local embedder's raw vectors: every entry must be a numeric
+ * array. Shared by the Ollama/AIRunner backends (their loops were an exact
+ * clone) so garbage never silently poisons the index.
+ */
+export function validateLocalVectors(
+	vectors: unknown[],
+	rawBody: string,
+	label: string,
+	makeError: (message: string) => Error,
+): { embeddings: number[][]; promptTokens: number } {
+	const embeddings: number[][] = []
+	let promptTokens = 0
+	for (const item of vectors) {
+		if (!Array.isArray(item) || item.some((v) => typeof v !== "number")) {
+			throw makeError(
+				`${label} embeddings response contained a non-numeric embedding vector. Raw body: ${excerpt(rawBody)}`,
+			)
+		}
+		embeddings.push(item as number[])
+		promptTokens += (item as number[]).length
+	}
+	return { embeddings, promptTokens }
+}

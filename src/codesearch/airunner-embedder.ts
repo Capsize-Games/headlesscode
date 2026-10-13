@@ -37,7 +37,7 @@
  * does for the other backends.
  */
 
-import type { EmbedResult } from "./embedder-types.js"
+import { excerpt, validateLocalVectors, type EmbedResult } from "./embedder-types.js"
 
 /** Default AIRunner server base URL (AIRunner's standard local port). */
 export const DEFAULT_AIRUNNER_URL = "http://localhost:8080"
@@ -159,17 +159,12 @@ export class AirunnerEmbedder {
 		// Validate every entry is a numeric array — garbage here would silently
 		// poison the index (dimension is whatever the model returns, so the
 		// per-vector length must at least be self-consistent).
-		const embeddings: number[][] = []
-		let promptTokens = 0
-		for (const item of data.embeddings) {
-			if (!Array.isArray(item) || item.some((v) => typeof v !== "number")) {
-				throw new AirunnerEmbedError(
-					`AIRunner embeddings response contained a non-numeric embedding vector. Raw body: ${excerpt(rawBody)}`,
-				)
-			}
-			embeddings.push(item as number[])
-			promptTokens += (item as number[]).length
-		}
+		const { embeddings, promptTokens } = validateLocalVectors(
+			data.embeddings,
+			rawBody,
+			"AIRunner",
+			(message) => new AirunnerEmbedError(message),
+		)
 
 		// No usage/cost to report for a fully local call — promptTokens is
 		// approximate (vector length, not true token count) and only used for
@@ -177,9 +172,4 @@ export class AirunnerEmbedder {
 		// NaN/undefined.
 		return { embeddings, model: this.model, promptTokens, totalTokens: promptTokens }
 	}
-}
-
-/** Truncate a raw body to a bounded excerpt for error messages. */
-function excerpt(body: string): string {
-	return body.length > 500 ? `${body.slice(0, 500)}…` : body
 }
