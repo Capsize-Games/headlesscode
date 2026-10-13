@@ -316,6 +316,10 @@ async function testDisposeReportsCleanupFailureAfterLeaderExit(workspaceRoot: st
 	}) as typeof process.kill
 	try {
 		const call = runtime.call(revision, { mode: "echo", pidFile }, { permissions: permissions() })
+		// Guard: teardown can fail before assert.rejects attaches below;
+		// without an early handler the rejection is momentarily unhandled
+		// and crashes the suite (observed in loaded sandboxes).
+		call.catch(() => undefined)
 		await waitForFile(pidFile, 2_000)
 		descendantPid = Number(await fs.readFile(pidFile, "utf8"))
 		await assert.rejects(call, /could not signal every verified member/i)
@@ -350,6 +354,9 @@ async function testMcpCloseRetainsFailedTransportForDispose(workspaceRoot: strin
 	}) as typeof process.kill
 	try {
 		const call = runtime.call(revision, { text: "hello" }, { permissions: permissions(), toolName: "echo" })
+		// Guard: see testDisposeReportsCleanupFailureAfterLeaderExit —
+		// teardown may fail before assert.rejects attaches.
+		call.catch(() => undefined)
 		await waitForFile(pidFile, 2_000)
 		descendantPid = Number(await fs.readFile(pidFile, "utf8"))
 		serverPid = Number(await fs.readFile(serverPidFile, "utf8"))
