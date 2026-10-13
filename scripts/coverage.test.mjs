@@ -2,10 +2,12 @@
 // percentage report on a tiny filtered run (claims tests, a few seconds)
 // instead of the full suite. Exit 1 with a clear message on any mismatch.
 import { execFileSync } from "node:child_process"
+import fs from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
 const repoRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
+const reportDir = path.join(repoRoot, ".headlesscode", "coverage")
 
 function runCoverage(args) {
 	try {
@@ -34,4 +36,21 @@ if (floor.status === 0) fail("--min 100 unexpectedly passed")
 if (!/below the 100% floor/.test(floor.out)) fail("floor-failure message missing")
 const invalid = runCoverage(["--min", "abc"])
 if (invalid.status !== 2) fail(`invalid --min exited ${invalid.status}, want 2`)
-console.log("  ok   coverage-selftest: summary line, floor pass/fail, invalid arg")
+// Nested-run isolation (2026-10-13 incident: nested c8 runs wiped the
+// outer run's shared tmp/, collapsing full-suite coverage to ~4.5%).
+// Each finished run must clean its own pid-unique tmp dir; a shared bare
+// tmp/ must never come back. Pre-existing tmp-* dirs belong to still-live
+// outer/concurrent runs, so only NEW leftovers fail.
+const before = new Set(fs.existsSync(reportDir) ? fs.readdirSync(reportDir) : [])
+runCoverage([...filter, "--min", "0"])
+const after = fs.existsSync(reportDir) ? fs.readdirSync(reportDir) : []
+if (after.includes("tmp")) fail("shared bare tmp/ dir present — nested runs would wipe it")
+for (const entry of after) {
+	if (entry.startsWith("tmp-") && !before.has(entry)) {
+		fail(`leftover temp dir ${entry} from a finished nested run`)
+	}
+	if (entry.startsWith("tmp-") && !/^tmp-\d+$/.test(entry)) {
+		fail(`non-pid temp dir ${entry}`)
+	}
+}
+console.log("  ok   coverage-selftest: summary line, floor pass/fail, invalid arg, nested-run tmp isolation")
