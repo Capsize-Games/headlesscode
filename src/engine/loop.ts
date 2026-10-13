@@ -170,21 +170,7 @@ import { writeHandoffSummary } from "./handoff.js"
 import type { EvidenceInput, EvidenceJournal } from "../evidence/types.js"
 import { canonicalJson, sha256 } from "../evidence/canonical.js"
 
-export function combineAbortSignals(signals: readonly (AbortSignal | undefined)[]): { signal: AbortSignal; dispose: () => void } {
-	const controller = new AbortController()
-	const listeners: Array<{ signal: AbortSignal; listener: () => void }> = []
-	for (const signal of signals) {
-		if (!signal) continue
-		if (signal.aborted) {
-			controller.abort(signal.reason)
-			break
-		}
-		const listener = (): void => controller.abort(signal.reason)
-		signal.addEventListener("abort", listener, { once: true })
-		listeners.push({ signal, listener })
-	}
-	return { signal: controller.signal, dispose: () => listeners.forEach(({ signal, listener }) => signal.removeEventListener("abort", listener)) }
-}
+export { combineAbortSignals } from "./loop-helpers.js"
 import {
 	isLazyToolCatalogEnabled,
 	LIST_TOOLS_NAME,
