@@ -1,5 +1,4 @@
 import assert from "node:assert/strict"
-import { readdirSync, readFileSync } from "node:fs"
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
 import { execFileSync, spawnSync } from "node:child_process"
@@ -12,6 +11,11 @@ import { parseWatchArgs } from "../../watcher/cli.js"
 import { defaultSpawn } from "../../watcher/watch.js"
 import { watchIssues, type SpawnBatch } from "../../watcher/watch.js"
 import { loadState, saveState } from "../state.js"
+import {
+	groupHasLiveMember,
+	processGroupGone,
+	procState,
+} from "../../testing/process-groups.js"
 import { runReworkStep } from "../resume.js"
 import { defaultWatcherState, loadWatcherState, saveWatcherState } from "../../watcher/state.js"
 
@@ -337,37 +341,10 @@ async function testInlineMusePromptUsesIgnoredScratchAndCleansUp(): Promise<void
 	}
 }
 
-function procState(pid: number): { pgrp: number; state: string } | null {
-	let text: string
-	try {
-		text = readFileSync(`/proc/${pid}/stat`, "utf8")
-	} catch {
-		return null
-	}
-	const afterComm = text.slice(text.lastIndexOf(")") + 2).split(" ")
-	return { pgrp: Number(afterComm[2]), state: afterComm[0] ?? "" }
-}
-
-// State-based stop check: kill() errnos lie under sandbox init
-// semantics (EPERM for a group of unreaped zombies; kill(0) success
-// for a zombie that exists but runs nothing). The group is settled
-// when the recorded pid is gone or no member is still running.
-function groupHasLiveMember(pgid: number): boolean {
-	let entries: string[]
-	try {
-		entries = readdirSync("/proc")
-	} catch {
-		return true
-	}
-	for (const entry of entries) {
-		if (!/^[0-9]+$/.test(entry)) continue
-		const stat = procState(Number(entry))
-		if (!stat || stat.pgrp !== pgid) continue
-		if (stat.state !== "Z" && stat.state !== "X") return true
-	}
-	return false
-}
-
+// State-based stop check: kill() errnos lie under sandbox group-signal
+// policy (persistent EPERM) and init semantics (kill(0) success for a
+// zombie that exists but runs nothing). The group is settled when the
+// recorded pid is gone or no member is still running.
 function workerGroupSettled(pgid: number, pid: number): boolean {
 	try {
 		process.kill(pid, 0)
@@ -375,7 +352,7 @@ function workerGroupSettled(pgid: number, pid: number): boolean {
 		if ((error as NodeJS.ErrnoException).code === "ESRCH") return true
 	}
 	if (process.platform !== "linux") return false
-	return !groupHasLiveMember(pgid)
+	return processGroupGone(pgid)
 }
 
 // True when the stop was delivered or already settled; false when the
