@@ -187,29 +187,42 @@ async function testPauseExcludesBlockedTimeFromBudgetClock(): Promise<void> {
 				if (call === 1) {
 					// Write the pause marker during call 1; iteration 2's
 					// checkPauseRequested then finds it and blocks. The test
-					// below holds the pause for ~400ms and removes it — the
-					// session's maxDurationMs is 300ms, so WITHOUT the clock
+					// below holds the pause for ~1500ms and removes it — the
+					// session's maxDurationMs is 1000ms, so WITHOUT the clock
 					// freeze iteration 2's pre-call tick() would trip the
 					// budget and abort. With the freeze it must not.
 					await fs.writeFile(path.join(ws, PAUSE_REQUESTED), new Date().toISOString() + "\n", "utf-8")
 				}
 			},
 		)
-		const session = makeSession(ws, client, { budget: { maxDurationMs: 300 }, maxPauseMs: 60_000, pausePollIntervalMs: 20 })
+		const session = makeSession(ws, client, {
+			budget: { maxDurationMs: 1000 },
+			maxPauseMs: 60_000,
+			pausePollIntervalMs: 20,
+		})
 		const runPromise = session.run()
 
-		// Hold the pause for ~400ms (well past the 300ms budget cap), then
-		// release it.
+		// Hold the pause for ~1500ms (well past the 1000ms budget cap), then
+		// release it. The wide envelope keeps unpaused work (slow under
+		// coverage and shared-host load) far from the cap.
 		await waitFor(async () => exists(path.join(ws, PAUSED)), 5_000)
-		await sleep(400)
+		await sleep(1500)
 		await fs.rm(path.join(ws, PAUSE_REQUESTED))
 		const result = await runPromise
 
 		// Without the clock freeze this would be status "error" / reason
-		// "budget" (the 400ms pause would trip the 300ms cap). With the
+		// "budget" (the 1500ms pause would trip the 1000ms cap). With the
 		// freeze, the paused time is excluded and the session succeeds.
-		assert.equal(result.status, "success", `paused time must be excluded from the budget, got ${JSON.stringify(result)}`)
-		assert.ok((result.budgetUsage?.elapsedMs ?? 0) < 300, "elapsedMs must stay under the 300ms cap despite the 400ms pause")
+		assert.equal(
+			result.status,
+			"success",
+			`paused time excluded from the budget, got ${JSON.stringify(result)}`,
+		)
+		const elapsedMs = result.budgetUsage?.elapsedMs ?? 0
+		assert.ok(
+			elapsedMs < 1000,
+			"elapsedMs under the 1000ms cap despite the 1500ms pause",
+		)
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
