@@ -46,7 +46,7 @@
  * does for the cloud path.
  */
 
-import type { EmbedResult } from "./embedder-types.js"
+import { excerptLocalBody, validateLocalEmbeddings, type EmbedResult } from "./embedder-types.js"
 
 /** Default Ollama server base URL (Ollama's standard local port). */
 export const DEFAULT_OLLAMA_URL = "http://localhost:11434"
@@ -144,13 +144,13 @@ export class OllamaEmbedder {
 					`Ollama backend selected but model "${this.model}" is not pulled — run ` +
 						`\`ollama pull ${this.model}\``,
 					response.status,
-					excerpt(rawBody),
+					excerptLocalBody(rawBody),
 				)
 			}
 			throw new OllamaEmbedError(
-				`Ollama embeddings returned HTTP ${response.status}: ${excerpt(rawBody || "(empty body)")}`,
+				`Ollama embeddings returned HTTP ${response.status}: ${excerptLocalBody(rawBody || "(empty body)")}`,
 				response.status,
-				excerpt(rawBody),
+				excerptLocalBody(rawBody),
 			)
 		}
 
@@ -164,32 +164,20 @@ export class OllamaEmbedder {
 			data = JSON.parse(rawBody)
 		} catch {
 			throw new OllamaEmbedError(
-				`Ollama embeddings returned HTTP 200 with a non-JSON/unparseable body: ${excerpt(rawBody || "(empty)")}`,
-			)
-		}
-
-		if (!Array.isArray(data?.embeddings) || data.embeddings.length !== texts.length) {
-			const n = Array.isArray(data?.embeddings) ? data.embeddings.length : 0
-			throw new OllamaEmbedError(
-				`Ollama embeddings response contained ${n} embeddings for ${texts.length} inputs. ` +
-					`Raw body: ${excerpt(rawBody || "(empty)")}`,
+				`Ollama embeddings returned HTTP 200 with a non-JSON/unparseable body: ${excerptLocalBody(rawBody || "(empty)")}`,
 			)
 		}
 
 		// Validate every entry is a numeric array — garbage here would silently
 		// poison the index (dimension is whatever the model returns, so the
 		// per-vector length must at least be self-consistent).
-		const embeddings: number[][] = []
-		let promptTokens = 0
-		for (const item of data.embeddings) {
-			if (!Array.isArray(item) || item.some((v) => typeof v !== "number")) {
-				throw new OllamaEmbedError(
-					`Ollama embeddings response contained a non-numeric embedding vector. Raw body: ${excerpt(rawBody)}`,
-				)
-			}
-			embeddings.push(item as number[])
-			promptTokens += (item as number[]).length
-		}
+		const { embeddings, promptTokens } = validateLocalEmbeddings(
+			"Ollama",
+			data.embeddings,
+			texts.length,
+			rawBody,
+			(message) => new OllamaEmbedError(message),
+		)
 
 		// No usage/cost to report for a fully local call — promptTokens is
 		// approximate (vector length, not true token count) and only used for
@@ -197,9 +185,4 @@ export class OllamaEmbedder {
 		// NaN/undefined.
 		return { embeddings, model: this.model, promptTokens, totalTokens: promptTokens }
 	}
-}
-
-/** Truncate a raw body to a bounded excerpt for error messages. */
-function excerpt(body: string): string {
-	return body.length > 500 ? `${body.slice(0, 500)}…` : body
 }

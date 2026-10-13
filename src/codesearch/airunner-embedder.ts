@@ -37,7 +37,7 @@
  * does for the other backends.
  */
 
-import type { EmbedResult } from "./embedder-types.js"
+import { excerptLocalBody, validateLocalEmbeddings, type EmbedResult } from "./embedder-types.js"
 
 /** Default AIRunner server base URL (AIRunner's standard local port). */
 export const DEFAULT_AIRUNNER_URL = "http://localhost:8080"
@@ -127,9 +127,9 @@ export class AirunnerEmbedder {
 		const rawBody = await response.text().catch(() => "")
 		if (!response.ok) {
 			throw new AirunnerEmbedError(
-				`AIRunner embeddings returned HTTP ${response.status}: ${excerpt(rawBody || "(empty body)")}`,
+				`AIRunner embeddings returned HTTP ${response.status}: ${excerptLocalBody(rawBody || "(empty body)")}`,
 				response.status,
-				excerpt(rawBody),
+				excerptLocalBody(rawBody),
 			)
 		}
 
@@ -144,32 +144,20 @@ export class AirunnerEmbedder {
 			data = JSON.parse(rawBody)
 		} catch {
 			throw new AirunnerEmbedError(
-				`AIRunner embeddings returned HTTP 200 with a non-JSON/unparseable body: ${excerpt(rawBody || "(empty)")}`,
-			)
-		}
-
-		if (!Array.isArray(data?.embeddings) || data.embeddings.length !== texts.length) {
-			const n = Array.isArray(data?.embeddings) ? data.embeddings.length : 0
-			throw new AirunnerEmbedError(
-				`AIRunner embeddings response contained ${n} embeddings for ${texts.length} inputs. ` +
-					`Raw body: ${excerpt(rawBody || "(empty)")}`,
+				`AIRunner embeddings returned HTTP 200 with a non-JSON/unparseable body: ${excerptLocalBody(rawBody || "(empty)")}`,
 			)
 		}
 
 		// Validate every entry is a numeric array — garbage here would silently
 		// poison the index (dimension is whatever the model returns, so the
 		// per-vector length must at least be self-consistent).
-		const embeddings: number[][] = []
-		let promptTokens = 0
-		for (const item of data.embeddings) {
-			if (!Array.isArray(item) || item.some((v) => typeof v !== "number")) {
-				throw new AirunnerEmbedError(
-					`AIRunner embeddings response contained a non-numeric embedding vector. Raw body: ${excerpt(rawBody)}`,
-				)
-			}
-			embeddings.push(item as number[])
-			promptTokens += (item as number[]).length
-		}
+		const { embeddings, promptTokens } = validateLocalEmbeddings(
+			"AIRunner",
+			data?.embeddings,
+			texts.length,
+			rawBody,
+			(message) => new AirunnerEmbedError(message),
+		)
 
 		// No usage/cost to report for a fully local call — promptTokens is
 		// approximate (vector length, not true token count) and only used for
@@ -177,9 +165,4 @@ export class AirunnerEmbedder {
 		// NaN/undefined.
 		return { embeddings, model: this.model, promptTokens, totalTokens: promptTokens }
 	}
-}
-
-/** Truncate a raw body to a bounded excerpt for error messages. */
-function excerpt(body: string): string {
-	return body.length > 500 ? `${body.slice(0, 500)}…` : body
 }

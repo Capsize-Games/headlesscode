@@ -30,3 +30,42 @@ export interface EmbedResult {
 	promptTokens: number
 	totalTokens: number
 }
+
+/** Truncate a raw body to a bounded excerpt for local embedder errors. */
+export function excerptLocalBody(body: string): string {
+	return body.length > 500 ? `${body.slice(0, 500)}…` : body
+}
+
+/**
+ * Validate a local embedding batch response. Shared by the Ollama and
+ * AIRunner backends so their length + numeric checks stay identical.
+ */
+export function validateLocalEmbeddings(
+	label: string,
+	embeddings: unknown,
+	textsLength: number,
+	rawBody: string,
+	makeError: (message: string) => Error,
+): { embeddings: number[][]; promptTokens: number } {
+	if (!Array.isArray(embeddings) || embeddings.length !== textsLength) {
+		const n = Array.isArray(embeddings) ? embeddings.length : 0
+		throw makeError(
+			`${label} embeddings response contained ${n} embeddings ` +
+				`for ${textsLength} inputs. ` +
+				`Raw body: ${excerptLocalBody(rawBody || "(empty)")}`,
+		)
+	}
+	const validated: number[][] = []
+	let promptTokens = 0
+	for (const item of embeddings) {
+		if (!Array.isArray(item) || item.some((v) => typeof v !== "number")) {
+			throw makeError(
+				`${label} embeddings response contained a non-numeric ` +
+					`embedding vector. Raw body: ${excerptLocalBody(rawBody)}`,
+			)
+		}
+		validated.push(item as number[])
+		promptTokens += (item as number[]).length
+	}
+	return { embeddings: validated, promptTokens }
+}
