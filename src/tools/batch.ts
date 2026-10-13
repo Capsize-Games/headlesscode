@@ -14,7 +14,10 @@
 import { editToolTargetPath, isParallelReadOnlyCall } from "../engine/tool-classes.js"
 import type { ToolContext, ToolResult } from "../engine/types.js"
 import { assembleSections, formatSummary } from "./batch-format.js"
-import type { ToolExecutor } from "./executor.js"
+import type { BatchExecutor, BatchSection } from "./batch-types.js"
+
+// Re-exported for backward compatibility (the leaf now owns the types).
+export type { BatchExecutor, BatchSection } from "./batch-types.js"
 
 /** Hard cap on sub-calls per batch (bounds one turn's blast radius). */
 export const MAX_BATCH_CALLS = 10
@@ -32,14 +35,6 @@ const REFUSED_IN_BATCH = new Set([
 interface BatchSubCall {
 	tool: string
 	args: Record<string, unknown>
-}
-
-/** One executed, refused, or skipped sub-call, in submission order. */
-export interface BatchSection {
-	tool: string
-	ok: boolean
-	skipped: boolean
-	content: string
 }
 
 /** Parsed batch args: sub-calls + the stop flag. */
@@ -88,7 +83,7 @@ function parseSubCall(
 
 /** Why a sub-call cannot run here, or undefined when it can. */
 function refusalFor(
-	executor: ToolExecutor,
+	executor: BatchExecutor,
 	sub: BatchSubCall,
 ): string | undefined {
 	if (REFUSED_IN_BATCH.has(sub.tool)) {
@@ -102,7 +97,7 @@ function refusalFor(
 }
 
 async function runSubCall(
-	executor: ToolExecutor,
+	executor: BatchExecutor,
 	sub: BatchSubCall,
 	index: number,
 	ctx: ToolContext,
@@ -165,7 +160,7 @@ function skippedSection(sub: BatchSubCall): BatchSection {
 }
 
 async function executeBatch(
-	executor: ToolExecutor,
+	executor: BatchExecutor,
 	workspaceRoot: string,
 	request: BatchRequest,
 	ctx: ToolContext,
@@ -227,7 +222,7 @@ function orderedSections(
  * including its read-only discipline and stubs.
  */
 export async function batchHandler(
-	executor: ToolExecutor,
+	executor: BatchExecutor,
 	args: Record<string, unknown>,
 	ctx: ToolContext,
 ): Promise<ToolResult> {

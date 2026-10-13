@@ -61,7 +61,7 @@ import * as path from "node:path"
 import { createAppAuthClient } from "../github/app-auth.js"
 import { checkMergedByAncestor, checkMergedByGitHubPr, type MergeCheckResult } from "./merge-check.js"
 import { loadStateSync, saveStateSync, updateGroup, type OrchestratorGroup, type OrchestratorState } from "./state.js"
-import { isTerminalStatus } from "./status.js"
+import { isTerminalStatus } from "./terminal-status.js"
 import { groupWorktreePath, isPidAlive } from "./watch.js"
 import {
 	branchSyncStatus,

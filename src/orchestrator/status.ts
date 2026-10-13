@@ -54,6 +54,7 @@ import * as path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 
 import type { CleanupStatus } from "./cleanup.js"
+import { isTerminalStatus, TERMINAL_STATUSES } from "./terminal-status.js"
 import {
 	defaultState,
 	loadStateSync,
@@ -72,19 +73,10 @@ import {
 } from "./watch.js"
 
 /**
- * The statuses that end a round for a group. `blocked` is NOT here on
- * purpose: a group waiting on a decision answer is not finished, and
- * `--wait` must keep waiting rather than exit early (see state.ts's
- * OrchestratorGroup.status doc comment). `orphaned` IS here: the group's
- * worktree is gone, so there is nothing left to wait FOR — the evidence is
- * gone, and reconciliation (reconcileGroups) has already surfaced the case
- * for a human to investigate rather than silently guessing an outcome.
+ * The statuses that end a round for a group — re-exported from the leaf
+ * (./terminal-status.js) so cleanup.ts shares them without an import cycle.
  */
-export const TERMINAL_STATUSES = ["done", "failed", "needs-human", "orphaned"] as const
-
-export function isTerminalStatus(status: string): boolean {
-	return TERMINAL_STATUSES.includes(status as (typeof TERMINAL_STATUSES)[number])
-}
+export { isTerminalStatus, TERMINAL_STATUSES } from "./terminal-status.js"
 
 /**
  * Default `--timeout-ms`: 2h, matching watch.ts's stall guard

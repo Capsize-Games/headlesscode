@@ -24,7 +24,7 @@ import * as path from "node:path"
 import * as ts from "typescript"
 
 import type { ToolContext, ToolResult } from "../engine/types.js"
-import { resolveWithinWorkspace } from "../tools/executor.js"
+import { resolveWithinWorkspace } from "../tools/paths.js"
 import { getCodeIntelCache, isSupportedSource, scriptKindFromFileName } from "./program.js"
 import { formatOutline, outlineSourceFile } from "./outline.js"
 import { findDefinition, formatDefinitions, makeRelativizer } from "./go-to-definition.js"

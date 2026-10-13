@@ -20,7 +20,7 @@ import { access } from "node:fs/promises"
 import type OpenAI from "openai"
 
 import type { ToolContext, ToolResult } from "../engine/types.js"
-import { resolveWithinWorkspace } from "../tools/executor.js"
+import { resolveWithinWorkspace } from "../tools/paths.js"
 import { describeImage } from "./describe.js"
 
 export const DESCRIBE_IMAGE_NAME = "describe_image"

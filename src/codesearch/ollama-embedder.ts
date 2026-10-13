@@ -46,7 +46,7 @@
  * does for the cloud path.
  */
 
-import type { EmbedResult } from "./embedder.js"
+import type { EmbedResult } from "./embedder-types.js"
 
 /** Default Ollama server base URL (Ollama's standard local port). */
 export const DEFAULT_OLLAMA_URL = "http://localhost:11434"

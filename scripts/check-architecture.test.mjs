@@ -38,10 +38,10 @@ try {
 	const messy = `export function tangled(a: number, b: number, c: number, d: number, e: number, f: number): number {\n\tlet value = 0\n${branches}\n\tif (value > 0) {\n\t\tif (value > 1) {\n\t\t\tif (value > 2) {\n\t\t\t\tif (value > 3) {\n\t\t\t\t\tif (value > 4) {\n\t\t\t\t\t\tconsole.log(value)\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\tif (value < 0) {\n\t\tprocess.exit(1)\n\t}\n\treturn value\n}\n`
 	fs.writeFileSync(path.join(dir, "messy.ts"), messy)
 	fs.writeFileSync(path.join(dir, "cli.ts"), "console.log(process.argv)\nif (!process.argv[2]) {\n\tprocess.exit(1)\n}\n")
-	fs.writeFileSync(path.join(dir, "ok.test.ts"), "console.log('trace')\n")
+	fs.writeFileSync(path.join(dir, "ok.test.ts"), "console.log('trace')\nif (!process.argv[1]) {\n\tprocess.exit(0)\n}\n")
 	const report = run([dir, "--workspace", dir, "--no-baseline"])
 	if (report.status !== 1) fail(`fixture exited ${report.status}, want 1`)
-	if (/cli\.ts.*(console|process-exit)|ok\.test\.ts.*console/.test(report.out)) fail("entry/test console exemptions misfired")
+	if (/cli\.ts.*(console|process-exit)|ok\.test\.ts.*(console|process-exit)/.test(report.out)) fail("entry/test exemptions misfired")
 	for (const rule of ["cycle", "clone", "complexity", "nesting", "params", "console", "process-exit"]) {
 		if (!report.out.includes(rule)) fail(`rule ${rule} did not fire`)
 	}

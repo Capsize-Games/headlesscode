@@ -158,7 +158,7 @@ function checkFile(relPath, absPath) {
 			const anchor = anchorOf(node)
 			findings.push({ key: `${relPath} console ${anchor.tag}`, display: `${relPath}:${anchor.line} console ${lines[anchor.line - 1].trim().slice(0, 60)}` })
 		}
-		if (ts.isCallExpression(node) && node.expression.getText(sourceFile) === "process.exit" && !isEntry) {
+		if (ts.isCallExpression(node) && node.expression.getText(sourceFile) === "process.exit" && !isEntry && !isTest) {
 			const anchor = anchorOf(node)
 			findings.push({ key: `${relPath} process-exit ${anchor.tag}`, display: `${relPath}:${anchor.line} process-exit direct process.exit call` })
 		}

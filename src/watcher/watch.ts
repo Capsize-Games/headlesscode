@@ -42,7 +42,7 @@ import { Logger } from "../engine/logger.js"
 import { museUnsupportedSettingsReason, parseHeadlessCodeJobBody, resolveAgentExecutorSelection, type AgentExecutor, type AgentExecutorSelection } from "../agent-executor.js"
 import { splitIssues, type SplitIssue, type WorktreeSpec } from "../orchestrator/split.js"
 import { loadStateSync } from "../orchestrator/state.js"
-import { writeTaskFiles } from "../orchestrator/cli.js"
+import { writeTaskFiles } from "../orchestrator/task-files.js"
 import { createGhClient, DEFAULT_GH_BASE_URL, type GhClient, type GitHubIssue, type GitHubPullRequestSummary } from "./github.js"
 import { GitHubIssueClaimStore, type ClaimSnapshot, type RunnerClaim } from "./claims.js"
 import {

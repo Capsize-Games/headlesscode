@@ -1,7 +1,6 @@
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
-import type { EvidenceBundle, EvidencePublicKey, EvidenceVerification, SignedSessionHead } from "./types.js"
-import { verifyEvidenceBundle } from "./verify.js"
+import type { EvidencePublicKey } from "./types.js"
 import { HttpEvidenceJournal, UnixEvidenceJournal } from "./collector.js"
 import type { EvidenceJournal } from "./types.js"
 
@@ -11,15 +10,8 @@ export * from "./collector.js"
 export * from "./verify.js"
 export { evidenceMain, runEvidenceCli } from "./cli.js"
 
-export async function verifyEvidenceFiles(bundlePath: string, pinnedKeyPath: string, pinnedHeadPath: string): Promise<EvidenceVerification> {
-	const [bundleRaw, keyRaw, headRaw] = await Promise.all([
-		fs.readFile(bundlePath, "utf8"), fs.readFile(pinnedKeyPath, "utf8"), fs.readFile(pinnedHeadPath, "utf8"),
-	])
-	const bundle = JSON.parse(bundleRaw) as EvidenceBundle
-	const keyValue = JSON.parse(keyRaw) as EvidencePublicKey
-	const pinnedHead = JSON.parse(headRaw) as SignedSessionHead
-	return verifyEvidenceBundle(bundle, keyValue, pinnedHead)
-}
+// Re-exported for backward compatibility (the leaf now owns the function).
+export { verifyEvidenceFiles } from "./verify.js"
 
 export interface EvidenceRuntimeConfig { sessionId: string; evidenceJournal: EvidenceJournal; evidenceRequired: boolean }
 export type EvidenceConnectionConfig = {

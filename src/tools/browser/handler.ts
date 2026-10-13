@@ -33,7 +33,7 @@ import * as path from "node:path"
 import { setTimeout as sleep } from "node:timers/promises"
 
 import type { AuxLlmUsage, ToolContext, ToolResult } from "../../engine/types.js"
-import { resolveWithinWorkspace } from "../executor.js"
+import { resolveWithinWorkspace } from "../paths.js"
 import { describeImage, type DescribeImageResult } from "../../vision/describe.js"
 import {
 	BrowserSession,

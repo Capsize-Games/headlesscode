@@ -70,7 +70,7 @@ Fewest lines for the most complexity — no repetition, no knots:
 | Nesting depth | `nesting` | > 4 control levels per function |
 | Parameter count | `params` | > 5 parameters (bundle into an options object) |
 | `console.*` in library code | `console` | tests and `cli.ts` entry points exempt |
-| `process.exit` in library code | `process-exit` | `cli.ts` entry points exempt; libraries throw |
+| `process.exit` in library code | `process-exit` | tests and `cli.ts` entry points exempt; libraries throw |
 
 Same content-anchored baseline ratchet
 (`scripts/architecture-baseline.json`): no new findings; regenerate in the

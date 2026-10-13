@@ -37,7 +37,7 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
 
-import { writeTaskFiles } from "../orchestrator/cli.js"
+import { writeTaskFiles } from "../orchestrator/task-files.js"
 import type { CloudProvider, CloudSessionRequest, CommandResult, SessionHandle } from "./provider.js"
 
 /** The harness repo root (parent of src/cloud) — same pattern as the CLI. */

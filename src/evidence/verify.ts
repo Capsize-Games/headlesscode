@@ -1,4 +1,5 @@
 import { createPublicKey, verify as verifySignature } from "node:crypto"
+import * as fs from "node:fs/promises"
 import { canonicalJson, boundedCanonicalJson, sha256 } from "./canonical.js"
 import type { EvidenceBundle, EvidencePublicKey, EvidenceReceipt, EvidenceVerification, SignedSessionHead } from "./types.js"
 
@@ -48,4 +49,27 @@ export function verifyEvidenceBundle(bundle: EvidenceBundle, pinnedPublicKey: Ev
 	if (pinnedHead.digest !== previous) errors.push("final record digest does not match pinned head")
 	if (!bundle.records.length && (pinnedHead.sequence !== 0 || pinnedHead.digest !== null)) errors.push("empty journal does not match pinned non-empty head")
 	return { valid: errors.length === 0, checkedRecords: bundle.records.length, errors, readableHistory: history }
+}
+
+/**
+ * Read a bundle + pinned key/head from disk and verify them (issue #128
+ * leaf). Lived in index.ts, which cli.ts cannot import without closing an
+ * import cycle (index.ts re-exports the CLI entry point); the leaf depends
+ * only on fs + the bundle verifier, so cli.ts and index.ts share it
+ * cycle-free.
+ */
+export async function verifyEvidenceFiles(
+	bundlePath: string,
+	pinnedKeyPath: string,
+	pinnedHeadPath: string,
+): Promise<EvidenceVerification> {
+	const [bundleRaw, keyRaw, headRaw] = await Promise.all([
+		fs.readFile(bundlePath, "utf8"),
+		fs.readFile(pinnedKeyPath, "utf8"),
+		fs.readFile(pinnedHeadPath, "utf8"),
+	])
+	const bundle = JSON.parse(bundleRaw) as EvidenceBundle
+	const keyValue = JSON.parse(keyRaw) as EvidencePublicKey
+	const pinnedHead = JSON.parse(headRaw) as SignedSessionHead
+	return verifyEvidenceBundle(bundle, keyValue, pinnedHead)
 }
