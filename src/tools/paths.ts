@@ -136,7 +136,7 @@ function followDanglingOrWalkUp(probe: string): string | null {
 }
 
 /** realpath of `p`, falling back to the lexical path when it can't resolve. */
-function realpathOrSelf(p: string): string {
+export function realpathOrSelf(p: string): string {
 	try {
 		return fs.realpathSync(p)
 	} catch {

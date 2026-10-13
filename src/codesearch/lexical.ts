@@ -24,6 +24,7 @@ import * as fsp from "node:fs/promises"
 import * as path from "node:path"
 
 import { walkSourceFiles } from "./files.js"
+import { realpathOrSelf } from "../tools/paths.js"
 
 /** Max candidate files opened during one fallback search. */
 export const LEXICAL_MAX_FILES = 1000
@@ -71,14 +72,6 @@ function isCredentialFile(rel: string): boolean {
 		}
 	}
 	return false
-}
-
-function realpathOrSelf(p: string): string {
-	try {
-		return fs.realpathSync(p)
-	} catch {
-		return p
-	}
 }
 
 function normalizeScope(scope: string): string {
