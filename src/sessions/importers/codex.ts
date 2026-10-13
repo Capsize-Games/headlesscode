@@ -1,10 +1,5 @@
 import type { SessionMessage, ArchivedToolCall } from "../types.js"
-import { isRecord, opaque, type ParsedImport, safeString } from "./common.js"
-
-function timestamp(value: unknown): string | undefined {
-	if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) return undefined
-	return value
-}
+import { isRecord, opaque, type ParsedImport, parseTimestamp, safeString } from "./common.js"
 
 function textContent(value: unknown): { text: string; opaque: { type: string; value: unknown }[] } {
 	if (typeof value === "string") return { text: value, opaque: [] }
@@ -52,7 +47,7 @@ export function parseCodexRecords(records: unknown[]): ParsedImport {
 			const id = safeString(payload.id)
 			if (id && recordIds.has(id)) { warnings.push(`Duplicate Codex response item ID ${id} was ignored.`); continue }
 			if (id) recordIds.add(id)
-			const time = timestamp(record.timestamp)
+			const time = parseTimestamp(record.timestamp)
 			if (itemType === "message") {
 				const role = payload.role
 				if (role !== "user" && role !== "assistant" && role !== "system" && role !== "developer") {
@@ -92,7 +87,7 @@ export function parseCodexRecords(records: unknown[]): ParsedImport {
 			sawBranch = true
 			warnings.push("Codex rollout contains compaction data; only explicit response items were imported.")
 			const summary = safeString(payload.message ?? payload.summary)
-			if (summary) messages.push({ role: "assistant", content: `[Imported Codex compaction summary]\n${summary}`, ...(timestamp(record.timestamp) ? { timestamp: timestamp(record.timestamp) } : {}) })
+			if (summary) messages.push({ role: "assistant", content: `[Imported Codex compaction summary]\n${summary}`, ...(parseTimestamp(record.timestamp) ? { timestamp: parseTimestamp(record.timestamp) } : {}) })
 			continue
 		}
 		if (type === "reasoning" || type === "encrypted_reasoning") {
@@ -100,7 +95,7 @@ export function parseCodexRecords(records: unknown[]): ParsedImport {
 			continue
 		}
 		warnings.push(`Unsupported Codex record type ${String(type ?? "(missing)")} was retained as opaque history.`)
-		messages.push({ role: "assistant", content: null, opaque: opaque(`codex-${String(type ?? "unknown")}`, record), ...(timestamp(record.timestamp) ? { timestamp: timestamp(record.timestamp) } : {}) })
+		messages.push({ role: "assistant", content: null, opaque: opaque(`codex-${String(type ?? "unknown")}`, record), ...(parseTimestamp(record.timestamp) ? { timestamp: parseTimestamp(record.timestamp) } : {}) })
 	}
 	for (const id of resultIds) if (!callIds.has(id)) warnings.push(`Codex tool result ${id} has no matching call; it was kept as historical output.`)
 	for (const id of callIds) if (!resultIds.has(id)) warnings.push(`Codex tool call ${id} has no matching result.`)

@@ -1,10 +1,5 @@
 import type { SessionMessage, ArchivedToolCall } from "../types.js"
-import { isRecord, opaque, type ParsedImport, safeString } from "./common.js"
-
-function timestamp(value: unknown): string | undefined {
-	if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) return undefined
-	return value
-}
+import { isRecord, opaque, type ParsedImport, parseTimestamp, safeString } from "./common.js"
 
 function contentText(value: unknown): string | null {
 	if (typeof value === "string") return value
@@ -27,7 +22,7 @@ function normalizeMessage(value: unknown, warnings: string[]): SessionMessage | 
 		return { role: "assistant", content: null, opaque: opaque("muse-message", value) }
 	}
 	const content = value.content ?? value.text ?? value.body
-	const result: SessionMessage = { role, content: contentText(content), ...(timestamp(value.timestamp) ? { timestamp: timestamp(value.timestamp) } : {}) }
+	const result: SessionMessage = { role, content: contentText(content), ...(parseTimestamp(value.timestamp) ? { timestamp: parseTimestamp(value.timestamp) } : {}) }
 	const calls: ArchivedToolCall[] = []
 	const callValues = Array.isArray(value.tool_calls) ? value.tool_calls : Array.isArray(value.toolCalls) ? value.toolCalls : []
 	for (const callValue of callValues) {
@@ -75,18 +70,18 @@ export function parseMuseExport(value: unknown): ParsedImport {
 			else if (/reasoning/i.test(String(payload.event.kind ?? ""))) {
 				const encrypted = encryptedReasoning(payload.event)
 				if (encrypted !== undefined) {
-					messages.push({ role: "assistant", content: null, opaque: opaque("muse-encrypted-reasoning", encrypted), ...(timestamp(envelope.recorded_at) ? { timestamp: timestamp(envelope.recorded_at) } : {}) })
+					messages.push({ role: "assistant", content: null, opaque: opaque("muse-encrypted-reasoning", encrypted), ...(parseTimestamp(envelope.recorded_at) ? { timestamp: parseTimestamp(envelope.recorded_at) } : {}) })
 					warnings.push("Muse encrypted reasoning was retained as opaque archive data and excluded from continuation context.")
 				} else warnings.push("Muse reasoning records were omitted; imported sessions never restore private reasoning.")
 			} else if (isSafeRunEvent(payload.event.kind)) warnings.push(`Muse run event ${String(payload.event.kind)} was unsupported and retained as opaque history.`)
-			if (isSafeRunEvent(payload.event.kind) && !message) messages.push({ role: "assistant", content: null, opaque: opaque(`muse-run-${String(payload.event.kind)}`, payload.event), ...(timestamp(envelope.recorded_at) ? { timestamp: timestamp(envelope.recorded_at) } : {}) })
+			if (isSafeRunEvent(payload.event.kind) && !message) messages.push({ role: "assistant", content: null, opaque: opaque(`muse-run-${String(payload.event.kind)}`, payload.event), ...(parseTimestamp(envelope.recorded_at) ? { timestamp: parseTimestamp(envelope.recorded_at) } : {}) })
 		} else if (payload.kind === "run") {
 			warnings.push("Muse run record has no event object and was omitted.")
 		} else if (envelope.payload_type === "approval.review" || /approval|permission/i.test(String(envelope.payload_type ?? ""))) {
 			warnings.push("Muse approval or permission records were omitted.")
 		} else if (/reasoning/i.test(String(envelope.payload_type ?? ""))) {
 			const encrypted = encryptedReasoning(payload)
-			if (encrypted !== undefined) messages.push({ role: "assistant", content: null, opaque: opaque("muse-encrypted-reasoning", encrypted), ...(timestamp(envelope.recorded_at) ? { timestamp: timestamp(envelope.recorded_at) } : {}) })
+			if (encrypted !== undefined) messages.push({ role: "assistant", content: null, opaque: opaque("muse-encrypted-reasoning", encrypted), ...(parseTimestamp(envelope.recorded_at) ? { timestamp: parseTimestamp(envelope.recorded_at) } : {}) })
 			else warnings.push("Muse reasoning records were omitted; imported sessions never restore private reasoning.")
 		}
 	}
@@ -120,7 +115,7 @@ function encryptedReasoning(value: unknown): unknown | undefined {
 
 function museRunMessage(event: Record<string, unknown>, recordedAt?: unknown): SessionMessage | undefined {
 	const kind = event.kind
-	const time = timestamp(recordedAt) ?? timestamp(event.timestamp)
+	const time = parseTimestamp(recordedAt) ?? parseTimestamp(event.timestamp)
 	if (kind === "started" && typeof event.prompt === "string") return { role: "user", content: event.prompt, ...(time ? { timestamp: time } : {}) }
 	if (kind === "tool_result" && typeof event.text === "string") return { role: "tool", content: event.text, ...(safeString(event.call_id) ? { toolCallId: safeString(event.call_id) } : {}), ...(time ? { timestamp: time } : {}) }
 	if (kind === "assistant_message_committed" && typeof event.text === "string") return { role: "assistant", content: event.text, ...(time ? { timestamp: time } : {}) }
@@ -170,13 +165,13 @@ export function parseMuseRecords(records: unknown[]): ParsedImport {
 			}
 			if (isSafeRunEvent(event.kind)) {
 				warnings.push(`Muse run event ${String(event.kind ?? "(missing)")} was retained as opaque history.`)
-				messages.push({ role: "assistant", content: null, opaque: opaque(`muse-run-${String(event.kind ?? "unknown")}`, event), ...(timestamp(record.recorded_at) ? { timestamp: timestamp(record.recorded_at) } : {}) })
+				messages.push({ role: "assistant", content: null, opaque: opaque(`muse-run-${String(event.kind ?? "unknown")}`, event), ...(parseTimestamp(record.recorded_at) ? { timestamp: parseTimestamp(record.recorded_at) } : {}) })
 			}
 			continue
 		}
 		if (/reasoning/i.test(String(record.payload_type ?? ""))) {
 			const encrypted = encryptedReasoning(payload)
-			if (encrypted !== undefined) messages.push({ role: "assistant", content: null, opaque: opaque("muse-encrypted-reasoning", encrypted), ...(timestamp(record.recorded_at) ? { timestamp: timestamp(record.recorded_at) } : {}) })
+			if (encrypted !== undefined) messages.push({ role: "assistant", content: null, opaque: opaque("muse-encrypted-reasoning", encrypted), ...(parseTimestamp(record.recorded_at) ? { timestamp: parseTimestamp(record.recorded_at) } : {}) })
 			else warnings.push("Muse reasoning records were omitted; imported sessions never restore private reasoning.")
 			continue
 		}
@@ -198,11 +193,11 @@ export function parseMuseRecords(records: unknown[]): ParsedImport {
 			warnings.push("Muse reasoning records were omitted; imported sessions never restore private reasoning.")
 		} else if (kind === "branch" || kind === "compaction" || kind === "summary") {
 			const summary = safeString(record.summary ?? record.text)
-			if (summary) messages.push({ role: "assistant", content: `[Imported ${String(kind)} context]\n${summary}`, ...(timestamp(record.timestamp) ? { timestamp: timestamp(record.timestamp) } : {}) })
+			if (summary) messages.push({ role: "assistant", content: `[Imported ${String(kind)} context]\n${summary}`, ...(parseTimestamp(record.timestamp) ? { timestamp: parseTimestamp(record.timestamp) } : {}) })
 			warnings.push(`Muse ${String(kind)} metadata was flattened into chronological history.`)
 		} else {
 			warnings.push(`Unsupported Muse JSONL record type ${String(kind ?? "(missing)")} was retained as opaque history.`)
-			messages.push({ role: "assistant", content: null, opaque: opaque(`muse-${String(kind ?? "unknown")}`, record), ...(timestamp(record.timestamp) ? { timestamp: timestamp(record.timestamp) } : {}) })
+			messages.push({ role: "assistant", content: null, opaque: opaque(`muse-${String(kind ?? "unknown")}`, record), ...(parseTimestamp(record.timestamp) ? { timestamp: parseTimestamp(record.timestamp) } : {}) })
 		}
 	}
 	for (const id of results) if (!calls.has(id)) warnings.push(`Muse tool result ${id} has no matching call; it was kept as historical output.`)

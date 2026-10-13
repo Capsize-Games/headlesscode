@@ -178,6 +178,11 @@ export function normalizeRole(value: unknown): SessionMessage["role"] | undefine
 	return undefined
 }
 
+export function parseTimestamp(value: unknown): string | undefined {
+	if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) return undefined
+	return value
+}
+
 export function titleFrom(pathname: string, fallback: string): string {
 	const name = path.basename(pathname).replace(/\.(jsonl|json)$/i, "")
 	return (name && name.length > 0 ? name : fallback).slice(0, 256)

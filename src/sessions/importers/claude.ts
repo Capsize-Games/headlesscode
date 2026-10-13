@@ -1,10 +1,5 @@
 import type { SessionMessage, ArchivedToolCall } from "../types.js"
-import { isRecord, opaque, type ParsedImport, safeString } from "./common.js"
-
-function time(value: unknown): string | undefined {
-	if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) return undefined
-	return value
-}
+import { isRecord, opaque, type ParsedImport, parseTimestamp, safeString } from "./common.js"
 
 function blocksToMessages(role: SessionMessage["role"], content: unknown, timestamp?: string): SessionMessage[] {
 	if (typeof content === "string") return [{ role, content, ...(timestamp ? { timestamp } : {}) }]
@@ -77,7 +72,7 @@ export function parseClaudeRecords(records: unknown[]): ParsedImport {
 				messages.push({ role: type, content: null, opaque: opaque("claude-message", record) })
 				continue
 			}
-			const converted = blocksToMessages(role, message?.content, time(record.timestamp))
+			const converted = blocksToMessages(role, message?.content, parseTimestamp(record.timestamp))
 			for (const item of converted) {
 				for (const call of item.toolCalls ?? []) {
 					if (callIds.has(call.id)) warnings.push(`Duplicate Claude tool call ID ${call.id} was retained.`)
@@ -87,15 +82,15 @@ export function parseClaudeRecords(records: unknown[]): ParsedImport {
 				messages.push(item)
 			}
 		} else if (type === "summary" && typeof record.summary === "string") {
-			messages.push({ role: "assistant", content: `[Imported conversation summary]\n${record.summary}`, ...(time(record.timestamp) ? { timestamp: time(record.timestamp) } : {}) })
+			messages.push({ role: "assistant", content: `[Imported conversation summary]\n${record.summary}`, ...(parseTimestamp(record.timestamp) ? { timestamp: parseTimestamp(record.timestamp) } : {}) })
 			warnings.push("Claude conversation summary was imported as historical context; earlier compacted messages may be absent.")
 		} else if (type === "system" && typeof record.content === "string") {
-			messages.push({ role: "system", content: record.content, ...(time(record.timestamp) ? { timestamp: time(record.timestamp) } : {}) })
+			messages.push({ role: "system", content: record.content, ...(parseTimestamp(record.timestamp) ? { timestamp: parseTimestamp(record.timestamp) } : {}) })
 		} else if (type === "compact_boundary" || type === "permission" || type === "approval" || type === "tool_decision" || type === "thinking" || type === "redacted_thinking") {
 			warnings.push(`Claude ${String(type)} metadata was omitted from the imported conversation.`)
 		} else {
 			warnings.push(`Unsupported Claude record type ${String(type ?? "(missing)")} was retained as opaque history.`)
-			messages.push({ role: "assistant", content: null, opaque: opaque(`claude-${String(type ?? "unknown")}`, record), ...(time(record.timestamp) ? { timestamp: time(record.timestamp) } : {}) })
+			messages.push({ role: "assistant", content: null, opaque: opaque(`claude-${String(type ?? "unknown")}`, record), ...(parseTimestamp(record.timestamp) ? { timestamp: parseTimestamp(record.timestamp) } : {}) })
 		}
 	}
 	for (const id of resultIds) if (!callIds.has(id)) warnings.push(`Claude tool result ${id} has no matching call; it was kept as historical output.`)
