@@ -16,10 +16,14 @@ import * as path from "node:path"
 
 import { orchestrateMain } from "../cli.js"
 import {
+	describeTarget,
 	findingsFromCommentBodies,
+	hasExactlyOneTarget,
+	parseIntFlag,
 	parseResumeArgs,
 	parseReviewArgs,
 	parseReworkArgs,
+	parseTargetArgs,
 	rebuildPatchFromMarkers,
 	recheckoutWorktree,
 	resumeGroup,
@@ -1212,6 +1216,82 @@ async function testOrchestrateMainDispatchesResumeHelp(): Promise<void> {
 	assert.ok(stdout.includes("orchestrate resume"), `resume help dispatched, got: ${stdout.slice(0, 80)}`)
 }
 
+// ─── hasExactlyOneTarget / parseTargetArgs / describeTarget / parseIntFlag ─
+
+async function testHasExactlyOneTarget(): Promise<void> {
+	assert.equal(hasExactlyOneTarget({ issue: 1 }), true)
+	assert.equal(hasExactlyOneTarget({ pr: 2 }), true)
+	assert.equal(hasExactlyOneTarget({ group: "w1" }), true)
+	assert.equal(hasExactlyOneTarget({}), false, "no target set")
+	const issuePr = { issue: 1, pr: 2 }
+	assert.equal(hasExactlyOneTarget(issuePr), false, "two set")
+	const issueGroup = { issue: 1, group: "w1" }
+	assert.equal(hasExactlyOneTarget(issueGroup), false, "two set")
+}
+
+async function testParseTargetArgs(): Promise<void> {
+	const issueOnly = parseTargetArgs(["--issue", "14", "--dry-run"])
+	assert.equal(issueOnly.error, undefined)
+	assert.deepEqual(issueOnly.target, { issue: 14 })
+	assert.deepEqual(issueOnly.rest, ["--dry-run"])
+	const eqForm = parseTargetArgs(["--group=w2"])
+	assert.equal(eqForm.error, undefined)
+	assert.deepEqual(eqForm.target, { group: "w2" })
+	const bad = parseTargetArgs(["--pr", "abc"])
+	assert.ok(bad.error && bad.error.includes("positive integer"))
+	const conflict = parseTargetArgs(["--issue", "1", "--group", "w1"])
+	assert.ok(conflict.error && conflict.error.includes("exactly one"))
+}
+
+async function testParseTargetArgsMissing(): Promise<void> {
+	// A missing value is an error, and nothing is consumed.
+	const missing = parseTargetArgs(["--issue"])
+	assert.ok(missing.error?.includes("positive integer"))
+	assert.deepEqual(missing.rest, [])
+	// A flag-like next token is NOT consumed as the value.
+	const flagNext = parseTargetArgs(["--issue", "--pr", "2"])
+	assert.ok(flagNext.error?.includes("positive integer"))
+	assert.deepEqual(flagNext.target, { pr: 2 })
+	// An empty inline value is rejected like any other bad integer.
+	const emptyInline = parseTargetArgs(["--issue="])
+	assert.ok(emptyInline.error?.includes("positive integer"))
+}
+
+async function testParseTargetArgsEmpty(): Promise<void> {
+	// An empty --group value is rejected.
+	const emptyGroup = parseTargetArgs(["--group", ""])
+	assert.ok(emptyGroup.error?.includes("non-empty group"))
+	// Parsing continues after an error; the LAST error wins.
+	const over = parseTargetArgs(["--pr", "abc", "--issue", "0"])
+	assert.ok(over.error?.includes("--issue requires"))
+	// Unknown flags pass through untouched.
+	const passthrough = parseTargetArgs(["--repo", "/tmp/x", "--issue", "3"])
+	assert.deepEqual(passthrough.rest, ["--repo", "/tmp/x"])
+}
+
+async function testDescribeTarget(): Promise<void> {
+	assert.equal(describeTarget({ issue: 7 }), "issue #7")
+	assert.equal(describeTarget({ pr: 3 }), "PR #3")
+	assert.equal(describeTarget({ group: "w1" }), 'group "w1"')
+	assert.equal(describeTarget({}), "(none)")
+}
+
+async function testParseIntFlag(): Promise<void> {
+	const flag = "--max-rework-cycles"
+	const spaced = parseIntFlag([flag, "5"], 0, flag)
+	assert.equal(spaced.error, undefined)
+	assert.equal(spaced.value, 5)
+	assert.equal(spaced.consumed, 1)
+	const inline = parseIntFlag([`${flag}=4`], 0, flag)
+	assert.equal(inline.error, undefined)
+	assert.equal(inline.value, 4)
+	assert.equal(inline.consumed, 0)
+	const missing = parseIntFlag([flag], 0, flag)
+	assert.ok(missing.error?.includes("Missing value"))
+	const zero = parseIntFlag([flag, "0"], 0, flag)
+	assert.ok(zero.error?.includes("positive integer"))
+}
+
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
 const tests: Array<[string, () => Promise<void>]> = [
@@ -1260,6 +1340,12 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["orchestrateMain dispatches review --help", testOrchestrateMainDispatchesReviewHelp],
 	["orchestrateMain dispatches rework --help", testOrchestrateMainDispatchesReworkHelp],
 	["orchestrateMain dispatches resume --help", testOrchestrateMainDispatchesResumeHelp],
+	["hasExactlyOneTarget accepts exactly one target", testHasExactlyOneTarget],
+	["parseTargetArgs extracts --issue/--pr/--group", testParseTargetArgs],
+	["parseTargetArgs missing/flag-next/empty-inline", testParseTargetArgsMissing],
+	["parseTargetArgs empty/overwrite/passthrough", testParseTargetArgsEmpty],
+	["describeTarget formats each target kind", testDescribeTarget],
+	["parseIntFlag value forms", testParseIntFlag],
 ]
 
 async function main(): Promise<void> {
