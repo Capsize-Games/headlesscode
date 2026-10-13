@@ -117,7 +117,7 @@ test("proof max-token option rejects invalid values and commands governed by a f
 test("proof preview selects a nonempty visible test set outside withheld RSI sources", async () => {
 	const parsed = parseProofDemonstrationArgs(["engineering", "--seed", "preview-seed"])
 	const defaultConfig = (await import("../config.js")).parseRsiArgs(["--repo", process.cwd()]).config!
-	assert.deepEqual(defaultConfig.evalCommands, ["npm test -- --filter rsi"])
+	assert.deepEqual(defaultConfig.evalCommands, ["npm test -- --filter engine"])
 	const previewConfig = configureProofVisibleEvaluations(defaultConfig)
 	assert.equal(previewConfig.regressionCommand, "npm test", "retain the full regression command")
 	assert.deepEqual(previewConfig.evalCommands, [...PROOF_VISIBLE_EVAL_COMMANDS])
