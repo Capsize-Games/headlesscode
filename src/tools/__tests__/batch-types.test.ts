@@ -21,6 +21,7 @@ import type { BatchExecutor, BatchSection } from "../batch-types.js"
 import { assembleSections, formatSummary } from "../batch-format.js"
 import { createHeadlessExecutor } from "../executor.js"
 import type { ToolContext } from "../../engine/types.js"
+import { runMain } from "../../test-runner.js"
 
 interface ExecResult {
 	content: string
@@ -83,38 +84,11 @@ async function testToolExecutorSatisfiesTheInterface(): Promise<void> {
 	assert.equal(asInterface.has("no-such-tool"), false)
 }
 
-async function runOne(name: string, fn: () => Promise<void>): Promise<boolean> {
-	try {
-		await fn()
-		console.log(`  ok   ${name}`)
-		return true
-	} catch (error) {
-		console.error(`  FAIL ${name}`)
-		if (error instanceof Error) console.error(error.stack ?? error)
-		else console.error(String(error))
-		return false
-	}
-}
+const tests: Array<[string, () => Promise<void>]> = [
+	["runs against the interface", testBatchHandlerRunsAgainstTheInterface],
+	["unknown tool is a section error", testUnknownToolIsASectionError],
+	["sections flow through", testLeafSectionsFlowThroughTheFormatter],
+	["executor satisfies interface", testToolExecutorSatisfiesTheInterface],
+]
 
-async function main(): Promise<void> {
-	const tests: Array<[string, () => Promise<void>]> = [
-		["runs against the interface", testBatchHandlerRunsAgainstTheInterface],
-		["unknown tool is a section error", testUnknownToolIsASectionError],
-		["sections flow through", testLeafSectionsFlowThroughTheFormatter],
-		["executor satisfies interface", testToolExecutorSatisfiesTheInterface],
-	]
-	let failed = 0
-	for (const [name, fn] of tests) {
-		if (!(await runOne(name, fn))) failed++
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} batch-types tests passed`)
-}
-
-main().catch((error) => {
-	console.error("Test runner crashed:", error)
-	process.exit(1)
-})
+runMain("batch-types", tests)

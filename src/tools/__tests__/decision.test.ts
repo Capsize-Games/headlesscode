@@ -20,6 +20,7 @@ import { BudgetTracker } from "../../budget/budget.js"
 import { HeadlessSession } from "../../engine/loop.js"
 import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } from "../../engine/types.js"
 import type { PermissionsConfig } from "../../permissions/config.js"
+import { runMain } from "../../test-runner.js"
 
 async function mkTmpWorkspace(prefix: string): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -380,26 +381,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["permissions: reviewer/QA read-only executor gates execute_command identically", testReadOnlyExecutorAlsoGatesCommands],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} executor tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("executor", tests)

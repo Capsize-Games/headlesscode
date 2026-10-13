@@ -27,6 +27,7 @@ import {
 	LOCAL_SUMMARIZATION_DEFAULT_ENABLED,
 	LOCAL_SUMMARIZATION_ENV,
 } from "../output-summarizer.js"
+import { runMain } from "../../test-runner.js"
 
 // ─── Fake Ollama server ───────────────────────────────────────────────────────
 
@@ -243,26 +244,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["summarizer: oversized summary (> MAX_SUMMARY_CHARS) rejected", testOversizedSummaryRejected],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} output-summarizer tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("output-summarizer", tests)

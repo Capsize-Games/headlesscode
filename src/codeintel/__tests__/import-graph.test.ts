@@ -19,6 +19,7 @@ import * as path from "node:path"
 
 import { createHeadlessExecutor } from "../../tools/executor.js"
 import { getCodeIntelCache, resetCodeIntelCaches } from "../program.js"
+import { runMain } from "../../test-runner.js"
 
 const FIXTURE_A = `import { b1 } from "./b.js"
 import type { c1 } from "./c.js"
@@ -146,33 +147,11 @@ async function testNonTsFile(): Promise<void> {
 	}
 }
 
-async function main(): Promise<void> {
-	const tests: Array<[string, () => Promise<void>]> = [
-		["imports resolve to real file paths (incl. type-only and unresolved)", testImportsResolvedToRealPaths],
-		["reverse lookup sees type imports and re-exports", testReverseLookupIncludingReExportAndTypeImport],
-		["program cache is reused across calls and invalidated on file change", testProgramCacheReusedAcrossCalls],
-		["non-TS file returns the not-supported result", testNonTsFile],
-	]
+const tests: Array<[string, () => Promise<void>]> = [
+	["imports resolve to real file paths (incl. type-only and unresolved)", testImportsResolvedToRealPaths],
+	["reverse lookup sees type imports and re-exports", testReverseLookupIncludingReExportAndTypeImport],
+	["program cache is reused across calls and invalidated on file change", testProgramCacheReusedAcrossCalls],
+	["non-TS file returns the not-supported result", testNonTsFile],
+]
 
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} import_graph tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("import_graph", tests)

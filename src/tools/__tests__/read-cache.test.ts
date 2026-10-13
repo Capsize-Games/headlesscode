@@ -16,6 +16,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 
 import { createHeadlessExecutor, createReadOnlyHeadlessExecutor } from "../executor.js"
+import { runMain } from "../../test-runner.js"
 
 async function mkTmpWorkspace(prefix: string): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -384,26 +385,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["disableReadFileCache absent/false: default cache behavior unaffected", testCacheStillWorksWhenOptionIsAbsentOrFalse],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} read-cache tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("read-cache", tests)

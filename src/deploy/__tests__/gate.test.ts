@@ -7,6 +7,7 @@
 import assert from "node:assert/strict"
 
 import { decideApproval, type ApprovalInputs } from "../gate.js"
+import { runMain } from "../../test-runner.js"
 
 function inputs(over: Partial<ApprovalInputs>): ApprovalInputs {
 	return { interactive: false, approvalFileExists: false, ...over }
@@ -108,26 +109,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["all inputs empty denies", testNonInteractiveEverythingEmptyDenies],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} deploy-gate decision tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("deploy-gate decision", tests)

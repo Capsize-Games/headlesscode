@@ -33,6 +33,7 @@ import { EventFeed, eventsDir, eventsFilePath, readEventsFile } from "../../engi
 import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } from "../../engine/types.js"
 import { reviewTools } from "../../orchestrator/reviewer.js"
 import { qaTools } from "../../qa/qa.js"
+import { runMain } from "../../test-runner.js"
 
 async function mkTmpWorkspace(prefix: string): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -353,26 +354,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["summarizeToolArg previews update_todo_list args", testSummarizeToolArgForUpdateTodoList],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} update_todo_list tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("update_todo_list", tests)

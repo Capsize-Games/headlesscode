@@ -22,6 +22,7 @@ import * as path from "node:path"
 
 import { createHeadlessExecutor } from "../../tools/executor.js"
 import { resetCodeIntelCaches } from "../program.js"
+import { runMain } from "../../test-runner.js"
 
 // Line numbers below are 1-based and VERIFIED against the fixture text:
 // add=6, PI=10, first overload=18, second overload=19, loose=24,
@@ -216,36 +217,14 @@ async function testMissingFile(): Promise<void> {
 	}
 }
 
-async function main(): Promise<void> {
-	const tests: Array<[string, () => Promise<void>]> = [
-		["plain function resolves to its declaration", testPlainFunctionDefinition],
-		["character disambiguates symbols on one line", testCharacterDisambiguation],
-		["definition in a .d.ts via tsconfig paths alias resolves", testDefinitionInDtsThroughPathsAlias],
-		["overloaded function returns ALL definitions", testOverloadReturnsAllDefinitions],
-		["unresolvable (any-typed) symbol gets a clear message", testUnresolvableSymbol],
-		["non-TS file returns the not-supported result", testNonTsFile],
-		["missing file errors clearly", testMissingFile],
-	]
+const tests: Array<[string, () => Promise<void>]> = [
+	["plain function resolves to its declaration", testPlainFunctionDefinition],
+	["character disambiguates symbols on one line", testCharacterDisambiguation],
+	["definition in a .d.ts via tsconfig paths alias resolves", testDefinitionInDtsThroughPathsAlias],
+	["overloaded function returns ALL definitions", testOverloadReturnsAllDefinitions],
+	["unresolvable (any-typed) symbol gets a clear message", testUnresolvableSymbol],
+	["non-TS file returns the not-supported result", testNonTsFile],
+	["missing file errors clearly", testMissingFile],
+]
 
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} go_to_definition tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("go_to_definition", tests)

@@ -8,6 +8,7 @@ import type { CodeIntel } from "../../codeintel/program.js"
 import type { GateRunner } from "../review-gates.js"
 import { runReviewGates } from "../review-gates.js"
 import { hasRealWorktreeChanges } from "../verification-gate.js"
+import { runMain } from "../../test-runner.js"
 
 function git(repo: string, args: string[]): string {
 	return execFileSync("git", ["-C", repo, ...args], {
@@ -162,27 +163,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["uncovered sources flagged", () => withFixture(uncoveredSourceFlagged)],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			const detail = err instanceof Error ? err.stack ?? err.message : String(err)
-			console.error(detail)
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} review-gates tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("review-gates", tests)

@@ -16,6 +16,7 @@ import * as path from "node:path"
 
 import { checkpointsMain, parseCheckpointsArgs } from "../cli.js"
 import { createCheckpointService } from "../service.js"
+import { runMain } from "../../test-runner.js"
 
 async function tmpRepo(prefix = "hc-ckpt-cli-"): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -223,26 +224,4 @@ const tests: Array<[string, () => void | Promise<void>]> = [
 	["checkpointsMain: diff against the working tree exits 0", testMainDiffAgainstWorkingTree],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? (err.stack ?? err.message) : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} checkpoints CLI tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("checkpoints CLI", tests)

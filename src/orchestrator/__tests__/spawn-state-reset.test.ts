@@ -23,6 +23,7 @@ import * as fsPromises from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
+import { runMain } from "../../test-runner.js"
 
 const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url))
 const SPAWN_SCRIPT = path.join(REPO_ROOT, "scripts", "spawn-parallel-worktrees.sh")
@@ -164,26 +165,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["reused worktree slot clears stale review_verdict/qa/cost_recorded (issue #28)", testReusedSlotClearsStaleReviewQaCostFields],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? (err.stack ?? err.message) : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} spawn-state-reset tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("spawn-state-reset", tests)

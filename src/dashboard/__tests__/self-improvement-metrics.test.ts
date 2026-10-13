@@ -30,6 +30,7 @@ import {
 	extractIssueRefs,
 } from "../self-improvement-metrics.js"
 import type { SessionRow } from "../aggregate.js"
+import { runMain } from "../../test-runner.js"
 
 const execFileP = promisify(execFile)
 
@@ -199,26 +200,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["computeIssueLifecycle: a repo with no GitHub remote degrades to undefined, never throws", testIssueLifecycleDegradesGracefullyWithoutGhRemote],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? (err.stack ?? err.message) : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} self-improvement-metrics tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("self-improvement-metrics", tests)

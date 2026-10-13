@@ -24,6 +24,7 @@ import { saveWatcherState, type WatcherState } from "../../watcher/state.js"
 import { watchIssues, type SpawnBatch, type WatcherConfig } from "../../watcher/watch.js"
 import { loadWatcherState } from "../../watcher/state.js"
 import type { GhClient, GitHubIssue } from "../../watcher/github.js"
+import { runMain } from "../../test-runner.js"
 
 const SILENT = new Logger({ level: "silent" })
 
@@ -260,26 +261,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["watcher: pre-existing running fleet at cap -> all new issues deferred", testWatcherGlobalCapRespectsActiveFleet],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} concurrency tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("concurrency", tests)

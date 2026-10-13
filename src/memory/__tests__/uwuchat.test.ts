@@ -8,6 +8,7 @@
 import assert from "node:assert/strict"
 
 import { API_PREFIX, UwUChatMemoryError, UwUChatMemoryStore } from "../uwuchat.js"
+import { runMain } from "../../test-runner.js"
 
 const BASE = "https://uwu.example"
 
@@ -163,26 +164,4 @@ const tests: Array<[string, () => Promise<void> | void]> = [
 	["typed UwUChatMemoryError on non-2xx", testTypedErrorOnNon2xx],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} uwuchat tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("uwuchat", tests)

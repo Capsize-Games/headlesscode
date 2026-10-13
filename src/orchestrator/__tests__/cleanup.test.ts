@@ -35,6 +35,7 @@ import {
 	type OrchestratorGroup,
 	type OrchestratorState,
 } from "../state.js"
+import { runMain } from "../../test-runner.js"
 
 const ownedFixtureDirectories = new Set<string>()
 const FIXTURE_REMOVE_ATTEMPTS = 5
@@ -771,26 +772,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["orchestrate status shows the cleanup column (eligible) for a merged terminal group", testStatusShowsCleanupColumn],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} cleanup tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("cleanup", tests)

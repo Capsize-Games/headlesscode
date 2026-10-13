@@ -14,6 +14,7 @@ import {
 	truncateHistory,
 } from "../loop.js"
 import type { ChatMessage, ChatTool } from "../types.js"
+import { runMain } from "../../test-runner.js"
 
 function msg(role: ChatMessage["role"], content: string | null): ChatMessage {
 	return { role, content }
@@ -94,23 +95,4 @@ const tests: Array<[string, () => void]> = [
 	["messagesPrefixEquals empty snapshot", testPrefixEqualsEmptySnapshot],
 ]
 
-function main(): void {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} tests passed`)
-}
-
-main()
+runMain("", tests)

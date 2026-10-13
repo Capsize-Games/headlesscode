@@ -18,6 +18,7 @@ import * as path from "node:path"
 
 import { getCallGraph } from "../call-graph.js"
 import { getCodeIntelCache, resetCodeIntelCaches } from "../program.js"
+import { runMain } from "../../test-runner.js"
 
 const FIXTURE_A = `import { greet, Greeter } from "./b.js"
 
@@ -101,30 +102,8 @@ async function testCallTargetsResolveToDefiningFile(): Promise<void> {
 	}
 }
 
-async function main(): Promise<void> {
-	const tests: Array<[string, () => Promise<void>]> = [
-		["call targets resolve to their defining file via the TS checker", testCallTargetsResolveToDefiningFile],
-	]
+const tests: Array<[string, () => Promise<void>]> = [
+	["call targets resolve to their defining file via the TS checker", testCallTargetsResolveToDefiningFile],
+]
 
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} call-graph tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("call-graph", tests)

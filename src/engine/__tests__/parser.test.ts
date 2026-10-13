@@ -14,6 +14,7 @@ import assert from "node:assert/strict"
 
 import { bestEffortPartialJson, extractEmbeddedToolCall, parseToolCall, parseToolCalls } from "../parser.js"
 import type { ChatMessage, ChatToolCall } from "../types.js"
+import { runMain } from "../../test-runner.js"
 
 function call(overrides: Partial<ChatToolCall> = {}, id = "call_1"): ChatToolCall {
 	return {
@@ -256,23 +257,4 @@ const tests: Array<[string, () => void]> = [
 	],
 ]
 
-function main(): void {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} tests passed`)
-}
-
-main()
+runMain("", tests)

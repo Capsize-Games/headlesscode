@@ -19,6 +19,7 @@ import assert from "node:assert/strict"
 
 import { dashboardMain, parseDashboardArgs } from "../cli.js"
 import { parseTrendArgs, trendMain } from "../trend-cli.js"
+import { runMain } from "../../test-runner.js"
 
 /** Capture stdout+stderr written during `fn()`. */
 async function captureOutput(fn: () => Promise<number>): Promise<{ exit: number; stdout: string; stderr: string }> {
@@ -134,26 +135,4 @@ const tests: Array<[string, () => void | Promise<void>]> = [
 	["trend: trendMain with a bad arg exits 2", testTrendMainBadArgExitsTwo],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? (err.stack ?? err.message) : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} dashboard/trend CLI tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("dashboard/trend CLI", tests)

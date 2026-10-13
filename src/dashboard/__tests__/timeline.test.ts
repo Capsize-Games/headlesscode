@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url"
 
 import { buildTimeline, classifyTool } from "../timeline.js"
 import type { EventRecord } from "../../engine/events.js"
+import { runMain } from "../../test-runner.js"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -325,26 +326,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["timeline: page.ts's TL_READ/WRITE/EXEC/SEARCH sets stay in sync with timeline.ts's", testPageTsWriteToolsStayInSyncWithTimelineTs],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} dashboard timeline tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("dashboard timeline", tests)

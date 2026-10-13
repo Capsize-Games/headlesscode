@@ -12,6 +12,7 @@ import * as path from "node:path"
 
 import { appendEvent, type EventRecord } from "../../engine/events.js"
 import { analyzeWorktreeSessions, formatAnalysisReport, listSessionIds } from "../log-analysis.js"
+import { runMain } from "../../test-runner.js"
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -175,26 +176,4 @@ const tests: [string, () => Promise<void>][] = [
 	["formatAnalysisReport renders readable text", testFormatAnalysisReportIsReadable],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? (err.stack ?? err.message) : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} log-analysis tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("log-analysis", tests)

@@ -12,6 +12,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 
 import { ensureWorkspaceGitignore } from "../gitignore.js"
+import { runMain } from "../../test-runner.js"
 
 const EXPECTED_ENTRY = "# headlesscode session artifacts (events, reports, usage, scratch, memory)\n/.headlesscode/\n"
 
@@ -141,26 +142,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["missing / non-directory workspace is a silent no-op (no .gitignore created)", testNonDirectoryWorkspaceIsSkipped],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} gitignore tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("gitignore", tests)

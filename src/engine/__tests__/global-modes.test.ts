@@ -29,6 +29,7 @@ const ROOT_SANDBOX = path.join(os.tmpdir(), `hc-global-modes-root-${process.pid}
 import assert from "node:assert/strict"
 
 import { buildSystemPrompt, loadCustomModes } from "../prompt.js"
+import { runSuites } from "../../test-runner.js"
 
 // ─── Per-test HOME sandboxing ───────────────────────────────────────────────
 
@@ -232,22 +233,11 @@ async function main(): Promise<void> {
 	)
 	assert.equal(process.env.HOME, path.join(ROOT_SANDBOX, "home-0"))
 
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack : err)
-		}
-	}
+	const failed = await runSuites("global-modes", tests)
 	if (failed > 0) {
 		console.error(`\n${failed} test(s) failed`)
 		process.exit(1)
 	}
-	console.log(`\nAll ${tests.length} global-modes tests passed`)
 }
 
 main().finally(async () => {

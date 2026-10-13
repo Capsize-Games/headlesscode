@@ -14,6 +14,7 @@ import assert from "node:assert/strict"
 
 import { readLimitFromEnv } from "../../tools/executor.js"
 import { summarizeToolArg } from "../loop.js"
+import { runMain } from "../../test-runner.js"
 
 function testSliceModeWithExplicitOffsetLimit(): void {
 	assert.equal(
@@ -104,23 +105,4 @@ const tests: Array<[string, () => void]> = [
 	["edit_file/search_replace use file_path", testEditFileAndSearchReplaceUseFilePath],
 ]
 
-function main(): void {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} tests passed`)
-}
-
-main()
+runMain("", tests)

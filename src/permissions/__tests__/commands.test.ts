@@ -31,6 +31,7 @@ import {
 	redirectTargets,
 	resolveRedirectTarget,
 } from "../commands.js"
+import { runMain } from "../../test-runner.js"
 
 // ─── (a) dangerous substitutions are always refused, regardless of config ───
 
@@ -570,26 +571,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["cd refusal precedes redirect; describes", testCdRefusalPrecedesRedirect],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} command-permissions tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("command-permissions", tests)

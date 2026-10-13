@@ -20,6 +20,7 @@ import * as path from "node:path"
 import { FileEvidenceCollector, UnixEvidenceJournal } from "../collector.js"
 import { verifyEvidenceFiles } from "../verify.js"
 import { verifyEvidenceFiles as indexVerifyEvidenceFiles } from "../index.js"
+import { runMain } from "../../test-runner.js"
 
 interface SignedBundlePaths {
 	bundlePath: string
@@ -103,37 +104,10 @@ async function testIndexReexportsTheLeaf(): Promise<void> {
 	assert.equal(indexVerifyEvidenceFiles, verifyEvidenceFiles)
 }
 
-async function runOne(name: string, fn: () => Promise<void>): Promise<boolean> {
-	try {
-		await fn()
-		console.log(`  ok   ${name}`)
-		return true
-	} catch (error) {
-		console.error(`  FAIL ${name}`)
-		if (error instanceof Error) console.error(error.stack ?? error)
-		else console.error(String(error))
-		return false
-	}
-}
+const tests: Array<[string, () => Promise<void>]> = [
+	["accepts a signed bundle", testVerifyFilesAcceptsSignedBundle],
+	["rejects a tampered bundle", testVerifyFilesRejectsTamperedBundle],
+	["index re-exports the leaf", testIndexReexportsTheLeaf],
+]
 
-async function main(): Promise<void> {
-	const tests: Array<[string, () => Promise<void>]> = [
-		["accepts a signed bundle", testVerifyFilesAcceptsSignedBundle],
-		["rejects a tampered bundle", testVerifyFilesRejectsTamperedBundle],
-		["index re-exports the leaf", testIndexReexportsTheLeaf],
-	]
-	let failed = 0
-	for (const [name, fn] of tests) {
-		if (!(await runOne(name, fn))) failed++
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} verify-files tests passed`)
-}
-
-main().catch((error) => {
-	console.error("Test runner crashed:", error)
-	process.exit(1)
-})
+runMain("verify-files", tests)

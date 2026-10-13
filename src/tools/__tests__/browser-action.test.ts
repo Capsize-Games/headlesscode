@@ -31,6 +31,7 @@ import { createHeadlessExecutor } from "../executor.js"
 import { describeImage } from "../../vision/describe.js"
 import { setVisionCaptionerForTest } from "../browser/handler.js"
 import type { AuxLlmUsage } from "../../engine/types.js"
+import { runSuites } from "../../test-runner.js"
 
 /**
  * COV-6: on a fresh contributor machine, Playwright's `chromium` package is
@@ -480,17 +481,7 @@ async function main(): Promise<void> {
 		process.exit(0)
 	}
 
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
+	const failed = await runSuites("browser_action", tests)
 	if (failed > 0) {
 		console.error(`\n${failed} test(s) failed`)
 		// Explicit exit: Playwright's connection sockets can keep the event
@@ -498,7 +489,6 @@ async function main(): Promise<void> {
 		// finished suite.
 		process.exit(1)
 	}
-	console.log(`\nAll ${tests.length} browser_action tests passed`)
 	// See above — a closed Playwright browser can still hold a handle.
 	process.exit(0)
 }

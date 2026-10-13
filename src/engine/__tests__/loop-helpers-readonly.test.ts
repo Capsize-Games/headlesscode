@@ -13,6 +13,7 @@ import {
 	isReadOnlyDirectCall,
 	isReadOnlyTurnCall,
 } from "../loop.js"
+import { runMain } from "../../test-runner.js"
 
 function testCombineAbortedWhenInputAborted(): void {
 	const c = new AbortController()
@@ -147,23 +148,4 @@ const tests: Array<[string, () => void]> = [
 	["artifact nudge names streak+path", testArtifactNudgeNamesStreakAndPath],
 ]
 
-function main(): void {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} tests passed`)
-}
-
-main()
+runMain("", tests)

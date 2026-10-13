@@ -30,6 +30,7 @@ import * as path from "node:path"
 import { createHeadlessExecutor } from "../executor.js"
 import { MAX_RESULT_CHARS } from "../executor.js"
 import { LOCAL_SUMMARIZATION_DEFAULT_ENABLED } from "../output-summarizer.js"
+import { runMain } from "../../test-runner.js"
 
 const SUMMARIZATION_ENV = "HEADLESSCODE_LOCAL_SUMMARIZATION"
 const OLLAMA_URL_ENV = "HEADLESSCODE_OLLAMA_URL"
@@ -260,26 +261,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["ON + oversized result: summarized with transparency header", testOnOversizedResultIsSummarized],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} local-summarization-gate tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("local-summarization-gate", tests)

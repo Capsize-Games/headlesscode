@@ -20,6 +20,7 @@ import * as path from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { STACK_NAMES } from "./engine/stacks.js"
+import { runMain } from "./test-runner.js"
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const SHIPPED_DIR = path.join(repoRoot, "shared", "stacks")
@@ -65,23 +66,4 @@ const tests: Array<[string, () => void]> = [
 	["javascript + python content shipped", testRoundStacksShipped],
 ]
 
-function main(): void {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack : err)
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} stack-rules-content tests passed`)
-}
-
-main()
+runMain("stack-rules-content", tests)

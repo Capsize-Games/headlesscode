@@ -30,6 +30,7 @@ import { execFileSync } from "node:child_process"
 import { buildCodemap } from "../build.js"
 import { codemapDir, codemapJsonPath, codemapLockPath, codemapHtmlPath, loadLock, loadCodemap } from "../lock.js"
 import { resetCodeIntelCaches } from "../../codeintel/program.js"
+import { runMain } from "../../test-runner.js"
 
 const TSCONFIG = JSON.stringify(
 	{
@@ -273,35 +274,13 @@ async function testHtmlIsSelfContained(): Promise<void> {
 	}
 }
 
-async function main(): Promise<void> {
-	const tests: Array<[string, () => Promise<void>]> = [
-		["TS/JS modules get resolved import edges + correct roles", testTypeScriptEdgesAndRoles],
-		["Python modules get AST-subprocess import edges", testPythonEdges],
-		["C/C++ modules get regex include edges", testCppIncludeEdges],
-		["TS/JS call edges resolve cross-module calls + entrypoint flows", testCallEdgesAndEntrypointFlows],
-		["regeneration is fingerprint-aware (no writes when unchanged)", testFingerprintAwareRegeneration],
-		["html visualizer is self-contained and embeds the map", testHtmlIsSelfContained],
-	]
+const tests: Array<[string, () => Promise<void>]> = [
+	["TS/JS modules get resolved import edges + correct roles", testTypeScriptEdgesAndRoles],
+	["Python modules get AST-subprocess import edges", testPythonEdges],
+	["C/C++ modules get regex include edges", testCppIncludeEdges],
+	["TS/JS call edges resolve cross-module calls + entrypoint flows", testCallEdgesAndEntrypointFlows],
+	["regeneration is fingerprint-aware (no writes when unchanged)", testFingerprintAwareRegeneration],
+	["html visualizer is self-contained and embeds the map", testHtmlIsSelfContained],
+]
 
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} codemap build tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("codemap build", tests)

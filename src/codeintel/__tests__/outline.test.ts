@@ -19,6 +19,7 @@ import * as path from "node:path"
 
 import { createHeadlessExecutor } from "../../tools/executor.js"
 import { resetCodeIntelCaches } from "../program.js"
+import { runMain } from "../../test-runner.js"
 
 const FIXTURE_MATH = `export interface Point {
 	x: number
@@ -155,34 +156,12 @@ async function testOutlinePathTraversalRejected(): Promise<void> {
 	}
 }
 
-async function main(): Promise<void> {
-	const tests: Array<[string, () => Promise<void>]> = [
-		["outline returns the exact fixture structure", testOutlineExactStructure],
-		["outline signatures exclude bodies and duplicate keywords", testOutlineSignatureHasNoBody],
-		["outline of a missing file errors", testOutlineMissingFile],
-		["outline of a non-TS file returns the not-supported error", testOutlineUnsupportedFileType],
-		["outline rejects paths escaping the workspace", testOutlinePathTraversalRejected],
-	]
+const tests: Array<[string, () => Promise<void>]> = [
+	["outline returns the exact fixture structure", testOutlineExactStructure],
+	["outline signatures exclude bodies and duplicate keywords", testOutlineSignatureHasNoBody],
+	["outline of a missing file errors", testOutlineMissingFile],
+	["outline of a non-TS file returns the not-supported error", testOutlineUnsupportedFileType],
+	["outline rejects paths escaping the workspace", testOutlinePathTraversalRejected],
+]
 
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} outline tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("outline", tests)

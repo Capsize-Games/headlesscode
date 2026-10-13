@@ -26,6 +26,7 @@ const ROOT_SANDBOX = path.join(os.tmpdir(), `hc-stack-content-${process.pid}-${D
 
 import { buildSystemPrompt } from "../prompt.js"
 import { STACK_RULES_HEADER, getCentralStackRulesDir, loadStackRules } from "../stacks.js"
+import { runSuites } from "../../test-runner.js"
 
 /** Repo root = 4 levels up from src/engine/__tests__/<this file>. */
 const REPO_ROOT = path.resolve(fileURLToPath(import.meta.url), "..", "..", "..", "..")
@@ -157,22 +158,11 @@ async function main(): Promise<void> {
 	)
 	assert.equal(process.env.HOME, path.join(ROOT_SANDBOX, "home-0"))
 
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack : err)
-		}
-	}
+	const failed = await runSuites("stack-rules-content", tests)
 	if (failed > 0) {
 		console.error(`\n${failed} test(s) failed`)
 		process.exit(1)
 	}
-	console.log(`\nAll ${tests.length} stack-rules-content tests passed`)
 }
 
 main().finally(async () => {

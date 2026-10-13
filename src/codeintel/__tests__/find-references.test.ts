@@ -23,6 +23,7 @@ import * as path from "node:path"
 import { createHeadlessExecutor } from "../../tools/executor.js"
 import { resetCodeIntelCaches } from "../program.js"
 import { MAX_REFERENCES } from "../find-references.js"
+import { runMain } from "../../test-runner.js"
 
 const FIXTURE_UTIL = `export function util(): number {
 	return 1
@@ -139,33 +140,11 @@ async function testNonTsFile(): Promise<void> {
 	}
 }
 
-async function main(): Promise<void> {
-	const tests: Array<[string, () => Promise<void>]> = [
-		["returns exact reference sites for a symbol with few usages", testExactReferenceSites],
-		["caps output on a symbol with many usages and announces the overflow", testCapOnManyUsages],
-		["no-resolvable-references gets a clear message", testNoReferences],
-		["non-TS file returns the not-supported result", testNonTsFile],
-	]
+const tests: Array<[string, () => Promise<void>]> = [
+	["returns exact reference sites for a symbol with few usages", testExactReferenceSites],
+	["caps output on a symbol with many usages and announces the overflow", testCapOnManyUsages],
+	["no-resolvable-references gets a clear message", testNoReferences],
+	["non-TS file returns the not-supported result", testNonTsFile],
+]
 
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} find_references tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("find_references", tests)

@@ -11,6 +11,7 @@ import * as path from "node:path"
 
 import { LocalMemoryStore, sanitizeProject } from "../local.js"
 import type { SessionSummary } from "../types.js"
+import { runMain } from "../../test-runner.js"
 
 async function tmpDir(prefix: string): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -198,26 +199,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["sanitizeProject produces filesystem-safe slugs", testSanitizeProject],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} local store tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("local store", tests)

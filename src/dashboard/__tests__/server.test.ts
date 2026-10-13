@@ -17,6 +17,7 @@ import { setTimeout as sleep } from "node:timers/promises"
 import { startDashboardServer } from "../server.js"
 import type { Server } from "node:http"
 import { eventsFilePath } from "../../engine/events.js"
+import { runMain } from "../../test-runner.js"
 
 async function tmpRepo(prefix = "hc-server-"): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -359,26 +360,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["server: non-GET/non-POST methods to unrelated routes are still rejected (405)", testNonGetPostMethodsStillRejected],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} dashboard server tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("dashboard server", tests)

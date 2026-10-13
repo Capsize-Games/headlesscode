@@ -15,6 +15,7 @@ import assert from "node:assert/strict"
 
 import { buildStatusSummary, formatStatusText } from "../status.js"
 import type { OrchestratorGroup, OrchestratorState } from "../state.js"
+import { runMain } from "../../test-runner.js"
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -149,26 +150,4 @@ const tests: [string, () => Promise<void>][] = [
 	["formatStatusText omits batch usage when absent", testFormattedTextOmitsBatchUsageWhenAbsent],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? (err.stack ?? err.message) : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} status tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("status", tests)

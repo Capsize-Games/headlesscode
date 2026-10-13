@@ -17,6 +17,7 @@ import * as path from "node:path"
 import { executeTool } from "../tool-exec.js"
 import { startDashboardServer } from "../server.js"
 import type { Server } from "node:http"
+import { runMain } from "../../test-runner.js"
 
 async function mkTmpWorkspace(prefix: string): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -194,23 +195,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["HTTP POST /api/tool/execute rejects bad body", testHttpEndpointRejectsBadBody],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`ok - ${name}`)
-		} catch (error) {
-			failed++
-			console.error(`FAIL - ${name}`)
-			console.error(error)
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed}/${tests.length} tool-exec tests failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} tool-exec tests passed`)
-}
-
-main()
+runMain("tool-exec", tests)

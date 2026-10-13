@@ -45,6 +45,7 @@ import {
 } from "../condense.js"
 import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } from "../types.js"
 import { BudgetTracker } from "../../budget/budget.js"
+import { runMain } from "../../test-runner.js"
 
 // ─── Fakes ───────────────────────────────────────────────────────────────────
 
@@ -1338,26 +1339,4 @@ const tests: Array<[string, () => Promise<void> | void]> = [
 	["session: condensation call times out instead of hanging forever (non-fatal)", testSessionCondenseCallTimesOutNonFatally],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} condense tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("condense", tests)

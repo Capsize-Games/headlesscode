@@ -21,6 +21,7 @@ import { HeadlessSession } from "../../engine/loop.js"
 import type { ChatMessage, LlmClient, LlmRequest, LlmResponse } from "../../engine/types.js"
 import { LocalMemoryStore } from "../local.js"
 import type { MemoryStore } from "../types.js"
+import { runMain } from "../../test-runner.js"
 
 const PROJECT = "wiring-project"
 
@@ -204,26 +205,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["memory failures are non-fatal to the session", testMemoryFailureDoesNotFailSession],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} memory-wiring tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("memory-wiring", tests)

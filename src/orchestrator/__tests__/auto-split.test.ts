@@ -12,6 +12,7 @@ import assert from "node:assert/strict"
 import { autoSplitOversizedIssues, proposeSemanticSplit } from "../auto-split.js"
 import type { IssueSizeWarning, SplitIssue } from "../split.js"
 import type { LlmClient, LlmRequest, LlmResponse } from "../../engine/types.js"
+import { runMain } from "../../test-runner.js"
 
 function issue(number: number, title: string, body?: string): SplitIssue {
 	return { number, title, body }
@@ -241,26 +242,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["autoSplitOversizedIssues: preserves the relative order of unflagged issues", testAutoSplitPreservesOrderOfUnflaggedIssues],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} auto-split tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("auto-split", tests)
