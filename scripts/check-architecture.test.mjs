@@ -51,6 +51,32 @@ try {
 	fs.appendFileSync(path.join(dir, "messy.ts"), "console.log(tangled(1, 2, 3, 4, 5, 6))\n")
 	const fresh = run([dir, "--workspace", dir, "--baseline", baseline])
 	if (fresh.status !== 1 || !fresh.out.includes("NEW findings")) fail("new finding did not fail the ratchet")
+	const diamond = fs.mkdtempSync(path.join(os.tmpdir(), "headlesscode-diamond-"))
+	try {
+		fs.writeFileSync(path.join(diamond, "tsconfig.json"), '{"compilerOptions":{"strict":true},"include":["*.ts"]}')
+		fs.writeFileSync(path.join(diamond, "s.ts"), 'import "./a"\nimport "./b"\nexport const s = 1\n')
+		fs.writeFileSync(path.join(diamond, "a.ts"), 'import "./t"\nexport const a = 1\n')
+		fs.writeFileSync(path.join(diamond, "b.ts"), 'import "./t"\nexport const b = 1\n')
+		fs.writeFileSync(path.join(diamond, "t.ts"), 'import "./s"\nexport const t = 1\n')
+		const cycles = run([diamond, "--workspace", diamond, "--no-baseline"]).out.split("\n").filter((l) => l.startsWith("cycle")).sort()
+		const want = ["cycle a.ts -> t.ts -> s.ts -> a.ts", "cycle t.ts -> s.ts -> b.ts -> t.ts"].sort()
+		if (JSON.stringify(cycles) !== JSON.stringify(want)) fail(`diamond cycles ${JSON.stringify(cycles)}, want ${JSON.stringify(want)}`)
+		const dbl = path.join(diamond, "baseline.json")
+		if (run([diamond, "--workspace", diamond, "--baseline", dbl, "--write-baseline"]).status !== 0) fail("diamond baseline write failed")
+		const moved = fs.mkdtempSync(path.join(os.tmpdir(), "headlesscode-moved-"))
+		try {
+			for (const name of fs.readdirSync(diamond)) {
+				if (name === "baseline.json") continue
+				fs.copyFileSync(path.join(diamond, name), path.join(moved, name))
+			}
+			const again = run([moved, "--workspace", moved, "--baseline", dbl]).out
+			if (/new: cycle/.test(again)) fail("cycle keys are not checkout-portable")
+		} finally {
+			fs.rmSync(moved, { recursive: true, force: true })
+		}
+	} finally {
+		fs.rmSync(diamond, { recursive: true, force: true })
+	}
 } finally {
 	fs.rmSync(dir, { recursive: true, force: true })
 }

@@ -44,14 +44,15 @@ function checkCycles(workspaceRoot) {
 	const edges = new Map()
 	for (const [file, imports] of graph.imports) {
 		if (!local(file)) continue
-		edges.set(file, imports.map((e) => e.resolved).filter((r) => local(r)))
+		edges.set(file, imports.map((e) => e.resolved).filter((r) => local(r)).sort())
 	}
 	const seen = new Set()
 	const stack = []
 	const visit = (file) => {
 		if (stack.includes(file)) {
 			const cycle = [...stack.slice(stack.indexOf(file)), file]
-			const key = `cycle ${[...cycle].sort().join("<")}`
+			const relKey = [...new Set(cycle)].map((f) => path.relative(workspaceRoot, f)).sort()
+			const key = `cycle ${relKey.join("<")}`
 			if (!seen.has(key)) {
 				seen.add(key)
 				const rel = cycle.map((f) => path.relative(workspaceRoot, f))
@@ -65,7 +66,9 @@ function checkCycles(workspaceRoot) {
 		stack.pop()
 		seen.add(`done:${file}`)
 	}
-	for (const file of edges.keys()) visit(file)
+	// Sorted: DFS done-pruning makes the reported cycle set order-dependent,
+	// and codeintel's graph order follows readdir order, which differs per checkout.
+	for (const file of [...edges.keys()].sort()) visit(file)
 	return findings
 }
 
