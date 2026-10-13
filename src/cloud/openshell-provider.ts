@@ -345,11 +345,21 @@ export function runOpenShellCommandAsync(args: string[], timeoutMs?: number, exe
 		const startTermination = () => {
 			if (!child.pid || terminationPromise || finished) return
 			const deadline = Date.now() + terminationBoundMs
-			terminationPromise = terminateOwnedProcesses(deadline)
-			void terminationPromise.then(
-				() => { if (aborted) settleFailure(signal?.reason ?? new Error("OpenShell command aborted")); else settleResult(child.exitCode, child.signalCode) },
-				(error: unknown) => { terminationFailure = error; settleFailure(error) },
-			)
+		terminationPromise = terminateOwnedProcesses(deadline)
+		void terminationPromise.then(
+			() => {
+				if (aborted) { settleFailure(signal?.reason ?? new Error("OpenShell command aborted")); return }
+				// Timeout teardown always begins with SIGTERM, so a timeout
+				// result deterministically reports the harness-initiated
+				// SIGTERM: the close event can otherwise arrive as a bare
+				// 1/null exit when the kill lands after the child already
+				// started exiting (sandbox-scheduling race), which would
+				// omit signal=SIGTERM from the diagnostics.
+				if (timedOut) settleResult(child.exitCode && child.exitCode !== 0 ? child.exitCode : 1, child.signalCode ?? "SIGTERM")
+				else settleResult(child.exitCode, child.signalCode)
+			},
+			(error: unknown) => { terminationFailure = error; settleFailure(error) },
+		)
 			finalizationTimer = setTimeout(() => {
 				settleFailure(terminationFailure ?? new Error("OpenShell process teardown did not finalize before its bounded deadline"))
 			}, terminationBoundMs + 250)
@@ -376,10 +386,14 @@ export function runOpenShellCommandAsync(args: string[], timeoutMs?: number, exe
 		child.once("close", (code, childSignal) => {
 			if (aborted || timedOut) {
 				if (!terminationPromise) startTermination()
-				void terminationPromise?.then(() => {
-					if (aborted) settleFailure(signal?.reason ?? new Error("OpenShell command aborted"))
-					else settleResult(code, childSignal)
-				}, settleFailure)
+			void terminationPromise?.then(() => {
+				if (aborted) settleFailure(signal?.reason ?? new Error("OpenShell command aborted"))
+				// Same normalization as the startTermination path: the
+				// close event's own code/signal races the SIGTERM teardown,
+				// so a timeout result reports harness-initiated SIGTERM.
+				else if (timedOut) settleResult(code && code !== 0 ? code : 1, childSignal ?? "SIGTERM")
+				else settleResult(code, childSignal)
+			}, settleFailure)
 				return
 			}
 			settleResult(code, childSignal)
