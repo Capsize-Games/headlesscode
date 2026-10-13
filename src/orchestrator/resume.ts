@@ -53,92 +53,23 @@ import {
 	readWorktreeUsage,
 } from "./watch.js"
 
+import {
+	describeTarget as describeResumeTarget,
+	hasExactlyOneTarget as hasExactlyOneResumeTarget,
+	parseIntFlag as parseResumeIntFlag,
+	parseTargetArgs as parseResumeTargetArgs,
+	type ResumeTarget as ResumeTargetShape,
+} from "./resume-target.js"
 // ─── Shared target parsing ───────────────────────────────────────────────────
 
 /** Which group(s) a standalone subcommand targets: by issue, PR, or name. */
-export interface ResumeTarget {
-	issue?: number
-	pr?: number
-	group?: string
-}
+export type ResumeTarget = ResumeTargetShape
 
 /** One of --issue/--pr/--group is set (never more than one). */
-export function hasExactlyOneTarget(target: ResumeTarget): boolean {
-	const set = (t: ResumeTarget): number =>
-		(t.issue !== undefined ? 1 : 0) + (t.pr !== undefined ? 1 : 0) + (t.group !== undefined ? 1 : 0)
-	return set(target) === 1
-}
+export const hasExactlyOneTarget = hasExactlyOneResumeTarget
 
 /** Extract --issue/--pr/--group from an argv list; the rest is returned untouched. */
-export function parseTargetArgs(argv: string[]): { rest: string[]; target: ResumeTarget; error?: string } {
-	const target: ResumeTarget = {}
-	let error: string | undefined
-	const rest: string[] = []
-	const flagOf = (arg: string): string => {
-		const eq = arg.indexOf("=")
-		return eq === -1 ? arg : arg.slice(0, eq)
-	}
-	const inlineValueOf = (arg: string): string | undefined => {
-		const eq = arg.indexOf("=")
-		return eq === -1 ? undefined : arg.slice(eq + 1)
-	}
-	for (let i = 0; i < argv.length; i++) {
-		const arg = argv[i]
-		const flag = flagOf(arg)
-		const inlineValue = inlineValueOf(arg)
-		const next = (): string | undefined => {
-			if (inlineValue !== undefined) {
-				return inlineValue
-			}
-			const v = argv[i + 1]
-			if (v === undefined || v.startsWith("--")) {
-				return undefined
-			}
-			i++
-			return v
-		}
-		switch (flag) {
-			case "--issue": {
-				const v = next()
-				const n = v === undefined ? Number.NaN : Number(v)
-				if (!Number.isInteger(n) || n <= 0) {
-					error = "--issue requires a positive integer"
-				} else if (hasExactlyOneTarget(target)) {
-					error = "provide exactly one of --issue, --pr, --group"
-				} else {
-					target.issue = n
-				}
-				break
-			}
-			case "--pr": {
-				const v = next()
-				const n = v === undefined ? Number.NaN : Number(v)
-				if (!Number.isInteger(n) || n <= 0) {
-					error = "--pr requires a positive integer"
-				} else if (hasExactlyOneTarget(target)) {
-					error = "provide exactly one of --issue, --pr, --group"
-				} else {
-					target.pr = n
-				}
-				break
-			}
-			case "--group": {
-				const v = next()
-				if (v === undefined || v === "") {
-					error = "--group requires a non-empty group name"
-				} else if (hasExactlyOneTarget(target)) {
-					error = "provide exactly one of --issue, --pr, --group"
-				} else {
-					target.group = v
-				}
-				break
-			}
-			default:
-				rest.push(arg)
-		}
-	}
-	return { rest, target, error }
-}
+export const parseTargetArgs = parseResumeTargetArgs
 
 // ─── `orchestrate review` ────────────────────────────────────────────────────
 
@@ -1557,18 +1488,7 @@ function isGitRepo(repo: string): boolean {
 	}
 }
 
-export function describeTarget(target: ResumeTarget): string {
-	if (target.issue !== undefined) {
-		return `issue #${target.issue}`
-	}
-	if (target.pr !== undefined) {
-		return `PR #${target.pr}`
-	}
-	if (target.group !== undefined) {
-		return `group "${target.group}"`
-	}
-	return "(none)"
-}
+export const describeTarget = describeResumeTarget
 
 /** Resolve the target group(s) from state; fails loudly when none match. */
 function resolveGroupsOrFail(
@@ -1945,17 +1865,4 @@ export async function resumeMain(argv: string[], io: ResumeIo = {}): Promise<num
 }
 
 /** Read a positive integer flag value via the argv cursor (shared by the parsers). */
-export function parseIntFlag(argv: string[], i: number, flag: string): { value: number | undefined; error?: string; consumed: number } {
-	const eq = argv[i].indexOf("=")
-	const inlineValue = eq === -1 ? undefined : argv[i].slice(eq + 1)
-	const v = inlineValue ?? argv[i + 1]
-	if (v === undefined || (inlineValue === undefined && v.startsWith("--"))) {
-		return { value: undefined, error: `Missing value for ${flag}`, consumed: 0 }
-	}
-	const n = Number(v)
-	const consumed = inlineValue === undefined ? 1 : 0
-	if (!Number.isInteger(n) || n <= 0) {
-		return { value: undefined, error: `${flag} requires a positive integer`, consumed }
-	}
-	return { value: n, consumed }
-}
+export const parseIntFlag = parseResumeIntFlag
