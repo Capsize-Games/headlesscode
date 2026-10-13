@@ -259,31 +259,7 @@ export class MuseClient implements LlmClient {
 		model: string,
 		startedAt: number,
 	): Promise<LlmResponse> {
-		let response: Response
-		try {
-			response = await fetch(url, {
-				method: "POST",
-				headers,
-				body: JSON.stringify(body),
-				signal: request.signal,
-			})
-		} catch (err) {
-			if (err instanceof Error && err.name === "AbortError") {
-				throw err // caller-managed abort (e.g. timeout in the loop)
-			}
-			throw new MuseError(
-				`Network error calling Meta Model API: ${err instanceof Error ? err.message : String(err)}`,
-			)
-		}
-
-		if (!response.ok) {
-			const rawBody = await response.text().catch(() => "")
-			throw new MuseError(
-				`Meta Model API returned HTTP ${response.status}: ${excerpt(rawBody)}`,
-				response.status,
-				excerpt(rawBody),
-			)
-		}
+		const response = await postMuseChat(url, headers, body, request.signal, false)
 
 		// Same raw-body-first discipline as the OpenRouter client: a 200
 		// status doesn't guarantee a well-formed choices[] payload — surface
@@ -348,31 +324,7 @@ export class MuseClient implements LlmClient {
 		model: string,
 		startedAt: number,
 	): Promise<LlmResponse> {
-		let response: Response
-		try {
-			response = await fetch(url, {
-				method: "POST",
-				headers,
-				body: JSON.stringify(body),
-				signal: request.signal,
-			})
-		} catch (err) {
-			if (err instanceof Error && err.name === "AbortError") {
-				throw err
-			}
-			throw new MuseError(
-				`Network error calling Meta Model API (stream): ${err instanceof Error ? err.message : String(err)}`,
-			)
-		}
-
-		if (!response.ok) {
-			const rawBody = await response.text().catch(() => "")
-			throw new MuseError(
-				`Meta Model API returned HTTP ${response.status}: ${excerpt(rawBody)}`,
-				response.status,
-				excerpt(rawBody),
-			)
-		}
+		const response = await postMuseChat(url, headers, body, request.signal, true)
 
 		if (!response.body) {
 			throw new MuseError("Meta Model API returned a stream response with no body")
@@ -588,6 +540,41 @@ function mapUsage(raw: RawUsage | undefined): LlmResponse["usage"] {
 		totalTokens: raw.total_tokens,
 		cachedTokens: raw.prompt_tokens_details?.cached_tokens,
 	}
+}
+
+/** Shared POST + non-2xx guard for the non-streaming and streaming paths. */
+async function postMuseChat(
+	url: string,
+	headers: Record<string, string>,
+	body: Record<string, unknown>,
+	signal: AbortSignal | undefined,
+	stream: boolean,
+): Promise<Response> {
+	let response: Response
+	try {
+		response = await fetch(url, {
+			method: "POST",
+			headers,
+			body: JSON.stringify(body),
+			signal,
+		})
+	} catch (err) {
+		if (err instanceof Error && err.name === "AbortError") {
+			throw err
+		}
+		throw new MuseError(
+			`Network error calling Meta Model API${stream ? " (stream)" : ""}: ${err instanceof Error ? err.message : String(err)}`,
+		)
+	}
+	if (!response.ok) {
+		const rawBody = await response.text().catch(() => "")
+		throw new MuseError(
+			`Meta Model API returned HTTP ${response.status}: ${excerpt(rawBody)}`,
+			response.status,
+			excerpt(rawBody),
+		)
+	}
+	return response
 }
 
 /** Truncate a raw body to a bounded excerpt for error messages. */
