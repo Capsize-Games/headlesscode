@@ -7,6 +7,7 @@
  */
 
 import { startTrendServer } from "./trend.js"
+import { waitForShutdownSignal } from "./wait-for-shutdown.js"
 
 const TREND_USAGE = `headlesscode trend — local, live-updating, multi-repo cost-efficiency trend
 
@@ -115,27 +116,5 @@ export async function trendMain(argv: string[]): Promise<number> {
 
 	process.stdout.write(`[trend] listening on http://127.0.0.1:${options.port} (repos: ${options.repos.join(", ")})\n`)
 
-	return new Promise<number>((resolve) => {
-		let shuttingDown = false
-		const onSignal = (): void => {
-			// Only the first signal shuts down; a second Ctrl-C while the
-			// server is mid-close is ignored (the process exits on its own
-			// once the listening handle is gone).
-			if (shuttingDown) {
-				return
-			}
-			shuttingDown = true
-			process.stdout.write("\n[trend] shutting down\n")
-			process.removeListener("SIGINT", onSignal)
-			process.removeListener("SIGTERM", onSignal)
-			// Release the port: stop accepting new connections and drop
-			// keep-alive sockets so the process can exit. Without close the
-			// listening handle keeps the event loop alive and the port bound.
-			server.close()
-			server.closeAllConnections?.()
-			resolve(0)
-		}
-		process.on("SIGINT", onSignal)
-		process.on("SIGTERM", onSignal)
-	})
+	return waitForShutdownSignal(server, "trend")
 }
