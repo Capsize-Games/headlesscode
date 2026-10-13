@@ -50,3 +50,7 @@ id_rsa*
 
 # Local tool runtime artifacts (Claude Code scheduled-task lock, etc.)
 /.claude/
+
+# Generated orchestrate splitter task files (untracked scratch; must not trip
+# the RSI benchmark image build's clean-checkout guard). See #156.
+/plans/parallel-tasks/
