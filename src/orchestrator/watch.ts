@@ -192,6 +192,10 @@ export function groupWorktreePath(repoRoot: string, group: OrchestratorGroup): s
 function readExitCode(wtPath: string): number | undefined {
 	try {
 		const raw = fs.readFileSync(path.join(wtPath, ".harness.exit"), "utf-8").trim()
+		// Number("") is 0 — an empty file must read as missing, not success.
+		if (raw === "") {
+			return undefined
+		}
 		const code = Number(raw)
 		return Number.isFinite(code) ? code : undefined
 	} catch {
@@ -409,14 +413,41 @@ function processAlive(pid: number): boolean {
  * group concept) fall back to the single-pid check.
  */
 export function isPidAlive(wtPath: string, pidFile = ".harness.pid"): boolean {
+	return workerLiveness(wtPath, pidFile) === "alive"
+}
+
+/**
+ * Tristate worker liveness (issue #132): isPidAlive's boolean conflates
+ * "process dead" with "no pid file at all", but reconcile must act only on
+ * positive evidence — failing an "unknown" group would terminalize one
+ * there is no evidence about. "unknown" = neither pid file present/parseable.
+ */
+export type WorkerLiveness = "alive" | "dead" | "unknown"
+
+export function workerLiveness(
+	wtPath: string,
+	pidFile = ".harness.pid",
+): WorkerLiveness {
 	if (pidFile === ".harness.pid") {
 		const pgid = readPidFile(wtPath, ".harness.pgid")
 		if (pgid !== undefined) {
-			return processAlive(-pgid)
+			return processAlive(-pgid) ? "alive" : "dead"
 		}
 	}
 	const pid = readPidFile(wtPath, pidFile)
-	return pid !== undefined && processAlive(pid)
+	if (pid === undefined) {
+		return "unknown"
+	}
+	return processAlive(pid) ? "alive" : "dead"
+}
+
+/** `.harness.exit` presence (any content, incl. empty), not parsing it. */
+export function hasExitMarker(wtPath: string): boolean {
+	try {
+		return fs.statSync(path.join(wtPath, ".harness.exit")).isFile()
+	} catch {
+		return false
+	}
 }
 
 /**
@@ -503,6 +534,31 @@ export function inspectGroup(
 	// and fell back to autonomous decision) — flow back to "running".
 	if (group.status === "blocked") {
 		return { status: "running", blocked: undefined }
+	}
+
+	// Issue #132: killed mid-run (OOM/ENOSPC/pkill) — the wrapper wrote
+	// .harness.exit but died before .harness.done. No need to wait out the
+	// stall timeout for this: a dead process plus the exit marker is positive
+	// evidence the run ended abnormally. Shaped like the done-branch above
+	// (summary/usage/last_commit) so review/cost semantics stay intact.
+	// Blocked groups returned above; no exit file or a live/unknown process
+	// falls through to the stall guard untouched.
+	if (hasExitMarker(wtPath) && workerLiveness(wtPath) === "dead") {
+		const exitCode = readExitCode(wtPath)
+		const summary = tailLog(path.join(wtPath, "harness.log"))
+		const usage = readWorktreeUsage(wtPath)
+		return {
+			status: "failed",
+			last_activity: {
+				note: `worker died without .harness.done `
+					+ `(exit ${exitCode ?? "unparseable"} — see harness.log)`,
+				last_commit: lastCommit(wtPath),
+			},
+			commits: group.commits ?? [],
+			...(exitCode !== undefined ? { exit_code: exitCode } : {}),
+			summary: summary.slice(-4000),
+			...(usage ? { usage } : {}),
+		}
 	}
 
 	// Stall guard: spawned long ago with no completion marker.

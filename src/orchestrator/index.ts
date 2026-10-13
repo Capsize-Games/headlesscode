@@ -59,8 +59,12 @@ export {
 export type { GroupEstimate, IssueEstimate, ShapeStats } from "./cost-estimate.js"
 
 
-export { watchGroups, inspectGroup, tailLog, groupWorktreePath, isPidAlive, DEFAULT_POLL_INTERVAL_MS, DEFAULT_STALL_TIMEOUT_MS } from "./watch.js"
-export type { WatchOptions, WatchSummary } from "./watch.js"
+export {
+	watchGroups, inspectGroup, tailLog, groupWorktreePath, isPidAlive,
+	workerLiveness, hasExitMarker,
+	DEFAULT_POLL_INTERVAL_MS, DEFAULT_STALL_TIMEOUT_MS,
+} from "./watch.js"
+export type { WatchOptions, WatchSummary, WorkerLiveness } from "./watch.js"
 
 export { checkMergedByAncestor, checkMergedByGitHubPr } from "./merge-check.js"
 export type { MergeCheckResult } from "./merge-check.js"
