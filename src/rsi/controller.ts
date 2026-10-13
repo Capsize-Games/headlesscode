@@ -54,747 +54,95 @@ function log(hooks: RsiHooks, line: string): void {
 	(hooks.log ?? ((message) => process.stdout.write(`${message}\n`)))(line)
 }
 
-type IntegrityOutput = NonNullable<RsiRunRecord["evaluatorIntegrity"]>["outputs"][number]
-
-function trialOutputRecords(candidateId: string, taskId: string, trial: TrialResult): IntegrityOutput[] {
-	return [{
-		candidateId,
-		taskId,
-		outputSha256: evaluatorIntegrityDigest({ command: trial.command, exitCode: trial.exitCode, stdout: trial.stdout, stderr: trial.stderr, timedOut: trial.timedOut ?? false }),
-		...(trial.outputArtifactSha256 ? { artifactSha256: trial.outputArtifactSha256, artifactBytes: trial.outputArtifactBytes } : {}),
-	}]
-}
-
-function evaluationOutputRecords(candidateId: string, evaluation: EvaluationSummary): IntegrityOutput[] {
-	const trials: Array<{ taskId: string; trial: TrialResult }> = [
-		{ taskId: "regression", trial: evaluation.regression },
-		...(evaluation.typecheck ? [{ taskId: "typecheck", trial: evaluation.typecheck }] : []),
-		...evaluation.visible.map((trial, index) => ({ taskId: `visible-${index}`, trial })),
-		...evaluation.hidden.map((trial, index) => ({ taskId: `hidden-${index}`, trial })),
-	]
-	return trials.flatMap(({ taskId, trial }) => trialOutputRecords(candidateId, taskId, trial))
-}
-
-function adversarialOutputRecords(review: AdversarialReviewRecord): IntegrityOutput[] {
-	const refs: Array<[string, string | undefined]> = [
-		["prompt", review.promptArtifactSha256], ["result", review.resultArtifactSha256],
-		["error", review.errorArtifactSha256], ["tests", review.testArtifactSha256],
-		["snapshot", review.snapshotArtifactSha256],
-		...review.testResults.map((test, index): [string, string | undefined] => [`test-output-${index}`, test.outputArtifactSha256]),
-	]
-	return refs.filter((entry): entry is [string, string] => !!entry[1]).map(([taskId, artifactSha256]) => ({
-		candidateId: review.candidateId,
-		taskId: `adversarial-${taskId}`,
-		outputSha256: artifactSha256,
-		artifactSha256,
-	}))
-}
-
-function verifyArchivedIntegrityOutputs(run: RsiRunRecord, signedOutputs: IntegrityOutput[]): void {
-	const expected: IntegrityOutput[] = []
-	if (run.baselineEvaluation) expected.push(...evaluationOutputRecords("baseline", run.baselineEvaluation))
-	for (const candidate of run.candidates) {
-		if (candidate.result) expected.push(...trialOutputRecords(candidate.id, "regression", candidate.result))
-	}
-	for (const review of run.adversarialReviews ?? []) expected.push(...adversarialOutputRecords(review))
-	const signed = new Map(signedOutputs.map((entry) => [`${entry.candidateId}\0${entry.taskId}`, entry]))
-	for (const output of expected) {
-		const recorded = signed.get(`${output.candidateId}\0${output.taskId}`)
-		if (!recorded || canonicalJson(recorded) !== canonicalJson(output)) throw new Error(`archived evaluator output differs from signed identity: ${output.candidateId}/${output.taskId}`)
-	}
-	for (const output of signedOutputs) {
-		if (output.candidateId === "baseline" && !run.baselineEvaluation) throw new Error("signed baseline evaluator outputs are missing from the RSI archive")
-		if (output.candidateId !== "baseline" && output.taskId === "regression" && !run.candidates.some((candidate) => candidate.id === output.candidateId && candidate.result)) {
-			throw new Error(`signed regression output is missing from the RSI archive: ${output.candidateId}`)
-		}
-	}
-}
-
-function mergeIntegrityOutputs(record: NonNullable<RsiRunRecord["evaluatorIntegrity"]>, outputs: IntegrityOutput[]): void {
-	const byTask = new Map(record.outputs.map((entry) => [`${entry.candidateId}\0${entry.taskId}`, entry]))
-	for (const output of outputs) {
-		const key = `${output.candidateId}\0${output.taskId}`
-		const existing = byTask.get(key)
-		if (existing && canonicalJson(existing) !== canonicalJson(output)) throw new Error(`evaluator output identity changed for ${output.candidateId}/${output.taskId}`)
-		byTask.set(key, output)
-	}
-	record.outputs = [...byTask.values()].sort((left, right) => left.candidateId.localeCompare(right.candidateId) || left.taskId.localeCompare(right.taskId))
-}
-
-function evaluatorArchiveStateDigest(run: RsiRunRecord): string {
-	const state = JSON.parse(JSON.stringify({
-		baselineEvaluation: run.baselineEvaluation ?? null,
-		baselineFitness: run.baselineFitness ?? null,
-		candidates: run.candidates,
-		adversarialReviews: run.adversarialReviews ?? [],
-		selected: run.selected ?? null,
-		selectedCandidates: run.selectedCandidates ?? [],
-	})) as Record<string, unknown>
-	return evaluatorIntegrityDigest(state)
-}
-
-async function verifyIntegrityArtifacts(queue: PostgresRsiJobQueue | undefined, outputs: IntegrityOutput[]): Promise<void> {
-	const references = outputs.filter((entry) => entry.artifactSha256)
-	if (references.length > 0 && !queue) throw new Error("evaluator integrity artifact verification requires the configured RSI artifact store")
-	for (const reference of references) {
-		const bytes = await queue!.getArtifact(reference.artifactSha256!)
-		if (createHash("sha256").update(bytes).digest("hex") !== reference.artifactSha256 || reference.artifactBytes !== undefined && bytes.byteLength !== reference.artifactBytes) {
-			throw new Error(`evaluator output artifact differs from its signed identity: ${reference.candidateId}/${reference.taskId}`)
-		}
-	}
-}
-
-async function persistEvaluatorIntegrity(
-	config: RsiConfig,
-	run: RsiRunRecord,
-	trust: EvaluatorIntegrityTrust | undefined,
-	input: Record<string, unknown>,
-): Promise<void> {
-	const record = run.evaluatorIntegrity
-	if (!record) throw new Error("evaluator integrity record was not initialized")
-	if (!trust) {
-		record.status = "unsealed"
-		return
-	}
-	const payload: EvaluatorIntegrityPayload = {
-		schemaVersion: 1,
-		runId: run.runId,
-		input,
-		inputSha256: evaluatorIntegrityDigest(input),
-		archiveStateSha256: evaluatorArchiveStateDigest(run),
-		outputs: record.outputs,
-		generations: record.generations,
-		...(record.selectedCandidateId ? { selectedCandidateId: record.selectedCandidateId } : {}),
-	}
-	const saved = await writeEvaluatorIntegrityManifest(config.archiveDir, run.runId, signEvaluatorIntegrity(trust, payload))
-	record.status = "sealed"
-	record.keyId = trust.keyId
-	record.inputSha256 = payload.inputSha256
-	record.archiveStateSha256 = payload.archiveStateSha256
-	record.manifestPath = saved.path
-	record.manifestSha256 = saved.sha256
-}
-
-async function verifyResumedEvaluatorIntegrity(
-	config: RsiConfig,
-	run: RsiRunRecord,
-	trust: EvaluatorIntegrityTrust | undefined,
-	input: Record<string, unknown>,
-	attested: boolean,
-): Promise<void> {
-	const existing = run.evaluatorIntegrity
-	const hasSealArtifacts = await hasEvaluatorIntegrityManifests(config.archiveDir, run.runId)
-	if ((!existing || existing.status !== "sealed") && hasSealArtifacts) throw new Error("evaluator integrity seal artifacts exist but archive metadata is missing or downgraded; refusing unsealed resume")
-	if (!existing) {
-		if (attested) throw new Error("attested RSI resume requires a signed evaluator integrity manifest; this historical run is unsealed")
-		if (trust) throw new Error("cannot retroactively seal a historical RSI run; start a new run with evaluator integrity trust configured")
-		return
-	}
-	const currentInputSha256 = evaluatorIntegrityDigest(input)
-	if (existing.status === "sealed") {
-		if (!trust) throw new Error("sealed RSI run cannot resume without its independently pinned evaluator integrity trust")
-		if (!existing.manifestSha256 || existing.manifestPath !== path.posix.join("evaluator-integrity", `${run.runId}.${existing.manifestSha256}.json`)) throw new Error("evaluator integrity manifest pointer is malformed")
-		const saved = await readEvaluatorIntegrityManifest(config.archiveDir, run.runId, existing.manifestSha256)
-		if (saved.sha256 !== existing.manifestSha256) throw new Error("evaluator integrity manifest bytes changed since the run was checkpointed")
-		const envelope = verifyEvaluatorIntegrity(trust, saved.envelope)
-		const payload = envelope.payload as Partial<EvaluatorIntegrityPayload>
-		if (payload.schemaVersion !== 1 || payload.runId !== run.runId || payload.inputSha256 !== currentInputSha256 || canonicalJson(payload.input) !== canonicalJson(input)) throw new Error("evaluator source, base tree, configuration, commands, or inputs changed since the signed RSI snapshot")
-		if (payload.archiveStateSha256 !== evaluatorArchiveStateDigest(run) || existing.archiveStateSha256 !== payload.archiveStateSha256) throw new Error("archived evaluator state changed since its last signed checkpoint")
-		if (canonicalJson(payload.outputs) !== canonicalJson(existing.outputs) || canonicalJson(payload.generations) !== canonicalJson(existing.generations) || payload.selectedCandidateId !== existing.selectedCandidateId) throw new Error("signed evaluator outputs or selection differ from the RSI archive checkpoint")
-		if (existing.keyId !== trust.keyId || existing.inputSha256 !== currentInputSha256) throw new Error("evaluator integrity trust or manifest identity differs from the frozen run identity")
-		verifyArchivedIntegrityOutputs(run, existing.outputs)
-		for (const generation of existing.generations) {
-			const generationCandidates = run.candidates.filter((candidate) => candidate.generation === generation.generation)
-			const accepted = generationCandidates.filter((candidate) => candidate.status === "accepted")
-			const expectedSelectedIds = paretoFront(accepted).map((candidate) => candidate.id)
-			const expectedSelected = [...accepted].sort((left, right) => compareFitness(right.fitness, left.fitness))[0]?.id
-			const reviews = (run.adversarialReviews ?? []).filter((review) => generationCandidates.some((candidate) => candidate.id === review.candidateId))
-			if (canonicalJson(generation.selectedCandidateIds) !== canonicalJson(expectedSelectedIds) || generation.selectedCandidateId !== expectedSelected ||
-				generation.decisionsSha256 !== evaluatorGenerationDecisionDigest(generationCandidates, reviews, expectedSelected)) {
-				throw new Error(`archived evaluator decisions differ from the signed selection for generation ${generation.generation}`)
-			}
-		}
-		const latestGeneration = existing.generations.at(-1)
-		if ((latestGeneration && canonicalJson(latestGeneration.selectedCandidateIds) !== canonicalJson(run.selectedCandidates ?? [])) || existing.selectedCandidateId !== run.selected) throw new Error("selected candidates differ from the signed evaluator selection")
-		return
-	}
-	if (trust) throw new Error("cannot retroactively seal an unsealed RSI run; start a new run with evaluator integrity trust configured")
-	if (attested) throw new Error("attested RSI resume requires an independently signed evaluator integrity manifest")
-}
-
-function isTerminal(candidate: CandidateRecord): boolean {
-	return candidate.status === "accepted" || candidate.status === "rejected" || candidate.status === "failed"
-}
-
-function proofCandidateSlot(generation: number, index: number): string { return `g${generation}-candidate-${index}` }
-export const RSI_CONFIRMATION_RETENTION_TASK_IDS = ["redirect-escape", "qa-baseline-counts", "strict-tool-schema", "dashboard-git-owner-api"] as const
-
-export function proofCampaignTaskWallBoundMs(config: RsiConfig, plannedGenerations: number, developmentTasks: BenchmarkManifest["tasks"], confirmationTasks: BenchmarkManifest["tasks"], includeConfirmation = true): number {
-	const slotsPerArm = plannedGenerations * config.population
-	const candidateCountBothArms = 2 * slotsPerArm
-	const candidateTaskMs = config.commandTimeoutMs * (3 + config.evalCommands.length)
-		+ 3 * developmentTasks.reduce((sum, task) => sum + task.ceilings.timeoutMs, 0)
-	const confirmationTaskMs = includeConfirmation ? 4 * confirmationTasks.reduce((sum, task) => sum + task.ceilings.timeoutMs, 0) : 0
-	const bound = candidateCountBothArms * candidateTaskMs + confirmationTaskMs
-	if (!Number.isSafeInteger(bound) || bound <= 0) throw new Error("proof campaign task-time ceiling exceeds safe integer accounting")
-	return bound
-}
-
-export interface ProofCampaignSpendReservationMicros {
-	mutation: number
-	benchmark: number
-	total: number
-}
-
-export function proofCampaignSpendReservationMicros(args: {
-	mutationJobs: number
-	mutationMaxJobSpendUsd: number
-	mutationAllocationUsd: number
-	benchmarkJobs: number
-	benchmarkMaxJobSpendUsd: number
-	benchmarkAllocationUsd: number
-	totalAllocationUsd: number
-	benchmarkShortfallMessage: string
-}): ProofCampaignSpendReservationMicros {
-	const floorMicros = (usd: number): number => {
-		const micros = Math.floor(usd * 1_000_000)
-		if (!Number.isSafeInteger(micros) || micros < 0) throw new Error("proof campaign spend allocation exceeds safe microUSD accounting")
-		return micros
-	}
-	const reservationMicros = (jobs: number, perJobUsd: number): number => {
-		const perJobMicros = Math.ceil(perJobUsd * 1_000_000)
-		const totalMicros = jobs * perJobMicros
-		if (!Number.isSafeInteger(jobs) || jobs < 0 || !Number.isSafeInteger(perJobMicros) || perJobMicros < 0 || !Number.isSafeInteger(totalMicros)) throw new Error("proof campaign job reservations exceed safe microUSD accounting")
-		return totalMicros
-	}
-	const mutation = reservationMicros(args.mutationJobs, args.mutationMaxJobSpendUsd)
-	const benchmark = reservationMicros(args.benchmarkJobs, args.benchmarkMaxJobSpendUsd)
-	if (floorMicros(args.mutationAllocationUsd) < mutation) throw new Error("mutation broker campaign allocation is below the sum of frozen mutation job reservations")
-	if (floorMicros(args.benchmarkAllocationUsd) < benchmark) throw new Error(args.benchmarkShortfallMessage)
-	const total = mutation + benchmark
-	if (!Number.isSafeInteger(total)) throw new Error("proof campaign job reservations exceed safe microUSD accounting")
-	if (floorMicros(args.totalAllocationUsd) < total) throw new Error("proof campaign total allocation is below the sum of frozen job reservations")
-	return { mutation, benchmark, total }
-}
-
-export function createProofCampaignManifest(args: {
-	config: RsiConfig
-	campaignId: string
-	baseCommit: string
-	model: string
-	provider: string
-	openRouterProfileId?: string
-	runtime: NonNullable<RsiRunRecord["workerHarnessRuntime"]>
-	developmentManifest: BenchmarkManifest
-	developmentManifestDigest: string
-	plannedGenerations: number
-	proofProtocol: NonNullable<RsiRunRecord["developmentProofProtocol"]>
-}): ProofCampaignManifest {
-	const engineeringOnly = args.config.workerHarnessEngineeringOnly === true
-	if (engineeringOnly && args.config.workerHarnessPhase === "confirmation") throw new Error("engineering-only proof runs cannot enter confirmation")
-	if (args.provider !== "openshell-openrouter") throw new Error("restart-safe proof campaigns require supervisor-accounted OpenRouter inference")
-	if (args.config.computePolicy === "adaptive-independent") throw new Error("restart-safe proof campaigns require every frozen generation to run; adaptive early-stop is not admitted")
-	const benchmarkTasks = args.developmentManifest.tasks.filter((task) => task.split === "development")
-	const confirmationTasks = args.developmentManifest.tasks.filter((task) => task.split === "confirmation")
-	if (!benchmarkTasks.length || (!engineeringOnly && !confirmationTasks.length)) throw new Error("proof campaign requires nonempty development tasks and, unless engineering-only, confirmation tasks")
-	if (!engineeringOnly && RSI_CONFIRMATION_RETENTION_TASK_IDS.some((taskId) => !confirmationTasks.some((task) => task.id === taskId))) throw new Error("frozen benchmark manifest is missing a preregistered confirmation retention task")
-	const taskDigest = (tasks: typeof args.developmentManifest.tasks) => createHash("sha256").update(JSON.stringify(tasks)).digest("hex")
-	const mutationCampaignId = proofBrokerCampaignId(args.campaignId, "mutation")
-	const benchmarkCampaignId = proofBrokerCampaignId(args.campaignId, "benchmark")
-	const mutationLimits = openRouterBrokerLimitsFromEnvironment(openRouterAllocatedEnvironment(process.env, "mutation"), mutationCampaignId, { maxCalls: args.config.maxIterations, ...(args.config.maxTokens ? { maxOutputTokensPerCall: args.config.maxTokens } : {}), maxDurationMs: args.config.commandTimeoutMs })
-	const benchmarkEnv = openRouterAllocatedEnvironment(process.env, "benchmark")
-	const benchmarkLimits = openRouterBrokerLimitsFromEnvironment(benchmarkEnv, benchmarkCampaignId, { maxDurationMs: Math.min(...benchmarkTasks.map((task) => task.ceilings.timeoutMs)) })
-	const confirmationLimits = openRouterBrokerLimitsFromEnvironment(benchmarkEnv, benchmarkCampaignId, { maxDurationMs: Math.min(...confirmationTasks.map((task) => task.ceilings.timeoutMs)) })
-	const jobCostCeiling = (limits: typeof mutationLimits, maxCalls: number, maxOutputTokensPerCall: number): number => {
-		const perCallTokens = Math.min(limits.maxTotalTokens, limits.maxInputTokensPerCall + maxOutputTokensPerCall)
-		const jobTokens = Math.min(limits.maxTotalTokens, maxCalls * (limits.maxInputTokensPerCall + maxOutputTokensPerCall))
-		const unitPrice = Math.max(limits.maxInputPricePerMillionUsd, limits.maxOutputPricePerMillionUsd)
-		const micros = (tokens: number) => Math.ceil(tokens * unitPrice)
-		if (micros(perCallTokens) > limits.maxCallSpendUsd * 1_000_000) throw new Error("OpenRouter per-call spend cap is below the price ceiling for the admitted token ceiling")
-		return micros(jobTokens) / 1_000_000
-	}
-	if (jobCostCeiling(mutationLimits, mutationLimits.maxCalls, mutationLimits.maxOutputTokensPerCall) > mutationLimits.maxJobSpendUsd) throw new Error("OpenRouter mutation job spend cap is below its admitted token and price ceilings")
-	for (const task of benchmarkTasks) if (jobCostCeiling(benchmarkLimits, task.ceilings.maxCalls, task.ceilings.maxOutputTokensPerCall) > benchmarkLimits.maxJobSpendUsd) throw new Error(`OpenRouter benchmark job spend cap is below the frozen token and price ceiling for ${task.id}`)
-	if (!engineeringOnly) for (const task of confirmationTasks) if (jobCostCeiling(confirmationLimits, task.ceilings.maxCalls, task.ceilings.maxOutputTokensPerCall) > confirmationLimits.maxJobSpendUsd) throw new Error(`OpenRouter confirmation job spend cap is below the frozen token and price ceiling for ${task.id}`)
-	const candidateCounts = Array.from({ length: args.plannedGenerations }, (_, generation) => args.config.computePolicy === "adaptive-independent" && generation > 0 ? 1 : args.config.population)
-	const schedule: ProofCampaignManifest["schedule"] = []
-	for (const armId of ["fixed-control", "self-hosted"]) for (let generation = 0; generation < args.plannedGenerations; generation++) {
-		for (let index = 0; index < candidateCounts[generation]!; index++) {
-			const slot = proofCandidateSlot(generation, index)
-			schedule.push({ armId, generation, candidateId: slot, taskId: "mutation", seed: args.config.seed, attemptKind: "mutation", phase: "development" })
-			schedule.push({ armId, generation, candidateId: slot, taskId: "regression", seed: args.config.seed, attemptKind: "verification", phase: "development" })
-			schedule.push({ armId, generation, candidateId: slot, taskId: "typecheck", seed: args.config.seed, attemptKind: "verification", phase: "development" })
-			for (const [taskIndex] of args.config.evalCommands.entries()) schedule.push({ armId, generation, candidateId: slot, taskId: `visible-${taskIndex}`, seed: args.config.seed, attemptKind: "verification", phase: "development" })
-			for (const role of ["child", "parent", "base"]) for (const task of benchmarkTasks) schedule.push({ armId, generation, candidateId: `${slot}:${role}`, taskId: task.id, seed: String(task.seed), attemptKind: "development-proof", phase: "development" })
-		}
-	}
-	const finalGeneration = args.plannedGenerations - 1
-	if (!engineeringOnly) for (const armId of ["fixed-control", "self-hosted"]) {
-		for (let generation = 0; generation < args.plannedGenerations; generation++) {
-			for (let index = 0; index < candidateCounts[generation]!; index++) for (const task of confirmationTasks) schedule.push({ armId, generation, candidateId: proofCandidateSlot(generation, index), taskId: task.id, seed: String(task.seed), attemptKind: "confirmation", phase: "confirmation" })
-		}
-		for (const task of confirmationTasks) schedule.push({ armId, generation: finalGeneration, candidateId: "root-control", taskId: task.id, seed: String(task.seed), attemptKind: "fixed-control", phase: "confirmation" })
-	}
-	const developmentCallsPerProofRole = benchmarkTasks.reduce((sum, task) => sum + task.ceilings.maxCalls, 0)
-	const confirmationCalls = engineeringOnly ? 0 : 4 * confirmationTasks.reduce((sum, task) => sum + task.ceilings.maxCalls, 0) // selected final and root-control, for both arms
-	const rootCalls = 2 * candidateCounts.reduce((sum, count) => sum + count * (mutationLimits.maxCalls + 3 * developmentCallsPerProofRole), 0) + confirmationCalls
-	const developmentTokensPerProofRole = benchmarkTasks.reduce((sum, task) => sum + Math.min(benchmarkLimits.maxTotalTokens, task.ceilings.maxCalls * (benchmarkLimits.maxInputTokensPerCall + task.ceilings.maxOutputTokensPerCall)), 0)
-	const confirmationTokensPerHarness = confirmationTasks.reduce((sum, task) => sum + Math.min(confirmationLimits.maxTotalTokens, task.ceilings.maxCalls * (confirmationLimits.maxInputTokensPerCall + task.ceilings.maxOutputTokensPerCall)), 0)
-	const mutationTokens = Math.min(mutationLimits.maxTotalTokens, mutationLimits.maxCalls * (mutationLimits.maxInputTokensPerCall + mutationLimits.maxOutputTokensPerCall))
-	const rootTokens = 2 * candidateCounts.reduce((sum, count) => sum + count * (mutationTokens + 3 * developmentTokensPerProofRole), 0) + (engineeringOnly ? 0 : 4 * confirmationTokensPerHarness)
-	if (!Number.isSafeInteger(rootCalls) || !Number.isSafeInteger(rootTokens)) throw new Error("proof campaign root call or token ceiling exceeds safe integer accounting")
-	const campaignBudget = openRouterCampaignBudgetAllocation(process.env)
-	const slotsPerArm = candidateCounts.reduce((sum, count) => sum + count, 0)
-	const mutationBudgetLimits = openRouterBrokerLimitsFromEnvironment(openRouterAllocatedEnvironment(process.env, "mutation"), mutationCampaignId)
-	const benchmarkJobCount = 2 * slotsPerArm * 3 * benchmarkTasks.length + (engineeringOnly ? 0 : 4 * confirmationTasks.length)
-	const reservations = proofCampaignSpendReservationMicros({
-		mutationJobs: 2 * slotsPerArm, mutationMaxJobSpendUsd: mutationLimits.maxJobSpendUsd, mutationAllocationUsd: mutationBudgetLimits.maxCampaignSpendUsd,
-		benchmarkJobs: benchmarkJobCount, benchmarkMaxJobSpendUsd: benchmarkLimits.maxJobSpendUsd, benchmarkAllocationUsd: benchmarkLimits.maxCampaignSpendUsd,
-		totalAllocationUsd: campaignBudget.totalUsd,
-		benchmarkShortfallMessage: engineeringOnly ? "benchmark broker campaign allocation is below development proof job reservations" : "benchmark broker campaign allocation is below development plus selected-final/root confirmation job reservations",
-	})
-	const taskWallBoundMs = proofCampaignTaskWallBoundMs(args.config, args.plannedGenerations, benchmarkTasks, confirmationTasks, !engineeringOnly)
-	const maxRuntimeMs = args.config.maxRuntimeMs ?? 60 * 60_000
-	if (maxRuntimeMs < taskWallBoundMs) throw new Error(`proof campaign runtime ceiling ${maxRuntimeMs}ms is below the summed frozen task-time ceiling ${taskWallBoundMs}ms`)
-	return {
-		schemaVersion: 1, phaseMode: engineeringOnly ? "engineering-only" : "paired-confirmation", campaignId: args.campaignId, rootCommit: args.baseCommit,
-		benchmarkDigests: { manifest: args.developmentManifestDigest, development: taskDigest(benchmarkTasks), confirmation: taskDigest(engineeringOnly ? [] : confirmationTasks) },
-		armAssignment: { fixedControl: "fixed-control", selfHosted: "self-hosted" },
-		model: { provider: args.provider, id: args.model, ...(args.openRouterProfileId ? { profileId: args.openRouterProfileId } : {}), settings: { sampling: args.proofProtocol.model.sampling, roles: args.config.roles ?? {}, maxIterations: args.config.maxIterations, maxTokens: args.config.maxTokens ?? null } },
-		seed: args.config.seed, taskOrder: ["mutation", "regression", "typecheck", ...args.config.evalCommands.map((_, index) => `visible-${index}`), ...benchmarkTasks.map((task) => task.id), ...(engineeringOnly ? [] : confirmationTasks.map((task) => task.id))], schedule,
-		budgets: {
-			attempt: { maxCalls: Math.max(mutationLimits.maxCalls, benchmarkLimits.maxCalls, ...(!engineeringOnly ? [confirmationLimits.maxCalls] : [])), maxTokens: Math.max(mutationLimits.maxTotalTokens, benchmarkLimits.maxTotalTokens, ...(!engineeringOnly ? [confirmationLimits.maxTotalTokens] : [])), maxSpendUsd: Math.max(mutationLimits.maxJobSpendUsd, benchmarkLimits.maxJobSpendUsd, ...(!engineeringOnly ? [confirmationLimits.maxJobSpendUsd] : [])), maxDurationMs: Math.max(args.config.commandTimeoutMs, ...benchmarkTasks.map((task) => task.ceilings.timeoutMs), ...(!engineeringOnly ? confirmationTasks.map((task) => task.ceilings.timeoutMs) : [])) },
-			root: { maxCalls: rootCalls, maxTokens: rootTokens, maxSpendUsd: Math.min(campaignBudget.totalUsd, reservations.total / 1_000_000), maxRuntimeMs },
-		},
-		acceptanceRule: { ...args.proofProtocol.rule, confirmationRetentionTaskIds: engineeringOnly ? [] : [...RSI_CONFIRMATION_RETENTION_TASK_IDS], minimumSelfHostedCampaigns: 2, requiredSuccessiveTransitions: 2, clusterConfidence: 0.9 }, runtime: { imageDigest: args.runtime.imageDigest, harnessCommit: args.runtime.harnessCommit, dependencyLockDigest: args.runtime.dependencyLockDigest },
-		analysisVersion: args.proofProtocol.schemaVersion.toString(), settings: { phaseMode: engineeringOnly ? "engineering-only" : "paired-confirmation", configDigest: workerHarnessConfigDigest(args.config, { baseCommit: args.baseCommit, model: args.model, provider: args.provider, proofProtocolDigest: args.proofProtocol.protocolDigest }), effectiveConfig: Object.fromEntries(Object.entries(args.config).filter(([key]) => !["workerHarnessMode", "workerHarnessPhase", "workerHarnessEngineeringOnly", "workerHarnessPairId", "workerHarnessRunId", "resumeRunId", "candidateIdNamespace", "workerHarnessParentCommit", "workerHarnessSnapshotTreeDigest", "hiddenSuitePath", "hiddenPublicKeyPath", "hiddenPrivateKeyPath", "hiddenNonceStorePath", "evaluatorSigningKeyPath", "evaluatorTrustedPublicKeyPath", "proofBenchmarkFixtures"].includes(key))), candidateCounts, taskWallBoundMs, evaluationCells: ["regression", "typecheck", ...args.config.evalCommands.map((_, index) => `visible-${index}`)], developmentTaskIdentities: benchmarkTasks.map((task) => ({ id: task.id, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings })), confirmationTaskIdentities: engineeringOnly ? [] : confirmationTasks.map((task) => ({ id: task.id, family: task.family, seed: task.seed, startDigest: task.startDigest, verifierDigest: task.verifierDigest, ceilings: task.ceilings })), inferenceCeilings: { maxInputTokensPerCall: benchmarkLimits.maxInputTokensPerCall, maxOutputTokensPerCall: benchmarkLimits.maxOutputTokensPerCall, maxCallsPerAttempt: benchmarkLimits.maxCalls, maxTotalTokens: benchmarkLimits.maxTotalTokens, maxCallSpendUsd: benchmarkLimits.maxCallSpendUsd, maxJobSpendUsd: benchmarkLimits.maxJobSpendUsd, maxInputPricePerMillionUsd: benchmarkLimits.maxInputPricePerMillionUsd, maxOutputPricePerMillionUsd: benchmarkLimits.maxOutputPricePerMillionUsd }, inferenceCampaignIds: { mutation: mutationCampaignId, benchmark: benchmarkCampaignId }, inferenceAllocationsUsd: { mutation: mutationLimits.maxCampaignSpendUsd, benchmark: benchmarkLimits.maxCampaignSpendUsd } },
-	}
-}
-
-export function proofBrokerCampaignId(rootCampaignId: string, allocation: "mutation" | "benchmark"): string {
-	if (!rootCampaignId.trim()) throw new Error("proof campaign ID is required to derive broker campaign identity")
-	return `${rootCampaignId}:${allocation}`
-}
-
-export async function reconcileProofCampaignJob(queue: PostgresRsiJobQueue, existing: FleetJob | undefined, expected: FleetJobIdentity, lease: ProofCampaignArmLease): Promise<FleetJob | undefined> {
-	if (!existing || fleetJobMatches(existing, expected)) return existing
-	if (existing.status === "queued") {
-		const rebound = await queue.rebindQueuedProofJob(existing.jobId, expected, lease)
-		if (fleetJobMatches(rebound, expected)) return rebound
-	}
-	throw new Error("existing proof campaign job is not the same completed result or a safely rebindable queued job")
-}
-
-export async function rebuildFinishedProofCampaignArchive(args: {
-	run: RsiRunRecord
-	config: RsiConfig
-	snapshot: Record<string, unknown>
-	manifest: ProofCampaignManifest
-	armId: string
-	now: () => string
-}): Promise<RsiRunRecord> {
-	const campaign = args.snapshot.campaign as Record<string, unknown> | undefined
-	const arms = args.snapshot.arms as Array<Record<string, unknown>> | undefined
-	const arm = arms?.find((entry) => entry.arm_id === args.armId)
-	const expectedDigest = proofCampaignManifestDigest(args.manifest)
-	if (!campaign || !arm || arm.state !== "finished" || String(campaign.manifest_sha256).trim() !== expectedDigest) throw new Error("finished proof campaign snapshot does not match the frozen manifest and arm")
-	if (arm.run_id !== args.run.runId || args.run.candidates.some((candidate) => !isTerminal(candidate))) throw new Error("finished proof campaign arm cannot rebuild an incomplete or foreign run archive")
-	if (args.manifest.phaseMode === "engineering-only") {
-		const events = args.snapshot.events as Array<Record<string, unknown>> | undefined
-		if (!events?.some((event) => event.arm_id === args.armId && event.event_type === "engineering-development-finished") || args.run.proofConfirmation || args.run.confirmationAttempts?.length) throw new Error("engineering-only recovery must have a terminal development event and no confirmation evidence")
-	} else await verifyFinishedConfirmationCheckpoint(args.run, args.config.archiveDir, args.snapshot, args.manifest, args.armId)
-	args.run.proofCampaign = { manifest: args.manifest, manifestSha256: expectedDigest, campaignId: args.manifest.campaignId, armId: args.armId, epoch: Number(arm.epoch), state: "finished", ledgerSnapshot: args.snapshot }
-	const selections = (args.snapshot.events as Array<Record<string, unknown>>).filter((event) => event.arm_id === args.armId && event.event_type === "generation-selected").sort((left, right) => Number(left.sequence) - Number(right.sequence))
-	const finalSelection = selections.at(-1)?.payload as { generation?: number; selectedCandidateIds?: string[] } | undefined
-	if (finalSelection && Number.isSafeInteger(finalSelection.generation)) {
-		args.run.selectedCandidates = (finalSelection.selectedCandidateIds ?? []).map((slot) => {
-			const generationCandidates = args.run.candidates.filter((candidate) => candidate.generation === finalSelection.generation)
-			const index = Number(/candidate-(\d+)$/.exec(slot)?.[1] ?? -1)
-			return generationCandidates[index]?.id ?? ""
-		}).filter(Boolean)
-		args.run.selected ??= [...args.run.candidates.filter((candidate) => candidate.status === "accepted")].sort((a, b) => compareFitness(b.fitness, a.fitness))[0]?.id
-	}
-	args.run.finishedAt ??= args.now()
-	const recoveredReportPath = `${args.config.archiveDir}/${args.run.runId}.md`
-	await fs.mkdir(args.config.archiveDir, { recursive: true })
-	await fs.writeFile(recoveredReportPath, formatRunReport(args.run, args.config), "utf8")
-	args.run.reports = [...new Set([...args.run.reports, recoveredReportPath])]
-	await appendRun(args.config.archiveDir, args.run)
-	return args.run
-}
-
-async function verifyFinishedConfirmationCheckpoint(run: RsiRunRecord, archiveDir: string, snapshot: Record<string, unknown>, manifest: ProofCampaignManifest, armId: string): Promise<void> {
-	const events = snapshot.events as Array<Record<string, unknown>> | undefined
-	const attempts = snapshot.attempts as Array<Record<string, unknown>> | undefined
-	const selection = events?.filter((event) => event.arm_id === armId && event.event_type === "final-harness-selected")
-	const payload = selection?.length === 1 ? selection[0]!.payload as { generation?: number; candidateId?: string; commit?: string } : undefined
-	const saved = run.proofConfirmation
-	if (!payload || !saved || saved.selectedHarness.slotId !== payload.candidateId || saved.selectedHarness.generation !== payload.generation || saved.selectedHarness.commit !== payload.commit || saved.rootHarness.commit !== manifest.rootCommit || run.confirmationEvidence !== "complete") throw new Error("finished campaign recovery requires a matching checkpointed final-harness selection and confirmation result")
-	const cells = manifest.schedule.filter((cell) => cell.armId === armId && cell.phase === "confirmation" && (cell.candidateId === "root-control" || (cell.candidateId === payload.candidateId && cell.generation === payload.generation)))
-	const byCandidateKind = (candidateId: string, kind: string) => cells.filter((cell) => cell.candidateId === candidateId && cell.attemptKind === kind)
-	const selectedRows = byCandidateKind(String(payload.candidateId), payload.candidateId === "root-control" ? "fixed-control" : "confirmation")
-	const rootRows = byCandidateKind("root-control", "fixed-control")
-	const rowFor = (cell: typeof cells[number]) => attempts?.filter((row) => row.arm_id === armId && Number(row.generation) === cell.generation && row.candidate_id === cell.candidateId && row.task_id === cell.taskId && row.seed === cell.seed && row.attempt_kind === cell.attemptKind && row.status === "completed") ?? []
-	const expectedSelectedRows = selectedRows.flatMap((cell) => rowFor(cell))
-	const expectedRootRows = rootRows.flatMap((cell) => rowFor(cell))
-	const orderedIds = (rows: Array<Record<string, unknown>>) => rows.map((row) => String(row.broker_job_id)).sort()
-	if (expectedSelectedRows.length !== selectedRows.length || expectedRootRows.length !== rootRows.length || JSON.stringify(orderedIds(expectedSelectedRows)) !== JSON.stringify([...saved.selectedHarness.attemptIds].sort()) || JSON.stringify(orderedIds(expectedRootRows)) !== JSON.stringify([...saved.rootHarness.attemptIds].sort())) throw new Error("finished campaign recovery checkpoint does not name the completed selected and root confirmation cells")
-	const artifacts = new Map((run.confirmationAttempts ?? []).map((attempt) => [attempt.attemptId, attempt]))
-	for (const row of [...expectedSelectedRows, ...expectedRootRows]) {
-		const attemptId = String(row.broker_job_id)
-		const attempt = artifacts.get(attemptId)
-		const expectedProfile = attempt ? openRouterProfileForModel(attempt.model.id, run.proofCampaign?.manifest.model.profileId) : undefined
-		const profileIdMatches = expectedProfile?.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? attempt?.inferenceReceipt?.profileId === undefined || attempt?.inferenceReceipt?.profileId === expectedProfile.id : attempt?.inferenceReceipt?.profileId === expectedProfile?.id
-		if (!attempt || attempt.validity !== "valid" || !attempt.proofQualified || attempt.resourceAccounting !== "supervisor-enforced" || !attempt.inferenceReceipt?.qualified || !profileIdMatches || attempt.inferenceReceipt.endpointProvider !== expectedProfile?.endpointProvider || attempt.inferenceReceipt.returnedProviders?.join(",") !== expectedProfile?.endpointProvider || createHash("sha256").update(JSON.stringify(attempt)).digest("hex") !== String(row.result_sha256).trim()) throw new Error(`finished campaign recovery attempt ${attemptId} does not match its verified durable result`)
-		const storedRefs = row.artifact_refs as Record<string, { sha256?: string }> | undefined
-		if (!storedRefs || Object.entries(attempt.artifactRefs).some(([name, digest]) => storedRefs[name]?.sha256 !== digest)) throw new Error(`finished campaign recovery attempt ${attemptId} has different artifact references`)
-		const candidateId = String(row.candidate_id)
-		const kind = String(row.attempt_kind)
-		const outputRoot = path.join(archiveDir, "confirmation", manifest.campaignId, armId, candidateId, kind, "harness", attempt.harnessCommit)
-		for (const digest of Object.values(attempt.artifactRefs)) {
-			if (!/^[a-f0-9]{64}$/.test(digest)) throw new Error(`finished campaign recovery attempt ${attemptId} has a malformed artifact digest`)
-			const artifact = path.join(outputRoot, "artifacts", "sha256", digest.slice(0, 2), digest)
-			const stat = await fs.lstat(artifact)
-			if (!stat.isFile() || stat.isSymbolicLink() || createHash("sha256").update(await fs.readFile(artifact)).digest("hex") !== digest) throw new Error(`finished campaign recovery artifact ${digest} is missing or changed`)
-		}
-	}
-}
-
-/** Rebuild only the durable development-phase checkpoint after its DB commit. */
-export async function rebuildEvaluatedProofCampaignArchive(args: {
-	run: RsiRunRecord
-	config: RsiConfig
-	snapshot: Record<string, unknown>
-	manifest: ProofCampaignManifest
-	armId: string
-	now: () => string
-}): Promise<RsiRunRecord> {
-	const campaign = args.snapshot.campaign as Record<string, unknown> | undefined
-	const arms = args.snapshot.arms as Array<Record<string, unknown>> | undefined
-	const events = args.snapshot.events as Array<Record<string, unknown>> | undefined
-	const arm = arms?.find((entry) => entry.arm_id === args.armId)
-	const expectedDigest = proofCampaignManifestDigest(args.manifest)
-	const finishEvent = events?.some((event) => event.arm_id === args.armId && event.event_type === "development-phase-finished" && (event.payload as { remainingPhase?: unknown })?.remainingPhase === "confirmation")
-	if (!campaign || !arm || !finishEvent || arm.phase !== "confirmation" || !["evaluated", "selected", "rejected"].includes(String(arm.state)) || String(campaign.manifest_sha256).trim() !== expectedDigest) throw new Error("evaluated proof campaign snapshot does not match the frozen manifest and development completion")
-	if (arm.run_id !== args.run.runId || args.run.candidates.some((candidate) => !isTerminal(candidate))) throw new Error("evaluated proof campaign arm cannot rebuild from an incomplete or foreign run checkpoint")
-	const expectedMode = args.armId === args.manifest.armAssignment.fixedControl ? "fixed-control" : "self-hosted"
-	if (args.run.workerHarnessPairId !== args.manifest.campaignId || args.run.workerHarnessMode !== expectedMode) throw new Error("evaluated proof campaign checkpoint has a foreign paired-run identity")
-	if (arm.lease_expires_at && new Date(String(arm.lease_expires_at)).getTime() > Date.now()) throw new Error("evaluated proof campaign arm has an active coordinator; refusing read-only recovery during confirmation work")
-	args.run.proofCampaign = { manifest: args.manifest, manifestSha256: expectedDigest, campaignId: args.manifest.campaignId, armId: args.armId, epoch: Number(arm.epoch), state: "evaluated", ledgerSnapshot: args.snapshot }
-	args.run.finishedAt ??= args.now()
-	const reportPath = `${args.config.archiveDir}/${args.run.runId}.md`
-	await fs.mkdir(args.config.archiveDir, { recursive: true })
-	await fs.writeFile(reportPath, formatRunReport(args.run, args.config), "utf8")
-	args.run.reports = [...new Set([...args.run.reports, reportPath])]
-	await appendRun(args.config.archiveDir, args.run)
-	return args.run
-}
-
-class CandidateLineageError extends Error {}
-
-export function validateCandidateParent(candidate: CandidateRecord, run: RsiRunRecord, config: RsiConfig, protocol: NonNullable<RsiRunRecord["developmentProofProtocol"]>): void {
-	if (candidate.parent === "baseline") {
-		if (candidate.baseCommit !== run.baseCommit || candidate.parentCommit !== run.baseCommit) throw new CandidateLineageError("baseline child does not use the frozen run base commit")
-		return
-	}
-	const parent = run.candidates.find((entry) => entry.id === candidate.parent)
-	if (!parent || parent.status !== "accepted" || parent.developmentProof?.accepted !== true || parent.developmentProof.runId !== run.runId || parent.developmentProof.protocolDigest !== protocol.protocolDigest || !parent.fitness || Object.values(parent.fitness.hardGates).some((passed) => passed === false)) {
-		throw new CandidateLineageError(`candidate parent ${candidate.parent} is missing, rejected, from another run/protocol, or fails hard gates`)
-	}
-	const parentCommit = parent.commits[0]
-	if (!parentCommit || candidate.baseCommit !== parentCommit || candidate.parentCommit !== parentCommit) throw new CandidateLineageError(`candidate parent ${candidate.parent} commit does not match its mutation base`)
-	try {
-		execFileSync("git", ["merge-base", "--is-ancestor", run.baseCommit, parentCommit], { cwd: config.repoRoot, stdio: "ignore" })
-	} catch { throw new CandidateLineageError(`candidate parent ${candidate.parent} is outside the frozen run base lineage`) }
-	const inheritedPaths = execFileSync("git", ["diff", "--name-only", "-z", "--no-renames", run.baseCommit, parentCommit], { cwd: config.repoRoot, encoding: "buffer" }) as Buffer
-	const violations = mutationSnapshotProtectedPathViolations(inheritedPaths.toString("utf8").split("\0").filter(Boolean), config.protectedPaths)
-	if (violations.length > 0) throw new CandidateLineageError(`candidate parent ${candidate.parent} inherits protected path changes: ${violations.join(", ")}`)
-}
-
-function replaceJob(run: RsiRunRecord, job: ExperimentJob): void {
-	run.jobs ??= []
-	const index = run.jobs.findIndex((entry) => entry.id === job.id)
-	if (index >= 0) run.jobs[index] = job
-	else run.jobs.push(job)
-}
-
-function combinedArchive(archive: RsiArchive, run: RsiRunRecord): RsiArchive {
-	const currentIds = new Set(run.candidates.map((candidate) => candidate.id))
-	return { ...archive, candidates: [...archive.candidates.filter((candidate) => !currentIds.has(candidate.id)), ...run.candidates] }
-}
-
-function validateDeterministicWorkerHarnessRunId(config: RsiConfig): void {
-	if (config.workerHarnessRunId) {
-		const suffix = config.workerHarnessMode === "fixed-control" ? "fixed" : config.workerHarnessMode === "self-hosted" ? "self" : undefined
-		if (!config.workerHarnessPairId || !suffix || config.workerHarnessRunId !== `${config.workerHarnessPairId}-${suffix}` || !/^rsi-proof-[a-f0-9]{20}-(fixed|self)$/.test(config.workerHarnessRunId)) throw new Error("deterministic worker harness run ID must match its paired campaign and arm")
-	}
-	}
-
-function initialRun(config: RsiConfig, baseCommit: string, now: string): RsiRunRecord {
-	const modelCandidateId = config.modelCandidateId ?? "model-base"
-	validateDeterministicWorkerHarnessRunId(config)
-	return {
-		runId: config.workerHarnessRunId ?? `rsi-${now.replace(/[^0-9]/g, "").slice(0, 14)}-${randomUUID().slice(0, 8)}`,
-		startedAt: now,
-		model: config.model,
-		baseRef: config.baseRef,
-		baseCommit,
-		generations: config.generations,
-		parentSelectionPolicy: config.parentSelectionPolicy ?? "champion-specialist-novelty",
-		selectedCandidates: [],
-		parentChoices: {},
-		modelCandidates: [baseModelCandidate(config.model, now, modelCandidateId)],
-		combinations: [],
-		jobs: [],
-		trajectoryRefs: [],
-		curriculumTasks: [],
-		adversarialReviews: [],
-		candidates: [],
-		reports: [],
-		confirmationEvidence: "unmeasured",
-	}
-}
-
-async function buildEvaluatorIntegrityInput(args: {
-	config: RsiConfig
-	run: RsiRunRecord
-	packageRoot: string
-	roles: RsiConfig["roles"]
-	workerModel: string
-	workerProvider: string
-	workerOpenRouterProfile?: string
-	proofProtocol: ReturnType<typeof freezeDevelopmentProofProtocol>
-	benchmarkManifestSha256: string
-	evaluatorRuntime?: EvaluatorRuntimeIdentity
-	hiddenVerifierIdentity?: RsiRunRecord["hiddenVerifierIdentity"]
-	syntheticRuntimeIdentity?: boolean
-}): Promise<Record<string, unknown>> {
-	const source = await evaluatorSourceIdentity(args.packageRoot)
-	const baseTreeSha256 = evaluatorBaseTreeIdentity(args.config.repoRoot, args.run.baseCommit)
-	const config = args.config
-	return {
-		schemaVersion: 1,
-		runId: args.run.runId,
-		baseCommit: args.run.baseCommit,
-		baseTreeSha256,
-		evaluatorSource: source,
-		imageIdentity: {
-			requestedImage: args.evaluatorRuntime ? `headlesscode-openshell-rsi@${args.evaluatorRuntime.imageDigest}` : null,
-			pinnedImageDigest: args.evaluatorRuntime?.imageDigest ?? null,
-			identitySource: args.evaluatorRuntime?.identitySource ?? "not-executed-dry-run",
-			workerHarnessRuntime: args.run.workerHarnessRuntime ?? null,
-			gatewayAlias: process.env.OPENSHELL_GATEWAY ?? null,
-		},
-		evaluatorIsolationPolicy: args.evaluatorRuntime ? { source: args.evaluatorRuntime.policySource, sha256: args.evaluatorRuntime.policySha256 } : null,
-		storageAndWorkspace: {
-			repository: path.resolve(config.repoRoot),
-			archive: path.resolve(config.archiveDir),
-			worktrees: path.resolve(config.worktreeDir),
-			trajectoryOutput: path.resolve(config.trajectoryDir ?? path.join(config.archiveDir, "trajectories")),
-			curriculumOutput: path.resolve(config.curriculumDir ?? path.join(config.archiveDir, "curriculum")),
-		},
-		commands: {
-			regression: config.regressionCommand,
-			visible: [...config.evalCommands],
-			hidden: [...config.hiddenEvalCommands],
-		},
-		effectiveArguments: {
-			baseRef: config.baseRef,
-			model: args.workerModel,
-			provider: args.workerProvider,
-			openRouterProfile: args.workerOpenRouterProfile ?? null,
-			roles: args.roles ?? null,
-			population: config.population,
-			generations: args.run.generations,
-			maxConcurrent: config.maxConcurrent,
-			maxIterations: config.maxIterations,
-			maxTokens: config.maxTokens ?? null,
-			commandTimeoutMs: config.commandTimeoutMs,
-			computePolicy: config.computePolicy ?? "single",
-			maxTrajectories: config.maxTrajectories ?? null,
-			maxTotalIterations: config.maxTotalIterations ?? null,
-			maxRuntimeMs: config.maxRuntimeMs ?? null,
-			seed: config.seed,
-			mutationTask: config.mutationTask,
-			mutationKind: config.mutationKind ?? "corrective",
-			hypothesis: config.hypothesis ?? null,
-			protectedPaths: [...config.protectedPaths].sort(),
-			parentSelectionPolicy: config.parentSelectionPolicy ?? "champion-specialist-novelty",
-			developmentProofRule: config.developmentProofRule ?? null,
-			developmentProofProtocolSha256: args.proofProtocol.protocolDigest,
-			workerHarness: {
-				mode: args.run.workerHarnessMode ?? "fixed-control",
-				pairId: args.run.workerHarnessPairId ?? null,
-				configDigest: args.run.workerHarnessConfigDigest ?? null,
-				plannedGenerations: args.run.workerHarnessPlannedGenerations ?? null,
-				phase: config.workerHarnessPhase ?? null,
-				engineeringOnly: config.workerHarnessEngineeringOnly ?? false,
-			},
-		},
-		inputArtifacts: [
-			{ id: "development-benchmark-manifest", sha256: args.benchmarkManifestSha256 },
-			...(args.hiddenVerifierIdentity ? [{ id: "hidden-verifier-suite", sha256: args.hiddenVerifierIdentity.suiteSha256 }, { id: "hidden-verifier-public-key", sha256: args.hiddenVerifierIdentity.publicKeySha256 }, { id: "hidden-verifier-image", sha256: args.hiddenVerifierIdentity.imageDigest }] : []),
-		],
-	}
-}
-
-async function waitForFleetJob(queue: PostgresRsiJobQueue, jobId: string, timeoutMs: number, runtimeDeadlineMs?: number): Promise<FleetJob> {
-	const deadline = Math.min(Date.now() + timeoutMs, runtimeDeadlineMs ?? Number.POSITIVE_INFINITY)
-	for (;;) {
-		const job = await queue.getJob(jobId)
-		if (!job) throw new Error(`fleet job ${jobId} disappeared`)
-		if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") return job
-		if (Date.now() >= deadline) break
-		await delay(500)
-	}
-	const reason = runtimeDeadlineMs !== undefined && Date.now() >= runtimeDeadlineMs ? "RSI run runtime ceiling" : "coordinator wait timeout"
-	await queue.cancel(jobId, reason)
-	const teardownDeadline = Date.now() + 60_000
-	while (Date.now() < teardownDeadline) {
-		const job = await queue.getJob(jobId)
-		if (!job) throw new Error(`fleet job ${jobId} disappeared during cancellation`)
-		if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") return job
-		await delay(200)
-	}
-	throw new Error(`fleet job ${jobId} exceeded ${reason}; cancellation is pending worker teardown and its lease remains capacity-reserved`)
-}
-
-function fleetRuntimeDeadlineMs(config: RsiConfig, run: RsiRunRecord): number | undefined {
-	return config.maxRuntimeMs === undefined ? undefined : Date.parse(run.startedAt) + config.maxRuntimeMs
-}
-
-export function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snapshot: { content: Buffer; snapshotCommit: string; snapshotTreeDigest?: string }, options: { campaignId?: string; boundedInference?: boolean; includeWorkerHarness?: boolean; proofCampaign?: FleetJobPayload["proofCampaign"]; remainingCampaignMs?: number; evaluatorRuntime?: Pick<EvaluatorRuntimeIdentity, "imageDigest" | "policySha256"> } = {}): FleetJobPayload {
-	const provider = config.roles?.worker?.provider === "openrouter" ? "openrouter" : "ollama"
-	const openRouterProfile = provider === "openrouter" ? openRouterProfileForModel(candidate.model, config.roles?.worker?.openRouterProfile) : undefined
-	const inferenceLimits = provider === "openrouter" && options.boundedInference
-		? openRouterBrokerLimitsFromEnvironment(openRouterAllocatedEnvironment(process.env, "mutation"), options.campaignId ?? "", {
-			maxCalls: config.maxIterations,
-			...(config.maxTokens ? { maxOutputTokensPerCall: config.maxTokens } : {}),
-			maxDurationMs: Math.max(1, Math.min(config.commandTimeoutMs, options.remainingCampaignMs ?? config.commandTimeoutMs)),
-		})
-		: undefined
-	const effectiveMode = effectiveWorkerHarnessMode(config.workerHarnessMode ?? "fixed-control", candidate.generation)
-	const runtime = config.workerHarnessRuntime
-	if (config.workerHarnessMode && options.includeWorkerHarness && (!runtime || !validWorkerHarnessRuntimeIdentity(runtime) || !snapshot.snapshotTreeDigest)) throw new Error("worker harness job lacks its frozen runtime and sanitized snapshot identity")
-	return {
-		schemaVersion: 1,
-		snapshotSha256: "", // replaced with the verified artifact digest before enqueue
-		snapshotBytes: snapshot.content.byteLength,
-		snapshotCommit: snapshot.snapshotCommit,
-		task: config.mutationTask,
-		model: candidate.model,
-		provider,
-		...(openRouterProfile && openRouterProfile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { openRouterProfile: openRouterProfile.id } : {}),
-		...(options.proofCampaign ? { proofCampaign: options.proofCampaign } : {}),
-		...(inferenceLimits ? { inferenceLimits } : {}),
-		...(options.evaluatorRuntime ? { evaluatorRuntime: { ...options.evaluatorRuntime } } : {}),
-		maxIterations: config.maxIterations,
-		timeoutMs: config.commandTimeoutMs,
-		protectedPaths: config.protectedPaths,
-		candidate: {
-			id: candidate.id, generation: candidate.generation, parent: candidate.parent,
-			...(config.workerHarnessMode && options.includeWorkerHarness ? { baseCommit: candidate.baseCommit } : {}),
-			mutationKind: candidate.mutationKind, hypothesis: candidate.hypothesis,
-			modelCandidateId: candidate.modelCandidateId, computePolicy: config.computePolicy,
-		},
-		regressionCommand: config.regressionCommand,
-		evalCommands: config.evalCommands,
-		...(config.workerHarnessMode && options.includeWorkerHarness ? { workerHarness: {
-			runMode: config.workerHarnessMode,
-			mode: effectiveMode,
-			...(config.workerHarnessPairId ? { pairId: config.workerHarnessPairId } : {}),
-			parentCommit: candidate.baseCommit,
-			snapshotTreeDigest: snapshot.snapshotTreeDigest!,
-			runtime: runtime!,
-			executedCliPath: workerHarnessCliPath(effectiveMode),
-		} } : {}),
-	}
-}
-
-function recordFleetInferenceUsage(candidate: CandidateRecord, resultValue: unknown, payload: FleetJobPayload, jobId: string): void {
-	candidate.modelProvider = `openshell-${payload.provider ?? "ollama"}`
-	if ((payload.provider ?? "ollama") !== "openrouter") return
-	if (!resultValue || typeof resultValue !== "object" || !payload.inferenceLimits) throw new Error("OpenRouter fleet mutation result is missing its broker identity")
-	const result = resultValue as { provider?: unknown; model?: unknown; inferenceReceipt?: Record<string, unknown> }
-	const receipt = result.inferenceReceipt
-	const profile = openRouterProfileForModel(payload.model, payload.openRouterProfile)
-	const profileIdMatches = profile.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? receipt?.profileId === undefined || receipt.profileId === profile.id : receipt?.profileId === profile.id
-	const price = receipt?.endpointPrice as OpenRouterEndpointPriceSnapshot | undefined
-	const priceMatches = profile.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID || Boolean(price && price.model === profile.model && price.provider === profile.endpointProvider && price.endpointTag === profile.endpointTag
-		&& price.quantization === profile.quantization && profile.requiredParameters.every((parameter) => price.supportedParameters.includes(parameter))
-		&& Number.isFinite(Date.parse(price.observedAt)) && /^[a-f0-9]{64}$/.test(price.responseSha256)
-		&& Number.isFinite(price.inputPricePerMillionUsd) && price.inputPricePerMillionUsd > 0 && price.inputPricePerMillionUsd <= payload.inferenceLimits.maxInputPricePerMillionUsd
-		&& Number.isFinite(price.outputPricePerMillionUsd) && price.outputPricePerMillionUsd > 0 && price.outputPricePerMillionUsd <= payload.inferenceLimits.maxOutputPricePerMillionUsd)
-	if (result.provider !== "openrouter" || result.model !== payload.model || !receipt || receipt.provider !== "openrouter" || !profileIdMatches || !priceMatches || receipt.endpointProvider !== profile.endpointProvider || receipt.jobId !== jobId || receipt.campaignId !== payload.inferenceLimits.campaignId || receipt.model !== payload.model || receipt.accounting !== "supervisor-enforced" || receipt.qualified !== true || !Array.isArray(receipt.returnedModels) || receipt.returnedModels.length !== 1 || !profile.returnedModels.includes(String(receipt.returnedModels[0])) || !Array.isArray(receipt.returnedProviders) || receipt.returnedProviders.length !== 1 || receipt.returnedProviders[0] !== profile.endpointProvider) {
-		throw new Error("OpenRouter fleet mutation result lacks a qualified receipt bound to the admitted provider, model, job and campaign")
-	}
-	const values = [receipt.calls, receipt.promptTokens, receipt.completionTokens, receipt.totalTokens, receipt.costUsd]
-	if (!values.every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0) || !Number.isSafeInteger(receipt.calls) || !Number.isSafeInteger(receipt.promptTokens) || !Number.isSafeInteger(receipt.completionTokens) || !Number.isSafeInteger(receipt.totalTokens)) throw new Error("OpenRouter fleet mutation receipt contains malformed resource totals")
-	if (!Array.isArray(receipt.denials) || !receipt.denials.every((entry) => entry && typeof entry === "object" && Number.isSafeInteger((entry as OpenRouterDenialSummary).statusCode) && (entry as OpenRouterDenialSummary).statusCode >= 400 && (entry as OpenRouterDenialSummary).statusCode <= 599 && Number.isSafeInteger((entry as OpenRouterDenialSummary).count) && (entry as OpenRouterDenialSummary).count >= 1 && /^[a-z-]+$/.test((entry as OpenRouterDenialSummary).reason))) throw new Error("OpenRouter fleet mutation receipt contains malformed denial summaries")
-	candidate.inferenceUsage = {
-		provider: "openrouter", endpointProvider: profile.endpointProvider, ...(profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { profileId: profile.id } : {}), model: payload.model, returnedModels: receipt.returnedModels as string[], returnedProviders: receipt.returnedProviders as string[], calls: receipt.calls as number,
-		promptTokens: receipt.promptTokens as number, completionTokens: receipt.completionTokens as number, totalTokens: receipt.totalTokens as number,
-		costUsd: receipt.costUsd as number, accounting: "supervisor-enforced", qualified: true, jobId,
-		campaignId: payload.inferenceLimits.campaignId,
-		denials: receipt.denials as OpenRouterDenialSummary[],
-	}
-}
-
-function recordFleetInferenceDenials(candidate: CandidateRecord, resultValue: unknown, payload: FleetJobPayload, jobId: string): void {
-	if (payload.provider !== "openrouter" || !resultValue || typeof resultValue !== "object") return
-	const result = resultValue as { provider?: unknown; model?: unknown; inferenceAudit?: { accounting?: unknown; jobId?: unknown; denials?: unknown } }
-	const audit = result.inferenceAudit
-	if (result.provider !== "openrouter" || result.model !== payload.model || audit?.accounting !== "incomplete" || audit.jobId !== jobId || !Array.isArray(audit.denials)) return
-	const denials = audit.denials as OpenRouterDenialSummary[]
-	if (!denials.every((entry) => entry && typeof entry === "object" && Number.isSafeInteger(entry.statusCode) && entry.statusCode >= 400 && entry.statusCode <= 599 && Number.isSafeInteger(entry.count) && entry.count >= 1 && /^[a-z-]+$/.test(entry.reason))) return
-	candidate.inferenceDenials = structuredClone(denials)
-}
-
-function fleetEvaluationResult(value: unknown): { regression: TrialResult; typecheck: TrialResult; visible: TrialResult[] } {
-	if (!value || typeof value !== "object") throw new Error("fleet evaluation result is malformed")
-	const result = value as {
-		evaluation?: { regression?: unknown; typecheck?: unknown; visible?: unknown[] }
-		outputArtifact?: { sha256?: unknown; bytes?: unknown }
-	}
-	const output = result.outputArtifact
-	if (!output || typeof output.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(output.sha256) || !Number.isSafeInteger(output.bytes) || Number(output.bytes) < 1) {
-		throw new Error("fleet evaluation output artifact reference is missing or malformed")
-	}
-	const compactTrial = (trial: unknown): TrialResult => {
-		if (!trial || typeof trial !== "object") throw new Error("fleet evaluation trial is malformed")
-		const item = trial as TrialResult
-		if (typeof item.ok !== "boolean" || (item.exitCode !== null && !Number.isSafeInteger(item.exitCode)) || !Number.isFinite(item.durationMs) || item.durationMs < 0 || typeof item.command !== "string" || item.command.length > 512 || typeof item.stdout !== "string" || item.stdout.length > 2048 || typeof item.stderr !== "string" || item.stderr.length > 2048 || item.outputArtifactSha256 !== output.sha256 || item.outputArtifactBytes !== output.bytes) {
-			throw new Error("fleet evaluation trial exceeds bounded result fields or lacks its output artifact reference")
-		}
-		return item
-	}
-	const evaluation = result.evaluation
-	if (!evaluation || !Array.isArray(evaluation.visible)) throw new Error("fleet evaluation trial list is malformed")
-	return { regression: compactTrial(evaluation.regression), typecheck: compactTrial(evaluation.typecheck), visible: evaluation.visible.map(compactTrial) }
-}
-
-function fleetWorkerHarnessExecution(value: unknown, expected: FleetJobPayload): WorkerHarnessExecution | undefined {
-	if (!expected.workerHarness) return undefined
-	if (!value || typeof value !== "object") throw new Error("fleet mutation result omitted its worker harness identity")
-	const execution = (value as { workerHarnessExecution?: WorkerHarnessExecution }).workerHarnessExecution
-	const plan = expected.workerHarness
-	if (!execution || execution.mode !== plan.mode || execution.parentCommit !== plan.parentCommit
-		|| execution.snapshotTreeDigest !== plan.snapshotTreeDigest || execution.executedCliPath !== plan.executedCliPath
-		|| JSON.stringify(execution.runtime) !== JSON.stringify(plan.runtime)
-		|| !/^[a-f0-9]{40}$/.test(execution.snapshotCommit)) throw new Error("fleet mutation result does not match its frozen worker harness identity")
-	return execution
-}
-
-function validateCandidateWorkerHarnessExecution(candidate: CandidateRecord, run: RsiRunRecord, config: RsiConfig, execution?: WorkerHarnessExecution): void {
-	if (!config.workerHarnessMode) return
-	const expectedMode = effectiveWorkerHarnessMode(config.workerHarnessMode, candidate.generation)
-	if (!execution || execution.mode !== expectedMode || execution.parentCommit !== candidate.baseCommit
-		|| execution.executedCliPath !== workerHarnessCliPath(expectedMode)
-		|| !/^[a-f0-9]{64}$/.test(execution.snapshotTreeDigest)
-		|| !/^[a-f0-9]{40}$/.test(execution.snapshotCommit)
-		|| JSON.stringify(execution.runtime) !== JSON.stringify(run.workerHarnessRuntime)) throw new Error("mutation result lacks the frozen worker harness execution identity")
-	candidate.workerHarnessExecution = execution
-}
+import {
+	adversarialOutputRecords,
+	evaluationOutputRecords,
+	mergeIntegrityOutputs,
+	verifyIntegrityArtifacts,
+} from "./controller-integrity.js"
+import {
+	buildEvaluatorIntegrityInput,
+	persistEvaluatorIntegrity,
+	verifyResumedEvaluatorIntegrity,
+} from "./controller-integrity-seal.js"
+import {
+	CandidateLineageError,
+	combinedArchive,
+	initialRun,
+	isTerminal,
+	replaceJob,
+	validateCandidateParent,
+	validateDeterministicWorkerHarnessRunId,
+} from "./controller-candidates.js"
+import {
+	createProofCampaignManifest,
+	proofBrokerCampaignId,
+	proofCandidateSlot,
+} from "./controller-proof-manifest.js"
+import {
+	rebuildEvaluatedProofCampaignArchive,
+	rebuildFinishedProofCampaignArchive,
+	reconcileProofCampaignJob,
+} from "./controller-proof-archive.js"
+import {
+	fleetEvaluationResult,
+	fleetPayload,
+	fleetRuntimeDeadlineMs,
+	fleetWorkerHarnessExecution,
+	recordFleetInferenceDenials,
+	recordFleetInferenceUsage,
+	validateCandidateWorkerHarnessExecution,
+	waitForFleetJob,
+} from "./controller-fleet.js"
+export type { IntegrityOutput } from "./controller-integrity.js"
+export {
+	adversarialOutputRecords,
+	evaluationOutputRecords,
+	evaluatorArchiveStateDigest,
+	mergeIntegrityOutputs,
+	trialOutputRecords,
+	verifyArchivedIntegrityOutputs,
+	verifyIntegrityArtifacts,
+} from "./controller-integrity.js"
+export {
+	buildEvaluatorIntegrityInput,
+	persistEvaluatorIntegrity,
+	verifyResumedEvaluatorIntegrity,
+} from "./controller-integrity-seal.js"
+export {
+	CandidateLineageError,
+	combinedArchive,
+	initialRun,
+	isTerminal,
+	replaceJob,
+	validateCandidateParent,
+	validateDeterministicWorkerHarnessRunId,
+} from "./controller-candidates.js"
+export {
+	createProofCampaignManifest,
+	proofBrokerCampaignId,
+	proofCampaignSpendReservationMicros,
+	proofCampaignTaskWallBoundMs,
+	proofCandidateSlot,
+	RSI_CONFIRMATION_RETENTION_TASK_IDS,
+} from "./controller-proof-manifest.js"
+export type { ProofCampaignSpendReservationMicros } from "./controller-proof-manifest.js"
+export {
+	rebuildEvaluatedProofCampaignArchive,
+	rebuildFinishedProofCampaignArchive,
+	reconcileProofCampaignJob,
+	verifyFinishedConfirmationCheckpoint,
+} from "./controller-proof-archive.js"
+export {
+	fleetEvaluationResult,
+	fleetPayload,
+	fleetRuntimeDeadlineMs,
+	fleetWorkerHarnessExecution,
+	recordFleetInferenceDenials,
+	recordFleetInferenceUsage,
+	validateCandidateWorkerHarnessExecution,
+	waitForFleetJob,
+} from "./controller-fleet.js"
 
 async function validateCurriculumOnFleet(
 	tasks: RsiRunRecord["curriculumTasks"],
@@ -1033,7 +381,7 @@ async function evaluateBaselineFleet(
 	}
 }
 
-function recoverInterruptedCandidates(run: RsiRunRecord, now: string): void {
+export function recoverInterruptedCandidates(run: RsiRunRecord, now: string): void {
 	for (const candidate of run.candidates) {
 		if (candidate.status === "mutating" || candidate.status === "evaluating") {
 			candidate.status = "failed"
@@ -2059,3 +1407,4 @@ export async function improveMain(argv: string[]): Promise<number> {
 		return 1
 	}
 }
+
