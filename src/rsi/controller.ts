@@ -6,16 +6,18 @@ import { setTimeout as delay } from "node:timers/promises"
 import { fileURLToPath } from "node:url"
 import { appendRun, checkpointRun as archiveCheckpointRun, findActiveRun, findRun, readArchive } from "./archive.js"
 import { parseRsiArgs, rsiHelp } from "./config.js"
-import { generateCurriculumProposals, validateCurriculumProposals, writeCurriculumProposals } from "./curriculum.js"
+import { admitMutationGrant } from "./controller-broker-grants.js"
+import { planGenerationCandidates } from "./controller-planning.js"
+import { finalizeRunReporting } from "./controller-reporting.js"
 import { evaluateCandidate } from "./evaluator.js"
-import { computeFitness, compareFitness, comparePairedEvaluation } from "./fitness.js"
+import { computeFitness, comparePairedEvaluation } from "./fitness.js"
 import { baseModelCandidate, createCombination } from "./models.js"
 import { runMutation } from "./mutation.js"
 import { formatRunReport } from "./reports.js"
 import { mutationSnapshotProtectedPathViolations, protectedPathViolations } from "./sandbox.js"
 import { resolveRoles } from "./roles.js"
-import { newExperimentJob, paretoFront, selectParentChoices, transitionJob } from "./selection.js"
-import { captureCandidateTrajectory, exportTrajectoryDatasets } from "./trajectory.js"
+import { newExperimentJob, transitionJob } from "./selection.js"
+import { captureCandidateTrajectory } from "./trajectory.js"
 import { decideAdaptiveContinuation } from "./adaptive.js"
 import { createOpenShellCommandRunner, resolveRsiEvaluatorRuntimeIdentity } from "./openshell.js"
 import type { EvaluatorRuntimeIdentity } from "./evaluator-runtime.js"
@@ -27,7 +29,6 @@ import {
 	candidateCommits,
 	changedFiles,
 	createCandidateWorktree,
-	newCandidate,
 	removeCandidateWorktree,
 	resolveBaseCommit,
 } from "./workspace.js"
@@ -47,7 +48,18 @@ import { runProofConfirmation } from "./proof-confirmation.js"
 import { loadHiddenVerifierConfig } from "./hidden-config.js"
 import { createOpenShellHiddenCaseRunner } from "./hidden-openshell-runner.js"
 import type { HiddenEvaluationOptions } from "./evaluator.js"
-import { canonicalJson, evaluatorBaseTreeIdentity, evaluatorGenerationDecisionDigest, evaluatorIntegrityDigest, evaluatorSourceIdentity, hasEvaluatorIntegrityManifests, loadEvaluatorIntegrityTrust, readEvaluatorIntegrityManifest, signEvaluatorIntegrity, verifyEvaluatorIntegrity, writeEvaluatorIntegrityManifest } from "./evaluation-integrity.js"
+import {
+	canonicalJson,
+	evaluatorBaseTreeIdentity,
+	evaluatorIntegrityDigest,
+	evaluatorSourceIdentity,
+	hasEvaluatorIntegrityManifests,
+	loadEvaluatorIntegrityTrust,
+	readEvaluatorIntegrityManifest,
+	signEvaluatorIntegrity,
+	verifyEvaluatorIntegrity,
+	writeEvaluatorIntegrityManifest,
+} from "./evaluation-integrity.js"
 import type { EvaluatorIntegrityPayload, EvaluatorIntegrityTrust } from "./evaluation-integrity.js"
 
 function log(hooks: RsiHooks, line: string): void {
@@ -60,6 +72,7 @@ import {
 	mergeIntegrityOutputs,
 	verifyIntegrityArtifacts,
 } from "./controller-integrity.js"
+import { selectGenerationCandidates } from "./controller-selection.js"
 import {
 	buildEvaluatorIntegrityInput,
 	persistEvaluatorIntegrity,
@@ -143,82 +156,6 @@ export {
 	validateCandidateWorkerHarnessExecution,
 	waitForFleetJob,
 } from "./controller-fleet.js"
-
-async function validateCurriculumOnFleet(
-	tasks: RsiRunRecord["curriculumTasks"],
-	config: RsiConfig,
-	run: RsiRunRecord,
-	queue: PostgresRsiJobQueue,
-	now: () => string,
-	evaluatorRuntime: Pick<EvaluatorRuntimeIdentity, "imageDigest" | "policySha256">,
-): Promise<NonNullable<RsiRunRecord["curriculumTasks"]>> {
-	if (!tasks?.length) return []
-	return validateCurriculumProposals(tasks, run.baseCommit, async (task, attempt, replayKey) => {
-		const replayCandidate: CandidateRecord = {
-			id: `${task.fixtureId}-replay-${attempt}`,
-			generation: 0,
-			parent: run.baseCommit,
-			branch: `curriculum-${task.fixtureId}`,
-			worktree: config.repoRoot,
-			baseCommit: run.baseCommit,
-			status: "evaluating",
-			model: config.model,
-			mutation: task.task,
-			createdAt: now(),
-			updatedAt: now(),
-			commits: [],
-			changedFiles: [],
-			protectedPathViolations: [],
-		}
-		const idempotencyKey = `${run.runId}:${replayKey}`
-		const snapshot = createEvaluationSnapshotBundle(config.repoRoot, run.baseCommit, config)
-		const artifact = await queue.putArtifact(snapshot.content)
-		const payload = fleetPayload(config, replayCandidate, snapshot, { evaluatorRuntime })
-		payload.snapshotSha256 = artifact.sha256
-		payload.task = `Replay registered curriculum fixture ${task.fixtureId}`
-		payload.regressionCommand = "true"
-		payload.evalCommands = [task.groundTruthCommand]
-		const expected = {
-			idempotencyKey,
-			runId: run.runId,
-			candidateId: replayCandidate.id,
-			jobKind: "evaluation" as const,
-			resourceClass: "CPU" as const,
-			concurrencyKey: `curriculum:${task.fixtureId}`,
-			artifactSha256: artifact.sha256,
-			payload,
-		}
-		let job = await queue.getJobByIdempotencyKey(idempotencyKey)
-		if (!job) {
-			job = await queue.enqueue({
-				idempotencyKey,
-				runId: run.runId,
-				candidateId: replayCandidate.id,
-				jobKind: "evaluation",
-				resourceClass: "CPU",
-				concurrencyKey: expected.concurrencyKey,
-				artifactSha256: artifact.sha256,
-				payload,
-			})
-		}
-		if (!fleetJobMatches(job, expected)) return { ok: false, exitCode: null, failure: "idempotent curriculum replay key refers to a stale or mismatched fleet job payload" }
-		const completed = await waitForFleetJob(queue, job.jobId, requiredFleetJobLeaseMs("evaluation", config.commandTimeoutMs, 1) + 60_000, fleetRuntimeDeadlineMs(config, run))
-		if (completed.status !== "completed" || !completed.result || typeof completed.result !== "object") return { ok: false, exitCode: null, failure: completed.error ?? `OpenShell curriculum replay ended ${completed.status}` }
-		try {
-			const evaluation = fleetEvaluationResult(completed.result)
-			const trial = evaluation.visible[0]
-			if (!trial) return { ok: false, exitCode: null, failure: "OpenShell curriculum replay returned no fixture trial" }
-			return {
-				ok: trial.ok,
-				exitCode: trial.exitCode,
-				outputSha256: trial.outputArtifactSha256,
-				...(!trial.ok ? { failure: `fixture command exited ${trial.exitCode ?? "unknown"}` } : {}),
-			}
-		} catch (error) {
-			return { ok: false, exitCode: null, failure: error instanceof Error ? error.message : String(error) }
-		}
-	}, now())
-}
 
 async function runAdversarialStage(
 	candidate: CandidateRecord,
@@ -849,23 +786,16 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 					}
 				}
 			}
-			const merged = { ...combinedArchive(archive, run), candidates: run.candidates }
-			const choices = generation === 0
-				? []
-				: selectParentChoices(merged, run.parentSelectionPolicy ?? "champion-specialist-novelty", config.population)
-			const fallbackBase = run.selected
-				? run.candidates.find((candidate) => candidate.id === run.selected)?.commits[0] ?? run.baseCommit
-				: run.baseCommit
-			const candidateCount = config.computePolicy === "adaptive-independent" && generation > 0 ? 1 : config.population
-			candidates = Array.from({ length: candidateCount }, (_, index) => {
-				const parentChoice = choices[index]
-				const candidate = newCandidate(runConfig, generation, index, parentChoice?.baseCommit ?? fallbackBase, now(), parentChoice)
-				if (parentChoice) run.parentChoices![candidate.id] = parentChoice.reason
-				return candidate
+			candidates = await planGenerationCandidates({
+				archive,
+				run,
+				config,
+				runConfig,
+				generation,
+				now,
+				log: (message) => log(hooks, message),
+				checkpoint: checkpointWithEvaluatorIntegrity,
 			})
-			run.candidates.push(...candidates)
-			log(hooks, `[rsi] generation ${generation}: planning ${candidates.length} candidate(s) with policy ${run.parentSelectionPolicy}`)
-			if (!config.dryRun) await checkpointWithEvaluatorIntegrity()
 		} else {
 			log(hooks, `[rsi] generation ${generation}: resuming ${candidates.length} persisted candidate(s)`)
 		}
@@ -918,14 +848,16 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 					if (campaignLease) existing = await reconcileProofCampaignJob(fleetQueue, existing, expected, campaignLease)
 					if (existing && !fleetJobMatches(existing, expected)) throw new Error("existing idempotent mutation job has mismatched execution identity, snapshot, or task payload")
 					if (campaignStore && campaignLease) {
-						const limits = payload.inferenceLimits
-						if (!limits) throw new Error("proof campaign mutation has no bounded broker limits")
-						const requestSha256 = fleetPayloadDigest(existing?.status === "completed" ? existing.payload : payload)
-						const admitted = await campaignStore.admit(campaignLease, {
-							attemptKey, kind: "mutation", identity: { generation: candidate.generation, candidateId: slotId, taskId: "mutation", seed: runConfig.seed, attemptKind: "mutation" }, sourceCandidateId: candidate.id,
-							requestSha256, calls: limits.maxCalls, tokens: limits.maxTotalTokens, spendUsd: limits.maxJobSpendUsd, ...(existing ? { jobId: existing.jobId } : {}),
+						await admitMutationGrant({
+							store: campaignStore,
+							lease: campaignLease,
+							attemptKey,
+							slotId,
+							candidate,
+							seed: runConfig.seed,
+							payload,
+							existing,
 						})
-						if (admitted.status !== "completed") await campaignStore.markDispatched(campaignLease, attemptKey, existing?.jobId)
 					}
 					if (worktree.commits > 0) {
 						const completed = existing
@@ -1280,21 +1212,23 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 			}
 		}
 
-		const accepted = candidates.filter((candidate) => candidate.status === "accepted")
-		const front = paretoFront(accepted)
-		const ranked = [...accepted].sort((a, b) => compareFitness(b.fitness, a.fitness))
-		run.selectedCandidates = front.map((candidate) => candidate.id)
-		if (ranked[0]) run.selected = ranked[0].id
-		const generationSelection = {
+		const selection = selectGenerationCandidates({
+			candidates,
 			generation,
-			selectedCandidateIds: [...run.selectedCandidates],
-			...(ranked[0] ? { selectedCandidateId: ranked[0].id } : {}),
-			decisionsSha256: evaluatorGenerationDecisionDigest(candidates, run.adversarialReviews ?? [], ranked[0]?.id),
-		}
+			adversarialReviews: run.adversarialReviews ?? [],
+		})
+		run.selectedCandidates = selection.selectedCandidates
+		if (selection.selected !== undefined) run.selected = selection.selected
 		const integrityRecord = run.evaluatorIntegrity!
 		const previousGeneration = integrityRecord.generations.find((entry) => entry.generation === generation)
-		if (previousGeneration && canonicalJson(previousGeneration) !== canonicalJson(generationSelection)) throw new Error(`evaluator selection changed for already sealed generation ${generation}`)
-		if (!previousGeneration) integrityRecord.generations.push(generationSelection)
+		const sealed = previousGeneration
+			&& canonicalJson(previousGeneration) !== canonicalJson(selection.selection)
+		if (sealed) {
+			const what = "evaluator selection changed for already sealed"
+				+ ` generation ${generation}`
+			throw new Error(what)
+		}
+		if (!previousGeneration) integrityRecord.generations.push(selection.selection)
 		if (run.selected) integrityRecord.selectedCandidateId = run.selected
 		else delete integrityRecord.selectedCandidateId
 		await verifyIntegrityArtifacts(fleetQueue, integrityRecord.outputs)
@@ -1302,7 +1236,9 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		await checkpointWithEvaluatorIntegrity()
 		if (campaignStore && campaignLease) {
 			await assertCampaignLease()
-			const selectedSlots = front.map((candidate) => proofCandidateSlot(candidate.generation, candidates.indexOf(candidate)))
+			const slotOf = (entry: CandidateRecord): string =>
+				proofCandidateSlot(entry.generation, candidates.indexOf(entry))
+			const selectedSlots = selection.front.map(slotOf)
 			await campaignStore.selectGeneration(campaignLease, generation, selectedSlots)
 		}
 		if (config.computePolicy === "adaptive-independent") {
@@ -1323,38 +1259,24 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 		await checkpointWithEvaluatorIntegrity()
 	}
 
-	const merged = combinedArchive(archive, run)
-	let curriculum = generateCurriculumProposals(merged, now())
-	if (fleetQueue && !config.dryRun && curriculum.length > 0) {
-		if (!evaluatorRuntime) throw new Error("fleet curriculum evaluation requires its frozen evaluator image and policy identity")
-		curriculum = await validateCurriculumOnFleet(curriculum, runConfig, run, fleetQueue, now, evaluatorRuntime)
-		run.curriculumTasks = curriculum
-		await checkpointWithEvaluatorIntegrity()
-	} else {
-		run.curriculumTasks = curriculum
-	}
-	if (!config.dryRun && curriculum.length > 0) {
-		await writeCurriculumProposals(curriculum, config.curriculumDir ?? `${config.archiveDir}/curriculum`)
-	}
-	if (!config.dryRun && trajectories.length > 0) {
-		await exportTrajectoryDatasets(trajectories, `${config.trajectoryDir ?? `${config.archiveDir}/trajectories`}/datasets`)
-	}
-	if (campaignStore && campaignLease) {
-		await assertCampaignLease()
-		await campaignStore.finishDevelopmentArm(campaignLease)
-		const snapshot = await campaignStore.snapshot(campaignLease.campaignId)
-		const engineeringOnly = run.proofCampaign?.manifest.phaseMode === "engineering-only"
-		run.proofCampaign = { ...run.proofCampaign!, state: engineeringOnly ? "finished" : "evaluated", ledgerSnapshot: snapshot }
-		if (engineeringOnly) {
-			run.finishedAt = now()
-			const reportPath = `${config.archiveDir}/${run.runId}.md`
-			await fs.mkdir(config.archiveDir, { recursive: true })
-			await fs.writeFile(reportPath, formatRunReport(run, config), "utf8")
-			run.reports = [...new Set([...run.reports, reportPath])]
-			await appendRun(config.archiveDir, run)
-			return run
-		}
-	}
+	const finishedEarly = await finalizeRunReporting({
+		run,
+		config,
+		runConfig,
+		archive,
+		trajectories,
+		fleetQueue: fleetQueue || undefined,
+		evaluatorRuntime,
+		campaign: campaignStore && campaignLease
+			? {
+				store: campaignStore, lease: campaignLease,
+				assertLease: assertCampaignLease,
+			}
+			: undefined,
+		now,
+		checkpoint: checkpointWithEvaluatorIntegrity,
+	})
+	if (finishedEarly) return run
 
 	run.finishedAt = now()
 	const report = formatRunReport(run, config)
