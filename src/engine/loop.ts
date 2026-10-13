@@ -170,7 +170,7 @@ import { writeHandoffSummary } from "./handoff.js"
 import type { EvidenceInput, EvidenceJournal } from "../evidence/types.js"
 import { canonicalJson, sha256 } from "../evidence/canonical.js"
 
-function combineAbortSignals(signals: readonly (AbortSignal | undefined)[]): { signal: AbortSignal; dispose: () => void } {
+export function combineAbortSignals(signals: readonly (AbortSignal | undefined)[]): { signal: AbortSignal; dispose: () => void } {
 	const controller = new AbortController()
 	const listeners: Array<{ signal: AbortSignal; listener: () => void }> = []
 	for (const signal of signals) {
@@ -205,7 +205,7 @@ export const DEFAULT_MAX_PAUSE_MS = 2 * 60 * 60 * 1000
 export const DEFAULT_PAUSE_POLL_INTERVAL_MS = 5_000
 
 /** Monitor observations cannot mutate nested tool arguments or share their references. */
-function immutableBoundaryArguments(args: Record<string, unknown>): Readonly<Record<string, unknown>> {
+export function immutableBoundaryArguments(args: Record<string, unknown>): Readonly<Record<string, unknown>> {
 	const copy = structuredClone(args)
 	const pending: unknown[] = [copy]
 	while (pending.length > 0) {
@@ -358,7 +358,7 @@ export const DEFAULT_MAX_TOKENS = 32_768
 const READ_ONLY_TOOL_NAMES = new Set(["list_files", "read_file", "search_files"])
 
 /** Direct-call read-only test shared by top-level calls and batch children. */
-function isReadOnlyDirectCall(call: { name: string; args: Record<string, unknown> }): boolean {
+export function isReadOnlyDirectCall(call: { name: string; args: Record<string, unknown> }): boolean {
 	return (
 		READ_ONLY_TOOL_NAMES.has(call.name) ||
 		(call.name === "execute_command" &&
@@ -376,7 +376,7 @@ function isReadOnlyDirectCall(call: { name: string; args: Record<string, unknown
  * commands). Empty, malformed, oversized, or nested batches — and batches mixing in
  * any productive child — count as productive so they reset the streak.
  */
-function isReadOnlyTurnCall(call: { name: string; args: Record<string, unknown> }): boolean {
+export function isReadOnlyTurnCall(call: { name: string; args: Record<string, unknown> }): boolean {
 	if (call.name !== "batch") {
 		return isReadOnlyDirectCall(call)
 	}
@@ -521,7 +521,7 @@ const DAEMON_EMPTY_REPLY_FALLBACK_TEXTS = [
  * DEFAULT_ARTIFACT_REJECTION_NUDGE_THRESHOLD's doc comment for the real
  * failure shape this addresses.
  */
-function artifactRejectionNudgeMessage(streak: number, relativePath: string): string {
+export function artifactRejectionNudgeMessage(streak: number, relativePath: string): string {
 	return (
 		`Your last ${streak} attempts to complete this task were rejected for the same reason, and each time you ` +
 		`edited '${relativePath}' without making any read_file call in between. Adding a citation-shaped string or a ` +
@@ -610,7 +610,7 @@ const CITATION_PATTERN = /\b[\w.-]+(?:\/[\w.-]+)+\.\w+:\d+(?:-\d+)?\b/g
  * all — a real, if partial, improvement: previously ANY citation-shaped
  * text counted, even a wholly invented file path.
  */
-async function countVerifiedCitations(content: string, workspaceRoot: string): Promise<number> {
+export async function countVerifiedCitations(content: string, workspaceRoot: string): Promise<number> {
 	const matches = content.match(CITATION_PATTERN) ?? []
 	let verified = 0
 	for (const citation of matches) {
@@ -646,7 +646,7 @@ async function countVerifiedCitations(content: string, workspaceRoot: string): P
  * (via CITATION_PATTERN) so the caller can also enforce
  * requireArtifactMinCitations without a second filesystem pass.
  */
-async function matchingArtifactFileStatus(
+export async function matchingArtifactFileStatus(
 	workspaceRoot: string,
 	pattern: string,
 ): Promise<{ found: boolean; citationCount: number; relativePath?: string; content?: string }> {
@@ -706,7 +706,7 @@ const execFileP = promisify(execFile)
  * guardrail's structural backstop — independent of whether the prompt
  * instruction alone is followed.
  */
-async function hasUncommittedTrackedChanges(
+export async function hasUncommittedTrackedChanges(
 	workspaceRoot: string,
 	sessionWrittenPaths: ReadonlySet<string>,
 ): Promise<boolean> {
@@ -6384,7 +6384,7 @@ function boundedExtensionJson(value: unknown): string {
 	return serialized
 }
 
-function sameToolNames(a: ChatTool[], b: ChatTool[]): boolean {
+export function sameToolNames(a: ChatTool[], b: ChatTool[]): boolean {
 	const names = (tools: ChatTool[]): string[] =>
 		tools
 			.filter((t) => t.type === "function")
@@ -6412,7 +6412,7 @@ function sameToolNames(a: ChatTool[], b: ChatTool[]): boolean {
  * REPLACES whole prefix entries), so reference equality per index is
  * authoritative and cheap — no deep compare needed.
  */
-function messagesPrefixEquals(live: ChatMessage[], snapshot: ChatMessage[]): boolean {
+export function messagesPrefixEquals(live: ChatMessage[], snapshot: ChatMessage[]): boolean {
 	if (live.length < snapshot.length) {
 		return false
 	}
@@ -6490,7 +6490,7 @@ export function truncateHistory(messages: ChatMessage[], windowSize: number): Ch
 	* the caller's flag/default wins). Mirrors the other env fallbacks in
 	* src/cli.ts (envNumber) — invalid values are ignored, not fatal.
 	*/
-function envMaxPauseMs(): number | undefined {
+export function envMaxPauseMs(): number | undefined {
 	const raw = process.env.HEADLESSCODE_MAX_PAUSE_MS
 	if (raw === undefined || raw === "") {
 		return undefined
@@ -6506,7 +6506,7 @@ function envMaxPauseMs(): number | undefined {
  * values fall back to the default — a 0 or negative threshold would inject
  * the nudge on the very first read, which is noise, not guidance.
  */
-function envReadOnlyNudgeThreshold(): number {
+export function envReadOnlyNudgeThreshold(): number {
 	const raw = process.env.HEADLESSCODE_READ_ONLY_NUDGE_THRESHOLD
 	if (raw === undefined || raw === "") {
 		return DEFAULT_READ_ONLY_NUDGE_THRESHOLD
@@ -6515,7 +6515,7 @@ function envReadOnlyNudgeThreshold(): number {
 	return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_READ_ONLY_NUDGE_THRESHOLD
 }
 
-function envReadOnlyStallLimit(): number {
+export function envReadOnlyStallLimit(): number {
 	const raw = process.env.HEADLESSCODE_READ_ONLY_STALL_LIMIT
 	if (raw === undefined || raw === "") {
 		return DEFAULT_READ_ONLY_STALL_LIMIT
@@ -6524,7 +6524,7 @@ function envReadOnlyStallLimit(): number {
 	return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_READ_ONLY_STALL_LIMIT
 }
 
-function envToolFailureNudgeThreshold(): number {
+export function envToolFailureNudgeThreshold(): number {
 	const raw = process.env.HEADLESSCODE_TOOL_FAILURE_NUDGE_THRESHOLD
 	if (raw === undefined || raw === "") {
 		return DEFAULT_TOOL_FAILURE_NUDGE_THRESHOLD
@@ -6533,7 +6533,7 @@ function envToolFailureNudgeThreshold(): number {
 	return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_TOOL_FAILURE_NUDGE_THRESHOLD
 }
 
-function envArtifactRejectionNudgeThreshold(): number {
+export function envArtifactRejectionNudgeThreshold(): number {
 	const raw = process.env.HEADLESSCODE_ARTIFACT_REJECTION_NUDGE_THRESHOLD
 	if (raw === undefined || raw === "") {
 		return DEFAULT_ARTIFACT_REJECTION_NUDGE_THRESHOLD
@@ -6542,7 +6542,7 @@ function envArtifactRejectionNudgeThreshold(): number {
 	return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_ARTIFACT_REJECTION_NUDGE_THRESHOLD
 }
 
-function envIdenticalCallRepeatPenaltyBoost(): number {
+export function envIdenticalCallRepeatPenaltyBoost(): number {
 	const raw = process.env.HEADLESSCODE_IDENTICAL_CALL_REPEAT_PENALTY_BOOST
 	if (raw === undefined || raw === "") {
 		return DEFAULT_IDENTICAL_CALL_REPEAT_PENALTY_BOOST
@@ -6557,7 +6557,7 @@ function envIdenticalCallRepeatPenaltyBoost(): number {
  * — including unset — means OFF). Default OFF deliberately: the blocking
  * request path (which the e2e fixtures and most tests assume) is unchanged.
  */
-function envStreaming(): boolean {
+export function envStreaming(): boolean {
 	const raw = process.env.HEADLESSCODE_STREAM
 	if (raw === undefined || raw === "") {
 		return false
