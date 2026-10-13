@@ -420,6 +420,17 @@ async function testReadlineCtrlCInPseudoTerminal(): Promise<void> {
 		console.warn("terminal chat PTY test skipped: util-linux script command is unavailable")
 		return
 	}
+	const ptyProbe = spawnSync("script", ["-qfec", "true", "/dev/null"], {
+		encoding: "utf8",
+	})
+	const ptyDenied = ptyProbe.status !== 0
+		&& /pseudo-terminal|Permission denied/i.test(
+			`${ptyProbe.stderr ?? ""}${ptyProbe.stdout ?? ""}`,
+		)
+	if (ptyDenied) {
+		console.warn("terminal chat PTY test skipped: no pseudo-terminal in sandbox")
+		return
+	}
 	const program = `import { TerminalInput } from "./src/terminal/input.ts"; const input = new TerminalInput({ input: process.stdin, output: process.stdout, terminal: true }); console.log("PTY_READY"); input.readLine("> ").then((result) => { console.log("PTY_RESULT:" + result.kind); input.close(); });`
 	const quotedProgram = `'${program.replace(/'/g, "'\\''")}'`
 	const child = spawn("script", ["-qfec", `${process.execPath} --import tsx --input-type=module -e ${quotedProgram}`, "/dev/null"], {
