@@ -62,7 +62,14 @@ import {
 	type OrchestratorGroup,
 	type OrchestratorState,
 } from "./state.js"
-import { DEFAULT_POLL_INTERVAL_MS, DEFAULT_STALL_TIMEOUT_MS, groupWorktreePath } from "./watch.js"
+import {
+	DEFAULT_POLL_INTERVAL_MS,
+	DEFAULT_STALL_TIMEOUT_MS,
+	groupWorktreePath,
+	hasExitMarker,
+	workerLiveness,
+	type WorkerLiveness,
+} from "./watch.js"
 
 /**
  * The statuses that end a round for a group. `blocked` is NOT here on
@@ -378,6 +385,10 @@ export interface ReconcileHooks {
 	hasDoneMarker?: (worktreePath: string) => boolean
 	/** `.harness.exit` reader (default: parse <wt>/.harness.exit, undefined when absent/invalid). */
 	readExitCode?: (worktreePath: string) => number | undefined
+	/** `.harness.exit` presence check (default: hasExitMarker from watch.js). */
+	hasExitMarker?: (worktreePath: string) => boolean
+	/** Worker liveness (default: workerLiveness from watch.js). */
+	workerLiveness?: (worktreePath: string) => WorkerLiveness
 }
 
 export interface ReconcileResult {
@@ -411,52 +422,100 @@ export function reconcileGroups(state: OrchestratorState, repo: string, hooks: R
 	const readExitCode = hooks.readExitCode ?? ((p: string): number | undefined => {
 		try {
 			const raw = fs.readFileSync(path.join(p, ".harness.exit"), "utf-8").trim()
+			// Number("") is 0 — an empty file must read as missing, not success.
+			if (raw === "") {
+				return undefined
+			}
 			const code = Number(raw)
 			return Number.isFinite(code) ? code : undefined
 		} catch {
 			return undefined
 		}
 	})
+	const exitPresent = hooks.hasExitMarker ?? hasExitMarker
+	const livenessOf = hooks.workerLiveness ?? workerLiveness
 
 	let current = state
 	const reconciled: string[] = []
 	for (const group of state.groups) {
-		if (isTerminalStatus(group.status)) {
-			continue
-		}
-		const wtPath = groupWorktreePath(repo, group)
-		if (hasDoneMarker(wtPath)) {
-			// Ground truth exists: the worker finished. Mirror watch.ts's
-			// mapping (exit 0 → done, anything else/unknown → failed).
-			const exitCode = readExitCode(wtPath)
-			const status = exitCode === 0 ? "done" : "failed"
-			current = updateGroup(current, group.name, {
-				status,
-				...(exitCode !== undefined ? { exit_code: exitCode } : {}),
-				last_activity: {
-					note:
-						exitCode === 0
-							? "reconciled from .harness markers: worker completed cleanly (exit 0)"
-							: `reconciled from .harness markers: worker exited ${exitCode ?? "with unknown code"}`,
-				},
-			})
-			reconciled.push(group.name)
-		} else if (!worktreeExists(wtPath)) {
-			// Worktree entirely gone, never reached a terminal status: the
-			// outcome is genuinely unknowable from markers — surface it as
-			// "orphaned" for a human instead of silently guessing done.
-			current = updateGroup(current, group.name, {
-				status: "orphaned",
-				last_activity: {
-					note: "orphaned: worktree removed before a terminal status — investigate via git history",
-				},
-			})
+		const patch = reconcileOneGroup(group, repo, {
+			worktreeExists, hasDoneMarker, readExitCode, exitPresent, livenessOf,
+		})
+		if (patch) {
+			current = updateGroup(current, group.name, patch)
 			reconciled.push(group.name)
 		}
-		// else: worktree still present, no .harness.done → still in progress;
-		// absence of evidence is not evidence of absence — leave as-is.
 	}
 	return { state: current, reconciled }
+}
+
+interface ReconcileProbes {
+	worktreeExists: (p: string) => boolean
+	hasDoneMarker: (p: string) => boolean
+	readExitCode: (p: string) => number | undefined
+	exitPresent: (p: string) => boolean
+	livenessOf: (p: string) => WorkerLiveness
+}
+
+function doneMarkerPatch(
+	probes: ReconcileProbes,
+	wtPath: string,
+): Partial<OrchestratorGroup> {
+	// Ground truth exists: the worker finished. Mirror watch.ts's
+	// mapping (exit 0 → done, anything else/unknown → failed).
+	const exitCode = probes.readExitCode(wtPath)
+	const status = exitCode === 0 ? "done" : "failed"
+	return {
+		status,
+		...(exitCode !== undefined ? { exit_code: exitCode } : {}),
+		last_activity: {
+			note: exitCode === 0
+				? "reconciled: worker completed cleanly (exit 0)"
+				: `reconciled: worker exited ${exitCode ?? "with unknown code"}`,
+		},
+	}
+}
+
+function orphanedPatch(): Partial<OrchestratorGroup> {
+	// Worktree gone with no terminal status: unknowable from markers.
+	return {
+		status: "orphaned",
+		last_activity: {
+			note: "orphaned: worktree removed — investigate via git history",
+		},
+	}
+}
+
+function killedPatch(
+	probes: ReconcileProbes,
+	wtPath: string,
+): Partial<OrchestratorGroup> {
+	const exitCode = probes.readExitCode(wtPath)
+	const detail = exitCode ?? "unparseable"
+	return {
+		status: "failed",
+		...(exitCode !== undefined ? { exit_code: exitCode } : {}),
+		last_activity: {
+			note: `reconciled: worker dead with exit ${detail}, no .done marker`,
+		},
+	}
+}
+
+function reconcileOneGroup(
+	group: OrchestratorGroup,
+	repo: string,
+	probes: ReconcileProbes,
+): Partial<OrchestratorGroup> | undefined {
+	if (isTerminalStatus(group.status)) return undefined
+	const wtPath = groupWorktreePath(repo, group)
+	if (probes.hasDoneMarker(wtPath)) return doneMarkerPatch(probes, wtPath)
+	if (!probes.worktreeExists(wtPath)) return orphanedPatch()
+	// Issue #132: dead worker + exit file but no .done marker → fail
+	// promptly instead of waiting out the 120m stall guard.
+	if (probes.exitPresent(wtPath) && probes.livenessOf(wtPath) === "dead") {
+		return killedPatch(probes, wtPath)
+	}
+	return undefined
 }
 
 // ─── Blocking wait ───────────────────────────────────────────────────────────

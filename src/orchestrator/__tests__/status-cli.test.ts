@@ -7,6 +7,7 @@
  */
 
 import assert from "node:assert/strict"
+import { spawnSync } from "node:child_process"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
@@ -488,6 +489,41 @@ async function makeWorktree(repo: string, name: string, exitCode?: number): Prom
 	await fs.mkdir(path.join(wt, ".harness.done"), { recursive: true })
 }
 
+/**
+ * Issue #132: a worker killed mid-run (OOM/ENOSPC/pkill) writes .harness.exit
+ * but never .harness.done. The worktree holds the exit marker WITHOUT the
+ * done dir; liveness comes from a dead pid file unless the test injects it.
+ */
+async function makeKilledWorktree(
+	repo: string,
+	name: string,
+	exitContent: string,
+): Promise<void> {
+	const wt = path.join(repo, ".worktrees", name)
+	await fs.mkdir(wt, { recursive: true })
+	await fs.writeFile(path.join(wt, ".harness.exit"), exitContent, "utf8")
+}
+
+/** A pid guaranteed dead at read time: a trivial child that already exited. */
+async function writeDeadPidFile(repo: string, name: string): Promise<void> {
+	const dead = spawnSync(process.execPath, ["-e", "process.exit(0)"])
+	if (!dead.pid) {
+		throw new Error("expected the trivial child to report a pid")
+	}
+	const wt = path.join(repo, ".worktrees", name)
+	await fs.writeFile(path.join(wt, ".harness.pid"), String(dead.pid), "utf8")
+}
+
+/** Running w1 + killed worktree; returns statePath. */
+async function setupKilledState(repo: string, exit = "3"): Promise<string> {
+	const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
+	const running = baseGroup({ status: "running" })
+	saveStateSync(statePath, updateGroup(defaultState("r1"), "w1", running))
+	await makeKilledWorktree(repo, "w1", exit)
+	await writeDeadPidFile(repo, "w1")
+	return statePath
+}
+
 async function testOneShotReconcilesDoneFromMarkersAndPersists(): Promise<void> {
 	const repo = await tmpRepo()
 	try {
@@ -795,6 +831,151 @@ async function testWaitMidWaitReconcileWithLiveWatcherDoesNotPersist(): Promise<
 	}
 }
 
+/**
+ * Issue #132: dead PID + exit 3, no .done → failed with exit_code 3,
+ * persisted to disk (one-shot statusMain uses the real workerLiveness).
+ */
+async function testOneShotFailsKilledWorkerWithExitCode(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const statePath = path.join(repo, ".worktrees", ".orchestrator-state.json")
+		saveStateSync(statePath, updateGroup(defaultState("r1"), "w1", baseGroup({ status: "running" })))
+		await makeKilledWorktree(repo, "w1", "3")
+		await writeDeadPidFile(repo, "w1")
+
+		const cap = capture()
+		const code = await statusMain(["--repo", repo], cap.io)
+
+		assert.equal(code, 1, "reconciled to failed -> exit 1")
+		const onDisk = loadStateSync(statePath)
+		assert.equal(onDisk.groups[0].status, "failed", "killed → failed")
+		assert.equal(onDisk.groups[0].exit_code, 3, "numeric exit code recorded")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+/**
+ * Issue #132 regression for the Number("") === 0 bug: an EMPTY .harness.exit
+ * (the observed w3 case) reconciles to failed with NO exit_code.
+ */
+async function testEmptyExitReconcilesFailed(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const statePath = await setupKilledState(repo, "")
+		const result = reconcileGroups(loadStateSync(statePath), repo)
+		assert.deepEqual(result.reconciled, ["w1"])
+		const group = result.state.groups[0]
+		assert.equal(group.status, "failed", "empty exit → failed")
+		assert.equal(group.exit_code, undefined, "no code recorded")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function testEmptyExitCliFails(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const statePath = await setupKilledState(repo, "")
+		const cap = capture()
+		const code = await statusMain(["--repo", repo], cap.io)
+		assert.equal(code, 1, "reconciled to failed -> exit 1")
+		const onDisk = loadStateSync(statePath)
+		assert.equal(onDisk.groups[0].status, "failed")
+		assert.equal(onDisk.groups[0].exit_code, undefined)
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+/**
+ * Issue #132: a LIVE pid keeps the group running even with an exit
+ * file present — no false positives on pid reuse.
+ */
+async function testLiveWorkerLeftAlone(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const statePath = await setupKilledState(repo)
+		// This test process's own pid is guaranteed alive here.
+		const wt = path.join(repo, ".worktrees", "w1")
+		const pidText = String(process.pid)
+		await fs.writeFile(path.join(wt, ".harness.pid"), pidText, "utf8")
+
+		const cap = capture()
+		const code = await statusMain(["--repo", repo], cap.io)
+		assert.equal(code, 0, "running-only state -> exit 0")
+		const onDisk = loadStateSync(statePath)
+		assert.equal(onDisk.groups[0].status, "running")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+/**
+ * Issue #132: no pid files (liveness "unknown") + exit present → left
+ * running. "Unknown" groups stay on the stall-guard path by design.
+ */
+async function testUnknownLeftAlone(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const statePath = await setupKilledState(repo)
+		const wt = path.join(repo, ".worktrees", "w1")
+		await fs.rm(path.join(wt, ".harness.pid"), { force: true })
+		const result = reconcileGroups(loadStateSync(statePath), repo)
+		assert.deepEqual(result.reconciled, [])
+		assert.equal(result.state.groups[0].status, "running")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+async function runWaitJson(repo: string): Promise<{
+	code: number
+	elapsed: number
+	out: string
+}> {
+	const t0 = Date.now()
+	const cap = capture()
+	const args = ["--repo", repo, "--wait", "--json"]
+	const flags = [...args, "--timeout-ms", "5000", "--poll-interval-ms", "50"]
+	const code = await statusMain(flags, cap.io)
+	return { code, elapsed: Date.now() - t0, out: cap.out.join("") }
+}
+
+/** Issue #132: --wait on a killed group returns promptly as failed. */
+async function testWaitFailsKilledPromptly(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		const statePath = await setupKilledState(repo)
+		const waited = await runWaitJson(repo)
+		assert.equal(waited.code, 1, "reconciled to failed -> exit 1")
+		assert.ok(waited.elapsed < 2000, `prompt, not timeout (${waited.elapsed}ms)`)
+		const onDisk = loadStateSync(statePath)
+		assert.equal(onDisk.groups[0].status, "failed")
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
+/** Issue #132: --wait reports the reconciled group without timing out. */
+async function testWaitReportsReconciled(): Promise<void> {
+	const repo = await tmpRepo()
+	try {
+		await setupKilledState(repo)
+		const waited = await runWaitJson(repo)
+		const parsed = JSON.parse(waited.out) as OrchestratorState & {
+			allDone: boolean
+			timedOut: boolean
+			reconciled?: string[]
+		}
+		assert.equal(parsed.allDone, false)
+		assert.equal(parsed.timedOut, false)
+		assert.deepEqual(parsed.reconciled, ["w1"])
+	} finally {
+		await fs.rm(repo, { recursive: true, force: true })
+	}
+}
+
 async function testWaitTreatsOrphanedAsTerminal(): Promise<void> {
 	const repo = await tmpRepo()
 	try {
@@ -847,6 +1028,13 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["wait persists a mid-wait reconcile with no watcher (issue #116 rework)", testWaitPersistsMidWaitReconcileWithNoWatcher],
 	["wait never persists mid-wait reconcile with a live watcher (issue #116 rework 2)", testWaitMidWaitReconcileWithLiveWatcherDoesNotPersist],
 	["wait treats orphaned as terminal and returns promptly", testWaitTreatsOrphanedAsTerminal],
+	["one-shot fails a killed worker", testOneShotFailsKilledWorkerWithExitCode],
+	["empty exit reconciles failed without code", testEmptyExitReconcilesFailed],
+	["empty exit CLI fails", testEmptyExitCliFails],
+	["live worker left alone", testLiveWorkerLeftAlone],
+	["unknown liveness left alone", testUnknownLeftAlone],
+	["wait fails killed group promptly", testWaitFailsKilledPromptly],
+	["wait reports the reconciled group", testWaitReportsReconciled],
 ]
 
 async function main(): Promise<void> {

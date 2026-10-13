@@ -618,6 +618,71 @@ async function testStallGuardResolvesToFailedWhenPidIsDead(): Promise<void> {
 	}
 }
 
+/** Worktree dir + exit marker with content "3"; caller adds pid/log. */
+async function writeExitMarker(wtPath: string): Promise<void> {
+	await fs.mkdir(wtPath, { recursive: true })
+	const exitFile = path.join(wtPath, ".harness.exit")
+	await fs.writeFile(exitFile, "3", "utf-8")
+}
+
+/** Pid of a trivial child that already exited (guaranteed dead). */
+function deadPid(): number {
+	const dead = spawnSync(process.execPath, ["-e", "process.exit(0)"])
+	assert.ok(dead.pid, "trivial child reports a pid")
+	return dead.pid
+}
+
+/** Write a .harness.pid file under the worktree dir. */
+async function writePidFile(wtPath: string, pid: number): Promise<void> {
+	const pidFile = path.join(wtPath, ".harness.pid")
+	await fs.writeFile(pidFile, String(pid), "utf-8")
+}
+
+/**
+ * Issue #132: a worker killed mid-run — dead pid + .harness.exit present,
+ * spawned SECONDS ago (far under the stall timeout), no .harness.done —
+ * must fail promptly with summary/usage, not wait out the 2h stall guard.
+ */
+async function testInspectGroupFailsKilledWorkerPromptly(): Promise<void> {
+	const repoRoot = await tmpRepo()
+	try {
+		const wtPath = path.join(repoRoot, ".worktrees", "w1")
+		await writeExitMarker(wtPath)
+		const logFile = path.join(wtPath, "harness.log")
+		await fs.writeFile(logFile, "line one\nline two\n", "utf-8")
+		await writePidFile(wtPath, deadPid())
+		const group = baseGroup({ spawned: new Date().toISOString() })
+		const patch = inspectGroup(repoRoot, group, Date.now(), DEFAULT_STALL_TIMEOUT_MS)
+		assert.ok(patch, "dead + exit resolves now")
+		assert.equal(patch?.status, "failed", "killed → failed")
+		assert.equal(patch?.exit_code, 3, "numeric exit code recorded")
+		assert.ok(patch?.summary?.includes("line two"), "summary captured")
+		assert.equal(patch?.stalled, undefined, "fast-fail is not a stall")
+	} finally {
+		await fs.rm(repoRoot, { recursive: true, force: true })
+	}
+}
+
+/**
+ * Issue #132: an alive worker with an exit file but no .done marker
+ * (pid reuse / transient state) must produce no patch.
+ */
+async function testInspectGroupLeavesLiveWorkerAlone(): Promise<void> {
+	const repoRoot = await tmpRepo()
+	try {
+		const wtPath = path.join(repoRoot, ".worktrees", "w1")
+		await writeExitMarker(wtPath)
+		await writePidFile(wtPath, process.pid)
+
+		const group = baseGroup({ spawned: new Date().toISOString() })
+		const patch = inspectGroup(repoRoot, group, Date.now(), DEFAULT_STALL_TIMEOUT_MS)
+
+		assert.equal(patch, undefined, "live worker not failed")
+	} finally {
+		await fs.rm(repoRoot, { recursive: true, force: true })
+	}
+}
+
 /**
  * 2026-08-02 incident regression, the actual busy-loop cause: a group past
  * the stall timeout whose worker IS still genuinely alive must report the
@@ -946,6 +1011,8 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["inspectGroup: blocked group is exempt from the stall guard", testBlockedGroupIsExemptFromStallGuard],
 	["inspectGroup: stalled + confirmed-dead pid resolves to failed", testStallGuardResolvesToFailedWhenPidIsDead],
 	["inspectGroup: stalled + still-alive pid reports once, then stops (busy-loop regression)", testStallGuardReportsOnceThenStopsWhileStillAlive],
+	["killed fails promptly", testInspectGroupFailsKilledWorkerPromptly],
+	["live + exit left alone", testInspectGroupLeavesLiveWorkerAlone],
 	["watchGroups: blocked -> running -> done end-to-end transition", testWatchGroupsBlockedThenUnblockedFlow],
 	["watchGroups: BLOCKED line printed once on the transition into blocked", testWatchGroupsPrintsBlockedTransitionToStderr],
 	["watchGroups: BLOCKED line not repeated while the group stays blocked", testWatchGroupsDoesNotRepeatBlockedLineWhileStillBlocked],
