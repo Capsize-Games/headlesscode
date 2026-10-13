@@ -64,6 +64,17 @@ async function waitForMarker(marker: string): Promise<void> {
 	throw new Error(`worker marker did not appear: ${marker}`)
 }
 
+/** Process-group id of pid via ps(1); null when ps itself is missing. */
+function processGroupOf(pid: number): string | null {
+	try {
+		const args = ["-o", "pgid=", "-p", String(pid)]
+		return execFileSync("ps", args, { encoding: "utf8" }).trim()
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null
+		throw error
+	}
+}
+
 function launch(workspace: string, bin: string, argsFile: string, extraEnv: NodeJS.ProcessEnv = {}, task = "task.md"): { status: number | null; stdout: string; stderr: string } {
 	const result = spawnSync("bash", [path.join(repoRoot, "scripts", "run-worker.sh"), workspace, task, "--executor", "muse", "--muse-model", "meta/test-model", "--max-iterations", "7"], {
 		cwd: repoRoot,
@@ -347,9 +358,17 @@ async function testMuseProcessStaysInRecordedKillableWorkerGroup(): Promise<void
 		await waitForMarker(pidFile)
 		workerGroup = await fs.readFile(path.join(fake.workspace, ".harness.pgid"), "utf8")
 		const musePid = Number(await fs.readFile(pidFile, "utf8"))
-		const museGroup = execFileSync("ps", ["-o", "pgid=", "-p", String(musePid)], { encoding: "utf8" }).trim()
+		const museGroup = processGroupOf(musePid)
 		assert.equal(workerGroup, wrapperPid, "setsid wrapper writes its process-group id")
-		assert.equal(museGroup, workerGroup, "Muse runs in the same process group the stop command signals")
+		if (museGroup === null) {
+			// Probe: ps(1) is unavailable (minimal evaluator image without
+			// procps), so pgid equality cannot be read directly. Membership
+			// is still proven behaviorally below: SIGTERM to -workerGroup
+			// must stop the Muse process.
+			process.stdout.write("  skip muse pgid equality: ps(1) unavailable\n")
+		} else {
+			assert.equal(museGroup, workerGroup, "Muse runs in the same process group the stop command signals")
+		}
 		process.kill(-Number(workerGroup), "SIGTERM")
 		await sleep(100)
 		assert.throws(() => process.kill(musePid, 0), "Muse process exits when its worker process group is stopped")
