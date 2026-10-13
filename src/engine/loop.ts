@@ -3194,27 +3194,23 @@ export class HeadlessSession {
 			// available" — would otherwise silently drop the entire handoff for
 			// that continuation cycle. Mirrors fetchModelContextWindow's own
 			// once-per-session retry-with-backoff (src/llm/openrouter.ts).
-			let summary: string
-			try {
-				summary = await condenseOldestTurns(this.llmClient, {
+			const runCondense = (): Promise<string> =>
+				condenseOldestTurns(this.llmClient, {
 					messages: toSummarize,
 					count,
 					model: config.condenseModel,
 					maxTokens: config.condenseMaxTokens,
 					onUsage: (usage) => this.recordHandoffCondensationUsage(usage, budgetTracker),
 				})
+			let summary: string
+			try {
+				summary = await runCondense()
 			} catch (firstError) {
 				this.logger.warn("[handoff] condensation call failed, retrying once after a short backoff", {
 					error: firstError instanceof Error ? firstError.message : String(firstError),
 				})
 				await sleep(250) // matches fetchModelContextWindow's own once-per-session backoff
-				summary = await condenseOldestTurns(this.llmClient, {
-					messages: toSummarize,
-					count,
-					model: config.condenseModel,
-					maxTokens: config.condenseMaxTokens,
-					onUsage: (usage) => this.recordHandoffCondensationUsage(usage, budgetTracker),
-				})
+				summary = await runCondense()
 			}
 			const header =
 				`# Handoff summary — written when the previous session hit the iteration cap\n\n` +
