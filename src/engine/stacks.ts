@@ -30,6 +30,7 @@ import * as fsp from "node:fs/promises"
 import * as path from "node:path"
 import { promisify } from "node:util"
 
+import { FALLBACK_EXCLUDES } from "../codesearch/files.js"
 import { projectStoreRoot } from "../project-store.js"
 import * as yaml from "yaml"
 
@@ -98,37 +99,6 @@ const PYTHON_DEP_STACK_PATTERNS: Array<[StackName, RegExp]> = [
 const TS_EXTENSIONS = new Set([".ts", ".tsx"])
 const PY_EXTENSIONS = new Set([".py"])
 const CPP_EXTENSIONS = new Set([".cpp", ".hpp", ".cc", ".hh"])
-
-/** Directories skipped by the non-git fallback walk (mirrors codesearch/files.ts). */
-const FALLBACK_EXCLUDES = new Set([
-	".git",
-	".gitignore",
-	".headlesscode",
-	".worktrees",
-	".roo",
-	"node_modules",
-	"dist",
-	"build",
-	"out",
-	"coverage",
-	".next",
-	".nuxt",
-	"vendor",
-	"target",
-	"__pycache__",
-	"venv",
-	".venv",
-	"env",
-	"Pods",
-	".idea",
-	".vscode",
-	".parcel-cache",
-	".pytest_cache",
-	".terraform",
-	".terragrunt-cache",
-	"bin",
-	"obj",
-])
 
 async function readFileSafe(filePath: string): Promise<string | null> {
 	try {

@@ -69,7 +69,7 @@ function isAlwaysExcluded(rel: string): boolean {
 }
 
 /** Minimal fallback excludes used when the workspace is NOT a git repo. */
-const FALLBACK_EXCLUDES = new Set([
+export const FALLBACK_EXCLUDES = new Set([
 	".git",
 	".gitignore",
 	".headlesscode",
