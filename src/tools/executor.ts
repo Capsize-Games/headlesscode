@@ -1899,7 +1899,7 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext, 
 				const combined = [stdout, stderr].filter(Boolean).join("\n")
 				// Log debug information
 				if (process.env.HEADLESSCODE_DEBUG) {
-					console.error(`[execute_command debug] Command: ${command}, Code: ${code}, Signal: ${signal}, stdout: ${stdout.slice(0, 200)}, stderr: ${stderr.slice(0, 200)}`)
+					process.stderr.write(`[execute_command debug] Command: ${command}, Code: ${code}, Signal: ${signal}, stdout: ${stdout.slice(0, 200)}, stderr: ${stderr.slice(0, 200)}\n`)
 				}
 				// 2026-08-27: the SAME bash-spawn-ENOENT failure this file already
 				// retries on (see isBashSpawnEnoent / the `error` handler above)
