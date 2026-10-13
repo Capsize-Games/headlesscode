@@ -19,7 +19,7 @@ import {
 	MAX_GROUPS,
 	ISSUE_SIZE_WARN_THRESHOLD,
 } from "../split.js"
-import type { SplitIssue } from "../split.js"
+import type { SplitIssue, WorktreeSpec } from "../split.js"
 
 function issue(number: number, title: string, body?: string): SplitIssue {
 	return { number, title, body }
@@ -167,7 +167,31 @@ async function testDeterministicRegardlessOfInputOrder(): Promise<void> {
 	const b = [a[3], a[1], a[0], a[2]]
 	const specsA = splitIssues(a)
 	const specsB = splitIssues(b)
-	assert.deepEqual(specsA, specsB, "split output must be order-independent")
+	// Grouping (names, numbers, files) is order-independent; `entries`
+	// records input positions by design (#144), so compare without it.
+	const grouping = (specs: WorktreeSpec[]) =>
+		specs.map(({ entries: _entries, ...rest }) => rest)
+	assert.deepEqual(
+		grouping(specsA),
+		grouping(specsB),
+		"split output must be order-independent",
+	)
+}
+
+async function testSameNumberEntriesKeepDistinctPositions(): Promise<void> {
+	const entries = [
+		issue(127, "Quality: engine loop.ts slim-down", "loop slice body"),
+		issue(127, "Quality: orchestrator CLI slim-down", "cli slice body"),
+	]
+	const specs = splitIssues(entries)
+	const all = specs.flatMap((s) => s.entries ?? [])
+	assert.deepEqual([...all].sort((a, b) => a - b), [0, 1])
+	for (const spec of specs) {
+		assert.equal(spec.entries?.length, spec.issues.length)
+		spec.entries?.forEach((e, i) => {
+			assert.equal(entries[e].number, spec.issues[i])
+		})
+	}
 }
 
 // ─── shapeOf / issueShape (the cost-estimation taxonomy, issue #16) ─────────
@@ -244,6 +268,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["never more than 4 groups, all issues preserved", testNeverMoreThanMaxGroups],
 	["task-file naming convention", testNamesAndTaskFileConvention],
 	["deterministic regardless of input order", testDeterministicRegardlessOfInputOrder],
+	[
+		"same-number entries keep distinct positions (#144)",
+		testSameNumberEntriesKeepDistinctPositions,
+	],
 	["shapeOf matches mechanical shapes from the title", testShapeOfMatchesMechanicalShapesFromTitle],
 	["issueShape marks hot-path issues hot (title or body, beats mechanical shape)", testIssueShapeHotWinsOverMechanicalShape],
 	["topLevelSectionCount counts numbered/bulleted/ordinal-heading sections only (issue #53)", testTopLevelSectionCount],

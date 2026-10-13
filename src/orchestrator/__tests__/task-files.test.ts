@@ -30,6 +30,22 @@ import {
 	writeTaskFiles as cliWriteTaskFiles,
 } from "../cli.js"
 
+function renderSameNumberPair(): [string, string] {
+	const slices = [
+		{ number: 127, title: "loop slice", body: "LOOP-BODY" },
+		{ number: 127, title: "cli slice", body: "CLI-BODY" },
+	]
+	const first = buildTaskFileContent(
+		{ name: "w9", issues: [127], entries: [0], taskFile: "w9.md" },
+		slices,
+	)
+	const second = buildTaskFileContent(
+		{ name: "w10", issues: [127], entries: [1], taskFile: "w10.md" },
+		slices,
+	)
+	return [first, second]
+}
+
 async function testBuildTaskFileContentInlineBodies(): Promise<void> {
 	const content = buildTaskFileContent(
 		{ name: "w1", issues: [27], taskFile: "w1.md" },
@@ -38,6 +54,11 @@ async function testBuildTaskFileContentInlineBodies(): Promise<void> {
 	assert.match(content, /### Issue #27: Fix it/)
 	assert.match(content, /the body/)
 	assert.match(content, /Scope: #27 only\./)
+	const [first, second] = renderSameNumberPair()
+	assert.match(first, /LOOP-BODY/)
+	assert.doesNotMatch(first, /CLI-BODY/)
+	assert.match(second, /CLI-BODY/)
+	assert.doesNotMatch(second, /LOOP-BODY/)
 }
 
 async function testBuildTaskFileContentFallback(): Promise<void> {
@@ -56,6 +77,17 @@ async function testReworkEmbedsFindings(): Promise<void> {
 	const content = buildReworkTaskFileContent(group, ["finding A"], 1)
 	assert.match(content, /finding A/)
 	assert.match(content, /rework cycle 1/)
+	const sliced = buildReworkTaskFileContent(
+		{
+			name: "w10",
+			issues: [127],
+			entries: [1],
+			issueBodies: { "1": { title: "cli slice", body: "CLI-BODY" } },
+		},
+		["finding"],
+		1,
+	)
+	assert.match(sliced, /CLI-BODY/)
 }
 
 async function testQaReworkAndContinuation(): Promise<void> {
