@@ -4,7 +4,11 @@ import type { ComputePolicy, MutationHypothesis, MutationKind, ParentSelectionPo
 import { DEFAULT_DEVELOPMENT_PROOF_RULE } from "./development-proof.js"
 
 export const DEFAULT_RSI_MODEL = "wxrq-qwen3.5-9b:latest"
-export const DEFAULT_VISIBLE_EVALS = ["npm test -- --filter rsi"]
+// Fleet eval snapshots always omit src/rsi/ (alwaysOmit in openshell.ts — the
+// supervisor/evaluator tree is withheld from guests), so a visible eval
+// targeting rsi tests matches zero files and fails every baseline. Target
+// the engine suite instead (same choice as PROOF_VISIBLE_EVAL_COMMANDS).
+export const DEFAULT_VISIBLE_EVALS = ["npm test -- --filter engine"]
 export const DEFAULT_PROTECTED_PATHS = [
 	...DEFAULT_PROTECTED_FILES,
 	"src/rsi/",
