@@ -342,24 +342,33 @@ export function runOpenShellCommandAsync(args: string[], timeoutMs?: number, exe
 			if (firstFailure !== undefined) throw firstFailure
 			throw new Error("OpenShell launcher process group remains after bounded SIGKILL teardown")
 		}
+		const settleTimeoutResult = (
+			code: number | null,
+			reported: NodeJS.Signals | null,
+		) => {
+			settleResult(code && code !== 0 ? code : 1, reported ?? "SIGTERM")
+		}
+		const settleAfterTermination = () => {
+			if (aborted) {
+				settleFailure(
+					signal?.reason ?? new Error("OpenShell command aborted"),
+				)
+				return
+			}
+			// Timeout teardown begins with SIGTERM, so a timeout result
+			// reports harness-initiated SIGTERM even when the close
+			// event arrives as a bare 1/null exit (sandbox race).
+			if (timedOut) settleTimeoutResult(child.exitCode, child.signalCode)
+			else settleResult(child.exitCode, child.signalCode)
+		}
 		const startTermination = () => {
 			if (!child.pid || terminationPromise || finished) return
 			const deadline = Date.now() + terminationBoundMs
-		terminationPromise = terminateOwnedProcesses(deadline)
-		void terminationPromise.then(
-			() => {
-				if (aborted) { settleFailure(signal?.reason ?? new Error("OpenShell command aborted")); return }
-				// Timeout teardown always begins with SIGTERM, so a timeout
-				// result deterministically reports the harness-initiated
-				// SIGTERM: the close event can otherwise arrive as a bare
-				// 1/null exit when the kill lands after the child already
-				// started exiting (sandbox-scheduling race), which would
-				// omit signal=SIGTERM from the diagnostics.
-				if (timedOut) settleResult(child.exitCode && child.exitCode !== 0 ? child.exitCode : 1, child.signalCode ?? "SIGTERM")
-				else settleResult(child.exitCode, child.signalCode)
-			},
-			(error: unknown) => { terminationFailure = error; settleFailure(error) },
-		)
+			terminationPromise = terminateOwnedProcesses(deadline)
+			void terminationPromise.then(settleAfterTermination, (error: unknown) => {
+				terminationFailure = error
+				settleFailure(error)
+			})
 			finalizationTimer = setTimeout(() => {
 				settleFailure(terminationFailure ?? new Error("OpenShell process teardown did not finalize before its bounded deadline"))
 			}, terminationBoundMs + 250)
@@ -391,7 +400,7 @@ export function runOpenShellCommandAsync(args: string[], timeoutMs?: number, exe
 				// Same normalization as the startTermination path: the
 				// close event's own code/signal races the SIGTERM teardown,
 				// so a timeout result reports harness-initiated SIGTERM.
-				else if (timedOut) settleResult(code && code !== 0 ? code : 1, childSignal ?? "SIGTERM")
+				else if (timedOut) settleTimeoutResult(code, childSignal)
 				else settleResult(code, childSignal)
 			}, settleFailure)
 				return

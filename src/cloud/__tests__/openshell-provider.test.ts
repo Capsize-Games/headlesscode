@@ -286,9 +286,14 @@ async function testHostAbortEscalatesItsLauncherGroupAndRemovesGrandchild(): Pro
 		// still stopped that exact process. Either outcome is terminal — only a
 		// live state fails — so both branches use the same identity-checked
 		// terminal assertion instead of demanding ESRCH.
-		assertLinuxProcessTerminal(grandchildPid, groupSignalDenied
-			? "contained fallback stopped the original descendant; a zombie is not claimed reaped"
-			: "primary group signaling stopped the original descendant; a zombie is not claimed reaped", originalIdentity)
+		const terminalNote = groupSignalDenied
+			? "contained fallback stopped the original descendant"
+			: "primary group signaling stopped the original descendant"
+		assertLinuxProcessTerminal(
+			grandchildPid,
+			`${terminalNote}; a zombie is not claimed reaped`,
+			originalIdentity,
+		)
 	} finally {
 		processRef.kill = originalKill
 		if (!aborted) controller.abort(new Error("fixture cleanup"))
@@ -795,7 +800,10 @@ async function main(): Promise<void> {
 	await testImmediateAbortWaitsForLauncherIdentityAndCleansUp()
 	console.log("  ok   OpenShell immediate abort waits for identity capture and cleans up")
 	await testHostAbortEscalatesItsLauncherGroupAndRemovesGrandchild()
-	console.log("  ok   OpenShell abort stops the exact descendant group (reaped ESRCH or verified zombie)")
+	console.log(
+		"  ok   OpenShell abort stops the exact descendant group " +
+			"(reaped ESRCH or verified zombie)",
+	)
 	await testContainedAbortFallsBackForDeniedGroupSignals()
 	console.log("  ok   OpenShell contained abort uses verified member signals when group signals return EPERM")
 	await testTimeoutEscalatesAfterLauncherExitsAndVerifiesGrandchild()
