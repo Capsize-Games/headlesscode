@@ -2731,14 +2731,7 @@ const IMPLEMENTED_TOOLS = new Set([
  * executor and the advertised tool list (loop.ts gates advertisement on
  * executor.has) omit them.
  */
-function registerTypeScriptGatedTools(
-	executor: ToolExecutor,
-	workspaceRoot: string,
-	options: ToolExecutorOptions = {},
-): void {
-	if (!isTypeScriptWorkspace(workspaceRoot)) {
-		return
-	}
+function registerReadOnlyCodeintelTools(executor: ToolExecutor): void {
 	executor.register("outline", outlineHandler)
 	executor.register("go_to_definition", goToDefinitionHandler)
 	executor.register("find_references", findReferencesHandler)
@@ -2748,6 +2741,17 @@ function registerTypeScriptGatedTools(
 	executor.register("call_hierarchy", callHierarchyHandler)
 	executor.register("workspace_symbol", workspaceSymbolHandler)
 	executor.register("find_implementations", findImplementationsHandler)
+}
+
+function registerTypeScriptGatedTools(
+	executor: ToolExecutor,
+	workspaceRoot: string,
+	options: ToolExecutorOptions = {},
+): void {
+	if (!isTypeScriptWorkspace(workspaceRoot)) {
+		return
+	}
+	registerReadOnlyCodeintelTools(executor)
 	// rename_symbol EDITS files, so it is deliberately NOT registered on the
 	// read-only executors (reviewer/QA/local explore) — they must never be
 	// able to modify source, and their tool lists don't advertise it either
@@ -2825,15 +2829,7 @@ function createReadCommandExecutor(workspaceRoot: string, options: ToolExecutorO
 	// language gate as the headless executor — a reviewer of a C++/Python
 	// workspace must not be handed ts.Program tools.
 	if (isTypeScriptWorkspace(workspaceRoot)) {
-		executor.register("outline", outlineHandler)
-		executor.register("go_to_definition", goToDefinitionHandler)
-		executor.register("find_references", findReferencesHandler)
-		executor.register("import_graph", importGraphHandler)
-		executor.register("get_diagnostics", getDiagnosticsHandler)
-		executor.register("type_at_position", typeAtPositionHandler)
-		executor.register("call_hierarchy", callHierarchyHandler)
-		executor.register("workspace_symbol", workspaceSymbolHandler)
-		executor.register("find_implementations", findImplementationsHandler)
+		registerReadOnlyCodeintelTools(executor)
 	}
 
 	executor.register("attempt_completion", attemptCompletionHandler)
