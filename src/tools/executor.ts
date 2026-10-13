@@ -960,30 +960,29 @@ function unrefStream(stream: NodeJS.ReadableStream | null): void {
  * call times out mid-session — that is the whole point of the background
  * semantics (see the vendored execute_command tool's timeout contract).
  */
-function killBackgroundCommands(backgroundCommands: Set<ChildProcess>): void {
-	for (const child of backgroundCommands) {
-		try {
-			if (child.exitCode === null && child.signalCode === null) {
-				if (child.pid != null) {
-					// The child is a detached process-group leader (see
-					// executeCommandHandler), so kill the whole group with a
-					// negative pid — that reaps grandchildren too (e.g. the
-					// `node`/`sh` the shell may have spawned), not just the
-					// shell itself. Falls back to killing the direct child on
-					// platforms where group signals aren't supported.
-					try {
-						process.kill(-child.pid, "SIGKILL")
-					} catch {
-						child.kill("SIGKILL")
-					}
-				} else {
-					child.kill("SIGKILL")
-				}
-			}
-		} catch {
-			// Already gone — nothing to clean up.
+// Kill a detached execute_command child and its process group. Group
+// signals are denied in some sandboxes (killpg EPERM for same-UID
+// callers), so fall back to killing the direct child — the shell's
+// death still stops its command sequence. Never throws.
+function killChildTree(child: ChildProcess): void {
+	try {
+		if (child.exitCode !== null || child.signalCode !== null) return
+		if (child.pid == null || process.platform === "win32") {
+			child.kill("SIGKILL")
+			return
 		}
+		try {
+			process.kill(-child.pid, "SIGKILL")
+		} catch {
+			child.kill("SIGKILL")
+		}
+	} catch {
+		// Already gone — nothing to clean up.
 	}
+}
+
+function killBackgroundCommands(backgroundCommands: Set<ChildProcess>): void {
+	for (const child of backgroundCommands) killChildTree(child)
 	backgroundCommands.clear()
 }
 
@@ -1726,10 +1725,7 @@ function executeCommandHandler(args: Record<string, unknown>, ctx: ToolContext, 
 				// can also stop this command's background process group.
 				const onAbort = (): void => {
 					clearTimeout(timer)
-					try {
-						if (child.pid != null && process.platform !== "win32") process.kill(-child.pid, "SIGKILL")
-						else child.kill("SIGKILL")
-					} catch { /* The process may have exited before cancellation. */ }
+					killChildTree(child)
 					finish(err("execute_command: stopped by supervisor"))
 				}
 				ctx.signal?.addEventListener("abort", onAbort, { once: true })
