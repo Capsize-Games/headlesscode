@@ -31,6 +31,7 @@ import { execFileSync, spawnSync } from "node:child_process"
 import * as fs from "node:fs"
 import * as path from "node:path"
 
+import { createArgCursor } from "./arg-cursor.js"
 import {
 	handleIterationExhaustion,
 	handleQaSessionError,
@@ -121,21 +122,9 @@ export function parseReviewArgs(argv: string[]): { options: ReviewCliOptions; er
 	}
 	options.target = target
 	for (let i = 0; i < rest.length; i++) {
-		const arg = rest[i]
-		const eq = arg.indexOf("=")
-		const flag = eq === -1 ? arg : arg.slice(0, eq)
-		const inlineValue = eq === -1 ? undefined : arg.slice(eq + 1)
-		const next = (): string | undefined => {
-			if (inlineValue !== undefined) {
-				return inlineValue
-			}
-			const v = rest[i + 1]
-			if (v === undefined || v.startsWith("--")) {
-				return undefined
-			}
+		const { arg, flag, next } = createArgCursor(rest, i, () => {
 			i++
-			return v
-		}
+		})
 		switch (flag) {
 			case "--repo": {
 				const v = next()
@@ -236,21 +225,9 @@ export function parseReworkArgs(argv: string[]): { options: ReworkCliOptions; er
 	}
 	options.target = target
 	for (let i = 0; i < rest.length; i++) {
-		const arg = rest[i]
-		const eq = arg.indexOf("=")
-		const flag = eq === -1 ? arg : arg.slice(0, eq)
-		const inlineValue = eq === -1 ? undefined : arg.slice(eq + 1)
-		const next = (): string | undefined => {
-			if (inlineValue !== undefined) {
-				return inlineValue
-			}
-			const v = rest[i + 1]
-			if (v === undefined || v.startsWith("--")) {
-				return undefined
-			}
+		const { arg, flag, next } = createArgCursor(rest, i, () => {
 			i++
-			return v
-		}
+		})
 		switch (flag) {
 			case "--repo": {
 				const v = next()
@@ -399,21 +376,9 @@ export function parseResumeArgs(argv: string[]): { options: ResumeCliOptions; er
 	}
 	options.target = target
 	for (let i = 0; i < rest.length; i++) {
-		const arg = rest[i]
-		const eq = arg.indexOf("=")
-		const flag = eq === -1 ? arg : arg.slice(0, eq)
-		const inlineValue = eq === -1 ? undefined : arg.slice(eq + 1)
-		const next = (): string | undefined => {
-			if (inlineValue !== undefined) {
-				return inlineValue
-			}
-			const v = rest[i + 1]
-			if (v === undefined || v.startsWith("--")) {
-				return undefined
-			}
+		const { arg, flag, next } = createArgCursor(rest, i, () => {
 			i++
-			return v
-		}
+		})
 		switch (flag) {
 			case "--repo": {
 				const v = next()
