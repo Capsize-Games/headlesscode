@@ -204,6 +204,31 @@ function readExitCode(wtPath: string): number | undefined {
 }
 
 /**
+ * Issue #136 Part B: read the main-tree tripwire marker written by
+ * scripts/check-main-tree-clean.sh — the main-checkout entries that
+ * appeared during this worker's run window. Porcelain lines, kept
+ * verbatim (the XY prefix is evidence). Undefined when the marker is
+ * absent or empty (clean run, or a worktree from before the tripwire).
+ */
+export function readMainTreeDirty(wtPath: string): string[] | undefined {
+	try {
+		const marker = path.join(wtPath, ".harness.main-tree-dirty")
+		const raw = fs.readFileSync(marker, "utf-8")
+		const entries = raw.split("\n").filter((line) => line !== "")
+		return entries.length > 0 ? entries : undefined
+	} catch {
+		return undefined
+	}
+}
+
+/** One loud line describing a tripwire finding (file list capped). */
+export function describeMainTreeDirty(entries: string[]): string {
+	const shown = entries.slice(0, 20).join(", ")
+	const more = entries.length > 20 ? `, +${entries.length - 20} more` : ""
+	return `MAIN-TREE-DIRTY: worker wrote outside its worktree (${shown}${more})`
+}
+
+/**
  * Cost/token monitoring (workstream 3): sum every usage record found under
  * `<worktree>/.headlesscode/usage/*.jsonl` (the worker's session usage — see
  * `src/engine/usage.ts`). Defensive: a worktree is expected to hold exactly
@@ -474,6 +499,9 @@ export function inspectGroup(
 		const exitCode = readExitCode(wtPath)
 		const status = exitCode === 0 ? "done" : "failed"
 		const summary = tailLog(path.join(wtPath, "harness.log"))
+		const dirty = readMainTreeDirty(wtPath)
+		const dirtyNote =
+			dirty === undefined ? "" : `; ${describeMainTreeDirty(dirty)}`
 		const note =
 			exitCode === 0
 				? `worker completed cleanly (exit 0)${summary ? " — see harness.log" : ""}`
@@ -482,11 +510,12 @@ export function inspectGroup(
 		return {
 			status,
 			last_activity: {
-				note,
+				note: note + dirtyNote,
 				last_commit: lastCommit(wtPath),
 			},
 			commits: group.commits ?? [],
 			...(exitCode !== undefined ? { exit_code: exitCode } : {}),
+			...(dirty === undefined ? {} : { main_tree_dirty: dirty }),
 			// `.slice(-4000)`, NOT `.slice(0, 4000)`: this is a TAIL (already the
 			// last SUMMARY_TAIL_LINES lines of the run) being capped to a char
 			// budget. Keeping the FIRST 4000 chars of a tail throws away the most

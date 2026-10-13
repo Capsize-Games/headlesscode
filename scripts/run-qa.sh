@@ -147,11 +147,16 @@ if [ -n "${HEADLESSCODE_MAX_DURATION_MS:-}" ]; then
     BUDGET_ARG="$BUDGET_ARG --max-duration-ms '$HEADLESSCODE_MAX_DURATION_MS'"
 fi
 
+# Issue #136 Part B: after QA exits, diff the MAIN checkout against the
+# pre-launch snapshot — same tripwire as run-worker.sh (qa marker stem).
+TRIPWIRE_CHECK="bash '$HARNESS_ROOT/scripts/check-main-tree-clean.sh' qa check '$WT_PATH' || echo 'TRIPWIRE-FAILED: main-tree check did not run — confinement unverified for this run'"
+
 WRAPPER="
 cd '$HARNESS_ROOT'
 $CLI --task-file '$TASK_FILE' --workspace '$WT_PATH' --mode '$MODE' $MODEL_ARG $LOG_FILE_ARG $BUDGET_ARG
 CODE=\$?
 printf '%s' \"\$CODE\" > '$WT_PATH/.qa.exit'
+$TRIPWIRE_CHECK
 mkdir '$WT_PATH/.qa.done' 2>/dev/null
 exit \$CODE
 "
@@ -159,6 +164,8 @@ exit \$CODE
 # ── Launch detached + record pid + pgid ─────────────────────────────────────
 rm -f "$WT_PATH/.qa.exit"
 rm -rf "$WT_PATH/.qa.done"
+# Issue #136 Part B: snapshot the MAIN checkout BEFORE QA starts.
+bash "$HARNESS_ROOT/scripts/check-main-tree-clean.sh" qa snapshot "$WT_PATH" || echo "run-qa: warning: main-tree tripwire snapshot failed" >&2
 
 # Issue #20 (same fix as run-worker.sh): run the QA wrapper in its OWN process
 # group via setsid so a stop command can kill the whole tree, and record the

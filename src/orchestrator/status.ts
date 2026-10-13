@@ -66,8 +66,10 @@ import {
 import {
 	DEFAULT_POLL_INTERVAL_MS,
 	DEFAULT_STALL_TIMEOUT_MS,
+	describeMainTreeDirty,
 	groupWorktreePath,
 	hasExitMarker,
+	readMainTreeDirty,
 	workerLiveness,
 	type WorkerLiveness,
 } from "./watch.js"
@@ -103,6 +105,8 @@ export interface StatusGroupRow {
 	findingsCount: number
 	usageCostUsd?: number
 	exitCode?: number
+	/** Issue #136 Part B tripwire finding (undefined = clean run). */
+	mainTreeDirty?: string[]
 	stalled: boolean
 	blockedQuestion?: string
 	qaVerdict?: string
@@ -212,6 +216,7 @@ export function buildStatusSummary(state: OrchestratorState): StatusSummary {
 			findingsCount: g.pending_review_findings?.length ?? 0,
 			usageCostUsd: g.usage?.costUsd,
 			exitCode: g.exit_code,
+			mainTreeDirty: g.main_tree_dirty,
 			stalled: g.stalled === true,
 			blockedQuestion: g.blocked?.question,
 			qaVerdict: g.qa?.verdict,
@@ -337,6 +342,9 @@ export function formatStatusText(
 			if (g.stalled) {
 				bits.push("STALLED")
 			}
+			if (g.mainTreeDirty !== undefined) {
+				bits.push(describeMainTreeDirty(g.mainTreeDirty))
+			}
 			if (g.blockedQuestion) {
 				bits.push(`blocked: ${g.blockedQuestion}`)
 			}
@@ -381,6 +389,11 @@ export interface ReconcileHooks {
 	hasExitMarker?: (worktreePath: string) => boolean
 	/** Worker liveness (default: workerLiveness from watch.js). */
 	workerLiveness?: (worktreePath: string) => WorkerLiveness
+	/**
+	 * `.harness.main-tree-dirty` reader.
+	 * Default: readMainTreeDirty from watch.js.
+	 */
+	readMainTreeDirty?: (worktreePath: string) => string[] | undefined
 }
 
 export interface ReconcileResult {
@@ -426,12 +439,18 @@ export function reconcileGroups(state: OrchestratorState, repo: string, hooks: R
 	})
 	const exitPresent = hooks.hasExitMarker ?? hasExitMarker
 	const livenessOf = hooks.workerLiveness ?? workerLiveness
+	const readDirtyMarker = hooks.readMainTreeDirty ?? readMainTreeDirty
 
 	let current = state
 	const reconciled: string[] = []
 	for (const group of state.groups) {
 		const patch = reconcileOneGroup(group, repo, {
-			worktreeExists, hasDoneMarker, readExitCode, exitPresent, livenessOf,
+			worktreeExists,
+			hasDoneMarker,
+			readExitCode,
+			exitPresent,
+			livenessOf,
+			readMainTreeDirty: readDirtyMarker,
 		})
 		if (patch) {
 			current = updateGroup(current, group.name, patch)
@@ -447,23 +466,45 @@ interface ReconcileProbes {
 	readExitCode: (p: string) => number | undefined
 	exitPresent: (p: string) => boolean
 	livenessOf: (p: string) => WorkerLiveness
+	readMainTreeDirty: (p: string) => string[] | undefined
+}
+
+function tripwirePatch(
+	probes: ReconcileProbes,
+	wtPath: string,
+): { extra: Partial<OrchestratorGroup>; suffix: string } {
+	const dirty = probes.readMainTreeDirty(wtPath)
+	if (dirty === undefined) {
+		return { extra: {}, suffix: "" }
+	}
+	const suffix = `; ${describeMainTreeDirty(dirty)}`
+	return { extra: { main_tree_dirty: dirty }, suffix }
+}
+
+function reconcileDoneNote(
+	exitCode: number | undefined,
+	suffix: string,
+): string {
+	const base =
+		exitCode === 0
+			? "reconciled: worker completed cleanly (exit 0)"
+			: `reconciled: worker exited ${exitCode ?? "with unknown code"}`
+	return base + suffix
 }
 
 function doneMarkerPatch(
 	probes: ReconcileProbes,
 	wtPath: string,
 ): Partial<OrchestratorGroup> {
-	// Ground truth exists: the worker finished. Mirror watch.ts's
-	// mapping (exit 0 → done, anything else/unknown → failed).
+	// Mirror watch.ts: exit 0 → done, anything else/unknown → failed.
 	const exitCode = probes.readExitCode(wtPath)
-	const status = exitCode === 0 ? "done" : "failed"
+	const trip = tripwirePatch(probes, wtPath)
 	return {
-		status,
+		status: exitCode === 0 ? "done" : "failed",
 		...(exitCode !== undefined ? { exit_code: exitCode } : {}),
+		...trip.extra,
 		last_activity: {
-			note: exitCode === 0
-				? "reconciled: worker completed cleanly (exit 0)"
-				: `reconciled: worker exited ${exitCode ?? "with unknown code"}`,
+			note: reconcileDoneNote(exitCode, trip.suffix),
 		},
 	}
 }
@@ -484,11 +525,14 @@ function killedPatch(
 ): Partial<OrchestratorGroup> {
 	const exitCode = probes.readExitCode(wtPath)
 	const detail = exitCode ?? "unparseable"
+	const trip = tripwirePatch(probes, wtPath)
+	const baseNote = `reconciled: worker dead with exit ${detail}, no .done marker`
 	return {
 		status: "failed",
 		...(exitCode !== undefined ? { exit_code: exitCode } : {}),
+		...trip.extra,
 		last_activity: {
-			note: `reconciled: worker dead with exit ${detail}, no .done marker`,
+			note: baseNote + trip.suffix,
 		},
 	}
 }

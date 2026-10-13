@@ -84,6 +84,10 @@ const HARNESS_ARTIFACTS = [
 	".harness.done",
 	".harness.needs-decision",
 	".harness.decision-answer",
+	".harness.main-tree-before", // issue #136 Part B tripwire baseline
+	".harness.main-tree-dirty", // issue #136 Part B tripwire finding
+	".qa.main-tree-before",
+	".qa.main-tree-dirty",
 	".qa.pid",
 	".qa.exit",
 	".qa.done",

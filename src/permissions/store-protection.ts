@@ -186,17 +186,219 @@ export function expandEnv(p: string, env: NodeJS.ProcessEnv = process.env): stri
 }
 
 /**
+ * Chain-local variable bindings harvested from earlier sub-commands
+ * (`export NAME=value`, bare `NAME=value`): the runtime shell would expand
+ * them, so the gate must too — otherwise every `export OUT=dir && ... $OUT`
+ * chain is a false positive. `poison` holds names bound to unresolvable
+ * values (command substitutions, input, globs): uses of those fail closed.
+ */
+export interface ChainEnv {
+	overlay: Map<string, string>
+	poison: Set<string>
+}
+
+export function newChainEnv(): ChainEnv {
+	return { overlay: new Map(), poison: new Set() }
+}
+
+function isValidEnvName(name: string): boolean {
+	return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name)
+}
+
+function valueHasSpecials(value: string): boolean {
+	return /[$`\\*?[\]()<>|&;#\s]/.test(value)
+}
+
+/** Record one NAME=value binding: static values overlay, dynamic values
+ * poison. An empty harvest never clears poison (it may be a mangled
+ * `NAME=$(...)` whose substitution parseCommand promoted away). */
+function harvestBinding(env: ChainEnv, name: string, value: string): void {
+	if (!isValidEnvName(name)) return
+	if (valueHasSpecials(value)) {
+		env.poison.add(name)
+		env.overlay.delete(name)
+		return
+	}
+	if (value !== "") env.poison.delete(name)
+	env.overlay.set(name, value)
+}
+
+function splitAssignment(word: string): [string, string] | null {
+	const eq = word.indexOf("=")
+	if (eq <= 0) return null
+	const name = word.slice(0, eq)
+	if (!isValidEnvName(name)) return null
+	return [name, word.slice(eq + 1)]
+}
+
+/** Harvest `export A=1 B=2` / bare `A=1 B=2` assignments from split words.
+ * `A=1 cmd` (env prefix + command) harvests NOTHING — prefixes are
+ * temporary, not bindings. Bare `export NAME` (no `=`) is a no-op. */
+export function harvestSubAssignments(words: string[], env: ChainEnv): void {
+	if (words[0] === "export") {
+		for (const word of words.slice(1)) {
+			const binding = splitAssignment(word)
+			if (binding !== null) harvestBinding(env, binding[0], binding[1])
+		}
+		return
+	}
+	const bindings = words.map(splitAssignment)
+	if (bindings.some((binding) => binding === null)) return
+	for (const binding of bindings) {
+		if (binding !== null) harvestBinding(env, binding[0], binding[1])
+	}
+}
+
+/** Pre-poison names assigned from dynamic values in the RAW command. The
+ * ordered walk sees `NAME=` (empty) for `NAME=$(...)` — the substitution
+ * was promoted to its own sub-command — so without this pass a later
+ * static-looking harvest would clear poison that must stick. */
+export function prePoisonRawAssignments(command: string, env: ChainEnv): void {
+	const re = /(?:^|[;&|]|\s)(?:export\s+)?([A-Za-z_]\w*)=([^\s;&|]*)/g
+	let match: RegExpExecArray | null
+	while ((match = re.exec(command)) !== null) {
+		if (valueHasSpecials(match[2] ?? "")) {
+			env.poison.add(match[1] ?? "")
+			env.overlay.delete(match[1] ?? "")
+		}
+	}
+}
+
+function isKnownVar(name: string, env: ChainEnv): boolean {
+	if (env.poison.has(name) || name === "") return false
+	if (env.overlay.has(name)) return true
+	return process.env[name] !== undefined
+}
+
+function poisonedDefaultOp(
+	match: string,
+	op: string,
+	fallback: string,
+): string {
+	if (op === ":+" || op === "+") return fallback
+	return match
+}
+
+function knownDefaultOp(
+	name: string,
+	op: string,
+	fallback: string,
+	env: ChainEnv,
+): string {
+	if (op === ":+" || op === "+") return fallback
+	return env.overlay.get(name) ?? process.env[name] ?? ""
+}
+
+function unsetDefaultOp(
+	name: string,
+	op: string,
+	fallback: string,
+	env: ChainEnv,
+): string {
+	if (op === ":=" || op === "=") {
+		harvestBinding(env, name, fallback)
+		return fallback
+	}
+	if (op === ":-" || op === "-") return fallback
+	return ""
+}
+
+function defaultOpValue(
+	match: string,
+	name: string,
+	op: string,
+	fallback: string,
+	env: ChainEnv,
+): string {
+	if (env.poison.has(name)) return poisonedDefaultOp(match, op, fallback)
+	if (isKnownVar(name, env)) return knownDefaultOp(name, op, fallback, env)
+	return unsetDefaultOp(name, op, fallback, env)
+}
+
+/** Expand `${V:-D}` / `${V:=D}` / `${V:+A}` / `${V:?M}` (and bare `-`/`=`/
+ * `+`/`?`) plus `${#V}`. `:=` on a truly-unset var assigns (as at
+ * runtime); on a poisoned var the match is left for the poison guard —
+ * `:=` never assigns over a set var, poisoned ones included. */
+function expandOperandDefaults(word: string, env: ChainEnv): string {
+	const pattern = /\$\{([A-Za-z_]\w*)(:-|:=|:\+|:\?|-|=|\+|\?)([^}]*)\}/g
+	const expand = (m: string, n: string, o: string, f: string): string =>
+		defaultOpValue(m, n, o, f, env)
+	const withDefault = word.replace(pattern, expand)
+	return withDefault.replace(/\$\{#[A-Za-z_]\w*\}/g, "")
+}
+
+/** Strip references to unknown/poisoned vars. Truly-unset vars expand to
+ * empty at runtime, so stripping is EXACT (not an approximation): `>$U/x`
+ * really writes `/x`, while bare `>$U` really errors (safe). Special vars
+ * ($$, $?, $1...) are shell-provided, never stripped. */
+function stripUnknownRefs(word: string, env: ChainEnv): string {
+	const keepKnown = (m: string, name: string): string => {
+		return isKnownVar(name, env) ? m : ""
+	}
+	const braced = word.replace(/\$\{([A-Za-z_]\w*)\}/g, keepKnown)
+	return braced.replace(/\$([A-Za-z_]\w*)/g, keepKnown)
+}
+
+/** True when the word references a poisoned (unresolvable-valued) var.
+ * Unlike truly-unset vars (which expand to empty — stripped exactly), a
+ * poisoned var holds an UNKNOWN value, so any gated use fails closed. */
+export function usesPoisonedVar(word: string, env: ChainEnv): boolean {
+	const names: string[] = []
+	word.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\}/g, (_m, name: string) => {
+		names.push(name)
+		return _m
+	})
+	word.replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (_m, name: string) => {
+		names.push(name)
+		return _m
+	})
+	return names.some((name) => env.poison.has(name))
+}
+
+/** The expanded-but-unresolved word: env + defaults + stripping, before
+ * `~` and resolve. Lets `cd` distinguish "expanded to empty" (→ $HOME,
+ * refused fail-closed) from literal `.` (stays, allowed). */
+export function expandOperandWord(
+	word: string,
+	env: ChainEnv = newChainEnv(),
+): string {
+	const merged = { ...process.env }
+	for (const [name, value] of env.overlay) merged[name] = value
+	const expanded = expandEnv(expandOperandDefaults(word, env), merged)
+	return stripUnknownRefs(expanded, env)
+}
+
+/**
+ * Resolve a raw operand word to an absolute path: chain-overlay + process
+ * env expansion (`${V:-D}` defaults honored, `:=` assigns), unknown-var
+ * stripping (exact — unset vars expand to empty), `~` expansion, then
+ * `path.resolve` against the command's working directory. TOTAL: unknown
+ * input degrades to a stripped path whose containment check fails closed.
+ */
+export function resolveOperandTarget(
+	word: string,
+	cwd: string,
+	env: ChainEnv = newChainEnv(),
+): string {
+	return path.resolve(cwd, expandHome(expandOperandWord(word, env)))
+}
+
+/**
  * Resolve a raw target word to an absolute path: env expansion, `~`
  * expansion, then `path.resolve` against the command's working directory
  * (relative targets anchor there). A trailing `/*` glob is dropped — deleting
  * "the store's contents" via `rm -rf <store>/*` targets the store itself.
  */
-export function resolveCommandTarget(target: string, workspaceRoot: string): string {
-	let expanded = expandEnv(expandHome(target))
+export function resolveCommandTarget(
+	target: string,
+	workspaceRoot: string,
+	env: ChainEnv = newChainEnv(),
+): string {
+	let expanded = resolveOperandTarget(target, workspaceRoot, env)
 	if (expanded.endsWith("/*")) {
 		expanded = expanded.slice(0, -2)
 	}
-	return path.resolve(workspaceRoot, expanded)
+	return expanded
 }
 
 /**
@@ -256,17 +458,32 @@ export interface StoreDestructionRefusal {
  * store-targeting destructive command. `workspaceRoot` anchors relative
  * targets (defaults to process.cwd()).
  */
-export function checkCentralStoreDestruction(subCommand: string, workspaceRoot?: string): StoreDestructionRefusal | null {
+export function checkCentralStoreDestruction(
+	subCommand: string,
+	workspaceRoot?: string,
+	env: ChainEnv = newChainEnv(),
+): StoreDestructionRefusal | null {
 	const words = splitCommandWords(subCommand)
 	if (!isRecursiveDelete(words)) {
 		return null
 	}
 	const root = path.resolve(workspaceRoot ?? process.cwd())
 	for (const target of deleteTargets(words)) {
-		const resolved = resolveCommandTarget(target, root)
-		if (isCentralStoreOrParent(resolved)) {
-			return { target: resolved, storeRoot: projectStoreRoot() }
-		}
+		const hit = storeTargetHit(target, root, env)
+		if (hit !== null) return hit
 	}
 	return null
+}
+
+function storeTargetHit(
+	target: string,
+	root: string,
+	env: ChainEnv,
+): StoreDestructionRefusal | null {
+	if (usesPoisonedVar(target, env)) {
+		return { target, storeRoot: projectStoreRoot() }
+	}
+	const resolved = resolveCommandTarget(target, root, env)
+	if (!isCentralStoreOrParent(resolved)) return null
+	return { target: resolved, storeRoot: projectStoreRoot() }
 }

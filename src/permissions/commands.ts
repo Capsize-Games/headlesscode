@@ -53,6 +53,14 @@
  *   that writes outside the workspace via a non-redirect mechanism (e.g.
  *   `python -c "open('/tmp/x','w')"`) is out of scope; see
  *   redirectTargets/checkRedirectEscape below.
+ * - CD-ESCAPE + WRITE-OPERAND PROTECTION (always-applied, NOT configurable,
+ *   issue #136): a `cd`/`pushd` outside the workspace, or a file-writing
+ *   operand (cp/mv/ln/install/rsync/scp destination, `tee` output, `git`
+ *   repo pointer, `tar`/`sed -i`/`curl`/`wget` output, shell script file)
+ *   outside the workspace, is refused. The cd guard is load-bearing: an
+ *   outside-cd re-anchors every later relative path, defeating the other
+ *   guards. Same honest scope as above (sudo/ssh/xargs/script contents
+ *   are boundaries); see checkCdEscape/checkWriteOperandEscape below.
  *
  * `parseCommand` is ported WITHOUT the `shell-quote` dependency (not present in
  * this repo's node_modules): quoted strings, arithmetic, parameter expansions,
@@ -69,7 +77,17 @@
 import * as os from "node:os"
 import * as path from "node:path"
 
-import { checkCentralStoreDestruction, expandEnv, expandHome, splitCommandWords } from "./store-protection.js"
+import {
+	type ChainEnv,
+	checkCentralStoreDestruction,
+	expandOperandWord,
+	harvestSubAssignments,
+	newChainEnv,
+	prePoisonRawAssignments,
+	resolveOperandTarget,
+	splitCommandWords,
+	usesPoisonedVar,
+} from "./store-protection.js"
 
 // ─── parseCommand port (zoo-code/src/shared/parse-command.ts) ───────────────
 
@@ -457,7 +475,12 @@ function parseCommandLine(command: string): string[] {
 	const variables: string[] = []
 	const parameterExpansions: string[] = []
 
-	let processedCommand = command.replace(/\d*>&\d*/g, (match) => {
+	// Noclobber redirect operators (`>|`, `>>|`, `&>|`, `&>>|`, with optional
+	// fd digits) mask like fd-duplications: their `|` is not a pipe and must
+	// not split the sub-command (else `cat >| /tmp/x` splits into `cat >`
+	// and `/tmp/x`, and the redirect guard never sees its target).
+	const redirMask = /\d*>&\d*|\d*(?:&>>\||&>\||>>\||>\|)/g
+	let processedCommand = command.replace(redirMask, (match) => {
 		redirections.push(match)
 		return `__REDIR_${redirections.length - 1}__`
 	})
@@ -675,22 +698,12 @@ export function redirectTargets(command: string): RedirectTarget[] {
 
 /**
  * Resolve a redirect target word to an absolute path, anchored on the command's
- * working directory. Applies the same `~`/`$VAR` expansion and `/*`-glob
- * truncation as the central-store check (store-protection.ts's
- * resolveCommandTarget), so `/tmp` and `/tmp/x` behave identically to `~` and
- * `$TMPDIR` — a relative target like `> out.txt` anchors inside the workspace.
- *
- * A word the shell could expand (e.g. `$TMPDIR/x.txt`) resolves through the
- * SAME expansions the central-store check applies (expandHome/expandEnv), so
- * `> $TMPDIR/x` with TMPDIR set to /tmp refuses like the literal `/tmp/x` it
- * expands to. An UNKNOWN variable stays literal — the shell would expand it
- * to an empty word (the redirect would then hit a missing-operand error),
- * which cannot write outside the workspace, so resolving it literally is the
- * safe direction.
+ * working directory. Delegates to the shared operand resolver: known vars
+ * expand, unknown vars strip (exact — unset vars expand to empty, so
+ * `> $U/x` really writes `/x` while bare `> $U` really errors, safe).
  */
 export function resolveRedirectTarget(target: string, workspaceRoot: string): string {
-	const expanded = expandEnv(expandHome(target))
-	return path.resolve(workspaceRoot, expanded)
+	return resolveOperandTarget(target, path.resolve(workspaceRoot))
 }
 
 /**
@@ -718,20 +731,14 @@ export function isOutsideWorkspace(root: string, target: string): boolean {
 }
 
 /**
- * Check ONE sub-command (already split by parseCommand) for an output
- * redirect whose resolved target escapes the workspace root. Returns the
- * first offending redirect, or `null` when every redirect target stays inside
- * the workspace. `workspaceRoot` anchors relative targets (defaults to
- * process.cwd()).
+ * Check a command for an output redirect escaping the workspace root.
+ * Runs the shared ordered walk: relative targets resolve against the
+ * tracked cd-chain cwd but containment compares against the workspace
+ * root (the old code compared against the post-cd directory, so
+ * `cd /tmp && echo hi > x` wrongly passed). Chain exports overlay.
  */
 export function checkRedirectEscape(subCommand: string, workspaceRoot?: string): RedirectTarget | null {
-	const root = path.resolve(workspaceRoot ?? process.cwd())
-	for (const target of redirectTargets(subCommand)) {
-		if (isOutsideWorkspace(root, resolveRedirectTarget(target.word, root))) {
-			return target
-		}
-	}
-	return null
+	return scanWholeCommand(subCommand, workspaceRoot).redir
 }
 
 /** Human-readable operator for the model-facing refusal message. */
@@ -739,6 +746,1001 @@ export function describeRedirect(target: RedirectTarget): string {
 	const compact =
 		target.operator.includes("&") || target.operator.includes("|") || /^\d*>>/.test(target.operator)
 	return compact ? `${target.operator}${target.word}` : `${target.operator} ${target.word}`
+}
+
+// ─── workspace-confinement scans (issue #136) ──
+//
+// A `cd` outside the workspace re-anchors every later relative path in the
+// chain, silently defeating the redirect/operand guards (the SEC-6 tracking
+// resolved AND compared against the post-cd directory — always "inside").
+// The load-bearing fix is refusing the outside-cd itself; the redirect and
+// write-operand scans are backstops for absolute paths. All three scans
+// share one ordered sub-command walk so chain exports, cd tracking, and
+// first-hit-wins stay consistent between checkCommand and the exported
+// single-purpose checks. This is pattern-based, not a sandbox: sudo/su,
+// ssh, xargs/find -exec command construction, and script-file CONTENTS are
+// documented boundaries (an allowed `sudo` already moots confinement).
+
+export interface CdEscape {
+	subCommand: string
+	directory: string
+	reason?: string
+}
+
+export interface WriteOperandEscape {
+	subCommand: string
+	command: string
+	operand: string
+	reason?: string
+}
+
+export function describeCdEscape(escape: CdEscape): string {
+	const base = `cd ${escape.directory}`
+	return escape.reason === undefined ? base : `${base} (${escape.reason})`
+}
+
+export function describeWriteEscape(escape: WriteOperandEscape): string {
+	if (escape.reason !== undefined) {
+		return `${escape.command} ${escape.operand}: ${escape.reason}`
+	}
+	return `${escape.command} writes ${escape.operand}`
+}
+
+/** Mutable state for one ordered sub-command walk. `contain` never moves
+ * (the workspace root); `cwd` tracks inside-only cds; `env` accumulates
+ * chain exports. Forks (subshells, `sh -c`) copy everything but share hits. */
+interface ScanCtx {
+	contain: string
+	cwd: string
+	prevCwd: string
+	stack: string[]
+	env: ChainEnv
+}
+
+interface ScanOut {
+	cd: CdEscape | null
+	op: WriteOperandEscape | null
+	redir: RedirectTarget | null
+}
+
+function newScanCtx(root: string): ScanCtx {
+	const resolved = path.resolve(root)
+	return {
+		contain: resolved, cwd: resolved, prevCwd: resolved, stack: [],
+		env: newChainEnv(),
+	}
+}
+
+function hasMoreFlags(rest: string[]): boolean {
+	return rest.length > 0 && (rest[0] ?? "").startsWith("-") && rest[0] !== "--"
+}
+
+function forkScanCtx(ctx: ScanCtx): ScanCtx {
+	return {
+		contain: ctx.contain,
+		cwd: ctx.cwd,
+		prevCwd: ctx.prevCwd,
+		stack: [...ctx.stack],
+		env: { overlay: new Map(ctx.env.overlay), poison: new Set(ctx.env.poison) },
+	}
+}
+
+function newScanOut(): ScanOut {
+	return { cd: null, op: null, redir: null }
+}
+
+function mergeChainEnv(chain: ChainEnv, local: ChainEnv): ChainEnv {
+	return {
+		overlay: new Map([...chain.overlay, ...local.overlay]),
+		poison: new Set([...chain.poison, ...local.poison]),
+	}
+}
+
+interface NormalizedArgv {
+	argv0: string
+	args: string[]
+	local: ChainEnv
+	opaqueEnv: boolean
+	opaqueFlag: string | null
+	parenLocal: boolean
+}
+
+const SHELL_KEYWORDS = new Set([
+	"!", "time", "command", "builtin", "if", "while", "until",
+	"do", "then", "else", "elif",
+])
+
+interface StrippedWrappers {
+	words: string[]
+	opaque: boolean
+	opaqueFlag: string | null
+	local: string[]
+}
+
+function splitEnvPrefix(words: string[]): { env: string[]; rest: string[] } {
+	let i = 0
+	while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i] ?? "")) i++
+	return { env: words.slice(0, i), rest: words.slice(i) }
+}
+
+interface GroupedWords {
+	words: string[]
+	parenLocal: boolean
+}
+
+function stripGroupDelimiters(words: string[]): GroupedWords {
+	let rest = words
+	let parenLocal = false
+	while (rest.length > 0 && /^[{()]+$/.test(rest[0])) {
+		if (rest[0].includes("(")) parenLocal = true
+		rest = rest.slice(1)
+	}
+	if (rest.length > 0 && /^[(]/.test(rest[0])) {
+		parenLocal = true
+		rest = [rest[0].replace(/^[(]+/, ""), ...rest.slice(1)]
+	}
+	if (rest.length > 0 && /^[{}]/.test(rest[0])) {
+		rest = [rest[0].replace(/^[{}]+/, ""), ...rest.slice(1)]
+	}
+	return { words: rest, parenLocal }
+}
+
+function timeoutFlagTakesValue(flag: string): boolean {
+	const valued = new Set(["-s", "-k", "--signal", "--kill-after"])
+	return valued.has(flag)
+}
+
+function stripTimeoutPrefix(words: string[]): string[] {
+	let rest = words.slice(1)
+	while (hasMoreFlags(rest)) {
+		rest = rest.slice(timeoutFlagTakesValue(rest[0] ?? "") ? 2 : 1)
+	}
+	if (rest[0] === "--") rest = rest.slice(1)
+	if (rest.length > 0 && !(rest[0] ?? "").startsWith("-")) rest = rest.slice(1)
+	return rest
+}
+
+function stripNicePrefix(words: string[]): string[] {
+	let rest = words.slice(1)
+	while (hasMoreFlags(rest)) {
+		const flag = rest[0] ?? ""
+		rest = rest.slice(flag === "-n" || flag === "--adjustment" ? 2 : 1)
+	}
+	if (rest[0] === "--") rest = rest.slice(1)
+	return rest
+}
+
+function envFlagIsOpaque(flag: string): boolean {
+	const opaque = new Set(["-i", "-u", "--ignore-environment", "--unset"])
+	return opaque.has(flag)
+}
+
+function stripEnvCommand(words: string[]): StrippedWrappers {
+	let rest = words.slice(1)
+	let opaque = false
+	let opaqueFlag: string | null = null
+	while (hasMoreFlags(rest)) {
+		const flag = rest[0] ?? ""
+		if (envFlagIsOpaque(flag)) {
+			opaque = true
+			opaqueFlag = flag
+		}
+		rest = rest.slice(flag === "-u" || flag === "--unset" ? 2 : 1)
+	}
+	if (rest[0] === "--") rest = rest.slice(1)
+	const prefix = splitEnvPrefix(rest)
+	return { words: prefix.rest, opaque, opaqueFlag, local: prefix.env }
+}
+
+/** Peel one non-env transparent wrapper; null when the head is none. */
+function stripPlainWrapper(words: string[]): string[] | null {
+	const head = words[0] ?? ""
+	if (head === "time") {
+		const rest = words.slice(1)
+		return rest[0] === "-p" ? rest.slice(1) : rest
+	}
+	if (SHELL_KEYWORDS.has(head)) return words.slice(1)
+	if (head === "timeout") return stripTimeoutPrefix(words)
+	if (head === "nice") return stripNicePrefix(words)
+	if (head === "nohup") return words.slice(1)
+	return null
+}
+
+interface WrapperAcc {
+	opaque: boolean
+	opaqueFlag: string | null
+	local: string[]
+}
+
+function applyEnvWrapper(rest: string[], acc: WrapperAcc): string[] | null {
+	if ((rest[0] ?? "") !== "env") return null
+	const stripped = stripEnvCommand(rest)
+	acc.opaque = acc.opaque || stripped.opaque
+	acc.opaqueFlag = stripped.opaqueFlag ?? acc.opaqueFlag
+	acc.local.push(...stripped.local)
+	return stripped.words
+}
+
+function stripCommandWrappers(words: string[]): StrippedWrappers {
+	let rest = words
+	const acc: WrapperAcc = { opaque: false, opaqueFlag: null, local: [] }
+	for (;;) {
+		const peeled = stripPlainWrapper(rest) ?? applyEnvWrapper(rest, acc)
+		if (peeled === null) break
+		rest = peeled
+	}
+	return {
+		words: rest, opaque: acc.opaque, opaqueFlag: acc.opaqueFlag, local: acc.local,
+	}
+}
+
+/** Reduce split words to the effective argv: env prefixes (kept as a local
+ * overlay), grouping delimiters, and transparent wrappers (keywords,
+ * timeout/nice/nohup/env) are peeled; `sudo` is deliberately NOT peeled —
+ * an allowed sudo already moots confinement (operator's choice). */
+function normalizeArgv(words: string[]): NormalizedArgv | null {
+	const prefix = splitEnvPrefix(words)
+	const local = newChainEnv()
+	harvestSubAssignments(prefix.env, local)
+	const grouped = stripGroupDelimiters(prefix.rest)
+	const stripped = stripCommandWrappers(grouped.words)
+	harvestSubAssignments(stripped.local, local)
+	const core = stripped.words.filter((word) => word !== "")
+	if (core.length === 0) return null
+	return {
+		argv0: path.basename(core[0] ?? ""),
+		args: core.slice(1),
+		local,
+		opaqueEnv: stripped.opaque,
+		opaqueFlag: stripped.opaqueFlag,
+		parenLocal: grouped.parenLocal,
+	}
+}
+
+/** First non-flag word of a cd/pushd argv (`-` survives: it toggles cwd). */
+function cdDirOperand(args: string[]): string | null {
+	let rest = args
+	while (hasMoreFlags(rest) && rest[0] !== "-") rest = rest.slice(1)
+	if (rest[0] === "--") rest = rest.slice(1)
+	return rest[0] ?? null
+}
+
+function cdpathBlocks(dir: string, subEnv: ChainEnv): boolean {
+	if (dir.startsWith("~") || dir.includes("/") || dir === "-") return false
+	const cdpath = subEnv.overlay.get("CDPATH") ?? process.env.CDPATH ?? ""
+	return cdpath !== ""
+}
+
+function homeEscape(
+	sub: string,
+	ctx: ScanCtx,
+	subEnv: ChainEnv,
+): CdEscape | null {
+	const resolved = resolveOperandTarget("~", ctx.cwd, subEnv)
+	if (!isOutsideWorkspace(ctx.contain, resolved)) return null
+	return { subCommand: sub, directory: "~" }
+}
+
+function opaqueEnvCdEscape(norm: NormalizedArgv, sub: string): CdEscape {
+	return {
+		subCommand: sub,
+		directory: norm.opaqueFlag ?? "env",
+		reason: "cleared environment is opaque",
+	}
+}
+
+function cdCheckWord(word: string, subEnv: ChainEnv): string {
+	if (word === "") return "~"
+	return expandOperandWord(word, subEnv) === "" ? "~" : word
+}
+
+function poisonedCdHit(
+	word: string,
+	sub: string,
+	subEnv: ChainEnv,
+): CdEscape | null {
+	if (!usesPoisonedVar(word, subEnv)) return null
+	return { subCommand: sub, directory: word, reason: "unresolvable variable" }
+}
+
+function containedCdHit(
+	check: string,
+	sub: string,
+	ctx: ScanCtx,
+	subEnv: ChainEnv,
+): CdEscape | null {
+	if (cdpathBlocks(check, subEnv)) {
+		const reason = "CDPATH makes slashless cd unresolvable"
+		return { subCommand: sub, directory: check, reason }
+	}
+	const resolved = resolveOperandTarget(check, ctx.cwd, subEnv)
+	if (!isOutsideWorkspace(ctx.contain, resolved)) return null
+	return { subCommand: sub, directory: check }
+}
+
+function cdDirEscape(
+	dir: string,
+	norm: NormalizedArgv,
+	sub: string,
+	ctx: ScanCtx,
+	subEnv: ChainEnv,
+): CdEscape | null {
+	const word = norm.parenLocal ? dir.replace(/\)+$/, "") : dir
+	const poisoned = poisonedCdHit(word, sub, subEnv)
+	if (poisoned !== null) return poisoned
+	return containedCdHit(cdCheckWord(word, subEnv), sub, ctx, subEnv)
+}
+
+function cdEscapeInArgv(
+	norm: NormalizedArgv,
+	sub: string,
+	ctx: ScanCtx,
+	subEnv: ChainEnv,
+): CdEscape | null {
+	if (norm.opaqueEnv) return opaqueEnvCdEscape(norm, sub)
+	if (norm.argv0 !== "cd" && norm.argv0 !== "pushd") return null
+	const dir = cdDirOperand(norm.args)
+	if (norm.argv0 === "pushd" && isStackRotation(dir)) return null
+	if (dir === "-") return null
+	if (dir === null || dir === "") return homeEscape(sub, ctx, subEnv)
+	return cdDirEscape(dir, norm, sub, ctx, subEnv)
+}
+
+function isStackRotation(dir: string | null): boolean {
+	return dir === null || /^[+-]\d+$/.test(dir)
+}
+
+function trackCdDir(
+	norm: NormalizedArgv,
+	ctx: ScanCtx,
+	subEnv: ChainEnv,
+): void {
+	const dir = cdDirOperand(norm.args)
+	if (dir === "-") {
+		const prev = ctx.prevCwd
+		ctx.prevCwd = ctx.cwd
+		ctx.cwd = prev
+		return
+	}
+	if (dir === null || dir === "") return
+	if (cdpathBlocks(dir, subEnv)) return
+	const word = norm.parenLocal ? dir.replace(/\)+$/, "") : dir
+	if (usesPoisonedVar(word, subEnv)) return
+	ctx.prevCwd = ctx.cwd
+	ctx.cwd = resolveOperandTarget(word === "" ? "~" : word, ctx.cwd, subEnv)
+}
+
+function popDirStack(ctx: ScanCtx): void {
+	const top = ctx.stack.pop()
+	if (top === undefined) return
+	ctx.prevCwd = ctx.cwd
+	ctx.cwd = top
+}
+
+function swapDirStack(ctx: ScanCtx): void {
+	const top = ctx.stack.pop()
+	if (top === undefined) return
+	ctx.stack.push(ctx.cwd)
+	ctx.prevCwd = ctx.cwd
+	ctx.cwd = top
+}
+
+function pushdDirUntrackable(dir: string, subEnv: ChainEnv): boolean {
+	if (dir === "" || dir === "-") return true
+	if (isStackRotation(dir) || cdpathBlocks(dir, subEnv)) return true
+	return usesPoisonedVar(dir, subEnv)
+}
+
+function trackPushdPopd(
+	norm: NormalizedArgv,
+	ctx: ScanCtx,
+	subEnv: ChainEnv,
+): void {
+	if (norm.argv0 === "popd") {
+		popDirStack(ctx)
+		return
+	}
+	if (norm.argv0 !== "pushd") return
+	const dir = cdDirOperand(norm.args)
+	if (dir === null) {
+		swapDirStack(ctx)
+		return
+	}
+	if (pushdDirUntrackable(dir, subEnv)) return
+	ctx.stack.push(ctx.cwd)
+	ctx.prevCwd = ctx.cwd
+	ctx.cwd = resolveOperandTarget(dir, ctx.cwd, subEnv)
+}
+
+/** Track inside-only directory changes for later sub-commands. Paren-local
+ * cds (subshells) never leak; rotations are no-ops (the stack holds only
+ * inside dirs, so order is irrelevant to containment). */
+function trackCd(
+	norm: NormalizedArgv | null,
+	ctx: ScanCtx,
+	subEnv: ChainEnv,
+): void {
+	if (norm === null || norm.parenLocal || norm.opaqueEnv) return
+	if (norm.argv0 === "cd") {
+		trackCdDir(norm, ctx, subEnv)
+		return
+	}
+	trackPushdPopd(norm, ctx, subEnv)
+}
+
+interface OperandRule {
+	values: string[]
+	scripts: string[]
+	skipValues: string[]
+	positionals: "last" | "all" | "script-rest" | "none" | "first"
+}
+
+function lastDest(...values: string[]): OperandRule {
+	return { values, scripts: [], skipValues: [], positionals: "last" }
+}
+
+function noPositionals(...values: string[]): OperandRule {
+	return { values, scripts: [], skipValues: [], positionals: "none" }
+}
+
+function allPositionals(): OperandRule {
+	return { values: [], scripts: [], skipValues: [], positionals: "all" }
+}
+
+function scriptRest(...skipValues: string[]): OperandRule {
+	const scripts = ["-e", "-f"]
+	return { values: [], scripts, skipValues, positionals: "script-rest" }
+}
+
+const WRITE_OPERAND_RULES: Record<string, OperandRule> = {
+	cp: lastDest("-t", "--target-directory"),
+	mv: lastDest("-t", "--target-directory"),
+	ln: lastDest("-t", "--target-directory"),
+	install: lastDest("-t", "--target-directory"),
+	rsync: lastDest(),
+	scp: lastDest(),
+	tee: allPositionals(),
+	git: noPositionals("-C", "--git-dir", "--work-tree"),
+	tar: noPositionals("-f", "--file", "-C", "--directory"),
+	sed: scriptRest(),
+	perl: scriptRest("-I", "-F"),
+	curl: noPositionals("-o", "--output", "--output-dir"),
+	wget: noPositionals("-O", "--output-document", "-P", "--directory-prefix"),
+	source: { values: [], scripts: [], skipValues: [], positionals: "first" },
+	".": { values: [], scripts: [], skipValues: [], positionals: "first" },
+}
+
+/** True when a single-dash cluster carries `letter` (`-pi` has `i`) or a
+ * long flag matches. Letters that consume the rest of the word stop the
+ * scan (`-ei` is `-e` with value `i`, not `-i`; `-tf` is `-t` with `f`). */
+function matchesLongFlag(word: string, longs: string[]): boolean {
+	return longs.some((long) => word === long || word.startsWith(`${long}=`))
+}
+
+function clusterCarries(
+	word: string,
+	letter: string,
+	stoppers: string[],
+): boolean {
+	if (!/^-[^-]/.test(word)) return false
+	for (const char of word.slice(1)) {
+		if (stoppers.includes(`-${char}`)) return false
+		if (char === letter) return true
+	}
+	return false
+}
+
+function clusterHasLetter(
+	args: string[],
+	letter: string,
+	stoppers: string[],
+	longs: string[],
+): boolean {
+	for (const word of args) {
+		if (matchesLongFlag(word, longs)) return true
+		if (clusterCarries(word, letter, stoppers)) return true
+	}
+	return false
+}
+
+/** Consume a value flag: separate (`-t DIR`), `--flag=DIR`, or attached
+ * (`-tDIR`) forms. Returns the next index to visit. */
+function attachedFlagValue(word: string, flags: string[]): string | null {
+	if (!/^-[A-Za-z]/.test(word) || word.length <= 2) return null
+	if (!flags.includes(word.slice(0, 2))) return null
+	return word.slice(2)
+}
+
+function consumeValueFlag(
+	word: string,
+	args: string[],
+	index: number,
+	flags: string[],
+	into: string[],
+): number {
+	if (flags.includes(word)) {
+		if (index + 1 < args.length) into.push(args[index + 1] ?? "")
+		return index + 1
+	}
+	const attached = attachedFlagValue(word, flags)
+	if (attached !== null) {
+		into.push(attached)
+		return index
+	}
+	const eq = word.indexOf("=")
+	if (eq > 0 && flags.includes(word.slice(0, eq))) into.push(word.slice(eq + 1))
+	return index
+}
+
+/** tar's `-f` inside a cluster (`-cf ARCHIVE`, `-xffoo.tar`): the archive
+ * follows the `f` (same word) or the word. Separate from the table: `f`
+ * is positional-shape inside clusters, not a plain flag. */
+function tarClusterArchive(args: string[]): string | null {
+	for (let i = 0; i < args.length; i++) {
+		const word = args[i] ?? ""
+		if (!/^-[^-]/.test(word) || word === "-f") continue
+		const at = word.indexOf("f", 1)
+		if (at < 0) continue
+		if (at + 1 < word.length) return word.slice(at + 1)
+		return i + 1 < args.length ? (args[i + 1] ?? null) : null
+	}
+	return null
+}
+
+interface CollectedOperands {
+	fromFlags: string[]
+	positional: string[]
+	scriptSeen: boolean
+}
+
+interface FlagStep {
+	next: number
+	script: boolean
+}
+
+function collectFlagWord(
+	word: string,
+	args: string[],
+	index: number,
+	rule: OperandRule,
+	fromFlags: string[],
+): FlagStep {
+	const before = fromFlags.length
+	let next = consumeValueFlag(word, args, index, rule.values, fromFlags)
+	if (fromFlags.length === before) {
+		next = consumeValueFlag(word, args, next, rule.scripts, [])
+	}
+	const attached = attachedFlagValue(word, rule.scripts) !== null
+	const script = rule.scripts.includes(word) || attached
+	next = consumeValueFlag(word, args, next, rule.skipValues, [])
+	return { next: next + 1, script }
+}
+
+interface CollectState extends CollectedOperands {
+	dashdash: boolean
+}
+
+function collectNextArg(
+	args: string[],
+	index: number,
+	rule: OperandRule,
+	acc: CollectState,
+): number {
+	const word = args[index] ?? ""
+	if (!acc.dashdash && word === "--") {
+		acc.dashdash = true
+		return index + 1
+	}
+	if (!acc.dashdash && word.startsWith("-") && word.length > 1) {
+		const step = collectFlagWord(word, args, index, rule, acc.fromFlags)
+		acc.scriptSeen = acc.scriptSeen || step.script
+		return step.next
+	}
+	acc.positional.push(word)
+	return index + 1
+}
+
+function collectOperandCandidates(
+	args: string[],
+	rule: OperandRule,
+): CollectedOperands {
+	const acc: CollectState = {
+		fromFlags: [], positional: [], scriptSeen: false, dashdash: false,
+	}
+	let i = 0
+	while (i < args.length) i = collectNextArg(args, i, rule, acc)
+	const { fromFlags, positional, scriptSeen } = acc
+	return { fromFlags, positional, scriptSeen }
+}
+
+function positionalCandidates(
+	collected: CollectedOperands,
+	rule: OperandRule,
+): string[] {
+	const positional = collected.positional
+	if (rule.positionals === "last" && positional.length > 0) {
+		const last = positional[positional.length - 1] ?? ""
+		return [last]
+	}
+	if (rule.positionals === "all") return positional
+	if (rule.positionals === "first") return positional.slice(0, 1)
+	if (rule.positionals === "script-rest") {
+		return collected.scriptSeen ? positional : positional.slice(1)
+	}
+	return []
+}
+
+function gitRepoVarEscape(
+	name: string,
+	sub: string,
+	ctx: ScanCtx,
+	subEnv: ChainEnv,
+): WriteOperandEscape | null {
+	const raw = subEnv.overlay.get(name) ?? process.env[name]
+	if (raw === undefined) return null
+	if (subEnv.poison.has(name) || usesPoisonedVar(raw, subEnv)) {
+		const reason = "unresolvable repo pointer"
+		return { subCommand: sub, command: "git", operand: name, reason }
+	}
+	const resolved = resolveOperandTarget(raw, ctx.cwd, subEnv)
+	if (!isOutsideWorkspace(ctx.contain, resolved)) return null
+	const operand = `${name}=${raw}`
+	return { subCommand: sub, command: "git", operand, reason: "git repo escapes" }
+}
+
+function gitRepoEscape(
+	norm: NormalizedArgv,
+	sub: string,
+	ctx: ScanCtx,
+	subEnv: ChainEnv,
+): WriteOperandEscape | null {
+	if (norm.argv0 !== "git") return null
+	for (const name of ["GIT_DIR", "GIT_WORK_TREE"]) {
+		const hit = gitRepoVarEscape(name, sub, ctx, subEnv)
+		if (hit !== null) return hit
+	}
+	return null
+}
+
+function wordWritesOutside(
+	word: string,
+	norm: NormalizedArgv,
+	sub: string,
+	ctx: ScanCtx,
+	subEnv: ChainEnv,
+): WriteOperandEscape | null {
+	if (word === "" || (norm.argv0 === "scp" && word.includes(":"))) return null
+	const check = norm.parenLocal ? word.replace(/\)+$/, "") : word
+	if (usesPoisonedVar(check, subEnv)) {
+		const reason = "unresolvable variable"
+		return { subCommand: sub, command: norm.argv0, operand: word, reason }
+	}
+	const resolved = resolveOperandTarget(check, ctx.cwd, subEnv)
+	if (!isOutsideWorkspace(ctx.contain, resolved)) return null
+	return { subCommand: sub, command: norm.argv0, operand: word }
+}
+
+function writesOutside(
+	words: string[],
+	norm: NormalizedArgv,
+	sub: string,
+	ctx: ScanCtx,
+	subEnv: ChainEnv,
+): WriteOperandEscape | null {
+	for (const word of words) {
+		const hit = wordWritesOutside(word, norm, sub, ctx, subEnv)
+		if (hit !== null) return hit
+	}
+	return null
+}
+
+function tarWriteHit(
+	norm: NormalizedArgv,
+	sub: string,
+	ctx: ScanCtx,
+	subEnv: ChainEnv,
+): WriteOperandEscape | null {
+	if (norm.argv0 !== "tar") return null
+	const absolute = clusterHasLetter(norm.args, "P", ["-f"], ["--absolute-names"])
+	if (absolute) {
+		const reason = "absolute-name extraction"
+		return { subCommand: sub, command: "tar", operand: "-P", reason }
+	}
+	const archive = tarClusterArchive(norm.args)
+	if (archive === null) return null
+	return writesOutside([archive], norm, sub, ctx, subEnv)
+}
+
+/** sed/perl without `-i` read their files (stdout carries the output);
+ * only in-place edits write, so only those are gated. */
+function inPlaceEditGated(norm: NormalizedArgv): boolean {
+	if (norm.argv0 !== "sed" && norm.argv0 !== "perl") return true
+	const base = ["-e", "-f"]
+	const stoppers = norm.argv0 === "perl" ? [...base, "-I", "-F"] : base
+	return clusterHasLetter(norm.args, "i", stoppers, ["--in-place"])
+}
+
+/** A hard link's TARGET is read (an outside inode smuggled in); a symlink
+ * target is inert text (file tools refuse to follow escapes later). */
+function hardlinkTargetHit(
+	norm: NormalizedArgv,
+	sub: string,
+	ctx: ScanCtx,
+	subEnv: ChainEnv,
+	positional: string[],
+): WriteOperandEscape | null {
+	if (norm.argv0 !== "ln") return null
+	if (clusterHasLetter(norm.args, "s", ["-t"], ["--symbolic"])) return null
+	const first = positional[0] ?? ""
+	if (first === "") return null
+	return writesOutside([first], norm, sub, ctx, subEnv)
+}
+
+function tableOperandEscape(
+	norm: NormalizedArgv,
+	sub: string,
+	ctx: ScanCtx,
+	subEnv: ChainEnv,
+): WriteOperandEscape | null {
+	const rule = WRITE_OPERAND_RULES[norm.argv0]
+	if (rule === undefined) return null
+	const tarHit = tarWriteHit(norm, sub, ctx, subEnv)
+	if (tarHit !== null) return tarHit
+	if (!inPlaceEditGated(norm)) return null
+	const collected = collectOperandCandidates(norm.args, rule)
+	const flagHit = writesOutside(collected.fromFlags, norm, sub, ctx, subEnv)
+	if (flagHit !== null) return flagHit
+	const positional = positionalCandidates(collected, rule)
+	const hit = writesOutside(positional, norm, sub, ctx, subEnv)
+	if (hit !== null) return hit
+	return hardlinkTargetHit(norm, sub, ctx, subEnv, collected.positional)
+}
+
+const SHELL_COMMANDS = new Set(["sh", "bash", "dash", "zsh", "ksh"])
+
+function shellOptionTakesValue(flag: string): boolean {
+	return flag === "-o" || flag === "-O" || flag === "+o" || flag === "+O"
+}
+
+/** First script-file operand of a shell invocation (no `-c`): `-o`/`-O`
+ * values are consumed, every other dash-word skipped. */
+function shellScriptFile(args: string[]): string | null {
+	let i = 0
+	while (i < args.length) {
+		const word = args[i] ?? ""
+		if (word === "--") return args[i + 1] ?? null
+		if (word.startsWith("-") && word.length > 1) {
+			i += shellOptionTakesValue(word) ? 2 : 1
+			continue
+		}
+		return word
+	}
+	return null
+}
+
+function findDashCScript(args: string[]): string | null {
+	for (let i = 0; i < args.length; i++) {
+		const word = args[i] ?? ""
+		if (word === "-c" || word === "--command") return args[i + 1] ?? null
+		if (word.startsWith("--command=")) return word.slice("--command=".length)
+	}
+	return null
+}
+
+function shellStdinOpaque(
+	norm: NormalizedArgv,
+	sub: string,
+): WriteOperandEscape {
+	const explicit = norm.args.some((word) => word === "-s" || word === "--stdin")
+	const operand = explicit ? "-s" : "(stdin)"
+	const reason = "stdin script is opaque"
+	return { subCommand: sub, command: norm.argv0, operand, reason }
+}
+
+function shellScriptFileHit(
+	norm: NormalizedArgv,
+	sub: string,
+	ctx: ScanCtx,
+	subEnv: ChainEnv,
+): WriteOperandEscape | null {
+	const file = shellScriptFile(norm.args)
+	if (file === null || file === "") return null
+	const resolved = resolveOperandTarget(file, ctx.cwd, subEnv)
+	if (!isOutsideWorkspace(ctx.contain, resolved)) return null
+	return { subCommand: sub, command: norm.argv0, operand: file }
+}
+
+/** Shell invocations: `-c` scripts are scanned (forked context — a child
+ * shell never leaks exports/cwd); `-s`/redirected-stdin/bare shells are
+ * opaque (refused); a script FILE outside the workspace is refused (its
+ * contents are a documented boundary — inside scripts run unscanned).
+ * Piped-stdin shells (`... | bash`) are invisible per-sub-command and pass;
+ * flag-only probes (`bash --version`) are safe no-ops and pass. */
+function shellInvocationEscape(
+	norm: NormalizedArgv,
+	sub: string,
+	ctx: ScanCtx,
+	subEnv: ChainEnv,
+	out: ScanOut,
+): WriteOperandEscape | null {
+	if (!SHELL_COMMANDS.has(norm.argv0)) return null
+	const script = findDashCScript(norm.args)
+	if (script !== null) {
+		scanPartsShared(parseCommand(script).commands, forkScanCtx(ctx), out)
+		return null
+	}
+	const dashS = norm.args.some((word) => word === "-s" || word === "--stdin")
+	if (dashS || norm.args.length === 0 || /</.test(sub)) {
+		return shellStdinOpaque(norm, sub)
+	}
+	return shellScriptFileHit(norm, sub, ctx, subEnv)
+}
+
+function opaqueEnvOpEscape(
+	norm: NormalizedArgv,
+	sub: string,
+): WriteOperandEscape {
+	return {
+		subCommand: sub,
+		command: "env",
+		operand: norm.opaqueFlag ?? "-i",
+		reason: "cleared environment is opaque",
+	}
+}
+
+function opEscapeInArgv(
+	norm: NormalizedArgv,
+	sub: string,
+	ctx: ScanCtx,
+	subEnv: ChainEnv,
+	out: ScanOut,
+): WriteOperandEscape | null {
+	if (norm.opaqueEnv) return opaqueEnvOpEscape(norm, sub)
+	if (norm.argv0 === "eval") {
+		scanPartsShared(parseCommand(norm.args.join(" ")).commands, ctx, out)
+		return null
+	}
+	const shellHit = shellInvocationEscape(norm, sub, ctx, subEnv, out)
+	if (shellHit !== null) return shellHit
+	if (SHELL_COMMANDS.has(norm.argv0)) return null
+	const tableHit = tableOperandEscape(norm, sub, ctx, subEnv)
+	if (tableHit !== null) return tableHit
+	return gitRepoEscape(norm, sub, ctx, subEnv)
+}
+
+function redirEscapeInSub(
+	sub: string,
+	ctx: ScanCtx,
+	subEnv: ChainEnv,
+): RedirectTarget | null {
+	for (const target of redirectTargets(sub)) {
+		if (usesPoisonedVar(target.word, subEnv)) return target
+		const resolved = resolveOperandTarget(target.word, ctx.cwd, subEnv)
+		if (isOutsideWorkspace(ctx.contain, resolved)) return target
+	}
+	return null
+}
+
+function readVarOperands(args: string[]): string[] {
+	const takesValue = new Set(["-p", "-d", "-n", "-N", "-t", "-u"])
+	let i = 0
+	while (i < args.length) {
+		const word = args[i] ?? ""
+		if (word === "--") {
+			i++
+			break
+		}
+		if (word.startsWith("-") && word.length > 1) {
+			i += takesValue.has(word) ? 2 : 1
+			continue
+		}
+		break
+	}
+	return args.slice(i)
+}
+
+/** `read` binds names from input (unresolvable): poison its operands so
+ * later uses fail closed. */
+function poisonReadVars(norm: NormalizedArgv | null, env: ChainEnv): void {
+	if (norm === null || norm.argv0 !== "read") return
+	for (const name of readVarOperands(norm.args)) {
+		if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+			env.poison.add(name)
+			env.overlay.delete(name)
+		}
+	}
+}
+
+/** Atomic paren groups walk in a fork (subshells never leak cwd or
+ * exports); hits still propagate out. Returns whether it applied. */
+function scanParenGroup(sub: string, ctx: ScanCtx, out: ScanOut): boolean {
+	const trimmed = sub.trim()
+	if (!trimmed.startsWith("(")) return false
+	const inner = trimmed.replace(/^\(+/, "").replace(/\)+$/, "")
+	scanPartsShared(parseCommand(inner).commands, forkScanCtx(ctx), out)
+	return true
+}
+
+/** Argv scans with explicit first-wins (never ??=): the op scan recurses
+ * into `-c`/eval scripts, recording hits as a side effect — a ??= would
+ * evaluate the nullish check BEFORE the RHS and clobber a
+ * recursion-recorded hit with the outer call's own null. */
+function scanSubArgv(
+	norm: NormalizedArgv,
+	sub: string,
+	ctx: ScanCtx,
+	subEnv: ChainEnv,
+	out: ScanOut,
+): void {
+	const cdHit = cdEscapeInArgv(norm, sub, ctx, subEnv)
+	if (out.cd === null) out.cd = cdHit
+	const opHit = opEscapeInArgv(norm, sub, ctx, subEnv, out)
+	if (opHit !== null && out.op === null) out.op = opHit
+	poisonReadVars(norm, ctx.env)
+}
+
+/** Check one sub-command (all three scans), then harvest its assignments
+ * and track its cd for LATER sub-commands. */
+function scanSubShared(sub: string, ctx: ScanCtx, out: ScanOut): void {
+	if (sub.trim() === "" || scanParenGroup(sub, ctx, out)) return
+	const words = splitCommandWords(sub)
+	const norm = normalizeArgv(words)
+	const subEnv = mergeChainEnv(ctx.env, norm?.local ?? newChainEnv())
+	if (norm !== null) scanSubArgv(norm, sub, ctx, subEnv, out)
+	const redirHit = redirEscapeInSub(sub, ctx, subEnv)
+	if (out.redir === null) out.redir = redirHit
+	if (norm !== null) trackCd(norm, ctx, subEnv)
+	harvestSubAssignments(words, ctx.env)
+}
+
+/** Ordered walk with resplit fixpoint: a sub-command that re-splits is
+ * promoted-subshell content (top-level operators always split), so its
+ * parts walk forked. Re-splitting strictly shrinks the strings. */
+function scanPartsShared(parts: string[], ctx: ScanCtx, out: ScanOut): void {
+	for (const sub of parts) {
+		const resplit = parseCommand(sub).commands
+		if (resplit.length > 1) {
+			scanPartsShared(resplit, forkScanCtx(ctx), out)
+			continue
+		}
+		scanSubShared(sub, ctx, out)
+	}
+}
+
+function scanWholeCommand(command: string, workspaceRoot?: string): ScanOut {
+	const ctx = newScanCtx(workspaceRoot ?? process.cwd())
+	prePoisonRawAssignments(command, ctx.env)
+	const out = newScanOut()
+	scanPartsShared(parseCommand(command).commands, ctx, out)
+	return out
+}
+
+/**
+ * Check a command for a directory change escaping the workspace root:
+ * `cd`/`pushd` to an outside path, bare `cd` ($HOME), `cd` with an
+ * unresolvable operand, or an opaque environment (`env -i`). Per-sub-command
+ * argv analysis (unlike the redirect raw scan): `echo "cd /tmp"` and
+ * heredoc bodies naming cd are dead text, correctly allowed.
+ */
+export function checkCdEscape(
+	command: string,
+	workspaceRoot?: string,
+): CdEscape | null {
+	return scanWholeCommand(command, workspaceRoot).cd
+}
+
+/**
+ * Check a command for file-writing operands escaping the workspace root:
+ * copy/move/link/install/rsync/scp destinations, `tee` outputs, `git`
+ * repo pointers (`-C`, `--git-dir`, `--work-tree`, `GIT_DIR`), `tar`
+ * archives/dirs, in-place `sed`/`perl` files, downloader outputs, and
+ * shell script files. Reads (`cat /etc/x`) and remote scp (`h:/x`) pass.
+ */
+export function checkWriteOperandEscape(
+	command: string,
+	workspaceRoot?: string,
+): WriteOperandEscape | null {
+	return scanWholeCommand(command, workspaceRoot).op
 }
 
 // ─── allow/deny logic port (zoo-code/src/core/auto-approval/commands.ts) ────
@@ -901,9 +1903,21 @@ export interface CommandRefusal {
 	 * - "protected_store": recursive delete targeting the shared central store
 	 *   or a parent of it — always blocked, NOT configurable (see
 	 *   src/permissions/store-protection.ts).
+	 * - "cd_escape": a directory change escaping the workspace root — always
+	 *   blocked, NOT configurable (issue #136).
+	 * - "write_escape": a file-writing operand escaping the workspace root —
+	 *   always blocked, NOT configurable (issue #136).
 	 */
-	kind: "dangerous" | "malformed" | "redirect_escape" | "denied" | "not_allowed" | "protected_store"
-	/** The sub-command that triggered the refusal (denied/not_allowed/protected_store/redirect_escape). */
+	kind:
+		| "dangerous"
+		| "malformed"
+		| "redirect_escape"
+		| "denied"
+		| "not_allowed"
+		| "protected_store"
+		| "cd_escape"
+		| "write_escape"
+	/** The sub-command that triggered the refusal (all kinds but dangerous). */
 	subCommand?: string
 	/** The deny-list pattern that matched (denied). */
 	pattern?: string
@@ -915,6 +1929,10 @@ export interface CommandRefusal {
 	storeRoot?: string
 	/** The redirect that escaped the workspace (redirect_escape). */
 	redirect?: RedirectTarget
+	/** The directory change that escaped the workspace (cd_escape). */
+	cd?: CdEscape
+	/** The file-writing operand that escaped (write_escape). */
+	writeOperand?: WriteOperandEscape
 }
 
 /**
@@ -934,12 +1952,15 @@ export interface CommandRefusal {
  *    to `/tmp`. Runs before parsing so it also catches redirects embedded in
  *    unparseable fragments (e.g. a heredoc body's own `> /tmp` line).
  * 4. Each sub-command from `parseCommand` (so `echo hi && rm -rf /` is checked
- *    per sub-command, not as one opaque string): FIRST the central-store
- *    protection (recursive delete targeting the shared store or a parent of it
- *    — always refused, even with empty allow/deny config, and NOT overridable
- *    by any permissions config), THEN the redirect-escape guard per
- *    sub-command, then the deny-list, then the allow-list, with upstream's
- *    longest-prefix-match precedence.
+ *    per sub-command, not as one opaque string), in one ordered walk that
+ *    threads the cd-chain cwd and chain exports: FIRST the cd-escape guard
+ *    (an outside-cd re-anchors every later relative path, so it refuses
+ *    before anything else is resolved — issue #136), THEN the central-store
+ *    protection (recursive delete targeting the shared store or a parent of
+ *    it — always refused, even with empty allow/deny config, and NOT
+ *    overridable by any permissions config), THEN the redirect-escape and
+ *    write-operand guards per sub-command, then the deny-list, then the
+ *    allow-list, with upstream's longest-prefix-match precedence.
  *
  * `options.workspaceRoot` anchors relative command targets for the
  * central-store and redirect-escape checks (the executor passes the command's
@@ -960,9 +1981,15 @@ export function checkCommand(
  	return { kind: "dangerous" }
  }
 
- // Pre-parse redirect-escape scan: redirectTargets walks the raw command
- // (heredoc bodies included), so it still catches redirects that parseCommand
- // would classify as malformed (unterminated quote/heredoc).
+ // Pre-parse scans (cd first, then redirect): both walk the raw command
+ // (heredoc bodies included), so they still catch escapes that parseCommand
+ // would classify as malformed (unterminated quote/heredoc). cd precedes
+ // the redirect for the same reason it precedes it per sub-command: an
+ // outside-cd re-anchors every later relative path.
+ const cdEscape = checkCdEscape(command, options?.workspaceRoot)
+ if (cdEscape !== null) {
+ 	return { kind: "cd_escape", subCommand: command, cd: cdEscape }
+ }
  const redirectEscape = checkRedirectEscape(command, options?.workspaceRoot)
  if (redirectEscape !== null) {
  	return { kind: "redirect_escape", subCommand: command, redirect: redirectEscape }
@@ -973,72 +2000,63 @@ export function checkCommand(
  	return { kind: "malformed", parseError, subCommand: command }
  }
 
-	// Track a leading `cd <dir> && ...` chain's effective cwd across
-	// sub-commands (SEC-6): `cd /tmp && rm -rf x` must resolve `x` against
-	// /tmp, not the pre-cd workspace root, or a relative-path rm evades the
-	// central-store check. Only a plain `cd <path>` sub-command updates the
-	// tracked cwd (best-effort — `cd` inside a subshell, via a variable, or
-	// via `pushd`/`popd` is not tracked; see store-protection.ts header).
-	let effectiveCwd = path.resolve(options?.workspaceRoot ?? process.cwd())
+	// One ordered walk threads the cd-chain cwd, directory stack, and chain
+	// exports across sub-commands (SEC-6): relative targets resolve against
+	// the tracked cwd, containment always against the workspace root.
+	const ctx = newScanCtx(options?.workspaceRoot ?? process.cwd())
+	prePoisonRawAssignments(command, ctx.env)
 
 	for (const sub of subCommands) {
 		const cmd = sub.replace(/\d*>&\d*/, "").trim()
 		if (!cmd) {
 			continue
 		}
-		// Always-applied central-store protection: runs before (and
-		// independently of) the allow/deny lists, so the empty-allow-list
-		// default-ALLOW branch can never bypass it and no permissions.json
-		// entry can override it.
-		const storeRefusal = checkCentralStoreDestruction(cmd, effectiveCwd)
-		if (storeRefusal !== null) {
-			return {
-				kind: "protected_store",
-				subCommand: cmd,
-				target: storeRefusal.target,
-				storeRoot: storeRefusal.storeRoot,
-			}
-		}
-		// Per-sub-command redirect-escape guard (the pre-parse scan above is
-		// the same check on the whole command; this names the offending
-		// sub-command for the refusal message). Anchored to the tracked
-		// cd-chain cwd for the same reason as the store-destruction check
-		// above — a relative redirect after `cd /tmp && ...` must resolve
-		// against /tmp, not the pre-cd workspace root.
-		const subRedirect = checkRedirectEscape(cmd, effectiveCwd)
-		if (subRedirect !== null) {
-			return { kind: "redirect_escape", subCommand: cmd, redirect: subRedirect }
-		}
-		const refusal = checkSingleCommand(cmd, allowedCommands, deniedCommands)
+		const refusal = checkOneSubCommand(cmd, ctx, allowedCommands, deniedCommands)
 		if (refusal !== null) {
 			return refusal
-		}
-		const cdTarget = matchLeadingCd(cmd)
-		if (cdTarget !== null) {
-			effectiveCwd = path.resolve(effectiveCwd, expandEnv(expandHome(cdTarget)))
 		}
 	}
 
  return null
 }
 
-/**
- * When `cmd` is a plain `cd <path>` (optionally quoted, no other words), return
- * the raw path argument; otherwise null. Deliberately narrow — `cd` combined
- * with anything else on the same sub-command word (e.g. `cd /tmp; ls`, already
- * split by parseCommand into separate sub-commands) or with no argument
- * (`cd` alone, which goes to $HOME) is not tracked.
- */
-function matchLeadingCd(cmd: string): string | null {
-	const m = cmd.match(/^cd\s+(.+)$/)
-	if (!m) {
-		return null
+function checkSubStore(cmd: string, ctx: ScanCtx): CommandRefusal | null {
+	const storeRefusal = checkCentralStoreDestruction(cmd, ctx.cwd, ctx.env)
+	if (storeRefusal === null) return null
+	return {
+		kind: "protected_store",
+		subCommand: cmd,
+		target: storeRefusal.target,
+		storeRoot: storeRefusal.storeRoot,
 	}
-	let arg = m[1].trim()
-	if ((arg.startsWith('"') && arg.endsWith('"')) || (arg.startsWith("'") && arg.endsWith("'"))) {
-		arg = arg.slice(1, -1)
+}
+
+function checkSubScans(cmd: string, ctx: ScanCtx): CommandRefusal | null {
+	const out = newScanOut()
+	scanSubShared(cmd, ctx, out)
+	if (out.cd !== null) {
+		return { kind: "cd_escape", subCommand: cmd, cd: out.cd }
 	}
-	return arg || null
+	const store = checkSubStore(cmd, ctx)
+	if (store !== null) return store
+	if (out.redir !== null) {
+		return { kind: "redirect_escape", subCommand: cmd, redirect: out.redir }
+	}
+	if (out.op !== null) {
+		return { kind: "write_escape", subCommand: cmd, writeOperand: out.op }
+	}
+	return null
+}
+
+function checkOneSubCommand(
+	cmd: string,
+	ctx: ScanCtx,
+	allowedCommands: string[],
+	deniedCommands: string[],
+): CommandRefusal | null {
+	const scans = checkSubScans(cmd, ctx)
+	if (scans !== null) return scans
+	return checkSingleCommand(cmd, allowedCommands, deniedCommands)
 }
 
 function checkSingleCommand(
