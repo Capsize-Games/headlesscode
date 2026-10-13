@@ -30,3 +30,8 @@ export interface EmbedResult {
 	promptTokens: number
 	totalTokens: number
 }
+
+/** Truncate a raw provider body to a bounded excerpt for error messages. */
+export function excerpt(body: string): string {
+	return body.length > 500 ? `${body.slice(0, 500)}…` : body
+}
