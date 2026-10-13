@@ -36,7 +36,7 @@ process.env.GIT_CEILING_DIRECTORIES = [...new Set(gitCeilings)].join(path.delimi
  * remembered to invoke it separately — the only DIRECT check that the
  * vendored Zoo Code prompt builder still imports and runs headlessly.
  */
-const EXTRA_FILES = ["scripts/check-page-script.mjs", "scripts/check-tmpdir-project-store.mjs", "src/vendor/tests/smoke.ts"]
+const EXTRA_FILES = ["scripts/check-page-script.mjs", "scripts/check-tmpdir-project-store.mjs", "scripts/coverage.test.mjs", "scripts/check-code-standards.test.mjs", "scripts/check-architecture.test.mjs", "src/vendor/tests/smoke.ts"]
 
 function findTestFiles(dir) {
 	const found = []
