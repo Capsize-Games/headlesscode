@@ -366,6 +366,13 @@ async function testMcpCloseRetainsFailedTransportForDispose(workspaceRoot: strin
 		processRef.kill = originalKill
 		if (serverPid > 0) {
 			try { originalKill(-serverPid, "SIGKILL") } catch { /* fixture process group may already be gone */ }
+			// Fall back to the server pid itself: the group kill demonstrably
+			// misses in sealed guests (observed RSI eval failure), leaving the
+			// server alive for the reap check below. Direct kill matches the
+			// descendant reap; the pid is fixture-owned either way.
+			try {
+				originalKill(serverPid, "SIGKILL")
+			} catch { /* server may already be gone */ }
 			assert.equal(await processIsGone(serverPid), true, "test reaps the MCP server after restoring real signals")
 		}
 		if (descendantPid > 0) {
