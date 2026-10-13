@@ -427,7 +427,9 @@ function assertLinuxProcessTerminal(pid: number, message: string, expected?: Tes
 	catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return; throw error }
 	assert.equal(process.platform, "linux", "only Linux procfs can distinguish a non-running zombie from a live process")
 	const current = readTestProcessIdentity(pid)
-	assert.ok(current, `${message} (process stat remains readable)`)
+	// Reaped between the signal probe above and this read: same as ESRCH,
+	// the process is terminal (widens under coverage/load scheduling gaps).
+	if (!current) return
 	if (expected) assert.deepEqual({ ...current, state: expected.state }, { ...expected, state: expected.state }, "a remaining terminal PID is the exact captured process identity")
 	assert.ok(current.state === "Z" || current.state === "X", `${message} (observed state ${current.state})`)
 }
