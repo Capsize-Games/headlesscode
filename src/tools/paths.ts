@@ -15,6 +15,15 @@ import { PathTraversalError } from "./path-traversal-error.js"
 import { SymlinkEscapeError } from "./symlink-escape-error.js"
 
 /**
+ * True when `candidate` is `root` itself or lives beneath it.
+ * Single home for the prefix-containment check used by both the lexical
+ * guard and the symlink-following guard below.
+ */
+function isWithinRoot(root: string, candidate: string): boolean {
+	return candidate === root || candidate.startsWith(root + path.sep)
+}
+
+/**
  * Resolve `p` against the workspace root and reject anything that escapes it.
  *
  * Two layers of containment (issue #64):
@@ -40,7 +49,7 @@ import { SymlinkEscapeError } from "./symlink-escape-error.js"
 export function resolveWithinWorkspace(root: string, p: string): string {
 	const rootAbs = path.resolve(root)
 	const target = path.resolve(rootAbs, p)
-	if (target !== rootAbs && !target.startsWith(rootAbs + path.sep)) {
+	if (!isWithinRoot(rootAbs, target)) {
 		throw new PathTraversalError(p, rootAbs)
 	}
 	assertNoSymlinkEscape(rootAbs, target, p)
@@ -103,7 +112,7 @@ function throwIfEscaped(
 	rootAbs: string,
 	requested: string,
 ): void {
-	if (real !== rootReal && !real.startsWith(rootReal + path.sep)) {
+	if (!isWithinRoot(rootReal, real)) {
 		throw new SymlinkEscapeError(requested, rootAbs, real)
 	}
 }
