@@ -173,7 +173,7 @@ async function extractPythonEdges(root: string, modules: ModuleEntry[]): Promise
 	try {
 		parsed = JSON.parse(stdout)
 	} catch {
-		console.warn("[codemap] python extractor returned malformed output — skipped")
+		process.stderr.write("[codemap] python extractor returned malformed output — skipped\n")
 		return { edges, externalDeps }
 	}
 	for (const [file, imports] of Object.entries(parsed.files ?? {})) {
@@ -292,7 +292,7 @@ function runPythonExtractor(root: string, files: string[]): Promise<string | und
 			if (code === 0) {
 				resolve(stdout)
 			} else {
-				console.warn(`[codemap] python extractor exited ${code}: ${stderr.trim().slice(0, 400)}`)
+				process.stderr.write(`[codemap] python extractor exited ${code}: ${stderr.trim().slice(0, 400)}\n`)
 				resolve(undefined)
 			}
 		})
