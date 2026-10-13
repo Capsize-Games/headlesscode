@@ -51,13 +51,33 @@ export async function runOpenShellSubsession<T>(
 	}
 }
 
-function remapWorkspacePaths(value: unknown, workspace: string): any {
+function remapWorkspacePaths<T>(value: T, workspace: string): T {
 	if (typeof value === "string") {
-		if (value === workspace) return "/workspace"
-		if (value.startsWith(`${workspace}${path.sep}`)) return `/workspace${value.slice(workspace.length).split(path.sep).join("/")}`
+		if (value === workspace) return "/workspace" as unknown as T
+		if (value.startsWith(`${workspace}${path.sep}`)) {
+			const suffix = value
+				.slice(workspace.length)
+				.split(path.sep)
+				.join("/")
+			return `/workspace${suffix}` as unknown as T
+		}
 		return value
 	}
-	if (Array.isArray(value)) return value.map((item) => remapWorkspacePaths(item, workspace))
-	if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, remapWorkspacePaths(item, workspace)]))
+	if (Array.isArray(value)) {
+		const items = (value as unknown[]).map((item) =>
+			remapWorkspacePaths(item, workspace)
+		)
+		return items as unknown as T
+	}
+	if (value && typeof value === "object") {
+		const entries = Object.entries(
+			value as unknown as Record<string, unknown>,
+		)
+		const remapped = entries.map(([key, item]) => [
+			key,
+			remapWorkspacePaths(item, workspace),
+		])
+		return Object.fromEntries(remapped) as unknown as T
+	}
 	return value
 }
