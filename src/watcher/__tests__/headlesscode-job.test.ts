@@ -138,7 +138,9 @@ async function testForgedWorktreeMarkersCannotFinishLiveWorker(): Promise<void> 
 		assert.equal(h.closed, false, "worker-controlled markers cannot close an issue while its process group is live")
 	} finally {
 		if (child.pid) {
-			try { process.kill(-child.pid, "SIGKILL") } catch { /* fixture already exited */ }
+			// Direct kill: the exec'd fixture is a single-process group,
+			// and group signals are denied in the eval sandbox.
+			try { child.kill("SIGKILL") } catch { /* fixture already exited */ }
 		}
 	}
 	await run(h)
@@ -198,7 +200,9 @@ async function testStaleAttemptAndUnknownIdentityStayRunning(): Promise<void> {
 		assert.equal((await loadWatcherState(h.stateFile)).processed[String(h.issue.number)]?.status, "spawned", "a reused PID does not prove the captured process group is gone")
 	} finally {
 		if (reused.pid) {
-			try { process.kill(-reused.pid, "SIGKILL") } catch { /* fixture already exited */ }
+			// Direct kill: the exec'd fixture is a single-process group,
+			// and group signals are denied in the eval sandbox.
+			try { reused.kill("SIGKILL") } catch { /* fixture already exited */ }
 		}
 	}
 }
