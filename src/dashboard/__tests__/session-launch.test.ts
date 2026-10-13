@@ -357,8 +357,20 @@ async function testModesEndpointRequiresRepo(): Promise<void> {
 
 async function testTokenGatesControlPlanePosts(): Promise<void> {
 	const repo = await tmpRepo()
+	// Inject the fake CLI (like the spawn tests above): without it, the
+	// good-auth POST below launches a REAL detached session
+	// (`--task x --mode multi-agent-orchestrator-headless`) that the test
+	// never reaps — every suite run leaked one live orchestrator burning
+	// real LLM tokens until it blocked on .harness.needs-decision forever.
+	const fake = await makeFakeCli()
 	try {
-		const server = await startDashboardServer({ port: 0, repo, token: "sekret" })
+		const server = await startDashboardServer({
+			port: 0,
+			repo,
+			token: "sekret",
+			cli: `node ${fake.script}`,
+			repoRoot: fake.dir,
+		})
 		const addr = server.address()
 		const port = typeof addr === "object" && addr ? addr.port : 0
 		const base = `http://127.0.0.1:${port}`
@@ -383,6 +395,10 @@ async function testTokenGatesControlPlanePosts(): Promise<void> {
 				body: JSON.stringify({ task: "x" }),
 			})
 			assert.equal(goodAuth.status, 200)
+			// The launch went to the FAKE cli (not a real session): its
+			// marker file proves the child that spawned was ours.
+			await sleep(300)
+			await fs.access(fake.marker)
 
 			// GETs are unaffected (read-only stays open).
 			const getEvents = await fetch(base + "/api/session/nope/events")
@@ -391,6 +407,13 @@ async function testTokenGatesControlPlanePosts(): Promise<void> {
 			server.close()
 		}
 	} finally {
+		try {
+			const pidRaw = await fs.readFile(fake.marker, "utf-8")
+			process.kill(Number(pidRaw), "SIGKILL")
+		} catch {
+			// already gone (the 401 paths spawn nothing)
+		}
+		await fs.rm(fake.dir, { recursive: true, force: true })
 		await fs.rm(repo, { recursive: true, force: true })
 	}
 }
