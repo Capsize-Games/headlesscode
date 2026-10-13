@@ -336,6 +336,28 @@ async function testInlineMusePromptUsesIgnoredScratchAndCleansUp(): Promise<void
 	}
 }
 
+function isAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0)
+		return true
+	} catch {
+		return false
+	}
+}
+
+async function stopWorkerGroup(group: string, pid: number): Promise<void> {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			process.kill(-Number(group), "SIGTERM")
+			return
+		} catch {
+			if (!isAlive(pid)) return
+			if (attempt >= 9) throw new Error(`group ${group} stuck`)
+			await sleep(100)
+		}
+	}
+}
+
 async function testMuseProcessStaysInRecordedKillableWorkerGroup(): Promise<void> {
 	const fake = await setupFakeMuse()
 	const pidFile = path.join(fake.root, "muse.pid")
@@ -369,7 +391,11 @@ async function testMuseProcessStaysInRecordedKillableWorkerGroup(): Promise<void
 		} else {
 			assert.equal(museGroup, workerGroup, "Muse runs in the same process group the stop command signals")
 		}
-		process.kill(-Number(workerGroup), "SIGTERM")
+		// Group signaling can race wrapper teardown under load
+		// (EPERM/ESRCH for a transient group in a loaded sandbox).
+		// Retry briefly; the invariant below still fails loudly if
+		// the worker survives an actually-signalled group.
+		await stopWorkerGroup(workerGroup, musePid)
 		await sleep(100)
 		assert.throws(() => process.kill(musePid, 0), "Muse process exits when its worker process group is stopped")
 	} finally {
