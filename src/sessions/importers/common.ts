@@ -32,6 +32,11 @@ export function safeString(value: unknown, max = 64 * 1024): string | undefined 
 	return value.length <= max ? value : `${value.slice(0, max)}… [truncated]`
 }
 
+export function parseTimestamp(value: unknown): string | undefined {
+	if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) return undefined
+	return value
+}
+
 export function jsonDepth(value: unknown, depth = 0): number {
 	if (depth > IMPORT_LIMITS.jsonDepth) return depth
 	if (Array.isArray(value)) return value.reduce<number>((max, item) => Math.max(max, jsonDepth(item, depth + 1)), depth)

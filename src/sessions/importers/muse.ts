@@ -1,10 +1,5 @@
 import type { SessionMessage, ArchivedToolCall } from "../types.js"
-import { isRecord, opaque, type ParsedImport, safeString } from "./common.js"
-
-function timestamp(value: unknown): string | undefined {
-	if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) return undefined
-	return value
-}
+import { isRecord, opaque, type ParsedImport, parseTimestamp as timestamp, safeString } from "./common.js"
 
 function contentText(value: unknown): string | null {
 	if (typeof value === "string") return value

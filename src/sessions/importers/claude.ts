@@ -1,10 +1,5 @@
 import type { SessionMessage, ArchivedToolCall } from "../types.js"
-import { isRecord, opaque, type ParsedImport, safeString } from "./common.js"
-
-function time(value: unknown): string | undefined {
-	if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) return undefined
-	return value
-}
+import { isRecord, opaque, type ParsedImport, parseTimestamp as time, safeString } from "./common.js"
 
 function blocksToMessages(role: SessionMessage["role"], content: unknown, timestamp?: string): SessionMessage[] {
 	if (typeof content === "string") return [{ role, content, ...(timestamp ? { timestamp } : {}) }]
