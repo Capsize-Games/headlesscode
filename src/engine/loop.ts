@@ -99,7 +99,6 @@ import type { SkillRegistry } from "../skills/registry.js"
 import { readEnabledSkillRoots } from "../skills/store.js"
 import { findMatchingPattern } from "../permissions/protected-files.js"
 import { createExtension, extensionBundleDigest, listExtensions, loadExtension, validateExtensionBundle } from "../extensions/registry.js"
-import type { ExtensionRevision, ExtensionSummary } from "../extensions/registry.js"
 import { isExtensionToolName, appendExtensionTools } from "../extensions/tools.js"
 import { SessionExtensionRuntime } from "../extensions/runtime.js"
 import { extractEmbeddedToolCall, parseToolCalls } from "./parser.js"
@@ -169,6 +168,13 @@ import {
 import { writeHandoffSummary } from "./handoff.js"
 import type { EvidenceInput, EvidenceJournal } from "../evidence/types.js"
 import { canonicalJson, sha256 } from "../evidence/canonical.js"
+import {
+	boundedExtensionJson,
+	extensionIdentity,
+	extensionSummaryData,
+	hasExecutorWorkspaceWriteTool,
+	hasWorkspaceWriteTool,
+} from "./loop-helpers.js"
 
 export function combineAbortSignals(signals: readonly (AbortSignal | undefined)[]): { signal: AbortSignal; dispose: () => void } {
 	const controller = new AbortController()
@@ -6359,31 +6365,6 @@ export const TRUNCATION_BATCH_SIZE = 10
  * system prompt / messages[0] are left untouched so the provider's cached
  * prompt prefix survives the switch.
  */
-function hasWorkspaceWriteTool(tools: readonly ChatTool[]): boolean {
-	const writers = new Set(["write_to_file", "apply_diff", "search_replace", "edit_file", "set_indentation"])
-	return tools.some((tool) => tool.type === "function" && writers.has(tool.function.name))
-}
-
-function hasExecutorWorkspaceWriteTool(executor: ToolExecutor): boolean {
-	return ["write_to_file", "apply_diff", "search_replace", "edit_file", "set_indentation"].some((name) => executor.has(name))
-}
-
-function extensionIdentity(revision: ExtensionRevision): { kind: "skill" | "tool" | "mcp"; id: string; digest: string } {
-	return { kind: revision.manifest.kind, id: revision.manifest.id, digest: revision.digest }
-}
-
-function extensionSummaryData(summary: ExtensionSummary): { manifest: ExtensionSummary["manifest"]; digest: string } {
-	return { manifest: summary.manifest, digest: summary.digest }
-}
-
-function boundedExtensionJson(value: unknown): string {
-	const serialized = JSON.stringify(value)
-	if (typeof serialized !== "string" || Buffer.byteLength(serialized, "utf8") > 512 * 1024) {
-		throw new Error("extension result exceeds the 512 KiB session result limit")
-	}
-	return serialized
-}
-
 export function sameToolNames(a: ChatTool[], b: ChatTool[]): boolean {
 	const names = (tools: ChatTool[]): string[] =>
 		tools
