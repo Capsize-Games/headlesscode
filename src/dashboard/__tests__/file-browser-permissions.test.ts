@@ -29,6 +29,7 @@ import { startDashboardServer } from "../server.js"
 import type { Server } from "node:http"
 import { permissionsFilePath, resolvePermissions } from "../../permissions/config.js"
 import { DEFAULT_PROTECTED_FILES } from "../../permissions/protected-files.js"
+import { runSuites } from "../../test-runner.js"
 
 async function tmpRepo(prefix = "hc-fileperm-"): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -552,16 +553,10 @@ async function main(): Promise<void> {
 	process.env.HEADLESSCODE_DATA_DIR = storeTmp
 	let failed = 0
 	try {
-		for (const [name, fn] of tests) {
-			try {
-				await fn()
-				console.log(`  ok   ${name}`)
-			} catch (err) {
-				failed++
-				console.error(`  FAIL ${name}`)
-				console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-			}
-		}
+		failed = await runSuites(
+			"dashboard file-browser + permissions settings",
+			tests,
+		)
 	} finally {
 		delete process.env.HEADLESSCODE_DATA_DIR
 		await fs.rm(storeTmp, { recursive: true, force: true })
@@ -570,7 +565,6 @@ async function main(): Promise<void> {
 		console.error(`\n${failed} test(s) failed`)
 		process.exit(1)
 	}
-	console.log(`\nAll ${tests.length} dashboard file-browser + permissions settings tests passed`)
 }
 
 main().catch((err) => {

@@ -55,6 +55,7 @@ import {
 } from "../local-explore.js"
 import type { LocalChatClient, LocalChatResponse, LocalExploreOptions, LocalExploreRequest } from "../local-explore.js"
 import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } from "../types.js"
+import { runMain } from "../../test-runner.js"
 
 // ─── Fakes ───────────────────────────────────────────────────────────────────
 
@@ -178,10 +179,10 @@ async function makeSession(options: {
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
-const tests: Array<{ name: string; fn: () => Promise<void> | void }> = []
+const tests: Array<[string, () => Promise<void> | void]> = []
 
 function test(name: string, fn: () => Promise<void> | void) {
-	tests.push({ name, fn })
+	tests.push([name, fn])
 }
 
 // 1. Iteration cap enforcement: a local model that never stops must be cut
@@ -631,26 +632,4 @@ test("Ollama client wraps HTTP and network failures in LocalExploreError", async
 
 // ─── Runner ──────────────────────────────────────────────────────────────────
 
-async function main() {
-	let failed = 0
-	for (const { name, fn } of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} local-explore tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("local-explore", tests)

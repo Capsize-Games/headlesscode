@@ -43,6 +43,7 @@ import {
 	getCentralStackRulesDir,
 	loadStackRules,
 } from "../stacks.js"
+import { runSuites } from "../../test-runner.js"
 
 // ─── Per-test HOME sandboxing (mirrors global-modes.test.ts) ────────────────
 
@@ -580,22 +581,11 @@ async function main(): Promise<void> {
 		"getCentralStackRulesDir() must resolve under the per-test data dir",
 	)
 
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack : err)
-		}
-	}
+	const failed = await runSuites("stack-rules", tests)
 	if (failed > 0) {
 		console.error(`\n${failed} test(s) failed`)
 		process.exit(1)
 	}
-	console.log(`\nAll ${tests.length} stack-rules tests passed`)
 }
 
 main().finally(async () => {

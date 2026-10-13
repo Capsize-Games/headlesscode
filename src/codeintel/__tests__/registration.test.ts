@@ -19,6 +19,7 @@ import * as path from "node:path"
 import { createHeadlessExecutor } from "../../tools/executor.js"
 import { resetCodeIntelCaches } from "../program.js"
 import { CODE_INTEL_TOOL_NAMES } from "../tools.js"
+import { runMain } from "../../test-runner.js"
 
 // Line numbers below are 1-based and VERIFIED against the fixture text:
 // Shape=1, area=2, Circle=5, Circle.area=6, double=11, quadruple=15
@@ -185,45 +186,20 @@ async function testAdvertisedInToolList(): Promise<void> {
 	}
 }
 
-async function main(): Promise<void> {
-	const tests: Array<[string, () => Promise<void>]> = [
-		["all five tools are registered", testAllRegistered],
-		["get_diagnostics runs via executor", testDiagnosticsThroughExecutor],
-		["type_at_position runs via executor", testHoverThroughExecutor],
-		[
-			"workspace_symbol runs via executor",
-			testWorkspaceSymbolThroughExecutor,
-		],
-		[
-			"find_implementations runs via executor",
-			testImplementationsThroughExecutor,
-		],
-		["call_hierarchy runs via executor", testCallHierarchyThroughExecutor],
-		["all five are in CODE_INTEL_TOOLS", testAdvertisedInToolList],
-	]
+const tests: Array<[string, () => Promise<void>]> = [
+	["all five tools are registered", testAllRegistered],
+	["get_diagnostics runs via executor", testDiagnosticsThroughExecutor],
+	["type_at_position runs via executor", testHoverThroughExecutor],
+	[
+		"workspace_symbol runs via executor",
+		testWorkspaceSymbolThroughExecutor,
+	],
+	[
+		"find_implementations runs via executor",
+		testImplementationsThroughExecutor,
+	],
+	["call_hierarchy runs via executor", testCallHierarchyThroughExecutor],
+	["all five are in CODE_INTEL_TOOLS", testAdvertisedInToolList],
+]
 
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			const detail = err instanceof Error
-				? (err.stack ?? err.message)
-				: String(err)
-			console.error(detail)
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} registration tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("registration", tests)

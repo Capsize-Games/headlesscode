@@ -23,6 +23,7 @@ import {
 	PathTraversalError as ExecutorTraversalError,
 	resolveWithinWorkspace as executorResolve,
 } from "../executor.js"
+import { runMain } from "../../test-runner.js"
 
 async function mkWorkspace(prefix: string): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -76,40 +77,13 @@ async function testExecutorReexportsTheSameGuard(): Promise<void> {
 	assert.throws(() => executorResolve(ws, "../escape.txt"), PathTraversalError)
 }
 
-async function runOne(name: string, fn: () => Promise<void>): Promise<boolean> {
-	try {
-		await fn()
-		console.log(`  ok   ${name}`)
-		return true
-	} catch (error) {
-		console.error(`  FAIL ${name}`)
-		if (error instanceof Error) console.error(error.stack ?? error)
-		else console.error(String(error))
-		return false
-	}
-}
+const tests: Array<[string, () => Promise<void>]> = [
+	["inside path resolves", testInsidePathResolves],
+	["dot path resolves to root", testDotPathResolvesToRoot],
+	["traversal refused", testTraversalRefused],
+	["symlink escape refused", testSymlinkEscapeRefused],
+	["escape is a traversal error", testSymlinkEscapeIsATraversalError],
+	["executor re-exports guard", testExecutorReexportsTheSameGuard],
+]
 
-async function main(): Promise<void> {
-	const tests: Array<[string, () => Promise<void>]> = [
-		["inside path resolves", testInsidePathResolves],
-		["dot path resolves to root", testDotPathResolvesToRoot],
-		["traversal refused", testTraversalRefused],
-		["symlink escape refused", testSymlinkEscapeRefused],
-		["escape is a traversal error", testSymlinkEscapeIsATraversalError],
-		["executor re-exports guard", testExecutorReexportsTheSameGuard],
-	]
-	let failed = 0
-	for (const [name, fn] of tests) {
-		if (!(await runOne(name, fn))) failed++
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} paths tests passed`)
-}
-
-main().catch((error) => {
-	console.error("Test runner crashed:", error)
-	process.exit(1)
-})
+runMain("paths", tests)

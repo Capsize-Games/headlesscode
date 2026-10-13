@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url"
 import { removeHarnessArtifacts } from "../cleanup.js"
 import { buildStatusSummary, formatStatusText } from "../status.js"
 import { reconcileGroups } from "../status.js"
+import { runMain } from "../../test-runner.js"
 import {
 	DEFAULT_STALL_TIMEOUT_MS,
 	inspectGroup,
@@ -202,14 +203,14 @@ async function cleanupRemovesMarkers(dir: string): Promise<void> {
 	}
 }
 
-const tests: Array<[string, (fx: Fixture) => Promise<void>]> = [
-	["clean run leaves no marker", cleanRunLeavesNoMarker],
-	["escaped write is reported", escapedWriteIsReported],
-	["orchestrator dirs excluded", orchestratorDirsExcluded],
-	["missing baseline reports all", missingBaselineReportsAll],
-	["main checkout refuses loudly", mainCheckoutRefusesLoudly],
-	["qa role uses qa markers", qaRoleUsesQaMarkers],
-	["script and reader agree", scriptAndReaderAgree],
+const tests: Array<[string, () => Promise<void>]> = [
+	["clean run leaves no marker", () => withFixture(cleanRunLeavesNoMarker)],
+	["escaped write is reported", () => withFixture(escapedWriteIsReported)],
+	["orchestrator dirs excluded", () => withFixture(orchestratorDirsExcluded)],
+	["missing baseline reports all", () => withFixture(missingBaselineReportsAll)],
+	["main checkout refuses loudly", () => withFixture(mainCheckoutRefusesLoudly)],
+	["qa role uses qa markers", () => withFixture(qaRoleUsesQaMarkers)],
+	["script and reader agree", () => withFixture(scriptAndReaderAgree)],
 	["reader reads marker lines", () => withTmpDir(readerReadsMarkerLines)],
 	["inspect persists dirty", () => withTmpDir(inspectPersistsDirty)],
 	["reconcile persists dirty", () => withTmpDir(reconcilePersistsDirty)],
@@ -217,27 +218,4 @@ const tests: Array<[string, (fx: Fixture) => Promise<void>]> = [
 	["cleanup removes markers", () => withTmpDir(cleanupRemovesMarkers)],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await withFixture(fn)
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			const detail = err instanceof Error ? err.stack ?? err.message : String(err)
-			console.error(detail)
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} main-tree-tripwire tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("main-tree-tripwire", tests)

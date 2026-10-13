@@ -12,6 +12,7 @@ import * as path from "node:path"
 
 import { MAX_CHUNK_CHARS } from "../embedder.js"
 import { chunkFile } from "../chunk.js"
+import { runMain } from "../../test-runner.js"
 
 async function mkTmpWorkspace(files: Record<string, string>): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hc-chunk-"))
@@ -322,26 +323,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["gitignored + binary files are skipped (walker integration)", testSkipsBinaryAndGitignoredFiles],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} chunk tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("chunk", tests)

@@ -12,6 +12,7 @@ import { execFileSync } from "node:child_process"
 
 import { appendCostHistoryRecord, appendSessionCostRecord, type CostHistoryRecord, type SessionCostRecord } from "../cost-history.js"
 import { costHistoryCliMain, parseCostHistoryArgs } from "../cost-history-cli.js"
+import { runSuites } from "../../test-runner.js"
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -327,16 +328,7 @@ async function main(): Promise<void> {
 	process.env.HEADLESSCODE_DATA_DIR = storeTmp
 	let failed = 0
 	try {
-		for (const [name, fn] of tests) {
-			try {
-				await fn()
-				console.log(`  ok   ${name}`)
-			} catch (err) {
-				failed++
-				console.error(`  FAIL ${name}`)
-				console.error(err instanceof Error ? (err.stack ?? err.message) : String(err))
-			}
-		}
+		failed = await runSuites("cost-history-cli", tests)
 	} finally {
 		delete process.env.HEADLESSCODE_DATA_DIR
 		await fs.rm(storeTmp, { recursive: true, force: true })
@@ -345,7 +337,6 @@ async function main(): Promise<void> {
 		console.error(`\n${failed} test(s) failed`)
 		process.exit(1)
 	}
-	console.log(`\nAll ${tests.length} cost-history-cli tests passed`)
 }
 
 main().catch((err) => {

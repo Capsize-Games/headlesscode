@@ -19,6 +19,7 @@ import {
 	type SessionBudget,
 } from "../budget.js"
 import type { PricingTable } from "../cost.js"
+import { runMain } from "../../test-runner.js"
 
 // Cheap model for deterministic math: $1/1M in, $2/1M out → 1000 in + 1000 out
 // = (1000*1 + 1000*2)/1e6 = $0.003 per call.
@@ -346,26 +347,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["session: iterations cap trips before the next LLM call", testSessionBudgetIterationsCap],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} budget tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("budget", tests)

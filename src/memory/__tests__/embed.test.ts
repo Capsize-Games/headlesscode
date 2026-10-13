@@ -7,6 +7,7 @@
 import assert from "node:assert/strict"
 
 import { cosine, createLocalEmbedder, similarity } from "../embed.js"
+import { runMain } from "../../test-runner.js"
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
@@ -72,23 +73,4 @@ const tests: Array<[string, () => void]> = [
 	["createLocalEmbedder validates dims", testDimsValidation],
 ]
 
-function main(): void {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} embed tests passed`)
-}
-
-main()
+runMain("embed", tests)

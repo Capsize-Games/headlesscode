@@ -22,6 +22,7 @@ import * as path from "node:path"
 
 import { createHeadlessExecutor } from "../executor.js"
 import { chunkHash } from "../../codesearch/index.js"
+import { runSuites } from "../../test-runner.js"
 
 async function mkTmpWorkspace(prefix: string): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -130,16 +131,7 @@ async function main(): Promise<void> {
 	process.env.HEADLESSCODE_DATA_DIR = storeTmp
 	let failed = 0
 	try {
-		for (const [name, fn] of tests) {
-			try {
-				await fn()
-				console.log(`  ok   ${name}`)
-			} catch (err) {
-				failed++
-				console.error(`  FAIL ${name}`)
-				console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-			}
-		}
+		failed = await runSuites("codebase_search handler", tests)
 	} finally {
 		delete process.env.HEADLESSCODE_DATA_DIR
 		await fs.rm(storeTmp, { recursive: true, force: true })
@@ -148,7 +140,6 @@ async function main(): Promise<void> {
 		console.error(`\n${failed} test(s) failed`)
 		process.exit(1)
 	}
-	console.log(`\nAll ${tests.length} codebase_search handler tests passed`)
 }
 
 main().catch((err) => {

@@ -16,6 +16,7 @@ import * as path from "node:path"
 
 import { createHeadlessExecutor } from "../executor.js"
 import type { ToolExecutor } from "../executor.js"
+import { runMain } from "../../test-runner.js"
 
 async function mkFixtureWorkspace(): Promise<string> {
 	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "hc-batch-"))
@@ -208,46 +209,21 @@ async function exists(p: string): Promise<boolean> {
 	}
 }
 
-async function main(): Promise<void> {
-	const tests: Array<[string, () => Promise<void>]> = [
-		["all-reads batch returns all sections", testAllReadsBatch],
-		["edit-then-read sees new content", testEditThenReadSeesNewContent],
-		[
-			"refused tools are per-section errors",
-			testRefusedToolsArePerSectionErrors,
-		],
-		["unknown tool is a per-section error", testUnknownToolIsAPerSectionError],
-		["11 sub-calls is a batch-level error", testOverCapIsABatchLevelError],
-		["empty calls is a batch-level error", testEmptyCallsIsABatchLevelError],
-		[
-			"stop_on_error skips the serial remainder",
-			testStopOnErrorSkipsSerialRemainder,
-		],
-		["oversized section is truncated", testSectionTruncation],
-	]
+const tests: Array<[string, () => Promise<void>]> = [
+	["all-reads batch returns all sections", testAllReadsBatch],
+	["edit-then-read sees new content", testEditThenReadSeesNewContent],
+	[
+		"refused tools are per-section errors",
+		testRefusedToolsArePerSectionErrors,
+	],
+	["unknown tool is a per-section error", testUnknownToolIsAPerSectionError],
+	["11 sub-calls is a batch-level error", testOverCapIsABatchLevelError],
+	["empty calls is a batch-level error", testEmptyCallsIsABatchLevelError],
+	[
+		"stop_on_error skips the serial remainder",
+		testStopOnErrorSkipsSerialRemainder,
+	],
+	["oversized section is truncated", testSectionTruncation],
+]
 
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			const detail = err instanceof Error
-				? (err.stack ?? err.message)
-				: String(err)
-			console.error(detail)
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} batch tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("batch", tests)

@@ -28,6 +28,7 @@ import type { Server } from "node:http"
 import { createHeadlessExecutor } from "../../tools/executor.js"
 import { eventsFilePath } from "../../engine/events.js"
 import { DECISION_MARKERS, validateSessionStartBody } from "../session-launch.js"
+import { runMain } from "../../test-runner.js"
 
 async function tmpRepo(prefix = "hc-launch-"): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -431,26 +432,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["session-launch: optional bearer token gates control-plane POSTs, off by default", testTokenGatesControlPlanePosts],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} session-launch tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("session-launch", tests)

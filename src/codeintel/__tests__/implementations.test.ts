@@ -19,6 +19,7 @@ import * as path from "node:path"
 import type { ToolContext } from "../../engine/types.js"
 import { resetCodeIntelCaches } from "../program.js"
 import { findImplementationsHandler } from "../implementations.js"
+import { runMain } from "../../test-runner.js"
 
 // Line numbers below are 1-based and VERIFIED against the fixture text:
 // Shape=1, area=2, Circle=5, Circle.area=6, Square=11, Square.area=12,
@@ -198,35 +199,12 @@ async function testNonTsFile(): Promise<void> {
 	}
 }
 
-async function main(): Promise<void> {
-	const tests: Array<[string, () => Promise<void>]> = [
-		["interface method finds class methods", testInterfaceMethodImplementations],
-		["base method finds the subclass override", testSubclassOverride],
-		["empty spot gets the graceful message", testNoImplementationsMessage],
-		["symbol arg disambiguates one line", testSymbolArgDisambiguation],
-		["non-TS file is refused, not guessed", testNonTsFile],
-	]
+const tests: Array<[string, () => Promise<void>]> = [
+	["interface method finds class methods", testInterfaceMethodImplementations],
+	["base method finds the subclass override", testSubclassOverride],
+	["empty spot gets the graceful message", testNoImplementationsMessage],
+	["symbol arg disambiguates one line", testSymbolArgDisambiguation],
+	["non-TS file is refused, not guessed", testNonTsFile],
+]
 
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			const detail = err instanceof Error ? err.stack ?? err.message : String(err)
-			console.error(detail)
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} find_implementations tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("find_implementations", tests)

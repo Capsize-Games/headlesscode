@@ -27,6 +27,7 @@ import {
 	resolveOllamaEmbeddingModel,
 	resolveOllamaUrl,
 } from "../ollama-embedder.js"
+import { runMain } from "../../test-runner.js"
 
 /** Deterministic fake vector for a text (dim 8), so tests can assert content. */
 function fakeVector(text: string): number[] {
@@ -220,26 +221,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["Ollama URL/model env vars resolve with sensible defaults", testEnvResolution],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} ollama-embedder tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("ollama-embedder", tests)

@@ -24,6 +24,7 @@ import * as path from "node:path"
 
 import { startDashboardServer } from "../server.js"
 import type { Server } from "node:http"
+import { runMain } from "../../test-runner.js"
 
 async function tmpRepo(prefix = "hc-page-route-"): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -139,26 +140,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["GET / without --repo still renders, with an empty file-browser default", testGetRootWithoutRepoStillRendersWithEmptyDefault],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? (err.stack ?? err.message) : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} dashboard page-route tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("dashboard page-route", tests)

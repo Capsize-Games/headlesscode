@@ -14,6 +14,7 @@ import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
+import { runMain } from "./test-runner.js"
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url))
 const SCRIPT = path.join(REPO_ROOT, "scripts", "run-tests.mjs")
@@ -135,26 +136,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["--help / -h print usage and exit 0 without running the suite (BUG-14)", testHelpFlagPrintsUsageAndExitsWithoutRunningTests],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? (err.stack ?? err.message) : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} run-tests-script tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("run-tests-script", tests)

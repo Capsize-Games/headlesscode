@@ -35,6 +35,7 @@ import * as net from "node:net"
 import * as os from "node:os"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
+import { runMain } from "../../test-runner.js"
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL("../../../", import.meta.url)))
 
@@ -207,26 +208,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["dashboard CLI: real SIGINT closes the HTTP server and releases the port", testDashboardCliSigintClosesServer],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? (err.stack ?? err.message) : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} sigint-shutdown tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("sigint-shutdown", tests)

@@ -10,6 +10,7 @@ import * as path from "node:path"
 
 import { parseQaResult, runQa, runQaWithRetries } from "../qa.js"
 import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } from "../../engine/types.js"
+import { runMain } from "../../test-runner.js"
 
 // ─── Fake LLM client (same pattern as engine/__tests__/loop.test.ts) ─────────
 
@@ -349,26 +350,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["runQaWithRetries: exhausts retries and returns the final error verdict", testRunQaWithRetriesExhaustsRetries],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} QA parsing tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("QA parsing", tests)

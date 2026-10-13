@@ -26,6 +26,7 @@ import {
 	type CommandResult,
 	type SessionHandle,
 } from "../provider.js"
+import { runMain } from "../../test-runner.js"
 
 async function tmpRepo(): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-provider-repo-"))
@@ -188,26 +189,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["HetznerDockerProvider is a documented sketch (not implemented)", testHetznerSketchIsDocumentedNotImplemented],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} provider tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("provider", tests)

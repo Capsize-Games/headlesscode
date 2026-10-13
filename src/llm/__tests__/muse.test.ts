@@ -20,6 +20,7 @@ import {
 	resolveLlmProviderOrReport,
 } from "../muse.js"
 import type { LlmRequest } from "../../engine/types.js"
+import { runMain } from "../../test-runner.js"
 
 const baseRequest: LlmRequest = {
 	model: "muse-spark-1.3",
@@ -452,23 +453,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["MUSE_BASE_URL is the documented Meta endpoint", testBaseUrlDefault],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack : err)
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} muse client tests passed`)
-}
-
-main()
+runMain("muse client", tests)

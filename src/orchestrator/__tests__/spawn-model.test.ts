@@ -23,6 +23,7 @@ import * as fsPromises from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
+import { runSuites } from "../../test-runner.js"
 
 /** This repo root (parent of src/orchestrator/__tests__/). */
 const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url))
@@ -256,16 +257,7 @@ async function main(): Promise<void> {
 	process.env.HEADLESSCODE_DATA_DIR = storeTmp
 	let failed = 0
 	try {
-		for (const [name, fn] of tests) {
-			try {
-				await fn()
-				console.log(`  ok   ${name}`)
-			} catch (err) {
-				failed++
-				console.error(`  FAIL ${name}`)
-				console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-			}
-		}
+		failed = await runSuites("spawn-model", tests)
 	} finally {
 		delete process.env.HEADLESSCODE_DATA_DIR
 		await fsPromises.rm(storeTmp, { recursive: true, force: true })
@@ -274,7 +266,6 @@ async function main(): Promise<void> {
 		console.error(`\n${failed} test(s) failed`)
 		process.exit(1)
 	}
-	console.log(`\nAll ${tests.length} spawn-model tests passed`)
 }
 
 main().catch((err) => {

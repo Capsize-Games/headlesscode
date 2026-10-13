@@ -17,6 +17,7 @@ import * as path from "node:path"
 import { buildSummary, sumSessions } from "../aggregate.js"
 import type { LiveUsageRecord, UsageRecord } from "../../engine/usage.js"
 import { saveState, type OrchestratorState } from "../../orchestrator/state.js"
+import { runMain } from "../../test-runner.js"
 
 async function tmpRepo(prefix = "hc-dashboard-"): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -388,26 +389,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["sumSessions: empty input -> zeroed totals", testSumSessionsEmpty],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} dashboard aggregate tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("dashboard aggregate", tests)

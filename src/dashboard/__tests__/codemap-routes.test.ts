@@ -17,6 +17,7 @@ import type { Server } from "node:http"
 import { startDashboardServer } from "../server.js"
 import { buildCodemap } from "../../codemap/build.js"
 import { resetCodeIntelCaches } from "../../codeintel/program.js"
+import { runMain } from "../../test-runner.js"
 
 async function tmpRepo(prefix = "hc-codemap-route-"): Promise<string> {
 	const ws = await fsp.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -119,33 +120,11 @@ async function testNoGeneratedMapIsClear404(): Promise<void> {
 	}
 }
 
-async function main(): Promise<void> {
-	const tests: Array<[string, () => Promise<void>]> = [
-		["GET /api/codemap?repo= serves the stored codemap.json", testServesCodemapJson],
-		["GET /api/codemap/html?repo= serves the visualizer", testServesCodemapHtml],
-		["missing ?repo= is a 400", testMissingRepoParamIs400],
-		["a repo with no generated map is a clear 404", testNoGeneratedMapIsClear404],
-	]
+const tests: Array<[string, () => Promise<void>]> = [
+	["GET /api/codemap?repo= serves the stored codemap.json", testServesCodemapJson],
+	["GET /api/codemap/html?repo= serves the visualizer", testServesCodemapHtml],
+	["missing ?repo= is a 400", testMissingRepoParamIs400],
+	["a repo with no generated map is a clear 404", testNoGeneratedMapIsClear404],
+]
 
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} codemap dashboard-route tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("codemap dashboard-route", tests)

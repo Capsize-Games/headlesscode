@@ -18,6 +18,7 @@ import * as path from "node:path"
 import type { ToolContext } from "../../engine/types.js"
 import { resetCodeIntelCaches } from "../program.js"
 import { callHierarchyHandler } from "../call-hierarchy.js"
+import { runMain } from "../../test-runner.js"
 
 // Line numbers below are 1-based and VERIFIED against the fixture text:
 // leaf=1, mid=5 (calls leaf on 6 and 7), top=10 (calls mid on 11),
@@ -202,37 +203,15 @@ async function testNonTsFile(): Promise<void> {
 	}
 }
 
-async function main(): Promise<void> {
-	const tests: Array<[string, () => Promise<void>]> = [
-		["direct caller found from a definition", testDirectCallerFound],
-		["caller lookup works from a call site", testCallerViaCallSite],
-		["direct callees found", testDirectCalleesFound],
-		["callee lookup from a call site starts at the selected callee", testCalleesFromCallSiteStartAtSelectedCallee],
-		["default direction returns both sides", testBothDirectionsDefault],
-		["max_depth=1 excludes depth-2 edges", testMaxDepthPrunesDeeperEdges],
-		["any-typed call is tolerated", testAnyTypedCallTolerated],
-		["non-TS file returns the not-supported result", testNonTsFile],
-	]
+const tests: Array<[string, () => Promise<void>]> = [
+	["direct caller found from a definition", testDirectCallerFound],
+	["caller lookup works from a call site", testCallerViaCallSite],
+	["direct callees found", testDirectCalleesFound],
+	["callee lookup from a call site starts at the selected callee", testCalleesFromCallSiteStartAtSelectedCallee],
+	["default direction returns both sides", testBothDirectionsDefault],
+	["max_depth=1 excludes depth-2 edges", testMaxDepthPrunesDeeperEdges],
+	["any-typed call is tolerated", testAnyTypedCallTolerated],
+	["non-TS file returns the not-supported result", testNonTsFile],
+]
 
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} call_hierarchy tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("call_hierarchy", tests)

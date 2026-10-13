@@ -25,6 +25,7 @@ import {
 	defaultResearchTaskText,
 	parseFilingResult,
 } from "../pipeline.js"
+import { runMain } from "../../test-runner.js"
 
 function testParseFilingResultStructuredLine(): void {
 	// The required `ISSUES:` line is authoritative.
@@ -92,26 +93,4 @@ const tests: Array<[string, () => void | Promise<void>]> = [
 	["mode constants match .roomodes slugs", testModeConstants],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} pipeline tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("pipeline", tests)

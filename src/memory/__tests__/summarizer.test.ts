@@ -9,6 +9,7 @@ import assert from "node:assert/strict"
 import { buildRollingSummary, extractFacts, extractSessionSummary } from "../summarizer.js"
 import type { ChatMessage, SessionResult } from "../../engine/types.js"
 import type { SessionSummary } from "../types.js"
+import { runMain } from "../../test-runner.js"
 
 function toolMessage(name: string, content: string): ChatMessage {
 	return { role: "tool", tool_call_id: `c_${Math.random()}`, name, content }
@@ -150,23 +151,4 @@ const tests: Array<[string, () => void]> = [
 	["rolling summary renders key facts", testRollingSummaryIncludesKeyFacts],
 ]
 
-function main(): void {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} summarizer tests passed`)
-}
-
-main()
+runMain("summarizer", tests)

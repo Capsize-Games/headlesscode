@@ -32,6 +32,7 @@ import * as path from "node:path"
 
 import { DockerSessionProvider } from "../docker-provider.js"
 import type { CloudSessionRequest, CommandResult, SessionHandle } from "../provider.js"
+import { runSuites } from "../../test-runner.js"
 
 // ─── Docker availability probe ───────────────────────────────────────────────
 
@@ -302,18 +303,8 @@ if (probe.ok) {
 
 async function main(): Promise<void> {
 	console.log(`  note: ${dockerNote}`)
-	let failed = 0
 	let skipped = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
+	const failed = await runSuites("docker-provider", tests)
 	if (!probe.ok) {
 		skipped = 2
 		console.log(`  SKIP ${skipped} real-daemon test(s) — ${probe.reason}`)
@@ -322,7 +313,7 @@ async function main(): Promise<void> {
 		console.error(`\n${failed} test(s) failed`)
 		process.exit(1)
 	}
-	console.log(`\nAll ${tests.length} docker-provider tests passed (${skipped} skipped: no Docker daemon)`)
+	console.log(`  note: ${skipped} skipped (no Docker daemon)`)
 }
 
 main().catch((err) => {

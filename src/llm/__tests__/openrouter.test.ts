@@ -13,6 +13,7 @@ import { estimateCost } from "../../budget/cost.js"
 import { buildRequestBody, isRetryableOpenRouterError, OpenRouterClient, OpenRouterError, parseReasoningEffort } from "../openrouter.js"
 import { PromptByteBudgetError, TOOL_RESULT_BUDGET_NOTICE } from "../request-budget.js"
 import type { LlmRequest } from "../../engine/types.js"
+import { runMain } from "../../test-runner.js"
 
 const baseRequest: LlmRequest = {
 	model: "irrelevant-here",
@@ -1109,23 +1110,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["fetchModelInfo: one fetch resolves window AND price together", testFetchModelInfoSharesOneFetch],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack : err)
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} openrouter request-building tests passed`)
-}
-
-main()
+runMain("openrouter request-building", tests)

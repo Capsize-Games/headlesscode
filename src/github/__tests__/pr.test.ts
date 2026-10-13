@@ -9,6 +9,7 @@
 import assert from "node:assert/strict"
 
 import { NoDiffError, OpenPrError, getPullRequestStatus, getRepoDefaultBranch, openPullRequest } from "../pr.js"
+import { runMain } from "../../test-runner.js"
 
 /** The token used for API calls in these tests (fake — never a real one). */
 const FAKE_TOKEN = "ghs_TESTTOKEN1234567890"
@@ -384,26 +385,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["getPullRequestStatus rejects a malformed 2xx body", testGetPullRequestStatusMalformedBodyThrows],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} PR tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("PR", tests)

@@ -18,6 +18,7 @@ import {
 	TERMINAL_STATUSES as STATUS_LIST,
 } from "../status.js"
 import { isTerminalStatus, TERMINAL_STATUSES } from "../terminal-status.js"
+import { runMain } from "../../test-runner.js"
 
 async function testTerminalStatusesAreTerminal(): Promise<void> {
 	for (const status of ["done", "failed", "needs-human", "orphaned"]) {
@@ -43,38 +44,11 @@ async function testStatusReexportsTheLeaf(): Promise<void> {
 	assert.equal(statusIsTerminal("running"), isTerminalStatus("running"))
 }
 
-async function runOne(name: string, fn: () => Promise<void>): Promise<boolean> {
-	try {
-		await fn()
-		console.log(`  ok   ${name}`)
-		return true
-	} catch (error) {
-		console.error(`  FAIL ${name}`)
-		if (error instanceof Error) console.error(error.stack ?? error)
-		else console.error(String(error))
-		return false
-	}
-}
+const tests: Array<[string, () => Promise<void>]> = [
+	["terminal statuses are terminal", testTerminalStatusesAreTerminal],
+	["live statuses are not terminal", testLiveStatusesAreNotTerminal],
+	["blocked stays non-terminal", testBlockedStaysNonTerminal],
+	["status re-exports the leaf", testStatusReexportsTheLeaf],
+]
 
-async function main(): Promise<void> {
-	const tests: Array<[string, () => Promise<void>]> = [
-		["terminal statuses are terminal", testTerminalStatusesAreTerminal],
-		["live statuses are not terminal", testLiveStatusesAreNotTerminal],
-		["blocked stays non-terminal", testBlockedStaysNonTerminal],
-		["status re-exports the leaf", testStatusReexportsTheLeaf],
-	]
-	let failed = 0
-	for (const [name, fn] of tests) {
-		if (!(await runOne(name, fn))) failed++
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} terminal-status tests passed`)
-}
-
-main().catch((error) => {
-	console.error("Test runner crashed:", error)
-	process.exit(1)
-})
+runMain("terminal-status", tests)

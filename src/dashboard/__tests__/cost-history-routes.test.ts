@@ -23,6 +23,7 @@ import {
 	type CostHistoryRecord,
 	type SessionCostRecord,
 } from "../../orchestrator/cost-history.js"
+import { runMain } from "../../test-runner.js"
 
 async function tmpRepo(prefix = "hc-cost-history-route-"): Promise<string> {
 	return fsp.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -237,39 +238,17 @@ async function testNoHistoryIsEmpty200(): Promise<void> {
 	}
 }
 
-async function main(): Promise<void> {
-	const tests: Array<[string, () => Promise<void>]> = [
-		["GET /api/cost-history?repo= serves group + session records (newest first)", testServesGroupAndSessionRecords],
-		["?since=<iso> windows by recordedAt", testSinceWindowsByRecordedAt],
-		[
-			"?since= boundary: millisecond-precision recordedAt vs second-precision since includes the equal instant",
-			testSinceBoundaryMillisecondPrecisionIncludesEqualInstant,
-		],
-		["?limit=N keeps the most recent N", testLimitKeepsMostRecent],
-		["missing ?repo= is a 400", testMissingRepoIs400],
-		["invalid ?since= / ?limit= are 400s", testInvalidSinceAndLimitAre400],
-		["a repo with no history is an empty 200", testNoHistoryIsEmpty200],
-	]
+const tests: Array<[string, () => Promise<void>]> = [
+	["GET /api/cost-history?repo= serves group + session records (newest first)", testServesGroupAndSessionRecords],
+	["?since=<iso> windows by recordedAt", testSinceWindowsByRecordedAt],
+	[
+		"?since= boundary: millisecond-precision recordedAt vs second-precision since includes the equal instant",
+		testSinceBoundaryMillisecondPrecisionIncludesEqualInstant,
+	],
+	["?limit=N keeps the most recent N", testLimitKeepsMostRecent],
+	["missing ?repo= is a 400", testMissingRepoIs400],
+	["invalid ?since= / ?limit= are 400s", testInvalidSinceAndLimitAre400],
+	["a repo with no history is an empty 200", testNoHistoryIsEmpty200],
+]
 
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} cost-history dashboard-route tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("cost-history dashboard-route", tests)

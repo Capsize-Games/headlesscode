@@ -15,6 +15,7 @@ import * as path from "node:path"
 import type { ToolContext } from "../../engine/types.js"
 import { typeAtPositionHandler } from "../hover.js"
 import { resetCodeIntelCaches } from "../program.js"
+import { runMain } from "../../test-runner.js"
 
 // Line numbers below are 1-based and VERIFIED against the fixture text:
 // lib.ts: doc=1-6, add=7, greeting=11. main.ts: import=1, sum=3, shout=5.
@@ -151,37 +152,15 @@ async function testNoIdentifierGraceful(): Promise<void> {
 	}
 }
 
-async function main(): Promise<void> {
-	const tests: Array<[string, () => Promise<void>]> = [
-		["inferred-type const shows its type text", testInferredConstType],
-		["function use shows the full signature", testFunctionSignature],
-		[
-			"import specifier resolves through the import",
-			testImportSpecifierResolves,
-		],
-		["docs and JSDoc tags follow the signature", testDocsAndTags],
-		["blank spot yields the graceful message", testNoIdentifierGraceful],
-	]
+const tests: Array<[string, () => Promise<void>]> = [
+	["inferred-type const shows its type text", testInferredConstType],
+	["function use shows the full signature", testFunctionSignature],
+	[
+		"import specifier resolves through the import",
+		testImportSpecifierResolves,
+	],
+	["docs and JSDoc tags follow the signature", testDocsAndTags],
+	["blank spot yields the graceful message", testNoIdentifierGraceful],
+]
 
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} type_at_position tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("type_at_position", tests)

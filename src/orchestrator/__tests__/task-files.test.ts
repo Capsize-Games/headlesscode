@@ -29,6 +29,7 @@ import {
 	buildTaskFileContent as cliBuildTaskFileContent,
 	writeTaskFiles as cliWriteTaskFiles,
 } from "../cli.js"
+import { runMain } from "../../test-runner.js"
 
 function renderSameNumberPair(): [string, string] {
 	const slices = [
@@ -121,41 +122,14 @@ async function testOrchestratorCliReexportsTheLeaf(): Promise<void> {
 	assert.equal(cliWriteTaskFiles, writeTaskFiles)
 }
 
-async function runOne(name: string, fn: () => Promise<void>): Promise<boolean> {
-	try {
-		await fn()
-		console.log(`  ok   ${name}`)
-		return true
-	} catch (error) {
-		console.error(`  FAIL ${name}`)
-		if (error instanceof Error) console.error(error.stack ?? error)
-		else console.error(String(error))
-		return false
-	}
-}
+const tests: Array<[string, () => Promise<void>]> = [
+	["inlines bodies", testBuildTaskFileContentInlineBodies],
+	["falls back", testBuildTaskFileContentFallback],
+	["plan-first mentions planning", testPlanFirstMentionsPlanning],
+	["rework embeds findings", testReworkEmbedsFindings],
+	["qa-rework and continuation", testQaReworkAndContinuation],
+	["writeTaskFiles writes both", testWriteTaskFilesWritesBoth],
+	["cli re-exports the leaf", testOrchestratorCliReexportsTheLeaf],
+]
 
-async function main(): Promise<void> {
-	const tests: Array<[string, () => Promise<void>]> = [
-		["inlines bodies", testBuildTaskFileContentInlineBodies],
-		["falls back", testBuildTaskFileContentFallback],
-		["plan-first mentions planning", testPlanFirstMentionsPlanning],
-		["rework embeds findings", testReworkEmbedsFindings],
-		["qa-rework and continuation", testQaReworkAndContinuation],
-		["writeTaskFiles writes both", testWriteTaskFilesWritesBoth],
-		["cli re-exports the leaf", testOrchestratorCliReexportsTheLeaf],
-	]
-	let failed = 0
-	for (const [name, fn] of tests) {
-		if (!(await runOne(name, fn))) failed++
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} task-files tests passed`)
-}
-
-main().catch((error) => {
-	console.error("Test runner crashed:", error)
-	process.exit(1)
-})
+runMain("task-files", tests)

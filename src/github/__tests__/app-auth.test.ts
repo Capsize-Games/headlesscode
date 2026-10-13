@@ -18,6 +18,7 @@ import assert from "node:assert/strict"
 import * as crypto from "node:crypto"
 
 import { createAppAuthClient, type TokenCache } from "../app-auth.js"
+import { runMain } from "../../test-runner.js"
 
 /** A real RSA key (PKCS#1 PEM, like GitHub provides) so JWT signing works. */
 function fakePrivateKey(): string {
@@ -217,26 +218,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["exchange failure surfaces as typed AppAuthError", testExchangeFailureThrowsTypedError],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} app-auth tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("app-auth", tests)

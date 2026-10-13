@@ -22,6 +22,7 @@ import { AddressInfo } from "node:net"
 
 import { createHeadlessExecutor } from "../executor.js"
 import type { AuxLlmUsage } from "../../engine/types.js"
+import { runMain } from "../../test-runner.js"
 
 const SCRIPTED_CONTENT =
 	"A dashboard titled 'Q3 Revenue Dashboard' shows $42,318.50 (+12.4%), Active users 1,284 (-3.1%), Error rate 0.07%."
@@ -197,27 +198,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["describe_image: bad path argument is a clear error", testBadArgumentRejected],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} describe_image tests passed`)
-	process.exit(0)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("describe_image", tests)

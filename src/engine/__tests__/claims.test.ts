@@ -13,6 +13,7 @@ import {
 	type ClaimVerification,
 } from "../claims.js"
 import { resolvePermissions } from "../../permissions/config.js"
+import { runMain } from "../../test-runner.js"
 
 /** Deterministic tmp workspace per test. */
 async function makeTmpWorkspace(files: Record<string, string> = {}): Promise<string> {
@@ -337,51 +338,73 @@ function testAllClaimsVerifiedHelpers(): void {
 
 // --- runner ----------------------------------------------------------------
 
-const tests: Array<{ name: string; fn: () => void | Promise<void> }> = [
-	{ name: "extract: file-existence claims", fn: testExtractsFileExistenceClaims },
-	{ name: "extract: file claim behind a preposition (verb … to <path>)", fn: testExtractsFileClaimBehindPreposition },
-	{ name: "extract: prepositional phrase without a change verb is not a claim", fn: testPrepositionPatternStillNeedsAVerb },
-	{ name: "extract: bare path mentions without verbs ignored", fn: testIgnoresBarePathMentionsWithoutVerbs },
-	{ name: "extract: command-passed claims", fn: testExtractsCommandPassedClaims },
-	{ name: "extract: serial markers only when serial mentioned", fn: testExtractsSerialMarkersOnlyWhenSerialMentioned },
-	{ name: "extract: PR URL claims", fn: testExtractsPrUrlClaims },
-	{ name: "extract: dedupe identical claims", fn: testDeduplicatesClaims },
-	{ name: "verify: file exists against disk", fn: testFileExistsVerifiedAgainstDisk },
-	{ name: "verify: empty file fails", fn: testEmptyFileClaimFails },
-	{ name: "verify: command re-run passes", fn: testCommandClaimRerunPasses },
-	{ name: "verify: command re-run fails on non-zero exit", fn: testCommandClaimRerunFails },
-	{ name: "extract: quoted token in pass phrase becomes expectedMarker", fn: testExtractsExpectedMarkerFromQuotedToken },
-	{ name: "extract: all-caps word in pass phrase becomes expectedMarker", fn: testExtractsExpectedMarkerFromAllCapsWord },
-	{ name: "extract: lowercase adjectives are not output markers", fn: testLowercasePassPhraseDoesNotBecomeMarker },
-	{ name: "verify: exit 0 but missing claimed marker FAILS", fn: testCommandClaimExitZeroButMissingMarkerFails },
-	{ name: "verify: exit 0 with the claimed marker passes", fn: testCommandClaimExitZeroWithMarkerPasses },
-	{ name: "resolveClaimPath: ../ traversal and absolute paths rejected", fn: testResolveClaimPathRejectsEscapes },
-	{ name: "verify: denied command refused, never re-run", fn: testCommandClaimRefusedByPermissionGate },
-	{ name: "verify: nonexistent command fails", fn: testCommandClaimNonexistentCommandFails },
-	{ name: "verify: serial markers against newest serial log", fn: testSerialMarkerVerifiedAgainstLog },
-	{ name: "verify: no serial log fails closed", fn: testSerialMarkerNoLogFails },
-	{ name: "verify: PR number against real git history", fn: testPrUrlVerifiedAgainstGitHistory },
-	{ name: "helpers: allClaimsVerified / firstUnverifiedDetail", fn: testAllClaimsVerifiedHelpers },
+const tests: Array<[string, () => void | Promise<void>]> = [
+	["extract: file-existence claims", testExtractsFileExistenceClaims],
+	[
+		"extract: file claim behind a preposition (verb … to <path>)",
+		testExtractsFileClaimBehindPreposition,
+	],
+	[
+		"extract: prepositional phrase without a change verb is not a claim",
+		testPrepositionPatternStillNeedsAVerb,
+	],
+	[
+		"extract: bare path mentions without verbs ignored",
+		testIgnoresBarePathMentionsWithoutVerbs,
+	],
+	["extract: command-passed claims", testExtractsCommandPassedClaims],
+	[
+		"extract: serial markers only when serial mentioned",
+		testExtractsSerialMarkersOnlyWhenSerialMentioned,
+	],
+	["extract: PR URL claims", testExtractsPrUrlClaims],
+	["extract: dedupe identical claims", testDeduplicatesClaims],
+	["verify: file exists against disk", testFileExistsVerifiedAgainstDisk],
+	["verify: empty file fails", testEmptyFileClaimFails],
+	["verify: command re-run passes", testCommandClaimRerunPasses],
+	["verify: command re-run fails on non-zero exit", testCommandClaimRerunFails],
+	[
+		"extract: quoted token in pass phrase becomes expectedMarker",
+		testExtractsExpectedMarkerFromQuotedToken,
+	],
+	[
+		"extract: all-caps word in pass phrase becomes expectedMarker",
+		testExtractsExpectedMarkerFromAllCapsWord,
+	],
+	[
+		"extract: lowercase adjectives are not output markers",
+		testLowercasePassPhraseDoesNotBecomeMarker,
+	],
+	[
+		"verify: exit 0 but missing claimed marker FAILS",
+		testCommandClaimExitZeroButMissingMarkerFails,
+	],
+	[
+		"verify: exit 0 with the claimed marker passes",
+		testCommandClaimExitZeroWithMarkerPasses,
+	],
+	[
+		"resolveClaimPath: ../ traversal and absolute paths rejected",
+		testResolveClaimPathRejectsEscapes,
+	],
+	[
+		"verify: denied command refused, never re-run",
+		testCommandClaimRefusedByPermissionGate,
+	],
+	["verify: nonexistent command fails", testCommandClaimNonexistentCommandFails],
+	[
+		"verify: serial markers against newest serial log",
+		testSerialMarkerVerifiedAgainstLog,
+	],
+	["verify: no serial log fails closed", testSerialMarkerNoLogFails],
+	[
+		"verify: PR number against real git history",
+		testPrUrlVerifiedAgainstGitHistory,
+	],
+	[
+		"helpers: allClaimsVerified / firstUnverifiedDetail",
+		testAllClaimsVerifiedHelpers,
+	],
 ]
 
-async function run(): Promise<void> {
-	let failed = 0
-	for (const t of tests) {
-		try {
-			await t.fn()
-			console.log(`PASS ${t.name}`)
-		} catch (err) {
-			failed++
-			console.error(`FAIL ${t.name}`)
-			console.error(err instanceof Error ? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		process.exitCode = 1
-		console.error(`\n${failed}/${tests.length} tests failed`)
-	} else {
-		console.log(`\nAll ${tests.length} claims tests passed`)
-	}
-}
-
-void run()
+runMain("claims", tests)

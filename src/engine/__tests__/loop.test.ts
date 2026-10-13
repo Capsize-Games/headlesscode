@@ -38,6 +38,7 @@ import type { EvidenceInput, EvidenceJournal, EvidenceReceipt } from "../../evid
 import type { ToolExecutor } from "../../tools/executor.js"
 import type { SessionBudget } from "../../budget/budget.js"
 import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } from "../types.js"
+import { runSuites } from "../../test-runner.js"
 
 // ─── Fake LLM client ─────────────────────────────────────────────────────────
 
@@ -4375,22 +4376,11 @@ process.on("unhandledRejection", (reason) => {
 })
 
 async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
+	const failed = await runSuites("", tests)
 	if (failed > 0) {
 		console.error(`\n${failed} test(s) failed`)
 		process.exit(1)
 	}
-	console.log(`\nAll ${tests.length} tests passed`)
 	testsFinished = true
 	process.exitCode = 0
 }

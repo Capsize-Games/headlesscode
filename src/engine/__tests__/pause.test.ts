@@ -20,6 +20,7 @@ import { HeadlessSession } from "../loop.js"
 import { BudgetTracker } from "../../budget/budget.js"
 import { eventsDir, eventsFilePath, readEventsFile } from "../events.js"
 import type { ChatMessage, ChatToolCall, LlmClient, LlmRequest, LlmResponse } from "../types.js"
+import { runMain } from "../../test-runner.js"
 
 const PAUSE_REQUESTED = ".harness.pause-requested"
 const PAUSED = ".harness.paused"
@@ -299,26 +300,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["pause: no marker -> zero behavior change", testNoMarkerMeansNoBlocking],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} pause tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("pause", tests)

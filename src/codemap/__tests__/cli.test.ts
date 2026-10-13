@@ -23,6 +23,7 @@ import { execFileSync } from "node:child_process"
 import { codemapMain, parseCodemapArgs } from "../cli.js"
 import { codemapJsonPath } from "../lock.js"
 import { resetCodeIntelCaches } from "../../codeintel/program.js"
+import { runMain } from "../../test-runner.js"
 
 function gitInit(root: string): void {
 	execFileSync("git", ["init", "-q"], { cwd: root, stdio: "ignore" })
@@ -157,26 +158,4 @@ const tests: Array<[string, () => void | Promise<void>]> = [
 	["codemapMain: --force always regenerates", testMainForceAlwaysRegenerates],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? (err.stack ?? err.message) : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} codemap CLI tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("codemap CLI", tests)

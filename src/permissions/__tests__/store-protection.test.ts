@@ -39,6 +39,7 @@ import {
 	resolveProjectIdentity,
 	writeProjectMetadata,
 } from "../../project-store.js"
+import { runMain } from "../../test-runner.js"
 
 async function mkTmp(prefix: string): Promise<string> {
 	return fsp.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -373,26 +374,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["word splitting / tilde + env expansion / containment edges", testWordSplittingAndPathResolution],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} store-protection tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("store-protection", tests)

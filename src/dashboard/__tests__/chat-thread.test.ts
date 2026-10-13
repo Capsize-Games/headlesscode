@@ -13,6 +13,7 @@ import assert from "node:assert/strict"
 
 import { groupEventsIntoChat, summarizeArg } from "../chat-thread.js"
 import type { EventRecord } from "../../engine/events.js"
+import { runMain } from "../../test-runner.js"
 
 function event(type: string, extra: Record<string, unknown> = {}): EventRecord {
 	return { ts: "2026-08-01T00:00:00.000Z", sessionId: "session-1", type, ...extra }
@@ -278,26 +279,4 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["chat-thread: summarizeArg shortens long args, keeps short ones", testSummarizeArg],
 ]
 
-async function main(): Promise<void> {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} dashboard chat-thread tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("dashboard chat-thread", tests)

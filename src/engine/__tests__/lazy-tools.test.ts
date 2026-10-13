@@ -18,6 +18,7 @@ import {
 	splitCoreAndLazyTools,
 } from "../lazy-tools.js"
 import type { ChatTool } from "../types.js"
+import { runMain } from "../../test-runner.js"
 
 function fnTool(name: string, description = `${name} description`): ChatTool {
 	return { type: "function", function: { name, description, parameters: { type: "object", properties: {} } } }
@@ -133,22 +134,4 @@ const tests: Array<[string, () => void]> = [
 	["renderToolIndex: empty case", testRenderToolIndexEmptyCase],
 ]
 
-function main(): void {
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			fn()
-			console.log(`  ok   ${name}`)
-		} catch (error) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(error)
-		}
-	}
-	console.log(`\n${failed === 0 ? "All" : `${tests.length - failed}/${tests.length}`} ${tests.length} tests passed`)
-	if (failed > 0) {
-		process.exit(1)
-	}
-}
-
-main()
+runMain("", tests)

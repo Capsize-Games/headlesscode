@@ -21,6 +21,7 @@ import * as path from "node:path"
 import { createHeadlessExecutor } from "../../tools/executor.js"
 import { getCodeIntelCache, resetCodeIntelCaches } from "../program.js"
 import { renameSymbol } from "../rename-symbol.js"
+import { runMain } from "../../test-runner.js"
 
 const FIXTURE_UTIL = `export function util(): number {
 	return 1
@@ -189,33 +190,11 @@ async function testMidWriteFailureRollsBackWrittenFiles(): Promise<void> {
 	}
 }
 
-async function main(): Promise<void> {
-	const tests: Array<[string, () => Promise<void>]> = [
-		["renames every real site across files and leaves lookalike identifiers untouched", testRenameAcrossAllSites],
-		["invalid new name is refused with nothing changed", testInvalidNewNameLeavesEverythingUntouched],
-		["stale snapshot aborts before any write (no partial edits)", testStaleSnapshotAbortsWithNoPartialWrites],
-		["mid-write failure rolls back the files already written", testMidWriteFailureRollsBackWrittenFiles],
-	]
+const tests: Array<[string, () => Promise<void>]> = [
+	["renames every real site across files and leaves lookalike identifiers untouched", testRenameAcrossAllSites],
+	["invalid new name is refused with nothing changed", testInvalidNewNameLeavesEverythingUntouched],
+	["stale snapshot aborts before any write (no partial edits)", testStaleSnapshotAbortsWithNoPartialWrites],
+	["mid-write failure rolls back the files already written", testMidWriteFailureRollsBackWrittenFiles],
+]
 
-	let failed = 0
-	for (const [name, fn] of tests) {
-		try {
-			await fn()
-			console.log(`  ok   ${name}`)
-		} catch (err) {
-			failed++
-			console.error(`  FAIL ${name}`)
-			console.error(err instanceof Error ? err.stack ?? err.message : String(err))
-		}
-	}
-	if (failed > 0) {
-		console.error(`\n${failed} test(s) failed`)
-		process.exit(1)
-	}
-	console.log(`\nAll ${tests.length} rename_symbol tests passed`)
-}
-
-main().catch((err) => {
-	console.error("Test runner crashed:", err)
-	process.exit(1)
-})
+runMain("rename_symbol", tests)
