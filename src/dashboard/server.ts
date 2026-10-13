@@ -349,16 +349,11 @@ async function handleRequest(
 			return
 		}
 		try {
-			const raw = await readJsonBody(req)
-			let body: unknown
-			try {
-				body = JSON.parse(raw || "{}")
-			} catch (err) {
-				res
-					.writeHead(400, { "content-type": "application/json; charset=utf-8" })
-					.end(JSON.stringify({ error: `invalid JSON body: ${err instanceof Error ? err.message : String(err)}` }))
+			const parsed = await parseJsonBody(req, res)
+			if (!parsed.ok) {
 				return
 			}
+			const body: unknown = parsed.body
 			const repo = (body as { repo?: string }).repo?.trim()
 			if (!repo) {
 				res
@@ -388,16 +383,11 @@ async function handleRequest(
 	}
 	if (url.pathname === "/api/session/start" && req.method === "POST") {
 		try {
-			const raw = await readJsonBody(req)
-			let body: unknown
-			try {
-				body = JSON.parse(raw || "{}")
-			} catch (err) {
-				res
-					.writeHead(400, { "content-type": "application/json; charset=utf-8" })
-					.end(JSON.stringify({ error: `invalid JSON body: ${err instanceof Error ? err.message : String(err)}` }))
+			const parsed = await parseJsonBody(req, res)
+			if (!parsed.ok) {
 				return
 			}
+			const body: unknown = parsed.body
 			const validationError = validateSessionStartBody(body)
 			if (validationError) {
 				res
@@ -448,16 +438,11 @@ async function handleRequest(
 	}
 	if (url.pathname === "/api/tool/execute" && req.method === "POST") {
 		try {
-			const raw = await readJsonBody(req)
-			let body: unknown
-			try {
-				body = JSON.parse(raw || "{}")
-			} catch (err) {
-				res
-					.writeHead(400, { "content-type": "application/json; charset=utf-8" })
-					.end(JSON.stringify({ error: `invalid JSON body: ${err instanceof Error ? err.message : String(err)}` }))
+			const parsed = await parseJsonBody(req, res)
+			if (!parsed.ok) {
 				return
 			}
+			const body: unknown = parsed.body
 			const request = body as ToolExecuteRequest
 			const result = await executeTool(request)
 			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(JSON.stringify(result))
@@ -496,16 +481,11 @@ async function handleRequest(
 				)
 				return
 			}
-			const raw = await readJsonBody(req)
-			let body: unknown
-			try {
-				body = JSON.parse(raw || "{}")
-			} catch (err) {
-				res
-					.writeHead(400, { "content-type": "application/json; charset=utf-8" })
-					.end(JSON.stringify({ error: `invalid JSON body: ${err instanceof Error ? err.message : String(err)}` }))
+			const parsed = await parseJsonBody(req, res)
+			if (!parsed.ok) {
 				return
 			}
+			const body: unknown = parsed.body
 			const answer = (body as { answer?: unknown })?.answer
 			if (typeof answer !== "string" || answer.trim() === "") {
 				res
@@ -562,16 +542,11 @@ async function handleRequest(
 				)
 				return
 			}
-			const raw = await readJsonBody(req)
-			let body: unknown
-			try {
-				body = JSON.parse(raw || "{}")
-			} catch (err) {
-				res
-					.writeHead(400, { "content-type": "application/json; charset=utf-8" })
-					.end(JSON.stringify({ error: `invalid JSON body: ${err instanceof Error ? err.message : String(err)}` }))
+			const parsed = await parseJsonBody(req, res)
+			if (!parsed.ok) {
 				return
 			}
+			const body: unknown = parsed.body
 			const text = (body as { text?: unknown })?.text
 			if (typeof text !== "string" || text.trim() === "") {
 				res
@@ -752,16 +727,11 @@ async function handleRequest(
 			return
 		}
 		try {
-			const raw = await readJsonBody(req)
-			let body: unknown
-			try {
-				body = JSON.parse(raw || "{}")
-			} catch (err) {
-				res
-					.writeHead(400, { "content-type": "application/json; charset=utf-8" })
-					.end(JSON.stringify({ error: `invalid JSON body: ${err instanceof Error ? err.message : String(err)}` }))
+			const parsed = await parseJsonBody(req, res)
+			if (!parsed.ok) {
 				return
 			}
+			const body: unknown = parsed.body
 			const hash = (body as { hash?: unknown })?.hash
 			if (typeof hash !== "string" || hash.trim() === "") {
 				res
@@ -1088,6 +1058,26 @@ async function handleRequest(
 	}
 
 	res.writeHead(404, { "content-type": "text/plain" }).end("Not Found")
+}
+
+/** Parse a JSON body (empty means {}); on invalid JSON reply 400. */
+async function parseJsonBody(
+	req: http.IncomingMessage,
+	res: http.ServerResponse,
+): Promise<{ body: unknown; ok: true } | { ok: false }> {
+	const raw = await readJsonBody(req)
+	try {
+		return { body: JSON.parse(raw || "{}"), ok: true }
+	} catch (err) {
+		res
+			.writeHead(400, { "content-type": "application/json; charset=utf-8" })
+			.end(
+				JSON.stringify({
+					error: `invalid JSON body: ${err instanceof Error ? err.message : String(err)}`,
+				}),
+			)
+		return { ok: false }
+	}
 }
 
 /** Read a request body as text (bounded — settings payloads are tiny). */
