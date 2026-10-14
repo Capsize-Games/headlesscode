@@ -5,7 +5,7 @@ import * as path from "node:path"
 import { HeadlessSession } from "../../engine/loop.js"
 import type { ChatMessage, LlmClient, LlmRequest, LlmResponse } from "../../engine/types.js"
 import { createReadOnlyHeadlessExecutor } from "../../tools/executor.js"
-import { discoverSkills } from "../registry.js"
+import { discoverSkills, type SkillRegistry } from "../registry.js"
 import { runSkillsCli } from "../cli.js"
 import { readEnabledSkillRoots } from "../store.js"
 
@@ -307,6 +307,106 @@ async function testMockSessionActivatesCapturedSkillWithinMode(): Promise<void> 
 	}
 }
 
+async function discoverEnabled(
+	root: string,
+	skills: string,
+): Promise<SkillRegistry> {
+	return discoverSkills(root, {
+		enabledRoots: [skills],
+		includeUserRoots: false,
+	})
+}
+
+async function testSnapshotOverflowPath(): Promise<void> {
+	const root = await fixtureRoot()
+	try {
+		const skills = path.join(root, "skills")
+		const extra: Record<string, string> = {}
+		for (let index = 0; index < 9; index++) {
+			extra[`data-${index}.txt`] = "x".repeat(60 * 1024)
+		}
+		const dir = await writeSkill(skills, "big-skill", "big-skill", "B", extra)
+		const registry = await discoverEnabled(root, skills)
+		assert.equal(registry.get("big-skill"), undefined)
+		const problem = registry.problems.find((item) =>
+			item.message.includes("512 KiB"))
+		assert.ok(problem)
+		assert.equal(problem.path, dir)
+	} finally {
+		await fs.rm(root, { recursive: true, force: true })
+	}
+}
+
+async function testSnapshotSymlinkPath(): Promise<void> {
+	const root = await fixtureRoot()
+	try {
+		const skills = path.join(root, "skills")
+		const dir = await writeSkill(skills, "link-skill", "link-skill", "B")
+		await fs.symlink(path.join(dir, "SKILL.md"), path.join(dir, "l.md"))
+		const registry = await discoverEnabled(root, skills)
+		assert.equal(registry.get("link-skill"), undefined)
+		const problem = registry.problems.find((item) =>
+			item.message.includes("symlinks are not allowed"))
+		assert.ok(problem)
+		assert.equal(problem.path, dir)
+	} finally {
+		await fs.rm(root, { recursive: true, force: true })
+	}
+}
+
+async function testManifestErrorPath(): Promise<void> {
+	const root = await fixtureRoot()
+	try {
+		const skills = path.join(root, "skills")
+		const dir = await writeSkill(skills, "bad-skill", "bad-skill", "B")
+		await fs.writeFile(path.join(dir, "SKILL.md"), "No frontmatter")
+		const registry = await discoverEnabled(root, skills)
+		assert.equal(registry.get("bad-skill"), undefined)
+		const problem = registry.problems.find((item) =>
+			item.message.includes("frontmatter"))
+		assert.ok(problem)
+		assert.equal(problem.path, path.join(dir, "SKILL.md"))
+	} finally {
+		await fs.rm(root, { recursive: true, force: true })
+	}
+}
+
+async function testOversizedManifestPath(): Promise<void> {
+	const root = await fixtureRoot()
+	try {
+		const skills = path.join(root, "skills")
+		const dir = await writeSkill(skills, "fat-skill", "fat-skill", "B")
+		await fs.writeFile(
+			path.join(dir, "SKILL.md"),
+			`---\nname: fat-skill\ndescription: x\n---\n${"y".repeat(70_000)}\n`,
+		)
+		const registry = await discoverEnabled(root, skills)
+		assert.equal(registry.get("fat-skill"), undefined)
+		const problem = registry.problems.find((item) =>
+			item.message.includes("64 KiB"))
+		assert.ok(problem)
+		assert.equal(problem.path, path.join(dir, "SKILL.md"))
+	} finally {
+		await fs.rm(root, { recursive: true, force: true })
+	}
+}
+
+async function testDirectoryMismatchPath(): Promise<void> {
+	const root = await fixtureRoot()
+	try {
+		const skills = path.join(root, "skills")
+		const dir = await writeSkill(skills, "wrong-dir", "right-name", "B")
+		const registry = await discoverEnabled(root, skills)
+		assert.equal(registry.get("right-name"), undefined)
+		const problem = registry.problems.find((item) =>
+			item.message.includes("directory name must match"))
+		assert.ok(problem)
+		assert.equal(problem.path, dir)
+	} finally {
+		await fs.rm(root, { recursive: true, force: true })
+	}
+}
+
 const tests: Array<[string, () => Promise<void>]> = [
 	["valid and invalid manifests plus bounded references", testValidInvalidManifestAndBoundedReference],
 	["duplicate precedence and explicitly enabled roots", testDuplicatePrecedenceAndEnabledRoots],
@@ -317,6 +417,11 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["local imports are offline and idempotent", testImportIsOfflineAndIdempotent],
 	["enable records a root for discovery", testEnablePersistsAnExplicitRoot],
 	["mocked session activates a captured skill without widening mode tools", testMockSessionActivatesCapturedSkillWithinMode],
+	["snapshot overflow path", testSnapshotOverflowPath],
+	["snapshot symlink path", testSnapshotSymlinkPath],
+	["manifest error path", testManifestErrorPath],
+	["oversized manifest path", testOversizedManifestPath],
+	["directory mismatch path", testDirectoryMismatchPath],
 ]
 
 async function main(): Promise<void> {

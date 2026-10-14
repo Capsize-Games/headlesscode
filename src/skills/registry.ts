@@ -248,6 +248,22 @@ export function defaultSkillRoots(workspaceRoot: string, options: DiscoverSkillO
 	return roots
 }
 
+function snapshotProblemPath(
+	skillDir: string,
+	manifestPath: string,
+	message: string,
+): string {
+	// snapshotSkillFiles reports oversized or binary companions as
+	// diagnostics, so a thrown size or binary error is SKILL.md itself.
+	if (
+		message.includes("64 KiB")
+		|| message.includes("binary files are unsupported")
+	) {
+		return manifestPath
+	}
+	return skillDir
+}
+
 /** Discover once and capture every skill file so a running session cannot see mid-turn edits. */
 export async function discoverSkills(workspaceRoot: string, options: DiscoverSkillOptions = {}): Promise<SkillRegistry> {
 	const problems: SkillProblem[] = []
@@ -282,8 +298,10 @@ export async function discoverSkills(workspaceRoot: string, options: DiscoverSki
 				break rootLoop
 			}
 			const manifestPath = path.join(skillDir, "SKILL.md")
+			let snapshotTaken = false
 			try {
 				const files = await snapshotSkillFiles(skillDir, rootReal, (problem) => problems.push(problem))
+				snapshotTaken = true
 				const raw = files.get("SKILL.md")
 				if (raw === undefined) throw new Error("SKILL.md is missing from the captured skill snapshot")
 				parseSkillManifest(raw)
@@ -295,7 +313,13 @@ export async function discoverSkills(workspaceRoot: string, options: DiscoverSki
 				const pinnedManifest = files.get("SKILL.md")
 				if (pinnedManifest === undefined) throw new Error("SKILL.md was not captured")
 				const pinned = parseSkillManifest(pinnedManifest)
-				if (path.basename(skillDir) !== pinned.name) throw new Error(`directory name must match manifest name '${pinned.name}'`)
+				if (path.basename(skillDir) !== pinned.name) {
+					problems.push({
+						path: skillDir,
+						message: `directory name must match manifest name '${pinned.name}'`,
+					})
+					continue
+				}
 				const digest = skillFilesDigest(files)
 				const item: SkillSnapshot = Object.freeze({
 					name: pinned.name,
@@ -314,7 +338,15 @@ export async function discoverSkills(workspaceRoot: string, options: DiscoverSki
 				referenceFiles.set(item.name, new Map(files))
 				registryBytes += snapshotBytes
 			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT") problems.push({ path: manifestPath, message: error instanceof Error ? error.message : String(error) })
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+					const message = error instanceof Error
+						? error.message
+						: String(error)
+					const target = snapshotTaken
+						? manifestPath
+						: snapshotProblemPath(skillDir, manifestPath, message)
+					problems.push({ path: target, message })
+				}
 			}
 		}
 	}
