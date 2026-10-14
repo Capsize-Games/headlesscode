@@ -41,7 +41,7 @@ def extract_adapter_archive(archive_path: pathlib.Path, destination: pathlib.Pat
     observed = set()
     with tarfile.open(fileobj=io.BytesIO(archive_path.read_bytes()), mode="r:") as archive:
         for member in archive.getmembers():
-            if member.isdir() and member.name.rstrip("/") == expected_prefix.rstrip("/"):
+            if member.isdir():
                 continue
             if not member.isfile() or not member.name.startswith(expected_prefix):
                 raise ValueError("adapter archive contains an unsafe path or non-regular file")

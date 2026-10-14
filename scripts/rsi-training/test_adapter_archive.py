@@ -41,6 +41,23 @@ class AdapterArchiveTest(unittest.TestCase):
             self.assertEqual((destination / "adapter_config.json").read_bytes(), b"{}")
             self.assertEqual((destination / "adapter_model.safetensors").read_bytes(), b"weights")
 
+    def test_skips_leading_directory_entries(self) -> None:
+        parent = tarfile.TarInfo(".headlesscode-rsi-model-output/")
+        parent.type = tarfile.DIRTYPE
+        nested = tarfile.TarInfo(".headlesscode-rsi-model-output/adapter/")
+        nested.type = tarfile.DIRTYPE
+        with tempfile.TemporaryDirectory() as root:
+            archive = pathlib.Path(root) / "adapter.tar"
+            archive.write_bytes(tar_bytes([
+                (".headlesscode-rsi-model-output/", b"", parent),
+                (".headlesscode-rsi-model-output/adapter/", b"", nested),
+                (".headlesscode-rsi-model-output/adapter/adapter_config.json", b"{}", None),
+                (".headlesscode-rsi-model-output/adapter/adapter_model.safetensors", b"weights", None),
+            ]))
+            destination = pathlib.Path(root) / "out"
+            MODULE.extract_adapter_archive(archive, destination)
+            self.assertEqual((destination / "adapter_config.json").read_bytes(), b"{}")
+
     def test_rejects_path_escape_symlinks_and_extra_files(self) -> None:
         cases = [
             [("../outside", b"x", None)],
