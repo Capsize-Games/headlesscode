@@ -697,9 +697,30 @@ export async function runOpenShellModelJob(candidate: CandidateRecord, config: R
 	if (training && (task.maxSteps !== 8 || task.adapterPath || task.modelKind)) throw new Error("training job differs from the bounded QLoRA policy")
 	if (!training && (!task.modelKind || !task.cellIds.length || (task.modelKind === "adapter" && !task.adapterPath) || (task.modelKind === "base" && task.adapterPath))) throw new Error("model evaluation job is missing or mismatches its fixed cell/model identity")
 	const output = "/workspace/.headlesscode-rsi-model-output"
+	const scripts = "/workspace/scripts/rsi-training"
+	const modelDir = "/workspace/.headlesscode-rsi-model"
+	const base = "/workspace/.rsi-base-model"
+	const shared = [
+		`--base-model ${base}`,
+		`--base-model-id '${task.baseModelId}'`,
+	]
 	const command = training
-		? `python3 /opt/headlesscode-rsi-training/train_qlora.py --base-model /workspace/.rsi-base-model --base-model-id '${task.baseModelId}' --dataset /workspace/.headlesscode-rsi-model/dataset.jsonl --manifest /workspace/.headlesscode-rsi-model/manifest.json --output /workspace/.headlesscode-rsi-model-output`
-		: `python3 /opt/headlesscode-rsi-training/evaluate_adapter.py --base-model /workspace/.rsi-base-model --base-model-id '${task.baseModelId}' --cells /workspace/.headlesscode-rsi-model/evaluation-cells.jsonl --output ${output}/evaluation-result.json${task.modelKind === "adapter" ? " --adapter-archive /workspace/.headlesscode-rsi-model/adapter.tar" : ""}`
+		? [
+			`python3 ${scripts}/train_qlora.py`,
+			...shared,
+			`--dataset ${modelDir}/dataset.jsonl`,
+			`--manifest ${modelDir}/manifest.json`,
+			`--output ${output}`,
+		].join(" ")
+		: [
+			`python3 ${scripts}/evaluate_adapter.py`,
+			...shared,
+			`--cells ${modelDir}/evaluation-cells.jsonl`,
+			`--output ${output}/evaluation-result.json`,
+			...(task.modelKind === "adapter"
+				? [`--adapter-archive ${modelDir}/adapter.tar`]
+				: []),
+		].join(" ")
 	const isolated = await runSnapshot({
 		config,
 		sourceRoot: candidate.worktree,
@@ -716,7 +737,14 @@ export async function runOpenShellModelJob(candidate: CandidateRecord, config: R
 	try {
 		const resultName = training ? "training-result.json" : "evaluation-result.json"
 		const resultPath = path.join(isolated.snapshot, ".headlesscode-rsi-model-output", resultName)
-		if (!fs.existsSync(resultPath)) throw new Error(`OpenShell model job omitted ${resultName}; exit=${isolated.result.exitCode}`)
+		if (!fs.existsSync(resultPath)) {
+			const guest = isolated.result.stdout.trim() || "(empty guest output)"
+			const detail = mutationFailureDiagnostic(guest)
+			const summary = detail.replaceAll("\n", " | ")
+			const omitted = `OpenShell model job omitted ${resultName}`
+			const code = `exit=${isolated.result.exitCode}`
+			throw new Error(`${omitted}; ${code}; guest output: ${summary}`)
+		}
 		const result = JSON.parse(fs.readFileSync(resultPath, "utf8")) as Record<string, unknown>
 		if (result.schemaVersion !== 1 || !["completed", "failed", "partial"].includes(String(result.status))) throw new Error("OpenShell model job returned an invalid result record")
 		if (training && result.status === "completed") {
