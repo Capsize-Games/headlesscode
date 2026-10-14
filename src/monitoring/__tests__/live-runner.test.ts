@@ -429,6 +429,33 @@ async function testCompletionOverrunIsJournaledBeforeAnyToolDispatch(): Promise<
 	} finally { await fs.rm(directory, { recursive: true, force: true }) }
 }
 
+function reasoningHeavyClient(): MockBillingClient {
+	const done = { name: "attempt_completion",
+		args: JSON.stringify({ result: "done" }) }
+	const usage = { promptTokens: 710, completionTokens: 1033,
+		totalTokens: 1743 }
+	const billing = { totalCostUsd: 0.0001, tokensPrompt: 710,
+		tokensCompletion: 122, nativeTokensPrompt: 710,
+		nativeTokensCompletion: 1033, nativeTokensReasoning: 884 }
+	return new MockBillingClient([done], LIVE_MODEL, "Meta",
+		{ responseUsage: usage, metadata: billing })
+}
+
+async function testReasoningHeavyNativeOverrunIsAccepted(): Promise<void> {
+	const directory = await scratch()
+	try {
+		const client = reasoningHeavyClient()
+		const options = { outputDir: directory, client,
+			maxOutputTokens: 1024 }
+		const summary = await collectLiveDevelopment(options)
+		assert.equal(summary.abortedAttempts, 0)
+		assert.equal(summary.completedRuns, 32)
+		assert.equal(summary.billing.unacceptedBillingRecords, 0)
+		assert.equal(summary.billing.completionTokens, 32 * 1033,
+			"budget accounting still uses native tokens")
+	} finally { await fs.rm(directory, { recursive: true, force: true }) }
+}
+
 async function testHeldoutCannotStartWithoutQualifiedDevelopment(): Promise<void> {
 	const directory = await scratch()
 	try {
@@ -509,6 +536,7 @@ await testUncertainRequestIsNotAutomaticallyReplayed()
 await testCopiedGlobalLedgerEpochsDoNotBlockResume()
 await testKnownPerRunAdmissionStopCompletesAndSettlesTrajectory()
 await testCompletionOverrunIsJournaledBeforeAnyToolDispatch()
+await testReasoningHeavyNativeOverrunIsAccepted()
 await testHeldoutCannotStartWithoutQualifiedDevelopment()
 await testHeldoutRejectsDifferentFrozenOutputCapBeforeInference()
 await testStorageRootSymlinkIsRejectedBeforeInference()
