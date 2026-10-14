@@ -39,6 +39,7 @@ export interface ChatCliDependencies {
 	validateMode?: (mode: string) => boolean | Promise<boolean>
 	skills?: ChatSkillService
 	imports?: ChatImportService
+	forceExit: (code: number) => never
 }
 
 export interface ChatCliOptions { workspaceRoot: string; resumeId?: string; model?: string; mode?: string; help: boolean }
@@ -101,6 +102,7 @@ export async function chatMain(argv: string[], deps: ChatCliDependencies): Promi
 	let model = options.model ?? deps.initialModel
 	let mode = options.mode ?? deps.initialMode ?? DEFAULT_MODE
 	let activeTurn: AbortController | undefined
+	let abortRequested = false
 	let exitRequested = false
 	let exitCode = 0
 	let pendingMessages: SessionMessage[] = []
@@ -220,6 +222,7 @@ export async function chatMain(argv: string[], deps: ChatCliDependencies): Promi
 		} finally {
 			deps.signal?.removeEventListener("abort", externalAbort)
 			activeTurn = undefined
+			abortRequested = false
 		}
 		const messages = [...result.messages]
 		if (!messages.some((message) => message.role === "user" && message.content === prompt)) {
@@ -344,8 +347,15 @@ export async function chatMain(argv: string[], deps: ChatCliDependencies): Promi
 
 	input.setInterruptHandler(() => {
 		if (activeTurn) {
+			if (abortRequested) {
+				renderer.writeError("Turn is not responding; force quitting.")
+				deps.forceExit(130)
+				return true
+			}
+			abortRequested = true
 			activeTurn.abort(new Error("interrupted by user"))
-			renderer.writeNotice("Interrupt requested; waiting for the active turn to stop.")
+			renderer.writeNotice("Interrupt requested; waiting for the turn to stop.")
+			renderer.writeNotice("Press Ctrl-C again to force quit without saving.")
 			return true
 		}
 		return false
@@ -424,7 +434,8 @@ export function chatHelp(): string {
 		"Enter a message to start a turn. Use \"\"\" on its own line to enter or end a multiline message.",
 		"/help  /exit  /new  /fork  /resume <id>  /sessions  /save",
 		"/model [name]  /mode [name]  /skills  /skill <id>  /import <provider> <file>",
-		"Prefix a slash command with another / to send it as a message. Ctrl-C cancels an active turn; Ctrl-D exits.",
+		"Prefix a slash command with another / to send it as a message.",
+		"Ctrl-C cancels an active turn, twice force quits; Ctrl-D exits.",
 	].join("\n")
 }
 

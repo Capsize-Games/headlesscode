@@ -11,6 +11,16 @@ import { chatMain, chatUsage, parseChatArgs } from "./chat.js"
 import { createChatTurnRunner } from "./bridge.js"
 import { sanitizeTerminalText } from "./renderer.js"
 
+export function defaultForceExit(code: number): never {
+	process.exit(code)
+}
+
+function chatForceExit(
+	runtime: TerminalRuntimeOptions,
+): (code: number) => never {
+	return runtime.forceExit ?? defaultForceExit
+}
+
 export interface TerminalRuntimeOptions {
 	llmClient?: LlmClient
 	skillRegistry?: SkillRegistry
@@ -19,6 +29,7 @@ export interface TerminalRuntimeOptions {
 	errorOutput?: Writable
 	signal?: AbortSignal
 	extraArgs?: string[]
+	forceExit?: (code: number) => never
 }
 
 export async function terminalMain(argv: string[], runtime: TerminalRuntimeOptions = {}): Promise<number> {
@@ -53,6 +64,7 @@ export async function terminalMain(argv: string[], runtime: TerminalRuntimeOptio
 		return await chatMain(argv, {
 			runTurn, createStore: (workspace) => new SessionStore(workspace),
 			input: runtime.input, output, errorOutput, signal,
+			forceExit: chatForceExit(runtime),
 			validateMode: async (mode) => Boolean(getModeBySlug(mode, await loadCustomModes(options.workspaceRoot)) ?? modes.find((entry) => entry.slug === mode)),
 			skills: { list: async () => frozenRegistry.skills, activate: async (name) => frozenRegistry.activate(name) },
 			imports: { importFile: async (provider, file, workspace) => {
