@@ -456,6 +456,25 @@ async function testReasoningHeavyNativeOverrunIsAccepted(): Promise<void> {
 	} finally { await fs.rm(directory, { recursive: true, force: true }) }
 }
 
+async function testMalformedArgumentsAreSanitizedOnEcho(): Promise<void> {
+	const directory = await scratch()
+	try {
+		const broken = { name: "apply_diff", args: "{\"content\":\"truncated" }
+		const done = { name: "attempt_completion",
+			args: JSON.stringify({ result: "done" }) }
+		const client = new MockBillingClient([broken, done])
+		const summary = await collectLiveDevelopment({ outputDir: directory, client })
+		assert.equal(summary.abortedAttempts, 0)
+		assert.equal(summary.completedRuns, 32)
+		const history = client.requests[1]?.messages ?? []
+		const calls = history.filter((message) => {
+			return (message.tool_calls?.length ?? 0) > 0
+		})
+		const echoed = calls[0]?.tool_calls?.[0]?.function.arguments
+		assert.equal(echoed, "{}")
+	} finally { await fs.rm(directory, { recursive: true, force: true }) }
+}
+
 async function testHeldoutCannotStartWithoutQualifiedDevelopment(): Promise<void> {
 	const directory = await scratch()
 	try {
@@ -537,6 +556,7 @@ await testCopiedGlobalLedgerEpochsDoNotBlockResume()
 await testKnownPerRunAdmissionStopCompletesAndSettlesTrajectory()
 await testCompletionOverrunIsJournaledBeforeAnyToolDispatch()
 await testReasoningHeavyNativeOverrunIsAccepted()
+await testMalformedArgumentsAreSanitizedOnEcho()
 await testHeldoutCannotStartWithoutQualifiedDevelopment()
 await testHeldoutRejectsDifferentFrozenOutputCapBeforeInference()
 await testStorageRootSymlinkIsRejectedBeforeInference()

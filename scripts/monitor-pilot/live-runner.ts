@@ -282,7 +282,20 @@ function parseArgs(call: { readonly id: string; readonly function: { readonly na
 }
 
 function toolCallMessage(response: LlmResponse): ChatMessage {
-	return response.message
+	const toolCalls = response.message.tool_calls?.map((call) => {
+		if (isJsonObjectArguments(call.function.arguments)) return call
+		return { ...call, function: { ...call.function, arguments: "{}" } }
+	})
+	return { ...response.message, tool_calls: toolCalls }
+}
+
+function isJsonObjectArguments(raw: string): boolean {
+	try {
+		const parsed: unknown = JSON.parse(raw)
+		return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+	} catch {
+		return false
+	}
 }
 
 function stableCallBatchSignature(calls: readonly PilotToolCall[]): string {
