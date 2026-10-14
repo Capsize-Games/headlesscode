@@ -132,8 +132,12 @@ def main() -> int:
                 raise RuntimeError("training loss became non-finite")
         adapter_dir = output / "adapter"
         model.save_pretrained(adapter_dir, safe_serialization=True)
-        if not (adapter_dir / "adapter_config.json").is_file() or not (adapter_dir / "adapter_model.safetensors").is_file():
-            raise RuntimeError("training ended without a complete PEFT adapter artifact")
+        readme = adapter_dir / "README.md"
+        if readme.is_file():
+            readme.unlink()
+        names = sorted(path.name for path in adapter_dir.iterdir() if path.is_file())
+        if names != ["adapter_config.json", "adapter_model.safetensors"]:
+            raise RuntimeError("training ended without exactly the fixed PEFT adapter file set")
         result.update({
             "status": "completed",
             "stepsCompleted": steps,
