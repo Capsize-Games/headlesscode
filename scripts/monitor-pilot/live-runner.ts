@@ -452,7 +452,12 @@ async function runLiveTrajectory(options: LiveTrajectoryOptions): Promise<{
 		if (!metadata) throw new LivePilotGuardError("authoritative-billing-record-unavailable")
 		assertPinnedIdentity(response, metadata)
 		const usage = assertUsage(response, metadata)
-		if (usage.completion > request.maxTokens!) throw new LivePilotGuardError("completion-exceeded-request-cap")
+		if (metadata.tokensCompletion !== undefined && !isSafeInteger(metadata.tokensCompletion)) {
+			throw new LivePilotGuardError("billing-token-usage-missing")
+		}
+		// maxTokens constrains visible output; native counts include uncapped reasoning.
+		const visibleCompletion = metadata.tokensCompletion ?? usage.completion
+		if (visibleCompletion > request.maxTokens!) throw new LivePilotGuardError("completion-exceeded-request-cap")
 		if (inputTokens + outputTokens + usage.prompt + usage.completion > LIVE_BUDGET.maxTokens) throw new LivePilotGuardError("measured-token-cap-exceeded")
 		inputTokens += usage.prompt
 		outputTokens += usage.completion
