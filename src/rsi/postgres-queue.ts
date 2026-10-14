@@ -480,6 +480,24 @@ export class PostgresRsiJobQueue {
 				 FROM expired WHERE jobs.job_id=expired.job_id`,
 				[this.policy.queueName],
 			)
+			await client.query(
+				`WITH abandoned AS (
+				 SELECT job_id FROM headlesscode_rsi_jobs
+				 WHERE queue_name=$1 AND status='leased'
+				 AND cancel_requested_at IS NOT NULL
+				 AND lease_expires_at <= clock_timestamp()
+				 ORDER BY lease_expires_at LIMIT 100 FOR UPDATE SKIP LOCKED
+				)
+				UPDATE headlesscode_rsi_jobs AS jobs SET status='cancelled',
+				 error=LEFT(COALESCE(jobs.cancel_reason,
+				 'cancellation requested')
+				 || ' (lease expired before teardown was acknowledged)',
+				 4000),
+				 lease_owner=NULL, lease_token=NULL,
+				 lease_expires_at=NULL, updated_at=clock_timestamp()
+				 FROM abandoned WHERE jobs.job_id=abandoned.job_id`,
+				[this.policy.queueName],
+			)
 			const capacities = await client.query(
 				`SELECT count(*)::int AS total,
 				 count(*) FILTER (WHERE lease_owner=$1)::int AS worker_total

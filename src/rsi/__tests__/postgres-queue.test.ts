@@ -6,7 +6,12 @@ import test from "node:test"
 import { S3RsiArtifactStore } from "../artifact-store.js"
 import { FileRsiArtifactStore } from "../artifact-store.js"
 import type { OpenRouterBrokerGrant, OpenRouterCallReservation, OpenRouterBrokerLimits, OpenRouterEndpointPriceSnapshot } from "../inference-broker.js"
-import { fleetJobMatches, fleetQueuePolicy, missingFleetResourceClasses, PostgresRsiJobQueue, requiredFleetJobLeaseMs, type FleetJob, type FleetJobIdentity, type FleetJobPayload, type FleetQueuePolicy } from "../postgres-queue.js"
+import { fleetJobMatches, fleetQueuePolicy } from "../postgres-queue.js"
+import { missingFleetResourceClasses } from "../postgres-queue.js"
+import { PostgresRsiJobQueue } from "../postgres-queue.js"
+import { requiredFleetJobLeaseMs } from "../postgres-queue.js"
+import type { FleetJob, FleetJobIdentity, FleetJobLease, FleetJobPayload,
+	FleetQueuePolicy } from "../postgres-queue.js"
 
 test("fleet job replay identity rejects stale snapshots, tasks, base commits, evaluation config, and routing", () => {
 	const expected: FleetJobIdentity = {
@@ -515,6 +520,47 @@ test("PostgreSQL queue integration: active cancellation fences lease completion 
 		assert.equal((await queue.getJob(job.jobId))?.status, "cancelled")
 		const replacement = await queue.claim("worker-waiting")
 		assert.equal(replacement?.job.jobId, waitingJob.jobId, "capacity becomes available after teardown acknowledgment")
+	} finally {
+		await cleanup()
+	}
+})
+
+type CancelReapFixture = {
+	jobId: string; lease: FleetJobLease; waitingJobId: string
+}
+
+async function setupCancelReap(queue: PostgresRsiJobQueue,
+	pool: Pool): Promise<CancelReapFixture> {
+	for (const workerId of ["worker-dead", "worker-next"]) {
+		await queue.registerWorker({ workerId, gatewayId: `gateway-${workerId}`,
+			hostname: `host-${workerId}`, maxActive: 1, resourceClasses: ["LOCAL_GPU"] })
+	}
+	const job = await addJob(queue, "dead-owner-cancel")
+	const waitingJob = await addJob(queue, "waiting-for-release")
+	const lease = await queue.claim("worker-dead")
+	assert.ok(lease)
+	assert.equal(await queue.cancel(job.jobId, "supervisor stop"), true)
+	const expire = "UPDATE headlesscode_rsi_jobs " +
+		"SET lease_expires_at=clock_timestamp()-interval '1 second' " +
+		"WHERE job_id=$1"
+	await pool.query(expire, [job.jobId])
+	return { jobId: job.jobId, lease, waitingJobId: waitingJob.jobId }
+}
+
+test("PostgreSQL queue integration: expired cancel-requested lease " +
+	"resolves without its owner", { skip: !integrationReady }, async () => {
+	const { queue, pool, cleanup } = await createQueue(testPolicy(
+		`cancel-reap-${randomUUID().slice(0, 8)}`,
+		{ maxInFlight: 1, classCapacity: { LOCAL_GPU: 1 } }))
+	try {
+		const cancelled = await setupCancelReap(queue, pool)
+		const replacement = await queue.claim("worker-next")
+		assert.equal((await queue.getJob(cancelled.jobId))?.status, "cancelled")
+		const error = (await queue.getJob(cancelled.jobId))?.error
+		assert.ok(error?.includes("supervisor stop"))
+		assert.equal(replacement?.job.jobId, cancelled.waitingJobId,
+			"expired cancel-requested lease frees capacity")
+		assert.equal(await queue.acknowledgeCancellation(cancelled.lease), false)
 	} finally {
 		await cleanup()
 	}
