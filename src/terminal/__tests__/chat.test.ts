@@ -62,7 +62,12 @@ function streams(text: string): { input: PassThrough; output: PassThrough; read:
 }
 
 function dependencies(store: MemoryStore, runTurn: ChatTurnRunner, input: PassThrough, output: PassThrough, overrides: Partial<ChatCliDependencies> = {}): ChatCliDependencies {
-	return { createStore: () => store, runTurn, input, output, errorOutput: output, terminal: false, cwd: workspaceRoot, env: { NO_COLOR: "1" }, ...overrides }
+	const unused: (code: number) => never = () => {
+		throw new Error("forceExit should be stubbed")
+	}
+	return { createStore: () => store, runTurn, input, output,
+		errorOutput: output, terminal: false, cwd: workspaceRoot,
+		env: { NO_COLOR: "1" }, forceExit: unused, ...overrides }
 }
 
 async function testArgsAndSlashParsing(): Promise<void> {
@@ -455,6 +460,39 @@ async function testReadlineCtrlCInPseudoTerminal(): Promise<void> {
 	assert.match(result.output, /PTY_RESULT:interrupt/)
 }
 
+function ttyStreams(): { input: PassThrough; output: PassThrough } {
+	const input = new PassThrough() as PassThrough & { isTTY: boolean }
+	const output = new PassThrough() as PassThrough & { isTTY: boolean }
+	input.isTTY = true
+	output.isTTY = true
+	return { input, output }
+}
+
+async function settle(): Promise<void> {
+	await new Promise((resolve) => setTimeout(resolve, 50))
+}
+
+async function testSecondInterruptForceQuitsHungTurn(): Promise<void> {
+	const { input, output } = ttyStreams()
+	let turnStarted = false; const exits: number[] = []
+	const hung: ChatTurnRunner = async () => {
+		turnStarted = true; return await new Promise<never>(() => {})
+	}
+	const forceExit = ((code: number): void => {
+		exits.push(code); input.end()
+	}) as (code: number) => never
+	const deps = dependencies(new MemoryStore(), hung, input, output,
+		{ terminal: true, env: {}, forceExit })
+	chatMain([], deps)
+	input.write("work\n"); while (!turnStarted) await settle()
+	input.write(String.fromCharCode(3))
+	await settle()
+	assert.deepEqual(exits, [])
+	input.write(String.fromCharCode(3))
+	await settle()
+	assert.deepEqual(exits, [130])
+}
+
 async function main(): Promise<void> {
 	await testArgsAndSlashParsing()
 	await testTurnsPersistAndResume()
@@ -467,7 +505,8 @@ async function main(): Promise<void> {
 	await testSaveFailureCanBeRetried()
 	await testInputAndRendererBounds()
 	await testReadlineCtrlCInPseudoTerminal()
-	console.log("All 11 terminal chat tests passed")
+	await testSecondInterruptForceQuitsHungTurn()
+	console.log("All 12 terminal chat tests passed")
 }
 
 main().catch((error) => { console.error(error); process.exitCode = 1 })
