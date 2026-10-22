@@ -1,0 +1,44 @@
+name: Publish verified container
+on:
+  workflow_run:
+    workflows: [ci]
+    branches: [master]
+    types: [completed]
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: headlesscode-container
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'master'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Require tested current master
+        env:
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          git fetch origin master
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse origin/master)" = "$SOURCE_SHA"
+      - name: Build and verify the runtime image
+        env:
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          image="ghcr.io/capsize-games/headlesscode:sha-$SOURCE_SHA"
+          docker build --pull -f docker/Dockerfile --label "org.opencontainers.image.revision=$SOURCE_SHA" --label "org.opencontainers.image.source=https://github.com/Capsize-Games/headlesscode" -t "$image" .
+          test "$(docker run --rm --entrypoint node "$image" --version)" = v22.23.4
+          docker run --rm --entrypoint headlesscode "$image" --version
+          docker run --rm --entrypoint node "$image" -e 'const fs=require("fs"),c=require("crypto");const p=fs.readFileSync("/etc/ssl/certs/ca-certificates.crt","utf8");for(const s of p.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g)||[]){const x=new c.X509Certificate(s);if(/CN=(emSign ECC Root CA - G3|AAA Certificate Services)(\n|$)/.test(x.subject))throw Error("Revoked CA root retained");}'
+      - name: Publish the tested image
+        env:
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USER" --password-stdin
+          docker push "ghcr.io/capsize-games/headlesscode:sha-$SOURCE_SHA"

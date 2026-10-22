@@ -46,6 +46,7 @@ FROM node:22.23.4-bookworm-slim
 # recent release so detail queries (issue/pr view) keep working.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git \
+    && apt-get upgrade -y ca-certificates \
     && curl -fsSL https://github.com/cli/cli/releases/download/v2.98.0/gh_2.98.0_linux_amd64.tar.gz -o /tmp/gh.tar.gz \
     && tar -xzf /tmp/gh.tar.gz -C /tmp \
     && install -m 0755 /tmp/gh_2.98.0_linux_amd64/bin/gh /usr/local/bin/gh \
