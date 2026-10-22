@@ -30,7 +30,7 @@
 #     needs no Docker.
 # ---------------------------------------------------------------------------
 
-FROM node:22-bookworm-slim
+FROM node:22.23.4-bookworm-slim
 
 # git: the orchestration path (worktree spawn / checkpoints / reviewers)
 # shells out to git constantly. ca-certificates: HTTPS for OpenRouter + npm.
