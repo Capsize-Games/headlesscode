@@ -25,6 +25,7 @@
  */
 
 import * as path from "node:path"
+import { createReadStream } from "node:fs"
 import * as fsp from "node:fs/promises"
 import * as yaml from "yaml"
 
@@ -42,6 +43,7 @@ import { getNativeTools } from "../vendor/zoo-code/src/core/prompts/tools/native
 import { getGroupName, getModeBySlug, modes, getToolsForMode } from "../vendor/zoo-code/src/shared/modes.js"
 import { TOOL_GROUPS } from "../vendor/zoo-code/src/shared/tools.js"
 import { customModesSettingsSchema } from "../vendor/zoo-code/types/index.js"
+import { logger as promptLogger } from "../vendor/zoo-code/src/utils/logging.js"
 import { batchTool } from "../tools/batch-tool.js"
 import { browserActionTool } from "../tools/browser/tool.js"
 import { describeImageTool } from "../vision/tool.js"
@@ -59,6 +61,15 @@ import type { SkillCatalogItem } from "../skills/registry.js"
 
 /** Opt-in gate for buildLeanSystemPrompt — see its doc comment. Default OFF. */
 export const LEAN_SYSTEM_PROMPT_ENV = "HEADLESSCODE_LEAN_SYSTEM_PROMPT"
+
+// Project mode files are read from the active workspace, which may contain
+// repository-controlled input. Bound both total bytes and the arrays that
+// reach Zod: Zod 3 records every validation issue while it continues through
+// an array, including after a `.max()` failure.
+const MAX_MODE_FILE_BYTES = 1_000_000
+const MAX_CUSTOM_MODES = 100
+const MAX_MODE_GROUP_ENTRIES = 100
+const MAX_ALLOWED_MCP_SERVERS = 32
 
 export function isLeanSystemPromptEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
 	const v = env[LEAN_SYSTEM_PROMPT_ENV]
@@ -182,9 +193,15 @@ function cleanInvisibleCharacters(content: string): string {
 async function loadModesFromFile(filePath: string, source: "project" | "global"): Promise<ModeConfig[]> {
 	let raw: string
 	try {
-		raw = await fsp.readFile(filePath, "utf-8")
+		raw = await readBoundedModeFile(filePath)
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			return []
+		}
+		if (error instanceof ModeFileTooLargeError) {
+			promptLogger.warn(
+				`${path.basename(filePath)} was rejected: ${error.message}`,
+			)
 			return []
 		}
 		throw error
@@ -210,6 +227,12 @@ async function loadModesFromFile(filePath: string, source: "project" | "global")
 	if (typeof parsed !== "object" || parsed === null || !Array.isArray((parsed as { customModes?: unknown }).customModes)) {
 		return []
 	}
+	const collectionLimitError = customModeCollectionLimitError(parsed)
+	if (collectionLimitError) {
+		const prefix = `[headlesscode] ${path.basename(filePath)} was rejected:`
+		promptLogger.warn(`${prefix} ${collectionLimitError}`)
+		return []
+	}
 
 	const result = customModesSettingsSchema.safeParse(parsed)
 	if (!result.success) {
@@ -221,6 +244,87 @@ async function loadModesFromFile(filePath: string, source: "project" | "global")
 	}
 
 	return result.data.customModes.map((mode) => ({ ...mode, source }))
+}
+
+class ModeFileTooLargeError extends Error {}
+
+async function readBoundedModeFile(filePath: string): Promise<string> {
+	const chunks: Buffer[] = []
+	let totalBytes = 0
+	for await (const chunk of createReadStream(filePath)) {
+		const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+		totalBytes += buffer.byteLength
+		if (totalBytes > MAX_MODE_FILE_BYTES) {
+			throw new ModeFileTooLargeError(
+				`file exceeds the ${MAX_MODE_FILE_BYTES}-byte limit`,
+			)
+		}
+		chunks.push(buffer)
+	}
+	return Buffer.concat(chunks, totalBytes).toString("utf-8")
+}
+
+function customModeCollectionLimitError(value: unknown): string | undefined {
+	const modes = (value as { customModes: unknown[] }).customModes
+	if (modes.length > MAX_CUSTOM_MODES) {
+		return `customModes exceeds the ${MAX_CUSTOM_MODES}-entry limit`
+	}
+	for (const [index, candidate] of modes.entries()) {
+		const error = modeCollectionLimitError(candidate, index)
+		if (error) return error
+	}
+	return undefined
+}
+
+function modeCollectionLimitError(
+	candidate: unknown,
+	index: number,
+): string | undefined {
+	if (
+		typeof candidate !== "object" ||
+		candidate === null ||
+		Array.isArray(candidate)
+	) {
+		return undefined
+	}
+	const mode = candidate as { groups?: unknown; allowedMcpServers?: unknown }
+	return (
+		modeGroupLimitError(mode.groups, index) ??
+		modeServerLimitError(mode.allowedMcpServers, index)
+	)
+}
+
+function modeGroupLimitError(
+	value: unknown,
+	index: number,
+): string | undefined {
+	if (!Array.isArray(value) || value.length <= MAX_MODE_GROUP_ENTRIES) {
+		return undefined
+	}
+	return collectionLimitError(index, "groups", MAX_MODE_GROUP_ENTRIES)
+}
+
+function modeServerLimitError(
+	value: unknown,
+	index: number,
+): string | undefined {
+	if (!Array.isArray(value) || value.length <= MAX_ALLOWED_MCP_SERVERS) {
+		return undefined
+	}
+	return collectionLimitError(
+		index,
+		"allowedMcpServers",
+		MAX_ALLOWED_MCP_SERVERS,
+	)
+}
+
+function collectionLimitError(
+	index: number,
+	field: string,
+	limit: number,
+): string {
+	const location = `customModes[${index}].${field}`
+	return `${location} exceeds ${limit} entries`
 }
 
 /**
