@@ -221,3 +221,18 @@ creating Git subprocesses. This keeps inherited editor commands out of shadow
 checkpoint operations and matches the dependency's unsafe-operation checks.
 These are local adaptations to `ShadowCheckpointService.ts`; upstream
 attribution and license notices remain in place.
+
+## 7. Zod 4 compatibility and array bounds (2026-10-23)
+
+The project now pins the Zod 4 release line (`zod` 4.6.6 or newer) to receive
+upstream fixes and keep the MCP SDK on its supported Zod 4 path. Vendored Zoo
+Code schemas use Zod 4 APIs; `ZodError.issues` replaces the removed `.errors`
+alias, and the mode schema's type assertion uses Zod 4's two-parameter
+`ZodType` form.
+
+Input-controlled arrays parsed from workspace mode configuration and message
+schemas have explicit upper bounds. This lets Zod 4 reject over-limit arrays
+before validating each element. The deprecated-group preprocessor also leaves
+oversized arrays intact for that early rejection rather than allocating a
+filtered copy. The bounds are 32 tool groups, 128 allowed MCP servers, 64
+custom modes, and 128 image entries per message.

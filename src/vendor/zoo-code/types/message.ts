@@ -253,7 +253,7 @@ export const clineMessageSchema = z.object({
 	ask: clineAskSchema.optional(),
 	say: clineSaySchema.optional(),
 	text: z.string().optional(),
-	images: z.array(z.string()).optional(),
+	images: z.array(z.string()).max(128).optional(),
 	partial: z.boolean().optional(),
 	reasoning: z.string().optional(),
 	conversationHistoryIndex: z.number().optional(),
@@ -369,7 +369,7 @@ export const queuedMessageSchema = z.object({
 	timestamp: z.number(),
 	id: z.string(),
 	text: z.string(),
-	images: z.array(z.string()).optional(),
+	images: z.array(z.string()).max(128).optional(),
 })
 
 export type QueuedMessage = z.infer<typeof queuedMessageSchema>

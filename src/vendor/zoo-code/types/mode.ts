@@ -59,7 +59,11 @@ function isDeprecatedGroupEntry(entry: unknown): boolean {
 /**
  * Raw schema for validating group entries after deprecated groups are stripped.
  */
-const rawGroupEntryArraySchema = z.array(groupEntrySchema).refine(
+const MAX_GROUP_ENTRIES = 32
+const MAX_ALLOWED_MCP_SERVERS = 128
+const MAX_CUSTOM_MODES = 64
+
+const rawGroupEntryArraySchema = z.array(groupEntrySchema).max(MAX_GROUP_ENTRIES).refine(
 	(groups) => {
 		const seen = new Set()
 
@@ -89,9 +93,9 @@ const rawGroupEntryArraySchema = z.array(groupEntrySchema).refine(
  * and breaks `zodResolver` generic inference in downstream consumers.
  */
 export const groupEntryArraySchema = z.preprocess((val) => {
-	if (!Array.isArray(val)) return val
+	if (!Array.isArray(val) || val.length > MAX_GROUP_ENTRIES) return val
 	return val.filter((entry) => !isDeprecatedGroupEntry(entry))
-}, rawGroupEntryArraySchema) as z.ZodType<GroupEntry[], z.ZodTypeDef, GroupEntry[]>
+}, rawGroupEntryArraySchema) as unknown as z.ZodType<GroupEntry[]>
 
 export const modeConfigSchema = z.object({
 	slug: z.string().regex(/^[a-zA-Z0-9-]+$/, "Slug must contain only letters numbers and dashes"),
@@ -104,6 +108,7 @@ export const modeConfigSchema = z.object({
 	source: z.enum(["global", "project"]).optional(),
 	allowedMcpServers: z
 		.array(z.string())
+		.max(MAX_ALLOWED_MCP_SERVERS)
 		.describe(
 			"Optional list of MCP server names to include. When omitted, all servers are available. When set, only the listed servers are injected.",
 		)
@@ -117,7 +122,7 @@ export type ModeConfig = z.infer<typeof modeConfigSchema>
  */
 
 export const customModesSettingsSchema = z.object({
-	customModes: z.array(modeConfigSchema).refine(
+	customModes: z.array(modeConfigSchema).max(MAX_CUSTOM_MODES).refine(
 		(modes) => {
 			const slugs = new Set()
 
