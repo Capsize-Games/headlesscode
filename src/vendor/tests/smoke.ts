@@ -91,6 +91,18 @@ async function main(): Promise<void> {
 		throw new Error(`customModesSettingsSchema rejected a valid config: ${JSON.stringify(parsed.error)}`)
 	}
 
+	const oversizedGroups = customModesSettingsSchema.safeParse({
+		customModes: [{
+			slug: "oversized",
+			name: "Oversized",
+			roleDefinition: "Oversized mode",
+			groups: Array.from({ length: 33 }, () => ({})),
+		}],
+	})
+	if (oversizedGroups.success || oversizedGroups.error.issues.length !== 1 || oversizedGroups.error.issues[0]?.code !== "too_big") {
+		throw new Error("oversized groups should be rejected before their entries are parsed")
+	}
+
 	console.log(
 		`[smoke] system prompt built (${prompt.length} chars); native tools: ${tools.length}; anthropic tools: ${anthropicTools.length}; roomodes schema: ok`,
 	)
