@@ -1,8 +1,9 @@
 import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
-import path from "node:path"
+import { resolve } from "node:path"
 
-const dockerfile = readFileSync(path.join(process.cwd(), "docker", "Dockerfile"), "utf8")
+const dockerfilePath = resolve(process.cwd(), "docker", "Dockerfile")
+const dockerfile = readFileSync(dockerfilePath, "utf8")
 
 const retiredCertificates = [
 	"mozilla/emSign_ECC_Root_CA_-_G3.crt",
@@ -14,10 +15,16 @@ const retiredCertificates = [
 for (const certificate of retiredCertificates) {
 	const escapedPath = certificate.replaceAll("/", "\\/")
 	assert.ok(
-		dockerfile.split("\n").some((line) => line.includes(`-e '/^${escapedPath}$/s/^/!/'`)),
+			dockerfile
+				.split("\n")
+				.some((line) => line.includes(`-e '/^${escapedPath}$/s/^/!/'`)),
 		`Docker build must disable ${certificate}`,
 	)
 }
 
-assert.match(dockerfile, /update-ca-certificates --fresh/, "disabled roots must be removed from generated trust bundles")
+assert.match(
+	dockerfile,
+	/update-ca-certificates --fresh/,
+	"disabled roots must be removed from generated trust bundles",
+)
 console.log("Docker CA trust policy tests passed")
