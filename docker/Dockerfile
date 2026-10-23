@@ -47,7 +47,12 @@ FROM node:22.23.4-bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git \
     && apt-get upgrade -y ca-certificates \
-    && sed -i '/^mozilla\/emSign_ECC_Root_CA_-_G3.crt$/s/^/!/; /^mozilla\/Comodo_AAA_Services_root.crt$/s/^/!/' /etc/ca-certificates.conf \
+    && sed -i \
+        -e '/^mozilla\/emSign_ECC_Root_CA_-_G3.crt$/s/^/!/' \
+        -e '/^mozilla\/Comodo_AAA_Services_root.crt$/s/^/!/' \
+        -e '/^mozilla\/emSign_Root_CA_-_C1.crt$/s/^/!/' \
+        -e '/^mozilla\/emSign_ECC_Root_CA_-_C3.crt$/s/^/!/' \
+        /etc/ca-certificates.conf \
     && update-ca-certificates --fresh \
     && curl -fsSL https://github.com/cli/cli/releases/download/v2.98.0/gh_2.98.0_linux_amd64.tar.gz -o /tmp/gh.tar.gz \
     && tar -xzf /tmp/gh.tar.gz -C /tmp \
