@@ -6344,6 +6344,13 @@ export function summarizeToolArg(name: string, args: Record<string, unknown>): s
 			// The checklist body, clipped so a long planning list doesn't spam
 			// the event/feed view (the todo_updated event carries full counts).
 			return str(args.todos)?.slice(0, 200)
+		case "ask_followup_question":
+			// The question IS the call's identity — without it the
+			// tool_call event renders as a bare
+			// "Tool: ask_followup_question" with no hint of what was
+			// asked (the full question + suggestions ride the
+			// decision_blocked event).
+			return str(args.question)?.slice(0, 200)
 		default:
 			return undefined
 	}

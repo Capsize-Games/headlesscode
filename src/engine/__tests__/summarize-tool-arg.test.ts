@@ -76,6 +76,24 @@ function testOtherToolsUnchanged(): void {
 	assert.equal(summarizeToolArg("read_file", {}), undefined, "read_file without a path → undefined")
 }
 
+function testAskFollowupQuestionShowsQuestion(): void {
+	// ask_followup_question's question is its identity — without it the
+	// tool_call event renders as a bare "Tool: ask_followup_question"
+	// with no hint of what was asked.
+	assert.equal(
+		summarizeToolArg("ask_followup_question", {
+			question: "Which config?",
+			follow_up: [],
+		}),
+		"Which config?",
+	)
+	assert.equal(
+		summarizeToolArg("ask_followup_question", { question: "x".repeat(250) }),
+		"x".repeat(200),
+	)
+	assert.equal(summarizeToolArg("ask_followup_question", {}), undefined)
+}
+
 function testEditFileAndSearchReplaceUseFilePath(): void {
 	// 2026-09-02: real, confirmed bug -- edit_file and search_replace's
 	// native tool schemas declare `file_path`, not `path` (unlike
@@ -102,6 +120,7 @@ const tests: Array<[string, () => void]> = [
 	["read_file indentation mode with anchor_line", testIndentationModeWithAnchorLine],
 	["read_file indentation mode without anchor_line", testIndentationModeWithoutAnchorLine],
 	["other tools' summaries unchanged", testOtherToolsUnchanged],
+	["ask_followup_question shows question", testAskFollowupQuestionShowsQuestion],
 	["edit_file/search_replace use file_path", testEditFileAndSearchReplaceUseFilePath],
 ]
 

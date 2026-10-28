@@ -1,9 +1,18 @@
+import * as fsp from "node:fs/promises"
 import * as path from "node:path"
 import type { Readable, Writable } from "node:stream"
 import type { ChatTurnResult, ChatTurnRunner } from "./types.js"
 import type { CreateSessionInput, SessionArchive, SessionMessage, SessionProvider, SessionSummary } from "../sessions/types.js"
+import {
+	DECISION_ANSWER_FILENAME,
+	NEEDS_DECISION_FILENAME,
+} from "../tools/executor.js"
 import { TerminalInput, readComposedInput } from "./input.js"
-import { TerminalRenderer, sanitizeTerminalText } from "./renderer.js"
+import {
+	TerminalRenderer,
+	decisionSuggestions,
+	sanitizeTerminalText,
+} from "./renderer.js"
 
 export interface TerminalSessionStore {
 	create(input?: CreateSessionInput, signal?: AbortSignal): Promise<SessionArchive>
@@ -48,6 +57,89 @@ const DEFAULT_MODE = "code"
 const MAX_SESSION_MESSAGES = 50_000
 const MAX_CONTEXT_CHARS = 50_000
 const RUNNER_ERROR_TEXT = "The turn runner failed before returning a result."
+
+interface DecisionPrompt {
+	input: TerminalInput
+	workspaceRoot: string
+	onError: (message: string) => void
+	supervisorSignal?: AbortSignal
+}
+
+function mapDecisionAnswer(
+	text: string,
+	suggestions: string[],
+): string {
+	const pick = Number(text)
+	const valid = suggestions.length > 0 &&
+		Number.isInteger(pick) &&
+		pick >= 1 &&
+		pick <= suggestions.length
+	return valid ? suggestions[pick - 1] : text
+}
+
+async function readDecisionAnswer(
+	prompt: DecisionPrompt,
+	suggestions: string[],
+	signal: AbortSignal,
+): Promise<string | undefined> {
+	const label = suggestions.length > 0
+		? `answer (1-${suggestions.length} or text)> `
+		: "answer> "
+	for (;;) {
+		if (signal.aborted) return undefined
+		if (prompt.supervisorSignal?.aborted) return undefined
+		const reply = await prompt.input.readLine(label)
+		if (reply.kind !== "line") return undefined
+		const text = reply.line.trim()
+		if (text) return mapDecisionAnswer(text, suggestions)
+	}
+}
+
+async function decisionMarkerPresent(
+	prompt: DecisionPrompt,
+): Promise<boolean> {
+	try {
+		const marker = path.join(
+			prompt.workspaceRoot,
+			NEEDS_DECISION_FILENAME,
+		)
+		await fsp.access(marker)
+	} catch {
+		return false
+	}
+	return true
+}
+
+async function writeDecisionAnswer(
+	prompt: DecisionPrompt,
+	answer: string,
+): Promise<void> {
+	try {
+		const target = path.join(
+			prompt.workspaceRoot,
+			DECISION_ANSWER_FILENAME,
+		)
+		await fsp.writeFile(target, answer, "utf8")
+	} catch (error) {
+		prompt.onError(`Could not write answer: ${errorMessage(error)}`)
+	}
+}
+
+async function runDecisionPrompt(
+	prompt: DecisionPrompt,
+	fields: Record<string, unknown>,
+	signal: AbortSignal,
+): Promise<void> {
+	if (!(await decisionMarkerPresent(prompt))) return
+	const answer = await readDecisionAnswer(
+		prompt,
+		decisionSuggestions(fields),
+		signal,
+	)
+	if (answer !== undefined) {
+		await writeDecisionAnswer(prompt, answer)
+	}
+}
 
 export function parseChatArgs(argv: string[], cwd = process.cwd()): ChatCliOptions {
 	let workspaceRoot = path.resolve(cwd)
@@ -190,6 +282,34 @@ export async function chatMain(argv: string[], deps: ChatCliDependencies): Promi
 		return true
 	}
 
+	// Interactive ask_followup_question / switch_mode approval: the
+	// engine blocks on `<workspace>/.harness.decision-answer` while it
+	// waits, so a terminal turn would hang (up to the 30-minute default)
+	// with no way to reply. Prompt inline and write the answer file the
+	// engine is polling for. Sequential by construction — the engine
+	// serves one escalation at a time — with a guard in case events
+	// ever overlap.
+	const promptForDecision = (): DecisionPrompt => ({
+		input,
+		workspaceRoot: activeWorkspaceRoot,
+		onError: (message) => renderer.writeError(message),
+		supervisorSignal: deps.signal,
+	})
+	let decisionPromptActive = false
+	const answerDecision = async (
+		fields: Record<string, unknown>,
+		signal: AbortSignal,
+	): Promise<void> => {
+		if (decisionPromptActive) return
+		if (signal.aborted || deps.signal?.aborted) return
+		decisionPromptActive = true
+		try {
+			await runDecisionPrompt(promptForDecision(), fields, signal)
+		} finally {
+			decisionPromptActive = false
+		}
+	}
+
 	const runTurn = async (prompt: string): Promise<void> => {
 		if (deps.signal?.aborted) {
 			renderer.writeError("The supervisor has stopped this session.")
@@ -215,7 +335,16 @@ export async function chatMain(argv: string[], deps: ChatCliDependencies): Promi
 				mode,
 				...(model ? { model } : {}),
 				signal: localController.signal,
-				onEvent: (type, fields) => { try { renderer.renderEvent(type, fields) } catch { /* Rendering cannot change runner outcome. */ } },
+				onEvent: (type, fields) => {
+					try {
+						renderer.renderEvent(type, fields)
+					} catch {
+						// Rendering cannot change runner outcome.
+					}
+					if (type === "decision_blocked") {
+						void answerDecision(fields, localController.signal)
+					}
+				},
 			})
 		} catch (error) {
 			result = { status: "error", result: "", error: errorMessage(error) || RUNNER_ERROR_TEXT, messages: [] }
