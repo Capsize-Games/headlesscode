@@ -2,7 +2,7 @@ import * as fs from "node:fs"
 import { CampaignControlStore, MAX_MONTHLY_BUDGET_MICROS } from "./store.js"
 import { loadCampaignAdapterConfig, readCampaignBudgetReport, runCampaignTick, runFleetAdapterUnderLock, verifyCampaignDispatchLock } from "./runner.js"
 import { mutateCampaignControlLocked } from "./authority.js"
-import { CAMPAIGN_ADAPTER_FILE, CAMPAIGN_CONTROL_FILE } from "./paths.js"
+import { CAMPAIGN_ADAPTER_FILE, CAMPAIGN_CONTROL_FILE, REPOSITORY_CAMPAIGN_REGISTRY_FILE, REPOSITORY_CAMPAIGN_STATE_FILE } from "./paths.js"
 import { readCampaignRsiStatus } from "./rsi.js"
 import * as os from "node:os"
 import * as path from "node:path"
@@ -29,7 +29,8 @@ export async function campaignMain(args: string[]): Promise<number> {
 	if (action === "serve") {
 		if (positional.length) return 2
 		const { startCampaignControlServer } = await import("./server.js")
-		await startCampaignControlServer({ staticRoot: path.join(os.homedir(), "Projects/capsize-web/apps/fleet-campaign-control/dist") })
+		await startCampaignControlServer({ staticRoot: path.join(os.homedir(), "Projects/capsize-web/apps/fleet-campaign-control/dist"),
+			repositoryCampaignRegistryPath: REPOSITORY_CAMPAIGN_REGISTRY_FILE, repositoryCampaignStatePath: REPOSITORY_CAMPAIGN_STATE_FILE })
 		process.stdout.write(JSON.stringify({ status: "listening", url: "http://127.0.0.1:4391/" }) + "\n")
 		return 0
 	}

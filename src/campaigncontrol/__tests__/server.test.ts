@@ -6,7 +6,9 @@ import { request, type Server } from "node:http"
 import { CampaignControlStore, type CampaignControlState } from "../store.js"
 import { startCampaignControlServer, type CampaignMutation } from "../server.js"
 import { readCampaignRsiStatus, type CampaignRsiStatus } from "../rsi.js"
+import type { ProviderRsiStatus } from "../provider-rsi.js"
 import type { CampaignJobReport, CampaignReadinessReport } from "../runner.js"
+import { RepositoryCampaignStore, type RepositoryCampaignDefinition } from "../repository-campaigns.js"
 import { runMain, type SuiteTest } from "../../test-runner.js"
 
 const currentMonth = () => new Date().toISOString().slice(0, 7)
@@ -194,6 +196,100 @@ async function testStaticServerDoesNotExposeUnlistedFiles(): Promise<void> {
 	} finally { await close(f) }
 }
 
+async function testRepositoryCampaignApiIsAdditiveAndReportsMockReadiness(): Promise<void> {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-repository-campaign-api-"))
+	const definitions: RepositoryCampaignDefinition[] = [{ id: "headlesscode-internal", name: "HeadlessCode",
+		sourceRevision: null, workerProfile: null, recipeDigest: null, evaluatorDigest: null, model: null, dataAccessProfile: null,
+		qualification: { sourceAudited: false, workerQualified: false, recipeQualified: false, evaluatorQualified: false,
+			modelApproved: false, dataApproved: false, accessApproved: false } }]
+	const repositoryCampaigns = new RepositoryCampaignStore(path.join(root, "repository-campaigns.json"), definitions)
+	const f = await fixture()
+	const extended = await startCampaignControlServer({
+		port: 0, staticRoot: path.join(f.root, "dist"), store: f.store, controlPath: f.store.path, repositoryCampaigns,
+		loadAdapter: async () => ({ releaseRoot: f.root, stateRoot: f.root, releaseDigest: "a".repeat(64) }),
+		readBudget: async () => ({ month: currentMonth(), settledMicros: 0, reservedMicros: 0, ambiguousMicros: 0 }),
+		readJobs: async () => ({ jobs: [], jobDetailsAvailable: false }),
+		readRsi: async () => ({ mode: "offline-synthetic-only", status: "not-run", activation: "not-performed",
+			limits: { modelCalls: 0, spendUsd: 0, comparisons: 1, maxDurationSeconds: 30, maxFixtures: 500 }, history: [] }),
+		readProviderRsi: async (): Promise<ProviderRsiStatus> => ({ mode: "provider-synthetic-only", model: "meta/muse-spark-1.3-contributor",
+			activation: "not-performed", maxSpendMicros: 20_000, history: [] }),
+	})
+	const address = extended.address(); assert.ok(address && typeof address !== "string")
+	const base = `http://127.0.0.1:${address.port}`
+	try {
+		const legacy = await fetch(`${base}/api/campaign-control`)
+		assert.equal(legacy.status, 200, "existing Fleet endpoint remains available")
+		const initialResponse = await fetch(`${base}/api/repository-campaigns`)
+		assert.equal(initialResponse.status, 200)
+		const initial = await initialResponse.json() as any
+		assert.equal(initial.mode, "offline-synthetic-only")
+		assert.equal(initial.modelCalls, 0)
+		assert.equal(initial.controlPlaneOnly, true)
+		assert.equal(initial.budget.authority, "fleet-broker-ledger-not-integrated")
+		assert.equal(initial.budget.available, false)
+		assert.equal(initial.budget.limitMicros, 0, "repository campaigns do not create a separate spend allowance")
+		assert.equal(initial.campaigns[0].readiness, "blocked-prerequisite")
+		assert.ok(initial.campaigns[0].readinessReasons.includes("authoritative-broker-budget"))
+		const start = await fetch(`${base}/api/repository-campaigns`, { method: "POST", headers: { "content-type": "application/json" },
+			body: JSON.stringify({ action: "start", campaignId: "headlesscode-internal" }) })
+		assert.equal(start.status, 409)
+		assert.match((await start.json() as any).error, /audited-private-source/)
+		const invalid = await fetch(`${base}/api/repository-campaigns`, { method: "POST", headers: { "content-type": "application/json" },
+			body: JSON.stringify({ action: "run", campaignId: "headlesscode-internal", command: "ignored" }) })
+		assert.equal(invalid.status, 400)
+	} finally {
+		await new Promise<void>((resolve, reject) => extended.close((error) => error ? reject(error) : resolve()))
+		await close(f); await fs.rm(root, { recursive: true, force: true })
+	}
+}
+
+async function testRepositoryDraftCreateAndConfigureNeverSelfCertifyReadiness(): Promise<void> {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-repository-campaign-draft-api-"))
+	const repositoryCampaigns = new RepositoryCampaignStore(path.join(root, "repository-campaigns.json"), [])
+	const f = await fixture()
+	const server = await startCampaignControlServer({ port: 0, staticRoot: path.join(f.root, "dist"), store: f.store,
+		repositoryCampaigns, loadAdapter: async () => ({ releaseRoot: f.root, stateRoot: f.root, releaseDigest: "a".repeat(64) }),
+		readBudget: async () => ({ month: currentMonth(), settledMicros: 0, reservedMicros: 0, ambiguousMicros: 0 }),
+		readJobs: async () => ({ jobs: [], jobDetailsAvailable: false }),
+		readRsi: async () => ({ mode: "offline-synthetic-only", status: "not-run", activation: "not-performed",
+			limits: { modelCalls: 0, spendUsd: 0, comparisons: 1, maxDurationSeconds: 30, maxFixtures: 500 }, history: [] }),
+		readProviderRsi: async (): Promise<ProviderRsiStatus> => ({ mode: "provider-synthetic-only", model: "meta/muse-spark-1.3-contributor",
+			activation: "not-performed", maxSpendMicros: 20_000, history: [] }),
+	})
+	const address = server.address(); assert.ok(address && typeof address !== "string")
+	const base = `http://127.0.0.1:${address.port}`
+	try {
+		const headers = { "content-type": "application/json" }
+		const created = await fetch(`${base}/api/repository-campaigns`, { method: "POST", headers,
+			body: JSON.stringify({ action: "create", id: "sample-repo", name: "Sample repo", repository: "Capsize-Games/sample" }) })
+		assert.equal(created.status, 200)
+		const configured = await fetch(`${base}/api/repository-campaigns`, { method: "POST", headers,
+			body: JSON.stringify({ action: "configure", campaignId: "sample-repo", sourceRevision: "a".repeat(40), requestedModelProfile: "muse-spark-contributor" }) })
+		assert.equal(configured.status, 200)
+		const detail = await fetch(`${base}/api/repository-campaigns/sample-repo`)
+		assert.equal(detail.status, 200)
+		const body = await detail.json() as any
+		assert.equal(body.campaign.readiness, "blocked-prerequisite")
+		assert.deepEqual(body.campaign.readinessReasons, ["owner-provisioned-enrollment-review"])
+		assert.equal(body.campaign.sourceRevision, "a".repeat(40))
+		assert.equal(JSON.stringify(body).includes("workerQualified"), false, "client configuration cannot set trusted qualification")
+		const page1 = await fetch(`${base}/api/repository-campaigns/sample-repo/history?cursor=0&limit=1`)
+		assert.equal(page1.status, 200)
+		const history1 = await page1.json() as any
+		assert.equal(history1.items.length, 1)
+		assert.equal(history1.nextCursor, 1)
+		const page2 = await fetch(`${base}/api/repository-campaigns/sample-repo/history?cursor=1&limit=1`)
+		assert.equal((await page2.json() as any).items[0].action, "configured")
+		const forced = await fetch(`${base}/api/repository-campaigns`, { method: "POST", headers,
+			body: JSON.stringify({ action: "configure", campaignId: "sample-repo", sourceRevision: "a".repeat(40),
+				requestedModelProfile: "muse-spark-contributor", workerQualified: true, modelApproved: true }) })
+		assert.equal(forced.status, 400)
+	} finally {
+		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+		await close(f); await fs.rm(root, { recursive: true, force: true })
+	}
+}
+
 const tests: readonly SuiteTest[] = [
 	["control API reports actual ledger totals and leaves package jobs explicitly unavailable", testLoopbackApiReportsActualBudgetAndNoFabricatedJobs],
 	["control API exposes readiness coverage and completion counts", testApiShowsProfileCoverageAndCompletionCounts],
@@ -202,6 +298,8 @@ const tests: readonly SuiteTest[] = [
 	["unknown fields, over-cap budget, wrong hosts, and cross-origin requests are rejected", testUnknownFieldsInvalidBudgetAndCrossOriginAreRejected],
 	["optional bearer auth gates the API while leaving the app entry available", testOptionalBearerTokenGatesApiButNotStaticEntry],
 	["static serving is confined to the built UI allowlist", testStaticServerDoesNotExposeUnlistedFiles],
+	["repository campaign API is additive and exposes mock mode and readiness", testRepositoryCampaignApiIsAdditiveAndReportsMockReadiness],
+	["repository draft create and configure cannot self-certify readiness", testRepositoryDraftCreateAndConfigureNeverSelfCertifyReadiness],
 ]
 
 runMain("campaign-control-server", tests)

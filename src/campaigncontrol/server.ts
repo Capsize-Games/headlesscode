@@ -7,6 +7,7 @@ import { mutateCampaignControlLocked } from "./authority.js"
 import { loadCampaignAdapterConfig, readCampaignBudgetReport, readCampaignJobReport, type CampaignBudgetReport, type CampaignJobReport, type CampaignReadinessReport } from "./runner.js"
 import { readCampaignRsiStatus, type CampaignRsiStatus } from "./rsi.js"
 import { readProviderRsiStatus, type ProviderRsiStatus } from "./provider-rsi.js"
+import { RepositoryCampaignStore, loadRepositoryCampaignDefinitions } from "./repository-campaigns.js"
 
 export const CAMPAIGN_CONTROL_PORT = 4391
 const MAX_BODY_BYTES = 4096
@@ -52,6 +53,9 @@ export interface CampaignControlServerOptions {
 	readRsi?: () => Promise<CampaignRsiStatus>
 	readProviderRsi?: () => Promise<ProviderRsiStatus>
 	mutate?: (action: CampaignMutation, micros?: number) => Promise<CampaignControlState>
+	repositoryCampaigns?: RepositoryCampaignStore
+	repositoryCampaignStatePath?: string
+	repositoryCampaignRegistryPath?: string
 }
 
 function json(res: http.ServerResponse, status: number, body: unknown): void {
@@ -233,6 +237,72 @@ async function handleRequest(
 		}
 		return
 	}
+	const repositoryCampaignRoute = /^\/api\/repository-campaigns(?:\/([a-z0-9][a-z0-9-]{1,62})(?:\/(history))?)?$/.exec(url.pathname)
+	if (repositoryCampaignRoute) {
+		if (url.hash) { json(res, 400, { error: "fragments are not supported" }); return }
+		const repoStore = options.repositoryCampaigns
+		if (!repoStore) { json(res, 503, { error: "repository campaign registry is unavailable" }); return }
+		if (req.method === "GET") {
+			try {
+				const status = await repoStore.status()
+				if (repositoryCampaignRoute[2] === "history") {
+					if ([...url.searchParams.keys()].some((key) => !["cursor", "limit"].includes(key))) { json(res, 400, { error: "history query fields are invalid" }); return }
+					const cursorRaw = url.searchParams.get("cursor") ?? "0", limitRaw = url.searchParams.get("limit") ?? "50"
+					const cursor = Number(cursorRaw), limit = Number(limitRaw)
+					if (!/^\d{1,6}$/.test(cursorRaw) || !/^\d{1,3}$/.test(limitRaw) || limit < 1 || limit > 100 || cursor > 200 ||
+						url.searchParams.getAll("cursor").length > 1 || url.searchParams.getAll("limit").length > 1) { json(res, 400, { error: "history cursor or limit is invalid" }); return }
+					let page
+					try { page = await repoStore.historyPage(repositoryCampaignRoute[1]!, cursor, limit) }
+					catch (error) {
+						if (error instanceof Error && error.message === "repository campaign is not registered") { json(res, 404, { error: error.message }); return }
+						if (error instanceof Error && error.message === "history cursor is out of range") { json(res, 400, { error: error.message }); return }
+						throw error
+					}
+					json(res, 200, { mode: "offline-synthetic-only", modelCalls: 0, controlPlaneOnly: true, campaignId: repositoryCampaignRoute[1], ...page }); return
+				}
+				if (repositoryCampaignRoute[1]) {
+					if (url.search) { json(res, 400, { error: "detail query parameters are not supported" }); return }
+					const campaigns = status.campaigns as Array<Record<string, unknown>>
+					const drafts = status.drafts as Array<Record<string, unknown>>
+					const item = campaigns.find((row) => row.id === repositoryCampaignRoute[1]) ?? drafts.find((row) => row.id === repositoryCampaignRoute[1])
+					if (!item) { json(res, 404, { error: "repository campaign is not registered" }); return }
+					json(res, 200, { mode: "offline-synthetic-only", modelCalls: 0, controlPlaneOnly: true, campaign: item }); return
+				}
+				if (url.search) { json(res, 400, { error: "list query parameters are not supported" }); return }
+				json(res, 200, { mode: "offline-synthetic-only", modelCalls: 0, controlPlaneOnly: true, ...status })
+			}
+			catch { json(res, 503, { error: "repository campaign status is unavailable" }) }
+			return
+		}
+		if (repositoryCampaignRoute[1] && repositoryCampaignRoute[2]) { res.writeHead(405, { allow: "GET" }).end(); return }
+		if (req.method !== "POST") { res.writeHead(405, { allow: "GET, POST" }).end(); return }
+		let body: unknown
+		try { body = await readBody(req) }
+		catch (error) { const reason = error instanceof Error ? error.message : "json"; json(res, reason === "size" ? 413 : 400, { error: reason === "content-type" ? "application/json is required" : "request body is invalid" }); return }
+		if (!body || typeof body !== "object" || Array.isArray(body)) { json(res, 400, { error: "request body is invalid" }); return }
+		const value = body as Record<string, unknown>
+		try {
+			if (value.action === "create" && Object.keys(value).sort().join(",") === "action,id,name,repository" &&
+				typeof value.id === "string" && typeof value.name === "string" && typeof value.repository === "string") {
+				await repoStore.createDraft({ id: value.id, name: value.name, repository: value.repository })
+			} else if (value.action === "configure" && Object.keys(value).sort().join(",") === "action,campaignId,requestedModelProfile,sourceRevision" &&
+				typeof value.campaignId === "string" && typeof value.requestedModelProfile === "string" && typeof value.sourceRevision === "string") {
+				await repoStore.configureDraft(value.campaignId, { sourceRevision: value.sourceRevision, requestedModelProfile: value.requestedModelProfile })
+			} else if ((value.action === "start" || value.action === "stop") && Object.keys(value).sort().join(",") === "action,campaignId" && typeof value.campaignId === "string") {
+				if (value.action === "start") await repoStore.start(value.campaignId); else await repoStore.stop(value.campaignId)
+			} else if (value.action === "budget" && Object.keys(value).sort().join(",") === "action,budgetMicros,budgetTokens,campaignId" &&
+				typeof value.campaignId === "string" && Number.isSafeInteger(value.budgetMicros) && Number.isSafeInteger(value.budgetTokens)) {
+				await repoStore.setCampaignBudget(value.campaignId, value.budgetMicros as number, value.budgetTokens as number)
+			} else { json(res, 400, { error: "repository campaign action or fields are invalid" }); return }
+			json(res, 200, { mode: "offline-synthetic-only", modelCalls: 0, controlPlaneOnly: true, ...(await repoStore.status()) })
+		} catch (error) {
+			const message = error instanceof Error && (error.message === "repository campaign is not registered" || error.message === "repository draft is not registered" || error.message === "repository campaign is already registered" || error.message === "repository draft metadata is invalid" || error.message === "repository draft configuration is invalid" || error.message === "budget is outside the permitted range" ||
+				error.message.startsWith("campaign is blocked:") || error.message === "campaign budget is below committed usage" ||
+				error.message.startsWith("repository budgets exceed authoritative Fleet allocation") || error.message === "repository draft is not registered") ? error.message : "repository campaign change could not be applied"
+			json(res, message === "repository campaign is not registered" ? 404 : 409, { error: message })
+		}
+		return
+	}
 	if (req.method !== "GET") { res.writeHead(405, { allow: "GET" }).end(); return }
 	try {
 		const pathname = decodeURIComponent(url.pathname)
@@ -257,6 +327,10 @@ export async function startCampaignControlServer(options: CampaignControlServerO
 	if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("campaign control port is invalid")
 	const staticRoot = await validateStaticRoot(options.staticRoot)
 	const store = options.store ?? new CampaignControlStore(options.controlPath ?? CAMPAIGN_CONTROL_FILE)
+	if (!options.repositoryCampaigns && options.repositoryCampaignRegistryPath) {
+		const definitions = await loadRepositoryCampaignDefinitions(options.repositoryCampaignRegistryPath)
+		options.repositoryCampaigns = new RepositoryCampaignStore(options.repositoryCampaignStatePath ?? `${options.repositoryCampaignRegistryPath}.state.json`, definitions)
+	}
 	let actualPort = port
 	const server = http.createServer((req, res) => {
 		void handleRequest(req, res, options, staticRoot, store, actualPort).catch(() => {
