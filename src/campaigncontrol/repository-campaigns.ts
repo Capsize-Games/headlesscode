@@ -303,6 +303,40 @@ export class RepositoryCampaignStore {
 		}, now)
 	}
 
+	/**
+	 * Linearize an upstream request start against Stop using the same durable
+	 * campaign-state lock. The lock is released as soon as `start` returns its
+	 * promise; an already-started request may finish and must still be settled.
+	 */
+	async withClaimRequestStart<T>(claim: ClaimedRepositoryJob, start: () => Promise<T>): Promise<T> {
+		if (!claim || typeof start !== "function") throw new Error("campaign request claim is invalid")
+		const release = await this.lock()
+		let pending: Promise<T>
+		try {
+			const state = await this.loadState(new Date())
+			const job = state.jobs.find((candidate) => candidate.id === claim.job.id)
+			const campaign = state.campaigns[claim.job.campaignId]
+			if (!campaign?.enabled || campaign.epoch !== claim.epoch || !job || job.status !== "running" ||
+				job.claimId !== claim.claimId || job.epoch !== claim.epoch) throw new Error("campaign request claim is stale or stopped")
+			pending = start()
+		} finally {
+			await release()
+		}
+		return await pending!
+	}
+
+	async assertClaimCurrent(claim: ClaimedRepositoryJob): Promise<void> {
+		if (!claim) throw new Error("campaign claim is invalid")
+		const release = await this.lock()
+		try {
+			const state = await this.loadState(new Date())
+			const job = state.jobs.find((candidate) => candidate.id === claim.job.id)
+			const campaign = state.campaigns[claim.job.campaignId]
+			if (!campaign?.enabled || campaign.epoch !== claim.epoch || !job || job.status !== "running" ||
+				job.claimId !== claim.claimId || job.epoch !== claim.epoch) throw new Error("campaign claim is stale or stopped")
+		} finally { await release() }
+	}
+
 	/** Enqueue deduplicated advisory work; input is metadata only, never fetched or executed. */
 	async enqueue(id: string, advisoryId: string, now = new Date()): Promise<RepositoryCampaignJob> {
 		this.requireDefinition(id)
@@ -478,19 +512,25 @@ export class RepositoryCampaignStore {
 	private async update<T>(mutate: (s: CampaignState) => T, now: Date): Promise<T> {
 		const release = await this.lock()
 		try {
-			let s: CampaignState
-			try {
-				const st = await fs.lstat(this.path)
-				if (!st.isFile() || st.isSymbolicLink() || st.size > 1024 * 1024 || (typeof process.getuid === "function" && st.uid !== process.getuid())) throw new Error("repository campaign state is not a bounded owner file")
-				s = JSON.parse(await fs.readFile(this.path, "utf8"))
-				if (!validateState(s)) throw new Error("repository campaign state failed schema validation")
-			} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; s = blankState(now) }
+			const s = await this.loadState(now)
 			if (s.month !== monthNow(now)) s.month = monthNow(now)
 			for (const id of this.definitions.keys()) if (!s.campaigns[id]) s.campaigns[id] = this.initialCampaign()
 			const result = mutate(s)
 			await this.write(s)
 			return result
 		} finally { await release() }
+	}
+	private async loadState(now: Date): Promise<CampaignState> {
+		let s: CampaignState
+		try {
+			const st = await fs.lstat(this.path)
+			if (!st.isFile() || st.isSymbolicLink() || st.size > 1024 * 1024 || (typeof process.getuid === "function" && st.uid !== process.getuid())) throw new Error("repository campaign state is not a bounded owner file")
+			s = JSON.parse(await fs.readFile(this.path, "utf8"))
+			if (!validateState(s)) throw new Error("repository campaign state failed schema validation")
+		} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; s = blankState(now) }
+		if (s.month !== monthNow(now)) s.month = monthNow(now)
+		for (const id of this.definitions.keys()) if (!s.campaigns[id]) s.campaigns[id] = this.initialCampaign()
+		return s
 	}
 	private async lock(): Promise<() => Promise<void>> {
 		const parent = path.dirname(this.path)

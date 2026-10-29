@@ -109,7 +109,7 @@ test("Muse endpoint admission pins current Meta metadata and rejects changed end
 	}
 })
 
-async function setup(t: { after(fn: () => void | Promise<void>): void }, overrides: { usage?: Record<string, unknown>; model?: string; profileId?: "muse-spark-contributor"; limits?: OpenRouterBrokerLimits; upstreamFetch?: typeof fetch } = {}) {
+async function setup(t: { after(fn: () => void | Promise<void>): void }, overrides: { usage?: Record<string, unknown>; model?: string; profileId?: "muse-spark-contributor"; limits?: OpenRouterBrokerLimits; upstreamFetch?: typeof fetch; requestStartGate?: (start: () => Promise<Response>) => Promise<Response> } = {}) {
 	const root = await scratch("rsi-inference-broker")
 	t.after(() => fs.rm(root, { recursive: true, force: true }))
 	const ledger = new FileOpenRouterInferenceLedger(path.join(root, "ledger.json"))
@@ -117,10 +117,35 @@ async function setup(t: { after(fn: () => void | Promise<void>): void }, overrid
 	const broker = await startOpenRouterBroker({
 		jobId: "attempt-1234567890123456", leaseToken: "lease-test", limits: overrides.limits ?? limits("campaign-test"), apiKey: "host-secret",
 		bindHost: "127.0.0.1", ledger, upstreamFetch: upstream.fetcher, ...(overrides.model ? { model: overrides.model } : {}), ...(overrides.profileId ? { profileId: overrides.profileId } : {}),
+		...(overrides.requestStartGate ? { requestStartGate: overrides.requestStartGate } : {}),
 	})
 	t.after(() => broker.close())
 	return { root, ledger, broker, upstream }
 }
+
+test("broker runs the repository request-start gate after authority reservation and before upstream POST", async (t) => {
+	const events: string[] = []
+	const upstreamFetch = (async (input: string | URL, init?: RequestInit) => {
+		if (String(input).includes("/models/")) return new Response(JSON.stringify({ data: { endpoints: [museEndpointMetadata()] } }), { status: 200 })
+		events.push("post")
+		assert.equal(init?.method, "POST")
+		return new Response(JSON.stringify(routedResponse({ id: "gated", model: RSI_MUSE_OPENROUTER_MODEL, choices: [], usage: { prompt_tokens: 20, completion_tokens: 4, cost: 0.0001 } }, "meta")), { status: 200, headers: { "content-type": "application/json" } })
+	}) as typeof fetch
+	const f = await setup(t, { upstreamFetch, model: RSI_MUSE_OPENROUTER_MODEL, profileId: "muse-spark-contributor", requestStartGate: async (start) => {
+		events.push("gate")
+		const response = start()
+		events.push("gate-release")
+		return await response
+	} })
+	const reserve = f.ledger.reserve.bind(f.ledger)
+	f.ledger.reserve = async (...args) => { events.push("reserve"); await reserve(...args) }
+	const response = await fetch(`${f.broker.localBaseUrl}/api/v1/chat/completions`, {
+		method: "POST", headers: { authorization: `Bearer ${f.broker.capability}`, "content-type": "application/json", "x-rsi-call-id": "repository-gated-call-0001" },
+		body: requestBody({ model: RSI_MUSE_OPENROUTER_MODEL, max_tokens: 64, tools: [] }),
+	})
+	assert.equal(response.status, 200)
+	assert.deepEqual(events, ["reserve", "gate", "post", "gate-release"])
+})
 
 test("broker prompt byte budget is derived from the tighter admitted input or request ceiling", async (t) => {
 	const tokenBounded = await setup(t, { limits: limits("token-budget", { maxInputTokensPerCall: 4_096, maxRequestBytes: 16_384 }) })

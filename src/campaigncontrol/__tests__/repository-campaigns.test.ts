@@ -175,6 +175,33 @@ async function testStopHoldsInFlightReservationUntilMeasuredSettlement(): Promis
 	} finally { await fs.rm(root, { recursive: true, force: true }) }
 }
 
+async function testRequestStartIsFencedAgainstStopButInFlightRequestCanSettle(): Promise<void> {
+	const { root, store } = await fixture()
+	try {
+		const now = new Date("2026-10-29T12:00:00Z")
+		await store.setCampaignBudget("headlesscode-internal", 50_000, 50_000, now)
+		await store.start("headlesscode-internal", now)
+		await store.enqueue("headlesscode-internal", "CVE-2026-1242", now)
+		const claim = await store.claimNext("headlesscode-internal", { micros: 20_000, tokens: 20_000 }, now)
+		assert.ok(claim)
+		let sendCount = 0
+		let finishRequest!: (value: string) => void
+		const pendingResponse = new Promise<string>((resolve) => { finishRequest = resolve })
+		const response = store.withClaimRequestStart(claim!, () => { sendCount += 1; return pendingResponse })
+		while (sendCount === 0) await new Promise((resolve) => setTimeout(resolve, 1))
+		await store.stop("headlesscode-internal", new Date(now.getTime() + 1))
+		await assert.rejects(store.withClaimRequestStart(claim!, async () => { sendCount += 1; return "never" }), /stale or stopped/)
+		assert.equal(sendCount, 1, "Stop prevents a later send but does not cancel one already started")
+		finishRequest("measured-response")
+		assert.equal(await response, "measured-response")
+		await store.finish(claim!, { status: "succeeded", actualMicros: 8_000, actualTokens: 9_000 }, new Date(now.getTime() + 2))
+		const status = await store.status(new Date(now.getTime() + 2)) as any
+		assert.equal(status.budget.reservedMicros, 0)
+		assert.equal(status.budget.settledMicros, 8_000)
+		assert.equal(status.campaigns.find((item: any) => item.id === "headlesscode-internal").enabled, false)
+	} finally { await fs.rm(root, { recursive: true, force: true }) }
+}
+
 async function testInjectedMockDispatcherProcessesOnlyOneClaimedJob(): Promise<void> {
 	const { root, store } = await fixture()
 	try {
@@ -204,6 +231,7 @@ const tests: readonly SuiteTest[] = [
 	["duplicate enqueue is idempotent and restart uses a new epoch", testRepeatedAdvisoryEnqueueIsIdempotentAndStopThenRestartUsesNewEpoch],
 	["campaign lifetime token and spend totals survive monthly rollover without resuming", testLifetimeBudgetsSurviveMonthRolloverAndDoNotResume],
 	["Stop keeps in-flight token and spend holds until measured settlement", testStopHoldsInFlightReservationUntilMeasuredSettlement],
+	["request start is ordered with Stop and an already-started request remains settleable", testRequestStartIsFencedAgainstStopButInFlightRequestCanSettle],
 	["injected mock dispatcher runs one queued job and does not poll an empty queue", testInjectedMockDispatcherProcessesOnlyOneClaimedJob],
 ]
 
