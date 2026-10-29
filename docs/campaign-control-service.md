@@ -32,8 +32,9 @@ process environment values.
 
 ## Install and check
 
-Installation is a separate reviewed activation step; this candidate has not
-been activated.
+The reviewed supervisor was activated on the reference MX workstation on
+2026-10-29. Use these commands to install on another authorized target or verify
+the existing installation.
 
 ```sh
 python3 scripts/manage_campaign_control_supervisor.py install
@@ -68,10 +69,12 @@ stops and preserves it for review. Other cron entries are kept.
 The observed API process used the supported `campaign serve` command from the
 HeadlessCode checkout. The user cron daemon was running; system and user systemd
 managers were offline on the inspected MX host. This candidate uses the user
-cron daemon and is not activated. Root review is required before adding the
-marked `@reboot` entry and starting the supervisor. Preparing this package does
-not add a campaign tick entry or change live campaign state, credentials,
-registration, or access gates.
+cron daemon. After source review and 16 focused synthetic tests, installation
+and the live identity/status check passed. The existing API PID and all prior
+cron entries were preserved; a private crontab snapshot and activation receipt
+were retained. Reboot recovery has not been exercised on the live workstation.
+No campaign tick entry, live campaign state, credentials, registration, or access
+gate was changed.
 
 ## Synthetic checks
 
