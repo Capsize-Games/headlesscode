@@ -120,6 +120,71 @@ test("HCL broker and real Python Fleet authority settle canonical and admitted a
   } finally { await broker.close() }
 })
 
+test("authenticated Muse discovery is served from the admitted snapshot without contaminating the receipt", async (t) => {
+  const fixture = await makeFixture("fleet-bridge-muse-discovery")
+  t.after(fixture.cleanup)
+  const upstreamUrls: string[] = []
+  const upstream = (async (input: string | URL, init?: RequestInit) => {
+    upstreamUrls.push(String(input))
+    return await endpointResponse(input, init)
+  }) as typeof fetch
+  const broker = await start(fixture, "attempt-muse-discovery-123", upstream)
+  try {
+    const discovery = await fetch(`${broker.localBaseUrl}/api/v1/models/${RSI_MUSE_OPENROUTER_MODEL}/endpoints`, {
+      headers: { authorization: `Bearer ${broker.capability}` },
+    })
+    assert.equal(discovery.status, 200)
+    const metadata = await discovery.json() as { data?: { endpoints?: Array<Record<string, unknown>> } }
+    const discovered = metadata.data?.endpoints?.[0]
+    assert.equal(discovered?.provider_name, "Meta")
+    assert.equal(discovered?.tag, "meta")
+    assert.equal(discovered?.quantization, "unknown")
+    assert.equal(discovered?.status, 0)
+    assert.deepEqual(discovered?.supported_parameters, metaEndpoint().supported_parameters)
+    assert.deepEqual(discovered?.supports_tool_choice, { auto: true, required: true })
+    const discoveredPricing = discovered?.pricing as { prompt?: unknown; completion?: unknown }
+    assert.equal(Number(discoveredPricing.prompt), Number(metaEndpoint().pricing.prompt))
+    assert.equal(Number(discoveredPricing.completion), Number(metaEndpoint().pricing.completion))
+    assert.equal(upstreamUrls.filter((url) => url.includes("/models/")).length, 1,
+      "only the host preflight reached OpenRouter; guest discovery reads the cached admitted snapshot")
+
+    const responseResult = await fetch(`${broker.localBaseUrl}/api/v1/chat/completions`, {
+      method: "POST", headers: { authorization: `Bearer ${broker.capability}`, "content-type": "application/json", "x-rsi-call-id": "muse-discovery-post-0001" },
+      body: requestBody(),
+    })
+    assert.equal(responseResult.status, 200)
+    const receipt = await broker.receipt()
+    assert.equal(receipt.qualified, true)
+    assert.deepEqual(receipt.denials, [])
+    assert.equal(receipt.calls, 1)
+  } finally { await broker.close() }
+})
+
+test("other metadata routes remain denied and contaminate the Fleet receipt", async (t) => {
+  const fixture = await makeFixture("fleet-bridge-unknown-discovery")
+  t.after(fixture.cleanup)
+  let upstreamMetadataGets = 0
+  const upstream = (async (input: string | URL, init?: RequestInit) => {
+    if (String(input).includes("/models/")) upstreamMetadataGets++
+    return await endpointResponse(input, init)
+  }) as typeof fetch
+  const broker = await start(fixture, "attempt-unknown-discovery-123", upstream)
+  try {
+    for (const suffix of ["other/model/endpoints", `${RSI_MUSE_OPENROUTER_MODEL}/endpoints?fallback=true`]) {
+      const denied = await fetch(`${broker.localBaseUrl}/api/v1/models/${suffix}`, {
+        headers: { authorization: `Bearer ${broker.capability}` },
+      })
+      assert.equal(denied.status, 404)
+    }
+    const receipt = await broker.receipt()
+    assert.equal(receipt.qualified, false)
+    assert.deepEqual(receipt.denials.map(({ statusCode, reason, count }) => ({ statusCode, reason, count })), [
+      { statusCode: 404, reason: "unsupported-endpoint", count: 2 },
+    ])
+    assert.equal(upstreamMetadataGets, 1, "unknown guest routes never reach the provider")
+  } finally { await broker.close() }
+})
+
 test("real Fleet bridge persists HTTP 403 ambiguity across fresh bridge processes and denies another POST", async (t) => {
   const fixture = await makeFixture("fleet-bridge-403")
   t.after(fixture.cleanup)

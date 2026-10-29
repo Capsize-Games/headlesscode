@@ -784,7 +784,21 @@ export async function startOpenRouterBroker(options: OpenRouterBrokerOptions): P
 			const url = new URL(request.url ?? "/", "http://rsi-broker.invalid")
 			const endpointPath = `/api/v1/models/${model}/endpoints`
 			if (request.method === "GET" && url.pathname === endpointPath && !url.search) {
-				await deny(404, "metadata-not-admitted", "model metadata is not provided by the RSI broker"); return
+				if (profile.id !== "muse-spark-contributor") {
+					await deny(404, "metadata-not-admitted", "model metadata is not provided by the RSI broker"); return
+				}
+				// The host already fetched and validated this exact endpoint's metadata
+				// before issuing the job capability. Serve only that pinned snapshot to
+				// the worker's SDK discovery GET; it is not a provider call or denial.
+				const price = endpointPrice
+				sendJson(response, 200, { data: { endpoints: [{
+					provider_name: profile.endpointProviderName, tag: profile.endpointTag,
+					...(profile.quantization ? { quantization: profile.quantization } : {}), status: 0,
+					supported_parameters: price.supportedParameters,
+					supports_tool_choice: { auto: true, required: true },
+					pricing: { prompt: String(price.inputPricePerMillionUsd / 1_000_000), completion: String(price.outputPricePerMillionUsd / 1_000_000) },
+				}] } })
+				return
 			}
 			if (request.method !== "POST" || url.pathname !== "/api/v1/chat/completions" || url.search) { await deny(404, "unsupported-endpoint", "broker endpoint is not admitted"); return }
 			const callId = request.headers["x-rsi-call-id"]
