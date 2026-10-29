@@ -273,18 +273,12 @@ async function testEmptyFeed(): Promise<void> {
 	assert.equal(model.totals.toolCalls, 0)
 }
 
-// ─── page.ts stays in sync with timeline.ts ──────────────────────────────────
-//
-// src/dashboard/page.ts's tool-classification sets (TL_READ/TL_WRITE/
-// TL_EXEC/TL_SEARCH) are a deliberately duplicated, NOT-imported inline
-// vanilla-JS twin of this file's READ_TOOLS/WRITE_TOOLS/EXEC_TOOLS/
-// SEARCH_TOOLS (see page.ts's own comment: "keep the two in sync") — no
-// build step means page.ts can't import timeline.ts directly. Found live
-// 2026-08-21: adding set_indentation to WRITE_TOOLS here did NOT
-// automatically update page.ts's TL_WRITE, and nothing caught the drift —
-// zero test coverage existed for page.ts's copy at all. This reads both
-// files' real source and asserts the four sets match exactly, member for
-// member, so a future addition here that forgets the twin fails loudly.
+// ─── shared built renderer stays in sync with timeline.ts ────────────────────
+// The dashboard shim in src/dashboard/page.ts reads the canonical shared UI
+// build from capsize-web/apps/headlesscode/dist. Check that built browser code,
+// rather than the retired local page.ts implementation, against this timeline
+// model. Keep this integration optional so a standalone CLI checkout still
+// runs its tests when the sibling dashboard artifact is absent.
 
 function extractSetMembers(source: string, varName: string): string[] {
 	const match = new RegExp(`${varName}\\s*=\\s*new Set\\(\\[([^\\]]*)\\]\\)`).exec(source)
@@ -293,25 +287,54 @@ function extractSetMembers(source: string, varName: string): string[] {
 	return items.map((s) => s.slice(1, -1)).sort()
 }
 
-async function testPageTsWriteToolsStayInSyncWithTimelineTs(): Promise<void> {
-	const timelineSource = await fs.readFile(path.join(__dirname, "..", "timeline.ts"), "utf-8")
-	const pageSource = await fs.readFile(path.join(__dirname, "..", "page.ts"), "utf-8")
+const timelineSetPairs: Array<[string, string]> = [
+	["READ_TOOLS", "TL_READ"],
+	["WRITE_TOOLS", "TL_WRITE"],
+	["EXEC_TOOLS", "TL_EXEC"],
+	["SEARCH_TOOLS", "TL_SEARCH"],
+]
 
-	const pairs: Array<[string, string]> = [
-		["READ_TOOLS", "TL_READ"],
-		["WRITE_TOOLS", "TL_WRITE"],
-		["EXEC_TOOLS", "TL_EXEC"],
-		["SEARCH_TOOLS", "TL_SEARCH"],
-	]
-	for (const [timelineVar, pageVar] of pairs) {
-		const timelineMembers = extractSetMembers(timelineSource, timelineVar)
-		const pageMembers = extractSetMembers(pageSource, pageVar)
+function assertRendererParity(timelineSource: string, rendererSource: string): void {
+	for (const [timelineVar, rendererVar] of timelineSetPairs) {
 		assert.deepEqual(
-			pageMembers,
-			timelineMembers,
-			`page.ts's ${pageVar} has drifted from timeline.ts's ${timelineVar} — keep the two in sync (see page.ts's own comment)`,
+			extractSetMembers(rendererSource, rendererVar),
+			extractSetMembers(timelineSource, timelineVar),
+			`shared renderer's ${rendererVar} has drifted from timeline.ts's ${timelineVar}`,
 		)
 	}
+}
+
+async function testSharedRendererToolSetsStayInSyncWithTimelineTs(): Promise<void> {
+	const timelineSource = await fs.readFile(path.join(__dirname, "..", "timeline.ts"), "utf-8")
+	const explicitRendererPath = process.env.CAPSIZE_HEADLESSCODE_RENDERER_JS
+	const rendererPath = explicitRendererPath
+		?? path.resolve(__dirname, "../../../../capsize-web/apps/headlesscode/dist/assets/headlesscode.js")
+	let rendererSource: string
+	try {
+		rendererSource = await fs.readFile(rendererPath, "utf-8")
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			if (explicitRendererPath) {
+				throw new Error(`CAPSIZE_HEADLESSCODE_RENDERER_JS points to a missing shared renderer: ${rendererPath}`)
+			}
+			console.log(`SKIP dashboard timeline parity: optional shared renderer is absent at ${rendererPath}`)
+			return
+		}
+		throw error
+	}
+
+	assertRendererParity(timelineSource, rendererSource)
+
+	const driftedRenderer = rendererSource.replace(
+		/(const TL_READ = new Set\(\[[^\]]*)\]/,
+		'$1, "synthetic_drift"]',
+	)
+	assert.notEqual(driftedRenderer, rendererSource, "synthetic renderer fixture must change the TL_READ set")
+	assert.throws(
+		() => assertRendererParity(timelineSource, driftedRenderer),
+		/shared renderer's TL_READ has drifted/,
+		"the parity assertion must reject a drifted renderer fixture",
+	)
 }
 
 // ─── Runner ──────────────────────────────────────────────────────────────────
@@ -323,7 +346,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["timeline: condensation point becomes a marker with before/after counts", testCondensationMarker],
 	["timeline: dominant-category ties break deterministically", testTieBreakPriority],
 	["timeline: empty feed degrades gracefully", testEmptyFeed],
-	["timeline: page.ts's TL_READ/WRITE/EXEC/SEARCH sets stay in sync with timeline.ts's", testPageTsWriteToolsStayInSyncWithTimelineTs],
+	["timeline: shared renderer TL_READ/WRITE/EXEC/SEARCH sets stay in sync with timeline.ts", testSharedRendererToolSetsStayInSyncWithTimelineTs],
 ]
 
 runMain("dashboard timeline", tests)
