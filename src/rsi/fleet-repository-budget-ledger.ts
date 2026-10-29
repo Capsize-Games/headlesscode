@@ -1,10 +1,13 @@
 /** Repository-scoped adapter for Fleet's v2 shared budget authority. */
 import { createHash } from "node:crypto"
+import { spawn, type StdioOptions } from "node:child_process"
+import { constants } from "node:fs"
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
 import { CAMPAIGN_CONTROL_FILE } from "../campaigncontrol/paths.js"
-import { verifyCampaignDispatchLock } from "../campaigncontrol/runner.js"
-import { FLEET_BUDGET_CAMPAIGN_ID, type FleetBudgetLedgerOptions, invokeFleetBudgetBridge } from "./fleet-budget-ledger.js"
+import { prepareDispatchLock } from "../campaigncontrol/runner.js"
+import { FLEET_BUDGET_CAMPAIGN_ID, type FleetBudgetLedgerOptions, invokeFleetBudgetBridge,
+	resolveFleetBudgetBridgeRelease } from "./fleet-budget-ledger.js"
 import type {
 	OpenRouterBrokerGrant, OpenRouterBrokerReceipt, OpenRouterCallReceipt,
 	OpenRouterCallReservation, OpenRouterCallSettlement, OpenRouterDenialReason, OpenRouterInferenceLedger,
@@ -21,6 +24,7 @@ const DENIAL_REASONS = new Set<OpenRouterDenialReason>([
 	"budget-or-fence", "job-deadline", "upstream-ambiguous", "usage-unverifiable", "usage-out-of-bounds",
 	"settlement-failed", "request-failed",
 ])
+const MAX_HANDOFF_REPLY = 64 * 1024
 
 export interface FleetRepositoryBudgetScope {
 	repositoryCampaignId: string
@@ -36,8 +40,9 @@ export interface FleetRepositoryBudgetScope {
 
 export interface FleetRepositoryBudgetLedgerOptions extends FleetBudgetLedgerOptions {
 	scope: FleetRepositoryBudgetScope
-	/** Test seam only; production validates the inherited HeadlessCode dispatch lock. */
+	/** Test seams only; production uses the bounded cross-process request-start handoff. */
 	assertDispatchFence?: () => Promise<void>
+	requestStartHandoff?: (message: Record<string, unknown>, onAdmitted: (reply: Reply) => void | Promise<void>) => Promise<void>
 }
 
 export interface FleetRepositoryReconciliation {
@@ -83,10 +88,12 @@ type Reply = Record<string, unknown>
  */
 export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 	readonly requiresHostApiKeyIdentity = true
+	private readonly options: FleetRepositoryBudgetLedgerOptions
+	private readonly invokeTestSeam: boolean
 	private readonly scope: FleetRepositoryBudgetScope
 	private readonly expectedKeyIdentity: string
 	private readonly call: (message: Record<string, unknown>) => Promise<Reply>
-	private readonly assertDispatchFence: () => Promise<void>
+	private readonly assertDispatchFence?: () => Promise<void>
 	private readonly jobs = new Map<string, OpenRouterBrokerGrant>()
 	private readonly idempotency = new Map<string, string>()
 
@@ -95,10 +102,13 @@ export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 		if (!options.invoke && (options.python !== undefined || options.timeoutMs !== undefined || options.assertDispatchFence !== undefined)) {
 			throw new Error("Fleet repository bridge process overrides are restricted to the injected test seam")
 		}
+		if (!options.invoke && options.requestStartHandoff !== undefined) throw new Error("Fleet request-start handoff override is restricted to the injected test seam")
 		this.scope = validateScope(options.scope)
+		this.options = options
+		this.invokeTestSeam = options.invoke !== undefined
 		this.expectedKeyIdentity = options.expectedKeyIdentity
 		this.call = (message) => invokeFleetBudgetBridge(message, options)
-		this.assertDispatchFence = options.assertDispatchFence ?? verifyInheritedDispatchFence
+		this.assertDispatchFence = options.assertDispatchFence
 	}
 
 	assertApiKey(apiKey: string): void {
@@ -144,15 +154,26 @@ export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 		this.idempotency.set(reservation.callId, idempotencyKey)
 	}
 
-	/** Called by the broker between reservation and HTTP send, while both claim and Fleet fence are held. */
-	async requestStart(grant: OpenRouterBrokerGrant, reservation: OpenRouterCallReservation): Promise<void> {
+	/** Admit and invoke the exact HTTP send while the shared Fleet lock is held, then release before response completion. */
+	async requestStart(grant: OpenRouterBrokerGrant, reservation: OpenRouterCallReservation,
+		start: () => Promise<Response>, markStarted: (request: Promise<Response>) => void): Promise<void> {
 		this.remember(grant)
 		validateReservation(reservation)
-		await this.assertDispatchFence()
 		const idempotencyKey = idempotencyKeyFor(this.scope, grant.jobId, reservation)
-		const result = await this.call({ ...this.identity(grant, "repository-request-start"),
-			callId: reservation.callId, idempotencyKey })
-		if (result.started !== true || result.state !== "transmitting") throw new Error("Fleet repository request-start was not admitted")
+		const message = { ...this.identity(grant, "repository-request-start"), callId: reservation.callId, idempotencyKey }
+		const admitAndSend = (result: Reply) => {
+			assertRequestStartReply(result, this.scope, grant, reservation)
+			if (result.started !== true || result.state !== "transmitting") throw new Error("Fleet repository request-start was not admitted")
+			markStarted(start())
+		}
+		if (this.invokeTestSeam && !this.options.requestStartHandoff) {
+			await this.assertDispatchFence?.()
+			admitAndSend(await this.call(message))
+		} else if (this.options.requestStartHandoff) {
+			await this.options.requestStartHandoff(message, admitAndSend)
+		} else {
+			await invokeRequestStartHandoff(message, this.options, admitAndSend)
+		}
 	}
 
 	async settle(grant: OpenRouterBrokerGrant, settlement: OpenRouterCallSettlement & { callId: string }): Promise<void> {
@@ -305,13 +326,93 @@ function usdMicros(value: number): number {
 	return micros
 }
 
-async function verifyInheritedDispatchFence(): Promise<void> {
-	const raw = process.env.HEADLESSCODE_CAMPAIGN_LOCK_FD
-	if (!raw || !/^\d{1,6}$/.test(raw) || Number(raw) < 3) throw new Error("repository provider send requires the inherited HeadlessCode dispatch lock")
-	const expected = path.join(path.dirname(CAMPAIGN_CONTROL_FILE), "campaign-dispatch.lock")
-	const target = await fs.readlink(`/proc/self/fd/${Number(raw)}`).catch(() => "")
-	if (target !== expected) throw new Error("repository provider send inherited a different dispatch lock")
-	await verifyCampaignDispatchLock(CAMPAIGN_CONTROL_FILE)
+function assertRequestStartReply(result: Reply, scope: FleetRepositoryBudgetScope, grant: OpenRouterBrokerGrant,
+	reservation: OpenRouterCallReservation): void {
+	if (Object.keys(result).sort().join(",") !== "attemptId,callId,jobId,repositoryCampaignId,repositoryEpoch,repositoryId,started,state" ||
+		typeof result.started !== "boolean" || result.jobId !== grant.jobId || result.callId !== reservation.callId ||
+		result.repositoryCampaignId !== scope.repositoryCampaignId || result.repositoryId !== scope.repositoryId ||
+		result.repositoryEpoch !== scope.repositoryEpoch || typeof result.attemptId !== "string" ||
+		!/^rsi-repo-[a-f0-9]{64}$/.test(result.attemptId) ||
+		(result.started ? result.state !== "transmitting" : !["reserved", "ambiguous", "settled"].includes(String(result.state)))) {
+		throw new Error("Fleet repository request-start identity is invalid")
+	}
+}
+
+/**
+ * The Python bridge and this process share one open-file description for the
+ * global dispatch flock. Python emits its admission while holding the flock;
+ * this process invokes fetch synchronously, acknowledges that invocation, then
+ * retains its descriptor until the Python child exits or is killed.
+ */
+async function invokeRequestStartHandoff(message: Record<string, unknown>, options: FleetRepositoryBudgetLedgerOptions,
+	onAdmitted: (reply: Reply) => void): Promise<void> {
+	const payload = Buffer.from(JSON.stringify(message) + "\n", "utf8")
+	if (payload.length > 32 * 1024) throw new Error("Fleet request-start exceeds its size bound")
+	const { releaseRoot } = await resolveFleetBudgetBridgeRelease()
+	const lockPath = await prepareDispatchLock(CAMPAIGN_CONTROL_FILE)
+	const lock = await fs.open(lockPath, constants.O_RDWR | constants.O_NOFOLLOW)
+	const info = await lock.stat()
+	if (!info.isFile() || info.nlink !== 1 || (info.mode & 0o077) !== 0 ||
+		(typeof process.getuid === "function" && info.uid !== process.getuid())) {
+		await lock.close()
+		throw new Error("Fleet request-start lock is not an owner-only regular file")
+	}
+	const python = options.python ?? "/usr/bin/python3"
+	return await new Promise<void>((resolve, reject) => {
+		const env: NodeJS.ProcessEnv = { PATH: "/usr/bin:/bin", PYTHONPATH: releaseRoot, PYTHONNOUSERSITE: "1",
+			HEADLESSCODE_CAMPAIGN_LOCK_FD: "3" }
+		const stdio: StdioOptions = ["pipe", "pipe", "ignore", lock.fd]
+		const child = spawn(python, ["-m", "operations.campaign_budget_bridge"], { cwd: releaseRoot, shell: false, env, stdio })
+		const stdout = child.stdout, stdin = child.stdin
+		if (!stdout || !stdin) { child.kill("SIGKILL"); void lock.close(); reject(new Error("Fleet handoff pipes are unavailable")); return }
+		let buffer = Buffer.alloc(0), admitted = false, requestInvoked = false, protocolFault = false, done = false
+		let timeoutError = false
+		const finish = async (error?: Error) => {
+			if (done) return
+			done = true
+			clearTimeout(timer)
+			await lock.close().catch(() => undefined)
+			if (error && !requestInvoked) reject(error)
+			else resolve()
+		}
+		const timer = setTimeout(() => {
+			timeoutError = true
+			child.kill("SIGKILL")
+		}, options.timeoutMs ?? 5_000)
+		stdout.on("data", (chunk: Buffer) => {
+			if (done) return
+			buffer = Buffer.concat([buffer, chunk])
+			if (buffer.length > MAX_HANDOFF_REPLY) { protocolFault = true; child.kill("SIGKILL"); return }
+			if (admitted) { protocolFault = true; child.kill("SIGKILL"); return }
+			const newline = buffer.indexOf(10)
+			if (newline < 0) return
+			if (newline !== buffer.length - 1) { protocolFault = true; child.kill("SIGKILL"); return }
+			let reply: Reply
+			try {
+				const parsed: unknown = JSON.parse(buffer.subarray(0, newline).toString("utf8"))
+				if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error()
+				reply = parsed as Reply
+			} catch { protocolFault = true; child.kill("SIGKILL"); return }
+			try {
+				onAdmitted(reply)
+				requestInvoked = reply.started === true
+				admitted = true
+				stdin.write(reply.started ? "send-started\n" : "abort\n")
+				stdin.end()
+			} catch {
+				protocolFault = true
+				child.kill("SIGKILL")
+			}
+		})
+		child.on("error", () => { void finish(new Error("Fleet request-start bridge is unavailable")) })
+		child.on("close", (code) => {
+			const error = timeoutError ? new Error("Fleet request-start handoff timed out") :
+				!admitted || code !== 0 || protocolFault ? new Error("Fleet request-start handoff failed closed") : undefined
+			void finish(error)
+		})
+		stdin.on("error", () => { protocolFault = true })
+		stdin.write(payload)
+	})
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

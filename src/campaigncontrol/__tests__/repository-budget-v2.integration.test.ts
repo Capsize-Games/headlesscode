@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
-import { spawnSync } from "node:child_process"
-import { existsSync } from "node:fs"
+import { spawn, spawnSync } from "node:child_process"
+import { constants, existsSync } from "node:fs"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
@@ -44,6 +44,33 @@ with patches[0]:
     with ExitStack() as stack:
         for item in patches[1:]: stack.enter_context(item)
         print(json.dumps(bridge._authority().dispatch(json.load(sys.stdin)), separators=(",", ":")))
+`
+const pythonBridgeHandoff = `
+import json, os, sys
+from contextlib import ExitStack
+from unittest.mock import patch
+import operations.campaign_budget as budget
+import operations.campaign_budget_bridge as bridge
+import operations.campaign_control as control
+month = os.environ.get("FLEET_TEST_MONTH")
+crash_after_admit = os.environ.get("FLEET_TEST_CRASH_AFTER_ADMIT") == "1"
+def fixed_control(path, **kwargs):
+    with open(path, "r", encoding="utf-8") as stream: value = json.load(stream)
+    if month: value["month"] = month
+    return value
+patches = [patch.object(budget, "_provider_snapshot", return_value={"limit_micros": 5000000, "remaining_micros": 5000000, "usage_micros": 0})]
+if crash_after_admit:
+    original = bridge.FleetBudgetBridge._repository_request_start
+    def crash_after_request_start(self, message):
+        result = original(self, message)
+        os._exit(79)
+    bridge.FleetBudgetBridge._repository_request_start = crash_after_request_start
+if month:
+    patches.extend([patch.object(budget, "_utc_month", return_value=month), patch.object(budget, "read_control", side_effect=fixed_control), patch.object(control, "read_control", side_effect=fixed_control), patch.object(bridge, "read_control", side_effect=fixed_control)])
+with patches[0]:
+    with ExitStack() as stack:
+        for item in patches[1:]: stack.enter_context(item)
+        bridge.main()
 `
 const fleetRoot = process.env.FLEET_SECURITY_WATCH_TEST_ROOT ?? path.resolve(process.cwd(), "../fleet-repository-budget-v2")
 const fleetSourceAvailable = existsSync(path.join(fleetRoot, "operations/campaign_budget_bridge.py"))
@@ -104,6 +131,9 @@ interface Fixture {
 	setFault(value?: string): void
 	setMonth(value?: string): void
 	invoke(message: Record<string, unknown>): Promise<Record<string, unknown>>
+	requestStartHandoff(message: Record<string, unknown>, onAdmitted: (reply: Record<string, unknown>) => void | Promise<void>): Promise<void>
+	tryDispatchLock(): boolean
+	crashNextHandoff(): void
 	setControl(value: { globalEnabled?: boolean; globalEpoch?: number; repoAEnabled?: boolean; repoAEpoch?: number; repoBEnabled?: boolean; repoBEpoch?: number }): Promise<void>
 	cleanup(): Promise<void>
 }
@@ -130,8 +160,8 @@ async function fixture(): Promise<Fixture> {
 	await fs.writeFile(path.join(campaign, "repository-scopes.json"), JSON.stringify({ schemaVersion: 1, repositories: scopes }), { mode: 0o600 })
 	await fs.chmod(path.join(campaign, "repository-scopes.json"), 0o600)
 	let controlState = { globalEnabled: true, globalEpoch: 1, repoAEnabled: true, repoAEpoch: 1, repoBEnabled: true, repoBEpoch: 1 }
-	let fault: string | undefined, month: string | undefined
-	const writeControl = async () => {
+	let fault: string | undefined, month: string | undefined, crashHandoff = false
+	const writeControl = async (underDispatchLock = false) => {
 		const now = Date.now()
 		const value = { schemaVersion: 1, campaignId: "fleet-security-watch", enabled: controlState.globalEnabled,
 			canAdmit: controlState.globalEnabled, epoch: controlState.globalEpoch, budgetLimitMicros: 5_000_000,
@@ -141,7 +171,13 @@ async function fixture(): Promise<Fixture> {
 				"repo-a": { enabled: controlState.repoAEnabled, epoch: controlState.repoAEpoch, repositoryId: "fixture-a", sourceRevision: sourceA, policySha256: policyA },
 				"repo-b": { enabled: controlState.repoBEnabled, epoch: controlState.repoBEpoch, repositoryId: "fixture-b", sourceRevision: sourceB, policySha256: policyB },
 			} }
-		await fs.writeFile(controlFile, JSON.stringify(value), { mode: 0o600 }); await fs.chmod(controlFile, 0o600)
+		if (underDispatchLock) {
+			const child = spawnSync("/usr/bin/python3", ["-c", "import fcntl,json,os,sys; x=json.load(sys.stdin); fd=os.open(x['lock'],os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600); fcntl.flock(fd,fcntl.LOCK_EX); open(x['control'],'w',encoding='utf-8').write(json.dumps(x['value']))"],
+				{ input: JSON.stringify({ lock: path.join(controlDir, "campaign-dispatch.lock"), control: controlFile, value }), encoding: "utf8", timeout: 5_000 })
+			if (child.error || child.status !== 0) throw new Error("fixture global Stop could not acquire dispatch lock")
+		} else {
+			await fs.writeFile(controlFile, JSON.stringify(value), { mode: 0o600 }); await fs.chmod(controlFile, 0o600)
+		}
 	}
 	await writeControl()
 	const invoke = async (message: Record<string, unknown>) => {
@@ -151,6 +187,50 @@ async function fixture(): Promise<Fixture> {
 		fault = undefined
 		if (child.error || child.status !== 0) throw new Error(`offline Fleet v2 bridge call failed closed (${child.status ?? child.error?.message ?? "spawn-error"}): ${(child.stderr ?? "").slice(0, 1200)}`)
 		return JSON.parse(child.stdout.trim()) as Record<string, unknown>
+	}
+	const requestStartHandoff = async (message: Record<string, unknown>, onAdmitted: (reply: Record<string, unknown>) => void | Promise<void>) => {
+		const lockPath = path.join(controlDir, "campaign-dispatch.lock")
+		const lock = await fs.open(lockPath, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 0o600)
+		await lock.chmod(0o600)
+		try { await new Promise<void>((resolve, reject) => {
+			const child = spawn("/usr/bin/python3", ["-c", pythonBridgeHandoff], { stdio: ["pipe", "pipe", "ignore", lock.fd],
+				env: { HOME: home, PATH: process.env.PATH ?? "/usr/bin:/bin", PYTHONPATH: fleetRoot, PYTHONNOUSERSITE: "1",
+					HEADLESSCODE_CAMPAIGN_LOCK_FD: "3", ...(month ? { FLEET_TEST_MONTH: month } : {}), ...(crashHandoff ? { FLEET_TEST_CRASH_AFTER_ADMIT: "1" } : {}) } })
+			crashHandoff = false
+			if (!child.stdout || !child.stdin) { child.kill("SIGKILL"); reject(new Error("fixture handoff pipes are unavailable")); return }
+			const stdoutStream = child.stdout, stdinStream = child.stdin
+			let stdout = "", admitted = false, handling = false, protocolError = false
+			const timer = setTimeout(() => { protocolError = true; child.kill("SIGKILL") }, 10_000)
+			stdoutStream.on("data", (chunk: Buffer) => {
+				stdout += chunk.toString("utf8")
+				if (Buffer.byteLength(stdout) > 64 * 1024) { protocolError = true; child.kill("SIGKILL"); return }
+				if (admitted || handling) { protocolError = true; child.kill("SIGKILL"); return }
+				const newline = stdout.indexOf("\n")
+				if (newline < 0) return
+				if (newline !== stdout.length - 1) { protocolError = true; child.kill("SIGKILL"); return }
+				try {
+					const reply = JSON.parse(stdout.slice(0, newline)) as Record<string, unknown>
+					handling = true
+					void Promise.resolve(onAdmitted(reply)).then(() => {
+						admitted = true
+						stdinStream.write(reply.started === true ? "send-started\n" : "abort\n")
+						stdinStream.end()
+					}).catch(() => { protocolError = true; child.kill("SIGKILL") })
+				} catch { protocolError = true; child.kill("SIGKILL") }
+			})
+			child.once("error", () => { protocolError = true; reject(new Error("fixture handoff spawn failed")) })
+			child.once("close", (code) => {
+				clearTimeout(timer)
+				if (code !== 0 || !admitted || protocolError) reject(new Error("fixture request-start handoff failed"))
+				else resolve()
+			})
+			stdinStream.write(JSON.stringify(message) + "\n")
+		}) } finally { await lock.close() }
+	}
+	const tryDispatchLock = () => {
+		const child = spawnSync("/usr/bin/python3", ["-c", "import fcntl,os,sys; fd=os.open(sys.argv[1],os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600); exec('try:\\n fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)\\nexcept BlockingIOError:\\n sys.exit(1)')" , path.join(controlDir, "campaign-dispatch.lock")],
+			{ encoding: "utf8", timeout: 2_000 })
+		return child.status === 0
 	}
 	const authority: RepositoryBudgetAuthority = { mode: "synthetic-test", available: true, limitMicros: 20_000,
 		limitTokens: 20_000, committedMicros: 0, committedTokens: 0 }
@@ -169,11 +249,13 @@ async function fixture(): Promise<Fixture> {
 	const claims = { "repo-a": claimA, "repo-b": claimB }
 	const grants = { "repo-a": grant(claimA.job.id), "repo-b": grant(claimB.job.id) }
 	const bindings = Object.fromEntries((["repo-a", "repo-b"] as const).map((id) => [id, createRepositoryCampaignBudgetBinding({
-		store, claim: claims[id], scope: scope(id), expectedKeyIdentity: keyIdentity, invoke,
+		store, claim: claims[id], scope: scope(id), expectedKeyIdentity: keyIdentity, invoke, requestStartHandoff,
 		assertDispatchFence: async () => undefined,
 	})])) as Fixture["bindings"]
-	return { root, home, store, claims, grants, bindings, setFault(value) { fault = value }, setMonth(value) { month = value }, invoke,
-		async setControl(next) { controlState = { ...controlState, ...next }; await writeControl() }, cleanup: () => fs.rm(home, { recursive: true, force: true }) }
+	return { root, home, store, claims, grants, bindings, setFault(value) { fault = value }, setMonth(value) { month = value }, invoke, requestStartHandoff,
+		tryDispatchLock,
+		crashNextHandoff() { crashHandoff = true },
+		async setControl(next) { controlState = { ...controlState, ...next }; await writeControl(true) }, cleanup: () => fs.rm(home, { recursive: true, force: true }) }
 }
 
 test("HCL binding sends v2 repository identities and both repositories consume the same legacy campaign lifetime pool", { skip: integrationSkip }, async (t) => {
@@ -220,7 +302,7 @@ test("Stop changes to either epoch before the dual request-start fence prevent t
 	await f.setControl({ repoAEnabled: false, repoAEpoch: 2 })
 	let sends = 0
 	await assert.rejects(f.bindings[id].requestStartGate(async () => { sends += 1; return new Response("must not send") },
-		{ grant: f.grants[id], reservation: call }), /outside|mismatched|stale|unavailable|current/)
+		{ grant: f.grants[id], reservation: call }), /outside|mismatched|stale|unavailable|current|handoff failed/)
 	assert.equal(sends, 0)
 })
 
@@ -229,24 +311,83 @@ test("Stop waits for Fleet request-start admission and send invocation, then pro
 	const id = "repo-a" as const, call = reservation("fixture-ordered-stop-call")
 	const admissionEntered = deferred<void>(), releaseAdmission = deferred<void>()
 	const sendStarted = deferred<void>(), releaseResponse = deferred<Response>()
-	const invoke = async (message: Record<string, unknown>) => {
-		if (message.op === "repository-request-start") {
+	const requestStartHandoff = async (message: Record<string, unknown>, onAdmitted: (reply: Record<string, unknown>) => void | Promise<void>) =>
+		await f.requestStartHandoff(message, async (reply) => {
 			admissionEntered.resolve()
 			await releaseAdmission.promise
-		}
-		return await f.invoke(message)
-	}
+			await onAdmitted(reply)
+		})
 	const binding = createRepositoryCampaignBudgetBinding({ store: f.store, claim: f.claims[id], scope: scope(id), expectedKeyIdentity: keyIdentity,
-		invoke, assertDispatchFence: async () => undefined })
+		invoke: f.invoke, requestStartHandoff })
 	await binding.register(f.grants[id]); await binding.reserve(f.grants[id], call)
 	const request = binding.requestStartGate(() => { sendStarted.resolve(); return releaseResponse.promise }, { grant: f.grants[id], reservation: call })
 	await admissionEntered.promise
+	assert.equal(f.tryDispatchLock(), false, "global Stop cannot cross an admitted-but-not-yet-invoked send")
 	const stopped = f.store.stop(id)
 	releaseAdmission.resolve()
 	await sendStarted.promise
 	await stopped
+	await f.setControl({ globalEnabled: false, globalEpoch: 2 })
 	releaseResponse.resolve(new Response("fixture response"))
 	assert.equal((await request).status, 200)
+})
+
+test("Python crash after durable request-start is fail-closed and preserves both ambiguous holds", { skip: integrationSkip }, async (t) => {
+	const f = await fixture(); t.after(f.cleanup)
+	const id = "repo-a" as const, call = reservation("fixture-python-crash-call")
+	await f.bindings[id].register(f.grants[id]); await f.bindings[id].reserve(f.grants[id], call)
+	f.crashNextHandoff()
+	let sends = 0
+	await assert.rejects(f.bindings[id].requestStartGate(async () => { sends += 1; return new Response("must not send") },
+		{ grant: f.grants[id], reservation: call }), /handoff failed/)
+	assert.equal(sends, 0)
+	assert.equal(f.tryDispatchLock(), true, "parent closes the shared lock descriptor after the bridge crash")
+	await f.store.recoverInterrupted()
+	const result = await f.bindings[id].reconcile(f.grants[id])
+	assert.deepEqual(result.calls.map((row) => row.state), ["ambiguous"])
+	const status = await f.store.status() as any
+	assert.equal(status.jobs.find((job: any) => job.id === f.claims[id].job.id).status, "ambiguous")
+	assert.equal(status.budget.ambiguousMicros, 20_000)
+})
+
+test("Node-side no-ack closes its shared lock descriptor and leaves the send reservation held", { skip: integrationSkip }, async (t) => {
+	const f = await fixture(); t.after(f.cleanup)
+	const id = "repo-a" as const, call = reservation("fixture-no-ack-call")
+	await f.bindings[id].register(f.grants[id]); await f.bindings[id].reserve(f.grants[id], call)
+	const abortBeforeAck = (message: Record<string, unknown>) => f.requestStartHandoff(message, () => {
+		throw new Error("simulated Node termination before request-start acknowledgement")
+	})
+	const binding = createRepositoryCampaignBudgetBinding({ store: f.store, claim: f.claims[id], scope: scope(id), expectedKeyIdentity: keyIdentity,
+		invoke: f.invoke, requestStartHandoff: abortBeforeAck })
+	let sends = 0
+	await assert.rejects(binding.requestStartGate(async () => { sends += 1; return new Response("must not send") },
+		{ grant: f.grants[id], reservation: call }), /handoff failed/)
+	assert.equal(sends, 0)
+	assert.equal(f.tryDispatchLock(), true)
+	await f.store.recoverInterrupted()
+	const reconciled = await binding.reconcile(f.grants[id])
+	assert.deepEqual(reconciled.calls.map((row) => row.state), ["ambiguous"])
+	const status = await f.store.status() as any
+	assert.equal(status.budget.ambiguousMicros, 20_000)
+})
+
+test("immediately rejected fetch is observed during lock acknowledgement and keeps the claim recoverable", { skip: integrationSkip }, async (t) => {
+	const f = await fixture(); t.after(f.cleanup)
+	const id = "repo-a" as const, call = reservation("fixture-rejected-fetch-call")
+	await f.bindings[id].register(f.grants[id]); await f.bindings[id].reserve(f.grants[id], call)
+	const admitted = deferred<void>(), release = deferred<void>()
+	const handoff = (message: Record<string, unknown>, onAdmitted: (reply: Record<string, unknown>) => void | Promise<void>) =>
+		f.requestStartHandoff(message, async (reply) => { admitted.resolve(); await release.promise; await onAdmitted(reply) })
+	const binding = createRepositoryCampaignBudgetBinding({ store: f.store, claim: f.claims[id], scope: scope(id), expectedKeyIdentity: keyIdentity,
+		invoke: f.invoke, requestStartHandoff: handoff })
+	const request = binding.requestStartGate(() => Promise.reject(new Error("synthetic fetch failure")), { grant: f.grants[id], reservation: call })
+	await admitted.promise
+	release.resolve()
+	await assert.rejects(request, /synthetic fetch failure/)
+	await f.store.recoverInterrupted()
+	const status = await f.store.status() as any
+	assert.equal(status.jobs.find((job: any) => job.id === f.claims[id].job.id).status, "ambiguous")
+	assert.equal(status.budget.ambiguousMicros, 20_000)
 })
 
 test("restart reconciliation settles an exact late receipt after Stop and UTC month rollover", { skip: integrationSkip }, async (t) => {

@@ -417,10 +417,11 @@ export class RepositoryCampaignStore {
 	 * campaign-state lock. The lock is released as soon as `start` returns its
 	 * promise; an already-started request may finish and must still be settled.
 	 */
-	async withClaimRequestStart<T>(claim: ClaimedRepositoryJob, start: () => Promise<T>, beforeStart?: () => Promise<void>): Promise<T> {
+	async withClaimRequestStart<T>(claim: ClaimedRepositoryJob, start: () => Promise<T>,
+		beforeStart?: (start: () => Promise<T>, markStarted: (request: Promise<T>) => void) => Promise<void>): Promise<T> {
 		if (!claim || typeof start !== "function") throw new Error("campaign request claim is invalid")
 		const release = await this.lock()
-		let pending: Promise<T>
+		let pending: Promise<T> | undefined
 		try {
 			const state = await this.loadState(new Date())
 			const job = state.jobs.find((candidate) => candidate.id === claim.job.id)
@@ -431,8 +432,18 @@ export class RepositoryCampaignStore {
 			// callback that starts the HTTP request. Keep the repository lock while
 			// the Fleet v2 start transition is resolved, so Stop cannot slip between
 			// the local epoch check and the actual request invocation.
-			if (beforeStart) await beforeStart()
-			pending = start()
+			if (beforeStart) {
+				await beforeStart(start, (request) => {
+					if (pending) throw new Error("campaign request was started more than once")
+					pending = request
+					// The handoff may wait for its cross-process lock acknowledgement
+					// after fetch has already returned a rejected promise. Attach a
+					// rejection observer now; the original promise is still awaited
+					// below once the dispatch lock is released.
+					void request.catch(() => undefined)
+				})
+				if (!pending) throw new Error("campaign request-start did not invoke the request")
+			} else pending = start()
 		} finally {
 			await release()
 		}

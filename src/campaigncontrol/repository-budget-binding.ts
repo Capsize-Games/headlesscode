@@ -11,7 +11,8 @@ export const FLEET_REPOSITORY_CAMPAIGN_ID = "fleet-security-watch"
 export const FLEET_BRIDGE_CAMPAIGN_LIFETIME_CAP_MICROS = 20_000
 
 export type RepositoryBudgetLedger = OpenRouterInferenceLedger & {
-	requestStart(grant: OpenRouterBrokerGrant, reservation: OpenRouterCallReservation): Promise<void>
+	requestStart(grant: OpenRouterBrokerGrant, reservation: OpenRouterCallReservation, start: () => Promise<Response>,
+		markStarted: (request: Promise<Response>) => void): Promise<void>
 	reconcile(grant: OpenRouterBrokerGrant, callId?: string): Promise<FleetRepositoryReconciliation>
 	budgetSnapshot(): Promise<FleetRepositoryBudgetSnapshot>
 }
@@ -25,6 +26,7 @@ export function createRepositoryCampaignBudgetBinding(options: {
 	timeoutMs?: number
 	invoke?: (message: Record<string, unknown>) => Promise<Record<string, unknown>>
 	assertDispatchFence?: () => Promise<void>
+	requestStartHandoff?: (message: Record<string, unknown>, onAdmitted: (reply: Record<string, unknown>) => void | Promise<void>) => Promise<void>
 }): RepositoryCampaignBudgetBinding {
 	const fleet = new FleetRepositoryBudgetLedger({
 		expectedKeyIdentity: options.expectedKeyIdentity, scope: options.scope,
@@ -32,6 +34,7 @@ export function createRepositoryCampaignBudgetBinding(options: {
 		...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
 		...(options.invoke ? { invoke: options.invoke } : {}),
 		...(options.assertDispatchFence ? { assertDispatchFence: options.assertDispatchFence } : {}),
+		...(options.requestStartHandoff ? { requestStartHandoff: options.requestStartHandoff } : {}),
 	})
 	return new RepositoryCampaignBudgetBinding(options.store, options.claim, fleet)
 }
@@ -85,8 +88,8 @@ export class RepositoryCampaignBudgetBinding implements OpenRouterInferenceLedge
 
 	requestStartGate(start: () => Promise<Response>, context: { grant: OpenRouterBrokerGrant; reservation: OpenRouterCallReservation }): Promise<Response> {
 		this.validateGrant(context.grant)
-		return this.store.withClaimRequestStart(this.claim, start, async () => {
-			await this.fleet.requestStart(context.grant, context.reservation)
+		return this.store.withClaimRequestStart(this.claim, start, async (send, markStarted) => {
+			await this.fleet.requestStart(context.grant, context.reservation, send, markStarted)
 		})
 	}
 
