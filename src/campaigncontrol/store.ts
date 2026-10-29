@@ -153,8 +153,10 @@ export class CampaignControlStore {
 
 	async snapshot(now = new Date()): Promise<CampaignControlState> { return this.read(now) }
 
-	async status(now = new Date()): Promise<{ control: CampaignControlState; runs: CampaignRun[] }> {
-		return { control: await this.read(now), runs: await this.readRuns() }
+	async status(now = new Date()): Promise<{ control: Omit<CampaignControlState, "repositoryCampaigns">; runs: CampaignRun[] }> {
+		const control = await this.read(now)
+		delete control.repositoryCampaigns
+		return { control, runs: await this.readRuns() }
 	}
 
 	async setEnabled(enabled: boolean, now = new Date()): Promise<CampaignControlState> {

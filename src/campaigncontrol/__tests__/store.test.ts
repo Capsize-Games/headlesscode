@@ -149,14 +149,14 @@ async function testRepositoryControlMapIsExactPrivateScopeAndEpochFenced(): Prom
 			sourceRevision: definition.sourceRevision, policySha256: definition.policySha256 })
 		await store.setRepositoryCampaign(definition, true)
 		assert.equal((await store.snapshot()).repositoryCampaigns?.[definition.id]?.epoch, 3, "re-enable never reuses a stopped epoch")
+		const view = await store.status()
+		assert.equal(Object.hasOwn(view.control, "repositoryCampaigns"), false, "private repository scopes never enter the legacy public projection")
 		const raw = JSON.parse(await fs.readFile(store.path, "utf8"))
 		raw.repositoryCampaigns[definition.id].extra = "untrusted"
 		await fs.writeFile(store.path, JSON.stringify(raw), { mode: 0o600 })
 		await assert.rejects(store.snapshot(), /exact-schema validation/)
 		state = await new CampaignControlStore(store.path).snapshot().catch(() => state)
 		assert.ok(state.repositoryCampaigns?.[definition.id], "the scope is only in the private file, not lost from returned legacy DTOs")
-		const view = await store.status()
-		assert.equal(Object.hasOwn(view.control, "repositoryCampaigns"), false, "private repository scopes never enter the legacy public projection")
 	} finally { await fs.rm(root, { recursive: true, force: true }) }
 }
 
