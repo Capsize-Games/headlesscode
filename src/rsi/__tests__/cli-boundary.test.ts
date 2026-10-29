@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
 import * as fs from "node:fs"
 import * as path from "node:path"
+import { pathToFileURL } from "node:url"
 import test from "node:test"
 import { main } from "../../cli.js"
 import { createEvaluationSnapshotBundle } from "../openshell.js"
@@ -36,7 +37,7 @@ test("visible CLI dispatches RSI help and rejects invalid model-training mode th
 	assert.equal(protectedEntrypoint, rsiCliMain)
 })
 
-test("a real evaluation snapshot typechecks with all protected RSI implementations withheld", { timeout: 120_000 }, () => {
+test("a real evaluation snapshot typechecks with all protected implementations withheld", { timeout: 120_000 }, async () => {
 	const repoRoot = process.cwd()
 	const scratch = path.join(repoRoot, ".headlesscode", "scratch")
 	fs.mkdirSync(scratch, { recursive: true, mode: 0o700 })
@@ -63,6 +64,14 @@ test("a real evaluation snapshot typechecks with all protected RSI implementatio
 		fs.writeFileSync(bundlePath, snapshot.content, { mode: 0o600, flag: "wx" })
 		execFileSync("git", ["clone", "--quiet", bundlePath, clone], { cwd: root, stdio: "pipe" })
 		assert.equal(fs.existsSync(path.join(clone, "src", "rsi")), false, "the evaluation clone must not contain any RSI source or entrypoint")
+		const campaignControl = path.join(clone, "src", "campaigncontrol")
+		assert.deepEqual(fs.readdirSync(campaignControl).sort(), ["cli.ts", "repository-curl-evaluator.ts", "repository-known-advisory.ts"],
+			"the evaluation clone contains only the non-operational campaign shims")
+		assert.equal(fs.existsSync(path.join(campaignControl, "repository-campaigns.ts")), false,
+			"the evaluation clone must not contain the campaign control plane")
+		const shim = await import(pathToFileURL(path.join(campaignControl, "cli.ts")).href) as { campaignMain(args: string[]): Promise<number> }
+		assert.equal(await shim.campaignMain(["start", "curl-maintenance"]), 2,
+			"campaign actions remain unavailable in the evaluation clone")
 		assert.equal(fs.existsSync(path.join(clone, "src", "rsi-cli-contract.ts")), true, "the visible CLI contract remains available to candidate typechecking")
 		fs.symlinkSync(path.join(repoRoot, "node_modules"), path.join(clone, "node_modules"), "dir")
 		const environment = { ...process.env, TMPDIR: scratch }

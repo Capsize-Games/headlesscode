@@ -107,7 +107,18 @@ function pathIsSafe(relativePath: string): boolean {
 
 function alwaysOmit(relativePath: string): boolean {
 	const normalized = relativePath.replaceAll("\\", "/")
-	return normalized.startsWith("__headlesscode_rsi_adversarial__/") || findMatchingPattern(normalized, [...DEFAULT_PROTECTED_FILES, "shared/openshell/headlesscode-policy.yaml", ".headlesscode/", ".worktrees/", "node_modules/", "src/rsi/", "scripts/eval-suite/", "fixtures/rsi-benchmark/", "__rsi_benchmark_verifier__/"]) !== null
+	return normalized.startsWith("__headlesscode_rsi_adversarial__/") || findMatchingPattern(normalized, [...DEFAULT_PROTECTED_FILES, "shared/openshell/headlesscode-policy.yaml", ".headlesscode/", ".worktrees/", "node_modules/", "src/rsi/", "src/campaigncontrol/", "scripts/eval-suite/", "fixtures/rsi-benchmark/", "__rsi_benchmark_verifier__/"]) !== null
+}
+
+function writeCampaignControlSnapshotShim(snapshot: string): void {
+	const directory = path.join(snapshot, "src", "campaigncontrol")
+	fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
+	fs.writeFileSync(path.join(directory, "repository-curl-evaluator.ts"),
+		'export const CURL_FIXED_ADVISORY = "CVE-2026-92390"\n', { mode: 0o600, flag: "wx" })
+	fs.writeFileSync(path.join(directory, "repository-known-advisory.ts"),
+		'export const CURL_DEBIAN_SOURCE_URL = "https://security-tracker.debian.org/tracker/CVE-2026-92390"\n', { mode: 0o600, flag: "wx" })
+	fs.writeFileSync(path.join(directory, "cli.ts"),
+		'export async function campaignMain(_args: string[]): Promise<number> { return 2 }\n', { mode: 0o600, flag: "wx" })
 }
 
 function sha256Buffer(value: Buffer): string { return createHash("sha256").update(value).digest("hex") }
@@ -185,6 +196,7 @@ function initializeSnapshot(sourceRoot: string, commit: string, destination: str
 		fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
 		fs.writeFileSync(target, blobs.get(file.path)!, { mode: file.mode === "100755" ? 0o755 : 0o644, flag: "wx" })
 	}
+	writeCampaignControlSnapshotShim(destination)
 	if (mode === "evaluation" && includeHarnessDependencies) fs.symlinkSync(`${OPENSHELL_HARNESS_ROOT}/node_modules`, path.join(destination, IMAGE_DEPENDENCIES_LINK))
 	execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: destination })
 	execFileSync("git", ["config", "user.name", "HeadlessCode RSI Snapshot"], { cwd: destination })
