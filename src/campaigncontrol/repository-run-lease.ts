@@ -66,19 +66,7 @@ function findTsxLoader(): string | undefined {
 export function createRepositoryCampaignRunLease(controlPath = CAMPAIGN_CONTROL_FILE): RepositoryCampaignRunLease {
 	if (path.resolve(controlPath) !== path.resolve(CAMPAIGN_CONTROL_FILE)) throw new Error("repository campaign run lease must use the configured control file")
 	return {
-		async acquire(timeoutMs) {
-			if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 60_000 || timeoutMs > 30 * 60_000) throw new Error("repository campaign run lease duration is invalid")
-			const value = await runLocked(["_repository-run-begin", String(timeoutMs)], 10_000)
-			if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).join(",") !== "run") throw new Error("repository campaign run lease response is invalid")
-			const run = (value as { run: unknown }).run
-			if (run === null) return null
-			if (!run || typeof run !== "object" || Array.isArray(run)) throw new Error("repository campaign run lease response is invalid")
-			const candidate = run as ActiveCampaignRun
-			if (!/^[0-9a-f-]{36}$/.test(candidate.id) || !Number.isSafeInteger(candidate.epoch) ||
-				![candidate.startedAt, candidate.expiresAt].every(Number.isSafeInteger) || candidate.expiresAt <= Date.now() ||
-				candidate.expiresAt - candidate.startedAt !== timeoutMs) throw new Error("repository campaign run lease response is invalid")
-			return candidate
-		},
+		async acquire(timeoutMs) { return acquireRun(timeoutMs) },
 		async finish(run, status) {
 			const value = await runLocked(["_repository-run-finish", run.id, status], 5_000)
 			if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).join(",") !== "run") throw new Error("repository campaign run completion is invalid")
@@ -89,6 +77,40 @@ export function createRepositoryCampaignRunLease(controlPath = CAMPAIGN_CONTROL_
 		},
 	}
 }
+
+async function acquireRun(timeoutMs: number): Promise<ActiveCampaignRun | null> {
+	if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 60_000 || timeoutMs > 30 * 60_000) throw new Error("repository campaign run lease duration is invalid")
+	const value = await runLocked(["_repository-run-begin", String(timeoutMs)], 10_000)
+	return validatedRun(value, timeoutMs)
+}
+
+function validatedRun(value: unknown, timeoutMs: number): ActiveCampaignRun | null {
+	if (!isRunEnvelope(value)) throw new Error("repository campaign run lease response is invalid")
+	const run = (value as { run: unknown }).run
+	if (run === null) return null
+	if (!isRunObject(run)) throw new Error("repository campaign run lease response is invalid")
+	const candidate = run as ActiveCampaignRun
+	if (!validRunIdentity(candidate) || !validRunTimes(candidate, timeoutMs)) throw new Error("repository campaign run lease response is invalid")
+	return candidate
+}
+
+function isRunEnvelope(value: unknown): boolean {
+	return Boolean(value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).join(",") === "run")
+}
+function isRunObject(value: unknown): boolean { return Boolean(value && typeof value === "object" && !Array.isArray(value)) }
+
+function validRunIdentity(run: ActiveCampaignRun): boolean {
+	return /^[0-9a-f-]{36}$/.test(run.id) && Number.isSafeInteger(run.epoch)
+}
+
+function validRunTimes(run: ActiveCampaignRun, timeoutMs: number): boolean {
+	if (!validTimestamp(run.startedAt) || !validTimestamp(run.expiresAt)) return false
+	if (run.expiresAt <= Date.now()) return false
+	return validLeaseDuration(run, timeoutMs)
+}
+
+function validTimestamp(value: number): boolean { return Number.isSafeInteger(value) }
+function validLeaseDuration(run: ActiveCampaignRun, timeoutMs: number): boolean { return run.expiresAt - run.startedAt === timeoutMs }
 
 async function runLocked(args: string[], timeoutMs: number): Promise<unknown> {
 	const loader = findTsxLoader()

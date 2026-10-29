@@ -6,36 +6,16 @@ import type { RepositoryWorkerPipelineAdapters } from "./repository-worker-pipel
 import { createRepositoryWorkerPipeline } from "./repository-worker-pipeline.js"
 import { OsvCommitAdvisoryIntake } from "./repository-advisory-intake.js"
 import type { RepositoryCampaignStore } from "./repository-campaigns.js"
-import { createCurlRepositoryPipelineAdapters } from "./repository-curl-runtime.js"
+import { CURL_PRIVATE_RUNTIME_ADAPTER_ID, createCurlRepositoryPipelineAdapters } from "./repository-curl-runtime.js"
+import type { RepositoryPipelineAdapterFactory, RepositoryPipelineAdapterFactoryContext, RepositoryWorkerRegistration } from "./repository-worker-registration.js"
 
 const MAX_REGISTRY_BYTES = 64 * 1024
 const MAX_REGISTRATIONS = 32
 const PUBLIC_INTAKE_PINS: Readonly<Record<string, { publicBaseRevision: string; supportedAdvisoryIds: readonly string[] }>> = Object.freeze({
-	"curl-92390-fixed-v1": { publicBaseRevision: "ce57339379d82d29637b4752979e54128b6b2348", supportedAdvisoryIds: ["CVE-2026-92390"] },
+	[CURL_PRIVATE_RUNTIME_ADAPTER_ID]: { publicBaseRevision: "ce57339379d82d29637b4752979e54128b6b2348", supportedAdvisoryIds: ["CVE-2026-92390"] },
 })
 
-export interface RepositoryWorkerRegistration {
-	campaignId: string
-	repositoryId: string
-	repository: string
-	sourceRevision: string
-	policySha256: string
-	workerProfile: string
-	recipeDigest: string
-	evaluatorDigest: string
-	model: string
-	profileId: string
-	pipelineAdapterId: string
-	executionKind: "live-cve"
-	reservation: { micros: number; tokens: number }
-}
-
-export interface RepositoryPipelineAdapterFactoryContext {
-	store: RepositoryCampaignStore
-}
-
-export type RepositoryPipelineAdapterFactory = (registration: RepositoryWorkerRegistration, definition: RepositoryCampaignDefinition,
-	context?: RepositoryPipelineAdapterFactoryContext) => RepositoryWorkerPipelineAdapters
+export type { RepositoryPipelineAdapterFactory, RepositoryPipelineAdapterFactoryContext, RepositoryWorkerRegistration } from "./repository-worker-registration.js"
 
 /** Built-in production adapters are code-owned; a private registry only selects among them. */
 export const BUILTIN_REPOSITORY_PIPELINE_ADAPTER_FACTORIES: ReadonlyMap<string, RepositoryPipelineAdapterFactory> = new Map([

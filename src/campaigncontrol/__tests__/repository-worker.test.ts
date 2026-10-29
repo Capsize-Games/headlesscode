@@ -26,6 +26,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 		assert.match(command, /--session-id 'worker-job-123'/)
 		assert.match(command, /--security-profile local/)
 		assert.match(command, /--published-advisory-qualification/)
+		assert.match(command, /export HEADLESSCODE_DATA_DIR=\/tmp\/headlesscode-repository-qualification/)
 		assert.match(command, /--max-tokens 4000 --max-iterations 2 --max-cost-usd 0\.008/)
 		assert.match(command, /timeout --signal=TERM --kill-after=10s 840s \.\/node_modules\/\.bin\/tsx src\/cli\.ts/)
 		assert.equal(REPOSITORY_WORKER_BROKER_URL, "http://host.openshell.internal:4392")

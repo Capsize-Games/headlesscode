@@ -18,11 +18,10 @@ import { createRepositoryCampaignBudgetBinding } from "./repository-budget-bindi
 import { CURL_CANDIDATE_TREE_SHA, CURL_EVALUATOR_DIGEST, CURL_FIXED_ADVISORY,
 	CURL_PRIVATE_SOURCE_REVISION, CURL_PROFILE_ID,
 	CURL_WORKER_DIGEST, evaluatePinnedCurlCandidate, makeCurlProtectedEvaluationRequest } from "./repository-curl-evaluator.js"
-import type { RepositoryWorkerRegistration } from "./repository-worker-registry.js"
-import type { RepositoryPipelineAdapterFactoryContext } from "./repository-worker-registry.js"
+import type { RepositoryWorkerRegistration, RepositoryPipelineAdapterFactoryContext } from "./repository-worker-registration.js"
 import type { RepositoryWorkerPipelineAdapters, RepositoryPreparedWorkspace } from "./repository-worker-pipeline.js"
 import { runRepositoryWorkerThroughBroker, writeRepositoryWorkerTask, type VettedAdvisorySnapshot } from "./repository-worker.js"
-import { verifyPinnedGitWorktreeTree } from "./repository-source-tree.js"
+import { restorePinnedWorktreeEolBytes, verifyPinnedGitWorktreeTree } from "./repository-source-tree.js"
 import { CURL_DEBIAN_AFFECTED_RANGE, CURL_DEBIAN_FIXED_REVISION, CURL_DEBIAN_INTRODUCED_REVISION, CURL_DEBIAN_SNAPSHOT_SHA256,
 	CURL_DEBIAN_SOURCE_HTML_SHA256, CURL_DEBIAN_SOURCE_URL, loadKnownCurlDebianAdvisory } from "./repository-known-advisory.js"
 
@@ -37,7 +36,7 @@ const SOURCE_ROOT = path.join(os.homedir(), ".local", "share", "headlesscode", "
 const CONTAINED_RUNTIME_ROOT = path.join(os.homedir(), ".local", "state", "headlesscode", "repository-runtime")
 const EVIDENCE_STORAGE_DIR = path.join(CONTAINED_RUNTIME_ROOT, "evidence-store")
 const EVIDENCE_CONFIG_DIR = path.join(CONTAINED_RUNTIME_ROOT, "evidence-config")
-const EVIDENCE_SOCKET_PATH = `/run/user/${typeof process.getuid === "function" ? process.getuid() : "unknown"}/hc-cve-evidence.sock`
+const EVIDENCE_SOCKET_PATH = `/run/user/${typeof process.getuid === "function" ? process.getuid() : "unknown"}/hce/evidence.sock`
 const PROFILE_PATH = path.join(CONTAINED_RUNTIME_ROOT, "profile", "repository-worker.yaml")
 const CONTROL_STATE_DIR = path.join(CONTAINED_RUNTIME_ROOT, "control-state")
 const CONTROL_SOCKET_DIR = `/run/user/${typeof process.getuid === "function" ? process.getuid() : "unknown"}/hcctl/{session}`
@@ -226,6 +225,9 @@ export function createCurlRepositoryPipelineAdapters(
 			}
 			try {
 				worktree = await (dependencies.createWorktree ?? createPinnedWorktree)(sourceRoot)
+				if (!dependencies.createWorktree) {
+					await restorePinnedWorktreeEolBytes({ worktree, revision: CURL_PRIVATE_SOURCE_REVISION, expectedTreeSha: CURL_CANDIDATE_TREE_SHA })
+				}
 				const sessionId = containedEvidenceSessionId(path.basename(worktree))
 				evidenceService = await (dependencies.startEvidenceService ?? startContainedEvidenceService)({ storageDir: runtimeConfig.evidenceStorageDir,
 					socketPath: runtimeConfig.evidenceSocketPath, configDirectory: runtimeConfig.evidenceConfigDir, sessionIds: [sessionId], repoRoot: sourceRoot })

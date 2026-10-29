@@ -331,7 +331,7 @@ async function handleRequest(
 					let fleetBudget: FleetRepositoryBudgetSnapshot | undefined
 					try { fleetBudget = await options.readRepositoryBudgetSnapshot?.(id) } catch { /* status remains explicit as unavailable */ }
 					const runtimeReadiness = repositoryCoordinator?.readiness(definition)
-					json(res, 200, repositoryProgressSnapshot(definition, campaign, jobs, observedAt, fleetBudget, runtimeReadiness)); return
+					json(res, 200, repositoryProgressSnapshot(definition, campaign, jobs, observedAt, { fleetBudget, runtimeReadiness })); return
 				}
 				if (repositoryCampaignRoute[1]) {
 					if (url.search) { json(res, 400, { error: "detail query parameters are not supported" }); return }

@@ -53,7 +53,7 @@ async function testRuntimeConfigHasOneFixedOwnerSchema(): Promise<void> {
 		profileSha256: "bf8c90c394400e1df6cfbe4063666c918aabf613ab8246006f7757b1355ee358",
 		evidenceStorageDir: "/home/joe/.local/state/headlesscode/repository-runtime/evidence-store",
 		evidenceConfigDir: "/home/joe/.local/state/headlesscode/repository-runtime/evidence-config",
-		evidenceSocketPath: "/run/user/1000/hc-cve-evidence.sock",
+		evidenceSocketPath: "/run/user/1000/hce/evidence.sock",
 		controlStateDir: "/home/joe/.local/state/headlesscode/repository-runtime/control-state",
 		controlSocketDir: "/run/user/1000/hcctl/{session}", brokerBindHost: "127.0.0.1",
 		openshellXdgConfigHome: "/home/joe/Projects/headlesscode/.worktrees/ux/.headlesscode/scratch/rsi-muse/xdg-user",
@@ -139,7 +139,7 @@ async function testContainedCollectorStartsBeforeProfileAndClosesWithWorkspace()
 		repositoryLifetime: { limitMicros: 20_000, limitTokens: 108_000 } } as any
 	const key = "A".repeat(43)
 	const keyIdentity = createHash("sha256").update(key).digest("hex")
-	const profile = { evidenceSocketPath: "/run/user/1000/hc-cve-evidence.sock",
+	const profile = { evidenceSocketPath: "/run/user/1000/hce/evidence.sock",
 		evidencePublicKeyFingerprint: "sha256:collector-test" } as any
 	const worktree = path.join(root, sessionId)
 	await fs.mkdir(worktree)
@@ -147,7 +147,7 @@ async function testContainedCollectorStartsBeforeProfileAndClosesWithWorkspace()
 		profileSha256: "bf8c90c394400e1df6cfbe4063666c918aabf613ab8246006f7757b1355ee358",
 		evidenceStorageDir: "/home/joe/.local/state/headlesscode/repository-runtime/evidence-store",
 		evidenceConfigDir: "/home/joe/.local/state/headlesscode/repository-runtime/evidence-config",
-		evidenceSocketPath: "/run/user/1000/hc-cve-evidence.sock",
+		evidenceSocketPath: "/run/user/1000/hce/evidence.sock",
 		controlStateDir: "/home/joe/.local/state/headlesscode/repository-runtime/control-state",
 		controlSocketDir: "/run/user/1000/hcctl/{session}", brokerBindHost: "127.0.0.1",
 		openshellXdgConfigHome: "/home/joe/Projects/headlesscode/.worktrees/ux/.headlesscode/scratch/rsi-muse/xdg-user",

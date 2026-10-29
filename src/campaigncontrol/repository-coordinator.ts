@@ -119,51 +119,82 @@ export class RepositoryCampaignCoordinator {
 
 	async tick(): Promise<void> {
 		if (this.stopped || this.active.size >= MAX_CONCURRENT_WORKERS) return
-		let status: { campaigns: RepositoryCampaignDefinition[]; jobs: RepositoryCampaignJob[] }
-		try { status = await this.store.status() as { campaigns: RepositoryCampaignDefinition[]; jobs: RepositoryCampaignJob[] }; this.lastFailure = null }
-		catch { this.lastFailure = { at: Date.now(), kind: "store-unavailable" }; throw new Error("repository coordinator store is unavailable") }
+		const status = await this.readStatus()
 		for (const definition of status.campaigns) {
 			if (this.active.size >= MAX_CONCURRENT_WORKERS || this.stopped) break
-			const runtime = this.readiness(definition)
-			if (runtime.state !== "ready") continue
-			const worker = this.workers.find((entry) => identityMatches(definition, entry))
-			if (!worker) continue
-			const campaign = status.campaigns.find((item) => item.id === definition.id) as (RepositoryCampaignDefinition & { enabled?: boolean; readiness?: string }) | undefined
-			if (!campaign?.enabled || campaign.readiness !== "ready") continue
-			if (worker.executionKind === "live-cve" && worker.advisoryIntake) {
-				const lastPoll = this.intakePollAt.get(definition.id) ?? 0
-				if (Date.now() - lastPoll >= INTAKE_POLL_MS) {
-					this.intakePollAt.set(definition.id, Date.now())
-					try {
-						const records = await worker.advisoryIntake.poll()
-						for (const record of records) await this.store.observePublishedAdvisory({ campaignId: definition.id,
-							publicBaseRevision: worker.advisoryIntake.publicBaseRevision, advisoryId: record.advisoryId,
-							snapshotSha256: record.snapshotSha256, eligible: worker.advisoryIntake.supportedAdvisoryIds.includes(record.advisoryId) })
-						this.intakeErrors.delete(definition.id)
-						this.intakeOutcomes.set(definition.id, records.length ? "observed" : "empty")
-						status = await this.store.status() as typeof status
-					} catch { this.intakeErrors.set(definition.id, Date.now()); this.intakeOutcomes.set(definition.id, "unavailable") }
-				}
-			}
-			const queued = status.jobs.some((job) => job.campaignId === definition.id && job.status === "queued")
-			if (!queued) continue
-			if (worker.executionKind === "live-cve" && !this.globalRun) {
-				try { this.globalRun = await this.runLease!.acquire(GLOBAL_RUN_LEASE_MS) }
-				catch { continue }
-				if (!this.globalRun) continue
-			}
-			const claim = await this.store.claimNext(definition.id, worker.reservation, new Date(), { executionKind: worker.executionKind })
-			if (!claim) continue
-			const controller = new AbortController()
-			this.active.set(claim.job.id, controller)
-			const pending = this.process(worker, definition, claim, controller.signal).finally(() => {
-				this.active.delete(claim.job.id)
-				this.jobs.delete(pending)
-				this.wake?.()
-			})
-			this.jobs.add(pending)
+			if (!this.intakeCampaignEnabled(definition, status.campaigns)) continue
+			await this.pollIntake(definition)
+			const refreshed = await this.readStatus()
+			await this.startQueuedJob(definition, refreshed)
 		}
 		if (this.active.size === 0 && this.globalRun) await this.finishGlobalRun("succeeded")
+	}
+
+	private intakeCampaignEnabled(definition: RepositoryCampaignDefinition, campaigns: RepositoryCampaignDefinition[]): boolean {
+		const campaign = campaigns.find((entry) => entry.id === definition.id) as (RepositoryCampaignDefinition & { enabled?: boolean; readiness?: string }) | undefined
+		return campaign?.enabled === true && campaign.readiness === "ready" && this.readiness(definition).state === "ready"
+	}
+
+	private async readStatus(): Promise<{ campaigns: RepositoryCampaignDefinition[]; jobs: RepositoryCampaignJob[] }> {
+		try {
+			const status = await this.store.status() as { campaigns: RepositoryCampaignDefinition[]; jobs: RepositoryCampaignJob[] }
+			this.lastFailure = null
+			return status
+		} catch {
+			this.lastFailure = { at: Date.now(), kind: "store-unavailable" }
+			throw new Error("repository coordinator store is unavailable")
+		}
+	}
+
+	private async pollIntake(definition: RepositoryCampaignDefinition): Promise<void> {
+		const worker = this.workers.find((entry) => identityMatches(definition, entry))
+		const intake = worker?.advisoryIntake
+		if (!intake || worker.executionKind !== "live-cve" || Date.now() - (this.intakePollAt.get(definition.id) ?? 0) < INTAKE_POLL_MS) return
+		this.intakePollAt.set(definition.id, Date.now())
+		try {
+			const records = await intake.poll()
+			for (const record of records) await this.store.observePublishedAdvisory({ campaignId: definition.id,
+				publicBaseRevision: intake.publicBaseRevision, advisoryId: record.advisoryId,
+				snapshotSha256: record.snapshotSha256, eligible: intake.supportedAdvisoryIds.includes(record.advisoryId) })
+			this.intakeErrors.delete(definition.id)
+			this.intakeOutcomes.set(definition.id, records.length ? "observed" : "empty")
+		} catch {
+			this.intakeErrors.set(definition.id, Date.now())
+			this.intakeOutcomes.set(definition.id, "unavailable")
+		}
+	}
+
+	private async startQueuedJob(definition: RepositoryCampaignDefinition, status: { campaigns: RepositoryCampaignDefinition[]; jobs: RepositoryCampaignJob[] }): Promise<void> {
+		const worker = this.eligibleWorker(definition, status)
+		if (!worker || !await this.ensureRun(worker)) return
+		const claim = await this.store.claimNext(definition.id, worker.reservation, new Date(), { executionKind: worker.executionKind })
+		if (claim) this.launch(worker, definition, claim)
+	}
+
+	private eligibleWorker(definition: RepositoryCampaignDefinition, status: { campaigns: RepositoryCampaignDefinition[]; jobs: RepositoryCampaignJob[] }): RegisteredRepositoryWorker | undefined {
+		if (this.readiness(definition).state !== "ready") return undefined
+		const worker = this.workers.find((entry) => identityMatches(definition, entry))
+		const campaign = status.campaigns.find((item) => item.id === definition.id) as (RepositoryCampaignDefinition & { enabled?: boolean; readiness?: string }) | undefined
+		const queued = status.jobs.some((job) => job.campaignId === definition.id && job.status === "queued")
+		return worker && campaign?.enabled && campaign.readiness === "ready" && queued ? worker : undefined
+	}
+
+	private async ensureRun(worker: RegisteredRepositoryWorker): Promise<boolean> {
+		if (worker.executionKind !== "live-cve" || this.globalRun) return true
+		try { this.globalRun = await this.runLease!.acquire(GLOBAL_RUN_LEASE_MS) }
+		catch { return false }
+		return this.globalRun !== null
+	}
+
+	private launch(worker: RegisteredRepositoryWorker, definition: RepositoryCampaignDefinition, claim: ClaimedRepositoryJob): void {
+		const controller = new AbortController()
+		this.active.set(claim.job.id, controller)
+		const pending = this.process(worker, definition, claim, controller.signal).finally(() => {
+			this.active.delete(claim.job.id)
+			this.jobs.delete(pending)
+			this.wake?.()
+		})
+		this.jobs.add(pending)
 	}
 
 	private async finishGlobalRun(status: "succeeded" | "failed"): Promise<void> {
@@ -191,33 +222,65 @@ export class RepositoryCampaignCoordinator {
 			heartbeat = setInterval(() => { void this.store.heartbeat(claim).catch(() => undefined) }, HEARTBEAT_MS)
 			const result = await worker.execute({ definition, claim, signal, progress: (patch) => this.store.updateClaimProgress(claim, patch) })
 			this.validateResult(result)
-			const stage = result.status === "succeeded" ? "deliver" : (result.completedSteps.at(-1) ?? "intake")
-			await this.store.updateClaimProgress(claim, { stage, currentTask: result.currentTask,
-				completedSteps: result.completedSteps, blocker: result.blocker, nextStep: result.nextStep, evidenceRefs: result.evidenceRefs, boardRef: result.boardRef })
-			if (result.accounting === "ambiguous" || result.status === "ambiguous" || result.actualMicros === null || result.actualTokens === null) {
-				await this.store.finish(claim, { status: "ambiguous", progress: { currentTask: result.currentTask, blocker: result.blocker, nextStep: result.nextStep, boardRef: result.boardRef } })
-			} else {
-				await this.store.finish(claim, { status: result.status, actualMicros: result.actualMicros, actualTokens: result.actualTokens,
-					progress: { currentTask: result.currentTask, blocker: result.blocker, nextStep: result.nextStep, boardRef: result.boardRef } })
-			}
+			await this.saveResult(claim, result)
 		} catch {
-			this.lastFailure = { at: Date.now(), kind: "worker-failure" }
-			await this.store.finish(claim, { status: "ambiguous" }).catch(() => undefined)
+			await this.failAmbiguous(claim)
 		} finally { if (heartbeat) clearInterval(heartbeat) }
 	}
 
-	private validateResult(result: RepositoryWorkerExecutionResult): void {
-		if (!result || !["succeeded", "failed", "ambiguous"].includes(result.status) || !["measured", "ambiguous"].includes(result.accounting) ||
-			(result.actualMicros !== null && (!Number.isSafeInteger(result.actualMicros) || result.actualMicros < 0)) ||
-			(result.actualTokens !== null && (!Number.isSafeInteger(result.actualTokens) || result.actualTokens < 0)) ||
-			!Array.isArray(result.completedSteps) || result.completedSteps.some((step, index) => !REPOSITORY_CAMPAIGN_STEPS.includes(step) || (index > 0 && REPOSITORY_CAMPAIGN_STEPS.indexOf(step) <= REPOSITORY_CAMPAIGN_STEPS.indexOf(result.completedSteps[index - 1]!))) ||
-			!Array.isArray(result.evidenceRefs) || result.evidenceRefs.length > 20 || typeof result.currentTask !== "string" || !result.currentTask.trim() || result.currentTask.length > 240 ||
-			(result.blocker !== null && (typeof result.blocker !== "string" || result.blocker.length > 240)) ||
-			(result.nextStep !== null && (typeof result.nextStep !== "string" || result.nextStep.length > 240)) ||
-			(result.boardRef !== undefined && result.boardRef !== null && (typeof result.boardRef !== "string" || result.boardRef.length > 256 ||
-				!/^http:\/\/127\.0\.0\.1:8078\/api\/cards\/1c25cecf-e5e8-4b68-b6fd-5d6ad25426d7#hc-repository-result-v1:[a-f0-9]{64}$/.test(result.boardRef)))) throw new Error(ERROR_TEXT)
-		if (result.status === "succeeded" && (result.accounting !== "measured" || result.actualMicros === null || result.actualTokens === null ||
-			result.completedSteps.length !== REPOSITORY_CAMPAIGN_STEPS.length || result.completedSteps.some((step, index) => step !== REPOSITORY_CAMPAIGN_STEPS[index]) ||
-			!["intake", "candidate", "test-receipt", "delivery"].every((kind) => result.evidenceRefs.some((ref) => ref.kind === kind)))) throw new Error(ERROR_TEXT)
+	private async saveResult(claim: ClaimedRepositoryJob, result: RepositoryWorkerExecutionResult): Promise<void> {
+		const stage = result.status === "succeeded" ? "deliver" : (result.completedSteps.at(-1) ?? "intake")
+		const progress = { currentTask: result.currentTask, blocker: result.blocker, nextStep: result.nextStep, boardRef: result.boardRef }
+		await this.store.updateClaimProgress(claim, { stage, ...progress,
+			completedSteps: result.completedSteps, evidenceRefs: result.evidenceRefs })
+		if (result.accounting === "ambiguous" || result.status === "ambiguous" || result.actualMicros === null || result.actualTokens === null) {
+			await this.store.finish(claim, { status: "ambiguous", progress })
+			return
+		}
+		await this.store.finish(claim, { status: result.status, actualMicros: result.actualMicros, actualTokens: result.actualTokens, progress })
 	}
+
+	private async failAmbiguous(claim: ClaimedRepositoryJob): Promise<void> {
+		this.lastFailure = { at: Date.now(), kind: "worker-failure" }
+		await this.store.finish(claim, { status: "ambiguous" }).catch(() => undefined)
+	}
+
+	private validateResult(result: RepositoryWorkerExecutionResult): void {
+		if (!isValidWorkerResult(result) || (result.status === "succeeded" && !isCompleteWorkerResult(result))) throw new Error(ERROR_TEXT)
+	}
+}
+
+function isValidWorkerResult(result: RepositoryWorkerExecutionResult): boolean {
+	return Boolean(result && validResultStatus(result) && validResultAmounts(result) && validSteps(result.completedSteps) &&
+		validResultDetails(result) && validBoardRef(result.boardRef))
+}
+
+function validResultStatus(result: RepositoryWorkerExecutionResult): boolean {
+	return ["succeeded", "failed", "ambiguous"].includes(result.status) && ["measured", "ambiguous"].includes(result.accounting)
+}
+function validResultAmounts(result: RepositoryWorkerExecutionResult): boolean {
+	return validAmount(result.actualMicros) && validAmount(result.actualTokens)
+}
+function validResultDetails(result: RepositoryWorkerExecutionResult): boolean {
+	return Array.isArray(result.evidenceRefs) && result.evidenceRefs.length <= 20 && validMessage(result.currentTask, false) &&
+		validMessage(result.blocker, true) && validMessage(result.nextStep, true)
+}
+
+function validAmount(value: number | null): boolean { return value === null || (Number.isSafeInteger(value) && value >= 0) }
+function validMessage(value: string | null, nullable: boolean): boolean {
+	return (nullable && value === null) || (typeof value === "string" && value.length <= 240 && (nullable || value.trim().length > 0))
+}
+function validBoardRef(value: string | null | undefined): boolean {
+	return value === undefined || value === null || (typeof value === "string" && value.length <= 256 &&
+		/^http:\/\/127\.0\.0\.1:8078\/api\/cards\/1c25cecf-e5e8-4b68-b6fd-5d6ad25426d7#hc-repository-result-v1:[a-f0-9]{64}$/.test(value))
+}
+function validSteps(steps: RepositoryCampaignStep[]): boolean {
+	return Array.isArray(steps) && steps.every((step, index) => REPOSITORY_CAMPAIGN_STEPS.includes(step) &&
+		(index === 0 || REPOSITORY_CAMPAIGN_STEPS.indexOf(step) > REPOSITORY_CAMPAIGN_STEPS.indexOf(steps[index - 1]!)))
+}
+function isCompleteWorkerResult(result: RepositoryWorkerExecutionResult): boolean {
+	return result.accounting === "measured" && result.actualMicros !== null && result.actualTokens !== null &&
+		result.completedSteps.length === REPOSITORY_CAMPAIGN_STEPS.length &&
+		result.completedSteps.every((step, index) => step === REPOSITORY_CAMPAIGN_STEPS[index]) &&
+		["intake", "candidate", "test-receipt", "delivery"].every((kind) => result.evidenceRefs.some((ref) => ref.kind === kind))
 }

@@ -4,7 +4,7 @@ import { createServer } from "node:http"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { OpenShellSessionProvider, runOpenShellCommandAsync, validateOpenShellHostRuntimeEnv, validateReadOnlyMountTargets } from "../openshell-provider.js"
+import { assertWorkerLaunchPurpose, OpenShellSessionProvider, runOpenShellCommandAsync, validateOpenShellHostRuntimeEnv, validateReadOnlyMountTargets } from "../openshell-provider.js"
 import type { CloudSessionRequest } from "../provider.js"
 import { EmergencyControl } from "../../control/emergency-controller.js"
 
@@ -35,6 +35,12 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 	let resolve!: () => void
 	const promise = new Promise<void>((done) => { resolve = done })
 	return { promise, resolve }
+}
+
+async function testRepositoryWorkerProfileIsAcceptedButEvaluationProfileIsRejected(): Promise<void> {
+	assert.doesNotThrow(() => assertWorkerLaunchPurpose("worker"))
+	assert.doesNotThrow(() => assertWorkerLaunchPurpose("repository-worker"))
+	assert.throws(() => assertWorkerLaunchPurpose("evaluation"), /cannot run an evaluation profile/)
 }
 
 async function testIsolatedCloneExportAndImport(): Promise<void> {
@@ -822,6 +828,8 @@ async function testFencedTeardownDoesNotImportSandboxResults(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+	await testRepositoryWorkerProfileIsAcceptedButEvaluationProfileIsRejected()
+	console.log("  ok   OpenShell worker launch accepts the repository broker profile and rejects evaluation profiles")
 	await testIsolatedCloneExportAndImport()
 	console.log("  ok   OpenShell exports isolated clone results without mounting the host worktree")
 	await testSandboxNameIsStableAndDistinct()

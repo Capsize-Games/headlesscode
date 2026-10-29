@@ -18,6 +18,7 @@ export function repositoryWorkerCommand(sessionId: string): string {
 	const quote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`
 	return [
 	"set -eu",
+	"export HEADLESSCODE_DATA_DIR=/tmp/headlesscode-repository-qualification",
 	`repository_capability="$(cat ${REPOSITORY_BROKER_CAPABILITY_PATH})"`,
 	"export HEADLESSCODE_OPENROUTER_API_KEY=\"$repository_capability\"",
 	"export HEADLESSCODE_RSI_INFERENCE_CAPABILITY=\"$repository_capability\"",

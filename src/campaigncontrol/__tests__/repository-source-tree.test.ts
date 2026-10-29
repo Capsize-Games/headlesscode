@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 import { test } from "node:test"
-import { verifyPinnedGitWorktreeTree } from "../repository-source-tree.js"
+import { restorePinnedWorktreeEolBytes, verifyPinnedGitWorktreeTree } from "../repository-source-tree.js"
 
 async function fixture(): Promise<{ root: string; revision: string; treeSha: string; cleanup(): Promise<void> }> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-pinned-source-tree-"))
@@ -47,4 +47,31 @@ test("pinned source verifier rejects untracked files, symlinks and mismatched tr
 	await assert.rejects(verifyPinnedGitWorktreeTree({ worktree: f.root, revision: f.revision, expectedTreeSha: f.treeSha }), /symbolic link/)
 	await fs.rm(path.join(f.root, "src", "link.ts"))
 	await assert.rejects(verifyPinnedGitWorktreeTree({ worktree: f.root, revision: f.revision, expectedTreeSha: "0".repeat(40) }), /does not match/)
+})
+
+test("fresh worktree restores only verified CRLF checkout bytes and verifier rejects later mutation", async (t) => {
+	const f = await fixture(); t.after(f.cleanup)
+	await fs.writeFile(path.join(f.root, ".gitattributes"), "windows.txt text eol=crlf\n")
+	await fs.writeFile(path.join(f.root, "windows.txt"), "first\nsecond\n")
+	const git = (args: string[]) => {
+		const result = spawnSync("git", ["-C", f.root, ...args], { encoding: "utf8", timeout: 10_000 })
+		if (result.error || result.status !== 0) throw new Error("temporary Git fixture update failed")
+		return result.stdout.trim()
+	}
+	git(["add", ".gitattributes", "windows.txt"])
+	git(["commit", "--quiet", "-m", "add CRLF fixture"])
+	const revision = git(["rev-parse", "HEAD"])
+	const treeSha = git(["rev-parse", "HEAD^{tree}"])
+	const worktreeParent = path.join(f.root, ".worktrees")
+	await fs.mkdir(worktreeParent, { mode: 0o700 })
+	const worktree = path.join(worktreeParent, "curl-campaign-test")
+	git(["worktree", "add", "--quiet", "--detach", worktree, revision])
+	t.after(() => fs.rm(worktreeParent, { recursive: true, force: true }))
+	const checkedOut = await fs.readFile(path.join(worktree, "windows.txt"))
+	assert.deepEqual(checkedOut, Buffer.from("first\r\nsecond\r\n"))
+	assert.equal(await restorePinnedWorktreeEolBytes({ worktree, revision, expectedTreeSha: treeSha }), 1)
+	assert.deepEqual(await fs.readFile(path.join(worktree, "windows.txt")), Buffer.from("first\nsecond\n"))
+	assert.equal((await verifyPinnedGitWorktreeTree({ worktree, revision, expectedTreeSha: treeSha })).fileCount, 3)
+	await fs.writeFile(path.join(worktree, "windows.txt"), "worker mutation\n")
+	await assert.rejects(verifyPinnedGitWorktreeTree({ worktree, revision, expectedTreeSha: treeSha }), /bytes differ/)
 })

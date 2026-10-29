@@ -24,6 +24,10 @@ export const OPENSHELL_HARNESS_ROOT = "/opt/headlesscode"
 
 export const OPENSHELL_WORKSPACE_TARGET = "/workspace"
 
+export function assertWorkerLaunchPurpose(purpose: ContainedRuntimeProfile["purpose"]): void {
+	if (purpose !== "worker" && purpose !== "repository-worker") throw new Error("worker launcher cannot run an evaluation profile")
+}
+
 const HOST_RUNTIME_ENV_KEYS = new Set([
 	"XDG_CONFIG_HOME", "XDG_STATE_HOME", "HEADLESSCODE_CONTAINED_PROFILE", "HEADLESSCODE_CONTAINED_PROFILE_SHA256",
 	"HEADLESSCODE_CONTAINED_EVIDENCE_CONFIG_DIR", "HEADLESSCODE_RSI_BROKER_BIND_HOST",
@@ -715,7 +719,7 @@ export class OpenShellSessionProvider implements CloudProvider {
 		filesystemPolicy.read_write.push("/result")
 		if (this.containedProfile) {
 			const profile = this.containedProfile
-			if (profile.purpose !== "worker") throw new Error("worker launcher cannot run an evaluation profile")
+			assertWorkerLaunchPurpose(profile.purpose)
 			if (!this.evidenceRuntimeConfig || this.evidenceRuntimeConfig.pinnedPublicKey.keyId !== profile.evidencePublicKeyFingerprint) throw new Error("evidence session key does not match the pinned contained profile")
 			if (this.evidenceRuntimeConfig.pinnedPublicKey.publicKeyPem.trim() !== fs.readFileSync(profile.evidencePublicKeyPath, "utf8").trim()) throw new Error("evidence runtime public key differs from the pinned collector key file")
 			if (!this.evidenceRuntimeConfig.sessionId || !this.evidenceRuntimeConfig.capability) throw new Error("evidence runtime configuration is missing its scoped session capability")

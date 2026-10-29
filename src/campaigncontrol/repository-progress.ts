@@ -122,80 +122,118 @@ function usage(job: RepositoryCampaignJob): RepositoryProgressSnapshot["workers"
 		ambiguousMicros: null, settledTokens: null, reservedTokens: null, ambiguousTokens: null }
 }
 
+function budgetIsFresh(definition: RepositoryCampaignDefinition, budget: FleetRepositoryBudgetSnapshot | undefined, observedAt: number): boolean {
+	if (!budget || !snapshotModeValid(budget) || !snapshotTimeValid(budget.asOfMs, observedAt) || !snapshotRunValid(budget, observedAt)) return false
+	return snapshotIdentityValid(definition, budget)
+}
+
+function snapshotModeValid(budget: FleetRepositoryBudgetSnapshot): boolean {
+	return budget.mode === "fleet-v2" ? budget.available && !budget.snapshotOnly : budget.snapshotOnly === true
+}
+function snapshotTimeValid(asOfMs: number, observedAt: number): boolean {
+	return Number.isSafeInteger(asOfMs) && observedAt - asOfMs <= REPOSITORY_PROGRESS_FRESH_MS && asOfMs <= observedAt + REPOSITORY_PROGRESS_FRESH_MS
+}
+function snapshotRunValid(budget: FleetRepositoryBudgetSnapshot, observedAt: number): boolean {
+	return budget.mode === "fleet-v2-readonly" ? budget.runId === null && budget.runExpiresAtMs === null :
+		budget.runExpiresAtMs !== null && budget.runExpiresAtMs > observedAt
+}
+function snapshotIdentityValid(definition: RepositoryCampaignDefinition, budget: FleetRepositoryBudgetSnapshot): boolean {
+	return budget.repositoryCampaignId === definition.id && budget.repositoryId === definition.repositoryId && budget.repository === definition.repository &&
+		budget.sourceRevision === definition.sourceRevision && budget.policySha256 === definition.policySha256 && budget.model === definition.model &&
+		budget.profileId === definition.workerProfile && /^[a-f0-9]{64}$/.test(budget.policySha256)
+}
+
+function freshnessFor(jobs: RepositoryCampaignJob[], observedAt: number): RepositoryProgressSnapshot["freshness"] {
+	const active = jobs.filter((job) => job.status === "running" && job.progress)
+	const unknownActive = jobs.some((job) => job.status === "running" && !job.progress)
+	const lastHeartbeatAt = active.length ? Math.max(...active.map((job) => job.progress!.heartbeatAt)) : null
+	const leaseExpiresAt = active.length ? Math.min(...active.map((job) => job.progress!.leaseExpiresAt)) : null
+	const stale = active.some((job) => observedAt - job.progress!.heartbeatAt > REPOSITORY_PROGRESS_FRESH_MS || observedAt > job.progress!.leaseExpiresAt)
+	return { state: unknownActive ? "unavailable" : stale ? "stale" : "fresh", lastHeartbeatAt, leaseExpiresAt }
+}
+
+function countsFor(jobs: RepositoryCampaignJob[], freshness: ProgressFreshness): RepositoryProgressSnapshot["counts"] {
+	const fresh = freshness === "fresh"
+	return {
+		source: fresh ? "repository-campaign-store" : "unavailable",
+		queued: fresh ? jobs.filter((job) => job.status === "queued").length : null,
+		running: fresh ? jobs.filter((job) => job.status === "running" && job.progress).length : null,
+		blocked: fresh ? jobs.filter((job) => job.progress?.blocker !== null && job.progress?.blocker !== undefined).length : null,
+		completed: fresh ? jobs.filter((job) => job.status === "succeeded").length : null,
+		failed: fresh ? jobs.filter((job) => job.status === "failed").length : null,
+		ambiguous: fresh ? jobs.filter((job) => job.status === "ambiguous").length : null,
+	}
+}
+
+function workersFor(jobs: RepositoryCampaignJob[]): RepositoryProgressSnapshot["workers"] {
+	return jobs.flatMap((job) => job.progress ? [{ workerId: job.progress.workerId, jobId: job.id, advisoryId: job.advisoryId,
+		executionKind: job.progress.executionKind, status: job.status, stage: job.progress.stage, goal: job.progress.goal,
+		currentTask: job.progress.currentTask, completedSteps: [...job.progress.completedSteps], requiredSteps: [...job.progress.requiredSteps],
+		lastActionAt: job.progress.lastActionAt, heartbeatAt: job.progress.heartbeatAt, leaseExpiresAt: job.progress.leaseExpiresAt,
+		blocker: job.progress.blocker, nextStep: job.progress.nextStep, evidenceRefs: structuredClone(job.progress.evidenceRefs),
+		boardRef: job.progress.boardRef ?? null, usage: usage(job) }] : [])
+}
+
+function executionKind(liveJobs: RepositoryCampaignJob[], developmentJobs: RepositoryCampaignJob[]): RepositoryProgressSnapshot["executionKind"] {
+	if (liveJobs.length && developmentJobs.length) return "unavailable"
+	if (liveJobs.length) return "live-cve"
+	return developmentJobs.length ? "development-checkpoint" : "unavailable"
+}
+
+function resolveReadiness(campaign: Record<string, unknown>, override?: RepositoryRuntimeReadiness): {
+	state: RepositoryProgressSnapshot["readiness"]["state"]; reasons: string[]
+} {
+	const reasons = Array.isArray(campaign.readinessReasons) ? campaign.readinessReasons.filter((x): x is string => typeof x === "string") : []
+	if (override && override.state !== "ready") reasons.push(...override.reasons)
+	return { state: override && override.state !== "ready" ? override.state : readinessState(campaign), reasons }
+}
+
+function budgetView(definition: RepositoryCampaignDefinition, budget: FleetRepositoryBudgetSnapshot | undefined, observedAt: number): RepositoryProgressSnapshot["budget"] {
+	if (budget && budgetIsFresh(definition, budget, observedAt)) return {
+		source: "fleet-v2-ledger", updatedAt: budget.asOfMs, state: "measured",
+		global: { limitMicros: budget.limitMicros, limitTokens: budget.limitTokens, committedMicros: budget.committedMicros, committedTokens: budget.committedTokens },
+		monthly: { ...budget.monthly }, campaignLifetime: { ...budget.campaignLifetime }, legacyLifetime: { ...budget.legacyLifetime },
+		repositoryLifetime: { ...budget.repositoryLifetime },
+		control: { campaignId: budget.campaignId, enabled: budget.globalEnabled, canAdmit: budget.canAdmit,
+			epoch: budget.controlEpoch, runId: budget.runId, runExpiresAtMs: budget.runExpiresAtMs },
+		repository: { id: budget.repositoryId, slug: budget.repository, sourceRevision: budget.sourceRevision,
+			policySha256: budget.policySha256, model: budget.model, profileId: budget.profileId,
+			enabled: budget.repositoryEnabled, epoch: budget.repositoryEpoch },
+	}
+	const nullCampaign = { limitMicros: null, limitTokens: null, settledMicros: null, reservedMicros: null, ambiguousMicros: null, settledTokens: null, reservedTokens: null, ambiguousTokens: null }
+	const nullLifetime = { settledMicros: null, reservedMicros: null, ambiguousMicros: null, settledTokens: null, reservedTokens: null, ambiguousTokens: null }
+	return {
+		source: "unavailable", updatedAt: null, state: "unavailable",
+		global: { limitMicros: null, limitTokens: null, committedMicros: null, committedTokens: null },
+		monthly: { month: null, limitMicros: null, settledMicros: null, reservedMicros: null, ambiguousMicros: null },
+		campaignLifetime: { ...nullCampaign }, legacyLifetime: { ...nullLifetime }, repositoryLifetime: { ...nullCampaign },
+		control: { campaignId: null, enabled: null, canAdmit: null, epoch: null, runId: null, runExpiresAtMs: null },
+		repository: { id: null, slug: null, sourceRevision: null, policySha256: null, model: null, profileId: null, enabled: null, epoch: null },
+	}
+}
+
 export function repositoryProgressSnapshot(
 	definition: RepositoryCampaignDefinition,
 	campaign: Record<string, unknown>,
 	jobs: RepositoryCampaignJob[],
 	observedAt = Date.now(),
-	fleetBudget?: FleetRepositoryBudgetSnapshot,
-	runtimeReadiness?: RepositoryRuntimeReadiness,
+	options: { fleetBudget?: FleetRepositoryBudgetSnapshot; runtimeReadiness?: RepositoryRuntimeReadiness } = {},
 ): RepositoryProgressSnapshot {
 	const liveJobs = jobs.filter((job) => job.progress?.executionKind === "live-cve")
 	const developmentJobs = jobs.filter((job) => job.progress?.executionKind === "development-checkpoint")
 	const visibleJobs = [...liveJobs, ...developmentJobs].slice(-100)
-	const active = visibleJobs.filter((job) => job.status === "running")
-	const unknownActive = jobs.some((job) => job.status === "running" && !job.progress)
-	const lastHeartbeat = active.length ? Math.max(...active.map((job) => job.progress!.heartbeatAt)) : null
-	const leaseExpiry = active.length ? Math.min(...active.map((job) => job.progress!.leaseExpiresAt)) : null
-	const freshness: ProgressFreshness = unknownActive ? "unavailable" : active.length === 0 ? "fresh" : active.some((job) =>
-		observedAt - job.progress!.heartbeatAt > REPOSITORY_PROGRESS_FRESH_MS || observedAt > job.progress!.leaseExpiresAt) ? "stale" : "fresh"
-	const budgetFresh = Boolean(fleetBudget && (fleetBudget.mode === "fleet-v2" ? fleetBudget.available && !fleetBudget.snapshotOnly : fleetBudget.snapshotOnly === true) &&
-		Number.isSafeInteger(fleetBudget.asOfMs) && observedAt - fleetBudget.asOfMs <= REPOSITORY_PROGRESS_FRESH_MS &&
-		fleetBudget.asOfMs <= observedAt + REPOSITORY_PROGRESS_FRESH_MS &&
-		(fleetBudget.mode === "fleet-v2-readonly" ? fleetBudget.runId === null && fleetBudget.runExpiresAtMs === null : fleetBudget.runExpiresAtMs !== null && fleetBudget.runExpiresAtMs > observedAt) &&
-		definition.repositoryId !== undefined && definition.repository !== undefined &&
-		fleetBudget.repositoryCampaignId === definition.id && fleetBudget.repositoryId === definition.repositoryId &&
-		fleetBudget.repository === definition.repository &&
-		fleetBudget.sourceRevision === definition.sourceRevision && fleetBudget.policySha256 === definition.policySha256 && fleetBudget.model === definition.model &&
-		fleetBudget.profileId === definition.workerProfile && /^[a-f0-9]{64}$/.test(fleetBudget.policySha256));
-	const nullCampaign = { limitMicros: null, limitTokens: null, settledMicros: null, reservedMicros: null, ambiguousMicros: null, settledTokens: null, reservedTokens: null, ambiguousTokens: null }
-	const nullLifetime = { settledMicros: null, reservedMicros: null, ambiguousMicros: null, settledTokens: null, reservedTokens: null, ambiguousTokens: null }
-	const freshCounts = freshness === "fresh"
-	const counts: RepositoryProgressSnapshot["counts"] = {
-		source: freshCounts ? "repository-campaign-store" : "unavailable",
-		queued: freshCounts ? visibleJobs.filter((job) => job.status === "queued").length : null,
-		running: freshCounts ? active.length : null,
-		blocked: freshCounts ? visibleJobs.filter((job) => job.progress?.blocker !== null && job.progress?.blocker !== undefined).length : null,
-		completed: freshCounts ? visibleJobs.filter((job) => job.status === "succeeded").length : null,
-		failed: freshCounts ? visibleJobs.filter((job) => job.status === "failed").length : null,
-		ambiguous: freshCounts ? visibleJobs.filter((job) => job.status === "ambiguous").length : null,
-	}
-	const localReadiness = readinessState(campaign)
-	const readinessReasons = Array.isArray(campaign.readinessReasons) ? campaign.readinessReasons.filter((x): x is string => typeof x === "string") : []
-	if (runtimeReadiness && runtimeReadiness.state !== "ready") readinessReasons.push(...runtimeReadiness.reasons)
-	const readiness = runtimeReadiness && runtimeReadiness.state !== "ready" ? runtimeReadiness.state : localReadiness
+	const freshness = freshnessFor(jobs, observedAt)
+	const resolved = resolveReadiness(campaign, options.runtimeReadiness)
 	return {
 		schemaVersion: 1,
-		executionKind: liveJobs.length && developmentJobs.length ? "unavailable" : liveJobs.length ? "live-cve" : developmentJobs.length ? "development-checkpoint" : "unavailable",
+		executionKind: executionKind(liveJobs, developmentJobs),
 		observedAt,
 		repository: { id: definition.id, name: definition.name, slug: definition.repository ?? null },
-		state: readiness === "blocked-prerequisite" || readiness === "blocked-access" ? readiness : campaignState(campaign.state),
-		readiness: { state: readiness, reasons: [...new Set(readinessReasons)].slice(0, 32) },
-		freshness: { state: freshness, lastHeartbeatAt: lastHeartbeat, leaseExpiresAt: leaseExpiry },
-		budget: budgetFresh ? {
-			source: "fleet-v2-ledger", updatedAt: fleetBudget!.asOfMs, state: "measured",
-			global: { limitMicros: fleetBudget!.limitMicros, limitTokens: fleetBudget!.limitTokens, committedMicros: fleetBudget!.committedMicros, committedTokens: fleetBudget!.committedTokens },
-			monthly: { ...fleetBudget!.monthly }, campaignLifetime: { ...fleetBudget!.campaignLifetime },
-			legacyLifetime: { ...fleetBudget!.legacyLifetime }, repositoryLifetime: { ...fleetBudget!.repositoryLifetime },
-			control: { campaignId: fleetBudget!.campaignId, enabled: fleetBudget!.globalEnabled, canAdmit: fleetBudget!.canAdmit,
-				epoch: fleetBudget!.controlEpoch, runId: fleetBudget!.runId, runExpiresAtMs: fleetBudget!.runExpiresAtMs },
-			repository: { id: fleetBudget!.repositoryId, slug: fleetBudget!.repository, sourceRevision: fleetBudget!.sourceRevision,
-				policySha256: fleetBudget!.policySha256, model: fleetBudget!.model, profileId: fleetBudget!.profileId,
-				enabled: fleetBudget!.repositoryEnabled, epoch: fleetBudget!.repositoryEpoch },
-		} : {
-			source: "unavailable", updatedAt: null, state: "unavailable",
-			global: { limitMicros: null, limitTokens: null, committedMicros: null, committedTokens: null },
-			monthly: { month: null, limitMicros: null, settledMicros: null, reservedMicros: null, ambiguousMicros: null },
-			campaignLifetime: { ...nullCampaign }, legacyLifetime: { ...nullLifetime }, repositoryLifetime: { ...nullCampaign },
-			control: { campaignId: null, enabled: null, canAdmit: null, epoch: null, runId: null, runExpiresAtMs: null },
-			repository: { id: null, slug: null, sourceRevision: null, policySha256: null, model: null, profileId: null, enabled: null, epoch: null },
-		},
-		workers: visibleJobs.flatMap((job) => job.progress ? [{ workerId: job.progress.workerId, jobId: job.id, advisoryId: job.advisoryId,
-			executionKind: job.progress.executionKind, status: job.status, stage: job.progress.stage, goal: job.progress.goal,
-			currentTask: job.progress.currentTask, completedSteps: [...job.progress.completedSteps], requiredSteps: [...job.progress.requiredSteps],
-			lastActionAt: job.progress.lastActionAt, heartbeatAt: job.progress.heartbeatAt, leaseExpiresAt: job.progress.leaseExpiresAt,
-			blocker: job.progress.blocker, nextStep: job.progress.nextStep, evidenceRefs: structuredClone(job.progress.evidenceRefs),
-			boardRef: job.progress.boardRef ?? null, usage: usage(job) }] : []),
-		counts,
+		state: resolved.state === "blocked-prerequisite" || resolved.state === "blocked-access" ? resolved.state : campaignState(campaign.state),
+		readiness: { state: resolved.state, reasons: [...new Set(resolved.reasons)].slice(0, 32) },
+		freshness,
+		budget: budgetView(definition, options.fleetBudget, observedAt),
+		workers: workersFor(visibleJobs),
+		counts: countsFor(visibleJobs, freshness.state),
 	}
 }
