@@ -55,6 +55,12 @@ export interface FleetBudgetLedgerOptions {
   invoke?: (message: Record<string, unknown>) => Promise<BridgeReply>
 }
 
+/** Invoke the same verified fixed Fleet bridge used by the legacy v1 ledger. */
+export async function invokeFleetBudgetBridge(message: Record<string, unknown>, options: FleetBudgetLedgerOptions): Promise<BridgeReply> {
+  if (options.invoke) return await options.invoke(message)
+  return await invokeBridge(message, options)
+}
+
 function safeText(value: unknown, name: string): string {
   if (typeof value !== "string" || value.length < 1 || value.length > 256) throw new Error(`invalid ${name}`)
   return value

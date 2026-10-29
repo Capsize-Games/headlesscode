@@ -3,9 +3,9 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 import { test } from "node:test"
-import { RepositoryCampaignBudgetBinding } from "../repository-budget-binding.js"
+import { RepositoryCampaignBudgetBinding, type RepositoryBudgetLedger } from "../repository-budget-binding.js"
 import { RepositoryCampaignStore, type RepositoryBudgetAuthority, type RepositoryCampaignDefinition } from "../repository-campaigns.js"
-import type { OpenRouterBrokerGrant, OpenRouterBrokerReceipt, OpenRouterInferenceLedger } from "../../rsi/inference-broker.js"
+import type { OpenRouterBrokerGrant, OpenRouterBrokerReceipt } from "../../rsi/inference-broker.js"
 import { runMain, type SuiteTest } from "../../test-runner.js"
 
 const qualification = { sourceAudited: true, workerQualified: true, recipeQualified: true, evaluatorQualified: true,
@@ -43,12 +43,15 @@ function mockLedger() {
 		campaignId: "fleet-security-watch", model: "meta/muse-spark-1.3-contributor", returnedModels: [], returnedProviders: [],
 		calls: 1, promptTokens: 800, completionTokens: 100, totalTokens: 900, costUsd: 0.005, accounting: "supervisor-enforced",
 		qualified: true, callReceipts: [], denials: [] }
-	const ledger: OpenRouterInferenceLedger = {
+	const ledger: RepositoryBudgetLedger = {
 		async register(value) { calls.push("register"); return (value.issuedAtMs ?? Date.now()) + 60_000 },
 		async recordDenial() { calls.push("denial") },
 		async reserve() { calls.push("reserve") },
 		async settle() { calls.push("settle") },
 		async receipt(value) { calls.push("receipt"); return { ...receipt, jobId: value.jobId } },
+		async requestStart() { calls.push("request-start") },
+		async reconcile(value) { calls.push("reconcile"); return { calls: [], receipt: { ...receipt, jobId: value.jobId } } },
+		async budgetSnapshot() { return {} as Awaited<ReturnType<RepositoryBudgetLedger["budgetSnapshot"]>> },
 	}
 	return { calls, ledger }
 }
@@ -94,7 +97,9 @@ async function testStopAfterGlobalReservationFencesSendAndKeepsLocalHold(): Prom
 			reservedTokens: 5_000, startedAt: new Date().toISOString() })
 		await f.store.stop("test-repository")
 		let sends = 0
-		await assert.rejects(binding.requestStartGate(async () => { sends += 1; return new Response("unexpected") }), /stale or stopped/)
+		await assert.rejects(binding.requestStartGate(async () => { sends += 1; return new Response("unexpected") },
+			{ grant: jobGrant, reservation: { callId: "call-stop-1", requestSha256: "f".repeat(64), reservedUsd: 0.01,
+				reservedTokens: 5_000, startedAt: new Date().toISOString() } }), /stale or stopped/)
 		const status = await f.store.status() as any
 		assert.equal(sends, 0)
 		assert.equal(mock.calls.filter((entry) => entry === "reserve").length, 1)

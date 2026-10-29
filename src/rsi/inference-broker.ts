@@ -399,7 +399,10 @@ export interface OpenRouterBrokerOptions {
 	port?: number
 	upstreamFetch?: typeof fetch
 	/** Optional campaign epoch gate; it must release its lock after invoking, not awaiting, the request. */
-	requestStartGate?: (start: () => Promise<Response>) => Promise<Response>
+	requestStartGate?: (start: () => Promise<Response>, context: {
+		grant: OpenRouterBrokerGrant
+		reservation: OpenRouterCallReservation
+	}) => Promise<Response>
 	now?: () => number
 	/** Observes response status and method only; request bodies and credentials are never exposed. */
 	onHttpResponse?: (event: { method: string; statusCode: number; requestBytes?: number }) => void
@@ -839,7 +842,7 @@ export async function startOpenRouterBroker(options: OpenRouterBrokerOptions): P
 					method: "POST", redirect: "error", signal: controller.signal,
 					headers: { authorization: `Bearer ${options.apiKey}`, "content-type": "application/json", "X-OpenRouter-Metadata": "enabled" }, body: checked.encodedBody,
 				})
-				upstream = await (options.requestStartGate ? options.requestStartGate(startRequest) : startRequest())
+				upstream = await (options.requestStartGate ? options.requestStartGate(startRequest, { grant, reservation }) : startRequest())
 				upstreamBody = await readResponse(upstream, limits.maxResponseBytes)
 			} catch {
 				clearTimeout(timer)

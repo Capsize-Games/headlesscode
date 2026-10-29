@@ -1,0 +1,411 @@
+/** Repository-scoped adapter for Fleet's v2 shared budget authority. */
+import { createHash } from "node:crypto"
+import * as fs from "node:fs/promises"
+import * as path from "node:path"
+import { CAMPAIGN_CONTROL_FILE } from "../campaigncontrol/paths.js"
+import { verifyCampaignDispatchLock } from "../campaigncontrol/runner.js"
+import { FLEET_BUDGET_CAMPAIGN_ID, type FleetBudgetLedgerOptions, invokeFleetBudgetBridge } from "./fleet-budget-ledger.js"
+import type {
+	OpenRouterBrokerGrant, OpenRouterBrokerReceipt, OpenRouterCallReceipt,
+	OpenRouterCallReservation, OpenRouterCallSettlement, OpenRouterDenialReason, OpenRouterInferenceLedger,
+} from "./inference-broker.js"
+
+const ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/
+const HEX = /^[a-f0-9]{64}$/
+const REPOSITORY = /^[A-Za-z0-9_.-]{1,39}\/[A-Za-z0-9_.-]{1,100}$/
+const MODEL = "meta/muse-spark-1.3-contributor"
+const PROFILE = "muse-spark-contributor"
+const RETURNED_MODELS = new Set([MODEL, "meta/muse-spark-1.3-contributor-20260902"])
+const DENIAL_REASONS = new Set<OpenRouterDenialReason>([
+	"metadata-not-admitted", "unsupported-endpoint", "malformed-call-id", "invalid-request", "request-size-limit",
+	"budget-or-fence", "job-deadline", "upstream-ambiguous", "usage-unverifiable", "usage-out-of-bounds",
+	"settlement-failed", "request-failed",
+])
+
+export interface FleetRepositoryBudgetScope {
+	repositoryCampaignId: string
+	repositoryId: string
+	repository: string
+	sourceRevision: string
+	policySha256: string
+	model: typeof MODEL
+	profileId: typeof PROFILE
+	/** Current owner-controlled Fleet repository epoch, distinct from the HCL claim epoch. */
+	repositoryEpoch: number
+}
+
+export interface FleetRepositoryBudgetLedgerOptions extends FleetBudgetLedgerOptions {
+	scope: FleetRepositoryBudgetScope
+	/** Test seam only; production validates the inherited HeadlessCode dispatch lock. */
+	assertDispatchFence?: () => Promise<void>
+}
+
+export interface FleetRepositoryReconciliation {
+	calls: Array<{ callId: string; state: string; attemptId: string }>
+	receipt: OpenRouterBrokerReceipt
+}
+
+export interface FleetRepositoryBudgetSnapshot {
+	mode: "fleet-v2"
+	available: boolean
+	limitMicros: number
+	limitTokens: number
+	committedMicros: number
+	committedTokens: number
+	asOfMs: number
+	campaignId: string
+	globalEnabled: boolean
+	canAdmit: boolean
+	controlEpoch: number
+	runId: string
+	runExpiresAtMs: number
+	repositoryCampaignId: string
+	repositoryId: string
+	repository: string
+	sourceRevision: string
+	policySha256: string
+	model: string
+	profileId: string
+	repositoryEnabled: boolean
+	repositoryEpoch: number
+	monthly: { month: string; limitMicros: number; settledMicros: number; reservedMicros: number; ambiguousMicros: number }
+	campaignLifetime: { limitMicros: number; limitTokens: number; settledMicros: number; reservedMicros: number; ambiguousMicros: number; settledTokens: number; reservedTokens: number; ambiguousTokens: number }
+	legacyLifetime: { settledMicros: number; reservedMicros: number; ambiguousMicros: number; settledTokens: number; reservedTokens: number; ambiguousTokens: number }
+	repositoryLifetime: { limitMicros: number; limitTokens: number; settledMicros: number; reservedMicros: number; ambiguousMicros: number; settledTokens: number; reservedTokens: number; ambiguousTokens: number }
+}
+
+type Reply = Record<string, unknown>
+
+/**
+ * Carries the fixed repository/source/job identity through every v2 bridge call.
+ * It shares FleetBudgetInferenceLedger's bridge transport and host key identity;
+ * no provider key, repository path or executable crosses the bridge boundary.
+ */
+export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
+	readonly requiresHostApiKeyIdentity = true
+	private readonly scope: FleetRepositoryBudgetScope
+	private readonly expectedKeyIdentity: string
+	private readonly call: (message: Record<string, unknown>) => Promise<Reply>
+	private readonly assertDispatchFence: () => Promise<void>
+	private readonly jobs = new Map<string, OpenRouterBrokerGrant>()
+	private readonly idempotency = new Map<string, string>()
+
+	constructor(options: FleetRepositoryBudgetLedgerOptions) {
+		if (!/^[a-f0-9]{64}$/.test(options.expectedKeyIdentity)) throw new Error("Fleet repository ledger requires a host API-key identity")
+		if (!options.invoke && (options.python !== undefined || options.timeoutMs !== undefined || options.assertDispatchFence !== undefined)) {
+			throw new Error("Fleet repository bridge process overrides are restricted to the injected test seam")
+		}
+		this.scope = validateScope(options.scope)
+		this.expectedKeyIdentity = options.expectedKeyIdentity
+		this.call = (message) => invokeFleetBudgetBridge(message, options)
+		this.assertDispatchFence = options.assertDispatchFence ?? verifyInheritedDispatchFence
+	}
+
+	assertApiKey(apiKey: string): void {
+		if (createHash("sha256").update(apiKey).digest("hex") !== this.expectedKeyIdentity) {
+			throw new Error("Fleet repository ledger host API-key identity differs from selected broker key")
+		}
+	}
+
+	async register(grant: OpenRouterBrokerGrant): Promise<number> {
+		this.remember(grant)
+		const issuedAtMs = grant.issuedAtMs ?? Date.now()
+		if (!Number.isSafeInteger(issuedAtMs) || !Number.isSafeInteger(grant.limits.maxDurationMs) || grant.limits.maxDurationMs < 1) {
+			throw new Error("invalid Fleet repository job deadline")
+		}
+		grant.issuedAtMs = issuedAtMs
+		const result = await this.call({ ...this.identity(grant, "repository-register"), ...grantLimits(grant), issuedAtMs })
+		const deadline = result.deadlineAtMs
+		if (!Number.isSafeInteger(deadline) || Number(deadline) <= Date.now() || Number(deadline) > issuedAtMs + grant.limits.maxDurationMs) {
+			throw new Error("Fleet authority returned an invalid repository grant deadline")
+		}
+		return Number(deadline)
+	}
+
+	async recordDenial(grant: OpenRouterBrokerGrant, statusCode: number, reason: OpenRouterDenialReason): Promise<void> {
+		this.remember(grant)
+		if (!Number.isInteger(statusCode) || statusCode < 400 || statusCode > 599 || !DENIAL_REASONS.has(reason)) throw new Error("invalid repository denial")
+		await this.call({ ...this.identity(grant, "repository-denial"), statusCode, reason })
+	}
+
+	async reserve(grant: OpenRouterBrokerGrant, reservation: OpenRouterCallReservation): Promise<void> {
+		this.remember(grant)
+		validateReservation(reservation)
+		const idempotencyKey = idempotencyKeyFor(this.scope, grant.jobId, reservation)
+		const previous = this.idempotency.get(reservation.callId)
+		if (previous && previous !== idempotencyKey) throw new Error("repository call identity changed")
+		const result = await this.call({ ...this.identity(grant, "repository-reserve"), ...grantLimits(grant),
+			callId: reservation.callId, idempotencyKey, requestSha256: reservation.requestSha256,
+			reservedMicros: usdMicros(reservation.reservedUsd), reservedTokens: reservation.reservedTokens,
+			startedAt: reservation.startedAt })
+		if (result.reserved !== true || !["reserved", "reserve-intent"].includes(String(result.state))) {
+			throw new Error("Fleet authority did not preserve the repository reservation")
+		}
+		this.idempotency.set(reservation.callId, idempotencyKey)
+	}
+
+	/** Called by the broker between reservation and HTTP send, while both claim and Fleet fence are held. */
+	async requestStart(grant: OpenRouterBrokerGrant, reservation: OpenRouterCallReservation): Promise<void> {
+		this.remember(grant)
+		validateReservation(reservation)
+		await this.assertDispatchFence()
+		const idempotencyKey = idempotencyKeyFor(this.scope, grant.jobId, reservation)
+		const result = await this.call({ ...this.identity(grant, "repository-request-start"),
+			callId: reservation.callId, idempotencyKey })
+		if (result.started !== true || result.state !== "transmitting") throw new Error("Fleet repository request-start was not admitted")
+	}
+
+	async settle(grant: OpenRouterBrokerGrant, settlement: OpenRouterCallSettlement & { callId: string }): Promise<void> {
+		this.remember(grant)
+		const idempotencyKey = this.idempotency.get(settlement.callId)
+		if (!idempotencyKey) throw new Error("repository settlement has no matching durable reservation")
+		const result = await this.call({ ...this.identity(grant, "repository-settle"),
+			callId: settlement.callId, idempotencyKey, settlement })
+		if (settlement.state === "complete" && result.settled !== true) throw new Error("Fleet authority could not settle measured repository call")
+	}
+
+	async receipt(grant: OpenRouterBrokerGrant): Promise<OpenRouterBrokerReceipt> {
+		this.remember(grant)
+		const result = await this.call({ ...this.identity(grant, "repository-receipt") })
+		assertReceiptIdentity(result, this.scope, grant)
+		return toBrokerReceipt(result, grant, this.scope)
+	}
+
+	/** Read the registered scope's current Fleet epochs and separate monthly/lifetime usage. */
+	async budgetSnapshot(): Promise<FleetRepositoryBudgetSnapshot> {
+		const result = await this.call({ schemaVersion: 2, op: "repository-budget-status", campaignId: FLEET_BUDGET_CAMPAIGN_ID,
+			repositoryCampaignId: this.scope.repositoryCampaignId, repositoryId: this.scope.repositoryId,
+			repository: this.scope.repository, sourceRevision: this.scope.sourceRevision,
+			policySha256: this.scope.policySha256, model: this.scope.model, profileId: this.scope.profileId,
+			keyIdentity: this.expectedKeyIdentity })
+		const monthly = result.monthly
+		const campaignLifetime = result.campaignLifetime
+		const legacyLifetime = result.legacyLifetime
+		const repositoryLifetime = result.repositoryLifetime
+		if (result.schemaVersion !== 2 || typeof result.available !== "boolean" || !Number.isSafeInteger(result.asOfMs) ||
+			result.campaignId !== FLEET_BUDGET_CAMPAIGN_ID || typeof result.globalEnabled !== "boolean" || typeof result.canAdmit !== "boolean" ||
+			Date.now() - Number(result.asOfMs) > 60_000 || Number(result.asOfMs) > Date.now() + 60_000 ||
+			!Number.isSafeInteger(result.controlEpoch) || typeof result.runId !== "string" || !ID.test(result.runId) ||
+			!Number.isSafeInteger(result.runExpiresAtMs) || Number(result.asOfMs) >= Number(result.runExpiresAtMs) ||
+			result.repositoryCampaignId !== this.scope.repositoryCampaignId || result.repositoryId !== this.scope.repositoryId ||
+			result.repository !== this.scope.repository || result.sourceRevision !== this.scope.sourceRevision ||
+			result.policySha256 !== this.scope.policySha256 || result.model !== this.scope.model || result.profileId !== this.scope.profileId ||
+			typeof result.repositoryEnabled !== "boolean" || !Number.isSafeInteger(result.repositoryEpoch) || Number(result.repositoryEpoch) < 0 ||
+			!isMonthlyUsage(monthly) || !isLifetimeUsage(campaignLifetime, 20_000, 108_000) ||
+			!isLifetimeUsage(legacyLifetime) || !isLifetimeUsage(repositoryLifetime, undefined, undefined, true)) {
+			throw new Error("Fleet repository budget snapshot is invalid")
+		}
+		const externalMicros = Number(legacyLifetime.settledMicros) + Number(legacyLifetime.reservedMicros) + Number(legacyLifetime.ambiguousMicros)
+		const externalTokens = Number(legacyLifetime.settledTokens) + Number(legacyLifetime.reservedTokens) + Number(legacyLifetime.ambiguousTokens)
+		const monthlyUsed = Number(monthly.settledMicros) + Number(monthly.reservedMicros) + Number(monthly.ambiguousMicros)
+		const campaignSpend = Number(campaignLifetime.settledMicros) + Number(campaignLifetime.reservedMicros) + Number(campaignLifetime.ambiguousMicros)
+		const campaignTokens = Number(campaignLifetime.settledTokens) + Number(campaignLifetime.reservedTokens) + Number(campaignLifetime.ambiguousTokens)
+		const repositorySpend = Number(repositoryLifetime.settledMicros) + Number(repositoryLifetime.reservedMicros) + Number(repositoryLifetime.ambiguousMicros)
+		const repositoryTokens = Number(repositoryLifetime.settledTokens) + Number(repositoryLifetime.reservedTokens) + Number(repositoryLifetime.ambiguousTokens)
+		const derivedAvailable = result.globalEnabled === true && result.canAdmit === true && result.repositoryEnabled === true &&
+			monthlyUsed < Number(monthly.limitMicros) && campaignSpend < 20_000 && campaignTokens < 108_000 &&
+			repositorySpend < Number(repositoryLifetime.limitMicros) && repositoryTokens < Number(repositoryLifetime.limitTokens)
+		if (result.externalCommittedMicros !== externalMicros || result.externalCommittedTokens !== externalTokens ||
+			result.available !== derivedAvailable || !Number.isSafeInteger(monthly.limitMicros) || Number(monthly.limitMicros) > 5_000_000 ||
+			Number(repositoryLifetime.limitMicros) > 20_000 || Number(repositoryLifetime.limitTokens) > 108_000 ||
+			monthlyUsed > Number(monthly.limitMicros) || campaignSpend > 20_000 || campaignTokens > 108_000 ||
+			repositorySpend > Number(repositoryLifetime.limitMicros) || repositoryTokens > Number(repositoryLifetime.limitTokens)) {
+			throw new Error("Fleet repository budget snapshot counters are inconsistent")
+		}
+		return { mode: "fleet-v2", available: result.available, limitMicros: 20_000, limitTokens: 108_000,
+			committedMicros: externalMicros, committedTokens: externalTokens, asOfMs: Number(result.asOfMs),
+			campaignId: FLEET_BUDGET_CAMPAIGN_ID, globalEnabled: result.globalEnabled, canAdmit: result.canAdmit,
+			controlEpoch: Number(result.controlEpoch), runId: result.runId, runExpiresAtMs: Number(result.runExpiresAtMs),
+			repositoryCampaignId: String(result.repositoryCampaignId), repositoryId: String(result.repositoryId),
+			repository: String(result.repository), sourceRevision: String(result.sourceRevision), policySha256: String(result.policySha256),
+			model: String(result.model), profileId: String(result.profileId), repositoryEnabled: result.repositoryEnabled,
+			repositoryEpoch: Number(result.repositoryEpoch), monthly: monthly as FleetRepositoryBudgetSnapshot["monthly"],
+			campaignLifetime: campaignLifetime as FleetRepositoryBudgetSnapshot["campaignLifetime"],
+			legacyLifetime: legacyLifetime as FleetRepositoryBudgetSnapshot["legacyLifetime"],
+			repositoryLifetime: repositoryLifetime as FleetRepositoryBudgetSnapshot["repositoryLifetime"] }
+	}
+
+	async reconcile(grant: OpenRouterBrokerGrant, callId?: string): Promise<FleetRepositoryReconciliation> {
+		this.remember(grant)
+		if (callId !== undefined && !ID.test(callId)) throw new Error("invalid repository reconciliation call id")
+		const result = await this.call({ ...this.identity(grant, "repository-reconcile"), ...(callId ? { callId } : {}) })
+		assertReceiptIdentity(result, this.scope, grant)
+		const rows = result.calls
+		if (!Array.isArray(rows) || rows.length > grant.limits.maxCalls) throw new Error("Fleet repository reconciliation response is invalid")
+		const calls = rows.map((row) => {
+			if (!isRecord(row) || !ID.test(String(row.callId)) || !ID.test(String(row.attemptId)) ||
+				!new Set(["reserve-intent", "reserved", "start-intent", "transmitting", "settled", "ambiguous", "settle-intent"]).has(String(row.state))) {
+				throw new Error("Fleet repository reconciliation row is invalid")
+			}
+			return { callId: String(row.callId), state: String(row.state), attemptId: String(row.attemptId) }
+		})
+		return { calls, receipt: await this.receipt(grant) }
+	}
+
+	private identity(grant: OpenRouterBrokerGrant, op: string): Record<string, unknown> {
+		return { schemaVersion: 2, op, campaignId: FLEET_BUDGET_CAMPAIGN_ID,
+			repositoryCampaignId: this.scope.repositoryCampaignId, repositoryId: this.scope.repositoryId,
+			repository: this.scope.repository, sourceRevision: this.scope.sourceRevision,
+			policySha256: this.scope.policySha256, model: this.scope.model, profileId: this.scope.profileId,
+			repositoryEpoch: this.scope.repositoryEpoch, jobId: grant.jobId, keyIdentity: this.expectedKeyIdentity }
+	}
+
+	private remember(grant: OpenRouterBrokerGrant): void {
+		if (!grant || !ID.test(grant.jobId) || grant.limits?.campaignId !== FLEET_BUDGET_CAMPAIGN_ID ||
+			grant.model !== this.scope.model || grant.profileId !== this.scope.profileId || grant.model !== MODEL || grant.profileId !== PROFILE ||
+			grant.apiKeyIdentity !== this.expectedKeyIdentity ||
+			usdMicros(grant.limits.maxJobSpendUsd) > this.scopeMaxSpend() ||
+			grant.limits.maxCampaignSpendUsd > 0.02 || grant.limits.maxTotalTokens > this.scopeMaxTokens()) {
+			throw new Error("Fleet repository grant differs from its registered source, model, key or lifetime allocation")
+		}
+		const prior = this.jobs.get(grant.jobId)
+		if (prior && (prior.model !== grant.model || prior.profileId !== grant.profileId || prior.apiKeyIdentity !== grant.apiKeyIdentity ||
+			prior.limits.maxCampaignSpendUsd !== grant.limits.maxCampaignSpendUsd)) throw new Error("Fleet repository job grant changed")
+		this.jobs.set(grant.jobId, grant)
+	}
+
+	private scopeMaxSpend(): number { return 20_000 }
+	private scopeMaxTokens(): number { return 108_000 }
+}
+
+function validateScope(scope: FleetRepositoryBudgetScope): FleetRepositoryBudgetScope {
+	if (!scope || !ID.test(scope.repositoryCampaignId) || !ID.test(scope.repositoryId) || !REPOSITORY.test(scope.repository) ||
+		!(/^[a-f0-9]{40}$|^[a-f0-9]{64}$/).test(scope.sourceRevision) || !HEX.test(scope.policySha256) ||
+		scope.model !== MODEL || scope.profileId !== PROFILE || !Number.isSafeInteger(scope.repositoryEpoch) || scope.repositoryEpoch < 0) {
+		throw new Error("Fleet repository budget scope is invalid")
+	}
+	return Object.freeze({ ...scope })
+}
+
+function validateReservation(reservation: OpenRouterCallReservation): void {
+	if (!reservation || !ID.test(reservation.callId) || !HEX.test(reservation.requestSha256) ||
+		!Number.isSafeInteger(reservation.reservedTokens) || reservation.reservedTokens < 1 ||
+		typeof reservation.startedAt !== "string" || reservation.startedAt.length > 64) throw new Error("repository call reservation is invalid")
+	}
+
+function idempotencyKeyFor(scope: FleetRepositoryBudgetScope, jobId: string, reservation: OpenRouterCallReservation): string {
+	return createHash("sha256").update([scope.repositoryCampaignId, scope.repositoryId, scope.sourceRevision,
+		scope.policySha256, jobId, reservation.callId, reservation.requestSha256].join("\0")).digest("hex")
+}
+
+function grantLimits(grant: OpenRouterBrokerGrant): Record<string, unknown> {
+	const l = grant.limits
+	return { maxCalls: l.maxCalls, maxInputTokensPerCall: l.maxInputTokensPerCall,
+		maxOutputTokensPerCall: l.maxOutputTokensPerCall, maxTotalTokens: l.maxTotalTokens,
+		maxDurationMs: l.maxDurationMs, maxRequestBytes: l.maxRequestBytes, maxResponseBytes: l.maxResponseBytes,
+		maxInputPricePerMillionUsd: l.maxInputPricePerMillionUsd, maxOutputPricePerMillionUsd: l.maxOutputPricePerMillionUsd,
+		maxCallSpendMicros: usdMicros(l.maxCallSpendUsd), maxJobSpendMicros: usdMicros(l.maxJobSpendUsd),
+		maxCampaignSpendMicros: usdMicros(l.maxCampaignSpendUsd) }
+}
+
+function usdMicros(value: number): number {
+	if (!Number.isFinite(value) || value <= 0) throw new Error("repository spend reservation is invalid")
+	const micros = Math.ceil(value * 1_000_000)
+	if (!Number.isSafeInteger(micros) || micros > 5_000_000) throw new Error("repository spend reservation exceeds the existing Fleet cap")
+	return micros
+}
+
+async function verifyInheritedDispatchFence(): Promise<void> {
+	const raw = process.env.HEADLESSCODE_CAMPAIGN_LOCK_FD
+	if (!raw || !/^\d{1,6}$/.test(raw) || Number(raw) < 3) throw new Error("repository provider send requires the inherited HeadlessCode dispatch lock")
+	const expected = path.join(path.dirname(CAMPAIGN_CONTROL_FILE), "campaign-dispatch.lock")
+	const target = await fs.readlink(`/proc/self/fd/${Number(raw)}`).catch(() => "")
+	if (target !== expected) throw new Error("repository provider send inherited a different dispatch lock")
+	await verifyCampaignDispatchLock(CAMPAIGN_CONTROL_FILE)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value)
+}
+
+function isUsage(value: unknown, includeLimits: boolean): value is Record<string, unknown> {
+	if (!isRecord(value)) return false
+	const numbers = ["settledMicros", "reservedMicros", "ambiguousMicros", "settledTokens", "reservedTokens", "ambiguousTokens"]
+	if (includeLimits) numbers.push("limitMicros", "limitTokens")
+	return Object.keys(value).sort().join(",") === numbers.sort().join(",") &&
+		numbers.every((key) => Number.isSafeInteger(value[key]) && Number(value[key]) >= 0)
+}
+
+function isLifetimeUsage(value: unknown, spendLimit?: number, tokenLimit?: number, allowLimits = false): value is Record<string, unknown> {
+	if (!isUsage(value, spendLimit !== undefined || allowLimits)) return false
+	if (spendLimit !== undefined) return value.limitMicros === spendLimit && value.limitTokens === tokenLimit
+	if (allowLimits) return Number(value.limitMicros) > 0 && Number(value.limitMicros) <= 20_000 &&
+		Number(value.limitTokens) > 0 && Number(value.limitTokens) <= 108_000
+	return true
+}
+
+function isMonthlyUsage(value: unknown): value is Record<string, unknown> {
+	return isRecord(value) && typeof value.month === "string" && /^\d{4}-(0[1-9]|1[0-2])$/.test(value.month) &&
+		Object.keys(value).sort().join(",") === "ambiguousMicros,limitMicros,month,reservedMicros,settledMicros" &&
+		Number.isSafeInteger(value.limitMicros) && Number(value.limitMicros) > 0 &&
+		["settledMicros", "reservedMicros", "ambiguousMicros"].every((key) => Number.isSafeInteger(value[key]) && Number(value[key]) >= 0)
+}
+
+function assertReceiptIdentity(result: Reply, scope: FleetRepositoryBudgetScope, grant: OpenRouterBrokerGrant): void {
+	if (result.jobId !== grant.jobId || result.campaignId !== FLEET_BUDGET_CAMPAIGN_ID ||
+		result.repositoryCampaignId !== scope.repositoryCampaignId || result.repositoryId !== scope.repositoryId ||
+		result.sourceRevision !== scope.sourceRevision || result.policySha256 !== scope.policySha256 ||
+		result.repositoryEpoch !== scope.repositoryEpoch || result.model !== scope.model || result.profileId !== scope.profileId) {
+		throw new Error("Fleet repository receipt identity mismatch")
+	}
+}
+
+function toBrokerReceipt(result: Reply, grant: OpenRouterBrokerGrant, scope: FleetRepositoryBudgetScope): OpenRouterBrokerReceipt {
+	const rows = result.calls
+	const denialRows = result.denials
+	if (!Array.isArray(rows) || rows.length > grant.limits.maxCalls || !Array.isArray(denialRows) || denialRows.length > 128) {
+		throw new Error("Fleet repository receipt is invalid")
+	}
+	const calls: OpenRouterCallReceipt[] = rows.map((value) => {
+		if (!isRecord(value) || value.jobId !== grant.jobId || value.campaignId !== FLEET_BUDGET_CAMPAIGN_ID ||
+			value.model !== scope.model || value.profileId !== scope.profileId || !ID.test(String(value.callId)) ||
+			!HEX.test(String(value.requestSha256)) || !Number.isSafeInteger(value.reservedMicros) ||
+			!Number.isSafeInteger(value.reservedTokens) || typeof value.startedAt !== "string" ||
+			!new Set(["reserve-intent", "reserved", "start-intent", "transmitting", "settle-intent", "ambiguous", "settled"]).has(String(value.state))) {
+			throw new Error("Fleet repository call receipt is invalid")
+		}
+		const settlement = isRecord(value.settlement) ? value.settlement : {}
+		const measured = value.state === "settled" && settlement.state === "complete" && settlement.qualified === true &&
+			typeof settlement.returnedModel === "string" && RETURNED_MODELS.has(settlement.returnedModel) &&
+			settlement.returnedProvider === "meta" && typeof settlement.providerRequestId === "string" &&
+			Number.isSafeInteger(settlement.promptTokens) && Number(settlement.promptTokens) >= 0 && Number(settlement.promptTokens) <= grant.limits.maxInputTokensPerCall &&
+			Number.isSafeInteger(settlement.completionTokens) && Number(settlement.completionTokens) >= 0 && Number(settlement.completionTokens) <= grant.limits.maxOutputTokensPerCall &&
+			Number.isFinite(settlement.costUsd) && Number(settlement.costUsd) >= 0 && Number(settlement.costUsd) <= Number(value.reservedMicros) / 1_000_000 &&
+			Number(settlement.promptTokens) + Number(settlement.completionTokens) <= Number(value.reservedTokens) && HEX.test(String(settlement.responseSha256))
+		return { jobId: grant.jobId, campaignId: FLEET_BUDGET_CAMPAIGN_ID, model: scope.model, profileId: PROFILE,
+			callId: String(value.callId), requestSha256: String(value.requestSha256), reservedUsd: Number(value.reservedMicros) / 1_000_000,
+			reservedTokens: Number(value.reservedTokens), startedAt: value.startedAt,
+			state: value.state === "settled" ? "complete" : "unmeasured", authoritative: measured,
+			...(typeof settlement.returnedModel === "string" ? { returnedModel: settlement.returnedModel } : {}),
+			...(typeof settlement.returnedProvider === "string" ? { returnedProvider: settlement.returnedProvider } : {}),
+			...(typeof settlement.providerRequestId === "string" ? { providerRequestId: settlement.providerRequestId } : {}),
+			...(Number.isSafeInteger(settlement.promptTokens) ? { promptTokens: Number(settlement.promptTokens) } : {}),
+			...(Number.isSafeInteger(settlement.cachedPromptTokens) ? { cachedPromptTokens: Number(settlement.cachedPromptTokens) } : {}),
+			...(Number.isSafeInteger(settlement.completionTokens) ? { completionTokens: Number(settlement.completionTokens) } : {}),
+			...(Number.isFinite(settlement.costUsd) ? { costUsd: Number(settlement.costUsd) } : {}),
+			...(typeof settlement.responseSha256 === "string" ? { responseSha256: settlement.responseSha256 } : {}) }
+	})
+	const denials = denialRows.map((value) => {
+		if (!isRecord(value) || !Number.isSafeInteger(value.statusCode) || !DENIAL_REASONS.has(value.reason as OpenRouterDenialReason) ||
+			!Number.isSafeInteger(value.count) || Number(value.count) < 1) throw new Error("Fleet repository denial receipt is invalid")
+		return { statusCode: Number(value.statusCode), reason: value.reason as OpenRouterDenialReason, count: Number(value.count) }
+	})
+	const qualifiedCalls = calls.filter((call) => call.authoritative)
+	const promptTokens = sum(qualifiedCalls, "promptTokens")
+	const completionTokens = sum(qualifiedCalls, "completionTokens")
+	const costUsd = sum(qualifiedCalls, "costUsd")
+	return { provider: "openrouter", endpointProvider: "fleet-budget-authority", jobId: grant.jobId,
+		campaignId: FLEET_BUDGET_CAMPAIGN_ID, model: scope.model, profileId: scope.profileId,
+		returnedModels: [...new Set(qualifiedCalls.map((call) => call.returnedModel).filter((v): v is string => Boolean(v)))],
+		returnedProviders: [...new Set(qualifiedCalls.map((call) => call.returnedProvider).filter((v): v is string => Boolean(v)))],
+		calls: calls.length, promptTokens, completionTokens,
+		totalTokens: promptTokens === null || completionTokens === null ? null : promptTokens + completionTokens,
+		costUsd, accounting: calls.length > 0 && calls.every((call) => call.authoritative) && denials.length === 0 ? "supervisor-enforced" : "incomplete",
+		qualified: calls.length > 0 && calls.every((call) => call.authoritative) && denials.length === 0,
+		callReceipts: calls, denials }
+}
+
+function sum(rows: OpenRouterCallReceipt[], key: "promptTokens" | "completionTokens" | "costUsd"): number | null {
+	if (rows.length === 0 || rows.some((row) => typeof row[key] !== "number")) return null
+	return rows.reduce((total, row) => total + Number(row[key]), 0)
+}

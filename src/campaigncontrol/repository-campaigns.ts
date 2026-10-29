@@ -60,12 +60,33 @@ export interface RepositoryCampaignDefinition {
 }
 
 export interface RepositoryBudgetAuthority {
-	mode: "synthetic-test"
+	mode: "synthetic-test" | "fleet-v2"
 	available: boolean
 	limitMicros: number
 	limitTokens: number
 	committedMicros: number
 	committedTokens: number
+	/** Fresh authority projection fields are present only for mode=fleet-v2. */
+	asOfMs?: number
+	campaignId?: string
+	globalEnabled?: boolean
+	canAdmit?: boolean
+	controlEpoch?: number
+	runId?: string
+	runExpiresAtMs?: number
+	repositoryCampaignId?: string
+	repositoryId?: string
+	repository?: string
+	sourceRevision?: string
+	policySha256?: string
+	model?: string
+	profileId?: string
+	repositoryEnabled?: boolean
+	repositoryEpoch?: number
+	monthly?: { month: string; limitMicros: number; settledMicros: number; reservedMicros: number; ambiguousMicros: number }
+	campaignLifetime?: { limitMicros: number; limitTokens: number; settledMicros: number; reservedMicros: number; ambiguousMicros: number; settledTokens: number; reservedTokens: number; ambiguousTokens: number }
+	legacyLifetime?: { settledMicros: number; reservedMicros: number; ambiguousMicros: number; settledTokens: number; reservedTokens: number; ambiguousTokens: number }
+	repositoryLifetime?: { limitMicros: number; limitTokens: number; settledMicros: number; reservedMicros: number; ambiguousMicros: number; settledTokens: number; reservedTokens: number; ambiguousTokens: number }
 }
 
 export interface RepositoryCampaignJob {
@@ -119,6 +140,35 @@ export type MockRepositoryDispatcher = (job: RepositoryCampaignJob) => Promise<{
 	actualMicros?: number
 	actualTokens?: number
 }>
+
+function validUsageCounters(value: unknown, includeLimits = false): value is Record<string, number> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false
+	const counters = ["settledMicros", "reservedMicros", "ambiguousMicros", "settledTokens", "reservedTokens", "ambiguousTokens"]
+	if (Object.keys(value).sort().join(",") !== [...counters, ...(includeLimits ? ["limitMicros", "limitTokens"] : [])].sort().join(",")) return false
+	return [...counters, ...(includeLimits ? ["limitMicros", "limitTokens"] : [])]
+		.every((key) => Number.isSafeInteger((value as Record<string, unknown>)[key]) && Number((value as Record<string, unknown>)[key]) >= 0)
+}
+
+function validLifetimeSnapshot(value: unknown, spendLimit?: number, tokenLimit?: number, allowLimits = false): boolean {
+	if (!validUsageCounters(value, allowLimits || spendLimit !== undefined)) return false
+	const row = value as Record<string, unknown>
+	if (spendLimit === undefined) {
+		if (!allowLimits) return !Object.hasOwn(value, "limitMicros") && !Object.hasOwn(value, "limitTokens")
+		return Number.isSafeInteger(row.limitMicros) && Number(row.limitMicros) >= 0 && Number(row.limitMicros) <= REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS &&
+			Number.isSafeInteger(row.limitTokens) && Number(row.limitTokens) >= 0 && Number(row.limitTokens) <= REPOSITORY_CAMPAIGN_BUDGET_CAP_TOKENS
+	}
+	return Number.isSafeInteger(row.limitMicros) && Number(row.limitMicros) === spendLimit &&
+		Number.isSafeInteger(row.limitTokens) && Number(row.limitTokens) === tokenLimit
+}
+
+function validMonthlySnapshot(value: unknown): boolean {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false
+	const row = value as Record<string, unknown>
+	return Object.keys(value).sort().join(",") === "ambiguousMicros,limitMicros,month,reservedMicros,settledMicros" &&
+		typeof row.month === "string" && row.month === monthNow(new Date()) &&
+		Number.isSafeInteger(row.limitMicros) && Number(row.limitMicros) > 0 && Number(row.limitMicros) <= 5_000_000 &&
+		["settledMicros", "reservedMicros", "ambiguousMicros"].every((key) => Number.isSafeInteger(row[key]) && Number(row[key]) >= 0)
+}
 
 export async function loadRepositoryCampaignDefinitions(filePath: string): Promise<RepositoryCampaignDefinition[]> {
 	try {
@@ -243,9 +293,9 @@ export class RepositoryCampaignStore {
 	readonly path: string
 	private readonly lockPath: string
 	private readonly definitions = new Map<string, RepositoryCampaignDefinition>()
-	private readonly readBudgetAuthority: () => RepositoryBudgetAuthority
+	private readonly readBudgetAuthority: (campaignId?: string) => RepositoryBudgetAuthority
 
-	constructor(filePath: string, definitions: RepositoryCampaignDefinition[], readBudgetAuthority: () => RepositoryBudgetAuthority = () => ({ mode: "synthetic-test", available: false, limitMicros: 0, limitTokens: 0, committedMicros: 0, committedTokens: 0 })) {
+	constructor(filePath: string, definitions: RepositoryCampaignDefinition[], readBudgetAuthority: (campaignId?: string) => RepositoryBudgetAuthority = () => ({ mode: "synthetic-test", available: false, limitMicros: 0, limitTokens: 0, committedMicros: 0, committedTokens: 0 })) {
 		this.path = path.resolve(filePath)
 		this.lockPath = `${this.path}.lock`
 		this.readBudgetAuthority = readBudgetAuthority
@@ -259,18 +309,21 @@ export class RepositoryCampaignStore {
 
 	async status(now = new Date()): Promise<Record<string, unknown>> {
 		const state = await this.read(now)
-		const authority = this.budgetAuthority()
+		const authority = this.budgetAuthority(this.definitions.keys().next().value)
 		const totals = this.aggregateTotals(state)
 		return {
 			month: state.month,
-			budget: { authority: "fleet-broker-ledger-not-integrated", adapter: authority.available ? "synthetic-test-only" : "none", available: authority.available,
+			budget: { authority: authority.mode, adapter: authority.available ? authority.mode : "none", available: authority.available,
 				limitMicros: authority.limitMicros, limitTokens: authority.limitTokens, externalCommittedMicros: authority.committedMicros,
 				externalCommittedTokens: authority.committedTokens, ...totals,
+				...(authority.monthly ? { monthly: authority.monthly } : {}),
+				...(authority.campaignLifetime ? { campaignLifetime: authority.campaignLifetime } : {}),
 				remainingMicros: Math.max(0, authority.limitMicros - authority.committedMicros - totals.settledMicros - totals.reservedMicros - totals.ambiguousMicros),
 				remainingTokens: Math.max(0, authority.limitTokens - authority.committedTokens - totals.settledTokens - totals.reservedTokens - totals.ambiguousTokens) },
 			campaigns: [...this.definitions.values()].map((definition) => {
 				const campaign = state.campaigns[definition.id] ?? this.initialCampaign()
-				const missing = this.missingReadiness(definition, authority, campaign, state)
+				const scopedAuthority = this.budgetAuthority(definition.id)
+				const missing = this.missingReadiness(definition, scopedAuthority, campaign, state)
 				const exhausted = this.isExhausted(campaign)
 				const stateName = this.campaignState(definition.id, campaign, missing, exhausted, state.jobs)
 				const readiness = missing.some((reason) => reason !== "aggregate-budget-exhausted") ? "blocked-prerequisite" :
@@ -328,7 +381,7 @@ export class RepositoryCampaignStore {
 		await this.update((s) => {
 			const c = this.campaign(s, id)
 			if (micros < c.settledMicros + c.reservedMicros + c.ambiguousMicros || tokens < c.settledTokens + c.reservedTokens + c.ambiguousTokens) throw new Error("campaign budget is below committed usage")
-			const authority = this.budgetAuthority()
+			const authority = this.budgetAuthority(id)
 			const allocated = Object.values(s.campaigns).reduce((sum, campaign) => ({ micros: sum.micros + campaign.budgetLimitMicros, tokens: sum.tokens + campaign.budgetLimitTokens }), { micros: 0, tokens: 0 })
 			if (!authority.available || allocated.micros - c.budgetLimitMicros + micros > authority.limitMicros || allocated.tokens - c.budgetLimitTokens + tokens > authority.limitTokens) throw new Error("repository budgets exceed authoritative Fleet allocation or broker authority is unavailable")
 			if (c.budgetLimitMicros !== micros || c.budgetLimitTokens !== tokens) {
@@ -343,7 +396,7 @@ export class RepositoryCampaignStore {
 		await this.update((s) => {
 			const c = this.campaign(s, id)
 			if (c.enabled) return
-			const reasons = this.missingReadiness(this.requireDefinition(id), this.budgetAuthority(), c, s)
+			const reasons = this.missingReadiness(this.requireDefinition(id), this.budgetAuthority(id), c, s)
 			if (this.isExhausted(c)) reasons.push("campaign-budget-exhausted")
 			if (reasons.length) throw new Error(`campaign is blocked: ${reasons.join(", ")}`)
 			c.enabled = true; c.epoch += 1; this.event(s, id, "started", now)
@@ -364,7 +417,7 @@ export class RepositoryCampaignStore {
 	 * campaign-state lock. The lock is released as soon as `start` returns its
 	 * promise; an already-started request may finish and must still be settled.
 	 */
-	async withClaimRequestStart<T>(claim: ClaimedRepositoryJob, start: () => Promise<T>): Promise<T> {
+	async withClaimRequestStart<T>(claim: ClaimedRepositoryJob, start: () => Promise<T>, beforeStart?: () => Promise<void>): Promise<T> {
 		if (!claim || typeof start !== "function") throw new Error("campaign request claim is invalid")
 		const release = await this.lock()
 		let pending: Promise<T>
@@ -374,6 +427,11 @@ export class RepositoryCampaignStore {
 			const campaign = state.campaigns[claim.job.campaignId]
 			if (!campaign?.enabled || campaign.epoch !== claim.epoch || !job || job.status !== "running" ||
 				job.claimId !== claim.claimId || job.epoch !== claim.epoch) throw new Error("campaign request claim is stale or stopped")
+			// Repository and Fleet admissions are both checked before invoking the
+			// callback that starts the HTTP request. Keep the repository lock while
+			// the Fleet v2 start transition is resolved, so Stop cannot slip between
+			// the local epoch check and the actual request invocation.
+			if (beforeStart) await beforeStart()
 			pending = start()
 		} finally {
 			await release()
@@ -423,7 +481,7 @@ export class RepositoryCampaignStore {
 		}
 		return this.update((s) => {
 			const c = this.campaign(s, id)
-			const authority = this.budgetAuthority()
+			const authority = this.budgetAuthority(id)
 			if (!c.enabled || this.missingReadiness(this.requireDefinition(id), authority, c, s).length) return undefined
 			if (this.isExhausted(c)) { c.enabled = false; c.epoch += 1; this.event(s, id, "budget-exhausted", now); return undefined }
 			const totals = this.aggregateTotals(s)
@@ -545,6 +603,31 @@ export class RepositoryCampaignStore {
 		}, now)
 	}
 
+	/** Reclassify a recovered ambiguous hold only after an authoritative bridge receipt was verified. */
+	async settleRecoveredClaim(claim: ClaimedRepositoryJob,
+		result: { status: "succeeded" | "failed"; actualMicros: number; actualTokens: number }, now = new Date()): Promise<void> {
+		if (!claim || !claim.job || !["succeeded", "failed"].includes(result.status) ||
+			![result.actualMicros, result.actualTokens].every((n) => Number.isSafeInteger(n) && n >= 0)) {
+			throw new Error("recovered campaign settlement is invalid")
+		}
+		await this.update((s) => {
+			const job = s.jobs.find((candidate) => candidate.id === claim.job.id)
+			if (!job || job.claimId !== claim.claimId || job.epoch !== claim.epoch) throw new Error("campaign claim is stale")
+			if (job.status === result.status && job.settledMicros === result.actualMicros && job.settledTokens === result.actualTokens) return
+			if (job.status !== "ambiguous") throw new Error("campaign claim is not a recovered ambiguous job")
+			const heldMicros = job.settledMicros
+			const heldTokens = job.settledTokens
+			const c = this.campaign(s, job.campaignId)
+			if (result.actualMicros > heldMicros || result.actualTokens > heldTokens ||
+				c.ambiguousMicros < heldMicros || c.ambiguousTokens < heldTokens) throw new Error("recovered usage exceeds its ambiguous reservation")
+			c.ambiguousMicros -= heldMicros; c.ambiguousTokens -= heldTokens
+			c.settledMicros += result.actualMicros; c.settledTokens += result.actualTokens
+			job.status = result.status; job.settledMicros = result.actualMicros; job.settledTokens = result.actualTokens; job.updatedAt = now.getTime()
+			if (this.isExhausted(c) && c.enabled) { c.enabled = false; c.epoch += 1; this.event(s, job.campaignId, "budget-exhausted", now) }
+			this.event(s, job.campaignId, "completed", now, job.id)
+		}, now)
+	}
+
 	/** A lost process never causes an automatic replay of a claimed job. */
 	async recoverInterrupted(now = new Date()): Promise<number> {
 		return this.update((s) => {
@@ -571,11 +654,37 @@ export class RepositoryCampaignStore {
 		if (!Number.isSafeInteger(micros) || micros < 0 || micros > REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS ||
 			!Number.isSafeInteger(tokens) || tokens < 0 || tokens > REPOSITORY_CAMPAIGN_BUDGET_CAP_TOKENS) throw new Error("budget is outside the permitted range")
 	}
-	private budgetAuthority(): RepositoryBudgetAuthority {
-		const authority = this.readBudgetAuthority()
-		if (!authority || authority.mode !== "synthetic-test" || typeof authority.available !== "boolean" || !Number.isSafeInteger(authority.limitMicros) || authority.limitMicros < 0 || authority.limitMicros > REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS ||
+	private budgetAuthority(campaignId?: string): RepositoryBudgetAuthority {
+		const authority = this.readBudgetAuthority(campaignId)
+		if (!authority || !["synthetic-test", "fleet-v2"].includes(authority.mode) || typeof authority.available !== "boolean" || !Number.isSafeInteger(authority.limitMicros) || authority.limitMicros < 0 || authority.limitMicros > REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS ||
 			!Number.isSafeInteger(authority.limitTokens) || authority.limitTokens < 0 || authority.limitTokens > REPOSITORY_CAMPAIGN_BUDGET_CAP_TOKENS ||
 			![authority.committedMicros, authority.committedTokens].every((n) => Number.isSafeInteger(n) && n >= 0)) throw new Error("authoritative Fleet budget is unavailable")
+		if (authority.mode === "fleet-v2" && (!Number.isSafeInteger(authority.asOfMs) || Date.now() - Number(authority.asOfMs) > 60_000 || Number(authority.asOfMs) > Date.now() + 60_000 ||
+			!Number.isSafeInteger(authority.controlEpoch) || Number(authority.controlEpoch) < 0 || !Number.isSafeInteger(authority.repositoryEpoch) || Number(authority.repositoryEpoch) < 0 ||
+			authority.campaignId !== "fleet-security-watch" || !authority.runId || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(authority.runId) ||
+			!Number.isSafeInteger(authority.runExpiresAtMs) || Number(authority.asOfMs) >= Number(authority.runExpiresAtMs) ||
+			Date.now() >= Number(authority.runExpiresAtMs) || !authority.repositoryCampaignId || !authority.repositoryId ||
+			!authority.repository || !authority.sourceRevision || !authority.policySha256 || !authority.model || !authority.profileId ||
+			typeof authority.globalEnabled !== "boolean" || typeof authority.canAdmit !== "boolean" || typeof authority.repositoryEnabled !== "boolean" ||
+			!authority.monthly || !authority.campaignLifetime || !authority.legacyLifetime || !authority.repositoryLifetime ||
+			!validMonthlySnapshot(authority.monthly) || !validLifetimeSnapshot(authority.campaignLifetime, REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS, REPOSITORY_CAMPAIGN_BUDGET_CAP_TOKENS) ||
+			!validLifetimeSnapshot(authority.legacyLifetime) || !validLifetimeSnapshot(authority.repositoryLifetime, undefined, undefined, true) ||
+			!validId(authority.repositoryId) || !/^[A-Za-z0-9_.-]{1,39}\/[A-Za-z0-9_.-]{1,100}$/.test(authority.repository) ||
+			!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(authority.sourceRevision) || !/^[a-f0-9]{64}$/.test(authority.policySha256) ||
+			!validId(authority.profileId) ||
+			authority.limitMicros !== REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS || authority.limitTokens !== REPOSITORY_CAMPAIGN_BUDGET_CAP_TOKENS ||
+			authority.committedMicros !== authority.legacyLifetime.settledMicros + authority.legacyLifetime.reservedMicros + authority.legacyLifetime.ambiguousMicros ||
+			authority.committedTokens !== authority.legacyLifetime.settledTokens + authority.legacyLifetime.reservedTokens + authority.legacyLifetime.ambiguousTokens ||
+			authority.available !== (authority.globalEnabled === true && authority.canAdmit === true && authority.repositoryEnabled === true &&
+				authority.monthly.settledMicros + authority.monthly.reservedMicros + authority.monthly.ambiguousMicros < authority.monthly.limitMicros &&
+				authority.campaignLifetime.settledMicros + authority.campaignLifetime.reservedMicros + authority.campaignLifetime.ambiguousMicros < authority.limitMicros &&
+				authority.campaignLifetime.settledTokens + authority.campaignLifetime.reservedTokens + authority.campaignLifetime.ambiguousTokens < authority.limitTokens &&
+				authority.repositoryLifetime.settledMicros + authority.repositoryLifetime.reservedMicros + authority.repositoryLifetime.ambiguousMicros < authority.repositoryLifetime.limitMicros &&
+				authority.repositoryLifetime.settledTokens + authority.repositoryLifetime.reservedTokens + authority.repositoryLifetime.ambiguousTokens < authority.repositoryLifetime.limitTokens) ||
+			campaignId !== undefined && (authority.repositoryCampaignId !== campaignId || authority.sourceRevision !== this.requireDefinition(campaignId).sourceRevision ||
+				authority.model !== this.requireDefinition(campaignId).model))) {
+			throw new Error("Fleet v2 repository budget snapshot is invalid")
+		}
 		return authority
 	}
 	private campaign(s: CampaignState, id: string): CampaignRecord {
