@@ -36,13 +36,15 @@ import { loadBenchmark } from "./benchmark/runner.js"
 import { openRouterAllocatedEnvironment, openRouterBrokerLimitsFromEnvironment, openRouterCampaignBudgetAllocation, openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID } from "./inference-broker.js"
 import type { OpenRouterDenialSummary, OpenRouterEndpointPriceSnapshot } from "./inference-broker.js"
 import { candidateProofDecision, compareDevelopmentAttempts, developmentCells, freezeDevelopmentProofProtocol } from "./development-proof.js"
-import type { DevelopmentTaskCell } from "./development-proof.js"
+import type { DevelopmentProofProtocol, DevelopmentTaskCell } from "./development-proof.js"
 import type { BenchmarkAttempt } from "./benchmark/types.js"
 import type { BenchmarkManifest } from "./benchmark/types.js"
 import { runDevelopmentBenchmarkForCommit } from "./development-benchmark.js"
 import { loadBoundProofBenchmarkFixtures } from "./benchmark/proof-fixtures.js"
 import { workerHarnessConfigDigest, workerHarnessRuntimeIdentityFromEnvironment, validWorkerHarnessRuntimeIdentity, effectiveWorkerHarnessMode } from "./worker-harness.js"
 import { workerHarnessCliPath } from "./worker-harness.js"
+import { assertMutationAllowlist } from "./mutation-allowlist.js"
+import { FLEET_BUDGET_CAMPAIGN_ID } from "./fleet-budget-ledger.js"
 import { PostgresProofCampaign, proofCampaignManifestDigest, type ProofCampaignArmLease, type ProofCampaignManifest } from "./proof-campaign.js"
 import { runProofConfirmation } from "./proof-confirmation.js"
 import { loadHiddenVerifierConfig } from "./hidden-config.js"
@@ -59,6 +61,7 @@ import {
 	signEvaluatorIntegrity,
 	verifyEvaluatorIntegrity,
 	writeEvaluatorIntegrityManifest,
+	evaluatorGenerationDecisionDigest,
 } from "./evaluation-integrity.js"
 import type { EvaluatorIntegrityPayload, EvaluatorIntegrityTrust } from "./evaluation-integrity.js"
 
@@ -366,6 +369,20 @@ async function captureCandidate(
 }
 
 export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverride?: PostgresRsiJobQueue): Promise<RsiRunRecord> {
+	if (config.campaignScopedEvaluation) {
+		const campaign = config.campaignScopedEvaluation
+		if (!/^[a-f0-9]{64}$/.test(campaign.planDigest) || !/^[a-f0-9]{64}$/.test(campaign.fixtureDigest) || !/^[a-f0-9]{64}$/.test(campaign.evaluatorDigest)
+			|| !validWorkerHarnessRuntimeIdentity(campaign.runtime)
+			|| !["intake-parsing", "deduplication", "evidence-validation", "reporting"].includes(campaign.objective)
+			|| campaign.typecheckCommand !== "python3 -c \"compile(open('candidate.py').read(), 'candidate.py', 'exec')\""
+			|| config.population !== 1 || config.generations !== 1 || config.maxIterations !== 3 || config.maxConcurrent !== 1
+			|| !config.allowedMutationPaths || config.allowedMutationPaths.length !== 1
+			|| config.hiddenEvalCommands.length !== 0 || config.hiddenSuitePath || config.workerHarnessPairId || config.workerHarnessMode
+			|| config.roles?.adversary || config.computePolicy === "adaptive-independent"
+			|| !Number.isSafeInteger(config.maxRuntimeMs) || config.maxRuntimeMs! < 1 || config.maxRuntimeMs! > 300_000) {
+			throw new Error("campaign-scoped RSI requires one fixed candidate, paired visible evaluation, exact mutation scope, and bounded runtime")
+		}
+	}
 	if (config.computePolicy === "adaptive-independent") {
 		const trajectoryLimit = config.maxTrajectories ?? config.population + 1
 		const iterationLimit = config.maxTotalIterations ?? trajectoryLimit * config.maxIterations
@@ -393,6 +410,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	if (resumed && config.workerHarnessRunId && resumed.runId !== config.workerHarnessRunId) throw new Error("worker harness deterministic run identity differs from the resumed archive record")
 	const baseCommit = resumed?.baseCommit ?? (await resolveBaseCommit(config))
 	const run = resumed ?? initialRun({ ...config, model: workerModel, roles }, baseCommit, now())
+	if (resumed && JSON.stringify(resumed.campaignScopedEvaluation ?? null) !== JSON.stringify(config.campaignScopedEvaluation ? { ...config.campaignScopedEvaluation, eligibility: "paired-evaluation-only" } : null)) throw new Error("campaign-scoped evaluator identity differs from the durable run manifest")
 	if (resumed && resumed.candidateIdNamespace !== undefined && resumed.candidateIdNamespace !== run.runId.slice(-8)) {
 		throw new Error("candidate branch namespace differs from the durable run identity")
 	}
@@ -477,7 +495,9 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	await emitPreparationReceipt("fixture-validation", "started")
 	let loadedProofBenchmark: { manifest: BenchmarkManifest; manifestDigest: string }
 	try {
-		loadedProofBenchmark = config.proofBenchmarkFixtures
+		loadedProofBenchmark = config.campaignScopedEvaluation
+			? { manifest: { schemaVersion: 1, runnerVersion: "campaign-scoped-no-development-proof", createdFromCommit: baseCommit, tasks: [] }, manifestDigest: config.campaignScopedEvaluation.fixtureDigest }
+			: config.proofBenchmarkFixtures
 			? await loadBoundProofBenchmarkFixtures(config.proofBenchmarkFixtures, config.repoRoot)
 			: hooks.runDevelopmentBenchmark
 				? await fs.readFile(path.join(proofFixturesRoot, "manifest.json"), "utf8").then((rawManifest) => ({ manifest: JSON.parse(rawManifest) as BenchmarkManifest, manifestDigest: createHash("sha256").update(rawManifest).digest("hex") }))
@@ -488,12 +508,10 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	}
 	await emitPreparationReceipt("fixture-validation", "completed", loadedProofBenchmark.manifestDigest)
 	await emitPreparationReceipt("proof-protocol", "started", loadedProofBenchmark.manifestDigest)
-	const proofProtocol = freezeDevelopmentProofProtocol(
-		loadedProofBenchmark.manifest,
-		loadedProofBenchmark.manifestDigest,
-		{ provider: workerProvider, id: workerModel, sampling: { temperature: 0, think: false, seed: "provider-default" }, ...(workerOpenRouterProfile && workerOpenRouterProfile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { profileId: workerOpenRouterProfile.id } : {}) },
-		config.developmentProofRule,
-	)
+	const protocolModel = { provider: workerProvider, id: workerModel, sampling: { temperature: 0, think: false, seed: "provider-default" }, ...(workerOpenRouterProfile && workerOpenRouterProfile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { profileId: workerOpenRouterProfile.id } : {}) }
+	const proofProtocol: DevelopmentProofProtocol = config.campaignScopedEvaluation
+		? { schemaVersion: 1, manifestDigest: config.campaignScopedEvaluation.fixtureDigest, taskSetDigest: config.campaignScopedEvaluation.fixtureDigest, taskIds: [], taskIdentities: [], model: protocolModel, rule: { minimumNetWins: 1, retentionTaskIds: [], maximumMeanTokenIncreaseRatio: 1 }, protocolDigest: config.campaignScopedEvaluation.planDigest }
+		: freezeDevelopmentProofProtocol(loadedProofBenchmark.manifest, loadedProofBenchmark.manifestDigest, protocolModel, config.developmentProofRule)
 	await emitPreparationReceipt("proof-protocol", "completed", loadedProofBenchmark.manifestDigest)
 	const plannedGenerations = resumed?.workerHarnessPlannedGenerations ?? stageCount
 	if (resumed && (config.workerHarnessMode !== undefined || run.workerHarnessPairId !== undefined) && stageCount !== plannedGenerations) {
@@ -528,9 +546,11 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 	run.workerHarnessPlannedGenerations ??= plannedGenerations
 	run.workerHarnessSamplingSeed = config.seed
 	if (workerHarnessRuntime) run.workerHarnessRuntime = workerHarnessRuntime
-	if (resumed && !resumed.developmentProofProtocol) throw new Error("cannot resume an RSI run without its frozen development proof protocol")
-	if (resumed && resumed.developmentProofProtocol?.protocolDigest !== proofProtocol.protocolDigest) throw new Error("development proof protocol differs from the frozen protocol on this run")
-	run.developmentProofProtocol ??= proofProtocol
+	if (!config.campaignScopedEvaluation) {
+		if (resumed && !resumed.developmentProofProtocol) throw new Error("cannot resume an RSI run without its frozen development proof protocol")
+		if (resumed && resumed.developmentProofProtocol?.protocolDigest !== proofProtocol.protocolDigest) throw new Error("development proof protocol differs from the frozen protocol on this run")
+		run.developmentProofProtocol ??= proofProtocol
+	} else if (resumed?.developmentProofProtocol) throw new Error("campaign-scoped run cannot resume with a generic HCL development proof record")
 	const integrityTrust = await loadEvaluatorIntegrityTrust(runConfig)
 	const attestedRun = !config.dryRun && !!(config.workerHarnessPairId || config.workerHarnessMode || config.workerHarnessEngineeringOnly || config.hiddenSuitePath || config.hiddenEvalCommands.length || roles?.adversary)
 	if (attestedRun && !integrityTrust) throw new Error("paired proof, hidden-evaluator, and adversarial qualification runs require independently pinned evaluator integrity trust")
@@ -833,7 +853,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 					const remainingCampaignMs = campaignLease ? Math.max(1, Date.parse(campaignLease.deadlineAt) - Date.now()) : undefined
 					const attemptKey = key
 					const payload = fleetPayload(runConfig, candidate, snapshot, {
-						campaignId: campaignLease ? proofBrokerCampaignId(campaignLease.campaignId, "mutation") : run.runId, boundedInference: true, includeWorkerHarness: true, remainingCampaignMs,
+						campaignId: campaignLease ? proofBrokerCampaignId(campaignLease.campaignId, "mutation") : runConfig.campaignScopedEvaluation ? FLEET_BUDGET_CAMPAIGN_ID : run.runId, boundedInference: true, includeWorkerHarness: true, remainingCampaignMs,
 						...(campaignLease ? { proofCampaign: { campaignId: campaignLease.campaignId, armId: campaignLease.armId, epoch: campaignLease.epoch, manifestSha256: campaignLease.manifestSha256, cells: [{ attemptKey, slotId, attemptKind: "mutation" as const }] } } : {}),
 					})
 					payload.snapshotSha256 = artifact.sha256
@@ -873,6 +893,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 						if (patch.byteLength !== result.patchBytes || appliedPatch.byteLength !== result.patchBytes || createHash("sha256").update(appliedPatch).digest("hex") !== result.patchSha256) {
 							throw new Error("candidate worktree commit does not match the completed fleet mutation patch")
 						}
+						if (runConfig.allowedMutationPaths) await assertMutationAllowlist(candidate.worktree, candidate.baseCommit, runConfig.allowedMutationPaths)
 						let recorded = run.jobs.find((entry) => entry.candidateId === candidate.id && entry.kind === "mutation")
 						if (!recorded) {
 							recorded = newExperimentJob("mutation", mutationResource, now(), candidate.id)
@@ -934,6 +955,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 						const patch = await fleetQueue.getArtifact(result.patchSha256)
 						if (patch.byteLength !== result.patchBytes) throw new Error("fleet mutation patch length did not match result metadata")
 						applyFleetMutationPatch(patch, candidate, runConfig)
+						if (runConfig.allowedMutationPaths) await assertMutationAllowlist(candidate.worktree, candidate.baseCommit, runConfig.allowedMutationPaths)
 					} else {
 					await createCandidateWorktree(runConfig, candidate)
 					managedWorktrees.add(candidate.id)
@@ -1069,7 +1091,12 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 					: "baseline"
 				validateCandidateParent(candidate, run, config, proofProtocol)
 				let campaignDependentAttemptKeys: string[] = []
-				if (Object.values(candidate.fitness.hardGates).some((passed) => passed === false)) {
+				if (runConfig.campaignScopedEvaluation) {
+					// This mode is a paired visible-fixture comparison only. It must never
+					// dispatch or claim the generic HCL development benchmark protocol.
+					const hardGatesPassed = Object.values(candidate.fitness.hardGates).every((passed) => passed !== false)
+					candidate.status = hardGatesPassed && candidate.fitness.score > 0 && candidate.pairedComparison?.improved === true ? "accepted" : "rejected"
+				} else if (Object.values(candidate.fitness.hardGates).some((passed) => passed === false)) {
 					const empty: DevelopmentTaskCell[] = []
 					const immediateParent = compareDevelopmentAttempts({ protocol: proofProtocol, childCommit, referenceCommit: parentCommit, referenceKind: "immediate-parent", child: empty, reference: empty })
 					const originalBase = compareDevelopmentAttempts({ protocol: proofProtocol, childCommit, referenceCommit: run.baseCommit, referenceKind: "original-base", child: empty, reference: empty })
@@ -1106,7 +1133,7 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 						...rootCells.map((cell) => `development:${slotId}:base:${cell.attemptId}`),
 					]
 				}
-				candidate.status = candidate.fitness.score > 0 && candidate.developmentProof.accepted ? "accepted" : "rejected"
+				if (!runConfig.campaignScopedEvaluation) candidate.status = candidate.fitness.score > 0 && candidate.developmentProof?.accepted === true ? "accepted" : "rejected"
 				if (campaignStore && campaignLease) {
 					const slotId = proofCandidateSlot(candidate.generation, candidates.indexOf(candidate))
 					const verificationKeys = ["regression", "typecheck", ...config.evalCommands.map((_, index) => `visible-${index}`)].map((taskId) => `${run.runId}:${candidate.id}:evaluation:${taskId}`)
@@ -1212,13 +1239,23 @@ export async function runRsi(config: RsiConfig, hooks: RsiHooks = {}, queueOverr
 			}
 		}
 
-		const selection = selectGenerationCandidates({
+		const measuredSelection = selectGenerationCandidates({
 			candidates,
 			generation,
 			adversarialReviews: run.adversarialReviews ?? [],
 		})
+		const selection = runConfig.campaignScopedEvaluation
+			? {
+				...measuredSelection,
+				selectedCandidates: [] as string[],
+				selected: undefined,
+				front: [],
+				selection: { generation, selectedCandidateIds: [], decisionsSha256: evaluatorGenerationDecisionDigest(candidates, run.adversarialReviews ?? [], undefined) },
+			}
+			: measuredSelection
 		run.selectedCandidates = selection.selectedCandidates
 		if (selection.selected !== undefined) run.selected = selection.selected
+		else delete run.selected
 		const integrityRecord = run.evaluatorIntegrity!
 		const previousGeneration = integrityRecord.generations.find((entry) => entry.generation === generation)
 		const sealed = previousGeneration

@@ -37,6 +37,8 @@ import {
 	buildSystemPrompt,
 	loadCustomModes,
 	selectToolsForMode,
+	selectCampaignMutationTools,
+	CAMPAIGN_MUTATION_SYSTEM_PROMPT,
 } from "./engine/prompt.js"
 import { orchestrateMain } from "./orchestrator/cli.js"
 import { watchMain } from "./watcher/cli.js"
@@ -807,6 +809,10 @@ export async function main(argv: string[] = process.argv.slice(2), hooks?: CliRu
 	if (argv[0] === "control") {
 		const { controlMain } = await import("./control/cli.js")
 		return controlMain(argv.slice(1))
+	}
+	if (argv[0] === "campaign") {
+		const { campaignMain } = await import("./campaigncontrol/cli.js")
+		return campaignMain(argv.slice(1))
 	}
 	if (argv[0] === "openshell-review-session" || argv[0] === "openshell-qa-session") {
 		let payload: Record<string, unknown>
@@ -1659,6 +1665,11 @@ export async function main(argv: string[] = process.argv.slice(2), hooks?: CliRu
 	try {
 		const session = new HeadlessSession({
 			workspaceRoot,
+			...(process.env.HEADLESSCODE_RSI_CAMPAIGN_MUTATION === "1" ? {
+				tools: selectCampaignMutationTools(options.mode ?? "code"),
+				toolAllowlist: ["read_file", "write_to_file", "execute_command", "attempt_completion"],
+				systemPromptOverride: CAMPAIGN_MUTATION_SYSTEM_PROMPT,
+			} : {}),
 			sessionId: options.sessionId,
 			mode: options.mode,
 			model: effectiveModel,

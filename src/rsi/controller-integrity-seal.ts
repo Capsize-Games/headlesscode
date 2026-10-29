@@ -168,9 +168,11 @@ export async function buildEvaluatorIntegrityInput(args: {
 			mutationKind: config.mutationKind ?? "corrective",
 			hypothesis: config.hypothesis ?? null,
 			protectedPaths: [...config.protectedPaths].sort(),
+			allowedMutationPaths: [...(config.allowedMutationPaths ?? [])].sort(),
+			campaignScopedEvaluation: config.campaignScopedEvaluation ?? null,
 			parentSelectionPolicy: config.parentSelectionPolicy ?? "champion-specialist-novelty",
 			developmentProofRule: config.developmentProofRule ?? null,
-			developmentProofProtocolSha256: args.proofProtocol.protocolDigest,
+			developmentProofProtocolSha256: config.campaignScopedEvaluation ? null : args.proofProtocol.protocolDigest,
 			workerHarness: {
 				mode: args.run.workerHarnessMode ?? "fixed-control",
 				pairId: args.run.workerHarnessPairId ?? null,

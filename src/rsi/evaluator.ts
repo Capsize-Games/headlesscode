@@ -55,7 +55,8 @@ export async function evaluateCandidate(
 		}
 	}
 	const regression = await isolatedRunner(config.regressionCommand, candidateRoot, config.commandTimeoutMs)
-	const typecheck = await isolatedRunner("npm run typecheck", candidateRoot, config.commandTimeoutMs)
+	const typecheckCommand = config.campaignScopedEvaluation?.typecheckCommand ?? "npm run typecheck"
+	const typecheck = await isolatedRunner(typecheckCommand, candidateRoot, config.commandTimeoutMs)
 	const visible: TrialResult[] = []
 	for (const command of config.evalCommands) {
 		visible.push(await isolatedRunner(command, candidateRoot, config.commandTimeoutMs))

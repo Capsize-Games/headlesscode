@@ -855,6 +855,21 @@ export function selectToolsForMode(mode: string, customModes: ModeConfig[] = [])
 	return selected
 }
 
+/** Existing, narrow read/edit/run tools needed by the fixed one-file campaign fixture. */
+export const CAMPAIGN_MUTATION_TOOL_NAMES = ["read_file", "write_to_file", "execute_command", "attempt_completion"] as const
+
+export const CAMPAIGN_MUTATION_SYSTEM_PROMPT = [
+	"You are a coding worker in a bounded synthetic fixture. Follow the task exactly.",
+	"Only inspect and edit candidate.py. Make a focused change for the stated ordinary parsing/deduplication/recovery/reporting behavior. Do not modify tests, policy, configuration, dependencies, or other files.",
+	"Do not run tests or contact network services. Use the provided file tools and execute_command only to inspect files and commit the candidate.py change. Do not claim results you did not verify.",
+	"When the change is committed, call attempt_completion with a short factual summary. If the task cannot be completed within scope, stop and explain why.",
+].join("\n\n")
+
+export function selectCampaignMutationTools(mode = "code"): ChatTool[] {
+	const allowed = new Set<string>(CAMPAIGN_MUTATION_TOOL_NAMES)
+	return selectToolsForMode(mode, []).filter((tool) => tool.type === "function" && allowed.has(tool.function.name))
+}
+
 /**
 	* Append the `browser_action` tool schema to a tool list if it isn't already
 	* present. `browser_action` is NOT a vendored Zoo Code tool (it's new work —

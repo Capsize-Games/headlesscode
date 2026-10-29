@@ -78,9 +78,11 @@ export function fleetPayload(config: RsiConfig, candidate: CandidateRecord, snap
 		...(options.proofCampaign ? { proofCampaign: options.proofCampaign } : {}),
 		...(inferenceLimits ? { inferenceLimits } : {}),
 		...(options.evaluatorRuntime ? { evaluatorRuntime: { ...options.evaluatorRuntime } } : {}),
+		...(config.campaignScopedEvaluation ? { campaignScopedEvaluation: { ...config.campaignScopedEvaluation } } : {}),
 		maxIterations: config.maxIterations,
 		timeoutMs: config.commandTimeoutMs,
 		protectedPaths: config.protectedPaths,
+		...(config.allowedMutationPaths ? { allowedMutationPaths: [...config.allowedMutationPaths] } : {}),
 		candidate: {
 			id: candidate.id, generation: candidate.generation, parent: candidate.parent,
 			...(config.workerHarnessMode && options.includeWorkerHarness ? { baseCommit: candidate.baseCommit } : {}),

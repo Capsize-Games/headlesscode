@@ -117,12 +117,22 @@ export interface FleetJobPayload {
 	openRouterProfile?: RsiOpenRouterProfileId
 	proofCampaign?: { campaignId: string; armId: string; epoch: number; manifestSha256: string; cells: Array<{ attemptKey: string; slotId: string; attemptKind: "mutation" | "verification" }> }
 	evaluatorRuntime?: { imageDigest: string; policySha256: string }
+	/** Fixed paired synthetic campaign evaluation; preserved over queue serialization. */
+	campaignScopedEvaluation?: {
+		planDigest: string
+		fixtureDigest: string
+		evaluatorDigest: string
+		runtime: WorkerHarnessRuntimeIdentity
+		objective: "intake-parsing" | "deduplication" | "evidence-validation" | "reporting"
+		typecheckCommand: string
+	}
 	/** Supervisor-authored adversarial artifacts, bound to the immutable snapshot. */
 	adversarialEvaluation?: { testsSha256: string; runnerSha256: string }
 	inferenceLimits?: OpenRouterBrokerLimits
 	maxIterations: number
 	timeoutMs: number
 	protectedPaths: string[]
+	allowedMutationPaths?: string[]
 	candidate: Record<string, unknown>
 	regressionCommand?: string
 	evalCommands?: string[]

@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { networkInterfaces } from "node:os"
 import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises"
 import * as path from "node:path"
+import { CAMPAIGN_MUTATION_TOOL_NAMES } from "../engine/prompt.js"
 
 export const RSI_OPENROUTER_MODEL = "deepseek/deepseek-v4-flash-0731"
 export const RSI_OPENROUTER_ENDPOINT_PROVIDER = "deepinfra"
@@ -74,6 +75,8 @@ export interface OpenRouterBrokerGrant {
 	leaseToken: string
 	capability: string
 	model: string
+	/** SHA-256 of the exact host API key selected for this broker; never the key itself. */
+	apiKeyIdentity?: string
 	profileId?: RsiOpenRouterProfileId
 	endpointPrice?: OpenRouterEndpointPriceSnapshot
 	limits: OpenRouterBrokerLimits
@@ -256,12 +259,13 @@ export class FileOpenRouterInferenceLedger implements OpenRouterInferenceLedger 
 		const profile = grantProfile(grant)
 		const priceIdentity = profile.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? undefined : grant.endpointPrice && endpointPriceIdentity(grant.endpointPrice)
 		if (profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID && !priceIdentity) throw new Error("Muse OpenRouter grant is missing its admitted endpoint-price snapshot")
-		const fingerprint = { campaignId: grant.limits.campaignId, model: grant.model, ...profileReceiptIdentity(profile), ...(priceIdentity ? { endpointPrice: priceIdentity } : {}), limits: grant.limits }
+		const fingerprint = { campaignId: grant.limits.campaignId, model: grant.model, ...(grant.apiKeyIdentity ? { apiKeyIdentity: grant.apiKeyIdentity } : {}), ...profileReceiptIdentity(profile), ...(priceIdentity ? { endpointPrice: priceIdentity } : {}), limits: grant.limits }
 		return this.locked((state) => {
 			const current = state.jobs[grant.jobId]
 			const currentFingerprint = current && {
 				campaignId: current.grant.limits.campaignId,
 				model: current.grant.model,
+				...(current.grant.apiKeyIdentity ? { apiKeyIdentity: current.grant.apiKeyIdentity } : {}),
 				...(current.grant.profileId ? { profileId: current.grant.profileId } : {}),
 				...(current.grant.endpointPrice ? { endpointPrice: endpointPriceIdentity(current.grant.endpointPrice) } : {}),
 				limits: current.grant.limits,
@@ -272,7 +276,9 @@ export class FileOpenRouterInferenceLedger implements OpenRouterInferenceLedger 
 			if (campaign && campaign.maxSpendUsd !== grant.limits.maxCampaignSpendUsd) throw new Error("OpenRouter file ledger campaign cap differs from prior accounting")
 			state.campaigns[grant.limits.campaignId] ??= { maxSpendUsd: grant.limits.maxCampaignSpendUsd, spentUsd: 0, reservedUsd: 0, blocked: false }
 			const deadlineAtMs = current?.deadlineAtMs ?? (grant.issuedAtMs ?? Date.now()) + grant.limits.maxDurationMs
-			const persistedGrant = current?.grant ?? { campaignId: grant.limits.campaignId, model: grant.model, ...profileReceiptIdentity(profile), ...(grant.endpointPrice ? { endpointPrice: grant.endpointPrice } : {}), limits: grant.limits }
+			const persistedGrant = current?.grant ?? { campaignId: grant.limits.campaignId, model: grant.model,
+				...(grant.apiKeyIdentity ? { apiKeyIdentity: grant.apiKeyIdentity } : {}),
+				...profileReceiptIdentity(profile), ...(grant.endpointPrice ? { endpointPrice: grant.endpointPrice } : {}), limits: grant.limits }
 			state.jobs[grant.jobId] = current ?? { grant: persistedGrant, capabilitySha256: sha256(grant.capability), leaseSha256: sha256(grant.leaseToken), blocked: false, deadlineAtMs, reservations: [] }
 			if (current) {
 				current.capabilitySha256 = sha256(grant.capability)
@@ -384,6 +390,8 @@ export interface OpenRouterBrokerOptions {
 	leaseToken: string
 	model?: string
 	profileId?: RsiOpenRouterProfileId
+	/** Enforce the fixed four-tool campaign mutation contract before reservation or upstream POST. */
+	campaignMutationOnly?: boolean
 	limits: OpenRouterBrokerLimits
 	apiKey: string
 	ledger: OpenRouterInferenceLedger
@@ -543,7 +551,7 @@ async function readResponse(response: Response, maximumBytes: number): Promise<B
 	return Buffer.concat(chunks, size)
 }
 
-function parseUsage(body: Buffer, contentType: string): { model?: string; provider?: string; id?: string; promptTokens?: number; cachedPromptTokens?: number; completionTokens?: number; costUsd?: number } {
+function parseUsage(body: Buffer, contentType: string): { model?: string; provider?: string; id?: string; promptTokens?: number; cachedPromptTokens?: number; completionTokens?: number; costUsd?: number; refusal?: boolean } {
 	let values: Array<Record<string, unknown>> = []
 	if (contentType.includes("text/event-stream")) {
 		for (const line of body.toString("utf8").split(/\r?\n/)) {
@@ -562,9 +570,24 @@ function parseUsage(body: Buffer, contentType: string): { model?: string; provid
 	let cachedPromptTokens: number | undefined
 	let completionTokens: number | undefined
 	let costUsd: number | undefined
+	let refusal = false
 	for (const item of values) {
 		if (typeof item.model === "string") model = item.model
 		if (typeof item.id === "string") id = item.id
+		if (Array.isArray(item.choices)) {
+			for (const choice of item.choices) {
+				if (!choice || typeof choice !== "object" || Array.isArray(choice)) continue
+				const row = choice as Record<string, unknown>
+				if (row.finish_reason === "content_filter") refusal = true
+				for (const field of ["message", "delta"]) {
+					const content = row[field]
+					if (content && typeof content === "object" && !Array.isArray(content)) {
+						const refusalText = (content as Record<string, unknown>).refusal
+						if (typeof refusalText === "string" && refusalText.trim().length > 0) refusal = true
+					}
+				}
+			}
+		}
 		const metadata = item.openrouter_metadata
 		if (metadata && typeof metadata === "object" && !Array.isArray(metadata)) {
 			const endpoints = (metadata as Record<string, unknown>).endpoints
@@ -586,7 +609,7 @@ function parseUsage(body: Buffer, contentType: string): { model?: string; provid
 		if (Number.isSafeInteger(row.completion_tokens) && Number(row.completion_tokens) >= 0) completionTokens = Number(row.completion_tokens)
 		if (typeof row.cost === "number" && Number.isFinite(row.cost) && row.cost >= 0) costUsd = row.cost
 	}
-	return { ...(model ? { model } : {}), ...(provider ? { provider } : {}), ...(id ? { id } : {}), ...(promptTokens !== undefined ? { promptTokens } : {}), ...(cachedPromptTokens !== undefined ? { cachedPromptTokens } : {}), ...(completionTokens !== undefined ? { completionTokens } : {}), ...(costUsd !== undefined ? { costUsd } : {}) }
+	return { ...(model ? { model } : {}), ...(provider ? { provider } : {}), ...(id ? { id } : {}), ...(promptTokens !== undefined ? { promptTokens } : {}), ...(cachedPromptTokens !== undefined ? { cachedPromptTokens } : {}), ...(completionTokens !== undefined ? { completionTokens } : {}), ...(costUsd !== undefined ? { costUsd } : {}), ...(refusal ? { refusal: true } : {}) }
 }
 
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
@@ -603,7 +626,7 @@ function capabilityMatches(header: string | undefined, capability: string): bool
 	return timingSafeEqual(actual, expected)
 }
 
-function validateRequestBody(body: Buffer, limits: OpenRouterBrokerLimits, profile: RsiOpenRouterProfile, cacheRoutingKey: string): { encodedBody: Buffer; outputLimit: number } {
+function validateRequestBody(body: Buffer, limits: OpenRouterBrokerLimits, profile: RsiOpenRouterProfile, cacheRoutingKey: string, campaignMutationOnly = false): { encodedBody: Buffer; outputLimit: number } {
 	let parsed: unknown
 	try { parsed = JSON.parse(body.toString("utf8")) } catch { throw new Error("request JSON is malformed") }
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("request must be a JSON object")
@@ -611,6 +634,19 @@ function validateRequestBody(body: Buffer, limits: OpenRouterBrokerLimits, profi
 	const allowed = new Set(["model", "messages", "tools", "tool_choice", "temperature", "max_tokens", "max_completion_tokens", "stream", "stream_options", "provider", "include_reasoning", "reasoning", "session_id", "prompt_cache_key"])
 	for (const key of Object.keys(value)) if (!allowed.has(key)) throw new Error(`request field is not admitted: ${key}`)
 	if (value.model !== profile.model) throw new Error("request model is not admitted for this job")
+	if (campaignMutationOnly) {
+		const tools = value.tools
+		const names = Array.isArray(tools) ? tools.map((tool) => {
+			if (!tool || typeof tool !== "object" || Array.isArray(tool)) return ""
+			const fn = (tool as Record<string, unknown>).function
+			return fn && typeof fn === "object" && !Array.isArray(fn) && typeof (fn as Record<string, unknown>).name === "string"
+				? (fn as Record<string, unknown>).name as string : ""
+		}) : []
+		const allowed = new Set<string>(CAMPAIGN_MUTATION_TOOL_NAMES)
+		if (names.length > allowed.size || names.some((name) => !allowed.has(name)) || new Set(names).size !== names.length) {
+			throw new Error("campaign mutation request tools exceed the fixed four-tool ceiling")
+		}
+	}
 	if (!Array.isArray(value.messages) || value.messages.length < 1) throw new Error("request messages are malformed")
 	for (const message of value.messages) {
 		if (!message || typeof message !== "object" || Array.isArray(message)) throw new Error("request message is malformed")
@@ -721,7 +757,10 @@ export async function startOpenRouterBroker(options: OpenRouterBrokerOptions): P
 	const endpointPrice = await verifyPinnedPriceCeiling(upstreamFetch, options.apiKey, limits, profile)
 	if (!options.bindHost || options.bindHost === "0.0.0.0" || options.bindHost === "::" || !isHostInterfaceAddress(options.bindHost)) throw new Error("OpenRouter broker requires an address assigned to a host interface; wildcard or non-local listeners are disabled")
 	const issuedAtMs = now()
-	const grant: OpenRouterBrokerGrant = { jobId: options.jobId, leaseToken: options.leaseToken, capability, model, ...profileReceiptIdentity(profile), ...(profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { endpointPrice } : {}), limits, issuedAtMs }
+		const keyBoundLedger = (options.ledger as OpenRouterInferenceLedger & { requiresHostApiKeyIdentity?: boolean }).requiresHostApiKeyIdentity === true
+		const grant: OpenRouterBrokerGrant = { jobId: options.jobId, leaseToken: options.leaseToken, capability, model,
+			...(keyBoundLedger ? { apiKeyIdentity: createHash("sha256").update(options.apiKey).digest("hex") } : {}),
+			...profileReceiptIdentity(profile), ...(profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { endpointPrice } : {}), limits, issuedAtMs }
 	const jobDeadlineAtMs = await options.ledger.register(grant)
 	if (!Number.isFinite(jobDeadlineAtMs) || jobDeadlineAtMs <= now()) throw new Error("OpenRouter job duration limit exhausted")
 	let closing = false
@@ -755,7 +794,7 @@ export async function startOpenRouterBroker(options: OpenRouterBrokerOptions): P
 			try {
 				rawBody = await readBody(request, limits.maxRequestBytes)
 				requestBytes = rawBody.byteLength
-				checked = validateRequestBody(rawBody, limits, profile, cacheRoutingKey)
+				checked = validateRequestBody(rawBody, limits, profile, cacheRoutingKey, options.campaignMutationOnly === true)
 			} catch (error) {
 				const message = error instanceof Error ? error.message : "invalid request"
 				const limited = /exceeds|too large|byte bound/i.test(message)
@@ -797,9 +836,11 @@ export async function startOpenRouterBroker(options: OpenRouterBrokerOptions): P
 			const contentType = upstream.headers.get("content-type") ?? "application/json"
 			const usage = upstream.ok ? parseUsage(upstreamBody, contentType) : {}
 			const measurable = usage.promptTokens !== undefined && usage.completionTokens !== undefined && usage.costUsd !== undefined && usage.provider !== undefined && (usage.cachedPromptTokens === undefined || usage.cachedPromptTokens <= usage.promptTokens)
-			if (!upstream.ok || !measurable) {
+			if (!upstream.ok || !measurable || usage.refusal === true) {
 				await options.ledger.settle(grant, { callId, state: "unmeasured", ...(usage.model ? { returnedModel: usage.model } : {}), ...(usage.provider ? { returnedProvider: usage.provider } : {}), ...(usage.id ? { providerRequestId: usage.id } : {}), ...(usage.promptTokens !== undefined ? { promptTokens: usage.promptTokens } : {}), ...(usage.cachedPromptTokens !== undefined ? { cachedPromptTokens: usage.cachedPromptTokens } : {}), ...(usage.completionTokens !== undefined ? { completionTokens: usage.completionTokens } : {}), ...(usage.costUsd !== undefined ? { costUsd: usage.costUsd } : {}), responseSha256: sha256(upstreamBody), completedAt: new Date(now()).toISOString() }).catch(() => undefined)
-				await deny(502, "usage-unverifiable", "upstream response lacks verifiable usage or selected endpoint metadata; request is unqualified"); return
+				await deny(502, "usage-unverifiable", usage.refusal === true
+					? "upstream returned a refusal or content filter; request is unqualified"
+					: "upstream response lacks verifiable usage or selected endpoint metadata; request is unqualified"); return
 			}
 			const promptTokens = usage.promptTokens!
 			const completionTokens = usage.completionTokens!

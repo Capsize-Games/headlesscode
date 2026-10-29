@@ -129,6 +129,45 @@ test("broker prompt byte budget is derived from the tighter admitted input or re
 	assert.equal(requestBounded.broker.maxPromptBytes, 2_048 - 128)
 })
 
+test("campaign broker enforces a four-tool ceiling before reservation or POST while admitting internal subsets", async (t) => {
+	const tool = (name: string) => ({ type: "function", function: { name, parameters: { type: "object", properties: {} } } })
+	const expected = ["attempt_completion", "execute_command", "read_file", "write_to_file"]
+	const defaultTools = ["apply_diff", "ask_followup_question", "attempt_completion", "codebase_search", "execute_command", "list_files", "new_task", "read_file", "search_replace", "edit_file", "switch_mode", "update_todo_list", "write_to_file", "browser_action", "describe_image", "set_indentation", "batch", "extension_manage", "extension_call"].map(tool)
+	const root = await scratch("rsi-campaign-tool-allowlist")
+	t.after(() => fs.rm(root, { recursive: true, force: true }))
+	const events: string[] = []
+	const ledger = new FileOpenRouterInferenceLedger(path.join(root, "ledger.json"))
+	const reserve = ledger.reserve.bind(ledger)
+	ledger.reserve = async (...args) => { events.push("reserve"); await reserve(...args) }
+	const upstreamFetch = (async (input: string | URL) => {
+		if (String(input).includes("/models/")) return new Response(JSON.stringify({ data: { endpoints: [museEndpointMetadata()] } }), { status: 200 })
+		events.push("post")
+		return new Response(JSON.stringify(routedResponse({ id: "campaign-tools", model: RSI_MUSE_OPENROUTER_MODEL, choices: [], usage: { prompt_tokens: 20, completion_tokens: 4, cost: 0.0001 } }, "meta")), { status: 200, headers: { "content-type": "application/json" } })
+	}) as typeof fetch
+	const broker = await startOpenRouterBroker({ jobId: "attempt-campaign-tools-1234", leaseToken: "lease", model: RSI_MUSE_OPENROUTER_MODEL,
+		profileId: "muse-spark-contributor", campaignMutationOnly: true, limits: limits("campaign-tools", { maxTotalTokens: 20_000 }), apiKey: "host-secret", bindHost: "127.0.0.1", ledger, upstreamFetch })
+	t.after(() => broker.close())
+	const send = async (callId: string, tools: unknown[]) => fetch(`${broker.localBaseUrl}/api/v1/chat/completions`, {
+		method: "POST", headers: { authorization: `Bearer ${broker.capability}`, "content-type": "application/json", "x-rsi-call-id": callId },
+		body: requestBody({ model: RSI_MUSE_OPENROUTER_MODEL, max_tokens: 64, tools }),
+	})
+	const refused = await send("campaign-default-tools-0001", defaultTools)
+	assert.equal(refused.status, 400)
+	assert.deepEqual(events, [])
+	assert.equal((await broker.receipt()).calls, 0)
+	const admitted = await send("campaign-subset-tools-0002", [tool("execute_command")])
+	assert.equal(admitted.status, 200)
+	assert.deepEqual(events, ["reserve", "post"])
+	const emptyTools = await send("campaign-empty-tools-0003", [])
+	assert.equal(emptyTools.status, 200)
+	assert.deepEqual(events, ["reserve", "post", "reserve", "post"])
+	const unapproved = await send("campaign-unknown-tool-0004", [...expected.map(tool), tool("browser_action")])
+	assert.equal(unapproved.status, 400)
+	assert.deepEqual(events, ["reserve", "post", "reserve", "post"])
+	assert.equal((await broker.receipt()).calls, 2)
+	assert.equal((await broker.receipt()).qualified, true)
+})
+
 test("broker rejects limits that cannot provide a positive guest prompt budget before metadata admission", async (t) => {
 	const root = await scratch("rsi-inference-small-prompt-budget")
 	t.after(() => fs.rm(root, { recursive: true, force: true }))
@@ -286,6 +325,80 @@ test("OpenRouter broker leaves missing or mismatched returned endpoint identity 
 		assert.deepEqual(receipt.returnedProviders, returnedProvider ? [returnedProvider] : [])
 		await broker.close()
 	}
+})
+
+test("structured HTTP 200 refusal is unmeasured and blocks a new call ID", async (t) => {
+	const requests: string[] = []
+	const upstreamFetch = (async (input: string | URL) => {
+		const url = String(input)
+		requests.push(url)
+		if (url.includes("/models/")) return new Response(JSON.stringify({ data: { endpoints: [endpointMetadata()] } }), { status: 200 })
+		return new Response(JSON.stringify(routedResponse({ id: "refusal-response", model: RSI_OPENROUTER_MODEL,
+			choices: [{ message: { refusal: "private refusal detail" }, finish_reason: "stop" }],
+			usage: { prompt_tokens: 20, completion_tokens: 4, cost: 0.0001 } })),
+			{ status: 200, headers: { "content-type": "application/json" } })
+	}) as typeof fetch
+	const { broker } = await setup(t, { upstreamFetch })
+	const send = (callId: string) => fetch(`${broker.localBaseUrl}/api/v1/chat/completions`, {
+		method: "POST", headers: { authorization: `Bearer ${broker.capability}`, "content-type": "application/json", "x-rsi-call-id": callId }, body: requestBody(),
+	})
+	const first = await send("structured-refusal-0001")
+	assert.equal(first.status, 502)
+	assert.equal((await first.text()).includes("private refusal detail"), false)
+	assert.equal((await broker.receipt()).qualified, false)
+	assert.equal((await send("structured-refusal-newid-2")).status, 429)
+	assert.equal(requests.filter((url) => url.endsWith("/chat/completions")).length, 1)
+})
+
+test("HTTP 403 is retained as unmeasured and blocks retries after restart", async (t) => {
+	const requests: string[] = []
+	const upstreamFetch = (async (input: string | URL) => {
+		const url = String(input)
+		requests.push(url)
+		if (url.includes("/models/")) return new Response(JSON.stringify({ data: { endpoints: [endpointMetadata()] } }), { status: 200 })
+		return new Response(JSON.stringify({ error: { message: "private upstream denial" } }), { status: 403,
+			headers: { "content-type": "application/json" } })
+	}) as typeof fetch
+	const { ledger, broker } = await setup(t, { upstreamFetch })
+	const send = (base: string, capability: string, callId: string) => fetch(`${base}/api/v1/chat/completions`, {
+		method: "POST", headers: { authorization: `Bearer ${capability}`, "content-type": "application/json", "x-rsi-call-id": callId }, body: requestBody(),
+	})
+	const first = await send(broker.localBaseUrl, broker.capability, "upstream-403-call-0001")
+	assert.equal(first.status, 502)
+	assert.equal((await first.text()).includes("private upstream denial"), false)
+	const restarted = await startOpenRouterBroker({ jobId: "attempt-1234567890123456", leaseToken: "lease-test",
+		limits: limits("campaign-test"), apiKey: "host-secret", bindHost: "127.0.0.1", ledger, upstreamFetch })
+	t.after(() => restarted.close())
+	assert.equal((await send(restarted.localBaseUrl, restarted.capability, "upstream-403-newid-02")).status, 429)
+	assert.equal(requests.filter((url) => url.endsWith("/chat/completions")).length, 1)
+})
+
+test("SSE content-filter response is unmeasured and does not forward provider output", async (t) => {
+	const requests: string[] = []
+	const upstreamFetch = (async (input: string | URL) => {
+		const url = String(input)
+		requests.push(url)
+		if (url.includes("/models/")) return new Response(JSON.stringify({ data: { endpoints: [endpointMetadata()] } }), { status: 200 })
+		const events = [
+			{ id: "filtered-response", model: RSI_OPENROUTER_MODEL, choices: [{ delta: { refusal: "private filter detail" }, finish_reason: "content_filter" }] },
+			routedResponse({ id: "filtered-response", model: RSI_OPENROUTER_MODEL,
+				usage: { prompt_tokens: 20, completion_tokens: 0, cost: 0.00001 } }),
+		]
+		return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n",
+			{ status: 200, headers: { "content-type": "text/event-stream" } })
+	}) as typeof fetch
+	const { broker } = await setup(t, { upstreamFetch })
+	const first = await fetch(`${broker.localBaseUrl}/api/v1/chat/completions`, {
+		method: "POST", headers: { authorization: `Bearer ${broker.capability}`, "content-type": "application/json", "x-rsi-call-id": "sse-filter-call-0001" }, body: requestBody({ stream: true }),
+	})
+	assert.equal(first.status, 502)
+	assert.equal((await first.text()).includes("private filter detail"), false)
+	assert.equal((await broker.receipt()).qualified, false)
+	const retry = await fetch(`${broker.localBaseUrl}/api/v1/chat/completions`, {
+		method: "POST", headers: { authorization: `Bearer ${broker.capability}`, "content-type": "application/json", "x-rsi-call-id": "sse-filter-newid-02" }, body: requestBody({ stream: true }),
+	})
+	assert.equal(retry.status, 429)
+	assert.equal(requests.filter((url) => url.endsWith("/chat/completions")).length, 1)
 })
 
 test("file ledger preserves the job deadline across broker restart and rejects a late response", async (t) => {

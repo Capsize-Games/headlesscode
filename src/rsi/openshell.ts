@@ -204,7 +204,7 @@ function sha256SnapshotTree(snapshot: string): string {
 	return createHash("sha256").update(execFileBuffer("git", ["ls-tree", "-r", "-z", "--full-tree", "HEAD"], { cwd: snapshot })).digest("hex")
 }
 
-function verifyWorkerHarnessRuntime(expected: WorkerHarnessRuntimeIdentity): void {
+export function verifyWorkerHarnessRuntime(expected: WorkerHarnessRuntimeIdentity): void {
 	if (!validWorkerHarnessRuntimeIdentity(expected)) throw new Error("RSI worker harness runtime identity is malformed")
 	const actualDigest = execFileSync("docker", ["image", "inspect", "--format={{.Id}}", expected.imageName], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim()
 	if (actualDigest !== expected.imageDigest) throw new Error("RSI worker image digest differs from the frozen run identity")
@@ -383,6 +383,7 @@ export function rsiMutationGuestEnvironment(config: RsiConfig, candidate: Candid
 			HEADLESSCODE_CAPTURE_TRANSCRIPT_DIR: path.join("/workspace", ".headlesscode", "rsi-transcripts"),
 			HEADLESSCODE_MAX_ITERATIONS: String(config.maxIterations),
 			HEADLESSCODE_MAX_DURATION_MS: String(config.commandTimeoutMs),
+			...(config.campaignScopedEvaluation ? { HEADLESSCODE_RSI_CAMPAIGN_MUTATION: "1" } : {}),
 		}
 	}
 	if (provider !== "ollama") throw new Error("RSI OpenShell worker provider must be ollama or explicitly brokered openrouter")
@@ -398,6 +399,16 @@ export function rsiMutationGuestEnvironment(config: RsiConfig, candidate: Candid
 		HEADLESSCODE_MAX_ITERATIONS: String(config.maxIterations),
 		HEADLESSCODE_MAX_DURATION_MS: String(config.commandTimeoutMs),
 	}
+}
+
+/** Select a campaign's frozen runtime image without changing ordinary RSI defaults. */
+export function pinnedMutationImage(config: RsiConfig, suppliedImage?: string): string | undefined {
+	if (config.workerHarnessMode) {
+		if (!config.workerHarnessRuntime) throw new Error("RSI worker harness requires a frozen runtime image and dependency identity")
+		return config.workerHarnessRuntime.imageDigest
+	}
+	if (config.campaignScopedEvaluation) return config.campaignScopedEvaluation.runtime.imageDigest
+	return suppliedImage
 }
 
 export function networkRules(mode: IsolatedRunOptions["mode"], inferenceBroker?: RsiInferenceBrokerAccess): Record<string, unknown> {
@@ -763,11 +774,13 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 		const requestedMode = config.workerHarnessMode ?? "fixed-control"
 		const effectiveMode = effectiveWorkerHarnessMode(requestedMode, candidate.generation)
 		const runtime = config.workerHarnessRuntime
-		let pinnedImage = image
+		let pinnedImage = pinnedMutationImage(config, image)
 		if (config.workerHarnessMode) {
 			if (!runtime) throw new Error("RSI worker harness requires a frozen runtime image and dependency identity")
 			verifyWorkerHarnessRuntime(runtime)
 			pinnedImage = runtime.imageDigest
+		} else if (config.campaignScopedEvaluation) {
+			verifyWorkerHarnessRuntime(config.campaignScopedEvaluation.runtime)
 		}
 		const cliPath = workerHarnessCliPath(effectiveMode)
 		const workerCommand = [

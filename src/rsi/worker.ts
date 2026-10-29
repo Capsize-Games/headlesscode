@@ -6,7 +6,7 @@ import * as path from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
 import { openshellPreflight } from "../cloud/openshell-preflight.js"
 import { PostgresRsiJobQueue, fleetQueuePolicy, requiredFleetJobLeaseMs, type FleetJobLease, type FleetJobPayload } from "./postgres-queue.js"
-import { OpenShellMutationPreflightError, readVerifiedAdversarialEvaluationArtifacts, runOpenShellEvaluation, runOpenShellModelJob, runOpenShellMutation } from "./openshell.js"
+import { OpenShellMutationPreflightError, readVerifiedAdversarialEvaluationArtifacts, runOpenShellEvaluation, runOpenShellModelJob, runOpenShellMutation, verifyWorkerHarnessRuntime } from "./openshell.js"
 import type { CandidateRecord, ComputePolicy, EvaluationSummary, MutationHypothesis, MutationKind, RsiConfig, RsiRoleConfig, TrialResult } from "./types.js"
 import { startOpenRouterBroker, openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID, type OpenRouterBrokerReceipt, type OpenRouterBrokerOptions } from "./inference-broker.js"
 import { effectiveWorkerHarnessMode, workerHarnessCliPath, validWorkerHarnessRuntimeIdentity } from "./worker-harness.js"
@@ -15,6 +15,9 @@ import type { EmergencyControl } from "../control/emergency-controller.js"
 import { EmergencyControl as EmergencyControlRuntime } from "../control/emergency-controller.js"
 import { OpenShellSessionProvider } from "../cloud/openshell-provider.js"
 import { DEFAULT_RSI_ARTIFACT_LIMIT } from "./artifact-store.js"
+import { FleetBudgetInferenceLedger } from "./fleet-budget-ledger.js"
+import type { OpenRouterInferenceLedger } from "./inference-broker.js"
+import { assertMutationAllowlist } from "./mutation-allowlist.js"
 
 const EVALUATION_PREVIEW_CHARS = 2048
 const MUTATION_FAILURE_ARTIFACT_MAX_BYTES = DEFAULT_RSI_ARTIFACT_LIMIT
@@ -137,6 +140,8 @@ export interface RsiWorkerOptions {
 	runEvaluation?: typeof runOpenShellEvaluation
 	runModelJob?: typeof runOpenShellModelJob
 	createInferenceBroker?: typeof startOpenRouterBroker
+	/** Optional independent spend authority; job/artifact operations still use queue. */
+	inferenceLedger?: OpenRouterInferenceLedger
 	emergencyControl?: Pick<EmergencyControl, "identity" | "stateDirectoryPath" | "signal" | "state" | "snapshot" | "assertRunning" | "waitUntilRunning" | "registerCleanup" | "registerResource" | "releaseResource">
 }
 
@@ -147,7 +152,13 @@ function parsePositiveInteger(value: string | undefined, fallback: number, name:
 	return parsed
 }
 
-function taskConfig(payload: FleetJobPayload, root: string, queue: PostgresRsiJobQueue): RsiConfig {
+export function taskConfig(payload: FleetJobPayload, root: string, queue: PostgresRsiJobQueue): RsiConfig {
+	if (payload.campaignScopedEvaluation) {
+		const scoped = payload.campaignScopedEvaluation
+		if (!/^[a-f0-9]{64}$/.test(scoped.planDigest) || !/^[a-f0-9]{64}$/.test(scoped.fixtureDigest) || !/^[a-f0-9]{64}$/.test(scoped.evaluatorDigest)
+			|| !["intake-parsing", "deduplication", "evidence-validation", "reporting"].includes(scoped.objective)
+			|| scoped.typecheckCommand !== "python3 -c \"compile(open('candidate.py').read(), 'candidate.py', 'exec')\"") throw new Error("fleet campaign evaluation identity is malformed")
+	}
 	const roles: RsiRoleConfig = { worker: { provider: payload.provider ?? "ollama", model: payload.model, ...(payload.openRouterProfile ? { openRouterProfile: payload.openRouterProfile } : {}) } }
 	return {
 		repoRoot: root,
@@ -179,6 +190,7 @@ function taskConfig(payload: FleetJobPayload, root: string, queue: PostgresRsiJo
 			workerHarnessParentCommit: payload.workerHarness.parentCommit,
 			workerHarnessSnapshotTreeDigest: payload.workerHarness.snapshotTreeDigest,
 		} : {}),
+		...(payload.campaignScopedEvaluation ? { campaignScopedEvaluation: { ...payload.campaignScopedEvaluation } } : {}),
 	}
 }
 
@@ -297,6 +309,7 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions, sig
 		if (lease.job.jobKind === "mutation") verifyWorkerHarnessPayload(payload, repoRoot)
 		const candidate = candidateFromPayload(payload, repoRoot)
 		const config = taskConfig(payload, repoRoot, options.queue)
+		if (lease.job.jobKind === "mutation" && config.campaignScopedEvaluation) verifyWorkerHarnessRuntime(config.campaignScopedEvaluation.runtime)
 		const started = Date.now()
 		let result: Record<string, unknown>
 		if (lease.job.jobKind === "mutation") {
@@ -311,9 +324,11 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions, sig
 					const apiKey = process.env.HEADLESSCODE_OPENROUTER_API_KEY?.trim()
 					const bindHost = process.env.HEADLESSCODE_RSI_BROKER_BIND_HOST?.trim()
 					if (!apiKey || !bindHost) throw new Error("OpenRouter fleet worker requires the host API key and explicit RSI broker interface address")
+					const inferenceLedger = options.inferenceLedger ?? options.queue
+					if (inferenceLedger instanceof FleetBudgetInferenceLedger) inferenceLedger.assertApiKey(apiKey)
 					const brokerOptions: OpenRouterBrokerOptions = {
-						jobId: lease.job.jobId, leaseToken: lease.token, model: profile.model, ...(profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { profileId: profile.id } : {}), limits: payload.inferenceLimits,
-						apiKey, bindHost, ledger: options.queue,
+						jobId: lease.job.jobId, leaseToken: lease.token, model: profile.model, ...(profile.id !== RSI_DEFAULT_OPENROUTER_PROFILE_ID ? { profileId: profile.id } : {}), ...(payload.campaignScopedEvaluation ? { campaignMutationOnly: true } : {}), limits: payload.inferenceLimits,
+						apiKey, bindHost, ledger: inferenceLedger,
 					}
 					broker = await (options.createInferenceBroker ?? startOpenRouterBroker)(brokerOptions)
 				}
@@ -364,6 +379,7 @@ async function executeLease(lease: FleetJobLease, options: RsiWorkerOptions, sig
 				const profileIdMatches = profile.id === RSI_DEFAULT_OPENROUTER_PROFILE_ID ? receipt?.profileId === undefined || receipt.profileId === profile.id : receipt?.profileId === profile.id
 				if (!receipt?.qualified || receipt.model !== payload.model || !profileIdMatches || receipt.endpointProvider !== profile.endpointProvider || receipt.provider !== "openrouter") throw new Error("OpenRouter mutation did not produce a qualified, profile-bound broker receipt")
 			}
+			if (payload.allowedMutationPaths) await assertMutationAllowlist(repoRoot, payload.snapshotCommit, payload.allowedMutationPaths)
 			const patch = execFileSync("git", ["diff", "--binary", "--no-ext-diff", "--no-renames", `${candidate.baseCommit}...HEAD`], { cwd: repoRoot, encoding: "buffer", maxBuffer: options.queue.policy.maxInFlight * 1024 * 1024 * 16 })
 			if (patch.byteLength === 0) throw new Error("OpenShell mutation produced no patch")
 			const artifact = await options.queue.putArtifact(patch)
@@ -571,6 +587,13 @@ export async function rsiWorkerMain(env: NodeJS.ProcessEnv = process.env): Promi
 			pollMs: parsePositiveInteger(env.HEADLESSCODE_RSI_WORKER_POLL_MS, 1000, "HEADLESSCODE_RSI_WORKER_POLL_MS"),
 			signal: controller.signal,
 				emergencyControl,
+			...(env.HEADLESSCODE_RSI_FLEET_BUDGET_LEDGER === "1" ? (() => {
+				const apiKey = env.HEADLESSCODE_OPENROUTER_API_KEY?.trim()
+				if (!apiKey) throw new Error("Fleet budget ledger requires the selected host OpenRouter key")
+				return { inferenceLedger: new FleetBudgetInferenceLedger({
+					expectedKeyIdentity: createHash("sha256").update(apiKey).digest("hex"),
+				}) }
+			})() : {}),
 		})
 		if (stopPromise) await stopPromise
 		if (emergencyControl.state === "failed-to-stop" && emergencyControl.hasCleanupHandlers) await emergencyControl.waitForStopped()

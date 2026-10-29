@@ -64,6 +64,7 @@ export function initialRun(config: RsiConfig, baseCommit: string, now: string): 
 		baseRef: config.baseRef,
 		baseCommit,
 		generations: config.generations,
+		...(config.campaignScopedEvaluation ? { campaignScopedEvaluation: { ...config.campaignScopedEvaluation, eligibility: "paired-evaluation-only" as const } } : {}),
 		parentSelectionPolicy: config.parentSelectionPolicy ?? "champion-specialist-novelty",
 		selectedCandidates: [],
 		parentChoices: {},

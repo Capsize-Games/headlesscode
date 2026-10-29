@@ -276,6 +276,17 @@ export interface RsiConfig {
 	maxTotalIterations?: number
 	maxRuntimeMs?: number
 	protectedPaths: string[]
+	/** Optional positive allowlist for campaign mutations; every changed file must match. */
+	allowedMutationPaths?: string[]
+	/** Fixed synthetic campaign evaluation; bypasses HCL development-benchmark proof. */
+	campaignScopedEvaluation?: {
+		planDigest: string
+		fixtureDigest: string
+		evaluatorDigest: string
+		runtime: WorkerHarnessRuntimeIdentity
+		objective: "intake-parsing" | "deduplication" | "evidence-validation" | "reporting"
+		typecheckCommand: string
+	}
 	developmentProofRule?: DevelopmentProofRule
 	commandTimeoutMs: number
 	parentSelectionPolicy?: ParentSelectionPolicy
@@ -509,6 +520,14 @@ export interface RsiRunRecord {
 		ledgerSnapshot?: Record<string, unknown>
 		incompleteReason?: string
 		state: "running" | "evaluated" | "selected" | "rejected" | "incomplete" | "finished"
+	}
+	campaignScopedEvaluation?: {
+		planDigest: string
+		fixtureDigest: string
+		evaluatorDigest: string
+		runtime: WorkerHarnessRuntimeIdentity
+		objective: "intake-parsing" | "deduplication" | "evidence-validation" | "reporting"
+		eligibility: "paired-evaluation-only"
 	}
 	adversarialReviews?: AdversarialReviewRecord[]
 	candidates: CandidateRecord[]

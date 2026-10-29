@@ -260,6 +260,11 @@ export function containedGuestEnvironment(
 		const value = requested[name] ?? ambient[name]
 		if (value !== undefined) result[name] = value
 	}
+	// This request-only marker selects a smaller tool catalog and shorter prompt.
+	// Admit only the exact trusted-worker value emitted by the campaign adapter.
+	if (profile.purpose === "worker" && requested.HEADLESSCODE_RSI_CAMPAIGN_MUTATION === "1") {
+		result.HEADLESSCODE_RSI_CAMPAIGN_MUTATION = "1"
+	}
 	if (profile.purpose === "worker") result.HEADLESSCODE_CODE_MODE_BACKEND = "openrouter"
 	result.HEADLESSCODE_SECURITY_PROFILE = "contained"
 	result.HEADLESSCODE_EVIDENCE_CONFIG_PATH = CONTAINED_EVIDENCE_RUNTIME_PATH
