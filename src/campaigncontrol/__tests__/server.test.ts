@@ -198,7 +198,7 @@ async function testStaticServerDoesNotExposeUnlistedFiles(): Promise<void> {
 
 async function testRepositoryCampaignApiIsAdditiveAndReportsMockReadiness(): Promise<void> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-repository-campaign-api-"))
-	const definitions: RepositoryCampaignDefinition[] = [{ id: "headlesscode-internal", name: "HeadlessCode",
+	const definitions: RepositoryCampaignDefinition[] = [{ id: "headlesscode-internal", name: "HeadlessCode", repositoryId: "headlesscode-internal", repository: "Capsize-Games/headlesscode-internal",
 		sourceRevision: null, workerProfile: null, recipeDigest: null, evaluatorDigest: null, model: null, dataAccessProfile: null,
 		qualification: { sourceAudited: false, workerQualified: false, recipeQualified: false, evaluatorQualified: false,
 			modelApproved: false, dataApproved: false, accessApproved: false } }]
@@ -225,7 +225,8 @@ async function testRepositoryCampaignApiIsAdditiveAndReportsMockReadiness(): Pro
 		assert.equal(initial.mode, "offline-synthetic-only")
 		assert.equal(initial.modelCalls, 0)
 		assert.equal(initial.controlPlaneOnly, true)
-		assert.equal(initial.budget.authority, "fleet-broker-ledger-not-integrated")
+		assert.equal(initial.budget.authority, "synthetic-test")
+		assert.equal(initial.budget.adapter, "none")
 		assert.equal(initial.budget.available, false)
 		assert.equal(initial.budget.limitMicros, 0, "repository campaigns do not create a separate spend allowance")
 		assert.equal(initial.campaigns[0].readiness, "blocked-prerequisite")
@@ -294,7 +295,7 @@ async function testRepositoryProgressAndEvidenceRoutesAreReadOnlyAndSanitized():
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-repository-progress-api-"))
 	const qualified = { sourceAudited: true, workerQualified: true, recipeQualified: true, evaluatorQualified: true,
 		modelApproved: true, dataApproved: true, accessApproved: true }
-	const definition: RepositoryCampaignDefinition = { id: "sample-repo", name: "Sample Repository", repositoryId: "capsize-sample-repo", repository: "Capsize/Sample", sourceRevision: "a".repeat(40),
+	const definition: RepositoryCampaignDefinition = { id: "sample-repo", name: "Sample Repository", repositoryId: "capsize-sample-repo", repository: "Capsize/Sample", sourceRevision: "a".repeat(40), policySha256: "d".repeat(64),
 		workerProfile: "fixed-fixture", recipeDigest: "b".repeat(64), evaluatorDigest: "c".repeat(64), model: "fixture-only",
 		dataAccessProfile: "fixture-only", qualification: qualified }
 	const repositoryCampaigns = new RepositoryCampaignStore(path.join(root, "repository-campaigns.json"), [definition], () => ({
@@ -307,7 +308,8 @@ async function testRepositoryProgressAndEvidenceRoutesAreReadOnlyAndSanitized():
 	const claim = await repositoryCampaigns.claimNext("sample-repo", { micros: 10_000, tokens: 10_000 })
 	assert.ok(claim)
 	const ref = { id: "d".repeat(64), kind: "candidate" as const, label: "Candidate digest" }
-	await repositoryCampaigns.updateClaimProgress(claim!, { stage: "prepare-candidate", currentTask: "Prepare isolated candidate", completedSteps: ["intake", "deduplicate", "investigate"], nextStep: "verify", evidenceRefs: [ref] })
+	const boardRef = `http://127.0.0.1:8078/api/cards/1c25cecf-e5e8-4b68-b6fd-5d6ad25426d7#hc-repository-result-v1:${"f".repeat(64)}`
+	await repositoryCampaigns.updateClaimProgress(claim!, { stage: "prepare-candidate", currentTask: "Prepare isolated candidate", completedSteps: ["intake", "deduplicate", "investigate"], nextStep: "verify", evidenceRefs: [ref], boardRef })
 	const server = await startCampaignControlServer({ port: 0, staticRoot: path.join(f.root, "dist"), store: f.store,
 		repositoryCampaigns, loadAdapter: async () => ({ releaseRoot: f.root, stateRoot: f.root, releaseDigest: "a".repeat(64) }),
 		readBudget: async () => ({ month: currentMonth(), settledMicros: 0, reservedMicros: 0, ambiguousMicros: 0 }),
@@ -327,6 +329,7 @@ async function testRepositoryProgressAndEvidenceRoutesAreReadOnlyAndSanitized():
 		assert.deepEqual(body.repository, { id: "sample-repo", name: "Sample Repository", slug: "Capsize/Sample" })
 		assert.equal(body.workers[0].workerId, claim!.job.progress?.workerId)
 		assert.equal(body.workers[0].goal.includes("CVE-2026-1260"), true)
+		assert.equal(body.workers[0].boardRef, boardRef)
 		assert.equal(body.workers[0].usage.state, "unavailable")
 		assert.equal(body.counts.source, "repository-campaign-store")
 		assert.equal(body.counts.running, 1)
@@ -335,6 +338,50 @@ async function testRepositoryProgressAndEvidenceRoutesAreReadOnlyAndSanitized():
 		assert.deepEqual(await evidence.json(), { schemaVersion: 1, campaignId: "sample-repo", jobId: claim!.job.id, evidence: ref })
 		assert.equal((await fetch(`${base}/api/repository-campaigns/sample-repo/progress`, { method: "POST" })).status, 405)
 		assert.equal((await fetch(`${base}/api/repository-campaigns/sample-repo/jobs/${claim!.job.id}/evidence/${"e".repeat(64)}`)).status, 404)
+	} finally {
+		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+		await close(f); await fs.rm(root, { recursive: true, force: true })
+	}
+}
+
+async function testCoordinatorLeavesUnregisteredCampaignBlocked(): Promise<void> {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-repository-coordinator-api-"))
+	const qualified = { sourceAudited: true, workerQualified: true, recipeQualified: true, evaluatorQualified: true,
+		modelApproved: true, dataApproved: true, accessApproved: true }
+	const definition: RepositoryCampaignDefinition = { id: "sample-repo", name: "Sample Repository", repositoryId: "capsize-sample-repo", repository: "Capsize/Sample", sourceRevision: "a".repeat(40), policySha256: "d".repeat(64),
+		workerProfile: "fixed-fixture", recipeDigest: "b".repeat(64), evaluatorDigest: "c".repeat(64), model: "fixture-only",
+		dataAccessProfile: "fixture-only", qualification: qualified }
+	const repositoryCampaigns = new RepositoryCampaignStore(path.join(root, "repository-campaigns.json"), [definition], () => ({
+		mode: "synthetic-test", available: true, limitMicros: 50_000, limitTokens: 50_000, committedMicros: 0, committedTokens: 0,
+	}))
+	await repositoryCampaigns.setCampaignBudget("sample-repo", 40_000, 40_000)
+	await repositoryCampaigns.start("sample-repo")
+	await repositoryCampaigns.enqueue("sample-repo", "CVE-2026-1260")
+	const f = await fixture()
+	const server = await startCampaignControlServer({ port: 0, staticRoot: path.join(f.root, "dist"), store: f.store,
+		repositoryCampaigns, enableRepositoryCoordinator: true,
+		loadAdapter: async () => ({ releaseRoot: f.root, stateRoot: f.root, releaseDigest: "a".repeat(64) }),
+		readBudget: async () => ({ month: currentMonth(), settledMicros: 0, reservedMicros: 0, ambiguousMicros: 0 }),
+		readJobs: async () => ({ jobs: [], jobDetailsAvailable: false }),
+		readRsi: async () => ({ mode: "offline-synthetic-only", status: "not-run", activation: "not-performed",
+			limits: { modelCalls: 0, spendUsd: 0, comparisons: 1, maxDurationSeconds: 30, maxFixtures: 500 }, history: [] }),
+	})
+	const address = server.address(); assert.ok(address && typeof address !== "string")
+	try {
+		const response = await fetch(`http://127.0.0.1:${address.port}/api/repository-campaigns/sample-repo/progress`)
+		assert.equal(response.status, 200)
+		const body = await response.json() as any
+		assert.equal(body.readiness.state, "blocked-prerequisite")
+		assert.deepEqual(body.readiness.reasons.slice(-3), ["contained-worker-adapter-unregistered", "protected-evaluator-unregistered", "private-delivery-adapter-unregistered"])
+		assert.equal(body.state, "blocked-prerequisite")
+		assert.equal(body.workers.length, 0, "the coordinator does not invent a worker record for an unregistered adapter")
+		const listed = await (await fetch(`http://127.0.0.1:${address.port}/api/repository-campaigns`)).json() as any
+		assert.equal(listed.campaigns[0].readiness, "blocked-prerequisite", "campaign list reflects runtime adapter availability")
+		const start = await fetch(`http://127.0.0.1:${address.port}/api/repository-campaigns`, { method: "POST", headers: { "content-type": "application/json" },
+			body: JSON.stringify({ action: "start", campaignId: "sample-repo" }) })
+		assert.equal(start.status, 409, "Start is rejected while worker/evaluator/delivery adapters are unregistered")
+		assert.match((await start.json() as any).error, /contained-worker-adapter-unregistered/)
+		assert.equal((await repositoryCampaigns.status() as any).jobs[0].status, "queued", "no adapter means no claim")
 	} finally {
 		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
 		await close(f); await fs.rm(root, { recursive: true, force: true })
@@ -352,6 +399,7 @@ const tests: readonly SuiteTest[] = [
 	["repository campaign API is additive and exposes mock mode and readiness", testRepositoryCampaignApiIsAdditiveAndReportsMockReadiness],
 	["repository draft create and configure cannot self-certify readiness", testRepositoryDraftCreateAndConfigureNeverSelfCertifyReadiness],
 	["repository progress and evidence routes are read-only, ownership-bound, and sanitized", testRepositoryProgressAndEvidenceRoutesAreReadOnlyAndSanitized],
+	["repository coordinator reports missing adapters and does not claim queued work", testCoordinatorLeavesUnregisteredCampaignBlocked],
 ]
 
 runMain("campaign-control-server", tests)

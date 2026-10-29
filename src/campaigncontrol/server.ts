@@ -2,13 +2,17 @@ import * as fs from "node:fs/promises"
 import * as http from "node:http"
 import * as path from "node:path"
 import { CampaignControlStore, MAX_MONTHLY_BUDGET_MICROS, type CampaignControlState, type CampaignRun } from "./store.js"
-import { CAMPAIGN_ADAPTER_FILE, CAMPAIGN_CONTROL_FILE } from "./paths.js"
+import { CAMPAIGN_ADAPTER_FILE, CAMPAIGN_CONTROL_FILE, REPOSITORY_WORKER_REGISTRY_FILE } from "./paths.js"
 import { mutateCampaignControlLocked } from "./authority.js"
 import { loadCampaignAdapterConfig, readCampaignBudgetReport, readCampaignJobReport, type CampaignBudgetReport, type CampaignJobReport, type CampaignReadinessReport } from "./runner.js"
 import { readCampaignRsiStatus, type CampaignRsiStatus } from "./rsi.js"
 import { readProviderRsiStatus, type ProviderRsiStatus } from "./provider-rsi.js"
 import { RepositoryCampaignStore, loadRepositoryCampaignDefinitions } from "./repository-campaigns.js"
 import { repositoryProgressSnapshot, type FleetRepositoryBudgetSnapshot } from "./repository-progress.js"
+import { RepositoryCampaignCoordinator, type RegisteredRepositoryWorker } from "./repository-coordinator.js"
+import { bindRepositoryWorkerRegistrations, BUILTIN_REPOSITORY_PIPELINE_ADAPTER_FACTORIES, loadRepositoryWorkerRegistrations, type RepositoryPipelineAdapterFactory } from "./repository-worker-registry.js"
+import { createRepositoryCampaignRunLease, type RepositoryCampaignRunLease, withCampaignDispatchFence } from "./repository-run-lease.js"
+import { createRepositoryBudgetAuthorityReader } from "./repository-budget-authority.js"
 
 export const CAMPAIGN_CONTROL_PORT = 4391
 const MAX_BODY_BYTES = 4096
@@ -58,6 +62,12 @@ export interface CampaignControlServerOptions {
 	readRepositoryBudgetSnapshot?: (campaignId: string) => Promise<FleetRepositoryBudgetSnapshot>
 	repositoryCampaignStatePath?: string
 	repositoryCampaignRegistryPath?: string
+	repositoryWorkerRegistryPath?: string
+	repositoryPipelineAdapterFactories?: ReadonlyMap<string, RepositoryPipelineAdapterFactory>
+	/** Enables the bounded repository poller. Production registration must be explicit; the default is no workers. */
+	enableRepositoryCoordinator?: boolean
+	repositoryWorkers?: readonly RegisteredRepositoryWorker[]
+	repositoryRunLease?: RepositoryCampaignRunLease
 }
 
 function json(res: http.ServerResponse, status: number, body: unknown): void {
@@ -172,6 +182,34 @@ function allowedHost(hostHeader: string | undefined, port: number): boolean {
 	} catch { return false }
 }
 
+function repositoryStatusWithRuntime(status: Record<string, unknown>, store: RepositoryCampaignStore,
+	coordinator?: RepositoryCampaignCoordinator): Record<string, unknown> {
+	if (!coordinator || !Array.isArray(status.campaigns)) return status
+	const definitions = new Map(store.registeredDefinitions().map((definition) => [definition.id, definition]))
+	const intakeRecords = Array.isArray(status.intakeRecords) ? status.intakeRecords as Array<Record<string, unknown>> : []
+	const campaigns = status.campaigns.map((value) => {
+		if (!value || typeof value !== "object" || Array.isArray(value)) return value
+		const row = value as Record<string, unknown>
+		const definition = definitions.get(String(row.id))
+		if (!definition) return row
+		const runtime = coordinator.readiness(definition)
+		const reasons = Array.isArray(row.readinessReasons) ? row.readinessReasons.filter((reason): reason is string => typeof reason === "string") : []
+		const sourceStatus = coordinator.intakeStatus(definition.id)
+		const scopedRecords = intakeRecords.filter((record) => record.campaignId === definition.id)
+		const intake = { ...sourceStatus, eligibleRecords: scopedRecords.filter((record) => record.disposition === "eligible").length,
+			unsupportedRecords: scopedRecords.filter((record) => record.disposition === "unsupported-profile").length }
+		if (runtime.state === "ready") return { ...row, advisoryIntake: intake }
+		return { ...row, advisoryIntake: intake, state: runtime.state, readiness: runtime.state,
+			readinessReasons: [...new Set([...reasons, ...runtime.reasons])].slice(0, 32) }
+	})
+	return { ...status, campaigns }
+}
+
+function repositoryResponseMetadata(coordinator?: RepositoryCampaignCoordinator): Record<string, unknown> {
+	if (coordinator?.activityMode() === "registered-live-cve") return { mode: "registered-live-cve", controlPlaneOnly: false }
+	return { mode: "offline-synthetic-only", modelCalls: 0, controlPlaneOnly: true }
+}
+
 async function handleRequest(
 	req: http.IncomingMessage,
 	res: http.ServerResponse,
@@ -179,6 +217,7 @@ async function handleRequest(
 	staticRoot: string,
 	store: CampaignControlStore,
 	port: number,
+	repositoryCoordinator?: RepositoryCampaignCoordinator,
 ): Promise<void> {
 	const host = req.headers.host
 	if (!allowedHost(host, port)) { json(res, 421, { error: "host is not served here" }); return }
@@ -265,7 +304,7 @@ async function handleRequest(
 		if (!repoStore) { json(res, 503, { error: "repository campaign registry is unavailable" }); return }
 		if (req.method === "GET") {
 			try {
-				const status = await repoStore.status()
+				const status = repositoryStatusWithRuntime(await repoStore.status(), repoStore, repositoryCoordinator)
 				if (repositoryCampaignRoute[2] === "history") {
 					if ([...url.searchParams.keys()].some((key) => !["cursor", "limit"].includes(key))) { json(res, 400, { error: "history query fields are invalid" }); return }
 					const cursorRaw = url.searchParams.get("cursor") ?? "0", limitRaw = url.searchParams.get("limit") ?? "50"
@@ -279,7 +318,7 @@ async function handleRequest(
 						if (error instanceof Error && error.message === "history cursor is out of range") { json(res, 400, { error: error.message }); return }
 						throw error
 					}
-					json(res, 200, { mode: "offline-synthetic-only", modelCalls: 0, controlPlaneOnly: true, campaignId: repositoryCampaignRoute[1], ...page }); return
+					json(res, 200, { ...repositoryResponseMetadata(repositoryCoordinator), campaignId: repositoryCampaignRoute[1], ...page }); return
 				}
 				if (repositoryCampaignRoute[2] === "progress") {
 					if (url.search) { json(res, 400, { error: "progress query parameters are not supported" }); return }
@@ -291,7 +330,8 @@ async function handleRequest(
 					const observedAt = Date.now()
 					let fleetBudget: FleetRepositoryBudgetSnapshot | undefined
 					try { fleetBudget = await options.readRepositoryBudgetSnapshot?.(id) } catch { /* status remains explicit as unavailable */ }
-					json(res, 200, repositoryProgressSnapshot(definition, campaign, jobs, observedAt, fleetBudget)); return
+					const runtimeReadiness = repositoryCoordinator?.readiness(definition)
+					json(res, 200, repositoryProgressSnapshot(definition, campaign, jobs, observedAt, fleetBudget, runtimeReadiness)); return
 				}
 				if (repositoryCampaignRoute[1]) {
 					if (url.search) { json(res, 400, { error: "detail query parameters are not supported" }); return }
@@ -299,10 +339,10 @@ async function handleRequest(
 					const drafts = status.drafts as Array<Record<string, unknown>>
 					const item = campaigns.find((row) => row.id === repositoryCampaignRoute[1]) ?? drafts.find((row) => row.id === repositoryCampaignRoute[1])
 					if (!item) { json(res, 404, { error: "repository campaign is not registered" }); return }
-					json(res, 200, { mode: "offline-synthetic-only", modelCalls: 0, controlPlaneOnly: true, campaign: item }); return
+					json(res, 200, { ...repositoryResponseMetadata(repositoryCoordinator), campaign: item }); return
 				}
 				if (url.search) { json(res, 400, { error: "list query parameters are not supported" }); return }
-				json(res, 200, { mode: "offline-synthetic-only", modelCalls: 0, controlPlaneOnly: true, ...status })
+				json(res, 200, { ...repositoryResponseMetadata(repositoryCoordinator), ...status })
 			}
 			catch { json(res, 503, { error: "repository campaign status is unavailable" }) }
 			return
@@ -322,12 +362,42 @@ async function handleRequest(
 				typeof value.campaignId === "string" && typeof value.requestedModelProfile === "string" && typeof value.sourceRevision === "string") {
 				await repoStore.configureDraft(value.campaignId, { sourceRevision: value.sourceRevision, requestedModelProfile: value.requestedModelProfile })
 			} else if ((value.action === "start" || value.action === "stop") && Object.keys(value).sort().join(",") === "action,campaignId" && typeof value.campaignId === "string") {
-				if (value.action === "start") await repoStore.start(value.campaignId); else await repoStore.stop(value.campaignId)
+				const campaignId = value.campaignId
+				const definition = repoStore.registeredDefinitions().find((item) => item.id === campaignId)
+				if (!definition) throw new Error("repository campaign is not registered")
+				if (value.action === "start" && repositoryCoordinator) {
+					const runtime = repositoryCoordinator.readiness(definition)
+					if (runtime.state !== "ready") throw new Error(`campaign is blocked: ${runtime.reasons.join(", ")}`)
+				}
+				const mutation = async () => {
+					if (value.action === "start") {
+						const completeScope = Boolean(definition.repositoryId && definition.repository && typeof definition.sourceRevision === "string" &&
+							/^[a-f0-9]{40}$/.test(definition.sourceRevision) && typeof definition.policySha256 === "string" && /^[a-f0-9]{64}$/.test(definition.policySha256))
+						if (completeScope) await store.setRepositoryCampaign({ id: definition.id, repositoryId: definition.repositoryId!,
+							sourceRevision: definition.sourceRevision!, policySha256: definition.policySha256! }, true)
+						try { await repoStore.start(campaignId) }
+						catch (error) { if (completeScope) await store.setRepositoryCampaign({ id: definition.id, repositoryId: definition.repositoryId!,
+							sourceRevision: definition.sourceRevision!, policySha256: definition.policySha256! }, false).catch(() => undefined); throw error }
+					} else {
+						await repoStore.stop(campaignId)
+						await store.disableRepositoryCampaign(campaignId)
+				}
+				}
+				if (value.action === "start" && options.repositoryRunLease && path.resolve(store.path) === path.resolve(CAMPAIGN_CONTROL_FILE)) {
+					const status = await repoStore.status()
+					const campaign = (status.campaigns as Array<Record<string, unknown>>).find((item) => item.id === campaignId)
+					if (!campaign) throw new Error("repository campaign is not registered")
+					const run = campaign.enabled === true ? null : await options.repositoryRunLease.acquire(20 * 60_000)
+					if (campaign.enabled !== true && !run) throw new Error("campaign is blocked: global-campaign-run-lease-unavailable")
+					try { await withCampaignDispatchFence(store.path, mutation) }
+					finally { if (run) await options.repositoryRunLease.finish(run, "succeeded").catch(() => undefined) }
+				} else if (path.resolve(store.path) === path.resolve(CAMPAIGN_CONTROL_FILE)) await withCampaignDispatchFence(store.path, mutation)
+				else await mutation()
 			} else if (value.action === "budget" && Object.keys(value).sort().join(",") === "action,budgetMicros,budgetTokens,campaignId" &&
 				typeof value.campaignId === "string" && Number.isSafeInteger(value.budgetMicros) && Number.isSafeInteger(value.budgetTokens)) {
 				await repoStore.setCampaignBudget(value.campaignId, value.budgetMicros as number, value.budgetTokens as number)
 			} else { json(res, 400, { error: "repository campaign action or fields are invalid" }); return }
-			json(res, 200, { mode: "offline-synthetic-only", modelCalls: 0, controlPlaneOnly: true, ...(await repoStore.status()) })
+			json(res, 200, { ...repositoryResponseMetadata(repositoryCoordinator), ...(await repoStore.status()) })
 		} catch (error) {
 			const message = error instanceof Error && (error.message === "repository campaign is not registered" || error.message === "repository draft is not registered" || error.message === "repository campaign is already registered" || error.message === "repository draft metadata is invalid" || error.message === "repository draft configuration is invalid" || error.message === "budget is outside the permitted range" ||
 				error.message.startsWith("campaign is blocked:") || error.message === "campaign budget is below committed usage" ||
@@ -362,11 +432,29 @@ export async function startCampaignControlServer(options: CampaignControlServerO
 	const store = options.store ?? new CampaignControlStore(options.controlPath ?? CAMPAIGN_CONTROL_FILE)
 	if (!options.repositoryCampaigns && options.repositoryCampaignRegistryPath) {
 		const definitions = await loadRepositoryCampaignDefinitions(options.repositoryCampaignRegistryPath)
-		options.repositoryCampaigns = new RepositoryCampaignStore(options.repositoryCampaignStatePath ?? `${options.repositoryCampaignRegistryPath}.state.json`, definitions)
+		const readAuthority = createRepositoryBudgetAuthorityReader(definitions, store.path)
+		options.readRepositoryBudgetSnapshot ??= readAuthority as (campaignId: string) => Promise<FleetRepositoryBudgetSnapshot>
+		options.repositoryCampaigns = new RepositoryCampaignStore(options.repositoryCampaignStatePath ?? `${options.repositoryCampaignRegistryPath}.state.json`, definitions, readAuthority)
 	}
+	if (options.repositoryCampaigns && path.resolve(store.path) === path.resolve(CAMPAIGN_CONTROL_FILE)) {
+		const definitions = options.repositoryCampaigns.registeredDefinitions()
+		if (definitions.length) await withCampaignDispatchFence(store.path, async () => {
+			for (const definition of definitions) await store.registerRepositoryCampaign(definition)
+		})
+	}
+	let repositoryCoordinator: RepositoryCampaignCoordinator | undefined
+	if (options.enableRepositoryCoordinator && options.repositoryCampaigns) {
+		const registrations = await loadRepositoryWorkerRegistrations(options.repositoryWorkerRegistryPath ?? REPOSITORY_WORKER_REGISTRY_FILE)
+		const workers = options.repositoryWorkers ?? bindRepositoryWorkerRegistrations(options.repositoryCampaigns.registeredDefinitions(), registrations,
+			options.repositoryPipelineAdapterFactories ?? BUILTIN_REPOSITORY_PIPELINE_ADAPTER_FACTORIES, { store: options.repositoryCampaigns })
+		options.repositoryRunLease ??= (path.resolve(store.path) === path.resolve(CAMPAIGN_CONTROL_FILE)
+			? createRepositoryCampaignRunLease(store.path) : undefined)
+		repositoryCoordinator = new RepositoryCampaignCoordinator(options.repositoryCampaigns, workers, undefined, options.repositoryRunLease)
+	}
+	if (repositoryCoordinator) await repositoryCoordinator.start()
 	let actualPort = port
 	const server = http.createServer((req, res) => {
-		void handleRequest(req, res, options, staticRoot, store, actualPort).catch(() => {
+		void handleRequest(req, res, options, staticRoot, store, actualPort, repositoryCoordinator).catch(() => {
 			if (!res.headersSent) json(res, 500, { error: "campaign control request failed" })
 			else res.end()
 		})
@@ -377,6 +465,7 @@ export async function startCampaignControlServer(options: CampaignControlServerO
 			server.removeListener("error", reject)
 			const address = server.address()
 			actualPort = address && typeof address !== "string" ? address.port : port
+			if (repositoryCoordinator) server.once("close", () => { void repositoryCoordinator.stop() })
 			resolve(server)
 		})
 	})

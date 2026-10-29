@@ -10,8 +10,8 @@ export type ProgressState = "ready" | "running" | "waiting" | "stopping" | "stop
 	"budget-exhausted" | "blocked-prerequisite" | "blocked-access" | "failed" | "unavailable"
 
 export interface FleetRepositoryBudgetSnapshot {
-	mode: "fleet-v2"; available: boolean; limitMicros: number; limitTokens: number; committedMicros: number; committedTokens: number;
-	asOfMs: number; campaignId: string; globalEnabled: boolean; canAdmit: boolean; controlEpoch: number; runId: string; runExpiresAtMs: number;
+	mode: "fleet-v2" | "fleet-v2-readonly"; available: boolean; snapshotOnly?: boolean; limitMicros: number; limitTokens: number; committedMicros: number; committedTokens: number;
+	asOfMs: number; campaignId: string; globalEnabled: boolean; canAdmit: boolean; controlEpoch: number; runId: string | null; runExpiresAtMs: number | null;
 	repositoryCampaignId: string; repositoryId: string; repository: string; sourceRevision: string; policySha256: string;
 	model: string; profileId: string; repositoryEnabled: boolean; repositoryEpoch: number;
 	monthly: { month: string; limitMicros: number; settledMicros: number; reservedMicros: number; ambiguousMicros: number };
@@ -57,6 +57,7 @@ export interface RepositoryProgressSnapshot {
 		blocker: string | null
 		nextStep: string | null
 		evidenceRefs: RepositoryEvidenceRef[]
+		boardRef: string | null
 		usage: {
 			source: "repository-claim" | "fleet-v2-ledger" | "unavailable"
 			state: "reserved" | "measured" | "ambiguous" | "unavailable"
@@ -77,6 +78,11 @@ export interface RepositoryProgressSnapshot {
 		failed: number | null
 		ambiguous: number | null
 	}
+}
+
+export interface RepositoryRuntimeReadiness {
+	state: "ready" | "blocked-prerequisite" | "blocked-access"
+	reasons: string[]
 }
 
 function readinessState(campaign: Record<string, unknown>): RepositoryProgressSnapshot["readiness"]["state"] {
@@ -122,6 +128,7 @@ export function repositoryProgressSnapshot(
 	jobs: RepositoryCampaignJob[],
 	observedAt = Date.now(),
 	fleetBudget?: FleetRepositoryBudgetSnapshot,
+	runtimeReadiness?: RepositoryRuntimeReadiness,
 ): RepositoryProgressSnapshot {
 	const liveJobs = jobs.filter((job) => job.progress?.executionKind === "live-cve")
 	const developmentJobs = jobs.filter((job) => job.progress?.executionKind === "development-checkpoint")
@@ -132,13 +139,14 @@ export function repositoryProgressSnapshot(
 	const leaseExpiry = active.length ? Math.min(...active.map((job) => job.progress!.leaseExpiresAt)) : null
 	const freshness: ProgressFreshness = unknownActive ? "unavailable" : active.length === 0 ? "fresh" : active.some((job) =>
 		observedAt - job.progress!.heartbeatAt > REPOSITORY_PROGRESS_FRESH_MS || observedAt > job.progress!.leaseExpiresAt) ? "stale" : "fresh"
-	const budgetFresh = Boolean(fleetBudget && fleetBudget.mode === "fleet-v2" && fleetBudget.available &&
+	const budgetFresh = Boolean(fleetBudget && (fleetBudget.mode === "fleet-v2" ? fleetBudget.available && !fleetBudget.snapshotOnly : fleetBudget.snapshotOnly === true) &&
 		Number.isSafeInteger(fleetBudget.asOfMs) && observedAt - fleetBudget.asOfMs <= REPOSITORY_PROGRESS_FRESH_MS &&
-		fleetBudget.asOfMs <= observedAt + REPOSITORY_PROGRESS_FRESH_MS && fleetBudget.runExpiresAtMs > observedAt &&
+		fleetBudget.asOfMs <= observedAt + REPOSITORY_PROGRESS_FRESH_MS &&
+		(fleetBudget.mode === "fleet-v2-readonly" ? fleetBudget.runId === null && fleetBudget.runExpiresAtMs === null : fleetBudget.runExpiresAtMs !== null && fleetBudget.runExpiresAtMs > observedAt) &&
 		definition.repositoryId !== undefined && definition.repository !== undefined &&
 		fleetBudget.repositoryCampaignId === definition.id && fleetBudget.repositoryId === definition.repositoryId &&
 		fleetBudget.repository === definition.repository &&
-		fleetBudget.sourceRevision === definition.sourceRevision && fleetBudget.model === definition.model &&
+		fleetBudget.sourceRevision === definition.sourceRevision && fleetBudget.policySha256 === definition.policySha256 && fleetBudget.model === definition.model &&
 		fleetBudget.profileId === definition.workerProfile && /^[a-f0-9]{64}$/.test(fleetBudget.policySha256));
 	const nullCampaign = { limitMicros: null, limitTokens: null, settledMicros: null, reservedMicros: null, ambiguousMicros: null, settledTokens: null, reservedTokens: null, ambiguousTokens: null }
 	const nullLifetime = { settledMicros: null, reservedMicros: null, ambiguousMicros: null, settledTokens: null, reservedTokens: null, ambiguousTokens: null }
@@ -152,13 +160,17 @@ export function repositoryProgressSnapshot(
 		failed: freshCounts ? visibleJobs.filter((job) => job.status === "failed").length : null,
 		ambiguous: freshCounts ? visibleJobs.filter((job) => job.status === "ambiguous").length : null,
 	}
+	const localReadiness = readinessState(campaign)
+	const readinessReasons = Array.isArray(campaign.readinessReasons) ? campaign.readinessReasons.filter((x): x is string => typeof x === "string") : []
+	if (runtimeReadiness && runtimeReadiness.state !== "ready") readinessReasons.push(...runtimeReadiness.reasons)
+	const readiness = runtimeReadiness && runtimeReadiness.state !== "ready" ? runtimeReadiness.state : localReadiness
 	return {
 		schemaVersion: 1,
 		executionKind: liveJobs.length && developmentJobs.length ? "unavailable" : liveJobs.length ? "live-cve" : developmentJobs.length ? "development-checkpoint" : "unavailable",
 		observedAt,
 		repository: { id: definition.id, name: definition.name, slug: definition.repository ?? null },
-		state: campaignState(campaign.state),
-		readiness: { state: readinessState(campaign), reasons: Array.isArray(campaign.readinessReasons) ? campaign.readinessReasons.filter((x): x is string => typeof x === "string") : [] },
+		state: readiness === "blocked-prerequisite" || readiness === "blocked-access" ? readiness : campaignState(campaign.state),
+		readiness: { state: readiness, reasons: [...new Set(readinessReasons)].slice(0, 32) },
 		freshness: { state: freshness, lastHeartbeatAt: lastHeartbeat, leaseExpiresAt: leaseExpiry },
 		budget: budgetFresh ? {
 			source: "fleet-v2-ledger", updatedAt: fleetBudget!.asOfMs, state: "measured",
@@ -182,7 +194,8 @@ export function repositoryProgressSnapshot(
 			executionKind: job.progress.executionKind, status: job.status, stage: job.progress.stage, goal: job.progress.goal,
 			currentTask: job.progress.currentTask, completedSteps: [...job.progress.completedSteps], requiredSteps: [...job.progress.requiredSteps],
 			lastActionAt: job.progress.lastActionAt, heartbeatAt: job.progress.heartbeatAt, leaseExpiresAt: job.progress.leaseExpiresAt,
-			blocker: job.progress.blocker, nextStep: job.progress.nextStep, evidenceRefs: structuredClone(job.progress.evidenceRefs), usage: usage(job) }] : []),
+			blocker: job.progress.blocker, nextStep: job.progress.nextStep, evidenceRefs: structuredClone(job.progress.evidenceRefs),
+			boardRef: job.progress.boardRef ?? null, usage: usage(job) }] : []),
 		counts,
 	}
 }

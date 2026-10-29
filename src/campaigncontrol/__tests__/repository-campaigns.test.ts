@@ -11,9 +11,9 @@ const qualified = {
 	modelApproved: true, dataApproved: true, accessApproved: true,
 }
 const definitions: RepositoryCampaignDefinition[] = [
-	{ id: "headlesscode-internal", name: "HeadlessCode", sourceRevision: "a".repeat(40), workerProfile: "mock-worker",
+	{ id: "headlesscode-internal", name: "HeadlessCode", sourceRevision: "a".repeat(40), policySha256: "1".repeat(64), workerProfile: "mock-worker",
 		recipeDigest: "b".repeat(64), evaluatorDigest: "c".repeat(64), model: "synthetic-fixture-only", dataAccessProfile: "fixture-only", qualification: qualified },
-	{ id: "fleet-security-watch", name: "Fleet Security Watch", sourceRevision: "d".repeat(40), workerProfile: "mock-worker",
+	{ id: "fleet-security-watch", name: "Fleet Security Watch", sourceRevision: "d".repeat(40), policySha256: "2".repeat(64), workerProfile: "mock-worker",
 		recipeDigest: "e".repeat(64), evaluatorDigest: "f".repeat(64), model: "synthetic-fixture-only", dataAccessProfile: "fixture-only", qualification: qualified },
 	{ id: "missing-worker", name: "Missing Worker", sourceRevision: null, workerProfile: null,
 		recipeDigest: null, evaluatorDigest: null, model: null, dataAccessProfile: null,
@@ -233,7 +233,8 @@ async function testClaimProgressIsDurableFencedAndEvidenceIsAppendOnly(): Promis
 		const claim = await store.claimNext("headlesscode-internal", { micros: 20_000, tokens: 20_000 }, now)
 		assert.ok(claim)
 		const ref = { id: "a".repeat(64), kind: "test-receipt" as const, label: "Offline test receipt" }
-		await store.updateClaimProgress(claim!, { stage: "verify", currentTask: "Run the fixed offline regression", completedSteps: ["intake", "deduplicate", "investigate", "prepare-candidate"], nextStep: "deliver", evidenceRefs: [ref] }, new Date(now.getTime() + 10))
+		const boardRef = `http://127.0.0.1:8078/api/cards/1c25cecf-e5e8-4b68-b6fd-5d6ad25426d7#hc-repository-result-v1:${"b".repeat(64)}`
+		await store.updateClaimProgress(claim!, { stage: "verify", currentTask: "Run the fixed offline regression", completedSteps: ["intake", "deduplicate", "investigate", "prepare-candidate"], nextStep: "deliver", evidenceRefs: [ref], boardRef }, new Date(now.getTime() + 10))
 		await store.heartbeat(claim!, new Date(now.getTime() + 20))
 		const persisted = new RepositoryCampaignStore(store.path, definitions)
 		const status = await persisted.status(new Date(now.getTime() + 21)) as any
@@ -242,13 +243,17 @@ async function testClaimProgressIsDurableFencedAndEvidenceIsAppendOnly(): Promis
 		assert.equal(job.progress.workerId.length, 36)
 		assert.equal(job.progress.heartbeatAt, now.getTime() + 20)
 		assert.equal(job.progress.leaseExpiresAt, now.getTime() + 20 + 120_000)
+		assert.equal(job.progress.boardRef, boardRef)
 		await assert.rejects(persisted.updateClaimProgress(claim!, { stage: "intake", currentTask: "Reset progress", completedSteps: [] }, new Date(now.getTime() + 30)), /cannot forget completed steps/)
 		await assert.rejects(persisted.updateClaimProgress(claim!, { stage: "verify", currentTask: "Replace evidence", completedSteps: ["intake", "deduplicate", "investigate", "prepare-candidate"], evidenceRefs: [] }, new Date(now.getTime() + 31)), /evidence cannot be removed/)
+		await assert.rejects(persisted.updateClaimProgress(claim!, { stage: "verify", currentTask: "Replace link", completedSteps: ["intake", "deduplicate", "investigate", "prepare-candidate"], boardRef: "https://example.com/" }, new Date(now.getTime() + 32)), /invalid/)
+		await assert.rejects(persisted.updateClaimProgress(claim!, { stage: "verify", currentTask: "Replace link", completedSteps: ["intake", "deduplicate", "investigate", "prepare-candidate"], boardRef: null }, new Date(now.getTime() + 33)), /cannot be removed or changed/)
 		const snapshot = repositoryProgressSnapshot(definitions[0]!, status.campaigns.find((item: any) => item.id === "headlesscode-internal"), status.jobs.filter((item: any) => item.campaignId === "headlesscode-internal"), now.getTime() + 21)
 		assert.equal(snapshot.executionKind, "development-checkpoint")
 		assert.equal(snapshot.freshness.state, "fresh")
 		assert.equal(snapshot.workers[0]?.usage.state, "unavailable", "development checkpoint usage is not reported as real spend")
 		assert.equal(snapshot.workers[0]?.evidenceRefs[0]?.id, ref.id)
+		assert.equal(snapshot.workers[0]?.boardRef, boardRef)
 	} finally { await fs.rm(root, { recursive: true, force: true }) }
 }
 
@@ -286,6 +291,36 @@ async function testSyntheticAuthorityCannotCreateLiveCveProgress(): Promise<void
 	} finally { await fs.rm(root, { recursive: true, force: true }) }
 }
 
+async function testPublishedAdvisoryIntakePersistsSourceDigestAndQueuesOnlySupportedRecordOnce(): Promise<void> {
+	const { root, store } = await fixture()
+	try {
+		const now = new Date("2026-10-29T12:00:00Z")
+		await store.setCampaignBudget("headlesscode-internal", 50_000, 50_000, now)
+		await store.start("headlesscode-internal", now)
+		const source = "a".repeat(40)
+		const digest = "b".repeat(64)
+		const unsupported = await store.observePublishedAdvisory({ campaignId: "headlesscode-internal", publicBaseRevision: source,
+			advisoryId: "CVE-2026-1234", snapshotSha256: "c".repeat(64), eligible: false }, now)
+		assert.equal(unsupported.record.disposition, "unsupported-profile")
+		assert.equal(unsupported.queued, false)
+		const first = await store.observePublishedAdvisory({ campaignId: "headlesscode-internal", publicBaseRevision: source,
+			advisoryId: "CVE-2026-1235", snapshotSha256: digest, eligible: true }, now)
+		assert.equal(first.changed, true)
+		assert.equal(first.queued, true)
+		assert.ok(first.record.jobId)
+		const restarted = new RepositoryCampaignStore(store.path, definitions)
+		const duplicate = await restarted.observePublishedAdvisory({ campaignId: "headlesscode-internal", publicBaseRevision: source,
+			advisoryId: "CVE-2026-1235", snapshotSha256: digest, eligible: true }, new Date(now.getTime() + 10))
+		assert.equal(duplicate.changed, false)
+		assert.equal(duplicate.queued, false)
+		const status = await restarted.status(new Date(now.getTime() + 11)) as any
+		assert.equal(status.jobs.filter((job: any) => job.advisoryId === "CVE-2026-1235").length, 1)
+		assert.equal(status.jobs.filter((job: any) => job.advisoryId === "CVE-2026-1234").length, 0)
+		assert.equal(status.intakeRecords.length, 2)
+		assert.equal(status.intakeRecords.find((row: any) => row.advisoryId === "CVE-2026-1234").disposition, "unsupported-profile")
+	} finally { await fs.rm(root, { recursive: true, force: true }) }
+}
+
 const tests: readonly SuiteTest[] = [
 	["aggregate budget reservations are atomic across repository campaigns", testAggregateClaimsAreAtomicAcrossRepositories],
 	["stop cancels queued work and rejects new claims", testStopCancelsQueuedWorkAndFencesNewClaims],
@@ -300,6 +335,7 @@ const tests: readonly SuiteTest[] = [
 	["claim progress persists under the claim lock and cannot forget evidence or completed steps", testClaimProgressIsDurableFencedAndEvidenceIsAppendOnly],
 	["expired worker lease makes freshness and counts unavailable", testProgressSnapshotMarksExpiredLeaseStaleAndHidesCounts],
 	["synthetic authority cannot create a live-CVE worker claim", testSyntheticAuthorityCannotCreateLiveCveProgress],
+	["published advisory intake persists source digests, exposes unsupported rows, and deduplicates after restart", testPublishedAdvisoryIntakePersistsSourceDigestAndQueuesOnlySupportedRecordOnce],
 ]
 
 runMain("repository-campaigns", tests)

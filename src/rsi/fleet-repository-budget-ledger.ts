@@ -51,8 +51,9 @@ export interface FleetRepositoryReconciliation {
 }
 
 export interface FleetRepositoryBudgetSnapshot {
-	mode: "fleet-v2"
+	mode: "fleet-v2" | "fleet-v2-readonly"
 	available: boolean
+	snapshotOnly?: boolean
 	limitMicros: number
 	limitTokens: number
 	committedMicros: number
@@ -62,8 +63,8 @@ export interface FleetRepositoryBudgetSnapshot {
 	globalEnabled: boolean
 	canAdmit: boolean
 	controlEpoch: number
-	runId: string
-	runExpiresAtMs: number
+	runId: string | null
+	runExpiresAtMs: number | null
 	repositoryCampaignId: string
 	repositoryId: string
 	repository: string
@@ -194,7 +195,16 @@ export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 
 	/** Read the registered scope's current Fleet epochs and separate monthly/lifetime usage. */
 	async budgetSnapshot(): Promise<FleetRepositoryBudgetSnapshot> {
-		const result = await this.call({ schemaVersion: 2, op: "repository-budget-status", campaignId: FLEET_BUDGET_CAMPAIGN_ID,
+		return await this.readBudgetSnapshot("repository-budget-status")
+	}
+
+	/** Read accounting for cold-start UI/budget setup without creating a run or admission. */
+	async budgetSnapshotOnly(): Promise<FleetRepositoryBudgetSnapshot> {
+		return await this.readBudgetSnapshot("repository-budget-snapshot")
+	}
+
+	private async readBudgetSnapshot(op: "repository-budget-status" | "repository-budget-snapshot"): Promise<FleetRepositoryBudgetSnapshot> {
+		const result = await this.call({ schemaVersion: 2, op, campaignId: FLEET_BUDGET_CAMPAIGN_ID,
 			repositoryCampaignId: this.scope.repositoryCampaignId, repositoryId: this.scope.repositoryId,
 			repository: this.scope.repository, sourceRevision: this.scope.sourceRevision,
 			policySha256: this.scope.policySha256, model: this.scope.model, profileId: this.scope.profileId,
@@ -203,11 +213,14 @@ export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 		const campaignLifetime = result.campaignLifetime
 		const legacyLifetime = result.legacyLifetime
 		const repositoryLifetime = result.repositoryLifetime
-		if (result.schemaVersion !== 2 || typeof result.available !== "boolean" || !Number.isSafeInteger(result.asOfMs) ||
+		const snapshotOnly = op === "repository-budget-snapshot"
+		if (result.schemaVersion !== 2 || typeof result.available !== "boolean" || (snapshotOnly && result.snapshotOnly !== true) ||
+			(!snapshotOnly && result.snapshotOnly !== undefined && result.snapshotOnly !== false) || !Number.isSafeInteger(result.asOfMs) ||
 			result.campaignId !== FLEET_BUDGET_CAMPAIGN_ID || typeof result.globalEnabled !== "boolean" || typeof result.canAdmit !== "boolean" ||
 			Date.now() - Number(result.asOfMs) > 60_000 || Number(result.asOfMs) > Date.now() + 60_000 ||
-			!Number.isSafeInteger(result.controlEpoch) || typeof result.runId !== "string" || !ID.test(result.runId) ||
-			!Number.isSafeInteger(result.runExpiresAtMs) || Number(result.asOfMs) >= Number(result.runExpiresAtMs) ||
+			!Number.isSafeInteger(result.controlEpoch) || (snapshotOnly
+				? result.runId !== null || result.runExpiresAtMs !== null || result.available !== false
+				: typeof result.runId !== "string" || !ID.test(result.runId) || !Number.isSafeInteger(result.runExpiresAtMs) || Number(result.asOfMs) >= Number(result.runExpiresAtMs)) ||
 			result.repositoryCampaignId !== this.scope.repositoryCampaignId || result.repositoryId !== this.scope.repositoryId ||
 			result.repository !== this.scope.repository || result.sourceRevision !== this.scope.sourceRevision ||
 			result.policySha256 !== this.scope.policySha256 || result.model !== this.scope.model || result.profileId !== this.scope.profileId ||
@@ -223,7 +236,7 @@ export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 		const campaignTokens = Number(campaignLifetime.settledTokens) + Number(campaignLifetime.reservedTokens) + Number(campaignLifetime.ambiguousTokens)
 		const repositorySpend = Number(repositoryLifetime.settledMicros) + Number(repositoryLifetime.reservedMicros) + Number(repositoryLifetime.ambiguousMicros)
 		const repositoryTokens = Number(repositoryLifetime.settledTokens) + Number(repositoryLifetime.reservedTokens) + Number(repositoryLifetime.ambiguousTokens)
-		const derivedAvailable = result.globalEnabled === true && result.canAdmit === true && result.repositoryEnabled === true &&
+		const derivedAvailable = !snapshotOnly && result.globalEnabled === true && result.canAdmit === true && result.repositoryEnabled === true &&
 			monthlyUsed < Number(monthly.limitMicros) && campaignSpend < 20_000 && campaignTokens < 108_000 &&
 			repositorySpend < Number(repositoryLifetime.limitMicros) && repositoryTokens < Number(repositoryLifetime.limitTokens)
 		if (result.externalCommittedMicros !== externalMicros || result.externalCommittedTokens !== externalTokens ||
@@ -233,10 +246,11 @@ export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 			repositorySpend > Number(repositoryLifetime.limitMicros) || repositoryTokens > Number(repositoryLifetime.limitTokens)) {
 			throw new Error("Fleet repository budget snapshot counters are inconsistent")
 		}
-		return { mode: "fleet-v2", available: result.available, limitMicros: 20_000, limitTokens: 108_000,
+		return { mode: snapshotOnly ? "fleet-v2-readonly" : "fleet-v2", available: result.available,
+			...(snapshotOnly ? { snapshotOnly: true } : {}), limitMicros: 20_000, limitTokens: 108_000,
 			committedMicros: externalMicros, committedTokens: externalTokens, asOfMs: Number(result.asOfMs),
 			campaignId: FLEET_BUDGET_CAMPAIGN_ID, globalEnabled: result.globalEnabled, canAdmit: result.canAdmit,
-			controlEpoch: Number(result.controlEpoch), runId: result.runId, runExpiresAtMs: Number(result.runExpiresAtMs),
+			controlEpoch: Number(result.controlEpoch), runId: snapshotOnly ? null : String(result.runId), runExpiresAtMs: snapshotOnly ? null : Number(result.runExpiresAtMs),
 			repositoryCampaignId: String(result.repositoryCampaignId), repositoryId: String(result.repositoryId),
 			repository: String(result.repository), sourceRevision: String(result.sourceRevision), policySha256: String(result.policySha256),
 			model: String(result.model), profileId: String(result.profileId), repositoryEnabled: result.repositoryEnabled,

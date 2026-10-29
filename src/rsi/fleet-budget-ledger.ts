@@ -18,6 +18,20 @@ const BRIDGE_MODULE = "operations/campaign_budget_bridge.py"
 export const FLEET_BUDGET_CAMPAIGN_ID = "fleet-security-watch" as const
 const FLEET_CAMPAIGN_CONFIG = path.join(os.homedir(), ".local", "state", "fleet-security-watch", "automation", "campaign", "config.json")
 
+/** Read only the configured credential fingerprint; never return the credential itself. */
+export async function readFleetBudgetKeyIdentity(configPath = FLEET_CAMPAIGN_CONFIG): Promise<string> {
+	if (!await verifyFleetBudgetCredential(configPath)) throw new Error("verified Fleet campaign credential is unavailable")
+	const info = await fs.lstat(configPath)
+	if (!info.isFile() || info.isSymbolicLink() || info.size > 32 * 1024 || (info.mode & 0o077) !== 0 ||
+		(typeof process.getuid === "function" && info.uid !== process.getuid())) throw new Error("Fleet campaign config is not private")
+	const handle = await fs.open(configPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
+	try {
+		const value = JSON.parse(await handle.readFile("utf8")) as Record<string, unknown>
+		if (typeof value.key_identity !== "string" || !/^[a-f0-9]{64}$/.test(value.key_identity)) throw new Error("Fleet campaign key identity is invalid")
+		return value.key_identity
+	} finally { await handle.close() }
+}
+
 /** Verify the configured Fleet key in place without returning or logging its value. */
 export async function verifyFleetBudgetCredential(configPath = FLEET_CAMPAIGN_CONFIG, expectedUid = typeof process.getuid === "function" ? process.getuid() : 0): Promise<boolean> {
   let configHandle: fs.FileHandle | undefined

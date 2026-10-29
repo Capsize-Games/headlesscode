@@ -24,6 +24,24 @@ export const OPENSHELL_HARNESS_ROOT = "/opt/headlesscode"
 
 export const OPENSHELL_WORKSPACE_TARGET = "/workspace"
 
+const HOST_RUNTIME_ENV_KEYS = new Set([
+	"XDG_CONFIG_HOME", "XDG_STATE_HOME", "HEADLESSCODE_CONTAINED_PROFILE", "HEADLESSCODE_CONTAINED_PROFILE_SHA256",
+	"HEADLESSCODE_CONTAINED_EVIDENCE_CONFIG_DIR", "HEADLESSCODE_RSI_BROKER_BIND_HOST",
+	"HEADLESSCODE_OPENSHELL_SCRATCH_ROOT", "HEADLESSCODE_CONTROL_ID", "HEADLESSCODE_CONTROL_STATE_DIR",
+	"HEADLESSCODE_CONTROL_SOCKET_DIR", "HEADLESSCODE_CONTAINED_SESSION_PREFIX", "HEADLESSCODE_CONTAINED_SESSION_ID",
+])
+
+export function validateOpenShellHostRuntimeEnv(input: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
+	if (input === undefined) return {}
+	if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("OpenShell host runtime environment must be a map")
+	const result: NodeJS.ProcessEnv = {}
+	for (const [key, value] of Object.entries(input)) {
+		if (!HOST_RUNTIME_ENV_KEYS.has(key) || typeof value !== "string" || value.includes("\0")) throw new Error(`OpenShell host runtime environment field is not allowed: ${key}`)
+		result[key] = value
+	}
+	return result
+}
+
 interface LinuxProcessIdentity {
 	pid: number
 	processGroupId: number
@@ -187,13 +205,18 @@ export interface OpenShellSessionProviderOptions {
 	signal?: AbortSignal
 	stopGraceMs?: number
 	deleteVerifyTimeoutMs?: number
+	/** Narrow nonsecret host-only environment for the OpenShell CLI; never copied to guest request env. */
+	hostRuntimeEnv?: NodeJS.ProcessEnv
 	emergencyControl?: Pick<EmergencyControl, "identity" | "state" | "stateDirectoryPath" | "signal" | "assertRunning" | "registerCleanup" | "registerResource" | "releaseResource">
 }
 
-export function runOpenShellCommandAsync(args: string[], timeoutMs?: number, executable = "openshell", signal?: AbortSignal, graceMs = 1_000): Promise<CommandResult> {
+export function runOpenShellCommandAsync(args: string[], timeoutMs?: number, executable = "openshell", signal?: AbortSignal, graceMs = 1_000,
+	hostRuntimeEnv: NodeJS.ProcessEnv = {}): Promise<CommandResult> {
+	const scopedHostEnvironment = validateOpenShellHostRuntimeEnv(hostRuntimeEnv)
 	return new Promise((resolve, reject) => {
 		if (signal?.aborted) { reject(signal.reason ?? new Error("OpenShell command aborted")); return }
-		const child = spawn(executable, args, { stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" })
+		const child = spawn(executable, args, { stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32",
+			env: { ...process.env, ...scopedHostEnvironment } })
 		let stdout = ""
 		let stderr = ""
 		let timer: NodeJS.Timeout | undefined
@@ -425,6 +448,7 @@ export class OpenShellSessionProvider implements CloudProvider {
 	private readonly readOnlyMounts: Array<{ source: string; target: string }>
 	private readonly run: (args: string[], timeoutMs?: number) => CommandResult
 	private readonly runHarnessCommand: (args: string[], timeoutMs?: number, signal?: AbortSignal) => Promise<CommandResult>
+	private readonly hostRuntimeEnv: NodeJS.ProcessEnv
 	private readonly listSandboxes: () => string[]
 	private readonly importResults: boolean
 	private readonly scratchRoot: string
@@ -445,6 +469,7 @@ export class OpenShellSessionProvider implements CloudProvider {
 	private readonly creating = new Map<string, Promise<void>>()
 
 	constructor(options: OpenShellSessionProviderOptions = {}) {
+		this.hostRuntimeEnv = validateOpenShellHostRuntimeEnv(options.hostRuntimeEnv)
 		this.image = options.image ?? process.env.HEADLESSCODE_OPENSHELL_IMAGE ?? "headlesscode-openshell:local"
 		this.policy = options.policy ?? process.env.HEADLESSCODE_OPENSHELL_POLICY
 		this.providers = options.providers ?? (process.env.HEADLESSCODE_OPENSHELL_PROVIDERS ?? "headlesscode-openrouter").split(",").map((name) => name.trim()).filter(Boolean)
@@ -488,12 +513,13 @@ export class OpenShellSessionProvider implements CloudProvider {
 		}
 		const injectedRun = options.run
 		this.run = injectedRun ?? ((args, timeoutMs) => {
-			const result = spawnSync("openshell", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs })
+			const result = spawnSync("openshell", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs,
+				env: { ...process.env, ...this.hostRuntimeEnv } })
 			return { exitCode: result.status ?? 1, output: `${result.stdout ?? ""}${result.stderr ?? ""}`.trim() }
 		})
 		this.runHarnessCommand = options.runAsync ?? (injectedRun
 			? async (args, timeoutMs) => injectedRun(args, timeoutMs)
-			: (args, timeoutMs, signal) => runOpenShellCommandAsync(args, timeoutMs, "openshell", signal, this.stopGraceMs))
+			: (args, timeoutMs, signal) => runOpenShellCommandAsync(args, timeoutMs, "openshell", signal, this.stopGraceMs, this.hostRuntimeEnv))
 		this.listSandboxes = options.listSandboxes ?? (() => {
 			const result = this.run(["sandbox", "list", "--output", "json"])
 			if (result.exitCode !== 0) throw new Error(`OpenShell sandbox list failed: ${result.output}`)

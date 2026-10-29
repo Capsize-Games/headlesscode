@@ -2,12 +2,16 @@ import * as fs from "node:fs/promises"
 import * as constants from "node:fs"
 import * as path from "node:path"
 import { randomUUID } from "node:crypto"
+import { CURL_CAMPAIGN_ID, CURL_DEBIAN_AFFECTED_RANGE, CURL_DEBIAN_FIXED_REVISION, CURL_DEBIAN_INTRODUCED_REVISION,
+	CURL_DEBIAN_PUBLIC_BASE_REVISION, CURL_DEBIAN_SNAPSHOT_SHA256, CURL_DEBIAN_SOURCE_HTML_SHA256, CURL_DEBIAN_SOURCE_URL,
+	CURL_FIXED_ADVISORY } from "./repository-known-advisory.js"
 
 export const REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS = 5_000_000
 // Keeps the mock subcap within the existing fixed Fleet campaign's 108k-token ceiling.
 export const REPOSITORY_CAMPAIGN_BUDGET_CAP_TOKENS = 108_000
 const MAX_CAMPAIGNS = 32
 const MAX_JOBS = 500
+const MAX_INTAKE_RECORDS = 5_000
 const MAX_HISTORY = 200
 const MOCK_DISPATCH_TIMEOUT_MS = 30_000
 export const REPOSITORY_WORKER_LEASE_MS = 120_000
@@ -35,7 +39,11 @@ export interface RepositoryJobProgress {
 	blocker: string | null
 	nextStep: string | null
 	evidenceRefs: RepositoryEvidenceRef[]
+	/** Fixed local Agent Board result reference, present only after verified private delivery. */
+	boardRef?: string | null
 }
+
+const PRIVATE_BOARD_REF = /^http:\/\/127\.0\.0\.1:8078\/api\/cards\/1c25cecf-e5e8-4b68-b6fd-5d6ad25426d7#hc-repository-result-v1:[a-f0-9]{64}$/
 
 export interface RepositoryCampaignDefinition {
 	id: string
@@ -43,6 +51,7 @@ export interface RepositoryCampaignDefinition {
 	repositoryId?: string
 	repository?: string
 	sourceRevision: string | null
+	policySha256?: string
 	workerProfile: string | null
 	recipeDigest: string | null
 	evaluatorDigest: string | null
@@ -60,8 +69,9 @@ export interface RepositoryCampaignDefinition {
 }
 
 export interface RepositoryBudgetAuthority {
-	mode: "synthetic-test" | "fleet-v2"
+	mode: "synthetic-test" | "fleet-v2" | "fleet-v2-readonly" | "unavailable"
 	available: boolean
+	snapshotOnly?: boolean
 	limitMicros: number
 	limitTokens: number
 	committedMicros: number
@@ -72,8 +82,8 @@ export interface RepositoryBudgetAuthority {
 	globalEnabled?: boolean
 	canAdmit?: boolean
 	controlEpoch?: number
-	runId?: string
-	runExpiresAtMs?: number
+	runId?: string | null
+	runExpiresAtMs?: number | null
 	repositoryCampaignId?: string
 	repositoryId?: string
 	repository?: string
@@ -105,6 +115,21 @@ export interface RepositoryCampaignJob {
 	settledTokens: number
 	progress?: RepositoryJobProgress
 	detail?: string
+	purpose?: "qualification"
+}
+
+export interface RepositoryAdvisoryIntakeRecord {
+	campaignId: string
+	publicBaseRevision: string
+	advisoryId: string
+	snapshotSha256: string
+	disposition: "eligible" | "unsupported-profile"
+	firstSeenAt: number
+	lastSeenAt: number
+	jobId: string | null
+	source?: "osv-commit-query" | "debian-tracker-snapshot"
+	sourceUrl?: string
+	sourceContentSha256?: string
 }
 
 interface CampaignRecord {
@@ -126,6 +151,7 @@ interface CampaignState {
 	campaigns: Record<string, CampaignRecord>
 	drafts: Record<string, { id: string; repository: string; name: string; sourceRevision: string | null; requestedModelProfile: string | null }>
 	jobs: RepositoryCampaignJob[]
+	intakeRecords: RepositoryAdvisoryIntakeRecord[]
 	history: Array<{ at: number; campaignId: string; action: "drafted" | "configured" | "started" | "stopped" | "budget" | "budget-exhausted" | "claimed" | "completed" | "interrupted"; epoch: number; jobId?: string }>
 }
 
@@ -198,17 +224,31 @@ function validId(value: unknown): value is string {
 	return typeof value === "string" && /^[a-z0-9][a-z0-9-]{1,62}$/.test(value) &&
 		!new Set(["constructor", "prototype", "tostring", "valueof", "hasownproperty", "__proto__"]).has(value)
 }
+function validAdvisoryId(value: unknown): value is string {
+	return typeof value === "string" && /^(?:CVE-\d{4}-\d{4,12}|GHSA-[23456789cfghjmpqrvwx-]{4}-[23456789cfghjmpqrvwx-]{4}-[23456789cfghjmpqrvwx-]{4}|PYSEC-\d{4}-\d+|RUSTSEC-\d{4}-\d+)$/.test(value)
+}
+function validAdvisorySourceUrl(value: unknown): value is string {
+	if (typeof value !== "string" || value.length > 512) return false
+	try {
+		const url = new URL(value)
+		return url.protocol === "https:" && ["osv.dev", "security-tracker.debian.org", "nvd.nist.gov"].includes(url.hostname) &&
+			!url.username && !url.password && !url.search && !url.hash
+	} catch { return false }
+}
 function monthNow(date: Date): string { return date.toISOString().slice(0, 7) }
 
 function blankState(now: Date): CampaignState {
-	return { schemaVersion: 1, month: monthNow(now), campaigns: {}, drafts: {}, jobs: [], history: [] }
+	return { schemaVersion: 1, month: monthNow(now), campaigns: {}, drafts: {}, jobs: [], intakeRecords: [], history: [] }
 }
 
 function validateDefinition(definition: RepositoryCampaignDefinition): void {
 	if (!definition || typeof definition !== "object") throw new Error("repository campaign definition is invalid")
 	const q = definition.qualification
+	const definitionKeys = Object.keys(definition).sort().join(",")
 	if (!(["dataAccessProfile,evaluatorDigest,id,model,name,qualification,recipeDigest,sourceRevision,workerProfile",
-		"dataAccessProfile,evaluatorDigest,id,model,name,qualification,recipeDigest,repository,repositoryId,sourceRevision,workerProfile"].includes(Object.keys(definition).sort().join(","))) ||
+		"dataAccessProfile,evaluatorDigest,id,model,name,policySha256,qualification,recipeDigest,sourceRevision,workerProfile",
+		"dataAccessProfile,evaluatorDigest,id,model,name,qualification,recipeDigest,repository,repositoryId,sourceRevision,workerProfile",
+		"dataAccessProfile,evaluatorDigest,id,model,name,policySha256,qualification,recipeDigest,repository,repositoryId,sourceRevision,workerProfile"].includes(definitionKeys)) ||
 		!validId(definition.id) || typeof definition.name !== "string" || !definition.name.trim() || definition.name.length > 100 ||
 		(definition.repositoryId !== undefined && !validId(definition.repositoryId)) ||
 		(definition.repository !== undefined && (typeof definition.repository !== "string" || !/^[A-Za-z0-9_.-]{1,39}\/[A-Za-z0-9_.-]{1,100}$/.test(definition.repository))) ||
@@ -218,7 +258,8 @@ function validateDefinition(definition: RepositoryCampaignDefinition): void {
 		Object.values(q).some((value) => typeof value !== "boolean") ||
 		(definition.sourceRevision !== null && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(definition.sourceRevision)) ||
 		(definition.recipeDigest !== null && !/^[a-f0-9]{64}$/.test(definition.recipeDigest)) ||
-		(definition.evaluatorDigest !== null && !/^[a-f0-9]{64}$/.test(definition.evaluatorDigest))) {
+		(definition.evaluatorDigest !== null && !/^[a-f0-9]{64}$/.test(definition.evaluatorDigest)) ||
+		(definition.policySha256 !== undefined && !/^[a-f0-9]{64}$/.test(definition.policySha256))) {
 		throw new Error("repository campaign definition is invalid")
 	}
 }
@@ -226,11 +267,12 @@ function validateDefinition(definition: RepositoryCampaignDefinition): void {
 function validateState(value: unknown): value is CampaignState {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false
 	const s = value as Partial<CampaignState>
-	if (Object.keys(value as object).sort().join(",") !== "campaigns,drafts,history,jobs,month,schemaVersion" ||
+	if (!(["campaigns,drafts,history,jobs,month,schemaVersion", "campaigns,drafts,history,intakeRecords,jobs,month,schemaVersion"].includes(Object.keys(value as object).sort().join(","))) ||
 		s.schemaVersion !== 1 || typeof s.month !== "string" || !/^\d{4}-(0[1-9]|1[0-2])$/.test(s.month) ||
 		!s.campaigns || typeof s.campaigns !== "object" || Array.isArray(s.campaigns) || Object.keys(s.campaigns).length > MAX_CAMPAIGNS ||
 		!s.drafts || typeof s.drafts !== "object" || Array.isArray(s.drafts) || Object.keys(s.drafts).length > MAX_CAMPAIGNS ||
-		!Array.isArray(s.jobs) || s.jobs.length > MAX_JOBS || !Array.isArray(s.history) || s.history.length > MAX_HISTORY) return false
+		!Array.isArray(s.jobs) || s.jobs.length > MAX_JOBS || !Array.isArray(s.history) || s.history.length > MAX_HISTORY ||
+		(s.intakeRecords !== undefined && (!Array.isArray(s.intakeRecords) || s.intakeRecords.length > MAX_INTAKE_RECORDS))) return false
 	for (const [id, record] of Object.entries(s.campaigns)) {
 		if (!validId(id) || !record || typeof record !== "object" || Object.keys(record).sort().join(",") !== "ambiguousMicros,ambiguousTokens,budgetLimitMicros,budgetLimitTokens,enabled,epoch,reservedMicros,reservedTokens,settledMicros,settledTokens" ||
 			typeof record.enabled !== "boolean" || !Number.isSafeInteger(record.epoch) || record.epoch < 0 ||
@@ -253,8 +295,27 @@ function validateState(value: unknown): value is CampaignState {
 			typeof job.month !== "string" || !/^\d{4}-(0[1-9]|1[0-2])$/.test(job.month) ||
 			![job.reservedMicros, job.settledMicros, job.reservedTokens, job.settledTokens].every((n) => Number.isSafeInteger(n) && n >= 0) || ids.has(job.id) ||
 			(job.claimId !== undefined && typeof job.claimId !== "string") || (job.detail !== undefined && typeof job.detail !== "string") ||
+			(job.purpose !== undefined && (job.purpose !== "qualification" || job.campaignId !== CURL_CAMPAIGN_ID || job.advisoryId !== CURL_FIXED_ADVISORY ||
+				!(s.intakeRecords ?? []).some((row) => row?.source === "debian-tracker-snapshot" && row.jobId === job.id &&
+					row.campaignId === job.campaignId && row.advisoryId === job.advisoryId && row.snapshotSha256 === CURL_DEBIAN_SNAPSHOT_SHA256))) ||
 			(job.progress !== undefined && !validProgress(job.progress))) return false
 		ids.add(job.id)
+	}
+	const intakeKeys = new Set<string>()
+	for (const row of s.intakeRecords ?? []) {
+		const key = `${row?.campaignId}:${row?.publicBaseRevision}:${row?.advisoryId}`
+		if (!row || typeof row !== "object" || !validId(row.campaignId) || !s.campaigns[row.campaignId] ||
+			!/^[a-f0-9]{40}$/.test(row.publicBaseRevision) || !validAdvisoryId(row.advisoryId) ||
+			!/^[a-f0-9]{64}$/.test(row.snapshotSha256) || !["eligible", "unsupported-profile"].includes(row.disposition) ||
+			(row.source !== undefined && !["osv-commit-query", "debian-tracker-snapshot"].includes(row.source)) ||
+			(row.sourceUrl !== undefined && !validAdvisorySourceUrl(row.sourceUrl)) ||
+			(row.sourceContentSha256 !== undefined && !/^[a-f0-9]{64}$/.test(row.sourceContentSha256)) ||
+			(row.source === "debian-tracker-snapshot" && (row.campaignId !== CURL_CAMPAIGN_ID || row.advisoryId !== CURL_FIXED_ADVISORY ||
+				row.publicBaseRevision !== CURL_DEBIAN_PUBLIC_BASE_REVISION || row.sourceUrl !== CURL_DEBIAN_SOURCE_URL || row.sourceContentSha256 !== CURL_DEBIAN_SOURCE_HTML_SHA256 ||
+				row.snapshotSha256 !== CURL_DEBIAN_SNAPSHOT_SHA256)) ||
+			![row.firstSeenAt, row.lastSeenAt].every(Number.isSafeInteger) || row.firstSeenAt > row.lastSeenAt ||
+			(row.jobId !== null && (!validId(row.jobId) || !s.jobs.some((job) => job.id === row.jobId))) || intakeKeys.has(`${key}:${row.source ?? "osv-commit-query"}`)) return false
+		intakeKeys.add(`${key}:${row.source ?? "osv-commit-query"}`)
 	}
 	for (const item of s.history) {
 		if (!item || typeof item !== "object" || !validId(item.campaignId) || (!s.campaigns[item.campaignId] && !s.drafts[item.campaignId]) ||
@@ -269,7 +330,9 @@ function validProgress(value: unknown): value is RepositoryJobProgress {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false
 	const p = value as RepositoryJobProgress
 	const steps = new Set<string>(REPOSITORY_CAMPAIGN_STEPS)
-	return Object.keys(value).sort().join(",") === "blocker,completedSteps,currentTask,evidenceRefs,executionKind,goal,heartbeatAt,lastActionAt,leaseExpiresAt,nextStep,requiredSteps,stage,workerId" &&
+	const keys = Object.keys(value).sort().join(",")
+	return (keys === "blocker,completedSteps,currentTask,evidenceRefs,executionKind,goal,heartbeatAt,lastActionAt,leaseExpiresAt,nextStep,requiredSteps,stage,workerId" ||
+		keys === "blocker,boardRef,completedSteps,currentTask,evidenceRefs,executionKind,goal,heartbeatAt,lastActionAt,leaseExpiresAt,nextStep,requiredSteps,stage,workerId") &&
 		["development-checkpoint", "live-cve"].includes(p.executionKind) && /^[0-9a-f-]{36}$/.test(p.workerId) &&
 		typeof p.goal === "string" && p.goal.length > 0 && p.goal.length <= 240 &&
 		typeof p.currentTask === "string" && p.currentTask.length > 0 && p.currentTask.length <= 240 &&
@@ -285,7 +348,8 @@ function validProgress(value: unknown): value is RepositoryJobProgress {
 		Array.isArray(p.evidenceRefs) && p.evidenceRefs.length <= 20 && p.evidenceRefs.every((item) => item &&
 			Object.keys(item).sort().join(",") === "id,kind,label" && /^[a-f0-9]{64}$/.test(item.id) &&
 			["intake", "candidate", "test-receipt", "delivery"].includes(item.kind) &&
-			typeof item.label === "string" && item.label.length > 0 && item.label.length <= 80)
+			typeof item.label === "string" && item.label.length > 0 && item.label.length <= 80) &&
+		(p.boardRef === undefined || p.boardRef === null || (typeof p.boardRef === "string" && p.boardRef.length <= 256 && PRIVATE_BOARD_REF.test(p.boardRef)))
 }
 
 /** Durable control plane. Its optional budget adapter is synthetic-test-only; production is denied until the broker integration exists. */
@@ -293,9 +357,9 @@ export class RepositoryCampaignStore {
 	readonly path: string
 	private readonly lockPath: string
 	private readonly definitions = new Map<string, RepositoryCampaignDefinition>()
-	private readonly readBudgetAuthority: (campaignId?: string) => RepositoryBudgetAuthority
+	private readonly readBudgetAuthority: (campaignId?: string) => RepositoryBudgetAuthority | Promise<RepositoryBudgetAuthority>
 
-	constructor(filePath: string, definitions: RepositoryCampaignDefinition[], readBudgetAuthority: (campaignId?: string) => RepositoryBudgetAuthority = () => ({ mode: "synthetic-test", available: false, limitMicros: 0, limitTokens: 0, committedMicros: 0, committedTokens: 0 })) {
+	constructor(filePath: string, definitions: RepositoryCampaignDefinition[], readBudgetAuthority: (campaignId?: string) => RepositoryBudgetAuthority | Promise<RepositoryBudgetAuthority> = () => ({ mode: "synthetic-test", available: false, limitMicros: 0, limitTokens: 0, committedMicros: 0, committedTokens: 0 })) {
 		this.path = path.resolve(filePath)
 		this.lockPath = `${this.path}.lock`
 		this.readBudgetAuthority = readBudgetAuthority
@@ -307,22 +371,30 @@ export class RepositoryCampaignStore {
 		}
 	}
 
+	/** Return immutable registration identities for code-owned adapter binding. */
+	registeredDefinitions(): RepositoryCampaignDefinition[] {
+		return [...this.definitions.values()].map((definition) => structuredClone(definition))
+	}
+
 	async status(now = new Date()): Promise<Record<string, unknown>> {
 		const state = await this.read(now)
-		const authority = this.budgetAuthority(this.definitions.keys().next().value)
+		const definitions = [...this.definitions.values()]
+		const scopedAuthorities = await Promise.all(definitions.map(async (definition) => [definition.id, await this.budgetAuthority(definition.id)] as const))
+		const byCampaign = new Map(scopedAuthorities)
+		const authority = definitions.length ? byCampaign.get(definitions[0]!.id)! : await this.budgetAuthority()
 		const totals = this.aggregateTotals(state)
 		return {
 			month: state.month,
-			budget: { authority: authority.mode, adapter: authority.available ? authority.mode : "none", available: authority.available,
+			budget: { authority: authority.mode, adapter: authority.mode === "fleet-v2-readonly" ? authority.mode : authority.available ? authority.mode : "none", available: authority.available,
 				limitMicros: authority.limitMicros, limitTokens: authority.limitTokens, externalCommittedMicros: authority.committedMicros,
 				externalCommittedTokens: authority.committedTokens, ...totals,
 				...(authority.monthly ? { monthly: authority.monthly } : {}),
 				...(authority.campaignLifetime ? { campaignLifetime: authority.campaignLifetime } : {}),
 				remainingMicros: Math.max(0, authority.limitMicros - authority.committedMicros - totals.settledMicros - totals.reservedMicros - totals.ambiguousMicros),
 				remainingTokens: Math.max(0, authority.limitTokens - authority.committedTokens - totals.settledTokens - totals.reservedTokens - totals.ambiguousTokens) },
-			campaigns: [...this.definitions.values()].map((definition) => {
+			campaigns: definitions.map((definition) => {
 				const campaign = state.campaigns[definition.id] ?? this.initialCampaign()
-				const scopedAuthority = this.budgetAuthority(definition.id)
+				const scopedAuthority = byCampaign.get(definition.id)!
 				const missing = this.missingReadiness(definition, scopedAuthority, campaign, state)
 				const exhausted = this.isExhausted(campaign)
 				const stateName = this.campaignState(definition.id, campaign, missing, exhausted, state.jobs)
@@ -332,7 +404,7 @@ export class RepositoryCampaignStore {
 					readiness, readinessReasons: missing }
 			}),
 			drafts: Object.values(state.drafts).map((draft) => ({ ...draft, readiness: "blocked-prerequisite", readinessReasons: ["owner-provisioned-enrollment-review"] })),
-			jobs: state.jobs.slice(-100), history: state.history.slice(-100),
+			jobs: state.jobs.slice(-100), history: state.history.slice(-100), intakeRecords: (state.intakeRecords ?? []).slice(-100),
 		}
 	}
 
@@ -378,12 +450,12 @@ export class RepositoryCampaignStore {
 
 	async setCampaignBudget(id: string, micros: number, tokens: number, now = new Date()): Promise<void> {
 		this.requireDefinition(id); this.validBudget(micros, tokens)
+		const authority = await this.budgetAuthority(id)
 		await this.update((s) => {
 			const c = this.campaign(s, id)
 			if (micros < c.settledMicros + c.reservedMicros + c.ambiguousMicros || tokens < c.settledTokens + c.reservedTokens + c.ambiguousTokens) throw new Error("campaign budget is below committed usage")
-			const authority = this.budgetAuthority(id)
 			const allocated = Object.values(s.campaigns).reduce((sum, campaign) => ({ micros: sum.micros + campaign.budgetLimitMicros, tokens: sum.tokens + campaign.budgetLimitTokens }), { micros: 0, tokens: 0 })
-			if (!authority.available || allocated.micros - c.budgetLimitMicros + micros > authority.limitMicros || allocated.tokens - c.budgetLimitTokens + tokens > authority.limitTokens) throw new Error("repository budgets exceed authoritative Fleet allocation or broker authority is unavailable")
+			if (authority.mode === "unavailable" || allocated.micros - c.budgetLimitMicros + micros > authority.limitMicros || allocated.tokens - c.budgetLimitTokens + tokens > authority.limitTokens) throw new Error("repository budgets exceed authoritative Fleet allocation or broker authority is unavailable")
 			if (c.budgetLimitMicros !== micros || c.budgetLimitTokens !== tokens) {
 				c.budgetLimitMicros = micros; c.budgetLimitTokens = tokens; c.epoch += 1; this.event(s, id, "budget", now)
 				if (this.isExhausted(c) && c.enabled) { c.enabled = false; c.epoch += 1; this.event(s, id, "budget-exhausted", now) }
@@ -393,10 +465,11 @@ export class RepositoryCampaignStore {
 
 	async start(id: string, now = new Date()): Promise<void> {
 		this.requireDefinition(id)
+		const authority = await this.budgetAuthority(id)
 		await this.update((s) => {
 			const c = this.campaign(s, id)
 			if (c.enabled) return
-			const reasons = this.missingReadiness(this.requireDefinition(id), this.budgetAuthority(id), c, s)
+			const reasons = this.missingReadiness(this.requireDefinition(id), authority, c, s)
 			if (this.isExhausted(c)) reasons.push("campaign-budget-exhausted")
 			if (reasons.length) throw new Error(`campaign is blocked: ${reasons.join(", ")}`)
 			c.enabled = true; c.epoch += 1; this.event(s, id, "started", now)
@@ -477,6 +550,68 @@ export class RepositoryCampaignStore {
 		}, now)
 	}
 
+	/** Persist one OSV source/advisory observation and queue only explicitly recipe-supported CVEs. */
+	async observePublishedAdvisory(input: { campaignId: string; publicBaseRevision: string; advisoryId: string;
+		snapshotSha256: string; eligible: boolean }, now = new Date()): Promise<{ changed: boolean; queued: boolean; record: RepositoryAdvisoryIntakeRecord }> {
+		this.requireDefinition(input.campaignId)
+		if (!/^[a-f0-9]{40}$/.test(input.publicBaseRevision) || !validAdvisoryId(input.advisoryId) ||
+			(input.eligible && !input.advisoryId.startsWith("CVE-")) || !/^[a-f0-9]{64}$/.test(input.snapshotSha256) ||
+		typeof input.eligible !== "boolean") throw new Error("published advisory observation is invalid")
+		return this.update((s) => {
+			const disposition = input.eligible ? "eligible" : "unsupported-profile"
+			let record = (s.intakeRecords ??= []).find((row) => row.campaignId === input.campaignId && row.publicBaseRevision === input.publicBaseRevision && row.advisoryId === input.advisoryId &&
+				(row.source ?? "osv-commit-query") === "osv-commit-query")
+			const changed = !record || record.snapshotSha256 !== input.snapshotSha256 || record.disposition !== disposition
+			if (!record) {
+				if (s.intakeRecords.length >= MAX_INTAKE_RECORDS) throw new Error("published advisory intake record limit reached")
+				record = { campaignId: input.campaignId, publicBaseRevision: input.publicBaseRevision, advisoryId: input.advisoryId,
+					snapshotSha256: input.snapshotSha256, disposition, firstSeenAt: now.getTime(), lastSeenAt: now.getTime(), jobId: null,
+					source: "osv-commit-query", sourceUrl: `https://osv.dev/vulnerability/${encodeURIComponent(input.advisoryId)}` }
+				s.intakeRecords.push(record)
+			} else {
+				record.snapshotSha256 = input.snapshotSha256; record.disposition = disposition; record.lastSeenAt = now.getTime()
+			}
+			let queued = false
+			if (input.eligible && s.campaigns[input.campaignId]?.enabled && record.jobId === null &&
+				!s.jobs.some((job) => job.campaignId === input.campaignId && job.advisoryId === input.advisoryId)) {
+				if (s.jobs.length >= MAX_JOBS) throw new Error("campaign job queue is full")
+				const job: RepositoryCampaignJob = { id: randomUUID(), campaignId: input.campaignId, advisoryId: input.advisoryId, status: "queued",
+					epoch: s.campaigns[input.campaignId]!.epoch, createdAt: now.getTime(), updatedAt: now.getTime(), month: s.month,
+					reservedMicros: 0, settledMicros: 0, reservedTokens: 0, settledTokens: 0 }
+				s.jobs.push(job); record.jobId = job.id; queued = true
+			}
+			return { changed, queued, record: { ...record } }
+		}, now)
+	}
+
+	/** Queue the one owner-approved Curl known-advisory qualification, separate from the OSV discovery feed. */
+	async enqueueKnownQualification(input: { campaignId: string; advisoryId: string; publicBaseRevision: string; snapshotSha256: string;
+		sourceUrl: string; sourceContentSha256: string; affectedRange: string }, now = new Date()): Promise<RepositoryCampaignJob> {
+		if (input.campaignId !== CURL_CAMPAIGN_ID || input.advisoryId !== CURL_FIXED_ADVISORY || input.publicBaseRevision !== CURL_DEBIAN_PUBLIC_BASE_REVISION ||
+			input.snapshotSha256 !== CURL_DEBIAN_SNAPSHOT_SHA256 || input.sourceUrl !== CURL_DEBIAN_SOURCE_URL ||
+			input.sourceContentSha256 !== CURL_DEBIAN_SOURCE_HTML_SHA256 || input.affectedRange !== CURL_DEBIAN_AFFECTED_RANGE) {
+			throw new Error("known advisory qualification is outside the owner-approved Curl snapshot")
+		}
+		this.requireDefinition(input.campaignId)
+		return this.update((s) => {
+			const existing = (s.intakeRecords ??= []).find((row) => row.campaignId === input.campaignId && row.publicBaseRevision === input.publicBaseRevision &&
+				row.advisoryId === input.advisoryId && row.source === "debian-tracker-snapshot")
+			if (existing) throw new Error("known advisory qualification has already been recorded")
+			if (!s.campaigns[input.campaignId]?.enabled) throw new Error("known advisory qualification requires an enabled campaign")
+			const job: RepositoryCampaignJob = { id: randomUUID(), campaignId: input.campaignId, advisoryId: input.advisoryId, status: "queued",
+				epoch: s.campaigns[input.campaignId]!.epoch, createdAt: now.getTime(), updatedAt: now.getTime(), month: s.month,
+				reservedMicros: 0, settledMicros: 0, reservedTokens: 0, settledTokens: 0, purpose: "qualification" }
+			s.jobs.push(job)
+			const record: RepositoryAdvisoryIntakeRecord = { campaignId: input.campaignId, publicBaseRevision: input.publicBaseRevision,
+				advisoryId: input.advisoryId, snapshotSha256: input.snapshotSha256, disposition: "eligible", firstSeenAt: now.getTime(),
+				lastSeenAt: now.getTime(), jobId: job.id, source: "debian-tracker-snapshot", sourceUrl: input.sourceUrl,
+				sourceContentSha256: input.sourceContentSha256 }
+			if (s.jobs.length > MAX_JOBS || s.intakeRecords.length >= MAX_INTAKE_RECORDS) throw new Error("known advisory qualification storage limit reached")
+			s.intakeRecords.push(record)
+			return { ...job }
+		}, now)
+	}
+
 	/** Reserve aggregate and per-campaign capacity before handing a job to a mock dispatcher. */
 	async claimNext(id: string, reservation: { micros: number; tokens: number }, now = new Date(),
 		mode: { executionKind: RepositoryJobProgress["executionKind"]; requiredSteps?: readonly RepositoryCampaignStep[] } = { executionKind: "development-checkpoint" }): Promise<ClaimedRepositoryJob | undefined> {
@@ -487,12 +622,12 @@ export class RepositoryCampaignStore {
 			requiredSteps.length !== REPOSITORY_CAMPAIGN_STEPS.length || requiredSteps.some((step, index) => step !== REPOSITORY_CAMPAIGN_STEPS[index])) {
 			throw new Error("campaign worker progress profile is invalid")
 		}
-		if (mode.executionKind === "live-cve" && (this.readBudgetAuthority() as { mode?: string }).mode !== "fleet-v2") {
+		const authority = await this.budgetAuthority(id)
+		if (mode.executionKind === "live-cve" && authority.mode !== "fleet-v2") {
 			throw new Error("live campaign claims require authoritative Fleet v2 registration")
 		}
 		return this.update((s) => {
 			const c = this.campaign(s, id)
-			const authority = this.budgetAuthority(id)
 			if (!c.enabled || this.missingReadiness(this.requireDefinition(id), authority, c, s).length) return undefined
 			if (this.isExhausted(c)) { c.enabled = false; c.epoch += 1; this.event(s, id, "budget-exhausted", now); return undefined }
 			const totals = this.aggregateTotals(s)
@@ -505,10 +640,11 @@ export class RepositoryCampaignStore {
 			const claimId = randomUUID()
 			job.status = "running"; job.claimId = claimId; job.epoch = c.epoch; job.reservedMicros = reservation.micros; job.reservedTokens = reservation.tokens; job.updatedAt = now.getTime()
 			job.progress = { executionKind: mode.executionKind, workerId: randomUUID(),
-				goal: `Assess ${job.advisoryId} and prepare a verified review candidate`, currentTask: "Read registered advisory metadata",
+				goal: job.purpose === "qualification" ? `Verify the owner-approved evidence for ${job.advisoryId} through the registered pipeline` :
+					`Assess ${job.advisoryId} and prepare a verified review candidate`, currentTask: "Read registered advisory metadata",
 				stage: "intake", completedSteps: [], requiredSteps: [...requiredSteps], lastActionAt: now.getTime(),
 				heartbeatAt: now.getTime(), leaseExpiresAt: now.getTime() + REPOSITORY_WORKER_LEASE_MS,
-				blocker: null, nextStep: "deduplicate", evidenceRefs: [] }
+				blocker: null, nextStep: "deduplicate", evidenceRefs: [], boardRef: null }
 			c.reservedMicros += reservation.micros; c.reservedTokens += reservation.tokens; this.event(s, id, "claimed", now, job.id)
 			return { job: { ...job }, claimId, epoch: c.epoch }
 		}, now)
@@ -517,7 +653,7 @@ export class RepositoryCampaignStore {
 	/** Persist coordinator progress under the same durable lock as the claim and budget. */
 	async updateClaimProgress(claim: ClaimedRepositoryJob, patch: {
 		stage: RepositoryCampaignStep; currentTask: string; completedSteps: RepositoryCampaignStep[];
-		blocker?: string | null; nextStep?: string | null; evidenceRefs?: RepositoryEvidenceRef[]
+		blocker?: string | null; nextStep?: string | null; evidenceRefs?: RepositoryEvidenceRef[]; boardRef?: string | null
 	}, now = new Date()): Promise<void> {
 		if (!claim || !patch || !REPOSITORY_CAMPAIGN_STEPS.includes(patch.stage) ||
 			typeof patch.currentTask !== "string" || !patch.currentTask.trim() || patch.currentTask.length > 240 ||
@@ -526,6 +662,7 @@ export class RepositoryCampaignStore {
 				(index > 0 && REPOSITORY_CAMPAIGN_STEPS.indexOf(step) <= REPOSITORY_CAMPAIGN_STEPS.indexOf(patch.completedSteps[index - 1]!))) ||
 			(patch.blocker !== undefined && patch.blocker !== null && (typeof patch.blocker !== "string" || patch.blocker.length > 240)) ||
 			(patch.nextStep !== undefined && patch.nextStep !== null && (typeof patch.nextStep !== "string" || patch.nextStep.length > 240)) ||
+			(patch.boardRef !== undefined && patch.boardRef !== null && (typeof patch.boardRef !== "string" || patch.boardRef.length > 256 || !PRIVATE_BOARD_REF.test(patch.boardRef))) ||
 			(patch.evidenceRefs !== undefined && (!Array.isArray(patch.evidenceRefs) || patch.evidenceRefs.length > 20 ||
 				patch.evidenceRefs.some((ref) => !ref || !/^[a-f0-9]{64}$/.test(ref.id) ||
 					!["intake", "candidate", "test-receipt", "delivery"].includes(ref.kind) ||
@@ -541,12 +678,14 @@ export class RepositoryCampaignStore {
 				old.completedSteps.some((step, index) => patch.completedSteps[index] !== step)) throw new Error("campaign progress cannot forget completed steps")
 			const refs = patch.evidenceRefs ?? old.evidenceRefs
 			if (refs.length < old.evidenceRefs.length || old.evidenceRefs.some((item, index) => JSON.stringify(refs[index]) !== JSON.stringify(item))) throw new Error("campaign evidence cannot be removed or changed")
+			const boardRef = patch.boardRef === undefined ? (old.boardRef ?? null) : patch.boardRef
+			if (old.boardRef && boardRef !== old.boardRef) throw new Error("private Board reference cannot be removed or changed")
 			job.progress = { ...old, stage: patch.stage, currentTask: patch.currentTask,
 				completedSteps: [...patch.completedSteps], lastActionAt: now.getTime(), heartbeatAt: now.getTime(),
 				leaseExpiresAt: now.getTime() + REPOSITORY_WORKER_LEASE_MS,
 				blocker: patch.blocker === undefined ? old.blocker : patch.blocker,
 				nextStep: patch.nextStep === undefined ? old.nextStep : patch.nextStep,
-				evidenceRefs: structuredClone(refs) }
+				evidenceRefs: structuredClone(refs), boardRef }
 			job.updatedAt = now.getTime()
 		}, now)
 	}
@@ -580,10 +719,16 @@ export class RepositoryCampaignStore {
 	}
 
 	/** Settle only a matching claim in the same ON epoch; an uncertain result remains charged. */
-	async finish(claim: ClaimedRepositoryJob, result: { status: "succeeded" | "failed" | "ambiguous"; actualMicros?: number; actualTokens?: number }, now = new Date()): Promise<void> {
+	async finish(claim: ClaimedRepositoryJob, result: { status: "succeeded" | "failed" | "ambiguous"; actualMicros?: number; actualTokens?: number;
+		progress?: { currentTask?: string; blocker?: string | null; nextStep?: string | null; boardRef?: string | null } }, now = new Date()): Promise<void> {
 		if (!claim || !claim.job || !["succeeded", "failed", "ambiguous"].includes(result.status) ||
 			(result.actualMicros !== undefined && (!Number.isSafeInteger(result.actualMicros) || result.actualMicros < 0)) ||
-			(result.actualTokens !== undefined && (!Number.isSafeInteger(result.actualTokens) || result.actualTokens < 0))) throw new Error("campaign result is invalid")
+			(result.actualTokens !== undefined && (!Number.isSafeInteger(result.actualTokens) || result.actualTokens < 0)) ||
+			(result.progress !== undefined && (!result.progress || Object.keys(result.progress).some((key) => !["currentTask", "blocker", "nextStep", "boardRef"].includes(key)) ||
+				(result.progress.currentTask !== undefined && (typeof result.progress.currentTask !== "string" || !result.progress.currentTask.trim() || result.progress.currentTask.length > 240)) ||
+				(result.progress.blocker !== undefined && result.progress.blocker !== null && (typeof result.progress.blocker !== "string" || result.progress.blocker.length > 240)) ||
+				(result.progress.nextStep !== undefined && result.progress.nextStep !== null && (typeof result.progress.nextStep !== "string" || result.progress.nextStep.length > 240)) ||
+				(result.progress.boardRef !== undefined && result.progress.boardRef !== null && (typeof result.progress.boardRef !== "string" || result.progress.boardRef.length > 256 || !PRIVATE_BOARD_REF.test(result.progress.boardRef)))))) throw new Error("campaign result is invalid")
 		await this.update((s) => {
 			const job = s.jobs.find((candidate) => candidate.id === claim.job.id)
 			if (!job || job.status !== "running" || job.claimId !== claim.claimId || job.epoch !== claim.epoch) throw new Error("campaign claim is stale")
@@ -604,10 +749,12 @@ export class RepositoryCampaignStore {
 				job.progress.lastActionAt = now.getTime()
 				job.progress.heartbeatAt = now.getTime()
 				job.progress.leaseExpiresAt = now.getTime()
-				job.progress.currentTask = result.status === "succeeded" ? "Worker completed; review the recorded result" :
+				job.progress.currentTask = result.progress?.currentTask ?? (result.status === "succeeded" ? "Worker completed; review the recorded result" :
 					result.status === "failed" ? "Worker stopped after an unsuccessful result" : "Worker result needs reconciliation"
-				job.progress.nextStep = result.status === "succeeded" ? null : "reconcile recorded result before retry"
-				job.progress.blocker = result.status === "succeeded" ? null : "Result requires review before any retry"
+				)
+				job.progress.nextStep = result.progress?.nextStep ?? (result.status === "succeeded" ? null : "reconcile recorded result before retry")
+				job.progress.blocker = result.progress?.blocker ?? (result.status === "succeeded" ? null : "Result requires review before any retry")
+				if (result.progress?.boardRef !== undefined) job.progress.boardRef = result.progress.boardRef
 			}
 			if (this.isExhausted(c) && c.enabled) { c.enabled = false; c.epoch += 1; this.event(s, job.campaignId, "budget-exhausted", now) }
 			this.event(s, job.campaignId, "completed", now, job.id)
@@ -665,28 +812,34 @@ export class RepositoryCampaignStore {
 		if (!Number.isSafeInteger(micros) || micros < 0 || micros > REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS ||
 			!Number.isSafeInteger(tokens) || tokens < 0 || tokens > REPOSITORY_CAMPAIGN_BUDGET_CAP_TOKENS) throw new Error("budget is outside the permitted range")
 	}
-	private budgetAuthority(campaignId?: string): RepositoryBudgetAuthority {
-		const authority = this.readBudgetAuthority(campaignId)
-		if (!authority || !["synthetic-test", "fleet-v2"].includes(authority.mode) || typeof authority.available !== "boolean" || !Number.isSafeInteger(authority.limitMicros) || authority.limitMicros < 0 || authority.limitMicros > REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS ||
+	private async budgetAuthority(campaignId?: string): Promise<RepositoryBudgetAuthority> {
+		const authority = await this.readBudgetAuthority(campaignId)
+		if (!authority || !["synthetic-test", "fleet-v2", "fleet-v2-readonly", "unavailable"].includes(authority.mode) || typeof authority.available !== "boolean" || !Number.isSafeInteger(authority.limitMicros) || authority.limitMicros < 0 || authority.limitMicros > REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS ||
 			!Number.isSafeInteger(authority.limitTokens) || authority.limitTokens < 0 || authority.limitTokens > REPOSITORY_CAMPAIGN_BUDGET_CAP_TOKENS ||
 			![authority.committedMicros, authority.committedTokens].every((n) => Number.isSafeInteger(n) && n >= 0)) throw new Error("authoritative Fleet budget is unavailable")
-		if (authority.mode === "fleet-v2" && (!Number.isSafeInteger(authority.asOfMs) || Date.now() - Number(authority.asOfMs) > 60_000 || Number(authority.asOfMs) > Date.now() + 60_000 ||
+		if (authority.mode === "unavailable") {
+			if (authority.available || authority.limitMicros !== 0 || authority.limitTokens !== 0 || authority.committedMicros !== 0 || authority.committedTokens !== 0) throw new Error("unavailable Fleet authority projection is invalid")
+			return authority
+		}
+		const snapshotOnly = authority.mode === "fleet-v2-readonly"
+		if ((authority.mode === "fleet-v2" || snapshotOnly) && (!Number.isSafeInteger(authority.asOfMs) || Date.now() - Number(authority.asOfMs) > 60_000 || Number(authority.asOfMs) > Date.now() + 60_000 ||
 			!Number.isSafeInteger(authority.controlEpoch) || Number(authority.controlEpoch) < 0 || !Number.isSafeInteger(authority.repositoryEpoch) || Number(authority.repositoryEpoch) < 0 ||
-			authority.campaignId !== "fleet-security-watch" || !authority.runId || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(authority.runId) ||
-			!Number.isSafeInteger(authority.runExpiresAtMs) || Number(authority.asOfMs) >= Number(authority.runExpiresAtMs) ||
-			Date.now() >= Number(authority.runExpiresAtMs) || !authority.repositoryCampaignId || !authority.repositoryId ||
+			authority.campaignId !== "fleet-security-watch" || (snapshotOnly
+				? authority.snapshotOnly !== true || authority.available !== false || authority.runId !== null || authority.runExpiresAtMs !== null
+				: authority.snapshotOnly !== undefined && authority.snapshotOnly !== false || !authority.runId || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(authority.runId) ||
+					!Number.isSafeInteger(authority.runExpiresAtMs) || Number(authority.asOfMs) >= Number(authority.runExpiresAtMs) || Date.now() >= Number(authority.runExpiresAtMs)) || !authority.repositoryCampaignId || !authority.repositoryId ||
 			!authority.repository || !authority.sourceRevision || !authority.policySha256 || !authority.model || !authority.profileId ||
 			typeof authority.globalEnabled !== "boolean" || typeof authority.canAdmit !== "boolean" || typeof authority.repositoryEnabled !== "boolean" ||
 			!authority.monthly || !authority.campaignLifetime || !authority.legacyLifetime || !authority.repositoryLifetime ||
-			!validMonthlySnapshot(authority.monthly) || !validLifetimeSnapshot(authority.campaignLifetime, REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS, REPOSITORY_CAMPAIGN_BUDGET_CAP_TOKENS) ||
+			!validMonthlySnapshot(authority.monthly) || !validLifetimeSnapshot(authority.campaignLifetime, 20_000, REPOSITORY_CAMPAIGN_BUDGET_CAP_TOKENS) ||
 			!validLifetimeSnapshot(authority.legacyLifetime) || !validLifetimeSnapshot(authority.repositoryLifetime, undefined, undefined, true) ||
 			!validId(authority.repositoryId) || !/^[A-Za-z0-9_.-]{1,39}\/[A-Za-z0-9_.-]{1,100}$/.test(authority.repository) ||
 			!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(authority.sourceRevision) || !/^[a-f0-9]{64}$/.test(authority.policySha256) ||
 			!validId(authority.profileId) ||
-			authority.limitMicros !== REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS || authority.limitTokens !== REPOSITORY_CAMPAIGN_BUDGET_CAP_TOKENS ||
+			authority.limitMicros !== 20_000 || authority.limitTokens !== REPOSITORY_CAMPAIGN_BUDGET_CAP_TOKENS ||
 			authority.committedMicros !== authority.legacyLifetime.settledMicros + authority.legacyLifetime.reservedMicros + authority.legacyLifetime.ambiguousMicros ||
 			authority.committedTokens !== authority.legacyLifetime.settledTokens + authority.legacyLifetime.reservedTokens + authority.legacyLifetime.ambiguousTokens ||
-			authority.available !== (authority.globalEnabled === true && authority.canAdmit === true && authority.repositoryEnabled === true &&
+			authority.available !== (!snapshotOnly && authority.globalEnabled === true && authority.canAdmit === true && authority.repositoryEnabled === true &&
 				authority.monthly.settledMicros + authority.monthly.reservedMicros + authority.monthly.ambiguousMicros < authority.monthly.limitMicros &&
 				authority.campaignLifetime.settledMicros + authority.campaignLifetime.reservedMicros + authority.campaignLifetime.ambiguousMicros < authority.limitMicros &&
 				authority.campaignLifetime.settledTokens + authority.campaignLifetime.reservedTokens + authority.campaignLifetime.ambiguousTokens < authority.limitTokens &&
@@ -714,17 +867,26 @@ export class RepositoryCampaignStore {
 		const q = definition.qualification
 		const missing: string[] = []
 		if (!definition.sourceRevision || !q.sourceAudited) missing.push("audited-private-source")
+		if (!definition.policySha256) missing.push("reviewed-policy-digest")
 		if (!definition.workerProfile || !q.workerQualified) missing.push("qualified-worker")
 		if (!definition.recipeDigest || !q.recipeQualified) missing.push("reviewed-recipe")
 		if (!definition.evaluatorDigest || !q.evaluatorQualified) missing.push("independent-evaluator")
 		if (!definition.model || !q.modelApproved) missing.push("approved-exact-model")
 		if (!definition.dataAccessProfile || !q.dataApproved) missing.push("approved-data-destination")
 		if (!q.accessApproved) missing.push("operation-specific-access")
-		if (!authority.available) missing.push("authoritative-broker-budget")
+		const snapshotCanProvision = authority.mode === "fleet-v2-readonly" && authority.snapshotOnly === true &&
+			authority.globalEnabled === true && authority.canAdmit === true && authority.repositoryEnabled === true &&
+			authority.monthly && authority.campaignLifetime && authority.repositoryLifetime &&
+			authority.monthly.settledMicros + authority.monthly.reservedMicros + authority.monthly.ambiguousMicros < authority.monthly.limitMicros &&
+			authority.campaignLifetime.settledMicros + authority.campaignLifetime.reservedMicros + authority.campaignLifetime.ambiguousMicros < authority.limitMicros &&
+			authority.campaignLifetime.settledTokens + authority.campaignLifetime.reservedTokens + authority.campaignLifetime.ambiguousTokens < authority.limitTokens &&
+			authority.repositoryLifetime.settledMicros + authority.repositoryLifetime.reservedMicros + authority.repositoryLifetime.ambiguousMicros < authority.repositoryLifetime.limitMicros &&
+			authority.repositoryLifetime.settledTokens + authority.repositoryLifetime.reservedTokens + authority.repositoryLifetime.ambiguousTokens < authority.repositoryLifetime.limitTokens
+		if (!authority.available && !snapshotCanProvision) missing.push("authoritative-broker-budget")
 		const allocations = Object.values(state.campaigns).reduce((sum, c) => ({ micros: sum.micros + c.budgetLimitMicros, tokens: sum.tokens + c.budgetLimitTokens }), { micros: 0, tokens: 0 })
 		if (allocations.micros > authority.limitMicros || allocations.tokens > authority.limitTokens) missing.push("aggregate-budget-allocation")
 		const totals = this.aggregateTotals(state)
-		if (authority.available && (authority.committedMicros + totals.settledMicros + totals.reservedMicros + totals.ambiguousMicros >= authority.limitMicros ||
+		if ((authority.available || snapshotCanProvision) && (authority.committedMicros + totals.settledMicros + totals.reservedMicros + totals.ambiguousMicros >= authority.limitMicros ||
 			authority.committedTokens + totals.settledTokens + totals.reservedTokens + totals.ambiguousTokens >= authority.limitTokens)) missing.push("aggregate-budget-exhausted")
 		if (campaign.budgetLimitMicros <= 0 || campaign.budgetLimitTokens <= 0) missing.push("finite-token-and-spend-allocation")
 		return missing
@@ -773,6 +935,7 @@ export class RepositoryCampaignStore {
 			const st = await fs.lstat(this.path)
 			if (!st.isFile() || st.isSymbolicLink() || st.size > 1024 * 1024 || (typeof process.getuid === "function" && st.uid !== process.getuid())) throw new Error("repository campaign state is not a bounded owner file")
 			s = JSON.parse(await fs.readFile(this.path, "utf8"))
+			if (s && typeof s === "object" && !Array.isArray(s) && !Object.hasOwn(s, "intakeRecords")) s.intakeRecords = []
 			if (!validateState(s)) throw new Error("repository campaign state failed schema validation")
 		} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; s = blankState(now) }
 		if (s.month !== monthNow(now)) s.month = monthNow(now)

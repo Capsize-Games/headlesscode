@@ -10,7 +10,7 @@ import { runMain, type SuiteTest } from "../../test-runner.js"
 
 const qualification = { sourceAudited: true, workerQualified: true, recipeQualified: true, evaluatorQualified: true,
 	modelApproved: true, dataApproved: true, accessApproved: true }
-const definitions: RepositoryCampaignDefinition[] = [{ id: "test-repository", name: "Test Repository", sourceRevision: "a".repeat(40),
+const definitions: RepositoryCampaignDefinition[] = [{ id: "test-repository", name: "Test Repository", sourceRevision: "a".repeat(40), policySha256: "1".repeat(64),
 	workerProfile: "mock-worker", recipeDigest: "b".repeat(64), evaluatorDigest: "c".repeat(64), model: "fixture-only",
 	dataAccessProfile: "fixture-only", qualification }]
 

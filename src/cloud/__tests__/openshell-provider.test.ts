@@ -4,7 +4,7 @@ import { createServer } from "node:http"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { OpenShellSessionProvider, runOpenShellCommandAsync, validateReadOnlyMountTargets } from "../openshell-provider.js"
+import { OpenShellSessionProvider, runOpenShellCommandAsync, validateOpenShellHostRuntimeEnv, validateReadOnlyMountTargets } from "../openshell-provider.js"
 import type { CloudSessionRequest } from "../provider.js"
 import { EmergencyControl } from "../../control/emergency-controller.js"
 
@@ -108,6 +108,7 @@ async function testIsolatedCloneExportAndImport(): Promise<void> {
 		}
 		const provider = new OpenShellSessionProvider({
 			image: "worker:test", policy, providers: [], scratchRoot: path.join(repo, "gateway-visible-scratch"),
+			hostRuntimeEnv: { XDG_CONFIG_HOME: "/tmp/host-only-xdg-config", HEADLESSCODE_CONTAINED_EVIDENCE_CONFIG_DIR: "/tmp/host-only-evidence" },
 			readOnlyMounts: [{ source: promptDir, target: "/workspace/.headlesscode-session" }, { source: checkpointDir, target: "/workspace/.rsi-base-model" }],
 			run: cliRun,
 			runAsync: (args) => {
@@ -132,6 +133,8 @@ async function testIsolatedCloneExportAndImport(): Promise<void> {
 		const request: CloudSessionRequest = { repo, issue: { number: 1, title: "test" }, worktreeSpec: { name: "worker", issues: [1], taskFile: "worker.md" }, env: { HEADLESSCODE_MEMORY_DIR: memoryDir } }
 		const handle = await provider.spawnExistingWorktreeSession(request, hostWorkspace)
 		assert.equal(handle.address, hostWorkspace)
+		assert.ok(!createArgs.includes("XDG_CONFIG_HOME=/tmp/host-only-xdg-config"), "host OpenShell paths are not sent as guest environment values")
+		assert.ok(!createArgs.includes("HEADLESSCODE_CONTAINED_EVIDENCE_CONFIG_DIR=/tmp/host-only-evidence"), "host evidence paths are not sent into the guest")
 		const mounts = JSON.parse(createArgs[createArgs.indexOf("--driver-config-json") + 1]).docker.mounts as Array<{ source: string; target: string; read_only: boolean }>
 		assert.deepEqual(mounts.map((mount) => mount.target).slice(0, 2), ["/workspace", "/result"])
 		assert.equal(mounts.some((mount) => mount.source === repo || mount.source === hostWorkspace), false, "host repository and orchestration worktree are never bind-mounted")
@@ -230,6 +233,34 @@ async function testAsyncOpenShellCommandReportsSafeExitAndTimeoutDetails(): Prom
 	assert.equal(timeout.exitCode, 1)
 	assert.match(timeout.output, /timeout=true/)
 	assert.match(timeout.output, /signal=SIGTERM/)
+}
+
+async function testHostRuntimeEnvironmentIsScopedAndValidated(): Promise<void> {
+	const priorXdgConfig = process.env.XDG_CONFIG_HOME
+	const allowed = validateOpenShellHostRuntimeEnv({
+		XDG_CONFIG_HOME: "/tmp/scoped-config",
+		HEADLESSCODE_CONTAINED_PROFILE: "/tmp/reviewed-profile.yaml",
+		HEADLESSCODE_RSI_BROKER_BIND_HOST: "127.0.0.1",
+	})
+	assert.deepEqual(allowed, {
+		XDG_CONFIG_HOME: "/tmp/scoped-config",
+		HEADLESSCODE_CONTAINED_PROFILE: "/tmp/reviewed-profile.yaml",
+		HEADLESSCODE_RSI_BROKER_BIND_HOST: "127.0.0.1",
+	})
+	assert.throws(() => validateOpenShellHostRuntimeEnv({ HEADLESSCODE_OPENROUTER_API_KEY: "must-not-be-overridden" }), /not allowed/)
+	assert.throws(() => validateOpenShellHostRuntimeEnv({ HOME: "/tmp/other-home" }), /not allowed/)
+	assert.throws(() => validateOpenShellHostRuntimeEnv({ XDG_CONFIG_HOME: "bad\0path" }), /not allowed/)
+	const result = await runOpenShellCommandAsync(
+		["-e", "process.stdout.write(JSON.stringify({config:process.env.XDG_CONFIG_HOME,profile:process.env.HEADLESSCODE_CONTAINED_PROFILE}))"],
+		2_000,
+		process.execPath,
+		undefined,
+		1_000,
+		allowed,
+	)
+	assert.equal(result.exitCode, 0)
+	assert.deepEqual(JSON.parse(result.output), { config: "/tmp/scoped-config", profile: "/tmp/reviewed-profile.yaml" }, "the host CLI receives scoped profile settings")
+	assert.equal(process.env.XDG_CONFIG_HOME, priorXdgConfig, "scoped settings do not mutate the API process environment")
 }
 
 async function testImmediateAbortWaitsForLauncherIdentityAndCleansUp(): Promise<void> {
@@ -799,6 +830,8 @@ async function main(): Promise<void> {
 	console.log("  ok   OpenShell read-only mount targets are safe and non-overlapping")
 	await testAsyncOpenShellCommandReportsSafeExitAndTimeoutDetails()
 	console.log("  ok   OpenShell async command errors report safe exit and timeout details")
+	await testHostRuntimeEnvironmentIsScopedAndValidated()
+	console.log("  ok   OpenShell host runtime environment is validated, scoped, and not forwarded to the guest")
 	await testImmediateAbortWaitsForLauncherIdentityAndCleansUp()
 	console.log("  ok   OpenShell immediate abort waits for identity capture and cleans up")
 	await testHostAbortEscalatesItsLauncherGroupAndRemovesGrandchild()

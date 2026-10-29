@@ -2,10 +2,16 @@ import * as fs from "node:fs"
 import { CampaignControlStore, MAX_MONTHLY_BUDGET_MICROS } from "./store.js"
 import { loadCampaignAdapterConfig, readCampaignBudgetReport, runCampaignTick, runFleetAdapterUnderLock, verifyCampaignDispatchLock } from "./runner.js"
 import { mutateCampaignControlLocked } from "./authority.js"
-import { CAMPAIGN_ADAPTER_FILE, CAMPAIGN_CONTROL_FILE, REPOSITORY_CAMPAIGN_REGISTRY_FILE, REPOSITORY_CAMPAIGN_STATE_FILE } from "./paths.js"
+import { CAMPAIGN_ADAPTER_FILE, CAMPAIGN_CONTROL_FILE, REPOSITORY_CAMPAIGN_REGISTRY_FILE, REPOSITORY_CAMPAIGN_STATE_FILE, REPOSITORY_WORKER_REGISTRY_FILE } from "./paths.js"
 import { readCampaignRsiStatus } from "./rsi.js"
 import * as os from "node:os"
 import * as path from "node:path"
+import { RepositoryCampaignStore, loadRepositoryCampaignDefinitions } from "./repository-campaigns.js"
+import { createRepositoryBudgetAuthorityReader } from "./repository-budget-authority.js"
+import { bindRepositoryWorkerRegistrations, BUILTIN_REPOSITORY_PIPELINE_ADAPTER_FACTORIES, loadRepositoryWorkerRegistrations } from "./repository-worker-registry.js"
+import { loadKnownCurlDebianAdvisory } from "./repository-known-advisory.js"
+import { CURL_CAMPAIGN_ID, CURL_CANDIDATE_TREE_SHA, CURL_FIXED_ADVISORY, CURL_PRIVATE_SOURCE_REVISION,
+	evaluatePinnedCurlCandidate, makeCurlProtectedEvaluationRequest } from "./repository-curl-evaluator.js"
 
 function parseBudget(dollars: string): number | undefined {
 	if (!/^(?:0|[1-9]\d*)(?:\.\d{1,6})?$/.test(dollars)) return undefined
@@ -15,12 +21,12 @@ function parseBudget(dollars: string): number | undefined {
 }
 
 function usage(): string {
-	return "Usage: headlesscode campaign <status|rsi|on|off|budget --usd <amount>|tick|serve> [--json]"
+	return "Usage: headlesscode campaign <status|rsi|on|off|budget --usd <amount>|tick|serve|qualify-known curl-maintenance CVE-2026-92390 --purpose=qualification> [--json]"
 }
 
 export async function campaignMain(args: string[]): Promise<number> {
 	const [action, ...rest] = args
-	if (!action || !["status", "rsi", "on", "off", "budget", "tick", "serve", "_apply", "_adapter-tick"].includes(action)) {
+	if (!action || !["status", "rsi", "on", "off", "budget", "tick", "serve", "qualify-known", "_apply", "_adapter-tick", "_repository-run-begin", "_repository-run-finish", "_repository-lock-hold"].includes(action)) {
 		process.stderr.write(`${usage()}\n`)
 		return 2
 	}
@@ -30,7 +36,8 @@ export async function campaignMain(args: string[]): Promise<number> {
 		if (positional.length) return 2
 		const { startCampaignControlServer } = await import("./server.js")
 		await startCampaignControlServer({ staticRoot: path.join(os.homedir(), "Projects/capsize-web/apps/fleet-campaign-control/dist"),
-			repositoryCampaignRegistryPath: REPOSITORY_CAMPAIGN_REGISTRY_FILE, repositoryCampaignStatePath: REPOSITORY_CAMPAIGN_STATE_FILE })
+			repositoryCampaignRegistryPath: REPOSITORY_CAMPAIGN_REGISTRY_FILE, repositoryCampaignStatePath: REPOSITORY_CAMPAIGN_STATE_FILE,
+			repositoryWorkerRegistryPath: REPOSITORY_WORKER_REGISTRY_FILE, enableRepositoryCoordinator: true })
 		process.stdout.write(JSON.stringify({ status: "listening", url: "http://127.0.0.1:4391/" }) + "\n")
 		return 0
 	}
@@ -44,6 +51,77 @@ export async function campaignMain(args: string[]): Promise<number> {
 		await store.updateBudgetProjection(await readCampaignBudgetReport(adapter))
 		process.stdout.write(JSON.stringify(result) + "\n")
 		return result.status === "succeeded" ? 0 : 1
+	}
+	if (action === "_repository-run-begin") {
+		if (positional.length !== 1 || !/^\d{4,8}$/.test(positional[0]!)) return 2
+		await verifyCampaignDispatchLock(CAMPAIGN_CONTROL_FILE)
+		const timeoutMs = Number(positional[0])
+		if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 60_000 || timeoutMs > 30 * 60_000) return 2
+		const runStore = new CampaignControlStore(CAMPAIGN_CONTROL_FILE)
+		const state = await runStore.snapshot()
+		if (!state.enabled || !state.canAdmit) {
+			process.stdout.write(JSON.stringify({ run: null }) + "\n")
+			return 0
+		}
+		const run = await runStore.beginAdmittedRunIfIdle(new Date(), timeoutMs, state.epoch)
+		process.stdout.write(JSON.stringify({ run: run ?? null }) + "\n")
+		return 0
+	}
+	if (action === "_repository-run-finish") {
+		if (positional.length !== 2 || !/^[0-9a-f-]{36}$/.test(positional[0]!) || !["succeeded", "failed"].includes(positional[1]!)) return 2
+		await verifyCampaignDispatchLock(CAMPAIGN_CONTROL_FILE)
+		const run = await new CampaignControlStore(CAMPAIGN_CONTROL_FILE).finishRun(positional[0]!, positional[1]! as "succeeded" | "failed", "repository-worker coordinator finished")
+		process.stdout.write(JSON.stringify({ run }) + "\n")
+		return 0
+	}
+	if (action === "_repository-lock-hold") {
+		if (positional.length) return 2
+		await verifyCampaignDispatchLock(CAMPAIGN_CONTROL_FILE)
+		process.stdout.write("LOCKED\n")
+		await new Promise<void>((resolve) => {
+			process.stdin.once("data", () => resolve())
+			process.stdin.once("end", () => resolve())
+			process.stdin.resume()
+		})
+		return 0
+	}
+	if (action === "qualify-known") {
+		if (positional.length !== 3 || positional[0] !== CURL_CAMPAIGN_ID || positional[1] !== CURL_FIXED_ADVISORY || positional[2] !== "--purpose=qualification") return 2
+		try {
+		const definitions = await loadRepositoryCampaignDefinitions(REPOSITORY_CAMPAIGN_REGISTRY_FILE)
+		const definition = definitions.find((item) => item.id === CURL_CAMPAIGN_ID)
+		if (!definition) throw new Error("known qualification campaign is not owner-registered")
+		const readAuthority = createRepositoryBudgetAuthorityReader(definitions, CAMPAIGN_CONTROL_FILE)
+		const repositoryStore = new RepositoryCampaignStore(REPOSITORY_CAMPAIGN_STATE_FILE, definitions, readAuthority)
+		const registrations = await loadRepositoryWorkerRegistrations(REPOSITORY_WORKER_REGISTRY_FILE)
+		const workers = bindRepositoryWorkerRegistrations(definitions, registrations, BUILTIN_REPOSITORY_PIPELINE_ADAPTER_FACTORIES, { store: repositoryStore })
+		if (workers.filter((worker) => worker.workerProfile === definition.workerProfile && worker.executionKind === "live-cve").length !== 1) {
+			throw new Error("known qualification requires its exact owner-registered live worker")
+		}
+		const advisory = await loadKnownCurlDebianAdvisory()
+		const fixedProof = await evaluatePinnedCurlCandidate(makeCurlProtectedEvaluationRequest({ campaignId: CURL_CAMPAIGN_ID,
+			jobId: "known-qualification-preflight", advisoryId: CURL_FIXED_ADVISORY,
+			candidateRevision: CURL_PRIVATE_SOURCE_REVISION, candidateTreeSha: CURL_CANDIDATE_TREE_SHA }))
+		if (!fixedProof.accepted || fixedProof.disposition !== "already-fixed" || fixedProof.reasonCode !== "fixed-proof-verified") {
+			throw new Error("known qualification requires the pinned already-fixed proof")
+		}
+		const state = await repositoryStore.status() as { campaigns: Array<Record<string, unknown>>; jobs: Array<Record<string, unknown>> }
+		const campaign = state.campaigns.find((item) => item.id === CURL_CAMPAIGN_ID)
+		if (!campaign || campaign.enabled !== true || campaign.readiness !== "ready") throw new Error("known qualification requires a started campaign with fresh registered prerequisites")
+		if (state.jobs.some((job) => job.campaignId === CURL_CAMPAIGN_ID && job.advisoryId === CURL_FIXED_ADVISORY)) {
+			throw new Error("known advisory qualification already has a job")
+		}
+		const job = await repositoryStore.enqueueKnownQualification({ campaignId: CURL_CAMPAIGN_ID, advisoryId: advisory.advisoryId,
+			publicBaseRevision: advisory.publicBaseRevision, snapshotSha256: advisory.snapshotSha256, sourceUrl: advisory.sourceUrl,
+			sourceContentSha256: advisory.sourceHtmlSha256, affectedRange: advisory.affectedRange })
+		process.stdout.write(`${JSON.stringify({ purpose: "qualification", campaignId: CURL_CAMPAIGN_ID, jobId: job.id,
+			advisoryId: job.advisoryId, source: "debian-tracker-snapshot", snapshotSha256: advisory.snapshotSha256,
+			sourceHtmlSha256: advisory.sourceHtmlSha256, sourceUrl: advisory.sourceUrl, state: "queued" })}\n`)
+		return 0
+		} catch (error) {
+			process.stderr.write(`headlesscode campaign: ${error instanceof Error ? error.message : "known qualification could not be queued"}\n`)
+			return 1
+		}
 	}
 	if (action === "_apply") {
 		if (positional.length < 1 || positional.length > 2) return 2

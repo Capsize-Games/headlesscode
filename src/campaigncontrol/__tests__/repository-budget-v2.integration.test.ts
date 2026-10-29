@@ -8,6 +8,7 @@ import * as path from "node:path"
 import { test } from "node:test"
 import { createRepositoryCampaignBudgetBinding } from "../repository-budget-binding.js"
 import { RepositoryCampaignStore, type RepositoryBudgetAuthority, type RepositoryCampaignDefinition } from "../repository-campaigns.js"
+import { CampaignControlStore } from "../store.js"
 import { FleetRepositoryBudgetLedger, type FleetRepositoryBudgetScope } from "../../rsi/fleet-repository-budget-ledger.js"
 import type { OpenRouterBrokerGrant, OpenRouterCallReservation, OpenRouterCallSettlement } from "../../rsi/inference-broker.js"
 
@@ -79,9 +80,9 @@ const integrationSkip = fleetSourceAvailable ? false : "requires the Fleet sourc
 const qualification = { sourceAudited: true, workerQualified: true, recipeQualified: true, evaluatorQualified: true,
 	modelApproved: true, dataApproved: true, accessApproved: true }
 const definitions: RepositoryCampaignDefinition[] = [
-	{ id: "repo-a", name: "Repository A", sourceRevision: sourceA, workerProfile: "fixture-worker", recipeDigest: "c".repeat(64),
+	{ id: "repo-a", name: "Repository A", repositoryId: "fixture-a", repository: "Capsize-Games/fixture-a", sourceRevision: sourceA, policySha256: policyA, workerProfile: "fixture-worker", recipeDigest: "c".repeat(64),
 		evaluatorDigest: "d".repeat(64), model: MODEL, dataAccessProfile: "fixture-data", qualification },
-	{ id: "repo-b", name: "Repository B", sourceRevision: sourceB, workerProfile: "fixture-worker", recipeDigest: "e".repeat(64),
+	{ id: "repo-b", name: "Repository B", repositoryId: "fixture-b", repository: "Capsize-Games/fixture-b", sourceRevision: sourceB, policySha256: policyB, workerProfile: "fixture-worker", recipeDigest: "e".repeat(64),
 		evaluatorDigest: "f".repeat(64), model: MODEL, dataAccessProfile: "fixture-data", qualification },
 ]
 
@@ -125,6 +126,7 @@ interface Fixture {
 	root: string
 	home: string
 	store: RepositoryCampaignStore
+	controlStore: CampaignControlStore
 	claims: { "repo-a": NonNullable<Awaited<ReturnType<RepositoryCampaignStore["claimNext"]>>>; "repo-b": NonNullable<Awaited<ReturnType<RepositoryCampaignStore["claimNext"]>>> }
 	bindings: Record<"repo-a" | "repo-b", ReturnType<typeof createRepositoryCampaignBudgetBinding>>
 	grants: Record<"repo-a" | "repo-b", OpenRouterBrokerGrant>
@@ -140,7 +142,7 @@ interface Fixture {
 
 async function privateDir(directory: string): Promise<void> { await fs.mkdir(directory, { recursive: true, mode: 0o700 }); await fs.chmod(directory, 0o700) }
 
-async function fixture(): Promise<Fixture> {
+async function fixture(options: { activeRun?: boolean; repositoryEnabled?: boolean } = {}): Promise<Fixture> {
 	const home = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-fleet-v2-")); await fs.chmod(home, 0o700)
 	const campaign = path.join(home, ".local", "state", "fleet-security-watch", "automation", "campaign")
 	const controlDir = path.join(home, ".local", "share", "headlesscode", "campaign-control")
@@ -159,27 +161,14 @@ async function fixture(): Promise<Fixture> {
 	})
 	await fs.writeFile(path.join(campaign, "repository-scopes.json"), JSON.stringify({ schemaVersion: 1, repositories: scopes }), { mode: 0o600 })
 	await fs.chmod(path.join(campaign, "repository-scopes.json"), 0o600)
-	let controlState = { globalEnabled: true, globalEpoch: 1, repoAEnabled: true, repoAEpoch: 1, repoBEnabled: true, repoBEpoch: 1 }
+	const controlStore = new CampaignControlStore(controlFile)
+	const controlDefinitions = new Map(definitions.map((definition) => [definition.id, definition]))
 	let fault: string | undefined, month: string | undefined, crashHandoff = false
-	const writeControl = async (underDispatchLock = false) => {
-		const now = Date.now()
-		const value = { schemaVersion: 1, campaignId: "fleet-security-watch", enabled: controlState.globalEnabled,
-			canAdmit: controlState.globalEnabled, epoch: controlState.globalEpoch, budgetLimitMicros: 5_000_000,
-			month: new Date().toISOString().slice(0, 7), settledMicros: 0, reservedMicros: 0, ambiguousMicros: 0,
-			activeRun: { id: `fixture-run-${controlState.globalEpoch}`, epoch: controlState.globalEpoch, startedAt: now - 1000, expiresAt: now + 300_000 },
-			repositoryCampaigns: {
-				"repo-a": { enabled: controlState.repoAEnabled, epoch: controlState.repoAEpoch, repositoryId: "fixture-a", sourceRevision: sourceA, policySha256: policyA },
-				"repo-b": { enabled: controlState.repoBEnabled, epoch: controlState.repoBEpoch, repositoryId: "fixture-b", sourceRevision: sourceB, policySha256: policyB },
-			} }
-		if (underDispatchLock) {
-			const child = spawnSync("/usr/bin/python3", ["-c", "import fcntl,json,os,sys; x=json.load(sys.stdin); fd=os.open(x['lock'],os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600); fcntl.flock(fd,fcntl.LOCK_EX); open(x['control'],'w',encoding='utf-8').write(json.dumps(x['value']))"],
-				{ input: JSON.stringify({ lock: path.join(controlDir, "campaign-dispatch.lock"), control: controlFile, value }), encoding: "utf8", timeout: 5_000 })
-			if (child.error || child.status !== 0) throw new Error("fixture global Stop could not acquire dispatch lock")
-		} else {
-			await fs.writeFile(controlFile, JSON.stringify(value), { mode: 0o600 }); await fs.chmod(controlFile, 0o600)
-		}
-	}
-	await writeControl()
+	await controlStore.setBudgetLimit(5_000_000)
+	await controlStore.setEnabled(true)
+	for (const definition of definitions) await controlStore.setRepositoryCampaign(definition, options.repositoryEnabled ?? true)
+	const globalControl = await controlStore.snapshot()
+	if (options.activeRun !== false) await controlStore.beginAdmittedRunIfIdle(new Date(), 300_000, globalControl.epoch)
 	const invoke = async (message: Record<string, unknown>) => {
 		const child = spawnSync("/usr/bin/python3", ["-c", pythonBridge], { input: JSON.stringify(message), encoding: "utf8", timeout: 10_000,
 			env: { HOME: home, PATH: process.env.PATH ?? "/usr/bin:/bin", PYTHONPATH: fleetRoot, PYTHONNOUSERSITE: "1",
@@ -252,10 +241,15 @@ async function fixture(): Promise<Fixture> {
 		store, claim: claims[id], scope: scope(id), expectedKeyIdentity: keyIdentity, invoke, requestStartHandoff,
 		assertDispatchFence: async () => undefined,
 	})])) as Fixture["bindings"]
-	return { root, home, store, claims, grants, bindings, setFault(value) { fault = value }, setMonth(value) { month = value }, invoke, requestStartHandoff,
+	return { root, home, store, controlStore, claims, grants, bindings, setFault(value) { fault = value }, setMonth(value) { month = value }, invoke, requestStartHandoff,
 		tryDispatchLock,
 		crashNextHandoff() { crashHandoff = true },
-		async setControl(next) { controlState = { ...controlState, ...next }; await writeControl(true) }, cleanup: () => fs.rm(home, { recursive: true, force: true }) }
+		async setControl(next) {
+			if (next.globalEnabled !== undefined) await controlStore.setEnabled(next.globalEnabled)
+			for (const [id, enabled] of [["repo-a", next.repoAEnabled], ["repo-b", next.repoBEnabled]] as const) {
+				if (enabled !== undefined) await controlStore.setRepositoryCampaign(controlDefinitions.get(id)!, enabled)
+			}
+		}, cleanup: () => fs.rm(home, { recursive: true, force: true }) }
 }
 
 test("HCL binding sends v2 repository identities and both repositories consume the same legacy campaign lifetime pool", { skip: integrationSkip }, async (t) => {
@@ -293,6 +287,47 @@ test("HCL binding sends v2 repository identities and both repositories consume t
 	await extraLedger.register(extraGrant)
 	await assert.rejects(extraLedger.reserve(extraGrant, { ...reservation("extra-call"), reservedUsd: 0.01, reservedTokens: 2 }),
 		/repository lifetime budget exhausted/)
+})
+
+test("cold start reads Fleet budget without a run, then starts, claims, and stops through real HCL and Fleet stores", { skip: integrationSkip }, async (t) => {
+	const f = await fixture({ activeRun: false, repositoryEnabled: false }); t.after(f.cleanup)
+	const definition = definitions[0]!
+	const readAuthority = async (): Promise<RepositoryBudgetAuthority> => {
+		const state = await f.controlStore.snapshot()
+		const row = state.repositoryCampaigns?.[definition.id]
+		assert.ok(row)
+		const ledger = new FleetRepositoryBudgetLedger({ expectedKeyIdentity: keyIdentity, scope: scope("repo-a", row.epoch), invoke: f.invoke })
+		return state.activeRun ? await ledger.budgetSnapshot() : await ledger.budgetSnapshotOnly()
+	}
+	const repoStore = new RepositoryCampaignStore(path.join(f.root, "cold-start.json"), [definition], readAuthority)
+	const initial = await repoStore.status() as any
+	assert.equal(initial.budget.authority, "fleet-v2-readonly")
+	assert.equal(initial.budget.available, false)
+	const coldSnapshot = await new FleetRepositoryBudgetLedger({ expectedKeyIdentity: keyIdentity, scope: scope("repo-a"), invoke: f.invoke }).budgetSnapshotOnly()
+	assert.equal(coldSnapshot.snapshotOnly, true)
+	assert.equal(coldSnapshot.runId, null)
+	assert.equal(coldSnapshot.runExpiresAtMs, null)
+	await repoStore.setCampaignBudget(definition.id, 10_000, 10_000)
+	const global = await f.controlStore.snapshot()
+	const run = await f.controlStore.beginAdmittedRunIfIdle(new Date(), 300_000, global.epoch)
+	assert.ok(run, "cold Start acquires a fresh bounded global run")
+	await f.controlStore.setRepositoryCampaign(definition, true)
+	await repoStore.start(definition.id)
+	const runBound = await readAuthority()
+	assert.equal(runBound.mode, "fleet-v2")
+	assert.equal(runBound.runId, run!.id)
+	await repoStore.enqueue(definition.id, "CVE-2026-92390")
+	const claim = await repoStore.claimNext(definition.id, { micros: 10_000, tokens: 10_000 }, new Date(), { executionKind: "live-cve" })
+	assert.ok(claim, "one claim is admitted only with the real active run and repository epoch")
+	await repoStore.stop(definition.id)
+	await f.controlStore.setRepositoryCampaign(definition, false)
+	const stopped = await f.controlStore.snapshot()
+	assert.equal(stopped.repositoryCampaigns?.[definition.id]?.enabled, false)
+	assert.equal(stopped.repositoryCampaigns?.[definition.id]?.epoch, 3)
+	await f.controlStore.finishRun(run!.id, "succeeded", "offline cold-start fixture completed")
+	await repoStore.finish(claim!, { status: "ambiguous" })
+	const final = await repoStore.status() as any
+	assert.equal(final.campaigns[0].enabled, false)
 })
 
 test("Stop changes to either epoch before the dual request-start fence prevent the HTTP callback", { skip: integrationSkip }, async (t) => {

@@ -133,6 +133,33 @@ async function testAdmittedRunRequiresCurrentOnEpochAndSpendRoom(): Promise<void
 	} finally { await fs.rm(root, { recursive: true, force: true }) }
 }
 
+async function testRepositoryControlMapIsExactPrivateScopeAndEpochFenced(): Promise<void> {
+	const { root, store } = await fixture()
+	try {
+		const definition = { id: "sample-repo", repositoryId: "capsize-sample-repo", sourceRevision: "a".repeat(40), policySha256: "b".repeat(64) }
+		await store.setRepositoryCampaign(definition, true)
+		let state = await store.snapshot()
+		assert.deepEqual(state.repositoryCampaigns?.[definition.id], { enabled: true, epoch: 1, repositoryId: definition.repositoryId,
+			sourceRevision: definition.sourceRevision, policySha256: definition.policySha256 })
+		assert.deepEqual(Object.keys(await fs.readFile(store.path, "utf8").then(JSON.parse) as object).sort().at(-1), "updatedAt")
+		await store.setRepositoryCampaign(definition, true)
+		assert.equal((await store.snapshot()).repositoryCampaigns?.[definition.id]?.epoch, 1, "repeat Start does not create a new epoch")
+		await store.disableRepositoryCampaign(definition.id)
+		assert.deepEqual((await store.snapshot()).repositoryCampaigns?.[definition.id], { enabled: false, epoch: 2, repositoryId: definition.repositoryId,
+			sourceRevision: definition.sourceRevision, policySha256: definition.policySha256 })
+		await store.setRepositoryCampaign(definition, true)
+		assert.equal((await store.snapshot()).repositoryCampaigns?.[definition.id]?.epoch, 3, "re-enable never reuses a stopped epoch")
+		const raw = JSON.parse(await fs.readFile(store.path, "utf8"))
+		raw.repositoryCampaigns[definition.id].extra = "untrusted"
+		await fs.writeFile(store.path, JSON.stringify(raw), { mode: 0o600 })
+		await assert.rejects(store.snapshot(), /exact-schema validation/)
+		state = await new CampaignControlStore(store.path).snapshot().catch(() => state)
+		assert.ok(state.repositoryCampaigns?.[definition.id], "the scope is only in the private file, not lost from returned legacy DTOs")
+		const view = await store.status()
+		assert.equal(Object.hasOwn(view.control, "repositoryCampaigns"), false, "private repository scopes never enter the legacy public projection")
+	} finally { await fs.rm(root, { recursive: true, force: true }) }
+}
+
 const tests: readonly SuiteTest[] = [
 	["initial state is off and budget limit is capped", testInitialOffAndBudgetCeiling],
 	["control handoff has exact schema and run history survives restart", testExactControlSchemaAndRestartHistory],
@@ -141,6 +168,7 @@ const tests: readonly SuiteTest[] = [
 	["stale run receipts cannot clear a newer fence", testStaleRunReceiptCannotClearNewerFence],
 	["live campaign run leases cannot be overwritten", testLiveRunLeaseIsNeverReplaced],
 	["inference leases require the same enabled epoch and available spend", testAdmittedRunRequiresCurrentOnEpochAndSpendRoom],
+	["repository scope control is exact, private, and epoch fenced", testRepositoryControlMapIsExactPrivateScopeAndEpochFenced],
 ]
 
 runMain("campaign-control", tests)

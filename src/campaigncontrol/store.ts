@@ -37,6 +37,23 @@ export interface CampaignControlState {
 	nextDueAt: number | null
 	updatedAt: number
 	activeRun: ActiveCampaignRun | null
+	/** Private Fleet-v2 scope admission map. Never included in the legacy HTTP projection. */
+	repositoryCampaigns?: Record<string, RepositoryCampaignControlEntry>
+}
+
+export interface RepositoryCampaignControlEntry {
+	enabled: boolean
+	epoch: number
+	repositoryId: string
+	sourceRevision: string
+	policySha256: string
+}
+
+export interface RepositoryCampaignControlDefinition {
+	id: string
+	repositoryId?: string
+	sourceRevision: string | null
+	policySha256?: string
 }
 
 export interface CampaignBudgetProjection {
@@ -51,7 +68,7 @@ function validState(value: unknown): value is CampaignControlState {
 	const s = value as Partial<CampaignControlState>
 	const keys = Object.keys(value as object).sort().join(",")
 	const expected = ["activeRun", "ambiguousMicros", "budgetLimitMicros", "canAdmit", "campaignId", "enabled", "epoch", "month", "nextDueAt", "reservedMicros", "schemaVersion", "settledMicros", "updatedAt"].sort().join(",")
-	if (keys !== expected) return false
+	if (keys !== expected && keys !== [...expected.split(","), "repositoryCampaigns"].sort().join(",")) return false
 	const active = s.activeRun
 	return s.schemaVersion === 1 && s.campaignId === CAMPAIGN_ID &&
 		typeof s.enabled === "boolean" && Number.isSafeInteger(s.epoch) && (s.epoch ?? -1) >= 0 &&
@@ -67,7 +84,22 @@ function validState(value: unknown): value is CampaignControlState {
 		(active === null || (!!active && typeof active === "object" &&
 			Object.keys(active).sort().join(",") === "epoch,expiresAt,id,startedAt" &&
 			typeof active.id === "string" && Number.isSafeInteger(active.epoch) &&
-			Number.isSafeInteger(active.startedAt) && Number.isSafeInteger(active.expiresAt) && active.expiresAt >= active.startedAt))
+			Number.isSafeInteger(active.startedAt) && Number.isSafeInteger(active.expiresAt) && active.expiresAt >= active.startedAt)) &&
+		(s.repositoryCampaigns === undefined || validRepositoryCampaignMap(s.repositoryCampaigns))
+}
+
+function validRepositoryCampaignMap(value: unknown): value is Record<string, RepositoryCampaignControlEntry> {
+	if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length > 32) return false
+	for (const [id, raw] of Object.entries(value)) {
+		if (!/^[a-z0-9][a-z0-9-]{1,62}$/.test(id) || !raw || typeof raw !== "object" || Array.isArray(raw)) return false
+		const item = raw as Record<string, unknown>
+		if (Object.keys(item).sort().join(",") !== "enabled,epoch,policySha256,repositoryId,sourceRevision" ||
+			typeof item.enabled !== "boolean" || !Number.isSafeInteger(item.epoch) || Number(item.epoch) < 0 ||
+			typeof item.repositoryId !== "string" || !/^[a-z0-9][a-z0-9-]{1,62}$/.test(item.repositoryId) ||
+			typeof item.sourceRevision !== "string" || !/^[a-f0-9]{40}$/.test(item.sourceRevision) ||
+			typeof item.policySha256 !== "string" || !/^[a-f0-9]{64}$/.test(item.policySha256)) return false
+	}
+	return true
 }
 
 function initialState(now: Date): CampaignControlState {
@@ -151,6 +183,59 @@ export class CampaignControlStore {
 				state.epoch += 1
 				this.refreshCanAdmit(state)
 			}
+			return state
+		}, now)
+	}
+
+	/** Write only immutable identities from the compiled repository registry. */
+	async setRepositoryCampaign(definition: RepositoryCampaignControlDefinition, enabled: boolean, now = new Date()): Promise<CampaignControlState> {
+		if (!definition || !/^[a-z0-9][a-z0-9-]{1,62}$/.test(definition.id) ||
+			!definition.repositoryId || !/^[a-z0-9][a-z0-9-]{1,62}$/.test(definition.repositoryId) ||
+			typeof definition.sourceRevision !== "string" || !/^[a-f0-9]{40}$/.test(definition.sourceRevision) ||
+			typeof definition.policySha256 !== "string" || !/^[a-f0-9]{64}$/.test(definition.policySha256) || typeof enabled !== "boolean") {
+			throw new Error("repository campaign control identity is incomplete")
+		}
+		return this.update((state) => {
+			const map = state.repositoryCampaigns ?? (state.repositoryCampaigns = {})
+			const previous = map[definition.id]
+			const sameIdentity = previous?.repositoryId === definition.repositoryId && previous.sourceRevision === definition.sourceRevision && previous.policySha256 === definition.policySha256
+			if (previous && !sameIdentity && previous.enabled) throw new Error("enabled repository campaign identity cannot be replaced")
+			const epoch = previous ? previous.epoch + (previous.enabled === enabled && sameIdentity ? 0 : 1) : 1
+			map[definition.id] = { enabled, epoch, repositoryId: definition.repositoryId!, sourceRevision: definition.sourceRevision!, policySha256: definition.policySha256! }
+			return state
+		}, now)
+	}
+
+	/** Ensure the private Fleet map is rooted only in a compiled definition. */
+	async registerRepositoryCampaign(definition: RepositoryCampaignControlDefinition, now = new Date()): Promise<CampaignControlState> {
+		if (!definition || !/^[a-z0-9][a-z0-9-]{1,62}$/.test(definition.id) || !definition.repositoryId ||
+			!/^[a-z0-9][a-z0-9-]{1,62}$/.test(definition.repositoryId) || typeof definition.sourceRevision !== "string" ||
+			!/^[a-f0-9]{40}$/.test(definition.sourceRevision) || typeof definition.policySha256 !== "string" || !/^[a-f0-9]{64}$/.test(definition.policySha256)) {
+			throw new Error("repository campaign control identity is incomplete")
+		}
+		return this.update((state) => {
+			const map = state.repositoryCampaigns ?? (state.repositoryCampaigns = {})
+			const previous = map[definition.id]
+			if (!previous) {
+				if (Object.keys(map).length >= 32) throw new Error("repository campaign control map is full")
+				map[definition.id] = { enabled: false, epoch: 1, repositoryId: definition.repositoryId!,
+					sourceRevision: definition.sourceRevision!, policySha256: definition.policySha256! }
+				return state
+			}
+			const sameIdentity = previous.repositoryId === definition.repositoryId && previous.sourceRevision === definition.sourceRevision && previous.policySha256 === definition.policySha256
+			if (!sameIdentity && previous.enabled) throw new Error("enabled repository campaign identity cannot be replaced")
+			if (!sameIdentity) map[definition.id] = { enabled: false, epoch: previous.epoch + 1, repositoryId: definition.repositoryId!,
+				sourceRevision: definition.sourceRevision!, policySha256: definition.policySha256! }
+			return state
+		}, now)
+	}
+
+	/** Fenced Stop can revoke a retained scope even if its source registration was removed. */
+	async disableRepositoryCampaign(id: string, now = new Date()): Promise<CampaignControlState> {
+		if (!/^[a-z0-9][a-z0-9-]{1,62}$/.test(id)) throw new Error("repository campaign id is invalid")
+		return this.update((state) => {
+			const entry = state.repositoryCampaigns?.[id]
+			if (entry?.enabled) { entry.enabled = false; entry.epoch += 1 }
 			return state
 		}, now)
 	}
