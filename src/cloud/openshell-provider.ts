@@ -15,7 +15,7 @@ import { parse, stringify } from "yaml"
 import { writeTaskFiles } from "../orchestrator/task-files.js"
 import { projectStoreRoot, resolveProjectDataDir } from "../project-store.js"
 import type { CloudProvider, CloudSessionRequest, CommandResult, SessionHandle } from "./provider.js"
-import { CONTAINED_EVIDENCE_RUNTIME_PATH, containedGuestEnvironment, verifyContainedSandboxIdentity } from "../security/profile.js"
+import { CONTAINED_EVIDENCE_RUNTIME_PATH, REPOSITORY_BROKER_CAPABILITY_PATH, containedGuestEnvironment, verifyContainedSandboxIdentity } from "../security/profile.js"
 import type { ContainedRuntimeProfile } from "../security/profile.js"
 import type { EmergencyControl } from "../control/emergency-controller.js"
 
@@ -178,6 +178,8 @@ export interface OpenShellSessionProviderOptions {
 	containedProfile?: ContainedRuntimeProfile
 	/** Per-session evidence capability; runtime-only and never copied into environment or prompts. */
 	evidenceRuntimeConfig?: { sessionId: string; capability: string; pinnedPublicKey: { keyId: string; publicKeyPem: string } }
+	/** Per-job broker capability file; accepted only by the no-provider repository-worker profile. */
+	repositoryBrokerCapabilityFile?: string
 	run?: (args: string[], timeoutMs?: number) => CommandResult
 	/** Async command runner used for long guest commands so host services can keep serving requests. */
 	runAsync?: (args: string[], timeoutMs?: number, signal?: AbortSignal) => Promise<CommandResult>
@@ -437,6 +439,7 @@ export class OpenShellSessionProvider implements CloudProvider {
 	private readonly gpu?: number
 	private readonly containedProfile?: ContainedRuntimeProfile
 	private readonly evidenceRuntimeConfig?: OpenShellSessionProviderOptions["evidenceRuntimeConfig"]
+	private readonly repositoryBrokerCapabilityFile?: string
 	private readonly workspaces = new Map<string, OpenShellWorkspaceState>()
 	private readonly controlCleanups = new Map<string, () => void>()
 	private readonly creating = new Map<string, Promise<void>>()
@@ -464,6 +467,7 @@ export class OpenShellSessionProvider implements CloudProvider {
 		this.gpu = options.gpu
 		this.containedProfile = options.containedProfile
 		this.evidenceRuntimeConfig = options.evidenceRuntimeConfig
+		this.repositoryBrokerCapabilityFile = options.repositoryBrokerCapabilityFile
 		if (this.containedProfile) {
 			if (this.gpu !== undefined) throw new Error("contained profile does not permit GPU allocation")
 			if (!this.emergencyControl || this.emergencyControl.identity !== this.containedProfile.expectedEmergencyControllerIdentity) throw new Error("contained profile requires the pinned, active supervisor emergency controller")
@@ -475,6 +479,9 @@ export class OpenShellSessionProvider implements CloudProvider {
 			if (this.image !== this.containedProfile.image || this.policy !== this.containedProfile.policySnapshotPath || this.cpu !== this.containedProfile.cpu || this.memory !== this.containedProfile.memory || this.providers.join("\0") !== this.containedProfile.providers.join("\0")) {
 				throw new Error("OpenShell request settings differ from the resolved contained profile")
 			}
+			if (this.containedProfile.purpose === "repository-worker") {
+				if (!this.repositoryBrokerCapabilityFile || this.providers.length !== 0 || !this.containedProfile.brokerCapabilityGuestPath) throw new Error("repository worker requires only its scoped broker capability file and no providers")
+			} else if (this.repositoryBrokerCapabilityFile) throw new Error("broker capability files are restricted to repository-worker sessions")
 			if (options.autoProviders === true || options.includeProjectData === true || this.readOnlyMounts.length || Object.keys(this.networkPolicy).length) {
 				throw new Error("contained sessions cannot attach ambient providers, project snapshots, arbitrary mounts, or network overrides")
 			}
@@ -753,6 +760,13 @@ export class OpenShellSessionProvider implements CloudProvider {
 			fs.cpSync(path.resolve(mount.source), sourceSnapshot, { recursive: true, dereference: true })
 			mounts.push({ type: "bind", source: sourceSnapshot, target: mountTargets[index]!, read_only: true })
 			filesystemPolicy.read_only.push(mountTargets[index]!)
+		}
+		if (this.containedProfile?.purpose === "repository-worker") {
+			const commonGitDir = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: repo, encoding: "utf8" }).trim()
+			const snapshot = path.join(isolated.tempRoot, "repository-broker-capability")
+			snapshotRepositoryBrokerCapability(this.repositoryBrokerCapabilityFile!, snapshot, [hostWorkspace, commonGitDir, isolated.tempRoot, this.scratchRoot])
+			mounts.push({ type: "bind", source: snapshot, target: REPOSITORY_BROKER_CAPABILITY_PATH, read_only: true })
+			filesystemPolicy.read_only.push(REPOSITORY_BROKER_CAPABILITY_PATH)
 		}
 		const generatedPolicy = path.join(isolated.tempRoot, "policy.generated.yaml")
 		fs.writeFileSync(generatedPolicy, stringify(policy), { flag: "wx", mode: 0o600 })
@@ -1088,6 +1102,24 @@ export function validateReadOnlyMountTargets(readOnlyMounts: Array<{ source: str
 		}
 	}
 	return targets
+}
+
+/** Validate and snapshot one broker capability without exposing its contents in arguments or logs. */
+export function snapshotRepositoryBrokerCapability(sourcePath: string, destinationPath: string, protectedPaths: string[]): void {
+	const source = path.resolve(sourcePath)
+	assertNoSymlinkAncestors(source)
+	const realSource = fs.realpathSync(source)
+	const stat = fs.lstatSync(realSource)
+	if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0 ||
+		(typeof process.getuid === "function" && stat.uid !== process.getuid()) ||
+		protectedPaths.some((item) => pathsOverlap(realSource, path.resolve(item)))) {
+		throw new Error("repository broker capability must be an owner-only regular file outside the worktree and session data")
+	}
+	const capability = fs.readFileSync(realSource, "utf8").trim()
+	if (!/^[A-Za-z0-9_-]{43}$/.test(capability) || Buffer.from(capability, "base64url").length !== 32) throw new Error("repository broker capability file is invalid")
+	const fd = fs.openSync(destinationPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o400)
+	try { fs.fchmodSync(fd, 0o400); fs.writeFileSync(fd, `${capability}\n`, "utf8") }
+	finally { fs.closeSync(fd) }
 }
 
 function isSameOrInside(parent: string, child: string): boolean {

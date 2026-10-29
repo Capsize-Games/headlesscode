@@ -10,10 +10,38 @@ const MAX_CAMPAIGNS = 32
 const MAX_JOBS = 500
 const MAX_HISTORY = 200
 const MOCK_DISPATCH_TIMEOUT_MS = 30_000
+export const REPOSITORY_WORKER_LEASE_MS = 120_000
+export const REPOSITORY_PROGRESS_FRESH_MS = 60_000
+export const REPOSITORY_CAMPAIGN_STEPS = ["intake", "deduplicate", "investigate", "prepare-candidate", "verify", "deliver"] as const
+export type RepositoryCampaignStep = typeof REPOSITORY_CAMPAIGN_STEPS[number]
+
+export interface RepositoryEvidenceRef {
+	id: string
+	kind: "intake" | "candidate" | "test-receipt" | "delivery"
+	label: string
+}
+
+export interface RepositoryJobProgress {
+	executionKind: "development-checkpoint" | "live-cve"
+	workerId: string
+	goal: string
+	currentTask: string
+	stage: RepositoryCampaignStep
+	completedSteps: RepositoryCampaignStep[]
+	requiredSteps: RepositoryCampaignStep[]
+	lastActionAt: number
+	heartbeatAt: number
+	leaseExpiresAt: number
+	blocker: string | null
+	nextStep: string | null
+	evidenceRefs: RepositoryEvidenceRef[]
+}
 
 export interface RepositoryCampaignDefinition {
 	id: string
 	name: string
+	repositoryId?: string
+	repository?: string
 	sourceRevision: string | null
 	workerProfile: string | null
 	recipeDigest: string | null
@@ -54,6 +82,7 @@ export interface RepositoryCampaignJob {
 	settledMicros: number
 	reservedTokens: number
 	settledTokens: number
+	progress?: RepositoryJobProgress
 	detail?: string
 }
 
@@ -128,8 +157,11 @@ function blankState(now: Date): CampaignState {
 function validateDefinition(definition: RepositoryCampaignDefinition): void {
 	if (!definition || typeof definition !== "object") throw new Error("repository campaign definition is invalid")
 	const q = definition.qualification
-	if (Object.keys(definition).sort().join(",") !== "dataAccessProfile,evaluatorDigest,id,model,name,qualification,recipeDigest,sourceRevision,workerProfile" ||
+	if (!(["dataAccessProfile,evaluatorDigest,id,model,name,qualification,recipeDigest,sourceRevision,workerProfile",
+		"dataAccessProfile,evaluatorDigest,id,model,name,qualification,recipeDigest,repository,repositoryId,sourceRevision,workerProfile"].includes(Object.keys(definition).sort().join(","))) ||
 		!validId(definition.id) || typeof definition.name !== "string" || !definition.name.trim() || definition.name.length > 100 ||
+		(definition.repositoryId !== undefined && !validId(definition.repositoryId)) ||
+		(definition.repository !== undefined && (typeof definition.repository !== "string" || !/^[A-Za-z0-9_.-]{1,39}\/[A-Za-z0-9_.-]{1,100}$/.test(definition.repository))) ||
 		![definition.sourceRevision, definition.workerProfile, definition.recipeDigest, definition.evaluatorDigest, definition.model, definition.dataAccessProfile]
 			.every((value) => value === null || (typeof value === "string" && value.length <= 160)) ||
 		!q || Object.keys(q).sort().join(",") !== "accessApproved,dataApproved,evaluatorQualified,modelApproved,recipeQualified,sourceAudited,workerQualified" ||
@@ -170,7 +202,8 @@ function validateState(value: unknown): value is CampaignState {
 			!Number.isSafeInteger(job.epoch) || !Number.isSafeInteger(job.createdAt) || !Number.isSafeInteger(job.updatedAt) ||
 			typeof job.month !== "string" || !/^\d{4}-(0[1-9]|1[0-2])$/.test(job.month) ||
 			![job.reservedMicros, job.settledMicros, job.reservedTokens, job.settledTokens].every((n) => Number.isSafeInteger(n) && n >= 0) || ids.has(job.id) ||
-			(job.claimId !== undefined && typeof job.claimId !== "string") || (job.detail !== undefined && typeof job.detail !== "string")) return false
+			(job.claimId !== undefined && typeof job.claimId !== "string") || (job.detail !== undefined && typeof job.detail !== "string") ||
+			(job.progress !== undefined && !validProgress(job.progress))) return false
 		ids.add(job.id)
 	}
 	for (const item of s.history) {
@@ -180,6 +213,29 @@ function validateState(value: unknown): value is CampaignState {
 			(item.jobId !== undefined && !validId(item.jobId)) || Object.keys(item).some((key) => !["at", "campaignId", "action", "epoch", "jobId"].includes(key))) return false
 	}
 	return true
+}
+
+function validProgress(value: unknown): value is RepositoryJobProgress {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false
+	const p = value as RepositoryJobProgress
+	const steps = new Set<string>(REPOSITORY_CAMPAIGN_STEPS)
+	return Object.keys(value).sort().join(",") === "blocker,completedSteps,currentTask,evidenceRefs,executionKind,goal,heartbeatAt,lastActionAt,leaseExpiresAt,nextStep,requiredSteps,stage,workerId" &&
+		["development-checkpoint", "live-cve"].includes(p.executionKind) && /^[0-9a-f-]{36}$/.test(p.workerId) &&
+		typeof p.goal === "string" && p.goal.length > 0 && p.goal.length <= 240 &&
+		typeof p.currentTask === "string" && p.currentTask.length > 0 && p.currentTask.length <= 240 &&
+		steps.has(p.stage) && Array.isArray(p.requiredSteps) && p.requiredSteps.length === REPOSITORY_CAMPAIGN_STEPS.length &&
+		p.requiredSteps.every((step, index) => step === REPOSITORY_CAMPAIGN_STEPS[index]) &&
+		Array.isArray(p.completedSteps) && p.completedSteps.length <= p.requiredSteps.length &&
+		p.completedSteps.every((step, index) => steps.has(step) && p.requiredSteps.indexOf(step) >= 0 &&
+			(index === 0 || p.requiredSteps.indexOf(step) > p.requiredSteps.indexOf(p.completedSteps[index - 1]!))) &&
+		[p.lastActionAt, p.heartbeatAt, p.leaseExpiresAt].every(Number.isSafeInteger) &&
+		p.lastActionAt <= p.heartbeatAt && p.heartbeatAt <= p.leaseExpiresAt &&
+		(p.blocker === null || (typeof p.blocker === "string" && p.blocker.length <= 240)) &&
+		(p.nextStep === null || (typeof p.nextStep === "string" && p.nextStep.length <= 240)) &&
+		Array.isArray(p.evidenceRefs) && p.evidenceRefs.length <= 20 && p.evidenceRefs.every((item) => item &&
+			Object.keys(item).sort().join(",") === "id,kind,label" && /^[a-f0-9]{64}$/.test(item.id) &&
+			["intake", "candidate", "test-receipt", "delivery"].includes(item.kind) &&
+			typeof item.label === "string" && item.label.length > 0 && item.label.length <= 80)
 }
 
 /** Durable control plane. Its optional budget adapter is synthetic-test-only; production is denied until the broker integration exists. */
@@ -353,9 +409,18 @@ export class RepositoryCampaignStore {
 	}
 
 	/** Reserve aggregate and per-campaign capacity before handing a job to a mock dispatcher. */
-	async claimNext(id: string, reservation: { micros: number; tokens: number }, now = new Date()): Promise<ClaimedRepositoryJob | undefined> {
+	async claimNext(id: string, reservation: { micros: number; tokens: number }, now = new Date(),
+		mode: { executionKind: RepositoryJobProgress["executionKind"]; requiredSteps?: readonly RepositoryCampaignStep[] } = { executionKind: "development-checkpoint" }): Promise<ClaimedRepositoryJob | undefined> {
 		this.requireDefinition(id)
 		if (![reservation?.micros, reservation?.tokens].every((n) => Number.isSafeInteger(n) && n > 0)) throw new Error("reservation must include positive token and spend limits")
+		const requiredSteps = mode.requiredSteps ?? REPOSITORY_CAMPAIGN_STEPS
+		if ((mode.executionKind !== "development-checkpoint" && mode.executionKind !== "live-cve") ||
+			requiredSteps.length !== REPOSITORY_CAMPAIGN_STEPS.length || requiredSteps.some((step, index) => step !== REPOSITORY_CAMPAIGN_STEPS[index])) {
+			throw new Error("campaign worker progress profile is invalid")
+		}
+		if (mode.executionKind === "live-cve" && (this.readBudgetAuthority() as { mode?: string }).mode !== "fleet-v2") {
+			throw new Error("live campaign claims require authoritative Fleet v2 registration")
+		}
 		return this.update((s) => {
 			const c = this.campaign(s, id)
 			const authority = this.budgetAuthority()
@@ -370,8 +435,61 @@ export class RepositoryCampaignStore {
 			if (!job) return undefined
 			const claimId = randomUUID()
 			job.status = "running"; job.claimId = claimId; job.epoch = c.epoch; job.reservedMicros = reservation.micros; job.reservedTokens = reservation.tokens; job.updatedAt = now.getTime()
+			job.progress = { executionKind: mode.executionKind, workerId: randomUUID(),
+				goal: `Assess ${job.advisoryId} and prepare a verified review candidate`, currentTask: "Read registered advisory metadata",
+				stage: "intake", completedSteps: [], requiredSteps: [...requiredSteps], lastActionAt: now.getTime(),
+				heartbeatAt: now.getTime(), leaseExpiresAt: now.getTime() + REPOSITORY_WORKER_LEASE_MS,
+				blocker: null, nextStep: "deduplicate", evidenceRefs: [] }
 			c.reservedMicros += reservation.micros; c.reservedTokens += reservation.tokens; this.event(s, id, "claimed", now, job.id)
 			return { job: { ...job }, claimId, epoch: c.epoch }
+		}, now)
+	}
+
+	/** Persist coordinator progress under the same durable lock as the claim and budget. */
+	async updateClaimProgress(claim: ClaimedRepositoryJob, patch: {
+		stage: RepositoryCampaignStep; currentTask: string; completedSteps: RepositoryCampaignStep[];
+		blocker?: string | null; nextStep?: string | null; evidenceRefs?: RepositoryEvidenceRef[]
+	}, now = new Date()): Promise<void> {
+		if (!claim || !patch || !REPOSITORY_CAMPAIGN_STEPS.includes(patch.stage) ||
+			typeof patch.currentTask !== "string" || !patch.currentTask.trim() || patch.currentTask.length > 240 ||
+			!Array.isArray(patch.completedSteps) || patch.completedSteps.length > REPOSITORY_CAMPAIGN_STEPS.length ||
+			patch.completedSteps.some((step, index) => !REPOSITORY_CAMPAIGN_STEPS.includes(step) ||
+				(index > 0 && REPOSITORY_CAMPAIGN_STEPS.indexOf(step) <= REPOSITORY_CAMPAIGN_STEPS.indexOf(patch.completedSteps[index - 1]!))) ||
+			(patch.blocker !== undefined && patch.blocker !== null && (typeof patch.blocker !== "string" || patch.blocker.length > 240)) ||
+			(patch.nextStep !== undefined && patch.nextStep !== null && (typeof patch.nextStep !== "string" || patch.nextStep.length > 240)) ||
+			(patch.evidenceRefs !== undefined && (!Array.isArray(patch.evidenceRefs) || patch.evidenceRefs.length > 20 ||
+				patch.evidenceRefs.some((ref) => !ref || !/^[a-f0-9]{64}$/.test(ref.id) ||
+					!["intake", "candidate", "test-receipt", "delivery"].includes(ref.kind) ||
+					typeof ref.label !== "string" || !ref.label.trim() || ref.label.length > 80)))) {
+			throw new Error("campaign progress update is invalid")
+		}
+		await this.update((s) => {
+			const job = s.jobs.find((candidate) => candidate.id === claim.job.id)
+			if (!job || job.status !== "running" || job.claimId !== claim.claimId || job.epoch !== claim.epoch || !job.progress) throw new Error("campaign claim is stale")
+			if (now.getTime() > job.progress.leaseExpiresAt) throw new Error("campaign worker lease expired")
+			const old = job.progress
+			if (patch.completedSteps.some((step) => !old.requiredSteps.includes(step)) ||
+				old.completedSteps.some((step, index) => patch.completedSteps[index] !== step)) throw new Error("campaign progress cannot forget completed steps")
+			const refs = patch.evidenceRefs ?? old.evidenceRefs
+			if (refs.length < old.evidenceRefs.length || old.evidenceRefs.some((item, index) => JSON.stringify(refs[index]) !== JSON.stringify(item))) throw new Error("campaign evidence cannot be removed or changed")
+			job.progress = { ...old, stage: patch.stage, currentTask: patch.currentTask,
+				completedSteps: [...patch.completedSteps], lastActionAt: now.getTime(), heartbeatAt: now.getTime(),
+				leaseExpiresAt: now.getTime() + REPOSITORY_WORKER_LEASE_MS,
+				blocker: patch.blocker === undefined ? old.blocker : patch.blocker,
+				nextStep: patch.nextStep === undefined ? old.nextStep : patch.nextStep,
+				evidenceRefs: structuredClone(refs) }
+			job.updatedAt = now.getTime()
+		}, now)
+	}
+
+	async heartbeat(claim: ClaimedRepositoryJob, now = new Date()): Promise<void> {
+		await this.update((s) => {
+			const job = s.jobs.find((candidate) => candidate.id === claim?.job?.id)
+			if (!job || job.status !== "running" || job.claimId !== claim.claimId || job.epoch !== claim.epoch || !job.progress) throw new Error("campaign claim is stale")
+			if (now.getTime() > job.progress.leaseExpiresAt) throw new Error("campaign worker lease expired")
+			job.progress.heartbeatAt = now.getTime()
+			job.progress.leaseExpiresAt = now.getTime() + REPOSITORY_WORKER_LEASE_MS
+			job.updatedAt = now.getTime()
 		}, now)
 	}
 
@@ -413,6 +531,15 @@ export class RepositoryCampaignStore {
 				c.settledMicros += actual; c.settledTokens += tokens
 			}
 			job.reservedMicros = 0; job.reservedTokens = 0; job.updatedAt = now.getTime()
+			if (job.progress) {
+				job.progress.lastActionAt = now.getTime()
+				job.progress.heartbeatAt = now.getTime()
+				job.progress.leaseExpiresAt = now.getTime()
+				job.progress.currentTask = result.status === "succeeded" ? "Worker completed; review the recorded result" :
+					result.status === "failed" ? "Worker stopped after an unsuccessful result" : "Worker result needs reconciliation"
+				job.progress.nextStep = result.status === "succeeded" ? null : "reconcile recorded result before retry"
+				job.progress.blocker = result.status === "succeeded" ? null : "Result requires review before any retry"
+			}
 			if (this.isExhausted(c) && c.enabled) { c.enabled = false; c.epoch += 1; this.event(s, job.campaignId, "budget-exhausted", now) }
 			this.event(s, job.campaignId, "completed", now, job.id)
 		}, now)

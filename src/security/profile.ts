@@ -6,8 +6,10 @@ import { spawnSync } from "node:child_process"
 import { parse } from "yaml"
 
 export type SecurityProfileName = "local" | "contained"
-export type ContainedPurpose = "worker" | "evaluation"
+export type ContainedPurpose = "worker" | "evaluation" | "repository-worker"
 export const CONTAINED_EVIDENCE_RUNTIME_PATH = "/run/headlesscode/evidence-runtime.json"
+export const REPOSITORY_BROKER_PORT = 4392
+export const REPOSITORY_BROKER_CAPABILITY_PATH = "/run/headlesscode/repository-broker-capability"
 
 export interface ContainedRuntimeProfile {
 	readonly name: "contained"
@@ -30,6 +32,7 @@ export interface ContainedRuntimeProfile {
 	readonly evidenceGuestPath: string
 	readonly evidencePublicKeyPath: string
 	readonly evidenceGuestPublicKeyPath: string
+	readonly brokerCapabilityGuestPath?: string
 	readonly evidencePublicKeyFingerprint: string
 	readonly allowedGuestEnv: readonly string[]
 	readonly policySnapshotDir: string
@@ -96,8 +99,9 @@ export function resolveContainedRuntimeProfile(options: ResolveContainedProfileO
 	if (!isPositiveQuantity(resourceConfig.cpu) || !isPositiveQuantity(resourceConfig.memory)) throw new Error("contained profile CPU and memory limits must be positive quantities")
 	const providers = stringArray(config.providers, "contained profile providers")
 	const endpoint = parseInferenceEndpoint(config.inference, purpose)
-	if (purpose === "evaluation" && providers.length) throw new Error("evaluation sessions must not attach credential providers")
+	if ((purpose === "evaluation" || purpose === "repository-worker") && providers.length) throw new Error(`${purpose} sessions must not attach credential providers`)
 	if (purpose === "worker" && (!providers.length || !endpoint)) throw new Error("worker sessions require explicit credential provider and inference endpoint")
+	if (purpose === "repository-worker" && (!endpoint || endpoint.host !== "host.openshell.internal" || endpoint.port !== REPOSITORY_BROKER_PORT)) throw new Error("repository worker requires the fixed host-bound budget broker endpoint")
 	if (purpose === "worker" && providers.includes("headlesscode-openrouter") && !env.HEADLESSCODE_OPENROUTER_API_KEY) {
 		throw new Error("contained OpenRouter worker requires the host-side provider credential")
 	}
@@ -107,6 +111,9 @@ export function resolveContainedRuntimeProfile(options: ResolveContainedProfileO
 		if (configured.protocol !== "https:" || configured.hostname.toLowerCase() !== endpoint?.host || (configured.port && configured.port !== String(endpoint.port))) {
 			throw new Error("OPENROUTER_BASE_URL must match the approved remote inference endpoint")
 		}
+	}
+	if (purpose === "repository-worker" && env.OPENROUTER_BASE_URL !== undefined && env.OPENROUTER_BASE_URL !== `http://host.openshell.internal:${REPOSITORY_BROKER_PORT}`) {
+		throw new Error("repository worker base URL must match the fixed host budget broker")
 	}
 	if (purpose === "worker" && env.HEADLESSCODE_CODE_MODE_BACKEND && env.HEADLESSCODE_CODE_MODE_BACKEND !== "openrouter") {
 		throw new Error("contained profile permits remote OpenRouter inference only; local model backends are disabled")
@@ -155,7 +162,7 @@ export function resolveContainedRuntimeProfile(options: ResolveContainedProfileO
 		fs.rmSync(snapshotDir, { recursive: true, force: true })
 		throw error
 	}
-	const allowedGuestEnv = Object.freeze([...GUEST_ENV].filter((name) => env[name] !== undefined))
+	const allowedGuestEnv = Object.freeze(purpose === "repository-worker" ? ["OPENROUTER_MODEL", "OPENROUTER_BASE_URL"] : [...GUEST_ENV].filter((name) => env[name] !== undefined))
 	return Object.freeze({
 		name: "contained",
 		purpose,
@@ -177,6 +184,7 @@ export function resolveContainedRuntimeProfile(options: ResolveContainedProfileO
 		evidenceGuestPath,
 		evidencePublicKeyPath,
 		evidenceGuestPublicKeyPath,
+		...(purpose === "repository-worker" ? { brokerCapabilityGuestPath: REPOSITORY_BROKER_CAPABILITY_PATH } : {}),
 		evidencePublicKeyFingerprint: evidenceConfig.publicKeyFingerprint.toLowerCase(),
 		allowedGuestEnv,
 		policySnapshotDir: snapshotDir,
@@ -204,7 +212,7 @@ export function verifyContainedPrerequisites(options: {
 }
 
 /** Check the gateway's loaded effective policy before the agent command starts. */
-export function assertEffectiveOpenShellPolicy(policyText: string, profile: Pick<ContainedRuntimeProfile, "purpose" | "inferenceEndpoint" | "evidenceGuestPath" | "evidenceGuestPublicKeyPath">): void {
+export function assertEffectiveOpenShellPolicy(policyText: string, profile: Pick<ContainedRuntimeProfile, "purpose" | "inferenceEndpoint" | "evidenceGuestPath" | "evidenceGuestPublicKeyPath" | "brokerCapabilityGuestPath">): void {
 	let document: unknown
 	try { document = parse(policyText) as unknown } catch { throw new Error("OpenShell did not return a parseable effective policy") }
 	if (!isRecord(document)) throw new Error("OpenShell effective policy response was not a map")
@@ -230,6 +238,7 @@ export function assertEffectiveOpenShellPolicy(policyText: string, profile: Pick
 	if (!["/workspace", "/result", profile.evidenceGuestPath].every((item) => readWritePaths.includes(item))) throw new Error("effective OpenShell policy omits the workspace, result, or evidence socket grant")
 	if (!readOnlyPaths.includes(profile.evidenceGuestPublicKeyPath)) throw new Error("effective OpenShell policy does not expose the pinned evidence public key read-only")
 	if (!readOnlyPaths.includes(CONTAINED_EVIDENCE_RUNTIME_PATH)) throw new Error("effective OpenShell policy does not expose the scoped evidence runtime config read-only")
+	if (profile.purpose === "repository-worker" && profile.brokerCapabilityGuestPath && !readOnlyPaths.includes(profile.brokerCapabilityGuestPath)) throw new Error("effective OpenShell policy does not expose the scoped broker capability read-only")
 	const endpoints: Array<{ host: string; port: number; enforcement?: string }> = []
 	for (const [name, rawRule] of Object.entries(networkMap)) {
 		if (!isRecord(rawRule) || !Array.isArray(rawRule.endpoints) || !Array.isArray(rawRule.binaries)) throw new Error(`effective OpenShell network rule ${name} is malformed`)
@@ -241,6 +250,12 @@ export function assertEffectiveOpenShellPolicy(policyText: string, profile: Pick
 	}
 	if (profile.purpose === "evaluation") {
 		if (endpoints.length) throw new Error("effective evaluation policy grants network access")
+		return
+	}
+	if (profile.purpose === "repository-worker") {
+		const expected = profile.inferenceEndpoint
+		if (!expected || expected.host !== "host.openshell.internal" || expected.port !== REPOSITORY_BROKER_PORT || endpoints.length !== 1 ||
+			endpoints[0]?.host !== expected.host || endpoints[0]?.port !== expected.port || endpoints[0]?.enforcement !== "enforce") throw new Error("effective repository worker policy does not match the fixed budget broker route")
 		return
 	}
 	const expected = profile.inferenceEndpoint
@@ -260,17 +275,23 @@ export function containedGuestEnvironment(
 		const value = requested[name] ?? ambient[name]
 		if (value !== undefined) result[name] = value
 	}
+	if (profile.purpose === "repository-worker") {
+		if (result.OPENROUTER_BASE_URL !== `http://host.openshell.internal:${REPOSITORY_BROKER_PORT}` ||
+			typeof result.OPENROUTER_MODEL !== "string" || !/^[A-Za-z0-9._:/-]{1,160}$/.test(result.OPENROUTER_MODEL)) throw new Error("repository worker environment must name the fixed broker and an exact model")
+	}
 	// This request-only marker selects a smaller tool catalog and shorter prompt.
 	// Admit only the exact trusted-worker value emitted by the campaign adapter.
 	if (profile.purpose === "worker" && requested.HEADLESSCODE_RSI_CAMPAIGN_MUTATION === "1") {
 		result.HEADLESSCODE_RSI_CAMPAIGN_MUTATION = "1"
 	}
-	if (profile.purpose === "worker") result.HEADLESSCODE_CODE_MODE_BACKEND = "openrouter"
+	if (profile.purpose === "worker" || profile.purpose === "repository-worker") result.HEADLESSCODE_CODE_MODE_BACKEND = "openrouter"
 	result.HEADLESSCODE_SECURITY_PROFILE = "contained"
 	result.HEADLESSCODE_EVIDENCE_CONFIG_PATH = CONTAINED_EVIDENCE_RUNTIME_PATH
-	for (const name of ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"]) {
-		const value = identity[name]
-		if (value !== undefined) result[name] = value
+	if (profile.purpose !== "repository-worker") {
+		for (const name of ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"]) {
+			const value = identity[name]
+			if (value !== undefined) result[name] = value
+		}
 	}
 	return result
 }
@@ -306,7 +327,8 @@ function validatePolicy(value: unknown, options: { purpose: ContainedPurpose; en
 		throw new Error("contained OpenShell policy has a broad or runtime-overlapping writable path")
 	}
 	if (!filesystem.read_write.includes("/workspace") || !filesystem.read_write.includes("/result") || !filesystem.read_write.includes(options.evidenceGuestPath)) throw new Error("contained OpenShell policy must grant only the workspace, result, and evidence socket writable mounts")
-	if (!filesystem.read_only.includes(options.evidenceGuestPublicKeyPath) || !filesystem.read_only.includes(CONTAINED_EVIDENCE_RUNTIME_PATH)) throw new Error("contained OpenShell policy must expose the evidence public key and scoped runtime config read-only")
+	if (!filesystem.read_only.includes(options.evidenceGuestPublicKeyPath) || !filesystem.read_only.includes(CONTAINED_EVIDENCE_RUNTIME_PATH) ||
+		(options.purpose === "repository-worker" && !filesystem.read_only.includes(REPOSITORY_BROKER_CAPABILITY_PATH))) throw new Error("contained OpenShell policy must expose the evidence public key, scoped runtime config, and any required broker capability read-only")
 	if (!isRecord(networks)) throw new Error("contained OpenShell policy must define network_policies as a map")
 	const endpoints: Array<{ host: string; port: number; enforcement?: string }> = []
 	for (const [key, rule] of Object.entries(networks)) {
@@ -322,6 +344,10 @@ function validatePolicy(value: unknown, options: { purpose: ContainedPurpose; en
 	}
 	if (options.purpose === "evaluation") {
 		if (endpoints.length) throw new Error("evaluation policy must grant no network endpoints")
+	} else if (options.purpose === "repository-worker") {
+		const expected = options.endpoint
+		if (!expected || expected.host !== "host.openshell.internal" || expected.port !== REPOSITORY_BROKER_PORT || endpoints.length !== 1 ||
+			endpoints[0]?.host !== expected.host || endpoints[0]?.port !== expected.port || endpoints[0]?.enforcement !== "enforce") throw new Error("repository worker policy must allow only the fixed enforced host budget broker")
 	} else {
 		const expected = options.endpoint
 		if (!expected || endpoints.some((endpoint) => endpoint.host !== expected.host || endpoint.port !== expected.port)) {
@@ -343,7 +369,7 @@ function validateNetworkBinaries(value: unknown[], label: string): void {
 export function verifyContainedSandboxIdentity(options: {
 	probe: OpenShellProbe
 	name: string
-	profile: Pick<ContainedRuntimeProfile, "image" | "purpose" | "inferenceEndpoint" | "evidenceGuestPath" | "evidenceGuestPublicKeyPath">
+	profile: Pick<ContainedRuntimeProfile, "image" | "purpose" | "inferenceEndpoint" | "evidenceGuestPath" | "evidenceGuestPublicKeyPath" | "brokerCapabilityGuestPath">
 }): void {
 	const sandbox = options.probe(["sandbox", "get", options.name, "--output", "json"], 10_000)
 	if (sandbox.error || sandbox.status !== 0) throw new Error("could not inspect created OpenShell sandbox identity")
@@ -364,15 +390,18 @@ export function loadResolvedContainedProfile(serialized: string | undefined): Co
 	if (!isRecord(value) || value.name !== "contained" || value.version !== 1 || typeof value.policySnapshotPath !== "string" || typeof value.policySha256 !== "string" || !HASH.test(value.policySha256) || typeof value.profileSha256 !== "string" || !HASH.test(value.profileSha256)) {
 		throw new Error("resolved contained profile identity is incomplete")
 	}
-	const allowedFields = new Set(["name", "purpose", "version", "profileSha256", "runtimeVersion", "gatewayIdentity", "expectedGatewayIdentity", "expectedEmergencyControllerIdentity", "policySha256", "policySnapshotPath", "image", "cpu", "memory", "providers", "inferenceEndpoint", "evidenceRequired", "evidenceSocketPath", "evidenceGuestPath", "evidencePublicKeyPath", "evidenceGuestPublicKeyPath", "evidencePublicKeyFingerprint", "allowedGuestEnv", "policySnapshotDir"])
+	const allowedFields = new Set(["name", "purpose", "version", "profileSha256", "runtimeVersion", "gatewayIdentity", "expectedGatewayIdentity", "expectedEmergencyControllerIdentity", "policySha256", "policySnapshotPath", "image", "cpu", "memory", "providers", "inferenceEndpoint", "evidenceRequired", "evidenceSocketPath", "evidenceGuestPath", "evidencePublicKeyPath", "evidenceGuestPublicKeyPath", "brokerCapabilityGuestPath", "evidencePublicKeyFingerprint", "allowedGuestEnv", "policySnapshotDir"])
 	if (Object.keys(value).some((field) => !allowedFields.has(field))) throw new Error("resolved contained profile contains unrecognized fields")
-	if (value.purpose !== "worker" && value.purpose !== "evaluation") throw new Error("resolved contained profile purpose is invalid")
+	if (value.purpose !== "worker" && value.purpose !== "evaluation" && value.purpose !== "repository-worker") throw new Error("resolved contained profile purpose is invalid")
 	for (const field of ["runtimeVersion", "gatewayIdentity", "expectedGatewayIdentity", "expectedEmergencyControllerIdentity", "image", "cpu", "memory", "evidenceSocketPath", "evidenceGuestPath", "evidencePublicKeyPath", "evidenceGuestPublicKeyPath", "evidencePublicKeyFingerprint", "policySnapshotDir"]) {
 		if (typeof value[field] !== "string" || !value[field]) throw new Error(`resolved contained profile ${field} is invalid`)
 	}
 	if (value.gatewayIdentity !== value.expectedGatewayIdentity || !IMAGE.test(value.image as string) || !/^sha256:[a-f0-9]{64}$/i.test(value.evidencePublicKeyFingerprint as string)) throw new Error("resolved contained profile identities are invalid")
 	if (value.evidenceRequired !== true || !Array.isArray(value.providers) || value.providers.some((item) => typeof item !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(item))) throw new Error("resolved contained profile requirements are invalid")
-	if (!Array.isArray(value.allowedGuestEnv) || value.allowedGuestEnv.some((item) => typeof item !== "string" || !GUEST_ENV.has(item))) throw new Error("resolved contained profile guest environment allowlist is invalid")
+	if (value.purpose === "repository-worker" && (value.providers.length !== 0 || value.brokerCapabilityGuestPath !== undefined && value.brokerCapabilityGuestPath !== REPOSITORY_BROKER_CAPABILITY_PATH)) throw new Error("resolved repository worker profile cannot attach providers or choose a capability path")
+	if (value.purpose !== "repository-worker" && value.brokerCapabilityGuestPath !== undefined) throw new Error("broker capability path is restricted to repository-worker profiles")
+	if (!Array.isArray(value.allowedGuestEnv) || value.allowedGuestEnv.some((item) => typeof item !== "string" || !GUEST_ENV.has(item)) ||
+		(value.purpose === "repository-worker" && value.allowedGuestEnv.some((item) => !["OPENROUTER_MODEL", "OPENROUTER_BASE_URL"].includes(item)))) throw new Error("resolved contained profile guest environment allowlist is invalid")
 	const endpoint = parseInferenceEndpoint(value.inferenceEndpoint, value.purpose)
 	if (value.inferenceEndpoint !== undefined && !endpoint) throw new Error("resolved contained profile inference endpoint is invalid")
 	const runtimeVersion = value.runtimeVersion as string
@@ -419,6 +448,7 @@ export function loadResolvedContainedProfile(serialized: string | undefined): Co
 		evidenceGuestPath,
 		evidencePublicKeyPath: publicKeyPath,
 		evidenceGuestPublicKeyPath,
+		...(value.purpose === "repository-worker" ? { brokerCapabilityGuestPath: REPOSITORY_BROKER_CAPABILITY_PATH } : {}),
 		evidencePublicKeyFingerprint: evidencePublicKeyFingerprint.toLowerCase(),
 		allowedGuestEnv: Object.freeze([...(value.allowedGuestEnv as string[])]),
 		policySnapshotDir,
@@ -442,6 +472,10 @@ function parseInferenceEndpoint(value: unknown, purpose: ContainedPurpose): { ho
 	}
 	if (!isRecord(value) || typeof value.host !== "string" || !Number.isInteger(value.port)) throw new Error("contained worker profile requires an inference host and port")
 	const host = value.host.toLowerCase()
+	if (purpose === "repository-worker") {
+		if (host !== "host.openshell.internal" || value.port !== REPOSITORY_BROKER_PORT) throw new Error("repository worker endpoint must use the fixed host budget broker")
+		return { host, port: REPOSITORY_BROKER_PORT }
+	}
 	if (!/^[a-z0-9.-]+$/.test(host) || host.startsWith(".") || host.endsWith(".") || host.includes("..") || host.includes("*") || host === "localhost") {
 		throw new Error("contained inference endpoint must be an exact public DNS hostname")
 	}

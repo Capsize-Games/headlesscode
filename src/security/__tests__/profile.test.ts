@@ -4,7 +4,7 @@ import * as fs from "node:fs"
 import * as net from "node:net"
 import * as os from "node:os"
 import * as path from "node:path"
-import { assertEffectiveOpenShellPolicy, cleanupContainedRuntimeProfile, containedGuestEnvironment, loadResolvedContainedProfile, resolveContainedRuntimeProfile, serializeResolvedContainedProfile, verifyContainedPrerequisites } from "../profile.js"
+import { assertEffectiveOpenShellPolicy, cleanupContainedRuntimeProfile, containedGuestEnvironment, loadResolvedContainedProfile, REPOSITORY_BROKER_CAPABILITY_PATH, REPOSITORY_BROKER_PORT, resolveContainedRuntimeProfile, serializeResolvedContainedProfile, verifyContainedPrerequisites } from "../profile.js"
 import type { OpenShellProbe, OpenShellProbeResult } from "../profile.js"
 
 const scratchRoot = path.join(process.cwd(), ".headlesscode", "scratch")
@@ -110,6 +110,34 @@ const healthyProbe: OpenShellProbe = (args): OpenShellProbeResult => {
 }
 
 const tests: Array<[string, () => Promise<void>]> = [
+	["repository worker profile uses only the fixed broker and never imports provider credentials", async () => {
+		const endpoint = { host: "host.openshell.internal", port: REPOSITORY_BROKER_PORT, enforcement: "enforce" }
+		const f = await fixture({
+			profile: { providers: [], inference: { host: endpoint.host, port: endpoint.port } },
+			policy: {
+				filesystem_policy: { include_workdir: false, read_only: ["/usr", "/lib", "/etc", "/opt/headlesscode", "/etc/headlesscode/collector.pem", "/run/headlesscode/evidence-runtime.json", REPOSITORY_BROKER_CAPABILITY_PATH], read_write: ["/tmp", "/workspace", "/result", "/run/headlesscode/evidence.sock"] },
+				network_policies: { broker: { endpoints: [endpoint], binaries: [{ path: "/usr/bin/node" }] } },
+			},
+		})
+		try {
+			f.refreshProfile()
+			const bytes = fs.readFileSync(f.profile)
+			f.env.HEADLESSCODE_CONTAINED_PROFILE_SHA256 = createHash("sha256").update(bytes).digest("hex")
+			f.env.HEADLESSCODE_OPENROUTER_API_KEY = undefined
+			f.env.OPENROUTER_BASE_URL = `http://host.openshell.internal:${REPOSITORY_BROKER_PORT}`
+			const resolved = resolveContainedRuntimeProfile({ repoRoot: f.repo, purpose: "repository-worker", env: f.env, probe: healthyProbe })
+			assert.deepEqual(resolved.providers, [])
+			assert.equal(resolved.brokerCapabilityGuestPath, REPOSITORY_BROKER_CAPABILITY_PATH)
+			const guestEnv = containedGuestEnvironment(resolved, {}, { OPENROUTER_MODEL: "fixture/model", OPENROUTER_BASE_URL: `http://host.openshell.internal:${REPOSITORY_BROKER_PORT}`, OPENROUTER_API_KEY: "must-not-pass" }, { GIT_AUTHOR_NAME: "must-not-pass" })
+			assert.equal(guestEnv.OPENROUTER_MODEL, "fixture/model")
+			assert.equal(guestEnv.OPENROUTER_API_KEY, undefined)
+			assert.equal(guestEnv.GIT_AUTHOR_NAME, undefined)
+			assert.throws(() => containedGuestEnvironment(resolved, {}, { OPENROUTER_MODEL: "fixture/model", OPENROUTER_BASE_URL: "https://openrouter.ai" }), /fixed broker/)
+			const transferred = loadResolvedContainedProfile(serializeResolvedContainedProfile(resolved))
+			assert.equal(transferred.brokerCapabilityGuestPath, REPOSITORY_BROKER_CAPABILITY_PATH)
+			cleanupContainedRuntimeProfile(resolved)
+		} finally { await f.close() }
+	}],
 	["resolves a pinned profile and snapshots the exact reviewed policy bytes", async () => {
 		const f = await fixture()
 		try {

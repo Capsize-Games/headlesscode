@@ -290,6 +290,57 @@ async function testRepositoryDraftCreateAndConfigureNeverSelfCertifyReadiness():
 	}
 }
 
+async function testRepositoryProgressAndEvidenceRoutesAreReadOnlyAndSanitized(): Promise<void> {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-repository-progress-api-"))
+	const qualified = { sourceAudited: true, workerQualified: true, recipeQualified: true, evaluatorQualified: true,
+		modelApproved: true, dataApproved: true, accessApproved: true }
+	const definition: RepositoryCampaignDefinition = { id: "sample-repo", name: "Sample Repository", repositoryId: "capsize-sample-repo", repository: "Capsize/Sample", sourceRevision: "a".repeat(40),
+		workerProfile: "fixed-fixture", recipeDigest: "b".repeat(64), evaluatorDigest: "c".repeat(64), model: "fixture-only",
+		dataAccessProfile: "fixture-only", qualification: qualified }
+	const repositoryCampaigns = new RepositoryCampaignStore(path.join(root, "repository-campaigns.json"), [definition], () => ({
+		mode: "synthetic-test", available: true, limitMicros: 50_000, limitTokens: 50_000, committedMicros: 0, committedTokens: 0,
+	}))
+	const f = await fixture()
+	await repositoryCampaigns.setCampaignBudget("sample-repo", 40_000, 40_000)
+	await repositoryCampaigns.start("sample-repo")
+	await repositoryCampaigns.enqueue("sample-repo", "CVE-2026-1260")
+	const claim = await repositoryCampaigns.claimNext("sample-repo", { micros: 10_000, tokens: 10_000 })
+	assert.ok(claim)
+	const ref = { id: "d".repeat(64), kind: "candidate" as const, label: "Candidate digest" }
+	await repositoryCampaigns.updateClaimProgress(claim!, { stage: "prepare-candidate", currentTask: "Prepare isolated candidate", completedSteps: ["intake", "deduplicate", "investigate"], nextStep: "verify", evidenceRefs: [ref] })
+	const server = await startCampaignControlServer({ port: 0, staticRoot: path.join(f.root, "dist"), store: f.store,
+		repositoryCampaigns, loadAdapter: async () => ({ releaseRoot: f.root, stateRoot: f.root, releaseDigest: "a".repeat(64) }),
+		readBudget: async () => ({ month: currentMonth(), settledMicros: 0, reservedMicros: 0, ambiguousMicros: 0 }),
+		readJobs: async () => ({ jobs: [], jobDetailsAvailable: false }),
+		readRsi: async () => ({ mode: "offline-synthetic-only", status: "not-run", activation: "not-performed",
+			limits: { modelCalls: 0, spendUsd: 0, comparisons: 1, maxDurationSeconds: 30, maxFixtures: 500 }, history: [] }),
+		readProviderRsi: async (): Promise<ProviderRsiStatus> => ({ mode: "provider-synthetic-only", model: "meta/muse-spark-1.3-contributor",
+			activation: "not-performed", maxSpendMicros: 20_000, history: [] }),
+	})
+	const address = server.address(); assert.ok(address && typeof address !== "string")
+	const base = `http://127.0.0.1:${address.port}`
+	try {
+		const response = await fetch(`${base}/api/repository-campaigns/sample-repo/progress`)
+		assert.equal(response.status, 200)
+		const body = await response.json() as any
+		assert.equal(body.executionKind, "development-checkpoint")
+		assert.deepEqual(body.repository, { id: "sample-repo", name: "Sample Repository", slug: "Capsize/Sample" })
+		assert.equal(body.workers[0].workerId, claim!.job.progress?.workerId)
+		assert.equal(body.workers[0].goal.includes("CVE-2026-1260"), true)
+		assert.equal(body.workers[0].usage.state, "unavailable")
+		assert.equal(body.counts.source, "repository-campaign-store")
+		assert.equal(body.counts.running, 1)
+		const evidence = await fetch(`${base}/api/repository-campaigns/sample-repo/jobs/${claim!.job.id}/evidence/${ref.id}`)
+		assert.equal(evidence.status, 200)
+		assert.deepEqual(await evidence.json(), { schemaVersion: 1, campaignId: "sample-repo", jobId: claim!.job.id, evidence: ref })
+		assert.equal((await fetch(`${base}/api/repository-campaigns/sample-repo/progress`, { method: "POST" })).status, 405)
+		assert.equal((await fetch(`${base}/api/repository-campaigns/sample-repo/jobs/${claim!.job.id}/evidence/${"e".repeat(64)}`)).status, 404)
+	} finally {
+		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+		await close(f); await fs.rm(root, { recursive: true, force: true })
+	}
+}
+
 const tests: readonly SuiteTest[] = [
 	["control API reports actual ledger totals and leaves package jobs explicitly unavailable", testLoopbackApiReportsActualBudgetAndNoFabricatedJobs],
 	["control API exposes readiness coverage and completion counts", testApiShowsProfileCoverageAndCompletionCounts],
@@ -300,6 +351,7 @@ const tests: readonly SuiteTest[] = [
 	["static serving is confined to the built UI allowlist", testStaticServerDoesNotExposeUnlistedFiles],
 	["repository campaign API is additive and exposes mock mode and readiness", testRepositoryCampaignApiIsAdditiveAndReportsMockReadiness],
 	["repository draft create and configure cannot self-certify readiness", testRepositoryDraftCreateAndConfigureNeverSelfCertifyReadiness],
+	["repository progress and evidence routes are read-only, ownership-bound, and sanitized", testRepositoryProgressAndEvidenceRoutesAreReadOnlyAndSanitized],
 ]
 
 runMain("campaign-control-server", tests)

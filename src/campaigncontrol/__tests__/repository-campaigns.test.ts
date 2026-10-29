@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 import { RepositoryCampaignStore, type RepositoryBudgetAuthority, type RepositoryCampaignDefinition } from "../repository-campaigns.js"
+import { repositoryProgressSnapshot } from "../repository-progress.js"
 import { runMain, type SuiteTest } from "../../test-runner.js"
 
 const qualified = {
@@ -222,6 +223,69 @@ async function testInjectedMockDispatcherProcessesOnlyOneClaimedJob(): Promise<v
 	} finally { await fs.rm(root, { recursive: true, force: true }) }
 }
 
+async function testClaimProgressIsDurableFencedAndEvidenceIsAppendOnly(): Promise<void> {
+	const { root, store } = await fixture()
+	try {
+		const now = new Date("2026-10-29T12:00:00Z")
+		await store.setCampaignBudget("headlesscode-internal", 50_000, 50_000, now)
+		await store.start("headlesscode-internal", now)
+		await store.enqueue("headlesscode-internal", "CVE-2026-1250", now)
+		const claim = await store.claimNext("headlesscode-internal", { micros: 20_000, tokens: 20_000 }, now)
+		assert.ok(claim)
+		const ref = { id: "a".repeat(64), kind: "test-receipt" as const, label: "Offline test receipt" }
+		await store.updateClaimProgress(claim!, { stage: "verify", currentTask: "Run the fixed offline regression", completedSteps: ["intake", "deduplicate", "investigate", "prepare-candidate"], nextStep: "deliver", evidenceRefs: [ref] }, new Date(now.getTime() + 10))
+		await store.heartbeat(claim!, new Date(now.getTime() + 20))
+		const persisted = new RepositoryCampaignStore(store.path, definitions)
+		const status = await persisted.status(new Date(now.getTime() + 21)) as any
+		const job = status.jobs.find((item: any) => item.id === claim!.job.id)
+		assert.equal(job.progress.executionKind, "development-checkpoint")
+		assert.equal(job.progress.workerId.length, 36)
+		assert.equal(job.progress.heartbeatAt, now.getTime() + 20)
+		assert.equal(job.progress.leaseExpiresAt, now.getTime() + 20 + 120_000)
+		await assert.rejects(persisted.updateClaimProgress(claim!, { stage: "intake", currentTask: "Reset progress", completedSteps: [] }, new Date(now.getTime() + 30)), /cannot forget completed steps/)
+		await assert.rejects(persisted.updateClaimProgress(claim!, { stage: "verify", currentTask: "Replace evidence", completedSteps: ["intake", "deduplicate", "investigate", "prepare-candidate"], evidenceRefs: [] }, new Date(now.getTime() + 31)), /evidence cannot be removed/)
+		const snapshot = repositoryProgressSnapshot(definitions[0]!, status.campaigns.find((item: any) => item.id === "headlesscode-internal"), status.jobs.filter((item: any) => item.campaignId === "headlesscode-internal"), now.getTime() + 21)
+		assert.equal(snapshot.executionKind, "development-checkpoint")
+		assert.equal(snapshot.freshness.state, "fresh")
+		assert.equal(snapshot.workers[0]?.usage.state, "unavailable", "development checkpoint usage is not reported as real spend")
+		assert.equal(snapshot.workers[0]?.evidenceRefs[0]?.id, ref.id)
+	} finally { await fs.rm(root, { recursive: true, force: true }) }
+}
+
+async function testProgressSnapshotMarksExpiredLeaseStaleAndHidesCounts(): Promise<void> {
+	const { root, store } = await fixture()
+	try {
+		const now = new Date("2026-10-29T12:00:00Z")
+		await store.setCampaignBudget("headlesscode-internal", 50_000, 50_000, now)
+		await store.start("headlesscode-internal", now)
+		await store.enqueue("headlesscode-internal", "CVE-2026-1251", now)
+		const claim = await store.claimNext("headlesscode-internal", { micros: 20_000, tokens: 20_000 }, now)
+		assert.ok(claim)
+		const status = await store.status(now) as any
+		const snapshot = repositoryProgressSnapshot(definitions[0]!, status.campaigns.find((item: any) => item.id === "headlesscode-internal"), status.jobs, now.getTime() + 120_001)
+		assert.equal(snapshot.freshness.state, "stale")
+		assert.equal(snapshot.counts.source, "unavailable")
+		assert.equal(snapshot.counts.running, null)
+		assert.equal(snapshot.budget.source, "unavailable")
+		assert.equal(snapshot.budget.monthly.reservedMicros, null)
+		await assert.rejects(store.heartbeat(claim!, new Date(now.getTime() + 120_001)), /lease expired/)
+	} finally { await fs.rm(root, { recursive: true, force: true }) }
+}
+
+async function testSyntheticAuthorityCannotCreateLiveCveProgress(): Promise<void> {
+	const { root, store } = await fixture()
+	try {
+		const now = new Date("2026-10-29T12:00:00Z")
+		await store.setCampaignBudget("headlesscode-internal", 50_000, 50_000, now)
+		await store.start("headlesscode-internal", now)
+		await store.enqueue("headlesscode-internal", "CVE-2026-1252", now)
+		await assert.rejects(store.claimNext("headlesscode-internal", { micros: 1_000, tokens: 1_000 }, now, { executionKind: "live-cve" }), /authoritative Fleet v2/)
+		const status = await store.status(now) as any
+		assert.equal(status.jobs[0].status, "queued")
+		assert.equal(status.jobs[0].progress, undefined)
+	} finally { await fs.rm(root, { recursive: true, force: true }) }
+}
+
 const tests: readonly SuiteTest[] = [
 	["aggregate budget reservations are atomic across repository campaigns", testAggregateClaimsAreAtomicAcrossRepositories],
 	["stop cancels queued work and rejects new claims", testStopCancelsQueuedWorkAndFencesNewClaims],
@@ -233,6 +297,9 @@ const tests: readonly SuiteTest[] = [
 	["Stop keeps in-flight token and spend holds until measured settlement", testStopHoldsInFlightReservationUntilMeasuredSettlement],
 	["request start is ordered with Stop and an already-started request remains settleable", testRequestStartIsFencedAgainstStopButInFlightRequestCanSettle],
 	["injected mock dispatcher runs one queued job and does not poll an empty queue", testInjectedMockDispatcherProcessesOnlyOneClaimedJob],
+	["claim progress persists under the claim lock and cannot forget evidence or completed steps", testClaimProgressIsDurableFencedAndEvidenceIsAppendOnly],
+	["expired worker lease makes freshness and counts unavailable", testProgressSnapshotMarksExpiredLeaseStaleAndHidesCounts],
+	["synthetic authority cannot create a live-CVE worker claim", testSyntheticAuthorityCannotCreateLiveCveProgress],
 ]
 
 runMain("repository-campaigns", tests)

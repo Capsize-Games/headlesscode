@@ -8,6 +8,7 @@ import { loadCampaignAdapterConfig, readCampaignBudgetReport, readCampaignJobRep
 import { readCampaignRsiStatus, type CampaignRsiStatus } from "./rsi.js"
 import { readProviderRsiStatus, type ProviderRsiStatus } from "./provider-rsi.js"
 import { RepositoryCampaignStore, loadRepositoryCampaignDefinitions } from "./repository-campaigns.js"
+import { repositoryProgressSnapshot, type FleetRepositoryBudgetSnapshot } from "./repository-progress.js"
 
 export const CAMPAIGN_CONTROL_PORT = 4391
 const MAX_BODY_BYTES = 4096
@@ -54,6 +55,7 @@ export interface CampaignControlServerOptions {
 	readProviderRsi?: () => Promise<ProviderRsiStatus>
 	mutate?: (action: CampaignMutation, micros?: number) => Promise<CampaignControlState>
 	repositoryCampaigns?: RepositoryCampaignStore
+	readRepositoryBudgetSnapshot?: (campaignId: string) => Promise<FleetRepositoryBudgetSnapshot>
 	repositoryCampaignStatePath?: string
 	repositoryCampaignRegistryPath?: string
 }
@@ -237,7 +239,26 @@ async function handleRequest(
 		}
 		return
 	}
-	const repositoryCampaignRoute = /^\/api\/repository-campaigns(?:\/([a-z0-9][a-z0-9-]{1,62})(?:\/(history))?)?$/.exec(url.pathname)
+	const evidenceRoute = /^\/api\/repository-campaigns\/([a-z0-9][a-z0-9-]{1,62})\/jobs\/([0-9a-f-]{36})\/evidence\/([a-f0-9]{64})$/.exec(url.pathname)
+	if (evidenceRoute) {
+		if (req.method !== "GET") { res.writeHead(405, { allow: "GET" }).end(); return }
+		if (url.search || url.hash) { json(res, 400, { error: "evidence query parameters are not supported" }); return }
+		const repoStore = options.repositoryCampaigns
+		if (!repoStore) { json(res, 503, { error: "repository campaign registry is unavailable" }); return }
+		try {
+			const status = await repoStore.status()
+			const campaign = (status.campaigns as Array<Record<string, unknown>>).find((row) => row.id === evidenceRoute[1])
+			if (!campaign) { json(res, 404, { error: "repository campaign is not registered" }); return }
+			const job = (status.jobs as Array<Record<string, unknown>>).find((row) => row.id === evidenceRoute[2] && row.campaignId === evidenceRoute[1])
+			if (!job) { json(res, 404, { error: "campaign job evidence is unavailable" }); return }
+			const progress = job.progress as { evidenceRefs?: Array<{ id: string; kind: string; label: string }> } | undefined
+			const evidence = progress?.evidenceRefs?.find((item) => item.id === evidenceRoute[3])
+			if (!evidence) { json(res, 404, { error: "campaign job evidence is unavailable" }); return }
+			json(res, 200, { schemaVersion: 1, campaignId: evidenceRoute[1], jobId: evidenceRoute[2], evidence })
+		} catch { json(res, 503, { error: "repository campaign evidence is unavailable" }) }
+		return
+	}
+	const repositoryCampaignRoute = /^\/api\/repository-campaigns(?:\/([a-z0-9][a-z0-9-]{1,62})(?:\/(history|progress))?)?$/.exec(url.pathname)
 	if (repositoryCampaignRoute) {
 		if (url.hash) { json(res, 400, { error: "fragments are not supported" }); return }
 		const repoStore = options.repositoryCampaigns
@@ -259,6 +280,18 @@ async function handleRequest(
 						throw error
 					}
 					json(res, 200, { mode: "offline-synthetic-only", modelCalls: 0, controlPlaneOnly: true, campaignId: repositoryCampaignRoute[1], ...page }); return
+				}
+				if (repositoryCampaignRoute[2] === "progress") {
+					if (url.search) { json(res, 400, { error: "progress query parameters are not supported" }); return }
+					const id = repositoryCampaignRoute[1]!
+					const campaign = (status.campaigns as Array<Record<string, unknown>>).find((row) => row.id === id)
+					if (!campaign) { json(res, 404, { error: "repository campaign is not registered" }); return }
+					const definition = campaign as unknown as import("./repository-campaigns.js").RepositoryCampaignDefinition
+					const jobs = (status.jobs as import("./repository-campaigns.js").RepositoryCampaignJob[]).filter((job) => job.campaignId === id)
+					const observedAt = Date.now()
+					let fleetBudget: FleetRepositoryBudgetSnapshot | undefined
+					try { fleetBudget = await options.readRepositoryBudgetSnapshot?.(id) } catch { /* status remains explicit as unavailable */ }
+					json(res, 200, repositoryProgressSnapshot(definition, campaign, jobs, observedAt, fleetBudget)); return
 				}
 				if (repositoryCampaignRoute[1]) {
 					if (url.search) { json(res, 400, { error: "detail query parameters are not supported" }); return }
