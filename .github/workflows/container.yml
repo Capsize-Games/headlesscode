@@ -1,3 +1,4 @@
+# Public publishing is disabled in this private maintenance branch.
 name: Publish verified container
 on:
   workflow_run:
@@ -12,8 +13,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   publish:
-    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'master'
-    runs-on: ubuntu-latest
+    if: ${{ false }}
+    runs-on: [self-hosted, Linux, X64, workstation-ci, headlesscode-internal-ci]
     steps:
       - uses: actions/checkout@v4
         with:

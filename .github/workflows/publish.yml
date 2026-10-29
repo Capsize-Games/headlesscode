@@ -1,3 +1,4 @@
+# Public publishing is disabled in this private maintenance branch.
 # Build a release package on version tags and attach it to the GitHub Release.
 # This workflow does not publish packages to npm.
 #
@@ -15,8 +16,8 @@ permissions:
 jobs:
   npm-publish:
     name: Verify and attach release artifact
-    if: github.event.repository.private == false
-    runs-on: ubuntu-latest
+    if: ${{ false }}
+    runs-on: [self-hosted, Linux, X64, workstation-ci, headlesscode-internal-ci]
     timeout-minutes: 30
     steps:
       - name: Checkout tag
