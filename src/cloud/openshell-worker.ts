@@ -84,6 +84,7 @@ export async function runOpenShellWorktreeCommand(
 				pinnedPublicKey: containedSupervisor.evidenceConnection.pinnedPublicKey,
 			} } : {}),
 			...(containedSupervisor ? { emergencyControl: containedSupervisor.control } : {}),
+			signal: providerOptions.signal,
 			image: containedProfile.image,
 			cpu: containedProfile.cpu,
 			memory: containedProfile.memory,

@@ -39,6 +39,8 @@ export interface RepositoryWorkerLaunch {
 	hostRuntimeEnv?: NodeJS.ProcessEnv
 	/** Read-only qualification jobs never import a candidate Git bundle into the pinned host checkout. */
 	importResults?: boolean
+	/** Coordinator Stop signal; the OpenShell provider tears down the owned sandbox before returning. */
+	signal: AbortSignal
 }
 
 export interface RepositoryWorkerResult {
@@ -112,9 +114,22 @@ export async function runRepositoryWorkerThroughBroker(input: {
 		profileId: input.profileId, limits: input.limits, apiKey: input.apiKey, bindHost: input.bindHost, ledger: input.ledger,
 		capabilityDirectory: input.capabilityDirectory })
 	try {
-		const run = await runContainedRepositoryWorker({ ...input.launch, capabilityFile: session.capabilityFile })
+		const startedAt = Date.now()
+		let run: RepositoryWorkerResult
+		try {
+			run = await runContainedRepositoryWorker({ ...input.launch, capabilityFile: session.capabilityFile })
+		} catch {
+			const output = "OpenShell repository worker stopped or failed before returning a result"
+			run = { ok: false, exitCode: 1, durationMs: Math.max(0, Date.now() - startedAt),
+				outputSha256: createHash("sha256").update(output).digest("hex"),
+				failureDiagnostic: output }
+		}
+		// Close the guest-facing listener and drain sent upstream calls before
+		// reading the durable usage receipt. Missing settlement stays ambiguous.
+		let brokerDrained = false
+		try { await session.broker.close(); brokerDrained = true } catch { /* usage stays ambiguous below */ }
 		const receipt = await session.broker.receipt()
-		const measured = receipt.qualified && receipt.costUsd !== null && receipt.totalTokens !== null && Number.isFinite(receipt.costUsd) && receipt.costUsd >= 0 &&
+		const measured = brokerDrained && receipt.qualified && receipt.costUsd !== null && receipt.totalTokens !== null && Number.isFinite(receipt.costUsd) && receipt.costUsd >= 0 &&
 			Number.isSafeInteger(receipt.totalTokens) && receipt.totalTokens >= 0
 		return { ...run, receipt, actualMicros: measured ? Math.ceil(receipt.costUsd! * 1_000_000) : null,
 			actualTokens: measured ? receipt.totalTokens! : null }
@@ -179,6 +194,7 @@ export function writeRepositoryWorkerTask(worktree: string, input: VettedAdvisor
 
 /** Launches only the fixed HeadlessCode CLI in the dedicated no-provider broker profile. */
 export async function runContainedRepositoryWorker(input: RepositoryWorkerLaunch): Promise<RepositoryWorkerResult> {
+	if (input?.signal?.aborted) throw input.signal.reason ?? new Error("repository worker stopped before OpenShell launch")
 	if (!input || !path.isAbsolute(input.repoRoot) || !path.isAbsolute(input.worktree) || !path.isAbsolute(input.capabilityFile) ||
 		!input.profile || input.profile.purpose !== "repository-worker" || input.profile.providers.length !== 0 ||
 		input.profile.inferenceEndpoint?.host !== "host.openshell.internal" || input.profile.inferenceEndpoint.port !== REPOSITORY_BROKER_PORT ||
@@ -208,6 +224,7 @@ export async function runContainedRepositoryWorker(input: RepositoryWorkerLaunch
 		importResults: input.importResults ?? true,
 		commandTimeoutMs: 15 * 60_000,
 		hostRuntimeEnv: input.hostRuntimeEnv,
+		signal: input.signal,
 	})
 	const outputSha256 = createHash("sha256").update(result.output).digest("hex")
 	const durationMs = Math.max(0, Date.now() - startedAt)

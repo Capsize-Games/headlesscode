@@ -139,7 +139,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 					port: 443 } } as unknown as ContainedRuntimeProfile
 		await assert.rejects(runContainedRepositoryWorker({ repoRoot: root,
 			worktree: root, profile, model: "fixture/model",
-				capabilityFile: path.join(root, "cap"), taskSha256: "a".repeat(64) }),
+				capabilityFile: path.join(root, "cap"), taskSha256: "a".repeat(64), signal: new AbortController().signal }),
 					/fixed profile/)
 	})],
 ]

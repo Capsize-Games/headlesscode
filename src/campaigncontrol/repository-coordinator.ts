@@ -59,7 +59,7 @@ export class RepositoryCampaignCoordinator {
 	private loopPromise?: Promise<void>
 	private stopped = false
 	private lastFailure: { at: number; kind: "store-unavailable" | "worker-failure" } | null = null
-	private readonly active = new Map<string, AbortController>()
+	private readonly active = new Map<string, { campaignId: string; controller: AbortController }>()
 	private readonly jobs = new Set<Promise<void>>()
 	private wake?: () => void
 	private globalRun: ActiveCampaignRun | null = null
@@ -110,11 +110,22 @@ export class RepositoryCampaignCoordinator {
 	async stop(): Promise<void> {
 		this.stopped = true
 		this.wake?.()
-		for (const controller of this.active.values()) controller.abort(new Error("repository coordinator stopped"))
+		for (const active of this.active.values()) active.controller.abort(new Error("repository coordinator stopped"))
 		await this.loopPromise
 		await Promise.allSettled([...this.jobs])
 		await this.finishGlobalRun("failed")
 		this.loopPromise = undefined
+	}
+
+	/** Abort only this campaign's active work after its durable Stop transition. */
+	stopCampaign(campaignId: string): void {
+		if (!/^[a-z0-9][a-z0-9-]{1,62}$/.test(campaignId)) throw new Error("repository campaign identity is invalid")
+		for (const active of this.active.values()) {
+			if (active.campaignId === campaignId && !active.controller.signal.aborted) {
+				active.controller.abort(new Error("repository campaign stopped"))
+			}
+		}
+		this.wake?.()
 	}
 
 	async tick(): Promise<void> {
@@ -188,7 +199,7 @@ export class RepositoryCampaignCoordinator {
 
 	private launch(worker: RegisteredRepositoryWorker, definition: RepositoryCampaignDefinition, claim: ClaimedRepositoryJob): void {
 		const controller = new AbortController()
-		this.active.set(claim.job.id, controller)
+		this.active.set(claim.job.id, { campaignId: definition.id, controller })
 		const pending = this.process(worker, definition, claim, controller.signal).finally(() => {
 			this.active.delete(claim.job.id)
 			this.jobs.delete(pending)
@@ -219,6 +230,8 @@ export class RepositoryCampaignCoordinator {
 	private async process(worker: RegisteredRepositoryWorker, definition: RepositoryCampaignDefinition, claim: ClaimedRepositoryJob, signal: AbortSignal): Promise<void> {
 		let heartbeat: NodeJS.Timeout | undefined
 		try {
+			await this.store.assertClaimCurrent(claim)
+			if (signal.aborted) throw signal.reason ?? new Error("repository campaign stopped")
 			heartbeat = setInterval(() => { void this.store.heartbeat(claim).catch(() => undefined) }, HEARTBEAT_MS)
 			const result = await worker.execute({ definition, claim, signal, progress: (patch) => this.store.updateClaimProgress(claim, patch) })
 			this.validateResult(result)

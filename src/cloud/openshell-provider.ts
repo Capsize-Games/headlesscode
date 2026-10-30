@@ -544,7 +544,13 @@ export class OpenShellSessionProvider implements CloudProvider {
 		})
 	}
 
-	private get signal(): AbortSignal | undefined { return this.externalSignal ?? this.emergencyControl?.signal }
+	private get signal(): AbortSignal | undefined {
+		const emergencySignal = this.emergencyControl?.signal
+		if (this.externalSignal && emergencySignal && this.externalSignal !== emergencySignal) {
+			return AbortSignal.any([this.externalSignal, emergencySignal])
+		}
+		return this.externalSignal ?? emergencySignal
+	}
 
 	private sandboxName(handle: SessionHandle): string { return handle.containerId ?? this.sandboxNameForWorktree(handle.id) }
 

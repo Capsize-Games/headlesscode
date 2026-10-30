@@ -4,7 +4,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 import type { ActiveCampaignRun } from "../store.js"
 import { RepositoryCampaignStore,
-	type RepositoryBudgetAuthority, type RepositoryCampaignDefinition, type RepositoryCampaignJob,
+	type ClaimedRepositoryJob, type RepositoryBudgetAuthority, type RepositoryCampaignDefinition, type RepositoryCampaignJob,
 	type RepositoryAdvisoryIntakeRecord } from "../repository-campaigns.js"
 import type { RepositoryWorkerPipelineAdapters,
 	RepositoryPreparedWorkspace } from "../repository-worker-pipeline.js"
@@ -146,6 +146,130 @@ async function testPipelineStopsAtRejectedEvaluatorAndDoesNotDeliver(): Promise<
 	} finally { await fs.rm(root, { recursive: true, force: true }) }
 }
 
+async function testStopDuringPreparationSkipsContainedLaunchAndCleansWorkspace(): Promise<void> {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-camp-stop-before-worker-"))
+	let enteredPreparation!: () => void
+	const preparationEntered = new Promise<void>((resolve) => { enteredPreparation = resolve })
+	let releasePreparation!: () => void
+	const preparationRelease = new Promise<void>((resolve) => { releasePreparation = resolve })
+	let runContainedCalls = 0
+	let cleanupCalls = 0
+	let evaluationCalls = 0
+	let deliveryCalls = 0
+	const store = new RepositoryCampaignStore(path.join(root, "state.json"), [definition], () => ({
+		mode: "synthetic-test", available: true, limitMicros: 100_000,
+		limitTokens: 100_000, committedMicros: 0, committedTokens: 0,
+	}))
+	try {
+		await store.setCampaignBudget(definition.id, 80_000, 80_000)
+		await store.start(definition.id)
+		await store.enqueue(definition.id, "CVE-2026-1260")
+		const worker = createRepositoryWorkerPipeline({ workerProfile: definition.workerProfile!, recipeDigest: definition.recipeDigest!,
+			evaluatorDigest: definition.evaluatorDigest!, model: definition.model!, executionKind: "development-checkpoint",
+			reservation: { micros: 10_000, tokens: 10_000 },
+			async lookupAdvisory(advisoryId) { return { advisoryId, sourceUrl: "https://nvd.nist.gov/vuln/detail/CVE-2026-1260",
+				snapshotSha256: digest("d"), summary: "Offline fixture only", affectedRange: "< 1.0", fixedVersion: "1.0", verificationCheckIds: ["fixture-check"] } },
+			async prepareWorkspace() {
+				enteredPreparation()
+				await preparationRelease
+				return { worktree: root, taskSha256: digest("e"),
+					async runContained() { runContainedCalls += 1; return { ok: true, durationMs: 1, outputSha256: digest("f"), actualMicros: 0, actualTokens: 0 } },
+					async candidateSha256() { return digest("1") }, async cleanup() { cleanupCalls += 1 } }
+			},
+			async evaluate() { evaluationCalls += 1; return { passed: true, evidenceSha256: digest("2"), detail: "unexpected" } },
+			async deliverPrivate() { deliveryCalls += 1; return { accepted: true, evidenceSha256: digest("3") } },
+		})
+		const coordinator = new RepositoryCampaignCoordinator(store, [worker], 100)
+		await coordinator.start()
+		try {
+			await preparationEntered
+			await store.stop(definition.id)
+			coordinator.stopCampaign(definition.id)
+			releasePreparation()
+			const stopped = await waitForTerminal(store)
+			assert.equal(stopped.status, "ambiguous", "a pre-dispatch stop keeps its reserved hold until exact no-call reconciliation")
+			assert.equal(runContainedCalls, 0, "Stop prevents contained launch before the model-call path")
+			assert.equal(cleanupCalls, 1, "prepared worktree and supervisor resources are cleaned")
+			assert.equal(evaluationCalls, 0)
+			assert.equal(deliveryCalls, 0)
+		} finally { releasePreparation(); await coordinator.stop() }
+	} finally { await fs.rm(root, { recursive: true, force: true }) }
+}
+
+async function testStopAfterRequestStartPreservesSettlementAndDoesNotReplay(): Promise<void> {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-camp-stop-after-send-"))
+	let enteredRequest!: () => void
+	const requestEntered = new Promise<void>((resolve) => { enteredRequest = resolve })
+	let releaseRequest!: () => void
+	const requestRelease = new Promise<void>((resolve) => { releaseRequest = resolve })
+	let observedAbort!: () => void
+	const abortObserved = new Promise<void>((resolve) => { observedAbort = resolve })
+	let sends = 0
+	let cleanupCalls = 0
+	let evaluationCalls = 0
+	let deliveryCalls = 0
+	let claim: ClaimedRepositoryJob | undefined
+	const store = new RepositoryCampaignStore(path.join(root, "state.json"), [definition], () => ({
+		mode: "synthetic-test", available: true, limitMicros: 100_000,
+		limitTokens: 100_000, committedMicros: 0, committedTokens: 0,
+	}))
+	try {
+		await store.setCampaignBudget(definition.id, 80_000, 80_000)
+		await store.start(definition.id)
+		await store.enqueue(definition.id, "CVE-2026-1260")
+		const worker = createRepositoryWorkerPipeline({ workerProfile: definition.workerProfile!, recipeDigest: definition.recipeDigest!,
+			evaluatorDigest: definition.evaluatorDigest!, model: definition.model!, executionKind: "development-checkpoint",
+			reservation: { micros: 10_000, tokens: 10_000 },
+			async lookupAdvisory(advisoryId) { return { advisoryId, sourceUrl: "https://nvd.nist.gov/vuln/detail/CVE-2026-1260",
+				snapshotSha256: digest("d"), summary: "Offline fixture only", affectedRange: "< 1.0", fixedVersion: "1.0", verificationCheckIds: ["fixture-check"] } },
+			async prepareWorkspace(input) {
+				claim = input.claim
+				return { worktree: root, taskSha256: digest("e"),
+					async runContained(signal) {
+						signal.addEventListener("abort", observedAbort, { once: true })
+						const started = await store.withClaimRequestStart(claim!, async () => {
+							sends += 1
+							enteredRequest()
+							await requestRelease
+							return "settled-fixture-response"
+						})
+						assert.equal(started, "settled-fixture-response")
+						return { ok: false, durationMs: 20, outputSha256: digest("f"), actualMicros: 7_000, actualTokens: 9_000,
+							failureDiagnostic: "Contained worker cancelled after request start; exact fixture receipt settled" }
+					},
+					async candidateSha256() { return digest("1") }, async cleanup() { cleanupCalls += 1 }
+				}
+			},
+			async evaluate() { evaluationCalls += 1; return { passed: true, evidenceSha256: digest("2"), detail: "unexpected" } },
+			async deliverPrivate() { deliveryCalls += 1; return { accepted: true, evidenceSha256: digest("3") } },
+		})
+		const coordinator = new RepositoryCampaignCoordinator(store, [worker], 100)
+		await coordinator.start()
+		try {
+			await requestEntered
+			await store.stop(definition.id)
+			coordinator.stopCampaign(definition.id)
+			await abortObserved
+			await assert.rejects(store.withClaimRequestStart(claim!, async () => { sends += 1; return "forbidden" }), /stale or stopped/)
+			assert.equal(sends, 1, "the stop fence rejects every later call")
+			releaseRequest()
+			const settled = await waitForTerminal(store)
+			assert.equal(settled.status, "failed")
+			assert.equal(settled.settledMicros, 7_000)
+			assert.equal(settled.settledTokens, 9_000)
+			assert.equal(cleanupCalls, 1)
+			assert.equal(evaluationCalls, 0, "Stop prevents verification and delivery after the already-sent call settles")
+			assert.equal(deliveryCalls, 0)
+		} finally { releaseRequest(); await coordinator.stop() }
+		const restarted = new RepositoryCampaignStore(store.path, [definition], () => ({
+			mode: "synthetic-test", available: true, limitMicros: 100_000,
+			limitTokens: 100_000, committedMicros: 0, committedTokens: 0,
+		}))
+		assert.equal(readStatus(await restarted.status()).jobs.length, 1)
+		assert.equal(sends, 1, "restart does not replay the settled stopped job")
+	} finally { releaseRequest(); await fs.rm(root, { recursive: true, force: true }) }
+}
+
 async function testLiveRunLeaseLifecycle(): Promise<void> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-camp-run-"))
 	const run: ActiveCampaignRun = { id: "11111111-1111-4111-8111-111111111111",
@@ -241,6 +365,8 @@ async function testPublishedIntakeQueuesOnceAcrossPollsAndCoordinatorRestart(): 
 const tests: readonly SuiteTest[] = [
 	["registered repository pipeline runs intake, contained worker, evaluator, and private delivery in order", testCoordinatorRunsRegisteredIntakeWorkerEvaluatorDeliveryLoop],
 	["protected evaluator rejection blocks private delivery", testPipelineStopsAtRejectedEvaluatorAndDoesNotDeliver],
+	["Stop during preparation prevents contained launch and cleans the prepared workspace", testStopDuringPreparationSkipsContainedLaunchAndCleansWorkspace],
+	["Stop after request start blocks later calls, preserves measured settlement, and does not replay", testStopAfterRequestStartPreservesSettlementAndDoesNotReplay],
 	["live worker obtains and releases a bounded global run lease", testLiveRunLeaseLifecycle],
 	["existing global run lease leaves queued work untouched", testLiveRunLeaseBusyLeavesJobQueued],
 	["published advisory intake queues once, stays quiet when unchanged, and deduplicates after restart", testPublishedIntakeQueuesOnceAcrossPollsAndCoordinatorRestart],

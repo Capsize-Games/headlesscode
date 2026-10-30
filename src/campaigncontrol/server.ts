@@ -380,6 +380,7 @@ async function handleRequest(
 							sourceRevision: definition.sourceRevision!, policySha256: definition.policySha256! }, false).catch(() => undefined); throw error }
 					} else {
 						await repoStore.stop(campaignId)
+						repositoryCoordinator?.stopCampaign(campaignId)
 						await store.disableRepositoryCampaign(campaignId)
 				}
 				}

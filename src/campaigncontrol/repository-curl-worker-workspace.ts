@@ -42,9 +42,10 @@ export async function buildCurlPreparedWorkspace(input: CurlPrepareInput,
 			setRemoved: (removed) => { taskRemoved = removed } })
 	return {
 		worktree, taskSha256, cleanup, candidateSha256,
-		runContained: async () => await runContainedWorker({
+		runContained: async (signal) => await runContainedWorker({
 			input, context, sourceRoot, worktree, profile, taskSha256, hostRuntimeEnv,
 			leaseToken, limits, apiKey, bindHost, binding, runWorker,
+			signal,
 			isStarted: () => workerStarted, setStarted: () => { workerStarted = true },
 		}),
 	}
@@ -105,17 +106,21 @@ async function runContainedWorker(input: {
 	runWorker: CurlRuntimeServices["runWorker"]
 	isStarted: () => boolean
 	setStarted: () => void
+	signal: AbortSignal
 }): Promise<{ ok: boolean; durationMs: number; outputSha256: string;
 	actualMicros: number | null; actualTokens: number | null;
 		failureDiagnostic?: string }> {
 	if (input.isStarted()) throw new
 		Error("Curl qualification worker session may run only once")
 	input.setStarted()
+	if (input.signal.aborted) throw input.signal.reason ?? new Error("Curl qualification worker stopped before dispatch")
 	await input.context.store.assertClaimCurrent(input.input.claim)
+	if (input.signal.aborted) throw input.signal.reason ?? new Error("Curl qualification worker stopped before dispatch")
 	const result = await input.runWorker({
 		launch: { repoRoot: input.sourceRoot, worktree: input.worktree,
 			profile: input.profile,
 			model: MODEL, taskSha256: input.taskSha256,
+			signal: input.signal,
 				hostRuntimeEnv: input.hostRuntimeEnv,
 			importResults: false },
 		capabilityDirectory: path.dirname(input.context.store.path),

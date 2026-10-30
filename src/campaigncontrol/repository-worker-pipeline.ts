@@ -8,7 +8,7 @@ import { writeRepositoryWorkerDiagnostic } from "./repository-worker-diagnostics
 export interface RepositoryPreparedWorkspace {
 	readonly worktree: string
 	readonly taskSha256: string
-	readonly runContained: () => Promise<{ ok: boolean; durationMs: number; outputSha256: string; actualMicros: number | null; actualTokens: number | null; failureDiagnostic?: string }>
+	readonly runContained: (signal: AbortSignal) => Promise<{ ok: boolean; durationMs: number; outputSha256: string; actualMicros: number | null; actualTokens: number | null; failureDiagnostic?: string }>
 	readonly candidateSha256: () => Promise<string>
 	readonly historicalRepairCandidate?: CurlHistoricalRepairCandidate
 	readonly cleanup?: () => Promise<void>
@@ -100,8 +100,10 @@ export function createRepositoryWorkerPipeline(adapters: RepositoryWorkerPipelin
 					actualTokens = 0
 					await progress({ stage: "prepare-candidate", currentTask: "Materialize the pinned historical repair patch", completedSteps, evidenceRefs })
 				} else {
+					if (signal.aborted) throw signal.reason ?? new Error("worker stopped before contained execution")
 					await progress({ stage: "prepare-candidate", currentTask: "Run the registered contained worker", completedSteps, evidenceRefs })
-					const worker = await workspace.runContained()
+					if (signal.aborted) throw signal.reason ?? new Error("worker stopped before contained execution")
+					const worker = await workspace.runContained(signal)
 					actualMicros = worker.actualMicros
 					actualTokens = worker.actualTokens
 					if (!worker.ok) throw new Error(worker.failureDiagnostic ?? "OpenShell worker returned a nonzero exit; no bounded output detail was captured")
