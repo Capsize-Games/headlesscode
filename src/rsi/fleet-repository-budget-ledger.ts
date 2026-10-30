@@ -337,7 +337,9 @@ export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 				value.reservedMicros !== 4_000 || !Number.isSafeInteger(value.reservedTokens) || Number(value.reservedTokens) < 1 || Number(value.reservedTokens) > 36_000 ||
 				!Number.isSafeInteger(value.actualMicros) || Number(value.actualMicros) < 0 || Number(value.actualMicros) > Number(value.reservedMicros) ||
 				!Number.isSafeInteger(value.actualTokens) || Number(value.actualTokens) < 0 || Number(value.actualTokens) > Number(value.reservedTokens) ||
-				!isRecord(value.settlement) || !validClosedSessionSettlement(value.settlement, Number(value.actualMicros), Number(value.actualTokens), Number(value.reservedTokens))) {
+				!isRecord(value.settlement) || !validClosedSessionSettlement(
+					value.settlement, String(value.callId), Number(value.actualMicros),
+					Number(value.actualTokens), Number(value.reservedTokens))) {
 				throw new Error("Fleet closed-session proof contains an unsettled or mismatched call")
 			}
 			return value as unknown as FleetRepositoryClosedSessionProof["calls"][number]
@@ -618,11 +620,16 @@ function withoutField(value: Record<string, unknown>, field: string): Record<str
 	return Object.fromEntries(Object.entries(value).filter(([key]) => key !== field))
 }
 
-function validClosedSessionSettlement(value: Record<string, unknown>, actualMicros: number, actualTokens: number, reservedTokens: number): boolean {
-	const keys = Object.keys(value).sort().join(",")
+function validClosedSessionSettlement(
+	value: Record<string, unknown>, callId: string, actualMicros: number,
+	actualTokens: number, reservedTokens: number,
+): boolean {
+	const keys = Object.keys(value)
+		.filter((key) => key !== "cachedPromptTokens" && key !== "callId")
+		.sort().join(",")
 	const required = ["completedAt", "costUsd", "completionTokens", "promptTokens", "providerRequestId", "qualified", "responseSha256", "returnedModel", "returnedProvider", "state"].sort().join(",")
-	const optionalCached = keys === [...required.split(","), "cachedPromptTokens"].sort().join(",")
-	if (keys !== required && !optionalCached) return false
+	if (keys !== required ||
+		(value.callId !== undefined && value.callId !== callId)) return false
 	const prompt = value.promptTokens, completion = value.completionTokens, cost = value.costUsd
 	const tokenFields = Number.isSafeInteger(prompt) && Number(prompt) >= 0 && Number(prompt) <= 32_000 &&
 		Number.isSafeInteger(completion) && Number(completion) >= 0 && Number(completion) <= 4_000 &&

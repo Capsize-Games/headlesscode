@@ -49,6 +49,23 @@ function ledger(response: Record<string, unknown>) {
 	return new FleetRepositoryBudgetLedger({ scope, expectedKeyIdentity: keyIdentity, invoke: async () => response })
 }
 
+test("closed settlement binds nested call identity", async () => {
+	const proof = createProof() as unknown as FleetRepositoryClosedSessionProof
+	const first = proof.calls[0]!
+	first.settlement.callId = first.callId
+	first.settlement.cachedPromptTokens = 0
+	const accepted = ledger({ ...redigest(proof) })
+	const verified = await accepted.proveClosedCurlQualificationSession(
+		jobId, scope.repositoryEpoch,
+	)
+	assert.equal(verified.settledMicros, 493)
+	first.settlement.callId = "another-call"
+	const rejected = ledger({ ...redigest(proof) })
+	await assert.rejects(rejected.proveClosedCurlQualificationSession(
+		jobId, scope.repositoryEpoch,
+	), /unsettled or mismatched call/)
+})
+
 test("closed Curl qualification proof verifies exact settled calls and cap denial", async () => {
 	const verified = await ledger(createProof()).proveClosedCurlQualificationSession(jobId, scope.repositoryEpoch)
 	assert.deepEqual([verified.settledMicros, verified.settledTokens, verified.calls.length, verified.denials.length], [493, 6_064, 2, 1])
