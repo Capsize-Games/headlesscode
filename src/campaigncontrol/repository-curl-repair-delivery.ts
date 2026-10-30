@@ -544,14 +544,87 @@ function canonical(value: unknown): string {
 
 async function gitValue(root: string, ...args: string[]): Promise<string> { return (await run("git", ["-C", root, ...args])).trim() }
 
-/** Fixed host-side gh calls need the desktop keyring's D-Bus socket, never inherited token variables. */
-export function fixedCurlDeliveryGitHubEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+/** Fixed host-side gh calls use the owner's validated keyring bus, never inherited token or bus variables. */
+export function fixedCurlDeliveryGitHubEnvironment(source: NodeJS.ProcessEnv = process.env,
+	): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = { PATH: "/usr/local/bin:/usr/bin:/bin", HOME: os.homedir() }
-	for (const name of ["DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"] as const) {
-		const value = source[name]
-		if (typeof value === "string" && value.length > 0 && value.length <= 2_048) env[name] = value
+	const uid = typeof process.getuid === "function" ? process.getuid() : -1
+	const session = uid >= 0 ? resolveOwnerSessionBus(uid) : null
+	if (session) {
+		env.DBUS_SESSION_BUS_ADDRESS = session.address
+		env.XDG_RUNTIME_DIR = session.runtimeDir
+	}
+	// Read source to make explicit that credential/bus values are not inherited.
+	void source
+	return env
+}
+
+function resolveOwnerSessionBus(uid: number): { address: string; runtimeDir: string } | null {
+	try {
+		const runtimeDir = `/run/user/${uid}`
+		if (!isPrivateOwnerDirectory(runtimeDir, uid)) return null
+		const tmpStat = fs.statSync("/tmp")
+		if (!tmpStat.isDirectory() || tmpStat.uid !== 0 || (tmpStat.mode & 0o1000) === 0) return null
+		const sessions: Array<{ pid: number; address: string }> = []
+		for (const entry of fs.readdirSync("/proc")) {
+			if (!/^[1-9][0-9]{0,8}$/.test(entry)) continue
+			const pid = Number(entry)
+			const proc = `/proc/${entry}`
+			try {
+				if (fs.statSync(proc).uid !== uid || fs.readFileSync(`${proc}/comm`, "utf8").trim() !== "xfce4-session" ||
+					fs.realpathSync(`${proc}/exe`) !== "/usr/bin/xfce4-session") continue
+				const variables = readProcEnvironment(proc)
+				if (variables.XDG_RUNTIME_DIR !== runtimeDir || !isOwnerDbusProcess(pid, uid, variables.DBUS_SESSION_BUS_ADDRESS)) continue
+				const match = variables.DBUS_SESSION_BUS_ADDRESS?.match(/^unix:path=(\/tmp\/dbus-[A-Za-z0-9]{1,64}),guid=([a-f0-9]{32})$/)
+				if (!match) continue
+				const socketStat = fs.lstatSync(match[1]!)
+				if (!socketStat.isSocket() || socketStat.uid !== uid) continue
+				process.kill(pid, 0)
+				sessions.push({ pid, address: variables.DBUS_SESSION_BUS_ADDRESS! })
+			} catch { /* stale or unverifiable process entries are ignored */ }
+		}
+		return sessions.length === 1 ? { address: sessions[0]!.address, runtimeDir } : null
+	} catch {
+		return null
+	}
+}
+
+function readProcEnvironment(proc: string): Record<string, string> {
+	const env: Record<string, string> = {}
+	for (const item of fs.readFileSync(`${proc}/environ`).toString("utf8").split("\0")) {
+		const equals = item.indexOf("=")
+		if (equals < 0) continue
+		const name = item.slice(0, equals)
+		if (name === "DBUS_SESSION_BUS_ADDRESS" || name === "XDG_RUNTIME_DIR") env[name] = item.slice(equals + 1)
 	}
 	return env
+}
+
+function isPrivateOwnerDirectory(directory: string, uid: number): boolean {
+	const info = fs.lstatSync(directory)
+	return info.isDirectory() && !info.isSymbolicLink() && info.uid === uid && (info.mode & 0o077) === 0 &&
+		fs.realpathSync(directory) === directory
+}
+
+function isOwnerDirectory(directory: string, uid: number): boolean {
+	const info = fs.lstatSync(directory)
+	return info.isDirectory() && !info.isSymbolicLink() && info.uid === uid && fs.realpathSync(directory) === directory
+}
+
+function isOwnerDbusProcess(sessionPid: number, uid: number, address?: string): boolean {
+	if (!address) return false
+	for (const entry of fs.readdirSync("/proc")) {
+		if (!/^[1-9][0-9]{0,8}$/.test(entry) || Number(entry) === sessionPid) continue
+		const proc = `/proc/${entry}`
+		try {
+			if (fs.statSync(proc).uid === uid && ["dbus-daemon", "dbus-broker"].includes(fs.readFileSync(`${proc}/comm`, "utf8").trim()) &&
+				readProcEnvironment(proc).DBUS_SESSION_BUS_ADDRESS === address) {
+				process.kill(Number(entry), 0)
+				return true
+			}
+		} catch { /* stale or unverifiable process entries are ignored */ }
+	}
+	return false
 }
 
 async function runGitHub(args: string[], timeoutMs = 30_000): Promise<string> {
