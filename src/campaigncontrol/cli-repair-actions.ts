@@ -69,43 +69,8 @@ export async function handleAction(action: string, positional: string[]): Promis
 		return v2.runRepairKnownV2(positional)
 	}
 	if (action === "retry-repair") {
-		if (positional.length !== 3 || positional[0] !== CURL_REPAIR_CAMPAIGN_ID ||
-			!/^([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i.test(positional[1]!) ||
-			positional[2] !== `--confirm-retry-repair=${positional[1]}`) return 2
-		try {
-			const definitions = await loadRepositoryCampaignDefinitions(REPOSITORY_CAMPAIGN_REGISTRY_FILE)
-			const definition = definitions.find((item) => item.id === CURL_REPAIR_CAMPAIGN_ID)
-			if (!definition || definition.workerProfile !== CURL_REPAIR_PROFILE_ID) throw new Error("historical Curl retry requires its exact owner-registered repair profile")
-			const readAuthority = createRepositoryBudgetAuthorityReader(definitions, CAMPAIGN_CONTROL_FILE)
-			const repositoryStore = new RepositoryCampaignStore(REPOSITORY_CAMPAIGN_STATE_FILE, definitions, readAuthority)
-			const authority = await readAuthority(CURL_REPAIR_CAMPAIGN_ID)
-			const liveClaimWindow = authority.mode === "fleet-v2-budget-only" && authority.available === false && authority.snapshotOnly === true &&
-				!!authority.runId && Number.isSafeInteger(authority.runExpiresAtMs) && authority.runExpiresAtMs! > Date.now()
-			const snapshotProvisioning = authority.mode === "fleet-v2-readonly" && authority.available === false && authority.snapshotOnly === true &&
-				authority.runId === null && authority.runExpiresAtMs === null
-			if (!((liveClaimWindow || snapshotProvisioning) && authority.model === "none" && authority.profileId === "no-model" && authority.repositoryCampaignId === definition.id &&
-				authority.repositoryId === definition.repositoryId && authority.repository === definition.repository &&
-				authority.sourceRevision === definition.sourceRevision && authority.policySha256 === definition.policySha256 &&
-				authority.globalEnabled === true && authority.canAdmit === true && authority.repositoryEnabled === true)) {
-				throw new Error("fresh enabled Fleet Curl budget provisioning authority is unavailable")
-			}
-			await verifyCurlHistoricalRepairSourcePin()
-			const view = await repositoryStore.recoveryView(positional[1]!)
-			if (!view.job || view.activeJobs.length) throw new Error("retry target is unavailable or another Curl job is active")
-			const candidate = await buildCurlHistoricalRepairCandidate()
-			const receipt = await evaluateCurlHistoricalRepairCandidate({ candidate, jobId: view.job.id })
-			if (receipt.disposition !== "historical-fix-qualified") throw new Error("historical Curl retry requires protected regression evidence")
-			const child = await repositoryStore.enqueueVerifiedHistoricalRepairRetry(view.job.id,
-				`CONFIRM RETRY HISTORICAL CURL DELIVERY ${view.job.id}`, {
-					candidateSha256: curlHistoricalRepairCandidateSha256(candidate), verificationSha256: receipt.evidenceSha256,
-				})
-			process.stdout.write(`${JSON.stringify({ retry: "verified-historical-curl-delivery", parentJobId: view.job.id,
-				childJobId: child.id, jobId: child.id, evidenceSha256: receipt.evidenceSha256, state: child.status })}\n`)
-			return 0
-		} catch (error) {
-			process.stderr.write(`headlesscode campaign: ${error instanceof Error ? error.message : "historical Curl retry failed closed"}\n`)
-			return 1
-		}
+		const retry = await import("./cli-retry-repair-action.js")
+		return retry.runRetryRepair(positional)
 	}
 	return undefined
 }
