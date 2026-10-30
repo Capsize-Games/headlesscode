@@ -640,7 +640,7 @@ async function runGitHub(args: string[], timeoutMs = 30_000): Promise<string> {
 async function run(command: string, args: string[], timeoutMs = 30_000): Promise<string> {
 	try {
 		const { stdout } = await execFileAsync(command, args, { timeout: timeoutMs, maxBuffer: 256 * 1024, encoding: "utf8",
-			env: { PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin", HOME: os.homedir() } })
+			env: fixedCurlDeliveryGitHubEnvironment() })
 		return stdout
 	} catch {
 		throw new Error("fixed Curl delivery command failed")
@@ -650,7 +650,7 @@ async function run(command: string, args: string[], timeoutMs = 30_000): Promise
 async function runStatus(command: string, args: string[], timeoutMs = 30_000): Promise<number> {
 	try {
 		await execFileAsync(command, args, { timeout: timeoutMs, maxBuffer: 256 * 1024, encoding: "utf8",
-			env: { PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin", HOME: os.homedir() } } as any)
+			env: fixedCurlDeliveryGitHubEnvironment() } as any)
 		return 0
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException & { code?: number }).code
