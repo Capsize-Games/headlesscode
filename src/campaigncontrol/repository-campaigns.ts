@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises"
 import { acquireCampaignLock, ensurePrivateCampaignRoot, readCampaignStateFile } from "./repository-campaigns-state-io.js"
-import { REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS, REPOSITORY_CAMPAIGN_BUDGET_CAP_TOKENS, MAX_CAMPAIGNS, MAX_JOBS, MAX_INTAKE_RECORDS, MAX_HISTORY, MOCK_DISPATCH_TIMEOUT_MS, REPOSITORY_WORKER_LEASE_MS, REPOSITORY_PROGRESS_FRESH_MS, REPOSITORY_CAMPAIGN_STEPS, RepositoryCampaignStep, RepositoryEvidenceRef, RepositoryJobProgress, PRIVATE_BOARD_REF, RepositoryCampaignDefinition, RepositoryBudgetAuthority, RepositoryCampaignJob, RepositoryAdvisoryIntakeRecord,  } from "./repository-campaigns-model.js"
+import { REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS, REPOSITORY_CAMPAIGN_BUDGET_CAP_TOKENS, MAX_CAMPAIGNS, MAX_JOBS, MAX_INTAKE_RECORDS, MAX_HISTORY, MOCK_DISPATCH_TIMEOUT_MS, REPOSITORY_WORKER_LEASE_MS, REPOSITORY_PROGRESS_FRESH_MS, REPOSITORY_CAMPAIGN_STEPS, RepositoryCampaignStep, RepositoryEvidenceRef, RepositoryJobProgress, validPrivateBoardRef, RepositoryCampaignDefinition, RepositoryBudgetAuthority, RepositoryCampaignJob, RepositoryAdvisoryIntakeRecord,  } from "./repository-campaigns-model.js"
 import { CampaignRecord, CampaignState, ClaimedRepositoryJob, MockRepositoryDispatcher } from "./repository-campaigns-state-model.js"
 export * from "./repository-campaigns-state-model.js"
 export * from "./repository-campaigns-model.js"
@@ -326,7 +326,7 @@ function validJobOptionalDetails(job: RepositoryCampaignJob, s: Partial<Campaign
 	const retry = job.retryOf === undefined || validId(job.retryOf)
 	const purpose = job.purpose === undefined || validQualificationJob(job, s) ||
 		validRepairJob(job, s) || validRepairV2Job(job, s)
-	const progress = job.progress === undefined || validProgress(job.progress)
+	const progress = job.progress === undefined || validProgress(job.progress, job.campaignId)
 	return text && retry && purpose && progress
 }
 
@@ -477,9 +477,14 @@ function validOptionalProgressNote(value: unknown): boolean {
 	return value === null || (typeof value === "string" && value.length <= 240)
 }
 
-function validProgressTimesAndNotes(p: RepositoryJobProgress): boolean {
+function isV2Campaign(campaignId: string): boolean {
+	return campaignId === CURL_REPAIR_V2_CAMPAIGN_ID
+}
+
+function validProgressTimesAndNotes(p: RepositoryJobProgress, campaignId: string): boolean {
 	const board = p.boardRef === undefined || p.boardRef === null ||
-		(typeof p.boardRef === "string" && p.boardRef.length <= 256 && PRIVATE_BOARD_REF.test(p.boardRef))
+		(typeof p.boardRef === "string" && p.boardRef.length <= 256 &&
+			validPrivateBoardRef(p.boardRef, isV2Campaign(campaignId)))
 	return validProgressTimes(p) && validOptionalProgressNote(p.blocker) && validOptionalProgressNote(p.nextStep) && board
 }
 
@@ -490,11 +495,11 @@ function validProgressEvidence(p: RepositoryJobProgress): boolean {
 		typeof item.label === "string" && item.label.length > 0 && item.label.length <= 80)
 }
 
-function validProgress(value: unknown): value is RepositoryJobProgress {
+function validProgress(value: unknown, campaignId: string): value is RepositoryJobProgress {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false
 	const progress = value as RepositoryJobProgress
 	return validProgressIdentity(progress, value) && validProgressSteps(progress) &&
-		validProgressTimesAndNotes(progress) && validProgressEvidence(progress)
+		validProgressTimesAndNotes(progress, campaignId) && validProgressEvidence(progress)
 }
 
 function missingSourceAndRecipe(definition: RepositoryCampaignDefinition): string[] {
@@ -720,23 +725,26 @@ function validOptionalUpdateText(value: unknown, allowNull: boolean): boolean {
 	return typeof value === "string" && value.length <= 240
 }
 
-function validProgressUpdateNotes(patch: RepositoryProgressUpdate): boolean {
+function validProgressUpdateNotes(patch: RepositoryProgressUpdate, campaignId: string): boolean {
 	const board = patch.boardRef === undefined || patch.boardRef === null ||
-		(typeof patch.boardRef === "string" && patch.boardRef.length <= 256 && PRIVATE_BOARD_REF.test(patch.boardRef))
+		(typeof patch.boardRef === "string" && patch.boardRef.length <= 256 &&
+			validPrivateBoardRef(patch.boardRef, isV2Campaign(campaignId)))
 	return validOptionalUpdateText(patch.blocker, true) && validOptionalUpdateText(patch.nextStep, true) && board
 }
 
-function validProgressUpdate(patch: RepositoryProgressUpdate): boolean {
+function validProgressUpdate(patch: RepositoryProgressUpdate, campaignId: string): boolean {
 	if (!patch || typeof patch !== "object") return false
 	const fields = REPOSITORY_CAMPAIGN_STEPS.includes(patch.stage) && typeof patch.currentTask === "string" &&
 		!!patch.currentTask.trim() && patch.currentTask.length <= 240
-	return fields && validProgressUpdateSteps(patch) && validProgressUpdateNotes(patch) && validProgressUpdateEvidence(patch.evidenceRefs)
+	return fields && validProgressUpdateSteps(patch) &&
+		validProgressUpdateNotes(patch, campaignId) &&
+		validProgressUpdateEvidence(patch.evidenceRefs)
 }
 
-function validFinishProgress(progress: RepositoryFinishProgress | undefined): boolean {
+function validFinishProgress(progress: RepositoryFinishProgress | undefined, campaignId: string): boolean {
 	if (progress === undefined) return true
 	const knownKeys = Object.keys(progress).every((key) => ["currentTask", "blocker", "nextStep", "boardRef"].includes(key))
-	return !!progress && knownKeys && validFinishText(progress) && validFinishBoardRef(progress.boardRef)
+	return !!progress && knownKeys && validFinishText(progress) && validFinishBoardRef(progress.boardRef, campaignId)
 }
 
 function validFinishText(progress: RepositoryFinishProgress): boolean {
@@ -744,13 +752,16 @@ function validFinishText(progress: RepositoryFinishProgress): boolean {
 	return task && validOptionalUpdateText(progress.blocker, true) && validOptionalUpdateText(progress.nextStep, true)
 }
 
-function validFinishBoardRef(value: string | null | undefined): boolean {
-	return value === undefined || value === null || (typeof value === "string" && value.length <= 256 && PRIVATE_BOARD_REF.test(value))
+function validFinishBoardRef(value: string | null | undefined, campaignId: string): boolean {
+	return value === undefined || value === null ||
+		(typeof value === "string" && value.length <= 256 &&
+			validPrivateBoardRef(value, isV2Campaign(campaignId)))
 }
 
 function validFinishResult(claim: ClaimedRepositoryJob, result: RepositoryFinishResult): boolean {
 	const usage = [result.actualMicros, result.actualTokens].every((n) => n === undefined || (Number.isSafeInteger(n) && n >= 0))
-	return !!claim && !!claim.job && ["succeeded", "failed", "ambiguous"].includes(result.status) && usage && validFinishProgress(result.progress)
+	return !!claim && !!claim.job && ["succeeded", "failed", "ambiguous"].includes(result.status) && usage &&
+		validFinishProgress(result.progress, claim.job.campaignId)
 }
 
 function validRecoveredFinish(claim: ClaimedRepositoryJob, result: RecoveredFinishResult): boolean {
@@ -1426,7 +1437,7 @@ export class RepositoryCampaignStore {
 
 	/** Persist coordinator progress under the same durable lock as the claim and budget. */
 	async updateClaimProgress(claim: ClaimedRepositoryJob, patch: RepositoryProgressUpdate, now = new Date()): Promise<void> {
-		if (!claim || !validProgressUpdate(patch)) throw new Error("campaign progress update is invalid")
+		if (!claim || !validProgressUpdate(patch, claim.job.campaignId)) throw new Error("campaign progress update is invalid")
 		await this.update((s) => {
 			const job = requireRunningProgressJob(s, claim, now)
 			const refs = assertProgressAppendOnly(job.progress!, patch)

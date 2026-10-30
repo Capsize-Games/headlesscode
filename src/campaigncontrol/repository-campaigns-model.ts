@@ -49,11 +49,20 @@ export interface RepositoryJobProgress {
 	boardRef?: string | null
 }
 
-export const PRIVATE_BOARD_REF = new RegExp(
+export const PRIVATE_BOARD_REF_V1 = new RegExp(
 	"^http://127\\.0\\.0\\.1:8078/api/cards/" +
 	"1c25cecf-e5e8-4b68-b6fd-5d6ad25426d7" +
 	"#hc-repository-result-v1:[a-f0-9]{64}$",
 )
+export const PRIVATE_BOARD_REF_V2 = new RegExp(
+	"^http://127\\.0\\.0\\.1:8078/api/cards/" +
+	"1c25cecf-e5e8-4b68-b6fd-5d6ad25426d7" +
+	"#hc-repository-result-v2:[a-f0-9]{64}$",
+)
+
+export function validPrivateBoardRef(value: string, isV2: boolean): boolean {
+	return isV2 ? PRIVATE_BOARD_REF_V2.test(value) : PRIVATE_BOARD_REF_V1.test(value)
+}
 
 export interface RepositoryCampaignDefinition {
 	id: string
