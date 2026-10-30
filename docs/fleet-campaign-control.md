@@ -41,7 +41,7 @@ campaign definition reports `workerQualified=false`. The Curl campaign is
 disabled and blocked on prerequisites. No live CVE worker is currently
 runnable or claimed.
 
-As of 2026-10-29, the legacy global admission switch is ON at control epoch 20.
+As of 2026-10-29, the legacy global admission switch is ON at control epoch 22.
 That state does not change the Curl campaign's disabled, blocked-prerequisite
 state. Do not describe qualification-profile code or historical jobs as a live
 worker run, verified repair, upstream submission or catalog publication.

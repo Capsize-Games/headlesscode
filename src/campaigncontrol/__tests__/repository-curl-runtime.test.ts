@@ -168,7 +168,7 @@ async function testContainedCollectorStartsBeforeProfileAndClosesWithWorkspace()
 			repositoryEpoch: 3, runId: "fleet-run", controlEpoch: 9,
 		monthly: { limitMicros: 1_000_000 },
 			campaignLifetime: { limitMicros: 20_000, limitTokens: 108_000 },
-		repositoryLifetime: { limitMicros: 20_000, limitTokens: 108_000 }
+		repositoryLifetime: { limitMicros: 18_000, limitTokens: 90_000 }
 	} as unknown as FleetRepositoryBudgetSnapshot
 	const key = "A".repeat(43)
 	const keyIdentity = createHash("sha256").update(key).digest("hex")
@@ -187,7 +187,17 @@ async function testContainedCollectorStartsBeforeProfileAndClosesWithWorkspace()
 			brokerBindHost: "127.0.0.1",
 		openshellXdgConfigHome: "/home/joe/Projects/headlesscode/.worktrees/ux/.headlesscode/scratch/rsi-muse/xdg-user",
 		openshellXdgStateHome: "/home/joe/Projects/headlesscode/.worktrees/ux/.headlesscode/scratch/rsi-muse/xdg-state" } as const
+	const advisory = { advisoryId: CURL_FIXED_ADVISORY,
+		sourceUrl: `https://security-tracker.debian.org/tracker/${CURL_FIXED_ADVISORY}`, snapshotSha256: "d".repeat(64),
+		summary: "fixed facts", affectedRange: "source range", fixedVersion: null,
+		verificationCheckIds: ["muse-spark-contributor"] }
 	try {
+		for (const caps of [{ limitMicros: 0, limitTokens: 0 }, { limitMicros: 20_001, limitTokens: 108_001 }]) {
+			const blocked = createCurlRepositoryPipelineAdapters(registration, definition, { store }, {
+				readBudgetAuthority: async () => ({ ...authority, repositoryLifetime: { ...authority.repositoryLifetime!, ...caps } }),
+			})
+			await assert.rejects(blocked.prepareWorkspace({ definition, claim, advisory }), /fresh active Fleet v2 repository budget/)
+		}
 		const adapters = createCurlRepositoryPipelineAdapters(registration,
 			definition, { store }, {
 			projectRoot: root, sourceRoot: root, loadRuntimeConfig: () => runtimeConfig,
@@ -211,13 +221,11 @@ async function testContainedCollectorStartsBeforeProfileAndClosesWithWorkspace()
 				assert.equal(input.launch.hostRuntimeEnv?.XDG_STATE_HOME, runtimeConfig.openshellXdgStateHome)
 				assert.equal(input.launch.hostRuntimeEnv?.OPENROUTER_API_KEY, undefined)
 				assert.equal(input.launch.importResults, false)
+				assert.equal(input.limits.maxDurationMs, 300_000, "the v2 bridge's hard 300-second grant cap must be respected")
 				return { ok: true, exitCode: 0, durationMs: 1, outputSha256: "c".repeat(64),
 				receipt: {} as unknown as OpenRouterBrokerReceipt, actualMicros: 0, actualTokens: 0 } },
 		})
-		const prepared = await adapters.prepareWorkspace({ definition, claim, advisory: { advisoryId: CURL_FIXED_ADVISORY,
-			sourceUrl: `https://security-tracker.debian.org/tracker/${CURL_FIXED_ADVISORY}`, snapshotSha256: "d".repeat(64),
-			summary: "fixed facts", affectedRange: "source range", fixedVersion: null,
-				verificationCheckIds: ["muse-spark-contributor"] } })
+		const prepared = await adapters.prepareWorkspace({ definition, claim, advisory })
 		assert.ok(events.indexOf(`start-evidence:${sessionId}`) >= 0)
 		assert.ok(events.indexOf("start-evidence:" + sessionId) < events.indexOf("resolve-profile"))
 		assert.ok(events.indexOf("resolve-profile") < events.indexOf("validate-supervisor"))

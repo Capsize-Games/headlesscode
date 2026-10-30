@@ -452,6 +452,7 @@ function assertNoSymlinkAncestors(value: string): void {
 }
 
 function isFreshLiveAuthority(value: Awaited<ReturnType<ReturnType<typeof createRepositoryBudgetAuthorityReader>>>, definition: RepositoryCampaignDefinition): boolean {
+	const repositoryLimits = value.repositoryLifetime
 	return value.mode === "fleet-v2" && value.available === true && value.canAdmit === true && value.globalEnabled === true &&
 		value.campaignId === "fleet-security-watch" && typeof value.asOfMs === "number" && Date.now() - value.asOfMs >= 0 && Date.now() - value.asOfMs <= 30_000 &&
 		value.repositoryCampaignId === definition.id && value.repositoryId === definition.repositoryId && value.repository === definition.repository &&
@@ -459,7 +460,9 @@ function isFreshLiveAuthority(value: Awaited<ReturnType<ReturnType<typeof create
 		value.profileId === PROFILE_ID && value.repositoryEnabled === true && Number.isSafeInteger(value.repositoryEpoch) && value.repositoryEpoch! > 0 &&
 		value.runId !== null && typeof value.runId === "string" && Number.isSafeInteger(value.controlEpoch) &&
 		value.monthly?.limitMicros !== undefined && value.campaignLifetime?.limitMicros === MAX_LIFETIME_MICROS && value.campaignLifetime.limitTokens === MAX_LIFETIME_TOKENS &&
-		value.repositoryLifetime?.limitMicros === MAX_LIFETIME_MICROS && value.repositoryLifetime.limitTokens === MAX_LIFETIME_TOKENS
+		repositoryLimits !== undefined && Number.isSafeInteger(repositoryLimits.limitMicros) && repositoryLimits.limitMicros >= MAX_JOB_MICROS &&
+		repositoryLimits.limitMicros <= MAX_LIFETIME_MICROS && Number.isSafeInteger(repositoryLimits.limitTokens) &&
+		repositoryLimits.limitTokens >= MAX_JOB_TOKENS && repositoryLimits.limitTokens <= MAX_LIFETIME_TOKENS
 }
 
 function buildLimits(claim: ClaimedRepositoryJob) {
@@ -470,7 +473,7 @@ function buildLimits(claim: ClaimedRepositoryJob) {
 	}
 	return { campaignId: "fleet-security-watch", maxCalls: 2,
 		maxInputTokensPerCall: 32_000, maxOutputTokensPerCall: 4_000, maxTotalTokens: tokens,
-		maxDurationMs: 840_000, maxRequestBytes: 32_768, maxResponseBytes: 65_536,
+		maxDurationMs: 300_000, maxRequestBytes: 32_768, maxResponseBytes: 65_536,
 		maxInputPricePerMillionUsd: 0.1, maxOutputPricePerMillionUsd: 0.2,
 		maxCallSpendUsd: 0.004, maxJobSpendUsd: micros / 1_000_000,
 		maxCampaignSpendUsd: 0.02 }
