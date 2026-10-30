@@ -209,13 +209,14 @@ async function ensurePrivateRoot(directory: string): Promise<void> {
 			(typeof process.getuid === "function" && info.uid !== process.getuid())) {
 			throw new Error("Curl v2 state path is not owner-private")
 		}
-		await fs.chmod(current, 0o700)
 	}
+	await fs.chmod(absolute, 0o700)
 }
 
 async function readReceipt<T>(claim: CurlRepairV2ClaimIdentity, name: string,
 	validate: (value: unknown, claim: CurlRepairV2ClaimIdentity) => value is T): Promise<CurlRepairV2StageReceipt<T>> {
 	const filePath = path.join(STATE_ROOT, "curl-historical-v2", claim.jobId, name)
+	await ensurePrivateRoot(path.dirname(filePath))
 	const info = await fs.lstat(filePath)
 	if (!info.isFile() || info.isSymbolicLink() ||
 		(typeof process.getuid === "function" && info.uid !== process.getuid()) ||
