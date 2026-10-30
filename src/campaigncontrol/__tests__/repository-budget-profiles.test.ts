@@ -1,7 +1,9 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { repositoryBudgetProfile } from "../repository-budget-authority.js"
-import { makeCurlRepairV2Definition } from "./curl-repair-v2-campaign-fixture.js"
+import {
+	makeCurlRepairV2Definition,
+} from "./curl-repair-v2-campaign-fixture.js"
 
 test("only the exact compiled v2 identity selects a no-model budget", () => {
 	const definition = makeCurlRepairV2Definition()

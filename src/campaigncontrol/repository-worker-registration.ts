@@ -1,5 +1,7 @@
 import type { RepositoryCampaignDefinition } from "./repository-campaigns.js"
-import type { RepositoryWorkerPipelineAdapters } from "./repository-worker-pipeline.js"
+import type {
+	RepositoryWorkerPipelineAdapters,
+} from "./repository-worker-pipeline.js"
 
 export interface RepositoryWorkerRegistration {
 	campaignId: string
