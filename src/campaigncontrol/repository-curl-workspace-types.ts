@@ -53,6 +53,4 @@ export interface CandidateDigestDependencies {
 	worktree: string
 	taskSha256: string
 	verifyTree: CurlWorkspaceDependencies["verifyTree"]
-	isRemoved: () => boolean
-	setRemoved: (value: boolean) => void
 }
