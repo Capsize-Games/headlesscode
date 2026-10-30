@@ -10,29 +10,47 @@ import type {
 	CurlRepairV2WorkerReceipt,
 } from "./repository-curl-repair-v2-receipt-types.js"
 
-export function isWorkerReceipt(value: unknown,
-	claim: CurlRepairV2ClaimIdentity): value is CurlRepairV2WorkerReceipt {
+export function isWorkerReceipt(
+	value: unknown,
+	claim: CurlRepairV2ClaimIdentity,
+): value is CurlRepairV2WorkerReceipt {
 	if (!record(value)) return false
-	return value.schema_version === 2 && value.profile === CURL_REPAIR_V2_PROFILE_ID &&
+	return value.schema_version === 2 &&
+		value.profile === CURL_REPAIR_V2_PROFILE_ID &&
 		value.job_id === claim.jobId && value.claim_id === claim.claimId &&
 		value.epoch === claim.epoch && value.stage === "candidate-preparation" &&
 		value.source_revision === CURL_REPAIR_SOURCE_REVISION &&
 		value.candidate_revision === CURL_REPAIR_CANDIDATE_REVISION &&
 		value.candidate_tree === CURL_REPAIR_CANDIDATE_TREE_SHA &&
-		value.image_digest === CURL_REPAIR_V2_IMAGE_DIGEST && digest(value.artifact_sha256) &&
+		value.image_digest === CURL_REPAIR_V2_IMAGE_DIGEST &&
+		digest(value.artifact_sha256) &&
 		numberInRange(value.artifact_bytes, 1, 200_000_000) &&
 		digest(value.worker_recipe_sha256) && value.cleanup_confirmed === true &&
 		numberInRange(value.created_at_unix, 1, Number.MAX_SAFE_INTEGER) &&
 		digest(value.signature)
 }
 
-export function isEvaluatorReceipt(value: unknown,
-	claim: CurlRepairV2ClaimIdentity): value is CurlRepairV2EvaluatorReceipt {
+export function isEvaluatorReceipt(
+	value: unknown,
+	claim: CurlRepairV2ClaimIdentity,
+): value is CurlRepairV2EvaluatorReceipt {
 	if (!record(value)) return false
-	return value.schema_version === 2 && value.profile === CURL_REPAIR_V2_PROFILE_ID &&
+	return hasClaimFields(value, claim) && hasEvaluatorFields(value)
+}
+
+function hasClaimFields(
+	value: Record<string, unknown>,
+	claim: CurlRepairV2ClaimIdentity,
+): boolean {
+	return value.schema_version === 2 &&
+		value.profile === CURL_REPAIR_V2_PROFILE_ID &&
 		value.job_id === claim.jobId && value.claim_id === claim.claimId &&
-		value.epoch === claim.epoch && value.stage === "candidate-evaluation" &&
-		value.candidate_revision === CURL_REPAIR_CANDIDATE_REVISION &&
+		value.epoch === claim.epoch &&
+		value.stage === "candidate-evaluation"
+}
+
+function hasEvaluatorFields(value: Record<string, unknown>): boolean {
+	return value.candidate_revision === CURL_REPAIR_CANDIDATE_REVISION &&
 		value.candidate_tree === CURL_REPAIR_CANDIDATE_TREE_SHA &&
 		value.image_digest === CURL_REPAIR_V2_IMAGE_DIGEST &&
 		JSON.stringify(value.test_ids) === "[3037,3038,5033]" &&

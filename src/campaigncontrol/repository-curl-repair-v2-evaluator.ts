@@ -58,8 +58,11 @@ export async function evaluateCurlHistoricalRepairV2(input: {
 	evaluator: CurlRepairV2StageReceipt<CurlRepairV2EvaluatorReceipt>
 	evaluateBase?: typeof evaluateCurlHistoricalRepairCandidate
 }): Promise<CurlHistoricalRepairV2Receipt> {
-	const base = await (input.evaluateBase ?? evaluateCurlHistoricalRepairCandidate)({
-		candidate: input.candidate, jobId: input.jobId,
+	const evaluateBase = input.evaluateBase ??
+		evaluateCurlHistoricalRepairCandidate
+	const base = await evaluateBase({
+		candidate: input.candidate,
+		jobId: input.jobId,
 	})
 	validateExecution(input, base)
 	return makeReceipt(input, base)
@@ -74,16 +77,34 @@ function validateExecution(input: {
 }, base: CurlHistoricalRepairReceipt): void {
 	const worker = input.worker.receipt
 	const evaluation = input.evaluator.receipt
-	if (worker.job_id !== input.jobId || worker.claim_id !== input.claimId || worker.epoch !== input.epoch ||
-		evaluation.job_id !== input.jobId || evaluation.claim_id !== input.claimId || evaluation.epoch !== input.epoch ||
-		evaluation.worker_receipt_sha256 !== input.worker.receiptFileSha256 ||
-		evaluation.candidate_artifact_sha256 !== worker.artifact_sha256 ||
-		evaluation.test_ids.some((testId, index) => testId !== CURL_REPAIR_V2_TEST_IDS[index]) ||
-		Object.values(evaluation.test_results).some((result) => result !== "pass") ||
-		!evaluation.sanitizer_clean || !evaluation.cleanup_confirmed ||
+	if (!matchesClaim(worker, input) ||
+		!validEvaluation(input, worker, evaluation) ||
 		base.disposition !== "historical-fix-qualified") {
-		throw new Error("Curl v2 execution receipt failed its claim and candidate bindings")
+		throw new Error("Curl v2 execution receipt bindings are invalid")
 	}
+}
+
+function validEvaluation(
+	input: { jobId: string; claimId: string; epoch: number;
+		worker: CurlRepairV2StageReceipt<CurlRepairV2WorkerReceipt> },
+	worker: CurlRepairV2WorkerReceipt,
+	evaluation: CurlRepairV2EvaluatorReceipt,
+): boolean {
+	return matchesClaim(evaluation, input) &&
+		evaluation.worker_receipt_sha256 === input.worker.receiptFileSha256 &&
+		evaluation.candidate_artifact_sha256 === worker.artifact_sha256 &&
+		evaluation.test_ids.every((testId, index) =>
+			testId === CURL_REPAIR_V2_TEST_IDS[index]) &&
+		Object.values(evaluation.test_results).every((result) => result === "pass") &&
+		evaluation.sanitizer_clean && evaluation.cleanup_confirmed
+}
+
+function matchesClaim(
+	receipt: { job_id: string; claim_id: string; epoch: number },
+	claim: { jobId: string; claimId: string; epoch: number },
+): boolean {
+	return receipt.job_id === claim.jobId &&
+		receipt.claim_id === claim.claimId && receipt.epoch === claim.epoch
 }
 
 function makeReceipt(input: {
@@ -105,15 +126,25 @@ function receiptBaseFor(input: {
 	epoch: number
 	worker: CurlRepairV2StageReceipt<CurlRepairV2WorkerReceipt>
 	evaluator: CurlRepairV2StageReceipt<CurlRepairV2EvaluatorReceipt>
-}, base: CurlHistoricalRepairReceipt): Omit<CurlHistoricalRepairV2Receipt, "evidenceSha256"> {
+}, base: CurlHistoricalRepairReceipt): Omit<
+	CurlHistoricalRepairV2Receipt, "evidenceSha256"
+> {
 	return {
 		schemaVersion: 2 as const,
 		disposition: "historical-fix-qualified" as const,
 		proofMode: "fresh-job-bound-isolated-regression" as const,
-		scope: base.scope,
-		advisoryId: base.advisoryId,
-		profileId: base.profileId,
-		sourceRevision: base.sourceRevision,
+		...baseFields(base),
+		execution: executionFor(input),
+	}
+}
+
+function baseFields(
+	base: CurlHistoricalRepairReceipt,
+): Omit<CurlHistoricalRepairV2Receipt, "evidenceSha256" | "execution" |
+	"schemaVersion" | "disposition" | "proofMode"> {
+	return {
+		scope: base.scope, advisoryId: base.advisoryId,
+		profileId: base.profileId, sourceRevision: base.sourceRevision,
 		sourceTreeSha: base.sourceTreeSha,
 		candidateRevision: base.candidateRevision,
 		candidateTreeSha: base.candidateTreeSha,
@@ -121,7 +152,6 @@ function receiptBaseFor(input: {
 		sourceEnvelopeSha256: base.sourceEnvelopeSha256,
 		artifactManifestSha256: base.artifactManifestSha256,
 		protectedProof: base.protectedProof,
-		execution: executionFor(input),
 	}
 }
 
@@ -139,22 +169,38 @@ function executionFor(input: {
 		jobId: input.jobId,
 		claimId: input.claimId,
 		epoch: input.epoch,
+		...stageEvidence(input, evaluation),
+		sanitizerClean: true,
+		cleanupConfirmed: true,
+	}
+}
+
+function stageEvidence(
+	input: { worker: CurlRepairV2StageReceipt<CurlRepairV2WorkerReceipt>;
+		evaluator: CurlRepairV2StageReceipt<CurlRepairV2EvaluatorReceipt> },
+	evaluation: CurlRepairV2EvaluatorReceipt,
+): Pick<CurlHistoricalRepairV2Receipt["execution"],
+	"workerReceiptSha256" | "evaluatorReceiptSha256" |
+	"candidateArtifactSha256" | "imageDigest" | "testIds" | "testResults"> {
+	return {
 		workerReceiptSha256: input.worker.receiptFileSha256,
 		evaluatorReceiptSha256: input.evaluator.receiptFileSha256,
 		candidateArtifactSha256: evaluation.candidate_artifact_sha256,
 		imageDigest: evaluation.image_digest,
 		testIds: CURL_REPAIR_V2_TEST_IDS,
 		testResults: evaluation.test_results,
-		sanitizerClean: true,
-		cleanupConfirmed: true,
 	}
 }
 
-function sha256(value: string): string { return createHash("sha256").update(value).digest("hex") }
+function sha256(value: string): string {
+	return createHash("sha256").update(value).digest("hex")
+}
 
 function canonical(value: unknown): string {
 	if (value === null || typeof value !== "object") return JSON.stringify(value)
 	if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`
-	return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b))
-		.map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(",")}}`
+	const entries = Object.entries(value as Record<string, unknown>)
+		.sort(([left], [right]) => left.localeCompare(right))
+	return `{${entries.map(([key, item]) =>
+		`${JSON.stringify(key)}:${canonical(item)}`).join(",")}}`
 }

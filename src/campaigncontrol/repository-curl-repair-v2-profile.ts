@@ -7,16 +7,24 @@ import {
 import { CURL_REPAIR_V2_CAMPAIGN_ID } from "./repository-campaign-ids.js"
 
 export const CURL_REPAIR_V2_PROFILE_ID = "curl-92390-historical-repair-v2"
-export const CURL_REPAIR_V2_ADAPTER_ID = "curl-92390-historical-repair-runtime-v2"
+export const CURL_REPAIR_V2_ADAPTER_ID =
+	"curl-92390-historical-repair-runtime-v2"
 export const CURL_REPAIR_V2_REPOSITORY_ID = "curl-maintenance-repair-v2"
 export const CURL_REPAIR_V2_SOURCE_REVISION = CURL_REPAIR_SOURCE_REVISION
 export const CURL_REPAIR_V2_TARGET_REPOSITORY = CURL_REPAIR_TARGET_REPOSITORY
 export const CURL_REPAIR_V2_MODEL = "none"
-export const CURL_REPAIR_V2_ACCESS_PROFILE = "public-source-and-published-advisory-only"
-export const CURL_REPAIR_V2_RESERVATION = Object.freeze({ micros: 1, tokens: 1 })
-export const CURL_REPAIR_V2_LIFETIME_ALLOCATION = Object.freeze({ micros: 400, tokens: 500 })
-export const CURL_REPAIR_V2_HELPER_SHA256 = "f7bbe5b12a443107eb4eeb2920c7fb70a0ac76b6c9342bf76678644adc9e4fad"
-export const CURL_REPAIR_V2_IMAGE_DIGEST = "8924c5d2afd16f45d34a32f34de613ed7146a9557d07deb9edc83588d2dfdc04"
+export const CURL_REPAIR_V2_ACCESS_PROFILE =
+	"public-source-and-published-advisory-only"
+export const CURL_REPAIR_V2_RESERVATION = Object.freeze({
+	 micros: 1, tokens: 1,
+})
+export const CURL_REPAIR_V2_LIFETIME_ALLOCATION = Object.freeze({
+	 micros: 400, tokens: 500,
+})
+export const CURL_REPAIR_V2_HELPER_SHA256 =
+	"f7bbe5b12a443107eb4eeb2920c7fb70a0ac76b6c9342bf76678644adc9e4fad"
+export const CURL_REPAIR_V2_IMAGE_DIGEST =
+	"8924c5d2afd16f45d34a32f34de613ed7146a9557d07deb9edc83588d2dfdc04"
 export const CURL_REPAIR_V2_TEST_IDS = Object.freeze([3037, 3038, 5033])
 
 const RECIPE = Object.freeze({
@@ -31,7 +39,8 @@ const RECIPE = Object.freeze({
 	helperSha256: CURL_REPAIR_V2_HELPER_SHA256,
 	testIds: CURL_REPAIR_V2_TEST_IDS,
 	network: "none",
-	limits: { cpu: 1, memoryBytes: 1_073_741_824, swapBytes: 1_073_741_824,
+	limits: {
+		cpu: 1, memoryBytes: 1_073_741_824, swapBytes: 1_073_741_824,
 		pids: 64, durationSeconds: 825, outputBytes: 65_536 },
 })
 
@@ -73,6 +82,8 @@ function digest(value: object): string {
 function canonical(value: unknown): string {
 	if (value === null || typeof value !== "object") return JSON.stringify(value)
 	if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`
-	return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b))
-		.map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(",")}}`
+	const entries = Object.entries(value as Record<string, unknown>)
+		.sort(([left], [right]) => left.localeCompare(right))
+	return `{${entries.map(([key, item]) =>
+		`${JSON.stringify(key)}:${canonical(item)}`).join(",")}}`
 }

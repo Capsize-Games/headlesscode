@@ -1,8 +1,15 @@
 import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
-import { evaluateCurlHistoricalRepairCandidate } from "../repository-curl-repair-evaluator.js"
-import { evaluateCurlHistoricalRepairV2 } from "../repository-curl-repair-v2-evaluator.js"
-import type { CurlRepairV2EvaluatorReceipt, CurlRepairV2WorkerReceipt } from "../repository-curl-repair-v2-execution.js"
+import {
+	evaluateCurlHistoricalRepairCandidate,
+} from "../repository-curl-repair-evaluator.js"
+import {
+	evaluateCurlHistoricalRepairV2,
+} from "../repository-curl-repair-v2-evaluator.js"
+import type {
+	CurlRepairV2EvaluatorReceipt,
+	CurlRepairV2WorkerReceipt,
+} from "../repository-curl-repair-v2-execution.js"
 import {
 	CURL_REPAIR_V2_CAMPAIGN_ID,
 } from "../repository-campaign-ids.js"
@@ -15,11 +22,16 @@ import {
 	CURL_REPAIR_V2_IMAGE_DIGEST, CURL_REPAIR_V2_PROFILE_ID,
 	CURL_REPAIR_V2_TEST_IDS, CURL_REPAIR_V2_EVALUATOR_DIGEST,
 } from "../repository-curl-repair-v2-profile.js"
-import { buildCurlHistoricalRepairTestFixture } from "./curl-historical-repair-fixture.js"
+import {
+	buildCurlHistoricalRepairTestFixture,
+} from "./curl-historical-repair-fixture.js"
 import { runMain, type SuiteTest } from "../../test-runner.js"
 
-const claim = { jobId: "11111111-1111-4111-8111-111111111111",
-	claimId: "22222222-2222-4222-8222-222222222222", epoch: 7 }
+const claim = {
+	jobId: "11111111-1111-4111-8111-111111111111",
+	claimId: "22222222-2222-4222-8222-222222222222",
+	epoch: 7,
+}
 const workerHash = sha256("worker receipt")
 const evaluatorHash = sha256("evaluator receipt")
 const artifactHash = sha256("candidate archive")
@@ -39,7 +51,8 @@ function workerReceipt(): CurlRepairV2WorkerReceipt {
 function evaluatorReceipt(): CurlRepairV2EvaluatorReceipt {
 	return { schema_version: 2, profile: CURL_REPAIR_V2_PROFILE_ID,
 		job_id: claim.jobId, claim_id: claim.claimId, epoch: claim.epoch,
-		stage: "candidate-evaluation", candidate_revision: CURL_REPAIR_CANDIDATE_REVISION,
+		stage: "candidate-evaluation",
+		candidate_revision: CURL_REPAIR_CANDIDATE_REVISION,
 		candidate_tree: CURL_REPAIR_CANDIDATE_TREE_SHA,
 		image_digest: CURL_REPAIR_V2_IMAGE_DIGEST, worker_receipt_sha256: workerHash,
 		candidate_artifact_sha256: artifactHash, test_ids: [3037, 3038, 5033],
@@ -49,15 +62,19 @@ function evaluatorReceipt(): CurlRepairV2EvaluatorReceipt {
 		created_at_unix: 1, signature: sha256("signature") }
 }
 
-async function baseReceipt(candidate: Awaited<ReturnType<typeof buildCurlHistoricalRepairTestFixture>>) {
-	return await evaluateCurlHistoricalRepairCandidate({ candidate, jobId: claim.jobId,
+async function baseReceipt(
+	candidate: Awaited<ReturnType<typeof buildCurlHistoricalRepairTestFixture>>,
+): Promise<Awaited<ReturnType<typeof evaluateCurlHistoricalRepairCandidate>>> {
+	return await evaluateCurlHistoricalRepairCandidate({
+		candidate, jobId: claim.jobId,
 		buildCandidate: async () => candidate,
 		evaluateFixedProof: async () => ({ schemaVersion: 1, accepted: true,
-			disposition: "already-fixed", evidenceSha256: sha256("proof"),
+			disposition: "already-fixed",
+		evidenceSha256: sha256("proof"),
 			reasonCode: "fixed-proof-verified" }) })
 }
 
-async function v2EvidenceCombinesFreshJobBoundStagesWithPinnedProof(): Promise<void> {
+async function v2EvidenceBindsFreshStagesToPinnedProof(): Promise<void> {
 	const candidate = await buildCurlHistoricalRepairTestFixture()
 	const result = await evaluateCurlHistoricalRepairV2({ candidate,
 		...claim,
@@ -66,7 +83,10 @@ async function v2EvidenceCombinesFreshJobBoundStagesWithPinnedProof(): Promise<v
 		evaluateBase: async () => await baseReceipt(candidate) })
 	assert.equal(result.disposition, "historical-fix-qualified")
 	assert.equal(result.proofMode, "fresh-job-bound-isolated-regression")
-	assert.equal(result.execution.evaluatorDigest, CURL_REPAIR_V2_EVALUATOR_DIGEST)
+	assert.equal(
+		result.execution.evaluatorDigest,
+		CURL_REPAIR_V2_EVALUATOR_DIGEST,
+	)
 	assert.deepEqual(result.execution.testIds, CURL_REPAIR_V2_TEST_IDS)
 	assert.equal(result.execution.candidateArtifactSha256, artifactHash)
 	assert.match(result.evidenceSha256, /^[a-f0-9]{64}$/)
@@ -76,11 +96,13 @@ async function v2EvidenceCombinesFreshJobBoundStagesWithPinnedProof(): Promise<v
 
 async function v2EvidenceRejectsDetachedClaimOrWorkerArtifact(): Promise<void> {
 	const candidate = await buildCurlHistoricalRepairTestFixture()
-	await assert.rejects(evaluateCurlHistoricalRepairV2({ candidate,
+	await assert.rejects(evaluateCurlHistoricalRepairV2({
+		candidate,
 		...claim, claimId: "33333333-3333-4333-8333-333333333333",
 		worker: { receipt: workerReceipt(), receiptFileSha256: workerHash },
 		evaluator: { receipt: evaluatorReceipt(), receiptFileSha256: evaluatorHash },
-		evaluateBase: async () => await baseReceipt(candidate) }), /claim and candidate bindings/)
+		evaluateBase: async () => await baseReceipt(candidate),
+	}), /execution receipt bindings are invalid/)
 }
 
 function sha256(value: string): string {
@@ -88,8 +110,14 @@ function sha256(value: string): string {
 }
 
 const tests: readonly SuiteTest[] = [
-	["v2 receipt binds fresh isolated regression stages to the pinned proof", v2EvidenceCombinesFreshJobBoundStagesWithPinnedProof],
-	["v2 receipt rejects detached claim and worker artifact", v2EvidenceRejectsDetachedClaimOrWorkerArtifact],
+	[
+		"v2 receipt binds fresh isolated regression stages to the pinned proof",
+		v2EvidenceBindsFreshStagesToPinnedProof,
+	],
+	[
+		"v2 receipt rejects detached claim and worker artifact",
+		v2EvidenceRejectsDetachedClaimOrWorkerArtifact,
+	],
 ]
 
 await runMain("repository-curl-repair-v2", tests)

@@ -1,6 +1,12 @@
-import type { CURL_REPAIR_V2_IMAGE_DIGEST, CURL_REPAIR_V2_PROFILE_ID } from "./repository-curl-repair-v2-profile.js"
-import type { CURL_REPAIR_CANDIDATE_REVISION, CURL_REPAIR_CANDIDATE_TREE_SHA,
-	CURL_REPAIR_SOURCE_REVISION } from "./repository-curl-repair.js"
+import type {
+	CURL_REPAIR_V2_IMAGE_DIGEST,
+	CURL_REPAIR_V2_PROFILE_ID,
+} from "./repository-curl-repair-v2-profile.js"
+import type {
+	CURL_REPAIR_CANDIDATE_REVISION,
+	CURL_REPAIR_CANDIDATE_TREE_SHA,
+	CURL_REPAIR_SOURCE_REVISION,
+} from "./repository-curl-repair.js"
 
 export interface CurlRepairV2ClaimIdentity {
 	jobId: string
