@@ -19,22 +19,33 @@ import {
 	CURL_REPAIR_V2_LIFETIME_ALLOCATION,
 	CURL_REPAIR_V2_RESERVATION,
 } from "../repository-curl-repair-v2-profile.js"
-import { makeCurlRepairV2Definition } from "./curl-repair-v2-campaign-fixture.js"
+import {
+	makeCurlRepairV2Definition,
+} from "./curl-repair-v2-campaign-fixture.js"
 import { runMain, type SuiteTest } from "../../test-runner.js"
 
-const boardRef = `http://127.0.0.1:8078/api/cards/1c25cecf-e5e8-4b68-b6fd-5d6ad25426d7#hc-repository-result-v2:${"a".repeat(64)}`
+const boardRef = boardReference("a".repeat(64))
+
+function boardReference(result: string): string {
+	const card = "1c25cecf-e5e8-4b68-b6fd-5d6ad25426d7"
+	const base = `http://127.0.0.1:8078/api/cards/${card}`
+	return `${base}#hc-repository-result-v2:${result}`
+}
 
 function authority(activeRun: boolean): RepositoryBudgetAuthority {
 	const definition = makeCurlRepairV2Definition()
 	const now = Date.now()
-	const zero = {
-		settledMicros: 0,
-		reservedMicros: 0,
-		ambiguousMicros: 0,
-		settledTokens: 0,
-		reservedTokens: 0,
-		ambiguousTokens: 0,
+	return {
+		...authorityControl(activeRun, now),
+		...authorityRunScope(activeRun, definition, now),
+		...authorityLedgers(),
 	}
+}
+
+function authorityControl(
+	activeRun: boolean,
+	now: number,
+): RepositoryBudgetAuthority {
 	return {
 		mode: activeRun ? "fleet-v2-budget-only" : "fleet-v2-readonly",
 		available: false,
@@ -48,6 +59,15 @@ function authority(activeRun: boolean): RepositoryBudgetAuthority {
 		globalEnabled: true,
 		canAdmit: true,
 		controlEpoch: 1,
+	}
+}
+
+function authorityRunScope(
+	activeRun: boolean,
+	definition: ReturnType<typeof makeCurlRepairV2Definition>,
+	now: number,
+): Partial<RepositoryBudgetAuthority> {
+	return {
 		runId: activeRun ? "boardref-test-run" : null,
 		runExpiresAtMs: activeRun ? now + 300_000 : null,
 		repositoryCampaignId: definition.id,
@@ -59,13 +79,13 @@ function authority(activeRun: boolean): RepositoryBudgetAuthority {
 		profileId: "no-model",
 		repositoryEnabled: true,
 		repositoryEpoch: 1,
-		monthly: {
-			month: new Date().toISOString().slice(0, 7),
-			limitMicros: 5_000_000,
-			settledMicros: 0,
-			reservedMicros: 0,
-			ambiguousMicros: 0,
-		},
+	}
+}
+
+function authorityLedgers(): Partial<RepositoryBudgetAuthority> {
+	const zero = zeroLedger()
+	return {
+		monthly: authorityMonthly(),
 		campaignLifetime: {
 			limitMicros: 20_000,
 			limitTokens: 108_000,
@@ -77,6 +97,29 @@ function authority(activeRun: boolean): RepositoryBudgetAuthority {
 			limitTokens: CURL_REPAIR_V2_LIFETIME_ALLOCATION.tokens,
 			...zero,
 		},
+	}
+}
+
+function zeroLedger(): NonNullable<
+	RepositoryBudgetAuthority["legacyLifetime"]
+> {
+	return {
+		settledMicros: 0,
+		reservedMicros: 0,
+		ambiguousMicros: 0,
+		settledTokens: 0,
+		reservedTokens: 0,
+		ambiguousTokens: 0,
+	}
+}
+
+function authorityMonthly(): NonNullable<RepositoryBudgetAuthority["monthly"]> {
+	return {
+		month: new Date().toISOString().slice(0, 7),
+		limitMicros: 5_000_000,
+		settledMicros: 0,
+		reservedMicros: 0,
+		ambiguousMicros: 0,
 	}
 }
 
@@ -100,52 +143,82 @@ function pinnedIntake(): {
 	}
 }
 
+type BoardRefClaim = NonNullable<
+	Awaited<ReturnType<RepositoryCampaignStore["claimNext"]>>
+>
+
 async function v2BoardReferenceSurvivesClaimFinishAndReload(): Promise<void> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-v2-boardref-"))
 	const file = path.join(root, "state.json")
-	let activeRun = false
+	const box = { current: false }
 	const store = new RepositoryCampaignStore(
 		file,
 		[makeCurlRepairV2Definition()],
-		() => authority(activeRun),
+		() => authority(box.current),
 	)
 	try {
-		await store.setCampaignBudget(
-			CURL_REPAIR_V2_CAMPAIGN_ID,
-			CURL_REPAIR_V2_LIFETIME_ALLOCATION.micros,
-			CURL_REPAIR_V2_LIFETIME_ALLOCATION.tokens,
-		)
-		await store.start(CURL_REPAIR_V2_CAMPAIGN_ID)
-		await store.observeKnownRepairAdvisoryV2(pinnedIntake())
-		activeRun = true
-		const claim = await store.claimNext(
-			CURL_REPAIR_V2_CAMPAIGN_ID,
-			CURL_REPAIR_V2_RESERVATION,
-			new Date(),
-			{ executionKind: "live-cve" },
-		)
-		assert.ok(claim)
-		await assert.rejects(
-			store.updateClaimProgress(claim!, progress("https://example.com")),
-			/campaign progress update is invalid/,
-		)
-		await store.updateClaimProgress(claim!, progress(boardRef))
-		await store.finish(claim!, {
-			status: "succeeded",
-			actualMicros: 0,
-			actualTokens: 0,
-			progress: { boardRef },
-		})
-		const reopened = new RepositoryCampaignStore(
-			file,
-			[makeCurlRepairV2Definition()],
-			() => authority(activeRun),
-		)
-		const view = await reopened.recoveryView(claim!.job.id)
-		assert.equal(view.job?.progress?.boardRef, boardRef)
+		await startBoardRefRun(store)
+		box.current = true
+		const claim = await claimBoardRefRun(store)
+		await finishBoardRefClaim(store, claim)
+		await assertBoardRefReloaded(file, box, claim)
 	} finally {
 		await fs.rm(root, { recursive: true, force: true })
 	}
+}
+
+async function startBoardRefRun(store: RepositoryCampaignStore): Promise<void> {
+	await store.setCampaignBudget(
+		CURL_REPAIR_V2_CAMPAIGN_ID,
+		CURL_REPAIR_V2_LIFETIME_ALLOCATION.micros,
+		CURL_REPAIR_V2_LIFETIME_ALLOCATION.tokens,
+	)
+	await store.start(CURL_REPAIR_V2_CAMPAIGN_ID)
+	await store.observeKnownRepairAdvisoryV2(pinnedIntake())
+}
+
+async function claimBoardRefRun(
+	store: RepositoryCampaignStore,
+): Promise<BoardRefClaim> {
+	const claim = await store.claimNext(
+		CURL_REPAIR_V2_CAMPAIGN_ID,
+		CURL_REPAIR_V2_RESERVATION,
+		new Date(),
+		{ executionKind: "live-cve" },
+	)
+	if (!claim) throw new Error("boardref fixture produced no claim")
+	return claim
+}
+
+async function finishBoardRefClaim(
+	store: RepositoryCampaignStore,
+	claim: BoardRefClaim,
+): Promise<void> {
+	await assert.rejects(
+		store.updateClaimProgress(claim, progress("https://example.com")),
+		/campaign progress update is invalid/,
+	)
+	await store.updateClaimProgress(claim, progress(boardRef))
+	await store.finish(claim, {
+		status: "succeeded",
+		actualMicros: 0,
+		actualTokens: 0,
+		progress: { boardRef },
+	})
+}
+
+async function assertBoardRefReloaded(
+	file: string,
+	box: { current: boolean },
+	claim: BoardRefClaim,
+): Promise<void> {
+	const reopened = new RepositoryCampaignStore(
+		file,
+		[makeCurlRepairV2Definition()],
+		() => authority(box.current),
+	)
+	const view = await reopened.recoveryView(claim.job.id)
+	assert.equal(view.job?.progress?.boardRef, boardRef)
 }
 
 function progress(ref: string): {
@@ -157,13 +230,18 @@ function progress(ref: string): {
 	return {
 		stage: "deliver" as const,
 		currentTask: "Record the private result",
-		completedSteps: ["intake", "deduplicate", "investigate", "prepare-candidate", "verify"],
+		completedSteps: [
+			"intake", "deduplicate", "investigate", "prepare-candidate", "verify",
+		],
 		boardRef: ref,
 	}
 }
 
 const tests: readonly SuiteTest[] = [
-	["v2 board reference survives a claim, finish, and reload", v2BoardReferenceSurvivesClaimFinishAndReload],
+	[
+		"v2 board reference survives a claim, finish, and reload",
+		v2BoardReferenceSurvivesClaimFinishAndReload,
+	],
 ]
 
 await runMain("repository-campaign-v2-boardref", tests)
