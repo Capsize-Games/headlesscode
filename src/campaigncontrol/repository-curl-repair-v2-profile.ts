@@ -22,7 +22,7 @@ export const CURL_REPAIR_V2_LIFETIME_ALLOCATION = Object.freeze({
 	 micros: 400, tokens: 500,
 })
 export const CURL_REPAIR_V2_HELPER_SHA256 =
-	"f7bbe5b12a443107eb4eeb2920c7fb70a0ac76b6c9342bf76678644adc9e4fad"
+	"66f15251c010589245ddb397ee431b30bac9ab6b8e99b42b20843d9ae3e6bfc6"
 export const CURL_REPAIR_V2_IMAGE_DIGEST =
 	"8924c5d2afd16f45d34a32f34de613ed7146a9557d07deb9edc83588d2dfdc04"
 export const CURL_REPAIR_V2_TEST_IDS = Object.freeze([3037, 3038, 5033])
