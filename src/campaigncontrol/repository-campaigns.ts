@@ -1327,6 +1327,40 @@ export class RepositoryCampaignStore {
 		}, now)
 	}
 
+	/** Atomically record the one pinned Debian repair snapshot and queue it once across polls and restarts. */
+	async observeKnownRepairAdvisory(input: { campaignId: string; advisoryId: string; publicBaseRevision: string; snapshotSha256: string;
+		sourceUrl: string; sourceContentSha256: string; affectedRange: string }, now = new Date()): Promise<{ changed: boolean; queued: boolean; job: RepositoryCampaignJob; record: RepositoryAdvisoryIntakeRecord }> {
+		if (input.campaignId !== CURL_REPAIR_CAMPAIGN_ID || input.advisoryId !== CURL_FIXED_ADVISORY || input.publicBaseRevision !== CURL_DEBIAN_PUBLIC_BASE_REVISION ||
+			input.snapshotSha256 !== CURL_DEBIAN_SNAPSHOT_SHA256 || input.sourceUrl !== CURL_DEBIAN_SOURCE_URL ||
+			input.sourceContentSha256 !== CURL_DEBIAN_SOURCE_HTML_SHA256 || input.affectedRange !== CURL_DEBIAN_AFFECTED_RANGE) {
+			throw new Error("known advisory repair observation is outside the owner-approved Curl snapshot")
+		}
+		this.requireDefinition(input.campaignId)
+		return this.update((s) => {
+			s.intakeRecords ??= []
+			const existing = s.intakeRecords.find((row) => row.campaignId === input.campaignId && row.publicBaseRevision === input.publicBaseRevision &&
+				row.advisoryId === input.advisoryId && row.source === "debian-tracker-repair-snapshot")
+			if (existing) {
+				if (!validPinnedDebianIntake(existing) || existing.disposition !== "eligible" || !existing.jobId) throw new Error("known Curl repair intake record is incomplete or changed")
+				const prior = s.jobs.find((job) => job.id === existing.jobId)
+				if (!prior || !validRepairJob(prior, s)) throw new Error("known Curl repair intake lost its durable job")
+				return { changed: false, queued: false, job: structuredClone(prior), record: { ...existing } }
+			}
+			const campaign = s.campaigns[input.campaignId]
+			if (!campaign?.enabled) throw new Error("known advisory repair requires an enabled campaign")
+			if (s.jobs.length >= MAX_JOBS || s.intakeRecords.length >= MAX_INTAKE_RECORDS) throw new Error("known advisory repair storage limit reached")
+			const job: RepositoryCampaignJob = { id: randomUUID(), campaignId: input.campaignId, advisoryId: input.advisoryId, status: "queued",
+				epoch: campaign.epoch, createdAt: now.getTime(), updatedAt: now.getTime(), month: s.month,
+				reservedMicros: 0, settledMicros: 0, reservedTokens: 0, settledTokens: 0, purpose: "repair" }
+			const record: RepositoryAdvisoryIntakeRecord = { campaignId: input.campaignId, publicBaseRevision: input.publicBaseRevision,
+				advisoryId: input.advisoryId, snapshotSha256: input.snapshotSha256, disposition: "eligible", firstSeenAt: now.getTime(),
+				lastSeenAt: now.getTime(), jobId: job.id, source: "debian-tracker-repair-snapshot", sourceUrl: input.sourceUrl,
+				sourceContentSha256: input.sourceContentSha256 }
+			s.jobs.push(job); s.intakeRecords.push(record)
+			return { changed: true, queued: true, job: structuredClone(job), record: { ...record } }
+		}, now)
+	}
+
 	/** Reserve aggregate and per-campaign capacity before handing a job to a mock dispatcher. */
 	async claimNext(id: string, reservation: { micros: number; tokens: number }, now = new Date(),
 		mode: { executionKind: RepositoryJobProgress["executionKind"]; requiredSteps?: readonly RepositoryCampaignStep[] } = { executionKind: "development-checkpoint" }): Promise<ClaimedRepositoryJob | undefined> {

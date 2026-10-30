@@ -35,6 +35,7 @@ export const CURL_REPAIR_PROTECTED_RECEIPT_SHA256 = "e09bc19de4c667feac255e31d50
 export const CURL_REPAIR_PROTECTED_ARTIFACT_MANIFEST_SHA256 = "8e48963669c8898efda99ddf3e770fe4712f63b3210e4f75d0820934b398a759"
 export const CURL_REPAIR_DELIVERY_POLICY_SHA256_PIN = "43549dbb21dd6677777b276855d6ee5445b5c2fb39cbe8988b951f32d7ecec69"
 export const CURL_REPAIR_RESERVATION = Object.freeze({ micros: 1, tokens: 1 })
+export const CURL_REPAIR_PRIVATE_SOURCE_ROOT = path.join(os.homedir(), ".local", "share", "headlesscode", "repository-sources", "curl-maintenance")
 
 const REPAIR_PROFILE_PINS = Object.freeze({
 	campaignId: CURL_REPAIR_CAMPAIGN_ID,
@@ -125,6 +126,22 @@ export function curlHistoricalRepairCandidateSha256(candidate: CurlHistoricalRep
 		patchPath: candidate.patchPath, patchBytes: candidate.patchBytes, patchSha256: candidate.patchSha256,
 		sourceEnvelopeSha256: candidate.sourceEnvelopeSha256, artifactManifestSha256: candidate.artifactManifestSha256,
 		protectedProof: candidate.protectedProof }))
+}
+
+/** Verify the owner-private source pin before automatic repair intake may admit work. */
+export async function verifyCurlHistoricalRepairSourcePin(sourceRoot = CURL_REPAIR_PRIVATE_SOURCE_ROOT): Promise<void> {
+	const root = path.resolve(sourceRoot)
+	const info = await fs.promises.lstat(root)
+	if (!info.isDirectory() || info.isSymbolicLink() || (typeof process.getuid === "function" && info.uid !== process.getuid())) {
+		throw new Error("private Curl source checkout is unavailable")
+	}
+	const [head, tree, status, shallow] = await Promise.all([
+		git(root, "rev-parse", "HEAD"), git(root, "rev-parse", "HEAD^{tree}"),
+		git(root, "status", "--porcelain"), git(root, "rev-parse", "--is-shallow-repository"),
+	])
+	if (head !== CURL_REPAIR_SOURCE_REVISION || tree !== CURL_REPAIR_SOURCE_TREE_SHA || status !== "" || shallow !== "false") {
+		throw new Error("private Curl source pin changed or is not a clean full-history checkout")
+	}
 }
 
 /** Extract only the one reviewed b31→c24 patch from a clean owner-private full-history checkout. */

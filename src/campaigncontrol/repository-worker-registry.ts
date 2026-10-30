@@ -111,9 +111,10 @@ export function bindRepositoryWorkerRegistrations(
 			throw new Error("code-owned repository pipeline factory returned an unbound adapter")
 		}
 		const worker = createRepositoryWorkerPipeline(adapters)
+		if (worker.advisoryIntake) return worker
 		const source = PUBLIC_INTAKE_PINS[registration.pipelineAdapterId]
 		if (!source) return worker
-		return { ...worker, advisoryIntake: { publicBaseRevision: source.publicBaseRevision,
+		return { ...worker, advisoryIntake: { source: "osv-commit-query" as const, publicBaseRevision: source.publicBaseRevision,
 			supportedAdvisoryIds: source.supportedAdvisoryIds, poll: () => new OsvCommitAdvisoryIntake().poll(source.publicBaseRevision) } }
 	})
 }

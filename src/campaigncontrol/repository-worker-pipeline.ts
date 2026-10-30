@@ -1,5 +1,5 @@
 import type { ClaimedRepositoryJob, RepositoryCampaignDefinition, RepositoryCampaignStep, RepositoryEvidenceRef } from "./repository-campaigns.js"
-import type { RegisteredRepositoryWorker, RepositoryWorkerExecutionResult } from "./repository-coordinator.js"
+import type { RegisteredRepositoryWorker, RepositoryAdvisoryIntake, RepositoryWorkerExecutionResult } from "./repository-coordinator.js"
 import type { VettedAdvisorySnapshot } from "./repository-worker.js"
 import type { CurlHistoricalRepairCandidate } from "./repository-curl-repair.js"
 import type { CurlHistoricalRepairReceipt } from "./repository-curl-repair-evaluator.js"
@@ -35,6 +35,7 @@ export interface RepositoryWorkerPipelineAdapters {
 	readonly model: string
 	readonly executionKind: "development-checkpoint" | "live-cve"
 	readonly reservation: { readonly micros: number; readonly tokens: number }
+	readonly advisoryIntake?: RepositoryAdvisoryIntake
 	lookupAdvisory(advisoryId: string, definition: RepositoryCampaignDefinition): Promise<VettedAdvisorySnapshot>
 	prepareWorkspace(input: { definition: RepositoryCampaignDefinition; claim: ClaimedRepositoryJob; advisory: VettedAdvisorySnapshot }): Promise<RepositoryPreparedWorkspace>
 	evaluate(input: { definition: RepositoryCampaignDefinition; claim: ClaimedRepositoryJob; advisory: VettedAdvisorySnapshot; workspace: RepositoryPreparedWorkspace; candidateSha256: string }): Promise<RepositoryVerificationReceipt>
@@ -68,6 +69,7 @@ export function createRepositoryWorkerPipeline(adapters: RepositoryWorkerPipelin
 	return {
 		workerProfile: adapters.workerProfile, recipeDigest: adapters.recipeDigest, evaluatorDigest: adapters.evaluatorDigest,
 		model: adapters.model, executionKind: adapters.executionKind, reservation: { ...adapters.reservation },
+		...(adapters.advisoryIntake ? { advisoryIntake: adapters.advisoryIntake } : {}),
 		async execute({ definition, claim, signal, progress }): Promise<RepositoryWorkerExecutionResult> {
 			let evidenceRefs: RepositoryEvidenceRef[] = []
 			let completedSteps: RepositoryCampaignStep[] = []

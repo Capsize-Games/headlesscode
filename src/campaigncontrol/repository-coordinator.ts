@@ -10,6 +10,11 @@ import {
 import type { ActiveCampaignRun } from "./store.js"
 import type { RepositoryCampaignRunLease } from "./repository-run-lease.js"
 import type { PublishedAdvisoryRecord } from "./repository-advisory-intake.js"
+import type { KnownCurlDebianAdvisory } from "./repository-known-advisory.js"
+
+export type RepositoryAdvisoryIntake =
+	| { source: "osv-commit-query"; publicBaseRevision: string; supportedAdvisoryIds: readonly string[]; poll(): Promise<PublishedAdvisoryRecord[]> }
+	| { source: "debian-tracker-repair-snapshot"; publicBaseRevision: string; poll(): Promise<KnownCurlDebianAdvisory>; verifySource(): Promise<void> }
 
 export interface RepositoryWorkerExecutionResult {
 	status: "succeeded" | "failed" | "ambiguous"
@@ -30,7 +35,7 @@ export interface RegisteredRepositoryWorker {
 	readonly evaluatorDigest: string
 	readonly model: string
 	readonly executionKind: "development-checkpoint" | "live-cve"
-	readonly advisoryIntake?: { readonly publicBaseRevision: string; readonly supportedAdvisoryIds: readonly string[]; poll(): Promise<PublishedAdvisoryRecord[]> }
+	readonly advisoryIntake?: RepositoryAdvisoryIntake
 	readonly reservation: { readonly micros: number; readonly tokens: number }
 	execute(input: {
 		definition: RepositoryCampaignDefinition
@@ -66,6 +71,7 @@ export class RepositoryCampaignCoordinator {
 	private readonly intakePollAt = new Map<string, number>()
 	private readonly intakeErrors = new Map<string, number>()
 	private readonly intakeOutcomes = new Map<string, "empty" | "observed" | "unavailable">()
+	private readonly intakePrerequisiteErrors = new Map<string, string>()
 
 	constructor(private readonly store: RepositoryCampaignStore, private readonly workers: readonly RegisteredRepositoryWorker[],
 		private readonly pollMs = MAX_POLL_MS, private readonly runLease?: RepositoryCampaignRunLease) {
@@ -80,9 +86,14 @@ export class RepositoryCampaignCoordinator {
 
 	readiness(definition: RepositoryCampaignDefinition): RepositoryRuntimeReadiness {
 		if (this.lastFailure?.kind === "store-unavailable") return { state: "blocked-prerequisite", reasons: ["repository-coordinator-store-unavailable"] }
+		const intakePrerequisiteError = this.intakePrerequisiteErrors.get(definition.id)
+		if (intakePrerequisiteError) return { state: "blocked-prerequisite", reasons: [intakePrerequisiteError] }
 		const matches = this.workers.filter((worker) => worker.workerProfile === definition.workerProfile)
 		if (!matches.length) return { state: "blocked-prerequisite", reasons: ["contained-worker-adapter-unregistered", "protected-evaluator-unregistered", "private-delivery-adapter-unregistered"] }
 		if (matches.length !== 1 || !identityMatches(definition, matches[0]!)) return { state: "blocked-prerequisite", reasons: ["worker-recipe-evaluator-identity-mismatch"] }
+		if (matches[0]!.advisoryIntake?.source === "debian-tracker-repair-snapshot" && this.intakeErrors.has(definition.id)) {
+			return { state: "blocked-prerequisite", reasons: ["debian-repair-intake-unavailable"] }
+		}
 		if (!definition.repositoryId || !definition.repository) return { state: "blocked-prerequisite", reasons: ["private-repository-identity-unavailable"] }
 		if (matches[0]!.executionKind === "live-cve" && !this.runLease) return { state: "blocked-prerequisite", reasons: ["global-campaign-run-lease-unavailable"] }
 		return { state: "ready", reasons: [] }
@@ -92,10 +103,12 @@ export class RepositoryCampaignCoordinator {
 		return this.workers.some((worker) => worker.executionKind === "live-cve") ? "registered-live-cve" : "offline-synthetic-only"
 	}
 
-	intakeStatus(campaignId: string): { source: "osv-commit-query" | "unavailable"; coverage: "partial" | "unavailable"; state: "not-configured" | "waiting" | "empty" | "observed" | "unavailable"; lastPollAt: number | null } {
+	intakeStatus(campaignId: string): { source: "osv-commit-query" | "debian-tracker-repair-snapshot" | "unavailable"; coverage: "partial" | "pinned-snapshot" | "unavailable"; state: "not-configured" | "waiting" | "empty" | "observed" | "unavailable"; lastPollAt: number | null } {
 		const worker = this.workers.find((item) => item.workerProfile === this.store.registeredDefinitions().find((definition) => definition.id === campaignId)?.workerProfile)
 		if (!worker?.advisoryIntake) return { source: "unavailable", coverage: "unavailable", state: "not-configured", lastPollAt: null }
-		return { source: "osv-commit-query", coverage: "partial", state: this.intakeErrors.has(campaignId) ? "unavailable" : this.intakeOutcomes.get(campaignId) ?? "waiting",
+		const intake = worker.advisoryIntake
+		return { source: intake.source, coverage: intake.source === "osv-commit-query" ? "partial" : "pinned-snapshot",
+			state: this.intakeErrors.has(campaignId) || this.intakePrerequisiteErrors.has(campaignId) ? "unavailable" : this.intakeOutcomes.get(campaignId) ?? "waiting",
 			lastPollAt: this.intakePollAt.get(campaignId) ?? null }
 	}
 
@@ -134,6 +147,7 @@ export class RepositoryCampaignCoordinator {
 		for (const definition of status.campaigns) {
 			if (this.active.size >= MAX_CONCURRENT_WORKERS || this.stopped) break
 			if (!this.intakeCampaignEnabled(definition, status.campaigns)) continue
+			if (!await this.verifyIntakePrerequisite(definition)) continue
 			await this.pollIntake(definition)
 			const refreshed = await this.readStatus()
 			await this.startQueuedJob(definition, refreshed)
@@ -163,19 +177,47 @@ export class RepositoryCampaignCoordinator {
 		if (!intake || worker.executionKind !== "live-cve" || Date.now() - (this.intakePollAt.get(definition.id) ?? 0) < INTAKE_POLL_MS) return
 		this.intakePollAt.set(definition.id, Date.now())
 		try {
-			const records = await intake.poll()
-			for (const record of records) await this.store.observePublishedAdvisory({ campaignId: definition.id,
-				publicBaseRevision: intake.publicBaseRevision, advisoryId: record.advisoryId,
-				snapshotSha256: record.snapshotSha256, eligible: intake.supportedAdvisoryIds.includes(record.advisoryId) })
+			if (intake.source === "debian-tracker-repair-snapshot") {
+				const record = await intake.poll()
+				await this.store.observeKnownRepairAdvisory({ campaignId: definition.id, publicBaseRevision: intake.publicBaseRevision,
+					advisoryId: record.advisoryId, snapshotSha256: record.snapshotSha256, sourceUrl: record.sourceUrl,
+					sourceContentSha256: record.sourceHtmlSha256, affectedRange: record.affectedRange })
+				this.intakeOutcomes.set(definition.id, "observed")
+			} else {
+				const records = await intake.poll()
+				for (const record of records) await this.store.observePublishedAdvisory({ campaignId: definition.id,
+					publicBaseRevision: intake.publicBaseRevision, advisoryId: record.advisoryId,
+					snapshotSha256: record.snapshotSha256, eligible: intake.supportedAdvisoryIds.includes(record.advisoryId) })
+				this.intakeOutcomes.set(definition.id, records.length ? "observed" : "empty")
+			}
 			this.intakeErrors.delete(definition.id)
-			this.intakeOutcomes.set(definition.id, records.length ? "observed" : "empty")
+			this.intakePrerequisiteErrors.delete(definition.id)
 		} catch {
 			this.intakeErrors.set(definition.id, Date.now())
 			this.intakeOutcomes.set(definition.id, "unavailable")
+			if (intake.source === "debian-tracker-repair-snapshot") this.intakePrerequisiteErrors.set(definition.id, "debian-repair-intake-unavailable")
+		}
+	}
+
+	private async verifyIntakePrerequisite(definition: RepositoryCampaignDefinition): Promise<boolean> {
+		const worker = this.workers.find((entry) => identityMatches(definition, entry))
+		const intake = worker?.advisoryIntake
+		if (!intake || intake.source !== "debian-tracker-repair-snapshot") return true
+		try {
+			await intake.verifySource()
+			this.intakePrerequisiteErrors.delete(definition.id)
+			return true
+		} catch {
+			this.intakePrerequisiteErrors.set(definition.id, "private-source-pin-changed-or-unavailable")
+			this.intakeOutcomes.set(definition.id, "unavailable")
+			return false
 		}
 	}
 
 	private async startQueuedJob(definition: RepositoryCampaignDefinition, status: { campaigns: RepositoryCampaignDefinition[]; jobs: RepositoryCampaignJob[] }): Promise<void> {
+		if (!await this.verifyIntakePrerequisite(definition)) return
+		const registered = this.workers.find((entry) => identityMatches(definition, entry))
+		if (registered?.advisoryIntake?.source === "debian-tracker-repair-snapshot" && this.intakeErrors.has(definition.id)) return
 		const worker = this.eligibleWorker(definition, status)
 		if (!worker || !await this.ensureRun(worker)) return
 		const claim = await this.store.claimNext(definition.id, worker.reservation, new Date(), { executionKind: worker.executionKind })

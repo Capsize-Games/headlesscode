@@ -340,7 +340,7 @@ async function testPublishedIntakeQueuesOnceAcrossPollsAndCoordinatorRestart(): 
 		})
 		const intakeRecord = { advisoryId: "CVE-2026-1262", snapshotSha256: digest("d"), sourceUrl: "https://osv.dev/vulnerability/CVE-2026-1262",
 			summary: "Fixture published advisory", affectedRange: "< 1.0" }
-		const liveWorker = { ...worker, advisoryIntake: { publicBaseRevision: "e".repeat(40), supportedAdvisoryIds: ["CVE-2026-1262"],
+		const liveWorker = { ...worker, advisoryIntake: { source: "osv-commit-query" as const, publicBaseRevision: "e".repeat(40), supportedAdvisoryIds: ["CVE-2026-1262"],
 			async poll(): Promise<PublishedAdvisoryRecord[]> { polls++; return [intakeRecord] } } }
 		const lease = { async acquire(): Promise<null> { return null }, async finish(value: ActiveCampaignRun, status: "succeeded" | "failed"): ReturnType<RepositoryCampaignRunLease["finish"]> { return { ...value, status, finishedAt: Date.now() } } }
 		const first = new RepositoryCampaignCoordinator(store, [liveWorker], 100, lease)

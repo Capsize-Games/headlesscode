@@ -124,6 +124,8 @@ async function testBuiltInCurlAdapterReceivesItsPinnedPublicAdvisoryIntake(): Pr
 			"the built-in Curl worker must have an intake poller")
 		assert.equal(worker.advisoryIntake.publicBaseRevision,
 			"ce57339379d82d29637b4752979e54128b6b2348")
+		assert.equal(worker.advisoryIntake.source, "osv-commit-query",
+			"the read-only qualification profile keeps its OSV source label")
 		assert.deepEqual(worker.advisoryIntake.supportedAdvisoryIds, [],
 			"the read-only qualification worker must not claim OSV candidates as repair work")
 		const observation = await store.observePublishedAdvisory({ campaignId: exactDefinition.id,
