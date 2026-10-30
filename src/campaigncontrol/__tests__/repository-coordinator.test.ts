@@ -50,9 +50,13 @@ function liveAuthority(run: ActiveCampaignRun): RepositoryBudgetAuthority {
 		legacyLifetime: emptyLifetime,
 		repositoryLifetime: { limitMicros: 20_000, limitTokens: 20_000, ...emptyLifetime } }
 }
-async function waitForTerminal(store: RepositoryCampaignStore): Promise<RepositoryCampaignJob> {
+async function waitForTerminal(
+	store: RepositoryCampaignStore,
+	advisoryId?: string,
+): Promise<RepositoryCampaignJob> {
 	for (let i = 0; i < 300; i++) {
-		const job = readStatus(await store.status()).jobs[0]
+		const jobs = readStatus(await store.status()).jobs
+		const job = advisoryId ? jobs.find((item) => item.advisoryId === advisoryId) : jobs[0]
 		if (job && job.status !== "queued" && job.status !== "running") return job
 		await new Promise<void>((resolve) => setTimeout(resolve, 10))
 	}
@@ -61,6 +65,10 @@ async function waitForTerminal(store: RepositoryCampaignStore): Promise<Reposito
 async function testCoordinatorRunsRegisteredIntakeWorkerEvaluatorDeliveryLoop(): Promise<void> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-camp-") )
 	const calls: string[] = []
+	let releaseWorker: (() => void) | undefined
+	let workerStarted: (() => void) | undefined
+	const workerGate = new Promise<void>((resolve) => { releaseWorker = resolve })
+	const workerEntered = new Promise<void>((resolve) => { workerStarted = resolve })
 	try {
 		const store = new RepositoryCampaignStore(path.join(root, "state.json"),
 			[definition], () => ({ mode: "synthetic-test", available: true,
@@ -77,15 +85,29 @@ async function testCoordinatorRunsRegisteredIntakeWorkerEvaluatorDeliveryLoop():
 				snapshotSha256: digest("d"), summary: "Offline fixture only",
 					affectedRange: "< 1.0", fixedVersion: "1.0",
 						verificationCheckIds: ["fixture-check"] } },
-			async prepareWorkspace(): ReturnType<RepositoryWorkerPipelineAdapters["prepareWorkspace"]> { calls.push("prepare"); return { worktree: root,
+			async prepareWorkspace({ claim }): ReturnType<RepositoryWorkerPipelineAdapters["prepareWorkspace"]> { calls.push("prepare"); return { worktree: root,
 				taskSha256: digest("e"),
-				async runContained(): ReturnType<RepositoryPreparedWorkspace["runContained"]> { calls.push("contained-worker"); return { ok: true,
-					durationMs: 12, outputSha256: digest("f"), actualMicros: 0,
-						actualTokens: 0 } },
+				async runContained(): ReturnType<RepositoryPreparedWorkspace["runContained"]> {
+					calls.push("contained-worker")
+					if (claim.job.advisoryId === "CVE-2026-1261") return { ok: false,
+						durationMs: 4, outputSha256: digest("5"), actualMicros: 7,
+						actualTokens: 9, failureDiagnostic: "fixture worker failure" }
+					workerStarted?.()
+					await workerGate
+					return { ok: true, durationMs: 12, outputSha256: digest("f"),
+						actualMicros: 0, actualTokens: 0 }
+				},
 				async candidateSha256(): ReturnType<RepositoryPreparedWorkspace["candidateSha256"]> { return digest("1") },
 					async cleanup(): Promise<void> { calls.push("cleanup") } } },
-			async evaluate(): ReturnType<RepositoryWorkerPipelineAdapters["evaluate"]> { calls.push("evaluator"); return { passed: true,
-				evidenceSha256: digest("2"), detail: "private bounded fixture result" } },
+			async evaluate(): ReturnType<RepositoryWorkerPipelineAdapters["evaluate"]> {
+				calls.push("evaluator")
+				const status = readStatus(await store.status())
+				const active = status.jobs.find((item) => item.advisoryId === "CVE-2026-1260")!
+				assert.equal(active.progress?.stage, "verify")
+				assert.equal(active.progress?.currentTask, "Run the protected registered evaluator")
+				assert.equal(active.progress?.completedSteps.includes("prepare-candidate"), true)
+				return { passed: true, evidenceSha256: digest("2"), detail: "private bounded fixture result" }
+			},
 			async deliverPrivate(): ReturnType<RepositoryWorkerPipelineAdapters["deliverPrivate"]> { calls.push("delivery"); return { accepted: true,
 				evidenceSha256: digest("3"),
 					boardRef: `http://127.0.0.1:8078/api/cards/1c25cecf-e5e8-4b68-b6fd-5d6ad25426d7#hc-repository-result-v1:${digest("4")}` } },
@@ -93,12 +115,26 @@ async function testCoordinatorRunsRegisteredIntakeWorkerEvaluatorDeliveryLoop():
 		const coordinator = new RepositoryCampaignCoordinator(store, [worker], 100)
 		await coordinator.start()
 		try {
+			await workerEntered
+			const pending = readStatus(await store.status()).jobs[0]!
+			assert.equal(pending.progress?.stage, "prepare-candidate")
+			assert.equal(pending.progress?.currentTask, "Run the registered contained worker")
+			assert.equal(pending.progress?.completedSteps.includes("prepare-candidate"), false)
+			releaseWorker?.()
 			const completed = await waitForTerminal(store)
-			assert.equal(completed.status, "succeeded"); assert.ok(completed.progress)
+			assert.equal(completed.status, "succeeded", JSON.stringify(completed.progress)); assert.ok(completed.progress)
 			assert.deepEqual(calls, ["intake", "prepare", "contained-worker", "evaluator", "delivery", "cleanup"])
 			assert.deepEqual(completed.progress.completedSteps, ["intake", "deduplicate", "investigate", "prepare-candidate", "verify", "deliver"])
 			assert.deepEqual(completed.progress.evidenceRefs.map((entry) => entry.kind), ["intake", "candidate", "test-receipt", "delivery"])
 			assert.equal(completed.progress.boardRef, `http://127.0.0.1:8078/api/cards/1c25cecf-e5e8-4b68-b6fd-5d6ad25426d7#hc-repository-result-v1:${digest("4")}`)
+			await store.enqueue(definition.id, "CVE-2026-1261")
+			const failed = await waitForTerminal(store, "CVE-2026-1261")
+			assert.equal(failed.status, "failed")
+			assert.equal(failed.progress?.stage, "prepare-candidate")
+			assert.equal(failed.progress?.currentTask, "Run the registered contained worker")
+			assert.equal(failed.progress?.completedSteps.includes("prepare-candidate"), false)
+			assert.equal(failed.settledMicros, 7)
+			assert.equal(failed.settledTokens, 9)
 		} finally { await coordinator.stop() }
 	} finally { await fs.rm(root, { recursive: true, force: true }) }
 }

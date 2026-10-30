@@ -93,6 +93,7 @@ export function createRepositoryWorkerPipeline(adapters: RepositoryWorkerPipelin
 				completedSteps = ["intake", "deduplicate"]
 				currentStage = "investigate"
 				await progress({ stage: "investigate", currentTask: "Check the advisory against the registered source", completedSteps, evidenceRefs })
+				completedSteps = [...completedSteps, "investigate"]
 
 				if (signal.aborted) throw new Error("worker stopped before contained execution")
 				currentTask = "Prepare the bounded isolated workspace"
@@ -104,16 +105,17 @@ export function createRepositoryWorkerPipeline(adapters: RepositoryWorkerPipelin
 						(workspace.requiresContainedRepairWorker && typeof workspace.runContained !== "function") :
 						typeof workspace.runContained !== "function")) throw new Error("prepared workspace is invalid")
 				try {
-				completedSteps = ["intake", "deduplicate", "investigate", "prepare-candidate"]
-					currentStage = "verify"
 				if (claim.job.purpose === "repair" && !workspace.requiresContainedRepairWorker) {
 					actualMicros = 0
 					actualTokens = 0
-					await progress({ stage: "prepare-candidate", currentTask: "Materialize the pinned historical repair patch", completedSteps, evidenceRefs })
+					currentTask = "Materialize the pinned historical repair patch"
+					await progress({ stage: "prepare-candidate", currentTask, completedSteps, evidenceRefs })
 				} else {
 					if (signal.aborted) throw signal.reason ?? new Error("worker stopped before contained execution")
-					const task = claim.job.purpose === "repair" ? "Prepare the pinned repair in the isolated worker" : "Run the registered contained worker"
-					await progress({ stage: "prepare-candidate", currentTask: task, completedSteps, evidenceRefs })
+					currentTask = claim.job.purpose === "repair" ?
+						"Prepare the pinned repair in the isolated worker" :
+						"Run the registered contained worker"
+					await progress({ stage: currentStage, currentTask, completedSteps, evidenceRefs })
 					if (signal.aborted) throw signal.reason ?? new Error("worker stopped before contained execution")
 					const worker = await workspace.runContained(signal)
 					actualMicros = worker.actualMicros
@@ -122,7 +124,10 @@ export function createRepositoryWorkerPipeline(adapters: RepositoryWorkerPipelin
 				}
 				const candidateSha256 = requireDigest(await workspace.candidateSha256(), "candidate")
 				evidenceRefs.push(ref("candidate", "Candidate source digest", candidateSha256))
-				await progress({ stage: "verify", currentTask: "Run the protected registered evaluator", completedSteps, evidenceRefs })
+				completedSteps = [...completedSteps, "prepare-candidate"]
+				currentStage = "verify"
+				currentTask = "Run the protected registered evaluator"
+				await progress({ stage: currentStage, currentTask, completedSteps, evidenceRefs })
 				if (signal.aborted) throw new Error("worker stopped before protected evaluation")
 				const verification = await adapters.evaluate({ definition, claim, advisory, workspace, candidateSha256, signal })
 				const verificationDigest = requireDigest(verification.evidenceSha256, "verification receipt")
