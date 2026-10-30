@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { buildCurlHistoricalRepairCandidate, CURL_REPAIR_CANDIDATE_REVISION, CURL_REPAIR_CANDIDATE_TREE_SHA,
+import { CURL_REPAIR_CANDIDATE_REVISION, CURL_REPAIR_CANDIDATE_TREE_SHA,
 	CURL_REPAIR_HISTORICAL_BASE, CURL_REPAIR_PATCH_SHA256, CURL_REPAIR_PROTECTED_PROOF_EVIDENCE_SHA256,
 	CURL_REPAIR_PROFILE_ID, CURL_REPAIR_SOURCE_REVISION } from "../repository-curl-repair.js"
 import { evaluateCurlHistoricalRepairCandidate } from "../repository-curl-repair-evaluator.js"
@@ -14,9 +14,10 @@ import type { RepositoryCampaignDefinition, ClaimedRepositoryJob, RepositoryCamp
 import type { RepositoryWorkerRegistration } from "../repository-worker-registration.js"
 import type { SuiteTest } from "../../test-runner.js"
 import { runMain } from "../../test-runner.js"
+import { buildCurlHistoricalRepairTestFixture, makeCurlDebianAdvisoryTestFixture } from "./curl-historical-repair-fixture.js"
 
-async function candidateIsThePinnedHistoricalSourcePatch(): Promise<void> {
-	const candidate = await buildCurlHistoricalRepairCandidate()
+async function offlineFixtureEncodesThePinnedHistoricalSourcePatch(): Promise<void> {
+	const candidate = await buildCurlHistoricalRepairTestFixture()
 	assert.equal(candidate.sourceRevision, CURL_REPAIR_HISTORICAL_BASE)
 	assert.equal(candidate.candidateRevision, CURL_REPAIR_CANDIDATE_REVISION)
 	assert.equal(candidate.candidateTreeSha, CURL_REPAIR_CANDIDATE_TREE_SHA)
@@ -28,11 +29,12 @@ async function candidateIsThePinnedHistoricalSourcePatch(): Promise<void> {
 		["historical_base-red", "reference_fix-green", "fork_head-green", "candidate-green"])
 }
 
-async function historicalReceiptRequiresVerifiedFixedProof(): Promise<void> {
-	const candidate = await buildCurlHistoricalRepairCandidate()
+async function historicalReceiptRequiresAnAcceptedProtectedProofAdapter(): Promise<void> {
+	const candidate = await buildCurlHistoricalRepairTestFixture()
 	let receivedCandidateRevision = ""
 	let calls = 0
 	const receipt = await evaluateCurlHistoricalRepairCandidate({ candidate, jobId: "repair-fixture-001",
+		buildCandidate: async () => candidate,
 		evaluateFixedProof: async (request) => {
 			calls += 1
 			receivedCandidateRevision = request.candidateRevision
@@ -49,15 +51,17 @@ async function historicalReceiptRequiresVerifiedFixedProof(): Promise<void> {
 	assert.equal(receipt.protectedProof.evidenceSha256, CURL_REPAIR_PROTECTED_PROOF_EVIDENCE_SHA256)
 	assert.match(receipt.evidenceSha256, /^[a-f0-9]{64}$/)
 	await assert.rejects(evaluateCurlHistoricalRepairCandidate({ candidate, jobId: "repair-fixture-002",
+		buildCandidate: async () => candidate,
 		evaluateFixedProof: async () => ({ schemaVersion: 1, accepted: false, disposition: "blocked",
 			evidenceSha256: "b".repeat(64), reasonCode: "proof-invalid" }) }), /independently verified fixed regression proof/)
 }
 
 async function alteredPatchCannotBorrowProtectedProof(): Promise<void> {
-	const candidate = await buildCurlHistoricalRepairCandidate()
+	const candidate = await buildCurlHistoricalRepairTestFixture()
 	let calls = 0
 	const altered = { ...candidate, patchBase64: Buffer.from("not the reviewed patch").toString("base64") }
 	await assert.rejects(evaluateCurlHistoricalRepairCandidate({ candidate: altered, jobId: "repair-fixture-003",
+		buildCandidate: async () => candidate,
 		evaluateFixedProof: async () => {
 			calls += 1
 			return { schemaVersion: 1, accepted: true, disposition: "already-fixed",
@@ -66,9 +70,9 @@ async function alteredPatchCannotBorrowProtectedProof(): Promise<void> {
 	assert.equal(calls, 0)
 }
 
-async function repairFactoryPipelineNeverStartsAModelWorker(): Promise<void> {
+async function syntheticRepairPipelineNeverStartsAModelWorker(): Promise<void> {
 	const calls: string[] = []
-	const candidate = await buildCurlHistoricalRepairCandidate()
+	const candidate = await buildCurlHistoricalRepairTestFixture()
 	const definition: RepositoryCampaignDefinition = { id: CURL_REPAIR_CAMPAIGN_ID, name: "Historical Curl repair",
 		repositoryId: CURL_REPAIR_REPOSITORY_ID, repository: CURL_REPAIR_TARGET_REPOSITORY,
 		sourceRevision: CURL_REPAIR_SOURCE_REVISION, policySha256: CURL_REPAIR_POLICY_SHA256,
@@ -87,7 +91,9 @@ async function repairFactoryPipelineNeverStartsAModelWorker(): Promise<void> {
 	const store = { path: "/private/test/state.json", async assertClaimCurrent() { calls.push("claim-check") } } as unknown as RepositoryCampaignStore
 	const adapters = createCurlHistoricalRepairAdapters(registration, definition, { store }, {
 		buildCandidate: async () => candidate,
+		loadAdvisory: async () => makeCurlDebianAdvisoryTestFixture(),
 		evaluateCandidate: async (input) => evaluateCurlHistoricalRepairCandidate({ ...input,
+			buildCandidate: async () => candidate,
 			evaluateFixedProof: async () => ({ schemaVersion: 1, accepted: true, disposition: "already-fixed",
 				evidenceSha256: "a".repeat(64), reasonCode: "fixed-proof-verified" }) }),
 		deliverRepair: async ({ candidate: evaluated, claim }) => {
@@ -113,10 +119,10 @@ async function repairFactoryPipelineNeverStartsAModelWorker(): Promise<void> {
 }
 
 const tests: readonly SuiteTest[] = [
-	["Curl repair candidate extracts only the pinned historical b31-to-c24 patch", candidateIsThePinnedHistoricalSourcePatch],
-	["Curl repair receipt binds the historical candidate to protected fixed-proof evidence", historicalReceiptRequiresVerifiedFixedProof],
+	["offline fixture encodes only the pinned historical b31-to-c24 source patch", offlineFixtureEncodesThePinnedHistoricalSourcePatch],
+	["historical receipt requires an accepted protected-proof adapter", historicalReceiptRequiresAnAcceptedProtectedProofAdapter],
 	["modified Curl patches cannot borrow the protected proof", alteredPatchCannotBorrowProtectedProof],
-	["the registered historical repair pipeline has no model worker and measures zero usage", repairFactoryPipelineNeverStartsAModelWorker],
+	["synthetic historical repair pipeline has no model worker and measures zero usage", syntheticRepairPipelineNeverStartsAModelWorker],
 ]
 
 await runMain("repository-curl-repair", tests)

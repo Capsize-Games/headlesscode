@@ -10,7 +10,7 @@ import { CURL_DEBIAN_AFFECTED_RANGE, CURL_DEBIAN_FIXED_REVISION, CURL_DEBIAN_INT
 import { CURL_REPAIR_ADAPTER_ID, CURL_REPAIR_CAMPAIGN_ID, CURL_REPAIR_EVALUATOR_DIGEST,
 	CURL_REPAIR_POLICY_SHA256, CURL_REPAIR_PROFILE_ID, CURL_REPAIR_RECIPE_DIGEST, CURL_REPAIR_REPOSITORY_ID,
 	CURL_REPAIR_RESERVATION, CURL_REPAIR_SOURCE_REVISION, CURL_REPAIR_TARGET_REPOSITORY,
-	buildCurlHistoricalRepairCandidate } from "../repository-curl-repair.js"
+} from "../repository-curl-repair.js"
 import { evaluateCurlHistoricalRepairCandidate } from "../repository-curl-repair-evaluator.js"
 import { createCurlHistoricalRepairAdapters } from "../repository-curl-repair-runtime.js"
 import { RepositoryCampaignCoordinator } from "../repository-coordinator.js"
@@ -19,6 +19,7 @@ import type { RepositoryCampaignRunLease } from "../repository-run-lease.js"
 import type { ActiveCampaignRun } from "../store.js"
 import type { CurlRepairRuntimeDependencies } from "../repository-curl-repair-runtime.js"
 import { runMain, type SuiteTest } from "../../test-runner.js"
+import { buildCurlHistoricalRepairTestFixture } from "./curl-historical-repair-fixture.js"
 
 const qualified = { sourceAudited: true, workerQualified: true, recipeQualified: true,
 	evaluatorQualified: true, modelApproved: true, dataApproved: true, accessApproved: true }
@@ -89,7 +90,7 @@ async function registeredRepairIntakeQueuesAndSettlesOnceAcrossRestart(): Promis
 	let evaluatorCalls = 0
 	let deliveryCalls = 0
 	try {
-		const candidate = await buildCurlHistoricalRepairCandidate()
+		const candidate = await buildCurlHistoricalRepairTestFixture()
 		const advisory = snapshot()
 		const run: ActiveCampaignRun = { id: "44444444-4444-4444-8444-444444444444", epoch: 1,
 			startedAt: Date.now(), expiresAt: Date.now() + 20 * 60_000 }
@@ -102,7 +103,8 @@ async function registeredRepairIntakeQueuesAndSettlesOnceAcrossRestart(): Promis
 				verifySource: async () => { sourceChecks += 1 },
 				evaluateCandidate: async (input) => {
 					evaluatorCalls += 1
-					return await evaluateCurlHistoricalRepairCandidate({ ...input, evaluateFixedProof: async () => ({ schemaVersion: 1,
+					return await evaluateCurlHistoricalRepairCandidate({ ...input, buildCandidate: async () => candidate,
+						evaluateFixedProof: async () => ({ schemaVersion: 1,
 						accepted: true, disposition: "already-fixed", evidenceSha256: "a".repeat(64), reasonCode: "fixed-proof-verified" }) })
 				},
 				deliverRepair: async ({ claim, candidate: delivered }) => {
@@ -210,7 +212,7 @@ async function ambiguousRepairObservationNeverCreatesAReplay(): Promise<void> {
 }
 
 const tests: readonly SuiteTest[] = [
-	["registered Debian snapshot automatically queues and settles the historical already-fixed repair once across restart", registeredRepairIntakeQueuesAndSettlesOnceAcrossRestart],
+	["synthetic Debian snapshot queues and settles the historical already-fixed repair once across restart", registeredRepairIntakeQueuesAndSettlesOnceAcrossRestart],
 	["changed private Curl source pin reports a prerequisite failure and blocks new claims", changedPrivateSourcePinBlocksNewClaims],
 	["ambiguous repair intake remains durably held and is never automatically replayed", ambiguousRepairObservationNeverCreatesAReplay],
 ]

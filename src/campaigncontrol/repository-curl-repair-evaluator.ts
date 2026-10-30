@@ -44,6 +44,8 @@ export async function evaluateCurlHistoricalRepairCandidate(input: {
 	candidate: CurlHistoricalRepairCandidate
 	jobId: string
 	evaluateFixedProof?: typeof evaluatePinnedCurlCandidate
+	/** Trusted offline fixture hook; production adapters omit this and verify the owner-private source by default. */
+	buildCandidate?: typeof buildCurlHistoricalRepairCandidate
 }): Promise<CurlHistoricalRepairReceipt> {
 	const candidate = input?.candidate
 	if (!candidate || input.jobId !== input.jobId?.toLowerCase() || !/^[a-z0-9][a-z0-9._-]{0,95}$/.test(input.jobId) ||
@@ -57,7 +59,7 @@ export async function evaluateCurlHistoricalRepairCandidate(input: {
 		candidate.protectedProof.phases.join(",") !== "historical_base-red,reference_fix-green,fork_head-green,candidate-green") {
 		throw new Error("historical Curl repair candidate is outside the compiled profile")
 	}
-	const expectedCandidate = await buildCurlHistoricalRepairCandidate()
+	const expectedCandidate = await (input.buildCandidate ?? buildCurlHistoricalRepairCandidate)()
 	if (canonical(candidate) !== canonical(expectedCandidate)) throw new Error("historical Curl source patch does not match the clean pinned checkout")
 	const patch = Buffer.from(candidate.patchBase64, "base64")
 	if (patch.length !== candidate.patchBytes || createHash("sha256").update(patch).digest("hex") !== CURL_REPAIR_PATCH_SHA256) {
