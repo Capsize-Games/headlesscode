@@ -94,8 +94,19 @@ function makeReceipt(input: {
 	worker: CurlRepairV2StageReceipt<CurlRepairV2WorkerReceipt>
 	evaluator: CurlRepairV2StageReceipt<CurlRepairV2EvaluatorReceipt>
 }, base: CurlHistoricalRepairReceipt): CurlHistoricalRepairV2Receipt {
-	const evaluation = input.evaluator.receipt
-	const receiptBase: Omit<CurlHistoricalRepairV2Receipt, "evidenceSha256"> = {
+	const receiptBase = receiptBaseFor(input, base)
+	return { ...receiptBase, evidenceSha256: sha256(canonical(receiptBase)) }
+}
+
+function receiptBaseFor(input: {
+	candidate: CurlHistoricalRepairCandidate
+	jobId: string
+	claimId: string
+	epoch: number
+	worker: CurlRepairV2StageReceipt<CurlRepairV2WorkerReceipt>
+	evaluator: CurlRepairV2StageReceipt<CurlRepairV2EvaluatorReceipt>
+}, base: CurlHistoricalRepairReceipt): Omit<CurlHistoricalRepairV2Receipt, "evidenceSha256"> {
+	return {
 		schemaVersion: 2 as const,
 		disposition: "historical-fix-qualified" as const,
 		proofMode: "fresh-job-bound-isolated-regression" as const,
@@ -110,23 +121,33 @@ function makeReceipt(input: {
 		sourceEnvelopeSha256: base.sourceEnvelopeSha256,
 		artifactManifestSha256: base.artifactManifestSha256,
 		protectedProof: base.protectedProof,
-		execution: {
-			profileId: CURL_REPAIR_V2_PROFILE_ID,
-			evaluatorDigest: CURL_REPAIR_V2_EVALUATOR_DIGEST,
-			jobId: input.jobId,
-			claimId: input.claimId,
-			epoch: input.epoch,
-			workerReceiptSha256: input.worker.receiptFileSha256,
-			evaluatorReceiptSha256: input.evaluator.receiptFileSha256,
-			candidateArtifactSha256: evaluation.candidate_artifact_sha256,
-			imageDigest: evaluation.image_digest,
-			testIds: CURL_REPAIR_V2_TEST_IDS,
-			testResults: evaluation.test_results,
-			sanitizerClean: true as const,
-			cleanupConfirmed: true as const,
-		},
+		execution: executionFor(input),
 	}
-	return { ...receiptBase, evidenceSha256: sha256(canonical(receiptBase)) }
+}
+
+function executionFor(input: {
+	jobId: string
+	claimId: string
+	epoch: number
+	worker: CurlRepairV2StageReceipt<CurlRepairV2WorkerReceipt>
+	evaluator: CurlRepairV2StageReceipt<CurlRepairV2EvaluatorReceipt>
+}): CurlHistoricalRepairV2Receipt["execution"] {
+	const evaluation = input.evaluator.receipt
+	return {
+		profileId: CURL_REPAIR_V2_PROFILE_ID,
+		evaluatorDigest: CURL_REPAIR_V2_EVALUATOR_DIGEST,
+		jobId: input.jobId,
+		claimId: input.claimId,
+		epoch: input.epoch,
+		workerReceiptSha256: input.worker.receiptFileSha256,
+		evaluatorReceiptSha256: input.evaluator.receiptFileSha256,
+		candidateArtifactSha256: evaluation.candidate_artifact_sha256,
+		imageDigest: evaluation.image_digest,
+		testIds: CURL_REPAIR_V2_TEST_IDS,
+		testResults: evaluation.test_results,
+		sanitizerClean: true,
+		cleanupConfirmed: true,
+	}
 }
 
 function sha256(value: string): string { return createHash("sha256").update(value).digest("hex") }
