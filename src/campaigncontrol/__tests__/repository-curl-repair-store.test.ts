@@ -57,12 +57,15 @@ async function repairQueueUsesOnlyItsSeparateCampaignIdentity(): Promise<void> {
 async function failedVerifiedDeliveryCanBeExplicitlyRetriedOnce(): Promise<void> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-repair-retry-"))
 	const file = path.join(root, "state.json")
+	let snapshotProvisioning = false
+	let globalEnabled = true
 	const authority = (): RepositoryBudgetAuthority => {
 		const now = Date.now(), zero = { settledMicros: 0, reservedMicros: 0, ambiguousMicros: 0,
 			settledTokens: 0, reservedTokens: 0, ambiguousTokens: 0 }
-		return { mode: "fleet-v2-budget-only", available: false, snapshotOnly: true, limitMicros: 20_000, limitTokens: 108_000,
-			committedMicros: 0, committedTokens: 0, asOfMs: now, campaignId: "fleet-security-watch", globalEnabled: true,
-			canAdmit: true, controlEpoch: 1, runId: "retry_test_run", runExpiresAtMs: now + 300_000,
+		return { mode: snapshotProvisioning ? "fleet-v2-readonly" : "fleet-v2-budget-only", available: false, snapshotOnly: true, limitMicros: 20_000, limitTokens: 108_000,
+			committedMicros: 0, committedTokens: 0, asOfMs: now, campaignId: "fleet-security-watch", globalEnabled,
+			canAdmit: true, controlEpoch: 1, runId: snapshotProvisioning ? null : "retry_test_run",
+			runExpiresAtMs: snapshotProvisioning ? null : now + 300_000,
 			repositoryCampaignId: definition.id, repositoryId: definition.repositoryId, repository: definition.repository,
 			sourceRevision: definition.sourceRevision!, policySha256: definition.policySha256!, model: "none", profileId: "no-model",
 			repositoryEnabled: true, repositoryEpoch: 1,
@@ -93,12 +96,26 @@ async function failedVerifiedDeliveryCanBeExplicitlyRetriedOnce(): Promise<void>
 			blocker: "registered-pipeline-step-failed", nextStep: "review the private bounded diagnostic before any recovery", evidenceRefs })
 		await store.finish(claim!, { status: "failed", progress: { currentTask: "Record the verified result through private delivery",
 			blocker: "registered-pipeline-step-failed", nextStep: "review the private bounded diagnostic before any recovery" } })
+		await assert.rejects(store.enqueueVerifiedHistoricalRepairRetry(parent.id,
+			`CONFIRM RETRY HISTORICAL CURL DELIVERY ${parent.id}`, { candidateSha256: hex("9"), verificationSha256: hex("3") }), /evidence differs/)
+		globalEnabled = false
+		await assert.rejects(store.enqueueVerifiedHistoricalRepairRetry(parent.id,
+			`CONFIRM RETRY HISTORICAL CURL DELIVERY ${parent.id}`, { candidateSha256: hex("2"), verificationSha256: hex("3") }), /Fleet v2 repository budget snapshot is invalid/)
+		globalEnabled = true
+		await store.stop(definition.id)
+		await assert.rejects(store.enqueueVerifiedHistoricalRepairRetry(parent.id,
+			`CONFIRM RETRY HISTORICAL CURL DELIVERY ${parent.id}`, { candidateSha256: hex("2"), verificationSha256: hex("3") }), /started campaign/)
+		await store.start(definition.id)
+		snapshotProvisioning = true
 		const child = await store.enqueueVerifiedHistoricalRepairRetry(parent.id,
 			`CONFIRM RETRY HISTORICAL CURL DELIVERY ${parent.id}`, { candidateSha256: hex("2"), verificationSha256: hex("3") })
 		assert.equal(child.retryOf, parent.id)
 		assert.equal(child.purpose, "repair")
 		assert.equal(child.status, "queued")
 		const persisted = new RepositoryCampaignStore(file, [definition], authority)
+		await assert.rejects(persisted.claimNext(definition.id, CURL_REPAIR_RESERVATION, new Date(), { executionKind: "live-cve" }), /authoritative Fleet v2 registration/)
+		await assert.rejects(persisted.enqueueVerifiedHistoricalRepairRetry(child.id,
+			`CONFIRM RETRY HISTORICAL CURL DELIVERY ${child.id}`, { candidateSha256: hex("2"), verificationSha256: hex("3") }), /failed zero-cost verified Curl delivery/)
 		const status = await persisted.status() as { jobs: Array<{ id: string; status: string; retryOf?: string; purpose?: string }> }
 		assert.deepEqual(status.jobs.map(({ id, status, retryOf }) => ({ id, status, retryOf })), [
 			{ id: parent.id, status: "failed", retryOf: undefined }, { id: child.id, status: "queued", retryOf: parent.id }])
@@ -106,12 +123,58 @@ async function failedVerifiedDeliveryCanBeExplicitlyRetriedOnce(): Promise<void>
 			`CONFIRM RETRY HISTORICAL CURL DELIVERY ${parent.id}`, { candidateSha256: hex("2"), verificationSha256: hex("3") }), /already has a retry child/)
 		await assert.rejects(persisted.enqueueVerifiedHistoricalRepairRetry(parent.id, "", {
 			candidateSha256: hex("2"), verificationSha256: hex("3") }), /confirmation and evidence are required/)
+		snapshotProvisioning = false
+		const paidClaim = await persisted.claimNext(definition.id, CURL_REPAIR_RESERVATION, new Date(), { executionKind: "live-cve" })
+		assert.ok(paidClaim)
+		await persisted.updateClaimProgress(paidClaim!, { stage: "deliver", currentTask: "Record the verified result through private delivery",
+			completedSteps: ["intake", "deduplicate", "investigate", "prepare-candidate", "verify"],
+			blocker: "registered-pipeline-step-failed", nextStep: "review the private bounded diagnostic before any recovery", evidenceRefs })
+		await persisted.finish(paidClaim!, { status: "failed", actualMicros: 1, actualTokens: 1, progress: {
+			currentTask: "Record the verified result through private delivery", blocker: "registered-pipeline-step-failed",
+			nextStep: "review the private bounded diagnostic before any recovery" } })
+		await assert.rejects(persisted.enqueueVerifiedHistoricalRepairRetry(child.id,
+			`CONFIRM RETRY HISTORICAL CURL DELIVERY ${child.id}`, { candidateSha256: hex("2"), verificationSha256: hex("3") }),
+		/retry target is not the failed zero-cost verified Curl delivery attempt/)
+	} finally { await fs.rm(root, { recursive: true, force: true }) }
+}
+
+async function ambiguousRepairCannotBeRetried(): Promise<void> {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-repair-ambiguous-retry-"))
+	const zero = { settledMicros: 0, reservedMicros: 0, ambiguousMicros: 0,
+		settledTokens: 0, reservedTokens: 0, ambiguousTokens: 0 }
+	const authority = (): RepositoryBudgetAuthority => {
+		const now = Date.now()
+		return { mode: "fleet-v2-budget-only", available: false, snapshotOnly: true, limitMicros: 20_000, limitTokens: 108_000,
+			committedMicros: 0, committedTokens: 0, asOfMs: now, campaignId: "fleet-security-watch", globalEnabled: true,
+			canAdmit: true, controlEpoch: 1, runId: "retry_test_run", runExpiresAtMs: now + 300_000,
+			repositoryCampaignId: definition.id, repositoryId: definition.repositoryId, repository: definition.repository,
+			sourceRevision: definition.sourceRevision!, policySha256: definition.policySha256!, model: "none", profileId: "no-model",
+			repositoryEnabled: true, repositoryEpoch: 1,
+			monthly: { month: new Date().toISOString().slice(0, 7), limitMicros: 5_000_000, settledMicros: 0, reservedMicros: 0, ambiguousMicros: 0 },
+			campaignLifetime: { limitMicros: 20_000, limitTokens: 108_000, ...zero }, legacyLifetime: { ...zero },
+			repositoryLifetime: { limitMicros: 1_000, limitTokens: 7_000, ...zero } }
+	}
+	try {
+		const store = new RepositoryCampaignStore(path.join(root, "state.json"), [definition], authority)
+		await store.setCampaignBudget(definition.id, 1_000, 7_000)
+		await store.start(definition.id)
+		const parent = (await store.observeKnownRepairAdvisory({ campaignId: definition.id, advisoryId: "CVE-2026-92390",
+			publicBaseRevision: CURL_DEBIAN_PUBLIC_BASE_REVISION, snapshotSha256: CURL_DEBIAN_SNAPSHOT_SHA256,
+			sourceUrl: CURL_DEBIAN_SOURCE_URL, sourceContentSha256: CURL_DEBIAN_SOURCE_HTML_SHA256,
+			affectedRange: CURL_DEBIAN_AFFECTED_RANGE })).job
+		const claim = await store.claimNext(definition.id, CURL_REPAIR_RESERVATION, new Date(), { executionKind: "live-cve" })
+		assert.ok(claim)
+		await store.finish(claim!, { status: "ambiguous" })
+		await assert.rejects(store.enqueueVerifiedHistoricalRepairRetry(parent.id,
+			`CONFIRM RETRY HISTORICAL CURL DELIVERY ${parent.id}`, { candidateSha256: "2".repeat(64), verificationSha256: "3".repeat(64) }),
+		/retry target is not the failed zero-cost verified Curl delivery attempt/)
 	} finally { await fs.rm(root, { recursive: true, force: true }) }
 }
 
 const tests: readonly SuiteTest[] = [
 	["known Curl historical repair is stored only under the separate repair campaign", repairQueueUsesOnlyItsSeparateCampaignIdentity],
 	["a failed zero-cost verified Curl delivery has one evidence-bound retry child", failedVerifiedDeliveryCanBeExplicitlyRetriedOnce],
+	["an ambiguous Curl repair claim cannot be retried", ambiguousRepairCannotBeRetried],
 ]
 
 await runMain("repository-curl-repair-store", tests)

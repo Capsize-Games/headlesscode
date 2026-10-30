@@ -176,13 +176,15 @@ export async function campaignMain(args: string[]): Promise<number> {
 			const readAuthority = createRepositoryBudgetAuthorityReader(definitions, CAMPAIGN_CONTROL_FILE)
 			const repositoryStore = new RepositoryCampaignStore(REPOSITORY_CAMPAIGN_STATE_FILE, definitions, readAuthority)
 			const authority = await readAuthority(CURL_REPAIR_CAMPAIGN_ID)
-			if (!(authority.mode === "fleet-v2-budget-only" && authority.available === false && authority.snapshotOnly === true &&
-				authority.model === "none" && authority.profileId === "no-model" && authority.repositoryCampaignId === definition.id &&
+			const liveClaimWindow = authority.mode === "fleet-v2-budget-only" && authority.available === false && authority.snapshotOnly === true &&
+				!!authority.runId && Number.isSafeInteger(authority.runExpiresAtMs) && authority.runExpiresAtMs! > Date.now()
+			const snapshotProvisioning = authority.mode === "fleet-v2-readonly" && authority.available === false && authority.snapshotOnly === true &&
+				authority.runId === null && authority.runExpiresAtMs === null
+			if (!((liveClaimWindow || snapshotProvisioning) && authority.model === "none" && authority.profileId === "no-model" && authority.repositoryCampaignId === definition.id &&
 				authority.repositoryId === definition.repositoryId && authority.repository === definition.repository &&
 				authority.sourceRevision === definition.sourceRevision && authority.policySha256 === definition.policySha256 &&
-				authority.globalEnabled === true && authority.canAdmit === true && authority.repositoryEnabled === true &&
-				!!authority.runId && Number.isSafeInteger(authority.runExpiresAtMs) && authority.runExpiresAtMs! > Date.now())) {
-				throw new Error("fresh live budget-only Fleet authority is unavailable")
+				authority.globalEnabled === true && authority.canAdmit === true && authority.repositoryEnabled === true)) {
+				throw new Error("fresh enabled Fleet Curl budget provisioning authority is unavailable")
 			}
 			await verifyCurlHistoricalRepairSourcePin()
 			const view = await repositoryStore.recoveryView(positional[1]!)
