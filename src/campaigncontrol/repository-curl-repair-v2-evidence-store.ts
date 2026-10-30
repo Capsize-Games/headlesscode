@@ -82,8 +82,10 @@ async function ensureOwnerPrivateRoot(directory: string): Promise<void> {
 	}
 	await assertPrivateDirectory(home)
 	const parts = path.relative(home, absolute).split(path.sep).filter(Boolean)
+	let current = home
 	for (const part of parts) {
-		await ensurePrivateDirectory(path.join(home, part))
+		current = path.join(current, part)
+		await ensurePrivateDirectory(current)
 	}
 	await fs.chmod(absolute, 0o700)
 }
