@@ -6,6 +6,7 @@ import {
 	CURL_REPAIR_DELIVERY_POLICY, CURL_REPAIR_DELIVERY_POLICY_SHA256,
 	fixedCurlDeliveryGitHubEnvironment,
 	deliverVerifiedCurlRepairDraft,
+	createFixedCurlReadOnlyGitAdapter,
 	type CurlRepairClaim, type CurlRepairDeliveryDependencies, type CurlRepairGitAdapter,
 	type CurlRepairGitHubAdapter, type CurlRepairPullRequest, type CurlRepairTarget,
 } from "../repository-curl-repair-delivery.js"
@@ -245,6 +246,16 @@ async function testSharedDescriptorLockRejectsConcurrentDelivery(): Promise<void
 	assert.equal((await first).disposition, "already-fixed")
 }
 
+async function testFixedReadOnlyGitSurfaceDoesNotExposeMutationOrCallNetwork(): Promise<void> {
+	const adapter = createFixedCurlReadOnlyGitAdapter()
+	assert.deepEqual(Object.keys(adapter).sort(), [
+		"candidateIsAncestor",
+		"inspectTarget",
+	])
+	assert.equal(typeof adapter.inspectTarget, "function")
+	assert.equal(typeof adapter.candidateIsAncestor, "function")
+}
+
 const tests: readonly SuiteTest[] = [
 	["fixed GitHub delivery rejects fake credential and D-Bus paths", testFixedGitHubEnvironmentRejectsFakeCredentialAndBusPaths],
 	["repair delivery policy is fixed and separate from the qualification claim", testPolicyIsFixedAndRepairClaimsAreDistinct],
@@ -255,6 +266,7 @@ const tests: readonly SuiteTest[] = [
 	["lost private branch acknowledgement is resolved by the exact remote ref", testLostBranchAcknowledgementUsesExactRefReadback],
 	["receipt mismatch and stale claim stop before remote effects", testReceiptMismatchAndStaleClaimStopBeforeRemoteEffects],
 	["shared descriptor lock excludes concurrent private delivery reconciliation", testSharedDescriptorLockRejectsConcurrentDelivery],
+	["fixed read-only Git API exposes no remote mutation operations", testFixedReadOnlyGitSurfaceDoesNotExposeMutationOrCallNetwork],
 ]
 
 await runMain("repository-curl-repair-delivery", tests)

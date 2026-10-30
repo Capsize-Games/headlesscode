@@ -117,6 +117,29 @@ export interface CurlRepairGitAdapter {
 	pushCandidate(branch: string, candidateRevision: string, expectedBaseRevision: string): Promise<void>
 }
 
+export type FixedCurlReadOnlyGit = Pick<
+	CurlRepairGitAdapter,
+	"inspectTarget" | "candidateIsAncestor"
+>
+
+/** Return fixed, read-only Git evidence for the compiled private Curl pins. */
+export function createFixedCurlReadOnlyGitAdapter(): FixedCurlReadOnlyGit {
+	const adapter = new FixedCurlGitAdapter(
+		path.join(
+			os.homedir(),
+			".local",
+			"share",
+			"headlesscode",
+			"curl-repair-readonly",
+		),
+	)
+	return Object.freeze({
+		inspectTarget: () => adapter.inspectTarget(),
+		candidateIsAncestor: (candidate: string, target: string) =>
+			adapter.candidateIsAncestor(candidate, target),
+	})
+}
+
 export interface CurlRepairGitHubAdapter {
 	findPullRequests(branch: string): Promise<CurlRepairPullRequest[]>
 	createDraftPullRequest(input: { branch: string; title: string; body: string }): Promise<void>
