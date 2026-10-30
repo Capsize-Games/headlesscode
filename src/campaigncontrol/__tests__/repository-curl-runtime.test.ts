@@ -14,6 +14,16 @@ import { CURL_CANDIDATE_TREE_SHA, CURL_EVALUATOR_DIGEST, CURL_FIXED_ADVISORY,
 import { RepositoryCampaignStore,
 	type ClaimedRepositoryJob, type RepositoryCampaignDefinition } from "../repository-campaigns.js"
 import { CAMPAIGN_CONTROL_FILE } from "../paths.js"
+import {
+	CONTROL_SOCKET_DIR,
+	CONTROL_STATE_DIR,
+	EVIDENCE_CONFIG_DIR,
+	EVIDENCE_SOCKET_PATH,
+	EVIDENCE_STORAGE_DIR,
+	OPEN_SHELL_XDG_CONFIG_HOME,
+	OPEN_SHELL_XDG_STATE_HOME,
+	PROFILE_PATH,
+} from "../repository-curl-profile.js"
 import type { ContainedRuntimeProfile } from "../../security/profile.js"
 import type { ContainedEvidenceService } from "../../security/contained-evidence-service.js"
 import type { FleetRepositoryBudgetSnapshot } from "../../rsi/fleet-repository-budget-ledger.js"
@@ -92,16 +102,16 @@ async function testRuntimeConfigHasOneFixedOwnerSchema(): Promise<void> {
 	assert.match(CURL_RUNTIME_CONFIG_PATH,
 		/\.local\/state\/headlesscode\/repository-runtime\/runtime\.json$/)
 	const base = { schemaVersion: 1,
-		profilePath: "/home/joe/.local/state/headlesscode/repository-runtime/profile/repository-worker.yaml",
+		profilePath: PROFILE_PATH,
 		profileSha256: "bf8c90c394400e1df6cfbe4063666c918aabf613ab8246006f7757b1355ee358",
-		evidenceStorageDir: "/home/joe/.local/state/headlesscode/repository-runtime/evidence-store",
-		evidenceConfigDir: "/home/joe/.local/state/headlesscode/repository-runtime/evidence-config",
-		evidenceSocketPath: "/home/joe/.local/state/headlesscode/repository-runtime/evidence-socket/evidence.sock",
-		controlStateDir: "/home/joe/.local/state/headlesscode/repository-runtime/control-state",
-		controlSocketDir: "/run/user/1000/hcctl/{session}",
+		evidenceStorageDir: EVIDENCE_STORAGE_DIR,
+		evidenceConfigDir: EVIDENCE_CONFIG_DIR,
+		evidenceSocketPath: EVIDENCE_SOCKET_PATH,
+		controlStateDir: CONTROL_STATE_DIR,
+		controlSocketDir: CONTROL_SOCKET_DIR,
 			brokerBindHost: "127.0.0.1",
-		openshellXdgConfigHome: "/home/joe/Projects/headlesscode/.worktrees/ux/.headlesscode/scratch/rsi-muse/xdg-user",
-		openshellXdgStateHome: "/home/joe/Projects/headlesscode/.worktrees/ux/.headlesscode/scratch/rsi-muse/xdg-state" }
+		openshellXdgConfigHome: OPEN_SHELL_XDG_CONFIG_HOME,
+		openshellXdgStateHome: OPEN_SHELL_XDG_STATE_HOME }
 	rejectRuntimeConfig(base, { arbitraryPath: "/tmp" }, /unknown or missing fields/)
 	rejectRuntimeConfig(base, { brokerBindHost: "0.0.0.0" }, /brokerBindHost differs/)
 	rejectRuntimeConfig(base, { schemaVersion: 2 }, /schemaVersion differs/)
@@ -179,21 +189,21 @@ async function testContainedCollectorStartsBeforeProfileAndClosesWithWorkspace()
 	} as unknown as FleetRepositoryBudgetSnapshot
 	const key = "A".repeat(43)
 	const keyIdentity = createHash("sha256").update(key).digest("hex")
-	const profile = { evidenceSocketPath: "/home/joe/.local/state/headlesscode/repository-runtime/evidence-socket/evidence.sock",
+	const profile = { evidenceSocketPath: EVIDENCE_SOCKET_PATH,
 		evidencePublicKeyFingerprint: "sha256:collector-test" } as unknown as ContainedRuntimeProfile
 	const worktree = path.join(root, sessionId)
 	await fs.mkdir(worktree)
 	const runtimeConfig = { schemaVersion: 1,
-		profilePath: "/home/joe/.local/state/headlesscode/repository-runtime/profile/repository-worker.yaml",
+		profilePath: PROFILE_PATH,
 		profileSha256: "bf8c90c394400e1df6cfbe4063666c918aabf613ab8246006f7757b1355ee358",
-		evidenceStorageDir: "/home/joe/.local/state/headlesscode/repository-runtime/evidence-store",
-		evidenceConfigDir: "/home/joe/.local/state/headlesscode/repository-runtime/evidence-config",
-		evidenceSocketPath: "/home/joe/.local/state/headlesscode/repository-runtime/evidence-socket/evidence.sock",
-		controlStateDir: "/home/joe/.local/state/headlesscode/repository-runtime/control-state",
-		controlSocketDir: "/run/user/1000/hcctl/{session}",
+		evidenceStorageDir: EVIDENCE_STORAGE_DIR,
+		evidenceConfigDir: EVIDENCE_CONFIG_DIR,
+		evidenceSocketPath: EVIDENCE_SOCKET_PATH,
+		controlStateDir: CONTROL_STATE_DIR,
+		controlSocketDir: CONTROL_SOCKET_DIR,
 			brokerBindHost: "127.0.0.1",
-		openshellXdgConfigHome: "/home/joe/Projects/headlesscode/.worktrees/ux/.headlesscode/scratch/rsi-muse/xdg-user",
-		openshellXdgStateHome: "/home/joe/Projects/headlesscode/.worktrees/ux/.headlesscode/scratch/rsi-muse/xdg-state" } as const
+		openshellXdgConfigHome: OPEN_SHELL_XDG_CONFIG_HOME,
+		openshellXdgStateHome: OPEN_SHELL_XDG_STATE_HOME } as const
 	const advisory = { advisoryId: CURL_FIXED_ADVISORY,
 		sourceUrl: `https://security-tracker.debian.org/tracker/${CURL_FIXED_ADVISORY}`, snapshotSha256: "d".repeat(64),
 		summary: "fixed facts", affectedRange: "source range", fixedVersion: null,
