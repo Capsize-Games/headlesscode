@@ -7,7 +7,7 @@ import { CURL_CAMPAIGN_ID, CURL_DEBIAN_AFFECTED_RANGE, CURL_DEBIAN_FIXED_REVISIO
 	CURL_FIXED_ADVISORY } from "./repository-known-advisory.js"
 import { CURL_REPAIR_CAMPAIGN_ID } from "./repository-campaign-ids.js"
 import { CURL_REPAIR_EVALUATOR_DIGEST, CURL_REPAIR_POLICY_SHA256, CURL_REPAIR_PROFILE_ID, CURL_REPAIR_RECIPE_DIGEST, CURL_REPAIR_SOURCE_REVISION,
-	CURL_REPAIR_REPOSITORY_ID, CURL_REPAIR_TARGET_REPOSITORY } from "./repository-curl-repair.js"
+	CURL_REPAIR_REPOSITORY_ID, CURL_REPAIR_RESERVATION, CURL_REPAIR_TARGET_REPOSITORY } from "./repository-curl-repair.js"
 
 export const REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS = 5_000_000
 // Keeps the mock subcap within the existing fixed Fleet campaign's 108k-token ceiling.
@@ -119,7 +119,7 @@ export interface RepositoryCampaignJob {
 	progress?: RepositoryJobProgress
 	detail?: string
 	purpose?: "qualification" | "repair"
-	/** Explicit owner-authorized retry lineage; only the verified no-call Curl path may set this. */
+	/** Explicit owner-authorized lineage for the verified Curl no-call and historical repair retry paths. */
 	retryOf?: string
 }
 
@@ -404,9 +404,34 @@ function validQualificationJob(job: RepositoryCampaignJob, s: Partial<CampaignSt
 }
 
 function validRepairJob(job: RepositoryCampaignJob, s: Partial<CampaignState>): boolean {
+	if (job.purpose !== "repair" || job.campaignId !== CURL_REPAIR_CAMPAIGN_ID || job.advisoryId !== CURL_FIXED_ADVISORY) return false
+	let root = job
+	const seen = new Set<string>([job.id])
+	while (root.retryOf !== undefined) {
+		if (!validId(root.retryOf)) return false
+		const parent = (s.jobs ?? []).find((candidate) => candidate.id === root.retryOf)
+		if (!parent || seen.has(parent.id) || !retryableHistoricalRepairFailure(parent) || parent.campaignId !== job.campaignId ||
+			parent.advisoryId !== job.advisoryId || (s.jobs ?? []).filter((candidate) => candidate.retryOf === parent.id).length > 1) return false
+		seen.add(parent.id)
+		root = parent
+	}
+	return (s.intakeRecords ?? []).some((row) => row?.source === "debian-tracker-repair-snapshot" && row.jobId === root.id &&
+		row.campaignId === job.campaignId && row.advisoryId === job.advisoryId && row.snapshotSha256 === CURL_DEBIAN_SNAPSHOT_SHA256)
+}
+
+function retryableHistoricalRepairFailure(job: RepositoryCampaignJob): boolean {
+	const progress = job.progress
+	const refs = progress?.evidenceRefs ?? []
+	const count = (kind: RepositoryEvidenceRef["kind"]) => refs.filter((ref) => ref.kind === kind).length
 	return job.purpose === "repair" && job.campaignId === CURL_REPAIR_CAMPAIGN_ID && job.advisoryId === CURL_FIXED_ADVISORY &&
-		(s.intakeRecords ?? []).some((row) => row?.source === "debian-tracker-repair-snapshot" && row.jobId === job.id &&
-			row.campaignId === job.campaignId && row.advisoryId === job.advisoryId && row.snapshotSha256 === CURL_DEBIAN_SNAPSHOT_SHA256)
+		job.status === "failed" && job.reservedMicros === 0 && job.reservedTokens === 0 && job.settledMicros === 0 && job.settledTokens === 0 &&
+		progress?.executionKind === "live-cve" && (progress.stage === "verify" || progress.stage === "deliver") &&
+		progress.blocker === "registered-pipeline-step-failed" && progress.nextStep === "review the private bounded diagnostic before any recovery" &&
+		(progress.currentTask === "Prepare the bounded isolated workspace" ||
+			progress.currentTask === "Record the verified result through private delivery") &&
+		JSON.stringify(progress.completedSteps) === JSON.stringify(REPOSITORY_CAMPAIGN_STEPS.slice(0, 5)) &&
+		JSON.stringify(progress.requiredSteps) === JSON.stringify(REPOSITORY_CAMPAIGN_STEPS) &&
+		count("intake") === 1 && count("candidate") === 1 && count("test-receipt") === 1 && count("diagnostic") === 1 && count("delivery") === 0
 }
 
 function validJobRecord(job: RepositoryCampaignJob, s: Partial<CampaignState>, ids: Set<string>): boolean {
@@ -575,6 +600,18 @@ function usageBelowLimits(usage: { settledMicros: number; reservedMicros: number
 	settledTokens: number; reservedTokens: number; ambiguousTokens: number }, micros: number, tokens: number): boolean {
 	return usage.settledMicros + usage.reservedMicros + usage.ambiguousMicros < micros &&
 		usage.settledTokens + usage.reservedTokens + usage.ambiguousTokens < tokens
+}
+
+function monthlyUsage(usage: { settledMicros: number; reservedMicros: number; ambiguousMicros: number }): number {
+	return usage.settledMicros + usage.reservedMicros + usage.ambiguousMicros
+}
+
+function lifetimeSpend(usage: { settledMicros: number; reservedMicros: number; ambiguousMicros: number }): number {
+	return monthlyUsage(usage)
+}
+
+function lifetimeTokens(usage: { settledTokens: number; reservedTokens: number; ambiguousTokens: number }): number {
+	return usage.settledTokens + usage.reservedTokens + usage.ambiguousTokens
 }
 
 function monthlyUsageBelowLimit(usage: { settledMicros: number; reservedMicros: number; ambiguousMicros: number }, limitMicros: number): boolean {
@@ -1343,6 +1380,60 @@ export class RepositoryCampaignStore {
 			s.jobs.push(job)
 			s.intakeRecords.push(record)
 			return { ...job }
+		}, now)
+	}
+
+	/** Create one explicit child for a zero-cost verified historical Curl repair that failed before delivery completed. */
+	async enqueueVerifiedHistoricalRepairRetry(parentJobId: string, confirmation: string,
+		evidence: { candidateSha256: string; verificationSha256: string }, now = new Date()): Promise<RepositoryCampaignJob> {
+		if (!validId(parentJobId) || confirmation !== `CONFIRM RETRY HISTORICAL CURL DELIVERY ${parentJobId}` ||
+			!/^[a-f0-9]{64}$/.test(evidence?.candidateSha256 ?? "") || !/^[a-f0-9]{64}$/.test(evidence?.verificationSha256 ?? "")) {
+			throw new Error("explicit verified Curl repair retry confirmation and evidence are required")
+		}
+		const definition = this.requireDefinition(CURL_REPAIR_CAMPAIGN_ID)
+		const authority = await this.budgetAuthority(CURL_REPAIR_CAMPAIGN_ID)
+		if ((!snapshotCanProvision(authority) && !liveBudgetOnlyAdmission(authority, definition)) ||
+			!authority.globalEnabled || !authority.canAdmit || !authority.repositoryEnabled) {
+			throw new Error("fresh enabled Fleet budget-only Curl authority is unavailable")
+		}
+		return this.update((s) => {
+			const campaign = this.campaign(s, CURL_REPAIR_CAMPAIGN_ID)
+			if (!campaign.enabled || this.missingReadiness(definition, authority, campaign, s).length || this.isExhausted(campaign)) {
+				throw new Error("verified Curl repair retry requires a started campaign with fresh prerequisites and remaining budget")
+			}
+			const parent = s.jobs.find((job) => job.id === parentJobId)
+			if (!parent || !retryableHistoricalRepairFailure(parent) || !validRepairJob(parent, s)) {
+				throw new Error("retry target is not the failed zero-cost verified Curl delivery attempt")
+			}
+			const candidateRefs = parent.progress!.evidenceRefs.filter((ref) => ref.kind === "candidate")
+			const verificationRefs = parent.progress!.evidenceRefs.filter((ref) => ref.kind === "test-receipt")
+			if (candidateRefs.length !== 1 || candidateRefs[0]!.id !== evidence.candidateSha256 ||
+				verificationRefs.length !== 1 || verificationRefs[0]!.id !== evidence.verificationSha256) {
+				throw new Error("recomputed Curl candidate or protected verification evidence differs from the failed job")
+			}
+			if (s.jobs.some((job) => job.retryOf === parent.id)) throw new Error("this failed Curl delivery attempt already has a retry child")
+			if (s.jobs.some((job) => job.campaignId === CURL_REPAIR_CAMPAIGN_ID && (job.status === "queued" || job.status === "running"))) {
+				throw new Error("another Curl repair job is active")
+			}
+			const totals = this.aggregateTotals(s), monthly = authority.monthly!, campaignLifetime = authority.campaignLifetime!, repositoryLifetime = authority.repositoryLifetime!
+			const spend = CURL_REPAIR_RESERVATION.micros, tokens = CURL_REPAIR_RESERVATION.tokens
+			if (campaign.settledMicros + campaign.reservedMicros + campaign.ambiguousMicros + spend > campaign.budgetLimitMicros ||
+				campaign.settledTokens + campaign.reservedTokens + campaign.ambiguousTokens + tokens > campaign.budgetLimitTokens ||
+				authority.committedMicros + totals.settledMicros + totals.reservedMicros + totals.ambiguousMicros + spend > authority.limitMicros ||
+				authority.committedTokens + totals.settledTokens + totals.reservedTokens + totals.ambiguousTokens + tokens > authority.limitTokens ||
+				monthlyUsage(monthly) + spend > monthly.limitMicros ||
+				lifetimeSpend(campaignLifetime) + spend > campaignLifetime.limitMicros ||
+				lifetimeTokens(campaignLifetime) + tokens > campaignLifetime.limitTokens ||
+				lifetimeSpend(repositoryLifetime) + spend > repositoryLifetime.limitMicros ||
+				lifetimeTokens(repositoryLifetime) + tokens > repositoryLifetime.limitTokens) {
+				throw new Error("verified Curl repair retry exceeds the fresh remaining budget")
+			}
+			if (s.jobs.length >= MAX_JOBS) throw new Error("campaign job queue is full")
+			const child: RepositoryCampaignJob = { id: randomUUID(), retryOf: parent.id, campaignId: parent.campaignId,
+				advisoryId: parent.advisoryId, status: "queued", epoch: campaign.epoch, createdAt: now.getTime(), updatedAt: now.getTime(),
+				month: s.month, reservedMicros: 0, settledMicros: 0, reservedTokens: 0, settledTokens: 0, purpose: "repair" }
+			s.jobs.push(child)
+			return structuredClone(child)
 		}, now)
 	}
 

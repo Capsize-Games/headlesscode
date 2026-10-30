@@ -118,15 +118,16 @@ export function createRepositoryWorkerPipeline(adapters: RepositoryWorkerPipelin
 				const verificationDigest = requireDigest(verification.evidenceSha256, "verification receipt")
 				evidenceRefs.push(ref("test-receipt", "Protected verification receipt", verificationDigest))
 				completedSteps = [...completedSteps, "verify"]
-					currentStage = "deliver"
-				if (!verification.passed) return { status: "failed", accounting: actualMicros === null || actualTokens === null ? "ambiguous" : "measured",
+				if (!verification.passed) return { status: "failed", stage: "verify", accounting: actualMicros === null || actualTokens === null ? "ambiguous" : "measured",
 					actualMicros, actualTokens, completedSteps, evidenceRefs, currentTask: "Protected verification rejected the candidate",
 					blocker: "protected-evaluator-rejected-candidate", nextStep: "review the protected verification receipt" }
-				await progress({ stage: "deliver", currentTask: "Record the verified result through private delivery", completedSteps, evidenceRefs })
+				currentStage = "deliver"
+				currentTask = "Record the verified result through private delivery"
+				await progress({ stage: currentStage, currentTask, completedSteps, evidenceRefs })
 				if (signal.aborted) throw new Error("worker stopped before private delivery")
 				const delivery = await adapters.deliverPrivate({ definition, claim, advisory, candidateSha256, verification })
 				const deliveryDigest = requireDigest(delivery.evidenceSha256, "private delivery receipt")
-				if (!delivery.accepted) return { status: "failed", accounting: actualMicros === null || actualTokens === null ? "ambiguous" : "measured",
+				if (!delivery.accepted) return { status: "failed", stage: "deliver", accounting: actualMicros === null || actualTokens === null ? "ambiguous" : "measured",
 					actualMicros, actualTokens, completedSteps, evidenceRefs: [...evidenceRefs, ref("delivery", "Private delivery attempt", deliveryDigest)],
 					currentTask: "Private delivery did not accept the verified result", blocker: "private-delivery-not-accepted", nextStep: "reconcile the private delivery receipt" }
 				if (delivery.boardRef !== undefined && delivery.boardRef !== null &&
@@ -136,10 +137,10 @@ export function createRepositoryWorkerPipeline(adapters: RepositoryWorkerPipelin
 				}
 				evidenceRefs.push(ref("delivery", "Private delivery receipt", deliveryDigest))
 				completedSteps = [...completedSteps, "deliver"]
-				if (actualMicros === null || actualTokens === null) return { status: "ambiguous", accounting: "ambiguous",
+				if (actualMicros === null || actualTokens === null) return { status: "ambiguous", stage: "deliver", accounting: "ambiguous",
 					actualMicros, actualTokens, completedSteps, evidenceRefs, boardRef: delivery.boardRef ?? null, currentTask: "Private delivery completed but usage reconciliation is pending",
 					blocker: "usage-reconciliation-pending", nextStep: "reconcile the broker receipt before retry" }
-				return { status: "succeeded", accounting: "measured",
+				return { status: "succeeded", stage: "deliver", accounting: "measured",
 					actualMicros, actualTokens, completedSteps, evidenceRefs, boardRef: delivery.boardRef ?? null, currentTask: "Private delivery receipt recorded", blocker: null, nextStep: null }
 				} finally {
 					await workspace.cleanup?.()
@@ -151,7 +152,7 @@ export function createRepositoryWorkerPipeline(adapters: RepositoryWorkerPipelin
 						evidenceRefs = [...evidenceRefs, ref("diagnostic", "Private bounded failure diagnostic", diagnostic.digest)]
 					} catch { /* Failure details stay absent rather than falling back to API-visible raw text. */ }
 				}
-				return { status: actualMicros === null || actualTokens === null ? "ambiguous" : "failed",
+				return { status: actualMicros === null || actualTokens === null ? "ambiguous" : "failed", stage: currentStage,
 					accounting: actualMicros === null || actualTokens === null ? "ambiguous" : "measured", actualMicros, actualTokens,
 					completedSteps, evidenceRefs, currentTask, blocker: "registered-pipeline-step-failed", nextStep: "review the private bounded diagnostic before any recovery" }
 			}
