@@ -360,6 +360,7 @@ async function testCoordinatorLeavesUnregisteredCampaignBlocked(): Promise<void>
 	const f = await fixture()
 	const server = await startCampaignControlServer({ port: 0, staticRoot: path.join(f.root, "dist"), store: f.store,
 		repositoryCampaigns, enableRepositoryCoordinator: true,
+		repositoryWorkerRegistryPath: path.join(root, "empty-worker-registry.json"),
 		loadAdapter: async () => ({ releaseRoot: f.root, stateRoot: f.root, releaseDigest: "a".repeat(64) }),
 		readBudget: async () => ({ month: currentMonth(), settledMicros: 0, reservedMicros: 0, ambiguousMicros: 0 }),
 		readJobs: async () => ({ jobs: [], jobDetailsAvailable: false }),
