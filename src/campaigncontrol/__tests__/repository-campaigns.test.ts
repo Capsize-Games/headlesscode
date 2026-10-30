@@ -439,6 +439,32 @@ async function testPublishedAdvisoryIntakePersistsSourceDigestAndQueuesOnlySuppo
 	} finally { await fs.rm(root, { recursive: true, force: true }) }
 }
 
+async function testVerifiedNoCallProofSettlesOnlyTheAmbiguousClaimAndPersistsEvidence(): Promise<void> {
+	const { root, store } = await fixture()
+	try {
+		const now = new Date("2026-10-29T12:00:00Z")
+		await queueJob(store, "headlesscode-internal", "CVE-2026-1236", now, 50_000)
+		const claim = await store.claimNext("headlesscode-internal", { micros: 20_000, tokens: 20_000 }, now)
+		assert.ok(claim)
+		await store.finish(claim!, { status: "ambiguous" }, now)
+		const restarted = new RepositoryCampaignStore(store.path, definitions)
+		const proofSha256 = "9".repeat(64)
+		await restarted.settleRecoveredClaim(claim!, { status: "failed", actualMicros: 0, actualTokens: 0, proofSha256 }, new Date(now.getTime() + 1))
+		const verifiedRestart = new RepositoryCampaignStore(store.path, definitions)
+		const state = await statusAt(verifiedRestart, new Date(now.getTime() + 2))
+		const job = jobRow(state, claim!.job.id)
+		assert.equal(job.status, "failed")
+		assert.equal(job.settledMicros, 0)
+		assert.equal(job.settledTokens, 0)
+		assert.ok(job.progress)
+		assert.ok(job.progress.evidenceRefs.some((ref) => ref.kind === "no-call-proof" && ref.id === proofSha256))
+		assert.equal(state.budget.ambiguousMicros, 0)
+		assert.equal(state.budget.ambiguousTokens, 0)
+		await verifiedRestart.settleRecoveredClaim(claim!, { status: "failed", actualMicros: 0, actualTokens: 0, proofSha256 }, new Date(now.getTime() + 3))
+		await assert.rejects(verifiedRestart.settleRecoveredClaim(claim!, { status: "failed", actualMicros: 0, actualTokens: 0, proofSha256: "8".repeat(64) }, new Date(now.getTime() + 4)), /ambiguous/)
+	} finally { await fs.rm(root, { recursive: true, force: true }) }
+}
+
 const tests: readonly SuiteTest[] = [
 	["aggregate budget reservations are atomic across repository campaigns", testAggregateClaimsAreAtomicAcrossRepositories],
 	["stop cancels queued work and rejects new claims", testStopCancelsQueuedWorkAndFencesNewClaims],
@@ -454,6 +480,7 @@ const tests: readonly SuiteTest[] = [
 	["expired worker lease makes freshness and counts unavailable", testProgressSnapshotMarksExpiredLeaseStaleAndHidesCounts],
 	["synthetic authority cannot create a live-CVE worker claim", testSyntheticAuthorityCannotCreateLiveCveProgress],
 	["published advisory intake persists source digests, exposes unsupported rows, and deduplicates after restart", testPublishedAdvisoryIntakePersistsSourceDigestAndQueuesOnlySupportedRecordOnce],
+	["verified no-call proof settles only its ambiguous claim and persists evidence", testVerifiedNoCallProofSettlesOnlyTheAmbiguousClaimAndPersistsEvidence],
 ]
 
 runMain("repository-campaigns", tests)

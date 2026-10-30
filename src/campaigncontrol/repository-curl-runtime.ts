@@ -14,6 +14,7 @@ import { readFleetBudgetKeyIdentity, verifyFleetBudgetCredential } from "../rsi/
 import type { FleetRepositoryBudgetScope } from "../rsi/fleet-repository-budget-ledger.js"
 import { type ClaimedRepositoryJob, type RepositoryCampaignDefinition, type RepositoryCampaignStore } from "./repository-campaigns.js"
 import { createRepositoryBudgetAuthorityReader } from "./repository-budget-authority.js"
+import { CAMPAIGN_CONTROL_FILE } from "./paths.js"
 import { createRepositoryCampaignBudgetBinding } from "./repository-budget-binding.js"
 import { CURL_CANDIDATE_TREE_SHA, CURL_EVALUATOR_DIGEST, CURL_FIXED_ADVISORY,
 	CURL_PRIVATE_SOURCE_REVISION, CURL_PROFILE_ID,
@@ -22,6 +23,7 @@ import type { RepositoryWorkerRegistration, RepositoryPipelineAdapterFactoryCont
 import type { RepositoryWorkerPipelineAdapters, RepositoryPreparedWorkspace } from "./repository-worker-pipeline.js"
 import { runRepositoryWorkerThroughBroker, writeRepositoryWorkerTask, type VettedAdvisorySnapshot } from "./repository-worker.js"
 import { restorePinnedWorktreeEolBytes, verifyPinnedGitWorktreeTree } from "./repository-source-tree.js"
+import { writeRepositoryWorkerDiagnostic } from "./repository-worker-diagnostics.js"
 import { CURL_DEBIAN_AFFECTED_RANGE, CURL_DEBIAN_FIXED_REVISION, CURL_DEBIAN_INTRODUCED_REVISION, CURL_DEBIAN_SNAPSHOT_SHA256,
 	CURL_DEBIAN_SOURCE_HTML_SHA256, CURL_DEBIAN_SOURCE_URL, loadKnownCurlDebianAdvisory } from "./repository-known-advisory.js"
 
@@ -32,7 +34,8 @@ const CAMPAIGN_ID = "curl-maintenance"
 const REPOSITORY_ID = "curl-maintenance"
 const REPOSITORY = "Capsize-Games/curl-maintenance"
 const WORKER_PROFILE = "curl-published-advisory-v1"
-const SOURCE_ROOT = path.join(os.homedir(), ".local", "share", "headlesscode", "repository-sources", "curl-maintenance")
+export const CURL_PRIVATE_SOURCE_ROOT = path.join(os.homedir(), ".local", "share", "headlesscode", "repository-sources", "curl-maintenance")
+const SOURCE_ROOT = CURL_PRIVATE_SOURCE_ROOT
 const CONTAINED_RUNTIME_ROOT = path.join(os.homedir(), ".local", "state", "headlesscode", "repository-runtime")
 const EVIDENCE_STORAGE_DIR = path.join(CONTAINED_RUNTIME_ROOT, "evidence-store")
 const EVIDENCE_CONFIG_DIR = path.join(CONTAINED_RUNTIME_ROOT, "evidence-config")
@@ -100,6 +103,7 @@ interface CurlRuntimeDependencies {
 	createWorktree?: typeof createPinnedWorktree
 	removeWorktree?: typeof removeOwnedWorktree
 	readBudgetAuthority?: ReturnType<typeof createRepositoryBudgetAuthorityReader>
+	createBudgetAuthorityReader?: typeof createRepositoryBudgetAuthorityReader
 	loadRuntimeConfig?: () => CurlRuntimeConfig
 }
 
@@ -156,7 +160,7 @@ export function createCurlRepositoryPipelineAdapters(
 	validateRegistration(registration, definition, context)
 	const sourceRoot = path.resolve(dependencies.sourceRoot ?? SOURCE_ROOT)
 	const projectRoot = path.resolve(dependencies.projectRoot ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.."))
-	const authority = dependencies.readBudgetAuthority ?? createRepositoryBudgetAuthorityReader([definition], context.store.path)
+	const authority = dependencies.readBudgetAuthority ?? (dependencies.createBudgetAuthorityReader ?? createRepositoryBudgetAuthorityReader)([definition], CAMPAIGN_CONTROL_FILE)
 	const lookup = dependencies.lookupAdvisory ?? (async (advisoryId: string, currentDefinition: RepositoryCampaignDefinition) => {
 		if (currentDefinition.id !== CAMPAIGN_ID || advisoryId !== CURL_FIXED_ADVISORY) throw new Error("Curl advisory is outside the fixed qualification scope")
 		return await loadKnownCurlDebianAdvisory()
@@ -174,6 +178,9 @@ export function createCurlRepositoryPipelineAdapters(
 		model: registration.model,
 		executionKind: "live-cve",
 		reservation: { ...registration.reservation },
+		async recordFailureDiagnostic(input) {
+			return await writeRepositoryWorkerDiagnostic(context.store.path, { claim: input.claim, stage: input.stage, error: input.error })
+		},
 		async lookupAdvisory(advisoryId, currentDefinition) {
 			if (currentDefinition.id !== definition.id || advisoryId !== CURL_FIXED_ADVISORY) throw new Error("Curl advisory identity does not match the registered profile")
 			const advisory = await lookup(advisoryId, currentDefinition)

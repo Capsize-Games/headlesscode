@@ -13,6 +13,7 @@ import { CURL_CANDIDATE_TREE_SHA, CURL_EVALUATOR_DIGEST, CURL_FIXED_ADVISORY,
 	CURL_WORKER_DIGEST } from "../repository-curl-evaluator.js"
 import { RepositoryCampaignStore,
 	type ClaimedRepositoryJob, type RepositoryCampaignDefinition } from "../repository-campaigns.js"
+import { CAMPAIGN_CONTROL_FILE } from "../paths.js"
 import type { ContainedRuntimeProfile } from "../../security/profile.js"
 import type { ContainedEvidenceService } from "../../security/contained-evidence-service.js"
 import type { FleetRepositoryBudgetSnapshot } from "../../rsi/fleet-repository-budget-ledger.js"
@@ -70,8 +71,14 @@ async function testFactoryBindsOnlyTheCompiledOwnerPolicy(): Promise<void> {
 	assert.equal(CURL_CAMPAIGN_POLICY.limits.jobTokens, 72_000)
 	const store = { path: path.join(os.tmpdir(),
 		"curl-campaign-test.json") } as RepositoryCampaignStore
+	let authorityPath = ""
 	const adapters = createCurlRepositoryPipelineAdapters(registration,
-		definition, { store })
+		definition, { store }, { createBudgetAuthorityReader(_definitions, controlPath) {
+			authorityPath = controlPath ?? ""
+			return async () => { throw new Error("test authority reader is not invoked") }
+		} })
+	assert.equal(authorityPath, CAMPAIGN_CONTROL_FILE)
+	assert.notEqual(authorityPath, store.path, "the Fleet reader must never parse repository-campaign state as control state")
 	assert.equal(adapters.workerProfile, definition.workerProfile)
 	assert.equal(adapters.executionKind, "live-cve")
 	assert.deepEqual(adapters.reservation, registration.reservation)

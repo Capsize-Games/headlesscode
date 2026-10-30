@@ -50,6 +50,24 @@ export interface FleetRepositoryReconciliation {
 	receipt: OpenRouterBrokerReceipt
 }
 
+export interface FleetRepositoryNoCallProof {
+	campaignId: typeof FLEET_BUDGET_CAMPAIGN_ID
+	repositoryCampaignId: string
+	repositoryId: string
+	repository: string
+	sourceRevision: string
+	policySha256: string
+	repositoryEpoch: number
+	model: string
+	profileId: string
+	keyIdentity: string
+	proved: boolean
+	disposition: "no-recorded-provider-activity" | "activity-present"
+	asOfMs: number
+	jobId: string
+	counts: { grants: number; calls: number; denials: number }
+}
+
 export interface FleetRepositoryBudgetSnapshot {
 	mode: "fleet-v2" | "fleet-v2-readonly"
 	available: boolean
@@ -201,6 +219,38 @@ export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 	/** Read accounting for cold-start UI/budget setup without creating a run or admission. */
 	async budgetSnapshotOnly(): Promise<FleetRepositoryBudgetSnapshot> {
 		return await this.readBudgetSnapshot("repository-budget-snapshot")
+	}
+
+	/** Read immutable Fleet ledgers for explicit owner recovery; this never calls provider authority. */
+	async proveNoCall(jobId: string, repositoryEpoch: number): Promise<FleetRepositoryNoCallProof> {
+		if (!ID.test(jobId) || !Number.isSafeInteger(repositoryEpoch) || repositoryEpoch < 0) throw new Error("Fleet no-call proof identity is invalid")
+		const result = await this.call({ schemaVersion: 2, op: "repository-no-call-proof", campaignId: FLEET_BUDGET_CAMPAIGN_ID,
+			repositoryCampaignId: this.scope.repositoryCampaignId, repositoryId: this.scope.repositoryId,
+			repository: this.scope.repository, sourceRevision: this.scope.sourceRevision,
+			policySha256: this.scope.policySha256, model: this.scope.model, profileId: this.scope.profileId,
+			keyIdentity: this.expectedKeyIdentity, repositoryEpoch, jobId })
+		const counts = result.counts
+		const expected = "asOfMs,campaignId,counts,disposition,jobId,keyIdentity,model,policySha256,profileId,proved,repository,repositoryCampaignId,repositoryEpoch,repositoryId,schemaVersion,sourceRevision"
+		const validCounts = !!counts && typeof counts === "object" && !Array.isArray(counts) &&
+			Object.keys(counts).sort().join(",") === "calls,denials,grants" &&
+			["grants", "calls", "denials"].every((key) => Number.isSafeInteger((counts as Record<string, unknown>)[key]) && Number((counts as Record<string, unknown>)[key]) >= 0)
+		const noActivity = validCounts && ["grants", "calls", "denials"].every((key) => Number((counts as Record<string, number>)[key]) === 0)
+		if (Object.keys(result).sort().join(",") !== expected || result.schemaVersion !== 2 ||
+			result.campaignId !== FLEET_BUDGET_CAMPAIGN_ID || result.repositoryCampaignId !== this.scope.repositoryCampaignId ||
+			result.repositoryId !== this.scope.repositoryId || result.repository !== this.scope.repository ||
+			result.sourceRevision !== this.scope.sourceRevision || result.policySha256 !== this.scope.policySha256 ||
+			result.model !== this.scope.model || result.profileId !== this.scope.profileId || result.keyIdentity !== this.expectedKeyIdentity ||
+			result.repositoryEpoch !== repositoryEpoch || result.jobId !== jobId || !validCounts ||
+			!Number.isSafeInteger(result.asOfMs) || Date.now() - Number(result.asOfMs) > 60_000 || Number(result.asOfMs) > Date.now() + 60_000 ||
+			result.proved !== noActivity || result.disposition !== (noActivity ? "no-recorded-provider-activity" : "activity-present")) {
+			throw new Error("Fleet repository no-call proof is invalid")
+		}
+		return { campaignId: FLEET_BUDGET_CAMPAIGN_ID, repositoryCampaignId: this.scope.repositoryCampaignId,
+			repositoryId: this.scope.repositoryId, repository: this.scope.repository, sourceRevision: this.scope.sourceRevision,
+			policySha256: this.scope.policySha256, repositoryEpoch, model: this.scope.model, profileId: this.scope.profileId,
+			keyIdentity: this.expectedKeyIdentity, proved: noActivity,
+			disposition: noActivity ? "no-recorded-provider-activity" : "activity-present",
+			asOfMs: Number(result.asOfMs), jobId, counts: counts as FleetRepositoryNoCallProof["counts"] }
 	}
 
 	private async readBudgetSnapshot(op: "repository-budget-status" | "repository-budget-snapshot"): Promise<FleetRepositoryBudgetSnapshot> {

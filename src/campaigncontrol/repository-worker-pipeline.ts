@@ -3,6 +3,7 @@ import type { RegisteredRepositoryWorker, RepositoryWorkerExecutionResult } from
 import type { VettedAdvisorySnapshot } from "./repository-worker.js"
 import type { CurlHistoricalRepairCandidate } from "./repository-curl-repair.js"
 import type { CurlHistoricalRepairReceipt } from "./repository-curl-repair-evaluator.js"
+import { writeRepositoryWorkerDiagnostic } from "./repository-worker-diagnostics.js"
 
 export interface RepositoryPreparedWorkspace {
 	readonly worktree: string
@@ -38,6 +39,7 @@ export interface RepositoryWorkerPipelineAdapters {
 	prepareWorkspace(input: { definition: RepositoryCampaignDefinition; claim: ClaimedRepositoryJob; advisory: VettedAdvisorySnapshot }): Promise<RepositoryPreparedWorkspace>
 	evaluate(input: { definition: RepositoryCampaignDefinition; claim: ClaimedRepositoryJob; advisory: VettedAdvisorySnapshot; workspace: RepositoryPreparedWorkspace; candidateSha256: string }): Promise<RepositoryVerificationReceipt>
 	deliverPrivate(input: { definition: RepositoryCampaignDefinition; claim: ClaimedRepositoryJob; advisory: VettedAdvisorySnapshot; candidateSha256: string; verification: RepositoryVerificationReceipt }): Promise<RepositoryPrivateDeliveryReceipt>
+	recordFailureDiagnostic?(input: { claim: ClaimedRepositoryJob; stage: RepositoryCampaignStep; error: unknown }): Promise<{ digest: string }>
 }
 
 function ref(kind: RepositoryEvidenceRef["kind"], label: string, digest: string): RepositoryEvidenceRef {
@@ -69,6 +71,7 @@ export function createRepositoryWorkerPipeline(adapters: RepositoryWorkerPipelin
 		async execute({ definition, claim, signal, progress }): Promise<RepositoryWorkerExecutionResult> {
 			let evidenceRefs: RepositoryEvidenceRef[] = []
 			let completedSteps: RepositoryCampaignStep[] = []
+			let currentStage: RepositoryCampaignStep = "intake"
 			let actualMicros: number | null = null
 			let actualTokens: number | null = null
 			let currentTask = "Load the registered advisory snapshot"
@@ -79,15 +82,19 @@ export function createRepositoryWorkerPipeline(adapters: RepositoryWorkerPipelin
 				const intakeDigest = requireDigest(advisory.snapshotSha256, "advisory snapshot")
 				evidenceRefs = [ref("intake", "Vetted advisory snapshot", intakeDigest)]
 				completedSteps = ["intake", "deduplicate"]
+				currentStage = "investigate"
 				await progress({ stage: "investigate", currentTask: "Check the advisory against the registered source", completedSteps, evidenceRefs })
 
 				if (signal.aborted) throw new Error("worker stopped before contained execution")
 				currentTask = "Prepare the bounded isolated workspace"
+				currentStage = "prepare-candidate"
+				await progress({ stage: currentStage, currentTask, completedSteps, evidenceRefs })
 				const workspace = await adapters.prepareWorkspace({ definition, claim, advisory })
 				if (!/^[a-f0-9]{64}$/.test(workspace.taskSha256) || typeof workspace.candidateSha256 !== "function" ||
 					(claim.job.purpose === "repair" ? !workspace.historicalRepairCandidate : typeof workspace.runContained !== "function")) throw new Error("prepared workspace is invalid")
 				try {
 				completedSteps = ["intake", "deduplicate", "investigate", "prepare-candidate"]
+					currentStage = "verify"
 				if (claim.job.purpose === "repair") {
 					actualMicros = 0
 					actualTokens = 0
@@ -110,6 +117,7 @@ export function createRepositoryWorkerPipeline(adapters: RepositoryWorkerPipelin
 				const verificationDigest = requireDigest(verification.evidenceSha256, "verification receipt")
 				evidenceRefs.push(ref("test-receipt", "Protected verification receipt", verificationDigest))
 				completedSteps = [...completedSteps, "verify"]
+					currentStage = "deliver"
 				if (!verification.passed) return { status: "failed", accounting: actualMicros === null || actualTokens === null ? "ambiguous" : "measured",
 					actualMicros, actualTokens, completedSteps, evidenceRefs, currentTask: "Protected verification rejected the candidate",
 					blocker: "protected-evaluator-rejected-candidate", nextStep: "review the protected verification receipt" }
@@ -136,9 +144,15 @@ export function createRepositoryWorkerPipeline(adapters: RepositoryWorkerPipelin
 					await workspace.cleanup?.()
 				}
 			} catch (error) {
+				if (adapters.recordFailureDiagnostic) {
+					try {
+						const diagnostic = await adapters.recordFailureDiagnostic({ claim, stage: currentStage, error })
+						evidenceRefs = [...evidenceRefs, ref("diagnostic", "Private bounded failure diagnostic", diagnostic.digest)]
+					} catch { /* Failure details stay absent rather than falling back to API-visible raw text. */ }
+				}
 				return { status: actualMicros === null || actualTokens === null ? "ambiguous" : "failed",
 					accounting: actualMicros === null || actualTokens === null ? "ambiguous" : "measured", actualMicros, actualTokens,
-					completedSteps, evidenceRefs, currentTask, blocker: "registered-pipeline-step-failed", nextStep: "review the bounded adapter failure out of band" }
+					completedSteps, evidenceRefs, currentTask, blocker: "registered-pipeline-step-failed", nextStep: "review the private bounded diagnostic before any recovery" }
 			}
 		},
 	}

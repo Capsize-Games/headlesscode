@@ -22,7 +22,7 @@ export type RepositoryCampaignStep = typeof REPOSITORY_CAMPAIGN_STEPS[number]
 
 export interface RepositoryEvidenceRef {
 	id: string
-	kind: "intake" | "candidate" | "test-receipt" | "delivery"
+	kind: "intake" | "candidate" | "test-receipt" | "delivery" | "diagnostic" | "no-call-proof"
 	label: string
 }
 
@@ -126,7 +126,7 @@ type RepositoryProgressUpdate = {
 }
 type RepositoryFinishProgress = { currentTask?: string; blocker?: string | null; nextStep?: string | null; boardRef?: string | null }
 type RepositoryFinishResult = { status: "succeeded" | "failed" | "ambiguous"; actualMicros?: number; actualTokens?: number; progress?: RepositoryFinishProgress }
-type RecoveredFinishResult = { status: "succeeded" | "failed"; actualMicros: number; actualTokens: number }
+type RecoveredFinishResult = { status: "succeeded" | "failed"; actualMicros: number; actualTokens: number; proofSha256?: string }
 
 export interface RepositoryAdvisoryIntakeRecord {
 	campaignId: string
@@ -516,7 +516,7 @@ function validProgressTimesAndNotes(p: RepositoryJobProgress): boolean {
 function validProgressEvidence(p: RepositoryJobProgress): boolean {
 	return Array.isArray(p.evidenceRefs) && p.evidenceRefs.length <= 20 && p.evidenceRefs.every((item) => item &&
 		Object.keys(item).sort().join(",") === "id,kind,label" && /^[a-f0-9]{64}$/.test(item.id) &&
-		["intake", "candidate", "test-receipt", "delivery"].includes(item.kind) &&
+		["intake", "candidate", "test-receipt", "delivery", "diagnostic", "no-call-proof"].includes(item.kind) &&
 		typeof item.label === "string" && item.label.length > 0 && item.label.length <= 80)
 }
 
@@ -763,7 +763,7 @@ function validProgressUpdateSteps(patch: RepositoryProgressUpdate): boolean {
 function validProgressUpdateEvidence(refs: RepositoryEvidenceRef[] | undefined): boolean {
 	if (refs === undefined) return true
 	return Array.isArray(refs) && refs.length <= 20 && refs.every((ref) => ref && /^[a-f0-9]{64}$/.test(ref.id) &&
-		["intake", "candidate", "test-receipt", "delivery"].includes(ref.kind) && typeof ref.label === "string" && !!ref.label.trim() && ref.label.length <= 80)
+		["intake", "candidate", "test-receipt", "delivery", "diagnostic", "no-call-proof"].includes(ref.kind) && typeof ref.label === "string" && !!ref.label.trim() && ref.label.length <= 80)
 }
 
 function validOptionalUpdateText(value: unknown, allowNull: boolean): boolean {
@@ -807,7 +807,8 @@ function validFinishResult(claim: ClaimedRepositoryJob, result: RepositoryFinish
 
 function validRecoveredFinish(claim: ClaimedRepositoryJob, result: RecoveredFinishResult): boolean {
 	return !!claim && !!claim.job && ["succeeded", "failed"].includes(result.status) &&
-		[result.actualMicros, result.actualTokens].every((n) => Number.isSafeInteger(n) && n >= 0)
+		[result.actualMicros, result.actualTokens].every((n) => Number.isSafeInteger(n) && n >= 0) &&
+		(result.proofSha256 === undefined || /^[a-f0-9]{64}$/.test(result.proofSha256))
 }
 
 async function invokeClaimStart<T>(start: () => Promise<T>,
@@ -895,7 +896,8 @@ function matchesClaim(job: RepositoryCampaignJob, claim: ClaimedRepositoryJob): 
 }
 
 function isAlreadySettled(job: RepositoryCampaignJob, result: RecoveredFinishResult): boolean {
-	return job.status === result.status && job.settledMicros === result.actualMicros && job.settledTokens === result.actualTokens
+	const proofMatches = result.proofSha256 === undefined || !!job.progress?.evidenceRefs.some((ref) => ref.kind === "no-call-proof" && ref.id === result.proofSha256)
+	return job.status === result.status && job.settledMicros === result.actualMicros && job.settledTokens === result.actualTokens && proofMatches
 }
 
 function requireRecoveredJob(s: CampaignState, claim: ClaimedRepositoryJob): RepositoryCampaignJob {
@@ -919,6 +921,17 @@ function applyRecoveredSettlement(job: RepositoryCampaignJob, campaign: Campaign
 	job.settledMicros = result.actualMicros
 	job.settledTokens = result.actualTokens
 	job.updatedAt = now.getTime()
+	if (result.proofSha256) {
+		if (!job.progress) throw new Error("recovered no-call proof has no job progress record")
+		const existing = job.progress.evidenceRefs.find((ref) => ref.kind === "no-call-proof")
+		if (existing && existing.id !== result.proofSha256) throw new Error("recovered no-call proof conflicts with prior job evidence")
+		if (!existing) job.progress.evidenceRefs.push({ id: result.proofSha256, kind: "no-call-proof", label: "Fleet no-call proof" })
+		job.progress.lastActionAt = now.getTime()
+		job.progress.heartbeatAt = now.getTime()
+		job.progress.leaseExpiresAt = now.getTime()
+		job.progress.currentTask = "Failed prepare attempt reconciled against Fleet no-call proof"
+		job.progress.nextStep = "Review the prepare failure before considering a separate job"
+	}
 }
 
 function findOrCreateObservedRecord(s: CampaignState, input: ObservedAdvisoryInput, now: Date,
@@ -1017,6 +1030,15 @@ export class RepositoryCampaignStore {
 			drafts: Object.values(state.drafts).map((draft) => ({ ...draft, readiness: "blocked-prerequisite", readinessReasons: ["owner-provisioned-enrollment-review"] })),
 			jobs: state.jobs.slice(-100), history: state.history.slice(-100), intakeRecords: (state.intakeRecords ?? []).slice(-100),
 		}
+	}
+
+	/** Full job view for the owner-only recovery command; never exposed by the HTTP API. */
+	async recoveryView(jobId: string, now = new Date()): Promise<{ job: RepositoryCampaignJob | undefined; activeJobs: RepositoryCampaignJob[] }> {
+		if (!/^[0-9a-f-]{36}$/.test(jobId)) throw new Error("recovery job identity is invalid")
+		const state = await this.read(now)
+		const target = state.jobs.find((job) => job.id === jobId)
+		return { job: target ? structuredClone(target) : undefined,
+			activeJobs: state.jobs.filter((job) => job.status === "running").map((job) => structuredClone(job)) }
 	}
 
 	async createDraft(input: { id: string; repository: string; name: string }, now = new Date()): Promise<void> {

@@ -14,6 +14,9 @@ import { CURL_CAMPAIGN_ID, CURL_CANDIDATE_TREE_SHA, CURL_FIXED_ADVISORY, CURL_PR
 	evaluatePinnedCurlCandidate, makeCurlProtectedEvaluationRequest } from "./repository-curl-evaluator.js"
 import { buildCurlHistoricalRepairCandidate, CURL_REPAIR_CAMPAIGN_ID, CURL_REPAIR_PROFILE_ID } from "./repository-curl-repair.js"
 import { evaluateCurlHistoricalRepairCandidate } from "./repository-curl-repair-evaluator.js"
+import { readFleetBudgetKeyIdentity } from "../rsi/fleet-budget-ledger.js"
+import { FleetRepositoryBudgetLedger } from "../rsi/fleet-repository-budget-ledger.js"
+import { recoverAmbiguousPrepareWithNoCallProof } from "./repository-no-call-recovery.js"
 
 function parseBudget(dollars: string): number | undefined {
 	if (!/^(?:0|[1-9]\d*)(?:\.\d{1,6})?$/.test(dollars)) return undefined
@@ -23,12 +26,12 @@ function parseBudget(dollars: string): number | undefined {
 }
 
 function usage(): string {
-	return "Usage: headlesscode campaign <status|rsi|on|off|budget --usd <amount>|tick|serve|qualify-known curl-maintenance CVE-2026-92390 --purpose=qualification|repair-known curl-historical-repair CVE-2026-92390 --purpose=repair> [--json]"
+	return "Usage: headlesscode campaign <status|rsi|on|off|budget --usd <amount>|tick|serve|qualify-known curl-maintenance CVE-2026-92390 --purpose=qualification|repair-known curl-historical-repair CVE-2026-92390 --purpose=repair|recover-no-call curl-maintenance <job-id> --confirm-no-call-proof=<job-id>> [--json]"
 }
 
 export async function campaignMain(args: string[]): Promise<number> {
 	const [action, ...rest] = args
-	if (!action || !["status", "rsi", "on", "off", "budget", "tick", "serve", "qualify-known", "repair-known", "_apply", "_adapter-tick", "_repository-run-begin", "_repository-run-finish", "_repository-lock-hold"].includes(action)) {
+	if (!action || !["status", "rsi", "on", "off", "budget", "tick", "serve", "qualify-known", "repair-known", "recover-no-call", "_apply", "_adapter-tick", "_repository-run-begin", "_repository-run-finish", "_repository-lock-hold"].includes(action)) {
 		process.stderr.write(`${usage()}\n`)
 		return 2
 	}
@@ -158,6 +161,40 @@ export async function campaignMain(args: string[]): Promise<number> {
 			return 0
 		} catch (error) {
 			process.stderr.write(`headlesscode campaign: ${error instanceof Error ? error.message : "known repair could not be queued"}\n`)
+			return 1
+		}
+	}
+	if (action === "recover-no-call") {
+		if (positional.length !== 3 || positional[0] !== CURL_CAMPAIGN_ID ||
+			!/^([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i.test(positional[1]!) ||
+			positional[2] !== `--confirm-no-call-proof=${positional[1]}`) return 2
+		try {
+			const definitions = await loadRepositoryCampaignDefinitions(REPOSITORY_CAMPAIGN_REGISTRY_FILE)
+			const definition = definitions.find((item) => item.id === CURL_CAMPAIGN_ID)
+			if (!definition) throw new Error("no-call recovery requires the owner-registered Curl qualification")
+			const readAuthority = createRepositoryBudgetAuthorityReader(definitions, CAMPAIGN_CONTROL_FILE)
+			const authority = await readAuthority(CURL_CAMPAIGN_ID)
+			if (!((authority.mode === "fleet-v2" || authority.mode === "fleet-v2-readonly") &&
+				authority.repositoryCampaignId === definition.id && authority.repositoryId === definition.repositoryId &&
+				authority.repository === definition.repository && authority.sourceRevision === definition.sourceRevision &&
+				authority.policySha256 === definition.policySha256 && authority.model === definition.model &&
+				authority.profileId === "muse-spark-contributor" && Number.isSafeInteger(authority.repositoryEpoch))) {
+				throw new Error("fresh Fleet Curl scope is unavailable for no-call recovery")
+			}
+			const scope = { repositoryCampaignId: definition.id, repositoryId: definition.repositoryId!, repository: definition.repository!,
+				sourceRevision: definition.sourceRevision!, policySha256: definition.policySha256!, model: definition.model as "meta/muse-spark-1.3-contributor",
+				profileId: "muse-spark-contributor" as const, repositoryEpoch: authority.repositoryEpoch! }
+			const expectedKeyIdentity = await readFleetBudgetKeyIdentity()
+			const ledger = new FleetRepositoryBudgetLedger({ expectedKeyIdentity, scope })
+			const repositoryStore = new RepositoryCampaignStore(REPOSITORY_CAMPAIGN_STATE_FILE, definitions, readAuthority)
+			const result = await recoverAmbiguousPrepareWithNoCallProof(positional[1]!, `CONFIRM RECOVER NO-CALL ${positional[1]}`, {
+				store: repositoryStore, controlStore: new CampaignControlStore(CAMPAIGN_CONTROL_FILE), ledger, definition, scope,
+				expectedKeyIdentity, storePath: REPOSITORY_CAMPAIGN_STATE_FILE,
+			})
+			process.stdout.write(`${JSON.stringify({ recovery: "no-call-proof", ...result })}\n`)
+			return 0
+		} catch (error) {
+			process.stderr.write(`headlesscode campaign: ${error instanceof Error ? error.message : "no-call recovery failed closed"}\n`)
 			return 1
 		}
 	}

@@ -15,6 +15,7 @@ import {
 } from "./repository-curl-repair.js"
 import { evaluateCurlHistoricalRepairCandidate } from "./repository-curl-repair-evaluator.js"
 import { CURL_REPAIR_DELIVERY_POLICY_SHA256 } from "./repository-curl-repair-delivery.js"
+import { writeRepositoryWorkerDiagnostic } from "./repository-worker-diagnostics.js"
 
 const SOURCE_ROOT = path.join(os.homedir(), ".local", "share", "headlesscode", "repository-sources", "curl-maintenance")
 const MODEL = "none"
@@ -43,6 +44,9 @@ export function createCurlHistoricalRepairAdapters(registration: RepositoryWorke
 		model: registration.model,
 		executionKind: "live-cve",
 		reservation: { ...registration.reservation },
+		async recordFailureDiagnostic(input) {
+			return await writeRepositoryWorkerDiagnostic(context.store.path, { claim: input.claim, stage: input.stage, error: input.error })
+		},
 		async lookupAdvisory(advisoryId, currentDefinition) {
 			if (currentDefinition.id !== CURL_REPAIR_CAMPAIGN_ID || advisoryId !== CURL_FIXED_ADVISORY) throw new Error("Curl repair advisory is outside the pinned profile")
 			return await loadKnownCurlDebianAdvisory()

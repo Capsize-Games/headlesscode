@@ -208,6 +208,7 @@ async function fixture(options: { activeRun?: boolean; repositoryEnabled?: boole
 	const credential = path.join(campaign, "test-key"),
 		config = path.join(campaign, "config.json")
 	const controlFile = path.join(controlDir, "control.json")
+	await fs.writeFile(path.join(controlDir, "campaign-dispatch.lock"), "", { mode: 0o600 })
 	await fs.writeFile(credential, fakeKey,
 		{ mode: 0o600 }); await fs.chmod(credential, 0o600)
 	await fs.writeFile(config, JSON.stringify({ schema_version: 1,
@@ -355,6 +356,28 @@ test("HCL binding sends v2 repository identities and both repositories consume t
 	await extraLedger.register(extraGrant)
 	await assert.rejects(extraLedger.reserve(extraGrant, { ...reservation("extra-call"), reservedUsd: 0.01, reservedTokens: 2 }),
 		/repository lifetime budget exhausted/)
+})
+
+test("Fleet no-call proof is scope-bound, point-in-time and read-only", { skip: integrationSkip }, async (t) => {
+	const f = await fixture(); t.after(f.cleanup)
+	const ledger = new FleetRepositoryBudgetLedger({ expectedKeyIdentity: keyIdentity, scope: scope("repo-a"), invoke: async (message) => {
+		const result = await f.invoke(message)
+		if (message.op === "repository-no-call-proof") assert.deepEqual(Object.keys(result).sort(), ["asOfMs", "campaignId", "counts", "disposition", "jobId", "keyIdentity", "model", "policySha256", "profileId", "proved", "repository", "repositoryCampaignId", "repositoryEpoch", "repositoryId", "schemaVersion", "sourceRevision"].sort())
+		return result
+	} })
+	const empty = await ledger.proveNoCall("prepare-failed-job", 1)
+	assert.equal(empty.proved, true)
+	assert.equal(empty.disposition, "no-recorded-provider-activity")
+	assert.deepEqual(empty.counts, { grants: 0, calls: 0, denials: 0 })
+	assert.equal(empty.jobId, "prepare-failed-job")
+	assert.ok(Math.abs(Date.now() - empty.asOfMs) < 10_000)
+	const grantValue = grant("prepare-job-with-grant")
+	await ledger.register(grantValue)
+	const afterGrant = await ledger.proveNoCall(grantValue.jobId, 1)
+	assert.equal(afterGrant.proved, false)
+	assert.equal(afterGrant.disposition, "activity-present")
+	assert.deepEqual(afterGrant.counts, { grants: 1, calls: 0, denials: 0 })
+	await assert.rejects(ledger.proveNoCall("prepare-failed-job", -1), /no-call proof identity is invalid/)
 })
 
 test("cold start reads Fleet budget without a run, then starts, claims, and stops through real HCL and Fleet stores", { skip: integrationSkip }, async (t) => {
