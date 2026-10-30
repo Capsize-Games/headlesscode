@@ -117,6 +117,8 @@ export interface RepositoryCampaignJob {
 	progress?: RepositoryJobProgress
 	detail?: string
 	purpose?: "qualification" | "repair"
+	/** Explicit owner-authorized retry lineage; only the verified no-call Curl path may set this. */
+	retryOf?: string
 }
 
 type ObservedAdvisoryInput = { campaignId: string; publicBaseRevision: string; advisoryId: string; snapshotSha256: string; eligible: boolean }
@@ -379,9 +381,17 @@ function validDraftRecord(id: string, draft: CampaignState["drafts"][string]): b
 }
 
 function validQualificationJob(job: RepositoryCampaignJob, s: Partial<CampaignState>): boolean {
-	return job.purpose === "qualification" && job.campaignId === CURL_CAMPAIGN_ID && job.advisoryId === CURL_FIXED_ADVISORY &&
-		(s.intakeRecords ?? []).some((row) => row?.source === "debian-tracker-snapshot" && row.jobId === job.id &&
-			row.campaignId === job.campaignId && row.advisoryId === job.advisoryId && row.snapshotSha256 === CURL_DEBIAN_SNAPSHOT_SHA256)
+	if (job.purpose !== "qualification" || job.campaignId !== CURL_CAMPAIGN_ID || job.advisoryId !== CURL_FIXED_ADVISORY) return false
+	if (job.retryOf === undefined) return (s.intakeRecords ?? []).some((row) => row?.source === "debian-tracker-snapshot" && row.jobId === job.id &&
+		row.campaignId === job.campaignId && row.advisoryId === job.advisoryId && row.snapshotSha256 === CURL_DEBIAN_SNAPSHOT_SHA256)
+	const parent = (s.jobs ?? []).find((row) => row.id === job.retryOf)
+	const parentProof = parent?.progress?.evidenceRefs.filter((ref) => ref.kind === "no-call-proof") ?? []
+	return !!parent && parent.retryOf === undefined && parent.purpose === "qualification" && parent.campaignId === job.campaignId &&
+		parent.advisoryId === job.advisoryId && parent.status === "failed" && parent.reservedMicros === 0 && parent.reservedTokens === 0 &&
+		parent.settledMicros === 0 && parent.settledTokens === 0 && parentProof.length === 1 && /^[a-f0-9]{64}$/.test(parentProof[0]!.id) &&
+		(s.intakeRecords ?? []).some((row) => row?.source === "debian-tracker-snapshot" && row.jobId === parent.id &&
+			row.campaignId === job.campaignId && row.advisoryId === job.advisoryId && row.snapshotSha256 === CURL_DEBIAN_SNAPSHOT_SHA256) &&
+		(s.jobs ?? []).filter((row) => row.retryOf === parent.id).length === 1
 }
 
 function validRepairJob(job: RepositoryCampaignJob, s: Partial<CampaignState>): boolean {
@@ -399,9 +409,10 @@ function validJobRecord(job: RepositoryCampaignJob, s: Partial<CampaignState>, i
 
 function validJobOptionalDetails(job: RepositoryCampaignJob, s: Partial<CampaignState>): boolean {
 	const text = (job.claimId === undefined || typeof job.claimId === "string") && (job.detail === undefined || typeof job.detail === "string")
+	const retry = job.retryOf === undefined || validId(job.retryOf)
 	const purpose = job.purpose === undefined || validQualificationJob(job, s) || validRepairJob(job, s)
 	const progress = job.progress === undefined || validProgress(job.progress)
-	return text && purpose && progress
+	return text && retry && purpose && progress
 }
 
 function validJobIdentityAndStatus(job: RepositoryCampaignJob, s: Partial<CampaignState>): boolean {
@@ -1210,6 +1221,59 @@ export class RepositoryCampaignStore {
 			if (s.jobs.length > MAX_JOBS || s.intakeRecords.length >= MAX_INTAKE_RECORDS) throw new Error("known advisory qualification storage limit reached")
 			s.intakeRecords.push(record)
 			return { ...job }
+		}, now)
+	}
+
+	/** Create one explicit child retry for a failed, zero-cost, proof-backed Curl qualification. */
+	async enqueueVerifiedNoCallRetry(parentJobId: string, confirmation: string, now = new Date()): Promise<RepositoryCampaignJob> {
+		if (!validId(parentJobId) || confirmation !== `CONFIRM RETRY NO-CALL ${parentJobId}`) {
+			throw new Error("explicit no-call retry confirmation is required")
+		}
+		const definition = this.requireDefinition(CURL_CAMPAIGN_ID)
+		const authority = await this.budgetAuthority(CURL_CAMPAIGN_ID)
+		if (authority.mode !== "fleet-v2" || !authority.available || authority.globalEnabled !== true || authority.canAdmit !== true ||
+			authority.repositoryEnabled !== true || !authority.runId || !authority.runExpiresAtMs || authority.runExpiresAtMs <= now.getTime()) {
+			throw new Error("no-call retry requires fresh enabled Fleet dispatch authority")
+		}
+		return this.update((s) => {
+			const campaign = this.campaign(s, CURL_CAMPAIGN_ID)
+			if (!campaign.enabled || this.missingReadiness(definition, authority, campaign, s).length || this.isExhausted(campaign)) {
+				throw new Error("no-call retry requires a ready campaign with remaining lifetime budget")
+			}
+			const parent = s.jobs.find((job) => job.id === parentJobId)
+			const proofRefs = parent?.progress?.evidenceRefs.filter((ref) => ref.kind === "no-call-proof") ?? []
+			if (!parent || parent.retryOf !== undefined || parent.campaignId !== CURL_CAMPAIGN_ID || parent.advisoryId !== CURL_FIXED_ADVISORY ||
+				parent.purpose !== "qualification" || parent.status !== "failed" || parent.reservedMicros !== 0 || parent.reservedTokens !== 0 ||
+				parent.settledMicros !== 0 || parent.settledTokens !== 0 || proofRefs.length !== 1 || !/^[a-f0-9]{64}$/.test(proofRefs[0]!.id)) {
+				throw new Error("retry parent is not a recovered zero-cost Curl qualification")
+			}
+			const intake = s.intakeRecords.find((row) => row.source === "debian-tracker-snapshot" && row.jobId === parent.id &&
+				row.campaignId === parent.campaignId && row.advisoryId === parent.advisoryId && row.snapshotSha256 === CURL_DEBIAN_SNAPSHOT_SHA256)
+			if (!intake) throw new Error("retry parent has no matching immutable advisory intake record")
+			if (s.jobs.some((job) => job.retryOf === parent.id)) throw new Error("this failed qualification already has a retry child")
+			if (s.jobs.some((job) => job.campaignId === CURL_CAMPAIGN_ID && (job.status === "queued" || job.status === "running"))) {
+				throw new Error("another Curl qualification job is active")
+			}
+			const totals = this.aggregateTotals(s)
+			const requiredMicros = 8_000, requiredTokens = 72_000
+			const monthly = authority.monthly!, campaignLifetime = authority.campaignLifetime!, repositoryLifetime = authority.repositoryLifetime!
+			if (campaign.settledMicros + campaign.reservedMicros + campaign.ambiguousMicros + requiredMicros > campaign.budgetLimitMicros ||
+				campaign.settledTokens + campaign.reservedTokens + campaign.ambiguousTokens + requiredTokens > campaign.budgetLimitTokens ||
+				authority.committedMicros + totals.settledMicros + totals.reservedMicros + totals.ambiguousMicros + requiredMicros > authority.limitMicros ||
+				authority.committedTokens + totals.settledTokens + totals.reservedTokens + totals.ambiguousTokens + requiredTokens > authority.limitTokens ||
+				monthly.settledMicros + monthly.reservedMicros + monthly.ambiguousMicros + requiredMicros > monthly.limitMicros ||
+				campaignLifetime.settledMicros + campaignLifetime.reservedMicros + campaignLifetime.ambiguousMicros + requiredMicros > campaignLifetime.limitMicros ||
+				campaignLifetime.settledTokens + campaignLifetime.reservedTokens + campaignLifetime.ambiguousTokens + requiredTokens > campaignLifetime.limitTokens ||
+				repositoryLifetime.settledMicros + repositoryLifetime.reservedMicros + repositoryLifetime.ambiguousMicros + requiredMicros > repositoryLifetime.limitMicros ||
+				repositoryLifetime.settledTokens + repositoryLifetime.reservedTokens + repositoryLifetime.ambiguousTokens + requiredTokens > repositoryLifetime.limitTokens) {
+				throw new Error("no-call retry exceeds remaining Fleet or local budget")
+			}
+			if (s.jobs.length >= MAX_JOBS) throw new Error("campaign job queue is full")
+			const child: RepositoryCampaignJob = { id: randomUUID(), retryOf: parent.id, campaignId: parent.campaignId,
+				advisoryId: parent.advisoryId, status: "queued", epoch: campaign.epoch, createdAt: now.getTime(), updatedAt: now.getTime(),
+				month: s.month, reservedMicros: 0, settledMicros: 0, reservedTokens: 0, settledTokens: 0, purpose: "qualification" }
+			s.jobs.push(child)
+			return structuredClone(child)
 		}, now)
 	}
 

@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 import { test } from "node:test"
-import { recoverAmbiguousPrepareWithNoCallProof } from "../repository-no-call-recovery.js"
+import { recoverAmbiguousPrepareWithNoCallProof, verifyRecoveredNoCallArtifact } from "../repository-no-call-recovery.js"
 import type { RepositoryCampaignDefinition, RepositoryCampaignJob } from "../repository-campaigns.js"
 import type { FleetRepositoryBudgetScope, FleetRepositoryNoCallProof } from "../../rsi/fleet-repository-budget-ledger.js"
 
@@ -52,7 +52,7 @@ async function fixture(options: { activeRun?: boolean; activeJobs?: boolean; san
 		listRunningSandboxes: () => options.sandboxes ?? [], worktreeRoot, clock: () => now,
 		withDispatchFence: async <T>(operation: () => Promise<T>) => await operation(),
 	}
-	return { root, storePath, dependencies, get proofCalls() { return proofCalls }, get settlement() { return settlement }, get controlCalls() { return controlCalls } }
+	return { root, storePath, job, dependencies, get proofCalls() { return proofCalls }, get settlement() { return settlement }, get controlCalls() { return controlCalls } }
 }
 
 test("recovery requires the exact owner confirmation before any proof read", async (t) => {
@@ -89,6 +89,9 @@ test("a fresh exact zero-call Fleet proof is saved before failed zero-cost settl
 	assert.equal(info.mode & 0o777, 0o600)
 	const stored = JSON.parse(await fs.readFile(recordPath, "utf8"))
 	assert.equal(stored.proof.jobId, id)
+	const recoveredJob = { ...f.job, status: "failed" as const, settledMicros: 0, settledTokens: 0,
+		progress: { ...f.job.progress!, evidenceRefs: [{ id: result.proofSha256, kind: "no-call-proof" as const, label: "Fleet no-call proof" }] } }
+	assert.equal(await verifyRecoveredNoCallArtifact(recoveredJob, f.storePath, scope, proof.keyIdentity), result.proofSha256)
 	assert.deepEqual(stored.proof.counts, { grants: 0, calls: 0, denials: 0 })
 	const settlementArgs = f.settlement as [unknown, { proofSha256: string; status: string; actualMicros: number }]
 	assert.equal(settlementArgs[1].proofSha256, result.proofSha256)

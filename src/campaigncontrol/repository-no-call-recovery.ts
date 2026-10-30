@@ -72,6 +72,52 @@ export async function recoverAmbiguousPrepareWithNoCallProof(jobId: string, conf
 	})
 }
 
+/** Verify the immutable no-call artifact before creating an explicit retry child. */
+export async function verifyRecoveredNoCallArtifact(job: RepositoryCampaignJob, storePath: string,
+	scope: FleetRepositoryBudgetScope, keyIdentity: string): Promise<string> {
+	if (job.campaignId !== "curl-maintenance" || job.advisoryId !== "CVE-2026-92390" || job.purpose !== "qualification" ||
+		job.status !== "failed" || job.retryOf !== undefined || job.settledMicros !== 0 || job.settledTokens !== 0 ||
+		job.reservedMicros !== 0 || job.reservedTokens !== 0 || !job.progress || !job.claimId || !Number.isSafeInteger(job.epoch)) {
+		throw new Error("retry target is not a recovered zero-cost Curl qualification")
+	}
+	const refs = job.progress.evidenceRefs.filter((ref) => ref.kind === "no-call-proof")
+	if (refs.length !== 1 || !HEX.test(refs[0]!.id)) throw new Error("retry target has no unique no-call proof reference")
+	const digest = refs[0]!.id
+	const directory = path.join(path.dirname(path.resolve(storePath)), "no-call-proofs")
+	const directoryStat = await fs.lstat(directory)
+	if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || (directoryStat.mode & 0o077) !== 0 ||
+		(typeof process.getuid === "function" && directoryStat.uid !== process.getuid())) throw new Error("no-call proof directory is not owner-only")
+	const filename = `${job.id}-${job.claimId}-${job.epoch}-${digest}.json`
+	const target = path.join(directory, filename)
+	const info = await fs.lstat(target)
+	if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o077) !== 0 || info.nlink !== 1 || info.size > 8 * 1024 ||
+		(typeof process.getuid === "function" && info.uid !== process.getuid())) throw new Error("no-call proof artifact is unavailable")
+	const handle = await fs.open(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK)
+	let bytes: Buffer
+	try {
+		const opened = await handle.stat()
+		if (!opened.isFile() || opened.nlink !== 1 || opened.size > 8 * 1024 || (opened.mode & 0o077) !== 0 ||
+			(typeof process.getuid === "function" && opened.uid !== process.getuid())) throw new Error("no-call proof artifact changed while opening")
+		bytes = await handle.readFile()
+	} finally { await handle.close() }
+	if (bytes.byteLength > 8 * 1024) throw new Error("no-call proof artifact exceeds its bound")
+	if (createHash("sha256").update(bytes).digest("hex") !== digest) throw new Error("no-call proof artifact digest does not match")
+	let record: Record<string, unknown>
+	try { record = JSON.parse(bytes.toString("utf8")) } catch { throw new Error("no-call proof artifact is malformed") }
+	const proof = record.proof as FleetRepositoryNoCallProof | undefined
+	if (Object.keys(record).sort().join(",") !== "claimId,epoch,jobId,proof,schemaVersion" || record.schemaVersion !== 1 ||
+		record.claimId !== job.claimId || record.epoch !== job.epoch || record.jobId !== job.id || !proof || proof.proved !== true ||
+		proof.disposition !== "no-recorded-provider-activity" || proof.jobId !== job.id || proof.campaignId !== "fleet-security-watch" ||
+		proof.repositoryCampaignId !== scope.repositoryCampaignId || proof.repositoryId !== scope.repositoryId ||
+		proof.repository !== scope.repository || proof.sourceRevision !== scope.sourceRevision || proof.policySha256 !== scope.policySha256 ||
+		proof.model !== scope.model || proof.profileId !== scope.profileId || proof.keyIdentity !== keyIdentity ||
+		!Number.isSafeInteger(proof.repositoryEpoch) || !Number.isSafeInteger(proof.asOfMs) || proof.asOfMs > Date.now() + 60_000 ||
+		!proof.counts || proof.counts.grants !== 0 || proof.counts.calls !== 0 || proof.counts.denials !== 0) {
+		throw new Error("no-call proof artifact does not match the recovered Curl attempt")
+	}
+	return digest
+}
+
 function isRecoverableTarget(job: RepositoryCampaignJob | undefined, definition: RepositoryCampaignDefinition, now: number): job is RepositoryCampaignJob {
 	return !!job && job.id !== undefined && job.campaignId === definition.id && job.advisoryId === "CVE-2026-92390" &&
 		job.purpose === "qualification" && job.status === "ambiguous" && typeof job.claimId === "string" && UUID.test(job.claimId) &&
