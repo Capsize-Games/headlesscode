@@ -2,13 +2,18 @@ import assert from "node:assert/strict"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { snapshotRepositoryBrokerCapability } from "../../cloud/openshell-provider.js"
+import {
+	snapshotRepositoryBrokerCapability,
+} from "../../cloud/openshell-provider.js"
 import { REPOSITORY_WORKER_BROKER_URL, repositoryWorkerCommand,
 	runContainedRepositoryWorker, writeRepositoryBrokerCapability,
-		writeRepositoryWorkerTask, summarizeWorkerFailure } from "../repository-worker.js"
+		writeRepositoryWorkerTask, summarizeWorkerFailure,
+	} from "../repository-worker.js"
 import type { ContainedRuntimeProfile } from "../../security/profile.js"
 
-async function withTempDir(fn: (root: string) => Promise<void> | void): Promise<void> {
+async function withTempDir(
+	fn: (root: string) => Promise<void> | void,
+): Promise<void> {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "hcl-repository-worker-"))
 	try { fs.chmodSync(root, 0o700); await fn(root) } finally { fs.rmSync(root,
 		{ recursive: true, force: true }) }
@@ -54,38 +59,62 @@ function assertTaskContents(root: string, digest: string): void {
 	assert.equal(fs.statSync(taskPath).mode & 0o777, 0o600)
 }
 
+
+function assertCommandReadsCapabilityAtRuntime(command: string): void {
+	const runtimeCapabilityRef = "repository_capability=\"$(cat "
+		+ "/run/headlesscode/repository-broker-capability)\""
+	const inferenceExport = "export HEADLESSCODE_RSI_INFERENCE_CAPABILITY="
+		+ "\"$repository_capability\""
+	assert.equal(command.includes(runtimeCapabilityRef), true)
+	assert.equal(command.includes(inferenceExport), true)
+}
 function assertBrokerCapabilityCommand(root: string): void {
 	const file = writeRepositoryBrokerCapability(root, capability)
 	assert.equal(fs.statSync(file).mode & 0o777, 0o600)
 	assert.equal(fs.readFileSync(file, "utf8").trim(), capability)
 	const command = repositoryWorkerCommand("worker-job-123")
 	assert.equal(command.includes(capability), false)
-	assert.equal(command.includes("repository_capability=\"$(cat /run/headlesscode/repository-broker-capability)\""), true)
-	assert.equal(command.includes("export HEADLESSCODE_RSI_INFERENCE_CAPABILITY=\"$repository_capability\""), true)
+	assertCommandReadsCapabilityAtRuntime(command)
 	assert.equal(command.includes("OPENROUTER_BASE_URL="), false)
 	assert.match(command, /--session-id 'worker-job-123'/)
 	assert.match(command, /--security-profile local/)
 	assert.match(command, /--published-advisory-qualification/)
-	assert.match(command, /--max-tokens 4000 --max-iterations 2 --max-cost-usd 0\.008/)
+	assert.match(
+		command, /--max-tokens 4000 --max-iterations 2 --max-cost-usd 0\.008/,
+	)
 	assert.equal(REPOSITORY_WORKER_BROKER_URL,
 		"http://host.openshell.internal:4392")
 }
 
 function assertWorkerFailureSummaryIsBoundedAndScrubbed(): void {
-	const summary = summarizeWorkerFailure(1, 529,
-		"noise line\nError: EACCES opening /home/joe/private/profile with Bearer secret-value\nnext failure sk-ABCDEFGHIJKLMNOPQRSTUV1234",
-		"a".repeat(64))
+	const noisyFailure = "noise line\nError: EACCES opening /home/jo"
+		+ "e/private/profile with Bearer secret-value"
+		+ "\nnext failure sk-ABCDEFGHIJKLMNOPQRSTUV1234";
+	const summary = summarizeWorkerFailure(
+		1,
+		529,
+		noisyFailure,
+		"a".repeat(64),
+	)
 	assert.ok(summary.length <= 512)
 	assert.match(summary, /exit=1/)
 	assert.match(summary, /EACCES opening \[local-path\]/)
 	assert.match(summary, /Bearer \[redacted\]/)
 	assert.match(summary, /\[redacted-token\]/)
-	assert.doesNotMatch(summary, /secret-value|sk-ABCDEFGHIJKLMNOPQRSTUV1234|\/home\/joe\/private/)
+	assert.doesNotMatch(summary, /secret-value/)
+	assert.doesNotMatch(summary, /sk-ABCDEFGHIJKLMNOPQRSTUV1234/)
+	assert.doesNotMatch(summary, /\/home\/joe\/private/)
 }
 
 const tests: Array<[string, () => Promise<void>]> = [
-	["nonzero worker output is summarized with bounded redaction", async () => assertWorkerFailureSummaryIsBoundedAndScrubbed()],
-	["stores the per-job broker capability in a private file, never command or environment text", async () => withTempDir(assertBrokerCapabilityCommand)],
+	[
+		"nonzero worker output is summarized with bounded redaction",
+		async () => assertWorkerFailureSummaryIsBoundedAndScrubbed(),
+	],
+	[
+		"stores the per-job broker capability in a private file, never command text",
+		async () => withTempDir(assertBrokerCapabilityCommand),
+	],
 	["fixed worker command matches the immutable OpenShell image contract",
 		async () => {
 		const image = fs.readFileSync(path.join(process.cwd(),
@@ -104,7 +133,10 @@ const tests: Array<[string, () => Promise<void>]> = [
 		assert.throws(() => writeRepositoryBrokerCapability(permissive,
 			capability), /owner-only/)
 	})],
-	["writes only bounded, source-linked advisory facts and returns an immutable task digest", testWritesBoundedTask],
+	[
+		"writes only bounded, source-linked advisory facts and returns a task digest",
+		testWritesBoundedTask,
+	],
 	["qualification task explicitly forbids edits, commands, and tests",
 		async () => withTempDir((root) => {
 		writeRepositoryWorkerTask(root, { advisoryId: "CVE-2026-1024",
@@ -119,7 +151,9 @@ const tests: Array<[string, () => Promise<void>]> = [
 		assert.match(task, /protected fixed-profile verification separately/)
 		assert.doesNotMatch(task, /prepare a minimal candidate/)
 	})],
-	["snapshots a broker capability read-only and rejects unprotected or malformed sources", async () => withTempDir((root) => {
+	[
+		"snapshots a broker capability and rejects unprotected sources",
+		async () => withTempDir((root) => {
 		const source = writeRepositoryBrokerCapability(root, capability)
 		const protectedDir = path.join(root,
 			"protected"); fs.mkdirSync(protectedDir,
@@ -137,10 +171,16 @@ const tests: Array<[string, () => Promise<void>]> = [
 			providers: ["headlesscode-openrouter"],
 				inferenceEndpoint: { host: "openrouter.ai",
 					port: 443 } } as unknown as ContainedRuntimeProfile
-		await assert.rejects(runContainedRepositoryWorker({ repoRoot: root,
-			worktree: root, profile, model: "fixture/model",
-				capabilityFile: path.join(root, "cap"), taskSha256: "a".repeat(64), signal: new AbortController().signal }),
-					/fixed profile/)
+		await assert.rejects(runContainedRepositoryWorker({
+			repoRoot: root,
+			worktree: root,
+			profile,
+			model: "fixture/model",
+			capabilityFile: path.join(root, "cap"),
+			taskSha256: "a".repeat(64),
+			signal: new AbortController().signal,
+		}),
+			/fixed profile/)
 	})],
 ]
 
