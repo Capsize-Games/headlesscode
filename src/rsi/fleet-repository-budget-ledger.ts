@@ -77,6 +77,11 @@ export interface FleetRepositoryNoCallProof {
 	jobId: string
 	counts: { grants: number; calls: number; denials: number }
 	grant: null | { issuedAtMs: number; deadlineAtMs: number; grantSha256: string; runId: string; controlEpoch: number }
+	globalEnabled?: false
+	canAdmit?: false
+	activeRunId?: null
+	controlEpoch?: number
+	repositoryEnabled?: boolean
 }
 
 export interface FleetRepositoryClosedSessionProof {
@@ -257,7 +262,13 @@ export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 
 	/** Read immutable Fleet ledgers for explicit owner recovery; this never calls provider authority. */
 	async proveNoCall(jobId: string, repositoryEpoch: number): Promise<FleetRepositoryNoCallProof> {
-		if (this.scope.model !== MODEL || this.scope.profileId !== PROFILE) throw new Error("no-call proof is unavailable for a budget-only repository scope")
+		const v2NoModel = this.scope.repositoryCampaignId === CURL_REPAIR_V2_CAMPAIGN_ID &&
+			this.scope.repositoryId === CURL_REPAIR_V2_REPOSITORY_ID &&
+			this.scope.repository === CURL_REPAIR_V2_TARGET_REPOSITORY &&
+			this.scope.sourceRevision === CURL_REPAIR_V2_SOURCE_REVISION &&
+			this.scope.policySha256 === CURL_REPAIR_V2_POLICY_SHA256 &&
+			this.scope.model === "none" && this.scope.profileId === "no-model"
+		if (!v2NoModel && (this.scope.model !== MODEL || this.scope.profileId !== PROFILE)) throw new Error("no-call proof is unavailable for a budget-only repository scope")
 		if (!ID.test(jobId) || !Number.isSafeInteger(repositoryEpoch) || repositoryEpoch < 0) throw new Error("Fleet no-call proof identity is invalid")
 		const result = await this.call({ schemaVersion: 2, op: "repository-no-call-proof", campaignId: FLEET_BUDGET_CAMPAIGN_ID,
 			repositoryCampaignId: this.scope.repositoryCampaignId, repositoryId: this.scope.repositoryId,
@@ -265,7 +276,8 @@ export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 			policySha256: this.scope.policySha256, model: this.scope.model, profileId: this.scope.profileId,
 			keyIdentity: this.expectedKeyIdentity, repositoryEpoch, jobId })
 		const counts = result.counts
-		const expected = "asOfMs,campaignId,counts,disposition,grant,jobId,keyIdentity,model,policySha256,profileId,proved,repository,repositoryCampaignId,repositoryEpoch,repositoryId,schemaVersion,sourceRevision"
+		const v2Expected = "activeRunId,asOfMs,campaignId,canAdmit,controlEpoch,counts,disposition,globalEnabled,grant,jobId,keyIdentity,model,policySha256,profileId,proved,repository,repositoryCampaignId,repositoryEnabled,repositoryEpoch,repositoryId,schemaVersion,sourceRevision"
+		const expected = v2NoModel ? v2Expected : "asOfMs,campaignId,counts,disposition,grant,jobId,keyIdentity,model,policySha256,profileId,proved,repository,repositoryCampaignId,repositoryEpoch,repositoryId,schemaVersion,sourceRevision"
 		const validCounts = !!counts && typeof counts === "object" && !Array.isArray(counts) &&
 			Object.keys(counts).sort().join(",") === "calls,denials,grants" &&
 			["grants", "calls", "denials"].every((key) => Number.isSafeInteger((counts as Record<string, unknown>)[key]) && Number((counts as Record<string, unknown>)[key]) >= 0)
@@ -281,8 +293,13 @@ export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 			typeof grant.grantSha256 === "string" && /^[a-f0-9]{64}$/.test(grant.grantSha256)
 		const expiredUnusedGrant = validCounts && Number((counts as Record<string, number>).grants) === 1 && grantShape &&
 			zeroCallsAndDenials && Number(grant!.issuedAtMs) <= Number(result.asOfMs) && Number(grant!.deadlineAtMs) <= Number(result.asOfMs)
-		const proved = zeroCallsAndDenials && (zeroGrant || expiredUnusedGrant)
-		const disposition = zeroGrant ? "no-recorded-provider-activity" : expiredUnusedGrant ? "expired-unused-grant" :
+		const v2StateValid = !v2NoModel || (Number((counts as Record<string, number> | undefined)?.grants) === 0 &&
+			grant === null && result.globalEnabled === false && result.canAdmit === false && result.activeRunId === null &&
+			Number.isSafeInteger(result.controlEpoch) && Number(result.controlEpoch) >= 0 &&
+			typeof result.repositoryEnabled === "boolean")
+		const proved = v2NoModel ? v2StateValid && validCounts && Number((counts as Record<string, number>).calls) === 0 &&
+			Number((counts as Record<string, number>).denials) === 0 : zeroCallsAndDenials && (zeroGrant || expiredUnusedGrant)
+		const disposition = v2NoModel ? (proved ? "no-recorded-provider-activity" : "activity-present") : zeroGrant ? "no-recorded-provider-activity" : expiredUnusedGrant ? "expired-unused-grant" :
 			grantShape && zeroCallsAndDenials ? "grant-not-expired" : "activity-present"
 		if (Object.keys(result).sort().join(",") !== expected || result.schemaVersion !== 2 ||
 			result.campaignId !== FLEET_BUDGET_CAMPAIGN_ID || result.repositoryCampaignId !== this.scope.repositoryCampaignId ||
@@ -291,7 +308,8 @@ export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 			result.model !== this.scope.model || result.profileId !== this.scope.profileId || result.keyIdentity !== this.expectedKeyIdentity ||
 			result.repositoryEpoch !== repositoryEpoch || result.jobId !== jobId || !validCounts ||
 			!Number.isSafeInteger(result.asOfMs) || Date.now() - Number(result.asOfMs) > 60_000 || Number(result.asOfMs) > Date.now() + 60_000 ||
-			result.proved !== proved || result.disposition !== disposition) {
+			result.proved !== proved || result.disposition !== disposition || !v2StateValid ||
+			(v2NoModel && result.model !== "none")) {
 			throw new Error("Fleet repository no-call proof is invalid")
 		}
 		return { campaignId: FLEET_BUDGET_CAMPAIGN_ID, repositoryCampaignId: this.scope.repositoryCampaignId,
@@ -300,7 +318,9 @@ export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 			keyIdentity: this.expectedKeyIdentity, proved,
 			disposition: disposition,
 			asOfMs: Number(result.asOfMs), jobId, counts: counts as FleetRepositoryNoCallProof["counts"],
-			grant: grant as FleetRepositoryNoCallProof["grant"] }
+			grant: grant as FleetRepositoryNoCallProof["grant"],
+			...(v2NoModel ? { globalEnabled: false as const, canAdmit: false as const, activeRunId: null,
+				controlEpoch: Number(result.controlEpoch), repositoryEnabled: result.repositoryEnabled as boolean } : {}) }
 	}
 
 	/** Verify the independent read-only ledger proof for the exact closed two-call Curl qualification session. */

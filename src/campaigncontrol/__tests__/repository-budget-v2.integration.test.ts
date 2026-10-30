@@ -14,6 +14,9 @@ import { RepositoryCampaignStore, type RepositoryBudgetAuthority,
 import { createRepositoryWorkerPipeline, type RepositoryPreparedWorkspace,
 	type RepositoryWorkerPipelineAdapters } from "../repository-worker-pipeline.js"
 import { repositoryProgressSnapshot } from "../repository-progress.js"
+import { CURL_REPAIR_V2_CAMPAIGN_ID } from "../repository-campaign-ids.js"
+import { CURL_REPAIR_V2_POLICY_SHA256, CURL_REPAIR_V2_REPOSITORY_ID,
+	CURL_REPAIR_V2_SOURCE_REVISION, CURL_REPAIR_V2_TARGET_REPOSITORY } from "../repository-curl-repair-v2-profile.js"
 import { CampaignControlStore } from "../store.js"
 import { FleetRepositoryBudgetLedger,
 	type FleetRepositoryBudgetScope } from "../../rsi/fleet-repository-budget-ledger.js"
@@ -515,6 +518,38 @@ test("Fleet no-call proof is scope-bound, point-in-time and read-only", async (t
 	assert.ok(expired.grant && expired.grant.deadlineAtMs <= expired.asOfMs)
 	assert.equal(beforeExpiredProof, afterExpiredProof, "HCL proof read does not mutate the Fleet SQLite ledger")
 	await assert.rejects(ledger.proveNoCall("prepare-failed-job", -1), /no-call proof identity is invalid/)
+})
+
+test("zero-call proof admits only the exact stopped Curl v2 budget-only scope", async () => {
+	const v2Scope: FleetRepositoryBudgetScope = { repositoryCampaignId: CURL_REPAIR_V2_CAMPAIGN_ID,
+		repositoryId: CURL_REPAIR_V2_REPOSITORY_ID, repository: CURL_REPAIR_V2_TARGET_REPOSITORY,
+		sourceRevision: CURL_REPAIR_V2_SOURCE_REVISION, policySha256: CURL_REPAIR_V2_POLICY_SHA256,
+		model: "none", profileId: "no-model", repositoryEpoch: 7 }
+	const payload = { schemaVersion: 2, proved: true, disposition: "no-recorded-provider-activity",
+		asOfMs: Date.now(), grant: null, campaignId: "fleet-security-watch", ...v2Scope,
+		keyIdentity, jobId: "infra-failed-v2", counts: { grants: 0, calls: 0, denials: 0 },
+		globalEnabled: false, canAdmit: false, activeRunId: null, controlEpoch: 9,
+		repositoryEnabled: true }
+	const ledger = new FleetRepositoryBudgetLedger({ expectedKeyIdentity: keyIdentity, scope: v2Scope,
+		invoke: async () => payload })
+	const proof = await ledger.proveNoCall(payload.jobId, 7)
+	assert.equal(proof.proved, true)
+	assert.equal(proof.controlEpoch, 9)
+	assert.equal(proof.repositoryEnabled, true)
+	assert.equal(proof.globalEnabled, false)
+	assert.equal(proof.activeRunId, null)
+	for (const invalid of [
+		{ ...payload, globalEnabled: true },
+		{ ...payload, activeRunId: "still-running" },
+		{ ...payload, counts: { grants: 1, calls: 0, denials: 0 }, proved: false, disposition: "activity-present" },
+	]) {
+		const rejected = new FleetRepositoryBudgetLedger({ expectedKeyIdentity: keyIdentity, scope: v2Scope,
+			invoke: async () => invalid })
+		await assert.rejects(rejected.proveNoCall(payload.jobId, 7), /no-call proof is invalid/)
+	}
+	assert.throws(() => new FleetRepositoryBudgetLedger({ expectedKeyIdentity: keyIdentity,
+		scope: { ...v2Scope, repositoryCampaignId: "other-none" }, invoke: async () => payload }),
+	/Fleet repository budget scope is invalid/)
 })
 
 test("cold start reads Fleet budget without a run, then starts, claims, and stops through real HCL and Fleet stores", async (t) => {
