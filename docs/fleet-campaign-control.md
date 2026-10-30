@@ -1,36 +1,52 @@
-# Fleet campaign integration
+# Fleet campaign control
 
-The optional `headlesscode campaign` commands control a locally registered
-Fleet adapter. The registration identifies an immutable verified Fleet
-release and its private state directory; it is not a general command runner.
+HeadlessCode exposes two separate controls: the legacy global Fleet adapter and
+registered per-repository campaigns. Their switches and readiness are separate.
+Enabling the global adapter does not enable a repository campaign.
 
-- `campaign status` reads actual switch, allocation and history.
-- `campaign on` and `campaign off` persist admission state. OFF stops new jobs;
-  accepted work retains its cleanup/evaluation path.
-- `campaign budget --usd 5` sets the shared monthly maximum. Lower values are
-  supported; committed and ambiguous spend cannot be silently discarded.
-- `campaign tick` runs the fixed adapter under a non-overlap lease. The
-  owner's ordinary OS schedule invokes it; there is no Codex timer.
-- `campaign serve` provides the loopback control API used by the shared local
-  dashboard. It must not be exposed as the public CVE catalog.
+## Legacy global adapter
 
-The private registration normally lives at
-`~/.local/share/headlesscode/campaign-control/fleet-adapter.json`.
-Credentials, registrations, databases and machine inventory are not release
-source. The sibling Fleet repository documents configuration and supported
-package recipes in `docs/AUTOMATION.md`.
+The optional `headlesscode campaign` commands control the locally registered
+Fleet adapter:
 
-## RSI status
+- `campaign status` reads the global switch, budget allocation and run history.
+- `campaign on` and `campaign off` change admission for the legacy adapter.
+  OFF blocks new work while accepted work retains its cleanup and evaluation
+  path.
+- `campaign budget --usd <amount>` sets the shared monthly limit. The limit
+  cannot discard committed or ambiguous spend.
+- `campaign tick` runs the fixed adapter under a non-overlap lease. The ordinary
+  owner-managed schedule invokes it; Codex timers do not.
+- `campaign serve` exposes the loopback control API on port 4391. It does not
+  expose the public CVE catalog.
 
-The separate campaign RSI binding is restricted to public synthetic intake
-fixtures, one mutable source file, protected evaluation/policy, a frozen
-runtime image and finite shared-ledger call/token/spend limits. It does not
-enable general CVE research or production deployment. Candidate promotion is
-explicit; a model response cannot approve itself.
+The legacy budget remains part of the existing shared monthly authority; it is
+not a separate allowance for repository campaigns.
 
-The measured October 29 experiment failed without a patch or promotion:
-three settled calls, 10,132 tokens, $0.000538, zero ambiguous spend. The idle
-worker was stopped. Campaign tool filtering now enforces a four-tool ceiling;
-metadata-discovery denial qualification still requires repair and retesting.
-The integration release therefore does not claim a qualified production RSI
-loop. Previously refused operations remain stopped.
+## Per-repository campaign status
+
+The additive repository coordinator keeps campaign definitions, claims,
+readiness, job history and worker registrations in separate owner-controlled
+state. Browser requests cannot set trusted source, worker, policy, model,
+access or evaluator qualifications. A campaign is runnable only when the
+owner-provisioned definition and exact worker registration satisfy those
+checks.
+
+The current repository definition is the Curl entry for CVE-2026-92390. Code
+includes the fixed evaluator profile `curl-92390-fixed-v1` and a
+qualification-only preflight for its pinned source proof. That proof does not
+establish worker qualification and the preflight is not a patch worker or a
+general advisory approval. The live private worker registry is empty and the
+campaign definition reports `workerQualified=false`. The Curl campaign is
+disabled and blocked on prerequisites. No live CVE worker is currently
+runnable or claimed.
+
+As of 2026-10-29, the legacy global admission switch is ON at control epoch 20.
+That state does not change the Curl campaign's disabled, blocked-prerequisite
+state. Do not describe qualification-profile code or historical jobs as a live
+worker run, verified repair, upstream submission or catalog publication.
+
+The protected budget and stop controls remain authoritative for any future
+repository worker. A stopped or blocked campaign must not be started until its
+registered source, worker, fixed recipe, evaluator, data access and model
+qualifications are independently present and verified.

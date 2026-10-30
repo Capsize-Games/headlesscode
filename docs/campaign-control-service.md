@@ -66,15 +66,23 @@ stops and preserves it for review. Other cron entries are kept.
 
 ## Current activation status
 
-The observed API process used the supported `campaign serve` command from the
-HeadlessCode checkout. The user cron daemon was running; system and user systemd
-managers were offline on the inspected MX host. This candidate uses the user
-cron daemon. After source review and 16 focused synthetic tests, installation
-and the live identity/status check passed. The existing API PID and all prior
-cron entries were preserved; a private crontab snapshot and activation receipt
-were retained. Reboot recovery has not been exercised on the live workstation.
-No campaign tick entry, live campaign state, credentials, registration, or access
-gate was changed.
+The managed check last reported the loopback supervisor healthy. An earlier
+check found the supervisor stopped even though its `@reboot` entry remained;
+the supported installer restarted the existing managed singleton, and the next
+managed check passed. Reboot recovery has not been exercised, so the cron entry
+is not evidence of a successful reboot test. The API is a control surface; its
+health does not establish that a repository worker is ready or running.
+
+At the latest recorded campaign check, legacy global admission was ON at epoch
+20. The separate Curl repository campaign remained disabled and blocked on
+prerequisites because `workerQualified` was false and the private worker registry
+was empty. No live CVE worker was runnable or claimed. See
+[Fleet campaign control](fleet-campaign-control.md) for the current distinction
+between global admission and repository readiness.
+
+The service check does not verify model access, qualify a worker, enable a
+repository campaign, run a campaign tick, or test reboot recovery. It does not
+change repository campaign state or publish CVE catalog content.
 
 ## Synthetic checks
 
