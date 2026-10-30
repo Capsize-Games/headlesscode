@@ -1,3 +1,4 @@
+import { campaignUsage, isCampaignAction } from "./campaign-usage.js"
 import * as fs from "node:fs"
 import { CampaignControlStore, MAX_MONTHLY_BUDGET_MICROS } from "./store.js"
 import { loadCampaignAdapterConfig, readCampaignBudgetReport, runCampaignTick, runFleetAdapterUnderLock, verifyCampaignDispatchLock } from "./runner.js"
@@ -15,6 +16,8 @@ import { CURL_CAMPAIGN_ID, CURL_CANDIDATE_TREE_SHA, CURL_FIXED_ADVISORY, CURL_PR
 import { buildCurlHistoricalRepairCandidate, curlHistoricalRepairCandidateSha256,
 	CURL_REPAIR_CAMPAIGN_ID, CURL_REPAIR_PROFILE_ID, verifyCurlHistoricalRepairSourcePin } from "./repository-curl-repair.js"
 import { evaluateCurlHistoricalRepairCandidate } from "./repository-curl-repair-evaluator.js"
+import { CURL_REPAIR_V2_CAMPAIGN_ID } from "./repository-campaign-ids.js"
+import { CURL_REPAIR_V2_PROFILE_ID, CURL_REPAIR_V2_ADAPTER_ID } from "./repository-curl-repair-v2-profile.js"
 import { readFleetBudgetKeyIdentity } from "../rsi/fleet-budget-ledger.js"
 import { FleetRepositoryBudgetLedger } from "../rsi/fleet-repository-budget-ledger.js"
 import { recoverAmbiguousPrepareWithNoCallProof, verifyRecoveredNoCallArtifact } from "./repository-no-call-recovery.js"
@@ -28,12 +31,12 @@ function parseBudget(dollars: string): number | undefined {
 }
 
 function usage(): string {
-	return "Usage: headlesscode campaign <status|rsi|on|off|budget --usd <amount>|tick|serve|qualify-known curl-maintenance CVE-2026-92390 --purpose=qualification|retry-no-call curl-maintenance <failed-job-id> --confirm-retry-no-call=<failed-job-id>|repair-known curl-historical-repair CVE-2026-92390 --purpose=repair|retry-repair curl-historical-repair <failed-job-id> --confirm-retry-repair=<failed-job-id>|recover-no-call curl-maintenance <job-id> --confirm-no-call-proof=<job-id>|reconcile-paid-qualification curl-maintenance <job-id> --confirm-partial-billing=<job-id>> [--json]"
+	return campaignUsage()
 }
 
 export async function campaignMain(args: string[]): Promise<number> {
 	const [action, ...rest] = args
-	if (!action || !["status", "rsi", "on", "off", "budget", "tick", "serve", "qualify-known", "retry-no-call", "repair-known", "retry-repair", "recover-no-call", "reconcile-paid-qualification", "_apply", "_adapter-tick", "_repository-run-begin", "_repository-run-finish", "_repository-lock-hold"].includes(action)) {
+	if (!action || !isCampaignAction(action)) {
 		process.stderr.write(`${usage()}\n`)
 		return 2
 	}
@@ -163,6 +166,42 @@ export async function campaignMain(args: string[]): Promise<number> {
 			return 0
 		} catch (error) {
 			process.stderr.write(`headlesscode campaign: ${error instanceof Error ? error.message : "known repair could not be queued"}\n`)
+			return 1
+		}
+	}
+	if (action === "repair-known-v2") {
+		if (positional.length !== 3 || positional[0] !== CURL_REPAIR_V2_CAMPAIGN_ID ||
+			positional[1] !== CURL_FIXED_ADVISORY || positional[2] !== "--purpose=repair") return 2
+		try {
+			const definitions = await loadRepositoryCampaignDefinitions(REPOSITORY_CAMPAIGN_REGISTRY_FILE)
+			const definition = definitions.find((item) => item.id === CURL_REPAIR_V2_CAMPAIGN_ID)
+			if (!definition || definition.workerProfile !== CURL_REPAIR_V2_PROFILE_ID) throw new Error("v2 repair profile is not owner-registered")
+			const registrations = await loadRepositoryWorkerRegistrations(REPOSITORY_WORKER_REGISTRY_FILE)
+			if (!registrations.some((row) => row.campaignId === CURL_REPAIR_V2_CAMPAIGN_ID && row.pipelineAdapterId === CURL_REPAIR_V2_ADAPTER_ID)) {
+				throw new Error("v2 repair adapter is not owner-registered")
+			}
+			const readAuthority = createRepositoryBudgetAuthorityReader(definitions, CAMPAIGN_CONTROL_FILE)
+			const repositoryStore = new RepositoryCampaignStore(REPOSITORY_CAMPAIGN_STATE_FILE, definitions, readAuthority)
+			const state = await repositoryStore.status() as { campaigns: Array<Record<string, unknown>>; jobs: Array<Record<string, unknown>> }
+			const campaign = state.campaigns.find((item) => item.id === CURL_REPAIR_V2_CAMPAIGN_ID)
+			if (!campaign || campaign.enabled !== true || campaign.readiness !== "ready") throw new Error("v2 repair requires fresh registered prerequisites")
+			if (state.jobs.some((job) => job.campaignId === CURL_REPAIR_V2_CAMPAIGN_ID && job.purpose === "repair")) {
+				throw new Error("the v2 known advisory repair already has a job")
+			}
+			const advisory = await loadKnownCurlDebianAdvisory()
+			await verifyCurlHistoricalRepairSourcePin()
+			const candidate = await buildCurlHistoricalRepairCandidate()
+			const job = await repositoryStore.enqueueKnownRepairV2({ campaignId: CURL_REPAIR_V2_CAMPAIGN_ID,
+				advisoryId: advisory.advisoryId, publicBaseRevision: advisory.publicBaseRevision,
+				snapshotSha256: advisory.snapshotSha256, sourceUrl: advisory.sourceUrl,
+				sourceContentSha256: advisory.sourceHtmlSha256, affectedRange: advisory.affectedRange })
+			process.stdout.write(`${JSON.stringify({ purpose: "repair", profileId: CURL_REPAIR_V2_PROFILE_ID,
+				campaignId: CURL_REPAIR_V2_CAMPAIGN_ID, jobId: job.id, advisoryId: job.advisoryId,
+				sourceRevision: candidate.sourceRevision, candidateRevision: candidate.candidateRevision,
+				candidateTreeSha: candidate.candidateTreeSha, patchSha256: candidate.patchSha256, state: "queued" })}\n`)
+			return 0
+		} catch (error) {
+			process.stderr.write(`headlesscode campaign: ${error instanceof Error ? error.message : "v2 known repair could not be queued"}\n`)
 			return 1
 		}
 	}

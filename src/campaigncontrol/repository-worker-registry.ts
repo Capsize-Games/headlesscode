@@ -8,7 +8,10 @@ import { OsvCommitAdvisoryIntake } from "./repository-advisory-intake.js"
 import type { RepositoryCampaignStore } from "./repository-campaigns.js"
 import { CURL_PRIVATE_RUNTIME_ADAPTER_ID, createCurlRepositoryPipelineAdapters } from "./repository-curl-runtime.js"
 import { createCurlHistoricalRepairAdapters } from "./repository-curl-repair-runtime.js"
+import { createCurlHistoricalRepairV2Adapters } from "./repository-curl-repair-v2-runtime.js"
 import { CURL_REPAIR_ADAPTER_ID, verifyCurlHistoricalRepairSourcePin } from "./repository-curl-repair.js"
+import { CURL_REPAIR_V2_ADAPTER_ID } from "./repository-curl-repair-v2-profile.js"
+import { CURL_REPAIR_V2_CAMPAIGN_ID } from "./repository-campaign-ids.js"
 import type { RepositoryPipelineAdapterFactory, RepositoryPipelineAdapterFactoryContext, RepositoryWorkerRegistration } from "./repository-worker-registration.js"
 
 const MAX_REGISTRY_BYTES = 64 * 1024
@@ -16,6 +19,7 @@ const MAX_REGISTRATIONS = 32
 const NO_SUPPORTED_ADVISORIES = Object.freeze([] as string[])
 const PUBLIC_INTAKE_PINS: Readonly<Record<string, { publicBaseRevision: string; supportedAdvisoryIds: readonly string[] }>> = Object.freeze({
 	[CURL_PRIVATE_RUNTIME_ADAPTER_ID]: { publicBaseRevision: "ce57339379d82d29637b4752979e54128b6b2348", supportedAdvisoryIds: NO_SUPPORTED_ADVISORIES },
+	[CURL_REPAIR_V2_ADAPTER_ID]: { publicBaseRevision: "ce57339379d82d29637b4752979e54128b6b2348", supportedAdvisoryIds: NO_SUPPORTED_ADVISORIES },
 })
 
 export type { RepositoryPipelineAdapterFactory, RepositoryPipelineAdapterFactoryContext, RepositoryWorkerRegistration } from "./repository-worker-registration.js"
@@ -29,6 +33,10 @@ export const BUILTIN_REPOSITORY_PIPELINE_ADAPTER_FACTORIES: ReadonlyMap<string, 
 	[CURL_REPAIR_ADAPTER_ID, (registration, definition, context) => {
 		if (!context) throw new Error("repository pipeline store context is unavailable")
 		return createCurlHistoricalRepairAdapters(registration, definition, context)
+	}],
+	[CURL_REPAIR_V2_ADAPTER_ID, (registration, definition, context) => {
+		if (!context) throw new Error("repository pipeline store context is unavailable")
+		return createCurlHistoricalRepairV2Adapters(registration, definition, context)
 	}],
 ])
 
@@ -116,6 +124,7 @@ export function bindRepositoryWorkerRegistrations(
 		if (!source) return worker
 		return { ...worker, advisoryIntake: { source: "osv-commit-query" as const, publicBaseRevision: source.publicBaseRevision,
 			supportedAdvisoryIds: source.supportedAdvisoryIds, poll: () => new OsvCommitAdvisoryIntake().poll(source.publicBaseRevision),
-			...(registration.pipelineAdapterId === CURL_PRIVATE_RUNTIME_ADAPTER_ID ? { verifySource: () => verifyCurlHistoricalRepairSourcePin() } : {}) } }
+			...(registration.pipelineAdapterId === CURL_PRIVATE_RUNTIME_ADAPTER_ID || registration.campaignId === CURL_REPAIR_V2_CAMPAIGN_ID
+				? { verifySource: () => verifyCurlHistoricalRepairSourcePin() } : {}) } }
 	})
 }

@@ -4,12 +4,9 @@ import { CampaignControlStore } from "./store.js"
 import type { RepositoryBudgetAuthority, RepositoryCampaignDefinition } from "./repository-campaigns.js"
 import { FleetRepositoryBudgetLedger, type FleetRepositoryBudgetLedgerOptions, type FleetRepositoryBudgetScope } from "../rsi/fleet-repository-budget-ledger.js"
 import { readFleetBudgetKeyIdentity } from "../rsi/fleet-budget-ledger.js"
-import { CURL_REPAIR_CAMPAIGN_ID, CURL_REPAIR_EVALUATOR_DIGEST, CURL_REPAIR_POLICY_SHA256,
-	CURL_REPAIR_PROFILE_ID, CURL_REPAIR_RECIPE_DIGEST, CURL_REPAIR_REPOSITORY_ID,
-	CURL_REPAIR_SOURCE_REVISION, CURL_REPAIR_TARGET_REPOSITORY } from "./repository-curl-repair.js"
+import { repositoryBudgetProfile } from "./repository-budget-profiles.js"
+export { repositoryBudgetProfile } from "./repository-budget-profiles.js"
 
-const MODEL = "meta/muse-spark-1.3-contributor"
-const PROFILE = "muse-spark-contributor"
 const REPAIR_MODEL = "none"
 const REPAIR_PROFILE = "no-model"
 
@@ -17,19 +14,6 @@ export interface RepositoryBudgetAuthorityReaderDependencies {
 	/** Test seams only; production reads the existing host key-identity metadata and fixed bridge. */
 	readKeyIdentity?: typeof readFleetBudgetKeyIdentity
 	createLedger?: (options: FleetRepositoryBudgetLedgerOptions) => Pick<FleetRepositoryBudgetLedger, "budgetSnapshot" | "budgetSnapshotOnly">
-}
-
-export function repositoryBudgetProfile(
-	definition: RepositoryCampaignDefinition,
-): Pick<FleetRepositoryBudgetScope, "model" | "profileId"> | undefined {
-	if (definition.id === CURL_REPAIR_CAMPAIGN_ID) {
-		if (definition.repositoryId !== CURL_REPAIR_REPOSITORY_ID || definition.repository !== CURL_REPAIR_TARGET_REPOSITORY ||
-			definition.sourceRevision !== CURL_REPAIR_SOURCE_REVISION || definition.policySha256 !== CURL_REPAIR_POLICY_SHA256 ||
-			definition.workerProfile !== CURL_REPAIR_PROFILE_ID || definition.recipeDigest !== CURL_REPAIR_RECIPE_DIGEST ||
-			definition.evaluatorDigest !== CURL_REPAIR_EVALUATOR_DIGEST || definition.model !== REPAIR_MODEL) return undefined
-		return { model: REPAIR_MODEL, profileId: REPAIR_PROFILE }
-	}
-	return definition.model === MODEL ? { model: MODEL, profileId: PROFILE } : undefined
 }
 
 /** Current, source-bound Fleet v2 authority. Every call is a fresh bridge snapshot. */
