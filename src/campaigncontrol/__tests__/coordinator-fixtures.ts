@@ -82,7 +82,7 @@ export function syntheticAuthority(): RepositoryBudgetAuthority {
 	}
 }
 
-function liveRunScope(run: ActiveCampaignRun): {
+export function liveRunScope(run: ActiveCampaignRun): {
 	controlEpoch: number
 	runId: string
 	runExpiresAtMs: number
@@ -94,7 +94,9 @@ function liveRunScope(run: ActiveCampaignRun): {
 	}
 }
 
-function liveRepositoryScope(): {
+export function liveRepositoryScope(
+	scopeDefinition: RepositoryCampaignDefinition = definition,
+): {
 	repositoryCampaignId: string
 	repositoryId: string
 	repository: string
@@ -103,12 +105,12 @@ function liveRepositoryScope(): {
 	model: string
 } {
 	return {
-		repositoryCampaignId: definition.id,
-		repositoryId: definition.repositoryId!,
-		repository: definition.repository!,
-		sourceRevision: definition.sourceRevision!,
-		policySha256: definition.policySha256!,
-		model: definition.model!,
+		repositoryCampaignId: scopeDefinition.id,
+		repositoryId: scopeDefinition.repositoryId!,
+		repository: scopeDefinition.repository!,
+		sourceRevision: scopeDefinition.sourceRevision!,
+		policySha256: scopeDefinition.policySha256!,
+		model: scopeDefinition.model!,
 	}
 }
 
