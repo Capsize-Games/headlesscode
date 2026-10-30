@@ -2,9 +2,12 @@ import assert from "node:assert/strict"
 import { OsvCommitAdvisoryIntake } from "../repository-advisory-intake.js"
 import { runMain, type SuiteTest } from "../../test-runner.js"
 
-async function testPinnedCommitPollFollowsBoundedPagesAndDeduplicatesAliases(): Promise<void> {
+async function
+	testPinnedCommitPollFollowsBoundedPagesAndDeduplicatesAliases(
+	): Promise<void> {
 	const calls: Array<{ url: string; body: Record<string, unknown> }> = []
-	const rows = await new OsvCommitAdvisoryIntake({ fetch: pagedOsvFetch(calls) }).poll("a".repeat(40))
+	const rows = await new OsvCommitAdvisoryIntake({
+		fetch: pagedOsvFetch(calls) }).poll("a".repeat(40))
 	assert.deepEqual(calls.map((call) => call.body),
 		[{ commit: "a".repeat(40) }, { commit: "a".repeat(40), page_token: "next" }])
 	assert.ok(calls.every((call) => call.url === "https://api.osv.dev/v1/query"))
@@ -15,8 +18,10 @@ async function testPinnedCommitPollFollowsBoundedPagesAndDeduplicatesAliases(): 
 	assert.equal(rows[0]?.snapshotSha256.length, 64)
 }
 
-function pagedOsvFetch(calls: Array<{ url: string; body: Record<string, unknown> }>):
-	(url: string, body: string, timeoutMs: number) => Promise<{ status: number; body: Uint8Array }> {
+function pagedOsvFetch(
+	calls: Array<{ url: string; body: Record<string, unknown> }>):
+	(url: string, body: string, timeoutMs: number) => Promise<{
+		status: number; body: Uint8Array }> {
 	return async (url: string, body: string, _timeoutMs: number): Promise<{
 		status: number; body: Uint8Array }> => {
 		const parsed = JSON.parse(body) as Record<string, unknown>
@@ -33,20 +38,28 @@ function pagedOsvFetch(calls: Array<{ url: string; body: Record<string, unknown>
 	}
 }
 
-async function testPinnedCommitPollRejectsUnboundedOrInvalidResponses(): Promise<void> {
+async function
+	testPinnedCommitPollRejectsUnboundedOrInvalidResponses(): Promise<void> {
 	const intake = new OsvCommitAdvisoryIntake({ maxPages: 1,
 		fetch: async () => ({ status: 200,
 		body: Buffer.from(JSON.stringify({ vulns: [],
 			next_page_token: "more" })) }) })
 	await assert.rejects(intake.poll("bad"), /pinned public upstream commit/)
 	await assert.rejects(intake.poll("b".repeat(40)), /page limit/)
-	const invalid = new OsvCommitAdvisoryIntake({ fetch: async () => ({ status: 200, body: Buffer.from("{}") }) })
+	const invalid = new OsvCommitAdvisoryIntake({
+		fetch: async () => ({ status: 200, body: Buffer.from("{}") }) })
 	await assert.rejects(invalid.poll("c".repeat(40)), /schema is invalid/)
 }
 
+const followsTitle = "OSV commit intake follows bounded pages and " +
+	"deduplicates canonical CVE aliases"
+const rejectsTitle = "OSV commit intake rejects invalid identity, " +
+	"truncated pagination, and malformed feed responses"
+
 const tests: readonly SuiteTest[] = [
-	["OSV commit intake follows bounded pages and deduplicates canonical CVE aliases", testPinnedCommitPollFollowsBoundedPagesAndDeduplicatesAliases],
-	["OSV commit intake rejects invalid identity, truncated pagination, and malformed feed responses", testPinnedCommitPollRejectsUnboundedOrInvalidResponses],
+	[followsTitle,
+		testPinnedCommitPollFollowsBoundedPagesAndDeduplicatesAliases],
+	[rejectsTitle, testPinnedCommitPollRejectsUnboundedOrInvalidResponses],
 ]
 
 await runMain("repository-advisory-intake", tests)
