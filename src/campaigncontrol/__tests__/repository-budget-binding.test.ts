@@ -22,21 +22,27 @@ const definitions: RepositoryCampaignDefinition[] = [{ id: "test-repository",
 	dataAccessProfile: "fixture-only", qualification }]
 
 type CampaignStatusSnapshot = {
-	budget: { reservedMicros: number; settledMicros: number; settledTokens: number }
+	budget: {
+		reservedMicros: number
+		settledMicros: number
+		settledTokens: number
+	}
 }
 
 function readStatus(value: Record<string, unknown>): CampaignStatusSnapshot {
 	return value as unknown as CampaignStatusSnapshot
 }
 
-async function fixture(): Promise<{ root: string; store: RepositoryCampaignStore; claim: NonNullable<Awaited<ReturnType<RepositoryCampaignStore["claimNext"]>>> }> {
+async function fixture(): Promise<{
+	root: string
+	store: RepositoryCampaignStore
+	claim: NonNullable<
+		Awaited<ReturnType<RepositoryCampaignStore["claimNext"]>>>
+}> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(),
 		"hcl-repository-budget-binding-"))
-	const authority: RepositoryBudgetAuthority = { mode: "synthetic-test",
-		available: true, limitMicros: 40_000,
-		limitTokens: 40_000, committedMicros: 0, committedTokens: 0 }
 	const store = new RepositoryCampaignStore(path.join(root, "campaigns.json"),
-		definitions, () => authority)
+		definitions, () => syntheticAuthority())
 	const now = new Date("2026-10-29T12:00:00Z")
 	await store.setCampaignBudget("test-repository", 40_000, 40_000, now)
 	await store.start("test-repository", now)
@@ -45,6 +51,17 @@ async function fixture(): Promise<{ root: string; store: RepositoryCampaignStore
 		tokens: 20_000 }, now)
 	assert.ok(claim)
 	return { root, store, claim }
+}
+
+function syntheticAuthority(): RepositoryBudgetAuthority {
+	return {
+		mode: "synthetic-test",
+		available: true,
+		limitMicros: 40_000,
+		limitTokens: 40_000,
+		committedMicros: 0,
+		committedTokens: 0,
+	}
 }
 
 function grant(jobId: string): OpenRouterBrokerGrant {
@@ -92,22 +109,46 @@ function startRequest(
 		reservedTokens: 5_000, startedAt: new Date().toISOString() } })
 }
 
+function verifyLedgerMethods(calls: string[]): Pick<RepositoryBudgetLedger,
+	"receipt" | "reconcile" | "budgetSnapshot"> {
+	return {
+		async receipt(value): ReturnType<
+			RepositoryBudgetLedger["receipt"]> {
+			calls.push("receipt")
+			return mockReceipt(value.jobId)
+		},
+		async reconcile(value): ReturnType<
+			RepositoryBudgetLedger["reconcile"]> {
+			calls.push("reconcile")
+			return { calls: [], receipt: mockReceipt(value.jobId) }
+		},
+		async budgetSnapshot(): ReturnType<
+			RepositoryBudgetLedger["budgetSnapshot"]> {
+			return {} as Awaited<
+				ReturnType<RepositoryBudgetLedger["budgetSnapshot"]>>
+		},
+	}
+}
+
 function mockLedger(): MockLedger {
 	const calls: string[] = []
 	const ledger: RepositoryBudgetLedger = {
-		async register(value): Promise<number> { calls.push("register"); return (value.issuedAtMs ?? Date.now()) + 60_000 },
+		async register(value): Promise<number> {
+			calls.push("register")
+			return (value.issuedAtMs ?? Date.now()) + 60_000
+		},
 		async recordDenial(): Promise<void> { calls.push("denial") },
 		async reserve(): Promise<void> { calls.push("reserve") },
 		async settle(): Promise<void> { calls.push("settle") },
-		async receipt(value): ReturnType<RepositoryBudgetLedger["receipt"]> { calls.push("receipt"); return mockReceipt(value.jobId) },
 		async requestStart(): Promise<void> { calls.push("request-start") },
-		async reconcile(value): ReturnType<RepositoryBudgetLedger["reconcile"]> { calls.push("reconcile"); return { calls: [], receipt: mockReceipt(value.jobId) } },
-		async budgetSnapshot(): ReturnType<RepositoryBudgetLedger["budgetSnapshot"]> { return {} as Awaited<ReturnType<RepositoryBudgetLedger["budgetSnapshot"]>> },
+		...verifyLedgerMethods(calls),
 	}
 	return { calls, ledger }
 }
 
-async function testRepositorySubcapIsDurableBeforeFleetReservationAndReceiptSettles(): Promise<void> {
+async function
+	testRepositorySubcapIsDurableBeforeFleetReservationAndReceiptSettles(
+	): Promise<void> {
 	const f = await fixture()
 	try {
 		const mock = mockLedger()
@@ -115,11 +156,10 @@ async function testRepositorySubcapIsDurableBeforeFleetReservationAndReceiptSett
 			mock.ledger)
 		const jobGrant = grant(f.claim.job.id)
 		await binding.register(jobGrant)
-		await binding.reserve(jobGrant, { callId: "call-001",
-			requestSha256: "e".repeat(64), reservedUsd: 0.01,
-			reservedTokens: 5_000, startedAt: new Date().toISOString() })
+		await reserveCall(binding, jobGrant, "call-001", "e".repeat(64))
 		await binding.finishFromReceipt(jobGrant)
-		const status = await f.store.status(new Date("2026-10-29T12:01:00Z")) as unknown as CampaignStatusSnapshot
+		const status = await f.store.status(
+			new Date("2026-10-29T12:01:00Z")) as unknown as CampaignStatusSnapshot
 		assert.deepEqual(mock.calls, ["register", "reserve", "receipt"])
 		assert.equal(status.budget.reservedMicros, 0)
 		assert.equal(status.budget.settledMicros, 5_000)
@@ -127,27 +167,23 @@ async function testRepositorySubcapIsDurableBeforeFleetReservationAndReceiptSett
 	} finally { await fs.rm(f.root, { recursive: true, force: true }) }
 }
 
-async function testRepositoryBindingRejectsGrantOutsideClaimOrFixedFleetLifetimeCap(): Promise<void> {
+async function
+	testRepositoryBindingRejectsGrantOutsideClaimOrFixedFleetLifetimeCap(
+	): Promise<void> {
 	const f = await fixture()
 	try {
 		const mock = mockLedger()
 		const binding = new RepositoryCampaignBudgetBinding(f.store, f.claim,
 			mock.ledger)
-		await assert.rejects(binding.register({ ...grant(f.claim.job.id),
-			jobId: "another-job" }), /outside the claimed repository allocation/)
-		await assert.rejects(binding.register({ ...grant(f.claim.job.id),
-			limits: { ...grant(f.claim.job.id).limits,
-				campaignId: "other-campaign" } }),
-					/outside the claimed repository allocation/)
-		await assert.rejects(binding.register({ ...grant(f.claim.job.id),
-			limits: { ...grant(f.claim.job.id).limits, maxCampaignSpendUsd: 0.03 } }),
-				/outside the claimed repository allocation/)
+		await rejectsMismatchedGrants(binding, f.claim.job.id)
 		assert.deepEqual(mock.calls, [],
 			"invalid claims never reach the shared authority")
 	} finally { await fs.rm(f.root, { recursive: true, force: true }) }
 }
 
-async function testStopAfterGlobalReservationFencesSendAndKeepsLocalHold(): Promise<void> {
+async function
+	testStopAfterGlobalReservationFencesSendAndKeepsLocalHold(
+	): Promise<void> {
 	const f = await fixture()
 	try {
 		const mock = mockLedger()
@@ -161,17 +197,51 @@ async function testStopAfterGlobalReservationFencesSendAndKeepsLocalHold(): Prom
 		await assert.rejects(startRequest(binding, jobGrant, () => { sends += 1 }),
 			/stale or stopped/)
 		const status = await f.store.status() as unknown as CampaignStatusSnapshot
-		assert.equal(sends, 0)
-		assert.equal(mock.calls.filter((entry) => entry === "reserve").length, 1)
-		assert.equal(status.budget.reservedMicros, 20_000,
-			"the full job subcap stays held while global reservation is uncertain")
+		expectStopHold(mock, status, sends)
 	} finally { await fs.rm(f.root, { recursive: true, force: true }) }
 }
 
+async function rejectsMismatchedGrants(
+	binding: RepositoryCampaignBudgetBinding,
+	jobId: string,
+): Promise<void> {
+	const base = grant(jobId)
+	await assert.rejects(binding.register({ ...base,
+		jobId: "another-job" }),
+		/outside the claimed repository allocation/)
+	await assert.rejects(binding.register({ ...base,
+		limits: { ...base.limits, campaignId: "other-campaign" } }),
+		/outside the claimed repository allocation/)
+	await assert.rejects(binding.register({ ...base,
+		limits: { ...base.limits, maxCampaignSpendUsd: 0.03 } }),
+		/outside the claimed repository allocation/)
+}
+
+function expectStopHold(
+	mock: MockLedger,
+	status: CampaignStatusSnapshot,
+	sends: number,
+): void {
+	assert.equal(sends, 0)
+	assert.equal(mock.calls.filter((entry) => entry === "reserve").length, 1)
+	assert.equal(status.budget.reservedMicros, 20_000,
+		"the full job subcap stays held while global reservation is uncertain")
+}
+
+const durableTitle = "repository subcap is claimed before Fleet " +
+	"reservation and measured Fleet receipt settles it"
+const bindingRejectsTitle =
+	"repository budget binding rejects job, campaign, " +
+	"and lifetime-cap mismatches before authority access"
+const stopTitle = "Stop after Fleet reservation fences upstream send " +
+	"and retains the local budget hold"
+
 const tests: readonly SuiteTest[] = [
-	["repository subcap is claimed before Fleet reservation and measured Fleet receipt settles it", testRepositorySubcapIsDurableBeforeFleetReservationAndReceiptSettles],
-	["repository budget binding rejects job, campaign, and lifetime-cap mismatches before authority access", testRepositoryBindingRejectsGrantOutsideClaimOrFixedFleetLifetimeCap],
-	["Stop after Fleet reservation fences upstream send and retains the local budget hold", testStopAfterGlobalReservationFencesSendAndKeepsLocalHold],
+	[durableTitle,
+		testRepositorySubcapIsDurableBeforeFleetReservationAndReceiptSettles],
+	[bindingRejectsTitle,
+		testRepositoryBindingRejectsGrantOutsideClaimOrFixedFleetLifetimeCap],
+	[stopTitle, testStopAfterGlobalReservationFencesSendAndKeepsLocalHold],
 ]
 
 runMain("repository-budget-binding", tests)
