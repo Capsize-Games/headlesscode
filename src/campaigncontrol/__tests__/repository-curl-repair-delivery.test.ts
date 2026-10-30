@@ -114,21 +114,23 @@ async function testPolicyIsFixedAndRepairClaimsAreDistinct(): Promise<void> {
 	assert.equal(f.calls.length, 0)
 }
 
-async function testFixedGitHubEnvironmentUsesKeyringContextWithoutCredentialEnv(): Promise<void> {
+async function testFixedGitHubEnvironmentRejectsFakeCredentialAndBusPaths(): Promise<void> {
+	const fakeAddress = `unix:path=/tmp/dbus-fake-unowned,guid=${"c".repeat(32)}`
 	const env = fixedCurlDeliveryGitHubEnvironment({
 		PATH: "/untrusted/bin", HOME: "/untrusted/home",
-		DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
-		XDG_RUNTIME_DIR: "/run/user/1000",
+		DBUS_SESSION_BUS_ADDRESS: fakeAddress,
+		XDG_RUNTIME_DIR: "/tmp/attacker-runtime",
 		GH_TOKEN: "fake-credential-must-not-be-forwarded",
 		GITHUB_TOKEN: "fake-compat-credential-must-not-be-forwarded",
 		SSH_AUTH_SOCK: "/tmp/unrelated-agent.sock",
 		AWS_ACCESS_KEY_ID: "unrelated-secret",
 	})
-	assert.deepEqual(env, {
-		PATH: "/usr/local/bin:/usr/bin:/bin", HOME: os.homedir(),
-		DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
-		XDG_RUNTIME_DIR: "/run/user/1000",
-	})
+	assert.deepEqual({ PATH: env.PATH, HOME: env.HOME }, { PATH: "/usr/local/bin:/usr/bin:/bin", HOME: os.homedir() })
+	assert.notEqual(env.DBUS_SESSION_BUS_ADDRESS, fakeAddress, "D-Bus address must come from the validated owner desktop process")
+	if (env.DBUS_SESSION_BUS_ADDRESS !== undefined) {
+		assert.match(env.DBUS_SESSION_BUS_ADDRESS, /^unix:path=\/tmp\/dbus-[A-Za-z0-9]{1,64},guid=[a-f0-9]{32}$/)
+		assert.equal(env.XDG_RUNTIME_DIR, `/run/user/${process.getuid?.() ?? -1}`)
+	} else assert.equal(env.XDG_RUNTIME_DIR, undefined)
 	for (const secretName of ["GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK", "AWS_ACCESS_KEY_ID"]) {
 		assert.equal(Object.hasOwn(env, secretName), false, `${secretName} must not enter fixed gh subprocess environment`)
 	}
@@ -244,7 +246,7 @@ async function testSharedDescriptorLockRejectsConcurrentDelivery(): Promise<void
 }
 
 const tests: readonly SuiteTest[] = [
-	["fixed GitHub delivery uses desktop keyring context without forwarding fake credentials", testFixedGitHubEnvironmentUsesKeyringContextWithoutCredentialEnv],
+	["fixed GitHub delivery rejects fake credential and D-Bus paths", testFixedGitHubEnvironmentRejectsFakeCredentialAndBusPaths],
 	["repair delivery policy is fixed and separate from the qualification claim", testPolicyIsFixedAndRepairClaimsAreDistinct],
 	["candidate already in the private target never creates a branch or pull request", testCandidateAlreadyInPrivateBaseNeverCreatesBranchOrPullRequest],
 	["unknown target trees and changed source paths fail closed", testUnknownTargetTreeOrExtraSourceChangesAreBlocked],
