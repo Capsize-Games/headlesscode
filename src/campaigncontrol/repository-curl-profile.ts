@@ -42,13 +42,14 @@ export const EVIDENCE_STORAGE_DIR = path.join(CONTAINED_RUNTIME_ROOT,
 	"evidence-store")
 export const EVIDENCE_CONFIG_DIR = path.join(CONTAINED_RUNTIME_ROOT,
 	"evidence-config")
+export const EVIDENCE_SOCKET_DIRECTORY = path.join(CONTAINED_RUNTIME_ROOT,
+	"evidence-socket")
+export const EVIDENCE_SOCKET_PATH = path.join(EVIDENCE_SOCKET_DIRECTORY,
+	"evidence.sock")
 const RUNTIME_UID = typeof process.getuid === "function"
 	? process.getuid()
 	: "unknown"
 const RUNTIME_USER_DIR = `/run/user/${RUNTIME_UID}`
-export const EVIDENCE_SOCKET_PATH = path.join(
-	RUNTIME_USER_DIR, "hce", "evidence.sock",
-)
 export const PROFILE_PATH = path.join(CONTAINED_RUNTIME_ROOT, "profile",
 	"repository-worker.yaml")
 export const CONTROL_STATE_DIR = path.join(CONTAINED_RUNTIME_ROOT,

@@ -107,7 +107,7 @@ async function testContainedEvidenceServiceProvisionsDistinctWorkerCapabilities(
 	const repo = path.join(root, "repo")
 	const storageDir = path.join(root, "collector")
 	const configDirectory = path.join(root, "runtime")
-	const socketPath = path.join(root, "es.sock")
+	const socketPath = path.join(root, "persistent-evidence", "es.sock")
 	fs.mkdirSync(repo, { mode: 0o700 })
 	const marker = path.join(repo, "keep.txt")
 	fs.writeFileSync(marker, "preserve this repository")
@@ -116,8 +116,15 @@ async function testContainedEvidenceServiceProvisionsDistinctWorkerCapabilities(
 	await assert.rejects(() => startContainedEvidenceService({ storageDir: repo, configDirectory, socketPath, sessionIds: ["rejected"], repoRoot: repo }), /separate/)
 	assert.equal(fs.statSync(repo).mode & 0o777, originalMode, "rejected collector paths never change repository permissions")
 	assert.equal(fs.readFileSync(marker, "utf8"), "preserve this repository", "rejected collector paths preserve repository data")
+	const tmpMode = fs.statSync(os.tmpdir()).mode & 0o7777
+	await assert.rejects(() => startContainedEvidenceService({
+		storageDir: path.join(root, "unsafe-collector"), configDirectory: path.join(root, "unsafe-runtime"),
+		socketPath: path.join(os.tmpdir(), `hce-unsafe-${process.pid}.sock`), sessionIds: ["unsafe"], repoRoot: repo,
+	}), /owner-only real directory/)
+	assert.equal(fs.statSync(os.tmpdir()).mode & 0o7777, tmpMode, "socket setup refuses broad temporary parents without changing them")
 	const service = await startContainedEvidenceService({ storageDir, configDirectory, socketPath, sessionIds: ["worker-a", "worker-b"], repoRoot: repo })
 	try {
+		assert.equal(fs.statSync(path.dirname(socketPath)).mode & 0o777, 0o700, "missing evidence socket parent is created owner-only")
 		assert.deepEqual(service.sessions, ["worker-a", "worker-b"])
 		const first = JSON.parse(fs.readFileSync(path.join(configDirectory, "worker-a.json"), "utf8")) as { capability: string; evidenceRequired: boolean; pinnedPublicKey: { keyId: string } }
 		const second = JSON.parse(fs.readFileSync(path.join(configDirectory, "worker-b.json"), "utf8")) as { capability: string }
@@ -135,6 +142,7 @@ async function testContainedEvidenceServiceProvisionsDistinctWorkerCapabilities(
 	}
 	assert.ok(!fs.existsSync(path.join(configDirectory, "worker-a.json")), "closing service removes runtime capability handoffs")
 	assert.ok(!fs.existsSync(socketPath), "closing service removes its Unix socket")
+	assert.equal(fs.statSync(path.dirname(socketPath)).mode & 0o777, 0o700, "owner-only socket directory persists for stable bind mounting")
 	fs.rmSync(root, { recursive: true, force: true })
 }
 
