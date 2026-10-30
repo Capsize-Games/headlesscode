@@ -28,7 +28,14 @@ const BRANCH_PREFIX = "codex/curl-CVE-2026-92390-"
 const REPOSITORY_URL = `https://github.com/${CURL_REPAIR_TARGET_REPOSITORY}`
 const GIT_URL = `${REPOSITORY_URL}.git`
 const GITHUB_CLI = "/usr/bin/gh"
+const GIT_CLI = "/usr/bin/git"
 const TARGET_PATH = path.join(os.homedir(), ".local", "share", "headlesscode", "repository-sources", "curl-maintenance")
+
+type FixedDeliveryOperation = "gh-repo-view" | "gh-list-pull-requests" | "gh-create-draft" |
+	"git-clone-target" | "git-fetch-target-branch" | "git-fetch-candidate" |
+	"git-read-target-revision" | "git-read-target-tree" | "git-read-source-changes" |
+	"git-check-candidate-tree" | "git-check-candidate-ancestry" | "git-ls-remote-branch" |
+	"git-read-origin" | "git-read-current-default-branch" | "git-push-candidate"
 
 export const CURL_REPAIR_DELIVERY_POLICY = Object.freeze({
 	schemaVersion: 1,
@@ -306,33 +313,33 @@ class FixedCurlGitAdapter implements CurlRepairGitAdapter {
 		this.checkout = path.join(stateRoot, "private-checkout")
 	}
 	async inspectTarget(): Promise<CurlRepairTarget> {
-		const repository = await runGitHub(["repo", "view", CURL_REPAIR_TARGET_REPOSITORY, "--json", "nameWithOwner,url,isPrivate,defaultBranchRef"])
+		const repository = await runGitHub("gh-repo-view", ["repo", "view", CURL_REPAIR_TARGET_REPOSITORY, "--json", "nameWithOwner,url,isPrivate,defaultBranchRef"])
 		let view: any
 		try { view = JSON.parse(repository) } catch { throw new Error("private Curl destination metadata is invalid") }
 		if (view?.nameWithOwner !== CURL_REPAIR_TARGET_REPOSITORY || view?.url !== REPOSITORY_URL || view?.isPrivate !== true ||
 			view?.defaultBranchRef?.name !== DEFAULT_BRANCH) throw new Error("private Curl destination does not match the fixed repository identity")
 		await this.ensureCheckout()
-		await run("git", ["-C", this.checkout, "fetch", "--no-tags", "--no-recurse-submodules", "origin",
+		await run("git-fetch-target-branch", ["-C", this.checkout, "fetch", "--no-tags", "--no-recurse-submodules", "origin",
 			`+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}`])
-		const baseRevision = await gitValue(this.checkout, "rev-parse", `refs/remotes/origin/${DEFAULT_BRANCH}^{commit}`)
-		const treeSha = await gitValue(this.checkout, "rev-parse", `${baseRevision}^{tree}`)
-		const changed = await gitValue(this.checkout, "diff", "--name-only", CURL_REPAIR_TARGET_BASE, baseRevision)
+		const baseRevision = await gitValue("git-read-target-revision", this.checkout, "rev-parse", `refs/remotes/origin/${DEFAULT_BRANCH}^{commit}`)
+		const treeSha = await gitValue("git-read-target-tree", this.checkout, "rev-parse", `${baseRevision}^{tree}`)
+		const changed = await gitValue("git-read-source-changes", this.checkout, "diff", "--name-only", CURL_REPAIR_TARGET_BASE, baseRevision)
 		const changedPathsFromSource = changed.split(/\r?\n/).filter(Boolean).sort()
 		return { repository: CURL_REPAIR_TARGET_REPOSITORY, private: true, branch: DEFAULT_BRANCH, baseRevision, treeSha, changedPathsFromSource }
 	}
 	async candidateIsAncestor(candidateRevision: string, targetRevision: string): Promise<boolean> {
 		if (candidateRevision !== CURL_REPAIR_CANDIDATE_REVISION || !isSha(targetRevision)) throw new Error("Curl ancestry query is outside the fixed source identity")
-		await run("git", ["-C", this.checkout, "fetch", "--no-tags", "--no-recurse-submodules", TARGET_PATH, candidateRevision])
-		const candidateTree = await gitValue(this.checkout, "rev-parse", `${candidateRevision}^{tree}`)
+		await run("git-fetch-candidate", ["-C", this.checkout, "fetch", "--no-tags", "--no-recurse-submodules", TARGET_PATH, candidateRevision])
+		const candidateTree = await gitValue("git-check-candidate-tree", this.checkout, "rev-parse", `${candidateRevision}^{tree}`)
 		if (candidateTree !== CURL_REPAIR_CANDIDATE_TREE_SHA) throw new Error("private source candidate tree differs from the compiled repair pin")
-		const result = await runStatus("git", ["-C", this.checkout, "merge-base", "--is-ancestor", candidateRevision, targetRevision])
+		const result = await runStatus("git-check-candidate-ancestry", ["-C", this.checkout, "merge-base", "--is-ancestor", candidateRevision, targetRevision])
 		if (result === 0) return true
 		if (result === 1) return false
 		throw new Error("private Curl candidate ancestry could not be established")
 	}
 	async remoteBranchRevision(branch: string): Promise<string | null> {
 		validateBranch(branch)
-		const result = await run("git", ["ls-remote", "--heads", GIT_URL, `refs/heads/${branch}`])
+		const result = await run("git-ls-remote-branch", ["ls-remote", "--heads", GIT_URL, `refs/heads/${branch}`])
 		const lines = result.split(/\r?\n/).filter(Boolean)
 		if (lines.length === 0) return null
 		if (lines.length !== 1) throw new Error("private Curl branch lookup is ambiguous")
@@ -346,13 +353,13 @@ class FixedCurlGitAdapter implements CurlRepairGitAdapter {
 			throw new Error("private Curl branch write is outside the fixed historical repair")
 		}
 		await this.ensureCheckout()
-		const origin = await gitValue(this.checkout, "remote", "get-url", "origin")
+		const origin = await gitValue("git-read-origin", this.checkout, "remote", "get-url", "origin")
 		if (origin !== GIT_URL) throw new Error("private Curl checkout origin does not match its fixed destination")
-		await run("git", ["-C", this.checkout, "fetch", "--no-tags", "--no-recurse-submodules", "origin",
+		await run("git-fetch-target-branch", ["-C", this.checkout, "fetch", "--no-tags", "--no-recurse-submodules", "origin",
 			`+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}`])
-		const currentBase = await gitValue(this.checkout, "rev-parse", `refs/remotes/origin/${DEFAULT_BRANCH}^{commit}`)
+		const currentBase = await gitValue("git-read-current-default-branch", this.checkout, "rev-parse", `refs/remotes/origin/${DEFAULT_BRANCH}^{commit}`)
 		if (currentBase !== expectedBaseRevision) throw new Error("private Curl default branch moved before repair push")
-		await run("git", ["-C", this.checkout, "push", "origin", `${candidateRevision}:refs/heads/${branch}`])
+		await run("git-push-candidate", ["-C", this.checkout, "push", "origin", `${candidateRevision}:refs/heads/${branch}`])
 	}
 	private async ensureCheckout(): Promise<void> {
 		try {
@@ -364,7 +371,7 @@ class FixedCurlGitAdapter implements CurlRepairGitAdapter {
 			if (!gitInfo.isDirectory() || gitInfo.isSymbolicLink() || (typeof process.getuid === "function" && gitInfo.uid !== process.getuid())) {
 				throw new Error("private Curl checkout Git metadata is invalid")
 			}
-			const origin = await gitValue(this.checkout, "remote", "get-url", "origin")
+			const origin = await gitValue("git-read-origin", this.checkout, "remote", "get-url", "origin")
 			if (origin !== GIT_URL) throw new Error("private Curl checkout origin is invalid")
 			return
 		} catch (error) {
@@ -372,7 +379,7 @@ class FixedCurlGitAdapter implements CurlRepairGitAdapter {
 		}
 		await fsp.mkdir(this.stateRoot, { recursive: true, mode: 0o700 })
 		const temporary = path.join(this.stateRoot, `.private-checkout-${process.pid}-${randomUUID()}`)
-		await run("git", ["clone", "--no-checkout", "--no-tags", "--single-branch", "--branch", DEFAULT_BRANCH, GIT_URL, temporary])
+		await run("git-clone-target", ["clone", "--no-checkout", "--no-tags", "--single-branch", "--branch", DEFAULT_BRANCH, GIT_URL, temporary])
 		await fsp.chmod(temporary, 0o700)
 		await fsp.rename(temporary, this.checkout)
 	}
@@ -381,7 +388,7 @@ class FixedCurlGitAdapter implements CurlRepairGitAdapter {
 class FixedCurlGitHubAdapter implements CurlRepairGitHubAdapter {
 	async findPullRequests(branch: string): Promise<CurlRepairPullRequest[]> {
 		validateBranch(branch)
-		const raw = await runGitHub(["api", `repos/${CURL_REPAIR_TARGET_REPOSITORY}/pulls?state=all&head=Capsize-Games:${branch}&per_page=100`])
+		const raw = await runGitHub("gh-list-pull-requests", ["api", `repos/${CURL_REPAIR_TARGET_REPOSITORY}/pulls?state=all&head=Capsize-Games:${branch}&per_page=100`])
 		let rows: any
 		try { rows = JSON.parse(raw) } catch { throw new Error("private Curl pull request response is invalid") }
 		if (!Array.isArray(rows) || rows.length >= 100) throw new Error("private Curl pull request response exceeds its bound")
@@ -401,7 +408,7 @@ class FixedCurlGitHubAdapter implements CurlRepairGitHubAdapter {
 		if (input.title !== repairPullRequestTitle() || input.body.length > 8_000 || !input.body.startsWith("Verified historical Curl repair")) {
 			throw new Error("private Curl draft content is outside the fixed repair template")
 		}
-		await runGitHub(["pr", "create", "--draft", "--repo", CURL_REPAIR_TARGET_REPOSITORY, "--base", DEFAULT_BRANCH,
+		await runGitHub("gh-create-draft", ["pr", "create", "--draft", "--repo", CURL_REPAIR_TARGET_REPOSITORY, "--base", DEFAULT_BRANCH,
 			"--head", `${CURL_REPAIR_TARGET_REPOSITORY.split("/")[0]}:${input.branch}`, "--title", input.title, "--body", input.body], 60_000)
 	}
 }
@@ -542,8 +549,6 @@ function canonical(value: unknown): string {
 		.map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(",")}}`
 }
 
-async function gitValue(root: string, ...args: string[]): Promise<string> { return (await run("git", ["-C", root, ...args])).trim() }
-
 /** Fixed host-side gh calls use the owner's validated keyring bus, never inherited token or bus variables. */
 export function fixedCurlDeliveryGitHubEnvironment(source: NodeJS.ProcessEnv = process.env,
 	): NodeJS.ProcessEnv {
@@ -627,34 +632,38 @@ function isOwnerDbusProcess(sessionPid: number, uid: number, address?: string): 
 	return false
 }
 
-async function runGitHub(args: string[], timeoutMs = 30_000): Promise<string> {
+async function runGitHub(operation: FixedDeliveryOperation, args: string[], timeoutMs = 30_000): Promise<string> {
 	try {
 		const { stdout } = await execFileAsync(GITHUB_CLI, args, { timeout: timeoutMs, maxBuffer: 256 * 1024,
 			encoding: "utf8", env: fixedCurlDeliveryGitHubEnvironment() })
 		return stdout
 	} catch {
-		throw new Error("fixed Curl delivery command failed")
+		throw new Error(`fixed Curl delivery command failed (${operation})`)
 	}
 }
 
-async function run(command: string, args: string[], timeoutMs = 30_000): Promise<string> {
+async function run(operation: FixedDeliveryOperation, args: string[], timeoutMs = 30_000): Promise<string> {
 	try {
-		const { stdout } = await execFileAsync(command, args, { timeout: timeoutMs, maxBuffer: 256 * 1024, encoding: "utf8",
+		const { stdout } = await execFileAsync(GIT_CLI, args, { timeout: timeoutMs, maxBuffer: 256 * 1024, encoding: "utf8",
 			env: fixedCurlDeliveryGitHubEnvironment() })
 		return stdout
 	} catch {
-		throw new Error("fixed Curl delivery command failed")
+		throw new Error(`fixed Curl delivery command failed (${operation})`)
 	}
 }
 
-async function runStatus(command: string, args: string[], timeoutMs = 30_000): Promise<number> {
+async function runStatus(operation: FixedDeliveryOperation, args: string[], timeoutMs = 30_000): Promise<number> {
 	try {
-		await execFileAsync(command, args, { timeout: timeoutMs, maxBuffer: 256 * 1024, encoding: "utf8",
+		await execFileAsync(GIT_CLI, args, { timeout: timeoutMs, maxBuffer: 256 * 1024, encoding: "utf8",
 			env: fixedCurlDeliveryGitHubEnvironment() } as any)
 		return 0
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException & { code?: number }).code
 		if (typeof code === "number") return code
-		throw new Error("fixed Curl delivery command was unavailable")
+		throw new Error(`fixed Curl delivery command unavailable (${operation})`)
 	}
+}
+
+async function gitValue(operation: FixedDeliveryOperation, root: string, ...args: string[]): Promise<string> {
+	return (await run(operation, ["-C", root, ...args])).trim()
 }
