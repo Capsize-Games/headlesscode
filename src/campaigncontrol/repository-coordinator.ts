@@ -13,7 +13,7 @@ import type { PublishedAdvisoryRecord } from "./repository-advisory-intake.js"
 import type { KnownCurlDebianAdvisory } from "./repository-known-advisory.js"
 
 export type RepositoryAdvisoryIntake =
-	| { source: "osv-commit-query"; publicBaseRevision: string; supportedAdvisoryIds: readonly string[]; poll(): Promise<PublishedAdvisoryRecord[]> }
+	| { source: "osv-commit-query"; publicBaseRevision: string; supportedAdvisoryIds: readonly string[]; poll(): Promise<PublishedAdvisoryRecord[]>; verifySource?(): Promise<void> }
 	| { source: "debian-tracker-repair-snapshot"; publicBaseRevision: string; poll(): Promise<KnownCurlDebianAdvisory>; verifySource(): Promise<void> }
 
 export interface RepositoryWorkerExecutionResult {
@@ -202,7 +202,7 @@ export class RepositoryCampaignCoordinator {
 	private async verifyIntakePrerequisite(definition: RepositoryCampaignDefinition): Promise<boolean> {
 		const worker = this.workers.find((entry) => identityMatches(definition, entry))
 		const intake = worker?.advisoryIntake
-		if (!intake || intake.source !== "debian-tracker-repair-snapshot") return true
+		if (!intake || typeof intake.verifySource !== "function") return true
 		try {
 			await intake.verifySource()
 			this.intakePrerequisiteErrors.delete(definition.id)

@@ -6,6 +6,8 @@ import { CURL_CAMPAIGN_ID, CURL_DEBIAN_AFFECTED_RANGE, CURL_DEBIAN_FIXED_REVISIO
 	CURL_DEBIAN_PUBLIC_BASE_REVISION, CURL_DEBIAN_SNAPSHOT_SHA256, CURL_DEBIAN_SOURCE_HTML_SHA256, CURL_DEBIAN_SOURCE_URL,
 	CURL_FIXED_ADVISORY } from "./repository-known-advisory.js"
 import { CURL_REPAIR_CAMPAIGN_ID } from "./repository-campaign-ids.js"
+import { CURL_REPAIR_EVALUATOR_DIGEST, CURL_REPAIR_POLICY_SHA256, CURL_REPAIR_PROFILE_ID, CURL_REPAIR_RECIPE_DIGEST, CURL_REPAIR_SOURCE_REVISION,
+	CURL_REPAIR_REPOSITORY_ID, CURL_REPAIR_TARGET_REPOSITORY } from "./repository-curl-repair.js"
 
 export const REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS = 5_000_000
 // Keeps the mock subcap within the existing fixed Fleet campaign's 108k-token ceiling.
@@ -70,7 +72,7 @@ export interface RepositoryCampaignDefinition {
 }
 
 export interface RepositoryBudgetAuthority {
-	mode: "synthetic-test" | "fleet-v2" | "fleet-v2-readonly" | "unavailable"
+	mode: "synthetic-test" | "fleet-v2" | "fleet-v2-readonly" | "fleet-v2-budget-only" | "unavailable"
 	available: boolean
 	snapshotOnly?: boolean
 	limitMicros: number
@@ -595,6 +597,16 @@ function snapshotCanProvision(authority: RepositoryBudgetAuthority): boolean {
 	return snapshotProvisionAdmission(authority) && snapshotProvisionBudget(authority)
 }
 
+function liveBudgetOnlyAdmission(authority: RepositoryBudgetAuthority, definition: RepositoryCampaignDefinition): boolean {
+	return authority.mode === "fleet-v2-budget-only" && definition.id === CURL_REPAIR_CAMPAIGN_ID &&
+		definition.repositoryId === CURL_REPAIR_REPOSITORY_ID && definition.repository === CURL_REPAIR_TARGET_REPOSITORY &&
+		definition.sourceRevision === CURL_REPAIR_SOURCE_REVISION && definition.policySha256 === CURL_REPAIR_POLICY_SHA256 &&
+		definition.workerProfile === CURL_REPAIR_PROFILE_ID && definition.recipeDigest === CURL_REPAIR_RECIPE_DIGEST &&
+		definition.evaluatorDigest === CURL_REPAIR_EVALUATOR_DIGEST && authority.snapshotOnly === true && !authority.available &&
+		authority.globalEnabled === true && authority.canAdmit === true && authority.repositoryEnabled === true &&
+		!!authority.runId && Number.isSafeInteger(authority.runExpiresAtMs) && Number(authority.runExpiresAtMs) > Date.now()
+}
+
 function aggregateBudgetExhausted(authority: RepositoryBudgetAuthority,
 	totals: Pick<CampaignRecord, "settledMicros" | "reservedMicros" | "ambiguousMicros" | "settledTokens" | "reservedTokens" | "ambiguousTokens">): boolean {
 	const micros = authority.committedMicros + totals.settledMicros + totals.reservedMicros + totals.ambiguousMicros >= authority.limitMicros
@@ -603,7 +615,7 @@ function aggregateBudgetExhausted(authority: RepositoryBudgetAuthority,
 }
 
 function validAuthorityBase(authority: RepositoryBudgetAuthority): boolean {
-	if (!authority || !["synthetic-test", "fleet-v2", "fleet-v2-readonly", "unavailable"].includes(authority.mode) || typeof authority.available !== "boolean") return false
+	if (!authority || !["synthetic-test", "fleet-v2", "fleet-v2-readonly", "fleet-v2-budget-only", "unavailable"].includes(authority.mode) || typeof authority.available !== "boolean") return false
 	const committed = [authority.committedMicros, authority.committedTokens]
 	const limitsValid = Number.isSafeInteger(authority.limitMicros) && authority.limitMicros >= 0 && authority.limitMicros <= REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS &&
 		Number.isSafeInteger(authority.limitTokens) && authority.limitTokens >= 0 && authority.limitTokens <= REPOSITORY_CAMPAIGN_BUDGET_CAP_TOKENS
@@ -616,14 +628,15 @@ function validUnavailableAuthority(authority: RepositoryBudgetAuthority): boolea
 }
 
 function isFleetAuthority(mode: RepositoryBudgetAuthority["mode"]): boolean {
-	return mode === "fleet-v2" || mode === "fleet-v2-readonly"
+	return mode === "fleet-v2" || mode === "fleet-v2-readonly" || mode === "fleet-v2-budget-only"
 }
 
 function validFleetAuthority(authority: RepositoryBudgetAuthority, campaignId: string | undefined,
 	definitionFor: (id: string) => RepositoryCampaignDefinition): boolean {
 	const snapshotOnly = authority.mode === "fleet-v2-readonly"
-	return validFleetTimestampAndRun(authority, snapshotOnly) && validFleetScopeFields(authority) &&
-		validFleetUsage(authority, snapshotOnly) && validFleetCampaign(authority, campaignId, definitionFor)
+	const budgetOnly = authority.mode === "fleet-v2-budget-only"
+	return validFleetTimestampAndRun(authority, snapshotOnly, budgetOnly) && validFleetScopeFields(authority) &&
+		validFleetUsage(authority, snapshotOnly, budgetOnly) && validFleetCampaign(authority, campaignId, definitionFor)
 }
 
 function freshAuthorityTimestamp(authority: RepositoryBudgetAuthority, now: number): boolean {
@@ -640,16 +653,16 @@ function validSnapshotOnlyRun(authority: RepositoryBudgetAuthority): boolean {
 	return authority.snapshotOnly === true && !authority.available && authority.runId === null && authority.runExpiresAtMs === null
 }
 
-function validActiveRun(authority: RepositoryBudgetAuthority, now: number): boolean {
+function validActiveRun(authority: RepositoryBudgetAuthority, now: number, budgetOnly = false): boolean {
 	const runId = typeof authority.runId === "string" && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(authority.runId)
 	const expiry = Number.isSafeInteger(authority.runExpiresAtMs) && Number(authority.asOfMs) < Number(authority.runExpiresAtMs) && now < Number(authority.runExpiresAtMs)
-	return authority.snapshotOnly !== true && runId && expiry
+	return (budgetOnly ? authority.snapshotOnly === true : authority.snapshotOnly !== true) && runId && expiry
 }
 
-function validFleetTimestampAndRun(authority: RepositoryBudgetAuthority, snapshotOnly: boolean): boolean {
+function validFleetTimestampAndRun(authority: RepositoryBudgetAuthority, snapshotOnly: boolean, budgetOnly = false): boolean {
 	const now = Date.now()
 	if (!freshAuthorityTimestamp(authority, now) || !validAuthorityEpochs(authority) || authority.campaignId !== "fleet-security-watch") return false
-	return snapshotOnly ? validSnapshotOnlyRun(authority) : validActiveRun(authority, now)
+	return snapshotOnly ? validSnapshotOnlyRun(authority) : validActiveRun(authority, now, budgetOnly)
 }
 
 function validFleetRepositoryIdentity(authority: RepositoryBudgetAuthority): boolean {
@@ -687,9 +700,10 @@ function validLegacyUsageProjection(authority: RepositoryBudgetAuthority): boole
 	return authority.committedMicros === micros && authority.committedTokens === tokens
 }
 
-function validFleetUsage(authority: RepositoryBudgetAuthority, snapshotOnly: boolean): boolean {
+function validFleetUsage(authority: RepositoryBudgetAuthority, snapshotOnly: boolean, budgetOnly = false): boolean {
 	return validFleetUsageSnapshots(authority) && validLegacyUsageProjection(authority) &&
-		authority.available === (snapshotOnly ? false : fleetUsageAvailable(authority))
+		authority.available === (snapshotOnly || budgetOnly ? false : fleetUsageAvailable(authority)) &&
+		(!budgetOnly || (authority.snapshotOnly === true && authority.model === "none" && authority.profileId === "no-model"))
 }
 
 function fleetUsageAvailable(authority: RepositoryBudgetAuthority): boolean {
@@ -705,9 +719,14 @@ function fleetUsageAvailable(authority: RepositoryBudgetAuthority): boolean {
 
 function validFleetCampaign(authority: RepositoryBudgetAuthority, campaignId: string | undefined,
 	definitionFor: (id: string) => RepositoryCampaignDefinition): boolean {
-	if (campaignId === undefined) return true
+	if (campaignId === undefined) return authority.mode !== "fleet-v2-budget-only"
 	const definition = definitionFor(campaignId)
-	return authority.repositoryCampaignId === campaignId && authority.sourceRevision === definition.sourceRevision && authority.model === definition.model
+	const ordinary = authority.mode !== "fleet-v2-budget-only" && authority.repositoryCampaignId === campaignId &&
+		authority.sourceRevision === definition.sourceRevision && authority.model === definition.model
+	return ordinary || (liveBudgetOnlyAdmission(authority, definition) && authority.repositoryCampaignId === CURL_REPAIR_CAMPAIGN_ID &&
+		authority.repositoryId === CURL_REPAIR_REPOSITORY_ID && authority.repository === CURL_REPAIR_TARGET_REPOSITORY &&
+		authority.sourceRevision === CURL_REPAIR_SOURCE_REVISION && authority.policySha256 === CURL_REPAIR_POLICY_SHA256 &&
+		authority.model === "none" && authority.profileId === "no-model")
 }
 
 function validCampaignStateFile(stat: Awaited<ReturnType<typeof fs.lstat>>): boolean {
@@ -1026,7 +1045,7 @@ export class RepositoryCampaignStore {
 		const totals = this.aggregateTotals(state)
 		return {
 			month: state.month,
-			budget: { authority: authority.mode, adapter: authority.mode === "fleet-v2-readonly" ? authority.mode : authority.available ? authority.mode : "none", available: authority.available,
+			budget: { authority: authority.mode, adapter: authority.mode === "fleet-v2-readonly" || authority.mode === "fleet-v2-budget-only" ? authority.mode : authority.available ? authority.mode : "none", available: authority.available,
 				provisioningAvailable: snapshotCanProvision(authority),
 				limitMicros: authority.limitMicros, limitTokens: authority.limitTokens, externalCommittedMicros: authority.committedMicros,
 				externalCommittedTokens: authority.committedTokens, ...totals,
@@ -1372,7 +1391,8 @@ export class RepositoryCampaignStore {
 			throw new Error("campaign worker progress profile is invalid")
 		}
 		const authority = await this.budgetAuthority(id)
-		if (mode.executionKind === "live-cve" && authority.mode !== "fleet-v2") {
+		const budgetOnlyReady = liveBudgetOnlyAdmission(authority, this.requireDefinition(id))
+		if (mode.executionKind === "live-cve" && authority.mode !== "fleet-v2" && !budgetOnlyReady) {
 			throw new Error("live campaign claims require authoritative Fleet v2 registration")
 		}
 		return this.update((s) => {
@@ -1386,6 +1406,7 @@ export class RepositoryCampaignStore {
 				c.settledTokens + c.reservedTokens + c.ambiguousTokens + reservation.tokens > c.budgetLimitTokens) return undefined
 			const job = s.jobs.find((candidate) => candidate.campaignId === id && candidate.status === "queued")
 			if (!job) return undefined
+			if (budgetOnlyReady && (job.purpose !== "repair" || job.advisoryId !== CURL_FIXED_ADVISORY)) return undefined
 			const claimId = randomUUID()
 			job.status = "running"; job.claimId = claimId; job.epoch = c.epoch; job.reservedMicros = reservation.micros; job.reservedTokens = reservation.tokens; job.updatedAt = now.getTime()
 			job.progress = { executionKind: mode.executionKind, workerId: randomUUID(),
@@ -1525,14 +1546,15 @@ export class RepositoryCampaignStore {
 	private missingReadiness(definition: RepositoryCampaignDefinition, authority: RepositoryBudgetAuthority, campaign: CampaignRecord, state: CampaignState): string[] {
 		const missing = missingQualification(definition)
 		const canProvision = snapshotCanProvision(authority)
-		if (!authority.available && !canProvision) missing.push("authoritative-broker-budget")
+		const budgetOnlyReady = liveBudgetOnlyAdmission(authority, definition)
+		if (!authority.available && !canProvision && !budgetOnlyReady) missing.push("authoritative-broker-budget")
 		const repositoryLimits = authority.repositoryLifetime
 		if (isFleetAuthority(authority.mode) && (!repositoryLimits || campaign.budgetLimitMicros > repositoryLimits.limitMicros ||
 			campaign.budgetLimitTokens > repositoryLimits.limitTokens)) missing.push("repository-budget-allocation")
 		const allocations = this.aggregateAllocations(state)
 		if (allocations.micros > authority.limitMicros || allocations.tokens > authority.limitTokens) missing.push("aggregate-budget-allocation")
 		const totals = this.aggregateTotals(state)
-		if ((authority.available || canProvision) && aggregateBudgetExhausted(authority, totals)) missing.push("aggregate-budget-exhausted")
+		if ((authority.available || canProvision || budgetOnlyReady) && aggregateBudgetExhausted(authority, totals)) missing.push("aggregate-budget-exhausted")
 		if (campaign.budgetLimitMicros <= 0 || campaign.budgetLimitTokens <= 0) missing.push("finite-token-and-spend-allocation")
 		return missing
 	}

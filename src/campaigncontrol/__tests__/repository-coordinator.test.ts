@@ -362,6 +362,34 @@ async function testPublishedIntakeQueuesOnceAcrossPollsAndCoordinatorRestart(): 
 	} finally { await fs.rm(root, { recursive: true, force: true }) }
 }
 
+async function testChangedPrivateSourceBlocksOrdinaryOsvIntake(): Promise<void> {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-source-pin-osv-"))
+	const run: ActiveCampaignRun = { id: "44444444-4444-4444-8444-444444444444", epoch: 5, startedAt: Date.now(), expiresAt: Date.now() + 20 * 60_000 }
+	let polls = 0
+	try {
+		const store = new RepositoryCampaignStore(path.join(root, "state.json"), [definition], () => liveAuthority(run))
+		await store.setCampaignBudget(definition.id, 20_000, 20_000)
+		await store.start(definition.id)
+		const worker = createRepositoryWorkerPipeline({ workerProfile: definition.workerProfile!, recipeDigest: definition.recipeDigest!,
+			evaluatorDigest: definition.evaluatorDigest!, model: definition.model!, executionKind: "live-cve", reservation: { micros: 10_000, tokens: 10_000 },
+			async lookupAdvisory(): Promise<never> { throw new Error("changed source must not dispatch") }, async prepareWorkspace(): Promise<never> { throw new Error("changed source must not dispatch") },
+			async evaluate(): Promise<never> { throw new Error("changed source must not dispatch") }, async deliverPrivate(): Promise<never> { throw new Error("changed source must not dispatch") },
+		})
+		const liveWorker = { ...worker, advisoryIntake: { source: "osv-commit-query" as const, publicBaseRevision: "e".repeat(40), supportedAdvisoryIds: ["CVE-2026-1262"],
+			async verifySource(): Promise<void> { throw new Error("private Curl source pin changed") },
+			async poll(): Promise<PublishedAdvisoryRecord[]> { polls++; return [] } } }
+		const lease = { async acquire(): Promise<null> { return null }, async finish(value: ActiveCampaignRun, status: "succeeded" | "failed"): ReturnType<RepositoryCampaignRunLease["finish"]> { return { ...value, status, finishedAt: Date.now() } } }
+		const coordinator = new RepositoryCampaignCoordinator(store, [liveWorker], 100, lease)
+		await coordinator.tick()
+		const status = await store.status() as unknown as CoordinatorStatusSnapshot
+		assert.equal(polls, 0, "private source identity is checked before querying or claiming ordinary OSV intake")
+		assert.equal(status.jobs.length, 0)
+		assert.equal(status.intakeRecords.length, 0)
+		assert.equal(coordinator.intakeStatus(definition.id).state, "unavailable")
+		await coordinator.stop()
+	} finally { await fs.rm(root, { recursive: true, force: true }) }
+}
+
 const tests: readonly SuiteTest[] = [
 	["registered repository pipeline runs intake, contained worker, evaluator, and private delivery in order", testCoordinatorRunsRegisteredIntakeWorkerEvaluatorDeliveryLoop],
 	["protected evaluator rejection blocks private delivery", testPipelineStopsAtRejectedEvaluatorAndDoesNotDeliver],
@@ -370,6 +398,7 @@ const tests: readonly SuiteTest[] = [
 	["live worker obtains and releases a bounded global run lease", testLiveRunLeaseLifecycle],
 	["existing global run lease leaves queued work untouched", testLiveRunLeaseBusyLeavesJobQueued],
 	["published advisory intake queues once, stays quiet when unchanged, and deduplicates after restart", testPublishedIntakeQueuesOnceAcrossPollsAndCoordinatorRestart],
+	["a changed private source pin blocks ordinary OSV intake before polling", testChangedPrivateSourceBlocksOrdinaryOsvIntake],
 ]
 
 await runMain("repository-coordinator", tests)

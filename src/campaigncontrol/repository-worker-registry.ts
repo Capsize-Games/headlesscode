@@ -8,7 +8,7 @@ import { OsvCommitAdvisoryIntake } from "./repository-advisory-intake.js"
 import type { RepositoryCampaignStore } from "./repository-campaigns.js"
 import { CURL_PRIVATE_RUNTIME_ADAPTER_ID, createCurlRepositoryPipelineAdapters } from "./repository-curl-runtime.js"
 import { createCurlHistoricalRepairAdapters } from "./repository-curl-repair-runtime.js"
-import { CURL_REPAIR_ADAPTER_ID } from "./repository-curl-repair.js"
+import { CURL_REPAIR_ADAPTER_ID, verifyCurlHistoricalRepairSourcePin } from "./repository-curl-repair.js"
 import type { RepositoryPipelineAdapterFactory, RepositoryPipelineAdapterFactoryContext, RepositoryWorkerRegistration } from "./repository-worker-registration.js"
 
 const MAX_REGISTRY_BYTES = 64 * 1024
@@ -115,6 +115,7 @@ export function bindRepositoryWorkerRegistrations(
 		const source = PUBLIC_INTAKE_PINS[registration.pipelineAdapterId]
 		if (!source) return worker
 		return { ...worker, advisoryIntake: { source: "osv-commit-query" as const, publicBaseRevision: source.publicBaseRevision,
-			supportedAdvisoryIds: source.supportedAdvisoryIds, poll: () => new OsvCommitAdvisoryIntake().poll(source.publicBaseRevision) } }
+			supportedAdvisoryIds: source.supportedAdvisoryIds, poll: () => new OsvCommitAdvisoryIntake().poll(source.publicBaseRevision),
+			...(registration.pipelineAdapterId === CURL_PRIVATE_RUNTIME_ADAPTER_ID ? { verifySource: () => verifyCurlHistoricalRepairSourcePin() } : {}) } }
 	})
 }

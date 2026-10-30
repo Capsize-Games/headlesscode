@@ -8,6 +8,8 @@ import { CAMPAIGN_CONTROL_FILE } from "../campaigncontrol/paths.js"
 import { prepareDispatchLock } from "../campaigncontrol/runner.js"
 import { FLEET_BUDGET_CAMPAIGN_ID, type FleetBudgetLedgerOptions, invokeFleetBudgetBridge,
 	resolveFleetBudgetBridgeRelease } from "./fleet-budget-ledger.js"
+import { CURL_REPAIR_CAMPAIGN_ID, CURL_REPAIR_POLICY_SHA256, CURL_REPAIR_REPOSITORY_ID,
+	CURL_REPAIR_SOURCE_REVISION, CURL_REPAIR_TARGET_REPOSITORY } from "../campaigncontrol/repository-curl-repair.js"
 import type {
 	OpenRouterBrokerGrant, OpenRouterBrokerReceipt, OpenRouterCallReceipt,
 	OpenRouterCallReservation, OpenRouterCallSettlement, OpenRouterDenialReason, OpenRouterInferenceLedger,
@@ -32,8 +34,8 @@ export interface FleetRepositoryBudgetScope {
 	repository: string
 	sourceRevision: string
 	policySha256: string
-	model: typeof MODEL
-	profileId: typeof PROFILE
+	model: typeof MODEL | "none"
+	profileId: typeof PROFILE | "no-model"
 	/** Current owner-controlled Fleet repository epoch, distinct from the HCL claim epoch. */
 	repositoryEpoch: number
 }
@@ -224,6 +226,7 @@ export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 
 	/** Read immutable Fleet ledgers for explicit owner recovery; this never calls provider authority. */
 	async proveNoCall(jobId: string, repositoryEpoch: number): Promise<FleetRepositoryNoCallProof> {
+		if (this.scope.model !== MODEL || this.scope.profileId !== PROFILE) throw new Error("no-call proof is unavailable for a budget-only repository scope")
 		if (!ID.test(jobId) || !Number.isSafeInteger(repositoryEpoch) || repositoryEpoch < 0) throw new Error("Fleet no-call proof identity is invalid")
 		const result = await this.call({ schemaVersion: 2, op: "repository-no-call-proof", campaignId: FLEET_BUDGET_CAMPAIGN_ID,
 			repositoryCampaignId: this.scope.repositoryCampaignId, repositoryId: this.scope.repositoryId,
@@ -279,13 +282,18 @@ export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 		const campaignLifetime = result.campaignLifetime
 		const legacyLifetime = result.legacyLifetime
 		const repositoryLifetime = result.repositoryLifetime
-		const snapshotOnly = op === "repository-budget-snapshot"
+		const budgetOnly = this.scope.model === "none" && this.scope.profileId === "no-model"
+		const snapshotOnly = op === "repository-budget-snapshot" || budgetOnly
+		const snapshotRunValid = budgetOnly
+			? (result.runId === null && result.runExpiresAtMs === null) ||
+				(typeof result.runId === "string" && ID.test(result.runId) && Number.isSafeInteger(result.runExpiresAtMs) && Number(result.asOfMs) < Number(result.runExpiresAtMs))
+			: result.runId === null && result.runExpiresAtMs === null
 		if (result.schemaVersion !== 2 || typeof result.available !== "boolean" || (snapshotOnly && result.snapshotOnly !== true) ||
 			(!snapshotOnly && result.snapshotOnly !== undefined && result.snapshotOnly !== false) || !Number.isSafeInteger(result.asOfMs) ||
 			result.campaignId !== FLEET_BUDGET_CAMPAIGN_ID || typeof result.globalEnabled !== "boolean" || typeof result.canAdmit !== "boolean" ||
 			Date.now() - Number(result.asOfMs) > 60_000 || Number(result.asOfMs) > Date.now() + 60_000 ||
 			!Number.isSafeInteger(result.controlEpoch) || (snapshotOnly
-				? result.runId !== null || result.runExpiresAtMs !== null || result.available !== false
+				? !snapshotRunValid || result.available !== false
 				: typeof result.runId !== "string" || !ID.test(result.runId) || !Number.isSafeInteger(result.runExpiresAtMs) || Number(result.asOfMs) >= Number(result.runExpiresAtMs)) ||
 			result.repositoryCampaignId !== this.scope.repositoryCampaignId || result.repositoryId !== this.scope.repositoryId ||
 			result.repository !== this.scope.repository || result.sourceRevision !== this.scope.sourceRevision ||
@@ -316,7 +324,8 @@ export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 			...(snapshotOnly ? { snapshotOnly: true } : {}), limitMicros: 20_000, limitTokens: 108_000,
 			committedMicros: externalMicros, committedTokens: externalTokens, asOfMs: Number(result.asOfMs),
 			campaignId: FLEET_BUDGET_CAMPAIGN_ID, globalEnabled: result.globalEnabled, canAdmit: result.canAdmit,
-			controlEpoch: Number(result.controlEpoch), runId: snapshotOnly ? null : String(result.runId), runExpiresAtMs: snapshotOnly ? null : Number(result.runExpiresAtMs),
+			controlEpoch: Number(result.controlEpoch), runId: result.runId === null ? null : String(result.runId),
+			runExpiresAtMs: result.runExpiresAtMs === null ? null : Number(result.runExpiresAtMs),
 			repositoryCampaignId: String(result.repositoryCampaignId), repositoryId: String(result.repositoryId),
 			repository: String(result.repository), sourceRevision: String(result.sourceRevision), policySha256: String(result.policySha256),
 			model: String(result.model), profileId: String(result.profileId), repositoryEnabled: result.repositoryEnabled,
@@ -370,9 +379,14 @@ export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 }
 
 function validateScope(scope: FleetRepositoryBudgetScope): FleetRepositoryBudgetScope {
+	const museProfile = scope?.model === MODEL && scope.profileId === PROFILE
+	const repairBudgetOnlyProfile = scope?.model === "none" && scope.profileId === "no-model" &&
+		scope.repositoryCampaignId === CURL_REPAIR_CAMPAIGN_ID && scope.repositoryId === CURL_REPAIR_REPOSITORY_ID &&
+		scope.repository === CURL_REPAIR_TARGET_REPOSITORY && scope.sourceRevision === CURL_REPAIR_SOURCE_REVISION &&
+		scope.policySha256 === CURL_REPAIR_POLICY_SHA256
 	if (!scope || !ID.test(scope.repositoryCampaignId) || !ID.test(scope.repositoryId) || !REPOSITORY.test(scope.repository) ||
 		!(/^[a-f0-9]{40}$|^[a-f0-9]{64}$/).test(scope.sourceRevision) || !HEX.test(scope.policySha256) ||
-		scope.model !== MODEL || scope.profileId !== PROFILE || !Number.isSafeInteger(scope.repositoryEpoch) || scope.repositoryEpoch < 0) {
+		(!museProfile && !repairBudgetOnlyProfile) || !Number.isSafeInteger(scope.repositoryEpoch) || scope.repositoryEpoch < 0) {
 		throw new Error("Fleet repository budget scope is invalid")
 	}
 	return Object.freeze({ ...scope })
@@ -576,7 +590,7 @@ function toBrokerReceipt(result: Reply, grant: OpenRouterBrokerGrant, scope: Fle
 	const completionTokens = sum(qualifiedCalls, "completionTokens")
 	const costUsd = sum(qualifiedCalls, "costUsd")
 	return { provider: "openrouter", endpointProvider: "fleet-budget-authority", jobId: grant.jobId,
-		campaignId: FLEET_BUDGET_CAMPAIGN_ID, model: scope.model, profileId: scope.profileId,
+		campaignId: FLEET_BUDGET_CAMPAIGN_ID, model: scope.model, profileId: scope.profileId as OpenRouterBrokerGrant["profileId"],
 		returnedModels: [...new Set(qualifiedCalls.map((call) => call.returnedModel).filter((v): v is string => Boolean(v)))],
 		returnedProviders: [...new Set(qualifiedCalls.map((call) => call.returnedProvider).filter((v): v is string => Boolean(v)))],
 		calls: calls.length, promptTokens, completionTokens,
