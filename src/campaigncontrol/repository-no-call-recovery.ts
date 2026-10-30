@@ -12,6 +12,7 @@ import { withCampaignDispatchFence } from "./repository-run-lease.js"
 import type { FleetRepositoryBudgetLedger, FleetRepositoryBudgetScope, FleetRepositoryNoCallProof } from "../rsi/fleet-repository-budget-ledger.js"
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const ID = /^[a-z0-9][a-z0-9._-]{0,95}$/
 const HEX = /^[a-f0-9]{64}$/
 const DOCKER_SOCKET = "unix:///var/run/docker.sock"
 
@@ -76,7 +77,7 @@ export async function recoverAmbiguousPrepareWithNoCallProof(jobId: string, conf
 export async function verifyRecoveredNoCallArtifact(job: RepositoryCampaignJob, storePath: string,
 	scope: FleetRepositoryBudgetScope, keyIdentity: string): Promise<string> {
 	if (job.campaignId !== "curl-maintenance" || job.advisoryId !== "CVE-2026-92390" || job.purpose !== "qualification" ||
-		job.status !== "failed" || job.retryOf !== undefined || job.settledMicros !== 0 || job.settledTokens !== 0 ||
+		job.status !== "failed" || (job.retryOf !== undefined && !validRetryParent(job.retryOf)) || job.settledMicros !== 0 || job.settledTokens !== 0 ||
 		job.reservedMicros !== 0 || job.reservedTokens !== 0 || !job.progress || !job.claimId || !Number.isSafeInteger(job.epoch)) {
 		throw new Error("retry target is not a recovered zero-cost Curl qualification")
 	}
@@ -107,16 +108,18 @@ export async function verifyRecoveredNoCallArtifact(job: RepositoryCampaignJob, 
 	const proof = record.proof as FleetRepositoryNoCallProof | undefined
 	if (Object.keys(record).sort().join(",") !== "claimId,epoch,jobId,proof,schemaVersion" || record.schemaVersion !== 1 ||
 		record.claimId !== job.claimId || record.epoch !== job.epoch || record.jobId !== job.id || !proof || proof.proved !== true ||
-		proof.disposition !== "no-recorded-provider-activity" || proof.jobId !== job.id || proof.campaignId !== "fleet-security-watch" ||
+		!isAcceptedNoCallProof(proof) || proof.jobId !== job.id || proof.campaignId !== "fleet-security-watch" ||
 		proof.repositoryCampaignId !== scope.repositoryCampaignId || proof.repositoryId !== scope.repositoryId ||
 		proof.repository !== scope.repository || proof.sourceRevision !== scope.sourceRevision || proof.policySha256 !== scope.policySha256 ||
 		proof.model !== scope.model || proof.profileId !== scope.profileId || proof.keyIdentity !== keyIdentity ||
-		!Number.isSafeInteger(proof.repositoryEpoch) || !Number.isSafeInteger(proof.asOfMs) || proof.asOfMs > Date.now() + 60_000 ||
-		!proof.counts || proof.counts.grants !== 0 || proof.counts.calls !== 0 || proof.counts.denials !== 0) {
+		!Number.isSafeInteger(proof.repositoryEpoch) || !Number.isSafeInteger(proof.asOfMs) || Date.now() - proof.asOfMs > 60_000 || proof.asOfMs > Date.now() + 60_000 ||
+		!proof.counts || proof.counts.calls !== 0 || proof.counts.denials !== 0) {
 		throw new Error("no-call proof artifact does not match the recovered Curl attempt")
 	}
 	return digest
 }
+
+function validRetryParent(value: string): boolean { return UUID.test(value) }
 
 function isRecoverableTarget(job: RepositoryCampaignJob | undefined, definition: RepositoryCampaignDefinition, now: number): job is RepositoryCampaignJob {
 	return !!job && job.id !== undefined && job.campaignId === definition.id && job.advisoryId === "CVE-2026-92390" &&
@@ -132,9 +135,20 @@ function assertProofMatches(proof: FleetRepositoryNoCallProof, jobId: string, sc
 		proof.policySha256 !== scope.policySha256 || proof.repositoryEpoch !== scope.repositoryEpoch || proof.model !== scope.model ||
 		proof.profileId !== scope.profileId || proof.keyIdentity !== keyIdentity ||
 		!Number.isSafeInteger(proof.asOfMs) || Date.now() - proof.asOfMs > 60_000 || proof.asOfMs > Date.now() + 60_000 ||
-		!proof.counts || ![proof.counts.grants, proof.counts.calls, proof.counts.denials].every((n) => Number.isSafeInteger(n) && n >= 0)) {
+		!proof.counts || ![proof.counts.grants, proof.counts.calls, proof.counts.denials].every((n) => Number.isSafeInteger(n) && n >= 0) ||
+		!isAcceptedNoCallProof(proof)) {
 		throw new Error("Fleet no-call proof does not match this exact job and repository scope")
 	}
+}
+
+function isAcceptedNoCallProof(proof: FleetRepositoryNoCallProof): boolean {
+	if (!proof.counts || proof.counts.calls !== 0 || proof.counts.denials !== 0) return false
+	if (proof.counts.grants === 0) return proof.grant === null && proof.disposition === "no-recorded-provider-activity"
+	const grant = proof.grant
+	return proof.counts.grants === 1 && proof.disposition === "expired-unused-grant" && !!grant &&
+		Number.isSafeInteger(grant.issuedAtMs) && grant.issuedAtMs >= 0 && grant.issuedAtMs <= proof.asOfMs &&
+		Number.isSafeInteger(grant.deadlineAtMs) && grant.deadlineAtMs > grant.issuedAtMs && grant.deadlineAtMs <= proof.asOfMs &&
+		Number.isSafeInteger(grant.controlEpoch) && grant.controlEpoch >= 0 && ID.test(grant.runId) && HEX.test(grant.grantSha256)
 }
 
 async function persistProof(storePath: string, claim: ClaimedRepositoryJob, proof: FleetRepositoryNoCallProof): Promise<string> {

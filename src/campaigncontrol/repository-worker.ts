@@ -46,6 +46,8 @@ export interface RepositoryWorkerResult {
 	exitCode: number
 	durationMs: number
 	outputSha256: string
+	/** Scrubbed, bounded detail used only for the private failure artifact. */
+	failureDiagnostic?: string
 }
 
 export interface VettedAdvisorySnapshot {
@@ -207,6 +209,26 @@ export async function runContainedRepositoryWorker(input: RepositoryWorkerLaunch
 		commandTimeoutMs: 15 * 60_000,
 		hostRuntimeEnv: input.hostRuntimeEnv,
 	})
-	return { ok: result.exitCode === 0, exitCode: result.exitCode, durationMs: Math.max(0, Date.now() - startedAt),
-		outputSha256: createHash("sha256").update(result.output).digest("hex") }
+	const outputSha256 = createHash("sha256").update(result.output).digest("hex")
+	const durationMs = Math.max(0, Date.now() - startedAt)
+	return { ok: result.exitCode === 0, exitCode: result.exitCode, durationMs, outputSha256,
+		...(result.exitCode !== 0 ? { failureDiagnostic: summarizeWorkerFailure(result.exitCode, durationMs, result.output, outputSha256) } : {}) }
+}
+
+/** Keep only likely error lines; this detail is passed to the owner-only diagnostic writer, never the API. */
+export function summarizeWorkerFailure(exitCode: number, durationMs: number, output: string, outputSha256: string): string {
+	if (!Number.isSafeInteger(exitCode) || !Number.isSafeInteger(durationMs) || durationMs < 0 ||
+		!Number.isSafeInteger(Buffer.byteLength(output, "utf8")) || !/^[a-f0-9]{64}$/.test(outputSha256)) {
+		throw new Error("repository worker failure summary inputs are invalid")
+	}
+	const candidates = output.split(/\r?\n/).map((line) => line.trim()).filter((line) =>
+		/(^headlesscode:|\berror\b|\bfail(?:ed|ure)\b|not found|permission denied|invalid|cannot read|unable to)/i.test(line))
+	const excerpt = candidates.slice(-3).map((line) => line
+		.replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [redacted]")
+		.replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "[redacted-token]")
+		.replace(/\b[A-Za-z0-9_./+=:-]{40,}\b/g, "[redacted-value]")
+		.replace(/https?:\/\/[^\s?]+\?[^\s]*/gi, "[redacted-url]")
+		.replace(/(?:\/home\/|\/root\/|\/tmp\/|\/var\/tmp\/|\/run\/user\/)[^\s,;)]*/g, "[local-path]")
+		.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").slice(0, 180)).join(" | ")
+	return `OpenShell worker exit=${exitCode}; durationMs=${durationMs}; outputBytes=${Buffer.byteLength(output, "utf8")}; outputSha256=${outputSha256}; ${excerpt || "no classified error line captured"}`.slice(0, 512)
 }

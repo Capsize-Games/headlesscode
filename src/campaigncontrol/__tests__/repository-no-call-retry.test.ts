@@ -60,4 +60,17 @@ test("only one explicit child retry follows a recovered zero-cost Curl qualifica
 	assert.equal(status.intakeRecords.length, 1, "retry preserves the original intake record")
 	assert.equal(status.budget.ambiguousMicros, 0)
 	assert.equal(status.budget.ambiguousTokens, 0)
+
+	snapshotOnly = false
+	const childClaim = await store.claimNext(definition.id, { micros: 8_000, tokens: 72_000 }, new Date(), { executionKind: "live-cve" })
+	assert.ok(childClaim)
+	assert.equal(childClaim!.job.id, child.id)
+	await store.finish(childClaim!, { status: "ambiguous" })
+	await store.settleRecoveredClaim(childClaim!, { status: "failed", actualMicros: 0, actualTokens: 0, proofSha256: "8".repeat(64) })
+	snapshotOnly = true
+	const grandchild = await store.enqueueVerifiedNoCallRetry(child.id, `CONFIRM RETRY NO-CALL ${child.id}`, new Date())
+	assert.equal(grandchild.retryOf, child.id)
+	const chained = await store.status() as { jobs: Array<Record<string, unknown>> }
+	assert.equal(chained.jobs.find((job) => job.id === grandchild.id)?.retryOf, child.id)
+	await assert.rejects(store.enqueueVerifiedNoCallRetry(child.id, `CONFIRM RETRY NO-CALL ${child.id}`), /already has a retry child/)
 })

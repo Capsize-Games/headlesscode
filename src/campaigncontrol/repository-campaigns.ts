@@ -384,14 +384,21 @@ function validQualificationJob(job: RepositoryCampaignJob, s: Partial<CampaignSt
 	if (job.purpose !== "qualification" || job.campaignId !== CURL_CAMPAIGN_ID || job.advisoryId !== CURL_FIXED_ADVISORY) return false
 	if (job.retryOf === undefined) return (s.intakeRecords ?? []).some((row) => row?.source === "debian-tracker-snapshot" && row.jobId === job.id &&
 		row.campaignId === job.campaignId && row.advisoryId === job.advisoryId && row.snapshotSha256 === CURL_DEBIAN_SNAPSHOT_SHA256)
-	const parent = (s.jobs ?? []).find((row) => row.id === job.retryOf)
-	const parentProof = parent?.progress?.evidenceRefs.filter((ref) => ref.kind === "no-call-proof") ?? []
-	return !!parent && parent.retryOf === undefined && parent.purpose === "qualification" && parent.campaignId === job.campaignId &&
-		parent.advisoryId === job.advisoryId && parent.status === "failed" && parent.reservedMicros === 0 && parent.reservedTokens === 0 &&
-		parent.settledMicros === 0 && parent.settledTokens === 0 && parentProof.length === 1 && /^[a-f0-9]{64}$/.test(parentProof[0]!.id) &&
-		(s.intakeRecords ?? []).some((row) => row?.source === "debian-tracker-snapshot" && row.jobId === parent.id &&
-			row.campaignId === job.campaignId && row.advisoryId === job.advisoryId && row.snapshotSha256 === CURL_DEBIAN_SNAPSHOT_SHA256) &&
-		(s.jobs ?? []).filter((row) => row.retryOf === parent.id).length === 1
+	const seen = new Set<string>([job.id])
+	let parentId: string | undefined = job.retryOf
+	while (parentId !== undefined) {
+		const parent = (s.jobs ?? []).find((row) => row.id === parentId)
+		if (!parent || seen.has(parent.id) || parent.purpose !== "qualification" || parent.campaignId !== job.campaignId ||
+			parent.advisoryId !== job.advisoryId || parent.status !== "failed" || parent.reservedMicros !== 0 || parent.reservedTokens !== 0 ||
+			parent.settledMicros !== 0 || parent.settledTokens !== 0 || (s.jobs ?? []).filter((row) => row.retryOf === parent.id).length !== 1) return false
+		const parentProof = parent.progress?.evidenceRefs.filter((ref) => ref.kind === "no-call-proof") ?? []
+		if (parentProof.length !== 1 || !/^[a-f0-9]{64}$/.test(parentProof[0]!.id)) return false
+		seen.add(parent.id)
+		if (parent.retryOf === undefined) return (s.intakeRecords ?? []).some((row) => row?.source === "debian-tracker-snapshot" && row.jobId === parent.id &&
+			row.campaignId === job.campaignId && row.advisoryId === job.advisoryId && row.snapshotSha256 === CURL_DEBIAN_SNAPSHOT_SHA256)
+		parentId = parent.retryOf
+	}
+	return false
 }
 
 function validRepairJob(job: RepositoryCampaignJob, s: Partial<CampaignState>): boolean {
@@ -1246,12 +1253,23 @@ export class RepositoryCampaignStore {
 			}
 			const parent = s.jobs.find((job) => job.id === parentJobId)
 			const proofRefs = parent?.progress?.evidenceRefs.filter((ref) => ref.kind === "no-call-proof") ?? []
-			if (!parent || parent.retryOf !== undefined || parent.campaignId !== CURL_CAMPAIGN_ID || parent.advisoryId !== CURL_FIXED_ADVISORY ||
+			if (!parent || (parent.retryOf !== undefined && !validId(parent.retryOf)) || parent.campaignId !== CURL_CAMPAIGN_ID || parent.advisoryId !== CURL_FIXED_ADVISORY ||
 				parent.purpose !== "qualification" || parent.status !== "failed" || parent.reservedMicros !== 0 || parent.reservedTokens !== 0 ||
 				parent.settledMicros !== 0 || parent.settledTokens !== 0 || proofRefs.length !== 1 || !/^[a-f0-9]{64}$/.test(proofRefs[0]!.id)) {
 				throw new Error("retry parent is not a recovered zero-cost Curl qualification")
 			}
-			const intake = s.intakeRecords.find((row) => row.source === "debian-tracker-snapshot" && row.jobId === parent.id &&
+			let intakeRoot = parent
+			const seenParents = new Set<string>([parent.id])
+			while (intakeRoot.retryOf !== undefined) {
+				const retryParent = s.jobs.find((job) => job.id === intakeRoot.retryOf)
+				if (!retryParent || seenParents.has(retryParent.id) || retryParent.campaignId !== parent.campaignId ||
+					retryParent.advisoryId !== parent.advisoryId || retryParent.purpose !== "qualification") {
+					throw new Error("retry lineage is invalid")
+				}
+				seenParents.add(retryParent.id)
+				intakeRoot = retryParent
+			}
+			const intake = s.intakeRecords.find((row) => row.source === "debian-tracker-snapshot" && row.jobId === intakeRoot.id &&
 				row.campaignId === parent.campaignId && row.advisoryId === parent.advisoryId && row.snapshotSha256 === CURL_DEBIAN_SNAPSHOT_SHA256)
 			if (!intake) throw new Error("retry parent has no matching immutable advisory intake record")
 			if (s.jobs.some((job) => job.retryOf === parent.id)) throw new Error("this failed qualification already has a retry child")

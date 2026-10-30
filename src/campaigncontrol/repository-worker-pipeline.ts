@@ -8,7 +8,7 @@ import { writeRepositoryWorkerDiagnostic } from "./repository-worker-diagnostics
 export interface RepositoryPreparedWorkspace {
 	readonly worktree: string
 	readonly taskSha256: string
-	readonly runContained: () => Promise<{ ok: boolean; durationMs: number; outputSha256: string; actualMicros: number | null; actualTokens: number | null }>
+	readonly runContained: () => Promise<{ ok: boolean; durationMs: number; outputSha256: string; actualMicros: number | null; actualTokens: number | null; failureDiagnostic?: string }>
 	readonly candidateSha256: () => Promise<string>
 	readonly historicalRepairCandidate?: CurlHistoricalRepairCandidate
 	readonly cleanup?: () => Promise<void>
@@ -104,10 +104,7 @@ export function createRepositoryWorkerPipeline(adapters: RepositoryWorkerPipelin
 					const worker = await workspace.runContained()
 					actualMicros = worker.actualMicros
 					actualTokens = worker.actualTokens
-					if (!worker.ok) return { status: actualMicros === null || actualTokens === null ? "ambiguous" : "failed",
-						accounting: actualMicros === null || actualTokens === null ? "ambiguous" : "measured", actualMicros, actualTokens,
-						completedSteps, evidenceRefs, currentTask: "Contained worker stopped before a candidate was verified",
-						blocker: `contained-worker-exit-${worker.durationMs < 0 ? "unknown" : "nonzero"}`, nextStep: "review the worker result before retry" }
+					if (!worker.ok) throw new Error(worker.failureDiagnostic ?? "OpenShell worker returned a nonzero exit; no bounded output detail was captured")
 				}
 				const candidateSha256 = requireDigest(await workspace.candidateSha256(), "candidate")
 				evidenceRefs.push(ref("candidate", "Candidate source digest", candidateSha256))

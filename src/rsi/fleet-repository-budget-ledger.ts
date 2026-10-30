@@ -62,10 +62,11 @@ export interface FleetRepositoryNoCallProof {
 	profileId: string
 	keyIdentity: string
 	proved: boolean
-	disposition: "no-recorded-provider-activity" | "activity-present"
+	disposition: "no-recorded-provider-activity" | "expired-unused-grant" | "grant-not-expired" | "activity-present"
 	asOfMs: number
 	jobId: string
 	counts: { grants: number; calls: number; denials: number }
+	grant: null | { issuedAtMs: number; deadlineAtMs: number; grantSha256: string; runId: string; controlEpoch: number }
 }
 
 export interface FleetRepositoryBudgetSnapshot {
@@ -230,11 +231,25 @@ export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 			policySha256: this.scope.policySha256, model: this.scope.model, profileId: this.scope.profileId,
 			keyIdentity: this.expectedKeyIdentity, repositoryEpoch, jobId })
 		const counts = result.counts
-		const expected = "asOfMs,campaignId,counts,disposition,jobId,keyIdentity,model,policySha256,profileId,proved,repository,repositoryCampaignId,repositoryEpoch,repositoryId,schemaVersion,sourceRevision"
+		const expected = "asOfMs,campaignId,counts,disposition,grant,jobId,keyIdentity,model,policySha256,profileId,proved,repository,repositoryCampaignId,repositoryEpoch,repositoryId,schemaVersion,sourceRevision"
 		const validCounts = !!counts && typeof counts === "object" && !Array.isArray(counts) &&
 			Object.keys(counts).sort().join(",") === "calls,denials,grants" &&
 			["grants", "calls", "denials"].every((key) => Number.isSafeInteger((counts as Record<string, unknown>)[key]) && Number((counts as Record<string, unknown>)[key]) >= 0)
-		const noActivity = validCounts && ["grants", "calls", "denials"].every((key) => Number((counts as Record<string, number>)[key]) === 0)
+		const grant = result.grant as Record<string, unknown> | null
+		const zeroCallsAndDenials = validCounts && Number((counts as Record<string, number>).calls) === 0 && Number((counts as Record<string, number>).denials) === 0
+		const zeroGrant = validCounts && Number((counts as Record<string, number>).grants) === 0 && grant === null
+		const grantShape = !!grant && typeof grant === "object" && !Array.isArray(grant) &&
+			Object.keys(grant).sort().join(",") === "controlEpoch,deadlineAtMs,grantSha256,issuedAtMs,runId" &&
+			typeof grant.issuedAtMs === "number" && Number.isSafeInteger(grant.issuedAtMs) && grant.issuedAtMs >= 0 &&
+			typeof grant.deadlineAtMs === "number" && Number.isSafeInteger(grant.deadlineAtMs) &&
+			grant.deadlineAtMs > grant.issuedAtMs && typeof grant.controlEpoch === "number" && Number.isSafeInteger(grant.controlEpoch) && grant.controlEpoch >= 0 &&
+			typeof grant.runId === "string" && /^[a-z0-9][a-z0-9._-]{0,95}$/.test(grant.runId) &&
+			typeof grant.grantSha256 === "string" && /^[a-f0-9]{64}$/.test(grant.grantSha256)
+		const expiredUnusedGrant = validCounts && Number((counts as Record<string, number>).grants) === 1 && grantShape &&
+			zeroCallsAndDenials && Number(grant!.issuedAtMs) <= Number(result.asOfMs) && Number(grant!.deadlineAtMs) <= Number(result.asOfMs)
+		const proved = zeroCallsAndDenials && (zeroGrant || expiredUnusedGrant)
+		const disposition = zeroGrant ? "no-recorded-provider-activity" : expiredUnusedGrant ? "expired-unused-grant" :
+			grantShape && zeroCallsAndDenials ? "grant-not-expired" : "activity-present"
 		if (Object.keys(result).sort().join(",") !== expected || result.schemaVersion !== 2 ||
 			result.campaignId !== FLEET_BUDGET_CAMPAIGN_ID || result.repositoryCampaignId !== this.scope.repositoryCampaignId ||
 			result.repositoryId !== this.scope.repositoryId || result.repository !== this.scope.repository ||
@@ -242,15 +257,16 @@ export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 			result.model !== this.scope.model || result.profileId !== this.scope.profileId || result.keyIdentity !== this.expectedKeyIdentity ||
 			result.repositoryEpoch !== repositoryEpoch || result.jobId !== jobId || !validCounts ||
 			!Number.isSafeInteger(result.asOfMs) || Date.now() - Number(result.asOfMs) > 60_000 || Number(result.asOfMs) > Date.now() + 60_000 ||
-			result.proved !== noActivity || result.disposition !== (noActivity ? "no-recorded-provider-activity" : "activity-present")) {
+			result.proved !== proved || result.disposition !== disposition) {
 			throw new Error("Fleet repository no-call proof is invalid")
 		}
 		return { campaignId: FLEET_BUDGET_CAMPAIGN_ID, repositoryCampaignId: this.scope.repositoryCampaignId,
 			repositoryId: this.scope.repositoryId, repository: this.scope.repository, sourceRevision: this.scope.sourceRevision,
 			policySha256: this.scope.policySha256, repositoryEpoch, model: this.scope.model, profileId: this.scope.profileId,
-			keyIdentity: this.expectedKeyIdentity, proved: noActivity,
-			disposition: noActivity ? "no-recorded-provider-activity" : "activity-present",
-			asOfMs: Number(result.asOfMs), jobId, counts: counts as FleetRepositoryNoCallProof["counts"] }
+			keyIdentity: this.expectedKeyIdentity, proved,
+			disposition: disposition,
+			asOfMs: Number(result.asOfMs), jobId, counts: counts as FleetRepositoryNoCallProof["counts"],
+			grant: grant as FleetRepositoryNoCallProof["grant"] }
 	}
 
 	private async readBudgetSnapshot(op: "repository-budget-status" | "repository-budget-snapshot"): Promise<FleetRepositoryBudgetSnapshot> {

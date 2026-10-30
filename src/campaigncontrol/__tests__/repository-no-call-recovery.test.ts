@@ -24,7 +24,7 @@ const proof: FleetRepositoryNoCallProof = { campaignId: "fleet-security-watch", 
 	repositoryId: scope.repositoryId, repository: scope.repository, sourceRevision: scope.sourceRevision,
 	policySha256: scope.policySha256, repositoryEpoch: scope.repositoryEpoch, model: scope.model, profileId: scope.profileId,
 	keyIdentity: "a".repeat(64), proved: true, disposition: "no-recorded-provider-activity", asOfMs: Date.now(), jobId: id,
-	counts: { grants: 0, calls: 0, denials: 0 } }
+	counts: { grants: 0, calls: 0, denials: 0 }, grant: null }
 
 async function fixture(options: { activeRun?: boolean; activeJobs?: boolean; sandboxes?: string[]; proof?: FleetRepositoryNoCallProof } = {}) {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-no-call-recovery-")); await fs.chmod(root, 0o700)
@@ -99,10 +99,32 @@ test("a fresh exact zero-call Fleet proof is saved before failed zero-cost settl
 	assert.equal(settlementArgs[1].actualMicros, 0)
 })
 
+test("an expired unused exact grant can prove no call, while a live grant remains blocked", async (t) => {
+	const asOfMs = Date.now()
+	const grant = { issuedAtMs: asOfMs - 120_000, deadlineAtMs: asOfMs - 60_000, grantSha256: "b".repeat(64), runId: "run-123", controlEpoch: 23 }
+	const expired = { ...proof, proved: true, disposition: "expired-unused-grant" as const, asOfMs, grant,
+		counts: { grants: 1, calls: 0, denials: 0 } }
+	const f = await fixture({ proof: expired }); t.after(() => fs.rm(f.root, { recursive: true, force: true }))
+	const result = await recoverAmbiguousPrepareWithNoCallProof(id, `CONFIRM RECOVER NO-CALL ${id}`, f.dependencies)
+	assert.equal(result.settledMicros, 0)
+	assert.equal(result.settledTokens, 0)
+	const recordDir = path.join(path.dirname(f.storePath), "no-call-proofs")
+	const recordPath = path.join(recordDir, (await fs.readdir(recordDir))[0]!)
+	const recovered = { ...f.job, status: "failed" as const, settledMicros: 0, settledTokens: 0,
+		progress: { ...f.job.progress!, evidenceRefs: [{ id: result.proofSha256, kind: "no-call-proof" as const, label: "Fleet no-call proof" }] } }
+	assert.equal(await verifyRecoveredNoCallArtifact(recovered, f.storePath, scope, proof.keyIdentity), result.proofSha256)
+	assert.equal(JSON.parse(await fs.readFile(recordPath, "utf8")).proof.disposition, "expired-unused-grant")
+
+	const live = await fixture({ proof: { ...expired, proved: false, disposition: "grant-not-expired", grant: { ...grant, deadlineAtMs: asOfMs + 30_000 } } })
+	t.after(() => fs.rm(live.root, { recursive: true, force: true }))
+	await assert.rejects(recoverAmbiguousPrepareWithNoCallProof(id, `CONFIRM RECOVER NO-CALL ${id}`, live.dependencies), /no-call proof/)
+	assert.equal(live.settlement, undefined)
+})
+
 test("recovery retains ambiguity when Fleet reports any grant or invalid scope", async (t) => {
 	const activeProof = { ...proof, proved: false, disposition: "activity-present" as const, counts: { grants: 1, calls: 0, denials: 0 } }
 	const f = await fixture({ proof: activeProof }); t.after(() => fs.rm(f.root, { recursive: true, force: true }))
-	await assert.rejects(recoverAmbiguousPrepareWithNoCallProof(id, `CONFIRM RECOVER NO-CALL ${id}`, f.dependencies), /provider activity/)
+	await assert.rejects(recoverAmbiguousPrepareWithNoCallProof(id, `CONFIRM RECOVER NO-CALL ${id}`, f.dependencies), /no-call proof/)
 	assert.equal(f.settlement, undefined)
 	const mismatch = await fixture({ proof: { ...proof, sourceRevision: "9".repeat(40) } }); t.after(() => fs.rm(mismatch.root, { recursive: true, force: true }))
 	await assert.rejects(recoverAmbiguousPrepareWithNoCallProof(id, `CONFIRM RECOVER NO-CALL ${id}`, mismatch.dependencies), /does not match/)

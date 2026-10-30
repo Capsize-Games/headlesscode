@@ -5,7 +5,7 @@ import * as path from "node:path"
 import { snapshotRepositoryBrokerCapability } from "../../cloud/openshell-provider.js"
 import { REPOSITORY_WORKER_BROKER_URL, repositoryWorkerCommand,
 	runContainedRepositoryWorker, writeRepositoryBrokerCapability,
-		writeRepositoryWorkerTask } from "../repository-worker.js"
+		writeRepositoryWorkerTask, summarizeWorkerFailure } from "../repository-worker.js"
 import type { ContainedRuntimeProfile } from "../../security/profile.js"
 
 async function withTempDir(fn: (root: string) => Promise<void> | void): Promise<void> {
@@ -71,7 +71,20 @@ function assertBrokerCapabilityCommand(root: string): void {
 		"http://host.openshell.internal:4392")
 }
 
+function assertWorkerFailureSummaryIsBoundedAndScrubbed(): void {
+	const summary = summarizeWorkerFailure(1, 529,
+		"noise line\nError: EACCES opening /home/joe/private/profile with Bearer secret-value\nnext failure sk-ABCDEFGHIJKLMNOPQRSTUV1234",
+		"a".repeat(64))
+	assert.ok(summary.length <= 512)
+	assert.match(summary, /exit=1/)
+	assert.match(summary, /EACCES opening \[local-path\]/)
+	assert.match(summary, /Bearer \[redacted\]/)
+	assert.match(summary, /\[redacted-token\]/)
+	assert.doesNotMatch(summary, /secret-value|sk-ABCDEFGHIJKLMNOPQRSTUV1234|\/home\/joe\/private/)
+}
+
 const tests: Array<[string, () => Promise<void>]> = [
+	["nonzero worker output is summarized with bounded redaction", async () => assertWorkerFailureSummaryIsBoundedAndScrubbed()],
 	["stores the per-job broker capability in a private file, never command or environment text", async () => withTempDir(assertBrokerCapabilityCommand)],
 	["fixed worker command matches the immutable OpenShell image contract",
 		async () => {
