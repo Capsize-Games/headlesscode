@@ -1,12 +1,15 @@
 import type { ClaimedRepositoryJob, RepositoryCampaignDefinition, RepositoryCampaignStep, RepositoryEvidenceRef } from "./repository-campaigns.js"
 import type { RegisteredRepositoryWorker, RepositoryWorkerExecutionResult } from "./repository-coordinator.js"
 import type { VettedAdvisorySnapshot } from "./repository-worker.js"
+import type { CurlHistoricalRepairCandidate } from "./repository-curl-repair.js"
+import type { CurlHistoricalRepairReceipt } from "./repository-curl-repair-evaluator.js"
 
 export interface RepositoryPreparedWorkspace {
 	readonly worktree: string
 	readonly taskSha256: string
 	readonly runContained: () => Promise<{ ok: boolean; durationMs: number; outputSha256: string; actualMicros: number | null; actualTokens: number | null }>
 	readonly candidateSha256: () => Promise<string>
+	readonly historicalRepairCandidate?: CurlHistoricalRepairCandidate
 	readonly cleanup?: () => Promise<void>
 }
 
@@ -14,6 +17,7 @@ export interface RepositoryVerificationReceipt {
 	readonly passed: boolean
 	readonly evidenceSha256: string
 	readonly detail: string
+	readonly historicalRepair?: { readonly candidate: CurlHistoricalRepairCandidate; readonly receipt: CurlHistoricalRepairReceipt }
 }
 
 export interface RepositoryPrivateDeliveryReceipt {
@@ -80,17 +84,24 @@ export function createRepositoryWorkerPipeline(adapters: RepositoryWorkerPipelin
 				if (signal.aborted) throw new Error("worker stopped before contained execution")
 				currentTask = "Prepare the bounded isolated workspace"
 				const workspace = await adapters.prepareWorkspace({ definition, claim, advisory })
-				if (!/^[a-f0-9]{64}$/.test(workspace.taskSha256) || typeof workspace.runContained !== "function" || typeof workspace.candidateSha256 !== "function") throw new Error("prepared workspace is invalid")
+				if (!/^[a-f0-9]{64}$/.test(workspace.taskSha256) || typeof workspace.candidateSha256 !== "function" ||
+					(claim.job.purpose === "repair" ? !workspace.historicalRepairCandidate : typeof workspace.runContained !== "function")) throw new Error("prepared workspace is invalid")
 				try {
 				completedSteps = ["intake", "deduplicate", "investigate", "prepare-candidate"]
-				await progress({ stage: "prepare-candidate", currentTask: "Run the registered contained worker", completedSteps, evidenceRefs })
-				const worker = await workspace.runContained()
-				actualMicros = worker.actualMicros
-				actualTokens = worker.actualTokens
-				if (!worker.ok) return { status: actualMicros === null || actualTokens === null ? "ambiguous" : "failed",
-					accounting: actualMicros === null || actualTokens === null ? "ambiguous" : "measured", actualMicros, actualTokens,
-					completedSteps, evidenceRefs, currentTask: "Contained worker stopped before a candidate was verified",
-					blocker: `contained-worker-exit-${worker.durationMs < 0 ? "unknown" : "nonzero"}`, nextStep: "review the worker result before retry" }
+				if (claim.job.purpose === "repair") {
+					actualMicros = 0
+					actualTokens = 0
+					await progress({ stage: "prepare-candidate", currentTask: "Materialize the pinned historical repair patch", completedSteps, evidenceRefs })
+				} else {
+					await progress({ stage: "prepare-candidate", currentTask: "Run the registered contained worker", completedSteps, evidenceRefs })
+					const worker = await workspace.runContained()
+					actualMicros = worker.actualMicros
+					actualTokens = worker.actualTokens
+					if (!worker.ok) return { status: actualMicros === null || actualTokens === null ? "ambiguous" : "failed",
+						accounting: actualMicros === null || actualTokens === null ? "ambiguous" : "measured", actualMicros, actualTokens,
+						completedSteps, evidenceRefs, currentTask: "Contained worker stopped before a candidate was verified",
+						blocker: `contained-worker-exit-${worker.durationMs < 0 ? "unknown" : "nonzero"}`, nextStep: "review the worker result before retry" }
+				}
 				const candidateSha256 = requireDigest(await workspace.candidateSha256(), "candidate")
 				evidenceRefs.push(ref("candidate", "Candidate source digest", candidateSha256))
 				await progress({ stage: "verify", currentTask: "Run the protected registered evaluator", completedSteps, evidenceRefs })

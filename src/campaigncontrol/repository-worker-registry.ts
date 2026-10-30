@@ -7,12 +7,15 @@ import { createRepositoryWorkerPipeline } from "./repository-worker-pipeline.js"
 import { OsvCommitAdvisoryIntake } from "./repository-advisory-intake.js"
 import type { RepositoryCampaignStore } from "./repository-campaigns.js"
 import { CURL_PRIVATE_RUNTIME_ADAPTER_ID, createCurlRepositoryPipelineAdapters } from "./repository-curl-runtime.js"
+import { createCurlHistoricalRepairAdapters } from "./repository-curl-repair-runtime.js"
+import { CURL_REPAIR_ADAPTER_ID } from "./repository-curl-repair.js"
 import type { RepositoryPipelineAdapterFactory, RepositoryPipelineAdapterFactoryContext, RepositoryWorkerRegistration } from "./repository-worker-registration.js"
 
 const MAX_REGISTRY_BYTES = 64 * 1024
 const MAX_REGISTRATIONS = 32
+const NO_SUPPORTED_ADVISORIES = Object.freeze([] as string[])
 const PUBLIC_INTAKE_PINS: Readonly<Record<string, { publicBaseRevision: string; supportedAdvisoryIds: readonly string[] }>> = Object.freeze({
-	[CURL_PRIVATE_RUNTIME_ADAPTER_ID]: { publicBaseRevision: "ce57339379d82d29637b4752979e54128b6b2348", supportedAdvisoryIds: ["CVE-2026-92390"] },
+	[CURL_PRIVATE_RUNTIME_ADAPTER_ID]: { publicBaseRevision: "ce57339379d82d29637b4752979e54128b6b2348", supportedAdvisoryIds: NO_SUPPORTED_ADVISORIES },
 })
 
 export type { RepositoryPipelineAdapterFactory, RepositoryPipelineAdapterFactoryContext, RepositoryWorkerRegistration } from "./repository-worker-registration.js"
@@ -22,6 +25,10 @@ export const BUILTIN_REPOSITORY_PIPELINE_ADAPTER_FACTORIES: ReadonlyMap<string, 
 	["curl-92390-private-runtime-v1", (registration, definition, context) => {
 		if (!context) throw new Error("repository pipeline store context is unavailable")
 		return createCurlRepositoryPipelineAdapters(registration, definition, context)
+	}],
+	[CURL_REPAIR_ADAPTER_ID, (registration, definition, context) => {
+		if (!context) throw new Error("repository pipeline store context is unavailable")
+		return createCurlHistoricalRepairAdapters(registration, definition, context)
 	}],
 ])
 

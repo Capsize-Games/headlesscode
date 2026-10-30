@@ -124,8 +124,14 @@ async function testBuiltInCurlAdapterReceivesItsPinnedPublicAdvisoryIntake(): Pr
 			"the built-in Curl worker must have an intake poller")
 		assert.equal(worker.advisoryIntake.publicBaseRevision,
 			"ce57339379d82d29637b4752979e54128b6b2348")
-		assert.deepEqual(worker.advisoryIntake.supportedAdvisoryIds,
-			["CVE-2026-92390"])
+		assert.deepEqual(worker.advisoryIntake.supportedAdvisoryIds, [],
+			"the read-only qualification worker must not claim OSV candidates as repair work")
+		const observation = await store.observePublishedAdvisory({ campaignId: exactDefinition.id,
+			publicBaseRevision: worker.advisoryIntake.publicBaseRevision, advisoryId: "CVE-2026-92390",
+			snapshotSha256: "e".repeat(64), eligible: false })
+		assert.equal(observation.queued, false)
+		assert.equal(observation.record.disposition, "unsupported-profile")
+		assert.equal(((await store.status()) as { jobs: unknown[] }).jobs.length, 0)
 	} finally { await fs.rm(root, { recursive: true, force: true }) }
 }
 

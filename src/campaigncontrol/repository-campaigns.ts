@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto"
 import { CURL_CAMPAIGN_ID, CURL_DEBIAN_AFFECTED_RANGE, CURL_DEBIAN_FIXED_REVISION, CURL_DEBIAN_INTRODUCED_REVISION,
 	CURL_DEBIAN_PUBLIC_BASE_REVISION, CURL_DEBIAN_SNAPSHOT_SHA256, CURL_DEBIAN_SOURCE_HTML_SHA256, CURL_DEBIAN_SOURCE_URL,
 	CURL_FIXED_ADVISORY } from "./repository-known-advisory.js"
+import { CURL_REPAIR_CAMPAIGN_ID } from "./repository-campaign-ids.js"
 
 export const REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS = 5_000_000
 // Keeps the mock subcap within the existing fixed Fleet campaign's 108k-token ceiling.
@@ -115,7 +116,7 @@ export interface RepositoryCampaignJob {
 	settledTokens: number
 	progress?: RepositoryJobProgress
 	detail?: string
-	purpose?: "qualification"
+	purpose?: "qualification" | "repair"
 }
 
 type ObservedAdvisoryInput = { campaignId: string; publicBaseRevision: string; advisoryId: string; snapshotSha256: string; eligible: boolean }
@@ -136,7 +137,7 @@ export interface RepositoryAdvisoryIntakeRecord {
 	firstSeenAt: number
 	lastSeenAt: number
 	jobId: string | null
-	source?: "osv-commit-query" | "debian-tracker-snapshot"
+	source?: "osv-commit-query" | "debian-tracker-snapshot" | "debian-tracker-repair-snapshot"
 	sourceUrl?: string
 	sourceContentSha256?: string
 }
@@ -383,6 +384,12 @@ function validQualificationJob(job: RepositoryCampaignJob, s: Partial<CampaignSt
 			row.campaignId === job.campaignId && row.advisoryId === job.advisoryId && row.snapshotSha256 === CURL_DEBIAN_SNAPSHOT_SHA256)
 }
 
+function validRepairJob(job: RepositoryCampaignJob, s: Partial<CampaignState>): boolean {
+	return job.purpose === "repair" && job.campaignId === CURL_REPAIR_CAMPAIGN_ID && job.advisoryId === CURL_FIXED_ADVISORY &&
+		(s.intakeRecords ?? []).some((row) => row?.source === "debian-tracker-repair-snapshot" && row.jobId === job.id &&
+			row.campaignId === job.campaignId && row.advisoryId === job.advisoryId && row.snapshotSha256 === CURL_DEBIAN_SNAPSHOT_SHA256)
+}
+
 function validJobRecord(job: RepositoryCampaignJob, s: Partial<CampaignState>, ids: Set<string>): boolean {
 	if (!validJobIdentityAndStatus(job, s) || !validJobAccounting(job) || ids.has(job.id)) return false
 	if (!validJobOptionalDetails(job, s)) return false
@@ -392,7 +399,7 @@ function validJobRecord(job: RepositoryCampaignJob, s: Partial<CampaignState>, i
 
 function validJobOptionalDetails(job: RepositoryCampaignJob, s: Partial<CampaignState>): boolean {
 	const text = (job.claimId === undefined || typeof job.claimId === "string") && (job.detail === undefined || typeof job.detail === "string")
-	const purpose = job.purpose === undefined || validQualificationJob(job, s)
+	const purpose = job.purpose === undefined || validQualificationJob(job, s) || validRepairJob(job, s)
 	const progress = job.progress === undefined || validProgress(job.progress)
 	return text && purpose && progress
 }
@@ -409,7 +416,8 @@ function validJobAccounting(job: RepositoryCampaignJob): boolean {
 }
 
 function validPinnedDebianIntake(row: RepositoryAdvisoryIntakeRecord): boolean {
-	return row.campaignId === CURL_CAMPAIGN_ID && row.advisoryId === CURL_FIXED_ADVISORY &&
+	const campaignId = row.source === "debian-tracker-repair-snapshot" ? CURL_REPAIR_CAMPAIGN_ID : CURL_CAMPAIGN_ID
+	return row.campaignId === campaignId && row.advisoryId === CURL_FIXED_ADVISORY &&
 		row.publicBaseRevision === CURL_DEBIAN_PUBLIC_BASE_REVISION && row.sourceUrl === CURL_DEBIAN_SOURCE_URL &&
 		row.sourceContentSha256 === CURL_DEBIAN_SOURCE_HTML_SHA256 && row.snapshotSha256 === CURL_DEBIAN_SNAPSHOT_SHA256
 }
@@ -429,10 +437,10 @@ function validIntakeIdentity(row: RepositoryAdvisoryIntakeRecord, s: Partial<Cam
 }
 
 function validIntakeSource(row: RepositoryAdvisoryIntakeRecord): boolean {
-	const source = row.source === undefined || ["osv-commit-query", "debian-tracker-snapshot"].includes(row.source)
+	const source = row.source === undefined || ["osv-commit-query", "debian-tracker-snapshot", "debian-tracker-repair-snapshot"].includes(row.source)
 	const url = row.sourceUrl === undefined || validAdvisorySourceUrl(row.sourceUrl)
 	const content = row.sourceContentSha256 === undefined || /^[a-f0-9]{64}$/.test(row.sourceContentSha256)
-	const pinned = row.source !== "debian-tracker-snapshot" || validPinnedDebianIntake(row)
+	const pinned = !["debian-tracker-snapshot", "debian-tracker-repair-snapshot"].includes(row.source ?? "") || validPinnedDebianIntake(row)
 	return source && url && content && pinned
 }
 
@@ -1183,6 +1191,34 @@ export class RepositoryCampaignStore {
 		}, now)
 	}
 
+	/** Queue one explicit historical Curl repair qualification, distinct from the read-only qualification purpose. */
+	async enqueueKnownRepair(input: { campaignId: string; advisoryId: string; publicBaseRevision: string; snapshotSha256: string;
+		sourceUrl: string; sourceContentSha256: string; affectedRange: string }, now = new Date()): Promise<RepositoryCampaignJob> {
+		if (input.campaignId !== CURL_REPAIR_CAMPAIGN_ID || input.advisoryId !== CURL_FIXED_ADVISORY || input.publicBaseRevision !== CURL_DEBIAN_PUBLIC_BASE_REVISION ||
+			input.snapshotSha256 !== CURL_DEBIAN_SNAPSHOT_SHA256 || input.sourceUrl !== CURL_DEBIAN_SOURCE_URL ||
+			input.sourceContentSha256 !== CURL_DEBIAN_SOURCE_HTML_SHA256 || input.affectedRange !== CURL_DEBIAN_AFFECTED_RANGE) {
+			throw new Error("known advisory repair is outside the owner-approved Curl snapshot")
+		}
+		this.requireDefinition(input.campaignId)
+		return this.update((s) => {
+			const existing = (s.intakeRecords ??= []).find((row) => row.campaignId === input.campaignId && row.publicBaseRevision === input.publicBaseRevision &&
+				row.advisoryId === input.advisoryId && row.source === "debian-tracker-repair-snapshot")
+			if (existing) throw new Error("known advisory repair has already been recorded")
+			if (!s.campaigns[input.campaignId]?.enabled) throw new Error("known advisory repair requires an enabled campaign")
+			const job: RepositoryCampaignJob = { id: randomUUID(), campaignId: input.campaignId, advisoryId: input.advisoryId, status: "queued",
+				epoch: s.campaigns[input.campaignId]!.epoch, createdAt: now.getTime(), updatedAt: now.getTime(), month: s.month,
+				reservedMicros: 0, settledMicros: 0, reservedTokens: 0, settledTokens: 0, purpose: "repair" }
+			const record: RepositoryAdvisoryIntakeRecord = { campaignId: input.campaignId, publicBaseRevision: input.publicBaseRevision,
+				advisoryId: input.advisoryId, snapshotSha256: input.snapshotSha256, disposition: "eligible", firstSeenAt: now.getTime(),
+				lastSeenAt: now.getTime(), jobId: job.id, source: "debian-tracker-repair-snapshot", sourceUrl: input.sourceUrl,
+				sourceContentSha256: input.sourceContentSha256 }
+			if (s.jobs.length >= MAX_JOBS || s.intakeRecords.length >= MAX_INTAKE_RECORDS) throw new Error("known advisory repair storage limit reached")
+			s.jobs.push(job)
+			s.intakeRecords.push(record)
+			return { ...job }
+		}, now)
+	}
+
 	/** Reserve aggregate and per-campaign capacity before handing a job to a mock dispatcher. */
 	async claimNext(id: string, reservation: { micros: number; tokens: number }, now = new Date(),
 		mode: { executionKind: RepositoryJobProgress["executionKind"]; requiredSteps?: readonly RepositoryCampaignStep[] } = { executionKind: "development-checkpoint" }): Promise<ClaimedRepositoryJob | undefined> {
@@ -1212,6 +1248,7 @@ export class RepositoryCampaignStore {
 			job.status = "running"; job.claimId = claimId; job.epoch = c.epoch; job.reservedMicros = reservation.micros; job.reservedTokens = reservation.tokens; job.updatedAt = now.getTime()
 			job.progress = { executionKind: mode.executionKind, workerId: randomUUID(),
 				goal: job.purpose === "qualification" ? `Verify the owner-approved evidence for ${job.advisoryId} through the registered pipeline` :
+					job.purpose === "repair" ? `Qualify the reviewed historical fix for ${job.advisoryId} and reconcile the private fork` :
 					`Assess ${job.advisoryId} and prepare a verified review candidate`, currentTask: "Read registered advisory metadata",
 				stage: "intake", completedSteps: [], requiredSteps: [...requiredSteps], lastActionAt: now.getTime(),
 				heartbeatAt: now.getTime(), leaseExpiresAt: now.getTime() + REPOSITORY_WORKER_LEASE_MS,
