@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import { createHash, generateKeyPairSync } from "node:crypto"
 import * as fs from "node:fs"
 import * as net from "node:net"
+import * as os from "node:os"
 import * as path from "node:path"
 
 import { UnixEvidenceJournal } from "../../evidence/collector.js"
@@ -12,8 +13,7 @@ import { startContainedSupervisor } from "../supervisor.js"
 import { controlMain } from "../../control/cli.js"
 import type { ContainedRuntimeProfile } from "../profile.js"
 
-const scratch = path.join(process.cwd(), ".headlesscode", "scratch")
-fs.mkdirSync(scratch, { recursive: true, mode: 0o700 })
+const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "hcs-"))
 
 async function testProtectedPerSessionHandoffIsBoundAndRequired(): Promise<void> {
 	const root = fs.mkdtempSync(path.join(scratch, "supervisor-config-"))
@@ -52,7 +52,7 @@ async function testProtectedPerSessionHandoffIsBoundAndRequired(): Promise<void>
 	assert.throws(() => validateContainedSupervisorRoots(profile, protectedRepo, {
 		HEADLESSCODE_CONTAINED_EVIDENCE_CONFIG_DIR: configDir,
 		HEADLESSCODE_CONTROL_STATE_DIR: protectedRepo,
-		HEADLESSCODE_CONTROL_SOCKET_DIR: socketDirectory,
+		HEADLESSCODE_CONTROL_SOCKET_DIR: path.join(root, "control-sockets", "{session}"),
 	}), /overlap/)
 	assert.equal(fs.statSync(protectedRepo).mode & 0o777, originalRepoMode, "rejected supervisor paths never change repository permissions")
 	assert.equal(fs.readFileSync(protectedMarker, "utf8"), originalMarker, "rejected supervisor paths preserve repository data")
@@ -81,7 +81,7 @@ async function testProtectedPerSessionHandoffIsBoundAndRequired(): Promise<void>
 	const supervisorEnv = {
 		HEADLESSCODE_CONTAINED_EVIDENCE_CONFIG_DIR: configDir,
 		HEADLESSCODE_CONTROL_STATE_DIR: stateDir,
-		HEADLESSCODE_CONTROL_SOCKET_DIR: path.join(process.cwd(), ".headlesscode", "{session}"),
+		HEADLESSCODE_CONTROL_SOCKET_DIR: socketDirectory,
 	}
 	const running = await startContainedSupervisor({ profile, sessionId: "s", repoRoot: repo, workspaceRoot: repo, env: supervisorEnv })
 	const oldSignal = running.control.signal
@@ -99,7 +99,6 @@ async function testProtectedPerSessionHandoffIsBoundAndRequired(): Promise<void>
 	fs.chmodSync(configPath, 0o644)
 	assert.throws(() => loadContainedSupervisorRuntime({ profile, sessionId: "s", repoRoot: repo, workspaceRoot: repo, env: { HEADLESSCODE_CONTAINED_EVIDENCE_CONFIG_DIR: configDir } }), /private regular file/)
 	await new Promise<void>((resolve) => socketServer.close(() => resolve()))
-	fs.rmSync(path.join(process.cwd(), ".headlesscode", "s"), { recursive: true, force: true })
 	fs.rmSync(root, { recursive: true, force: true })
 }
 
@@ -108,8 +107,7 @@ async function testContainedEvidenceServiceProvisionsDistinctWorkerCapabilities(
 	const repo = path.join(root, "repo")
 	const storageDir = path.join(root, "collector")
 	const configDirectory = path.join(root, "runtime")
-	const socketPath = path.join(scratch, "es.sock")
-	fs.rmSync(socketPath, { force: true })
+	const socketPath = path.join(root, "es.sock")
 	fs.mkdirSync(repo, { mode: 0o700 })
 	const marker = path.join(repo, "keep.txt")
 	fs.writeFileSync(marker, "preserve this repository")
@@ -142,4 +140,5 @@ async function testContainedEvidenceServiceProvisionsDistinctWorkerCapabilities(
 
 await testProtectedPerSessionHandoffIsBoundAndRequired()
 await testContainedEvidenceServiceProvisionsDistinctWorkerCapabilities()
+fs.rmSync(scratch, { recursive: true, force: true })
 console.log("Contained supervisor tests passed")

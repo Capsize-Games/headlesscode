@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
 import { spawnSync } from "node:child_process"
+import { existsSync } from "node:fs"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
@@ -33,6 +34,24 @@ function setupPaths(home: string) {
   return { campaign, control, credential: path.join(campaign, "test-key"), config: path.join(campaign, "config.json"), controlFile: path.join(control, "control.json") }
 }
 
+function isPrivateFleetSource(root: string): boolean {
+	const bridge = path.join(root, "operations", "campaign_budget_bridge.py")
+	if (!existsSync(bridge) || !existsSync(path.join(root, "operations", "campaign_budget.py"))) return false
+	const remote = spawnSync("git", ["remote", "get-url", "origin"], { cwd: root, encoding: "utf8", timeout: 2_000 })
+	return remote.status === 0 && /^(?:git@github\.com:Capsize-Games\/fleet-security-watch\.git|https:\/\/github\.com\/Capsize-Games\/fleet-security-watch\.git)$/.test(remote.stdout.trim())
+}
+
+function fleetSourceRoot(): string {
+	const candidates = [
+		path.resolve(process.cwd(), "../fleet-security-watch"),
+		path.resolve(process.cwd(), "../../fleet-security-watch"),
+		path.join(os.homedir(), "Projects", "fleet-security-watch"),
+	]
+	const root = candidates.find(isPrivateFleetSource)
+	if (!root) throw new Error("private Fleet source checkout is unavailable for the real-bridge integration test")
+	return root
+}
+
 async function privateDir(directory: string) { await fs.mkdir(directory, { recursive: true, mode: 0o700 }); await fs.chmod(directory, 0o700) }
 async function writeControl(file: string, epoch: number, enabled = true) {
   const now = Date.now()
@@ -54,12 +73,17 @@ async function makeFixture(prefix: string) {
     image_digest: "b".repeat(64), credential_file: files.credential, key_identity: keyIdentity }), { mode: 0o600 })
   await fs.chmod(files.config, 0o600)
   await writeControl(files.controlFile, 3)
-  const fleetRoot = path.resolve(process.cwd(), "../fleet-security-watch")
+  const fleetRoot = fleetSourceRoot()
   const invoke = async (message: Record<string, unknown>) => {
     const child = spawnSync("/usr/bin/python3", ["-c", bridgeScript], { input: JSON.stringify(message),
-      encoding: "utf8", timeout: 10_000, env: { HOME: home, PATH: process.env.PATH ?? "/usr/bin:/bin",
+      encoding: "utf8", timeout: 30_000, env: { HOME: home, PATH: process.env.PATH ?? "/usr/bin:/bin",
         PYTHONPATH: fleetRoot, PYTHONDONTWRITEBYTECODE: "1" } })
-    if (child.error || child.status !== 0) throw new Error("real Fleet bridge subprocess failed closed")
+    if (child.error || child.status !== 0) {
+		const stderr = (child.stderr ?? "").trim().split("\n").slice(-4).join(" ")
+			.replaceAll(home, "<test-home>").replaceAll(os.homedir(), "<user-home>").slice(-512)
+		const errorCode = child.error && "code" in child.error && typeof child.error.code === "string" ? child.error.code : "spawn error"
+		throw new Error(`real Fleet bridge subprocess failed closed (status ${child.status ?? "unavailable"}${child.error ? `, ${errorCode}` : ""})${stderr ? `: ${stderr}` : ""}`)
+	}
     return JSON.parse(child.stdout.trim()) as Record<string, unknown>
   }
   const ledger = new FleetBudgetInferenceLedger({ expectedKeyIdentity: keyIdentity, invoke })
