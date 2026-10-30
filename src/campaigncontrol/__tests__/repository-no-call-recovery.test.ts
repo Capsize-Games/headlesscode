@@ -92,6 +92,11 @@ test("a fresh exact zero-call Fleet proof is saved before failed zero-cost settl
 	const recoveredJob = { ...f.job, status: "failed" as const, settledMicros: 0, settledTokens: 0,
 		progress: { ...f.job.progress!, evidenceRefs: [{ id: result.proofSha256, kind: "no-call-proof" as const, label: "Fleet no-call proof" }] } }
 	assert.equal(await verifyRecoveredNoCallArtifact(recoveredJob, f.storePath, scope, proof.keyIdentity), result.proofSha256)
+	const later = Date.now() + 120_000
+	const clock = t.mock.method(Date, "now", () => later)
+	try {
+		assert.equal(await verifyRecoveredNoCallArtifact(recoveredJob, f.storePath, scope, proof.keyIdentity), result.proofSha256)
+	} finally { clock.mock.restore() }
 	assert.deepEqual(stored.proof.counts, { grants: 0, calls: 0, denials: 0 })
 	const settlementArgs = f.settlement as [unknown, { proofSha256: string; status: string; actualMicros: number }]
 	assert.equal(settlementArgs[1].proofSha256, result.proofSha256)

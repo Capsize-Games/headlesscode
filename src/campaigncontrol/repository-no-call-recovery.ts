@@ -112,7 +112,7 @@ export async function verifyRecoveredNoCallArtifact(job: RepositoryCampaignJob, 
 		proof.repositoryCampaignId !== scope.repositoryCampaignId || proof.repositoryId !== scope.repositoryId ||
 		proof.repository !== scope.repository || proof.sourceRevision !== scope.sourceRevision || proof.policySha256 !== scope.policySha256 ||
 		proof.model !== scope.model || proof.profileId !== scope.profileId || proof.keyIdentity !== keyIdentity ||
-		!Number.isSafeInteger(proof.repositoryEpoch) || !Number.isSafeInteger(proof.asOfMs) || Date.now() - proof.asOfMs > 60_000 || proof.asOfMs > Date.now() + 60_000 ||
+		!Number.isSafeInteger(proof.repositoryEpoch) || !Number.isSafeInteger(proof.asOfMs) || proof.asOfMs > Date.now() + 60_000 ||
 		!proof.counts || proof.counts.calls !== 0 || proof.counts.denials !== 0) {
 		throw new Error("no-call proof artifact does not match the recovered Curl attempt")
 	}
