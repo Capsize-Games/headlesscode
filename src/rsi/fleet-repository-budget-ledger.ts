@@ -10,6 +10,14 @@ import { FLEET_BUDGET_CAMPAIGN_ID, type FleetBudgetLedgerOptions, invokeFleetBud
 	resolveFleetBudgetBridgeRelease } from "./fleet-budget-ledger.js"
 import { CURL_REPAIR_CAMPAIGN_ID, CURL_REPAIR_POLICY_SHA256, CURL_REPAIR_REPOSITORY_ID,
 	CURL_REPAIR_SOURCE_REVISION, CURL_REPAIR_TARGET_REPOSITORY } from "../campaigncontrol/repository-curl-repair.js"
+import {
+	CURL_REPAIR_V2_LIFETIME_ALLOCATION,
+	CURL_REPAIR_V2_POLICY_SHA256,
+	CURL_REPAIR_V2_REPOSITORY_ID,
+	CURL_REPAIR_V2_SOURCE_REVISION,
+	CURL_REPAIR_V2_TARGET_REPOSITORY,
+} from "../campaigncontrol/repository-curl-repair-v2-profile.js"
+import { CURL_REPAIR_V2_CAMPAIGN_ID } from "../campaigncontrol/repository-campaign-ids.js"
 import type {
 	OpenRouterBrokerGrant, OpenRouterBrokerReceipt, OpenRouterCallReceipt,
 	OpenRouterCallReservation, OpenRouterCallSettlement, OpenRouterDenialReason, OpenRouterInferenceLedger,
@@ -300,7 +308,8 @@ export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 			result.policySha256 !== this.scope.policySha256 || result.model !== this.scope.model || result.profileId !== this.scope.profileId ||
 			typeof result.repositoryEnabled !== "boolean" || !Number.isSafeInteger(result.repositoryEpoch) || Number(result.repositoryEpoch) < 0 ||
 			!isMonthlyUsage(monthly) || !isLifetimeUsage(campaignLifetime, 20_000, 108_000) ||
-			!isLifetimeUsage(legacyLifetime) || !isLifetimeUsage(repositoryLifetime, undefined, undefined, true)) {
+			!isLifetimeUsage(legacyLifetime) || !isLifetimeUsage(repositoryLifetime, undefined, undefined, true) ||
+			!validNoModelAllocation(this.scope, repositoryLifetime)) {
 			throw new Error("Fleet repository budget snapshot is invalid")
 		}
 		const externalMicros = Number(legacyLifetime.settledMicros) + Number(legacyLifetime.reservedMicros) + Number(legacyLifetime.ambiguousMicros)
@@ -384,12 +393,30 @@ function validateScope(scope: FleetRepositoryBudgetScope): FleetRepositoryBudget
 		scope.repositoryCampaignId === CURL_REPAIR_CAMPAIGN_ID && scope.repositoryId === CURL_REPAIR_REPOSITORY_ID &&
 		scope.repository === CURL_REPAIR_TARGET_REPOSITORY && scope.sourceRevision === CURL_REPAIR_SOURCE_REVISION &&
 		scope.policySha256 === CURL_REPAIR_POLICY_SHA256
+	const repairV2BudgetOnlyProfile = scope?.model === "none" && scope.profileId === "no-model" &&
+		scope.repositoryCampaignId === CURL_REPAIR_V2_CAMPAIGN_ID &&
+		scope.repositoryId === CURL_REPAIR_V2_REPOSITORY_ID &&
+		scope.repository === CURL_REPAIR_V2_TARGET_REPOSITORY &&
+		scope.sourceRevision === CURL_REPAIR_V2_SOURCE_REVISION &&
+		scope.policySha256 === CURL_REPAIR_V2_POLICY_SHA256
 	if (!scope || !ID.test(scope.repositoryCampaignId) || !ID.test(scope.repositoryId) || !REPOSITORY.test(scope.repository) ||
 		!(/^[a-f0-9]{40}$|^[a-f0-9]{64}$/).test(scope.sourceRevision) || !HEX.test(scope.policySha256) ||
-		(!museProfile && !repairBudgetOnlyProfile) || !Number.isSafeInteger(scope.repositoryEpoch) || scope.repositoryEpoch < 0) {
+		(!museProfile && !repairBudgetOnlyProfile && !repairV2BudgetOnlyProfile) ||
+		!Number.isSafeInteger(scope.repositoryEpoch) || scope.repositoryEpoch < 0) {
 		throw new Error("Fleet repository budget scope is invalid")
 	}
 	return Object.freeze({ ...scope })
+}
+
+function validNoModelAllocation(scope: FleetRepositoryBudgetScope,
+	usage: unknown): boolean {
+	if (scope.model !== "none" || scope.profileId !== "no-model") return true
+	if (!usage || typeof usage !== "object" || Array.isArray(usage)) return false
+	const row = usage as Record<string, unknown>
+	const expected = scope.repositoryCampaignId === CURL_REPAIR_CAMPAIGN_ID
+		? { micros: 1_000, tokens: 7_000 }
+		: CURL_REPAIR_V2_LIFETIME_ALLOCATION
+	return row.limitMicros === expected.micros && row.limitTokens === expected.tokens
 }
 
 function validateReservation(reservation: OpenRouterCallReservation): void {

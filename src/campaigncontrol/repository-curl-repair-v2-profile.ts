@@ -9,6 +9,8 @@ import { CURL_REPAIR_V2_CAMPAIGN_ID } from "./repository-campaign-ids.js"
 export const CURL_REPAIR_V2_PROFILE_ID = "curl-92390-historical-repair-v2"
 export const CURL_REPAIR_V2_ADAPTER_ID = "curl-92390-historical-repair-runtime-v2"
 export const CURL_REPAIR_V2_REPOSITORY_ID = "curl-maintenance-repair-v2"
+export const CURL_REPAIR_V2_SOURCE_REVISION = CURL_REPAIR_SOURCE_REVISION
+export const CURL_REPAIR_V2_TARGET_REPOSITORY = CURL_REPAIR_TARGET_REPOSITORY
 export const CURL_REPAIR_V2_MODEL = "none"
 export const CURL_REPAIR_V2_ACCESS_PROFILE = "public-source-and-published-advisory-only"
 export const CURL_REPAIR_V2_RESERVATION = Object.freeze({ micros: 1, tokens: 1 })
