@@ -1,7 +1,12 @@
 import { createHash, randomUUID } from "node:crypto"
 import { readFileSync } from "node:fs"
 import { Pool, type PoolClient } from "pg"
-import type { ResourceClass, WorkerHarnessMode, WorkerHarnessRuntimeIdentity } from "./types.js"
+import type {
+	CampaignEvaluationObjective,
+	ResourceClass,
+	WorkerHarnessMode,
+	WorkerHarnessRuntimeIdentity,
+} from "./types.js"
 import { createRsiArtifactStore, type RsiArtifactReference, type RsiArtifactStore } from "./artifact-store.js"
 import { sumMicrousd, sumMicrousdAsUsd, usdEqualsMicrousd } from "./microusd.js"
 import { endpointPriceIdentity, openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID, type OpenRouterBrokerGrant, type OpenRouterBrokerReceipt, type OpenRouterCallReceipt, type OpenRouterCallReservation, type OpenRouterCallSettlement, type OpenRouterDenialReason, type OpenRouterEndpointPriceSnapshot, type OpenRouterInferenceLedger, type RsiOpenRouterProfileId } from "./inference-broker.js"
@@ -123,11 +128,7 @@ export interface FleetJobPayload {
 		fixtureDigest: string
 		evaluatorDigest: string
 		runtime: WorkerHarnessRuntimeIdentity
-		objective:
-			| "intake-parsing"
-			| "deduplication"
-			| "evidence-validation"
-			| "reporting"
+		objective: CampaignEvaluationObjective
 		typecheckCommand: string
 	}
 	/** Supervisor-authored adversarial artifacts, bound to the immutable snapshot. */
