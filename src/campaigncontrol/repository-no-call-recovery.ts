@@ -11,6 +11,11 @@ import { CAMPAIGN_CONTROL_FILE } from "./paths.js"
 import { withCampaignDispatchFence } from "./repository-run-lease.js"
 import type { FleetRepositoryBudgetLedger, FleetRepositoryBudgetScope, FleetRepositoryNoCallProof } from "../rsi/fleet-repository-budget-ledger.js"
 
+import {
+	isNoModelV2RecoveryScope, isNoModelV2RecoveryJob,
+	listCurlV2RecoveryContainers,
+} from "./repository-no-model-recovery-scope.js"
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const ID = /^[a-z0-9][a-z0-9._-]{0,95}$/
 const HEX = /^[a-f0-9]{64}$/
@@ -25,6 +30,7 @@ export interface RepositoryNoCallRecoveryDependencies {
 	expectedKeyIdentity: string
 	storePath: string
 	listRunningSandboxes?: () => string[]
+	listRunningRepairContainers?: (job: RepositoryCampaignJob) => string[]
 	worktreeRoot?: string
 	clock?: () => number
 	withDispatchFence?: <T>(operation: () => Promise<T>) => Promise<T>
@@ -35,15 +41,16 @@ export async function recoverAmbiguousPrepareWithNoCallProof(jobId: string, conf
 	dependencies: RepositoryNoCallRecoveryDependencies): Promise<{ jobId: string; status: "failed"; settledMicros: 0; settledTokens: 0; proofSha256: string }> {
 	if (!UUID.test(jobId) || confirmation !== `CONFIRM RECOVER NO-CALL ${jobId}`) throw new Error("explicit no-call recovery confirmation is required")
 	const { definition, scope } = dependencies
-	if (definition.id !== "curl-maintenance" || definition.repository !== scope.repository ||
+	const noModelV2 = isNoModelV2RecoveryScope(definition, scope)
+	if (!noModelV2 && (definition.id !== "curl-maintenance" || definition.repository !== scope.repository ||
 		definition.repositoryId !== scope.repositoryId || definition.sourceRevision !== scope.sourceRevision ||
 		definition.policySha256 !== scope.policySha256 || scope.repositoryCampaignId !== definition.id ||
-		scope.model !== definition.model || scope.profileId !== "muse-spark-contributor") {
+		scope.model !== definition.model || scope.profileId !== "muse-spark-contributor")) {
 		throw new Error("no-call recovery is outside the fixed Curl qualification scope")
 	}
 	const now = dependencies.clock?.() ?? Date.now()
 	const initialControl = await dependencies.controlStore.snapshot(new Date(now))
-	if (initialControl.activeRun !== null) throw new Error("no-call recovery requires no active global run")
+	if (initialControl.activeRun !== null || (noModelV2 && initialControl.enabled !== false)) throw new Error("no-call recovery requires no active global run and budget-only recovery requires Off")
 	const view = await dependencies.store.recoveryView(jobId, new Date(now))
 	const target = view.job
 	if (view.activeJobs.length || !isRecoverableTarget(target, definition, now)) {
@@ -52,6 +59,8 @@ export async function recoverAmbiguousPrepareWithNoCallProof(jobId: string, conf
 	assertNoActiveCurlWorktrees(dependencies.worktreeRoot ?? path.join(CURL_PRIVATE_SOURCE_ROOT, ".worktrees"))
 	const listSandboxes = dependencies.listRunningSandboxes ?? listRunningOpenShellSandboxes
 	if (listSandboxes().length) throw new Error("no-call recovery requires no running OpenShell sandbox")
+	const listRepair = dependencies.listRunningRepairContainers ?? listCurlV2RecoveryContainers
+	if (noModelV2 && listRepair(target).length) throw new Error("no-call recovery requires Curl v2 containers absent")
 	const proof = await dependencies.ledger.proveNoCall(jobId, scope.repositoryEpoch)
 	assertProofMatches(proof, jobId, scope, dependencies.expectedKeyIdentity)
 	if (!proof.proved) throw new Error("Fleet records provider activity for this job; ambiguous usage remains held")
@@ -59,11 +68,12 @@ export async function recoverAmbiguousPrepareWithNoCallProof(jobId: string, conf
 	return await withFence(async () => {
 		const latestControl = await dependencies.controlStore.snapshot(new Date())
 		const latestJobs = await dependencies.store.recoveryView(jobId)
-		if (latestControl.activeRun !== null || latestJobs.activeJobs.length || !isRecoverableTarget(latestJobs.job, definition, Date.now())) {
+		if (latestControl.activeRun !== null || (noModelV2 && latestControl.enabled !== false) || latestJobs.activeJobs.length || !isRecoverableTarget(latestJobs.job, definition, Date.now())) {
 			throw new Error("no-call recovery preconditions changed before settlement")
 		}
 		assertNoActiveCurlWorktrees(dependencies.worktreeRoot ?? path.join(CURL_PRIVATE_SOURCE_ROOT, ".worktrees"))
 		if (listSandboxes().length) throw new Error("no-call recovery requires no running OpenShell sandbox")
+		if (noModelV2 && listRepair(target).length) throw new Error("no-call recovery requires Curl v2 containers absent")
 		assertProofMatches(proof, jobId, scope, dependencies.expectedKeyIdentity)
 		if (!proof.proved) throw new Error("Fleet records provider activity for this job; ambiguous usage remains held")
 		const claim = { claimId: target.claimId!, epoch: target.epoch, job: target } as ClaimedRepositoryJob
@@ -76,7 +86,8 @@ export async function recoverAmbiguousPrepareWithNoCallProof(jobId: string, conf
 /** Verify the immutable no-call artifact before creating an explicit retry child. */
 export async function verifyRecoveredNoCallArtifact(job: RepositoryCampaignJob, storePath: string,
 	scope: FleetRepositoryBudgetScope, keyIdentity: string): Promise<string> {
-	if (job.campaignId !== "curl-maintenance" || job.advisoryId !== "CVE-2026-92390" || job.purpose !== "qualification" ||
+	const noModelV2 = isNoModelV2RecoveryJob(job) && scope.profileId === "no-model" && scope.model === "none"
+	if ((!noModelV2 && (job.campaignId !== "curl-maintenance" || job.purpose !== "qualification")) || job.advisoryId !== "CVE-2026-92390" ||
 		job.status !== "failed" || (job.retryOf !== undefined && !validRetryParent(job.retryOf)) || job.settledMicros !== 0 || job.settledTokens !== 0 ||
 		job.reservedMicros !== 0 || job.reservedTokens !== 0 || !job.progress || !job.claimId || !Number.isSafeInteger(job.epoch)) {
 		throw new Error("retry target is not a recovered zero-cost Curl qualification")
@@ -123,7 +134,7 @@ function validRetryParent(value: string): boolean { return UUID.test(value) }
 
 function isRecoverableTarget(job: RepositoryCampaignJob | undefined, definition: RepositoryCampaignDefinition, now: number): job is RepositoryCampaignJob {
 	return !!job && job.id !== undefined && job.campaignId === definition.id && job.advisoryId === "CVE-2026-92390" &&
-		job.purpose === "qualification" && job.status === "ambiguous" && typeof job.claimId === "string" && UUID.test(job.claimId) &&
+		(job.purpose === "qualification" || (definition.id === "curl-historical-repair-v2" && isNoModelV2RecoveryJob(job))) && job.status === "ambiguous" && typeof job.claimId === "string" && UUID.test(job.claimId) &&
 		Number.isSafeInteger(job.epoch) && job.epoch > 0 && job.progress !== undefined &&
 		Number.isSafeInteger(job.progress.leaseExpiresAt) && job.progress.leaseExpiresAt <= now &&
 		job.settledMicros > 0 && job.settledTokens > 0 && job.reservedMicros === 0 && job.reservedTokens === 0
@@ -144,6 +155,7 @@ function assertProofMatches(proof: FleetRepositoryNoCallProof, jobId: string, sc
 function isAcceptedNoCallProof(proof: FleetRepositoryNoCallProof): boolean {
 	if (!proof.counts || proof.counts.calls !== 0 || proof.counts.denials !== 0) return false
 	if (proof.counts.grants === 0) return proof.grant === null && proof.disposition === "no-recorded-provider-activity"
+	if (proof.model === "none" || proof.profileId === "no-model") return false
 	const grant = proof.grant
 	return proof.counts.grants === 1 && proof.disposition === "expired-unused-grant" && !!grant &&
 		Number.isSafeInteger(grant.issuedAtMs) && grant.issuedAtMs >= 0 && grant.issuedAtMs <= proof.asOfMs &&
