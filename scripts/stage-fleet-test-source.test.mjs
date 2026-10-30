@@ -50,6 +50,7 @@ test("stages the configured commit and ignores dirty checkout files", () => {
 		const result = run(root, commit, temp)
 		assert.equal(result.status, 0, result.stderr)
 		const staged = fs.readFileSync(path.join(temp, "github-env"), "utf8")
+		assert.ok(staged.endsWith("\n"), "CI environment records end with a newline")
 		const sourceRoot = staged.trim().split("=").at(-1)
 		assert.equal(
 			fs.readFileSync(path.join(sourceRoot, "operations/campaign_budget_bridge.py"), "utf8"),
@@ -71,6 +72,9 @@ test("fails clearly when required configuration or commit is unavailable", () =>
 		const invalid = run(root, "missing-ref", temp)
 		assert.notEqual(invalid.status, 0)
 		assert.match(invalid.stderr, /staging failed/)
+		const mutable = run(root, "HEAD", temp)
+		assert.notEqual(mutable.status, 0)
+		assert.match(mutable.stderr, /immutable Git object ID/)
 	} finally {
 		fs.rmSync(temp, { recursive: true, force: true })
 	}

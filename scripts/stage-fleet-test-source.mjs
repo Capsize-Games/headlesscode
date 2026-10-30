@@ -28,6 +28,9 @@ function validateCheckout(root) {
 }
 
 function resolveCommit(root, ref) {
+	if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(ref)) {
+		throw new Error("Fleet test ref must be an immutable Git object ID")
+	}
 	const commit = git(root, ["rev-parse", "--verify", `${ref}^{commit}`])
 	if (!/^[a-f0-9]{40,64}$/.test(commit)) {
 		throw new Error("Fleet test ref did not resolve to an immutable commit")
@@ -50,7 +53,11 @@ function writeCiEnvironment(sourceRoot) {
 }
 
 function stageFleetTestSource() {
-	const root = path.resolve(requireConfig("FLEET_SECURITY_WATCH_PRIVATE_ROOT"))
+	const configured = requireConfig("FLEET_SECURITY_WATCH_PRIVATE_ROOT")
+	if (!path.isAbsolute(configured)) {
+		throw new Error("private Fleet source root must be absolute")
+	}
+	const root = path.resolve(configured)
 	const ref = requireConfig("FLEET_SECURITY_WATCH_TEST_REF")
 	validateCheckout(root)
 	const commit = resolveCommit(root, ref)
