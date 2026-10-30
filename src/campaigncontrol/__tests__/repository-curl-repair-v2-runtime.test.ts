@@ -1,5 +1,4 @@
 import assert from "node:assert/strict"
-import { createHash } from "node:crypto"
 import type {
 	ClaimedRepositoryJob, RepositoryCampaignDefinition,
 } from "../repository-campaigns.js"
@@ -36,15 +35,11 @@ import {
 	CURL_REPAIR_PATCH_SHA256,
 } from "../repository-curl-repair.js"
 import {
-	parseKnownCurlDebianSnapshot, CURL_DEBIAN_AFFECTED_RANGE,
-	CURL_DEBIAN_FIXED_REVISION, CURL_DEBIAN_INTRODUCED_REVISION,
-	CURL_DEBIAN_PUBLIC_BASE_REVISION, CURL_DEBIAN_SNAPSHOT_SHA256,
-	CURL_DEBIAN_SOURCE_HTML_SHA256,
-	CURL_DEBIAN_SOURCE_URL, CURL_DEBIAN_SUMMARY,
-} from "../repository-known-advisory.js"
-import {
 	buildCurlHistoricalRepairTestFixture,
 } from "./curl-historical-repair-fixture.js"
+import {
+	buildVettedCurlDebianAdvisoryFixture,
+} from "./curl-v2-advisory-fixture.js"
 import {
 	evaluateCurlHistoricalRepairCandidate,
 } from "../repository-curl-repair-evaluator.js"
@@ -78,34 +73,14 @@ async function v2RuntimeRunsNoProviderStages(): Promise<void> {
 		registration(def), def, { store },
 		runtimeDependencies(events, candidate),
 	)
-	adapters.lookupAdvisory = async () => vettedAdvisoryFixture()
+	adapters.lookupAdvisory = async () =>
+		buildVettedCurlDebianAdvisoryFixture()
 	const result = await executePipeline(adapters, def)
 	assert.equal(result.status, "succeeded")
 	assert.equal(result.actualMicros, 0)
 	assert.equal(result.actualTokens, 0)
 	assert.deepEqual(events, ["claim-current", "claim-current", "claim-current",
 		"claim-current", "private-delivery-adapter"])
-}
-
-function vettedAdvisoryFixture() {
-	// Keep composition coverage independent of the operator's HOME snapshot.
-	const bytes = Buffer.from(`${JSON.stringify({
-		advisoryId: CURL_FIXED_ADVISORY,
-		affectedRange: CURL_DEBIAN_AFFECTED_RANGE,
-		fixedRevision: CURL_DEBIAN_FIXED_REVISION,
-		introducedRevision: CURL_DEBIAN_INTRODUCED_REVISION,
-		observedAt: "2026-10-29T22:34:23.039960+00:00",
-		publicBaseRevision: CURL_DEBIAN_PUBLIC_BASE_REVISION,
-		schemaVersion: 1,
-		sourceHtmlSha256: CURL_DEBIAN_SOURCE_HTML_SHA256,
-		sourceUrl: CURL_DEBIAN_SOURCE_URL,
-		summary: CURL_DEBIAN_SUMMARY,
-	}, null, 2)}\n`)
-	const digest = createHash("sha256").update(bytes).digest("hex")
-	assert.equal(digest, CURL_DEBIAN_SNAPSHOT_SHA256)
-	return parseKnownCurlDebianSnapshot(
-		bytes, digest, Date.parse("2026-10-30T12:00:00Z"),
-	)
 }
 
 function runtimeDependencies(
