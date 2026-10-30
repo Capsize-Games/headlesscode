@@ -19,7 +19,9 @@ export interface RepositoryBudgetAuthorityReaderDependencies {
 	createLedger?: (options: FleetRepositoryBudgetLedgerOptions) => Pick<FleetRepositoryBudgetLedger, "budgetSnapshot" | "budgetSnapshotOnly">
 }
 
-function profileForDefinition(definition: RepositoryCampaignDefinition): Pick<FleetRepositoryBudgetScope, "model" | "profileId"> | undefined {
+export function repositoryBudgetProfile(
+	definition: RepositoryCampaignDefinition,
+): Pick<FleetRepositoryBudgetScope, "model" | "profileId"> | undefined {
 	if (definition.id === CURL_REPAIR_CAMPAIGN_ID) {
 		if (definition.repositoryId !== CURL_REPAIR_REPOSITORY_ID || definition.repository !== CURL_REPAIR_TARGET_REPOSITORY ||
 			definition.sourceRevision !== CURL_REPAIR_SOURCE_REVISION || definition.policySha256 !== CURL_REPAIR_POLICY_SHA256 ||
@@ -40,7 +42,7 @@ export function createRepositoryBudgetAuthorityReader(
 	return async (campaignId) => {
 		if (!campaignId) return unavailable()
 		const definition = byId.get(campaignId)
-		const profile = definition && profileForDefinition(definition)
+		const profile = definition && repositoryBudgetProfile(definition)
 		if (!definition || !profile || !definition.repositoryId || !definition.repository ||
 			!definition.sourceRevision || !/^[a-f0-9]{40}$/.test(definition.sourceRevision) || !definition.policySha256 || !/^[a-f0-9]{64}$/.test(definition.policySha256)) {
 			return unavailable()
