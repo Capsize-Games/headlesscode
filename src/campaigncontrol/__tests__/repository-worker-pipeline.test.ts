@@ -73,9 +73,37 @@ async function testNonzeroContainedWorkerExitRecordsBoundedDiagnostic(): Promise
 	assert.doesNotMatch(JSON.stringify(result), /invalid bounded task|outputBytes/)
 }
 
+async function deliveryFailureReportsTheDeliveryStageAndTask(): Promise<void> {
+	const definition = { id: "curl-maintenance", name: "Curl", repositoryId: "curl-maintenance", repository: "Capsize-Games/curl-maintenance",
+		sourceRevision: "a".repeat(40), policySha256: "b".repeat(64), workerProfile: "curl-published-advisory-v1",
+		recipeDigest: "c".repeat(64), evaluatorDigest: "d".repeat(64), model: "meta/muse-spark-1.3-contributor" } as RepositoryCampaignDefinition
+	const claim = { claimId: "21234567-89ab-cdef-0123-456789abcdef", epoch: 6,
+		job: { id: "cdef0123-4567-89ab-cdef-0123456789ab", campaignId: "curl-maintenance", advisoryId: "CVE-2026-92390", purpose: "qualification" } } as ClaimedRepositoryJob
+	const advisory: VettedAdvisorySnapshot = { advisoryId: claim.job.advisoryId, sourceUrl: "https://example.invalid/advisory",
+		snapshotSha256: "e".repeat(64), summary: "bounded fixture", affectedRange: "fixture", fixedVersion: null, verificationCheckIds: [] }
+	const worker = createRepositoryWorkerPipeline({ workerProfile: definition.workerProfile!, recipeDigest: definition.recipeDigest!,
+		evaluatorDigest: definition.evaluatorDigest!, model: definition.model!, executionKind: "live-cve", reservation: { micros: 8000, tokens: 72000 },
+		async lookupAdvisory() { return advisory },
+		async prepareWorkspace() { return { worktree: "/tmp/fixture", taskSha256: "f".repeat(64),
+			async runContained() { return { ok: true, durationMs: 20, outputSha256: "a".repeat(64), actualMicros: 1, actualTokens: 1 } },
+			async candidateSha256() { return "f".repeat(64) } } },
+		async evaluate() { return { passed: true, evidenceSha256: "b".repeat(64), detail: "fixture passed" } },
+		async deliverPrivate() { throw new Error("private delivery read failed") },
+		async recordFailureDiagnostic() { return { digest: "c".repeat(64) } },
+	})
+	const result = await worker.execute({ definition, claim, signal: new AbortController().signal, async progress() {} })
+	assert.equal(result.status, "failed")
+	assert.equal(result.stage, "deliver")
+	assert.equal(result.currentTask, "Record the verified result through private delivery")
+	assert.equal(result.blocker, "registered-pipeline-step-failed")
+	assert.equal(result.actualMicros, 1)
+	assert.equal(result.actualTokens, 1)
+}
+
 const tests: readonly SuiteTest[] = [
 	["prepare failure records a private redacted diagnostic and keeps API result opaque", testPrepareFailureIsRecordedPrivatelyAndNeverReturnedRaw],
 	["nonzero contained-worker exit goes through the private diagnostic writer", testNonzeroContainedWorkerExitRecordsBoundedDiagnostic],
+	["a thrown delivery failure reports its actual stage and current task", deliveryFailureReportsTheDeliveryStageAndTask],
 ]
 
 runMain("repository-worker-pipeline", tests)
