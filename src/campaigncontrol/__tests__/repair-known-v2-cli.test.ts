@@ -18,6 +18,13 @@ try {
 	assert.match(result.stderr, /v2 repair profile is not owner-registered/)
 	assert.equal(fs.existsSync(path.join(home, ".local/share/headlesscode/campaign-control")), false,
 		"missing owner registration fails before creating control state")
+	const invalidRetry = spawnSync(process.execPath, [tsx, path.join(root, "src/cli.ts"),
+		"campaign", "retry-repair", "curl-historical-repair", "invalid-id",
+		"--confirm-retry-repair=invalid-id"], {
+		cwd: root, encoding: "utf8", env: { ...process.env, HOME: home }, timeout: 30_000,
+	})
+	assert.equal(invalidRetry.status, 2, "retry rejects a malformed job id before reading campaign state")
+	assert.equal(invalidRetry.stdout, "")
 } finally {
 	fs.rmSync(home, { recursive: true, force: true })
 }
