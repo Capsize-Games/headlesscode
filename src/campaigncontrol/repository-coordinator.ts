@@ -18,6 +18,7 @@ export type RepositoryAdvisoryIntake =
 
 export interface RepositoryWorkerExecutionResult {
 	status: "succeeded" | "failed" | "ambiguous"
+	stage?: RepositoryCampaignStep
 	accounting: "measured" | "ambiguous"
 	actualMicros: number | null
 	actualTokens: number | null
@@ -284,7 +285,7 @@ export class RepositoryCampaignCoordinator {
 	}
 
 	private async saveResult(claim: ClaimedRepositoryJob, result: RepositoryWorkerExecutionResult): Promise<void> {
-		const stage = result.status === "succeeded" ? "deliver" : (result.completedSteps.at(-1) ?? "intake")
+		const stage = result.stage ?? (result.status === "succeeded" ? "deliver" : (result.completedSteps.at(-1) ?? "intake"))
 		const progress = { currentTask: result.currentTask, blocker: result.blocker, nextStep: result.nextStep, boardRef: result.boardRef }
 		await this.store.updateClaimProgress(claim, { stage, ...progress,
 			completedSteps: result.completedSteps, evidenceRefs: result.evidenceRefs })
@@ -317,7 +318,8 @@ function validResultAmounts(result: RepositoryWorkerExecutionResult): boolean {
 	return validAmount(result.actualMicros) && validAmount(result.actualTokens)
 }
 function validResultDetails(result: RepositoryWorkerExecutionResult): boolean {
-	return Array.isArray(result.evidenceRefs) && result.evidenceRefs.length <= 20 && validMessage(result.currentTask, false) &&
+	return (result.stage === undefined || REPOSITORY_CAMPAIGN_STEPS.includes(result.stage)) &&
+		Array.isArray(result.evidenceRefs) && result.evidenceRefs.length <= 20 && validMessage(result.currentTask, false) &&
 		validMessage(result.blocker, true) && validMessage(result.nextStep, true)
 }
 
