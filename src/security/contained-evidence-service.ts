@@ -40,6 +40,7 @@ export async function startContainedEvidenceService(options: {
 	for (let i = 0; i < roots.length; i++) {
 		for (let j = i + 1; j < roots.length; j++) if (overlaps(roots[i]!, roots[j]!)) throw new Error("evidence storage, config, socket, and repository paths must be separate")
 	}
+	preparePrivateSocketDirectory(path.dirname(socketPath))
 	const configFiles = sessions.map((id) => path.join(configDirectory, `${id}.json`))
 	if (configFiles.some((file) => fs.existsSync(file))) throw new Error("a per-session evidence runtime config already exists; choose new worker session IDs")
 	const collector = await FileEvidenceCollector.start({ storageDir, socketPath })
@@ -108,6 +109,41 @@ function preparePrivateDirectory(value: string): string {
 	const stat = fs.lstatSync(real)
 	if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) throw new Error("evidence storage and runtime config directories must be private real directories")
 	return real
+}
+
+function preparePrivateSocketDirectory(value: string): void {
+	const absolute = path.resolve(value)
+	assertNoSymlinkAncestors(absolute)
+	const missing: string[] = []
+	let existing = absolute
+	while (true) {
+		try { fs.lstatSync(existing); break }
+		catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+			missing.push(existing)
+			const parent = path.dirname(existing)
+			if (parent === existing) throw new Error("evidence socket directory has no safe existing parent")
+			existing = parent
+		}
+	}
+	const uid = typeof process.getuid === "function" ? process.getuid() : -1
+	const base = fs.lstatSync(existing)
+	if (!base.isDirectory() || base.isSymbolicLink() || base.uid !== uid || (base.mode & 0o077) !== 0 || fs.realpathSync(existing) !== existing) {
+		throw new Error("evidence socket directory must descend from an owner-only real directory")
+	}
+	for (const directory of missing.reverse()) {
+		fs.mkdirSync(directory, { mode: 0o700 })
+		const info = fs.lstatSync(directory)
+		if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== uid || fs.realpathSync(directory) !== directory) {
+			throw new Error("evidence socket directory could not be created as an owner-owned real directory")
+		}
+		fs.chmodSync(directory, 0o700)
+	}
+	const target = fs.lstatSync(absolute)
+	if (!target.isDirectory() || target.isSymbolicLink() || target.uid !== uid || fs.realpathSync(absolute) !== absolute) {
+		throw new Error("evidence socket directory must be an owner-owned real directory")
+	}
+	if ((target.mode & 0o077) !== 0) fs.chmodSync(absolute, 0o700)
 }
 
 function assertNoSymlinkAncestors(value: string): void {
