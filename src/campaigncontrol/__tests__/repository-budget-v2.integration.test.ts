@@ -7,10 +7,15 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { test } from "node:test"
 import { createRepositoryCampaignBudgetBinding } from "../repository-budget-binding.js"
-import { RepositoryCampaignStore, type RepositoryBudgetAuthority, type RepositoryCampaignDefinition } from "../repository-campaigns.js"
+import { RepositoryCampaignStore, type RepositoryBudgetAuthority,
+	type RepositoryCampaignDefinition,
+		type RepositoryCampaignJob } from "../repository-campaigns.js"
 import { CampaignControlStore } from "../store.js"
-import { FleetRepositoryBudgetLedger, type FleetRepositoryBudgetScope } from "../../rsi/fleet-repository-budget-ledger.js"
-import type { OpenRouterBrokerGrant, OpenRouterCallReservation, OpenRouterCallSettlement } from "../../rsi/inference-broker.js"
+import { FleetRepositoryBudgetLedger,
+	type FleetRepositoryBudgetScope } from "../../rsi/fleet-repository-budget-ledger.js"
+import type { OpenRouterBrokerGrant, OpenRouterCallReservation,
+	OpenRouterCallSettlement,
+		OpenRouterBrokerLimits } from "../../rsi/inference-broker.js"
 
 const MODEL = "meta/muse-spark-1.3-contributor"
 const PROFILE = "muse-spark-contributor"
@@ -30,21 +35,28 @@ def fixed_control(path, **kwargs):
     with open(path, "r", encoding="utf-8") as stream: value = json.load(stream)
     if month: value["month"] = month
     return value
-patches = [patch.object(budget, "_provider_snapshot", return_value={"limit_micros": 5000000, "remaining_micros": 5000000, "usage_micros": 0})]
+patches = [patch.object(budget, "_provider_snapshot",
+        return_value={"limit_micros": 5000000, "remaining_micros": 5000000,
+        "usage_micros": 0})]
 if month:
-    patches.extend([patch.object(budget, "_utc_month", return_value=month), patch.object(budget, "read_control", side_effect=fixed_control), patch.object(control, "read_control", side_effect=fixed_control), patch.object(bridge, "read_control", side_effect=fixed_control)])
+    patches.extend([patch.object(budget, "_utc_month", return_value=month),
+        patch.object(budget, "read_control", side_effect=fixed_control),
+        patch.object(control, "read_control", side_effect=fixed_control),
+        patch.object(bridge, "read_control", side_effect=fixed_control)])
 if fault == "settle-after":
     original = budget.BudgetAuthority.settle
     def settle_then_lose(self, **kwargs):
         result = original(self, **kwargs)
         if result: raise OSError("fixture lost settlement response after durable commit")
         return result
-    patches.append(patch.object(budget.BudgetAuthority, "settle", settle_then_lose))
+    patches.append(patch.object(budget.BudgetAuthority, "settle",
+        settle_then_lose))
 with patches[0]:
     from contextlib import ExitStack
     with ExitStack() as stack:
         for item in patches[1:]: stack.enter_context(item)
-        print(json.dumps(bridge._authority().dispatch(json.load(sys.stdin)), separators=(",", ":")))
+        print(json.dumps(bridge._authority().dispatch(json.load(sys.stdin)),
+        separators=(",", ":")))
 `
 const pythonBridgeHandoff = `
 import json, os, sys
@@ -59,7 +71,9 @@ def fixed_control(path, **kwargs):
     with open(path, "r", encoding="utf-8") as stream: value = json.load(stream)
     if month: value["month"] = month
     return value
-patches = [patch.object(budget, "_provider_snapshot", return_value={"limit_micros": 5000000, "remaining_micros": 5000000, "usage_micros": 0})]
+patches = [patch.object(budget, "_provider_snapshot",
+        return_value={"limit_micros": 5000000, "remaining_micros": 5000000,
+        "usage_micros": 0})]
 if crash_after_admit:
     original = bridge.FleetBudgetBridge._repository_request_start
     def crash_after_request_start(self, message):
@@ -67,53 +81,80 @@ if crash_after_admit:
         os._exit(79)
     bridge.FleetBudgetBridge._repository_request_start = crash_after_request_start
 if month:
-    patches.extend([patch.object(budget, "_utc_month", return_value=month), patch.object(budget, "read_control", side_effect=fixed_control), patch.object(control, "read_control", side_effect=fixed_control), patch.object(bridge, "read_control", side_effect=fixed_control)])
+    patches.extend([patch.object(budget, "_utc_month", return_value=month),
+        patch.object(budget, "read_control", side_effect=fixed_control),
+        patch.object(control, "read_control", side_effect=fixed_control),
+        patch.object(bridge, "read_control", side_effect=fixed_control)])
 with patches[0]:
     with ExitStack() as stack:
         for item in patches[1:]: stack.enter_context(item)
         bridge.main()
 `
 const fleetRoot = process.env.FLEET_SECURITY_WATCH_TEST_ROOT ?? path.resolve(process.cwd(), "../fleet-repository-budget-v2")
-const fleetSourceAvailable = existsSync(path.join(fleetRoot, "operations/campaign_budget_bridge.py"))
+const fleetSourceAvailable = existsSync(path.join(fleetRoot,
+	"operations/campaign_budget_bridge.py"))
 const integrationSkip = fleetSourceAvailable ? false : "requires the Fleet source checkout; set FLEET_SECURITY_WATCH_TEST_ROOT in combined integration runs"
 
-const qualification = { sourceAudited: true, workerQualified: true, recipeQualified: true, evaluatorQualified: true,
+const qualification = { sourceAudited: true, workerQualified: true,
+	recipeQualified: true, evaluatorQualified: true,
 	modelApproved: true, dataApproved: true, accessApproved: true }
 const definitions: RepositoryCampaignDefinition[] = [
-	{ id: "repo-a", name: "Repository A", repositoryId: "fixture-a", repository: "Capsize-Games/fixture-a", sourceRevision: sourceA, policySha256: policyA, workerProfile: "fixture-worker", recipeDigest: "c".repeat(64),
-		evaluatorDigest: "d".repeat(64), model: MODEL, dataAccessProfile: "fixture-data", qualification },
-	{ id: "repo-b", name: "Repository B", repositoryId: "fixture-b", repository: "Capsize-Games/fixture-b", sourceRevision: sourceB, policySha256: policyB, workerProfile: "fixture-worker", recipeDigest: "e".repeat(64),
-		evaluatorDigest: "f".repeat(64), model: MODEL, dataAccessProfile: "fixture-data", qualification },
+	{ id: "repo-a", name: "Repository A", repositoryId: "fixture-a",
+		repository: "Capsize-Games/fixture-a", sourceRevision: sourceA,
+			policySha256: policyA, workerProfile: "fixture-worker",
+				recipeDigest: "c".repeat(64),
+		evaluatorDigest: "d".repeat(64), model: MODEL,
+			dataAccessProfile: "fixture-data", qualification },
+	{ id: "repo-b", name: "Repository B", repositoryId: "fixture-b",
+		repository: "Capsize-Games/fixture-b", sourceRevision: sourceB,
+			policySha256: policyB, workerProfile: "fixture-worker",
+				recipeDigest: "e".repeat(64),
+		evaluatorDigest: "f".repeat(64), model: MODEL,
+			dataAccessProfile: "fixture-data", qualification },
 ]
 
 function scope(id: "repo-a" | "repo-b", epoch = 1): FleetRepositoryBudgetScope {
 	return id === "repo-a"
-		? { repositoryCampaignId: id, repositoryId: "fixture-a", repository: "Capsize-Games/fixture-a", sourceRevision: sourceA,
-			policySha256: policyA, model: MODEL, profileId: PROFILE, repositoryEpoch: epoch }
-		: { repositoryCampaignId: id, repositoryId: "fixture-b", repository: "Capsize-Games/fixture-b", sourceRevision: sourceB,
-			policySha256: policyB, model: MODEL, profileId: PROFILE, repositoryEpoch: epoch }
+		? { repositoryCampaignId: id, repositoryId: "fixture-a",
+			repository: "Capsize-Games/fixture-a", sourceRevision: sourceA,
+			policySha256: policyA, model: MODEL, profileId: PROFILE,
+				repositoryEpoch: epoch }
+		: { repositoryCampaignId: id, repositoryId: "fixture-b",
+			repository: "Capsize-Games/fixture-b", sourceRevision: sourceB,
+			policySha256: policyB, model: MODEL, profileId: PROFILE,
+				repositoryEpoch: epoch }
 }
 
-function limits(maxJobSpendUsd = 0.01, maxTotalTokens = 10_000) {
-	return { campaignId: "fleet-security-watch", maxCalls: 3, maxInputTokensPerCall: 4_000, maxOutputTokensPerCall: 1_000,
-		maxTotalTokens, maxDurationMs: 60_000, maxRequestBytes: 16_384, maxResponseBytes: 32_768,
-		maxInputPricePerMillionUsd: 1, maxOutputPricePerMillionUsd: 2, maxCallSpendUsd: 0.01,
+function limits(maxJobSpendUsd = 0.01,
+	maxTotalTokens = 10_000): OpenRouterBrokerLimits {
+	return { campaignId: "fleet-security-watch", maxCalls: 3,
+		maxInputTokensPerCall: 4_000, maxOutputTokensPerCall: 1_000,
+		maxTotalTokens, maxDurationMs: 60_000, maxRequestBytes: 16_384,
+			maxResponseBytes: 32_768,
+		maxInputPricePerMillionUsd: 1, maxOutputPricePerMillionUsd: 2,
+			maxCallSpendUsd: 0.01,
 		maxJobSpendUsd, maxCampaignSpendUsd: 0.02 }
 }
 
-function grant(jobId: string, maxJobSpendUsd = 0.01, maxTotalTokens = 10_000): OpenRouterBrokerGrant {
-	return { jobId, leaseToken: "synthetic-lease", capability: "synthetic-capability", model: MODEL, profileId: PROFILE,
+function grant(jobId: string, maxJobSpendUsd = 0.01,
+	maxTotalTokens = 10_000): OpenRouterBrokerGrant {
+	return { jobId, leaseToken: "synthetic-lease",
+		capability: "synthetic-capability", model: MODEL, profileId: PROFILE,
 		apiKeyIdentity: keyIdentity, limits: limits(maxJobSpendUsd, maxTotalTokens) }
 }
 
 function reservation(callId: string): OpenRouterCallReservation {
-	return { callId, requestSha256: "9".repeat(64), reservedUsd: 0.01, reservedTokens: 5_000, startedAt: new Date().toISOString() }
+	return { callId, requestSha256: "9".repeat(64), reservedUsd: 0.01,
+		reservedTokens: 5_000, startedAt: new Date().toISOString() }
 }
 
 function settlement(callId: string): OpenRouterCallSettlement & { callId: string } {
-	return { callId, state: "complete", qualified: true, returnedModel: MODEL, returnedProvider: "meta",
-		providerRequestId: "fixture-provider-receipt", promptTokens: 12, completionTokens: 7,
-		costUsd: 0.0001, responseSha256: "8".repeat(64), completedAt: new Date().toISOString() }
+	return { callId, state: "complete", qualified: true, returnedModel: MODEL,
+		returnedProvider: "meta",
+		providerRequestId: "fixture-provider-receipt", promptTokens: 12,
+			completionTokens: 7,
+		costUsd: 0.0001, responseSha256: "8".repeat(64),
+			completedAt: new Date().toISOString() }
 }
 
 function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
@@ -128,38 +169,62 @@ interface Fixture {
 	store: RepositoryCampaignStore
 	controlStore: CampaignControlStore
 	claims: { "repo-a": NonNullable<Awaited<ReturnType<RepositoryCampaignStore["claimNext"]>>>; "repo-b": NonNullable<Awaited<ReturnType<RepositoryCampaignStore["claimNext"]>>> }
-	bindings: Record<"repo-a" | "repo-b", ReturnType<typeof createRepositoryCampaignBudgetBinding>>
+	bindings: Record<"repo-a" | "repo-b",
+		ReturnType<typeof createRepositoryCampaignBudgetBinding>>
 	grants: Record<"repo-a" | "repo-b", OpenRouterBrokerGrant>
 	setFault(value?: string): void
 	setMonth(value?: string): void
 	invoke(message: Record<string, unknown>): Promise<Record<string, unknown>>
-	requestStartHandoff(message: Record<string, unknown>, onAdmitted: (reply: Record<string, unknown>) => void | Promise<void>): Promise<void>
+	requestStartHandoff(message: Record<string, unknown>,
+		onAdmitted: (reply: Record<string,
+			unknown>) => void | Promise<void>): Promise<void>
 	tryDispatchLock(): boolean
 	crashNextHandoff(): void
 	setControl(value: { globalEnabled?: boolean; globalEpoch?: number; repoAEnabled?: boolean; repoAEpoch?: number; repoBEnabled?: boolean; repoBEpoch?: number }): Promise<void>
 	cleanup(): Promise<void>
 }
 
+type CampaignBudgetStatus = {
+	budget: { ambiguousMicros: number; settledMicros: number; settledTokens: number; reservedMicros: number; authority: string; available: boolean }
+	campaigns: Array<{ enabled: boolean }>
+	jobs: Array<RepositoryCampaignJob & { settledMicros: number; settledTokens: number }>
+}
+
+function readCampaignBudgetStatus(value: Record<string,
+	unknown>): CampaignBudgetStatus {
+	return value as unknown as CampaignBudgetStatus
+}
+
 async function privateDir(directory: string): Promise<void> { await fs.mkdir(directory, { recursive: true, mode: 0o700 }); await fs.chmod(directory, 0o700) }
 
 async function fixture(options: { activeRun?: boolean; repositoryEnabled?: boolean } = {}): Promise<Fixture> {
-	const home = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-fleet-v2-")); await fs.chmod(home, 0o700)
-	const campaign = path.join(home, ".local", "state", "fleet-security-watch", "automation", "campaign")
-	const controlDir = path.join(home, ".local", "share", "headlesscode", "campaign-control")
+	const home = await fs.mkdtemp(path.join(os.tmpdir(),
+		"hcl-fleet-v2-")); await fs.chmod(home, 0o700)
+	const campaign = path.join(home, ".local", "state", "fleet-security-watch",
+		"automation", "campaign")
+	const controlDir = path.join(home, ".local", "share", "headlesscode",
+		"campaign-control")
 	await privateDir(campaign); await privateDir(controlDir)
-	const credential = path.join(campaign, "test-key"), config = path.join(campaign, "config.json")
+	const credential = path.join(campaign, "test-key"),
+		config = path.join(campaign, "config.json")
 	const controlFile = path.join(controlDir, "control.json")
-	await fs.writeFile(credential, fakeKey, { mode: 0o600 }); await fs.chmod(credential, 0o600)
-	await fs.writeFile(config, JSON.stringify({ schema_version: 1, enabled: true, repository: "/fixture", base_sha: "a".repeat(40),
-		board_card: "1c25cecf", image_digest: "b".repeat(64), credential_file: credential, key_identity: keyIdentity }), { mode: 0o600 })
+	await fs.writeFile(credential, fakeKey,
+		{ mode: 0o600 }); await fs.chmod(credential, 0o600)
+	await fs.writeFile(config, JSON.stringify({ schema_version: 1,
+		enabled: true, repository: "/fixture", base_sha: "a".repeat(40),
+		board_card: "1c25cecf", image_digest: "b".repeat(64),
+			credential_file: credential, key_identity: keyIdentity }), { mode: 0o600 })
 	await fs.chmod(config, 0o600)
 	const scopes = (["repo-a", "repo-b"] as const).map((id) => {
 		const s = scope(id)
-		return { repositoryCampaignId: s.repositoryCampaignId, repositoryId: s.repositoryId, repository: s.repository,
-			sourceRevision: s.sourceRevision, policySha256: s.policySha256, model: s.model, profileId: s.profileId,
+		return { repositoryCampaignId: s.repositoryCampaignId,
+			repositoryId: s.repositoryId, repository: s.repository,
+			sourceRevision: s.sourceRevision, policySha256: s.policySha256,
+				model: s.model, profileId: s.profileId,
 			maxLifetimeSpendMicros: 10_000, maxLifetimeTokens: 10_000 }
 	})
-	await fs.writeFile(path.join(campaign, "repository-scopes.json"), JSON.stringify({ schemaVersion: 1, repositories: scopes }), { mode: 0o600 })
+	await fs.writeFile(path.join(campaign, "repository-scopes.json"),
+		JSON.stringify({ schemaVersion: 1, repositories: scopes }), { mode: 0o600 })
 	await fs.chmod(path.join(campaign, "repository-scopes.json"), 0o600)
 	const controlStore = new CampaignControlStore(controlFile)
 	const controlDefinitions = new Map(definitions.map((definition) => [definition.id, definition]))
@@ -170,9 +235,12 @@ async function fixture(options: { activeRun?: boolean; repositoryEnabled?: boole
 	const globalControl = await controlStore.snapshot()
 	if (options.activeRun !== false) await controlStore.beginAdmittedRunIfIdle(new Date(), 300_000, globalControl.epoch)
 	const invoke = async (message: Record<string, unknown>) => {
-		const child = spawnSync("/usr/bin/python3", ["-c", pythonBridge], { input: JSON.stringify(message), encoding: "utf8", timeout: 10_000,
-			env: { HOME: home, PATH: process.env.PATH ?? "/usr/bin:/bin", PYTHONPATH: fleetRoot, PYTHONNOUSERSITE: "1",
-				...(fault ? { FLEET_TEST_FAULT: fault } : {}), ...(month ? { FLEET_TEST_MONTH: month } : {}) } })
+		const child = spawnSync("/usr/bin/python3", ["-c", pythonBridge],
+			{ input: JSON.stringify(message), encoding: "utf8", timeout: 10_000,
+			env: { HOME: home, PATH: process.env.PATH ?? "/usr/bin:/bin",
+				PYTHONPATH: fleetRoot, PYTHONNOUSERSITE: "1",
+				...(fault ? { FLEET_TEST_FAULT: fault } : {}),
+					...(month ? { FLEET_TEST_MONTH: month } : {}) } })
 		fault = undefined
 		if (child.error || child.status !== 0) throw new Error(`offline Fleet v2 bridge call failed closed (${child.status ?? child.error?.message ?? "spawn-error"}): ${(child.stderr ?? "").slice(0, 1200)}`)
 		return JSON.parse(child.stdout.trim()) as Record<string, unknown>
@@ -241,10 +309,10 @@ async function fixture(options: { activeRun?: boolean; repositoryEnabled?: boole
 		store, claim: claims[id], scope: scope(id), expectedKeyIdentity: keyIdentity, invoke, requestStartHandoff,
 		assertDispatchFence: async () => undefined,
 	})])) as Fixture["bindings"]
-	return { root, home, store, controlStore, claims, grants, bindings, setFault(value) { fault = value }, setMonth(value) { month = value }, invoke, requestStartHandoff,
+	return { root, home, store, controlStore, claims, grants, bindings, setFault(value): void { fault = value }, setMonth(value): void { month = value }, invoke, requestStartHandoff,
 		tryDispatchLock,
-		crashNextHandoff() { crashHandoff = true },
-		async setControl(next) {
+		crashNextHandoff(): void { crashHandoff = true },
+		async setControl(next): Promise<void> {
 			if (next.globalEnabled !== undefined) await controlStore.setEnabled(next.globalEnabled)
 			for (const [id, enabled] of [["repo-a", next.repoAEnabled], ["repo-b", next.repoBEnabled]] as const) {
 				if (enabled !== undefined) await controlStore.setRepositoryCampaign(controlDefinitions.get(id)!, enabled)
@@ -267,7 +335,7 @@ test("HCL binding sends v2 repository identities and both repositories consume t
 		await f.bindings[id].finishFromReceipt(f.grants[id], new Date("2026-10-29T12:01:00Z"))
 	}
 	assert.equal(sends, 2)
-	const state = await f.store.status(new Date("2026-10-29T12:02:00Z")) as any
+	const state = await f.store.status(new Date("2026-10-29T12:02:00Z")) as unknown as CampaignBudgetStatus
 	assert.equal(state.budget.settledMicros, 200)
 	assert.equal(state.budget.settledTokens, 38)
 	assert.equal(state.budget.reservedMicros, 0)
@@ -300,7 +368,7 @@ test("cold start reads Fleet budget without a run, then starts, claims, and stop
 		return state.activeRun ? await ledger.budgetSnapshot() : await ledger.budgetSnapshotOnly()
 	}
 	const repoStore = new RepositoryCampaignStore(path.join(f.root, "cold-start.json"), [definition], readAuthority)
-	const initial = await repoStore.status() as any
+	const initial = await repoStore.status() as unknown as CampaignBudgetStatus
 	assert.equal(initial.budget.authority, "fleet-v2-readonly")
 	assert.equal(initial.budget.available, false)
 	const coldSnapshot = await new FleetRepositoryBudgetLedger({ expectedKeyIdentity: keyIdentity, scope: scope("repo-a"), invoke: f.invoke }).budgetSnapshotOnly()
@@ -326,7 +394,8 @@ test("cold start reads Fleet budget without a run, then starts, claims, and stop
 	assert.equal(stopped.repositoryCampaigns?.[definition.id]?.epoch, 3)
 	await f.controlStore.finishRun(run!.id, "succeeded", "offline cold-start fixture completed")
 	await repoStore.finish(claim!, { status: "ambiguous" })
-	const final = await repoStore.status() as any
+	const final = await repoStore.status() as unknown as CampaignBudgetStatus
+	assert.ok(final.campaigns[0])
 	assert.equal(final.campaigns[0].enabled, false)
 })
 
@@ -380,8 +449,10 @@ test("Python crash after durable request-start is fail-closed and preserves both
 	await f.store.recoverInterrupted()
 	const result = await f.bindings[id].reconcile(f.grants[id])
 	assert.deepEqual(result.calls.map((row) => row.state), ["ambiguous"])
-	const status = await f.store.status() as any
-	assert.equal(status.jobs.find((job: any) => job.id === f.claims[id].job.id).status, "ambiguous")
+	const status = await f.store.status() as unknown as CampaignBudgetStatus
+	const job = status.jobs.find((item) => item.id === f.claims[id].job.id)
+	assert.ok(job)
+	assert.equal(job.status, "ambiguous")
 	assert.equal(status.budget.ambiguousMicros, 20_000)
 })
 
@@ -402,7 +473,7 @@ test("Node-side no-ack closes its shared lock descriptor and leaves the send res
 	await f.store.recoverInterrupted()
 	const reconciled = await binding.reconcile(f.grants[id])
 	assert.deepEqual(reconciled.calls.map((row) => row.state), ["ambiguous"])
-	const status = await f.store.status() as any
+	const status = await f.store.status() as unknown as CampaignBudgetStatus
 	assert.equal(status.budget.ambiguousMicros, 20_000)
 })
 
@@ -420,8 +491,10 @@ test("immediately rejected fetch is observed during lock acknowledgement and kee
 	release.resolve()
 	await assert.rejects(request, /synthetic fetch failure/)
 	await f.store.recoverInterrupted()
-	const status = await f.store.status() as any
-	assert.equal(status.jobs.find((job: any) => job.id === f.claims[id].job.id).status, "ambiguous")
+	const status = await f.store.status() as unknown as CampaignBudgetStatus
+	const job = status.jobs.find((item) => item.id === f.claims[id].job.id)
+	assert.ok(job)
+	assert.equal(job.status, "ambiguous")
 	assert.equal(status.budget.ambiguousMicros, 20_000)
 })
 
@@ -444,8 +517,9 @@ test("restart reconciliation settles an exact late receipt after Stop and UTC mo
 		invoke: f.invoke, assertDispatchFence: async () => undefined })
 	const result = await recovered.reconcile(f.grants[id], undefined, new Date("2026-11-01T00:00:00Z"))
 	assert.deepEqual(result.calls.map((row) => row.state), ["settled"])
-	const final = await restarted.status(new Date("2026-11-01T00:01:00Z")) as any
-	const settled = final.jobs.find((job: any) => job.id === f.claims[id].job.id)
+	const final = await restarted.status(new Date("2026-11-01T00:01:00Z")) as unknown as CampaignBudgetStatus
+	const settled = final.jobs.find((job) => job.id === f.claims[id].job.id)
+	assert.ok(settled)
 	assert.equal(settled.status, "succeeded")
 	assert.equal(settled.settledMicros, 100)
 	assert.equal(settled.settledTokens, 19)

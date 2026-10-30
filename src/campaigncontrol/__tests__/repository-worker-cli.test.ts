@@ -4,13 +4,18 @@ import * as path from "node:path"
 import { FileEvidenceCollector } from "../../evidence/collector.js"
 import { main } from "../../cli.js"
 import { OpenRouterClient } from "../../llm/openrouter.js"
-import { RSI_MUSE_OPENROUTER_MODEL, startOpenRouterBroker } from "../../rsi/inference-broker.js"
-import type { OpenRouterBrokerLimits, OpenRouterInferenceLedger } from "../../rsi/inference-broker.js"
+import { RSI_MUSE_OPENROUTER_MODEL,
+	startOpenRouterBroker } from "../../rsi/inference-broker.js"
+import type { OpenRouterBrokerLimits,
+	OpenRouterInferenceLedger } from "../../rsi/inference-broker.js"
 
 function brokerLimits(): OpenRouterBrokerLimits {
-	return { campaignId: "fleet-security-watch", maxCalls: 1, maxInputTokensPerCall: 120_000, maxOutputTokensPerCall: 32_768,
-		maxTotalTokens: 160_000, maxDurationMs: 60_000, maxRequestBytes: 2_000_000, maxResponseBytes: 64_000,
-		maxInputPricePerMillionUsd: 1, maxOutputPricePerMillionUsd: 1, maxCallSpendUsd: 1, maxJobSpendUsd: 1, maxCampaignSpendUsd: 1 }
+	return { campaignId: "fleet-security-watch", maxCalls: 1,
+		maxInputTokensPerCall: 120_000, maxOutputTokensPerCall: 32_768,
+		maxTotalTokens: 160_000, maxDurationMs: 60_000, maxRequestBytes: 2_000_000,
+			maxResponseBytes: 64_000,
+		maxInputPricePerMillionUsd: 1, maxOutputPricePerMillionUsd: 1,
+			maxCallSpendUsd: 1, maxJobSpendUsd: 1, maxCampaignSpendUsd: 1 }
 }
 
 async function pickPort(): Promise<number> {
@@ -30,8 +35,12 @@ async function testContainedGuestCliUsesFakeBrokerWithoutRecursiveOpenShell(): P
 	const evidenceDir = path.join(root, "evidence")
 	await fs.mkdir(workspace, { mode: 0o700 }); await fs.chmod(workspace, 0o700)
 	const prior = new Map<string, string | undefined>()
-	const keys = ["HEADLESSCODE_SECURITY_PROFILE", "HEADLESSCODE_EVIDENCE_CONFIG_PATH", "HEADLESSCODE_CONTAINED_PROFILE", "HEADLESSCODE_CONTAINED_PROFILE_SHA256",
-		"HEADLESSCODE_CODE_MODE_BACKEND", "HEADLESSCODE_RSI_INFERENCE_CAPABILITY", "HEADLESSCODE_OPENROUTER_API_KEY", "OPENROUTER_MODEL", "OPENROUTER_BASE_URL", "LLM_PROVIDER", "HEADLESSCODE_CONTROL_ID"]
+	const keys = ["HEADLESSCODE_SECURITY_PROFILE",
+		"HEADLESSCODE_EVIDENCE_CONFIG_PATH", "HEADLESSCODE_CONTAINED_PROFILE",
+			"HEADLESSCODE_CONTAINED_PROFILE_SHA256",
+		"HEADLESSCODE_CODE_MODE_BACKEND", "HEADLESSCODE_RSI_INFERENCE_CAPABILITY",
+			"HEADLESSCODE_OPENROUTER_API_KEY", "OPENROUTER_MODEL",
+				"OPENROUTER_BASE_URL", "LLM_PROVIDER", "HEADLESSCODE_CONTROL_ID"]
 	for (const key of keys) prior.set(key, process.env[key])
 	let collector: FileEvidenceCollector | undefined
 	let broker: Awaited<ReturnType<typeof startOpenRouterBroker>> | undefined
@@ -39,19 +48,23 @@ async function testContainedGuestCliUsesFakeBrokerWithoutRecursiveOpenShell(): P
 	try {
 		const sessionId = "contained-worker-test"
 		const socketPath = path.join(root, "collector.sock")
-		collector = await FileEvidenceCollector.start({ storageDir: evidenceDir, socketPath })
+		collector = await FileEvidenceCollector.start({ storageDir: evidenceDir,
+			socketPath })
 		const evidenceCapability = await collector.authorizeSession(sessionId)
 		const configPath = path.join(root, "runtime.json")
-		await fs.writeFile(configPath, JSON.stringify({ sessionId, socketPath, capability: evidenceCapability,
-			pinnedPublicKey: collector.publicKey, evidenceRequired: true }), { mode: 0o400 })
+		await fs.writeFile(configPath, JSON.stringify({ sessionId, socketPath,
+			capability: evidenceCapability,
+			pinnedPublicKey: collector.publicKey, evidenceRequired: true }),
+				{ mode: 0o400 })
 		await fs.chmod(configPath, 0o400)
 		const events: string[] = []
 		const ledger: OpenRouterInferenceLedger = {
-			async register() { events.push("register"); return Date.now() + 55_000 },
-			async reserve() { events.push("reserve") },
-			async settle() { events.push("settle") },
-			async recordDenial(_grant, status, reason) { events.push(`denial:${status}:${reason}`) },
-			async receipt() { throw new Error("receipt is not needed in the CLI path") },
+			async register(): Promise<number> { events.push("register"); return Date.now() + 55_000 },
+			async reserve(): Promise<void> { events.push("reserve") },
+			async settle(): Promise<void> { events.push("settle") },
+			async recordDenial(_grant, status,
+				reason): Promise<void> { events.push(`denial:${status}:${reason}`) },
+			async receipt(): Promise<never> { throw new Error("receipt is not needed in the CLI path") },
 		}
 		const upstreamFetch = (async (input: string | URL) => {
 			const url = String(input)
