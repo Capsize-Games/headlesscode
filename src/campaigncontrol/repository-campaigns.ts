@@ -1057,7 +1057,17 @@ export class RepositoryCampaignStore {
 			const c = this.campaign(s, id)
 			if (micros < c.settledMicros + c.reservedMicros + c.ambiguousMicros || tokens < c.settledTokens + c.reservedTokens + c.ambiguousTokens) throw new Error("campaign budget is below committed usage")
 			const allocated = Object.values(s.campaigns).reduce((sum, campaign) => ({ micros: sum.micros + campaign.budgetLimitMicros, tokens: sum.tokens + campaign.budgetLimitTokens }), { micros: 0, tokens: 0 })
-			if (authority.mode === "unavailable" || allocated.micros - c.budgetLimitMicros + micros > authority.limitMicros || allocated.tokens - c.budgetLimitTokens + tokens > authority.limitTokens) throw new Error("repository budgets exceed authoritative Fleet allocation or broker authority is unavailable")
+			const repositoryLimits = authority.repositoryLifetime
+			if (authority.mode === "unavailable") throw new Error("authoritative broker budget is unavailable")
+			if (authority.mode === "synthetic-test" && !authority.available) {
+				throw new Error("repository budgets exceed authoritative Fleet allocation or broker authority is unavailable")
+			}
+			if (isFleetAuthority(authority.mode) && (!repositoryLimits || micros > repositoryLimits.limitMicros || tokens > repositoryLimits.limitTokens)) {
+				throw new Error("repository budget exceeds authoritative Fleet per-repository allocation")
+			}
+			if (allocated.micros - c.budgetLimitMicros + micros > authority.limitMicros || allocated.tokens - c.budgetLimitTokens + tokens > authority.limitTokens) {
+				throw new Error("repository budgets exceed authoritative Fleet aggregate allocation")
+			}
 			if (c.budgetLimitMicros !== micros || c.budgetLimitTokens !== tokens) {
 				c.budgetLimitMicros = micros; c.budgetLimitTokens = tokens; c.epoch += 1; this.event(s, id, "budget", now)
 				if (this.isExhausted(c) && c.enabled) { c.enabled = false; c.epoch += 1; this.event(s, id, "budget-exhausted", now) }
@@ -1336,6 +1346,9 @@ export class RepositoryCampaignStore {
 		const missing = missingQualification(definition)
 		const canProvision = snapshotCanProvision(authority)
 		if (!authority.available && !canProvision) missing.push("authoritative-broker-budget")
+		const repositoryLimits = authority.repositoryLifetime
+		if (isFleetAuthority(authority.mode) && (!repositoryLimits || campaign.budgetLimitMicros > repositoryLimits.limitMicros ||
+			campaign.budgetLimitTokens > repositoryLimits.limitTokens)) missing.push("repository-budget-allocation")
 		const allocations = this.aggregateAllocations(state)
 		if (allocations.micros > authority.limitMicros || allocations.tokens > authority.limitTokens) missing.push("aggregate-budget-allocation")
 		const totals = this.aggregateTotals(state)
