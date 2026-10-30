@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto"
-import { CURL_CANDIDATE_TREE_SHA, CURL_FIXED_ADVISORY, CURL_PRIVATE_SOURCE_REVISION,
-	evaluatePinnedCurlCandidate, makeCurlProtectedEvaluationRequest } from "./repository-curl-evaluator.js"
+import { CURL_CANDIDATE_TREE_SHA, CURL_FIXED_ADVISORY,
+	CURL_PRIVATE_SOURCE_REVISION, evaluatePinnedCurlCandidate,
+	makeCurlProtectedEvaluationRequest,
+	type CurlProtectedEvaluationResult } from "./repository-curl-evaluator.js"
 import { buildCurlHistoricalRepairCandidate, type CurlHistoricalRepairCandidate } from "./repository-curl-repair.js"
 import {
 	CURL_REPAIR_CANDIDATE_REVISION, CURL_REPAIR_CANDIDATE_TREE_SHA, CURL_REPAIR_HISTORICAL_BASE,
@@ -67,9 +69,12 @@ export async function evaluateCurlHistoricalRepairCandidate(input: {
 	}
 	const protectedRequest = makeCurlProtectedEvaluationRequest({ campaignId: "curl-maintenance", jobId: input.jobId,
 		advisoryId: CURL_FIXED_ADVISORY, candidateRevision: CURL_PRIVATE_SOURCE_REVISION, candidateTreeSha: CURL_CANDIDATE_TREE_SHA })
-	const protectedResult = await (input.evaluateFixedProof ?? evaluatePinnedCurlCandidate)(protectedRequest)
-	if (!protectedResult.accepted || protectedResult.disposition !== "already-fixed" || protectedResult.reasonCode !== "fixed-proof-verified") {
-		throw new Error("historical Curl repair requires the independently verified fixed regression proof")
+	const protectedResult = await (input.evaluateFixedProof ??
+		evaluatePinnedCurlCandidate)(protectedRequest)
+	if (!protectedResult.accepted ||
+		protectedResult.disposition !== "already-fixed" ||
+		protectedResult.reasonCode !== "fixed-proof-verified") {
+		throw unverifiedProofError(protectedResult)
 	}
 	const receiptBase: Omit<CurlHistoricalRepairReceipt, "evidenceSha256"> = {
 		schemaVersion: 1 as const,
@@ -91,6 +96,14 @@ export async function evaluateCurlHistoricalRepairCandidate(input: {
 			evaluatorEvidenceSha256: protectedResult.evidenceSha256 },
 	}
 	return { ...receiptBase, evidenceSha256: createHash("sha256").update(canonical(receiptBase)).digest("hex") }
+}
+
+function unverifiedProofError(
+	result: CurlProtectedEvaluationResult,
+): Error {
+	return new Error("historical Curl repair requires " +
+		"the independently verified fixed regression proof " +
+		`(${result.disposition}/${result.reasonCode})`)
 }
 
 function canonical(value: unknown): string {

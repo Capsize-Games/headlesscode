@@ -56,6 +56,18 @@ async function historicalReceiptRequiresAnAcceptedProtectedProofAdapter(): Promi
 			evidenceSha256: "b".repeat(64), reasonCode: "proof-invalid" }) }), /independently verified fixed regression proof/)
 }
 
+async function rejectedProofReportsItsDisposition(): Promise<void> {
+	const candidate = await buildCurlHistoricalRepairTestFixture()
+	await assert.rejects(evaluateCurlHistoricalRepairCandidate({
+		candidate, jobId: "repair-fixture-004",
+		buildCandidate: async () => candidate,
+		evaluateFixedProof: async () => ({ schemaVersion: 1,
+			accepted: false, disposition: "blocked",
+			evidenceSha256: "b".repeat(64),
+			reasonCode: "proof-invalid" }),
+	}), /fixed regression proof \(blocked\/proof-invalid\)/)
+}
+
 async function alteredPatchCannotBorrowProtectedProof(): Promise<void> {
 	const candidate = await buildCurlHistoricalRepairTestFixture()
 	let calls = 0
@@ -121,6 +133,7 @@ async function syntheticRepairPipelineNeverStartsAModelWorker(): Promise<void> {
 const tests: readonly SuiteTest[] = [
 	["offline fixture encodes only the pinned historical b31-to-c24 source patch", offlineFixtureEncodesThePinnedHistoricalSourcePatch],
 	["historical receipt requires an accepted protected-proof adapter", historicalReceiptRequiresAnAcceptedProtectedProofAdapter],
+	["rejected proof reports its disposition and reason", rejectedProofReportsItsDisposition],
 	["modified Curl patches cannot borrow the protected proof", alteredPatchCannotBorrowProtectedProof],
 	["synthetic historical repair pipeline has no model worker and measures zero usage", syntheticRepairPipelineNeverStartsAModelWorker],
 ]
