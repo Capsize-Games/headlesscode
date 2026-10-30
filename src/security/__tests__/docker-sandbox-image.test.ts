@@ -20,20 +20,31 @@ function container(id: string, role: string, name: string, image = imageId, conf
 }
 
 function runWith(containers: unknown[], localId = imageId, localRef = imageRef): (args: string[], _timeout: number, _max: number) => DockerCommandResult {
-	const ids = containers.map((entry) => (entry as { Id: string }).Id)
+	const matchesLabels = (entry: unknown) => {
+		const labels = (entry as { Config?: { Labels?: Record<string, unknown> } }).Config?.Labels
+		return labels?.["openshell.ai/sandbox-id"] === sandboxId && labels?.["openshell.ai/sandbox-name"] === sandboxName && labels?.["openshell.ai/isolation-role"] === "sandbox"
+	}
+	const matching = containers.filter(matchesLabels)
+	const ids = matching.map((entry) => (entry as { Id: string }).Id)
 	return (args) => {
-		if (args[0] === "ps") return { status: 0, stdout: `${ids.join("\n")}\n` }
-		if (args[0] === "inspect") return { status: 0, stdout: JSON.stringify(containers) }
+		if (args[0] === "ps") {
+			assert.deepEqual(args, ["ps", "-aq", "--no-trunc", "--filter", `label=openshell.ai/sandbox-id=${sandboxId}`,
+				"--filter", `label=openshell.ai/sandbox-name=${sandboxName}`, "--filter", "label=openshell.ai/isolation-role=sandbox"])
+			return { status: 0, stdout: `${ids.join("\n")}${ids.length ? "\n" : ""}` }
+		}
+		if (args[0] === "inspect") return { status: 0, stdout: JSON.stringify(matching.filter((entry) => ids.includes((entry as { Id: string }).Id))) }
 		if (args[0] === "image" && args[1] === "inspect" && args[2] === localRef) return { status: 0, stdout: JSON.stringify([{ Id: localId }]) }
 		return { status: 1, stdout: "" }
 	}
 }
 
 const tests: Array<[string, () => void]> = [
-	["matches the exact workload labels and role, excluding the supervisor", () => {
+	["filters Docker to exact workload labels before inspecting only matching IDs", () => {
 		const result = inspectLocalDockerSandboxImage(expectation, runWith([
 			container(supervisorId, "supervisor", "supervisor", `sha256:${"d".repeat(64)}`),
 			container(workloadId, "sandbox", "workload"),
+			{ ...container("3".repeat(64), "sandbox", "unrelated", `sha256:${"e".repeat(64)}`),
+				Config: { Image: imageId, Labels: { "openshell.ai/sandbox-id": sandboxId, "openshell.ai/sandbox-name": "other-sandbox", "openshell.ai/isolation-role": "sandbox" } } },
 		]),)
 		assert.equal(result.imageId, imageId)
 		assert.equal(result.configImage, imageId)
@@ -45,11 +56,17 @@ const tests: Array<[string, () => void]> = [
 		const result = inspectLocalDockerSandboxImage(expectation, runWith([container(workloadId, "sandbox", "workload", imageId, imageRef)]))
 		assert.equal(result.configImage, imageRef)
 	}],
-	["rejects missing or mismatched sandbox labels and role", () => {
+	["revalidates exact labels after Docker filtering", () => {
 		for (const candidate of [
 			{ ...container(workloadId, "sandbox", "workload"), Config: { Image: imageId, Labels: { "openshell.ai/sandbox-id": sandboxId, "openshell.ai/sandbox-name": "other", "openshell.ai/isolation-role": "sandbox" } } },
 			container(workloadId, "supervisor", "workload"),
-		]) assert.throws(() => inspectLocalDockerSandboxImage(expectation, runWith([candidate])), /no local Docker workload/)
+		]) {
+			const runner = (args: string[]) => args[0] === "ps"
+				? { status: 0, stdout: `${workloadId}\n` }
+				: args[0] === "inspect" ? { status: 0, stdout: JSON.stringify([candidate]) }
+					: { status: 1, stdout: "" }
+			assert.throws(() => inspectLocalDockerSandboxImage(expectation, runner), /no local Docker workload/)
+		}
 	}],
 	["rejects duplicate workload matches", () => {
 		assert.throws(() => inspectLocalDockerSandboxImage(expectation, runWith([
@@ -65,7 +82,7 @@ const tests: Array<[string, () => void]> = [
 		assert.throws(() => inspectLocalDockerSandboxImage(expectation, runWith([container(workloadId, "sandbox", "workload", imageId, imageId, 2_000_000_000, 8 * 1024 ** 3)])), /CPU or memory limit/)
 	}],
 	["fails closed when local inspection is unavailable, malformed, or over bounds", () => {
-		assert.throws(() => inspectLocalDockerSandboxImage(expectation, () => ({ status: 1, stdout: "" })), /enumerate local Docker/)
+		assert.throws(() => inspectLocalDockerSandboxImage(expectation, () => ({ status: 1, stdout: "" })), /enumerate matching local Docker/)
 		assert.throws(() => inspectLocalDockerSandboxImage(expectation, (args) => args[0] === "ps" ? { status: 0, stdout: `${"f".repeat(64)}\n` } : { status: 0, stdout: "{}" }), /was not a JSON array/)
 		assert.throws(() => inspectLocalDockerSandboxImage(expectation, (args) => args[0] === "ps" ? { status: 0, stdout: Array.from({ length: 201 }, () => "a".repeat(64)).join("\n") } : { status: 0, stdout: "[]" }), /verification bound/)
 	}],

@@ -33,16 +33,21 @@ export function inspectLocalDockerSandboxImage(
 	run: DockerCommandRunner = runLocalDocker,
 ): DockerSandboxImageEvidence {
 	validateExpectation(expectation)
-	const idsResult = run(["ps", "-aq", "--no-trunc"], 10_000, 256 * 1024)
-	if (idsResult.error || idsResult.status !== 0) throw new Error("could not enumerate local Docker containers for OpenShell identity verification")
+	const idsResult = run([
+		"ps", "-aq", "--no-trunc",
+		"--filter", `label=openshell.ai/sandbox-id=${expectation.sandboxId}`,
+		"--filter", `label=openshell.ai/sandbox-name=${expectation.sandboxName}`,
+		"--filter", "label=openshell.ai/isolation-role=sandbox",
+	], 10_000, 256 * 1024)
+	if (idsResult.error || idsResult.status !== 0) throw new Error("could not enumerate matching local Docker workload containers for OpenShell identity verification")
 	const ids = idsResult.stdout.split(/\r?\n/).filter(Boolean)
 	if (ids.length > MAX_CONTAINERS || ids.some((id) => !/^[a-f0-9]{64}$/i.test(id))) throw new Error("local Docker container list is invalid or exceeds the verification bound")
 	const inspected = ids.length ? run(["inspect", ...ids], 20_000, MAX_OUTPUT_BYTES) : { status: 0, stdout: "[]" }
-	if (inspected.error || inspected.status !== 0) throw new Error("could not inspect local Docker sandbox identities")
-	const containers = parseJsonArray(inspected.stdout, "local Docker container inspection")
-	if (containers.length !== ids.length) throw new Error("local Docker returned an incomplete container identity set")
+	if (inspected.error || inspected.status !== 0) throw new Error("could not inspect matching local Docker workload identities")
+	const containers = parseJsonArray(inspected.stdout, "matching local Docker workload inspection")
+	if (containers.length !== ids.length) throw new Error("local Docker returned an incomplete workload identity set")
 	const matching = containers.filter((container) => isOpenShellWorkload(container, expectation))
-	if (matching.length !== 1) throw new Error(matching.length ? "multiple local Docker workload containers match the OpenShell sandbox" : "no local Docker workload container matches the OpenShell sandbox")
+	if (matching.length !== 1) throw new Error(matching.length ? "multiple local Docker workload containers match the OpenShell sandbox" : "no local Docker workload container matches the OpenShell sandbox labels")
 	const workload = matching[0]!
 	const localImage = run(["image", "inspect", expectation.image], 10_000, 1024 * 1024)
 	if (localImage.error || localImage.status !== 0) throw new Error("pinned contained image is unavailable in the local Docker image store")
