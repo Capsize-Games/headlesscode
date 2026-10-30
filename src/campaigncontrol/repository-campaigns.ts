@@ -555,7 +555,7 @@ function monthlyUsageBelowLimit(usage: { settledMicros: number; reservedMicros: 
 
 function snapshotProvisionAdmission(authority: RepositoryBudgetAuthority): boolean {
 	return authority.mode === "fleet-v2-readonly" && authority.snapshotOnly === true && authority.globalEnabled === true &&
-		authority.canAdmit === true && authority.repositoryEnabled === true
+		authority.canAdmit === true
 }
 
 function snapshotProvisionBudget(authority: RepositoryBudgetAuthority): boolean {
@@ -988,6 +988,7 @@ export class RepositoryCampaignStore {
 		return {
 			month: state.month,
 			budget: { authority: authority.mode, adapter: authority.mode === "fleet-v2-readonly" ? authority.mode : authority.available ? authority.mode : "none", available: authority.available,
+				provisioningAvailable: snapshotCanProvision(authority),
 				limitMicros: authority.limitMicros, limitTokens: authority.limitTokens, externalCommittedMicros: authority.committedMicros,
 				externalCommittedTokens: authority.committedTokens, ...totals,
 				...(authority.monthly ? { monthly: authority.monthly } : {}),

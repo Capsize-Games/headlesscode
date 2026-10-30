@@ -185,8 +185,8 @@ interface Fixture {
 }
 
 type CampaignBudgetStatus = {
-	budget: { ambiguousMicros: number; settledMicros: number; settledTokens: number; reservedMicros: number; authority: string; available: boolean }
-	campaigns: Array<{ enabled: boolean }>
+	budget: { ambiguousMicros: number; settledMicros: number; settledTokens: number; reservedMicros: number; authority: string; available: boolean; provisioningAvailable: boolean }
+	campaigns: Array<{ enabled: boolean; readiness: string }>
 	jobs: Array<RepositoryCampaignJob & { settledMicros: number; settledTokens: number }>
 }
 
@@ -371,11 +371,20 @@ test("cold start reads Fleet budget without a run, then starts, claims, and stop
 	const initial = await repoStore.status() as unknown as CampaignBudgetStatus
 	assert.equal(initial.budget.authority, "fleet-v2-readonly")
 	assert.equal(initial.budget.available, false)
+	assert.equal(initial.budget.provisioningAvailable, true,
+		"a validated read-only snapshot may provision while this repository is disabled")
 	const coldSnapshot = await new FleetRepositoryBudgetLedger({ expectedKeyIdentity: keyIdentity, scope: scope("repo-a"), invoke: f.invoke }).budgetSnapshotOnly()
 	assert.equal(coldSnapshot.snapshotOnly, true)
 	assert.equal(coldSnapshot.runId, null)
 	assert.equal(coldSnapshot.runExpiresAtMs, null)
 	await repoStore.setCampaignBudget(definition.id, 10_000, 10_000)
+	await repoStore.enqueue(definition.id, "CVE-2026-92390")
+	await assert.rejects(repoStore.claimNext(definition.id, { micros: 10_000, tokens: 10_000 }, new Date(), { executionKind: "live-cve" }),
+		/require authoritative Fleet v2 registration/)
+	const readyForStart = await repoStore.status() as unknown as CampaignBudgetStatus
+	assert.equal(readyForStart.campaigns[0]?.enabled, false)
+	assert.equal(readyForStart.campaigns[0]?.readiness, "ready",
+		"the read-only snapshot clears the budget prerequisite before Start")
 	const global = await f.controlStore.snapshot()
 	const run = await f.controlStore.beginAdmittedRunIfIdle(new Date(), 300_000, global.epoch)
 	assert.ok(run, "cold Start acquires a fresh bounded global run")
@@ -384,7 +393,6 @@ test("cold start reads Fleet budget without a run, then starts, claims, and stop
 	const runBound = await readAuthority()
 	assert.equal(runBound.mode, "fleet-v2")
 	assert.equal(runBound.runId, run!.id)
-	await repoStore.enqueue(definition.id, "CVE-2026-92390")
 	const claim = await repoStore.claimNext(definition.id, { micros: 10_000, tokens: 10_000 }, new Date(), { executionKind: "live-cve" })
 	assert.ok(claim, "one claim is admitted only with the real active run and repository epoch")
 	await repoStore.stop(definition.id)
@@ -397,6 +405,27 @@ test("cold start reads Fleet budget without a run, then starts, claims, and stop
 	const final = await repoStore.status() as unknown as CampaignBudgetStatus
 	assert.ok(final.campaigns[0])
 	assert.equal(final.campaigns[0].enabled, false)
+})
+
+test("read-only snapshot permits budget changes for an enabled repository but never dispatches", { skip: integrationSkip }, async (t) => {
+	const f = await fixture({ activeRun: false, repositoryEnabled: true }); t.after(f.cleanup)
+	const definition = definitions[0]!
+	const readAuthority = async (): Promise<RepositoryBudgetAuthority> => {
+		const ledger = new FleetRepositoryBudgetLedger({ expectedKeyIdentity: keyIdentity,
+			scope: scope("repo-a"), invoke: f.invoke })
+		return ledger.budgetSnapshotOnly()
+	}
+	const repoStore = new RepositoryCampaignStore(path.join(f.root, "readonly-enabled.json"), [definition], readAuthority)
+	await repoStore.setCampaignBudget(definition.id, 10_000, 10_000)
+	await repoStore.start(definition.id)
+	const before = await repoStore.status() as unknown as CampaignBudgetStatus
+	assert.equal(before.budget.available, false)
+	assert.equal(before.budget.provisioningAvailable, true)
+	assert.equal(before.campaigns[0]?.enabled, true)
+	await repoStore.setCampaignBudget(definition.id, 9_000, 9_000)
+	await repoStore.enqueue(definition.id, "CVE-2026-92390")
+	await assert.rejects(repoStore.claimNext(definition.id, { micros: 1_000, tokens: 1_000 }, new Date(), { executionKind: "live-cve" }),
+		/require authoritative Fleet v2 registration/)
 })
 
 test("Stop changes to either epoch before the dual request-start fence prevent the HTTP callback", { skip: integrationSkip }, async (t) => {
