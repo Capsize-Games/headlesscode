@@ -71,6 +71,29 @@ export interface FleetRepositoryNoCallProof {
 	grant: null | { issuedAtMs: number; deadlineAtMs: number; grantSha256: string; runId: string; controlEpoch: number }
 }
 
+export interface FleetRepositoryClosedSessionProof {
+	schemaVersion: 1
+	campaignId: typeof FLEET_BUDGET_CAMPAIGN_ID
+	repositoryCampaignId: string
+	repositoryId: string
+	repository: string
+	sourceRevision: string
+	policySha256: string
+	repositoryEpoch: number
+	model: string
+	profileId: string
+	keyIdentity: string
+	jobId: string
+	asOfMs: number
+	grant: { grantSha256: string; runId: string; controlEpoch: number; issuedAtMs: number; deadlineAtMs: number; limits: Record<string, unknown> }
+	calls: Array<{ callId: string; attemptId: string; requestSha256: string; reservedMicros: number; reservedTokens: number;
+		actualMicros: number; actualTokens: number; settlement: Record<string, unknown> }>
+	denials: Array<{ statusCode: number; reason: OpenRouterDenialReason; count: number }>
+	settledMicros: number
+	settledTokens: number
+	proofSha256: string
+}
+
 export interface FleetRepositoryBudgetSnapshot {
 	mode: "fleet-v2" | "fleet-v2-readonly"
 	available: boolean
@@ -270,6 +293,64 @@ export class FleetRepositoryBudgetLedger implements OpenRouterInferenceLedger {
 			disposition: disposition,
 			asOfMs: Number(result.asOfMs), jobId, counts: counts as FleetRepositoryNoCallProof["counts"],
 			grant: grant as FleetRepositoryNoCallProof["grant"] }
+	}
+
+	/** Verify the independent read-only ledger proof for the exact closed two-call Curl qualification session. */
+	async proveClosedCurlQualificationSession(jobId: string, repositoryEpoch: number): Promise<FleetRepositoryClosedSessionProof> {
+		if (this.scope.repositoryCampaignId !== "curl-maintenance" || this.scope.model !== MODEL || this.scope.profileId !== PROFILE ||
+			!ID.test(jobId) || !Number.isSafeInteger(repositoryEpoch) || repositoryEpoch < 0 || repositoryEpoch !== this.scope.repositoryEpoch) {
+			throw new Error("closed-session proof is outside the fixed Curl qualification scope")
+		}
+		const result = await this.call({ schemaVersion: 2, op: "repository-closed-session-proof", campaignId: FLEET_BUDGET_CAMPAIGN_ID,
+			repositoryCampaignId: this.scope.repositoryCampaignId, repositoryId: this.scope.repositoryId, repository: this.scope.repository,
+			sourceRevision: this.scope.sourceRevision, policySha256: this.scope.policySha256, model: this.scope.model,
+			profileId: this.scope.profileId, keyIdentity: this.expectedKeyIdentity, repositoryEpoch, jobId })
+		const required = "asOfMs,calls,campaignId,denials,grant,jobId,keyIdentity,model,policySha256,profileId,proofSha256,repository,repositoryCampaignId,repositoryEpoch,repositoryId,schemaVersion,settledMicros,settledTokens,sourceRevision"
+		if (Object.keys(result).sort().join(",") !== required || result.schemaVersion !== 1 || result.campaignId !== FLEET_BUDGET_CAMPAIGN_ID ||
+			result.repositoryCampaignId !== this.scope.repositoryCampaignId || result.repositoryId !== this.scope.repositoryId ||
+			result.repository !== this.scope.repository || result.sourceRevision !== this.scope.sourceRevision ||
+			result.policySha256 !== this.scope.policySha256 || result.repositoryEpoch !== repositoryEpoch ||
+			result.model !== MODEL || result.profileId !== PROFILE || result.keyIdentity !== this.expectedKeyIdentity || result.jobId !== jobId ||
+			!Number.isSafeInteger(result.asOfMs) || Date.now() - Number(result.asOfMs) > 60_000 || Number(result.asOfMs) > Date.now() + 60_000 ||
+			!HEX.test(String(result.proofSha256))) throw new Error("Fleet closed-session proof identity is invalid or stale")
+		if (sha256Canonical(withoutField(result, "proofSha256")) !== result.proofSha256) throw new Error("Fleet closed-session proof digest is forged")
+		const expectedLimits = { maxCalls: 2, maxInputTokensPerCall: 32_000, maxOutputTokensPerCall: 4_000, maxTotalTokens: 72_000,
+			maxDurationMs: 300_000, maxRequestBytes: 32_768, maxResponseBytes: 65_536, maxInputPricePerMillionUsd: "0.1",
+			maxOutputPricePerMillionUsd: "0.2", maxCallSpendUsd: 4_000, maxJobSpendUsd: 8_000, maxCampaignSpendUsd: 20_000 }
+		const grant = result.grant
+		if (!isRecord(grant) || Object.keys(grant).sort().join(",") !== "controlEpoch,deadlineAtMs,grantSha256,issuedAtMs,limits,runId" ||
+			!HEX.test(String(grant.grantSha256)) || !ID.test(String(grant.runId)) || !Number.isSafeInteger(grant.controlEpoch) ||
+			Number(grant.controlEpoch) < 0 || !Number.isSafeInteger(grant.issuedAtMs) || !Number.isSafeInteger(grant.deadlineAtMs) ||
+			Number(grant.issuedAtMs) < 0 || Number(grant.issuedAtMs) >= Number(grant.deadlineAtMs) ||
+			Number(grant.deadlineAtMs) > Number(grant.issuedAtMs) + 300_000 || Number(grant.deadlineAtMs) > Number(result.asOfMs) ||
+			!isRecord(grant.limits) || canonicalJson(grant.limits) !== canonicalJson(expectedLimits)) {
+			throw new Error("Fleet closed-session grant is active or outside the fixed call ceiling")
+		}
+		if (!Array.isArray(result.calls) || result.calls.length !== 2 || !Array.isArray(result.denials) || result.denials.length !== 1 ||
+			!isRecord(result.denials[0]) || Object.keys(result.denials[0]).sort().join(",") !== "count,reason,statusCode" ||
+			result.denials[0].statusCode !== 429 || result.denials[0].reason !== "budget-or-fence" || result.denials[0].count !== 1) {
+			throw new Error("Fleet closed-session proof does not show the exact pre-forward cap denial")
+		}
+		const calls = result.calls.map((value) => {
+			if (!isRecord(value) || Object.keys(value).sort().join(",") !== "actualMicros,actualTokens,attemptId,callId,requestSha256,reservedMicros,reservedTokens,settlement" ||
+				!ID.test(String(value.callId)) || !ID.test(String(value.attemptId)) || !HEX.test(String(value.requestSha256)) ||
+				value.reservedMicros !== 4_000 || !Number.isSafeInteger(value.reservedTokens) || Number(value.reservedTokens) < 1 || Number(value.reservedTokens) > 36_000 ||
+				!Number.isSafeInteger(value.actualMicros) || Number(value.actualMicros) < 0 || Number(value.actualMicros) > Number(value.reservedMicros) ||
+				!Number.isSafeInteger(value.actualTokens) || Number(value.actualTokens) < 0 || Number(value.actualTokens) > Number(value.reservedTokens) ||
+				!isRecord(value.settlement) || !validClosedSessionSettlement(value.settlement, Number(value.actualMicros), Number(value.actualTokens), Number(value.reservedTokens))) {
+				throw new Error("Fleet closed-session proof contains an unsettled or mismatched call")
+			}
+			return value as unknown as FleetRepositoryClosedSessionProof["calls"][number]
+		})
+		if (new Set(calls.map((call) => call.callId)).size !== 2 || new Set(calls.map((call) => call.attemptId)).size !== 2) {
+			throw new Error("Fleet closed-session call identities are duplicated")
+		}
+		const settledMicros = calls.reduce((sum, call) => sum + call.actualMicros, 0)
+		const settledTokens = calls.reduce((sum, call) => sum + call.actualTokens, 0)
+		if (settledMicros > 8_000 || settledTokens > 72_000 || result.settledMicros !== settledMicros || result.settledTokens !== settledTokens) {
+			throw new Error("Fleet closed-session aggregate usage does not match its exact call receipts")
+		}
+		return result as unknown as FleetRepositoryClosedSessionProof
 	}
 
 	private async readBudgetSnapshot(op: "repository-budget-status" | "repository-budget-snapshot"): Promise<FleetRepositoryBudgetSnapshot> {
@@ -511,6 +592,40 @@ async function invokeRequestStartHandoff(message: Record<string, unknown>, optio
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value)
+}
+
+function canonicalJson(value: unknown): string {
+	if (value === null || typeof value !== "object") return JSON.stringify(value)
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`
+	return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+		.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`
+}
+
+function sha256Canonical(value: unknown): string {
+	return createHash("sha256").update(canonicalJson(value)).digest("hex")
+}
+
+function withoutField(value: Record<string, unknown>, field: string): Record<string, unknown> {
+	return Object.fromEntries(Object.entries(value).filter(([key]) => key !== field))
+}
+
+function validClosedSessionSettlement(value: Record<string, unknown>, actualMicros: number, actualTokens: number, reservedTokens: number): boolean {
+	const keys = Object.keys(value).sort().join(",")
+	const required = ["completedAt", "costUsd", "completionTokens", "promptTokens", "providerRequestId", "qualified", "responseSha256", "returnedModel", "returnedProvider", "state"].sort().join(",")
+	const optionalCached = keys === [...required.split(","), "cachedPromptTokens"].sort().join(",")
+	if (keys !== required && !optionalCached) return false
+	const prompt = value.promptTokens, completion = value.completionTokens, cost = value.costUsd
+	const tokenFields = Number.isSafeInteger(prompt) && Number(prompt) >= 0 && Number(prompt) <= 32_000 &&
+		Number.isSafeInteger(completion) && Number(completion) >= 0 && Number(completion) <= 4_000 &&
+		Number(prompt) + Number(completion) === actualTokens && actualTokens <= reservedTokens
+	const cached = value.cachedPromptTokens === undefined || (Number.isSafeInteger(value.cachedPromptTokens) &&
+		Number(value.cachedPromptTokens) >= 0 && Number(value.cachedPromptTokens) <= Number(prompt))
+	const costValid = typeof cost === "number" && Number.isFinite(cost) && cost >= 0 &&
+		Math.ceil(cost * 1_000_000 - 1e-9) === actualMicros && actualMicros <= 4_000
+	return value.state === "complete" && value.qualified === true && typeof value.returnedModel === "string" && RETURNED_MODELS.has(value.returnedModel) &&
+		value.returnedProvider === "meta" && typeof value.providerRequestId === "string" && value.providerRequestId.length > 0 &&
+		value.providerRequestId.length <= 256 && HEX.test(String(value.responseSha256)) &&
+		typeof value.completedAt === "string" && Number.isFinite(Date.parse(value.completedAt)) && tokenFields && cached && costValid
 }
 
 function isUsage(value: unknown, includeLimits: boolean): value is Record<string, unknown> {

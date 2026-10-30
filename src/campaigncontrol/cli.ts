@@ -18,6 +18,7 @@ import { evaluateCurlHistoricalRepairCandidate } from "./repository-curl-repair-
 import { readFleetBudgetKeyIdentity } from "../rsi/fleet-budget-ledger.js"
 import { FleetRepositoryBudgetLedger } from "../rsi/fleet-repository-budget-ledger.js"
 import { recoverAmbiguousPrepareWithNoCallProof, verifyRecoveredNoCallArtifact } from "./repository-no-call-recovery.js"
+import { reconcileClosedCurlQualificationBilling } from "./repository-partial-billing-recovery.js"
 
 function parseBudget(dollars: string): number | undefined {
 	if (!/^(?:0|[1-9]\d*)(?:\.\d{1,6})?$/.test(dollars)) return undefined
@@ -27,12 +28,12 @@ function parseBudget(dollars: string): number | undefined {
 }
 
 function usage(): string {
-	return "Usage: headlesscode campaign <status|rsi|on|off|budget --usd <amount>|tick|serve|qualify-known curl-maintenance CVE-2026-92390 --purpose=qualification|retry-no-call curl-maintenance <failed-job-id> --confirm-retry-no-call=<failed-job-id>|repair-known curl-historical-repair CVE-2026-92390 --purpose=repair|retry-repair curl-historical-repair <failed-job-id> --confirm-retry-repair=<failed-job-id>|recover-no-call curl-maintenance <job-id> --confirm-no-call-proof=<job-id>> [--json]"
+	return "Usage: headlesscode campaign <status|rsi|on|off|budget --usd <amount>|tick|serve|qualify-known curl-maintenance CVE-2026-92390 --purpose=qualification|retry-no-call curl-maintenance <failed-job-id> --confirm-retry-no-call=<failed-job-id>|repair-known curl-historical-repair CVE-2026-92390 --purpose=repair|retry-repair curl-historical-repair <failed-job-id> --confirm-retry-repair=<failed-job-id>|recover-no-call curl-maintenance <job-id> --confirm-no-call-proof=<job-id>|reconcile-paid-qualification curl-maintenance <job-id> --confirm-partial-billing=<job-id>> [--json]"
 }
 
 export async function campaignMain(args: string[]): Promise<number> {
 	const [action, ...rest] = args
-	if (!action || !["status", "rsi", "on", "off", "budget", "tick", "serve", "qualify-known", "retry-no-call", "repair-known", "retry-repair", "recover-no-call", "_apply", "_adapter-tick", "_repository-run-begin", "_repository-run-finish", "_repository-lock-hold"].includes(action)) {
+	if (!action || !["status", "rsi", "on", "off", "budget", "tick", "serve", "qualify-known", "retry-no-call", "repair-known", "retry-repair", "recover-no-call", "reconcile-paid-qualification", "_apply", "_adapter-tick", "_repository-run-begin", "_repository-run-finish", "_repository-lock-hold"].includes(action)) {
 		process.stderr.write(`${usage()}\n`)
 		return 2
 	}
@@ -235,6 +236,39 @@ export async function campaignMain(args: string[]): Promise<number> {
 			return 0
 		} catch (error) {
 			process.stderr.write(`headlesscode campaign: ${error instanceof Error ? error.message : "no-call recovery failed closed"}\n`)
+			return 1
+		}
+	}
+	if (action === "reconcile-paid-qualification") {
+		if (positional.length !== 3 || positional[0] !== CURL_CAMPAIGN_ID ||
+			!/^([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i.test(positional[1]!) ||
+			positional[2] !== `--confirm-partial-billing=${positional[1]}`) return 2
+		try {
+			const definitions = await loadRepositoryCampaignDefinitions(REPOSITORY_CAMPAIGN_REGISTRY_FILE)
+			const definition = definitions.find((item) => item.id === CURL_CAMPAIGN_ID)
+			if (!definition) throw new Error("billing reconciliation requires the owner-registered Curl qualification")
+			const readAuthority = createRepositoryBudgetAuthorityReader(definitions, CAMPAIGN_CONTROL_FILE)
+			const authority = await readAuthority(CURL_CAMPAIGN_ID)
+			if (!((authority.mode === "fleet-v2" || authority.mode === "fleet-v2-readonly") && authority.repositoryCampaignId === definition.id &&
+				authority.repositoryId === definition.repositoryId && authority.repository === definition.repository &&
+				authority.sourceRevision === definition.sourceRevision && authority.policySha256 === definition.policySha256 &&
+				authority.model === definition.model && authority.profileId === "muse-spark-contributor" && Number.isSafeInteger(authority.repositoryEpoch))) {
+				throw new Error("fresh Fleet Curl scope is unavailable for billing reconciliation")
+			}
+			const scope = { repositoryCampaignId: definition.id, repositoryId: definition.repositoryId!, repository: definition.repository!,
+				sourceRevision: definition.sourceRevision!, policySha256: definition.policySha256!, model: definition.model as "meta/muse-spark-1.3-contributor",
+				profileId: "muse-spark-contributor" as const, repositoryEpoch: authority.repositoryEpoch! }
+			const expectedKeyIdentity = await readFleetBudgetKeyIdentity()
+			const ledger = new FleetRepositoryBudgetLedger({ expectedKeyIdentity, scope })
+			const repositoryStore = new RepositoryCampaignStore(REPOSITORY_CAMPAIGN_STATE_FILE, definitions, readAuthority)
+			const result = await reconcileClosedCurlQualificationBilling(positional[1]!, `CONFIRM SETTLE PARTIAL QUALIFICATION ${positional[1]}`, {
+				store: repositoryStore, controlStore: new CampaignControlStore(CAMPAIGN_CONTROL_FILE), ledger, definition, scope,
+				expectedKeyIdentity, storePath: REPOSITORY_CAMPAIGN_STATE_FILE,
+			})
+			process.stdout.write(`${JSON.stringify({ reconciliation: "closed-session-billing-proof", qualification: "unqualified", ...result })}\n`)
+			return 0
+		} catch (error) {
+			process.stderr.write(`headlesscode campaign: ${error instanceof Error ? error.message : "partial billing reconciliation failed closed"}\n`)
 			return 1
 		}
 	}

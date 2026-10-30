@@ -24,7 +24,7 @@ export type RepositoryCampaignStep = typeof REPOSITORY_CAMPAIGN_STEPS[number]
 
 export interface RepositoryEvidenceRef {
 	id: string
-	kind: "intake" | "candidate" | "test-receipt" | "delivery" | "diagnostic" | "no-call-proof"
+	kind: "intake" | "candidate" | "test-receipt" | "delivery" | "diagnostic" | "no-call-proof" | "billing-proof"
 	label: string
 }
 
@@ -130,7 +130,8 @@ type RepositoryProgressUpdate = {
 }
 type RepositoryFinishProgress = { currentTask?: string; blocker?: string | null; nextStep?: string | null; boardRef?: string | null }
 type RepositoryFinishResult = { status: "succeeded" | "failed" | "ambiguous"; actualMicros?: number; actualTokens?: number; progress?: RepositoryFinishProgress }
-type RecoveredFinishResult = { status: "succeeded" | "failed"; actualMicros: number; actualTokens: number; proofSha256?: string }
+type RecoveredFinishResult = { status: "succeeded" | "failed"; actualMicros: number; actualTokens: number;
+	proofSha256?: string; proofKind?: "no-call-proof" | "billing-proof" }
 
 export interface RepositoryAdvisoryIntakeRecord {
 	campaignId: string
@@ -561,7 +562,7 @@ function validProgressTimesAndNotes(p: RepositoryJobProgress): boolean {
 function validProgressEvidence(p: RepositoryJobProgress): boolean {
 	return Array.isArray(p.evidenceRefs) && p.evidenceRefs.length <= 20 && p.evidenceRefs.every((item) => item &&
 		Object.keys(item).sort().join(",") === "id,kind,label" && /^[a-f0-9]{64}$/.test(item.id) &&
-		["intake", "candidate", "test-receipt", "delivery", "diagnostic", "no-call-proof"].includes(item.kind) &&
+		["intake", "candidate", "test-receipt", "delivery", "diagnostic", "no-call-proof", "billing-proof"].includes(item.kind) &&
 		typeof item.label === "string" && item.label.length > 0 && item.label.length <= 80)
 }
 
@@ -837,7 +838,7 @@ function validProgressUpdateSteps(patch: RepositoryProgressUpdate): boolean {
 function validProgressUpdateEvidence(refs: RepositoryEvidenceRef[] | undefined): boolean {
 	if (refs === undefined) return true
 	return Array.isArray(refs) && refs.length <= 20 && refs.every((ref) => ref && /^[a-f0-9]{64}$/.test(ref.id) &&
-		["intake", "candidate", "test-receipt", "delivery", "diagnostic", "no-call-proof"].includes(ref.kind) && typeof ref.label === "string" && !!ref.label.trim() && ref.label.length <= 80)
+		["intake", "candidate", "test-receipt", "delivery", "diagnostic", "no-call-proof", "billing-proof"].includes(ref.kind) && typeof ref.label === "string" && !!ref.label.trim() && ref.label.length <= 80)
 }
 
 function validOptionalUpdateText(value: unknown, allowNull: boolean): boolean {
@@ -882,7 +883,9 @@ function validFinishResult(claim: ClaimedRepositoryJob, result: RepositoryFinish
 function validRecoveredFinish(claim: ClaimedRepositoryJob, result: RecoveredFinishResult): boolean {
 	return !!claim && !!claim.job && ["succeeded", "failed"].includes(result.status) &&
 		[result.actualMicros, result.actualTokens].every((n) => Number.isSafeInteger(n) && n >= 0) &&
-		(result.proofSha256 === undefined || /^[a-f0-9]{64}$/.test(result.proofSha256))
+		(result.proofSha256 === undefined || /^[a-f0-9]{64}$/.test(result.proofSha256)) &&
+		(result.proofKind === undefined || result.proofKind === "no-call-proof" || result.proofKind === "billing-proof") &&
+		(result.proofKind === undefined || result.proofSha256 !== undefined)
 }
 
 async function invokeClaimStart<T>(start: () => Promise<T>,
@@ -970,7 +973,8 @@ function matchesClaim(job: RepositoryCampaignJob, claim: ClaimedRepositoryJob): 
 }
 
 function isAlreadySettled(job: RepositoryCampaignJob, result: RecoveredFinishResult): boolean {
-	const proofMatches = result.proofSha256 === undefined || !!job.progress?.evidenceRefs.some((ref) => ref.kind === "no-call-proof" && ref.id === result.proofSha256)
+	const proofKind = result.proofKind ?? "no-call-proof"
+	const proofMatches = result.proofSha256 === undefined || !!job.progress?.evidenceRefs.some((ref) => ref.kind === proofKind && ref.id === result.proofSha256)
 	return job.status === result.status && job.settledMicros === result.actualMicros && job.settledTokens === result.actualTokens && proofMatches
 }
 
@@ -997,14 +1001,18 @@ function applyRecoveredSettlement(job: RepositoryCampaignJob, campaign: Campaign
 	job.updatedAt = now.getTime()
 	if (result.proofSha256) {
 		if (!job.progress) throw new Error("recovered no-call proof has no job progress record")
-		const existing = job.progress.evidenceRefs.find((ref) => ref.kind === "no-call-proof")
-		if (existing && existing.id !== result.proofSha256) throw new Error("recovered no-call proof conflicts with prior job evidence")
-		if (!existing) job.progress.evidenceRefs.push({ id: result.proofSha256, kind: "no-call-proof", label: "Fleet no-call proof" })
+		const proofKind = result.proofKind ?? "no-call-proof"
+		const existing = job.progress.evidenceRefs.find((ref) => ref.kind === proofKind)
+		if (existing && existing.id !== result.proofSha256) throw new Error("recovered ledger proof conflicts with prior job evidence")
+		if (!existing) job.progress.evidenceRefs.push({ id: result.proofSha256, kind: proofKind,
+			label: proofKind === "no-call-proof" ? "Fleet no-call proof" : "Fleet closed-session billing proof" })
 		job.progress.lastActionAt = now.getTime()
 		job.progress.heartbeatAt = now.getTime()
 		job.progress.leaseExpiresAt = now.getTime()
-		job.progress.currentTask = "Failed prepare attempt reconciled against Fleet no-call proof"
-		job.progress.nextStep = "Review the prepare failure before considering a separate job"
+		job.progress.currentTask = proofKind === "no-call-proof" ? "Failed prepare attempt reconciled against Fleet no-call proof" :
+			"Paid calls reconciled from Fleet closed-session proof; qualification remains unqualified"
+		job.progress.nextStep = proofKind === "no-call-proof" ? "Review the prepare failure before considering a separate job" :
+			"Retain the denied qualification result; no retry was created"
 	}
 }
 
