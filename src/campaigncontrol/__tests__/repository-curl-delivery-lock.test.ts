@@ -5,7 +5,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { runMain, type SuiteTest } from "../../test-runner.js"
 
-async function testDeliveryFlockPersistsOnParentDescriptorUntilClosed(): Promise<void> {
+async function testDeliveryFlockHeldUntilClose(): Promise<void> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-curl-flock-"))
 	const lockPath = path.join(root, "dedup.lock")
 	const parent = await fs.open(lockPath, "w+")
@@ -27,7 +27,10 @@ async function testDeliveryFlockPersistsOnParentDescriptorUntilClosed(): Promise
 }
 
 const tests: readonly SuiteTest[] = [
-	["delivery flock remains held by the parent descriptor until the transaction closes it", testDeliveryFlockPersistsOnParentDescriptorUntilClosed],
+	[
+		"delivery flock held by parent descriptor until transaction closes",
+		testDeliveryFlockHeldUntilClose,
+	],
 ]
 
 await runMain("repository-curl-delivery-lock", tests)

@@ -172,7 +172,9 @@ export async function buildEvaluatorIntegrityInput(args: {
 			campaignScopedEvaluation: config.campaignScopedEvaluation ?? null,
 			parentSelectionPolicy: config.parentSelectionPolicy ?? "champion-specialist-novelty",
 			developmentProofRule: config.developmentProofRule ?? null,
-			developmentProofProtocolSha256: config.campaignScopedEvaluation ? null : args.proofProtocol.protocolDigest,
+			developmentProofProtocolSha256: config.campaignScopedEvaluation
+				? null
+				: args.proofProtocol.protocolDigest,
 			workerHarness: {
 				mode: args.run.workerHarnessMode ?? "fixed-control",
 				pairId: args.run.workerHarnessPairId ?? null,
