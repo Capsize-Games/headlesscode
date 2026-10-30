@@ -1708,6 +1708,8 @@ export async function main(argv: string[] = process.argv.slice(2), hooks?: CliRu
 			model: effectiveModel,
 			taskText,
 			maxIterations: options.maxIterations,
+			retryLlmErrors: !options.publishedAdvisoryQualification,
+			writeIterationCapHandoff: !options.publishedAdvisoryQualification,
 			maxRecursionDepth,
 			childIterationFraction,
 			consecutiveErrorLimit,

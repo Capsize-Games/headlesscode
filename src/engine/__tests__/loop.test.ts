@@ -195,6 +195,8 @@ async function makeSession(options: {
 	/** Mode slug (default "code"). Read-only modes disable the commit guard. */
 	mode?: string
 	maxIterations?: number
+	retryLlmErrors?: boolean
+	writeIterationCapHandoff?: boolean
 	consecutiveErrorLimit?: number
 	windowSize?: number
 	budget?: SessionBudget
@@ -229,6 +231,8 @@ async function makeSession(options: {
 		llmClient: options.client,
 		executor: options.executor,
 		maxIterations: options.maxIterations ?? 10,
+		retryLlmErrors: options.retryLlmErrors,
+		writeIterationCapHandoff: options.writeIterationCapHandoff,
 		consecutiveErrorLimit: options.consecutiveErrorLimit ?? 3,
 		windowSize: options.windowSize ?? 40,
 		budget: options.budget ?? null,
@@ -1765,6 +1769,43 @@ async function testMainLlmCallDoesNotRetryDeterministicError(): Promise<void> {
 		const result = await session.run()
 		assert.equal(result.status, "error", "a deterministic 401 must fail immediately")
 		assert.equal(calls, 1, "no retry attempted for a non-retryable error")
+	} finally {
+		await fs.rm(ws, { recursive: true, force: true })
+	}
+}
+
+async function testFixedQualificationTwoCallBoundCompletesOrReportsIncomplete(): Promise<void> {
+	const ws = await fs.mkdtemp(path.join(os.tmpdir(), "headlesscode-qualification-call-bound-"))
+	try {
+		await fs.writeFile(path.join(ws, "evidence.txt"), "bounded evidence\n")
+		const completedClient = new FakeLlmClient([
+			() => toolCall("read_file", { path: "evidence.txt" }),
+			() => toolCall("attempt_completion", { result: "Evidence reviewed; conclusion is bounded." }),
+		])
+		const completed = await (await makeSession({ task: "review evidence", client: completedClient,
+			workspaceRoot: ws, maxIterations: 2, retryLlmErrors: false, writeIterationCapHandoff: false })).run()
+		assert.equal(completed.status, "success")
+		assert.equal(completedClient.requests.length, 2, "completion must fit within two inference calls")
+
+		const incompleteClient = new FakeLlmClient([
+			() => toolCall("read_file", { path: "evidence.txt" }),
+			() => toolCall("read_file", { path: "evidence.txt" }),
+		])
+		const incomplete = await (await makeSession({ task: "review evidence", client: incompleteClient,
+			workspaceRoot: ws, maxIterations: 2, retryLlmErrors: false, writeIterationCapHandoff: false })).run()
+		assert.equal(incomplete.status, "error", "work without an explicit finish must be reported incomplete")
+		assert.match(incomplete.error ?? "", /Max iterations \(2\) reached without task completion/)
+		assert.equal(incompleteClient.requests.length, 2, "iteration cap must stop after two inference calls")
+
+		const deniedClient = new FakeLlmClient([
+			() => toolCall("read_file", { path: "evidence.txt" }),
+			() => { throw new OpenRouterError("Fleet budget authority denied operation", 429) },
+			() => toolCall("attempt_completion", { result: "must not retry" }),
+		])
+		const denied = await (await makeSession({ task: "review evidence", client: deniedClient,
+			workspaceRoot: ws, maxIterations: 2, retryLlmErrors: false, writeIterationCapHandoff: false })).run()
+		assert.equal(denied.status, "error", "a broker denial must end the qualification as incomplete")
+		assert.equal(deniedClient.requests.length, 2, "a broker denial must not cause a third inference request")
 	} finally {
 		await fs.rm(ws, { recursive: true, force: true })
 	}
@@ -4296,6 +4337,7 @@ const tests: Array<[string, () => Promise<void>]> = [
 	["main LLM call retries once on a transient provider error then succeeds", testMainLlmCallRetriesOnceOnTransientProviderError],
 	["main LLM call fails after the retry also fails (no unbounded retry loop)", testMainLlmCallFailsAfterRetryAlsoFails],
 	["main LLM call does not retry a deterministic 401", testMainLlmCallDoesNotRetryDeterministicError],
+	["fixed qualification profile completes or reports incomplete within two inference calls", testFixedQualificationTwoCallBoundCompletesOrReportsIncomplete],
 	["max iterations -> handoff summary written for the next continuation", testIterationCapHandoffSummary],
 	["max iterations -> handoff write is non-fatal when its own condense call fails", testIterationCapHandoffSummaryNonFatalWhenCondenseCallFails],
 	["max iterations -> handoff write retries once after a transient condense failure", testIterationCapHandoffSummaryRetriesOnceAfterCondenseFailure],
