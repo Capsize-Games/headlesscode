@@ -10,7 +10,8 @@ import { CURL_REPAIR_CAMPAIGN_ID, CURL_REPAIR_V2_CAMPAIGN_ID } from "./repositor
 import { CURL_REPAIR_EVALUATOR_DIGEST, CURL_REPAIR_POLICY_SHA256, CURL_REPAIR_PROFILE_ID, CURL_REPAIR_RECIPE_DIGEST, CURL_REPAIR_SOURCE_REVISION,
 	CURL_REPAIR_REPOSITORY_ID, CURL_REPAIR_RESERVATION, CURL_REPAIR_TARGET_REPOSITORY } from "./repository-curl-repair.js"
 import { CURL_REPAIR_V2_EVALUATOR_DIGEST, CURL_REPAIR_V2_POLICY_SHA256, CURL_REPAIR_V2_PROFILE_ID,
-	CURL_REPAIR_V2_RECIPE_DIGEST, CURL_REPAIR_V2_REPOSITORY_ID } from "./repository-curl-repair-v2-profile.js"
+	CURL_REPAIR_V2_RECIPE_DIGEST, CURL_REPAIR_V2_REPOSITORY_ID,
+	CURL_REPAIR_V2_RESERVATION } from "./repository-curl-repair-v2-profile.js"
 
 export const REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS = 5_000_000
 // Keeps the mock subcap within the existing fixed Fleet campaign's 108k-token ceiling.
@@ -423,11 +424,114 @@ function validRepairJob(job: RepositoryCampaignJob, s: Partial<CampaignState>): 
 }
 
 function validRepairV2Job(job: RepositoryCampaignJob, s: Partial<CampaignState>): boolean {
-	return job.purpose === "repair" && job.campaignId === CURL_REPAIR_V2_CAMPAIGN_ID &&
-		job.advisoryId === CURL_FIXED_ADVISORY && job.retryOf === undefined &&
-		(s.intakeRecords ?? []).some((row) => row?.source === "debian-tracker-repair-v2-snapshot" &&
-			row.jobId === job.id && row.campaignId === job.campaignId &&
-			row.advisoryId === job.advisoryId && row.snapshotSha256 === CURL_DEBIAN_SNAPSHOT_SHA256)
+	if (job.purpose !== "repair" ||
+		job.campaignId !== CURL_REPAIR_V2_CAMPAIGN_ID ||
+		job.advisoryId !== CURL_FIXED_ADVISORY) return false
+	if (job.retryOf === undefined) return hasV2RepairIntake(job, s)
+	if (!validId(job.retryOf)) return false
+	const parent = (s.jobs ?? []).find((item) => item.id === job.retryOf)
+	return !!parent && validV2RecoveryParent(parent, s) &&
+		(s.jobs ?? []).filter((item) => item.retryOf === parent.id).length === 1
+}
+
+function hasV2RepairIntake(
+	job: RepositoryCampaignJob, s: Partial<CampaignState>,
+): boolean {
+	return (s.intakeRecords ?? []).filter((row) =>
+		row?.source === "debian-tracker-repair-v2-snapshot" &&
+		row.jobId === job.id && row.campaignId === job.campaignId &&
+		row.advisoryId === job.advisoryId &&
+		row.snapshotSha256 === CURL_DEBIAN_SNAPSHOT_SHA256).length === 1
+}
+
+function validV2RecoveryParent(
+	job: RepositoryCampaignJob, s: Partial<CampaignState>,
+): boolean {
+	const progress = job.progress
+	return job.retryOf === undefined && job.purpose === "repair" &&
+		job.campaignId === CURL_REPAIR_V2_CAMPAIGN_ID &&
+		job.advisoryId === CURL_FIXED_ADVISORY &&
+		job.status === "failed" && job.reservedMicros === 0 &&
+		job.reservedTokens === 0 &&
+		job.settledMicros === 0 && job.settledTokens === 0 &&
+		validV2RecoveryProgress(progress) && validV2RecoveryEvidence(progress) &&
+		hasV2RepairIntake(job, s)
+}
+
+function validV2RecoveryProgress(
+	progress: RepositoryJobProgress | undefined,
+): boolean {
+	return progress?.executionKind === "live-cve" &&
+		progress.stage === "prepare-candidate" &&
+		progress.blocker === "registered-pipeline-step-failed" &&
+		progress.currentTask ===
+			"Failed prepare attempt reconciled against Fleet no-call proof" &&
+		progress.nextStep ===
+			"Review the prepare failure before considering a separate job" &&
+		JSON.stringify(progress.completedSteps) ===
+			JSON.stringify(REPOSITORY_CAMPAIGN_STEPS.slice(0, 3)) &&
+		JSON.stringify(progress.requiredSteps) ===
+			JSON.stringify(REPOSITORY_CAMPAIGN_STEPS)
+}
+
+function evidenceCount(
+	refs: RepositoryEvidenceRef[], kind: RepositoryEvidenceRef["kind"],
+): number {
+	return refs.filter((ref) => ref.kind === kind).length
+}
+
+function validV2RecoveryEvidence(
+	progress: RepositoryJobProgress | undefined,
+): boolean {
+	if (!progress) return false
+	const refs = progress.evidenceRefs
+	const diagnostic = refs.filter((ref) => ref.kind === "diagnostic")
+	const proof = refs.filter((ref) => ref.kind === "no-call-proof")
+	return evidenceCount(refs, "intake") === 1 && diagnostic.length === 1 &&
+		/^[a-f0-9]{64}$/.test(diagnostic[0]!.id) &&
+		evidenceCount(refs, "candidate") === 0 &&
+		evidenceCount(refs, "test-receipt") === 0 &&
+		evidenceCount(refs, "delivery") === 0 &&
+		evidenceCount(refs, "billing-proof") === 0 && proof.length === 1 &&
+		/^[a-f0-9]{64}$/.test(proof[0]!.id)
+}
+
+function validV2RetryParent(job: RepositoryCampaignJob | undefined,
+	s: CampaignState, proofSha256: string): job is RepositoryCampaignJob {
+	if (!job || !validV2RecoveryParent(job, s)) return false
+	const proofs = job.progress!.evidenceRefs.filter(
+		(ref) => ref.kind === "no-call-proof",
+	)
+	return proofs.length === 1 && proofs[0]!.id === proofSha256
+}
+
+function requireV2RetryParent(s: CampaignState, parentId: string,
+	proofSha256: string): RepositoryCampaignJob {
+	const parent = s.jobs.find((job) => job.id === parentId)
+	if (!validV2RetryParent(parent, s, proofSha256)) {
+		throw new Error(
+			"retry parent is not a recovered zero-cost v2 prepare failure",
+		)
+	}
+	if (s.jobs.some((job) => job.retryOf === parent.id)) {
+		throw new Error("this recovered v2 failure already has a retry child")
+	}
+	if (s.jobs.some((job) => job.campaignId === CURL_REPAIR_V2_CAMPAIGN_ID &&
+		(job.status === "queued" || job.status === "running"))) {
+		throw new Error("another Curl v2 repair job is active")
+	}
+	return parent
+}
+
+function makeRecoveredV2Retry(parent: RepositoryCampaignJob, epoch: number,
+	month: string, now: Date): RepositoryCampaignJob {
+	return {
+		id: randomUUID(), retryOf: parent.id, campaignId: parent.campaignId,
+		advisoryId: parent.advisoryId, status: "queued", epoch,
+		createdAt: now.getTime(), updatedAt: now.getTime(), month,
+		reservedMicros: 0, settledMicros: 0, reservedTokens: 0,
+		settledTokens: 0, purpose: "repair",
+	}
 }
 
 function retryableHistoricalRepairFailure(job: RepositoryCampaignJob): boolean {
@@ -714,6 +818,50 @@ function v2RepairDefinition(definition: RepositoryCampaignDefinition): boolean {
 		definition.repository === CURL_REPAIR_TARGET_REPOSITORY && definition.sourceRevision === CURL_REPAIR_SOURCE_REVISION &&
 		definition.policySha256 === CURL_REPAIR_V2_POLICY_SHA256 && definition.workerProfile === CURL_REPAIR_V2_PROFILE_ID &&
 		definition.recipeDigest === CURL_REPAIR_V2_RECIPE_DIGEST && definition.evaluatorDigest === CURL_REPAIR_V2_EVALUATOR_DIGEST
+}
+
+function v2RetryAuthorityReady(authority: RepositoryBudgetAuthority,
+	definition: RepositoryCampaignDefinition, now: Date): boolean {
+	if (!v2RepairDefinition(definition)) return false
+	const identity = authority.repositoryCampaignId === definition.id &&
+		authority.repositoryId === definition.repositoryId &&
+		authority.repository === definition.repository &&
+		authority.sourceRevision === definition.sourceRevision &&
+		authority.policySha256 === definition.policySha256 &&
+		authority.model === "none" &&
+		authority.profileId === "no-model"
+	const enabled = authority.globalEnabled === true &&
+		authority.canAdmit === true &&
+		authority.repositoryEnabled === true
+	const live = authority.mode === "fleet-v2" && authority.available &&
+		validActiveRun(authority, now.getTime())
+	return identity && enabled && (live || snapshotCanProvision(authority) ||
+		liveBudgetOnlyAdmission(authority, definition))
+}
+
+function v2RetryHasBudget(
+	authority: RepositoryBudgetAuthority,
+	totals: Pick<CampaignRecord,
+		"settledMicros" | "reservedMicros" | "ambiguousMicros" |
+		"settledTokens" | "reservedTokens" | "ambiguousTokens"
+	>,
+	campaign: CampaignRecord): boolean {
+	const micros = CURL_REPAIR_V2_RESERVATION.micros
+	const tokens = CURL_REPAIR_V2_RESERVATION.tokens
+	const monthly = authority.monthly!
+	const lifetime = authority.campaignLifetime!
+	const repository = authority.repositoryLifetime!
+	return campaign.budgetLimitMicros - lifetimeSpend(campaign) >= micros &&
+		campaign.budgetLimitTokens - lifetimeTokens(campaign) >= tokens &&
+		authority.limitMicros - authority.committedMicros -
+			lifetimeSpend(totals) >= micros &&
+		authority.limitTokens - authority.committedTokens -
+			lifetimeTokens(totals) >= tokens &&
+		monthly.limitMicros - monthlyUsage(monthly) >= micros &&
+		lifetime.limitMicros - lifetimeSpend(lifetime) >= micros &&
+		lifetime.limitTokens - lifetimeTokens(lifetime) >= tokens &&
+		repository.limitMicros - lifetimeSpend(repository) >= micros &&
+		repository.limitTokens - lifetimeTokens(repository) >= tokens
 }
 
 function aggregateBudgetExhausted(authority: RepositoryBudgetAuthority,
@@ -1497,6 +1645,40 @@ export class RepositoryCampaignStore {
 			queuePinnedRepairInState(s, input, "debian-tracker-repair-v2-snapshot", now)
 			return { changed: true, queued: true }
 		}, now)
+	}
+
+	/** Queue one explicit no-call retry for the pinned historical Curl v2 job. */
+	async enqueueRecoveredCurlRepairV2Retry(parentId: string, confirmation: string,
+		proofSha256: string, now = new Date()): Promise<RepositoryCampaignJob> {
+		if (!validId(parentId) ||
+			confirmation !== `CONFIRM RETRY RECOVERED CURL V2 NO-CALL ${parentId}` ||
+			!/^[a-f0-9]{64}$/.test(proofSha256)) {
+			throw new Error("explicit v2 retry confirmation and proof are required")
+		}
+		const definition = this.requireDefinition(CURL_REPAIR_V2_CAMPAIGN_ID)
+		const authority = await this.budgetAuthority(CURL_REPAIR_V2_CAMPAIGN_ID)
+		if (!v2RetryAuthorityReady(authority, definition, now)) {
+			throw new Error("fresh enabled v2 Fleet budget authority is unavailable")
+		}
+		return this.update((s) => this.queueRecoveredV2Retry(
+			s, parentId, proofSha256, definition, authority, now,
+		), now)
+	}
+
+	private queueRecoveredV2Retry(s: CampaignState, parentId: string,
+		proofSha256: string, definition: RepositoryCampaignDefinition,
+		authority: RepositoryBudgetAuthority, now: Date): RepositoryCampaignJob {
+		const campaign = this.campaign(s, CURL_REPAIR_V2_CAMPAIGN_ID)
+		const readiness = this.missingReadiness(definition, authority, campaign, s)
+		const budget = v2RetryHasBudget(authority, this.aggregateTotals(s), campaign)
+		if (!campaign.enabled || readiness.length || !budget) {
+			throw new Error("v2 retry requires ready authority and remaining reservation budget")
+		}
+		const parent = requireV2RetryParent(s, parentId, proofSha256)
+		if (s.jobs.length >= MAX_JOBS) throw new Error("campaign job queue is full")
+		const child = makeRecoveredV2Retry(parent, campaign.epoch, s.month, now)
+		s.jobs.push(child)
+		return structuredClone(child)
 	}
 
 	/** Create one explicit child for a zero-cost verified historical Curl repair that failed before delivery completed. */
