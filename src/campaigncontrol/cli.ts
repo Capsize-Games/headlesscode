@@ -209,12 +209,14 @@ export async function campaignMain(args: string[]): Promise<number> {
 			const readAuthority = createRepositoryBudgetAuthorityReader(definitions, CAMPAIGN_CONTROL_FILE)
 			const repositoryStore = new RepositoryCampaignStore(REPOSITORY_CAMPAIGN_STATE_FILE, definitions, readAuthority)
 			const authority = await readAuthority(CURL_CAMPAIGN_ID)
-			if (authority.mode !== "fleet-v2" || !authority.available || authority.globalEnabled !== true || authority.canAdmit !== true ||
+			const liveDispatchReady = authority.mode === "fleet-v2" && authority.available && !!authority.runId &&
+				!!authority.runExpiresAtMs && authority.runExpiresAtMs > Date.now()
+			const snapshotProvisioningReady = authority.mode === "fleet-v2-readonly" && authority.snapshotOnly === true && !authority.available
+			if ((!liveDispatchReady && !snapshotProvisioningReady) || authority.globalEnabled !== true || authority.canAdmit !== true ||
 				authority.repositoryEnabled !== true || authority.repositoryCampaignId !== definition.id || authority.repositoryId !== definition.repositoryId ||
 				authority.repository !== definition.repository || authority.sourceRevision !== definition.sourceRevision || authority.policySha256 !== definition.policySha256 ||
-				authority.model !== definition.model || authority.profileId !== "muse-spark-contributor" || !authority.runId ||
-				!Number.isSafeInteger(authority.runExpiresAtMs) || authority.runExpiresAtMs! <= Date.now()) {
-				throw new Error("fresh enabled Fleet Curl dispatch authority is unavailable")
+				authority.model !== definition.model || authority.profileId !== "muse-spark-contributor") {
+				throw new Error("fresh enabled Fleet Curl provisioning authority is unavailable")
 			}
 			const view = await repositoryStore.recoveryView(positional[1]!)
 			if (!view.job || view.activeJobs.length) throw new Error("retry target is unavailable or another Curl job is active")
@@ -225,7 +227,7 @@ export async function campaignMain(args: string[]): Promise<number> {
 			const proofSha256 = await verifyRecoveredNoCallArtifact(view.job, REPOSITORY_CAMPAIGN_STATE_FILE, scope, keyIdentity)
 			const child = await repositoryStore.enqueueVerifiedNoCallRetry(view.job.id, `CONFIRM RETRY NO-CALL ${view.job.id}`)
 			process.stdout.write(`${JSON.stringify({ retry: "explicit-no-call", campaignId: CURL_CAMPAIGN_ID,
-				parentJobId: view.job.id, childJobId: child.id, proofSha256, state: child.status })}\n`)
+				parentJobId: view.job.id, childJobId: child.id, jobId: child.id, proofSha256, state: child.status })}\n`)
 			return 0
 		} catch (error) {
 			process.stderr.write(`headlesscode campaign: ${error instanceof Error ? error.message : "no-call retry failed closed"}\n`)

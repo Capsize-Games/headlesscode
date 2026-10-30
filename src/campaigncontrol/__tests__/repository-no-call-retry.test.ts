@@ -17,11 +17,12 @@ const definition: RepositoryCampaignDefinition = { id: "curl-maintenance", name:
 	evaluatorDigest: CURL_EVALUATOR_DIGEST, model: "meta/muse-spark-1.3-contributor",
 	dataAccessProfile: "public-upstream-source-and-published-advisory-only", qualification: qualified }
 const empty = { settledMicros: 0, reservedMicros: 0, ambiguousMicros: 0, settledTokens: 0, reservedTokens: 0, ambiguousTokens: 0 }
-function authority(): RepositoryBudgetAuthority {
+function authority(snapshotOnly = false): RepositoryBudgetAuthority {
 	const now = Date.now()
-	return { mode: "fleet-v2", available: true, limitMicros: 20_000, limitTokens: 108_000,
+	return { mode: snapshotOnly ? "fleet-v2-readonly" : "fleet-v2", available: !snapshotOnly,
+		snapshotOnly: snapshotOnly || undefined, limitMicros: 20_000, limitTokens: 108_000,
 		committedMicros: 0, committedTokens: 0, asOfMs: now, campaignId: "fleet-security-watch", globalEnabled: true,
-		canAdmit: true, controlEpoch: 1, runId: "run-retry-test", runExpiresAtMs: now + 60_000,
+		canAdmit: true, controlEpoch: 1, runId: snapshotOnly ? null : "run-retry-test", runExpiresAtMs: snapshotOnly ? null : now + 60_000,
 		repositoryCampaignId: definition.id, repositoryId: definition.repositoryId!, repository: definition.repository!,
 		sourceRevision: definition.sourceRevision!, policySha256: definition.policySha256!, model: definition.model!,
 		profileId: "muse-spark-contributor", repositoryEnabled: true, repositoryEpoch: 1,
@@ -33,7 +34,8 @@ function authority(): RepositoryBudgetAuthority {
 test("only one explicit child retry follows a recovered zero-cost Curl qualification", async (t) => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-no-call-retry-")); t.after(() => fs.rm(root, { recursive: true, force: true }))
 	await fs.chmod(root, 0o700)
-	const store = new RepositoryCampaignStore(path.join(root, "campaigns.json"), [definition], () => authority())
+	let snapshotOnly = false
+	const store = new RepositoryCampaignStore(path.join(root, "campaigns.json"), [definition], () => authority(snapshotOnly))
 	const now = new Date()
 	await store.setCampaignBudget(definition.id, 18_000, 90_000, now)
 	await store.start(definition.id, now)
@@ -45,8 +47,8 @@ test("only one explicit child retry follows a recovered zero-cost Curl qualifica
 	await store.finish(claim!, { status: "ambiguous" }, now)
 	const proofSha256 = "9".repeat(64)
 	await store.settleRecoveredClaim(claim!, { status: "failed", actualMicros: 0, actualTokens: 0, proofSha256 }, new Date(now.getTime() + 1))
-	const snapshot = await authority()
-	const child = await store.enqueueVerifiedNoCallRetry(parent.id, `CONFIRM RETRY NO-CALL ${parent.id}`, new Date(snapshot.asOfMs!))
+	snapshotOnly = true
+	const child = await store.enqueueVerifiedNoCallRetry(parent.id, `CONFIRM RETRY NO-CALL ${parent.id}`, new Date())
 	assert.equal(child.retryOf, parent.id)
 	assert.notEqual(child.id, parent.id)
 	await assert.rejects(store.enqueueVerifiedNoCallRetry(parent.id, `CONFIRM RETRY NO-CALL ${parent.id}`), /already has a retry child/)

@@ -22,6 +22,7 @@ export interface FleetRepositoryBudgetSnapshot {
 
 export interface RepositoryProgressSnapshot {
 	schemaVersion: 1
+	campaignId: string
 	executionKind: "development-checkpoint" | "live-cve" | "unavailable"
 	observedAt: number
 	repository: { id: string; name: string; slug: string | null }
@@ -226,6 +227,7 @@ export function repositoryProgressSnapshot(
 	const resolved = resolveReadiness(campaign, options.runtimeReadiness)
 	return {
 		schemaVersion: 1,
+		campaignId: definition.id,
 		executionKind: executionKind(liveJobs, developmentJobs),
 		observedAt,
 		repository: { id: definition.id, name: definition.name, slug: definition.repository ?? null },

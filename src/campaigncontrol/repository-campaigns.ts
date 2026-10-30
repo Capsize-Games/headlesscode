@@ -1231,9 +1231,13 @@ export class RepositoryCampaignStore {
 		}
 		const definition = this.requireDefinition(CURL_CAMPAIGN_ID)
 		const authority = await this.budgetAuthority(CURL_CAMPAIGN_ID)
-		if (authority.mode !== "fleet-v2" || !authority.available || authority.globalEnabled !== true || authority.canAdmit !== true ||
-			authority.repositoryEnabled !== true || !authority.runId || !authority.runExpiresAtMs || authority.runExpiresAtMs <= now.getTime()) {
-			throw new Error("no-call retry requires fresh enabled Fleet dispatch authority")
+		const liveDispatchReady = authority.mode === "fleet-v2" && authority.available && authority.globalEnabled === true &&
+			authority.canAdmit === true && authority.repositoryEnabled === true && !!authority.runId &&
+			!!authority.runExpiresAtMs && authority.runExpiresAtMs > now.getTime()
+		const snapshotProvisioningReady = authority.mode === "fleet-v2-readonly" && authority.snapshotOnly === true &&
+			authority.globalEnabled === true && authority.canAdmit === true && authority.repositoryEnabled === true && snapshotCanProvision(authority)
+		if (!liveDispatchReady && !snapshotProvisioningReady) {
+			throw new Error("no-call retry requires fresh enabled Fleet provisioning authority")
 		}
 		return this.update((s) => {
 			const campaign = this.campaign(s, CURL_CAMPAIGN_ID)
