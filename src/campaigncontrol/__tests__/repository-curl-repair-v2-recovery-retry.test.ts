@@ -64,10 +64,25 @@ async function explicitRetryPersistsRootAndProof(): Promise<void> {
 }
 
 async function rejectCandidateParent(root: string): Promise<void> {
-	const candidate = await makeFailedPrepare(path.join(root, "candidate"), true)
+	const candidate = await makeFailedPrepare(
+		path.join(root, "candidate"), true, true,
+	)
 	await assert.rejects(candidate.store.enqueueRecoveredCurlRepairV2Retry(
 		candidate.parent.id, confirmation(candidate.parent.id), proofSha256,
 	), /retry parent/)
+}
+
+async function legacyParentCanRetry(): Promise<void> {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-v2-legacy-retry-"))
+	try {
+		const fixture = await makeFailedPrepare(root, false, true)
+		const child = await fixture.store.enqueueRecoveredCurlRepairV2Retry(
+			fixture.parent.id, confirmation(fixture.parent.id), proofSha256,
+		)
+		assert.equal(child.retryOf, fixture.parent.id)
+	} finally {
+		await fs.rm(root, { recursive: true, force: true })
+	}
 }
 
 async function rejectActiveJob(root: string): Promise<void> {
@@ -103,6 +118,10 @@ const tests: readonly SuiteTest[] = [
 	[
 		"v2 recovered no-call retry is explicit and reloadable",
 		explicitRetryPersistsRootAndProof,
+	],
+	[
+		"legacy v2 prepare failure is eligible only without candidate evidence",
+		legacyParentCanRetry,
 	],
 	[
 		"v2 retry rejects unsafe parents, active jobs, and Stop",
