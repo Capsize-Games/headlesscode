@@ -16,7 +16,7 @@ import {
 import {
 	CURL_REPAIR_CANDIDATE_REVISION, CURL_REPAIR_CANDIDATE_TREE_SHA,
 	CURL_REPAIR_HISTORICAL_BASE, CURL_REPAIR_PATCH_SHA256,
-	CURL_REPAIR_SOURCE_REVISION,
+	CURL_REPAIR_SOURCE_REVISION, CURL_REPAIR_SOURCE_TREE_SHA,
 } from "../repository-curl-repair.js"
 import {
 	CURL_REPAIR_V2_IMAGE_DIGEST, CURL_REPAIR_V2_PROFILE_ID,
@@ -105,6 +105,25 @@ async function v2EvidenceRejectsDetachedClaimOrWorkerArtifact(): Promise<void> {
 	}), /execution receipt bindings are invalid/)
 }
 
+async function historicalTreeDoesNotUseReviewedCheckoutTree(): Promise<void> {
+	const candidate = await buildCurlHistoricalRepairTestFixture()
+	assert.equal(candidate.sourceRevision, CURL_REPAIR_HISTORICAL_BASE)
+	assert.equal(
+		candidate.sourceTreeSha,
+		"b1ea31bb7377dd2bfe08fd67af44860de57afc12",
+	)
+	assert.notEqual(candidate.sourceTreeSha, CURL_REPAIR_SOURCE_TREE_SHA)
+	await assert.rejects(evaluateCurlHistoricalRepairCandidate({
+		candidate: { ...candidate, sourceTreeSha: CURL_REPAIR_SOURCE_TREE_SHA },
+		jobId: claim.jobId,
+		buildCandidate: async () => candidate,
+		evaluateFixedProof: async () => ({
+			schemaVersion: 1, accepted: true, disposition: "already-fixed",
+			evidenceSha256: sha256("proof"), reasonCode: "fixed-proof-verified",
+		}),
+	}), /does not match the clean pinned checkout/)
+}
+
 function sha256(value: string): string {
 	return createHash("sha256").update(value).digest("hex")
 }
@@ -117,6 +136,10 @@ const tests: readonly SuiteTest[] = [
 	[
 		"v2 receipt rejects detached claim and worker artifact",
 		v2EvidenceRejectsDetachedClaimOrWorkerArtifact,
+	],
+	[
+		"historical source tree stays distinct from the reviewed checkout tree",
+		historicalTreeDoesNotUseReviewedCheckoutTree,
 	],
 ]
 

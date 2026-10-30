@@ -3,30 +3,34 @@ import {
 	ensureCancelMarker,
 } from "./repository-curl-repair-v2-evidence-store.js"
 
+export interface BoundedStageProcessRequest {
+	command: string[]
+	cwd: string
+	cancelPath: string
+	signal: AbortSignal
+	timeoutMs: number
+	env: NodeJS.ProcessEnv
+}
+
 export async function runBoundedStageProcess(
-	command: string[],
-	cwd: string,
-	cancelPath: string,
-	signal: AbortSignal,
-	timeoutMs: number,
-	env: NodeJS.ProcessEnv,
+	request: BoundedStageProcessRequest,
 ): Promise<void> {
-	const child = spawn(command[0]!, command.slice(1), {
-		cwd, env, stdio: "ignore", shell: false, detached: false,
+	const child = spawn(request.command[0]!, request.command.slice(1), {
+		cwd: request.cwd, env: request.env,
+		stdio: "ignore", shell: false, detached: false,
 	})
-	await awaitChild(child, cancelPath, signal, timeoutMs)
+	await awaitChild(child, request)
 }
 
 async function awaitChild(
 	child: ReturnType<typeof spawn>,
-	cancelPath: string,
-	signal: AbortSignal,
-	timeoutMs: number,
+ request: BoundedStageProcessRequest,
 ): Promise<void> {
-	const timers = armCancellation(child, cancelPath, signal, timeoutMs)
+	const timers = armCancellation(child, request.cancelPath, request.signal,
+		request.timeoutMs)
 	try {
 		const code = await waitForExit(child)
-		if (signal.aborted || timers.requested()) {
+		if (request.signal.aborted || timers.requested()) {
 			throw new Error("Curl v2 stage was cancelled")
 		}
 		if (code !== 0) throw new Error("Curl v2 fixed Fleet stage failed")

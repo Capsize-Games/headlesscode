@@ -1,6 +1,6 @@
 import {
 	CURL_REPAIR_CANDIDATE_REVISION, CURL_REPAIR_CANDIDATE_TREE_SHA,
-	CURL_REPAIR_SOURCE_REVISION,
+	CURL_REPAIR_HISTORICAL_BASE, CURL_REPAIR_SOURCE_REVISION,
 } from "./repository-curl-repair.js"
 import {
 	CURL_REPAIR_V2_IMAGE_DIGEST, CURL_REPAIR_V2_PROFILE_ID,
@@ -15,12 +15,23 @@ export function isWorkerReceipt(
 	claim: CurlRepairV2ClaimIdentity,
 ): value is CurlRepairV2WorkerReceipt {
 	if (!record(value)) return false
+	return hasWorkerClaim(value, claim) && hasWorkerArtifact(value)
+}
+
+function hasWorkerClaim(
+	value: Record<string, unknown>,
+	claim: CurlRepairV2ClaimIdentity,
+): boolean {
 	return value.schema_version === 2 &&
 		value.profile === CURL_REPAIR_V2_PROFILE_ID &&
 		value.job_id === claim.jobId && value.claim_id === claim.claimId &&
 		value.epoch === claim.epoch && value.stage === "candidate-preparation" &&
 		value.source_revision === CURL_REPAIR_SOURCE_REVISION &&
-		value.candidate_revision === CURL_REPAIR_CANDIDATE_REVISION &&
+		value.base_revision === CURL_REPAIR_HISTORICAL_BASE
+}
+
+function hasWorkerArtifact(value: Record<string, unknown>): boolean {
+	return value.candidate_revision === CURL_REPAIR_CANDIDATE_REVISION &&
 		value.candidate_tree === CURL_REPAIR_CANDIDATE_TREE_SHA &&
 		value.image_digest === CURL_REPAIR_V2_IMAGE_DIGEST &&
 		digest(value.artifact_sha256) &&
@@ -50,12 +61,19 @@ function hasClaimFields(
 }
 
 function hasEvaluatorFields(value: Record<string, unknown>): boolean {
+	return hasEvaluatorCandidate(value) && hasEvaluatorProof(value)
+}
+
+function hasEvaluatorCandidate(value: Record<string, unknown>): boolean {
 	return value.candidate_revision === CURL_REPAIR_CANDIDATE_REVISION &&
 		value.candidate_tree === CURL_REPAIR_CANDIDATE_TREE_SHA &&
 		value.image_digest === CURL_REPAIR_V2_IMAGE_DIGEST &&
 		JSON.stringify(value.test_ids) === "[3037,3038,5033]" &&
-		validResults(value.test_results) && value.sanitizer_clean === true &&
-		value.cleanup_confirmed === true &&
+		validResults(value.test_results)
+}
+
+function hasEvaluatorProof(value: Record<string, unknown>): boolean {
+	return value.sanitizer_clean === true && value.cleanup_confirmed === true &&
 		numberInRange(value.created_at_unix, 1, Number.MAX_SAFE_INTEGER) &&
 		digest(value.worker_receipt_sha256) &&
 		digest(value.candidate_artifact_sha256) &&

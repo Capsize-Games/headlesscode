@@ -190,7 +190,10 @@ async function runBuildQueue(
 		evidenceRoot(), "curl-historical-v2", claim.jobId, "cancel.request",
 	)
 	await runBoundedStageProcess(
-		command, cwd, cancelPath, signal, timeoutMs, fixedEnvironment(cwd),
+		{
+			command, cwd, cancelPath, signal, timeoutMs,
+			env: fixedEnvironment(cwd),
+		},
 	)
 }
 
