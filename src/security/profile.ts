@@ -4,6 +4,8 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { spawnSync } from "node:child_process"
 import { parse } from "yaml"
+import { inspectLocalDockerSandboxImage } from "./docker-sandbox-image.js"
+import type { DockerSandboxImageExpectation, DockerSandboxImageObserver } from "./docker-sandbox-image.js"
 
 export type SecurityProfileName = "local" | "contained"
 export type ContainedPurpose = "worker" | "evaluation" | "repository-worker"
@@ -369,17 +371,79 @@ function validateNetworkBinaries(value: unknown[], label: string): void {
 export function verifyContainedSandboxIdentity(options: {
 	probe: OpenShellProbe
 	name: string
-	profile: Pick<ContainedRuntimeProfile, "image" | "purpose" | "inferenceEndpoint" | "evidenceGuestPath" | "evidenceGuestPublicKeyPath" | "brokerCapabilityGuestPath">
+	profile: Pick<ContainedRuntimeProfile, "image" | "cpu" | "memory" | "purpose" | "inferenceEndpoint" | "evidenceGuestPath" | "evidenceGuestPublicKeyPath" | "brokerCapabilityGuestPath">
+	imageObserver?: DockerSandboxImageObserver
 }): void {
 	const sandbox = options.probe(["sandbox", "get", options.name, "--output", "json"], 10_000)
 	if (sandbox.error || sandbox.status !== 0) throw new Error("could not inspect created OpenShell sandbox identity")
 	let sandboxDoc: unknown
 	try { sandboxDoc = JSON.parse(sandbox.stdout ?? "") as unknown } catch { throw new Error("OpenShell sandbox identity response was not valid JSON") }
-	const image = findStringValue(sandboxDoc, new Set(["image", "image_ref", "imageRef", "from"]))
-	if (image !== options.profile.image) throw new Error("created OpenShell sandbox image does not match the digest-pinned contained profile")
-	const policy = options.probe(["sandbox", "get", options.name, "--policy-only", "--output", "yaml"], 10_000)
+	if (!isRecord(sandboxDoc) || typeof sandboxDoc.id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(sandboxDoc.id) ||
+		sandboxDoc.name !== options.name || sandboxDoc.phase !== "Ready") throw new Error("created OpenShell sandbox identity is not a ready, exact-name UUID record")
+	const apiImage = readTypedSandboxImage(sandboxDoc)
+	if (apiImage !== undefined) {
+		if (apiImage !== options.profile.image) throw new Error("created OpenShell sandbox image does not match the digest-pinned contained profile")
+		assertTypedSandboxResources(sandboxDoc, options.profile)
+	} else {
+		const evidence = (options.imageObserver ?? inspectLocalDockerSandboxImage)(imageExpectation(sandboxDoc, options.profile))
+		if (evidence.imageId.toLowerCase() !== evidence.localImageId.toLowerCase() ||
+			(evidence.configImage !== options.profile.image && evidence.configImage.toLowerCase() !== evidence.localImageId.toLowerCase()) ||
+			evidence.cpuCores !== parseCpuQuantity(options.profile.cpu) || evidence.memoryBytes !== parseMemoryQuantity(options.profile.memory)) {
+			throw new Error("local Docker workload image or resource limits do not match the contained profile")
+		}
+	}
+	const policy = options.probe(["sandbox", "get", options.name, "--policy-only"], 10_000)
 	if (policy.error || policy.status !== 0) throw new Error("could not inspect created OpenShell effective policy")
 	assertEffectiveOpenShellPolicy(policy.stdout ?? "", options.profile)
+}
+
+function readTypedSandboxImage(document: Record<string, unknown>): string | undefined {
+	const paths = [
+		["image"], ["image_ref"], ["imageRef"], ["spec", "image"], ["spec", "template", "image"], ["template", "image"],
+	]
+	const values: string[] = []
+	for (const keys of paths) {
+		let current: unknown = document
+		for (const key of keys) current = isRecord(current) ? current[key] : undefined
+		if (current === undefined || current === null) continue
+		if (typeof current !== "string" || current.length > 256) throw new Error("OpenShell sandbox typed image field is invalid")
+		values.push(current)
+	}
+	if (new Set(values).size > 1) throw new Error("OpenShell sandbox returned conflicting typed image identities")
+	return values[0]
+}
+
+function imageExpectation(document: Record<string, unknown>, profile: Pick<ContainedRuntimeProfile, "image" | "cpu" | "memory">): DockerSandboxImageExpectation {
+	return { sandboxId: document.id as string, sandboxName: document.name as string, image: profile.image, cpu: profile.cpu, memory: profile.memory }
+}
+
+function assertTypedSandboxResources(document: Record<string, unknown>, profile: Pick<ContainedRuntimeProfile, "cpu" | "memory">): void {
+	const candidates = [
+		getRecordPath(document, ["resources"]), getRecordPath(document, ["spec", "resources"]),
+		getRecordPath(document, ["spec", "template", "resources"]), getRecordPath(document, ["template", "resources"]),
+	].filter((value): value is Record<string, unknown> => value !== undefined)
+	for (const resources of candidates) {
+		if (resources.cpu !== undefined && String(resources.cpu) !== profile.cpu) throw new Error("OpenShell sandbox typed CPU limit differs from the contained profile")
+		if (resources.memory !== undefined && String(resources.memory) !== profile.memory) throw new Error("OpenShell sandbox typed memory limit differs from the contained profile")
+	}
+}
+
+function getRecordPath(value: Record<string, unknown>, keys: string[]): Record<string, unknown> | undefined {
+	let current: unknown = value
+	for (const key of keys) current = isRecord(current) ? current[key] : undefined
+	return isRecord(current) ? current : undefined
+}
+
+function parseCpuQuantity(value: string): number {
+	if (!/^\d+(?:\.\d+)?$/.test(value)) throw new Error("contained profile CPU limit is invalid")
+	return Number(value)
+}
+
+function parseMemoryQuantity(value: string): number {
+	const match = /^(\d+)(B|Ki|Mi|Gi|K|M|G)?$/.exec(value)
+	if (!match) throw new Error("contained profile memory limit is invalid")
+	const factor = ({ B: 1, Ki: 1024, Mi: 1024 ** 2, Gi: 1024 ** 3, K: 1000, M: 1000 ** 2, G: 1000 ** 3 } as Record<string, number>)[match[2] ?? "B"]!
+	return Number(match[1]) * factor
 }
 
 /** Reconstitute only a supervisor-produced runtime identity; verify its frozen policy bytes. */
@@ -568,20 +632,6 @@ function defaultOpenShellProbe(args: string[], timeoutMs: number): OpenShellProb
 		stderr: result.stderr ?? "",
 		...(result.error ? { error: result.error } : {}),
 	}
-}
-
-function findStringValue(value: unknown, keys: Set<string>): string | undefined {
-	if (Array.isArray(value)) {
-		for (const item of value) { const result = findStringValue(item, keys); if (result) return result }
-		return undefined
-	}
-	if (!isRecord(value)) return undefined
-	for (const [key, item] of Object.entries(value)) {
-		if (keys.has(key) && typeof item === "string") return item
-		const nested = findStringValue(item, keys)
-		if (nested) return nested
-	}
-	return undefined
 }
 
 function sha256(value: Buffer): string { return createHash("sha256").update(value).digest("hex") }

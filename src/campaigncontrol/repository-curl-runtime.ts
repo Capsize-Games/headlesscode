@@ -275,7 +275,7 @@ export function createCurlRepositoryPipelineAdapters(
 					if (workerStarted) throw new Error("Curl qualification worker session may run only once")
 					workerStarted = true
 					await context.store.assertClaimCurrent(input.claim)
-				const workerResult = await runWorker({ launch: { repoRoot: sourceRoot, worktree, profile, model: MODEL, taskSha256, hostRuntimeEnv },
+					const workerResult = await runWorker({ launch: { repoRoot: sourceRoot, worktree, profile, model: MODEL, taskSha256, hostRuntimeEnv, importResults: false },
 						capabilityDirectory: path.dirname(context.store.path), jobId: input.claim.job.id, leaseToken, profileId: PROFILE_ID,
 						limits, apiKey, bindHost, ledger: binding })
 					return { ok: workerResult.ok, durationMs: workerResult.durationMs, outputSha256: workerResult.outputSha256,

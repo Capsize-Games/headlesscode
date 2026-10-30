@@ -171,6 +171,7 @@ async function testContainedCollectorStartsBeforeProfileAndClosesWithWorkspace()
 				assert.equal(input.launch.hostRuntimeEnv?.XDG_CONFIG_HOME, runtimeConfig.openshellXdgConfigHome)
 				assert.equal(input.launch.hostRuntimeEnv?.XDG_STATE_HOME, runtimeConfig.openshellXdgStateHome)
 				assert.equal(input.launch.hostRuntimeEnv?.OPENROUTER_API_KEY, undefined)
+				assert.equal(input.launch.importResults, false)
 				return { ok: true, exitCode: 0, durationMs: 1, outputSha256: "c".repeat(64),
 				receipt: {} as any, actualMicros: 0, actualTokens: 0 } },
 		})

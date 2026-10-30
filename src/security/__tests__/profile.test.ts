@@ -4,7 +4,7 @@ import * as fs from "node:fs"
 import * as net from "node:net"
 import * as os from "node:os"
 import * as path from "node:path"
-import { assertEffectiveOpenShellPolicy, cleanupContainedRuntimeProfile, containedGuestEnvironment, loadResolvedContainedProfile, REPOSITORY_BROKER_CAPABILITY_PATH, REPOSITORY_BROKER_PORT, resolveContainedRuntimeProfile, serializeResolvedContainedProfile, verifyContainedPrerequisites } from "../profile.js"
+import { assertEffectiveOpenShellPolicy, cleanupContainedRuntimeProfile, containedGuestEnvironment, loadResolvedContainedProfile, REPOSITORY_BROKER_CAPABILITY_PATH, REPOSITORY_BROKER_PORT, resolveContainedRuntimeProfile, serializeResolvedContainedProfile, verifyContainedPrerequisites, verifyContainedSandboxIdentity } from "../profile.js"
 import type { OpenShellProbe, OpenShellProbeResult } from "../profile.js"
 
 const scratchRoot = path.join(process.cwd(), ".headlesscode", "scratch")
@@ -210,6 +210,42 @@ const tests: Array<[string, () => Promise<void>]> = [
 		assert.throws(() => verifyContainedPrerequisites({ expectedGatewayIdentity: "local-docker", probe: () => ({ status: 127, error: new Error("ENOENT") }) }), /verifiable OpenShell CLI/)
 		assert.throws(() => verifyContainedPrerequisites({ expectedGatewayIdentity: "local-docker", probe: (args) => args[0] === "--version" ? { status: 0, stdout: "openshell 0.1.2" } : { status: 1, stderr: "unavailable" } }), /healthy, reachable/)
 		assert.throws(() => verifyContainedPrerequisites({ expectedGatewayIdentity: "approved-gateway", probe: (args) => args[0] === "--version" ? { status: 0, stdout: "openshell 0.1.2" } : { status: 0, stdout: "Gateway: other-gateway\nStatus: healthy\n" } }), /identity does not match/)
+	}],
+	["accepts only explicit typed image fields from the exact ready sandbox and preserves typed-image gateways", async () => {
+		const expectedImage = `registry.example/headlesscode@sha256:${"a".repeat(64)}`
+		let observerCalls = 0
+		const calls: string[][] = []
+		const probe: OpenShellProbe = (args) => { calls.push(args); return args.includes("--policy-only")
+			? { status: 0, stdout: fixturePolicy("openrouter.ai") }
+			: { status: 0, stdout: JSON.stringify({ id: "c5adaef3-8863-460b-ba74-3070d6788a12", name: "fixture-sandbox", phase: "Ready", image: expectedImage }) } }
+		assert.doesNotThrow(() => verifyContainedSandboxIdentity({ probe, name: "fixture-sandbox", profile: {
+			image: expectedImage, cpu: "2", memory: "4Gi", purpose: "worker", inferenceEndpoint: { host: "openrouter.ai", port: 443 },
+			evidenceGuestPath: "/run/headlesscode/evidence.sock", evidenceGuestPublicKeyPath: "/etc/headlesscode/collector.pem",
+		}, imageObserver: () => { observerCalls++; throw new Error("observer must not run for a typed image response") } }))
+		assert.equal(observerCalls, 0)
+		assert.deepEqual(calls[1], ["sandbox", "get", "fixture-sandbox", "--policy-only"])
+		assert.throws(() => verifyContainedSandboxIdentity({ probe: (args) => args.includes("--policy-only") ? { status: 0, stdout: fixturePolicy("openrouter.ai") } : {
+			status: 0, stdout: JSON.stringify({ id: "c5adaef3-8863-460b-ba74-3070d6788a12", name: "fixture-sandbox", phase: "Ready", spec: { template: { image: "headlesscode:latest" } } }),
+		}, name: "fixture-sandbox", profile: { image: expectedImage, cpu: "2", memory: "4Gi", purpose: "worker", inferenceEndpoint: { host: "openrouter.ai", port: 443 },
+			evidenceGuestPath: "/run/headlesscode/evidence.sock", evidenceGuestPublicKeyPath: "/etc/headlesscode/collector.pem" }, imageObserver: () => { observerCalls++; throw new Error("must not fall back after a typed mismatch") } }), /does not match/)
+		assert.equal(observerCalls, 0)
+	}],
+	["uses the bounded host observer for image-free API records and rejects wrong API ownership", async () => {
+		const expectedImage = `registry.example/headlesscode@sha256:${"a".repeat(64)}`
+		const evidence = { imageId: `sha256:${"b".repeat(64)}`, configImage: `sha256:${"b".repeat(64)}`, localImageId: `sha256:${"b".repeat(64)}`, cpuCores: 2, memoryBytes: 4 * 1024 ** 3 }
+		let observed: unknown
+		const profile = { image: expectedImage, cpu: "2", memory: "4Gi", purpose: "worker" as const, inferenceEndpoint: { host: "openrouter.ai", port: 443 },
+			evidenceGuestPath: "/run/headlesscode/evidence.sock", evidenceGuestPublicKeyPath: "/etc/headlesscode/collector.pem" }
+		const apiDoc = { id: "c5adaef3-8863-460b-ba74-3070d6788a12", name: "fixture-sandbox", phase: "Ready", policy: { image: "must-not-be-used" } }
+		const probe: OpenShellProbe = (args) => args.includes("--policy-only") ? { status: 0, stdout: fixturePolicy("openrouter.ai") } : { status: 0, stdout: JSON.stringify(apiDoc) }
+		assert.doesNotThrow(() => verifyContainedSandboxIdentity({ probe, name: "fixture-sandbox", profile, imageObserver: (value) => { observed = value; return evidence } }))
+		assert.deepEqual(observed, { sandboxId: apiDoc.id, sandboxName: apiDoc.name, image: expectedImage, cpu: "2", memory: "4Gi" })
+		assert.throws(() => verifyContainedSandboxIdentity({ probe: (args) => args.includes("--policy-only") ? { status: 0, stdout: fixturePolicy("openrouter.ai") } : {
+			status: 0, stdout: JSON.stringify({ ...apiDoc, name: "other-sandbox" }),
+		}, name: "fixture-sandbox", profile, imageObserver: () => evidence }), /exact-name UUID record/)
+		assert.throws(() => verifyContainedSandboxIdentity({ probe: (args) => args.includes("--policy-only") ? { status: 0, stdout: fixturePolicy("openrouter.ai") } : {
+			status: 0, stdout: JSON.stringify({ ...apiDoc, id: "invalid" }),
+		}, name: "fixture-sandbox", profile, imageObserver: () => evidence }), /exact-name UUID record/)
 	}],
 	["accepts only the expected effective inference endpoint and denies evaluation network", async () => {
 		const worker = { purpose: "worker" as const, inferenceEndpoint: { host: "openrouter.ai", port: 443 } }

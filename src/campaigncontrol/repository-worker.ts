@@ -37,6 +37,8 @@ export interface RepositoryWorkerLaunch {
 	taskSha256: string
 	/** Narrow host-only paths for the supervisor/OpenShell CLI; never copied into the guest request. */
 	hostRuntimeEnv?: NodeJS.ProcessEnv
+	/** Read-only qualification jobs never import a candidate Git bundle into the pinned host checkout. */
+	importResults?: boolean
 }
 
 export interface RepositoryWorkerResult {
@@ -201,6 +203,7 @@ export async function runContainedRepositoryWorker(input: RepositoryWorkerLaunch
 		providers: [],
 		autoProviders: false,
 		includeProjectData: false,
+		importResults: input.importResults ?? true,
 		commandTimeoutMs: 15 * 60_000,
 		hostRuntimeEnv: input.hostRuntimeEnv,
 	})
