@@ -7,9 +7,13 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { test } from "node:test"
 import { createRepositoryCampaignBudgetBinding } from "../repository-budget-binding.js"
+import { RepositoryCampaignCoordinator } from "../repository-coordinator.js"
 import { RepositoryCampaignStore, type RepositoryBudgetAuthority,
 	type RepositoryCampaignDefinition,
 		type RepositoryCampaignJob } from "../repository-campaigns.js"
+import { createRepositoryWorkerPipeline, type RepositoryPreparedWorkspace,
+	type RepositoryWorkerPipelineAdapters } from "../repository-worker-pipeline.js"
+import { repositoryProgressSnapshot } from "../repository-progress.js"
 import { CampaignControlStore } from "../store.js"
 import { FleetRepositoryBudgetLedger,
 	type FleetRepositoryBudgetScope } from "../../rsi/fleet-repository-budget-ledger.js"
@@ -356,6 +360,128 @@ test("HCL binding sends v2 repository identities and both repositories consume t
 	await extraLedger.register(extraGrant)
 	await assert.rejects(extraLedger.reserve(extraGrant, { ...reservation("extra-call"), reservedUsd: 0.01, reservedTokens: 2 }),
 		/repository lifetime budget exhausted/)
+})
+
+test("two-repository coordinator pipelines reserve together, Stop fences new calls, and restart preserves settled budget and progress", { skip: integrationSkip }, async (t) => {
+	const f = await fixture(); t.after(f.cleanup)
+	const root = path.join(f.root, "coordinated-pipelines"); await privateDir(root)
+	const pipelineDefinitions = definitions.map((definition) => ({ ...definition,
+		workerProfile: `fixture-${definition.id}`, }))
+	const authority: RepositoryBudgetAuthority = { mode: "synthetic-test", available: true,
+		limitMicros: 20_000, limitTokens: 20_000, committedMicros: 0, committedTokens: 0 }
+	const store = new RepositoryCampaignStore(path.join(root, "campaigns.json"), pipelineDefinitions, () => authority)
+	for (const id of ["repo-a", "repo-b"] as const) {
+		await store.setCampaignBudget(id, 10_000, 10_000)
+		await store.start(id)
+		await store.enqueue(id, id === "repo-a" ? "CVE-2026-92340" : "CVE-2026-92341")
+	}
+	const bothPrepared = deferred<void>(), allowA = deferred<void>(), allowB = deferred<void>()
+	const aSent = deferred<void>(), aResponse = deferred<Response>()
+	let prepared = 0, sendsA = 0, sendsB = 0, evaluatorCalls = 0, deliveryCalls = 0
+	const workers = (["repo-a", "repo-b"] as const).map((id) => {
+		const adapters: RepositoryWorkerPipelineAdapters = {
+			workerProfile: `fixture-${id}`, recipeDigest: (id === "repo-a" ? "c" : "e").repeat(64),
+			evaluatorDigest: (id === "repo-a" ? "d" : "f").repeat(64),
+			model: MODEL, executionKind: "development-checkpoint", reservation: { micros: 10_000, tokens: 10_000 },
+			async lookupAdvisory(advisoryId) { return { advisoryId, sourceUrl: `https://fixture.invalid/${advisoryId}`,
+				snapshotSha256: "e".repeat(64), summary: "Synthetic fixture", affectedRange: "< 1.0",
+				fixedVersion: "1.0", verificationCheckIds: ["fixture-check"] } },
+			async prepareWorkspace({ claim }): Promise<RepositoryPreparedWorkspace> {
+				const binding = createRepositoryCampaignBudgetBinding({ store, claim, scope: scope(id), expectedKeyIdentity: keyIdentity,
+					invoke: f.invoke, requestStartHandoff: f.requestStartHandoff })
+				const brokerGrant = grant(claim.job.id)
+				const call = reservation(`coordinator-${id}-${claim.job.id}`)
+				await binding.register(brokerGrant)
+				await binding.reserve(brokerGrant, call)
+				prepared += 1
+				if (prepared === 2) bothPrepared.resolve(undefined)
+				return { worktree: root, taskSha256: "f".repeat(64),
+					async runContained() {
+						await bothPrepared.promise
+						await (id === "repo-a" ? allowA.promise : allowB.promise)
+						const response = await binding.requestStartGate(async () => {
+							if (id === "repo-a") { sendsA += 1; aSent.resolve(undefined); return await aResponse.promise }
+							else { sendsB += 1; return new Response("unexpected fixture send") }
+						}, { grant: brokerGrant, reservation: call })
+						assert.equal(response.status, 200)
+						await binding.settle(brokerGrant, settlement(call.callId))
+						return { ok: true, durationMs: 1, outputSha256: "1".repeat(64), actualMicros: 100, actualTokens: 19 }
+					},
+					async candidateSha256() { return "2".repeat(64) },
+					async cleanup() { /* Synthetic workspace only. */ } }
+			},
+			async evaluate(): ReturnType<RepositoryWorkerPipelineAdapters["evaluate"]> { evaluatorCalls += 1; return { passed: true, evidenceSha256: "3".repeat(64), detail: "unexpected after Stop" } },
+			async deliverPrivate(): ReturnType<RepositoryWorkerPipelineAdapters["deliverPrivate"]> { deliveryCalls += 1; return { accepted: true, evidenceSha256: "4".repeat(64) } },
+		}
+		return createRepositoryWorkerPipeline(adapters)
+	})
+	const coordinator = new RepositoryCampaignCoordinator(store, workers, 100)
+	const waitTerminal = async (): Promise<RepositoryCampaignJob[]> => {
+		for (let i = 0; i < 300; i += 1) {
+			const jobs = (await store.status()).jobs as RepositoryCampaignJob[]
+			if (jobs.length === 2 && jobs.every((job) => job.status !== "queued" && job.status !== "running")) return jobs
+			await new Promise<void>((resolve) => setTimeout(resolve, 10))
+		}
+		throw new Error("synthetic coordinated jobs did not reach terminal states")
+	}
+	try {
+		await coordinator.start()
+		await bothPrepared.promise
+		const ledger = new FleetRepositoryBudgetLedger({ expectedKeyIdentity: keyIdentity, scope: scope("repo-a"), invoke: f.invoke })
+		const beforeCalls = await ledger.budgetSnapshot()
+		assert.equal(beforeCalls.campaignLifetime.reservedMicros, 20_000,
+			"both repository reservations consume the shared aggregate before either synthetic request starts")
+		assert.equal(beforeCalls.campaignLifetime.reservedTokens, 10_000)
+		assert.equal(sendsA + sendsB, 0)
+		allowA.resolve(undefined)
+		await aSent.promise
+		for (const id of ["repo-a", "repo-b"] as const) {
+			await store.stop(id)
+			coordinator.stopCampaign(id)
+		}
+		await f.setControl({ globalEnabled: false, repoAEnabled: false, repoBEnabled: false })
+		allowB.resolve(undefined)
+		for (let i = 0; i < 300; i += 1) {
+			const jobs = (await store.status()).jobs as RepositoryCampaignJob[]
+			if (jobs.some((job) => job.status === "ambiguous")) break
+			await new Promise<void>((resolve) => setTimeout(resolve, 10))
+		}
+		assert.equal(sendsB, 0, "Stop and the changed Fleet epoch prevent the second request callback")
+		aResponse.resolve(new Response("already-sent fixture response"))
+		const terminal = await waitTerminal()
+		await coordinator.stop()
+		assert.equal(sendsA, 1, "the already-started synthetic request is allowed to settle after Stop")
+		assert.equal(evaluatorCalls, 0)
+		assert.equal(deliveryCalls, 0)
+		assert.ok(terminal.some((job) => job.status === "failed" && job.settledMicros === 100))
+		assert.ok(terminal.some((job) => job.status === "ambiguous"), "the stopped unsent repository retains its unmeasured reservation")
+		const restarted = new RepositoryCampaignStore(store.path, pipelineDefinitions, () => authority)
+		for (const id of ["repo-a", "repo-b"] as const) {
+			const advisoryId = id === "repo-a" ? "CVE-2026-92340" : "CVE-2026-92341"
+			const duplicate = await restarted.enqueue(id, advisoryId)
+			assert.equal(duplicate.id, terminal.find((job) => job.campaignId === id)?.id,
+				"the same advisory is deduplicated after process restart")
+			const status = await restarted.status() as unknown as { campaigns: Array<Record<string, unknown> & { id: string }>;
+				jobs: RepositoryCampaignJob[] }
+			const definition = pipelineDefinitions.find((item) => item.id === id)!
+			const campaign = status.campaigns.find((item) => item.id === id)!
+			const progress = repositoryProgressSnapshot(definition, campaign,
+				(status.jobs as RepositoryCampaignJob[]).filter((job) => job.campaignId === id))
+			assert.equal(progress.workers.length, 1, "per-repository worker progress remains visible after restart")
+			assert.ok(progress.workers[0]?.goal)
+			assert.ok(progress.workers[0]?.workerId)
+			assert.ok(progress.workers[0]?.completedSteps.includes("intake"))
+			assert.equal(progress.counts.failed ?? -1, id === "repo-a" ? 1 : 0)
+			assert.equal(progress.counts.ambiguous ?? -1, id === "repo-b" ? 1 : 0)
+		}
+		const afterRestart = await ledger.budgetSnapshotOnly()
+		assert.equal(afterRestart.campaignLifetime.settledMicros, 100)
+		assert.equal(afterRestart.campaignLifetime.reservedMicros, 10_000)
+		assert.equal(((await restarted.status()) as unknown as { jobs: RepositoryCampaignJob[] }).jobs.length, 2)
+	} finally {
+		allowA.resolve(undefined); allowB.resolve(undefined); aResponse.resolve(new Response("fixture cleanup"))
+		await coordinator.stop()
+	}
 })
 
 test("Fleet no-call proof is scope-bound, point-in-time and read-only", { skip: integrationSkip }, async (t) => {
