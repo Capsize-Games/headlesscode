@@ -462,16 +462,26 @@ function validV2RecoveryProgress(
 	progress: RepositoryJobProgress | undefined,
 ): boolean {
 	return progress?.executionKind === "live-cve" &&
-		progress.stage === "prepare-candidate" &&
 		progress.blocker === "registered-pipeline-step-failed" &&
 		progress.currentTask ===
 			"Failed prepare attempt reconciled against Fleet no-call proof" &&
 		progress.nextStep ===
 			"Review the prepare failure before considering a separate job" &&
-		JSON.stringify(progress.completedSteps) ===
-			JSON.stringify(REPOSITORY_CAMPAIGN_STEPS.slice(0, 3)) &&
 		JSON.stringify(progress.requiredSteps) ===
-			JSON.stringify(REPOSITORY_CAMPAIGN_STEPS)
+		JSON.stringify(REPOSITORY_CAMPAIGN_STEPS) &&
+		(correctedPrepareProgress(progress) || legacyPrepareProgress(progress))
+}
+
+function correctedPrepareProgress(progress: RepositoryJobProgress): boolean {
+	return progress.stage === "prepare-candidate" &&
+		JSON.stringify(progress.completedSteps) ===
+			JSON.stringify(REPOSITORY_CAMPAIGN_STEPS.slice(0, 3))
+}
+
+function legacyPrepareProgress(progress: RepositoryJobProgress): boolean {
+	return progress.stage === "verify" &&
+		JSON.stringify(progress.completedSteps) ===
+			JSON.stringify(REPOSITORY_CAMPAIGN_STEPS.slice(0, 4))
 }
 
 function evidenceCount(

@@ -107,13 +107,13 @@ async function createStoreFixture(root: string): Promise<StoreFixture> {
 }
 
 export async function makeFailedPrepare(
-	root: string, candidate = false,
+	root: string, candidate = false, legacyProgress = false,
 ): Promise<FailureFixture> {
 	const fixture = await createStoreFixture(root)
 	const now = new Date()
 	const parent = await fixture.store.enqueueKnownRepairV2(pinnedInput(), now)
 	fixture.setActiveRun(true)
-	await failPrepareClaim(fixture.store, candidate, now)
+	await failPrepareClaim(fixture.store, candidate, legacyProgress, now)
 	fixture.setActiveRun(false)
 	return {
 		file: fixture.file, parent, store: fixture.store,
@@ -122,28 +122,36 @@ export async function makeFailedPrepare(
 }
 
 async function failPrepareClaim(
-	store: RepositoryCampaignStore, candidate: boolean, now: Date,
+	store: RepositoryCampaignStore, candidate: boolean,
+	legacyProgress: boolean, now: Date,
 ): Promise<void> {
 	const claim = await store.claimNext(
 		definition.id, CURL_REPAIR_V2_RESERVATION, now,
 		{ executionKind: "live-cve" },
 	)
 	assert.ok(claim)
-	await store.updateClaimProgress(claim!, failedPrepareProgress(candidate))
+	await store.updateClaimProgress(
+		claim!, failedPrepareProgress(candidate, legacyProgress),
+	)
 	await store.finish(claim!, ambiguousPrepareFailure())
 	await store.settleRecoveredClaim(claim!, recoveredNoCall(),
 		new Date(now.getTime() + 1))
 }
 
-function failedPrepareProgress(candidate: boolean): ProgressPatch {
+function failedPrepareProgress(
+	candidate: boolean, legacyProgress: boolean,
+): ProgressPatch {
 	const candidateRef = {
 		id: "3".repeat(64), kind: "candidate" as const,
 		label: "Candidate source digest",
 	}
+	const completedSteps: ProgressPatch["completedSteps"] = legacyProgress ?
+		["intake", "deduplicate", "investigate", "prepare-candidate"] :
+		["intake", "deduplicate", "investigate"]
 	return {
-		stage: "prepare-candidate" as const,
+		stage: legacyProgress ? "verify" : "prepare-candidate",
 		currentTask: "Prepare the bounded isolated workspace",
-		completedSteps: ["intake", "deduplicate", "investigate"],
+		completedSteps,
 		evidenceRefs: candidate ? [...refs, candidateRef] : refs,
 	}
 }
