@@ -1,7 +1,8 @@
 import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
 import { test } from "node:test"
-import { FleetRepositoryBudgetLedger, type FleetRepositoryBudgetScope } from "../fleet-repository-budget-ledger.js"
+import { closedSessionImmutableSha256, FleetRepositoryBudgetLedger, type FleetRepositoryBudgetScope,
+	type FleetRepositoryClosedSessionProof } from "../fleet-repository-budget-ledger.js"
 
 const scope: FleetRepositoryBudgetScope = { repositoryCampaignId: "curl-maintenance", repositoryId: "curl-maintenance",
 	repository: "Capsize-Games/curl-maintenance", sourceRevision: "c".repeat(40), policySha256: "d".repeat(64),
@@ -39,6 +40,11 @@ function createProof(overrides: Record<string, unknown> = {}) {
 	record.proofSha256 = createHash("sha256").update(canonical(record)).digest("hex")
 	return record
 }
+function redigest(proof: FleetRepositoryClosedSessionProof): FleetRepositoryClosedSessionProof {
+	const unsigned = { ...proof } as Record<string, unknown>
+	delete unsigned.proofSha256
+	return { ...proof, proofSha256: createHash("sha256").update(canonical(unsigned)).digest("hex") }
+}
 function ledger(response: Record<string, unknown>) {
 	return new FleetRepositoryBudgetLedger({ scope, expectedKeyIdentity: keyIdentity, invoke: async () => response })
 }
@@ -59,4 +65,20 @@ test("closed-session verifier rejects forged digest, mismatched job, active gran
 	const unsettled = createProof(); (unsettled.calls as Array<Record<string, unknown>>)[0]!.settlement = { state: "ambiguous" }
 	delete unsettled.proofSha256; unsettled.proofSha256 = createHash("sha256").update(canonical(unsettled)).digest("hex")
 	await assert.rejects(ledger(unsettled).proveClosedCurlQualificationSession(jobId, scope.repositoryEpoch), /unsettled or mismatched/)
+})
+
+test("immutable proof comparison ignores read time and detects changed session records", () => {
+	const first = createProof() as unknown as FleetRepositoryClosedSessionProof
+	const later = redigest({ ...first, asOfMs: first.asOfMs + 1 })
+	assert.notEqual(first.proofSha256, later.proofSha256)
+	assert.equal(closedSessionImmutableSha256(first), closedSessionImmutableSha256(later))
+	const callChange = structuredClone(first)
+	callChange.calls[0]!.settlement.providerRequestId = "changed-request-id"
+	const grantChange = structuredClone(first)
+	grantChange.grant.grantSha256 = "9".repeat(64)
+	const denialChange = structuredClone(first)
+	denialChange.denials[0]!.reason = "invalid-request"
+	for (const changed of [callChange, grantChange, denialChange]) {
+		assert.notEqual(closedSessionImmutableSha256(first), closedSessionImmutableSha256(changed))
+	}
 })

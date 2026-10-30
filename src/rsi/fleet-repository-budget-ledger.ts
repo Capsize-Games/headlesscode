@@ -605,6 +605,15 @@ function sha256Canonical(value: unknown): string {
 	return createHash("sha256").update(canonicalJson(value)).digest("hex")
 }
 
+/** Hash a closed session without the per-read timestamp or its digest field. */
+export function closedSessionImmutableSha256(
+	proof: FleetRepositoryClosedSessionProof,
+): string {
+	const immutable = Object.fromEntries(Object.entries(proof)
+		.filter(([key]) => key !== "asOfMs" && key !== "proofSha256"))
+	return sha256Canonical(immutable)
+}
+
 function withoutField(value: Record<string, unknown>, field: string): Record<string, unknown> {
 	return Object.fromEntries(Object.entries(value).filter(([key]) => key !== field))
 }
