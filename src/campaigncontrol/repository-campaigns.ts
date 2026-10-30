@@ -5,9 +5,11 @@ import { randomUUID } from "node:crypto"
 import { CURL_CAMPAIGN_ID, CURL_DEBIAN_AFFECTED_RANGE, CURL_DEBIAN_FIXED_REVISION, CURL_DEBIAN_INTRODUCED_REVISION,
 	CURL_DEBIAN_PUBLIC_BASE_REVISION, CURL_DEBIAN_SNAPSHOT_SHA256, CURL_DEBIAN_SOURCE_HTML_SHA256, CURL_DEBIAN_SOURCE_URL,
 	CURL_FIXED_ADVISORY } from "./repository-known-advisory.js"
-import { CURL_REPAIR_CAMPAIGN_ID } from "./repository-campaign-ids.js"
+import { CURL_REPAIR_CAMPAIGN_ID, CURL_REPAIR_V2_CAMPAIGN_ID } from "./repository-campaign-ids.js"
 import { CURL_REPAIR_EVALUATOR_DIGEST, CURL_REPAIR_POLICY_SHA256, CURL_REPAIR_PROFILE_ID, CURL_REPAIR_RECIPE_DIGEST, CURL_REPAIR_SOURCE_REVISION,
 	CURL_REPAIR_REPOSITORY_ID, CURL_REPAIR_RESERVATION, CURL_REPAIR_TARGET_REPOSITORY } from "./repository-curl-repair.js"
+import { CURL_REPAIR_V2_EVALUATOR_DIGEST, CURL_REPAIR_V2_POLICY_SHA256, CURL_REPAIR_V2_PROFILE_ID,
+	CURL_REPAIR_V2_RECIPE_DIGEST, CURL_REPAIR_V2_REPOSITORY_ID } from "./repository-curl-repair-v2-profile.js"
 
 export const REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS = 5_000_000
 // Keeps the mock subcap within the existing fixed Fleet campaign's 108k-token ceiling.
@@ -141,7 +143,7 @@ export interface RepositoryAdvisoryIntakeRecord {
 	firstSeenAt: number
 	lastSeenAt: number
 	jobId: string | null
-	source?: "osv-commit-query" | "debian-tracker-snapshot" | "debian-tracker-repair-snapshot"
+	source?: "osv-commit-query" | "debian-tracker-snapshot" | "debian-tracker-repair-snapshot" | "debian-tracker-repair-v2-snapshot"
 	sourceUrl?: string
 	sourceContentSha256?: string
 }
@@ -419,6 +421,14 @@ function validRepairJob(job: RepositoryCampaignJob, s: Partial<CampaignState>): 
 		row.campaignId === job.campaignId && row.advisoryId === job.advisoryId && row.snapshotSha256 === CURL_DEBIAN_SNAPSHOT_SHA256)
 }
 
+function validRepairV2Job(job: RepositoryCampaignJob, s: Partial<CampaignState>): boolean {
+	return job.purpose === "repair" && job.campaignId === CURL_REPAIR_V2_CAMPAIGN_ID &&
+		job.advisoryId === CURL_FIXED_ADVISORY && job.retryOf === undefined &&
+		(s.intakeRecords ?? []).some((row) => row?.source === "debian-tracker-repair-v2-snapshot" &&
+			row.jobId === job.id && row.campaignId === job.campaignId &&
+			row.advisoryId === job.advisoryId && row.snapshotSha256 === CURL_DEBIAN_SNAPSHOT_SHA256)
+}
+
 function retryableHistoricalRepairFailure(job: RepositoryCampaignJob): boolean {
 	const progress = job.progress
 	const refs = progress?.evidenceRefs ?? []
@@ -444,7 +454,8 @@ function validJobRecord(job: RepositoryCampaignJob, s: Partial<CampaignState>, i
 function validJobOptionalDetails(job: RepositoryCampaignJob, s: Partial<CampaignState>): boolean {
 	const text = (job.claimId === undefined || typeof job.claimId === "string") && (job.detail === undefined || typeof job.detail === "string")
 	const retry = job.retryOf === undefined || validId(job.retryOf)
-	const purpose = job.purpose === undefined || validQualificationJob(job, s) || validRepairJob(job, s)
+	const purpose = job.purpose === undefined || validQualificationJob(job, s) ||
+		validRepairJob(job, s) || validRepairV2Job(job, s)
 	const progress = job.progress === undefined || validProgress(job.progress)
 	return text && retry && purpose && progress
 }
@@ -461,10 +472,52 @@ function validJobAccounting(job: RepositoryCampaignJob): boolean {
 }
 
 function validPinnedDebianIntake(row: RepositoryAdvisoryIntakeRecord): boolean {
-	const campaignId = row.source === "debian-tracker-repair-snapshot" ? CURL_REPAIR_CAMPAIGN_ID : CURL_CAMPAIGN_ID
+	const campaignId = row.source === "debian-tracker-repair-snapshot" ? CURL_REPAIR_CAMPAIGN_ID :
+		row.source === "debian-tracker-repair-v2-snapshot" ? CURL_REPAIR_V2_CAMPAIGN_ID : CURL_CAMPAIGN_ID
 	return row.campaignId === campaignId && row.advisoryId === CURL_FIXED_ADVISORY &&
 		row.publicBaseRevision === CURL_DEBIAN_PUBLIC_BASE_REVISION && row.sourceUrl === CURL_DEBIAN_SOURCE_URL &&
 		row.sourceContentSha256 === CURL_DEBIAN_SOURCE_HTML_SHA256 && row.snapshotSha256 === CURL_DEBIAN_SNAPSHOT_SHA256
+}
+
+function repairIntakeMatches(input: { campaignId: string; advisoryId: string; publicBaseRevision: string;
+	snapshotSha256: string; sourceUrl: string; sourceContentSha256: string; affectedRange: string },
+	campaignId: string): boolean {
+	return input.campaignId === campaignId && input.advisoryId === CURL_FIXED_ADVISORY &&
+		input.publicBaseRevision === CURL_DEBIAN_PUBLIC_BASE_REVISION &&
+		input.snapshotSha256 === CURL_DEBIAN_SNAPSHOT_SHA256 && input.sourceUrl === CURL_DEBIAN_SOURCE_URL &&
+		input.sourceContentSha256 === CURL_DEBIAN_SOURCE_HTML_SHA256 && input.affectedRange === CURL_DEBIAN_AFFECTED_RANGE
+}
+
+function queuePinnedRepairInState(s: CampaignState, input: { campaignId: string; advisoryId: string;
+	publicBaseRevision: string; snapshotSha256: string; sourceUrl: string; sourceContentSha256: string },
+	source: "debian-tracker-repair-snapshot" | "debian-tracker-repair-v2-snapshot", now: Date): RepositoryCampaignJob {
+	const records = s.intakeRecords ??= []
+	if (records.some((row) => row.campaignId === input.campaignId && row.advisoryId === input.advisoryId && row.source === source)) {
+		throw new Error("known advisory repair has already been recorded")
+	}
+	const campaign = s.campaigns[input.campaignId]
+	if (!campaign?.enabled || s.jobs.length >= MAX_JOBS || records.length >= MAX_INTAKE_RECORDS) throw new Error("known advisory repair is not admissible")
+	const job = newRepairJob(input, campaign.epoch, s.month, now)
+	s.jobs.push(job)
+	records.push(newRepairIntake(input, source, job.id, now))
+	return { ...job }
+}
+
+function newRepairJob(input: { campaignId: string; advisoryId: string }, epoch: number,
+	month: string, now: Date): RepositoryCampaignJob {
+	return { id: randomUUID(), campaignId: input.campaignId, advisoryId: input.advisoryId,
+		status: "queued", epoch, createdAt: now.getTime(), updatedAt: now.getTime(), month,
+		reservedMicros: 0, settledMicros: 0, reservedTokens: 0, settledTokens: 0, purpose: "repair" }
+}
+
+function newRepairIntake(input: { campaignId: string; advisoryId: string; publicBaseRevision: string;
+	snapshotSha256: string; sourceUrl: string; sourceContentSha256: string },
+	source: "debian-tracker-repair-snapshot" | "debian-tracker-repair-v2-snapshot",
+	jobId: string, now: Date): RepositoryAdvisoryIntakeRecord {
+	return { campaignId: input.campaignId, publicBaseRevision: input.publicBaseRevision,
+		advisoryId: input.advisoryId, snapshotSha256: input.snapshotSha256, disposition: "eligible",
+		firstSeenAt: now.getTime(), lastSeenAt: now.getTime(), jobId, source,
+		sourceUrl: input.sourceUrl, sourceContentSha256: input.sourceContentSha256 }
 }
 
 function validIntakeRecord(row: RepositoryAdvisoryIntakeRecord, s: Partial<CampaignState>, keys: Set<string>): boolean {
@@ -482,10 +535,12 @@ function validIntakeIdentity(row: RepositoryAdvisoryIntakeRecord, s: Partial<Cam
 }
 
 function validIntakeSource(row: RepositoryAdvisoryIntakeRecord): boolean {
-	const source = row.source === undefined || ["osv-commit-query", "debian-tracker-snapshot", "debian-tracker-repair-snapshot"].includes(row.source)
+	const source = row.source === undefined || ["osv-commit-query", "debian-tracker-snapshot",
+		"debian-tracker-repair-snapshot", "debian-tracker-repair-v2-snapshot"].includes(row.source)
 	const url = row.sourceUrl === undefined || validAdvisorySourceUrl(row.sourceUrl)
 	const content = row.sourceContentSha256 === undefined || /^[a-f0-9]{64}$/.test(row.sourceContentSha256)
-	const pinned = !["debian-tracker-snapshot", "debian-tracker-repair-snapshot"].includes(row.source ?? "") || validPinnedDebianIntake(row)
+	const pinned = !["debian-tracker-snapshot", "debian-tracker-repair-snapshot",
+		"debian-tracker-repair-v2-snapshot"].includes(row.source ?? "") || validPinnedDebianIntake(row)
 	return source && url && content && pinned
 }
 
@@ -635,13 +690,24 @@ function snapshotCanProvision(authority: RepositoryBudgetAuthority): boolean {
 }
 
 function liveBudgetOnlyAdmission(authority: RepositoryBudgetAuthority, definition: RepositoryCampaignDefinition): boolean {
-	return authority.mode === "fleet-v2-budget-only" && definition.id === CURL_REPAIR_CAMPAIGN_ID &&
-		definition.repositoryId === CURL_REPAIR_REPOSITORY_ID && definition.repository === CURL_REPAIR_TARGET_REPOSITORY &&
-		definition.sourceRevision === CURL_REPAIR_SOURCE_REVISION && definition.policySha256 === CURL_REPAIR_POLICY_SHA256 &&
-		definition.workerProfile === CURL_REPAIR_PROFILE_ID && definition.recipeDigest === CURL_REPAIR_RECIPE_DIGEST &&
-		definition.evaluatorDigest === CURL_REPAIR_EVALUATOR_DIGEST && authority.snapshotOnly === true && !authority.available &&
+	const profile = v1RepairDefinition(definition) || v2RepairDefinition(definition)
+	return authority.mode === "fleet-v2-budget-only" && profile && authority.snapshotOnly === true && !authority.available &&
 		authority.globalEnabled === true && authority.canAdmit === true && authority.repositoryEnabled === true &&
 		!!authority.runId && Number.isSafeInteger(authority.runExpiresAtMs) && Number(authority.runExpiresAtMs) > Date.now()
+}
+
+function v1RepairDefinition(definition: RepositoryCampaignDefinition): boolean {
+	return definition.id === CURL_REPAIR_CAMPAIGN_ID && definition.repositoryId === CURL_REPAIR_REPOSITORY_ID &&
+		definition.repository === CURL_REPAIR_TARGET_REPOSITORY && definition.sourceRevision === CURL_REPAIR_SOURCE_REVISION &&
+		definition.policySha256 === CURL_REPAIR_POLICY_SHA256 && definition.workerProfile === CURL_REPAIR_PROFILE_ID &&
+		definition.recipeDigest === CURL_REPAIR_RECIPE_DIGEST && definition.evaluatorDigest === CURL_REPAIR_EVALUATOR_DIGEST
+}
+
+function v2RepairDefinition(definition: RepositoryCampaignDefinition): boolean {
+	return definition.id === CURL_REPAIR_V2_CAMPAIGN_ID && definition.repositoryId === CURL_REPAIR_V2_REPOSITORY_ID &&
+		definition.repository === CURL_REPAIR_TARGET_REPOSITORY && definition.sourceRevision === CURL_REPAIR_SOURCE_REVISION &&
+		definition.policySha256 === CURL_REPAIR_V2_POLICY_SHA256 && definition.workerProfile === CURL_REPAIR_V2_PROFILE_ID &&
+		definition.recipeDigest === CURL_REPAIR_V2_RECIPE_DIGEST && definition.evaluatorDigest === CURL_REPAIR_V2_EVALUATOR_DIGEST
 }
 
 function aggregateBudgetExhausted(authority: RepositoryBudgetAuthority,
@@ -760,9 +826,9 @@ function validFleetCampaign(authority: RepositoryBudgetAuthority, campaignId: st
 	const definition = definitionFor(campaignId)
 	const ordinary = authority.mode !== "fleet-v2-budget-only" && authority.repositoryCampaignId === campaignId &&
 		authority.sourceRevision === definition.sourceRevision && authority.model === definition.model
-	return ordinary || (liveBudgetOnlyAdmission(authority, definition) && authority.repositoryCampaignId === CURL_REPAIR_CAMPAIGN_ID &&
-		authority.repositoryId === CURL_REPAIR_REPOSITORY_ID && authority.repository === CURL_REPAIR_TARGET_REPOSITORY &&
-		authority.sourceRevision === CURL_REPAIR_SOURCE_REVISION && authority.policySha256 === CURL_REPAIR_POLICY_SHA256 &&
+	return ordinary || (liveBudgetOnlyAdmission(authority, definition) && authority.repositoryCampaignId === definition.id &&
+		authority.repositoryId === definition.repositoryId && authority.repository === definition.repository &&
+		authority.sourceRevision === definition.sourceRevision && authority.policySha256 === definition.policySha256 &&
 		authority.model === "none" && authority.profileId === "no-model")
 }
 
@@ -1380,6 +1446,37 @@ export class RepositoryCampaignStore {
 			s.jobs.push(job)
 			s.intakeRecords.push(record)
 			return { ...job }
+		}, now)
+	}
+
+	async enqueueKnownRepairV2(input: { campaignId: string; advisoryId: string; publicBaseRevision: string; snapshotSha256: string;
+		sourceUrl: string; sourceContentSha256: string; affectedRange: string }, now = new Date()): Promise<RepositoryCampaignJob> {
+		if (!repairIntakeMatches(input, CURL_REPAIR_V2_CAMPAIGN_ID)) throw new Error("known v2 repair is outside the pinned Curl snapshot")
+		this.requireDefinition(CURL_REPAIR_V2_CAMPAIGN_ID)
+		return await this.update((s) => queuePinnedRepairInState(s, input, "debian-tracker-repair-v2-snapshot", now), now)
+	}
+
+	async observeKnownRepairAdvisoryV2(input: { campaignId: string; advisoryId: string; publicBaseRevision: string;
+		snapshotSha256: string; sourceUrl: string; sourceContentSha256: string; affectedRange: string }, now = new Date()): Promise<{ changed: boolean; queued: boolean }> {
+		if (!repairIntakeMatches(input, CURL_REPAIR_V2_CAMPAIGN_ID)) throw new Error("known v2 repair observation is outside the pinned Curl snapshot")
+		this.requireDefinition(CURL_REPAIR_V2_CAMPAIGN_ID)
+		return await this.update((s) => {
+			const records = s.intakeRecords ??= []
+			const existing = records.find((row) => row.campaignId === input.campaignId &&
+				row.publicBaseRevision === input.publicBaseRevision && row.advisoryId === input.advisoryId &&
+				row.source === "debian-tracker-repair-v2-snapshot")
+			if (existing) {
+				const existingJob = existing.jobId ? s.jobs.find((job) => job.id === existing.jobId) : undefined
+				if (!validPinnedDebianIntake(existing) || existing.disposition !== "eligible" || !existing.jobId ||
+					!existingJob || !validRepairV2Job(existingJob, s)) {
+					throw new Error("known Curl v2 repair intake record is incomplete or changed")
+				}
+				return { changed: false, queued: false }
+			}
+			const campaign = s.campaigns[input.campaignId]
+			if (!campaign?.enabled) throw new Error("known v2 advisory repair requires an enabled campaign")
+			queuePinnedRepairInState(s, input, "debian-tracker-repair-v2-snapshot", now)
+			return { changed: true, queued: true }
 		}, now)
 	}
 

@@ -3,7 +3,10 @@ import type { RegisteredRepositoryWorker, RepositoryAdvisoryIntake, RepositoryWo
 import type { VettedAdvisorySnapshot } from "./repository-worker.js"
 import type { CurlHistoricalRepairCandidate } from "./repository-curl-repair.js"
 import type { CurlHistoricalRepairReceipt } from "./repository-curl-repair-evaluator.js"
+import type { CurlHistoricalRepairV2Receipt } from "./repository-curl-repair-v2-evaluator.js"
+import type { CurlRepairV2StageReceipt, CurlRepairV2WorkerReceipt, CurlRepairV2EvaluatorReceipt } from "./repository-curl-repair-v2-execution.js"
 import { writeRepositoryWorkerDiagnostic } from "./repository-worker-diagnostics.js"
+import { CURL_REPAIR_V2_CAMPAIGN_ID } from "./repository-campaign-ids.js"
 
 export interface RepositoryPreparedWorkspace {
 	readonly worktree: string
@@ -11,6 +14,7 @@ export interface RepositoryPreparedWorkspace {
 	readonly runContained: (signal: AbortSignal) => Promise<{ ok: boolean; durationMs: number; outputSha256: string; actualMicros: number | null; actualTokens: number | null; failureDiagnostic?: string }>
 	readonly candidateSha256: () => Promise<string>
 	readonly historicalRepairCandidate?: CurlHistoricalRepairCandidate
+	readonly requiresContainedRepairWorker?: boolean
 	readonly cleanup?: () => Promise<void>
 }
 
@@ -19,6 +23,9 @@ export interface RepositoryVerificationReceipt {
 	readonly evidenceSha256: string
 	readonly detail: string
 	readonly historicalRepair?: { readonly candidate: CurlHistoricalRepairCandidate; readonly receipt: CurlHistoricalRepairReceipt }
+	readonly historicalRepairV2?: { readonly candidate: CurlHistoricalRepairCandidate; readonly receipt: CurlHistoricalRepairV2Receipt;
+		readonly worker: CurlRepairV2StageReceipt<CurlRepairV2WorkerReceipt>;
+		readonly evaluator: CurlRepairV2StageReceipt<CurlRepairV2EvaluatorReceipt> }
 }
 
 export interface RepositoryPrivateDeliveryReceipt {
@@ -38,8 +45,8 @@ export interface RepositoryWorkerPipelineAdapters {
 	readonly advisoryIntake?: RepositoryAdvisoryIntake
 	lookupAdvisory(advisoryId: string, definition: RepositoryCampaignDefinition): Promise<VettedAdvisorySnapshot>
 	prepareWorkspace(input: { definition: RepositoryCampaignDefinition; claim: ClaimedRepositoryJob; advisory: VettedAdvisorySnapshot }): Promise<RepositoryPreparedWorkspace>
-	evaluate(input: { definition: RepositoryCampaignDefinition; claim: ClaimedRepositoryJob; advisory: VettedAdvisorySnapshot; workspace: RepositoryPreparedWorkspace; candidateSha256: string }): Promise<RepositoryVerificationReceipt>
-	deliverPrivate(input: { definition: RepositoryCampaignDefinition; claim: ClaimedRepositoryJob; advisory: VettedAdvisorySnapshot; candidateSha256: string; verification: RepositoryVerificationReceipt }): Promise<RepositoryPrivateDeliveryReceipt>
+	evaluate(input: { definition: RepositoryCampaignDefinition; claim: ClaimedRepositoryJob; advisory: VettedAdvisorySnapshot; workspace: RepositoryPreparedWorkspace; candidateSha256: string; signal: AbortSignal }): Promise<RepositoryVerificationReceipt>
+	deliverPrivate(input: { definition: RepositoryCampaignDefinition; claim: ClaimedRepositoryJob; advisory: VettedAdvisorySnapshot; candidateSha256: string; verification: RepositoryVerificationReceipt; signal: AbortSignal }): Promise<RepositoryPrivateDeliveryReceipt>
 	recordFailureDiagnostic?(input: { claim: ClaimedRepositoryJob; stage: RepositoryCampaignStep; error: unknown }): Promise<{ digest: string }>
 }
 
@@ -93,17 +100,20 @@ export function createRepositoryWorkerPipeline(adapters: RepositoryWorkerPipelin
 				await progress({ stage: currentStage, currentTask, completedSteps, evidenceRefs })
 				const workspace = await adapters.prepareWorkspace({ definition, claim, advisory })
 				if (!/^[a-f0-9]{64}$/.test(workspace.taskSha256) || typeof workspace.candidateSha256 !== "function" ||
-					(claim.job.purpose === "repair" ? !workspace.historicalRepairCandidate : typeof workspace.runContained !== "function")) throw new Error("prepared workspace is invalid")
+					(claim.job.purpose === "repair" ? !workspace.historicalRepairCandidate ||
+						(workspace.requiresContainedRepairWorker && typeof workspace.runContained !== "function") :
+						typeof workspace.runContained !== "function")) throw new Error("prepared workspace is invalid")
 				try {
 				completedSteps = ["intake", "deduplicate", "investigate", "prepare-candidate"]
 					currentStage = "verify"
-				if (claim.job.purpose === "repair") {
+				if (claim.job.purpose === "repair" && !workspace.requiresContainedRepairWorker) {
 					actualMicros = 0
 					actualTokens = 0
 					await progress({ stage: "prepare-candidate", currentTask: "Materialize the pinned historical repair patch", completedSteps, evidenceRefs })
 				} else {
 					if (signal.aborted) throw signal.reason ?? new Error("worker stopped before contained execution")
-					await progress({ stage: "prepare-candidate", currentTask: "Run the registered contained worker", completedSteps, evidenceRefs })
+					const task = claim.job.purpose === "repair" ? "Prepare the pinned repair in the isolated worker" : "Run the registered contained worker"
+					await progress({ stage: "prepare-candidate", currentTask: task, completedSteps, evidenceRefs })
 					if (signal.aborted) throw signal.reason ?? new Error("worker stopped before contained execution")
 					const worker = await workspace.runContained(signal)
 					actualMicros = worker.actualMicros
@@ -114,7 +124,7 @@ export function createRepositoryWorkerPipeline(adapters: RepositoryWorkerPipelin
 				evidenceRefs.push(ref("candidate", "Candidate source digest", candidateSha256))
 				await progress({ stage: "verify", currentTask: "Run the protected registered evaluator", completedSteps, evidenceRefs })
 				if (signal.aborted) throw new Error("worker stopped before protected evaluation")
-				const verification = await adapters.evaluate({ definition, claim, advisory, workspace, candidateSha256 })
+				const verification = await adapters.evaluate({ definition, claim, advisory, workspace, candidateSha256, signal })
 				const verificationDigest = requireDigest(verification.evidenceSha256, "verification receipt")
 				evidenceRefs.push(ref("test-receipt", "Protected verification receipt", verificationDigest))
 				completedSteps = [...completedSteps, "verify"]
@@ -125,14 +135,14 @@ export function createRepositoryWorkerPipeline(adapters: RepositoryWorkerPipelin
 				currentTask = "Record the verified result through private delivery"
 				await progress({ stage: currentStage, currentTask, completedSteps, evidenceRefs })
 				if (signal.aborted) throw new Error("worker stopped before private delivery")
-				const delivery = await adapters.deliverPrivate({ definition, claim, advisory, candidateSha256, verification })
+				const delivery = await adapters.deliverPrivate({ definition, claim, advisory, candidateSha256, verification, signal })
 				const deliveryDigest = requireDigest(delivery.evidenceSha256, "private delivery receipt")
 				if (!delivery.accepted) return { status: "failed", stage: "deliver", accounting: actualMicros === null || actualTokens === null ? "ambiguous" : "measured",
 					actualMicros, actualTokens, completedSteps, evidenceRefs: [...evidenceRefs, ref("delivery", "Private delivery attempt", deliveryDigest)],
 					currentTask: "Private delivery did not accept the verified result", blocker: "private-delivery-not-accepted", nextStep: "reconcile the private delivery receipt" }
 				if (delivery.boardRef !== undefined && delivery.boardRef !== null &&
 					(typeof delivery.boardRef !== "string" || delivery.boardRef.length > 256 ||
-					!/^http:\/\/127\.0\.0\.1:8078\/api\/cards\/1c25cecf-e5e8-4b68-b6fd-5d6ad25426d7#hc-repository-result-v1:[a-f0-9]{64}$/.test(delivery.boardRef))) {
+					!validPrivateBoardRef(delivery.boardRef, claim.job.campaignId === CURL_REPAIR_V2_CAMPAIGN_ID))) {
 					throw new Error("private Board reference is invalid")
 				}
 				evidenceRefs.push(ref("delivery", "Private delivery receipt", deliveryDigest))
@@ -158,4 +168,13 @@ export function createRepositoryWorkerPipeline(adapters: RepositoryWorkerPipelin
 			}
 		},
 	}
+}
+
+function validPrivateBoardRef(value: string, v2: boolean): boolean {
+	const marker = v2 ? "v2" : "v1"
+	const prefix = "http://127.0.0.1:8078/api/cards/"
+	const card = "1c25cecf-e5e8-4b68-b6fd-5d6ad25426d7"
+	const suffix = `#hc-repository-result-${marker}:`
+	return value.startsWith(prefix + card + suffix) &&
+		/^[a-f0-9]{64}$/.test(value.slice((prefix + card + suffix).length))
 }
