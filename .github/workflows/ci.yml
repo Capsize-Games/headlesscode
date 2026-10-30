@@ -35,6 +35,15 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Test private Fleet source staging
+        run: node --test scripts/stage-fleet-test-source.test.mjs
+
+      - name: Stage pinned private Fleet source for integration tests
+        env:
+          FLEET_SECURITY_WATCH_PRIVATE_ROOT: ${{ vars.FLEET_SECURITY_WATCH_PRIVATE_ROOT }}
+          FLEET_SECURITY_WATCH_TEST_REF: ${{ vars.FLEET_SECURITY_WATCH_TEST_REF }}
+        run: node scripts/stage-fleet-test-source.mjs
+
       - name: Install dependencies
         run: npm ci
 
@@ -58,3 +67,12 @@ jobs:
 
       - name: End-to-end (mock OpenRouter, no key)
         run: bash scripts/e2e/run.sh
+
+      - name: Remove staged Fleet source
+        if: always()
+        run: >-
+          node -e 'const fs=require("node:fs");const path=require("node:path");
+          const root=process.env.FLEET_SECURITY_WATCH_TEST_ROOT;
+          const temp=process.env.RUNNER_TEMP;
+          if(root&&temp&&path.dirname(root).startsWith(path.join(temp,"fleet-test-source-")))
+          fs.rmSync(path.dirname(root),{recursive:true,force:true})'

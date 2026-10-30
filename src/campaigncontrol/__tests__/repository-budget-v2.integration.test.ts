@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
 import { spawn, spawnSync } from "node:child_process"
-import { constants, existsSync } from "node:fs"
+import { constants } from "node:fs"
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
@@ -20,6 +20,7 @@ import { FleetRepositoryBudgetLedger,
 import type { OpenRouterBrokerGrant, OpenRouterCallReservation,
 	OpenRouterCallSettlement,
 		OpenRouterBrokerLimits } from "../../rsi/inference-broker.js"
+import { requiredFleetTestRoot } from "./fleet-test-source.js"
 
 const MODEL = "meta/muse-spark-1.3-contributor"
 const PROFILE = "muse-spark-contributor"
@@ -94,10 +95,7 @@ with patches[0]:
         for item in patches[1:]: stack.enter_context(item)
         bridge.main()
 `
-const fleetRoot = process.env.FLEET_SECURITY_WATCH_TEST_ROOT ?? path.resolve(process.cwd(), "../fleet-repository-budget-v2")
-const fleetSourceAvailable = existsSync(path.join(fleetRoot,
-	"operations/campaign_budget_bridge.py"))
-const integrationSkip = fleetSourceAvailable ? false : "requires the Fleet source checkout; set FLEET_SECURITY_WATCH_TEST_ROOT in combined integration runs"
+const fleetRoot = requiredFleetTestRoot()
 
 const qualification = { sourceAudited: true, workerQualified: true,
 	recipeQualified: true, evaluatorQualified: true,
@@ -325,7 +323,7 @@ async function fixture(options: { activeRun?: boolean; repositoryEnabled?: boole
 		}, cleanup: () => fs.rm(home, { recursive: true, force: true }) }
 }
 
-test("HCL binding sends v2 repository identities and both repositories consume the same legacy campaign lifetime pool", { skip: integrationSkip }, async (t) => {
+test("HCL binding sends v2 repository identities and both repositories consume the same legacy campaign lifetime pool", async (t) => {
 	const f = await fixture(); t.after(f.cleanup)
 	for (const id of ["repo-a", "repo-b"] as const) {
 		await f.bindings[id].register(f.grants[id])
@@ -362,7 +360,7 @@ test("HCL binding sends v2 repository identities and both repositories consume t
 		/repository lifetime budget exhausted/)
 })
 
-test("two-repository coordinator pipelines reserve together, Stop fences new calls, and restart preserves settled budget and progress", { skip: integrationSkip }, async (t) => {
+test("two-repository coordinator pipelines reserve together, Stop fences new calls, and restart preserves settled budget and progress", async (t) => {
 	const f = await fixture(); t.after(f.cleanup)
 	const root = path.join(f.root, "coordinated-pipelines"); await privateDir(root)
 	const pipelineDefinitions = definitions.map((definition) => ({ ...definition,
@@ -484,7 +482,7 @@ test("two-repository coordinator pipelines reserve together, Stop fences new cal
 	}
 })
 
-test("Fleet no-call proof is scope-bound, point-in-time and read-only", { skip: integrationSkip }, async (t) => {
+test("Fleet no-call proof is scope-bound, point-in-time and read-only", async (t) => {
 	const f = await fixture(); t.after(f.cleanup)
 	const ledger = new FleetRepositoryBudgetLedger({ expectedKeyIdentity: keyIdentity, scope: scope("repo-a"), invoke: async (message) => {
 		const result = await f.invoke(message)
@@ -519,7 +517,7 @@ test("Fleet no-call proof is scope-bound, point-in-time and read-only", { skip: 
 	await assert.rejects(ledger.proveNoCall("prepare-failed-job", -1), /no-call proof identity is invalid/)
 })
 
-test("cold start reads Fleet budget without a run, then starts, claims, and stops through real HCL and Fleet stores", { skip: integrationSkip }, async (t) => {
+test("cold start reads Fleet budget without a run, then starts, claims, and stops through real HCL and Fleet stores", async (t) => {
 	const f = await fixture({ activeRun: false, repositoryEnabled: false }); t.after(f.cleanup)
 	const definition = definitions[0]!
 	const readAuthority = async (): Promise<RepositoryBudgetAuthority> => {
@@ -569,7 +567,7 @@ test("cold start reads Fleet budget without a run, then starts, claims, and stop
 	assert.equal(final.campaigns[0].enabled, false)
 })
 
-test("read-only snapshot permits budget changes for an enabled repository but never dispatches", { skip: integrationSkip }, async (t) => {
+test("read-only snapshot permits budget changes for an enabled repository but never dispatches", async (t) => {
 	const f = await fixture({ activeRun: false, repositoryEnabled: true }); t.after(f.cleanup)
 	const definition = definitions[0]!
 	const readAuthority = async (): Promise<RepositoryBudgetAuthority> => {
@@ -590,7 +588,7 @@ test("read-only snapshot permits budget changes for an enabled repository but ne
 		/require authoritative Fleet v2 registration/)
 })
 
-test("Stop changes to either epoch before the dual request-start fence prevent the HTTP callback", { skip: integrationSkip }, async (t) => {
+test("Stop changes to either epoch before the dual request-start fence prevent the HTTP callback", async (t) => {
 	const f = await fixture(); t.after(f.cleanup)
 	const id = "repo-a" as const, call = reservation("fixture-stop-call")
 	await f.bindings[id].register(f.grants[id]); await f.bindings[id].reserve(f.grants[id], call)
@@ -601,7 +599,7 @@ test("Stop changes to either epoch before the dual request-start fence prevent t
 	assert.equal(sends, 0)
 })
 
-test("Stop waits for Fleet request-start admission and send invocation, then proceeds before HTTP completion", { skip: integrationSkip }, async (t) => {
+test("Stop waits for Fleet request-start admission and send invocation, then proceeds before HTTP completion", async (t) => {
 	const f = await fixture(); t.after(f.cleanup)
 	const id = "repo-a" as const, call = reservation("fixture-ordered-stop-call")
 	const admissionEntered = deferred<void>(), releaseAdmission = deferred<void>()
@@ -627,7 +625,7 @@ test("Stop waits for Fleet request-start admission and send invocation, then pro
 	assert.equal((await request).status, 200)
 })
 
-test("Python crash after durable request-start is fail-closed and preserves both ambiguous holds", { skip: integrationSkip }, async (t) => {
+test("Python crash after durable request-start is fail-closed and preserves both ambiguous holds", async (t) => {
 	const f = await fixture(); t.after(f.cleanup)
 	const id = "repo-a" as const, call = reservation("fixture-python-crash-call")
 	await f.bindings[id].register(f.grants[id]); await f.bindings[id].reserve(f.grants[id], call)
@@ -647,7 +645,7 @@ test("Python crash after durable request-start is fail-closed and preserves both
 	assert.equal(status.budget.ambiguousMicros, 20_000)
 })
 
-test("Node-side no-ack closes its shared lock descriptor and leaves the send reservation held", { skip: integrationSkip }, async (t) => {
+test("Node-side no-ack closes its shared lock descriptor and leaves the send reservation held", async (t) => {
 	const f = await fixture(); t.after(f.cleanup)
 	const id = "repo-a" as const, call = reservation("fixture-no-ack-call")
 	await f.bindings[id].register(f.grants[id]); await f.bindings[id].reserve(f.grants[id], call)
@@ -668,7 +666,7 @@ test("Node-side no-ack closes its shared lock descriptor and leaves the send res
 	assert.equal(status.budget.ambiguousMicros, 20_000)
 })
 
-test("immediately rejected fetch is observed during lock acknowledgement and keeps the claim recoverable", { skip: integrationSkip }, async (t) => {
+test("immediately rejected fetch is observed during lock acknowledgement and keeps the claim recoverable", async (t) => {
 	const f = await fixture(); t.after(f.cleanup)
 	const id = "repo-a" as const, call = reservation("fixture-rejected-fetch-call")
 	await f.bindings[id].register(f.grants[id]); await f.bindings[id].reserve(f.grants[id], call)
@@ -689,7 +687,7 @@ test("immediately rejected fetch is observed during lock acknowledgement and kee
 	assert.equal(status.budget.ambiguousMicros, 20_000)
 })
 
-test("restart reconciliation settles an exact late receipt after Stop and UTC month rollover", { skip: integrationSkip }, async (t) => {
+test("restart reconciliation settles an exact late receipt after Stop and UTC month rollover", async (t) => {
 	const f = await fixture(); t.after(f.cleanup)
 	const id = "repo-a" as const, call = reservation("fixture-restart-call")
 	await f.bindings[id].register(f.grants[id]); await f.bindings[id].reserve(f.grants[id], call)

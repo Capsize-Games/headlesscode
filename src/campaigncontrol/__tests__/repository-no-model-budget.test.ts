@@ -18,6 +18,7 @@ import type { FleetRepositoryBudgetLedgerOptions } from "../../rsi/fleet-reposit
 import type { OpenRouterBrokerGrant, OpenRouterCallReservation } from "../../rsi/inference-broker.js"
 import type { ActiveCampaignRun } from "../store.js"
 import { runMain, type SuiteTest } from "../../test-runner.js"
+import { requiredFleetTestRoot } from "./fleet-test-source.js"
 
 const key = "offline-budget-only-key-identity-source"
 const keyIdentity = createHash("sha256").update(key).digest("hex")
@@ -167,7 +168,7 @@ async function realPythonBudgetOnlyBridgeFeedsHclAuthorityAndLocalClaim(): Promi
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "hcl-no-model-python-bridge-"))
 	const campaignRoot = path.join(root, ".local", "state", "fleet-security-watch", "automation", "campaign")
 	const controlPath = path.join(root, ".local", "share", "headlesscode", "campaign-control", "control.json")
-	const fleetRoot = process.env.FLEET_SECURITY_WATCH_TEST_ROOT ?? path.resolve(process.cwd(), "../fleet-budget-only-no-model-bridge")
+	const fleetRoot = requiredFleetTestRoot()
 	try {
 		await fs.mkdir(campaignRoot, { recursive: true, mode: 0o700 })
 		await fs.mkdir(path.dirname(controlPath), { recursive: true, mode: 0o700 })
