@@ -1,4 +1,45 @@
 import * as fs from "node:fs/promises"
+import { acquireCampaignLock, ensurePrivateCampaignRoot, readCampaignStateFile } from "./repository-campaigns-state-io.js"
+import { REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS, REPOSITORY_CAMPAIGN_BUDGET_CAP_TOKENS, MAX_CAMPAIGNS, MAX_JOBS, MAX_INTAKE_RECORDS, MAX_HISTORY, MOCK_DISPATCH_TIMEOUT_MS, REPOSITORY_WORKER_LEASE_MS, REPOSITORY_PROGRESS_FRESH_MS, REPOSITORY_CAMPAIGN_STEPS, RepositoryCampaignStep, RepositoryEvidenceRef, RepositoryJobProgress, PRIVATE_BOARD_REF, RepositoryCampaignDefinition, RepositoryBudgetAuthority, RepositoryCampaignJob, RepositoryAdvisoryIntakeRecord,  } from "./repository-campaigns-model.js"
+import { CampaignRecord, CampaignState, ClaimedRepositoryJob, MockRepositoryDispatcher } from "./repository-campaigns-state-model.js"
+export * from "./repository-campaigns-state-model.js"
+export * from "./repository-campaigns-model.js"
+
+type ObservedAdvisoryInput = {
+	campaignId: string
+	publicBaseRevision: string
+	advisoryId: string
+	snapshotSha256: string
+	eligible: boolean
+}
+type RepositoryProgressUpdate = {
+	stage: RepositoryCampaignStep
+	currentTask: string
+	completedSteps: RepositoryCampaignStep[]
+	blocker?: string | null
+	nextStep?: string | null
+	evidenceRefs?: RepositoryEvidenceRef[]
+	boardRef?: string | null
+}
+type RepositoryFinishProgress = {
+	currentTask?: string
+	blocker?: string | null
+	nextStep?: string | null
+	boardRef?: string | null
+}
+type RepositoryFinishResult = {
+	status: "succeeded" | "failed" | "ambiguous"
+	actualMicros?: number
+	actualTokens?: number
+	progress?: RepositoryFinishProgress
+}
+type RecoveredFinishResult = {
+	status: "succeeded" | "failed"
+	actualMicros: number
+	actualTokens: number
+	proofSha256?: string
+	proofKind?: "no-call-proof" | "billing-proof"
+}
 import * as constants from "node:fs"
 import * as path from "node:path"
 import { randomUUID } from "node:crypto"
@@ -11,178 +52,6 @@ import { CURL_REPAIR_EVALUATOR_DIGEST, CURL_REPAIR_POLICY_SHA256, CURL_REPAIR_PR
 import { CURL_REPAIR_V2_EVALUATOR_DIGEST, CURL_REPAIR_V2_POLICY_SHA256, CURL_REPAIR_V2_PROFILE_ID,
 	CURL_REPAIR_V2_RECIPE_DIGEST, CURL_REPAIR_V2_REPOSITORY_ID } from "./repository-curl-repair-v2-profile.js"
 
-export const REPOSITORY_CAMPAIGN_BUDGET_CAP_MICROS = 5_000_000
-// Keeps the mock subcap within the existing fixed Fleet campaign's 108k-token ceiling.
-export const REPOSITORY_CAMPAIGN_BUDGET_CAP_TOKENS = 108_000
-const MAX_CAMPAIGNS = 32
-const MAX_JOBS = 500
-const MAX_INTAKE_RECORDS = 5_000
-const MAX_HISTORY = 200
-const MOCK_DISPATCH_TIMEOUT_MS = 30_000
-export const REPOSITORY_WORKER_LEASE_MS = 120_000
-export const REPOSITORY_PROGRESS_FRESH_MS = 60_000
-export const REPOSITORY_CAMPAIGN_STEPS = ["intake", "deduplicate", "investigate", "prepare-candidate", "verify", "deliver"] as const
-export type RepositoryCampaignStep = typeof REPOSITORY_CAMPAIGN_STEPS[number]
-
-export interface RepositoryEvidenceRef {
-	id: string
-	kind: "intake" | "candidate" | "test-receipt" | "delivery" | "diagnostic" | "no-call-proof" | "billing-proof"
-	label: string
-}
-
-export interface RepositoryJobProgress {
-	executionKind: "development-checkpoint" | "live-cve"
-	workerId: string
-	goal: string
-	currentTask: string
-	stage: RepositoryCampaignStep
-	completedSteps: RepositoryCampaignStep[]
-	requiredSteps: RepositoryCampaignStep[]
-	lastActionAt: number
-	heartbeatAt: number
-	leaseExpiresAt: number
-	blocker: string | null
-	nextStep: string | null
-	evidenceRefs: RepositoryEvidenceRef[]
-	/** Fixed local Agent Board result reference, present only after verified private delivery. */
-	boardRef?: string | null
-}
-
-const PRIVATE_BOARD_REF = /^http:\/\/127\.0\.0\.1:8078\/api\/cards\/1c25cecf-e5e8-4b68-b6fd-5d6ad25426d7#hc-repository-result-v1:[a-f0-9]{64}$/
-
-export interface RepositoryCampaignDefinition {
-	id: string
-	name: string
-	repositoryId?: string
-	repository?: string
-	sourceRevision: string | null
-	policySha256?: string
-	workerProfile: string | null
-	recipeDigest: string | null
-	evaluatorDigest: string | null
-	model: string | null
-	dataAccessProfile: string | null
-	qualification: {
-		sourceAudited: boolean
-		workerQualified: boolean
-		recipeQualified: boolean
-		evaluatorQualified: boolean
-		modelApproved: boolean
-		dataApproved: boolean
-		accessApproved: boolean
-	}
-}
-
-export interface RepositoryBudgetAuthority {
-	mode: "synthetic-test" | "fleet-v2" | "fleet-v2-readonly" | "fleet-v2-budget-only" | "unavailable"
-	available: boolean
-	snapshotOnly?: boolean
-	limitMicros: number
-	limitTokens: number
-	committedMicros: number
-	committedTokens: number
-	/** Fresh authority projection fields are present only for mode=fleet-v2. */
-	asOfMs?: number
-	campaignId?: string
-	globalEnabled?: boolean
-	canAdmit?: boolean
-	controlEpoch?: number
-	runId?: string | null
-	runExpiresAtMs?: number | null
-	repositoryCampaignId?: string
-	repositoryId?: string
-	repository?: string
-	sourceRevision?: string
-	policySha256?: string
-	model?: string
-	profileId?: string
-	repositoryEnabled?: boolean
-	repositoryEpoch?: number
-	monthly?: { month: string; limitMicros: number; settledMicros: number; reservedMicros: number; ambiguousMicros: number }
-	campaignLifetime?: { limitMicros: number; limitTokens: number; settledMicros: number; reservedMicros: number; ambiguousMicros: number; settledTokens: number; reservedTokens: number; ambiguousTokens: number }
-	legacyLifetime?: { settledMicros: number; reservedMicros: number; ambiguousMicros: number; settledTokens: number; reservedTokens: number; ambiguousTokens: number }
-	repositoryLifetime?: { limitMicros: number; limitTokens: number; settledMicros: number; reservedMicros: number; ambiguousMicros: number; settledTokens: number; reservedTokens: number; ambiguousTokens: number }
-}
-
-export interface RepositoryCampaignJob {
-	id: string
-	campaignId: string
-	advisoryId: string
-	status: "queued" | "running" | "cancelled" | "succeeded" | "failed" | "ambiguous"
-	epoch: number
-	createdAt: number
-	updatedAt: number
-	month: string
-	claimId?: string
-	reservedMicros: number
-	settledMicros: number
-	reservedTokens: number
-	settledTokens: number
-	progress?: RepositoryJobProgress
-	detail?: string
-	purpose?: "qualification" | "repair"
-	/** Explicit owner-authorized lineage for the verified Curl no-call and historical repair retry paths. */
-	retryOf?: string
-}
-
-type ObservedAdvisoryInput = { campaignId: string; publicBaseRevision: string; advisoryId: string; snapshotSha256: string; eligible: boolean }
-type RepositoryProgressUpdate = {
-	stage: RepositoryCampaignStep; currentTask: string; completedSteps: RepositoryCampaignStep[];
-	blocker?: string | null; nextStep?: string | null; evidenceRefs?: RepositoryEvidenceRef[]; boardRef?: string | null
-}
-type RepositoryFinishProgress = { currentTask?: string; blocker?: string | null; nextStep?: string | null; boardRef?: string | null }
-type RepositoryFinishResult = { status: "succeeded" | "failed" | "ambiguous"; actualMicros?: number; actualTokens?: number; progress?: RepositoryFinishProgress }
-type RecoveredFinishResult = { status: "succeeded" | "failed"; actualMicros: number; actualTokens: number;
-	proofSha256?: string; proofKind?: "no-call-proof" | "billing-proof" }
-
-export interface RepositoryAdvisoryIntakeRecord {
-	campaignId: string
-	publicBaseRevision: string
-	advisoryId: string
-	snapshotSha256: string
-	disposition: "eligible" | "unsupported-profile"
-	firstSeenAt: number
-	lastSeenAt: number
-	jobId: string | null
-	source?: "osv-commit-query" | "debian-tracker-snapshot" | "debian-tracker-repair-snapshot" | "debian-tracker-repair-v2-snapshot"
-	sourceUrl?: string
-	sourceContentSha256?: string
-}
-
-interface CampaignRecord {
-	enabled: boolean
-	epoch: number
-	budgetLimitMicros: number
-	budgetLimitTokens: number
-	settledMicros: number
-	reservedMicros: number
-	ambiguousMicros: number
-	settledTokens: number
-	reservedTokens: number
-	ambiguousTokens: number
-}
-
-interface CampaignState {
-	schemaVersion: 1
-	month: string
-	campaigns: Record<string, CampaignRecord>
-	drafts: Record<string, { id: string; repository: string; name: string; sourceRevision: string | null; requestedModelProfile: string | null }>
-	jobs: RepositoryCampaignJob[]
-	intakeRecords: RepositoryAdvisoryIntakeRecord[]
-	history: Array<{ at: number; campaignId: string; action: "drafted" | "configured" | "started" | "stopped" | "budget" | "budget-exhausted" | "claimed" | "completed" | "interrupted"; epoch: number; jobId?: string }>
-}
-
-export interface ClaimedRepositoryJob {
-	job: RepositoryCampaignJob
-	claimId: string
-	epoch: number
-}
-
-export type MockRepositoryDispatcher = (job: RepositoryCampaignJob) => Promise<{
-	status: "succeeded" | "failed" | "ambiguous"
-	actualMicros?: number
-	actualTokens?: number
-}>
 
 function validUsageCounters(value: unknown, includeLimits = false): value is Record<string, number> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false
@@ -831,68 +700,6 @@ function validFleetCampaign(authority: RepositoryBudgetAuthority, campaignId: st
 		authority.repositoryId === definition.repositoryId && authority.repository === definition.repository &&
 		authority.sourceRevision === definition.sourceRevision && authority.policySha256 === definition.policySha256 &&
 		authority.model === "none" && authority.profileId === "no-model")
-}
-
-function validCampaignStateFile(stat: Awaited<ReturnType<typeof fs.lstat>>): boolean {
-	const owner = typeof process.getuid !== "function" || stat.uid === process.getuid()
-	return stat.isFile() && !stat.isSymbolicLink() && stat.size <= 1024 * 1024 && owner
-}
-
-async function parseCampaignStateFile(filePath: string): Promise<CampaignState> {
-	const stat = await fs.lstat(filePath)
-	if (!validCampaignStateFile(stat)) throw new Error("repository campaign state is not a bounded owner file")
-	const state = JSON.parse(await fs.readFile(filePath, "utf8")) as CampaignState
-	if (state && typeof state === "object" && !Array.isArray(state) && !Object.hasOwn(state, "intakeRecords")) state.intakeRecords = []
-	if (!validateState(state)) throw new Error("repository campaign state failed schema validation")
-	return state
-}
-
-async function readCampaignStateFile(filePath: string): Promise<CampaignState | undefined> {
-	try { return await parseCampaignStateFile(filePath) }
-	catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined
-		throw error
-	}
-}
-
-async function ensurePrivateCampaignRoot(parent: string): Promise<void> {
-	await fs.mkdir(parent, { recursive: true, mode: 0o700 })
-	const stat = await fs.lstat(parent)
-	const owner = typeof process.getuid !== "function" || stat.uid === process.getuid()
-	if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0 || !owner) {
-		throw new Error("repository campaign root must be private and owner controlled")
-	}
-}
-
-async function createCampaignLock(lockPath: string): Promise<() => Promise<void>> {
-	const file = await fs.open(lockPath, "wx", 0o600)
-	await file.writeFile(`${process.pid}\n`)
-	return async () => { await file.close(); await fs.rm(lockPath, { force: true }) }
-}
-
-async function campaignLockOwnerAlive(lockPath: string): Promise<boolean> {
-	const owner = Number((await fs.readFile(lockPath, "utf8").catch(() => "")).trim())
-	if (!Number.isSafeInteger(owner) || owner <= 0) return false
-	try { process.kill(owner, 0); return true }
-	catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM" }
-}
-
-async function removeStaleCampaignLock(lockPath: string): Promise<void> {
-	const stale = `${lockPath}.stale.${randomUUID()}`
-	await fs.rename(lockPath, stale).catch(() => undefined)
-	await fs.rm(stale, { force: true }).catch(() => undefined)
-}
-
-async function acquireCampaignLock(lockPath: string): Promise<() => Promise<void>> {
-	for (let attempt = 0; attempt < 100; attempt++) {
-		try { return await createCampaignLock(lockPath) }
-		catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
-			if (!await campaignLockOwnerAlive(lockPath)) { await removeStaleCampaignLock(lockPath); continue }
-			await new Promise((resolve) => setTimeout(resolve, 10 + attempt))
-		}
-	}
-	throw new Error("repository campaign state is busy")
 }
 
 function validProgressUpdateSteps(patch: RepositoryProgressUpdate): boolean {
@@ -1798,7 +1605,7 @@ export class RepositoryCampaignStore {
 		} finally { await release() }
 	}
 	private async loadState(now: Date): Promise<CampaignState> {
-		const state = await readCampaignStateFile(this.path) ?? blankState(now)
+		const state = await readCampaignStateFile(this.path, validateState) ?? blankState(now)
 		if (state.month !== monthNow(now)) state.month = monthNow(now)
 		for (const id of this.definitions.keys()) if (!state.campaigns[id]) state.campaigns[id] = this.initialCampaign()
 		return state
