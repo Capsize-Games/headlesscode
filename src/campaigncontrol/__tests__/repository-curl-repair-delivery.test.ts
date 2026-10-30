@@ -4,6 +4,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 import {
 	CURL_REPAIR_DELIVERY_POLICY, CURL_REPAIR_DELIVERY_POLICY_SHA256,
+	fixedCurlDeliveryGitHubEnvironment,
 	deliverVerifiedCurlRepairDraft,
 	type CurlRepairClaim, type CurlRepairDeliveryDependencies, type CurlRepairGitAdapter,
 	type CurlRepairGitHubAdapter, type CurlRepairPullRequest, type CurlRepairTarget,
@@ -111,6 +112,26 @@ async function testPolicyIsFixedAndRepairClaimsAreDistinct(): Promise<void> {
 	const badClaim = { ...claim, job: { ...claim.job, campaignId: "curl-maintenance" } }
 	await assert.rejects(deliverVerifiedCurlRepairDraft({ claim: badClaim, candidate, receipt: makeReceipt(candidate) }, f.dependencies), /compiled claim/)
 	assert.equal(f.calls.length, 0)
+}
+
+async function testFixedGitHubEnvironmentUsesKeyringContextWithoutCredentialEnv(): Promise<void> {
+	const env = fixedCurlDeliveryGitHubEnvironment({
+		PATH: "/untrusted/bin", HOME: "/untrusted/home",
+		DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
+		XDG_RUNTIME_DIR: "/run/user/1000",
+		GH_TOKEN: "fake-credential-must-not-be-forwarded",
+		GITHUB_TOKEN: "fake-compat-credential-must-not-be-forwarded",
+		SSH_AUTH_SOCK: "/tmp/unrelated-agent.sock",
+		AWS_ACCESS_KEY_ID: "unrelated-secret",
+	})
+	assert.deepEqual(env, {
+		PATH: "/usr/local/bin:/usr/bin:/bin", HOME: os.homedir(),
+		DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
+		XDG_RUNTIME_DIR: "/run/user/1000",
+	})
+	for (const secretName of ["GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK", "AWS_ACCESS_KEY_ID"]) {
+		assert.equal(Object.hasOwn(env, secretName), false, `${secretName} must not enter fixed gh subprocess environment`)
+	}
 }
 
 async function testCandidateAlreadyInPrivateBaseNeverCreatesBranchOrPullRequest(): Promise<void> {
@@ -223,6 +244,7 @@ async function testSharedDescriptorLockRejectsConcurrentDelivery(): Promise<void
 }
 
 const tests: readonly SuiteTest[] = [
+	["fixed GitHub delivery uses desktop keyring context without forwarding fake credentials", testFixedGitHubEnvironmentUsesKeyringContextWithoutCredentialEnv],
 	["repair delivery policy is fixed and separate from the qualification claim", testPolicyIsFixedAndRepairClaimsAreDistinct],
 	["candidate already in the private target never creates a branch or pull request", testCandidateAlreadyInPrivateBaseNeverCreatesBranchOrPullRequest],
 	["unknown target trees and changed source paths fail closed", testUnknownTargetTreeOrExtraSourceChangesAreBlocked],

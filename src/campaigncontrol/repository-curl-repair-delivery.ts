@@ -27,6 +27,7 @@ const MAX_PATCH_BYTES = 2_000_000
 const BRANCH_PREFIX = "codex/curl-CVE-2026-92390-"
 const REPOSITORY_URL = `https://github.com/${CURL_REPAIR_TARGET_REPOSITORY}`
 const GIT_URL = `${REPOSITORY_URL}.git`
+const GITHUB_CLI = "/usr/bin/gh"
 const TARGET_PATH = path.join(os.homedir(), ".local", "share", "headlesscode", "repository-sources", "curl-maintenance")
 
 export const CURL_REPAIR_DELIVERY_POLICY = Object.freeze({
@@ -305,7 +306,7 @@ class FixedCurlGitAdapter implements CurlRepairGitAdapter {
 		this.checkout = path.join(stateRoot, "private-checkout")
 	}
 	async inspectTarget(): Promise<CurlRepairTarget> {
-		const repository = await run("gh", ["repo", "view", CURL_REPAIR_TARGET_REPOSITORY, "--json", "nameWithOwner,url,isPrivate,defaultBranchRef"])
+		const repository = await runGitHub(["repo", "view", CURL_REPAIR_TARGET_REPOSITORY, "--json", "nameWithOwner,url,isPrivate,defaultBranchRef"])
 		let view: any
 		try { view = JSON.parse(repository) } catch { throw new Error("private Curl destination metadata is invalid") }
 		if (view?.nameWithOwner !== CURL_REPAIR_TARGET_REPOSITORY || view?.url !== REPOSITORY_URL || view?.isPrivate !== true ||
@@ -380,7 +381,7 @@ class FixedCurlGitAdapter implements CurlRepairGitAdapter {
 class FixedCurlGitHubAdapter implements CurlRepairGitHubAdapter {
 	async findPullRequests(branch: string): Promise<CurlRepairPullRequest[]> {
 		validateBranch(branch)
-		const raw = await run("gh", ["api", `repos/${CURL_REPAIR_TARGET_REPOSITORY}/pulls?state=all&head=Capsize-Games:${branch}&per_page=100`])
+		const raw = await runGitHub(["api", `repos/${CURL_REPAIR_TARGET_REPOSITORY}/pulls?state=all&head=Capsize-Games:${branch}&per_page=100`])
 		let rows: any
 		try { rows = JSON.parse(raw) } catch { throw new Error("private Curl pull request response is invalid") }
 		if (!Array.isArray(rows) || rows.length >= 100) throw new Error("private Curl pull request response exceeds its bound")
@@ -400,7 +401,7 @@ class FixedCurlGitHubAdapter implements CurlRepairGitHubAdapter {
 		if (input.title !== repairPullRequestTitle() || input.body.length > 8_000 || !input.body.startsWith("Verified historical Curl repair")) {
 			throw new Error("private Curl draft content is outside the fixed repair template")
 		}
-		await run("gh", ["pr", "create", "--draft", "--repo", CURL_REPAIR_TARGET_REPOSITORY, "--base", DEFAULT_BRANCH,
+		await runGitHub(["pr", "create", "--draft", "--repo", CURL_REPAIR_TARGET_REPOSITORY, "--base", DEFAULT_BRANCH,
 			"--head", `${CURL_REPAIR_TARGET_REPOSITORY.split("/")[0]}:${input.branch}`, "--title", input.title, "--body", input.body], 60_000)
 	}
 }
@@ -542,6 +543,26 @@ function canonical(value: unknown): string {
 }
 
 async function gitValue(root: string, ...args: string[]): Promise<string> { return (await run("git", ["-C", root, ...args])).trim() }
+
+/** Fixed host-side gh calls need the desktop keyring's D-Bus socket, never inherited token variables. */
+export function fixedCurlDeliveryGitHubEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = { PATH: "/usr/local/bin:/usr/bin:/bin", HOME: os.homedir() }
+	for (const name of ["DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"] as const) {
+		const value = source[name]
+		if (typeof value === "string" && value.length > 0 && value.length <= 2_048) env[name] = value
+	}
+	return env
+}
+
+async function runGitHub(args: string[], timeoutMs = 30_000): Promise<string> {
+	try {
+		const { stdout } = await execFileAsync(GITHUB_CLI, args, { timeout: timeoutMs, maxBuffer: 256 * 1024,
+			encoding: "utf8", env: fixedCurlDeliveryGitHubEnvironment() })
+		return stdout
+	} catch {
+		throw new Error("fixed Curl delivery command failed")
+	}
+}
 
 async function run(command: string, args: string[], timeoutMs = 30_000): Promise<string> {
 	try {
