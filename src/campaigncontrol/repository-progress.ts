@@ -4,20 +4,17 @@ import {
 	type RepositoryCampaignJob,
 	type RepositoryEvidenceRef,
 } from "./repository-campaigns.js"
+import { repositoryBudgetProfile } from "./repository-budget-authority.js"
+import type {
+	FleetRepositoryBudgetSnapshot as LedgerBudgetSnapshot,
+} from "../rsi/fleet-repository-budget-ledger.js"
 
 export type ProgressFreshness = "fresh" | "stale" | "unavailable"
 export type ProgressState = "ready" | "running" | "waiting" | "stopping" | "stopped" |
 	"budget-exhausted" | "blocked-prerequisite" | "blocked-access" | "failed" | "unavailable"
 
-export interface FleetRepositoryBudgetSnapshot {
-	mode: "fleet-v2" | "fleet-v2-readonly"; available: boolean; snapshotOnly?: boolean; limitMicros: number; limitTokens: number; committedMicros: number; committedTokens: number;
-	asOfMs: number; campaignId: string; globalEnabled: boolean; canAdmit: boolean; controlEpoch: number; runId: string | null; runExpiresAtMs: number | null;
-	repositoryCampaignId: string; repositoryId: string; repository: string; sourceRevision: string; policySha256: string;
-	model: string; profileId: string; repositoryEnabled: boolean; repositoryEpoch: number;
-	monthly: { month: string; limitMicros: number; settledMicros: number; reservedMicros: number; ambiguousMicros: number };
-	campaignLifetime: { limitMicros: number; limitTokens: number; settledMicros: number; reservedMicros: number; ambiguousMicros: number; settledTokens: number; reservedTokens: number; ambiguousTokens: number };
-	legacyLifetime: { settledMicros: number; reservedMicros: number; ambiguousMicros: number; settledTokens: number; reservedTokens: number; ambiguousTokens: number };
-	repositoryLifetime: { limitMicros: number; limitTokens: number; settledMicros: number; reservedMicros: number; ambiguousMicros: number; settledTokens: number; reservedTokens: number; ambiguousTokens: number };
+export type FleetRepositoryBudgetSnapshot = Omit<LedgerBudgetSnapshot, "mode"> & {
+	mode: LedgerBudgetSnapshot["mode"] | "fleet-v2-budget-only"
 }
 
 export interface RepositoryProgressSnapshot {
@@ -129,7 +126,11 @@ function budgetIsFresh(definition: RepositoryCampaignDefinition, budget: FleetRe
 }
 
 function snapshotModeValid(budget: FleetRepositoryBudgetSnapshot): boolean {
-	return budget.mode === "fleet-v2" ? budget.available && !budget.snapshotOnly : budget.snapshotOnly === true
+	if (budget.mode === "fleet-v2") {
+		return budget.available && !budget.snapshotOnly
+	}
+	return ["fleet-v2-readonly", "fleet-v2-budget-only"].includes(budget.mode) &&
+		budget.snapshotOnly === true && budget.available === false
 }
 function snapshotTimeValid(asOfMs: number, observedAt: number): boolean {
 	return Number.isSafeInteger(asOfMs) && observedAt - asOfMs <= REPOSITORY_PROGRESS_FRESH_MS && asOfMs <= observedAt + REPOSITORY_PROGRESS_FRESH_MS
@@ -139,9 +140,11 @@ function snapshotRunValid(budget: FleetRepositoryBudgetSnapshot, observedAt: num
 		budget.runExpiresAtMs !== null && budget.runExpiresAtMs > observedAt
 }
 function snapshotIdentityValid(definition: RepositoryCampaignDefinition, budget: FleetRepositoryBudgetSnapshot): boolean {
+	const profile = repositoryBudgetProfile(definition)
 	return budget.repositoryCampaignId === definition.id && budget.repositoryId === definition.repositoryId && budget.repository === definition.repository &&
 		budget.sourceRevision === definition.sourceRevision && budget.policySha256 === definition.policySha256 && budget.model === definition.model &&
-		budget.profileId === definition.workerProfile && /^[a-f0-9]{64}$/.test(budget.policySha256)
+		profile !== undefined && budget.profileId === profile.profileId &&
+		/^[a-f0-9]{64}$/.test(budget.policySha256)
 }
 
 function freshnessFor(jobs: RepositoryCampaignJob[], observedAt: number): RepositoryProgressSnapshot["freshness"] {
