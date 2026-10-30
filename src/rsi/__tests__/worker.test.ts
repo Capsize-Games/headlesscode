@@ -7,7 +7,12 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { externalizeEvaluationOutputs, externalizeMutationFailureOutput, runRsiWorker, type RsiWorkerOptions } from "../worker.js"
 import { OpenShellMutationPreflightError, rsiMutationGuestEnvironment } from "../openshell.js"
-import { RSI_MUSE_OPENROUTER_MODEL, type OpenRouterBrokerLimits, type OpenRouterBrokerReceipt, type OpenRouterInferenceLedger } from "../inference-broker.js"
+import {
+	RSI_MUSE_OPENROUTER_MODEL,
+	type OpenRouterBrokerLimits,
+	type OpenRouterBrokerReceipt,
+	type OpenRouterInferenceLedger,
+} from "../inference-broker.js"
 import { EmergencyControl } from "../../control/emergency-controller.js"
 import type { FleetJobLease, FleetJobPayload } from "../postgres-queue.js"
 
@@ -355,7 +360,10 @@ test("fleet Muse mutation forwards its profile into the real guest environment g
 		}
 		const worker = runRsiWorker({
 			queue, workerId: "muse-profile-test-worker", gatewayId: "muse-profile-test-gateway", maxActive: 1,
-			resourceClasses: ["CPU"], scratchRoot: workerScratch, maxJobs: 1, inferenceLedger: fleetLedger,
+			resourceClasses: ["CPU"],
+			scratchRoot: workerScratch,
+			maxJobs: 1,
+			inferenceLedger: fleetLedger,
 			createInferenceBroker: async (options) => {
 				capturedLedger = options.ledger
 				capturedProfile = options.profileId
@@ -379,7 +387,11 @@ test("fleet Muse mutation forwards its profile into the real guest environment g
 		assert.equal(failReason, undefined)
 		assert.equal(queueStatus, "completed")
 		assert.equal(capturedProfile, "muse-spark-contributor", "supervisor-created broker remains pinned to Muse")
-		assert.equal(capturedLedger, fleetLedger, "OpenRouter broker uses the injected Fleet ledger while queue remains the job store")
+		assert.equal(
+			capturedLedger,
+			fleetLedger,
+			"broker uses the injected Fleet ledger; queue remains the job store",
+		)
 		assert.equal(capturedEnvironment?.HEADLESSCODE_CODE_MODE_BACKEND, "openrouter")
 		assert.equal(capturedEnvironment?.HEADLESSCODE_CODE_MODE_MODEL, RSI_MUSE_OPENROUTER_MODEL)
 		assert.equal(capturedEnvironment?.HEADLESSCODE_RSI_INFERENCE_CAPABILITY, "opaque-synthetic-capability")
