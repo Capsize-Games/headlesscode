@@ -33,6 +33,8 @@ const TARGET_PATH = path.join(os.homedir(), ".local", "share", "headlesscode", "
 
 type FixedDeliveryOperation = "gh-repo-view" | "gh-list-pull-requests" | "gh-create-draft" |
 	"git-clone-target" | "git-fetch-target-branch" | "git-fetch-candidate" |
+	"git-verify-reference-origin" | "git-verify-reference-tip" | "git-verify-reference-tree" |
+	"git-read-reference-alternates" | "git-verify-clone-origin" | "git-verify-clone-branch" |
 	"git-read-target-revision" | "git-read-target-tree" | "git-read-source-changes" |
 	"git-check-candidate-tree" | "git-check-candidate-ancestry" | "git-ls-remote-branch" |
 	"git-read-origin" | "git-read-current-default-branch" | "git-push-candidate"
@@ -377,11 +379,35 @@ class FixedCurlGitAdapter implements CurlRepairGitAdapter {
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
 		}
+		await this.verifyReferenceRepository()
 		await fsp.mkdir(this.stateRoot, { recursive: true, mode: 0o700 })
 		const temporary = path.join(this.stateRoot, `.private-checkout-${process.pid}-${randomUUID()}`)
-		await run("git-clone-target", ["clone", "--no-checkout", "--no-tags", "--single-branch", "--branch", DEFAULT_BRANCH, GIT_URL, temporary])
-		await fsp.chmod(temporary, 0o700)
-		await fsp.rename(temporary, this.checkout)
+		try {
+			await run("git-clone-target", ["clone", "--reference-if-able", TARGET_PATH, "--dissociate", "--no-checkout", "--no-tags", "--single-branch", "--branch", DEFAULT_BRANCH, GIT_URL, temporary])
+			const clonedOrigin = await gitValue("git-verify-clone-origin", temporary, "remote", "get-url", "origin")
+			const clonedBranch = await gitValue("git-verify-clone-branch", temporary, "rev-parse", "--verify", `refs/remotes/origin/${DEFAULT_BRANCH}^{commit}`)
+			const alternatesPath = await gitValue("git-read-reference-alternates", temporary, "rev-parse", "--git-path", "objects/info/alternates")
+			if (clonedOrigin !== GIT_URL || !isSha(clonedBranch) || fs.existsSync(path.isAbsolute(alternatesPath) ? alternatesPath : path.resolve(temporary, alternatesPath))) {
+				throw new Error("private Curl checkout reference validation failed")
+			}
+			await fsp.chmod(temporary, 0o700)
+			await fsp.rename(temporary, this.checkout)
+		} catch (error) {
+			await fsp.rm(temporary, { recursive: true, force: true })
+			throw error
+		}
+	}
+	private async verifyReferenceRepository(): Promise<void> {
+		const uid = typeof process.getuid === "function" ? process.getuid() : -1
+		if (uid < 0 || !isPrivateOwnerDirectory(TARGET_PATH, uid)) throw new Error("private Curl checkout reference is not owner-private")
+		const origin = await gitValue("git-verify-reference-origin", TARGET_PATH, "remote", "get-url", "origin")
+		const tip = await gitValue("git-verify-reference-tip", TARGET_PATH, "rev-parse", "--verify", `refs/remotes/origin/${DEFAULT_BRANCH}^{commit}`)
+		const tree = await gitValue("git-verify-reference-tree", TARGET_PATH, "rev-parse", "--verify", `${tip}^{tree}`)
+		const alternatesPath = await gitValue("git-read-reference-alternates", TARGET_PATH, "rev-parse", "--git-path", "objects/info/alternates")
+		if (origin !== GIT_URL || tip !== VERIFIED_TARGET_TIP || tree !== VERIFIED_TARGET_TREE ||
+			fs.existsSync(path.isAbsolute(alternatesPath) ? alternatesPath : path.resolve(TARGET_PATH, alternatesPath))) {
+			throw new Error("private Curl checkout reference does not match its verified pin")
+		}
 	}
 }
 
