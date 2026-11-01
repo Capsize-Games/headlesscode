@@ -15,7 +15,7 @@ import { parse, stringify } from "yaml"
 import { writeTaskFiles } from "../orchestrator/task-files.js"
 import { projectStoreRoot, resolveProjectDataDir } from "../project-store.js"
 import type { CloudProvider, CloudSessionRequest, CommandResult, SessionHandle } from "./provider.js"
-import { CONTAINED_EVIDENCE_RUNTIME_PATH, containedGuestEnvironment, verifyContainedSandboxIdentity } from "../security/profile.js"
+import { CONTAINED_EVIDENCE_RUNTIME_PATH, REPOSITORY_BROKER_CAPABILITY_PATH, containedGuestEnvironment, verifyContainedSandboxIdentity } from "../security/profile.js"
 import type { ContainedRuntimeProfile } from "../security/profile.js"
 import type { EmergencyControl } from "../control/emergency-controller.js"
 
@@ -23,6 +23,28 @@ import type { EmergencyControl } from "../control/emergency-controller.js"
 export const OPENSHELL_HARNESS_ROOT = "/opt/headlesscode"
 
 export const OPENSHELL_WORKSPACE_TARGET = "/workspace"
+
+export function assertWorkerLaunchPurpose(purpose: ContainedRuntimeProfile["purpose"]): void {
+	if (purpose !== "worker" && purpose !== "repository-worker") throw new Error("worker launcher cannot run an evaluation profile")
+}
+
+const HOST_RUNTIME_ENV_KEYS = new Set([
+	"XDG_CONFIG_HOME", "XDG_STATE_HOME", "HEADLESSCODE_CONTAINED_PROFILE", "HEADLESSCODE_CONTAINED_PROFILE_SHA256",
+	"HEADLESSCODE_CONTAINED_EVIDENCE_CONFIG_DIR", "HEADLESSCODE_RSI_BROKER_BIND_HOST",
+	"HEADLESSCODE_OPENSHELL_SCRATCH_ROOT", "HEADLESSCODE_CONTROL_ID", "HEADLESSCODE_CONTROL_STATE_DIR",
+	"HEADLESSCODE_CONTROL_SOCKET_DIR", "HEADLESSCODE_CONTAINED_SESSION_PREFIX", "HEADLESSCODE_CONTAINED_SESSION_ID",
+])
+
+export function validateOpenShellHostRuntimeEnv(input: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
+	if (input === undefined) return {}
+	if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("OpenShell host runtime environment must be a map")
+	const result: NodeJS.ProcessEnv = {}
+	for (const [key, value] of Object.entries(input)) {
+		if (!HOST_RUNTIME_ENV_KEYS.has(key) || typeof value !== "string" || value.includes("\0")) throw new Error(`OpenShell host runtime environment field is not allowed: ${key}`)
+		result[key] = value
+	}
+	return result
+}
 
 interface LinuxProcessIdentity {
 	pid: number
@@ -178,6 +200,8 @@ export interface OpenShellSessionProviderOptions {
 	containedProfile?: ContainedRuntimeProfile
 	/** Per-session evidence capability; runtime-only and never copied into environment or prompts. */
 	evidenceRuntimeConfig?: { sessionId: string; capability: string; pinnedPublicKey: { keyId: string; publicKeyPem: string } }
+	/** Per-job broker capability file; accepted only by the no-provider repository-worker profile. */
+	repositoryBrokerCapabilityFile?: string
 	run?: (args: string[], timeoutMs?: number) => CommandResult
 	/** Async command runner used for long guest commands so host services can keep serving requests. */
 	runAsync?: (args: string[], timeoutMs?: number, signal?: AbortSignal) => Promise<CommandResult>
@@ -185,13 +209,18 @@ export interface OpenShellSessionProviderOptions {
 	signal?: AbortSignal
 	stopGraceMs?: number
 	deleteVerifyTimeoutMs?: number
+	/** Narrow nonsecret host-only environment for the OpenShell CLI; never copied to guest request env. */
+	hostRuntimeEnv?: NodeJS.ProcessEnv
 	emergencyControl?: Pick<EmergencyControl, "identity" | "state" | "stateDirectoryPath" | "signal" | "assertRunning" | "registerCleanup" | "registerResource" | "releaseResource">
 }
 
-export function runOpenShellCommandAsync(args: string[], timeoutMs?: number, executable = "openshell", signal?: AbortSignal, graceMs = 1_000): Promise<CommandResult> {
+export function runOpenShellCommandAsync(args: string[], timeoutMs?: number, executable = "openshell", signal?: AbortSignal, graceMs = 1_000,
+	hostRuntimeEnv: NodeJS.ProcessEnv = {}): Promise<CommandResult> {
+	const scopedHostEnvironment = validateOpenShellHostRuntimeEnv(hostRuntimeEnv)
 	return new Promise((resolve, reject) => {
 		if (signal?.aborted) { reject(signal.reason ?? new Error("OpenShell command aborted")); return }
-		const child = spawn(executable, args, { stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" })
+		const child = spawn(executable, args, { stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32",
+			env: { ...process.env, ...scopedHostEnvironment } })
 		let stdout = ""
 		let stderr = ""
 		let timer: NodeJS.Timeout | undefined
@@ -423,6 +452,7 @@ export class OpenShellSessionProvider implements CloudProvider {
 	private readonly readOnlyMounts: Array<{ source: string; target: string }>
 	private readonly run: (args: string[], timeoutMs?: number) => CommandResult
 	private readonly runHarnessCommand: (args: string[], timeoutMs?: number, signal?: AbortSignal) => Promise<CommandResult>
+	private readonly hostRuntimeEnv: NodeJS.ProcessEnv
 	private readonly listSandboxes: () => string[]
 	private readonly importResults: boolean
 	private readonly scratchRoot: string
@@ -437,11 +467,13 @@ export class OpenShellSessionProvider implements CloudProvider {
 	private readonly gpu?: number
 	private readonly containedProfile?: ContainedRuntimeProfile
 	private readonly evidenceRuntimeConfig?: OpenShellSessionProviderOptions["evidenceRuntimeConfig"]
+	private readonly repositoryBrokerCapabilityFile?: string
 	private readonly workspaces = new Map<string, OpenShellWorkspaceState>()
 	private readonly controlCleanups = new Map<string, () => void>()
 	private readonly creating = new Map<string, Promise<void>>()
 
 	constructor(options: OpenShellSessionProviderOptions = {}) {
+		this.hostRuntimeEnv = validateOpenShellHostRuntimeEnv(options.hostRuntimeEnv)
 		this.image = options.image ?? process.env.HEADLESSCODE_OPENSHELL_IMAGE ?? "headlesscode-openshell:local"
 		this.policy = options.policy ?? process.env.HEADLESSCODE_OPENSHELL_POLICY
 		this.providers = options.providers ?? (process.env.HEADLESSCODE_OPENSHELL_PROVIDERS ?? "headlesscode-openrouter").split(",").map((name) => name.trim()).filter(Boolean)
@@ -464,6 +496,7 @@ export class OpenShellSessionProvider implements CloudProvider {
 		this.gpu = options.gpu
 		this.containedProfile = options.containedProfile
 		this.evidenceRuntimeConfig = options.evidenceRuntimeConfig
+		this.repositoryBrokerCapabilityFile = options.repositoryBrokerCapabilityFile
 		if (this.containedProfile) {
 			if (this.gpu !== undefined) throw new Error("contained profile does not permit GPU allocation")
 			if (!this.emergencyControl || this.emergencyControl.identity !== this.containedProfile.expectedEmergencyControllerIdentity) throw new Error("contained profile requires the pinned, active supervisor emergency controller")
@@ -475,18 +508,22 @@ export class OpenShellSessionProvider implements CloudProvider {
 			if (this.image !== this.containedProfile.image || this.policy !== this.containedProfile.policySnapshotPath || this.cpu !== this.containedProfile.cpu || this.memory !== this.containedProfile.memory || this.providers.join("\0") !== this.containedProfile.providers.join("\0")) {
 				throw new Error("OpenShell request settings differ from the resolved contained profile")
 			}
+			if (this.containedProfile.purpose === "repository-worker") {
+				if (!this.repositoryBrokerCapabilityFile || this.providers.length !== 0 || !this.containedProfile.brokerCapabilityGuestPath) throw new Error("repository worker requires only its scoped broker capability file and no providers")
+			} else if (this.repositoryBrokerCapabilityFile) throw new Error("broker capability files are restricted to repository-worker sessions")
 			if (options.autoProviders === true || options.includeProjectData === true || this.readOnlyMounts.length || Object.keys(this.networkPolicy).length) {
 				throw new Error("contained sessions cannot attach ambient providers, project snapshots, arbitrary mounts, or network overrides")
 			}
 		}
 		const injectedRun = options.run
 		this.run = injectedRun ?? ((args, timeoutMs) => {
-			const result = spawnSync("openshell", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs })
+			const result = spawnSync("openshell", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs,
+				env: { ...process.env, ...this.hostRuntimeEnv } })
 			return { exitCode: result.status ?? 1, output: `${result.stdout ?? ""}${result.stderr ?? ""}`.trim() }
 		})
 		this.runHarnessCommand = options.runAsync ?? (injectedRun
 			? async (args, timeoutMs) => injectedRun(args, timeoutMs)
-			: (args, timeoutMs, signal) => runOpenShellCommandAsync(args, timeoutMs, "openshell", signal, this.stopGraceMs))
+			: (args, timeoutMs, signal) => runOpenShellCommandAsync(args, timeoutMs, "openshell", signal, this.stopGraceMs, this.hostRuntimeEnv))
 		this.listSandboxes = options.listSandboxes ?? (() => {
 			const result = this.run(["sandbox", "list", "--output", "json"])
 			if (result.exitCode !== 0) throw new Error(`OpenShell sandbox list failed: ${result.output}`)
@@ -507,7 +544,13 @@ export class OpenShellSessionProvider implements CloudProvider {
 		})
 	}
 
-	private get signal(): AbortSignal | undefined { return this.externalSignal ?? this.emergencyControl?.signal }
+	private get signal(): AbortSignal | undefined {
+		const emergencySignal = this.emergencyControl?.signal
+		if (this.externalSignal && emergencySignal && this.externalSignal !== emergencySignal) {
+			return AbortSignal.any([this.externalSignal, emergencySignal])
+		}
+		return this.externalSignal ?? emergencySignal
+	}
 
 	private sandboxName(handle: SessionHandle): string { return handle.containerId ?? this.sandboxNameForWorktree(handle.id) }
 
@@ -682,7 +725,7 @@ export class OpenShellSessionProvider implements CloudProvider {
 		filesystemPolicy.read_write.push("/result")
 		if (this.containedProfile) {
 			const profile = this.containedProfile
-			if (profile.purpose !== "worker") throw new Error("worker launcher cannot run an evaluation profile")
+			assertWorkerLaunchPurpose(profile.purpose)
 			if (!this.evidenceRuntimeConfig || this.evidenceRuntimeConfig.pinnedPublicKey.keyId !== profile.evidencePublicKeyFingerprint) throw new Error("evidence session key does not match the pinned contained profile")
 			if (this.evidenceRuntimeConfig.pinnedPublicKey.publicKeyPem.trim() !== fs.readFileSync(profile.evidencePublicKeyPath, "utf8").trim()) throw new Error("evidence runtime public key differs from the pinned collector key file")
 			if (!this.evidenceRuntimeConfig.sessionId || !this.evidenceRuntimeConfig.capability) throw new Error("evidence runtime configuration is missing its scoped session capability")
@@ -753,6 +796,13 @@ export class OpenShellSessionProvider implements CloudProvider {
 			fs.cpSync(path.resolve(mount.source), sourceSnapshot, { recursive: true, dereference: true })
 			mounts.push({ type: "bind", source: sourceSnapshot, target: mountTargets[index]!, read_only: true })
 			filesystemPolicy.read_only.push(mountTargets[index]!)
+		}
+		if (this.containedProfile?.purpose === "repository-worker") {
+			const commonGitDir = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: repo, encoding: "utf8" }).trim()
+			const snapshot = path.join(isolated.tempRoot, "repository-broker-capability")
+			snapshotRepositoryBrokerCapability(this.repositoryBrokerCapabilityFile!, snapshot, [hostWorkspace, commonGitDir, isolated.tempRoot, this.scratchRoot])
+			mounts.push({ type: "bind", source: snapshot, target: REPOSITORY_BROKER_CAPABILITY_PATH, read_only: true })
+			filesystemPolicy.read_only.push(REPOSITORY_BROKER_CAPABILITY_PATH)
 		}
 		const generatedPolicy = path.join(isolated.tempRoot, "policy.generated.yaml")
 		fs.writeFileSync(generatedPolicy, stringify(policy), { flag: "wx", mode: 0o600 })
@@ -1088,6 +1138,24 @@ export function validateReadOnlyMountTargets(readOnlyMounts: Array<{ source: str
 		}
 	}
 	return targets
+}
+
+/** Validate and snapshot one broker capability without exposing its contents in arguments or logs. */
+export function snapshotRepositoryBrokerCapability(sourcePath: string, destinationPath: string, protectedPaths: string[]): void {
+	const source = path.resolve(sourcePath)
+	assertNoSymlinkAncestors(source)
+	const realSource = fs.realpathSync(source)
+	const stat = fs.lstatSync(realSource)
+	if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0 ||
+		(typeof process.getuid === "function" && stat.uid !== process.getuid()) ||
+		protectedPaths.some((item) => pathsOverlap(realSource, path.resolve(item)))) {
+		throw new Error("repository broker capability must be an owner-only regular file outside the worktree and session data")
+	}
+	const capability = fs.readFileSync(realSource, "utf8").trim()
+	if (!/^[A-Za-z0-9_-]{43}$/.test(capability) || Buffer.from(capability, "base64url").length !== 32) throw new Error("repository broker capability file is invalid")
+	const fd = fs.openSync(destinationPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o400)
+	try { fs.fchmodSync(fd, 0o400); fs.writeFileSync(fd, `${capability}\n`, "utf8") }
+	finally { fs.closeSync(fd) }
 }
 
 function isSameOrInside(parent: string, child: string): boolean {

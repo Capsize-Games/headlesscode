@@ -231,6 +231,12 @@ export interface CurriculumTask {
 	promotedAt?: string
 }
 
+export type CampaignEvaluationObjective =
+	| "intake-parsing"
+	| "deduplication"
+	| "evidence-validation"
+	| "reporting"
+
 export interface RsiConfig {
 	repoRoot: string
 	/** Supervisor-only benchmark fixtures. This identity is never placed in a candidate job payload. */
@@ -276,6 +282,17 @@ export interface RsiConfig {
 	maxTotalIterations?: number
 	maxRuntimeMs?: number
 	protectedPaths: string[]
+	/** Allowlist for campaign mutations; every changed file must match. */
+	allowedMutationPaths?: string[]
+	/** Fixed synthetic campaign evaluation; skips HCL development proof. */
+	campaignScopedEvaluation?: {
+		planDigest: string
+		fixtureDigest: string
+		evaluatorDigest: string
+		runtime: WorkerHarnessRuntimeIdentity
+		objective: CampaignEvaluationObjective
+		typecheckCommand: string
+	}
 	developmentProofRule?: DevelopmentProofRule
 	commandTimeoutMs: number
 	parentSelectionPolicy?: ParentSelectionPolicy
@@ -509,6 +526,14 @@ export interface RsiRunRecord {
 		ledgerSnapshot?: Record<string, unknown>
 		incompleteReason?: string
 		state: "running" | "evaluated" | "selected" | "rejected" | "incomplete" | "finished"
+	}
+	campaignScopedEvaluation?: {
+		planDigest: string
+		fixtureDigest: string
+		evaluatorDigest: string
+		runtime: WorkerHarnessRuntimeIdentity
+		objective: CampaignEvaluationObjective
+		eligibility: "paired-evaluation-only"
 	}
 	adversarialReviews?: AdversarialReviewRecord[]
 	candidates: CandidateRecord[]

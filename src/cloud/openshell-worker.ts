@@ -2,7 +2,7 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 import { execFileSync } from "node:child_process"
 
-import { OPENSHELL_HARNESS_ROOT, OpenShellSessionProvider } from "./openshell-provider.js"
+import { OPENSHELL_HARNESS_ROOT, OpenShellSessionProvider, validateOpenShellHostRuntimeEnv } from "./openshell-provider.js"
 import type { OpenShellSessionProviderOptions } from "./openshell-provider.js"
 import type { CloudSessionRequest, CommandResult } from "./provider.js"
 import { loadResolvedContainedProfile } from "../security/profile.js"
@@ -56,21 +56,23 @@ export async function runOpenShellWorktreeCommand(
 	env: Record<string, string> = {},
 	providerOptions: OpenShellSessionProviderOptions = {},
 ): Promise<CommandResult> {
-	const contained = process.env.HEADLESSCODE_SECURITY_PROFILE === "contained"
-	const containedProfile = providerOptions.containedProfile ?? (contained ? loadResolvedContainedProfile(process.env.HEADLESSCODE_CONTAINED_RUNTIME_PROFILE_JSON) : undefined)
+	const hostRuntimeEnv = validateOpenShellHostRuntimeEnv(providerOptions.hostRuntimeEnv)
+	const hostEnvironment = { ...process.env, ...hostRuntimeEnv }
+	const contained = hostEnvironment.HEADLESSCODE_SECURITY_PROFILE === "contained" || providerOptions.containedProfile !== undefined
+	const containedProfile = providerOptions.containedProfile ?? (contained ? loadResolvedContainedProfile(hostEnvironment.HEADLESSCODE_CONTAINED_RUNTIME_PROFILE_JSON) : undefined)
 	if (contained && !containedProfile) throw new Error("contained route has no supervisor-resolved immutable profile")
-	const policy = containedProfile?.policySnapshotPath ?? providerOptions.policy ?? process.env.HEADLESSCODE_OPENSHELL_POLICY
+	const policy = containedProfile?.policySnapshotPath ?? providerOptions.policy ?? hostEnvironment.HEADLESSCODE_OPENSHELL_POLICY
 	if (!policy || !fs.existsSync(policy)) throw new Error("set HEADLESSCODE_OPENSHELL_POLICY to an existing base policy YAML")
-	const providers = containedProfile ? [...containedProfile.providers] : providerOptions.providers ?? (process.env.HEADLESSCODE_OPENSHELL_PROVIDERS ?? "headlesscode-openrouter").split(",").map((value) => value.trim()).filter(Boolean)
-	if (providers.includes("headlesscode-openrouter") && !process.env.HEADLESSCODE_OPENROUTER_API_KEY) throw new Error("set HEADLESSCODE_OPENROUTER_API_KEY so OpenShell can provide the imported credential profile")
+	const providers = containedProfile ? [...containedProfile.providers] : providerOptions.providers ?? (hostEnvironment.HEADLESSCODE_OPENSHELL_PROVIDERS ?? "headlesscode-openrouter").split(",").map((value) => value.trim()).filter(Boolean)
+	if (providers.includes("headlesscode-openrouter") && !hostEnvironment.HEADLESSCODE_OPENROUTER_API_KEY) throw new Error("set HEADLESSCODE_OPENROUTER_API_KEY so OpenShell can provide the imported credential profile")
 	const worktreePath = path.resolve(worktree)
 	const repoPath = path.resolve(repo)
 	const name = path.basename(worktreePath)
-	const runtimeSessionId = containedProfile ? containedEvidenceSessionId(name, env.HEADLESSCODE_CONTAINED_SESSION_PREFIX ?? process.env.HEADLESSCODE_CONTAINED_SESSION_PREFIX, env.HEADLESSCODE_CONTAINED_SESSION_ID) : undefined
+	const runtimeSessionId = containedProfile ? containedEvidenceSessionId(name, env.HEADLESSCODE_CONTAINED_SESSION_PREFIX ?? hostRuntimeEnv.HEADLESSCODE_CONTAINED_SESSION_PREFIX, env.HEADLESSCODE_CONTAINED_SESSION_ID ?? hostRuntimeEnv.HEADLESSCODE_CONTAINED_SESSION_ID) : undefined
 	const memoryDir = containedProfile ? undefined : env.HEADLESSCODE_MEMORY_DIR ?? process.env.HEADLESSCODE_MEMORY_DIR
 	const memoryPath = memoryDir ? path.resolve(memoryDir) : undefined
 	if (memoryPath) fs.mkdirSync(memoryPath, { recursive: true })
-	const containedSupervisor = containedProfile && runtimeSessionId ? await startContainedSupervisor({ profile: containedProfile, sessionId: runtimeSessionId, repoRoot: repoPath, workspaceRoot: worktreePath }) : undefined
+	const containedSupervisor = containedProfile && runtimeSessionId ? await startContainedSupervisor({ profile: containedProfile, sessionId: runtimeSessionId, repoRoot: repoPath, workspaceRoot: worktreePath, env: hostEnvironment }) : undefined
 	try {
 	const provider = new OpenShellSessionProvider({
 		...providerOptions,
@@ -82,6 +84,7 @@ export async function runOpenShellWorktreeCommand(
 				pinnedPublicKey: containedSupervisor.evidenceConnection.pinnedPublicKey,
 			} } : {}),
 			...(containedSupervisor ? { emergencyControl: containedSupervisor.control } : {}),
+			signal: providerOptions.signal,
 			image: containedProfile.image,
 			cpu: containedProfile.cpu,
 			memory: containedProfile.memory,

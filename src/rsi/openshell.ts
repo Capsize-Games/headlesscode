@@ -107,7 +107,18 @@ function pathIsSafe(relativePath: string): boolean {
 
 function alwaysOmit(relativePath: string): boolean {
 	const normalized = relativePath.replaceAll("\\", "/")
-	return normalized.startsWith("__headlesscode_rsi_adversarial__/") || findMatchingPattern(normalized, [...DEFAULT_PROTECTED_FILES, "shared/openshell/headlesscode-policy.yaml", ".headlesscode/", ".worktrees/", "node_modules/", "src/rsi/", "scripts/eval-suite/", "fixtures/rsi-benchmark/", "__rsi_benchmark_verifier__/"]) !== null
+	return normalized.startsWith("__headlesscode_rsi_adversarial__/") || findMatchingPattern(normalized, [...DEFAULT_PROTECTED_FILES, "shared/openshell/headlesscode-policy.yaml", ".headlesscode/", ".worktrees/", "node_modules/", "src/rsi/", "src/campaigncontrol/", "scripts/eval-suite/", "fixtures/rsi-benchmark/", "__rsi_benchmark_verifier__/"]) !== null
+}
+
+function writeCampaignControlSnapshotShim(snapshot: string): void {
+	const directory = path.join(snapshot, "src", "campaigncontrol")
+	fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
+	fs.writeFileSync(path.join(directory, "repository-curl-evaluator.ts"),
+		'export const CURL_FIXED_ADVISORY = "CVE-2026-92390"\n', { mode: 0o600, flag: "wx" })
+	fs.writeFileSync(path.join(directory, "repository-known-advisory.ts"),
+		'export const CURL_DEBIAN_SOURCE_URL = "https://security-tracker.debian.org/tracker/CVE-2026-92390"\n', { mode: 0o600, flag: "wx" })
+	fs.writeFileSync(path.join(directory, "cli.ts"),
+		'export async function campaignMain(_args: string[]): Promise<number> { return 2 }\n', { mode: 0o600, flag: "wx" })
 }
 
 function sha256Buffer(value: Buffer): string { return createHash("sha256").update(value).digest("hex") }
@@ -185,6 +196,7 @@ function initializeSnapshot(sourceRoot: string, commit: string, destination: str
 		fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
 		fs.writeFileSync(target, blobs.get(file.path)!, { mode: file.mode === "100755" ? 0o755 : 0o644, flag: "wx" })
 	}
+	writeCampaignControlSnapshotShim(destination)
 	if (mode === "evaluation" && includeHarnessDependencies) fs.symlinkSync(`${OPENSHELL_HARNESS_ROOT}/node_modules`, path.join(destination, IMAGE_DEPENDENCIES_LINK))
 	execFileSync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: destination })
 	execFileSync("git", ["config", "user.name", "HeadlessCode RSI Snapshot"], { cwd: destination })
@@ -204,7 +216,7 @@ function sha256SnapshotTree(snapshot: string): string {
 	return createHash("sha256").update(execFileBuffer("git", ["ls-tree", "-r", "-z", "--full-tree", "HEAD"], { cwd: snapshot })).digest("hex")
 }
 
-function verifyWorkerHarnessRuntime(expected: WorkerHarnessRuntimeIdentity): void {
+export function verifyWorkerHarnessRuntime(expected: WorkerHarnessRuntimeIdentity): void {
 	if (!validWorkerHarnessRuntimeIdentity(expected)) throw new Error("RSI worker harness runtime identity is malformed")
 	const actualDigest = execFileSync("docker", ["image", "inspect", "--format={{.Id}}", expected.imageName], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim()
 	if (actualDigest !== expected.imageDigest) throw new Error("RSI worker image digest differs from the frozen run identity")
@@ -383,6 +395,7 @@ export function rsiMutationGuestEnvironment(config: RsiConfig, candidate: Candid
 			HEADLESSCODE_CAPTURE_TRANSCRIPT_DIR: path.join("/workspace", ".headlesscode", "rsi-transcripts"),
 			HEADLESSCODE_MAX_ITERATIONS: String(config.maxIterations),
 			HEADLESSCODE_MAX_DURATION_MS: String(config.commandTimeoutMs),
+			...(config.campaignScopedEvaluation ? { HEADLESSCODE_RSI_CAMPAIGN_MUTATION: "1" } : {}),
 		}
 	}
 	if (provider !== "ollama") throw new Error("RSI OpenShell worker provider must be ollama or explicitly brokered openrouter")
@@ -398,6 +411,16 @@ export function rsiMutationGuestEnvironment(config: RsiConfig, candidate: Candid
 		HEADLESSCODE_MAX_ITERATIONS: String(config.maxIterations),
 		HEADLESSCODE_MAX_DURATION_MS: String(config.commandTimeoutMs),
 	}
+}
+
+/** Select a campaign's frozen runtime image without changing ordinary RSI defaults. */
+export function pinnedMutationImage(config: RsiConfig, suppliedImage?: string): string | undefined {
+	if (config.workerHarnessMode) {
+		if (!config.workerHarnessRuntime) throw new Error("RSI worker harness requires a frozen runtime image and dependency identity")
+		return config.workerHarnessRuntime.imageDigest
+	}
+	if (config.campaignScopedEvaluation) return config.campaignScopedEvaluation.runtime.imageDigest
+	return suppliedImage
 }
 
 export function networkRules(mode: IsolatedRunOptions["mode"], inferenceBroker?: RsiInferenceBrokerAccess): Record<string, unknown> {
@@ -763,11 +786,13 @@ export async function runOpenShellMutation(candidate: CandidateRecord, config: R
 		const requestedMode = config.workerHarnessMode ?? "fixed-control"
 		const effectiveMode = effectiveWorkerHarnessMode(requestedMode, candidate.generation)
 		const runtime = config.workerHarnessRuntime
-		let pinnedImage = image
+		let pinnedImage = pinnedMutationImage(config, image)
 		if (config.workerHarnessMode) {
 			if (!runtime) throw new Error("RSI worker harness requires a frozen runtime image and dependency identity")
 			verifyWorkerHarnessRuntime(runtime)
 			pinnedImage = runtime.imageDigest
+		} else if (config.campaignScopedEvaluation) {
+			verifyWorkerHarnessRuntime(config.campaignScopedEvaluation.runtime)
 		}
 		const cliPath = workerHarnessCliPath(effectiveMode)
 		const workerCommand = [

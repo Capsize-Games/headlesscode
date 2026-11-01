@@ -33,6 +33,24 @@ RUN mkdir -p /opt/headlesscode-session /opt/headlesscode-data/projects /opt/head
 ENV HEADLESSCODE_ROOT=/opt/headlesscode
 WORKDIR /sandbox
 USER sandbox
+RUN --network=none set -eu; \
+    test "$(id -u)" = "1000"; \
+    test -r /opt/headlesscode/src/cli.ts; \
+    test -r /opt/headlesscode/package.json; \
+    test -r /opt/headlesscode/package-lock.json; \
+    test -r /opt/headlesscode/tsconfig.json; \
+    test -r /opt/headlesscode/shared/stacks; \
+    test -x /opt/headlesscode/shared/stacks; \
+    test -x /opt/headlesscode/node_modules/.bin/tsx; \
+    test -r /opt/headlesscode/scripts/run-worker.sh; \
+    test -x /opt/headlesscode/scripts/run-worker.sh; \
+    test ! -w /opt/headlesscode/src/cli.ts; \
+    test ! -w /opt/headlesscode/src; \
+    test ! -w /opt/headlesscode/shared; \
+    test ! -w /opt/headlesscode/package.json; \
+    test ! -w /opt/headlesscode/package-lock.json; \
+    test ! -w /opt/headlesscode/tsconfig.json; \
+    /opt/headlesscode/node_modules/.bin/tsx /opt/headlesscode/src/cli.ts --help >/dev/null
 RUN test -r /opt/headlesscode/src/cli.ts \
     && test -r /opt/headlesscode/package.json \
     && test -r /opt/headlesscode/package-lock.json \

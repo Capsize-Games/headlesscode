@@ -105,6 +105,34 @@ export class TerminalRenderer {
 			if (status) this.writeStatus(`Turn ${status}`, status === "success" ? "green" : "yellow")
 			return
 		}
+		if (normalized === "decision_blocked") {
+			this.endStreamLine()
+			const raw = asString(fields.question)
+			const question = sanitizeTerminalText(
+				raw || "The agent has a question.",
+			).slice(0, MAX_STATUS_CHARS)
+			this.writeStatus(`Question: ${question}`, "yellow")
+			decisionSuggestions(fields).forEach((text, index) => {
+				const shown = sanitizeTerminalText(text).slice(0, 320)
+				this.writeStatus(`  ${index + 1}. ${shown}`)
+			})
+			return
+		}
+		if (normalized === "decision_answered") {
+			this.endStreamLine()
+			if (fields.timedOut === true) {
+				this.writeStatus(
+					"Question timed out; the agent decides alone.",
+					"yellow",
+				)
+				return
+			}
+			const answer = sanitizeTerminalText(
+				asString(fields.answer),
+			).slice(0, MAX_STATUS_CHARS)
+			if (answer) this.writeStatus(`Answer: ${answer}`, "green")
+			return
+		}
 		if (normalized.includes("reasoning")) return
 		const summary = summarizeFields(fields)
 		if (summary) this.writeStatus(`[${sanitizeTerminalText(type).slice(0, 60)}] ${summary}`)
@@ -160,6 +188,18 @@ export class TerminalRenderer {
 		const code = { red: 31, green: 32, yellow: 33, blue: 34, cyan: 36 }[color]
 		return `\u001b[${code}m${text}\u001b[0m`
 	}
+}
+
+export function decisionSuggestions(
+	fields: Record<string, unknown>,
+): string[] {
+	const raw = fields.suggestions
+	if (!Array.isArray(raw)) return []
+	return raw
+		.filter((entry): entry is string =>
+			typeof entry === "string" && entry.length > 0,
+		)
+		.slice(0, 9)
 }
 
 export function sanitizeTerminalText(value: string): string {

@@ -1,7 +1,15 @@
 import assert from "node:assert/strict"
 import { spawn, spawnSync } from "node:child_process"
+import * as fs from "node:fs/promises"
+import * as os from "node:os"
+import * as path from "node:path"
 import { PassThrough } from "node:stream"
-import type { ChatTurnRunner } from "../types.js"
+import { setTimeout as sleep } from "node:timers/promises"
+import type {
+	ChatTurnRequest,
+	ChatTurnResult,
+	ChatTurnRunner,
+} from "../types.js"
 import { chatMain, parseChatArgs, parseSlashCommand } from "../chat.js"
 import { TerminalInput, readComposedInput } from "../input.js"
 import { sanitizeTerminalText, TerminalRenderer } from "../renderer.js"
@@ -418,6 +426,112 @@ async function testInputAndRendererBounds(): Promise<void> {
 	assert.ok(partial.includes("partial final response"))
 }
 
+async function testDecisionEventsRender(): Promise<void> {
+	const output = new PassThrough()
+	let rendered = ""
+	output.on("data", (chunk) => { rendered += chunk.toString() })
+	const renderer = new TerminalRenderer({ output, color: false })
+	renderer.startTurn()
+	renderer.renderEvent("decision_blocked", {
+		question: "Which config?",
+		suggestions: ["A", "B"],
+	})
+	renderer.renderEvent("decision_answered", { answer: "B" })
+	renderer.renderEvent("decision_blocked", { question: "Again?" })
+	renderer.renderEvent("decision_answered", { timedOut: true })
+	assert.match(rendered, /Which config\?/)
+	assert.match(rendered, /1\. A/)
+	assert.match(rendered, /2\. B/)
+	assert.match(rendered, /Answer: B/)
+	assert.match(rendered, /timed out/i)
+}
+
+async function waitForDecisionAnswer(
+	workspace: string,
+	seen: { answer: string },
+): Promise<void> {
+	const target = path.join(workspace, ".harness.decision-answer")
+	const deadline = Date.now() + 5000
+	for (;;) {
+		try {
+			seen.answer = await fs.readFile(target, "utf8")
+			await fs.rm(target, { force: true })
+			return
+		} catch {
+			// Answer not written yet.
+		}
+		if (Date.now() >= deadline) return
+		await sleep(25)
+	}
+}
+
+async function answerTurnOnce(
+	request: ChatTurnRequest,
+	seen: { answer: string },
+): Promise<ChatTurnResult> {
+	const root = request.workspaceRoot
+	const needs = path.join(root, ".harness.needs-decision")
+	await fs.writeFile(needs, '{"question":"Which config?"}', "utf8")
+	request.onEvent("decision_blocked", {
+		question: "Which config?",
+		suggestions: ["A", "B"],
+	})
+	await waitForDecisionAnswer(root, seen)
+	request.onEvent("decision_answered", { answer: seen.answer })
+	return {
+		status: "success",
+		result: `chose ${seen.answer}`,
+		messages: [{ role: "user", content: request.prompt }],
+	}
+}
+
+function decisionAnswerRunner(seen: { answer: string }): ChatTurnRunner {
+	return (request) => answerTurnOnce(request, seen)
+}
+
+function decisionDeps(
+	input: PassThrough,
+	output: PassThrough,
+	workspace: string,
+	seen: { answer: string },
+): ChatCliDependencies {
+	return dependencies(
+		new MemoryStore(),
+		decisionAnswerRunner(seen),
+		input,
+		output,
+		{ cwd: workspace },
+	)
+}
+
+async function runDecisionPromptTurn(
+	workspace: string,
+): Promise<void> {
+	const seen = { answer: "" }
+	const input = new PassThrough()
+	const output = new PassThrough()
+	let rendered = ""
+	output.on("data", (chunk) => { rendered += chunk.toString() })
+	input.write("go\n")
+	setTimeout(() => input.write("2\n"), 100)
+	setTimeout(() => input.end(), 3000)
+	const deps = decisionDeps(input, output, workspace, seen)
+	assert.equal(await chatMain([], deps), 0)
+	assert.equal(seen.answer, "B")
+	assert.match(rendered, /Which config\?/)
+}
+
+async function testDecisionBlockedPromptsInline(): Promise<void> {
+	const workspace = await fs.mkdtemp(
+		path.join(os.tmpdir(), "hcc-decision-"),
+	)
+	try {
+		await runDecisionPromptTurn(workspace)
+	} finally {
+		await fs.rm(workspace, { recursive: true, force: true })
+	}
+}
+
 async function testReadlineCtrlCInPseudoTerminal(): Promise<void> {
 	if (process.platform !== "linux") return
 	const probe = spawnSync("script", ["--version"], { encoding: "utf8" })
@@ -504,9 +618,11 @@ async function main(): Promise<void> {
 	await testRevisionConflictRequiresRetryAndCtrlCAborts()
 	await testSaveFailureCanBeRetried()
 	await testInputAndRendererBounds()
+	await testDecisionEventsRender()
+	await testDecisionBlockedPromptsInline()
 	await testReadlineCtrlCInPseudoTerminal()
 	await testSecondInterruptForceQuitsHungTurn()
-	console.log("All 12 terminal chat tests passed")
+	console.log("All 14 terminal chat tests passed")
 }
 
 main().catch((error) => { console.error(error); process.exitCode = 1 })

@@ -814,6 +814,10 @@ export interface HeadlessSessionConfig {
 	model?: string
 	taskText: string
 	maxIterations?: number
+	/** Disable provider-error retries for fixed profiles whose call ceiling equals the iteration ceiling. */
+	retryLlmErrors?: boolean
+	/** Disable the model-backed iteration-cap summary for fixed call-budgeted profiles. */
+	writeIterationCapHandoff?: boolean
 	consecutiveErrorLimit?: number
 	/** Skip prompt building and use this exact system prompt. */
 	systemPromptOverride?: string
@@ -1223,6 +1227,8 @@ export interface ResolvedSessionConfig {
 	model: string
 	taskText: string
 	maxIterations: number
+	retryLlmErrors?: boolean
+	writeIterationCapHandoff?: boolean
 	consecutiveErrorLimit: number
 	systemPromptOverride?: string
 	llmTimeoutMs: number
@@ -1596,6 +1602,8 @@ export class HeadlessSession {
 			model: config.model ?? process.env.OPENROUTER_MODEL ?? DEFAULT_MODEL,
 			taskText: config.taskText,
 			maxIterations: config.maxIterations ?? DEFAULT_MAX_ITERATIONS,
+			retryLlmErrors: config.retryLlmErrors,
+			writeIterationCapHandoff: config.writeIterationCapHandoff,
 			consecutiveErrorLimit: config.consecutiveErrorLimit ?? DEFAULT_CONSECUTIVE_ERROR_LIMIT,
 			systemPromptOverride: config.systemPromptOverride,
 			llmTimeoutMs: config.llmTimeoutMs ?? DEFAULT_LLM_TIMEOUT_MS,
@@ -3725,7 +3733,8 @@ export class HeadlessSession {
 					// Retryable classification is per cloud provider (each
 					// client classifies its own error type; a foreign error
 					// is never retryable by the other classifier).
-					if (!isRetryableOpenRouterError(firstAttemptError) && !isRetryableMuseError(firstAttemptError)) {
+					if (this.config.retryLlmErrors === false ||
+						(!isRetryableOpenRouterError(firstAttemptError) && !isRetryableMuseError(firstAttemptError))) {
 						throw firstAttemptError
 					}
 					this.logger.warn("[loop] main LLM call failed with a retryable provider error, retrying once", {
@@ -5468,7 +5477,9 @@ export class HeadlessSession {
 		// this exact error string) — write a handoff summary so that new
 		// conversation doesn't start from a blank slate. Non-fatal; never
 		// changes the result below.
-		await this.writeIterationCapHandoff(messages, budgetTracker)
+		if (this.config.writeIterationCapHandoff !== false) {
+			await this.writeIterationCapHandoff(messages, budgetTracker)
+		}
 		return {
 			status: "error",
 			error: `Max iterations (${maxIterations}) reached without task completion`,
@@ -6344,6 +6355,13 @@ export function summarizeToolArg(name: string, args: Record<string, unknown>): s
 			// The checklist body, clipped so a long planning list doesn't spam
 			// the event/feed view (the todo_updated event carries full counts).
 			return str(args.todos)?.slice(0, 200)
+		case "ask_followup_question":
+			// The question IS the call's identity — without it the
+			// tool_call event renders as a bare
+			// "Tool: ask_followup_question" with no hint of what was
+			// asked (the full question + suggestions ride the
+			// decision_blocked event).
+			return str(args.question)?.slice(0, 200)
 		default:
 			return undefined
 	}

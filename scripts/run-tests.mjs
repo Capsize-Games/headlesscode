@@ -17,17 +17,43 @@
 
 import { execFileSync } from "node:child_process"
 import * as fs from "node:fs"
+import * as os from "node:os"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
 
 const repoRoot = path.resolve(fileURLToPath(import.meta.url), "..", "..")
+const systemTmpRoot = os.tmpdir()
 const scratchRoot = path.join(repoRoot, ".headlesscode", "scratch")
 fs.mkdirSync(scratchRoot, { recursive: true })
-process.env.TMPDIR ??= scratchRoot
-// Plain fixtures inside scratch must not inherit the harness repository identity.
+const ownsTmpRoot = process.env.TMPDIR === undefined
+const ownedTmpRoot = ownsTmpRoot ? createPrivateTempRoot() : null
+if (ownedTmpRoot) process.env.TMPDIR = ownedTmpRoot
+if (ownedTmpRoot) process.on("exit", () => removeOwnedTempRoot(ownedTmpRoot))
+// Preserve the shared system temp path for tests of its unsafe parent policy.
+process.env.HEADLESSCODE_TEST_SYSTEM_TMPDIR = systemTmpRoot
+// Plain fixtures inside TMPDIR must not inherit the harness repository identity.
 const gitCeilings = (process.env.GIT_CEILING_DIRECTORIES ?? "").split(path.delimiter).filter(Boolean)
 gitCeilings.push(fs.realpathSync(process.env.TMPDIR))
 process.env.GIT_CEILING_DIRECTORIES = [...new Set(gitCeilings)].join(path.delimiter)
+
+function createPrivateTempRoot() {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "hct-"))
+	try {
+		fs.chmodSync(root, 0o700)
+		return root
+	} catch (error) {
+		fs.rmSync(root, { recursive: true, force: true })
+		throw error
+	}
+}
+
+function removeOwnedTempRoot(root) {
+	try {
+		fs.rmSync(root, { recursive: true, force: true })
+	} catch {
+		// Cleanup of our private test root is best-effort during process exit.
+	}
+}
 
 /**
  * Non-test-suffixed scripts that ran as part of the old chain. Includes

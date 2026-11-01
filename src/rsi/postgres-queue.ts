@@ -1,7 +1,12 @@
 import { createHash, randomUUID } from "node:crypto"
 import { readFileSync } from "node:fs"
 import { Pool, type PoolClient } from "pg"
-import type { ResourceClass, WorkerHarnessMode, WorkerHarnessRuntimeIdentity } from "./types.js"
+import type {
+	CampaignEvaluationObjective,
+	ResourceClass,
+	WorkerHarnessMode,
+	WorkerHarnessRuntimeIdentity,
+} from "./types.js"
 import { createRsiArtifactStore, type RsiArtifactReference, type RsiArtifactStore } from "./artifact-store.js"
 import { sumMicrousd, sumMicrousdAsUsd, usdEqualsMicrousd } from "./microusd.js"
 import { endpointPriceIdentity, openRouterProfileForModel, RSI_DEFAULT_OPENROUTER_PROFILE_ID, type OpenRouterBrokerGrant, type OpenRouterBrokerReceipt, type OpenRouterCallReceipt, type OpenRouterCallReservation, type OpenRouterCallSettlement, type OpenRouterDenialReason, type OpenRouterEndpointPriceSnapshot, type OpenRouterInferenceLedger, type RsiOpenRouterProfileId } from "./inference-broker.js"
@@ -117,12 +122,22 @@ export interface FleetJobPayload {
 	openRouterProfile?: RsiOpenRouterProfileId
 	proofCampaign?: { campaignId: string; armId: string; epoch: number; manifestSha256: string; cells: Array<{ attemptKey: string; slotId: string; attemptKind: "mutation" | "verification" }> }
 	evaluatorRuntime?: { imageDigest: string; policySha256: string }
+	/** Paired campaign evaluation; preserved over queue serialization. */
+	campaignScopedEvaluation?: {
+		planDigest: string
+		fixtureDigest: string
+		evaluatorDigest: string
+		runtime: WorkerHarnessRuntimeIdentity
+		objective: CampaignEvaluationObjective
+		typecheckCommand: string
+	}
 	/** Supervisor-authored adversarial artifacts, bound to the immutable snapshot. */
 	adversarialEvaluation?: { testsSha256: string; runnerSha256: string }
 	inferenceLimits?: OpenRouterBrokerLimits
 	maxIterations: number
 	timeoutMs: number
 	protectedPaths: string[]
+	allowedMutationPaths?: string[]
 	candidate: Record<string, unknown>
 	regressionCommand?: string
 	evalCommands?: string[]

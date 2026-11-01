@@ -2828,3 +2828,35 @@ export function createLocalExploreExecutor(workspaceRoot: string, options: ToolE
 
 	return executor
 }
+
+/**
+ * Minimal read-only executor for the fixed Curl published-advisory qualification.
+ * It exposes one bounded source excerpt and the normal completion signal only.
+ */
+export function createPublishedAdvisoryQualificationExecutor(workspaceRoot: string): ToolExecutor {
+	const executor = new ToolExecutor(workspaceRoot)
+	const readCache = new Map<string, ReadFileCacheEntry>()
+	executor.register("read_file", (args, ctx) => {
+		if (args.path !== "src/tool_cb_hdr.c") return err("repository qualification may read only src/tool_cb_hdr.c")
+		if ((args.mode !== undefined && args.mode !== "slice") || args.indentation !== undefined) return err("repository qualification supports only bounded slice reads")
+		const limit = args.limit === undefined ? 80 : args.limit
+		if (!Number.isInteger(limit) || (limit as number) < 1 || (limit as number) > 80) return err("repository qualification source excerpts are limited to 80 lines")
+		const boundedArgs = { ...args, limit }
+		const prior = readCache.get(readFileKey(boundedArgs, ctx))
+		const result = readFileHandler(boundedArgs, ctx, prior, readCache)
+		if (result instanceof Promise) return result.then((value) => boundQualificationRead(value))
+		return boundQualificationRead(result)
+	})
+	executor.register("attempt_completion", attemptCompletionHandler)
+	for (const name of VENDORED_TOOL_NAMES) {
+		if (!executor.has(name)) executor.register(name, stubHandler(name, ["read_file", "attempt_completion"]))
+	}
+	return executor
+}
+
+function boundQualificationRead(result: ToolResult): ToolResult {
+	const limit = 8 * 1024
+	const bytes = Buffer.from(result.content, "utf8")
+	if (bytes.byteLength <= limit) return result
+	return { ...result, content: `${bytes.subarray(0, limit).toString("utf8")}\n[qualification source excerpt truncated at 8 KiB]` }
+}

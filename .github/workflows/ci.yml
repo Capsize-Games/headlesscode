@@ -3,24 +3,27 @@
 #   e2e pass (scripts/e2e/run.sh) since the e2e suites exercise real
 #   spawn/worker flows against a local mock OpenRouter server.
 #
-# Runs on GitHub-hosted runners (public repo — no self-hosted worker).
 # No API key and no network access are needed — the mock server serves the
-# entire session, so this is safe to run on any push/PR, including from forks.
+# entire session. Only branches in the private maintenance repository run here.
 name: ci
 
 on:
   push:
-    branches: ["**", "!headlesscode-claims/**"]
+    branches: ["wip/audit-20261027"]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: private-campaign-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   typecheck-test-e2e:
-    if: github.event.repository.private == false
-    runs-on: ubuntu-latest
+    if: github.repository == 'Capsize-Games/headlesscode-internal' && github.event.repository.private == true && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, Linux, X64, workstation-ci, headlesscode-internal-ci]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -32,6 +35,15 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Test private Fleet source staging
+        run: node --test scripts/stage-fleet-test-source.test.mjs
+
+      - name: Stage pinned private Fleet source for integration tests
+        env:
+          FLEET_SECURITY_WATCH_PRIVATE_ROOT: ${{ vars.FLEET_SECURITY_WATCH_PRIVATE_ROOT }}
+          FLEET_SECURITY_WATCH_TEST_REF: ${{ vars.FLEET_SECURITY_WATCH_TEST_REF }}
+        run: node scripts/stage-fleet-test-source.mjs
+
       - name: Install dependencies
         run: npm ci
 
@@ -39,7 +51,7 @@ jobs:
       # which launches a REAL headless Chromium via Playwright — the browser
       # binary is a separate download, not part of npm ci.
       - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install chromium
 
       - name: Typecheck
         run: npx tsc --noEmit
@@ -55,3 +67,12 @@ jobs:
 
       - name: End-to-end (mock OpenRouter, no key)
         run: bash scripts/e2e/run.sh
+
+      - name: Remove staged Fleet source
+        if: always()
+        run: >-
+          node -e 'const fs=require("node:fs");const path=require("node:path");
+          const root=process.env.FLEET_SECURITY_WATCH_TEST_ROOT;
+          const temp=process.env.RUNNER_TEMP;
+          if(root&&temp&&path.dirname(root).startsWith(path.join(temp,"fleet-test-source-")))
+          fs.rmSync(path.dirname(root),{recursive:true,force:true})'

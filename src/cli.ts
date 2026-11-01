@@ -37,7 +37,14 @@ import {
 	buildSystemPrompt,
 	loadCustomModes,
 	selectToolsForMode,
+	selectCampaignMutationTools,
+	CAMPAIGN_MUTATION_SYSTEM_PROMPT,
+	PUBLISHED_ADVISORY_QUALIFICATION_SYSTEM_PROMPT,
+	selectPublishedAdvisoryQualificationTools,
 } from "./engine/prompt.js"
+import { createPublishedAdvisoryQualificationExecutor } from "./tools/executor.js"
+import { CURL_FIXED_ADVISORY } from "./campaigncontrol/repository-curl-evaluator.js"
+import { CURL_DEBIAN_SOURCE_URL } from "./campaigncontrol/repository-known-advisory.js"
 import { orchestrateMain } from "./orchestrator/cli.js"
 import { watchMain } from "./watcher/cli.js"
 import { checkpointsMain } from "./checkpoints/cli.js"
@@ -68,6 +75,7 @@ interface CliOptions {
 	mode: string
 	task?: string
 	taskFile?: string
+	publishedAdvisoryQualification?: boolean
 	workspace?: string
 	/** Explicit session id override (set by the dashboard's session-launch endpoint). */
 	sessionId?: string
@@ -323,6 +331,7 @@ Options:
                                        contained: OpenShell only, fails closed)
   --task <text>              The task description for the agent
   --task-file <path>         Read the task from a file (relative to workspace)
+  --published-advisory-qualification  Fixed read-only advisory review profile
   --workspace <root>         Workspace root (default: $HEADLESSCODE_WORKSPACE_ROOT or cwd)
   --session-id <id>          Explicit session id (default: a fresh UUID).
                              Required for contained runs and must match a
@@ -533,6 +542,10 @@ export function parseArgs(argv: string[]): { options: CliOptions; error?: string
 		}
 
 		switch (flag) {
+			case "--published-advisory-qualification":
+				if (inlineValue !== undefined) return { options, error: `${flag} does not take a value` }
+				options.publishedAdvisoryQualification = true
+				break
 			case "--security-profile": {
 				const value = next()
 				try { options.securityProfile = resolveSecurityProfile(value) }
@@ -807,6 +820,10 @@ export async function main(argv: string[] = process.argv.slice(2), hooks?: CliRu
 	if (argv[0] === "control") {
 		const { controlMain } = await import("./control/cli.js")
 		return controlMain(argv.slice(1))
+	}
+	if (argv[0] === "campaign") {
+		const { campaignMain } = await import("./campaigncontrol/cli.js")
+		return campaignMain(argv.slice(1))
 	}
 	if (argv[0] === "openshell-review-session" || argv[0] === "openshell-qa-session") {
 		let payload: Record<string, unknown>
@@ -1179,6 +1196,23 @@ export async function main(argv: string[] = process.argv.slice(2), hooks?: CliRu
 	if (taskText.trim() === "") {
 		stderr.write("headlesscode: task text is empty\n")
 		return 2
+	}
+	if (options.publishedAdvisoryQualification) {
+		const taskBytes = Buffer.byteLength(taskText, "utf8")
+		if (options.dryRun || options.task || !options.taskFile || !options.sessionId || options.mode !== "code" || taskBytes > 8_192 ||
+			!taskText.startsWith("# Repository security review task\n") || !taskText.includes("This is a qualification-only review.") ||
+			!taskText.includes(CURL_FIXED_ADVISORY) || !taskText.includes(CURL_DEBIAN_SOURCE_URL)) {
+			stderr.write("headlesscode: published-advisory qualification requires its bounded qualification task file, session, and code mode\n")
+			return 2
+		}
+		// These limits are code-owned and cannot be raised by argv or environment.
+		options.maxTokens = 4_000
+		options.maxIterations = 2
+		options.maxCostUsd = Math.min(options.maxCostUsd ?? envNumber("HEADLESSCODE_MAX_COST_USD") ?? 0.008, 0.008)
+		options.maxDurationMs = Math.min(options.maxDurationMs ?? envNumber("HEADLESSCODE_MAX_DURATION_MS") ?? 840_000, 840_000)
+		options.noMemory = true
+		options.noCheckpoints = true
+		options.stream = false
 	}
 	if (options.securityProfile === "contained") {
 		if (hooks) { stderr.write("headlesscode: interactive turns require a supervisor-backed contained transport; use openshell-session\n"); return 2 }
@@ -1659,11 +1693,23 @@ export async function main(argv: string[] = process.argv.slice(2), hooks?: CliRu
 	try {
 		const session = new HeadlessSession({
 			workspaceRoot,
+			...(options.publishedAdvisoryQualification ? {
+				tools: selectPublishedAdvisoryQualificationTools(options.mode),
+				executor: createPublishedAdvisoryQualificationExecutor(workspaceRoot),
+				systemPromptOverride: PUBLISHED_ADVISORY_QUALIFICATION_SYSTEM_PROMPT,
+			} : {}),
+			...(process.env.HEADLESSCODE_RSI_CAMPAIGN_MUTATION === "1" ? {
+				tools: selectCampaignMutationTools(options.mode ?? "code"),
+				toolAllowlist: ["read_file", "write_to_file", "execute_command", "attempt_completion"],
+				systemPromptOverride: CAMPAIGN_MUTATION_SYSTEM_PROMPT,
+			} : {}),
 			sessionId: options.sessionId,
 			mode: options.mode,
 			model: effectiveModel,
 			taskText,
 			maxIterations: options.maxIterations,
+			retryLlmErrors: !options.publishedAdvisoryQualification,
+			writeIterationCapHandoff: !options.publishedAdvisoryQualification,
 			maxRecursionDepth,
 			childIterationFraction,
 			consecutiveErrorLimit,
