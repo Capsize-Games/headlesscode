@@ -41,6 +41,8 @@ import * as path from "node:path"
 import { execFileSync, spawn } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
 
+import { recordSessionPid } from "./session-pids.js"
+
 /** Marker basenames, relative to the session's workspace root (src/tools/executor.ts idiom). */
 const NEEDS_DECISION_FILENAME = ".harness.needs-decision"
 const DECISION_ANSWER_FILENAME = ".harness.decision-answer"
@@ -271,6 +273,27 @@ export async function launchSession(
 	// alive nor die when the dashboard exits. It becomes its own process
 	// group leader (detached: true) and keeps running independently.
 	child.unref()
+
+	// Record the detached pid so POST /api/session/:id/stop can find
+	// (and group-signal) this session later — including after a
+	// dashboard restart, which the detached child survives. Non-fatal
+	// on failure: the session is already running, and failing the
+	// launch response would orphan it without returning its id.
+	if (child.pid) {
+		try {
+			await recordSessionPid({
+				sessionId, pid: child.pid, workspaceRoot: workspace,
+				mode,
+			})
+		} catch (error) {
+			process.stderr.write(
+				`[session-launch] failed to record pid for session ` +
+					`${sessionId} (stop will not find it): ` +
+					`${error instanceof Error ? error.message :
+						String(error)}\n`,
+			)
+		}
+	}
 
 	return { sessionId, pid: child.pid ?? 0, workspace, mode }
 }

@@ -1,7 +1,7 @@
 /**
  * `headlesscode dashboard` subcommand — a local, auto-refreshing cost/token
- * dashboard (workstream 3) + live per-session event feed + pause/resume
- * control (live worker monitoring).
+ * dashboard (workstream 3) + live per-session event feed + pause/resume/
+ * stop control (live worker monitoring).
  *
  *   npx tsx src/cli.ts dashboard [--port 4390] [--repo <path>]
  *
@@ -59,6 +59,10 @@ Environment:
                  process runs as root (a container's usual default);
                  unset (default) = skip, leaving those files owned by
                  whoever ran the dashboard.
+  HEADLESSCODE_DASHBOARD_STOP_GRACE_MS    Grace period (ms) between
+                 SIGTERM and SIGKILL for POST /api/session/:id/stop
+                 (default: 5000). A per-request { graceMs } body
+                 overrides it for that call.
 
 Notes:
   Binds to 127.0.0.1 only — no auth unless HEADLESSCODE_DASHBOARD_TOKEN is
@@ -140,6 +144,11 @@ export async function dashboardMain(argv: string[]): Promise<number> {
 		return 0
 	}
 
+	const stopGraceRaw = Number(
+		process.env.HEADLESSCODE_DASHBOARD_STOP_GRACE_MS || undefined)
+	const stopGraceMs = Number.isInteger(stopGraceRaw) &&
+		stopGraceRaw >= 0 ? stopGraceRaw : undefined
+
 	let server: Awaited<ReturnType<typeof startDashboardServer>>
 	try {
 		server = await startDashboardServer({
@@ -149,6 +158,7 @@ export async function dashboardMain(argv: string[]): Promise<number> {
 			cli: process.env.HEADLESSCODE_DASHBOARD_SESSION_CLI || undefined,
 			repoRoot: process.env.HEADLESSCODE_DASHBOARD_SESSION_REPO_ROOT || undefined,
 			worktreeRoot: process.env.HEADLESSCODE_DASHBOARD_WORKTREE_ROOT || undefined,
+			stopGraceMs,
 		})
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err)

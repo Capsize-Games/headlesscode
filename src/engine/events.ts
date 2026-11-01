@@ -14,6 +14,9 @@
  *   session_start / iteration_start / llm_response / tool_call / tool_result
  *   checkpoint_saved / decision_blocked / decision_answered
  *   condensed / todo_updated / paused / resumed / session_end
+ *   session_stopped (the dashboard stopped this session — appended by
+ *   POST /api/session/:id/stop AFTER the process died, so it comes from
+ *   src/dashboard/session-stop.ts via appendEvent, not HeadlessSession)
  *   unverified_claim (fabrication fix, 2026-09-01): emitted when
  *   evidenceRequiredCompletion was on and an attempt_completion was DEFERRED
  *   because a machine-checkable claim in its result could not be verified

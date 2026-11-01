@@ -14,6 +14,9 @@
  *   GET  /api/session/:id/events  JSON events feed (incremental via ?since=<offset>)
  *   POST /api/session/:id/pause   write `.harness.pause-requested` (worker pauses between iterations)
  *   POST /api/session/:id/resume  remove `.harness.pause-requested` (worker resumes)
+ *   POST /api/session/:id/stop    SIGTERM the detached process group recorded
+ *                                 at launch, grace, then SIGKILL (see
+ *                                 src/dashboard/session-stop.ts); idempotent
  *   GET  /api/settings/mode-models?repo=<path>   current mode-models.json content ({} if absent)
  *   POST /api/settings/mode-models?repo=<path>   validate + write mode-models.json (creates .headlesscode/)
  *   POST /api/session/start       launch a detached top-level session (see src/dashboard/session-launch.ts)
@@ -107,6 +110,7 @@ import {
 import { readCostHistory, readSessionCostHistory } from "../orchestrator/cost-history.js"
 import { listProjectEntries } from "../project-store.js"
 import { listWorkspaceDir, readWorkspaceFile } from "./files.js"
+import { parseStopGraceOverride, stopSession } from "./session-stop.js"
 import { executeTool, type ToolExecuteRequest } from "./tool-exec.js"
 import {
 	loadPermissionsFile,
@@ -168,6 +172,12 @@ export interface DashboardServerOptions {
 	 * instead of the developer's home directory; not a public config surface.
 	 */
 	checkpointDir?: string
+	/**
+	 * SIGTERM grace period (ms) for POST /api/session/:id/stop before
+	 * escalating to SIGKILL (default: 5000 — see session-stop.ts). A
+	 * per-request `{ graceMs }` body overrides it for that one call.
+	 */
+	stopGraceMs?: number
 }
 
 /** Start the dashboard HTTP server. Resolves once it's listening. */
@@ -209,7 +219,7 @@ async function handleRequest(
 	// Optional control-plane token (HEADLESSCODE_DASHBOARD_TOKEN — see
 	// DashboardServerOptions.token). When configured, every state-changing
 	// POST requires the bearer header: /api/session/* (start/pause/resume/
-	// answer), the destructive POST /api/checkpoints/restore (reverts real
+	// stop/answer), the destructive POST /api/checkpoints/restore (reverts real
 	// workspace files — never gated looser than the session routes), and
 	// POST /api/settings/permissions (a weakened permissions file is more
 	// consequential than starting a session — same gate).
@@ -327,6 +337,87 @@ async function handleRequest(
 			res
 				.writeHead(500, { "content-type": "application/json; charset=utf-8" })
 				.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
+		}
+		return
+	}
+
+	// Stop a dashboard-launched session: POST /api/session/:id/stop —
+	// SIGTERM the detached process group recorded at launch, grace,
+	// then SIGKILL (see session-stop.ts + session-pids.ts). Same
+	// POST-only rule and optional bearer-token gate as pause/resume
+	// (the generic /api/session/* check at the top). Idempotent: an
+	// already-dead/stopped session is a 200, an unknown one a 404 —
+	// never a 500 for either. Optional body: { graceMs }.
+	const stopMatch = /^\/api\/session\/([^/]+)\/stop$/.exec(url.pathname)
+	if (stopMatch && req.method !== "POST") {
+		res.writeHead(405, { "content-type": "text/plain" }).end("Method Not Allowed")
+		return
+	}
+	if (stopMatch && req.method === "POST") {
+		const sessionId = decodeURIComponent(stopMatch[1])
+		const repo = url.searchParams.get("repo") || options.repo
+		if (!repo) {
+			res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ error: "missing repo — pass ?repo=<path> or start the dashboard with --repo" }),
+			)
+			return
+		}
+		try {
+			const raw = await readJsonBody(req)
+			let body: unknown = {}
+			if (raw.trim() !== "") {
+				try {
+					body = JSON.parse(raw)
+				} catch (err) {
+					const detail = err instanceof Error ? err.message : String(err)
+					res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+						JSON.stringify({
+							error: `invalid JSON body: ${detail}`,
+						}),
+					)
+					return
+				}
+			}
+			const grace = parseStopGraceOverride(body)
+			if (grace.error) {
+				res.writeHead(400, { "content-type": "application/json; charset=utf-8" }).end(
+					JSON.stringify({ error: grace.error }),
+				)
+				return
+			}
+			const result = await stopSession(
+				repo, sessionId, grace.graceMs ?? options.stopGraceMs)
+			if (result.status === "unknown" || result.status === "no-pid-recorded") {
+				res.writeHead(404, { "content-type": "application/json; charset=utf-8" }).end(
+					JSON.stringify({
+						error: result.message, sessionId, ok: false,
+						status: result.status,
+					}),
+				)
+				return
+			}
+			if (!result.ok) {
+				const code = result.status === "invalid-pid" ? 400 : 500
+				res
+					.writeHead(code, { "content-type": "application/json; charset=utf-8" })
+					.end(JSON.stringify({
+						error: result.message, sessionId, ok: false,
+						status: result.status,
+					}))
+				return
+			}
+			res.writeHead(200, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({
+					sessionId, action: "stop", ok: true, stopped: true,
+					status: result.status, pid: result.pid,
+					signal: result.signal, worktree: result.worktree,
+				}),
+			)
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error)
+			res.writeHead(500, { "content-type": "application/json; charset=utf-8" }).end(
+				JSON.stringify({ error: detail }),
+			)
 		}
 		return
 	}
