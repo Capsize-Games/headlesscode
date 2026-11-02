@@ -60,6 +60,8 @@ export interface SessionStartRequest {
 	task?: string
 	/** Mode slug (default: multi-agent-orchestrator-headless). */
 	mode?: string
+	/** Optional coding model identifier forwarded to the session CLI. */
+	model?: string
 }
 
 /** Request body for POST /api/session/:id/answer. */
@@ -208,7 +210,7 @@ export function validateSessionStartBody(body: unknown): string | undefined {
 	if (body === null || typeof body !== "object" || Array.isArray(body)) {
 		return "body must be a JSON object"
 	}
-	const { task, repo, mode } = body as Record<string, unknown>
+	const { task, repo, mode, model } = body as Record<string, unknown>
 	if (typeof task !== "string" || task.trim() === "") {
 		return "missing or empty 'task' — provide the prompt text to run"
 	}
@@ -218,7 +220,15 @@ export function validateSessionStartBody(body: unknown): string | undefined {
 	if (mode !== undefined && (typeof mode !== "string" || mode.trim() === "")) {
 		return "'mode' must be a non-empty string slug"
 	}
+	if (model !== undefined && !isValidModelIdentifier(model)) {
+		return "'model' must be a valid identifier of at most 255 characters"
+	}
 	return undefined
+}
+
+function isValidModelIdentifier(value: unknown): value is string {
+	return typeof value === "string" &&
+		/^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,254}$/.test(value.trim())
 }
 
 /** Split a CLI command string into argv (whitespace-separated, no shell). */
@@ -238,6 +248,7 @@ export async function launchSession(
 		workspace: string
 		task: string
 		mode?: string
+		model?: string
 		/**
 		 * CLI invocation template, e.g. "npx tsx src/cli.ts". Tests point it
 		 * at a tiny fake script for fast, deterministic assertions.
@@ -249,6 +260,10 @@ export async function launchSession(
 ): Promise<LaunchSessionResult> {
 	const sessionId = randomUUID()
 	const mode = options.mode?.trim() ? options.mode.trim() : DEFAULT_LAUNCH_MODE
+	const model = options.model?.trim()
+	if (model && !isValidModelIdentifier(model)) {
+		throw new Error("model must be a valid identifier of at most 255 characters")
+	}
 	const workspace = path.resolve(options.workspace)
 	const cli = options.cli ?? "npx tsx src/cli.ts"
 	// The dashboard may have been started from a different cwd than this repo;
@@ -256,7 +271,11 @@ export async function launchSession(
 	// matter where the dashboard process was launched from.
 	const repoRoot = path.resolve(options.repoRoot ?? process.cwd())
 
-	const argv = [...splitCli(cli), "--task", options.task, "--mode", mode, "--workspace", workspace, "--session-id", sessionId]
+	const argv = [
+		...splitCli(cli), "--task", options.task, "--mode", mode,
+		"--workspace", workspace, "--session-id", sessionId,
+		...(model ? ["--model", model] : []),
+	]
 
 	// NOTE (control-plane): the child inherits this process's environment —
 	// HEADLESSCODE_OPENROUTER_API_KEY and OPENROUTER_BASE_URL (the e2e mock) included. The

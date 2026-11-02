@@ -80,6 +80,14 @@ async function testValidateBodyRejectsMalformed(): Promise<void> {
 	assert.match(validateSessionStartBody({ task: "   " }) ?? "", /missing or empty 'task'/i)
 	assert.match(validateSessionStartBody({ task: "x", repo: 42 }) ?? "", /'repo' must be a non-empty string/i)
 	assert.match(validateSessionStartBody({ task: "x", mode: "" }) ?? "", /'mode' must be a non-empty string/i)
+	assert.match(
+		validateSessionStartBody({ task: "x", model: "bad model" }) ?? "",
+		/valid identifier/i,
+	)
+	assert.match(
+		validateSessionStartBody({ task: "x", model: "m".repeat(256) }) ?? "",
+		/255 characters/i,
+	)
 	// Valid bodies pass.
 	assert.equal(validateSessionStartBody({ task: "do the thing" }), undefined)
 	assert.equal(validateSessionStartBody({ task: "x", repo: "/tmp/r", mode: "code" }), undefined)
@@ -93,19 +101,30 @@ async function testValidateBodyRejectsMalformed(): Promise<void> {
  * file existed and the process was still running shortly after the response —
  * proving the endpoint truly detached (spawn + unref), not awaited.
  */
-async function makeFakeCli(): Promise<{ dir: string; script: string; marker: string }> {
+async function makeFakeCli(): Promise<{
+	dir: string
+	script: string
+	marker: string
+	argvMarker: string
+}> {
 	const dir = await tmpRepo("hc-launch-fakecli-")
 	const script = path.join(dir, "fake-cli.mjs")
 	const marker = path.join(dir, "started.marker")
+	const argvMarker = path.join(dir, "argv.marker")
 	await fs.writeFile(
 		script,
 		`import { writeFileSync } from "node:fs";
 writeFileSync(${JSON.stringify(marker)}, process.pid.toString(), "utf-8");
+writeFileSync(
+	${JSON.stringify(argvMarker)},
+	JSON.stringify(process.argv.slice(2)),
+	"utf-8",
+);
 await new Promise((r) => setTimeout(r, 5000));
 `,
 		"utf-8",
 	)
-	return { dir, script, marker }
+	return { dir, script, marker, argvMarker }
 }
 
 async function testStartSpawnsDetachedProcess(): Promise<void> {
@@ -187,6 +206,10 @@ async function testStartHttpEndpointValidatesAndSpawns(): Promise<void> {
 			const bad = await postJson(base, "/api/session/start", { mode: "code" })
 			assert.equal(bad.status, 400)
 			assert.match(String((bad.body as { error?: string }).error ?? ""), /missing or empty 'task'/i)
+			const badModel = await postJson(base, "/api/session/start", {
+				task: "do work", model: "bad model",
+			})
+			assert.equal(badModel.status, 400)
 
 			// Invalid JSON body -> 400.
 			const badJsonRes = await fetch(base + "/api/session/start", {
@@ -202,13 +225,19 @@ async function testStartHttpEndpointValidatesAndSpawns(): Promise<void> {
 
 			// Valid -> 200 with a sessionId + pid, and the fake's marker file
 			// gets written (proving the child really was spawned).
-			const ok = await postJson(base, "/api/session/start", { task: "do work", mode: "code" })
+			const ok = await postJson(base, "/api/session/start", {
+				task: "do work", mode: "code", model: "provider/model-v1:latest",
+			})
 			assert.equal(ok.status, 200)
 			const body = ok.body as { sessionId: string; pid: number }
 			assert.ok(typeof body.sessionId === "string" && body.sessionId.length > 0)
 			assert.ok(Number.isInteger(body.pid) && body.pid > 0)
 			await sleep(300)
 			await fs.access(fake.marker)
+			const argv = JSON.parse(await fs.readFile(fake.argvMarker, "utf-8")) as string[]
+			const modelIndex = argv.indexOf("--model")
+			assert.ok(modelIndex >= 0, "selected model must reach the spawned CLI")
+			assert.equal(argv[modelIndex + 1], "provider/model-v1:latest")
 		} finally {
 			server.close()
 		}
