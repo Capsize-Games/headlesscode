@@ -496,7 +496,9 @@ async function handleRequest(
 					.end(JSON.stringify({ error: validationError }))
 				return
 			}
-			const start = body as { task: string; repo?: string; mode?: string }
+			const start = body as {
+				task: string; repo?: string; mode?: string; model?: string
+			}
 			const repo = start.repo?.trim() || options.repo
 			if (!repo) {
 				res
@@ -512,6 +514,7 @@ async function handleRequest(
 				workspace: repo,
 				task: start.task,
 				mode: start.mode,
+				model: start.model,
 				cli: options.cli,
 				repoRoot: options.repoRoot,
 			})
